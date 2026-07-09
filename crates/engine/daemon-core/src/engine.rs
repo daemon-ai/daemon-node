@@ -39,6 +39,16 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+/// Drop duplicate `(name, args)` tool calls within a single assistant message, keeping the first
+/// occurrence (a faithful port of hermes' `_deduplicate_tool_calls`, run_agent.py:3395). A model
+/// that emits the same call twice in one round would otherwise run the tool twice; deduping at the
+/// decode/dispatch boundary makes an identical parallel call idempotent. The `args` compared are the
+/// raw model arguments (pre-repair), matching the Python key `(function.name, function.arguments)`.
+fn deduplicate_tool_calls(calls: &mut Vec<crate::conversation::ToolCall>) {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    calls.retain(|c| seen.insert((c.name.clone(), c.args.clone())));
+}
+
 /// A background-job completion handed back to the engine on rehydration (the core-local form of the
 /// durable `JobCompletion`; the host adapter converts between them).
 #[derive(Clone, Debug)]
@@ -394,14 +404,27 @@ impl Engine {
     /// report whether cancellation has been requested.
     fn boundary(&mut self, control: &TurnControl, events: &EventSink) -> bool {
         self.serve_snapshots(control, events);
+        // A hard interrupt supersedes any queued steer (hermes `clear_interrupt` drops
+        // `_pending_steer`): the interrupted turn's next iteration won't happen, so appending the
+        // steer as a durable marker it will never act on is surprising. When cancelling, drop each
+        // queued steer and ack it not-accepted rather than splicing it into the conversation.
+        let cancelling = control.is_cancelled();
         // Context-only observes that arrived mid-turn fold in as plain user context (no marker, no
         // ack, no trigger): they become part of the model context the next turn assembles.
         for input in control.drain_observe() {
             self.push_observe(input);
         }
         for steer in control.drain_steer() {
-            self.push_steer_marker(&steer);
             let request_id = steer.request_id;
+            if cancelling {
+                events.emit(|seq| AgentEvent::Steered {
+                    seq,
+                    request_id,
+                    accepted: false,
+                });
+                continue;
+            }
+            self.push_steer_marker(&steer);
             events.emit(|seq| AgentEvent::Steered {
                 seq,
                 request_id,
@@ -503,6 +526,14 @@ impl Engine {
         let mut attempt = 0u32;
         let mut compacted = false;
         loop {
+            // A cancellation observed between attempts (e.g. a `/stop` that landed while a transient
+            // stream error was being handled) aborts the recovery loop immediately — before any fresh
+            // credential acquire or provider re-invocation — rather than opening a doomed new attempt.
+            // Mirrors hermes' `_interruptible_streaming_api_call` checking `_interrupt_requested` at
+            // the top of its retry loop (test_stream_interrupt_retry.py).
+            if cancel.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
             tracing::debug!(
                 attempt,
                 offer_tools,
@@ -552,7 +583,13 @@ impl Engine {
                             },
                         });
                     }
-                    tokio::time::sleep(after).await;
+                    // The backoff is interruptible: a `/stop` during the wait aborts immediately
+                    // instead of serving out a (possibly long, `Retry-After`-sized) sleep.
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(Failure::Cancelled),
+                        _ = tokio::time::sleep(after) => {}
+                    }
                     attempt += 1;
                 }
                 RecoveryStep::Rotate => {
@@ -1177,7 +1214,7 @@ impl Engine {
                     epoch = model_epoch,
                     offer_tools = true
                 );
-                let out = match self
+                let mut out = match self
                     .call_model(events, true, &cancel)
                     .instrument(model_span)
                     .await
@@ -1191,6 +1228,12 @@ impl Engine {
                 if self.boundary(control, events) {
                     return Ok(self.finish_interrupted(events));
                 }
+
+                // §9 dedup: at the decode/dispatch boundary, collapse duplicate (name, args) tool
+                // calls the model emitted within this one assistant message to their first
+                // occurrence (mirrors hermes' `_deduplicate_tool_calls`), so an identical parallel
+                // call is executed once rather than once per duplicate.
+                deduplicate_tool_calls(&mut out.tool_calls);
 
                 if out.tool_calls.is_empty() {
                     // §11 -> §10 post-turn hooks (spec order): record the assistant turn, then

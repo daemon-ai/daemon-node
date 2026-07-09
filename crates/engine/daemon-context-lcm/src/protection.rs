@@ -1417,4 +1417,133 @@ mod tests {
             "byte-identical when the walk changed nothing"
         );
     }
+
+    // ---- Wave 2 theme 2: ingest-protection replay + quarantine interplay ----------------------
+
+    use daemon_core::{AssistantMsg, ToolCall, ToolResult, ToolTurn, Turn, UserMsg};
+
+    // PARITY: hermes-lcm tests/test_ingest_protection.py::test_sensitive_patterns_redact_bypassed_active_replay_without_storage
+    // Sensitive redaction must still fire on the provider-facing active replay even when the
+    // session is bypassed (ignored/stateless) and nothing is stored durably — `ReplayQuarantine::Skip`
+    // skips only the quarantine, never the redaction pass. Protection is not bypassed by replay.
+    #[test]
+    fn replay_redacts_sensitive_even_when_quarantine_skipped() {
+        let active = vec!["api_key".to_string()];
+        // Low-entropy stand-ins (>=12 chars, matching the api_key regex) so no secret-shaped
+        // literal lands in the source tree; redaction fires on the value regardless of entropy.
+        let secret = "x".repeat(24);
+        let tool_secret = "y".repeat(28);
+
+        let mut user = Turn::User(UserMsg::new(format!("api_key={secret}")));
+        sanitize_replay_turn(&mut user, &active, "sess", ReplayQuarantine::Skip);
+        match &user {
+            Turn::User(u) => {
+                assert!(
+                    !u.text.contains(secret.as_str()),
+                    "user secret redacted on replay"
+                );
+                assert!(u.text.contains("[LCM sensitive redaction:"));
+            }
+            _ => panic!("expected user turn"),
+        }
+
+        let args = serde_json::json!({ "api_key": tool_secret }).to_string();
+        let mut tool = Turn::Tool(ToolTurn {
+            assistant: AssistantMsg::text("calling the tool"),
+            calls: vec![(
+                ToolCall {
+                    call_id: "call_1".into(),
+                    name: "lookup".into(),
+                    args,
+                },
+                ToolResult {
+                    call_id: "call_1".into(),
+                    ok: true,
+                    content: "ok".into(),
+                },
+            )],
+        });
+        sanitize_replay_turn(&mut tool, &active, "sess", ReplayQuarantine::Skip);
+        match &tool {
+            Turn::Tool(t) => {
+                assert!(
+                    !t.calls[0].0.args.contains(tool_secret.as_str()),
+                    "nested tool-call secret redacted on bypassed replay"
+                );
+                assert!(t.calls[0].0.args.contains("LCM sensitive redaction"));
+            }
+            _ => panic!("expected tool turn"),
+        }
+    }
+
+    // PARITY: hermes-lcm tests/test_ingest_protection.py::test_quarantined_assistant_tool_call_content_is_removed_from_noop_active_replay
+    // A runaway assistant turn on active replay is swapped for a volatile placeholder (no disk) while
+    // its tool-call structure is preserved verbatim. The degenerate body never reaches the provider.
+    #[test]
+    fn replay_quarantines_runaway_assistant_volatile_without_touching_disk() {
+        let body = "loop loop loop loop\n".repeat(6000);
+        let mut turn = Turn::Tool(ToolTurn {
+            assistant: AssistantMsg::text(body.clone()),
+            calls: vec![(
+                ToolCall {
+                    call_id: "call_loop".into(),
+                    name: "lookup".into(),
+                    args: "{}".into(),
+                },
+                ToolResult {
+                    call_id: "call_loop".into(),
+                    ok: true,
+                    content: "tool result".into(),
+                },
+            )],
+        });
+        sanitize_replay_turn(&mut turn, &[], "sess", ReplayQuarantine::Volatile);
+        match &turn {
+            Turn::Tool(t) => {
+                assert!(
+                    t.assistant.text.contains("LCM active replay placeholder"),
+                    "volatile quarantine swaps in the on-disk-free placeholder: {}",
+                    t.assistant.text
+                );
+                assert!(!t.assistant.text.contains("loop loop loop loop"));
+                // Tool-call structure is preserved verbatim.
+                assert_eq!(t.calls.len(), 1);
+                assert_eq!(t.calls[0].0.call_id, "call_loop");
+                assert_eq!(t.calls[0].0.args, "{}");
+                assert_eq!(t.calls[0].1.content, "tool result");
+            }
+            _ => panic!("expected tool turn"),
+        }
+    }
+
+    // PARITY: hermes-lcm tests/test_ingest_protection.py::test_quarantined_assistant_output_does_not_enter_summaries_or_active_context
+    // The spill variant quarantines the runaway body behind an externalized placeholder that stays
+    // recoverable, so a durable session keeps the content lossless while never replaying the runaway.
+    #[test]
+    fn replay_quarantines_runaway_assistant_spill_is_recoverable() {
+        let dir = std::env::temp_dir().join(format!("lcm-replay-spill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let body = "loop loop loop loop\n".repeat(6000);
+        let mut turn = Turn::Assistant(AssistantMsg::text(body.clone()));
+        sanitize_replay_turn(
+            &mut turn,
+            &[],
+            "sess",
+            ReplayQuarantine::Spill(dir.as_path()),
+        );
+        match &turn {
+            Turn::Assistant(a) => {
+                assert!(a.text.contains("Externalized quarantined assistant output"));
+                assert!(!a.text.contains("loop loop loop loop"));
+                let reference = crate::externalize::extract_ref(&a.text).unwrap();
+                assert_eq!(
+                    crate::externalize::read_externalized(dir.as_path(), &reference).unwrap(),
+                    body,
+                    "spilled quarantine payload is recoverable"
+                );
+            }
+            _ => panic!("expected assistant turn"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -19,6 +19,9 @@
 //! 3. **No empties**: a plain `user`/`assistant` message with blank content and no tool calls is
 //!    dropped, and an empty tool-result body is coerced to a placeholder (providers reject empty
 //!    content blocks).
+//! 4. **User merge**: two consecutive plain-text `user` messages are merged (`\n\n`-joined) so no
+//!    user input is lost and role alternation holds; a multimodal user (non-empty `images`) is
+//!    never merged (mirrors hermes `repair_message_sequence` pass 2).
 //!
 //! It is a no-op for a well-formed sequence (the common case), so it never perturbs the normal path.
 
@@ -86,7 +89,25 @@ pub fn repair_message_sequence(mut messages: Vec<RequestMsg>) -> Vec<RequestMsg>
         } else if role == "assistant" || role == "user" {
             // (3) Drop empty plain messages; keep anything with content.
             if !messages[i].content.trim().is_empty() {
-                out.push(messages[i].clone());
+                // (4) Merge consecutive plain-text user messages (hermes `repair_message_sequence`
+                //     pass 2), so no user input is lost. Multimodal users (non-empty `images`) are
+                //     left as distinct messages — collapsing them risks mangling attachments.
+                let merge_into_prev = role == "user"
+                    && messages[i].images.is_empty()
+                    && out
+                        .last()
+                        .is_some_and(|l| l.role == "user" && l.images.is_empty());
+                if merge_into_prev {
+                    let cur = messages[i].content.clone();
+                    let prev = out.last_mut().expect("checked by merge_into_prev");
+                    prev.content = if prev.content.is_empty() {
+                        cur
+                    } else {
+                        format!("{}\n\n{}", prev.content, cur)
+                    };
+                } else {
+                    out.push(messages[i].clone());
+                }
             }
             i += 1;
         } else {
@@ -102,21 +123,21 @@ mod tests {
     use super::*;
     use crate::conversation::ToolCall;
 
-    fn user(text: &str) -> RequestMsg {
+    pub(super) fn user(text: &str) -> RequestMsg {
         RequestMsg {
             role: "user".into(),
             content: text.into(),
             ..Default::default()
         }
     }
-    fn assistant(text: &str) -> RequestMsg {
+    pub(super) fn assistant(text: &str) -> RequestMsg {
         RequestMsg {
             role: "assistant".into(),
             content: text.into(),
             ..Default::default()
         }
     }
-    fn assistant_calls(text: &str, ids: &[&str]) -> RequestMsg {
+    pub(super) fn assistant_calls(text: &str, ids: &[&str]) -> RequestMsg {
         RequestMsg {
             role: "assistant".into(),
             content: text.into(),
@@ -131,7 +152,7 @@ mod tests {
             ..Default::default()
         }
     }
-    fn tool(id: &str, content: &str) -> RequestMsg {
+    pub(super) fn tool(id: &str, content: &str) -> RequestMsg {
         RequestMsg {
             role: "tool".into(),
             content: content.into(),
@@ -208,4 +229,113 @@ mod tests {
         assert_eq!(out.iter().filter(|m| m.role == "tool").count(), 1);
         assert_eq!(out[2].content, "first");
     }
+}
+
+/// Parity tests ported from hermes' `repair_message_sequence`
+/// (`agent/agent_runtime_helpers.py:347`; tests
+/// `tests/run_agent/test_message_sequence_repair.py`). The Python pass drops stray tool results
+/// (already handled by the Rust port) and merges consecutive `user` messages (the gap).
+///
+/// Adaptation: hermes represents multimodal user content as a *list* and skips merging when a side
+/// is a list; the Rust `RequestMsg` carries text in `content` and images in `images`, so the Rust
+/// port skips merging when either side has non-empty `images`. hermes returns a repair count; the
+/// Rust port returns the repaired `Vec`, so parity is asserted on the resulting messages.
+///
+/// Consecutive-user merging is now ported, so these all pass; each asserts the behavior of the
+/// corresponding Python test case.
+#[cfg(test)]
+mod parity {
+    use super::tests::{assistant, assistant_calls, tool, user};
+    use super::*;
+    use crate::provider::RequestImage;
+
+    fn user_multimodal(text: &str) -> RequestMsg {
+        RequestMsg {
+            role: "user".into(),
+            content: text.into(),
+            images: vec![RequestImage {
+                mime: "image/png".into(),
+                data_base64: "AAAA".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    // ── Consecutive-user merge (gap) ──────────────────────────────────────
+
+    // parity: test_message_sequence_repair.py::test_repair_merges_consecutive_user_messages (tests/run_agent/test_message_sequence_repair.py:81)
+    #[test]
+    fn merges_consecutive_user_messages() {
+        let out = repair_message_sequence(vec![user("first"), user("second")]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, "user");
+        assert_eq!(out[0].content, "first\n\nsecond");
+    }
+
+    // ── Behavior the Rust port already has (must PASS) ────────────────────
+
+    // parity: test_message_sequence_repair.py::test_repair_preserves_user_content_when_one_side_empty (tests/run_agent/test_message_sequence_repair.py:96)
+    #[test]
+    fn preserves_user_content_when_one_side_empty() {
+        let out = repair_message_sequence(vec![user(""), user("real message")]);
+        assert_eq!(out, vec![user("real message")]);
+    }
+
+    // parity: test_message_sequence_repair.py::test_repair_preserves_multimodal_user_content (tests/run_agent/test_message_sequence_repair.py:165)
+    #[test]
+    fn preserves_multimodal_user_content() {
+        // A user message with images must NOT be merged into an adjacent user message.
+        let out = repair_message_sequence(vec![user_multimodal("hi"), user("follow-up")]);
+        assert_eq!(out.len(), 2);
+        assert!(!out[0].images.is_empty());
+    }
+
+    // parity: test_message_sequence_repair.py::test_repair_does_not_rewind_ongoing_dialog_tool_pair (tests/run_agent/test_message_sequence_repair.py:108)
+    #[test]
+    fn does_not_rewind_ongoing_dialog_tool_pair() {
+        // assistant(tool_calls) + tool + user is a VALID pattern (user redirect before the model's
+        // continuation turn); repair must leave it untouched.
+        let input = vec![
+            user("Q1"),
+            assistant_calls("", &["t1"]),
+            tool("t1", "out"),
+            user("Q2"),
+        ];
+        assert_eq!(repair_message_sequence(input.clone()), input);
+    }
+
+    // parity: test_message_sequence_repair.py::test_repair_drops_stray_tool_with_unknown_tool_call_id (tests/run_agent/test_message_sequence_repair.py:131)
+    #[test]
+    fn drops_stray_tool_with_unknown_tool_call_id() {
+        let out = repair_message_sequence(vec![
+            user("hi"),
+            assistant("hello"),
+            tool("orphan", "stray"),
+            user("real"),
+        ]);
+        assert!(out.iter().all(|m| m.role != "tool"));
+    }
+
+    // parity: test_message_sequence_repair.py::test_repair_leaves_valid_conversation_unchanged (tests/run_agent/test_message_sequence_repair.py:146)
+    #[test]
+    fn leaves_valid_conversation_unchanged() {
+        let input = vec![
+            user("list files"),
+            assistant_calls("", &["t1"]),
+            tool("t1", "a.txt b.txt"),
+            assistant("Found 2 files"),
+            user("more"),
+        ];
+        assert_eq!(repair_message_sequence(input.clone()), input);
+    }
+
+    // parity: test_message_sequence_repair.py::test_repair_empty_messages_returns_zero (tests/run_agent/test_message_sequence_repair.py:181)
+    #[test]
+    fn empty_messages_is_noop() {
+        assert_eq!(repair_message_sequence(vec![]), vec![]);
+    }
+
+    // NOTE: test_repair_preserves_system_messages is out-of-scope — in the Rust engine the system
+    // prompt is a separate wire field, not part of this flattened message sequence, so the leading
+    // non-`user` trim intentionally drops a leading `system` message (see PARITY.md).
 }

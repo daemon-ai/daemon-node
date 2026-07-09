@@ -263,6 +263,18 @@ pub fn load_payload(dir: &Path, reference: &str) -> Option<serde_json::Value> {
     Some(summary)
 }
 
+/// Whether a payload record's `kind` is a §8.2 ingest spill. Python writes every ingest spill
+/// record with the umbrella kind `ingest_payload`; the Rust `store_payload` records keep the
+/// family (`data_uri` / `base64_run` / `payload`) instead, so restoration accepts the union.
+/// Quarantine and tool-result/GC spills stay excluded (they are recovery surfaces, not identity
+/// content).
+fn is_ingest_spill_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ingest_payload" | "data_uri" | "base64_run" | "payload"
+    )
+}
+
 /// Replace §8.2 ingest placeholders with their stored payload content, for identity matching only
 /// (`restore_ingest_payload_placeholders`, `LCM:ingest_protection.py:496-522`). A missing,
 /// non-ingest, or session-mismatched payload leaves the placeholder untouched so callers never
@@ -277,7 +289,8 @@ pub fn restore_ingest_placeholders(dir: &Path, text: &str, session_id: &str) -> 
             let Some(payload) = load_payload(dir, reference) else {
                 return caps[0].to_string();
             };
-            if payload.get("kind").and_then(|k| k.as_str()) != Some("ingest_payload") {
+            let kind = payload.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+            if !is_ingest_spill_kind(kind) {
                 return caps[0].to_string();
             }
             let payload_session = payload

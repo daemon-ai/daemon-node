@@ -1472,4 +1472,173 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rank, -1.0);
     }
+
+    // ---- Wave 2 theme 1: search ranking at scale (role bias, batch caps, limit stability) -----
+
+    /// Append one message with an explicit timestamp; returns its store_id.
+    fn append_one(store: &Store, session: &str, role: &str, content: &str, ts: f64) -> i64 {
+        store
+            .append_batch(
+                session,
+                &[NewMessage {
+                    role: role.into(),
+                    content: Some(content.into()),
+                    ..Default::default()
+                }],
+                ts,
+            )
+            .unwrap()[0]
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_core.py::test_search_relevance_prefers_user_over_newer_assistant_on_similar_match
+    #[test]
+    fn relevance_prefers_user_over_newer_assistant_on_similar_match() {
+        let store = Store::open_in_memory().unwrap();
+        // The user hit is older; the assistant hit is newer with identical content.
+        let user_id = append_one(
+            &store,
+            "sess1",
+            "user",
+            "vendoring should stay external plugin host support only",
+            1.0,
+        );
+        let assistant_id = append_one(
+            &store,
+            "sess1",
+            "assistant",
+            "vendoring should stay external plugin host support only",
+            2.0,
+        );
+        let filter = MessageFilter {
+            session: Some("sess1"),
+            ..Default::default()
+        };
+        let results =
+            search_messages(&store, "vendoring", SortMode::Relevance, &filter, 2).unwrap();
+        assert_eq!(results[0].row.store_id, user_id);
+        assert_eq!(results[1].row.store_id, assistant_id);
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_core.py::test_search_relevance_does_not_let_weaker_user_hit_beat_stronger_assistant_hit
+    #[test]
+    fn relevance_does_not_let_weaker_user_hit_beat_stronger_assistant_hit() {
+        let store = Store::open_in_memory().unwrap();
+        let weaker_user_id = append_one(
+            &store,
+            "sess1",
+            "user",
+            "vendoring blah blah external blah host",
+            1.0,
+        );
+        let stronger_assistant_id =
+            append_one(&store, "sess1", "assistant", "vendoring external host", 2.0);
+        let filter = MessageFilter {
+            session: Some("sess1"),
+            ..Default::default()
+        };
+        let results = search_messages(
+            &store,
+            "vendoring external host",
+            SortMode::Relevance,
+            &filter,
+            2,
+        )
+        .unwrap();
+        assert_eq!(results[0].row.store_id, stronger_assistant_id);
+        assert_eq!(results[1].row.store_id, weaker_user_id);
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_core.py::test_search_relevance_still_surfaces_preferred_user_hit_from_large_same_rank_pool
+    #[test]
+    fn relevance_surfaces_preferred_user_hit_from_large_same_rank_pool() {
+        let store = Store::open_in_memory().unwrap();
+        let preferred_user_id = append_one(&store, "sess1", "user", "vendoring", 1.0);
+        for _ in 0..150 {
+            append_one(&store, "sess1", "assistant", "vendoring", 2.0);
+        }
+        let filter = MessageFilter {
+            session: Some("sess1"),
+            ..Default::default()
+        };
+        let results =
+            search_messages(&store, "vendoring", SortMode::Relevance, &filter, 5).unwrap();
+        assert_eq!(results[0].row.store_id, preferred_user_id);
+        assert_eq!(results[0].row.role, "user");
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_core.py::test_search_relevance_top_results_do_not_change_when_limit_increases_on_large_single_term_pool
+    #[test]
+    fn relevance_top_results_stable_when_limit_increases_on_large_pool() {
+        let store = Store::open_in_memory().unwrap();
+        append_one(&store, "sess1", "user", "vendoring", 1.0);
+        let mut batch: Vec<NewMessage> = Vec::new();
+        for idx in 0..250 {
+            let (role, content) = if idx % 5 == 0 {
+                ("tool", "{\"vendoring\":\"vendoring vendoring vendoring\"}")
+            } else {
+                (
+                    "assistant",
+                    "vendoring vendoring vendoring vendoring vendoring spam",
+                )
+            };
+            batch.push(NewMessage {
+                role: role.into(),
+                content: Some(content.into()),
+                ..Default::default()
+            });
+        }
+        store.append_batch("sess1", &batch, 2.0).unwrap();
+        let filter = MessageFilter {
+            session: Some("sess1"),
+            ..Default::default()
+        };
+        let top_5: Vec<i64> = search_messages(&store, "vendoring", SortMode::Relevance, &filter, 5)
+            .unwrap()
+            .iter()
+            .map(|r| r.row.store_id)
+            .collect();
+        let top_50: Vec<i64> =
+            search_messages(&store, "vendoring", SortMode::Relevance, &filter, 50)
+                .unwrap()
+                .iter()
+                .take(5)
+                .map(|r| r.row.store_id)
+                .collect();
+        assert_eq!(top_5, top_50);
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_core.py::test_search_recency_same_timestamp_pool_is_limit_stable
+    #[test]
+    fn recency_same_timestamp_pool_is_limit_stable() {
+        let store = Store::open_in_memory().unwrap();
+        let mut batch: Vec<NewMessage> = Vec::new();
+        for idx in 0..120 {
+            batch.push(NewMessage {
+                role: "assistant".into(),
+                content: Some(format!(
+                    "alpha alpha alpha beta beta gamma gamma gamma spam {idx}"
+                )),
+                ..Default::default()
+            });
+        }
+        batch.push(NewMessage {
+            role: "assistant".into(),
+            content: Some("keep alpha beta gamma concise".into()),
+            ..Default::default()
+        });
+        // A single batch timestamp reproduces the Python same-timestamp pool.
+        store.append_batch("sess1", &batch, 500.0).unwrap();
+        let filter = MessageFilter {
+            session: Some("sess1"),
+            ..Default::default()
+        };
+        let short =
+            search_messages(&store, "alpha beta gamma", SortMode::Recency, &filter, 5).unwrap();
+        let long =
+            search_messages(&store, "alpha beta gamma", SortMode::Recency, &filter, 200).unwrap();
+        assert!(short.iter().all(|r| r.row.timestamp == 500.0));
+        let short_ids: Vec<i64> = short.iter().map(|r| r.row.store_id).collect();
+        let long_ids: Vec<i64> = long.iter().take(5).map(|r| r.row.store_id).collect();
+        assert_eq!(short_ids, long_ids);
+    }
 }

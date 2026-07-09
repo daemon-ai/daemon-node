@@ -39,9 +39,13 @@ impl Engine {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Resolve a recorded conflict (`veracity_consolidation.py` resolution path). On a confirmed
-    /// conflict the older fact is marked `superseded_by` the newer one; either way the `conflicts`
-    /// row is stamped with the LLM resolution + timestamp so it is not re-validated.
+    /// Resolve a recorded conflict (`veracity_consolidation.py` `resolve_conflict`, hardened per
+    /// E2.a.6). On a confirmed conflict the loser fact is marked `superseded_by` the winner;
+    /// either way the `conflicts` row is stamped with the LLM resolution + timestamp so it is not
+    /// re-validated. First-writer-wins: an already-resolved conflict is never re-resolved (two
+    /// competing resolutions would otherwise leave BOTH facts superseded), and winner/loser must
+    /// be exactly the conflict's fact pair (a foreign id must not silently supersede anything).
+    /// The read-decide-write sequence runs under [`veracity::serialized_write`].
     pub fn resolve_conflict(
         &self,
         conflict_id: i64,
@@ -49,24 +53,59 @@ impl Engine {
         winner_fact_id: &str,
         loser_fact_id: &str,
     ) -> Result<()> {
+        use rusqlite::OptionalExtension;
         let conn = self.store.conn.lock().unwrap();
-        let now = util::now_iso();
-        if confirmed {
+        veracity::serialized_write(&conn, |conn| {
+            let row: Option<(String, String, Option<String>)> = conn
+                .query_row(
+                    "SELECT fact_a_id, fact_b_id, resolution FROM conflicts WHERE id = ?1",
+                    params![conflict_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((fact_a, fact_b, resolution)) = row else {
+                tracing::warn!(
+                    conflict_id,
+                    "resolve_conflict: unknown conflict id; skipping"
+                );
+                return Ok(());
+            };
+            if resolution.is_some() {
+                tracing::warn!(
+                    conflict_id,
+                    "resolve_conflict: conflict already resolved; keeping the first resolution"
+                );
+                return Ok(());
+            }
+            let pair_matches = (winner_fact_id == fact_a && loser_fact_id == fact_b)
+                || (winner_fact_id == fact_b && loser_fact_id == fact_a);
+            if confirmed && !pair_matches {
+                tracing::warn!(
+                    conflict_id,
+                    winner_fact_id,
+                    loser_fact_id,
+                    "resolve_conflict: ids do not match the conflict's fact pair; refusing"
+                );
+                return Ok(());
+            }
+            let now = util::now_iso();
+            if confirmed {
+                conn.execute(
+                    "UPDATE consolidated_facts SET superseded_by = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![winner_fact_id, now, loser_fact_id],
+                )?;
+            }
+            let resolution = if confirmed {
+                "llm_confirmed"
+            } else {
+                "llm_rejected"
+            };
             conn.execute(
-                "UPDATE consolidated_facts SET superseded_by = ?1, updated_at = ?2 WHERE id = ?3",
-                params![winner_fact_id, now, loser_fact_id],
+                "UPDATE conflicts SET resolution = ?1, resolved_at = ?2 WHERE id = ?3",
+                params![resolution, now, conflict_id],
             )?;
-        }
-        let resolution = if confirmed {
-            "llm_confirmed"
-        } else {
-            "llm_rejected"
-        };
-        conn.execute(
-            "UPDATE conflicts SET resolution = ?1, resolved_at = ?2 WHERE id = ?3",
-            params![resolution, now, conflict_id],
-        )?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Promote unconsolidated working-memory rows into the episodic tier (a minimal slice of

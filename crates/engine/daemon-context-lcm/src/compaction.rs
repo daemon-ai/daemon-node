@@ -102,6 +102,10 @@ pub(crate) struct CompactionOutcome {
     pub index: Vec<Vec<i64>>,
     /// What this call did (drives `lcm_status`'s `last_compression_*` fields).
     pub status: CompressionStatus,
+    /// The cache-friendly condensation suppression reason for this pass
+    /// (`_last_condensation_suppressed_reason` — empty when condensation ran, was not gated, or
+    /// was never reached).
+    pub condensation_suppressed: &'static str,
 }
 
 /// Run one compaction call (`compress`, `LCM:engine.py:851-1160`): up to `max_leaf_passes` leaf
@@ -139,6 +143,7 @@ pub(crate) async fn run_compaction(
         conv: Conversation { system, turns },
         index,
         status: CompressionStatus::Noop(reason.to_string()),
+        condensation_suppressed: "",
     };
     if turns.is_empty() {
         return noop(system, turns, index, "empty message list");
@@ -181,6 +186,13 @@ pub(crate) async fn run_compaction(
     // Auto-derive the focus topic from recent real user turns (`_derive_auto_focus_topic`,
     // `LCM:engine.py:4340-4399`) so summarization prioritizes current user intent.
     let focus_topic = derive_auto_focus_topic(&turns, cfg).unwrap_or_default();
+
+    // The preserved-objective anchor search runs over the PRE-drain conversation (Python captures
+    // `anchor_source_messages = list(working_messages)` before compaction, `LCM:engine.py:905`):
+    // the newest real user turn is usually inside the chunk being summarized, so searching the
+    // drained working view would never find it.
+    let anchor_source: Vec<Turn> = turns.clone();
+    let anchor_fresh_tail_start = turns.len().saturating_sub(cfg.fresh_tail_count);
 
     let overflow_deficit = used_tokens.saturating_sub(budget);
     let mut estimated_active_tokens = used_tokens;
@@ -437,6 +449,7 @@ pub(crate) async fn run_compaction(
                 },
                 index: new_index,
                 status,
+                condensation_suppressed: "",
             };
         }
         return noop(system, turns, index, noop_reason);
@@ -445,7 +458,7 @@ pub(crate) async fn run_compaction(
     // Condensation: climb depths while a level has >= fanin uncondensed siblings (§6.6), carrying
     // the same focus topic + custom instructions into the condensation prompts, subject to the
     // opt-in cache-friendly follow-on gate.
-    condense(
+    let condensation_suppressed = condense(
         store,
         tok,
         cfg,
@@ -463,12 +476,12 @@ pub(crate) async fn run_compaction(
     .await;
 
     // Preserve the newest real user objective that fell outside the tail as a scaffold section
-    // (`_latest_user_context_anchor`, `LCM:engine.py:3978-4015`).
-    let fresh_tail_start = turns.len().saturating_sub(cfg.fresh_tail_count);
+    // (`_latest_user_context_anchor`, `LCM:engine.py:3978-4015`), searching the pre-drain
+    // snapshot so an objective inside the summarized chunk is still anchored.
     let ext_dir = cfg.externalization_dir();
     let objective = latest_user_context_anchor(
-        &turns,
-        fresh_tail_start,
+        &anchor_source,
+        anchor_fresh_tail_start,
         cfg,
         session_id,
         ext_dir.as_deref(),
@@ -505,6 +518,7 @@ pub(crate) async fn run_compaction(
         },
         index: new_index,
         status: CompressionStatus::Compacted,
+        condensation_suppressed,
     }
 }
 
@@ -923,6 +937,10 @@ impl CondensationGate {
 /// still condense). In cache-friendly mode a follow-on condensation right after a leaf pass needs
 /// `fanin * cache_friendly_min_debt_groups` accumulated siblings, and at most one group condenses
 /// per call.
+///
+/// Returns the cache-friendly suppression reason when the gate suppressed every eligible group and
+/// nothing condensed (`_last_condensation_suppressed_reason`, `LCM:engine.py:3933-3934`); empty
+/// otherwise.
 #[allow(clippy::too_many_arguments)]
 async fn condense(
     store: &Store,
@@ -934,12 +952,14 @@ async fn condense(
     focus_topic: &str,
     gate: CondensationGate,
     now: f64,
-) {
+) -> &'static str {
+    let mut condensed_any = false;
+    let mut suppression_reason: &'static str = "";
     let fanin = cfg.condensation_fanin.max(1);
     // `incremental_max_depth`: 0 disables condensation; -1 (unlimited) derives the upper bound
     // from the deepest existing node + 1 so condensation can always create the next depth.
     let upper = match cfg.incremental_max_depth {
-        0 => return,
+        0 => return "",
         d if d < 0 => store.max_depth(session_id).unwrap_or(-1).max(0) + 1,
         d => d,
     };
@@ -957,6 +977,7 @@ async fn condense(
             continue;
         }
         if let Err(reason) = gate.allows(cfg, uncondensed.len()) {
+            suppression_reason = reason;
             tracing::debug!(
                 depth,
                 uncondensed = uncondensed.len(),
@@ -1018,11 +1039,18 @@ async fn condense(
             tracing::warn!(error = %e, depth, "lcm: failed to persist condensation node");
             break;
         }
+        condensed_any = true;
         // Cache-friendly mode condenses at most one group per compress call
         // (`LCM:engine.py:3929-3930`) — the next group waits for a later turn.
         if gate.leaf_compacted_this_turn && cfg.cache_friendly_condensation_enabled {
             break;
         }
+    }
+    // Only a fully suppressed pass reports the reason (`LCM:engine.py:3933-3934`).
+    if !condensed_any && gate.leaf_compacted_this_turn && cfg.cache_friendly_condensation_enabled {
+        suppression_reason
+    } else {
+        ""
     }
 }
 
@@ -1229,6 +1257,27 @@ mod tests {
         assert!((5..8).contains(&after_75), "75% target shrank: {after_75}");
         // A single-turn chunk cannot shrink.
         assert_eq!(next_leaf_rescue_chunk_len(&region, 1, 100, &tok, &c), 0);
+    }
+
+    // PARITY: hermes-lcm tests/test_auto_focus_topic.py::test_multimodal_content
+    // Multimodal user content (a list of typed parts) is flattened to its text via the §8.4
+    // `text_content_for_pattern_matching` seam before the engine sees it, so auto-focus still
+    // derives a topic from the text part.
+    #[test]
+    fn auto_focus_handles_multimodal_content_parts() {
+        let multimodal = serde_json::json!([{"type": "text", "text": "How does this image look?"}]);
+        let flattened = crate::protection::text_content_for_pattern_matching(&multimodal);
+        assert!(
+            flattened.contains("image"),
+            "text part extracted: {flattened}"
+        );
+
+        let turns = vec![user("Look at this image"), user(&flattened)];
+        let focus = derive_auto_focus_topic(&turns, &cfg()).unwrap();
+        assert!(
+            focus.contains("image"),
+            "focus derived from multimodal text: {focus}"
+        );
     }
 
     #[test]
@@ -1534,6 +1583,67 @@ mod tests {
             Some(tok.count_turn(&tail[0]) + 1),
         );
         assert_eq!(out, tail);
+    }
+
+    // PARITY: hermes-lcm tests/test_lcm_core.py::test_assembly_skips_oversized_assistant_turn_to_preserve_user_prompt
+    // The newest user objective is preserved into the summary turn (never re-emitted as a raw user
+    // row), an oversized assistant turn is dropped, and the latest compact status survives — the
+    // assembled context degrades gracefully under the cap instead of overflowing.
+    #[test]
+    fn capped_assembly_preserves_objective_and_drops_oversized_assistant() {
+        let store = Store::open_in_memory().unwrap();
+        let tok = Tokenizer::heuristic();
+        let system = daemon_core::SystemPrompt::new("");
+        let objective = "KEEP_USER_DECISION: continue with prompt-aware assembly.".to_string();
+        let oversized = assistant(&"oversized assistant tool chatter ".repeat(400));
+        let status = assistant("Latest compact status.");
+
+        // A cap that fits the preserved-objective summary turn plus the tiny status tail, but not
+        // the oversized assistant chatter.
+        let obj_summary_tokens = tok
+            .count_text(&summary_turn_body(std::slice::from_ref(&objective)))
+            + crate::tokens::PER_MESSAGE_OVERHEAD;
+        let cap = obj_summary_tokens + tok.count_turn(&status) + 4;
+
+        let (out, index) = assemble_capped(
+            &store,
+            &tok,
+            "s1",
+            &system,
+            Some(objective.clone()),
+            vec![oversized, status.clone()],
+            vec![Vec::new(); 2],
+            Some(cap),
+        );
+
+        // The oversized chatter never appears; the newest status survives.
+        let contents: String = out
+            .iter()
+            .map(|t| match t {
+                Turn::User(u) => u.text.clone(),
+                Turn::Assistant(a) => a.text.clone(),
+                Turn::Tool(tt) => tt.assistant.text.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            contents.contains("KEEP_USER_DECISION"),
+            "objective preserved"
+        );
+        assert!(
+            contents.contains("Latest compact status"),
+            "latest status kept"
+        );
+        assert!(
+            !contents.contains("oversized assistant tool chatter"),
+            "oversized turn dropped"
+        );
+        // The objective is folded into the summary turn — not re-emitted as a raw user row.
+        assert!(
+            !out.iter().any(|t| matches!(t, Turn::User(_))),
+            "objective is not a raw user turn"
+        );
+        assert_eq!(out.len(), index.len());
     }
 
     #[test]

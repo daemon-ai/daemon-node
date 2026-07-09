@@ -1238,6 +1238,50 @@ async fn steer_drained_appends_marker_and_acks() {
         .any(|t| matches!(t, Turn::User(u) if u.text.contains("[steer] focus"))));
 }
 
+// parity: test_steer.py::TestSteerClearedOnInterrupt::test_clear_interrupt_drops_pending_steer (tests/run_agent/test_steer.py:185)
+//
+// Hermes `clear_interrupt()` drops `_pending_steer`: "a hard interrupt supersedes any pending
+// steer — the agent's next tool iteration won't happen, so delivering the steer later would be
+// surprising." Ported to the engine's phase boundary: a steer queued while the turn is cancelling
+// must be dropped (not appended as a durable `[steer]` marker the interrupted turn will never act
+// on) and acked as *not* accepted so the client learns it was superseded.
+#[tokio::test]
+async fn interrupt_supersedes_pending_steer() {
+    let mut engine = completing_engine("steer-interrupt");
+    engine.push_user(UserMsg::new("hi"));
+    let control = TurnControl::new();
+    control.push_steer(SteerReq {
+        request_id: ReqId(9),
+        text: "focus".into(),
+    });
+    control.cancel();
+    let (sink, log) = collecting();
+
+    let outcome = engine.run_turn(&NoopHost, &sink, &control).await.unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Interrupted),
+        _ => panic!("expected an interrupted outcome"),
+    }
+    // The queued steer must NOT have been appended to the durable conversation.
+    assert!(
+        !engine
+            .snapshot()
+            .conversation
+            .turns
+            .iter()
+            .any(|t| matches!(t, Turn::User(u) if u.text.contains("[steer]"))),
+        "an interrupt must supersede (drop) a pending steer, not append it as a durable marker"
+    );
+    // It is acked as not-accepted so the client knows the steer was dropped by the interrupt.
+    assert!(
+        log.lock().unwrap().iter().any(|e| matches!(
+            e,
+            AgentEvent::Steered { request_id, accepted, .. } if *request_id == ReqId(9) && !*accepted
+        )),
+        "the superseded steer is acked with accepted=false"
+    );
+}
+
 // --- ReAct loop (§4.2) ---
 
 use crate::conversation::ToolCall;
@@ -1293,15 +1337,49 @@ async fn multi_round_loop_runs_tools_then_completes() {
     assert_eq!(tool_turns, 2);
 }
 
+// parity: test_agent_guardrails.py::TestDeduplicateToolCalls::test_duplicate_pair_deduplicated (tests/run_agent/test_agent_guardrails.py:177)
+//
+// Ports hermes' `_deduplicate_tool_calls` (run_agent.py:3395), applied at the decode/dispatch
+// boundary (agent/conversation_loop.py:3866): duplicate (name, args) tool calls within one
+// assistant message collapse to the first occurrence, so an identical parallel call runs once.
+/// Two identical (name, args) tool calls in one assistant message are deduplicated — the tool runs
+/// exactly once, not once per duplicate.
+#[tokio::test]
+async fn deduplicates_identical_parallel_tool_calls() {
+    let runs = Arc::new(AtomicU64::new(0));
+    let provider = Arc::new(ScriptedProvider::new(
+        vec![ScriptStep::Calls(vec![
+            ("counter".into(), "{}".into()),
+            ("counter".into(), "{}".into()),
+        ])],
+        "done",
+    ));
+    let mut engine = looping_engine(provider, runs.clone(), 8);
+    engine.push_user(UserMsg::new("go"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, TurnOutcome::Completed(_)));
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        1,
+        "identical parallel tool calls should be deduplicated to a single execution"
+    );
+}
+
 /// A batch of two `Parallel` tool calls runs concurrently: the peak observed in-flight count is 2.
 #[tokio::test]
 async fn parallel_tool_batch_runs_concurrently() {
     let active = Arc::new(AtomicU64::new(0));
     let max_seen = Arc::new(AtomicU64::new(0));
+    // Distinct args so the §9 tool-call dedup does not collapse the pair — we are probing
+    // concurrency here, not deduplication.
     let provider = Arc::new(ScriptedProvider::new(
         vec![ScriptStep::Calls(vec![
-            ("para".into(), "{}".into()),
-            ("para".into(), "{}".into()),
+            ("para".into(), "{\"i\":0}".into()),
+            ("para".into(), "{\"i\":1}".into()),
         ])],
         "done",
     ));
@@ -1432,6 +1510,99 @@ async fn no_progress_guard_disabled_runs_to_iteration_budget() {
     assert_eq!(runs.load(Ordering::Relaxed), 4);
 }
 
+/// A tool that always fails (`ToolResult.ok == false`), counting its runs — drives the §12 tool-call
+/// guardrail's failure escalation end-to-end.
+struct FailingTool {
+    runs: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for FailingTool {
+    fn name(&self) -> &str {
+        "boom"
+    }
+    fn schema(&self) -> &str {
+        "{}"
+    }
+    async fn run(
+        &self,
+        call: &crate::conversation::ToolCall,
+        _cx: &crate::turn::TurnCx<'_>,
+    ) -> crate::tools::ToolOutcome {
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        crate::tools::ToolOutcome::text(call.call_id.clone(), false, "boom failed".to_string())
+    }
+}
+
+// parity: test_tool_call_guardrail_runtime.py::test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error (tests/run_agent/test_tool_call_guardrail_runtime.py:271)
+//
+// Ports the §12 guardrail escalation (hermes agent/tool_guardrails.py) end-to-end: with hard-stop
+// enabled, a tool that keeps failing with identical arguments is blocked once it crosses
+// `exact_failure_block_after`, ending the turn as a controlled `NoProgress` stop — not a top-level
+// error. The round-level no-progress guard is disabled so only the per-call guardrail can stop it.
+/// Guardrail hard-stop halts a repeated identical failure through a full `run_turn`.
+#[tokio::test]
+async fn guardrail_hard_stop_halts_repeated_failure_through_run_turn() {
+    let runs = Arc::new(AtomicU64::new(0));
+    let provider = looping_call_provider("boom");
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FailingTool { runs: runs.clone() }));
+    let mut engine =
+        test_engine("guard-halt", provider, registry).with_config(crate::config::Config {
+            max_iterations: 20,
+            max_repeated_rounds: 0,
+            guardrail: crate::config::GuardrailConfig {
+                hard_stop_enabled: true,
+                ..crate::config::GuardrailConfig::default()
+            },
+            ..crate::config::Config::default()
+        });
+    engine.push_user(UserMsg::new("keep failing"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::NoProgress),
+        _ => panic!("expected a controlled guardrail halt, not a top-level error"),
+    }
+    // Blocked at `exact_failure_block_after` (5): the tool ran 5 times; the 6th call was blocked.
+    assert_eq!(runs.load(Ordering::Relaxed), 5);
+}
+
+// parity: test_tool_call_guardrail_runtime.py::test_default_run_conversation_warns_without_guardrail_halt (tests/run_agent/test_tool_call_guardrail_runtime.py:241)
+//
+// The default (warnings on, hard-stop off) never blocks: the repeatedly-failing tool keeps running
+// to the iteration budget (warn guidance is appended to results, but execution is not stopped),
+// proving warn != halt. The round no-progress guard is disabled to isolate the guardrail axis.
+/// Warn-only guardrail (the default) does not halt execution through a full `run_turn`.
+#[tokio::test]
+async fn guardrail_warn_only_does_not_halt_through_run_turn() {
+    let runs = Arc::new(AtomicU64::new(0));
+    let provider = looping_call_provider("boom");
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FailingTool { runs: runs.clone() }));
+    let mut engine =
+        test_engine("guard-warn", provider, registry).with_config(crate::config::Config {
+            max_iterations: 4,
+            max_repeated_rounds: 0,
+            ..crate::config::Config::default()
+        });
+    engine.push_user(UserMsg::new("keep failing"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::BudgetExhausted),
+        _ => panic!("warn-only must not halt; expected budget exhaustion"),
+    }
+    // No hard stop: the tool ran on every one of the 4 budgeted rounds.
+    assert_eq!(runs.load(Ordering::Relaxed), 4);
+}
+
 /// Cancellation observed mid-loop (after a tool runs) finalizes the turn as `Interrupted` rather
 /// than looping back to the model.
 #[tokio::test]
@@ -1542,6 +1713,93 @@ async fn rate_limit_retries_with_backoff_then_completes() {
             .iter()
             .any(|e| matches!(e, AgentEvent::RateLimit { .. })),
         "a RateLimit event was emitted during backoff"
+    );
+}
+
+/// A provider that, on its first call, cancels the shared turn token (simulating a `/stop` that
+/// arrives while a transient stream error is being handled) and returns a retryable transport
+/// failure; any later call would succeed — but must never be reached once interrupted.
+struct CancelThenTransient {
+    cancel: CancellationToken,
+    calls: AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl Provider for CancelThenTransient {
+    fn capabilities(&self) -> Capabilities {
+        test_caps()
+    }
+    async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // /stop arrives while the transient error is being handled.
+            self.cancel.cancel();
+            Err(Failure::TransientTransport(
+                "connection reset by /stop".into(),
+            ))
+        } else {
+            Ok(ok_output("should never retry after an interrupt"))
+        }
+    }
+}
+
+// parity: test_stream_interrupt_retry.py::TestStreamInterruptBeforeRetry::test_interrupt_prevents_stream_retry (tests/run_agent/test_stream_interrupt_retry.py:45)
+//
+// Hermes' `_interruptible_streaming_api_call` checks `_interrupt_requested` at the TOP of its retry
+// loop, so a `/stop` that lands while a transient stream error is being handled aborts immediately
+// instead of opening a fresh connection (and burning retry-cycle × read-timeout latency). Ported to
+// the engine's §8 recovery loop (`call_model`): a cancellation observed between attempts aborts the
+// loop before it acquires a fresh credential or re-invokes the provider.
+#[tokio::test]
+async fn interrupt_aborts_model_retry_loop() {
+    use crate::credentials::CredentialProvider;
+    let control = TurnControl::new();
+    let creds = Arc::new(TwoProfileCreds {
+        acquired: std::sync::Mutex::new(Vec::new()),
+    });
+    let provider = Arc::new(CancelThenTransient {
+        cancel: control.cancel_token(),
+        calls: AtomicU64::new(0),
+    });
+    let mut engine = Engine::fresh(
+        SessionId::new("stream-int"),
+        SystemPrompt::new("test"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_credentials(
+        creds.clone() as Arc<dyn CredentialProvider>,
+        ProfileRef::new("primary"),
+    )
+    .with_config(Config {
+        // Tiny backoff so, without the fix, the doomed retry is reached fast (not a 2min sleep).
+        model_backoff_base_ms: 1,
+        model_backoff_max_ms: 2,
+        model_max_retries: 3,
+        ..Config::default()
+    });
+    engine.push_user(UserMsg::new("hello"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &control)
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Interrupted),
+        _ => panic!("an interrupt during a transient error must abort the retry loop"),
+    }
+    // The retry after the interrupt must do NO work: it must not acquire a fresh credential (the
+    // primary was acquired exactly once, for the first, failed attempt) …
+    assert_eq!(
+        creds.acquired.lock().unwrap().clone(),
+        vec!["primary".to_string()],
+        "the interrupted retry must not acquire a fresh credential"
+    );
+    // … and the provider is not re-invoked for a doomed fresh attempt.
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "the interrupted retry must not re-invoke the provider"
     );
 }
 

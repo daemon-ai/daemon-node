@@ -297,6 +297,184 @@ impl Engine {
         Ok(id)
     }
 
+    /// Batch insert into working memory for high-throughput ingestion (`beam.py` `remember_batch`
+    /// L3047-L3310). The bulk inserts commit in ONE transaction (Python's single post-loop
+    /// commit), then each row runs the same always-on enrichment pipeline `remember` runs —
+    /// temporal annotations, gist/fact graph ingestion weighted by the row's OWN veracity, the
+    /// MEMORIA regex pass, and a per-row `CREATE` event — with per-row failure isolation so one
+    /// bad row never poisons the rest of the batch (E2). Batch rows skip exact-content dedup and
+    /// land with the column-default `global` scope, exactly like Python's batch INSERT. Returns
+    /// the new ids in item order.
+    pub fn remember_batch(
+        &self,
+        items: &[BatchItem],
+        args: &RememberBatchArgs,
+    ) -> Result<Vec<String>> {
+        // Clamp the method-level default once, not per row (`beam.py` L3145-L3148).
+        let default_veracity = veracity::clamp_veracity(
+            args.veracity.as_deref().unwrap_or(""),
+            "remember_batch.default",
+        );
+        let trust_tier = if TRUST_TIERS.contains(&args.trust_tier.as_str()) {
+            args.trust_tier.as_str()
+        } else {
+            "IMPORTED"
+        };
+        let timestamp = util::now_iso();
+        struct RowMeta {
+            source: String,
+            veracity: String,
+            importance: f64,
+        }
+        let mut ids: Vec<String> = Vec::with_capacity(items.len());
+        let mut meta_by_id: std::collections::HashMap<String, RowMeta> =
+            std::collections::HashMap::new();
+
+        let conn = self.store.conn.lock().unwrap();
+        // ── Bulk insert, one transaction (`beam.py` L3149-L3212 + the single commit) ──
+        {
+            let tx = conn.unchecked_transaction()?;
+            for item in items {
+                let (content, blob_meta) =
+                    sanitize::sanitize_content(&item.content, &self.config.blob_dir());
+                let mut metadata = match &item.metadata {
+                    Some(serde_json::Value::Object(m)) => m.clone(),
+                    _ => serde_json::Map::new(),
+                };
+                if !blob_meta.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                    metadata.insert("_blob".to_string(), blob_meta);
+                }
+                let memory_id = util::generate_id(&content);
+                let memory_type = typed_memory::classify(&content).as_str();
+                // Per-item override semantics gated by force_veracity (`beam.py` L3170-L3190).
+                let item_veracity = if args.force_veracity {
+                    if item.veracity.is_some() {
+                        tracing::warn!(
+                            default = %default_veracity,
+                            "remember_batch: force_veracity=true; ignoring per-item veracity"
+                        );
+                    }
+                    default_veracity.clone()
+                } else if let Some(v) = &item.veracity {
+                    veracity::clamp_veracity(v, "remember_batch.per_item")
+                } else {
+                    default_veracity.clone()
+                };
+                let item_source = item
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| "conversation".to_string());
+                let importance = item.importance.unwrap_or(0.5);
+                tx.execute(
+                    "INSERT INTO working_memory \
+                     (id, content, source, timestamp, session_id, importance, metadata_json, \
+                      author_id, author_type, channel_id, memory_type, veracity, trust_tier) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        memory_id,
+                        content,
+                        item_source,
+                        timestamp,
+                        self.config.session_id,
+                        importance,
+                        serde_json::to_string(&serde_json::Value::Object(metadata))?,
+                        item.author_id
+                            .clone()
+                            .or_else(|| self.config.author_id.clone()),
+                        item.author_type
+                            .clone()
+                            .or_else(|| self.config.author_type.clone()),
+                        item.channel_id
+                            .clone()
+                            .or_else(|| self.config.channel_id.clone()),
+                        memory_type,
+                        item_veracity,
+                        trust_tier,
+                    ],
+                )?;
+                meta_by_id.insert(
+                    memory_id.clone(),
+                    RowMeta {
+                        source: item_source,
+                        veracity: item_veracity,
+                        importance,
+                    },
+                );
+                ids.push(memory_id);
+            }
+            tx.commit()?;
+        }
+
+        // ── Precomputed embeddings (`beam.py` L3213-L3252): storage failure must not break the
+        //    batch — the vector voice just misses these rows. ──
+        for (i, item) in items.iter().enumerate() {
+            if let Some(vector) = &item.vector {
+                if let Err(e) = self.store_embedding(&conn, &ids[i], vector, &args.model) {
+                    tracing::warn!(
+                        error = %e, id = %ids[i],
+                        "remember_batch: embedding storage failed (vector voice will miss this row)"
+                    );
+                }
+            }
+        }
+
+        // ── E2: per-row enrichment parity with `remember()` (`beam.py` L3254-L3307) ──
+        for id in &ids {
+            let enrich: Result<()> = (|| {
+                let Some(meta) = meta_by_id.get(id) else {
+                    return Ok(());
+                };
+                let row: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT content, timestamp FROM working_memory WHERE id = ?1",
+                        params![id],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((row_content, row_timestamp)) = row else {
+                    return Ok(());
+                };
+                self.add_temporal_triple(&conn, id, &row_timestamp, &meta.source);
+                self.ingest_graph_and_veracity(&conn, id, &row_content, &meta.veracity);
+                if args.extract_entities {
+                    self.extract_and_store_entities(&conn, id, &row_content);
+                }
+                // MEMORIA regex extraction for every batch row (`beam.py` L3290-L3293).
+                if let Err(e) =
+                    memoria::extract_and_store(&conn, &self.config.session_id, &row_content, 0, id)
+                {
+                    tracing::debug!(error = %e, "memoria extraction failed (non-fatal)");
+                }
+                // MEMORY_ADDED parity with `remember()` — streaming observers + the event log
+                // see batch rows the same way they see single-row writes (`beam.py` L3294-L3300;
+                // the port stamps the row's real importance where Python hardcodes 0.5).
+                self.emit_event(
+                    &conn,
+                    "CREATE",
+                    id,
+                    Some(&row_content),
+                    &meta.source,
+                    meta.importance,
+                );
+                Ok(())
+            })();
+            if let Err(e) = enrich {
+                tracing::warn!(error = %e, id, "remember_batch: per-row enrichment failed");
+            }
+        }
+
+        self.trim_working_memory(&conn)?;
+        if let Some(cache) = self.query_cache.get() {
+            cache.invalidate();
+        }
+        Ok(ids)
+    }
+
     /// Public exact-dedup probe for the tool layer (`__init__.py` `_handle_shared_remember` L1995
     /// checks for an existing row to report `existing_shared` vs `stored_shared`).
     pub fn find_existing(&self, content: &str) -> Result<Option<String>> {

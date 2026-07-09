@@ -343,14 +343,19 @@ fn tool_failure_recovery_hint(name: &str, count: u32) -> String {
 /// keys makes the hash order-insensitive regardless of any `serde_json` `preserve_order` feature
 /// unification in the workspace (hermes uses `sort_keys=True`).
 fn hash_canonical_json(raw: &str) -> u64 {
+    // The §9 repair pass now collapses unrepairable input to `{}` (hermes semantics for tool
+    // *arguments*). That is wrong for hashing arbitrary result *bodies* — two distinct non-JSON
+    // bodies ("v1"/"v2") must not both hash as `{}`. So only trust the canonical JSON form when the
+    // body genuinely is/repairs to JSON; otherwise hash the raw string.
+    let raw_is_json = serde_json::from_str::<serde_json::Value>(raw.trim()).is_ok();
     let repaired = repair_tool_args(raw).args;
     let canonical = match serde_json::from_str::<serde_json::Value>(&repaired) {
-        Ok(value) => {
+        Ok(value) if raw_is_json || repaired != "{}" => {
             let mut out = String::new();
             canonicalize(&value, &mut out);
             out
         }
-        Err(_) => repaired,
+        _ => raw.to_string(),
     };
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     canonical.hash(&mut hasher);

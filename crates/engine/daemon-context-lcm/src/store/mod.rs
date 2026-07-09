@@ -313,6 +313,30 @@ pub struct SourceStats {
     pub effective_unknown_messages: i64,
 }
 
+/// A per-session footprint row for the `/lcm doctor clean`/`retention` scans — the shared
+/// `_scan_clean_candidates` / `_scan_retention_candidates` CTE output (`LCM:command.py:200/285`).
+#[derive(Clone, Debug, Default)]
+pub struct SessionFootprint {
+    /// The session id (from `messages` ∪ `summary_nodes`).
+    pub session_id: String,
+    /// Stored message rows.
+    pub message_count: i64,
+    /// Sum of message `token_estimate`.
+    pub token_total: i64,
+    /// Stored summary nodes.
+    pub node_count: i64,
+    /// Sum of node `token_count`.
+    pub node_token_total: i64,
+    /// Oldest message timestamp.
+    pub first_message_at: Option<f64>,
+    /// Newest message timestamp.
+    pub last_message_at: Option<f64>,
+    /// Oldest node activity (earliest_at, else created_at).
+    pub first_node_at: Option<f64>,
+    /// Newest node activity (latest_at, else created_at).
+    pub last_node_at: Option<f64>,
+}
+
 /// Lifecycle/session fragmentation diagnostics (`lcm_doctor`'s `lifecycle_fragmentation`) — the
 /// in-database portion of `get_fragmentation_stats` (`LCM:lifecycle_state.py:337`). The external host
 /// `state_db` comparison is intentionally omitted (the daemon has no separate host sessions DB).
@@ -556,6 +580,25 @@ impl Store {
         }
         tx.commit()?;
         Ok(ids)
+    }
+
+    /// Test-only: insert a raw row with a legacy blank (`''`) `source`, bypassing the write-time
+    /// normalization in [`append_batch`], so the source-normalization doctor can be exercised.
+    #[cfg(test)]
+    pub(crate) fn insert_legacy_blank_source_row(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        conn.execute(
+            "INSERT INTO messages \
+             (session_id, source, role, content, timestamp, token_estimate) \
+             VALUES (?1, '', ?2, ?3, 1.0, 1)",
+            params![session_id, role, content],
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 
     /// Fetch a single message by `store_id`.
@@ -1659,6 +1702,232 @@ impl Store {
             legacy_blank_source_messages,
             effective_unknown_messages: normalized_unknown_messages + legacy_blank_source_messages,
         })
+    }
+
+    /// A dry-run plan for normalizing legacy NULL/blank `source` rows to the explicit `unknown`
+    /// bucket (`get_source_normalization_plan`, `LCM:store.py`). Returns
+    /// `(would_update_messages, affected_sessions, stats_before)`.
+    pub fn source_normalization_plan(&self) -> Result<(i64, i64, SourceStats)> {
+        let stats_before = self.source_stats(None)?;
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let blank = legacy_blank_source_clause("source");
+        let sql =
+            format!("SELECT COUNT(*), COUNT(DISTINCT session_id) FROM messages WHERE {blank}");
+        let (would_update, affected_sessions) =
+            conn.query_row(&sql, [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok((would_update, affected_sessions, stats_before))
+    }
+
+    /// Normalize legacy NULL/blank `source` rows to the explicit `unknown` bucket
+    /// (`normalize_legacy_blank_sources`, `LCM:store.py`). Returns
+    /// `(updated_messages, stats_before, stats_after)`.
+    pub fn normalize_legacy_blank_sources(&self) -> Result<(i64, SourceStats, SourceStats)> {
+        let stats_before = self.source_stats(None)?;
+        let blank = legacy_blank_source_clause("source");
+        let updated = {
+            let conn = self.conn.lock().expect("lcm store poisoned");
+            conn.execute(
+                &format!("UPDATE messages SET source = 'unknown' WHERE {blank}"),
+                [],
+            )? as i64
+        };
+        let stats_after = self.source_stats(None)?;
+        Ok((updated, stats_before, stats_after))
+    }
+
+    /// Per-session footprint stats for the `/lcm doctor clean`/`retention` scans (the shared
+    /// `_scan_clean_candidates` / `_scan_retention_candidates` CTE, `LCM:command.py:200/285`):
+    /// every session id present in `messages` or `summary_nodes`, with message/node counts, token
+    /// totals, and activity time bounds. `session_id` scopes the scan to one session (retention).
+    pub fn session_footprints(&self, session_id: Option<&str>) -> Result<Vec<SessionFootprint>> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let where_clause = if session_id.is_some() {
+            "WHERE s.session_id = ?1"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "WITH session_ids AS ( \
+                 SELECT session_id FROM messages \
+                 UNION \
+                 SELECT session_id FROM summary_nodes \
+             ), \
+             message_stats AS ( \
+                 SELECT session_id, COUNT(*) AS message_count, \
+                        COALESCE(SUM(token_estimate), 0) AS token_total, \
+                        MIN(timestamp) AS first_message_at, \
+                        MAX(timestamp) AS last_message_at \
+                 FROM messages GROUP BY session_id \
+             ), \
+             node_stats AS ( \
+                 SELECT session_id, COUNT(*) AS node_count, \
+                        COALESCE(SUM(token_count), 0) AS node_token_total, \
+                        MIN(COALESCE(earliest_at, created_at)) AS first_node_at, \
+                        MAX(COALESCE(latest_at, created_at)) AS last_node_at \
+                 FROM summary_nodes GROUP BY session_id \
+             ) \
+             SELECT s.session_id, \
+                    COALESCE(m.message_count, 0), COALESCE(m.token_total, 0), \
+                    COALESCE(n.node_count, 0), COALESCE(n.node_token_total, 0), \
+                    m.first_message_at, m.last_message_at, n.first_node_at, n.last_node_at \
+             FROM session_ids s \
+             LEFT JOIN message_stats m ON m.session_id = s.session_id \
+             LEFT JOIN node_stats n ON n.session_id = s.session_id \
+             {where_clause} \
+             ORDER BY s.session_id"
+        );
+        let map = |r: &Row<'_>| {
+            Ok(SessionFootprint {
+                session_id: r.get(0)?,
+                message_count: r.get(1)?,
+                token_total: r.get(2)?,
+                node_count: r.get(3)?,
+                node_token_total: r.get(4)?,
+                first_message_at: r.get(5)?,
+                last_message_at: r.get(6)?,
+                first_node_at: r.get(7)?,
+                last_node_at: r.get(8)?,
+            })
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = match session_id {
+            Some(sid) => stmt
+                .query_map([sid], map)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map([], map)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Delete cleanup-candidate sessions in ONE transaction (a port of
+    /// `_delete_clean_candidates_atomically`, `LCM:command.py:1293`): messages + summary nodes for
+    /// the candidate sessions, plus lifecycle rows whose session references are fully covered by
+    /// the candidate set. `protected` sessions are excluded from the candidate set, and a
+    /// lifecycle row referencing a protected or non-candidate session is skipped (counted).
+    /// Returns `(messages_deleted, nodes_deleted, lifecycle_deleted, lifecycle_skipped)`.
+    pub fn delete_sessions_atomically(
+        &self,
+        session_ids: &[String],
+        protected: &[String],
+    ) -> Result<(i64, i64, i64, i64)> {
+        let candidates: Vec<&String> = session_ids
+            .iter()
+            .filter(|s| !s.is_empty() && !protected.contains(s))
+            .collect();
+        if candidates.is_empty() {
+            return Ok((0, 0, 0, 0));
+        }
+        let mut conn = self.conn.lock().expect("lcm store poisoned");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let placeholders = candidates.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let params: Vec<&dyn rusqlite::ToSql> = candidates
+            .iter()
+            .map(|s| *s as &dyn rusqlite::ToSql)
+            .collect();
+        let (messages_deleted, nodes_deleted, lifecycle_deleted, lifecycle_skipped);
+        {
+            let lifecycle_rows: Vec<(String, String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT conversation_id, COALESCE(current_session_id, ''), \
+                         COALESCE(last_finalized_session_id, '') FROM lcm_lifecycle_state",
+                )?;
+                let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                mapped.collect::<std::result::Result<_, _>>()?
+            };
+            let is_candidate = |s: &str| candidates.iter().any(|c| c.as_str() == s);
+            let is_protected = |s: &str| protected.iter().any(|p| p == s);
+            let mut delete_conversations: Vec<String> = Vec::new();
+            let mut skipped = 0i64;
+            for (conversation_id, cur, fin) in lifecycle_rows {
+                let refs: Vec<&str> = [cur.as_str(), fin.as_str()]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if refs.is_empty() || !refs.iter().any(|s| is_candidate(s)) {
+                    continue;
+                }
+                if refs.iter().any(|s| is_protected(s)) {
+                    skipped += 1;
+                    continue;
+                }
+                if refs.iter().all(|s| is_candidate(s)) {
+                    delete_conversations.push(conversation_id);
+                } else {
+                    skipped += 1;
+                }
+            }
+            messages_deleted = tx.execute(
+                &format!("DELETE FROM messages WHERE session_id IN ({placeholders})"),
+                params.as_slice(),
+            )? as i64;
+            nodes_deleted = tx.execute(
+                &format!("DELETE FROM summary_nodes WHERE session_id IN ({placeholders})"),
+                params.as_slice(),
+            )? as i64;
+            let mut deleted = 0i64;
+            for conversation_id in &delete_conversations {
+                deleted += tx.execute(
+                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?1",
+                    [conversation_id],
+                )? as i64;
+            }
+            lifecycle_deleted = deleted;
+            lifecycle_skipped = skipped;
+        }
+        tx.commit()?;
+        Ok((
+            messages_deleted,
+            nodes_deleted,
+            lifecycle_deleted,
+            lifecycle_skipped,
+        ))
+    }
+
+    /// Classify lifecycle rows with no stored data for `/lcm doctor clean lifecycle`
+    /// (`_doctor_clean_lifecycle_text`, `LCM:command.py:1435`). Returns
+    /// `(empty_current, empty_finalized, empty_protected)`: rows whose referenced sessions have
+    /// zero messages AND zero nodes, split by current-only vs finalized, with protected-session
+    /// rows counted separately.
+    pub fn empty_lifecycle_stats(&self, protected: &[String]) -> Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut with_data: HashSet<String> = HashSet::new();
+        for sql in [
+            "SELECT DISTINCT session_id FROM messages",
+            "SELECT DISTINCT session_id FROM summary_nodes",
+        ] {
+            let mut stmt = conn.prepare(sql)?;
+            for s in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                with_data.insert(s?);
+            }
+        }
+        let rows: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(current_session_id, ''), \
+                     COALESCE(last_finalized_session_id, '') FROM lcm_lifecycle_state",
+            )?;
+            let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            mapped.collect::<std::result::Result<_, _>>()?
+        };
+        let (mut empty_current, mut empty_finalized, mut empty_protected) = (0i64, 0i64, 0i64);
+        for (cur, fin) in rows {
+            if (!cur.is_empty() && with_data.contains(&cur))
+                || (!fin.is_empty() && with_data.contains(&fin))
+            {
+                continue;
+            }
+            if protected.iter().any(|p| p == &cur || p == &fin) {
+                empty_protected += 1;
+                continue;
+            }
+            if !cur.is_empty() && fin.is_empty() {
+                empty_current += 1;
+            } else {
+                empty_finalized += 1;
+            }
+        }
+        Ok((empty_current, empty_finalized, empty_protected))
     }
 
     /// Lifecycle/session fragmentation diagnostics — `lcm_doctor`'s `lifecycle_fragmentation` check
@@ -3732,6 +4001,148 @@ mod tests {
         drop(copy);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Wave 2 theme 5: WAL crash-safety (durability PRAGMAs + graceful close checkpoint) -----
+
+    // PARITY: hermes-lcm tests/test_crash_safe_wal.py::TestConfigureConnectionPragmas
+    #[test]
+    fn wal_durability_pragmas_are_configured_on_a_durable_store() {
+        let dir = std::env::temp_dir().join(format!("lcm-wal-pragma-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("test.db")).expect("open");
+        {
+            let conn = store.conn.lock().unwrap();
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(journal_mode, "wal");
+            let synchronous: i64 = conn
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(synchronous, 2, "synchronous=FULL");
+            let busy_timeout: i64 = conn
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(busy_timeout, 30_000);
+            let wal_autocheckpoint: i64 = conn
+                .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(wal_autocheckpoint, 500);
+            let journal_size_limit: i64 = conn
+                .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(journal_size_limit, 67_108_864);
+            let mmap_size: i64 = conn
+                .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mmap_size, 268_435_456);
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // PARITY: hermes-lcm tests/test_crash_safe_wal.py::TestGracefulClose::test_message_store_close_runs_checkpoint
+    #[test]
+    fn graceful_close_checkpoints_the_wal() {
+        let dir = std::env::temp_dir().join(format!("lcm-wal-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("store.db");
+        let store = Store::open(&db).expect("open");
+        store
+            .append_batch(
+                "sess",
+                &[NewMessage {
+                    role: "user".into(),
+                    content: Some("hello".into()),
+                    ..NewMessage::default()
+                }],
+                1.0,
+            )
+            .unwrap();
+        assert!(db.exists());
+        // Dropping the store runs the passive checkpoint and closes the last connection, so SQLite
+        // flushes committed WAL frames back into the main database file.
+        drop(store);
+        let wal = std::path::PathBuf::from(format!("{}-wal", db.display()));
+        let wal_size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_size < 4096,
+            "WAL still {wal_size} bytes after graceful close; checkpoint may not have run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Wave 2 theme 9: concurrent append serialization -------------------------------------
+
+    // PARITY: hermes-lcm tests/test_lcm_core.py::test_write_lock_serializes_concurrent_appends
+    // The Rust `Store` serializes every write behind `conn: Mutex<Connection>` (the analog of
+    // Python's `_write_lock` RLock). Heavy concurrent single + batch appends from many `std::thread`
+    // workers must complete without errors and produce the exact expected row count — no lost or
+    // duplicated rows from interleaving.
+    #[test]
+    fn concurrent_appends_serialize_without_losing_rows() {
+        use std::sync::Arc;
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        const N_THREADS: usize = 8;
+        const PER_THREAD_SINGLES: usize = 25;
+        const PER_THREAD_BATCH_SIZE: usize = 5;
+        const PER_THREAD_BATCHES: usize = 5;
+
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|thread_id| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || -> Result<()> {
+                    let session = format!("sess-t{thread_id}");
+                    for i in 0..PER_THREAD_SINGLES {
+                        store.append_batch(
+                            &session,
+                            &[NewMessage {
+                                role: "user".into(),
+                                content: Some(format!("single-{thread_id}-{i}")),
+                                token_estimate: 1,
+                                ..NewMessage::default()
+                            }],
+                            1.0,
+                        )?;
+                    }
+                    for b in 0..PER_THREAD_BATCHES {
+                        let msgs: Vec<NewMessage> = (0..PER_THREAD_BATCH_SIZE)
+                            .map(|j| NewMessage {
+                                role: "user".into(),
+                                content: Some(format!("batch-{thread_id}-{b}-{j}")),
+                                token_estimate: 1,
+                                ..NewMessage::default()
+                            })
+                            .collect();
+                        store.append_batch(&session, &msgs, 1.0)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join()
+                .expect("worker thread panicked")
+                .expect("append failed");
+        }
+
+        let expected =
+            N_THREADS * (PER_THREAD_SINGLES + PER_THREAD_BATCHES * PER_THREAD_BATCH_SIZE);
+        let actual: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actual as usize, expected,
+            "concurrent appends lost or duplicated rows — broken serialization"
+        );
     }
 
     /// `scan_fts_repair` (`_scan_fts_repair`, `LCM:command.py:665-701`) reports a desynced index

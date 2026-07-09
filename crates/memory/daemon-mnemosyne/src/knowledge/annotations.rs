@@ -130,6 +130,73 @@ pub fn query_by_memory(
     Ok(rows)
 }
 
+/// A full annotation row for cross-store transfer (`annotations.py` `export_all` L266+): carries the
+/// primary-key `id` so [`import_all`] can dedup by identity across databases.
+#[derive(Clone, Debug)]
+pub struct AnnotationExport {
+    /// The primary-key row id.
+    pub id: i64,
+    /// The annotated memory id.
+    pub memory_id: String,
+    /// Kind.
+    pub kind: String,
+    /// Value.
+    pub value: String,
+    /// Source tag (`None` when unset).
+    pub source: Option<String>,
+    /// Confidence `[0, 1]`.
+    pub confidence: f64,
+}
+
+/// Export every annotation row, id-carrying, insertion-ordered (`annotations.py` `export_all`).
+pub fn export_all(conn: &Connection) -> Result<Vec<AnnotationExport>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, memory_id, kind, value, source, confidence FROM annotations ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AnnotationExport {
+                id: r.get(0)?,
+                memory_id: r.get(1)?,
+                kind: r.get(2)?,
+                value: r.get(3)?,
+                source: r.get(4)?,
+                confidence: r.get::<_, Option<f64>>(5)?.unwrap_or(1.0),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Import annotation rows preserving their ids, deduping by id (`annotations.py` `import_all`).
+/// Returns `(inserted, skipped)`.
+pub fn import_all(conn: &Connection, rows: &[AnnotationExport]) -> Result<(usize, usize)> {
+    let mut inserted = 0usize;
+    let mut skipped = 0usize;
+    for row in rows {
+        // `INSERT OR IGNORE` on the explicit primary-key id makes re-importing the same export a
+        // no-op (id already present), matching the Python idempotent-reimport contract.
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO annotations (id, memory_id, kind, value, source, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                row.id,
+                row.memory_id,
+                row.kind,
+                row.value,
+                row.source,
+                row.confidence
+            ],
+        )?;
+        if changed > 0 {
+            inserted += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+    Ok((inserted, skipped))
+}
+
 /// All annotations of a kind, optionally filtered by value (`annotations.py` `query_by_kind`). When
 /// `filter_noise` and `kind == "mentions"`, meta/system noise values are excluded.
 pub fn query_by_kind(
@@ -210,5 +277,89 @@ mod tests {
         let kept = query_by_kind(&c, "mentions", None, true).unwrap();
         assert!(kept.iter().any(|a| a.value == "Acme"));
         assert!(!kept.iter().any(|a| a.value == "System"));
+    }
+
+    // PARITY: Mnemosyne tests/test_annotations.py::TestAnnotationStoreMultiValuePreservation::test_multiple_mentions_for_one_memory_preserved
+    // The E6 contract: multiple values under one (memory_id, kind) are append-only — no sibling
+    // auto-invalidation (the TripleStore bug this store fixes).
+    #[test]
+    fn multiple_values_for_one_memory_kind_are_preserved() {
+        let store = Store::open_in_memory().unwrap();
+        let c = store.conn.lock().unwrap();
+        add(&c, "mem-1", "mentions", "Alice", "", 1.0).unwrap();
+        add(&c, "mem-1", "mentions", "Bob", "", 1.0).unwrap();
+        add(&c, "mem-1", "mentions", "Charlie", "", 1.0).unwrap();
+        let vals: std::collections::HashSet<String> =
+            query_by_memory(&c, "mem-1", Some("mentions"))
+                .unwrap()
+                .into_iter()
+                .map(|a| a.value)
+                .collect();
+        assert_eq!(
+            vals,
+            ["Alice", "Bob", "Charlie"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+    }
+
+    // PARITY: Mnemosyne tests/test_annotations.py::TestAnnotationStoreMultiValuePreservation::test_add_returns_row_id
+    #[test]
+    fn add_returns_distinct_row_ids() {
+        let store = Store::open_in_memory().unwrap();
+        let c = store.conn.lock().unwrap();
+        let id1 = add(&c, "mem-1", "mentions", "Alice", "", 1.0).unwrap();
+        let id2 = add(&c, "mem-1", "mentions", "Bob", "", 1.0).unwrap();
+        assert_ne!(id1, id2);
+        assert!(id1 > 0 && id2 > 0);
+    }
+
+    // PARITY: Mnemosyne tests/test_annotations.py::TestAnnotationStoreExportImport::test_export_import_round_trip
+    // PARITY: Mnemosyne tests/test_annotations.py::TestAnnotationStoreExportImport::test_import_idempotent_on_existing_ids
+    #[test]
+    fn annotation_export_import_round_trips_and_is_idempotent() {
+        let src = Store::open_in_memory().unwrap();
+        let dst = Store::open_in_memory().unwrap();
+        {
+            let c = src.conn.lock().unwrap();
+            add(&c, "mem-1", "mentions", "Alice", "extraction", 0.8).unwrap();
+            add(&c, "mem-1", "mentions", "Bob", "", 1.0).unwrap();
+            add(&c, "mem-2", "fact", "Something interesting here", "", 1.0).unwrap();
+        }
+        let exported = {
+            let c = src.conn.lock().unwrap();
+            export_all(&c).unwrap()
+        };
+        assert_eq!(exported.len(), 3, "export must carry every row");
+
+        let dc = dst.conn.lock().unwrap();
+        let (inserted, skipped) = import_all(&dc, &exported).unwrap();
+        assert_eq!((inserted, skipped), (3, 0), "fresh import inserts all");
+        assert_eq!(
+            export_all(&dc).unwrap().len(),
+            3,
+            "round-trip preserves rows"
+        );
+        // Re-importing the same export is a no-op (dedup by id).
+        let (reins, reskip) = import_all(&dc, &exported).unwrap();
+        assert_eq!((reins, reskip), (0, 3), "re-import skips existing ids");
+    }
+
+    // PARITY: Mnemosyne tests/test_annotations.py::TestAnnotationStoreQueries::test_query_by_memory_with_kind_filter
+    #[test]
+    fn query_by_memory_filters_by_kind() {
+        let store = Store::open_in_memory().unwrap();
+        let c = store.conn.lock().unwrap();
+        add(&c, "mem-1", "mentions", "Alice", "", 1.0).unwrap();
+        add(&c, "mem-1", "mentions", "Bob", "", 1.0).unwrap();
+        add(&c, "mem-1", "fact", "Some fact about mem-1 here", "", 1.0).unwrap();
+        assert_eq!(query_by_memory(&c, "mem-1", None).unwrap().len(), 3);
+        assert_eq!(
+            query_by_memory(&c, "mem-1", Some("mentions"))
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }
