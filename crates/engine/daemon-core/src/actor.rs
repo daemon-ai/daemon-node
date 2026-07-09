@@ -84,6 +84,9 @@ enum ActorMsg {
     /// in-flight turn's prompt cache is never invalidated mid-conversation.
     SetProvider {
         provider: Arc<dyn Provider>,
+        /// The new provider's model id when the caller resolved one (re-keys the engine's
+        /// model-dependent guidance at the boundary recompose); `None` keeps the prior identity.
+        model: Option<String>,
         origin: Origin,
     },
     /// Live per-session edit-approval mode switch: set the engine's [`ApprovalPolicy`]. Applied at a
@@ -331,11 +334,12 @@ impl AgentHandle {
 
     /// Swap the model provider for this session (a live model switch). Applied at the next turn
     /// boundary; an in-flight turn finishes on the old provider to preserve prompt caching.
-    pub async fn set_provider(&self, provider: Arc<dyn Provider>) {
+    pub async fn set_provider(&self, provider: Arc<dyn Provider>, model: Option<String>) {
         let _ = self
             .tx
             .send(ActorMsg::SetProvider {
                 provider,
+                model,
                 origin: local_origin(),
             })
             .await;
@@ -412,7 +416,7 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
             VecDeque::new();
         // A live model switch requested while a turn was running (or while idle): applied here at the
         // turn boundary so it never invalidates an in-flight turn's prompt cache.
-        let mut pending_provider: Option<Arc<dyn Provider>> = None;
+        let mut pending_provider: Option<(Arc<dyn Provider>, Option<String>)> = None;
         // A live edit-approval mode switch requested while a turn was running (or while idle):
         // applied at the turn boundary alongside the provider switch.
         let mut pending_policy: Option<crate::approval::ApprovalPolicy> = None;
@@ -428,8 +432,8 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
 
         loop {
             // Apply any pending live model switch before deciding/driving the next turn.
-            if let Some(provider) = pending_provider.take() {
-                engine.set_provider(provider);
+            if let Some((provider, model)) = pending_provider.take() {
+                engine.set_provider(provider, model);
             }
             // Apply any pending live edit-approval mode switch.
             if let Some(policy) = pending_policy.take() {
@@ -498,8 +502,10 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                         let outcome = engine.rewind_to(&anchor, request_id, &sink);
                         let _ = reply.send(outcome);
                     }
-                    ActorMsg::SetProvider { provider, .. } => {
-                        pending_provider = Some(provider);
+                    ActorMsg::SetProvider {
+                        provider, model, ..
+                    } => {
+                        pending_provider = Some((provider, model));
                     }
                     ActorMsg::SetApprovalPolicy { policy, .. } => {
                         pending_policy = Some(policy);
@@ -549,8 +555,10 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                                     ActorMsg::StartTurn { input, reply, .. } => {
                                         pending_starts.push_back((input, reply));
                                     }
-                                    ActorMsg::SetProvider { provider, .. } => {
-                                        pending_provider = Some(provider);
+                                    ActorMsg::SetProvider {
+                                        provider, model, ..
+                                    } => {
+                                        pending_provider = Some((provider, model));
                                     }
                                     ActorMsg::SetApprovalPolicy { policy, .. } => {
                                         pending_policy = Some(policy);
@@ -917,7 +925,7 @@ mod tests {
         assert_eq!(turn_text(&handle, &mut rx).await, "first");
 
         handle
-            .set_provider(Arc::new(MockProvider::completing("second")))
+            .set_provider(Arc::new(MockProvider::completing("second")), None)
             .await;
 
         assert_eq!(turn_text(&handle, &mut rx).await, "second");

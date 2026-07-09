@@ -321,6 +321,24 @@ pub trait AsyncPromptSource: Send + Sync {
     }
 }
 
+/// A **model-keyed** prompt source (§10): re-resolved at every composition against the engine's
+/// live model identity, so model-dependent guidance (tool-use enforcement, model-family
+/// operational blocks) follows a live model switch instead of reproducing the family text the
+/// session opened under. The recompose a model switch triggers already invalidates the provider
+/// prefix cache, so re-keying these blocks costs nothing extra.
+pub trait ModelPromptSource: Send + Sync {
+    /// The block to compose for `model_id` (`None` = nothing for this model). `model_id` is the
+    /// engine's best-known model identity: the resolved spec's model id when the node supplied
+    /// one, else the profile label.
+    fn block(&self, model_id: &str) -> Option<String>;
+
+    /// The [`ComposedPrompt`] slot this source contributes to (see
+    /// [`StablePromptSource::slot_kind`]).
+    fn slot_kind(&self) -> SlotKind {
+        SlotKind::Guidance
+    }
+}
+
 /// A per-turn nudge source (§10/§11): consulted when a **user-triggered** turn opens, with the
 /// count of user turns in the durable conversation, and contributing ephemeral text to that turn's
 /// [`TurnInjection`] (the outgoing request's last user message — never the cached system prefix,

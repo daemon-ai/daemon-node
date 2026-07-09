@@ -18,7 +18,9 @@
 
 use crate::command::CommandProviderHandle;
 use crate::config::Config;
-use crate::context::{AsyncPromptSource, ContextEngine, StablePromptSource, ToolCallObserver};
+use crate::context::{
+    AsyncPromptSource, ContextEngine, ModelPromptSource, StablePromptSource, ToolCallObserver,
+};
 use crate::conversation::SystemPrompt;
 use crate::credentials::CredentialProvider;
 use crate::engine::Engine;
@@ -100,6 +102,12 @@ pub struct EngineProfile {
     /// Async prompt sources (§10) gathered over each engine's execution environment at the same
     /// composition boundaries (e.g. the workspace context files, the environment hints).
     async_sources: Vec<Arc<dyn AsyncPromptSource>>,
+    /// Model-keyed prompt sources (§10) re-resolved at every composition against the engine's
+    /// live model identity (e.g. tool-use enforcement + model-family guidance).
+    model_sources: Vec<Arc<dyn ModelPromptSource>>,
+    /// The resolved model id engines this profile builds identify as (keys the model-dependent
+    /// guidance + the composed-prompt stale-identity check). `None` => the profile-label fallback.
+    model_id: Option<String>,
     /// Per-turn nudge sources (§10/§11), consulted when a user-triggered turn opens (e.g. the
     /// USER.md save nudge).
     nudge_sources: Vec<Arc<dyn crate::context::NudgeSource>>,
@@ -141,6 +149,8 @@ impl EngineProfile {
             memory_builder: None,
             prompt_sources: Vec::new(),
             async_sources: Vec::new(),
+            model_sources: Vec::new(),
+            model_id: None,
             nudge_sources: Vec::new(),
             tool_observers: None,
             checkpoints: None,
@@ -246,6 +256,20 @@ impl EngineProfile {
     /// hints use.
     pub fn with_async_prompt_block(mut self, source: Arc<dyn AsyncPromptSource>) -> Self {
         self.async_sources.push(source);
+        self
+    }
+
+    /// Register a model-keyed prompt source (§10), re-resolved at every composition against the
+    /// engine's live model identity — the seam tool-use enforcement + model-family guidance use.
+    pub fn with_model_prompt_block(mut self, source: Arc<dyn ModelPromptSource>) -> Self {
+        self.model_sources.push(source);
+        self
+    }
+
+    /// Set the resolved model id engines this profile builds identify as (keys the
+    /// model-dependent guidance + the composed-prompt stale-identity check).
+    pub fn with_model_id(mut self, model: impl Into<String>) -> Self {
+        self.model_id = Some(model.into());
         self
     }
 
@@ -356,6 +380,12 @@ impl EngineProfile {
         }
         if !self.async_sources.is_empty() {
             engine = engine.with_async_sources(self.async_sources.clone());
+        }
+        if !self.model_sources.is_empty() {
+            engine = engine.with_model_sources(self.model_sources.clone());
+        }
+        if let Some(model) = &self.model_id {
+            engine = engine.with_model_id(model.clone());
         }
         if !self.nudge_sources.is_empty() {
             engine = engine.with_nudge_sources(self.nudge_sources.clone());

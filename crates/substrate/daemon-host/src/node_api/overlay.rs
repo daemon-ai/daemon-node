@@ -123,7 +123,10 @@ impl NodeApiImpl {
                 ApiError::Unsupported("no profile to derive a provider from".into())
             })?;
             overlay.apply_to(&mut spec);
-            handle.set_provider((factory)(&spec)).await;
+            // The effective model id rides along so the boundary recompose re-keys the
+            // model-dependent guidance against the model that will actually run.
+            let model = spec.model.clone();
+            handle.set_provider((factory)(&spec), Some(model)).await;
         }
         Ok(())
     }

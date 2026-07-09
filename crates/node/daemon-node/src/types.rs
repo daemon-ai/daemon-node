@@ -59,6 +59,11 @@ pub struct PromptAssembly {
     /// The composition policy (guidance toggles, caps, nudge cadence) from the binary's
     /// `[prompt]` config section.
     pub policy: PromptPolicy,
+    /// The launch config's model id, identifying the role engines (orchestrator, fleet child,
+    /// fixed session) that resolve their provider from the launch config rather than a profile —
+    /// so their model-keyed guidance and composed-prompt identity use the real model. `None`
+    /// (tests) falls back to the profile-label identity.
+    pub launch_model: Option<String>,
 }
 
 /// The `[prompt]`-section composition policy: which guidance blocks compose, the content caps,

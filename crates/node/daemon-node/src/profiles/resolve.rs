@@ -96,6 +96,12 @@ impl SessionFactoryCtx {
                 // Scope the §10/§11 subsystem stores to the profile's own id (its on-disk key), so two
                 // rooms routed to two profiles get isolated context/memory banks under their own homes.
                 .with_profile_ref(ProfileRef::new(&spec.id));
+        // The resolved model id keys the engine's model-dependent guidance and its composed-prompt
+        // stale-identity check (an empty model — the unconfigured first-boot seed — keeps the
+        // profile-label fallback).
+        if !spec.model.trim().is_empty() {
+            profile = profile.with_model_id(spec.model.clone());
+        }
         if spec.budget.tokens.is_some() || spec.budget.wall_ms.is_some() {
             profile = profile.with_budget(Budget {
                 tokens: spec.budget.tokens,

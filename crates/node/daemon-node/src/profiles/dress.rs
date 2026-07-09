@@ -56,6 +56,13 @@ pub(crate) fn dress_with_credential(
         // Scope §10/§11 subsystem stores to the node's launch profile (the legacy single-profile
         // home), so the durable/orchestrator/fixed-session engines share one bank as before.
         .with_profile_ref(a.profile.clone());
+    // The launch model identifies the role engines (they resolve their provider from the launch
+    // config, not a profile), keying model-dependent guidance + the composed-prompt identity.
+    if let Some(model) = a.prompt.launch_model.as_deref().map(str::trim) {
+        if !model.is_empty() {
+            profile = profile.with_model_id(model);
+        }
+    }
     // Per-session builders (stateful/session-scoped backends) take precedence over shared instances.
     if let Some(builder) = &a.context_builder {
         profile = profile.with_context_engine_builder(builder.clone());

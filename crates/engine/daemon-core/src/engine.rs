@@ -11,8 +11,8 @@
 
 use crate::config::Config;
 use crate::context::{
-    AsyncPromptSource, BudgetedContextEngine, ComposedPrompt, ContextEngine, NudgeSource,
-    StablePromptSource, ToolCallObserver, TurnInjection,
+    AsyncPromptSource, BudgetedContextEngine, ComposedPrompt, ContextEngine, ModelPromptSource,
+    NudgeSource, StablePromptSource, ToolCallObserver, TurnInjection,
 };
 use crate::control::{SteerReq, TurnControl};
 use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Turn};
@@ -157,6 +157,15 @@ pub struct Engine {
     /// composition boundaries as [`Self::prompt_sources`] — e.g. the workspace context files and
     /// the environment hints.
     async_sources: Vec<Arc<dyn AsyncPromptSource>>,
+    /// Model-keyed prompt sources (§10) re-resolved at every composition against
+    /// [`Self::model_id`] — e.g. tool-use enforcement + model-family guidance, which must follow
+    /// a live model switch.
+    model_sources: Vec<Arc<dyn ModelPromptSource>>,
+    /// The engine's best-known model identity: the resolved spec's model id (threaded at
+    /// construction via [`EngineProfile`](crate::EngineProfile) and refreshed by a live
+    /// [`set_provider`](Self::set_provider) switch). `None` falls back to the credential-profile
+    /// label — the pre-existing best-effort identity.
+    model_id: Option<String>,
     /// Per-turn nudge sources (§10/§11): consulted when a user-triggered turn opens; contributions
     /// ride the [`TurnInjection`] (e.g. the USER.md save nudge). Empty by default.
     nudge_sources: Vec<Arc<dyn NudgeSource>>,
@@ -225,13 +234,20 @@ impl Engine {
         }
     }
 
-    /// Swap the model provider this engine calls — a live, per-session model switch. Refreshes the
-    /// §10 context-window denominator from the new provider's [`Capabilities`](crate::provider::Capabilities)
-    /// and marks the composed prompt dirty so it is **recomposed at the next turn boundary** (the
+    /// Swap the model provider this engine calls — a live, per-session model switch. `model` is
+    /// the new provider's model id when the caller knows it (the overlay-apply path resolves it
+    /// from the effective spec); it refreshes [`Self::model_id`] so the recomposition below
+    /// re-keys the model-dependent guidance against the model that will actually run (`None`
+    /// keeps the previous identity — a bare provider swap). Refreshes the §10 context-window
+    /// denominator from the new provider's [`Capabilities`](crate::provider::Capabilities) and
+    /// marks the composed prompt dirty so it is **recomposed at the next turn boundary** (the
     /// actor applies the switch between turns), never mid-turn — an in-flight turn's prompt cache
     /// is never invalidated mid-conversation.
-    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>, model: Option<String>) {
         self.provider = provider;
+        if let Some(model) = model {
+            self.model_id = Some(model);
+        }
         let info = self.model_info();
         self.context.on_model(&info);
         self.composed_dirty = true;
@@ -574,8 +590,9 @@ impl Engine {
     /// - `Identity`: the conversation's persona/system text (the profile's SOUL.md / role persona,
     ///   resolved by the node at engine construction).
     /// - `Guidance`: the context engine's [`guidance_block`](ContextEngine::guidance_block) plus
-    ///   every [`StablePromptSource`] then every [`AsyncPromptSource`] routed by its `slot_kind()`
-    ///   (Guidance by default) — registration order within a slot, so the composition is
+    ///   every [`StablePromptSource`], then every [`ModelPromptSource`] (re-keyed on the live
+    ///   model identity), then every [`AsyncPromptSource`] — each routed by its `slot_kind()`
+    ///   (Guidance by default), registration order within a slot, so the composition is
     ///   deterministic and byte-stable.
     /// - `SkillsIndex`/`ContextFiles`/`UserProfile`/`Stamp`: prompt sources that override
     ///   `slot_kind()` (wired by the node integration layer).
@@ -596,6 +613,16 @@ impl Engine {
         for source in &self.prompt_sources {
             if let Some(block) = source.block() {
                 builder.push(source.slot_kind(), block);
+            }
+        }
+        // Model-keyed sources re-resolve against the LIVE model identity every composition, so a
+        // model switch's recompose swaps the family-specific guidance along with the model.
+        if !self.model_sources.is_empty() {
+            let model = self.model_info().model;
+            for source in &self.model_sources {
+                if let Some(block) = source.block(&model) {
+                    builder.push(source.slot_kind(), block);
+                }
             }
         }
         for source in &self.async_sources {
@@ -719,10 +746,16 @@ impl Engine {
     }
 
     /// A best-effort description of the active model for the §10 [`on_model`](ContextEngine::on_model)
-    /// hook: the profile label plus the provider's declared context window (if any).
+    /// hook and the composed-prompt identity check: the resolved model id when the node supplied
+    /// one (so a model change while a durable session was parked is detected as stale runtime
+    /// identity on restore), else the profile label (the pre-existing fallback), plus the
+    /// provider's declared context window (if any).
     fn model_info(&self) -> crate::context::ModelInfo {
         crate::context::ModelInfo {
-            model: self.profile.as_str().to_string(),
+            model: self
+                .model_id
+                .clone()
+                .unwrap_or_else(|| self.profile.as_str().to_string()),
             max_context: self.provider.capabilities().max_context,
         }
     }

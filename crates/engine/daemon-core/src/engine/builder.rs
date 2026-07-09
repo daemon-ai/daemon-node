@@ -40,6 +40,8 @@ impl Engine {
             memory: Vec::new(),
             prompt_sources: Vec::new(),
             async_sources: Vec::new(),
+            model_sources: Vec::new(),
+            model_id: None,
             nudge_sources: Vec::new(),
             tool_observers: Vec::new(),
             next_trigger: None,
@@ -112,6 +114,21 @@ impl Engine {
     /// the same composition boundaries (e.g. the workspace context files, the environment hints).
     pub fn with_async_sources(mut self, sources: Vec<Arc<dyn AsyncPromptSource>>) -> Self {
         self.async_sources = sources;
+        self
+    }
+
+    /// Register model-keyed prompt sources (§10), re-resolved at every composition against the
+    /// engine's live model identity (e.g. tool-use enforcement + model-family guidance).
+    pub fn with_model_sources(mut self, sources: Vec<Arc<dyn ModelPromptSource>>) -> Self {
+        self.model_sources = sources;
+        self
+    }
+
+    /// Set the engine's model identity — the resolved spec's model id, used to key
+    /// [`ModelPromptSource`]s and the composed-prompt stale-identity check. Without it the engine
+    /// falls back to its credential-profile label.
+    pub fn with_model_id(mut self, model: impl Into<String>) -> Self {
+        self.model_id = Some(model.into());
         self
     }
 

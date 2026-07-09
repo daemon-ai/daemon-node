@@ -369,7 +369,7 @@ async fn model_switch_recomposes_at_turn_boundary() {
         .unwrap();
 
     // …but a model switch marks the composition dirty and the next turn boundary rebuilds it.
-    engine.set_provider(provider.clone());
+    engine.set_provider(provider.clone(), None);
     engine.push_user(UserMsg::new("three"));
     engine
         .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
@@ -675,6 +675,74 @@ async fn non_user_turns_do_not_consult_nudge_sources() {
         1,
         "user turn: consulted once"
     );
+}
+
+/// A model-keyed source re-resolves against the LIVE model identity at every composition: the
+/// recompose a live model switch triggers swaps the family-specific guidance along with the
+/// model, instead of reproducing the family text the session opened under (OQ2 full fidelity).
+#[tokio::test]
+async fn model_keyed_guidance_follows_a_live_model_switch() {
+    /// The model-family-guidance shape: keyed purely on the model id substring.
+    struct FamilyGuidance;
+    impl crate::context::ModelPromptSource for FamilyGuidance {
+        fn block(&self, model_id: &str) -> Option<String> {
+            if model_id.contains("gpt") {
+                Some("GPT-FAMILY-GUIDANCE".into())
+            } else if model_id.contains("claude") {
+                Some("CLAUDE-FAMILY-GUIDANCE".into())
+            } else {
+                None
+            }
+        }
+    }
+    let provider = RequestRecordingProvider::new();
+    let mut engine = Engine::fresh(
+        SessionId::new("model-keyed"),
+        SystemPrompt::new("persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_model_sources(vec![Arc::new(FamilyGuidance)])
+    .with_model_id("gpt-5.5");
+
+    engine.push_user(UserMsg::new("one"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    // A live switch to a different family: the boundary recompose re-keys the guidance.
+    engine.set_provider(provider.clone(), Some("claude-4.6-opus".into()));
+    engine.push_user(UserMsg::new("two"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    // A bare provider swap (no model id) keeps the current identity.
+    engine.set_provider(provider.clone(), None);
+    engine.push_user(UserMsg::new("three"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    let systems = provider.systems();
+    assert!(systems[0].contains("GPT-FAMILY-GUIDANCE"), "{}", systems[0]);
+    assert!(!systems[0].contains("CLAUDE-FAMILY"));
+    assert!(
+        systems[1].contains("CLAUDE-FAMILY-GUIDANCE"),
+        "the switch re-keyed the family guidance: {}",
+        systems[1]
+    );
+    assert!(!systems[1].contains("GPT-FAMILY"));
+    assert!(
+        systems[2].contains("CLAUDE-FAMILY-GUIDANCE"),
+        "a bare provider swap keeps the model identity: {}",
+        systems[2]
+    );
+    // The identity also lands on the durable snapshot (the stale-identity restore check).
+    assert_eq!(engine.snapshot().composed_model, "claude-4.6-opus");
 }
 
 /// A tool-call observer's hint is appended to the executed call's RESULT content: the model reads

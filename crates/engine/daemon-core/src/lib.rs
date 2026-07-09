@@ -61,8 +61,9 @@ pub use command::{
 pub use config::Config;
 pub use context::{
     estimate_tokens, AsyncPromptSource, BudgetedContextEngine, ComposedPrompt,
-    ComposedPromptBuilder, ContextEngine, ContextStrategy, ModelInfo, NudgeSource, Pressure, Slot,
-    SlotKind, SlotReport, StablePromptSource, ToolCallObserver, TurnInjection,
+    ComposedPromptBuilder, ContextEngine, ContextStrategy, ModelInfo, ModelPromptSource,
+    NudgeSource, Pressure, Slot, SlotKind, SlotReport, StablePromptSource, ToolCallObserver,
+    TurnInjection,
 };
 pub use control::{SteerReq, TurnControl};
 pub use conversation::{
