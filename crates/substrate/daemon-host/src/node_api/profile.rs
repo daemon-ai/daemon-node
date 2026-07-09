@@ -242,6 +242,26 @@ impl ProfileApi for NodeApiImpl {
         Ok(())
     }
 
+    async fn soul_get(&self, id: String) -> Result<String, ApiError> {
+        let persona = self.persona_backend()?;
+        // Fetch-before-delegate: the persona backend seeds SOUL.md on a miss, so an unknown
+        // profile id must fail here (the same not-found the other profile ops raise) rather than
+        // materialize an orphan persona doc.
+        let spec = self.profile_store()?.get(&id).map_err(profile_err)?;
+        crate::persona_ops::soul_get_guarded(persona.as_ref(), spec.as_ref(), &id).await
+    }
+
+    async fn soul_set(&self, id: String, text: String) -> Result<(), ApiError> {
+        let persona = self.persona_backend()?;
+        let spec = self.profile_store()?.get(&id).map_err(profile_err)?;
+        crate::persona_ops::soul_set_guarded(persona.as_ref(), spec.as_ref(), &id, &text).await?;
+        // A persona edit changes what a client renders for the profile: ping the node-wide
+        // pointer so thin clients refetch. The backend owns validation + the revision log
+        // (PersonaStore::set is the single SOUL.md revision writer), so nothing is recorded here.
+        self.emit_profiles_changed();
+        Ok(())
+    }
+
     async fn skill_history(
         &self,
         name: String,
@@ -414,6 +434,14 @@ impl NodeApiImpl {
         self.profiles
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("profile management not available".into()))
+    }
+
+    /// The persona (SOUL.md) backend, or [`ApiError::Unsupported`] when this node hosts no persona
+    /// management (no [`PersonaOps`](crate::persona_ops::PersonaOps) bound at assembly).
+    fn persona_backend(&self) -> Result<&Arc<dyn crate::persona_ops::PersonaOps>, ApiError> {
+        self.persona_ops
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("persona management not available".into()))
     }
 
     /// Resolve an agent-catalog entry by `name`: the merged catalog (durable manual registrations +
