@@ -1259,6 +1259,27 @@ mod tests {
         assert_eq!(next_leaf_rescue_chunk_len(&region, 1, 100, &tok, &c), 0);
     }
 
+    // PARITY: hermes-lcm tests/test_auto_focus_topic.py::test_multimodal_content
+    // Multimodal user content (a list of typed parts) is flattened to its text via the §8.4
+    // `text_content_for_pattern_matching` seam before the engine sees it, so auto-focus still
+    // derives a topic from the text part.
+    #[test]
+    fn auto_focus_handles_multimodal_content_parts() {
+        let multimodal = serde_json::json!([{"type": "text", "text": "How does this image look?"}]);
+        let flattened = crate::protection::text_content_for_pattern_matching(&multimodal);
+        assert!(
+            flattened.contains("image"),
+            "text part extracted: {flattened}"
+        );
+
+        let turns = vec![user("Look at this image"), user(&flattened)];
+        let focus = derive_auto_focus_topic(&turns, &cfg()).unwrap();
+        assert!(
+            focus.contains("image"),
+            "focus derived from multimodal text: {focus}"
+        );
+    }
+
     #[test]
     fn auto_focus_collects_recent_user_turns_newest_last() {
         let turns = vec![
