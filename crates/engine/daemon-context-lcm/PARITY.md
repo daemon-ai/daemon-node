@@ -112,6 +112,18 @@ Reconcile gap-open rows (not attempted this pass) are grouped in the backlog sec
 |---|---|---|---|
 | `/lcm doctor source` scan (L440) | gap-closed | `doctor_source_scans_legacy_blank_rows` | red `053b890`, green `179200d`; new `Store::source_normalization_plan` |
 | `/lcm doctor source apply` (L451) | gap-closed | `doctor_source_apply_normalizes_legacy_blank_rows` | same pair; backup-first `Store::normalize_legacy_blank_sources`, no-op batch skips the backup |
+| `test_lcm_doctor_retention_reports_old_heavy_sessions` (L744) | gap-closed | `doctor_retention_scopes_analysis_to_the_active_session` | red `d14302b`, green `<doctor-clean green>`; active-session-scoped footprint/age analysis |
+| `test_lcm_doctor_retention_counts_summary_only_sessions` (L786) | gap-closed | `doctor_retention_reports_nothing_without_active_session_rows` | same pair |
+| `test_lcm_doctor_retention_keeps_stale_sessions_visible_when_list_is_truncated` (L816) | already-covered | `doctor_retention_reports_nothing_without_active_session_rows` | scoping makes the truncation case identical to the empty case (Python asserts the same "no stored sessions" output) |
+| `test_lcm_doctor_clean_reports_pattern_matched_junk_candidates` (L840) | gap-closed | `doctor_clean_reports_pattern_matched_junk_candidates` | same pair; new `Store::session_footprints` scan |
+| `test_lcm_doctor_clean_prefers_ignore_over_stateless_when_both_match` (L859) | gap-closed | `doctor_clean_prefers_ignored_class_over_stateless` | same pair |
+| `test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates` (L910) | gap-closed | `doctor_clean_apply_backup_first_deletes_safe_candidates` | same pair; `Store::delete_sessions_atomically` (single-tx messages+nodes+lifecycle) |
+| `test_lcm_doctor_clean_apply_denied_by_default` (L1026) | gap-closed | `doctor_clean_apply_denied_by_default` | same pair; gated on the pre-existing `doctor_clean_apply_enabled` config |
+| `test_lcm_doctor_clean_lifecycle_reports_empty_candidates` (L1042) | gap-closed | `doctor_clean_lifecycle_reports_empty_rows` | same pair; `Store::empty_lifecycle_stats` |
+| `test_lcm_doctor_clean_lifecycle_apply_is_backup_first_and_deletes_safe_candidates` (L1063) | gap-closed | `doctor_clean_lifecycle_apply_deletes_empty_rows` | same pair; operator apply prunes regardless of row age (the automatic bind-time GC keeps its age guard) |
+| `test_lcm_doctor_clean_lifecycle_apply_denied_by_default` (L1091) | gap-closed | `doctor_clean_lifecycle_apply_denied_by_default` | same pair |
+| `test_lcm_doctor_clean_returns_error_on_schema_problem` (L875) / `test_lcm_backup_returns_error_when_sqlite_backup_fails` (L897) | out-of-scope | — | driven by Python connection monkeypatching (`_FakeConn` / `sqlite3.connect` boom); the Rust store owns its connection and offers no equivalent fault-injection seam. Error branches exist and mirror command.py wording |
+| `test_lcm_doctor_clean_apply_aborts_if_backup_fails` (L950) / `..._rolls_back_if_delete_fails_after_backup` (L976) | out-of-scope | — | same monkeypatch-driven fault injection; the Rust apply is backup-first and single-transaction (rollback on error) by construction |
 
 ## Out of scope (recorded per task brief)
 

@@ -313,6 +313,30 @@ pub struct SourceStats {
     pub effective_unknown_messages: i64,
 }
 
+/// A per-session footprint row for the `/lcm doctor clean`/`retention` scans — the shared
+/// `_scan_clean_candidates` / `_scan_retention_candidates` CTE output (`LCM:command.py:200/285`).
+#[derive(Clone, Debug, Default)]
+pub struct SessionFootprint {
+    /// The session id (from `messages` ∪ `summary_nodes`).
+    pub session_id: String,
+    /// Stored message rows.
+    pub message_count: i64,
+    /// Sum of message `token_estimate`.
+    pub token_total: i64,
+    /// Stored summary nodes.
+    pub node_count: i64,
+    /// Sum of node `token_count`.
+    pub node_token_total: i64,
+    /// Oldest message timestamp.
+    pub first_message_at: Option<f64>,
+    /// Newest message timestamp.
+    pub last_message_at: Option<f64>,
+    /// Oldest node activity (earliest_at, else created_at).
+    pub first_node_at: Option<f64>,
+    /// Newest node activity (latest_at, else created_at).
+    pub last_node_at: Option<f64>,
+}
+
 /// Lifecycle/session fragmentation diagnostics (`lcm_doctor`'s `lifecycle_fragmentation`) — the
 /// in-database portion of `get_fragmentation_stats` (`LCM:lifecycle_state.py:337`). The external host
 /// `state_db` comparison is intentionally omitted (the daemon has no separate host sessions DB).
@@ -1709,6 +1733,201 @@ impl Store {
         };
         let stats_after = self.source_stats(None)?;
         Ok((updated, stats_before, stats_after))
+    }
+
+    /// Per-session footprint stats for the `/lcm doctor clean`/`retention` scans (the shared
+    /// `_scan_clean_candidates` / `_scan_retention_candidates` CTE, `LCM:command.py:200/285`):
+    /// every session id present in `messages` or `summary_nodes`, with message/node counts, token
+    /// totals, and activity time bounds. `session_id` scopes the scan to one session (retention).
+    pub fn session_footprints(&self, session_id: Option<&str>) -> Result<Vec<SessionFootprint>> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let where_clause = if session_id.is_some() {
+            "WHERE s.session_id = ?1"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "WITH session_ids AS ( \
+                 SELECT session_id FROM messages \
+                 UNION \
+                 SELECT session_id FROM summary_nodes \
+             ), \
+             message_stats AS ( \
+                 SELECT session_id, COUNT(*) AS message_count, \
+                        COALESCE(SUM(token_estimate), 0) AS token_total, \
+                        MIN(timestamp) AS first_message_at, \
+                        MAX(timestamp) AS last_message_at \
+                 FROM messages GROUP BY session_id \
+             ), \
+             node_stats AS ( \
+                 SELECT session_id, COUNT(*) AS node_count, \
+                        COALESCE(SUM(token_count), 0) AS node_token_total, \
+                        MIN(COALESCE(earliest_at, created_at)) AS first_node_at, \
+                        MAX(COALESCE(latest_at, created_at)) AS last_node_at \
+                 FROM summary_nodes GROUP BY session_id \
+             ) \
+             SELECT s.session_id, \
+                    COALESCE(m.message_count, 0), COALESCE(m.token_total, 0), \
+                    COALESCE(n.node_count, 0), COALESCE(n.node_token_total, 0), \
+                    m.first_message_at, m.last_message_at, n.first_node_at, n.last_node_at \
+             FROM session_ids s \
+             LEFT JOIN message_stats m ON m.session_id = s.session_id \
+             LEFT JOIN node_stats n ON n.session_id = s.session_id \
+             {where_clause} \
+             ORDER BY s.session_id"
+        );
+        let map = |r: &Row<'_>| {
+            Ok(SessionFootprint {
+                session_id: r.get(0)?,
+                message_count: r.get(1)?,
+                token_total: r.get(2)?,
+                node_count: r.get(3)?,
+                node_token_total: r.get(4)?,
+                first_message_at: r.get(5)?,
+                last_message_at: r.get(6)?,
+                first_node_at: r.get(7)?,
+                last_node_at: r.get(8)?,
+            })
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = match session_id {
+            Some(sid) => stmt
+                .query_map([sid], map)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map([], map)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Delete cleanup-candidate sessions in ONE transaction (a port of
+    /// `_delete_clean_candidates_atomically`, `LCM:command.py:1293`): messages + summary nodes for
+    /// the candidate sessions, plus lifecycle rows whose session references are fully covered by
+    /// the candidate set. `protected` sessions are excluded from the candidate set, and a
+    /// lifecycle row referencing a protected or non-candidate session is skipped (counted).
+    /// Returns `(messages_deleted, nodes_deleted, lifecycle_deleted, lifecycle_skipped)`.
+    pub fn delete_sessions_atomically(
+        &self,
+        session_ids: &[String],
+        protected: &[String],
+    ) -> Result<(i64, i64, i64, i64)> {
+        let candidates: Vec<&String> = session_ids
+            .iter()
+            .filter(|s| !s.is_empty() && !protected.contains(s))
+            .collect();
+        if candidates.is_empty() {
+            return Ok((0, 0, 0, 0));
+        }
+        let mut conn = self.conn.lock().expect("lcm store poisoned");
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let placeholders = candidates.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let params: Vec<&dyn rusqlite::ToSql> = candidates
+            .iter()
+            .map(|s| *s as &dyn rusqlite::ToSql)
+            .collect();
+        let (messages_deleted, nodes_deleted, lifecycle_deleted, lifecycle_skipped);
+        {
+            let lifecycle_rows: Vec<(String, String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT conversation_id, COALESCE(current_session_id, ''), \
+                         COALESCE(last_finalized_session_id, '') FROM lcm_lifecycle_state",
+                )?;
+                let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                mapped.collect::<std::result::Result<_, _>>()?
+            };
+            let is_candidate = |s: &str| candidates.iter().any(|c| c.as_str() == s);
+            let is_protected = |s: &str| protected.iter().any(|p| p == s);
+            let mut delete_conversations: Vec<String> = Vec::new();
+            let mut skipped = 0i64;
+            for (conversation_id, cur, fin) in lifecycle_rows {
+                let refs: Vec<&str> = [cur.as_str(), fin.as_str()]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if refs.is_empty() || !refs.iter().any(|s| is_candidate(s)) {
+                    continue;
+                }
+                if refs.iter().any(|s| is_protected(s)) {
+                    skipped += 1;
+                    continue;
+                }
+                if refs.iter().all(|s| is_candidate(s)) {
+                    delete_conversations.push(conversation_id);
+                } else {
+                    skipped += 1;
+                }
+            }
+            messages_deleted = tx.execute(
+                &format!("DELETE FROM messages WHERE session_id IN ({placeholders})"),
+                params.as_slice(),
+            )? as i64;
+            nodes_deleted = tx.execute(
+                &format!("DELETE FROM summary_nodes WHERE session_id IN ({placeholders})"),
+                params.as_slice(),
+            )? as i64;
+            let mut deleted = 0i64;
+            for conversation_id in &delete_conversations {
+                deleted += tx.execute(
+                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?1",
+                    [conversation_id],
+                )? as i64;
+            }
+            lifecycle_deleted = deleted;
+            lifecycle_skipped = skipped;
+        }
+        tx.commit()?;
+        Ok((
+            messages_deleted,
+            nodes_deleted,
+            lifecycle_deleted,
+            lifecycle_skipped,
+        ))
+    }
+
+    /// Classify lifecycle rows with no stored data for `/lcm doctor clean lifecycle`
+    /// (`_doctor_clean_lifecycle_text`, `LCM:command.py:1435`). Returns
+    /// `(empty_current, empty_finalized, empty_protected)`: rows whose referenced sessions have
+    /// zero messages AND zero nodes, split by current-only vs finalized, with protected-session
+    /// rows counted separately.
+    pub fn empty_lifecycle_stats(&self, protected: &[String]) -> Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().expect("lcm store poisoned");
+        let mut with_data: HashSet<String> = HashSet::new();
+        for sql in [
+            "SELECT DISTINCT session_id FROM messages",
+            "SELECT DISTINCT session_id FROM summary_nodes",
+        ] {
+            let mut stmt = conn.prepare(sql)?;
+            for s in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                with_data.insert(s?);
+            }
+        }
+        let rows: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(current_session_id, ''), \
+                     COALESCE(last_finalized_session_id, '') FROM lcm_lifecycle_state",
+            )?;
+            let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            mapped.collect::<std::result::Result<_, _>>()?
+        };
+        let (mut empty_current, mut empty_finalized, mut empty_protected) = (0i64, 0i64, 0i64);
+        for (cur, fin) in rows {
+            if (!cur.is_empty() && with_data.contains(&cur))
+                || (!fin.is_empty() && with_data.contains(&fin))
+            {
+                continue;
+            }
+            if protected.iter().any(|p| p == &cur || p == &fin) {
+                empty_protected += 1;
+                continue;
+            }
+            if !cur.is_empty() && fin.is_empty() {
+                empty_current += 1;
+            } else {
+                empty_finalized += 1;
+            }
+        }
+        Ok((empty_current, empty_finalized, empty_protected))
     }
 
     /// Lifecycle/session fragmentation diagnostics — `lcm_doctor`'s `lifecycle_fragmentation` check

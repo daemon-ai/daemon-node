@@ -622,6 +622,13 @@ impl LcmContextEngine {
         !self.message_patterns.is_empty() && self.message_patterns.is_match(&turn_match_text(turn))
     }
 
+    /// The actively-bound session id — the identity the doctor cleanup/retention surfaces protect
+    /// (`engine._session_id` in `command.py`; the row receiving live writes).
+    fn bound_session_id(&self) -> String {
+        let state = self.state.lock().expect("lcm state poisoned");
+        effective_session(&state.session_id)
+    }
+
     /// Restart reconcile for a non-scaffold replay: return `(turn_cursor, kind)` — how many leading
     /// turns of `turns` are a replay of the durable store, and why. A core port of
     /// `_reconcile_ingest_cursor_from_store` + `_find_reconciled_cursor_for_store_tail`
@@ -1644,6 +1651,487 @@ fn rotate_apply_text(engine: &LcmContextEngine) -> String {
     lines.join("\n")
 }
 
+/// A `/lcm doctor clean` candidate (`_scan_clean_candidates`, `LCM:command.py:200`).
+struct CleanCandidate {
+    session_id: String,
+    classes: Vec<&'static str>,
+    message_count: i64,
+    node_count: i64,
+    token_total: i64,
+}
+
+/// The `/lcm doctor clean` scan result.
+struct CleanScan {
+    candidates: Vec<CleanCandidate>,
+    ignored_count: usize,
+    stateless_count: usize,
+    protected_count: usize,
+}
+
+/// Scan stored sessions for pattern-matched junk/noise candidates (`_scan_clean_candidates`,
+/// `LCM:command.py:200-283`): every stored session is classified against the compiled
+/// `ignore_session_patterns` first (ignored wins over stateless); the actively-bound session is
+/// protected from cleanup.
+fn scan_clean_candidates(engine: &LcmContextEngine) -> crate::error::Result<CleanScan> {
+    let bound = engine.bound_session_id();
+    let rows = engine.store.session_footprints(None)?;
+    let mut scan = CleanScan {
+        candidates: Vec::new(),
+        ignored_count: 0,
+        stateless_count: 0,
+        protected_count: 0,
+    };
+    for row in rows {
+        let keys = build_session_match_keys("", &row.session_id);
+        let mut classes: Vec<&'static str> = Vec::new();
+        if engine.ignore_session_globs.matches(&keys) {
+            classes.push("ignored-pattern");
+            scan.ignored_count += 1;
+        } else if engine.stateless_session_globs.matches(&keys) {
+            classes.push("stateless-pattern");
+            scan.stateless_count += 1;
+        }
+        if classes.is_empty() {
+            continue;
+        }
+        if row.session_id == bound {
+            scan.protected_count += 1;
+            continue;
+        }
+        scan.candidates.push(CleanCandidate {
+            session_id: row.session_id,
+            classes,
+            message_count: row.message_count,
+            node_count: row.node_count,
+            token_total: row.token_total,
+        });
+    }
+    Ok(scan)
+}
+
+/// `/lcm doctor clean` — best-effort read-only scan for obvious junk/noise session candidates
+/// (`_doctor_clean_text`, `LCM:command.py:1207`).
+fn doctor_clean_text(engine: &LcmContextEngine) -> String {
+    let scan = match scan_clean_candidates(engine) {
+        Ok(scan) => scan,
+        Err(e) => {
+            return [
+                "LCM doctor clean".to_string(),
+                "status: error".to_string(),
+                format!("error: {e}"),
+                "note: read-only scan only — no rows were deleted".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    let mut lines = vec![
+        "LCM doctor clean".to_string(),
+        format!(
+            "status: {}",
+            if scan.candidates.is_empty() {
+                "ok"
+            } else {
+                "candidates-found"
+            }
+        ),
+        format!("candidate_sessions: {}", scan.candidates.len()),
+        format!("ignored_pattern_matches: {}", scan.ignored_count),
+        format!("stateless_pattern_matches: {}", scan.stateless_count),
+    ];
+    if scan.protected_count > 0 {
+        lines.push(format!(
+            "protected_sessions_skipped: {}",
+            scan.protected_count
+        ));
+    }
+    if scan.candidates.is_empty() {
+        lines.push("result: no obvious junk/noise session candidates detected".to_string());
+        return lines.join("\n");
+    }
+    lines.push("candidates:".to_string());
+    for item in scan.candidates.iter().take(20) {
+        lines.push(format!(
+            "- {} | class={} | messages={} | nodes={} | tokens={}",
+            item.session_id,
+            item.classes.join(", "),
+            item.message_count,
+            item.node_count,
+            item.token_total,
+        ));
+    }
+    if scan.candidates.len() > 20 {
+        lines.push(format!(
+            "... {} more candidate session(s) omitted",
+            scan.candidates.len() - 20
+        ));
+    }
+    lines.push(
+        "note: best-effort stored-session scan only — platform-only matches may not be \
+         reconstructable from the SQLite state"
+            .to_string(),
+    );
+    lines.push("note: read-only scan only — no rows were deleted".to_string());
+    lines.push(
+        "note: use `/lcm doctor clean apply` only after a backup-first review of these safe \
+         candidates"
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+/// `/lcm doctor clean apply` — backup-first atomic deletion of the safe pattern-matched cleanup
+/// candidates (`_doctor_clean_apply_text`, `LCM:command.py:1367`). Denied unless
+/// `doctor_clean_apply_enabled` is set.
+fn doctor_clean_apply_text(engine: &LcmContextEngine) -> String {
+    if !engine.config.doctor_clean_apply_enabled {
+        return [
+            "LCM doctor clean apply".to_string(),
+            "status: denied".to_string(),
+            "error: destructive cleanup is disabled by default".to_string(),
+            "note: enable `doctor_clean_apply_enabled` only in trusted operator environments"
+                .to_string(),
+            "note: no rows were deleted".to_string(),
+        ]
+        .join("\n");
+    }
+    let scan = match scan_clean_candidates(engine) {
+        Ok(scan) => scan,
+        Err(e) => {
+            return [
+                "LCM doctor clean apply".to_string(),
+                "status: error".to_string(),
+                format!("error: {e}"),
+                "note: cleanup apply aborted before any rows were deleted".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    if scan.candidates.is_empty() {
+        return [
+            "LCM doctor clean apply".to_string(),
+            "status: ok".to_string(),
+            "candidate_sessions: 0".to_string(),
+            "result: no safe cleanup candidates detected".to_string(),
+            "note: nothing was deleted".to_string(),
+        ]
+        .join("\n");
+    }
+    let db = engine
+        .config
+        .db_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let backup = match engine.backup_database() {
+        Ok(b) => b,
+        Err(e) => {
+            return [
+                "LCM doctor clean apply".to_string(),
+                "status: error".to_string(),
+                format!("database_path: {db}"),
+                format!("error: backup failed: {e}"),
+                "note: cleanup apply aborted before any rows were deleted".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    let session_ids: Vec<String> = scan
+        .candidates
+        .iter()
+        .map(|c| c.session_id.clone())
+        .collect();
+    let protected = vec![engine.bound_session_id()];
+    match engine
+        .store
+        .delete_sessions_atomically(&session_ids, &protected)
+    {
+        Ok((messages_deleted, nodes_deleted, lifecycle_deleted, lifecycle_skipped)) => [
+            "LCM doctor clean apply".to_string(),
+            "status: ok".to_string(),
+            format!("database_path: {db}"),
+            format!("backup_path: {}", backup.path.display()),
+            format!("backup_size: {}", fmt_size(backup.size)),
+            format!("candidate_sessions: {}", scan.candidates.len()),
+            format!("messages_deleted: {messages_deleted}"),
+            format!("nodes_deleted: {nodes_deleted}"),
+            format!("lifecycle_rows_deleted: {lifecycle_deleted}"),
+            format!("lifecycle_rows_skipped: {lifecycle_skipped}"),
+            "note: backup created before cleanup apply".to_string(),
+        ]
+        .join("\n"),
+        Err(e) => [
+            "LCM doctor clean apply".to_string(),
+            "status: error".to_string(),
+            format!("database_path: {db}"),
+            format!("backup_path: {}", backup.path.display()),
+            format!("backup_size: {}", fmt_size(backup.size)),
+            format!("error: cleanup apply failed: {e}"),
+            "note: cleanup apply rolled back; restore from the backup if you need to inspect \
+             pre-apply state"
+                .to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
+/// `/lcm doctor retention` — read-only retention analysis scoped to the active session
+/// (`_doctor_retention_text` + `_scan_retention_candidates`, `LCM:command.py:285/1248`).
+fn doctor_retention_text(engine: &LcmContextEngine) -> String {
+    let session = engine.bound_session_id();
+    let rows = if session.is_empty() {
+        Vec::new()
+    } else {
+        match engine.store.session_footprints(Some(&session)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return [
+                    "LCM doctor retention".to_string(),
+                    "status: error".to_string(),
+                    format!("error: {e}"),
+                    "note: read-only analysis only — no rows were deleted".to_string(),
+                ]
+                .join("\n");
+            }
+        }
+    };
+    struct RetentionRow {
+        session_id: String,
+        protected: bool,
+        message_count: i64,
+        node_count: i64,
+        token_total: i64,
+        last_activity_at: f64,
+        age_days: f64,
+    }
+    let now = LcmContextEngine::now();
+    let mut sessions: Vec<RetentionRow> = Vec::new();
+    let (mut stale_30, mut stale_90, mut tokens_30, mut tokens_90, mut protected_count) =
+        (0i64, 0i64, 0i64, 0i64, 0i64);
+    for row in rows {
+        let timestamps: Vec<f64> = [
+            row.first_message_at,
+            row.last_message_at,
+            row.first_node_at,
+            row.last_node_at,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if timestamps.is_empty() {
+            continue;
+        }
+        let last_activity_at = timestamps.iter().copied().fold(f64::MIN, f64::max);
+        let age_days = ((now - last_activity_at) / 86_400.0).max(0.0);
+        let protected = row.session_id == session;
+        let token_total = row.token_total + row.node_token_total;
+        if protected {
+            protected_count += 1;
+        }
+        if age_days >= 30.0 {
+            stale_30 += 1;
+            tokens_30 += token_total;
+        }
+        if age_days >= 90.0 {
+            stale_90 += 1;
+            tokens_90 += token_total;
+        }
+        sessions.push(RetentionRow {
+            session_id: row.session_id,
+            protected,
+            message_count: row.message_count,
+            node_count: row.node_count,
+            token_total,
+            last_activity_at,
+            age_days,
+        });
+    }
+    // Python's sort key: protected last, stale bucket first, then footprint descending
+    // (`LCM:command.py:416-426`).
+    sessions.sort_by(|a, b| {
+        (a.protected as u8)
+            .cmp(&(b.protected as u8))
+            .then_with(|| {
+                let a_fresh = u8::from(a.age_days < 30.0);
+                let b_fresh = u8::from(b.age_days < 30.0);
+                a_fresh.cmp(&b_fresh)
+            })
+            .then_with(|| b.token_total.cmp(&a.token_total))
+            .then_with(|| b.node_count.cmp(&a.node_count))
+            .then_with(|| b.message_count.cmp(&a.message_count))
+            .then_with(|| {
+                a.last_activity_at
+                    .partial_cmp(&b.last_activity_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    let mut lines = vec![
+        "LCM doctor retention".to_string(),
+        format!(
+            "status: {}",
+            if sessions.is_empty() {
+                "ok"
+            } else {
+                "analysis-ready"
+            }
+        ),
+        format!("sessions_analyzed: {}", sessions.len()),
+        format!("stale_sessions_30d: {stale_30}"),
+        format!("stale_sessions_90d: {stale_90}"),
+        format!("retained_tokens_30d: {tokens_30}"),
+        format!("retained_tokens_90d: {tokens_90}"),
+    ];
+    if protected_count > 0 {
+        lines.push(format!("protected_sessions: {protected_count}"));
+    }
+    if sessions.is_empty() {
+        lines.push("result: no stored sessions found for retention analysis".to_string());
+        lines.push("note: read-only analysis only — no rows were deleted".to_string());
+        return lines.join("\n");
+    }
+    lines.push("retention_candidates:".to_string());
+    for item in sessions.iter().take(20) {
+        lines.push(format!(
+            "- {} | protected={} | messages={} | nodes={} | tokens={} | age_days={:.1}",
+            item.session_id,
+            if item.protected { "yes" } else { "no" },
+            item.message_count,
+            item.node_count,
+            item.token_total,
+            item.age_days,
+        ));
+    }
+    if sessions.len() > 20 {
+        lines.push(format!(
+            "... {} more session(s) omitted",
+            sessions.len() - 20
+        ));
+    }
+    lines.push("note: retention analysis is scoped to the active session only".to_string());
+    lines.push(
+        "note: stale sessions are listed before fresh ones; within each bucket, candidates are \
+         sorted by footprint (tokens/nodes/messages), with protected current-session entries \
+         listed after non-protected ones"
+            .to_string(),
+    );
+    lines.push("note: read-only analysis only — no rows were deleted".to_string());
+    lines.push(
+        "note: if you prune later, create a safety snapshot first with `/lcm backup`".to_string(),
+    );
+    lines.join("\n")
+}
+
+/// `/lcm doctor clean lifecycle` — read-only scan for lifecycle rows with zero stored data
+/// (`_doctor_clean_lifecycle_text`, `LCM:command.py:1435`).
+fn doctor_clean_lifecycle_text(engine: &LcmContextEngine) -> String {
+    let count = engine.store.lifecycle_row_count().unwrap_or(0);
+    let protected = vec![engine.bound_session_id()];
+    let (empty_current, empty_finalized, empty_protected) =
+        match engine.store.empty_lifecycle_stats(&protected) {
+            Ok(stats) => stats,
+            Err(e) => {
+                return [
+                    "LCM doctor clean lifecycle".to_string(),
+                    "status: error".to_string(),
+                    format!("error: {e}"),
+                    "note: read-only scan — no rows were deleted".to_string(),
+                ]
+                .join("\n");
+            }
+        };
+    let total_empty = empty_current + empty_finalized;
+    if total_empty == 0 {
+        return [
+            "LCM doctor clean lifecycle".to_string(),
+            "status: ok".to_string(),
+            format!("lifecycle_rows: {count}"),
+            "empty_rows: 0".to_string(),
+            "note: no empty lifecycle rows to prune".to_string(),
+        ]
+        .join("\n");
+    }
+    [
+        "LCM doctor clean lifecycle".to_string(),
+        "status: candidates-found".to_string(),
+        format!("lifecycle_rows: {count}"),
+        format!("empty_rows: {total_empty}"),
+        format!("  empty_current: {empty_current}"),
+        format!("  empty_finalized: {empty_finalized}"),
+        format!("  empty_protected: {empty_protected}"),
+        "note: read-only scan — no rows were deleted".to_string(),
+        "note: empty rows reference sessions with zero messages and zero nodes".to_string(),
+        "note: use `/lcm doctor clean lifecycle apply` to delete empty rows".to_string(),
+    ]
+    .join("\n")
+}
+
+/// `/lcm doctor clean lifecycle apply` — backup-first pruning of empty lifecycle rows
+/// (`_doctor_clean_lifecycle_apply_text`, `LCM:command.py:1490`). Denied unless
+/// `doctor_clean_apply_enabled` is set; the operator apply prunes regardless of row age (the
+/// automatic session-bind GC keeps its age guard).
+fn doctor_clean_lifecycle_apply_text(engine: &LcmContextEngine) -> String {
+    if !engine.config.doctor_clean_apply_enabled {
+        return [
+            "LCM doctor clean lifecycle apply".to_string(),
+            "status: denied".to_string(),
+            "error: destructive cleanup is disabled by default".to_string(),
+            "note: enable `doctor_clean_apply_enabled` only in trusted operator environments"
+                .to_string(),
+            "note: no rows were deleted".to_string(),
+        ]
+        .join("\n");
+    }
+    let db = engine
+        .config
+        .db_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let backup = match engine.backup_database() {
+        Ok(b) => b,
+        Err(e) => {
+            return [
+                "LCM doctor clean lifecycle apply".to_string(),
+                "status: error".to_string(),
+                "error: failed to create backup before destructive cleanup".to_string(),
+                format!("database_path: {db}"),
+                format!("backup_error: {e}"),
+                "note: no rows were deleted".to_string(),
+            ]
+            .join("\n");
+        }
+    };
+    let before = engine.store.lifecycle_row_count().unwrap_or(0);
+    let protected = vec![engine.bound_session_id()];
+    match engine
+        .store
+        .prune_empty_sessions(&protected, None, LcmContextEngine::now())
+    {
+        Ok(deleted) => {
+            let after = engine.store.lifecycle_row_count().unwrap_or(0);
+            [
+                "LCM doctor clean lifecycle apply".to_string(),
+                "status: ok".to_string(),
+                format!("lifecycle_rows_before: {before}"),
+                format!("lifecycle_rows_deleted: {deleted}"),
+                format!("lifecycle_rows_remaining: {after}"),
+                format!("backup_path: {}", backup.path.display()),
+                format!("backup_size_bytes: {}", backup.size),
+                "note: only empty lifecycle rows were deleted — messages and nodes untouched"
+                    .to_string(),
+            ]
+            .join("\n")
+        }
+        Err(e) => [
+            "LCM doctor clean lifecycle apply".to_string(),
+            "status: error".to_string(),
+            "error: failed to prune empty sessions".to_string(),
+            format!("backup_path: {}", backup.path.display()),
+            format!("prune_error: {e}"),
+            "note: no rows were deleted".to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
 /// `/lcm doctor source` — read-only scan for legacy blank-`source` rows (`_doctor_source_text`,
 /// `LCM:command.py:766`). Reports the source-bucket breakdown and how many rows a normalize would
 /// touch, without changing anything.
@@ -1919,22 +2407,36 @@ impl CommandProvider for LcmContextEngine {
                 let json = self.call_tool("lcm_status", Value::Null).await;
                 Ok(CommandOutput::text(pretty_json(&json)))
             }
-            "doctor" => match (arg(1), arg(2)) {
-                (None, _) => {
+            "doctor" => match (arg(1), arg(2), arg(3)) {
+                (None, _, _) => {
                     let json = self.call_tool("lcm_doctor", Value::Null).await;
                     Ok(CommandOutput::text(pretty_json(&json)))
                 }
-                (Some("repair"), None) => Ok(CommandOutput::text(doctor_repair_text(self))),
-                (Some("repair"), Some("apply")) => {
+                (Some("repair"), None, _) => Ok(CommandOutput::text(doctor_repair_text(self))),
+                (Some("repair"), Some("apply"), _) => {
                     Ok(CommandOutput::text(doctor_repair_apply_text(self)))
                 }
-                (Some("source"), None) => Ok(CommandOutput::text(doctor_source_text(self))),
-                (Some("source"), Some("apply")) => {
+                (Some("source"), None, _) => Ok(CommandOutput::text(doctor_source_text(self))),
+                (Some("source"), Some("apply"), _) => {
                     Ok(CommandOutput::text(doctor_source_apply_text(self)))
                 }
+                (Some("retention"), None, _) => {
+                    Ok(CommandOutput::text(doctor_retention_text(self)))
+                }
+                (Some("clean"), None, _) => Ok(CommandOutput::text(doctor_clean_text(self))),
+                (Some("clean"), Some("apply"), _) => {
+                    Ok(CommandOutput::text(doctor_clean_apply_text(self)))
+                }
+                (Some("clean"), Some("lifecycle"), None) => {
+                    Ok(CommandOutput::text(doctor_clean_lifecycle_text(self)))
+                }
+                (Some("clean"), Some("lifecycle"), Some("apply")) => {
+                    Ok(CommandOutput::text(doctor_clean_lifecycle_apply_text(self)))
+                }
                 _ => Err(CommandError::BadArgs(
-                    "unknown /lcm doctor subcommand (try `doctor`, `doctor repair [apply]`, or \
-                     `doctor source [apply]`)"
+                    "unknown /lcm doctor subcommand (try `doctor`, `doctor repair [apply]`, \
+                     `doctor source [apply]`, `doctor retention`, `doctor clean [apply]`, or \
+                     `doctor clean lifecycle [apply]`)"
                         .to_string(),
                 )),
             },
@@ -4533,7 +5035,7 @@ mod tests {
 
     // parity: command.py::test_lcm_doctor_retention_reports_old_heavy_sessions (tests/test_lcm_command.py:744)
     #[tokio::test]
-    async fn parity_gap_doctor_retention_scopes_analysis_to_the_active_session() {
+    async fn doctor_retention_scopes_analysis_to_the_active_session() {
         let lcm = LcmContextEngine::open_for_session(
             LcmConfig::in_memory(),
             &SessionId::new("s1"),
@@ -4570,7 +5072,7 @@ mod tests {
 
     // parity: command.py::test_lcm_doctor_retention_counts_summary_only_sessions (tests/test_lcm_command.py:786)
     #[tokio::test]
-    async fn parity_gap_doctor_retention_reports_nothing_without_active_session_rows() {
+    async fn doctor_retention_reports_nothing_without_active_session_rows() {
         let lcm = LcmContextEngine::open_for_session(
             LcmConfig::in_memory(),
             &SessionId::new("s1"),
@@ -4592,7 +5094,7 @@ mod tests {
 
     // parity: command.py::test_lcm_doctor_clean_reports_pattern_matched_junk_candidates (tests/test_lcm_command.py:840)
     #[tokio::test]
-    async fn parity_gap_doctor_clean_reports_pattern_matched_junk_candidates() {
+    async fn doctor_clean_reports_pattern_matched_junk_candidates() {
         let cfg = LcmConfig {
             ignore_session_patterns: vec!["cron*".to_string()],
             ..LcmConfig::in_memory()
@@ -4612,7 +5114,7 @@ mod tests {
 
     // parity: command.py::test_lcm_doctor_clean_prefers_ignore_over_stateless_when_both_match (tests/test_lcm_command.py:859)
     #[tokio::test]
-    async fn parity_gap_doctor_clean_prefers_ignored_class_over_stateless() {
+    async fn doctor_clean_prefers_ignored_class_over_stateless() {
         let cfg = LcmConfig {
             ignore_session_patterns: vec!["cron*".to_string()],
             stateless_session_patterns: vec!["cron*".to_string()],
@@ -4630,7 +5132,7 @@ mod tests {
 
     // parity: command.py::test_lcm_doctor_clean_apply_denied_by_default (tests/test_lcm_command.py:1026)
     #[tokio::test]
-    async fn parity_gap_doctor_clean_apply_denied_by_default() {
+    async fn doctor_clean_apply_denied_by_default() {
         let cfg = LcmConfig {
             ignore_session_patterns: vec!["cron*".to_string()],
             ..LcmConfig::in_memory()
@@ -4648,7 +5150,7 @@ mod tests {
 
     // parity: command.py::test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates (tests/test_lcm_command.py:910)
     #[tokio::test]
-    async fn parity_gap_doctor_clean_apply_backup_first_deletes_safe_candidates() {
+    async fn doctor_clean_apply_backup_first_deletes_safe_candidates() {
         let dir = reconcile_dir("clean-apply");
         let cfg = LcmConfig {
             data_dir: dir.clone(),
@@ -4690,7 +5192,7 @@ mod tests {
 
     // parity: command.py::test_lcm_doctor_clean_lifecycle_reports_empty_candidates (tests/test_lcm_command.py:1042)
     #[tokio::test]
-    async fn parity_gap_doctor_clean_lifecycle_reports_empty_rows() {
+    async fn doctor_clean_lifecycle_reports_empty_rows() {
         let lcm = LcmContextEngine::open_for_session(
             LcmConfig::in_memory(),
             &SessionId::new("s1"),
@@ -4718,7 +5220,7 @@ mod tests {
 
     // parity: command.py::test_lcm_doctor_clean_lifecycle_apply_is_backup_first_and_deletes_safe_candidates (tests/test_lcm_command.py:1063)
     #[tokio::test]
-    async fn parity_gap_doctor_clean_lifecycle_apply_deletes_empty_rows() {
+    async fn doctor_clean_lifecycle_apply_deletes_empty_rows() {
         let dir = reconcile_dir("clean-lifecycle-apply");
         let cfg = LcmConfig {
             data_dir: dir.clone(),
@@ -4754,7 +5256,7 @@ mod tests {
 
     // parity: command.py::test_lcm_doctor_clean_lifecycle_apply_denied_by_default (tests/test_lcm_command.py:1091)
     #[tokio::test]
-    async fn parity_gap_doctor_clean_lifecycle_apply_denied_by_default() {
+    async fn doctor_clean_lifecycle_apply_denied_by_default() {
         let lcm = LcmContextEngine::open_for_session(
             LcmConfig::in_memory(),
             &SessionId::new("s1"),
