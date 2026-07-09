@@ -669,6 +669,368 @@ mod tests {
         assert!(unknown.contains("unknown_tool"));
     }
 
+    /// Seed a private memory through the tool surface and stamp its `author_id` (the
+    /// `_seed_private` fixture, tests/test_hermes_memory_provider_validation.py:30).
+    async fn seed_with_author(provider: &MnemosyneProvider, content: &str, author: &str) -> String {
+        let res = provider
+            .call_tool(
+                "mnemosyne_remember",
+                json!({"content": content, "importance": 0.7, "source": "fact"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed["status"], "stored", "seed failed: {res}");
+        let mid = parsed["memory_id"].as_str().unwrap().to_string();
+        provider
+            .engine
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE working_memory SET author_id = ?1 WHERE id = ?2",
+                    rusqlite::params![author, mid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        mid
+    }
+
+    /// `(author_id, validator, validated_at, validation_count, valid_until, content)` for a row
+    /// (the `_row` fixture, tests/test_hermes_memory_provider_validation.py:57).
+    type RowFields = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+        String,
+    );
+    fn row_fields(engine: &Engine, mid: &str) -> Option<RowFields> {
+        use rusqlite::OptionalExtension;
+        engine
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT author_id, validator, validated_at, COALESCE(validation_count, 0), \
+                     valid_until, content FROM working_memory WHERE id = ?1",
+                    rusqlite::params![mid],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?)
+            })
+            .unwrap()
+    }
+
+    /// `(validator, action, new_content)` rows, insertion-ordered (the `_validation_log`
+    /// fixture, tests/test_hermes_memory_provider_validation.py:67).
+    fn validation_log(engine: &Engine, mid: &str) -> Vec<(String, String, Option<String>)> {
+        engine
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT validator, action, new_content FROM memory_validations \
+                     WHERE memory_id = ?1 ORDER BY validation_id",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![mid], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap()
+    }
+
+    // parity: test_hermes_memory_provider_validation.py::test_validate_attest_preserves_author_and_records_validator (tests/test_hermes_memory_provider_validation.py:106)
+    #[tokio::test]
+    async fn parity_gap_tool_validate_attest_records_validator_preserving_author() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        let mid = seed_with_author(&provider, "SSH key at /home/user/.ssh/pc", "Sisyphus").await;
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": mid, "action": "attest", "validator": "Albedo",
+                       "note": "confirmed during deploy"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed["status"], "validation_attest", "got: {res}");
+        assert_eq!(parsed["validator"], "Albedo");
+        assert_eq!(parsed["author_id"], "Sisyphus");
+
+        let (author, validator, validated_at, count, _, _) =
+            row_fields(&provider.engine, &mid).expect("row");
+        assert_eq!(author.as_deref(), Some("Sisyphus"), "author preserved");
+        assert_eq!(validator.as_deref(), Some("Albedo"), "validator updated");
+        assert!(validated_at.is_some(), "validated_at stamped");
+        assert_eq!(count, 1, "validation_count incremented");
+    }
+
+    // parity: test_hermes_memory_provider_validation.py::test_validate_attest_falls_back_to_agent_identity (tests/test_hermes_memory_provider_validation.py:129)
+    #[tokio::test]
+    async fn parity_gap_tool_validate_attest_falls_back_to_agent_identity() {
+        // The engine's configured author_id is the Rust analog of the Python provider's
+        // `_agent_identity` fallback.
+        let engine = Arc::new(
+            Engine::open_in_memory(MnemosyneConfig {
+                author_id: Some("Hopz".to_string()),
+                ..MnemosyneConfig::default()
+            })
+            .unwrap(),
+        );
+        let provider = MnemosyneProvider::new(engine);
+        let mid = seed_with_author(&provider, "Project at /tmp/proj", "Sisyphus").await;
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": mid, "action": "attest"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed["validator"], "Hopz", "got: {res}");
+    }
+
+    // parity: test_hermes_memory_provider_validation.py::test_validate_update_replaces_content_and_keeps_author (tests/test_hermes_memory_provider_validation.py:143)
+    // parity: test_hermes_memory_provider_validation.py::test_validate_update_requires_new_content (tests/test_hermes_memory_provider_validation.py:161)
+    #[tokio::test]
+    async fn parity_gap_tool_validate_update_replaces_content_and_requires_new_content() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        let mid = seed_with_author(&provider, "SSH key at /home/user/.ssh/pc", "Sisyphus").await;
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": mid, "action": "update", "validator": "Albedo",
+                       "new_content": "SSH key at /home/user/.ssh/laptop"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed["status"], "validation_update", "got: {res}");
+        let (author, validator, _, _, _, content) =
+            row_fields(&provider.engine, &mid).expect("row");
+        assert_eq!(
+            content, "SSH key at /home/user/.ssh/laptop",
+            "content updated"
+        );
+        assert_eq!(author.as_deref(), Some("Sisyphus"), "author preserved");
+        assert_eq!(validator.as_deref(), Some("Albedo"), "validator updated");
+
+        // `update` without new_content is rejected.
+        let bad = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": mid, "action": "update", "validator": "Albedo"}),
+            )
+            .await;
+        assert!(bad.contains("new_content is required"), "got: {bad}");
+    }
+
+    // parity: test_hermes_memory_provider_validation.py::test_validate_invalidate_sets_valid_until (tests/test_hermes_memory_provider_validation.py:175)
+    #[tokio::test]
+    async fn parity_gap_tool_validate_invalidate_sets_valid_until() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        let mid = seed_with_author(&provider, "outdated fact about VPN", "Sisyphus").await;
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": mid, "action": "invalidate", "validator": "Hopz",
+                       "note": "user changed VPN"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed["status"], "validation_invalidate", "got: {res}");
+        let (author, validator, _, _, valid_until, _) =
+            row_fields(&provider.engine, &mid).expect("row");
+        assert!(valid_until.is_some(), "valid_until set");
+        assert_eq!(validator.as_deref(), Some("Hopz"), "validator recorded");
+        assert_eq!(author.as_deref(), Some("Sisyphus"), "author preserved");
+    }
+
+    // parity: test_hermes_memory_provider_validation.py::test_validate_delete_removes_row (tests/test_hermes_memory_provider_validation.py:195)
+    #[tokio::test]
+    async fn parity_gap_tool_validate_delete_removes_row() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        let mid = seed_with_author(&provider, "stale fact", "Sisyphus").await;
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": mid, "action": "delete", "validator": "Albedo"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed["status"], "validation_delete", "got: {res}");
+        assert!(
+            row_fields(&provider.engine, &mid).is_none(),
+            "row must be deleted"
+        );
+    }
+
+    // parity: test_hermes_memory_provider_validation.py::test_validate_works_on_shared_surface (tests/test_hermes_memory_provider_validation.py:211)
+    #[tokio::test]
+    async fn parity_gap_tool_validate_works_on_shared_surface() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        let stored = provider
+            .call_tool(
+                "mnemosyne_shared_remember",
+                json!({"content": "User prefers Tailscale over OpenVPN", "kind": "preference"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed["status"], "stored_shared", "seed failed: {stored}");
+        let mid = parsed["memory_id"].as_str().unwrap().to_string();
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": mid, "action": "attest", "validator": "Albedo",
+                       "bank": "surface"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(parsed["status"], "validation_attest", "got: {res}");
+        assert_eq!(parsed["bank"], "surface");
+        let surface = provider.surface_engine().expect("surface engine");
+        let (_, validator, _, _, _, _) = row_fields(surface, &mid).expect("surface row");
+        assert_eq!(validator.as_deref(), Some("Albedo"));
+    }
+
+    // parity: test_hermes_memory_provider_validation.py::test_ring_buffer_keeps_only_last_three_validations (tests/test_hermes_memory_provider_validation.py:230)
+    // parity: test_hermes_memory_provider_validation.py::test_validation_count_grows_unbounded (tests/test_hermes_memory_provider_validation.py:247)
+    #[tokio::test]
+    async fn parity_gap_tool_validate_ring_buffer_keeps_last_three_while_count_grows() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        let mid = seed_with_author(&provider, "SSH key location", "Sisyphus").await;
+
+        for who in ["v1", "v2", "v3", "v4", "v5", "v6"] {
+            provider
+                .call_tool(
+                    "mnemosyne_validate",
+                    json!({"memory_id": mid, "action": "attest", "validator": who}),
+                )
+                .await;
+        }
+
+        let log = validation_log(&provider.engine, &mid);
+        let validators: Vec<&str> = log.iter().map(|(v, _, _)| v.as_str()).collect();
+        assert_eq!(
+            validators,
+            vec!["v4", "v5", "v6"],
+            "ring buffer keeps only the last 3"
+        );
+        let (_, _, _, count, _, _) = row_fields(&provider.engine, &mid).expect("row");
+        assert_eq!(count, 6, "validation_count on the live row grows unbounded");
+    }
+
+    // parity: test_hermes_memory_provider_validation.py::test_validate_unknown_memory_returns_error (tests/test_hermes_memory_provider_validation.py:265)
+    // parity: test_hermes_memory_provider_validation.py::test_validate_unknown_action_rejected (tests/test_hermes_memory_provider_validation.py:274)
+    // parity: test_hermes_memory_provider_validation.py::test_validate_unknown_bank_rejected (tests/test_hermes_memory_provider_validation.py:284)
+    // parity: test_hermes_memory_provider_validation.py::test_validate_missing_memory_id_rejected (tests/test_hermes_memory_provider_validation.py:295)
+    #[tokio::test]
+    async fn parity_gap_tool_validate_rejects_bad_requests() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        let mid = seed_with_author(&provider, "fact", "Sisyphus").await;
+
+        let unknown_memory = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": "nonexistent", "action": "attest"}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&unknown_memory).unwrap();
+        assert_eq!(parsed["error"], "memory_not_found", "got: {unknown_memory}");
+
+        let unknown_action = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": mid, "action": "frobnicate"}),
+            )
+            .await;
+        assert!(
+            unknown_action.contains("unknown action"),
+            "got: {unknown_action}"
+        );
+        assert!(
+            validation_log(&provider.engine, &mid).is_empty(),
+            "a rejected action must not append a validation row"
+        );
+
+        let unknown_bank = provider
+            .call_tool(
+                "mnemosyne_validate",
+                json!({"memory_id": mid, "action": "attest", "bank": "weird"}),
+            )
+            .await;
+        assert!(unknown_bank.contains("unknown bank"), "got: {unknown_bank}");
+
+        let missing_id = provider
+            .call_tool("mnemosyne_validate", json!({"action": "attest"}))
+            .await;
+        assert!(
+            missing_id.contains("memory_id is required"),
+            "got: {missing_id}"
+        );
+    }
+
+    // parity: test_hermes_memory_provider_validation.py::test_collaborative_attestation_chain (tests/test_hermes_memory_provider_validation.py:303)
+    #[tokio::test]
+    async fn parity_gap_tool_validate_collaborative_attestation_chain() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        let mid = seed_with_author(&provider, "SSH key at /home/user/.ssh/pc", "Sisyphus").await;
+
+        for (action, validator, new_content) in [
+            (
+                "update",
+                "Albedo",
+                Some("SSH key at /home/user/.ssh/laptop"),
+            ),
+            (
+                "update",
+                "Sisyphus",
+                Some("SSH key at /home/user/.ssh/main"),
+            ),
+            ("attest", "Hopz", None),
+        ] {
+            let mut args = json!({"memory_id": mid, "action": action, "validator": validator});
+            if let Some(c) = new_content {
+                args["new_content"] = json!(c);
+            }
+            provider.call_tool("mnemosyne_validate", args).await;
+        }
+
+        let (author, validator, _, count, _, content) =
+            row_fields(&provider.engine, &mid).expect("row");
+        assert_eq!(author.as_deref(), Some("Sisyphus"), "author preserved");
+        assert_eq!(validator.as_deref(), Some("Hopz"), "latest validator");
+        assert_eq!(count, 3);
+        assert!(content.contains("main"), "latest content: {content}");
+
+        let log = validation_log(&provider.engine, &mid);
+        assert_eq!(
+            log.iter().map(|(v, _, _)| v.as_str()).collect::<Vec<_>>(),
+            vec!["Albedo", "Sisyphus", "Hopz"]
+        );
+        assert_eq!(
+            log.iter().map(|(_, a, _)| a.as_str()).collect::<Vec<_>>(),
+            vec!["update", "update", "attest"]
+        );
+    }
+
     #[tokio::test]
     async fn shared_tools_write_to_separate_surface_bank() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
