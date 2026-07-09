@@ -4052,10 +4052,12 @@ pub enum JournalRecordPayload {
     },
     /// A rich chat message (wire vNEXT): the [`ChatMessage`] representation of a conversation-history
     /// entry, carrying delivery/edit state, author, and attachments the coarser `Block` shape omits.
-    /// Additive — clients that only know `Management`/`Block` ignore it.
+    /// Additive — clients that only know `Management`/`Block` ignore it. Boxed to keep the enum small
+    /// (`ChatMessage` is the largest variant); `Box<T>` serializes identically, so the wire shape is
+    /// unchanged.
     Chat {
         /// The decoded chat message.
-        message: ChatMessage,
+        message: Box<ChatMessage>,
     },
 }
 

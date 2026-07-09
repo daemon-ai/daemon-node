@@ -116,7 +116,7 @@ malformed").
 | `/tags/to-string-single` | `tags_to_string_single` | PORT |
 | `/tags/to-string-multiple-with-separator` | `tags_to_string_multiple_with_separator` | PORT |
 | `/tags/to-string-multiple-with-null-separator` | `tags_to_string_multiple_with_null_separator` | PORT |
-| `/tag/split` | `tag_split` | PORT (full data table incl. `🐦` unicode rows) |
+| `/tag/split` | `tag_split_table` | PORT (full data table incl. `🐦` unicode rows) |
 | `/tag/contains/full` | `tags_contains_full` | PORT |
 | `/tag/contains/partial` | `tags_contains_partial` | PORT |
 | `/tag/contains/none` | `tags_contains_none` | PORT |
@@ -145,11 +145,25 @@ covering every row:
 
 ## Summary
 
-- **libpurple g_test cases enumerated in scope:** 33 (5 message + 27 tags + 1 markup g_test with 10
-  data rows → 42 assertions), all PORT.
-- **Skipped (documented, not counted as cases):** GObject signal-emission counters and `GListModel`
-  machinery (message `notify::*`, tags `added`/`removed` + item-type/items-changed), and
+- **libpurple g_test cases enumerated in scope:** 33 (5 message + 27 tags + 1 markup g_test whose
+  10-row data table is ported in full), all PORT — zero skipped cases.
+- **Skipped (documented sub-aspects, not counted as cases):** GObject signal-emission counters and
+  `GListModel` machinery (message `notify::*`, tags `added`/`removed` + item-type/items-changed), and
   `PurpleMessage:attributes` (Pango run-list). All are toolkit constructs with no wire/DTO meaning;
   the state they guard is ported.
 - **EXTRA coverage added:** message `is_empty` / `compare_timestamp` / wire round-trip; tags
   conversation-type alignment; markup entity + numeric-entity + malformed rows.
+
+## Evidence (TDD)
+
+- **Rust test totals:** 41 tests — 8 `message.rs` + 28 `tags.rs` + 5 `markup.rs`.
+- **RED (commit `3dad397`, stubs only):** 35 of 41 failed at assertion level — markup 5/5,
+  tags 23/28, message 7/8. The 6 that passed red are vacuously-true-on-empty edges
+  (`tags_lookup_non_existent`, `tags_remove_non_existent_bare`, `tags_remove_non_existent_with_value`,
+  `tags_remove_all_empty`, `tags_contains_none`) and the serde-only wire round-trip
+  (`chat_message_journal_payload_round_trips`), which exercises no stubbed behavior.
+- **GREEN:** all 41 pass; CDDL conformance (`fixtures_validate_against_cddl`,
+  `invalid_payloads_are_rejected`) and the arbitrary proptests
+  (`arbitrary_api_request_matches_cddl`, `arbitrary_api_response_matches_cddl`) green, proving the
+  `chat-message` / `message-attachment` / `journal-record-payload-chat` CDDL rules are in lockstep
+  with the Rust types (incl. the `Box<ChatMessage>` variant payload, which encodes identically).

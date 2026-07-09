@@ -60,6 +60,35 @@ pub(super) fn try_render(resp: ApiResponse) -> Option<ApiResponse> {
                         "  - [{}] cur={} seg={} seq={} {} block: {:?}",
                         mark, r.cursor, r.segment, r.seq, r.kind, block
                     ),
+                    // wire vNEXT (W2-E): the richer chat-message history entry.
+                    JournalRecordPayload::Chat { message } => {
+                        let author = match &message.author {
+                            Some(daemon_api::Participant::Contact(c)) => {
+                                c.display_name.clone().unwrap_or_else(|| c.id.clone())
+                            }
+                            Some(daemon_api::Participant::Agent { member, .. }) => member.clone(),
+                            None => "-".into(),
+                        };
+                        let mut flags = Vec::new();
+                        if message.delivered() {
+                            flags.push("delivered");
+                        }
+                        if message.edited() {
+                            flags.push("edited");
+                        }
+                        if !message.attachments.is_empty() {
+                            flags.push("attachments");
+                        }
+                        let flags = if flags.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", flags.join(","))
+                        };
+                        println!(
+                            "  - [{}] cur={} seg={} seq={} {} chat: <{}> {}{}",
+                            mark, r.cursor, r.segment, r.seq, r.kind, author, message.text, flags
+                        );
+                    }
                 }
             }
         }

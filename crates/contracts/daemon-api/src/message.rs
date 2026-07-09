@@ -17,7 +17,7 @@ use crate::Participant;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-/// One message attachment (← `PurpleAttachment`).
+/// One message attachment (← `PurpleAttachment`). `wire vNEXT`.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageAttachment {
@@ -106,38 +106,46 @@ impl ChatMessage {
 
     /// Whether the message was delivered (`purple_message_get_delivered`): `delivered_at` is set.
     pub fn delivered(&self) -> bool {
-        false
+        self.delivered_at.is_some()
     }
 
     /// Set/clear delivery (`purple_message_set_delivered`): `true` stamps `delivered_at` with `now`,
     /// `false` clears it.
-    pub fn set_delivered(&mut self, _delivered: bool, _now: u64) {}
+    pub fn set_delivered(&mut self, delivered: bool, now: u64) {
+        self.set_delivered_at(delivered.then_some(now));
+    }
 
     /// Set the delivered timestamp directly (`purple_message_set_delivered_at`); `None` clears it (and
     /// thus marks the message not-delivered).
-    pub fn set_delivered_at(&mut self, _at: Option<u64>) {}
+    pub fn set_delivered_at(&mut self, at: Option<u64>) {
+        self.delivered_at = at;
+    }
 
     /// Whether the message was edited (`purple_message_get_edited`): `edited_at` is set.
     pub fn edited(&self) -> bool {
-        false
+        self.edited_at.is_some()
     }
 
     /// Set/clear edited (`purple_message_set_edited`): `true` stamps `edited_at` with `now`, `false`
     /// clears it.
-    pub fn set_edited(&mut self, _edited: bool, _now: u64) {}
+    pub fn set_edited(&mut self, edited: bool, now: u64) {
+        self.set_edited_at(edited.then_some(now));
+    }
 
     /// Set the edited timestamp directly (`purple_message_set_edited_at`); `None` clears it.
-    pub fn set_edited_at(&mut self, _at: Option<u64>) {}
+    pub fn set_edited_at(&mut self, at: Option<u64>) {
+        self.edited_at = at;
+    }
 
     /// Whether the message body is empty (`purple_message_is_empty`).
     pub fn is_empty(&self) -> bool {
-        true
+        self.text.is_empty()
     }
 
     /// Order two messages by timestamp (`purple_message_compare_timestamp`): an unset timestamp
-    /// (`None`) sorts before a set one, else earlier before later.
-    pub fn compare_timestamp(&self, _other: &ChatMessage) -> Ordering {
-        Ordering::Equal
+    /// (`None`) sorts before a set one, else earlier before later (`birb_date_time_compare`).
+    pub fn compare_timestamp(&self, other: &ChatMessage) -> Ordering {
+        self.timestamp.cmp(&other.timestamp)
     }
 }
 
@@ -278,10 +286,15 @@ mod tests {
         // The additive wire arm: ChatMessage rides the conversation-history surface.
         let msg = ChatMessage::new(Some(contact("u")), "hi");
         let payload = JournalRecordPayload::Chat {
-            message: msg.clone(),
+            message: Box::new(msg.clone()),
         };
         let bytes = crate::to_cbor(&payload);
         let back: JournalRecordPayload = crate::from_cbor(&bytes).expect("decode");
-        assert_eq!(back, JournalRecordPayload::Chat { message: msg });
+        assert_eq!(
+            back,
+            JournalRecordPayload::Chat {
+                message: Box::new(msg)
+            }
+        );
     }
 }

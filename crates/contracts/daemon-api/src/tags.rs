@@ -14,8 +14,11 @@ use crate::ConversationType;
 
 /// Split a tag into `(name, value)` on the first `:` (`purple_tag_split`). No colon → `value` is
 /// `None`. A leading/sole `:` yields `("", Some(rest))`.
-pub fn tag_split(_tag: &str) -> (String, Option<String>) {
-    (String::new(), None)
+pub fn tag_split(tag: &str) -> (String, Option<String>) {
+    match tag.find(':') {
+        None => (tag.to_string(), None),
+        Some(idx) => (tag[..idx].to_string(), Some(tag[idx + 1..].to_string())),
+    }
 }
 
 /// An ordered set of string tags (← `PurpleTags`).
@@ -45,58 +48,117 @@ impl Tags {
         &self.tags
     }
 
-    /// Add a full tag (`purple_tags_add`): remove any exactly-equal existing tag, then append.
-    pub fn add(&mut self, _tag: &str) {}
+    /// Add a full tag (`purple_tags_add` → `purple_tags_real_add`): remove any exactly-equal existing
+    /// tag, then append. A duplicate add therefore moves the tag to the end and keeps the length.
+    pub fn add(&mut self, tag: &str) {
+        self.remove(tag);
+        self.tags.push(tag.to_string());
+    }
 
-    /// Add a tag from `(name, value)` (`purple_tags_add_with_value`).
-    pub fn add_with_value(&mut self, _name: &str, _value: Option<&str>) {}
+    /// Add a tag from `(name, value)` (`purple_tags_add_with_value`): builds `"name:value"` (or
+    /// `"name"` when `value` is `None`) then adds it.
+    pub fn add_with_value(&mut self, name: &str, value: Option<&str>) {
+        let tag = match value {
+            Some(v) => format!("{name}:{v}"),
+            None => name.to_string(),
+        };
+        self.add(&tag);
+    }
 
     /// Remove an exactly-equal tag (`purple_tags_remove`). Returns whether one was removed.
-    pub fn remove(&mut self, _tag: &str) -> bool {
-        false
+    pub fn remove(&mut self, tag: &str) -> bool {
+        if let Some(idx) = self.tags.iter().position(|t| t == tag) {
+            self.tags.remove(idx);
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove the tag built from `(name, value)` (`purple_tags_remove_with_value`).
-    pub fn remove_with_value(&mut self, _name: &str, _value: Option<&str>) -> bool {
-        false
+    pub fn remove_with_value(&mut self, name: &str, value: Option<&str>) -> bool {
+        match value {
+            None => self.remove(name),
+            Some(v) => self.remove(&format!("{name}:{v}")),
+        }
     }
 
     /// Remove every tag (`purple_tags_remove_all`).
-    pub fn remove_all(&mut self) {}
-
-    /// Whether an exactly-equal tag exists (`purple_tags_exists`). An empty tag is never present.
-    pub fn exists(&self, _tag: &str) -> bool {
-        false
+    pub fn remove_all(&mut self) {
+        self.tags.clear();
     }
 
-    /// Look up a tag by name (`purple_tags_lookup`): returns `(value, found)`.
-    pub fn lookup(&self, _name: &str) -> (Option<&str>, bool) {
+    /// Whether an exactly-equal tag exists (`purple_tags_exists`). An empty tag is never present.
+    pub fn exists(&self, tag: &str) -> bool {
+        if tag.is_empty() {
+            return false;
+        }
+        self.tags.iter().any(|t| t == tag)
+    }
+
+    /// Look up a tag by name (`purple_tags_lookup`): returns `(value, found)`. For a tag that has
+    /// `name` as a prefix, the char after the prefix decides — end-of-string → bare tag
+    /// (`(None, true)`); `:` → `(Some(value), true)`. A partial name match (`"pur"` vs `"purple"`)
+    /// does not match.
+    pub fn lookup(&self, name: &str) -> (Option<&str>, bool) {
+        for tag in &self.tags {
+            if let Some(rest) = tag.strip_prefix(name) {
+                if rest.is_empty() {
+                    return (None, true);
+                } else if let Some(value) = rest.strip_prefix(':') {
+                    // A ':' right after the name means a valued tag; its value is the remainder.
+                    return (Some(value), true);
+                }
+            }
+        }
         (None, false)
     }
 
     /// The value for `name`, ignoring the found-flag (`purple_tags_get`).
-    pub fn get(&self, _name: &str) -> Option<&str> {
-        None
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.lookup(name).0
     }
 
-    /// The sub-collection of tags whose name is exactly `name` (`purple_tags_get_all_with_name`).
-    pub fn get_all_with_name(&self, _name: &str) -> Tags {
-        Tags::new()
+    /// The sub-collection of tags whose name is exactly `name` (`purple_tags_get_all_with_name`): a
+    /// prefix match followed by end-of-string or `:`. An empty `name` yields an empty collection.
+    pub fn get_all_with_name(&self, name: &str) -> Tags {
+        let mut filtered = Tags::new();
+        if name.is_empty() {
+            return filtered;
+        }
+        for tag in &self.tags {
+            if let Some(rest) = tag.strip_prefix(name) {
+                if rest.is_empty() || rest.starts_with(':') {
+                    filtered.tags.push(tag.clone());
+                }
+            }
+        }
+        filtered
     }
 
     /// Join the tags into a string (`purple_tags_to_string`); `separator = None` concatenates.
-    pub fn to_string_with(&self, _separator: Option<&str>) -> String {
-        String::new()
+    pub fn to_string_with(&self, separator: Option<&str>) -> String {
+        match separator {
+            Some(sep) => self.tags.join(sep),
+            None => self.tags.concat(),
+        }
     }
 
     /// Whether every tag in `needle` exists in `self` (`purple_tags_contains`).
-    pub fn contains(&self, _needle: &Tags) -> bool {
-        false
+    pub fn contains(&self, needle: &Tags) -> bool {
+        needle.tags.iter().all(|tag| self.exists(tag))
     }
 
     /// Set the conversation `"type"` tag from a [`ConversationType`], reusing
-    /// [`ConversationType::tag_value`] (W1-B). `Unset` removes the tag.
-    pub fn set_conversation_type(&mut self, _ty: ConversationType) {}
+    /// [`ConversationType::tag_value`] (W1-B, `details.rs`) rather than re-deriving the mapping.
+    /// `Unset` removes any existing `"type"` tag; otherwise the previous `"type"` tag is replaced.
+    pub fn set_conversation_type(&mut self, ty: ConversationType) {
+        // Drop any existing `type` / `type:*` tag first.
+        self.tags.retain(|t| t != "type" && !t.starts_with("type:"));
+        if let Some(value) = ty.tag_value() {
+            self.add_with_value("type", Some(value));
+        }
+    }
 }
 
 #[cfg(test)]

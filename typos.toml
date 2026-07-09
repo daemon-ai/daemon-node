@@ -13,6 +13,9 @@ extend-exclude = [
   "**/build*/**",
   "**/result-*/**",
   "*.lock",
+  # Canonical CBOR wire fixtures are binary codegen (xtask api-fixtures); their byte streams
+  # coincidentally spell fragments (e.g. a text-string length byte after "display_name").
+  "**/fixtures/cbor/**",
 ]
 
 # Domain terms / library names / valid spelling variants / short identifier fragments that typos
