@@ -95,6 +95,7 @@ impl Fixture {
             last_compression_status: "idle",
             last_compression_noop_reason: "",
             ingest_reconciliation: &Value::Null,
+            condensation_suppressed_reason: "",
         }
     }
 }

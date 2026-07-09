@@ -103,6 +103,10 @@ struct State {
     /// `LCM:engine.py:3065-3085`) — surfaced by `lcm_status` as `ingest_reconciliation`.
     /// `Null` renders as the Python "not run" default. Counts are turn-based (adaptation).
     last_ingest_reconciliation: Value,
+    /// The cache-friendly condensation suppression reason of the last compaction
+    /// (`_last_condensation_suppressed_reason`, `LCM:engine.py:380`) — surfaced by `lcm_status`;
+    /// empty when condensation ran, was not gated, or has not been reached yet.
+    last_condensation_suppressed_reason: &'static str,
 }
 
 /// The provider-reported usage snapshot recorded by [`ContextEngine::after_response`]
@@ -276,6 +280,7 @@ impl LcmContextEngine {
         state.last_compression_noop_reason.clear();
         // Back to the "not run" default (`LCM:engine.py:1732`).
         state.last_ingest_reconciliation = Value::Null;
+        state.last_condensation_suppressed_reason = "";
     }
 
     /// The `/new`-style session reset (`on_session_reset`, `LCM:engine.py:2202-2219`): arm the
@@ -408,6 +413,7 @@ impl LcmContextEngine {
             last_compression_status: String,
             last_compression_noop_reason: String,
             ingest_reconciliation: Value,
+            condensation_suppressed_reason: &'static str,
         }
         let snap = {
             let state = self.state.lock().expect("lcm state poisoned");
@@ -430,6 +436,7 @@ impl LcmContextEngine {
                 },
                 last_compression_noop_reason: state.last_compression_noop_reason.clone(),
                 ingest_reconciliation: state.last_ingest_reconciliation.clone(),
+                condensation_suppressed_reason: state.last_condensation_suppressed_reason,
             }
         };
         let cx = ToolCx {
@@ -451,6 +458,7 @@ impl LcmContextEngine {
             last_compression_status: &snap.last_compression_status,
             last_compression_noop_reason: &snap.last_compression_noop_reason,
             ingest_reconciliation: &snap.ingest_reconciliation,
+            condensation_suppressed_reason: snap.condensation_suppressed_reason,
         };
         crate::tools::dispatch(&cx, name, args).await
     }
@@ -1144,6 +1152,7 @@ impl ContextEngine for LcmContextEngine {
         state.breakers = breakers;
         state.cursor = outcome.index.len();
         state.turn_store_ids = outcome.index;
+        state.last_condensation_suppressed_reason = outcome.condensation_suppressed;
         match outcome.status {
             crate::compaction::CompressionStatus::Compacted => {
                 state.compaction_count += 1;
@@ -4237,7 +4246,7 @@ mod tests {
 
     // parity: engine.py::test_cache_friendly_gating_suppresses_follow_on_condensation_for_single_fanin_group (tests/test_lcm_engine.py:4306)
     #[tokio::test]
-    async fn parity_gap_cache_friendly_gating_suppresses_single_fanin_group() {
+    async fn cache_friendly_gating_suppresses_single_fanin_group() {
         let cfg = LcmConfig {
             fresh_tail_count: 2,
             leaf_chunk_tokens: 50,
@@ -4275,7 +4284,7 @@ mod tests {
 
     // parity: engine.py::test_critical_budget_pressure_bypasses_cache_friendly_single_group_suppression (tests/test_lcm_engine.py:4359)
     #[tokio::test]
-    async fn parity_gap_critical_pressure_bypasses_cache_friendly_suppression() {
+    async fn critical_pressure_bypasses_cache_friendly_suppression() {
         let cfg = LcmConfig {
             fresh_tail_count: 2,
             leaf_chunk_tokens: 50,
@@ -4316,7 +4325,7 @@ mod tests {
 
     // parity: engine.py::test_cache_friendly_gating_allows_condensation_when_debt_reaches_two_groups (tests/test_lcm_engine.py:4411)
     #[tokio::test]
-    async fn parity_gap_cache_friendly_gating_allows_two_debt_groups() {
+    async fn cache_friendly_gating_allows_two_debt_groups() {
         let cfg = LcmConfig {
             fresh_tail_count: 2,
             leaf_chunk_tokens: 50,

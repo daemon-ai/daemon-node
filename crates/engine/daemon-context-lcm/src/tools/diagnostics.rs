@@ -597,6 +597,9 @@ pub(super) fn status(cx: &ToolCx<'_>) -> String {
         } else {
             cx.ingest_reconciliation.clone()
         },
+        // `_last_condensation_suppressed_reason` (`LCM:engine.py:2481`) — why the cache-friendly
+        // gate suppressed the last follow-on condensation ("" when it ran or was not gated).
+        "condensation_suppressed_reason": cx.condensation_suppressed_reason,
         "runtime_identity": runtime_identity(cx),
         "lifecycle": lifecycle,
         "lifecycle_fragmentation": lifecycle_fragmentation,

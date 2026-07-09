@@ -102,6 +102,10 @@ pub(crate) struct CompactionOutcome {
     pub index: Vec<Vec<i64>>,
     /// What this call did (drives `lcm_status`'s `last_compression_*` fields).
     pub status: CompressionStatus,
+    /// The cache-friendly condensation suppression reason for this pass
+    /// (`_last_condensation_suppressed_reason` — empty when condensation ran, was not gated, or
+    /// was never reached).
+    pub condensation_suppressed: &'static str,
 }
 
 /// Run one compaction call (`compress`, `LCM:engine.py:851-1160`): up to `max_leaf_passes` leaf
@@ -139,6 +143,7 @@ pub(crate) async fn run_compaction(
         conv: Conversation { system, turns },
         index,
         status: CompressionStatus::Noop(reason.to_string()),
+        condensation_suppressed: "",
     };
     if turns.is_empty() {
         return noop(system, turns, index, "empty message list");
@@ -444,6 +449,7 @@ pub(crate) async fn run_compaction(
                 },
                 index: new_index,
                 status,
+                condensation_suppressed: "",
             };
         }
         return noop(system, turns, index, noop_reason);
@@ -452,7 +458,7 @@ pub(crate) async fn run_compaction(
     // Condensation: climb depths while a level has >= fanin uncondensed siblings (§6.6), carrying
     // the same focus topic + custom instructions into the condensation prompts, subject to the
     // opt-in cache-friendly follow-on gate.
-    condense(
+    let condensation_suppressed = condense(
         store,
         tok,
         cfg,
@@ -512,6 +518,7 @@ pub(crate) async fn run_compaction(
         },
         index: new_index,
         status: CompressionStatus::Compacted,
+        condensation_suppressed,
     }
 }
 
@@ -930,6 +937,10 @@ impl CondensationGate {
 /// still condense). In cache-friendly mode a follow-on condensation right after a leaf pass needs
 /// `fanin * cache_friendly_min_debt_groups` accumulated siblings, and at most one group condenses
 /// per call.
+///
+/// Returns the cache-friendly suppression reason when the gate suppressed every eligible group and
+/// nothing condensed (`_last_condensation_suppressed_reason`, `LCM:engine.py:3933-3934`); empty
+/// otherwise.
 #[allow(clippy::too_many_arguments)]
 async fn condense(
     store: &Store,
@@ -941,12 +952,14 @@ async fn condense(
     focus_topic: &str,
     gate: CondensationGate,
     now: f64,
-) {
+) -> &'static str {
+    let mut condensed_any = false;
+    let mut suppression_reason: &'static str = "";
     let fanin = cfg.condensation_fanin.max(1);
     // `incremental_max_depth`: 0 disables condensation; -1 (unlimited) derives the upper bound
     // from the deepest existing node + 1 so condensation can always create the next depth.
     let upper = match cfg.incremental_max_depth {
-        0 => return,
+        0 => return "",
         d if d < 0 => store.max_depth(session_id).unwrap_or(-1).max(0) + 1,
         d => d,
     };
@@ -964,6 +977,7 @@ async fn condense(
             continue;
         }
         if let Err(reason) = gate.allows(cfg, uncondensed.len()) {
+            suppression_reason = reason;
             tracing::debug!(
                 depth,
                 uncondensed = uncondensed.len(),
@@ -1025,11 +1039,18 @@ async fn condense(
             tracing::warn!(error = %e, depth, "lcm: failed to persist condensation node");
             break;
         }
+        condensed_any = true;
         // Cache-friendly mode condenses at most one group per compress call
         // (`LCM:engine.py:3929-3930`) — the next group waits for a later turn.
         if gate.leaf_compacted_this_turn && cfg.cache_friendly_condensation_enabled {
             break;
         }
+    }
+    // Only a fully suppressed pass reports the reason (`LCM:engine.py:3933-3934`).
+    if !condensed_any && gate.leaf_compacted_this_turn && cfg.cache_friendly_condensation_enabled {
+        suppression_reason
+    } else {
+        ""
     }
 }
 
