@@ -124,6 +124,7 @@ Notes:
 | 42 | `/account-settings/get-set-string-list` | `settings_get_set_string_list` | P |
 | 43 | `/account-settings/remove-all` | `settings_remove_all` | P |
 | 44 | `/account-settings/update` | `settings_update` | P |
+| — | `AccountSettings::to_values` projection (helper) | `settings_to_values_projection` | + |
 
 Typed-accessor semantics: `get_bool/int/string/string_list(id, fallback)` return
 the value only when a setting exists **and has the matching type**, else the
@@ -175,15 +176,16 @@ disconnect-reason DTO behavior is covered by #53.
 - libpurple `g_test` cases enumerated across the 7 scope files: **61**
   (CCD 7, CJD 3, conversation 23, account-setting 8, account-settings 12,
   presence 3, connection 5).
-- Ported (P): **35** (CCD 7, CJD 3, conversation 13, account-setting 6,
+- Ported (P): **40** (CCD 7, CJD 3, conversation 13, account-setting 6,
   account-settings 10, presence 1).
-- Extra derived/daemon-native cases (+): **6** (presence predicates/ordering ×5,
-  disconnect-reason ×1).
+- Extra derived/daemon-native cases (+): **7** (presence predicates/ordering ×5,
+  disconnect-reason ×1, `AccountSettings::to_values` projection ×1).
 - Skipped (S): **26**, each with a reason above — GObject property-bag/signal
   mechanics, or member/message/tag-plumbing owned by other packages, or the
   `federated` conversation flag absent from the wire DTO.
 
-Rust test count in `details::tests`: **41** (35 P + 6 +).
+Rust test count in `details::tests`: **47** (40 P + 7 +). Green run:
+`test result: ok. 47 passed; 0 failed`.
 
 ## Helper APIs added (for later packages)
 
