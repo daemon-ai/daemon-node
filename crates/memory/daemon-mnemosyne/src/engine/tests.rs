@@ -2083,6 +2083,45 @@ fn configured_recall_weights_change_ranking_end_to_end() {
     assert!(hits[0].importance >= 0.5, "top hit is the important row");
 }
 
+// parity: test_configurable_scoring.py::TestRecallConfigurableWeights::test_explicit_params_override_env_in_recall (tests/test_configurable_scoring.py:202)
+#[test]
+fn recall_explicit_weight_overrides_beat_configured_defaults() {
+    // Importance-heavy configured defaults (the env-var layer in Python)…
+    let e = Engine::open_in_memory(MnemosyneConfig {
+        recall_weights: (0.1, 0.1, 0.8),
+        ..MnemosyneConfig::default()
+    })
+    .unwrap();
+    e.remember(
+        "critical alert generic text",
+        &RememberArgs {
+            importance: 0.1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    e.remember(
+        "critical system status",
+        &RememberArgs {
+            importance: 0.9,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // …drive the default ranking toward the important row…
+    let defaults = e.recall("critical alert", 5).unwrap();
+    assert!(
+        defaults[0].content.contains("system status"),
+        "config defaults rank the important row first, got {defaults:?}"
+    );
+    // …but explicit per-call weights take precedence over the configured defaults.
+    let overridden = recall_weighted(&e, "critical alert", (Some(0.5), Some(0.45), Some(0.05)));
+    assert!(
+        overridden[0].content.contains("generic"),
+        "explicit per-call weights must override the configured defaults, got {overridden:?}"
+    );
+}
+
 // parity: test_configurable_scoring.py::TestRecallConfigurableWeights::test_zero_all_weights_uses_defaults_in_recall (tests/test_configurable_scoring.py:227)
 // parity: test_configurable_scoring.py::TestEdgeCases::test_invalid_negative_param_clamped (tests/test_configurable_scoring.py:307)
 // parity: test_configurable_scoring.py::TestEdgeCases::test_very_high_fts_weight (tests/test_configurable_scoring.py:298)

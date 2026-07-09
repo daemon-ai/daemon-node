@@ -1109,6 +1109,55 @@ mod tests {
             .unwrap();
     }
 
+    // parity: test_configurable_scoring.py::TestPublicRecallConfigurableWeights::test_mnemosyne_recall_accepts_weight_params (tests/test_configurable_scoring.py:241)
+    // parity: test_configurable_scoring.py::TestPublicRecallConfigurableWeights::test_module_recall_accepts_weight_params (tests/test_configurable_scoring.py:257)
+    #[tokio::test]
+    async fn tool_recall_forwards_weight_overrides() {
+        let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
+        let provider = MnemosyneProvider::new(engine);
+        for (content, importance) in [
+            ("critical alert generic text", 0.1),
+            ("critical system status", 0.9),
+        ] {
+            provider
+                .call_tool(
+                    "mnemosyne_remember",
+                    json!({"content": content, "importance": importance}),
+                )
+                .await;
+        }
+        let top = |res: &str| -> String {
+            let parsed: Value = serde_json::from_str(res).unwrap();
+            parsed["results"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Keyword-heavy overrides rank the exact lexical match first…
+        let lexical = provider
+            .call_tool(
+                "mnemosyne_recall",
+                json!({"query": "critical alert", "vec_weight": 0.5, "fts_weight": 0.45,
+                       "importance_weight": 0.05}),
+            )
+            .await;
+        assert!(top(&lexical).contains("generic"), "got: {lexical}");
+
+        // …while importance-heavy overrides flip the ranking through the same tool wire.
+        let important = provider
+            .call_tool(
+                "mnemosyne_recall",
+                json!({"query": "critical alert", "vec_weight": 0.1, "fts_weight": 0.1,
+                       "importance_weight": 0.8}),
+            )
+            .await;
+        assert!(
+            top(&important).contains("system status"),
+            "got: {important}"
+        );
+    }
+
     // parity: test_e2_remember_batch_enrichment.py::test_extract_false_does_not_call_llm (tests/test_e2_remember_batch_enrichment.py:244)
     // parity: test_e2_remember_batch_enrichment.py::test_extract_true_calls_llm_fact_extractor_per_row (tests/test_e2_remember_batch_enrichment.py:258)
     #[tokio::test]
