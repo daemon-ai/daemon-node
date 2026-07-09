@@ -2391,3 +2391,60 @@ fn capitalize(word: &str) -> String {
         None => String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Engine, MnemosyneConfig, RememberArgs};
+
+    // PARITY: Mnemosyne tests/test_cyrillic_fts.py::TestFtsSearchRoutesCyrillic::test_working_memory_fallback
+    // A Cyrillic query whose surface form is NOT indexed (an inflection FTS5's unicode61 tokenizer
+    // cannot stem) yields zero MATCH rows, so `fts_search_working` must route to the Cyrillic LIKE
+    // fallback and still return the stored inflected row.
+    #[test]
+    fn cyrillic_fts_working_routes_inflected_query_to_fallback() {
+        let e = Engine::open_in_memory(MnemosyneConfig::default()).unwrap();
+        // Stored accusative "тёмную"; query nominative "тёмная" (not in the DB).
+        e.remember(
+            "Пользователь предпочитает тёмную тему",
+            &RememberArgs::default(),
+        )
+        .unwrap();
+        e.remember("Совершенно посторонний текст", &RememberArgs::default())
+            .unwrap();
+        let conn = e.store.conn.lock().unwrap();
+        let rows = fts_search_working(&conn, "тёмная", 5);
+        // The inflected row surfaces via the fallback; the unrelated Cyrillic row does not.
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly the inflected row via fallback: {rows:?}"
+        );
+    }
+
+    // PARITY: Mnemosyne tests/test_cyrillic_fts.py::TestFtsSearchRoutesCyrillic::test_episodic_fallback
+    #[test]
+    fn cyrillic_fts_episodic_routes_inflected_query_to_fallback() {
+        let e = Engine::open_in_memory(MnemosyneConfig::default()).unwrap();
+        let conn = e.store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO episodic_memory (id, content, importance) VALUES ('ep1', ?1, 0.9)",
+            params!["Пользователь предпочитает тёмную тему"],
+        )
+        .unwrap();
+        let rows = fts_search_episodic(&conn, "тёмная", 5);
+        assert!(
+            !rows.is_empty(),
+            "episodic Cyrillic fallback must surface the inflected row: {rows:?}"
+        );
+    }
+
+    // PARITY: Mnemosyne tests/test_cyrillic_fts.py::TestCyrillicLikeSearchWorking::test_returns_empty_for_latin_query
+    // A Latin query must NOT engage the Cyrillic fallback (it goes through the normal FTS5 path).
+    #[test]
+    fn latin_query_does_not_engage_cyrillic_fallback() {
+        let e = Engine::open_in_memory(MnemosyneConfig::default()).unwrap();
+        let conn = e.store.conn.lock().unwrap();
+        assert!(cyrillic_like_search_working(&conn, "dark mode", 5).is_empty());
+    }
+}
