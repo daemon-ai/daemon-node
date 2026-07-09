@@ -793,9 +793,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         },
     )?;
     // Profiles CRUD (PRO-2/3/4): exercise the now-concrete profile-spec (the optional arms -
-    // tool_allowlist Some, base_url/system_prompt set - and the nested budget/tunables maps).
+    // tool_allowlist Some - and the nested budget/tunables maps).
     let mut fixture_spec = ProfileSpec::new("work", ProviderSelector::GenAi, "claude-opus-4-8");
-    fixture_spec.system_prompt = "You are a helpful work assistant.".into();
     fixture_spec.tool_allowlist = Some(vec!["read".into(), "search".into()]);
     write_cbor(
         &out,
@@ -828,6 +827,27 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &out,
         "response-profile.cbor",
         &ApiResponse::Profile(Some(fixture_spec)),
+    )?;
+    // Persona ops (wire v36): the SoulGet/SoulSet requests + the SoulText response, so
+    // `verify-codec` proves the generated zcbor C decoder accepts the new persona shapes (the
+    // composed system prompt itself never travels — this is the SOUL.md source text only).
+    write_cbor(
+        &out,
+        "request-soul-get.cbor",
+        &ApiRequest::SoulGet { id: "work".into() },
+    )?;
+    write_cbor(
+        &out,
+        "request-soul-set.cbor",
+        &ApiRequest::SoulSet {
+            id: "work".into(),
+            text: "You are a focused work assistant.".into(),
+        },
+    )?;
+    write_cbor(
+        &out,
+        "response-soul-text.cbor",
+        &ApiResponse::SoulText("You are a focused work assistant.".into()),
     )?;
     // The profile listing (PRO-1) exercising the wire v31 provenance on `profile-info`: one
     // operator-authored (created_by "operator", no owner) and one agent-authored
