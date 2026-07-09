@@ -76,6 +76,188 @@ async fn routing_pin_resolves_to_bound_session_impl() {
     handle.shutdown().await;
 }
 
+/// A routed session composes the per-surface transport hint (prompt-arch): a Matrix-family origin
+/// activates an engine whose system prompt carries the Matrix formatting hint, while an unmapped
+/// surface (telegram) composes none — end to end through `submit_routed` -> `ensure` -> the
+/// session builder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_session_composes_the_transport_hint() {
+    as_system(routed_session_composes_the_transport_hint_impl()).await;
+}
+async fn routed_session_composes_the_transport_hint_impl() {
+    use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
+    use daemon_common::ReqId;
+    use daemon_host::{MemProfileStore, ProfileStore, RoutingRegistry};
+    use daemon_protocol::{AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg};
+    use std::sync::Mutex as StdMutex;
+
+    /// Records each request's `(engine id, system)` then completes.
+    struct SystemRecorder {
+        id: String,
+        seen: Arc<StdMutex<Vec<(String, String)>>>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for SystemRecorder {
+        fn capabilities(&self) -> daemon_core::Capabilities {
+            daemon_core::Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: daemon_core::ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+        async fn chat(
+            &self,
+            req: daemon_core::Request,
+        ) -> Result<daemon_core::ModelOutput, daemon_core::Failure> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((self.id.clone(), req.system.clone()));
+            Ok(daemon_core::ModelOutput {
+                text: "ok".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    let store = Arc::new(MemProfileStore::new());
+    store
+        .create(ProfileSpec::new(
+            "alpha",
+            ProviderSelector::GenAi,
+            "model-a",
+        ))
+        .expect("create profile");
+    store.set_active("alpha").expect("set active");
+
+    let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+    let resolver: daemon_node::ProviderResolver = {
+        let seen = seen.clone();
+        Arc::new(move |spec: &ProfileSpec| {
+            let id = spec.id.clone();
+            let seen = seen.clone();
+            let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                Arc::new(SystemRecorder {
+                    id: id.clone(),
+                    seen: seen.clone(),
+                }) as Arc<dyn Provider>
+            });
+            builder
+        })
+    };
+
+    let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+        store: Arc::new(InMemoryStore::new()),
+        partition: PARTITION,
+        host_config: fast_host_config(),
+        providers: gate_providers(),
+        credentials: None,
+        profile: ProfileRef::new("alpha"),
+        engine_config: daemon_core::Config::default(),
+        journal_seed: Some([0x56; 32]),
+        nesting_depth: 0,
+        context: None,
+        context_builder: None,
+        memory: Vec::new(),
+        memory_builder: None,
+        extra_tools: Vec::new(),
+        models: None,
+        profiles: Some(store),
+        provider_resolver: Some(resolver),
+        credential_store: None,
+        cloud_catalog: None,
+        prompt_sources: vec![],
+        revisions: None,
+        skills: None,
+        skills_resolver: None,
+        routing: Some(RoutingRegistry::new()),
+        checkpoints: None,
+        auth_factories: vec![],
+        workspace_root: None,
+        blob_root: None,
+        fs: Default::default(),
+        processes: Default::default(),
+        title_aux: None,
+        reaper: Default::default(),
+        orchestrate: Default::default(),
+        foreign_gateway: None,
+        prompt: Default::default(),
+    });
+
+    async fn route_and_finish(node: &Arc<NodeApiImpl>, origin: Origin) -> SessionId {
+        let session = node
+            .submit_routed(
+                origin,
+                AgentCommand::StartTurn {
+                    input: UserMsg::new("hi"),
+                    request_id: ReqId(1),
+                },
+            )
+            .await
+            .expect("routed submit");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let finished = node
+                .poll(session.clone(), 0)
+                .await
+                .expect("poll")
+                .into_iter()
+                .any(|item| matches!(item, Outbound::Event(AgentEvent::TurnFinished { .. })));
+            if finished {
+                return session;
+            }
+            assert!(Instant::now() < deadline, "routed turn never finished");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // A Matrix-family (instance-qualified) origin composes the Matrix hint...
+    let matrix_session = route_and_finish(
+        &node,
+        Origin::new(
+            TransportId::new("matrix/@bot:hs.org"),
+            OriginScope::Group {
+                chat: "!room:hs".into(),
+                thread: None,
+            },
+        ),
+    )
+    .await;
+    // ...and an unmapped surface composes none.
+    let telegram_session = route_and_finish(
+        &node,
+        Origin::new(
+            TransportId::new("telegram/bot-1"),
+            OriginScope::Dm {
+                user: "alice".into(),
+            },
+        ),
+    )
+    .await;
+    assert_ne!(matrix_session, telegram_session);
+
+    let seen = seen.lock().unwrap();
+    let system_of = |wanted_hint: bool| {
+        seen.iter()
+            .find(|(_, system)| system.contains("Matrix room") == wanted_hint)
+            .map(|(_, system)| system.clone())
+    };
+    let matrix_system = system_of(true).expect("the matrix-origin session recorded a request");
+    assert!(
+        matrix_system.contains("Session surface: a Matrix room"),
+        "the Matrix formatting hint composed into the routed session's prompt"
+    );
+    let plain_system = system_of(false).expect("the telegram-origin session recorded a request");
+    assert!(
+        !plain_system.contains("Matrix"),
+        "unmapped surface: no hint"
+    );
+    drop(seen);
+
+    handle.shutdown().await;
+}
+
 /// THE ROUTING GATE (daemon-event-io-spec §5.9): a routed submit hands the host only an `Origin`
 /// and the host's routing registry resolves it to a session + profile + delivery. Proves, with no
 /// chat transport at all: (1) the account->profile baseline (two transport instances bound to two
