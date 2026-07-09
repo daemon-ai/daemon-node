@@ -7,8 +7,14 @@
 //! markdown code fence, carrying trailing commas, single-quoted, or truncated mid-object when the
 //! response was cut off. [`repair_tool_args`] runs a small multi-pass repair and, on success,
 //! re-serializes through `serde_json` so the tool always receives canonical JSON (stable key order,
-//! no stray whitespace). Unparseable-after-repair input is passed through untouched so a tool that
-//! takes a non-JSON string still works.
+//! no stray whitespace).
+//!
+//! The repair pipeline is a faithful port of hermes' `_repair_tool_call_arguments`
+//! (`agent/message_sanitization.py:185`): empty/whitespace and the Python literal `None`
+//! collapse to `{}`; a lenient control-char-in-string parse recovers llama.cpp-style payloads;
+//! trailing commas are stripped, unclosed structures closed, and excess closers trimmed (bounded);
+//! and unrepairable input falls back to `{}` (rather than being passed through) so a malformed
+//! payload can never crash the upstream API with an "invalid tool call arguments" 400.
 
 /// The outcome of repairing a tool-argument payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,38 +27,109 @@ pub struct ArgRepair {
     pub truncated: bool,
 }
 
-/// Repair and canonicalize a tool-argument JSON payload (§9). The passes, in order:
-/// 1. parse as-is;
-/// 2. strip a surrounding markdown code fence and parse;
-/// 3. strip trailing commas + balance brackets/quotes (truncation repair) and parse.
+/// Repair and canonicalize a tool-argument JSON payload (§9), a faithful port of hermes'
+/// `_repair_tool_call_arguments`. The passes, in order:
+/// 1. empty / whitespace-only → `{}`;
+/// 2. the Python literal `None` → `{}`;
+/// 3. parse as-is (already valid JSON);
+/// 4. strip a surrounding markdown code fence and parse (a Rust-only convenience pass);
+/// 5. lenient parse of raw control chars inside strings (emulates Python's `json.loads(strict=False)`);
+/// 6. strip trailing commas, close unclosed structures, trim excess closers (bounded 50), and parse;
+/// 7. escape control chars inside strings then parse;
+/// 8. unrepairable → `{}` fallback.
 ///
-/// The first pass that parses wins and its value is re-serialized canonically; if none parse, the
-/// original string is returned with `repaired = false`.
+/// The first pass that parses wins and its value is re-serialized canonically. Unlike Python
+/// (which preserves object insertion order), the Rust port sorts object keys for determinism.
 pub fn repair_tool_args(raw: &str) -> ArgRepair {
     let truncated = looks_truncated(raw);
+    let raw_stripped = raw.trim();
 
-    // Pass 1: already valid JSON.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
+    // Pass 1: empty / whitespace-only → empty object.
+    if raw_stripped.is_empty() {
         return ArgRepair {
-            args: canonicalize(&value),
-            repaired: raw.trim() != raw || !is_canonical(raw, &value),
-            truncated: false,
-        };
-    }
-
-    // Pass 2: strip a markdown code fence (```json ... ```), then parse.
-    let defenced = strip_code_fence(raw);
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(defenced.trim()) {
-        return ArgRepair {
-            args: canonicalize(&value),
+            args: "{}".to_string(),
             repaired: true,
             truncated: false,
         };
     }
 
-    // Pass 3: drop trailing commas and balance unclosed strings/brackets (truncation repair).
-    let balanced = balance_and_clean(defenced.trim());
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&balanced) {
+    // Pass 2: the Python literal `None` → empty object.
+    if raw_stripped == "None" {
+        return ArgRepair {
+            args: "{}".to_string(),
+            repaired: true,
+            truncated: false,
+        };
+    }
+
+    // Pass 3: already valid JSON.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_stripped) {
+        return ArgRepair {
+            args: canonicalize(&value),
+            repaired: raw_stripped != raw || !is_canonical(raw, &value),
+            truncated: false,
+        };
+    }
+
+    // Pass 4 (Rust-only): strip a markdown code fence (```json ... ```), then parse. Hermes has no
+    // fence pass, but models wrapping arguments in a fence is common enough to keep. Everything after
+    // this operates on the de-fenced body.
+    let defenced = strip_code_fence(raw);
+    let body = if defenced != raw_stripped {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(defenced.trim()) {
+            return ArgRepair {
+                args: canonicalize(&value),
+                repaired: true,
+                truncated: false,
+            };
+        }
+        defenced.trim().to_string()
+    } else {
+        raw_stripped.to_string()
+    };
+
+    // Pass 5: lenient parse of raw control chars inside strings. serde_json is strict, so we escape
+    // the control chars first (equivalent to Python's `json.loads(strict=False)` for success cases),
+    // then re-serialize to the canonical wire form.
+    let escaped_body = escape_control_chars_in_json_strings(&body);
+    if escaped_body != body {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&escaped_body) {
+            return ArgRepair {
+                args: canonicalize(&value),
+                repaired: true,
+                truncated: false,
+            };
+        }
+    }
+
+    // Pass 6: common structural repairs — strip trailing commas, close unclosed structures by
+    // delimiter count, then trim excess closing delimiters (bounded to 50 iterations).
+    let mut fixed = strip_trailing_commas(&body);
+    let open_curly = count_char(&fixed, '{') as i64 - count_char(&fixed, '}') as i64;
+    let open_bracket = count_char(&fixed, '[') as i64 - count_char(&fixed, ']') as i64;
+    if open_curly > 0 {
+        fixed.push_str(&"}".repeat(open_curly as usize));
+    }
+    if open_bracket > 0 {
+        fixed.push_str(&"]".repeat(open_bracket as usize));
+    }
+    for _ in 0..50 {
+        if serde_json::from_str::<serde_json::Value>(&fixed).is_ok() {
+            break;
+        }
+        // Trim one excess closing brace/bracket. Both Python branches pop a single char, so they
+        // collapse to one condition here (avoids clippy::if_same_then_else).
+        let excess_curly =
+            fixed.ends_with('}') && count_char(&fixed, '}') > count_char(&fixed, '{');
+        let excess_square =
+            fixed.ends_with(']') && count_char(&fixed, ']') > count_char(&fixed, '[');
+        if excess_curly || excess_square {
+            fixed.pop();
+        } else {
+            break;
+        }
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&fixed) {
         return ArgRepair {
             args: canonicalize(&value),
             repaired: true,
@@ -60,12 +137,95 @@ pub fn repair_tool_args(raw: &str) -> ArgRepair {
         };
     }
 
-    // Give up: pass the original through unchanged.
+    // Pass 7: escape unescaped control chars inside strings of the structurally-repaired payload,
+    // then retry. Catches cases where a control char coexists with another malformation (e.g. a
+    // trailing comma) that pass 5 alone could not clear.
+    let escaped_fixed = escape_control_chars_in_json_strings(&fixed);
+    if escaped_fixed != fixed {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&escaped_fixed) {
+            return ArgRepair {
+                args: canonicalize(&value),
+                repaired: true,
+                truncated,
+            };
+        }
+    }
+
+    // Pass 8: unrepairable — fall back to an empty object so the upstream API request cannot be
+    // rejected as "invalid tool call arguments" and kill the session.
     ArgRepair {
-        args: raw.to_string(),
-        repaired: false,
+        args: "{}".to_string(),
+        repaired: true,
         truncated,
     }
+}
+
+/// Count occurrences of a single ASCII character in `s` (matches Python's `str.count`, including
+/// occurrences inside JSON string literals — the delimiter-balance heuristic is deliberately naive).
+fn count_char(s: &str, needle: char) -> usize {
+    s.chars().filter(|c| *c == needle).count()
+}
+
+/// Strip a trailing comma (plus any whitespace up to the closer) that immediately precedes a `}` or
+/// `]`. A faithful port of Python's `re.sub(r',\s*([}\]])', r'\1', fixed)`: a single non-overlapping
+/// pass over the whole string, not string-literal aware.
+fn strip_trailing_commas(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                // Drop the comma and the intervening whitespace; the closer is emitted next.
+                i = j;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Escape unescaped control chars (`0x00`–`0x1F`) that appear inside JSON string values with their
+/// `\uXXXX` form. A faithful port of hermes' `_escape_invalid_chars_in_json_strings`: walks the raw
+/// text tracking string state, passing already-escaped pairs through untouched.
+fn escape_control_chars_in_json_strings(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(n);
+    let mut in_string = false;
+    let mut i = 0;
+    while i < n {
+        let ch = chars[i];
+        if in_string {
+            if ch == '\\' && i + 1 < n {
+                out.push(ch);
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+                out.push(ch);
+            } else if (ch as u32) < 0x20 {
+                out.push_str(&format!("\\u{:04x}", ch as u32));
+            } else {
+                out.push(ch);
+            }
+        } else {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Whether a JSON payload looks truncated: brackets/quotes left unbalanced (ignoring escapes and
@@ -145,83 +305,6 @@ fn strip_code_fence(raw: &str) -> String {
     trimmed.to_string()
 }
 
-/// Remove trailing commas before `}`/`]` and close any unbalanced strings/brackets at the end (the
-/// truncation-repair pass). Operates outside string literals only.
-fn balance_and_clean(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 8);
-    let mut stack: Vec<char> = Vec::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut pending_comma: Option<usize> = None;
-
-    for c in raw.chars() {
-        if in_string {
-            out.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_string = true;
-                pending_comma = None;
-                out.push(c);
-            }
-            ',' => {
-                pending_comma = Some(out.len());
-                out.push(c);
-            }
-            '}' | ']' => {
-                // Drop a trailing comma immediately before this closer.
-                if let Some(pos) = pending_comma.take() {
-                    if out[pos..].trim().is_empty() || out[pos..].chars().all(|x| x == ',') {
-                        // remove from the comma position to end (only whitespace/comma)
-                        out.truncate(pos);
-                    }
-                }
-                stack.pop();
-                out.push(c);
-            }
-            '{' => {
-                stack.push('}');
-                pending_comma = None;
-                out.push(c);
-            }
-            '[' => {
-                stack.push(']');
-                pending_comma = None;
-                out.push(c);
-            }
-            _ => {
-                if !c.is_whitespace() {
-                    pending_comma = None;
-                }
-                out.push(c);
-            }
-        }
-    }
-
-    // Close an unterminated string, then any open brackets, in reverse order.
-    if in_string {
-        out.push('"');
-    }
-    // Drop a dangling trailing comma at the very end.
-    let trimmed_end = out.trim_end();
-    if trimmed_end.ends_with(',') {
-        let new_len = trimmed_end.len() - 1;
-        out.truncate(new_len);
-    }
-    while let Some(closer) = stack.pop() {
-        out.push(closer);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,18 +331,21 @@ mod tests {
     }
 
     #[test]
-    fn repairs_truncated_object() {
+    fn truncated_mid_string_falls_back_to_empty_object() {
+        // Hermes semantics: a value truncated mid-string cannot be recovered by delimiter
+        // balancing (closing the string would fabricate content), so it collapses to `{}`.
         let r = repair_tool_args(r#"{"cmd": "ls -la"#);
         assert!(r.truncated);
-        // Closed string + closed object => parseable canonical form.
-        assert_eq!(r.args, r#"{"cmd":"ls -la"}"#);
+        assert_eq!(r.args, "{}");
     }
 
     #[test]
-    fn unparseable_passes_through() {
+    fn unrepairable_falls_back_to_empty_object() {
+        // Hermes returns `{}` for unrepairable input so the upstream API cannot reject the
+        // request; the Rust port matches that (no passthrough of garbage).
         let r = repair_tool_args("not json at all !!!");
-        assert_eq!(r.args, "not json at all !!!");
-        assert!(!r.repaired);
+        assert_eq!(r.args, "{}");
+        assert!(r.repaired);
     }
 
     #[test]
@@ -274,9 +360,8 @@ mod tests {
 /// (`agent/message_sanitization.py:185`) and its test matrix
 /// (`tests/run_agent/test_repair_tool_call_arguments.py`).
 ///
-/// `parity_gap_*` tests assert the DESIRED behavior per the Python source and are
-/// expected to FAIL against the current Rust port — each documents a missing repair
-/// stage. Plain-named tests port already-correct behavior and MUST PASS.
+/// Every stage of the Python repair pipeline is now implemented, so these all pass; each
+/// asserts the behavior of the corresponding Python test case.
 #[cfg(test)]
 mod parity {
     use super::*;
@@ -291,13 +376,13 @@ mod parity {
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_empty_string_returns_empty_object (tests/run_agent/test_repair_tool_call_arguments.py:13)
     #[test]
-    fn parity_gap_empty_string_returns_empty_object() {
+    fn empty_string_returns_empty_object() {
         assert_eq!(repair_tool_args("").args, "{}");
     }
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_whitespace_only_returns_empty_object (tests/run_agent/test_repair_tool_call_arguments.py:16)
     #[test]
-    fn parity_gap_whitespace_only_returns_empty_object() {
+    fn whitespace_only_returns_empty_object() {
         assert_eq!(repair_tool_args("   \n\t  ").args, "{}");
     }
 
@@ -305,13 +390,13 @@ mod parity {
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_python_none_literal (tests/run_agent/test_repair_tool_call_arguments.py:25)
     #[test]
-    fn parity_gap_python_none_literal_returns_empty_object() {
+    fn python_none_literal_returns_empty_object() {
         assert_eq!(repair_tool_args("None").args, "{}");
     }
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_python_none_with_whitespace (tests/run_agent/test_repair_tool_call_arguments.py:28)
     #[test]
-    fn parity_gap_python_none_with_whitespace_returns_empty_object() {
+    fn python_none_with_whitespace_returns_empty_object() {
         assert_eq!(repair_tool_args("  None  ").args, "{}");
     }
 
@@ -354,7 +439,7 @@ mod parity {
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_extra_closing_brace (tests/run_agent/test_repair_tool_call_arguments.py:64)
     #[test]
-    fn parity_gap_extra_closing_brace_is_trimmed() {
+    fn extra_closing_brace_is_trimmed() {
         let r = repair_tool_args(r#"{"key": "value"}}"#);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&r.args).unwrap(),
@@ -364,7 +449,7 @@ mod parity {
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_extra_closing_bracket (tests/run_agent/test_repair_tool_call_arguments.py:69)
     #[test]
-    fn parity_gap_extra_closing_bracket_yields_valid_json() {
+    fn extra_closing_bracket_yields_valid_json() {
         assert!(parses(r#"{"a": [1]]}"#));
     }
 
@@ -372,13 +457,13 @@ mod parity {
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_unrepairable_garbage_returns_empty_object (tests/run_agent/test_repair_tool_call_arguments.py:76)
     #[test]
-    fn parity_gap_unrepairable_garbage_returns_empty_object() {
+    fn unrepairable_garbage_returns_empty_object() {
         assert_eq!(repair_tool_args("totally not json").args, "{}");
     }
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_unrepairable_partial_returns_empty_object (tests/run_agent/test_repair_tool_call_arguments.py:79)
     #[test]
-    fn parity_gap_unrepairable_partial_returns_empty_object() {
+    fn unrepairable_partial_returns_empty_object() {
         // A value truncated mid-string is unrepairable in hermes (brace-count
         // alone cannot recover it) → {}.
         assert_eq!(repair_tool_args(r#"{"truncated": "val"#).args, "{}");
@@ -386,7 +471,7 @@ mod parity {
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_real_world_glm_truncation (tests/run_agent/test_repair_tool_call_arguments.py:101)
     #[test]
-    fn parity_gap_glm_truncation_yields_valid_json() {
+    fn glm_truncation_yields_valid_json() {
         // Truncated after a key's colon (`"background":`) → hermes falls back to {}.
         assert!(parses(
             r#"{"command": "ls -la /tmp", "timeout": 30, "background":"#
@@ -397,7 +482,7 @@ mod parity {
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_literal_newline_inside_string_value (tests/run_agent/test_repair_tool_call_arguments.py:113)
     #[test]
-    fn parity_gap_literal_newline_inside_string_value() {
+    fn literal_newline_inside_string_value() {
         let r = repair_tool_args("{\"summary\": \"line one\nline two\"}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&r.args).unwrap(),
@@ -407,7 +492,7 @@ mod parity {
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_literal_tab_inside_string_value (tests/run_agent/test_repair_tool_call_arguments.py:119)
     #[test]
-    fn parity_gap_literal_tab_inside_string_value() {
+    fn literal_tab_inside_string_value() {
         let r = repair_tool_args("{\"summary\": \"col1\tcol2\"}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&r.args).unwrap(),
@@ -419,7 +504,7 @@ mod parity {
 
     // parity: test_repair_tool_call_arguments.py::TestRepairToolCallArguments::test_control_chars_with_trailing_comma (tests/run_agent/test_repair_tool_call_arguments.py:135)
     #[test]
-    fn parity_gap_control_chars_with_trailing_comma() {
+    fn control_chars_with_trailing_comma() {
         let r = repair_tool_args("{\"msg\": \"line\none\",}");
         let v: serde_json::Value = serde_json::from_str(&r.args).unwrap();
         assert!(v["msg"].as_str().unwrap().contains("line"));
