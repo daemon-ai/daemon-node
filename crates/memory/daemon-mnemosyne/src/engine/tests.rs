@@ -1527,7 +1527,7 @@ fn cross_session_forget_is_denied_and_preserves_annotations() {
 
 // parity: test_e6a_followup_gaps.py::TestForgetCascadeIsAtomic::test_failed_cascade_rolls_back_working_memory_delete (tests/test_e6a_followup_gaps.py:178)
 #[test]
-fn parity_gap_forget_cascade_failure_rolls_back_row_delete() {
+fn forget_cascade_failure_rolls_back_row_delete() {
     let e = engine();
     let id = e
         .remember(

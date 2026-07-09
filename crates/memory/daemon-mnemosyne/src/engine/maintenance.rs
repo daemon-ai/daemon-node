@@ -193,22 +193,27 @@ impl Engine {
 
     /// Hard-delete a working-memory row plus its derived state (`beam.py` `forget_working`
     /// L3913-L3958): the session-or-global-scoped delete is the authorization boundary for the
-    /// annotation/embedding cascade (E6.a). FTS rows are removed by the delete trigger. Returns
-    /// whether anything was deleted.
+    /// annotation/embedding cascade (E6.a). FTS rows are removed by the delete trigger. The whole
+    /// cascade runs in one transaction so a mid-cascade failure rolls back the working_memory
+    /// delete (E6.a /review F3). Returns whether anything was deleted.
     pub fn forget(&self, id: &str) -> Result<bool> {
         let conn = self.store.conn.lock().unwrap();
-        let deleted = conn.execute(
+        // `unchecked_transaction` (deferred) mirrors Python's implicit-BEGIN + explicit
+        // commit/rollback; on error the dropped transaction rolls back.
+        let tx = conn.unchecked_transaction()?;
+        let deleted = tx.execute(
             "DELETE FROM working_memory WHERE id = ?1 AND (session_id = ?2 OR scope = 'global')",
             params![id, self.config.session_id],
         )?;
         if deleted > 0 {
-            conn.execute("DELETE FROM annotations WHERE memory_id = ?1", params![id])?;
-            conn.execute(
+            tx.execute("DELETE FROM annotations WHERE memory_id = ?1", params![id])?;
+            tx.execute(
                 "DELETE FROM memory_embeddings WHERE memory_id = ?1",
                 params![id],
             )?;
-            self.audit(&conn, "forget", Some(id), None);
+            self.audit(&tx, "forget", Some(id), None);
         }
+        tx.commit()?;
         Ok(deleted > 0)
     }
 
