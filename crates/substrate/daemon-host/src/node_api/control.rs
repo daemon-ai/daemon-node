@@ -1563,6 +1563,13 @@ impl ControlApi for NodeApiImpl {
         })
     }
 
+    async fn notification_list(&self) -> Vec<daemon_api::NotificationInfo> {
+        // The node-authoritative notification list (wire vNEXT), newest first — a snapshot of the
+        // node's `NotificationManager` (ported from libpurple's `PurpleNotificationManager`).
+        // Clients re-list on a `NotificationsChanged` pointer.
+        self.notifications_snapshot()
+    }
+
     async fn roster_add(
         &self,
         transport: TransportId,

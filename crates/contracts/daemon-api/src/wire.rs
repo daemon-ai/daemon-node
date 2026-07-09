@@ -1103,6 +1103,10 @@ pub enum ApiRequest {
         /// The new consent state (`true` opts passive telemetry in).
         enabled: bool,
     },
+    /// [`ControlApi::notification_list`] — the node's live notification list (wire vNEXT). A
+    /// read-only snapshot (newest first); the client re-lists on a
+    /// [`NodeEvent::NotificationsChanged`] pointer. Answered by [`ApiResponse::Notifications`].
+    NotificationList,
 }
 
 /// The serializable reflection of an interface result.
@@ -1316,6 +1320,8 @@ pub enum ApiResponse {
         /// The current consent state.
         enabled: bool,
     },
+    /// The node's live notification list (`notification_list`; wire vNEXT), newest first.
+    Notifications(Vec<NotificationInfo>),
 }
 
 // ---------------------------------------------------------------------------

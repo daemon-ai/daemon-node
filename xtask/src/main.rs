@@ -627,6 +627,33 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             next: Some("@bob:matrix.org".into()),
         }),
     )?;
+    // Notifications (wire vNEXT; port-notify): the read-only list op + a response carrying an
+    // authorization-request and a connection-error notification, so verify-codec proves the
+    // generated zcbor C decoder accepts the notification-info shape + its typed kinds.
+    write_cbor(
+        &out,
+        "request-notification-list.cbor",
+        &ApiRequest::NotificationList,
+    )?;
+    write_cbor(
+        &out,
+        "response-notifications.cbor",
+        &ApiResponse::Notifications(vec![
+            daemon_api::NotificationInfo::new_authorization(
+                Some("notif-authz".into()),
+                daemon_api::AuthorizationRequest::new(daemon_api::ContactInfo {
+                    id: "@bob:matrix.org".into(),
+                    display_name: Some("Bob".into()),
+                    presence: daemon_api::Presence::default(),
+                    permission: daemon_api::ContactPermission::Unset,
+                }),
+            ),
+            daemon_api::NotificationInfo::new_connection_error(
+                Some("notif-conn".into()),
+                TransportId::new("matrix/@me:hs.org"),
+            ),
+        ]),
+    )?;
     // Account management (wire v35): the reversible-connect + persisted enabled/label + credential
     // rename requests, so verify-codec proves the generated zcbor C decoder accepts all four new
     // request variants (including the `? label` optional in both set/clear shapes).
@@ -1167,6 +1194,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 NodeEvent::ContactsChanged {
                     transport: TransportId::new("matrix/@bot:hs.org"),
                 },
+                // wire vNEXT: the payload-free notifications-changed pointer (port-notify).
+                NodeEvent::NotificationsChanged,
             ],
             next_cursor: 12,
             head_cursor: 12,

@@ -211,6 +211,7 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
                 ApiResponse::TelemetryConsent { enabled }
             })
         }
+        ApiRequest::NotificationList => ApiResponse::Notifications(api.notification_list().await),
         _ => return None,
     })
 }

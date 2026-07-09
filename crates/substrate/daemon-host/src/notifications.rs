@@ -9,7 +9,7 @@
 //! It owns an ordered collection of [`NotificationInfo`]s (newest first, like the C
 //! prepend-and-let-the-UI-sort model) plus the unread-count accounting. Mutations return a typed
 //! outcome the caller acts on (the daemon analog of the C `added`/`removed`/`read`/`unread` signals
-//! + the `unread-count` property notify): there are no GObject signals, so the manager reports
+//! plus the `unread-count` property notify): there are no GObject signals, so the manager reports
 //! transitions by value.
 //!
 //! Faithful-to-C accounting note: only `add`, single `remove`, and `set_read` adjust `unread_count`
