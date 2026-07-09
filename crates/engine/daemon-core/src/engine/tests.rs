@@ -1238,6 +1238,50 @@ async fn steer_drained_appends_marker_and_acks() {
         .any(|t| matches!(t, Turn::User(u) if u.text.contains("[steer] focus"))));
 }
 
+// parity: test_steer.py::TestSteerClearedOnInterrupt::test_clear_interrupt_drops_pending_steer (tests/run_agent/test_steer.py:185)
+//
+// Hermes `clear_interrupt()` drops `_pending_steer`: "a hard interrupt supersedes any pending
+// steer — the agent's next tool iteration won't happen, so delivering the steer later would be
+// surprising." Ported to the engine's phase boundary: a steer queued while the turn is cancelling
+// must be dropped (not appended as a durable `[steer]` marker the interrupted turn will never act
+// on) and acked as *not* accepted so the client learns it was superseded.
+#[tokio::test]
+async fn parity_gap_interrupt_supersedes_pending_steer() {
+    let mut engine = completing_engine("steer-interrupt");
+    engine.push_user(UserMsg::new("hi"));
+    let control = TurnControl::new();
+    control.push_steer(SteerReq {
+        request_id: ReqId(9),
+        text: "focus".into(),
+    });
+    control.cancel();
+    let (sink, log) = collecting();
+
+    let outcome = engine.run_turn(&NoopHost, &sink, &control).await.unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Interrupted),
+        _ => panic!("expected an interrupted outcome"),
+    }
+    // The queued steer must NOT have been appended to the durable conversation.
+    assert!(
+        !engine
+            .snapshot()
+            .conversation
+            .turns
+            .iter()
+            .any(|t| matches!(t, Turn::User(u) if u.text.contains("[steer]"))),
+        "an interrupt must supersede (drop) a pending steer, not append it as a durable marker"
+    );
+    // It is acked as not-accepted so the client knows the steer was dropped by the interrupt.
+    assert!(
+        log.lock().unwrap().iter().any(|e| matches!(
+            e,
+            AgentEvent::Steered { request_id, accepted, .. } if *request_id == ReqId(9) && !*accepted
+        )),
+        "the superseded steer is acked with accepted=false"
+    );
+}
+
 // --- ReAct loop (§4.2) ---
 
 use crate::conversation::ToolCall;
