@@ -93,9 +93,19 @@ impl StringField {
     /// whether the *filled* state changed (the `notify::filled` the C test counts): true iff the
     /// value actually changed AND its emptiness toggled.
     pub fn set_value(&mut self, value: Option<&str>) -> bool {
-        // TDD-RED stub.
-        let _ = value;
-        false
+        let before = self.is_filled();
+        // g_set_str semantics: NULL and "" are distinct, so NULL→"" counts as a change.
+        let changed = match (self.value.as_deref(), value) {
+            (Some(a), Some(b)) => a != b,
+            (None, None) => false,
+            _ => true,
+        };
+        if !changed {
+            return false;
+        }
+        self.value = value.map(str::to_string);
+        let after = self.is_filled();
+        before != after
     }
 }
 
@@ -131,27 +141,35 @@ impl IntField {
 
     /// Set the value.
     pub fn set_value(&mut self, value: i32) {
-        // TDD-RED stub.
-        let _ = value;
+        self.value = value;
     }
 
     /// Set the inclusive lower bound.
     pub fn set_lower_bound(&mut self, lower_bound: i32) {
-        // TDD-RED stub.
-        let _ = lower_bound;
+        self.lower_bound = lower_bound;
     }
 
     /// Set the inclusive upper bound.
     pub fn set_upper_bound(&mut self, upper_bound: i32) {
-        // TDD-RED stub.
-        let _ = upper_bound;
+        self.upper_bound = upper_bound;
     }
 
     /// Bounds check (`purple_request_field_int_is_valid`): the subclass validator run first by
     /// [`RequestField::is_valid`].
     fn is_valid(&self) -> Result<(), String> {
-        // TDD-RED stub.
-        Err("request: IntField::is_valid unimplemented".to_string())
+        if self.value < self.lower_bound {
+            return Err(format!(
+                "Int value {} exceeds lower bound {}",
+                self.value, self.lower_bound
+            ));
+        }
+        if self.value > self.upper_bound {
+            return Err(format!(
+                "Int value {} exceeds upper bound {}",
+                self.value, self.upper_bound
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -175,8 +193,7 @@ impl BoolField {
 
     /// Set the value.
     pub fn set_value(&mut self, value: bool) {
-        // TDD-RED stub.
-        let _ = value;
+        self.value = value;
     }
 }
 
@@ -200,41 +217,50 @@ impl ChoiceField {
 
     /// Add an option by id/label (`purple_request_field_choice_add`). Empty id or label is ignored.
     pub fn add(&mut self, id: &str, label: &str) {
-        // TDD-RED stub.
-        let _ = (id, label);
+        if id.is_empty() || label.is_empty() {
+            return;
+        }
+        self.add_item(LocalizedString {
+            id: id.to_string(),
+            label: label.to_string(),
+        });
     }
 
     /// Add a prebuilt option (`purple_request_field_choice_add_item`).
     pub fn add_item(&mut self, item: LocalizedString) {
-        // TDD-RED stub.
-        let _ = item;
+        self.items.push(item);
     }
 
     /// Remove every option and reset the selection (`purple_request_field_choice_clear`).
     pub fn clear(&mut self) {
-        // TDD-RED stub.
+        self.selected = 0;
+        self.items.clear();
     }
 
     /// Remove the option at `position` (`purple_request_field_choice_remove`); returns whether one
     /// was removed. Removing the selected position resets the selection to 0.
     pub fn remove(&mut self, position: usize) -> bool {
-        // TDD-RED stub.
-        let _ = position;
-        false
+        if position >= self.items.len() {
+            return false;
+        }
+        self.items.remove(position);
+        if position == self.selected {
+            self.selected = 0;
+        }
+        true
     }
 
     /// Remove the first option whose id matches (`purple_request_field_choice_remove_by_id`).
     pub fn remove_by_id(&mut self, id: &str) -> bool {
-        // TDD-RED stub.
-        let _ = id;
-        false
+        match self.items.iter().position(|item| item.id == id) {
+            Some(index) => self.remove(index),
+            None => false,
+        }
     }
 
     /// Remove the first option matching `item`'s id (`purple_request_field_choice_remove_item`).
     pub fn remove_item(&mut self, item: &LocalizedString) -> bool {
-        // TDD-RED stub.
-        let _ = item;
-        false
+        self.remove_by_id(&item.id)
     }
 
     /// The selected index, or `None` when empty (C `G_MAXUINT`)
@@ -250,8 +276,9 @@ impl ChoiceField {
     /// Select the option at `selected` (`purple_request_field_choice_set_selected`); ignored when
     /// out of bounds or already selected.
     pub fn set_selected(&mut self, selected: usize) {
-        // TDD-RED stub.
-        let _ = selected;
+        if selected != self.selected && selected < self.items.len() {
+            self.selected = selected;
+        }
     }
 
     /// The selected option (`purple_request_field_choice_get_selected_item`), or `None`.
@@ -301,40 +328,59 @@ impl ListField {
 
     /// Add an item by id/label (`purple_request_field_list_add`). Duplicates are allowed.
     pub fn add(&mut self, id: &str, label: &str) {
-        // TDD-RED stub.
-        let _ = (id, label);
+        self.add_item(LocalizedString {
+            id: id.to_string(),
+            label: label.to_string(),
+        });
     }
 
     /// Add a prebuilt item (`purple_request_field_list_add_item`).
     pub fn add_item(&mut self, item: LocalizedString) {
-        // TDD-RED stub.
-        let _ = item;
+        self.items.push(item);
     }
 
     /// Remove every item (clearing the selection first) (`purple_request_field_list_clear`).
     pub fn clear(&mut self) {
-        // TDD-RED stub.
+        self.clear_selected();
+        self.items.clear();
     }
 
     /// Clear the selection (`purple_request_field_list_clear_selected`).
     pub fn clear_selected(&mut self) {
-        // TDD-RED stub.
+        self.selected.clear();
     }
 
     /// Remove the first item whose id matches (`purple_request_field_list_remove_by_id`).
     pub fn remove_by_id(&mut self, id: &str) -> bool {
-        // TDD-RED stub.
-        let _ = id;
-        false
+        match self.items.iter().position(|item| item.id == id) {
+            Some(index) => {
+                self.items.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Select the item with `id` (`purple_request_field_list_select_item`): already-selected →
     /// `false`; in single-select mode a prior selection is cleared first; returns whether a new
     /// selection was made.
     pub fn select_item(&mut self, id: &str) -> bool {
-        // TDD-RED stub.
-        let _ = id;
-        false
+        // Already selected → nothing to do.
+        if self.selected.iter().any(|item| item.id == id) {
+            return false;
+        }
+        // Single-select replaces any prior selection.
+        if !self.multi_select && !self.selected.is_empty() {
+            self.selected.clear();
+        }
+        // Select the matching item if it exists.
+        match self.items.iter().find(|item| item.id == id) {
+            Some(item) => {
+                self.selected.push(item.clone());
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -352,8 +398,7 @@ impl ImageField {
 
     /// Set (or clear) the image (`purple_request_field_image_set_image`).
     pub fn set_image(&mut self, image: Option<ImageRef>) {
-        // TDD-RED stub.
-        let _ = image;
+        self.image = image;
     }
 }
 
@@ -378,8 +423,7 @@ impl AccountField {
 
     /// Set (or clear) the selected account (`purple_request_field_account_set_account`).
     pub fn set_account(&mut self, account: Option<TransportId>) {
-        // TDD-RED stub.
-        let _ = account;
+        self.account = account;
     }
 }
 
@@ -724,15 +768,28 @@ impl RequestField {
     /// Whether the field is filled (`purple_request_field_is_filled`): only strings compute this;
     /// every other variant is always filled.
     pub fn is_filled(&self) -> bool {
-        // TDD-RED stub.
-        false
+        match &self.kind {
+            RequestFieldKind::String(f) => f.is_filled(),
+            _ => true,
+        }
     }
 
     /// Validate the field (`purple_request_field_is_valid`): subclass validator (int bounds), then
     /// the custom validator, then the required-and-filled check — in that order.
     pub fn is_valid(&self) -> Result<(), String> {
-        // TDD-RED stub.
-        Err("request: RequestField::is_valid unimplemented".to_string())
+        // 1. The subclass validator (only int has one — the bounds check).
+        if let RequestFieldKind::Int(f) = &self.kind {
+            f.is_valid()?;
+        }
+        // 2. The custom validator, iff the subclass validator passed.
+        if let Some(validator) = &self.validator {
+            validator(self)?;
+        }
+        // 3. A required field must be filled.
+        if self.required && !self.is_filled() {
+            return Err("Required field is not filled.".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -801,22 +858,25 @@ impl RequestGroup {
 
     /// Whether every field is valid (`purple_request_group_is_valid`). Empty ⇒ valid.
     pub fn is_valid(&self) -> bool {
-        // TDD-RED stub.
-        false
+        self.fields.iter().all(|field| field.is_valid().is_ok())
     }
 
     /// Add a field (`purple_request_group_add_field`). Returns whether the group's validity flipped
-    /// (the `notify::valid` the C test counts).
+    /// (the `notify::valid` the C test counts). `before` is the cached validity of the group
+    /// *without* the new field, matching how the C `invalid_fields` set is consulted before the new
+    /// field is inserted into it.
     pub fn add_field(&mut self, field: RequestField) -> bool {
-        // TDD-RED stub.
+        let before = self.valid;
         self.fields.push(field);
-        false
+        self.valid = self.is_valid();
+        before != self.valid
     }
 
     /// Recompute validity after a member field changed; returns whether it flipped.
     pub fn revalidate(&mut self) -> bool {
-        // TDD-RED stub.
-        false
+        let before = self.valid;
+        self.valid = self.is_valid();
+        before != self.valid
     }
 }
 
@@ -900,21 +960,23 @@ impl RequestPage {
 
     /// Whether every group is valid (`purple_request_page_is_valid`). Empty ⇒ valid.
     pub fn is_valid(&self) -> bool {
-        // TDD-RED stub.
-        false
+        self.groups.iter().all(RequestGroup::is_valid)
     }
 
     /// Add a group (`purple_request_page_add_group`). Returns whether the page's validity flipped.
+    /// `before` is the cached validity *without* the new group (see [`RequestGroup::add_field`]).
     pub fn add_group(&mut self, group: RequestGroup) -> bool {
-        // TDD-RED stub.
+        let before = self.valid;
         self.groups.push(group);
-        false
+        self.valid = self.is_valid();
+        before != self.valid
     }
 
     /// Recompute validity after a member group/field changed; returns whether it flipped.
     pub fn revalidate(&mut self) -> bool {
-        // TDD-RED stub.
-        false
+        let before = self.valid;
+        self.valid = self.is_valid();
+        before != self.valid
     }
 
     /// The first field with `id` across all groups (`purple_request_page_get_field`).
@@ -935,51 +997,49 @@ impl RequestPage {
     /// Whether the field with `id` is required (`purple_request_page_is_field_required`); false if
     /// no such field.
     pub fn is_field_required(&self, id: &str) -> bool {
-        // TDD-RED stub.
-        let _ = id;
-        false
+        self.get_field(id).is_some_and(RequestField::is_required)
     }
 
     /// The string value of the field with `id` (`purple_request_page_get_string`); `None` on type
     /// mismatch / null / missing.
     pub fn get_string(&self, id: &str) -> Option<&str> {
-        // TDD-RED stub.
-        let _ = id;
-        None
+        self.get_field(id)
+            .and_then(RequestField::as_string)
+            .and_then(StringField::value)
     }
 
     /// The integer value of the field with `id` (`purple_request_page_get_integer`); `0` fallback.
     pub fn get_integer(&self, id: &str) -> i32 {
-        // TDD-RED stub.
-        let _ = id;
-        0
+        self.get_field(id)
+            .and_then(RequestField::as_int)
+            .map_or(0, IntField::value)
     }
 
     /// The boolean value of the field with `id` (`purple_request_page_get_bool`); `false` fallback.
     pub fn get_bool(&self, id: &str) -> bool {
-        // TDD-RED stub.
-        let _ = id;
-        false
+        self.get_field(id)
+            .and_then(RequestField::as_bool)
+            .is_some_and(BoolField::value)
     }
 
     /// The selected choice item of the field with `id` (`purple_request_page_get_choice`).
     pub fn get_choice(&self, id: &str) -> Option<&LocalizedString> {
-        // TDD-RED stub.
-        let _ = id;
-        None
+        self.get_field(id)
+            .and_then(RequestField::as_choice)
+            .and_then(ChoiceField::selected_item)
     }
 
     /// The selected account of the field with `id` (`purple_request_page_get_account`).
     pub fn get_account(&self, id: &str) -> Option<&TransportId> {
-        // TDD-RED stub.
-        let _ = id;
-        None
+        self.get_field(id)
+            .and_then(RequestField::as_account)
+            .and_then(AccountField::account)
     }
 
     /// Emit the one-shot close (`purple_request_page_close` → the `::close` signal). Modelled as an
     /// emission counter; every call emits.
     pub fn close(&mut self) {
-        // TDD-RED stub.
+        self.close_emissions += 1;
     }
 
     /// How many times [`RequestPage::close`] has emitted.
