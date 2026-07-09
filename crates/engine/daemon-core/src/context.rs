@@ -349,9 +349,22 @@ pub trait ModelPromptSource: Send + Sync {
 /// on restore (N prior user turns resume the cycle at `N % interval`) and means assistant-only
 /// turns (background completions, scheduled wakes) never advance it.
 pub trait NudgeSource: Send + Sync {
-    /// The nudge to inject this turn (`None` = nothing). `user_turns` counts the user turns in the
-    /// conversation *including* the one opening this turn.
-    fn nudge(&self, user_turns: u64) -> Option<String>;
+    /// The nudge to inject this turn (`None` = nothing), consulted with the per-turn [`NudgeCx`].
+    fn nudge(&self, cx: &NudgeCx) -> Option<String>;
+}
+
+/// The per-turn context a [`NudgeSource`] is consulted with. A struct (not bare arguments) so new
+/// per-turn facts can be added without breaking every implementor. Named `NudgeCx` because `TurnCx`
+/// is already the tool-execution context ([`crate::turn::TurnCx`]).
+pub struct NudgeCx<'a> {
+    /// The count of user turns in the durable conversation, *including* the one opening this turn.
+    /// The cadence position for interval reminders (self-hydrating on restore).
+    pub user_turns: u64,
+    /// The origin transport of the submit that opened this turn (a routed chat surface like
+    /// `matrix`), or `None` for no-origin activations (durable rehydrate, injected store inputs,
+    /// background completions, cron, steer, observe). The per-submit key an origin-aware source
+    /// (e.g. the transport formatting hint) matches on — never the multi-transport session.
+    pub origin: Option<&'a daemon_protocol::TransportId>,
 }
 
 /// A per-tool-call observer (§10/§12): sees every **executed** tool call and may return hint text

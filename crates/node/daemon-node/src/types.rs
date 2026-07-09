@@ -83,7 +83,8 @@ pub struct PromptPolicy {
     pub model_guidance: bool,
     /// Compose the environment-hints block (host OS / home / workspace cwd).
     pub environment_hints: bool,
-    /// Compose the per-session transport (surface) hint for routed sessions.
+    /// Inject the per-surface transport hint for a turn opened by a routed submit, keyed on that
+    /// submit's origin transport (per-turn, never session-scoped — a session is multi-transport).
     pub transport_hints: bool,
     /// Compose the date-only stamp.
     pub date_stamp: bool,

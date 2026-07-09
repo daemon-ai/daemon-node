@@ -58,6 +58,7 @@ impl Engine {
         self.snapshot.conversation.turns.truncate(retained);
         self.pending.clear();
         self.next_trigger = None;
+        self.next_origin = None;
         self.snapshot.waiting_for.clear();
         self.snapshot.pending_approvals.clear();
         // Cadence counters are relative to the dropped tail; reset so the rewound point starts clean.

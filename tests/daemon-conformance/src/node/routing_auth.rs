@@ -76,6 +76,232 @@ async fn routing_pin_resolves_to_bound_session_impl() {
     handle.shutdown().await;
 }
 
+/// Per-turn transport hints, end to end (prompt-arch): the per-surface formatting hint is injected
+/// on a turn keyed on **that submit's** origin — never the session. Two routed submits land on the
+/// SAME pinned session: the Matrix-origin turn carries the Matrix hint in its outgoing request's
+/// last user message, while the `api`-origin turn to the same session carries none. The hint is
+/// request-only (`TurnInjection`): it never enters the durable conversation, so the session's
+/// snapshot stays clean of hint bytes across both turns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_turn_transport_hint_keys_on_the_submit_not_the_session() {
+    as_system(per_turn_transport_hint_keys_on_the_submit_not_the_session_impl()).await;
+}
+async fn per_turn_transport_hint_keys_on_the_submit_not_the_session_impl() {
+    use daemon_api::{Outbound, ProfileSpec, ProviderSelector, SessionApi};
+    use daemon_common::ReqId;
+    use daemon_host::{MemProfileStore, ProfileStore, RoutingRegistry};
+    use daemon_protocol::{AgentCommand, AgentEvent, Origin, OriginScope, TransportId, UserMsg};
+    use std::sync::Mutex as StdMutex;
+
+    /// Records each request's last user message (where a `TurnInjection` rides), then completes.
+    struct LastUserRecorder {
+        seen: Arc<StdMutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for LastUserRecorder {
+        fn capabilities(&self) -> daemon_core::Capabilities {
+            daemon_core::Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: daemon_core::ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+        async fn chat(
+            &self,
+            req: daemon_core::Request,
+        ) -> Result<daemon_core::ModelOutput, daemon_core::Failure> {
+            let last_user = req
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            self.seen.lock().unwrap().push(last_user);
+            Ok(daemon_core::ModelOutput {
+                text: "ok".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    let store = Arc::new(MemProfileStore::new());
+    store
+        .create(ProfileSpec::new(
+            "alpha",
+            ProviderSelector::GenAi,
+            "model-a",
+        ))
+        .expect("create profile");
+    store.set_active("alpha").expect("set active");
+
+    let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let resolver: daemon_node::ProviderResolver = {
+        let seen = seen.clone();
+        Arc::new(move |_spec: &ProfileSpec| {
+            let seen = seen.clone();
+            let builder: daemon_core::ProviderBuilder = Arc::new(move || {
+                Arc::new(LastUserRecorder { seen: seen.clone() }) as Arc<dyn Provider>
+            });
+            builder
+        })
+    };
+
+    let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+        store: Arc::new(InMemoryStore::new()),
+        partition: PARTITION,
+        host_config: fast_host_config(),
+        providers: gate_providers(),
+        credentials: None,
+        profile: ProfileRef::new("alpha"),
+        engine_config: daemon_core::Config::default(),
+        journal_seed: Some([0x57; 32]),
+        nesting_depth: 0,
+        context: None,
+        context_builder: None,
+        memory: Vec::new(),
+        memory_builder: None,
+        extra_tools: Vec::new(),
+        models: None,
+        profiles: Some(store),
+        provider_resolver: Some(resolver),
+        credential_store: None,
+        cloud_catalog: None,
+        prompt_sources: vec![],
+        revisions: None,
+        skills: None,
+        skills_resolver: None,
+        routing: Some(RoutingRegistry::new()),
+        checkpoints: None,
+        auth_factories: vec![],
+        workspace_root: None,
+        blob_root: None,
+        fs: Default::default(),
+        processes: Default::default(),
+        title_aux: None,
+        reaper: Default::default(),
+        orchestrate: Default::default(),
+        foreign_gateway: None,
+        // `[prompt].transport_hints` defaults on: the origin-aware TransportHintSource is attached.
+        prompt: Default::default(),
+    });
+
+    // Both origins pin to the SAME session, so the second submit reuses the first's live engine —
+    // proving the hint follows the per-turn submit origin, not a session-stable property.
+    let shared = SessionId::new("shared-surface");
+    let matrix_origin = Origin::new(
+        TransportId::new("matrix/@bot:hs.org"),
+        OriginScope::Group {
+            chat: "!room:hs".into(),
+            thread: None,
+        },
+    );
+    let api_origin = Origin::new(
+        TransportId::new("api"),
+        OriginScope::Dm {
+            user: "alice".into(),
+        },
+    );
+    node.routing_bind_chat(matrix_origin.clone(), shared.clone(), None)
+        .await
+        .expect("pin the matrix origin");
+    node.routing_bind_chat(api_origin.clone(), shared.clone(), None)
+        .await
+        .expect("pin the api origin to the same session");
+
+    async fn route_and_finish(node: &Arc<NodeApiImpl>, origin: Origin) {
+        node.submit_routed(
+            origin,
+            AgentCommand::StartTurn {
+                input: UserMsg::new("hi"),
+                request_id: ReqId(1),
+            },
+        )
+        .await
+        .expect("routed submit");
+    }
+    async fn drain_until_finished(node: &Arc<NodeApiImpl>, session: &SessionId) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let finished = node
+                .poll(session.clone(), 0)
+                .await
+                .expect("poll")
+                .into_iter()
+                .any(|item| matches!(item, Outbound::Event(AgentEvent::TurnFinished { .. })));
+            if finished {
+                return;
+            }
+            assert!(Instant::now() < deadline, "routed turn never finished");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // Turn 1: a Matrix-origin submit — the outgoing request carries the Matrix surface hint.
+    route_and_finish(&node, matrix_origin).await;
+    drain_until_finished(&node, &shared).await;
+    // Turn 2: an api-origin submit to the SAME session — no hint that turn.
+    route_and_finish(&node, api_origin).await;
+    drain_until_finished(&node, &shared).await;
+
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one request per turn, same session");
+        assert!(
+            seen[0].contains("Matrix room"),
+            "turn 1 (matrix origin): the per-surface hint rides the request, got {:?}",
+            seen[0]
+        );
+        assert!(
+            !seen[1].contains("Matrix"),
+            "turn 2 (api origin, same session): no hint — keyed on the submit, not the session, got {:?}",
+            seen[1]
+        );
+    }
+
+    // The durable conversation stays clean of hint bytes: the request-only injection never enters
+    // the persisted turns (a snapshot of the shared session shows no surface hint on any user turn).
+    node.submit(
+        shared.clone(),
+        AgentCommand::Snapshot {
+            request_id: ReqId(99),
+        },
+    )
+    .await
+    .expect("snapshot request");
+    let view = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = node
+                .poll(shared.clone(), 0)
+                .await
+                .expect("poll")
+                .into_iter()
+                .find_map(|item| match item {
+                    Outbound::Event(AgentEvent::Snapshot {
+                        view,
+                        request_id: ReqId(99),
+                        ..
+                    }) => Some(view),
+                    _ => None,
+                });
+            if let Some(view) = snap {
+                break view;
+            }
+            assert!(Instant::now() < deadline, "snapshot never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    assert!(
+        view.turns.iter().all(|t| !t.text.contains("Matrix")),
+        "the durable conversation must stay clean of hint bytes, got {:?}",
+        view.turns
+    );
+
+    handle.shutdown().await;
+}
+
 /// THE ROUTING GATE (daemon-event-io-spec §5.9): a routed submit hands the host only an `Origin`
 /// and the host's routing registry resolves it to a session + profile + delivery. Proves, with no
 /// chat transport at all: (1) the account->profile baseline (two transport instances bound to two

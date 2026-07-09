@@ -917,6 +917,12 @@ impl LiveSessions {
                 // Record the inbound command on the merged log first, so an observer sees what was
                 // submitted ahead of the engine's replies (StartTurn enters the conversation),
                 // attributed to the submitting surface's `origin`.
+                //
+                // Clone the origin for the turn before `record_inbound` consumes it: the Core actor
+                // carries it as this submit's per-turn origin (arming the engine's one-shot
+                // `next_origin`), so an origin-aware nudge source can compose a per-surface hint for
+                // exactly this turn — keyed on the submit, never the multi-transport session.
+                let origin_for_turn = origin.clone();
                 self.record_inbound(
                     &session,
                     LogEntryParts {
@@ -931,7 +937,7 @@ impl LiveSessions {
                 match handle {
                     LiveHandle::Core(handle) => {
                         tokio::spawn(async move {
-                            let _ = handle.start_turn(input).await;
+                            let _ = handle.start_turn_from(origin_for_turn, input).await;
                         });
                     }
                     // A foreign session backgrounds the turn itself (submit must return promptly);

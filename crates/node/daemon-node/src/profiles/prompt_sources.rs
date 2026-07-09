@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use daemon_core::{
-    AsyncPromptSource, EngineProfile, ExecutionEnvironment, ModelPromptSource, NudgeSource,
-    SlotKind, StablePromptSource, ToolCallObserver,
+    AsyncPromptSource, EngineProfile, ExecutionEnvironment, ModelPromptSource, NudgeCx,
+    NudgeSource, SlotKind, StablePromptSource, ToolCallObserver,
 };
 use daemon_prompt::{
     core_agentic_guidance, date_stamp, environment_hints, model_family_guidance, tool_use_guidance,
@@ -149,11 +149,31 @@ struct UserProfileNudge {
 }
 
 impl NudgeSource for UserProfileNudge {
-    fn nudge(&self, user_turns: u64) -> Option<String> {
-        if self.interval == 0 || !user_turns.is_multiple_of(u64::from(self.interval)) {
+    fn nudge(&self, cx: &NudgeCx) -> Option<String> {
+        if self.interval == 0 || !cx.user_turns.is_multiple_of(u64::from(self.interval)) {
             return None;
         }
         Some(USER_PROFILE_NUDGE.to_string())
+    }
+}
+
+/// The per-surface transport hint as an origin-aware [`NudgeSource`] (prompt-arch, `[prompt]`-gated):
+/// on a turn opened by a routed submit it injects the formatting guidance daemon-prompt knows for
+/// that submit's origin transport — Matrix today. It is per-TURN by construction (keyed on
+/// [`NudgeCx::origin`], the one-shot origin of *this* submit), so it is correct across the ways a
+/// session is multi-transport (GUI `Submit` to any session, chat pins, `Handover`, rooms fan-out):
+/// a no-origin turn (durable rehydrate, injected store inputs, background completions, cron, steer,
+/// observe) carries no origin and therefore composes nothing. Socket clients compose none (GUI/TUI
+/// are indistinguishable at wire v36), and any transport without a documented rendering rule maps to
+/// nothing — the family match lives in `daemon_prompt::transport_hints`.
+struct TransportHintSource;
+
+impl NudgeSource for TransportHintSource {
+    fn nudge(&self, cx: &NudgeCx) -> Option<String> {
+        // Transport ids are instance-qualified (`matrix/@bot:hs`); the FAMILY segment keys the
+        // hint (node-side policy — splitting is not daemon-prompt's concern).
+        let family = cx.origin?.as_str().split('/').next().unwrap_or_default();
+        daemon_prompt::transport_hints(family).map(str::to_string)
     }
 }
 
@@ -249,6 +269,11 @@ pub(crate) fn attach_prompt_sources(
             }));
         }
     }
+    if policy.transport_hints {
+        // Origin-aware, per-turn: injects the surface hint only on a turn opened by a routed
+        // submit whose origin family daemon-prompt knows rules for. No-origin turns compose none.
+        profile = profile.with_nudge_source(Arc::new(TransportHintSource));
+    }
     if policy.date_stamp {
         profile = profile.with_prompt_block(Arc::new(DateStampSource));
     }
@@ -317,16 +342,60 @@ mod tests {
         assert!(no_tools.block("gpt-5.5").is_none(), "no tools, no block");
     }
 
+    /// A `NudgeCx` at cadence position `user_turns` with no origin (the cadence-only case).
+    fn cadence(user_turns: u64) -> NudgeCx<'static> {
+        NudgeCx {
+            user_turns,
+            origin: None,
+        }
+    }
+
     #[test]
     fn nudge_fires_on_the_interval_only() {
         let nudge = UserProfileNudge { interval: 3 };
-        assert!(nudge.nudge(1).is_none());
-        assert!(nudge.nudge(2).is_none());
-        assert_eq!(nudge.nudge(3).as_deref(), Some(USER_PROFILE_NUDGE));
-        assert!(nudge.nudge(4).is_none());
-        assert!(nudge.nudge(6).is_some());
+        assert!(nudge.nudge(&cadence(1)).is_none());
+        assert!(nudge.nudge(&cadence(2)).is_none());
+        assert_eq!(
+            nudge.nudge(&cadence(3)).as_deref(),
+            Some(USER_PROFILE_NUDGE)
+        );
+        assert!(nudge.nudge(&cadence(4)).is_none());
+        assert!(nudge.nudge(&cadence(6)).is_some());
         let disabled = UserProfileNudge { interval: 0 };
-        assert!((0..10).all(|n| disabled.nudge(n).is_none()));
+        assert!((0..10).all(|n| disabled.nudge(&cadence(n)).is_none()));
+    }
+
+    #[test]
+    fn transport_hint_maps_by_family_and_ignores_origin_less_turns() {
+        let source = TransportHintSource;
+        // Instance-qualified matrix ids (`matrix/<mxid>`, the adapter's stamp) map by family.
+        for id in ["matrix", "matrix/@bot:hs.org"] {
+            let origin = daemon_protocol::TransportId::new(id);
+            let hint = source
+                .nudge(&NudgeCx {
+                    user_turns: 1,
+                    origin: Some(&origin),
+                })
+                .expect("the matrix family injects a hint");
+            assert!(hint.contains("Matrix room"), "{id}");
+        }
+        // A socket/unmapped family composes nothing.
+        let api = daemon_protocol::TransportId::new("api");
+        assert!(source
+            .nudge(&NudgeCx {
+                user_turns: 1,
+                origin: Some(&api),
+            })
+            .is_none());
+        let telegram = daemon_protocol::TransportId::new("telegram/bot-1");
+        assert!(source
+            .nudge(&NudgeCx {
+                user_turns: 1,
+                origin: Some(&telegram),
+            })
+            .is_none());
+        // No origin (durable rehydrate, background completion, steer, observe): no hint, ever.
+        assert!(source.nudge(&cadence(1)).is_none());
     }
 
     /// End-to-end over a real exec env: the async sources read the WORKSPACE (context files from

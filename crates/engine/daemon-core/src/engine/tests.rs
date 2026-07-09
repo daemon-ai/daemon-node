@@ -513,8 +513,8 @@ async fn nudge_source_fires_at_interval_via_turn_injection() {
     /// Fires every 3rd user turn (the NudgeCounter cadence, stateless over the count).
     struct EveryThird;
     impl crate::context::NudgeSource for EveryThird {
-        fn nudge(&self, user_turns: u64) -> Option<String> {
-            user_turns
+        fn nudge(&self, cx: &crate::context::NudgeCx) -> Option<String> {
+            cx.user_turns
                 .is_multiple_of(3)
                 .then(|| "NUDGE-SAVE-PROFILE".to_string())
         }
@@ -583,8 +583,8 @@ async fn nudge_source_fires_at_interval_via_turn_injection() {
 async fn nudge_cadence_hydrates_from_restored_history() {
     struct EveryThird;
     impl crate::context::NudgeSource for EveryThird {
-        fn nudge(&self, user_turns: u64) -> Option<String> {
-            user_turns.is_multiple_of(3).then(|| "NUDGE".to_string())
+        fn nudge(&self, cx: &crate::context::NudgeCx) -> Option<String> {
+            cx.user_turns.is_multiple_of(3).then(|| "NUDGE".to_string())
         }
     }
     // First incarnation: two user turns, no nudge yet.
@@ -635,7 +635,7 @@ async fn nudge_cadence_hydrates_from_restored_history() {
 async fn non_user_turns_do_not_consult_nudge_sources() {
     struct Recording(Arc<AtomicU64>);
     impl crate::context::NudgeSource for Recording {
-        fn nudge(&self, _user_turns: u64) -> Option<String> {
+        fn nudge(&self, _cx: &crate::context::NudgeCx) -> Option<String> {
             self.0.fetch_add(1, Ordering::Relaxed);
             None
         }
@@ -675,6 +675,91 @@ async fn non_user_turns_do_not_consult_nudge_sources() {
         1,
         "user turn: consulted once"
     );
+}
+
+/// The engine's one-shot `next_origin` channel (mirroring `next_trigger`): the origin armed for a
+/// turn reaches the nudge sources via `NudgeCx.origin` and its contribution rides the outgoing
+/// request's last user message; and it is consumed by that turn, so the *next* turn (armed with no
+/// origin — the no-origin structural default for rehydrate/completions/steer/observe) sees `None`
+/// and composes nothing.
+#[tokio::test]
+async fn next_origin_is_one_shot_and_reaches_nudge_sources() {
+    /// Records the origin string each consulted turn saw, and injects a per-origin hint so the
+    /// same source proves both the seam (origin reached it) and the injection (hint in request).
+    struct OriginRecorder(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+    impl crate::context::NudgeSource for OriginRecorder {
+        fn nudge(&self, cx: &crate::context::NudgeCx) -> Option<String> {
+            let seen = cx.origin.map(|t| t.as_str().to_string());
+            self.0.lock().unwrap().push(seen.clone());
+            seen.map(|s| format!("SURFACE:{s}"))
+        }
+    }
+
+    let provider = RequestRecordingProvider::new();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut engine = Engine::fresh(
+        SessionId::new("origin-oneshot"),
+        SystemPrompt::new("persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_nudge_sources(vec![Arc::new(OriginRecorder(seen.clone()))]);
+
+    // Turn 1: armed with a matrix origin — the source sees it and injects the per-surface hint.
+    engine.set_next_origin(Some(daemon_protocol::TransportId::new(
+        "matrix/@bot:hs.org",
+    )));
+    engine.push_user(UserMsg::new("first"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    // Turn 2: NOT armed — the one-shot was consumed, so the source sees no origin (no hint).
+    engine.push_user(UserMsg::new("second"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Some("matrix/@bot:hs.org".to_string()), None],
+        "the armed origin reaches the source on its turn; the next turn sees none (one-shot)"
+    );
+
+    let last_user_of = |req: &Request| {
+        req.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .unwrap()
+            .content
+            .clone()
+    };
+    let requests = provider.seen.lock().unwrap();
+    assert!(
+        last_user_of(&requests[0]).contains("SURFACE:matrix/@bot:hs.org"),
+        "turn 1: the origin-keyed hint rides the outgoing request"
+    );
+    assert!(
+        !last_user_of(&requests[1]).contains("SURFACE:"),
+        "turn 2: no origin, no hint"
+    );
+    // The durable conversation never carries the injected hint (request-only TurnInjection).
+    for req in requests.iter() {
+        assert!(!req.system.contains("SURFACE:"), "never the system prompt");
+    }
+    drop(requests);
+    for turn in &engine.snapshot().conversation.turns {
+        if let Turn::User(u) = turn {
+            assert!(
+                !u.text.contains("SURFACE:"),
+                "durable user text stays clean of the hint: {}",
+                u.text
+            );
+        }
+    }
 }
 
 /// A model-keyed source re-resolves against the LIVE model identity at every composition: the

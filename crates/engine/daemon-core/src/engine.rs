@@ -12,7 +12,7 @@
 use crate::config::Config;
 use crate::context::{
     AsyncPromptSource, BudgetedContextEngine, ComposedPrompt, ContextEngine, ModelPromptSource,
-    NudgeSource, StablePromptSource, ToolCallObserver, TurnInjection,
+    NudgeCx, NudgeSource, StablePromptSource, ToolCallObserver, TurnInjection,
 };
 use crate::control::{SteerReq, TurnControl};
 use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Turn};
@@ -32,8 +32,8 @@ use daemon_common::{
 };
 use daemon_protocol::{
     AgentEvent, CompletionSource, ContextStatus, ConvTurnView, ConvView, EndReason, HostRequest,
-    HostRequestHandler, HostRequestKind, RewindAnchor, SpawnSeed, SpawnSpec, TurnSummary,
-    TurnTrigger, UserMsg,
+    HostRequestHandler, HostRequestKind, RewindAnchor, SpawnSeed, SpawnSpec, TransportId,
+    TurnSummary, TurnTrigger, UserMsg,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -175,6 +175,13 @@ pub struct Engine {
     /// A one-shot override for the next turn's [`TurnTrigger`] (set when a steer opens a turn);
     /// consumed at the start of `run_turn`.
     next_trigger: Option<TurnTrigger>,
+    /// A one-shot per-turn origin transport: the [`TransportId`] of the submit that opens the next
+    /// turn (a routed chat surface like `matrix`), set by the actor beside [`push_user`](Self::push_user)
+    /// and consumed via `.take()` at turn open — exactly mirroring [`Self::next_trigger`]. It is the
+    /// per-submit correlation the origin-aware [`NudgeSource`]s key on ([`NudgeCx::origin`]); no-origin
+    /// activations (durable rehydrate, injected store inputs, background completions, cron, steer,
+    /// observe) never set it, so they structurally produce no per-surface injection.
+    next_origin: Option<TransportId>,
     /// Whether the once-per-incarnation §10/§11 lifecycle hooks (`on_model`, `on_session_start`,
     /// `on_session_switch(Start|Resume)`) have fired yet. Set on the first `run_turn`.
     lifecycle_started: bool,
@@ -309,6 +316,15 @@ impl Engine {
     /// default `User`. Has no effect if a turn is already mid-flight.
     pub fn set_next_trigger(&mut self, trigger: TurnTrigger) {
         self.next_trigger = Some(trigger);
+    }
+
+    /// Arm the next turn's origin transport (a one-shot override consumed at the start of the next
+    /// `run_turn`, mirroring [`set_next_trigger`](Self::set_next_trigger)). The actor sets this beside
+    /// [`push_user`](Self::push_user) from the opening submit's [`Origin`](daemon_protocol::Origin)
+    /// so an origin-aware [`NudgeSource`] can compose a per-surface hint for exactly that turn. Has
+    /// no effect if a turn is already mid-flight (the actor only dequeues starts at a boundary).
+    pub fn set_next_origin(&mut self, origin: Option<TransportId>) {
+        self.next_origin = origin;
     }
 
     /// The current snapshot (the only durable state).
@@ -809,7 +825,12 @@ impl Engine {
     /// [`MemoryProvider`](crate::memory::MemoryProvider) is registered; nudges fire only on
     /// **user-triggered** turns (`user_turn`), so background completions and scheduled wakes never
     /// advance or repeat a cadence.
-    async fn prepare_turn_context(&mut self, events: &EventSink, user_turn: bool) {
+    async fn prepare_turn_context(
+        &mut self,
+        events: &EventSink,
+        user_turn: bool,
+        origin: Option<&TransportId>,
+    ) {
         if self.composed_dirty {
             // A model switch invalidated the composition: rebuild it at this turn boundary (never
             // mid-turn) under the new model identity.
@@ -826,9 +847,13 @@ impl Engine {
                 .iter()
                 .filter(|t| matches!(t, Turn::User(_)))
                 .count() as u64;
+            // The per-turn context handed to every nudge source: the cadence position plus the
+            // opening submit's origin transport (`None` on no-origin activations), so origin-aware
+            // sources (e.g. the transport formatting hint) key on this submit — never the session.
+            let cx = NudgeCx { user_turns, origin };
             self.nudge_sources
                 .iter()
-                .filter_map(|s| s.nudge(user_turns))
+                .filter_map(|s| s.nudge(&cx))
                 .collect()
         } else {
             Vec::new()
@@ -1010,6 +1035,10 @@ impl Engine {
         #[cfg_attr(not(feature = "otel"), allow(clippy::let_and_return))]
         let outcome = async {
             let resuming = !self.pending.is_empty();
+            // One-shot: the opening submit's origin transport, consumed here so the *next* turn
+            // (if it has no submit of its own) sees none — the structural guarantee that no-origin
+            // paths compose no per-surface hint. Mirrors `next_trigger.take()` directly below.
+            let origin = self.next_origin.take();
             let trigger = self.next_trigger.take().unwrap_or(if resuming {
                 TurnTrigger::BackgroundCompletion {
                     source: CompletionSource::Delegation(self.pending[0].job_id.clone()),
@@ -1095,7 +1124,7 @@ impl Engine {
                 session = %context_session,
                 epoch = context_epoch
             );
-            self.prepare_turn_context(events, user_turn)
+            self.prepare_turn_context(events, user_turn, origin.as_ref())
                 .instrument(context_span)
                 .await;
 

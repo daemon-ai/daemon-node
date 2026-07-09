@@ -45,6 +45,7 @@ impl Engine {
             nudge_sources: Vec::new(),
             tool_observers: Vec::new(),
             next_trigger: None,
+            next_origin: None,
             lifecycle_started: false,
         }
     }

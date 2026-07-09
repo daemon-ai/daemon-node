@@ -250,48 +250,23 @@ pub fn environment_hints(input: &EnvironmentInput) -> Option<String> {
     Some(blocks.join("\n\n"))
 }
 
-/// Where a session's traffic originates — the daemon analogue of hermes' platform hints. Each
-/// surface renders replies differently, so the agent gets formatting guidance keyed on it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportOrigin {
-    /// The daemon GUI desktop client.
-    GuiClient,
-    /// The daemon TUI terminal client.
-    TuiClient,
-    /// A Matrix room (the `daemon-matrix` adapter).
-    Matrix,
-    /// An external editor/IDE driving the node over ACP (the `daemon-acp` adapter).
-    AcpClient,
-}
-
-/// The per-surface formatting hint for `origin`.
-pub fn transport_hints(origin: TransportOrigin) -> Option<String> {
-    let hint = match origin {
-        TransportOrigin::GuiClient => {
-            "Session surface: the daemon GUI client. Your replies render as rich markdown — \
-             headings, tables, task lists, and fenced code blocks all display natively. Prefer \
-             structured formatting (bullet and numbered lists, tables for enumerable facts) for \
-             scannable output; long code belongs in fenced blocks with a language tag."
-        }
-        TransportOrigin::TuiClient => {
-            "Session surface: the daemon TUI client, a terminal chat. Markdown renders in a \
-             character grid: prefer compact bullet and numbered lists and short fenced code \
-             blocks; avoid wide tables and images — they do not render well in a terminal."
-        }
-        TransportOrigin::Matrix => {
+/// The per-surface formatting hint for a transport `family` — the daemon analogue of hermes'
+/// platform hints. Keyed on the transport FAMILY string (the node splits an instance-qualified
+/// id like `matrix/@bot:hs` down to its family before calling), since a surface renders replies
+/// differently and the agent gets formatting guidance for it. Only families this crate knows
+/// rules for return a hint; an unknown family (the common case for socket clients — GUI/TUI are
+/// indistinguishable at wire v36 — and any transport without a documented rendering rule yet)
+/// returns `None`. Adding a new family (Telegram, Discord, …) is one match arm.
+pub fn transport_hints(family: &str) -> Option<&'static str> {
+    match family {
+        "matrix" => Some(
             "Session surface: a Matrix room. Replies are delivered as Matrix messages with \
              markdown formatting. Keep them concise and chat-shaped: short paragraphs, bullet \
              lists, fenced code blocks for anything long. Other room members may see your \
-             replies, so avoid dumping large raw output into the room."
-        }
-        TransportOrigin::AcpClient => {
-            "Session surface: an external editor/IDE driving this daemon over ACP (Agent Client \
-             Protocol). Your replies render in the client's chat panel beside the user's code: \
-             keep them tight, reference files by path so the client can link them, and put code \
-             in fenced blocks."
-        }
-    };
-    Some(hint.to_string())
+             replies, so avoid dumping large raw output into the room.",
+        ),
+        _ => None,
+    }
 }
 
 /// The date-only stamp: `Conversation started: <today>`. `today` is the caller-formatted date
@@ -524,39 +499,20 @@ mod tests {
     // ── Transport hints ───────────────────────────────────────────────
 
     #[test]
-    fn every_origin_has_a_nonempty_hint() {
-        for origin in [
-            TransportOrigin::GuiClient,
-            TransportOrigin::TuiClient,
-            TransportOrigin::Matrix,
-            TransportOrigin::AcpClient,
-        ] {
-            let hint = transport_hints(origin).unwrap();
-            assert!(hint.len() > 50, "{origin:?}");
-            assert!(hint.starts_with("Session surface:"), "{origin:?}");
+    fn matrix_family_has_a_nonempty_surface_hint() {
+        let hint = transport_hints("matrix").expect("the matrix family maps to a hint");
+        assert!(hint.len() > 50);
+        assert!(hint.starts_with("Session surface:"));
+        assert!(hint.contains("Matrix room"));
+    }
+
+    #[test]
+    fn unknown_families_compose_no_hint() {
+        // Families this crate has no documented rendering rule for (socket clients, transports not
+        // yet mapped, empty) return None — the node treats that as "no hint".
+        for family in ["gui", "tui", "acp", "telegram", "discord", "api", ""] {
+            assert!(transport_hints(family).is_none(), "{family}");
         }
-    }
-
-    #[test]
-    fn origin_hints_name_their_surface() {
-        assert!(transport_hints(TransportOrigin::GuiClient)
-            .unwrap()
-            .contains("GUI"));
-        assert!(transport_hints(TransportOrigin::TuiClient)
-            .unwrap()
-            .contains("TUI"));
-        assert!(transport_hints(TransportOrigin::Matrix)
-            .unwrap()
-            .contains("Matrix room"));
-        assert!(transport_hints(TransportOrigin::AcpClient)
-            .unwrap()
-            .contains("ACP"));
-    }
-
-    #[test]
-    fn tui_hint_steers_away_from_wide_tables() {
-        let hint = transport_hints(TransportOrigin::TuiClient).unwrap();
-        assert!(hint.contains("avoid wide tables"));
     }
 
     // ── Date stamp ────────────────────────────────────────────────────

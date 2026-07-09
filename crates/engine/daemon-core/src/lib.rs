@@ -61,7 +61,7 @@ pub use command::{
 pub use config::Config;
 pub use context::{
     estimate_tokens, AsyncPromptSource, BudgetedContextEngine, ComposedPrompt,
-    ComposedPromptBuilder, ContextEngine, ContextStrategy, ModelInfo, ModelPromptSource,
+    ComposedPromptBuilder, ContextEngine, ContextStrategy, ModelInfo, ModelPromptSource, NudgeCx,
     NudgeSource, Pressure, Slot, SlotKind, SlotReport, StablePromptSource, ToolCallObserver,
     TurnInjection,
 };

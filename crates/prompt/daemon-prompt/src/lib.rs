@@ -46,9 +46,9 @@ pub mod user_profile;
 pub use context_files::{ContextFilesLoader, SubdirHintTracker};
 pub use guidance::{
     core_agentic_guidance, date_stamp, environment_hints, model_family_guidance, tool_use_guidance,
-    transport_hints, EnvironmentInput, ToolUseMode, TransportOrigin,
-    GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE, TASK_COMPLETION_GUIDANCE,
-    TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS,
+    transport_hints, EnvironmentInput, ToolUseMode, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    OPENAI_MODEL_EXECUTION_GUIDANCE, TASK_COMPLETION_GUIDANCE, TOOL_USE_ENFORCEMENT_GUIDANCE,
+    TOOL_USE_ENFORCEMENT_MODELS,
 };
 pub use persona::{role_persona, PersonaStore, RolePersona, DEFAULT_PERSONA_CAP, DEFAULT_SOUL_MD};
 pub use revlog::{Author, RevisionEntry};

@@ -412,8 +412,15 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                 let _ = actor_log.send(entry);
             },
         );
-        let mut pending_starts: VecDeque<(UserMsg, oneshot::Sender<Result<TurnSummary, Failure>>)> =
-            VecDeque::new();
+        // Each queued start carries its opening `Origin` so the boundary can arm the engine's
+        // one-shot `next_origin` (the per-submit transport the origin-aware nudge sources key on)
+        // beside `push_user`.
+        type PendingStart = (
+            UserMsg,
+            Origin,
+            oneshot::Sender<Result<TurnSummary, Failure>>,
+        );
+        let mut pending_starts: VecDeque<PendingStart> = VecDeque::new();
         // A live model switch requested while a turn was running (or while idle): applied here at the
         // turn boundary so it never invalidates an in-flight turn's prompt cache.
         let mut pending_provider: Option<(Arc<dyn Provider>, Option<String>)> = None;
@@ -463,7 +470,10 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                         accepted: true,
                     });
                 }
-            } else if let Some((input, reply)) = pending_starts.pop_front() {
+            } else if let Some((input, origin, reply)) = pending_starts.pop_front() {
+                // Arm the one-shot origin for this turn beside the opening user message: the engine
+                // consumes it via `.take()` at turn open, so a following no-submit turn sees none.
+                engine.set_next_origin(Some(origin.transport));
                 engine.push_user(input);
                 reply_slot = Some(reply);
             } else if shutting_down {
@@ -477,8 +487,13 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                 // Record the inbound command on the merged log before acting on it.
                 record_inbound(&sink, &msg);
                 match msg {
-                    ActorMsg::StartTurn { input, reply, .. } => {
-                        pending_starts.push_back((input, reply));
+                    ActorMsg::StartTurn {
+                        input,
+                        origin,
+                        reply,
+                        ..
+                    } => {
+                        pending_starts.push_back((input, origin, reply));
                     }
                     ActorMsg::Steer {
                         request_id, text, ..
@@ -552,8 +567,13 @@ pub fn spawn_agent_session(mut engine: Engine, host: Arc<dyn HostRequestHandler>
                                     ActorMsg::Snapshot { request_id, .. } => {
                                         control.push_snapshot(request_id);
                                     }
-                                    ActorMsg::StartTurn { input, reply, .. } => {
-                                        pending_starts.push_back((input, reply));
+                                    ActorMsg::StartTurn {
+                                        input,
+                                        origin,
+                                        reply,
+                                        ..
+                                    } => {
+                                        pending_starts.push_back((input, origin, reply));
                                     }
                                     ActorMsg::SetProvider {
                                         provider, model, ..
