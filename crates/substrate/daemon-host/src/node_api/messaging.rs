@@ -97,6 +97,24 @@ impl NodeApiImpl {
                 ))
             })
     }
+
+    /// Resolve the file-transfer feature for `transport` (W2-H).
+    pub(crate) fn file_transfer_for(
+        &self,
+        transport: &TransportId,
+    ) -> Result<Arc<dyn daemon_api::SupportsFileTransfer>, ApiError> {
+        self.adapters
+            .load_full()
+            .adapter_for_transport(transport)
+            .and_then(|a| a.messaging())
+            .and_then(|m| m.file_transfer())
+            .ok_or_else(|| {
+                ApiError::Unsupported(format!(
+                    "transport {} has no file-transfer support",
+                    transport.as_str()
+                ))
+            })
+    }
 }
 
 /// A human label for a [`Participant`] (the management-audit detail; never a secret payload).

@@ -220,7 +220,9 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ContactSetAlias { .. }
         | RosterAdd { .. }
         | RosterUpdate { .. }
-        | RosterRemove { .. } => C::MessagingWrite,
+        | RosterRemove { .. }
+        | FtSend { .. }
+        | FtReceive { .. } => C::MessagingWrite,
 
         // -- serve_registry: extension/agent/provider registry + node config --------------------
         // AgentDiscover only probes recipes and caches in memory (no persistence) -> a read.

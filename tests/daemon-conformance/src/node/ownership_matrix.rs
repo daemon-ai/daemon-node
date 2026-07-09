@@ -404,7 +404,9 @@ fn classify(req: &ApiRequest) -> Coverage {
         | RosterList { .. }
         | RosterAdd { .. }
         | RosterUpdate { .. }
-        | RosterRemove { .. } => NotSessionTouching,
+        | RosterRemove { .. }
+        | FtSend { .. }
+        | FtReceive { .. } => NotSessionTouching,
         AgentDiscover
         | AgentCatalog
         | AgentRegister { .. }

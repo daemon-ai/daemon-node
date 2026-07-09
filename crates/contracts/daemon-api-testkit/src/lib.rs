@@ -247,21 +247,17 @@ impl FailSwitches {
 /// per-verb [`FailSwitches`]. The daemon analogue of libpurple's non-empty `Test*` fixtures: it
 /// advertises all verbs supported and each verb succeeds unless its switch is flipped. Wave-2
 /// packages build feature tests on top of this.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct FakeProtocol {
     fail: FailSwitches,
     /// Whether `validate_account` should reject (separate from the verb switches — it is a
     /// [`MessagingProtocol`]-level method, not a feature-trait verb).
     validate_fails: bool,
-}
-
-impl Default for FakeProtocol {
-    fn default() -> Self {
-        Self {
-            fail: FailSwitches::none(),
-            validate_fails: false,
-        }
-    }
+    /// The in-memory record of accepted [`SupportsFileTransfer::send`] transfers (the daemon
+    /// analogue of the libpurple fixture "sending" the file); only successful sends are recorded.
+    sent: std::sync::Mutex<Vec<FileTransfer>>,
+    /// The in-memory record of accepted [`SupportsFileTransfer::receive`] transfers.
+    received: std::sync::Mutex<Vec<FileTransfer>>,
 }
 
 impl FakeProtocol {
@@ -276,6 +272,7 @@ impl FakeProtocol {
         Arc::new(Self {
             fail: FailSwitches::all(),
             validate_fails: true,
+            ..Default::default()
         })
     }
 
@@ -283,8 +280,18 @@ impl FakeProtocol {
     pub fn with_failures(fail: FailSwitches) -> Arc<Self> {
         Arc::new(Self {
             fail,
-            validate_fails: false,
+            ..Default::default()
         })
+    }
+
+    /// The transfers accepted by [`SupportsFileTransfer::send`] so far (in-memory reference state).
+    pub fn sent_transfers(&self) -> Vec<FileTransfer> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    /// The transfers accepted by [`SupportsFileTransfer::receive`] so far.
+    pub fn received_transfers(&self) -> Vec<FileTransfer> {
+        self.received.lock().unwrap().clone()
     }
 
     /// Resolve a unit-returning verb keyed by its sentinel: `Ok(())` unless switched to fail.
@@ -567,11 +574,19 @@ impl SupportsFileTransfer for FakeProtocol {
             receive: true,
         }
     }
-    async fn send(&self, _transfer: FileTransfer) -> Result<(), ApiError> {
-        self.unit(sentinels::FILE_TRANSFER_SEND)
+    async fn send(&self, _transport: TransportId, transfer: FileTransfer) -> Result<(), ApiError> {
+        self.unit(sentinels::FILE_TRANSFER_SEND)?;
+        self.sent.lock().unwrap().push(transfer);
+        Ok(())
     }
-    async fn receive(&self, _transfer: FileTransfer) -> Result<(), ApiError> {
-        self.unit(sentinels::FILE_TRANSFER_RECEIVE)
+    async fn receive(
+        &self,
+        _transport: TransportId,
+        transfer: FileTransfer,
+    ) -> Result<(), ApiError> {
+        self.unit(sentinels::FILE_TRANSFER_RECEIVE)?;
+        self.received.lock().unwrap().push(transfer);
+        Ok(())
     }
 }
 
@@ -801,15 +816,16 @@ pub async fn assert_ops_match_behavior(proto: Arc<dyn MessagingProtocol>) {
         let transfer = FileTransfer {
             name: "f.bin".to_string(),
             blob: daemon_common::BlobRef::new(daemon_common::ContentHash::new([0u8; 32]), 0),
+            ..Default::default()
         };
         check(
-            &ft.send(transfer.clone()).await,
+            &ft.send(t.clone(), transfer.clone()).await,
             ops.send,
             sentinels::FILE_TRANSFER_SEND,
             "file_transfer::send",
         );
         check(
-            &ft.receive(transfer).await,
+            &ft.receive(t.clone(), transfer).await,
             ops.receive,
             sentinels::FILE_TRANSFER_RECEIVE,
             "file_transfer::receive",

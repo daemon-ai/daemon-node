@@ -1389,6 +1389,30 @@ request-feedback-submit = { "FeedbackSubmit": { "kind": feedback-kind, ? "target
 request-telemetry-consent-get = "TelemetryConsentGet"
 request-telemetry-consent-set = { "TelemetryConsentSet": { "enabled": bool } }
 
+; ----- file transfer (W2-H; wire vNEXT) -----
+; FileTransfer (<- PurpleFileTransfer). "name"+"blob" are the Wave-1 shape; the rest are additive
+; #[serde(default)] fields (present-and-typed by serde; optional here). direction/state are
+; serde-external unit-variant strings.
+; `-t` suffixes avoid the zcbor coder-name clash with the map members `direction`/`state`.
+file-transfer-direction-t = "Send" / "Receive"
+file-transfer-state-t = "Unknown" / "Negotiating" / "Started" / "Finished" / "Failed"
+file-transfer = {
+  "name": tstr,
+  "blob": blob-ref,
+  ? "direction": file-transfer-direction-t,
+  ? "state": file-transfer-state-t,
+  ? "remote": (contact-info / null),
+  ? "initiator": (contact-info / null),
+  ? "file_size": uint64,
+  ? "transferred": uint64,
+  ? "content_type": (tstr / null),
+  ? "message": (tstr / null),
+  ? "error": (tstr / null),
+  ? "source": (tstr / null)
+}
+request-ft-send = { "FtSend": { "transport": transport-id, "transfer": file-transfer } }
+request-ft-receive = { "FtReceive": { "transport": transport-id, "transfer": file-transfer } }
+
 api-request = request-submit
             / request-submit-routed
             / request-poll
@@ -1573,6 +1597,8 @@ api-request = request-submit
             / request-feedback-submit
             / request-telemetry-consent-get
             / request-telemetry-consent-set
+            / request-ft-send
+            / request-ft-receive
 
 response-ok = "Ok"
 response-routed = { "Routed": { "session": session-id } }

@@ -1592,6 +1592,51 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &ApiResponse::TelemetryConsent { enabled: true },
     )?;
 
+    // -- file transfer (W2-H; wire vNEXT) --------------------------------------------------------
+    {
+        use daemon_api::{FileTransfer, FileTransferDirection, FileTransferState};
+        use daemon_common::{BlobRef, ContentHash};
+
+        let blob = BlobRef {
+            hash: ContentHash::new([7u8; 32]),
+            size: 1337,
+            name: Some("cat.png".into()),
+            mime: Some("image/png".into()),
+        };
+        write_cbor(
+            &out,
+            "request-ft-send.cbor",
+            &ApiRequest::FtSend {
+                transport: TransportId::new("matrix/@bot:localhost"),
+                transfer: FileTransfer {
+                    name: "cat.png".into(),
+                    blob: blob.clone(),
+                    direction: FileTransferDirection::Send,
+                    state: FileTransferState::Negotiating,
+                    file_size: 1337,
+                    content_type: Some("image/png".into()),
+                    message: Some("here you go".into()),
+                    ..Default::default()
+                },
+            },
+        )?;
+        write_cbor(
+            &out,
+            "request-ft-receive.cbor",
+            &ApiRequest::FtReceive {
+                transport: TransportId::new("matrix/@bot:localhost"),
+                transfer: FileTransfer {
+                    name: "cat.png".into(),
+                    blob,
+                    direction: FileTransferDirection::Receive,
+                    file_size: 1337,
+                    source: Some("mxc://localhost/abc123".into()),
+                    ..Default::default()
+                },
+            },
+        )?;
+    }
+
     println!("generated CBOR fixtures in {}", out.display());
     Ok(())
 }

@@ -481,28 +481,65 @@ mod file_transfer {
     fn empty() -> Arc<dyn daemon_api::SupportsFileTransfer> {
         EmptyProtocol::new().file_transfer().unwrap()
     }
+    fn fake() -> Arc<dyn daemon_api::SupportsFileTransfer> {
+        FakeProtocol::new().file_transfer().unwrap()
+    }
+    fn fake_failing() -> Arc<dyn daemon_api::SupportsFileTransfer> {
+        FakeProtocol::failing().file_transfer().unwrap()
+    }
 
     fn transfer() -> daemon_api::FileTransfer {
         daemon_api::FileTransfer {
             name: "file.png".into(),
             blob: daemon_common::BlobRef::new(daemon_common::ContentHash::new([0u8; 32]), 0),
+            ..Default::default()
         }
     }
 
+    // ---- Empty (Wave 1) ----
     #[tokio::test]
     async fn ft_empty_implements_and_send_unsupported() {
         let ft = empty();
         assert!(!ft.supported().send);
-        assert_unsupported(ft.send(transfer()).await, sentinels::FILE_TRANSFER_SEND);
+        assert_unsupported(
+            ft.send(t(), transfer()).await,
+            sentinels::FILE_TRANSFER_SEND,
+        );
     }
     #[tokio::test]
     async fn ft_empty_implements_and_receive_unsupported() {
         let ft = empty();
         assert!(!ft.supported().receive);
         assert_unsupported(
-            ft.receive(transfer()).await,
+            ft.receive(t(), transfer()).await,
             sentinels::FILE_TRANSFER_RECEIVE,
         );
+    }
+
+    // ---- Normal / error (← /protocol-file-transfer/normal/*; W2-H) ----
+    #[tokio::test]
+    async fn ft_fake_implements_and_send_ok() {
+        // ⟵ /protocol-file-transfer/normal/send-normal: implements_send + a successful finish.
+        let ft = fake();
+        assert!(ft.supported().send);
+        assert!(ft.send(t(), transfer()).await.is_ok());
+    }
+    #[tokio::test]
+    async fn ft_fake_send_error() {
+        // ⟵ /protocol-file-transfer/normal/send-error: should_error → a non-sentinel Err.
+        assert_error(fake_failing().send(t(), transfer()).await);
+    }
+    #[tokio::test]
+    async fn ft_fake_implements_and_receive_ok() {
+        // ⟵ /protocol-file-transfer/normal/receive-normal.
+        let ft = fake();
+        assert!(ft.supported().receive);
+        assert!(ft.receive(t(), transfer()).await.is_ok());
+    }
+    #[tokio::test]
+    async fn ft_fake_receive_error() {
+        // ⟵ /protocol-file-transfer/normal/receive-error.
+        assert_error(fake_failing().receive(t(), transfer()).await);
     }
 }
 
