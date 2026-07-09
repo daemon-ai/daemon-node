@@ -20,19 +20,40 @@ use std::cmp::Ordering;
 /// `haystack`, caseless, ignoring characters in between (a caseless *subsequence* match — e.g.
 /// `Br` matches `biRb`). Casefolding is Unicode lowercase (approximates `g_utf8_casefold`).
 fn str_matches(pattern: &str, haystack: &str) -> bool {
-    let _ = (pattern, haystack);
-    false
+    let mut pat = pattern.chars().flat_map(char::to_lowercase).peekable();
+    // An empty pattern is a subsequence of anything.
+    if pat.peek().is_none() {
+        return true;
+    }
+    for hc in haystack.chars().flat_map(char::to_lowercase) {
+        if pat.peek() == Some(&hc) {
+            pat.next();
+            if pat.peek().is_none() {
+                return true;
+            }
+        }
+    }
+    pat.peek().is_none()
 }
 
 /// Port of `purple_utf8_strcasecmp` for non-NULL operands: casefold (Unicode lowercase) then
 /// codepoint order. **Divergence:** approximates `g_utf8_collate` — identical for ASCII inputs.
 fn utf8_strcasecmp(a: &str, b: &str) -> Ordering {
-    let _ = (a, b);
-    Ordering::Equal
+    let a_fold: String = a.chars().flat_map(char::to_lowercase).collect();
+    let b_fold: String = b.chars().flat_map(char::to_lowercase).collect();
+    a_fold.cmp(&b_fold)
 }
 
-fn role_rank(_role: MemberRole) -> u8 {
-    0
+/// Sort weight for a role: a higher weight means "more standing", which sorts *first* (the daemon
+/// analog of libpurple's "more/higher badges sorts first" in `purple_badges_compare`).
+fn role_rank(role: MemberRole) -> u8 {
+    match role {
+        MemberRole::None => 0,
+        MemberRole::Voice => 1,
+        MemberRole::HalfOp => 2,
+        MemberRole::Op => 3,
+        MemberRole::Founder => 4,
+    }
 }
 
 // ===========================================================================
@@ -45,35 +66,53 @@ impl ContactInfo {
     /// nor a person field (those live on [`ConversationMember`]; person precedence is Wave-3), so
     /// the chain reduces to `display_name → id`.
     pub fn name_for_display(&self) -> &str {
-        ""
+        if let Some(display_name) = self.display_name.as_deref() {
+            if !display_name.is_empty() {
+                return display_name;
+            }
+        }
+        &self.id
     }
 
     /// Port of `purple_contact_info_matches`. `None`/empty needle matches; otherwise a caseless
     /// subsequence match against `id` then `display_name`.
     pub fn matches(&self, needle: Option<&str>) -> bool {
-        let _ = needle;
+        let needle = match needle {
+            None | Some("") => return true,
+            Some(needle) => needle,
+        };
+        if !self.id.is_empty() && str_matches(needle, &self.id) {
+            return true;
+        }
+        if let Some(display_name) = self.display_name.as_deref() {
+            if !display_name.is_empty() && str_matches(needle, display_name) {
+                return true;
+            }
+        }
         false
     }
 
     /// Non-NULL ordering by name-for-display (person precedence is Wave-3). Suitable for
     /// `slice::sort_by`. See [`contact_info_compare`] for the NULL-safe variant.
     pub fn cmp_for_display(&self, other: &ContactInfo) -> Ordering {
-        let _ = other;
-        Ordering::Equal
+        utf8_strcasecmp(self.name_for_display(), other.name_for_display())
     }
 }
 
 /// Port of `purple_contact_info_compare` including the NULL rules
 /// (`Some,None → Less`, `None,Some → Greater`, `None,None → Equal`).
 pub fn contact_info_compare(a: Option<&ContactInfo>, b: Option<&ContactInfo>) -> Ordering {
-    let _ = (a, b);
-    Ordering::Equal
+    match (a, b) {
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+        (Some(a), Some(b)) => a.cmp_for_display(b),
+    }
 }
 
 /// Port of `purple_contact_info_equal` (`compare == 0`, NULL-safe).
 pub fn contact_info_equal(a: Option<&ContactInfo>, b: Option<&ContactInfo>) -> bool {
-    let _ = (a, b);
-    false
+    contact_info_compare(a, b) == Ordering::Equal
 }
 
 // ===========================================================================
@@ -84,36 +123,66 @@ impl ConversationMember {
     /// Port of `purple_conversation_member_get_name_for_display`: `alias → nickname →
     /// contact.name_for_display`.
     pub fn name_for_display(&self) -> &str {
-        ""
+        if let Some(alias) = self.alias.as_deref() {
+            if !alias.is_empty() {
+                return alias;
+            }
+        }
+        if let Some(nickname) = self.nickname.as_deref() {
+            if !nickname.is_empty() {
+                return nickname;
+            }
+        }
+        self.contact.name_for_display()
     }
 
     /// Port of `purple_conversation_member_matches`: `None`/empty needle matches; otherwise
     /// `alias`, then `nickname`, then the contact-info chain.
     pub fn matches(&self, needle: Option<&str>) -> bool {
-        let _ = needle;
-        false
+        let needle = match needle {
+            None | Some("") => return true,
+            Some(needle) => needle,
+        };
+        if let Some(alias) = self.alias.as_deref() {
+            if !alias.is_empty() && str_matches(needle, alias) {
+                return true;
+            }
+        }
+        if let Some(nickname) = self.nickname.as_deref() {
+            if !nickname.is_empty() && str_matches(needle, nickname) {
+                return true;
+            }
+        }
+        self.contact.matches(Some(needle))
     }
 
     /// Port of `purple_conversation_member_compare` less the NULL handling: role first (a higher
     /// role sorts first — the daemon analog of libpurple's badge ordering), then name-for-display.
     /// Suitable for `slice::sort_by`.
     pub fn cmp_in_conversation(&self, other: &ConversationMember) -> Ordering {
-        let _ = other;
-        Ordering::Equal
+        // A higher role sorts first, so the higher rank must yield `Less`.
+        let by_role = role_rank(other.role).cmp(&role_rank(self.role));
+        if by_role != Ordering::Equal {
+            return by_role;
+        }
+        utf8_strcasecmp(self.name_for_display(), other.name_for_display())
     }
 }
 
 /// Port of `purple_conversation_member_compare` NULL rules + delegation to
 /// [`ConversationMember::cmp_in_conversation`].
 pub fn member_compare(a: Option<&ConversationMember>, b: Option<&ConversationMember>) -> Ordering {
-    let _ = (a, b);
-    Ordering::Equal
+    match (a, b) {
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+        (Some(a), Some(b)) => a.cmp_in_conversation(b),
+    }
 }
 
 /// Port of `purple_conversation_member_equal` (`compare == 0`, NULL-safe).
 pub fn member_equal(a: Option<&ConversationMember>, b: Option<&ConversationMember>) -> bool {
-    let _ = (a, b);
-    false
+    member_compare(a, b) == Ordering::Equal
 }
 
 // ===========================================================================
@@ -126,14 +195,20 @@ pub fn find_member<'a>(
     members: &'a [ConversationMember],
     info: &ContactInfo,
 ) -> Option<&'a ConversationMember> {
-    let _ = (members, info);
-    None
+    position_of_member(members, info).map(|position| &members[position])
 }
 
 /// Port of `purple_conversation_members_has_member`.
 pub fn has_member(members: &[ConversationMember], info: &ContactInfo) -> bool {
-    let _ = (members, info);
-    false
+    position_of_member(members, info).is_some()
+}
+
+/// The index of the first member whose contact compares equal to `info`
+/// (`purple_contact_info_compare == 0`, mirroring `check_member_equal`).
+fn position_of_member(members: &[ConversationMember], info: &ContactInfo) -> Option<usize> {
+    members
+        .iter()
+        .position(|member| contact_info_equal(Some(&member.contact), Some(info)))
 }
 
 /// Port of `purple_conversation_members_find_or_add_member`: returns the existing member (and
@@ -142,29 +217,40 @@ pub fn find_or_add_member<'a>(
     members: &'a mut Vec<ConversationMember>,
     info: &ContactInfo,
 ) -> (&'a mut ConversationMember, bool) {
-    // Stub: unconditionally append (wrong — must dedup) so the RED assertions fail.
-    members.push(new_member(info));
-    let last = members.len() - 1;
-    (&mut members[last], true)
+    match position_of_member(members, info) {
+        Some(position) => (&mut members[position], false),
+        None => {
+            members.push(new_member(info));
+            let position = members.len() - 1;
+            (&mut members[position], true)
+        }
+    }
 }
 
 /// Port of `purple_conversation_members_remove_member`: removes the member whose contact compares
 /// equal to `info`; returns whether a member was removed.
 pub fn remove_member(members: &mut Vec<ConversationMember>, info: &ContactInfo) -> bool {
-    let _ = (members, info);
-    false
+    match position_of_member(members, info) {
+        Some(position) => {
+            members.remove(position);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Port of `purple_conversation_members_remove_all_members`.
 pub fn remove_all_members(members: &mut Vec<ConversationMember>) {
-    let _ = members;
+    members.clear();
 }
 
 /// Port of `purple_conversation_members_get_active_typers`: members whose typing state is
 /// [`TypingState::Typing`], in order.
 pub fn active_typers(members: &[ConversationMember]) -> Vec<&ConversationMember> {
-    let _ = members;
-    Vec::new()
+    members
+        .iter()
+        .filter(|member| member.typing == TypingState::Typing)
+        .collect()
 }
 
 /// Port of `purple_conversation_members_find_first_other`: the first member whose contact does not
@@ -173,8 +259,9 @@ pub fn find_first_other<'a>(
     members: &'a [ConversationMember],
     info: &ContactInfo,
 ) -> Option<&'a ConversationMember> {
-    let _ = (members, info);
-    None
+    members
+        .iter()
+        .find(|member| !contact_info_equal(Some(&member.contact), Some(info)))
 }
 
 /// Port of `purple_conversation_members_extend`: appends every member of `source` onto `existing`
@@ -183,7 +270,7 @@ pub fn extend_members(
     existing: &mut Vec<ConversationMember>,
     source: &mut Vec<ConversationMember>,
 ) {
-    let _ = (existing, source);
+    existing.append(source);
 }
 
 /// A fresh member for `info` with default per-conversation state
@@ -210,16 +297,20 @@ pub fn find_dm<'a>(
     transport: &TransportId,
     contact: &ContactInfo,
 ) -> Option<&'a ConversationInfo> {
-    let _ = (conversations, transport, contact);
-    None
+    conversations.iter().find(|conversation| {
+        conversation.transport == *transport
+            && conversation.kind == ConversationType::Dm
+            && has_member(&conversation.members, contact)
+    })
 }
 
 /// Order-independent member-set equality (scope item 5 — "same set of participants regardless of
 /// order"): true when both collections contain the same set of contacts (by
 /// `purple_contact_info_compare == 0`). Derived helper; no direct libpurple g_test.
 pub fn same_member_set(a: &[ConversationMember], b: &[ConversationMember]) -> bool {
-    let _ = (a, b);
-    false
+    a.len() == b.len()
+        && a.iter().all(|member| has_member(b, &member.contact))
+        && b.iter().all(|member| has_member(a, &member.contact))
 }
 
 // ===========================================================================
@@ -268,24 +359,24 @@ mod tests {
     // -- ContactInfo::compare ----------------------------------------------
 
     #[test]
-    fn contact_info_compare_not_null__null() {
+    fn contact_info_compare_not_null_null() {
         let c = info("");
         assert_eq!(contact_info_compare(Some(&c), None), Ordering::Less);
     }
 
     #[test]
-    fn contact_info_compare_null__not_null() {
+    fn contact_info_compare_null_not_null() {
         let c = info("");
         assert_eq!(contact_info_compare(None, Some(&c)), Ordering::Greater);
     }
 
     #[test]
-    fn contact_info_compare_null__null() {
+    fn contact_info_compare_null_null() {
         assert_eq!(contact_info_compare(None, None), Ordering::Equal);
     }
 
     #[test]
-    fn contact_info_compare_name__name() {
+    fn contact_info_compare_name_name() {
         let a = info("aaa");
         let mut b = info("zzz");
         assert_eq!(contact_info_compare(Some(&a), Some(&b)), Ordering::Less);
@@ -297,7 +388,7 @@ mod tests {
     // -- ContactInfo::equal ------------------------------------------------
 
     #[test]
-    fn contact_info_equal_not_null__not_null() {
+    fn contact_info_equal_not_null_not_null() {
         let mut a = info("");
         let mut b = info("");
         assert!(contact_info_equal(Some(&a), Some(&b)));
@@ -308,19 +399,19 @@ mod tests {
     }
 
     #[test]
-    fn contact_info_equal_not_null__null() {
+    fn contact_info_equal_not_null_null() {
         let a = info("");
         assert!(!contact_info_equal(Some(&a), None));
     }
 
     #[test]
-    fn contact_info_equal_null__not_null() {
+    fn contact_info_equal_null_not_null() {
         let a = info("");
         assert!(!contact_info_equal(None, Some(&a)));
     }
 
     #[test]
-    fn contact_info_equal_null__null() {
+    fn contact_info_equal_null_null() {
         assert!(contact_info_equal(None, None));
     }
 
@@ -410,19 +501,19 @@ mod tests {
     // -- ConversationMember::compare ---------------------------------------
 
     #[test]
-    fn member_compare_not_null__null() {
+    fn member_compare_not_null_null() {
         let m = member(info(""));
         assert_eq!(member_compare(Some(&m), None), Ordering::Less);
     }
 
     #[test]
-    fn member_compare_null__not_null() {
+    fn member_compare_null_not_null() {
         let m = member(info(""));
         assert_eq!(member_compare(None, Some(&m)), Ordering::Greater);
     }
 
     #[test]
-    fn member_compare_null__null() {
+    fn member_compare_null_null() {
         assert_eq!(member_compare(None, None), Ordering::Equal);
     }
 
@@ -433,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn member_compare_nickname__nickname() {
+    fn member_compare_nickname_nickname() {
         let mut m1 = member(info(""));
         m1.nickname = Some("aaa".into());
         let mut m2 = member(info(""));
@@ -445,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn member_compare_role__nickname() {
+    fn member_compare_role_nickname() {
         // ← badges__nickname, badges mapped to role. A higher role sorts first; once roles are
         // equal, the nickname breaks the tie.
         let mut m1 = member(info(""));

@@ -45,16 +45,16 @@ scope but no direct libpurple g_test.
 | `/contact-info/get_name_for_display/contact_with_alias` | — | SKIP: no `alias` field on daemon `ContactInfo` (alias lives on `ConversationMember`, covered there) |
 | `/contact-info/get_name_for_display/contact_with_display_name` | `contact_info_name_for_display_display_name` | PORT |
 | `/contact-info/get_name_for_display/id_fallback` | `contact_info_name_for_display_id_fallback` | PORT |
-| `/contact-info/compare/not_null__null` | `contact_info_compare_not_null__null` | PORT |
-| `/contact-info/compare/null__not_null` | `contact_info_compare_null__not_null` | PORT |
-| `/contact-info/compare/null__null` | `contact_info_compare_null__null` | PORT |
+| `/contact-info/compare/not_null__null` | `contact_info_compare_not_null_null` | PORT |
+| `/contact-info/compare/null__not_null` | `contact_info_compare_null_not_null` | PORT |
+| `/contact-info/compare/null__null` | `contact_info_compare_null_null` | PORT |
 | `/contact-info/compare/person__no_person` | — | SKIP: no `person` (Wave-3) |
 | `/contact-info/compare/no_person__person` | — | SKIP: no `person` (Wave-3) |
-| `/contact-info/compare/name__name` | `contact_info_compare_name__name` | PORT |
-| `/contact-info/equal/not_null__not_null` | `contact_info_equal_not_null__not_null` | PORT |
-| `/contact-info/equal/not_null__null` | `contact_info_equal_not_null__null` | PORT |
-| `/contact-info/equal/null__not_null` | `contact_info_equal_null__not_null` | PORT |
-| `/contact-info/equal/null__null` | `contact_info_equal_null__null` | PORT |
+| `/contact-info/compare/name__name` | `contact_info_compare_name_name` | PORT |
+| `/contact-info/equal/not_null__not_null` | `contact_info_equal_not_null_not_null` | PORT |
+| `/contact-info/equal/not_null__null` | `contact_info_equal_not_null_null` | PORT |
+| `/contact-info/equal/null__not_null` | `contact_info_equal_null_not_null` | PORT |
+| `/contact-info/equal/null__null` | `contact_info_equal_null_null` | PORT |
 | `/contact-info/matches/accepts_null` | `contact_info_matches_accepts_null` | PORT |
 | `/contact-info/matches/emptry_string` | `contact_info_matches_empty_string` | PORT |
 | `/contact-info/matches/alias` | — | SKIP: no `alias` field (covered at member level) |
@@ -74,12 +74,12 @@ Out of scope (other W1 packages): `/new`, `/properties`, `/get-avatar-for-displa
 | `/conversation-member/matches/alias` | `member_matches_alias` | PORT |
 | `/conversation-member/matches/nickname` | `member_matches_nickname` | PORT (C sets `alias`; faithful — C test name is a misnomer) |
 | `/conversation-member/matches/contact_info` | `member_matches_contact_info` | PORT (contact alias→`display_name`) |
-| `/conversation-member/compare/not_null__null` | `member_compare_not_null__null` | PORT |
-| `/conversation-member/compare/null__not_null` | `member_compare_null__not_null` | PORT |
-| `/conversation-member/compare/null__null` | `member_compare_null__null` | PORT |
+| `/conversation-member/compare/not_null__null` | `member_compare_not_null_null` | PORT |
+| `/conversation-member/compare/null__not_null` | `member_compare_null_not_null` | PORT |
+| `/conversation-member/compare/null__null` | `member_compare_null_null` | PORT |
 | `/conversation-member/compare/same` | `member_compare_same` | PORT |
-| `/conversation-member/compare/nickname__nickname` | `member_compare_nickname__nickname` | PORT |
-| `/conversation-member/compare/badges__nickname` | `member_compare_role__nickname` | PORT (badges→role) |
+| `/conversation-member/compare/nickname__nickname` | `member_compare_nickname_nickname` | PORT |
+| `/conversation-member/compare/badges__nickname` | `member_compare_role_nickname` | PORT (badges→role) |
 
 Out of scope: `/new`, `/properties`, `/typing-state/timeout`, `/badges-changed-signal`, `/is-account`.
 
