@@ -58,6 +58,46 @@ impl `agent/message_sanitization.py:185` (`_repair_tool_call_arguments`).
 | `test_literal_control_char_reserialised_to_wire_form` | already-covered | (same behavior as newline/tab gaps) | not duplicated |
 | `test_control_chars_with_trailing_comma` | ported-fail (gap) | `parity_gap_control_chars_with_trailing_comma` | control-char escape fallback after comma-strip missing |
 
+### 2. Tool-name repair — `src/repair/tool_name.rs`
+
+Source: `tests/run_agent/test_repair_tool_call_name.py`;
+impl `AIAgent._repair_tool_call`. The Rust port handles case/separator/quote-strip/
+namespace/fuzzy; it lacks CamelCase→snake_case, `_tool`/`Tool` suffix stripping, and
+VolcEngine XML-attribute trimming. hermes returns `None` for an unresolved name; the
+Rust port returns `Err` (treated as the parity equivalent).
+
+| Source test | Status | Rust test | Reason |
+|---|---|---|---|
+| `test_lowercase_already_matches` | already-covered | (existing `exact_match_passes_through`) | exact match |
+| `test_uppercase_simple` | ported-pass | `uppercase_simple` | case-fold handled |
+| `test_dash_to_underscore` | already-covered | (existing `normalizes_case_prefix_and_separators`) | separator normalize |
+| `test_space_to_underscore` | already-covered | (existing `normalizes_case_prefix_and_separators`) | separator normalize |
+| `test_fuzzy_near_miss` | ported-pass | `fuzzy_near_miss` | fuzzy handled |
+| `test_unknown_returns_none` | ported-pass | `unknown_returns_none` | rejects far name |
+| `test_camel_case_no_suffix` | already-covered | (fuzzy already recovers `BrowserClick`) | not duplicated (passes via fuzzy) |
+| `test_camel_case_with_underscore_tool_suffix` | ported-fail (gap) | `parity_gap_camel_case_with_underscore_tool_suffix` | `_tool` suffix not stripped |
+| `test_camel_case_with_Tool_class_suffix` | ported-fail (gap) | `parity_gap_camel_case_with_tool_class_suffix` | `PatchTool` class suffix not stripped |
+| `test_double_tacked_class_and_snake_suffix` | ported-fail (gap) | `parity_gap_double_tacked_class_and_snake_suffix` | `TodoTool_tool` double suffix |
+| `test_simple_name_with_tool_suffix` | ported-fail (gap) | `parity_gap_simple_name_with_tool_suffix` | `Patch_tool` |
+| `test_simple_name_with_dash_tool_suffix` | ported-fail (gap) | `parity_gap_simple_name_with_dash_tool_suffix` | `patch-tool` |
+| `test_camel_case_preserves_multi_word_match` | ported-fail (gap) | `parity_gap_camel_case_preserves_multi_word_match` | `WriteFileTool` → `write_file` |
+| `test_mixed_separators_and_suffix` | ported-fail (gap) | `parity_gap_mixed_separators_and_suffix` | `write-file_Tool` |
+| `test_empty_string` | ported-pass | `empty_string_returns_none` | empty → None |
+| `test_only_tool_suffix` | ported-pass | `only_tool_suffix_returns_none` | `_tool` → None |
+| `test_none_passed_as_name` | unportable-no-API | — | `&str` param; `None` not representable |
+| `test_very_long_name_does_not_match_by_accident` | ported-pass | `very_long_name_returns_none` | no accidental fuzzy match |
+| `test_terminal_with_xml_attribute_pollution` | ported-fail (gap) | `parity_gap_terminal_with_xml_attribute_pollution` | XML attr pollution not trimmed |
+| `test_execute_code_with_xml_attribute_pollution` | ported-fail (gap) | `parity_gap_execute_code_with_xml_attribute_pollution` | same |
+| `test_session_search_with_xml_attribute_pollution` | already-covered | (same root cause as terminal/execute_code gaps) | not duplicated |
+| `test_camel_case_tool_with_xml_pollution` | ported-fail (gap) | `parity_gap_camel_case_tool_with_xml_pollution` | XML + CamelCase suffix |
+| `test_tool_name_with_trailing_quote_only` | ported-pass | `trailing_quote_only_is_trimmed` | surrounding-quote strip handles it |
+| `test_tool_name_with_angle_bracket_pollution` | ported-fail (gap) | `parity_gap_tool_name_with_angle_bracket_pollution` | `<` pollution not trimmed |
+| `test_tool_name_with_single_quote_pollution` | ported-fail (gap) | `parity_gap_tool_name_with_single_quote_pollution` | inner single-quote attr not trimmed |
+| `test_clean_tool_name_unaffected_by_sanitizer` | already-covered | (existing `exact_match_passes_through`) | passthrough |
+| `test_space_separated_name_still_normalizes` | already-covered | (existing separator test) | space normalize |
+| `test_pollution_with_unknown_tool_root_still_fails` | ported-pass | `polluted_unknown_root_returns_none` | garbage → None |
+| `test_leading_quote_falls_through_to_fuzzy_match` | ported-pass | `leading_and_trailing_quotes_resolve` | `"terminal"` → terminal |
+
 ---
 
 ## `parity_gap_` summary (the red list)
@@ -77,6 +117,22 @@ impl `agent/message_sanitization.py:185` (`_repair_tool_call_arguments`).
 - `parity_gap_literal_tab_inside_string_value` — literal tab in string.
 - `parity_gap_control_chars_with_trailing_comma` — control-char escape fallback.
 
+**Tool-name repair (`tool_name.rs`)** — CamelCase→snake_case + class-like suffix stripping
+- `parity_gap_camel_case_with_underscore_tool_suffix`
+- `parity_gap_camel_case_with_tool_class_suffix`
+- `parity_gap_double_tacked_class_and_snake_suffix`
+- `parity_gap_simple_name_with_tool_suffix`
+- `parity_gap_simple_name_with_dash_tool_suffix`
+- `parity_gap_camel_case_preserves_multi_word_match`
+- `parity_gap_mixed_separators_and_suffix`
+
+**Tool-name repair (`tool_name.rs`)** — VolcEngine XML-attribute pollution trimming
+- `parity_gap_terminal_with_xml_attribute_pollution`
+- `parity_gap_execute_code_with_xml_attribute_pollution`
+- `parity_gap_camel_case_tool_with_xml_pollution`
+- `parity_gap_tool_name_with_angle_bracket_pollution`
+- `parity_gap_tool_name_with_single_quote_pollution`
+
 ### Suspected broken logic
 
 - `parity_gap_unrepairable_partial_returns_empty_object` — Rust over-repairs a
@@ -86,7 +142,6 @@ impl `agent/message_sanitization.py:185` (`_repair_tool_call_arguments`).
 
 ## Scope not yet reached
 
-- P0.2 Tool-name repair (`tool_name.rs`)
 - P0.3 Tool-error sanitization (`tool_error.rs`)
 - P0.4 Message-sequence repair (`message_sequence.rs`)
 - P0.5 Engine end-to-end (dedup, guardrail escalation, 413/compaction loop, streaming)

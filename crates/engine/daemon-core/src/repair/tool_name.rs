@@ -129,3 +129,191 @@ mod tests {
         assert!(err.to_string().contains("valid tools"));
     }
 }
+
+/// Parity tests ported from hermes' `AIAgent._repair_tool_call`
+/// (`tests/run_agent/test_repair_tool_call_name.py`). The Python routine, on top of
+/// the case/separator/fuzzy handling the Rust port already has, also
+/// (a) splits CamelCase to snake_case, (b) strips `_tool`/`-tool`/`Tool` class-like
+/// suffixes (up to twice), and (c) trims VolcEngine XML-attribute pollution at the
+/// first `"`/`'`/`<`/`>`. Those three are the gaps.
+///
+/// `parity_gap_*` tests assert the desired Python behavior and are expected to FAIL.
+/// Plain-named tests port behavior the Rust port already handles and MUST PASS.
+/// hermes returns `None` for an unresolved name; the Rust port returns `Err`, so we
+/// treat `Err` as the parity equivalent of `None`.
+#[cfg(test)]
+mod parity {
+    use super::*;
+
+    fn valid() -> Vec<String> {
+        [
+            "todo",
+            "patch",
+            "browser_click",
+            "browser_navigate",
+            "web_search",
+            "read_file",
+            "write_file",
+            "terminal",
+            "execute_code",
+            "session_search",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn repair(name: &str) -> Option<String> {
+        repair_tool_name(name, &valid()).ok()
+    }
+
+    // ── Existing behavior that already works (must PASS) ───────────────────
+
+    // parity: test_repair_tool_call_name.py::TestExistingBehaviorStillWorks::test_uppercase_simple (tests/run_agent/test_repair_tool_call_name.py:53)
+    #[test]
+    fn uppercase_simple() {
+        assert_eq!(repair("TERMINAL").as_deref(), Some("terminal"));
+    }
+
+    // parity: test_repair_tool_call_name.py::TestExistingBehaviorStillWorks::test_fuzzy_near_miss (tests/run_agent/test_repair_tool_call_name.py:62)
+    #[test]
+    fn fuzzy_near_miss() {
+        assert_eq!(repair("terminall").as_deref(), Some("terminal"));
+    }
+
+    // parity: test_repair_tool_call_name.py::TestExistingBehaviorStillWorks::test_unknown_returns_none (tests/run_agent/test_repair_tool_call_name.py:66)
+    #[test]
+    fn unknown_returns_none() {
+        assert_eq!(repair("xyz_no_such_tool"), None);
+    }
+
+    // parity: test_repair_tool_call_name.py::TestEdgeCases::test_empty_string (tests/run_agent/test_repair_tool_call_name.py:104)
+    #[test]
+    fn empty_string_returns_none() {
+        assert_eq!(repair(""), None);
+    }
+
+    // parity: test_repair_tool_call_name.py::TestEdgeCases::test_only_tool_suffix (tests/run_agent/test_repair_tool_call_name.py:107)
+    #[test]
+    fn only_tool_suffix_returns_none() {
+        assert_eq!(repair("_tool"), None);
+    }
+
+    // parity: test_repair_tool_call_name.py::TestEdgeCases::test_very_long_name_does_not_match_by_accident (tests/run_agent/test_repair_tool_call_name.py:117)
+    #[test]
+    fn very_long_name_returns_none() {
+        assert_eq!(repair("ThisIsNotRemotelyARealToolName_tool"), None);
+    }
+
+    // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_tool_name_with_trailing_quote_only (tests/run_agent/test_repair_tool_call_name.py:155)
+    #[test]
+    fn trailing_quote_only_is_trimmed() {
+        assert_eq!(repair("terminal\"").as_deref(), Some("terminal"));
+    }
+
+    // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_leading_quote_falls_through_to_fuzzy_match (tests/run_agent/test_repair_tool_call_name.py:183)
+    #[test]
+    fn leading_and_trailing_quotes_resolve() {
+        assert_eq!(repair("\"terminal\"").as_deref(), Some("terminal"));
+    }
+
+    // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_pollution_with_unknown_tool_root_still_fails (tests/run_agent/test_repair_tool_call_name.py:177)
+    #[test]
+    fn polluted_unknown_root_returns_none() {
+        assert_eq!(repair("no_such_tool\" parameter=\"x\" string=\"true"), None);
+    }
+
+    // ── CamelCase → snake_case + class-like suffix stripping (gaps) ────────
+
+    // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_camel_case_with_underscore_tool_suffix (tests/run_agent/test_repair_tool_call_name.py:76)
+    #[test]
+    fn parity_gap_camel_case_with_underscore_tool_suffix() {
+        assert_eq!(
+            repair("BrowserClick_tool").as_deref(),
+            Some("browser_click")
+        );
+    }
+
+    // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_camel_case_with_Tool_class_suffix (tests/run_agent/test_repair_tool_call_name.py:79)
+    #[test]
+    fn parity_gap_camel_case_with_tool_class_suffix() {
+        assert_eq!(repair("PatchTool").as_deref(), Some("patch"));
+    }
+
+    // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_double_tacked_class_and_snake_suffix (tests/run_agent/test_repair_tool_call_name.py:82)
+    #[test]
+    fn parity_gap_double_tacked_class_and_snake_suffix() {
+        assert_eq!(repair("TodoTool_tool").as_deref(), Some("todo"));
+    }
+
+    // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_simple_name_with_tool_suffix (tests/run_agent/test_repair_tool_call_name.py:87)
+    #[test]
+    fn parity_gap_simple_name_with_tool_suffix() {
+        assert_eq!(repair("Patch_tool").as_deref(), Some("patch"));
+    }
+
+    // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_simple_name_with_dash_tool_suffix (tests/run_agent/test_repair_tool_call_name.py:90)
+    #[test]
+    fn parity_gap_simple_name_with_dash_tool_suffix() {
+        assert_eq!(repair("patch-tool").as_deref(), Some("patch"));
+    }
+
+    // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_camel_case_preserves_multi_word_match (tests/run_agent/test_repair_tool_call_name.py:93)
+    #[test]
+    fn parity_gap_camel_case_preserves_multi_word_match() {
+        assert_eq!(repair("WriteFileTool").as_deref(), Some("write_file"));
+    }
+
+    // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_mixed_separators_and_suffix (tests/run_agent/test_repair_tool_call_name.py:97)
+    #[test]
+    fn parity_gap_mixed_separators_and_suffix() {
+        assert_eq!(repair("write-file_Tool").as_deref(), Some("write_file"));
+    }
+
+    // ── VolcEngine XML-attribute pollution trimming (gaps) ────────────────
+
+    // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_terminal_with_xml_attribute_pollution (tests/run_agent/test_repair_tool_call_name.py:136)
+    #[test]
+    fn parity_gap_terminal_with_xml_attribute_pollution() {
+        assert_eq!(
+            repair("terminal\" parameter=\"command\" string=\"true").as_deref(),
+            Some("terminal")
+        );
+    }
+
+    // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_execute_code_with_xml_attribute_pollution (tests/run_agent/test_repair_tool_call_name.py:141)
+    #[test]
+    fn parity_gap_execute_code_with_xml_attribute_pollution() {
+        assert_eq!(
+            repair("execute_code\" parameter=\"code\" string=\"true").as_deref(),
+            Some("execute_code")
+        );
+    }
+
+    // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_camel_case_tool_with_xml_pollution (tests/run_agent/test_repair_tool_call_name.py:149)
+    #[test]
+    fn parity_gap_camel_case_tool_with_xml_pollution() {
+        assert_eq!(
+            repair("BrowserClick_tool\" parameter=\"selector\" string=\"true").as_deref(),
+            Some("browser_click")
+        );
+    }
+
+    // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_tool_name_with_angle_bracket_pollution (tests/run_agent/test_repair_tool_call_name.py:159)
+    #[test]
+    fn parity_gap_tool_name_with_angle_bracket_pollution() {
+        assert_eq!(
+            repair("terminal<parameter=command").as_deref(),
+            Some("terminal")
+        );
+    }
+
+    // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_tool_name_with_single_quote_pollution (tests/run_agent/test_repair_tool_call_name.py:163)
+    #[test]
+    fn parity_gap_tool_name_with_single_quote_pollution() {
+        assert_eq!(
+            repair("terminal' parameter='command' string='true").as_deref(),
+            Some("terminal")
+        );
+    }
+}
