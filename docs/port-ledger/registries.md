@@ -95,25 +95,37 @@ revoke; this package only adds the **missing** clean-handling-of-non-existent / 
 | `/credential-manager/set-active/non-existent` (operate on unknown provider → error/clean) | `revoke_profile_on_unacquired_profile_is_noop` (broker op on a never-acquired profile is a clean no-op; a later acquire+use for it still works) | credentials.rs | green-parity (new; daemon has no active-provider — divergence: unknown profile is a clean no-op / fallback, not an error) |
 | `/credential-manager/no-provider/{read,write,clear}-password-async` (op with no active provider fails cleanly) | `mem_store_ops_on_unset_profile_are_clean`, `file_store_ops_on_unset_profile_are_clean` (get → None, remove → Ok no-op, keys → empty) + `pooled_source_rotate_revoke_unknown_cap_are_noops` | credstore.rs | green-parity (new) |
 | `/credential-manager/set-active/{null,normal}`; provider `{read,write,clear}` | `source_provisions_stored_then_fallback`, `store_source_is_mode_aware`, `pooled_source_*`, `multi_profile_broker_*`, `revoke_profile_invalidates_outstanding_lease` | credstore.rs / credentials.rs | **existing** — do not rewrite |
-| `test_credential_provider_normal.c` read/write/clear reach the impl | `source_provisions_stored_then_fallback` (read), `mem_store_set_get_remove_redacts` (write/clear via store) + new `store_source_revoke_and_store_remove_clear_secret` (clear-password analogue) | credstore.rs | existing + new |
+| `test_credential_provider_normal.c` read/write/clear reach the impl | `source_provisions_stored_then_fallback` (read), `mem_store_set_get_remove_redacts` (write/clear via store) + new `store_source_revoke_and_store_remove_clear_secret` (clear-password analogue) | credstore.rs | existing + new (green-parity) |
+| `test_credential_provider_normal.c` get-locked / unlock | — | — | skipped: the daemon credential surface has no lock/unlock concept — the v1 store is plaintext-at-rest with 0600 perms, always "unlocked" (an OS-keychain backend that could lock is an explicitly deferred refinement, see credstore.rs module docs). |
 | `test_credential_provider_empty.c` (default methods return NOT_IMPLEMENTED) | — | — | skipped: the daemon `CredentialSource` trait has no defaulted async methods that error; `Native`-mode refusal on a store-backed source (`store_source_is_mode_aware`, existing) is the closest "unsupported operation" analogue. The default-impl-returns-default pattern is instead exercised on `MessagingProtocol` (`messaging_feature_probes_default_to_none`, Cluster 1). |
 
 ---
 
-## Summary
+## Summary (final — suite reconciled)
 
 - **libpurple cases in scope:** 32 across 6 files (protocol-manager 2, scheduled-task 7,
   command-manager 7, credential-manager 11, credential-provider-normal 5 — the
   credential-provider-empty 5 fold into the same "default-impl" row).
-- **Ported (green-parity or covered by existing):** see per-row status.
+- **Final tally:** 24 of the 32 cases are covered by a green Rust test (new or pre-existing,
+  per row); 8 are skipped-with-reason (GObject `/properties` plumbing; command
+  remove/remove-all/find-all/per-conversation ×4; credential get-locked+unlock ×2;
+  credential-provider-empty defaults ×1 folded row). Every row is green or
+  skipped-with-reason; **no row is red**.
+- **New tests added by this package: 29** — adapters 7, cron 12 (5 `CronOps` + 5 schedule
+  arithmetic + 2 scheduler tick), commands 5, credentials 5. All 29 passed on first run
+  against the current implementation (green-parity: this package ports test coverage over
+  already-correct behavior; no implementation bug was exposed, so no red→green fix cycle
+  occurred in any cluster).
 - **Daemon-native rows (no libpurple analogue):** AdapterRegistry ordering/instances/lookup/
   dup, cron catch-up/fast-forward/unknown-job, command enumeration/dispatch/alias-collision,
   credential no-op edges.
 - **Skipped (with reason):** GObject property introspection; command remove/remove-all/
   find-all/per-conversation filtering (build-once first-wins registry — divergence);
+  credential get-locked/unlock (no lock concept on the v1 store);
   credential-provider-empty NOT_IMPLEMENTED defaults (no daemon analogue on the credential
   trait; covered on the messaging trait instead).
 - **Divergences noted:** duplicate adapter family retained (Vec, not rejected); past one-shot
   yields no fire instead of erroring; command registry is first-wins build-once (no removal,
   no priority stacking, no per-conversation filter); credentials have no active-provider
-  concept (unknown profile is a clean no-op/fallback, not an error).
+  concept (mutating a never-acquired profile is a clean no-op, unknown profile falls back —
+  not an error).

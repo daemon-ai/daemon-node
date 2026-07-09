@@ -631,4 +631,44 @@ mod tests {
             .expect("unset profile still acquires via fallback");
         assert_eq!(lease.secret.as_ref().unwrap().expose(), "sk-fallback");
     }
+
+    /// `test_credential_manager.c` `/credential-manager/set-active/non-existent` analogue —
+    /// **divergence**: libpurple errors when told to operate on an unregistered provider; the
+    /// daemon broker treats a mutation against a never-acquired profile as a clean no-op (it does
+    /// NOT lazily create the authority just to revoke it), and the profile stays fully usable
+    /// afterwards.
+    #[tokio::test]
+    async fn revoke_profile_on_unacquired_profile_is_noop() {
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("alpha", "key-alpha").unwrap();
+        let signer = Arc::new(CapabilitySigner::generate());
+        let broker = MultiProfileStoreBroker::new(
+            store,
+            signer,
+            "sk-fallback",
+            ["chat"],
+            Some(1_000),
+            CredMode::Bearer,
+            60_000,
+        );
+
+        // Revoke before any acquire: nothing exists for the profile, so nothing happens.
+        broker.revoke_profile(&ProfileRef::new("alpha"));
+        assert!(
+            broker.take_audit().is_empty(),
+            "a no-op revoke must not create an authority (no audit recorded)"
+        );
+
+        // The profile is untouched: a first acquire + use works normally afterwards.
+        let scope = CredScope::new(["alpha"], ["chat"], Some(1_000));
+        let lease = broker
+            .acquire(None, &ProfileRef::new("alpha"), &scope)
+            .await
+            .expect("acquire after the no-op revoke");
+        assert_eq!(lease.secret.as_ref().unwrap().expose(), "key-alpha");
+        broker
+            .use_capability(None, &lease)
+            .await
+            .expect("the lease resolves — the profile was never actually revoked");
+    }
 }
