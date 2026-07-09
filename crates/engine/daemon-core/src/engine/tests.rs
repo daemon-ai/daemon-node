@@ -1466,6 +1466,99 @@ async fn no_progress_guard_disabled_runs_to_iteration_budget() {
     assert_eq!(runs.load(Ordering::Relaxed), 4);
 }
 
+/// A tool that always fails (`ToolResult.ok == false`), counting its runs — drives the §12 tool-call
+/// guardrail's failure escalation end-to-end.
+struct FailingTool {
+    runs: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for FailingTool {
+    fn name(&self) -> &str {
+        "boom"
+    }
+    fn schema(&self) -> &str {
+        "{}"
+    }
+    async fn run(
+        &self,
+        call: &crate::conversation::ToolCall,
+        _cx: &crate::turn::TurnCx<'_>,
+    ) -> crate::tools::ToolOutcome {
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        crate::tools::ToolOutcome::text(call.call_id.clone(), false, "boom failed".to_string())
+    }
+}
+
+// parity: test_tool_call_guardrail_runtime.py::test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error (tests/run_agent/test_tool_call_guardrail_runtime.py:271)
+//
+// Ports the §12 guardrail escalation (hermes agent/tool_guardrails.py) end-to-end: with hard-stop
+// enabled, a tool that keeps failing with identical arguments is blocked once it crosses
+// `exact_failure_block_after`, ending the turn as a controlled `NoProgress` stop — not a top-level
+// error. The round-level no-progress guard is disabled so only the per-call guardrail can stop it.
+/// Guardrail hard-stop halts a repeated identical failure through a full `run_turn`.
+#[tokio::test]
+async fn guardrail_hard_stop_halts_repeated_failure_through_run_turn() {
+    let runs = Arc::new(AtomicU64::new(0));
+    let provider = looping_call_provider("boom");
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FailingTool { runs: runs.clone() }));
+    let mut engine =
+        test_engine("guard-halt", provider, registry).with_config(crate::config::Config {
+            max_iterations: 20,
+            max_repeated_rounds: 0,
+            guardrail: crate::config::GuardrailConfig {
+                hard_stop_enabled: true,
+                ..crate::config::GuardrailConfig::default()
+            },
+            ..crate::config::Config::default()
+        });
+    engine.push_user(UserMsg::new("keep failing"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::NoProgress),
+        _ => panic!("expected a controlled guardrail halt, not a top-level error"),
+    }
+    // Blocked at `exact_failure_block_after` (5): the tool ran 5 times; the 6th call was blocked.
+    assert_eq!(runs.load(Ordering::Relaxed), 5);
+}
+
+// parity: test_tool_call_guardrail_runtime.py::test_default_run_conversation_warns_without_guardrail_halt (tests/run_agent/test_tool_call_guardrail_runtime.py:241)
+//
+// The default (warnings on, hard-stop off) never blocks: the repeatedly-failing tool keeps running
+// to the iteration budget (warn guidance is appended to results, but execution is not stopped),
+// proving warn != halt. The round no-progress guard is disabled to isolate the guardrail axis.
+/// Warn-only guardrail (the default) does not halt execution through a full `run_turn`.
+#[tokio::test]
+async fn guardrail_warn_only_does_not_halt_through_run_turn() {
+    let runs = Arc::new(AtomicU64::new(0));
+    let provider = looping_call_provider("boom");
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FailingTool { runs: runs.clone() }));
+    let mut engine =
+        test_engine("guard-warn", provider, registry).with_config(crate::config::Config {
+            max_iterations: 4,
+            max_repeated_rounds: 0,
+            ..crate::config::Config::default()
+        });
+    engine.push_user(UserMsg::new("keep failing"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::BudgetExhausted),
+        _ => panic!("warn-only must not halt; expected budget exhaustion"),
+    }
+    // No hard stop: the tool ran on every one of the 4 budgeted rounds.
+    assert_eq!(runs.load(Ordering::Relaxed), 4);
+}
+
 /// Cancellation observed mid-loop (after a tool runs) finalizes the turn as `Interrupted` rather
 /// than looping back to the model.
 #[tokio::test]
