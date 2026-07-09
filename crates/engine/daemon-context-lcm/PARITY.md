@@ -161,6 +161,60 @@ Red/green pairs:
 | `condensation_suppressed_reason` in `lcm_status` (3 tests) | `efe45ee` | `7bc5b31` |
 | `/lcm doctor retention` + `clean [lifecycle] [apply]` (9 tests) | `d14302b` | `61293ae` |
 
+## Wave 2 (P1) — result
+
+TDD parity port of the P1 audit themes. Every P1 behavior with a real surface in the crate was
+already correctly implemented, so the 9 themes landed as **ported-pass** tests (21 new tests,
+225 → 246). No red tests were left behind; no gaps needed closing. clippy/fmt clean, tree clean.
+
+Note on the wave-1 backlog above: the P1 themes are orthogonal to that reconcile-focused backlog,
+so none of the backlog rows were addressed this pass — they remain open as recorded.
+
+Counts: **ported-pass 21 · gap-closed 0 · gap-open 0 · already-covered 6 rows · out-of-scope 5 rows.**
+
+| Python source | Rust test | Status | Notes |
+|---|---|---|---|
+| `test_lcm_core.py::test_search_relevance_prefers_user_over_newer_assistant_on_similar_match` | `search.rs::relevance_prefers_user_over_newer_assistant_on_similar_match` | ported-pass | role bias beats recency under relevance |
+| `test_lcm_core.py::test_search_relevance_does_not_let_weaker_user_hit_beat_stronger_assistant_hit` | `search.rs::relevance_does_not_let_weaker_user_hit_beat_stronger_assistant_hit` | ported-pass | bm25 rank beats role bias |
+| `test_lcm_core.py::test_search_relevance_still_surfaces_preferred_user_hit_from_large_same_rank_pool` | `search.rs::relevance_surfaces_preferred_user_hit_from_large_same_rank_pool` | ported-pass | 150-row same-rank pool, user surfaces |
+| `test_lcm_core.py::test_search_relevance_top_results_do_not_change_when_limit_increases_on_large_single_term_pool` | `search.rs::relevance_top_results_stable_when_limit_increases_on_large_pool` | ported-pass | limit-stable top-5 over 251 rows |
+| `test_lcm_core.py::test_search_recency_same_timestamp_pool_is_limit_stable` | `search.rs::recency_same_timestamp_pool_is_limit_stable` | ported-pass | 121-row same-timestamp pool, limit-stable |
+| `test_lcm_core.py::test_search_relevance_caps_fts_batches_for_large_single_term_pool` | `search.rs::fetch_limits_widen_for_precise_shapes` | already-covered | the FTS batch cap is the `compute_search_candidate_cap` unit; Python asserts it via a SQL trace-callback seam the Rust store does not expose |
+| `test_ingest_protection.py::test_sensitive_patterns_redact_bypassed_active_replay_without_storage` | `protection.rs::replay_redacts_sensitive_even_when_quarantine_skipped` | ported-pass | `ReplayQuarantine::Skip` still redacts (protection not bypassed) |
+| `test_ingest_protection.py::test_quarantined_assistant_tool_call_content_is_removed_from_noop_active_replay` | `protection.rs::replay_quarantines_runaway_assistant_volatile_without_touching_disk` | ported-pass | volatile placeholder, no disk, tool-call structure preserved |
+| `test_ingest_protection.py::test_quarantined_assistant_output_does_not_enter_summaries_or_active_context` | `protection.rs::replay_quarantines_runaway_assistant_spill_is_recoverable` | ported-pass | spill variant stays recoverable |
+| `test_lcm_rotate.py::test_rotate_preview_reports_noop_when_total_messages_within_tail` | `provider.rs::rotate_preview_noop_when_total_within_tail` | ported-pass | empty pre-tail → noop, no mutation |
+| `test_lcm_rotate.py::test_rotate_handles_session_with_exactly_fresh_tail_count_messages` | `provider.rs::rotate_noop_when_exactly_fresh_tail_count_messages` | ported-pass | boundary at fresh_tail_count |
+| `test_lcm_rotate.py::test_rotate_apply_rolling_backup_overwrites_prior_slot_on_actual_rotate` | `provider.rs::rotate_apply_reuses_rolling_slot_on_repeated_rotate` | ported-pass | repeated rotate reuses the single rolling slot |
+| `test_lcm_core.py::test_assembly_skips_oversized_assistant_turn_to_preserve_user_prompt` | `compaction.rs::capped_assembly_preserves_objective_and_drops_oversized_assistant` | ported-pass | objective folded into summary; oversized assistant dropped; latest status kept |
+| `test_lcm_core.py::test_assembly_skips_oversized_summary_and_keeps_later_fit_summary` (+ `test_max_assembly_tokens_*`) | `compaction.rs::capped_assembly_trims_summary_sections_to_the_remaining_budget` + `capped_assembly_keeps_the_newest_fitting_tail_and_stops_at_a_user_turn` | already-covered | oversized-summary-skip, gap-ends-selection, cap-too-small-drops-summary all pre-covered by wave-1 unit tests |
+| `test_crash_safe_wal.py::TestConfigureConnectionPragmas` | `store.rs::wal_durability_pragmas_are_configured_on_a_durable_store` | ported-pass | journal_mode=wal, synchronous=FULL, busy_timeout=30000, wal_autocheckpoint=500, journal_size_limit=64MiB, mmap_size=256MiB |
+| `test_crash_safe_wal.py::TestGracefulClose::test_message_store_close_runs_checkpoint` | `store.rs::graceful_close_checkpoints_the_wal` | ported-pass | Drop-time passive checkpoint + last-connection close flushes WAL |
+| `test_crash_safe_wal.py::TestConfigureConnectionPragmas::test_*` env family | — | out-of-scope | Python monkeypatches a raw `sqlite3.connect`; the single Rust `Store` owns its connection (no three-store split, no per-helper `close()` masking seam) |
+| `test_lcm_core.py::TestConfig::test_defaults` | `config.rs::config_defaults_match_python` | ported-pass | full Appendix-A default surface |
+| `test_lcm_core.py::TestConfig::test_from_env*` (12 tests) | — | out-of-scope | the crate reads no environment (the node injects config); there is no `from_env`/HERMES_HOME/yaml surface to port |
+| `test_auto_focus_topic.py::test_multimodal_content` | `compaction.rs::auto_focus_handles_multimodal_content_parts` | ported-pass | §8.4 `text_content_for_pattern_matching` flattens multimodal parts; auto-focus consumes the text |
+| `test_lcm_engine.py::test_limit_zero_returns_error` | `tools/tests.rs::grep_limit_zero_returns_error` | ported-pass | grep limit=0 → error mentioning `limit` |
+| `test_lcm_engine.py::test_limit_negative_returns_error` | `tools/tests.rs::grep_limit_negative_returns_error` | ported-pass | grep limit=-5 → error |
+| `test_lcm_engine.py::test_store_id_not_found_returns_error` | `tools/tests.rs::expand_store_id_not_found_returns_error` | ported-pass | out-of-range expand store_id → error mentioning `store_id` |
+| `test_lcm_engine.py::test_store_id_not_an_integer_returns_error` | `tools/tests.rs::expand_store_id_not_an_integer_returns_error` | ported-pass | non-integer store_id → error mentioning `integer` |
+| `test_lcm_engine.py::test_multiple_modes_returns_error` / `test_no_modes_returns_error` | `tools/tests.rs::expand_rejects_mode_combinations_with_python_error_text` | already-covered | wave-1 test asserts both mode-combination error strings |
+| `test_lcm_core.py::test_write_lock_serializes_concurrent_appends` | `store.rs::concurrent_appends_serialize_without_losing_rows` | ported-pass | 8 `std::thread` workers, 400 rows, no loss; Rust serializes via `conn: Mutex<Connection>` (the `_write_lock` RLock analog) |
+
+Wave-2 commit trail (all single-commit ports; no red/green pairs since nothing was a gap):
+
+| theme | commit |
+|---|---|
+| 1 search ranking at scale | `848f9c5` |
+| 2 ingest-protection replay + quarantine | `d440948` |
+| 3 rotate edge cases | `170dd1f` |
+| 4 assembly guardrails | `8f8e637` |
+| 5 WAL crash-safety | `a3d6750` |
+| 6 config defaults | `b3c627d` |
+| 7 auto-focus multimodal | `9bb499d` |
+| 8 grep/expand tool edges | `50ebc8d` |
+| 9 concurrent append serialization | `f3d04aa` |
+
 ## Wave-2 backlog (not attempted this pass — no red tests left behind)
 
 Grouped by kind, each with an implementation sketch:
