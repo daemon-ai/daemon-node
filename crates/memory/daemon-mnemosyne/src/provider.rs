@@ -747,7 +747,7 @@ mod tests {
 
     // parity: test_hermes_memory_provider_validation.py::test_validate_attest_preserves_author_and_records_validator (tests/test_hermes_memory_provider_validation.py:106)
     #[tokio::test]
-    async fn parity_gap_tool_validate_attest_records_validator_preserving_author() {
+    async fn tool_validate_attest_records_validator_preserving_author() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
         let provider = MnemosyneProvider::new(engine);
         let mid = seed_with_author(&provider, "SSH key at /home/user/.ssh/pc", "Sisyphus").await;
@@ -774,7 +774,7 @@ mod tests {
 
     // parity: test_hermes_memory_provider_validation.py::test_validate_attest_falls_back_to_agent_identity (tests/test_hermes_memory_provider_validation.py:129)
     #[tokio::test]
-    async fn parity_gap_tool_validate_attest_falls_back_to_agent_identity() {
+    async fn tool_validate_attest_falls_back_to_agent_identity() {
         // The engine's configured author_id is the Rust analog of the Python provider's
         // `_agent_identity` fallback.
         let engine = Arc::new(
@@ -800,7 +800,7 @@ mod tests {
     // parity: test_hermes_memory_provider_validation.py::test_validate_update_replaces_content_and_keeps_author (tests/test_hermes_memory_provider_validation.py:143)
     // parity: test_hermes_memory_provider_validation.py::test_validate_update_requires_new_content (tests/test_hermes_memory_provider_validation.py:161)
     #[tokio::test]
-    async fn parity_gap_tool_validate_update_replaces_content_and_requires_new_content() {
+    async fn tool_validate_update_replaces_content_and_requires_new_content() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
         let provider = MnemosyneProvider::new(engine);
         let mid = seed_with_author(&provider, "SSH key at /home/user/.ssh/pc", "Sisyphus").await;
@@ -835,7 +835,7 @@ mod tests {
 
     // parity: test_hermes_memory_provider_validation.py::test_validate_invalidate_sets_valid_until (tests/test_hermes_memory_provider_validation.py:175)
     #[tokio::test]
-    async fn parity_gap_tool_validate_invalidate_sets_valid_until() {
+    async fn tool_validate_invalidate_sets_valid_until() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
         let provider = MnemosyneProvider::new(engine);
         let mid = seed_with_author(&provider, "outdated fact about VPN", "Sisyphus").await;
@@ -858,7 +858,7 @@ mod tests {
 
     // parity: test_hermes_memory_provider_validation.py::test_validate_delete_removes_row (tests/test_hermes_memory_provider_validation.py:195)
     #[tokio::test]
-    async fn parity_gap_tool_validate_delete_removes_row() {
+    async fn tool_validate_delete_removes_row() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
         let provider = MnemosyneProvider::new(engine);
         let mid = seed_with_author(&provider, "stale fact", "Sisyphus").await;
@@ -879,7 +879,7 @@ mod tests {
 
     // parity: test_hermes_memory_provider_validation.py::test_validate_works_on_shared_surface (tests/test_hermes_memory_provider_validation.py:211)
     #[tokio::test]
-    async fn parity_gap_tool_validate_works_on_shared_surface() {
+    async fn tool_validate_works_on_shared_surface() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
         let provider = MnemosyneProvider::new(engine);
         let stored = provider
@@ -910,7 +910,7 @@ mod tests {
     // parity: test_hermes_memory_provider_validation.py::test_ring_buffer_keeps_only_last_three_validations (tests/test_hermes_memory_provider_validation.py:230)
     // parity: test_hermes_memory_provider_validation.py::test_validation_count_grows_unbounded (tests/test_hermes_memory_provider_validation.py:247)
     #[tokio::test]
-    async fn parity_gap_tool_validate_ring_buffer_keeps_last_three_while_count_grows() {
+    async fn tool_validate_ring_buffer_keeps_last_three_while_count_grows() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
         let provider = MnemosyneProvider::new(engine);
         let mid = seed_with_author(&provider, "SSH key location", "Sisyphus").await;
@@ -940,7 +940,7 @@ mod tests {
     // parity: test_hermes_memory_provider_validation.py::test_validate_unknown_bank_rejected (tests/test_hermes_memory_provider_validation.py:284)
     // parity: test_hermes_memory_provider_validation.py::test_validate_missing_memory_id_rejected (tests/test_hermes_memory_provider_validation.py:295)
     #[tokio::test]
-    async fn parity_gap_tool_validate_rejects_bad_requests() {
+    async fn tool_validate_rejects_bad_requests() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
         let provider = MnemosyneProvider::new(engine);
         let mid = seed_with_author(&provider, "fact", "Sisyphus").await;
@@ -988,7 +988,7 @@ mod tests {
 
     // parity: test_hermes_memory_provider_validation.py::test_collaborative_attestation_chain (tests/test_hermes_memory_provider_validation.py:303)
     #[tokio::test]
-    async fn parity_gap_tool_validate_collaborative_attestation_chain() {
+    async fn tool_validate_collaborative_attestation_chain() {
         let engine = Arc::new(Engine::open_in_memory(MnemosyneConfig::default()).unwrap());
         let provider = MnemosyneProvider::new(engine);
         let mid = seed_with_author(&provider, "SSH key at /home/user/.ssh/pc", "Sisyphus").await;

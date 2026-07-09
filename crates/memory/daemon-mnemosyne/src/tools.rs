@@ -15,7 +15,7 @@
 use crate::embeddings::Embedder;
 use crate::engine::{
     CanonicalRemember, Engine, GraphLink, GroupSummary, RecallReq, RememberArgs, SleepGroup,
-    TripleAdd, TripleEnd, TripleQuery, ValidateArgs,
+    TripleAdd, TripleEnd, TripleQuery,
 };
 use crate::extract::Extractor;
 use daemon_core::tools::ToolDef;
@@ -60,7 +60,7 @@ pub fn defs() -> Vec<ToolDef> {
         ),
         def(
             "mnemosyne_validate",
-            r#"{"type":"object","properties":{"id":{"type":"string"},"action":{"type":"string"},"validator":{"type":"string"},"new_content":{"type":"string"},"note":{"type":"string"}},"required":["id","action"]}"#,
+            r#"{"type":"object","properties":{"memory_id":{"type":"string"},"action":{"type":"string","enum":["attest","update","invalidate","delete"]},"validator":{"type":"string"},"new_content":{"type":"string"},"note":{"type":"string"},"bank":{"type":"string","enum":["private","surface"]}},"required":["memory_id","action"]}"#,
         ),
         def(
             "mnemosyne_sleep",
@@ -642,15 +642,73 @@ pub async fn dispatch(cx: &ToolCx<'_>, name: &str, args: Value) -> String {
             }
         }
         "mnemosyne_validate" => {
-            match engine.validate(&ValidateArgs {
-                id: s(&args, "id").unwrap_or(""),
-                action: s(&args, "action").unwrap_or("confirm"),
-                validator: s(&args, "validator"),
-                new_content: s(&args, "new_content"),
-                note: s(&args, "note"),
-            }) {
-                Ok(found) => json!({"status": "ok", "found": found}).to_string(),
-                Err(e) => err(e),
+            // Collaborative attestation over either bank (`_handle_validate`, `__init__.py`
+            // L2091-L2207): any agent can attest/update/invalidate/delete any memory; the
+            // original author_id is preserved and the ring buffer keeps the last 3 validations.
+            let memory_id = s(&args, "memory_id").or_else(|| s(&args, "id")).unwrap_or("");
+            let action = s(&args, "action").unwrap_or("");
+            let bank = s(&args, "bank").unwrap_or("private");
+            let new_content = s(&args, "new_content").filter(|c| !c.is_empty());
+            let note = s(&args, "note").filter(|n| !n.is_empty());
+            if memory_id.is_empty() {
+                return json!({"error": "memory_id is required"}).to_string();
+            }
+            if !matches!(action, "attest" | "update" | "invalidate" | "delete") {
+                return json!({"error": format!("unknown action: {action}")}).to_string();
+            }
+            if !matches!(bank, "private" | "surface") {
+                return json!({"error": format!("unknown bank: {bank}")}).to_string();
+            }
+            if action == "update" && new_content.is_none() {
+                return json!({"error": "new_content is required for action='update'"}).to_string();
+            }
+            // Validator identity: explicit arg, else the configured author identity — the Rust
+            // analog of Python's `self._agent_identity` — else "unknown".
+            let validator = s(&args, "validator")
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .or_else(|| engine.config().author_id.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let target = if bank == "surface" {
+                match cx.surface() {
+                    Ok(sf) => sf,
+                    Err(e) => return e,
+                }
+            } else {
+                engine
+            };
+            match target.validate_action(memory_id, action, &validator, new_content, note) {
+                Ok(Some(outcome)) => {
+                    // Tool-level audit into the private provider log, bank-stamped (`_audit_event`).
+                    engine.audit_tool(
+                        &format!("validate_{action}"),
+                        Some(memory_id),
+                        bank,
+                        "mnemosyne_validate",
+                        None,
+                    );
+                    json!({
+                        "status": format!("validation_{action}"),
+                        "memory_id": memory_id,
+                        "bank": bank,
+                        "validator": validator,
+                        "author_id": outcome.author_id,
+                        "previous_content": outcome.previous_content.chars().take(200).collect::<String>(),
+                    })
+                    .to_string()
+                }
+                Ok(None) => json!({
+                    "error": "memory_not_found",
+                    "memory_id": memory_id,
+                    "bank": bank,
+                })
+                .to_string(),
+                Err(e) => json!({
+                    "error": "validation_failed",
+                    "reason": e.to_string(),
+                    "memory_id": memory_id,
+                })
+                .to_string(),
             }
         }
         "mnemosyne_sleep" => {

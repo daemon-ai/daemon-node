@@ -246,6 +246,97 @@ impl Engine {
         Ok(changed)
     }
 
+    /// Apply one collaborative-attestation action to a working-memory row in THIS bank
+    /// (`hermes_memory_provider/__init__.py` `_handle_validate` L2091-L2207): `attest` stamps
+    /// `validator`/`validated_at` and bumps `validation_count`; `update` additionally replaces the
+    /// content; `invalidate` stamps `valid_until`; `delete` removes the row. Every applied action
+    /// appends a `memory_validations` entry — the `trim_validations_to_3` trigger keeps the ring
+    /// buffer at the last 3 per memory while `validation_count` on the live row grows unbounded.
+    /// The original `author_id` is never touched. Atomic: the row mutation and the log append
+    /// commit together. Returns `None` when the memory does not exist in this bank. Distinct from
+    /// [`Engine::validate`], which ports `beam.py`'s own confirm/correct/reject surface.
+    pub fn validate_action(
+        &self,
+        memory_id: &str,
+        action: &str,
+        validator: &str,
+        new_content: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<Option<ValidationOutcome>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.store.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let existing: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT author_id, content FROM working_memory WHERE id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((author_id, previous_content)) = existing else {
+            return Ok(None);
+        };
+        match action {
+            "delete" => {
+                tx.execute(
+                    "DELETE FROM working_memory WHERE id = ?1",
+                    params![memory_id],
+                )?;
+            }
+            "update" => {
+                tx.execute(
+                    "UPDATE working_memory SET content = ?1, validator = ?2, \
+                     validated_at = CURRENT_TIMESTAMP, \
+                     validation_count = COALESCE(validation_count, 0) + 1 WHERE id = ?3",
+                    params![new_content.unwrap_or_default(), validator, memory_id],
+                )?;
+                // Crate invariant beyond the Python handler: a content rewrite drops the stale
+                // dense embedding (as in [`Engine::update`]) so vector recall can't serve the
+                // pre-correction text.
+                tx.execute(
+                    "DELETE FROM memory_embeddings WHERE memory_id = ?1",
+                    params![memory_id],
+                )?;
+            }
+            "invalidate" => {
+                tx.execute(
+                    "UPDATE working_memory SET valid_until = CURRENT_TIMESTAMP, validator = ?1, \
+                     validated_at = CURRENT_TIMESTAMP, \
+                     validation_count = COALESCE(validation_count, 0) + 1 WHERE id = ?2",
+                    params![validator, memory_id],
+                )?;
+            }
+            // `attest` (the action allowlist is enforced at the tool boundary).
+            _ => {
+                tx.execute(
+                    "UPDATE working_memory SET validator = ?1, validated_at = CURRENT_TIMESTAMP, \
+                     validation_count = COALESCE(validation_count, 0) + 1 WHERE id = ?2",
+                    params![validator, memory_id],
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO memory_validations (memory_id, validator, action, new_content, note) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                memory_id,
+                validator,
+                action,
+                if action == "update" {
+                    new_content
+                } else {
+                    None
+                },
+                note,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some(ValidationOutcome {
+            author_id,
+            previous_content,
+        }))
+    }
+
     /// Record a human/agent validation action on a memory (`beam.py` `validate`). Appends a
     /// `memory_validations` row and bumps the row's `validation_count`/`validated_at`/`validator`.
     /// `action = "correct"` with `new_content` rewrites the content; `action = "reject"` invalidates

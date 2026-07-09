@@ -371,6 +371,16 @@ pub struct CanonicalRemember<'a> {
     pub confidence: f64,
 }
 
+/// What [`Engine::validate_action`] observed before applying a collaborative-attestation action
+/// (`_handle_validate`'s response fields, `hermes_memory_provider/__init__.py` L2201-L2207).
+#[derive(Clone, Debug)]
+pub struct ValidationOutcome {
+    /// The row's original author — preserved across validations.
+    pub author_id: Option<String>,
+    /// The row content before the action was applied.
+    pub previous_content: String,
+}
+
 /// Arguments for [`Engine::validate`] — record a human/agent validation action on a memory.
 pub struct ValidateArgs<'a> {
     /// The target memory id.
