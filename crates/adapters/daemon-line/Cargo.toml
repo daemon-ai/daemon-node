@@ -42,6 +42,8 @@ axum = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# W1-A conformance: run the ops<->behavior invariant against the real adapter.
+daemon-api-testkit = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # compute a valid `x-line-signature` fixture in the webhook-verify test (HMAC-SHA256 + base64), so no
 # real channel secret or live network is needed. Test-only.

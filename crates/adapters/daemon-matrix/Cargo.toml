@@ -31,6 +31,8 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
+# W1-A conformance: run the ops<->behavior invariant against the real adapter.
+daemon-api-testkit = { workspace = true }
 # `testing` pulls in `test_utils::mocks::MatrixMockServer`; `matrix-sdk-test` provides the
 # `JoinedRoomBuilder` / `EventFactory` sync-injection helpers used to drive the inbound path.
 matrix-sdk = { workspace = true, features = ["testing"] }

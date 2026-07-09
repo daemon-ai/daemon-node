@@ -57,6 +57,8 @@ wacloudapi = "0.1.0"
 openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [dev-dependencies]
+# W1-A conformance: run the ops<->behavior invariant against the real adapter.
+daemon-api-testkit = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]

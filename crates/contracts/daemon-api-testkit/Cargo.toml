@@ -1,0 +1,20 @@
+[package]
+name = "daemon-api-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Dev-only harness crate: reference MessagingProtocol impls + the ops<->behavior invariant that
+# adapter conformance tests build on. Never published.
+publish = false
+
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+# Only for constructing a `BlobRef` (needs `ContentHash`, which `daemon-api` does not re-export)
+# in the file-transfer probe of `assert_ops_match_behavior`. Internal path dep — no new crate.
+daemon-common = { workspace = true }
+async-trait = { workspace = true }
+
+[lints]
+workspace = true
