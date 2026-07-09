@@ -38,15 +38,40 @@ impl std::fmt::Display for NameRepairError {
 
 impl std::error::Error for NameRepairError {}
 
-/// Resolve `raw` to a registered tool name (§9): exact match on the normalized form, else the
-/// closest fuzzy match above [`FUZZY_THRESHOLD`], else [`NameRepairError`].
+/// Resolve `raw` to a registered tool name (§9), a faithful port of hermes'
+/// `repair_tool_call` (`agent/agent_runtime_helpers.py:1925`) layered on top of the Rust port's
+/// existing namespace/quote normalization:
+/// 1. trim VolcEngine XML-attribute pollution at the first `"`/`'`/`<`/`>` (issue #33007);
+/// 2. exact match on the (namespace/quote/case/separator) normalized name;
+/// 3. build a candidate set adding CamelCase→snake_case and class-like `_tool`/`-tool`/`tool`
+///    suffix stripping (applied up to twice for double-tacked suffixes like `TodoTool_tool`), and
+///    exact-match any candidate;
+/// 4. else the closest fuzzy match above [`FUZZY_THRESHOLD`], else [`NameRepairError`].
+///
+/// Hermes returns `None` on failure; the Rust port returns `Err` with the valid names so the
+/// provider can surface a protocol-valid corrective error. The fuzzy stage uses `strsim`
+/// (normalized Levenshtein) where hermes uses `difflib.get_close_matches`; the two agree on the
+/// accept/reject cases in the parity matrix.
 pub fn repair_tool_name(raw: &str, valid: &[String]) -> Result<String, NameRepairError> {
-    let normalized = normalize(raw);
+    let cleaned = trim_xml_pollution(raw);
+    let normalized = normalize(&cleaned);
 
     // Exact match on the normalized name (case-insensitively against normalized valid names).
     for name in valid {
         if normalize(name) == normalized {
             return Ok(name.clone());
+        }
+    }
+
+    // Build the candidate set for class-like emissions, then exact-match any candidate against the
+    // (normalized) valid names.
+    let candidates = build_candidates(&cleaned);
+    for name in valid {
+        let nv = normalize(name);
+        for cand in &candidates {
+            if !cand.is_empty() && normalize(cand) == nv {
+                return Ok(name.clone());
+            }
         }
     }
 
@@ -66,6 +91,23 @@ pub fn repair_tool_name(raw: &str, valid: &[String]) -> Result<String, NameRepai
     }
 }
 
+/// Trim VolcEngine-style XML-attribute pollution: some endpoints leak raw XML attribute fragments
+/// into the tool name (e.g. `terminal" parameter="command" string="true`). Truncate at the first
+/// `"`/`'`/`<`/`>` that is *not* at position 0 — a leading quote is left for [`normalize`] to strip,
+/// and whitespace is never split on so legitimate `write file` still flows through. Faithful port of
+/// the `_xml_sep` loop in hermes' `repair_tool_call`.
+fn trim_xml_pollution(raw: &str) -> String {
+    let mut s = raw.to_string();
+    for sep in ['"', '\'', '<', '>'] {
+        if let Some(idx) = s.find(sep) {
+            if idx > 0 {
+                s.truncate(idx);
+            }
+        }
+    }
+    s
+}
+
 /// Normalize a tool name for matching: trim, strip surrounding quotes/backticks, drop a leading
 /// `functions.`/`tool.`/`tools.` namespace, lowercase, and unify `-`/space to `_`.
 fn normalize(raw: &str) -> String {
@@ -81,6 +123,74 @@ fn normalize(raw: &str) -> String {
         .chars()
         .map(|c| if c == '-' || c == ' ' { '_' } else { c })
         .collect()
+}
+
+/// Hermes' `_norm`: lowercase and unify `-`/space to `_` (no namespace/quote handling).
+fn norm_simple(s: &str) -> String {
+    s.to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == '-' || c == ' ' { '_' } else { c })
+        .collect()
+}
+
+/// Hermes' `_camel_snake`: insert `_` before each uppercase letter that is not the first char, then
+/// lowercase (`TodoTool` → `todo_tool`, `WriteFileTool` → `write_file_tool`).
+fn camel_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && c.is_ascii_uppercase() {
+            out.push('_');
+        }
+        out.push(c);
+    }
+    out.to_ascii_lowercase()
+}
+
+/// Hermes' `_strip_tool_suffix`: strip a trailing `_tool`/`-tool`/`tool` class-like suffix (checked
+/// in that order), then trim any trailing `_`/`-`. Returns `None` when no suffix matched.
+fn strip_tool_suffix(s: &str) -> Option<String> {
+    let lc = s.to_ascii_lowercase();
+    for suffix in ["_tool", "-tool", "tool"] {
+        if lc.ends_with(suffix) {
+            let cut = s.len() - suffix.len();
+            let trimmed = s[..cut].trim_end_matches(['_', '-']);
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Build the candidate set hermes assembles in `repair_tool_call`: the raw (xml-trimmed) name, its
+/// lowercase, its `_norm` form, and its CamelCase→snake form, then class-like suffix stripping
+/// applied up to twice (each stripped form re-expanded through `_norm` and `_camel_snake`).
+fn build_candidates(base: &str) -> Vec<String> {
+    let mut cands: Vec<String> = Vec::new();
+    let push = |c: String, v: &mut Vec<String>| {
+        if !v.contains(&c) {
+            v.push(c);
+        }
+    };
+    push(base.to_string(), &mut cands);
+    push(base.to_ascii_lowercase(), &mut cands);
+    push(norm_simple(base), &mut cands);
+    push(camel_snake(base), &mut cands);
+
+    for _ in 0..2 {
+        let mut extra: Vec<String> = Vec::new();
+        for c in &cands {
+            if let Some(stripped) = strip_tool_suffix(c) {
+                if !stripped.is_empty() {
+                    extra.push(stripped.clone());
+                    extra.push(norm_simple(&stripped));
+                    extra.push(camel_snake(&stripped));
+                }
+            }
+        }
+        for e in extra {
+            push(e, &mut cands);
+        }
+    }
+    cands
 }
 
 #[cfg(test)]
@@ -130,15 +240,13 @@ mod tests {
     }
 }
 
-/// Parity tests ported from hermes' `AIAgent._repair_tool_call`
-/// (`tests/run_agent/test_repair_tool_call_name.py`). The Python routine, on top of
-/// the case/separator/fuzzy handling the Rust port already has, also
+/// Parity tests ported from hermes' `repair_tool_call`
+/// (`agent/agent_runtime_helpers.py:1925`; tests `tests/run_agent/test_repair_tool_call_name.py`).
+/// On top of the case/separator/fuzzy handling the Rust port already had, it now
 /// (a) splits CamelCase to snake_case, (b) strips `_tool`/`-tool`/`Tool` class-like
 /// suffixes (up to twice), and (c) trims VolcEngine XML-attribute pollution at the
-/// first `"`/`'`/`<`/`>`. Those three are the gaps.
+/// first `"`/`'`/`<`/`>`, so these all pass.
 ///
-/// `parity_gap_*` tests assert the desired Python behavior and are expected to FAIL.
-/// Plain-named tests port behavior the Rust port already handles and MUST PASS.
 /// hermes returns `None` for an unresolved name; the Rust port returns `Err`, so we
 /// treat `Err` as the parity equivalent of `None`.
 #[cfg(test)]
@@ -227,7 +335,7 @@ mod parity {
 
     // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_camel_case_with_underscore_tool_suffix (tests/run_agent/test_repair_tool_call_name.py:76)
     #[test]
-    fn parity_gap_camel_case_with_underscore_tool_suffix() {
+    fn camel_case_with_underscore_tool_suffix() {
         assert_eq!(
             repair("BrowserClick_tool").as_deref(),
             Some("browser_click")
@@ -236,37 +344,37 @@ mod parity {
 
     // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_camel_case_with_Tool_class_suffix (tests/run_agent/test_repair_tool_call_name.py:79)
     #[test]
-    fn parity_gap_camel_case_with_tool_class_suffix() {
+    fn camel_case_with_tool_class_suffix() {
         assert_eq!(repair("PatchTool").as_deref(), Some("patch"));
     }
 
     // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_double_tacked_class_and_snake_suffix (tests/run_agent/test_repair_tool_call_name.py:82)
     #[test]
-    fn parity_gap_double_tacked_class_and_snake_suffix() {
+    fn double_tacked_class_and_snake_suffix() {
         assert_eq!(repair("TodoTool_tool").as_deref(), Some("todo"));
     }
 
     // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_simple_name_with_tool_suffix (tests/run_agent/test_repair_tool_call_name.py:87)
     #[test]
-    fn parity_gap_simple_name_with_tool_suffix() {
+    fn simple_name_with_tool_suffix() {
         assert_eq!(repair("Patch_tool").as_deref(), Some("patch"));
     }
 
     // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_simple_name_with_dash_tool_suffix (tests/run_agent/test_repair_tool_call_name.py:90)
     #[test]
-    fn parity_gap_simple_name_with_dash_tool_suffix() {
+    fn simple_name_with_dash_tool_suffix() {
         assert_eq!(repair("patch-tool").as_deref(), Some("patch"));
     }
 
     // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_camel_case_preserves_multi_word_match (tests/run_agent/test_repair_tool_call_name.py:93)
     #[test]
-    fn parity_gap_camel_case_preserves_multi_word_match() {
+    fn camel_case_preserves_multi_word_match() {
         assert_eq!(repair("WriteFileTool").as_deref(), Some("write_file"));
     }
 
     // parity: test_repair_tool_call_name.py::TestClassLikeEmissions::test_mixed_separators_and_suffix (tests/run_agent/test_repair_tool_call_name.py:97)
     #[test]
-    fn parity_gap_mixed_separators_and_suffix() {
+    fn mixed_separators_and_suffix() {
         assert_eq!(repair("write-file_Tool").as_deref(), Some("write_file"));
     }
 
@@ -274,7 +382,7 @@ mod parity {
 
     // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_terminal_with_xml_attribute_pollution (tests/run_agent/test_repair_tool_call_name.py:136)
     #[test]
-    fn parity_gap_terminal_with_xml_attribute_pollution() {
+    fn terminal_with_xml_attribute_pollution() {
         assert_eq!(
             repair("terminal\" parameter=\"command\" string=\"true").as_deref(),
             Some("terminal")
@@ -283,7 +391,7 @@ mod parity {
 
     // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_execute_code_with_xml_attribute_pollution (tests/run_agent/test_repair_tool_call_name.py:141)
     #[test]
-    fn parity_gap_execute_code_with_xml_attribute_pollution() {
+    fn execute_code_with_xml_attribute_pollution() {
         assert_eq!(
             repair("execute_code\" parameter=\"code\" string=\"true").as_deref(),
             Some("execute_code")
@@ -292,7 +400,7 @@ mod parity {
 
     // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_camel_case_tool_with_xml_pollution (tests/run_agent/test_repair_tool_call_name.py:149)
     #[test]
-    fn parity_gap_camel_case_tool_with_xml_pollution() {
+    fn camel_case_tool_with_xml_pollution() {
         assert_eq!(
             repair("BrowserClick_tool\" parameter=\"selector\" string=\"true").as_deref(),
             Some("browser_click")
@@ -301,7 +409,7 @@ mod parity {
 
     // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_tool_name_with_angle_bracket_pollution (tests/run_agent/test_repair_tool_call_name.py:159)
     #[test]
-    fn parity_gap_tool_name_with_angle_bracket_pollution() {
+    fn tool_name_with_angle_bracket_pollution() {
         assert_eq!(
             repair("terminal<parameter=command").as_deref(),
             Some("terminal")
@@ -310,7 +418,7 @@ mod parity {
 
     // parity: test_repair_tool_call_name.py::TestVolcEngineXmlPollution::test_tool_name_with_single_quote_pollution (tests/run_agent/test_repair_tool_call_name.py:163)
     #[test]
-    fn parity_gap_tool_name_with_single_quote_pollution() {
+    fn tool_name_with_single_quote_pollution() {
         assert_eq!(
             repair("terminal' parameter='command' string='true").as_deref(),
             Some("terminal")
