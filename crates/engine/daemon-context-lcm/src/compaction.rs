@@ -56,12 +56,16 @@ const PRESERVED_TODO_PREFIX: &str =
 /// `summary_parts` joiner, `LCM:engine.py:4127`).
 const SUMMARY_PART_SEPARATOR: &str = "\n\n---\n\n";
 
-/// The one-time system-prompt note appended on the first compaction (`_append_lcm_note_to_content`,
-/// `LCM:engine.py:3939-3945`).
-const LCM_SYSTEM_NOTE: &str = "\n\n[Note: This conversation uses Lossless Context Management \
-(LCM). Earlier turns have been compacted into hierarchical summaries below. Use lcm_grep to \
-search history, lcm_describe to inspect the DAG, and lcm_expand to recover original details from \
-any summary.]";
+/// The LCM tooling note (the `_append_lcm_note_to_content` analog, `LCM:engine.py:3939-3945`) —
+/// contributed as a **static guidance slot from session start** via
+/// [`ContextEngine::guidance_block`](daemon_core::ContextEngine::guidance_block) instead of being
+/// appended to `Conversation.system` on the first compaction: a mid-session system mutation would
+/// bust the provider's cached prefix. Worded in the conditional so it is accurate before any
+/// compaction has run.
+pub(crate) const LCM_SYSTEM_NOTE: &str = "[Note: This conversation uses Lossless Context \
+Management (LCM). As it grows, earlier turns may be compacted into hierarchical summaries. Use \
+lcm_grep to search history, lcm_describe to inspect the DAG, and lcm_expand to recover original \
+details from any summary.]";
 
 /// Auto-focus bounds (`LCM:engine.py:89-91`): up to 3 recent user turns, 260 chars each, 700 total.
 const AUTO_FOCUS_MAX_TURNS: usize = 3;
@@ -119,7 +123,6 @@ pub(crate) async fn run_compaction(
     aux_chain: &[Arc<dyn Provider>],
     breakers: &mut [SummaryCircuitBreaker],
     session_id: &str,
-    first_compaction: bool,
     turn_store_ids: Vec<Vec<i64>>,
     conv: Conversation,
     budget: usize,
@@ -127,10 +130,7 @@ pub(crate) async fn run_compaction(
     now: f64,
 ) -> CompactionOutcome {
     let used_tokens = tok.count_conversation(&conv);
-    let Conversation {
-        mut system,
-        mut turns,
-    } = conv;
+    let Conversation { system, mut turns } = conv;
     let mut index = turn_store_ids;
     let noop = |system: daemon_core::SystemPrompt,
                 turns: Vec<Turn>,
@@ -474,12 +474,10 @@ pub(crate) async fn run_compaction(
         ext_dir.as_deref(),
     );
 
-    // First compaction: append the one-time LCM note to the system prompt
-    // (`_append_lcm_note_to_content`, `LCM:engine.py:3939-3954` — only a real system prompt
-    // anchors it).
-    if first_compaction && !system.text.is_empty() && !system.text.contains(LCM_SYSTEM_NOTE) {
-        system.text.push_str(LCM_SYSTEM_NOTE);
-    }
+    // NOTE: the system prompt is deliberately untouched here. The LCM tooling note
+    // (`LCM_SYSTEM_NOTE`) is a static guidance slot composed at session start
+    // (`LcmContextEngine::guidance_block`) — mutating `Conversation.system` mid-session would
+    // bust the provider's cached prefix.
 
     // Assemble: [system] + [summary turn over the DAG frontier] + [uncompacted remainder + fresh
     // tail], rebuilding the ingest index in lockstep (the synthetic summary turn holds no

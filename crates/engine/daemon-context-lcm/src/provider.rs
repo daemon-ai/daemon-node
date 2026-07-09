@@ -596,6 +596,13 @@ impl ContextEngine for LcmContextEngine {
         }
     }
 
+    /// The LCM tooling note, contributed as a static guidance slot from session start — the
+    /// cache-correct home of the former first-compaction `Conversation.system` append
+    /// (`_append_lcm_note_to_content`): the composed prefix never mutates mid-session.
+    fn guidance_block(&self) -> Option<String> {
+        Some(crate::compaction::LCM_SYSTEM_NOTE.to_string())
+    }
+
     fn before_turn(&self, conv: &mut Conversation, budget: Option<usize>) -> Pressure {
         // Keep the durable transcript current before measuring pressure (so the tools see this
         // turn) — the store ingests the *original* content (protected at the write boundary).
@@ -720,7 +727,7 @@ impl ContextEngine for LcmContextEngine {
             }
         }
         self.ingest_current(&conv);
-        let (tokenizer, session_id, mut breakers, first_compaction, index, context_length) = {
+        let (tokenizer, session_id, mut breakers, index, context_length) = {
             let mut state = self.state.lock().expect("lcm state poisoned");
             let breakers = std::mem::take(&mut state.breakers);
             let index = std::mem::take(&mut state.turn_store_ids);
@@ -728,7 +735,6 @@ impl ContextEngine for LcmContextEngine {
                 state.tokenizer.clone(),
                 state.session_id.clone(),
                 breakers,
-                state.compaction_count == 0,
                 index,
                 state.context_length,
             )
@@ -742,7 +748,6 @@ impl ContextEngine for LcmContextEngine {
             &self.aux_chain,
             &mut breakers,
             &session,
-            first_compaction,
             index,
             conv,
             budget,
@@ -1498,6 +1503,38 @@ mod tests {
         // A D0 node was persisted and messages were ingested for it.
         assert!(lcm.store().summary_count("s1").unwrap() >= 1);
         assert!(lcm.store().message_count("s1").unwrap() > 0);
+    }
+
+    /// A first compaction leaves the system prompt untouched (the prefix-cache regression: the
+    /// old behavior appended the LCM note to `Conversation.system`, busting the cached prefix
+    /// mid-session).
+    #[tokio::test]
+    async fn first_compaction_leaves_system_prefix_untouched() {
+        let lcm = LcmContextEngine::open_in_memory(aux_with("summary")).unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        let c = convo(50);
+        let system_before = c.system.clone();
+        let compacted = lcm.compact(c, 100).await;
+        assert!(compacted.turns.len() < 100, "compaction ran");
+        assert_eq!(
+            compacted.system.text.as_bytes(),
+            system_before.text.as_bytes(),
+            "compaction must never mutate the system prompt"
+        );
+    }
+
+    /// The LCM tooling note is a static guidance contribution available from session start —
+    /// composed into the system prompt once, before any compaction has run.
+    #[tokio::test]
+    async fn lcm_guidance_block_present_from_start() {
+        let lcm = LcmContextEngine::open_in_memory(aux_with("summary")).unwrap();
+        let note = lcm.guidance_block().expect("a static guidance note");
+        for tool in ["lcm_grep", "lcm_describe", "lcm_expand"] {
+            assert!(note.contains(tool), "note keeps the {tool} guidance");
+        }
+        // Stable across calls (cache-stable by construction).
+        assert_eq!(lcm.guidance_block(), Some(note));
     }
 
     #[tokio::test]
