@@ -404,14 +404,27 @@ impl Engine {
     /// report whether cancellation has been requested.
     fn boundary(&mut self, control: &TurnControl, events: &EventSink) -> bool {
         self.serve_snapshots(control, events);
+        // A hard interrupt supersedes any queued steer (hermes `clear_interrupt` drops
+        // `_pending_steer`): the interrupted turn's next iteration won't happen, so appending the
+        // steer as a durable marker it will never act on is surprising. When cancelling, drop each
+        // queued steer and ack it not-accepted rather than splicing it into the conversation.
+        let cancelling = control.is_cancelled();
         // Context-only observes that arrived mid-turn fold in as plain user context (no marker, no
         // ack, no trigger): they become part of the model context the next turn assembles.
         for input in control.drain_observe() {
             self.push_observe(input);
         }
         for steer in control.drain_steer() {
-            self.push_steer_marker(&steer);
             let request_id = steer.request_id;
+            if cancelling {
+                events.emit(|seq| AgentEvent::Steered {
+                    seq,
+                    request_id,
+                    accepted: false,
+                });
+                continue;
+            }
+            self.push_steer_marker(&steer);
             events.emit(|seq| AgentEvent::Steered {
                 seq,
                 request_id,

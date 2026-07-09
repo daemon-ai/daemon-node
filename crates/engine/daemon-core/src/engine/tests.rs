@@ -1246,7 +1246,7 @@ async fn steer_drained_appends_marker_and_acks() {
 // must be dropped (not appended as a durable `[steer]` marker the interrupted turn will never act
 // on) and acked as *not* accepted so the client learns it was superseded.
 #[tokio::test]
-async fn parity_gap_interrupt_supersedes_pending_steer() {
+async fn interrupt_supersedes_pending_steer() {
     let mut engine = completing_engine("steer-interrupt");
     engine.push_user(UserMsg::new("hi"));
     let control = TurnControl::new();
