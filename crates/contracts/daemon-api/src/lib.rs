@@ -46,9 +46,10 @@ pub mod profile;
 pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
     BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, CuratorChange, CuratorEntry,
-    Distribution, EngineSelector, EngineTunables, ForeignBackend, MemoryProviderSel,
-    ModelDescriptor, ProfileInfo, ProfileSpec, ProviderDescriptor, ProviderKindWire,
-    ProviderSelector, ProviderSignIn, SessionOverlay, ToolsOverride,
+    CustomProvider, CustomProviderSource, Distribution, EngineSelector, EngineTunables,
+    ForeignBackend, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
+    ProviderDescriptor, ProviderKindWire, ProviderSelector, ProviderSignIn, SessionOverlay,
+    ToolsOverride,
 };
 
 /// One item of a [`LogStream`]: either a merged-log entry, or a `Lagged` signal that the live
@@ -1495,6 +1496,26 @@ pub trait ModelApi: Send + Sync {
         _after: Option<String>,
     ) -> WirePage<ModelDescriptor> {
         WirePage::default()
+    }
+
+    /// The persisted user-defined custom OpenAI-compatible providers (the editor's read-your-writes
+    /// view — the raw [`CustomProvider`] write model, distinct from the merged `provider_catalog`
+    /// read). Default: empty (no custom-provider store wired).
+    async fn custom_provider_list(&self) -> Vec<CustomProvider> {
+        Vec::new()
+    }
+
+    /// Create/update a user-defined custom provider (keyed by [`CustomProvider::id`]); the node
+    /// forces `source = User` and re-validates `base_url`/`wire_selector`. It then appears as a
+    /// normal `provider_catalog` row. Default: unsupported (no store wired).
+    async fn custom_provider_set(&self, _provider: CustomProvider) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("custom_provider_set".into()))
+    }
+
+    /// Remove a user-defined custom provider by id (idempotent; config-seeded entries are not
+    /// user-removable). Default: unsupported (no store wired).
+    async fn custom_provider_remove(&self, _id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("custom_provider_remove".into()))
     }
 }
 

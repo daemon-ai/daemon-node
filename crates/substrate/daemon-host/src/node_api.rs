@@ -72,6 +72,7 @@ use daemon_api::{
     CreateConversationDetails,
     CredentialApi,
     CredentialInfo,
+    CustomProvider,
     DeliverySink,
     Distribution,
     EventsPage,
@@ -291,6 +292,18 @@ pub trait CloudCatalog: Send + Sync {
     /// Local engines are served by the host from the `ModelManager` catalog, not here.
     async fn provider_models(&self, provider_id: &str, key: Option<String>)
         -> Vec<ModelDescriptor>;
+
+    /// List an arbitrary OpenAI-compatible endpoint's models via `GET {base_url}/models`,
+    /// credential-aware (`key` is sent as a bearer when present, keyless otherwise). Backs custom
+    /// providers: the host resolves the stored `base_url` + credential and calls this, so the host
+    /// never links `genai`/egress. Default: empty (a catalog with no OpenAI-compatible probe wired).
+    async fn openai_compat_models(
+        &self,
+        _base_url: &str,
+        _key: Option<String>,
+    ) -> Vec<ModelDescriptor> {
+        Vec::new()
+    }
 }
 
 /// The foreign-agent discovery hook (I7). `daemon-host` does not link the ACP runtime (`daemon-acp`

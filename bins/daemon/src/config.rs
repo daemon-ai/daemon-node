@@ -1398,6 +1398,46 @@ impl PromptConfig {
 
 // --- the node configuration -------------------------------------------------------------------
 
+/// One config-seeded custom OpenAI-compatible provider (`[[custom_providers]]`). Mapped at boot to a
+/// wire `daemon_api::CustomProvider` with `source = Config` and upserted into the durable provider
+/// store, so it appears in `provider_catalog` alongside user-created entries.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomProviderConfig {
+    /// The stable, user-namespaced picker id (e.g. `"custom/my-gateway"`).
+    pub id: String,
+    /// Human label for the picker row (defaults to `id` when empty).
+    pub display_name: String,
+    /// The OpenAI-compatible API base URL (e.g. `https://my-gateway/v1/`).
+    pub base_url: String,
+    /// Whether running turns / listing models needs a bearer credential.
+    pub requires_key: bool,
+    /// The default credential ref the app copies into a selecting profile. `None` = none.
+    pub credential_ref: Option<String>,
+}
+
+impl CustomProviderConfig {
+    /// Project this config row into the wire [`daemon_api::CustomProvider`] write model, tagged
+    /// `source = Config` and bound to the OpenAI-compatible `DaemonApi` selector. An empty
+    /// `display_name` falls back to the id.
+    pub fn to_wire(&self) -> daemon_api::CustomProvider {
+        let display_name = if self.display_name.trim().is_empty() {
+            self.id.clone()
+        } else {
+            self.display_name.clone()
+        };
+        daemon_api::CustomProvider {
+            id: self.id.clone(),
+            display_name,
+            base_url: self.base_url.clone(),
+            wire_selector: daemon_api::ProviderSelector::DaemonApi,
+            requires_key: self.requires_key,
+            credential_ref: self.credential_ref.clone(),
+            source: daemon_api::CustomProviderSource::Config,
+        }
+    }
+}
+
 /// The node configuration: the single source of truth, deserialized by [`figment`] from
 /// defaults <- TOML <- env <- CLI. Field names are the TOML/serde keys; env keys are `DAEMON_` +
 /// the (uppercased, `__`-nested) path. Paths that default relative to `data_dir`/`profile_home`
@@ -1449,6 +1489,10 @@ pub struct NodeConfig {
     pub infer: LocalConfig,
     /// Model-management (search/download/cache/catalog) tuning.
     pub models: ModelsConfig,
+    /// User-named custom OpenAI-compatible providers seeded from config (`[[custom_providers]]`).
+    /// Upserted into the durable provider store at boot with `source = Config` (config is
+    /// authoritative for its ids; user-created entries persist independently).
+    pub custom_providers: Vec<CustomProviderConfig>,
     /// Embeddings backend tuning (Mnemosyne vector recall; `Off` by default).
     pub embed: EmbedConfig,
     /// Vision-tool tuning (`vision_analyze` aux backend; `Off` by default).
@@ -1564,6 +1608,7 @@ impl Default for NodeConfig {
             model: String::new(),
             infer: LocalConfig::default(),
             models: ModelsConfig::default(),
+            custom_providers: Vec::new(),
             embed: EmbedConfig::default(),
             vision: VisionConfig::default(),
             metta: MettaConfig::default(),
@@ -1893,6 +1938,55 @@ fn walk_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `[[custom_providers]]` config row projects to a `source = Config` wire provider bound to the
+    /// OpenAI-compatible `DaemonApi` selector, with an empty `display_name` falling back to the id.
+    #[test]
+    fn custom_provider_config_projects_to_wire() {
+        let full = CustomProviderConfig {
+            id: "custom/gw".into(),
+            display_name: "My Gateway".into(),
+            base_url: "https://gw.example/v1/".into(),
+            requires_key: true,
+            credential_ref: Some("cred".into()),
+        };
+        let wire = full.to_wire();
+        assert_eq!(wire.id, "custom/gw");
+        assert_eq!(wire.display_name, "My Gateway");
+        assert_eq!(wire.base_url, "https://gw.example/v1/");
+        assert_eq!(wire.wire_selector, daemon_api::ProviderSelector::DaemonApi);
+        assert!(wire.requires_key);
+        assert_eq!(wire.credential_ref.as_deref(), Some("cred"));
+        assert!(matches!(
+            wire.source,
+            daemon_api::CustomProviderSource::Config
+        ));
+
+        // Empty display_name falls back to the id.
+        let bare = CustomProviderConfig {
+            id: "custom/bare".into(),
+            base_url: "https://b/v1/".into(),
+            ..Default::default()
+        };
+        assert_eq!(bare.to_wire().display_name, "custom/bare");
+    }
+
+    /// `[[custom_providers]]` parses from TOML into the `NodeConfig`.
+    #[test]
+    fn custom_providers_parse_from_toml() {
+        let fig = Figment::from(Serialized::defaults(NodeConfig::default())).merge(Toml::string(
+            "[[custom_providers]]\n\
+             id = \"custom/gw\"\n\
+             display_name = \"My Gateway\"\n\
+             base_url = \"https://gw.example/v1/\"\n\
+             requires_key = true\n",
+        ));
+        let cfg: NodeConfig = fig.extract().expect("extract");
+        assert_eq!(cfg.custom_providers.len(), 1);
+        assert_eq!(cfg.custom_providers[0].id, "custom/gw");
+        assert_eq!(cfg.custom_providers[0].base_url, "https://gw.example/v1/");
+        assert!(cfg.custom_providers[0].requires_key);
+    }
 
     /// `[prompt].cache_ttl` precedence: unset leaves `[engine].cache_ttl` governing; `"1h"`
     /// selects the extended tier; anything unrecognized falls back to the 5-minute default (the

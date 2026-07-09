@@ -318,7 +318,10 @@ fn classify(req: &ApiRequest) -> Coverage {
         | Models { .. }
         | ModelCurrent { .. }
         | ProviderCatalog
-        | ProviderModels { .. } => NotSessionTouching,
+        | ProviderModels { .. }
+        | CustomProviderList
+        | CustomProviderSet { .. }
+        | CustomProviderRemove { .. } => NotSessionTouching,
         ProfileList
         | ProfileGet { .. }
         | ProfileCreate { .. }

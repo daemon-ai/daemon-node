@@ -467,6 +467,21 @@ pub enum ApiRequest {
         #[serde(default)]
         after: Option<String>,
     },
+    /// [`ModelApi::custom_provider_list`] — the persisted user-defined custom providers (the editor
+    /// read-your-writes view). Gated on `Capability::ModelsRead`.
+    CustomProviderList,
+    /// [`ModelApi::custom_provider_set`] — create/update a custom OpenAI-compatible provider. Gated
+    /// on `Capability::ModelsWrite`.
+    CustomProviderSet {
+        /// The custom provider to persist (keyed by [`CustomProvider::id`]).
+        provider: CustomProvider,
+    },
+    /// [`ModelApi::custom_provider_remove`] — remove a user-defined custom provider by id. Gated on
+    /// `Capability::ModelsWrite`.
+    CustomProviderRemove {
+        /// The [`CustomProvider::id`] to remove.
+        id: String,
+    },
     /// [`SessionApi::set_session_model`].
     SetSessionModel {
         /// The live session to switch.
@@ -1202,6 +1217,8 @@ pub enum ApiResponse {
     ProviderCatalog(Vec<ProviderDescriptor>),
     /// A page of a provider's discoverable models (`provider_models`), descriptor-id order.
     ProviderModels(WirePage<ModelDescriptor>),
+    /// The persisted user-defined custom providers (`custom_provider_list`).
+    CustomProviders(Vec<CustomProvider>),
     /// A profile distribution (profile_export).
     Distribution(Distribution),
     /// A created profile id (profile_import).

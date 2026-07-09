@@ -77,6 +77,10 @@ CREATE TABLE cron_suggestions (
     status       TEXT NOT NULL DEFAULT 'pending',
     created_unix INTEGER NOT NULL
 );
+CREATE TABLE custom_providers (
+id    TEXT PRIMARY KEY,
+entry BLOB NOT NULL
+);
 CREATE TABLE delegations (
     rowseq         INTEGER PRIMARY KEY AUTOINCREMENT,
     child          TEXT NOT NULL UNIQUE,

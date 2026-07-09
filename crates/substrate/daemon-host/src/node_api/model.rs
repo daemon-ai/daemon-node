@@ -167,12 +167,14 @@ impl ModelApi for NodeApiImpl {
     async fn provider_catalog(&self) -> Vec<ProviderDescriptor> {
         // The binary wires the genai-backed catalog (local engines + every genai vendor + Daemon
         // Cloud). Independent of the launch default, so an unconfigured node still lists providers.
-        match &self.cloud_catalog {
+        let base = match &self.cloud_catalog {
             Some(catalog) => catalog.providers().await,
             // Fallback for a catalog-less node (test stubs / remote-only): the local engines + Daemon
             // Cloud (genai vendors need the binary's genai hook). The base URL is the public gateway.
             None => Self::static_provider_catalog(),
-        }
+        };
+        // Overlay the durable user-defined custom providers (the single merged read model).
+        self.merge_custom_providers(base).await
     }
 
     async fn provider_models(
@@ -186,6 +188,21 @@ impl ModelApi for NodeApiImpl {
         // the ModelManager catalog (the client appends its own "Discover More" affordance).
         let mut models = if provider == "llama_cpp" || provider == "mistral_rs" {
             self.installed_models_for(&provider).await
+        } else if let Some(custom) = self.custom_provider_by_id(&provider).await {
+            // A user-defined custom provider: list its OpenAI-compatible endpoint, credential-aware.
+            // A first-run transient key wins; else the stored credential the request (or the
+            // provider's own default `credential_ref`) points at. A turn always uses the stored
+            // profile credential regardless.
+            let key = transient_key.or_else(|| {
+                credential_ref
+                    .as_deref()
+                    .or(custom.credential_ref.as_deref())
+                    .and_then(|r| self.credentials.as_ref().and_then(|c| c.get(r)))
+            });
+            match &self.cloud_catalog {
+                Some(catalog) => catalog.openai_compat_models(&custom.base_url, key).await,
+                None => Vec::new(),
+            }
         } else {
             // Resolve the LIST credential: a first-run transient key wins, else the stored
             // credential the `credential_ref` points at. A turn always uses the stored profile
@@ -206,9 +223,100 @@ impl ModelApi for NodeApiImpl {
             m.id.clone()
         })
     }
+
+    async fn custom_provider_list(&self) -> Vec<CustomProvider> {
+        self.custom_providers_decoded().await
+    }
+
+    async fn custom_provider_set(&self, mut provider: CustomProvider) -> Result<(), ApiError> {
+        // The node owns provenance + the wire binding: a wire-set is always a `User` entry bound to
+        // the OpenAI-compatible `DaemonApi` selector, regardless of what the client supplied.
+        provider.source = daemon_api::CustomProviderSource::User;
+        provider.wire_selector = ProviderSelector::DaemonApi;
+        if provider.id.trim().is_empty() {
+            return Err(ApiError::Unsupported("custom provider id is empty".into()));
+        }
+        validate_base_url(&provider.base_url)?;
+        self.store
+            .custom_provider_set(daemon_store::CustomProviderRecord {
+                id: provider.id.clone(),
+                entry: to_cbor(&provider),
+            })
+            .await
+            .map_err(|e| ApiError::Other(format!("custom provider set: {e}")))
+    }
+
+    async fn custom_provider_remove(&self, id: String) -> Result<(), ApiError> {
+        // Config-seeded entries are owned by node config (re-seeded each boot), so they are not
+        // user-removable over the wire; only `User` entries can be deleted.
+        if let Some(existing) = self.custom_provider_by_id(&id).await {
+            if matches!(existing.source, daemon_api::CustomProviderSource::Config) {
+                return Err(ApiError::Unsupported(format!(
+                    "custom provider {id:?} is config-seeded and cannot be removed over the wire"
+                )));
+            }
+        }
+        self.store
+            .custom_provider_remove(&id)
+            .await
+            .map_err(|e| ApiError::Other(format!("custom provider remove: {e}")))
+    }
+}
+
+/// Validate a custom-provider base URL is a well-formed http(s) URL. A server-side UX check; the
+/// egress client re-validates and enforces SSRF policy on the actual listing/turn call.
+fn validate_base_url(base: &str) -> Result<(), ApiError> {
+    let trimmed = base.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::Unsupported(
+            "custom provider base_url is empty".into(),
+        ));
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err(ApiError::Unsupported(
+            "custom provider base_url must be an http(s) URL".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl NodeApiImpl {
+    /// The persisted custom providers, decoded from the durable store (an undecodable row is
+    /// skipped). Backs `custom_provider_list` and the `provider_catalog`/`provider_models` overlays.
+    pub(crate) async fn custom_providers_decoded(&self) -> Vec<CustomProvider> {
+        self.store
+            .custom_provider_list()
+            .await
+            .into_iter()
+            .filter_map(|rec| from_cbor::<CustomProvider>(&rec.entry).ok())
+            .collect()
+    }
+
+    /// One persisted custom provider by id, if present.
+    async fn custom_provider_by_id(&self, id: &str) -> Option<CustomProvider> {
+        self.custom_providers_decoded()
+            .await
+            .into_iter()
+            .find(|p| p.id == id)
+    }
+
+    /// Overlay the durable custom providers onto a builtin provider list, custom winning on an id
+    /// collision (mirrors `agent_catalog`'s manual-over-builtin precedence).
+    async fn merge_custom_providers(
+        &self,
+        mut base: Vec<ProviderDescriptor>,
+    ) -> Vec<ProviderDescriptor> {
+        for custom in self.custom_providers_decoded().await {
+            let desc = custom.to_descriptor();
+            if let Some(slot) = base.iter_mut().find(|d| d.id == desc.id) {
+                *slot = desc;
+            } else {
+                base.push(desc);
+            }
+        }
+        base
+    }
+
     /// The model-management facade, or [`ApiError::Unsupported`] when this node has none.
     fn require_models(&self) -> Result<&Arc<ModelManager>, ApiError> {
         self.models

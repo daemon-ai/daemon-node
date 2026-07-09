@@ -294,6 +294,17 @@ pub struct AcpEntry {
     pub entry: Vec<u8>,
 }
 
+/// A durable user-defined custom provider entry (the "generalized Daemon Cloud" write model): the
+/// persisted half of the provider catalog. `entry` is the opaque host-encoded CBOR of the wire
+/// `CustomProvider`; the store stays protocol-free (mirrors [`AcpEntry`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomProviderRecord {
+    /// The custom-provider id (the primary key for upsert/lookup/delete).
+    pub id: String,
+    /// The opaque host descriptor (CBOR of the wire `CustomProvider`).
+    pub entry: Vec<u8>,
+}
+
 /// Bounded retention for cron run history: the most recent N runs kept per job (both backends).
 pub const CRON_RUN_RETENTION: usize = 50;
 
@@ -1364,6 +1375,21 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// List the durable user-defined custom provider entries. Default: none.
+    async fn custom_provider_list(&self) -> Vec<CustomProviderRecord> {
+        Vec::new()
+    }
+
+    /// Upsert a custom provider entry (keyed by [`CustomProviderRecord::id`]). Default: no-op.
+    async fn custom_provider_set(&self, _entry: CustomProviderRecord) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Remove a custom provider entry by id (idempotent). Default: no-op.
+    async fn custom_provider_remove(&self, _id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// List every durable session id with its current status (the node control surface's
     /// `sessions` projection). Defaults to empty so a non-authoritative store (the brokered child
     /// proxy) need not implement it; an authoritative backend overrides it.
@@ -1523,6 +1549,9 @@ struct Inner {
     /// Durable manually-registered ACP catalog entries, keyed by name (I7; the in-memory analogue of
     /// the SQLite `acp_catalog` table).
     acp_catalog: HashMap<String, AcpEntry>,
+    /// Durable user-defined custom providers, keyed by id (the in-memory analogue of the SQLite
+    /// `custom_providers` table).
+    custom_providers: HashMap<String, CustomProviderRecord>,
     /// Durable scheduled jobs, keyed by id (I15; the in-memory analogue of the SQLite `cron_jobs`
     /// table).
     cron_jobs: HashMap<String, StoredCronJob>,
@@ -2293,6 +2322,30 @@ impl SessionStore for InMemoryStore {
 
     async fn acp_remove(&self, name: &str) -> Result<(), StoreError> {
         self.inner.lock().unwrap().acp_catalog.remove(name);
+        Ok(())
+    }
+
+    async fn custom_provider_list(&self) -> Vec<CustomProviderRecord> {
+        self.inner
+            .lock()
+            .unwrap()
+            .custom_providers
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    async fn custom_provider_set(&self, entry: CustomProviderRecord) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .custom_providers
+            .insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    async fn custom_provider_remove(&self, id: &str) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().custom_providers.remove(id);
         Ok(())
     }
 

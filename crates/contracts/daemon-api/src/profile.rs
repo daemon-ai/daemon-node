@@ -581,6 +581,71 @@ pub struct ProviderDescriptor {
     pub sign_in: Option<ProviderSignIn>,
 }
 
+/// The provenance of a persisted [`CustomProvider`]: whether it was seeded from node config at boot
+/// or created by a user over the wire. Config entries are re-seeded (idempotently) on every boot —
+/// config is authoritative for its ids — while `User` entries persist independently and are the only
+/// ones a wire `custom_provider_set`/`custom_provider_remove` may create or delete.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomProviderSource {
+    /// Seeded from node config (`[[custom_providers]]`) at boot; re-seeded idempotently.
+    Config,
+    /// Created by a user over the wire (`custom_provider_set`); the default.
+    #[default]
+    User,
+}
+
+/// A user-named, persisted custom OpenAI-compatible provider — the **write** model that generalizes
+/// the hardcoded "Daemon Cloud" into a first-class, discoverable catalog entry. It carries only the
+/// user-owned fields; the node projects it into the read-only [`ProviderDescriptor`] the picker
+/// renders (via [`CustomProvider::to_descriptor`]). Every custom provider binds
+/// [`ProviderSelector::DaemonApi`] — genai's OpenAI adapter pinned at `base_url` — so a persisted
+/// profile selecting it needs no new provider kind.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomProvider {
+    /// Stable, user-namespaced picker id (e.g. `"custom/my-gateway"`). Doubles as the
+    /// [`ProviderDescriptor::id`] and the durable store key.
+    pub id: String,
+    /// Human label for the picker row.
+    pub display_name: String,
+    /// The OpenAI-compatible API base URL (e.g. `https://my-gateway/v1/`): pinned as the selecting
+    /// profile's `base_url` and used for credential-aware `GET {base}/models` discovery.
+    pub base_url: String,
+    /// The wire selector a persisted profile must use for this provider. Fixed to
+    /// [`ProviderSelector::DaemonApi`] today (an OpenAI-compatible pass-through); a field so the
+    /// shape can generalize later without a wire break.
+    pub wire_selector: ProviderSelector,
+    /// Whether running turns / listing models needs a bearer credential.
+    pub requires_key: bool,
+    /// The default credential ref the app copies into a profile that selects this provider (and the
+    /// LIST call authenticates with when no transient key is supplied). `None` = none.
+    #[serde(default)]
+    pub credential_ref: Option<String>,
+    /// Provenance: config-seeded vs user-created (see [`CustomProviderSource`]).
+    pub source: CustomProviderSource,
+}
+
+impl CustomProvider {
+    /// Project this write model into the read-only [`ProviderDescriptor`] the catalog renders. The
+    /// picker "kind" is [`ProviderKindWire::DaemonCloud`] (a custom provider is a Daemon-Cloud-style
+    /// OpenAI gateway); `default_base_url` seeds the profile so the app never hardcodes an endpoint;
+    /// model discovery is always supported (`GET {base}/models`); there is no interactive sign-in.
+    pub fn to_descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            kind: ProviderKindWire::DaemonCloud,
+            wire_selector: self.wire_selector,
+            requires_key: self.requires_key,
+            supports_model_discovery: true,
+            default_base_url: Some(self.base_url.clone()),
+            sign_in: None,
+        }
+    }
+}
+
 /// A redacted view of a stored credential (the shape a GUI's "API keys" list renders). The secret
 /// itself is never returned on a read — only whether one is present and a short masked hint.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -632,6 +697,48 @@ impl CredentialInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_provider_projects_to_daemon_cloud_descriptor() {
+        let custom = CustomProvider {
+            id: "custom/gw".into(),
+            display_name: "My Gateway".into(),
+            base_url: "https://gw.example/v1/".into(),
+            wire_selector: ProviderSelector::DaemonApi,
+            requires_key: true,
+            credential_ref: Some("cred".into()),
+            source: CustomProviderSource::User,
+        };
+        let d = custom.to_descriptor();
+        assert_eq!(d.id, "custom/gw");
+        assert_eq!(d.display_name, "My Gateway");
+        assert_eq!(d.kind, ProviderKindWire::DaemonCloud);
+        assert_eq!(d.wire_selector, ProviderSelector::DaemonApi);
+        assert!(d.requires_key);
+        assert!(d.supports_model_discovery);
+        assert_eq!(
+            d.default_base_url.as_deref(),
+            Some("https://gw.example/v1/")
+        );
+        assert!(d.sign_in.is_none());
+    }
+
+    #[test]
+    fn custom_provider_cbor_round_trips() {
+        let custom = CustomProvider {
+            id: "custom/gw".into(),
+            display_name: "GW".into(),
+            base_url: "https://gw.example/v1/".into(),
+            wire_selector: ProviderSelector::DaemonApi,
+            requires_key: false,
+            credential_ref: None,
+            source: CustomProviderSource::Config,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&custom, &mut buf).unwrap();
+        let back: CustomProvider = ciborium::de::from_reader(&buf[..]).unwrap();
+        assert_eq!(custom, back);
+    }
 
     #[test]
     fn empty_overlay_inherits_the_profile() {
