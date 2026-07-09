@@ -2474,7 +2474,10 @@ pub fn command_specs() -> Vec<CommandSpec> {
     vec![CommandSpec::new("lcm")
         .summary("Lossless context management: status, health, preset, backup, rotate")
         .category("Context")
-        .args_hint("<status|doctor [repair|source [apply]]|preset|backup|rotate [apply]>")
+        .args_hint(
+            "<status|doctor [repair|source|clean [lifecycle]|retention [apply]]|preset|backup|\
+             rotate [apply]>",
+        )
         .subcommands(["status", "doctor", "preset", "backup", "rotate"])]
 }
 
