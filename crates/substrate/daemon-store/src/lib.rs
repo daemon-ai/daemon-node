@@ -377,6 +377,18 @@ pub struct StoredCronSuggestion {
     pub created_unix: u64,
 }
 
+/// A durable saved-presence row (W2-F). The store stays protocol-free: `payload` is the opaque
+/// host-encoded CBOR of the wire `SavedPresence` (mirroring `cron_jobs.spec`), while `id` is the
+/// typed primary key for upsert/lookup/delete. Rows are insertion-ordered by the backend so the
+/// host-side `PresenceManager` list (and its active index) is stable across reloads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSavedPresence {
+    /// The opaque saved-presence id (primary key).
+    pub id: String,
+    /// The opaque host descriptor (CBOR of the wire `SavedPresence`).
+    pub payload: Vec<u8>,
+}
+
 /// A durable user-feedback record on the feedback outbox (N1: "user feedback over OpenTelemetry").
 ///
 /// The store stays protocol-free: every field is a primitive/string the host mapped from the wire
@@ -1349,6 +1361,37 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    // -- saved presences (W2-F): the durable backing for the host `PresenceManager` -------------
+
+    /// List every durable saved presence in insertion order (W2-F). The host `PresenceManager`
+    /// loads these at startup (and seeds its default offline/available presences if absent).
+    /// Default: none (a store without the saved-presence table — presences are then in-memory only).
+    async fn saved_presence_list(&self) -> Vec<StoredSavedPresence> {
+        Vec::new()
+    }
+
+    /// Upsert a saved presence (keyed by [`StoredSavedPresence::id`]); an existing row keeps its
+    /// position, a new row is appended. Default: no-op.
+    async fn saved_presence_set(&self, _presence: StoredSavedPresence) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Remove a saved presence by id (idempotent). Default: no-op.
+    async fn saved_presence_remove(&self, _id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The id of the active saved presence, if one has been set (W2-F). Default: `None`.
+    async fn saved_presence_active_get(&self) -> Option<String> {
+        None
+    }
+
+    /// Set the active saved-presence id (single-row setting, mirroring `telemetry_consent`).
+    /// Default: no-op.
+    async fn saved_presence_active_set(&self, _id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// List the durable manually-registered ACP agent catalog entries (I7). Default: none.
     async fn acp_list(&self) -> Vec<AcpEntry> {
         Vec::new()
@@ -1530,6 +1573,12 @@ struct Inner {
     cron_runs: HashMap<String, Vec<StoredCronRun>>,
     /// Durable cron suggestions, keyed by id (I15; analogue of `cron_suggestions`).
     cron_suggestions: HashMap<String, StoredCronSuggestion>,
+    /// Durable saved presences in insertion order (W2-F; analogue of the SQLite `saved_presences`
+    /// table). A `Vec` (not a `HashMap`) so the list order — which the `PresenceManager` active
+    /// index depends on — is stable across reloads.
+    saved_presences: Vec<StoredSavedPresence>,
+    /// The active saved-presence id, if set (W2-F; analogue of `saved_presence_active`).
+    saved_presence_active: Option<String>,
     fault: Option<FaultPoint>,
     /// Append-only journal entries per stream, in append (cursor) order across all segments.
     journal_entries: HashMap<JournalStreamId, Vec<JournalEntry>>,
@@ -2395,6 +2444,42 @@ impl SessionStore for InMemoryStore {
 
     async fn cron_suggestion_remove(&self, id: &str) -> Result<(), StoreError> {
         self.inner.lock().unwrap().cron_suggestions.remove(id);
+        Ok(())
+    }
+
+    async fn saved_presence_list(&self) -> Vec<StoredSavedPresence> {
+        self.inner.lock().unwrap().saved_presences.clone()
+    }
+
+    async fn saved_presence_set(&self, presence: StoredSavedPresence) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Upsert in place to preserve insertion order (an existing id keeps its position).
+        match inner
+            .saved_presences
+            .iter_mut()
+            .find(|p| p.id == presence.id)
+        {
+            Some(existing) => *existing = presence,
+            None => inner.saved_presences.push(presence),
+        }
+        Ok(())
+    }
+
+    async fn saved_presence_remove(&self, id: &str) -> Result<(), StoreError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .saved_presences
+            .retain(|p| p.id != id);
+        Ok(())
+    }
+
+    async fn saved_presence_active_get(&self) -> Option<String> {
+        self.inner.lock().unwrap().saved_presence_active.clone()
+    }
+
+    async fn saved_presence_active_set(&self, id: &str) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().saved_presence_active = Some(id.to_string());
         Ok(())
     }
 

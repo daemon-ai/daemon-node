@@ -1591,6 +1591,50 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-telemetry-consent.cbor",
         &ApiResponse::TelemetryConsent { enabled: true },
     )?;
+    // Saved presences (W2-F; wire vNEXT): the list/save/delete/set-active ops + the listing reply.
+    {
+        use daemon_api::{PresencePrimitive, SavedPresence};
+        write_cbor(
+            &out,
+            "request-presence-list.cbor",
+            &ApiRequest::PresenceList,
+        )?;
+        let fixture_presence = SavedPresence {
+            id: "ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
+            name: Some("Streaming".into()),
+            primitive: PresencePrimitive::Streaming,
+            message: Some("live on twitch".into()),
+            emoji: Some("💀".into()),
+            last_used: Some(1_700_000_000),
+            use_count: 7,
+        };
+        write_cbor(
+            &out,
+            "request-presence-save.cbor",
+            &ApiRequest::PresenceSave {
+                presence: fixture_presence.clone(),
+            },
+        )?;
+        write_cbor(
+            &out,
+            "request-presence-delete.cbor",
+            &ApiRequest::PresenceDelete {
+                id: "ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
+            },
+        )?;
+        write_cbor(
+            &out,
+            "request-presence-set-active.cbor",
+            &ApiRequest::PresenceSetActive {
+                id: "ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
+            },
+        )?;
+        write_cbor(
+            &out,
+            "response-saved-presences.cbor",
+            &ApiResponse::SavedPresences(vec![fixture_presence]),
+        )?;
+    }
 
     println!("generated CBOR fixtures in {}", out.display());
     Ok(())

@@ -1140,6 +1140,9 @@ presence-primitive-t = "Offline"
                      / "Streaming"
                      / "OutOfOffice"
 presence = { "primitive": presence-primitive-t, ? "message": (tstr / null), ? "emoji": (tstr / null), ? "mobile": bool, ? "idle_since": (uint64 / null) }
+; saved-presence (W2-F; wire vNEXT): a named, reusable presence. `id`+`primitive` are required; the
+; rest mirror serde `#[serde(default)]` (present-null / present / absent all accepted).
+saved-presence = { "id": tstr, ? "name": (tstr / null), "primitive": presence-primitive-t, ? "message": (tstr / null), ? "emoji": (tstr / null), ? "last_used": (uint64 / null), ? "use_count": uint64 }
 contact-permission = "Unset"
                    / "Allow"
                    / "Deny"
@@ -1389,6 +1392,12 @@ request-feedback-submit = { "FeedbackSubmit": { "kind": feedback-kind, ? "target
 request-telemetry-consent-get = "TelemetryConsentGet"
 request-telemetry-consent-set = { "TelemetryConsentSet": { "enabled": bool } }
 
+; ----- saved presences (W2-F; wire vNEXT) -----
+request-presence-list = "PresenceList"
+request-presence-save = { "PresenceSave": { "presence": saved-presence } }
+request-presence-delete = { "PresenceDelete": { "id": tstr } }
+request-presence-set-active = { "PresenceSetActive": { "id": tstr } }
+
 api-request = request-submit
             / request-submit-routed
             / request-poll
@@ -1573,6 +1582,10 @@ api-request = request-submit
             / request-feedback-submit
             / request-telemetry-consent-get
             / request-telemetry-consent-set
+            / request-presence-list
+            / request-presence-save
+            / request-presence-delete
+            / request-presence-set-active
 
 response-ok = "Ok"
 response-routed = { "Routed": { "session": session-id } }
@@ -1689,6 +1702,8 @@ response-who-am-i     = { "WhoAmI": principal-view }
 feedback-ack = { "accepted": bool, "queued": bool }
 response-feedback-ack = { "FeedbackAck": feedback-ack }
 response-telemetry-consent = { "TelemetryConsent": { "enabled": bool } }
+; ----- saved presences (W2-F; wire vNEXT) -----
+response-saved-presences = { "SavedPresences": [* saved-presence] }
 api-response = response-ok
              / response-routed
              / response-session-created
@@ -1783,6 +1798,7 @@ api-response = response-ok
              / response-who-am-i
              / response-feedback-ack
              / response-telemetry-consent
+             / response-saved-presences
 
 ; ----- multiplexed / server-streaming socket envelope (wire L0; daemon-sync-protocol-spec.md §2) ---
 ; Wraps api-request/api-response so one connection carries many correlated exchanges, with

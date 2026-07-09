@@ -1258,6 +1258,32 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("cron_dismiss_suggestion".into()))
     }
 
+    // -- Saved presences (W2-F; wire vNEXT): the node-authoritative list of named, reusable
+    //    presences the app renders + drives. Backed by the host `PresenceManager` over the durable
+    //    store; a node built without it inherits the defaulted empty list / `Unsupported`. --
+
+    /// List every saved presence (wire vNEXT), in the manager's insertion order. Default: empty.
+    async fn presence_list(&self) -> Vec<SavedPresence> {
+        Vec::new()
+    }
+
+    /// Create or update a saved presence (wire vNEXT): mints an id when unset, else replaces the
+    /// existing presence by id. Default: unsupported.
+    async fn presence_save(&self, _presence: SavedPresence) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("presence_save".into()))
+    }
+
+    /// Delete a saved presence by id (wire vNEXT; idempotent). Default: unsupported.
+    async fn presence_delete(&self, _id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("presence_delete".into()))
+    }
+
+    /// Set the active saved presence by id (wire vNEXT), bumping its use-count + last-used.
+    /// Default: unsupported.
+    async fn presence_set_active(&self, _id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("presence_set_active".into()))
+    }
+
     // -- Filesystem / workspace surface (daemon-fs-surface-spec.md). Grouped (defaulted) here, not a
     //    new sub-trait, so every NodeApi implementor inherits the surface; a node with a workspace
     //    binds the real impl (backed by daemon-host's WorkspaceFs). --
@@ -5309,3 +5335,5 @@ mod dispatch;
 pub use dispatch::*;
 mod details;
 pub use details::*;
+mod saved_presence;
+pub use saved_presence::*;

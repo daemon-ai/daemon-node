@@ -163,6 +163,15 @@ CREATE TABLE rooms (
     policy     TEXT NOT NULL,
     descriptor BLOB NOT NULL
 );
+CREATE TABLE saved_presence_active (
+id     INTEGER PRIMARY KEY CHECK (id = 0),
+active TEXT NOT NULL
+);
+CREATE TABLE saved_presences (
+rowseq  INTEGER PRIMARY KEY AUTOINCREMENT,
+id      TEXT NOT NULL UNIQUE,
+payload BLOB NOT NULL
+);
 CREATE VIRTUAL TABLE session_fts USING fts5 (
     session_id UNINDEXED,
     title,

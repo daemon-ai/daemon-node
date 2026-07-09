@@ -1103,6 +1103,26 @@ pub enum ApiRequest {
         /// The new consent state (`true` opts passive telemetry in).
         enabled: bool,
     },
+
+    // -- saved presences (W2-F; wire vNEXT) ------------------------------------------------------
+    /// [`ControlApi::presence_list`] — list the saved presences (wire vNEXT). Answered by
+    /// [`ApiResponse::SavedPresences`].
+    PresenceList,
+    /// [`ControlApi::presence_save`] — create or update a saved presence (wire vNEXT).
+    PresenceSave {
+        /// The saved presence to persist (an empty `id` mints a fresh one).
+        presence: SavedPresence,
+    },
+    /// [`ControlApi::presence_delete`] — delete a saved presence by id (wire vNEXT; idempotent).
+    PresenceDelete {
+        /// The saved-presence id to remove.
+        id: String,
+    },
+    /// [`ControlApi::presence_set_active`] — set the active saved presence by id (wire vNEXT).
+    PresenceSetActive {
+        /// The saved-presence id to activate.
+        id: String,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -1316,6 +1336,10 @@ pub enum ApiResponse {
         /// The current consent state.
         enabled: bool,
     },
+
+    // -- saved presences (W2-F; wire vNEXT) ------------------------------------------------------
+    /// The saved-presence listing (the reply to `PresenceList`), in the manager's insertion order.
+    SavedPresences(Vec<SavedPresence>),
 }
 
 // ---------------------------------------------------------------------------

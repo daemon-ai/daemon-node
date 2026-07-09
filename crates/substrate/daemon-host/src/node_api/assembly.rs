@@ -81,6 +81,7 @@ impl NodeApiImpl {
             workspace: None,
             blobs: None,
             cron: None,
+            presences: None,
             commands: Arc::new(ArcSwapOption::empty()),
             tools_inventory: Arc::new(ArcSwapOption::empty()),
             caps: daemon_api::CapsReport::default(),
@@ -188,6 +189,17 @@ impl NodeApiImpl {
     /// jobs through one validation path. Absent, the cron ops keep their defaulted behavior.
     pub fn with_cron(mut self, cron: Arc<crate::cron::CronOps>) -> Self {
         self.cron = Some(cron);
+        self
+    }
+
+    /// Bind the saved-presence manager (W2-F; wire vNEXT) backing the `presence_*` control ops.
+    /// The manager is shared over the same durable [`SessionStore`] as the rest of the node.
+    /// Absent, the presence ops keep their defaulted empty-list / `Unsupported` behavior.
+    pub fn with_presence_manager(
+        mut self,
+        presences: Arc<crate::presence::PresenceManager>,
+    ) -> Self {
+        self.presences = Some(presences);
         self
     }
 
