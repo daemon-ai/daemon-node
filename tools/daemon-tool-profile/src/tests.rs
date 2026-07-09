@@ -127,7 +127,8 @@ async fn create_persists_under_the_agent_namespace() {
         .get("agent/s1/researcher")
         .unwrap()
         .expect("the created profile is persisted under the agent namespace");
-    assert_eq!(spec.system_prompt, "a focused researcher");
+    // TODO(prompt-arch Lane E): assert the persona landed via PersonaStore (SoulGet) once the
+    // tool routes `system_prompt`/`persona` through it (the spec field left the wire at v36).
     assert_eq!(
         spec.tool_allowlist,
         Some(vec!["fs".to_string(), "web_search".to_string()])
@@ -212,14 +213,9 @@ async fn edit_allowed_for_a_descendant_via_id_prefix() {
     tool.dispatch(&ancestor, edit)
         .await
         .expect("an ancestor may manage a descendant's profile");
-    assert_eq!(
-        profiles
-            .get("agent/s1/c2/child-helper")
-            .unwrap()
-            .unwrap()
-            .system_prompt,
-        "edited by ancestor"
-    );
+    // TODO(prompt-arch Lane E): assert the persona edit landed via PersonaStore (SoulGet) once
+    // the tool routes it there (the spec field left the wire at v36); the subtree-ownership
+    // grant above is the behavior this test pins.
 }
 
 #[tokio::test]

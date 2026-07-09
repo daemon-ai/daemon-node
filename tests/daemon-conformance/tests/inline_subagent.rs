@@ -11,7 +11,8 @@
 //! - a **Core** inline sub-agent (custom `system_prompt` + a restricted `tool_allowlist`): the
 //!   durable resolver rebuilds the child's engine from the persisted inline `ProfileSpec` — proven
 //!   by capturing the exact spec the provider resolver is handed at resolution — and the child
-//!   (ephemeral) is reaped (archived) after it completes;
+//!   (ephemeral) is reaped (archived) after it completes (the inline persona no longer maps onto
+//!   `ProfileSpec` since wire v36; Lane E re-proves it through PersonaSource resolution);
 //! - a **Foreign** inline sub-agent (`engine = Foreign { agent }`): the child runs as its ACP agent
 //!   via the `ForeignIncarnation` (its journaled transcript carries the ACP agent's own output);
 //! - a **posture-widening** inline spec (no `tool_allowlist` = the full node toolset): the in-turn
@@ -73,9 +74,11 @@ impl Provider for SpawnSourceProvider {
     }
 }
 
-/// The captured `(id, system_prompt, tool_allowlist)` the provider resolver is handed — the proof an
-/// inline sub-agent's spec reached engine resolution.
-type CapturedSpecs = Arc<Mutex<Vec<(String, String, Option<Vec<String>>)>>>;
+/// The captured `(id, tool_allowlist)` the provider resolver is handed — the proof an inline
+/// sub-agent's spec reached engine resolution.
+// TODO(prompt-arch Lane E): re-capture the inline persona through PersonaSource resolution (it
+// left `ProfileSpec` at wire v36, so the resolver spec no longer carries it).
+type CapturedSpecs = Arc<Mutex<Vec<(String, Option<Vec<String>>)>>>;
 
 /// Assemble a full node wired for inline delegation: a profile store + a capturing provider resolver
 /// (so the dispatching factory + Core resolution are active) and an `orchestrator` provider that
@@ -104,16 +107,15 @@ fn assemble_inline_node(
     providers.register("orchestrator", orchestrator);
 
     // The capturing resolver: records every spec it is handed (the inline child's spec carries the
-    // ad-hoc persona + allowlist), and returns a completing mock so a Core child finishes its turn.
+    // ad-hoc allowlist), and returns a completing mock so a Core child finishes its turn.
     let captured: CapturedSpecs = Arc::new(Mutex::new(Vec::new()));
     let resolver: ProviderResolver = {
         let captured = captured.clone();
         Arc::new(move |spec: &ProfileSpec| {
-            captured.lock().unwrap().push((
-                spec.id.clone(),
-                spec.system_prompt.clone(),
-                spec.tool_allowlist.clone(),
-            ));
+            captured
+                .lock()
+                .unwrap()
+                .push((spec.id.clone(), spec.tool_allowlist.clone()));
             let builder: ProviderBuilder =
                 Arc::new(|| Arc::new(MockProvider::completing("inline done")) as Arc<dyn Provider>);
             builder
@@ -248,17 +250,17 @@ async fn core_inline_subagent_runs_with_inline_config_and_is_reaped_impl() {
         "an ephemeral lifetime yields an EphemeralSubagent (the reaped role)"
     );
 
-    // Positive proof it ran with the INLINE config: the provider resolver was handed a spec keyed by
-    // the child's id carrying the inline persona + the restricted allowlist (the durable resolver
-    // rebuilt the engine from the persisted inline spec).
-    let saw_inline = captured.lock().unwrap().iter().any(|(id, prompt, allow)| {
-        id == child.as_str()
-            && prompt == "you are a haiku bot"
-            && allow.as_deref() == Some(&["fs".to_string()][..])
+    // Positive proof it ran with the INLINE config: the provider resolver was handed a spec keyed
+    // by the child's id carrying the restricted allowlist (the durable resolver rebuilt the engine
+    // from the persisted inline spec).
+    // TODO(prompt-arch Lane E): also re-prove the inline persona reached resolution (via
+    // PersonaSource) — it left `ProfileSpec` at wire v36, so the resolver spec no longer shows it.
+    let saw_inline = captured.lock().unwrap().iter().any(|(id, allow)| {
+        id == child.as_str() && allow.as_deref() == Some(&["fs".to_string()][..])
     });
     assert!(
         saw_inline,
-        "the inline persona + restricted allowlist reached engine resolution; captured: {:?}",
+        "the inline restricted allowlist reached engine resolution; captured: {:?}",
         captured.lock().unwrap()
     );
 

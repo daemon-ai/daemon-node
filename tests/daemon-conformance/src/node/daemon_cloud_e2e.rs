@@ -180,7 +180,6 @@ async fn mount_chat(server: &MockServer, content: &str) {
 fn daemon_cloud_profile(base: &str, model: &str) -> ProfileSpec {
     ProfileSpec {
         base_url: Some(base.to_string()),
-        system_prompt: "You are the Daemon Cloud agent.".into(),
         ..ProfileSpec::new("gateway", ProviderSelector::DaemonApi, model)
     }
 }

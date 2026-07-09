@@ -54,8 +54,7 @@ async fn delivery_sink_push_honors_handover_impl() {
     }
 
     let store = Arc::new(MemProfileStore::new());
-    let mut spec = ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a");
-    spec.system_prompt = "You are alpha.".into();
+    let spec = ProfileSpec::new("alpha", ProviderSelector::GenAi, "model-a");
     store.create(spec).expect("create profile");
     store.set_active("alpha").expect("set active");
 
@@ -265,8 +264,7 @@ async fn delivery_sessions_discovery_and_pull_subscriber_impl() {
 
     let store = Arc::new(MemProfileStore::new());
     for (id, model) in [("alpha", "model-a"), ("beta", "model-b")] {
-        let mut spec = ProfileSpec::new(id, ProviderSelector::GenAi, model);
-        spec.system_prompt = format!("You are {id}.");
+        let spec = ProfileSpec::new(id, ProviderSelector::GenAi, model);
         store.create(spec).expect("create profile");
     }
     store.set_active("alpha").expect("set active");
@@ -534,8 +532,7 @@ async fn routed_profiles_get_isolated_memory_banks_impl() {
     // Two accounts bound to two profiles.
     let store = Arc::new(MemProfileStore::new());
     for (id, model) in [("alpha", "model-a"), ("beta", "model-b")] {
-        let mut spec = ProfileSpec::new(id, ProviderSelector::GenAi, model);
-        spec.system_prompt = format!("You are {id}.");
+        let spec = ProfileSpec::new(id, ProviderSelector::GenAi, model);
         store.create(spec).expect("create profile");
     }
     store.set_active("alpha").expect("set active");
