@@ -34,7 +34,9 @@ impl Engine {
             exec,
             checkpoints: None,
             context: Arc::new(BudgetedContextEngine::default()),
-            assembler: PromptAssembler::default(),
+            composed: None,
+            composed_dirty: false,
+            turn_injection: TurnInjection::default(),
             memory: Vec::new(),
             prompt_sources: Vec::new(),
             next_trigger: None,
@@ -96,8 +98,8 @@ impl Engine {
         self
     }
 
-    /// Register generic stable-tier prompt sources (§10) folded into the system prompt each turn
-    /// (e.g. the skills index). Independent of memory; expected to be cache-stable.
+    /// Register generic stable prompt sources (§10) composed into the system prompt at session
+    /// start (e.g. the skills index). Independent of memory; expected to be cache-stable.
     pub fn with_prompt_sources(mut self, sources: Vec<Arc<dyn StablePromptSource>>) -> Self {
         self.prompt_sources = sources;
         self

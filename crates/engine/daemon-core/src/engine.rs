@@ -10,7 +10,9 @@
 //! deterministic phase boundary (lifecycle §3.1).
 
 use crate::config::Config;
-use crate::context::{BudgetedContextEngine, ContextEngine, PromptAssembler, StablePromptSource};
+use crate::context::{
+    BudgetedContextEngine, ComposedPrompt, ContextEngine, StablePromptSource, TurnInjection,
+};
 use crate::control::{SteerReq, TurnControl};
 use crate::conversation::{AssistantMsg, Conversation, SystemPrompt, ToolTurn, Turn};
 use crate::credentials::{CredentialProvider, EmbeddedCredentialPool};
@@ -130,17 +132,25 @@ pub struct Engine {
     /// The checkpoint store (§12 safety): when set, the pipeline checkpoints the workspace before a
     /// mutating tool runs (rewind via the `Checkpoint{List,Rewind}` control surface). `None` => off.
     checkpoints: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
-    /// The context engine (§10): prompt assembly, budget pressure, and compaction. Defaults to the
-    /// cheap [`BudgetedContextEngine`] (drop-oldest).
+    /// The context engine (§10): prompt composition hooks, budget pressure, and compaction.
+    /// Defaults to the cheap [`BudgetedContextEngine`] (drop-oldest).
     context: Arc<dyn ContextEngine>,
-    /// The tiered prompt assembler (§10) for the current turn; memory (§11) populates its non-body
-    /// tiers at turn start, the call_model phase folds them into the request.
-    assembler: PromptAssembler,
+    /// The session's composed system prompt (§10): built once per session (or restored
+    /// byte-identical from the snapshot) and reused every turn so the provider prefix cache holds.
+    /// Mirrors `snapshot.composed_prompt`. `None` until the session starts.
+    composed: Option<ComposedPrompt>,
+    /// Whether the composition must be rebuilt at the next turn boundary (set by a model switch —
+    /// [`Engine::set_provider`] — so an in-flight turn's prompt cache is never invalidated).
+    composed_dirty: bool,
+    /// The per-turn ephemeral injection (§10/§11): memory recall + nudges, rebuilt each turn and
+    /// appended to the outgoing request's last user message only. Never persisted.
+    turn_injection: TurnInjection,
     /// The registered memory providers (§11). Empty by default — memory is opt-in; the engine drives
     /// their hook order (`recall -> prompt_block -> before_compact -> after_turn`) around each turn.
     memory: Vec<Arc<dyn MemoryProvider>>,
-    /// Generic stable-tier prompt sources (§10), independent of memory — e.g. the skills index.
-    /// Folded into `assembler.stable` each turn; expected to be cache-stable across a conversation.
+    /// Generic stable prompt sources (§10), independent of memory — e.g. the skills index. Captured
+    /// once at composition time into their [`SlotKind`](crate::context::SlotKind) slots; expected to
+    /// be cache-stable across a conversation.
     prompt_sources: Vec<Arc<dyn StablePromptSource>>,
     /// A one-shot override for the next turn's [`TurnTrigger`] (set when a steer opens a turn);
     /// consumed at the start of `run_turn`.
@@ -205,13 +215,15 @@ impl Engine {
     }
 
     /// Swap the model provider this engine calls — a live, per-session model switch. Refreshes the
-    /// §10 context-window denominator from the new provider's [`Capabilities`](crate::provider::Capabilities).
-    /// Intended to take effect at a turn boundary (the actor applies it between turns) so an
-    /// in-flight turn's prompt cache is never invalidated mid-conversation.
+    /// §10 context-window denominator from the new provider's [`Capabilities`](crate::provider::Capabilities)
+    /// and marks the composed prompt dirty so it is **recomposed at the next turn boundary** (the
+    /// actor applies the switch between turns), never mid-turn — an in-flight turn's prompt cache
+    /// is never invalidated mid-conversation.
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
         let info = self.model_info();
         self.context.on_model(&info);
+        self.composed_dirty = true;
     }
 
     /// Set this session's edit-approval [`ApprovalPolicy`](crate::approval::ApprovalPolicy) (the §12
@@ -457,8 +469,9 @@ impl Engine {
                 "engine.model_call.attempt"
             );
             // Rebuilt each attempt: a compaction step rewrites the conversation in place. The §10
-            // assembler folds memory/stable tiers into the system preamble (empty by default).
-            let mut req = self.assembler.assemble(&self.snapshot.conversation, &tools);
+            // composed prompt + per-turn injection are fixed for the turn, so a rebuild is
+            // byte-identical unless compaction changed the body.
+            let mut req = self.assemble(&tools);
             // The scope a turn needs: the `chat` action on this engine's profile.
             let want = CredScope::new([self.profile.as_str()], ["chat"], self.budget.tokens);
             let lease = self
@@ -526,26 +539,109 @@ impl Engine {
         }
     }
 
-    /// §11 `recall` + `prompt_block` gathering into the §10 assembler tiers, in spec order: each
-    /// provider's recall results land in the `recalled` tier and its persistent `prompt_block` in
-    /// the `stable` tier. A no-op when no [`MemoryProvider`](crate::memory::MemoryProvider) is
-    /// registered. The recall query is the latest user message.
-    async fn gather_memory(&mut self) {
+    /// Assemble the outgoing provider [`Request`](crate::provider::Request) for this turn: the
+    /// flattened conversation body, the composed system prompt (byte-stable across turns), the
+    /// per-turn [`TurnInjection`] appended to the last user message (Request-only — the durable
+    /// conversation is never touched), the configured cache TTL, and the `system_and_3` cache
+    /// breakpoints marked **after** the final system string is in place.
+    fn assemble(&self, tools: &[crate::tools::ToolDef]) -> crate::provider::Request {
+        let mut req = crate::provider::build_context(&self.snapshot.conversation, tools);
+        req.system = self
+            .composed
+            .as_ref()
+            .map(ComposedPrompt::render)
+            .unwrap_or_default();
+        self.turn_injection.apply_to_last_user(&mut req);
+        req.cache_ttl = self.config.cache_ttl;
+        crate::provider::mark_cache_breakpoints(&mut req);
+        req
+    }
+
+    /// Build the session's [`ComposedPrompt`] from the current sources (§10) — called only at
+    /// composition boundaries (session start, model switch at a turn boundary), never per turn:
+    ///
+    /// - `Identity`: the conversation's persona/system text (the profile's system prompt today;
+    ///   the persona store's SOUL.md once it lands).
+    /// - `Guidance`: the context engine's [`guidance_block`](ContextEngine::guidance_block) plus
+    ///   every [`StablePromptSource`] routed by its `slot_kind()` (Guidance by default).
+    /// - `SkillsIndex`/`ContextFiles`/`UserProfile`/`Stamp`: prompt sources that override
+    ///   `slot_kind()` (wired by the node integration layer).
+    /// - `MemoryBlock`: each memory provider's persistent `prompt_block`, captured **here** — not
+    ///   per turn — so the system prompt stays byte-stable for the whole session.
+    fn compose(&self) -> ComposedPrompt {
+        let mut builder = ComposedPrompt::builder();
+        builder.push(
+            crate::context::SlotKind::Identity,
+            self.snapshot.conversation.system.text.clone(),
+        );
+        if let Some(guidance) = self.context.guidance_block() {
+            builder.push(crate::context::SlotKind::Guidance, guidance);
+        }
+        for source in &self.prompt_sources {
+            if let Some(block) = source.block() {
+                builder.push(source.slot_kind(), block);
+            }
+        }
+        for provider in &self.memory {
+            if let Some(block) = provider.prompt_block() {
+                builder.push(crate::context::SlotKind::MemoryBlock, block.text);
+            }
+        }
+        builder.build()
+    }
+
+    /// Install the session's composition: restore the stored [`ComposedPrompt`] **byte-identical**
+    /// when one exists for the current model identity (the hermes restore invariant — any byte
+    /// change here would invalidate the provider prefix cache), else compose fresh and persist it
+    /// on the snapshot. A stored composition under a *different* model is stale runtime identity:
+    /// recompose (the live `/model` switch analog).
+    fn restore_or_compose(&mut self) {
+        let model = self.model_info().model;
+        match self.snapshot.composed_prompt.as_ref() {
+            Some(stored) if self.snapshot.composed_model == model => {
+                self.composed = Some(stored.clone());
+            }
+            Some(_) => {
+                tracing::info!(
+                    session = %self.snapshot.session_id,
+                    stored_model = %self.snapshot.composed_model,
+                    model = %model,
+                    "stored composed prompt has stale runtime identity; recomposing"
+                );
+                self.recompose(model);
+            }
+            None => self.recompose(model),
+        }
+        self.composed_dirty = false;
+    }
+
+    /// Compose fresh under `model` and persist the result on the durable snapshot.
+    fn recompose(&mut self, model: String) {
+        let composed = self.compose();
+        self.snapshot.composed_prompt = Some(composed.clone());
+        self.snapshot.composed_model = model;
+        self.composed = Some(composed);
+    }
+
+    /// §11 per-turn `recall` gathering into the [`TurnInjection`] (never the system prompt): each
+    /// provider's recall block, in provider order. A no-op (empty) when no
+    /// [`MemoryProvider`](crate::memory::MemoryProvider) is registered. The recall query is the
+    /// latest user message.
+    async fn gather_recall(&self) -> Vec<String> {
         if self.memory.is_empty() {
-            return;
+            return Vec::new();
         }
         let query = RecallQuery {
             text: self.latest_user_text(),
             top_k: 5,
         };
+        let mut recalled = Vec::new();
         for provider in &self.memory {
             if let Some(block) = provider.recall(&query).await {
-                self.assembler.recalled.push(block.text);
-            }
-            if let Some(block) = provider.prompt_block() {
-                self.assembler.stable.push(block.text);
+                recalled.push(block.text);
             }
         }
+        recalled
     }
 
     /// The most recent user message text (the salient §11 recall query); empty if none.
@@ -611,10 +707,11 @@ impl Engine {
     }
 
     /// Fire the once-per-incarnation §10/§11 lifecycle hooks before the first turn does any work:
-    /// `context.on_model` -> `context.on_session_start` -> `memory.on_session_switch(Start|Resume)`.
-    /// Idempotent — a no-op on every turn after the first. `resuming` reflects whether this
-    /// incarnation re-activated on a background completion (so the boundary is a `Resume`, not a
-    /// fresh `Start`).
+    /// `context.on_model` -> `context.on_session_start` -> `memory.on_session_switch(Start|Resume)`,
+    /// then install the session's composed prompt (restored byte-identical from the snapshot, or
+    /// composed fresh — the composition boundary). Idempotent — a no-op on every turn after the
+    /// first. `resuming` reflects whether this incarnation re-activated on a background completion
+    /// (so the boundary is a `Resume`, not a fresh `Start`).
     async fn ensure_session_started(&mut self, resuming: bool) {
         if self.lifecycle_started {
             return;
@@ -629,6 +726,7 @@ impl Engine {
             SwitchReason::Start
         };
         self.notify_session_switch(reason).await;
+        self.restore_or_compose();
     }
 
     /// End the session: notify the §10 context engine and §11 memory providers so they can flush /
@@ -649,23 +747,23 @@ impl Engine {
         self.notify_session_switch(SwitchReason::End).await;
     }
 
-    /// §10/§11 pre-turn hooks (run once before the ReAct loop): re-gather memory recall/blocks into
-    /// the §10 [`PromptAssembler`] tiers, then measure budget [`Pressure`](crate::context::Pressure)
+    /// §10/§11 pre-turn hooks (run once before the ReAct loop): recompose the system prompt if a
+    /// model switch marked it dirty (the turn-boundary recomposition), gather per-turn memory
+    /// recall into the [`TurnInjection`], then measure budget [`Pressure`](crate::context::Pressure)
     /// and proactively compact when over the configured budget (`memory.before_compact` ->
-    /// `ctx.compact`). Memory population is a no-op until a [`MemoryProvider`](crate::memory::MemoryProvider)
+    /// `ctx.compact`). Recall is a no-op until a [`MemoryProvider`](crate::memory::MemoryProvider)
     /// is registered.
     async fn prepare_turn_context(&mut self, events: &EventSink) {
-        self.assembler.reset_turn();
-        self.gather_memory().await;
-        // §10 generic stable-tier blocks (e.g. the skills index), folded after memory blocks. Each
-        // source is expected to be cache-stable so the system prompt stays byte-stable across turns.
-        for source in &self.prompt_sources {
-            if let Some(block) = source.block() {
-                if !block.is_empty() {
-                    self.assembler.stable.push(block);
-                }
-            }
+        if self.composed_dirty {
+            // A model switch invalidated the composition: rebuild it at this turn boundary (never
+            // mid-turn) under the new model identity.
+            self.recompose(self.model_info().model);
+            self.composed_dirty = false;
         }
+        self.turn_injection = TurnInjection {
+            recalled: self.gather_recall().await,
+            nudges: Vec::new(),
+        };
         let budget = self.config.context_budget_tokens.map(|b| b as usize);
         // `before_turn` may sanitize the provider-facing conversation in place (LCM active-replay
         // redaction/quarantine) in addition to measuring pressure.
@@ -822,6 +920,9 @@ impl Engine {
             "daemon.usage.api_calls" = tracing::field::Empty,
             "daemon.turn.end_reason" = tracing::field::Empty,
         );
+        // Telemetry identity records the persona (`conversation.system`) only — the full composed
+        // prompt is intentionally not logged here (it can be large and is composed after this
+        // point on the first turn; per-slot attribution lives in `ComposedPrompt::report`).
         #[cfg(feature = "otel")]
         crate::genai_telemetry::record_turn_identity(
             &span,
@@ -908,8 +1009,9 @@ impl Engine {
             // §10/§11 once-per-incarnation lifecycle hooks before the first turn's work.
             self.ensure_session_started(resuming).await;
 
-            // §11/§10 pre-turn hooks: gather memory recall/blocks into the assembler, then measure
-            // budget pressure and compact if over budget (memory.before_compact -> ctx.compact).
+            // §11/§10 pre-turn hooks: recompose on a model switch, gather memory recall into the
+            // turn injection, then measure budget pressure and compact if over budget
+            // (memory.before_compact -> ctx.compact).
             let context_session = self.snapshot.session_id.clone();
             let context_epoch = self.snapshot.epoch.0;
             let context_span = tracing::debug_span!(

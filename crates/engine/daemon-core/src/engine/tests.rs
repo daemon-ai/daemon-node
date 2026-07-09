@@ -112,6 +112,389 @@ async fn prompt_source_block_is_injected_into_system() {
     );
 }
 
+/// A provider that records every full [`Request`] it receives, then completes.
+struct RequestRecordingProvider {
+    seen: std::sync::Mutex<Vec<Request>>,
+}
+
+impl RequestRecordingProvider {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+    fn systems(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.system.clone())
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for RequestRecordingProvider {
+    fn capabilities(&self) -> Capabilities {
+        test_caps()
+    }
+    async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+        self.seen.lock().unwrap().push(req);
+        Ok(ok_output("ok"))
+    }
+}
+
+/// A stable prompt source whose block can be mutated mid-session (to prove edits do NOT leak into
+/// the composed prompt until the next composition boundary).
+struct MutableBlock(Arc<std::sync::Mutex<String>>);
+impl crate::context::StablePromptSource for MutableBlock {
+    fn block(&self) -> Option<String> {
+        Some(self.0.lock().unwrap().clone())
+    }
+}
+
+/// A memory provider with per-turn recall and no persistent block.
+struct RecallOnlyMemory;
+#[async_trait::async_trait]
+impl MemoryProvider for RecallOnlyMemory {
+    fn name(&self) -> &str {
+        "recall-only"
+    }
+    async fn recall(&self, _q: &RecallQuery) -> Option<crate::memory::RecalledBlock> {
+        Some(crate::memory::RecalledBlock {
+            text: "RECALLED-XYZ".into(),
+        })
+    }
+}
+
+/// `Request.system` is byte-equal across turns — with a stable source, memory (block + per-turn
+/// recall), and even a mid-session source edit in play. The core cache regression: recall lands in
+/// the turn injection and source edits wait for the next composition boundary, so the system
+/// string never moves.
+#[tokio::test]
+async fn request_system_is_byte_stable_across_turns() {
+    let provider = RequestRecordingProvider::new();
+    let block = Arc::new(std::sync::Mutex::new("stable guidance v1".to_string()));
+    let mut engine = Engine::fresh(
+        SessionId::new("stable-sys"),
+        SystemPrompt::new("persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_prompt_sources(vec![Arc::new(MutableBlock(block.clone()))])
+    .with_memory(vec![
+        Arc::new(crate::memory::FileMemory::from_snapshot(
+            "the deploy key lives in vault",
+        )),
+        Arc::new(RecallOnlyMemory),
+    ]);
+
+    for turn in 0..3 {
+        engine.push_user(UserMsg::new(format!("about the deploy key, turn {turn}")));
+        engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+        // A mid-session source edit after the first turn must NOT leak into the system prompt
+        // (edits take effect at the next composition boundary — the hermes cache invariant).
+        *block.lock().unwrap() = format!("EDITED mid-session after turn {turn}");
+    }
+
+    let systems = provider.systems();
+    assert_eq!(systems.len(), 3);
+    assert_eq!(systems[0].as_bytes(), systems[1].as_bytes());
+    assert_eq!(systems[1].as_bytes(), systems[2].as_bytes());
+    assert!(systems[0].contains("persona"));
+    assert!(systems[0].contains("stable guidance v1"));
+    assert!(systems[0].contains("# Memory"), "memory block composed");
+    assert!(
+        !systems[0].contains("RECALLED-XYZ"),
+        "per-turn recall never reaches the system string"
+    );
+}
+
+/// The stable tier appears exactly once no matter how many turns run — the confirmed
+/// duplication defect (`prepare_turn_context` re-pushing into `assembler.stable` every turn) is
+/// structurally impossible now that composition happens once per session.
+#[tokio::test]
+async fn stable_tier_not_duplicated_across_turns() {
+    let provider = RequestRecordingProvider::new();
+    let mut engine = Engine::fresh(
+        SessionId::new("no-dup"),
+        SystemPrompt::new("persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_prompt_sources(vec![Arc::new(FixedBlock("UNIQUE-STABLE-BLOCK"))])
+    .with_memory(vec![Arc::new(crate::memory::FileMemory::from_snapshot(
+        "one memory paragraph",
+    ))]);
+
+    for i in 0..3 {
+        engine.push_user(UserMsg::new(format!("turn {i}")));
+        engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+    }
+    let last = provider.systems().pop().unwrap();
+    assert_eq!(
+        last.matches("UNIQUE-STABLE-BLOCK").count(),
+        1,
+        "stable block folded exactly once after 3 turns: {last}"
+    );
+    assert_eq!(
+        last.matches("one memory paragraph").count(),
+        1,
+        "memory block folded exactly once after 3 turns: {last}"
+    );
+}
+
+/// A restored session reuses the stored composed prompt **byte-identical** — even when a prompt
+/// source changed between incarnations (the hermes `test_restored_prompt_is_byte_identical_to_
+/// stored` invariant: any byte-level change here would invalidate the provider prefix cache; the
+/// edit takes effect at the next fresh session instead).
+#[tokio::test]
+async fn composed_prompt_restored_byte_identical_on_resume() {
+    // First incarnation: compose under source v1 and capture the durable snapshot.
+    let mut engine = Engine::fresh(
+        SessionId::new("restore"),
+        SystemPrompt::new("persona"),
+        Arc::new(TextProvider),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_prompt_sources(vec![Arc::new(FixedBlock("source v1"))]);
+    engine.push_user(UserMsg::new("hi"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    let snapshot = engine.snapshot().clone();
+    let stored = snapshot
+        .composed_prompt
+        .as_ref()
+        .expect("composition persisted on the snapshot")
+        .render();
+
+    // Second incarnation, rebuilt from the snapshot with a CHANGED source.
+    let provider = RequestRecordingProvider::new();
+    let mut restored =
+        Engine::from_snapshot(snapshot, provider.clone(), Arc::new(ToolRegistry::new()))
+            .with_prompt_sources(vec![Arc::new(FixedBlock("source v2 CHANGED"))]);
+    restored.push_user(UserMsg::new("again"));
+    restored
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    let seen = provider.systems().pop().unwrap();
+    assert_eq!(
+        seen.as_bytes(),
+        stored.as_bytes(),
+        "restored system prompt must be byte-identical to the stored composition"
+    );
+    assert!(seen.contains("source v1"), "the stored bytes win");
+    assert!(!seen.contains("source v2 CHANGED"), "no rebuild on resume");
+}
+
+/// A stored composition under a *different* model identity is stale — the restore path recomposes
+/// fresh (the live `/model`-switch analog of hermes' stale-runtime-identity rebuild).
+#[tokio::test]
+async fn stale_model_identity_recomposes_on_restore() {
+    let mut engine = Engine::fresh(
+        SessionId::new("stale-id"),
+        SystemPrompt::new("persona"),
+        Arc::new(TextProvider),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_prompt_sources(vec![Arc::new(FixedBlock("source v1"))]);
+    engine.push_user(UserMsg::new("hi"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    let mut snapshot = engine.snapshot().clone();
+    // Simulate a composition stored under a previous model identity.
+    snapshot.composed_model = "some-older-model".into();
+
+    let provider = RequestRecordingProvider::new();
+    let mut restored =
+        Engine::from_snapshot(snapshot, provider.clone(), Arc::new(ToolRegistry::new()))
+            .with_prompt_sources(vec![Arc::new(FixedBlock("source v2 CHANGED"))]);
+    restored.push_user(UserMsg::new("again"));
+    restored
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    let seen = provider.systems().pop().unwrap();
+    assert!(
+        seen.contains("source v2 CHANGED"),
+        "stale identity must rebuild from current sources: {seen}"
+    );
+    assert!(!seen.contains("source v1"));
+    assert_eq!(
+        restored.snapshot().composed_model,
+        "default",
+        "the rebuilt composition records the current model identity"
+    );
+}
+
+/// A model switch (`set_provider`) recomposes at the NEXT turn boundary — never mid-turn: the
+/// turn before the switch keeps its bytes, the turn after reflects re-read sources.
+#[tokio::test]
+async fn model_switch_recomposes_at_turn_boundary() {
+    let provider = RequestRecordingProvider::new();
+    let block = Arc::new(std::sync::Mutex::new("composed-at-start".to_string()));
+    let mut engine = Engine::fresh(
+        SessionId::new("model-switch"),
+        SystemPrompt::new("persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_prompt_sources(vec![Arc::new(MutableBlock(block.clone()))]);
+
+    engine.push_user(UserMsg::new("one"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    // A source edit alone does NOT recompose…
+    *block.lock().unwrap() = "composed-after-switch".to_string();
+    engine.push_user(UserMsg::new("two"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    // …but a model switch marks the composition dirty and the next turn boundary rebuilds it.
+    engine.set_provider(provider.clone());
+    engine.push_user(UserMsg::new("three"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    let systems = provider.systems();
+    assert!(systems[0].contains("composed-at-start"));
+    assert_eq!(
+        systems[0].as_bytes(),
+        systems[1].as_bytes(),
+        "no recompose without a boundary"
+    );
+    assert!(
+        systems[2].contains("composed-after-switch"),
+        "the switch recomposed at the turn boundary: {}",
+        systems[2]
+    );
+}
+
+/// Per-turn recall reaches ONLY the outgoing request's last user message: the durable
+/// conversation keeps the user's original text (deep-copy semantics — the request is built from
+/// the conversation, never the other way around) and the system string stays recall-free.
+#[tokio::test]
+async fn turn_injection_reaches_request_not_conversation_or_system() {
+    let provider = RequestRecordingProvider::new();
+    let mut engine = Engine::fresh(
+        SessionId::new("injection"),
+        SystemPrompt::new("persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_memory(vec![Arc::new(RecallOnlyMemory)]);
+
+    engine.push_user(UserMsg::new("plain user text"));
+    engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+
+    let req = provider.seen.lock().unwrap().pop().unwrap();
+    let last_user = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        last_user.content, "plain user text\n\nRECALLED-XYZ",
+        "recall appended to the outgoing request's last user message"
+    );
+    assert!(!req.system.contains("RECALLED-XYZ"));
+    // The durable conversation is untouched by the injection.
+    let user_turns: Vec<&str> = engine
+        .snapshot()
+        .conversation
+        .turns
+        .iter()
+        .filter_map(|t| match t {
+            Turn::User(u) => Some(u.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(user_turns, vec!["plain user text"]);
+}
+
+/// An internal-role-shaped session (no prompt sources, no memory — the curator/reviewer profile)
+/// stays byte-stable across turns too (the hermes background-review cache-parity behavior).
+#[tokio::test]
+async fn internal_role_session_stays_byte_stable() {
+    let provider = RequestRecordingProvider::new();
+    let mut engine = Engine::fresh(
+        SessionId::new("internal-role"),
+        SystemPrompt::new("reviewer persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    );
+    for i in 0..2 {
+        engine.push_user(UserMsg::new(format!("review {i}")));
+        engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+    }
+    let systems = provider.systems();
+    assert_eq!(systems[0].as_bytes(), systems[1].as_bytes());
+    assert_eq!(systems[0], "reviewer persona");
+}
+
+/// The engine marks `system_and_3` breakpoints on the outgoing request after the composed system
+/// is folded: `cache_system` reflects the FINAL system string and the trailing messages carry the
+/// message-level markers with the configured TTL.
+#[tokio::test]
+async fn assembled_request_carries_post_fold_breakpoints_and_ttl() {
+    let provider = RequestRecordingProvider::new();
+    let mut engine = Engine::fresh(
+        SessionId::new("breakpoints"),
+        SystemPrompt::new("persona"),
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+    )
+    .with_config(Config {
+        cache_ttl: crate::provider::CacheTtl::OneHour,
+        ..Config::default()
+    });
+    for i in 0..3 {
+        engine.push_user(UserMsg::new(format!("turn {i}")));
+        engine
+            .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+            .await
+            .unwrap();
+    }
+    let req = provider.seen.lock().unwrap().pop().unwrap();
+    assert!(req.cache_system, "the final composed system is cached");
+    assert_eq!(req.cache_ttl, crate::provider::CacheTtl::OneHour);
+    let marked = req.messages.iter().filter(|m| m.cache_breakpoint).count();
+    assert_eq!(marked, 3, "the last 3 messages carry breakpoints");
+    let n = req.messages.len();
+    assert!(
+        req.messages[n - 3..].iter().all(|m| m.cache_breakpoint),
+        "the marked messages are the trailing three"
+    );
+}
+
 /// With `memory_review_interval = 1`, a completed turn (no memory write) fires exactly one
 /// fire-and-forget `memory_review` spawn and the turn still completes normally (no suspend).
 #[tokio::test]
@@ -972,10 +1355,10 @@ impl MemoryProvider for RecordingMemory {
 }
 
 /// The §10/§11 hooks fire in spec order across an incarnation: the once-per-incarnation
-/// lifecycle hooks (`on_model -> session_start -> switch:start`) precede the per-turn hooks
-/// (`recall -> prompt_block -> before_turn -> before_compact -> compact -> switch:compaction ->
-/// after_turn -> after_response`), and `end_session` fires the teardown hooks
-/// (`session_end -> switch:end`).
+/// lifecycle hooks (`on_model -> session_start -> switch:start -> prompt_block`, the last being
+/// the composition-time memory-block capture) precede the per-turn hooks
+/// (`recall -> before_turn -> before_compact -> compact -> switch:compaction -> after_turn ->
+/// after_response`), and `end_session` fires the teardown hooks (`session_end -> switch:end`).
 #[tokio::test]
 async fn memory_and_context_hooks_fire_in_spec_order() {
     let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
@@ -1007,8 +1390,10 @@ async fn memory_and_context_hooks_fire_in_spec_order() {
             "on_model",
             "session_start",
             "switch:start",
-            "recall",
+            // `prompt_block` is captured at composition time (once per session), no longer per
+            // turn — the composed system prompt must stay byte-stable across the session.
             "prompt_block",
+            "recall",
             "before_turn",
             "before_compact",
             "compact",

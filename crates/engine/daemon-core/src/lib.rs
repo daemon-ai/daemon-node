@@ -60,8 +60,9 @@ pub use command::{
 };
 pub use config::Config;
 pub use context::{
-    estimate_tokens, BudgetedContextEngine, ContextEngine, ContextStrategy, ModelInfo, Pressure,
-    PromptAssembler, StablePromptSource,
+    estimate_tokens, BudgetedContextEngine, ComposedPrompt, ComposedPromptBuilder, ContextEngine,
+    ContextStrategy, ModelInfo, Pressure, Slot, SlotKind, SlotReport, StablePromptSource,
+    TurnInjection,
 };
 pub use control::{SteerReq, TurnControl};
 pub use conversation::{
@@ -88,9 +89,10 @@ pub use profile::{
     ProviderBuilder,
 };
 pub use provider::{
-    build_context, Capabilities, Failure, MockProvider, ModelOutput, Provider, ProviderRegistry,
-    Recovery, Request, RequestImage, RequestMsg, RequestParams, ResponseMeta, ScriptStep,
-    ScriptedProvider, StreamEvent, ToolCallFormat, UnconfiguredProvider,
+    build_context, mark_cache_breakpoints, CacheTtl, Capabilities, Failure, MockProvider,
+    ModelOutput, Provider, ProviderRegistry, Recovery, Request, RequestImage, RequestMsg,
+    RequestParams, ResponseMeta, ScriptStep, ScriptedProvider, StreamEvent, ToolCallFormat,
+    UnconfiguredProvider,
 };
 pub use recovery::{classify_api_error, drive_model_call, ModelCallPolicy, RecoveryStep};
 pub use repair::{

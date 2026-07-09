@@ -12,8 +12,9 @@
 //! store) compose without re-shaping the loop. The engine holds `Vec<Arc<dyn MemoryProvider>>`
 //! (empty by default — memory is opt-in) and drives the §11 hook order:
 //!
-//! `recall -> prompt_block (into the stable tier) -> before_compact -> compact -> assemble ->
-//!  after_turn -> after_response`.
+//! `recall (per-turn, into the TurnInjection) -> before_compact -> compact -> assemble ->
+//!  after_turn -> after_response`, with `prompt_block` captured once at prompt composition
+//! (session start / model switch), not per turn.
 //!
 //! Design notes (the seam is deliberately narrow):
 //! - A provider **owns its recall**: it ranks/formats internally and returns one [`RecalledBlock`]
@@ -58,15 +59,17 @@ pub enum SwitchReason {
     Manual,
 }
 
-/// A persistent block a provider injects into the **stable** prompt tier every turn (§11).
+/// A persistent block a provider contributes to the composed system prompt's MemoryBlock slot
+/// (§11), captured once per session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptBlock {
     /// The block text.
     pub text: String,
 }
 
-/// A block a provider recalls into the **recalled** prompt tier for one turn (§11) — already ranked
-/// and formatted by the provider, ready to inject.
+/// A block a provider recalls for one turn (§11), delivered via the per-turn
+/// [`TurnInjection`](crate::context::TurnInjection) — already ranked and formatted by the
+/// provider, ready to inject.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecalledBlock {
     /// The formatted recall text to inject into the prompt.
@@ -79,7 +82,9 @@ pub trait MemoryProvider: Send + Sync {
     /// A stable identifier (for diagnostics / dedup).
     fn name(&self) -> &str;
 
-    /// A persistent block injected into the stable prompt tier every turn (`None` = no block).
+    /// A persistent block composed into the system prompt's MemoryBlock slot (`None` = no block).
+    /// Captured once at composition time (session start / model switch) — it must be stable for
+    /// the life of a session so the composed prefix stays byte-stable.
     fn prompt_block(&self) -> Option<PromptBlock> {
         None
     }

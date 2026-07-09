@@ -9,6 +9,7 @@
 //! ([`SnapshotBlob`](daemon_common::SnapshotBlob)) so the durable substrate stays engine-agnostic.
 
 use crate::approval::ApprovalPolicy;
+use crate::context::ComposedPrompt;
 use crate::conversation::{Conversation, ToolCall};
 use daemon_common::{DaemonError, Epoch, JobId, SessionId, SnapshotBlob};
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,18 @@ pub struct Snapshot {
     /// [`Snapshot::decode`] warns (but still decodes) when a snapshot was written by a newer build.
     #[serde(default)]
     pub writer_version: String,
+    /// The session's [`ComposedPrompt`] (§10), stored so a resumed/rehydrated incarnation restores
+    /// the composed system prompt **byte-identical** (the hermes cache invariant: any byte-level
+    /// change at this point invalidates the provider prefix cache). `None` until the session's
+    /// first composition. `#[serde(default)]` keeps pre-existing snapshots decodable.
+    #[serde(default)]
+    pub composed_prompt: Option<ComposedPrompt>,
+    /// The model identity [`Snapshot::composed_prompt`] was composed under (the stale-runtime-
+    /// identity guard): a restore under a *different* model recomposes instead of reusing the
+    /// stored bytes. Empty until the first composition. `#[serde(default)]` keeps pre-existing
+    /// snapshots decodable.
+    #[serde(default)]
+    pub composed_model: String,
 }
 
 /// A gated tool call parked for a durable human-in-the-loop decision (§12). Persisted on the
@@ -141,6 +154,8 @@ impl Snapshot {
             pending_approvals: Vec::new(),
             session_allow_fingerprints: Vec::new(),
             writer_version: String::new(),
+            composed_prompt: None,
+            composed_model: String::new(),
         }
     }
 
@@ -222,6 +237,36 @@ mod tests {
         // Cluster B / allow_permanent: the allow-list defaults to empty on a pre-field blob.
         assert!(decoded.session_allow_fingerprints.is_empty());
         assert_eq!(decoded.iters_since_skill, 0);
+        // §10 composition: pre-field blobs default to "not composed yet".
+        assert!(decoded.composed_prompt.is_none());
+        assert!(decoded.composed_model.is_empty());
+    }
+
+    /// The §10 composed prompt survives the durable encode/decode round-trip **byte-identical**
+    /// (the restore invariant: any byte change would invalidate the provider prefix cache).
+    #[test]
+    fn round_trips_the_composed_prompt_byte_identical() {
+        let mut builder = crate::context::ComposedPrompt::builder();
+        builder.push(crate::context::SlotKind::Identity, "persona ☤ 🦊");
+        builder.push(crate::context::SlotKind::Guidance, "guide\nlines");
+        let composed = builder.build();
+        let rendered = composed.render();
+
+        let mut snap = Snapshot::fresh(SessionId::new("s-composed"));
+        snap.composed_prompt = Some(composed);
+        snap.composed_model = "profile-x".into();
+        let blob = snap.encode().unwrap();
+        let decoded = Snapshot::decode(&blob).unwrap();
+        assert_eq!(decoded.composed_model, "profile-x");
+        assert_eq!(
+            decoded
+                .composed_prompt
+                .expect("composition survives")
+                .render()
+                .as_bytes(),
+            rendered.as_bytes(),
+            "the restored composition renders the identical bytes"
+        );
     }
 
     /// Cluster B / allow_permanent: the per-session command allow-list survives the durable

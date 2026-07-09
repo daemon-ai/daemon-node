@@ -83,7 +83,8 @@ pub struct EngineProfile {
     context_builder: Option<ContextEngineBuilder>,
     memory: Vec<Arc<dyn MemoryProvider>>,
     memory_builder: Option<MemoryBuilder>,
-    /// Generic stable-tier prompt sources (§10), e.g. the skills index — independent of memory.
+    /// Generic stable prompt sources (§10), e.g. the skills index — independent of memory;
+    /// composed into the system prompt once per session.
     prompt_sources: Vec<Arc<dyn StablePromptSource>>,
     /// The §12 tool-checkpoint store every engine this profile builds records pre-mutation
     /// checkpoints into (shared across sessions; rewound via the control surface). `None` => off.
@@ -209,7 +210,7 @@ impl EngineProfile {
         self
     }
 
-    /// Register a generic stable-tier prompt source (§10) folded into the system prompt of every
+    /// Register a generic stable prompt source (§10) composed into the system prompt of every
     /// engine this profile builds — the seam the skills *index* uses (cache-stable; full bodies load
     /// on demand via `skill_view`). Independent of memory.
     pub fn with_prompt_block(mut self, source: Arc<dyn StablePromptSource>) -> Self {
