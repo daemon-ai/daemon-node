@@ -368,3 +368,63 @@ impl LcmConfig {
         caps.into_iter().min().map(|c| c.max(1))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Wave 2 theme 6: config defaults ------------------------------------------------------
+
+    // PARITY: hermes-lcm tests/test_lcm_core.py::TestConfig::test_defaults
+    // The Rust crate reads no environment (the node injects config), so the `from_env` family is
+    // out-of-scope; the Appendix-A default surface must still match the Python `LCMConfig()`.
+    #[test]
+    fn config_defaults_match_python() {
+        let c = LcmConfig::default();
+        assert_eq!(c.fresh_tail_count, 32);
+        assert_eq!(c.leaf_chunk_tokens, 20_000);
+        assert_eq!(c.context_threshold, 0.35);
+        assert_eq!(c.incremental_max_depth, 3);
+        assert_eq!(c.condensation_fanin, 4);
+        assert!(!c.dynamic_leaf_chunk_enabled);
+        assert_eq!(c.dynamic_leaf_chunk_max, 40_000);
+        assert!(!c.cache_friendly_condensation_enabled);
+        assert_eq!(c.cache_friendly_min_debt_groups, 2);
+        assert_eq!(c.custom_instructions, "");
+        assert!(!c.extraction_enabled);
+        assert_eq!(c.extraction_model, "");
+        assert_eq!(c.extraction_output_path, "");
+        assert!(!c.sensitive_patterns_enabled);
+        assert_eq!(
+            c.sensitive_patterns,
+            vec![
+                "api_key".to_string(),
+                "bearer_token".to_string(),
+                "password_assignment".to_string(),
+                "private_key".to_string(),
+            ]
+        );
+        assert_eq!(c.sensitive_patterns_source, "default");
+        assert!(!c.large_output_externalization_enabled);
+        assert_eq!(c.large_output_externalization_threshold_chars, 12_000);
+        assert_eq!(c.large_output_externalization_path, "");
+        assert!(!c.large_output_transcript_gc_enabled);
+        assert!(!c.deferred_maintenance_enabled);
+        assert_eq!(c.deferred_maintenance_max_passes, 4);
+        assert_eq!(c.critical_budget_pressure_ratio, 0.0);
+        assert!(c.ignore_session_patterns.is_empty());
+        assert!(c.stateless_session_patterns.is_empty());
+        assert!(c.ignore_message_patterns.is_empty());
+        assert_eq!(c.ignore_session_patterns_source, "default");
+        assert_eq!(c.stateless_session_patterns_source, "default");
+        assert_eq!(c.ignore_message_patterns_source, "default");
+        assert_eq!(c.summary_model, "");
+        assert!(c.summary_fallback_models.is_empty());
+        assert_eq!(c.summary_circuit_breaker_failure_threshold, 2);
+        assert_eq!(c.summary_circuit_breaker_cooldown_seconds, 300);
+        assert_eq!(c.expansion_model, "");
+        assert_eq!(c.expansion_context_tokens, 32_000);
+        assert_eq!(c.summary_timeout_ms, 60_000);
+        assert_eq!(c.expansion_timeout_ms, 120_000);
+    }
+}
