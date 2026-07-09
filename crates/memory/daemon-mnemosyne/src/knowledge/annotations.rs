@@ -211,4 +211,57 @@ mod tests {
         assert!(kept.iter().any(|a| a.value == "Acme"));
         assert!(!kept.iter().any(|a| a.value == "System"));
     }
+
+    // PARITY: Mnemosyne tests/test_annotations.py::TestAnnotationStoreMultiValuePreservation::test_multiple_mentions_for_one_memory_preserved
+    // The E6 contract: multiple values under one (memory_id, kind) are append-only — no sibling
+    // auto-invalidation (the TripleStore bug this store fixes).
+    #[test]
+    fn multiple_values_for_one_memory_kind_are_preserved() {
+        let store = Store::open_in_memory().unwrap();
+        let c = store.conn.lock().unwrap();
+        add(&c, "mem-1", "mentions", "Alice", "", 1.0).unwrap();
+        add(&c, "mem-1", "mentions", "Bob", "", 1.0).unwrap();
+        add(&c, "mem-1", "mentions", "Charlie", "", 1.0).unwrap();
+        let vals: std::collections::HashSet<String> =
+            query_by_memory(&c, "mem-1", Some("mentions"))
+                .unwrap()
+                .into_iter()
+                .map(|a| a.value)
+                .collect();
+        assert_eq!(
+            vals,
+            ["Alice", "Bob", "Charlie"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+    }
+
+    // PARITY: Mnemosyne tests/test_annotations.py::TestAnnotationStoreMultiValuePreservation::test_add_returns_row_id
+    #[test]
+    fn add_returns_distinct_row_ids() {
+        let store = Store::open_in_memory().unwrap();
+        let c = store.conn.lock().unwrap();
+        let id1 = add(&c, "mem-1", "mentions", "Alice", "", 1.0).unwrap();
+        let id2 = add(&c, "mem-1", "mentions", "Bob", "", 1.0).unwrap();
+        assert_ne!(id1, id2);
+        assert!(id1 > 0 && id2 > 0);
+    }
+
+    // PARITY: Mnemosyne tests/test_annotations.py::TestAnnotationStoreQueries::test_query_by_memory_with_kind_filter
+    #[test]
+    fn query_by_memory_filters_by_kind() {
+        let store = Store::open_in_memory().unwrap();
+        let c = store.conn.lock().unwrap();
+        add(&c, "mem-1", "mentions", "Alice", "", 1.0).unwrap();
+        add(&c, "mem-1", "mentions", "Bob", "", 1.0).unwrap();
+        add(&c, "mem-1", "fact", "Some fact about mem-1 here", "", 1.0).unwrap();
+        assert_eq!(query_by_memory(&c, "mem-1", None).unwrap().len(), 3);
+        assert_eq!(
+            query_by_memory(&c, "mem-1", Some("mentions"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 }
