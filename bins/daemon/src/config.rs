@@ -1295,6 +1295,107 @@ pub struct TelemetryConfig {
     pub feedback_endpoint: Option<String>,
 }
 
+/// The prompt-architecture composition policy (`[prompt]` / `DAEMON_PROMPT__*`, hermes parity):
+/// which guidance blocks compose into every engine's system prompt, the content caps, the USER.md
+/// surface, and the prompt-cache TTL override. Defaults mirror hermes (everything on, hermes
+/// caps). Persona/user-profile STORES follow the store backend (`persist_providers`): an
+/// ephemeral (memory-store) node runs on the built-in role personas with no SOUL.md/USER.md.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptConfig {
+    /// The prompt-cache TTL override: `"5m"` (the default tier) or `"1h"` (the extended tier).
+    /// PRECEDENCE: when set this wins over `engine.cache_ttl`; unset (`None`) leaves
+    /// `engine.cache_ttl` governing. Anything unrecognized falls back to the 5-minute default.
+    pub cache_ttl: Option<String>,
+    /// Compose the always-on core agentic / task-completion guidance block.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub core_guidance: bool,
+    /// Tool-use enforcement gating: `"auto"` (registry non-empty AND the model family is on the
+    /// enforcement list), `"on"` (whenever tools exist), or `"off"`.
+    pub tool_use_guidance: String,
+    /// Compose the model-family operational guidance block (keyed on the live model id).
+    #[serde(with = "daemon_common::flex_bool")]
+    pub model_guidance: bool,
+    /// Compose the environment-hints block (host OS / home / workspace cwd).
+    #[serde(with = "daemon_common::flex_bool")]
+    pub environment_hints: bool,
+    /// Compose the per-session transport (surface) hint for routed sessions.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub transport_hints: bool,
+    /// Compose the date-only stamp.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub date_stamp: bool,
+    /// Load workspace context files (DAEMON.md > AGENTS.md > CLAUDE.md > .cursorrules) into the
+    /// composed prompt, and track mid-session subdirectory hints.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub context_files: bool,
+    /// The per-source context-file character cap (head/tail truncation past it).
+    pub context_file_max_chars: usize,
+    /// The persona (SOUL.md / inline persona) character cap.
+    pub persona_cap: usize,
+    /// The USER.md surface: the per-profile store, the `user_profile` tool, the composed
+    /// UserProfile slot, and the save nudge.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub user_profile: bool,
+    /// The USER.md whole-store character cap (hermes `user_char_limit`).
+    pub user_profile_char_limit: usize,
+    /// Fire the USER.md save nudge every N user turns (`0` disables; hermes
+    /// `memory.nudge_interval`).
+    pub nudge_interval: u32,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            cache_ttl: None,
+            core_guidance: true,
+            tool_use_guidance: "auto".into(),
+            model_guidance: true,
+            environment_hints: true,
+            transport_hints: true,
+            date_stamp: true,
+            context_files: true,
+            context_file_max_chars: daemon_prompt::CONTEXT_FILE_MAX_CHARS,
+            persona_cap: daemon_prompt::DEFAULT_PERSONA_CAP,
+            user_profile: true,
+            user_profile_char_limit: daemon_prompt::DEFAULT_USER_CAP,
+            nudge_interval: 10,
+        }
+    }
+}
+
+impl PromptConfig {
+    /// The effective prompt-cache TTL: `prompt.cache_ttl` (when set) wins over the `[engine]`
+    /// value; anything unrecognized falls back to the 5-minute default tier
+    /// ([`daemon_core::CacheTtl::from_config_str`]).
+    pub fn effective_cache_ttl(&self, engine: daemon_core::CacheTtl) -> daemon_core::CacheTtl {
+        match &self.cache_ttl {
+            Some(ttl) => daemon_core::CacheTtl::from_config_str(ttl),
+            None => engine,
+        }
+    }
+
+    /// The node-side composition policy this config resolves to.
+    pub fn policy(&self) -> daemon_node::PromptPolicy {
+        daemon_node::PromptPolicy {
+            core_guidance: self.core_guidance,
+            tool_use_guidance: match self.tool_use_guidance.trim() {
+                "on" => daemon_prompt::ToolUseMode::On,
+                "off" => daemon_prompt::ToolUseMode::Off,
+                _ => daemon_prompt::ToolUseMode::Auto,
+            },
+            model_guidance: self.model_guidance,
+            environment_hints: self.environment_hints,
+            transport_hints: self.transport_hints,
+            date_stamp: self.date_stamp,
+            context_files: self.context_files,
+            context_file_max_chars: self.context_file_max_chars,
+            nudge_interval: self.nudge_interval,
+            persona_cap: self.persona_cap,
+        }
+    }
+}
+
 // --- the node configuration -------------------------------------------------------------------
 
 /// The node configuration: the single source of truth, deserialized by [`figment`] from
@@ -1386,6 +1487,8 @@ pub struct NodeConfig {
     pub credential_key: String,
     /// The engine tunables (§20) injected into every engine (`[engine]` / `DAEMON_ENGINE__*`).
     pub engine: daemon_core::Config,
+    /// The prompt-architecture composition policy (`[prompt]` / `DAEMON_PROMPT__*`).
+    pub prompt: PromptConfig,
     /// The 32-byte seed for the node's verifiable-journal signer (hex; `None` => ephemeral per boot).
     #[serde(with = "journal_seed_hex")]
     pub journal_seed: Option<[u8; 32]>,
@@ -1478,6 +1581,7 @@ impl Default for NodeConfig {
             mnemosyne: MnemosyneOpts::default(),
             credential_key: String::new(),
             engine: daemon_core::Config::default(),
+            prompt: PromptConfig::default(),
             journal_seed: None,
             nesting_depth: 0,
             orchestrate: OrchestrateConfig::default(),
@@ -1729,6 +1833,11 @@ pub fn config_reference() -> String {
          origin anyway, so it is gated by the mandatory authentication instead.\n\n",
     );
     out.push_str(
+        "Prompt-cache TTL precedence: `prompt.cache_ttl` (when set to `\"5m\"`/`\"1h\"`) wins \
+         over `engine.cache_ttl`; when unset, `engine.cache_ttl` governs. Unrecognized values \
+         fall back to the 5-minute default tier.\n\n",
+    );
+    out.push_str(
         "Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that serves \
          the Qt WASM app bundle in `web.root` (point it at the installed `daemon-app` bundle \
          directory) as static files and the same authenticated WebSocket mux carrier on `/ws` — \
@@ -1784,6 +1893,71 @@ fn walk_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[prompt].cache_ttl` precedence: unset leaves `[engine].cache_ttl` governing; `"1h"`
+    /// selects the extended tier; anything unrecognized falls back to the 5-minute default (the
+    /// hermes cache-TTL config semantics).
+    #[test]
+    fn prompt_cache_ttl_overrides_engine_with_lenient_fallback() {
+        use daemon_core::CacheTtl;
+        let unset = PromptConfig::default();
+        assert_eq!(
+            unset.effective_cache_ttl(CacheTtl::FiveMin),
+            CacheTtl::FiveMin
+        );
+        assert_eq!(
+            unset.effective_cache_ttl(CacheTtl::OneHour),
+            CacheTtl::OneHour
+        );
+        let one_hour = PromptConfig {
+            cache_ttl: Some("1h".into()),
+            ..PromptConfig::default()
+        };
+        assert_eq!(
+            one_hour.effective_cache_ttl(CacheTtl::FiveMin),
+            CacheTtl::OneHour
+        );
+        let invalid = PromptConfig {
+            cache_ttl: Some("2d".into()),
+            ..PromptConfig::default()
+        };
+        assert_eq!(
+            invalid.effective_cache_ttl(CacheTtl::OneHour),
+            CacheTtl::FiveMin,
+            "an unrecognized override falls back to the default tier, not the engine value"
+        );
+    }
+
+    /// The `[prompt]` defaults mirror hermes: everything on, hermes caps, `auto` tool-use gating.
+    #[test]
+    fn prompt_defaults_mirror_hermes() {
+        let policy = PromptConfig::default().policy();
+        assert!(policy.core_guidance);
+        assert_eq!(policy.tool_use_guidance, daemon_prompt::ToolUseMode::Auto);
+        assert!(policy.model_guidance && policy.environment_hints && policy.date_stamp);
+        assert!(policy.context_files);
+        assert_eq!(policy.context_file_max_chars, 20_000);
+        assert_eq!(policy.persona_cap, 20_000);
+        assert_eq!(policy.nudge_interval, 10);
+        assert_eq!(
+            PromptConfig::default().user_profile_char_limit,
+            1_375,
+            "the hermes user_char_limit"
+        );
+        // The gating strings parse leniently: unknown => Auto.
+        for (s, want) in [
+            ("on", daemon_prompt::ToolUseMode::On),
+            ("off", daemon_prompt::ToolUseMode::Off),
+            ("auto", daemon_prompt::ToolUseMode::Auto),
+            ("bogus", daemon_prompt::ToolUseMode::Auto),
+        ] {
+            let cfg = PromptConfig {
+                tool_use_guidance: s.into(),
+                ..PromptConfig::default()
+            };
+            assert_eq!(cfg.policy().tool_use_guidance, want, "{s}");
+        }
+    }
 
     #[test]
     fn unset_provider_boots_unconfigured() {

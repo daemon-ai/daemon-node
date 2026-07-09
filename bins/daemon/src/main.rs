@@ -817,8 +817,9 @@ fn default_profile_spec(
         MemoryProviderKind::File => MemoryProviderSel::File,
         MemoryProviderKind::None => MemoryProviderSel::None,
     };
-    // TODO(prompt-arch Lane E): the seed profile's persona is seeded as a SOUL.md doc via the
-    // PersonaStore, not a spec field (`system_prompt` left the wire at v36).
+    // The seed profile's persona is not a spec field (it left the wire at v36): its SOUL.md doc
+    // is seeded through the PersonaStore at boot (see the eager `personas.load` in `run_host`)
+    // and on the first composition/SoulGet thereafter.
     ProfileSpec {
         id: cfg.profile.clone(),
         provider,
@@ -2418,6 +2419,55 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     extra_tools.push(Arc::new(TodoTool::new()) as Arc<dyn Tool>);
     extra_tools.push(Arc::new(ClarifyTool::new()) as Arc<dyn Tool>);
 
+    // The prompt-architecture stores (`[prompt]`, hermes parity): per-profile SOUL.md personas +
+    // USER.md user profiles under the profile homes (`<data_dir>/<profile>/`). They follow the
+    // store backend like every other durable subsystem — an ephemeral (memory-store) node runs on
+    // the built-in role personas with no SOUL.md/USER.md surface (SoulGet/SoulSet then resolve
+    // Unsupported, mirroring the versioning gating).
+    let personas: Option<Arc<daemon_prompt::PersonaStore>> = if cfg.persist_providers() {
+        match daemon_prompt::PersonaStore::open(cfg.data_root(), cfg.prompt.persona_cap) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(error = %e, "opening the persona store failed; role personas only");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Seed the launch profile's SOUL.md eagerly (load() seeds DEFAULT_SOUL_MD on a miss, routed
+    // through set() so the seed is revision-logged) — a first-run SoulGet then serves the doc
+    // immediately instead of waiting for the first session composition.
+    if let Some(personas) = &personas {
+        if let Err(e) = personas.load(&cfg.profile) {
+            tracing::warn!(error = %e, profile = %cfg.profile, "seeding the launch SOUL.md failed");
+        }
+    }
+    let user_profiles: Option<Arc<daemon_prompt::UserProfileStore>> = if cfg.persist_providers()
+        && cfg.prompt.user_profile
+    {
+        match daemon_prompt::UserProfileStore::open(
+            cfg.data_root(),
+            cfg.prompt.user_profile_char_limit,
+        ) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(error = %e, "opening the user-profile store failed; USER.md off");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // The `user_profile` tool (add/replace/remove/read over USER.md) joins every role registry
+    // when the store is wired; entries scope to the calling engine's identity profile.
+    if let Some(store) = &user_profiles {
+        extra_tools.push(Arc::new(daemon_tool_user_profile::UserProfileTool::new(
+            store.clone(),
+            cfg.profile.clone(),
+        )) as Arc<dyn Tool>);
+    }
+
     // Long-term conversation recall (`session_search`, hermes parity): FTS + read/scroll/browse
     // over the durable session archive. The archive handle is built over the store now and
     // late-bound to the assembled node below (`set_live`) so resident live sessions are readable.
@@ -2746,7 +2796,13 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         providers,
         credentials: Some(credentials),
         profile: cred_profile,
-        engine_config: cfg.engine,
+        engine_config: {
+            // `[prompt].cache_ttl` (when set) wins over `[engine].cache_ttl`; unrecognized
+            // values fall back to the 5-minute default tier.
+            let mut engine = cfg.engine;
+            engine.cache_ttl = cfg.prompt.effective_cache_ttl(engine.cache_ttl);
+            engine
+        },
         journal_seed: cfg.journal_seed,
         nesting_depth: cfg.nesting_depth,
         context: None,
@@ -2786,9 +2842,14 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             max_ephemeral_per_session: cfg.orchestrate.max_ephemeral_per_session,
         },
         foreign_gateway: gateway_coords,
-        // Prompt-architecture stores + policy are wired by the `[prompt]` config workstream
-        // (WI-10); until then engines run on the built-in role personas.
-        prompt: Default::default(),
+        // The prompt-architecture inputs (hermes parity): the SOUL.md/USER.md stores built above,
+        // the `[prompt]` composition policy, and the launch model identity for the role engines.
+        prompt: daemon_node::PromptAssembly {
+            personas,
+            user_profiles,
+            policy: cfg.prompt.policy(),
+            launch_model: (!cfg.model.trim().is_empty()).then(|| cfg.model.clone()),
+        },
     });
     // Late-bind the assembled node onto the `session_search` archive so resident live sessions'
     // conversations are readable through the tool (the node did not exist when the tool was built).

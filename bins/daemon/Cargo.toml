@@ -61,6 +61,10 @@ daemon-tool-vision = { workspace = true }
 # Core chat tools registered on every role: the per-session `todo` planner and the `clarify` ask.
 daemon-tool-todo = { workspace = true }
 daemon-tool-clarify = { workspace = true }
+# The `user_profile` tool (USER.md) registered on every role when the store is wired ([prompt]).
+daemon-tool-user-profile = { workspace = true }
+# The persona/user-profile stores + caps the `[prompt]` section constructs and NodeAssembly carries.
+daemon-prompt = { workspace = true }
 # The `execute_code` tool (sandboxed one-shot Python); opt-in at runtime via `[execute_code].enable`.
 daemon-tool-execute-code = { workspace = true }
 # Long-term conversation recall (`session_search`) over the node's session archive.

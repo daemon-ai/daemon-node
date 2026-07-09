@@ -6,6 +6,8 @@ Configuration is layered by [figment](https://docs.rs/figment), later sources wi
 
 The `api.ws_addr` WebSocket listener (the browser/WASM mux carrier) serves plain `ws://` only and always requires SASL authentication; for `wss://`, terminate TLS at a reverse proxy in front of it for now. Browser connections must additionally match `api.ws_allowed_origins` (empty = every browser origin is refused). An upgrade without an `Origin` header (a non-browser client) is accepted by design: the origin allow-list is a browser CSRF defense — browsers stamp the header and page script cannot forge it — while a non-browser client controls its own headers and could present any allow-listed origin anyway, so it is gated by the mandatory authentication instead.
 
+Prompt-cache TTL precedence: `prompt.cache_ttl` (when set to `"5m"`/`"1h"`) wins over `engine.cache_ttl`; when unset, `engine.cache_ttl` governs. Unrecognized values fall back to the 5-minute default tier.
+
 Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that serves the Qt WASM app bundle in `web.root` (point it at the installed `daemon-app` bundle directory) as static files and the same authenticated WebSocket mux carrier on `/ws` — the browser loads the GUI from the daemon and connects back to the same origin, so same-origin upgrades need no origin configuration (an `Origin` matching the request's own `Host` is accepted automatically; `api.ws_allowed_origins` grants extra cross-origin allowance). Static files are public; the api still requires SASL. The bundle directory is scanned once at startup (restart to pick up new files), and `https://`/`wss://` terminate at a reverse proxy for now — behind one, add the public origin to `api.ws_allowed_origins` (the derived self-origin is `http://`).
 
 | TOML path | Environment variable | Type | Default |
@@ -49,6 +51,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `embed.model` | `DAEMON_EMBED__MODEL` | string | `""` |
 | `embed.provider` | `DAEMON_EMBED__PROVIDER` | string | `off` |
 | `engine.approval_policy` | `DAEMON_ENGINE__APPROVAL_POLICY` | string | `ask` |
+| `engine.cache_ttl` | `DAEMON_ENGINE__CACHE_TTL` | string | `FiveMin` |
 | `engine.context_budget_tokens` | `DAEMON_ENGINE__CONTEXT_BUDGET_TOKENS` | optional | _(unset)_ |
 | `engine.guardrail.exact_failure_block_after` | `DAEMON_ENGINE__GUARDRAIL__EXACT_FAILURE_BLOCK_AFTER` | number | `5` |
 | `engine.guardrail.exact_failure_warn_after` | `DAEMON_ENGINE__GUARDRAIL__EXACT_FAILURE_WARN_AFTER` | number | `2` |
@@ -193,6 +196,19 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `processes.watch_min_interval_secs` | `DAEMON_PROCESSES__WATCH_MIN_INTERVAL_SECS` | number | `15` |
 | `processes.watch_strike_limit` | `DAEMON_PROCESSES__WATCH_STRIKE_LIMIT` | number | `3` |
 | `profile` | `DAEMON_PROFILE` | string | `default` |
+| `prompt.cache_ttl` | `DAEMON_PROMPT__CACHE_TTL` | optional | _(unset)_ |
+| `prompt.context_file_max_chars` | `DAEMON_PROMPT__CONTEXT_FILE_MAX_CHARS` | number | `20000` |
+| `prompt.context_files` | `DAEMON_PROMPT__CONTEXT_FILES` | bool | `true` |
+| `prompt.core_guidance` | `DAEMON_PROMPT__CORE_GUIDANCE` | bool | `true` |
+| `prompt.date_stamp` | `DAEMON_PROMPT__DATE_STAMP` | bool | `true` |
+| `prompt.environment_hints` | `DAEMON_PROMPT__ENVIRONMENT_HINTS` | bool | `true` |
+| `prompt.model_guidance` | `DAEMON_PROMPT__MODEL_GUIDANCE` | bool | `true` |
+| `prompt.nudge_interval` | `DAEMON_PROMPT__NUDGE_INTERVAL` | number | `10` |
+| `prompt.persona_cap` | `DAEMON_PROMPT__PERSONA_CAP` | number | `20000` |
+| `prompt.tool_use_guidance` | `DAEMON_PROMPT__TOOL_USE_GUIDANCE` | string | `auto` |
+| `prompt.transport_hints` | `DAEMON_PROMPT__TRANSPORT_HINTS` | bool | `true` |
+| `prompt.user_profile` | `DAEMON_PROMPT__USER_PROFILE` | bool | `true` |
+| `prompt.user_profile_char_limit` | `DAEMON_PROMPT__USER_PROFILE_CHAR_LIMIT` | number | `1375` |
 | `python.enable` | `DAEMON_PYTHON__ENABLE` | bool | `false` |
 | `python.interpreter` | `DAEMON_PYTHON__INTERPRETER` | string | `python3` |
 | `python.max_restarts` | `DAEMON_PYTHON__MAX_RESTARTS` | number | `3` |
