@@ -2229,3 +2229,115 @@ fn polyphonic_recall_fuses_voices() {
         "polyphonic fused result"
     );
 }
+
+/// Recall with a temporal-boost configuration through the scoped recall surface.
+fn recall_temporal(
+    e: &Engine,
+    query: &'static str,
+    temporal_weight: f64,
+    temporal_halflife: Option<f64>,
+) -> Vec<MemoryRow> {
+    let scope = RecallScope::default();
+    e.recall_with_scope(&RecallReq {
+        query,
+        top_k: 5,
+        query_vector: None,
+        scope: &scope,
+        filters: crate::config::RecallFilters {
+            temporal_weight,
+            temporal_halflife,
+            ..Default::default()
+        },
+    })
+    .unwrap()
+}
+
+// PARITY: Mnemosyne tests/test_temporal_recall.py::TestTemporalRecallEndToEnd::test_temporal_boost_recent_vs_old
+#[test]
+fn temporal_boost_ranks_recent_over_old_end_to_end() {
+    let e = engine();
+    let test_args = RememberArgs {
+        source: "test".to_string(),
+        ..Default::default()
+    };
+    e.remember("Meeting about project alpha", &test_args)
+        .unwrap();
+    e.remember("Meeting about project beta", &test_args)
+        .unwrap();
+    {
+        let conn = e.store.conn.lock().unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(5))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let recent = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        conn.execute(
+            "UPDATE working_memory SET timestamp = ?1 WHERE content LIKE '%alpha%'",
+            params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE working_memory SET timestamp = ?1 WHERE content LIKE '%beta%'",
+            params![recent],
+        )
+        .unwrap();
+    }
+
+    let hits = recall_temporal(&e, "meeting", 0.5, None);
+    let score = |needle: &str| {
+        hits.iter()
+            .find(|h| h.content.contains(needle))
+            .map(|h| h.score)
+    };
+    let alpha = score("alpha");
+    let beta = score("beta");
+    assert!(
+        alpha.is_some() && beta.is_some(),
+        "both memories must surface: {hits:?}"
+    );
+    assert!(
+        beta.unwrap() > alpha.unwrap(),
+        "recent memory must outrank stale with temporal boost: beta={beta:?} alpha={alpha:?}"
+    );
+}
+
+// PARITY: Mnemosyne tests/test_temporal_recall.py::TestTemporalRecallEndToEnd::test_temporal_halflife_override
+#[test]
+fn temporal_halflife_override_changes_boost_end_to_end() {
+    let e = engine();
+    e.remember(
+        "Memory from two days ago",
+        &RememberArgs {
+            source: "test".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    {
+        let conn = e.store.conn.lock().unwrap();
+        let two_days = (chrono::Utc::now() - chrono::Duration::days(2))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        conn.execute(
+            "UPDATE working_memory SET timestamp = ?1 WHERE content LIKE '%two days ago%'",
+            params![two_days],
+        )
+        .unwrap();
+    }
+
+    // Only the per-call temporal_halflife differs; the base recency decay is identical, so any
+    // score delta is attributable to the temporal boost knob (`beam.py` L5137-L5141).
+    let score_short = recall_temporal(&e, "memory", 0.5, Some(6.0))
+        .first()
+        .map(|h| h.score)
+        .unwrap_or(0.0);
+    let score_long = recall_temporal(&e, "memory", 0.5, Some(168.0))
+        .first()
+        .map(|h| h.score)
+        .unwrap_or(0.0);
+    assert!(
+        score_long > score_short,
+        "a longer temporal halflife must boost a 2-day-old memory more: long={score_long} short={score_short}"
+    );
+}
