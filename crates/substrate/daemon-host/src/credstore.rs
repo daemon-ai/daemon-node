@@ -534,4 +534,98 @@ mod tests {
         let err = source.provision(&cap, CredMode::Native).unwrap_err();
         assert!(matches!(err, CredError::Other(_)), "Native must be refused");
     }
+
+    /// `test_credential_manager.c` `/credential-manager/no-provider/{read,write,clear}-password`
+    /// analogue on the in-memory store: every operation against a profile with no stored credential
+    /// completes cleanly — read is `None` (not a panic/error), clear is a tolerant no-op, and the
+    /// pool/listing surfaces are empty.
+    #[test]
+    fn mem_store_ops_on_unset_profile_are_clean() {
+        let s = MemCredentialStore::new();
+        assert!(s.get("ghost").is_none(), "read with nothing stored is None");
+        assert!(
+            s.remove("ghost").is_ok(),
+            "clear of an unset profile no-ops"
+        );
+        assert!(s.keys("ghost").is_empty(), "the pool is empty");
+        assert!(s.list_redacted().is_empty(), "nothing to enumerate");
+    }
+
+    /// The same no-provider edges on the file-backed store, including the not-yet-created backing
+    /// file: read/clear/list against a path that has never been written stay clean (no error, no
+    /// file materialized by reads).
+    #[test]
+    fn file_store_ops_on_unset_profile_are_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let store = FileCredentialStore::open(&path).unwrap();
+
+        // The backing file does not exist yet: reads are clean misses.
+        assert!(store.get("ghost").is_none());
+        assert!(store.keys("ghost").is_empty());
+        assert!(store.list_redacted().is_empty());
+        assert!(!path.exists(), "reads must not materialize the store file");
+        // Clearing an unset profile is a tolerant no-op (it may write an empty map).
+        assert!(store.remove("ghost").is_ok());
+        assert!(store.get("ghost").is_none());
+    }
+
+    /// `rotate`/`revoke` on a capability the pooled source never served are clean no-ops: no key is
+    /// cooled down, and provisioning is undisturbed (the daemon analogue of operating on a
+    /// non-existent provider registration).
+    #[test]
+    fn pooled_source_rotate_revoke_unknown_cap_are_noops() {
+        use std::sync::Arc;
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("grok", "key-a").unwrap();
+        store.add_key("grok", "key-b").unwrap();
+        let source = PooledStoreCredentialSource::new(store, "grok", "sk-fallback");
+        assert_eq!(source.live_count(), 2);
+
+        let unknown = CredId::new("never-served");
+        source.rotate(&unknown);
+        assert_eq!(
+            source.live_count(),
+            2,
+            "rotating an unserved capability cools nothing down"
+        );
+        source.revoke(&unknown);
+        // The pool still provisions its primary key normally.
+        let got = source
+            .provision(&CredId::new("c1"), CredMode::Bearer)
+            .unwrap()
+            .secret;
+        assert_eq!(got, "key-a");
+    }
+
+    /// `test_credential_provider_normal.c` clear-password analogue: `revoke` on a plain store
+    /// source does not clear the durable secret (the store is the backing, not the lease), while
+    /// removing the credential from the store is the real clear — the next provision falls back.
+    #[test]
+    fn store_source_revoke_and_store_remove_clear_secret() {
+        use std::sync::Arc;
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("opus", "sk-real").unwrap();
+        let source = StoreCredentialSource::new(store.clone(), "opus", "sk-fallback");
+        let cap = CredId::new("c1");
+        assert_eq!(
+            source.provision(&cap, CredMode::Bearer).unwrap().secret,
+            "sk-real"
+        );
+
+        // Revoking the capability is lease bookkeeping only — the stored secret survives.
+        source.revoke(&cap);
+        assert_eq!(
+            source.provision(&cap, CredMode::Bearer).unwrap().secret,
+            "sk-real",
+            "revoke must not clear the durable store"
+        );
+
+        // Clearing the store is the real clear-password: provisioning falls back.
+        store.remove("opus").unwrap();
+        assert_eq!(
+            source.provision(&cap, CredMode::Bearer).unwrap().secret,
+            "sk-fallback"
+        );
+    }
 }

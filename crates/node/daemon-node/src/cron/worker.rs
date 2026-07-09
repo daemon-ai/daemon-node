@@ -507,4 +507,79 @@ mod tests {
         assert_eq!(CronWorker::parse_provider("mistral_rs"), Some(MistralRs));
         assert_eq!(CronWorker::parse_provider("nonsense"), None);
     }
+
+    /// Insert a scheduled job into the store with the given paused flag + armed fire.
+    async fn seed_job(
+        store: &Arc<dyn daemon_store::SessionStore>,
+        schedule: &str,
+        paused: bool,
+        next_fire_unix: Option<u64>,
+    ) -> String {
+        let spec = CronSpec {
+            name: "job".into(),
+            schedule: schedule.into(),
+            ..CronSpec::default()
+        };
+        let id = "cron-tick-1".to_string();
+        store
+            .cron_set(daemon_store::StoredCronJob {
+                id: id.clone(),
+                schedule: schedule.into(),
+                spec: daemon_api::to_cbor(&spec),
+                next_fire_unix,
+                paused,
+                last_run_unix: None,
+                last_ok: None,
+                last_detail: None,
+                fire_count: 0,
+                created_unix: 0,
+                owner: None,
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    /// `test_scheduled_task.c` `/schedule/normal` + `/schedule/reuse`, end-to-end through the
+    /// resident scheduler: a due recurring job fires once (records a run + materializes an isolated
+    /// cron session) and re-arms with a future fire (reuse after completion).
+    #[tokio::test]
+    async fn tick_fires_due_recurring_and_rearms() {
+        let store: Arc<dyn daemon_store::SessionStore> =
+            Arc::new(daemon_store::InMemoryStore::new());
+        let worker = CronWorker::new(store.clone(), PartitionId::DEFAULT, mock_profile());
+        let now = CronWorker::now_unix();
+        let id = seed_job(&store, "@every 1h", false, Some(now)).await;
+
+        worker.tick_once().await.expect("tick");
+
+        let job = store.cron_get(&id).await.expect("job persists (recurring)");
+        assert_eq!(job.fire_count, 1, "the due job fired exactly once");
+        assert!(
+            job.next_fire_unix.is_some_and(|t| t > now),
+            "the job re-arms with a future fire (reuse after completion)"
+        );
+        let runs = store.cron_runs_list(&id, 10).await;
+        assert_eq!(runs.len(), 1, "one run recorded");
+        assert!(
+            runs[0].session.is_some(),
+            "the fire materialized an isolated cron session"
+        );
+    }
+
+    /// `/schedule/cancelled`, end-to-end: a paused (cancelled) job is excluded from `cron_due`, so a
+    /// tick never fires it — no run, no fire-count advance.
+    #[tokio::test]
+    async fn tick_skips_paused_job() {
+        let store: Arc<dyn daemon_store::SessionStore> =
+            Arc::new(daemon_store::InMemoryStore::new());
+        let worker = CronWorker::new(store.clone(), PartitionId::DEFAULT, mock_profile());
+        let id = seed_job(&store, "@every 1h", true, None).await;
+
+        worker.tick_once().await.expect("tick");
+
+        let job = store.cron_get(&id).await.expect("job persists");
+        assert_eq!(job.fire_count, 0, "a cancelled job never fires");
+        assert!(store.cron_runs_list(&id, 10).await.is_empty(), "no run");
+    }
 }

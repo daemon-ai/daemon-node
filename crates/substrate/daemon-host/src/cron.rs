@@ -435,3 +435,121 @@ fn parse_status(s: &str) -> SuggestionStatus {
         _ => SuggestionStatus::Pending,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_store::InMemoryStore;
+
+    /// A `CronOps` over a fresh in-memory store, plus the store handle for direct assertions.
+    fn ops() -> (CronOps, Arc<dyn SessionStore>) {
+        let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+        (CronOps::new(store.clone()), store)
+    }
+
+    fn spec(schedule: &str, enabled: bool) -> CronSpec {
+        CronSpec {
+            name: "job".into(),
+            schedule: schedule.into(),
+            enabled,
+            ..CronSpec::default()
+        }
+    }
+
+    /// `test_scheduled_task.c` `/schedule/normal` (the "scheduled" state): an enabled create parses
+    /// the schedule and arms a first fire.
+    #[tokio::test]
+    async fn create_enabled_sets_next_fire() {
+        let (ops, store) = ops();
+        let id = ops.create(spec("@every 1h", true)).await.expect("create");
+        let jobs = ops.list().await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert!(!jobs[0].paused);
+        assert!(
+            jobs[0].next_fire_unix.is_some(),
+            "an enabled job is armed with a first fire"
+        );
+        // It is due once we advance past the fire (the store's `cron_due` selects it).
+        let fire = jobs[0].next_fire_unix.unwrap();
+        assert_eq!(store.cron_due(fire).await.len(), 1);
+    }
+
+    /// `/scheduled-task/new` + `/properties` (default state UNSCHEDULED, no execute-at): a disabled
+    /// create is stored paused with no armed fire — the daemon "unscheduled" analogue.
+    #[tokio::test]
+    async fn create_disabled_has_no_next_fire() {
+        let (ops, store) = ops();
+        ops.create(spec("@every 1h", false)).await.expect("create");
+        let jobs = ops.list().await;
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].paused);
+        assert!(
+            jobs[0].next_fire_unix.is_none(),
+            "unscheduled: no execute-at"
+        );
+        // Never due while unscheduled.
+        assert!(store.cron_due(u64::MAX).await.is_empty());
+    }
+
+    /// `/scheduled-task/schedule/cancelled` (cancel → does not fire): pausing clears the armed fire
+    /// so the job is excluded from `cron_due`; resuming recomputes it.
+    #[tokio::test]
+    async fn pause_clears_next_fire_resume_recomputes() {
+        let (ops, store) = ops();
+        let id = ops.create(spec("@every 1h", true)).await.expect("create");
+        assert!(!store.cron_due(u64::MAX).await.is_empty(), "armed => due");
+
+        // Cancel.
+        ops.pause(id.clone(), true).await.expect("pause");
+        let job = store.cron_get(&id).await.expect("still present");
+        assert!(job.paused);
+        assert!(job.next_fire_unix.is_none());
+        assert!(
+            store.cron_due(u64::MAX).await.is_empty(),
+            "a cancelled job never fires"
+        );
+
+        // Resume re-arms.
+        ops.pause(id.clone(), false).await.expect("resume");
+        let job = store.cron_get(&id).await.expect("present");
+        assert!(!job.paused);
+        assert!(job.next_fire_unix.is_some(), "resume recomputes the fire");
+    }
+
+    /// `/scheduled-task/schedule/reschedule` (reschedule replaces the previous execute-at): update
+    /// replaces the spec + recomputes the fire in place — still exactly one job.
+    #[tokio::test]
+    async fn update_replaces_schedule_single_job() {
+        let (ops, store) = ops();
+        let id = ops.create(spec("@every 1h", true)).await.expect("create");
+        let before = store.cron_get(&id).await.unwrap().next_fire_unix.unwrap();
+
+        ops.update(id.clone(), spec("@every 30m", true))
+            .await
+            .expect("update");
+        let jobs = ops.list().await;
+        assert_eq!(jobs.len(), 1, "reschedule replaces in place, no duplicate");
+        assert_eq!(jobs[0].id, id);
+        assert_eq!(jobs[0].spec.schedule, "@every 30m");
+        let after = store.cron_get(&id).await.unwrap().next_fire_unix.unwrap();
+        assert!(
+            after <= before,
+            "a 30m reschedule fires no later than the previous 1h fire"
+        );
+    }
+
+    /// `update`/`pause` on an unknown job id error cleanly (daemon-native edge); `delete` is
+    /// idempotent (a no-op success), mirroring the store's tolerant remove.
+    #[tokio::test]
+    async fn mutate_unknown_job_errors() {
+        let (ops, _store) = ops();
+        assert!(ops
+            .update("nope".into(), spec("@every 1h", true))
+            .await
+            .is_err());
+        assert!(ops.pause("nope".into(), true).await.is_err());
+        // Delete of an unknown id is a tolerant no-op.
+        assert!(ops.delete("nope".into()).await.is_ok());
+    }
+}
