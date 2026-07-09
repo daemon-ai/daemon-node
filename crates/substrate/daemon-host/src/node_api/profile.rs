@@ -148,12 +148,23 @@ impl ProfileApi for NodeApiImpl {
                     .flatten()
             })
             .map(|r| r.seq);
+        // The SOUL doc travels with a distributed profile (wire v36); USER.md never does. Core
+        // engine only: reading a Foreign profile's persona would seed an orphan SOUL doc (its
+        // agent owns its prompt — there is no persona to export). `None` when no persona backend
+        // is wired or the read fails (a distribution without a persona is still importable).
+        let soul = match &self.persona_ops {
+            Some(persona) if !matches!(spec.engine, daemon_api::EngineSelector::Foreign { .. }) => {
+                persona.soul_get(&id).await.ok()
+            }
+            _ => None,
+        };
         Ok(Distribution {
             wire_version: daemon_common::WireVersion::CURRENT,
             profile: spec,
             skills,
             head_seq,
             source: None,
+            soul,
         })
     }
 
@@ -183,6 +194,9 @@ impl ProfileApi for NodeApiImpl {
         spec.created_by = Some(daemon_common::Author::Operator);
         spec.owner = None;
         let id = spec.id.clone();
+        // The created spec is moved into the store; keep a copy for the SOUL import's
+        // Foreign-engine guard below.
+        let soul_spec = spec.clone();
         store.create(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "import");
         self.emit_profiles_changed();
@@ -202,6 +216,18 @@ impl ProfileApi for NodeApiImpl {
                         &format!("import via {id}"),
                     )
                     .map_err(|e| ApiError::Other(format!("skill import: {e}")))?;
+            }
+        }
+        // Materialize the distribution's SOUL doc through the persona seam (wire v36). Best-effort
+        // + Foreign-guarded: `soul_set_guarded` refuses to write a persona for a Foreign-engine
+        // profile (its agent owns its prompt), and a persona hiccup never fails the import (the
+        // profile + skills already landed).
+        if let (Some(soul), Some(persona)) = (&dist.soul, &self.persona_ops) {
+            if let Err(e) =
+                crate::persona_ops::soul_set_guarded(persona.as_ref(), Some(&soul_spec), &id, soul)
+                    .await
+            {
+                tracing::warn!(profile = %id, error = %e, "profile import: SOUL doc not applied");
             }
         }
         // An imported profile can declare `bound_accounts` (§5.9 hot-reload).
@@ -238,6 +264,26 @@ impl ProfileApi for NodeApiImpl {
             daemon_common::Author::Operator,
             &format!("revert to {seq}"),
         );
+        self.emit_profiles_changed();
+        Ok(())
+    }
+
+    async fn soul_get(&self, id: String) -> Result<String, ApiError> {
+        let persona = self.persona_backend()?;
+        // Fetch-before-delegate: the persona backend seeds SOUL.md on a miss, so an unknown
+        // profile id must fail here (the same not-found the other profile ops raise) rather than
+        // materialize an orphan persona doc.
+        let spec = self.profile_store()?.get(&id).map_err(profile_err)?;
+        crate::persona_ops::soul_get_guarded(persona.as_ref(), spec.as_ref(), &id).await
+    }
+
+    async fn soul_set(&self, id: String, text: String) -> Result<(), ApiError> {
+        let persona = self.persona_backend()?;
+        let spec = self.profile_store()?.get(&id).map_err(profile_err)?;
+        crate::persona_ops::soul_set_guarded(persona.as_ref(), spec.as_ref(), &id, &text).await?;
+        // A persona edit changes what a client renders for the profile: ping the node-wide
+        // pointer so thin clients refetch. The backend owns validation + the revision log
+        // (PersonaStore::set is the single SOUL.md revision writer), so nothing is recorded here.
         self.emit_profiles_changed();
         Ok(())
     }
@@ -414,6 +460,14 @@ impl NodeApiImpl {
         self.profiles
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("profile management not available".into()))
+    }
+
+    /// The persona (SOUL.md) backend, or [`ApiError::Unsupported`] when this node hosts no persona
+    /// management (no [`PersonaOps`](crate::persona_ops::PersonaOps) bound at assembly).
+    fn persona_backend(&self) -> Result<&Arc<dyn crate::persona_ops::PersonaOps>, ApiError> {
+        self.persona_ops
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("persona management not available".into()))
     }
 
     /// Resolve an agent-catalog entry by `name`: the merged catalog (durable manual registrations +

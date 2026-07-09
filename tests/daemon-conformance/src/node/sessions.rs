@@ -315,11 +315,7 @@ async fn phase0_gui_readiness_demo_gate() {
 
     // 2. Create the genai/claude-opus-4-8 profile and make it the active default (the genai
     // adapter is inferred from the model id — the daemon keeps no per-provider selector).
-    let spec = {
-        let mut s = ProfileSpec::new("opus", ProviderSelector::GenAi, "claude-opus-4-8");
-        s.system_prompt = "You are Opus.".into();
-        s
-    };
+    let spec = ProfileSpec::new("opus", ProviderSelector::GenAi, "claude-opus-4-8");
     assert!(matches!(
         client
             .call(ApiRequest::ProfileCreate { spec })

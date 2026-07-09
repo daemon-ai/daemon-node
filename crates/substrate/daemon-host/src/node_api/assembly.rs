@@ -92,6 +92,7 @@ impl NodeApiImpl {
             managed: Arc::new(std::sync::Mutex::new(Vec::new())),
             gateway: Arc::new(std::sync::Mutex::new(None)),
             profile_ops: None,
+            persona_ops: None,
         }
     }
 
@@ -551,6 +552,18 @@ impl NodeApiImpl {
     /// assembly; absent, the operator path uses its inline validate+persist+record.
     pub fn with_profile_ops(mut self, profile_ops: Arc<crate::profile_ops::ProfileOps>) -> Self {
         self.profile_ops = Some(profile_ops);
+        self
+    }
+
+    /// Attach the persona (SOUL.md) backend behind the wire `SoulGet`/`SoulSet` ops (wire v36).
+    /// The backend owns validation/scan/cap/atomic-write + revision logging; the node interface
+    /// only enforces the profile-existence and Foreign-engine guards in front of it. Call during
+    /// assembly; absent, both persona ops resolve to `Unsupported`.
+    pub fn with_persona_ops(
+        mut self,
+        persona_ops: Arc<dyn crate::persona_ops::PersonaOps>,
+    ) -> Self {
+        self.persona_ops = Some(persona_ops);
         self
     }
 

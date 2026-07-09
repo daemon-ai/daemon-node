@@ -513,6 +513,11 @@ pub struct NodeApiImpl {
     /// this node (`ProfileValidator = NodeApiImpl`). `None` => the operator path falls back to the
     /// inline validate+persist+record (a minimal node with no shared facade / no agent tool).
     profile_ops: Option<Arc<crate::profile_ops::ProfileOps>>,
+    /// The persona (SOUL.md) backend behind the wire `SoulGet`/`SoulSet` ops (wire v36). `None` on
+    /// a node built without persona management (both ops then resolve to
+    /// [`ApiError::Unsupported`]). The real `PersonaStore` adapter is bound at node assembly via
+    /// [`with_persona_ops`](Self::with_persona_ops).
+    persona_ops: Option<Arc<dyn crate::persona_ops::PersonaOps>>,
 }
 
 impl NodeApiImpl {

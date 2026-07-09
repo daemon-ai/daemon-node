@@ -817,12 +817,13 @@ fn default_profile_spec(
         MemoryProviderKind::File => MemoryProviderSel::File,
         MemoryProviderKind::None => MemoryProviderSel::None,
     };
+    // TODO(prompt-arch Lane E): the seed profile's persona is seeded as a SOUL.md doc via the
+    // PersonaStore, not a spec field (`system_prompt` left the wire at v36).
     ProfileSpec {
         id: cfg.profile.clone(),
         provider,
         model: cfg.model.clone(),
         base_url: cfg.base_url.clone(),
-        system_prompt: String::new(),
         tool_allowlist: None,
         budget: BudgetSpec::default(),
         tunables: EngineTunables {

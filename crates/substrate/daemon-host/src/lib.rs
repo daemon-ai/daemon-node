@@ -55,6 +55,7 @@ pub mod foreign;
 pub mod journal;
 pub mod managed;
 pub mod node_api;
+pub mod persona_ops;
 pub mod process_agent;
 pub mod profile_ops;
 pub mod profiles;
@@ -130,6 +131,7 @@ pub use node_api::{
     NodeApiParts, NodeEventFeed, ProvisionedAccount, RoutingBuilder, SessionBackend,
     SessionEngineBuilder,
 };
+pub use persona_ops::PersonaOps;
 pub use process_agent::ProcessAgentUnit;
 pub use profile_ops::{ProfileEvents, ProfileOps, ProfileValidator};
 pub use profiles::{FileProfileStore, MemProfileStore, ProfileError, ProfileStore};

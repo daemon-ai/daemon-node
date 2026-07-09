@@ -701,7 +701,16 @@ impl WireVersion {
     /// `transport-instance-info`, and `label: tstr?` on `credential-info`, both overlaid by the
     /// node from its durable store. Additive (new request variants + two optional info fields), but
     /// bumped because `is_compatible` is strict-equal (mirrors the additive v15–v34 bumps).
-    pub const CURRENT: Self = Self(35);
+    ///
+    /// v36 (node-owned personas — BREAKING): removes the client-settable `system_prompt` field
+    /// from `profile-spec` (the composed system prompt is never wire-visible; personas live in
+    /// node-side per-profile SOUL.md docs). Adds the persona ops `SoulGet { id }` ->
+    /// `SoulText(tstr)` and `SoulSet { id, text }` -> `Ok` (gated like profile reads/writes; the
+    /// node validates/scans/caps + revision-logs, and `SoulSet` on a Foreign-engine profile is
+    /// rejected typed — an ACP agent owns its own prompt, there is no persona to set). The profile
+    /// `distribution` gains an optional `soul` doc (SOUL.md travels with an exported profile;
+    /// USER.md is personal data and never travels).
+    pub const CURRENT: Self = Self(36);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

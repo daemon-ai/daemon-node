@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 32)
+wire_version = uint                 ; daemon-common WireVersion (current = 36)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -903,13 +903,16 @@ revision = {
 ; null for unsigned bundles (the default); verification is off unless an operator configures a key.
 skill-bundle = { "name": tstr, "category": (tstr / null), "files": { * tstr => tstr }, ? "signature": (tstr / null) }
 ; a portable profile distribution: the concrete profile-spec plus the profile's local skills;
-; credential_ref is kept (a name, not a secret).
+; credential_ref is kept (a name, not a secret). soul (wire v36): the profile's persona (SOUL.md)
+; text at export time — null when the exporter hosts no persona management or the profile is
+; Foreign-engine (no persona); USER.md is personal data and never travels.
 distribution = {
   "wire_version": wire_version,
   "profile": profile-spec,
   "skills": [* skill-bundle],
   ? "head_seq": (uint64 / null),
   ? "source": (tstr / null),
+  ? "soul": (tstr / null),
 }
 ; the full ProfileSpec (daemon-api profile.rs). serde default + ciborium with no
 ; skip_serializing_if, so every field is present on the wire (Option fields as null); reuse the
@@ -942,7 +945,6 @@ profile-spec = {
   "provider": provider-selector,
   "model": tstr,
   "base_url": (tstr / null),
-  "system_prompt": tstr,
   "tool_allowlist": ([* tstr] / null),
   "budget": budget,
   "tunables": engine-tunables,
@@ -1224,6 +1226,10 @@ request-profile-import = { "ProfileImport": { "dist": distribution, ? "new_id": 
 request-profile-history = { "ProfileHistory": { "id": tstr, ? "after": (tstr / null) } }
 request-profile-at = { "ProfileAt": { "id": tstr, "seq": uint64 } }
 request-profile-revert = { "ProfileRevert": { "id": tstr, "seq": uint64 } }
+; persona ops (wire v36): read/replace a profile's node-owned persona (SOUL.md) text. The composed
+; system prompt itself is never wire-visible; SoulSet is rejected for Foreign-engine profiles.
+request-soul-get = { "SoulGet": { "id": tstr } }
+request-soul-set = { "SoulSet": { "id": tstr, "text": tstr } }
 request-skill-history = { "SkillHistory": { "name": tstr, ? "after": (tstr / null) } }
 request-skill-at = { "SkillAt": { "name": tstr, "seq": uint64 } }
 request-skill-revert = { "SkillRevert": { "name": tstr, "seq": uint64 } }
@@ -1430,6 +1436,8 @@ api-request = request-submit
             / request-profile-history
             / request-profile-at
             / request-profile-revert
+            / request-soul-get
+            / request-soul-set
             / request-skill-history
             / request-skill-at
             / request-skill-revert
@@ -1609,6 +1617,7 @@ response-model-quantizes = { "ModelQuantizes": [* quantize-status] }
 response-model-inspect = { "ModelInspect": gguf-info }
 response-profiles = { "Profiles": [* profile-info] }
 response-profile = { "Profile": (profile-spec / null) }   ; ProfileGet returns null on a missing id
+response-soul-text = { "SoulText": tstr }                 ; SoulGet returns the persona (SOUL.md) text
 response-credentials = { "Credentials": [* credential-info] }
 response-models = { "Models": model-page }
 response-model-current = { "ModelCurrent": (model-descriptor / null) }
@@ -1711,6 +1720,7 @@ api-response = response-ok
              / response-model-inspect
              / response-profiles
              / response-profile
+             / response-soul-text
              / response-credentials
              / response-models
              / response-model-current

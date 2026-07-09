@@ -106,8 +106,7 @@ async fn routed_submit_resolves_profile_and_delivery_per_origin_impl() {
         ("beta", "model-b"),
         ("secops", "model-s"),
     ] {
-        let mut spec = ProfileSpec::new(id, ProviderSelector::GenAi, model);
-        spec.system_prompt = format!("You are {id}.");
+        let spec = ProfileSpec::new(id, ProviderSelector::GenAi, model);
         store.create(spec).expect("create profile");
     }
     store.set_active("alpha").expect("set active");

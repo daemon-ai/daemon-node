@@ -131,12 +131,13 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ModelActivate { .. }
         | ModelQuantize(_) => C::ModelsWrite,
 
-        // -- serve_profile: profiles + skills (versioned) ---------------------------------------
+        // -- serve_profile: profiles + skills (versioned) + personas (wire v36) -----------------
         ProfileList
         | ProfileGet { .. }
         | ProfileExport { .. }
         | ProfileHistory { .. }
         | ProfileAt { .. }
+        | SoulGet { .. }
         | SkillHistory { .. }
         | SkillAt { .. }
         | SkillGet { .. } => C::ProfileRead,
@@ -147,6 +148,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ProfileClone { .. }
         | ProfileImport { .. }
         | ProfileRevert { .. }
+        | SoulSet { .. }
         | SkillRevert { .. }
         | SkillPut { .. } => C::ProfileWrite,
 
@@ -323,6 +325,11 @@ mod tests {
                 Capability::ModelsRead,
             ),
             (ApiRequest::ProfileList, Capability::ProfileRead),
+            // Persona reads (wire v36) are gated exactly like profile reads.
+            (
+                ApiRequest::SoulGet { id: "p".into() },
+                Capability::ProfileRead,
+            ),
             (
                 ApiRequest::CuratorList { profile: None },
                 Capability::ProfileRead,
@@ -363,6 +370,14 @@ mod tests {
             ),
             (
                 ApiRequest::ProfileDelete { id: "p".into() },
+                Capability::ProfileWrite,
+            ),
+            // Persona writes (wire v36) are gated exactly like profile writes.
+            (
+                ApiRequest::SoulSet {
+                    id: "p".into(),
+                    text: "persona".into(),
+                },
                 Capability::ProfileWrite,
             ),
             (

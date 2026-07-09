@@ -71,11 +71,10 @@ impl SessionFactoryCtx {
             &self.procs,
         );
         let skills_index = self.resolve_skills_into_registry(spec, &mut registry);
-        let persona = if spec.system_prompt.trim().is_empty() {
-            "interactive session".to_string()
-        } else {
-            spec.system_prompt.clone()
-        };
+        // TODO(prompt-arch Lane E): persona resolution moves node-side (PersonaSource ->
+        // PersonaStore SOUL.md); `ProfileSpec.system_prompt` left the wire at v36. This
+        // placeholder keeps the pre-existing empty-persona fallback until Lane E lands.
+        let persona = "interactive session".to_string();
         // The §20 tunables config, with the overlay's edit-approval override (if any) baked in so a
         // per-session mode switch is honored by both the live actor and a rehydrated durable engine.
         let mut config = merged_config(self.engine_config, &spec.tunables);

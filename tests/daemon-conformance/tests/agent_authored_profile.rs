@@ -217,7 +217,9 @@ async fn agent_authored_profile_is_recorded_and_spawned_impl() {
         .expect("profile_get")
         .expect("the agent-authored profile is persisted");
     assert!(authored_id.starts_with("agent/author-parent/"));
-    assert_eq!(spec.system_prompt, "a focused helper");
+    // TODO(prompt-arch Lane E): assert the authored persona landed via PersonaStore (SoulGet)
+    // once `profile_manage` routes it there (`system_prompt` left `ProfileSpec` at wire v36).
+    assert_eq!(spec.id, authored_id);
 
     // ...and it is recorded as `Author::Agent("profile_manage")` on the shared revision log.
     let hist = node

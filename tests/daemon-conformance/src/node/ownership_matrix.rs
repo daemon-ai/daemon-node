@@ -331,6 +331,10 @@ fn classify(req: &ApiRequest) -> Coverage {
         | ProfileHistory { .. }
         | ProfileAt { .. }
         | ProfileRevert { .. }
+        // Persona ops (wire v36) are profile-scoped like every other profile op: gated by
+        // ProfileRead/ProfileWrite capability, not per-owner session ownership.
+        | SoulGet { .. }
+        | SoulSet { .. }
         | SkillHistory { .. }
         | SkillAt { .. }
         | SkillRevert { .. }

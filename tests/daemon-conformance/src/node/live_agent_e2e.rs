@@ -63,7 +63,6 @@ async fn mount_gateway(server: &MockServer, content: &str) {
 fn gateway_profile(base: &str) -> ProfileSpec {
     ProfileSpec {
         base_url: Some(base.to_string()),
-        system_prompt: "You are the gateway agent.".into(),
         ..ProfileSpec::new(
             "gateway",
             ProviderSelector::DaemonApi,

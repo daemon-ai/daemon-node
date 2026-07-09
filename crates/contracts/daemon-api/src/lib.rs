@@ -1586,6 +1586,20 @@ pub trait ProfileApi: Send + Sync {
         Err(ApiError::Unsupported("profile_revert".into()))
     }
 
+    /// Read a profile's persona (SOUL.md) text (wire v36). This is the persona SOURCE text only —
+    /// the composed system prompt is never wire-visible. Unknown ids fail with the profile-op
+    /// not-found error rather than seeding a persona doc. Default: unsupported.
+    async fn soul_get(&self, _id: String) -> Result<String, ApiError> {
+        Err(ApiError::Unsupported("soul_get".into()))
+    }
+
+    /// Replace a profile's persona (SOUL.md) text (wire v36). The node validates/scans/caps and
+    /// revision-logs the write; rejected typed for a Foreign-engine profile (its agent owns its
+    /// own prompt — there is no persona to set). Default: unsupported.
+    async fn soul_set(&self, _id: String, _text: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("soul_set".into()))
+    }
+
     /// The revision history of a skill (oldest first), paged at [`WIRE_PAGE_MAX`]; the cursor is
     /// the stringified revision `seq`.
     async fn skill_history(

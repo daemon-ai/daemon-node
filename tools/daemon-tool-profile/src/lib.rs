@@ -152,9 +152,10 @@ fn apply_fields(spec: &mut ProfileSpec, args: &ManageArgs) {
     if let Some(base_url) = &args.base_url {
         spec.base_url = Some(base_url.clone());
     }
-    if let Some(system_prompt) = &args.system_prompt {
-        spec.system_prompt = system_prompt.clone();
-    }
+    // TODO(prompt-arch Lane E): route `system_prompt` (renamed `persona`) through the node's
+    // PersonaStore (the SoulSet path) — the spec field left the wire at v36. The arg is accepted
+    // and ignored until then, so existing agent calls don't hard-fail deserialization.
+    let _ = &args.system_prompt;
     if let Some(tool_allowlist) = &args.tool_allowlist {
         spec.tool_allowlist = Some(tool_allowlist.clone());
     }
