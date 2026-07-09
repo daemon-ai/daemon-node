@@ -217,9 +217,10 @@ impl ProfileSpec {
     /// Core inline sub-agent resolves through the ordinary `resolve_effective` path and a Foreign one
     /// routes to the foreign incarnation. It is never persisted in the profile store (the child binds
     /// `bound_profile = None`); the id is only its transient engine identity.
-    // TODO(prompt-arch Lane E): the inline spec's persona (`InlineProfileSpec.system_prompt`,
-    // renamed `persona`) resolves node-side via PersonaSource::Inline — it left `ProfileSpec` at
-    // wire v36 and no longer maps through this constructor.
+    /// The inline spec's `persona` deliberately does NOT map through this constructor: it left
+    /// `ProfileSpec` at wire v36 and resolves node-side via the inline `PersonaSource` (the fleet
+    /// seed path and the durable rehydrate both read it straight off the persisted
+    /// `InlineProfileSpec`).
     pub fn from_inline(id: impl Into<String>, inline: &daemon_protocol::InlineProfileSpec) -> Self {
         Self {
             tool_allowlist: inline.tool_allowlist.clone(),

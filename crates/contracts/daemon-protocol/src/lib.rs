@@ -238,9 +238,10 @@ impl Default for ForeignBackend {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlineProfileSpec {
-    /// The persona / system prompt the inline sub-agent runs under (empty = the node default).
+    /// The persona the inline sub-agent runs under (resolved node-side via the inline
+    /// `PersonaSource`; empty = the node default, the fleet-child role persona).
     #[serde(default)]
-    pub system_prompt: String,
+    pub persona: String,
     /// The tools the sub-agent may use. `None` = the full node toolset (a widening, operator-only);
     /// `Some(list)` = only those tool names (a least-privilege allowlist).
     #[serde(default)]
@@ -1877,7 +1878,7 @@ mod tests {
         let inline = DelegationInput {
             task: "inline work".into(),
             source: ChildSource::Inline(InlineProfileSpec {
-                system_prompt: "be terse".into(),
+                persona: "be terse".into(),
                 tool_allowlist: Some(vec!["fs".into()]),
                 model: "mock-model".into(),
                 ..InlineProfileSpec::default()

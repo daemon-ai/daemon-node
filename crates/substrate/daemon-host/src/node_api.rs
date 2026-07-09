@@ -231,9 +231,16 @@ pub enum SessionBackend {
 /// 1), read from `SessionMeta.inline_profile`; empty for every non-inline session. When non-empty
 /// and the decoded engine is `Core`, the resolver builds the sub-agent's engine from it directly
 /// (`bound_profile` is `None` for an inline child); a `Foreign` inline is handled by the dispatching
-/// factory's foreign incarnation, so the resolver returns `None` for it.
+/// factory's foreign incarnation, so the resolver returns `None` for it. The [`SessionId`] is the
+/// rehydrating session's own id — the transient engine identity an inline spec resolves under
+/// (its credential/context/memory scope key).
 pub type DurableProfileResolver = Arc<
-    dyn Fn(Option<ProfileRef>, &[u8], &SessionOverlay) -> Option<daemon_core::EngineProfile>
+    dyn Fn(
+            &SessionId,
+            Option<ProfileRef>,
+            &[u8],
+            &SessionOverlay,
+        ) -> Option<daemon_core::EngineProfile>
         + Send
         + Sync,
 >;

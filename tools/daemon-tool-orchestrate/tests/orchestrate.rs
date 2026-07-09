@@ -163,7 +163,7 @@ async fn spawn_carries_an_inline_source_and_rejects_posture_widening() {
     let out = run_as(
         &tool,
         "parent",
-        r#"{"verb":"spawn","task":"inline work","source":{"inline":{"system_prompt":"be terse","tool_allowlist":["fs"],"model":"mock-model"}}}"#,
+        r#"{"verb":"spawn","task":"inline work","source":{"inline":{"persona":"be terse","tool_allowlist":["fs"],"model":"mock-model"}}}"#,
     )
     .await;
     assert!(out.result.ok, "{}", out.result.content);
@@ -171,7 +171,7 @@ async fn spawn_carries_an_inline_source_and_rejects_posture_widening() {
     assert_eq!(
         input.source,
         ChildSource::Inline(InlineProfileSpec {
-            system_prompt: "be terse".into(),
+            persona: "be terse".into(),
             tool_allowlist: Some(vec!["fs".into()]),
             model: "mock-model".into(),
             ..InlineProfileSpec::default()
@@ -183,7 +183,7 @@ async fn spawn_carries_an_inline_source_and_rejects_posture_widening() {
     let denied = run_as(
         &tool,
         "parent",
-        r#"{"verb":"spawn","task":"inline work","source":{"inline":{"system_prompt":"anything"}}}"#,
+        r#"{"verb":"spawn","task":"inline work","source":{"inline":{"persona":"anything"}}}"#,
     )
     .await;
     assert!(

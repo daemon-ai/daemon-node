@@ -276,7 +276,7 @@ impl JobWorker for FleetJobWorker {
                             // store — the synthetic child id must not seed an orphan SOUL doc).
                             let persona = match &input.source {
                                 ChildSource::Inline(inline) => {
-                                    PersonaSource::Inline(&inline.system_prompt)
+                                    PersonaSource::Inline(&inline.persona)
                                 }
                                 _ => PersonaSource::Role(RolePersona::FleetChild),
                             };
@@ -321,15 +321,16 @@ impl JobWorker for FleetJobWorker {
                 // Per-child engine binding (Phase 1). A `Profile(name)` source binds the child's
                 // `bound_profile` — the durable resolver rehydrates it exactly like an interactive
                 // session's binding (an unknown name silently falls back at resolve time). An
-                // `Inline` source instead persists the ad-hoc `ProfileSpec` as opaque bytes in
-                // `inline_profile` with `bound_profile = None`; the durable resolver / foreign
-                // dispatch decode it at every hydrate so the sub-agent's config is honored across
-                // restarts. `Default` leaves both unset (the node default engine shape).
+                // `Inline` source instead persists the ad-hoc `InlineProfileSpec` itself as opaque
+                // bytes in `inline_profile` with `bound_profile = None` — the persona rides along —
+                // and the durable resolver / foreign dispatch decode it at every hydrate so the
+                // sub-agent's config is honored across restarts. `Default` leaves both unset (the
+                // node default engine shape).
                 if let Some(name) = &bound_profile {
                     meta.bound_profile = Some(ProfileRef::new(name.clone()));
                 }
-                if let Some(spec) = &inline_spec {
-                    meta.inline_profile = to_cbor(spec);
+                if let ChildSource::Inline(inline) = &input.source {
+                    meta.inline_profile = to_cbor(inline);
                 }
                 // Title the child from its task (truncated) so the parent's `status` verb and the
                 // GUI tree show what each child is doing; never clobbers an existing title.

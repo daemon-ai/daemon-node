@@ -643,29 +643,33 @@ fn build_factory(
         let store = store.clone();
         let ctx = ctx.clone();
         // Re-resolve a durable session's engine at hydrate. Precedence:
-        //   1. an INLINE sub-agent spec (Phase 1): the opaque `ProfileSpec` persisted in
+        //   1. an INLINE sub-agent spec (Phase 1): the opaque `InlineProfileSpec` persisted in
         //      `SessionMeta.inline_profile` (bound_profile is `None` for an inline child). A Core
-        //      inline spec resolves here; a Foreign inline spec is routed to the dispatching
-        //      factory's foreign incarnation, so this returns `None` (the foreign path).
-        //   2. a bound profile name -> the profile store.
+        //      inline spec resolves here — its persisted persona rides straight into the Identity
+        //      slot (never the persona store: the synthetic child id must not seed an orphan SOUL
+        //      doc); a Foreign inline spec is routed to the dispatching factory's foreign
+        //      incarnation, so this returns `None` (the foreign path).
+        //   2. a bound profile name -> the profile store (SOUL.md-backed persona).
         //   3. neither (e.g. a delegated orchestrator child) -> `None`, so the factory keeps its
         //      orchestrator profile.
         // `resolve_effective` stays Core-only: a `Foreign{agent}` binding/inline is routed to the
         // foreign incarnation, so the resolver only ever builds Core specs.
         let resolver: DurableProfileResolver = Arc::new(
-            move |bound: Option<ProfileRef>, inline: &[u8], overlay: &SessionOverlay| {
+            move |session: &SessionId,
+                  bound: Option<ProfileRef>,
+                  inline: &[u8],
+                  overlay: &SessionOverlay| {
                 if !inline.is_empty() {
-                    let spec = from_cbor::<ProfileSpec>(inline).ok()?;
-                    return match spec.engine {
-                        // The synthetic inline id must never touch the persona store (a load
-                        // would seed an orphan SOUL doc): until the persisted payload carries
-                        // the inline persona (prompt-arch WI-9), a rehydrated inline child runs
-                        // the fleet-child role persona.
-                        EngineSelector::Core => Some(ctx.resolve_effective(
-                            &spec,
-                            overlay,
-                            PersonaSource::Role(RolePersona::FleetChild),
-                        )),
+                    let inline = from_cbor::<daemon_protocol::InlineProfileSpec>(inline).ok()?;
+                    return match inline.engine {
+                        EngineSelector::Core => {
+                            let spec = ProfileSpec::from_inline(session.as_str(), &inline);
+                            Some(ctx.resolve_effective(
+                                &spec,
+                                overlay,
+                                PersonaSource::Inline(&inline.persona),
+                            ))
+                        }
                         EngineSelector::Foreign { .. } => None,
                     };
                 }

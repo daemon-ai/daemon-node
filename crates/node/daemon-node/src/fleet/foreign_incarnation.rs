@@ -104,14 +104,20 @@ impl DispatchingIncarnation {
     ) -> Option<(SessionId, String, ForeignBackend)> {
         let session_id = Snapshot::decode(snapshot).ok()?.session_id;
         let meta = foreign.store.session_meta(&session_id).await?;
-        let spec = if !meta.inline_profile.is_empty() {
-            daemon_api::from_cbor::<daemon_api::ProfileSpec>(&meta.inline_profile).ok()?
+        // An inline child persists the `InlineProfileSpec` itself (engine + foreign backend ride
+        // it directly); a bound child resolves its `ProfileSpec` from the store.
+        let (engine, backend) = if !meta.inline_profile.is_empty() {
+            let inline =
+                daemon_api::from_cbor::<daemon_protocol::InlineProfileSpec>(&meta.inline_profile)
+                    .ok()?;
+            (inline.engine, inline.foreign_backend)
         } else {
             let bound = meta.bound_profile?;
-            foreign.profiles.get(bound.as_str()).ok().flatten()?
+            let spec = foreign.profiles.get(bound.as_str()).ok().flatten()?;
+            (spec.engine, spec.foreign_backend)
         };
-        match spec.engine {
-            EngineSelector::Foreign { agent } => Some((session_id, agent, spec.foreign_backend)),
+        match engine {
+            EngineSelector::Foreign { agent } => Some((session_id, agent, backend)),
             EngineSelector::Core => None,
         }
     }

@@ -8,7 +8,7 @@
 //! Three cases against the REAL assembled node (dispatching engine factory + durable job worker +
 //! the ephemeral reaper):
 //!
-//! - a **Core** inline sub-agent (custom `system_prompt` + a restricted `tool_allowlist`): the
+//! - a **Core** inline sub-agent (custom `persona` + a restricted `tool_allowlist`): the
 //!   durable resolver rebuilds the child's engine from the persisted inline `ProfileSpec` — proven
 //!   by capturing the exact spec the provider resolver is handed at resolution — and the child
 //!   (ephemeral) is reaped (archived) after it completes (the inline persona no longer maps onto
@@ -76,9 +76,40 @@ impl Provider for SpawnSourceProvider {
 
 /// The captured `(id, tool_allowlist)` the provider resolver is handed — the proof an inline
 /// sub-agent's spec reached engine resolution.
-// TODO(prompt-arch Lane E): re-capture the inline persona through PersonaSource resolution (it
-// left `ProfileSpec` at wire v36, so the resolver spec no longer carries it).
 type CapturedSpecs = Arc<Mutex<Vec<(String, Option<Vec<String>>)>>>;
+
+/// The captured `(engine id, Request.system)` of every resolved engine's model calls — the proof
+/// the inline persona reached the composed Identity slot (PersonaSource::Inline).
+type CapturedSystems = Arc<Mutex<Vec<(String, String)>>>;
+
+/// The provider a resolved (inline child) engine runs: records each request's composed system
+/// string under the engine's id, then completes.
+struct SystemCaptureProvider {
+    id: String,
+    systems: CapturedSystems,
+}
+
+#[async_trait::async_trait]
+impl Provider for SystemCaptureProvider {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            supports_native_tools: true,
+            supports_streaming: false,
+            tool_call_format: ToolCallFormat::Native,
+            max_context: Some(8192),
+        }
+    }
+    async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+        self.systems
+            .lock()
+            .unwrap()
+            .push((self.id.clone(), req.system.clone()));
+        Ok(ModelOutput {
+            text: "inline done".into(),
+            ..Default::default()
+        })
+    }
+}
 
 /// Assemble a full node wired for inline delegation: a profile store + a capturing provider resolver
 /// (so the dispatching factory + Core resolution are active) and an `orchestrator` provider that
@@ -91,6 +122,7 @@ fn assemble_inline_node(
     Arc<dyn SessionStore>,
     SupervisorHandle,
     CapturedSpecs,
+    CapturedSystems,
 ) {
     let orchestrator: ProviderBuilder = {
         let source_json = source_json.to_string();
@@ -107,17 +139,26 @@ fn assemble_inline_node(
     providers.register("orchestrator", orchestrator);
 
     // The capturing resolver: records every spec it is handed (the inline child's spec carries the
-    // ad-hoc allowlist), and returns a completing mock so a Core child finishes its turn.
+    // ad-hoc allowlist), and returns a system-recording provider so a Core child's model call
+    // proves what composed prompt it actually ran under.
     let captured: CapturedSpecs = Arc::new(Mutex::new(Vec::new()));
+    let systems: CapturedSystems = Arc::new(Mutex::new(Vec::new()));
     let resolver: ProviderResolver = {
         let captured = captured.clone();
+        let systems = systems.clone();
         Arc::new(move |spec: &ProfileSpec| {
             captured
                 .lock()
                 .unwrap()
                 .push((spec.id.clone(), spec.tool_allowlist.clone()));
-            let builder: ProviderBuilder =
-                Arc::new(|| Arc::new(MockProvider::completing("inline done")) as Arc<dyn Provider>);
+            let id = spec.id.clone();
+            let systems = systems.clone();
+            let builder: ProviderBuilder = Arc::new(move || {
+                Arc::new(SystemCaptureProvider {
+                    id: id.clone(),
+                    systems: systems.clone(),
+                }) as Arc<dyn Provider>
+            });
             builder
         })
     };
@@ -165,7 +206,7 @@ fn assemble_inline_node(
         foreign_gateway: None,
         prompt: Default::default(),
     });
-    (node, store, handle, captured)
+    (node, store, handle, captured, systems)
 }
 
 /// Register the compiled mock ACP agent under `name` (source Manual), verified installed by the
@@ -224,8 +265,8 @@ async fn core_inline_subagent_runs_with_inline_config_and_is_reaped() {
 async fn core_inline_subagent_runs_with_inline_config_and_is_reaped_impl() {
     // A Core inline sub-agent: a custom persona + a restricted single-tool allowlist, no engine
     // (defaults to Core), no saved profile.
-    let source = r#"{"inline":{"system_prompt":"you are a haiku bot","tool_allowlist":["fs"],"model":"mock-model"}}"#;
-    let (node, store, handle, captured) = assemble_inline_node(source);
+    let source = r#"{"inline":{"persona":"you are a haiku bot","tool_allowlist":["fs"],"model":"mock-model"}}"#;
+    let (node, store, handle, captured, systems) = assemble_inline_node(source);
 
     let parent = SessionId::new("orch-parent");
     node.assign(parent.clone())
@@ -254,8 +295,6 @@ async fn core_inline_subagent_runs_with_inline_config_and_is_reaped_impl() {
     // Positive proof it ran with the INLINE config: the provider resolver was handed a spec keyed
     // by the child's id carrying the restricted allowlist (the durable resolver rebuilt the engine
     // from the persisted inline spec).
-    // TODO(prompt-arch Lane E): also re-prove the inline persona reached resolution (via
-    // PersonaSource) — it left `ProfileSpec` at wire v36, so the resolver spec no longer shows it.
     let saw_inline = captured.lock().unwrap().iter().any(|(id, allow)| {
         id == child.as_str() && allow.as_deref() == Some(&["fs".to_string()][..])
     });
@@ -263,6 +302,21 @@ async fn core_inline_subagent_runs_with_inline_config_and_is_reaped_impl() {
         saw_inline,
         "the inline restricted allowlist reached engine resolution; captured: {:?}",
         captured.lock().unwrap()
+    );
+    // ...and the inline persona reached the composed Identity slot end to end: the child's model
+    // call carried a system prompt OPENING with the ad-hoc persona (PersonaSource::Inline; the
+    // Identity slot renders first).
+    let child_system = systems
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(id, _)| id == child.as_str())
+        .map(|(_, system)| system.clone())
+        .expect("the inline child made a model call through the resolved provider");
+    assert!(
+        child_system.starts_with("you are a haiku bot"),
+        "the inline persona opens the child's composed system prompt; got: {}",
+        &child_system[..child_system.len().min(200)]
     );
 
     // Ephemeral reaping: the completed ephemeral child is archived after the (short) grace elapses.
@@ -296,7 +350,7 @@ async fn foreign_inline_subagent_runs_as_acp_impl() {
     // A Foreign inline sub-agent: engine names the ACP agent by catalog name; an explicit (empty)
     // allowlist keeps it out of the posture-widening gate (a foreign agent uses its own tools).
     let source = r#"{"inline":{"engine":{"Foreign":{"agent":"fake-echo"}},"tool_allowlist":[]}}"#;
-    let (node, store, handle, _captured) = assemble_inline_node(source);
+    let (node, store, handle, _captured, _systems) = assemble_inline_node(source);
     register_mock_agent(&node, "fake-echo").await;
 
     let parent = SessionId::new("orch-parent");
@@ -356,8 +410,8 @@ async fn posture_widening_inline_spec_is_rejected() {
 
 async fn posture_widening_inline_spec_is_rejected_impl() {
     // No tool_allowlist -> the full node toolset -> a security-widening only an operator may grant.
-    let source = r#"{"inline":{"system_prompt":"unrestricted"}}"#;
-    let (node, store, handle, _captured) = assemble_inline_node(source);
+    let source = r#"{"inline":{"persona":"unrestricted"}}"#;
+    let (node, store, handle, _captured, _systems) = assemble_inline_node(source);
 
     let parent = SessionId::new("orch-parent");
     node.assign(parent.clone())

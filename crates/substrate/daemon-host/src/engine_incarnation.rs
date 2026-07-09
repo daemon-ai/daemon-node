@@ -314,7 +314,7 @@ impl CoreIncarnation {
         let store = self.journal.as_ref().map(|cfg| &cfg.store)?;
         let meta = store.session_meta(session).await.unwrap_or_default();
         let overlay = decode_overlay(&meta.overlay);
-        resolver(meta.bound_profile, &meta.inline_profile, &overlay)
+        resolver(session, meta.bound_profile, &meta.inline_profile, &overlay)
     }
 
     /// Capture this (child) session's `outbox/` into the content store as a structured
