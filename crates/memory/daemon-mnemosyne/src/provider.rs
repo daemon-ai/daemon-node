@@ -1288,4 +1288,152 @@ mod tests {
             "audit actions: {audits:?}"
         );
     }
+
+    // ---- Unified private + surface recall (`tests/test_hermes_memory_provider_unified_recall.py`) ----
+
+    fn surface_read_provider(shared_surface_read: bool) -> MnemosyneProvider {
+        let engine = Arc::new(
+            Engine::open_in_memory(MnemosyneConfig {
+                shared_surface_read,
+                ..MnemosyneConfig::default()
+            })
+            .unwrap(),
+        );
+        MnemosyneProvider::new(engine)
+    }
+
+    async fn seed_private_tool(provider: &MnemosyneProvider, content: &str) {
+        let res = provider
+            .call_tool(
+                "mnemosyne_remember",
+                json!({"content": content, "importance": 0.6, "source": "fact", "scope": "global"}),
+            )
+            .await;
+        assert!(res.contains("\"status\":\"stored\""), "seed private: {res}");
+    }
+
+    async fn seed_surface_tool(provider: &MnemosyneProvider, content: &str) {
+        let res = provider
+            .call_tool(
+                "mnemosyne_shared_remember",
+                json!({"content": content, "kind": "preference", "importance": 0.8}),
+            )
+            .await;
+        assert!(
+            res.contains("\"status\":\"stored_shared\""),
+            "seed surface: {res}"
+        );
+    }
+
+    // PARITY: Mnemosyne tests/test_hermes_memory_provider_unified_recall.py::test_recall_default_returns_private_only
+    // PARITY: Mnemosyne tests/test_hermes_memory_provider_unified_recall.py::test_recall_default_tags_results_as_private
+    #[tokio::test]
+    async fn recall_default_returns_private_only_and_tags_private() {
+        let provider = surface_read_provider(false);
+        seed_private_tool(&provider, "Project root lives at /tmp/project directory").await;
+        seed_surface_tool(&provider, "User prefers Tailscale over OpenVPN").await;
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_recall",
+                json!({"query": "Tailscale", "limit": 10}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(
+            parsed["shared_surface_read"], false,
+            "surface read off: {res}"
+        );
+        for r in parsed["results"].as_array().unwrap() {
+            assert!(
+                !r["content"].as_str().unwrap().contains("Tailscale"),
+                "surface content must not leak when read is off: {res}"
+            );
+        }
+
+        // A query that DOES match the private row is tagged bank=private.
+        let res2 = provider
+            .call_tool(
+                "mnemosyne_recall",
+                json!({"query": "project root", "limit": 5}),
+            )
+            .await;
+        let parsed2: Value = serde_json::from_str(&res2).unwrap();
+        let rows = parsed2["results"].as_array().unwrap();
+        assert!(!rows.is_empty(), "private row must surface: {res2}");
+        for r in rows {
+            assert_eq!(r["bank"], "private", "private tag: {res2}");
+        }
+    }
+
+    // PARITY: Mnemosyne tests/test_hermes_memory_provider_unified_recall.py::test_recall_merges_results_from_both_banks
+    // PARITY: Mnemosyne tests/test_hermes_memory_provider_unified_recall.py::test_recall_tags_surface_results_with_bank_surface
+    #[tokio::test]
+    async fn recall_with_surface_read_merges_both_banks() {
+        let provider = surface_read_provider(true);
+        seed_private_tool(&provider, "User project Acme uses Postgres on port 5432").await;
+        seed_surface_tool(&provider, "User prefers Postgres for production databases").await;
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_recall",
+                json!({"query": "Postgres", "limit": 10}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(
+            parsed["shared_surface_read"], true,
+            "surface read on: {res}"
+        );
+        let banks: std::collections::HashSet<&str> = parsed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["bank"].as_str().unwrap())
+            .collect();
+        assert!(banks.contains("private"), "private bank present: {res}");
+        assert!(banks.contains("surface"), "surface bank merged: {res}");
+        // Surface rows carry the shared_surface flag.
+        for r in parsed["results"].as_array().unwrap() {
+            if r["bank"] == "surface" {
+                assert_eq!(r["shared_surface"], true, "surface flag: {res}");
+            }
+        }
+    }
+
+    // PARITY: Mnemosyne tests/test_hermes_memory_provider_unified_recall.py::test_recall_truncates_to_top_k_after_merge
+    #[tokio::test]
+    async fn recall_truncates_to_top_k_after_merge() {
+        let provider = surface_read_provider(true);
+        for i in 0..5 {
+            seed_private_tool(
+                &provider,
+                &format!("User runs script number {i} for migration tasks"),
+            )
+            .await;
+        }
+        for i in 0..5 {
+            seed_surface_tool(
+                &provider,
+                &format!("User prefers tool variant {i} for migration tasks"),
+            )
+            .await;
+        }
+
+        let res = provider
+            .call_tool(
+                "mnemosyne_recall",
+                json!({"query": "migration tasks", "limit": 4}),
+            )
+            .await;
+        let parsed: Value = serde_json::from_str(&res).unwrap();
+        assert!(
+            parsed["count"].as_u64().unwrap() <= 4,
+            "merged results truncated to top-k: {res}"
+        );
+        assert!(
+            parsed["results"].as_array().unwrap().len() <= 4,
+            "len<=4: {res}"
+        );
+    }
 }
