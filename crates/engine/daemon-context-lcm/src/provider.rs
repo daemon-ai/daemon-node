@@ -2439,6 +2439,412 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // parity: engine.py::test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool (tests/test_lcm_engine.py:1315)
+    #[tokio::test]
+    async fn compacted_restart_skips_synthetic_context_but_persists_new_tool() {
+        let dir = reconcile_dir("compacted-new-tool");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        // Incarnation 1: compact a long conversation (produces the synthetic summary scaffold).
+        let compacted = {
+            let lcm = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("s1"),
+                aux_with("s"),
+            )
+            .unwrap();
+            lcm.on_model(&model());
+            lcm.compact(convo(50), 100).await
+        };
+        let count1 = {
+            let probe = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("probe"),
+                aux_with("s"),
+            )
+            .unwrap();
+            probe.store().message_count("s1").unwrap()
+        };
+        // Incarnation 2: replay the compacted snapshot plus a genuinely-new tool turn.
+        let mut replay = compacted;
+        replay.push_tool(ToolTurn {
+            assistant: AssistantMsg::text("calling terminal"),
+            calls: vec![(
+                ToolCall {
+                    call_id: "call_2".into(),
+                    name: "terminal".into(),
+                    args: "{}".into(),
+                },
+                ToolResult {
+                    call_id: "call_2".into(),
+                    ok: true,
+                    content: "tool output after compacted restart".into(),
+                },
+            )],
+        });
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len() as i64,
+            count1 + 2,
+            "the synthetic summary context is skipped; only the new tool turn is persisted"
+        );
+        assert_eq!(
+            rows.last().unwrap().content.as_deref(),
+            Some("tool output after compacted restart")
+        );
+        assert_eq!(rows.last().unwrap().tool_call_id.as_deref(), Some("call_2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_reconciles_full_replay_without_system_prompt (tests/test_lcm_engine.py:1606)
+    #[tokio::test]
+    async fn restart_full_replay_without_system_anchor_appends_only_new_row() {
+        let dir = reconcile_dir("full-replay-no-anchor");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("first question"));
+            c.push_assistant(AssistantMsg::text("first answer"));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("first question"));
+        replay.push_assistant(AssistantMsg::text("first answer"));
+        replay.push_user(UserMsg::new("new question after restart"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "first question",
+                "first answer",
+                "new question after restart"
+            ],
+            "a multi-row full replay is proof enough without a system anchor"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_reconciles_complete_replay_without_system_prompt (tests/test_lcm_engine.py:1651)
+    #[tokio::test]
+    async fn restart_complete_replay_without_new_rows_is_noop() {
+        let dir = reconcile_dir("complete-replay-noop");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("first question"));
+            c.push_assistant(AssistantMsg::text("first answer"));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("first question"));
+        replay.push_assistant(AssistantMsg::text("first answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(contents, vec!["first question", "first answer"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail (tests/test_lcm_engine.py:1800)
+    #[tokio::test]
+    async fn restart_scaffolded_delta_matching_tail_is_preserved() {
+        let dir = reconcile_dir("scaffolded-delta");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("initial question"));
+            c.push_assistant(AssistantMsg::text("initial answer"));
+            c.push_user(UserMsg::new("retry"));
+        })
+        .await;
+        // Restart with the LCM system note and a delta repeating only the durable tail row.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_user(UserMsg::new("retry"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec!["initial question", "initial answer", "retry", "retry"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail_with_followup (tests/test_lcm_engine.py:1845)
+    #[tokio::test]
+    async fn restart_scaffolded_delta_with_followup_is_preserved() {
+        let dir = reconcile_dir("scaffolded-delta-followup");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("initial question"));
+            c.push_assistant(AssistantMsg::text("initial answer"));
+            c.push_user(UserMsg::new("retry"));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_user(UserMsg::new("retry"));
+        replay.push_assistant(AssistantMsg::text("next answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "initial question",
+                "initial answer",
+                "retry",
+                "retry",
+                "next answer"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_restart_reconciliation_filtered_singleton_tail_stays_ambiguous (tests/test_lcm_engine.py:2397)
+    #[tokio::test]
+    async fn restart_filtered_singleton_tail_stays_ambiguous() {
+        let dir = reconcile_dir("filtered-singleton");
+        let base = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        // Incarnation 1 has no ignore filter: both rows are persisted.
+        persist_durable_turns(&base, "s1", |c| {
+            c.push_user(UserMsg::new("Cronjob Response: heartbeat"));
+            c.push_user(UserMsg::new("real singleton tail"));
+        })
+        .await;
+        // Incarnation 2 enables the ignore filter; the singleton delta repeats the visible tail
+        // but stays ambiguous and must be preserved.
+        let cfg2 = LcmConfig {
+            ignore_message_patterns: vec!["^Cronjob Response:".to_string()],
+            ..base.clone()
+        };
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg2, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("real singleton tail"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "Cronjob Response: heartbeat",
+                "real singleton tail",
+                "real singleton tail"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_large_session_restart_reconciles_beyond_short_tail_window (tests/test_lcm_engine.py:1510)
+    #[tokio::test]
+    async fn restart_large_session_reconciles_beyond_short_tail_window() {
+        let dir = reconcile_dir("large-session");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            for i in 0..5000 {
+                c.push_user(UserMsg::new(format!("message before restart {i}")));
+            }
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        for i in 0..5000 {
+            replay.push_user(UserMsg::new(format!("message before restart {i}")));
+        }
+        replay.push_tool(ToolTurn {
+            assistant: AssistantMsg::text("calling terminal"),
+            calls: vec![(
+                ToolCall {
+                    call_id: "call_large".into(),
+                    name: "terminal".into(),
+                    args: "{}".into(),
+                },
+                ToolResult {
+                    call_id: "call_large".into(),
+                    ok: true,
+                    content: "large-session tool output after restart".into(),
+                },
+            )],
+        });
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len(), 5002, "5000 replayed rows + assistant + tool");
+        assert_eq!(rows.last().unwrap().role, "tool");
+        assert_eq!(
+            rows.last().unwrap().tool_call_id.as_deref(),
+            Some("call_large")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_repeated_prefix_after_scaffold_only_prefix (tests/test_lcm_engine.py:2338)
+    #[tokio::test]
+    async fn restart_repeated_head_after_scaffold_only_prefix_is_preserved() {
+        let dir = reconcile_dir("scaffold-repeated-head");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("old first question"));
+            c.push_assistant(AssistantMsg::text("old first answer"));
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable tail after scaffold {i}")));
+            }
+        })
+        .await;
+        let durable = 82;
+        // A stale replay: scaffold summary turn, then the durable HEAD pair (not the tail). The
+        // scaffold-only prefix is skipped; the repeated pair must be appended (no stale proof —
+        // the LCM-note system prompt is not a plain anchor).
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_assistant(AssistantMsg::text(
+            "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+        ));
+        replay.push_user(UserMsg::new("old first question"));
+        replay.push_assistant(AssistantMsg::text("old first answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len() as i64, durable + 2);
+        assert_eq!(
+            rows[rows.len() - 2].content.as_deref(),
+            Some("old first question")
+        );
+        assert_eq!(
+            rows[rows.len() - 1].content.as_deref(),
+            Some("old first answer")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_cleanup_sensitive_scaffolded_repeated_tail (tests/test_lcm_engine.py:1891)
+    #[tokio::test]
+    async fn restart_literal_json_assistant_tail_delta_is_preserved() {
+        let dir = reconcile_dir("literal-json-tail");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        let literal_json = r#"[{"text": "visible literal JSON payload", "type": "thinking"}]"#;
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("older question"));
+            c.push_assistant(AssistantMsg::text("older answer"));
+            c.push_user(UserMsg::new("retry"));
+            c.push_assistant(AssistantMsg::text(literal_json));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_user(UserMsg::new("retry"));
+        replay.push_assistant(AssistantMsg::text(literal_json));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len(), 6);
+        let tail: Vec<&str> = rows[2..]
+            .iter()
+            .filter_map(|r| r.content.as_deref())
+            .collect();
+        assert_eq!(tail, vec!["retry", literal_json, "retry", literal_json]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_skips_exact_lcm_system_scaffold (tests/test_lcm_engine.py:2095)
+    #[tokio::test]
+    async fn restart_system_only_replay_leaves_store_untouched() {
+        let dir = reconcile_dir("system-only");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("tail before restart"));
+        })
+        .await;
+        // Rust keeps the system prompt off the turn stream, so an "exact LCM system scaffold"
+        // replay is a conversation with zero turns; nothing must be ingested or deleted.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content.as_deref(), Some("tail before restart"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn ingest_redacts_sensitive_content_when_enabled() {
         let cfg = LcmConfig {

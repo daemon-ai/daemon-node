@@ -61,6 +61,17 @@ port of `_reconcile_ingest_cursor_from_store` / `_find_reconciled_cursor_for_sto
 the cursor past the proven replay prefix **without deleting durable rows**, then rebuilds
 `turn_store_ids` from the durable tail so a later compaction still maps replayed turns to real rows.
 
+| `test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool` (L1315) | ported-pass | `compacted_restart_skips_synthetic_context_but_persists_new_tool` | scaffold-led delete-path reconcile skips the synthetic context, persists the new tool turn |
+| `test_existing_session_restart_reconciles_full_replay_without_system_prompt` (L1606) | ported-pass | `restart_full_replay_without_system_anchor_appends_only_new_row` | raw multi-row full replay accepted without a system anchor |
+| `test_existing_session_restart_reconciles_complete_replay_without_system_prompt` (L1651) | ported-pass | `restart_complete_replay_without_new_rows_is_noop` | complete replay with nothing new is a no-op |
+| `test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail` (L1800) | ported-pass | `restart_scaffolded_delta_matching_tail_is_preserved` | LCM-note system prompt + singleton tail-matching delta stays ambiguous, appended |
+| `..._with_followup` (L1845) | ported-pass | `restart_scaffolded_delta_with_followup_is_preserved` | same + follow-up |
+| `test_restart_reconciliation_filtered_singleton_tail_stays_ambiguous` (L2397) | ported-pass | `restart_filtered_singleton_tail_stays_ambiguous` | ignore-filtered durable rows leave a singleton visible tail; delta preserved |
+| `test_existing_large_session_restart_reconciles_beyond_short_tail_window` (L1510) | ported-pass | `restart_large_session_reconciles_beyond_short_tail_window` | 5000-row session, full replay + new tool turn, no duplication |
+| `test_existing_session_restart_persists_repeated_prefix_after_scaffold_only_prefix` (L2338) | ported-pass | `restart_repeated_head_after_scaffold_only_prefix_is_preserved` | scaffold-only prefix skipped, repeated durable-head pair appended |
+| `test_existing_session_restart_persists_cleanup_sensitive_scaffolded_repeated_tail` (L1891) | ported-pass | `restart_literal_json_assistant_tail_delta_is_preserved` | literal-JSON assistant tail delta appended (Rust replay is not collapsed for this shape) |
+| `test_existing_session_restart_skips_exact_lcm_system_scaffold` (L2095) | ported-pass | `restart_system_only_replay_leaves_store_untouched` | zero-turn replay (system prompt is off the turn stream) never ingests/deletes |
+
 Reconcile gap-open rows (not attempted this pass) are grouped in the backlog section below.
 
 ### Area 2 — engine-level compaction behaviors
