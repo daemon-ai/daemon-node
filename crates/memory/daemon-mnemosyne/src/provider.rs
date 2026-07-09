@@ -1401,6 +1401,83 @@ mod tests {
         }
     }
 
+    // PARITY: Mnemosyne tests/test_hermes_memory_provider_thread_isolation.py::test_gateway_session_key_isolates_session_memories
+    // Two providers over the SAME on-disk bank but distinct session ids (the gateway thread key is
+    // the Rust session_id) must not surface each other's session-scoped rows through the recall
+    // tool, while scope='global' rows cross both.
+    #[tokio::test]
+    async fn recall_isolates_session_memories_across_providers() {
+        let dir = std::env::temp_dir().join(format!("mnemosyne-prov-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let make = |session_id: &str| {
+            let engine = Arc::new(
+                Engine::open(MnemosyneConfig {
+                    data_dir: dir.clone(),
+                    session_id: session_id.to_string(),
+                    ..MnemosyneConfig::default()
+                })
+                .unwrap(),
+            );
+            MnemosyneProvider::new(engine)
+        };
+        let prov_a = make("hermes_agent:main:telegram:dm:12345:11111");
+        let prov_b = make("hermes_agent:main:telegram:dm:12345:22222");
+
+        async fn remember(p: &MnemosyneProvider, content: &str, scope: &str) {
+            let res = p
+                .call_tool(
+                    "mnemosyne_remember",
+                    json!({"content": content, "scope": scope}),
+                )
+                .await;
+            assert!(res.contains("\"status\":\"stored\""), "remember: {res}");
+        }
+        async fn recall_contents(p: &MnemosyneProvider, query: &str) -> Vec<String> {
+            let res = p
+                .call_tool("mnemosyne_recall", json!({"query": query}))
+                .await;
+            let parsed: Value = serde_json::from_str(&res).unwrap();
+            parsed["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["content"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        remember(&prov_a, "Secret A the sky is green", "session").await;
+        remember(&prov_b, "Secret B the ocean is purple", "session").await;
+        remember(&prov_a, "Global water is wet", "global").await;
+
+        let a_secret = recall_contents(&prov_a, "secret").await;
+        assert!(
+            a_secret.iter().any(|c| c.contains("Secret A")),
+            "A sees its own session row: {a_secret:?}"
+        );
+        assert!(
+            !a_secret.iter().any(|c| c.contains("Secret B")),
+            "A must NOT see B's session row: {a_secret:?}"
+        );
+
+        // The global row crosses both threads.
+        assert!(
+            recall_contents(&prov_a, "global water")
+                .await
+                .iter()
+                .any(|c| c.contains("Global water is wet")),
+            "A sees the global row"
+        );
+        assert!(
+            recall_contents(&prov_b, "global water")
+                .await
+                .iter()
+                .any(|c| c.contains("Global water is wet")),
+            "B sees the global row"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // PARITY: Mnemosyne tests/test_hermes_memory_provider_unified_recall.py::test_recall_truncates_to_top_k_after_merge
     #[tokio::test]
     async fn recall_truncates_to_top_k_after_merge() {
