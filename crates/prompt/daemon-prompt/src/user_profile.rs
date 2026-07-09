@@ -510,6 +510,15 @@ fn drift_outcome(path: &std::path::Path, backup: PathBuf) -> WriteOutcome {
     }
 }
 
+/// The periodic USER.md save reminder injected on the nudge cadence (ephemeral, per-turn — it
+/// rides the turn injection, never the cached system prefix or the durable conversation). The
+/// daemon analogue of hermes' `memory.nudge_interval` reminder, targeted at the `user_profile`
+/// tool.
+pub const USER_PROFILE_NUDGE: &str = "[Periodic reminder] If you have learned durable facts \
+about the user this session (preferences, corrections, personal details, how they like to \
+work), save them now with the user_profile tool. If nothing new is worth saving, continue and \
+do not mention this reminder.";
+
 /// A pure nudge counter: fires every `interval` user turns. Assistant-only turns simply don't
 /// call [`on_user_turn`](Self::on_user_turn), so they never advance it; `interval == 0` disables
 /// it entirely. On session restore, [`hydrate`](Self::hydrate) re-seats the counter from the
@@ -1061,6 +1070,13 @@ mod tests {
     }
 
     // ── NudgeCounter ──────────────────────────────────────────────────
+
+    #[test]
+    fn nudge_text_names_the_tool_and_passes_the_scanner() {
+        assert!(USER_PROFILE_NUDGE.contains("user_profile"));
+        // A nudge injected into user context must never trip the same scanner that guards it.
+        assert!(first_threat_message(USER_PROFILE_NUDGE, Scope::Strict).is_none());
+    }
 
     #[test]
     fn nudge_fires_every_interval() {

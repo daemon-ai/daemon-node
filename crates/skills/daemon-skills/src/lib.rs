@@ -995,6 +995,11 @@ impl StablePromptSource for SkillsPromptSource {
         let index = self.store.render_index();
         (!index.is_empty()).then_some(index)
     }
+
+    /// The skills progressive-disclosure index owns its dedicated composed-prompt slot.
+    fn slot_kind(&self) -> daemon_core::SlotKind {
+        daemon_core::SlotKind::SkillsIndex
+    }
 }
 
 /// Parse the leading `---`-delimited YAML frontmatter of a `SKILL.md` body.

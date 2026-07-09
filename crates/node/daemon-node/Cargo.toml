@@ -45,6 +45,10 @@ daemon-skills = { workspace = true }
 # The prompt content + stores (hermes parity): PersonaStore (SOUL.md) / UserProfileStore (USER.md),
 # the role persona library, and the gated guidance builders the node composes into engine prompts.
 daemon-prompt = { workspace = true }
+# The composed prompt's date-only stamp (hermes "%A, %B %d, %Y"), formatted at composition time.
+chrono = { workspace = true }
+# The subdirectory hint observer parses tool-call argument JSON for workspace paths.
+serde_json = { workspace = true }
 async-trait = { workspace = true }
 # The host fleet event bus (I4/I8) is a `tokio::sync::broadcast` channel threaded through the
 # assembled producers (FleetRuntime/FleetJobWorker) into the tree-push surface.
@@ -53,7 +57,6 @@ tokio = { workspace = true }
 [dev-dependencies]
 # Smoke-test the wired-in defaults (LCM context + Mnemosyne memory) end-to-end through an engine turn.
 tokio = { workspace = true }
-serde_json = { workspace = true }
 daemon-context-lcm = { workspace = true }
 daemon-mnemosyne = { workspace = true }
 # Persona-resolution tests run a real PersonaStore over a scratch dir.

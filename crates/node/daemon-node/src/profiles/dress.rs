@@ -80,6 +80,14 @@ pub(crate) fn dress_with_credential(
     if let Some(index) = skills_index {
         profile = profile.with_prompt_block(index.clone());
     }
+    // The prompt-architecture source set (guidance / context files / USER.md / stamp). The role
+    // engines run as the launch agent, so their USER.md scope is the launch profile (OQ7); the
+    // background curators never pass through here (registry.rs builds them persona-only).
+    profile = crate::profiles::prompt_sources::attach_prompt_sources(
+        profile,
+        &a.prompt,
+        a.profile.as_str(),
+    );
     if let Some(checkpoints) = &a.checkpoints {
         profile = profile.with_checkpoints(checkpoints.clone());
     }

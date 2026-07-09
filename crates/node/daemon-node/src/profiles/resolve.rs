@@ -116,6 +116,10 @@ impl SessionFactoryCtx {
         if let Some(index) = skills_index {
             profile = profile.with_prompt_block(index);
         }
+        // The prompt-architecture source set (guidance / context files / USER.md / stamp), gated
+        // by the `[prompt]` policy and scoped to the profile's own USER.md.
+        profile =
+            crate::profiles::prompt_sources::attach_prompt_sources(profile, &self.prompt, &spec.id);
         profile = self.apply_credentials(profile, spec);
         self.apply_workspace_exec(profile, overlay)
     }
@@ -430,6 +434,213 @@ mod tests {
             crate::profiles::persona::PersonaSource::Profile(&base.id),
         );
         assert_eq!(seen.lock().unwrap().clone().unwrap().0, "base-model");
+    }
+
+    /// Full-slot composition through the real resolution path: a profile resolved with a persona
+    /// store, a user-profile store, a skills index, memory, and a workspace context file composes
+    /// EVERY [`daemon_core::SlotKind`] slot, `ComposedPrompt::report()` attributes each one, and
+    /// the rendered system stays byte-stable across turns.
+    #[tokio::test]
+    async fn resolve_effective_composes_every_slot() {
+        use daemon_api::ProviderSelector;
+        use daemon_core::{Capabilities, ModelOutput, Request, SlotKind, ToolCallFormat};
+        use std::sync::Mutex as StdMutex;
+
+        /// Records every request's system string, then completes.
+        struct Recording(Arc<StdMutex<Vec<String>>>);
+        #[async_trait]
+        impl daemon_core::Provider for Recording {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    supports_native_tools: true,
+                    supports_streaming: false,
+                    tool_call_format: ToolCallFormat::Native,
+                    max_context: Some(8192),
+                }
+            }
+            async fn chat(&self, req: Request) -> Result<ModelOutput, daemon_core::Failure> {
+                self.0.lock().unwrap().push(req.system.clone());
+                Ok(ModelOutput {
+                    text: "ok".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        /// A one-tool skills resolution whose index owns the SkillsIndex slot.
+        struct FakeIndex;
+        impl StablePromptSource for FakeIndex {
+            fn block(&self) -> Option<String> {
+                Some("SKILLS-INDEX-BLOCK".into())
+            }
+            fn slot_kind(&self) -> daemon_core::SlotKind {
+                daemon_core::SlotKind::SkillsIndex
+            }
+        }
+        struct NoopSkillTool;
+        #[async_trait]
+        impl Tool for NoopSkillTool {
+            fn name(&self) -> &str {
+                "skills_list"
+            }
+            fn schema(&self) -> &str {
+                "{}"
+            }
+            async fn run(
+                &self,
+                call: &daemon_core::ToolCall,
+                _cx: &daemon_core::TurnCx<'_>,
+            ) -> daemon_core::ToolOutcome {
+                daemon_core::ToolOutcome::text(call.call_id.clone(), true, "[]")
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let personas = Arc::new(
+            daemon_prompt::PersonaStore::open(
+                dir.path().join("profiles"),
+                daemon_prompt::DEFAULT_PERSONA_CAP,
+            )
+            .unwrap(),
+        );
+        let user_profiles = Arc::new(
+            daemon_prompt::UserProfileStore::open(
+                dir.path().join("profiles"),
+                daemon_prompt::DEFAULT_USER_CAP,
+            )
+            .unwrap(),
+        );
+        user_profiles.add("full-slots", "prefers rust").unwrap();
+        // The isolated per-session workspace, pre-seeded with a context file.
+        let ws = dir.path().join("ws");
+        let roots = Arc::new(WorkspaceRoots::new(ws.clone()));
+        let session = SessionId::new("slots-1");
+        let session_root = roots.isolated_root(session.as_str());
+        std::fs::create_dir_all(&session_root).unwrap();
+        std::fs::write(
+            session_root.join("AGENTS.md"),
+            "Workspace rules: verify twice.",
+        )
+        .unwrap();
+
+        let systems: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = systems.clone();
+        let resolver: ProviderResolver = Arc::new(move |_spec: &ProfileSpec| {
+            let recorded = recorded.clone();
+            Arc::new(move || Arc::new(Recording(recorded.clone())) as Arc<dyn Provider>)
+                as ProviderBuilder
+        });
+        let ctx = SessionFactoryCtx {
+            resolver,
+            extra_tools: Vec::new(),
+            engine_config: Config::default(),
+            credentials: None,
+            context: None,
+            context_builder: None,
+            memory: vec![Arc::new(daemon_core::FileMemory::from_snapshot(
+                "MEMORY-SNAPSHOT-BLOCK",
+            ))],
+            memory_builder: None,
+            prompt_sources: Vec::new(),
+            skills_resolver: Some(Arc::new(|_profile: &ProfileRef| crate::ResolvedSkills {
+                tools: vec![Arc::new(NoopSkillTool) as Arc<dyn Tool>],
+                index: Arc::new(FakeIndex) as Arc<dyn StablePromptSource>,
+            })),
+            workspace_roots: Some(roots),
+            fs_config: daemon_tool_fs::FsConfig::default(),
+            procs: crate::profiles::dress::ProcessToolkit {
+                registry: Arc::new(daemon_processes::ProcessRegistry::new(
+                    daemon_processes::RegistryConfig::default(),
+                    Arc::new(daemon_processes::RealClock::new()),
+                )),
+                shell: daemon_processes::ShellConfig::default(),
+            },
+            prompt: crate::types::PromptAssembly {
+                personas: Some(personas),
+                user_profiles: Some(user_profiles),
+                policy: Default::default(),
+                launch_model: None,
+            },
+        };
+
+        let base = ProfileSpec::new("full-slots", ProviderSelector::Mock, "gpt-5.5");
+        let engine_profile = ctx.resolve_effective(
+            &base,
+            &SessionOverlay::default(),
+            crate::profiles::persona::PersonaSource::Profile(&base.id),
+        );
+        let mut engine = engine_profile.fresh(session);
+        for i in 0..2 {
+            engine.push_user(daemon_protocol::UserMsg::new(format!("turn {i}")));
+            engine
+                .run_turn(
+                    &NoopHost,
+                    &daemon_core::EventSink::discarding(),
+                    &daemon_core::TurnControl::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Byte-stability across turns with the full source set wired.
+        let seen = systems.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].as_bytes(), seen[1].as_bytes());
+        let system = seen[0].clone();
+        drop(seen);
+
+        // Every slot's content made it into the rendered system, in slot order.
+        assert!(
+            system.contains(daemon_prompt::DEFAULT_SOUL_MD),
+            "Identity (seeded SOUL)"
+        );
+        assert!(
+            system.contains("# Finishing the job"),
+            "Guidance: core agentic"
+        );
+        assert!(
+            system.contains("# Tool-use enforcement"),
+            "Guidance: tool-use (gpt + tools)"
+        );
+        assert!(
+            system.contains("<tool_persistence>"),
+            "Guidance: model family (gpt)"
+        );
+        assert!(
+            system.contains("Current working directory:"),
+            "Guidance: env hints"
+        );
+        assert!(
+            system.contains("Workspace rules: verify twice."),
+            "ContextFiles: AGENTS.md"
+        );
+        assert!(system.contains("SKILLS-INDEX-BLOCK"), "SkillsIndex");
+        assert!(system.contains("MEMORY-SNAPSHOT-BLOCK"), "MemoryBlock");
+        assert!(system.contains("USER PROFILE"), "UserProfile header");
+        assert!(system.contains("prefers rust"), "UserProfile entry");
+        assert!(system.contains("Conversation started: "), "Stamp");
+
+        // The per-slot report attributes all seven slots (wire-invisible, test/tracing only).
+        let report = engine
+            .snapshot()
+            .composed_prompt
+            .as_ref()
+            .expect("composition persisted on the snapshot")
+            .report();
+        let kinds: Vec<SlotKind> = report.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SlotKind::Identity,
+                SlotKind::Guidance,
+                SlotKind::ContextFiles,
+                SlotKind::SkillsIndex,
+                SlotKind::MemoryBlock,
+                SlotKind::UserProfile,
+                SlotKind::Stamp,
+            ],
+            "every slot is attributed, in the fixed order"
+        );
     }
 
     #[tokio::test]

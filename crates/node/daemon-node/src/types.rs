@@ -56,6 +56,10 @@ pub struct PromptAssembly {
     /// tests) falls back to the built-in role persona library and resolves the wire persona ops
     /// (`SoulGet`/`SoulSet`) to `Unsupported` — mirroring how versioning is gated on `revisions`.
     pub personas: Option<Arc<daemon_prompt::PersonaStore>>,
+    /// The per-profile user-profile store (`<data_dir>/<profile>/USER.md`). `None` (ephemeral
+    /// nodes, tests) composes no UserProfile slot, registers no `user_profile` tool, and fires no
+    /// save nudge.
+    pub user_profiles: Option<Arc<daemon_prompt::UserProfileStore>>,
     /// The composition policy (guidance toggles, caps, nudge cadence) from the binary's
     /// `[prompt]` config section.
     pub policy: PromptPolicy,
@@ -70,6 +74,26 @@ pub struct PromptAssembly {
 /// and the USER.md nudge cadence. Defaults mirror hermes (everything on, hermes caps).
 #[derive(Clone, Copy, Debug)]
 pub struct PromptPolicy {
+    /// Compose the always-on core agentic / task-completion guidance block.
+    pub core_guidance: bool,
+    /// How the tool-use enforcement block is gated (`Auto` = registry non-empty AND the model
+    /// family is on the enforcement list; `On` = whenever tools exist; `Off` = never).
+    pub tool_use_guidance: daemon_prompt::ToolUseMode,
+    /// Compose the model-family operational guidance block (keyed on the live model id).
+    pub model_guidance: bool,
+    /// Compose the environment-hints block (host OS / home / workspace cwd).
+    pub environment_hints: bool,
+    /// Compose the per-session transport (surface) hint for routed sessions.
+    pub transport_hints: bool,
+    /// Compose the date-only stamp.
+    pub date_stamp: bool,
+    /// Load workspace context files into the ContextFiles slot (and track mid-session
+    /// subdirectory hints).
+    pub context_files: bool,
+    /// The per-source context-file character cap (head/tail truncation past it).
+    pub context_file_max_chars: usize,
+    /// Fire the USER.md save nudge every N user turns (`0` disables the nudge).
+    pub nudge_interval: u32,
     /// The persona (SOUL.md / inline persona) character cap.
     pub persona_cap: usize,
 }
@@ -77,6 +101,15 @@ pub struct PromptPolicy {
 impl Default for PromptPolicy {
     fn default() -> Self {
         Self {
+            core_guidance: true,
+            tool_use_guidance: daemon_prompt::ToolUseMode::Auto,
+            model_guidance: true,
+            environment_hints: true,
+            transport_hints: true,
+            date_stamp: true,
+            context_files: true,
+            context_file_max_chars: daemon_prompt::CONTEXT_FILE_MAX_CHARS,
+            nudge_interval: 10,
             persona_cap: daemon_prompt::DEFAULT_PERSONA_CAP,
         }
     }

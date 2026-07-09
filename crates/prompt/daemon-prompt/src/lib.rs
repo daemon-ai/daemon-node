@@ -58,7 +58,7 @@ pub use scan::{
 pub use truncate::{truncate_content, CONTEXT_FILE_MAX_CHARS};
 pub use user_profile::{
     user_profile_schema, NudgeCounter, UserProfileStore, WriteOutcome, DEFAULT_USER_CAP,
-    ENTRY_DELIMITER, USER_PROFILE_RUBRIC,
+    ENTRY_DELIMITER, USER_PROFILE_NUDGE, USER_PROFILE_RUBRIC,
 };
 
 /// Errors from the persona / user-profile stores and the revision log.
