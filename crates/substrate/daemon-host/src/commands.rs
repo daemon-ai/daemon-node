@@ -506,4 +506,95 @@ mod tests {
         .await;
         assert_eq!(operator, CommandAccess::Admin);
     }
+
+    /// `test_command_manager.c` `/command-manager/new`: a fresh registry is empty (zero commands),
+    /// resolves nothing, and enumerates no specs.
+    #[test]
+    fn empty_registry_reports_empty() {
+        let reg = CommandRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+        assert!(reg.specs().is_empty());
+        assert!(reg.resolve("anything").is_none());
+    }
+
+    /// The built-in catalog is enumerable: `len` matches the advertised `specs()`, and the listing
+    /// includes the canonical `help` command (the `command_list` payload a client renders).
+    #[test]
+    fn builtins_catalog_is_enumerable() {
+        let reg = CommandRegistry::with_builtins();
+        assert!(!reg.is_empty());
+        let specs = reg.specs();
+        assert_eq!(reg.len(), specs.len(), "len tracks the enumerated catalog");
+        assert!(
+            specs.iter().any(|s| s.name == "help"),
+            "help is advertised in the catalog"
+        );
+    }
+
+    /// `test_command_manager.c` `/command-manager/find-and-execute`: resolving a provider command
+    /// yields its `Owner::Provider`, whose handler dispatches the invocation to the provider.
+    #[tokio::test]
+    async fn resolve_provider_command_executes_via_owner() {
+        let mut reg = CommandRegistry::with_builtins();
+        reg.register_provider(Arc::new(FakeProvider {
+            name: "lcm",
+            specs: vec![CoreSpec::new("lcm").summary("Lossless context")],
+        }));
+        let entry = reg.resolve("lcm").expect("lcm resolves");
+        let Owner::Provider(provider) = &entry.owner else {
+            panic!("expected a provider owner");
+        };
+        let inv = CommandInvocation {
+            name: "lcm".into(),
+            args: "arg1 arg2".into(),
+            session: None,
+        };
+        let out = provider
+            .run_command(&inv, &CommandCx::node())
+            .await
+            .expect("dispatch succeeds");
+        assert_eq!(out.text, "ok", "the resolved owner ran the command");
+    }
+
+    /// Two providers both claiming `dup`: the first registrant wins and the catalog keeps a single
+    /// `dup` entry (the daemon's first-wins discipline in place of libpurple's priority stacking /
+    /// `find-all`).
+    #[test]
+    fn duplicate_provider_registration_first_wins() {
+        let mut reg = CommandRegistry::new();
+        reg.register_provider(Arc::new(FakeProvider {
+            name: "p1",
+            specs: vec![CoreSpec::new("dup").summary("first")],
+        }));
+        reg.register_provider(Arc::new(FakeProvider {
+            name: "p2",
+            specs: vec![CoreSpec::new("dup").summary("second")],
+        }));
+        let entry = reg.resolve("dup").expect("dup resolves");
+        assert_eq!(entry.spec.source, "p1", "first registrant wins");
+        assert_eq!(
+            reg.specs().iter().filter(|s| s.name == "dup").count(),
+            1,
+            "exactly one dup entry (no stacking)"
+        );
+    }
+
+    /// A provider whose *alias* (not name) collides with an existing entry is rejected whole: the
+    /// command does not partially register, and the incumbent alias still resolves to it.
+    #[test]
+    fn provider_alias_collision_rejects_whole_entry() {
+        let mut reg = CommandRegistry::with_builtins();
+        // `commands` is the built-in alias of `help`; a provider aliasing it must be rejected whole.
+        reg.register_provider(Arc::new(FakeProvider {
+            name: "rogue",
+            specs: vec![CoreSpec::new("newcmd").summary("hijack").alias("commands")],
+        }));
+        assert!(
+            reg.resolve("newcmd").is_none(),
+            "the whole entry is rejected on an alias collision, not partially added"
+        );
+        let commands = reg.resolve("commands").expect("incumbent alias intact");
+        assert!(matches!(commands.owner, Owner::Builtin(Builtin::Help)));
+    }
 }
