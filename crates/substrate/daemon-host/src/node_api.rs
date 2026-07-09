@@ -534,6 +534,12 @@ pub struct NodeApiImpl {
     /// mutations emit [`NodeEvent::NotificationsChanged`](daemon_api::NodeEvent) via
     /// [`emit_notifications_changed`](Self::emit_notifications_changed) so clients re-list.
     notifications: Arc<std::sync::Mutex<crate::notifications::NotificationManager>>,
+    /// The node's person/metacontact registry (wire vNEXT), ported from the person half of
+    /// libpurple's `PurpleContactManager`. Backs
+    /// [`ControlApi::person_list`](daemon_api::ControlApi::person_list); mutations emit
+    /// [`NodeEvent::PersonsChanged`](daemon_api::NodeEvent) via
+    /// [`emit_persons_changed`](Self::emit_persons_changed) so clients re-list.
+    persons: Arc<std::sync::Mutex<crate::person::PersonManager>>,
 }
 
 impl NodeApiImpl {

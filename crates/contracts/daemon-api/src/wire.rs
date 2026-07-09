@@ -1147,6 +1147,12 @@ pub enum ApiRequest {
         /// The transfer to receive.
         transfer: FileTransfer,
     },
+
+    // -- persons / metacontacts (W3-J; wire vNEXT) -----------------------------------------------
+    /// [`ControlApi::person_list`] — the node's person/metacontact registry (wire vNEXT). A
+    /// read-only snapshot (insertion order); the client re-lists on a
+    /// [`NodeEvent::PersonsChanged`] pointer. Answered by [`ApiResponse::Persons`].
+    PersonList,
 }
 
 /// The serializable reflection of an interface result.
@@ -1366,6 +1372,8 @@ pub enum ApiResponse {
     SavedPresences(Vec<SavedPresence>),
     /// The node's live notification list (`notification_list`; wire vNEXT), newest first.
     Notifications(Vec<NotificationInfo>),
+    /// The node's person/metacontact registry (`person_list`; wire vNEXT), insertion order.
+    Persons(Vec<Person>),
 }
 
 // ---------------------------------------------------------------------------

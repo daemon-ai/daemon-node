@@ -3,11 +3,13 @@
 //! Ported from libpurple (`purplecontactinfo.c`, `purpleconversationmember.c`,
 //! `purpleconversationmembers.c`, `purpleconversationmanager.c`). This is host-side derived logic
 //! over the existing DTOs — it adds no wire-contract surface. See `docs/port-ledger/matching.md`
-//! for the case-by-case provenance and the documented divergences (person precedence is Wave-3;
-//! badges map to [`MemberRole`]; UTF-8 collation is approximated by casefolded codepoint order).
+//! for the case-by-case provenance and the documented divergences (person precedence landed with
+//! W3-J `port-person` as the `*_with_person` layer below; badges map to [`MemberRole`]; UTF-8
+//! collation is approximated by casefolded codepoint order).
 
 use crate::{
-    ContactInfo, ConversationInfo, ConversationMember, ConversationType, MemberRole, TypingState,
+    ContactInfo, ConversationInfo, ConversationMember, ConversationType, MemberRole, Person,
+    TypingState,
 };
 use daemon_protocol::TransportId;
 use std::cmp::Ordering;
@@ -66,8 +68,9 @@ fn role_rank(role: MemberRole) -> u8 {
 impl ContactInfo {
     /// Port of `purple_contact_info_get_name_for_display`. The libpurple chain is
     /// `alias → person-alias → display_name → id`; the daemon `ContactInfo` has neither an alias
-    /// nor a person field (those live on [`ConversationMember`]; person precedence is Wave-3), so
-    /// the chain reduces to `display_name → id`.
+    /// nor a person field (those live on [`ConversationMember`] / [`Person`]), so the chain reduces
+    /// to `display_name → id`. The person-aware layer is
+    /// [`name_for_display_with_person`](ContactInfo::name_for_display_with_person) (W3-J).
     pub fn name_for_display(&self) -> &str {
         if let Some(display_name) = self.display_name.as_deref() {
             if !display_name.is_empty() {
@@ -95,10 +98,52 @@ impl ContactInfo {
         false
     }
 
-    /// Non-NULL ordering by name-for-display (person precedence is Wave-3). Suitable for
-    /// `slice::sort_by`. See [`contact_info_compare`] for the NULL-safe variant.
+    /// Non-NULL ordering by name-for-display (person-blind; the person-aware variant is
+    /// [`contact_info_compare_with_person`]). Suitable for `slice::sort_by`. See
+    /// [`contact_info_compare`] for the NULL-safe variant.
     pub fn cmp_for_display(&self, other: &ContactInfo) -> Ordering {
         utf8_strcasecmp(self.name_for_display(), other.name_for_display())
+    }
+}
+
+impl ContactInfo {
+    /// The person-aware name-for-display (W3-J): the full libpurple chain
+    /// `contact-alias → person-alias → display_name → id`. The daemon `ContactInfo` has no
+    /// contact-alias field, so the effective chain is `person-alias → display_name → id` — the
+    /// person's alias (when the contact is associated with a [`Person`]) is inserted ahead of the
+    /// contact's own `display_name → id`. `None` (no person) reduces to [`ContactInfo::name_for_display`].
+    pub fn name_for_display_with_person<'a>(&'a self, person: Option<&'a Person>) -> &'a str {
+        if let Some(alias) = person.and_then(|p| p.alias.as_deref()) {
+            if !alias.is_empty() {
+                return alias;
+            }
+        }
+        self.name_for_display()
+    }
+}
+
+/// Person-aware port of `purple_contact_info_compare` (W3-J): the NULL rules, then the
+/// person tier (a contact WITH an associated [`Person`] sorts before one without —
+/// `purplecontactinfo.c` `person_a != NULL && person_b == NULL → -1`), then person-aware
+/// name-for-display caseless. Each side is `(contact, its optional person)`.
+pub fn contact_info_compare_with_person(
+    a: Option<(&ContactInfo, Option<&Person>)>,
+    b: Option<(&ContactInfo, Option<&Person>)>,
+) -> Ordering {
+    match (a, b) {
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+        (Some((a, person_a)), Some((b, person_b))) => {
+            match (person_a.is_some(), person_b.is_some()) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                _ => utf8_strcasecmp(
+                    a.name_for_display_with_person(person_a),
+                    b.name_for_display_with_person(person_b),
+                ),
+            }
+        }
     }
 }
 
@@ -357,6 +402,58 @@ mod tests {
         // ← id_fallback: nothing but the id.
         let c = info("id");
         assert_eq!(c.name_for_display(), "id");
+    }
+
+    // -- ContactInfo::name_for_display (person-aware, W3-J re-activation) ---
+
+    #[test]
+    fn contact_info_name_for_display_person_alias() {
+        // ← /contact-info/get_name_for_display/person_with_alias: a contact whose person has an
+        // alias resolves to the person's alias (which outranks the contact's display_name).
+        let person = Person {
+            alias: Some("person alias".into()),
+            ..Default::default()
+        };
+        let c = info_dn("id", "display name");
+        assert_eq!(
+            c.name_for_display_with_person(Some(&person)),
+            "person alias"
+        );
+        // No person -> the plain display_name -> id chain.
+        assert_eq!(c.name_for_display_with_person(None), "display name");
+        // A person WITHOUT an alias -> also falls through to the contact's display_name.
+        let no_alias = Person::default();
+        assert_eq!(
+            c.name_for_display_with_person(Some(&no_alias)),
+            "display name"
+        );
+    }
+
+    // -- ContactInfo::compare (person-aware, W3-J re-activation) -----------
+
+    #[test]
+    fn contact_info_compare_person_no_person() {
+        // ← /contact-info/compare/person__no_person: a contact WITH a person sorts before one
+        // WITHOUT (both have empty ids, so only the person tier decides).
+        let person = Person::default();
+        let a = info("");
+        let b = info("");
+        assert_eq!(
+            contact_info_compare_with_person(Some((&a, Some(&person))), Some((&b, None))),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn contact_info_compare_no_person_person() {
+        // ← /contact-info/compare/no_person__person: the mirror — no-person sorts after person.
+        let person = Person::default();
+        let a = info("");
+        let b = info("");
+        assert_eq!(
+            contact_info_compare_with_person(Some((&a, None)), Some((&b, Some(&person)))),
+            Ordering::Greater
+        );
     }
 
     // -- ContactInfo::compare ----------------------------------------------

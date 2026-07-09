@@ -21,7 +21,9 @@ Display-name, matching, ordering, and member-collection logic ported from libpur
   out of scope (no test exercises it).
 - **`ContactInfo::name_for_display` chain** — C is `alias → person-alias → display_name → id`. The
   daemon `ContactInfo` has neither an `alias` nor a `person` field (alias/nickname live on
-  `ConversationMember`; person precedence is Wave-3), so the ported chain is `display_name → id`.
+  `ConversationMember`), so the ported chain is `display_name → id`. **W3-J update:** the
+  person-aware layer now exists (`name_for_display_with_person` / `contact_info_compare_with_person`,
+  taking `Option<&Person>`) — see `docs/port-ledger/person.md`.
 - **`ConversationMember::name_for_display` chain** — `alias → nickname → contact.name_for_display`
   (faithful; `purpleconversationmember.c:582`).
 - **Member equality for collections** — `check_member_equal` compares the members' **contact infos**
@@ -41,15 +43,15 @@ scope but no direct libpurple g_test.
 
 | libpurple g_test | Rust test (`matching.rs`) | Status |
 |---|---|---|
-| `/contact-info/get_name_for_display/person_with_alias` | — | SKIP: no `person` on daemon `ContactInfo`; person-aware precedence is Wave-3 |
+| `/contact-info/get_name_for_display/person_with_alias` | `contact_info_name_for_display_person_alias` | PORT (re-activated by W3-J `port-person` via `ContactInfo::name_for_display_with_person`; was SKIP: no `person` on daemon `ContactInfo`) |
 | `/contact-info/get_name_for_display/contact_with_alias` | — | SKIP: no `alias` field on daemon `ContactInfo` (alias lives on `ConversationMember`, covered there) |
 | `/contact-info/get_name_for_display/contact_with_display_name` | `contact_info_name_for_display_display_name` | PORT |
 | `/contact-info/get_name_for_display/id_fallback` | `contact_info_name_for_display_id_fallback` | PORT |
 | `/contact-info/compare/not_null__null` | `contact_info_compare_not_null_null` | PORT |
 | `/contact-info/compare/null__not_null` | `contact_info_compare_null_not_null` | PORT |
 | `/contact-info/compare/null__null` | `contact_info_compare_null_null` | PORT |
-| `/contact-info/compare/person__no_person` | — | SKIP: no `person` (Wave-3) |
-| `/contact-info/compare/no_person__person` | — | SKIP: no `person` (Wave-3) |
+| `/contact-info/compare/person__no_person` | `contact_info_compare_person_no_person` | PORT (re-activated by W3-J `port-person` via `contact_info_compare_with_person`) |
+| `/contact-info/compare/no_person__person` | `contact_info_compare_no_person_person` | PORT (re-activated by W3-J `port-person` via `contact_info_compare_with_person`) |
 | `/contact-info/compare/name__name` | `contact_info_compare_name_name` | PORT |
 | `/contact-info/equal/not_null__not_null` | `contact_info_equal_not_null_not_null` | PORT |
 | `/contact-info/equal/not_null__null` | `contact_info_equal_not_null_null` | PORT |
@@ -116,3 +118,8 @@ Out of scope: `/add-remove`, `/signals/*`.
 - **In-scope g_test cases enumerated:** 41 (23 contact-info of which 18 in-scope + 5 person/alias
   skips; 12 member; 7 members of which 6 in-scope + 1 skip; 3 find-dm).
 - **Ported:** 35 · **Skipped:** 6 (5 person/alias model gaps + 1 GListModel signal) · **Derived:** 1.
+- **W3-J update:** 3 of the person-dependent skips (`get_name_for_display/person_with_alias`,
+  `compare/person__no_person`, `compare/no_person__person`) are now PORTED by `port-person`
+  (see `docs/port-ledger/person.md`), leaving 2 skips (`contact_with_alias` name + `matches/alias` —
+  no `alias` field on daemon `ContactInfo`) + the GListModel signal row → totals now
+  **Ported: 38 · Skipped: 3 · Derived: 1**.

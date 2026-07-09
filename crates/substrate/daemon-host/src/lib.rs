@@ -56,6 +56,7 @@ pub mod journal;
 pub mod managed;
 pub mod node_api;
 pub mod notifications;
+pub mod person;
 pub mod persona_ops;
 pub mod presence;
 pub mod process_agent;

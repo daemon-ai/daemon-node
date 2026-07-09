@@ -1570,6 +1570,13 @@ impl ControlApi for NodeApiImpl {
         self.notifications_snapshot()
     }
 
+    async fn person_list(&self) -> Vec<daemon_api::Person> {
+        // The node-authoritative person/metacontact registry (wire vNEXT), insertion order — a
+        // snapshot of the node's `PersonManager` (ported from the person half of libpurple's
+        // `PurpleContactManager`). Clients re-list on a `PersonsChanged` pointer.
+        self.persons_snapshot()
+    }
+
     async fn roster_add(
         &self,
         transport: TransportId,
