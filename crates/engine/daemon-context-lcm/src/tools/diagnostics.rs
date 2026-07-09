@@ -590,9 +590,13 @@ pub(super) fn status(cx: &ToolCx<'_>) -> String {
         "source_lineage": source_lineage,
         "ingest_protection": sensitive_pattern_status(cx.config),
         "preset_suggestion": preset_status_payload(cx),
-        // The Rust ingest reconciles deterministically per incarnation and keeps no report — the
-        // Python field starts as `{}` too (`LCM:engine.py:_last_ingest_reconciliation`).
-        "ingest_reconciliation": {},
+        // The last restart-reconciliation record (`_record_ingest_reconciliation`,
+        // `LCM:engine.py:3065-3085`); the Python "not run" default before any reconcile ran.
+        "ingest_reconciliation": if cx.ingest_reconciliation.is_null() {
+            json!({"action": "none", "reason": "not run"})
+        } else {
+            cx.ingest_reconciliation.clone()
+        },
         "runtime_identity": runtime_identity(cx),
         "lifecycle": lifecycle,
         "lifecycle_fragmentation": lifecycle_fragmentation,

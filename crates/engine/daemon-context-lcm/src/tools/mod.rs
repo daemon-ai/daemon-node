@@ -102,6 +102,8 @@ pub(crate) struct ToolCx<'a> {
     pub last_compression_status: &'a str,
     /// Why the most recent compaction was a no-op (empty when it wasn't) — status.
     pub last_compression_noop_reason: &'a str,
+    /// The last restart-reconciliation record (`Null` before any reconcile ran) — status.
+    pub ingest_reconciliation: &'a serde_json::Value,
 }
 
 /// Dispatch one `lcm_*` tool by name, returning a JSON string (§10.7).

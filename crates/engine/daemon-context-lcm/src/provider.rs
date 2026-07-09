@@ -99,6 +99,10 @@ struct State {
     /// Provider-reported usage from the most recent model response (`update_from_response`,
     /// `LCM:engine.py:614-629`) — surfaced by `lcm_status`.
     usage: UsageMetrics,
+    /// The last restart-reconciliation record (`_record_ingest_reconciliation`,
+    /// `LCM:engine.py:3065-3085`) — surfaced by `lcm_status` as `ingest_reconciliation`.
+    /// `Null` renders as the Python "not run" default. Counts are turn-based (adaptation).
+    last_ingest_reconciliation: Value,
 }
 
 /// The provider-reported usage snapshot recorded by [`ContextEngine::after_response`]
@@ -270,6 +274,8 @@ impl LcmContextEngine {
         state.reconciled = false;
         state.last_compression_status = "idle".to_string();
         state.last_compression_noop_reason.clear();
+        // Back to the "not run" default (`LCM:engine.py:1732`).
+        state.last_ingest_reconciliation = Value::Null;
     }
 
     /// The `/new`-style session reset (`on_session_reset`, `LCM:engine.py:2202-2219`): arm the
@@ -401,6 +407,7 @@ impl LcmContextEngine {
             context_length_source: String,
             last_compression_status: String,
             last_compression_noop_reason: String,
+            ingest_reconciliation: Value,
         }
         let snap = {
             let state = self.state.lock().expect("lcm state poisoned");
@@ -422,6 +429,7 @@ impl LcmContextEngine {
                     state.last_compression_status.clone()
                 },
                 last_compression_noop_reason: state.last_compression_noop_reason.clone(),
+                ingest_reconciliation: state.last_ingest_reconciliation.clone(),
             }
         };
         let cx = ToolCx {
@@ -442,6 +450,7 @@ impl LcmContextEngine {
             context_length_source: &snap.context_length_source,
             last_compression_status: &snap.last_compression_status,
             last_compression_noop_reason: &snap.last_compression_noop_reason,
+            ingest_reconciliation: &snap.ingest_reconciliation,
         };
         crate::tools::dispatch(&cx, name, args).await
     }
@@ -539,7 +548,7 @@ impl LcmContextEngine {
                     .system
                     .text
                     .contains("Lossless Context Management (LCM)");
-                let (cursor, kind) = self.reconcile_turn_cursor(
+                let (cursor, kind, record) = self.reconcile_turn_cursor(
                     &session,
                     &conv.turns,
                     &tok,
@@ -550,6 +559,9 @@ impl LcmContextEngine {
                 state.turn_store_ids =
                     self.rebuild_turn_store_ids(&session, &conv.turns, cursor, &tok, kind);
                 state.cursor = cursor;
+                if let Some(record) = record {
+                    state.last_ingest_reconciliation = record;
+                }
             }
         }
         let scaffold = leading_scaffold_count(&conv.turns);
@@ -627,7 +639,7 @@ impl LcmContextEngine {
         tok: &Tokenizer,
         session_count: i64,
         system_is_plain: bool,
-    ) -> (usize, ReconcileKind) {
+    ) -> (usize, ReconcileKind, Option<Value>) {
         let all_rows = self.store.session_messages(session).unwrap_or_default();
         let ext_dir = self.config.externalization_dir();
         // Durable identities oldest→newest: `stored_raw_all` keeps every row (the stale-proof
@@ -643,7 +655,7 @@ impl LcmContextEngine {
             .map(|(_, id)| id.clone())
             .collect();
         if stored_all.is_empty() {
-            return (0, ReconcileKind::AmbiguousDelta);
+            return (0, ReconcileKind::AmbiguousDelta, None);
         }
         let flat_incoming: usize = turns
             .iter()
@@ -675,18 +687,32 @@ impl LcmContextEngine {
 
         let n = turns.len();
         let effective_session_count = stored_tail.len();
+        // The `_record_ingest_reconciliation` analog (`LCM:engine.py:3065-3085`); counts are
+        // turn-based where Python counts messages (adaptation).
+        let record = |action: &str, reason: &str, cursor: usize, effective_incoming: usize| {
+            serde_json::json!({
+                "action": action,
+                "reason": reason,
+                "cursor": cursor,
+                "incoming": n,
+                "session_count": session_count,
+                "stored_tail_count": stored_tail.len(),
+                "effective_incoming": effective_incoming,
+            })
+        };
         // Search high→low for the largest turn cursor proving a durable-tail replay.
         for t in (0..=n).rev() {
             let candidate_prefix = visible_prefix(t);
             if candidate_prefix.is_empty() {
                 // A leading run of scaffold/ignored-only turns; skip it (allow-empty-prefix).
-                let kind = if t == 0 {
-                    ReconcileKind::AmbiguousDelta
-                } else {
-                    ReconcileKind::ScaffoldOnly
-                };
                 if t > 0 {
-                    return (t, kind);
+                    let rec = record(
+                        "advanced cursor",
+                        "skipped scaffold-only prefix",
+                        t,
+                        visible_prefix(n).len(),
+                    );
+                    return (t, ReconcileKind::ScaffoldOnly, Some(rec));
                 }
                 break;
             }
@@ -700,7 +726,13 @@ impl LcmContextEngine {
                 && candidate_prefix.len() >= session_count as usize
                 && session_count > 1;
             if has_effective_full_replay || has_raw_full_replay {
-                return (t, ReconcileKind::TailReplay);
+                let rec = record(
+                    "advanced cursor",
+                    "replayed durable tail",
+                    t,
+                    visible_prefix(n).len(),
+                );
+                return (t, ReconcileKind::TailReplay, Some(rec));
             }
         }
 
@@ -711,9 +743,21 @@ impl LcmContextEngine {
         let incoming = visible_prefix(n);
         if is_suspicious_stale_no_overlap(&incoming, stored_tail, &stored_raw_all, system_is_plain)
         {
-            return (n, ReconcileKind::StaleSkip);
+            let rec = record(
+                "skipped batch",
+                "skipped stale no-overlap snapshot",
+                n,
+                incoming.len(),
+            );
+            return (n, ReconcileKind::StaleSkip, Some(rec));
         }
-        (0, ReconcileKind::AmbiguousDelta)
+        let rec = record(
+            "persisted batch",
+            "persisted ambiguous delta",
+            0,
+            incoming.len(),
+        );
+        (0, ReconcileKind::AmbiguousDelta, Some(rec))
     }
 
     /// Rebuild `turn_store_ids` for the reconciled replay prefix `turns[0..cursor]` from the durable
@@ -3849,7 +3893,7 @@ mod tests {
 
     // parity: engine.py::test_existing_compacted_session_restart_ignores_preserved_objective_anchor (tests/test_lcm_engine.py:1375)
     #[tokio::test]
-    async fn parity_gap_restart_ignores_preserved_objective_anchor() {
+    async fn restart_ignores_preserved_objective_anchor() {
         let dir = reconcile_dir("preserved-objective");
         let cfg = LcmConfig {
             data_dir: dir.clone(),
@@ -3947,7 +3991,7 @@ mod tests {
 
     // parity: engine.py::test_lcm_status_reports_ingest_reconciliation_diagnostics (tests/test_lcm_engine.py:2542)
     #[tokio::test]
-    async fn parity_gap_status_reports_ingest_reconciliation_diagnostics() {
+    async fn status_reports_ingest_reconciliation_diagnostics() {
         let dir = reconcile_dir("status-reconcile");
         let cfg = LcmConfig {
             data_dir: dir.clone(),

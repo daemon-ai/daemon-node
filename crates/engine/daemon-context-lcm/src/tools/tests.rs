@@ -94,6 +94,7 @@ impl Fixture {
             context_length_source: "model_info",
             last_compression_status: "idle",
             last_compression_noop_reason: "",
+            ingest_reconciliation: &Value::Null,
         }
     }
 }

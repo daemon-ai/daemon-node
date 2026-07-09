@@ -182,6 +182,13 @@ pub(crate) async fn run_compaction(
     // `LCM:engine.py:4340-4399`) so summarization prioritizes current user intent.
     let focus_topic = derive_auto_focus_topic(&turns, cfg).unwrap_or_default();
 
+    // The preserved-objective anchor search runs over the PRE-drain conversation (Python captures
+    // `anchor_source_messages = list(working_messages)` before compaction, `LCM:engine.py:905`):
+    // the newest real user turn is usually inside the chunk being summarized, so searching the
+    // drained working view would never find it.
+    let anchor_source: Vec<Turn> = turns.clone();
+    let anchor_fresh_tail_start = turns.len().saturating_sub(cfg.fresh_tail_count);
+
     let overflow_deficit = used_tokens.saturating_sub(budget);
     let mut estimated_active_tokens = used_tokens;
     let mut leaf_passes = 0usize;
@@ -463,12 +470,12 @@ pub(crate) async fn run_compaction(
     .await;
 
     // Preserve the newest real user objective that fell outside the tail as a scaffold section
-    // (`_latest_user_context_anchor`, `LCM:engine.py:3978-4015`).
-    let fresh_tail_start = turns.len().saturating_sub(cfg.fresh_tail_count);
+    // (`_latest_user_context_anchor`, `LCM:engine.py:3978-4015`), searching the pre-drain
+    // snapshot so an objective inside the summarized chunk is still anchored.
     let ext_dir = cfg.externalization_dir();
     let objective = latest_user_context_anchor(
-        &turns,
-        fresh_tail_start,
+        &anchor_source,
+        anchor_fresh_tail_start,
         cfg,
         session_id,
         ext_dir.as_deref(),
