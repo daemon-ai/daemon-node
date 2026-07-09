@@ -218,6 +218,8 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::PresenceSetActive { id } => unit_or_err(api.presence_set_active(id).await),
         // -- notifications (W2-G; wire vNEXT) ---------------------------------------------------
         ApiRequest::NotificationList => ApiResponse::Notifications(api.notification_list().await),
+        // -- persons / metacontacts (W3-J; wire vNEXT) ------------------------------------------
+        ApiRequest::PersonList => ApiResponse::Persons(api.person_list().await),
         _ => return None,
     })
 }

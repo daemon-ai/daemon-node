@@ -97,6 +97,7 @@ impl NodeApiImpl {
             notifications: Arc::new(std::sync::Mutex::new(
                 crate::notifications::NotificationManager::new(),
             )),
+            persons: Arc::new(std::sync::Mutex::new(crate::person::PersonManager::new())),
         }
     }
 

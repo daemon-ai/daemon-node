@@ -589,6 +589,7 @@ node-event = node-event-session-advanced
            / node-event-contacts-changed
            / node-event-resync-needed
            / node-event-notifications-changed
+           / node-event-persons-changed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64 } }
 node-event-roster-changed       = { "RosterChanged":      { "rev": uint64 } }
@@ -610,6 +611,8 @@ node-event-contacts-changed     = { "ContactsChanged":    { "transport": transpo
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 ; wire vNEXT: the notification set changed (add/remove/read/delete) -> re-list NotificationList.
 node-event-notifications-changed = "NotificationsChanged"
+; wire vNEXT: the person registry changed (create/remove/associate/dissociate) -> re-list PersonList.
+node-event-persons-changed      = "PersonsChanged"
 events-page = {
   "events": [0*64 node-event],
   "next_cursor": uint64,                ; pass as the next EventsSince cursor
@@ -1219,6 +1222,19 @@ notification-info = {
   "kind": notification-kind,
   ? "deleted": bool,
 }
+; ----- persons / metacontacts (wire vNEXT; port-person) -----
+; The avatar carrier (first wire-reachable via person.avatar): a content-addressed image blob.
+image = { "blob": blob-ref }
+; One transport-scoped contact endpoint of a person (transport + the contact reachable there).
+person-endpoint = { "transport": transport-id, "contact": contact-info }
+; A person/metacontact: auto-minted id, optional user alias + avatar, contact endpoints across
+; transports. `id` is required; the rest mirror serde #[serde(default)].
+person = {
+  "id": tstr,
+  ? "alias": (tstr / null),
+  ? "avatar": (image / null),
+  ? "endpoints": [* person-endpoint],
+}
 create-conversation-details = {
   ? "max_participants": uint, ? "participants": [* contact-info],
   ? "extras_schema": account-settings-schema, ? "extras": account-settings-values,
@@ -1452,6 +1468,9 @@ request-telemetry-consent-set = { "TelemetryConsentSet": { "enabled": bool } }
 ; wire vNEXT: the node's live notification list (read-only; re-listed on NotificationsChanged).
 request-notification-list = "NotificationList"
 
+; wire vNEXT: the node's person/metacontact registry (read-only; re-listed on PersonsChanged).
+request-person-list = "PersonList"
+
 ; ----- saved presences (W2-F; wire vNEXT) -----
 request-presence-list = "PresenceList"
 request-presence-save = { "PresenceSave": { "presence": saved-presence } }
@@ -1647,6 +1666,7 @@ api-request = request-submit
             / request-presence-delete
             / request-presence-set-active
             / request-notification-list
+            / request-person-list
 
 response-ok = "Ok"
 response-routed = { "Routed": { "session": session-id } }
@@ -1768,6 +1788,9 @@ response-saved-presences = { "SavedPresences": [* saved-presence] }
 
 ; wire vNEXT: the node's live notification list, newest first.
 response-notifications = { "Notifications": [* notification-info] }
+
+; wire vNEXT: the node's person/metacontact registry, insertion order.
+response-persons = { "Persons": [* person] }
 api-response = response-ok
              / response-routed
              / response-session-created
@@ -1864,6 +1887,7 @@ api-response = response-ok
              / response-telemetry-consent
              / response-saved-presences
              / response-notifications
+             / response-persons
 
 ; ----- multiplexed / server-streaming socket envelope (wire L0; daemon-sync-protocol-spec.md §2) ---
 ; Wraps api-request/api-response so one connection carries many correlated exchanges, with

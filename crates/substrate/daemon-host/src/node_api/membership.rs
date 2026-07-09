@@ -117,6 +117,83 @@ impl NodeApiImpl {
         removed
     }
 
+    /// Emit a payload-free `PersonsChanged` pointer (wire vNEXT) after a person-registry mutation
+    /// so clients re-list via `PersonList`. Mirrors `emit_notifications_changed`: the whole list is
+    /// cheap to refetch, so the event carries no detail.
+    pub(crate) fn emit_persons_changed(&self) {
+        if let Some(feed) = self.node_feed() {
+            feed.emit(NodeEvent::PersonsChanged);
+        }
+    }
+
+    /// A snapshot of the node's person registry (insertion order) — the
+    /// [`ControlApi::person_list`] backing (ported from the person half of libpurple's
+    /// `PurpleContactManager`).
+    pub(crate) fn persons_snapshot(&self) -> Vec<daemon_api::Person> {
+        self.persons.lock().expect("person manager mutex").list()
+    }
+
+    /// Add a person to the node registry and emit the `PersonsChanged` pointer on a real add (a
+    /// rejected double-add emits nothing). The producer seam adapters/tools use to create a person.
+    pub fn person_add(&self, person: daemon_api::Person) -> crate::person::AddOutcome {
+        let outcome = self
+            .persons
+            .lock()
+            .expect("person manager mutex")
+            .add_person(person);
+        if outcome == crate::person::AddOutcome::Added {
+            self.emit_persons_changed();
+        }
+        outcome
+    }
+
+    /// Remove a person from the node registry by id, emitting the `PersonsChanged` pointer when one
+    /// was removed.
+    pub fn person_remove(&self, id: &str, remove_endpoints: bool) -> bool {
+        let removed = self
+            .persons
+            .lock()
+            .expect("person manager mutex")
+            .remove_person(id, remove_endpoints);
+        if removed {
+            self.emit_persons_changed();
+        }
+        removed
+    }
+
+    /// Associate a contact endpoint with a person, emitting the `PersonsChanged` pointer when the
+    /// edge was created (an unknown person / duplicate edge emits nothing).
+    pub fn person_associate(&self, person_id: &str, endpoint: daemon_api::PersonEndpoint) -> bool {
+        let associated = self
+            .persons
+            .lock()
+            .expect("person manager mutex")
+            .associate(person_id, endpoint);
+        if associated {
+            self.emit_persons_changed();
+        }
+        associated
+    }
+
+    /// Dissociate a contact endpoint from a person, emitting the `PersonsChanged` pointer when the
+    /// edge existed.
+    pub fn person_dissociate(
+        &self,
+        person_id: &str,
+        transport: &TransportId,
+        contact_id: &str,
+    ) -> bool {
+        let dissociated = self
+            .persons
+            .lock()
+            .expect("person manager mutex")
+            .dissociate(person_id, transport, contact_id);
+        if dissociated {
+            self.emit_persons_changed();
+        }
+        dissociated
+    }
+
     /// Reconcile the node's own routing on a self-removal (item 3): drop the now-dangling
     /// `ChatRoute` pin for the conversation's origin (matches libpurple teardown — a re-join re-pins
     /// on next inbound), then reload the live routing table. Called BEFORE the invalidation event is

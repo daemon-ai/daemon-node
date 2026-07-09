@@ -1063,6 +1063,14 @@ pub trait ControlApi: Send + Sync {
         Vec::new()
     }
 
+    /// The node's person/metacontact registry (wire vNEXT), insertion order — the
+    /// node-authoritative [`Person`] collection a client renders and re-lists on a
+    /// [`NodeEvent::PersonsChanged`] pointer (ported from the person half of libpurple's
+    /// `PurpleContactManager`). Default: empty (a node assembled without a person registry).
+    async fn person_list(&self) -> Vec<Person> {
+        Vec::new()
+    }
+
     // -- Foreign-agent discovery + registry (catalog-style; the daemon probes its own PATH) --
 
     /// Trigger a server-side foreign-agent discovery scan (PATH + well-known locations + the
@@ -4335,6 +4343,10 @@ pub enum NodeEvent {
     /// mirroring [`NodeEvent::CatalogChanged`] — the whole list is cheap to refetch, so it carries
     /// no per-notification detail.
     NotificationsChanged,
+    /// The node's person/metacontact registry changed (wire vNEXT): a person was created or removed,
+    /// or a contact endpoint was associated/dissociated. A payload-free node-wide invalidation
+    /// pointer (clients re-list via `PersonList`), mirroring [`NodeEvent::NotificationsChanged`].
+    PersonsChanged,
 }
 
 /// A page of the node-wide event feed (`EventsSince` -> `EventsPage`): a batch of [`NodeEvent`]s past

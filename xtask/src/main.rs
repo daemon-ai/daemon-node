@@ -656,6 +656,41 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             ),
         ]),
     )?;
+    // Persons / metacontacts (wire vNEXT; port-person): the read-only list op + a response carrying
+    // an aliased, avatared, multi-endpoint person, so verify-codec proves the generated zcbor C
+    // decoder accepts the person shape (incl. the first wire-reachable `image` rule).
+    write_cbor(&out, "request-person-list.cbor", &ApiRequest::PersonList)?;
+    write_cbor(
+        &out,
+        "response-persons.cbor",
+        &ApiResponse::Persons(vec![daemon_api::Person {
+            id: "person-ada".into(),
+            alias: Some("Ada".into()),
+            avatar: Some(daemon_api::Image {
+                blob: daemon_common::BlobRef::new(daemon_common::ContentHash::new([7u8; 32]), 3),
+            }),
+            endpoints: vec![
+                daemon_api::PersonEndpoint::new(
+                    TransportId::new("matrix/@me:hs.org"),
+                    daemon_api::ContactInfo {
+                        id: "@ada:hs.org".into(),
+                        display_name: Some("Ada L.".into()),
+                        presence: daemon_api::Presence::default(),
+                        permission: daemon_api::ContactPermission::Allow,
+                    },
+                ),
+                daemon_api::PersonEndpoint::new(
+                    TransportId::new("discord/bot"),
+                    daemon_api::ContactInfo {
+                        id: "ada#1234".into(),
+                        display_name: None,
+                        presence: daemon_api::Presence::default(),
+                        permission: daemon_api::ContactPermission::Unset,
+                    },
+                ),
+            ],
+        }]),
+    )?;
     // Account management (wire v35): the reversible-connect + persisted enabled/label + credential
     // rename requests, so verify-codec proves the generated zcbor C decoder accepts all four new
     // request variants (including the `? label` optional in both set/clear shapes).
@@ -1251,6 +1286,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 },
                 // wire vNEXT: the payload-free notifications-changed pointer (port-notify).
                 NodeEvent::NotificationsChanged,
+                // wire vNEXT: the payload-free persons-changed pointer (port-person).
+                NodeEvent::PersonsChanged,
             ],
             next_cursor: 12,
             head_cursor: 12,
