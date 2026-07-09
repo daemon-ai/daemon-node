@@ -71,6 +71,8 @@ the cursor past the proven replay prefix **without deleting durable rows**, then
 | `test_existing_session_restart_persists_repeated_prefix_after_scaffold_only_prefix` (L2338) | ported-pass | `restart_repeated_head_after_scaffold_only_prefix_is_preserved` | scaffold-only prefix skipped, repeated durable-head pair appended |
 | `test_existing_session_restart_persists_cleanup_sensitive_scaffolded_repeated_tail` (L1891) | ported-pass | `restart_literal_json_assistant_tail_delta_is_preserved` | literal-JSON assistant tail delta appended (Rust replay is not collapsed for this shape) |
 | `test_existing_session_restart_skips_exact_lcm_system_scaffold` (L2095) | ported-pass | `restart_system_only_replay_leaves_store_untouched` | zero-turn replay (system prompt is off the turn stream) never ingests/deletes |
+| `test_restart_reconciliation_filtered_prefix_does_not_create_stale_proof` (L2487) | gap-closed | `restart_filtered_prefix_does_not_create_stale_proof` | red `4ea0d51`, green `<stale-proof green commit>`; stale proof now compares the RAW durable prefix |
+| `test_existing_session_restart_skips_stale_short_snapshot_with_externalized_head_payload` (L2185) | gap-closed | `restart_stale_snapshot_with_externalized_head_payload_is_skipped` | same pair; stored-row identities restore §8.2 ingest spills (`restore_ingest_placeholders` accepts the Rust family kinds — Python writes the umbrella `ingest_payload` kind) |
 
 Reconcile gap-open rows (not attempted this pass) are grouped in the backlog section below.
 

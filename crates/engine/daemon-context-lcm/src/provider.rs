@@ -588,17 +588,6 @@ impl LcmContextEngine {
         }
     }
 
-    /// Restart reconcile for a non-scaffold replay: return `(turn_cursor, kind)` — how many leading
-    /// turns of `turns` are a replay of the durable store, and why. A core port of
-    /// `_reconcile_ingest_cursor_from_store` + `_find_reconciled_cursor_for_store_tail`
-    /// (`LCM:engine.py:2910-3222`), operating at turn granularity (each turn flattens to one or
-    /// more message identities). Never deletes durable rows.
-    ///
-    /// Adaptation (see PARITY.md): the Python system-message anchor for the stale-snapshot guard is
-    /// mapped to "the conversation carries a plain system prompt (no LCM note)", because the Rust
-    /// `Conversation` keeps the system prompt out of the turn/row stream. Externalized-payload and
-    /// quarantine-identity restoration and the sanitized-active-cleanup equivalence flags are not
-    /// modeled here (documented gaps).
     /// Whether a durable store row matches the active `ignore_message_patterns` (so it is excluded
     /// from tail reconciliation, mirroring Python's `stored_row=True` filtering).
     fn row_is_ignored(&self, row: &crate::store::MessageRow) -> bool {
@@ -613,6 +602,24 @@ impl LcmContextEngine {
         !self.message_patterns.is_empty() && self.message_patterns.is_match(&turn_match_text(turn))
     }
 
+    /// Restart reconcile for a non-scaffold replay: return `(turn_cursor, kind)` — how many leading
+    /// turns of `turns` are a replay of the durable store, and why. A core port of
+    /// `_reconcile_ingest_cursor_from_store` + `_find_reconciled_cursor_for_store_tail`
+    /// (`LCM:engine.py:2910-3222`), operating at turn granularity (each turn flattens to one or
+    /// more message identities). Never deletes durable rows.
+    ///
+    /// Stored-row identities restore externalized ingest payloads before matching (the
+    /// `stored_row=True` restoration in `_message_replay_identity`), so a replay carrying the raw
+    /// inline payload still matches the placeholder row the write boundary persisted. The
+    /// stale-snapshot proof compares against the RAW durable prefix (ignore filters may suppress
+    /// noisy rows for tail reconciliation, but filtered history must not create replay evidence
+    /// for skipping a batch — `LCM:engine.py:3186-3192`).
+    ///
+    /// Adaptation (see PARITY.md): the Python system-message anchor for the stale-snapshot guard is
+    /// mapped to "the conversation carries a plain system prompt (no LCM note)", because the Rust
+    /// `Conversation` keeps the system prompt out of the turn/row stream. Quarantine-identity
+    /// restoration and the sanitized-active-cleanup equivalence flags are not modeled here
+    /// (documented gaps).
     fn reconcile_turn_cursor(
         &self,
         session: &str,
@@ -622,12 +629,18 @@ impl LcmContextEngine {
         system_is_plain: bool,
     ) -> (usize, ReconcileKind) {
         let all_rows = self.store.session_messages(session).unwrap_or_default();
-        // Durable identities (ignore-filtered), oldest→newest. `stored_head` is the full prefix
-        // from row 0; `stored_tail` is the last `tail_limit` of them.
+        let ext_dir = self.config.externalization_dir();
+        // Durable identities oldest→newest: `stored_raw_all` keeps every row (the stale-proof
+        // view); `stored_all` is the ignore-filtered view used for tail matching.
+        let stored_raw_all: Vec<ReplayId> = all_rows
+            .iter()
+            .map(|r| row_replay_id(r, ext_dir.as_deref()))
+            .collect();
         let stored_all: Vec<ReplayId> = all_rows
             .iter()
-            .filter(|r| !self.row_is_ignored(r))
-            .map(row_replay_id)
+            .zip(stored_raw_all.iter())
+            .filter(|(r, _)| !self.row_is_ignored(r))
+            .map(|(_, id)| id.clone())
             .collect();
         if stored_all.is_empty() {
             return (0, ReconcileKind::AmbiguousDelta);
@@ -692,10 +705,12 @@ impl LcmContextEngine {
         }
 
         // No qualifying replay cursor. A stale short snapshot that exactly re-supplies the durable
-        // head with no tail overlap must be skipped, not appended (a duplicate guard). Otherwise the
-        // batch is an ambiguous delta and is persisted from the top.
+        // head with no tail overlap must be skipped, not appended (a duplicate guard). The proof
+        // uses the RAW durable prefix — filtered rows must not manufacture stale evidence.
+        // Otherwise the batch is an ambiguous delta and is persisted from the top.
         let incoming = visible_prefix(n);
-        if is_suspicious_stale_no_overlap(&incoming, stored_tail, &stored_all, system_is_plain) {
+        if is_suspicious_stale_no_overlap(&incoming, stored_tail, &stored_raw_all, system_is_plain)
+        {
             return (n, ReconcileKind::StaleSkip);
         }
         (0, ReconcileKind::AmbiguousDelta)
@@ -764,7 +779,8 @@ enum ReconcileKind {
 
 /// A message-level replay identity for restart reconciliation (a core port of
 /// `_message_replay_identity`, `LCM:engine.py:2754`): `(role, content, tool_call_id, tool_calls)`.
-/// Externalized-payload / quarantine restoration is not modeled (adaptation — see PARITY.md).
+/// Stored rows restore externalized ingest payloads (`stored_row=True`); quarantine restoration is
+/// not modeled (adaptation — see PARITY.md).
 #[derive(Clone, PartialEq, Eq)]
 struct ReplayId {
     role: String,
@@ -773,10 +789,21 @@ struct ReplayId {
     tool_calls: String,
 }
 
-fn row_replay_id(row: &crate::store::MessageRow) -> ReplayId {
+/// The replay identity of a durable store row. Externalized ingest-payload placeholders are
+/// restored to their original inline content (the `stored_row=True` branch of
+/// `_message_replay_identity`) so a restart replay carrying the raw payload matches the row the
+/// write boundary persisted; quarantined-assistant spills keep their placeholder (kind mismatch).
+fn row_replay_id(row: &crate::store::MessageRow, ext_dir: Option<&std::path::Path>) -> ReplayId {
+    let mut content = row.content.clone().unwrap_or_default();
+    if let Some(dir) = ext_dir {
+        if content.contains("[Externalized LCM ingest payload:") {
+            content =
+                crate::externalize::restore_ingest_placeholders(dir, &content, &row.session_id);
+        }
+    }
     ReplayId {
         role: row.role.clone(),
-        content: row.content.clone().unwrap_or_default(),
+        content,
         tool_call_id: row.tool_call_id.clone().unwrap_or_default(),
         tool_calls: row.tool_calls.clone().unwrap_or_default(),
     }
@@ -3716,7 +3743,7 @@ mod tests {
 
     // parity: engine.py::test_existing_session_restart_skips_stale_short_snapshot_with_externalized_head_payload (tests/test_lcm_engine.py:2185)
     #[tokio::test]
-    async fn parity_gap_restart_stale_snapshot_with_externalized_head_payload_is_skipped() {
+    async fn restart_stale_snapshot_with_externalized_head_payload_is_skipped() {
         let dir = reconcile_dir("stale-externalized-head");
         let cfg = LcmConfig {
             data_dir: dir.clone(),
@@ -3772,7 +3799,7 @@ mod tests {
 
     // parity: engine.py::test_restart_reconciliation_filtered_prefix_does_not_create_stale_proof (tests/test_lcm_engine.py:2487)
     #[tokio::test]
-    async fn parity_gap_restart_filtered_prefix_does_not_create_stale_proof() {
+    async fn restart_filtered_prefix_does_not_create_stale_proof() {
         let dir = reconcile_dir("filtered-prefix-stale");
         let base = LcmConfig {
             data_dir: dir.clone(),
