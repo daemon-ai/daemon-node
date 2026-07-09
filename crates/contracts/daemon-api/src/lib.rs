@@ -5299,6 +5299,8 @@ mod tests {
     }
 }
 
+mod matching;
+pub use matching::*;
 mod args;
 pub use args::*;
 mod wire;
