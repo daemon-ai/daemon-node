@@ -6,6 +6,7 @@
 use crate::{classify_genai_error, finalize_output, RawToolCall};
 use async_trait::async_trait;
 use daemon_common::{Pricing, UsageDelta};
+use daemon_core::provider::CacheTtl;
 use daemon_core::{
     Capabilities, EmbeddingProvider, Failure, ModelOutput, Provider, Request, RequestImage,
     RequestMsg, RequestParams, ResponseMeta, StreamEvent, ToolCallFormat,
@@ -147,7 +148,12 @@ impl GenAiProvider {
     }
 
     fn chat_request(&self, req: &Request) -> ChatRequest {
-        let mut messages: Vec<ChatMessage> = req.messages.iter().map(to_chat_message).collect();
+        let marker = cache_marker(req.cache_ttl);
+        let mut messages: Vec<ChatMessage> = req
+            .messages
+            .iter()
+            .map(|msg| to_chat_message(msg, marker.clone()))
+            .collect();
         // A cache breakpoint on the tools+system prefix (the largest stable block) when the engine
         // requests it. genai ignores `cache_control` on the request-level `system` string for
         // Anthropic, so the system must be passed as a leading System *message* to carry the
@@ -156,7 +162,7 @@ impl GenAiProvider {
         if cache_system {
             messages.insert(
                 0,
-                ChatMessage::system(req.system.clone()).with_options(CacheControl::Ephemeral),
+                ChatMessage::system(req.system.clone()).with_options(marker),
             );
         }
         let mut chat = ChatRequest::new(messages);
@@ -437,10 +443,22 @@ async fn resolve_target(
     Ok(target)
 }
 
+/// Map an engine [`CacheTtl`] to the genai `cache_control` marker: the default 5-minute tier is
+/// the bare `{"type":"ephemeral"}` (no `ttl` key, hermes' 5m marker), the extended tier serializes
+/// `{"type":"ephemeral","ttl":"1h"}` on the Anthropic wire. Every breakpoint of one request shares
+/// the marker, so genai's "1h before 5m" ordering constraint can never trip.
+fn cache_marker(ttl: CacheTtl) -> CacheControl {
+    match ttl {
+        CacheTtl::FiveMin => CacheControl::Ephemeral,
+        CacheTtl::OneHour => CacheControl::Ephemeral1h,
+    }
+}
+
 /// Map one flattened [`RequestMsg`] into a `genai` [`ChatMessage`], preserving native tool linkage.
-/// A [`RequestMsg::cache_breakpoint`] becomes an ephemeral `cache_control` marker so a prefix-caching
-/// provider (Anthropic) caches the conversation up to that message; other providers ignore it.
-fn to_chat_message(msg: &RequestMsg) -> ChatMessage {
+/// A [`RequestMsg::cache_breakpoint`] becomes the request's `cache_control` `marker` so a
+/// prefix-caching provider (Anthropic) caches the conversation up to that message; other providers
+/// ignore it.
+fn to_chat_message(msg: &RequestMsg, marker: CacheControl) -> ChatMessage {
     let chat_msg = match msg.role.as_str() {
         "tool" => {
             let call_id = msg.tool_call_id.clone().unwrap_or_default();
@@ -478,7 +496,7 @@ fn to_chat_message(msg: &RequestMsg) -> ChatMessage {
         _ => ChatMessage::user(msg.content.clone()),
     };
     if msg.cache_breakpoint {
-        chat_msg.with_options(CacheControl::Ephemeral)
+        chat_msg.with_options(marker)
     } else {
         chat_msg
     }
@@ -907,7 +925,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let chat = to_chat_message(&msg);
+        let chat = to_chat_message(&msg, CacheControl::Ephemeral);
         let parts = chat.content.parts();
         assert!(parts.iter().any(|p| p.is_text()), "keeps the text part");
         assert!(
@@ -923,7 +941,7 @@ mod tests {
             content: "no image".into(),
             ..Default::default()
         };
-        let chat = to_chat_message(&msg);
+        let chat = to_chat_message(&msg, CacheControl::Ephemeral);
         assert!(!chat.content.parts().iter().any(|p| p.is_image()));
     }
 }

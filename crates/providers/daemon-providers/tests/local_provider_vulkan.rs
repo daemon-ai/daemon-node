@@ -76,12 +76,7 @@ async fn local_provider_chats_on_vulkan() {
             content: "Write one short sentence about the sky.".to_string(),
             ..Default::default()
         }],
-        tools: Vec::new(),
-        auth: None,
-        constraint: None,
-        cache_system: false,
-        params: Default::default(),
-        task: None,
+        ..Default::default()
     };
     let out = provider.chat(req).await.expect("chat ok");
     eprintln!(

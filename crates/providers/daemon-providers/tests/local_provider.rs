@@ -51,12 +51,7 @@ fn user_request(text: &str) -> Request {
             content: text.into(),
             ..Default::default()
         }],
-        tools: Vec::new(),
-        auth: None,
-        constraint: None,
-        cache_system: false,
-        params: Default::default(),
-        task: None,
+        ..Default::default()
     }
 }
 

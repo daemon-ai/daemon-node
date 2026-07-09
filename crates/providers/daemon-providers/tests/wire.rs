@@ -8,6 +8,7 @@
 //! The mock matches `POST` only (genai appends the adapter's path to our `with_endpoint` base, so we
 //! don't pin the exact path) and returns provider-shaped bodies that `genai` decodes.
 
+use daemon_core::provider::{mark_cache_breakpoints, CacheTtl};
 use daemon_core::{
     EmbeddingProvider, Failure, Provider, Request, RequestMsg, StreamEvent, ToolDef,
 };
@@ -30,10 +31,7 @@ fn req() -> Request {
             schema: r#"{"type":"object","properties":{"path":{"type":"string"}}}"#.into(),
         }],
         auth: Some("sk-test".into()),
-        constraint: None,
-        cache_system: false,
-        params: Default::default(),
-        task: None,
+        ..Default::default()
     }
 }
 
@@ -406,6 +404,185 @@ async fn anthropic_cache_breakpoints_serialize_to_wire() {
     assert!(
         has_cc,
         "last message should carry a cache_control block: {last}"
+    );
+}
+
+/// Count every `cache_control` marker anywhere in a JSON body (system blocks + message parts).
+fn count_cache_controls(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Object(map) => {
+            let own = usize::from(map.contains_key("cache_control"));
+            own + map.values().map(count_cache_controls).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(count_cache_controls).sum(),
+        _ => 0,
+    }
+}
+
+/// A minimal Anthropic-shaped completion the cache-layout tests mount.
+fn anthropic_ok_body() -> serde_json::Value {
+    serde_json::json!({
+        "id": "msg_ttl", "type": "message", "role": "assistant", "model": "claude-test",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "ok"}],
+        "usage": {"input_tokens": 3, "output_tokens": 1}
+    })
+}
+
+/// The default 5-minute TTL serializes as a bare `{"type":"ephemeral"}` marker (no `ttl` key) on
+/// both the system block and the marked message — the hermes 5m marker shape.
+#[tokio::test]
+async fn anthropic_default_ttl_serializes_bare_ephemeral() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok_body()))
+        .mount(&server)
+        .await;
+
+    let mut request = req();
+    request.cache_system = true;
+    request.messages.last_mut().unwrap().cache_breakpoint = true;
+    assert_eq!(request.cache_ttl, CacheTtl::FiveMin);
+
+    let provider = GenAiProvider::anthropic("claude-test").with_endpoint(endpoint(&server));
+    provider.chat(request).await.expect("chat succeeds");
+
+    let received = server.received_requests().await.expect("captured requests");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+    let rendered = body.to_string();
+    assert!(
+        rendered.contains(r#""cache_control":{"type":"ephemeral"}"#),
+        "5m marker is the bare ephemeral shape: {rendered}"
+    );
+    assert!(
+        !rendered.contains(r#""ttl""#),
+        "the default TTL carries no ttl key: {rendered}"
+    );
+}
+
+/// The 1-hour TTL serializes as `{"type":"ephemeral","ttl":"1h"}` on every marker of the request
+/// (hermes' `cache_ttl="1h"` variant).
+#[tokio::test]
+async fn anthropic_one_hour_ttl_serializes_on_every_marker() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok_body()))
+        .mount(&server)
+        .await;
+
+    let mut request = req();
+    request.cache_system = true;
+    request.cache_ttl = CacheTtl::OneHour;
+    request.messages.last_mut().unwrap().cache_breakpoint = true;
+
+    let provider = GenAiProvider::anthropic("claude-test").with_endpoint(endpoint(&server));
+    provider.chat(request).await.expect("chat succeeds");
+
+    let received = server.received_requests().await.expect("captured requests");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+
+    // The system block carries the 1h marker.
+    let system_has_1h = body["system"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b["cache_control"]["ttl"].as_str() == Some("1h"))
+        })
+        .unwrap_or(false);
+    assert!(system_has_1h, "system marker carries ttl=1h: {body}");
+
+    // The marked message part carries the same 1h marker.
+    let last = body["messages"].as_array().unwrap().last().unwrap();
+    let msg_has_1h = last["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .any(|p| p["cache_control"]["ttl"].as_str() == Some("1h"))
+        })
+        .unwrap_or(false);
+    assert!(msg_has_1h, "message marker carries ttl=1h: {last}");
+}
+
+/// The engine's `system_and_3` policy lands at most **4** `cache_control` markers on the
+/// Anthropic wire — the system prefix plus the last three messages, hermes'
+/// `test_max_4_breakpoints` at the JSON layout level.
+#[tokio::test]
+async fn anthropic_wire_caps_at_four_cache_markers() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_ok_body()))
+        .mount(&server)
+        .await;
+
+    // A long conversation: system + 8 messages through the engine's cache policy.
+    let mut request = req();
+    request.messages = (0..8)
+        .map(|i| RequestMsg {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: format!("msg{i}"),
+            ..Default::default()
+        })
+        .collect();
+    mark_cache_breakpoints(&mut request);
+
+    let provider = GenAiProvider::anthropic("claude-test").with_endpoint(endpoint(&server));
+    provider.chat(request).await.expect("chat succeeds");
+
+    let received = server.received_requests().await.expect("captured requests");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+    assert_eq!(
+        count_cache_controls(&body),
+        4,
+        "system + last 3 = exactly four markers on the wire: {body}"
+    );
+    // And they sit on the trailing three messages, not anywhere earlier.
+    let messages = body["messages"].as_array().unwrap();
+    for (i, msg) in messages.iter().enumerate() {
+        let marked = count_cache_controls(msg) > 0;
+        assert_eq!(
+            marked,
+            i >= messages.len() - 3,
+            "marker placement at message {i}: {msg}"
+        );
+    }
+}
+
+/// Policy gating by wire: the same engine-marked request produces NO `cache_control` keys on the
+/// OpenAI wire (which caches automatically and rejects unknown fields on strict gateways) — it
+/// keeps the `prompt_cache_key` routing hint instead. The Anthropic wire is the explicit-marker
+/// path; see the tests above.
+#[tokio::test]
+async fn openai_wire_emits_no_cache_control_markers() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-nocc", "object": "chat.completion", "model": "gpt-test",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })))
+        .mount(&server)
+        .await;
+
+    let mut request = req();
+    mark_cache_breakpoints(&mut request);
+    assert!(request.cache_system);
+
+    let provider = GenAiProvider::openai("gpt-test").with_endpoint(endpoint(&server));
+    provider.chat(request).await.expect("chat succeeds");
+
+    let received = server.received_requests().await.expect("captured requests");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+    assert_eq!(
+        count_cache_controls(&body),
+        0,
+        "no cache_control on the OpenAI wire: {body}"
+    );
+    assert!(
+        body["prompt_cache_key"].is_string(),
+        "OpenAI keeps the prompt_cache_key routing hint: {body}"
     );
 }
 

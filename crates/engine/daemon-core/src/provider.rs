@@ -18,6 +18,34 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// The prompt-cache TTL requested for a [`Request`]'s cache breakpoints (§ prompt caching).
+///
+/// Maps to Anthropic `cache_control` TTLs (`{"type":"ephemeral"}` = 5 minutes;
+/// `{"type":"ephemeral","ttl":"1h"}` = 1 hour, at 2x write cost). Providers without explicit
+/// breakpoints ignore it. All breakpoints of one request share the TTL (hermes `system_and_3`),
+/// so Anthropic's "longer TTLs must precede shorter" ordering constraint can never trip.
+/// Serde-capable because it rides the engine [`Config`](crate::config::Config).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CacheTtl {
+    /// The 5-minute ephemeral cache (the default; no `ttl` key on the wire).
+    #[default]
+    FiveMin,
+    /// The extended 1-hour cache (`"ttl":"1h"` on the wire; 2x base input price to write).
+    OneHour,
+}
+
+impl CacheTtl {
+    /// Parse a config string: `"1h"` selects [`CacheTtl::OneHour`]; anything else (including
+    /// `"5m"`, empty, or garbage) falls back to the [`CacheTtl::FiveMin`] default.
+    pub fn from_config_str(s: &str) -> Self {
+        if s.trim() == "1h" {
+            CacheTtl::OneHour
+        } else {
+            CacheTtl::FiveMin
+        }
+    }
+}
+
 /// How a model expects tool calls to be encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolCallFormat {
@@ -71,6 +99,9 @@ pub struct Request {
     /// prefix on their own (mistral.rs prefix cache; the llama worker's persistent context) and also
     /// ignore the hint.
     pub cache_system: bool,
+    /// The cache TTL for every breakpoint this request carries (`cache_system` + the message-level
+    /// [`RequestMsg::cache_breakpoint`]s). Providers without explicit breakpoints ignore it.
+    pub cache_ttl: CacheTtl,
     /// Per-call sampling overrides for this request. The `Default` (all `None`) preserves the
     /// provider's own defaults — the behavior of every main turn. Aux/LCM/title/vision call sites set
     /// the subset they need ([`Request::with_params`]); a provider maps what it supports and ignores
@@ -141,8 +172,9 @@ pub struct RequestMsg {
     /// For a `tool` message: the id of the call this result answers (native round-trip).
     pub tool_call_id: Option<String>,
     /// A prompt-cache breakpoint marker (§ prompt caching): when set, the stable prefix up to and
-    /// including this message should be cached. The engine's cache policy marks the last message of
-    /// the request so the growing conversation reuses the cached prefix across turns. This is an
+    /// including this message should be cached. The engine's cache policy
+    /// ([`mark_cache_breakpoints`], hermes `system_and_3`) marks the last three messages of the
+    /// request so the growing conversation reuses the cached prefix across turns. This is an
     /// explicit-breakpoint hint (Anthropic `cache_control`); providers that cache automatically or
     /// reuse the KV prefix themselves (OpenAI/DeepSeek, local engines) ignore it.
     pub cache_breakpoint: bool,
@@ -456,31 +488,37 @@ pub fn build_context(conv: &Conversation, tools: &[ToolDef]) -> Request {
     // or leave a suspended tool call unanswered, so enforce the provider structural contract here
     // (leading-user, tool pairing, no empty blocks). No-op for a well-formed sequence.
     let messages = crate::repair::repair_message_sequence(messages);
-    let mut req = Request {
+    // No breakpoints here: the engine marks them (`mark_cache_breakpoints`) AFTER the final system
+    // string is assembled from the composed prompt, so `cache_system` reflects what actually ships.
+    Request {
         system: conv.system.text.clone(),
         messages,
         tools: tools.to_vec(),
         auth: None,
         constraint: None,
         cache_system: false,
+        cache_ttl: CacheTtl::default(),
         params: RequestParams::default(),
         task: None,
-    };
-    mark_cache_breakpoints(&mut req);
-    req
+    }
 }
 
-/// Place prompt-cache breakpoints on the request's stable prefix (§ prompt caching).
+/// Place prompt-cache breakpoints on the request (§ prompt caching) — hermes' `system_and_3`
+/// policy (`prompt_caching.apply_anthropic_cache_control`).
 ///
-/// Two breakpoints, mirroring Anthropic's incremental multi-turn recommendation and hermes'
-/// `prompt_caching` policy: (1) the **tools+system** prefix (the largest stable block, unchanged
-/// turn to turn), and (2) the **last message** of the request, so the entire conversation prefix is
-/// cached and the *next* turn reads it as a hit before appending. Providers without prefix caching
-/// ignore both markers, so this is always safe to apply.
+/// Up to **4** breakpoints (the Anthropic maximum): the **tools+system** prefix (the largest
+/// stable block, byte-stable turn to turn) plus the **last 3 messages**, so the entire
+/// conversation prefix is cached and the *next* turn reads it as a hit before appending. Without a
+/// system prompt all 4 slots go to trailing messages. Must run **after** the final system string
+/// is assembled (the composed prompt folded in). Providers without explicit prefix caching ignore
+/// the markers, so this is always safe to apply.
 pub fn mark_cache_breakpoints(req: &mut Request) {
     req.cache_system = !req.system.is_empty();
-    if let Some(last) = req.messages.last_mut() {
-        last.cache_breakpoint = true;
+    let used = usize::from(req.cache_system);
+    let remaining = 4 - used;
+    let skip = req.messages.len().saturating_sub(remaining);
+    for msg in req.messages.iter_mut().skip(skip) {
+        msg.cache_breakpoint = true;
     }
 }
 
@@ -773,56 +811,104 @@ mod cache_tests {
     use crate::conversation::{AssistantMsg, Conversation, SystemPrompt};
     use daemon_protocol::UserMsg;
 
+    /// The count of message-level breakpoints on `req`.
+    fn breakpoints(req: &Request) -> usize {
+        req.messages.iter().filter(|m| m.cache_breakpoint).count()
+    }
+
     #[test]
-    fn build_context_marks_system_and_last_message() {
+    fn build_context_marks_no_breakpoints() {
+        // Breakpoints are the engine's job AFTER final system assembly — `build_context` alone
+        // (the LCM summarize / aux paths) must not mark anything.
         let mut conv = Conversation::new(SystemPrompt::new("a stable system prompt"));
         conv.push_user(UserMsg::new("hello"));
         conv.push_assistant(AssistantMsg::text("hi there"));
         let req = build_context(&conv, &[]);
-
-        assert!(req.cache_system, "a non-empty system is a cache breakpoint");
-        assert!(
-            req.messages.last().unwrap().cache_breakpoint,
-            "the last message anchors the conversation-prefix breakpoint"
-        );
-        assert_eq!(
-            req.messages.iter().filter(|m| m.cache_breakpoint).count(),
-            1,
-            "exactly one message-level breakpoint (the last)"
-        );
+        assert!(!req.cache_system);
+        assert_eq!(breakpoints(&req), 0);
+        assert_eq!(req.cache_ttl, CacheTtl::FiveMin);
     }
 
     #[test]
-    fn empty_system_is_not_a_cache_breakpoint() {
+    fn system_and_3_marks_system_plus_last_three() {
+        let mut conv = Conversation::new(SystemPrompt::new("a stable system prompt"));
+        for i in 0..4 {
+            conv.push_user(UserMsg::new(format!("q{i}")));
+            conv.push_assistant(AssistantMsg::text(format!("a{i}")));
+        }
+        let mut req = build_context(&conv, &[]);
+        mark_cache_breakpoints(&mut req);
+
+        assert!(req.cache_system, "a non-empty system is a cache breakpoint");
+        assert_eq!(breakpoints(&req), 3, "last 3 messages marked");
+        let n = req.messages.len();
+        for (i, msg) in req.messages.iter().enumerate() {
+            assert_eq!(
+                msg.cache_breakpoint,
+                i >= n - 3,
+                "only the trailing 3 carry markers (index {i} of {n})"
+            );
+        }
+    }
+
+    #[test]
+    fn system_and_3_caps_at_four_breakpoints_total() {
+        let mut conv = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..10 {
+            conv.push_user(UserMsg::new(format!("q{i}")));
+            conv.push_assistant(AssistantMsg::text(format!("a{i}")));
+        }
+        let mut req = build_context(&conv, &[]);
+        mark_cache_breakpoints(&mut req);
+        let total = breakpoints(&req) + usize::from(req.cache_system);
+        assert_eq!(total, 4, "system + last 3 = the Anthropic maximum");
+    }
+
+    #[test]
+    fn empty_system_gives_all_four_slots_to_messages() {
         let mut conv = Conversation::new(SystemPrompt::new(""));
-        conv.push_user(UserMsg::new("hello"));
-        let req = build_context(&conv, &[]);
+        for i in 0..6 {
+            conv.push_user(UserMsg::new(format!("m{i}")));
+        }
+        let mut req = build_context(&conv, &[]);
+        mark_cache_breakpoints(&mut req);
         assert!(!req.cache_system);
-        // The message-prefix breakpoint still applies even without a system.
-        assert!(req.messages.last().unwrap().cache_breakpoint);
+        assert_eq!(breakpoints(&req), 4, "no system => last 4 messages marked");
+    }
+
+    #[test]
+    fn fewer_messages_than_slots_marks_them_all() {
+        let mut conv = Conversation::new(SystemPrompt::new("sys"));
+        conv.push_user(UserMsg::new("hello"));
+        let mut req = build_context(&conv, &[]);
+        mark_cache_breakpoints(&mut req);
+        assert!(req.cache_system);
+        assert_eq!(breakpoints(&req), 1, "one message => one marker");
     }
 
     #[test]
     fn no_messages_yields_no_message_breakpoint() {
         let conv = Conversation::new(SystemPrompt::new("sys"));
-        let req = build_context(&conv, &[]);
+        let mut req = build_context(&conv, &[]);
+        mark_cache_breakpoints(&mut req);
         assert!(req.cache_system);
         assert!(req.messages.is_empty());
+    }
+
+    #[test]
+    fn cache_ttl_parses_config_strings_with_default_fallback() {
+        assert_eq!(CacheTtl::from_config_str("1h"), CacheTtl::OneHour);
+        assert_eq!(CacheTtl::from_config_str(" 1h "), CacheTtl::OneHour);
+        assert_eq!(CacheTtl::from_config_str("5m"), CacheTtl::FiveMin);
+        assert_eq!(CacheTtl::from_config_str(""), CacheTtl::FiveMin);
+        assert_eq!(CacheTtl::from_config_str("2d"), CacheTtl::FiveMin);
+        assert_eq!(CacheTtl::default(), CacheTtl::FiveMin);
     }
 
     #[tokio::test]
     async fn unconfigured_provider_errors_clearly_and_never_completes() {
         let provider = UnconfiguredProvider::new();
-        let req = Request {
-            system: String::new(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            auth: None,
-            constraint: None,
-            cache_system: false,
-            params: RequestParams::default(),
-            task: None,
-        };
+        let req = Request::default();
         let err = provider.chat(req).await.expect_err("must not complete");
         match err {
             Failure::Provider(msg) => assert!(

@@ -199,6 +199,13 @@ pub struct Config {
     /// autonomous fleet engines are configured `AutoAllow` so they never stall.
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
+    /// The prompt-cache TTL threaded onto every request's breakpoints (§ prompt caching): the
+    /// default 5-minute ephemeral tier, or the extended 1-hour tier for long-lived sessions
+    /// (hermes `cache_ttl`). Parse operator strings via
+    /// [`CacheTtl::from_config_str`](crate::provider::CacheTtl::from_config_str) — invalid values
+    /// fall back to the default.
+    #[serde(default)]
+    pub cache_ttl: crate::provider::CacheTtl,
 }
 
 impl Default for Config {
@@ -220,6 +227,7 @@ impl Default for Config {
             skill_review_interval: DEFAULT_REVIEW_NUDGE_INTERVAL,
             memory_review_interval: DEFAULT_REVIEW_NUDGE_INTERVAL,
             approval_policy: ApprovalPolicy::Ask,
+            cache_ttl: crate::provider::CacheTtl::FiveMin,
         }
     }
 }

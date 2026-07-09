@@ -170,6 +170,7 @@ pub fn request_to_core(req: &crate::wire::ChatCompletionRequest) -> Result<Reque
         auth: None,
         constraint: None,
         cache_system: false,
+        cache_ttl: Default::default(),
         params,
         task: None,
     })
