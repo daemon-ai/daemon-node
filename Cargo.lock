@@ -2312,6 +2312,7 @@ dependencies = [
  "async-trait",
  "cddl-cat",
  "ciborium",
+ "daemon-api-testkit",
  "daemon-common",
  "daemon-protocol",
  "futures",
@@ -2321,6 +2322,16 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "daemon-api-testkit"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "daemon-api",
+ "daemon-common",
+ "daemon-protocol",
 ]
 
 [[package]]
