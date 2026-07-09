@@ -148,12 +148,23 @@ impl ProfileApi for NodeApiImpl {
                     .flatten()
             })
             .map(|r| r.seq);
+        // The SOUL doc travels with a distributed profile (wire v36); USER.md never does. Core
+        // engine only: reading a Foreign profile's persona would seed an orphan SOUL doc (its
+        // agent owns its prompt — there is no persona to export). `None` when no persona backend
+        // is wired or the read fails (a distribution without a persona is still importable).
+        let soul = match &self.persona_ops {
+            Some(persona) if !matches!(spec.engine, daemon_api::EngineSelector::Foreign { .. }) => {
+                persona.soul_get(&id).await.ok()
+            }
+            _ => None,
+        };
         Ok(Distribution {
             wire_version: daemon_common::WireVersion::CURRENT,
             profile: spec,
             skills,
             head_seq,
             source: None,
+            soul,
         })
     }
 
@@ -183,6 +194,9 @@ impl ProfileApi for NodeApiImpl {
         spec.created_by = Some(daemon_common::Author::Operator);
         spec.owner = None;
         let id = spec.id.clone();
+        // The created spec is moved into the store; keep a copy for the SOUL import's
+        // Foreign-engine guard below.
+        let soul_spec = spec.clone();
         store.create(spec).map_err(profile_err)?;
         self.record_profile(&id, daemon_common::Author::Operator, "import");
         self.emit_profiles_changed();
@@ -202,6 +216,18 @@ impl ProfileApi for NodeApiImpl {
                         &format!("import via {id}"),
                     )
                     .map_err(|e| ApiError::Other(format!("skill import: {e}")))?;
+            }
+        }
+        // Materialize the distribution's SOUL doc through the persona seam (wire v36). Best-effort
+        // + Foreign-guarded: `soul_set_guarded` refuses to write a persona for a Foreign-engine
+        // profile (its agent owns its prompt), and a persona hiccup never fails the import (the
+        // profile + skills already landed).
+        if let (Some(soul), Some(persona)) = (&dist.soul, &self.persona_ops) {
+            if let Err(e) =
+                crate::persona_ops::soul_set_guarded(persona.as_ref(), Some(&soul_spec), &id, soul)
+                    .await
+            {
+                tracing::warn!(profile = %id, error = %e, "profile import: SOUL doc not applied");
             }
         }
         // An imported profile can declare `bound_accounts` (§5.9 hot-reload).
