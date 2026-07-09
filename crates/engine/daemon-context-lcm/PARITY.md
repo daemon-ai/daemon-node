@@ -41,7 +41,7 @@ green) · `gap-open` (documented red backlog) · `out-of-scope`.
 
 ### Area 1 — restart-reconciliation matrix (`tests/test_lcm_engine.py` L1264–2542)
 
-Reconcile gap-closed cluster: red `3f0a48a`, green `<this commit>`.
+Reconcile gap-closed cluster: red `3f0a48a`, green `20e38d6`.
 
 | Python test | status | Rust test | note |
 |---|---|---|---|
@@ -71,7 +71,7 @@ the cursor past the proven replay prefix **without deleting durable rows**, then
 | `test_existing_session_restart_persists_repeated_prefix_after_scaffold_only_prefix` (L2338) | ported-pass | `restart_repeated_head_after_scaffold_only_prefix_is_preserved` | scaffold-only prefix skipped, repeated durable-head pair appended |
 | `test_existing_session_restart_persists_cleanup_sensitive_scaffolded_repeated_tail` (L1891) | ported-pass | `restart_literal_json_assistant_tail_delta_is_preserved` | literal-JSON assistant tail delta appended (Rust replay is not collapsed for this shape) |
 | `test_existing_session_restart_skips_exact_lcm_system_scaffold` (L2095) | ported-pass | `restart_system_only_replay_leaves_store_untouched` | zero-turn replay (system prompt is off the turn stream) never ingests/deletes |
-| `test_restart_reconciliation_filtered_prefix_does_not_create_stale_proof` (L2487) | gap-closed | `restart_filtered_prefix_does_not_create_stale_proof` | red `4ea0d51`, green `<stale-proof green commit>`; stale proof now compares the RAW durable prefix |
+| `test_restart_reconciliation_filtered_prefix_does_not_create_stale_proof` (L2487) | gap-closed | `restart_filtered_prefix_does_not_create_stale_proof` | red `4ea0d51`, green `e588990`; stale proof now compares the RAW durable prefix |
 | `test_existing_session_restart_skips_stale_short_snapshot_with_externalized_head_payload` (L2185) | gap-closed | `restart_stale_snapshot_with_externalized_head_payload_is_skipped` | same pair; stored-row identities restore §8.2 ingest spills (`restore_ingest_placeholders` accepts the Rust family kinds — Python writes the umbrella `ingest_payload` kind) |
 
 Reconcile gap-open rows (not attempted this pass) are grouped in the backlog section below.
@@ -88,7 +88,7 @@ Reconcile gap-open rows (not attempted this pass) are grouped in the backlog sec
 
 | Python test | status | Rust test | note |
 |---|---|---|---|
-| `/lcm doctor source` scan (L440) | gap-closed | `doctor_source_scans_legacy_blank_rows` | red `053b890`, green `<doctor-source green commit>`; new `Store::source_normalization_plan` |
+| `/lcm doctor source` scan (L440) | gap-closed | `doctor_source_scans_legacy_blank_rows` | red `053b890`, green `179200d`; new `Store::source_normalization_plan` |
 | `/lcm doctor source apply` (L451) | gap-closed | `doctor_source_apply_normalizes_legacy_blank_rows` | same pair; backup-first `Store::normalize_legacy_blank_sources`, no-op batch skips the backup |
 
 ## Out of scope (recorded per task brief)

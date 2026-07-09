@@ -3847,6 +3847,139 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // parity: engine.py::test_existing_compacted_session_restart_ignores_preserved_objective_anchor (tests/test_lcm_engine.py:1375)
+    #[tokio::test]
+    async fn parity_gap_restart_ignores_preserved_objective_anchor() {
+        let dir = reconcile_dir("preserved-objective");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            fresh_tail_count: 2,
+            ..LcmConfig::default()
+        };
+        let latest_request = "increase kanban autonomy";
+        // Incarnation 1: the newest real user turn is followed by two tool turns, so with a
+        // 2-turn fresh tail the compaction preserves it as an objective anchor inside the
+        // synthetic summary scaffold.
+        let compacted = {
+            let lcm = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("s1"),
+                aux_with("Older board cleanup summary."),
+            )
+            .unwrap();
+            lcm.on_model(&model());
+            let mut c = Conversation::new(SystemPrompt::new("You are concise."));
+            for i in 0..20 {
+                c.push_user(UserMsg::new(format!("clean up boards {i} ").repeat(20)));
+                c.push_assistant(AssistantMsg::text(format!("inspecting {i} ").repeat(20)));
+            }
+            c.push_user(UserMsg::new(latest_request));
+            for call in ["call_1", "call_2"] {
+                c.push_tool(ToolTurn {
+                    assistant: AssistantMsg::text(format!("inspect via {call}")),
+                    calls: vec![(
+                        ToolCall {
+                            call_id: call.into(),
+                            name: "inspect".into(),
+                            args: "{}".into(),
+                        },
+                        ToolResult {
+                            call_id: call.into(),
+                            ok: true,
+                            content: format!("{call} output"),
+                        },
+                    )],
+                });
+            }
+            lcm.compact(c, 100).await
+        };
+        // The compacted scaffold carries the preserved-objective anchor.
+        let scaffold_text = match &compacted.turns[0] {
+            Turn::Assistant(a) => a.text.clone(),
+            other => panic!("expected scaffold, got {other:?}"),
+        };
+        assert!(
+            scaffold_text.contains("Current user objective preserved"),
+            "anchor emitted: {scaffold_text}"
+        );
+        let count1 = {
+            let probe = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("probe"),
+                aux_with("s"),
+            )
+            .unwrap();
+            probe.store().message_count("s1").unwrap()
+        };
+        // Incarnation 2: replay the compacted snapshot plus one new user message.
+        let mut replay = compacted;
+        replay.push_user(UserMsg::new("follow-up after restart"));
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len() as i64, count1 + 1, "only the follow-up is new");
+        assert_eq!(
+            rows.last().unwrap().content.as_deref(),
+            Some("follow-up after restart")
+        );
+        let objective_repeats = rows
+            .iter()
+            .filter(|r| r.content.as_deref() == Some(latest_request))
+            .count();
+        assert_eq!(
+            objective_repeats, 1,
+            "the anchored objective is not re-ingested"
+        );
+        assert!(
+            rows.iter().all(|r| !r
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("Current user objective preserved")),
+            "the scaffold anchor never lands in the store"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_lcm_status_reports_ingest_reconciliation_diagnostics (tests/test_lcm_engine.py:2542)
+    #[tokio::test]
+    async fn parity_gap_status_reports_ingest_reconciliation_diagnostics() {
+        let dir = reconcile_dir("status-reconcile");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable message {i}")));
+            }
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut delta = Conversation::new(SystemPrompt::new("You are concise."));
+        delta.push_user(UserMsg::new("status delta"));
+        lcm2.before_turn(&mut delta, None);
+        let payload: Value =
+            serde_json::from_str(&lcm2.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(
+            payload["ingest_reconciliation"]["reason"], "persisted ambiguous delta",
+            "status: {payload}"
+        );
+        assert_eq!(
+            payload["ingest_reconciliation"]["action"],
+            "persisted batch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn durable_engine(tag: &str, fresh_tail: usize) -> (LcmContextEngine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("lcm-op-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
