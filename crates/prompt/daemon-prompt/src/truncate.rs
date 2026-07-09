@@ -34,6 +34,20 @@ pub fn truncate_content(content: &str, label: &str, max_chars: usize) -> String 
     )
 }
 
+/// Format `n` with thousands separators (Python `{:,}`) — used by the user-profile block header
+/// and store messages, which are byte-compatible with the hermes originals.
+pub(crate) fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +102,15 @@ mod tests {
         let over = "é".repeat(CONTEXT_FILE_MAX_CHARS + 1);
         let result = truncate_content(&over, "TEST.md", CONTEXT_FILE_MAX_CHARS);
         assert!(result.contains("truncated TEST.md"));
+    }
+
+    #[test]
+    fn group_thousands_matches_python_comma_format() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(1_375), "1,375");
+        assert_eq!(group_thousands(20_000), "20,000");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
     }
 }

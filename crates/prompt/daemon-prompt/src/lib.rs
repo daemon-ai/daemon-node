@@ -19,6 +19,12 @@
 //! - [`guidance`] — gated `Option<String>` block builders: core task-completion guidance,
 //!   tool-use enforcement, model-family operational guidance, environment hints, transport
 //!   hints, and the date-only stamp.
+//! - [`persona`] — [`PersonaStore`] (per-profile `SOUL.md`: seed / load→scan→cap /
+//!   validate→scan→cap→atomic-write→revision-log on set) plus the built-in role persona
+//!   library for the node's internal engine roles.
+//! - [`user_profile`] — [`UserProfileStore`] (per-profile `USER.md`: §-delimited entries,
+//!   dedup, scan-on-write, external-drift guard, load-time snapshot sanitization), the
+//!   `user_profile` tool schema/rubric, and the pure [`NudgeCounter`].
 //!
 //! Cache discipline: every producer here is deterministic from its inputs (no clocks, no env
 //! vars, no ambient config), so a caller that snapshots the outputs once per session gets a
@@ -27,8 +33,11 @@
 #![forbid(unsafe_code)]
 
 pub mod guidance;
+pub mod persona;
+mod revlog;
 pub mod scan;
 pub mod truncate;
+pub mod user_profile;
 
 pub use guidance::{
     core_agentic_guidance, date_stamp, environment_hints, model_family_guidance, tool_use_guidance,
@@ -36,10 +45,16 @@ pub use guidance::{
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE, TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS,
 };
+pub use persona::{role_persona, PersonaStore, RolePersona, DEFAULT_PERSONA_CAP, DEFAULT_SOUL_MD};
+pub use revlog::{Author, RevisionEntry};
 pub use scan::{
     first_threat_message, scan_context_content, scan_for_threats, Scope, INVISIBLE_CHARS,
 };
 pub use truncate::{truncate_content, CONTEXT_FILE_MAX_CHARS};
+pub use user_profile::{
+    user_profile_schema, NudgeCounter, UserProfileStore, WriteOutcome, DEFAULT_USER_CAP,
+    ENTRY_DELIMITER, USER_PROFILE_RUBRIC,
+};
 
 /// Errors from the persona / user-profile stores and the revision log.
 #[derive(Debug, thiserror::Error)]
