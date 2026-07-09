@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
+// Integration test: raw fs (temp dirs) is expected in tests.
+#![allow(clippy::disallowed_methods)]
 
 //! W2-H: the Rooms adapter's loopback [`SupportsFileTransfer`] over the node content store.
 //!

@@ -266,7 +266,7 @@ impl FileTransferManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FileTransferDirection, FileTransferState};
+    use crate::FileTransferState;
     use daemon_common::{BlobRef, ContentHash};
 
     fn contact(id: &str) -> ContactInfo {
