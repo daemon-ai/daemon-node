@@ -1742,6 +1742,248 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Persist `turns` into a fresh incarnation of `session` under `cfg`, then drop it (closing the
+    /// store). No compaction runs (`before_turn` only ingests). Returns nothing; the durable rows
+    /// remain for the next incarnation.
+    async fn persist_durable_turns(
+        cfg: &LcmConfig,
+        session: &str,
+        build: impl FnOnce(&mut Conversation),
+    ) {
+        let lcm = LcmContextEngine::open_for_session(
+            cfg.clone(),
+            &SessionId::new(session),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        let mut c = Conversation::new(SystemPrompt::new("You are concise."));
+        build(&mut c);
+        lcm.before_turn(&mut c, None);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_delta_message_matching_store_tail (tests/test_lcm_engine.py:1688)
+    #[tokio::test]
+    async fn parity_gap_restart_delta_matching_store_tail_is_preserved() {
+        let dir = reconcile_dir("delta-matching-tail");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("initial question"));
+            c.push_assistant(AssistantMsg::text("initial answer"));
+            c.push_user(UserMsg::new("retry"));
+        })
+        .await;
+        // Restart: the gateway hands only the newly-arrived delta, which happens to repeat the
+        // durable tail ("retry"). It must be preserved as a genuinely-new row, not treated as replay.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut delta = Conversation::new(SystemPrompt::new("You are concise."));
+        delta.push_user(UserMsg::new("retry"));
+        lcm2.before_turn(&mut delta, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(
+            contents,
+            vec!["initial question", "initial answer", "retry", "retry"],
+            "an ambiguous delta repeating the tail must append, not wipe the durable transcript"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_single_delta_message_matching_store_tail_with_followup (tests/test_lcm_engine.py:1762)
+    #[tokio::test]
+    async fn parity_gap_restart_single_delta_matching_tail_with_followup_is_preserved() {
+        let dir = reconcile_dir("single-delta-followup");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("retry"));
+        })
+        .await;
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut delta = Conversation::new(SystemPrompt::new("You are concise."));
+        delta.push_user(UserMsg::new("retry"));
+        delta.push_assistant(AssistantMsg::text("next answer"));
+        lcm2.before_turn(&mut delta, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        let contents: Vec<&str> = rows.iter().filter_map(|r| r.content.as_deref()).collect();
+        assert_eq!(contents, vec!["retry", "retry", "next answer"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_does_not_skip_repeated_non_tail_messages (tests/test_lcm_engine.py:1553)
+    #[tokio::test]
+    async fn parity_gap_restart_does_not_skip_repeated_non_tail_messages() {
+        let dir = reconcile_dir("repeated-non-tail");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("repeatable request"));
+            c.push_assistant(AssistantMsg::text("repeatable answer"));
+            for i in 0..120 {
+                c.push_user(UserMsg::new(format!("tail message before restart {i}")));
+            }
+        })
+        .await;
+        let durable = 122;
+        // Restart with a short stale replay that repeats an EARLY (non-tail) pair.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_user(UserMsg::new("repeatable request"));
+        replay.push_assistant(AssistantMsg::text("repeatable answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len() as i64,
+            durable + 2,
+            "repeated non-tail pair appended without wiping the durable transcript"
+        );
+        assert_eq!(
+            rows[rows.len() - 2].content.as_deref(),
+            Some("repeatable request")
+        );
+        assert_eq!(
+            rows[rows.len() - 1].content.as_deref(),
+            Some("repeatable answer")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_skips_stale_short_no_overlap_snapshot (tests/test_lcm_engine.py:2133)
+    #[tokio::test]
+    async fn parity_gap_restart_skips_stale_short_no_overlap_snapshot() {
+        let dir = reconcile_dir("stale-short-no-overlap");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new("old startup question"));
+            c.push_assistant(AssistantMsg::text("old startup answer"));
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable tail message {i}")));
+            }
+        })
+        .await;
+        let durable = 82;
+        // A restarted gateway hands a stale, short snapshot from the START of the session with no
+        // overlap with the durable tail. Appending it would duplicate; it must be skipped.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut stale = Conversation::new(SystemPrompt::new("You are concise."));
+        stale.push_user(UserMsg::new("old startup question"));
+        stale.push_assistant(AssistantMsg::text("old startup answer"));
+        lcm2.before_turn(&mut stale, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len() as i64,
+            durable,
+            "a stale short no-overlap snapshot is skipped, not appended or wiped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_persists_one_message_no_overlap_delta (tests/test_lcm_engine.py:2240)
+    #[tokio::test]
+    async fn parity_gap_restart_persists_one_message_no_overlap_delta() {
+        let dir = reconcile_dir("one-message-no-overlap");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable message {i}")));
+            }
+        })
+        .await;
+        let durable = 80;
+        // A single, genuinely-new standalone delta with no overlap must be appended (ambiguous
+        // singletons are preserved, not skipped).
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut delta = Conversation::new(SystemPrompt::new("You are concise."));
+        delta.push_user(UserMsg::new("legitimate standalone delta"));
+        lcm2.before_turn(&mut delta, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len() as i64, durable + 1);
+        assert_eq!(
+            rows.last().unwrap().content.as_deref(),
+            Some("legitimate standalone delta")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_existing_session_restart_scaffold_prefix_does_not_skip_unrelated_new_rows (tests/test_lcm_engine.py:2282)
+    #[tokio::test]
+    async fn parity_gap_restart_scaffold_prefix_does_not_skip_unrelated_new_rows() {
+        let dir = reconcile_dir("scaffold-prefix-unrelated");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&cfg, "s1", |c| {
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable message {i}")));
+            }
+        })
+        .await;
+        let durable = 80;
+        // Replay begins with a scaffold summary turn, then unrelated NEW rows. The scaffold prefix
+        // is skipped, but the new rows must be appended to the durable transcript.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new(
+            "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+        ));
+        replay.push_assistant(AssistantMsg::text(
+            "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+        ));
+        replay.push_user(UserMsg::new("unrelated new request"));
+        replay.push_assistant(AssistantMsg::text("unrelated new answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(rows.len() as i64, durable + 2);
+        assert_eq!(
+            rows[rows.len() - 2].content.as_deref(),
+            Some("unrelated new request")
+        );
+        assert_eq!(
+            rows[rows.len() - 1].content.as_deref(),
+            Some("unrelated new answer")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn ingest_redacts_sensitive_content_when_enabled() {
         let cfg = LcmConfig {
