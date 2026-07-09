@@ -45,7 +45,17 @@ impl CreateConversationDetails {
     /// (`purple_create_conversation_details_is_valid`): at least one participant is required, and —
     /// unless `max_participants == 0` (unlimited) — the participant count must not exceed it.
     pub fn is_valid(&self) -> Result<(), CreateConversationDetailsError> {
-        // STUB
+        let n_participants = self.participants.len();
+
+        if n_participants == 0 {
+            return Err(CreateConversationDetailsError::NoParticipants);
+        }
+
+        // max_participants == 0 means unlimited, so there is nothing to validate.
+        if self.max_participants > 0 && n_participants > self.max_participants as usize {
+            return Err(CreateConversationDetailsError::TooManyParticipants);
+        }
+
         Ok(())
     }
 }
@@ -60,8 +70,11 @@ impl ChannelJoinDetails {
     /// `nickname_supported`, `nickname`, `password_supported`, and `password`. The `*_max_length`
     /// fields are intentionally left untouched.
     pub fn merge(&mut self, source: &ChannelJoinDetails) {
-        // STUB
-        let _ = source;
+        self.name = source.name.clone();
+        self.nickname_supported = source.nickname_supported;
+        self.nickname = source.nickname.clone();
+        self.password_supported = source.password_supported;
+        self.password = source.password.clone();
     }
 }
 
@@ -72,33 +85,34 @@ impl ChannelJoinDetails {
 impl ConversationType {
     /// Whether this is a 1:1 direct message (`purple_conversation_is_dm`).
     pub fn is_dm(self) -> bool {
-        // STUB
-        false
+        self == ConversationType::Dm
     }
 
     /// Whether this is a group direct message (`purple_conversation_is_group_dm`).
     pub fn is_group_dm(self) -> bool {
-        // STUB
-        false
+        self == ConversationType::GroupDm
     }
 
     /// Whether this is a multi-user channel (`purple_conversation_is_channel`).
     pub fn is_channel(self) -> bool {
-        // STUB
-        false
+        self == ConversationType::Channel
     }
 
     /// Whether this is a thread (`purple_conversation_is_thread`).
     pub fn is_thread(self) -> bool {
-        // STUB
-        false
+        self == ConversationType::Thread
     }
 
     /// The `"type"` tag value libpurple derives in `purple_conversation_set_conversation_type`:
     /// `Dm→"dm"`, `GroupDm→"group-dm"`, `Channel→"channel"`, `Thread→"thread"`, `Unset→None`.
     pub fn tag_value(self) -> Option<&'static str> {
-        // STUB
-        None
+        match self {
+            ConversationType::Unset => None,
+            ConversationType::Dm => Some("dm"),
+            ConversationType::GroupDm => Some("group-dm"),
+            ConversationType::Channel => Some("channel"),
+            ConversationType::Thread => Some("thread"),
+        }
     }
 }
 
@@ -106,8 +120,12 @@ impl ConversationType {
 /// the first non-empty of `alias`, then `title`, then `id` (`id` is the final fallback even if
 /// empty).
 pub fn title_for_display(alias: Option<&str>, title: Option<&str>, id: &str) -> String {
-    // STUB
-    let _ = (alias, title);
+    if let Some(alias) = alias.filter(|s| !s.is_empty()) {
+        return alias.to_string();
+    }
+    if let Some(title) = title.filter(|s| !s.is_empty()) {
+        return title.to_string();
+    }
     id.to_string()
 }
 
@@ -145,9 +163,33 @@ impl ConversationInfo {
     /// when at least one name was found (else the title is left unchanged → `None`); returns `None`
     /// for non-DM/group-DM conversations.
     pub fn generate_title(&self, self_id: &str) -> Option<String> {
-        // STUB
-        let _ = self_id;
-        None
+        if self.kind != ConversationType::Dm && self.kind != ConversationType::GroupDm {
+            return None;
+        }
+
+        let mut names: Vec<&str> = Vec::new();
+        for member in &self.members {
+            let contact = &member.contact;
+            // Skip the account's own member.
+            if contact.id == self_id {
+                continue;
+            }
+            // Display name = display_name (non-empty), else id (non-empty); empty is skipped.
+            let name = contact
+                .display_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(Some(contact.id.as_str()).filter(|s| !s.is_empty()));
+            if let Some(name) = name {
+                names.push(name);
+            }
+        }
+
+        if names.is_empty() {
+            None
+        } else {
+            Some(names.join(", "))
+        }
     }
 }
 
@@ -182,23 +224,33 @@ impl AccountSettingStringList {
     /// Add an option, deduplicating by id (`purple_account_setting_string_list_add_item`). Returns
     /// `false` (and does nothing) if an option with `id` already exists.
     pub fn add_item(&mut self, id: &str, label: &str) -> bool {
-        // STUB
-        let _ = (id, label);
-        false
+        if self.items.iter().any(|item| item.id == id) {
+            return false;
+        }
+        self.items.push(LocalizedString {
+            id: id.to_string(),
+            label: label.to_string(),
+        });
+        true
     }
 
     /// The active option id, if any (`purple_account_setting_string_list_get_active_item`).
     pub fn active_item(&self) -> Option<&str> {
-        // STUB
-        None
+        self.active.as_deref()
     }
 
     /// Set (or, with `None`, clear) the active option
     /// (`purple_account_setting_string_list_set_active_item`). A non-`None` id is only accepted when
     /// it names an existing option (the libpurple production path; the g_test bypass is not ported).
     pub fn set_active_item(&mut self, id: Option<&str>) {
-        // STUB
-        let _ = id;
+        match id {
+            None => self.active = None,
+            Some(id) => {
+                if self.items.iter().any(|item| item.id == id) {
+                    self.active = Some(id.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -331,107 +383,163 @@ impl AccountSettings {
 
     /// Find a setting by id.
     pub fn find(&self, id: &str) -> Option<&AccountSetting> {
-        // STUB
-        let _ = id;
-        None
+        self.settings.iter().find(|s| s.id == id)
+    }
+
+    /// Find a mutable setting by id.
+    fn find_mut(&mut self, id: &str) -> Option<&mut AccountSetting> {
+        self.settings.iter_mut().find(|s| s.id == id)
     }
 
     /// Add a setting (`purple_account_settings_add_setting`). Returns `false` (and does nothing) if
     /// a setting with the same id already exists — libpurple treats a double-add as a programming
     /// error; here it is a rejected no-op.
     pub fn add_setting(&mut self, setting: AccountSetting) -> bool {
-        // STUB
-        let _ = setting;
-        false
+        if self.find(&setting.id).is_some() {
+            return false;
+        }
+        self.settings.push(setting);
+        true
     }
 
     /// Remove a setting by id (`purple_account_settings_remove_setting`). Returns whether one was
     /// removed.
     pub fn remove_setting(&mut self, id: &str) -> bool {
-        // STUB
-        let _ = id;
-        false
+        let before = self.settings.len();
+        self.settings.retain(|s| s.id != id);
+        self.settings.len() != before
     }
 
     /// Remove every setting (`purple_account_settings_remove_all_settings`).
     pub fn remove_all_settings(&mut self) {
-        // STUB
+        self.settings.clear();
     }
 
     /// Get a boolean, or `fallback` if absent/wrong-type (`purple_account_settings_get_boolean`).
     pub fn get_boolean(&self, id: &str, fallback: bool) -> bool {
-        // STUB
-        let _ = id;
-        fallback
+        self.find(id)
+            .and_then(AccountSetting::as_bool)
+            .unwrap_or(fallback)
     }
 
     /// Get an integer, or `fallback` if absent/wrong-type (`purple_account_settings_get_int`).
     pub fn get_int(&self, id: &str, fallback: i64) -> i64 {
-        // STUB
-        let _ = id;
-        fallback
+        self.find(id)
+            .and_then(AccountSetting::as_int)
+            .unwrap_or(fallback)
     }
 
     /// Get a string, or `fallback` if absent/wrong-type/null (`purple_account_settings_get_string`).
     pub fn get_string(&self, id: &str, fallback: &str) -> String {
-        // STUB
-        let _ = id;
-        fallback.to_string()
+        self.find(id)
+            .and_then(AccountSetting::as_str)
+            .unwrap_or(fallback)
+            .to_string()
     }
 
     /// Get the active id of a string-list, or `fallback` if absent/wrong-type/unset
     /// (`purple_account_settings_get_string_list`).
     pub fn get_string_list(&self, id: &str, fallback: Option<&str>) -> Option<String> {
-        // STUB
-        let _ = id;
-        fallback.map(str::to_string)
+        let active = self
+            .find(id)
+            .and_then(AccountSetting::as_string_list)
+            .and_then(AccountSettingStringList::active_item);
+        active.or(fallback).map(str::to_string)
     }
 
     /// Set a boolean, if a boolean setting with `id` exists
     /// (`purple_account_settings_set_boolean`).
     pub fn set_boolean(&mut self, id: &str, value: bool) {
-        // STUB
-        let _ = (id, value);
+        if let Some(setting) = self.find_mut(id) {
+            if matches!(setting.value, AccountSettingValue::Boolean(_)) {
+                setting.value = AccountSettingValue::Boolean(value);
+            }
+        }
     }
 
     /// Set an integer, if an integer setting with `id` exists (`purple_account_settings_set_int`).
     pub fn set_int(&mut self, id: &str, value: i64) {
-        // STUB
-        let _ = (id, value);
+        if let Some(setting) = self.find_mut(id) {
+            if matches!(setting.value, AccountSettingValue::Int(_)) {
+                setting.value = AccountSettingValue::Int(value);
+            }
+        }
     }
 
     /// Set a string, if a string setting with `id` exists (`purple_account_settings_set_string`).
     pub fn set_string(&mut self, id: &str, value: &str) {
-        // STUB
-        let _ = (id, value);
+        if let Some(setting) = self.find_mut(id) {
+            if matches!(setting.value, AccountSettingValue::Str(_)) {
+                setting.value = AccountSettingValue::Str(Some(value.to_string()));
+            }
+        }
     }
 
     /// Set the active id of a string-list, if one with `id` exists
     /// (`purple_account_settings_set_string_list`).
     pub fn set_string_list(&mut self, id: &str, item: Option<&str>) {
-        // STUB
-        let _ = (id, item);
+        if let Some(list) = self
+            .find_mut(id)
+            .and_then(AccountSetting::as_string_list_mut)
+        {
+            list.set_active_item(item);
+        }
     }
 
     /// Apply `updates` (`purple_account_settings_update_settings`): copy same-type values onto
     /// existing settings, add settings that don't yet exist, and skip type-mismatched updates.
     pub fn update_settings(&mut self, updates: &AccountSettings) {
-        // STUB
-        let _ = updates;
+        for update in &updates.settings {
+            let Some(found) = self.find_mut(&update.id) else {
+                self.settings.push(update.clone());
+                continue;
+            };
+
+            // Only same-type updates are applied; mismatches are skipped.
+            match (&found.value, &update.value) {
+                (AccountSettingValue::Boolean(_), AccountSettingValue::Boolean(_))
+                | (AccountSettingValue::Int(_), AccountSettingValue::Int(_))
+                | (AccountSettingValue::Str(_), AccountSettingValue::Str(_))
+                | (AccountSettingValue::StringList(_), AccountSettingValue::StringList(_)) => {
+                    found.value = update.value.clone();
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Project onto the wire [`AccountSettingsValues`] (string-keyed): booleans render `"true"`/
     /// `"false"`, ints their decimal, strings their value (null strings are omitted), string-lists
     /// their active id (unset lists are omitted).
     pub fn to_values(&self) -> AccountSettingsValues {
-        // STUB
-        AccountSettingsValues::default()
+        let mut values = AccountSettingsValues::default();
+        for setting in &self.settings {
+            let rendered = match &setting.value {
+                AccountSettingValue::Boolean(b) => Some(b.to_string()),
+                AccountSettingValue::Int(i) => Some(i.to_string()),
+                AccountSettingValue::Str(s) => s.clone(),
+                AccountSettingValue::StringList(list) => list.active_item().map(str::to_string),
+            };
+            if let Some(rendered) = rendered {
+                values.values.insert(setting.id.clone(), rendered);
+            }
+        }
+        values
     }
 
     /// Derive an [`AccountSettingsSchema`] (one [`AuthParamField`] per setting, not required).
     pub fn to_schema(&self) -> AccountSettingsSchema {
-        // STUB
-        AccountSettingsSchema::default()
+        AccountSettingsSchema {
+            fields: self
+                .settings
+                .iter()
+                .map(|s| AuthParamField {
+                    key: s.id.clone(),
+                    label: s.label.clone(),
+                    required: false,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -444,46 +552,60 @@ impl PresencePrimitive {
     /// `Available/Idle/Invisible/Away/DoNotDisturb/Streaming` are online; `Offline` and
     /// `OutOfOffice` (the `default` arm) are not.
     pub fn is_online(self) -> bool {
-        // STUB
-        false
+        matches!(
+            self,
+            PresencePrimitive::Available
+                | PresencePrimitive::Idle
+                | PresencePrimitive::Invisible
+                | PresencePrimitive::Away
+                | PresencePrimitive::DoNotDisturb
+                | PresencePrimitive::Streaming
+        )
     }
 }
 
 impl Presence {
     /// Whether the peer is available (`purple_presence_is_available`).
     pub fn is_available(&self) -> bool {
-        // STUB
-        false
+        self.primitive == PresencePrimitive::Available
     }
 
     /// Whether the peer is online (`purple_presence_is_online`).
     pub fn is_online(&self) -> bool {
-        // STUB
-        false
+        self.primitive.is_online()
     }
 
     /// Whether the peer is idle (`purple_presence_is_idle`): online and with an idle timestamp.
     pub fn is_idle(&self) -> bool {
-        // STUB
-        false
+        self.is_online() && self.idle_since.is_some()
     }
 
     /// Sort order vs another presence (`purple_presence_compare`, non-null arms): a non-offline
     /// presence sorts before an offline one; otherwise compare idle timestamps (`None` before
     /// `Some`).
     pub fn compare(&self, other: &Presence) -> Ordering {
-        // STUB
-        let _ = other;
-        Ordering::Equal
+        let self_offline = self.primitive == PresencePrimitive::Offline;
+        let other_offline = other.primitive == PresencePrimitive::Offline;
+
+        match (self_offline, other_offline) {
+            (false, true) => Ordering::Less,
+            (true, false) => Ordering::Greater,
+            // Both online or both offline: compare idle timestamps. `birb_date_time_compare`
+            // sorts NULL before non-NULL and earlier before later — exactly `Option<u64>::cmp`.
+            _ => self.idle_since.cmp(&other.idle_since),
+        }
     }
 }
 
 /// Null-aware presence ordering (`purple_presence_compare`, full): `None` sorts after `Some`
 /// (an absent presence is "less online").
 pub fn presence_compare(a: Option<&Presence>, b: Option<&Presence>) -> Ordering {
-    // STUB
-    let _ = (a, b);
-    Ordering::Equal
+    match (a, b) {
+        (Some(a), Some(b)) => a.compare(b),
+        (None, None) => Ordering::Equal,
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -496,8 +618,12 @@ impl DisconnectReason {
     /// blind retry, so they are terminal; transport-level and server-initiated drops are transient.
     /// Mirrors the node's existing `reason_is_fatal` policy.
     pub fn is_fatal(self) -> bool {
-        // STUB
-        false
+        matches!(
+            self,
+            DisconnectReason::AuthenticationFailed
+                | DisconnectReason::InvalidSettings
+                | DisconnectReason::CertificateError
+        )
     }
 }
 
