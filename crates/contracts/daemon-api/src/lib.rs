@@ -1055,6 +1055,14 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("roster_remove".into()))
     }
 
+    /// The node's live notification list (wire vNEXT), newest first — the node-authoritative
+    /// [`NotificationInfo`] collection a client renders and re-lists on a
+    /// [`NodeEvent::NotificationsChanged`] pointer (ported from libpurple's `PurpleNotificationManager`).
+    /// Default: empty (a node assembled without a notification manager).
+    async fn notification_list(&self) -> Vec<NotificationInfo> {
+        Vec::new()
+    }
+
     // -- Foreign-agent discovery + registry (catalog-style; the daemon probes its own PATH) --
 
     /// Trigger a server-side foreign-agent discovery scan (PATH + well-known locations + the
@@ -4322,6 +4330,11 @@ pub enum NodeEvent {
         /// The scope to refetch.
         scope: String,
     },
+    /// The node's notification set changed (wire vNEXT): a notification was added, removed, read, or
+    /// deleted. A payload-free node-wide invalidation pointer (clients re-list via `NotificationList`),
+    /// mirroring [`NodeEvent::CatalogChanged`] — the whole list is cheap to refetch, so it carries
+    /// no per-notification detail.
+    NotificationsChanged,
 }
 
 /// A page of the node-wide event feed (`EventsSince` -> `EventsPage`): a batch of [`NodeEvent`]s past
@@ -5352,3 +5365,6 @@ pub use message::*;
 
 mod tags;
 pub use tags::*;
+
+mod notify;
+pub use notify::*;

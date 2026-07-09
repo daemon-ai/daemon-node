@@ -216,6 +216,8 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::PresenceSave { presence } => unit_or_err(api.presence_save(presence).await),
         ApiRequest::PresenceDelete { id } => unit_or_err(api.presence_delete(id).await),
         ApiRequest::PresenceSetActive { id } => unit_or_err(api.presence_set_active(id).await),
+        // -- notifications (W2-G; wire vNEXT) ---------------------------------------------------
+        ApiRequest::NotificationList => ApiResponse::Notifications(api.notification_list().await),
         _ => return None,
     })
 }

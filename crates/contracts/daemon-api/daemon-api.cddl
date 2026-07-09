@@ -588,6 +588,7 @@ node-event = node-event-session-advanced
            / node-event-membership-changed
            / node-event-contacts-changed
            / node-event-resync-needed
+           / node-event-notifications-changed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64 } }
 node-event-roster-changed       = { "RosterChanged":      { "rev": uint64 } }
@@ -607,6 +608,8 @@ node-event-conversations-changed = { "ConversationsChanged": { "transport": tran
 node-event-membership-changed   = { "MembershipChanged":  { "transport": transport-id, "conv": tstr, "member": tstr, "change": membership-change, ? "actor": (tstr / null), ? "reason": (tstr / null), "is_self": bool } }
 node-event-contacts-changed     = { "ContactsChanged":    { "transport": transport-id } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
+; wire vNEXT: the notification set changed (add/remove/read/delete) -> re-list NotificationList.
+node-event-notifications-changed = "NotificationsChanged"
 events-page = {
   "events": [0*64 node-event],
   "next_cursor": uint64,                ; pass as the next EventsSince cursor
@@ -1190,6 +1193,32 @@ conversation-info = {
   ? "title": (tstr / null), ? "topic": (tstr / null), ? "description": (tstr / null),
   ? "members": [* conversation-member],
 }
+; ----- notifications (wire vNEXT; port-notify) -----
+authorization-request = { "contact": contact-info, ? "message": (tstr / null), ? "add": bool, ? "handled": bool }
+add-contact-request = { "contact": contact-info, ? "message": (tstr / null), ? "handled": bool }
+notification-kind = notification-kind-generic
+                  / notification-kind-add-contact
+                  / notification-kind-authorization
+                  / notification-kind-link
+                  / notification-kind-connection-error
+notification-kind-generic = "Generic"
+notification-kind-add-contact = { "AddContact": add-contact-request }
+notification-kind-authorization = { "Authorization": authorization-request }
+notification-kind-link = { "Link": { ? "link_text": (tstr / null), "link_uri": tstr } }
+notification-kind-connection-error = "ConnectionError"
+notification-info = {
+  "id": tstr,
+  ? "account": (transport-id / null),
+  ? "created_ms": uint64,
+  ? "read": bool,
+  ? "title": (tstr / null),
+  ? "subtitle": (tstr / null),
+  ? "icon_name": (tstr / null),
+  ? "interactive": bool,
+  ? "persistent": bool,
+  "kind": notification-kind,
+  ? "deleted": bool,
+}
 create-conversation-details = {
   ? "max_participants": uint, ? "participants": [* contact-info],
   ? "extras_schema": account-settings-schema, ? "extras": account-settings-values,
@@ -1420,6 +1449,8 @@ feedback-diagnostics = { ? "app_version": (tstr / null), ? "os": (tstr / null) }
 request-feedback-submit = { "FeedbackSubmit": { "kind": feedback-kind, ? "target": (feedback-target / null), ? "rating": (feedback-rating / null), ? "comment": (tstr / null), "include_content": bool, ? "diagnostics": (feedback-diagnostics / null), "surface": tstr } }
 request-telemetry-consent-get = "TelemetryConsentGet"
 request-telemetry-consent-set = { "TelemetryConsentSet": { "enabled": bool } }
+; wire vNEXT: the node's live notification list (read-only; re-listed on NotificationsChanged).
+request-notification-list = "NotificationList"
 
 ; ----- saved presences (W2-F; wire vNEXT) -----
 request-presence-list = "PresenceList"
@@ -1615,6 +1646,7 @@ api-request = request-submit
             / request-presence-save
             / request-presence-delete
             / request-presence-set-active
+            / request-notification-list
 
 response-ok = "Ok"
 response-routed = { "Routed": { "session": session-id } }
@@ -1733,6 +1765,9 @@ response-feedback-ack = { "FeedbackAck": feedback-ack }
 response-telemetry-consent = { "TelemetryConsent": { "enabled": bool } }
 ; ----- saved presences (W2-F; wire vNEXT) -----
 response-saved-presences = { "SavedPresences": [* saved-presence] }
+
+; wire vNEXT: the node's live notification list, newest first.
+response-notifications = { "Notifications": [* notification-info] }
 api-response = response-ok
              / response-routed
              / response-session-created
@@ -1828,6 +1863,7 @@ api-response = response-ok
              / response-feedback-ack
              / response-telemetry-consent
              / response-saved-presences
+             / response-notifications
 
 ; ----- multiplexed / server-streaming socket envelope (wire L0; daemon-sync-protocol-spec.md §2) ---
 ; Wraps api-request/api-response so one connection carries many correlated exchanges, with

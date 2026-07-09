@@ -1123,6 +1123,12 @@ pub enum ApiRequest {
         /// The saved-presence id to activate.
         id: String,
     },
+
+    // -- notifications (W2-G; wire vNEXT) --------------------------------------------------------
+    /// [`ControlApi::notification_list`] — the node's live notification list (wire vNEXT). A
+    /// read-only snapshot (newest first); the client re-lists on a
+    /// [`NodeEvent::NotificationsChanged`] pointer. Answered by [`ApiResponse::Notifications`].
+    NotificationList,
 }
 
 /// The serializable reflection of an interface result.
@@ -1340,6 +1346,8 @@ pub enum ApiResponse {
     // -- saved presences (W2-F; wire vNEXT) ------------------------------------------------------
     /// The saved-presence listing (the reply to `PresenceList`), in the manager's insertion order.
     SavedPresences(Vec<SavedPresence>),
+    /// The node's live notification list (`notification_list`; wire vNEXT), newest first.
+    Notifications(Vec<NotificationInfo>),
 }
 
 // ---------------------------------------------------------------------------

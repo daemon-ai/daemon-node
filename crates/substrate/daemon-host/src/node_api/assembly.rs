@@ -94,6 +94,9 @@ impl NodeApiImpl {
             gateway: Arc::new(std::sync::Mutex::new(None)),
             profile_ops: None,
             persona_ops: None,
+            notifications: Arc::new(std::sync::Mutex::new(
+                crate::notifications::NotificationManager::new(),
+            )),
         }
     }
 

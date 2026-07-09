@@ -55,6 +55,7 @@ pub mod foreign;
 pub mod journal;
 pub mod managed;
 pub mod node_api;
+pub mod notifications;
 pub mod persona_ops;
 pub mod presence;
 pub mod process_agent;
@@ -132,6 +133,7 @@ pub use node_api::{
     NodeApiParts, NodeEventFeed, ProvisionedAccount, RoutingBuilder, SessionBackend,
     SessionEngineBuilder,
 };
+pub use notifications::{AddOutcome, NotificationManager, ReadChange};
 pub use persona_ops::PersonaOps;
 pub use presence::PresenceManager;
 pub use process_agent::ProcessAgentUnit;

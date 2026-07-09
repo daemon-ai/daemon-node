@@ -529,6 +529,11 @@ pub struct NodeApiImpl {
     /// [`ApiError::Unsupported`]). The real `PersonaStore` adapter is bound at node assembly via
     /// [`with_persona_ops`](Self::with_persona_ops).
     persona_ops: Option<Arc<dyn crate::persona_ops::PersonaOps>>,
+    /// The node's live notification manager (wire vNEXT), ported from libpurple's
+    /// `PurpleNotificationManager`. Backs [`ControlApi::notification_list`](daemon_api::ControlApi::notification_list);
+    /// mutations emit [`NodeEvent::NotificationsChanged`](daemon_api::NodeEvent) via
+    /// [`emit_notifications_changed`](Self::emit_notifications_changed) so clients re-list.
+    notifications: Arc<std::sync::Mutex<crate::notifications::NotificationManager>>,
 }
 
 impl NodeApiImpl {

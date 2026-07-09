@@ -437,6 +437,9 @@ fn classify(req: &ApiRequest) -> Coverage {
         FeedbackSubmit { .. } | TelemetryConsentGet | TelemetryConsentSet { .. } => {
             NotSessionTouching
         }
+        // The notification list is node-wide (not per-owner session state): the coarse ControlRead
+        // capability gate governs it (wire vNEXT).
+        NotificationList => NotSessionTouching,
         // The node-owned gateway is a node-wide resident service (not per-owner session state): the
         // coarse capability gate governs (GatewayGet -> ControlRead, GatewaySet -> ControlWrite).
         GatewayGet | GatewaySet { .. } => NotSessionTouching,

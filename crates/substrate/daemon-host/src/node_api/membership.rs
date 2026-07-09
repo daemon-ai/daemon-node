@@ -67,6 +67,56 @@ impl NodeApiImpl {
         }
     }
 
+    /// Emit a payload-free `NotificationsChanged` pointer (wire vNEXT) after a notification-manager
+    /// mutation so clients re-list via `NotificationList`. Mirrors `emit_contacts_changed` /
+    /// `CatalogChanged`: the whole list is cheap to refetch, so the event carries no detail.
+    pub(crate) fn emit_notifications_changed(&self) {
+        if let Some(feed) = self.node_feed() {
+            feed.emit(NodeEvent::NotificationsChanged);
+        }
+    }
+
+    /// A snapshot of the node's live notifications (newest first) — the [`ControlApi::notification_list`]
+    /// backing (ported from libpurple's `PurpleNotificationManager`).
+    pub(crate) fn notifications_snapshot(&self) -> Vec<daemon_api::NotificationInfo> {
+        self.notifications
+            .lock()
+            .expect("notification manager mutex")
+            .list()
+    }
+
+    /// Add a notification to the node manager and emit the `NotificationsChanged` pointer on a real
+    /// add (a rejected double-add emits nothing). The producer seam adapters/tools use to raise a
+    /// notification onto the node's list.
+    pub fn notify_add(
+        &self,
+        notification: daemon_api::NotificationInfo,
+    ) -> crate::notifications::AddOutcome {
+        let outcome = self
+            .notifications
+            .lock()
+            .expect("notification manager mutex")
+            .add(notification);
+        if outcome == crate::notifications::AddOutcome::Added {
+            self.emit_notifications_changed();
+        }
+        outcome
+    }
+
+    /// Remove a notification from the node manager by id, emitting the `NotificationsChanged`
+    /// pointer when one was removed.
+    pub fn notify_remove(&self, id: &str) -> bool {
+        let removed = self
+            .notifications
+            .lock()
+            .expect("notification manager mutex")
+            .remove(id);
+        if removed {
+            self.emit_notifications_changed();
+        }
+        removed
+    }
+
     /// Reconcile the node's own routing on a self-removal (item 3): drop the now-dangling
     /// `ChatRoute` pin for the conversation's origin (matches libpurple teardown — a re-join re-pins
     /// on next inbound), then reload the live routing table. Called BEFORE the invalidation event is
