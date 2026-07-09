@@ -19,7 +19,10 @@ use std::cmp::Ordering;
 /// Port of `birb_str_matches(pattern, str)`: TRUE when `pattern` occurs in sequential order within
 /// `haystack`, caseless, ignoring characters in between (a caseless *subsequence* match — e.g.
 /// `Br` matches `biRb`). Casefolding is Unicode lowercase (approximates `g_utf8_casefold`).
-fn str_matches(pattern: &str, haystack: &str) -> bool {
+///
+/// `pub(crate)` so the sibling saved-presence port ([`crate::saved_presence`]) reuses the exact
+/// birb matcher rather than duplicating it (W2-F).
+pub(crate) fn str_matches(pattern: &str, haystack: &str) -> bool {
     let mut pat = pattern.chars().flat_map(char::to_lowercase).peekable();
     // An empty pattern is a subsequence of anything.
     if pat.peek().is_none() {
