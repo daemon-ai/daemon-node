@@ -4507,6 +4507,271 @@ mod tests {
         (lcm, dir)
     }
 
+    /// Seed one direct store row for `session` at `timestamp` (the Python
+    /// `engine._store.append(...)` + timestamp-UPDATE fixture).
+    fn seed_row(lcm: &LcmContextEngine, session: &str, content: &str, tokens: i64, ts: f64) {
+        lcm.store()
+            .append_batch(
+                session,
+                &[crate::store::NewMessage {
+                    role: "user".into(),
+                    content: Some(content.into()),
+                    token_estimate: tokens,
+                    ..Default::default()
+                }],
+                ts,
+            )
+            .unwrap();
+    }
+
+    fn now_secs() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    // parity: command.py::test_lcm_doctor_retention_reports_old_heavy_sessions (tests/test_lcm_command.py:744)
+    #[tokio::test]
+    async fn parity_gap_doctor_retention_scopes_analysis_to_the_active_session() {
+        let lcm = LcmContextEngine::open_for_session(
+            LcmConfig::in_memory(),
+            &SessionId::new("s1"),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "s1", "fresh chat", 8, now_secs());
+        seed_row(&lcm, "old-heavy", "archived chunk", 240, 1.0);
+        seed_node(&lcm, "old-heavy", 0, "old heavy summary", 10.0);
+        let text = run_lcm(&lcm, "doctor retention").await;
+        assert!(text.contains("LCM doctor retention"), "{text}");
+        assert!(text.contains("status: analysis-ready"), "{text}");
+        assert!(text.contains("sessions_analyzed: 1"), "{text}");
+        assert!(text.contains("stale_sessions_30d: 0"), "{text}");
+        assert!(text.contains("stale_sessions_90d: 0"), "{text}");
+        assert!(text.contains("retained_tokens_30d: 0"), "{text}");
+        assert!(text.contains("retained_tokens_90d: 0"), "{text}");
+        assert!(text.contains("retention_candidates:"), "{text}");
+        assert!(text.contains("s1 | protected=yes"), "{text}");
+        assert!(
+            !text.contains("old-heavy"),
+            "scoped to the active session: {text}"
+        );
+        assert!(
+            text.contains("note: retention analysis is scoped to the active session only"),
+            "{text}"
+        );
+        assert!(
+            text.contains("note: read-only analysis only — no rows were deleted"),
+            "{text}"
+        );
+    }
+
+    // parity: command.py::test_lcm_doctor_retention_counts_summary_only_sessions (tests/test_lcm_command.py:786)
+    #[tokio::test]
+    async fn parity_gap_doctor_retention_reports_nothing_without_active_session_rows() {
+        let lcm = LcmContextEngine::open_for_session(
+            LcmConfig::in_memory(),
+            &SessionId::new("s1"),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        seed_node(&lcm, "summary-only", 0, "summary only node", 10.0);
+        let text = run_lcm(&lcm, "doctor retention").await;
+        assert!(text.contains("sessions_analyzed: 0"), "{text}");
+        assert!(text.contains("stale_sessions_30d: 0"), "{text}");
+        assert!(text.contains("retained_tokens_30d: 0"), "{text}");
+        assert!(!text.contains("summary-only"), "{text}");
+        assert!(
+            text.contains("result: no stored sessions found for retention analysis"),
+            "{text}"
+        );
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_reports_pattern_matched_junk_candidates (tests/test_lcm_command.py:840)
+    #[tokio::test]
+    async fn parity_gap_doctor_clean_reports_pattern_matched_junk_candidates() {
+        let cfg = LcmConfig {
+            ignore_session_patterns: vec!["cron*".to_string()],
+            ..LcmConfig::in_memory()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "cron_20260414", "scheduled report", 12, 1.0);
+        seed_row(&lcm, "normal_session", "real conversation", 20, 1.0);
+        let text = run_lcm(&lcm, "doctor clean").await;
+        assert!(text.contains("LCM doctor clean"), "{text}");
+        assert!(text.contains("status: candidates-found"), "{text}");
+        assert!(text.contains("ignored_pattern_matches: 1"), "{text}");
+        assert!(text.contains("cron_20260414"), "{text}");
+        assert!(!text.contains("normal_session"), "{text}");
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_prefers_ignore_over_stateless_when_both_match (tests/test_lcm_command.py:859)
+    #[tokio::test]
+    async fn parity_gap_doctor_clean_prefers_ignored_class_over_stateless() {
+        let cfg = LcmConfig {
+            ignore_session_patterns: vec!["cron*".to_string()],
+            stateless_session_patterns: vec!["cron*".to_string()],
+            ..LcmConfig::in_memory()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "cron_20260414", "scheduled report", 12, 1.0);
+        let text = run_lcm(&lcm, "doctor clean").await;
+        assert!(text.contains("ignored_pattern_matches: 1"), "{text}");
+        assert!(text.contains("stateless_pattern_matches: 0"), "{text}");
+        assert!(text.contains("class=ignored-pattern"), "{text}");
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_apply_denied_by_default (tests/test_lcm_command.py:1026)
+    #[tokio::test]
+    async fn parity_gap_doctor_clean_apply_denied_by_default() {
+        let cfg = LcmConfig {
+            ignore_session_patterns: vec!["cron*".to_string()],
+            ..LcmConfig::in_memory()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "cron_20260414", "scheduled report", 12, 1.0);
+        let text = run_lcm(&lcm, "doctor clean apply").await;
+        assert!(text.contains("LCM doctor clean apply"), "{text}");
+        assert!(text.contains("status: denied"), "{text}");
+        assert!(text.contains("disabled by default"), "{text}");
+        assert_eq!(lcm.store().message_count("cron_20260414").unwrap(), 1);
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates (tests/test_lcm_command.py:910)
+    #[tokio::test]
+    async fn parity_gap_doctor_clean_apply_backup_first_deletes_safe_candidates() {
+        let dir = reconcile_dir("clean-apply");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ignore_session_patterns: vec!["cron*".to_string()],
+            doctor_clean_apply_enabled: true,
+            ..LcmConfig::default()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "cron_20260414", "scheduled report", 12, 1.0);
+        seed_row(&lcm, "normal_session", "real conversation", 20, 1.0);
+        seed_node(&lcm, "cron_20260414", 0, "scheduled report summary", 10.0);
+        lcm.store()
+            .bind_session("cron_20260414", "cron_20260414", 1.0)
+            .unwrap();
+        lcm.store()
+            .finalize_session("cron_20260414", "cron_20260414", 1, 1.0)
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor clean apply").await;
+        assert!(text.contains("LCM doctor clean apply"), "{text}");
+        assert!(text.contains("status: ok"), "{text}");
+        let backup_line = text
+            .lines()
+            .find(|l| l.starts_with("backup_path: "))
+            .unwrap_or_else(|| panic!("backup-first: {text}"));
+        assert!(std::path::Path::new(&backup_line["backup_path: ".len()..]).exists());
+        assert_eq!(lcm.store().message_count("cron_20260414").unwrap(), 0);
+        assert_eq!(lcm.store().summary_count("cron_20260414").unwrap(), 0);
+        assert!(lcm
+            .store()
+            .get_lifecycle("cron_20260414")
+            .unwrap()
+            .is_none());
+        assert_eq!(lcm.store().message_count("normal_session").unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_lifecycle_reports_empty_candidates (tests/test_lcm_command.py:1042)
+    #[tokio::test]
+    async fn parity_gap_doctor_clean_lifecycle_reports_empty_rows() {
+        let lcm = LcmContextEngine::open_for_session(
+            LcmConfig::in_memory(),
+            &SessionId::new("s1"),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        // The bound session has data (so its own lifecycle row is not an empty candidate).
+        seed_row(&lcm, "s1", "live data", 5, 1.0);
+        lcm.store()
+            .bind_session("orphan-1", "orphan-1", 1.0)
+            .unwrap();
+        lcm.store()
+            .bind_session("orphan-2", "orphan-2", 1.0)
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor clean lifecycle").await;
+        assert!(text.contains("LCM doctor clean lifecycle"), "{text}");
+        assert!(text.contains("status: candidates-found"), "{text}");
+        assert!(text.contains("empty_rows: 2"), "{text}");
+        assert!(text.contains("empty_current: 2"), "{text}");
+        assert!(text.contains("empty_finalized: 0"), "{text}");
+        assert!(text.contains("empty_protected: 0"), "{text}");
+        assert!(text.contains("no rows were deleted"), "{text}");
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_lifecycle_apply_is_backup_first_and_deletes_safe_candidates (tests/test_lcm_command.py:1063)
+    #[tokio::test]
+    async fn parity_gap_doctor_clean_lifecycle_apply_deletes_empty_rows() {
+        let dir = reconcile_dir("clean-lifecycle-apply");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            doctor_clean_apply_enabled: true,
+            ..LcmConfig::default()
+        };
+        let lcm =
+            LcmContextEngine::open_for_session(cfg, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm.on_model(&model());
+        seed_row(&lcm, "s1", "live data", 5, 1.0);
+        lcm.store()
+            .bind_session("orphan-1", "orphan-1", 1.0)
+            .unwrap();
+        lcm.store()
+            .bind_session("orphan-2", "orphan-2", 1.0)
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor clean lifecycle apply").await;
+        assert!(text.contains("LCM doctor clean lifecycle apply"), "{text}");
+        assert!(text.contains("status: ok"), "{text}");
+        assert!(text.contains("lifecycle_rows_deleted: 2"), "{text}");
+        assert!(text.contains("lifecycle_rows_remaining: 1"), "{text}");
+        assert!(text.contains("backup_path:"), "{text}");
+        assert!(text.contains("backup_size_bytes:"), "{text}");
+        let remaining = lcm
+            .store()
+            .get_lifecycle("s1")
+            .unwrap()
+            .expect("live row kept");
+        assert_eq!(remaining.current_session_id.as_deref(), Some("s1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: command.py::test_lcm_doctor_clean_lifecycle_apply_denied_by_default (tests/test_lcm_command.py:1091)
+    #[tokio::test]
+    async fn parity_gap_doctor_clean_lifecycle_apply_denied_by_default() {
+        let lcm = LcmContextEngine::open_for_session(
+            LcmConfig::in_memory(),
+            &SessionId::new("s1"),
+            aux_with("s"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.store()
+            .bind_session("orphan-1", "orphan-1", 1.0)
+            .unwrap();
+        let text = run_lcm(&lcm, "doctor clean lifecycle apply").await;
+        assert!(text.contains("LCM doctor clean lifecycle apply"), "{text}");
+        assert!(text.contains("status: denied"), "{text}");
+        assert!(text.contains("disabled by default"), "{text}");
+        assert!(lcm.store().get_lifecycle("orphan-1").unwrap().is_some());
+    }
+
     #[test]
     fn fmt_size_matches_the_python_precision_ladder() {
         assert_eq!(fmt_size(512), "512 B");
