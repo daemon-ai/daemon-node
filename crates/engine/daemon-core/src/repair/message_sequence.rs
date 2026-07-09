@@ -19,6 +19,9 @@
 //! 3. **No empties**: a plain `user`/`assistant` message with blank content and no tool calls is
 //!    dropped, and an empty tool-result body is coerced to a placeholder (providers reject empty
 //!    content blocks).
+//! 4. **User merge**: two consecutive plain-text `user` messages are merged (`\n\n`-joined) so no
+//!    user input is lost and role alternation holds; a multimodal user (non-empty `images`) is
+//!    never merged (mirrors hermes `repair_message_sequence` pass 2).
 //!
 //! It is a no-op for a well-formed sequence (the common case), so it never perturbs the normal path.
 
@@ -86,7 +89,25 @@ pub fn repair_message_sequence(mut messages: Vec<RequestMsg>) -> Vec<RequestMsg>
         } else if role == "assistant" || role == "user" {
             // (3) Drop empty plain messages; keep anything with content.
             if !messages[i].content.trim().is_empty() {
-                out.push(messages[i].clone());
+                // (4) Merge consecutive plain-text user messages (hermes `repair_message_sequence`
+                //     pass 2), so no user input is lost. Multimodal users (non-empty `images`) are
+                //     left as distinct messages — collapsing them risks mangling attachments.
+                let merge_into_prev = role == "user"
+                    && messages[i].images.is_empty()
+                    && out
+                        .last()
+                        .is_some_and(|l| l.role == "user" && l.images.is_empty());
+                if merge_into_prev {
+                    let cur = messages[i].content.clone();
+                    let prev = out.last_mut().expect("checked by merge_into_prev");
+                    prev.content = if prev.content.is_empty() {
+                        cur
+                    } else {
+                        format!("{}\n\n{}", prev.content, cur)
+                    };
+                } else {
+                    out.push(messages[i].clone());
+                }
             }
             i += 1;
         } else {
@@ -220,8 +241,8 @@ mod tests {
 /// port skips merging when either side has non-empty `images`. hermes returns a repair count; the
 /// Rust port returns the repaired `Vec`, so parity is asserted on the resulting messages.
 ///
-/// `parity_gap_*` tests assert the desired Python behavior and are expected to FAIL until merging is
-/// ported; plain-named tests port behavior the Rust port already has and MUST PASS.
+/// Consecutive-user merging is now ported, so these all pass; each asserts the behavior of the
+/// corresponding Python test case.
 #[cfg(test)]
 mod parity {
     use super::tests::{assistant, assistant_calls, tool, user};
@@ -244,7 +265,7 @@ mod parity {
 
     // parity: test_message_sequence_repair.py::test_repair_merges_consecutive_user_messages (tests/run_agent/test_message_sequence_repair.py:81)
     #[test]
-    fn parity_gap_merges_consecutive_user_messages() {
+    fn merges_consecutive_user_messages() {
         let out = repair_message_sequence(vec![user("first"), user("second")]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].role, "user");

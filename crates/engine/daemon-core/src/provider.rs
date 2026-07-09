@@ -866,9 +866,12 @@ mod cache_tests {
 
     #[test]
     fn empty_system_gives_all_four_slots_to_messages() {
+        // Alternate user/assistant so `build_context`'s message-sequence repair does not merge
+        // consecutive user messages (§9) — we just need >=4 distinct wire messages here.
         let mut conv = Conversation::new(SystemPrompt::new(""));
         for i in 0..6 {
             conv.push_user(UserMsg::new(format!("m{i}")));
+            conv.push_assistant(AssistantMsg::text(format!("a{i}")));
         }
         let mut req = build_context(&conv, &[]);
         mark_cache_breakpoints(&mut req);
