@@ -2888,6 +2888,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-prompt"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "daemon-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "daemon-protocol"
 version = "0.0.1"
 dependencies = [
