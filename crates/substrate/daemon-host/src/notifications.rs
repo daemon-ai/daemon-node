@@ -57,41 +57,48 @@ impl NotificationManager {
 
     /// The number of notifications.
     pub fn len(&self) -> usize {
-        // RED stub.
-        0
+        self.notifications.len()
     }
 
     /// Whether the manager holds no notifications.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.notifications.is_empty()
     }
 
     /// The current unread count.
     pub fn unread_count(&self) -> u32 {
-        // RED stub.
-        0
+        self.unread_count
     }
 
     /// A snapshot of the notifications (newest first) — what the `notification_list` op returns.
     pub fn list(&self) -> Vec<NotificationInfo> {
-        // RED stub.
-        Vec::new()
+        self.notifications.clone()
     }
 
     /// Add a notification (`purple_notification_manager_add`): prepend it (newest first), reject a
     /// double-add by id, and increment `unread_count` when it is unread.
     pub fn add(&mut self, notification: NotificationInfo) -> AddOutcome {
-        // RED stub.
-        let _ = notification;
-        AddOutcome::DuplicateRejected
+        if self.notifications.iter().any(|n| n.id == notification.id) {
+            return AddOutcome::DuplicateRejected;
+        }
+        if !notification.read {
+            self.unread_count = self.unread_count.saturating_add(1);
+        }
+        self.notifications.insert(0, notification);
+        AddOutcome::Added
     }
 
     /// Remove a notification by id (`purple_notification_manager_remove`): decrement `unread_count`
     /// when the removed item was unread. Returns whether one was removed (a second remove is a no-op).
     pub fn remove(&mut self, id: &str) -> bool {
-        // RED stub.
-        let _ = id;
-        false
+        let Some(pos) = self.notifications.iter().position(|n| n.id == id) else {
+            return false;
+        };
+        let removed = self.notifications.remove(pos);
+        if !removed.read {
+            self.unread_count = self.unread_count.saturating_sub(1);
+        }
+        true
     }
 
     /// Remove every notification bound to `account`
@@ -99,31 +106,44 @@ impl NotificationManager {
     /// notification is transient — removed only when `all == true`. Returns the removed count.
     /// (Faithful to C: does not adjust `unread_count`.)
     pub fn remove_with_account(&mut self, account: &TransportId, all: bool) -> usize {
-        // RED stub.
-        let _ = (account, all);
-        0
+        let before = self.notifications.len();
+        self.notifications.retain(|n| {
+            let matches = n.account.as_ref() == Some(account);
+            let can_remove = if is_transient(n) { all } else { true };
+            !(matches && can_remove)
+        });
+        before - self.notifications.len()
     }
 
     /// Remove every notification (`purple_notification_manager_clear`). (Faithful to C: does not
     /// adjust `unread_count`.)
     pub fn clear(&mut self) {
-        // RED stub.
+        self.notifications.clear();
     }
 
     /// Set a notification's read flag by id, updating `unread_count` and reporting the transition
     /// (the daemon analog of the manager's `notify::read` callback firing `read`/`unread`).
     pub fn set_read(&mut self, id: &str, read: bool) -> ReadChange {
-        // RED stub.
-        let _ = (id, read);
-        ReadChange::Unchanged
+        let Some(notification) = self.notifications.iter_mut().find(|n| n.id == id) else {
+            return ReadChange::Unchanged;
+        };
+        if notification.read == read {
+            return ReadChange::Unchanged;
+        }
+        notification.read = read;
+        if read {
+            self.unread_count = self.unread_count.saturating_sub(1);
+            ReadChange::MarkedRead
+        } else {
+            self.unread_count = self.unread_count.saturating_add(1);
+            ReadChange::MarkedUnread
+        }
     }
 
     /// Remove a notification as if it were deleted (`purple_notification_delete` → the manager's
     /// `deleted` callback → `remove`). Returns whether one was removed.
     pub fn delete(&mut self, id: &str) -> bool {
-        // RED stub.
-        let _ = id;
-        false
+        self.remove(id)
     }
 }
 
