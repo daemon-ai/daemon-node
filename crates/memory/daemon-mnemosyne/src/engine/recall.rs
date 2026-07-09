@@ -2447,4 +2447,130 @@ mod tests {
         let conn = e.store.conn.lock().unwrap();
         assert!(cyrillic_like_search_working(&conn, "dark mode", 5).is_empty());
     }
+
+    // ---- Cross-tier summary dedup (`test_e3a3_cross_tier_dedup.py`) ----
+
+    fn dedup_row(id: &str, tier: Tier, score: f64) -> MemoryRow {
+        MemoryRow {
+            id: id.to_string(),
+            content: format!("content-{id}"),
+            tier,
+            score,
+            ..Default::default()
+        }
+    }
+
+    fn ids(rows: &[MemoryRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    // PARITY: Mnemosyne tests/test_e3a3_cross_tier_dedup.py::TestDedupHelperUnit::test_no_episodic_rows_returns_input_unchanged
+    #[test]
+    fn dedup_no_episodic_rows_returns_input_unchanged() {
+        let results = vec![
+            dedup_row("wm-1", Tier::Working, 0.5),
+            dedup_row("wm-2", Tier::Working, 0.3),
+        ];
+        let out = dedup_cross_tier_summary_links(results.clone(), &HashMap::new());
+        assert_eq!(ids(&out), ids(&results));
+    }
+
+    // PARITY: Mnemosyne tests/test_e3a3_cross_tier_dedup.py::TestDedupHelperUnit::test_wm_wins_drops_episodic
+    #[test]
+    fn dedup_wm_wins_drops_episodic() {
+        let results = vec![
+            dedup_row("wm-1", Tier::Working, 0.9),
+            dedup_row("ep-1", Tier::Episodic, 0.5),
+        ];
+        let links = HashMap::from([("ep-1".to_string(), "wm-1".to_string())]);
+        let out = dedup_cross_tier_summary_links(results, &links);
+        assert_eq!(ids(&out), vec!["wm-1"]);
+    }
+
+    // PARITY: Mnemosyne tests/test_e3a3_cross_tier_dedup.py::TestDedupHelperUnit::test_episodic_wins_drops_wm
+    #[test]
+    fn dedup_episodic_wins_drops_wm() {
+        let results = vec![
+            dedup_row("ep-1", Tier::Episodic, 0.9),
+            dedup_row("wm-1", Tier::Working, 0.5),
+        ];
+        let links = HashMap::from([("ep-1".to_string(), "wm-1".to_string())]);
+        let out = dedup_cross_tier_summary_links(results, &links);
+        assert_eq!(ids(&out), vec!["ep-1"]);
+    }
+
+    // PARITY: Mnemosyne tests/test_e3a3_cross_tier_dedup.py::TestDedupHelperUnit::test_ties_keep_episodic
+    #[test]
+    fn dedup_ties_keep_episodic() {
+        let results = vec![
+            dedup_row("wm-1", Tier::Working, 0.6),
+            dedup_row("ep-1", Tier::Episodic, 0.6),
+        ];
+        let links = HashMap::from([("ep-1".to_string(), "wm-1".to_string())]);
+        let out = dedup_cross_tier_summary_links(results, &links);
+        assert_eq!(ids(&out), vec!["ep-1"]);
+    }
+
+    // PARITY: Mnemosyne tests/test_e3a3_cross_tier_dedup.py::TestDedupHelperUnit::test_summary_covers_multiple_wms_partial_overlap_per_cluster
+    #[test]
+    fn dedup_per_cluster_keeps_all_sources_when_summary_loses() {
+        // ep loses its cluster to the higher-scored wm-1, so ep is dropped and BOTH covered
+        // working rows survive (wm-2 is no longer represented by a surviving summary).
+        let results = vec![
+            dedup_row("wm-1", Tier::Working, 0.9),
+            dedup_row("ep-1", Tier::Episodic, 0.6),
+            dedup_row("wm-2", Tier::Working, 0.3),
+        ];
+        let links = HashMap::from([("ep-1".to_string(), "wm-1,wm-2,wm-3".to_string())]);
+        let out = dedup_cross_tier_summary_links(results, &links);
+        let got: HashSet<&str> = ids(&out).into_iter().collect();
+        assert!(got.contains("wm-1"));
+        assert!(got.contains("wm-2"));
+        assert!(!got.contains("ep-1"));
+    }
+
+    // PARITY: Mnemosyne tests/test_e3a3_cross_tier_dedup.py::TestDedupHelperUnit::test_summary_covers_multiple_wms_all_in_results
+    #[test]
+    fn dedup_summary_beats_all_sources_drops_them() {
+        let results = vec![
+            dedup_row("ep-1", Tier::Episodic, 0.9),
+            dedup_row("wm-1", Tier::Working, 0.5),
+            dedup_row("wm-2", Tier::Working, 0.4),
+        ];
+        let links = HashMap::from([("ep-1".to_string(), "wm-1,wm-2".to_string())]);
+        let out = dedup_cross_tier_summary_links(results, &links);
+        assert_eq!(ids(&out), vec!["ep-1"]);
+    }
+
+    // PARITY: Mnemosyne tests/test_e3a3_cross_tier_dedup.py::TestDedupHelperUnit::test_preserves_order_on_retained_rows
+    #[test]
+    fn dedup_preserves_input_order_on_retained_rows() {
+        let results = vec![
+            dedup_row("wm-1", Tier::Working, 0.9),
+            dedup_row("ep-1", Tier::Episodic, 0.5),
+            dedup_row("wm-99", Tier::Working, 0.4),
+        ];
+        let links = HashMap::from([("ep-1".to_string(), "wm-1".to_string())]);
+        let out = dedup_cross_tier_summary_links(results, &links);
+        assert_eq!(ids(&out), vec!["wm-1", "wm-99"]);
+    }
+
+    // PARITY: Mnemosyne tests/test_e3a3_cross_tier_dedup.py::TestDedupHelperUnit::test_empty_summary_of_string_handled
+    #[test]
+    fn dedup_empty_summary_of_string_is_a_noop() {
+        let results = vec![dedup_row("ep-empty", Tier::Episodic, 0.5)];
+        let links = HashMap::from([("ep-empty".to_string(), " , , ,".to_string())]);
+        let out = dedup_cross_tier_summary_links(results, &links);
+        assert_eq!(ids(&out), vec!["ep-empty"]);
+    }
+
+    // PARITY: Mnemosyne tests/test_e3a3_cross_tier_dedup.py::TestDedupHelperUnit::test_only_one_side_in_results_keeps_it
+    #[test]
+    fn dedup_only_one_side_in_results_keeps_it() {
+        // ep-1 summarizes wm-1 in the DB, but ep-1 was not recalled: wm-1 has no episodic peer.
+        let results = vec![dedup_row("wm-1", Tier::Working, 0.5)];
+        let links = HashMap::from([("ep-1".to_string(), "wm-1".to_string())]);
+        let out = dedup_cross_tier_summary_links(results, &links);
+        assert_eq!(ids(&out), vec!["wm-1"]);
+    }
 }
