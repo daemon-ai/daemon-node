@@ -4358,6 +4358,140 @@ mod tests {
         );
     }
 
+    /// A conversation with `region` heavy (~220-token) turns plus a 2-turn fresh tail — the
+    /// Python `_make_backlog_messages` shape for the deferred-maintenance debt tests.
+    fn debt_backlog_convo(region: usize) -> Conversation {
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        for i in 0..region + 2 {
+            let body = format!("chunk-{i} ").repeat(220);
+            if i % 2 == 0 {
+                c.push_user(UserMsg::new(body));
+            } else {
+                c.push_assistant(AssistantMsg::text(body));
+            }
+        }
+        c
+    }
+
+    fn debt_engine(max_passes: usize) -> LcmContextEngine {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 100,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 100,
+            deferred_maintenance_enabled: true,
+            deferred_maintenance_max_passes: max_passes,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(cfg, aux_with("debt summary")).unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        lcm
+    }
+
+    // parity: engine.py::test_debt_persists_when_bounded_leaf_passes_leave_raw_backlog (tests/test_lcm_engine.py:8849)
+    #[tokio::test]
+    async fn debt_persists_when_bounded_passes_leave_backlog() {
+        let lcm = debt_engine(1);
+        lcm.compact(debt_backlog_convo(4), 100_000).await;
+        let row = lcm
+            .store()
+            .get_lifecycle("s1")
+            .unwrap()
+            .expect("lifecycle row");
+        assert_eq!(row.debt_kind.as_deref(), Some("raw_backlog"));
+        assert!(
+            row.debt_size_estimate > 0,
+            "debt: {}",
+            row.debt_size_estimate
+        );
+    }
+
+    // parity: engine.py::test_bounded_catchup_reduces_then_clears_debt_only_after_backlog_shrinks (tests/test_lcm_engine.py:8877)
+    #[tokio::test]
+    async fn bounded_catchup_reduces_then_clears_debt() {
+        let lcm = debt_engine(2);
+        // Pass 1 (no debt yet): the polite dynamic loop stops after one bounded pass, leaving a
+        // three-turn backlog recorded as debt.
+        let out1 = lcm.compact(debt_backlog_convo(4), 100_000).await;
+        let debt1 = lcm.store().get_lifecycle("s1").unwrap().unwrap();
+        assert_eq!(debt1.debt_kind.as_deref(), Some("raw_backlog"));
+        assert!(debt1.debt_size_estimate > 0);
+        // Pass 2 (debt-carrying): up to two bounded catch-up passes reduce but do not clear.
+        let out2 = lcm.compact(out1, 100_000).await;
+        let debt2 = lcm.store().get_lifecycle("s1").unwrap().unwrap();
+        assert_eq!(debt2.debt_kind.as_deref(), Some("raw_backlog"));
+        assert!(
+            debt2.debt_size_estimate < debt1.debt_size_estimate,
+            "debt reduced: {} -> {}",
+            debt1.debt_size_estimate,
+            debt2.debt_size_estimate
+        );
+        assert!(debt2.last_maintenance_attempt_at.is_some());
+        // Pass 3 drains the remaining backlog; the debt clears only once it is gone.
+        let out3 = lcm.compact(out2, 100_000).await;
+        let debt3 = lcm.store().get_lifecycle("s1").unwrap().unwrap();
+        assert_eq!(debt3.debt_kind, None, "cleared after the backlog shrank");
+        assert_eq!(debt3.debt_size_estimate, 0);
+        assert!(!out3.turns.is_empty());
+    }
+
+    // parity: engine.py::test_status_and_lcm_status_surface_debt_state (tests/test_lcm_engine.py:8912)
+    #[tokio::test]
+    async fn status_surfaces_debt_state() {
+        let lcm = debt_engine(1);
+        lcm.compact(debt_backlog_convo(4), 100_000).await;
+        let status: Value =
+            serde_json::from_str(&lcm.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(status["lifecycle"]["debt_kind"], "raw_backlog", "{status}");
+        assert!(status["lifecycle"]["debt_size_estimate"].as_i64().unwrap() > 0);
+        assert_eq!(status["config"]["deferred_maintenance_enabled"], true);
+        assert_eq!(status["config"]["critical_budget_pressure_ratio"], 0.0);
+    }
+
+    // parity: engine.py::test_critical_budget_pressure_drains_under_threshold_deferred_debt (tests/test_lcm_engine.py:8938)
+    #[tokio::test]
+    async fn critical_pressure_drains_under_threshold_debt() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 1,
+            leaf_chunk_tokens: 10_000,
+            deferred_maintenance_enabled: true,
+            critical_budget_pressure_ratio: 0.90,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(cfg, aux_with("critical debt summary")).unwrap();
+        // A 100-token window puts this small conversation over the 90% critical ratio.
+        lcm.on_model(&ModelInfo {
+            model: "gpt-4o-mini".into(),
+            max_context: Some(100),
+        });
+        lcm.on_session_start(&SessionId::new("s1"));
+        lcm.store()
+            .record_debt("s1", "raw_backlog", 500, 1.0)
+            .unwrap();
+        let mut c = Conversation::new(SystemPrompt::new("sys"));
+        c.push_user(UserMsg::new(format!(
+            "small raw backlog {}",
+            "pad ".repeat(30)
+        )));
+        c.push_assistant(AssistantMsg::text(format!(
+            "small raw answer {}",
+            "pad ".repeat(30)
+        )));
+        c.push_user(UserMsg::new("fresh tail"));
+        let compacted = lcm.compact(c, 100_000).await;
+        // The under-threshold backlog would normally defer at the leaf floor; critical pressure
+        // drains it and the drained debt clears.
+        let row = lcm.store().get_lifecycle("s1").unwrap().unwrap();
+        assert_eq!(row.debt_kind, None, "debt drained under critical pressure");
+        assert_eq!(row.debt_size_estimate, 0);
+        assert_eq!(lcm.store().count_at_depth("s1", 0).unwrap(), 1);
+        match compacted.turns.last().expect("tail kept") {
+            Turn::User(u) => assert_eq!(u.text, "fresh tail"),
+            other => panic!("expected the fresh tail last, got {other:?}"),
+        }
+    }
+
     fn durable_engine(tag: &str, fresh_tail: usize) -> (LcmContextEngine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("lcm-op-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

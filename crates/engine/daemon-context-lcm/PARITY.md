@@ -91,13 +91,20 @@ Reconcile gap-open rows (not attempted this pass) are grouped in the backlog sec
 | `test_adaptive_leaf_rescue_retries_with_smaller_oldest_chunk` (L4085) | ported-pass | `adaptive_leaf_rescue_retries_with_smaller_oldest_chunk` | retry-worthy aux failure shrinks to the oldest single turn (breaker threshold raised in-test — the Python mock has no breaker) |
 | `test_unlimited_depth_condenses_beyond_ten` (L9029) | ported-pass | `unlimited_condensation_depth_reaches_d12` | `incremental_max_depth = -1` builds d12 from seeded d11 nodes through `compact` |
 | `test_dynamic_leaf_chunk_sizing_runs_bounded_catchup_passes_when_pressure_remains_high` (L4144) | already-covered | `compaction.rs` multi-pass unit tests | the bounded catch-up loop is unit-covered; the single-pass engine path is exercised by the L4029 port |
-| `test_cache_friendly_gating_suppresses_follow_on_condensation_for_single_fanin_group` (L4306) | gap-closed | `cache_friendly_gating_suppresses_single_fanin_group` | red `efe45ee`, green `<area2 green commit>`; node-level gating worked, the `condensation_suppressed_reason` status surface was missing |
+| `test_cache_friendly_gating_suppresses_follow_on_condensation_for_single_fanin_group` (L4306) | gap-closed | `cache_friendly_gating_suppresses_single_fanin_group` | red `efe45ee`, green `7bc5b31`; node-level gating worked, the `condensation_suppressed_reason` status surface was missing |
 | `test_critical_budget_pressure_bypasses_cache_friendly_single_group_suppression` (L4359) | gap-closed | `critical_pressure_bypasses_cache_friendly_suppression` | same pair |
 | `test_cache_friendly_gating_allows_condensation_when_debt_reaches_two_groups` (L4411) | gap-closed | `cache_friendly_gating_allows_two_debt_groups` | same pair |
 
-### Area 3 — deferred maintenance debt lifecycle
+### Area 3 — deferred maintenance debt lifecycle (`tests/test_lcm_engine.py` L8840–8990)
 
-(pending)
+| Python test | status | Rust test | note |
+|---|---|---|---|
+| `test_debt_persists_when_bounded_leaf_passes_leave_raw_backlog` (L8849) | ported-pass | `debt_persists_when_bounded_passes_leave_backlog` | bounded pass leaves backlog; lifecycle row records `raw_backlog` debt |
+| `test_bounded_catchup_reduces_then_clears_debt_only_after_backlog_shrinks` (L8877) | ported-pass | `bounded_catchup_reduces_then_clears_debt` | catch-up passes reduce then clear (single fixed `max_passes=2` engine — Rust config is per-instance, Python monkeypatches it per call) |
+| `test_status_and_lcm_status_surface_debt_state` (L8912) | ported-pass | `status_surfaces_debt_state` | `lcm_status.lifecycle.debt_kind` + config block |
+| `test_critical_budget_pressure_drains_under_threshold_deferred_debt` (L8938) | ported-pass | `critical_pressure_drains_under_threshold_debt` | critical pressure bypasses the leaf floor and drains under-threshold debt |
+| debt preflight advertising (`should_compress_preflight` asserts) | already-covered | `deferred_maintenance_debt_advertises_catchup_pressure_under_threshold` | pre-existing test |
+| `test_critical_budget_pressure_continues_dynamic_catchup_after_first_pass` (L8969) | already-covered | `bounded_catchup_reduces_then_clears_debt` + `critical_pressure_drains_under_threshold_debt` | the multi-pass continuation + critical-drain mechanics are the same code paths |
 
 ### Area 4 — doctor/maintenance commands (`tests/test_lcm_command.py` L440–1091)
 
