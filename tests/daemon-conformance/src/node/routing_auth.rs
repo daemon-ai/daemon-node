@@ -237,23 +237,27 @@ async fn routed_session_composes_the_transport_hint_impl() {
     .await;
     assert_ne!(matrix_session, telegram_session);
 
-    let seen = seen.lock().unwrap();
-    let system_of = |wanted_hint: bool| {
-        seen.iter()
-            .find(|(_, system)| system.contains("Matrix room") == wanted_hint)
-            .map(|(_, system)| system.clone())
-    };
-    let matrix_system = system_of(true).expect("the matrix-origin session recorded a request");
-    assert!(
-        matrix_system.contains("Session surface: a Matrix room"),
-        "the Matrix formatting hint composed into the routed session's prompt"
-    );
-    let plain_system = system_of(false).expect("the telegram-origin session recorded a request");
-    assert!(
-        !plain_system.contains("Matrix"),
-        "unmapped surface: no hint"
-    );
-    drop(seen);
+    // Scope the guard so it is provably released before the async shutdown below
+    // (clippy::await_holding_lock is scope-based and ignores a manual `drop`).
+    {
+        let seen = seen.lock().unwrap();
+        let system_of = |wanted_hint: bool| {
+            seen.iter()
+                .find(|(_, system)| system.contains("Matrix room") == wanted_hint)
+                .map(|(_, system)| system.clone())
+        };
+        let matrix_system = system_of(true).expect("the matrix-origin session recorded a request");
+        assert!(
+            matrix_system.contains("Session surface: a Matrix room"),
+            "the Matrix formatting hint composed into the routed session's prompt"
+        );
+        let plain_system =
+            system_of(false).expect("the telegram-origin session recorded a request");
+        assert!(
+            !plain_system.contains("Matrix"),
+            "unmapped surface: no hint"
+        );
+    }
 
     handle.shutdown().await;
 }
