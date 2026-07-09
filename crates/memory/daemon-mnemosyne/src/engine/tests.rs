@@ -1374,6 +1374,115 @@ fn base_recall_unchanged_when_flags_off() {
     );
 }
 
+// parity: test_consolidate_fact_sibling_races.py::test_concurrent_resolve_conflict_different_winners_deterministic (tests/test_consolidate_fact_sibling_races.py:56)
+// parity: test_consolidate_fact_sibling_races.py::TestReviewHardening::test_first_writer_wins_logs_warning (tests/test_consolidate_fact_sibling_races.py:436)
+#[test]
+fn parity_gap_resolve_conflict_first_writer_wins() {
+    use crate::knowledge::veracity::consolidate_fact;
+    let e = engine();
+    {
+        let c = e.store.conn.lock().unwrap();
+        consolidate_fact(&c, "Alice", "is", "engineer", "stated", "src_a").unwrap();
+        consolidate_fact(&c, "Alice", "is", "manager", "inferred", "src_b").unwrap();
+    }
+    let pending = e.pending_conflicts().unwrap();
+    assert_eq!(pending.len(), 1, "setup failure: expected one conflict");
+    let conflict = &pending[0];
+
+    // First resolution wins…
+    e.resolve_conflict(
+        conflict.conflict_id,
+        true,
+        &conflict.newer_fact_id,
+        &conflict.older_fact_id,
+    )
+    .unwrap();
+    // …and a second, opposite resolution of the SAME conflict must be a no-op — the two
+    // competing writers otherwise leave BOTH facts superseded (the pre-fix race shape).
+    e.resolve_conflict(
+        conflict.conflict_id,
+        true,
+        &conflict.older_fact_id,
+        &conflict.newer_fact_id,
+    )
+    .unwrap();
+
+    let c = e.store.conn.lock().unwrap();
+    let superseded: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM consolidated_facts \
+             WHERE subject = 'Alice' AND superseded_by IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        superseded <= 1,
+        "both facts superseded ({superseded}/2) — conflicting resolutions left an incoherent state"
+    );
+    let resolved_against: Option<String> = c
+        .query_row(
+            "SELECT superseded_by FROM consolidated_facts WHERE id = ?1",
+            params![conflict.older_fact_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        resolved_against.as_deref(),
+        Some(conflict.newer_fact_id.as_str()),
+        "the FIRST resolution must remain durable"
+    );
+}
+
+// parity: test_consolidate_fact_id_collision.py::TestReviewHardening::test_resolve_conflict_rejects_ambiguous_winning_id (tests/test_consolidate_fact_id_collision.py:389)
+#[test]
+fn parity_gap_resolve_conflict_rejects_foreign_fact_ids() {
+    use crate::knowledge::veracity::consolidate_fact;
+    let e = engine();
+    {
+        let c = e.store.conn.lock().unwrap();
+        consolidate_fact(&c, "Iris", "is", "the lead", "stated", "m1").unwrap();
+        consolidate_fact(&c, "Iris", "is", "the manager", "inferred", "m2").unwrap();
+        // An unrelated fact that must never be dragged into the resolution.
+        consolidate_fact(&c, "Zoe", "is", "the CFO", "stated", "m3").unwrap();
+    }
+    let pending = e.pending_conflicts().unwrap();
+    assert_eq!(pending.len(), 1, "setup failure: expected one conflict");
+    let conflict = &pending[0];
+    let foreign = crate::knowledge::veracity::compute_fact_id("Zoe", "is", "the CFO");
+
+    // A winner id that belongs to NEITHER side of the conflict must not supersede anything and
+    // must leave the conflict unresolved.
+    e.resolve_conflict(
+        conflict.conflict_id,
+        true,
+        &foreign,
+        &conflict.older_fact_id,
+    )
+    .unwrap();
+
+    let c = e.store.conn.lock().unwrap();
+    let superseded: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM consolidated_facts WHERE superseded_by IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        superseded, 0,
+        "a foreign winning id must not supersede any fact"
+    );
+    let unresolved: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM conflicts WHERE resolution IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unresolved, 1, "the conflict must remain unresolved");
+}
+
 // parity: test_e6a_followup_gaps.py::TestForgetCascadeToAnnotations::test_forget_deletes_annotations_for_memory_id (tests/test_e6a_followup_gaps.py:47)
 #[test]
 fn forget_cascades_annotations_and_embeddings() {
