@@ -4235,6 +4235,120 @@ mod tests {
         );
     }
 
+    // parity: engine.py::test_cache_friendly_gating_suppresses_follow_on_condensation_for_single_fanin_group (tests/test_lcm_engine.py:4306)
+    #[tokio::test]
+    async fn parity_gap_cache_friendly_gating_suppresses_single_fanin_group() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            condensation_fanin: 2,
+            cache_friendly_condensation_enabled: true,
+            cache_friendly_min_debt_groups: 2,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Leaf summary.\nExpand for details about: oldest raw chunk"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        seed_node(&lcm, "s1", 0, "Earlier leaf", 10.0);
+        lcm.compact(chunky_convo(35), 100_000).await;
+        // The fresh leaf makes exactly one fanin group (2 uncondensed d0) — a follow-on
+        // condensation right after the leaf pass is suppressed for cache stability.
+        assert_eq!(lcm.store().count_at_depth("s1", 0).unwrap(), 2);
+        assert_eq!(
+            lcm.store().count_at_depth("s1", 1).unwrap(),
+            0,
+            "no follow-on d1"
+        );
+        let status: Value =
+            serde_json::from_str(&lcm.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(
+            status["condensation_suppressed_reason"], "cache_friendly_single_group",
+            "status: {status}"
+        );
+    }
+
+    // parity: engine.py::test_critical_budget_pressure_bypasses_cache_friendly_single_group_suppression (tests/test_lcm_engine.py:4359)
+    #[tokio::test]
+    async fn parity_gap_critical_pressure_bypasses_cache_friendly_suppression() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            condensation_fanin: 2,
+            cache_friendly_condensation_enabled: true,
+            cache_friendly_min_debt_groups: 2,
+            critical_budget_pressure_ratio: 0.90,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Leaf summary.\nExpand for details about: oldest raw chunk"),
+        )
+        .unwrap();
+        // A 1000-token window with ~43-token-per-turn content puts the conversation over the
+        // 90% critical ratio (the Python `current_tokens=900` analog).
+        lcm.on_model(&ModelInfo {
+            model: "gpt-4o-mini".into(),
+            max_context: Some(300),
+        });
+        lcm.on_session_start(&SessionId::new("s1"));
+        seed_node(&lcm, "s1", 0, "Earlier leaf", 10.0);
+        lcm.compact(chunky_convo(35), 100_000).await;
+        assert_eq!(
+            lcm.store().count_at_depth("s1", 1).unwrap(),
+            1,
+            "critical pressure bypasses the cache-friendly gate"
+        );
+        let status: Value =
+            serde_json::from_str(&lcm.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(
+            status["condensation_suppressed_reason"], "",
+            "status: {status}"
+        );
+    }
+
+    // parity: engine.py::test_cache_friendly_gating_allows_condensation_when_debt_reaches_two_groups (tests/test_lcm_engine.py:4411)
+    #[tokio::test]
+    async fn parity_gap_cache_friendly_gating_allows_two_debt_groups() {
+        let cfg = LcmConfig {
+            fresh_tail_count: 2,
+            leaf_chunk_tokens: 50,
+            dynamic_leaf_chunk_enabled: true,
+            dynamic_leaf_chunk_max: 120,
+            condensation_fanin: 2,
+            cache_friendly_condensation_enabled: true,
+            cache_friendly_min_debt_groups: 2,
+            ..LcmConfig::in_memory()
+        };
+        let lcm = LcmContextEngine::open(
+            cfg,
+            aux_with("Leaf summary.\nExpand for details about: oldest raw chunk"),
+        )
+        .unwrap();
+        lcm.on_model(&model());
+        lcm.on_session_start(&SessionId::new("s1"));
+        for i in 0..3 {
+            seed_node(&lcm, "s1", 0, &format!("Earlier leaf {i}"), 10.0 + i as f64);
+        }
+        lcm.compact(chunky_convo(35), 100_000).await;
+        // 3 seeded + 1 fresh = 4 uncondensed = fanin * min_debt_groups — condensation proceeds
+        // (one group per call in cache-friendly mode).
+        assert_eq!(lcm.store().count_at_depth("s1", 1).unwrap(), 1);
+        let status: Value =
+            serde_json::from_str(&lcm.call_tool("lcm_status", Value::Null).await).unwrap();
+        assert_eq!(
+            status["condensation_suppressed_reason"], "",
+            "status: {status}"
+        );
+    }
+
     fn durable_engine(tag: &str, fresh_tail: usize) -> (LcmContextEngine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("lcm-op-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
