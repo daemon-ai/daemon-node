@@ -2530,3 +2530,72 @@ fn cross_tier_dedup_toggle_controls_summary_source_collapse() {
         "cross-tier dedup OFF leaves both the summary and its source"
     );
 }
+
+// ---- Polyphonic voice A/B toggles (`tests/test_ab_toggles.py::TestPolyphonicVoiceToggles`) ----
+
+/// Build a polyphonic engine with a single vector-bearing row, toggling one voice.
+fn poly_engine_with_vector_row(voice_vector: bool, voice_temporal: bool) -> Engine {
+    let e = Engine::open_in_memory(MnemosyneConfig {
+        recall_mode: RecallMode::Polyphonic,
+        voice_vector,
+        voice_temporal,
+        ..MnemosyneConfig::default()
+    })
+    .unwrap();
+    e.remember_with_vector(
+        "quarterly revenue figures attachment",
+        &RememberArgs::default(),
+        Some(&[1.0, 0.0, 0.0]),
+        "mock",
+    )
+    .unwrap();
+    e
+}
+
+// PARITY: Mnemosyne tests/test_ab_toggles.py::TestPolyphonicVoiceToggles::test_vector_voice_disabled_returns_empty
+#[test]
+fn voice_vector_toggle_gates_the_vector_voice() {
+    // Query "zzz" carries no lexical/graph/fact/temporal signal, so the aligned query vector is the
+    // ONLY voice that can surface the row. Disabling the vector voice must drop it entirely.
+    let enabled = poly_engine_with_vector_row(true, true);
+    let hits_on = enabled
+        .recall_with_vector("zzz", 5, Some(&[1.0, 0.0, 0.0]))
+        .unwrap();
+    assert!(
+        hits_on
+            .iter()
+            .any(|h| h.content.contains("quarterly revenue")),
+        "vector voice ON must surface the aligned row: {hits_on:?}"
+    );
+
+    let disabled = poly_engine_with_vector_row(false, true);
+    let hits_off = disabled
+        .recall_with_vector("zzz", 5, Some(&[1.0, 0.0, 0.0]))
+        .unwrap();
+    assert!(
+        !hits_off
+            .iter()
+            .any(|h| h.content.contains("quarterly revenue")),
+        "disabling the vector voice must drop its sole contribution: {hits_off:?}"
+    );
+}
+
+// PARITY: Mnemosyne tests/test_ab_toggles.py::TestPolyphonicVoiceToggles::test_temporal_voice_disabled_returns_empty
+#[test]
+fn voice_temporal_toggle_gates_the_temporal_voice() {
+    // A temporal-keyword query with no vector surfaces recent working rows via the temporal voice
+    // alone; disabling that voice must surface nothing.
+    let enabled = poly_engine_with_vector_row(true, true);
+    let hits_on = enabled.recall("notes from last week", 5).unwrap();
+    assert!(
+        !hits_on.is_empty(),
+        "temporal voice ON must surface recent rows on a temporal-cue query"
+    );
+
+    let disabled = poly_engine_with_vector_row(true, false);
+    let hits_off = disabled.recall("notes from last week", 5).unwrap();
+    assert!(
+        hits_off.is_empty(),
+        "disabling the temporal voice must drop its sole contribution: {hits_off:?}"
+    );
+}
