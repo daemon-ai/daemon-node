@@ -89,6 +89,11 @@ daemon/                              # cargo workspace root
 │   ├── memory/
 │   │   └── daemon-mnemosyne/        #   persistent memory provider and Mnemosyne Rust port
 │   │
+│   ├── prompt/                      # prompt CONTENT + node-owned prompt stores (feeds daemon-core's composer slots)
+│   │   └── daemon-prompt/           #   threat scan, truncation, guidance library, PersonaStore (SOUL.md),
+│   │                                #     UserProfileStore (USER.md), workspace context-file loader
+│   │                                #     (→ core only: ExecutionEnvironment IO + SlotKind; wiring deferred to daemon-node)
+│   │
 │   ├── substrate/                   # the durable layer + borrowable mechanism — the host's engine-room
 │   │   ├── daemon-store/            #   ★ SessionStore trait + SQLite/WAL/CBOR; 5 tables, 4 txns   (→ common)
 │   │   ├── daemon-activation/       #   ★ directory + lease/fence + inbox/outbox + recovery scan;
@@ -143,6 +148,7 @@ daemon/                              # cargo workspace root
 │   ├── daemon-tool-metta/
 │   ├── daemon-tool-todo/
 │   ├── daemon-tool-clarify/
+│   ├── daemon-tool-user-profile/    #   the user_profile add/replace/remove tool over UserProfileStore (→ prompt, core)
 │   └── daemon-tool-skill/
 │
 ├── bindings/                        # C ABI / embedding shells — thin cdylibs over the protocol seams (docs/specs/daemon-ffi-spec.md)
@@ -329,6 +335,13 @@ be tool-shaped is possible but out of scope here — it stays a host authority.
 - **One node binary, role by config.** `bins/daemon` runs as an embedder, a host, or an orchestrating
   engine depending on configuration — mirroring the recursion: the same binary tiles the unit tree and
   opens cuts via `daemon-provision` (synthesis §3.2). No separate `hostd`/`orchestratord`.
+- **Prompt runtime state is per-profile and durable-node-only.** `daemon-prompt`'s stores keep a
+  profile's persona and user profile as Markdown under the data dir: `<data_dir>/<profile>/SOUL.md`
+  (the Identity slot; seeded from `DEFAULT_SOUL_MD` on first load, read/edited over the wire via
+  `SoulGet`/`SoulSet`) and `<data_dir>/<profile>/USER.md` (the frozen per-session UserProfile slot,
+  never exported in a distribution — personal data). Both stores are bound only on a durable node;
+  an ephemeral (memory-store) node runs on the built-in role personas with no SOUL.md/USER.md, so its
+  persona ops resolve to `Unsupported`.
 
 ---
 

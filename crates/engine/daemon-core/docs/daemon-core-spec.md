@@ -31,7 +31,9 @@
 > (`memory.rs`) are now real seams: a `ContextEngine` (`before_turn`/`compact`/`after_response`, the
 > default `BudgetedContextEngine` drop-oldest + anti-thrash; `Summarize` provided non-default) and a
 > set of `MemoryProvider`s (`recall`/`prompt_block`/`before_compact`/`after_turn`, builtin
-> `FileMemory`) wired into `run_turn` in spec hook order, assembled via the tiered `PromptAssembler`.
+> `FileMemory`) wired into `run_turn` in spec hook order; the system prompt is a `ComposedPrompt`
+> (typed ordered `SlotKind` slots, composed once per session and byte-stable across turns) and each
+> turn's recall/nudges ride an ephemeral `TurnInjection` on the outgoing request only.
 > Real networked providers ship in the sibling crate `crates/providers/daemon-providers` as a single
 > `GenAiProvider` over the `genai` native-protocol client (OpenAI/Anthropic/Gemini/Groq/… with
 > streaming + native tools), dropping into the binary via config (`DAEMON_MODEL_PROVIDER`) with Mock
@@ -273,8 +275,8 @@ graph TD
 | `recovery.rs` | `Failure` taxonomy + tower-style layers |
 | `provider_profile.rs` | declarative provider quirks + registry |
 | `credential_pool.rs` | multi-key selection, cooldown, refresh — the **default embedded `CredentialProvider` impl** for standalone (L1) use; under a host the authority-backed impl is injected (§7) |
-| `prompt.rs` | tiered `PromptAssembler` (stable / context / volatile) |
-| `context.rs` | `ContextEngine` trait + in-core default strategies |
+| `context.rs` | `ContextEngine` trait + in-core default strategies; the system-prompt **composer** — `ComposedPrompt` (typed ordered `SlotKind` slots, composed once per session) + per-turn `TurnInjection`, and the `StablePromptSource`/`ModelPromptSource`/`AsyncPromptSource`/`NudgeSource`/`ToolCallObserver` seams the content sources bind to |
+| `crates/prompt/daemon-prompt` | *(sibling crate, not `daemon-core`)* prompt **content** + node-owned stores: threat scan, truncation, guidance library, `PersonaStore` (SOUL.md), `UserProfileStore` (USER.md), context-file loader — wired into the composer's slots by the node integration layer |
 | `context_compressor.rs` | LLM summarization pipeline (in-core default engine) |
 | `memory.rs` | `MemoryProvider` trait + builtin `MEMORY.md`/`USER.md` |
 | `tool_pipeline.rs` | validate / safety / checkpoint / execute -> `ToolOutcome` |
@@ -303,8 +305,9 @@ graph TD
 > with a second implementation"): introduce a trait only when a real second impl or a test fake
 > exists. Traits: `Provider` (openai/anthropic/xml/mock), `SessionStore` (sqlite/in-memory fake),
 > `ContextEngine` (default/LCM), `MemoryProvider` (builtin/Mnemosyne), `ExecutionEnvironment`
-> (local/docker/...). Concrete (no trait): the orchestrator, the phase functions, `PromptAssembler`,
-> the effect applier.
+> (local/docker/...). Concrete (no trait): the orchestrator, the phase functions, the `ComposedPrompt`
+> composer, the effect applier. (The prompt-source seams — `StablePromptSource` and friends — *are*
+> traits, because the `daemon-prompt` crate supplies real second impls.)
 
 ## 4. Runtime model (the four commitments)
 
@@ -877,24 +880,49 @@ trait ContextEngine: Send + Sync {
 - Session rotation on summarizing compaction is owned here, with a cross-process compression lock in
   the `SessionStore` (§14) guarding double rotation.
 
-**Tiered prompt assembly with cache discipline.**
+**Composed prompt with cache discipline.** The system prompt is a `ComposedPrompt` (`context.rs`):
+typed, ordered slots composed **once per session** and rendered byte-for-byte the same every turn.
 
 ```rust
-struct PromptAssembler {
-    stable: StablePrefix,        // identity + tool defs + skills index — byte-stable, cached
-    blocks: Vec<PromptBlock>,    // stable-tier contributions (e.g. memory instructions)
-    recalled: Vec<RecalledBlock>,// volatile-tier (memory recall, timestamp)
-    body: Conversation,          // owned/compacted by the ContextEngine
-}
+// The fixed slot order IS the composition contract (SlotKind::ORDER).
+pub enum SlotKind { Identity, Guidance, ContextFiles, SkillsIndex, MemoryBlock, UserProfile, Stamp }
+pub struct ComposedPrompt { /* at most one Slot { kind, text } per kind, held in ORDER */ }
+
+// Per-turn ephemera never enter the system prompt or the durable Conversation: they append to
+// the LAST user message of the OUTGOING Request only.
+pub struct TurnInjection { recalled: Vec<String>, nudges: Vec<String> }
 ```
 
-Contributions are **typed by cache tier**, so a volatile memory recall can never invalidate the
-stable prefix cache — the bug class `hermes-agent` avoids only by convention
-([`hermes-memory-context-ecosystem.md`](../../../../docs/research/hermes/hermes-memory-context-ecosystem.md) §3.4). `prompt.rs` holds
-`SystemPromptParts { stable, context, volatile }`, a `CachedSystemPrompt`, and
-`PromptInvalidationReason`; the rendered stable prefix is cached on the agent and rebuilt only on
-`/new`, compaction, or explicit invalidation. Provider-specific cache markers (Anthropic) are applied
-at the transport edge.
+Slot *content* is supplied by source seams captured once at composition time — the persona seeds
+`Identity`; `ContextEngine::guidance_block` plus the `StablePromptSource` / `ModelPromptSource`
+(re-keyed on the live model id) / `AsyncPromptSource` (gathered over the session's
+`ExecutionEnvironment`) blocks fill `Guidance`/`ContextFiles`/`SkillsIndex`/`UserProfile`; and each
+`MemoryProvider::prompt_block` fills `MemoryBlock` (the `daemon-prompt` crate provides the concrete
+persona, guidance-library, context-file, and user-profile sources). Because everything durable folds
+here and nothing volatile does, a memory recall can never invalidate the cached prefix — the bug
+class `hermes-agent` avoids only by convention
+([`hermes-memory-context-ecosystem.md`](../../../../docs/research/hermes/hermes-memory-context-ecosystem.md) §3.4).
+
+Recomposition happens **only** at defined boundaries: session start; session resume (the stored
+`ComposedPrompt` is restored **byte-identical** off the durable `Snapshot`, or recomposed when the
+runtime model identity is stale — the live `/model` switch); and a model switch at a turn boundary.
+Source edits (skills, persona/SOUL.md, USER.md) take effect at the *next* session — the Hermes cache
+invariant — and compaction never touches the system prefix. Per-turn recall and nudges ride the
+`TurnInjection` instead: the `NudgeSource` seam (consulted with `NudgeCx { user_turns, origin }`,
+so cadence reminders like the USER.md save nudge self-hydrate from the conversation's user-turn
+count) contributes turn text that is appended to the outgoing request's last user message and never
+persisted. The one-shot turn `origin` is armed on the `Engine` (`set_next_origin`, fed from the
+actor's `start_turn_from`) so an origin-aware source keys on exactly the submit that opened the turn.
+
+Cache breakpoints are placed **after** the final system string is assembled: `mark_cache_breakpoints`
+(`provider.rs`) implements Hermes' `system_and_3` policy — the tools+system prefix plus the last 3
+messages, capped at the 4-breakpoint Anthropic maximum, all sharing the request's `CacheTtl` (5m
+default, 1h option). `build_context` marks none (the engine does it once the composed prompt is
+folded into `Request.system`), and providers without explicit prefix caching ignore the markers.
+Anthropic `cache_control` ephemeral blocks + the OpenAI `prompt_cache_key` are mapped at the `genai`
+transport edge; local mistral.rs/llama.cpp engines reuse the KV/prefix themselves.
+`ComposedPrompt::report()` gives per-slot byte attribution for tests and tracing only — it is never
+on the wire.
 
 `context_refs.rs` ports `@`-reference expansion with token budgets and path/read safety (P2, or P1
 if coding workflows depend on it).
@@ -910,10 +938,11 @@ typed context to `call_tool`, LCM's tools get the live conversation cleanly. The
 
 **Priority.** P0 for the `ContextEngine` trait + error-driven compaction retry and at least a
 summarizing strategy. P1 for full anti-thrash/preflight/mid-turn triggers and session rotation/locks.
-The tiered `PromptAssembler` (stable / blocks / recalled / body) and prefix-cache discipline have
-**landed** — cache-stable stable-tier sources (memory `prompt_block`, the skills index) fold into a
-byte-stable prefix, and the engine's `mark_cache_breakpoints` drives Anthropic `cache_control` + an
-OpenAI `prompt_cache_key` (local engines reuse the KV/prefix). P2 for `@`-references.
+The `ComposedPrompt` composer + `TurnInjection` + prefix-cache discipline have **landed** — cache-
+stable sources (persona, guidance, context files, skills index, memory `prompt_block`, user-profile
+snapshot) fold into a byte-stable prefix composed once per session, per-turn recall/nudges ride the
+`TurnInjection`, and `mark_cache_breakpoints` drives the `system_and_3` Anthropic `cache_control` +
+OpenAI `prompt_cache_key` mapping (local engines reuse the KV/prefix). P2 for `@`-references.
 
 **Acceptance.** A long session compresses into a structured summary preserving active task, completed
 actions, pending asks, files, and decisions; tool-call/result pairs cannot be split; the stable
@@ -976,15 +1005,15 @@ sequenceDiagram
   participant L as Agent loop
   participant M as MemoryProvider(s)
   participant E as ContextEngine
-  participant A as PromptAssembler
-  L->>M: recall(query) -> volatile block(s)
+  participant A as assemble() (ComposedPrompt + TurnInjection)
+  L->>M: recall(query) -> per-turn block(s) into TurnInjection
   L->>E: before_turn(conv) -> Pressure
   alt over budget
     L->>M: before_compact(conv)
     L->>E: compact(conv, budget)
   end
-  L->>A: assemble(stable + blocks + recalled + body)
-  A-->>L: prompt
+  L->>A: Request.system = ComposedPrompt (once/session); TurnInjection -> last user msg
+  A-->>L: request
   Note over L: LLM call + tool execution (engine/memory tools dispatch with typed ToolCx)
   L->>M: after_turn(turn, conv)
   L->>E: after_response(usage)
@@ -1755,10 +1784,14 @@ acceptance criteria. Each phase is shippable.
 > + builtin `FileMemory`), and a networked `GenAiProvider` in `daemon-providers` — one `genai`
 > native-protocol client over OpenAI/Anthropic/Gemini/Groq/… under our `Provider` trait, with native
 > tool JSON-Schema + `tool_call_id` round-tripping (config-selected; Mock is the zero-config default).
-> **Prompt caching + tiered assembly have landed**: the tiered `PromptAssembler` (stable / blocks /
-> recalled / body) folds cache-stable sources (memory `prompt_block`, skills index) into a byte-stable
-> prefix, and `mark_cache_breakpoints` drives Anthropic `cache_control` ephemeral blocks + an OpenAI
-> `prompt_cache_key` (the local mistral.rs/llama.cpp engines reuse the KV/prefix themselves).
+> **Prompt caching + composed assembly have landed**: the `ComposedPrompt` composer folds cache-stable
+> sources (persona/SOUL.md, guidance library, workspace context files, skills index, memory
+> `prompt_block`, user-profile/USER.md snapshot) into a typed-slot, byte-stable prefix built once per
+> session, with per-turn recall/nudges carried on an ephemeral `TurnInjection` (never the prefix,
+> never the durable conversation); `mark_cache_breakpoints` applies the `system_and_3` policy driving
+> Anthropic `cache_control` ephemeral blocks + an OpenAI `prompt_cache_key` (the local
+> mistral.rs/llama.cpp engines reuse the KV/prefix themselves). The prompt *content* + node-owned
+> stores live in the sibling `crates/prompt/daemon-prompt`.
 > **Checkpoint/rewind** (§12) has also landed (git-first/snapshot `CheckpointStore` + conversation
 > `RewindTo`/`Rewound`). **Still deferred**: the deep summary-DAG / embedding memory store, parallel
 > tool batching (§12), and remote exec backends (§13, P3).
