@@ -20,10 +20,11 @@ Green baseline — no pre-existing failures.
 ## Current state (this branch)
 
 ```
-test result: ok. 250 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 252 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-All Wave 1 P0 gaps are closed (green). No `gap-open` (deliberately-left-red) tests remain.
+All Wave 1 (P0) and Wave 2 (P1) gaps are closed (green). No `gap-open` (deliberately-left-red)
+tests remain.
 
 ## Status legend
 
@@ -235,7 +236,157 @@ partial-tool sections of `tests/run_agent/test_streaming.py`.
 
 ---
 
+## Wave 2 (P1)
+
+Priorities 1–7 from the wave-2 scope. Each pointer was verified against the actual Hermes source
+before porting. Where a behavior turned out to live in the provider transport / CLI / node-config
+layer rather than the engine (`daemon-core`), it is recorded `out-of-scope` with a pointer instead
+of crossing the crate boundary (the superproject invariant: the node decides transport/config, the
+engine drives the turn).
+
+### 1. Provider fallback chains — `src/engine.rs` (`call_model` `RecoveryStep::Fallback`)
+
+Source: `tests/run_agent/test_provider_fallback.py`; impl `run_agent.py:4243` (`_try_activate_fallback`
+→ `agent/chat_completion_helpers.py:1045` `try_activate_fallback`).
+
+The engine-side intent — *primary profile errors → hop to the fallback profile and continue the same
+turn with the conversation intact; the fallback serves the final response* — is already implemented
+(`call_model`'s `RecoveryStep::Fallback` swaps `self.profile` to `fallback_profile` with a fresh
+retry budget) and covered by `fallback_profile_hops_credential_profile` (acquires primary, then
+fallback; completes with the fallback's response; the user turn is untouched). The rest of the Python
+file is provider-client resolution, not engine logic.
+
+| Source test | Status | Reason |
+|---|---|---|
+| `TestFallbackChainAdvancement::*` (hop → continue → complete on fallback) | already-covered | `fallback_profile_hops_credential_profile` proves the hop + same-turn continuation + which profile served the final response |
+| `TestFallbackChainInit::*` (list-vs-dict `fallback_model`, filter invalid entries) | out-of-scope | `_fallback_chain` config parsing lives in `run_agent.__init__`; the Rust engine models a single `EngineProfile::with_fallback_profile` (chain length = 1). Chain config is a node/config concern |
+| `TestFallbackChainDedup::*` (skip self-matching provider/model/base_url) | out-of-scope | provider-client identity dedup (`resolve_provider_client`, base_url compare) is `daemon-providers`/config, not the profile-hop engine |
+| `TestPoolRotationRoom::*` (`_pool_may_recover_from_rate_limit`) | out-of-scope | credential-pool rotation-room heuristic; the Rust `Recovery::Rotate`→`Recovery::Fallback` budget escalation (`recovery.rs::decide`) is the engine analog and is unit-tested (`decide_bounds_by_budget`) |
+| `try_activate_fallback` client swap (api_mode detection, Anthropic/OpenAI client build, pool clear) | out-of-scope | transport-layer client construction (`daemon-providers`) |
+| user-facing "trying fallback…" status | out-of-scope | Hermes buffers a CLI `vprint` status; the daemon-core wire signal is the completed `TurnFinished`, and the profile hop is silent by design (no per-hop `AgentEvent`) |
+
+### 2. Steering — `src/engine.rs` (`boundary`, `push_steer_marker`)
+
+Source: `tests/run_agent/test_steer.py`; impl `agent/agent_runtime_helpers.py`
+(`apply_pending_steer_to_tool_results`) + `run_agent.py` (`steer` / `_drain_pending_steer` /
+`clear_interrupt`).
+
+The engine already drains queued steers at each phase boundary, appends an out-of-band `[steer]`
+marker into the conversation, and acks each with `AgentEvent::Steered` (covered by
+`steer_drained_appends_marker_and_acks`). The one behavior that was **missing**: an interrupt must
+supersede a pending steer.
+
+| Source test | Status | Rust test | Reason |
+|---|---|---|---|
+| `TestSteerClearedOnInterrupt::test_clear_interrupt_drops_pending_steer` | gap-closed (red `223a672`, green `0cad275`) | `interrupt_supersedes_pending_steer` | a steer queued while the turn is cancelling is dropped (not appended) and acked `accepted=false` |
+| `TestSteerInjection::*` (append to last tool result), `TestPreApiCallSteerDrain::*` | ported-pass (adapted) | `steer_drained_appends_marker_and_acks` | Rust appends an out-of-band `[steer]` **user marker** at the boundary rather than mutating the last tool-result content — same intent (cache-safe out-of-band injection the model trusts), different carrier |
+| `TestSteerAcceptance::*` (reject empty/whitespace/None, strip, concatenate) | out-of-scope | steer *text validation* (empty/whitespace rejection, `\n`-join of repeated steers) is the actor/control-layer submit path; the engine consumes already-validated `SteerReq`s off `TurnControl`. Repeated steers queue as separate markers (merged by the §-repair user-merge) rather than one `\n`-joined buffer |
+| `TestSteerThreadSafety`, `TestSteerMarkerContract`, `TestSteerCommandRegistry` | out-of-scope | `_pending_steer_lock` threading, `STEER_MARKER`/system-prompt-note contract, and CLI `/steer` command registration are CLI/gateway concerns, not the engine turn loop |
+
+Adaptation: Hermes stores one mutable `_pending_steer` string cleared by `clear_interrupt`; the Rust
+engine keeps steers on the shared `TurnControl` queue and the *boundary* drops them when cancelling —
+the same "interrupt beats a queued steer" invariant, expressed against the typed control surface.
+
+### 3. Stream-interrupt retry — `src/engine.rs` (`call_model` recovery loop)
+
+Source: `tests/run_agent/test_stream_interrupt_retry.py`; impl `run_agent.py`
+(`_interruptible_streaming_api_call` — `_interrupt_requested` check at the top of the retry loop).
+
+`drive_model_call` (recovery.rs) already aborts a *single* stream on cancel (biased `select!` on the
+cancel token — `cancel_aborts_stream`). The gap was one level up: the §8 recovery **loop** in
+`call_model` retried after a transient failure without re-checking cancellation, so a `/stop` that
+arrived while a transient error was being handled still acquired a fresh credential and served out
+the backoff before the next attempt observed the cancel.
+
+| Source test | Status | Rust test | Reason |
+|---|---|---|---|
+| `TestStreamInterruptBeforeRetry::test_interrupt_prevents_stream_retry` | gap-closed (red `3ac2e6a`, green `d61ab4e`) | `interrupt_aborts_model_retry_loop` | a cancel observed between attempts aborts before the fresh credential acquire / provider re-invocation |
+| `test_interrupt_before_first_attempt` | already-covered | (`interrupt_at_boundary_finalizes_interrupted`) | a pre-cancelled turn never reaches `call_model` (the opening `boundary` finalizes interrupted) |
+| `test_normal_retry_still_works_without_interrupt` | already-covered | (`rate_limit_retries_with_backoff_then_completes`) | transient retries still succeed when not cancelled |
+| partial-delta stream assembly (concatenating streamed tool-call deltas) | out-of-scope | (as recorded in Wave 1 §5d) the Rust `drive_model_call` consumes a fully-assembled `ModelOutput`; delta assembly is the `daemon-providers` transport layer |
+
+The green commit also made the backoff sleep itself interruptible (`select!` on the cancel token),
+so a long `Retry-After` wait aborts immediately rather than serving out the full delay — the faithful
+port of Hermes' "exit immediately instead of retrying/serving the read-timeout."
+
+### 4. Anthropic prompt-cache policy — `src/provider.rs` (`mark_cache_breakpoints`)
+
+Source: `tests/run_agent/test_anthropic_prompt_cache_policy.py`; impl
+`agent/prompt_caching.py:49` (`apply_anthropic_cache_control`) + `run_agent`
+(`_anthropic_prompt_cache_policy`).
+
+The **placement** policy (the daemon-core part) — hermes' `system_and_3`: up to 4 breakpoints,
+tools+system prefix + last 3 messages, marked after the composed system is folded, all-to-messages
+when the system is empty — is fully implemented in `mark_cache_breakpoints` and already covered.
+
+| Source behavior | Status | Rust test | Reason |
+|---|---|---|---|
+| `system_and_3` placement: system + last 3 messages, 4-breakpoint budget | already-covered | `provider::cache_tests::{system_and_3_marks_system_plus_last_three, system_and_3_caps_at_four_breakpoints_total, empty_system_gives_all_four_slots_to_messages}` + engine `assembled_request_carries_post_fold_breakpoints_and_ttl` | the placement rules the audit lists |
+| system-prompt byte-stability (breakpoints marked post-fold) | already-covered | engine `request_system_is_byte_stable_across_turns`, `assembled_request_carries_post_fold_breakpoints_and_ttl` | `mark_cache_breakpoints` runs after the composed system is assembled |
+| `_anthropic_prompt_cache_policy` matrix — `(should_cache, use_native_layout)` by provider / base_url / api_mode / model (OpenRouter envelope vs native, MiniMax/Qwen/opencode allowlists, third-party gateways, OpenAI-wire blocklist, switch/fallback overrides) | out-of-scope | the *whether/which-layout* decision is provider-transport identity (`daemon-providers`): daemon-core places breakpoints; the networked provider decides if the wire honors them and in which layout |
+
+### 5. Unicode / adversarial payload sanitization
+
+Source (audit pointer `tests/test_message_sanitization.py` does not exist; the real files are)
+`tests/run_agent/test_unicode_ascii_codec.py` + `tests/cli/test_surrogate_sanitization.py`; impl
+`run_agent.py` (`_strip_non_ascii`, `_sanitize_messages_non_ascii`, `_sanitize_messages_surrogates`,
+`_sanitize_structure_non_ascii`, `_sanitize_tools_non_ascii`).
+
+Verified against source: this is **transport-encoding recovery**, not decode-boundary adversarial
+sanitization. `_sanitize_messages_*` strip non-ASCII / replace surrogates on the request
+payload+headers only when httpx raises `UnicodeEncodeError` on an ASCII locale (`LANG=C`, issue
+#6843) — it runs in the request-send/retry path and mutates the OpenAI/Anthropic client's `api_key`,
+`api_messages`, `api_kwargs`. There is no Hermes rule that strips zero-width/bidi/control characters
+at a daemon-core decode boundary; the daemon-core repair modules (`repair/tool_arg.rs`,
+`repair/tool_error.rs`, `repair/content.rs`) already handle the control-char/ANSI/`<think>` cases the
+model output actually carries (Wave 1).
+
+| Source behavior | Status | Reason |
+|---|---|---|
+| `_strip_non_ascii` / `_sanitize_messages_non_ascii` / `_sanitize_tools_non_ascii` / `_sanitize_structure_non_ascii` | out-of-scope | ASCII-locale `UnicodeEncodeError` recovery in the request-send path — `daemon-providers` transport, keyed on the SDK client + headers the engine never sees |
+| `_sanitize_messages_surrogates` (`\ud800` → `\ufffd`) | out-of-scope | surrogate scrub on the outgoing payload, same transport-encoding path |
+| control-char / ANSI / role-tag / `<think>` scrubbing on model output | already-covered | Wave 1 `repair/tool_arg.rs`, `repair/tool_error.rs`, `repair/content.rs` |
+
+### 6. Budget-pressure notices — `src/engine.rs` (`finish_budget_exhausted`)
+
+Source: `tests/run_agent/test_iteration_budget_race.py`; impl `run_agent.py` (`IterationBudget`,
+`_budget_reminder_text`).
+
+The engine-side intent — *the iteration budget is a hard stop, preceded by one final toolless
+"grace" summary call, then the turn ends `BudgetExhausted`* — is implemented in
+`finish_budget_exhausted` and covered.
+
+| Source behavior | Status | Rust test | Reason |
+|---|---|---|---|
+| iteration budget hard stop + one grace (toolless summary) call | already-covered | `iteration_budget_exhaustion_ends_with_summary` | budget exhaustion runs the tool `max_iterations` times, then one summary round, then ends `BudgetExhausted` |
+| `IterationBudget` consume/refund/remaining/used + thread safety | out-of-scope | Hermes' `IterationBudget` is a shared, lock-guarded counter across worker threads; the Rust engine uses a single-owner local `rounds_left: u32` in `run_turn` (no shared budget object, no lock — no data race to test) |
+| user-visible `_budget_reminder_text` ("budget exhausted… send `continue`") | out-of-scope | CLI/gateway reminder prose; the daemon-core wire signal is the `TurnFinished { end_reason: BudgetExhausted }` the client renders |
+
+### 7. Toolset composition
+
+Source: `tests/test_toolsets.py`; impl `toolsets.py` (`resolve_toolset`, `resolve_multiple_toolsets`,
+`get_toolset`, cycle detection, `create_custom_toolset`, `hermes-*` platform base toolsets).
+
+`daemon-core`'s tool layer is a flat `ToolRegistry` (register-by-name, last-writer-wins, offered set
+gated by `tool_search_threshold_bytes`). Toolset *composition* — named toolsets, `includes`
+resolution with cycle detection, platform base-toolset inheritance, enable/disable lists, `all`/`*`
+aliases, registry-snapshot membership — has no daemon-core surface: the node/config layer builds the
+`ToolRegistry` an engine (or a constrained subsystem child) is constructed with. This matches
+`EngineProfile::with_registry` ("constrain a background-review child to a skills-only / memory-only
+toolset") — composition is decided outside the engine.
+
+| Source test | Status | Reason |
+|---|---|---|
+| `TestResolveToolset` / `TestResolveMultipleToolsets` (includes, cycle detection, union/dedup, `all`/`*`) | out-of-scope | toolset graph resolution is node/config; the engine receives an already-resolved `ToolRegistry` |
+| `TestGetToolset` / `TestRegistryOwnedToolsets` / `TestPluginToolsets` (live registry membership, plugin toolsets) | out-of-scope | `tools.registry` snapshot + plugin discovery is the host tool-plumbing layer |
+| `TestToolsetConsistency::test_hermes_platforms_share_core_tools` (platform base toolset) | out-of-scope | `hermes-*` platform toolset definitions live in `toolsets.py`; the node picks the platform registry per surface |
+| within-registry dedup (register same name twice → one tool) | already-covered | `tools.rs` `ToolRegistry` unit tests (register-by-name map) |
+
+---
+
 ## Summary
+
+### Wave 1 (P0)
 
 - **gap-closed: 5 behavior areas** (33 individual source-test rows) — tool-argument repair, tool-name
   repair, tool-error sanitization, message-sequence user-merge, tool-call dedup.
@@ -246,6 +397,22 @@ partial-tool sections of `tests/run_agent/test_streaming.py`.
 - **out-of-scope:** tool-error Python envelope + dispatcher integration (3), message-sequence system
   message / scaffolding stripper / flush-cursor (3), streaming partial-delta assembly (1).
 - **unportable-no-API:** `None`-typed inputs for both repair functions (2).
+- **gap-open: 0** — no deliberately-left-red tests remain.
+
+### Wave 2 (P1)
+
+- **gap-closed: 2 behaviors** — (2) interrupt supersedes a pending steer (`223a672`→`0cad275`);
+  (3) interrupt aborts the model-call recovery loop (`3ac2e6a`→`d61ab4e`).
+- **already-covered:** (1) fallback profile hop + same-turn continuation; (3) pre-cancel + normal
+  retry; (4) `system_and_3` breakpoint placement + system byte-stability; (6) budget grace call +
+  hard stop; (7) within-registry name dedup.
+- **out-of-scope (provider transport / CLI / node-config layer):** (1) `_fallback_chain` config,
+  skip-self dedup, `resolve_provider_client`, pool rotation-room, CLI fallback status; (2) steer
+  text validation + `/steer` command registry + marker contract + thread-safety; (3) partial-delta
+  stream assembly; (4) `_anthropic_prompt_cache_policy` should-cache/native-layout matrix;
+  (5) ASCII-locale `UnicodeEncodeError` / surrogate payload sanitization (transport-encoding
+  recovery, not a decode-boundary rule); (6) `IterationBudget` shared-counter thread-safety +
+  `_budget_reminder_text`; (7) toolset graph resolution / includes / platform base toolsets.
 - **gap-open: 0** — no deliberately-left-red tests remain.
 
 ### Regressions hit while implementing (all resolved)
@@ -259,7 +426,11 @@ partial-tool sections of `tests/run_agent/test_streaming.py`.
 - `parallel_tool_batch_runs_concurrently` used two identical `(para, {})` calls; the new tool-call
   dedup collapsed them. Fixed by giving them distinct args (dedup green commit `3078303`).
 
+Wave 2 introduced no regressions: the two engine changes (`boundary` steer-on-cancel;
+`call_model` cancel-check + interruptible backoff) are cancel-path-only, so the existing 250 tests
+stayed green throughout (250 → 251 → 252 as each gap closed).
+
 ### Scope not reached
 
-None — all Wave 1 (P0) items 1–5 were addressed (implemented, ported, or explicitly recorded as
-already-covered / out-of-scope above).
+None — all Wave 1 (P0) items 1–5 and Wave 2 (P1) items 1–7 were addressed (implemented, ported, or
+explicitly recorded as already-covered / out-of-scope above).
