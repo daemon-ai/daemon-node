@@ -23,17 +23,19 @@ use async_trait::async_trait;
 use daemon_api::{
     AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiError, ChannelJoinDetails,
     ConnectionState, ContactInfo, ContactsOps, ConvSendArgs, ConversationInfo, ConversationOps,
-    CreateConversationDetails, MemberBanArgs, MemberInviteArgs, MemberRemoveArgs,
-    MemberSetRoleArgs, MembershipOps, MessagingProtocol, NodeApi, Participant, PresenceState,
-    SupportsContacts, SupportsConversations, SupportsDirectory, SupportsMembership,
-    TransportAdapter, TransportInstanceInfo,
+    CreateConversationDetails, FileTransfer, FileTransferOps, MemberBanArgs, MemberInviteArgs,
+    MemberRemoveArgs, MemberSetRoleArgs, MembershipOps, MessagingProtocol, NodeApi, Participant,
+    PresenceState, SupportsContacts, SupportsConversations, SupportsDirectory,
+    SupportsFileTransfer, SupportsMembership, TransportAdapter, TransportInstanceInfo,
 };
-use daemon_host::AccountProvisioning;
+use daemon_host::{AccountProvisioning, BlobStore};
 use daemon_protocol::TransportId;
 
+use matrix_sdk::ruma::api::client::authenticated_media::get_content;
+use matrix_sdk::ruma::api::client::media::create_content;
 use matrix_sdk::ruma::api::client::room::{create_room, Visibility};
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-use matrix_sdk::ruma::{Int, OwnedUserId, RoomId, RoomOrAliasId, UserId};
+use matrix_sdk::ruma::{Int, MxcUri, OwnedUserId, RoomId, RoomOrAliasId, UserId};
 use matrix_sdk::{Client, Room};
 
 use crate::mapping::{contact_from, role_to_power, room_to_info};
@@ -52,6 +54,10 @@ pub struct MatrixAdapter {
     /// The node-owned lifecycle sink (wire v30): the adapter reports conversation/membership changes
     /// and disconnect causes through it. `None` in unit tests that never wire the node.
     sink: Option<Arc<dyn daemon_api::LifecycleSink>>,
+    /// The node content store, for [`SupportsFileTransfer`] (W2-H): `send` reads a blob's bytes to
+    /// upload to the Matrix content repo, `receive` stores downloaded bytes back. `None` ⟹ the
+    /// feature is absent (`file_transfer()` returns `None`).
+    blobs: Option<Arc<dyn BlobStore>>,
 }
 
 impl MatrixAdapter {
@@ -69,6 +75,24 @@ impl MatrixAdapter {
             cfg,
             clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             sink,
+            blobs: None,
+        })
+    }
+
+    /// Like [`new`](Self::new), but wires the node content store so [`SupportsFileTransfer`] (W2-H)
+    /// is advertised + operable (media upload for send, download for receive).
+    pub fn with_blobs(
+        provisioning: Arc<dyn AccountProvisioning>,
+        cfg: MatrixConfig,
+        sink: Option<Arc<dyn daemon_api::LifecycleSink>>,
+        blobs: Arc<dyn BlobStore>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            provisioning,
+            cfg,
+            clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            sink,
+            blobs: Some(blobs),
         })
     }
 
@@ -219,6 +243,80 @@ impl MessagingProtocol for MatrixAdapter {
 
     fn directory(self: Arc<Self>) -> Option<Arc<dyn SupportsDirectory>> {
         Some(self)
+    }
+
+    fn file_transfer(self: Arc<Self>) -> Option<Arc<dyn SupportsFileTransfer>> {
+        // Present only when the node content store is wired (W2-H); absent ⟹ `None`, so the
+        // ops-vs-behavior invariant sees no advertised (yet unimplemented) file-transfer verbs.
+        if self.blobs.is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+#[async_trait]
+impl SupportsFileTransfer for MatrixAdapter {
+    fn supported(&self) -> FileTransferOps {
+        // Reachable only when `blobs` is wired (see `file_transfer()`); both verbs are then live.
+        FileTransferOps {
+            send: self.blobs.is_some(),
+            receive: self.blobs.is_some(),
+        }
+    }
+
+    async fn send(&self, transport: TransportId, transfer: FileTransfer) -> Result<(), ApiError> {
+        // Media upload: read the blob's bytes from the node store and upload them to the Matrix
+        // content repository (`POST /_matrix/media/v3/upload`).
+        let blobs = self
+            .blobs
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("file_transfer_send".into()))?;
+        let client = self.client_for(&transport).await?;
+        let bytes = blobs
+            .get(&transfer.blob.hash, None)
+            .await
+            .map_err(|e| ApiError::Other(format!("matrix file transfer send (blob): {e}")))?;
+        let mut request = create_content::v3::Request::new(bytes);
+        request.content_type = transfer
+            .content_type
+            .clone()
+            .or_else(|| transfer.blob.mime.clone());
+        client
+            .send(request)
+            .await
+            .map(|_| ())
+            .map_err(|e| ApiError::Other(format!("matrix media upload: {e}")))
+    }
+
+    async fn receive(
+        &self,
+        transport: TransportId,
+        transfer: FileTransfer,
+    ) -> Result<(), ApiError> {
+        // Media download: fetch the remote `mxc://` content and store it back into the node blob
+        // store (`GET /_matrix/client/v1/media/download/...`).
+        let blobs = self
+            .blobs
+            .as_ref()
+            .ok_or_else(|| ApiError::Unsupported("file_transfer_receive".into()))?;
+        let client = self.client_for(&transport).await?;
+        let source = transfer.source.as_deref().ok_or_else(|| {
+            ApiError::Other("matrix file transfer receive requires a source mxc:// uri".into())
+        })?;
+        let mxc = <&MxcUri>::from(source);
+        let request = get_content::v1::Request::from_uri(mxc)
+            .map_err(|e| ApiError::Other(format!("invalid matrix mxc uri {source}: {e}")))?;
+        let resp = client
+            .send(request)
+            .await
+            .map_err(|e| ApiError::Other(format!("matrix media download: {e}")))?;
+        blobs
+            .put(&resp.file)
+            .await
+            .map(|_| ())
+            .map_err(|e| ApiError::Other(format!("matrix file transfer receive (blob): {e}")))
     }
 }
 
