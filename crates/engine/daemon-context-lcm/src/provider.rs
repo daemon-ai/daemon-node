@@ -3714,6 +3714,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // parity: engine.py::test_existing_session_restart_skips_stale_short_snapshot_with_externalized_head_payload (tests/test_lcm_engine.py:2185)
+    #[tokio::test]
+    async fn parity_gap_restart_stale_snapshot_with_externalized_head_payload_is_skipped() {
+        let dir = reconcile_dir("stale-externalized-head");
+        let cfg = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            large_output_externalization_enabled: true,
+            ..LcmConfig::default()
+        };
+        let data_uri = format!("data:image/png;base64,{}", "QUJDREVGRw==".repeat(500));
+        let head_user = format!("old startup image {data_uri}");
+        persist_durable_turns(&cfg, "s1", |c| {
+            c.push_user(UserMsg::new(head_user.clone()));
+            c.push_assistant(AssistantMsg::text("old startup answer"));
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable tail message {i}")));
+            }
+        })
+        .await;
+        // The head row was externalized at the write boundary.
+        {
+            let probe = LcmContextEngine::open_for_session(
+                cfg.clone(),
+                &SessionId::new("probe"),
+                aux_with("s"),
+            )
+            .unwrap();
+            let rows = probe.store().session_messages("s1").unwrap();
+            assert_eq!(rows.len(), 82);
+            let head = rows[0].content.as_deref().unwrap();
+            assert!(
+                head.contains("[Externalized LCM ingest payload:"),
+                "head externalized: {head}"
+            );
+            assert!(!head.contains(&data_uri));
+        }
+        // Restart with a stale short snapshot re-supplying the raw head (inline payload intact).
+        // Identity restoration must recognize it as the externalized durable head and skip it.
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg.clone(), &SessionId::new("s1"), aux_with("s"))
+                .unwrap();
+        lcm2.on_model(&model());
+        let mut stale = Conversation::new(SystemPrompt::new("You are concise."));
+        stale.push_user(UserMsg::new(head_user.clone()));
+        stale.push_assistant(AssistantMsg::text("old startup answer"));
+        lcm2.before_turn(&mut stale, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len(),
+            82,
+            "the stale externalized-head snapshot is skipped, not duplicated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // parity: engine.py::test_restart_reconciliation_filtered_prefix_does_not_create_stale_proof (tests/test_lcm_engine.py:2487)
+    #[tokio::test]
+    async fn parity_gap_restart_filtered_prefix_does_not_create_stale_proof() {
+        let dir = reconcile_dir("filtered-prefix-stale");
+        let base = LcmConfig {
+            data_dir: dir.clone(),
+            bank: "default".to_string(),
+            ..LcmConfig::default()
+        };
+        persist_durable_turns(&base, "s1", |c| {
+            c.push_user(UserMsg::new("Cronjob Response: heartbeat"));
+            c.push_user(UserMsg::new("real prefix question"));
+            c.push_assistant(AssistantMsg::text("real prefix answer"));
+            for i in 0..80 {
+                c.push_user(UserMsg::new(format!("durable tail after filter {i}")));
+            }
+        })
+        .await;
+        let durable = 83;
+        // Incarnation 2 enables the ignore filter. The delta repeats what is now the *visible*
+        // durable head — but the stale-snapshot proof must use the RAW durable prefix (the cron
+        // row included), so this batch stays ambiguous and is preserved.
+        let cfg2 = LcmConfig {
+            ignore_message_patterns: vec!["^Cronjob Response:".to_string()],
+            ..base.clone()
+        };
+        let lcm2 =
+            LcmContextEngine::open_for_session(cfg2, &SessionId::new("s1"), aux_with("s")).unwrap();
+        lcm2.on_model(&model());
+        let mut replay = Conversation::new(SystemPrompt::new("You are concise."));
+        replay.push_user(UserMsg::new("real prefix question"));
+        replay.push_assistant(AssistantMsg::text("real prefix answer"));
+        lcm2.before_turn(&mut replay, None);
+        let rows = lcm2.store().session_messages("s1").unwrap();
+        assert_eq!(
+            rows.len() as i64,
+            durable + 2,
+            "filtered history must not create stale-replay proof"
+        );
+        assert_eq!(
+            rows[rows.len() - 2].content.as_deref(),
+            Some("real prefix question")
+        );
+        assert_eq!(
+            rows[rows.len() - 1].content.as_deref(),
+            Some("real prefix answer")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn durable_engine(tag: &str, fresh_tail: usize) -> (LcmContextEngine, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("lcm-op-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
