@@ -80,8 +80,12 @@ async fn serve_session(api: &dyn SessionApi, req: ApiRequest) -> Option<ApiRespo
         ApiRequest::SessionHistory {
             session,
             after_cursor,
+            before_cursor,
             max,
-        } => ApiResponse::Journal(api.session_history(session, after_cursor, max).await),
+        } => ApiResponse::Journal(
+            api.session_history(session, after_cursor, before_cursor, max)
+                .await,
+        ),
         ApiRequest::Subscribe {
             session,
             after_seq,
@@ -219,7 +223,9 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         // -- notifications (W2-G; wire v37) ---------------------------------------------------
         ApiRequest::NotificationList => ApiResponse::Notifications(api.notification_list().await),
         // -- persons / metacontacts (W3-J; wire v37) ------------------------------------------
-        ApiRequest::PersonList => ApiResponse::Persons(api.person_list().await),
+        ApiRequest::PersonList { since_rev } => {
+            ApiResponse::Persons(api.person_list(since_rev).await)
+        }
         _ => return None,
     })
 }
@@ -242,8 +248,12 @@ async fn serve_fleet(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> 
         ApiRequest::UnitHistory {
             unit,
             after_cursor,
+            before_cursor,
             max,
-        } => ApiResponse::Journal(api.unit_history(unit, after_cursor, max).await),
+        } => ApiResponse::Journal(
+            api.unit_history(unit, after_cursor, before_cursor, max)
+                .await,
+        ),
         ApiRequest::Pause { unit } => unit_or_err(api.pause(unit).await),
         ApiRequest::Resume { unit } => unit_or_err(api.resume(unit).await),
         ApiRequest::Scale { unit, n } => unit_or_err(api.scale(unit, n).await),
@@ -486,9 +496,11 @@ async fn serve_routing(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
 /// Messaging surface: conversations, membership, contacts, directory.
 async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
     Some(match req {
-        ApiRequest::ConvList { transport, after } => {
-            ApiResponse::Conversations(api.conv_list(transport, after).await)
-        }
+        ApiRequest::ConvList {
+            transport,
+            after,
+            since_rev,
+        } => ApiResponse::Conversations(api.conv_list(transport, after, since_rev).await),
         ApiRequest::ConvGet { transport, conv } => {
             ApiResponse::Conversation(api.conv_get(transport, conv).await)
         }
@@ -551,9 +563,11 @@ async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespon
             api.directory_search(transport, query).await,
             ApiResponse::Contacts,
         ),
-        ApiRequest::RosterList { transport, after } => {
-            ApiResponse::ContactPage(api.roster_list(transport, after).await)
-        }
+        ApiRequest::RosterList {
+            transport,
+            after,
+            since_rev,
+        } => ApiResponse::ContactPage(api.roster_list(transport, after, since_rev).await),
         ApiRequest::RosterAdd { transport, contact } => {
             unit_or_err(api.roster_add(transport, contact).await)
         }

@@ -1296,7 +1296,7 @@ impl ControlApi for NodeApiImpl {
         // (2) close conversations (best-effort; adapters that do not support leave are skipped).
         let mut after: Option<String> = None;
         loop {
-            let page = self.conv_list(transport.clone(), after.take()).await;
+            let page = self.conv_list(transport.clone(), after.take(), None).await;
             for conv in &page.items {
                 let _ = self.conv_leave(transport.clone(), conv.id.clone()).await;
             }
@@ -1327,7 +1327,17 @@ impl ControlApi for NodeApiImpl {
         &self,
         transport: TransportId,
         after: Option<String>,
+        since_rev: Option<u64>,
     ) -> daemon_api::ConvPage {
+        // rung 2 delta read (the SessionsQuery template, control.rs `sessions_query`): when
+        // `since_rev` is set and the feed can serve it, restrict the page to the conversations
+        // changed after that revision + the `removed` tombstones. An unservable `since_rev`
+        // (node restarted -> in-memory index reset; or the needed tombstones were evicted) falls
+        // through to a full page, which the client applies as a replace-and-prune.
+        let delta = match (since_rev, self.node_feed()) {
+            (Some(since), Some(feed)) => feed.conversations_delta(&transport, since),
+            _ => None,
+        };
         // The adapters return unbounded, adapter-ordered listings; sort + page here (once) rather
         // than teaching every `SupportsConversations` impl the cursor. The cursor is the
         // conversation id.
@@ -1336,6 +1346,40 @@ impl ControlApi for NodeApiImpl {
             Err(_) => Vec::new(),
         };
         convs.sort_by(|a, b| a.id.cmp(&b.id));
+        if let Some((changed, mut removed, rev)) = delta {
+            let changed_set: std::collections::HashSet<&str> =
+                changed.iter().map(|s| s.as_str()).collect();
+            // A changed key absent from the adapter's current set left the collection without a
+            // Removed emission reaching the index — prune it client-side too (mirrors the
+            // scope-relative removals in `sessions_query`).
+            let present: std::collections::HashSet<&str> =
+                convs.iter().map(|c| c.id.as_str()).collect();
+            removed.extend(
+                changed
+                    .iter()
+                    .filter(|id| !present.contains(id.as_str()))
+                    .cloned(),
+            );
+            if removed.len() <= daemon_api::WIRE_PAGE_MAX {
+                // The page body is the changed + still-present conversations; the rev is the one
+                // the delta was computed at (atomically with the change/removed sets).
+                convs.retain(|c| changed_set.contains(c.id.as_str()));
+                let page =
+                    daemon_api::paginate(convs, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
+                        c.id.clone()
+                    });
+                return daemon_api::ConvPage {
+                    items: page.items,
+                    next: page.next,
+                    rev,
+                    removed,
+                };
+            }
+            // Delta guard: `removed` rides unpaginated next to the page body, so a tombstone list
+            // past the wire page bound would be un-decodable by the fixed-buffer client codec.
+            // Serve a full page instead (the same fallback an unservable `since_rev` takes); the
+            // client applies it as a replace + prune, needing no removals.
+        }
         let page = daemon_api::paginate(convs, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
             c.id.clone()
         });
@@ -1350,6 +1394,8 @@ impl ControlApi for NodeApiImpl {
             items: page.items,
             next: page.next,
             rev,
+            // Populated only on a delta read; a full page replaces the client's set wholesale.
+            removed: Vec::new(),
         }
     }
 
@@ -1517,6 +1563,7 @@ impl ControlApi for NodeApiImpl {
             transport,
             conv,
             after_cursor,
+            before_cursor,
             max,
         } = args;
         // The merged conversation transcript is a verifiable journal stream keyed generically as
@@ -1527,7 +1574,11 @@ impl ControlApi for NodeApiImpl {
             transport.as_str(),
             conv
         )));
-        self.read_history(stream, after_cursor, max).await
+        match before_cursor {
+            // rung 2: the newest-anchored backward window (before_cursor wins over after_cursor).
+            Some(before) => self.read_history_before(stream, before, max).await,
+            None => self.read_history(stream, after_cursor, max).await,
+        }
     }
 
     async fn member_invite(&self, args: MemberInviteArgs) -> Result<(), ApiError> {
@@ -1645,7 +1696,14 @@ impl ControlApi for NodeApiImpl {
         &self,
         transport: TransportId,
         after: Option<String>,
+        since_rev: Option<u64>,
     ) -> daemon_api::ContactPage {
+        // rung 2 delta read: exactly `conv_list`'s shape (the SessionsQuery template) over the
+        // per-transport contact-roster index.
+        let delta = match (since_rev, self.node_feed()) {
+            (Some(since), Some(feed)) => feed.contacts_delta(&transport, since),
+            _ => None,
+        };
         // The adapter returns the unbounded, adapter-ordered roster; sort + page here (once) rather
         // than teaching every `SupportsRoster` impl the cursor. The cursor is the contact id
         // (mirrors `conv_list`).
@@ -1654,6 +1712,34 @@ impl ControlApi for NodeApiImpl {
             Err(_) => Vec::new(),
         };
         contacts.sort_by(|a, b| a.id.cmp(&b.id));
+        if let Some((changed, mut removed, rev)) = delta {
+            let changed_set: std::collections::HashSet<&str> =
+                changed.iter().map(|s| s.as_str()).collect();
+            let present: std::collections::HashSet<&str> =
+                contacts.iter().map(|c| c.id.as_str()).collect();
+            removed.extend(
+                changed
+                    .iter()
+                    .filter(|id| !present.contains(id.as_str()))
+                    .cloned(),
+            );
+            if removed.len() <= daemon_api::WIRE_PAGE_MAX {
+                contacts.retain(|c| changed_set.contains(c.id.as_str()));
+                let page = daemon_api::paginate(
+                    contacts,
+                    after.as_deref(),
+                    daemon_api::WIRE_PAGE_MAX,
+                    |c| c.id.clone(),
+                );
+                return daemon_api::ContactPage {
+                    items: page.items,
+                    next: page.next,
+                    rev,
+                    removed,
+                };
+            }
+            // Delta guard: an over-bound tombstone list falls back to a full page (see conv_list).
+        }
         let page =
             daemon_api::paginate(contacts, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
                 c.id.clone()
@@ -1667,6 +1753,7 @@ impl ControlApi for NodeApiImpl {
             items: page.items,
             next: page.next,
             rev,
+            removed: Vec::new(),
         }
     }
 
@@ -1680,14 +1767,47 @@ impl ControlApi for NodeApiImpl {
         daemon_api::RevList { rev, items }
     }
 
-    async fn person_list(&self) -> daemon_api::RevList<daemon_api::Person> {
+    async fn person_list(
+        &self,
+        since_rev: Option<u64>,
+    ) -> daemon_api::RevDeltaList<daemon_api::Person> {
         // The node-authoritative person/metacontact registry (wire v37), insertion order — a
         // snapshot of the node's `PersonManager` (ported from the person half of libpurple's
         // `PurpleContactManager`). Clients re-list on a `PersonsChanged` pointer; rung 1 echoes the
-        // persons rev so they can skip an unchanged re-list.
-        let items = self.persons_snapshot();
+        // persons rev so they can skip an unchanged re-list; rung 2 serves a delta (changed persons
+        // + removed tombstones) when `since_rev` is servable (the SessionsQuery template).
+        let delta = match (since_rev, self.node_feed()) {
+            (Some(since), Some(feed)) => feed.persons_delta(since),
+            _ => None,
+        };
+        let mut items = self.persons_snapshot();
+        if let Some((changed, mut removed, rev)) = delta {
+            let changed_set: std::collections::HashSet<&str> =
+                changed.iter().map(|s| s.as_str()).collect();
+            let present: std::collections::HashSet<&str> =
+                items.iter().map(|p| p.id.as_str()).collect();
+            removed.extend(
+                changed
+                    .iter()
+                    .filter(|id| !present.contains(id.as_str()))
+                    .cloned(),
+            );
+            if removed.len() <= daemon_api::WIRE_PAGE_MAX {
+                items.retain(|p| changed_set.contains(p.id.as_str()));
+                return daemon_api::RevDeltaList {
+                    rev,
+                    items,
+                    removed,
+                };
+            }
+            // Delta guard: an over-bound tombstone list falls back to the full list (see conv_list).
+        }
         let rev = self.node_feed().map(|f| f.persons_rev()).unwrap_or(0);
-        daemon_api::RevList { rev, items }
+        daemon_api::RevDeltaList {
+            rev,
+            items,
+            removed: Vec::new(),
+        }
     }
 
     async fn roster_add(
@@ -1695,7 +1815,8 @@ impl ControlApi for NodeApiImpl {
         transport: TransportId,
         contact: ContactInfo,
     ) -> Result<(), ApiError> {
-        let detail = format!("transport={} contact={}", transport.as_str(), contact.id);
+        let id = contact.id.clone();
+        let detail = format!("transport={} contact={id}", transport.as_str());
         let res = self
             .audited(
                 "mgmt.roster.add",
@@ -1704,7 +1825,7 @@ impl ControlApi for NodeApiImpl {
             )
             .await;
         if res.is_ok() {
-            self.emit_contacts_changed(transport);
+            self.emit_contacts_changed(transport, &id, false);
         }
         res
     }
@@ -1714,7 +1835,8 @@ impl ControlApi for NodeApiImpl {
         transport: TransportId,
         contact: ContactInfo,
     ) -> Result<(), ApiError> {
-        let detail = format!("transport={} contact={}", transport.as_str(), contact.id);
+        let id = contact.id.clone();
+        let detail = format!("transport={} contact={id}", transport.as_str());
         let res = self
             .audited(
                 "mgmt.roster.update",
@@ -1724,7 +1846,7 @@ impl ControlApi for NodeApiImpl {
             )
             .await;
         if res.is_ok() {
-            self.emit_contacts_changed(transport);
+            self.emit_contacts_changed(transport, &id, false);
         }
         res
     }
@@ -1734,7 +1856,8 @@ impl ControlApi for NodeApiImpl {
         transport: TransportId,
         contact: ContactInfo,
     ) -> Result<(), ApiError> {
-        let detail = format!("transport={} contact={}", transport.as_str(), contact.id);
+        let id = contact.id.clone();
+        let detail = format!("transport={} contact={id}", transport.as_str());
         let res = self
             .audited(
                 "mgmt.roster.remove",
@@ -1744,7 +1867,7 @@ impl ControlApi for NodeApiImpl {
             )
             .await;
         if res.is_ok() {
-            self.emit_contacts_changed(transport);
+            self.emit_contacts_changed(transport, &id, true);
         }
         res
     }
@@ -1970,13 +2093,23 @@ impl ControlApi for NodeApiImpl {
         }
     }
 
-    async fn unit_history(&self, id: UnitId, after_cursor: u64, max: u32) -> JournalPageView {
+    async fn unit_history(
+        &self,
+        id: UnitId,
+        after_cursor: u64,
+        before_cursor: Option<u64>,
+        max: u32,
+    ) -> JournalPageView {
         // Auth 4 (F3): a non-owner must not read another owner's unit history (deny -> empty page).
         if !self.unit_owner_visible(&id).await {
             return JournalPageView::default();
         }
-        self.read_history(JournalStreamId::unit(&id), after_cursor, max)
-            .await
+        let stream = JournalStreamId::unit(&id);
+        match before_cursor {
+            // rung 2: the newest-anchored backward window (before_cursor wins over after_cursor).
+            Some(before) => self.read_history_before(stream, before, max).await,
+            None => self.read_history(stream, after_cursor, max).await,
+        }
     }
 
     async fn pause(&self, id: UnitId) -> Result<(), ApiError> {

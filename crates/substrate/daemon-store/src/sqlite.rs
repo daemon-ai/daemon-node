@@ -2542,6 +2542,71 @@ impl SessionStore for SqliteStore {
         }
     }
 
+    async fn load_journal_before(
+        &self,
+        stream: &JournalStreamId,
+        before_cursor: u64,
+        max: u32,
+    ) -> JournalPage {
+        let conn = self.conn.lock().unwrap();
+        let head_cursor: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(cursor), 0) FROM journal_entries WHERE stream = ?1",
+                params![stream.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c as u64)
+            .unwrap_or(0);
+        let limit: i64 = if max == 0 { -1 } else { max as i64 };
+        // The backward sibling of the forward query (rung 2): the `max` NEWEST rows strictly below
+        // the anchor, taken DESC then reversed to the ascending order every journal page serves.
+        // The anchor is clamped into i64 range (cursors are AUTOINCREMENT rowids, far below it),
+        // so `u64::MAX` — "the latest window" — never wraps negative through the i64 parameter.
+        let anchor = before_cursor.min(i64::MAX as u64) as i64;
+        let mut stmt = match conn.prepare(
+            "SELECT cursor, segment, seq, bytes, content_hash FROM journal_entries \
+             WHERE stream = ?1 AND cursor < ?2 ORDER BY cursor DESC LIMIT ?3",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return JournalPage::default(),
+        };
+        let rows = stmt.query_map(params![stream.as_str(), anchor, limit], |row| {
+            let hash_bytes: Vec<u8> = row.get(4)?;
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&hash_bytes);
+            Ok(JournalEntry {
+                cursor: row.get::<_, i64>(0)? as u64,
+                segment: row.get::<_, i64>(1)? as u64,
+                entry: TraceEntry {
+                    seq: row.get::<_, i64>(2)? as u64,
+                    bytes: row.get::<_, Vec<u8>>(3)?,
+                    content_hash: ContentHash::new(hash),
+                },
+            })
+        });
+        let mut entries: Vec<JournalEntry> = match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => return JournalPage::default(),
+        };
+        entries.reverse();
+        // The backward continuation: the OLDEST returned cursor (pass as the next before_cursor),
+        // or the input anchor when the window is empty.
+        let next_cursor = entries.first().map(|e| e.cursor).unwrap_or(before_cursor);
+        let mut segments: Vec<u64> = entries.iter().map(|e| e.segment).collect();
+        segments.sort_unstable();
+        segments.dedup();
+        let segment_roots = segments
+            .into_iter()
+            .filter_map(|seg| Self::committed_root(&conn, stream, seg).map(|root| (seg, root)))
+            .collect();
+        JournalPage {
+            entries,
+            segment_roots,
+            next_cursor,
+            head_cursor,
+        }
+    }
+
     async fn record_journal_seal(
         &self,
         stream: &JournalStreamId,

@@ -180,6 +180,7 @@ impl SessionApi for NodeApiImpl {
         &self,
         session: SessionId,
         after_cursor: u64,
+        before_cursor: Option<u64>,
         max: u32,
     ) -> JournalPageView {
         // Auth 4 (read-of-one): own-or-`SessionSeeAll`. The wire return is non-fallible, so an
@@ -187,8 +188,12 @@ impl SessionApi for NodeApiImpl {
         if self.require_session_access(&session, false).await.is_err() {
             return JournalPageView::default();
         }
-        self.read_history(JournalStreamId::session(&session), after_cursor, max)
-            .await
+        let stream = JournalStreamId::session(&session);
+        match before_cursor {
+            // rung 2: the newest-anchored backward window (before_cursor wins over after_cursor).
+            Some(before) => self.read_history_before(stream, before, max).await,
+            None => self.read_history(stream, after_cursor, max).await,
+        }
     }
 
     async fn log_after(

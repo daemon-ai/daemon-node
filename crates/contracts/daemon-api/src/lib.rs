@@ -338,12 +338,15 @@ pub trait SessionApi: Send + Sync {
     /// Non-destructive, cursor-paged read of a session's **durable** verifiable history (decoded
     /// finished chat blocks + lifecycle records, with a per-entry `verified` flag) for reconnect /
     /// scroll-back. Complements [`Self::poll`] (which destructively drains the *live* delta stream):
-    /// repeated reads from the same `after_cursor` return the same page. Default: an empty page (a
-    /// transport with no durable journal, e.g. an ephemeral session-only FFI).
+    /// repeated reads from the same `after_cursor` return the same page. `before_cursor` (rung 2,
+    /// api vNEXT) flips the read into a newest-anchored backward window — the `max` newest entries
+    /// with `cursor < before_cursor` — and wins over `after_cursor` when present. Default: an empty
+    /// page (a transport with no durable journal, e.g. an ephemeral session-only FFI).
     async fn session_history(
         &self,
         _session: SessionId,
         _after_cursor: u64,
+        _before_cursor: Option<u64>,
         _max: u32,
     ) -> JournalPageView {
         JournalPageView::default()
@@ -591,8 +594,16 @@ pub trait ControlApi: Send + Sync {
     /// finished chat blocks + management lifecycle records, each carrying the `verified` flag of its
     /// sealed segment) — the reconnect / scroll-back read for a GUI rendering a transcript for any
     /// node in the tree, and the auditor's one-chain verify pass. Complements (does not replace) the
-    /// destructive live [`Self::unit_outbound`] drain. Default: an empty page.
-    async fn unit_history(&self, _id: UnitId, _after_cursor: u64, _max: u32) -> JournalPageView {
+    /// destructive live [`Self::unit_outbound`] drain. `before_cursor` (rung 2, api vNEXT) flips the
+    /// read into a newest-anchored backward window, exactly as [`SessionApi::session_history`].
+    /// Default: an empty page.
+    async fn unit_history(
+        &self,
+        _id: UnitId,
+        _after_cursor: u64,
+        _before_cursor: Option<u64>,
+        _max: u32,
+    ) -> JournalPageView {
         JournalPageView::default()
     }
 
@@ -863,8 +874,16 @@ pub trait ControlApi: Send + Sync {
     //    empty / `Unsupported` (a node with no messaging adapter registered). --
 
     /// List the conversations a transport owns (`SupportsConversations::list`), paged at
-    /// [`WIRE_PAGE_MAX`] in conversation-id order. Default: empty.
-    async fn conv_list(&self, _transport: TransportId, _after: Option<String>) -> ConvPage {
+    /// [`WIRE_PAGE_MAX`] in conversation-id order. `since_rev` (rung 2, api vNEXT) requests a
+    /// delta read — only the conversations changed after that revision plus `removed` tombstones;
+    /// an unservable revision degrades to the full page (the SessionsQuery template). Default:
+    /// empty.
+    async fn conv_list(
+        &self,
+        _transport: TransportId,
+        _after: Option<String>,
+        _since_rev: Option<u64>,
+    ) -> ConvPage {
         ConvPage::default()
     }
 
@@ -1013,8 +1032,14 @@ pub trait ControlApi: Send + Sync {
 
     /// List a transport's server-side contact roster (`SupportsRoster::list`), paged at
     /// [`WIRE_PAGE_MAX`] in contact-id order (mirrors [`ControlApi::conv_list`]; the adapter
-    /// returns the unbounded roster, the host sorts + pages it once). Default: empty.
-    async fn roster_list(&self, _transport: TransportId, _after: Option<String>) -> ContactPage {
+    /// returns the unbounded roster, the host sorts + pages it once). `since_rev` (rung 2, api
+    /// vNEXT) requests a delta read exactly as [`ControlApi::conv_list`]. Default: empty.
+    async fn roster_list(
+        &self,
+        _transport: TransportId,
+        _after: Option<String>,
+        _since_rev: Option<u64>,
+    ) -> ContactPage {
         ContactPage::default()
     }
 
@@ -1079,9 +1104,11 @@ pub trait ControlApi: Send + Sync {
     /// The node's person/metacontact registry (wire v37), insertion order — the
     /// node-authoritative [`Person`] collection a client renders and re-lists on a
     /// [`NodeEvent::PersonsChanged`] pointer (ported from the person half of libpurple's
-    /// `PurpleContactManager`). Default: empty (a node assembled without a person registry).
-    async fn person_list(&self) -> RevList<Person> {
-        RevList::default()
+    /// `PurpleContactManager`). `since_rev` (rung 2, api vNEXT) requests a delta read — only the
+    /// persons changed after that revision plus `removed` tombstones; an unservable revision
+    /// degrades to the full list. Default: empty (a node assembled without a person registry).
+    async fn person_list(&self, _since_rev: Option<u64>) -> RevDeltaList<Person> {
+        RevDeltaList::default()
     }
 
     // -- Foreign-agent discovery + registry (catalog-style; the daemon probes its own PATH) --
@@ -4345,10 +4372,12 @@ pub struct JournalRecord {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalPageView {
-    /// The decoded entries in cursor order.
+    /// The decoded entries in cursor order (ascending on forward AND backward reads).
     pub entries: Vec<JournalRecord>,
-    /// The cursor to pass as `after_cursor` on the next read (the last entry's cursor, or the input
-    /// `after_cursor` when the page is empty).
+    /// The continuation cursor. Forward read: pass as the next `after_cursor` (the last entry's
+    /// cursor, or the input `after_cursor` when the page is empty). Backward read (rung 2, api
+    /// vNEXT — `before_cursor` set): pass as the next `before_cursor` (the FIRST/oldest entry's
+    /// cursor, or the input `before_cursor` when the page is empty).
     pub next_cursor: u64,
     /// The highest cursor currently stored for the stream (how far a reader can scroll).
     pub head_cursor: u64,
@@ -4693,6 +4722,7 @@ mod tests {
             ApiRequest::ConvList {
                 transport: transport.clone(),
                 after: Some("conv-cursor".into()),
+                since_rev: Some(9),
             },
             ApiRequest::ConvGet {
                 transport: transport.clone(),
@@ -4745,6 +4775,7 @@ mod tests {
                 transport: transport.clone(),
                 conv: "r1".into(),
                 after_cursor: 0,
+                before_cursor: Some(4096),
                 max: 16,
             }),
             ApiRequest::MemberInvite(MemberInviteArgs {
@@ -4833,6 +4864,7 @@ mod tests {
                 items: vec![info.clone()],
                 next: Some(info.id.clone()),
                 rev: 0,
+                removed: vec!["conv-gone".into()],
             }),
             ApiResponse::Conversation(Some(info.clone())),
             ApiResponse::ConvCreateDetails(CreateConversationDetails::default()),
@@ -5363,10 +5395,12 @@ mod tests {
             ApiRequest::RosterList {
                 transport: transport.clone(),
                 after: Some("@aaa:matrix.org".into()),
+                since_rev: Some(3),
             },
             ApiRequest::RosterList {
                 transport: transport.clone(),
                 after: None,
+                since_rev: None,
             },
             ApiRequest::RosterAdd {
                 transport: transport.clone(),
@@ -5390,6 +5424,7 @@ mod tests {
                 items: vec![contact.clone()],
                 next: Some("@bob:matrix.org".into()),
                 rev: 0,
+                removed: vec!["@gone:matrix.org".into()],
             }),
             ApiResponse::ContactPage(ContactPage::default()),
             ApiResponse::Ok,

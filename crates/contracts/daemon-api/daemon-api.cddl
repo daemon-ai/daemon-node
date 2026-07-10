@@ -510,6 +510,9 @@ journal-record = {
   "payload": journal-record-payload-t,
 }
 
+; rung 2 (api vNEXT): shape unchanged; `next_cursor` doubles as the backward continuation — on a
+; `before_cursor` read it is the OLDEST returned cursor (pass it as the next `before_cursor`), on a
+; forward read the newest (pass it as the next `after_cursor`); the input cursor when empty.
 journal-page-view = {
   "entries": [0*64 journal-record],
   "next_cursor": uint64,
@@ -1305,7 +1308,10 @@ request-unit = { "Unit": { "unit": unit-id } }
 ; single-consumer drain (FFI/MCP-LCD; multi-surface uses UnitHistory). See daemon-event-io-spec §5.4.1.
 request-unit-events = { "UnitEvents": { "unit": unit-id, "max": uint } }
 request-unit-outbound = { "UnitOutbound": { "unit": unit-id, "max": uint } }
-request-session-history = { "SessionHistory": { "session": session-id, "after_cursor": uint64, "max": uint } }
+; rung 2 (api vNEXT): `after_cursor` relaxes to optional (default 0) and `? before_cursor` lands —
+; the generalized backward window (see conv-history-args; before_cursor wins when present).
+request-session-history = { "SessionHistory": { "session": session-id, ? "after_cursor": uint64,
+                                                ? "before_cursor": uint64, "max": uint } }
 request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint64, "max": uint } }
 request-events-since = { "EventsSince": { "cursor": uint64, ? "wait_ms": (uint / null) } }
 request-delivery-targets = { "DeliveryTargets": { "session": session-id } }
@@ -1313,7 +1319,9 @@ request-delivery-sessions = { "DeliverySessions": { "transport": transport-id, ?
 request-handover = { "Handover": { "session": session-id, "target": delivery-target } }
 record-meta-args = { "session": session-id, "origin": origin, "kind": tstr, "body": byte-array }
 request-record-meta = { "RecordMeta": record-meta-args }
-request-unit-history = { "UnitHistory": { "unit": unit-id, "after_cursor": uint64, "max": uint } }
+; rung 2 (api vNEXT): backward window, exactly as request-session-history.
+request-unit-history = { "UnitHistory": { "unit": unit-id, ? "after_cursor": uint64,
+                                          ? "before_cursor": uint64, "max": uint } }
 request-pause = { "Pause": { "unit": unit-id } }
 request-resume = { "Resume": { "unit": unit-id } }
 request-scale = { "Scale": { "unit": unit-id, "n": uint } }
@@ -1431,7 +1439,12 @@ request-transport-remove = { "TransportRemove": { "transport": transport-id } }
 request-transport-connect = { "TransportConnect": { "transport": transport-id } }
 request-transport-set-enabled = { "TransportSetEnabled": { "transport": transport-id, "enabled": bool } }
 request-transport-set-label = { "TransportSetLabel": { "transport": transport-id, ? "label": (tstr / null) } }
-request-conv-list = { "ConvList": { "transport": transport-id, ? "after": (tstr / null) } }
+; rung 2 (api vNEXT): + `since_rev` — a delta read past the transport's conversation-set rev
+; (SessionsQuery template): servable -> only conversations changed after `since_rev` + `removed`
+; tombstones; unservable (rev too old / node restarted / tombstones evicted) -> the full page.
+; null/absent = a full page (the cold-client / pre-vNEXT behavior).
+request-conv-list = { "ConvList": { "transport": transport-id, ? "after": (tstr / null),
+                                    ? "since_rev": (uint64 / null) } }
 request-conv-get = { "ConvGet": { "transport": transport-id, "conv": tstr } }
 request-conv-create-details = { "ConvCreateDetails": { "transport": transport-id } }
 request-conv-create = { "ConvCreate": { "transport": transport-id, "details": create-conversation-details } }
@@ -1444,7 +1457,12 @@ request-conv-set-topic = { "ConvSetTopic": { "transport": transport-id, "conv": 
 request-conv-set-title = { "ConvSetTitle": { "transport": transport-id, "conv": tstr, ? "title": (tstr / null) } }
 request-conv-set-description = { "ConvSetDescription": { "transport": transport-id, "conv": tstr, ? "description": (tstr / null) } }
 request-conv-delete = { "ConvDelete": { "transport": transport-id, "conv": tstr } }
-conv-history-args = { "transport": transport-id, "conv": tstr, ? "after_cursor": uint64, ? "max": uint }
+; rung 2 (api vNEXT): + `before_cursor` — a backward window over the durable conv journal:
+; `before_cursor` + `max` = the `max` records with cursor < before_cursor, newest-anchored (pass a
+; value past head — e.g. 2^64-1 — for the latest window in one round-trip; `head_cursor` in the
+; journal-page-view reply confirms the live edge). When present it wins over `after_cursor`.
+conv-history-args = { "transport": transport-id, "conv": tstr, ? "after_cursor": uint64,
+                      ? "before_cursor": uint64, ? "max": uint }
 request-conv-history = { "ConvHistory": conv-history-args }
 member-invite-args = { "transport": transport-id, "conv": tstr, "who": participant, ? "message": (tstr / null) }
 request-member-invite = { "MemberInvite": member-invite-args }
@@ -1458,7 +1476,10 @@ request-contact-get-profile = { "ContactGetProfile": { "transport": transport-id
 request-contact-set-alias = { "ContactSetAlias": { "transport": transport-id, "contact": contact-info, ? "alias": (tstr / null) } }
 request-contact-action-menu = { "ContactActionMenu": { "transport": transport-id, "contact": contact-info } }
 request-directory-search = { "DirectorySearch": { "transport": transport-id, ? "query": (tstr / null) } }
-request-roster-list = { "RosterList": { "transport": transport-id, ? "after": (tstr / null) } }
+; rung 2 (api vNEXT): + `since_rev` — a delta read past the transport's contact-roster rev
+; (mirrors request-conv-list; the SessionsQuery template).
+request-roster-list = { "RosterList": { "transport": transport-id, ? "after": (tstr / null),
+                                        ? "since_rev": (uint64 / null) } }
 request-roster-add = { "RosterAdd": { "transport": transport-id, "contact": contact-info } }
 request-roster-update = { "RosterUpdate": { "transport": transport-id, "contact": contact-info } }
 request-roster-remove = { "RosterRemove": { "transport": transport-id, "contact": contact-info } }
@@ -1506,7 +1527,10 @@ request-telemetry-consent-set = { "TelemetryConsentSet": { "enabled": bool } }
 request-notification-list = "NotificationList"
 
 ; wire v37: the node's person/metacontact registry (read-only; re-listed on PersonsChanged).
-request-person-list = "PersonList"
+; rung 2 (api vNEXT): the bare-string form becomes a map so the request can carry `since_rev` — a
+; delta read past the persons rev (SessionsQuery template; breaking arm-shape change, bundled into
+; the deferred bump). null/absent = the full list.
+request-person-list = { "PersonList": { ? "since_rev": (uint64 / null) } }
 
 ; ----- saved presences (W2-F; wire v37) -----
 request-presence-list = "PresenceList"
@@ -1763,8 +1787,14 @@ chat-route-page = { "items": [0*64 chat-route], ? "next": (tstr / null) }
 room-page = { "items": [0*64 room-info], ? "next": (tstr / null) }
 ; rung 1 (api vNEXT): conv-page/contact-page echo the transport's coalescing rev (compared against
 ; ConversationsChanged.rev / ContactsChanged.rev to skip an unchanged refetch).
-conv-page = { "items": [0*64 conversation-info], ? "next": (tstr / null), "rev": uint64 }
-contact-page = { "items": [0*64 contact-info], ? "next": (tstr / null), "rev": uint64 }
+; rung 2 (api vNEXT): + `removed` tombstones — on a delta read (`since_rev` servable) `items` holds
+; only the entries changed after `since_rev` and `removed` the keys gone since then (bounded at the
+; wire page max; a larger removal set falls back to a full page). Absent/empty on a full page: the
+; client applies a full page as replace-and-prune, needing no removal list (SessionsQuery template).
+conv-page = { "items": [0*64 conversation-info], ? "next": (tstr / null), "rev": uint64,
+              ? "removed": [0*64 tstr] }
+contact-page = { "items": [0*64 contact-info], ? "next": (tstr / null), "rev": uint64,
+                 ? "removed": [0*64 tstr] }
 response-approvals = { "Approvals": approval-page }
 response-fingerprints = { "Fingerprints": [0*64 remembered-fingerprint] }
 response-fleet = { "Fleet": fleet-report }
@@ -1870,7 +1900,12 @@ response-notifications = { "Notifications": { "rev": uint64, "items": [* notific
 
 ; wire v37: the node's person/metacontact registry, insertion order.
 ; rung 1 (api vNEXT): the list gains a coalescing rev (compared against PersonsChanged.rev).
-response-persons = { "Persons": { "rev": uint64, "items": [* person] } }
+; rung 2 (api vNEXT): + `removed` tombstones — on a delta read (`since_rev` servable) `items` holds
+; only the persons changed after `since_rev` and `removed` the person ids gone since then (bounded
+; at the wire page max; a larger removal set falls back to the full list, which the client applies
+; as replace-and-prune).
+response-persons = { "Persons": { "rev": uint64, "items": [* person],
+                                  ? "removed": [0*64 tstr] } }
 
 ; wire v38: a transport instance's persisted NON-SECRET account-settings values (the
 ; transport-settings read-back; secrets live in the credential store, never here).

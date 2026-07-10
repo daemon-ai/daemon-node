@@ -74,7 +74,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         // The notification list is a node-wide control-plane read (wire v37).
         | NotificationList
         // The person/metacontact registry is a node-wide control-plane read (wire v37).
-        | PersonList => C::ControlRead,
+        | PersonList { .. } => C::ControlRead,
         // Durable control-plane lifecycle is operator-level (Assign wakes a durable session).
         Assign { .. } => C::ControlWrite,
         // The roster reads are "one's own sessions"; SeeAll (Track C) widens them cross-owner.
@@ -363,6 +363,7 @@ mod tests {
                 ApiRequest::ConvList {
                     transport: TransportId::new("t"),
                     after: None,
+                    since_rev: None,
                 },
                 Capability::MessagingRead,
             ),

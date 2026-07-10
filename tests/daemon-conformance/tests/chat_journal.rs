@@ -105,6 +105,7 @@ async fn sink_chat_message_journals_and_emits() {
                 transport: transport.clone(),
                 conv: conv.to_string(),
                 after_cursor,
+                before_cursor: None,
                 max: 0,
             })
         };

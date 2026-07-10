@@ -439,6 +439,7 @@ async fn demo_tree_lists_space_parent_and_kinds() {
         .call(ApiRequest::ConvList {
             transport: demo.clone(),
             after: None,
+            since_rev: None,
         })
         .await
         .unwrap()
@@ -507,6 +508,7 @@ async fn demo_roster_lists_contacts_with_presence() {
         .call(ApiRequest::RosterList {
             transport: demo,
             after: None,
+            since_rev: None,
         })
         .await
         .unwrap()
@@ -570,6 +572,7 @@ async fn demo_send_journals_chat_and_scripted_reply() {
                 transport: demo.clone(),
                 conv: conv.into(),
                 after_cursor: 0,
+                before_cursor: None,
                 max: 0,
             }))
             .await

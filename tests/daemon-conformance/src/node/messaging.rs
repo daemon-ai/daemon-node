@@ -97,6 +97,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
         .call(ApiRequest::ConvList {
             transport: room.clone(),
             after: None,
+            since_rev: None,
         })
         .await
         .unwrap()
@@ -312,6 +313,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
             transport: room.clone(),
             conv: "r2".into(),
             after_cursor: 0,
+            before_cursor: None,
             max: 0,
         }))
         .await
@@ -517,6 +519,7 @@ async fn roster_items(
         .call(ApiRequest::RosterList {
             transport: transport.clone(),
             after: None,
+            since_rev: None,
         })
         .await
         .unwrap()
@@ -942,6 +945,7 @@ impl RoomsSocket {
                 transport: daemon_protocol::TransportId::new("room"),
                 conv: conv.into(),
                 after_cursor,
+                before_cursor: None,
                 max,
             }))
             .await
@@ -1190,6 +1194,7 @@ async fn conv_list_pages_beyond_the_wire_bound() {
             .call(ApiRequest::ConvList {
                 transport: room.clone(),
                 after: after.take(),
+                since_rev: None,
             })
             .await
             .unwrap()

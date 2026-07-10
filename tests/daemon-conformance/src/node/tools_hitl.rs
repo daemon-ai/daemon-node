@@ -169,7 +169,7 @@ async fn core_tools_session_does_real_work_impl(store: Arc<dyn SessionStore>) {
     let mut page = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let p = node.session_history(session.clone(), 0, 0).await;
+        let p = node.session_history(session.clone(), 0, None, 0).await;
         if has_tool_result(&p) && p.entries.iter().all(|e| e.verified) {
             page = Some(p);
             break;
