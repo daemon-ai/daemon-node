@@ -200,6 +200,7 @@ impl SupportsConversations for WhatsappAdapter {
             conv,
             from: _from,
             message,
+            op_id: _,
         } = args;
         // The account is always the sender; `from` attribution is not forwarded onto the wire.
         let backend = self.backend_for(&transport).await?;
@@ -226,6 +227,7 @@ impl SupportsMembership for WhatsappAdapter {
             conv,
             who,
             message: _message,
+            op_id: _,
         } = args;
         let who = contact_id(&who)?;
         let backend = self.backend_for(&transport).await?;
@@ -238,6 +240,7 @@ impl SupportsMembership for WhatsappAdapter {
             conv,
             who,
             reason: _reason,
+            op_id: _,
         } = args;
         let who = contact_id(&who)?;
         let backend = self.backend_for(&transport).await?;
@@ -314,6 +317,7 @@ mod tests {
                 conv: "15559876543".to_string(),
                 from: None,
                 message: UserMsg::new("hello".to_string()),
+                op_id: None,
             },
         )
         .await
@@ -334,6 +338,7 @@ mod tests {
                 conv: "1".to_string(),
                 from: None,
                 message: UserMsg::new("x".to_string()),
+                op_id: None,
             },
         )
         .await
@@ -356,6 +361,7 @@ mod tests {
                     ..ContactInfo::default()
                 }),
                 message: None,
+                op_id: None,
             },
         )
         .await
@@ -373,6 +379,7 @@ mod tests {
                     member: "@agent".to_string(),
                 },
                 message: None,
+                op_id: None,
             },
         )
         .await
@@ -394,6 +401,7 @@ mod tests {
                     ..ContactInfo::default()
                 }),
                 message: None,
+                op_id: None,
             },
         )
         .await

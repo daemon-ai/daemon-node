@@ -556,6 +556,7 @@ async fn demo_send_journals_chat_and_scripted_reply() {
                 conv: conv.into(),
                 from: None,
                 message: UserMsg::new("hello demo"),
+                op_id: None,
             }))
             .await
             .unwrap(),
@@ -627,7 +628,7 @@ async fn demo_send_journals_chat_and_scripted_reply() {
             .events
             .iter()
             .filter(|e| {
-                matches!(e, NodeEvent::MessagesChanged { transport: t, conv: c }
+                matches!(e, NodeEvent::MessagesChanged { transport: t, conv: c, .. }
                     if t.as_str() == "demo" && c == conv)
             })
             .count(),
@@ -695,6 +696,7 @@ async fn demo_transport_settings_configure_and_reconnect() {
             settings: AccountSettingsValues {
                 values: map(&[("display_name", "My Demo"), ("mood", "grumpy")]),
             },
+            op_id: None,
         })
         .await
         .unwrap()
@@ -720,6 +722,7 @@ async fn demo_transport_settings_configure_and_reconnect() {
             settings: AccountSettingsValues {
                 values: map(&[("reply_delay_ms", "80")]),
             },
+            op_id: None,
         })
         .await
         .unwrap()
@@ -753,6 +756,7 @@ async fn demo_transport_settings_configure_and_reconnect() {
             settings: AccountSettingsValues {
                 values: map(&[("bogus", "x")]),
             },
+            op_id: None,
         })
         .await
         .unwrap()
@@ -772,6 +776,7 @@ async fn demo_transport_settings_configure_and_reconnect() {
             settings: AccountSettingsValues {
                 values: map(&[("display_name", daemon_demo::VALIDATE_REJECT_VALUE)]),
             },
+            op_id: None,
         })
         .await
         .unwrap()

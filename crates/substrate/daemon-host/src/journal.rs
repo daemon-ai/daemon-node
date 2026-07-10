@@ -144,6 +144,7 @@ impl JournalSink {
         &self,
         kind: String,
         payload: JournalPayload,
+        origin_op: Option<String>,
     ) -> Result<(), daemon_store::StoreError> {
         let segment = self.segment.load(Ordering::Relaxed);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
@@ -156,6 +157,7 @@ impl JournalSink {
             kind,
             timestamp_ms: now_ms(),
             writer_version: daemon_common::VERSION.to_string(),
+            origin_op,
             payload,
         };
         tracing::debug!(
@@ -186,7 +188,7 @@ impl JournalSink {
         kind: impl Into<String>,
         detail: String,
     ) -> Result<(), daemon_store::StoreError> {
-        self.append(kind.into(), JournalPayload::Management { detail })
+        self.append(kind.into(), JournalPayload::Management { detail }, None)
             .await
     }
 
@@ -214,6 +216,7 @@ impl JournalSink {
             kind: format!("cred.{}", event.kind.label()),
             timestamp_ms: event.timestamp_ms,
             writer_version: daemon_common::VERSION.to_string(),
+            origin_op: None,
             payload: JournalPayload::Management {
                 detail: event.summary(),
             },
@@ -251,6 +254,7 @@ impl JournalSink {
         self.append(
             block.kind_label().to_string(),
             JournalPayload::Block { body },
+            None,
         )
         .await
     }
@@ -258,14 +262,23 @@ impl JournalSink {
     /// Append one conversation [`ChatMessage`](daemon_api::ChatMessage) to the chain (wire v38)
     /// under the `chat.message` kind — the per-message record of a `conv:<transport>:<conv>`
     /// stream, decoded back into `JournalRecordPayload::Chat` by the history reader.
+    ///
+    /// `origin_op` (rung 3, api vNEXT) is the client-minted op_id of the operation that caused this
+    /// message, stamped on the node-owned envelope (the adapter payload is untouched); `None` when
+    /// the report carried no opaque token (inbound messages, token-incapable adapters).
     pub async fn record_chat(
         &self,
         message: &daemon_api::ChatMessage,
+        origin_op: Option<String>,
     ) -> Result<(), daemon_store::StoreError> {
         let mut body = Vec::new();
         ciborium::into_writer(message, &mut body).expect("encode chat message to CBOR");
-        self.append("chat.message".to_string(), JournalPayload::Chat { body })
-            .await
+        self.append(
+            "chat.message".to_string(),
+            JournalPayload::Chat { body },
+            origin_op,
+        )
+        .await
     }
 
     /// Seal the open segment: recompute the Merkle root from the durable entries, sign it, and

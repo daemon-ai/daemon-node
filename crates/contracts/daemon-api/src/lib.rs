@@ -42,6 +42,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod op_context;
+pub use op_context::{current_op_id, with_op_id};
+
 pub mod profile;
 pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
@@ -737,6 +740,34 @@ pub trait ControlApi: Send + Sync {
     async fn events_subscribe(&self, _cursor: u64) -> Result<NodeEventStream, ApiError> {
         Ok(stream::empty().boxed())
     }
+
+    /// Rung 3 (api vNEXT): the race-free initial-sync baseline — every collection's rev + the feed
+    /// cursor + epoch, snapshotted ATOMICALLY under one feed-lock acquisition (06G6). A cold client
+    /// anchors its cursor + per-collection revs from this single consistent point before its first
+    /// [`Self::events_page`]. Default: an empty report (a node with no feed).
+    async fn bootstrap(&self) -> BootstrapReport {
+        BootstrapReport::default()
+    }
+
+    // -- rung 3 (api vNEXT) op-id idempotent dedup ---------------------------------------------
+    //
+    // The verb-agnostic dedup seam the shared `dispatch` core consults for every request carrying
+    // an `op_id` ([`ApiRequest::op_id`]): a durable `(principal, op_id)`-keyed table (TTL 24h)
+    // returning the ORIGINAL result bytes on a duplicate, so a retried write is safe (06G4). The
+    // node reads the request principal itself (task-local), so these take only the op_id + bytes.
+    // Defaults: no dedup (a node with no durable store just re-executes — the v38-era behavior).
+
+    /// Look up a prior result for `op_id` under the current request principal, if one is stored and
+    /// unexpired. `Some(bytes)` is the CBOR of the original [`ApiResponse`]; the dispatch core
+    /// returns it verbatim without re-running the handler. Default: `None` (never dedup).
+    async fn command_dedup_lookup(&self, _op_id: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Record `result` (the CBOR of a successful [`ApiResponse`]) for `op_id` under the current
+    /// request principal, so a later retry deduplicates to it. First-writer-wins (a duplicate is a
+    /// no-op on the stored value). Default: a no-op (never dedup).
+    async fn command_dedup_store(&self, _op_id: &str, _result: Vec<u8>) {}
 
     // -- chat→session routing pins (I5; daemon-event-io-spec §5.9) ------------------------------
     //
@@ -2456,6 +2487,11 @@ pub struct SessionPage {
     /// with `archived=true`, not a removal); reserved for a future hard-delete path.
     #[serde(default)]
     pub removed: Vec<SessionId>,
+    /// Rung 3 (api vNEXT) uniform provenance (carrier 2): a page-side `session-id -> origin_op`
+    /// map, present only for sessions whose latest reflected roster mutation carried an `op_id`
+    /// (e.g. a `SessionUpdateMeta` rename/pin/archive). Operation metadata, not roster state.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub origin_ops: std::collections::BTreeMap<String, String>,
 }
 
 /// A partial update to a session's roster metadata — the backend of daemon-app's "session actions"
@@ -3644,7 +3680,20 @@ pub trait LifecycleSink: Send + Sync {
     /// conversation's verifiable journal stream (`conv:<transport>:<conv>`, the stream
     /// `ConvHistory` pages) and then emits [`NodeEvent::MessagesChanged`]. Adapters never journal
     /// conversation history themselves.
-    async fn chat_message(&self, transport: TransportId, conv: String, message: ChatMessage);
+    ///
+    /// `origin_op` (rung 3, api vNEXT) is the OPAQUE node token an adapter hands back from the send
+    /// seam where its protocol can round-trip one — the client-minted `op_id` of the causing
+    /// `ConvSend`. The node stamps it as uniform `origin_op` provenance on both the journal record
+    /// and the `MessagesChanged` pointer (it never interprets the token). `None` for inbound
+    /// deliveries and token-incapable adapters — the null-provenance path (degraded, never
+    /// heuristic).
+    async fn chat_message(
+        &self,
+        transport: TransportId,
+        conv: String,
+        message: ChatMessage,
+        origin_op: Option<String>,
+    );
 }
 
 /// A self-describing events-IO transport adapter — the declarative analogue of libpurple's
@@ -4363,6 +4412,12 @@ pub struct JournalRecord {
     /// signature checked + chain linked). `false` for an as-yet-unsealed (open) segment or when the
     /// node exposes no verifying key.
     pub verified: bool,
+    /// Rung 3 (api vNEXT) uniform provenance (carrier 1): the client-minted `op_id` of the
+    /// operation that caused this record, stamped on the node-owned envelope so every journaled
+    /// stream carries it (the adapter payload is untouched). `None` when the causing op carried no
+    /// token (inbound messages, token-incapable adapters) — degraded, never heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_op: Option<String>,
     /// The decoded entry payload.
     pub payload: JournalRecordPayload,
 }
@@ -4463,6 +4518,10 @@ pub enum NodeEvent {
         session: SessionId,
         /// The roster revision at the change.
         rev: u64,
+        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the causing op's `op_id` when the
+        /// emit site knows it (a `SessionUpdateMeta` carrying one); `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_op: Option<String>,
     },
     /// The roster set changed (a session opened/closed/moved); the client refetches (delta in L4).
     RosterChanged {
@@ -4535,6 +4594,10 @@ pub enum NodeEvent {
         /// clients MUST NOT re-derive this (wire v30). `false` for transient reasons + connects.
         #[serde(default)]
         fatal: bool,
+        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the causing op's `op_id` when the
+        /// emit site knows it (e.g. a `TransportConfigure` reconnect); `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_op: Option<String>,
     },
     /// A transport's conversation set changed (wire v30): a conversation was added or removed.
     /// Retires client `ConvList` re-polling — a pointer; the client refetches `ConvGet`/`ConvList`.
@@ -4549,6 +4612,10 @@ pub enum NodeEvent {
         /// client compares it against `conv-page`'s echoed rev to reconcile drift. Per-transport,
         /// in-memory (a restart resets it -> full read).
         rev: u64,
+        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the causing op's `op_id` when the
+        /// emit site knows it; `None` otherwise (adapter-reported changes have no local token).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_op: Option<String>,
     },
     /// A conversation's membership changed (wire v30). A granular invalidation pointer; on an
     /// `is_self` removal (`Left`/`Kicked`/`Banned`) the node has ALREADY reconciled its own routing
@@ -4572,6 +4639,10 @@ pub enum NodeEvent {
         /// Whether `member` is THIS account. On a self `Left`/`Kicked`/`Banned` the node reconciled
         /// its routing for the now-dangling origin before emitting.
         is_self: bool,
+        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the causing op's `op_id` when the
+        /// emit site knows it (a member-invite/remove/ban carrying one); `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_op: Option<String>,
     },
     /// A transport's server-side contact roster changed (wire v34): a contact was added, updated, or
     /// removed. A payload-free-per-transport invalidation pointer (named `ContactsChanged` to avoid
@@ -4618,6 +4689,12 @@ pub enum NodeEvent {
         transport: TransportId,
         /// The affected conversation id.
         conv: String,
+        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the client-minted `op_id` of the
+        /// send that caused this message, stamped at the `LifecycleSink::chat_message` choke point
+        /// (the same token the node stamps as `origin_op` on the journal record). `None` for
+        /// inbound messages / token-incapable adapters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_op: Option<String>,
     },
 }
 
@@ -4734,6 +4811,7 @@ mod tests {
             ApiRequest::ConvCreate {
                 transport: transport.clone(),
                 details: CreateConversationDetails::default(),
+                op_id: Some("op-create".into()),
             },
             ApiRequest::ConvJoinDetails {
                 transport: transport.clone(),
@@ -4741,6 +4819,7 @@ mod tests {
             ApiRequest::ConvJoin {
                 transport: transport.clone(),
                 details: ChannelJoinDetails::default(),
+                op_id: None,
             },
             ApiRequest::ConvLeave {
                 transport: transport.clone(),
@@ -4751,21 +4830,25 @@ mod tests {
                 conv: "r1".into(),
                 from: Some(who.clone()),
                 message: UserMsg::new("hi"),
+                op_id: Some("op-send".into()),
             }),
             ApiRequest::ConvSetTopic {
                 transport: transport.clone(),
                 conv: "r1".into(),
                 topic: Some("t".into()),
+                op_id: None,
             },
             ApiRequest::ConvSetTitle {
                 transport: transport.clone(),
                 conv: "r1".into(),
                 title: None,
+                op_id: None,
             },
             ApiRequest::ConvSetDescription {
                 transport: transport.clone(),
                 conv: "r1".into(),
                 description: Some("d".into()),
+                op_id: None,
             },
             ApiRequest::ConvDelete {
                 transport: transport.clone(),
@@ -4783,24 +4866,28 @@ mod tests {
                 conv: "r1".into(),
                 who: who.clone(),
                 message: None,
+                op_id: Some("op-invite".into()),
             }),
             ApiRequest::MemberRemove(MemberRemoveArgs {
                 transport: transport.clone(),
                 conv: "r1".into(),
                 who: who.clone(),
                 reason: Some("bye".into()),
+                op_id: None,
             }),
             ApiRequest::MemberBan(MemberBanArgs {
                 transport: transport.clone(),
                 conv: "r1".into(),
                 who: who.clone(),
                 reason: None,
+                op_id: None,
             }),
             ApiRequest::MemberSetRole(MemberSetRoleArgs {
                 transport: transport.clone(),
                 conv: "r1".into(),
                 who: who.clone(),
                 role: MemberRole::Op,
+                op_id: None,
             }),
             ApiRequest::ContactGetProfile {
                 transport: transport.clone(),
@@ -4816,6 +4903,7 @@ mod tests {
                     ..ContactInfo::default()
                 },
                 alias: Some("Ali".into()),
+                op_id: None,
             },
             ApiRequest::ContactActionMenu {
                 transport: transport.clone(),
@@ -4865,6 +4953,9 @@ mod tests {
                 next: Some(info.id.clone()),
                 rev: 0,
                 removed: vec!["conv-gone".into()],
+                origin_ops: [("r1".to_string(), "op-send".to_string())]
+                    .into_iter()
+                    .collect(),
             }),
             ApiResponse::Conversation(Some(info.clone())),
             ApiResponse::ConvCreateDetails(CreateConversationDetails::default()),
@@ -4927,11 +5018,13 @@ mod tests {
                 settings: AccountSettingsValues {
                     values: values.clone(),
                 },
+                op_id: Some("op-cfg".into()),
             },
             // An empty merge (no keys) is a valid wire shape (serde-default map).
             ApiRequest::TransportConfigure {
                 transport,
                 settings: AccountSettingsValues::default(),
+                op_id: None,
             },
         ];
         for req in reqs {
@@ -5405,14 +5498,17 @@ mod tests {
             ApiRequest::RosterAdd {
                 transport: transport.clone(),
                 contact: contact.clone(),
+                op_id: Some("op-roster".into()),
             },
             ApiRequest::RosterUpdate {
                 transport: transport.clone(),
                 contact: contact.clone(),
+                op_id: None,
             },
             ApiRequest::RosterRemove {
                 transport: transport.clone(),
                 contact: contact.clone(),
+                op_id: None,
             },
         ];
         for req in reqs {
@@ -5425,6 +5521,7 @@ mod tests {
                 next: Some("@bob:matrix.org".into()),
                 rev: 0,
                 removed: vec!["@gone:matrix.org".into()],
+                origin_ops: std::collections::BTreeMap::new(),
             }),
             ApiResponse::ContactPage(ContactPage::default()),
             ApiResponse::Ok,
@@ -5536,6 +5633,7 @@ mod tests {
                 next_cursor: Some(SessionId::new("s1")),
                 rev: 7,
                 removed: vec![SessionId::new("gone")],
+                origin_ops: std::collections::BTreeMap::new(),
             }),
             ApiResponse::SessionDetail(Some(SessionDetail {
                 info: sample_info(),

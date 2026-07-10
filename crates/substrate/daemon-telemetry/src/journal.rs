@@ -79,6 +79,14 @@ pub struct JournalEntryView {
     /// (see [`entry_envelope`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub writer_version: String,
+    /// Rung 3 (api vNEXT) uniform operation provenance: the client-minted `op_id` of the operation
+    /// that caused this record, stamped on the NODE-OWNED envelope (the adapter payload is
+    /// untouched) so every journaled stream carries it. `None` when the causing operation carried
+    /// no op_id (or a protocol could not round-trip the opaque token) — degraded, never heuristic.
+    /// Omitted from the wire when absent so pre-provenance entries reproduce their original Gordian
+    /// digest and still verify (the additive-field discipline shared with `writer_version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_op: Option<String>,
     /// The typed payload.
     pub payload: JournalPayload,
 }
@@ -110,6 +118,11 @@ fn entry_envelope(v: &JournalEntryView) -> Envelope {
     // reproduces its original digest and still verifies. Never backfilled onto old rows.
     if !v.writer_version.is_empty() {
         env = env.add_assertion("writer", v.writer_version.clone());
+    }
+    // Provenance assertion, added only when present so a pre-provenance entry reproduces its
+    // original digest and still verifies (never backfilled onto old rows).
+    if let Some(op) = &v.origin_op {
+        env = env.add_assertion("origin_op", op.clone());
     }
     match &v.payload {
         JournalPayload::Management { detail } => env.add_assertion("detail", detail.clone()),
@@ -312,6 +325,7 @@ mod tests {
             kind: kind.into(),
             timestamp_ms: 1_000 + seq,
             writer_version: String::new(),
+            origin_op: None,
             payload: JournalPayload::Management {
                 detail: format!("detail-{seq}"),
             },
@@ -328,6 +342,7 @@ mod tests {
             kind: "block.message".into(),
             timestamp_ms: 2_000 + seq,
             writer_version: String::new(),
+            origin_op: None,
             payload: JournalPayload::Block {
                 body: body.to_vec(),
             },
@@ -349,6 +364,41 @@ mod tests {
         let v = block("s", 0, 3, b"hello-block");
         let (bytes, _hash) = encode_entry(&v);
         assert_eq!(decode_entry(&bytes).unwrap(), v);
+    }
+
+    /// Rung 3 (provenance carrier 1): `origin_op` round-trips through the entry codec, and a
+    /// present value is folded into the Gordian digest (tamper-evident) while an ABSENT value
+    /// reproduces the pre-provenance digest exactly — old entries still verify (the additive-field
+    /// discipline shared with `writer_version`).
+    #[test]
+    fn origin_op_round_trips_and_is_digest_stable_when_absent() {
+        let mut with_op = mgmt("s", 0, 0, "chat.message");
+        let without = with_op.clone();
+        with_op.origin_op = Some("op-7".into());
+
+        // Round-trips through the stored CBOR.
+        let (bytes, hash_with) = encode_entry(&with_op);
+        assert_eq!(decode_entry(&bytes).unwrap(), with_op);
+        assert_eq!(
+            decode_entry(&bytes).unwrap().origin_op.as_deref(),
+            Some("op-7")
+        );
+
+        // Present provenance changes the digest (it is an assertion over the entry).
+        let (_b, hash_without) = encode_entry(&without);
+        assert_ne!(
+            hash_with, hash_without,
+            "origin_op is folded into the digest"
+        );
+
+        // An entry with no provenance reproduces the ORIGINAL digest of a same-shape entry that
+        // predates the field (no assertion added), so historical segments keep verifying.
+        let legacy = without.clone();
+        let (_b2, hash_legacy) = encode_entry(&legacy);
+        assert_eq!(
+            hash_without, hash_legacy,
+            "an absent origin_op adds no assertion (digest-stable vs a pre-provenance entry)"
+        );
     }
 
     #[test]

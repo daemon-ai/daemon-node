@@ -37,6 +37,7 @@ pub(super) async fn run(client: &ApiClient, cmd: MemberCmd) -> anyhow::Result<()
             conv,
             who: super::participant(member, profile),
             message,
+            op_id: None,
         }),
         MemberCmd::Remove {
             transport,
@@ -49,6 +50,7 @@ pub(super) async fn run(client: &ApiClient, cmd: MemberCmd) -> anyhow::Result<()
             conv,
             who: super::participant(member, profile),
             reason,
+            op_id: None,
         }),
         MemberCmd::Ban {
             transport,
@@ -61,6 +63,7 @@ pub(super) async fn run(client: &ApiClient, cmd: MemberCmd) -> anyhow::Result<()
             conv,
             who: super::participant(member, profile),
             reason,
+            op_id: None,
         }),
         MemberCmd::SetRole {
             transport,
@@ -73,6 +76,7 @@ pub(super) async fn run(client: &ApiClient, cmd: MemberCmd) -> anyhow::Result<()
             conv,
             who: super::participant(member, profile),
             role: parse_role(&role)?,
+            op_id: None,
         }),
     };
     render(client.call(req).await?);

@@ -169,6 +169,7 @@ impl SupportsConversations for WeChatAdapter {
             conv,
             from: _from,
             message,
+            op_id: _,
         } = args;
         // The bound WeChat account is always the sender; `from` attribution is not forwarded onto the
         // wire (the outbound projector posts the same way). The conversation id is the peer user id.
@@ -267,6 +268,7 @@ mod tests {
                 conv: "peer-unknown".to_string(),
                 from: None,
                 message: UserMsg::new("hi".to_string()),
+                op_id: None,
             },
         )
         .await
@@ -284,6 +286,7 @@ mod tests {
                 conv: "peer".to_string(),
                 from: None,
                 message: UserMsg::new("hi".to_string()),
+                op_id: None,
             },
         )
         .await

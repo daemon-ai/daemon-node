@@ -179,9 +179,13 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::SessionRecap { session } => {
             ApiResponse::SessionRecap(api.session_recap(session).await)
         }
-        ApiRequest::SessionUpdateMeta { session, patch } => {
-            unit_or_err(api.session_update_meta(session, patch).await)
-        }
+        // op_id is consumed by the dispatch dedup + op-context seams; the handler reads the causing
+        // op from `current_op_id()` to stamp provenance (uniform, no per-verb parameter).
+        ApiRequest::SessionUpdateMeta {
+            session,
+            patch,
+            op_id: _,
+        } => unit_or_err(api.session_update_meta(session, patch).await),
         ApiRequest::Rewind { session, point } => unit_or_err(api.rewind(session, point).await),
         // -- user feedback + node-owned telemetry consent (N1; wire v31) ------------------------
         ApiRequest::FeedbackSubmit {
@@ -226,6 +230,8 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::PersonList { since_rev } => {
             ApiResponse::Persons(api.person_list(since_rev).await)
         }
+        // rung 3 (api vNEXT): the race-free initial-sync baseline (revs + cursor + epoch).
+        ApiRequest::Bootstrap => ApiResponse::Bootstrap(api.bootstrap().await),
         _ => return None,
     })
 }
@@ -488,6 +494,7 @@ async fn serve_routing(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::TransportConfigure {
             transport,
             settings,
+            op_id: _,
         } => unit_or_err(api.transport_configure(transport, settings).await),
         _ => return None,
     })
@@ -507,19 +514,23 @@ async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespon
         ApiRequest::ConvCreateDetails { transport } => {
             ApiResponse::ConvCreateDetails(api.conv_create_details(transport).await)
         }
-        ApiRequest::ConvCreate { transport, details } => {
-            ok_or_err(api.conv_create(transport, details).await, |info| {
-                ApiResponse::Conversation(Some(info))
-            })
-        }
+        ApiRequest::ConvCreate {
+            transport,
+            details,
+            op_id: _,
+        } => ok_or_err(api.conv_create(transport, details).await, |info| {
+            ApiResponse::Conversation(Some(info))
+        }),
         ApiRequest::ConvJoinDetails { transport } => {
             ApiResponse::ConvJoinDetails(api.conv_join_details(transport).await)
         }
-        ApiRequest::ConvJoin { transport, details } => {
-            ok_or_err(api.conv_join(transport, details).await, |info| {
-                ApiResponse::Conversation(Some(info))
-            })
-        }
+        ApiRequest::ConvJoin {
+            transport,
+            details,
+            op_id: _,
+        } => ok_or_err(api.conv_join(transport, details).await, |info| {
+            ApiResponse::Conversation(Some(info))
+        }),
         ApiRequest::ConvLeave { transport, conv } => {
             unit_or_err(api.conv_leave(transport, conv).await)
         }
@@ -528,16 +539,19 @@ async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespon
             transport,
             conv,
             topic,
+            op_id: _,
         } => unit_or_err(api.conv_set_topic(transport, conv, topic).await),
         ApiRequest::ConvSetTitle {
             transport,
             conv,
             title,
+            op_id: _,
         } => unit_or_err(api.conv_set_title(transport, conv, title).await),
         ApiRequest::ConvSetDescription {
             transport,
             conv,
             description,
+            op_id: _,
         } => unit_or_err(api.conv_set_description(transport, conv, description).await),
         ApiRequest::ConvDelete { transport, conv } => {
             unit_or_err(api.conv_delete(transport, conv).await)
@@ -555,6 +569,7 @@ async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespon
             transport,
             contact,
             alias,
+            op_id: _,
         } => unit_or_err(api.contact_set_alias(transport, contact, alias).await),
         ApiRequest::ContactActionMenu { transport, contact } => {
             ApiResponse::ActionMenu(api.contact_action_menu(transport, contact).await)
@@ -568,18 +583,25 @@ async fn serve_messaging(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiRespon
             after,
             since_rev,
         } => ApiResponse::ContactPage(api.roster_list(transport, after, since_rev).await),
-        ApiRequest::RosterAdd { transport, contact } => {
-            unit_or_err(api.roster_add(transport, contact).await)
-        }
-        ApiRequest::RosterUpdate { transport, contact } => {
-            unit_or_err(api.roster_update(transport, contact).await)
-        }
-        ApiRequest::RosterRemove { transport, contact } => {
-            unit_or_err(api.roster_remove(transport, contact).await)
-        }
+        ApiRequest::RosterAdd {
+            transport,
+            contact,
+            op_id: _,
+        } => unit_or_err(api.roster_add(transport, contact).await),
+        ApiRequest::RosterUpdate {
+            transport,
+            contact,
+            op_id: _,
+        } => unit_or_err(api.roster_update(transport, contact).await),
+        ApiRequest::RosterRemove {
+            transport,
+            contact,
+            op_id: _,
+        } => unit_or_err(api.roster_remove(transport, contact).await),
         ApiRequest::FtSend {
             transport,
             transfer,
+            op_id: _,
         } => unit_or_err(api.ft_send(transport, transfer).await),
         ApiRequest::FtReceive {
             transport,
@@ -707,10 +729,45 @@ async fn serve_access(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
 }
 
 /// Dispatch a request against a full [`NodeApi`] — the entry point the socket/TCP/JSON-RPC node
-/// transports call. Fans out to the per-surface `serve_*` helpers; every `ApiRequest` variant is
-/// routed by exactly one of them (verified by the `daemon-conformance` suite, which exercises the
-/// whole surface through `dispatch`).
+/// transports call.
+///
+/// Rung 3 (api vNEXT) wraps the fan-out with two verb-agnostic seams keyed off
+/// [`ApiRequest::op_id`]:
+/// 1. **Idempotent dedup** — before running an op that carries an `op_id`, consult
+///    [`ControlApi::command_dedup_lookup`]; a hit returns the ORIGINAL result bytes verbatim (no
+///    side effect, surfaced as the same success response). After a fresh, non-error run the result
+///    is recorded via [`ControlApi::command_dedup_store`] so a later retry deduplicates.
+/// 2. **Op-id dispatch context** — the op_id is bound as a task-local ([`with_op_id`]) for the
+///    handler, so a node-owned mutation stamps uniform `origin_op` provenance where it owns the
+///    change record, with no per-verb signature.
+///
+/// Errors are never cached (a transient/rejection must re-execute on retry — ADR-006 alt 6). Only
+/// a request that carries an `op_id` touches either seam; everything else dispatches directly.
 pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
+    let Some(op_id) = req.op_id().map(|s| s.to_string()) else {
+        return dispatch_inner(api, req).await;
+    };
+    // A duplicate returns the original result with no side effect (indistinguishable from the
+    // first ack — the point of returning the result, not an error).
+    if let Some(bytes) = api.command_dedup_lookup(&op_id).await {
+        if let Ok(resp) = ciborium::from_reader::<ApiResponse, _>(&bytes[..]) {
+            return resp;
+        }
+    }
+    let resp = with_op_id(Some(op_id.clone()), dispatch_inner(api, req)).await;
+    if !matches!(resp, ApiResponse::Error(_)) {
+        let mut buf = Vec::new();
+        if ciborium::into_writer(&resp, &mut buf).is_ok() {
+            api.command_dedup_store(&op_id, buf).await;
+        }
+    }
+    resp
+}
+
+/// The surface fan-out: every `ApiRequest` variant is routed by exactly one per-surface `serve_*`
+/// helper (verified by the `daemon-conformance` suite, which exercises the whole surface through
+/// [`dispatch`]).
+async fn dispatch_inner(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
     if let Some(resp) = serve_session(api, req.clone()).await {
         return resp;
     }

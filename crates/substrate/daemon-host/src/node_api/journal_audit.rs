@@ -62,6 +62,7 @@ impl NodeApiImpl {
         transport: &TransportId,
         conv: &str,
         message: &daemon_api::ChatMessage,
+        origin_op: Option<String>,
     ) -> bool {
         let stream = JournalStreamId::unit(&UnitId::new(format!(
             "conv:{}:{}",
@@ -83,7 +84,7 @@ impl NodeApiImpl {
                 }
             }
         };
-        if let Err(e) = sink.record_chat(message).await {
+        if let Err(e) = sink.record_chat(message, origin_op).await {
             tracing::warn!(error = %e, transport = %transport.as_str(), conv, "chat journal: record failed");
             return false;
         }
@@ -185,6 +186,8 @@ impl NodeApiImpl {
                     kind: view.kind,
                     timestamp_ms: view.timestamp_ms,
                     verified: seg_verified.get(&je.segment).copied().unwrap_or(false),
+                    // rung 3 (api vNEXT): the node-owned envelope's uniform operation provenance.
+                    origin_op: view.origin_op,
                     payload,
                 })
             })

@@ -618,6 +618,11 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             rev: 8,
             // rung 2 (api vNEXT): a delta read's removal tombstone (the client prunes it).
             removed: vec!["conv-007".into()],
+            // rung 3 (api vNEXT): the page-side `origin_ops` map — the changed conversation's
+            // latest reflected mutation carried this client op_id (carrier 2).
+            origin_ops: [("conv-064".to_string(), "018f3b9c-op".to_string())]
+                .into_iter()
+                .collect(),
         }),
     )?;
     // Conversation hierarchy (wire v38): a structural `Space` container (a root — no `parent`) and
@@ -652,6 +657,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             next: None,
             rev: 2,
             removed: Vec::new(),
+            origin_ops: std::collections::BTreeMap::new(),
         }),
     )?;
     // rung 2 (api vNEXT): the ConvHistory backward window — `before_cursor` present (a scroll-back
@@ -665,6 +671,41 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             after_cursor: 0,
             before_cursor: Some(9000),
             max: 64,
+        }),
+    )?;
+    // rung 3 (api vNEXT): a ConvSend carrying the client-minted op_id (the idempotency key + the
+    // provenance token), so verify-codec proves the generated zcbor C decoder accepts the additive
+    // `? op_id` member on conv-send-args.
+    write_cbor(
+        &out,
+        "request-conv-send.cbor",
+        &ApiRequest::ConvSend(daemon_api::ConvSendArgs {
+            transport: daemon_protocol::TransportId::new("rooms"),
+            conv: "conv-064".into(),
+            from: None,
+            message: daemon_protocol::UserMsg::new("hello"),
+            op_id: Some("018f3b9c-op".into()),
+        }),
+    )?;
+    // rung 3 (api vNEXT): the Bootstrap probe request + a response snapshot (revs + cursor +
+    // epoch), so verify-codec proves the generated decoder accepts the new request/response arms
+    // and the `{ * tstr => uint64 }` revs map.
+    write_cbor(&out, "request-bootstrap.cbor", &ApiRequest::Bootstrap)?;
+    write_cbor(
+        &out,
+        "response-bootstrap.cbor",
+        &ApiResponse::Bootstrap(daemon_api::BootstrapReport {
+            cursor: 42,
+            epoch: 1,
+            revs: [
+                ("roster".to_string(), 7u64),
+                ("fleet".to_string(), 9),
+                ("persons".to_string(), 6),
+                ("conv:rooms".to_string(), 8),
+                ("contacts:matrix/@me:hs.org".to_string(), 5),
+            ]
+            .into_iter()
+            .collect(),
         }),
     )?;
     // Server-side roster (wire v34): a paged list request + resume, the mutation requests carrying a
@@ -691,6 +732,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 presence: daemon_api::Presence::default(),
                 permission: daemon_api::ContactPermission::Allow,
             },
+            // rung 3 (api vNEXT): the client-minted idempotency key on a roster-edit lane verb.
+            op_id: Some("018f3b9c-roster".into()),
         },
     )?;
     write_cbor(
@@ -704,6 +747,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 presence: daemon_api::Presence::default(),
                 permission: daemon_api::ContactPermission::Unset,
             },
+            // rung 3 (api vNEXT): a token-less roster edit (the `? op_id` absent form).
+            op_id: None,
         },
     )?;
     write_cbor(
@@ -721,6 +766,10 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             rev: 5,
             // rung 2 (api vNEXT): a delta read's removal tombstone (the client prunes it).
             removed: vec!["@gone:matrix.org".into()],
+            // rung 3 (api vNEXT): the page-side `origin_ops` map (carrier 2).
+            origin_ops: [("@bob:matrix.org".to_string(), "018f3b9c-roster".to_string())]
+                .into_iter()
+                .collect(),
         }),
     )?;
     // Notifications (wire v37; port-notify): the read-only list op + a response carrying an
@@ -807,6 +856,10 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             }],
             // rung 2 (api vNEXT): a delta read's removal tombstone (the client prunes it).
             removed: vec!["person-gone".into()],
+            // rung 3 (api vNEXT): the page-side `origin_ops` map (carrier 2).
+            origin_ops: [("person-ada".to_string(), "018f3b9c-person".to_string())]
+                .into_iter()
+                .collect(),
         }),
     )?;
     // Account management (wire v35): the reversible-connect + persisted enabled/label + credential
@@ -1337,6 +1390,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             next_cursor: None,
             rev: 0,
             removed: Vec::new(),
+            origin_ops: std::collections::BTreeMap::new(),
         }),
     )?;
     // W6: the pure-local session recap op (request + a populated response), so verify-codec proves
@@ -1388,6 +1442,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 kind: "block.message".into(),
                 timestamp_ms: 911_347_200_000,
                 verified: true,
+                // rung 3 (api vNEXT): the node-owned envelope's uniform operation provenance
+                // (carrier 1) — this record was caused by a client op carrying this id.
+                origin_op: Some("018f3b9c-op".into()),
                 payload: JournalRecordPayload::Chat {
                     message: Box::new(ChatMessage {
                         id: Some("$evt:hs.org".into()),
@@ -1457,6 +1514,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     reason: None,
                     message: None,
                     fatal: false,
+                    origin_op: None,
                 },
                 // v30: a disconnect transition carrying a reason/message + the transient
                 // Disconnecting state (reconnect/backoff is node-owned; fatal:false = will retry).
@@ -1467,6 +1525,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     reason: Some(DisconnectReason::NetworkError),
                     message: Some("connection reset by peer".into()),
                     fatal: false,
+                    origin_op: None,
                 },
                 // v30: the two membership-push tiers.
                 NodeEvent::ConversationsChanged {
@@ -1475,6 +1534,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     change: ConvChange::Added,
                     // rung 1 (api vNEXT): the per-transport conversation-set rev.
                     rev: 2,
+                    // rung 3 (api vNEXT): carrier-3 provenance (null on adapter-reported changes).
+                    origin_op: None,
                 },
                 NodeEvent::MembershipChanged {
                     transport: TransportId::new("matrix/@bot:hs.org"),
@@ -1484,6 +1545,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     actor: Some("@admin:hs.org".into()),
                     reason: Some("cleanup".into()),
                     is_self: true,
+                    origin_op: None,
                 },
                 // v34: the roster-changed pointer, so verify-codec proves the generated decoder
                 // accepts the new node-event arm.
@@ -1501,6 +1563,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 NodeEvent::MessagesChanged {
                     transport: TransportId::new("matrix/@bot:hs.org"),
                     conv: "!room:hs.org".into(),
+                    // rung 3 (api vNEXT): carrier-3 provenance — the client send op that caused it.
+                    origin_op: Some("018f3b9c-op".into()),
                 },
             ],
             next_cursor: 13,
@@ -2012,6 +2076,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     message: Some("here you go".into()),
                     ..Default::default()
                 },
+                // rung 3 (api vNEXT): the client-minted idempotency key on the retry-sensitive
+                // direct FtSend verb (FtSend as an outboxed lane is deferred; §15).
+                op_id: Some("018f3b9c-ft".into()),
             },
         )?;
         write_cbor(
@@ -2055,6 +2122,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 settings: AccountSettingsValues {
                     values: values.clone(),
                 },
+                // rung 3 (api vNEXT): the client-minted idempotency key (retry-safe settings apply).
+                op_id: Some("018f3b9c-cfg".into()),
             },
         )?;
         write_cbor(

@@ -32,6 +32,7 @@ pub(super) async fn try_run(
                 title: Some(title),
                 ..Default::default()
             },
+            op_id: None,
         },
         Command::Pin { id, off } => ApiRequest::SessionUpdateMeta {
             session: SessionId::new(id),
@@ -39,6 +40,7 @@ pub(super) async fn try_run(
                 pinned: Some(!off),
                 ..Default::default()
             },
+            op_id: None,
         },
         Command::Archive { id, off } => ApiRequest::SessionUpdateMeta {
             session: SessionId::new(id),
@@ -46,6 +48,7 @@ pub(super) async fn try_run(
                 archived: Some(!off),
                 ..Default::default()
             },
+            op_id: None,
         },
         Command::Submit { id, text } => ApiRequest::Submit {
             session: SessionId::new(id),

@@ -20,7 +20,7 @@ use crate::{
     JournalPage, JournalSeal, ParkedApproval, Room, RoomMember, SessionMeta, SessionRole,
     SessionSearchHit, SessionStatus, SessionStore, StoreError, StoreStats, StoredCronJob,
     StoredCronRun, StoredCronSuggestion, StoredSavedPresence, TraceEntry, TraceSegment,
-    TransportPref, CRON_RUN_RETENTION,
+    TransportPref, COMMAND_DEDUP_TTL_MS, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -430,6 +430,23 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         // never configured (the empty map). Secrets never land here — they go to the credential
         // store via the auth flows.
         M::up("ALTER TABLE transport_prefs ADD COLUMN settings BLOB;"),
+        // M16 (rung 3, api vNEXT — op-id idempotent dedup): the durable command-dedup table. Keyed
+        // `(principal, op_id)`; `result` is the opaque CBOR of the original `ApiResponse` returned
+        // to a retry; `at_ms` is the insert time the 24h TTL is measured from (`COMMAND_DEDUP_TTL_MS`).
+        // The retry window that matters spans a node restart (06 open-Q5), so this is durable, not
+        // an in-memory LRU. Eviction is lazy (a read past the TTL deletes the stale row) plus the
+        // `at_ms` index so a periodic sweep can bound growth. INSERT OR IGNORE preserves the ORIGINAL
+        // result on a duplicate put (first-writer-wins).
+        M::up(
+            "CREATE TABLE command_dedup (\n\
+                 principal TEXT NOT NULL,\n\
+                 op_id     TEXT NOT NULL,\n\
+                 result    BLOB NOT NULL,\n\
+                 at_ms     INTEGER NOT NULL,\n\
+                 PRIMARY KEY (principal, op_id)\n\
+             );\n\
+             CREATE INDEX command_dedup_at ON command_dedup (at_ms);",
+        ),
     ])
 });
 
@@ -1882,6 +1899,57 @@ impl SessionStore for SqliteStore {
         Ok(())
     }
 
+    async fn command_dedup_get(
+        &self,
+        principal: &str,
+        op_id: &str,
+        now_ms: u64,
+    ) -> Option<Vec<u8>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(Vec<u8>, i64)> = conn
+            .query_row(
+                "SELECT result, at_ms FROM command_dedup WHERE principal = ?1 AND op_id = ?2",
+                params![principal, op_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        match row {
+            Some((result, at_ms)) if now_ms.saturating_sub(at_ms as u64) < COMMAND_DEDUP_TTL_MS => {
+                Some(result)
+            }
+            // Expired: evict lazily on access so a re-execution can re-cache.
+            Some(_) => {
+                let _ = conn.execute(
+                    "DELETE FROM command_dedup WHERE principal = ?1 AND op_id = ?2",
+                    params![principal, op_id],
+                );
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn command_dedup_put(
+        &self,
+        principal: &str,
+        op_id: &str,
+        result: Vec<u8>,
+        at_ms: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // First-writer-wins: a live duplicate is preserved (INSERT OR IGNORE). An expired row was
+        // already evicted by `command_dedup_get`, so a post-TTL re-execution re-inserts fresh.
+        conn.execute(
+            "INSERT OR IGNORE INTO command_dedup (principal, op_id, result, at_ms) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![principal, op_id, result, at_ms as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
     async fn gateway_override(&self) -> Option<(bool, Option<String>)> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -2659,8 +2727,9 @@ mod tests {
     /// gateway runtime-override `gateway_config` single-row setting, the Phase 1 inline
     /// sub-agent `session_meta.inline_profile` column, the wire-v35 `transport_prefs` +
     /// `credential_labels` account-management tables, the wire-v37 `saved_presences` +
-    /// `saved_presence_active` tables, the `custom_providers` table, and the wire-v38
-    /// `transport_prefs.settings` account-settings column).
+    /// `saved_presence_active` tables, the `custom_providers` table, the wire-v38
+    /// `transport_prefs.settings` account-settings column, and the rung-3 (api vNEXT)
+    /// `command_dedup` op-id idempotency table).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2671,7 +2740,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 15, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 16, "fresh DB is stamped to the latest migration");
     }
 
     /// `custom_provider_set`/`list`/`remove` round-trip identically on both the SQLite and in-memory

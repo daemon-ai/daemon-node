@@ -447,6 +447,10 @@ impl SupportsConversations for MatrixAdapter {
             conv,
             from,
             message,
+            // rung 3 (api vNEXT): the opaque client op token, round-tripped verbatim onto the
+            // server-acked send's lifecycle report (the node stamps `origin_op`; the adapter never
+            // interprets it).
+            op_id,
         } = args;
         // The Matrix account user is always the sender; `from` attribution is not forwarded onto the
         // Matrix wire (matrix-sdk posts as the bound account). The outbound projector posts the same
@@ -465,7 +469,7 @@ impl SupportsConversations for MatrixAdapter {
             msg.id = Some(response.response.event_id.to_string());
             msg.timestamp = Some(now);
             msg.set_delivered(true, now);
-            sink.chat_message(transport, conv, msg).await;
+            sink.chat_message(transport, conv, msg, op_id).await;
         }
         Ok(())
     }
@@ -516,6 +520,7 @@ impl SupportsMembership for MatrixAdapter {
             conv,
             who,
             message: _message,
+            op_id: _,
         } = args;
         let user = contact_mxid(&who)?;
         let room = self.room_for(&transport, &conv).await?;
@@ -530,6 +535,7 @@ impl SupportsMembership for MatrixAdapter {
             conv,
             who,
             reason,
+            op_id: _,
         } = args;
         let user = contact_mxid(&who)?;
         let room = self.room_for(&transport, &conv).await?;
@@ -544,6 +550,7 @@ impl SupportsMembership for MatrixAdapter {
             conv,
             who,
             reason,
+            op_id: _,
         } = args;
         let user = contact_mxid(&who)?;
         let room = self.room_for(&transport, &conv).await?;
@@ -558,6 +565,7 @@ impl SupportsMembership for MatrixAdapter {
             conv,
             who,
             role,
+            op_id: _,
         } = args;
         let user = contact_mxid(&who)?;
         let room = self.room_for(&transport, &conv).await?;
@@ -813,6 +821,7 @@ mod tests {
                 conv: room.as_str().to_string(),
                 from: None,
                 message: UserMsg::new("hello".to_string()),
+                op_id: None,
             },
         )
         .await
@@ -887,6 +896,7 @@ mod tests {
                 conv: room.as_str().to_string(),
                 who: agent,
                 message: None,
+                op_id: None,
             },
         )
         .await

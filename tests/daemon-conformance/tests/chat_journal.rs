@@ -71,6 +71,7 @@ fn messages_changed_round_trips() {
     let ev = NodeEvent::MessagesChanged {
         transport: TransportId::new("matrix/@bot:hs.org"),
         conv: "!room:hs.org".into(),
+        origin_op: None,
     };
     assert_eq!(ev, from_cbor::<NodeEvent>(&to_cbor(&ev)).unwrap());
 }
@@ -97,7 +98,7 @@ async fn sink_chat_message_journals_and_emits() {
         );
         inbound.id = Some("$evt1:hs.org".into());
         inbound.timestamp = Some(1_720_000_000);
-        sink.chat_message(transport.clone(), conv.to_string(), inbound.clone())
+        sink.chat_message(transport.clone(), conv.to_string(), inbound.clone(), None)
             .await;
 
         let history = |after_cursor: u64| {
@@ -135,7 +136,7 @@ async fn sink_chat_message_journals_and_emits() {
             .filter(|e| {
                 matches!(
                     e,
-                    NodeEvent::MessagesChanged { transport: t, conv: c }
+                    NodeEvent::MessagesChanged { transport: t, conv: c, .. }
                         if t == &transport && c == conv
                 )
             })
@@ -144,7 +145,7 @@ async fn sink_chat_message_journals_and_emits() {
 
         // A second (outbound, account-authored) message appends AFTER the first.
         let outbound = ChatMessage::new(None, "reply from the account");
-        sink.chat_message(transport.clone(), conv.to_string(), outbound.clone())
+        sink.chat_message(transport.clone(), conv.to_string(), outbound.clone(), None)
             .await;
 
         let page = history(0).await;

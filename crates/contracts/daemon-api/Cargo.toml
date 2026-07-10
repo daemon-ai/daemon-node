@@ -12,6 +12,10 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 async-trait = { workspace = true }
 ciborium = { workspace = true }
+# rung 3 (api vNEXT): a task-local op-id dispatch context (`op_context`) the shared `dispatch` core
+# binds around each handler so node-owned mutations stamp uniform `origin_op` provenance without a
+# per-verb signature. `task_local!` needs no runtime features.
+tokio = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 arbitrary = { workspace = true, optional = true }

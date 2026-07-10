@@ -75,6 +75,7 @@ impl RoomsNode {
             ApiRequest::ConvCreate {
                 transport: room(),
                 details,
+                op_id: None,
             },
         )
         .await
@@ -135,6 +136,7 @@ impl RoomsNode {
                 conv: conv.into(),
                 from: None,
                 message: UserMsg::new(text),
+                op_id: None,
             }),
         )
         .await
@@ -311,6 +313,7 @@ async fn roster_add(h: &RoomsNode, id: &str, name: &str) {
         ApiRequest::RosterAdd {
             transport: room(),
             contact: contact(id, Some(name)),
+            op_id: None,
         },
     )
     .await
@@ -370,6 +373,7 @@ async fn roster_list_delta_impl() {
         ApiRequest::RosterUpdate {
             transport: room(),
             contact: contact("agent-bob", Some("Bobby")),
+            op_id: None,
         },
     )
     .await
@@ -383,6 +387,7 @@ async fn roster_list_delta_impl() {
         ApiRequest::RosterRemove {
             transport: room(),
             contact: contact("agent-alice", None),
+            op_id: None,
         },
     )
     .await

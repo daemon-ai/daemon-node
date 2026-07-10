@@ -85,6 +85,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
         .call(ApiRequest::ConvCreate {
             transport: room.clone(),
             details,
+            op_id: None,
         })
         .await
         .unwrap()
@@ -113,6 +114,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
             transport: room.clone(),
             conv: "r1".into(),
             topic: Some("standup".into()),
+            op_id: None,
         })
         .await
         .unwrap();
@@ -131,6 +133,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
                 conv: "r1".into(),
                 who: who.clone(),
                 message: None,
+                op_id: None,
             }))
             .await
             .unwrap(),
@@ -152,6 +155,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
                 conv: "r1".into(),
                 from: None,
                 message: UserMsg::new("hey @bot please help"),
+                op_id: None,
             }))
             .await
             .unwrap(),
@@ -191,6 +195,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
                 conv: "r1".into(),
                 who,
                 reason: None,
+                op_id: None,
             }))
             .await
             .unwrap(),
@@ -232,7 +237,8 @@ async fn messaging_adapter_rooms_manage_over_socket() {
         client
             .call(ApiRequest::ConvCreate {
                 transport: room.clone(),
-                details: rr
+                details: rr,
+                op_id: None,
             })
             .await
             .unwrap(),
@@ -250,6 +256,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
                     conv: "r2".into(),
                     who,
                     message: None,
+                    op_id: None,
                 }))
                 .await
                 .unwrap(),
@@ -273,6 +280,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
                 conv: "r2".into(),
                 from: None,
                 message: UserMsg::new("kick off the discussion"),
+                op_id: None,
             }))
             .await
             .unwrap(),
@@ -375,8 +383,9 @@ async fn messaging_adapter_rooms_manage_over_socket() {
             .filter(|e| {
                 matches!(
                     e,
-                    daemon_api::NodeEvent::MessagesChanged { transport: t, conv }
-                        if t.as_str() == "room" && conv == "r2"
+                    daemon_api::NodeEvent::MessagesChanged {
+                        transport: t, conv, ..
+                    } if t.as_str() == "room" && conv == "r2"
                 )
             })
             .count(),
@@ -587,6 +596,7 @@ async fn messaging_adapter_roster_manage_over_socket() {
                 .call(ApiRequest::RosterAdd {
                     transport: transport.clone(),
                     contact: c,
+                    op_id: None,
                 })
                 .await
                 .unwrap(),
@@ -606,6 +616,7 @@ async fn messaging_adapter_roster_manage_over_socket() {
             .call(ApiRequest::RosterUpdate {
                 transport: transport.clone(),
                 contact: contact("@bob:hs", Some("Bobby")),
+                op_id: None,
             })
             .await
             .unwrap(),
@@ -624,6 +635,7 @@ async fn messaging_adapter_roster_manage_over_socket() {
             .call(ApiRequest::RosterRemove {
                 transport: transport.clone(),
                 contact: contact("@bob:hs", None),
+                op_id: None,
             })
             .await
             .unwrap(),
@@ -737,6 +749,7 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
                 .call(ApiRequest::RosterAdd {
                     transport: transport.clone(),
                     contact: c,
+                    op_id: None,
                 })
                 .await
                 .unwrap(),
@@ -759,6 +772,7 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
             .call(ApiRequest::RosterAdd {
                 transport: transport.clone(),
                 contact: contact("agent-alice", Some("Alice II")),
+                op_id: None,
             })
             .await
             .unwrap(),
@@ -771,6 +785,7 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
             .call(ApiRequest::RosterUpdate {
                 transport: transport.clone(),
                 contact: contact("agent-alice", Some("Alice Cooper")),
+                op_id: None,
             })
             .await
             .unwrap(),
@@ -789,6 +804,7 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
             .call(ApiRequest::RosterUpdate {
                 transport: transport.clone(),
                 contact: contact("agent-nobody", None),
+                op_id: None,
             })
             .await
             .unwrap(),
@@ -801,6 +817,7 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
             .call(ApiRequest::RosterRemove {
                 transport: transport.clone(),
                 contact: contact("agent-alice", None),
+                op_id: None,
             })
             .await
             .unwrap(),
@@ -811,6 +828,7 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
             .call(ApiRequest::RosterRemove {
                 transport: transport.clone(),
                 contact: contact("agent-alice", None),
+                op_id: None,
             })
             .await
             .unwrap(),
@@ -908,6 +926,7 @@ impl RoomsSocket {
                 .call(ApiRequest::ConvCreate {
                     transport: daemon_protocol::TransportId::new("room"),
                     details,
+                    op_id: None,
                 })
                 .await
                 .unwrap(),
@@ -925,6 +944,7 @@ impl RoomsSocket {
                     conv: conv.into(),
                     from,
                     message: UserMsg::new(text),
+                    op_id: None,
                 }))
                 .await
                 .unwrap(),
@@ -988,8 +1008,9 @@ impl RoomsSocket {
                 .filter(|e| {
                     matches!(
                         e,
-                        daemon_api::NodeEvent::MessagesChanged { transport, conv: c }
-                            if transport.as_str() == "room" && c == conv
+                        daemon_api::NodeEvent::MessagesChanged {
+                            transport, conv: c, ..
+                        } if transport.as_str() == "room" && c == conv
                     )
                 })
                 .count(),
@@ -1178,6 +1199,7 @@ async fn conv_list_pages_beyond_the_wire_bound() {
                 .call(ApiRequest::ConvCreate {
                     transport: room.clone(),
                     details,
+                    op_id: None,
                 })
                 .await
                 .unwrap(),

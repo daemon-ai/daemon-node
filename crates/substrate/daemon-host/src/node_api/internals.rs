@@ -203,14 +203,26 @@ pub(crate) const REMOVED_TOMBSTONE_CAP: usize = 256;
 /// `roster_delta`) generalized to string-keyed collections (persons globally; conversations and
 /// contacts per transport). In-memory like every rung-1 counter: a restart resets it, making any
 /// stored client rev unservable (-> full read; the accepted durability caveat, 06G2).
+/// The delta a [`DeltaIndex`] serves past a `since_rev`: the changed keys, the removed keys, the
+/// per-key `origin_op` provenance for changed keys whose causing mutation carried one (rung 3, api
+/// vNEXT — the page-side `origin_ops` map, carrier 2), and the current rev.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndexDelta {
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
+    pub origin_ops: std::collections::BTreeMap<String, String>,
+    pub rev: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct DeltaIndex {
     /// The collection's monotonic revision — the rung-1 coalescing counter, now owned here.
     rev: u64,
-    /// key -> the rev at its last change (upsert). A removed key leaves this map: its latest state
-    /// is the tombstone in `removed`, never both (an item in `items` AND `removed` on one page
-    /// would be ambiguous to apply).
-    changed: HashMap<String, u64>,
+    /// key -> `(rev at its last change, origin_op of the causing mutation)` (upsert). Rung 3 (api
+    /// vNEXT) widens the rung-2 `key -> rev` index to also carry the client op token that caused
+    /// the change (`None` when it carried none), which feeds the delta-page `origin_ops` map. A
+    /// removed key leaves this map: its latest state is the tombstone in `removed`, never both.
+    changed: HashMap<String, (u64, Option<String>)>,
     /// Removal tombstones `(rev, key)` in rev order, bounded at [`REMOVED_TOMBSTONE_CAP`].
     removed: VecDeque<(u64, String)>,
     /// The highest rev whose tombstone was evicted by the bound (`0` = none evicted). A
@@ -221,10 +233,11 @@ pub(crate) struct DeltaIndex {
 impl DeltaIndex {
     /// Bump the rev and record `key`'s change at it (upsert semantics; a pending tombstone for a
     /// re-added key is dropped — an item must never ride `items` AND `removed` on one page).
-    /// Returns the new rev for event stamping.
-    fn note_change(&mut self, key: &str) -> u64 {
+    /// `origin_op` (rung 3) is the client op token that caused the change (`None` = null
+    /// provenance). Returns the new rev for event stamping.
+    fn note_change(&mut self, key: &str, origin_op: Option<String>) -> u64 {
         self.rev += 1;
-        self.changed.insert(key.to_string(), self.rev);
+        self.changed.insert(key.to_string(), (self.rev, origin_op));
         self.removed.retain(|(_, k)| k != key);
         self.rev
     }
@@ -245,27 +258,36 @@ impl DeltaIndex {
         self.rev
     }
 
-    /// The delta past `since_rev`: `(changed keys, removed keys, current rev)` — or `None` when
+    /// The delta past `since_rev` (rung 2 changed/removed + rung 3 `origin_ops`) — or `None` when
     /// unservable: `since_rev` is ahead of `rev` (the node restarted and reset this in-memory
     /// index) or behind `removed_floor` (tombstones the client would need were evicted). The
     /// caller maps `None` to a full page (replace-and-prune client-side).
-    fn delta(&self, since_rev: u64) -> Option<(Vec<String>, Vec<String>, u64)> {
+    fn delta(&self, since_rev: u64) -> Option<IndexDelta> {
         if since_rev > self.rev || since_rev < self.removed_floor {
             return None;
         }
-        let changed: Vec<String> = self
-            .changed
-            .iter()
-            .filter(|(_, rev)| **rev > since_rev)
-            .map(|(k, _)| k.clone())
-            .collect();
+        let mut changed = Vec::new();
+        let mut origin_ops = std::collections::BTreeMap::new();
+        for (k, (rev, op)) in &self.changed {
+            if *rev > since_rev {
+                changed.push(k.clone());
+                if let Some(op) = op {
+                    origin_ops.insert(k.clone(), op.clone());
+                }
+            }
+        }
         let removed: Vec<String> = self
             .removed
             .iter()
             .filter(|(rev, _)| *rev > since_rev)
             .map(|(_, k)| k.clone())
             .collect();
-        Some((changed, removed, self.rev))
+        Some(IndexDelta {
+            changed,
+            removed,
+            origin_ops,
+            rev: self.rev,
+        })
     }
 }
 
@@ -277,9 +299,11 @@ pub(crate) struct NodeFeedInner {
     /// returned by `SessionsQuery`, so the two agree on which generation a refetch reflects. In-memory
     /// — resets to 0 on restart, which makes a stale client `since_rev` unservable (-> full page).
     rev: u64,
-    /// L4 delta index: the `rev` at each session's last roster change (rename/pin/archive/activity/
-    /// activation). `roster_delta(R)` returns the sessions whose value is `> R`.
-    changed: HashMap<SessionId, u64>,
+    /// L4 delta index: the `(rev, origin_op)` at each session's last roster change (rename/pin/
+    /// archive/activity/activation). `roster_delta(R)` returns the sessions whose rev is `> R`.
+    /// Rung 3 (api vNEXT) widens the value to carry the causing op token (the session-page
+    /// `origin_ops` map); `None` for changes with no op (activity/activation).
+    changed: HashMap<SessionId, (u64, Option<String>)>,
     /// L4 removal tombstones `(rev, session)` for sessions hard-removed from the roster. Effectively
     /// empty today (archive is a *change* with `archived=true`, not a removal; the store has no
     /// hard-delete) — reserved so the wire `removed` field is populated when a delete path lands.
@@ -346,10 +370,22 @@ impl NodeEventFeed {
     /// return it. The §5 emit hooks call this then stamp the returned `rev` onto the
     /// `RosterChanged`/`SessionMetaChanged` event, so the feed's `rev` and `SessionsQuery.rev` agree.
     pub(crate) fn note_roster_change(&self, session: &SessionId) -> u64 {
+        self.note_roster_change_op(session, None)
+    }
+
+    /// [`Self::note_roster_change`] carrying the causing op token (rung 3, api vNEXT): a
+    /// `SessionUpdateMeta` that carried an `op_id` records it here, so the session-page delta's
+    /// `origin_ops` map + the `SessionMetaChanged` pointer name the causing op. `None` = null
+    /// provenance (activity/activation stamps).
+    pub(crate) fn note_roster_change_op(
+        &self,
+        session: &SessionId,
+        origin_op: Option<String>,
+    ) -> u64 {
         let mut g = self.inner.lock().unwrap();
         g.rev += 1;
         let rev = g.rev;
-        g.changed.insert(session.clone(), rev);
+        g.changed.insert(session.clone(), (rev, origin_op));
         rev
     }
 
@@ -357,27 +393,37 @@ impl NodeEventFeed {
     /// `since_rev`, the sessions removed since then, and the current `rev`. Returns `None` when the
     /// delta is unservable — `since_rev` is ahead of our `rev` (the daemon restarted and reset the
     /// in-memory index, so the client must take a full page) — which the caller maps to a full query.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn roster_delta(
         &self,
         since_rev: u64,
-    ) -> Option<(Vec<SessionId>, Vec<SessionId>, u64)> {
+    ) -> Option<(
+        Vec<SessionId>,
+        Vec<SessionId>,
+        std::collections::BTreeMap<String, String>,
+        u64,
+    )> {
         let g = self.inner.lock().unwrap();
         if since_rev > g.rev {
             return None;
         }
-        let changed: Vec<SessionId> = g
-            .changed
-            .iter()
-            .filter(|(_, rev)| **rev > since_rev)
-            .map(|(s, _)| s.clone())
-            .collect();
+        let mut changed: Vec<SessionId> = Vec::new();
+        let mut origin_ops = std::collections::BTreeMap::new();
+        for (s, (rev, op)) in &g.changed {
+            if *rev > since_rev {
+                changed.push(s.clone());
+                if let Some(op) = op {
+                    origin_ops.insert(s.as_str().to_string(), op.clone());
+                }
+            }
+        }
         let removed: Vec<SessionId> = g
             .removed
             .iter()
             .filter(|(rev, _)| *rev > since_rev)
             .map(|(_, s)| s.clone())
             .collect();
-        Some((changed, removed, g.rev))
+        Some((changed, removed, origin_ops, g.rev))
     }
 
     /// The current roster revision (stamped on every `SessionsQuery` page, delta or full).
@@ -402,17 +448,27 @@ impl NodeEventFeed {
         g.profiles_rev
     }
 
-    /// Bump the persons revision, record `person` as changed (rung 2 delta index) or removed
-    /// (`removed = true` -> tombstone), and return the new rev (rung 1). The person-registry emit
-    /// hook calls this then stamps the returned `rev` onto a `PersonsChanged`, and `PersonList`
-    /// echoes the current value, so a burst of person writes collapses to one skip-if-unchanged
-    /// decision client-side.
+    /// Test convenience: a null-provenance persons change (production stamps `current_op_id()`).
+    #[cfg(test)]
     pub(crate) fn note_persons_change(&self, person: &str, removed: bool) -> u64 {
+        self.note_persons_change_op(person, removed, None)
+    }
+
+    /// Bump the persons revision, record `person` as changed (rung 2 delta index; rung 3 carries
+    /// the causing op token for the `response-persons` `origin_ops` map) or removed (`removed =
+    /// true` -> tombstone), and return the new rev (rung 1). The person-registry emit hook calls
+    /// this then stamps the returned `rev` onto a `PersonsChanged`. `origin_op` `None` = null.
+    pub(crate) fn note_persons_change_op(
+        &self,
+        person: &str,
+        removed: bool,
+        origin_op: Option<String>,
+    ) -> u64 {
         let mut g = self.inner.lock().unwrap();
         if removed {
             g.persons.note_remove(person)
         } else {
-            g.persons.note_change(person)
+            g.persons.note_change(person, origin_op)
         }
     }
 
@@ -423,7 +479,7 @@ impl NodeEventFeed {
 
     /// The persons delta past `since_rev` (rung 2): `(changed ids, removed ids, rev)`, or `None`
     /// when unservable (restart reset / tombstones evicted) — the caller serves a full list.
-    pub(crate) fn persons_delta(&self, since_rev: u64) -> Option<(Vec<String>, Vec<String>, u64)> {
+    pub(crate) fn persons_delta(&self, since_rev: u64) -> Option<IndexDelta> {
         self.inner.lock().unwrap().persons.delta(since_rev)
     }
 
@@ -449,18 +505,33 @@ impl NodeEventFeed {
 
     /// Bump a transport's contact-roster revision, record `contact` as changed or removed (rung 2
     /// delta index), and return the new rev (rung 1).
+    /// Test convenience: a null-provenance contacts change (production stamps `current_op_id()`).
+    #[cfg(test)]
     pub(crate) fn note_contacts_change(
         &self,
         transport: &TransportId,
         contact: &str,
         removed: bool,
     ) -> u64 {
+        self.note_contacts_change_op(transport, contact, removed, None)
+    }
+
+    /// Bump a transport's contact-roster revision, record `contact` as changed (rung 2 delta
+    /// index; rung 3 carries the causing op token for the `contact-page` `origin_ops` map) or
+    /// removed, and return the new rev (rung 1). `origin_op` `None` = null provenance.
+    pub(crate) fn note_contacts_change_op(
+        &self,
+        transport: &TransportId,
+        contact: &str,
+        removed: bool,
+        origin_op: Option<String>,
+    ) -> u64 {
         let mut g = self.inner.lock().unwrap();
         let index = g.contacts.entry(transport.clone()).or_default();
         if removed {
             index.note_remove(contact)
         } else {
-            index.note_change(contact)
+            index.note_change(contact, origin_op)
         }
     }
 
@@ -480,12 +551,17 @@ impl NodeEventFeed {
         &self,
         transport: &TransportId,
         since_rev: u64,
-    ) -> Option<(Vec<String>, Vec<String>, u64)> {
+    ) -> Option<IndexDelta> {
         let g = self.inner.lock().unwrap();
         // No index for the transport = rev 0: servable iff the client is also at 0 (empty delta).
         match g.contacts.get(transport) {
             Some(index) => index.delta(since_rev),
-            None => (since_rev == 0).then(|| (Vec::new(), Vec::new(), 0)),
+            None => (since_rev == 0).then(|| IndexDelta {
+                changed: Vec::new(),
+                removed: Vec::new(),
+                origin_ops: std::collections::BTreeMap::new(),
+                rev: 0,
+            }),
         }
     }
 
@@ -497,12 +573,24 @@ impl NodeEventFeed {
         conv: &str,
         removed: bool,
     ) -> u64 {
+        self.note_conversations_change_op(transport, conv, removed, None)
+    }
+
+    /// [`Self::note_conversations_change`] carrying the causing op token (rung 3, api vNEXT) for
+    /// the `conv-page` `origin_ops` map. `None` = null provenance.
+    pub(crate) fn note_conversations_change_op(
+        &self,
+        transport: &TransportId,
+        conv: &str,
+        removed: bool,
+        origin_op: Option<String>,
+    ) -> u64 {
         let mut g = self.inner.lock().unwrap();
         let index = g.conversations.entry(transport.clone()).or_default();
         if removed {
             index.note_remove(conv)
         } else {
-            index.note_change(conv)
+            index.note_change(conv, origin_op)
         }
     }
 
@@ -522,11 +610,16 @@ impl NodeEventFeed {
         &self,
         transport: &TransportId,
         since_rev: u64,
-    ) -> Option<(Vec<String>, Vec<String>, u64)> {
+    ) -> Option<IndexDelta> {
         let g = self.inner.lock().unwrap();
         match g.conversations.get(transport) {
             Some(index) => index.delta(since_rev),
-            None => (since_rev == 0).then(|| (Vec::new(), Vec::new(), 0)),
+            None => (since_rev == 0).then(|| IndexDelta {
+                changed: Vec::new(),
+                removed: Vec::new(),
+                origin_ops: std::collections::BTreeMap::new(),
+                rev: 0,
+            }),
         }
     }
 
@@ -538,6 +631,36 @@ impl NodeEventFeed {
     /// This feed's generation (rung 1), stamped onto every [`EventsPage`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Rung 3 (api vNEXT) — the race-free initial-sync baseline (06G6): the feed cursor + this
+    /// feed's generation + every tracked collection's current revision, snapshotted ATOMICALLY
+    /// under one `inner` lock acquisition. Because a single lock covers the cursor read AND every
+    /// rev read, the returned values are mutually consistent — a concurrent mutation either lands
+    /// entirely before the snapshot (reflected in both cursor and rev) or entirely after (in
+    /// neither), never torn across the two. Counts + cursors only (cheap; no entity payloads). The
+    /// `epoch` is immutable per feed, so it needs no lock. Keys are stable collection names the
+    /// client anchors its per-collection `since_rev` reads against.
+    pub(crate) fn bootstrap(&self) -> daemon_api::BootstrapReport {
+        let g = self.inner.lock().unwrap();
+        let mut revs = std::collections::BTreeMap::new();
+        revs.insert("roster".to_string(), g.rev);
+        revs.insert("fleet".to_string(), g.fleet_rev);
+        revs.insert("profiles".to_string(), g.profiles_rev);
+        revs.insert("persons".to_string(), g.persons.rev);
+        revs.insert("notifications".to_string(), g.notifications_rev);
+        revs.insert("catalog".to_string(), g.catalog_rev);
+        for (transport, index) in &g.conversations {
+            revs.insert(format!("conv:{}", transport.as_str()), index.rev);
+        }
+        for (transport, index) in &g.contacts {
+            revs.insert(format!("contacts:{}", transport.as_str()), index.rev);
+        }
+        daemon_api::BootstrapReport {
+            cursor: g.ring.head(),
+            epoch: self.epoch,
+            revs,
+        }
     }
 
     /// The `epoch` value to stamp onto an outgoing [`EventsPage`] (rung 1): this feed's generation.
@@ -792,6 +915,8 @@ fn emit_selector_change(
             feed.emit(NodeEvent::SessionMetaChanged {
                 session: session.clone(),
                 rev,
+                // Activity/activation stamps carry no client op token (null provenance).
+                origin_op: None,
             });
         }
     }
@@ -1910,7 +2035,11 @@ async fn index_and_title_session(
     }
     if let Some(feed) = &feed {
         let rev = feed.note_roster_change(&session);
-        feed.emit(NodeEvent::SessionMetaChanged { session, rev });
+        feed.emit(NodeEvent::SessionMetaChanged {
+            session,
+            rev,
+            origin_op: None,
+        });
     }
 }
 
@@ -2206,7 +2335,12 @@ mod node_feed_tests {
         feed.note_persons_change("p2", false); // rev 2
         feed.note_persons_change("p1", false); // rev 3 (p1 changed again)
 
-        let (mut changed, removed, rev) = feed.persons_delta(2).expect("servable");
+        let IndexDelta {
+            mut changed,
+            removed,
+            rev,
+            ..
+        } = feed.persons_delta(2).expect("servable");
         changed.sort();
         assert_eq!(rev, 3);
         assert_eq!(
@@ -2216,10 +2350,13 @@ mod node_feed_tests {
         );
         assert!(removed.is_empty());
 
-        let (changed, removed, rev) = feed.persons_delta(3).expect("servable at head");
-        assert_eq!((changed.len(), removed.len(), rev), (0, 0, 3));
+        let head = feed.persons_delta(3).expect("servable at head");
+        assert_eq!(
+            (head.changed.len(), head.removed.len(), head.rev),
+            (0, 0, 3)
+        );
 
-        let (mut changed, _, _) = feed.persons_delta(0).expect("servable from 0");
+        let mut changed = feed.persons_delta(0).expect("servable from 0").changed;
         changed.sort();
         assert_eq!(changed, vec!["p1".to_string(), "p2".to_string()]);
     }
@@ -2233,20 +2370,21 @@ mod node_feed_tests {
         feed.note_persons_change("p2", false); // rev 2
         feed.note_persons_change("p1", true); // rev 3: p1 removed
 
-        let (changed, removed, rev) = feed.persons_delta(2).expect("servable");
-        assert_eq!(rev, 3);
-        assert!(changed.is_empty(), "a removed key leaves the changed set");
-        assert_eq!(removed, vec!["p1".to_string()]);
+        let d = feed.persons_delta(2).expect("servable");
+        assert_eq!(d.rev, 3);
+        assert!(d.changed.is_empty(), "a removed key leaves the changed set");
+        assert_eq!(d.removed, vec!["p1".to_string()]);
 
         // A delta anchored AT the removal no longer needs the tombstone.
-        let (_, removed, _) = feed.persons_delta(3).expect("servable");
+        let removed = feed.persons_delta(3).expect("servable").removed;
         assert!(removed.is_empty());
 
         // Re-add: the pending tombstone is dropped; the key rides `changed` only.
         feed.note_persons_change("p1", false); // rev 4
-        let (changed, removed, rev) = feed.persons_delta(2).expect("servable");
-        assert_eq!(rev, 4);
-        assert_eq!(changed, vec!["p1".to_string()]);
+        let d = feed.persons_delta(2).expect("servable");
+        assert_eq!(d.rev, 4);
+        assert_eq!(d.changed, vec!["p1".to_string()]);
+        let removed = d.removed;
         assert!(
             removed.is_empty(),
             "a re-added key must not also ride `removed` (ambiguous apply)"
@@ -2284,9 +2422,10 @@ mod node_feed_tests {
             "a delta needing an evicted tombstone must be unservable"
         );
         // A client at the evicted tombstone's rev (2) needs only the retained ones -> servable.
-        let (_, removed, _) = feed
+        let removed = feed
             .conversations_delta(&t, 2)
-            .expect("servable at the floor");
+            .expect("servable at the floor")
+            .removed;
         assert_eq!(
             removed.len(),
             REMOVED_TOMBSTONE_CAP,
@@ -2305,21 +2444,18 @@ mod node_feed_tests {
         feed.note_contacts_change(&a, "@x:hs", true); // a rev 2
         feed.note_contacts_change(&b, "@x:hs", false); // b rev 1
 
-        let (changed, removed, rev) = feed.contacts_delta(&a, 1).expect("servable");
-        assert_eq!((changed.len(), rev), (0, 2));
-        assert_eq!(removed, vec!["@x:hs".to_string()]);
+        let da = feed.contacts_delta(&a, 1).expect("servable");
+        assert_eq!((da.changed.len(), da.rev), (0, 2));
+        assert_eq!(da.removed, vec!["@x:hs".to_string()]);
 
-        let (changed, removed, rev) = feed.contacts_delta(&b, 0).expect("servable");
-        assert_eq!(rev, 1);
-        assert_eq!(changed, vec!["@x:hs".to_string()]);
-        assert!(removed.is_empty(), "b never saw a removal");
+        let db = feed.contacts_delta(&b, 0).expect("servable");
+        assert_eq!(db.rev, 1);
+        assert_eq!(db.changed, vec!["@x:hs".to_string()]);
+        assert!(db.removed.is_empty(), "b never saw a removal");
 
         // An unseen transport: servable only at rev 0 (the empty delta); anything else degrades.
         let c = TransportId::new("xmpp/c");
-        assert_eq!(
-            feed.contacts_delta(&c, 0),
-            Some((Vec::new(), Vec::new(), 0))
-        );
+        assert_eq!(feed.contacts_delta(&c, 0), Some(IndexDelta::default()));
         assert!(feed.contacts_delta(&c, 5).is_none());
     }
 

@@ -80,6 +80,7 @@ fn membership_events_round_trip() {
             conv: "!r:hs".into(),
             change: ConvChange::Added,
             rev: 3,
+            origin_op: None,
         },
         NodeEvent::MembershipChanged {
             transport: TransportId::new("matrix/@bot:hs.org"),
@@ -89,6 +90,7 @@ fn membership_events_round_trip() {
             actor: Some("@admin:hs".into()),
             reason: Some("cleanup".into()),
             is_self: true,
+            origin_op: None,
         },
     ];
     for ev in events {

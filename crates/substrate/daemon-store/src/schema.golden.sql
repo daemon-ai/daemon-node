@@ -1,3 +1,4 @@
+CREATE INDEX command_dedup_at ON command_dedup (at_ms);
 CREATE INDEX completion_notices_parent ON completion_notices (parent_session);
 CREATE INDEX cron_jobs_due ON cron_jobs (paused, next_fire_unix);
 CREATE INDEX cron_runs_job ON cron_runs (job_id, rowseq);
@@ -21,6 +22,13 @@ CREATE TABLE chat_routes (
     session_id TEXT NOT NULL,
     profile    TEXT,
     descriptor BLOB NOT NULL
+);
+CREATE TABLE command_dedup (
+principal TEXT NOT NULL,
+op_id     TEXT NOT NULL,
+result    BLOB NOT NULL,
+at_ms     INTEGER NOT NULL,
+PRIMARY KEY (principal, op_id)
 );
 CREATE TABLE completion_inbox (
     rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
