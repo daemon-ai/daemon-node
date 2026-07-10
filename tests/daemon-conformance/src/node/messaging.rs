@@ -20,12 +20,8 @@ async fn messaging_adapter_rooms_manage_over_socket() {
     std::fs::create_dir_all(&dir).unwrap();
     let store: Arc<dyn SessionStore> =
         Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
-    let AssembledNode {
-        node,
-        handle,
-        signer,
-        ..
-    } = assemble_over(store.clone(), 0, [0x5d; 32], fast_host_config());
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store.clone(), 0, [0x5d; 32], fast_host_config());
 
     // Register the Rooms adapter (enabled) + a Matrix adapter (off; enumeration only), then drive
     // lifecycle from the node exactly as `bins/daemon` does.
@@ -37,8 +33,8 @@ async fn messaging_adapter_rooms_manage_over_socket() {
     let registry = daemon_host::AdapterRegistry::new()
         .with_adapter(daemon_rooms::RoomsAdapter::new(
             store.clone(),
-            signer,
             rooms_cfg,
+            Some(node.lifecycle_sink()),
         ))
         .with_adapter(daemon_matrix::MatrixAdapter::new(
             provisioning,
@@ -308,7 +304,9 @@ async fn messaging_adapter_rooms_manage_over_socket() {
         "the round-robin cascade must re-inject a reply and open a turn on both member sessions"
     );
 
-    // The merged room transcript records every post (operator + agent replies), verified.
+    // The merged room transcript records every post (operator + agent replies) as rich
+    // `JournalRecordPayload::Chat` records (wire vNEXT; the coarse `Block` shape is retired from
+    // the conv journal), verified, in append order.
     let history = match client
         .call(ApiRequest::ConvHistory(daemon_api::ConvHistoryArgs {
             transport: room.clone(),
@@ -322,18 +320,70 @@ async fn messaging_adapter_rooms_manage_over_socket() {
         ApiResponse::Journal(page) => page,
         other => panic!("expected Journal, got {other:?}"),
     };
-    let blocks = history
+    let chats: Vec<&daemon_api::JournalRecord> = history
         .entries
         .iter()
-        .filter(|e| matches!(e.payload, daemon_api::JournalRecordPayload::Block { .. }))
-        .count();
+        .filter(|e| matches!(e.payload, daemon_api::JournalRecordPayload::Chat { .. }))
+        .collect();
     assert!(
-        blocks >= 2,
-        "room transcript must contain the operator post + >=1 agent reply, got {blocks}"
+        chats.len() >= 2,
+        "room transcript must contain the operator post + >=1 agent reply as Chat records, got {}",
+        chats.len()
     );
     assert!(
         history.entries.iter().all(|e| e.verified),
-        "every transcript block must verify against the node signer"
+        "every transcript record must verify against the node signer"
+    );
+    assert!(
+        history
+            .entries
+            .windows(2)
+            .all(|w| w[0].cursor < w[1].cursor),
+        "history reads back in append order with strictly-increasing cursors"
+    );
+    // The operator post is first (account-originated: no author), carrying the RAW text —
+    // attribution rides the structured `author`, never the body.
+    match &chats[0].payload {
+        daemon_api::JournalRecordPayload::Chat { message } => {
+            assert_eq!(message.text, "kick off the discussion");
+            assert_eq!(message.author, None, "operator post has no author");
+        }
+        other => panic!("expected Chat, got {other:?}"),
+    }
+    // The re-injected member replies carry the member's structured identity.
+    assert!(
+        chats[1..].iter().any(|e| matches!(
+            &e.payload,
+            daemon_api::JournalRecordPayload::Chat { message } if message.author.is_some()
+        )),
+        "a loopback-delivered member reply is journaled with its author"
+    );
+    // Every append raised the granular MessagesChanged pointer for (room, r2) on the L3 feed.
+    let messages_changed = match client
+        .call(ApiRequest::EventsSince {
+            cursor: 0,
+            wait_ms: None,
+        })
+        .await
+        .unwrap()
+    {
+        ApiResponse::EventsPage(page) => page
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    daemon_api::NodeEvent::MessagesChanged { transport: t, conv }
+                        if t.as_str() == "room" && conv == "r2"
+                )
+            })
+            .count(),
+        other => panic!("expected EventsPage, got {other:?}"),
+    };
+    assert!(
+        messages_changed >= chats.len(),
+        "MessagesChanged must be emitted per Chat append (>= {} for r2, got {messages_changed})",
+        chats.len()
     );
 
     // Delete the room: it disappears from `get`.
@@ -629,19 +679,15 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
     std::fs::create_dir_all(&dir).unwrap();
     let store: Arc<dyn SessionStore> =
         Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
-    let AssembledNode {
-        node,
-        handle,
-        signer,
-        ..
-    } = assemble_over(store.clone(), 0, [0x5f; 32], fast_host_config());
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store.clone(), 0, [0x5f; 32], fast_host_config());
 
     let rooms_cfg = daemon_rooms::RoomsConfig {
         enabled: true,
         max_turns: 8,
     };
     let registry = daemon_host::AdapterRegistry::new().with_adapter(
-        daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg),
+        daemon_rooms::RoomsAdapter::new(store.clone(), rooms_cfg, Some(node.lifecycle_sink())),
     );
     node.set_adapters(registry);
     let adapter_tasks = node.spawn_adapters().await;
@@ -802,6 +848,282 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A node + live Rooms adapter served over a Unix socket — the shared bring-up for the chat-journal
+/// tests below (mirrors `messaging_adapter_rooms_manage_over_socket`, which keeps its own inline
+/// copy). Rooms persist to the durable store (InMemoryStore's `room_*` are no-ops), so sqlite.
+struct RoomsSocket {
+    client: ApiClient,
+    handle: daemon_host::SupervisorHandle,
+    server: tokio::task::JoinHandle<()>,
+    adapter_tasks: Vec<tokio::task::JoinHandle<()>>,
+    path: std::path::PathBuf,
+    dir: std::path::PathBuf,
+}
+
+impl RoomsSocket {
+    async fn bring_up(tag: &str, seed: [u8; 32]) -> Self {
+        let dir = std::env::temp_dir().join(format!("daemon-rooms-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn SessionStore> =
+            Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
+        let AssembledNode { node, handle, .. } =
+            assemble_over(store.clone(), 0, seed, fast_host_config());
+
+        let rooms_cfg = daemon_rooms::RoomsConfig {
+            enabled: true,
+            max_turns: 8,
+        };
+        let registry = daemon_host::AdapterRegistry::new().with_adapter(
+            daemon_rooms::RoomsAdapter::new(store.clone(), rooms_cfg, Some(node.lifecycle_sink())),
+        );
+        node.set_adapters(registry);
+        let adapter_tasks = node.spawn_adapters().await;
+
+        let path = temp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind api socket");
+        let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+        let client = ApiClient::new(path.clone());
+        Self {
+            client,
+            handle,
+            server,
+            adapter_tasks,
+            path,
+            dir,
+        }
+    }
+
+    /// Create a members-less room `id` (journal-only posts: the floor/fan-out half stays inert).
+    async fn create_room(&self, id: &str) {
+        let mut details = daemon_api::CreateConversationDetails::default();
+        details.extras.values.insert("id".into(), id.into());
+        details.extras.values.insert("name".into(), id.into());
+        assert!(matches!(
+            self.client
+                .call(ApiRequest::ConvCreate {
+                    transport: daemon_protocol::TransportId::new("room"),
+                    details,
+                })
+                .await
+                .unwrap(),
+            ApiResponse::Conversation(Some(_))
+        ));
+    }
+
+    /// `ConvSend` to `conv` (Ok expected; the journal append happens on the async serve loop).
+    async fn send(&self, conv: &str, from: Option<daemon_api::Participant>, text: &str) {
+        use daemon_protocol::UserMsg;
+        assert!(matches!(
+            self.client
+                .call(ApiRequest::ConvSend(daemon_api::ConvSendArgs {
+                    transport: daemon_protocol::TransportId::new("room"),
+                    conv: conv.into(),
+                    from,
+                    message: UserMsg::new(text),
+                }))
+                .await
+                .unwrap(),
+            ApiResponse::Ok
+        ));
+    }
+
+    /// One `ConvHistory` page for `conv`.
+    async fn history(
+        &self,
+        conv: &str,
+        after_cursor: u64,
+        max: u32,
+    ) -> daemon_api::JournalPageView {
+        match self
+            .client
+            .call(ApiRequest::ConvHistory(daemon_api::ConvHistoryArgs {
+                transport: daemon_protocol::TransportId::new("room"),
+                conv: conv.into(),
+                after_cursor,
+                max,
+            }))
+            .await
+            .unwrap()
+        {
+            ApiResponse::Journal(page) => page,
+            other => panic!("expected Journal, got {other:?}"),
+        }
+    }
+
+    /// Poll `ConvHistory` until it holds at least `n` entries, all sealed+verified (the send path
+    /// journals on the adapter's async serve loop; the seal follows the append), or the deadline
+    /// passes — returning the page either way so the caller's assertions report the actual state.
+    async fn history_at_least(&self, conv: &str, n: usize) -> daemon_api::JournalPageView {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let page = self.history(conv, 0, 0).await;
+            let settled = page.entries.len() >= n && page.entries.iter().all(|e| e.verified);
+            if settled || Instant::now() >= deadline {
+                return page;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The `MessagesChanged` pointers currently on the node-wide feed for `(room, conv)`.
+    async fn messages_changed(&self, conv: &str) -> usize {
+        match self
+            .client
+            .call(ApiRequest::EventsSince {
+                cursor: 0,
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+        {
+            ApiResponse::EventsPage(page) => page
+                .events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        daemon_api::NodeEvent::MessagesChanged { transport, conv: c }
+                            if transport.as_str() == "room" && c == conv
+                    )
+                })
+                .count(),
+            other => panic!("expected EventsPage, got {other:?}"),
+        }
+    }
+
+    async fn tear_down(self) {
+        self.server.abort();
+        for task in &self.adapter_tasks {
+            task.abort();
+        }
+        self.handle.shutdown().await;
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The journal obligation on the rooms send path (wire vNEXT): every `ConvSend` — operator
+/// (`from: None`) and contact-attributed alike — appends one `JournalRecordPayload::Chat` with a
+/// properly populated `ChatMessage` (structured author, RAW text, timestamp) to
+/// `conv:room:<conv>`, readable via `ConvHistory` in append order, and each append raises exactly
+/// one granular `NodeEvent::MessagesChanged { transport: "room", conv }` on the L3 feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conv_send_journals_chat_and_emits_messages_changed() {
+    let h = RoomsSocket::bring_up("chatjournal", [0x60; 32]).await;
+    h.create_room("j1").await;
+
+    // An operator post (`from: None`) and a contact-attributed post.
+    h.send("j1", None, "hello there").await;
+    let alice = daemon_api::Participant::Contact(daemon_api::ContactInfo {
+        id: "@alice:ext".into(),
+        ..daemon_api::ContactInfo::default()
+    });
+    h.send("j1", Some(alice.clone()), "hi from alice").await;
+
+    let page = h.history_at_least("j1", 2).await;
+    assert_eq!(
+        page.entries.len(),
+        2,
+        "two sends = two journal records, got {page:?}"
+    );
+    assert!(
+        page.entries.windows(2).all(|w| w[0].cursor < w[1].cursor),
+        "append order with strictly-increasing cursors"
+    );
+    for entry in &page.entries {
+        assert_eq!(entry.kind, "chat.message");
+        assert!(entry.verified, "per-message segments seal + verify");
+    }
+    match &page.entries[0].payload {
+        daemon_api::JournalRecordPayload::Chat { message } => {
+            assert_eq!(message.text, "hello there");
+            assert_eq!(message.author, None, "operator post: account-originated");
+            assert!(message.timestamp.is_some(), "the append stamps a timestamp");
+        }
+        other => panic!("expected Chat, got {other:?}"),
+    }
+    match &page.entries[1].payload {
+        daemon_api::JournalRecordPayload::Chat { message } => {
+            assert_eq!(message.text, "hi from alice");
+            assert_eq!(
+                message.author,
+                Some(alice),
+                "the ConvSend `from` participant rides ChatMessage::author"
+            );
+        }
+        other => panic!("expected Chat, got {other:?}"),
+    }
+
+    // One MessagesChanged per append, carrying the right (transport, conv).
+    assert_eq!(
+        h.messages_changed("j1").await,
+        2,
+        "each Chat append emits exactly one MessagesChanged"
+    );
+    assert_eq!(
+        h.messages_changed("nonexistent").await,
+        0,
+        "pointers are granular per conversation"
+    );
+
+    h.tear_down().await;
+}
+
+/// ConvHistory paging over Chat records (wire vNEXT): N messages page through `after_cursor + max`
+/// with stable, strictly-increasing cursors, no dup or gap, in append order — and a re-read from
+/// the same cursor returns the same page (non-destructive).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conv_history_pages_chat_records_with_stable_cursors() {
+    let h = RoomsSocket::bring_up("chatpaging", [0x61; 32]).await;
+    h.create_room("pg").await;
+
+    let total = 5usize;
+    for i in 0..total {
+        h.send("pg", None, &format!("m{i}")).await;
+    }
+    let all = h.history_at_least("pg", total).await;
+    assert_eq!(all.entries.len(), total, "all sends journaled, got {all:?}");
+
+    // Page with max=2: sizes 2+2+1, cursor-chained, union == append order, cursors monotonic.
+    let mut after = 0u64;
+    let mut sizes = Vec::new();
+    let mut texts = Vec::new();
+    let mut last_cursor = 0u64;
+    loop {
+        let page = h.history("pg", after, 2).await;
+        if page.entries.is_empty() {
+            break;
+        }
+        assert!(page.entries.len() <= 2, "max bounds the page");
+        // Stability: a re-read from the same cursor returns the identical page.
+        let again = h.history("pg", after, 2).await;
+        assert_eq!(page.entries, again.entries, "reads are non-destructive");
+        for entry in &page.entries {
+            assert!(entry.cursor > last_cursor, "cursors strictly increase");
+            last_cursor = entry.cursor;
+            match &entry.payload {
+                daemon_api::JournalRecordPayload::Chat { message } => {
+                    texts.push(message.text.clone())
+                }
+                other => panic!("expected Chat, got {other:?}"),
+            }
+        }
+        sizes.push(page.entries.len());
+        assert_eq!(
+            page.next_cursor, last_cursor,
+            "next_cursor is the last entry's cursor"
+        );
+        after = page.next_cursor;
+    }
+    assert_eq!(sizes, vec![2, 2, 1], "5 messages page as 2 + 2 + 1");
+    let expected: Vec<String> = (0..total).map(|i| format!("m{i}")).collect();
+    assert_eq!(texts, expected, "sent messages read back in append order");
+
+    h.tear_down().await;
+}
+
 /// Wire page bound (v25): `ConvList` over a transport holding more than `WIRE_PAGE_MAX`
 /// conversations is served in cursor pages through real dispatch/CBOR — 70 rooms page as 64 + 6,
 /// the `next` cursor chains the pages, and the union is exactly the full set with no dup or gap.
@@ -815,19 +1137,15 @@ async fn conv_list_pages_beyond_the_wire_bound() {
     std::fs::create_dir_all(&dir).unwrap();
     let store: Arc<dyn SessionStore> =
         Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
-    let AssembledNode {
-        node,
-        handle,
-        signer,
-        ..
-    } = assemble_over(store.clone(), 0, [0x5e; 32], fast_host_config());
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store.clone(), 0, [0x5e; 32], fast_host_config());
 
     let rooms_cfg = daemon_rooms::RoomsConfig {
         enabled: true,
         max_turns: 8,
     };
     let registry = daemon_host::AdapterRegistry::new().with_adapter(
-        daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg),
+        daemon_rooms::RoomsAdapter::new(store.clone(), rooms_cfg, Some(node.lifecycle_sink())),
     );
     node.set_adapters(registry);
     let adapter_tasks = node.spawn_adapters().await;

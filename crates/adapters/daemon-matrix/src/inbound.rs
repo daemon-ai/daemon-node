@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Inbound: Matrix room messages -> `Origin` + `Reception` -> the `daemon-ingest` gate.
+//! Inbound: Matrix room messages -> `Origin` + `Reception` -> the `daemon-ingest` gate, PLUS the
+//! wire-vNEXT journal obligation (every inbound message is reported through the node
+//! [`LifecycleSink`](daemon_api::LifecycleSink) so the conversation's durable chat history grows
+//! and `MessagesChanged` fires — in addition to the ingest routing, never instead of it).
 //!
 //! The adapter keeps only the *transport-specific* piece — classifying whether a message is
 //! *addressed* (mention / DM / `!command`) — and hands a normalised [`Reception`] to the reusable
@@ -40,6 +43,11 @@ pub struct InboundCtx {
     pub transport: TransportId,
     /// This account's own user id — messages from it are ignored (no self-loop).
     pub me: OwnedUserId,
+    /// The node-owned lifecycle sink (wire vNEXT): every inbound message is reported through it so
+    /// the node journals a `Chat` record on `conv:<transport>:<room>` and emits `MessagesChanged` —
+    /// in ADDITION to the agent-session `Ingestor` routing below, never instead of it. `None` in
+    /// unit tests that never wire the node.
+    pub sink: Option<Arc<dyn daemon_api::LifecycleSink>>,
 }
 
 /// Whether `body`/`mentions` address `me`: an explicit `m.mentions` entry, or the user id / localpart
@@ -72,11 +80,32 @@ pub async fn on_room_message(ev: OriginalSyncRoomMessageEvent, room: Room, ctx: 
     };
 
     let room_id = room.room_id().as_str().to_string();
+
+    // Journal obligation (wire vNEXT): report EVERY inbound message through the node sink, which
+    // appends a `Chat` record onto `conv:<transport>:<room>` and emits `MessagesChanged`. This is
+    // the transport-level conversation history, so it happens BEFORE the route table below — that
+    // table only gates *agent engagement*. The record carries the RAW body + the sender's MXID as
+    // the structured author (attribution never rides the text).
+    if let Some(sink) = &ctx.sink {
+        let mut msg = daemon_api::ChatMessage::new(
+            Some(daemon_api::Participant::Contact(daemon_api::ContactInfo {
+                id: ev.sender.to_string(),
+                ..Default::default()
+            })),
+            body.clone(),
+        );
+        msg.id = Some(ev.event_id.to_string());
+        msg.timestamp = Some(u64::from(ev.origin_server_ts.get()) / 1000);
+        sink.chat_message(ctx.transport.clone(), room_id.clone(), msg)
+            .await;
+    }
+
     let is_dm = room.is_direct().await.unwrap_or(false);
 
     let route = match config::route_for(&ctx.routes, &ctx.bare, &room_id, is_dm) {
         Some(r) => r,
-        // A configured route table that doesn't match this room: the adapter ignores it.
+        // A configured route table that doesn't match this room: the adapter ignores it (the
+        // history record above still landed — journaling is transport-level, not route-gated).
         None => return,
     };
 

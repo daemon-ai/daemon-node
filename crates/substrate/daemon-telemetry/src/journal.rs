@@ -44,6 +44,14 @@ pub enum JournalPayload {
         /// The opaque encoded block (CBOR by convention).
         body: Vec<u8>,
     },
+    /// One conversation chat message (wire vNEXT): opaque CBOR of a `daemon-api` `ChatMessage`,
+    /// the per-message record a messaging adapter's send/inbound obligation appends to a
+    /// `conv:<transport>:<conv>` stream. Opaque here for the same reason as `Block`: the
+    /// crypto/store layers stay contract-free; the host's history reader decodes it.
+    Chat {
+        /// The opaque encoded message (CBOR by convention).
+        body: Vec<u8>,
+    },
 }
 
 /// One journal entry: the canonical, replayable record the host appends and a reader decodes. The
@@ -105,9 +113,11 @@ fn entry_envelope(v: &JournalEntryView) -> Envelope {
     }
     match &v.payload {
         JournalPayload::Management { detail } => env.add_assertion("detail", detail.clone()),
-        // The block body is hashed (as hex) so any mutation invalidates the digest; the raw bytes
-        // ride the stored CBOR for replay.
+        // The block/chat bodies are hashed (as hex) so any mutation invalidates the digest; the
+        // raw bytes ride the stored CBOR for replay. Distinct assertion names keep a Chat entry's
+        // digest disjoint from a Block entry carrying identical bytes.
         JournalPayload::Block { body } => env.add_assertion("block", hex(body)),
+        JournalPayload::Chat { body } => env.add_assertion("chat", hex(body)),
     }
 }
 

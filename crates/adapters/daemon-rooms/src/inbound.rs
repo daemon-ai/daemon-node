@@ -65,12 +65,14 @@ impl Membership {
         self.by_room.remove(room);
     }
 
-    /// Reverse lookup: the `(room, member handle)` bound to `session`, if any. The outbound loop uses
-    /// this to resolve which Room a finished member turn belongs to before re-injecting it.
-    pub fn find_by_session(&self, session: &SessionId) -> Option<(RoomId, String)> {
+    /// Reverse lookup: the full [`RoomMember`] binding of `session` (+ its room), if any. The
+    /// outbound loop uses this to resolve which Room a finished member turn belongs to before
+    /// re-injecting it — and the member's profile binding, so the journal record's author keeps
+    /// the structured agent identity.
+    pub fn find_by_session(&self, session: &SessionId) -> Option<(RoomId, RoomMember)> {
         for (room, members) in &self.by_room {
             if let Some(m) = members.iter().find(|m| &m.session == session) {
-                return Some((room.clone(), m.member.clone()));
+                return Some((room.clone(), m.clone()));
             }
         }
         None

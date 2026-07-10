@@ -50,6 +50,51 @@ impl NodeApiImpl {
         Ok(out)
     }
 
+    /// Journal + seal one conversation chat message onto the verifiable `conv:<transport>:<conv>`
+    /// stream (wire vNEXT) — the append half of the [`LifecycleSink::chat_message`] seam every
+    /// messaging adapter reports its sends/deliveries through. One long-lived sink per stream
+    /// (mirroring [`Self::audit_management`]'s `mgmt_journal`) so the chain links per message and
+    /// concurrent appends to one conversation share a segment/seq source. Returns whether the
+    /// record landed durably (the caller emits `MessagesChanged` only then); no-op `false` when
+    /// journaling is disabled.
+    pub(crate) async fn journal_chat_message(
+        &self,
+        transport: &TransportId,
+        conv: &str,
+        message: &daemon_api::ChatMessage,
+    ) -> bool {
+        let stream = JournalStreamId::unit(&UnitId::new(format!(
+            "conv:{}:{}",
+            transport.as_str(),
+            conv
+        )));
+        let sink = {
+            let mut guard = self.chat_journals.lock().unwrap();
+            match guard.get(&stream) {
+                Some(sink) => sink.clone(),
+                None => {
+                    let Some(signer) = self.verifier.clone() else {
+                        return false;
+                    };
+                    let sink =
+                        Arc::new(JournalSink::new(self.store.clone(), signer, stream.clone()));
+                    guard.insert(stream, sink.clone());
+                    sink
+                }
+            }
+        };
+        if let Err(e) = sink.record_chat(message).await {
+            tracing::warn!(error = %e, transport = %transport.as_str(), conv, "chat journal: record failed");
+            return false;
+        }
+        // Seal per message so each record verifies immediately (`JournalRecord::verified`); a seal
+        // hiccup leaves the record durable in an open segment, so the pointer still goes out.
+        if let Err(e) = sink.seal().await {
+            tracing::warn!(error = %e, transport = %transport.as_str(), conv, "chat journal: seal failed");
+        }
+        true
+    }
+
     /// Read a stream's durable verifiable history: cursor-page the store, decode each entry to its
     /// typed view, decode block bodies into `TranscriptBlock`s, and stamp each entry with the
     /// verification result of its sealed segment. Non-destructive (the live drains are separate).
@@ -92,6 +137,13 @@ impl NodeApiImpl {
                     JournalPayload::Block { body } => {
                         let block: TranscriptBlock = ciborium::from_reader(&body[..]).ok()?;
                         JournalRecordPayload::Block { block }
+                    }
+                    JournalPayload::Chat { body } => {
+                        let message: daemon_api::ChatMessage =
+                            ciborium::from_reader(&body[..]).ok()?;
+                        JournalRecordPayload::Chat {
+                            message: Box::new(message),
+                        }
                     }
                 };
                 Some(JournalRecord {

@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
@@ -129,6 +130,14 @@ impl MatrixAdapter {
             .get_room(&room_id)
             .ok_or_else(|| ApiError::Other(format!("matrix room {conv} not found")))
     }
+}
+
+/// Unix seconds now — the adapter-side clock the journal record's timestamps are stamped with.
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Extract the target Matrix user id from a membership `Participant`. Matrix membership targets a
@@ -436,16 +445,29 @@ impl SupportsConversations for MatrixAdapter {
         let ConvSendArgs {
             transport,
             conv,
-            from: _from,
+            from,
             message,
         } = args;
         // The Matrix account user is always the sender; `from` attribution is not forwarded onto the
-        // wire (matrix-sdk posts as the bound account). The outbound projector posts the same way.
+        // Matrix wire (matrix-sdk posts as the bound account). The outbound projector posts the same
+        // way. Daemon-side, `from` DOES ride the journal record's author below.
         let room = self.room_for(&transport, &conv).await?;
-        room.send(RoomMessageEventContent::text_plain(message.text))
+        let response = room
+            .send(RoomMessageEventContent::text_plain(message.text.clone()))
             .await
-            .map(|_| ())
-            .map_err(|e| ApiError::Other(format!("matrix send: {e}")))
+            .map_err(|e| ApiError::Other(format!("matrix send: {e}")))?;
+        // Journal obligation (wire vNEXT): report the server-acked send through the node sink,
+        // which appends the `Chat` record onto `conv:<transport>:<conv>` and emits
+        // `MessagesChanged`. Ack ⇒ delivered; the acked event id is the protocol message id.
+        if let Some(sink) = &self.sink {
+            let now = now_unix_secs();
+            let mut msg = daemon_api::ChatMessage::new(from, message.text);
+            msg.id = Some(response.response.event_id.to_string());
+            msg.timestamp = Some(now);
+            msg.set_delivered(true, now);
+            sink.chat_message(transport, conv, msg).await;
+        }
+        Ok(())
     }
 
     async fn set_topic(

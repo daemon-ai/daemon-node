@@ -435,6 +435,13 @@ pub struct NodeApiImpl {
     /// mutations (`conv_*`/`member_*`) are recorded + sealed onto it so the audit chains per op.
     /// `None` until the first mutation (and stays `None` when journaling is disabled).
     mgmt_journal: Arc<std::sync::Mutex<Option<Arc<JournalSink>>>>,
+    /// The lazily-opened per-conversation chat-journal writers (wire vNEXT), one per
+    /// `conv:<transport>:<conv>` stream: the [`daemon_api::LifecycleSink::chat_message`] seam
+    /// records every adapter-reported send/delivery through the stream's one long-lived sink so
+    /// the chain links per message. Empty until the first message (and stays empty when
+    /// journaling is disabled).
+    chat_journals:
+        Arc<std::sync::Mutex<std::collections::HashMap<JournalStreamId, Arc<JournalSink>>>>,
     /// The foreign-agent discovery hook (I7), injected by the binary (which owns the ACP runtime).
     /// `None` => `agent_discover` yields nothing and the catalog is just the durable manual
     /// registrations.

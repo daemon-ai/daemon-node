@@ -3013,7 +3013,6 @@ dependencies = [
  "daemon-ingest",
  "daemon-protocol",
  "daemon-store",
- "daemon-telemetry",
  "futures",
  "serde",
  "tokio",

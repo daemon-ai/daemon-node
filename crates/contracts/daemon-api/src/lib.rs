@@ -3618,6 +3618,14 @@ pub trait LifecycleSink: Send + Sync {
         reason: Option<String>,
         is_self: bool,
     );
+
+    /// Report one chat message — an outbound send or an inbound delivery — on `conv` (wire vNEXT).
+    /// The NODE owns the consequences at this single seam, so every messaging adapter inherits
+    /// them: it appends the message as a [`JournalRecordPayload::Chat`] record onto the
+    /// conversation's verifiable journal stream (`conv:<transport>:<conv>`, the stream
+    /// `ConvHistory` pages) and then emits [`NodeEvent::MessagesChanged`]. Adapters never journal
+    /// conversation history themselves.
+    async fn chat_message(&self, transport: TransportId, conv: String, message: ChatMessage);
 }
 
 /// A self-describing events-IO transport adapter — the declarative analogue of libpurple's
@@ -4558,6 +4566,17 @@ pub enum NodeEvent {
     /// or a contact endpoint was associated/dissociated. A payload-free node-wide invalidation
     /// pointer (clients re-list via `PersonList`), mirroring [`NodeEvent::NotificationsChanged`].
     PersonsChanged,
+    /// A conversation's durable chat history grew (wire vNEXT): a messaging adapter recorded an
+    /// inbound or outbound [`ChatMessage`] as a [`JournalRecordPayload::Chat`] record on the
+    /// conversation's journal stream (`conv:<transport>:<conv>`). A granular invalidation pointer,
+    /// emitted once per appended message — the client refetches `ConvHistory` from its cursor
+    /// instead of re-polling the whole transcript.
+    MessagesChanged {
+        /// The owning transport instance.
+        transport: TransportId,
+        /// The affected conversation id.
+        conv: String,
+    },
 }
 
 /// A page of the node-wide event feed (`EventsSince` -> `EventsPage`): a batch of [`NodeEvent`]s past

@@ -12,9 +12,9 @@
 //! - persists rooms + membership to the durable [`SessionStore`] (`room_set` / `room_member_set`),
 //! - shares the in-memory [`Membership`] table with the live [`RoomRuntime`] (built in [`serve`]), and
 //! - forwards a `ConvSend` to that runtime over an `mpsc` command channel so the floor-gated fan-out,
-//!   the transcript append, and the agent-reply re-injection all run on the loop that owns the node
-//!   `api` — the adapter struct never holds an `Arc<dyn NodeApi>`, so there is no registry<->adapter
-//!   reference cycle.
+//!   the chat-journal report (via the node's [`LifecycleSink`], wire vNEXT), and the agent-reply
+//!   re-injection all run on the loop that owns the node `api` — the adapter struct never holds an
+//!   `Arc<dyn NodeApi>`, so there is no registry<->adapter reference cycle.
 //!
 //! [`serve`]: RoomsAdapter::serve
 
@@ -29,23 +29,20 @@ use tokio::sync::mpsc;
 
 use daemon_api::{
     from_cbor, to_cbor, AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiError,
-    ChannelJoinDetails, ConnectionState, ContactInfo, ContactPermission, ConvSendArgs,
+    ChannelJoinDetails, ChatMessage, ConnectionState, ContactInfo, ContactPermission, ConvSendArgs,
     ConversationInfo, ConversationMember, ConversationOps, ConversationType,
-    CreateConversationDetails, FileTransfer, FileTransferOps, MemberInviteArgs, MemberRemoveArgs,
-    MemberRole, MembershipOps, MessagingProtocol, NodeApi, Participant, Presence, PresenceState,
-    RosterOps, SupportsConversations, SupportsFileTransfer, SupportsMembership, SupportsRoster,
-    TransportAdapter, TransportInstanceInfo, TypingState,
+    CreateConversationDetails, FileTransfer, FileTransferOps, LifecycleSink, MemberInviteArgs,
+    MemberRemoveArgs, MemberRole, MembershipOps, MessagingProtocol, NodeApi, Participant, Presence,
+    PresenceState, RosterOps, SupportsConversations, SupportsFileTransfer, SupportsMembership,
+    SupportsRoster, TransportAdapter, TransportInstanceInfo, TypingState,
 };
-use daemon_common::{JournalStreamId, SessionId, UnitId};
-use daemon_host::journal::JournalSink;
+use daemon_common::SessionId;
 use daemon_host::{with_request_context, BlobStore, RequestContext};
 use daemon_ingest::Ingestor;
 use daemon_protocol::{
-    AgentEvent, RoomId, RoomMember, RoomPolicy, SenderId, SessionPayload, TranscriptBlock,
-    TranscriptRole, TransportId,
+    AgentEvent, RoomId, RoomMember, RoomPolicy, SenderId, SessionPayload, TransportId,
 };
 use daemon_store::{Room, RoomMember as StoreRoomMember, SessionStore};
-use daemon_telemetry::TraceSigner;
 
 use crate::{FloorControl, Membership, RoomInbound, RoomsConfig};
 
@@ -69,42 +66,38 @@ fn decode_descriptor(room: &Room) -> RoomDescriptor {
     from_cbor(&room.descriptor).unwrap_or_default()
 }
 
-/// The verifiable-journal stream id for a conversation's merged transcript. Generic over transport so
-/// the host's `conv_history` reader and the adapter writer agree: `conv:<transport>:<conv>`.
-fn transcript_stream(transport: &str, conv: &str) -> JournalStreamId {
-    JournalStreamId::unit(&UnitId::new(format!("conv:{transport}:{conv}")))
-}
-
 /// A command from an adapter op to the live [`serve`](RoomsAdapter::serve) loop (which owns the node
 /// `api`). Membership/metadata mutations are applied to the store + the shared table directly; only
-/// the external post (which needs the running runtime's `api`, floor state, and transcript) defers.
+/// the external post (which needs the running runtime's `api`, floor state, and journal seam) defers.
 enum RoomCommand {
-    /// Fan a `from`-attributed external post out to a room's members (floor-gated; transcribed).
+    /// Fan a `from`-attributed external post out to a room's members (floor-gated; journaled).
     Post {
         room: RoomId,
         /// The immutable sender identity (an agent/contact handle, or [`SenderId::local_loopback`]
         /// for an operator post) — never re-derived from display text.
         sender: SenderId,
+        /// The structured author for the journal record (`None` = the account/operator), carried
+        /// alongside `sender` so history keeps the full `Participant`, not a flattened handle.
+        author: Option<Participant>,
         text: String,
     },
 }
 
 /// The live room loop's shared state: the membership table (shared with the owning [`RoomsAdapter`]),
 /// the inbound fan-out, the ingest busy-gate, the set of subscribed member sessions, per-room
-/// [`FloorControl`] (cursor + cascade budget), and per-room transcript [`JournalSink`]s. Built in
-/// [`RoomsAdapter::serve`]; holds a `Weak` self-reference so an outbound subscription task can call
-/// back into it.
+/// [`FloorControl`] (cursor + cascade budget), and the node-owned [`LifecycleSink`] every post is
+/// journaled through. Built in [`RoomsAdapter::serve`]; holds a `Weak` self-reference so an outbound
+/// subscription task can call back into it.
 pub(crate) struct RoomRuntime {
     me: Weak<RoomRuntime>,
     api: Arc<dyn NodeApi>,
     store: Arc<dyn SessionStore>,
-    signer: Arc<TraceSigner>,
+    sink: Option<Arc<dyn LifecycleSink>>,
     membership: Arc<Mutex<Membership>>,
     inbound: Arc<RoomInbound>,
     ingestor: Arc<Ingestor>,
     subscribed: Mutex<HashSet<SessionId>>,
     floors: Mutex<HashMap<RoomId, FloorControl>>,
-    transcripts: Mutex<HashMap<RoomId, Arc<JournalSink>>>,
     max_turns: u32,
 }
 
@@ -113,19 +106,20 @@ pub(crate) struct RoomRuntime {
 struct RoomRuntimeParts {
     api: Arc<dyn NodeApi>,
     store: Arc<dyn SessionStore>,
-    signer: Arc<TraceSigner>,
+    sink: Option<Arc<dyn LifecycleSink>>,
     membership: Arc<Mutex<Membership>>,
     ingest_policy: daemon_ingest::IngestPolicy,
     max_turns: u32,
 }
 
-/// Inputs for [`RoomRuntime::post`]: the post to record + fan out, and whether it starts a fresh
+/// Inputs for [`RoomRuntime::post`]: the post to journal + fan out, and whether it starts a fresh
 /// cascade (`reset_budget`).
 struct RoomPost {
     room: RoomId,
     sender: SenderId,
+    /// The structured author the journal record carries (`None` = the account/operator).
+    author: Option<Participant>,
     text: String,
-    role: TranscriptRole,
     reset_budget: bool,
 }
 
@@ -134,7 +128,7 @@ impl RoomRuntime {
         let RoomRuntimeParts {
             api,
             store,
-            signer,
+            sink,
             membership,
             ingest_policy,
             max_turns,
@@ -145,11 +139,10 @@ impl RoomRuntime {
             ingestor: Arc::new(Ingestor::with_policy(api.clone(), ingest_policy)),
             api,
             store,
-            signer,
+            sink,
             membership,
             subscribed: Mutex::new(HashSet::new()),
             floors: Mutex::new(HashMap::new()),
-            transcripts: Mutex::new(HashMap::new()),
             max_turns,
         })
     }
@@ -228,22 +221,6 @@ impl RoomRuntime {
         ));
     }
 
-    /// The (lazily opened, cached) transcript writer for `room`.
-    fn transcript_sink(&self, room: &RoomId) -> Arc<JournalSink> {
-        self.transcripts
-            .lock()
-            .unwrap()
-            .entry(room.clone())
-            .or_insert_with(|| {
-                Arc::new(JournalSink::new(
-                    self.store.clone(),
-                    self.signer.clone(),
-                    transcript_stream(FAMILY, room.as_str()),
-                ))
-            })
-            .clone()
-    }
-
     /// The room's floor-control policy (from its stored descriptor; default if absent).
     async fn room_policy(&self, room: &RoomId) -> RoomPolicy {
         self.store
@@ -253,28 +230,27 @@ impl RoomRuntime {
             .unwrap_or_default()
     }
 
-    /// Append `sender: text` to the room transcript (one sealed block), then floor-gate it and fan it
-    /// out (StartTurn to admitted members, Observe to the rest; the sender is skipped). `reset_budget`
-    /// starts a fresh cascade (an external/operator post); a re-injected reply continues the cascade.
+    /// Journal the post as one `ChatMessage` on the room's conversation history, then floor-gate it
+    /// and fan it out (StartTurn to admitted members, Observe to the rest; the sender is skipped).
+    /// `reset_budget` starts a fresh cascade (an external/operator post); a re-injected reply
+    /// continues the cascade.
     async fn post(&self, args: RoomPost) {
         let RoomPost {
             room,
             sender,
+            author,
             text,
-            role,
             reset_budget,
         } = args;
-        // 1. Durable, verifiable transcript: one sealed block per post (the merged room history the
-        //    host's `conv_history` replays).
-        let sink = self.transcript_sink(&room);
-        let block = TranscriptBlock::Message {
-            role,
-            text: format!("{}: {}", sender.as_str(), text),
-        };
-        if let Err(e) = sink.record_block(&block).await {
-            tracing::warn!(error = %e, "rooms: transcript record failed");
-        } else if let Err(e) = sink.seal().await {
-            tracing::warn!(error = %e, "rooms: transcript seal failed");
+        // 1. Durable conversation history (wire vNEXT): report the message through the node's
+        //    LifecycleSink seam, which appends one verified `JournalRecordPayload::Chat` onto
+        //    `conv:room:<id>` (the stream `conv_history` pages) and emits `MessagesChanged`. The
+        //    record carries the RAW text + structured author — attribution never rides the body.
+        if let Some(sink) = &self.sink {
+            let mut message = ChatMessage::new(author, text.clone());
+            message.timestamp = Some(now_unix_secs());
+            sink.chat_message(TransportId::new(FAMILY), room.as_str().to_string(), message)
+                .await;
         }
 
         // 2. Snapshot members + policy (await before locking the !Send floor map).
@@ -312,12 +288,18 @@ impl RoomRuntime {
     }
 
     /// An external/operator `ConvSend` post (starts a fresh cascade).
-    async fn external_post(&self, room: RoomId, sender: SenderId, text: String) {
+    async fn external_post(
+        &self,
+        room: RoomId,
+        sender: SenderId,
+        author: Option<Participant>,
+        text: String,
+    ) {
         self.post(RoomPost {
             room,
             sender,
+            author,
             text,
-            role: TranscriptRole::User,
             reset_budget: true,
         })
         .await;
@@ -327,12 +309,24 @@ impl RoomRuntime {
     async fn reinject_reply(&self, session: &SessionId, text: String) {
         let resolved = self.membership.lock().unwrap().find_by_session(session);
         if let Some((room, member)) = resolved {
+            // The member handle is a structured identity (from the membership table), not text; the
+            // journal author keeps the full participant shape (agent when the profile binding is
+            // known, a bare contact handle for a legacy profile-less row).
+            let author = Some(match &member.profile {
+                Some(profile) => Participant::Agent {
+                    profile: profile.clone(),
+                    member: member.member.clone(),
+                },
+                None => Participant::Contact(ContactInfo {
+                    id: member.member.clone(),
+                    ..ContactInfo::default()
+                }),
+            });
             self.post(RoomPost {
                 room,
-                // The member handle is a structured identity (from the membership table), not text.
-                sender: SenderId::new(member),
+                sender: SenderId::new(member.member),
+                author,
                 text,
-                role: TranscriptRole::Assistant,
                 reset_budget: false,
             })
             .await;
@@ -340,12 +334,21 @@ impl RoomRuntime {
     }
 }
 
-/// The Rooms transport adapter. Holds the durable store, the journal signer (for the per-room
-/// transcript), the resolved config, the membership table it shares with the live runtime, and the
-/// command channel into [`serve`](Self::serve).
+/// Unix seconds now — the node-side clock the journal record's `timestamp` is stamped with.
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The Rooms transport adapter. Holds the durable store, the node-owned lifecycle sink (the
+/// wire-vNEXT chat-journal seam every post is reported through), the resolved config, the
+/// membership table it shares with the live runtime, and the command channel into
+/// [`serve`](Self::serve).
 pub struct RoomsAdapter {
     store: Arc<dyn SessionStore>,
-    signer: Arc<TraceSigner>,
+    sink: Option<Arc<dyn LifecycleSink>>,
     cfg: RoomsConfig,
     membership: Arc<Mutex<Membership>>,
     cmd_tx: mpsc::UnboundedSender<RoomCommand>,
@@ -363,38 +366,39 @@ pub struct RoomsAdapter {
 }
 
 impl RoomsAdapter {
-    /// Construct the adapter over the durable `store`, the node's verifiable-journal `signer` (used to
-    /// seal the merged per-room transcript), and the resolved `cfg`. The returned `Arc` is what the
-    /// host registry holds and what `serve` consumes; ops borrow `&self` through it.
+    /// Construct the adapter over the durable `store`, the node's [`LifecycleSink`] (wire vNEXT:
+    /// the chat-journal + `MessagesChanged` seam; pass `None` where the node is not wired — unit
+    /// tests), and the resolved `cfg`. The returned `Arc` is what the host registry holds and what
+    /// `serve` consumes; ops borrow `&self` through it.
     pub fn new(
         store: Arc<dyn SessionStore>,
-        signer: Arc<TraceSigner>,
         cfg: RoomsConfig,
+        sink: Option<Arc<dyn LifecycleSink>>,
     ) -> Arc<Self> {
-        Self::build(store, signer, cfg, None)
+        Self::build(store, cfg, sink, None)
     }
 
     /// Like [`new`](Self::new), but wires the node content store so the loopback
     /// [`SupportsFileTransfer`] (W2-H) is advertised + operable.
     pub fn with_blobs(
         store: Arc<dyn SessionStore>,
-        signer: Arc<TraceSigner>,
         cfg: RoomsConfig,
+        sink: Option<Arc<dyn LifecycleSink>>,
         blobs: Arc<dyn BlobStore>,
     ) -> Arc<Self> {
-        Self::build(store, signer, cfg, Some(blobs))
+        Self::build(store, cfg, sink, Some(blobs))
     }
 
     fn build(
         store: Arc<dyn SessionStore>,
-        signer: Arc<TraceSigner>,
         cfg: RoomsConfig,
+        sink: Option<Arc<dyn LifecycleSink>>,
         blobs: Option<Arc<dyn BlobStore>>,
     ) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             store,
-            signer,
+            sink,
             cfg,
             membership: Arc::new(Mutex::new(Membership::new())),
             cmd_tx,
@@ -549,7 +553,7 @@ impl TransportAdapter for RoomsAdapter {
         let runtime = RoomRuntime::new(RoomRuntimeParts {
             api: api.clone(),
             store: self.store.clone(),
-            signer: self.signer.clone(),
+            sink: self.sink.clone(),
             membership: self.membership.clone(),
             ingest_policy: self.cfg.ingest_policy(),
             max_turns: self.cfg.max_turns,
@@ -571,13 +575,18 @@ impl TransportAdapter for RoomsAdapter {
 
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                RoomCommand::Post { room, sender, text } => {
+                RoomCommand::Post {
+                    room,
+                    sender,
+                    author,
+                    text,
+                } => {
                     // The serve loop runs with no request context; an external post fans out via the
                     // ownership-gated `submit_from`, so bind the trusted `internal` embedded-caller
                     // identity for the fan-out.
                     with_request_context(
                         RequestContext::internal(),
-                        runtime.external_post(room, sender, text),
+                        runtime.external_post(room, sender, author, text),
                     )
                     .await;
                 }
@@ -738,9 +747,9 @@ impl SupportsConversations for RoomsAdapter {
         if self.store.room_get(&conv).await.is_none() {
             return Err(ApiError::Other(format!("room {conv} not found")));
         }
-        let sender = match from {
-            Some(Participant::Agent { member, .. }) => SenderId::new(member),
-            Some(Participant::Contact(c)) => SenderId::new(c.id),
+        let sender = match &from {
+            Some(Participant::Agent { member, .. }) => SenderId::new(member.clone()),
+            Some(Participant::Contact(c)) => SenderId::new(c.id.clone()),
             // No external participant: a node/operator loopback post — a typed, documented identity
             // rather than a re-derivable "operator" string.
             None => SenderId::local_loopback(),
@@ -749,6 +758,9 @@ impl SupportsConversations for RoomsAdapter {
             .send(RoomCommand::Post {
                 room: RoomId::new(conv),
                 sender,
+                // The full participant rides through to the journal record's author (`None` = the
+                // account/operator), matching the `ChatMessage::author` convention.
+                author: from,
                 text: message.text,
             })
             .map_err(|_| ApiError::Other("rooms serve loop is not running".to_string()))

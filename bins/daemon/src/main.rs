@@ -3202,10 +3202,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     let mut adapter_registry = daemon_host::AdapterRegistry::new();
     if cfg.rooms.enabled {
         tracing::info!("registering internal rooms transport (daemon-rooms)");
+        // [wire vNEXT] hand the adapter the node's lifecycle sink: every room post is journaled as
+        // a Chat record on `conv:room:<id>` + announced via MessagesChanged through that one seam.
         adapter_registry = adapter_registry.with_adapter(daemon_rooms::RoomsAdapter::new(
             store.clone(),
-            signer.clone(),
             cfg.rooms.clone(),
+            Some(node.lifecycle_sink()),
         ));
     }
     if cfg.matrix.enabled {

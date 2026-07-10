@@ -590,6 +590,7 @@ node-event = node-event-session-advanced
            / node-event-resync-needed
            / node-event-notifications-changed
            / node-event-persons-changed
+           / node-event-messages-changed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64 } }
 node-event-roster-changed       = { "RosterChanged":      { "rev": uint64 } }
@@ -613,6 +614,9 @@ node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 node-event-notifications-changed = "NotificationsChanged"
 ; wire v37: the person registry changed (create/remove/associate/dissociate) -> re-list PersonList.
 node-event-persons-changed      = "PersonsChanged"
+; wire vNEXT: a conversation's durable chat journal grew (one Chat record appended) -> refetch
+; ConvHistory from the client's cursor. Granular per-(transport, conv), emitted once per message.
+node-event-messages-changed     = { "MessagesChanged":    { "transport": transport-id, "conv": tstr } }
 events-page = {
   "events": [0*64 node-event],
   "next_cursor": uint64,                ; pass as the next EventsSince cursor
