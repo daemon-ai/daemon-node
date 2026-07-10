@@ -422,6 +422,7 @@ tree-report = {
   "root": (unit-id / null),
   "nodes": [0*64 unit-node],
   ? "next": (tstr / null),
+  "rev": uint64,                        ; rung 1 (api vNEXT): echo of FleetChanged.rev (compare loop)
 }
 
 ; A delegation/subagent lifecycle phase (the Subagent manage-event discriminator).
@@ -602,18 +603,23 @@ node-event-approval-pending     = { "ApprovalPending":    { "session": session-i
 ; v26: byte counters ride the event (throttled byte-level emission node-side).
 node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr, "downloaded_bytes": uint64, "total_bytes": uint64 } }
 ; v26: the installed-model registry changed (download cataloged / model deleted) -> refetch ModelCatalog.
-node-event-catalog-changed      = "CatalogChanged"
+; rung 1 (api vNEXT): gains a coalescing rev (breaking arm-shape change, bundled into the deferred bump).
+node-event-catalog-changed      = { "CatalogChanged":     { "rev": uint64 } }
 ; v29: a transport instance's connection/presence changed (adapter serve start / teardown / crash),
 ; carrying the full new state so clients stop navigation-polling TransportInstances.
 node-event-transport-changed    = { "TransportChanged":   { "transport": transport-id, "connection": connection-state, ? "presence": presence-state, ? "reason": (disconnect-reason / null), ? "message": (tstr / null), ? "fatal": bool } }
-node-event-conversations-changed = { "ConversationsChanged": { "transport": transport-id, "conv": tstr, "change": conv-change } }
+; rung 1 (api vNEXT): + per-transport conversation-set rev (echoed by conv-page).
+node-event-conversations-changed = { "ConversationsChanged": { "transport": transport-id, "conv": tstr, "change": conv-change, "rev": uint64 } }
 node-event-membership-changed   = { "MembershipChanged":  { "transport": transport-id, "conv": tstr, "member": tstr, "change": membership-change, ? "actor": (tstr / null), ? "reason": (tstr / null), "is_self": bool } }
-node-event-contacts-changed     = { "ContactsChanged":    { "transport": transport-id } }
+; rung 1 (api vNEXT): + per-transport contact-roster rev (echoed by contact-page).
+node-event-contacts-changed     = { "ContactsChanged":    { "transport": transport-id, "rev": uint64 } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 ; wire v37: the notification set changed (add/remove/read/delete) -> re-list NotificationList.
-node-event-notifications-changed = "NotificationsChanged"
+; rung 1 (api vNEXT): gains a coalescing rev (echoed by response-notifications).
+node-event-notifications-changed = { "NotificationsChanged": { "rev": uint64 } }
 ; wire v37: the person registry changed (create/remove/associate/dissociate) -> re-list PersonList.
-node-event-persons-changed      = "PersonsChanged"
+; rung 1 (api vNEXT): gains a coalescing rev (echoed by response-persons).
+node-event-persons-changed      = { "PersonsChanged":     { "rev": uint64 } }
 ; wire v38: a conversation's durable chat journal grew (one Chat record appended) -> refetch
 ; ConvHistory from the client's cursor. Granular per-(transport, conv), emitted once per message.
 node-event-messages-changed     = { "MessagesChanged":    { "transport": transport-id, "conv": tstr } }
@@ -621,6 +627,8 @@ events-page = {
   "events": [0*64 node-event],
   "next_cursor": uint64,                ; pass as the next EventsSince cursor
   "head_cursor": uint64,                ; highest cursor the feed has assigned
+  ? "epoch": uint64,                    ; rung 1 (api vNEXT): feed generation; bumps on node
+                                        ; (re)start so a prior-epoch cursor re-baselines vs resumes
 }
 
 ; ----- outbound delivery targets (§5.4: where a session's replies post) + handover -----
@@ -1753,8 +1761,10 @@ model-page = { "items": [0*64 model-descriptor], ? "next": (tstr / null) }   ; M
 revision-page = { "items": [0*64 revision], ? "next": (tstr / null) }
 chat-route-page = { "items": [0*64 chat-route], ? "next": (tstr / null) }
 room-page = { "items": [0*64 room-info], ? "next": (tstr / null) }
-conv-page = { "items": [0*64 conversation-info], ? "next": (tstr / null) }
-contact-page = { "items": [0*64 contact-info], ? "next": (tstr / null) }
+; rung 1 (api vNEXT): conv-page/contact-page echo the transport's coalescing rev (compared against
+; ConversationsChanged.rev / ContactsChanged.rev to skip an unchanged refetch).
+conv-page = { "items": [0*64 conversation-info], ? "next": (tstr / null), "rev": uint64 }
+contact-page = { "items": [0*64 contact-info], ? "next": (tstr / null), "rev": uint64 }
 response-approvals = { "Approvals": approval-page }
 response-fingerprints = { "Fingerprints": [0*64 remembered-fingerprint] }
 response-fleet = { "Fleet": fleet-report }
@@ -1855,10 +1865,12 @@ response-telemetry-consent = { "TelemetryConsent": { "enabled": bool } }
 response-saved-presences = { "SavedPresences": [* saved-presence] }
 
 ; wire v37: the node's live notification list, newest first.
-response-notifications = { "Notifications": [* notification-info] }
+; rung 1 (api vNEXT): the list gains a coalescing rev (compared against NotificationsChanged.rev).
+response-notifications = { "Notifications": { "rev": uint64, "items": [* notification-info] } }
 
 ; wire v37: the node's person/metacontact registry, insertion order.
-response-persons = { "Persons": [* person] }
+; rung 1 (api vNEXT): the list gains a coalescing rev (compared against PersonsChanged.rev).
+response-persons = { "Persons": { "rev": uint64, "items": [* person] } }
 
 ; wire v38: a transport instance's persisted NON-SECRET account-settings values (the
 ; transport-settings read-back; secrets live in the credential store, never here).

@@ -943,7 +943,9 @@ fn bind_model_surface(mut node_api: NodeApiImpl, a: &NodeAssembly, shared: &Shar
         // / a model was deleted) — clients refetch ModelCatalog instead of polling.
         let feed = shared.node_events.clone();
         models.set_catalog_changed(Arc::new(move || {
-            feed.emit(daemon_api::NodeEvent::CatalogChanged);
+            // rung 1: bump the catalog rev (once per emit) and stamp it onto the pointer.
+            let rev = feed.note_catalog_change();
+            feed.emit(daemon_api::NodeEvent::CatalogChanged { rev });
         }));
         node_api = node_api.with_models(models, a.profile.as_str().to_string());
     }

@@ -79,6 +79,7 @@ fn membership_events_round_trip() {
             transport: TransportId::new("matrix/@bot:hs.org"),
             conv: "!r:hs".into(),
             change: ConvChange::Added,
+            rev: 3,
         },
         NodeEvent::MembershipChanged {
             transport: TransportId::new("matrix/@bot:hs.org"),

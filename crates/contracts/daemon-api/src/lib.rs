@@ -864,12 +864,8 @@ pub trait ControlApi: Send + Sync {
 
     /// List the conversations a transport owns (`SupportsConversations::list`), paged at
     /// [`WIRE_PAGE_MAX`] in conversation-id order. Default: empty.
-    async fn conv_list(
-        &self,
-        _transport: TransportId,
-        _after: Option<String>,
-    ) -> WirePage<ConversationInfo> {
-        WirePage::default()
+    async fn conv_list(&self, _transport: TransportId, _after: Option<String>) -> ConvPage {
+        ConvPage::default()
     }
 
     /// Read one conversation by id (`SupportsConversations::get`). Default: `None`.
@@ -1018,12 +1014,8 @@ pub trait ControlApi: Send + Sync {
     /// List a transport's server-side contact roster (`SupportsRoster::list`), paged at
     /// [`WIRE_PAGE_MAX`] in contact-id order (mirrors [`ControlApi::conv_list`]; the adapter
     /// returns the unbounded roster, the host sorts + pages it once). Default: empty.
-    async fn roster_list(
-        &self,
-        _transport: TransportId,
-        _after: Option<String>,
-    ) -> WirePage<ContactInfo> {
-        WirePage::default()
+    async fn roster_list(&self, _transport: TransportId, _after: Option<String>) -> ContactPage {
+        ContactPage::default()
     }
 
     /// Add a contact to a transport's server-side roster (`SupportsRoster::add`). Default:
@@ -1060,8 +1052,8 @@ pub trait ControlApi: Send + Sync {
     /// [`NotificationInfo`] collection a client renders and re-lists on a
     /// [`NodeEvent::NotificationsChanged`] pointer (ported from libpurple's `PurpleNotificationManager`).
     /// Default: empty (a node assembled without a notification manager).
-    async fn notification_list(&self) -> Vec<NotificationInfo> {
-        Vec::new()
+    async fn notification_list(&self) -> RevList<NotificationInfo> {
+        RevList::default()
     }
 
     /// Send a file out over a transport (`SupportsFileTransfer::send`; wire v37). Default:
@@ -1088,8 +1080,8 @@ pub trait ControlApi: Send + Sync {
     /// node-authoritative [`Person`] collection a client renders and re-lists on a
     /// [`NodeEvent::PersonsChanged`] pointer (ported from the person half of libpurple's
     /// `PurpleContactManager`). Default: empty (a node assembled without a person registry).
-    async fn person_list(&self) -> Vec<Person> {
-        Vec::new()
+    async fn person_list(&self) -> RevList<Person> {
+        RevList::default()
     }
 
     // -- Foreign-agent discovery + registry (catalog-style; the daemon probes its own PATH) --
@@ -4484,9 +4476,14 @@ pub enum NodeEvent {
         total_bytes: u64,
     },
     /// The installed-model registry changed (a finished download was cataloged / a model was
-    /// deleted): the client refetches `ModelCatalog`. Payload-free and globally coalesced in the
-    /// backlog (a refetch always reads the whole catalog).
-    CatalogChanged,
+    /// deleted): the client refetches `ModelCatalog`. Globally coalesced in the backlog (a refetch
+    /// always reads the whole catalog); carries a coalescing `rev` (rung 1, api vNEXT) the client
+    /// compares against `ModelCatalog`'s echoed rev to skip an unchanged refetch.
+    CatalogChanged {
+        /// The new catalog revision (rung 1). In-memory; a restart resets it -> stale rev degrades
+        /// to a full read (the roster's shipped fallback).
+        rev: u64,
+    },
     /// An events-io transport instance's connection/presence changed (wire v29): emitted at the
     /// coarse real transitions (adapter serve start with the instance's reported state, clean
     /// teardown -> `Offline`, a crashed serve loop -> `Error`), carrying the full new state so a
@@ -4519,6 +4516,10 @@ pub enum NodeEvent {
         conv: String,
         /// Added or removed.
         change: ConvChange,
+        /// The owning transport's conversation-set revision at this change (rung 1, api vNEXT); the
+        /// client compares it against `conv-page`'s echoed rev to reconcile drift. Per-transport,
+        /// in-memory (a restart resets it -> full read).
+        rev: u64,
     },
     /// A conversation's membership changed (wire v30). A granular invalidation pointer; on an
     /// `is_self` removal (`Left`/`Kicked`/`Banned`) the node has ALREADY reconciled its own routing
@@ -4550,6 +4551,10 @@ pub enum NodeEvent {
     ContactsChanged {
         /// The owning transport instance whose roster changed.
         transport: TransportId,
+        /// The owning transport's contact-roster revision at this change (rung 1, api vNEXT); the
+        /// client compares it against `contact-page`'s echoed rev to skip an unchanged refetch.
+        /// Per-transport, in-memory (a restart resets it -> full read).
+        rev: u64,
     },
     /// The feed could not serve from the client's cursor (aged out / lagged); the client must
     /// re-baseline the named scope ("roster" / "all" / ...).
@@ -4559,13 +4564,21 @@ pub enum NodeEvent {
     },
     /// The node's notification set changed (wire v37): a notification was added, removed, read, or
     /// deleted. A payload-free node-wide invalidation pointer (clients re-list via `NotificationList`),
-    /// mirroring [`NodeEvent::CatalogChanged`] — the whole list is cheap to refetch, so it carries
-    /// no per-notification detail.
-    NotificationsChanged,
+    /// mirroring [`NodeEvent::CatalogChanged`] — the whole list is cheap to refetch. Carries a
+    /// coalescing `rev` (rung 1, api vNEXT) the client compares against `Notifications`' echoed rev
+    /// to skip an unchanged refetch.
+    NotificationsChanged {
+        /// The new notifications revision (rung 1). In-memory; a restart resets it -> full read.
+        rev: u64,
+    },
     /// The node's person/metacontact registry changed (wire v37): a person was created or removed,
-    /// or a contact endpoint was associated/dissociated. A payload-free node-wide invalidation
-    /// pointer (clients re-list via `PersonList`), mirroring [`NodeEvent::NotificationsChanged`].
-    PersonsChanged,
+    /// or a contact endpoint was associated/dissociated. A node-wide invalidation pointer (clients
+    /// re-list via `PersonList`), mirroring [`NodeEvent::NotificationsChanged`]. Carries a
+    /// coalescing `rev` (rung 1, api vNEXT) the client compares against `Persons`' echoed rev.
+    PersonsChanged {
+        /// The new persons revision (rung 1). In-memory; a restart resets it -> full read.
+        rev: u64,
+    },
     /// A conversation's durable chat history grew (wire v38): a messaging adapter recorded an
     /// inbound or outbound [`ChatMessage`] as a [`JournalRecordPayload::Chat`] record on the
     /// conversation's journal stream (`conv:<transport>:<conv>`). A granular invalidation pointer,
@@ -4591,6 +4604,14 @@ pub struct EventsPage {
     pub next_cursor: u64,
     /// The highest cursor the feed has assigned (how far a reader can advance now).
     pub head_cursor: u64,
+    /// The feed generation (rung 1, api vNEXT): a startup-minted counter that changes when the node
+    /// (re)starts, so a client with a prior-epoch cursor distinguishes "the ring overflowed" from
+    /// "a new feed generation" and re-baselines deliberately. Optional on the wire (`? epoch`):
+    /// absent means a pre-vNEXT node that does not stamp it. In-memory (process-lifetime) by design
+    /// — the accepted durability caveat (06G1); a bumped epoch degrades a stale cursor to a
+    /// deliberate resync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4808,9 +4829,10 @@ mod tests {
             parent: None,
         };
         let resps = vec![
-            ApiResponse::Conversations(WirePage {
+            ApiResponse::Conversations(ConvPage {
                 items: vec![info.clone()],
                 next: Some(info.id.clone()),
+                rev: 0,
             }),
             ApiResponse::Conversation(Some(info.clone())),
             ApiResponse::ConvCreateDetails(CreateConversationDetails::default()),
@@ -5364,11 +5386,12 @@ mod tests {
         }
 
         let resps = vec![
-            ApiResponse::ContactPage(WirePage {
+            ApiResponse::ContactPage(ContactPage {
                 items: vec![contact.clone()],
                 next: Some("@bob:matrix.org".into()),
+                rev: 0,
             }),
-            ApiResponse::ContactPage(WirePage::default()),
+            ApiResponse::ContactPage(ContactPage::default()),
             ApiResponse::Ok,
         ];
         for resp in resps {
@@ -5377,9 +5400,10 @@ mod tests {
 
         // The ContactsChanged event round-trips inside an EventsPage (its wire carrier).
         let wrapped = EventsPage {
-            events: vec![NodeEvent::ContactsChanged { transport }],
+            events: vec![NodeEvent::ContactsChanged { transport, rev: 0 }],
             next_cursor: 1,
             head_cursor: 1,
+            epoch: None,
         };
         assert_eq!(
             wrapped,
@@ -5572,6 +5596,7 @@ mod tests {
                 }),
             }],
             next: Some("root".into()),
+            rev: 0,
         });
         assert_eq!(ev, from_cbor::<TreeEvent>(&to_cbor(&ev)).unwrap());
     }

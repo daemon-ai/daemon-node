@@ -1065,7 +1065,9 @@ async fn pump_node_events(
                 }
             },
             _ = keepalive.tick() => {
-                let page = EventsPage { events: Vec::new(), next_cursor: last_cursor, head_cursor: last_cursor };
+                // rung 1: an empty keepalive tick carries no epoch (the client already learned the
+                // feed generation from the real pages streamed above).
+                let page = EventsPage { events: Vec::new(), next_cursor: last_cursor, head_cursor: last_cursor, epoch: None };
                 if tx.send(WireS2C::Item { id, res: ApiResponse::EventsPage(page) }).await.is_err() {
                     break;
                 }

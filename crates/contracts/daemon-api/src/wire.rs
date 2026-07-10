@@ -1337,16 +1337,18 @@ pub enum ApiResponse {
     ChatRoute(Option<ChatRoute>),
     /// A page of a transport instance's rooms (transport_rooms), room order.
     Rooms(WirePage<RoomInfo>),
-    /// A page of a transport's conversations (conv_list), conversation-id order.
-    Conversations(WirePage<ConversationInfo>),
+    /// A page of a transport's conversations (conv_list), conversation-id order, carrying the
+    /// transport's conversation-set revision (rung 1, api vNEXT).
+    Conversations(ConvPage),
     /// One conversation, if present (conv_get / conv_create / conv_join).
     Conversation(Option<ConversationInfo>),
     /// A remote contact's profile text (contact_get_profile).
     ContactProfile(String),
     /// A list of contacts (directory_search).
     Contacts(Vec<ContactInfo>),
-    /// A page of a transport's server-side contact roster (roster_list), contact-id order (wire v34).
-    ContactPage(WirePage<ContactInfo>),
+    /// A page of a transport's server-side contact roster (roster_list), contact-id order (wire v34),
+    /// carrying the transport's contact-roster revision (rung 1, api vNEXT).
+    ContactPage(ContactPage),
     /// A contact's action menu, if any (contact_action_menu).
     ActionMenu(Option<ActionMenu>),
     /// The typed create-conversation form (conv_create_details).
@@ -1404,10 +1406,12 @@ pub enum ApiResponse {
     // -- saved presences (W2-F; wire v37) ------------------------------------------------------
     /// The saved-presence listing (the reply to `PresenceList`), in the manager's insertion order.
     SavedPresences(Vec<SavedPresence>),
-    /// The node's live notification list (`notification_list`; wire v37), newest first.
-    Notifications(Vec<NotificationInfo>),
-    /// The node's person/metacontact registry (`person_list`; wire v37), insertion order.
-    Persons(Vec<Person>),
+    /// The node's live notification list (`notification_list`; wire v37), newest first, carrying the
+    /// notifications revision (rung 1, api vNEXT).
+    Notifications(RevList<NotificationInfo>),
+    /// The node's person/metacontact registry (`person_list`; wire v37), insertion order, carrying
+    /// the persons revision (rung 1, api vNEXT).
+    Persons(RevList<Person>),
     /// A transport instance's persisted NON-SECRET account-settings values (`transport_settings`;
     /// wire v38). Secrets never ride this response — they live in the credential store.
     TransportSettings(AccountSettingsValues),
@@ -1474,6 +1478,62 @@ impl<T> Default for WirePage<T> {
         Self {
             items: Vec::new(),
             next: None,
+        }
+    }
+}
+
+/// A page of a transport's conversations (`conv_list` -> `Conversations`), carrying the owning
+/// transport's conversation-set revision (rung 1, api vNEXT). Shape-identical to
+/// `WirePage<ConversationInfo>` plus a `rev`: the client compares `rev` against the
+/// `ConversationsChanged.rev` pointer to skip an unchanged refetch (breaking arm-shape change,
+/// bundled into the deferred v38->v39 bump). The CDDL rule is `conv-page`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvPage {
+    /// The conversations in this page (at most [`WIRE_PAGE_MAX`]).
+    pub items: Vec<ConversationInfo>,
+    /// The resume cursor when more items remain (`None` => last page).
+    #[serde(default)]
+    pub next: Option<String>,
+    /// The owning transport's conversation-set revision this page reflects (rung 1).
+    pub rev: u64,
+}
+
+/// A page of a transport's server-side contact roster (`roster_list` -> `ContactPage`), carrying the
+/// owning transport's contact-roster revision (rung 1, api vNEXT). Shape-identical to
+/// `WirePage<ContactInfo>` plus a `rev`, compared against `ContactsChanged.rev`. CDDL: `contact-page`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactPage {
+    /// The contacts in this page (at most [`WIRE_PAGE_MAX`]).
+    pub items: Vec<ContactInfo>,
+    /// The resume cursor when more items remain (`None` => last page).
+    #[serde(default)]
+    pub next: Option<String>,
+    /// The owning transport's contact-roster revision this page reflects (rung 1).
+    pub rev: u64,
+}
+
+/// A whole-list response that carries a coalescing revision (rung 1, api vNEXT): the node-authored
+/// list (persons, notifications) plus the collection's current `rev`, so a client compares `rev`
+/// against the matching `*Changed` pointer and skips re-listing an unchanged collection. Small
+/// operator-scale lists that stay under the wire page bound, so they inline the whole list (no
+/// cursor). The CDDL rules are `response-persons` / `response-notifications`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevList<T> {
+    /// The collection revision this list reflects (rung 1).
+    pub rev: u64,
+    /// The whole list (small, operator-scale — no wire page cursor).
+    pub items: Vec<T>,
+}
+
+// Manual impl: `derive(Default)` would demand `T: Default`, which the empty list does not need.
+impl<T> Default for RevList<T> {
+    fn default() -> Self {
+        Self {
+            rev: 0,
+            items: Vec::new(),
         }
     }
 }
@@ -2561,9 +2621,10 @@ mod conversation_hierarchy_tests {
         assert_eq!(back, ConversationType::Space);
 
         // Nested in the wire responses that carry conversations.
-        let page = ApiResponse::Conversations(WirePage {
+        let page = ApiResponse::Conversations(ConvPage {
             items: vec![space, child],
             next: None,
+            rev: 0,
         });
         let mut bytes = Vec::new();
         ciborium::into_writer(&page, &mut bytes).expect("encode Conversations page");
