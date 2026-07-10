@@ -38,6 +38,7 @@ use daemon_activation::ActivationManager;
 use daemon_api::{
     from_cbor,
     to_cbor,
+    AccountSettingsValues,
     ActionMenu,
     AdapterInfo,
     AgentEntry,

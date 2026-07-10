@@ -232,7 +232,7 @@ CREATE TABLE transport_prefs (
 transport TEXT PRIMARY KEY,
 enabled   INTEGER NOT NULL DEFAULT 1,
 label     TEXT
-);
+, settings BLOB);
 CREATE TABLE wake_outbox (
     rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL

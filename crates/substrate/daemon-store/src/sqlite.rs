@@ -423,6 +423,13 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
                  entry BLOB NOT NULL\n\
              );",
         ),
+        // M15 (wire vNEXT — transport account settings): the per-instance NON-SECRET settings
+        // values on the SAME `transport_prefs` row the enabled/label desires live on (additive
+        // column, mirroring the `session_meta.inline_profile` ALTER). The CBOR of a plain
+        // `BTreeMap<String, String>` (protocol-free, mirroring `feedback_outbox.payload`); NULL =
+        // never configured (the empty map). Secrets never land here — they go to the credential
+        // store via the auth flows.
+        M::up("ALTER TABLE transport_prefs ADD COLUMN settings BLOB;"),
     ])
 });
 
@@ -1682,9 +1689,9 @@ impl SessionStore for SqliteStore {
 
     async fn transport_prefs(&self) -> Vec<TransportPref> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn
-            .prepare("SELECT transport, enabled, label FROM transport_prefs ORDER BY transport")
-        {
+        let mut stmt = match conn.prepare(
+            "SELECT transport, enabled, label, settings FROM transport_prefs ORDER BY transport",
+        ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -1693,7 +1700,11 @@ impl SessionStore for SqliteStore {
                 transport: row.get::<_, String>(0)?,
                 enabled: row.get::<_, i64>(1)? != 0,
                 label: row.get::<_, Option<String>>(2)?,
-                settings: std::collections::BTreeMap::new(),
+                // NULL (never configured) or an undecodable blob reads as the empty map.
+                settings: row
+                    .get::<_, Option<Vec<u8>>>(3)?
+                    .and_then(|bytes| ciborium::de::from_reader(&bytes[..]).ok())
+                    .unwrap_or_default(),
             })
         });
         match rows {
@@ -1730,6 +1741,29 @@ impl SessionStore for SqliteStore {
             "INSERT INTO transport_prefs (transport, label) VALUES (?1, ?2) \
              ON CONFLICT(transport) DO UPDATE SET label = ?2",
             params![transport, label],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn set_transport_settings(
+        &self,
+        transport: &str,
+        settings: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), StoreError> {
+        // Upsert the whole (already-merged) settings map, preserving `enabled`/`label` — the same
+        // single-column upsert shape as the label/enabled ops on the shared prefs row.
+        let mut blob = Vec::new();
+        ciborium::ser::into_writer(settings, &mut blob).map_err(|e| {
+            StoreError::Common(DaemonError::Other(format!(
+                "transport settings encode: {e}"
+            )))
+        })?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO transport_prefs (transport, settings) VALUES (?1, ?2) \
+             ON CONFLICT(transport) DO UPDATE SET settings = ?2",
+            params![transport, blob],
         )
         .map_err(sql_err)?;
         Ok(())
@@ -2560,7 +2594,8 @@ mod tests {
     /// gateway runtime-override `gateway_config` single-row setting, the Phase 1 inline
     /// sub-agent `session_meta.inline_profile` column, the wire-v35 `transport_prefs` +
     /// `credential_labels` account-management tables, the wire-v37 `saved_presences` +
-    /// `saved_presence_active` tables, and the `custom_providers` table).
+    /// `saved_presence_active` tables, the `custom_providers` table, and the wire-vNEXT
+    /// `transport_prefs.settings` account-settings column).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2571,7 +2606,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 14, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 15, "fresh DB is stamped to the latest migration");
     }
 
     /// `custom_provider_set`/`list`/`remove` round-trip identically on both the SQLite and in-memory

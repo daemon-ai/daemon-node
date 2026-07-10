@@ -1510,6 +1510,13 @@ file-transfer = {
 request-ft-send = { "FtSend": { "transport": transport-id, "transfer": file-transfer } }
 request-ft-receive = { "FtReceive": { "transport": transport-id, "transfer": file-transfer } }
 
+; ----- transport account settings (N2; wire vNEXT) -----
+; Read + merge-edit of a transport instance's persisted NON-SECRET settings values (keys from the
+; adapter's account-settings-schema). Secrets never ride these ops — they go to the credential
+; store via the interactive-auth flows.
+request-transport-settings = { "TransportSettings": { "transport": transport-id } }
+request-transport-configure = { "TransportConfigure": { "transport": transport-id, "settings": account-settings-values } }
+
 api-request = request-submit
             / request-submit-routed
             / request-poll
@@ -1705,6 +1712,8 @@ api-request = request-submit
             / request-ft-send
             / request-ft-receive
             / request-person-list
+            / request-transport-settings
+            / request-transport-configure
 
 response-ok = "Ok"
 response-routed = { "Routed": { "session": session-id } }
@@ -1830,6 +1839,10 @@ response-notifications = { "Notifications": [* notification-info] }
 
 ; wire v37: the node's person/metacontact registry, insertion order.
 response-persons = { "Persons": [* person] }
+
+; wire vNEXT: a transport instance's persisted NON-SECRET account-settings values (the
+; transport-settings read-back; secrets live in the credential store, never here).
+response-transport-settings = { "TransportSettings": account-settings-values }
 api-response = response-ok
              / response-routed
              / response-session-created
@@ -1928,6 +1941,7 @@ api-response = response-ok
              / response-saved-presences
              / response-notifications
              / response-persons
+             / response-transport-settings
 
 ; ----- multiplexed / server-streaming socket envelope (wire L0; daemon-sync-protocol-spec.md §2) ---
 ; Wraps api-request/api-response so one connection carries many correlated exchanges, with

@@ -1204,6 +1204,87 @@ impl ControlApi for NodeApiImpl {
         Ok(())
     }
 
+    async fn transport_settings(
+        &self,
+        transport: TransportId,
+    ) -> Result<AccountSettingsValues, ApiError> {
+        // Read-back of the persisted per-instance settings values (wire vNEXT): a plain prefs-row
+        // lookup (a never-configured instance reads as the empty map), the same store row the
+        // label/enabled desires overlay from. SECURITY INVARIANT: secrets never live in this
+        // store — they go to the CredentialStore via the interactive-auth flows — so this read
+        // needs no redaction pass.
+        let values = self
+            .store
+            .transport_prefs()
+            .await
+            .into_iter()
+            .find(|p| p.transport == transport.as_str())
+            .map(|p| p.settings)
+            .unwrap_or_default();
+        Ok(AccountSettingsValues { values })
+    }
+
+    async fn transport_configure(
+        &self,
+        transport: TransportId,
+        settings: AccountSettingsValues,
+    ) -> Result<(), ApiError> {
+        // Merge-edit of a transport instance's NON-SECRET settings (wire vNEXT), node-sequenced
+        // (the client sends one intent): (1) reject keys outside the owning adapter's
+        // account_schema, (2) run the adapter's `validate_account` over the MERGED map (persisted
+        // ∪ incoming, incoming wins) and surface its error, (3) persist to the same prefs row the
+        // label/enabled ops use, (4) apply-by-reconnect when the instance is currently connected
+        // (the `TransportSetEnabled(false → true)` cycle), riding the existing Offline +
+        // serve-start `TransportChanged` pushes. Secrets never ride this op (credential store
+        // only).
+        let adapter = self
+            .adapters
+            .load_full()
+            .adapter_for_transport(&transport)
+            .ok_or_else(|| {
+                ApiError::Other(format!("no adapter owns transport {}", transport.as_str()))
+            })?;
+        // (1) Unknown keys are a client error, not something to silently persist: every settable
+        // key is declared by the adapter's account-setup form.
+        let schema = adapter.info().account_schema;
+        let known: std::collections::BTreeSet<&str> =
+            schema.fields.iter().map(|f| f.key.as_str()).collect();
+        if let Some(bad) = settings.values.keys().find(|k| !known.contains(k.as_str())) {
+            return Err(ApiError::Other(format!(
+                "unknown setting key `{bad}` for {}: not in the adapter's account_schema",
+                adapter.family()
+            )));
+        }
+        // (2) Merge over the persisted values (upsert semantics: unspecified keys keep their
+        // value), then let the adapter vet the EFFECTIVE map — a messaging protocol validates
+        // (`purple_protocol_validate_account`); a generic transport has no validator.
+        let mut merged = self.transport_settings(transport.clone()).await?.values;
+        merged.extend(settings.values);
+        if let Some(messaging) = adapter.clone().messaging() {
+            messaging
+                .validate_account(&AccountSettingsValues {
+                    values: merged.clone(),
+                })
+                .await?;
+        }
+        // (3) Persist the merged map (validation passed — nothing is stored on any error above).
+        self.store
+            .set_transport_settings(transport.as_str(), &merged)
+            .await
+            .map_err(|e| ApiError::Other(format!("set_transport_settings: {e}")))?;
+        // (4) Apply-by-reconnect, only when the instance is live right now: disconnect emits the
+        // Offline `TransportChanged`; the re-spawned serve loop emits its own serve-start push —
+        // reusing the existing event, exactly like the set-enabled cycle (no double-emit here).
+        let connected = self.adapters.load_full().instances().await.iter().any(|i| {
+            i.transport == transport && i.connection == daemon_api::ConnectionState::Connected
+        });
+        if connected {
+            self.transport_disconnect(transport.clone()).await?;
+            self.transport_connect(transport).await?;
+        }
+        Ok(())
+    }
+
     async fn transport_remove(&self, transport: TransportId) -> Result<(), ApiError> {
         // Remove implies disconnect, then ONE node-side teardown (wire v30, item 1): the client
         // issues a single intent; the node sequences the steps. (1) disconnect, (2) leave every

@@ -2288,6 +2288,20 @@ impl SessionStore for InMemoryStore {
         Ok(())
     }
 
+    async fn set_transport_settings(
+        &self,
+        transport: &str,
+        settings: &BTreeMap<String, String>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = inner
+            .transport_prefs
+            .entry(transport.to_string())
+            .or_insert((true, None, BTreeMap::new()));
+        entry.2 = settings.clone();
+        Ok(())
+    }
+
     async fn credential_labels(&self) -> Vec<(String, String)> {
         self.inner
             .lock()
