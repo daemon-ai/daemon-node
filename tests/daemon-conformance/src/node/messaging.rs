@@ -305,7 +305,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
     );
 
     // The merged room transcript records every post (operator + agent replies) as rich
-    // `JournalRecordPayload::Chat` records (wire vNEXT; the coarse `Block` shape is retired from
+    // `JournalRecordPayload::Chat` records (wire v38; the coarse `Block` shape is retired from
     // the conv journal), verified, in append order.
     let history = match client
         .call(ApiRequest::ConvHistory(daemon_api::ConvHistoryArgs {
@@ -1004,7 +1004,7 @@ impl RoomsSocket {
     }
 }
 
-/// The journal obligation on the rooms send path (wire vNEXT): every `ConvSend` — operator
+/// The journal obligation on the rooms send path (wire v38): every `ConvSend` — operator
 /// (`from: None`) and contact-attributed alike — appends one `JournalRecordPayload::Chat` with a
 /// properly populated `ChatMessage` (structured author, RAW text, timestamp) to
 /// `conv:room:<conv>`, readable via `ConvHistory` in append order, and each append raises exactly
@@ -1071,7 +1071,7 @@ async fn conv_send_journals_chat_and_emits_messages_changed() {
     h.tear_down().await;
 }
 
-/// ConvHistory paging over Chat records (wire vNEXT): N messages page through `after_cursor + max`
+/// ConvHistory paging over Chat records (wire v38): N messages page through `after_cursor + max`
 /// with stable, strictly-increasing cursors, no dup or gap, in append order — and a re-read from
 /// the same cursor returns the same page (non-destructive).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Conversation chat journal (wire vNEXT): the `LifecycleSink::chat_message` seam appends a
+//! Conversation chat journal (wire v38): the `LifecycleSink::chat_message` seam appends a
 //! `JournalRecordPayload::Chat` record onto the conversation's verifiable journal stream
 //! (`conv:<transport>:<conv>` — the stream `ConvHistory` pages) and emits the granular
 //! `NodeEvent::MessagesChanged` pointer, once per message. The seam is the single choke point every
@@ -65,7 +65,7 @@ fn assemble_min() -> AssembledNode {
     })
 }
 
-/// The new node-event variant survives the shared CBOR codec (the additive wire vNEXT arm).
+/// The new node-event variant survives the shared CBOR codec (the additive wire v38 arm).
 #[test]
 fn messages_changed_round_trips() {
     let ev = NodeEvent::MessagesChanged {

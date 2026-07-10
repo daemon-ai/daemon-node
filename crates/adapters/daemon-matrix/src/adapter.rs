@@ -456,7 +456,7 @@ impl SupportsConversations for MatrixAdapter {
             .send(RoomMessageEventContent::text_plain(message.text.clone()))
             .await
             .map_err(|e| ApiError::Other(format!("matrix send: {e}")))?;
-        // Journal obligation (wire vNEXT): report the server-acked send through the node sink,
+        // Journal obligation (wire v38): report the server-acked send through the node sink,
         // which appends the `Chat` record onto `conv:<transport>:<conv>` and emits
         // `MessagesChanged`. Ack ⇒ delivered; the acked event id is the protocol message id.
         if let Some(sink) = &self.sink {

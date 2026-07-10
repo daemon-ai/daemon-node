@@ -105,7 +105,7 @@ impl ConversationType {
 
     /// The `"type"` tag value libpurple derives in `purple_conversation_set_conversation_type`:
     /// `Dm→"dm"`, `GroupDm→"group-dm"`, `Channel→"channel"`, `Thread→"thread"`, `Unset→None`.
-    /// `Space→"space"` (wire vNEXT): the structural-container kind gets its own tag, slotted after
+    /// `Space→"space"` (wire v38): the structural-container kind gets its own tag, slotted after
     /// the message kinds — it is exhaustive here (a non-exhaustive match would fail to compile), so
     /// the new variant is handled explicitly rather than folded into a catch-all.
     pub fn tag_value(self) -> Option<&'static str> {

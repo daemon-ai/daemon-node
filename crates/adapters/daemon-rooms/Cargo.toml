@@ -20,7 +20,7 @@ daemon-common = { workspace = true }
 daemon-store = { workspace = true }
 # the in-process request-context binding + the blob store for the loopback file transfer. The merged
 # per-room chat history is journaled node-side through `daemon_api::LifecycleSink::chat_message`
-# (wire vNEXT), so no journal writer/signer lives here. Mirrors `daemon-matrix`'s host dep.
+# (wire v38), so no journal writer/signer lives here. Mirrors `daemon-matrix`'s host dep.
 daemon-host = { workspace = true }
 # the typed Room descriptor (kind/title/topic/policy) the adapter CBOR-encodes into the store's
 # protocol-free `Room.descriptor` opaque column.

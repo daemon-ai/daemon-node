@@ -383,7 +383,7 @@ fn classify(req: &ApiRequest) -> Coverage {
         | TransportConnect { .. }
         | TransportSetEnabled { .. }
         | TransportSetLabel { .. }
-        // The account-settings read + merge-edit (wire vNEXT) are RoutingRead/RoutingWrite
+        // The account-settings read + merge-edit (wire v38) are RoutingRead/RoutingWrite
         // capability-gated like the other transport account-management ops; not session-scoped.
         | TransportSettings { .. }
         | TransportConfigure { .. } => NotSessionTouching,

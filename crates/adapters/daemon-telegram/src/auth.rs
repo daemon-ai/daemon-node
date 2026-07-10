@@ -147,7 +147,7 @@ impl TelegramPendingFlow {
     }
 }
 
-/// A single-field `Form` challenge. `kind` renders + validates the field (wire vNEXT): a token/2FA
+/// A single-field `Form` challenge. `kind` renders + validates the field (wire v38): a token/2FA
 /// password is [`AuthFieldKind::Password`] (masked), a login code is [`AuthFieldKind::Number`].
 fn form_field(title: &str, key: &str, label: &str, kind: AuthFieldKind) -> AuthChallenge {
     AuthChallenge::Form {

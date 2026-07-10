@@ -1328,7 +1328,7 @@ async fn account_provisioning_enumerates_resolves_and_refreshes() {
     handle.shutdown().await;
 }
 
-/// USERPASSWORD INTERACTIVE-AUTH (wire vNEXT — the exchange-at-sign-in pattern): a reference
+/// USERPASSWORD INTERACTIVE-AUTH (wire v38 — the exchange-at-sign-in pattern): a reference
 /// username/password family proves the enriched-field + `AuthFlowKind::UserPassword` surface end to
 /// end through the node's `PendingAuthFlows` plumbing:
 /// (1) `auth_providers` advertises the `UserPassword` flow with a MASKED (`AuthFieldKind::Password`)

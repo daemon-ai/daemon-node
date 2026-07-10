@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
 //! N5 — the in-process **demo** transport (`daemon-demo`) driven end to end over the Unix socket,
-//! exactly as a GUI/TUI would, proving the whole vNEXT surface runs against a real node with zero
+//! exactly as a GUI/TUI would, proving the whole v38 surface runs against a real node with zero
 //! external network:
 //!
 //! 1. **Auth** — `auth_providers` advertises one family per [`AuthFlowKind`] variant; every flow

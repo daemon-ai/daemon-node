@@ -470,7 +470,7 @@ async fn serve_routing(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::TransportSetLabel { transport, label } => {
             unit_or_err(api.transport_set_label(transport, label).await)
         }
-        // -- transport account settings (N2; wire vNEXT) ----------------------------------------
+        // -- transport account settings (N2; wire v38) ----------------------------------------
         ApiRequest::TransportSettings { transport } => ok_or_err(
             api.transport_settings(transport).await,
             ApiResponse::TransportSettings,

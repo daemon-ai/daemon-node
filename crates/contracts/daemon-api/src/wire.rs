@@ -1169,16 +1169,16 @@ pub enum ApiRequest {
     /// [`NodeEvent::PersonsChanged`] pointer. Answered by [`ApiResponse::Persons`].
     PersonList,
 
-    // -- transport account settings (N2; wire vNEXT) --------------------------------------------
+    // -- transport account settings (N2; wire v38) --------------------------------------------
     /// [`ControlApi::transport_settings`] — read a transport instance's persisted NON-SECRET
-    /// account-settings values (wire vNEXT). Answered by [`ApiResponse::TransportSettings`].
+    /// account-settings values (wire v38). Answered by [`ApiResponse::TransportSettings`].
     /// Secrets never live in this surface — they go to the credential store via the auth flows.
     TransportSettings {
         /// The instance-qualified transport id.
         transport: TransportId,
     },
     /// [`ControlApi::transport_configure`] — merge-persist a transport instance's non-secret
-    /// settings values and apply them by reconnect (wire vNEXT). Answered by [`ApiResponse::Ok`].
+    /// settings values and apply them by reconnect (wire v38). Answered by [`ApiResponse::Ok`].
     TransportConfigure {
         /// The instance-qualified transport id.
         transport: TransportId,
@@ -1409,7 +1409,7 @@ pub enum ApiResponse {
     /// The node's person/metacontact registry (`person_list`; wire v37), insertion order.
     Persons(Vec<Person>),
     /// A transport instance's persisted NON-SECRET account-settings values (`transport_settings`;
-    /// wire vNEXT). Secrets never ride this response — they live in the credential store.
+    /// wire v38). Secrets never ride this response — they live in the credential store.
     TransportSettings(AccountSettingsValues),
 }
 
@@ -2103,6 +2103,19 @@ mod auth_contract_tests {
         assert_eq!(WIRE_VERSION, 2);
     }
 
+    /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the finalized integrations surface: v38. Distinct
+    /// from the transport-envelope [`WIRE_VERSION`] above (= 2), which the integrations port did
+    /// not touch. Bumping the contract version is a deliberate act — this assertion is the gate.
+    #[test]
+    fn contract_wire_version_is_v38() {
+        assert_eq!(
+            daemon_common::WireVersion::CURRENT,
+            daemon_common::WireVersion(38)
+        );
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(38));
+    }
+
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)
     /// and parses back to it through the public prefix.
     #[test]
@@ -2337,9 +2350,9 @@ mod auth_contract_tests {
         )));
     }
 
-    /// wire vNEXT: the enriched [`AuthParamField`] (the additive `kind` / `default` / `placeholder` /
+    /// wire v38: the enriched [`AuthParamField`] (the additive `kind` / `default` / `placeholder` /
     /// `choices` metadata) round-trips through ciborium for every [`AuthFieldKind`], `kind` defaults
-    /// to [`AuthFieldKind::Text`], and a legacy pre-vNEXT 3-member encoding still decodes — the new
+    /// to [`AuthFieldKind::Text`], and a legacy pre-v38 3-member encoding still decodes — the new
     /// members are backward-compatible (defaulting to `Text` / `None` / empty when absent).
     #[test]
     fn auth_param_field_metadata_round_trips() {
@@ -2365,10 +2378,10 @@ mod auth_contract_tests {
             assert_eq!(back, field);
         }
 
-        // `kind` defaults to Text (the pre-vNEXT rendering).
+        // `kind` defaults to Text (the pre-v38 rendering).
         assert_eq!(AuthFieldKind::default(), AuthFieldKind::Text);
 
-        // Backward-compat: a legacy 3-member map (pre-vNEXT: key/label/required only) still decodes,
+        // Backward-compat: a legacy 3-member map (pre-v38: key/label/required only) still decodes,
         // defaulting the new members.
         #[derive(serde::Serialize)]
         struct LegacyField {
@@ -2396,7 +2409,7 @@ mod auth_contract_tests {
         assert!(back.choices.is_empty());
     }
 
-    /// wire vNEXT: the new END variant [`AuthFlowKind::UserPassword`] round-trips on its own and
+    /// wire v38: the new END variant [`AuthFlowKind::UserPassword`] round-trips on its own and
     /// nested inside an [`AuthProviderInfo`] advertising a masked ([`AuthFieldKind::Password`])
     /// password field alongside a plain-text username.
     #[test]
@@ -2502,7 +2515,7 @@ mod auth_contract_tests {
     }
 }
 
-/// N4 (wire vNEXT — conversation hierarchy): the additive `ConversationInfo.parent` field and the
+/// N4 (wire v38 — conversation hierarchy): the additive `ConversationInfo.parent` field and the
 /// new `ConversationType::Space` variant that let a client render account → spaces → rooms trees.
 #[cfg(test)]
 mod conversation_hierarchy_tests {
@@ -2522,7 +2535,7 @@ mod conversation_hierarchy_tests {
         }
     }
 
-    /// wire vNEXT: a structural `Space` container and a child conversation carrying its containing
+    /// wire v38: a structural `Space` container and a child conversation carrying its containing
     /// space as `parent` both round-trip through ciborium (as bare `ConversationInfo` and nested in
     /// the `Conversations` page / `Conversation` response the projection actually emits).
     #[test]
@@ -2541,7 +2554,7 @@ mod conversation_hierarchy_tests {
             assert_eq!(back, value);
         }
 
-        // Standalone new variant round-trips (and is not confused with the pre-vNEXT variants).
+        // Standalone new variant round-trips (and is not confused with the pre-v38 variants).
         let mut bytes = Vec::new();
         ciborium::into_writer(&ConversationType::Space, &mut bytes).expect("encode Space");
         let back: ConversationType = ciborium::from_reader(&bytes[..]).expect("decode Space");
@@ -2558,7 +2571,7 @@ mod conversation_hierarchy_tests {
         assert_eq!(decoded, page);
     }
 
-    /// wire vNEXT backward-compat: a pre-vNEXT encoding WITHOUT `parent` (a peer that predates the
+    /// wire v38 backward-compat: a pre-v38 encoding WITHOUT `parent` (a peer that predates the
     /// hierarchy field) still decodes, defaulting `parent` to `None` — the field is purely additive.
     #[test]
     fn conversation_without_parent_defaults_to_none() {

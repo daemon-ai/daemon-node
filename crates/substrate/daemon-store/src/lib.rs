@@ -279,7 +279,7 @@ pub struct TransportPref {
     pub enabled: bool,
     /// The operator-set human label/rename (`None` = no custom label).
     pub label: Option<String>,
-    /// The persisted per-instance NON-SECRET account-settings values (wire vNEXT), keyed by the
+    /// The persisted per-instance NON-SECRET account-settings values (wire v38), keyed by the
     /// adapter's `account_schema` field keys. Plain strings, so the store stays protocol-free.
     /// SECURITY INVARIANT: secrets never land here — they go to the credential store via the
     /// auth flows; this map holds only non-secret configuration.
@@ -1207,7 +1207,7 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
-    /// Upsert a transport instance's persisted NON-SECRET account-settings values (wire vNEXT),
+    /// Upsert a transport instance's persisted NON-SECRET account-settings values (wire v38),
     /// preserving its enabled state and label. The caller (the node's `transport_configure`)
     /// passes the already-MERGED effective map, so this is a whole-map replace of the `settings`
     /// column on the same prefs row the enabled/label ops use. Secrets never ride this call —
@@ -1592,7 +1592,7 @@ struct Inner {
     /// Node-wide tool enable/disable overrides (wire v30), keyed by tool name (the in-memory
     /// analogue of the SQLite `tool_overrides` table).
     tool_overrides: HashMap<String, bool>,
-    /// Per-transport-instance preferences (wire v35 + vNEXT): desired enabled state + optional
+    /// Per-transport-instance preferences (wire v35 + v38): desired enabled state + optional
     /// label + non-secret settings values, keyed by transport id (the in-memory analogue of the
     /// SQLite `transport_prefs` table).
     #[allow(clippy::type_complexity)]

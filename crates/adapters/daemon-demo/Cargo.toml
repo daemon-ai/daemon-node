@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 # The in-process "demo" messaging transport (N5): a fully self-contained adapter + interactive-auth
-# factories that exercise the ENTIRE vNEXT surface — auth flows (every `AuthFlowKind`), the account
+# factories that exercise the ENTIRE v38 surface — auth flows (every `AuthFlowKind`), the account
 # settings schema + `validate_account`, the full conversation tree (Space/parent/Channel/Dm/GroupDm),
 # a seeded roster with varied presence, and live two-way chat journaled through the node's
 # `LifecycleSink`. It reaches nothing external: no network, no store, no credentials. Depends only on

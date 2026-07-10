@@ -255,7 +255,7 @@ impl JournalSink {
         .await
     }
 
-    /// Append one conversation [`ChatMessage`](daemon_api::ChatMessage) to the chain (wire vNEXT)
+    /// Append one conversation [`ChatMessage`](daemon_api::ChatMessage) to the chain (wire v38)
     /// under the `chat.message` kind — the per-message record of a `conv:<transport>:<conv>`
     /// stream, decoded back into `JournalRecordPayload::Chat` by the history reader.
     pub async fn record_chat(

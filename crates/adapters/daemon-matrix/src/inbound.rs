@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
 //! Inbound: Matrix room messages -> `Origin` + `Reception` -> the `daemon-ingest` gate, PLUS the
-//! wire-vNEXT journal obligation (every inbound message is reported through the node
+//! wire-v38 journal obligation (every inbound message is reported through the node
 //! [`LifecycleSink`](daemon_api::LifecycleSink) so the conversation's durable chat history grows
 //! and `MessagesChanged` fires — in addition to the ingest routing, never instead of it).
 //!
@@ -43,7 +43,7 @@ pub struct InboundCtx {
     pub transport: TransportId,
     /// This account's own user id — messages from it are ignored (no self-loop).
     pub me: OwnedUserId,
-    /// The node-owned lifecycle sink (wire vNEXT): every inbound message is reported through it so
+    /// The node-owned lifecycle sink (wire v38): every inbound message is reported through it so
     /// the node journals a `Chat` record on `conv:<transport>:<room>` and emits `MessagesChanged` —
     /// in ADDITION to the agent-session `Ingestor` routing below, never instead of it. `None` in
     /// unit tests that never wire the node.
@@ -81,7 +81,7 @@ pub async fn on_room_message(ev: OriginalSyncRoomMessageEvent, room: Room, ctx: 
 
     let room_id = room.room_id().as_str().to_string();
 
-    // Journal obligation (wire vNEXT): report EVERY inbound message through the node sink, which
+    // Journal obligation (wire v38): report EVERY inbound message through the node sink, which
     // appends a `Chat` record onto `conv:<transport>:<room>` and emits `MessagesChanged`. This is
     // the transport-level conversation history, so it happens BEFORE the route table below — that
     // table only gates *agent engagement*. The record carries the RAW body + the sender's MXID as

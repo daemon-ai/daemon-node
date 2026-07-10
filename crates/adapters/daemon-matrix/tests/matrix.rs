@@ -477,7 +477,7 @@ async fn file_transfer_receive_downloads_media() {
     let _ = std::fs::remove_dir_all(&expected_root);
 }
 
-/// N4 (wire vNEXT — conversation hierarchy): a synced `m.space` room projects to
+/// N4 (wire v38 — conversation hierarchy): a synced `m.space` room projects to
 /// `ConversationType::Space` through the public conversation projection (`SupportsConversations::get`
 /// → `room_to_info`). The room type is sourced from the SDK's `Room::is_space()` (the `m.space`
 /// `m.room.create` `type`), fabricated here with the harness's `EventFactory::create(..).with_space_type()`.
@@ -524,7 +524,7 @@ async fn space_room_projects_as_space_conversation() {
     assert_eq!(info.parent, None, "a top-level space is a hierarchy root");
 }
 
-/// N4 (wire vNEXT): a child room carries its containing space as `parent`, derived from the SDK's
+/// N4 (wire v38): a child room carries its containing space as `parent`, derived from the SDK's
 /// `Room::parent_spaces()` (the `m.space.parent` state relation). Only the child is synced, so the
 /// SDK reports the parent as `ParentSpace::Unverifiable(space_id)` — the projection still emits the
 /// id, and (dangling/unknown parents being a client concern) the node reports what the protocol says.
@@ -579,7 +579,7 @@ async fn child_room_carries_parent_space() {
     );
 }
 
-/// N4 (wire vNEXT): a plain (non-space, no `m.space.parent`) room projects with `parent == None` and
+/// N4 (wire v38): a plain (non-space, no `m.space.parent`) room projects with `parent == None` and
 /// a non-`Space` kind — proving the new field is only populated when the protocol actually reports a
 /// hierarchy relation.
 #[tokio::test]
@@ -623,7 +623,7 @@ async fn plain_room_has_no_parent() {
     assert_ne!(info.kind, ConversationType::Space);
 }
 
-/// A recording node-lifecycle sink: captures every `chat_message` report (the wire-vNEXT journal
+/// A recording node-lifecycle sink: captures every `chat_message` report (the wire-v38 journal
 /// obligation seam) so the vertical tests can assert the adapter reports each outbound send and
 /// inbound delivery exactly once, with a properly populated [`ChatMessage`].
 #[derive(Default)]
@@ -664,7 +664,7 @@ impl LifecycleSink for RecordingSink {
     }
 }
 
-/// The journal obligation on the matrix send path (wire vNEXT): a successful `ConvSend` reports
+/// The journal obligation on the matrix send path (wire v38): a successful `ConvSend` reports
 /// exactly one `chat_message` through the node sink — author = the `from` participant, RAW text,
 /// the server-acked event id as `ChatMessage::id`, delivered stamped — for the node to journal on
 /// `conv:<transport>:<room>` and announce via `MessagesChanged`.
@@ -734,7 +734,7 @@ async fn send_reports_chat_message_through_the_sink() {
     assert!(msg.delivered(), "a server-acked send is stamped delivered");
 }
 
-/// The journal obligation on the matrix inbound path (wire vNEXT): a synced `m.room.message`
+/// The journal obligation on the matrix inbound path (wire v38): a synced `m.room.message`
 /// reports one `chat_message` through the node sink — structured author (the sender MXID), RAW
 /// body, the matrix event id — in ADDITION to the existing agent-session `Ingestor` routing
 /// (the `StartTurn` still fires; journaling never replaces it).

@@ -59,7 +59,7 @@ fn next_msg_id() -> String {
 }
 
 /// The in-process demo transport adapter. Holds the resolved config + the node-owned lifecycle sink
-/// (the wire-vNEXT chat-journal seam every message is reported through). All domain state is seeded
+/// (the wire-v38 chat-journal seam every message is reported through). All domain state is seeded
 /// deterministically from [`crate::seed`]; nothing is persisted.
 pub struct DemoAdapter {
     cfg: DemoConfig,

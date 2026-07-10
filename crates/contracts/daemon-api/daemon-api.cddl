@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 37)
+wire_version = uint                 ; daemon-common WireVersion (current = 38)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -614,7 +614,7 @@ node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 node-event-notifications-changed = "NotificationsChanged"
 ; wire v37: the person registry changed (create/remove/associate/dissociate) -> re-list PersonList.
 node-event-persons-changed      = "PersonsChanged"
-; wire vNEXT: a conversation's durable chat journal grew (one Chat record appended) -> refetch
+; wire v38: a conversation's durable chat journal grew (one Chat record appended) -> refetch
 ; ConvHistory from the client's cursor. Granular per-(transport, conv), emitted once per message.
 node-event-messages-changed     = { "MessagesChanged":    { "transport": transport-id, "conv": tstr } }
 events-page = {
@@ -1072,17 +1072,17 @@ auth-flow-kind = "MatrixSso"
                / "UserToken"
                / "PhoneOtp"
                / "QrPairing"
-               / "UserPassword"          ; wire vNEXT: username+password exchanged at sign-in
-; how a client renders + validates one auth-param-field (wire vNEXT; default Text).
+               / "UserPassword"          ; wire v38: username+password exchanged at sign-in
+; how a client renders + validates one auth-param-field (wire v38; default Text).
 auth-field-kind = "Text" / "Password" / "Number" / "Choice"
 auth-param-field = {
   "key": tstr,
   "label": tstr,
   "required": bool,
-  ? "kind": auth-field-kind,            ; wire vNEXT (absent = Text)
-  ? "default": (tstr / null),           ; wire vNEXT: prefill value
-  ? "placeholder": (tstr / null),       ; wire vNEXT: empty-input hint
-  ? "choices": [* tstr],                ; wire vNEXT: allowed values when kind == Choice
+  ? "kind": auth-field-kind,            ; wire v38 (absent = Text)
+  ? "default": (tstr / null),           ; wire v38: prefill value
+  ? "placeholder": (tstr / null),       ; wire v38: empty-input hint
+  ? "choices": [* tstr],                ; wire v38: allowed values when kind == Choice
 }
 auth-provider-info = { "family": tstr, "flow_kind": auth-flow-kind, "display_name": tstr, "params_schema": [* auth-param-field] }
 ; one challenge a flow presents at a step — how the client collects the next auth-step-input.
@@ -1179,7 +1179,7 @@ conversation-type = "Unset"
                   / "GroupDm"
                   / "Channel"
                   / "Thread"
-                  / "Space"                ; wire vNEXT: a structural container (Matrix spaces;
+                  / "Space"                ; wire v38: a structural container (Matrix spaces;
                                             ; future guilds/workspaces) — holds children, not messages
 member-role = "None"
             / "Voice"
@@ -1218,7 +1218,7 @@ conversation-info = {
   "transport": transport-id, "id": tstr, "kind": conversation-type,
   ? "title": (tstr / null), ? "topic": (tstr / null), ? "description": (tstr / null),
   ? "members": [* conversation-member],
-  ? "parent": (tstr / null),                ; wire vNEXT: containing space/server-level conv id on
+  ? "parent": (tstr / null),                ; wire v38: containing space/server-level conv id on
                                             ; the same transport (absent/null = a root); clients
                                             ; treat unknown/cyclic parents as roots
 }
@@ -1530,7 +1530,7 @@ file-transfer = {
 request-ft-send = { "FtSend": { "transport": transport-id, "transfer": file-transfer } }
 request-ft-receive = { "FtReceive": { "transport": transport-id, "transfer": file-transfer } }
 
-; ----- transport account settings (N2; wire vNEXT) -----
+; ----- transport account settings (N2; wire v38) -----
 ; Read + merge-edit of a transport instance's persisted NON-SECRET settings values (keys from the
 ; adapter's account-settings-schema). Secrets never ride these ops — they go to the credential
 ; store via the interactive-auth flows.
@@ -1860,7 +1860,7 @@ response-notifications = { "Notifications": [* notification-info] }
 ; wire v37: the node's person/metacontact registry, insertion order.
 response-persons = { "Persons": [* person] }
 
-; wire vNEXT: a transport instance's persisted NON-SECRET account-settings values (the
+; wire v38: a transport instance's persisted NON-SECRET account-settings values (the
 ; transport-settings read-back; secrets live in the credential store, never here).
 response-transport-settings = { "TransportSettings": account-settings-values }
 api-response = response-ok

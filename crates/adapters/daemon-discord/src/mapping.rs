@@ -56,7 +56,7 @@ pub(crate) fn guild_channel_to_info(
         topic: channel.topic.clone(),
         description: None,
         members: Vec::new(),
-        // Discord guild hierarchy is not projected through this adapter (wire vNEXT).
+        // Discord guild hierarchy is not projected through this adapter (wire v38).
         parent: None,
     }
 }

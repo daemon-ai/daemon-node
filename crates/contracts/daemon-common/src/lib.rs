@@ -726,7 +726,22 @@ impl WireVersion {
     /// conversation-history representation (`JournalRecordPayload::Chat` + `ChatMessage`/
     /// `MessageAttachment`). All additive, but bumped because `is_compatible` is strict-equal
     /// (mirrors the additive v15–v36 bumps).
-    pub const CURRENT: Self = Self(37);
+    ///
+    /// v38 (integrations surface finalized): the one-time bump owning the five additive
+    /// integrations packages developed against v37. (N1) enriched interactive-auth metadata —
+    /// `AuthParamField` gains `kind`/`default`/`placeholder`/`choices`, the `AuthFieldKind`
+    /// (`Text`/`Password`/`Number`/`Choice`, serde-default `Text`) enum, and the new
+    /// `AuthFlowKind::UserPassword` (username+password exchanged at sign-in). (N2) transport
+    /// account settings — the `TransportSettings`/`TransportConfigure` ops (read + merge-persist a
+    /// transport instance's NON-SECRET settings) backed by `settings` on `transport_prefs` +
+    /// sqlite migration M15. (N3) conversation chat journaling — `NodeEvent::MessagesChanged` and
+    /// the `LifecycleSink::chat_message` seam appending `JournalRecordPayload::Chat` records.
+    /// (N4) conversation hierarchy — the additive `ConversationInfo.parent` field and
+    /// `ConversationType::Space` structural-container variant. (N5) the in-process `daemon-demo`
+    /// transport (no wire changes). All additive, but bumped because `is_compatible` is
+    /// strict-equal, so an older peer cannot decode the new surface (mirrors the additive
+    /// v15–v37 bumps).
+    pub const CURRENT: Self = Self(38);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

@@ -21,7 +21,7 @@ use matrix_sdk::{Room, RoomMemberships};
 /// Project a synced Matrix `Room` into the wire [`ConversationInfo`]. Occupants are the active
 /// membership set; `kind` is [`ConversationType::Space`] for an `m.space` room, else `Dm` for a
 /// direct room, else `Channel` (Matrix has no native group-DM-vs-channel distinction, so non-DM
-/// rooms project as `Channel`). `parent` (wire vNEXT) is the containing space this room advertises
+/// rooms project as `Channel`). `parent` (wire v38) is the containing space this room advertises
 /// via its `m.space.parent` relations, if any (see [`select_parent`]).
 pub(crate) async fn room_to_info(transport: &TransportId, room: &Room) -> ConversationInfo {
     // `is_space` short-circuits the DM heuristic: a space is a structural container, never a DM, so
@@ -50,7 +50,7 @@ pub(crate) async fn room_to_info(transport: &TransportId, room: &Room) -> Conver
     }
 }
 
-/// Pure projection of a Matrix room's structural flags to a wire [`ConversationType`] (wire vNEXT).
+/// Pure projection of a Matrix room's structural flags to a wire [`ConversationType`] (wire v38).
 /// `is_space` wins over `is_direct`: an `m.space` room is a structural container, never a message
 /// DM. Kept pure (no `Room`) so the mapping is unit-testable with synthesized inputs.
 pub(crate) fn conversation_kind(is_space: bool, is_direct: bool) -> ConversationType {
@@ -63,7 +63,7 @@ pub(crate) fn conversation_kind(is_space: bool, is_direct: bool) -> Conversation
     }
 }
 
-/// Pick a single wire `parent` from the space ids a room advertises as parents (wire vNEXT). Matrix
+/// Pick a single wire `parent` from the space ids a room advertises as parents (wire v38). Matrix
 /// permits multiple `m.space.parent` relations, but the wire `parent` is one containing space, so we
 /// pick the lexicographically-lowest id — mirroring the Matrix spec's canonical-parent tie-break
 /// (lowest room id by Unicode code-point) — for a stable, deterministic projection. No parents ⟹
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(role_from_matrix(RoomMemberRole::User), MemberRole::None);
     }
 
-    /// N4 (wire vNEXT): the pure room-type projection. An `m.space` room is a structural
+    /// N4 (wire v38): the pure room-type projection. An `m.space` room is a structural
     /// [`ConversationType::Space`] container regardless of any DM heuristic; a direct room is a
     /// [`ConversationType::Dm`]; every other room is a [`ConversationType::Channel`].
     #[test]
@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(conversation_kind(false, false), ConversationType::Channel);
     }
 
-    /// N4 (wire vNEXT): `parent` is a single containing space, but Matrix permits multiple
+    /// N4 (wire v38): `parent` is a single containing space, but Matrix permits multiple
     /// `m.space.parent` relations, so the projection picks the lexicographically-lowest space id
     /// (the spec's canonical-parent tie-break) for a deterministic result; no parents ⟹ `None`.
     #[test]

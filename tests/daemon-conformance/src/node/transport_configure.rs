@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Transport account settings (N2; wire vNEXT) end to end over the Unix socket: the
+//! Transport account settings (N2; wire v38) end to end over the Unix socket: the
 //! `TransportSettings` read + `TransportConfigure` merge-edit of a transport instance's persisted
 //! NON-SECRET settings values. Proves the node-authoritative behaviors this package adds:
 //!

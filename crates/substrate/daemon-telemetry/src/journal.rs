@@ -44,7 +44,7 @@ pub enum JournalPayload {
         /// The opaque encoded block (CBOR by convention).
         body: Vec<u8>,
     },
-    /// One conversation chat message (wire vNEXT): opaque CBOR of a `daemon-api` `ChatMessage`,
+    /// One conversation chat message (wire v38): opaque CBOR of a `daemon-api` `ChatMessage`,
     /// the per-message record a messaging adapter's send/inbound obligation appends to a
     /// `conv:<transport>:<conv>` stream. Opaque here for the same reason as `Block`: the
     /// crypto/store layers stay contract-free; the host's history reader decodes it.

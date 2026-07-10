@@ -590,7 +590,7 @@ mod protocol {
     }
     #[tokio::test]
     async fn protocol_fake_validate_account_rejects_marker_value() {
-        // daemon-specific (N2, wire vNEXT): an otherwise-operable Fake rejects a settings map
+        // daemon-specific (N2, wire v38): an otherwise-operable Fake rejects a settings map
         // carrying the marker VALUE with a non-`Unsupported` error — the adapter-side validation
         // failure the host's `transport_configure` op must surface.
         let mut values = std::collections::BTreeMap::new();

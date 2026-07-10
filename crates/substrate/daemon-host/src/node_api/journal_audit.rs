@@ -51,7 +51,7 @@ impl NodeApiImpl {
     }
 
     /// Journal + seal one conversation chat message onto the verifiable `conv:<transport>:<conv>`
-    /// stream (wire vNEXT) — the append half of the [`LifecycleSink::chat_message`] seam every
+    /// stream (wire v38) — the append half of the [`LifecycleSink::chat_message`] seam every
     /// messaging adapter reports its sends/deliveries through. One long-lived sink per stream
     /// (mirroring [`Self::audit_management`]'s `mgmt_journal`) so the chain links per message and
     /// concurrent appends to one conversation share a segment/seq source. Returns whether the

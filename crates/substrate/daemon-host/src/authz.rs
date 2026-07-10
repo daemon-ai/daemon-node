@@ -198,7 +198,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | TransportRooms { .. }
         | TransportAdapters
         | TransportInstances
-        // Reading an instance's persisted non-secret settings (wire vNEXT) is a registry read.
+        // Reading an instance's persisted non-secret settings (wire v38) is a registry read.
         | TransportSettings { .. } => C::RoutingRead,
         RoutingSet { .. }
         | RoutingBindChat { .. }
@@ -208,7 +208,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | TransportConnect { .. }
         | TransportSetEnabled { .. }
         | TransportSetLabel { .. }
-        // Editing an instance's settings (wire vNEXT) is an account-management write, like the
+        // Editing an instance's settings (wire v38) is an account-management write, like the
         // enabled/label ops above.
         | TransportConfigure { .. } => C::RoutingWrite,
 

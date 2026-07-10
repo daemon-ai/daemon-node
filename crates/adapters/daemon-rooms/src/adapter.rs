@@ -12,7 +12,7 @@
 //! - persists rooms + membership to the durable [`SessionStore`] (`room_set` / `room_member_set`),
 //! - shares the in-memory [`Membership`] table with the live [`RoomRuntime`] (built in [`serve`]), and
 //! - forwards a `ConvSend` to that runtime over an `mpsc` command channel so the floor-gated fan-out,
-//!   the chat-journal report (via the node's [`LifecycleSink`], wire vNEXT), and the agent-reply
+//!   the chat-journal report (via the node's [`LifecycleSink`], wire v38), and the agent-reply
 //!   re-injection all run on the loop that owns the node `api` — the adapter struct never holds an
 //!   `Arc<dyn NodeApi>`, so there is no registry<->adapter reference cycle.
 //!
@@ -242,7 +242,7 @@ impl RoomRuntime {
             text,
             reset_budget,
         } = args;
-        // 1. Durable conversation history (wire vNEXT): report the message through the node's
+        // 1. Durable conversation history (wire v38): report the message through the node's
         //    LifecycleSink seam, which appends one verified `JournalRecordPayload::Chat` onto
         //    `conv:room:<id>` (the stream `conv_history` pages) and emits `MessagesChanged`. The
         //    record carries the RAW text + structured author — attribution never rides the body.
@@ -343,7 +343,7 @@ fn now_unix_secs() -> u64 {
 }
 
 /// The Rooms transport adapter. Holds the durable store, the node-owned lifecycle sink (the
-/// wire-vNEXT chat-journal seam every post is reported through), the resolved config, the
+/// wire-v38 chat-journal seam every post is reported through), the resolved config, the
 /// membership table it shares with the live runtime, and the command channel into
 /// [`serve`](Self::serve).
 pub struct RoomsAdapter {
@@ -366,7 +366,7 @@ pub struct RoomsAdapter {
 }
 
 impl RoomsAdapter {
-    /// Construct the adapter over the durable `store`, the node's [`LifecycleSink`] (wire vNEXT:
+    /// Construct the adapter over the durable `store`, the node's [`LifecycleSink`] (wire v38:
     /// the chat-journal + `MessagesChanged` seam; pass `None` where the node is not wired — unit
     /// tests), and the resolved `cfg`. The returned `Arc` is what the host registry holds and what
     /// `serve` consumes; ops borrow `&self` through it.
@@ -438,7 +438,7 @@ impl RoomsAdapter {
             topic: desc.topic,
             description: desc.description,
             members,
-            // The Rooms adapter models flat agent rooms — no space/server hierarchy (wire vNEXT).
+            // The Rooms adapter models flat agent rooms — no space/server hierarchy (wire v38).
             parent: None,
         }
     }

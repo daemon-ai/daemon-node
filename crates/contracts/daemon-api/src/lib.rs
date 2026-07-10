@@ -1426,9 +1426,9 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("fs_write_from_blob".into()))
     }
 
-    // -- Transport account settings (N2; wire vNEXT) ----------------------------------------------
+    // -- Transport account settings (N2; wire v38) ----------------------------------------------
 
-    /// The persisted per-instance account-settings values of a transport (wire vNEXT) — the
+    /// The persisted per-instance account-settings values of a transport (wire v38) — the
     /// read-back for the client's account settings form, keyed by the adapter's
     /// [`AdapterInfo::account_schema`] field keys. SECURITY INVARIANT: secrets NEVER live in this
     /// store — they go to the credential store via the interactive-auth flows
@@ -1441,7 +1441,7 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("transport_settings".into()))
     }
 
-    /// Merge-persist a transport instance's non-secret settings values (wire vNEXT), then apply
+    /// Merge-persist a transport instance's non-secret settings values (wire v38), then apply
     /// them by reconnect. Node-sequenced (the client sends one intent): reject keys not in the
     /// owning adapter's [`AdapterInfo::account_schema`]; run the adapter's
     /// [`MessagingProtocol::validate_account`] over the MERGED values (persisted ∪ incoming,
@@ -1855,7 +1855,7 @@ pub enum AuthFlowKind {
     /// A QR-code device-link/pairing flow: the client renders a `Qr` challenge and polls until the
     /// other device approves (e.g. WhatsApp/Signal linked-device pairing).
     QrPairing,
-    /// A username + password exchanged at sign-in (wire vNEXT). A masked [`AuthChallenge::Form`]
+    /// A username + password exchanged at sign-in (wire v38). A masked [`AuthChallenge::Form`]
     /// collects a `username` ([`AuthFieldKind::Text`]) + `password` ([`AuthFieldKind::Password`]);
     /// the factory validates them and **exchanges** them for an opaque session token/blob, which
     /// [`crate::CredentialApi`]'s store persists as the RESULT. The password is transient — it drives
@@ -2007,8 +2007,8 @@ pub struct AuthCompleteResponse {
     pub bound_profile: Option<ProfileRef>,
 }
 
-/// How a client should render + validate an [`AuthParamField`] (wire vNEXT). Defaults to [`Text`],
-/// a plain single-line entry, so a pre-vNEXT peer that omits `kind` keeps today's behavior.
+/// How a client should render + validate an [`AuthParamField`] (wire v38). Defaults to [`Text`],
+/// a plain single-line entry, so a pre-v38 peer that omits `kind` keeps today's behavior.
 ///
 /// [`Text`]: AuthFieldKind::Text
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -2035,18 +2035,18 @@ pub struct AuthParamField {
     pub label: String,
     /// Whether the field is required.
     pub required: bool,
-    /// How the client should render + validate this field (wire vNEXT). Defaults to
+    /// How the client should render + validate this field (wire v38). Defaults to
     /// [`AuthFieldKind::Text`]; a secret (token/password) uses [`AuthFieldKind::Password`] so the
     /// client masks it.
     #[serde(default)]
     pub kind: AuthFieldKind,
-    /// A prefill/default value to seed the input with (wire vNEXT); `None` = start empty.
+    /// A prefill/default value to seed the input with (wire v38); `None` = start empty.
     #[serde(default)]
     pub default: Option<String>,
-    /// Placeholder/hint text shown in an empty input (wire vNEXT); `None` = no hint.
+    /// Placeholder/hint text shown in an empty input (wire v38); `None` = no hint.
     #[serde(default)]
     pub placeholder: Option<String>,
-    /// The allowed values when `kind == `[`AuthFieldKind::Choice`] (wire vNEXT); empty for every
+    /// The allowed values when `kind == `[`AuthFieldKind::Choice`] (wire v38); empty for every
     /// other kind.
     #[serde(default)]
     pub choices: Vec<String>,
@@ -3619,7 +3619,7 @@ pub trait LifecycleSink: Send + Sync {
         is_self: bool,
     );
 
-    /// Report one chat message — an outbound send or an inbound delivery — on `conv` (wire vNEXT).
+    /// Report one chat message — an outbound send or an inbound delivery — on `conv` (wire v38).
     /// The NODE owns the consequences at this single seam, so every messaging adapter inherits
     /// them: it appends the message as a [`JournalRecordPayload::Chat`] record onto the
     /// conversation's verifiable journal stream (`conv:<transport>:<conv>`, the stream
@@ -3942,12 +3942,12 @@ pub enum ConversationType {
     Channel,
     /// A thread within a conversation.
     Thread,
-    /// A structural container that holds child conversations rather than messages (wire vNEXT).
+    /// A structural container that holds child conversations rather than messages (wire v38).
     /// This models Matrix spaces (`m.space` rooms) today, and generalizes to future Discord guilds
     /// / Slack workspaces / server-level groupings: a `Space` never carries a message transcript —
     /// clients render it as a node in the account → spaces → rooms → DMs tree, and its children are
     /// the conversations that name it via [`ConversationInfo::parent`]. Appended at the END of the
-    /// enum so the discriminant stays additive for pre-vNEXT peers.
+    /// enum so the discriminant stays additive for pre-v38 peers.
     Space,
 }
 
@@ -4119,14 +4119,14 @@ pub struct ConversationInfo {
     #[serde(default)]
     pub members: Vec<ConversationMember>,
     /// The conversation id of the containing space/server-level conversation on the **same**
-    /// transport, if any (wire vNEXT). Set on a child conversation to name its parent — typically a
+    /// transport, if any (wire v38). Set on a child conversation to name its parent — typically a
     /// [`ConversationType::Space`] (a Matrix space, and future Discord guilds / Slack workspaces) —
     /// so clients can render an account → spaces → rooms → DMs tree. `None` ⟹ a top-level (root)
     /// conversation. The node emits exactly what the protocol reports and does not sanitize the
     /// graph: a `parent` may reference a conversation the client has not seen, and adapters that
     /// expose no hierarchy simply leave this `None`. Clients MUST tolerate cycles and dangling
     /// parents — treat an unknown or self-referential `parent` as a root. Appended at the END with
-    /// `#[serde(default)]` so a pre-vNEXT encoding that omits it decodes to `None`.
+    /// `#[serde(default)]` so a pre-v38 encoding that omits it decodes to `None`.
     #[serde(default)]
     pub parent: Option<String>,
 }
@@ -4566,7 +4566,7 @@ pub enum NodeEvent {
     /// or a contact endpoint was associated/dissociated. A payload-free node-wide invalidation
     /// pointer (clients re-list via `PersonList`), mirroring [`NodeEvent::NotificationsChanged`].
     PersonsChanged,
-    /// A conversation's durable chat history grew (wire vNEXT): a messaging adapter recorded an
+    /// A conversation's durable chat history grew (wire v38): a messaging adapter recorded an
     /// inbound or outbound [`ChatMessage`] as a [`JournalRecordPayload::Chat`] record on the
     /// conversation's journal stream (`conv:<transport>:<conv>`). A granular invalidation pointer,
     /// emitted once per appended message — the client refetches `ConvHistory` from its cursor
@@ -4855,7 +4855,7 @@ mod tests {
         }
     }
 
-    /// The transport account-settings ops (N2; wire vNEXT) round-trip through CBOR: the settings
+    /// The transport account-settings ops (N2; wire v38) round-trip through CBOR: the settings
     /// read, the merge-edit configure (populated and empty maps), and the values response.
     #[test]
     fn transport_settings_requests_and_response_round_trip() {

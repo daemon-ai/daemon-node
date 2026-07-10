@@ -580,7 +580,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             next: Some("conv-064".into()),
         }),
     )?;
-    // Conversation hierarchy (wire vNEXT): a structural `Space` container (a root — no `parent`) and
+    // Conversation hierarchy (wire v38): a structural `Space` container (a root — no `parent`) and
     // a child `Channel` naming that space via `parent`, so verify-codec proves the generated zcbor C
     // decoder accepts the new `ConversationType::Space` variant + the additive `parent` member.
     write_cbor(
@@ -845,7 +845,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     key: "otp".into(),
                     label: "One-time code".into(),
                     required: true,
-                    // wire vNEXT: exercise the enriched metadata (a numeric OTP with a hint) so
+                    // wire v38: exercise the enriched metadata (a numeric OTP with a hint) so
                     // verify-codec proves the generated C decoder accepts the new optional members.
                     kind: daemon_api::AuthFieldKind::Number,
                     placeholder: Some("123456".into()),
@@ -879,7 +879,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 bound_profile: Some(ProfileRef::new("default")),
             })),
         )?;
-        // wire vNEXT: an AuthProviders discovery response advertising the new UserPassword flow with
+        // wire v38: an AuthProviders discovery response advertising the new UserPassword flow with
         // an enriched params schema across every AuthFieldKind (a plain-text username, a MASKED
         // password, and a defaulted Choice) — so verify-codec proves the generated zcbor C decoder
         // accepts the enriched auth-param-field + the new auth-flow-kind arm.
@@ -1407,7 +1407,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 NodeEvent::NotificationsChanged,
                 // wire v37: the payload-free persons-changed pointer (port-person).
                 NodeEvent::PersonsChanged,
-                // wire vNEXT: the per-message conversation-history pointer (chat journal), so
+                // wire v38: the per-message conversation-history pointer (chat journal), so
                 // verify-codec proves the generated decoder accepts the new node-event arm.
                 NodeEvent::MessagesChanged {
                     transport: TransportId::new("matrix/@bot:hs.org"),
@@ -1927,7 +1927,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         )?;
     }
 
-    // -- transport account settings (N2; wire vNEXT) --------------------------------------------
+    // -- transport account settings (N2; wire v38) --------------------------------------------
     // The settings read + merge-edit of a transport instance's persisted NON-SECRET values, so
     // verify-codec proves the generated zcbor C decoder accepts the map-carrying shapes.
     {

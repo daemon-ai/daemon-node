@@ -1208,7 +1208,7 @@ impl ControlApi for NodeApiImpl {
         &self,
         transport: TransportId,
     ) -> Result<AccountSettingsValues, ApiError> {
-        // Read-back of the persisted per-instance settings values (wire vNEXT): a plain prefs-row
+        // Read-back of the persisted per-instance settings values (wire v38): a plain prefs-row
         // lookup (a never-configured instance reads as the empty map), the same store row the
         // label/enabled desires overlay from. SECURITY INVARIANT: secrets never live in this
         // store — they go to the CredentialStore via the interactive-auth flows — so this read
@@ -1229,7 +1229,7 @@ impl ControlApi for NodeApiImpl {
         transport: TransportId,
         settings: AccountSettingsValues,
     ) -> Result<(), ApiError> {
-        // Merge-edit of a transport instance's NON-SECRET settings (wire vNEXT), node-sequenced
+        // Merge-edit of a transport instance's NON-SECRET settings (wire v38), node-sequenced
         // (the client sends one intent): (1) reject keys outside the owning adapter's
         // account_schema, (2) run the adapter's `validate_account` over the MERGED map (persisted
         // ∪ incoming, incoming wins) and surface its error, (3) persist to the same prefs row the

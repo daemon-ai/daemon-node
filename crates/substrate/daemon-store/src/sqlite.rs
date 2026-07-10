@@ -423,7 +423,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
                  entry BLOB NOT NULL\n\
              );",
         ),
-        // M15 (wire vNEXT — transport account settings): the per-instance NON-SECRET settings
+        // M15 (wire v38 — transport account settings): the per-instance NON-SECRET settings
         // values on the SAME `transport_prefs` row the enabled/label desires live on (additive
         // column, mirroring the `session_meta.inline_profile` ALTER). The CBOR of a plain
         // `BTreeMap<String, String>` (protocol-free, mirroring `feedback_outbox.payload`); NULL =
@@ -2594,7 +2594,7 @@ mod tests {
     /// gateway runtime-override `gateway_config` single-row setting, the Phase 1 inline
     /// sub-agent `session_meta.inline_profile` column, the wire-v35 `transport_prefs` +
     /// `credential_labels` account-management tables, the wire-v37 `saved_presences` +
-    /// `saved_presence_active` tables, the `custom_providers` table, and the wire-vNEXT
+    /// `saved_presence_active` tables, the `custom_providers` table, and the wire-v38
     /// `transport_prefs.settings` account-settings column).
     #[test]
     fn migration_ladder_valid_and_applied() {
@@ -2649,7 +2649,7 @@ mod tests {
         check(&SqliteStore::open_in_memory().expect("open")).await;
     }
 
-    /// The per-transport NON-SECRET settings map (wire vNEXT) round-trips identically on both
+    /// The per-transport NON-SECRET settings map (wire v38) round-trips identically on both
     /// backends, rides the SAME `transport_prefs` row the enabled/label ops use (no cross-field
     /// clobbering in either direction), and a whole-map re-set replaces the previous map.
     #[tokio::test]

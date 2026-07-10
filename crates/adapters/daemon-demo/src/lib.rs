@@ -3,7 +3,7 @@
 
 //! `daemon-demo` — the in-process **demo** messaging transport (work package N5).
 //!
-//! A fully self-contained adapter + interactive-auth factories that exercise the ENTIRE vNEXT
+//! A fully self-contained adapter + interactive-auth factories that exercise the ENTIRE v38
 //! surface so the GUI/TUI apps and e2e scenarios can run the complete integrations experience
 //! against a real node with **zero external network**:
 //!

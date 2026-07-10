@@ -45,7 +45,7 @@ pub(crate) fn conversation_from(
         topic: None,
         description: None,
         members,
-        // Telegram exposes no space/server hierarchy through this projection (wire vNEXT).
+        // Telegram exposes no space/server hierarchy through this projection (wire v38).
         parent: None,
     }
 }
