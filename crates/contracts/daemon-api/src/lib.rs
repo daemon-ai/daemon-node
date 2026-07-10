@@ -1821,6 +1821,13 @@ pub enum AuthFlowKind {
     /// A QR-code device-link/pairing flow: the client renders a `Qr` challenge and polls until the
     /// other device approves (e.g. WhatsApp/Signal linked-device pairing).
     QrPairing,
+    /// A username + password exchanged at sign-in (wire vNEXT). A masked [`AuthChallenge::Form`]
+    /// collects a `username` ([`AuthFieldKind::Text`]) + `password` ([`AuthFieldKind::Password`]);
+    /// the factory validates them and **exchanges** them for an opaque session token/blob, which
+    /// [`crate::CredentialApi`]'s store persists as the RESULT. The password is transient — it drives
+    /// the exchange and is never itself stored. (Contrast [`BotToken`](Self::BotToken) /
+    /// [`UserToken`](Self::UserToken), where the pasted secret IS the stored credential.)
+    UserPassword,
 }
 
 /// A single challenge a flow presents to the client at some step — how the client should collect the
@@ -1966,9 +1973,27 @@ pub struct AuthCompleteResponse {
     pub bound_profile: Option<ProfileRef>,
 }
 
+/// How a client should render + validate an [`AuthParamField`] (wire vNEXT). Defaults to [`Text`],
+/// a plain single-line entry, so a pre-vNEXT peer that omits `kind` keeps today's behavior.
+///
+/// [`Text`]: AuthFieldKind::Text
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthFieldKind {
+    /// A plain single-line text entry (the default) — e.g. a username, homeserver, or handle.
+    #[default]
+    Text,
+    /// A secret entry (token/password): the client MUST mask input and must not echo or persist it.
+    Password,
+    /// A numeric entry (e.g. a one-time code); the client may render a numeric keypad.
+    Number,
+    /// A single choice from [`AuthParamField::choices`]; the client renders a picker.
+    Choice,
+}
+
 /// One field of a family's `params` form (capability discovery).
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthParamField {
     /// The `params` key.
     pub key: String,
@@ -1976,6 +2001,21 @@ pub struct AuthParamField {
     pub label: String,
     /// Whether the field is required.
     pub required: bool,
+    /// How the client should render + validate this field (wire vNEXT). Defaults to
+    /// [`AuthFieldKind::Text`]; a secret (token/password) uses [`AuthFieldKind::Password`] so the
+    /// client masks it.
+    #[serde(default)]
+    pub kind: AuthFieldKind,
+    /// A prefill/default value to seed the input with (wire vNEXT); `None` = start empty.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Placeholder/hint text shown in an empty input (wire vNEXT); `None` = no hint.
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    /// The allowed values when `kind == `[`AuthFieldKind::Choice`] (wire vNEXT); empty for every
+    /// other kind.
+    #[serde(default)]
+    pub choices: Vec<String>,
 }
 
 /// A registered interactive-auth provider (capability discovery for the client).

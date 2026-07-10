@@ -780,6 +780,7 @@ async fn interactive_auth_generic_begin_complete_binds_and_lists() {
                     key: "homeserver".into(),
                     label: "Homeserver".into(),
                     required: true,
+                    ..Default::default()
                 }],
             }
         }

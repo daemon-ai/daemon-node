@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 
 use daemon_api::{
-    ApiError, AuthChallenge, AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput,
+    ApiError, AuthChallenge, AuthFieldKind, AuthFlowKind, AuthParamField, AuthProviderInfo,
+    AuthStepInput,
 };
 use daemon_host::{
     AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, PendingAuthFlow,
@@ -80,11 +81,13 @@ impl AuthFlowFactory for WhatsappAuthFlowFactory {
                     key: PARAM_MODE.to_string(),
                     label: "Mode (user = WhatsApp Web QR, bot = Cloud API)".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 AuthParamField {
                     key: PARAM_CREDENTIAL_REF.to_string(),
                     label: "Account credential ref".to_string(),
                     required: true,
+                    ..Default::default()
                 },
             ],
         }
@@ -128,11 +131,15 @@ fn bot_form() -> AuthChallenge {
                 key: PARAM_ACCESS_TOKEN.to_string(),
                 label: "Access token".to_string(),
                 required: true,
+                // The Cloud API access token is a secret — mask it.
+                kind: AuthFieldKind::Password,
+                ..Default::default()
             },
             AuthParamField {
                 key: PARAM_PHONE_NUMBER_ID.to_string(),
                 label: "Phone number id".to_string(),
                 required: true,
+                ..Default::default()
             },
         ],
     }

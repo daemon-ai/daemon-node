@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use daemon_api::{
-    ApiError, AuthChallenge, AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput,
+    ApiError, AuthChallenge, AuthFieldKind, AuthFlowKind, AuthParamField, AuthProviderInfo,
+    AuthStepInput,
 };
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
 use daemon_host::{
@@ -128,16 +129,21 @@ impl AuthFlowFactory for SlackBotAuthFlowFactory {
                     key: PARAM_CLIENT_ID.to_string(),
                     label: "Slack app client id".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 AuthParamField {
                     key: PARAM_CLIENT_SECRET.to_string(),
                     label: "Slack app client secret".to_string(),
                     required: true,
+                    // The app client secret is a secret — mask it.
+                    kind: AuthFieldKind::Password,
+                    ..Default::default()
                 },
                 AuthParamField {
                     key: PARAM_SCOPE.to_string(),
                     label: "Bot scopes (comma-delimited, optional)".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
         }
@@ -362,16 +368,23 @@ fn user_form() -> AuthChallenge {
                 key: FIELD_XOXC.to_string(),
                 label: "xoxc token (from the browser session)".to_string(),
                 required: true,
+                // The browser-extracted token is a secret — mask it.
+                kind: AuthFieldKind::Password,
+                ..Default::default()
             },
             AuthParamField {
                 key: FIELD_XOXD.to_string(),
                 label: "xoxd cookie (the `d` cookie value)".to_string(),
                 required: true,
+                // The `d` cookie is a secret — mask it.
+                kind: AuthFieldKind::Password,
+                ..Default::default()
             },
             AuthParamField {
                 key: FIELD_LABEL.to_string(),
                 label: "Account label (optional)".to_string(),
                 required: false,
+                ..Default::default()
             },
         ],
     }

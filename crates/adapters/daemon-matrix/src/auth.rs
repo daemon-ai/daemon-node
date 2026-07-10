@@ -178,16 +178,19 @@ impl AuthFlowFactory for MatrixAuthFlowFactory {
                     key: PARAM_HOMESERVER.to_string(),
                     label: "Homeserver URL".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 AuthParamField {
                     key: PARAM_CREDENTIAL_REF.to_string(),
                     label: "Account credential ref".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 AuthParamField {
                     key: PARAM_IDP_ID.to_string(),
                     label: "Identity provider id (optional)".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
         }

@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use daemon_api::{
-    ApiError, AuthChallenge, AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput,
+    ApiError, AuthChallenge, AuthFieldKind, AuthFlowKind, AuthParamField, AuthProviderInfo,
+    AuthStepInput,
 };
 use daemon_host::{
     AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, PendingAuthFlow,
@@ -128,11 +129,13 @@ impl AuthFlowFactory for WeChatAuthFlowFactory {
                     key: PARAM_CREDENTIAL_REF.to_string(),
                     label: "Account credential ref".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 AuthParamField {
                     key: PARAM_BOT_AGENT.to_string(),
                     label: "Bot agent (optional UA string)".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
         }
@@ -281,6 +284,9 @@ impl PendingAuthFlow for WeChatPendingFlow {
                     key: PARAM_VERIFY_CODE.to_string(),
                     label: "Pairing code".to_string(),
                     required: true,
+                    // The pairing code WeChat shows on the phone is numeric.
+                    kind: AuthFieldKind::Number,
+                    ..Default::default()
                 }],
             })),
             PollDecision::Redirect(host) => {

@@ -18,7 +18,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use daemon_api::{
-    ApiError, AuthChallenge, AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput,
+    ApiError, AuthChallenge, AuthFieldKind, AuthFlowKind, AuthParamField, AuthProviderInfo,
+    AuthStepInput,
 };
 use daemon_host::{
     AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, PendingAuthFlow,
@@ -69,6 +70,7 @@ impl AuthFlowFactory for DiscordAuthFlowFactory {
                 key: PARAM_CREDENTIAL_REF.to_string(),
                 label: "Account credential ref".to_string(),
                 required: true,
+                ..Default::default()
             }],
         }
     }
@@ -114,6 +116,9 @@ impl DiscordPendingFlow {
                 key: FIELD_TOKEN.to_string(),
                 label: "Token".to_string(),
                 required: true,
+                // The bot/user token is a secret pasted into a form — mask it.
+                kind: AuthFieldKind::Password,
+                ..Default::default()
             }],
         }
     }

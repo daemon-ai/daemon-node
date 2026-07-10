@@ -49,7 +49,8 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
 use daemon_api::{
-    ApiError, AuthChallenge, AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput,
+    ApiError, AuthChallenge, AuthFieldKind, AuthFlowKind, AuthParamField, AuthProviderInfo,
+    AuthStepInput,
 };
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
 use daemon_host::{
@@ -191,31 +192,39 @@ pub fn generic_oauth2() -> OAuthFlowDescriptor {
                 key: PARAM_AUTHORIZATION_ENDPOINT.to_string(),
                 label: "Authorization endpoint URL".to_string(),
                 required: true,
+                ..Default::default()
             },
             AuthParamField {
                 key: PARAM_TOKEN_ENDPOINT.to_string(),
                 label: "Token endpoint URL".to_string(),
                 required: true,
+                ..Default::default()
             },
             AuthParamField {
                 key: PARAM_CLIENT_ID.to_string(),
                 label: "Client id".to_string(),
                 required: true,
+                ..Default::default()
             },
             AuthParamField {
                 key: PARAM_SCOPES.to_string(),
                 label: "Scopes (space-delimited, optional)".to_string(),
                 required: false,
+                ..Default::default()
             },
             AuthParamField {
                 key: PARAM_CLIENT_SECRET.to_string(),
                 label: "Client secret (confidential clients only)".to_string(),
                 required: false,
+                // The OAuth client secret is a secret — mask it.
+                kind: AuthFieldKind::Password,
+                ..Default::default()
             },
             AuthParamField {
                 key: PARAM_ACCOUNT_LABEL.to_string(),
                 label: "Account label (optional)".to_string(),
                 required: false,
+                ..Default::default()
             },
         ],
     }

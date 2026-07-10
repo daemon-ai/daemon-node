@@ -537,6 +537,7 @@ impl AccountSettings {
                     key: s.id.clone(),
                     label: s.label.clone(),
                     required: false,
+                    ..Default::default()
                 })
                 .collect(),
         }

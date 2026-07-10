@@ -20,7 +20,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use daemon_api::{
-    ApiError, AuthChallenge, AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput,
+    ApiError, AuthChallenge, AuthFieldKind, AuthFlowKind, AuthParamField, AuthProviderInfo,
+    AuthStepInput,
 };
 use daemon_host::{
     AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, PendingAuthFlow,
@@ -89,16 +90,23 @@ fn bot_token_form() -> AuthChallenge {
                 key: FIELD_CHANNEL_ACCESS_TOKEN.to_string(),
                 label: "Channel access token".to_string(),
                 required: true,
+                // The channel access token is a secret — mask it.
+                kind: AuthFieldKind::Password,
+                ..Default::default()
             },
             AuthParamField {
                 key: FIELD_CHANNEL_SECRET.to_string(),
                 label: "Channel secret".to_string(),
                 required: true,
+                // The channel secret is a secret — mask it.
+                kind: AuthFieldKind::Password,
+                ..Default::default()
             },
             AuthParamField {
                 key: FIELD_CHANNEL_ID.to_string(),
                 label: "Channel id (optional account handle)".to_string(),
                 required: false,
+                ..Default::default()
             },
         ],
     }
@@ -137,16 +145,23 @@ impl AuthFlowFactory for LineAuthFlowFactory {
                     key: FIELD_CHANNEL_ACCESS_TOKEN.to_string(),
                     label: "Channel access token".to_string(),
                     required: true,
+                    // The channel access token is a secret — mask it.
+                    kind: AuthFieldKind::Password,
+                    ..Default::default()
                 },
                 AuthParamField {
                     key: FIELD_CHANNEL_SECRET.to_string(),
                     label: "Channel secret".to_string(),
                     required: true,
+                    // The channel secret is a secret — mask it.
+                    kind: AuthFieldKind::Password,
+                    ..Default::default()
                 },
                 AuthParamField {
                     key: FIELD_CHANNEL_ID.to_string(),
                     label: "Channel id (optional account handle)".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
         }

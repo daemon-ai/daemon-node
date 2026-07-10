@@ -1068,7 +1068,18 @@ auth-flow-kind = "MatrixSso"
                / "UserToken"
                / "PhoneOtp"
                / "QrPairing"
-auth-param-field = { "key": tstr, "label": tstr, "required": bool }
+               / "UserPassword"          ; wire vNEXT: username+password exchanged at sign-in
+; how a client renders + validates one auth-param-field (wire vNEXT; default Text).
+auth-field-kind = "Text" / "Password" / "Number" / "Choice"
+auth-param-field = {
+  "key": tstr,
+  "label": tstr,
+  "required": bool,
+  ? "kind": auth-field-kind,            ; wire vNEXT (absent = Text)
+  ? "default": (tstr / null),           ; wire vNEXT: prefill value
+  ? "placeholder": (tstr / null),       ; wire vNEXT: empty-input hint
+  ? "choices": [* tstr],                ; wire vNEXT: allowed values when kind == Choice
+}
 auth-provider-info = { "family": tstr, "flow_kind": auth-flow-kind, "display_name": tstr, "params_schema": [* auth-param-field] }
 ; one challenge a flow presents at a step — how the client collects the next auth-step-input.
 auth-challenge-redirect = { "Redirect": { "authorization_url": tstr } }

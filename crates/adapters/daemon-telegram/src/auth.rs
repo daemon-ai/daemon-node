@@ -24,7 +24,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use daemon_api::{
-    ApiError, AuthChallenge, AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput,
+    ApiError, AuthChallenge, AuthFieldKind, AuthFlowKind, AuthParamField, AuthProviderInfo,
+    AuthStepInput,
 };
 use daemon_host::{
     AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, PendingAuthFlow,
@@ -146,14 +147,17 @@ impl TelegramPendingFlow {
     }
 }
 
-/// A single-field `Form` challenge.
-fn form_field(title: &str, key: &str, label: &str) -> AuthChallenge {
+/// A single-field `Form` challenge. `kind` renders + validates the field (wire vNEXT): a token/2FA
+/// password is [`AuthFieldKind::Password`] (masked), a login code is [`AuthFieldKind::Number`].
+fn form_field(title: &str, key: &str, label: &str, kind: AuthFieldKind) -> AuthChallenge {
     AuthChallenge::Form {
         title: title.to_string(),
         fields: vec![AuthParamField {
             key: key.to_string(),
             label: label.to_string(),
             required: true,
+            kind,
+            ..Default::default()
         }],
     }
 }
@@ -171,8 +175,18 @@ fn required(fields: &BTreeMap<String, String>, key: &str) -> Result<String, ApiE
 impl PendingAuthFlow for TelegramPendingFlow {
     fn initial_challenge(&self) -> AuthChallenge {
         match self.mode {
-            AccountMode::Bot => form_field("Enter the bot token", PARAM_TOKEN, "BotFather token"),
-            AccountMode::User => form_field("Enter your phone number", PARAM_PHONE, "Phone number"),
+            AccountMode::Bot => form_field(
+                "Enter the bot token",
+                PARAM_TOKEN,
+                "BotFather token",
+                AuthFieldKind::Password,
+            ),
+            AccountMode::User => form_field(
+                "Enter your phone number",
+                PARAM_PHONE,
+                "Phone number",
+                AuthFieldKind::Text,
+            ),
         }
     }
 
@@ -198,6 +212,7 @@ impl PendingAuthFlow for TelegramPendingFlow {
                     "Enter the login code we sent you",
                     PARAM_CODE,
                     "Login code",
+                    AuthFieldKind::Number,
                 )))
             }
             FlowState::AwaitCode => {
@@ -214,6 +229,7 @@ impl PendingAuthFlow for TelegramPendingFlow {
                             "Enter your 2FA password",
                             PARAM_PASSWORD,
                             "2FA password",
+                            AuthFieldKind::Password,
                         )))
                     }
                 }
@@ -272,11 +288,13 @@ impl AuthFlowFactory for TelegramAuthFlowFactory {
                     key: PARAM_MODE.to_string(),
                     label: "Account mode (user | bot)".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 AuthParamField {
                     key: PARAM_CREDENTIAL_REF.to_string(),
                     label: "Account credential ref".to_string(),
                     required: true,
+                    ..Default::default()
                 },
             ],
         }

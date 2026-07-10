@@ -2261,6 +2261,8 @@ mod auth_contract_tests {
                     key: "otp".into(),
                     label: "One-time code".into(),
                     required: true,
+                    kind: AuthFieldKind::Number,
+                    ..Default::default()
                 }],
             },
             AuthChallenge::Qr {

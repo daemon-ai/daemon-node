@@ -762,8 +762,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     // AuthStepResult arm — so verify-codec proves the generated zcbor decoder accepts the new shapes.
     {
         use daemon_api::{
-            AuthBeginResponse, AuthChallenge, AuthCompleteResponse, AuthParamField, AuthStepInput,
-            AuthStepRequest, AuthStepResult,
+            AuthBeginResponse, AuthChallenge, AuthCompleteResponse, AuthFieldKind, AuthFlowKind,
+            AuthParamField, AuthProviderInfo, AuthStepInput, AuthStepRequest, AuthStepResult,
         };
         write_cbor(
             &out,
@@ -812,6 +812,11 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     key: "otp".into(),
                     label: "One-time code".into(),
                     required: true,
+                    // wire vNEXT: exercise the enriched metadata (a numeric OTP with a hint) so
+                    // verify-codec proves the generated C decoder accepts the new optional members.
+                    kind: daemon_api::AuthFieldKind::Number,
+                    placeholder: Some("123456".into()),
+                    ..Default::default()
                 }],
             })),
         )?;
@@ -840,6 +845,45 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 transport_instance: daemon_protocol::TransportId::new("matrix/@bot:hs.org"),
                 bound_profile: Some(ProfileRef::new("default")),
             })),
+        )?;
+        // wire vNEXT: an AuthProviders discovery response advertising the new UserPassword flow with
+        // an enriched params schema across every AuthFieldKind (a plain-text username, a MASKED
+        // password, and a defaulted Choice) — so verify-codec proves the generated zcbor C decoder
+        // accepts the enriched auth-param-field + the new auth-flow-kind arm.
+        write_cbor(
+            &out,
+            "response-auth-providers.cbor",
+            &ApiResponse::AuthProviders(vec![AuthProviderInfo {
+                family: "userpass".into(),
+                flow_kind: AuthFlowKind::UserPassword,
+                display_name: "Username & password".into(),
+                params_schema: vec![
+                    AuthParamField {
+                        key: "username".into(),
+                        label: "Username".into(),
+                        required: true,
+                        kind: AuthFieldKind::Text,
+                        placeholder: Some("you@example.org".into()),
+                        ..Default::default()
+                    },
+                    AuthParamField {
+                        key: "password".into(),
+                        label: "Password".into(),
+                        required: true,
+                        kind: AuthFieldKind::Password,
+                        ..Default::default()
+                    },
+                    AuthParamField {
+                        key: "region".into(),
+                        label: "Region".into(),
+                        required: false,
+                        kind: AuthFieldKind::Choice,
+                        default: Some("us".into()),
+                        choices: vec!["us".into(), "eu".into()],
+                        ..Default::default()
+                    },
+                ],
+            }]),
         )?;
     }
     write_cbor(
