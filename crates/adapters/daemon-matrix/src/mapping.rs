@@ -14,18 +14,22 @@ use daemon_api::{
     MemberRole, Presence, TypingState,
 };
 use daemon_protocol::TransportId;
-use matrix_sdk::room::{RoomMember, RoomMemberRole};
+use futures::StreamExt;
+use matrix_sdk::room::{ParentSpace, RoomMember, RoomMemberRole};
 use matrix_sdk::{Room, RoomMemberships};
 
 /// Project a synced Matrix `Room` into the wire [`ConversationInfo`]. Occupants are the active
-/// membership set; `kind` is `Dm` for a direct room, else `Channel` (Matrix has no native
-/// group-DM-vs-channel distinction, so non-DM rooms project as `Channel`).
+/// membership set; `kind` is [`ConversationType::Space`] for an `m.space` room, else `Dm` for a
+/// direct room, else `Channel` (Matrix has no native group-DM-vs-channel distinction, so non-DM
+/// rooms project as `Channel`). `parent` (wire vNEXT) is the containing space this room advertises
+/// via its `m.space.parent` relations, if any (see [`select_parent`]).
 pub(crate) async fn room_to_info(transport: &TransportId, room: &Room) -> ConversationInfo {
-    let kind = if room.is_direct().await.unwrap_or(false) {
-        ConversationType::Dm
-    } else {
-        ConversationType::Channel
-    };
+    // `is_space` short-circuits the DM heuristic: a space is a structural container, never a DM, so
+    // we skip the (network-touching) `is_direct` probe for spaces.
+    let is_space = room.is_space();
+    let is_direct = !is_space && room.is_direct().await.unwrap_or(false);
+    let kind = conversation_kind(is_space, is_direct);
+    let parent = select_parent(parent_space_ids(room).await);
     let members = room
         .members(RoomMemberships::ACTIVE)
         .await
@@ -42,6 +46,55 @@ pub(crate) async fn room_to_info(transport: &TransportId, room: &Room) -> Conver
         // Matrix has no native room "description" distinct from the topic.
         description: None,
         members,
+        parent,
+    }
+}
+
+/// Pure projection of a Matrix room's structural flags to a wire [`ConversationType`] (wire vNEXT).
+/// `is_space` wins over `is_direct`: an `m.space` room is a structural container, never a message
+/// DM. Kept pure (no `Room`) so the mapping is unit-testable with synthesized inputs.
+pub(crate) fn conversation_kind(is_space: bool, is_direct: bool) -> ConversationType {
+    if is_space {
+        ConversationType::Space
+    } else if is_direct {
+        ConversationType::Dm
+    } else {
+        ConversationType::Channel
+    }
+}
+
+/// Pick a single wire `parent` from the space ids a room advertises as parents (wire vNEXT). Matrix
+/// permits multiple `m.space.parent` relations, but the wire `parent` is one containing space, so we
+/// pick the lexicographically-lowest id — mirroring the Matrix spec's canonical-parent tie-break
+/// (lowest room id by Unicode code-point) — for a stable, deterministic projection. No parents ⟹
+/// `None` (a root). Kept pure so it is unit-testable with synthesized inputs.
+pub(crate) fn select_parent(mut parent_space_ids: Vec<String>) -> Option<String> {
+    parent_space_ids.sort();
+    parent_space_ids.into_iter().next()
+}
+
+/// Collect the room ids of the spaces a room names as its parents, draining the SDK's
+/// [`Room::parent_spaces`] stream (the `m.space.parent` relation walk). We do NOT filter on the
+/// verification tier — `Reciprocal` / `WithPowerlevel` / `Illegitimate` / `Unverifiable` all yield
+/// the advertised parent id: the node emits what the protocol reports and leaves cycle/dangling
+/// handling to the client. Errors and a missing relation both collapse to an empty list.
+async fn parent_space_ids(room: &Room) -> Vec<String> {
+    let Ok(stream) = room.parent_spaces().await else {
+        return Vec::new();
+    };
+    stream
+        .filter_map(|res| async move { res.ok().map(|p| parent_space_id(&p)) })
+        .collect()
+        .await
+}
+
+/// The advertised parent room id behind a [`ParentSpace`], regardless of its verification tier.
+fn parent_space_id(parent: &ParentSpace) -> String {
+    match parent {
+        ParentSpace::Reciprocal(room)
+        | ParentSpace::WithPowerlevel(room)
+        | ParentSpace::Illegitimate(room) => room.room_id().as_str().to_string(),
+        ParentSpace::Unverifiable(id) => id.as_str().to_string(),
     }
 }
 
@@ -112,5 +165,33 @@ mod tests {
         );
         assert_eq!(role_from_matrix(RoomMemberRole::Moderator), MemberRole::Op);
         assert_eq!(role_from_matrix(RoomMemberRole::User), MemberRole::None);
+    }
+
+    /// N4 (wire vNEXT): the pure room-type projection. An `m.space` room is a structural
+    /// [`ConversationType::Space`] container regardless of any DM heuristic; a direct room is a
+    /// [`ConversationType::Dm`]; every other room is a [`ConversationType::Channel`].
+    #[test]
+    fn conversation_kind_projects_space_dm_channel() {
+        assert_eq!(conversation_kind(true, false), ConversationType::Space);
+        // `is_space` wins over `is_direct` — a space is a container, never a message DM.
+        assert_eq!(conversation_kind(true, true), ConversationType::Space);
+        assert_eq!(conversation_kind(false, true), ConversationType::Dm);
+        assert_eq!(conversation_kind(false, false), ConversationType::Channel);
+    }
+
+    /// N4 (wire vNEXT): `parent` is a single containing space, but Matrix permits multiple
+    /// `m.space.parent` relations, so the projection picks the lexicographically-lowest space id
+    /// (the spec's canonical-parent tie-break) for a deterministic result; no parents ⟹ `None`.
+    #[test]
+    fn parent_selection_is_deterministic() {
+        assert_eq!(select_parent(vec![]), None);
+        assert_eq!(
+            select_parent(vec!["!only:hs".into()]),
+            Some("!only:hs".into())
+        );
+        assert_eq!(
+            select_parent(vec!["!b:hs".into(), "!a:hs".into(), "!c:hs".into()]),
+            Some("!a:hs".into())
+        );
     }
 }

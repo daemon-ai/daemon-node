@@ -56,6 +56,8 @@ pub(crate) fn guild_channel_to_info(
         topic: channel.topic.clone(),
         description: None,
         members: Vec::new(),
+        // Discord guild hierarchy is not projected through this adapter (wire vNEXT).
+        parent: None,
     }
 }
 
@@ -73,6 +75,7 @@ pub(crate) fn private_channel_to_info(
         topic: None,
         description: None,
         members: Vec::new(),
+        parent: None,
     }
 }
 
@@ -90,6 +93,7 @@ pub(crate) fn channel_to_info(transport: &TransportId, channel: &Channel) -> Con
             topic: None,
             description: None,
             members: Vec::new(),
+            parent: None,
         },
     }
 }

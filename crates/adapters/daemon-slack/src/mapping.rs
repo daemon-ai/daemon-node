@@ -31,6 +31,8 @@ pub(crate) fn channel_to_info(transport: &TransportId, c: &ChannelSummary) -> Co
         topic: c.topic.clone(),
         description: None,
         members: Vec::new(),
+        // Slack workspace hierarchy is not projected through this adapter (wire vNEXT).
+        parent: None,
     }
 }
 

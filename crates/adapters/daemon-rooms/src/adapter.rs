@@ -434,6 +434,8 @@ impl RoomsAdapter {
             topic: desc.topic,
             description: desc.description,
             members,
+            // The Rooms adapter models flat agent rooms — no space/server hierarchy (wire vNEXT).
+            parent: None,
         }
     }
 

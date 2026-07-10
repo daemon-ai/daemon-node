@@ -397,6 +397,7 @@ fn fake_conversation(transport: TransportId, kind: ConversationType) -> Conversa
         topic: None,
         description: None,
         members: Vec::new(),
+        parent: None,
     }
 }
 

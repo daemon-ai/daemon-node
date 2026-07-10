@@ -472,6 +472,152 @@ async fn file_transfer_receive_downloads_media() {
     let _ = std::fs::remove_dir_all(&expected_root);
 }
 
+/// N4 (wire vNEXT — conversation hierarchy): a synced `m.space` room projects to
+/// `ConversationType::Space` through the public conversation projection (`SupportsConversations::get`
+/// → `room_to_info`). The room type is sourced from the SDK's `Room::is_space()` (the `m.space`
+/// `m.room.create` `type`), fabricated here with the harness's `EventFactory::create(..).with_space_type()`.
+#[tokio::test]
+async fn space_room_projects_as_space_conversation() {
+    use daemon_api::ConversationType;
+    use matrix_sdk::ruma::RoomVersionId;
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    server.mock_room_state_encryption().plain().mount().await;
+    let creator = client.user_id().expect("logged in").to_owned();
+
+    let space = room_id!("!space:localhost");
+    let factory = EventFactory::new().sender(&creator);
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(space).add_state_event(
+                factory
+                    .create(&creator, RoomVersionId::V1)
+                    .with_space_type(),
+            ),
+        )
+        .await;
+
+    let transport = TransportId::new("matrix/@bot:localhost");
+    let adapter = MatrixAdapter::new(Arc::new(MockProvisioning), Default::default(), None);
+    adapter
+        .register_live_client(transport.clone(), client)
+        .await;
+    let convs = adapter
+        .clone()
+        .messaging()
+        .unwrap()
+        .conversations()
+        .unwrap();
+
+    let info = convs
+        .get(transport, space.as_str().to_string())
+        .await
+        .expect("the space room resolves");
+    assert_eq!(info.kind, ConversationType::Space);
+    assert_eq!(info.parent, None, "a top-level space is a hierarchy root");
+}
+
+/// N4 (wire vNEXT): a child room carries its containing space as `parent`, derived from the SDK's
+/// `Room::parent_spaces()` (the `m.space.parent` state relation). Only the child is synced, so the
+/// SDK reports the parent as `ParentSpace::Unverifiable(space_id)` — the projection still emits the
+/// id, and (dangling/unknown parents being a client concern) the node reports what the protocol says.
+#[tokio::test]
+async fn child_room_carries_parent_space() {
+    use daemon_api::ConversationType;
+    use matrix_sdk::ruma::events::space::parent::SpaceParentEventContent;
+    use matrix_sdk::ruma::server_name;
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let space = room_id!("!space:localhost");
+    let child = room_id!("!child:localhost");
+    let factory = EventFactory::new().sender(user_id!("@bot:localhost"));
+    let parent = SpaceParentEventContent::new(vec![server_name!("localhost").to_owned()]);
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(child)
+                .add_timeline_event(factory.text_msg("seed"))
+                .add_state_event(factory.event(parent).state_key(space.to_string())),
+        )
+        .await;
+
+    let transport = TransportId::new("matrix/@bot:localhost");
+    let adapter = MatrixAdapter::new(Arc::new(MockProvisioning), Default::default(), None);
+    adapter
+        .register_live_client(transport.clone(), client)
+        .await;
+    let convs = adapter
+        .clone()
+        .messaging()
+        .unwrap()
+        .conversations()
+        .unwrap();
+
+    let info = convs
+        .get(transport, child.as_str().to_string())
+        .await
+        .expect("the child room resolves");
+    assert_eq!(
+        info.parent.as_deref(),
+        Some(space.as_str()),
+        "child advertises its containing space as parent"
+    );
+    assert_ne!(
+        info.kind,
+        ConversationType::Space,
+        "a child room is not itself a space"
+    );
+}
+
+/// N4 (wire vNEXT): a plain (non-space, no `m.space.parent`) room projects with `parent == None` and
+/// a non-`Space` kind — proving the new field is only populated when the protocol actually reports a
+/// hierarchy relation.
+#[tokio::test]
+async fn plain_room_has_no_parent() {
+    use daemon_api::ConversationType;
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let room = room_id!("!plain:localhost");
+    let factory = EventFactory::new();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room).add_timeline_event(
+                factory
+                    .text_msg("hello")
+                    .sender(user_id!("@alice:localhost")),
+            ),
+        )
+        .await;
+
+    let transport = TransportId::new("matrix/@bot:localhost");
+    let adapter = MatrixAdapter::new(Arc::new(MockProvisioning), Default::default(), None);
+    adapter
+        .register_live_client(transport.clone(), client)
+        .await;
+    let convs = adapter
+        .clone()
+        .messaging()
+        .unwrap()
+        .conversations()
+        .unwrap();
+
+    let info = convs
+        .get(transport, room.as_str().to_string())
+        .await
+        .expect("the plain room resolves");
+    assert_eq!(info.parent, None);
+    assert_ne!(info.kind, ConversationType::Space);
+}
+
 #[tokio::test]
 async fn delivery_manager_dedups_sessions() {
     let transport = TransportId::new("matrix/@bot:localhost");
