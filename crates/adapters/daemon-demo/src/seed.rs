@@ -100,8 +100,7 @@ fn contact(seed: &SeedContact) -> ContactInfo {
 
 /// The seeded roster (adapter-ordered; the host sorts + pages it centrally).
 pub fn roster() -> Vec<ContactInfo> {
-    // RED stub: no seed yet (GREEN fills the roster).
-    Vec::new()
+    CONTACTS.iter().map(contact).collect()
 }
 
 /// The roster contact with `id`, if seeded.
@@ -111,11 +110,6 @@ pub fn contact_by_id(id: &str) -> Option<ContactInfo> {
 
 /// The full seeded conversation tree for `transport` (the demo instance's id).
 pub fn conversations(transport: &TransportId) -> Vec<ConversationInfo> {
-    // RED stub: no seed tree yet (GREEN fills the Space/channels/DMs).
-    if true {
-        let _ = transport;
-        return Vec::new();
-    }
     let members: Vec<ConversationMember> = roster().into_iter().map(member).collect();
     let dm_members = |peer: &str| -> Vec<ConversationMember> {
         contact_by_id(peer).map(member).into_iter().collect()

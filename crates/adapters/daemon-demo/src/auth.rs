@@ -145,10 +145,6 @@ const DEMO_FLOW_KINDS: [AuthFlowKind; 7] = [
 /// alongside the [`DemoAdapter`](crate::DemoAdapter). Register these only when the demo transport is
 /// enabled, mirroring the per-transport auth-factory gating in `bins/daemon`.
 pub fn demo_auth_factories() -> Vec<std::sync::Arc<dyn AuthFlowFactory>> {
-    // RED stub: no factories registered yet (GREEN wires one per AuthFlowKind).
-    if true {
-        return Vec::new();
-    }
     DEMO_FLOW_KINDS
         .iter()
         .map(|&kind| {

@@ -184,9 +184,9 @@ impl TransportAdapter for DemoAdapter {
 #[async_trait]
 impl MessagingProtocol for DemoAdapter {
     async fn validate_account(&self, settings: &AccountSettingsValues) -> Result<(), ApiError> {
-        // RED stub: no validation yet (GREEN rejects the marker value).
-        let _ = settings;
-        if false && settings.values.values().any(|v| v == VALIDATE_REJECT_VALUE) {
+        // The documented marker: any field set to `reject-me` fails validation (the N2 reference
+        // rejection). Everything else is accepted — the demo has no real account constraints.
+        if settings.values.values().any(|v| v == VALIDATE_REJECT_VALUE) {
             return Err(ApiError::Other(format!(
                 "validate_account: the demo rejects the marker value {VALIDATE_REJECT_VALUE:?}"
             )));
@@ -229,12 +229,6 @@ impl SupportsConversations for DemoAdapter {
     }
 
     async fn send(&self, args: ConvSendArgs) -> Result<(), ApiError> {
-        // RED stub: accept the send but journal nothing yet (GREEN reports it + schedules a reply
-        // through the LifecycleSink).
-        if true {
-            let _ = &self.sink;
-            return Ok(());
-        }
         let ConvSendArgs {
             transport,
             conv,
