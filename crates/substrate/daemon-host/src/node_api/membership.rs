@@ -73,7 +73,7 @@ impl NodeApiImpl {
         if let Some(feed) = self.node_feed() {
             // rung 1: bump the per-transport contact-roster rev (exactly once per emit) and stamp it
             // so `RosterList`'s echoed rev and this pointer agree on the reflected generation.
-            // rung 3 (api vNEXT): stamp the causing op token (from the dispatch context — a
+            // rung 3 (api/39): stamp the causing op token (from the dispatch context — a
             // `RosterAdd`/`RosterUpdate`/`RosterRemove`/`ContactSetAlias` op_id) so the contact-page
             // delta's `origin_ops` names it. `None` outside an op-carrying dispatch (null path).
             let rev = feed.note_contacts_change_op(
@@ -145,7 +145,7 @@ impl NodeApiImpl {
     pub(crate) fn emit_persons_changed(&self, person: &str, removed: bool) {
         if let Some(feed) = self.node_feed() {
             // rung 1: bump the persons rev (once per emit) and stamp it (echoed by `PersonList`).
-            // rung 3 (api vNEXT): stamp any causing op token from the dispatch context (`None`
+            // rung 3 (api/39): stamp any causing op token from the dispatch context (`None`
             // outside one, which is the common case for adapter/tool-driven registry mutations).
             let rev = feed.note_persons_change_op(person, removed, daemon_api::current_op_id());
             feed.emit(NodeEvent::PersonsChanged { rev });
@@ -272,7 +272,7 @@ impl LifecycleSink for NodeApiImpl {
                 conv,
                 change,
                 rev,
-                // rung 3 (api vNEXT): adapter-reported set changes carry no local op token; the
+                // rung 3 (api/39): adapter-reported set changes carry no local op token; the
                 // page-side `origin_ops` map is the provenance carrier for these (null here).
                 origin_op: None,
             });
@@ -307,7 +307,7 @@ impl LifecycleSink for NodeApiImpl {
                 actor,
                 reason,
                 is_self,
-                // rung 3 (api vNEXT): membership pushes come from the adapter seam with no local
+                // rung 3 (api/39): membership pushes come from the adapter seam with no local
                 // op token; `None` is the null-provenance path (a future token round-trip fills it).
                 origin_op: None,
             });
@@ -326,7 +326,7 @@ impl LifecycleSink for NodeApiImpl {
         // (the stream `ConvHistory` pages), THEN announce it. The pointer is emitted only for a
         // durably-recorded message, so a client acting on it always finds the record.
         //
-        // rung 3 (api vNEXT): `origin_op` is the opaque client op token the adapter round-tripped
+        // rung 3 (api/39): `origin_op` is the opaque client op token the adapter round-tripped
         // from the send seam (`None` for inbound / token-incapable adapters). The node stamps it
         // UNIFORMLY on both carriers it owns here — the journal-record envelope and the
         // `MessagesChanged` pointer — never interpreting the token (verb-agnostic provenance).

@@ -111,10 +111,10 @@ pub enum ApiRequest {
         /// The session whose durable history to read.
         session: SessionId,
         /// The exclusive lower-bound cursor (0 from the start). Optional on the wire since rung 2
-        /// (api vNEXT), defaulting to 0; ignored when `before_cursor` is present.
+        /// (api/39), defaulting to 0; ignored when `before_cursor` is present.
         #[serde(default)]
         after_cursor: u64,
-        /// Backward window (rung 2, api vNEXT): when `Some(B)`, return the `max` newest records
+        /// Backward window (rung 2, api/39): when `Some(B)`, return the `max` newest records
         /// with `cursor < B` (newest-anchored; pass a value past head — e.g. `u64::MAX` — for the
         /// latest window in one round-trip). Wins over `after_cursor` when present. Absent on the
         /// wire when `None` (never null).
@@ -170,10 +170,10 @@ pub enum ApiRequest {
         /// The unit whose durable history to read.
         unit: UnitId,
         /// The exclusive lower-bound cursor (0 from the start). Optional on the wire since rung 2
-        /// (api vNEXT), defaulting to 0; ignored when `before_cursor` is present.
+        /// (api/39), defaulting to 0; ignored when `before_cursor` is present.
         #[serde(default)]
         after_cursor: u64,
-        /// Backward window (rung 2, api vNEXT): exactly as
+        /// Backward window (rung 2, api/39): exactly as
         /// [`ApiRequest::SessionHistory::before_cursor`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before_cursor: Option<u64>,
@@ -605,7 +605,7 @@ pub enum ApiRequest {
         session: SessionId,
         /// The partial metadata patch.
         patch: SessionMetaPatch,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (opaque token); dedup keys on
+        /// Rung 3 (api/39): the client-minted idempotency key (opaque token); dedup keys on
         /// `(principal, op_id)` and the change is stamped `origin_op` on the roster delta.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
@@ -820,7 +820,7 @@ pub enum ApiRequest {
         /// Resume cursor: the previous page's `next` (the last served conversation `id`).
         #[serde(default)]
         after: Option<String>,
-        /// Delta read (rung 2, api vNEXT): when `Some(R)`, ask for only the conversations changed
+        /// Delta read (rung 2, api/39): when `Some(R)`, ask for only the conversations changed
         /// after the transport's conversation-set revision `R` (plus `removed` tombstones), instead
         /// of the full page — the SessionsQuery template. `None` (default) = a full page; an
         /// unservable `R` (node restarted / tombstones evicted) also degrades to a full page.
@@ -845,7 +845,7 @@ pub enum ApiRequest {
         transport: TransportId,
         /// The filled create details.
         details: CreateConversationDetails,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe: no duplicate room).
+        /// Rung 3 (api/39): the client-minted idempotency key (retry-safe: no duplicate room).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
@@ -860,7 +860,7 @@ pub enum ApiRequest {
         transport: TransportId,
         /// The filled join details.
         details: ChannelJoinDetails,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe: no duplicate join).
+        /// Rung 3 (api/39): the client-minted idempotency key (retry-safe: no duplicate join).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
@@ -882,7 +882,7 @@ pub enum ApiRequest {
         /// The new topic (`None` clears).
         #[serde(default)]
         topic: Option<String>,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (conv-meta lane).
+        /// Rung 3 (api/39): the client-minted idempotency key (conv-meta lane).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
@@ -895,7 +895,7 @@ pub enum ApiRequest {
         /// The new title.
         #[serde(default)]
         title: Option<String>,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (conv-meta lane).
+        /// Rung 3 (api/39): the client-minted idempotency key (conv-meta lane).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
@@ -908,7 +908,7 @@ pub enum ApiRequest {
         /// The new description.
         #[serde(default)]
         description: Option<String>,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (conv-meta lane).
+        /// Rung 3 (api/39): the client-minted idempotency key (conv-meta lane).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
@@ -945,7 +945,7 @@ pub enum ApiRequest {
         /// The new alias (`None` clears).
         #[serde(default)]
         alias: Option<String>,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (roster-edit lane).
+        /// Rung 3 (api/39): the client-minted idempotency key (roster-edit lane).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
@@ -971,7 +971,7 @@ pub enum ApiRequest {
         /// Resume cursor: the previous page's `next` (the last served contact `id`).
         #[serde(default)]
         after: Option<String>,
-        /// Delta read (rung 2, api vNEXT): when `Some(R)`, only the contacts changed after the
+        /// Delta read (rung 2, api/39): when `Some(R)`, only the contacts changed after the
         /// transport's contact-roster revision `R` plus `removed` tombstones (mirrors
         /// [`ApiRequest::ConvList::since_rev`]; the SessionsQuery template).
         #[serde(default)]
@@ -983,7 +983,7 @@ pub enum ApiRequest {
         transport: TransportId,
         /// The contact to add.
         contact: ContactInfo,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (roster-edit lane).
+        /// Rung 3 (api/39): the client-minted idempotency key (roster-edit lane).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
@@ -993,7 +993,7 @@ pub enum ApiRequest {
         transport: TransportId,
         /// The contact to update.
         contact: ContactInfo,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (roster-edit lane).
+        /// Rung 3 (api/39): the client-minted idempotency key (roster-edit lane).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
@@ -1003,7 +1003,7 @@ pub enum ApiRequest {
         transport: TransportId,
         /// The contact to remove.
         contact: ContactInfo,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (roster-edit lane).
+        /// Rung 3 (api/39): the client-minted idempotency key (roster-edit lane).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
@@ -1209,7 +1209,7 @@ pub enum ApiRequest {
         transport: TransportId,
         /// The transfer to send.
         transfer: FileTransfer,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe direct verb; FtSend as
+        /// Rung 3 (api/39): the client-minted idempotency key (retry-safe direct verb; FtSend as
         /// an outboxed lane is deferred — §15 — direct + op_id meanwhile).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
@@ -1228,10 +1228,10 @@ pub enum ApiRequest {
     /// read-only snapshot (insertion order); the client re-lists on a
     /// [`NodeEvent::PersonsChanged`] pointer. Answered by [`ApiResponse::Persons`].
     ///
-    /// rung 2 (api vNEXT): the former unit variant becomes a struct variant so the request can
+    /// rung 2 (api/39): the former unit variant becomes a struct variant so the request can
     /// carry `since_rev` (a breaking arm-shape change, bundled into the deferred v38->v39 bump).
     PersonList {
-        /// Delta read (rung 2, api vNEXT): when `Some(R)`, only the persons changed after
+        /// Delta read (rung 2, api/39): when `Some(R)`, only the persons changed after
         /// registry revision `R` plus `removed` tombstones (the SessionsQuery template). `None`
         /// (default) = the full list.
         #[serde(default)]
@@ -1253,11 +1253,11 @@ pub enum ApiRequest {
         transport: TransportId,
         /// The settings keys to upsert (each key must be in the adapter's `account_schema`).
         settings: AccountSettingsValues,
-        /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe settings apply).
+        /// Rung 3 (api/39): the client-minted idempotency key (retry-safe settings apply).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         op_id: Option<String>,
     },
-    /// Rung 3 (api vNEXT): [`ControlApi::bootstrap`] — a race-free initial-sync baseline. One probe
+    /// Rung 3 (api/39): [`ControlApi::bootstrap`] — a race-free initial-sync baseline. One probe
     /// returns every collection's rev + the feed cursor + epoch, snapshotted atomically under the
     /// feed lock, so a cold client anchors its cursor + revs consistently before its first
     /// `EventsSince`. Answered by [`ApiResponse::Bootstrap`].
@@ -1265,7 +1265,7 @@ pub enum ApiRequest {
 }
 
 impl ApiRequest {
-    /// Rung 3 (api vNEXT): the client-minted idempotency key this request carries, if any — the
+    /// Rung 3 (api/39): the client-minted idempotency key this request carries, if any — the
     /// single verb-agnostic extraction point the dispatch dedup guard keys on. Every §6.4 lane
     /// verb and retry-sensitive direct verb reports its `op_id` here; every other request returns
     /// `None` (never deduplicated). Adding a new op-id-carrying verb means adding one arm here.
@@ -1445,7 +1445,7 @@ pub enum ApiResponse {
     /// A page of a transport instance's rooms (transport_rooms), room order.
     Rooms(WirePage<RoomInfo>),
     /// A page of a transport's conversations (conv_list), conversation-id order, carrying the
-    /// transport's conversation-set revision (rung 1, api vNEXT).
+    /// transport's conversation-set revision (rung 1, api/39).
     Conversations(ConvPage),
     /// One conversation, if present (conv_get / conv_create / conv_join).
     Conversation(Option<ConversationInfo>),
@@ -1454,7 +1454,7 @@ pub enum ApiResponse {
     /// A list of contacts (directory_search).
     Contacts(Vec<ContactInfo>),
     /// A page of a transport's server-side contact roster (roster_list), contact-id order (wire v34),
-    /// carrying the transport's contact-roster revision (rung 1, api vNEXT).
+    /// carrying the transport's contact-roster revision (rung 1, api/39).
     ContactPage(ContactPage),
     /// A contact's action menu, if any (contact_action_menu).
     ActionMenu(Option<ActionMenu>),
@@ -1514,16 +1514,16 @@ pub enum ApiResponse {
     /// The saved-presence listing (the reply to `PresenceList`), in the manager's insertion order.
     SavedPresences(Vec<SavedPresence>),
     /// The node's live notification list (`notification_list`; wire v37), newest first, carrying the
-    /// notifications revision (rung 1, api vNEXT).
+    /// notifications revision (rung 1, api/39).
     Notifications(RevList<NotificationInfo>),
     /// The node's person/metacontact registry (`person_list`; wire v37), insertion order, carrying
-    /// the persons revision (rung 1, api vNEXT) and — on a delta read — `removed` tombstones
-    /// (rung 2, api vNEXT).
+    /// the persons revision (rung 1, api/39) and — on a delta read — `removed` tombstones
+    /// (rung 2, api/39).
     Persons(RevDeltaList<Person>),
     /// A transport instance's persisted NON-SECRET account-settings values (`transport_settings`;
     /// wire v38). Secrets never ride this response — they live in the credential store.
     TransportSettings(AccountSettingsValues),
-    /// Rung 3 (api vNEXT): the race-free initial-sync baseline (the reply to
+    /// Rung 3 (api/39): the race-free initial-sync baseline (the reply to
     /// [`ApiRequest::Bootstrap`]) — every collection's rev + the feed cursor + epoch, snapshotted
     /// atomically under one feed-lock acquisition.
     Bootstrap(BootstrapReport),
@@ -1595,7 +1595,7 @@ impl<T> Default for WirePage<T> {
 }
 
 /// A page of a transport's conversations (`conv_list` -> `Conversations`), carrying the owning
-/// transport's conversation-set revision (rung 1, api vNEXT). Shape-identical to
+/// transport's conversation-set revision (rung 1, api/39). Shape-identical to
 /// `WirePage<ConversationInfo>` plus a `rev`: the client compares `rev` against the
 /// `ConversationsChanged.rev` pointer to skip an unchanged refetch (breaking arm-shape change,
 /// bundled into the deferred v38->v39 bump). The CDDL rule is `conv-page`.
@@ -1611,12 +1611,12 @@ pub struct ConvPage {
     pub next: Option<String>,
     /// The owning transport's conversation-set revision this page reflects (rung 1).
     pub rev: u64,
-    /// Delta read (rung 2, api vNEXT): conversation ids removed since the requested `since_rev`
+    /// Delta read (rung 2, api/39): conversation ids removed since the requested `since_rev`
     /// (the client prunes them). Empty on a full page — a full page replaces the client's set
     /// wholesale, so it carries no removal list (the SessionsQuery template).
     #[serde(default)]
     pub removed: Vec<String>,
-    /// Rung 3 (api vNEXT) uniform provenance (carrier 2): a page-side `key -> origin_op` map,
+    /// Rung 3 (api/39) uniform provenance (carrier 2): a page-side `key -> origin_op` map,
     /// present only for items whose latest reflected mutation carried an `op_id`. Operation
     /// metadata, not entity state (the DTOs stay clean); the client keys its pending-op UX on it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -1624,7 +1624,7 @@ pub struct ConvPage {
 }
 
 /// A page of a transport's server-side contact roster (`roster_list` -> `ContactPage`), carrying the
-/// owning transport's contact-roster revision (rung 1, api vNEXT). Shape-identical to
+/// owning transport's contact-roster revision (rung 1, api/39). Shape-identical to
 /// `WirePage<ContactInfo>` plus a `rev`, compared against `ContactsChanged.rev`. CDDL: `contact-page`.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1638,17 +1638,17 @@ pub struct ContactPage {
     pub next: Option<String>,
     /// The owning transport's contact-roster revision this page reflects (rung 1).
     pub rev: u64,
-    /// Delta read (rung 2, api vNEXT): contact ids removed since the requested `since_rev` (the
+    /// Delta read (rung 2, api/39): contact ids removed since the requested `since_rev` (the
     /// client prunes them). Empty on a full page (mirrors [`ConvPage::removed`]).
     #[serde(default)]
     pub removed: Vec<String>,
-    /// Rung 3 (api vNEXT) uniform provenance (carrier 2): a page-side `key -> origin_op` map
+    /// Rung 3 (api/39) uniform provenance (carrier 2): a page-side `key -> origin_op` map
     /// (mirrors [`ConvPage::origin_ops`]).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub origin_ops: std::collections::BTreeMap<String, String>,
 }
 
-/// A whole-list response that carries a coalescing revision (rung 1, api vNEXT): the node-authored
+/// A whole-list response that carries a coalescing revision (rung 1, api/39): the node-authored
 /// list (persons, notifications) plus the collection's current `rev`, so a client compares `rev`
 /// against the matching `*Changed` pointer and skips re-listing an unchanged collection. Small
 /// operator-scale lists that stay under the wire page bound, so they inline the whole list (no
@@ -1672,7 +1672,7 @@ impl<T> Default for RevList<T> {
     }
 }
 
-/// A [`RevList`] that can also carry `removed` tombstones (rung 2, api vNEXT) — the whole-list
+/// A [`RevList`] that can also carry `removed` tombstones (rung 2, api/39) — the whole-list
 /// response of a delta-read-capable collection (persons today). On a delta read (`since_rev`
 /// servable) `items` holds only the entries changed after `since_rev` and `removed` the string keys
 /// gone since then; on a full read `removed` is empty and the client applies the list as
@@ -1688,7 +1688,7 @@ pub struct RevDeltaList<T> {
     /// Delta read (rung 2): keys removed since the requested `since_rev`. Empty on a full read.
     #[serde(default)]
     pub removed: Vec<String>,
-    /// Rung 3 (api vNEXT) uniform provenance (carrier 2): a page-side `key -> origin_op` map
+    /// Rung 3 (api/39) uniform provenance (carrier 2): a page-side `key -> origin_op` map
     /// (mirrors [`ConvPage::origin_ops`]); `response-persons` carries the identical member.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub origin_ops: std::collections::BTreeMap<String, String>,
@@ -1706,7 +1706,7 @@ impl<T> Default for RevDeltaList<T> {
     }
 }
 
-/// Rung 3 (api vNEXT) — the race-free initial-sync baseline (the reply to
+/// Rung 3 (api/39) — the race-free initial-sync baseline (the reply to
 /// [`ApiRequest::Bootstrap`]). One probe returns the feed position (`cursor`), the feed generation
 /// (`epoch`), and every tracked collection's coalescing revision (`revs`, keyed by a stable
 /// collection name — `"roster"`, `"fleet"`, `"persons"`, per-transport `"conv:<id>"` /
@@ -2352,16 +2352,17 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the finalized integrations surface: v38. Distinct
-    /// from the transport-envelope [`WIRE_VERSION`] above (= 2), which the integrations port did
-    /// not touch. Bumping the contract version is a deliberate act — this assertion is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed mirror-architecture surface: v39 (the
+    /// single deliberate bump carrying rungs 1+2+3 together, spec 09 §10.4). Distinct from the
+    /// transport-envelope [`WIRE_VERSION`] above (= 2), which the mirror rungs did not touch.
+    /// Bumping the contract version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v38() {
+    fn contract_wire_version_is_v39() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(38)
+            daemon_common::WireVersion(39)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(38));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(39));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

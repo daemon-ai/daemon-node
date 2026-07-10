@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Unix-epoch milliseconds — the clock the rung-3 (api vNEXT) `command_dedup` TTL is measured
+/// Unix-epoch milliseconds — the clock the rung-3 (api/39) `command_dedup` TTL is measured
 /// against (insert time vs read time).
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -155,7 +155,7 @@ impl ControlApi for NodeApiImpl {
         // so it rides the `removed` list rather than silently vanishing from the delta.
         let mut removed: Vec<SessionId> = Vec::new();
         let mut delta_served = false;
-        // rung 3 (api vNEXT): the causing-op provenance for changed sessions (session-page carrier
+        // rung 3 (api/39): the causing-op provenance for changed sessions (session-page carrier
         // 2), threaded from the roster delta index; filtered to the served page body below.
         let delta_origin_ops = delta
             .as_ref()
@@ -202,7 +202,7 @@ impl ControlApi for NodeApiImpl {
         });
         // Cursor pagination: `after` is the last id of the previous page; skip through it.
         let next_cursor = paginate_roster(&mut roster, query.after.as_ref(), query.limit);
-        // rung 3 (api vNEXT): the page-side `origin_ops` map, restricted to the sessions actually
+        // rung 3 (api/39): the page-side `origin_ops` map, restricted to the sessions actually
         // served in this page (only meaningful on a delta read).
         let origin_ops: std::collections::BTreeMap<String, String> = roster
             .iter()
@@ -223,7 +223,7 @@ impl ControlApi for NodeApiImpl {
         }
     }
 
-    // ----- rung 3 (api vNEXT): Bootstrap probe + op-id idempotent dedup -----
+    // ----- rung 3 (api/39): Bootstrap probe + op-id idempotent dedup -----
 
     async fn bootstrap(&self) -> daemon_api::BootstrapReport {
         // The race-free initial-sync baseline (06G6): every collection's rev + the feed cursor +
@@ -395,7 +395,7 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(e.to_string()))?;
         // Nudge live roster/tree subscribers so the rename/pin/archive shows up without a poll.
         self.emit_tree_changed();
-        // L3: a rename/pin/archive changed this session's roster metadata. rung 3 (api vNEXT):
+        // L3: a rename/pin/archive changed this session's roster metadata. rung 3 (api/39):
         // stamp the causing op token (this `SessionUpdateMeta`'s op_id, from the dispatch context)
         // on both the roster delta index (session-page `origin_ops`) and the pointer.
         if let Some(feed) = self.node_feed() {
@@ -1441,7 +1441,7 @@ impl ControlApi for NodeApiImpl {
                     daemon_api::paginate(convs, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
                         c.id.clone()
                     });
-                // rung 3 (api vNEXT): the page-side `origin_ops`, restricted to the served items.
+                // rung 3 (api/39): the page-side `origin_ops`, restricted to the served items.
                 let origin_ops = page
                     .items
                     .iter()

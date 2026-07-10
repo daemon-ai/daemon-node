@@ -230,7 +230,7 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::PersonList { since_rev } => {
             ApiResponse::Persons(api.person_list(since_rev).await)
         }
-        // rung 3 (api vNEXT): the race-free initial-sync baseline (revs + cursor + epoch).
+        // rung 3 (api/39): the race-free initial-sync baseline (revs + cursor + epoch).
         ApiRequest::Bootstrap => ApiResponse::Bootstrap(api.bootstrap().await),
         _ => return None,
     })
@@ -731,7 +731,7 @@ async fn serve_access(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
 /// Dispatch a request against a full [`NodeApi`] — the entry point the socket/TCP/JSON-RPC node
 /// transports call.
 ///
-/// Rung 3 (api vNEXT) wraps the fan-out with two verb-agnostic seams keyed off
+/// Rung 3 (api/39) wraps the fan-out with two verb-agnostic seams keyed off
 /// [`ApiRequest::op_id`]:
 /// 1. **Idempotent dedup** — before running an op that carries an `op_id`, consult
 ///    [`ControlApi::command_dedup_lookup`]; a hit returns the ORIGINAL result bytes verbatim (no

@@ -249,7 +249,7 @@ impl RoomRuntime {
         if let Some(sink) = &self.sink {
             let mut message = ChatMessage::new(author, text.clone());
             message.timestamp = Some(now_unix_secs());
-            // rung 3 (api vNEXT): the rooms reference adapter routes sends through an internal
+            // rung 3 (api/39): the rooms reference adapter routes sends through an internal
             // command channel (a serve-loop boundary a task-local op token cannot cross), so it is
             // a token-incapable adapter for now — `origin_op` is null (the degraded path, never
             // heuristic). Confirmation resolves via the accepted-state policy (09§6.6).
@@ -752,7 +752,7 @@ impl SupportsConversations for RoomsAdapter {
             conv,
             from,
             message,
-            // rung 3 (api vNEXT): token-incapable adapter (routes through an internal command
+            // rung 3 (api/39): token-incapable adapter (routes through an internal command
             // channel); `origin_op` resolves null via the accepted-state policy (09§6.6).
             op_id: _,
         } = args;

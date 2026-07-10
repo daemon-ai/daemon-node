@@ -430,7 +430,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         // never configured (the empty map). Secrets never land here — they go to the credential
         // store via the auth flows.
         M::up("ALTER TABLE transport_prefs ADD COLUMN settings BLOB;"),
-        // M16 (rung 3, api vNEXT — op-id idempotent dedup): the durable command-dedup table. Keyed
+        // M16 (rung 3, api/39 — op-id idempotent dedup): the durable command-dedup table. Keyed
         // `(principal, op_id)`; `result` is the opaque CBOR of the original `ApiResponse` returned
         // to a retry; `at_ms` is the insert time the 24h TTL is measured from (`COMMAND_DEDUP_TTL_MS`).
         // The retry window that matters spans a node restart (06 open-Q5), so this is durable, not
@@ -2728,7 +2728,7 @@ mod tests {
     /// sub-agent `session_meta.inline_profile` column, the wire-v35 `transport_prefs` +
     /// `credential_labels` account-management tables, the wire-v37 `saved_presences` +
     /// `saved_presence_active` tables, the `custom_providers` table, the wire-v38
-    /// `transport_prefs.settings` account-settings column, and the rung-3 (api vNEXT)
+    /// `transport_prefs.settings` account-settings column, and the rung-3 (api/39)
     /// `command_dedup` op-id idempotency table).
     #[test]
     fn migration_ladder_valid_and_applied() {

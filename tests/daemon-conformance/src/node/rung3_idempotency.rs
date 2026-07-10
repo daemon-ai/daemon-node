@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Rung 3 (op-id idempotency + uniform operation provenance + Bootstrap probe, api vNEXT)
+//! Rung 3 (op-id idempotency + uniform operation provenance + Bootstrap probe, api/39)
 //! end-to-end over the assembled node.
 //!
 //! The properties proven:

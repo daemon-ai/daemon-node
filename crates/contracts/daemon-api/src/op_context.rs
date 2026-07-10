@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The rung-3 (api vNEXT) op-id **dispatch context** (spec 09 §10.3, ADR-006).
+//! The rung-3 (api/39) op-id **dispatch context** (spec 09 §10.3, ADR-006).
 //!
 //! The shared [`dispatch`](crate::dispatch) core binds the current request's client-minted `op_id`
 //! (extracted verb-agnostically via [`ApiRequest::op_id`](crate::ApiRequest::op_id)) as a

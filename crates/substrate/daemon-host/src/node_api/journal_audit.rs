@@ -186,7 +186,7 @@ impl NodeApiImpl {
                     kind: view.kind,
                     timestamp_ms: view.timestamp_ms,
                     verified: seg_verified.get(&je.segment).copied().unwrap_or(false),
-                    // rung 3 (api vNEXT): the node-owned envelope's uniform operation provenance.
+                    // rung 3 (api/39): the node-owned envelope's uniform operation provenance.
                     origin_op: view.origin_op,
                     payload,
                 })

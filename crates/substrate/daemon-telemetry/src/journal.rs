@@ -79,7 +79,7 @@ pub struct JournalEntryView {
     /// (see [`entry_envelope`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub writer_version: String,
-    /// Rung 3 (api vNEXT) uniform operation provenance: the client-minted `op_id` of the operation
+    /// Rung 3 (api/39) uniform operation provenance: the client-minted `op_id` of the operation
     /// that caused this record, stamped on the NODE-OWNED envelope (the adapter payload is
     /// untouched) so every journaled stream carries it. `None` when the causing operation carried
     /// no op_id (or a protocol could not round-trip the opaque token) — degraded, never heuristic.

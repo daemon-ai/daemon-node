@@ -741,7 +741,24 @@ impl WireVersion {
     /// transport (no wire changes). All additive, but bumped because `is_compatible` is
     /// strict-equal, so an older peer cannot decode the new surface (mirrors the additive
     /// v15–v37 bumps).
-    pub const CURRENT: Self = Self(38);
+    ///
+    /// v39 (mirror architecture — rungs 1+2+3, the single deliberate contract bump): the one-time
+    /// bump sealing the three node-refactor rungs (spec 09 §10) that support the client typed
+    /// mirror, developed against v38 and doc-tagged as pending the deferred bump until now. (Rung 1)
+    /// per-collection revisions + feed epoch — the coarse `*Changed` event pointers and their list
+    /// responses gain a coalescing
+    /// `rev` (skip-if-unchanged), and every events page carries the startup-minted feed `epoch`
+    /// (restart re-baseline). (Rung 2) delta reads + generalized backward windows — `conv_list` /
+    /// `person_list` / roster reads gain `since_rev` in and `removed` tombstones out (full-page
+    /// fallback), and the history reads gain a `? before_cursor` newest-anchored backward window.
+    /// (Rung 3) op-id idempotency + uniform operation provenance + bootstrap — retry-sensitive lane
+    /// and direct verbs carry a client-minted `op_id` (durable 24h `command_dedup`, a duplicate
+    /// returns the ORIGINAL result), a uniform nullable `origin_op` / `origin_ops` provenance rides
+    /// the journal envelope + delta pages + single-mutation events, and the `Bootstrap` probe
+    /// returns a race-free initial-sync baseline (`{cursor, epoch, revs}`). Bundled into ONE bump
+    /// because the rung-1 arm-shape changes are breaking and `is_compatible` is strict-equal
+    /// (mirrors the additive v15–v38 bumps); clients feature-detect via the `api/39` Hello feature.
+    pub const CURRENT: Self = Self(39);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

@@ -263,7 +263,7 @@ impl JournalSink {
     /// under the `chat.message` kind — the per-message record of a `conv:<transport>:<conv>`
     /// stream, decoded back into `JournalRecordPayload::Chat` by the history reader.
     ///
-    /// `origin_op` (rung 3, api vNEXT) is the client-minted op_id of the operation that caused this
+    /// `origin_op` (rung 3, api/39) is the client-minted op_id of the operation that caused this
     /// message, stamped on the node-owned envelope (the adapter payload is untouched); `None` when
     /// the report carried no opaque token (inbound messages, token-incapable adapters).
     pub async fn record_chat(

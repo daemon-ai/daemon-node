@@ -870,7 +870,7 @@ pub enum FaultPoint {
     BeforeWakePublish,
 }
 
-/// Rung 3 (api vNEXT): the time-to-live of a `command_dedup` row — 24h. The retry window that
+/// Rung 3 (api/39): the time-to-live of a `command_dedup` row — 24h. The retry window that
 /// matters spans a node restart (06 open-Q5), so the guarantee is durable, not an in-memory LRU;
 /// the TTL + a bounded key set keep the table from growing without bound. A read past the TTL
 /// re-executes the op and re-caches (see [`SessionStore::command_dedup_get`]).
@@ -1280,7 +1280,7 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
-    /// Rung 3 (api vNEXT) op-id idempotent dedup: look up a prior result for `(principal, op_id)`,
+    /// Rung 3 (api/39) op-id idempotent dedup: look up a prior result for `(principal, op_id)`,
     /// returning the stored CBOR bytes iff a row exists AND is unexpired at `now_ms` (within
     /// [`COMMAND_DEDUP_TTL_MS`]). An expired row is not served (and is lazily evicted) so the op
     /// re-executes. Default: `None` (a store with no dedup table — the v38-era re-execute behavior).
@@ -1293,7 +1293,7 @@ pub trait SessionStore: Send + Sync {
         None
     }
 
-    /// Rung 3 (api vNEXT): record `result` for `(principal, op_id)` stamped at `at_ms`. FIRST-
+    /// Rung 3 (api/39): record `result` for `(principal, op_id)` stamped at `at_ms`. FIRST-
     /// writer-wins — a duplicate key does not overwrite the stored value, so a retry always sees
     /// the ORIGINAL result (an expired row, already evicted by [`Self::command_dedup_get`], is
     /// re-insertable). Default: no-op (never dedups).
@@ -1688,7 +1688,7 @@ struct Inner {
     journal_cursor: u64,
     /// Append-only conversation-rewind seals per stream, in record order (the latest is active).
     journal_seals: HashMap<JournalStreamId, Vec<JournalSeal>>,
-    /// Rung 3 (api vNEXT) op-id dedup: `(principal, op_id) -> (result bytes, at_ms)` (the in-memory
+    /// Rung 3 (api/39) op-id dedup: `(principal, op_id) -> (result bytes, at_ms)` (the in-memory
     /// analogue of the SQLite `command_dedup` table). Bounded by the 24h TTL + lazy eviction on
     /// access. Not durable across a restart on this backend (the accepted caveat; the durable
     /// guarantee is the SQLite backend's).

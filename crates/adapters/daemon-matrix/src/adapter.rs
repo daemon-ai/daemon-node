@@ -447,7 +447,7 @@ impl SupportsConversations for MatrixAdapter {
             conv,
             from,
             message,
-            // rung 3 (api vNEXT): the opaque client op token, round-tripped verbatim onto the
+            // rung 3 (api/39): the opaque client op token, round-tripped verbatim onto the
             // server-acked send's lifecycle report (the node stamps `origin_op`; the adapter never
             // interprets it).
             op_id,
