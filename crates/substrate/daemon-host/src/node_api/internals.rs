@@ -326,8 +326,7 @@ impl NodeEventFeed {
     /// value, so a burst of person writes collapses to one skip-if-unchanged decision client-side.
     pub(crate) fn note_persons_change(&self) -> u64 {
         let mut g = self.inner.lock().unwrap();
-        // RED stub: not yet incremented (GREEN adds `g.persons_rev += 1`). Kept 0 so the emit-site
-        // and response-echo tests fail until the behavioral core lands.
+        g.persons_rev += 1;
         g.persons_rev
     }
 
@@ -339,7 +338,7 @@ impl NodeEventFeed {
     /// Bump the notifications revision and return it (rung 1).
     pub(crate) fn note_notifications_change(&self) -> u64 {
         let mut g = self.inner.lock().unwrap();
-        // RED stub (GREEN adds `g.notifications_rev += 1`).
+        g.notifications_rev += 1;
         g.notifications_rev
     }
 
@@ -352,7 +351,7 @@ impl NodeEventFeed {
     /// catalog-changed sink, so it is `pub`.
     pub fn note_catalog_change(&self) -> u64 {
         let mut g = self.inner.lock().unwrap();
-        // RED stub (GREEN adds `g.catalog_rev += 1`).
+        g.catalog_rev += 1;
         g.catalog_rev
     }
 
@@ -360,7 +359,7 @@ impl NodeEventFeed {
     pub(crate) fn note_contacts_change(&self, transport: &TransportId) -> u64 {
         let mut g = self.inner.lock().unwrap();
         let entry = g.contacts_rev.entry(transport.clone()).or_insert(0);
-        // RED stub (GREEN adds `*entry += 1`).
+        *entry += 1;
         *entry
     }
 
@@ -379,7 +378,7 @@ impl NodeEventFeed {
     pub(crate) fn note_conversations_change(&self, transport: &TransportId) -> u64 {
         let mut g = self.inner.lock().unwrap();
         let entry = g.conversations_rev.entry(transport.clone()).or_insert(0);
-        // RED stub (GREEN adds `*entry += 1`).
+        *entry += 1;
         *entry
     }
 
@@ -404,10 +403,9 @@ impl NodeEventFeed {
         self.epoch
     }
 
-    /// The `epoch` value to stamp onto an outgoing [`EventsPage`] (rung 1). RED stub returns `None`
-    /// (GREEN returns `Some(self.epoch)`), so the epoch tests fail until the behavioral core lands.
+    /// The `epoch` value to stamp onto an outgoing [`EventsPage`] (rung 1): this feed's generation.
     fn stamp_epoch(&self) -> Option<u64> {
-        None
+        Some(self.epoch())
     }
 
     /// Assign a cursor, retain in the bounded ring, and broadcast live. Consecutive

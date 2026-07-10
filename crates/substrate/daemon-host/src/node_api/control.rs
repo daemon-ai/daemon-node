@@ -826,8 +826,7 @@ impl ControlApi for NodeApiImpl {
         report.next = page.next;
         // rung 1: echo the fleet rev (the coalescing `FleetChanged.rev`) so the client closes the
         // compare loop and skips a `Tree` refetch when unchanged.
-        // RED stub: 0 (GREEN reads `self.node_feed().map(|f| f.fleet_rev()).unwrap_or(0)`).
-        report.rev = 0;
+        report.rev = self.node_feed().map(|f| f.fleet_rev()).unwrap_or(0);
         report
     }
 
