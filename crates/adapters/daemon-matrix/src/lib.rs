@@ -237,6 +237,7 @@ pub async fn serve(
             bare: acct.bare.clone(),
             transport: acct.transport.clone(),
             me: me.clone(),
+            sink: sink.clone(),
         };
         // Invite acceptance (EIO-11): join rooms this account is invited to (policy-gated), so an
         // externally-invited bot lands in the room and its rooms list / `ConvList` reflect it.

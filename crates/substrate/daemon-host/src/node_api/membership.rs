@@ -271,4 +271,12 @@ impl LifecycleSink for NodeApiImpl {
             });
         }
     }
+
+    async fn chat_message(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _message: daemon_api::ChatMessage,
+    ) {
+    }
 }

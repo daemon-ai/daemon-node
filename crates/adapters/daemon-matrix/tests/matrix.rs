@@ -36,9 +36,13 @@ use matrix_sdk::test_utils::mocks::{LoginResponseTemplate200, MatrixMockServer};
 use matrix_sdk_test::event_factory::EventFactory;
 use matrix_sdk_test::JoinedRoomBuilder;
 
-use daemon_api::{FileTransfer, TransportAdapter};
+use daemon_api::{
+    ChatMessage, ContactInfo, ConvChange, ConvSendArgs, DisconnectReason, FileTransfer,
+    LifecycleSink, MembershipChange, Participant, SupportsConversations, TransportAdapter,
+};
 use daemon_host::{AccountProvisioning, BlobStore, FileBlobStore, ProvisionedAccount};
 use daemon_matrix::MatrixAdapter;
+use daemon_protocol::UserMsg;
 
 /// A no-op provisioning seam: the file-transfer tests resolve the live client from the seeded
 /// registry (via `register_live_client`), never from provisioning.
@@ -227,6 +231,7 @@ async fn inbound_room_message_opens_a_turn() {
         bare: "@bot:localhost".to_string(),
         transport: TransportId::new(transport),
         me,
+        sink: None,
     };
     client.add_event_handler_context(ctx);
     client.add_event_handler(daemon_matrix::on_room_message);
@@ -470,6 +475,210 @@ async fn file_transfer_receive_downloads_media() {
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&expected_root);
+}
+
+/// A recording node-lifecycle sink: captures every `chat_message` report (the wire-vNEXT journal
+/// obligation seam) so the vertical tests can assert the adapter reports each outbound send and
+/// inbound delivery exactly once, with a properly populated [`ChatMessage`].
+#[derive(Default)]
+struct RecordingSink {
+    chats: Mutex<Vec<(TransportId, String, ChatMessage)>>,
+}
+
+#[async_trait]
+impl LifecycleSink for RecordingSink {
+    async fn transport_disconnected(
+        &self,
+        _transport: TransportId,
+        _reason: DisconnectReason,
+        _message: Option<String>,
+    ) {
+    }
+    async fn conversations_changed(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _change: ConvChange,
+    ) {
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn membership_changed(
+        &self,
+        _transport: TransportId,
+        _conv: String,
+        _member: String,
+        _change: MembershipChange,
+        _actor: Option<String>,
+        _reason: Option<String>,
+        _is_self: bool,
+    ) {
+    }
+    async fn chat_message(&self, transport: TransportId, conv: String, message: ChatMessage) {
+        self.chats.lock().unwrap().push((transport, conv, message));
+    }
+}
+
+/// The journal obligation on the matrix send path (wire vNEXT): a successful `ConvSend` reports
+/// exactly one `chat_message` through the node sink — author = the `from` participant, RAW text,
+/// the server-acked event id as `ChatMessage::id`, delivered stamped — for the node to journal on
+/// `conv:<transport>:<room>` and announce via `MessagesChanged`.
+#[tokio::test]
+async fn send_reports_chat_message_through_the_sink() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    server.mock_room_state_encryption().plain().mount().await;
+    let room = room_id!("!room:localhost");
+    server.sync_joined_room(&client, room).await;
+    server
+        .mock_room_send()
+        .ok(event_id!("$evt:localhost"))
+        .expect(1)
+        .mount()
+        .await;
+
+    let transport = TransportId::new("matrix/@bot:localhost");
+    let sink = Arc::new(RecordingSink::default());
+    let lifecycle: Arc<dyn LifecycleSink> = sink.clone();
+    let adapter = MatrixAdapter::new(
+        Arc::new(MockProvisioning),
+        Default::default(),
+        Some(lifecycle),
+    );
+    adapter
+        .register_live_client(transport.clone(), client)
+        .await;
+
+    let author = Participant::Contact(ContactInfo {
+        id: "@op:localhost".into(),
+        ..ContactInfo::default()
+    });
+    SupportsConversations::send(
+        &*adapter,
+        ConvSendArgs {
+            transport: transport.clone(),
+            conv: room.as_str().to_string(),
+            from: Some(author.clone()),
+            message: UserMsg::new("hello"),
+        },
+    )
+    .await
+    .expect("send succeeds against the mock");
+
+    let chats = sink.chats.lock().unwrap();
+    assert_eq!(
+        chats.len(),
+        1,
+        "one successful send = one chat_message report, got {chats:?}"
+    );
+    let (t, conv, msg) = &chats[0];
+    assert_eq!(t, &transport);
+    assert_eq!(conv, room.as_str());
+    assert_eq!(msg.text, "hello");
+    assert_eq!(
+        msg.author,
+        Some(author),
+        "the ConvSend `from` attribution rides ChatMessage::author"
+    );
+    assert_eq!(
+        msg.id.as_deref(),
+        Some("$evt:localhost"),
+        "the server-acked event id rides ChatMessage::id"
+    );
+    assert!(msg.timestamp.is_some(), "the send stamps a timestamp");
+    assert!(msg.delivered(), "a server-acked send is stamped delivered");
+}
+
+/// The journal obligation on the matrix inbound path (wire vNEXT): a synced `m.room.message`
+/// reports one `chat_message` through the node sink — structured author (the sender MXID), RAW
+/// body, the matrix event id — in ADDITION to the existing agent-session `Ingestor` routing
+/// (the `StartTurn` still fires; journaling never replaces it).
+#[tokio::test]
+async fn inbound_room_message_reports_chat_message_through_the_sink() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    server.mock_room_state_encryption().plain().mount().await;
+    let me = client.user_id().expect("logged in").to_owned();
+
+    let transport = "matrix/@bot:localhost";
+    let api = Arc::new(Recorder::new(transport, "!room:localhost"));
+    let napi: Arc<dyn NodeApi> = api.clone();
+    let ingestor = Arc::new(Ingestor::with_policy(napi.clone(), perthread_policy()));
+    let projector = Arc::new(MatrixProjector::new(
+        napi.clone(),
+        ingestor.clone(),
+        HashMap::new(),
+    ));
+    let delivery = Arc::new(DeliveryManager::new(napi.clone(), projector));
+    let sink = Arc::new(RecordingSink::default());
+    let lifecycle: Arc<dyn LifecycleSink> = sink.clone();
+
+    let ctx = InboundCtx {
+        ingestor,
+        delivery,
+        routes: Arc::new(Vec::new()),
+        bare: "@bot:localhost".to_string(),
+        transport: TransportId::new(transport),
+        me,
+        sink: Some(lifecycle),
+    };
+    client.add_event_handler_context(ctx);
+    client.add_event_handler(daemon_matrix::on_room_message);
+
+    let room = room_id!("!room:localhost");
+    let factory = EventFactory::new();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room).add_timeline_event(
+                factory
+                    .text_msg("!ping please")
+                    .sender(user_id!("@alice:localhost")),
+            ),
+        )
+        .await;
+
+    // Handlers dispatch during sync processing; poll briefly for the async report to land.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while sink.chats.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let chats = sink.chats.lock().unwrap();
+    assert_eq!(
+        chats.len(),
+        1,
+        "one inbound message = one chat_message report, got {chats:?}"
+    );
+    let (t, conv, msg) = &chats[0];
+    assert_eq!(t.as_str(), transport);
+    assert_eq!(conv, room.as_str());
+    assert_eq!(
+        msg.text, "!ping please",
+        "the journal carries the RAW body — attribution is structured, never text-prefixed"
+    );
+    assert!(
+        matches!(&msg.author, Some(Participant::Contact(c)) if c.id == "@alice:localhost"),
+        "the sender MXID rides ChatMessage::author, got {:?}",
+        msg.author
+    );
+    assert!(
+        msg.id.is_some(),
+        "the matrix event id rides ChatMessage::id"
+    );
+    assert!(
+        msg.timestamp.is_some(),
+        "origin_server_ts rides ChatMessage::timestamp"
+    );
+
+    // The existing Ingestor routing is untouched: the addressed message still opened a turn.
+    let cmds = api.commands.lock().unwrap();
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            AgentCommand::StartTurn { input, .. } if input.text.contains("!ping please")
+        )),
+        "journaling is in ADDITION to ingest routing, got {cmds:?}"
+    );
 }
 
 #[tokio::test]

@@ -40,6 +40,11 @@ pub struct InboundCtx {
     pub transport: TransportId,
     /// This account's own user id — messages from it are ignored (no self-loop).
     pub me: OwnedUserId,
+    /// The node-owned lifecycle sink (wire vNEXT): every inbound message is reported through it so
+    /// the node journals a `Chat` record on `conv:<transport>:<room>` and emits `MessagesChanged` —
+    /// in ADDITION to the agent-session `Ingestor` routing below, never instead of it. `None` in
+    /// unit tests that never wire the node.
+    pub sink: Option<Arc<dyn daemon_api::LifecycleSink>>,
 }
 
 /// Whether `body`/`mentions` address `me`: an explicit `m.mentions` entry, or the user id / localpart
