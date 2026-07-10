@@ -771,6 +771,7 @@ mod tests {
             topic: None,
             description: None,
             members,
+            parent: None,
         }
     }
 

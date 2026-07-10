@@ -3900,6 +3900,13 @@ pub enum ConversationType {
     Channel,
     /// A thread within a conversation.
     Thread,
+    /// A structural container that holds child conversations rather than messages (wire vNEXT).
+    /// This models Matrix spaces (`m.space` rooms) today, and generalizes to future Discord guilds
+    /// / Slack workspaces / server-level groupings: a `Space` never carries a message transcript —
+    /// clients render it as a node in the account → spaces → rooms → DMs tree, and its children are
+    /// the conversations that name it via [`ConversationInfo::parent`]. Appended at the END of the
+    /// enum so the discriminant stays additive for pre-vNEXT peers.
+    Space,
 }
 
 /// ← PurpleTypingState.
@@ -4069,6 +4076,17 @@ pub struct ConversationInfo {
     /// The observed members/occupants.
     #[serde(default)]
     pub members: Vec<ConversationMember>,
+    /// The conversation id of the containing space/server-level conversation on the **same**
+    /// transport, if any (wire vNEXT). Set on a child conversation to name its parent — typically a
+    /// [`ConversationType::Space`] (a Matrix space, and future Discord guilds / Slack workspaces) —
+    /// so clients can render an account → spaces → rooms → DMs tree. `None` ⟹ a top-level (root)
+    /// conversation. The node emits exactly what the protocol reports and does not sanitize the
+    /// graph: a `parent` may reference a conversation the client has not seen, and adapters that
+    /// expose no hierarchy simply leave this `None`. Clients MUST tolerate cycles and dangling
+    /// parents — treat an unknown or self-referential `parent` as a root. Appended at the END with
+    /// `#[serde(default)]` so a pre-vNEXT encoding that omits it decodes to `None`.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 /// Filled values for an adapter-described settings form (the companion to [`AccountSettingsSchema`]).
@@ -4734,6 +4752,7 @@ mod tests {
                 role: MemberRole::Op,
                 session: Some(SessionId::new("sess-1")),
             }],
+            parent: None,
         };
         let resps = vec![
             ApiResponse::Conversations(WirePage {

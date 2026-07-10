@@ -478,7 +478,7 @@ async fn file_transfer_receive_downloads_media() {
 /// `m.room.create` `type`), fabricated here with the harness's `EventFactory::create(..).with_space_type()`.
 #[tokio::test]
 async fn space_room_projects_as_space_conversation() {
-    use daemon_api::{ConversationType, SupportsConversations};
+    use daemon_api::ConversationType;
     use matrix_sdk::ruma::RoomVersionId;
 
     let server = MatrixMockServer::new().await;
@@ -525,7 +525,7 @@ async fn space_room_projects_as_space_conversation() {
 /// id, and (dangling/unknown parents being a client concern) the node reports what the protocol says.
 #[tokio::test]
 async fn child_room_carries_parent_space() {
-    use daemon_api::{ConversationType, SupportsConversations};
+    use daemon_api::ConversationType;
     use matrix_sdk::ruma::events::space::parent::SpaceParentEventContent;
     use matrix_sdk::ruma::server_name;
 
@@ -579,7 +579,7 @@ async fn child_room_carries_parent_space() {
 /// hierarchy relation.
 #[tokio::test]
 async fn plain_room_has_no_parent() {
-    use daemon_api::{ConversationType, SupportsConversations};
+    use daemon_api::ConversationType;
 
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;

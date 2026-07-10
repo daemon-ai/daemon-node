@@ -1175,6 +1175,8 @@ conversation-type = "Unset"
                   / "GroupDm"
                   / "Channel"
                   / "Thread"
+                  / "Space"                ; wire vNEXT: a structural container (Matrix spaces;
+                                            ; future guilds/workspaces) — holds children, not messages
 member-role = "None"
             / "Voice"
             / "HalfOp"
@@ -1212,6 +1214,9 @@ conversation-info = {
   "transport": transport-id, "id": tstr, "kind": conversation-type,
   ? "title": (tstr / null), ? "topic": (tstr / null), ? "description": (tstr / null),
   ? "members": [* conversation-member],
+  ? "parent": (tstr / null),                ; wire vNEXT: containing space/server-level conv id on
+                                            ; the same transport (absent/null = a root); clients
+                                            ; treat unknown/cyclic parents as roots
 }
 ; ----- notifications (wire v37; port-notify) -----
 authorization-request = { "contact": contact-info, ? "message": (tstr / null), ? "add": bool, ? "handled": bool }

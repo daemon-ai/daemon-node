@@ -575,8 +575,41 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 topic: None,
                 description: None,
                 members: Vec::new(),
+                parent: None,
             }],
             next: Some("conv-064".into()),
+        }),
+    )?;
+    // Conversation hierarchy (wire vNEXT): a structural `Space` container (a root — no `parent`) and
+    // a child `Channel` naming that space via `parent`, so verify-codec proves the generated zcbor C
+    // decoder accepts the new `ConversationType::Space` variant + the additive `parent` member.
+    write_cbor(
+        &out,
+        "response-conv-hierarchy.cbor",
+        &ApiResponse::Conversations(daemon_api::WirePage {
+            items: vec![
+                daemon_api::ConversationInfo {
+                    transport: daemon_protocol::TransportId::new("matrix/@me:hs.org"),
+                    id: "!space:hs.org".into(),
+                    kind: daemon_api::ConversationType::Space,
+                    title: Some("Engineering".into()),
+                    topic: None,
+                    description: None,
+                    members: Vec::new(),
+                    parent: None,
+                },
+                daemon_api::ConversationInfo {
+                    transport: daemon_protocol::TransportId::new("matrix/@me:hs.org"),
+                    id: "!room:hs.org".into(),
+                    kind: daemon_api::ConversationType::Channel,
+                    title: Some("general".into()),
+                    topic: Some("chit-chat".into()),
+                    description: None,
+                    members: Vec::new(),
+                    parent: Some("!space:hs.org".into()),
+                },
+            ],
+            next: None,
         }),
     )?;
     // Server-side roster (wire v34): a paged list request + resume, the mutation requests carrying a
