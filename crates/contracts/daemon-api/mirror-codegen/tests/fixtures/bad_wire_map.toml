@@ -1,0 +1,17 @@
+# NEGATIVE fixture: a wire path that does not ground in the CDDL -> must FAIL (§3.3 grounding).
+# `room-info.nonexistent_member` names a real rule but a member it does not have.
+
+[entity.Room]
+class = "M"
+key = ["transport", "room"]
+table = "m_rooms"
+
+  [entity.Room.fields.transport]
+  wire = "room-info.transport"
+  type = "QString"
+  [entity.Room.fields.room]
+  wire = "room-info.room"
+  type = "QString"
+  [entity.Room.fields.bogus]
+  wire = "room-info.nonexistent_member"
+  type = "QString"

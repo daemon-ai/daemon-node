@@ -1,0 +1,56 @@
+# Minimal valid map (grounds against the real daemon-api.cddl) for emitter unit tests.
+
+[entity.Room]
+class = "M"
+key = ["transport", "room"]
+table = "m_rooms"
+invalidators = ["ConversationsChanged"]
+wire_read = ["TransportRooms"]
+
+  [entity.Room.fields.transport]
+  wire = "room-info.transport"
+  type = "QString"
+  [entity.Room.fields.room]
+  wire = "room-info.room"
+  type = "QString"
+  [entity.Room.fields.name]
+  wire = "room-info.name"
+  type = "QString"
+
+  [entity.Room.sidecar.pinned]
+  type = "bool"
+
+[entity.ToolInfo]
+class = "L"
+key = ["name"]
+invalidators = ["connect-refresh"]
+wire_read = ["ToolList"]
+
+  [entity.ToolInfo.fields.name]
+  wire = "tool-info.name"
+  type = "QString"
+  [entity.ToolInfo.fields.enabled]
+  wire = "tool-info.enabled"
+  type = "bool"
+
+[entity.ChatMessage]
+class = "W"
+scope = ["transport", "conv"]
+window_key = "cursor"
+policy = "chat"
+table = "w_chat_messages"
+invalidators = ["MessagesChanged"]
+wire_read = ["ConvHistory"]
+
+  [entity.ChatMessage.fields.transport]
+  wire = "conv-history-args.transport"
+  type = "QString"
+  [entity.ChatMessage.fields.conv]
+  wire = "conv-history-args.conv"
+  type = "QString"
+  [entity.ChatMessage.fields.cursor]
+  wire = "journal-record.cursor"
+  type = "quint64"
+  [entity.ChatMessage.fields.text]
+  wire = "chat-message.text"
+  type = "QString"
