@@ -588,6 +588,29 @@ mod protocol {
                 .await,
         );
     }
+    #[tokio::test]
+    async fn protocol_fake_validate_account_rejects_marker_value() {
+        // daemon-specific (N2, wire vNEXT): an otherwise-operable Fake rejects a settings map
+        // carrying the marker VALUE with a non-`Unsupported` error — the adapter-side validation
+        // failure the host's `transport_configure` op must surface.
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            "nick".to_string(),
+            FakeProtocol::VALIDATE_REJECT_VALUE.to_string(),
+        );
+        assert_error(
+            FakeProtocol::new()
+                .validate_account(&AccountSettingsValues { values })
+                .await,
+        );
+        // Marker-free maps still validate (the rejection is value-keyed, not a global switch).
+        let mut ok = std::collections::BTreeMap::new();
+        ok.insert("nick".to_string(), "daemon-bot".to_string());
+        assert!(FakeProtocol::new()
+            .validate_account(&AccountSettingsValues { values: ok })
+            .await
+            .is_ok());
+    }
 }
 
 // ===========================================================================

@@ -1425,6 +1425,40 @@ pub trait ControlApi: Send + Sync {
     async fn fs_write_from_blob(&self, _args: FsWriteFromBlobArgs) -> Result<FsRevision, ApiError> {
         Err(ApiError::Unsupported("fs_write_from_blob".into()))
     }
+
+    // -- Transport account settings (N2; wire vNEXT) ----------------------------------------------
+
+    /// The persisted per-instance account-settings values of a transport (wire vNEXT) — the
+    /// read-back for the client's account settings form, keyed by the adapter's
+    /// [`AdapterInfo::account_schema`] field keys. SECURITY INVARIANT: secrets NEVER live in this
+    /// store — they go to the credential store via the interactive-auth flows
+    /// ([`auth_begin`](Self::auth_begin)/[`auth_step`](Self::auth_step)); this surface holds only
+    /// non-secret configuration. Default: unsupported.
+    async fn transport_settings(
+        &self,
+        _transport: TransportId,
+    ) -> Result<AccountSettingsValues, ApiError> {
+        Err(ApiError::Unsupported("transport_settings".into()))
+    }
+
+    /// Merge-persist a transport instance's non-secret settings values (wire vNEXT), then apply
+    /// them by reconnect. Node-sequenced (the client sends one intent): reject keys not in the
+    /// owning adapter's [`AdapterInfo::account_schema`]; run the adapter's
+    /// [`MessagingProtocol::validate_account`] over the MERGED values (persisted ∪ incoming,
+    /// incoming wins) and surface its error; persist to the same per-transport prefs store the
+    /// label/enabled ops use; and — when the instance is currently connected — cycle
+    /// [`transport_disconnect`](Self::transport_disconnect) →
+    /// [`transport_connect`](Self::transport_connect) so the new settings take effect (mirroring
+    /// how `transport_set_enabled(false → true)` cycles), which emits the existing
+    /// [`NodeEvent::TransportChanged`] Offline + serve-start pushes. Secrets never ride this op
+    /// (credential store only). Default: unsupported.
+    async fn transport_configure(
+        &self,
+        _transport: TransportId,
+        _settings: AccountSettingsValues,
+    ) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("transport_configure".into()))
+    }
 }
 
 /// The model-management sub-surface: search/download/cache/catalog/activate the local-inference
@@ -4775,6 +4809,48 @@ mod tests {
                 items: vec!["Block".into()],
             })),
             ApiResponse::ActionMenu(None),
+        ];
+        for resp in resps {
+            let bytes = to_cbor(&resp);
+            let back: ApiResponse = from_cbor(&bytes).unwrap();
+            assert_eq!(resp, back);
+        }
+    }
+
+    /// The transport account-settings ops (N2; wire vNEXT) round-trip through CBOR: the settings
+    /// read, the merge-edit configure (populated and empty maps), and the values response.
+    #[test]
+    fn transport_settings_requests_and_response_round_trip() {
+        let transport = TransportId::new("mock/acct");
+        let mut values = BTreeMap::new();
+        values.insert("server".to_string(), "hs.example.org".to_string());
+        values.insert("nick".to_string(), "daemon-bot".to_string());
+
+        let reqs = vec![
+            ApiRequest::TransportSettings {
+                transport: transport.clone(),
+            },
+            ApiRequest::TransportConfigure {
+                transport: transport.clone(),
+                settings: AccountSettingsValues {
+                    values: values.clone(),
+                },
+            },
+            // An empty merge (no keys) is a valid wire shape (serde-default map).
+            ApiRequest::TransportConfigure {
+                transport,
+                settings: AccountSettingsValues::default(),
+            },
+        ];
+        for req in reqs {
+            let bytes = to_cbor(&req);
+            let back: ApiRequest = from_cbor(&bytes).unwrap();
+            assert_eq!(req, back);
+        }
+
+        let resps = vec![
+            ApiResponse::TransportSettings(AccountSettingsValues { values }),
+            ApiResponse::TransportSettings(AccountSettingsValues::default()),
         ];
         for resp in resps {
             let bytes = to_cbor(&resp);

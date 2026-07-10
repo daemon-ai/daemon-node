@@ -1888,6 +1888,39 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         )?;
     }
 
+    // -- transport account settings (N2; wire vNEXT) --------------------------------------------
+    // The settings read + merge-edit of a transport instance's persisted NON-SECRET values, so
+    // verify-codec proves the generated zcbor C decoder accepts the map-carrying shapes.
+    {
+        use daemon_api::AccountSettingsValues;
+
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("server".to_string(), "hs.example.org".to_string());
+        values.insert("nick".to_string(), "daemon-bot".to_string());
+        write_cbor(
+            &out,
+            "request-transport-settings.cbor",
+            &ApiRequest::TransportSettings {
+                transport: TransportId::new("matrix/@bot:hs.org"),
+            },
+        )?;
+        write_cbor(
+            &out,
+            "request-transport-configure.cbor",
+            &ApiRequest::TransportConfigure {
+                transport: TransportId::new("matrix/@bot:hs.org"),
+                settings: AccountSettingsValues {
+                    values: values.clone(),
+                },
+            },
+        )?;
+        write_cbor(
+            &out,
+            "response-transport-settings.cbor",
+            &ApiResponse::TransportSettings(AccountSettingsValues { values }),
+        )?;
+    }
+
     println!("generated CBOR fixtures in {}", out.display());
     Ok(())
 }

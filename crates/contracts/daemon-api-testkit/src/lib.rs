@@ -261,6 +261,12 @@ pub struct FakeProtocol {
 }
 
 impl FakeProtocol {
+    /// The marker settings VALUE [`MessagingProtocol::validate_account`] rejects (N2): any
+    /// settings entry whose value equals this marker fails validation with a non-`Unsupported`
+    /// error, so host tests can prove the `transport_configure` op surfaces adapter validation
+    /// failures. Orthogonal to [`FakeProtocol::failing`]'s global validate switch.
+    pub const VALIDATE_REJECT_VALUE: &'static str = "reject-me";
+
     /// A fully-operable fake: every verb supported and succeeds.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -342,12 +348,23 @@ impl TransportAdapter for FakeProtocol {
 
 #[async_trait]
 impl MessagingProtocol for FakeProtocol {
-    async fn validate_account(&self, _settings: &AccountSettingsValues) -> Result<(), ApiError> {
+    async fn validate_account(&self, settings: &AccountSettingsValues) -> Result<(), ApiError> {
         if self.validate_fails {
-            Err(ApiError::Other("fake:validate_account error".into()))
-        } else {
-            Ok(())
+            return Err(ApiError::Other("fake:validate_account error".into()));
         }
+        // The value-keyed rejection (N2): an otherwise-operable fake still rejects the marker,
+        // so host tests can drive a REAL validation failure through `transport_configure`.
+        if settings
+            .values
+            .values()
+            .any(|v| v == Self::VALIDATE_REJECT_VALUE)
+        {
+            return Err(ApiError::Other(format!(
+                "fake:validate_account rejects marker value `{}`",
+                Self::VALIDATE_REJECT_VALUE
+            )));
+        }
+        Ok(())
     }
 
     fn conversations(self: Arc<Self>) -> Option<Arc<dyn SupportsConversations>> {

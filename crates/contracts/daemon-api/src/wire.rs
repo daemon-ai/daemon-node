@@ -1168,6 +1168,23 @@ pub enum ApiRequest {
     /// read-only snapshot (insertion order); the client re-lists on a
     /// [`NodeEvent::PersonsChanged`] pointer. Answered by [`ApiResponse::Persons`].
     PersonList,
+
+    // -- transport account settings (N2; wire vNEXT) --------------------------------------------
+    /// [`ControlApi::transport_settings`] — read a transport instance's persisted NON-SECRET
+    /// account-settings values (wire vNEXT). Answered by [`ApiResponse::TransportSettings`].
+    /// Secrets never live in this surface — they go to the credential store via the auth flows.
+    TransportSettings {
+        /// The instance-qualified transport id.
+        transport: TransportId,
+    },
+    /// [`ControlApi::transport_configure`] — merge-persist a transport instance's non-secret
+    /// settings values and apply them by reconnect (wire vNEXT). Answered by [`ApiResponse::Ok`].
+    TransportConfigure {
+        /// The instance-qualified transport id.
+        transport: TransportId,
+        /// The settings keys to upsert (each key must be in the adapter's `account_schema`).
+        settings: AccountSettingsValues,
+    },
 }
 
 /// The serializable reflection of an interface result.
@@ -1391,6 +1408,9 @@ pub enum ApiResponse {
     Notifications(Vec<NotificationInfo>),
     /// The node's person/metacontact registry (`person_list`; wire v37), insertion order.
     Persons(Vec<Person>),
+    /// A transport instance's persisted NON-SECRET account-settings values (`transport_settings`;
+    /// wire vNEXT). Secrets never ride this response — they live in the credential store.
+    TransportSettings(AccountSettingsValues),
 }
 
 // ---------------------------------------------------------------------------
