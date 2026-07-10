@@ -382,7 +382,11 @@ fn classify(req: &ApiRequest) -> Coverage {
         | TransportRemove { .. }
         | TransportConnect { .. }
         | TransportSetEnabled { .. }
-        | TransportSetLabel { .. } => NotSessionTouching,
+        | TransportSetLabel { .. }
+        // The account-settings read + merge-edit (wire vNEXT) are RoutingRead/RoutingWrite
+        // capability-gated like the other transport account-management ops; not session-scoped.
+        | TransportSettings { .. }
+        | TransportConfigure { .. } => NotSessionTouching,
         ConvList { .. }
         | ConvGet { .. }
         | ConvCreateDetails { .. }

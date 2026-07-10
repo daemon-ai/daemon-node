@@ -261,6 +261,12 @@ pub struct FakeProtocol {
 }
 
 impl FakeProtocol {
+    /// The marker settings VALUE [`MessagingProtocol::validate_account`] rejects (N2): any
+    /// settings entry whose value equals this marker fails validation with a non-`Unsupported`
+    /// error, so host tests can prove the `transport_configure` op surfaces adapter validation
+    /// failures. Orthogonal to [`FakeProtocol::failing`]'s global validate switch.
+    pub const VALIDATE_REJECT_VALUE: &'static str = "reject-me";
+
     /// A fully-operable fake: every verb supported and succeeds.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())

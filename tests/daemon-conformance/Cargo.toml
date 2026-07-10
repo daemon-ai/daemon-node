@@ -49,6 +49,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# N2 transport-configure conformance: the reference FakeProtocol whose `validate_account` rejects
+# the marker value, delegated to by the configure-target mock adapter. Test-only.
+daemon-api-testkit = { workspace = true }
 # Auth 7 e2e/negative suites: drive the real authenticated transports with the same `rsasl`
 # SCRAM-SHA-256 client a GUI/TUI uses, over a real `rustls` TLS/TCP connection with throwaway certs.
 # Test-only; never compiled into a shipped artifact.

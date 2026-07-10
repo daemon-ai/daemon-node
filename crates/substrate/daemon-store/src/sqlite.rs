@@ -1693,6 +1693,7 @@ impl SessionStore for SqliteStore {
                 transport: row.get::<_, String>(0)?,
                 enabled: row.get::<_, i64>(1)? != 0,
                 label: row.get::<_, Option<String>>(2)?,
+                settings: std::collections::BTreeMap::new(),
             })
         });
         match rows {
@@ -2608,6 +2609,69 @@ mod tests {
             store.custom_provider_remove("custom/a").await.unwrap();
             store.custom_provider_remove("custom/a").await.unwrap();
             assert_eq!(sorted(store).await, vec![b]);
+        }
+        check(&crate::InMemoryStore::new()).await;
+        check(&SqliteStore::open_in_memory().expect("open")).await;
+    }
+
+    /// The per-transport NON-SECRET settings map (wire vNEXT) round-trips identically on both
+    /// backends, rides the SAME `transport_prefs` row the enabled/label ops use (no cross-field
+    /// clobbering in either direction), and a whole-map re-set replaces the previous map.
+    #[tokio::test]
+    async fn transport_settings_round_trip_mem_and_sqlite() {
+        async fn check(store: &dyn SessionStore) {
+            // A store with no row reports no prefs at all.
+            assert!(store.transport_prefs().await.is_empty());
+
+            let mut settings = std::collections::BTreeMap::new();
+            settings.insert("server".to_string(), "hs.example.org".to_string());
+            settings.insert("nick".to_string(), "daemon-bot".to_string());
+            store
+                .set_transport_settings("mock/acct", &settings)
+                .await
+                .unwrap();
+            let prefs = store.transport_prefs().await;
+            assert_eq!(prefs.len(), 1);
+            assert_eq!(prefs[0].transport, "mock/acct");
+            assert_eq!(prefs[0].settings, settings, "settings map read-back");
+            assert!(prefs[0].enabled, "a fresh row defaults to enabled");
+            assert_eq!(prefs[0].label, None, "a fresh row has no label");
+
+            // The settings upsert preserves label/enabled set through their own ops...
+            store
+                .set_transport_label("mock/acct", Some("My Mock".into()))
+                .await
+                .unwrap();
+            store
+                .set_transport_enabled("mock/acct", false)
+                .await
+                .unwrap();
+            let mut replaced = std::collections::BTreeMap::new();
+            replaced.insert("server".to_string(), "hs2.example.org".to_string());
+            store
+                .set_transport_settings("mock/acct", &replaced)
+                .await
+                .unwrap();
+            let prefs = store.transport_prefs().await;
+            assert_eq!(prefs.len(), 1, "one row carries all three preferences");
+            assert_eq!(
+                prefs[0].settings, replaced,
+                "a re-set replaces the whole map (the caller passes the merged map)"
+            );
+            assert_eq!(prefs[0].label.as_deref(), Some("My Mock"), "label kept");
+            assert!(!prefs[0].enabled, "enabled kept");
+
+            // ...and the label/enabled upserts preserve the settings map in return.
+            store.set_transport_label("mock/acct", None).await.unwrap();
+            store
+                .set_transport_enabled("mock/acct", true)
+                .await
+                .unwrap();
+            let prefs = store.transport_prefs().await;
+            assert_eq!(
+                prefs[0].settings, replaced,
+                "label/enabled writes leave the settings column alone"
+            );
         }
         check(&crate::InMemoryStore::new()).await;
         check(&SqliteStore::open_in_memory().expect("open")).await;

@@ -26,7 +26,7 @@ use daemon_common::{
     ProfileRef, SessionId, SnapshotBlob, UsageDelta,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 #[cfg(feature = "sqlite")]
@@ -279,6 +279,11 @@ pub struct TransportPref {
     pub enabled: bool,
     /// The operator-set human label/rename (`None` = no custom label).
     pub label: Option<String>,
+    /// The persisted per-instance NON-SECRET account-settings values (wire vNEXT), keyed by the
+    /// adapter's `account_schema` field keys. Plain strings, so the store stays protocol-free.
+    /// SECURITY INVARIANT: secrets never land here — they go to the credential store via the
+    /// auth flows; this map holds only non-secret configuration.
+    pub settings: BTreeMap<String, String>,
 }
 
 /// A durable manually-registered foreign-agent catalog entry (I7): the operator-persisted half of
@@ -1202,6 +1207,19 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// Upsert a transport instance's persisted NON-SECRET account-settings values (wire vNEXT),
+    /// preserving its enabled state and label. The caller (the node's `transport_configure`)
+    /// passes the already-MERGED effective map, so this is a whole-map replace of the `settings`
+    /// column on the same prefs row the enabled/label ops use. Secrets never ride this call —
+    /// they belong to the credential store. Default: no-op.
+    async fn set_transport_settings(
+        &self,
+        _transport: &str,
+        _settings: &BTreeMap<String, String>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// List every persisted credential/account human label (wire v35) as `(profile, label)` pairs.
     /// The node overlays these onto `credential_list()`. Default: none (a store without the labels
     /// table — every credential then renders with no custom label). Backs the app's AccountsPage
@@ -1574,9 +1592,11 @@ struct Inner {
     /// Node-wide tool enable/disable overrides (wire v30), keyed by tool name (the in-memory
     /// analogue of the SQLite `tool_overrides` table).
     tool_overrides: HashMap<String, bool>,
-    /// Per-transport-instance preferences (wire v35): desired enabled state + optional label,
-    /// keyed by transport id (the in-memory analogue of the SQLite `transport_prefs` table).
-    transport_prefs: HashMap<String, (bool, Option<String>)>,
+    /// Per-transport-instance preferences (wire v35 + vNEXT): desired enabled state + optional
+    /// label + non-secret settings values, keyed by transport id (the in-memory analogue of the
+    /// SQLite `transport_prefs` table).
+    #[allow(clippy::type_complexity)]
+    transport_prefs: HashMap<String, (bool, Option<String>, BTreeMap<String, String>)>,
     /// Per-credential/account human labels (wire v35), keyed by profile (the in-memory analogue of
     /// the SQLite `credential_labels` table).
     credential_labels: HashMap<String, String>,
@@ -2231,10 +2251,11 @@ impl SessionStore for InMemoryStore {
             .unwrap()
             .transport_prefs
             .iter()
-            .map(|(transport, (enabled, label))| TransportPref {
+            .map(|(transport, (enabled, label, settings))| TransportPref {
                 transport: transport.clone(),
                 enabled: *enabled,
                 label: label.clone(),
+                settings: settings.clone(),
             })
             .collect()
     }
@@ -2248,7 +2269,7 @@ impl SessionStore for InMemoryStore {
         let entry = inner
             .transport_prefs
             .entry(transport.to_string())
-            .or_insert((true, None));
+            .or_insert((true, None, BTreeMap::new()));
         entry.0 = enabled;
         Ok(())
     }
@@ -2262,7 +2283,7 @@ impl SessionStore for InMemoryStore {
         let entry = inner
             .transport_prefs
             .entry(transport.to_string())
-            .or_insert((true, None));
+            .or_insert((true, None, BTreeMap::new()));
         entry.1 = label;
         Ok(())
     }

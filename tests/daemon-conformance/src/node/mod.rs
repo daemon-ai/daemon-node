@@ -47,6 +47,7 @@ mod semantic_search;
 mod session_recall;
 mod sessions;
 mod tools_hitl;
+mod transport_configure;
 mod tree_roster;
 mod web_serve;
 mod wire_client;

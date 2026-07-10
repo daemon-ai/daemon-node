@@ -2385,6 +2385,7 @@ dependencies = [
  "daemon-acp",
  "daemon-activation",
  "daemon-api",
+ "daemon-api-testkit",
  "daemon-auth",
  "daemon-common",
  "daemon-core",
