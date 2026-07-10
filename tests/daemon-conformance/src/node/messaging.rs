@@ -644,7 +644,7 @@ async fn messaging_adapter_roster_manage_over_socket() {
         .unwrap()
     {
         ApiResponse::EventsPage(page) => page.events.iter().any(|e| {
-            matches!(e, NodeEvent::ContactsChanged { transport: t } if t.as_str() == "rostmock")
+            matches!(e, NodeEvent::ContactsChanged { transport: t, .. } if t.as_str() == "rostmock")
         }),
         other => panic!("expected EventsPage, got {other:?}"),
     };
@@ -830,7 +830,7 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
         .unwrap()
     {
         ApiResponse::EventsPage(page) => page.events.iter().any(
-            |e| matches!(e, NodeEvent::ContactsChanged { transport: t } if t.as_str() == "room"),
+            |e| matches!(e, NodeEvent::ContactsChanged { transport: t, .. } if t.as_str() == "room"),
         ),
         other => panic!("expected EventsPage, got {other:?}"),
     };

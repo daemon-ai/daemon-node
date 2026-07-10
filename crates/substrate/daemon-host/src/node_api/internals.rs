@@ -181,6 +181,9 @@ impl MergedLog {
 pub struct NodeEventFeed {
     inner: Mutex<NodeFeedInner>,
     tx: broadcast::Sender<NodeFeedEntry>,
+    /// This feed's generation (rung 1), minted from [`FEED_EPOCH_SEQ`] at construction and stamped
+    /// onto every [`EventsPage`].
+    epoch: u64,
 }
 
 #[derive(Clone)]
@@ -210,7 +213,31 @@ pub(crate) struct NodeFeedInner {
     /// The monotonic profiles revision (Phase 3): bumped on every profile author/edit/delete and
     /// stamped onto `ProfilesChanged` (its coalescing key; the client re-fetches the profile list).
     profiles_rev: u64,
+    /// The monotonic persons revision (rung 1): bumped on every person-registry mutation and stamped
+    /// onto `PersonsChanged` AND echoed by `PersonList`, so the two agree on the reflected generation.
+    /// In-memory — resets to 0 on restart (a stale client rev degrades to a full read).
+    persons_rev: u64,
+    /// The monotonic notifications revision (rung 1): bumped on every notification-set mutation and
+    /// stamped onto `NotificationsChanged` + echoed by `NotificationList`.
+    notifications_rev: u64,
+    /// The monotonic installed-model catalog revision (rung 1): bumped on every catalog change and
+    /// stamped onto `CatalogChanged` (its coalescing key). No response echo in rung 1.
+    catalog_rev: u64,
+    /// Per-transport contact-roster revisions (rung 1): bumped on `ContactsChanged` and echoed by
+    /// `RosterList`'s `contact-page`. Keyed by the instance-qualified transport id.
+    contacts_rev: HashMap<TransportId, u64>,
+    /// Per-transport conversation-set revisions (rung 1): bumped on `ConversationsChanged` and echoed
+    /// by `ConvList`'s `conv-page`. Keyed by the instance-qualified transport id.
+    conversations_rev: HashMap<TransportId, u64>,
 }
+
+/// Process-global startup counter minting each feed's `epoch` (rung 1). Monotonic from 1 per
+/// [`NodeEventFeed`] constructed in this process, so two feeds (a simulated restart over a shared
+/// store) get distinct epochs — the property a client uses to tell "new feed generation" from "ring
+/// overflow". In-memory: a real process restart resets the sequence (the accepted durability
+/// caveat, 06G1) — the epoch only needs to be *distinguishable* from the client's stored value to
+/// force a deliberate re-baseline.
+static FEED_EPOCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl NodeEventFeed {
     pub fn new(capacity: usize) -> Arc<Self> {
@@ -223,8 +250,14 @@ impl NodeEventFeed {
                 removed: VecDeque::new(),
                 fleet_rev: 0,
                 profiles_rev: 0,
+                persons_rev: 0,
+                notifications_rev: 0,
+                catalog_rev: 0,
+                contacts_rev: HashMap::new(),
+                conversations_rev: HashMap::new(),
             }),
             tx,
+            epoch: FEED_EPOCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -288,6 +321,95 @@ impl NodeEventFeed {
         g.profiles_rev
     }
 
+    /// Bump the persons revision and return it (rung 1). The person-registry emit hook calls this
+    /// then stamps the returned `rev` onto a `PersonsChanged`, and `PersonList` echoes the current
+    /// value, so a burst of person writes collapses to one skip-if-unchanged decision client-side.
+    pub(crate) fn note_persons_change(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        // RED stub: not yet incremented (GREEN adds `g.persons_rev += 1`). Kept 0 so the emit-site
+        // and response-echo tests fail until the behavioral core lands.
+        g.persons_rev
+    }
+
+    /// The current persons revision (echoed on every `PersonList` response, rung 1).
+    pub(crate) fn persons_rev(&self) -> u64 {
+        self.inner.lock().unwrap().persons_rev
+    }
+
+    /// Bump the notifications revision and return it (rung 1).
+    pub(crate) fn note_notifications_change(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        // RED stub (GREEN adds `g.notifications_rev += 1`).
+        g.notifications_rev
+    }
+
+    /// The current notifications revision (echoed on every `NotificationList` response, rung 1).
+    pub(crate) fn notifications_rev(&self) -> u64 {
+        self.inner.lock().unwrap().notifications_rev
+    }
+
+    /// Bump the installed-model catalog revision and return it (rung 1). Called from the node crate's
+    /// catalog-changed sink, so it is `pub`.
+    pub fn note_catalog_change(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        // RED stub (GREEN adds `g.catalog_rev += 1`).
+        g.catalog_rev
+    }
+
+    /// Bump a transport's contact-roster revision and return it (rung 1).
+    pub(crate) fn note_contacts_change(&self, transport: &TransportId) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        let entry = g.contacts_rev.entry(transport.clone()).or_insert(0);
+        // RED stub (GREEN adds `*entry += 1`).
+        *entry
+    }
+
+    /// The current contact-roster revision for `transport` (echoed on `RosterList`, rung 1).
+    pub(crate) fn contacts_rev(&self, transport: &TransportId) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .contacts_rev
+            .get(transport)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Bump a transport's conversation-set revision and return it (rung 1).
+    pub(crate) fn note_conversations_change(&self, transport: &TransportId) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        let entry = g.conversations_rev.entry(transport.clone()).or_insert(0);
+        // RED stub (GREEN adds `*entry += 1`).
+        *entry
+    }
+
+    /// The current conversation-set revision for `transport` (echoed on `ConvList`, rung 1).
+    pub(crate) fn conversations_rev(&self, transport: &TransportId) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .conversations_rev
+            .get(transport)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The current fleet revision (echoed on every `Tree` response as `tree-report.rev`, rung 1).
+    pub(crate) fn fleet_rev(&self) -> u64 {
+        self.inner.lock().unwrap().fleet_rev
+    }
+
+    /// This feed's generation (rung 1), stamped onto every [`EventsPage`].
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The `epoch` value to stamp onto an outgoing [`EventsPage`] (rung 1). RED stub returns `None`
+    /// (GREEN returns `Some(self.epoch)`), so the epoch tests fail until the behavioral core lands.
+    fn stamp_epoch(&self) -> Option<u64> {
+        None
+    }
+
     /// Assign a cursor, retain in the bounded ring, and broadcast live. Consecutive
     /// `SessionAdvanced` for the same session are coalesced in the *backlog* (latest wins) so a
     /// reconnecting reader isn't flooded; the live broadcast still fires per emit (the client
@@ -311,8 +433,9 @@ impl NodeEventFeed {
         }
         // CatalogChanged coalesces globally too (a refetch reads the whole installed-model
         // catalog), so a burst of installs/deletes is one client refetch.
-        if matches!(&event, NodeEvent::CatalogChanged) {
-            g.ring.coalesce(|e| matches!(e, NodeEvent::CatalogChanged));
+        if matches!(&event, NodeEvent::CatalogChanged { .. }) {
+            g.ring
+                .coalesce(|e| matches!(e, NodeEvent::CatalogChanged { .. }));
         }
         // ProfilesChanged coalesces globally (a refetch reads the whole profile list), so a burst of
         // profile writes is one client refetch. Floor-exempt: collapsing superseded pings loses no
@@ -339,6 +462,7 @@ impl NodeEventFeed {
                 }],
                 next_cursor: head_cursor,
                 head_cursor,
+                epoch: self.stamp_epoch(),
             };
         }
         let mut events = Vec::new();
@@ -351,6 +475,7 @@ impl NodeEventFeed {
             events,
             next_cursor: next,
             head_cursor,
+            epoch: self.stamp_epoch(),
         }
     }
 
@@ -359,6 +484,8 @@ impl NodeEventFeed {
     pub(crate) fn subscribe(&self, after_cursor: u64) -> NodeEventStream {
         let g = self.inner.lock().unwrap();
         let head_cursor = g.ring.head();
+        // Capture the generation once so the (self-less, 'static) live closure can stamp it too.
+        let epoch = self.stamp_epoch();
         let mut backlog: Vec<EventsPage> = Vec::new();
         if g.ring.lagged(after_cursor) {
             backlog.push(EventsPage {
@@ -367,6 +494,7 @@ impl NodeEventFeed {
                 }],
                 next_cursor: head_cursor,
                 head_cursor,
+                epoch,
             });
         } else {
             for (cursor, event) in g.ring.page(after_cursor, 0) {
@@ -374,16 +502,18 @@ impl NodeEventFeed {
                     events: vec![event],
                     next_cursor: cursor,
                     head_cursor,
+                    epoch,
                 });
             }
         }
         let rx = self.tx.subscribe();
         drop(g);
-        let live = BroadcastStream::new(rx).map(|r| match r {
+        let live = BroadcastStream::new(rx).map(move |r| match r {
             Ok(entry) => EventsPage {
                 events: vec![entry.event],
                 next_cursor: entry.cursor,
                 head_cursor: entry.cursor,
+                epoch,
             },
             Err(BroadcastStreamRecvError::Lagged(_)) => EventsPage {
                 events: vec![NodeEvent::ResyncNeeded {
@@ -391,6 +521,7 @@ impl NodeEventFeed {
                 }],
                 next_cursor: 0,
                 head_cursor: 0,
+                epoch,
             },
         });
         stream::iter(backlog).chain(live).boxed()
@@ -1878,6 +2009,70 @@ mod node_feed_tests {
             live.events.as_slice(),
             [NodeEvent::ApprovalPending { .. }]
         ));
+    }
+
+    // ---- rung 1 (per-collection revisions + feed epoch, api vNEXT) ----
+
+    /// The global per-collection counters (persons / notifications / catalog) are monotonic and bump
+    /// exactly once per `note_*` call — the coalescing rev a client compares to skip a refetch.
+    #[test]
+    pub(crate) fn global_collection_revs_are_monotonic_and_bump_once() {
+        let feed = NodeEventFeed::new(64);
+        assert_eq!(feed.note_persons_change(), 1);
+        assert_eq!(feed.note_persons_change(), 2);
+        assert_eq!(feed.persons_rev(), 2, "persons_rev echoes the last bump");
+        assert_eq!(feed.note_notifications_change(), 1);
+        assert_eq!(feed.note_notifications_change(), 2);
+        assert_eq!(feed.notifications_rev(), 2);
+        assert_eq!(feed.note_catalog_change(), 1);
+        assert_eq!(feed.note_catalog_change(), 2);
+        // The counters are independent (a persons bump never moves notifications/catalog).
+        assert_eq!(feed.persons_rev(), 2);
+        assert_eq!(feed.notifications_rev(), 2);
+    }
+
+    /// The contacts / conversations counters are per transport: bumping one instance never advances
+    /// another, and each is monotonic.
+    #[test]
+    pub(crate) fn contacts_and_conversations_revs_are_per_transport() {
+        let feed = NodeEventFeed::new(64);
+        let a = TransportId::new("matrix/@me:hs.org");
+        let b = TransportId::new("room");
+
+        assert_eq!(feed.note_contacts_change(&a), 1);
+        assert_eq!(feed.note_contacts_change(&a), 2);
+        assert_eq!(feed.note_contacts_change(&b), 1, "b is independent of a");
+        assert_eq!(feed.contacts_rev(&a), 2);
+        assert_eq!(feed.contacts_rev(&b), 1);
+
+        assert_eq!(feed.note_conversations_change(&a), 1);
+        assert_eq!(
+            feed.conversations_rev(&a),
+            1,
+            "conversations rev is independent of contacts rev"
+        );
+        assert_eq!(feed.contacts_rev(&a), 2, "still 2 — untouched by conv bump");
+        // An unseen transport reads 0 (a stale client rev then degrades to a full read).
+        assert_eq!(feed.conversations_rev(&b), 0);
+    }
+
+    /// The feed epoch (rung 1) is stamped onto every emitted `EventsPage`, and a simulated restart
+    /// (a fresh feed over the same store) mints a distinct epoch — the signal a client uses to tell
+    /// "new feed generation" from "ring overflow".
+    #[test]
+    pub(crate) fn feed_epoch_is_stamped_on_pages_and_differs_across_restarts() {
+        let first = NodeEventFeed::new(64);
+        let second = NodeEventFeed::new(64); // simulated restart
+
+        let e1 = first.page(0, 0).epoch;
+        let e2 = second.page(0, 0).epoch;
+        assert!(e1.is_some(), "every page must carry the feed epoch");
+        assert!(e2.is_some());
+        assert_eq!(e1, Some(first.epoch()), "the page echoes the feed's epoch");
+        assert_ne!(
+            e1, e2,
+            "a restart (fresh feed) must mint a distinct epoch so a stale cursor re-baselines"
+        );
     }
 
     /// The background title generator replaces only an unset or still-seeded title: a user rename

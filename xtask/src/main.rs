@@ -566,7 +566,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     write_cbor(
         &out,
         "response-conv-list.cbor",
-        &ApiResponse::Conversations(daemon_api::WirePage {
+        &ApiResponse::Conversations(daemon_api::ConvPage {
             items: vec![daemon_api::ConversationInfo {
                 transport: daemon_protocol::TransportId::new("rooms"),
                 id: "conv-064".into(),
@@ -578,6 +578,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 parent: None,
             }],
             next: Some("conv-064".into()),
+            // rung 1 (api vNEXT): the transport's conversation-set rev the client compares against
+            // the `ConversationsChanged.rev` pointer.
+            rev: 8,
         }),
     )?;
     // Conversation hierarchy (wire v38): a structural `Space` container (a root — no `parent`) and
@@ -586,7 +589,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     write_cbor(
         &out,
         "response-conv-hierarchy.cbor",
-        &ApiResponse::Conversations(daemon_api::WirePage {
+        &ApiResponse::Conversations(daemon_api::ConvPage {
             items: vec![
                 daemon_api::ConversationInfo {
                     transport: daemon_protocol::TransportId::new("matrix/@me:hs.org"),
@@ -610,6 +613,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 },
             ],
             next: None,
+            rev: 2,
         }),
     )?;
     // Server-side roster (wire v34): a paged list request + resume, the mutation requests carrying a
@@ -652,7 +656,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     write_cbor(
         &out,
         "response-contact-page.cbor",
-        &ApiResponse::ContactPage(daemon_api::WirePage {
+        &ApiResponse::ContactPage(daemon_api::ContactPage {
             items: vec![daemon_api::ContactInfo {
                 id: "@bob:matrix.org".into(),
                 display_name: Some("Bob".into()),
@@ -660,6 +664,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 permission: daemon_api::ContactPermission::Allow,
             }],
             next: Some("@bob:matrix.org".into()),
+            // rung 1 (api vNEXT): the transport's contact-roster rev (vs `ContactsChanged.rev`).
+            rev: 5,
         }),
     )?;
     // Notifications (wire v37; port-notify): the read-only list op + a response carrying an
@@ -692,7 +698,12 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     write_cbor(
         &out,
         "response-notifications.cbor",
-        &ApiResponse::Notifications(vec![notif_authz, notif_conn]),
+        &ApiResponse::Notifications(daemon_api::RevList {
+            // rung 1 (api vNEXT): the notifications rev the client compares against
+            // `NotificationsChanged.rev` to skip an unchanged re-list.
+            rev: 4,
+            items: vec![notif_authz, notif_conn],
+        }),
     )?;
     // Persons / metacontacts (wire v37; port-person): the read-only list op + a response carrying
     // an aliased, avatared, multi-endpoint person, so verify-codec proves the generated zcbor C
@@ -701,33 +712,40 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     write_cbor(
         &out,
         "response-persons.cbor",
-        &ApiResponse::Persons(vec![daemon_api::Person {
-            id: "person-ada".into(),
-            alias: Some("Ada".into()),
-            avatar: Some(daemon_api::Image {
-                blob: daemon_common::BlobRef::new(daemon_common::ContentHash::new([7u8; 32]), 3),
-            }),
-            endpoints: vec![
-                daemon_api::PersonEndpoint::new(
-                    TransportId::new("matrix/@me:hs.org"),
-                    daemon_api::ContactInfo {
-                        id: "@ada:hs.org".into(),
-                        display_name: Some("Ada L.".into()),
-                        presence: daemon_api::Presence::default(),
-                        permission: daemon_api::ContactPermission::Allow,
-                    },
-                ),
-                daemon_api::PersonEndpoint::new(
-                    TransportId::new("discord/bot"),
-                    daemon_api::ContactInfo {
-                        id: "ada#1234".into(),
-                        display_name: None,
-                        presence: daemon_api::Presence::default(),
-                        permission: daemon_api::ContactPermission::Unset,
-                    },
-                ),
-            ],
-        }]),
+        &ApiResponse::Persons(daemon_api::RevList {
+            // rung 1 (api vNEXT): the persons rev the client compares against `PersonsChanged.rev`.
+            rev: 6,
+            items: vec![daemon_api::Person {
+                id: "person-ada".into(),
+                alias: Some("Ada".into()),
+                avatar: Some(daemon_api::Image {
+                    blob: daemon_common::BlobRef::new(
+                        daemon_common::ContentHash::new([7u8; 32]),
+                        3,
+                    ),
+                }),
+                endpoints: vec![
+                    daemon_api::PersonEndpoint::new(
+                        TransportId::new("matrix/@me:hs.org"),
+                        daemon_api::ContactInfo {
+                            id: "@ada:hs.org".into(),
+                            display_name: Some("Ada L.".into()),
+                            presence: daemon_api::Presence::default(),
+                            permission: daemon_api::ContactPermission::Allow,
+                        },
+                    ),
+                    daemon_api::PersonEndpoint::new(
+                        TransportId::new("discord/bot"),
+                        daemon_api::ContactInfo {
+                            id: "ada#1234".into(),
+                            display_name: None,
+                            presence: daemon_api::Presence::default(),
+                            permission: daemon_api::ContactPermission::Unset,
+                        },
+                    ),
+                ],
+            }],
+        }),
     )?;
     // Account management (wire v35): the reversible-connect + persisted enabled/label + credential
     // rename requests, so verify-codec proves the generated zcbor C decoder accepts all four new
@@ -1367,7 +1385,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     downloaded_bytes: 46_000_000,
                     total_bytes: 92_000_000,
                 },
-                NodeEvent::CatalogChanged,
+                NodeEvent::CatalogChanged { rev: 2 },
                 // v29: the presence-push event, so verify-codec proves the generated decoder
                 // accepts the new node-event arm + the connection/presence enums it carries.
                 NodeEvent::TransportChanged {
@@ -1393,6 +1411,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     transport: TransportId::new("matrix/@bot:hs.org"),
                     conv: "!room:hs.org".into(),
                     change: ConvChange::Added,
+                    // rung 1 (api vNEXT): the per-transport conversation-set rev.
+                    rev: 2,
                 },
                 NodeEvent::MembershipChanged {
                     transport: TransportId::new("matrix/@bot:hs.org"),
@@ -1407,11 +1427,13 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 // accepts the new node-event arm.
                 NodeEvent::ContactsChanged {
                     transport: TransportId::new("matrix/@bot:hs.org"),
+                    // rung 1 (api vNEXT): the per-transport contact-roster rev.
+                    rev: 5,
                 },
-                // wire v37: the payload-free notifications-changed pointer (port-notify).
-                NodeEvent::NotificationsChanged,
-                // wire v37: the payload-free persons-changed pointer (port-person).
-                NodeEvent::PersonsChanged,
+                // wire v37 + rung 1 (api vNEXT): the notifications-changed pointer with its rev.
+                NodeEvent::NotificationsChanged { rev: 4 },
+                // wire v37 + rung 1 (api vNEXT): the persons-changed pointer with its rev.
+                NodeEvent::PersonsChanged { rev: 6 },
                 // wire v38: the per-message conversation-history pointer (chat journal), so
                 // verify-codec proves the generated decoder accepts the new node-event arm.
                 NodeEvent::MessagesChanged {
@@ -1421,6 +1443,21 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             ],
             next_cursor: 13,
             head_cursor: 13,
+            // rung 1 (api vNEXT): the feed generation stamped on every page.
+            epoch: Some(1),
+        }),
+    )?;
+    // Tree report (rung 1, api vNEXT): the fleet-rev echo `tree-report.rev` (of `FleetChanged.rev`),
+    // so verify-codec proves the generated zcbor C decoder accepts the additive `rev` member. An
+    // empty node list keeps the fixture deterministic while exercising the new field + null root.
+    write_cbor(
+        &out,
+        "response-tree.cbor",
+        &ApiResponse::Tree(daemon_api::TreeReport {
+            root: None,
+            nodes: Vec::new(),
+            next: None,
+            rev: 9,
         }),
     )?;
     write_cbor(

@@ -63,7 +63,10 @@ impl NodeApiImpl {
     /// polling. A payload-free-per-transport invalidation pointer, mirroring `conversations_changed`.
     pub(crate) fn emit_contacts_changed(&self, transport: TransportId) {
         if let Some(feed) = self.node_feed() {
-            feed.emit(NodeEvent::ContactsChanged { transport });
+            // rung 1: bump the per-transport contact-roster rev (exactly once per emit) and stamp it
+            // so `RosterList`'s echoed rev and this pointer agree on the reflected generation.
+            let rev = feed.note_contacts_change(&transport);
+            feed.emit(NodeEvent::ContactsChanged { transport, rev });
         }
     }
 
@@ -72,7 +75,9 @@ impl NodeApiImpl {
     /// `CatalogChanged`: the whole list is cheap to refetch, so the event carries no detail.
     pub(crate) fn emit_notifications_changed(&self) {
         if let Some(feed) = self.node_feed() {
-            feed.emit(NodeEvent::NotificationsChanged);
+            // rung 1: bump the notifications rev (once per emit) and stamp it (echoed by `NotificationList`).
+            let rev = feed.note_notifications_change();
+            feed.emit(NodeEvent::NotificationsChanged { rev });
         }
     }
 
@@ -122,7 +127,9 @@ impl NodeApiImpl {
     /// cheap to refetch, so the event carries no detail.
     pub(crate) fn emit_persons_changed(&self) {
         if let Some(feed) = self.node_feed() {
-            feed.emit(NodeEvent::PersonsChanged);
+            // rung 1: bump the persons rev (once per emit) and stamp it (echoed by `PersonList`).
+            let rev = feed.note_persons_change();
+            feed.emit(NodeEvent::PersonsChanged { rev });
         }
     }
 
@@ -232,10 +239,14 @@ impl LifecycleSink for NodeApiImpl {
         change: ConvChange,
     ) {
         if let Some(feed) = self.node_feed() {
+            // rung 1: bump the per-transport conversation-set rev (once per emit) and stamp it so
+            // `ConvList`'s echoed rev and this pointer agree on the reflected generation.
+            let rev = feed.note_conversations_change(&transport);
             feed.emit(NodeEvent::ConversationsChanged {
                 transport,
                 conv,
                 change,
+                rev,
             });
         }
     }

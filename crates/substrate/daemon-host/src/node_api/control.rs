@@ -824,6 +824,10 @@ impl ControlApi for NodeApiImpl {
         );
         report.nodes = page.items;
         report.next = page.next;
+        // rung 1: echo the fleet rev (the coalescing `FleetChanged.rev`) so the client closes the
+        // compare loop and skips a `Tree` refetch when unchanged.
+        // RED stub: 0 (GREEN reads `self.node_feed().map(|f| f.fleet_rev()).unwrap_or(0)`).
+        report.rev = 0;
         report
     }
 
@@ -1324,18 +1328,30 @@ impl ControlApi for NodeApiImpl {
         &self,
         transport: TransportId,
         after: Option<String>,
-    ) -> daemon_api::WirePage<ConversationInfo> {
+    ) -> daemon_api::ConvPage {
         // The adapters return unbounded, adapter-ordered listings; sort + page here (once) rather
         // than teaching every `SupportsConversations` impl the cursor. The cursor is the
         // conversation id.
         let mut convs = match self.conversations_for(&transport) {
-            Ok(c) => c.list(transport).await,
+            Ok(c) => c.list(transport.clone()).await,
             Err(_) => Vec::new(),
         };
         convs.sort_by(|a, b| a.id.cmp(&b.id));
-        daemon_api::paginate(convs, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
+        let page = daemon_api::paginate(convs, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
             c.id.clone()
-        })
+        });
+        // rung 1: echo the transport's conversation-set rev so the client can skip-if-unchanged
+        // against the `ConversationsChanged.rev` pointer. Read after building the page so it is at
+        // least as fresh as the returned items.
+        let rev = self
+            .node_feed()
+            .map(|f| f.conversations_rev(&transport))
+            .unwrap_or(0);
+        daemon_api::ConvPage {
+            items: page.items,
+            next: page.next,
+            rev,
+        }
     }
 
     async fn conv_get(&self, transport: TransportId, conv: String) -> Option<ConversationInfo> {
@@ -1630,32 +1646,49 @@ impl ControlApi for NodeApiImpl {
         &self,
         transport: TransportId,
         after: Option<String>,
-    ) -> daemon_api::WirePage<ContactInfo> {
+    ) -> daemon_api::ContactPage {
         // The adapter returns the unbounded, adapter-ordered roster; sort + page here (once) rather
         // than teaching every `SupportsRoster` impl the cursor. The cursor is the contact id
         // (mirrors `conv_list`).
         let mut contacts = match self.roster_for(&transport) {
-            Ok(r) => r.list(transport).await,
+            Ok(r) => r.list(transport.clone()).await,
             Err(_) => Vec::new(),
         };
         contacts.sort_by(|a, b| a.id.cmp(&b.id));
-        daemon_api::paginate(contacts, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
-            c.id.clone()
-        })
+        let page =
+            daemon_api::paginate(contacts, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
+                c.id.clone()
+            });
+        // rung 1: echo the transport's contact-roster rev (skip-if-unchanged vs `ContactsChanged.rev`).
+        let rev = self
+            .node_feed()
+            .map(|f| f.contacts_rev(&transport))
+            .unwrap_or(0);
+        daemon_api::ContactPage {
+            items: page.items,
+            next: page.next,
+            rev,
+        }
     }
 
-    async fn notification_list(&self) -> Vec<daemon_api::NotificationInfo> {
+    async fn notification_list(&self) -> daemon_api::RevList<daemon_api::NotificationInfo> {
         // The node-authoritative notification list (wire v37), newest first — a snapshot of the
         // node's `NotificationManager` (ported from libpurple's `PurpleNotificationManager`).
-        // Clients re-list on a `NotificationsChanged` pointer.
-        self.notifications_snapshot()
+        // Clients re-list on a `NotificationsChanged` pointer; rung 1 echoes the notifications rev
+        // so they can skip an unchanged re-list.
+        let items = self.notifications_snapshot();
+        let rev = self.node_feed().map(|f| f.notifications_rev()).unwrap_or(0);
+        daemon_api::RevList { rev, items }
     }
 
-    async fn person_list(&self) -> Vec<daemon_api::Person> {
+    async fn person_list(&self) -> daemon_api::RevList<daemon_api::Person> {
         // The node-authoritative person/metacontact registry (wire v37), insertion order — a
         // snapshot of the node's `PersonManager` (ported from the person half of libpurple's
-        // `PurpleContactManager`). Clients re-list on a `PersonsChanged` pointer.
-        self.persons_snapshot()
+        // `PurpleContactManager`). Clients re-list on a `PersonsChanged` pointer; rung 1 echoes the
+        // persons rev so they can skip an unchanged re-list.
+        let items = self.persons_snapshot();
+        let rev = self.node_feed().map(|f| f.persons_rev()).unwrap_or(0);
+        daemon_api::RevList { rev, items }
     }
 
     async fn roster_add(

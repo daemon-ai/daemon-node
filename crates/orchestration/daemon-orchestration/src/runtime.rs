@@ -423,12 +423,16 @@ impl FleetRuntime {
                     // The full (unpaged) projection: the wire `ControlApi::tree` handler slices it
                     // into cursor pages; in-process consumers (the fleet bus) take it whole.
                     next: None,
+                    // rung 1: the wire handler stamps the authoritative fleet-rev echo; this
+                    // lower-level projection leaves it 0.
+                    rev: 0,
                 }
             }
             None => TreeReport {
                 root: None,
                 nodes,
                 next: None,
+                rev: 0,
             },
         }
     }
