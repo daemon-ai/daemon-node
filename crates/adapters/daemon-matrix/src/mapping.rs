@@ -113,4 +113,32 @@ mod tests {
         assert_eq!(role_from_matrix(RoomMemberRole::Moderator), MemberRole::Op);
         assert_eq!(role_from_matrix(RoomMemberRole::User), MemberRole::None);
     }
+
+    /// N4 (wire vNEXT): the pure room-type projection. An `m.space` room is a structural
+    /// [`ConversationType::Space`] container regardless of any DM heuristic; a direct room is a
+    /// [`ConversationType::Dm`]; every other room is a [`ConversationType::Channel`].
+    #[test]
+    fn conversation_kind_projects_space_dm_channel() {
+        assert_eq!(conversation_kind(true, false), ConversationType::Space);
+        // `is_space` wins over `is_direct` — a space is a container, never a message DM.
+        assert_eq!(conversation_kind(true, true), ConversationType::Space);
+        assert_eq!(conversation_kind(false, true), ConversationType::Dm);
+        assert_eq!(conversation_kind(false, false), ConversationType::Channel);
+    }
+
+    /// N4 (wire vNEXT): `parent` is a single containing space, but Matrix permits multiple
+    /// `m.space.parent` relations, so the projection picks the lexicographically-lowest space id
+    /// (the spec's canonical-parent tie-break) for a deterministic result; no parents ⟹ `None`.
+    #[test]
+    fn parent_selection_is_deterministic() {
+        assert_eq!(select_parent(vec![]), None);
+        assert_eq!(
+            select_parent(vec!["!only:hs".into()]),
+            Some("!only:hs".into())
+        );
+        assert_eq!(
+            select_parent(vec!["!b:hs".into(), "!a:hs".into(), "!c:hs".into()]),
+            Some("!a:hs".into())
+        );
+    }
 }

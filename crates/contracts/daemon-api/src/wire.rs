@@ -2481,3 +2481,87 @@ mod auth_contract_tests {
         }
     }
 }
+
+/// N4 (wire vNEXT — conversation hierarchy): the additive `ConversationInfo.parent` field and the
+/// new `ConversationType::Space` variant that let a client render account → spaces → rooms trees.
+#[cfg(test)]
+mod conversation_hierarchy_tests {
+    use super::*;
+    use daemon_protocol::TransportId;
+
+    fn info(id: &str, kind: ConversationType, parent: Option<String>) -> ConversationInfo {
+        ConversationInfo {
+            transport: TransportId::new("matrix/@me:hs"),
+            id: id.into(),
+            kind,
+            title: None,
+            topic: None,
+            description: None,
+            members: Vec::new(),
+            parent,
+        }
+    }
+
+    /// wire vNEXT: a structural `Space` container and a child conversation carrying its containing
+    /// space as `parent` both round-trip through ciborium (as bare `ConversationInfo` and nested in
+    /// the `Conversations` page / `Conversation` response the projection actually emits).
+    #[test]
+    fn conversation_parent_and_space_round_trip() {
+        let space = info("!space:hs", ConversationType::Space, None);
+        let child = info(
+            "!room:hs",
+            ConversationType::Channel,
+            Some("!space:hs".into()),
+        );
+
+        for value in [space.clone(), child.clone()] {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&value, &mut bytes).expect("encode ConversationInfo");
+            let back: ConversationInfo = ciborium::from_reader(&bytes[..]).expect("decode");
+            assert_eq!(back, value);
+        }
+
+        // Standalone new variant round-trips (and is not confused with the pre-vNEXT variants).
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&ConversationType::Space, &mut bytes).expect("encode Space");
+        let back: ConversationType = ciborium::from_reader(&bytes[..]).expect("decode Space");
+        assert_eq!(back, ConversationType::Space);
+
+        // Nested in the wire responses that carry conversations.
+        let page = ApiResponse::Conversations(WirePage {
+            items: vec![space, child],
+            next: None,
+        });
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&page, &mut bytes).expect("encode Conversations page");
+        let decoded: ApiResponse = ciborium::from_reader(&bytes[..]).expect("decode page");
+        assert_eq!(decoded, page);
+    }
+
+    /// wire vNEXT backward-compat: a pre-vNEXT encoding WITHOUT `parent` (a peer that predates the
+    /// hierarchy field) still decodes, defaulting `parent` to `None` — the field is purely additive.
+    #[test]
+    fn conversation_without_parent_defaults_to_none() {
+        #[derive(serde::Serialize)]
+        struct LegacyInfo {
+            transport: TransportId,
+            id: String,
+            kind: ConversationType,
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &LegacyInfo {
+                transport: TransportId::new("matrix/@me:hs"),
+                id: "!room:hs".into(),
+                kind: ConversationType::Channel,
+            },
+            &mut bytes,
+        )
+        .expect("encode legacy conversation-info");
+        let back: ConversationInfo =
+            ciborium::from_reader(&bytes[..]).expect("decode legacy conversation-info");
+        assert_eq!(back.id, "!room:hs");
+        assert_eq!(back.kind, ConversationType::Channel);
+        assert_eq!(back.parent, None);
+    }
+}
