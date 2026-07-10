@@ -59,7 +59,7 @@ pub struct ConvSendArgs {
     pub from: Option<Participant>,
     /// The message.
     pub message: UserMsg,
-    /// Rung 3 (api vNEXT): the client-minted idempotency key (UUIDv7 by convention, treated as an
+    /// Rung 3 (api/39): the client-minted idempotency key (UUIDv7 by convention, treated as an
     /// opaque token). A retry reuses it; the node dedups on `(principal, op_id)` and stamps it as
     /// `origin_op` provenance on the resulting journal record + `MessagesChanged` pointer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,7 +78,7 @@ pub struct ConvHistoryArgs {
     /// `before_cursor` is present.
     #[serde(default)]
     pub after_cursor: u64,
-    /// Backward window (rung 2, api vNEXT): when `Some(B)`, return the `max` newest entries with
+    /// Backward window (rung 2, api/39): when `Some(B)`, return the `max` newest entries with
     /// `cursor < B` (newest-anchored; pass a value past head — e.g. `u64::MAX` — for the latest
     /// window in one round-trip). Wins over `after_cursor` when present. Absent on the wire when
     /// `None` (never null).
@@ -102,7 +102,7 @@ pub struct MemberInviteArgs {
     /// An optional invite message.
     #[serde(default)]
     pub message: Option<String>,
-    /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe double-invite guard).
+    /// Rung 3 (api/39): the client-minted idempotency key (retry-safe double-invite guard).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_id: Option<String>,
 }
@@ -120,7 +120,7 @@ pub struct MemberRemoveArgs {
     /// An optional reason.
     #[serde(default)]
     pub reason: Option<String>,
-    /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe double-kick guard).
+    /// Rung 3 (api/39): the client-minted idempotency key (retry-safe double-kick guard).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_id: Option<String>,
 }
@@ -138,7 +138,7 @@ pub struct MemberBanArgs {
     /// An optional reason.
     #[serde(default)]
     pub reason: Option<String>,
-    /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe double-ban guard).
+    /// Rung 3 (api/39): the client-minted idempotency key (retry-safe double-ban guard).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_id: Option<String>,
 }
@@ -155,7 +155,7 @@ pub struct MemberSetRoleArgs {
     pub who: Participant,
     /// The new role.
     pub role: MemberRole,
-    /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe role-set guard).
+    /// Rung 3 (api/39): the client-minted idempotency key (retry-safe role-set guard).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_id: Option<String>,
 }

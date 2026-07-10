@@ -1785,7 +1785,7 @@ pub struct TreeReport {
     /// The resume cursor when more nodes remain (`None` => last page).
     #[serde(default)]
     pub next: Option<String>,
-    /// The fleet revision this report reflects (rung 1, api vNEXT): an echo of the coalescing
+    /// The fleet revision this report reflects (rung 1, api/39): an echo of the coalescing
     /// `FleetChanged.rev` pointer, closing the compare loop so a client skips a `Tree` refetch when
     /// `rev` is unchanged. In-memory (a restart resets it -> full refetch). Stamped by the node at
     /// the api boundary; lower-level projections leave it 0.

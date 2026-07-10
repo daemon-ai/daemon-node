@@ -234,7 +234,7 @@ impl SupportsConversations for DemoAdapter {
             conv,
             from,
             message,
-            // rung 3 (api vNEXT): the opaque client op token. The demo adapter is the reference
+            // rung 3 (api/39): the opaque client op token. The demo adapter is the reference
             // provenance-CAPABLE adapter — it hands the token straight back on the outbound
             // lifecycle report so the node stamps `origin_op` on the journal record + pointer.
             // (The adapter never mints or interprets it — it round-trips it verbatim.)

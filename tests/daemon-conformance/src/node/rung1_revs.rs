@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Rung 1 (per-collection revisions + feed epoch, api vNEXT) end-to-end over the assembled node.
+//! Rung 1 (per-collection revisions + feed epoch, api/39) end-to-end over the assembled node.
 //!
 //! These prove the node-authoritative behavior the wire deltas add: a domain mutation bumps its
 //! collection's coalescing revision exactly once and the matching list response echoes it (so a

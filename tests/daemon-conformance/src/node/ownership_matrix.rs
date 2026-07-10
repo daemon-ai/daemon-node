@@ -449,7 +449,7 @@ fn classify(req: &ApiRequest) -> Coverage {
         // The notification list is node-wide (not per-owner session state): the coarse ControlRead
         // capability gate governs it (wire v37).
         NotificationList => NotSessionTouching,
-        // rung 3 (api vNEXT): the Bootstrap probe is node-wide (revs + cursor + epoch), not
+        // rung 3 (api/39): the Bootstrap probe is node-wide (revs + cursor + epoch), not
         // per-owner session state — the coarse ControlRead gate governs it.
         Bootstrap => NotSessionTouching,
         // The person/metacontact registry is node-wide (not per-owner session state): the coarse

@@ -51,7 +51,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
                     extras: values,
                     ..CreateConversationDetails::default()
                 },
-                // The CLI is a direct (non-outbox) client; it mints no op_id (rung 3, api vNEXT).
+                // The CLI is a direct (non-outbox) client; it mints no op_id (rung 3, api/39).
                 op_id: None,
             }
         }

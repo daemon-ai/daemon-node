@@ -71,7 +71,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ApprovalsPending { .. }
         | CheckpointList { .. }
         | EventsSince { .. }
-        // rung 3 (api vNEXT): the Bootstrap probe is a node-wide control-plane read (revs + cursor
+        // rung 3 (api/39): the Bootstrap probe is a node-wide control-plane read (revs + cursor
         // + epoch), the same tier as EventsSince — a cold client anchors its initial sync with it.
         | Bootstrap
         // The notification list is a node-wide control-plane read (wire v37).

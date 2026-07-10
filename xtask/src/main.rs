@@ -284,7 +284,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             max: 64,
         },
     )?;
-    // rung 2 (api vNEXT): the generalized backward windows — a forward SessionHistory resume
+    // rung 2 (api/39): the generalized backward windows — a forward SessionHistory resume
     // (before_cursor absent, never null) and the newest-anchored backward forms of all three
     // journal reads, so verify-codec proves the generated zcbor decoder accepts both shapes.
     write_cbor(
@@ -587,7 +587,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         }),
     )?;
     // Paged conv_list (wire v25): a resume request + a page with a set `next` cursor, proving the
-    // generated zcbor C decoder accepts the conv-page shape. rung 2 (api vNEXT): the request
+    // generated zcbor C decoder accepts the conv-page shape. rung 2 (api/39): the request
     // carries a `since_rev` delta anchor and the page carries `removed` tombstones.
     write_cbor(
         &out,
@@ -613,12 +613,12 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 parent: None,
             }],
             next: Some("conv-064".into()),
-            // rung 1 (api vNEXT): the transport's conversation-set rev the client compares against
+            // rung 1 (api/39): the transport's conversation-set rev the client compares against
             // the `ConversationsChanged.rev` pointer.
             rev: 8,
-            // rung 2 (api vNEXT): a delta read's removal tombstone (the client prunes it).
+            // rung 2 (api/39): a delta read's removal tombstone (the client prunes it).
             removed: vec!["conv-007".into()],
-            // rung 3 (api vNEXT): the page-side `origin_ops` map — the changed conversation's
+            // rung 3 (api/39): the page-side `origin_ops` map — the changed conversation's
             // latest reflected mutation carried this client op_id (carrier 2).
             origin_ops: [("conv-064".to_string(), "018f3b9c-op".to_string())]
                 .into_iter()
@@ -660,7 +660,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             origin_ops: std::collections::BTreeMap::new(),
         }),
     )?;
-    // rung 2 (api vNEXT): the ConvHistory backward window — `before_cursor` present (a scroll-back
+    // rung 2 (api/39): the ConvHistory backward window — `before_cursor` present (a scroll-back
     // fetch of the newest 64 records below an anchor), `after_cursor` at its default.
     write_cbor(
         &out,
@@ -673,7 +673,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             max: 64,
         }),
     )?;
-    // rung 3 (api vNEXT): a ConvSend carrying the client-minted op_id (the idempotency key + the
+    // rung 3 (api/39): a ConvSend carrying the client-minted op_id (the idempotency key + the
     // provenance token), so verify-codec proves the generated zcbor C decoder accepts the additive
     // `? op_id` member on conv-send-args.
     write_cbor(
@@ -687,7 +687,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             op_id: Some("018f3b9c-op".into()),
         }),
     )?;
-    // rung 3 (api vNEXT): the Bootstrap probe request + a response snapshot (revs + cursor +
+    // rung 3 (api/39): the Bootstrap probe request + a response snapshot (revs + cursor +
     // epoch), so verify-codec proves the generated decoder accepts the new request/response arms
     // and the `{ * tstr => uint64 }` revs map.
     write_cbor(&out, "request-bootstrap.cbor", &ApiRequest::Bootstrap)?;
@@ -717,7 +717,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &ApiRequest::RosterList {
             transport: TransportId::new("matrix/@me:hs.org"),
             after: Some("@aaa:matrix.org".into()),
-            // rung 2 (api vNEXT): the delta anchor (the contact-roster rev last reflected).
+            // rung 2 (api/39): the delta anchor (the contact-roster rev last reflected).
             since_rev: Some(5),
         },
     )?;
@@ -732,7 +732,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 presence: daemon_api::Presence::default(),
                 permission: daemon_api::ContactPermission::Allow,
             },
-            // rung 3 (api vNEXT): the client-minted idempotency key on a roster-edit lane verb.
+            // rung 3 (api/39): the client-minted idempotency key on a roster-edit lane verb.
             op_id: Some("018f3b9c-roster".into()),
         },
     )?;
@@ -747,7 +747,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 presence: daemon_api::Presence::default(),
                 permission: daemon_api::ContactPermission::Unset,
             },
-            // rung 3 (api vNEXT): a token-less roster edit (the `? op_id` absent form).
+            // rung 3 (api/39): a token-less roster edit (the `? op_id` absent form).
             op_id: None,
         },
     )?;
@@ -762,11 +762,11 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 permission: daemon_api::ContactPermission::Allow,
             }],
             next: Some("@bob:matrix.org".into()),
-            // rung 1 (api vNEXT): the transport's contact-roster rev (vs `ContactsChanged.rev`).
+            // rung 1 (api/39): the transport's contact-roster rev (vs `ContactsChanged.rev`).
             rev: 5,
-            // rung 2 (api vNEXT): a delta read's removal tombstone (the client prunes it).
+            // rung 2 (api/39): a delta read's removal tombstone (the client prunes it).
             removed: vec!["@gone:matrix.org".into()],
-            // rung 3 (api vNEXT): the page-side `origin_ops` map (carrier 2).
+            // rung 3 (api/39): the page-side `origin_ops` map (carrier 2).
             origin_ops: [("@bob:matrix.org".to_string(), "018f3b9c-roster".to_string())]
                 .into_iter()
                 .collect(),
@@ -803,7 +803,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &out,
         "response-notifications.cbor",
         &ApiResponse::Notifications(daemon_api::RevList {
-            // rung 1 (api vNEXT): the notifications rev the client compares against
+            // rung 1 (api/39): the notifications rev the client compares against
             // `NotificationsChanged.rev` to skip an unchanged re-list.
             rev: 4,
             items: vec![notif_authz, notif_conn],
@@ -812,7 +812,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     // Persons / metacontacts (wire v37; port-person): the read-only list op + a response carrying
     // an aliased, avatared, multi-endpoint person, so verify-codec proves the generated zcbor C
     // decoder accepts the person shape (incl. the first wire-reachable `image` rule).
-    // rung 2 (api vNEXT): the former unit variant becomes a map carrying the delta anchor.
+    // rung 2 (api/39): the former unit variant becomes a map carrying the delta anchor.
     write_cbor(
         &out,
         "request-person-list.cbor",
@@ -822,7 +822,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &out,
         "response-persons.cbor",
         &ApiResponse::Persons(daemon_api::RevDeltaList {
-            // rung 1 (api vNEXT): the persons rev the client compares against `PersonsChanged.rev`.
+            // rung 1 (api/39): the persons rev the client compares against `PersonsChanged.rev`.
             rev: 6,
             items: vec![daemon_api::Person {
                 id: "person-ada".into(),
@@ -854,9 +854,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     ),
                 ],
             }],
-            // rung 2 (api vNEXT): a delta read's removal tombstone (the client prunes it).
+            // rung 2 (api/39): a delta read's removal tombstone (the client prunes it).
             removed: vec!["person-gone".into()],
-            // rung 3 (api vNEXT): the page-side `origin_ops` map (carrier 2).
+            // rung 3 (api/39): the page-side `origin_ops` map (carrier 2).
             origin_ops: [("person-ada".to_string(), "018f3b9c-person".to_string())]
                 .into_iter()
                 .collect(),
@@ -1442,7 +1442,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 kind: "block.message".into(),
                 timestamp_ms: 911_347_200_000,
                 verified: true,
-                // rung 3 (api vNEXT): the node-owned envelope's uniform operation provenance
+                // rung 3 (api/39): the node-owned envelope's uniform operation provenance
                 // (carrier 1) — this record was caused by a client op carrying this id.
                 origin_op: Some("018f3b9c-op".into()),
                 payload: JournalRecordPayload::Chat {
@@ -1532,9 +1532,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     transport: TransportId::new("matrix/@bot:hs.org"),
                     conv: "!room:hs.org".into(),
                     change: ConvChange::Added,
-                    // rung 1 (api vNEXT): the per-transport conversation-set rev.
+                    // rung 1 (api/39): the per-transport conversation-set rev.
                     rev: 2,
-                    // rung 3 (api vNEXT): carrier-3 provenance (null on adapter-reported changes).
+                    // rung 3 (api/39): carrier-3 provenance (null on adapter-reported changes).
                     origin_op: None,
                 },
                 NodeEvent::MembershipChanged {
@@ -1551,29 +1551,29 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 // accepts the new node-event arm.
                 NodeEvent::ContactsChanged {
                     transport: TransportId::new("matrix/@bot:hs.org"),
-                    // rung 1 (api vNEXT): the per-transport contact-roster rev.
+                    // rung 1 (api/39): the per-transport contact-roster rev.
                     rev: 5,
                 },
-                // wire v37 + rung 1 (api vNEXT): the notifications-changed pointer with its rev.
+                // wire v37 + rung 1 (api/39): the notifications-changed pointer with its rev.
                 NodeEvent::NotificationsChanged { rev: 4 },
-                // wire v37 + rung 1 (api vNEXT): the persons-changed pointer with its rev.
+                // wire v37 + rung 1 (api/39): the persons-changed pointer with its rev.
                 NodeEvent::PersonsChanged { rev: 6 },
                 // wire v38: the per-message conversation-history pointer (chat journal), so
                 // verify-codec proves the generated decoder accepts the new node-event arm.
                 NodeEvent::MessagesChanged {
                     transport: TransportId::new("matrix/@bot:hs.org"),
                     conv: "!room:hs.org".into(),
-                    // rung 3 (api vNEXT): carrier-3 provenance — the client send op that caused it.
+                    // rung 3 (api/39): carrier-3 provenance — the client send op that caused it.
                     origin_op: Some("018f3b9c-op".into()),
                 },
             ],
             next_cursor: 13,
             head_cursor: 13,
-            // rung 1 (api vNEXT): the feed generation stamped on every page.
+            // rung 1 (api/39): the feed generation stamped on every page.
             epoch: Some(1),
         }),
     )?;
-    // Tree report (rung 1, api vNEXT): the fleet-rev echo `tree-report.rev` (of `FleetChanged.rev`),
+    // Tree report (rung 1, api/39): the fleet-rev echo `tree-report.rev` (of `FleetChanged.rev`),
     // so verify-codec proves the generated zcbor C decoder accepts the additive `rev` member. An
     // empty node list keeps the fixture deterministic while exercising the new field + null root.
     write_cbor(
@@ -2076,7 +2076,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     message: Some("here you go".into()),
                     ..Default::default()
                 },
-                // rung 3 (api vNEXT): the client-minted idempotency key on the retry-sensitive
+                // rung 3 (api/39): the client-minted idempotency key on the retry-sensitive
                 // direct FtSend verb (FtSend as an outboxed lane is deferred; §15).
                 op_id: Some("018f3b9c-ft".into()),
             },
@@ -2122,7 +2122,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 settings: AccountSettingsValues {
                     values: values.clone(),
                 },
-                // rung 3 (api vNEXT): the client-minted idempotency key (retry-safe settings apply).
+                // rung 3 (api/39): the client-minted idempotency key (retry-safe settings apply).
                 op_id: Some("018f3b9c-cfg".into()),
             },
         )?;

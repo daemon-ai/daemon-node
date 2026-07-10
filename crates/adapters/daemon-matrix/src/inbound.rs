@@ -96,7 +96,7 @@ pub async fn on_room_message(ev: OriginalSyncRoomMessageEvent, room: Room, ctx: 
         );
         msg.id = Some(ev.event_id.to_string());
         msg.timestamp = Some(u64::from(ev.origin_server_ts.get()) / 1000);
-        // Inbound delivery: no local op token (null provenance, rung 3 api vNEXT).
+        // Inbound delivery: no local op token (null provenance, rung 3 api/39).
         sink.chat_message(ctx.transport.clone(), room_id.clone(), msg, None)
             .await;
     }

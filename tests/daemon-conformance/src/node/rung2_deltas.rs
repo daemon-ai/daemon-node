@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Rung 2 (delta reads + generalized backward windows, api vNEXT) end-to-end over the assembled
+//! Rung 2 (delta reads + generalized backward windows, api/39) end-to-end over the assembled
 //! node — the SessionsQuery template cloned onto ConvList / RosterList / PersonList, and the
 //! `before_cursor` backward window over the durable journal reads (ConvHistory / SessionHistory /
 //! UnitHistory).

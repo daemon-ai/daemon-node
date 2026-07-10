@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 38)
+wire_version = uint                 ; daemon-common WireVersion (current = 39)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -269,7 +269,7 @@ session-page = {
   ? "next_cursor": (session-id / null), ; null => last page
   "rev": uint64,                          ; L4: the roster revision this page reflects
   ? "removed": [0*64 session-id],       ; L4: ids removed since since_rev (delta reads only)
-  ? "origin_ops": origin-ops,           ; rung 3 (api vNEXT): carrier 2 — session-id -> causing op_id
+  ? "origin_ops": origin-ops,           ; rung 3 (api/39): carrier 2 — session-id -> causing op_id
 }
 
 ; One session's full detail (the detail-pane round-trip).
@@ -423,7 +423,7 @@ tree-report = {
   "root": (unit-id / null),
   "nodes": [0*64 unit-node],
   ? "next": (tstr / null),
-  "rev": uint64,                        ; rung 1 (api vNEXT): echo of FleetChanged.rev (compare loop)
+  "rev": uint64,                        ; rung 1 (api/39): echo of FleetChanged.rev (compare loop)
 }
 
 ; A delegation/subagent lifecycle phase (the Subagent manage-event discriminator).
@@ -499,11 +499,11 @@ journal-record-payload-t = journal-record-payload-management
                          / journal-record-payload-block
                          / journal-record-payload-chat
 
-; rung 3 (api vNEXT): uniform operation provenance — one nullable field, one name, on the general
+; rung 3 (api/39): uniform operation provenance — one nullable field, one name, on the general
 ; carriers (09§10.3). The causing operation's client-minted op_id.
 origin-op = tstr
 
-; carrier 2 — the page-side provenance map (rung 3, api vNEXT): key (item id) -> causing op_id.
+; carrier 2 — the page-side provenance map (rung 3, api/39): key (item id) -> causing op_id.
 ; A single named rule so the generated zcbor codec emits ONE map coder shared by every page that
 ; carries it (conv-page / contact-page / session-page / response-persons), rather than colliding
 ; per-parent inline maps.
@@ -525,7 +525,7 @@ journal-record = {
   "payload": journal-record-payload-t,
 }
 
-; rung 2 (api vNEXT): shape unchanged; `next_cursor` doubles as the backward continuation — on a
+; rung 2 (api/39): shape unchanged; `next_cursor` doubles as the backward continuation — on a
 ; `before_cursor` read it is the OLDEST returned cursor (pass it as the next `before_cursor`), on a
 ; forward read the newest (pass it as the next `after_cursor`); the input cursor when empty.
 journal-page-view = {
@@ -611,7 +611,7 @@ node-event = node-event-session-advanced
            / node-event-persons-changed
            / node-event-messages-changed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
-; rung 3 (api vNEXT): + `? "origin_op"` (carrier 3) — the causing op when the emit site knows it
+; rung 3 (api/39): + `? "origin_op"` (carrier 3) — the causing op when the emit site knows it
 ; (a SessionUpdateMeta that carried one); null otherwise.
 node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64, ? "origin_op": (origin-op / null) } }
 node-event-roster-changed       = { "RosterChanged":      { "rev": uint64 } }
@@ -623,33 +623,33 @@ node-event-approval-pending     = { "ApprovalPending":    { "session": session-i
 ; v26: byte counters ride the event (throttled byte-level emission node-side).
 node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr, "downloaded_bytes": uint64, "total_bytes": uint64 } }
 ; v26: the installed-model registry changed (download cataloged / model deleted) -> refetch ModelCatalog.
-; rung 1 (api vNEXT): gains a coalescing rev (breaking arm-shape change, bundled into the deferred bump).
+; rung 1 (api/39): gains a coalescing rev (breaking arm-shape change, bundled into the deferred bump).
 node-event-catalog-changed      = { "CatalogChanged":     { "rev": uint64 } }
 ; v29: a transport instance's connection/presence changed (adapter serve start / teardown / crash),
 ; carrying the full new state so clients stop navigation-polling TransportInstances.
 node-event-transport-changed    = { "TransportChanged":   { "transport": transport-id, "connection": connection-state, ? "presence": presence-state, ? "reason": (disconnect-reason / null), ? "message": (tstr / null), ? "fatal": bool, ? "origin_op": (origin-op / null) } }
-; rung 1 (api vNEXT): + per-transport conversation-set rev (echoed by conv-page).
+; rung 1 (api/39): + per-transport conversation-set rev (echoed by conv-page).
 node-event-conversations-changed = { "ConversationsChanged": { "transport": transport-id, "conv": tstr, "change": conv-change, "rev": uint64, ? "origin_op": (origin-op / null) } }
 node-event-membership-changed   = { "MembershipChanged":  { "transport": transport-id, "conv": tstr, "member": tstr, "change": membership-change, ? "actor": (tstr / null), ? "reason": (tstr / null), "is_self": bool, ? "origin_op": (origin-op / null) } }
-; rung 1 (api vNEXT): + per-transport contact-roster rev (echoed by contact-page).
+; rung 1 (api/39): + per-transport contact-roster rev (echoed by contact-page).
 node-event-contacts-changed     = { "ContactsChanged":    { "transport": transport-id, "rev": uint64 } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
 ; wire v37: the notification set changed (add/remove/read/delete) -> re-list NotificationList.
-; rung 1 (api vNEXT): gains a coalescing rev (echoed by response-notifications).
+; rung 1 (api/39): gains a coalescing rev (echoed by response-notifications).
 node-event-notifications-changed = { "NotificationsChanged": { "rev": uint64 } }
 ; wire v37: the person registry changed (create/remove/associate/dissociate) -> re-list PersonList.
-; rung 1 (api vNEXT): gains a coalescing rev (echoed by response-persons).
+; rung 1 (api/39): gains a coalescing rev (echoed by response-persons).
 node-event-persons-changed      = { "PersonsChanged":     { "rev": uint64 } }
 ; wire v38: a conversation's durable chat journal grew (one Chat record appended) -> refetch
 ; ConvHistory from the client's cursor. Granular per-(transport, conv), emitted once per message.
-; rung 3 (api vNEXT): + `? "origin_op"` (carrier 3) — the client send op stamped at the
+; rung 3 (api/39): + `? "origin_op"` (carrier 3) — the client send op stamped at the
 ; `LifecycleSink::chat_message` choke point (the same token as the journal record's `origin_op`).
 node-event-messages-changed     = { "MessagesChanged":    { "transport": transport-id, "conv": tstr, ? "origin_op": (origin-op / null) } }
 events-page = {
   "events": [0*64 node-event],
   "next_cursor": uint64,                ; pass as the next EventsSince cursor
   "head_cursor": uint64,                ; highest cursor the feed has assigned
-  ? "epoch": uint64,                    ; rung 1 (api vNEXT): feed generation; bumps on node
+  ? "epoch": uint64,                    ; rung 1 (api/39): feed generation; bumps on node
                                         ; (re)start so a prior-epoch cursor re-baselines vs resumes
 }
 
@@ -1327,7 +1327,7 @@ request-unit = { "Unit": { "unit": unit-id } }
 ; single-consumer drain (FFI/MCP-LCD; multi-surface uses UnitHistory). See daemon-event-io-spec §5.4.1.
 request-unit-events = { "UnitEvents": { "unit": unit-id, "max": uint } }
 request-unit-outbound = { "UnitOutbound": { "unit": unit-id, "max": uint } }
-; rung 2 (api vNEXT): `after_cursor` relaxes to optional (default 0) and `? before_cursor` lands —
+; rung 2 (api/39): `after_cursor` relaxes to optional (default 0) and `? before_cursor` lands —
 ; the generalized backward window (see conv-history-args; before_cursor wins when present).
 request-session-history = { "SessionHistory": { "session": session-id, ? "after_cursor": uint64,
                                                 ? "before_cursor": uint64, "max": uint } }
@@ -1338,7 +1338,7 @@ request-delivery-sessions = { "DeliverySessions": { "transport": transport-id, ?
 request-handover = { "Handover": { "session": session-id, "target": delivery-target } }
 record-meta-args = { "session": session-id, "origin": origin, "kind": tstr, "body": byte-array }
 request-record-meta = { "RecordMeta": record-meta-args }
-; rung 2 (api vNEXT): backward window, exactly as request-session-history.
+; rung 2 (api/39): backward window, exactly as request-session-history.
 request-unit-history = { "UnitHistory": { "unit": unit-id, ? "after_cursor": uint64,
                                           ? "before_cursor": uint64, "max": uint } }
 request-pause = { "Pause": { "unit": unit-id } }
@@ -1415,7 +1415,7 @@ request-sessions-query = { "SessionsQuery": { "query": session-query } }
 request-session-get = { "SessionGet": { "session": session-id } }
 request-session-search = { "SessionSearch": { "query": tstr, "limit": uint } }
 request-session-recap = { "SessionRecap": { "session": session-id } }
-; rung 3 (api vNEXT): + `? "op_id"` — the session-meta lane's idempotency + provenance key.
+; rung 3 (api/39): + `? "op_id"` — the session-meta lane's idempotency + provenance key.
 request-session-update-meta = { "SessionUpdateMeta": { "session": session-id, "patch": session-meta-patch, ? "op_id": (tstr / null) } }
 request-rewind = { "Rewind": { "session": session-id, "point": rewind-point } }
 request-agent-discover = "AgentDiscover"
@@ -1459,38 +1459,38 @@ request-transport-remove = { "TransportRemove": { "transport": transport-id } }
 request-transport-connect = { "TransportConnect": { "transport": transport-id } }
 request-transport-set-enabled = { "TransportSetEnabled": { "transport": transport-id, "enabled": bool } }
 request-transport-set-label = { "TransportSetLabel": { "transport": transport-id, ? "label": (tstr / null) } }
-; rung 2 (api vNEXT): + `since_rev` — a delta read past the transport's conversation-set rev
+; rung 2 (api/39): + `since_rev` — a delta read past the transport's conversation-set rev
 ; (SessionsQuery template): servable -> only conversations changed after `since_rev` + `removed`
 ; tombstones; unservable (rev too old / node restarted / tombstones evicted) -> the full page.
-; null/absent = a full page (the cold-client / pre-vNEXT behavior).
+; null/absent = a full page (the cold-client / pre-v39 behavior).
 request-conv-list = { "ConvList": { "transport": transport-id, ? "after": (tstr / null),
                                     ? "since_rev": (uint64 / null) } }
 request-conv-get = { "ConvGet": { "transport": transport-id, "conv": tstr } }
 request-conv-create-details = { "ConvCreateDetails": { "transport": transport-id } }
-; rung 3 (api vNEXT): + `? "op_id"` on the retry-sensitive direct create/join verbs (no duplicate room).
+; rung 3 (api/39): + `? "op_id"` on the retry-sensitive direct create/join verbs (no duplicate room).
 request-conv-create = { "ConvCreate": { "transport": transport-id, "details": create-conversation-details, ? "op_id": (tstr / null) } }
 request-conv-join-details = { "ConvJoinDetails": { "transport": transport-id } }
 request-conv-join = { "ConvJoin": { "transport": transport-id, "details": channel-join-details, ? "op_id": (tstr / null) } }
 request-conv-leave = { "ConvLeave": { "transport": transport-id, "conv": tstr } }
-; rung 3 (api vNEXT): + `op_id` — the client-minted idempotency + provenance key on the §6.4 lane
+; rung 3 (api/39): + `op_id` — the client-minted idempotency + provenance key on the §6.4 lane
 ; verbs and retry-sensitive direct verbs (06G4). Opaque tstr (UUIDv7 by client convention); the node
 ; dedups on (principal, op_id) within a 24h TTL and stamps it as `origin_op` provenance. Acks keep
 ; their EXISTING shapes; no verb grows a confirmation payload (09§14.13).
 conv-send-args = { "transport": transport-id, "conv": tstr, ? "from": (participant / null), "message": user-msg, ? "op_id": (tstr / null) }
 request-conv-send = { "ConvSend": conv-send-args }
-; rung 3 (api vNEXT): + `? "op_id"` on the conv-meta lane verbs.
+; rung 3 (api/39): + `? "op_id"` on the conv-meta lane verbs.
 request-conv-set-topic = { "ConvSetTopic": { "transport": transport-id, "conv": tstr, ? "topic": (tstr / null), ? "op_id": (tstr / null) } }
 request-conv-set-title = { "ConvSetTitle": { "transport": transport-id, "conv": tstr, ? "title": (tstr / null), ? "op_id": (tstr / null) } }
 request-conv-set-description = { "ConvSetDescription": { "transport": transport-id, "conv": tstr, ? "description": (tstr / null), ? "op_id": (tstr / null) } }
 request-conv-delete = { "ConvDelete": { "transport": transport-id, "conv": tstr } }
-; rung 2 (api vNEXT): + `before_cursor` — a backward window over the durable conv journal:
+; rung 2 (api/39): + `before_cursor` — a backward window over the durable conv journal:
 ; `before_cursor` + `max` = the `max` records with cursor < before_cursor, newest-anchored (pass a
 ; value past head — e.g. 2^64-1 — for the latest window in one round-trip; `head_cursor` in the
 ; journal-page-view reply confirms the live edge). When present it wins over `after_cursor`.
 conv-history-args = { "transport": transport-id, "conv": tstr, ? "after_cursor": uint64,
                       ? "before_cursor": uint64, ? "max": uint }
 request-conv-history = { "ConvHistory": conv-history-args }
-; rung 3 (api vNEXT): + `? "op_id"` on the retry-sensitive direct member-* verbs (double-op guard).
+; rung 3 (api/39): + `? "op_id"` on the retry-sensitive direct member-* verbs (double-op guard).
 member-invite-args = { "transport": transport-id, "conv": tstr, "who": participant, ? "message": (tstr / null), ? "op_id": (tstr / null) }
 request-member-invite = { "MemberInvite": member-invite-args }
 member-remove-args = { "transport": transport-id, "conv": tstr, "who": participant, ? "reason": (tstr / null), ? "op_id": (tstr / null) }
@@ -1500,15 +1500,15 @@ request-member-ban = { "MemberBan": member-ban-args }
 member-set-role-args = { "transport": transport-id, "conv": tstr, "who": participant, "role": member-role, ? "op_id": (tstr / null) }
 request-member-set-role = { "MemberSetRole": member-set-role-args }
 request-contact-get-profile = { "ContactGetProfile": { "transport": transport-id, "contact": contact-info } }
-; rung 3 (api vNEXT): + `? "op_id"` on the roster-edit lane's contact-alias verb.
+; rung 3 (api/39): + `? "op_id"` on the roster-edit lane's contact-alias verb.
 request-contact-set-alias = { "ContactSetAlias": { "transport": transport-id, "contact": contact-info, ? "alias": (tstr / null), ? "op_id": (tstr / null) } }
 request-contact-action-menu = { "ContactActionMenu": { "transport": transport-id, "contact": contact-info } }
 request-directory-search = { "DirectorySearch": { "transport": transport-id, ? "query": (tstr / null) } }
-; rung 2 (api vNEXT): + `since_rev` — a delta read past the transport's contact-roster rev
+; rung 2 (api/39): + `since_rev` — a delta read past the transport's contact-roster rev
 ; (mirrors request-conv-list; the SessionsQuery template).
 request-roster-list = { "RosterList": { "transport": transport-id, ? "after": (tstr / null),
                                         ? "since_rev": (uint64 / null) } }
-; rung 3 (api vNEXT): + `? "op_id"` on the roster-edit lane verbs.
+; rung 3 (api/39): + `? "op_id"` on the roster-edit lane verbs.
 request-roster-add = { "RosterAdd": { "transport": transport-id, "contact": contact-info, ? "op_id": (tstr / null) } }
 request-roster-update = { "RosterUpdate": { "transport": transport-id, "contact": contact-info, ? "op_id": (tstr / null) } }
 request-roster-remove = { "RosterRemove": { "transport": transport-id, "contact": contact-info, ? "op_id": (tstr / null) } }
@@ -1556,7 +1556,7 @@ request-telemetry-consent-set = { "TelemetryConsentSet": { "enabled": bool } }
 request-notification-list = "NotificationList"
 
 ; wire v37: the node's person/metacontact registry (read-only; re-listed on PersonsChanged).
-; rung 2 (api vNEXT): the bare-string form becomes a map so the request can carry `since_rev` — a
+; rung 2 (api/39): the bare-string form becomes a map so the request can carry `since_rev` — a
 ; delta read past the persons rev (SessionsQuery template; breaking arm-shape change, bundled into
 ; the deferred bump). null/absent = the full list.
 request-person-list = { "PersonList": { ? "since_rev": (uint64 / null) } }
@@ -1588,7 +1588,7 @@ file-transfer = {
   ? "error": (tstr / null),
   ? "source": (tstr / null)
 }
-; rung 3 (api vNEXT): + `? "op_id"` on the retry-sensitive direct FtSend verb (outboxed lane deferred).
+; rung 3 (api/39): + `? "op_id"` on the retry-sensitive direct FtSend verb (outboxed lane deferred).
 request-ft-send = { "FtSend": { "transport": transport-id, "transfer": file-transfer, ? "op_id": (tstr / null) } }
 request-ft-receive = { "FtReceive": { "transport": transport-id, "transfer": file-transfer } }
 
@@ -1597,10 +1597,10 @@ request-ft-receive = { "FtReceive": { "transport": transport-id, "transfer": fil
 ; adapter's account-settings-schema). Secrets never ride these ops — they go to the credential
 ; store via the interactive-auth flows.
 request-transport-settings = { "TransportSettings": { "transport": transport-id } }
-; rung 3 (api vNEXT): + `? "op_id"` on the retry-sensitive direct settings-apply verb.
+; rung 3 (api/39): + `? "op_id"` on the retry-sensitive direct settings-apply verb.
 request-transport-configure = { "TransportConfigure": { "transport": transport-id, "settings": account-settings-values, ? "op_id": (tstr / null) } }
 
-; rung 3 (api vNEXT): the race-free initial-sync baseline probe (06G6). A bare-string request (no
+; rung 3 (api/39): the race-free initial-sync baseline probe (06G6). A bare-string request (no
 ; args); the reply snapshots every collection's rev + the feed cursor + epoch under one feed lock.
 request-bootstrap = "Bootstrap"
 
@@ -1821,13 +1821,13 @@ model-page = { "items": [0*64 model-descriptor], ? "next": (tstr / null) }   ; M
 revision-page = { "items": [0*64 revision], ? "next": (tstr / null) }
 chat-route-page = { "items": [0*64 chat-route], ? "next": (tstr / null) }
 room-page = { "items": [0*64 room-info], ? "next": (tstr / null) }
-; rung 1 (api vNEXT): conv-page/contact-page echo the transport's coalescing rev (compared against
+; rung 1 (api/39): conv-page/contact-page echo the transport's coalescing rev (compared against
 ; ConversationsChanged.rev / ContactsChanged.rev to skip an unchanged refetch).
-; rung 2 (api vNEXT): + `removed` tombstones — on a delta read (`since_rev` servable) `items` holds
+; rung 2 (api/39): + `removed` tombstones — on a delta read (`since_rev` servable) `items` holds
 ; only the entries changed after `since_rev` and `removed` the keys gone since then (bounded at the
 ; wire page max; a larger removal set falls back to a full page). Absent/empty on a full page: the
 ; client applies a full page as replace-and-prune, needing no removal list (SessionsQuery template).
-; rung 3 (api vNEXT): + `? "origin_ops"` (carrier 2) — a page-side key->op_id map, present only for
+; rung 3 (api/39): + `? "origin_ops"` (carrier 2) — a page-side key->op_id map, present only for
 ; items whose latest reflected mutation carried an op_id. Operation metadata, not entity state; the
 ; DTOs stay clean and every collection gets the identical carrier.
 conv-page = { "items": [0*64 conversation-info], ? "next": (tstr / null), "rev": uint64,
@@ -1934,16 +1934,16 @@ response-telemetry-consent = { "TelemetryConsent": { "enabled": bool } }
 response-saved-presences = { "SavedPresences": [* saved-presence] }
 
 ; wire v37: the node's live notification list, newest first.
-; rung 1 (api vNEXT): the list gains a coalescing rev (compared against NotificationsChanged.rev).
+; rung 1 (api/39): the list gains a coalescing rev (compared against NotificationsChanged.rev).
 response-notifications = { "Notifications": { "rev": uint64, "items": [* notification-info] } }
 
 ; wire v37: the node's person/metacontact registry, insertion order.
-; rung 1 (api vNEXT): the list gains a coalescing rev (compared against PersonsChanged.rev).
-; rung 2 (api vNEXT): + `removed` tombstones — on a delta read (`since_rev` servable) `items` holds
+; rung 1 (api/39): the list gains a coalescing rev (compared against PersonsChanged.rev).
+; rung 2 (api/39): + `removed` tombstones — on a delta read (`since_rev` servable) `items` holds
 ; only the persons changed after `since_rev` and `removed` the person ids gone since then (bounded
 ; at the wire page max; a larger removal set falls back to the full list, which the client applies
 ; as replace-and-prune).
-; rung 3 (api vNEXT): + `? "origin_ops"` (carrier 2) — person-id -> causing op_id.
+; rung 3 (api/39): + `? "origin_ops"` (carrier 2) — person-id -> causing op_id.
 response-persons = { "Persons": { "rev": uint64, "items": [* person],
                                   ? "removed": [0*64 tstr],
                                   ? "origin_ops": origin-ops } }
@@ -1952,7 +1952,7 @@ response-persons = { "Persons": { "rev": uint64, "items": [* person],
 ; transport-settings read-back; secrets live in the credential store, never here).
 response-transport-settings = { "TransportSettings": account-settings-values }
 
-; rung 3 (api vNEXT): the Bootstrap probe reply — every collection's rev keyed by a stable name,
+; rung 3 (api/39): the Bootstrap probe reply — every collection's rev keyed by a stable name,
 ; plus the feed cursor + epoch, snapshotted atomically under one feed lock (06G6).
 response-bootstrap = { "Bootstrap": { "cursor": uint64, "epoch": uint64, "revs": { * tstr => uint64 } } }
 api-response = response-ok

@@ -204,8 +204,8 @@ pub(crate) const REMOVED_TOMBSTONE_CAP: usize = 256;
 /// contacts per transport). In-memory like every rung-1 counter: a restart resets it, making any
 /// stored client rev unservable (-> full read; the accepted durability caveat, 06G2).
 /// The delta a [`DeltaIndex`] serves past a `since_rev`: the changed keys, the removed keys, the
-/// per-key `origin_op` provenance for changed keys whose causing mutation carried one (rung 3, api
-/// vNEXT — the page-side `origin_ops` map, carrier 2), and the current rev.
+/// per-key `origin_op` provenance for changed keys whose causing mutation carried one (rung 3,
+/// api/39 — the page-side `origin_ops` map, carrier 2), and the current rev.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct IndexDelta {
     pub changed: Vec<String>,
@@ -218,8 +218,8 @@ pub(crate) struct IndexDelta {
 pub(crate) struct DeltaIndex {
     /// The collection's monotonic revision — the rung-1 coalescing counter, now owned here.
     rev: u64,
-    /// key -> `(rev at its last change, origin_op of the causing mutation)` (upsert). Rung 3 (api
-    /// vNEXT) widens the rung-2 `key -> rev` index to also carry the client op token that caused
+    /// key -> `(rev at its last change, origin_op of the causing mutation)` (upsert). Rung 3
+    /// (api/39) widens the rung-2 `key -> rev` index to also carry the client op token that caused
     /// the change (`None` when it carried none), which feeds the delta-page `origin_ops` map. A
     /// removed key leaves this map: its latest state is the tombstone in `removed`, never both.
     changed: HashMap<String, (u64, Option<String>)>,
@@ -301,7 +301,7 @@ pub(crate) struct NodeFeedInner {
     rev: u64,
     /// L4 delta index: the `(rev, origin_op)` at each session's last roster change (rename/pin/
     /// archive/activity/activation). `roster_delta(R)` returns the sessions whose rev is `> R`.
-    /// Rung 3 (api vNEXT) widens the value to carry the causing op token (the session-page
+    /// Rung 3 (api/39) widens the value to carry the causing op token (the session-page
     /// `origin_ops` map); `None` for changes with no op (activity/activation).
     changed: HashMap<SessionId, (u64, Option<String>)>,
     /// L4 removal tombstones `(rev, session)` for sessions hard-removed from the roster. Effectively
@@ -373,7 +373,7 @@ impl NodeEventFeed {
         self.note_roster_change_op(session, None)
     }
 
-    /// [`Self::note_roster_change`] carrying the causing op token (rung 3, api vNEXT): a
+    /// [`Self::note_roster_change`] carrying the causing op token (rung 3, api/39): a
     /// `SessionUpdateMeta` that carried an `op_id` records it here, so the session-page delta's
     /// `origin_ops` map + the `SessionMetaChanged` pointer name the causing op. `None` = null
     /// provenance (activity/activation stamps).
@@ -576,7 +576,7 @@ impl NodeEventFeed {
         self.note_conversations_change_op(transport, conv, removed, None)
     }
 
-    /// [`Self::note_conversations_change`] carrying the causing op token (rung 3, api vNEXT) for
+    /// [`Self::note_conversations_change`] carrying the causing op token (rung 3, api/39) for
     /// the `conv-page` `origin_ops` map. `None` = null provenance.
     pub(crate) fn note_conversations_change_op(
         &self,
@@ -633,7 +633,7 @@ impl NodeEventFeed {
         self.epoch
     }
 
-    /// Rung 3 (api vNEXT) — the race-free initial-sync baseline (06G6): the feed cursor + this
+    /// Rung 3 (api/39) — the race-free initial-sync baseline (06G6): the feed cursor + this
     /// feed's generation + every tracked collection's current revision, snapshotted ATOMICALLY
     /// under one `inner` lock acquisition. Because a single lock covers the cursor read AND every
     /// rev read, the returned values are mutually consistent — a concurrent mutation either lands
@@ -2275,7 +2275,7 @@ mod node_feed_tests {
         ));
     }
 
-    // ---- rung 1 (per-collection revisions + feed epoch, api vNEXT) ----
+    // ---- rung 1 (per-collection revisions + feed epoch, api/39) ----
 
     /// The global per-collection counters (persons / notifications / catalog) are monotonic and bump
     /// exactly once per `note_*` call — the coalescing rev a client compares to skip a refetch.
@@ -2324,7 +2324,7 @@ mod node_feed_tests {
         assert_eq!(feed.conversations_rev(&b), 0);
     }
 
-    // ---- rung 2 (delta indexes: changed keys + removed tombstones, api vNEXT) ----
+    // ---- rung 2 (delta indexes: changed keys + removed tombstones, api/39) ----
 
     /// A delta past `since_rev` returns exactly the keys changed after it — and a servable
     /// `since_rev == rev` returns the empty delta (the cheap "nothing changed" round-trip).

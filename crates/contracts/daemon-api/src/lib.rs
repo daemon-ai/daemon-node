@@ -342,7 +342,7 @@ pub trait SessionApi: Send + Sync {
     /// finished chat blocks + lifecycle records, with a per-entry `verified` flag) for reconnect /
     /// scroll-back. Complements [`Self::poll`] (which destructively drains the *live* delta stream):
     /// repeated reads from the same `after_cursor` return the same page. `before_cursor` (rung 2,
-    /// api vNEXT) flips the read into a newest-anchored backward window — the `max` newest entries
+    /// api/39) flips the read into a newest-anchored backward window — the `max` newest entries
     /// with `cursor < before_cursor` — and wins over `after_cursor` when present. Default: an empty
     /// page (a transport with no durable journal, e.g. an ephemeral session-only FFI).
     async fn session_history(
@@ -597,7 +597,7 @@ pub trait ControlApi: Send + Sync {
     /// finished chat blocks + management lifecycle records, each carrying the `verified` flag of its
     /// sealed segment) — the reconnect / scroll-back read for a GUI rendering a transcript for any
     /// node in the tree, and the auditor's one-chain verify pass. Complements (does not replace) the
-    /// destructive live [`Self::unit_outbound`] drain. `before_cursor` (rung 2, api vNEXT) flips the
+    /// destructive live [`Self::unit_outbound`] drain. `before_cursor` (rung 2, api/39) flips the
     /// read into a newest-anchored backward window, exactly as [`SessionApi::session_history`].
     /// Default: an empty page.
     async fn unit_history(
@@ -741,7 +741,7 @@ pub trait ControlApi: Send + Sync {
         Ok(stream::empty().boxed())
     }
 
-    /// Rung 3 (api vNEXT): the race-free initial-sync baseline — every collection's rev + the feed
+    /// Rung 3 (api/39): the race-free initial-sync baseline — every collection's rev + the feed
     /// cursor + epoch, snapshotted ATOMICALLY under one feed-lock acquisition (06G6). A cold client
     /// anchors its cursor + per-collection revs from this single consistent point before its first
     /// [`Self::events_page`]. Default: an empty report (a node with no feed).
@@ -749,7 +749,7 @@ pub trait ControlApi: Send + Sync {
         BootstrapReport::default()
     }
 
-    // -- rung 3 (api vNEXT) op-id idempotent dedup ---------------------------------------------
+    // -- rung 3 (api/39) op-id idempotent dedup ---------------------------------------------
     //
     // The verb-agnostic dedup seam the shared `dispatch` core consults for every request carrying
     // an `op_id` ([`ApiRequest::op_id`]): a durable `(principal, op_id)`-keyed table (TTL 24h)
@@ -905,7 +905,7 @@ pub trait ControlApi: Send + Sync {
     //    empty / `Unsupported` (a node with no messaging adapter registered). --
 
     /// List the conversations a transport owns (`SupportsConversations::list`), paged at
-    /// [`WIRE_PAGE_MAX`] in conversation-id order. `since_rev` (rung 2, api vNEXT) requests a
+    /// [`WIRE_PAGE_MAX`] in conversation-id order. `since_rev` (rung 2, api/39) requests a
     /// delta read — only the conversations changed after that revision plus `removed` tombstones;
     /// an unservable revision degrades to the full page (the SessionsQuery template). Default:
     /// empty.
@@ -1063,8 +1063,8 @@ pub trait ControlApi: Send + Sync {
 
     /// List a transport's server-side contact roster (`SupportsRoster::list`), paged at
     /// [`WIRE_PAGE_MAX`] in contact-id order (mirrors [`ControlApi::conv_list`]; the adapter
-    /// returns the unbounded roster, the host sorts + pages it once). `since_rev` (rung 2, api
-    /// vNEXT) requests a delta read exactly as [`ControlApi::conv_list`]. Default: empty.
+    /// returns the unbounded roster, the host sorts + pages it once). `since_rev` (rung 2,
+    /// api/39) requests a delta read exactly as [`ControlApi::conv_list`]. Default: empty.
     async fn roster_list(
         &self,
         _transport: TransportId,
@@ -1135,7 +1135,7 @@ pub trait ControlApi: Send + Sync {
     /// The node's person/metacontact registry (wire v37), insertion order — the
     /// node-authoritative [`Person`] collection a client renders and re-lists on a
     /// [`NodeEvent::PersonsChanged`] pointer (ported from the person half of libpurple's
-    /// `PurpleContactManager`). `since_rev` (rung 2, api vNEXT) requests a delta read — only the
+    /// `PurpleContactManager`). `since_rev` (rung 2, api/39) requests a delta read — only the
     /// persons changed after that revision plus `removed` tombstones; an unservable revision
     /// degrades to the full list. Default: empty (a node assembled without a person registry).
     async fn person_list(&self, _since_rev: Option<u64>) -> RevDeltaList<Person> {
@@ -2487,7 +2487,7 @@ pub struct SessionPage {
     /// with `archived=true`, not a removal); reserved for a future hard-delete path.
     #[serde(default)]
     pub removed: Vec<SessionId>,
-    /// Rung 3 (api vNEXT) uniform provenance (carrier 2): a page-side `session-id -> origin_op`
+    /// Rung 3 (api/39) uniform provenance (carrier 2): a page-side `session-id -> origin_op`
     /// map, present only for sessions whose latest reflected roster mutation carried an `op_id`
     /// (e.g. a `SessionUpdateMeta` rename/pin/archive). Operation metadata, not roster state.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -3681,7 +3681,7 @@ pub trait LifecycleSink: Send + Sync {
     /// `ConvHistory` pages) and then emits [`NodeEvent::MessagesChanged`]. Adapters never journal
     /// conversation history themselves.
     ///
-    /// `origin_op` (rung 3, api vNEXT) is the OPAQUE node token an adapter hands back from the send
+    /// `origin_op` (rung 3, api/39) is the OPAQUE node token an adapter hands back from the send
     /// seam where its protocol can round-trip one — the client-minted `op_id` of the causing
     /// `ConvSend`. The node stamps it as uniform `origin_op` provenance on both the journal record
     /// and the `MessagesChanged` pointer (it never interprets the token). `None` for inbound
@@ -4412,7 +4412,7 @@ pub struct JournalRecord {
     /// signature checked + chain linked). `false` for an as-yet-unsealed (open) segment or when the
     /// node exposes no verifying key.
     pub verified: bool,
-    /// Rung 3 (api vNEXT) uniform provenance (carrier 1): the client-minted `op_id` of the
+    /// Rung 3 (api/39) uniform provenance (carrier 1): the client-minted `op_id` of the
     /// operation that caused this record, stamped on the node-owned envelope so every journaled
     /// stream carries it (the adapter payload is untouched). `None` when the causing op carried no
     /// token (inbound messages, token-incapable adapters) — degraded, never heuristic.
@@ -4430,8 +4430,8 @@ pub struct JournalPageView {
     /// The decoded entries in cursor order (ascending on forward AND backward reads).
     pub entries: Vec<JournalRecord>,
     /// The continuation cursor. Forward read: pass as the next `after_cursor` (the last entry's
-    /// cursor, or the input `after_cursor` when the page is empty). Backward read (rung 2, api
-    /// vNEXT — `before_cursor` set): pass as the next `before_cursor` (the FIRST/oldest entry's
+    /// cursor, or the input `after_cursor` when the page is empty). Backward read (rung 2,
+    /// api/39 — `before_cursor` set): pass as the next `before_cursor` (the FIRST/oldest entry's
     /// cursor, or the input `before_cursor` when the page is empty).
     pub next_cursor: u64,
     /// The highest cursor currently stored for the stream (how far a reader can scroll).
@@ -4518,7 +4518,7 @@ pub enum NodeEvent {
         session: SessionId,
         /// The roster revision at the change.
         rev: u64,
-        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the causing op's `op_id` when the
+        /// Rung 3 (api/39) uniform provenance (carrier 3): the causing op's `op_id` when the
         /// emit site knows it (a `SessionUpdateMeta` carrying one); `None` otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_op: Option<String>,
@@ -4565,7 +4565,7 @@ pub enum NodeEvent {
     },
     /// The installed-model registry changed (a finished download was cataloged / a model was
     /// deleted): the client refetches `ModelCatalog`. Globally coalesced in the backlog (a refetch
-    /// always reads the whole catalog); carries a coalescing `rev` (rung 1, api vNEXT) the client
+    /// always reads the whole catalog); carries a coalescing `rev` (rung 1, api/39) the client
     /// compares against `ModelCatalog`'s echoed rev to skip an unchanged refetch.
     CatalogChanged {
         /// The new catalog revision (rung 1). In-memory; a restart resets it -> stale rev degrades
@@ -4594,7 +4594,7 @@ pub enum NodeEvent {
         /// clients MUST NOT re-derive this (wire v30). `false` for transient reasons + connects.
         #[serde(default)]
         fatal: bool,
-        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the causing op's `op_id` when the
+        /// Rung 3 (api/39) uniform provenance (carrier 3): the causing op's `op_id` when the
         /// emit site knows it (e.g. a `TransportConfigure` reconnect); `None` otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_op: Option<String>,
@@ -4608,11 +4608,11 @@ pub enum NodeEvent {
         conv: String,
         /// Added or removed.
         change: ConvChange,
-        /// The owning transport's conversation-set revision at this change (rung 1, api vNEXT); the
+        /// The owning transport's conversation-set revision at this change (rung 1, api/39); the
         /// client compares it against `conv-page`'s echoed rev to reconcile drift. Per-transport,
         /// in-memory (a restart resets it -> full read).
         rev: u64,
-        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the causing op's `op_id` when the
+        /// Rung 3 (api/39) uniform provenance (carrier 3): the causing op's `op_id` when the
         /// emit site knows it; `None` otherwise (adapter-reported changes have no local token).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_op: Option<String>,
@@ -4639,7 +4639,7 @@ pub enum NodeEvent {
         /// Whether `member` is THIS account. On a self `Left`/`Kicked`/`Banned` the node reconciled
         /// its routing for the now-dangling origin before emitting.
         is_self: bool,
-        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the causing op's `op_id` when the
+        /// Rung 3 (api/39) uniform provenance (carrier 3): the causing op's `op_id` when the
         /// emit site knows it (a member-invite/remove/ban carrying one); `None` otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_op: Option<String>,
@@ -4651,7 +4651,7 @@ pub enum NodeEvent {
     ContactsChanged {
         /// The owning transport instance whose roster changed.
         transport: TransportId,
-        /// The owning transport's contact-roster revision at this change (rung 1, api vNEXT); the
+        /// The owning transport's contact-roster revision at this change (rung 1, api/39); the
         /// client compares it against `contact-page`'s echoed rev to skip an unchanged refetch.
         /// Per-transport, in-memory (a restart resets it -> full read).
         rev: u64,
@@ -4665,7 +4665,7 @@ pub enum NodeEvent {
     /// The node's notification set changed (wire v37): a notification was added, removed, read, or
     /// deleted. A payload-free node-wide invalidation pointer (clients re-list via `NotificationList`),
     /// mirroring [`NodeEvent::CatalogChanged`] — the whole list is cheap to refetch. Carries a
-    /// coalescing `rev` (rung 1, api vNEXT) the client compares against `Notifications`' echoed rev
+    /// coalescing `rev` (rung 1, api/39) the client compares against `Notifications`' echoed rev
     /// to skip an unchanged refetch.
     NotificationsChanged {
         /// The new notifications revision (rung 1). In-memory; a restart resets it -> full read.
@@ -4674,7 +4674,7 @@ pub enum NodeEvent {
     /// The node's person/metacontact registry changed (wire v37): a person was created or removed,
     /// or a contact endpoint was associated/dissociated. A node-wide invalidation pointer (clients
     /// re-list via `PersonList`), mirroring [`NodeEvent::NotificationsChanged`]. Carries a
-    /// coalescing `rev` (rung 1, api vNEXT) the client compares against `Persons`' echoed rev.
+    /// coalescing `rev` (rung 1, api/39) the client compares against `Persons`' echoed rev.
     PersonsChanged {
         /// The new persons revision (rung 1). In-memory; a restart resets it -> full read.
         rev: u64,
@@ -4689,7 +4689,7 @@ pub enum NodeEvent {
         transport: TransportId,
         /// The affected conversation id.
         conv: String,
-        /// Rung 3 (api vNEXT) uniform provenance (carrier 3): the client-minted `op_id` of the
+        /// Rung 3 (api/39) uniform provenance (carrier 3): the client-minted `op_id` of the
         /// send that caused this message, stamped at the `LifecycleSink::chat_message` choke point
         /// (the same token the node stamps as `origin_op` on the journal record). `None` for
         /// inbound messages / token-incapable adapters.
@@ -4710,10 +4710,10 @@ pub struct EventsPage {
     pub next_cursor: u64,
     /// The highest cursor the feed has assigned (how far a reader can advance now).
     pub head_cursor: u64,
-    /// The feed generation (rung 1, api vNEXT): a startup-minted counter that changes when the node
+    /// The feed generation (rung 1, api/39): a startup-minted counter that changes when the node
     /// (re)starts, so a client with a prior-epoch cursor distinguishes "the ring overflowed" from
     /// "a new feed generation" and re-baselines deliberately. Optional on the wire (`? epoch`):
-    /// absent means a pre-vNEXT node that does not stamp it. In-memory (process-lifetime) by design
+    /// absent means a pre-v39 node that does not stamp it. In-memory (process-lifetime) by design
     /// — the accepted durability caveat (06G1); a bumped epoch degrades a stale cursor to a
     /// deliberate resync.
     #[serde(default, skip_serializing_if = "Option::is_none")]
