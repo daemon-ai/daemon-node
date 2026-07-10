@@ -61,11 +61,18 @@ impl NodeApiImpl {
     /// Emit a `ContactsChanged` for `transport` (wire v34) after a successful roster mutation
     /// (`roster_add`/`roster_update`/`roster_remove`) so clients refetch `RosterList` without
     /// polling. A payload-free-per-transport invalidation pointer, mirroring `conversations_changed`.
-    pub(crate) fn emit_contacts_changed(&self, transport: TransportId) {
+    /// The mutated `contact` id + whether it was a removal feed the rung-2 delta index (the event
+    /// shape itself stays the rung-1 `{transport, rev}` pointer).
+    pub(crate) fn emit_contacts_changed(
+        &self,
+        transport: TransportId,
+        contact: &str,
+        removed: bool,
+    ) {
         if let Some(feed) = self.node_feed() {
             // rung 1: bump the per-transport contact-roster rev (exactly once per emit) and stamp it
             // so `RosterList`'s echoed rev and this pointer agree on the reflected generation.
-            let rev = feed.note_contacts_change(&transport);
+            let rev = feed.note_contacts_change(&transport, contact, removed);
             feed.emit(NodeEvent::ContactsChanged { transport, rev });
         }
     }
@@ -124,11 +131,12 @@ impl NodeApiImpl {
 
     /// Emit a payload-free `PersonsChanged` pointer (wire v37) after a person-registry mutation
     /// so clients re-list via `PersonList`. Mirrors `emit_notifications_changed`: the whole list is
-    /// cheap to refetch, so the event carries no detail.
-    pub(crate) fn emit_persons_changed(&self) {
+    /// cheap to refetch, so the event carries no detail. The mutated `person` id + whether it was a
+    /// removal feed the rung-2 delta index (the event shape stays the rung-1 `{rev}` pointer).
+    pub(crate) fn emit_persons_changed(&self, person: &str, removed: bool) {
         if let Some(feed) = self.node_feed() {
             // rung 1: bump the persons rev (once per emit) and stamp it (echoed by `PersonList`).
-            let rev = feed.note_persons_change();
+            let rev = feed.note_persons_change(person, removed);
             feed.emit(NodeEvent::PersonsChanged { rev });
         }
     }
@@ -143,13 +151,14 @@ impl NodeApiImpl {
     /// Add a person to the node registry and emit the `PersonsChanged` pointer on a real add (a
     /// rejected double-add emits nothing). The producer seam adapters/tools use to create a person.
     pub fn person_add(&self, person: daemon_api::Person) -> crate::person::AddOutcome {
+        let id = person.id.clone();
         let outcome = self
             .persons
             .lock()
             .expect("person manager mutex")
             .add_person(person);
         if outcome == crate::person::AddOutcome::Added {
-            self.emit_persons_changed();
+            self.emit_persons_changed(&id, false);
         }
         outcome
     }
@@ -163,7 +172,7 @@ impl NodeApiImpl {
             .expect("person manager mutex")
             .remove_person(id, remove_endpoints);
         if removed {
-            self.emit_persons_changed();
+            self.emit_persons_changed(id, true);
         }
         removed
     }
@@ -177,13 +186,13 @@ impl NodeApiImpl {
             .expect("person manager mutex")
             .associate(person_id, endpoint);
         if associated {
-            self.emit_persons_changed();
+            self.emit_persons_changed(person_id, false);
         }
         associated
     }
 
     /// Dissociate a contact endpoint from a person, emitting the `PersonsChanged` pointer when the
-    /// edge existed.
+    /// edge existed (an endpoint change is a *change* to the still-present person, not a removal).
     pub fn person_dissociate(
         &self,
         person_id: &str,
@@ -196,7 +205,7 @@ impl NodeApiImpl {
             .expect("person manager mutex")
             .dissociate(person_id, transport, contact_id);
         if dissociated {
-            self.emit_persons_changed();
+            self.emit_persons_changed(person_id, false);
         }
         dissociated
     }
@@ -240,8 +249,13 @@ impl LifecycleSink for NodeApiImpl {
     ) {
         if let Some(feed) = self.node_feed() {
             // rung 1: bump the per-transport conversation-set rev (once per emit) and stamp it so
-            // `ConvList`'s echoed rev and this pointer agree on the reflected generation.
-            let rev = feed.note_conversations_change(&transport);
+            // `ConvList`'s echoed rev and this pointer agree on the reflected generation. rung 2:
+            // the keyed change feeds the delta index (`Removed` -> tombstone).
+            let rev = feed.note_conversations_change(
+                &transport,
+                &conv,
+                matches!(change, ConvChange::Removed),
+            );
             feed.emit(NodeEvent::ConversationsChanged {
                 transport,
                 conv,

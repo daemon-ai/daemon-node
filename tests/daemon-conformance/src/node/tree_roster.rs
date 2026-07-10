@@ -1017,6 +1017,7 @@ async fn nested_tree_projection_is_recursive_and_transport_agnostic_impl() {
             .call(ApiRequest::UnitHistory {
                 unit: grandchild.id.clone(),
                 after_cursor: 0,
+                before_cursor: None,
                 max: 0,
             })
             .await
@@ -1035,7 +1036,7 @@ async fn nested_tree_projection_is_recursive_and_transport_agnostic_impl() {
         "expected durable history entries for the grandchild"
     );
     assert_eq!(
-        node.unit_history(grandchild.id.clone(), 0, 0).await,
+        node.unit_history(grandchild.id.clone(), 0, None, 0).await,
         socket_history,
         "grandchild history must agree across transports"
     );

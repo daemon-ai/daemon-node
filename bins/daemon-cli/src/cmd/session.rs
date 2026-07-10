@@ -63,6 +63,7 @@ pub(super) async fn try_run(
         Command::History { id, after, max } => ApiRequest::SessionHistory {
             session: SessionId::new(id),
             after_cursor: after,
+            before_cursor: None,
             max,
         },
         other => return Ok(Some(other)),

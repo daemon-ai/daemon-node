@@ -110,8 +110,16 @@ pub enum ApiRequest {
     SessionHistory {
         /// The session whose durable history to read.
         session: SessionId,
-        /// The exclusive lower-bound cursor (0 from the start).
+        /// The exclusive lower-bound cursor (0 from the start). Optional on the wire since rung 2
+        /// (api vNEXT), defaulting to 0; ignored when `before_cursor` is present.
+        #[serde(default)]
         after_cursor: u64,
+        /// Backward window (rung 2, api vNEXT): when `Some(B)`, return the `max` newest records
+        /// with `cursor < B` (newest-anchored; pass a value past head — e.g. `u64::MAX` — for the
+        /// latest window in one round-trip). Wins over `after_cursor` when present. Absent on the
+        /// wire when `None` (never null).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_cursor: Option<u64>,
         /// Maximum entries to return (0 = all available).
         max: u32,
     },
@@ -161,8 +169,14 @@ pub enum ApiRequest {
     UnitHistory {
         /// The unit whose durable history to read.
         unit: UnitId,
-        /// The exclusive lower-bound cursor (0 from the start).
+        /// The exclusive lower-bound cursor (0 from the start). Optional on the wire since rung 2
+        /// (api vNEXT), defaulting to 0; ignored when `before_cursor` is present.
+        #[serde(default)]
         after_cursor: u64,
+        /// Backward window (rung 2, api vNEXT): exactly as
+        /// [`ApiRequest::SessionHistory::before_cursor`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_cursor: Option<u64>,
         /// Maximum entries to return (0 = all available).
         max: u32,
     },
@@ -802,6 +816,12 @@ pub enum ApiRequest {
         /// Resume cursor: the previous page's `next` (the last served conversation `id`).
         #[serde(default)]
         after: Option<String>,
+        /// Delta read (rung 2, api vNEXT): when `Some(R)`, ask for only the conversations changed
+        /// after the transport's conversation-set revision `R` (plus `removed` tombstones), instead
+        /// of the full page — the SessionsQuery template. `None` (default) = a full page; an
+        /// unservable `R` (node restarted / tombstones evicted) also degrades to a full page.
+        #[serde(default)]
+        since_rev: Option<u64>,
     },
     /// [`ControlApi::conv_get`] — one conversation by id.
     ConvGet {
@@ -929,6 +949,11 @@ pub enum ApiRequest {
         /// Resume cursor: the previous page's `next` (the last served contact `id`).
         #[serde(default)]
         after: Option<String>,
+        /// Delta read (rung 2, api vNEXT): when `Some(R)`, only the contacts changed after the
+        /// transport's contact-roster revision `R` plus `removed` tombstones (mirrors
+        /// [`ApiRequest::ConvList::since_rev`]; the SessionsQuery template).
+        #[serde(default)]
+        since_rev: Option<u64>,
     },
     /// [`ControlApi::roster_add`] — add a contact to the server-side roster (wire v34).
     RosterAdd {
@@ -1167,7 +1192,16 @@ pub enum ApiRequest {
     /// [`ControlApi::person_list`] — the node's person/metacontact registry (wire v37). A
     /// read-only snapshot (insertion order); the client re-lists on a
     /// [`NodeEvent::PersonsChanged`] pointer. Answered by [`ApiResponse::Persons`].
-    PersonList,
+    ///
+    /// rung 2 (api vNEXT): the former unit variant becomes a struct variant so the request can
+    /// carry `since_rev` (a breaking arm-shape change, bundled into the deferred v38->v39 bump).
+    PersonList {
+        /// Delta read (rung 2, api vNEXT): when `Some(R)`, only the persons changed after
+        /// registry revision `R` plus `removed` tombstones (the SessionsQuery template). `None`
+        /// (default) = the full list.
+        #[serde(default)]
+        since_rev: Option<u64>,
+    },
 
     // -- transport account settings (N2; wire v38) --------------------------------------------
     /// [`ControlApi::transport_settings`] — read a transport instance's persisted NON-SECRET
@@ -1410,8 +1444,9 @@ pub enum ApiResponse {
     /// notifications revision (rung 1, api vNEXT).
     Notifications(RevList<NotificationInfo>),
     /// The node's person/metacontact registry (`person_list`; wire v37), insertion order, carrying
-    /// the persons revision (rung 1, api vNEXT).
-    Persons(RevList<Person>),
+    /// the persons revision (rung 1, api vNEXT) and — on a delta read — `removed` tombstones
+    /// (rung 2, api vNEXT).
+    Persons(RevDeltaList<Person>),
     /// A transport instance's persisted NON-SECRET account-settings values (`transport_settings`;
     /// wire v38). Secrets never ride this response — they live in the credential store.
     TransportSettings(AccountSettingsValues),
@@ -1490,13 +1525,20 @@ impl<T> Default for WirePage<T> {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvPage {
-    /// The conversations in this page (at most [`WIRE_PAGE_MAX`]).
+    /// The conversations in this page (at most [`WIRE_PAGE_MAX`]). On a delta read
+    /// ([`ApiRequest::ConvList::since_rev`] servable): only the conversations changed after
+    /// `since_rev`.
     pub items: Vec<ConversationInfo>,
     /// The resume cursor when more items remain (`None` => last page).
     #[serde(default)]
     pub next: Option<String>,
     /// The owning transport's conversation-set revision this page reflects (rung 1).
     pub rev: u64,
+    /// Delta read (rung 2, api vNEXT): conversation ids removed since the requested `since_rev`
+    /// (the client prunes them). Empty on a full page — a full page replaces the client's set
+    /// wholesale, so it carries no removal list (the SessionsQuery template).
+    #[serde(default)]
+    pub removed: Vec<String>,
 }
 
 /// A page of a transport's server-side contact roster (`roster_list` -> `ContactPage`), carrying the
@@ -1505,13 +1547,19 @@ pub struct ConvPage {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactPage {
-    /// The contacts in this page (at most [`WIRE_PAGE_MAX`]).
+    /// The contacts in this page (at most [`WIRE_PAGE_MAX`]). On a delta read
+    /// ([`ApiRequest::RosterList::since_rev`] servable): only the contacts changed after
+    /// `since_rev`.
     pub items: Vec<ContactInfo>,
     /// The resume cursor when more items remain (`None` => last page).
     #[serde(default)]
     pub next: Option<String>,
     /// The owning transport's contact-roster revision this page reflects (rung 1).
     pub rev: u64,
+    /// Delta read (rung 2, api vNEXT): contact ids removed since the requested `since_rev` (the
+    /// client prunes them). Empty on a full page (mirrors [`ConvPage::removed`]).
+    #[serde(default)]
+    pub removed: Vec<String>,
 }
 
 /// A whole-list response that carries a coalescing revision (rung 1, api vNEXT): the node-authored
@@ -1534,6 +1582,35 @@ impl<T> Default for RevList<T> {
         Self {
             rev: 0,
             items: Vec::new(),
+        }
+    }
+}
+
+/// A [`RevList`] that can also carry `removed` tombstones (rung 2, api vNEXT) — the whole-list
+/// response of a delta-read-capable collection (persons today). On a delta read (`since_rev`
+/// servable) `items` holds only the entries changed after `since_rev` and `removed` the string keys
+/// gone since then; on a full read `removed` is empty and the client applies the list as
+/// replace-and-prune (the SessionsQuery template). Notifications deliberately stay [`RevList`]
+/// (snapshot + rev suffices for that small list; spec 09 §10.2). CDDL: `response-persons`.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevDeltaList<T> {
+    /// The collection revision this list reflects (rung 1).
+    pub rev: u64,
+    /// The whole list on a full read; only the changed entries on a delta read.
+    pub items: Vec<T>,
+    /// Delta read (rung 2): keys removed since the requested `since_rev`. Empty on a full read.
+    #[serde(default)]
+    pub removed: Vec<String>,
+}
+
+// Manual impl: `derive(Default)` would demand `T: Default`, which the empty list does not need.
+impl<T> Default for RevDeltaList<T> {
+    fn default() -> Self {
+        Self {
+            rev: 0,
+            items: Vec::new(),
+            removed: Vec::new(),
         }
     }
 }
@@ -2625,6 +2702,7 @@ mod conversation_hierarchy_tests {
             items: vec![space, child],
             next: None,
             rev: 0,
+            removed: Vec::new(),
         });
         let mut bytes = Vec::new();
         ciborium::into_writer(&page, &mut bytes).expect("encode Conversations page");

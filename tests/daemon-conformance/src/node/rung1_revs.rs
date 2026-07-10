@@ -138,7 +138,7 @@ async fn person_add_bumps_persons_rev_once_and_list_echoes_it_impl() {
 
 async fn person_list_rev(node: &Arc<NodeApiImpl>) -> u64 {
     use daemon_api::dispatch;
-    match dispatch(node.as_ref(), ApiRequest::PersonList).await {
+    match dispatch(node.as_ref(), ApiRequest::PersonList { since_rev: None }).await {
         ApiResponse::Persons(list) => list.rev,
         other => panic!("expected Persons, got {other:?}"),
     }

@@ -192,6 +192,76 @@ pub(crate) struct NodeFeedEntry {
     event: NodeEvent,
 }
 
+/// The bound on retained removal tombstones per [`DeltaIndex`] (rung 2). Enough for any client at
+/// most ~4 wire pages of removals behind; a client further behind is unservable and degrades to a
+/// full page (the same fallback an unservable `since_rev` takes), so eviction never silently loses
+/// a removal. Mirrors the feed's bounded-in-memory convention (the ring's fixed capacity).
+// RED (rung 2): referenced only by the failing unit tests until GREEN's `note_remove` enforces it.
+#[allow(dead_code)]
+pub(crate) const REMOVED_TOMBSTONE_CAP: usize = 256;
+
+/// Per-collection delta bookkeeping (rung 2): the rev at each key's last change plus bounded
+/// removal tombstones — the roster's L4 `changed`/`removed` pattern (the SessionsQuery template,
+/// `roster_delta`) generalized to string-keyed collections (persons globally; conversations and
+/// contacts per transport). In-memory like every rung-1 counter: a restart resets it, making any
+/// stored client rev unservable (-> full read; the accepted durability caveat, 06G2).
+#[derive(Default)]
+pub(crate) struct DeltaIndex {
+    /// The collection's monotonic revision — the rung-1 coalescing counter, now owned here.
+    rev: u64,
+    /// key -> the rev at its last change (upsert). A removed key leaves this map: its latest state
+    /// is the tombstone in `removed`, never both (an item in `items` AND `removed` on one page
+    /// would be ambiguous to apply).
+    changed: HashMap<String, u64>,
+    /// Removal tombstones `(rev, key)` in rev order, bounded at [`REMOVED_TOMBSTONE_CAP`].
+    removed: VecDeque<(u64, String)>,
+    /// The highest rev whose tombstone was evicted by the bound (`0` = none evicted). A
+    /// `since_rev < removed_floor` delta would silently miss those removals, so it is unservable.
+    removed_floor: u64,
+}
+
+impl DeltaIndex {
+    /// Bump the rev and record `key`'s change at it (upsert semantics; a pending tombstone for a
+    /// re-added key is dropped). Returns the new rev for event stamping.
+    fn note_change(&mut self, _key: &str) -> u64 {
+        // RED (rung 2): rev bookkeeping only — the changed/removed index is not maintained yet, so
+        // `delta()` serves empty change sets and the rung-2 tests fail. GREEN populates it.
+        self.rev += 1;
+        self.rev
+    }
+
+    /// Bump the rev and record `key`'s removal tombstone at it (dropping its `changed` entry;
+    /// eviction past the bound raises `removed_floor`). Returns the new rev for event stamping.
+    fn note_remove(&mut self, _key: &str) -> u64 {
+        // RED (rung 2): rev bookkeeping only, exactly as `note_change`.
+        self.rev += 1;
+        self.rev
+    }
+
+    /// The delta past `since_rev`: `(changed keys, removed keys, current rev)` — or `None` when
+    /// unservable: `since_rev` is ahead of `rev` (the node restarted and reset this in-memory
+    /// index) or behind `removed_floor` (tombstones the client would need were evicted). The
+    /// caller maps `None` to a full page (replace-and-prune client-side).
+    fn delta(&self, since_rev: u64) -> Option<(Vec<String>, Vec<String>, u64)> {
+        if since_rev > self.rev || since_rev < self.removed_floor {
+            return None;
+        }
+        let changed: Vec<String> = self
+            .changed
+            .iter()
+            .filter(|(_, rev)| **rev > since_rev)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let removed: Vec<String> = self
+            .removed
+            .iter()
+            .filter(|(rev, _)| *rev > since_rev)
+            .map(|(_, k)| k.clone())
+            .collect();
+        Some((changed, removed, self.rev))
+    }
+}
+
 pub(crate) struct NodeFeedInner {
     /// The bounded retained ring of payload-free events (the shared cursored-ring primitive). Its
     /// cursor is monotonic from 1; an overflow eviction raises the ring's floor (-> `ResyncNeeded`).
@@ -213,22 +283,26 @@ pub(crate) struct NodeFeedInner {
     /// The monotonic profiles revision (Phase 3): bumped on every profile author/edit/delete and
     /// stamped onto `ProfilesChanged` (its coalescing key; the client re-fetches the profile list).
     profiles_rev: u64,
-    /// The monotonic persons revision (rung 1): bumped on every person-registry mutation and stamped
-    /// onto `PersonsChanged` AND echoed by `PersonList`, so the two agree on the reflected generation.
-    /// In-memory — resets to 0 on restart (a stale client rev degrades to a full read).
-    persons_rev: u64,
+    /// The persons revision + delta index (rung 1 rev; rung 2 changed/removed): bumped on every
+    /// person-registry mutation, stamped onto `PersonsChanged` AND echoed by `PersonList`, so the
+    /// two agree on the reflected generation. Rung 2 delta reads (`PersonList.since_rev`) serve
+    /// from the changed/removed bookkeeping. In-memory — resets on restart (-> full read).
+    persons: DeltaIndex,
     /// The monotonic notifications revision (rung 1): bumped on every notification-set mutation and
-    /// stamped onto `NotificationsChanged` + echoed by `NotificationList`.
+    /// stamped onto `NotificationsChanged` + echoed by `NotificationList`. Deliberately NOT a
+    /// [`DeltaIndex`]: notifications stay snapshot+rev (spec 09 §10.2).
     notifications_rev: u64,
     /// The monotonic installed-model catalog revision (rung 1): bumped on every catalog change and
     /// stamped onto `CatalogChanged` (its coalescing key). No response echo in rung 1.
     catalog_rev: u64,
-    /// Per-transport contact-roster revisions (rung 1): bumped on `ContactsChanged` and echoed by
-    /// `RosterList`'s `contact-page`. Keyed by the instance-qualified transport id.
-    contacts_rev: HashMap<TransportId, u64>,
-    /// Per-transport conversation-set revisions (rung 1): bumped on `ConversationsChanged` and echoed
-    /// by `ConvList`'s `conv-page`. Keyed by the instance-qualified transport id.
-    conversations_rev: HashMap<TransportId, u64>,
+    /// Per-transport contact-roster revisions + delta indexes (rung 1 rev; rung 2 delta): bumped on
+    /// `ContactsChanged`, echoed by `RosterList`'s `contact-page`, delta-served on
+    /// `RosterList.since_rev`. Keyed by the instance-qualified transport id.
+    contacts: HashMap<TransportId, DeltaIndex>,
+    /// Per-transport conversation-set revisions + delta indexes (rung 1 rev; rung 2 delta): bumped
+    /// on `ConversationsChanged`, echoed by `ConvList`'s `conv-page`, delta-served on
+    /// `ConvList.since_rev`. Keyed by the instance-qualified transport id.
+    conversations: HashMap<TransportId, DeltaIndex>,
 }
 
 /// Process-global startup counter minting each feed's `epoch` (rung 1). Monotonic from 1 per
@@ -250,11 +324,11 @@ impl NodeEventFeed {
                 removed: VecDeque::new(),
                 fleet_rev: 0,
                 profiles_rev: 0,
-                persons_rev: 0,
+                persons: DeltaIndex::default(),
                 notifications_rev: 0,
                 catalog_rev: 0,
-                contacts_rev: HashMap::new(),
-                conversations_rev: HashMap::new(),
+                contacts: HashMap::new(),
+                conversations: HashMap::new(),
             }),
             tx,
             epoch: FEED_EPOCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -321,18 +395,29 @@ impl NodeEventFeed {
         g.profiles_rev
     }
 
-    /// Bump the persons revision and return it (rung 1). The person-registry emit hook calls this
-    /// then stamps the returned `rev` onto a `PersonsChanged`, and `PersonList` echoes the current
-    /// value, so a burst of person writes collapses to one skip-if-unchanged decision client-side.
-    pub(crate) fn note_persons_change(&self) -> u64 {
+    /// Bump the persons revision, record `person` as changed (rung 2 delta index) or removed
+    /// (`removed = true` -> tombstone), and return the new rev (rung 1). The person-registry emit
+    /// hook calls this then stamps the returned `rev` onto a `PersonsChanged`, and `PersonList`
+    /// echoes the current value, so a burst of person writes collapses to one skip-if-unchanged
+    /// decision client-side.
+    pub(crate) fn note_persons_change(&self, person: &str, removed: bool) -> u64 {
         let mut g = self.inner.lock().unwrap();
-        g.persons_rev += 1;
-        g.persons_rev
+        if removed {
+            g.persons.note_remove(person)
+        } else {
+            g.persons.note_change(person)
+        }
     }
 
     /// The current persons revision (echoed on every `PersonList` response, rung 1).
     pub(crate) fn persons_rev(&self) -> u64 {
-        self.inner.lock().unwrap().persons_rev
+        self.inner.lock().unwrap().persons.rev
+    }
+
+    /// The persons delta past `since_rev` (rung 2): `(changed ids, removed ids, rev)`, or `None`
+    /// when unservable (restart reset / tombstones evicted) — the caller serves a full list.
+    pub(crate) fn persons_delta(&self, since_rev: u64) -> Option<(Vec<String>, Vec<String>, u64)> {
+        self.inner.lock().unwrap().persons.delta(since_rev)
     }
 
     /// Bump the notifications revision and return it (rung 1).
@@ -355,12 +440,21 @@ impl NodeEventFeed {
         g.catalog_rev
     }
 
-    /// Bump a transport's contact-roster revision and return it (rung 1).
-    pub(crate) fn note_contacts_change(&self, transport: &TransportId) -> u64 {
+    /// Bump a transport's contact-roster revision, record `contact` as changed or removed (rung 2
+    /// delta index), and return the new rev (rung 1).
+    pub(crate) fn note_contacts_change(
+        &self,
+        transport: &TransportId,
+        contact: &str,
+        removed: bool,
+    ) -> u64 {
         let mut g = self.inner.lock().unwrap();
-        let entry = g.contacts_rev.entry(transport.clone()).or_insert(0);
-        *entry += 1;
-        *entry
+        let index = g.contacts.entry(transport.clone()).or_default();
+        if removed {
+            index.note_remove(contact)
+        } else {
+            index.note_change(contact)
+        }
     }
 
     /// The current contact-roster revision for `transport` (echoed on `RosterList`, rung 1).
@@ -368,18 +462,41 @@ impl NodeEventFeed {
         self.inner
             .lock()
             .unwrap()
-            .contacts_rev
+            .contacts
             .get(transport)
-            .copied()
+            .map(|i| i.rev)
             .unwrap_or(0)
     }
 
-    /// Bump a transport's conversation-set revision and return it (rung 1).
-    pub(crate) fn note_conversations_change(&self, transport: &TransportId) -> u64 {
+    /// A transport's contact-roster delta past `since_rev` (rung 2), `None` when unservable.
+    pub(crate) fn contacts_delta(
+        &self,
+        transport: &TransportId,
+        since_rev: u64,
+    ) -> Option<(Vec<String>, Vec<String>, u64)> {
+        let g = self.inner.lock().unwrap();
+        // No index for the transport = rev 0: servable iff the client is also at 0 (empty delta).
+        match g.contacts.get(transport) {
+            Some(index) => index.delta(since_rev),
+            None => (since_rev == 0).then(|| (Vec::new(), Vec::new(), 0)),
+        }
+    }
+
+    /// Bump a transport's conversation-set revision, record `conv` as changed or removed (rung 2
+    /// delta index), and return the new rev (rung 1).
+    pub(crate) fn note_conversations_change(
+        &self,
+        transport: &TransportId,
+        conv: &str,
+        removed: bool,
+    ) -> u64 {
         let mut g = self.inner.lock().unwrap();
-        let entry = g.conversations_rev.entry(transport.clone()).or_insert(0);
-        *entry += 1;
-        *entry
+        let index = g.conversations.entry(transport.clone()).or_default();
+        if removed {
+            index.note_remove(conv)
+        } else {
+            index.note_change(conv)
+        }
     }
 
     /// The current conversation-set revision for `transport` (echoed on `ConvList`, rung 1).
@@ -387,10 +504,23 @@ impl NodeEventFeed {
         self.inner
             .lock()
             .unwrap()
-            .conversations_rev
+            .conversations
             .get(transport)
-            .copied()
+            .map(|i| i.rev)
             .unwrap_or(0)
+    }
+
+    /// A transport's conversation-set delta past `since_rev` (rung 2), `None` when unservable.
+    pub(crate) fn conversations_delta(
+        &self,
+        transport: &TransportId,
+        since_rev: u64,
+    ) -> Option<(Vec<String>, Vec<String>, u64)> {
+        let g = self.inner.lock().unwrap();
+        match g.conversations.get(transport) {
+            Some(index) => index.delta(since_rev),
+            None => (since_rev == 0).then(|| (Vec::new(), Vec::new(), 0)),
+        }
     }
 
     /// The current fleet revision (echoed on every `Tree` response as `tree-report.rev`, rung 1).
@@ -2016,8 +2146,8 @@ mod node_feed_tests {
     #[test]
     pub(crate) fn global_collection_revs_are_monotonic_and_bump_once() {
         let feed = NodeEventFeed::new(64);
-        assert_eq!(feed.note_persons_change(), 1);
-        assert_eq!(feed.note_persons_change(), 2);
+        assert_eq!(feed.note_persons_change("p1", false), 1);
+        assert_eq!(feed.note_persons_change("p2", false), 2);
         assert_eq!(feed.persons_rev(), 2, "persons_rev echoes the last bump");
         assert_eq!(feed.note_notifications_change(), 1);
         assert_eq!(feed.note_notifications_change(), 2);
@@ -2037,13 +2167,17 @@ mod node_feed_tests {
         let a = TransportId::new("matrix/@me:hs.org");
         let b = TransportId::new("room");
 
-        assert_eq!(feed.note_contacts_change(&a), 1);
-        assert_eq!(feed.note_contacts_change(&a), 2);
-        assert_eq!(feed.note_contacts_change(&b), 1, "b is independent of a");
+        assert_eq!(feed.note_contacts_change(&a, "@x:hs", false), 1);
+        assert_eq!(feed.note_contacts_change(&a, "@y:hs", false), 2);
+        assert_eq!(
+            feed.note_contacts_change(&b, "@x:hs", false),
+            1,
+            "b is independent of a"
+        );
         assert_eq!(feed.contacts_rev(&a), 2);
         assert_eq!(feed.contacts_rev(&b), 1);
 
-        assert_eq!(feed.note_conversations_change(&a), 1);
+        assert_eq!(feed.note_conversations_change(&a, "!c1", false), 1);
         assert_eq!(
             feed.conversations_rev(&a),
             1,
@@ -2052,6 +2186,134 @@ mod node_feed_tests {
         assert_eq!(feed.contacts_rev(&a), 2, "still 2 — untouched by conv bump");
         // An unseen transport reads 0 (a stale client rev then degrades to a full read).
         assert_eq!(feed.conversations_rev(&b), 0);
+    }
+
+    // ---- rung 2 (delta indexes: changed keys + removed tombstones, api vNEXT) ----
+
+    /// A delta past `since_rev` returns exactly the keys changed after it — and a servable
+    /// `since_rev == rev` returns the empty delta (the cheap "nothing changed" round-trip).
+    #[test]
+    pub(crate) fn delta_index_serves_changed_keys_past_since_rev() {
+        let feed = NodeEventFeed::new(64);
+        feed.note_persons_change("p1", false); // rev 1
+        feed.note_persons_change("p2", false); // rev 2
+        feed.note_persons_change("p1", false); // rev 3 (p1 changed again)
+
+        let (mut changed, removed, rev) = feed.persons_delta(2).expect("servable");
+        changed.sort();
+        assert_eq!(rev, 3);
+        assert_eq!(
+            changed,
+            vec!["p1".to_string()],
+            "only keys changed after since_rev ride the delta"
+        );
+        assert!(removed.is_empty());
+
+        let (changed, removed, rev) = feed.persons_delta(3).expect("servable at head");
+        assert_eq!((changed.len(), removed.len(), rev), (0, 0, 3));
+
+        let (mut changed, _, _) = feed.persons_delta(0).expect("servable from 0");
+        changed.sort();
+        assert_eq!(changed, vec!["p1".to_string(), "p2".to_string()]);
+    }
+
+    /// A removal becomes a tombstone: it leaves the changed set and rides `removed` for deltas
+    /// anchored before it; a re-add drops the pending tombstone (never both sides on one page).
+    #[test]
+    pub(crate) fn delta_index_tombstones_removals_and_readds() {
+        let feed = NodeEventFeed::new(64);
+        feed.note_persons_change("p1", false); // rev 1
+        feed.note_persons_change("p2", false); // rev 2
+        feed.note_persons_change("p1", true); // rev 3: p1 removed
+
+        let (changed, removed, rev) = feed.persons_delta(2).expect("servable");
+        assert_eq!(rev, 3);
+        assert!(changed.is_empty(), "a removed key leaves the changed set");
+        assert_eq!(removed, vec!["p1".to_string()]);
+
+        // A delta anchored AT the removal no longer needs the tombstone.
+        let (_, removed, _) = feed.persons_delta(3).expect("servable");
+        assert!(removed.is_empty());
+
+        // Re-add: the pending tombstone is dropped; the key rides `changed` only.
+        feed.note_persons_change("p1", false); // rev 4
+        let (changed, removed, rev) = feed.persons_delta(2).expect("servable");
+        assert_eq!(rev, 4);
+        assert_eq!(changed, vec!["p1".to_string()]);
+        assert!(
+            removed.is_empty(),
+            "a re-added key must not also ride `removed` (ambiguous apply)"
+        );
+    }
+
+    /// A `since_rev` ahead of the current rev (the post-restart signature: in-memory counters
+    /// reset) is unservable -> `None` -> the caller serves a full page.
+    #[test]
+    pub(crate) fn delta_index_ahead_since_rev_is_unservable() {
+        let feed = NodeEventFeed::new(64);
+        feed.note_persons_change("p1", false); // rev 1
+        assert!(
+            feed.persons_delta(999).is_none(),
+            "ahead of rev: unservable"
+        );
+        assert!(feed.persons_delta(1).is_some());
+    }
+
+    /// Tombstone eviction past the bound raises the floor: a delta anchored below the evicted
+    /// tombstone's rev is unservable (it would silently miss removals), while one anchored at or
+    /// above the floor still serves. Memory stays bounded at REMOVED_TOMBSTONE_CAP.
+    #[test]
+    pub(crate) fn delta_index_tombstone_eviction_raises_the_unservable_floor() {
+        let feed = NodeEventFeed::new(64);
+        let t = TransportId::new("room");
+        // One change (rev 1), then CAP + 1 removals of distinct keys (revs 2..=CAP+2).
+        feed.note_conversations_change(&t, "keeper", false);
+        for i in 0..=REMOVED_TOMBSTONE_CAP {
+            feed.note_conversations_change(&t, &format!("gone-{i}"), true);
+        }
+        // The oldest tombstone (rev 2) was evicted: a client at rev 1 cannot be served.
+        assert!(
+            feed.conversations_delta(&t, 1).is_none(),
+            "a delta needing an evicted tombstone must be unservable"
+        );
+        // A client at the evicted tombstone's rev (2) needs only the retained ones -> servable.
+        let (_, removed, _) = feed
+            .conversations_delta(&t, 2)
+            .expect("servable at the floor");
+        assert_eq!(
+            removed.len(),
+            REMOVED_TOMBSTONE_CAP,
+            "exactly the retained tombstones ride the delta"
+        );
+    }
+
+    /// The per-transport delta indexes are isolated: a removal on one transport never appears in
+    /// another's delta, and an untouched transport serves the trivial rev-0 delta.
+    #[test]
+    pub(crate) fn delta_indexes_are_per_transport() {
+        let feed = NodeEventFeed::new(64);
+        let a = TransportId::new("matrix/@me:hs.org");
+        let b = TransportId::new("room");
+        feed.note_contacts_change(&a, "@x:hs", false); // a rev 1
+        feed.note_contacts_change(&a, "@x:hs", true); // a rev 2
+        feed.note_contacts_change(&b, "@x:hs", false); // b rev 1
+
+        let (changed, removed, rev) = feed.contacts_delta(&a, 1).expect("servable");
+        assert_eq!((changed.len(), rev), (0, 2));
+        assert_eq!(removed, vec!["@x:hs".to_string()]);
+
+        let (changed, removed, rev) = feed.contacts_delta(&b, 0).expect("servable");
+        assert_eq!(rev, 1);
+        assert_eq!(changed, vec!["@x:hs".to_string()]);
+        assert!(removed.is_empty(), "b never saw a removal");
+
+        // An unseen transport: servable only at rev 0 (the empty delta); anything else degrades.
+        let c = TransportId::new("xmpp/c");
+        assert_eq!(
+            feed.contacts_delta(&c, 0),
+            Some((Vec::new(), Vec::new(), 0))
+        );
+        assert!(feed.contacts_delta(&c, 5).is_none());
     }
 
     /// The feed epoch (rung 1) is stamped onto every emitted `EventsPage`, and a simulated restart

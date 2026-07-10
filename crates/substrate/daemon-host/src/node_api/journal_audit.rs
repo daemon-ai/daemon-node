@@ -110,6 +110,36 @@ impl NodeApiImpl {
         // contract stays generic; `next_cursor`/`head_cursor` let the client loop to completion.
         let max = daemon_api::clamp_page_max(max);
         let page = self.store.load_journal(&stream, after_cursor, max).await;
+        self.view_journal_page(stream, page).await
+    }
+
+    /// Read a stream's newest-anchored backward window (rung 2): the `max` newest entries with
+    /// `cursor < before_cursor`, decoded + verified exactly like [`Self::read_history`]. The view's
+    /// `next_cursor` is the backward continuation (the OLDEST returned cursor, or `before_cursor`
+    /// when the window is empty); anchoring is stable because appends land above every served
+    /// anchor, so interleaved writes never skip or duplicate entries across a backward walk.
+    pub(crate) async fn read_history_before(
+        &self,
+        stream: JournalStreamId,
+        before_cursor: u64,
+        max: u32,
+    ) -> JournalPageView {
+        // Same wire-bound clamp as the forward read (`max == 0` = one full wire page, newest).
+        let max = daemon_api::clamp_page_max(max);
+        let page = self
+            .store
+            .load_journal_before(&stream, before_cursor, max)
+            .await;
+        self.view_journal_page(stream, page).await
+    }
+
+    /// Decode + verify one fetched journal page into its wire view (shared by the forward and
+    /// backward reads; the page's cursors pass through untouched).
+    async fn view_journal_page(
+        &self,
+        stream: JournalStreamId,
+        page: daemon_store::JournalPage,
+    ) -> JournalPageView {
         let key = self.verifier.as_ref().map(|s| s.verifying_key());
 
         // Verify each distinct sealed segment the page touches exactly once.

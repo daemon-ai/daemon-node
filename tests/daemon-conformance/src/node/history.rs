@@ -51,7 +51,7 @@ async fn reconnect_reads_back_verified_session_history_impl() {
     let mut page = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let p = node.session_history(session.clone(), 0, 0).await;
+        let p = node.session_history(session.clone(), 0, None, 0).await;
         if !p.entries.is_empty() {
             page = Some(p);
             break;
@@ -76,7 +76,7 @@ async fn reconnect_reads_back_verified_session_history_impl() {
     );
 
     // Non-destructive: a repeat read from the same cursor returns the same entries.
-    let again = node.session_history(session.clone(), 0, 0).await;
+    let again = node.session_history(session.clone(), 0, None, 0).await;
     assert_eq!(
         again.entries, page.entries,
         "history read must be non-destructive"
@@ -132,7 +132,7 @@ async fn session_history_pages_past_the_wire_bound_impl() {
     let mut seen = 0usize;
     let mut pages = 0usize;
     loop {
-        let page = node.session_history(session.clone(), cursor, 0).await;
+        let page = node.session_history(session.clone(), cursor, None, 0).await;
         assert!(
             page.entries.len() <= WIRE_PAGE_MAX,
             "a history page must never exceed the wire bound, got {}",
@@ -241,7 +241,7 @@ async fn rewind_to_seals_history_and_reruns_over_node_impl() {
     let mut sealed = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let page = node.session_history(session.clone(), 0, 0).await;
+        let page = node.session_history(session.clone(), 0, None, 0).await;
         if page.sealed_after.is_some() {
             sealed = page.sealed_after;
             break;

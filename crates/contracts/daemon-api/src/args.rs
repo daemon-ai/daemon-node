@@ -69,9 +69,16 @@ pub struct ConvHistoryArgs {
     pub transport: TransportId,
     /// The conversation id.
     pub conv: String,
-    /// Return entries with cursor strictly greater than this (`0` from the start).
+    /// Return entries with cursor strictly greater than this (`0` from the start). Ignored when
+    /// `before_cursor` is present.
     #[serde(default)]
     pub after_cursor: u64,
+    /// Backward window (rung 2, api vNEXT): when `Some(B)`, return the `max` newest entries with
+    /// `cursor < B` (newest-anchored; pass a value past head — e.g. `u64::MAX` — for the latest
+    /// window in one round-trip). Wins over `after_cursor` when present. Absent on the wire when
+    /// `None` (never null).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_cursor: Option<u64>,
     /// Max entries (`0` = all).
     #[serde(default)]
     pub max: u32,

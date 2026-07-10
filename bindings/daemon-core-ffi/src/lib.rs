@@ -1257,7 +1257,7 @@ mod merged_log_tests {
 
         // The FFI exposes no durable journal, so history is empty: the meta event is observability
         // only and never graduates into durable history.
-        let history = api.session_history(session.clone(), 0, 0).await;
+        let history = api.session_history(session.clone(), 0, None, 0).await;
         assert!(history.entries.is_empty());
     }
 }

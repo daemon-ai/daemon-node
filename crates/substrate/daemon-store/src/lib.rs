@@ -1519,6 +1519,24 @@ pub trait SessionStore: Send + Sync {
         JournalPage::default()
     }
 
+    /// Backward cursor-paged read of a stream's journal (rung 2): the `max` NEWEST entries with
+    /// `cursor < before_cursor` (the window ending just below `before_cursor`), returned in
+    /// ASCENDING cursor order like [`Self::load_journal`]. `max == 0` = no cap. The page's
+    /// `next_cursor` is the backward continuation — the OLDEST returned cursor (pass it as the
+    /// next `before_cursor`), or `before_cursor` itself when the page is empty; `head_cursor` is
+    /// the stream head as on a forward read. Anchoring is stable by construction: appends land
+    /// above every already-served backward anchor, so an interleaved write never skips or
+    /// duplicates entries across a backward page walk. Non-destructive. Default: empty (a store
+    /// without a verifiable journal).
+    async fn load_journal_before(
+        &self,
+        _stream: &JournalStreamId,
+        _before_cursor: u64,
+        _max: u32,
+    ) -> JournalPage {
+        JournalPage::default()
+    }
+
     /// Record an append-only conversation-rewind seal against `stream` (conversation-rewind spec §6).
     /// Default no-op for stores without a verifiable journal.
     async fn record_journal_seal(
@@ -3206,6 +3224,186 @@ mod session_meta_tests {
     #[tokio::test]
     async fn sqlite_pending_inputs_round_trip() {
         pending_input_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+}
+
+#[cfg(test)]
+mod backward_journal_tests {
+    //! The rung-2 backward journal read (`load_journal_before`), proven against both backends:
+    //! newest-anchored windows in ascending order, strict upper bound, stable anchoring under
+    //! interleaved appends (no skips/dupes across a backward page walk), and non-destructive reads.
+
+    use super::*;
+
+    /// Append `n` entries to `stream` (one segment, seq = 0..n) and return their cursors in
+    /// append order (read back through the forward read, so the tests never assume the global
+    /// cursor's starting value).
+    async fn seed(store: &dyn SessionStore, stream: &JournalStreamId, n: u8) -> Vec<u64> {
+        for seq in 0..n {
+            store
+                .append_trace(
+                    stream,
+                    0,
+                    TraceEntry {
+                        seq: seq as u64,
+                        bytes: vec![seq],
+                        content_hash: ContentHash::new([seq; 32]),
+                    },
+                )
+                .await
+                .expect("append");
+        }
+        store
+            .load_journal(stream, 0, 0)
+            .await
+            .entries
+            .iter()
+            .map(|e| e.cursor)
+            .collect()
+    }
+
+    async fn backward_window_behaviour(store: &dyn SessionStore) {
+        let stream = JournalStreamId::unit(&daemon_common::UnitId::new("bwd-1"));
+        let cursors = seed(store, &stream, 7).await;
+        assert_eq!(cursors.len(), 7, "seed sanity");
+        let head = *cursors.last().unwrap();
+
+        // Latest window in one round-trip: before = u64::MAX anchors at the head.
+        let page = store.load_journal_before(&stream, u64::MAX, 3).await;
+        let got: Vec<u64> = page.entries.iter().map(|e| e.cursor).collect();
+        assert_eq!(got, cursors[4..7], "the 3 newest, ascending");
+        assert_eq!(page.head_cursor, head);
+        assert_eq!(
+            page.next_cursor, cursors[4],
+            "next_cursor = the OLDEST returned cursor (the backward continuation)"
+        );
+
+        // Continue backward: contiguous, no dupes, no skips.
+        let page2 = store
+            .load_journal_before(&stream, page.next_cursor, 3)
+            .await;
+        let got2: Vec<u64> = page2.entries.iter().map(|e| e.cursor).collect();
+        assert_eq!(got2, cursors[1..4]);
+        let page3 = store
+            .load_journal_before(&stream, page2.next_cursor, 3)
+            .await;
+        let got3: Vec<u64> = page3.entries.iter().map(|e| e.cursor).collect();
+        assert_eq!(got3, cursors[0..1], "the final, short page");
+
+        // Past the oldest entry: empty, next_cursor echoes the input anchor.
+        let done = store
+            .load_journal_before(&stream, page3.next_cursor, 3)
+            .await;
+        assert!(done.entries.is_empty());
+        assert_eq!(done.next_cursor, page3.next_cursor);
+
+        // Strict upper bound: before = smallest cursor excludes it; +1 yields exactly it.
+        let below = store.load_journal_before(&stream, cursors[0], 8).await;
+        assert!(below.entries.is_empty(), "cursor < before is strict");
+        let exactly = store.load_journal_before(&stream, cursors[0] + 1, 8).await;
+        assert_eq!(
+            exactly.entries.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+            cursors[0..1]
+        );
+
+        // max == 0 = no cap (mirrors the forward read's store contract).
+        let all = store.load_journal_before(&stream, u64::MAX, 0).await;
+        assert_eq!(
+            all.entries.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+            cursors,
+            "max 0 returns the whole stream below the anchor, ascending"
+        );
+
+        // Non-destructive: a repeat read returns the identical page.
+        let again = store.load_journal_before(&stream, u64::MAX, 3).await;
+        assert_eq!(again.entries, page.entries);
+    }
+
+    /// Writes landing between backward pages never disturb the walk: pages below an already
+    /// -served anchor are byte-identical, and the union has no dupes or skips — new records are
+    /// picked up by a forward read from the old head, exactly where the client expects them.
+    async fn backward_window_stable_under_interleaved_appends(store: &dyn SessionStore) {
+        let stream = JournalStreamId::unit(&daemon_common::UnitId::new("bwd-2"));
+        let cursors = seed(store, &stream, 5).await;
+        let head = *cursors.last().unwrap();
+
+        // First backward page (newest 2), anchoring the walk.
+        let first = store.load_journal_before(&stream, u64::MAX, 2).await;
+        assert_eq!(
+            first.entries.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+            cursors[3..5]
+        );
+
+        // Two new records land mid-walk.
+        for seq in 5..7u8 {
+            store
+                .append_trace(
+                    &stream,
+                    0,
+                    TraceEntry {
+                        seq: seq as u64,
+                        bytes: vec![seq],
+                        content_hash: ContentHash::new([seq; 32]),
+                    },
+                )
+                .await
+                .expect("append");
+        }
+
+        // The continuation below the anchor is untouched by the appends.
+        let second = store
+            .load_journal_before(&stream, first.next_cursor, 2)
+            .await;
+        assert_eq!(
+            second.entries.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+            cursors[1..3],
+            "pages below a served anchor must not shift under appends"
+        );
+        let third = store
+            .load_journal_before(&stream, second.next_cursor, 2)
+            .await;
+        assert_eq!(
+            third.entries.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+            cursors[0..1]
+        );
+
+        // No dupes / no skips across the whole walk; the interleaved records sit above the old
+        // head, served by the forward read from it.
+        let forward = store.load_journal(&stream, head, 0).await;
+        assert_eq!(forward.entries.len(), 2, "the two interleaved appends");
+        let mut union: Vec<u64> = first
+            .entries
+            .iter()
+            .chain(&second.entries)
+            .chain(&third.entries)
+            .map(|e| e.cursor)
+            .collect();
+        union.sort_unstable();
+        union.dedup();
+        assert_eq!(union, cursors, "backward union = the pre-append stream");
+    }
+
+    #[tokio::test]
+    async fn in_memory_backward_windows_are_anchored_and_ordered() {
+        backward_window_behaviour(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_backward_windows_are_anchored_and_ordered() {
+        backward_window_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_backward_windows_survive_interleaved_appends() {
+        backward_window_stable_under_interleaved_appends(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_backward_windows_survive_interleaved_appends() {
+        backward_window_stable_under_interleaved_appends(&SqliteStore::open_in_memory().unwrap())
+            .await;
     }
 }
 

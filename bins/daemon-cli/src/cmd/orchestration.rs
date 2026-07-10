@@ -76,6 +76,7 @@ pub(super) async fn run(client: &ApiClient, command: Command) -> anyhow::Result<
                 .call(ApiRequest::UnitHistory {
                     unit: UnitId::new(id),
                     after_cursor: after,
+                    before_cursor: None,
                     max,
                 })
                 .await?,

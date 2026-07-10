@@ -45,6 +45,7 @@ mod revocation_transport;
 mod routing_auth;
 mod routing_hot_reload;
 mod rung1_revs;
+mod rung2_deltas;
 mod semantic_search;
 mod session_recall;
 mod sessions;

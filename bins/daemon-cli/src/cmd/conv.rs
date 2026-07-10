@@ -19,6 +19,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
         ConvCmd::List { transport } => ApiRequest::ConvList {
             transport: TransportId::new(transport),
             after: None,
+            since_rev: None,
         },
         ConvCmd::Get { transport, conv } => ApiRequest::ConvGet {
             transport: TransportId::new(transport),
@@ -115,6 +116,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
             transport: TransportId::new(transport),
             conv,
             after_cursor: after,
+            before_cursor: None,
             max,
         }),
     };

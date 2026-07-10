@@ -451,7 +451,7 @@ fn classify(req: &ApiRequest) -> Coverage {
         NotificationList => NotSessionTouching,
         // The person/metacontact registry is node-wide (not per-owner session state): the coarse
         // ControlRead capability gate governs it (wire v37).
-        PersonList => NotSessionTouching,
+        PersonList { .. } => NotSessionTouching,
         // The node-owned gateway is a node-wide resident service (not per-owner session state): the
         // coarse capability gate governs (GatewayGet -> ControlRead, GatewaySet -> ControlWrite).
         GatewayGet | GatewaySet { .. } => NotSessionTouching,
@@ -725,6 +725,7 @@ fn owner_gated_samples(s: &SessionId) -> Vec<(&'static str, ApiRequest, Deny)> {
             ApiRequest::SessionHistory {
                 session: s.clone(),
                 after_cursor: 0,
+                before_cursor: None,
                 max: 64,
             },
             Deny::EmptyOrAbsent,
@@ -815,6 +816,7 @@ fn owner_gated_samples(s: &SessionId) -> Vec<(&'static str, ApiRequest, Deny)> {
             ApiRequest::UnitHistory {
                 unit: UnitId::new(s.as_str()),
                 after_cursor: 0,
+                before_cursor: None,
                 max: 8,
             },
             Deny::EmptyOrAbsent,

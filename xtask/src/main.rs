@@ -284,6 +284,39 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             max: 64,
         },
     )?;
+    // rung 2 (api vNEXT): the generalized backward windows — a forward SessionHistory resume
+    // (before_cursor absent, never null) and the newest-anchored backward forms of all three
+    // journal reads, so verify-codec proves the generated zcbor decoder accepts both shapes.
+    write_cbor(
+        &out,
+        "request-session-history.cbor",
+        &ApiRequest::SessionHistory {
+            session: SessionId::new("fixture-session"),
+            after_cursor: 128,
+            before_cursor: None,
+            max: 64,
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-session-history-before.cbor",
+        &ApiRequest::SessionHistory {
+            session: SessionId::new("fixture-session"),
+            after_cursor: 0,
+            before_cursor: Some(u64::MAX),
+            max: 64,
+        },
+    )?;
+    write_cbor(
+        &out,
+        "request-unit-history-before.cbor",
+        &ApiRequest::UnitHistory {
+            unit: daemon_common::UnitId::new("fixture-unit"),
+            after_cursor: 0,
+            before_cursor: Some(4096),
+            max: 32,
+        },
+    )?;
     write_cbor(
         &out,
         "request-events-since.cbor",
@@ -554,13 +587,15 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         }),
     )?;
     // Paged conv_list (wire v25): a resume request + a page with a set `next` cursor, proving the
-    // generated zcbor C decoder accepts the conv-page shape.
+    // generated zcbor C decoder accepts the conv-page shape. rung 2 (api vNEXT): the request
+    // carries a `since_rev` delta anchor and the page carries `removed` tombstones.
     write_cbor(
         &out,
         "request-conv-list.cbor",
         &ApiRequest::ConvList {
             transport: daemon_protocol::TransportId::new("rooms"),
             after: Some("conv-063".into()),
+            since_rev: Some(7),
         },
     )?;
     write_cbor(
@@ -581,6 +616,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             // rung 1 (api vNEXT): the transport's conversation-set rev the client compares against
             // the `ConversationsChanged.rev` pointer.
             rev: 8,
+            // rung 2 (api vNEXT): a delta read's removal tombstone (the client prunes it).
+            removed: vec!["conv-007".into()],
         }),
     )?;
     // Conversation hierarchy (wire v38): a structural `Space` container (a root — no `parent`) and
@@ -614,6 +651,20 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             ],
             next: None,
             rev: 2,
+            removed: Vec::new(),
+        }),
+    )?;
+    // rung 2 (api vNEXT): the ConvHistory backward window — `before_cursor` present (a scroll-back
+    // fetch of the newest 64 records below an anchor), `after_cursor` at its default.
+    write_cbor(
+        &out,
+        "request-conv-history-before.cbor",
+        &ApiRequest::ConvHistory(daemon_api::ConvHistoryArgs {
+            transport: daemon_protocol::TransportId::new("rooms"),
+            conv: "conv-064".into(),
+            after_cursor: 0,
+            before_cursor: Some(9000),
+            max: 64,
         }),
     )?;
     // Server-side roster (wire v34): a paged list request + resume, the mutation requests carrying a
@@ -625,6 +676,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &ApiRequest::RosterList {
             transport: TransportId::new("matrix/@me:hs.org"),
             after: Some("@aaa:matrix.org".into()),
+            // rung 2 (api vNEXT): the delta anchor (the contact-roster rev last reflected).
+            since_rev: Some(5),
         },
     )?;
     write_cbor(
@@ -666,6 +719,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             next: Some("@bob:matrix.org".into()),
             // rung 1 (api vNEXT): the transport's contact-roster rev (vs `ContactsChanged.rev`).
             rev: 5,
+            // rung 2 (api vNEXT): a delta read's removal tombstone (the client prunes it).
+            removed: vec!["@gone:matrix.org".into()],
         }),
     )?;
     // Notifications (wire v37; port-notify): the read-only list op + a response carrying an
@@ -708,11 +763,16 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     // Persons / metacontacts (wire v37; port-person): the read-only list op + a response carrying
     // an aliased, avatared, multi-endpoint person, so verify-codec proves the generated zcbor C
     // decoder accepts the person shape (incl. the first wire-reachable `image` rule).
-    write_cbor(&out, "request-person-list.cbor", &ApiRequest::PersonList)?;
+    // rung 2 (api vNEXT): the former unit variant becomes a map carrying the delta anchor.
+    write_cbor(
+        &out,
+        "request-person-list.cbor",
+        &ApiRequest::PersonList { since_rev: Some(6) },
+    )?;
     write_cbor(
         &out,
         "response-persons.cbor",
-        &ApiResponse::Persons(daemon_api::RevList {
+        &ApiResponse::Persons(daemon_api::RevDeltaList {
             // rung 1 (api vNEXT): the persons rev the client compares against `PersonsChanged.rev`.
             rev: 6,
             items: vec![daemon_api::Person {
@@ -745,6 +805,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     ),
                 ],
             }],
+            // rung 2 (api vNEXT): a delta read's removal tombstone (the client prunes it).
+            removed: vec!["person-gone".into()],
         }),
     )?;
     // Account management (wire v35): the reversible-connect + persisted enabled/label + credential
