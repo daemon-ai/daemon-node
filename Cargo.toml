@@ -307,6 +307,9 @@ daemon-ingest = { version = "0", path = "crates/adapters/daemon-ingest" }
 daemon-matrix = { version = "0", path = "crates/adapters/daemon-matrix" }
 daemon-oauth = { version = "0", path = "crates/adapters/daemon-oauth" }
 daemon-rooms = { version = "0", path = "crates/adapters/daemon-rooms" }
+# [N5:demo] the in-process demo transport (adapter + interactive-auth factories) exercising the full
+# vNEXT surface with zero external network. Self-contained, like `daemon-rooms`.
+daemon-demo = { version = "0", path = "crates/adapters/daemon-demo" }
 # [waveB:msg-adapters] Six additional chat-transport adapters (Phase 2 integration). Each isolates
 # its heavy external SDK deps; the daemon binary only references its `Adapter`/`AuthFlowFactory`/`Config`.
 daemon-telegram = { version = "0", path = "crates/adapters/daemon-telegram" }

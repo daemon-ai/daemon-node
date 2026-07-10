@@ -1,0 +1,31 @@
+[package]
+name = "daemon-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The in-process "demo" messaging transport (N5): a fully self-contained adapter + interactive-auth
+# factories that exercise the ENTIRE vNEXT surface — auth flows (every `AuthFlowKind`), the account
+# settings schema + `validate_account`, the full conversation tree (Space/parent/Channel/Dm/GroupDm),
+# a seeded roster with varied presence, and live two-way chat journaled through the node's
+# `LifecycleSink`. It reaches nothing external: no network, no store, no credentials. Depends only on
+# the contracts (+ the host auth seam for its factories) + the async runtime, mirroring how
+# `daemon-rooms` stays a self-contained in-process adapter.
+[dependencies]
+daemon-api = { workspace = true }
+daemon-protocol = { workspace = true }
+daemon-common = { workspace = true }
+# the host-side interactive-auth seam (`AuthFlowFactory`/`PendingAuthFlow`/`AuthOutcome`), exactly as
+# the descriptor-driven `daemon-oauth` families plug into it.
+daemon-host = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

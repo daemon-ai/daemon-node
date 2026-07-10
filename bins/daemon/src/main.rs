@@ -2723,6 +2723,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         ));
     }
     // [waveA:node-fixes] end
+    // [N5:demo] the demo transport's interactive-auth families (one per AuthFlowKind) ride only when
+    // the demo transport is enabled, mirroring the per-transport gating below. They need no config.
+    if cfg.demo.enabled {
+        auth_factories.extend(daemon_demo::demo_auth_factories());
+    }
     if cfg.matrix.enabled {
         auth_factories.push(Arc::new(daemon_matrix::MatrixAuthFlowFactory::new(
             cfg.matrix.store_root.clone(),
@@ -3207,6 +3212,16 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         adapter_registry = adapter_registry.with_adapter(daemon_rooms::RoomsAdapter::new(
             store.clone(),
             cfg.rooms.clone(),
+            Some(node.lifecycle_sink()),
+        ));
+    }
+    if cfg.demo.enabled {
+        tracing::info!("registering in-process demo transport (daemon-demo)");
+        // [N5:demo] hand the adapter the node's lifecycle sink: every ConvSend + scripted reply is
+        // journaled as a Chat record on `conv:demo:<id>` + announced via MessagesChanged through
+        // that one seam. The demo reaches nothing external (no store/accounts/credentials).
+        adapter_registry = adapter_registry.with_adapter(daemon_demo::DemoAdapter::new(
+            cfg.demo.clone(),
             Some(node.lifecycle_sink()),
         ));
     }

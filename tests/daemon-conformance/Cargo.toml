@@ -36,6 +36,9 @@ daemon-providers = { workspace = true }
 daemon-models = { workspace = true }
 daemon-acp = { workspace = true }
 daemon-rooms = { workspace = true }
+# N5 demo-transport conformance: the in-process demo adapter + its interactive-auth factories,
+# driven over the socket exactly as a GUI/TUI would. Used from `src/`, so a normal dependency.
+daemon-demo = { workspace = true }
 daemon-matrix = { workspace = true }
 daemon-delivery = { workspace = true }
 daemon-ingest = { workspace = true }

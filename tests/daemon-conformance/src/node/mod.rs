@@ -18,6 +18,7 @@ mod bootstrap_wiring;
 mod cron;
 mod daemon_cloud_e2e;
 mod delivery_memory;
+mod demo_transport;
 mod detached_delegation;
 mod events_transport;
 mod f3f4_ownership;

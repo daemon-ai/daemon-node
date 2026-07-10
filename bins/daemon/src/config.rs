@@ -1569,6 +1569,10 @@ pub struct NodeConfig {
     pub slack: daemon_slack::SlackConfig,
     /// The internal Rooms loopback transport config (`enabled = false` by default).
     pub rooms: daemon_rooms::RoomsConfig,
+    /// The in-process demo transport config (`enabled = false` by default). When on it registers the
+    /// [`DemoAdapter`](daemon_demo::DemoAdapter) + its interactive-auth factories (N5).
+    #[serde(default)]
+    pub demo: daemon_demo::DemoConfig,
     /// Interactive-auth (OAuth2 login) config: gates the provider-bound families that need
     /// operator-supplied config. The generic `oauth2` family and OpenRouter need no config.
     pub oauth: OAuthConfig,
@@ -1641,6 +1645,7 @@ impl Default for NodeConfig {
             line: daemon_line::LineConfig::default(),
             slack: daemon_slack::SlackConfig::default(),
             rooms: daemon_rooms::RoomsConfig::default(),
+            demo: daemon_demo::DemoConfig::default(),
             oauth: OAuthConfig::default(),
             api: ApiConfig::default(),
             shell: daemon_processes::ShellConfig::default(),
