@@ -1326,3 +1326,262 @@ async fn account_provisioning_enumerates_resolves_and_refreshes() {
 
     handle.shutdown().await;
 }
+
+/// USERPASSWORD INTERACTIVE-AUTH (wire vNEXT — the exchange-at-sign-in pattern): a reference
+/// username/password family proves the enriched-field + `AuthFlowKind::UserPassword` surface end to
+/// end through the node's `PendingAuthFlows` plumbing:
+/// (1) `auth_providers` advertises the `UserPassword` flow with a MASKED (`AuthFieldKind::Password`)
+///     password field beside a plain-text username;
+/// (2) `auth_begin` parks a `Form` challenge carrying that same masked field;
+/// (3) `auth_step(Fields)` with the RIGHT password validates + "exchanges" the (transient) password
+///     for an opaque session-token blob and completes — the exchanged TOKEN (never the password) is
+///     persisted through the `CredentialStore` (visible, redacted, via `credential_list`) and the
+///     optional profile bind is honored;
+/// (4) `auth_step(Fields)` with the WRONG password is rejected (the flow stays parked to retry).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_auth_userpassword_form_exchange_completes() {
+    use async_trait::async_trait;
+    use daemon_api::{
+        ApiError, AuthApi, AuthBeginRequest, AuthBindRequest, AuthChallenge, AuthFieldKind,
+        AuthFlowKind, AuthParamField, AuthProviderInfo, AuthStepInput, AuthStepRequest,
+        AuthStepResult, CredentialApi, ProfileSpec, ProviderSelector,
+    };
+    use daemon_host::{
+        AuthFlowFactory, AuthOutcome, AuthStepOutcome, MemCredentialStore, MemProfileStore,
+        PendingAuthFlow, ProfileStore,
+    };
+    use daemon_protocol::TransportId;
+    use std::collections::BTreeMap;
+
+    // The only accepted password (a real family exchanges against an IdP; this proves the seam).
+    const GOOD_PASSWORD: &str = "correct-horse";
+
+    // The masked `username`+`password` form this family collects (shared by discovery + the initial
+    // challenge so the client renders identical fields either way).
+    fn userpass_fields() -> Vec<AuthParamField> {
+        vec![
+            AuthParamField {
+                key: "username".into(),
+                label: "Username".into(),
+                required: true,
+                kind: AuthFieldKind::Text,
+                default: None,
+                placeholder: Some("you@example.org".into()),
+                choices: Vec::new(),
+            },
+            AuthParamField {
+                key: "password".into(),
+                label: "Password".into(),
+                required: true,
+                kind: AuthFieldKind::Password,
+                default: None,
+                placeholder: None,
+                choices: Vec::new(),
+            },
+        ]
+    }
+
+    struct UserPassFlow;
+    #[async_trait]
+    impl PendingAuthFlow for UserPassFlow {
+        fn initial_challenge(&self) -> AuthChallenge {
+            AuthChallenge::Form {
+                title: "Sign in".into(),
+                fields: userpass_fields(),
+            }
+        }
+        async fn step(&self, input: AuthStepInput) -> Result<AuthStepOutcome, ApiError> {
+            let AuthStepInput::Fields(fields) = input else {
+                return Err(ApiError::Other("userpass expects form fields".into()));
+            };
+            let username = fields
+                .get("username")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ApiError::Other("username is required".into()))?;
+            let password = fields
+                .get("password")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ApiError::Other("password is required".into()))?;
+            if password != GOOD_PASSWORD {
+                return Err(ApiError::Other("invalid username or password".into()));
+            }
+            // Exchange the (transient) password for an opaque session token; ONLY the token is
+            // persisted — the password never enters the blob.
+            Ok(AuthStepOutcome::Completed(AuthOutcome {
+                credential_blob: format!("session-token:{username}"),
+                credential_ref: format!("userpass/{username}"),
+                account_label: username.clone(),
+                transport_instance: TransportId::new(format!("userpass/{username}")),
+                slot: daemon_host::CredentialSlotKind::Derived,
+            }))
+        }
+    }
+
+    struct UserPassFactory;
+    #[async_trait]
+    impl AuthFlowFactory for UserPassFactory {
+        fn family(&self) -> &str {
+            "userpass"
+        }
+        fn provider_info(&self) -> AuthProviderInfo {
+            AuthProviderInfo {
+                family: "userpass".into(),
+                flow_kind: AuthFlowKind::UserPassword,
+                display_name: "Username & password".into(),
+                params_schema: userpass_fields(),
+            }
+        }
+        async fn begin(
+            &self,
+            _params: &BTreeMap<String, String>,
+            _redirect_uri: &str,
+        ) -> Result<Box<dyn PendingAuthFlow>, ApiError> {
+            Ok(Box::new(UserPassFlow))
+        }
+    }
+
+    let profiles = Arc::new(MemProfileStore::new());
+    profiles
+        .create(ProfileSpec::new(
+            "alpha",
+            ProviderSelector::GenAi,
+            "model-a",
+        ))
+        .expect("create alpha");
+    let creds = Arc::new(MemCredentialStore::new());
+
+    let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+        store: Arc::new(InMemoryStore::new()),
+        partition: PARTITION,
+        host_config: fast_host_config(),
+        providers: gate_providers(),
+        credentials: None,
+        profile: ProfileRef::new("alpha"),
+        engine_config: daemon_core::Config::default(),
+        journal_seed: Some([0x55; 32]),
+        nesting_depth: 0,
+        context: None,
+        context_builder: None,
+        memory: Vec::new(),
+        memory_builder: None,
+        extra_tools: Vec::new(),
+        models: None,
+        profiles: Some(profiles.clone()),
+        provider_resolver: None,
+        credential_store: Some(creds),
+        cloud_catalog: None,
+        prompt_sources: vec![],
+        revisions: None,
+        skills: None,
+        skills_resolver: None,
+        routing: None,
+        checkpoints: None,
+        auth_factories: vec![Arc::new(UserPassFactory)],
+        workspace_root: None,
+        blob_root: None,
+        fs: Default::default(),
+        processes: Default::default(),
+        title_aux: None,
+        reaper: Default::default(),
+        orchestrate: Default::default(),
+        foreign_gateway: None,
+        prompt: Default::default(),
+    });
+
+    // (1) discovery: the userpass family advertises the UserPassword flow + a masked password field.
+    let providers = node.auth_providers().await;
+    let info = providers
+        .iter()
+        .find(|p| p.family == "userpass")
+        .expect("the userpass family is listed");
+    assert_eq!(info.flow_kind, AuthFlowKind::UserPassword);
+    let password_field = info
+        .params_schema
+        .iter()
+        .find(|f| f.key == "password")
+        .expect("a password field in the schema");
+    assert_eq!(
+        password_field.kind,
+        AuthFieldKind::Password,
+        "the password field is advertised masked"
+    );
+
+    // (2) begin: parks a Form challenge carrying the masked password field, with a bind to alpha.
+    let begun = node
+        .auth_begin(AuthBeginRequest {
+            family: "userpass".into(),
+            params: BTreeMap::new(),
+            redirect_uri: String::new(),
+            bind: Some(AuthBindRequest {
+                profile: ProfileRef::new("alpha"),
+                transport_instance: None,
+                credential_ref: None,
+            }),
+        })
+        .await
+        .expect("auth_begin");
+    match &begun.challenge {
+        AuthChallenge::Form { fields, .. } => assert!(
+            fields
+                .iter()
+                .any(|f| f.key == "password" && f.kind == AuthFieldKind::Password && f.required),
+            "the initial challenge carries the masked, required password field: {fields:?}"
+        ),
+        other => panic!("expected a Form challenge, got {other:?}"),
+    }
+
+    // (3) a WRONG password is rejected; the flow stays parked for a retry.
+    let wrong = node
+        .auth_step(AuthStepRequest {
+            flow_id: begun.flow_id.clone(),
+            input: AuthStepInput::Fields(BTreeMap::from([
+                ("username".to_string(), "alice".to_string()),
+                ("password".to_string(), "hunter2".to_string()),
+            ])),
+        })
+        .await;
+    assert!(wrong.is_err(), "a wrong password is rejected");
+
+    // (4) the RIGHT password validates + exchanges for a session token and completes.
+    let done = node
+        .auth_step(AuthStepRequest {
+            flow_id: begun.flow_id.clone(),
+            input: AuthStepInput::Fields(BTreeMap::from([
+                ("username".to_string(), "alice".to_string()),
+                ("password".to_string(), GOOD_PASSWORD.to_string()),
+            ])),
+        })
+        .await
+        .expect("auth_step");
+    let completed = match done {
+        AuthStepResult::Completed(resp) => resp,
+        AuthStepResult::Challenge(c) => panic!("expected completion, got a challenge {c:?}"),
+    };
+    assert_eq!(completed.credential_ref, "userpass/alice");
+    assert_eq!(completed.account_label, "alice");
+    assert_eq!(
+        completed.bound_profile.as_ref().map(|p| p.as_str()),
+        Some("alpha")
+    );
+
+    // The exchanged token — not the transient password — is stored (redacted) under the derived ref.
+    let listed = node.credential_list().await;
+    assert!(
+        listed
+            .iter()
+            .any(|c| c.profile == "userpass/alice" && c.present),
+        "the exchanged session token is persisted (redacted): {listed:?}"
+    );
+    let alpha = profiles.get("alpha").unwrap().unwrap();
+    assert!(
+        alpha
+            .bound_accounts
+            .iter()
+            .any(|a| a.transport_instance == "userpass/alice"
+                && a.credential_ref == "userpass/alice"),
+        "alpha gained the bound account: {:?}",
+        alpha.bound_accounts
+    );
+
+    handle.shutdown().await;
+}

@@ -2315,6 +2315,107 @@ mod auth_contract_tests {
         )));
     }
 
+    /// wire vNEXT: the enriched [`AuthParamField`] (the additive `kind` / `default` / `placeholder` /
+    /// `choices` metadata) round-trips through ciborium for every [`AuthFieldKind`], `kind` defaults
+    /// to [`AuthFieldKind::Text`], and a legacy pre-vNEXT 3-member encoding still decodes — the new
+    /// members are backward-compatible (defaulting to `Text` / `None` / empty when absent).
+    #[test]
+    fn auth_param_field_metadata_round_trips() {
+        // Every AuthFieldKind, with all the new metadata populated, round-trips.
+        for kind in [
+            AuthFieldKind::Text,
+            AuthFieldKind::Password,
+            AuthFieldKind::Number,
+            AuthFieldKind::Choice,
+        ] {
+            let field = AuthParamField {
+                key: "k".into(),
+                label: "Label".into(),
+                required: true,
+                kind,
+                default: Some("seed".into()),
+                placeholder: Some("hint".into()),
+                choices: vec!["a".into(), "b".into()],
+            };
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&field, &mut bytes).expect("encode AuthParamField");
+            let back: AuthParamField = ciborium::from_reader(&bytes[..]).expect("decode");
+            assert_eq!(back, field);
+        }
+
+        // `kind` defaults to Text (the pre-vNEXT rendering).
+        assert_eq!(AuthFieldKind::default(), AuthFieldKind::Text);
+
+        // Backward-compat: a legacy 3-member map (pre-vNEXT: key/label/required only) still decodes,
+        // defaulting the new members.
+        #[derive(serde::Serialize)]
+        struct LegacyField {
+            key: String,
+            label: String,
+            required: bool,
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &LegacyField {
+                key: "homeserver".into(),
+                label: "Homeserver".into(),
+                required: true,
+            },
+            &mut bytes,
+        )
+        .expect("encode legacy field");
+        let back: AuthParamField =
+            ciborium::from_reader(&bytes[..]).expect("decode legacy 3-member field");
+        assert_eq!(back.key, "homeserver");
+        assert!(back.required);
+        assert_eq!(back.kind, AuthFieldKind::Text);
+        assert_eq!(back.default, None);
+        assert_eq!(back.placeholder, None);
+        assert!(back.choices.is_empty());
+    }
+
+    /// wire vNEXT: the new END variant [`AuthFlowKind::UserPassword`] round-trips on its own and
+    /// nested inside an [`AuthProviderInfo`] advertising a masked ([`AuthFieldKind::Password`])
+    /// password field alongside a plain-text username.
+    #[test]
+    fn auth_flow_kind_user_password_round_trips() {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&AuthFlowKind::UserPassword, &mut bytes).expect("encode");
+        let back: AuthFlowKind = ciborium::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(back, AuthFlowKind::UserPassword);
+
+        let info = AuthProviderInfo {
+            family: "userpass".into(),
+            flow_kind: AuthFlowKind::UserPassword,
+            display_name: "Username & password".into(),
+            params_schema: vec![
+                AuthParamField {
+                    key: "username".into(),
+                    label: "Username".into(),
+                    required: true,
+                    kind: AuthFieldKind::Text,
+                    default: None,
+                    placeholder: Some("you@example.org".into()),
+                    choices: Vec::new(),
+                },
+                AuthParamField {
+                    key: "password".into(),
+                    label: "Password".into(),
+                    required: true,
+                    kind: AuthFieldKind::Password,
+                    default: None,
+                    placeholder: None,
+                    choices: Vec::new(),
+                },
+            ],
+        };
+        let res = ApiResponse::AuthProviders(vec![info]);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&res, &mut bytes).expect("encode AuthProviders");
+        let decoded: ApiResponse = ciborium::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded, res);
+    }
+
     #[test]
     fn feedback_frames_round_trip() {
         fn rt_req(req: &ApiRequest) {
