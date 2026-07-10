@@ -2,10 +2,9 @@
 //!
 //! Ported from libpurple (`purplecontactinfo.c`, `purpleconversationmember.c`,
 //! `purpleconversationmembers.c`, `purpleconversationmanager.c`). This is host-side derived logic
-//! over the existing DTOs — it adds no wire-contract surface. See `docs/port-ledger/matching.md`
-//! for the case-by-case provenance and the documented divergences (person precedence landed with
-//! W3-J `port-person` as the `*_with_person` layer below; badges map to [`MemberRole`]; UTF-8
-//! collation is approximated by casefolded codepoint order).
+//! over the existing DTOs — it adds no wire-contract surface. Documented divergences: person
+//! precedence lands as the `*_with_person` layer below; badges map to [`MemberRole`]; UTF-8
+//! collation is approximated by casefolded codepoint order.
 
 use crate::{
     ContactInfo, ConversationInfo, ConversationMember, ConversationType, MemberRole, Person,

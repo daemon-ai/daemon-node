@@ -327,14 +327,14 @@ For daemon this maps to:
   exposed via an internal Room + an A2A endpoint.
 
 **Status: implemented** (was deferred). The model now exists, ported from `purpleperson.c` under
-TDD (see `docs/port-ledger/person.md` in the repo root): the `Person` wire DTO with
+TDD: the `Person` wire DTO with
 `endpoints: Vec<PersonEndpoint>` (`(TransportId, ContactInfo)` bindings) and `preferred_endpoint()`
 live in `crates/contracts/daemon-api/src/person.rs`; the person-aware display layering
 (`person-alias → display_name → id`) in `crates/contracts/daemon-api/src/matching.rs`; the host
 registry (create/remove/associate/dissociate/lookup) in `crates/substrate/daemon-host/src/person.rs`;
 and the read surface (`PersonList` → `Persons`, `NodeEvent::PersonsChanged`) in the wire contract
 (wire v37). `preferred_endpoint()` is the presence-comparator algorithm the libpurple tests
-assert; the open-conversation / account-priority tiers remain future layers (ledger-recorded).
+assert; the open-conversation / account-priority tiers remain future layers.
 
 ---
 

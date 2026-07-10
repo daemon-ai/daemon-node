@@ -14,7 +14,7 @@
 //! - [`FileTransferManager`] ← `PurpleFileTransferManager` (`purplefiletransfermanager.c`).
 //!
 //! The `account`/`local-file`/`cancellable` GObject properties are intentionally not ported (the
-//! daemon has no `PurpleAccount`/`GFile`/`GCancellable`; see `docs/port-ledger/filetransfer.md`).
+//! daemon has no `PurpleAccount`/`GFile`/`GCancellable`).
 
 use crate::{ContactInfo, FileTransfer, FileTransferDirection, FileTransferState};
 use daemon_common::{BlobRef, ContentHash};

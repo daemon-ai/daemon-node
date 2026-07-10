@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
 //! `MessagingProtocol` conformance suite — the daemon port of libpurple's protocol test fixtures
-//! (`libpurple/tests/test_protocol*.c`). Each module mirrors one libpurple test file; the full
-//! case map (incl. skipped-with-reason rows) lives in `docs/port-ledger/harness.md`.
+//! (`libpurple/tests/test_protocol*.c`). Each module mirrors one libpurple test file.
 //!
 //! libpurple's async callback + `implements_*` idioms translate to daemon-api as: `supported()`
 //! ops flags (⟵ `implements_*`), `Ok`/`Err` returns (⟵ the async `finish` result), and the
