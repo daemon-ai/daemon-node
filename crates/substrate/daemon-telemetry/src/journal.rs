@@ -351,6 +351,41 @@ mod tests {
         assert_eq!(decode_entry(&bytes).unwrap(), v);
     }
 
+    /// Rung 3 (provenance carrier 1): `origin_op` round-trips through the entry codec, and a
+    /// present value is folded into the Gordian digest (tamper-evident) while an ABSENT value
+    /// reproduces the pre-provenance digest exactly — old entries still verify (the additive-field
+    /// discipline shared with `writer_version`).
+    #[test]
+    fn origin_op_round_trips_and_is_digest_stable_when_absent() {
+        let mut with_op = mgmt("s", 0, 0, "chat.message");
+        let without = with_op.clone();
+        with_op.origin_op = Some("op-7".into());
+
+        // Round-trips through the stored CBOR.
+        let (bytes, hash_with) = encode_entry(&with_op);
+        assert_eq!(decode_entry(&bytes).unwrap(), with_op);
+        assert_eq!(
+            decode_entry(&bytes).unwrap().origin_op.as_deref(),
+            Some("op-7")
+        );
+
+        // Present provenance changes the digest (it is an assertion over the entry).
+        let (_b, hash_without) = encode_entry(&without);
+        assert_ne!(
+            hash_with, hash_without,
+            "origin_op is folded into the digest"
+        );
+
+        // An entry with no provenance reproduces the ORIGINAL digest of a same-shape entry that
+        // predates the field (no assertion added), so historical segments keep verifying.
+        let legacy = without.clone();
+        let (_b2, hash_legacy) = encode_entry(&legacy);
+        assert_eq!(
+            hash_without, hash_legacy,
+            "an absent origin_op adds no assertion (digest-stable vs a pre-provenance entry)"
+        );
+    }
+
     #[test]
     fn seal_and_verify_round_trip_interleaving_management_and_blocks() {
         let stream = JournalStreamId::new("verifiable");

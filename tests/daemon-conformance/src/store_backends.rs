@@ -452,3 +452,118 @@ async fn sqlite_feedback_outbox() {
     ))
     .await;
 }
+
+/// Rung 3: the durable `command_dedup` table behaves identically on both backends — a
+/// `(principal, op_id)` result round-trips within the TTL, different principals with the same
+/// op_id are independent, a duplicate put preserves the ORIGINAL result (first-writer-wins), and
+/// a read past the 24h TTL returns nothing (the op re-executes) and clears the stale row so a
+/// fresh put re-caches.
+async fn command_dedup_suite<S: SessionStore>(store: Arc<S>) {
+    use daemon_store::COMMAND_DEDUP_TTL_MS;
+
+    // A miss before anything is stored.
+    assert!(store
+        .command_dedup_get("alice", "op-1", 1_000)
+        .await
+        .is_none());
+
+    // Store, then a fresh get within the TTL returns the ORIGINAL bytes.
+    store
+        .command_dedup_put("alice", "op-1", b"RESULT".to_vec(), 1_000)
+        .await
+        .expect("put dedup row");
+    assert_eq!(
+        store.command_dedup_get("alice", "op-1", 1_500).await,
+        Some(b"RESULT".to_vec()),
+        "a stored result is returned within the TTL"
+    );
+
+    // Different principals with the same op_id are independent.
+    assert!(
+        store
+            .command_dedup_get("bob", "op-1", 1_500)
+            .await
+            .is_none(),
+        "dedup is keyed on (principal, op_id): a different principal is independent"
+    );
+
+    // A duplicate put keeps the FIRST result (the ORIGINAL is what a retry must see).
+    store
+        .command_dedup_put("alice", "op-1", b"SECOND".to_vec(), 1_600)
+        .await
+        .expect("duplicate put is a no-op on the value");
+    assert_eq!(
+        store.command_dedup_get("alice", "op-1", 1_700).await,
+        Some(b"RESULT".to_vec()),
+        "first-writer-wins: the original result is preserved"
+    );
+
+    // A read past the TTL returns nothing (the op re-executes) and clears the stale row.
+    let expired = 1_000 + COMMAND_DEDUP_TTL_MS + 1;
+    assert!(
+        store
+            .command_dedup_get("alice", "op-1", expired)
+            .await
+            .is_none(),
+        "an expired row is not served (the op re-executes)"
+    );
+    // After expiry a fresh put re-caches (the cleared row does not mask it).
+    store
+        .command_dedup_put("alice", "op-1", b"THIRD".to_vec(), expired)
+        .await
+        .expect("re-cache after expiry");
+    assert_eq!(
+        store.command_dedup_get("alice", "op-1", expired + 1).await,
+        Some(b"THIRD".to_vec()),
+        "a post-expiry put re-caches the re-executed result"
+    );
+}
+
+#[tokio::test]
+async fn in_memory_command_dedup() {
+    command_dedup_suite(Arc::new(InMemoryStore::new())).await;
+}
+
+#[tokio::test]
+async fn sqlite_command_dedup() {
+    command_dedup_suite(Arc::new(
+        SqliteStore::open_in_memory().expect("open sqlite"),
+    ))
+    .await;
+}
+
+/// Rung 3: a `command_dedup` row survives a node restart on the durable sqlite backend — the
+/// retry window that matters spans a restart (06 open-Q5), so the guarantee must be durable, not
+/// an in-memory LRU.
+#[tokio::test]
+async fn sqlite_command_dedup_survives_restart() {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "daemon-dedup-restart-{}-{}.sqlite",
+        std::process::id(),
+        n
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let store = SqliteStore::open(&path).expect("open sqlite file");
+        store
+            .command_dedup_put("alice", "op-durable", b"KEPT".to_vec(), 1_000)
+            .await
+            .expect("put dedup row");
+    }
+    {
+        // A fresh process (reopened store) still deduplicates the retried op.
+        let store = SqliteStore::open(&path).expect("reopen sqlite file");
+        assert_eq!(
+            store.command_dedup_get("alice", "op-durable", 2_000).await,
+            Some(b"KEPT".to_vec()),
+            "the dedup row is durable across a restart"
+        );
+    }
+
+    for ext in ["sqlite", "sqlite-wal", "sqlite-shm"] {
+        let _ = std::fs::remove_file(path.with_extension(ext));
+    }
+}
