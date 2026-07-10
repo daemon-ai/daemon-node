@@ -38,6 +38,7 @@ fn transport_changed_and_instance_carry_reason_fatal() {
         reason: Some(DisconnectReason::AuthenticationFailed),
         message: Some("invalid token".into()),
         fatal: true,
+        origin_op: None,
     };
     assert_eq!(ev, from_cbor::<NodeEvent>(&to_cbor(&ev)).unwrap());
 

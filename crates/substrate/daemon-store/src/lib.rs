@@ -870,6 +870,12 @@ pub enum FaultPoint {
     BeforeWakePublish,
 }
 
+/// Rung 3 (api vNEXT): the time-to-live of a `command_dedup` row — 24h. The retry window that
+/// matters spans a node restart (06 open-Q5), so the guarantee is durable, not an in-memory LRU;
+/// the TTL + a bounded key set keep the table from growing without bound. A read past the TTL
+/// re-executes the op and re-caches (see [`SessionStore::command_dedup_get`]).
+pub const COMMAND_DEDUP_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
 /// The durable session store — the sole authority for activation state (lifecycle §4–§5).
 #[async_trait]
 pub trait SessionStore: Send + Sync {
@@ -1274,6 +1280,33 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// Rung 3 (api vNEXT) op-id idempotent dedup: look up a prior result for `(principal, op_id)`,
+    /// returning the stored CBOR bytes iff a row exists AND is unexpired at `now_ms` (within
+    /// [`COMMAND_DEDUP_TTL_MS`]). An expired row is not served (and is lazily evicted) so the op
+    /// re-executes. Default: `None` (a store with no dedup table — the v38-era re-execute behavior).
+    async fn command_dedup_get(
+        &self,
+        _principal: &str,
+        _op_id: &str,
+        _now_ms: u64,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Rung 3 (api vNEXT): record `result` for `(principal, op_id)` stamped at `at_ms`. FIRST-
+    /// writer-wins — a duplicate key does not overwrite the stored value, so a retry always sees
+    /// the ORIGINAL result (an expired row, already evicted by [`Self::command_dedup_get`], is
+    /// re-insertable). Default: no-op (never dedups).
+    async fn command_dedup_put(
+        &self,
+        _principal: &str,
+        _op_id: &str,
+        _result: Vec<u8>,
+        _at_ms: u64,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Read the node-owned OpenAI-gateway runtime override (`GatewaySet`) as `(enabled, addr)`, if
     /// one was ever set. The node resolves the effective gateway config as this override layered on
     /// top of the boot `[gateway]` config, so a runtime enable/rebind survives a restart. Default:
@@ -1655,6 +1688,11 @@ struct Inner {
     journal_cursor: u64,
     /// Append-only conversation-rewind seals per stream, in record order (the latest is active).
     journal_seals: HashMap<JournalStreamId, Vec<JournalSeal>>,
+    /// Rung 3 (api vNEXT) op-id dedup: `(principal, op_id) -> (result bytes, at_ms)` (the in-memory
+    /// analogue of the SQLite `command_dedup` table). Bounded by the 24h TTL + lazy eviction on
+    /// access. Not durable across a restart on this backend (the accepted caveat; the durable
+    /// guarantee is the SQLite backend's).
+    command_dedup: HashMap<(String, String), (Vec<u8>, u64)>,
 }
 
 /// In-memory [`SessionStore`] backend. The default backend for phase 1 and the conformance harness.
@@ -2387,6 +2425,45 @@ impl SessionStore for InMemoryStore {
 
     async fn telemetry_consent_set(&self, enabled: bool) -> Result<(), StoreError> {
         self.inner.lock().unwrap().telemetry_consent = enabled;
+        Ok(())
+    }
+
+    async fn command_dedup_get(
+        &self,
+        principal: &str,
+        op_id: &str,
+        now_ms: u64,
+    ) -> Option<Vec<u8>> {
+        let mut inner = self.inner.lock().unwrap();
+        let key = (principal.to_string(), op_id.to_string());
+        match inner.command_dedup.get(&key) {
+            // Fresh: serve the ORIGINAL result.
+            Some((result, at_ms)) if now_ms.saturating_sub(*at_ms) < COMMAND_DEDUP_TTL_MS => {
+                Some(result.clone())
+            }
+            // Expired: evict lazily on access so a re-execution can re-cache.
+            Some(_) => {
+                inner.command_dedup.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn command_dedup_put(
+        &self,
+        principal: &str,
+        op_id: &str,
+        result: Vec<u8>,
+        at_ms: u64,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        // First-writer-wins: a duplicate key keeps the ORIGINAL (an expired row was already
+        // evicted by `command_dedup_get`, so this re-inserts fresh after a TTL re-execution).
+        inner
+            .command_dedup
+            .entry((principal.to_string(), op_id.to_string()))
+            .or_insert((result, at_ms));
         Ok(())
     }
 

@@ -59,6 +59,11 @@ pub struct ConvSendArgs {
     pub from: Option<Participant>,
     /// The message.
     pub message: UserMsg,
+    /// Rung 3 (api vNEXT): the client-minted idempotency key (UUIDv7 by convention, treated as an
+    /// opaque token). A retry reuses it; the node dedups on `(principal, op_id)` and stamps it as
+    /// `origin_op` provenance on the resulting journal record + `MessagesChanged` pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
 }
 
 /// Arguments for [`ControlApi::conv_history`].
@@ -97,6 +102,9 @@ pub struct MemberInviteArgs {
     /// An optional invite message.
     #[serde(default)]
     pub message: Option<String>,
+    /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe double-invite guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
 }
 
 /// Arguments for [`ControlApi::member_remove`].
@@ -112,6 +120,9 @@ pub struct MemberRemoveArgs {
     /// An optional reason.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe double-kick guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
 }
 
 /// Arguments for [`ControlApi::member_ban`].
@@ -127,6 +138,9 @@ pub struct MemberBanArgs {
     /// An optional reason.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe double-ban guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
 }
 
 /// Arguments for [`ControlApi::member_set_role`].
@@ -141,6 +155,9 @@ pub struct MemberSetRoleArgs {
     pub who: Participant,
     /// The new role.
     pub role: MemberRole,
+    /// Rung 3 (api vNEXT): the client-minted idempotency key (retry-safe role-set guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
 }
 
 /// Arguments for [`ControlApi::fs_write`].

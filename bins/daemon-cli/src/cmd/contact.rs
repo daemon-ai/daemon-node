@@ -33,6 +33,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ContactCmd) -> anyhow::Result<(
                 ..ContactInfo::default()
             },
             alias,
+            op_id: None,
         },
     };
     render(client.call(req).await?);

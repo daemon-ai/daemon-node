@@ -17,7 +17,6 @@
 //!   feed-lock acquisition, so its values are mutually consistent even under a mutation storm.
 
 use super::harness::*;
-use daemon_api::LifecycleSink;
 use daemon_protocol::{TransportId, UserMsg};
 
 // ---------------------------------------------------------------------------
@@ -238,7 +237,10 @@ async fn chat_message_provenance_impl() {
     // Carrier 3: the MessagesChanged pointer for the carried message names the causing op.
     let events = match daemon_api::dispatch(
         h.node.as_ref(),
-        ApiRequest::EventsSince { cursor: 0, max: 0 },
+        ApiRequest::EventsSince {
+            cursor: 0,
+            wait_ms: None,
+        },
     )
     .await
     {

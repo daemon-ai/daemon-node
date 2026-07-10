@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// Unix-epoch milliseconds — the clock the rung-3 (api vNEXT) `command_dedup` TTL is measured
+/// against (insert time vs read time).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[async_trait]
 impl ControlApi for NodeApiImpl {
     async fn events_page(&self, cursor: u64, max: u32) -> EventsPage {
@@ -146,7 +155,13 @@ impl ControlApi for NodeApiImpl {
         // so it rides the `removed` list rather than silently vanishing from the delta.
         let mut removed: Vec<SessionId> = Vec::new();
         let mut delta_served = false;
-        if let Some((changed, removed_hard, _)) = &delta {
+        // rung 3 (api vNEXT): the causing-op provenance for changed sessions (session-page carrier
+        // 2), threaded from the roster delta index; filtered to the served page body below.
+        let delta_origin_ops = delta
+            .as_ref()
+            .map(|(_, _, ops, _)| ops.clone())
+            .unwrap_or_default();
+        if let Some((changed, removed_hard, _, _)) = &delta {
             let changed_set: std::collections::HashSet<&SessionId> = changed.iter().collect();
             removed.extend(removed_hard.iter().cloned());
             // Changed-but-now-out-of-scope sessions left the client's view.
@@ -187,6 +202,16 @@ impl ControlApi for NodeApiImpl {
         });
         // Cursor pagination: `after` is the last id of the previous page; skip through it.
         let next_cursor = paginate_roster(&mut roster, query.after.as_ref(), query.limit);
+        // rung 3 (api vNEXT): the page-side `origin_ops` map, restricted to the sessions actually
+        // served in this page (only meaningful on a delta read).
+        let origin_ops: std::collections::BTreeMap<String, String> = roster
+            .iter()
+            .filter_map(|i| {
+                delta_origin_ops
+                    .get(i.session.as_str())
+                    .map(|op| (i.session.as_str().to_string(), op.clone()))
+            })
+            .collect();
         SessionPage {
             sessions: roster,
             next_cursor,
@@ -194,6 +219,41 @@ impl ControlApi for NodeApiImpl {
             // Populated only on a delta read (scope-relative + hard removals); a full page replaces
             // the client's roster wholesale, so it carries no removal list.
             removed,
+            origin_ops,
+        }
+    }
+
+    // ----- rung 3 (api vNEXT): Bootstrap probe + op-id idempotent dedup -----
+
+    async fn bootstrap(&self) -> daemon_api::BootstrapReport {
+        // The race-free initial-sync baseline (06G6): every collection's rev + the feed cursor +
+        // epoch, snapshotted atomically under one feed-lock acquisition. Empty when no feed is
+        // wired (a node assembled without the event feed).
+        self.node_feed().map(|f| f.bootstrap()).unwrap_or_default()
+    }
+
+    async fn command_dedup_lookup(&self, op_id: &str) -> Option<Vec<u8>> {
+        // Dedup is keyed `(principal, op_id)`. The principal is the current request's ownership id
+        // (fail-closed: a context-less request keys on the empty principal, matching how the
+        // ownership layer treats `None`). A different principal reusing the same op_id is
+        // independent — one client's retry never masks another's operation.
+        let principal = current_principal().map(|p| p.user_id).unwrap_or_default();
+        self.store
+            .command_dedup_get(&principal, op_id, now_ms())
+            .await
+    }
+
+    async fn command_dedup_store(&self, op_id: &str, result: Vec<u8>) {
+        let principal = current_principal().map(|p| p.user_id).unwrap_or_default();
+        // Best-effort: a dedup-table write failure must never fail the operation (whose side
+        // effect already landed); a later retry simply re-executes (idempotency is a safety net,
+        // not a correctness precondition).
+        if let Err(e) = self
+            .store
+            .command_dedup_put(&principal, op_id, result, now_ms())
+            .await
+        {
+            tracing::warn!(error = %e, op_id, "command dedup: store failed (retry will re-execute)");
         }
     }
 
@@ -335,10 +395,17 @@ impl ControlApi for NodeApiImpl {
             .map_err(|e| ApiError::Other(e.to_string()))?;
         // Nudge live roster/tree subscribers so the rename/pin/archive shows up without a poll.
         self.emit_tree_changed();
-        // L3: a rename/pin/archive changed this session's roster metadata.
+        // L3: a rename/pin/archive changed this session's roster metadata. rung 3 (api vNEXT):
+        // stamp the causing op token (this `SessionUpdateMeta`'s op_id, from the dispatch context)
+        // on both the roster delta index (session-page `origin_ops`) and the pointer.
         if let Some(feed) = self.node_feed() {
-            let rev = feed.note_roster_change(&session);
-            feed.emit(NodeEvent::SessionMetaChanged { session, rev });
+            let origin_op = daemon_api::current_op_id();
+            let rev = feed.note_roster_change_op(&session, origin_op.clone());
+            feed.emit(NodeEvent::SessionMetaChanged {
+                session,
+                rev,
+                origin_op,
+            });
         }
         Ok(())
     }
@@ -1109,6 +1176,7 @@ impl ControlApi for NodeApiImpl {
                 reason: Some(daemon_api::DisconnectReason::UserRequested),
                 message: None,
                 fatal: false,
+                origin_op: None,
             });
         }
         Ok(())
@@ -1201,6 +1269,7 @@ impl ControlApi for NodeApiImpl {
                     reason: cur.reason,
                     message: cur.message,
                     fatal: cur.fatal,
+                    origin_op: None,
                 });
             }
         }
@@ -1346,7 +1415,11 @@ impl ControlApi for NodeApiImpl {
             Err(_) => Vec::new(),
         };
         convs.sort_by(|a, b| a.id.cmp(&b.id));
-        if let Some((changed, mut removed, rev)) = delta {
+        if let Some(delta) = delta {
+            let changed = delta.changed;
+            let mut removed = delta.removed;
+            let origin_ops = delta.origin_ops;
+            let rev = delta.rev;
             let changed_set: std::collections::HashSet<&str> =
                 changed.iter().map(|s| s.as_str()).collect();
             // A changed key absent from the adapter's current set left the collection without a
@@ -1368,11 +1441,18 @@ impl ControlApi for NodeApiImpl {
                     daemon_api::paginate(convs, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |c| {
                         c.id.clone()
                     });
+                // rung 3 (api vNEXT): the page-side `origin_ops`, restricted to the served items.
+                let origin_ops = page
+                    .items
+                    .iter()
+                    .filter_map(|c| origin_ops.get(&c.id).map(|op| (c.id.clone(), op.clone())))
+                    .collect();
                 return daemon_api::ConvPage {
                     items: page.items,
                     next: page.next,
                     rev,
                     removed,
+                    origin_ops,
                 };
             }
             // Delta guard: `removed` rides unpaginated next to the page body, so a tombstone list
@@ -1396,6 +1476,7 @@ impl ControlApi for NodeApiImpl {
             rev,
             // Populated only on a delta read; a full page replaces the client's set wholesale.
             removed: Vec::new(),
+            origin_ops: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1712,7 +1793,11 @@ impl ControlApi for NodeApiImpl {
             Err(_) => Vec::new(),
         };
         contacts.sort_by(|a, b| a.id.cmp(&b.id));
-        if let Some((changed, mut removed, rev)) = delta {
+        if let Some(delta) = delta {
+            let changed = delta.changed;
+            let mut removed = delta.removed;
+            let origin_ops = delta.origin_ops;
+            let rev = delta.rev;
             let changed_set: std::collections::HashSet<&str> =
                 changed.iter().map(|s| s.as_str()).collect();
             let present: std::collections::HashSet<&str> =
@@ -1731,11 +1816,17 @@ impl ControlApi for NodeApiImpl {
                     daemon_api::WIRE_PAGE_MAX,
                     |c| c.id.clone(),
                 );
+                let origin_ops = page
+                    .items
+                    .iter()
+                    .filter_map(|c| origin_ops.get(&c.id).map(|op| (c.id.clone(), op.clone())))
+                    .collect();
                 return daemon_api::ContactPage {
                     items: page.items,
                     next: page.next,
                     rev,
                     removed,
+                    origin_ops,
                 };
             }
             // Delta guard: an over-bound tombstone list falls back to a full page (see conv_list).
@@ -1754,6 +1845,7 @@ impl ControlApi for NodeApiImpl {
             next: page.next,
             rev,
             removed: Vec::new(),
+            origin_ops: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1781,7 +1873,11 @@ impl ControlApi for NodeApiImpl {
             _ => None,
         };
         let mut items = self.persons_snapshot();
-        if let Some((changed, mut removed, rev)) = delta {
+        if let Some(delta) = delta {
+            let changed = delta.changed;
+            let mut removed = delta.removed;
+            let origin_ops = delta.origin_ops;
+            let rev = delta.rev;
             let changed_set: std::collections::HashSet<&str> =
                 changed.iter().map(|s| s.as_str()).collect();
             let present: std::collections::HashSet<&str> =
@@ -1794,10 +1890,15 @@ impl ControlApi for NodeApiImpl {
             );
             if removed.len() <= daemon_api::WIRE_PAGE_MAX {
                 items.retain(|p| changed_set.contains(p.id.as_str()));
+                let origin_ops = items
+                    .iter()
+                    .filter_map(|p| origin_ops.get(&p.id).map(|op| (p.id.clone(), op.clone())))
+                    .collect();
                 return daemon_api::RevDeltaList {
                     rev,
                     items,
                     removed,
+                    origin_ops,
                 };
             }
             // Delta guard: an over-bound tombstone list falls back to the full list (see conv_list).
@@ -1807,6 +1908,7 @@ impl ControlApi for NodeApiImpl {
             rev,
             items,
             removed: Vec::new(),
+            origin_ops: std::collections::BTreeMap::new(),
         }
     }
 

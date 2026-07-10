@@ -659,7 +659,13 @@ impl LifecycleSink for RecordingSink {
         _is_self: bool,
     ) {
     }
-    async fn chat_message(&self, transport: TransportId, conv: String, message: ChatMessage) {
+    async fn chat_message(
+        &self,
+        transport: TransportId,
+        conv: String,
+        message: ChatMessage,
+        _origin_op: Option<String>,
+    ) {
         self.chats.lock().unwrap().push((transport, conv, message));
     }
 }
@@ -705,6 +711,7 @@ async fn send_reports_chat_message_through_the_sink() {
             conv: room.as_str().to_string(),
             from: Some(author.clone()),
             message: UserMsg::new("hello"),
+            op_id: None,
         },
     )
     .await

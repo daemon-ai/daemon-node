@@ -389,6 +389,7 @@ impl NodeApiImpl {
                         reason: None,
                         message: None,
                         fatal: false,
+                        origin_op: None,
                     });
                 }
             }
@@ -430,6 +431,7 @@ impl NodeApiImpl {
                         reason,
                         message: None,
                         fatal,
+                        origin_op: None,
                     });
                 }
             }
@@ -452,6 +454,7 @@ impl NodeApiImpl {
                         reason: Some(daemon_api::DisconnectReason::NetworkError),
                         message: None,
                         fatal: false,
+                        origin_op: None,
                     });
                 }
             }

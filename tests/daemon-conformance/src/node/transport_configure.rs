@@ -205,6 +205,7 @@ async fn transport_settings_configure_round_trip_over_socket() {
             settings: AccountSettingsValues {
                 values: map(&[("server", "hs.example.org")]),
             },
+            op_id: None,
         })
         .await
         .unwrap()
@@ -229,6 +230,7 @@ async fn transport_settings_configure_round_trip_over_socket() {
             settings: AccountSettingsValues {
                 values: map(&[("nick", "daemon-bot")]),
             },
+            op_id: None,
         })
         .await
         .unwrap()
@@ -265,6 +267,7 @@ async fn transport_configure_rejects_unknown_key() {
             settings: AccountSettingsValues {
                 values: map(&[("bogus", "x")]),
             },
+            op_id: None,
         })
         .await
         .unwrap()
@@ -304,6 +307,7 @@ async fn transport_configure_surfaces_validate_account_error() {
             settings: AccountSettingsValues {
                 values: map(&[("nick", FakeProtocol::VALIDATE_REJECT_VALUE)]),
             },
+            op_id: None,
         })
         .await
         .unwrap()
@@ -348,6 +352,7 @@ async fn transport_configure_reconnects_connected_instance() {
             settings: AccountSettingsValues {
                 values: map(&[("server", "hs2.example.org")]),
             },
+            op_id: None,
         })
         .await
         .unwrap()
@@ -392,6 +397,7 @@ async fn transport_settings_survive_restart() {
             settings: AccountSettingsValues {
                 values: map(&[("server", "hs.example.org"), ("nick", "daemon-bot")]),
             },
+            op_id: None,
         })
         .await
         .unwrap()

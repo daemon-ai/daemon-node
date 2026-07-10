@@ -219,6 +219,7 @@ impl SupportsConversations for SlackAdapter {
             conv,
             from: _from,
             message,
+            op_id: _,
         } = args;
         // The Slack account is always the sender; `from` attribution is not forwarded onto the wire
         // (the SDK posts as the bound account). The outbound projector posts the same way.
@@ -246,6 +247,7 @@ impl SupportsMembership for SlackAdapter {
             conv,
             who,
             message: _message,
+            op_id: _,
         } = args;
         let user = contact_user(&who)?;
         let conn = self.conn_for(&transport).await?;
@@ -258,6 +260,7 @@ impl SupportsMembership for SlackAdapter {
             conv,
             who,
             reason: _reason,
+            op_id: _,
         } = args;
         let user = contact_user(&who)?;
         let conn = self.conn_for(&transport).await?;
@@ -396,6 +399,7 @@ mod tests {
                 conv: "C123".to_string(),
                 from: None,
                 message: UserMsg::new("hello".to_string()),
+                op_id: None,
             },
         )
         .await
@@ -431,6 +435,7 @@ mod tests {
                 conv: "C123".to_string(),
                 who: agent,
                 message: None,
+                op_id: None,
             },
         )
         .await

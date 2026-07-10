@@ -234,6 +234,11 @@ impl SupportsConversations for DemoAdapter {
             conv,
             from,
             message,
+            // rung 3 (api vNEXT): the opaque client op token. The demo adapter is the reference
+            // provenance-CAPABLE adapter — it hands the token straight back on the outbound
+            // lifecycle report so the node stamps `origin_op` on the journal record + pointer.
+            // (The adapter never mints or interprets it — it round-trips it verbatim.)
+            op_id,
         } = args;
 
         // 1. Report the outbound message through the node's LifecycleSink: the node appends one
@@ -249,7 +254,7 @@ impl SupportsConversations for DemoAdapter {
         outbound.id = Some(next_msg_id());
         outbound.timestamp = Some(now);
         outbound.set_delivered(true, now);
-        sink.chat_message(transport.clone(), conv.clone(), outbound)
+        sink.chat_message(transport.clone(), conv.clone(), outbound, op_id)
             .await;
 
         // 2. Schedule the scripted contact reply so the chat sees live two-way traffic. It arrives
@@ -272,7 +277,8 @@ impl SupportsConversations for DemoAdapter {
             reply.id = Some(next_msg_id());
             reply.timestamp = Some(now);
             reply.set_delivered(true, now);
-            sink.chat_message(transport, conv, reply).await;
+            // The scripted reply is an INBOUND delivery — no local op token (null provenance).
+            sink.chat_message(transport, conv, reply, None).await;
         });
         Ok(())
     }

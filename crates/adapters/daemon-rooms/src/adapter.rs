@@ -249,8 +249,17 @@ impl RoomRuntime {
         if let Some(sink) = &self.sink {
             let mut message = ChatMessage::new(author, text.clone());
             message.timestamp = Some(now_unix_secs());
-            sink.chat_message(TransportId::new(FAMILY), room.as_str().to_string(), message)
-                .await;
+            // rung 3 (api vNEXT): the rooms reference adapter routes sends through an internal
+            // command channel (a serve-loop boundary a task-local op token cannot cross), so it is
+            // a token-incapable adapter for now — `origin_op` is null (the degraded path, never
+            // heuristic). Confirmation resolves via the accepted-state policy (09§6.6).
+            sink.chat_message(
+                TransportId::new(FAMILY),
+                room.as_str().to_string(),
+                message,
+                None,
+            )
+            .await;
         }
 
         // 2. Snapshot members + policy (await before locking the !Send floor map).
@@ -743,6 +752,9 @@ impl SupportsConversations for RoomsAdapter {
             conv,
             from,
             message,
+            // rung 3 (api vNEXT): token-incapable adapter (routes through an internal command
+            // channel); `origin_op` resolves null via the accepted-state policy (09§6.6).
+            op_id: _,
         } = args;
         if self.store.room_get(&conv).await.is_none() {
             return Err(ApiError::Other(format!("room {conv} not found")));
@@ -819,6 +831,7 @@ impl SupportsMembership for RoomsAdapter {
             conv,
             who,
             message: _message,
+            op_id: _,
         } = args;
         let (profile, member) = match who {
             Participant::Agent { profile, member } => (profile, member),
@@ -855,6 +868,7 @@ impl SupportsMembership for RoomsAdapter {
             conv,
             who,
             reason: _reason,
+            op_id: _,
         } = args;
         let member = match who {
             Participant::Agent { member, .. } => member,

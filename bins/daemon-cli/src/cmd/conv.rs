@@ -51,6 +51,8 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
                     extras: values,
                     ..CreateConversationDetails::default()
                 },
+                // The CLI is a direct (non-outbox) client; it mints no op_id (rung 3, api vNEXT).
+                op_id: None,
             }
         }
         ConvCmd::Join { transport, name } => ApiRequest::ConvJoin {
@@ -59,6 +61,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
                 name: Some(name),
                 ..ChannelJoinDetails::default()
             },
+            op_id: None,
         },
         ConvCmd::Leave { transport, conv } => ApiRequest::ConvLeave {
             transport: TransportId::new(transport),
@@ -75,6 +78,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
             conv,
             from: from.map(|m| super::participant(m, from_profile)),
             message: UserMsg::new(text),
+            op_id: None,
         }),
         ConvCmd::Topic {
             transport,
@@ -84,6 +88,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
             transport: TransportId::new(transport),
             conv,
             topic,
+            op_id: None,
         },
         ConvCmd::Title {
             transport,
@@ -93,6 +98,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
             transport: TransportId::new(transport),
             conv,
             title,
+            op_id: None,
         },
         ConvCmd::Describe {
             transport,
@@ -102,6 +108,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ConvCmd) -> anyhow::Result<()> 
             transport: TransportId::new(transport),
             conv,
             description,
+            op_id: None,
         },
         ConvCmd::Delete { transport, conv } => ApiRequest::ConvDelete {
             transport: TransportId::new(transport),

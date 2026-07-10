@@ -690,6 +690,7 @@ pub async fn assert_ops_match_behavior(proto: Arc<dyn MessagingProtocol>) {
                 conv: "conv".to_string(),
                 from: None,
                 message: daemon_protocol::UserMsg::new("hi"),
+                op_id: None,
             })
             .await,
             ops.send,
@@ -728,6 +729,7 @@ pub async fn assert_ops_match_behavior(proto: Arc<dyn MessagingProtocol>) {
                 conv: "conv".to_string(),
                 who: who.clone(),
                 message: None,
+                op_id: None,
             })
             .await,
             ops.invite,
@@ -740,6 +742,7 @@ pub async fn assert_ops_match_behavior(proto: Arc<dyn MessagingProtocol>) {
                 conv: "conv".to_string(),
                 who: who.clone(),
                 reason: None,
+                op_id: None,
             })
             .await,
             ops.remove,
@@ -752,6 +755,7 @@ pub async fn assert_ops_match_behavior(proto: Arc<dyn MessagingProtocol>) {
                 conv: "conv".to_string(),
                 who: who.clone(),
                 reason: None,
+                op_id: None,
             })
             .await,
             ops.ban,
@@ -764,6 +768,7 @@ pub async fn assert_ops_match_behavior(proto: Arc<dyn MessagingProtocol>) {
                 conv: "conv".to_string(),
                 who,
                 role: daemon_api::MemberRole::default(),
+                op_id: None,
             })
             .await,
             ops.set_role,

@@ -103,6 +103,7 @@ mod conversation {
             conv: "c".into(),
             from: None,
             message: UserMsg::new("hi"),
+            op_id: None,
         };
         assert_unsupported(empty().send(args).await, sentinels::CONV_SEND);
     }
@@ -201,6 +202,7 @@ mod conversation {
             conv: "c".into(),
             from: None,
             message: UserMsg::new("hi"),
+            op_id: None,
         }
     }
     #[tokio::test]

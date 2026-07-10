@@ -119,6 +119,7 @@ fn transport_changed_round_trips() {
         reason: None,
         message: None,
         fatal: false,
+        origin_op: None,
     };
     assert_eq!(ev, from_cbor::<NodeEvent>(&to_cbor(&ev)).unwrap());
 }

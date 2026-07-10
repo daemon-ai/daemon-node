@@ -310,10 +310,15 @@ impl NodeApiImpl {
     /// archive change). No-op when no event feed is wired.
     fn emit_session_meta_changed(&self, session: &SessionId) {
         if let Some(feed) = self.node_feed() {
-            let rev = feed.note_roster_change(session);
+            // rung 3 (api vNEXT): stamp the causing op token when this fires inside an op-carrying
+            // dispatch (a `SessionUpdateMeta` that minted an op_id); `None` for activity/recency
+            // stamps outside any op context. Uniform — the same call reads the dispatch context.
+            let origin_op = daemon_api::current_op_id();
+            let rev = feed.note_roster_change_op(session, origin_op.clone());
             feed.emit(NodeEvent::SessionMetaChanged {
                 session: session.clone(),
                 rev,
+                origin_op,
             });
         }
     }

@@ -313,6 +313,7 @@ impl SupportsConversations for TelegramAdapter {
             conv,
             from: _from,
             message,
+            op_id: _,
         } = args;
         // The Telegram account is always the sender; `from` attribution is not forwarded onto the
         // wire (grammers posts as the bound account), matching the outbound projector.
@@ -340,6 +341,7 @@ impl SupportsMembership for TelegramAdapter {
             conv,
             who,
             reason: _reason,
+            op_id: _,
         } = args;
         let client = self.client_for(&transport).await?;
         client
@@ -353,6 +355,7 @@ impl SupportsMembership for TelegramAdapter {
             conv,
             who,
             reason: _reason,
+            op_id: _,
         } = args;
         let client = self.client_for(&transport).await?;
         client
@@ -602,6 +605,7 @@ mod tests {
                 conv: "-100".to_string(),
                 from: None,
                 message: UserMsg::new("hello"),
+                op_id: None,
             },
         )
         .await
@@ -622,6 +626,7 @@ mod tests {
                 conv: "1".to_string(),
                 from: None,
                 message: UserMsg::new("x"),
+                op_id: None,
             },
         )
         .await
@@ -646,6 +651,7 @@ mod tests {
                     ..ContactInfo::default()
                 }),
                 reason: None,
+                op_id: None,
             },
         )
         .await
@@ -663,6 +669,7 @@ mod tests {
                     member: "@agent".to_string(),
                 },
                 reason: None,
+                op_id: None,
             },
         )
         .await

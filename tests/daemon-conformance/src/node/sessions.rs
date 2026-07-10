@@ -155,6 +155,7 @@ async fn session_meta_rename_pin_archive_round_trip_impl() {
                     title: Some(Some("renamed".into())),
                     ..Default::default()
                 },
+                op_id: None,
             })
             .await
             .unwrap(),

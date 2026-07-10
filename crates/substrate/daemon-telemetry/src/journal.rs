@@ -79,6 +79,14 @@ pub struct JournalEntryView {
     /// (see [`entry_envelope`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub writer_version: String,
+    /// Rung 3 (api vNEXT) uniform operation provenance: the client-minted `op_id` of the operation
+    /// that caused this record, stamped on the NODE-OWNED envelope (the adapter payload is
+    /// untouched) so every journaled stream carries it. `None` when the causing operation carried
+    /// no op_id (or a protocol could not round-trip the opaque token) — degraded, never heuristic.
+    /// Omitted from the wire when absent so pre-provenance entries reproduce their original Gordian
+    /// digest and still verify (the additive-field discipline shared with `writer_version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_op: Option<String>,
     /// The typed payload.
     pub payload: JournalPayload,
 }
@@ -110,6 +118,11 @@ fn entry_envelope(v: &JournalEntryView) -> Envelope {
     // reproduces its original digest and still verifies. Never backfilled onto old rows.
     if !v.writer_version.is_empty() {
         env = env.add_assertion("writer", v.writer_version.clone());
+    }
+    // Provenance assertion, added only when present so a pre-provenance entry reproduces its
+    // original digest and still verifies (never backfilled onto old rows).
+    if let Some(op) = &v.origin_op {
+        env = env.add_assertion("origin_op", op.clone());
     }
     match &v.payload {
         JournalPayload::Management { detail } => env.add_assertion("detail", detail.clone()),
@@ -312,6 +325,7 @@ mod tests {
             kind: kind.into(),
             timestamp_ms: 1_000 + seq,
             writer_version: String::new(),
+            origin_op: None,
             payload: JournalPayload::Management {
                 detail: format!("detail-{seq}"),
             },
@@ -328,6 +342,7 @@ mod tests {
             kind: "block.message".into(),
             timestamp_ms: 2_000 + seq,
             writer_version: String::new(),
+            origin_op: None,
             payload: JournalPayload::Block {
                 body: body.to_vec(),
             },

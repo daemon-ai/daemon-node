@@ -275,6 +275,7 @@ impl SupportsConversations for DiscordAdapter {
             conv,
             from: _from,
             message,
+            op_id: _,
         } = args;
         // The Discord account is always the sender; `from` attribution is not forwarded onto the wire
         // (serenity posts as the bound account). The outbound projector posts the same way.
@@ -341,6 +342,7 @@ impl SupportsMembership for DiscordAdapter {
             conv,
             who,
             reason,
+            op_id: _,
         } = args;
         let user = contact_uid(&who)?;
         let http = self.http_for(&transport).await?;
@@ -358,6 +360,7 @@ impl SupportsMembership for DiscordAdapter {
             conv,
             who,
             reason,
+            op_id: _,
         } = args;
         let user = contact_uid(&who)?;
         let http = self.http_for(&transport).await?;

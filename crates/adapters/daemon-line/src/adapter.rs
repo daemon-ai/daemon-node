@@ -220,6 +220,7 @@ impl SupportsConversations for LineAdapter {
             conv,
             from: _from,
             message,
+            op_id: _,
         } = args;
         let account = self.client_for(&transport).await?;
         let request = PushMessageRequest {
