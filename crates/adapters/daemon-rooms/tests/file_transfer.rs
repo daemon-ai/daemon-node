@@ -17,7 +17,6 @@ use daemon_host::{BlobStore, FileBlobStore};
 use daemon_protocol::TransportId;
 use daemon_rooms::{RoomsAdapter, RoomsConfig};
 use daemon_store::SqliteStore;
-use daemon_telemetry::TraceSigner;
 
 fn temp_root(tag: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -34,8 +33,7 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
 
 async fn adapter_with_blobs(blobs: Arc<dyn BlobStore>) -> Arc<RoomsAdapter> {
     let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
-    let signer = Arc::new(TraceSigner::generate());
-    RoomsAdapter::with_blobs(store, signer, RoomsConfig::default(), blobs)
+    RoomsAdapter::with_blobs(store, RoomsConfig::default(), None, blobs)
 }
 
 #[tokio::test]
@@ -102,8 +100,7 @@ async fn file_transfer_receive_roundtrips_via_blob_store() {
 async fn file_transfer_ops_reflect_blob_store() {
     // No blob store ⟹ the feature is absent, and the ops-vs-behavior invariant still holds.
     let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
-    let signer = Arc::new(TraceSigner::generate());
-    let bare = RoomsAdapter::new(store, signer, RoomsConfig::default());
+    let bare = RoomsAdapter::new(store, RoomsConfig::default(), None);
     assert!(
         bare.clone().messaging().unwrap().file_transfer().is_none(),
         "no blob store ⟹ file_transfer() is None"

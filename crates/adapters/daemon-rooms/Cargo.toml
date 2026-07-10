@@ -18,10 +18,10 @@ daemon-protocol = { workspace = true }
 daemon-common = { workspace = true }
 # the durable Room + membership store this adapter persists to / loads from at bring-up.
 daemon-store = { workspace = true }
-# the verifiable-journal writer (JournalSink) + signer used to persist the merged per-room transcript
-# (the same encoding the host's history read decodes/verifies). Mirrors `daemon-matrix`'s host dep.
+# the in-process request-context binding + the blob store for the loopback file transfer. The merged
+# per-room chat history is journaled node-side through `daemon_api::LifecycleSink::chat_message`
+# (wire vNEXT), so no journal writer/signer lives here. Mirrors `daemon-matrix`'s host dep.
 daemon-host = { workspace = true }
-daemon-telemetry = { workspace = true }
 # the typed Room descriptor (kind/title/topic/policy) the adapter CBOR-encodes into the store's
 # protocol-free `Room.descriptor` opaque column.
 serde = { workspace = true }

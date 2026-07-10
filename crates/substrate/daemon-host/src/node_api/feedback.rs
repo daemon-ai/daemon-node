@@ -262,6 +262,9 @@ impl NodeApiImpl {
                         Err(_) => None,
                     }
                 }
+                // Conversation chat records live on `conv:*` streams, never on the session
+                // streams this reads; skip (neither a boundary nor assistant text).
+                JournalPayload::Chat { .. } => None,
             }
         });
         coalesce_assistant_text(items, daemon_api::FEEDBACK_COMMENT_MAX)

@@ -72,6 +72,7 @@ impl NodeApiImpl {
             disconnect_fatal: Arc::new(dashmap::DashMap::new()),
             self_weak: std::sync::OnceLock::new(),
             mgmt_journal: Arc::new(std::sync::Mutex::new(None)),
+            chat_journals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             agents: None,
             last_agents: Arc::new(std::sync::RwLock::new(Vec::new())),
             checkpoints: None,

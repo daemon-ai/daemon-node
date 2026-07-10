@@ -20,12 +20,8 @@ async fn messaging_adapter_rooms_manage_over_socket() {
     std::fs::create_dir_all(&dir).unwrap();
     let store: Arc<dyn SessionStore> =
         Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
-    let AssembledNode {
-        node,
-        handle,
-        signer,
-        ..
-    } = assemble_over(store.clone(), 0, [0x5d; 32], fast_host_config());
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store.clone(), 0, [0x5d; 32], fast_host_config());
 
     // Register the Rooms adapter (enabled) + a Matrix adapter (off; enumeration only), then drive
     // lifecycle from the node exactly as `bins/daemon` does.
@@ -37,8 +33,8 @@ async fn messaging_adapter_rooms_manage_over_socket() {
     let registry = daemon_host::AdapterRegistry::new()
         .with_adapter(daemon_rooms::RoomsAdapter::new(
             store.clone(),
-            signer,
             rooms_cfg,
+            Some(node.lifecycle_sink()),
         ))
         .with_adapter(daemon_matrix::MatrixAdapter::new(
             provisioning,
@@ -683,19 +679,15 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
     std::fs::create_dir_all(&dir).unwrap();
     let store: Arc<dyn SessionStore> =
         Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
-    let AssembledNode {
-        node,
-        handle,
-        signer,
-        ..
-    } = assemble_over(store.clone(), 0, [0x5f; 32], fast_host_config());
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store.clone(), 0, [0x5f; 32], fast_host_config());
 
     let rooms_cfg = daemon_rooms::RoomsConfig {
         enabled: true,
         max_turns: 8,
     };
     let registry = daemon_host::AdapterRegistry::new().with_adapter(
-        daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg),
+        daemon_rooms::RoomsAdapter::new(store.clone(), rooms_cfg, Some(node.lifecycle_sink())),
     );
     node.set_adapters(registry);
     let adapter_tasks = node.spawn_adapters().await;
@@ -875,19 +867,15 @@ impl RoomsSocket {
         std::fs::create_dir_all(&dir).unwrap();
         let store: Arc<dyn SessionStore> =
             Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
-        let AssembledNode {
-            node,
-            handle,
-            signer,
-            ..
-        } = assemble_over(store.clone(), 0, seed, fast_host_config());
+        let AssembledNode { node, handle, .. } =
+            assemble_over(store.clone(), 0, seed, fast_host_config());
 
         let rooms_cfg = daemon_rooms::RoomsConfig {
             enabled: true,
             max_turns: 8,
         };
         let registry = daemon_host::AdapterRegistry::new().with_adapter(
-            daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg),
+            daemon_rooms::RoomsAdapter::new(store.clone(), rooms_cfg, Some(node.lifecycle_sink())),
         );
         node.set_adapters(registry);
         let adapter_tasks = node.spawn_adapters().await;
@@ -1149,19 +1137,15 @@ async fn conv_list_pages_beyond_the_wire_bound() {
     std::fs::create_dir_all(&dir).unwrap();
     let store: Arc<dyn SessionStore> =
         Arc::new(SqliteStore::open(dir.join("store.sqlite")).expect("open sqlite store"));
-    let AssembledNode {
-        node,
-        handle,
-        signer,
-        ..
-    } = assemble_over(store.clone(), 0, [0x5e; 32], fast_host_config());
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store.clone(), 0, [0x5e; 32], fast_host_config());
 
     let rooms_cfg = daemon_rooms::RoomsConfig {
         enabled: true,
         max_turns: 8,
     };
     let registry = daemon_host::AdapterRegistry::new().with_adapter(
-        daemon_rooms::RoomsAdapter::new(store.clone(), signer, rooms_cfg),
+        daemon_rooms::RoomsAdapter::new(store.clone(), rooms_cfg, Some(node.lifecycle_sink())),
     );
     node.set_adapters(registry);
     let adapter_tasks = node.spawn_adapters().await;

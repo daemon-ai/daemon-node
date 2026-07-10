@@ -255,6 +255,19 @@ impl JournalSink {
         .await
     }
 
+    /// Append one conversation [`ChatMessage`](daemon_api::ChatMessage) to the chain (wire vNEXT)
+    /// under the `chat.message` kind — the per-message record of a `conv:<transport>:<conv>`
+    /// stream, decoded back into `JournalRecordPayload::Chat` by the history reader.
+    pub async fn record_chat(
+        &self,
+        message: &daemon_api::ChatMessage,
+    ) -> Result<(), daemon_store::StoreError> {
+        let mut body = Vec::new();
+        ciborium::into_writer(message, &mut body).expect("encode chat message to CBOR");
+        self.append("chat.message".to_string(), JournalPayload::Chat { body })
+            .await
+    }
+
     /// Seal the open segment: recompute the Merkle root from the durable entries, sign it, and
     /// commit it (fenced on the durable path). Then advance to the next segment, chaining onto this
     /// root and resetting the per-segment sequence — so the next turn is the next link.

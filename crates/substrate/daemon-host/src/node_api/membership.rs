@@ -274,9 +274,18 @@ impl LifecycleSink for NodeApiImpl {
 
     async fn chat_message(
         &self,
-        _transport: TransportId,
-        _conv: String,
-        _message: daemon_api::ChatMessage,
+        transport: TransportId,
+        conv: String,
+        message: daemon_api::ChatMessage,
     ) {
+        // Node-owned consequences of one adapter-reported message, at the single choke point every
+        // messaging adapter shares: append the durable Chat record onto the conversation's journal
+        // (the stream `ConvHistory` pages), THEN announce it. The pointer is emitted only for a
+        // durably-recorded message, so a client acting on it always finds the record.
+        if self.journal_chat_message(&transport, &conv, &message).await {
+            if let Some(feed) = self.node_feed() {
+                feed.emit(NodeEvent::MessagesChanged { transport, conv });
+            }
+        }
     }
 }

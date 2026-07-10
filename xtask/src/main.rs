@@ -1330,9 +1330,15 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 NodeEvent::NotificationsChanged,
                 // wire v37: the payload-free persons-changed pointer (port-person).
                 NodeEvent::PersonsChanged,
+                // wire vNEXT: the per-message conversation-history pointer (chat journal), so
+                // verify-codec proves the generated decoder accepts the new node-event arm.
+                NodeEvent::MessagesChanged {
+                    transport: TransportId::new("matrix/@bot:hs.org"),
+                    conv: "!room:hs.org".into(),
+                },
             ],
-            next_cursor: 12,
-            head_cursor: 12,
+            next_cursor: 13,
+            head_cursor: 13,
         }),
     )?;
     write_cbor(
