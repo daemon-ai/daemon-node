@@ -670,24 +670,29 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "request-notification-list.cbor",
         &ApiRequest::NotificationList,
     )?;
+    // Deterministic `created_ms`: the `NotificationInfo::new_*` constructors stamp wall-clock
+    // `now_ms()`, which would churn this fixture on every run. Pin it to a fixed epoch AFTER
+    // construction (runtime behavior is untouched — this is a fixture-only override).
+    const FIXTURE_NOTIF_CREATED_MS: u64 = 1_700_000_000_000;
+    let mut notif_authz = daemon_api::NotificationInfo::new_authorization(
+        Some("notif-authz".into()),
+        daemon_api::AuthorizationRequest::new(daemon_api::ContactInfo {
+            id: "@bob:matrix.org".into(),
+            display_name: Some("Bob".into()),
+            presence: daemon_api::Presence::default(),
+            permission: daemon_api::ContactPermission::Unset,
+        }),
+    );
+    notif_authz.created_ms = FIXTURE_NOTIF_CREATED_MS;
+    let mut notif_conn = daemon_api::NotificationInfo::new_connection_error(
+        Some("notif-conn".into()),
+        TransportId::new("matrix/@me:hs.org"),
+    );
+    notif_conn.created_ms = FIXTURE_NOTIF_CREATED_MS;
     write_cbor(
         &out,
         "response-notifications.cbor",
-        &ApiResponse::Notifications(vec![
-            daemon_api::NotificationInfo::new_authorization(
-                Some("notif-authz".into()),
-                daemon_api::AuthorizationRequest::new(daemon_api::ContactInfo {
-                    id: "@bob:matrix.org".into(),
-                    display_name: Some("Bob".into()),
-                    presence: daemon_api::Presence::default(),
-                    permission: daemon_api::ContactPermission::Unset,
-                }),
-            ),
-            daemon_api::NotificationInfo::new_connection_error(
-                Some("notif-conn".into()),
-                TransportId::new("matrix/@me:hs.org"),
-            ),
-        ]),
+        &ApiResponse::Notifications(vec![notif_authz, notif_conn]),
     )?;
     // Persons / metacontacts (wire v37; port-person): the read-only list op + a response carrying
     // an aliased, avatared, multi-endpoint person, so verify-codec proves the generated zcbor C
