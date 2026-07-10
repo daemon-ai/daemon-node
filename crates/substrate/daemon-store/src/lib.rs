@@ -2746,6 +2746,51 @@ impl SessionStore for InMemoryStore {
         }
     }
 
+    async fn load_journal_before(
+        &self,
+        stream: &JournalStreamId,
+        before_cursor: u64,
+        max: u32,
+    ) -> JournalPage {
+        let inner = self.inner.lock().unwrap();
+        let Some(log) = inner.journal_entries.get(stream) else {
+            return JournalPage::default();
+        };
+        let head_cursor = log.iter().map(|e| e.cursor).max().unwrap_or(0);
+        // The backward sibling of `load_journal` (rung 2): the `max` NEWEST entries strictly
+        // below the anchor, served ascending (sort, then keep the tail below `before_cursor`).
+        let mut entries: Vec<JournalEntry> = log
+            .iter()
+            .filter(|e| e.cursor < before_cursor)
+            .cloned()
+            .collect();
+        entries.sort_by_key(|e| e.cursor);
+        if max > 0 && entries.len() > max as usize {
+            entries.drain(..entries.len() - max as usize);
+        }
+        // The backward continuation: the OLDEST returned cursor, or the anchor when empty.
+        let next_cursor = entries.first().map(|e| e.cursor).unwrap_or(before_cursor);
+        let mut segments: Vec<u64> = entries.iter().map(|e| e.segment).collect();
+        segments.sort_unstable();
+        segments.dedup();
+        let segment_roots = segments
+            .into_iter()
+            .filter_map(|seg| {
+                inner
+                    .journal_roots
+                    .get(&(stream.clone(), seg))
+                    .cloned()
+                    .map(|root| (seg, root))
+            })
+            .collect();
+        JournalPage {
+            entries,
+            segment_roots,
+            next_cursor,
+            head_cursor,
+        }
+    }
+
     async fn record_journal_seal(
         &self,
         stream: &JournalStreamId,

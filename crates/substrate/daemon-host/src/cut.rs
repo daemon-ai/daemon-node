@@ -250,6 +250,15 @@ pub enum StoreCall {
         /// The page size (0 = all).
         max: u32,
     },
+    /// [`SessionStore::load_journal_before`] — the newest-anchored backward window (rung 2).
+    LoadJournalBefore {
+        /// The journal stream.
+        stream: JournalStreamId,
+        /// The exclusive upper-bound cursor.
+        before_cursor: u64,
+        /// The page size (0 = all).
+        max: u32,
+    },
 }
 
 /// The reply to a [`StoreCall`], typed per the trait's return shape. Fallible calls carry a
@@ -341,6 +350,7 @@ fn store_call_kind(call: &StoreCall) -> &'static str {
         StoreCall::CommitTraceSegment { .. } => "CommitTraceSegment",
         StoreCall::LoadTraceSegment { .. } => "LoadTraceSegment",
         StoreCall::LoadJournal { .. } => "LoadJournal",
+        StoreCall::LoadJournalBefore { .. } => "LoadJournalBefore",
     }
 }
 
@@ -439,6 +449,11 @@ async fn serve_store_call(store: &dyn SessionStore, call: StoreCall) -> StoreRep
             after_cursor,
             max,
         } => StoreReplyBody::Journal(store.load_journal(&stream, after_cursor, max).await),
+        StoreCall::LoadJournalBefore {
+            stream,
+            before_cursor,
+            max,
+        } => StoreReplyBody::Journal(store.load_journal_before(&stream, before_cursor, max).await),
     }
 }
 
@@ -695,6 +710,25 @@ impl SessionStore for RemoteStoreClient {
             .call(StoreCall::LoadJournal {
                 stream: stream.clone(),
                 after_cursor,
+                max,
+            })
+            .await
+        {
+            StoreReplyBody::Journal(p) => p,
+            _ => JournalPage::default(),
+        }
+    }
+
+    async fn load_journal_before(
+        &self,
+        stream: &JournalStreamId,
+        before_cursor: u64,
+        max: u32,
+    ) -> JournalPage {
+        match self
+            .call(StoreCall::LoadJournalBefore {
+                stream: stream.clone(),
+                before_cursor,
                 max,
             })
             .await

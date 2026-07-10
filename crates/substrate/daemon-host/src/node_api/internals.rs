@@ -196,8 +196,6 @@ pub(crate) struct NodeFeedEntry {
 /// most ~4 wire pages of removals behind; a client further behind is unservable and degrades to a
 /// full page (the same fallback an unservable `since_rev` takes), so eviction never silently loses
 /// a removal. Mirrors the feed's bounded-in-memory convention (the ring's fixed capacity).
-// RED (rung 2): referenced only by the failing unit tests until GREEN's `note_remove` enforces it.
-#[allow(dead_code)]
 pub(crate) const REMOVED_TOMBSTONE_CAP: usize = 256;
 
 /// Per-collection delta bookkeeping (rung 2): the rev at each key's last change plus bounded
@@ -222,19 +220,28 @@ pub(crate) struct DeltaIndex {
 
 impl DeltaIndex {
     /// Bump the rev and record `key`'s change at it (upsert semantics; a pending tombstone for a
-    /// re-added key is dropped). Returns the new rev for event stamping.
-    fn note_change(&mut self, _key: &str) -> u64 {
-        // RED (rung 2): rev bookkeeping only — the changed/removed index is not maintained yet, so
-        // `delta()` serves empty change sets and the rung-2 tests fail. GREEN populates it.
+    /// re-added key is dropped — an item must never ride `items` AND `removed` on one page).
+    /// Returns the new rev for event stamping.
+    fn note_change(&mut self, key: &str) -> u64 {
         self.rev += 1;
+        self.changed.insert(key.to_string(), self.rev);
+        self.removed.retain(|(_, k)| k != key);
         self.rev
     }
 
     /// Bump the rev and record `key`'s removal tombstone at it (dropping its `changed` entry;
     /// eviction past the bound raises `removed_floor`). Returns the new rev for event stamping.
-    fn note_remove(&mut self, _key: &str) -> u64 {
-        // RED (rung 2): rev bookkeeping only, exactly as `note_change`.
+    fn note_remove(&mut self, key: &str) -> u64 {
         self.rev += 1;
+        self.changed.remove(key);
+        self.removed.push_back((self.rev, key.to_string()));
+        // Bounded memory: evicting the oldest tombstone makes every delta anchored before it
+        // unservable (it would silently miss that removal), recorded as the floor.
+        while self.removed.len() > REMOVED_TOMBSTONE_CAP {
+            if let Some((rev, _)) = self.removed.pop_front() {
+                self.removed_floor = rev;
+            }
+        }
         self.rev
     }
 
