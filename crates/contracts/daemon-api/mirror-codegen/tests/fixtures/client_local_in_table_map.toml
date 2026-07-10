@@ -1,0 +1,17 @@
+# NEGATIVE fixture: a client_local field placed in a mirror table (fields.*) -> must FAIL
+# (spec §3.3 / guardrail §14.11: client_local lives only in sidecar).
+
+[entity.Room]
+class = "M"
+key = ["transport", "room"]
+table = "m_rooms"
+
+  [entity.Room.fields.transport]
+  wire = "room-info.transport"
+  type = "QString"
+  [entity.Room.fields.room]
+  wire = "room-info.room"
+  type = "QString"
+  [entity.Room.fields.unread]
+  client_local = true
+  type = "int"

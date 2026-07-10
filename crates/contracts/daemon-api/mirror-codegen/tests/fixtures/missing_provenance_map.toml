@@ -1,0 +1,16 @@
+# NEGATIVE fixture: `topic` has neither `wire` nor `client_local` -> generation must FAIL
+# (provenance completeness, spec §3.3).
+
+[entity.Room]
+class = "M"
+key = ["transport", "room"]
+table = "m_rooms"
+
+  [entity.Room.fields.transport]
+  wire = "room-info.transport"
+  type = "QString"
+  [entity.Room.fields.room]
+  wire = "room-info.room"
+  type = "QString"
+  [entity.Room.fields.topic]
+  type = "QString"
