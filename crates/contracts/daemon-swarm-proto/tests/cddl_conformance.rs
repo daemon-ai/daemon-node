@@ -101,8 +101,49 @@ fn all_sample_messages() -> Vec<SwarmMessage> {
             class: ThroughputClass::C2,
             capabilities: CapabilitySet::from_tokens(["tensor-abi@1", "det_sum@1"]).unwrap(),
         }),
-        SwarmMessage::Heartbeat(Heartbeat { round: 42 }),
+        SwarmMessage::Heartbeat(Heartbeat {
+            round: 42,
+            ready: None,
+        }),
     ]
+}
+
+#[test]
+fn heartbeat_ready_flag_cddl_conforms_and_roundtrips() {
+    use daemon_swarm_proto::from_canonical_slice;
+
+    // A legacy heartbeat omits `ready` on the wire; a Wave-3 ready heartbeat carries the bool.
+    let legacy = Heartbeat {
+        round: 3,
+        ready: None,
+    };
+    let ready = Heartbeat {
+        round: 3,
+        ready: Some(true),
+    };
+    for hb in [legacy, ready] {
+        let bytes = signed(SwarmMessage::Heartbeat(hb));
+        validate("signed-message", &bytes);
+    }
+    // The optional field is absent from the canonical bytes when `None` (back-compat), present when set.
+    let legacy_bytes = to_canonical_vec(&legacy).unwrap();
+    let ready_bytes = to_canonical_vec(&ready).unwrap();
+    assert!(ready_bytes.len() > legacy_bytes.len());
+    assert_eq!(
+        from_canonical_slice::<Heartbeat>(&legacy_bytes).unwrap(),
+        legacy
+    );
+    assert_eq!(
+        from_canonical_slice::<Heartbeat>(&ready_bytes).unwrap(),
+        ready
+    );
+    // A legacy heartbeat (no `ready` key) still decodes, defaulting to `None`.
+    assert_eq!(
+        from_canonical_slice::<Heartbeat>(&legacy_bytes)
+            .unwrap()
+            .ready,
+        None
+    );
 }
 
 #[test]
@@ -177,7 +218,10 @@ fn wrong_run_version_rejected() {
     let msg = SignedMessage::sign(
         &key(),
         SwarmProtoVersion(2),
-        SwarmMessage::Heartbeat(Heartbeat { round: 1 }),
+        SwarmMessage::Heartbeat(Heartbeat {
+            round: 1,
+            ready: None,
+        }),
     )
     .unwrap();
     // Signature is valid, but the run is pinned to a different version → join gate rejects it.

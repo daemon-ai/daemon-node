@@ -206,6 +206,12 @@ pub struct Join {
 pub struct Heartbeat {
     /// The peer's current round.
     pub round: u64,
+    /// Optional model-readiness signal during `Warmup` (§6.2/§6.5): `Some(true)` means the peer has
+    /// built + is ready to train, letting the coordinator exit `Warmup` early once every admitted
+    /// member is ready. Additive (Wave 3): omitted on the wire for legacy heartbeats, so the
+    /// timeout-only warmup path is unchanged for senders that never set it (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<bool>,
 }
 
 /// The externally-tagged union of every control-plane message.

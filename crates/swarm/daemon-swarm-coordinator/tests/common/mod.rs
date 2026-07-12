@@ -154,7 +154,16 @@ pub fn straggle_msg(k: &SigningKey, round: u64) -> SignedMessage {
 }
 
 pub fn heartbeat_msg(k: &SigningKey, round: u64) -> SignedMessage {
-    let h = Heartbeat { round };
+    let h = Heartbeat { round, ready: None };
+    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Heartbeat(h)).unwrap()
+}
+
+/// A heartbeat that also signals model-readiness during `Warmup` (Wave-3 additive `ready` flag).
+pub fn ready_heartbeat_msg(k: &SigningKey, round: u64) -> SignedMessage {
+    let h = Heartbeat {
+        round,
+        ready: Some(true),
+    };
     SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Heartbeat(h)).unwrap()
 }
 

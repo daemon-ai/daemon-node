@@ -98,6 +98,7 @@ join = {
 
 heartbeat = {
   "round": round,
+  ? "ready": bool,          ; optional model-readiness signal during Warmup (§6.2; additive Wave 3)
 }
 
 ; ----- the externally-tagged message union -----
