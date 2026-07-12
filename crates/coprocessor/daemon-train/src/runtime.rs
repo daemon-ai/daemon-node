@@ -516,7 +516,13 @@ impl Instance {
         if let Some(trap) = self.store.data_mut().trap.take() {
             return TrainError::Trap(trap);
         }
-        let msg = e.to_string();
+        // The trap reason (fuel/epoch/oob/unreachable) is often a source in the chain, not the
+        // top-level message ("error while executing at wasm backtrace: …").
+        let msg = e
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(": ");
         let low = msg.to_lowercase();
         let code = if low.contains("fuel") {
             TrapCode::BudgetFuel
