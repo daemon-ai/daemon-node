@@ -1,0 +1,26 @@
+[package]
+name = "daemon-swarm-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+daemon-swarm-proto = { workspace = true }
+tokio = { workspace = true }
+# The artifact-fetch / presign egress plane (§7.1). NOTE for lane R: raw `reqwest::Client` is
+# banned workspace-wide by clippy (`disallowed_types`, see clippy.toml); outbound HTTP must be
+# built through `daemon_egress::EgressClient`. Declared here for the transport surface; no client
+# is constructed in the Wave-0 scaffold.
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# Wired up during Wave-0 scaffolding; the SwarmTransport surface lands with lane R.
+ignored = ["tokio", "reqwest"]

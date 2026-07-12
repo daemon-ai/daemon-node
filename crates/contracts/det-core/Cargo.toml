@@ -1,0 +1,17 @@
+[package]
+name = "det-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Intentionally zero third-party dependencies: these are the fixed-order fp32 deterministic kernels
+# shared verbatim by the host worker and the guest SDK simulator, so bit-exact reproducibility can
+# never depend on a transitive crate's float behavior (swarm-tensor-abi-spec.md; §10.1).
+
+[lints]
+workspace = true

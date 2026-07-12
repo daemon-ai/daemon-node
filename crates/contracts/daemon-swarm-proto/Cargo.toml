@@ -1,0 +1,23 @@
+[package]
+name = "daemon-swarm-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# wasm32-clean by construction: serde for the envelope schema + ciborium for the CBOR codec. No
+# tokio, no Burn, no wasmtime — this crate compiles for the coordinator DO (wasm32) and the host
+# alike (swarm-training-spec.md §10.1).
+serde = { workspace = true }
+ciborium = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# Wired up during Wave-0 scaffolding; the envelope/codec surface lands with lane P.
+ignored = ["serde", "ciborium"]

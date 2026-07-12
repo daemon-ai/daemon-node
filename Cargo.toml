@@ -345,6 +345,16 @@ daemon-node = { version = "0", path = "crates/node/daemon-node" }
 # (no-hyperon) build; the worker build opts into the engine via `--features hyperon` on the crate.
 daemon-metta = { version = "0", path = "crates/coprocessor/daemon-metta", default-features = false }
 daemon-metta-client = { version = "0", path = "crates/coprocessor/daemon-metta-client" }
+# --- swarm training stack (swarm-training-spec.md §10.1; DAG-ordered) -----------------------------
+daemon-swarm-proto = { version = "0", path = "crates/contracts/daemon-swarm-proto" }
+det-core = { version = "0", path = "crates/contracts/det-core" }
+daemon-train-sdk = { version = "0", path = "crates/contracts/daemon-train-sdk" }
+daemon-swarm-net = { version = "0", path = "crates/swarm/daemon-swarm-net" }
+daemon-swarm-run = { version = "0", path = "crates/swarm/daemon-swarm-run" }
+daemon-swarm-coordinator = { version = "0", path = "crates/swarm/daemon-swarm-coordinator" }
+daemon-swarm-observe = { version = "0", path = "crates/swarm/daemon-swarm-observe" }
+daemon-train = { version = "0", path = "crates/coprocessor/daemon-train" }
+daemon-train-client = { version = "0", path = "crates/coprocessor/daemon-train-client" }
 daemon-pytool = { version = "0", path = "crates/coprocessor/daemon-pytool" }
 daemon-pytool-client = { version = "0", path = "crates/coprocessor/daemon-pytool-client" }
 daemon-tool-metta = { version = "0", path = "tools/daemon-tool-metta" }

@@ -1,0 +1,32 @@
+[package]
+name = "daemon-train"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "daemon-train"
+path = "src/bin/daemon-train.rs"
+
+[dependencies]
+daemon-swarm-proto = { workspace = true }
+# Host worker runtime: the wasm module sandbox (wasmtime) + the training engine (Burn, ndarray
+# backend + autodiff; NO GPU backends in the default gate) + content hashing for artifact / tensor
+# digests (blake3, xxh3). swarm-training-spec.md §5.1, §10.1. Heavy trees on purpose: this crate is
+# the worker fault domain and is built out-of-gate per backend lane in the real product.
+wasmtime = { workspace = true }
+burn = { workspace = true }
+blake3 = { workspace = true }
+xxhash-rust = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# Wired up during Wave-0 scaffolding; the host runtime + tensor ABI land with lane E.
+ignored = ["wasmtime", "burn"]
