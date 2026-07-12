@@ -133,6 +133,46 @@ pub struct Committee {
     pub witnesses: Vec<PeerId>,
 }
 
+/// Salt for the verifier-committee shuffle (§12).
+pub const VERIFIER_SALT: &[u8] = b"daemon-swarm/verifier/v1";
+/// Salt for the checkpointer (tie-breaker) election (§9).
+pub const CHECKPOINTER_SALT: &[u8] = b"daemon-swarm/checkpointer/v1";
+
+/// Select the verifier committee — a seed-shuffled `⌈n·percent/100⌉` subset (§12; TDD PROTO-15).
+///
+/// **`percent == 0` returns the empty set** — the shipped default keeps verification a no-op seam
+/// (Psyche's `verification_percent = 0`), designed but never faked.
+#[must_use]
+pub fn select_verifiers(roster: &[PeerId], seed: &Seed, percent: u32) -> Vec<PeerId> {
+    if percent == 0 || roster.is_empty() {
+        return Vec::new();
+    }
+    let mut pool = roster.to_vec();
+    pool.sort_unstable();
+    pool.dedup();
+    let n = pool.len() as u64;
+    let count = ((n * u64::from(percent)).div_ceil(100) as usize).clamp(1, pool.len());
+    let mut rng = seeded_lcg(seed, VERIFIER_SALT);
+    deterministic_shuffle(&mut pool, &mut rng);
+    pool.truncate(count);
+    pool
+}
+
+/// Elect a single checkpointer deterministically from `(seed, roster)` — the tie-breaker committee
+/// of one (§9; TDD PROTO-10). Order-independent (roster sorted first); `None` for an empty roster.
+#[must_use]
+pub fn elect_checkpointer(roster: &[PeerId], seed: &Seed) -> Option<PeerId> {
+    if roster.is_empty() {
+        return None;
+    }
+    let mut pool = roster.to_vec();
+    pool.sort_unstable();
+    pool.dedup();
+    let mut rng = seeded_lcg(seed, CHECKPOINTER_SALT);
+    let idx = rng.below(pool.len() as u64) as usize;
+    Some(pool[idx])
+}
+
 /// Select the round committee. `witness_target == 0` makes every peer a witness (§6.3); otherwise
 /// the first `min(witness_target, roster)` of the witness-salted shuffle are witnesses.
 ///
@@ -207,7 +247,7 @@ pub fn assign_batches(
 
     // Canonicalize by pubkey bytes, then shuffle so interval positions depend only on the set+seed.
     let mut peers: Vec<(PeerId, ThroughputClass)> = roster.to_vec();
-    peers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    peers.sort_unstable_by_key(|a| a.0);
     peers.dedup_by(|a, b| a.0 == b.0);
     let mut rng = seeded_lcg(seed, ASSIGN_SALT);
     deterministic_shuffle(&mut peers, &mut rng);

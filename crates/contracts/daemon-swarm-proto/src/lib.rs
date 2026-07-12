@@ -30,8 +30,9 @@ pub mod sign;
 pub mod version;
 
 pub use assignment::{
-    advance_cursor, assign_batches, class_weight, deterministic_shuffle, global_batch_at,
-    seeded_lcg, select_committee, witness_quorum, Committee, Lcg, WITNESS_TARGET_DEFAULT,
+    advance_cursor, assign_batches, class_weight, deterministic_shuffle, elect_checkpointer,
+    global_batch_at, seeded_lcg, select_committee, select_verifiers, witness_quorum, Committee,
+    Lcg, WITNESS_TARGET_DEFAULT,
 };
 pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
