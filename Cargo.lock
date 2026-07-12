@@ -4334,8 +4334,13 @@ dependencies = [
 name = "daemon-swarm-net"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "blake3",
+ "ciborium",
+ "daemon-core",
  "daemon-swarm-proto",
  "reqwest 0.12.28",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -4361,10 +4366,15 @@ dependencies = [
 name = "daemon-swarm-run"
 version = "0.0.1"
 dependencies = [
+ "blake3",
+ "ciborium",
  "daemon-swarm-net",
  "daemon-swarm-proto",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4718,8 +4728,10 @@ version = "0.0.1"
 dependencies = [
  "daemon-common",
  "daemon-provision",
+ "daemon-swarm-run",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
