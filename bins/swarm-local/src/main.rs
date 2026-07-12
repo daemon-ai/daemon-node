@@ -10,9 +10,10 @@
 //!   the deterministic `StubBackend` + the [`LocalCoordinator`](daemon_swarm_run::local_coordinator)
 //!   shell (tick + signing + receipt production over a shared payload store). Prints the agreed
 //!   per-round digest transcript + the offline replay check (PROTO-20).
-//! - `--backend worker`: one supervised `daemon-train` worker per peer over the frozen worker
-//!   protocol (probe → assess the frozen envelope → join). The fake worker keeps this path testable;
-//!   `MERGE-3`: point `--worker-bin` at the real E3 `daemon-train` worker binary.
+//! - `--backend worker`: one supervised `daemon-train-worker` per peer over the frozen worker
+//!   protocol (probe → assess the **real** signed envelope → join). The worker verifies the frozen
+//!   envelope, extracts `[experiment.config]`, resolves its `.wasm` module from the envelope artifact
+//!   map (`file://`, blake3-verified), and drives real host training (`WasmBackend`).
 //!
 //! This is a local developer runnable (like `xtask`): it reads an operator-supplied envelope path on
 //! the operator's own machine, so the file read carries a declared `#[allow]` rather than the
@@ -28,7 +29,7 @@ use daemon_swarm_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
 };
-use daemon_swarm_proto::{FrozenEnvelope, Hash, SigningKey};
+use daemon_swarm_proto::{to_canonical_vec, FrozenEnvelope, Hash, SigningKey};
 use daemon_swarm_run::harness::{run_swarm, SwarmConfig};
 use daemon_swarm_run::protocol::{JoinPolicy, LeaveMode, PolicyMode};
 use daemon_train_client::{TrainClientConfig, TrainSupervisor};
@@ -70,8 +71,8 @@ struct Args {
     /// Experiment profile passthrough (recorded in the run header).
     #[arg(long)]
     profile: Option<String>,
-    /// Worker binary for `--backend worker` (MERGE-3: the real daemon-train worker).
-    #[arg(long, default_value = "daemon-train")]
+    /// Worker binary for `--backend worker` (the real `daemon-train-worker`).
+    #[arg(long, default_value = "daemon-train-worker")]
     worker_bin: PathBuf,
 }
 
@@ -158,7 +159,20 @@ impl EnvelopeToml {
             experiment: ExperimentSection {
                 module: self.experiment.module,
                 abi: self.experiment.abi,
-                config: ciborium::value::Value::Text(self.experiment.config),
+                // An empty authoring `config` embeds the tiny-llama preset default (a valid, non-trivial
+                // experiment config), so `--backend worker` drives a real training round rather than
+                // choking on a placeholder. A non-empty string is carried verbatim (opaque, §4.3).
+                config: if self.experiment.config.trim().is_empty() {
+                    ciborium::value::Value::serialized(&daemon_train_sdk::models::TinyLlamaCfg {
+                        n_layers: 1,
+                        seq_len: 9,
+                        vocab: 64,
+                        ..daemon_train_sdk::models::TinyLlamaCfg::default()
+                    })
+                    .expect("tiny-llama default config is serializable")
+                } else {
+                    ciborium::value::Value::Text(self.experiment.config)
+                },
             },
             artifacts,
             data: DataSection {
@@ -204,6 +218,14 @@ fn read_envelope(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("read envelope {}", path.display()))
 }
 
+/// Read the operator-supplied module `.wasm` (to content-address it into the envelope artifact).
+/// Same declared `#[allow]` rationale as [`read_envelope`]: a local dev-run path, not an
+/// attacker-influenced input.
+#[allow(clippy::disallowed_methods)]
+fn read_module(path: &Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
+
 fn parse_seed(s: &str) -> Result<u64> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -223,7 +245,21 @@ async fn main() -> Result<()> {
     let rounds = args.rounds.unwrap_or(spec.data.rounds);
     let steps_per_round = spec.data.steps_per_round;
     let (min_peers, max_peers) = (spec.run.min_peers as usize, spec.run.max_peers as usize);
-    let envelope = spec.into_envelope();
+    let module_name = spec.experiment.module.clone();
+    let mut envelope = spec.into_envelope();
+
+    // Resolve the experiment module file so the worker path carries a real, blake3-verified artifact
+    // (relative to the envelope dir, or `DAEMON_TRAIN_MODULE`). The frozen envelope then binds the
+    // module by content hash; the worker fetches it via `ArtifactResolver`. Stub mode ignores this.
+    let module_abs = resolve_module_path(&args.envelope, &module_name);
+    if let Some(abs) = &module_abs {
+        if let Ok(bytes) = read_module(abs) {
+            if let Some(art) = envelope.artifacts.get_mut(&module_name) {
+                art.url = format!("file://{}", abs.display());
+                art.blake3 = daemon_swarm_proto::blake3_hash(&bytes);
+            }
+        }
+    }
 
     // The real §6.1 freeze → hash → sign → verify chain (a demo author key for local runs).
     envelope.validate().context("envelope validation")?;
@@ -250,8 +286,28 @@ async fn main() -> Result<()> {
 
     match args.backend {
         Backend::Stub => run_stub(peers, rounds, steps_per_round, seed).await,
-        Backend::Worker => run_worker(peers, &args.worker_bin, frozen.bytes()).await,
+        Backend::Worker => {
+            // The worker receives the full signed envelope (it verifies + resolves its module).
+            let wire = to_canonical_vec(&frozen.to_wire()).context("encode signed envelope")?;
+            run_worker(peers, &args.worker_bin, &wire, module_abs.as_deref()).await
+        }
     }
+}
+
+/// Resolve the experiment `.wasm` path for worker mode: `DAEMON_TRAIN_MODULE` if set, else the
+/// module name resolved relative to the envelope file's directory. `None` if neither exists.
+fn resolve_module_path(envelope: &Path, module_name: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DAEMON_TRAIN_MODULE") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let candidate = envelope
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(module_name);
+    candidate.exists().then_some(candidate)
 }
 
 /// Stub mode: the in-process peer harness + local coordinator over `StubBackend`.
@@ -286,10 +342,16 @@ async fn run_stub(peers: usize, rounds: u64, steps_per_round: u32, seed: u64) ->
     Ok(())
 }
 
-/// Worker mode: spawn one supervised `daemon-train` worker per peer over the frozen worker protocol
-/// (probe → assess the frozen envelope → join). `MERGE-3`: point `--worker-bin` at the real E3
-/// `daemon-train` worker binary — the fake worker keeps this path testable meanwhile.
-async fn run_worker(peers: usize, worker_bin: &Path, envelope_bytes: &[u8]) -> Result<()> {
+/// Worker mode: spawn one supervised `daemon-train-worker` per peer over the frozen worker protocol
+/// (probe → assess the **real** signed envelope → join). Each worker verifies the envelope, resolves
+/// its module from the artifact map (or the `DAEMON_TRAIN_MODULE` override), and drives real host
+/// training (`WasmBackend`, self-driven round).
+async fn run_worker(
+    peers: usize,
+    worker_bin: &Path,
+    envelope_bytes: &[u8],
+    module_path: Option<&Path>,
+) -> Result<()> {
     let policy = JoinPolicy {
         mode: PolicyMode::Always,
         vram_cap_mb: 0,
@@ -297,8 +359,18 @@ async fn run_worker(peers: usize, worker_bin: &Path, envelope_bytes: &[u8]) -> R
         schedule: None,
     };
     println!("\nspawning {peers} worker(s) from {}", worker_bin.display());
+    if let Some(m) = module_path {
+        println!("  module        : {}", m.display());
+    }
     for i in 0..peers {
-        let sup = TrainSupervisor::new(TrainClientConfig::new(worker_bin));
+        let mut client_cfg = TrainClientConfig::new(worker_bin);
+        if let Some(m) = module_path {
+            client_cfg.env.push((
+                "DAEMON_TRAIN_MODULE".to_string(),
+                m.to_string_lossy().into_owned(),
+            ));
+        }
+        let sup = TrainSupervisor::new(client_cfg);
         let hw = sup.probe().await.context("probe worker")?;
         let elig = sup
             .assess(envelope_bytes.to_vec())
@@ -323,7 +395,7 @@ async fn run_worker(peers: usize, worker_bin: &Path, envelope_bytes: &[u8]) -> R
         }
         sup.shutdown().await;
     }
-    println!("\nworker-backed run wired over the frozen protocol (real training is E3 / MERGE-3).");
+    println!("\nworker-backed run over the frozen protocol (real host training via WasmBackend).");
     Ok(())
 }
 

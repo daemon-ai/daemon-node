@@ -39,7 +39,7 @@ pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use capability::{Capability, CapabilitySet};
 pub use digest::{derive_schedule, digest_state, DigestSchedule, StateLayout};
-pub use envelope::{Envelope, FrozenEnvelope, ENVELOPE_SCHEMA_MAJOR};
+pub use envelope::{Envelope, FrozenEnvelope, SignedEnvelope, ENVELOPE_SCHEMA_MAJOR};
 pub use error::SwarmProtoError;
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};

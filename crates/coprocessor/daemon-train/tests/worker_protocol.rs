@@ -18,6 +18,11 @@ use std::time::Duration;
 
 use daemon_common::SessionId;
 use daemon_provision::{Placement, PlacementSpec, ProcessProvisioner, Provisioner};
+use daemon_swarm_proto::envelope::{
+    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
+    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
+};
+use daemon_swarm_proto::{to_canonical_vec, Hash, SigningKey};
 use daemon_swarm_run::protocol::{self, Command as WCmd, Event, JoinPolicy, PolicyMode};
 use daemon_train_client::{TrainClientConfig, TrainSupervisor};
 use daemon_train_sdk::models::TinyLlamaCfg;
@@ -132,6 +137,149 @@ fn policy() -> JoinPolicy {
         duty_cycle_pct: 100,
         schedule: None,
     }
+}
+
+/// A real signed run envelope whose `tiny-llama.wasm` artifact points at the built module by
+/// `file://` + real blake3, with the tiny-llama preset as `[experiment.config]`. Reopened + verified
+/// by the worker, which resolves the module through `ArtifactResolver` (no `DAEMON_TRAIN_MODULE`).
+fn signed_envelope_wire() -> Vec<u8> {
+    let module = module_path();
+    let bytes = std::fs::read(&module).expect("read module");
+    let blake3 = Hash(*blake3::hash(&bytes).as_bytes());
+    let mut artifacts = std::collections::BTreeMap::new();
+    artifacts.insert(
+        "tiny-llama.wasm".to_string(),
+        Artifact {
+            url: format!("file://{}", module.display()),
+            blake3,
+        },
+    );
+    artifacts.insert(
+        "manifest.json".to_string(),
+        Artifact {
+            url: "file://manifest.json".to_string(),
+            blake3: Hash([0u8; 32]),
+        },
+    );
+    let cfg = TinyLlamaCfg {
+        n_layers: 1,
+        seq_len: 9,
+        ..TinyLlamaCfg::default()
+    };
+    let env = Envelope {
+        run: RunSection {
+            schema: ENVELOPE_SCHEMA_MAJOR,
+            run_id: "worker-seam".to_string(),
+            min_peers: 1,
+            max_peers: 4,
+            access: Access::Org,
+        },
+        experiment: ExperimentSection {
+            module: "tiny-llama.wasm".to_string(),
+            abi: "tensor-abi@1".to_string(),
+            config: ciborium::value::Value::serialized(&cfg).expect("cfg value"),
+        },
+        artifacts,
+        data: DataSection {
+            manifest: "manifest.json".to_string(),
+            steps_per_round: 3,
+            global_batch: GlobalBatch {
+                start: 12,
+                end: 12,
+                ramp_rounds: 0,
+            },
+            stop: StopCondition::Rounds(4),
+        },
+        requirements: Requirements {
+            vram_mb_min: 0,
+            ram_gb_min: 0,
+            uplink_mbps_min: 0,
+            downlink_mbps_min: 0,
+            disk_gb_min: 0,
+            throughput_floor: "c1".to_string(),
+            update_mb_max: 64,
+            capabilities: Vec::new(),
+            payload_store: "r2".to_string(),
+        },
+        phases: Phases {
+            round_mode: RoundMode::Barrier,
+            warmup: 1,
+            round_train_max: 1_000,
+            round_witness: 1_000,
+            cooldown: 1,
+            epoch_rounds: 0,
+            checkpoint_every_epochs: 0,
+            stall_rounds_max: 2,
+            payload_retention_rounds: 8,
+        },
+    };
+    let author = SigningKey::from_bytes(&[0xA1u8; 32]);
+    let frozen = env.freeze(&author).expect("freeze envelope");
+    to_canonical_vec(&frozen.to_wire()).expect("encode signed envelope")
+}
+
+/// The Merge-3 envelope seam: the worker receives the **real** signed envelope, verifies it, extracts
+/// `[experiment.config]`, and resolves the module from the artifact map via `ArtifactResolver`
+/// (`file://`, blake3-verified) — **no `DAEMON_TRAIN_MODULE` override**. Assess is eligible and join
+/// drives a real round.
+#[tokio::test]
+async fn worker_resolves_module_from_signed_envelope() {
+    // Ensure the module exists on disk for the artifact resolver (no env override is set).
+    let _ = module_path();
+    let mut cfg = TrainClientConfig::new(worker_bin());
+    cfg.spawn_timeout = Duration::from_secs(30);
+    cfg.op_timeout = Duration::from_secs(60);
+    let sup = TrainSupervisor::new(cfg);
+
+    let elig = sup
+        .assess(signed_envelope_wire())
+        .await
+        .expect("assess over the signed envelope");
+    assert!(
+        elig.eligible,
+        "the worker resolved its module from the envelope + assessed eligible: {:?}",
+        elig.reasons
+    );
+    sup.join("worker-seam", "wss://coord.example/swarm", vec![], policy())
+        .await
+        .expect("join after envelope-resolved assess");
+    sup.shutdown().await;
+}
+
+/// RUN-9 (§10.5) over the **real** worker: preemption-as-churn. After a join, `Throttle{paused}`
+/// pauses the `WasmBackend` (checkpoint + drop the wasm instance) and resume re-instantiates; a
+/// subsequent join re-enters — all over the **same** worker (pause/resume is churn, never a respawn).
+#[tokio::test]
+async fn real_worker_preemption_pause_resume_rejoins_without_respawn() {
+    let module = module_path();
+    let mut cfg = TrainClientConfig::new(worker_bin());
+    cfg.env = vec![(
+        "DAEMON_TRAIN_MODULE".to_string(),
+        module.to_string_lossy().into_owned(),
+    )];
+    cfg.spawn_timeout = Duration::from_secs(30);
+    cfg.op_timeout = Duration::from_secs(60);
+    let sup = TrainSupervisor::new(cfg);
+
+    sup.assess(tiny_cfg_cbor()).await.expect("assess");
+    sup.join("run-9", "wss://coord", vec![], policy())
+        .await
+        .expect("initial join");
+
+    // Inference preempts training: pause frees the wasm instance, resume re-instantiates.
+    sup.throttle(None, None, true).await.expect("pause");
+    sup.throttle(None, None, false).await.expect("resume");
+    // Rejoin at the next boundary — a fresh backend over the same worker process.
+    sup.join("run-9", "wss://coord", vec![], policy())
+        .await
+        .expect("rejoin after resume");
+
+    assert_eq!(
+        sup.restarts().await,
+        0,
+        "pause/resume is churn over the same worker — never a respawn"
+    );
+    sup.shutdown().await;
 }
 
 // -- direct subprocess drive (observe the one-round RoundOutcome) --------------------------------

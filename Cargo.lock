@@ -4333,9 +4333,15 @@ dependencies = [
 name = "daemon-swarm-e2e"
 version = "0.0.1"
 dependencies = [
+ "blake3",
+ "ciborium",
+ "daemon-swarm-coordinator",
  "daemon-swarm-net",
+ "daemon-swarm-observe",
  "daemon-swarm-proto",
  "daemon-swarm-run",
+ "daemon-train",
+ "daemon-train-sdk",
  "tokio",
 ]
 
@@ -4386,6 +4392,7 @@ dependencies = [
  "ciborium",
  "daemon-swarm-coordinator",
  "daemon-swarm-net",
+ "daemon-swarm-observe",
  "daemon-swarm-proto",
  "figment",
  "serde",
@@ -4737,6 +4744,7 @@ dependencies = [
  "ciborium",
  "daemon-common",
  "daemon-provision",
+ "daemon-swarm-net",
  "daemon-swarm-proto",
  "daemon-swarm-run",
  "daemon-train-client",
@@ -13450,6 +13458,7 @@ dependencies = [
  "daemon-swarm-proto",
  "daemon-swarm-run",
  "daemon-train-client",
+ "daemon-train-sdk",
  "serde",
  "tokio",
  "toml 0.8.23",

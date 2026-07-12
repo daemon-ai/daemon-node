@@ -100,8 +100,10 @@ async fn supervisor_respawn() {
 
 /// RUN-9 (§10.5): preemption-as-churn. `Throttle{paused}` makes the peer leave the round cleanly;
 /// resume + rejoin re-enter at a boundary — over the **same** worker (pause/resume is churn, not a
-/// crash, so there is no respawn). Real wasm VRAM-free preemption is the E3 worker's side
-/// (`MERGE-3`: point at the daemon-train worker binary).
+/// crash, so there is no respawn). This fixture-worker test pins the supervision semantics (no
+/// respawn on pause/resume); the **real** `daemon-train-worker` preemption (wasm VRAM-free
+/// pause/resume via `WasmBackend`) is exercised in `daemon-train/tests/worker_protocol.rs`
+/// (`daemon-train-client` cannot depend on `daemon-train` — that would be a dependency cycle).
 #[tokio::test]
 async fn preemption_as_churn_pauses_and_rejoins_without_respawn() {
     let state = state_path("preempt");

@@ -3,8 +3,9 @@
 #   swarm-local --envelope bins/swarm-local/examples/local-demo.toml
 #
 # The runner reads this TOML, builds the resolved proto `Envelope`, freezes + verifies it (the real
-# §6.1 freeze/verify chain), and stands up `--peers` in-process peers + the local coordinator over
-# the deterministic StubBackend (default `--backend stub`).
+# §6.1 freeze/verify chain), and stands up `--peers` in-process peers + the local coordinator. The
+# default `--backend stub` ignores the experiment config; `--backend worker` spawns the real
+# `daemon-train-worker`, which builds the tiny-llama module from `[experiment.config]`.
 
 [run]
 run_id = "local-demo"
@@ -12,11 +13,13 @@ min_peers = 1
 max_peers = 8
 
 [experiment]
-module = "experiment.wasm"
+module = "tiny-llama.wasm"
 abi = "tensor-abi@1"
-# Opaque `[experiment.config]` bytes handed to the module's `da_build` (never interpreted by the
-# swarm). The stub backend ignores it; a real worker parses it.
-config = "demo-experiment-config"
+# An empty `[experiment.config]` makes `swarm-local` embed the tiny-llama preset default (a valid
+# experiment config), so `--backend worker` drives a real training round. The stub backend ignores
+# it. Supply the module `.wasm` to `--backend worker` via `DAEMON_TRAIN_MODULE` (or place it next to
+# this envelope so the artifact resolver finds it).
+config = ""
 
 [data]
 manifest = "manifest.json"

@@ -39,6 +39,10 @@ ciborium = { workspace = true }
 # worker binary implements the child side of the protocol. No cycle: `daemon-swarm-run` has no dep on
 # `daemon-train`. Path dep already declared in the frozen root manifest — no root/deny/flake change.
 daemon-swarm-run = { workspace = true }
+# The envelope artifact plane (`ArtifactResolver`, `file://` blake3-verified) the worker uses to
+# fetch its experiment module from the frozen envelope's artifact map (§8). Path dep already in the
+# frozen root manifest; net depends only on proto (no cycle). Used by the worker bin target.
+daemon-swarm-net = { workspace = true }
 # The length-framed `CutChannel` stdio transport the `daemon-train-worker` binary speaks (same
 # supervision contract as the other coprocessor workers, §10.2). Used by the bin target only.
 daemon-provision = { workspace = true }

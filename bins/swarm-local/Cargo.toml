@@ -17,6 +17,11 @@ daemon-swarm-run = { workspace = true, features = ["harness"] }
 daemon-swarm-proto = { workspace = true }
 # The node-side worker supervisor for `--backend worker` (spawn/probe/assess/join over §10.2).
 daemon-train-client = { workspace = true }
+# The tiny-llama preset config the demo envelope embeds when the authoring TOML leaves
+# `[experiment.config]` empty (so `--backend worker` drives a real, non-trivial training round). The
+# `sim` feature compiles the config/model types natively for this host binary. Path dep already in
+# the frozen root manifest.
+daemon-train-sdk = { workspace = true, features = ["sim"] }
 tokio = { workspace = true }
 clap = { workspace = true }
 # Parse the authoring TOML envelope (proto stays wasm32-clean + never parses TOML — §6.1).

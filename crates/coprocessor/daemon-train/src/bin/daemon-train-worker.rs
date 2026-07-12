@@ -15,29 +15,39 @@
 //! runtime instead of a script:
 //!
 //! - `Probe` → a real host capability report (`tabi@1`, all 66 host ops; GPU absent = CPU-only).
-//! - `AssessRun{envelope}` → the peer-side re-validation (spec §6.5): a static import scan of the
-//!   module bytes vs the host vocabulary, then a host meta-mode pass → `Assessed(Eligibility)`. The
-//!   envelope bytes are the `[experiment.config]` CBOR (real `FrozenEnvelope`/artifact resolution is
-//!   the Merge-3 seam); the config is cached for the subsequent `JoinRun`.
+//! - `AssessRun{envelope}` → the peer-side re-validation (spec §6.5). The `envelope` bytes are the
+//!   canonical [`SignedEnvelope`] wire form of the run's [`FrozenEnvelope`]: the worker **verifies**
+//!   it (`FrozenEnvelope::open`/`verify`), extracts the `[experiment.config]` via `config_bytes()`,
+//!   and **resolves the module** from the envelope's artifact map via
+//!   [`daemon_swarm_net::ArtifactResolver`] (`file://`, blake3-verified). `DAEMON_TRAIN_MODULE`, if
+//!   set, overrides the artifact resolution (dev / node-controlled). It then runs the static import
+//!   scan vs the host vocabulary + a host meta-mode pass → `Assessed(Eligibility)`, caching the
+//!   config + module bytes for the subsequent `JoinRun`. A raw-config-CBOR envelope (no signature
+//!   wrapper) is still accepted as a legacy path (module from `DAEMON_TRAIN_MODULE`).
 //! - `JoinRun` → construct a `WasmBackend`, emit `RunPhase{train}`, self-drive one round
 //!   (train × H → make_update → ingest) and stream `Metric`/`RoundOutcome`.
 //! - `Throttle{paused}` → `WasmBackend::pause`/`resume` (preemption-as-churn, §10.5).
 //! - `Leave`/`Shutdown`/`Ping` → as the protocol requires.
 //!
 //! A trapping module surfaces as `Event::Error{class: Module, …}` — the worker is never harmed.
-//!
-//! The experiment `.wasm` module is located via `DAEMON_TRAIN_MODULE` (an absolute path).
 
 use std::collections::BTreeSet;
 
 use daemon_provision::{CutChannel, CutWriter};
-use daemon_swarm_proto::{blake3_hash, PeerId};
+use daemon_swarm_net::{ArtifactRef, ArtifactResolver};
+use daemon_swarm_proto::{blake3_hash, from_canonical_slice, PeerId, SignedEnvelope};
 use daemon_swarm_run::backend::{BatchRef, StagedPayload, StepCtx, TrainerBackend};
 use daemon_swarm_run::protocol::{
     self, Command, Eligibility, ErrorClass, Event, Hardware, WorkerCapabilities,
 };
 use daemon_train::phase::PHASE_TABLE;
 use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig, WasmBackendError};
+
+/// The experiment inputs a run resolves to: the `[experiment.config]` CBOR + the module `.wasm`.
+struct ResolvedRun {
+    config: Vec<u8>,
+    module: Vec<u8>,
+}
 
 /// A representative meta/self-drive micro-batch shape (sequences × tokens-per-sequence). All-zero
 /// token ids are valid for any vocabulary (id 0 always exists), so the worker stays experiment
@@ -50,16 +60,6 @@ const SELF_PEER: PeerId = PeerId([0xA1; 32]);
 
 #[tokio::main]
 async fn main() {
-    let module = match load_module_bytes() {
-        Ok(bytes) => bytes,
-        Err(detail) => {
-            // No channel yet on a hard config error — report on stderr and exit non-zero so the
-            // supervisor sees an unhealthy spawn.
-            eprintln!("daemon-train-worker: {detail}");
-            std::process::exit(1);
-        }
-    };
-
     let channel = CutChannel::from_stdio();
     let (writer, mut reader) = channel.split();
 
@@ -71,8 +71,8 @@ async fn main() {
     )
     .await;
 
-    // Cached across commands: the last assessed `[experiment.config]` + the live joined backend.
-    let mut config: Option<Vec<u8>> = None;
+    // Cached across commands: the assessed run (config + module bytes) + the live joined backend.
+    let mut run: Option<ResolvedRun> = None;
     let mut backend: Option<WasmBackend> = None;
 
     while let Some(bytes) = reader.recv().await {
@@ -85,23 +85,27 @@ async fn main() {
         };
         match cmd {
             Command::Probe => send(&writer, &Event::Probed(hardware())).await,
-            Command::AssessRun { envelope } => {
-                config = Some(envelope.clone());
-                match assess(&module, &envelope) {
-                    Ok(elig) => send(&writer, &Event::Assessed(elig)).await,
+            Command::AssessRun { envelope } => match resolve_run(&envelope).await {
+                Ok(resolved) => match assess(&resolved.module, &resolved.config) {
+                    Ok(elig) => {
+                        run = Some(resolved);
+                        send(&writer, &Event::Assessed(elig)).await;
+                    }
                     Err(detail) => send(&writer, &worker_error(&detail)).await,
-                }
-            }
+                },
+                Err(detail) => send(&writer, &worker_error(&detail)).await,
+            },
             Command::JoinRun { run_id, .. } => {
-                let Some(cfg) = config.clone() else {
+                let Some(resolved) = run.as_ref() else {
                     send(
                         &writer,
-                        &worker_error("JoinRun before AssessRun: no experiment config"),
+                        &worker_error("JoinRun before AssessRun: no resolved run"),
                     )
                     .await;
                     continue;
                 };
-                match join_and_run_round(&module, &cfg, &run_id, &writer).await {
+                match join_and_run_round(&resolved.module, &resolved.config, &run_id, &writer).await
+                {
                     Ok(b) => backend = Some(b),
                     Err(detail) => send(&writer, &worker_error(&detail)).await,
                 }
@@ -121,11 +125,62 @@ async fn main() {
     }
 }
 
-/// The `.wasm` module bytes from `DAEMON_TRAIN_MODULE`.
-fn load_module_bytes() -> Result<Vec<u8>, String> {
-    let path = std::env::var("DAEMON_TRAIN_MODULE")
-        .map_err(|_| "DAEMON_TRAIN_MODULE is not set (path to the experiment .wasm)".to_string())?;
-    std::fs::read(&path).map_err(|e| format!("reading module {path}: {e}"))
+/// Resolve the `AssessRun` envelope bytes into `(config, module)` (the §6.1/§6.5 seam).
+///
+/// The bytes are the canonical [`SignedEnvelope`] wire form: verify it, take `config_bytes()`, and
+/// resolve the module from the envelope's artifact map via [`ArtifactResolver`] (`file://`,
+/// blake3-verified). `DAEMON_TRAIN_MODULE` overrides the artifact fetch. If the bytes are not a
+/// signed-envelope wrapper, fall back to treating them as raw `[experiment.config]` CBOR with the
+/// module from `DAEMON_TRAIN_MODULE` (the legacy direct-drive path).
+async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, String> {
+    match from_canonical_slice::<SignedEnvelope>(envelope_bytes) {
+        Ok(wire) => {
+            // A signed-envelope wrapper: verify it (re-derives hash + config, checks the signature).
+            let frozen = wire.open().map_err(|e| format!("verify envelope: {e}"))?;
+            let config = frozen.config_bytes().to_vec();
+            let module = resolve_module(&frozen).await?;
+            Ok(ResolvedRun { config, module })
+        }
+        // Not a signed-envelope wrapper: the legacy raw `[experiment.config]` CBOR path.
+        Err(_) => {
+            let module = module_from_env().ok_or_else(|| {
+                "AssessRun envelope is neither a signed envelope nor is DAEMON_TRAIN_MODULE set"
+                    .to_string()
+            })??;
+            Ok(ResolvedRun {
+                config: envelope_bytes.to_vec(),
+                module,
+            })
+        }
+    }
+}
+
+/// Resolve the experiment module bytes for a verified envelope: `DAEMON_TRAIN_MODULE` if set
+/// (override), else the envelope's `experiment.module` artifact via the `file://` resolver.
+async fn resolve_module(frozen: &daemon_swarm_proto::FrozenEnvelope) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = module_from_env() {
+        return bytes;
+    }
+    let envelope = frozen
+        .decode()
+        .map_err(|e| format!("decode envelope: {e}"))?;
+    let name = &envelope.experiment.module;
+    let artifact = envelope
+        .artifacts
+        .get(name)
+        .ok_or_else(|| format!("experiment module `{name}` absent from [artifacts]"))?;
+    let art = ArtifactRef::new(artifact.url.clone(), artifact.blake3);
+    ArtifactResolver::new()
+        .fetch(&art)
+        .await
+        .map_err(|e| format!("resolve module `{name}` ({}): {e}", artifact.url))
+}
+
+/// The `.wasm` module bytes from `DAEMON_TRAIN_MODULE` (the dev / node-controlled override), if set.
+/// `Some(Err(..))` means the var is set but the read failed.
+fn module_from_env() -> Option<Result<Vec<u8>, String>> {
+    let path = std::env::var("DAEMON_TRAIN_MODULE").ok()?;
+    Some(std::fs::read(&path).map_err(|e| format!("reading module {path}: {e}")))
 }
 
 /// The host `tabi@1` vocabulary (name-for-name with the phase table / SDK `TABI_IMPORTS`, all 66).

@@ -19,6 +19,15 @@ daemon-swarm-proto = { workspace = true }
 # the offline resync (checkpoint + record replay).
 daemon-swarm-net = { workspace = true }
 tokio = { workspace = true }
+# The wasm-backed profile e2e (`tests/wasm_profiles.rs`): the real host training backend
+# (`WasmBackend`), the pure coordinator `tick`, and the observe replay oracle (PROTO-20). All are
+# already in the frozen root `[workspace.dependencies]`; no cycle (the e2e crate is a leaf).
+daemon-train = { workspace = true }
+daemon-train-sdk = { path = "../../crates/contracts/daemon-train-sdk", features = ["sim"] }
+daemon-swarm-coordinator = { workspace = true }
+daemon-swarm-observe = { workspace = true }
+ciborium = { workspace = true }
+blake3 = { workspace = true }
 
 [lints]
 workspace = true

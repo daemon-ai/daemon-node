@@ -315,4 +315,37 @@ impl FrozenEnvelope {
         }
         verify_canonical(&self.signer, &self.signature, &self.hash)
     }
+
+    /// The serializable wire form of this frozen envelope (canonical bytes + author signature +
+    /// signer), for transport over an opaque byte seam like the worker protocol's `AssessRun`.
+    #[must_use]
+    pub fn to_wire(&self) -> SignedEnvelope {
+        SignedEnvelope {
+            bytes: self.bytes.clone(),
+            signature: self.signature,
+            signer: self.signer,
+        }
+    }
+}
+
+/// The serializable transport form of a [`FrozenEnvelope`]: the canonical envelope bytes plus the
+/// author's signature + signer. A [`FrozenEnvelope`] itself is not `Serialize` (its hash/config are
+/// re-derived, never trusted from the wire), so this is the shape that crosses an opaque byte seam
+/// (e.g. the worker protocol's `AssessRun { envelope }`). Reopen it with [`SignedEnvelope::open`],
+/// which re-derives the hash + config and verifies the signature (`FrozenEnvelope::open`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedEnvelope {
+    /// The canonical CBOR bytes of the resolved envelope.
+    pub bytes: Vec<u8>,
+    /// The author's ed25519 signature over the envelope hash.
+    pub signature: Signature,
+    /// The author's node identity.
+    pub signer: PeerId,
+}
+
+impl SignedEnvelope {
+    /// Reopen into a verified [`FrozenEnvelope`] (re-derives the hash + config, checks the signature).
+    pub fn open(self) -> Result<FrozenEnvelope, SwarmProtoError> {
+        FrozenEnvelope::open(self.bytes, self.signature, self.signer)
+    }
 }

@@ -15,7 +15,9 @@
 //! Scenarios: `ready` (default) | `exit-on-start` | `crash-once` | `ineligible`.
 //!
 //! `ineligible` answers `AssessRun` with a not-eligible verdict + reasons (the RUN-10 staged-assess
-//! rejection path). `MERGE-3`: the real meta-mode assess lives in the E3 `daemon-train` worker.
+//! rejection path). The real meta-mode assess (static import scan + host meta pass) lives in the
+//! `daemon-train-worker` binary; this fixture stays scripted so the supervision tests
+//! (respawn / meltdown / crash-once) do not need the wasm engine.
 
 use daemon_provision::{CutChannel, CutWriter};
 use daemon_swarm_run::protocol::{self, Command, Eligibility, Event, Hardware, WorkerCapabilities};
