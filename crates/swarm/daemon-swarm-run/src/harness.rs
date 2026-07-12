@@ -33,7 +33,7 @@ use daemon_swarm_net::{
     ControlPlane, FsPayloadStore, LoopbackGossip, PayloadStat, PayloadStore, SwarmNetError,
 };
 use daemon_swarm_proto::messages::{
-    BatchWindow, Commitment, Locator, RecordEntry, RoundOpen, RoundRecord, Straggle,
+    BatchWindow, Commitment, Locator, RecordEntry, RoundOpen, RoundRecord, Straggle, StraggleStatus,
 };
 use daemon_swarm_proto::{
     blake3_hash, commit_set, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed,
@@ -226,7 +226,8 @@ pub struct ScriptedCoordinator<C> {
     roster: Vec<PeerId>,
     steps_per_round: u32,
     micro_batch: u32,
-    collect_timeout: Duration,
+    stall_rounds_max: u32,
+    safety_timeout: Duration,
 }
 
 impl<C: ControlPlane> ScriptedCoordinator<C> {
@@ -239,6 +240,7 @@ impl<C: ControlPlane> ScriptedCoordinator<C> {
         mut roster: Vec<PeerId>,
         steps_per_round: u32,
         micro_batch: u32,
+        stall_rounds_max: u32,
     ) -> Self {
         roster.sort_unstable();
         Self {
@@ -249,7 +251,11 @@ impl<C: ControlPlane> ScriptedCoordinator<C> {
             roster,
             steps_per_round,
             micro_batch,
-            collect_timeout: Duration::from_millis(500),
+            stall_rounds_max,
+            // A large guard against a genuine hang only — round finalization is driven by
+            // deterministic all-accounted logic, never by this timeout, so it never fires in a
+            // correct run (which is what keeps the digest transcript reproducible).
+            safety_timeout: Duration::from_secs(10),
         }
     }
 
@@ -277,10 +283,18 @@ impl<C: ControlPlane> ScriptedCoordinator<C> {
         blake3_hash(&buf)
     }
 
-    /// Drive `num_rounds` rounds: open each round, collect commitments/straggles until every roster
-    /// peer is accounted for (or the collection window elapses), then publish the round record.
+    /// Drive `num_rounds` rounds: open each round, collect commitments/straggles until every
+    /// still-expected roster peer is accounted for (committed **or** straggled this round), then
+    /// publish the round record.
+    ///
+    /// Finalization is **deterministic**, never wall-clock driven: a peer that publishes more than
+    /// `stall_rounds_max` consecutive `Stalled` straggles has exhausted its budget and left, so it
+    /// is dropped from the expected set (mirroring the peer's own leave rule) — no timeout is ever
+    /// needed to make progress, which is what keeps the digest transcript reproducible.
     pub async fn run_rounds(&self, num_rounds: u64) -> Result<(), SwarmRunError> {
         let mut sub = self.control.subscribe();
+        let mut expected: BTreeSet<PeerId> = self.roster.iter().copied().collect();
+        let mut straggles: BTreeMap<PeerId, u32> = BTreeMap::new();
         for round in 0..num_rounds {
             let open = RoundOpen {
                 round,
@@ -293,12 +307,11 @@ impl<C: ControlPlane> ScriptedCoordinator<C> {
 
             let mut committed: BTreeMap<PeerId, (Hash, u64)> = BTreeMap::new();
             let mut accounted: BTreeSet<PeerId> = BTreeSet::new();
-            while !self.roster.iter().all(|p| accounted.contains(p)) {
-                let recv = tokio::time::timeout(self.collect_timeout, sub.recv()).await;
+            while !expected.iter().all(|p| accounted.contains(p)) {
+                let recv = tokio::time::timeout(self.safety_timeout, sub.recv()).await;
                 let bytes = match recv {
                     Ok(Some(bytes)) => bytes,
-                    // Plane closed or the collection window elapsed (a peer left / went silent):
-                    // finalize the record with whoever committed.
+                    // Plane closed, or the safety guard fired (never in a correct run).
                     Ok(None) | Err(_) => break,
                 };
                 let Ok(msg) = from_canonical_slice::<daemon_swarm_proto::SignedMessage>(&bytes)
@@ -317,9 +330,21 @@ impl<C: ControlPlane> ScriptedCoordinator<C> {
                     }) if r == round => {
                         committed.insert(msg.signer, (payload, size));
                         accounted.insert(msg.signer);
+                        straggles.insert(msg.signer, 0);
                     }
-                    SwarmMessage::Straggle(Straggle { round: r, .. }) if r == round => {
+                    SwarmMessage::Straggle(Straggle {
+                        round: r, status, ..
+                    }) if r == round => {
                         accounted.insert(msg.signer);
+                        // Only a `Stalled` straggle (skipped training) counts toward the leave
+                        // budget; `Fetching` means the peer committed but can't yet ingest.
+                        if status == StraggleStatus::Stalled {
+                            let c = straggles.entry(msg.signer).or_insert(0);
+                            *c += 1;
+                            if *c > self.stall_rounds_max {
+                                expected.remove(&msg.signer);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -486,6 +511,7 @@ where
         roster.clone(),
         cfg.steps_per_round,
         cfg.micro_batch,
+        cfg.stall_rounds_max,
     );
     let coord_handle = tokio::spawn(async move { coordinator.run_rounds(cfg.num_rounds).await });
 
@@ -498,7 +524,7 @@ where
         if roster.iter().all(|p| done.contains(p)) {
             break;
         }
-        match tokio::time::timeout(Duration::from_secs(3), col_rx.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(10), col_rx.recv()).await {
             Ok(Some((peer, ev))) => {
                 match &ev {
                     EngineEvent::RoundComplete { round, .. }
