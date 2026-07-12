@@ -8,11 +8,21 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# `harness` exposes the in-process multi-peer test harness + the TEST-ONLY scripted coordinator
+# (a hardcoded message sequence over LoopbackGossip; `// MERGE-2` swap for the real coordinator
+# tick loop) to external crates. Kept out of the default build; the `tests/daemon-swarm-e2e` crate
+# enables it. The crate's own unit tests reach the harness via `cfg(test)` (no feature needed).
+harness = []
+
 [dependencies]
 daemon-swarm-proto = { workspace = true }
 daemon-swarm-net = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+# The harness `FaultyStore` implements the async `PayloadStore` trait (harness / test only, gated
+# behind `cfg(any(test, feature = "harness"))`).
+async-trait = { workspace = true }
 # Worker protocol codec (§10.2) + manifest/backend wire shapes.
 serde = { workspace = true }
 ciborium = { workspace = true }
@@ -27,6 +37,6 @@ xxhash-rust = { workspace = true }
 workspace = true
 
 [package.metadata.cargo-machete]
-# `tokio` is declared for the Wave-2 round loop; the Wave-1 seams (data pipeline, TrainerBackend,
-# worker protocol codec) are synchronous.
-ignored = ["tokio"]
+# `async-trait` is used only by the harness `FaultyStore` PayloadStore impl, gated behind
+# `cfg(any(test, feature = "harness"))`, so it looks unused on the default (non-test) build path.
+ignored = ["async-trait"]

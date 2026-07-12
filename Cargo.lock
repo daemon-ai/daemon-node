@@ -4330,11 +4330,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-swarm-e2e"
+version = "0.0.1"
+dependencies = [
+ "daemon-swarm-proto",
+ "daemon-swarm-run",
+ "tokio",
+]
+
+[[package]]
 name = "daemon-swarm-net"
 version = "0.0.1"
 dependencies = [
  "async-trait",
- "blake3",
  "ciborium",
  "daemon-core",
  "daemon-swarm-proto",
@@ -4370,6 +4378,7 @@ dependencies = [
 name = "daemon-swarm-run"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "blake3",
  "ciborium",
  "daemon-swarm-net",
