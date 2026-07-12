@@ -401,6 +401,68 @@ fn message_with_wrong_version_rejected() {
     ));
 }
 
+// ----- Warmup early-exit on peer readiness (Wave-3 additive) -----
+
+#[test]
+fn warmup_early_exits_when_all_ready() {
+    let ks = keys(2);
+    let mut state = new_state(base_config());
+    for k in &ks {
+        let (s, _) = tick(state, Input::Message(join_msg(k)));
+        state = s;
+    }
+    // Entering Warmup still needs one clock (warmup_s = 10); the *exit* is what gains the early path.
+    let (s, _) = tick(state, Input::Clock(1));
+    state = s;
+    assert_eq!(state.phase, Phase::Warmup);
+    let warmup_start = state.phase_start_s;
+
+    // One peer ready is not enough.
+    let (s, _) = tick(state, Input::Message(ready_heartbeat_msg(&ks[0], 0)));
+    state = s;
+    assert_eq!(
+        state.phase,
+        Phase::Warmup,
+        "one ready is not a quorum of readiness"
+    );
+
+    // Both ready → round 0 opens immediately (event-driven, no warmup timeout).
+    let (s, out) = tick(state, Input::Message(ready_heartbeat_msg(&ks[1], 0)));
+    state = s;
+    assert_eq!(state.phase, Phase::RoundTrain);
+    assert_eq!(state.round, 0);
+    assert!(
+        state.now_s < warmup_start + base_config().warmup_s,
+        "opened before the warmup timeout would have fired"
+    );
+    assert!(publishes(&out)
+        .iter()
+        .any(|m| matches!(m, SwarmMessage::RoundOpen(_))));
+}
+
+#[test]
+fn warmup_falls_back_to_timeout_without_all_ready() {
+    let ks = keys(2);
+    let mut state = new_state(base_config());
+    for k in &ks {
+        let (s, _) = tick(state, Input::Message(join_msg(k)));
+        state = s;
+    }
+    let (s, _) = tick(state, Input::Clock(1));
+    state = s;
+    // Only one peer signals readiness → the early-exit gate stays closed.
+    let (s, _) = tick(state, Input::Message(ready_heartbeat_msg(&ks[0], 0)));
+    state = s;
+    assert_eq!(state.phase, Phase::Warmup);
+    // The warmup timeout still opens the round (unchanged back-compat path).
+    let (s, out) = tick(state, Input::Clock(base_config().warmup_s + 2));
+    state = s;
+    assert_eq!(state.phase, Phase::RoundTrain);
+    assert!(publishes(&out)
+        .iter()
+        .any(|m| matches!(m, SwarmMessage::RoundOpen(_))));
+}
+
 // ----- happy path: a fully-evidenced round records the committed set -----
 
 #[test]

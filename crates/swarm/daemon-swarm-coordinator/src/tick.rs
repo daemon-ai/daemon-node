@@ -57,15 +57,16 @@ fn drive_time(state: &mut CoordinatorState, out: &mut Vec<Output>) {
     match state.phase {
         Phase::WaitingForMembers => {
             if state.healthy_count() >= cfg.min_peers {
-                change_phase(state, out, Phase::Warmup);
+                enter_warmup(state, out);
             }
         }
         Phase::Warmup => {
             if state.healthy_count() < cfg.min_peers {
                 change_phase(state, out, Phase::WaitingForMembers);
-            } else if now >= state.phase_start_s + cfg.warmup_s {
-                state.epoch_start_round = state.round;
-                open_round(state, out);
+            } else if all_warmup_ready(state) || now >= state.phase_start_s + cfg.warmup_s {
+                // Exit warmup early once every admitted member signals readiness (Wave-3 additive),
+                // else on the warmup timeout (the always-available path, back-compat).
+                open_epoch_first_round(state, out);
             }
         }
         Phase::RoundTrain => {
@@ -118,7 +119,7 @@ fn on_message(state: &mut CoordinatorState, out: &mut Vec<Output>, sm: SignedMes
         SwarmMessage::StorageReceipt(sr) => on_receipt(state, out, sr),
         SwarmMessage::Digest(d) => on_digest(state, out, signer, d),
         SwarmMessage::Straggle(s) => on_straggle(state, signer, s),
-        SwarmMessage::Heartbeat(h) => on_heartbeat(state, signer, h),
+        SwarmMessage::Heartbeat(h) => on_heartbeat(state, out, signer, h),
         SwarmMessage::RoundOpen(_) | SwarmMessage::RoundRecord(_) => {
             out.push(Output::Reject(Rejection::UnexpectedMessage));
         }
@@ -288,7 +289,7 @@ fn on_straggle(state: &mut CoordinatorState, signer: PeerId, s: Straggle) {
     }
 }
 
-fn on_heartbeat(state: &mut CoordinatorState, signer: PeerId, h: Heartbeat) {
+fn on_heartbeat(state: &mut CoordinatorState, out: &mut Vec<Output>, signer: PeerId, h: Heartbeat) {
     if h.round > state.max_reported_round {
         state.max_reported_round = h.round;
     }
@@ -296,7 +297,12 @@ fn on_heartbeat(state: &mut CoordinatorState, signer: PeerId, h: Heartbeat) {
         if h.round > m.last_seen_round {
             m.last_seen_round = h.round;
         }
+        if h.ready == Some(true) {
+            m.warmup_ready = true;
+        }
     }
+    // A readiness heartbeat can open round 0 without waiting for the warmup timeout (§6.2).
+    maybe_exit_warmup(state, out);
 }
 
 // ----- control -----
@@ -355,6 +361,43 @@ fn maybe_finalize(state: &mut CoordinatorState, out: &mut Vec<Output>) {
             finalize_round(state, out);
         }
     }
+}
+
+/// Enter `Warmup`, clearing any stale per-member readiness from a previous epoch (§6.2).
+fn enter_warmup(state: &mut CoordinatorState, out: &mut Vec<Output>) {
+    for m in &mut state.roster {
+        m.warmup_ready = false;
+    }
+    change_phase(state, out, Phase::Warmup);
+}
+
+/// Whether every healthy member has signalled model-readiness this warmup (the early-exit gate).
+fn all_warmup_ready(state: &CoordinatorState) -> bool {
+    let mut any = false;
+    for m in state.roster.iter().filter(|m| m.is_healthy()) {
+        any = true;
+        if !m.warmup_ready {
+            return false;
+        }
+    }
+    any
+}
+
+/// Exit `Warmup` early (no timeout) once every admitted member is ready — the event-driven path a
+/// readiness heartbeat triggers (§6.2/§6.5, Wave-3 additive).
+fn maybe_exit_warmup(state: &mut CoordinatorState, out: &mut Vec<Output>) {
+    if state.phase == Phase::Warmup
+        && state.healthy_count() >= state.config.min_peers
+        && all_warmup_ready(state)
+    {
+        open_epoch_first_round(state, out);
+    }
+}
+
+/// Mark the epoch's first training round and open it.
+fn open_epoch_first_round(state: &mut CoordinatorState, out: &mut Vec<Output>) {
+    state.epoch_start_round = state.round;
+    open_round(state, out);
 }
 
 /// Open `state.round` for training: install the ring slot, publish `RoundOpen`, enter `RoundTrain`.
