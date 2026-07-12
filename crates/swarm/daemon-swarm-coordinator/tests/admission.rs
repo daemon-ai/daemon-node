@@ -107,6 +107,45 @@ fn envelope_hash_mismatch_rejected_when_asserted() {
 }
 
 #[test]
+fn envelope_hash_absent_is_tolerated() {
+    // Back-compat: a join that asserts no envelope hash is admitted even though the run has a
+    // specific frozen envelope hash. This is the wire reality until the `Join.envelope_hash` carrier
+    // lands (a Merge-3-coordinated additive field — see swarm-ledger-p3.md); the enforcement above is
+    // ready to consume it, but `tick` passes `None` today so existing peers are never spuriously
+    // rejected.
+    let cfg = base_config();
+    assert_eq!(
+        cfg.envelope_hash,
+        Hash([0x11; 32]),
+        "run has a real envelope hash"
+    );
+    let j = join_with(CapabilitySet::new());
+    let cand = JoinCandidate {
+        peer: pid(1),
+        version: SWARM_PROTO_VERSION,
+        join: &j,
+        asserted_hash: None,
+    };
+    assert!(admit(&cfg, Phase::WaitingForMembers, &[], &[], &cand).is_ok());
+}
+
+#[test]
+fn join_via_tick_does_not_yet_assert_envelope_hash() {
+    // The `tick` join path threads `asserted_hash: None` (the frozen `Join` carries no hash yet), so
+    // a join is admitted regardless of the run's envelope hash. When the additive `Join.envelope_hash`
+    // field lands at Merge 3, `tick` will forward it and `EnvelopeHashMismatch` becomes reachable
+    // from the wire (the reason + `admit` check are already present + tested above).
+    let mut cfg = base_config();
+    cfg.envelope_hash = Hash([0x77; 32]);
+    let state = new_state(cfg);
+    let (state, _) = daemon_swarm_coordinator::tick(
+        state,
+        daemon_swarm_coordinator::Input::Message(join_msg(&key(1))),
+    );
+    assert!(state.is_healthy_member(&peer_id(&key(1))));
+}
+
+#[test]
 fn run_id_mismatch_rejected() {
     let cfg = base_config();
     let j = Join {
