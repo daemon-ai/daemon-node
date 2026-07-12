@@ -12,6 +12,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use daemon_swarm_proto::blake3_hash;
+
 use crate::seam::ContentHash;
 use crate::transport::{ControlPlane, ControlSubscription};
 use crate::SwarmNetError;
@@ -66,10 +68,10 @@ impl ControlPlane for LoopbackGossip {
     }
 }
 
-/// A convenience: the blake3 message id used for dedupe (mirrors [`ContentHash::of`]).
+/// A convenience: the blake3 message id used for dedupe (proto's [`blake3_hash`]).
 #[must_use]
 pub fn message_id(message: &[u8]) -> ContentHash {
-    ContentHash::of(message)
+    blake3_hash(message)
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use daemon_core::ContainedRoot;
+use daemon_swarm_proto::blake3_hash;
 
 use crate::seam::{ContentHash, PayloadKey, RoundId, RunId};
 use crate::transport::{PayloadStat, PayloadStore};
@@ -124,7 +125,7 @@ impl PayloadStore for FsPayloadStore {
             .write(&Self::object_rel(key), bytes)
             .await
             .map_err(|e| transport_err("write object", &e))?;
-        Ok(ContentHash::of(bytes))
+        Ok(blake3_hash(bytes))
     }
 
     async fn get(
@@ -137,7 +138,7 @@ impl PayloadStore for FsPayloadStore {
             .read(&Self::object_rel(key))
             .await
             .map_err(|e| miss_or_err("read object", &e, key))?;
-        let actual = ContentHash::of(&bytes);
+        let actual = blake3_hash(&bytes);
         if &actual != expected {
             return Err(SwarmNetError::HashMismatch {
                 expected: expected.to_hex(),
@@ -156,7 +157,7 @@ impl PayloadStore for FsPayloadStore {
             .await
             .map_err(|e| miss_or_err("stat object", &e, key))?;
         Ok(PayloadStat {
-            hash: ContentHash::of(&bytes),
+            hash: blake3_hash(&bytes),
             size: bytes.len() as u64,
         })
     }
@@ -216,7 +217,7 @@ mod tests {
         let k = key("run-a", 3, 0x11);
 
         let hash = store.put(&k, b"update-bytes").await.unwrap();
-        assert_eq!(hash, ContentHash::of(b"update-bytes"));
+        assert_eq!(hash, blake3_hash(b"update-bytes"));
 
         let got = store.get(&k, &hash).await.unwrap();
         assert_eq!(got, b"update-bytes");
@@ -233,7 +234,7 @@ mod tests {
         let k = key("run-a", 0, 0x22);
         store.put(&k, b"honest").await.unwrap();
 
-        let wrong = ContentHash::of(b"different");
+        let wrong = blake3_hash(b"different");
         let err = store.get(&k, &wrong).await.unwrap_err();
         assert!(
             matches!(err, SwarmNetError::HashMismatch { .. }),
@@ -246,7 +247,7 @@ mod tests {
         let dir = temp_root("fsstore-missing");
         let store = FsPayloadStore::open(dir.path(), 8).unwrap();
         let k = key("run-a", 7, 0x33);
-        let err = store.get(&k, &ContentHash::of(b"x")).await.unwrap_err();
+        let err = store.get(&k, &blake3_hash(b"x")).await.unwrap_err();
         assert!(matches!(err, SwarmNetError::PayloadMiss(_)), "got {err:?}");
     }
 

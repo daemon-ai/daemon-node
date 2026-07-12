@@ -15,8 +15,9 @@
 //! `daemon_egress::EgressClient` (raw `reqwest::Client` is banned workspace-wide by clippy); no HTTP
 //! client is constructed this wave.
 //!
-//! Wave-1 note: identity/hash types live in [`seam`] as MERGE-1 placeholders for
-//! `daemon-swarm-proto` (lane P), which is not available beyond the Wave-0 scaffold this wave.
+//! Merge-1 note: the shared identity/hash vocabulary in [`seam`] is now the canonical
+//! `daemon-swarm-proto` types (blake3 `Hash`, `PeerId`); the [`ReceiptProducer`] emits proto's
+//! signed `StorageReceipt` control message (ed25519 over canonical CBOR).
 
 #![forbid(unsafe_code)]
 
@@ -29,7 +30,7 @@ pub mod transport;
 
 pub use artifact::{ArtifactRef, ArtifactResolver, ArtifactScheme};
 pub use gossip::LoopbackGossip;
-pub use receipt::{ReceiptProducer, ReceiptSigner, SignedReceipt, StorageReceipt, UnsignedSigner};
+pub use receipt::ReceiptProducer;
 pub use seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};
 pub use store::FsPayloadStore;
 pub use transport::{ControlPlane, ControlSubscription, PayloadStat, PayloadStore};

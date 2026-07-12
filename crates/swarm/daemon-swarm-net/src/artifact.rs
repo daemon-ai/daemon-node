@@ -12,6 +12,8 @@
 
 use std::path::PathBuf;
 
+use daemon_swarm_proto::blake3_hash;
+
 use crate::seam::ContentHash;
 use crate::SwarmNetError;
 
@@ -81,7 +83,7 @@ impl ArtifactResolver {
     /// [`SwarmNetError::HashMismatch`] (tamper/corruption reject, §12).
     pub async fn fetch(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, SwarmNetError> {
         let bytes = self.fetch_raw(&artifact.url).await?;
-        let actual = ContentHash::of(&bytes);
+        let actual = blake3_hash(&bytes);
         if actual != artifact.blake3 {
             return Err(SwarmNetError::HashMismatch {
                 expected: artifact.blake3.to_hex(),
@@ -155,7 +157,7 @@ mod tests {
 
     #[test]
     fn blake3_empty_golden() {
-        assert_eq!(ContentHash::of(b"").to_hex(), BLAKE3_EMPTY_HEX);
+        assert_eq!(blake3_hash(b"").to_hex(), BLAKE3_EMPTY_HEX);
     }
 
     #[test]
@@ -188,7 +190,7 @@ mod tests {
     async fn fetch_file_verifies_blake3() {
         let dir = temp_root("artifact-ok");
         let (_abs, url) = write_artifact(dir.path(), "module.wasm", b"wasm-bytes").await;
-        let art = ArtifactRef::new(url, ContentHash::of(b"wasm-bytes"));
+        let art = ArtifactRef::new(url, blake3_hash(b"wasm-bytes"));
 
         let got = ArtifactResolver::new().fetch(&art).await.unwrap();
         assert_eq!(got, b"wasm-bytes");
@@ -199,7 +201,7 @@ mod tests {
         let dir = temp_root("artifact-tamper");
         let (_abs, url) = write_artifact(dir.path(), "module.wasm", b"tampered").await;
         // The artifact map claims a different blake3 than the file actually has.
-        let art = ArtifactRef::new(url, ContentHash::of(b"expected-original"));
+        let art = ArtifactRef::new(url, blake3_hash(b"expected-original"));
 
         let err = ArtifactResolver::new().fetch(&art).await.unwrap_err();
         assert!(
@@ -210,10 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_file_is_fetch_error() {
-        let art = ArtifactRef::new(
-            "file:///no/such/daemon-swarm/artifact",
-            ContentHash::of(b""),
-        );
+        let art = ArtifactRef::new("file:///no/such/daemon-swarm/artifact", blake3_hash(b""));
         let err = ArtifactResolver::new().fetch(&art).await.unwrap_err();
         assert!(matches!(err, SwarmNetError::Fetch(_)), "got {err:?}");
     }
@@ -225,7 +224,7 @@ mod tests {
             "hf://org/repo@abcdef/file",
             "https://host/x",
         ] {
-            let art = ArtifactRef::new(url, ContentHash::of(b""));
+            let art = ArtifactRef::new(url, blake3_hash(b""));
             let err = ArtifactResolver::new().fetch(&art).await.unwrap_err();
             assert!(
                 matches!(err, SwarmNetError::SchemeUnsupported(_)),

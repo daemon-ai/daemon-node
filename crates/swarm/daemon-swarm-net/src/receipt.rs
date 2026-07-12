@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! [`ReceiptProducer`] — turns payload-store availability into signed `StorageReceipt` evidence.
+//! [`ReceiptProducer`] — turns payload-store availability into a signed proto `StorageReceipt`.
 //!
 //! The commit rule (§6.4 I6) consumes only **signed messages**: a payload enters the round record
 //! iff its `Commitment` arrived *and* signed availability evidence exists — either a
@@ -11,118 +11,118 @@
 //!
 //! Lane R models the *receipt-producer* half: a small component that polls/checks a
 //! [`PayloadStore`] via `head` (`stat`) and, when the object is available, produces a signed
-//! [`StorageReceipt`]. Signing is injected through the [`ReceiptSigner`] seam — Merge 1 replaces the
-//! placeholder receipt + signer with the proto crate's CDDL `StorageReceipt` message and the real
-//! ed25519 node-identity signature.
+//! [`StorageReceipt`](daemon_swarm_proto::messages::StorageReceipt). Merge 1 re-expressed this over
+//! proto: the message shape is proto's CDDL `StorageReceipt` (a round + its verified
+//! `(peer, hash, size)` [`RecordEntry`] set), and the signature is the real ed25519 node-identity
+//! [`SignedMessage`] frame produced by [`SignedMessage::sign`] over canonical CBOR (§7.3). Net
+//! never *defines* the message or signature type — it only assembles store evidence into proto's.
 
-use serde::{Deserialize, Serialize};
+use daemon_swarm_proto::messages::{RecordEntry, StorageReceipt};
+use daemon_swarm_proto::{SignedMessage, SigningKey, SwarmMessage, SwarmProtoVersion};
 
-use crate::seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};
+use crate::seam::{PayloadKey, RoundId};
 use crate::transport::PayloadStore;
 use crate::SwarmNetError;
 
-/// The availability-evidence message body: `(run, round, peer, hash, size)` the storage client has
-/// `HEAD`-verified against the payload store (spec §6.4 `StorageReceipt`).
+/// Polls a [`PayloadStore`] and emits signed availability evidence for committed payloads as proto
+/// [`SignedMessage`] frames carrying a [`StorageReceipt`].
 ///
-// MERGE-1: replace with daemon_swarm_proto::StorageReceipt (the CDDL message).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageReceipt {
-    /// The run this evidence is for.
-    pub run: RunId,
-    /// The round this evidence is for.
-    pub round: RoundId,
-    /// The peer whose payload availability is attested.
-    pub peer: PeerId,
-    /// The content hash the store holds for `(run, round, peer)`.
-    pub hash: ContentHash,
-    /// The object's size in bytes.
-    pub size: u64,
-}
-
-/// A [`StorageReceipt`] plus the signed bytes a consumer of the commit rule verifies.
-///
-/// `bytes` is the signed message wire form; this wave's [`UnsignedSigner`] simply CBOR-encodes the
-/// receipt (no signature), which is a mechanically-swappable placeholder for lane P's ed25519
-/// envelope.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SignedReceipt {
-    /// The decoded receipt body.
-    pub receipt: StorageReceipt,
-    /// The signed wire bytes (CBOR envelope) — what the commit rule consumes as a signed message.
-    pub bytes: Vec<u8>,
-}
-
-/// Signs a [`StorageReceipt`] into its wire bytes.
-///
-// MERGE-1: replace the implementation with lane P's ed25519 node-identity signing over the
-// canonical-CBOR receipt (the `StorageReceipt` control message, §7.3).
-pub trait ReceiptSigner: Send + Sync {
-    /// Produce the signed wire bytes for `receipt`.
-    fn sign(&self, receipt: &StorageReceipt) -> Result<Vec<u8>, SwarmNetError>;
-}
-
-/// A placeholder signer that CBOR-encodes the receipt without a signature (local mode / tests).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnsignedSigner;
-
-impl ReceiptSigner for UnsignedSigner {
-    fn sign(&self, receipt: &StorageReceipt) -> Result<Vec<u8>, SwarmNetError> {
-        let mut buf = Vec::new();
-        ciborium::into_writer(receipt, &mut buf)
-            .map_err(|e| SwarmNetError::Transport(format!("encode receipt: {e}")))?;
-        Ok(buf)
-    }
-}
-
-/// Polls a [`PayloadStore`] and emits signed availability evidence for committed payloads.
-pub struct ReceiptProducer<S, Sig> {
+/// The producer holds the node's ed25519 [`SigningKey`] and the run's pinned [`SwarmProtoVersion`]
+/// so every emitted receipt is a fully-signed control message the commit rule can consume directly.
+pub struct ReceiptProducer<S> {
     store: S,
-    signer: Sig,
+    key: SigningKey,
+    version: SwarmProtoVersion,
 }
 
-impl<S: PayloadStore, Sig: ReceiptSigner> ReceiptProducer<S, Sig> {
-    /// Build a producer over `store`, signing receipts with `signer`.
-    pub fn new(store: S, signer: Sig) -> Self {
-        Self { store, signer }
+impl<S: PayloadStore> ReceiptProducer<S> {
+    /// Build a producer over `store`, signing receipts with the node identity `key` at the run's
+    /// pinned proto `version`.
+    pub fn new(store: S, key: SigningKey, version: SwarmProtoVersion) -> Self {
+        Self {
+            store,
+            key,
+            version,
+        }
     }
 
-    /// Check `key` in the store and, if the object is available, produce a signed
-    /// [`StorageReceipt`]. A missing/expired object surfaces as [`SwarmNetError::PayloadMiss`] (no
-    /// evidence is emitted — exactly the §6.4 recovery-ladder rung 1 "no availability yet" case).
-    pub async fn produce(&self, key: &PayloadKey) -> Result<SignedReceipt, SwarmNetError> {
+    /// Check `key` in the store and, if the object is available, produce a signed single-entry
+    /// [`StorageReceipt`] message for its round. A missing/expired object surfaces as
+    /// [`SwarmNetError::PayloadMiss`] (no evidence is emitted — the §6.4 recovery-ladder rung 1 "no
+    /// availability yet" case).
+    pub async fn produce(&self, key: &PayloadKey) -> Result<SignedMessage, SwarmNetError> {
         let stat = self.store.head(key).await?;
         let receipt = StorageReceipt {
-            run: key.run.clone(),
             round: key.round,
-            peer: key.peer,
-            hash: stat.hash,
-            size: stat.size,
+            verified: vec![RecordEntry {
+                peer: key.peer,
+                hash: stat.hash,
+                size: stat.size,
+            }],
         };
-        let bytes = self.signer.sign(&receipt)?;
-        Ok(SignedReceipt { receipt, bytes })
+        self.sign(receipt)
     }
 
-    /// Produce receipts for every available key in `keys`, skipping (not failing on) the ones the
-    /// store cannot yet attest — the "poll a batch of committed payloads" shape.
-    pub async fn produce_available(&self, keys: &[PayloadKey]) -> Vec<SignedReceipt> {
-        let mut out = Vec::new();
+    /// Head-verify every key of `round` and aggregate the available objects into **one** signed
+    /// [`StorageReceipt`] (proto's batch shape: one round, many verified `(peer, hash, size)`
+    /// entries). Keys the store cannot yet attest are skipped (not failed on) — the "poll a batch of
+    /// committed payloads" shape. Returns `Ok(None)` when nothing in `keys` is available yet.
+    pub async fn produce_round(
+        &self,
+        round: RoundId,
+        keys: &[PayloadKey],
+    ) -> Result<Option<SignedMessage>, SwarmNetError> {
+        let mut verified = Vec::new();
         for key in keys {
-            if let Ok(receipt) = self.produce(key).await {
-                out.push(receipt);
+            if let Ok(stat) = self.store.head(key).await {
+                verified.push(RecordEntry {
+                    peer: key.peer,
+                    hash: stat.hash,
+                    size: stat.size,
+                });
             }
         }
-        out
+        if verified.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.sign(StorageReceipt { round, verified })?))
+    }
+
+    /// Sign a [`StorageReceipt`] into the proto [`SignedMessage`] control frame (ed25519 over
+    /// canonical CBOR of `(version, payload)`).
+    fn sign(&self, receipt: StorageReceipt) -> Result<SignedMessage, SwarmNetError> {
+        SignedMessage::sign(
+            &self.key,
+            self.version,
+            SwarmMessage::StorageReceipt(receipt),
+        )
+        .map_err(|e| SwarmNetError::Transport(format!("sign storage receipt: {e}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seam::{PeerId, RunId};
     use crate::store::FsPayloadStore;
     use crate::test_support::temp_root;
+    use daemon_swarm_proto::SWARM_PROTO_VERSION;
+
+    fn signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x42; 32])
+    }
 
     fn key(round: RoundId, peer: u8) -> PayloadKey {
         PayloadKey::new(RunId::new("run-r"), round, PeerId([peer; 32]))
+    }
+
+    /// Extract the `StorageReceipt` payload from a signed control message (panics on the wrong
+    /// variant — a test helper).
+    fn receipt_of(msg: &SignedMessage) -> &StorageReceipt {
+        match &msg.payload {
+            SwarmMessage::StorageReceipt(r) => r,
+            other => panic!("expected StorageReceipt, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -132,37 +132,63 @@ mod tests {
         let k = key(2, 0x01);
         let hash = store.put(&k, b"peer-update").await.unwrap();
 
-        let producer = ReceiptProducer::new(store, UnsignedSigner);
+        let producer = ReceiptProducer::new(store, signing_key(), SWARM_PROTO_VERSION);
         let signed = producer.produce(&k).await.unwrap();
 
-        assert_eq!(signed.receipt.hash, hash);
-        assert_eq!(signed.receipt.size, b"peer-update".len() as u64);
-        assert_eq!(signed.receipt.round, 2);
-        // The signed bytes decode back to the same receipt (placeholder = CBOR round-trip).
-        let decoded: StorageReceipt = ciborium::from_reader(&signed.bytes[..]).unwrap();
-        assert_eq!(decoded, signed.receipt);
+        // The frame is a real ed25519-signed control message at the pinned version.
+        assert!(signed.verify().is_ok());
+        assert_eq!(signed.version, SWARM_PROTO_VERSION);
+
+        let receipt = receipt_of(&signed);
+        assert_eq!(receipt.round, 2);
+        assert_eq!(receipt.verified.len(), 1);
+        assert_eq!(receipt.verified[0].peer, k.peer);
+        assert_eq!(receipt.verified[0].hash, hash);
+        assert_eq!(receipt.verified[0].size, b"peer-update".len() as u64);
     }
 
     #[tokio::test]
     async fn no_evidence_for_absent_object() {
         let dir = temp_root("receipt-absent");
         let store = FsPayloadStore::open(dir.path(), 8).unwrap();
-        let producer = ReceiptProducer::new(store, UnsignedSigner);
+        let producer = ReceiptProducer::new(store, signing_key(), SWARM_PROTO_VERSION);
         let err = producer.produce(&key(9, 0x02)).await.unwrap_err();
         assert!(matches!(err, SwarmNetError::PayloadMiss(_)), "got {err:?}");
     }
 
     #[tokio::test]
-    async fn produce_available_skips_missing() {
+    async fn produce_round_aggregates_available_and_skips_missing() {
         let dir = temp_root("receipt-batch");
         let store = FsPayloadStore::open(dir.path(), 8).unwrap();
-        let present = key(1, 0x03);
-        store.put(&present, b"here").await.unwrap();
+        let present_a = key(1, 0x03);
+        let present_b = key(1, 0x05);
+        store.put(&present_a, b"here").await.unwrap();
+        store.put(&present_b, b"there").await.unwrap();
         let absent = key(1, 0x04);
 
-        let producer = ReceiptProducer::new(store, UnsignedSigner);
-        let receipts = producer.produce_available(&[present.clone(), absent]).await;
-        assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].receipt.peer, present.peer);
+        let producer = ReceiptProducer::new(store, signing_key(), SWARM_PROTO_VERSION);
+        let signed = producer
+            .produce_round(1, &[present_a.clone(), absent, present_b.clone()])
+            .await
+            .unwrap()
+            .expect("at least one object is available");
+
+        assert!(signed.verify().is_ok());
+        let receipt = receipt_of(&signed);
+        assert_eq!(receipt.round, 1);
+        // The missing object is skipped; only the two available ones are attested.
+        assert_eq!(receipt.verified.len(), 2);
+        let peers: Vec<PeerId> = receipt.verified.iter().map(|e| e.peer).collect();
+        assert!(peers.contains(&present_a.peer));
+        assert!(peers.contains(&present_b.peer));
+    }
+
+    #[tokio::test]
+    async fn produce_round_emits_nothing_when_all_absent() {
+        let dir = temp_root("receipt-empty");
+        let store = FsPayloadStore::open(dir.path(), 8).unwrap();
+        let producer = ReceiptProducer::new(store, signing_key(), SWARM_PROTO_VERSION);
+        let out = producer.produce_round(3, &[key(3, 0x06)]).await.unwrap();
+        assert!(out.is_none());
     }
 }

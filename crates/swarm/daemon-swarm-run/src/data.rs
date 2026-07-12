@@ -14,7 +14,16 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::seam::{BatchId, ContentHash};
+use daemon_swarm_proto::{blake3_hash, Hash};
+
+use crate::seam::BatchId;
+
+/// Whether `s` is a well-formed blake3 content-hash hex string: exactly `Hash::LEN * 2` (64) hex
+/// digits. The manifest stores per-shard hashes as hex text (JSON), so this validates the string
+/// form of proto's canonical [`Hash`] without materializing one.
+fn is_blake3_hex(s: &str) -> bool {
+    s.len() == Hash::LEN * 2 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
 /// The token element width of a shard's fixed-width stream (spec §8: u16/u32).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +122,7 @@ impl Manifest {
                     seq_len: self.seq_len,
                 });
             }
-            if ContentHash::from_hex(&shard.blake3).is_err() {
+            if !is_blake3_hex(&shard.blake3) {
                 return Err(DataError::BadShardHash(i));
             }
         }
@@ -296,7 +305,7 @@ impl SyntheticCorpus {
                 name: name.clone(),
                 bytes: bytes.len() as u64,
                 tokens: tokens_per_shard,
-                blake3: ContentHash::of(&bytes).to_hex(),
+                blake3: blake3_hash(&bytes).to_hex(),
             });
             blobs.push((name, bytes));
         }
@@ -395,7 +404,7 @@ mod tests {
             name: name.into(),
             bytes: tokens * width.bytes(),
             tokens,
-            blake3: ContentHash::of(name.as_bytes()).to_hex(),
+            blake3: blake3_hash(name.as_bytes()).to_hex(),
         }
     }
 
@@ -559,7 +568,7 @@ mod tests {
         // Every manifest hash matches the generated shard bytes (the fetch-time integrity check).
         for (desc, (name, bytes)) in manifest.shards.iter().zip(blobs.iter()) {
             assert_eq!(&desc.name, name);
-            assert_eq!(desc.blake3, ContentHash::of(bytes).to_hex());
+            assert_eq!(desc.blake3, blake3_hash(bytes).to_hex());
         }
         // Mapping works end-to-end over the generated corpus.
         assert_eq!(
