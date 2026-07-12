@@ -22,6 +22,7 @@ pub mod capability;
 pub mod envelope;
 pub mod error;
 pub mod hash;
+pub mod merkle;
 pub mod sign;
 
 pub use bytes::{Hash, PeerId, Root, Seed, Signature};
@@ -30,6 +31,7 @@ pub use capability::{Capability, CapabilitySet};
 pub use envelope::{Envelope, FrozenEnvelope, ENVELOPE_SCHEMA_MAJOR};
 pub use error::SwarmProtoError;
 pub use hash::blake3_hash;
+pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
 pub use sign::{peer_id, sign_canonical, verify_canonical, Signed, SigningKey, VerifyingKey};
 
 #[cfg(test)]
