@@ -10,17 +10,27 @@ path = "src/lib.rs"
 
 [dependencies]
 daemon-swarm-proto = { workspace = true }
+# `ContainedRoot` (openat2 RESOLVE_BENEATH|NO_SYMLINKS) is the sanctioned fs surface: the
+# `FsPayloadStore` is rooted at one so peer-supplied key components can never escape the store root
+# (the workspace-wide clippy fs ban points here).
+daemon-core = { workspace = true }
 tokio = { workspace = true }
 # The artifact-fetch / presign egress plane (§7.1). NOTE for lane R: raw `reqwest::Client` is
 # banned workspace-wide by clippy (`disallowed_types`, see clippy.toml); outbound HTTP must be
 # built through `daemon_egress::EgressClient`. Declared here for the transport surface; no client
-# is constructed in the Wave-0 scaffold.
+# is constructed this wave (file:// artifact fetch only).
 reqwest = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+# Content addressing for artifacts / payloads / receipts (blake3, §6.4 — not sha256).
+blake3 = { workspace = true }
 
 [lints]
 workspace = true
 
 [package.metadata.cargo-machete]
-# Wired up during Wave-0 scaffolding; the SwarmTransport surface lands with lane R.
-ignored = ["tokio", "reqwest"]
+# `reqwest` is declared for the egress plane (§7.1) but no HTTP client is constructed this wave
+# (file:// artifact fetch only); r2/hf/https slot in later through daemon-egress.
+ignored = ["reqwest"]
