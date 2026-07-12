@@ -142,7 +142,19 @@ SDK are untouched (`abi_surface` stays green at 66).
 
 - **Cross-PEER bit-identity** (the guarantee): two `WasmBackend`s over the same module + config +
   batches + staged payloads produce **bit-identical** digests after N rounds of
-  step/inner_update/make_update/ingest — one case per profile (`sparse_loco`, `diloco`, `demo`).
+  step/inner_update/make_update/ingest — one case per profile (`sparse_loco`, `diloco`, `demo`) —
+  and the transcript is non-degenerate (evolves round to round) + reproducible run-to-run.
+
+  **Finding (host autodiff is absent this wave).** The host `CpuBackend::backward` is still a Wave-1
+  **no-op** (`backend.rs` — the E2 ledger's "CpuBackend reverse-mode tape" claim holds for the *sim*,
+  not the host `CpuBackend`). So on the host, `da_step` accumulates **zero** gradients and
+  `adamw_step` moves masters only by decoupled weight decay — i.e. `make_update` is currently
+  **data-independent** (peers with the same config are numerically identical clones regardless of
+  their batches). The cross-peer bit-identity guarantee holds either way (it is what the MVP
+  requires), and the digest still evolves each round via weight decay + the outer step. The test
+  therefore feeds **identical** batches to both peers (the query's "same batches" premise) and
+  asserts equality; true data-dependent peer divergence-then-reconvergence lands when host autodiff
+  (HOST-9) does. See the Merge-3 watch list.
 - **Checkpoint continuity**: `save → load → continue` reaches the same digest as the uninterrupted
   run (and `pause → resume` — preemption-as-churn — is digest-neutral).
 - **Sim ↔ host parity**: a nice-to-have cross-check, **not** a hard guarantee (recorded rationale
@@ -159,8 +171,9 @@ SDK are untouched (`abi_surface` stays green at 66).
 - **HOST-15 manifest purity**: `da_manifest` charges **zero** host imports (a fresh instance's
   `imports_charged()` is 0 after `manifest()`) for tiny-llama — extended from the Wave-1 pattern. A
   manifest that called a host import would trap `PhaseViolation` (no phase is entered for `da_manifest`).
-- **Guest `.wasm` size**: recorded by `guest_wasm_sizes_are_sane` (release build, well under a few
-  hundred KB — see the lane report for the measured bytes).
+- **Guest `.wasm` size**: recorded by `guest_wasm_sizes_are_sane` (release build, well under the
+  512 KiB budget): `tiny-llama.wasm` = **143 872 bytes (140 KiB)**, `test-abi-basic.wasm` =
+  **88 259 bytes (86 KiB)**.
 - `guests/README.md` documents authoring an experiment (the SDK surface, the `experiment!` macro, the
   three profiles + `TinyLlamaCfg`, and building via `cargo run -p xtask -- build-guests`).
 
@@ -195,4 +208,10 @@ ops (no profile required a new op). No new sync-point drift.
 - **`burn` is still on the default gate** (`daemon-train` declares it); adding `daemon-swarm-run` +
   `tokio` to `daemon-train` widens the crate's default-gate build further. The `OpBackend` seam still
   stands for the eventual lane-split.
+- **Host autodiff (HOST-9) is the biggest outstanding lane-E item.** The host `CpuBackend::backward`
+  is a no-op, so the host does not yet learn from data — `make_update` payloads are data-independent
+  (weight-decay + outer-step only). Cross-peer determinism (the MVP claim) does not depend on it, but
+  a real training demonstration and true peer-divergence-then-reconvergence do. Implement a host
+  reverse-mode tape behind the frozen `OpBackend` seam (the sim already has one) to close it; the
+  digest contract + `WasmBackend` surface are unaffected.
 - **Cross-peer identity is the frozen guarantee**; sim-vs-host is documented as det-lane-only.
