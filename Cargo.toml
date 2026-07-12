@@ -42,6 +42,26 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 ciborium = "0.2"
+# --- swarm training stack (swarm-training-spec.md §10.1) -------------------------------------------
+# The wasm guest sandbox for experiment modules, isolated to the `daemon-train` worker (never the
+# node process). default-features = false trims the defaults we don't need (async, component-model,
+# wat, coredump, profiling/ittapi, parallel-compilation) down to the JIT runtime we do: the
+# cranelift compiler + the pooling instance allocator. Fuel metering and epoch-interrupt preemption
+# (§10.5) are `Config` runtime levers, always available — no cargo feature required. No WASI (the
+# ABI is our own tensor ABI, tensor-ABI spec §5.1).
+wasmtime = { version = "46", default-features = false, features = ["runtime", "cranelift", "pooling-allocator"] }
+# The training engine, isolated to `daemon-train`. default-features = false + the ndarray backend
+# and autodiff only; GPU backends (wgpu/cuda/rocm/vulkan) are deliberately NOT in the default gate —
+# they build as separate Nix flake outputs per lane (like the daemon-infer engine lanes, §10.1).
+burn = { version = "0.21", default-features = false, features = ["std", "ndarray", "autodiff"] }
+# Canonical content hashing for artifact / tensor / checkpoint identity (blake3), plus the cheap
+# xxh3-64 in-memory change probe. Isolated to the swarm stack.
+blake3 = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# ed25519 signatures for swarm capability leases / witness attestations (§6, §7). v2 (dual
+# MIT/Apache-2.0 + BSD-3-Clause on the curve dep). Declared for the swarm lanes; wired in with the
+# envelope-signing surface (lane P).
+ed25519-dalek = "2"
 # property-based CDDL conformance: `arbitrary` derives (feature-gated, never shipped) generate values
 # across every wire variant; `proptest` (dev) drives them; serialized output is validated against
 # daemon-api.cddl so "Rust output always matches the schema" is a test, not a hope.
