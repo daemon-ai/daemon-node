@@ -112,7 +112,10 @@ pub mod prelude {
 #[macro_export]
 macro_rules! experiment {
     ($exp:ty) => {
-        #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+        // Exports exist only on the wasm guest target; under `sim`/native the macro expands to
+        // nothing (tests call the `Experiment` methods directly). Guest crates are always wasm and
+        // never carry a `sim` feature, so gating on the target arch alone keeps `check-cfg` quiet.
+        #[cfg(target_arch = "wasm32")]
         const _: () = {
             use ::core::cell::RefCell;
 

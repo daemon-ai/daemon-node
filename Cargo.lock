@@ -4706,7 +4706,10 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "burn",
+ "ciborium",
  "daemon-swarm-proto",
+ "det-core",
+ "serde",
  "thiserror 2.0.18",
  "wasmtime",
  "xxhash-rust",
@@ -4727,6 +4730,7 @@ name = "daemon-train-sdk"
 version = "0.0.1"
 dependencies = [
  "ciborium",
+ "det-core",
  "serde",
 ]
 
