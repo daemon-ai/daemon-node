@@ -648,7 +648,7 @@ where
     }
 
     let replay = coord_handle.await.ok().and_then(Result::ok);
-    for (_, h) in &peer_handles {
+    for h in peer_handles.values() {
         h.abort();
     }
     for h in fwd_handles {
@@ -750,14 +750,17 @@ fn spawn_record_collector(
             if msg.verify_for_run(version).is_err() {
                 continue;
             }
-            if let SwarmMessage::RoundRecord(RoundRecord { round, inline, .. }) = &msg.payload {
-                if let Some(entries) = inline {
-                    records
-                        .lock()
-                        .expect("records lock")
-                        .entry(*round)
-                        .or_insert_with(|| entries.clone());
-                }
+            if let SwarmMessage::RoundRecord(RoundRecord {
+                round,
+                inline: Some(entries),
+                ..
+            }) = &msg.payload
+            {
+                records
+                    .lock()
+                    .expect("records lock")
+                    .entry(*round)
+                    .or_insert_with(|| entries.clone());
             }
         }
     })

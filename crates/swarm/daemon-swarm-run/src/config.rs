@@ -160,6 +160,9 @@ mod tests {
     }
 
     #[test]
+    // `figment::Jail::expect_with` requires a `Result<_, figment::Error>` return; that error is
+    // large, but it is the harness's fixed signature (test-only).
+    #[allow(clippy::result_large_err)]
     fn figment_env_overrides_a_key() {
         figment::Jail::expect_with(|jail| {
             jail.set_env("DAEMON_SWARM_DATA_CACHE_GB", "128");
