@@ -317,3 +317,134 @@ lane-report deltas (none behavioral, none consensus-affecting):
 - **Additive-only extension.** The proto API, `SwarmTransport` traits, `TrainerBackend`, worker
   protocol, `tabi@1` subset, det-core signatures, and the phase table are frozen; extend, do not
   break.
+
+## Merge 2 — P0 milestone (real coordinator drives the e2e)
+
+Wave-2 lanes P2 (`swarm/p2` @ `2032ade`), R2 (`swarm/r2` @ `1358f36`), and E2 (`swarm/e2` @
+`e32b047`) are merged into `integrations/swarm` (three `--no-ff` merges, lane history preserved,
+`swarm/p2` → `swarm/r2` → `swarm/e2`). File sets were disjoint by construction; the only textual
+overlap was `Cargo.lock` (auto-merged, settled by `cargo check`). Lane ledgers are separate files
+(`swarm-ledger-{p2,r2,e2}.md`); no lane touched this program ledger or `guests/` member lists.
+
+**The P0 milestone landed:** the `tests/daemon-swarm-e2e` end-to-end now runs 3 peers × 20 rounds
+over `StubBackend` driven by the **real** `daemon_swarm_coordinator::tick` — R2's TEST-ONLY
+`ScriptedCoordinator` is gone.
+
+### What was swapped
+
+- **`ScriptedCoordinator` → `TickCoordinator`** (`daemon-swarm-run/src/harness.rs`, `harness`
+  feature). The pure `tick` stays in `daemon-swarm-coordinator`; the harness is the **impure shell**:
+  it holds a `CoordinatorState`, signs the coordinator's *unsigned* `RoundOpen`/`RoundRecord`
+  `Output::Publish` values with the coordinator identity and broadcasts them over `LoopbackGossip`,
+  and feeds `tick` the inbound signed peer messages, synthesized `Join`s (bootstrap roster),
+  `StorageReceipt` availability evidence, and scripted `Clock` inputs. `daemon-swarm-run` gains an
+  **optional** `daemon-swarm-coordinator` dep gated on the `harness` feature (+ a dev-dep for its own
+  `cfg(test)` harness tests) — a lane-owned `Cargo.toml` edit; the frozen root `Cargo.toml` already
+  declared the path dep, so **no root/deny/flake change and no `cargo deny` re-run** were needed.
+- **`engine.rs` `assignment::interval_for`** — equal-split replaced with P2's throughput-weighted
+  `daemon_swarm_proto::assignment::assign_batches` (all StubBackend peers `ThroughputClass::C1`,
+  `overlap_bps = 0` exact partition). The per-peer→interval mapping is now seed-shuffled; the
+  transcript changed, agreement held.
+
+### Impedance mismatches found (P2 tick I/O ↔ R2 harness) — the valuable findings
+
+1. **The commit rule needs availability *evidence*; R2 peers don't self-attest.** P2's `tick`
+   admits a payload only with a `StorageReceipt` **or** a witness-quorum of `Attestation`s (§6.4 I6).
+   R2's `RoundEngine` never attests its **own** payload (a peer's self-prefetch short-circuits in
+   `prefetch`), and a straggler cannot attest the peer whose object it failed to fetch. So
+   witness-quorum coverage alone **cannot evidence every payload** at small/stalled rosters: a single
+   peer (the RUN-5 barrier test) or peer0's object in the stall round (peer1 can't fetch it, so only
+   peer2 attests it → 1 < quorum(3)=2) would **never finalize**. Resolution: the harness shell runs
+   the **coordinator-as-storage-client** `StorageReceipt` path — on each `Commitment` it `HEAD`s the
+   shared store and feeds a signed `StorageReceipt`, exactly P2's intended primary evidence path
+   ("the coordinator's HEADs already arrived as signed StorageReceipt inputs", commit.rs). Evidence
+   is thereby decoupled from peer fetch success. **This is the single most important integration
+   finding** — the witness-attestation path is insufficient with the current peer engine.
+2. **No roster without `Join`s; the engine sends none.** `RoundEngine` subscribes and waits for
+   `RoundOpen`; it never `Join`s. The shell synthesizes each peer's signed `Join` (it re-derives the
+   deterministic peer keys) and feeds them at bootstrap so the roster forms through the real
+   admission path, then clocks past warmup to open round 0.
+3. **Warmup is timeout-only (P2 note).** The shell supplies two bootstrap `Clock` inputs
+   (`WaitingForMembers → Warmup → RoundTrain`); there is no per-peer model-ready confirmation this
+   wave.
+4. **Deterministic finalization without wall-clock coupling.** `tick` finalizes a round
+   *event-driven* the moment it is fully committed + evidenced (no clock) — the happy/catch-up path
+   thus needs **zero** clocks and is byte-identical across runs. A round blocked by a straggler that
+   won't commit is forced by a single timeout `Clock` **only once every healthy peer is accounted**
+   (committed+receipted, or `Straggle(Stalled)` this round) — the same content-driven rule R2's
+   scripted coordinator used; a generous quiescence guard covers a peer gone fully silent (left).
+   Neither ever fires on the happy path. `RoundOpen.deadline_unix_s` varies with the injected clock
+   but is not consumed by peers and never enters a digest.
+5. **Attestations are now redundant but harmless.** Peers still publish `Attestation`s; the shell
+   feeds them (all peers are witnesses via `witness_target = 0`), they populate `RoundState` and are
+   accepted, but receipts carry the actual evidence.
+
+### P0 evidence (e2e results)
+
+- `twenty_rounds_all_agree_with_stall_and_catchup`: **20 rounds**, 3 peers, **all digests equal
+  every round** (`all_agree`, 3 digests/round × 20); peer 1 **straggles round 7** (injected 2-`get`
+  payload miss of peer 0's object) and **catches up round 7 at round 8 open** (`Straggling{7}` +
+  `CaughtUp{7}`), no peer leaves.
+- `digest_transcript_is_byte_identical_across_runs`: two runs → **identical 20-entry agreed
+  transcript** (determinism, incl. the stall path).
+- **Replay assertion (PROTO-20 spirit):** the shell records the exact `tick` input sequence + a
+  canonical-CBOR `CoordinatorState` snapshot after each `RoundRecord`; `CoordinatorReplay::verify`
+  re-runs `tick` over the recorded inputs and asserts a **byte-identical per-round state trajectory**
+  (20 snapshots). Green, and stable across repeated runs.
+- All 29 `daemon-swarm-run` tests + 2 `record_ordering` (I3) tests pass against the real coordinator,
+  including the single-peer barrier test (RUN-5) and the leave test (`stall_budget_exhausted_leaves`).
+
+### Frozen Wave-2 surfaces (freeze at Merge 2; extend additively only)
+
+- **Assignment (`daemon_swarm_proto::assignment`, wasm32-clean):** `Lcg`/`seeded_lcg`,
+  `deterministic_shuffle`, `witness_quorum`, `class_weight`, `select_committee`/`select_verifiers`/
+  `elect_checkpointer`, `global_batch_at`/`advance_cursor`, `assign_batches`, `Committee`,
+  `WITNESS_TARGET_DEFAULT`. Golden vectors pinned (daemon seed `0xDAE07E57`).
+- **Coordinator (`daemon-swarm-coordinator`, pure library, wasm32-clean):**
+  `tick(CoordinatorState, Input) -> (CoordinatorState, Vec<Output>)`; `admit`;
+  `Input`/`Output`/`Notice`/`Rejection`/`AdmissionReject`; `Phase`; `CoordinatorState`
+  (canonical-CBOR-serializable, ring of `NUM_STORED_ROUNDS=4`); `RunConfig`/`CoordinatorParams`
+  (`from_envelope`); `ready_to_update_epoch`. **`tick` emits UNSIGNED coordinator messages — the
+  driver signs them.**
+- **RoundEngine (`daemon_swarm_run::engine`):** `RoundEngine::{new, run}`, `EngineConfig`,
+  `EngineEvent`, `RunOutcome`; `verify_record_set`. Peer-side barrier (I2), record-order staging
+  (I3), stall ladder. Checkpoint types (`daemon_swarm_run::checkpoint`): `CheckpointManifest`,
+  `save/load_checkpoint`, `resync_by_replay`, `ReplayStep`. Harness seam
+  (`daemon_swarm_run::harness`, `feature = "harness"`): `run_swarm`/`run_swarm_with`, `SwarmConfig`,
+  `SwarmRun` (+ `CoordinatorReplay`), `StallFault`/`FaultyStore`.
+- **`tabi@1` = 66 ops** (`daemon_train_sdk::TABI_IMPORTS`, pinned by `daemon-train/tests/abi_surface.rs`;
+  host `Linker` + SDK extern + `phase.rs` table agree name-for-name, all three length 66).
+- **Profile config schemas (`daemon_train_sdk::profiles`):** `SparseLocoCfg`, `DiLoCoCfg`, `DemoCfg`;
+  `TinyLlamaCfg` (guests/tiny-llama). det-core compression kernels (`dct2`/`idct2`/`topk_chunk`/
+  `absmax_pack`) additive to the frozen signatures.
+
+### Remaining `MERGE-2` markers — all genuinely Wave-3 (verified)
+
+| Site | Deferred work | Why Wave-3 |
+|---|---|---|
+| `engine.rs` (fetch-overlap note) | dedicated in-peer concurrent fetch task | buys nothing over the fast `FsPayloadStore` + would add digest nondeterminism; worthwhile only once the real **iroh/r2 payload plane** lands |
+| `engine.rs` `verify_record_set` | fetch `record-set.cbor` via `set_locator` at large rosters | the MVP small rosters ride the **inline** set; the object-fetch path needs the r2/iroh plane |
+| `checkpoint.rs` `resync` | wire the consensus/quorum-digest **desync trigger** | needs `daemon-swarm-observe` / the coordinator's digest tally (**observe-driven desync trigger**); the replay fold itself is done |
+| `net/fetch.rs` | alternate `BlobTicket` locators / network fetch fallback | awaits the **iroh-blobs** plane |
+
+(The `harness.rs` and `engine.rs` assignment "MERGE-2 resolved" comments are annotations that the
+scripted-coordinator swap + assignment swap are **done**, not pending work.)
+
+### Wave-3 must know (carried from lane reports + this integration)
+
+- **Peer self-attestation gap.** Because the peer engine does not attest its own payload, the
+  witness-quorum evidence path alone under-covers small/stalled rosters. Wave 3 either (a) has peers
+  self-attest, (b) keeps the coordinator `StorageReceipt` producer as the primary evidence source
+  (the runnable coordinator in `bins/` should ship one), or (c) both. The e2e proves (b) works.
+- **Envelope-hash admission** is structural (`JoinCandidate::asserted_hash` + `EnvelopeHashMismatch`)
+  but `tick` passes `None` — the frozen `Join` carries no hash. Enforce once `Join` gains an additive
+  `envelope_hash` field / assessment token.
+- **Warmup timeout-only** (no per-peer model-ready); **root-only attestation coverage** (membership
+  proofs, not inline) is a Wave-3 add; **verifier committee** is a no-op at `verification_percent=0`.
+- **`burn` is still on the default gate** (declared by `daemon-train`); the `OpBackend` seam still
+  stands — lane-split burn/CubeCL off the default path is outstanding Wave-2/3 lane-E work.
+- **E2 ↔ R2 are not wired together** (TinyLlama/profiles + the real wasm host vs the RoundEngine):
+  verified **no accidental coupling** — `daemon-swarm-run` has no dep on `daemon-train`/`-sdk` and
+  vice-versa. Real-backend wiring (the `TrainerBackend` impl over the wasm host) is Wave-3 work.
+- **Egress schemes** (`r2`/`hf`/`https`) still return `SchemeUnsupported` pending
+  `daemon_egress::EgressClient`.
