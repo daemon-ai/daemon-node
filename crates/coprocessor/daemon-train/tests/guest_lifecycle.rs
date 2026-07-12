@@ -249,3 +249,40 @@ fn full_round_shape_runs() {
     let after = inst.param_master("tok.weight").unwrap();
     assert_eq!(before, after);
 }
+
+/// HOST-15: `da_manifest` is **pure** — it charges zero host imports. `da_manifest` runs outside any
+/// entry-point phase, so a host import called during it would trap `PhaseViolation`; a clean run that
+/// charged nothing proves the manifest is a pure function of the config (ABI §6.2). Extends the
+/// Wave-1 purity pattern to the real tiny-llama module.
+#[test]
+fn manifest_is_pure_no_host_imports() {
+    let worker = Worker::new(EngineConfig::default()).unwrap();
+    let module = worker.load_module(&wasm("tiny_llama")).unwrap();
+    let mut inst = worker.instantiate(&module).unwrap();
+    let manifest = inst.manifest(&tiny_cbor()).unwrap();
+    assert_eq!(manifest.name, "tiny-llama");
+    assert_eq!(
+        inst.imports_charged(),
+        0,
+        "da_manifest must call no host import (it is a pure function of the config)"
+    );
+}
+
+/// Guest module release sizes stay well under a few hundred KB (a size-regression guard; the actual
+/// bytes are printed so the lane report can record them).
+#[test]
+fn guest_wasm_sizes_are_sane() {
+    for name in ["tiny_llama", "test_abi_basic"] {
+        let bytes = wasm(name);
+        eprintln!(
+            "guest {name}.wasm = {} bytes ({} KiB)",
+            bytes.len(),
+            bytes.len() / 1024
+        );
+        assert!(
+            bytes.len() < 512 * 1024,
+            "{name}.wasm is {} bytes (> 512 KiB budget)",
+            bytes.len()
+        );
+    }
+}
