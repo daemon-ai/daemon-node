@@ -137,7 +137,10 @@ fn on_join(
         peer: signer,
         version,
         join: &j,
-        asserted_hash: None,
+        // Wave-3: the frozen `Join` now carries an additive `envelope_hash`; forward it so the
+        // `EnvelopeHashMismatch` admission check is reachable from the wire (a peer that assessed a
+        // different envelope is rejected). Legacy joins omit it (`None`) → check skipped (back-compat).
+        asserted_hash: j.envelope_hash.as_ref(),
     };
     match admit(
         &state.config,

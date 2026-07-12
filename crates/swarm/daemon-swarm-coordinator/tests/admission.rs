@@ -24,6 +24,7 @@ fn join_with(caps: CapabilitySet) -> Join {
         iroh_id: IrohId([9; 32]),
         class: ThroughputClass::C3,
         capabilities: caps,
+        envelope_hash: None,
     }
 }
 
@@ -130,11 +131,10 @@ fn envelope_hash_absent_is_tolerated() {
 }
 
 #[test]
-fn join_via_tick_does_not_yet_assert_envelope_hash() {
-    // The `tick` join path threads `asserted_hash: None` (the frozen `Join` carries no hash yet), so
-    // a join is admitted regardless of the run's envelope hash. When the additive `Join.envelope_hash`
-    // field lands at Merge 3, `tick` will forward it and `EnvelopeHashMismatch` becomes reachable
-    // from the wire (the reason + `admit` check are already present + tested above).
+fn join_via_tick_without_hash_is_admitted() {
+    // A legacy `Join` that omits `envelope_hash` threads `asserted_hash: None`, so it is admitted
+    // regardless of the run's envelope hash (back-compat: the enforcement only fires when a hash is
+    // asserted).
     let mut cfg = base_config();
     cfg.envelope_hash = Hash([0x77; 32]);
     let state = new_state(cfg);
@@ -146,6 +146,36 @@ fn join_via_tick_does_not_yet_assert_envelope_hash() {
 }
 
 #[test]
+fn join_via_tick_asserts_envelope_hash() {
+    // Wave-3 (Merge 3): the additive `Join.envelope_hash` carrier is now threaded through `tick`, so
+    // a join asserting the WRONG envelope hash is rejected from the wire, and the correct hash is
+    // admitted. This closes the P2/P3 "structural but not wired" gap end-to-end.
+    let mut cfg = base_config();
+    cfg.envelope_hash = Hash([0x77; 32]);
+    let state = new_state(cfg);
+
+    // Wrong asserted hash → rejected, not admitted.
+    let (state, out) = daemon_swarm_coordinator::tick(
+        state,
+        daemon_swarm_coordinator::Input::Message(join_msg_with_hash(&key(1), Hash([0xEE; 32]))),
+    );
+    assert!(!state.is_healthy_member(&peer_id(&key(1))));
+    assert!(out.iter().any(|o| matches!(
+        o,
+        daemon_swarm_coordinator::Output::Reject(daemon_swarm_coordinator::Rejection::Admission(
+            AdmissionReject::EnvelopeHashMismatch
+        ))
+    )));
+
+    // Correct asserted hash → admitted.
+    let (state, _) = daemon_swarm_coordinator::tick(
+        state,
+        daemon_swarm_coordinator::Input::Message(join_msg_with_hash(&key(2), Hash([0x77; 32]))),
+    );
+    assert!(state.is_healthy_member(&peer_id(&key(2))));
+}
+
+#[test]
 fn run_id_mismatch_rejected() {
     let cfg = base_config();
     let j = Join {
@@ -153,6 +183,7 @@ fn run_id_mismatch_rejected() {
         iroh_id: IrohId([9; 32]),
         class: ThroughputClass::C2,
         capabilities: CapabilitySet::new(),
+        envelope_hash: None,
     };
     let cand = JoinCandidate {
         peer: pid(1),

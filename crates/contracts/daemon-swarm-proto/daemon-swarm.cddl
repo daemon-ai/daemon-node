@@ -94,6 +94,7 @@ join = {
   "iroh_id": iroh-id,
   "class": throughput-class,
   "capabilities": capabilities,
+  ? "envelope_hash": hash,   ; asserted frozen-envelope hash (§6.1/§6.5; additive Wave 3)
 }
 
 heartbeat = {

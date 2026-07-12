@@ -100,6 +100,9 @@ fn all_sample_messages() -> Vec<SwarmMessage> {
             iroh_id: IrohId([4; 32]),
             class: ThroughputClass::C2,
             capabilities: CapabilitySet::from_tokens(["tensor-abi@1", "det_sum@1"]).unwrap(),
+            // Exercise the additive optional envelope-hash carrier against the `? "envelope_hash"`
+            // CDDL rule (Wave 3).
+            envelope_hash: Some(daemon_swarm_proto::blake3_hash(b"smollm-500m-01-envelope")),
         }),
         SwarmMessage::Heartbeat(Heartbeat {
             round: 42,

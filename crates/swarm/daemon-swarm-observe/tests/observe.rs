@@ -117,6 +117,7 @@ fn join_msg(k: &SigningKey) -> SignedMessage {
         class: ThroughputClass::C1,
         // Must advertise the envelope's required capabilities to be admitted (§6.5).
         capabilities: CapabilitySet::from_tokens(["tensor-abi@1"]).unwrap(),
+        envelope_hash: None,
     };
     SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Join(j)).unwrap()
 }

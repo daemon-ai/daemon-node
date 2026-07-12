@@ -72,6 +72,18 @@ pub fn join_msg(k: &SigningKey) -> SignedMessage {
         iroh_id: IrohId([0x22; 32]),
         class: ThroughputClass::C2,
         capabilities: CapabilitySet::new(),
+        envelope_hash: None,
+    };
+    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Join(j)).unwrap()
+}
+
+pub fn join_msg_with_hash(k: &SigningKey, envelope_hash: Hash) -> SignedMessage {
+    let j = Join {
+        run_id: RUN_ID.to_string(),
+        iroh_id: IrohId([0x22; 32]),
+        class: ThroughputClass::C2,
+        capabilities: CapabilitySet::new(),
+        envelope_hash: Some(envelope_hash),
     };
     SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Join(j)).unwrap()
 }
@@ -82,6 +94,7 @@ pub fn join_msg_version(k: &SigningKey, version: SwarmProtoVersion) -> SignedMes
         iroh_id: IrohId([0x22; 32]),
         class: ThroughputClass::C2,
         capabilities: CapabilitySet::new(),
+        envelope_hash: None,
     };
     SignedMessage::sign(k, version, SwarmMessage::Join(j)).unwrap()
 }

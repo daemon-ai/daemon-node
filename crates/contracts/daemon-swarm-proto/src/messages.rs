@@ -199,6 +199,13 @@ pub struct Join {
     pub class: ThroughputClass,
     /// The peer's advertised capability set (pre-screened against the envelope, §6.5).
     pub capabilities: CapabilitySet,
+    /// The frozen-envelope hash the peer asserts it is joining under (§6.1/§6.5; TDD PROTO-12).
+    /// `Some(h)` lets the coordinator reject a peer that assessed a *different* envelope
+    /// (`AdmissionReject::EnvelopeHashMismatch`); `None` skips the check. Additive (Wave 3): omitted
+    /// on the wire for legacy joins (`#[serde(default)]`), so the pre-carrier back-compat path is
+    /// unchanged for senders that never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_hash: Option<Hash>,
 }
 
 /// `Heartbeat` — a peer's liveness ping (WS, ~15 s; §6.4).

@@ -273,11 +273,16 @@ impl<C: ControlPlane> LocalCoordinator<C> {
 
     /// Synthesize + feed a signed `Join` for `key` (the frozen `RoundEngine` never joins).
     async fn feed_join(&mut self, key: &SigningKey) -> Result<(), SwarmRunError> {
+        // Assert the run's frozen-envelope hash so the coordinator's envelope-hash admission check
+        // (§6.5, Wave-3 carrier) is exercised end-to-end: a matching hash is admitted, a peer that
+        // assessed a different envelope would be rejected.
+        let envelope_hash = self.state().config.envelope_hash;
         let join = Join {
             run_id: self.run.as_str().to_string(),
             iroh_id: JOIN_IROH_ID,
             class: ThroughputClass::C1,
             capabilities: CapabilitySet::new(),
+            envelope_hash: Some(envelope_hash),
         };
         let signed = SignedMessage::sign(key, self.version, SwarmMessage::Join(join))
             .map_err(|e| SwarmRunError::Lifecycle(format!("join sign: {e}")))?;
