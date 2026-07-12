@@ -45,6 +45,8 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `credential_key` | `DAEMON_CREDENTIAL_KEY` | string | `""` |
 | `custom_providers` | `DAEMON_CUSTOM_PROVIDERS` | array | `[]` |
 | `data_dir` | `DAEMON_DATA_DIR` | string | `$XDG_DATA_HOME/daemon` |
+| `demo.enabled` | `DAEMON_DEMO__ENABLED` | bool | `false` |
+| `demo.reply_delay_ms` | `DAEMON_DEMO__REPLY_DELAY_MS` | number | `40` |
 | `dispatch_interval_ms` | `DAEMON_DISPATCH_INTERVAL_MS` | number | `2` |
 | `embed.base_url` | `DAEMON_EMBED__BASE_URL` | optional | _(unset)_ |
 | `embed.dims` | `DAEMON_EMBED__DIMS` | number | `0` |
