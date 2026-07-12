@@ -11,15 +11,21 @@
 //! Wave-1 seams (the round loop itself lands in Wave 2):
 //! - [`data`] — the pre-tokenized shard [`Manifest`], `BatchId → (shard, offset)` mapping, interval
 //!   slicing into `steps_per_round` × micro-batches, and a deterministic [`SyntheticCorpus`] (§8, §6.3).
+//! - [`backend`] — the [`TrainerBackend`] trait (**the R↔E seam**) and the deterministic
+//!   [`StubBackend`] (§5.1, §10.2, ABI §2.3).
 //!
 //! Identity/hash types are re-exported from `daemon-swarm-net`'s [`seam`] (MERGE-1 placeholders for
 //! `daemon-swarm-proto`, lane P).
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod data;
 pub mod seam;
 
+pub use backend::{
+    AssessMeta, Assessment, BatchRef, StateDigest, StepCtx, StepStats, StubBackend, TrainerBackend,
+};
 pub use data::{
     BatchInterval, BatchLocation, DataError, InnerStep, Manifest, MicroBatch, ShardDesc,
     SyntheticCorpus, TokenWidth,
