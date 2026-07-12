@@ -23,16 +23,20 @@ pub mod envelope;
 pub mod error;
 pub mod hash;
 pub mod merkle;
+pub mod messages;
 pub mod sign;
+pub mod version;
 
-pub use bytes::{Hash, PeerId, Root, Seed, Signature};
+pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use capability::{Capability, CapabilitySet};
 pub use envelope::{Envelope, FrozenEnvelope, ENVELOPE_SCHEMA_MAJOR};
 pub use error::SwarmProtoError;
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
+pub use messages::{SignedMessage, SwarmMessage};
 pub use sign::{peer_id, sign_canonical, verify_canonical, Signed, SigningKey, VerifyingKey};
+pub use version::{SwarmProtoVersion, SWARM_PROTO_VERSION};
 
 #[cfg(test)]
 mod tests {

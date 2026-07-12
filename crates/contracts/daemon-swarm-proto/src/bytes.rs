@@ -138,3 +138,13 @@ byte_newtype!(
     64,
     "An ed25519 signature over canonical CBOR (spec §7.3)."
 );
+byte_newtype!(
+    IrohId,
+    32,
+    "A peer's iroh `NodeId` (ed25519), bound to the node identity at join (spec §7.2)."
+);
+byte_newtype!(
+    StateDigest,
+    16,
+    "An xxh3-128 round state digest (spec §5.6). 16 raw bytes; not a content hash."
+);
