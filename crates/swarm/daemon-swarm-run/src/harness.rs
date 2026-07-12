@@ -1,22 +1,39 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! In-process multi-peer harness + a **TEST-ONLY scripted coordinator** (spec §6.4; e2e support).
+//! In-process multi-peer harness driven by the **real** `daemon-swarm-coordinator` pure `tick`
+//! (spec §6.2/§6.4; the Merge-2 P0 milestone support).
 //!
-//! Lane P2's real coordinator is built in parallel and unavailable this wave, so the peer-side
-//! [`RoundEngine`](crate::engine::RoundEngine) is exercised against a scripted stand-in:
-//! [`ScriptedCoordinator`] emits a hardcoded `RoundOpen`/`RoundRecord` sequence over
-//! [`LoopbackGossip`](daemon_swarm_net::LoopbackGossip), observing peers' `Commitment`s /
-//! `Straggle`s to build each round's committed set. `// MERGE-2: replace with the
-//! daemon-swarm-coordinator tick loop` — the peer-set / event-collection shape here stays; only the
-//! coordinator swaps. This is the shape the Merge-2 P0 milestone test keeps.
+//! Merge 2 swapped R2's TEST-ONLY `ScriptedCoordinator` for [`TickCoordinator`], the impure shell
+//! around lane P2's pure [`tick`](daemon_swarm_coordinator::tick): it holds a
+//! [`CoordinatorState`], feeds it signed peer messages / `StorageReceipt` availability evidence /
+//! scripted `Clock` inputs, and **signs + publishes** the coordinator's own unsigned
+//! `RoundOpen`/`RoundRecord` outputs over [`LoopbackGossip`](daemon_swarm_net::LoopbackGossip). The
+//! peer-set / event-collection shape from R2 is unchanged — only the coordinator swapped.
 //!
-//! [`run_swarm`] spins up N peer engines + the scripted coordinator over one gossip mesh and one
-//! shared [`FsPayloadStore`](daemon_swarm_net::FsPayloadStore), runs a fixed number of rounds, and
-//! returns the collected [`SwarmRun`] event log (per-peer digests per round). An optional
-//! [`StallFault`] injects a payload miss (via [`FaultyStore`]) to drive the §6.4 stall ladder
-//! deterministically. Everything is seeded, so two runs of the same [`SwarmConfig`] produce a
-//! byte-identical digest transcript.
+//! ## Why a `StorageReceipt` evidence path
+//!
+//! The pure commit rule (§6.4 I6) admits a payload only with signed availability evidence — a
+//! `StorageReceipt` **or** a witness-quorum of `Attestation`s. R2's peer engine never attests its
+//! **own** payload (a peer's self-prefetch short-circuits), so witness-quorum alone cannot evidence
+//! every payload at small rosters / under a stall (e.g. a single peer, or a straggler that cannot
+//! fetch one peer's object). The shell therefore acts as the coordinator-as-storage-client: on each
+//! `Commitment` it `HEAD`s the shared store and feeds a signed `StorageReceipt` (P2's intended
+//! primary evidence path — "the coordinator's HEADs already arrived as signed StorageReceipt
+//! inputs"). This is decided **outside** `tick`, keeping the state machine pure.
+//!
+//! ## Deterministic finalization
+//!
+//! `tick` is pure, so the same input sequence yields the same `(state, outputs)`. Round records are
+//! order-independent functions of accumulated evidence, so the digest transcript does not depend on
+//! message arrival order. Rounds finalize **event-driven** (the last commitment + its receipt make
+//! the round fully committed + evidenced → `tick` finalizes with no clock). A round blocked by a
+//! straggler that will not commit is forced by a `Clock` input only once every still-expected peer
+//! is **accounted** (committed **or** `Straggle(Stalled)` this round) — the same deterministic rule
+//! R2's scripted coordinator used; a quiescence guard covers a peer that has gone fully silent
+//! (left). Neither ever fires on the happy path, so two runs of the same [`SwarmConfig`] produce a
+//! byte-identical digest transcript, and [`CoordinatorReplay`] re-runs `tick` over the recorded
+//! inputs to prove an identical canonical-CBOR state trajectory (PROTO-20 spirit).
 
 #![allow(clippy::too_many_lines)]
 
@@ -29,15 +46,19 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 
+use daemon_swarm_coordinator::{
+    tick, CoordinatorParams, CoordinatorState, Input, Output, Phase, RunConfig,
+};
 use daemon_swarm_net::{
     ControlPlane, FsPayloadStore, LoopbackGossip, PayloadStat, PayloadStore, SwarmNetError,
 };
+use daemon_swarm_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_swarm_proto::messages::{
-    BatchWindow, Commitment, Locator, RecordEntry, RoundOpen, RoundRecord, Straggle, StraggleStatus,
+    Commitment, Join, RecordEntry, StorageReceipt, Straggle, StraggleStatus, ThroughputClass,
 };
 use daemon_swarm_proto::{
-    blake3_hash, commit_set, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed,
-    SigningKey, SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
+    from_canonical_slice, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, Seed,
+    SignedMessage, SigningKey, SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
 
 use crate::backend::{StateDigest, StubBackend, TrainerBackend};
@@ -127,7 +148,7 @@ pub struct StallFault {
 pub struct SwarmConfig {
     /// Number of peers.
     pub num_peers: usize,
-    /// Number of rounds the scripted coordinator drives.
+    /// Number of rounds the coordinator drives (`[data].stop = Rounds(num_rounds)`).
     pub num_rounds: u64,
     /// Inner steps per round.
     pub steps_per_round: u32,
@@ -160,6 +181,52 @@ impl SwarmConfig {
     }
 }
 
+/// A recorded coordinator run trajectory for the offline replay assertion (PROTO-20 spirit).
+///
+/// Holds the exact ordered [`Input`] sequence the [`TickCoordinator`] fed its pure `tick`, the
+/// initial [`CoordinatorState`], and a canonical-CBOR snapshot of the state taken right after each
+/// `RoundRecord` was emitted. [`CoordinatorReplay::verify`] re-runs `tick` over the recorded inputs
+/// from the initial state and asserts a byte-identical per-round state trajectory.
+#[derive(Clone, Debug)]
+pub struct CoordinatorReplay {
+    initial: CoordinatorState,
+    inputs: Vec<Input>,
+    states_by_round: BTreeMap<RoundId, Vec<u8>>,
+}
+
+impl CoordinatorReplay {
+    /// The number of rounds whose post-record state was snapshotted.
+    #[must_use]
+    pub fn recorded_rounds(&self) -> usize {
+        self.states_by_round.len()
+    }
+
+    /// Re-run `tick` over the recorded inputs from the initial state and confirm the per-round
+    /// canonical-CBOR state trajectory is byte-identical to the live run (I1 / PROTO-20 spirit).
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        let mut state = self.initial.clone();
+        let mut replayed: BTreeMap<RoundId, Vec<u8>> = BTreeMap::new();
+        for input in &self.inputs {
+            let (next, outputs) = tick(state, input.clone());
+            state = next;
+            for o in &outputs {
+                if let Output::Publish(msg) = o {
+                    if let SwarmMessage::RoundRecord(rr) = msg.as_ref() {
+                        match to_canonical_vec(&state) {
+                            Ok(bytes) => {
+                                replayed.insert(rr.round, bytes);
+                            }
+                            Err(_) => return false,
+                        }
+                    }
+                }
+            }
+        }
+        replayed == self.states_by_round
+    }
+}
+
 /// The collected outcome of a swarm run: every `(peer, event)` the engines emitted.
 #[derive(Clone, Debug)]
 pub struct SwarmRun {
@@ -167,6 +234,8 @@ pub struct SwarmRun {
     pub roster: Vec<PeerId>,
     /// Every emitted event, tagged with the peer that emitted it (collection order).
     pub events: Vec<(PeerId, EngineEvent)>,
+    /// The coordinator's recorded `tick` trajectory for the replay assertion, if captured.
+    pub replay: Option<CoordinatorReplay>,
 }
 
 impl SwarmRun {
@@ -216,181 +285,14 @@ impl SwarmRun {
     }
 }
 
-/// A scripted coordinator (TEST-ONLY): drives rounds over a control plane, building each round's
-/// committed set from observed `Commitment`s. `// MERGE-2: replace with daemon-swarm-coordinator`.
-pub struct ScriptedCoordinator<C> {
-    control: Arc<C>,
-    key: SigningKey,
-    version: SwarmProtoVersion,
-    run: RunId,
-    roster: Vec<PeerId>,
-    steps_per_round: u32,
-    micro_batch: u32,
-    stall_rounds_max: u32,
-    safety_timeout: Duration,
-}
-
-impl<C: ControlPlane> ScriptedCoordinator<C> {
-    /// Build a scripted coordinator over `control` for `roster`.
-    #[must_use]
-    pub fn new(
-        control: Arc<C>,
-        key: SigningKey,
-        run: RunId,
-        mut roster: Vec<PeerId>,
-        steps_per_round: u32,
-        micro_batch: u32,
-        stall_rounds_max: u32,
-    ) -> Self {
-        roster.sort_unstable();
-        Self {
-            control,
-            key,
-            version: SWARM_PROTO_VERSION,
-            run,
-            roster,
-            steps_per_round,
-            micro_batch,
-            stall_rounds_max,
-            // A large guard against a genuine hang only — round finalization is driven by
-            // deterministic all-accounted logic, never by this timeout, so it never fires in a
-            // correct run (which is what keeps the digest transcript reproducible).
-            safety_timeout: Duration::from_secs(10),
-        }
-    }
-
-    fn global_batch(&self) -> u64 {
-        self.roster.len() as u64 * u64::from(self.steps_per_round) * u64::from(self.micro_batch)
-    }
-
-    fn window(&self, round: RoundId) -> BatchWindow {
-        let g = self.global_batch();
-        BatchWindow {
-            start: round * g,
-            end: (round + 1) * g,
-        }
-    }
-
-    fn seed(&self, round: RoundId) -> Seed {
-        Seed(*blake3_hash(&round.to_le_bytes()).as_bytes())
-    }
-
-    fn roster_digest(&self) -> Hash {
-        let mut buf = Vec::with_capacity(self.roster.len() * PeerId::LEN);
-        for p in &self.roster {
-            buf.extend_from_slice(p.as_bytes());
-        }
-        blake3_hash(&buf)
-    }
-
-    /// Drive `num_rounds` rounds: open each round, collect commitments/straggles until every
-    /// still-expected roster peer is accounted for (committed **or** straggled this round), then
-    /// publish the round record.
-    ///
-    /// Finalization is **deterministic**, never wall-clock driven: a peer that publishes more than
-    /// `stall_rounds_max` consecutive `Stalled` straggles has exhausted its budget and left, so it
-    /// is dropped from the expected set (mirroring the peer's own leave rule) — no timeout is ever
-    /// needed to make progress, which is what keeps the digest transcript reproducible.
-    pub async fn run_rounds(&self, num_rounds: u64) -> Result<(), SwarmRunError> {
-        let mut sub = self.control.subscribe();
-        let mut expected: BTreeSet<PeerId> = self.roster.iter().copied().collect();
-        let mut straggles: BTreeMap<PeerId, u32> = BTreeMap::new();
-        for round in 0..num_rounds {
-            let open = RoundOpen {
-                round,
-                seed: self.seed(round),
-                roster_digest: self.roster_digest(),
-                batch: self.window(round),
-                deadline_unix_s: 0,
-            };
-            self.publish(SwarmMessage::RoundOpen(open)).await?;
-
-            let mut committed: BTreeMap<PeerId, (Hash, u64)> = BTreeMap::new();
-            let mut accounted: BTreeSet<PeerId> = BTreeSet::new();
-            while !expected.iter().all(|p| accounted.contains(p)) {
-                let recv = tokio::time::timeout(self.safety_timeout, sub.recv()).await;
-                let bytes = match recv {
-                    Ok(Some(bytes)) => bytes,
-                    // Plane closed, or the safety guard fired (never in a correct run).
-                    Ok(None) | Err(_) => break,
-                };
-                let Ok(msg) = from_canonical_slice::<daemon_swarm_proto::SignedMessage>(&bytes)
-                else {
-                    continue;
-                };
-                if msg.verify_for_run(self.version).is_err() {
-                    continue;
-                }
-                match msg.payload {
-                    SwarmMessage::Commitment(Commitment {
-                        round: r,
-                        payload,
-                        size,
-                        ..
-                    }) if r == round => {
-                        committed.insert(msg.signer, (payload, size));
-                        accounted.insert(msg.signer);
-                        straggles.insert(msg.signer, 0);
-                    }
-                    SwarmMessage::Straggle(Straggle {
-                        round: r, status, ..
-                    }) if r == round => {
-                        accounted.insert(msg.signer);
-                        // Only a `Stalled` straggle (skipped training) counts toward the leave
-                        // budget; `Fetching` means the peer committed but can't yet ingest.
-                        if status == StraggleStatus::Stalled {
-                            let c = straggles.entry(msg.signer).or_insert(0);
-                            *c += 1;
-                            if *c > self.stall_rounds_max {
-                                expected.remove(&msg.signer);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            let pairs: Vec<(PeerId, Hash)> = committed.iter().map(|(p, (h, _))| (*p, *h)).collect();
-            let tree = commit_set(&pairs);
-            let entries: Vec<RecordEntry> = tree
-                .entries()
-                .iter()
-                .map(|(p, h)| RecordEntry {
-                    peer: *p,
-                    hash: *h,
-                    size: committed.get(p).map_or(0, |(_, s)| *s),
-                })
-                .collect();
-            let record = RoundRecord {
-                round,
-                set: tree.commitment(),
-                drops: Vec::new(),
-                next_seed: self.seed(round + 1),
-                set_locator: Locator::StoreKey(format!("record-set/{}/{round}", self.run.as_str())),
-                inline: Some(entries),
-            };
-            self.publish(SwarmMessage::RoundRecord(record)).await?;
-        }
-        Ok(())
-    }
-
-    async fn publish(&self, payload: SwarmMessage) -> Result<(), SwarmRunError> {
-        let signed = daemon_swarm_proto::SignedMessage::sign(&self.key, self.version, payload)
-            .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator sign: {e}")))?;
-        let bytes = to_canonical_vec(&signed)
-            .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator encode: {e}")))?;
-        self.control.publish(&bytes).await?;
-        Ok(())
-    }
-}
-
 /// A deterministic per-peer node identity key (index `i`).
 #[must_use]
 pub fn peer_key(i: usize) -> SigningKey {
     SigningKey::from_bytes(&[0x11 + i as u8; 32])
 }
 
-/// The coordinator's node identity key.
+/// The coordinator's node identity key (signs the emitted RoundOpen/RoundRecord + the shell's
+/// StorageReceipt evidence).
 #[must_use]
 pub fn coordinator_key() -> SigningKey {
     SigningKey::from_bytes(&[0xC0; 32])
@@ -400,8 +302,279 @@ pub fn coordinator_key() -> SigningKey {
 /// consensus round base coincides — the reconvergence precondition, §5.6).
 pub const EXPERIMENT_CONFIG: &[u8] = b"e2e-experiment-config";
 
-/// Run an in-process swarm (N peers + scripted coordinator) for `cfg.num_rounds` rounds over the
-/// deterministic [`StubBackend`]. Deterministic: same `cfg` → byte-identical digest transcript.
+/// The impure shell around the pure [`tick`]: signs + publishes the coordinator's outputs, supplies
+/// `StorageReceipt` evidence, and drives round finalization deterministically (`// MERGE-2` resolved
+/// — this replaced R2's `ScriptedCoordinator`).
+struct TickCoordinator<C> {
+    control: Arc<C>,
+    store: Arc<FsPayloadStore>,
+    key: SigningKey,
+    version: SwarmProtoVersion,
+    run: RunId,
+    num_peers: usize,
+    /// The pure coordinator state (kept in an `Option` so `tick` can take it by value + return it).
+    state: Option<CoordinatorState>,
+    /// Peers whose commitment for a round has been fed **and** receipted (evidenced).
+    committed: BTreeMap<RoundId, BTreeSet<PeerId>>,
+    /// Peers that reported a `Straggle(Stalled)` (skipped training) for a round.
+    stalled: BTreeMap<RoundId, BTreeSet<PeerId>>,
+    /// The ordered input log + per-round state snapshots for the replay assertion.
+    inputs: Vec<Input>,
+    states_by_round: BTreeMap<RoundId, Vec<u8>>,
+    initial: CoordinatorState,
+}
+
+impl<C: ControlPlane> TickCoordinator<C> {
+    fn new(
+        control: Arc<C>,
+        store: Arc<FsPayloadStore>,
+        key: SigningKey,
+        run: RunId,
+        cfg: &SwarmConfig,
+    ) -> Self {
+        // Global batch = peers × steps × micro-batch, so the per-peer (class-equal) partition is
+        // steps × micro-batch — divisible by `steps_per_round` for `slice_interval` (RUN-3).
+        let g =
+            (cfg.num_peers as u64) * u64::from(cfg.steps_per_round) * u64::from(cfg.micro_batch);
+        let n = cfg.num_peers as u32;
+        let params = CoordinatorParams {
+            seq_len: 1,
+            witness_target: 0, // every peer witnesses (matches the engine's witness set)
+            overlap_bps: 0,
+            k_absences: 1, // drop a genuinely-absent peer promptly (leave path)
+            verification_percent: 0,
+            authorized: Vec::new(),
+        };
+        let config = RunConfig {
+            run_id: run.as_str().to_string(),
+            proto_version: SWARM_PROTO_VERSION,
+            envelope_hash: Hash([0u8; 32]),
+            required_capabilities: CapabilitySet::new(),
+            min_peers: n,
+            max_peers: n.max(1),
+            warmup_s: 1,
+            // The happy path finalizes event-driven (no clocks), so these timeouts only bound the
+            // shell's *forced* progress clocks; keep them small.
+            round_train_max_s: 1,
+            round_witness_s: 1,
+            cooldown_s: 1,
+            epoch_rounds: 0, // one epoch for the whole run (no mid-run roster freeze boundary)
+            stall_rounds_max: cfg.stall_rounds_max,
+            global_batch: GlobalBatch {
+                start: g as u32,
+                end: g as u32,
+                ramp_rounds: 0,
+            },
+            stop: StopCondition::Rounds(cfg.num_rounds),
+            steps_per_round: cfg.steps_per_round,
+            seq_len: params.seq_len,
+            witness_target: params.witness_target,
+            overlap_bps: params.overlap_bps,
+            k_absences: params.k_absences,
+            verification_percent: params.verification_percent,
+            authorized: params.authorized,
+        };
+        let state = CoordinatorState::new(config, Seed([0xAB; 32]), 0);
+        Self {
+            control,
+            store,
+            key,
+            version: SWARM_PROTO_VERSION,
+            run,
+            num_peers: cfg.num_peers,
+            state: Some(state.clone()),
+            committed: BTreeMap::new(),
+            stalled: BTreeMap::new(),
+            inputs: Vec::new(),
+            states_by_round: BTreeMap::new(),
+            initial: state,
+        }
+    }
+
+    fn state(&self) -> &CoordinatorState {
+        self.state.as_ref().expect("coordinator state present")
+    }
+
+    /// Feed one input to the pure `tick`, record it, and sign + publish any emitted messages.
+    async fn apply(&mut self, input: Input) -> Result<(), SwarmRunError> {
+        self.inputs.push(input.clone());
+        let state = self.state.take().expect("coordinator state present");
+        let (state, outputs) = tick(state, input);
+        self.state = Some(state);
+        for o in outputs {
+            if let Output::Publish(msg) = o {
+                let payload = *msg;
+                let record_round = match &payload {
+                    SwarmMessage::RoundRecord(rr) => Some(rr.round),
+                    _ => None,
+                };
+                let signed = SignedMessage::sign(&self.key, self.version, payload)
+                    .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator sign: {e}")))?;
+                let bytes = to_canonical_vec(&signed)
+                    .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator encode: {e}")))?;
+                self.control.publish(&bytes).await?;
+                if let Some(r) = record_round {
+                    if let Ok(sbytes) = to_canonical_vec(self.state()) {
+                        self.states_by_round.insert(r, sbytes);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bootstrap: synthesize each peer's signed `Join`, then clock past warmup so round 0 opens.
+    async fn bootstrap(&mut self) -> Result<(), SwarmRunError> {
+        for i in 0..self.num_peers {
+            let k = peer_key(i);
+            let join = Join {
+                run_id: self.run.as_str().to_string(),
+                iroh_id: IrohId([0x22; 32]),
+                class: ThroughputClass::C1,
+                capabilities: CapabilitySet::new(),
+            };
+            let signed = SignedMessage::sign(&k, self.version, SwarmMessage::Join(join))
+                .map_err(|e| SwarmRunError::Lifecycle(format!("join sign: {e}")))?;
+            self.apply(Input::Message(signed)).await?;
+        }
+        // WaitingForMembers → Warmup, then Warmup → RoundTrain (warmup_s = 1) → RoundOpen(0).
+        self.apply(Input::Clock(1)).await?;
+        self.apply(Input::Clock(3)).await?;
+        Ok(())
+    }
+
+    /// Force the current round to finalize via the round/witness timeouts (a straggler will not
+    /// commit, so the event-driven fast path cannot fire). Loops a few times to walk
+    /// `RoundTrain → RoundWitness → commit → open(next)` in case one clock is not enough.
+    async fn force_current_round(&mut self) -> Result<(), SwarmRunError> {
+        for _ in 0..4 {
+            if !self.state().phase.is_round_active() {
+                break;
+            }
+            let before = self.state().round;
+            let now = self.state().now_s
+                + self.state().config.round_train_max_s
+                + self.state().config.round_witness_s
+                + 1;
+            self.apply(Input::Clock(now)).await?;
+            if self.state().round != before {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// After new round evidence, force the current round iff every still-healthy peer is accounted
+    /// (committed **and** receipted, or has sent a `Straggle(Stalled)` this round) yet the round has
+    /// not auto-finalized — the deterministic, content-driven finalization trigger.
+    async fn maybe_force_accounted(&mut self) -> Result<(), SwarmRunError> {
+        if !self.state().phase.is_round_active() {
+            return Ok(());
+        }
+        let round = self.state().round;
+        let healthy = self.state().healthy_peer_ids();
+        let committed = self.committed.get(&round);
+        let stalled = self.stalled.get(&round);
+        let all_accounted = healthy.iter().all(|p| {
+            committed.is_some_and(|c| c.contains(p)) || stalled.is_some_and(|s| s.contains(p))
+        });
+        if all_accounted && !healthy.is_empty() {
+            self.force_current_round().await?;
+        }
+        Ok(())
+    }
+
+    /// Produce + feed a signed `StorageReceipt` for `(round, peer)` if the object is in the store
+    /// (the coordinator-as-storage-client evidence path). Records the peer as evidenced.
+    async fn receipt_for(&mut self, round: RoundId, peer: PeerId) -> Result<(), SwarmRunError> {
+        let key = PayloadKey::new(self.run.clone(), round, peer);
+        let Ok(stat) = self.store.head(&key).await else {
+            return Ok(());
+        };
+        let sr = StorageReceipt {
+            round,
+            verified: vec![RecordEntry {
+                peer,
+                hash: stat.hash,
+                size: stat.size,
+            }],
+        };
+        let signed = SignedMessage::sign(&self.key, self.version, SwarmMessage::StorageReceipt(sr))
+            .map_err(|e| SwarmRunError::Lifecycle(format!("receipt sign: {e}")))?;
+        self.apply(Input::Message(signed)).await?;
+        self.committed.entry(round).or_default().insert(peer);
+        Ok(())
+    }
+
+    /// The run has finalized every round (or stopped) — nothing more to drive.
+    fn finished(&self) -> bool {
+        matches!(
+            self.state().phase,
+            Phase::Cooldown | Phase::Finished | Phase::Uninitialized
+        )
+    }
+
+    /// Drive the run to completion: bootstrap, then feed inbound signed peer messages (+ receipts +
+    /// accounted/quiescence-forced clocks) until the run reaches cooldown after the final round.
+    async fn drive(mut self) -> Result<CoordinatorReplay, SwarmRunError> {
+        let mut sub = self.control.subscribe();
+        self.bootstrap().await?;
+
+        // A generous quiescence guard: it never fires on the happy path (the coordinator's own
+        // republished RoundOpen/RoundRecord echoes keep the subscription lively), only when a peer
+        // has gone fully silent (left) so no `Straggle` will ever account it.
+        let quiescence = Duration::from_millis(1500);
+        while !self.finished() {
+            match tokio::time::timeout(quiescence, sub.recv()).await {
+                Ok(Some(bytes)) => {
+                    let Ok(msg) = from_canonical_slice::<SignedMessage>(&bytes) else {
+                        continue;
+                    };
+                    if msg.verify_for_run(self.version).is_err() {
+                        continue;
+                    }
+                    let signer = msg.signer;
+                    // Skip the coordinator's own republished outputs (fed to gossip, echoed back).
+                    match &msg.payload {
+                        SwarmMessage::RoundOpen(_) | SwarmMessage::RoundRecord(_) => continue,
+                        SwarmMessage::Commitment(Commitment { round, .. }) => {
+                            let round = *round;
+                            self.apply(Input::Message(msg)).await?;
+                            self.receipt_for(round, signer).await?;
+                        }
+                        SwarmMessage::Straggle(Straggle { round, status }) => {
+                            let round = *round;
+                            let stalled = *status == StraggleStatus::Stalled;
+                            self.apply(Input::Message(msg)).await?;
+                            if stalled {
+                                self.stalled.entry(round).or_default().insert(signer);
+                            }
+                        }
+                        _ => {
+                            self.apply(Input::Message(msg)).await?;
+                        }
+                    }
+                    self.maybe_force_accounted().await?;
+                }
+                Ok(None) => break, // control plane closed
+                Err(_) => {
+                    // Quiescence: a still-expected peer has gone silent — force the current round so
+                    // the run can make progress (and eventually drop the silent peer).
+                    self.force_current_round().await?;
+                }
+            }
+        }
+
+        Ok(CoordinatorReplay {
+            initial: self.initial,
+            inputs: self.inputs,
+            states_by_round: self.states_by_round,
+        })
+    }
+}
+
+/// Run an in-process swarm (N peers + the real coordinator `tick`) for `cfg.num_rounds` rounds over
+/// the deterministic [`StubBackend`]. Deterministic: same `cfg` → byte-identical digest transcript.
 pub async fn run_swarm(cfg: SwarmConfig) -> Result<SwarmRun, SwarmRunError> {
     run_swarm_with(cfg, |_i| {
         let mut backend = StubBackend::new();
@@ -428,10 +601,7 @@ where
     let version = SWARM_PROTO_VERSION;
 
     let keys: Vec<SigningKey> = (0..cfg.num_peers).map(peer_key).collect();
-    let peer_ids: Vec<PeerId> = keys
-        .iter()
-        .map(daemon_swarm_proto::peer_id)
-        .collect::<Vec<_>>();
+    let peer_ids: Vec<PeerId> = keys.iter().map(peer_id).collect::<Vec<_>>();
     let mut roster = peer_ids.clone();
     roster.sort_unstable();
 
@@ -504,16 +674,11 @@ where
     }
     drop(col_tx);
 
-    let coordinator = ScriptedCoordinator::new(
-        gossip.clone(),
-        coordinator_key(),
-        run.clone(),
-        roster.clone(),
-        cfg.steps_per_round,
-        cfg.micro_batch,
-        cfg.stall_rounds_max,
-    );
-    let coord_handle = tokio::spawn(async move { coordinator.run_rounds(cfg.num_rounds).await });
+    // The real coordinator tick loop (subscribes at construction, before it opens round 0).
+    let coordinator =
+        TickCoordinator::new(gossip.clone(), fs.clone(), coordinator_key(), run, &cfg);
+    let coord_handle: JoinHandle<Result<CoordinatorReplay, SwarmRunError>> =
+        tokio::spawn(async move { coordinator.drive().await });
 
     // Collect events until every peer has completed the final round (or left), with a safety
     // timeout so a silent/left peer cannot hang the harness.
@@ -524,7 +689,7 @@ where
         if roster.iter().all(|p| done.contains(p)) {
             break;
         }
-        match tokio::time::timeout(Duration::from_secs(10), col_rx.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(15), col_rx.recv()).await {
             Ok(Some((peer, ev))) => {
                 match &ev {
                     EngineEvent::RoundComplete { round, .. }
@@ -545,8 +710,9 @@ where
         }
     }
 
-    // Coordinator has published every round by now; tear the peers down and drain any tail events.
-    let _ = coord_handle.await;
+    // The coordinator has published every round by now; capture its replay trajectory, then tear
+    // the peers down and drain any tail events.
+    let replay = coord_handle.await.ok().and_then(Result::ok);
     for h in &peer_handles {
         h.abort();
     }
@@ -557,7 +723,11 @@ where
         events.push((peer, ev));
     }
 
-    Ok(SwarmRun { roster, events })
+    Ok(SwarmRun {
+        roster,
+        events,
+        replay,
+    })
 }
 
 /// A tiny process-lifetime counter for unique temp-dir names (no external `tempfile` dep).

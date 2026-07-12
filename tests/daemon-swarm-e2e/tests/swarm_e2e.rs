@@ -3,15 +3,18 @@
 
 //! Stub swarm end-to-end (spec §6.4; the Merge-2 P0 milestone test).
 //!
-//! N = 3 peers + a TEST-ONLY scripted coordinator drive the full round protocol over
-//! `LoopbackGossip` + a shared `FsPayloadStore` + the deterministic `StubBackend` for 20 rounds:
+//! N = 3 peers + the **real** `daemon-swarm-coordinator` pure `tick` loop (signed + published by the
+//! harness shell) drive the full round protocol over `LoopbackGossip` + a shared `FsPayloadStore` +
+//! the deterministic `StubBackend` for 20 rounds:
 //!
 //! - every peer's post-ingest digest is **equal every round** (the §5.6 agree-path);
 //! - one peer stalls round 7 (an injected payload miss) and catches up round 8 (§6.4 stall ladder);
-//! - two runs of the same config produce a **byte-identical** digest transcript (determinism).
+//! - two runs of the same config produce a **byte-identical** digest transcript (determinism);
+//! - the coordinator's `tick` trajectory replays byte-identically from its recorded inputs (I1 /
+//!   PROTO-20 spirit).
 //!
-//! `// MERGE-2: swap the scripted coordinator for the real daemon-swarm-coordinator tick loop` —
-//! this becomes the P0 gate test unchanged except for that swap.
+//! This is the P0 milestone: the swap from R2's TEST-ONLY scripted coordinator to the real tick
+//! loop landed at Merge 2.
 
 use daemon_swarm_proto::peer_id;
 use daemon_swarm_run::engine::EngineEvent;
@@ -77,6 +80,15 @@ async fn twenty_rounds_all_agree_with_stall_and_catchup() {
             .iter()
             .any(|e| matches!(e, EngineEvent::CaughtUp { round: 7, .. })),
         "peer 1 catches up round 7"
+    );
+
+    // The coordinator's pure `tick` trajectory replays byte-identically from its recorded inputs
+    // (canonical-CBOR state per round; I1 / PROTO-20 spirit).
+    let replay = run.replay.as_ref().expect("coordinator replay captured");
+    assert_eq!(replay.recorded_rounds(), 20, "a state snapshot per round");
+    assert!(
+        replay.verify(),
+        "replaying tick over the recorded inputs reproduces the state trajectory"
     );
 }
 

@@ -4381,6 +4381,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "ciborium",
+ "daemon-swarm-coordinator",
  "daemon-swarm-net",
  "daemon-swarm-proto",
  "serde",

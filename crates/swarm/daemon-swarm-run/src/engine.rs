@@ -27,9 +27,10 @@
 //! usually finds the set already local. (`// MERGE-2`: a dedicated in-peer concurrent fetch task
 //! becomes worthwhile once the real iroh/r2 payload plane replaces the fast `FsPayloadStore`.)
 //!
-//! Because lane P2's coordinator is built in parallel and unavailable, tests drive a **TEST-ONLY
-//! scripted coordinator** (`// MERGE-2: replace with daemon-swarm-coordinator tick loop`); this
-//! engine builds only the peer side against the frozen proto message types.
+//! As of Merge 2 the harness drives this engine with the **real** `daemon-swarm-coordinator` pure
+//! `tick` loop (signed + published by the harness shell); the engine still builds only the peer side
+//! against the frozen proto message types, consuming whatever signed `RoundOpen`/`RoundRecord` the
+//! coordinator emits.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -52,29 +53,39 @@ use crate::data::{slice_interval, BatchInterval, Corpus};
 use crate::seam::{PayloadKey, RoundId, RunId};
 use crate::SwarmRunError;
 
-/// Deterministic equal-split assignment of a global batch window across the roster.
+/// Per-round batch assignment: P2's throughput-weighted deterministic split (§6.3, PROTO-8).
 ///
-/// `// MERGE-2`: replace with `daemon-swarm-coordinator`'s throughput-weighted deterministic
-/// assignment (§6.3, PROTO-8). The split site is isolated here so the swap is one function.
+/// Merge 2 resolved the R2 `// MERGE-2` marker here by swapping the equal-split placeholder for
+/// `daemon_swarm_proto::assignment::assign_batches` — the single pure authority the coordinator and
+/// every peer re-derive byte-identically from `(round_seed, roster, window)`. The MVP StubBackend
+/// peers are all class-equal (`ThroughputClass::C1`), so the partition sizes stay even, but the
+/// peer→interval mapping is now seed-shuffled (transcript changes vs the old equal split, while
+/// cross-peer agreement is unaffected since every peer folds the same committed set).
 pub mod assignment {
     use super::{BatchInterval, PeerId};
-    use daemon_swarm_proto::messages::BatchWindow;
+    use daemon_swarm_proto::assignment::assign_batches;
+    use daemon_swarm_proto::messages::{BatchWindow, ThroughputClass};
+    use daemon_swarm_proto::Seed;
 
-    /// The `[start, end)` sub-interval assigned to `peer` — a contiguous equal split of `window`
-    /// across the (sorted) `roster`, with the last peer absorbing the remainder.
+    /// The `[start, end)` sub-interval `assign_batches` assigns to `peer` for the round seeded by
+    /// `seed` over `window`. Class-equal roster (StubBackend), zero overlap (exact partition). Falls
+    /// back to an empty interval at `window.start` if `peer` is not on the roster.
     #[must_use]
-    pub fn interval_for(window: BatchWindow, roster: &[PeerId], peer: &PeerId) -> BatchInterval {
-        let n = roster.len().max(1) as u64;
-        let idx = roster.iter().position(|p| p == peer).unwrap_or(0) as u64;
-        let total = window.end.saturating_sub(window.start);
-        let per = total / n;
-        let start = window.start + idx * per;
-        let end = if idx + 1 == n {
-            window.end
-        } else {
-            start + per
-        };
-        BatchInterval::new(start, end)
+    pub fn interval_for(
+        window: BatchWindow,
+        seed: Seed,
+        roster: &[PeerId],
+        peer: &PeerId,
+    ) -> BatchInterval {
+        let weighted: Vec<(PeerId, ThroughputClass)> =
+            roster.iter().map(|p| (*p, ThroughputClass::C1)).collect();
+        assign_batches(&weighted, &seed, window, 0)
+            .into_iter()
+            .find(|(p, _)| p == peer)
+            .map_or_else(
+                || BatchInterval::new(window.start, window.start),
+                |(_, w)| BatchInterval::new(w.start, w.end),
+            )
     }
 }
 
@@ -315,7 +326,7 @@ where
 
     /// Derive this peer's interval, train it, seal + PUT the payload, and publish the `Commitment`.
     async fn train_and_commit(&mut self, ro: &RoundOpen) -> Result<(), SwarmRunError> {
-        let interval = assignment::interval_for(ro.batch, &self.roster, &self.peer);
+        let interval = assignment::interval_for(ro.batch, ro.seed, &self.roster, &self.peer);
         let steps = slice_interval(interval, self.cfg.steps_per_round, self.cfg.micro_batch)?;
         let seq_len = self.corpus.manifest().seq_len;
 
