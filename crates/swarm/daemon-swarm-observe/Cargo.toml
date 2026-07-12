@@ -9,13 +9,20 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# The wire contract (message types, canonical codec, envelope, hashes) + the pure coordinator `tick`
+# the replay oracle re-runs (PROTO-20). Both path deps are already in the frozen root
+# `[workspace.dependencies]`, so declaring them here is a lane-owned edit — no root Cargo.toml change.
 daemon-swarm-proto = { workspace = true }
+daemon-swarm-coordinator = { workspace = true }
 serde = { workspace = true }
+# Node-side tool: observe uses std freely (std::io message-log framing) and follows its scaffold's
+# `thiserror` errors. It is NOT on the wasm32 substrate path (proto + coordinator stay wasm-clean).
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tests build a resolved `Envelope` whose `[experiment.config]` is a `ciborium::value::Value` (the
+# proto envelope's opaque config type). Dev-only; already in the frozen root workspace deps.
+ciborium = { workspace = true }
 
 [lints]
 workspace = true
-
-[package.metadata.cargo-machete]
-# Wired up during Wave-0 scaffolding; the event store + projections land with lane P.
-ignored = ["serde"]
