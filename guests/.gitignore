@@ -1,0 +1,5 @@
+# The guest build tree + the compiled wasm artifacts are never committed (built on demand via
+# `xtask build-guests`).
+/target
+Cargo.lock
+*.wasm

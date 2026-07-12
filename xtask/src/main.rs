@@ -52,6 +52,8 @@ enum Cmd {
     },
     /// Decode every CBOR fixture with the generated C codec (wire-compat gate).
     VerifyCodec,
+    /// Build the swarm guest experiment modules (`guests/`) for `wasm32-unknown-unknown`.
+    BuildGuests,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -61,7 +63,36 @@ fn main() -> anyhow::Result<()> {
         Cmd::ApiFixtures => gen_api_fixtures(),
         Cmd::GenZcbor { cddl, out } => gen_zcbor(cddl, out),
         Cmd::VerifyCodec => verify_codec(),
+        Cmd::BuildGuests => build_guests(),
     }
+}
+
+/// Build the swarm guest experiment modules for `wasm32-unknown-unknown`.
+///
+/// `guests/` is its OWN cargo workspace (excluded from the root workspace), so the host's native
+/// `cargo build/clippy/test` never tries to build a `cdylib` for wasm. This target runs
+/// `cargo build --release --target wasm32-unknown-unknown` inside it (swarm-training-spec.md §10.1).
+/// The `wasm32-unknown-unknown` rust-std is provided by the flake devShell toolchain.
+fn build_guests() -> anyhow::Result<()> {
+    let root = workspace_root();
+    let guests = root.join("guests");
+    anyhow::ensure!(
+        guests.join("Cargo.toml").is_file(),
+        "no guests workspace at {}",
+        guests.display()
+    );
+
+    // xtask is dev tooling; the crate-level `#![allow(clippy::disallowed_methods)]` covers this
+    // developer-controlled spawn.
+    let status = Command::new("cargo")
+        .current_dir(&guests)
+        .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run cargo for the guests workspace: {e}"))?;
+    anyhow::ensure!(status.success(), "building guests failed with {status}");
+
+    println!("built guests in {}", guests.display());
+    Ok(())
 }
 
 /// The workspace root (xtask's manifest dir is `<root>/xtask`).

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*/*", "tools/*", "bindings/*", "bins/*", "tests/*", "xtask"]
+# `guests/` is its OWN cargo workspace (the wasm32 experiment modules): it builds for
+# `wasm32-unknown-unknown` via `xtask build-guests`, links `daemon-train-sdk` by path, and must not
+# be pulled into the host workspace's default (native) gate. Kept out with an explicit exclude.
+exclude = ["guests"]
 
 [workspace.package]
 version = "0.0.1"

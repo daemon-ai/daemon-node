@@ -1,0 +1,14 @@
+[package]
+name = "tiny-llama"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A guest experiment module: a `cdylib` the host instantiates in the wasm sandbox (tensor-ABI spec
+# §5.1). The reference consumer of the guest SDK.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+daemon-train-sdk = { path = "../../crates/contracts/daemon-train-sdk" }
