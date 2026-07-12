@@ -9,17 +9,20 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# Wave 2 keeps this crate a PURE LIBRARY: the coordinator `tick` state machine + its types, with no
+# I/O. It depends only on the wasm-clean proto contract plus serde (derive) for the
+# canonical-CBOR-serializable state — so `tick` stays byte-reproducible on the wasm32/zkVM
+# coordinator substrate (§11.2, COORD-3). Errors are hand-rolled (no `thiserror`), matching the
+# lean-contract convention. The runnable local coordinator (axum/WS) + its deps land in Wave 3
+# (lane R owns `bins/`), which re-adds the server dependencies then. Root Cargo.toml is FROZEN and
+# untouched.
 daemon-swarm-proto = { workspace = true }
-# The local/private coordinator harness serves the state machine over axum/WS; the same crate also
-# exports a `wasm32` build for the cloud DO (§11.2). axum is host-only, so the wasm export gates it
-# out — declared here for the host harness surface.
-axum = { workspace = true }
-tokio = { workspace = true }
-thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+# Integer-only property testing of `tick` determinism (TDD PROTO-16). Dev-only: does not affect the
+# crate's wasm-clean normal-dependency surface.
+proptest = { workspace = true }
 
 [lints]
 workspace = true
-
-[package.metadata.cargo-machete]
-# Wired up during Wave-0 scaffolding; the coordinator harness lands with lane P.
-ignored = ["axum", "tokio"]

@@ -4324,10 +4324,9 @@ dependencies = [
 name = "daemon-swarm-coordinator"
 version = "0.0.1"
 dependencies = [
- "axum",
  "daemon-swarm-proto",
- "thiserror 2.0.18",
- "tokio",
+ "proptest",
+ "serde",
 ]
 
 [[package]]
