@@ -268,6 +268,18 @@ pub fn param_master(name: &str) -> Option<Vec<f32>> {
     })
 }
 
+/// The current accumulated fp32 gradient of a registered param (inspection; HOST-9 / autodiff
+/// checks). Reflects everything `backward@1` has accumulated since the last `zero_grads@1`.
+#[must_use]
+pub fn param_grad(name: &str) -> Option<Vec<f32>> {
+    with(|s| {
+        s.params
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.grad.clone())
+    })
+}
+
 /// The metrics reported via `metric@1` this run.
 #[must_use]
 pub fn metrics() -> Vec<(String, f32)> {

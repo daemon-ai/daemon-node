@@ -166,6 +166,37 @@ fn tiny_llama_forward_step_reports_loss() {
     );
 }
 
+/// HOST-8: a `meta` pass over the real model produces a schema-valid `MetaReport` — the param
+/// layout, byte footprints, per-entry op counts, the two-point ingest-per-peer fit, and the set of
+/// ops actually exercised (embedding/rmsnorm/flash_attn/…), all CBOR round-trippable.
+#[test]
+fn meta_report_layout_and_schema() {
+    let worker = Worker::new(EngineConfig::default()).unwrap();
+    let module = worker.load_module(&wasm("tiny_llama")).unwrap();
+    let mut inst = worker.instantiate(&module).unwrap();
+
+    let report = inst.meta(&tiny_cbor(), 2, tiny_cfg().seq_len).unwrap();
+
+    assert_eq!(report.abi >> 16, 1);
+    assert_eq!(report.params.len(), 1 + 9 + 1);
+    assert_eq!(report.params[0].0, "tok.weight");
+    assert!(report.master_bytes > 0 && report.grad_bytes == report.master_bytes);
+    assert!(
+        report.op_calls["da_step"] > 0,
+        "the forward charged host ops"
+    );
+    assert!(report.op_calls.contains_key("da_ingest_updates"));
+    // The forward exercised the Wave-2 NN vocabulary.
+    for op in ["embedding@1", "rmsnorm@1", "flash_attn@1", "silu@1"] {
+        assert!(report.ops_used.iter().any(|o| o == op), "meta missed {op}");
+    }
+    // The ingest cost fit is a non-negative per-peer slope, and the report round-trips as CBOR.
+    let bytes = report.to_cbor();
+    let back: daemon_train::MetaReport = ciborium::from_reader(bytes.as_slice()).unwrap();
+    assert_eq!(back.params.len(), report.params.len());
+    assert_eq!(back.ops_used, report.ops_used);
+}
+
 /// HOST-12 shape: a det-lane op in `da_step` is illegal (ABI §3.5) ⇒ typed `PhaseViolation`.
 #[test]
 fn phase_violation_traps_typed() {

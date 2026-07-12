@@ -144,6 +144,9 @@ struct HostState {
     op_budget: u64,
     handle_budget: usize,
     trap: Option<Trap>,
+    /// Every import charged over this instance's life (meta-mode `ops_used`, ABI §6.4). Unlike
+    /// `op_calls` (reset per entry point), this accumulates across the whole probe.
+    ops_used: std::collections::BTreeSet<&'static str>,
 }
 
 impl HostState {
@@ -168,11 +171,13 @@ impl HostState {
             op_budget: cfg.op_budget,
             handle_budget: cfg.max_step_handles,
             trap: None,
+            ops_used: std::collections::BTreeSet::new(),
         }
     }
 
     fn charge_op(&mut self, import: &'static str, phase: Phase) -> Result<(), Trap> {
         self.op_calls += 1;
+        self.ops_used.insert(import);
         if self.op_calls > self.op_budget {
             return Err(Trap::new(
                 TrapCode::BudgetOps,
@@ -730,6 +735,143 @@ impl Instance {
     #[must_use]
     pub fn metrics(&self) -> Vec<(String, f32)> {
         self.store.data().metrics.clone()
+    }
+
+    /// Run the full lifecycle once in `meta` mode and produce the `MetaReport` (ABI §6.4, HOST-8):
+    /// `da_build` → one `da_step` at the representative `(batch, seq)` shape → `da_inner_update` →
+    /// `da_make_update` → `da_ingest_updates` **twice** (1 and 2 staged) to fit the linear per-peer
+    /// ingest cost. This build measures a real execute pass on the CPU backend (see `meta.rs`).
+    ///
+    /// # Errors
+    ///
+    /// [`TrainError::Trap`]/[`TrainError::Sandbox`] on any lifecycle failure.
+    pub fn meta(
+        &mut self,
+        config: &[u8],
+        batch: u32,
+        seq: u32,
+    ) -> Result<crate::MetaReport, TrainError> {
+        let abi = {
+            let f = self
+                .instance
+                .get_typed_func::<(), u32>(&mut self.store, "da_abi")
+                .map_err(|_| Trap::bare(TrapCode::BadModule, "missing da_abi"))?;
+            f.call(&mut self.store, ())
+                .map_err(|e| TrainError::Sandbox(e.to_string()))?
+        };
+
+        self.build(config)?;
+        let op_build = self.store.data().op_calls;
+
+        let b = self.register_batch(vec![0u32; (batch * seq) as usize], batch, seq);
+        self.step(b, 0, 0, 1, batch)?;
+        let op_step = self.store.data().op_calls;
+
+        self.inner_update(0)?;
+        let op_inner = self.store.data().op_calls;
+
+        let container = self.make_update(0)?;
+        let op_make = self.store.data().op_calls;
+        let payload_bytes_est = self.container_bytes(container);
+
+        self.stage(container);
+        self.ingest(0, 1)?;
+        let op_ingest1 = self.store.data().op_calls;
+        self.stage(container);
+        self.ingest(0, 2)?;
+        let op_ingest2 = self.store.data().op_calls;
+        let ingest_op_calls_per_peer = op_ingest2.saturating_sub(op_ingest1);
+
+        let d = self.store.data();
+        let params: Vec<(String, Vec<u32>, u32)> = d
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), p.shape.clone(), p.dtype))
+            .collect();
+        let persistent: Vec<(String, Vec<u32>, u32, u32)> = d
+            .persistents
+            .iter()
+            .map(|s| (s.name.clone(), s.shape.clone(), s.dtype, s.class))
+            .collect();
+        let det_persistent: Vec<(String, Vec<u32>, u32)> = d
+            .det_persistents
+            .iter()
+            .map(|s| (s.name.clone(), s.shape.clone(), s.class))
+            .collect();
+
+        let param_bytes: u64 = d
+            .params
+            .iter()
+            .map(|p| (HostState::numel(&p.shape) * dtype_size(p.dtype)) as u64)
+            .sum();
+        let master_bytes: u64 = d
+            .params
+            .iter()
+            .map(|p| (HostState::numel(&p.shape) * 4) as u64)
+            .sum();
+        let grad_bytes = master_bytes;
+        let max_master: u64 = d
+            .params
+            .iter()
+            .map(|p| (HostState::numel(&p.shape) * 4) as u64)
+            .max()
+            .unwrap_or(0);
+
+        let mut op_calls = std::collections::BTreeMap::new();
+        op_calls.insert("da_build".to_string(), op_build);
+        op_calls.insert("da_step".to_string(), op_step);
+        op_calls.insert("da_inner_update".to_string(), op_inner);
+        op_calls.insert("da_make_update".to_string(), op_make);
+        op_calls.insert("da_ingest_updates".to_string(), op_ingest1);
+
+        let ops_used: Vec<String> = d.ops_used.iter().map(|s| (*s).to_string()).collect();
+
+        Ok(crate::MetaReport {
+            abi,
+            params,
+            persistent,
+            det_persistent,
+            param_bytes,
+            master_bytes,
+            grad_bytes,
+            // Coarse activation proxy (shape-only propagation is a later refinement).
+            act_bytes_est: master_bytes,
+            payload_bytes_est,
+            // Streaming ingest peak ≈ ~2 dense tensors + staged payloads (§5.9).
+            ingest_bytes_est: payload_bytes_est.saturating_mul(2) + 2 * max_master,
+            host_ram_bytes_est: master_bytes * 2 + payload_bytes_est.saturating_mul(2),
+            op_calls,
+            ingest_op_calls_per_peer,
+            ops_used,
+            value_dependent: false,
+        })
+    }
+
+    fn container_bytes(&self, container: u64) -> u64 {
+        if let Some(HandleClass::Update) = handle::classify(container) {
+            let idx = (handle::stable_index(container) - 1) as usize;
+            if let Some(c) = self.store.data().containers.get(idx) {
+                return c
+                    .sections
+                    .iter()
+                    .map(|s| match s {
+                        Section::Bytes(b) => b.len() as u64,
+                        Section::Tensor { data, .. } => (data.len() * 4) as u64,
+                    })
+                    .sum();
+            }
+        }
+        0
+    }
+}
+
+/// Byte size of a stored element of `dtype` (ABI §3.2).
+fn dtype_size(dtype: u32) -> usize {
+    match dtype {
+        3 => 8,     // I64
+        1 | 2 => 2, // BF16 / F16
+        6 | 7 => 1, // U8 / Bool
+        _ => 4,     // F32 / I32 / U32
     }
 }
 

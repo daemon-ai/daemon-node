@@ -19,12 +19,14 @@
 
 pub mod backend;
 pub mod handle;
+pub mod meta;
 pub mod phase;
 pub mod runtime;
 pub mod trap;
 
 pub use backend::{AdamwHp, CpuBackend, OpBackend, TensorId};
 pub use handle::{HandleClass, Lane};
+pub use meta::MetaReport;
 pub use phase::Phase;
 pub use runtime::{EngineConfig, Instance, LoadedModule, Manifest, ParamInfo, Worker};
 pub use trap::{Trap, TrapCode};
