@@ -36,6 +36,18 @@ ignore = [
   # drop Discord) then. NOTE: the rustls-webpki name-constraint / CRL issues are reachable only
   # after signature verification and require issuer misissuance, and Discord speaks only to Discord's
   # own pinned endpoints — bounded exposure. See the prominent Discord flag in the integration report.
+  # [swarm] bincode: unmaintained-status advisory only (no CVE) — the bincode team ceased
+  # development and consider 1.3.3 "complete"; the advisory flags the crate itself, so no version
+  # pin or alternative resolves it. It is an UNCONDITIONAL (non-optional) dependency of burn-core
+  # 0.21 (burn's record (de)serialization), the only path to it (verified: bincode 2.0.1 ->
+  # burn-core -> burn -> daemon-train). burn is isolated to the `daemon-train` WORKER fault domain
+  # (§10.1) — never linked into the node process — and in the shipped product it builds only as an
+  # out-of-gate per-backend Nix lane (like the daemon-infer engines), so this is not in the node's
+  # runtime attack surface. Exposure is further bounded: bincode only deserializes burn's own
+  # checkpoint/model records inside the sandboxed worker. A real CVE would carry a new advisory ID
+  # and still fail this gate. Re-evaluate when burn moves off bincode (postcard/rkyv are upstream
+  # candidates) or drops it behind a feature.
+  "RUSTSEC-2025-0141", # bincode: unmaintained; unconditional dep of burn-core 0.21 (daemon-train)
   "RUSTSEC-2025-0057", # fxhash: unmaintained; direct dep of serenity_self 0.13.3
   "RUSTSEC-2025-0134", # rustls-pemfile 1.0.4: unmaintained; via reqwest 0.11 -> serenity_self
   "RUSTSEC-2026-0049", # rustls-webpki 0.102.8: CRL distribution-point matching; via serenity_self
