@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assignment;
 pub mod bytes;
 pub mod canonical;
 pub mod capability;
@@ -28,6 +29,10 @@ pub mod messages;
 pub mod sign;
 pub mod version;
 
+pub use assignment::{
+    advance_cursor, assign_batches, class_weight, deterministic_shuffle, global_batch_at,
+    seeded_lcg, select_committee, witness_quorum, Committee, Lcg, WITNESS_TARGET_DEFAULT,
+};
 pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use capability::{Capability, CapabilitySet};
