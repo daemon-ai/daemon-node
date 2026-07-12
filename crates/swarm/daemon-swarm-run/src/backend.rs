@@ -16,7 +16,13 @@
 //! a post-ingest [`StateDigest`]; plus checkpoint save/load (§9).
 //!
 //! [`StubBackend`] is a deterministic fake (xxh3 of inputs) so Wave 2 can build + test the round
-//! loop over a real seam before the engine exists.
+//! loop over a real seam before the engine exists. It models the DiLoCo-family agree-path (§5.6):
+//! a `base` snapshot is the consensus round base (the outer-step anchor, ABI §5.9); local
+//! training moves `params` away from `base` between barriers; `ingest` performs the outer step
+//! `params = base ⊕ orderedFold(committed set)` and re-snapshots `base`. Because `base` is equal
+//! across peers post-ingest and the committed set (record order) is equal, every peer's post-ingest
+//! digest is **equal** — while `make_update` still emits a peer-distinct contribution derived from
+//! its diverged `params`. This is the property the Wave-2 round loop asserts round after round.
 
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
@@ -162,8 +168,10 @@ impl core::fmt::Debug for StateDigest {
 /// to exercise the full lifecycle and for tests to assert determinism + record-order sensitivity,
 /// with no engine, GPU, or wasm.
 pub struct StubBackend {
-    /// The canonical state dict; `None` until `build` is called.
+    /// The canonical state dict (diverges from `base` under local training); `None` until `build`.
     params: Option<Vec<u64>>,
+    /// The consensus round base — the outer-step anchor, re-snapshot at each `ingest` barrier.
+    base: Option<Vec<u64>>,
     /// The current step's accumulator (reset at each `inner_update`).
     accum: u64,
 }
@@ -177,6 +185,7 @@ impl StubBackend {
     pub fn new() -> Self {
         Self {
             params: None,
+            base: None,
             accum: 0,
         }
     }
@@ -187,6 +196,10 @@ impl StubBackend {
 
     fn params(&self) -> Result<&Vec<u64>, StubError> {
         self.params.as_ref().ok_or(StubError::NotBuilt)
+    }
+
+    fn base(&self) -> Result<&Vec<u64>, StubError> {
+        self.base.as_ref().ok_or(StubError::NotBuilt)
     }
 
     /// The little-endian bytes of the state dict (the digest / payload preimage).
@@ -210,9 +223,11 @@ impl TrainerBackend for StubBackend {
 
     fn build(&mut self, config: &[u8]) -> Result<(), StubError> {
         let seed = xxh3_64(config);
-        let params = (0..Self::STATE_LEN)
+        let params: Vec<u64> = (0..Self::STATE_LEN)
             .map(|i| xxh3_64(&[config, &(i as u64).to_le_bytes()].concat()) ^ seed)
             .collect();
+        // params and base coincide at build: the initial state is the first consensus base.
+        self.base = Some(params.clone());
         self.params = Some(params);
         self.accum = 0;
         Ok(())
@@ -270,9 +285,15 @@ impl TrainerBackend for StubBackend {
 
     fn make_update(&mut self, round: RoundId) -> Result<Vec<u8>, StubError> {
         let params = self.params()?;
+        let base = self.base()?;
+        // The contribution is a function of (round, base, this peer's diverged params): `base`
+        // makes it config-sensitive (equal across peers), the params-vs-base delta makes it
+        // peer-distinct (local training). Payload frame: round (8) ++ xxh3-128 (16).
         let mut preimage = round.to_le_bytes().to_vec();
-        preimage.extend_from_slice(&Self::state_bytes(params));
-        // The payload frame: round (8) ++ xxh3-128 of (round ++ state) (16) — deterministic bytes.
+        preimage.extend_from_slice(&Self::state_bytes(base));
+        for (p, b) in params.iter().zip(base.iter()) {
+            preimage.extend_from_slice(&p.wrapping_sub(*b).to_le_bytes());
+        }
         let digest = xxh3_128(&preimage);
         let mut out = round.to_le_bytes().to_vec();
         out.extend_from_slice(&digest.to_le_bytes());
@@ -284,32 +305,39 @@ impl TrainerBackend for StubBackend {
         round: RoundId,
         staged: &[StagedPayload],
     ) -> Result<StateDigest, StubError> {
-        let params = self.params_mut()?;
-        // Fold staged payloads in the caller's (record) order; the position index makes ingest
-        // order-sensitive, so a reordering bug diverges the digest loudly (§6.4 I3).
+        // Outer step from the consensus round base — independent of this peer's locally-diverged
+        // params, so peers that trained on different windows still reconverge (§5.6). The fold is
+        // record-ordered (position index), so a reorder diverges the digest loudly (§6.4 I3).
+        let mut next = self.base()?.clone();
         for (position, payload) in staged.iter().enumerate() {
             let mix = xxh3_64(&payload.bytes)
                 .wrapping_mul(2 * position as u64 + 1)
                 .wrapping_add(round);
-            let idx = position % params.len();
-            params[idx] = params[idx].wrapping_add(mix);
+            let idx = position % next.len();
+            next[idx] = next[idx].wrapping_add(mix);
         }
-        let digest = xxh3_128(&Self::state_bytes(params));
+        let digest = xxh3_128(&Self::state_bytes(&next));
+        // Re-snapshot the base: the post-ingest state is the next round's outer-step anchor.
+        self.base = Some(next.clone());
+        self.params = Some(next);
+        self.accum = 0;
         Ok(StateDigest(digest.to_le_bytes()))
     }
 
     fn checkpoint_save(&self) -> Result<Vec<u8>, StubError> {
         let params = self.params()?;
+        let base = self.base()?;
         let mut buf = Vec::new();
-        ciborium::into_writer(&(params, self.accum), &mut buf)
+        ciborium::into_writer(&(params, base, self.accum), &mut buf)
             .map_err(|e| StubError::Codec(e.to_string()))?;
         Ok(buf)
     }
 
     fn checkpoint_load(&mut self, bytes: &[u8]) -> Result<(), StubError> {
-        let (params, accum): (Vec<u64>, u64) =
+        let (params, base, accum): (Vec<u64>, Vec<u64>, u64) =
             ciborium::from_reader(bytes).map_err(|e| StubError::Codec(e.to_string()))?;
         self.params = Some(params);
+        self.base = Some(base);
         self.accum = accum;
         Ok(())
     }
@@ -440,6 +468,48 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StubError::NotBuilt));
         assert!(matches!(fresh.make_update(0), Err(StubError::NotBuilt)));
+    }
+
+    #[test]
+    fn peers_reconverge_despite_divergent_training() {
+        // Two peers build from the same config, train on *different* batches (diverging params),
+        // then ingest the *same* committed set in the *same* record order. The outer step anchors
+        // on the equal round base, so their post-ingest digests are equal (§5.6 agree-path).
+        let train = |b: &mut StubBackend, tokens: Vec<u32>| {
+            b.train_step(
+                &BatchRef {
+                    seq_len: tokens.len() as u32,
+                    tokens,
+                },
+                StepCtx {
+                    inner_step: 0,
+                    mb_index: 0,
+                    mb_count: 1,
+                    step_seqs: 1,
+                },
+            )
+            .unwrap();
+            b.inner_update(0).unwrap();
+        };
+
+        let mut a = built(b"same-config");
+        let mut b = built(b"same-config");
+        train(&mut a, vec![1, 2, 3, 4]);
+        train(&mut b, vec![9, 8, 7, 6]);
+
+        // Their locally-produced updates differ (different training)...
+        let ua = a.make_update(1).unwrap();
+        let ub = b.make_update(1).unwrap();
+        assert_ne!(
+            ua, ub,
+            "divergent training must yield distinct contributions"
+        );
+
+        // ...but ingesting the identical committed set in identical order reconverges the digest.
+        let staged = vec![payload(0x01, &ua), payload(0x02, &ub)];
+        let da = a.ingest(1, &staged).unwrap();
+        let db = b.ingest(1, &staged).unwrap();
+        assert_eq!(da, db, "equal base + equal committed set -> equal digest");
     }
 
     #[test]
