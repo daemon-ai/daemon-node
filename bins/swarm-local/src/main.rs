@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+//! `swarm-local` — the runnable local-mode swarm runner (spec §10.4 local run mode, §6.1).
+//!
+//! It reads an authoring TOML envelope, builds the resolved [`Envelope`], **freezes + verifies** it
+//! (the real §6.1 chain), and stands up an in-process run:
+//!
+//! - `--backend stub` (default): N [`RoundEngine`](daemon_swarm_run::engine::RoundEngine) peers over
+//!   the deterministic `StubBackend` + the [`LocalCoordinator`](daemon_swarm_run::local_coordinator)
+//!   shell (tick + signing + receipt production over a shared payload store). Prints the agreed
+//!   per-round digest transcript + the offline replay check (PROTO-20).
+//! - `--backend worker`: one supervised `daemon-train` worker per peer over the frozen worker
+//!   protocol (probe → assess the frozen envelope → join). The fake worker keeps this path testable;
+//!   `MERGE-3`: point `--worker-bin` at the real E3 `daemon-train` worker binary.
+//!
+//! This is a local developer runnable (like `xtask`): it reads an operator-supplied envelope path on
+//! the operator's own machine, so the file read carries a declared `#[allow]` rather than the
+//! `ContainedRoot` ceremony reserved for attacker-influenced paths.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use clap::{Parser, ValueEnum};
+use serde::Deserialize;
+
+use daemon_swarm_proto::envelope::{
+    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
+    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
+};
+use daemon_swarm_proto::{FrozenEnvelope, Hash, SigningKey};
+use daemon_swarm_run::harness::{run_swarm, SwarmConfig};
+use daemon_swarm_run::protocol::{JoinPolicy, LeaveMode, PolicyMode};
+use daemon_train_client::{TrainClientConfig, TrainSupervisor};
+
+/// The peer backend the runner drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    /// In-process `RoundEngine` peers over the deterministic `StubBackend`.
+    Stub,
+    /// One supervised `daemon-train` worker per peer over the frozen worker protocol.
+    Worker,
+}
+
+/// The `swarm-local` command line (frozen at Merge 3).
+#[derive(Parser, Debug)]
+#[command(
+    name = "swarm-local",
+    about = "Run a swarm training round loop locally (spec §10.4)."
+)]
+struct Args {
+    /// Path to the authoring TOML envelope (§6.1).
+    #[arg(long)]
+    envelope: PathBuf,
+    /// Number of in-process peers (clamped to the envelope's `[run].min_peers..=max_peers`).
+    #[arg(long, default_value_t = 3)]
+    peers: usize,
+    /// Rounds to drive (defaults to the envelope's `[data].rounds`).
+    #[arg(long)]
+    rounds: Option<u64>,
+    /// Corpus + coordinator seed (`0x`-prefixed hex or decimal).
+    #[arg(long, default_value = "0xDAE07E57")]
+    seed: String,
+    /// Payload-store / worker state directory (informational for stub mode).
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Peer backend.
+    #[arg(long, value_enum, default_value_t = Backend::Stub)]
+    backend: Backend,
+    /// Experiment profile passthrough (recorded in the run header).
+    #[arg(long)]
+    profile: Option<String>,
+    /// Worker binary for `--backend worker` (MERGE-3: the real daemon-train worker).
+    #[arg(long, default_value = "daemon-train")]
+    worker_bin: PathBuf,
+}
+
+/// The authoring TOML the runner parses (a small, operator-friendly subset of §6.1). The proto crate
+/// never parses TOML (it stays wasm32-clean), so the mapping to the resolved [`Envelope`] lives here.
+#[derive(Debug, Deserialize)]
+struct EnvelopeToml {
+    run: RunToml,
+    experiment: ExperimentToml,
+    data: DataToml,
+    #[serde(default)]
+    requirements: RequirementsToml,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunToml {
+    run_id: String,
+    min_peers: u32,
+    max_peers: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExperimentToml {
+    module: String,
+    abi: String,
+    #[serde(default)]
+    config: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataToml {
+    #[serde(default = "default_manifest")]
+    manifest: String,
+    steps_per_round: u32,
+    #[serde(default = "default_global_batch")]
+    global_batch: u32,
+    rounds: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RequirementsToml {
+    #[serde(default = "default_throughput_floor")]
+    throughput_floor: String,
+}
+
+fn default_manifest() -> String {
+    "manifest.json".to_string()
+}
+fn default_global_batch() -> u32 {
+    12
+}
+fn default_throughput_floor() -> String {
+    "c1".to_string()
+}
+
+impl EnvelopeToml {
+    /// Build the resolved proto [`Envelope`] this authoring TOML describes.
+    fn into_envelope(self) -> Envelope {
+        // Artifacts are pinned by content hash on the real plane; a local demo carries placeholder
+        // hashes (validation only checks the module + manifest names resolve).
+        let mut artifacts = std::collections::BTreeMap::new();
+        artifacts.insert(
+            self.experiment.module.clone(),
+            Artifact {
+                url: format!("file://{}", self.experiment.module),
+                blake3: Hash([0u8; 32]),
+            },
+        );
+        artifacts.insert(
+            self.data.manifest.clone(),
+            Artifact {
+                url: format!("file://{}", self.data.manifest),
+                blake3: Hash([0u8; 32]),
+            },
+        );
+        Envelope {
+            run: RunSection {
+                schema: ENVELOPE_SCHEMA_MAJOR,
+                run_id: self.run.run_id,
+                min_peers: self.run.min_peers,
+                max_peers: self.run.max_peers,
+                access: Access::Org,
+            },
+            experiment: ExperimentSection {
+                module: self.experiment.module,
+                abi: self.experiment.abi,
+                config: ciborium::value::Value::Text(self.experiment.config),
+            },
+            artifacts,
+            data: DataSection {
+                manifest: self.data.manifest,
+                steps_per_round: self.data.steps_per_round,
+                global_batch: GlobalBatch {
+                    start: self.data.global_batch,
+                    end: self.data.global_batch,
+                    ramp_rounds: 0,
+                },
+                stop: StopCondition::Rounds(self.data.rounds),
+            },
+            requirements: Requirements {
+                vram_mb_min: 0,
+                ram_gb_min: 0,
+                uplink_mbps_min: 0,
+                downlink_mbps_min: 0,
+                disk_gb_min: 0,
+                throughput_floor: self.requirements.throughput_floor,
+                update_mb_max: 64,
+                capabilities: Vec::new(),
+                payload_store: "r2".to_string(),
+            },
+            phases: Phases {
+                round_mode: RoundMode::Barrier,
+                warmup: 1,
+                round_train_max: 1,
+                round_witness: 1,
+                cooldown: 1,
+                epoch_rounds: 0,
+                checkpoint_every_epochs: 0,
+                stall_rounds_max: 2,
+                payload_retention_rounds: 8,
+            },
+        }
+    }
+}
+
+/// Read the operator-supplied envelope file. Declared `#[allow]`: a local dev-run path on the
+/// operator's own machine, not an attacker-influenced input (the `ContainedRoot` guard's domain).
+#[allow(clippy::disallowed_methods)]
+fn read_envelope(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("read envelope {}", path.display()))
+}
+
+fn parse_seed(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).context("parse hex seed")
+    } else {
+        s.parse::<u64>().context("parse decimal seed")
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let seed = parse_seed(&args.seed)?;
+
+    let toml_text = read_envelope(&args.envelope)?;
+    let spec: EnvelopeToml = toml::from_str(&toml_text).context("parse envelope TOML")?;
+    let rounds = args.rounds.unwrap_or(spec.data.rounds);
+    let steps_per_round = spec.data.steps_per_round;
+    let (min_peers, max_peers) = (spec.run.min_peers as usize, spec.run.max_peers as usize);
+    let envelope = spec.into_envelope();
+
+    // The real §6.1 freeze → hash → sign → verify chain (a demo author key for local runs).
+    envelope.validate().context("envelope validation")?;
+    let author = SigningKey::from_bytes(&[0xA1u8; 32]);
+    let frozen: FrozenEnvelope = envelope.freeze(&author).context("freeze envelope")?;
+    frozen.verify().context("verify frozen envelope")?;
+
+    let peers = args.peers.clamp(min_peers.max(1), max_peers.max(1));
+
+    println!("swarm-local — local run");
+    println!("  run_id        : {}", frozen_run_id(&frozen)?);
+    println!("  envelope hash : {}", frozen.hash().to_hex());
+    println!("  peers         : {peers}  (min {min_peers}, max {max_peers})");
+    println!("  rounds        : {rounds}");
+    println!("  steps/round   : {steps_per_round}");
+    println!("  seed          : {seed:#x}");
+    if let Some(profile) = &args.profile {
+        println!("  profile       : {profile}");
+    }
+    if let Some(dir) = &args.state_dir {
+        println!("  state dir     : {}", dir.display());
+    }
+    println!("  backend       : {:?}", args.backend);
+
+    match args.backend {
+        Backend::Stub => run_stub(peers, rounds, steps_per_round, seed).await,
+        Backend::Worker => run_worker(peers, &args.worker_bin, frozen.bytes()).await,
+    }
+}
+
+/// Stub mode: the in-process peer harness + local coordinator over `StubBackend`.
+async fn run_stub(peers: usize, rounds: u64, steps_per_round: u32, seed: u64) -> Result<()> {
+    let cfg = SwarmConfig {
+        num_peers: peers,
+        num_rounds: rounds,
+        steps_per_round,
+        micro_batch: 2,
+        corpus_seed: seed,
+        ..SwarmConfig::small(rounds)
+    };
+    let run = run_swarm(cfg).await.context("run local swarm")?;
+
+    println!(
+        "\nagreed digest transcript ({} rounds):",
+        run.agreed_transcript().len()
+    );
+    for (round, digest) in run.agreed_transcript() {
+        println!("  round {round:>4}  {}", digest.to_hex());
+    }
+    let agree = run.all_agree();
+    println!("\nall peers agree every round : {agree}");
+    if let Some(replay) = &run.replay {
+        println!(
+            "coordinator replay verified : {} ({} rounds)",
+            replay.verify(),
+            replay.recorded_rounds()
+        );
+    }
+    anyhow::ensure!(agree, "peers disagreed on at least one round");
+    Ok(())
+}
+
+/// Worker mode: spawn one supervised `daemon-train` worker per peer over the frozen worker protocol
+/// (probe → assess the frozen envelope → join). `MERGE-3`: point `--worker-bin` at the real E3
+/// `daemon-train` worker binary — the fake worker keeps this path testable meanwhile.
+async fn run_worker(peers: usize, worker_bin: &Path, envelope_bytes: &[u8]) -> Result<()> {
+    let policy = JoinPolicy {
+        mode: PolicyMode::Always,
+        vram_cap_mb: 0,
+        duty_cycle_pct: 100,
+        schedule: None,
+    };
+    println!("\nspawning {peers} worker(s) from {}", worker_bin.display());
+    for i in 0..peers {
+        let sup = TrainSupervisor::new(TrainClientConfig::new(worker_bin));
+        let hw = sup.probe().await.context("probe worker")?;
+        let elig = sup
+            .assess(envelope_bytes.to_vec())
+            .await
+            .context("assess run")?;
+        println!(
+            "  peer {i}: gpus={} vram_mb={} eligible={} {:?}",
+            hw.gpus, hw.vram_mb, elig.eligible, elig.reasons
+        );
+        if elig.eligible {
+            sup.join(
+                "local-demo",
+                "local://coordinator",
+                Vec::new(),
+                policy.clone(),
+            )
+            .await
+            .context("join run")?;
+            sup.leave("local-demo", LeaveMode::Graceful)
+                .await
+                .context("leave run")?;
+        }
+        sup.shutdown().await;
+    }
+    println!("\nworker-backed run wired over the frozen protocol (real training is E3 / MERGE-3).");
+    Ok(())
+}
+
+/// The run id from the frozen envelope's decoded body.
+fn frozen_run_id(frozen: &FrozenEnvelope) -> Result<String> {
+    Ok(frozen.decode().context("decode envelope")?.run.run_id)
+}

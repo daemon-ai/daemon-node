@@ -23,13 +23,7 @@ use daemon_swarm_run::harness::{peer_key, run_swarm, StallFault, SwarmConfig};
 /// The 20-round, 3-peer scenario with a stall at round 7 and catch-up at round 8.
 fn scenario() -> SwarmConfig {
     SwarmConfig {
-        num_peers: 3,
         num_rounds: 20,
-        steps_per_round: 2,
-        micro_batch: 2,
-        stall_rounds_max: 2,
-        checkpoint_every_rounds: 0,
-        corpus_seed: 0xDAE0_7E57,
         fault: Some(StallFault {
             // Peer 1 cannot fetch peer 0's round-7 payload for its first 2 gets (prefetch +
             // barrier), stalls, and catches up on its next attempt (round 8 open).
@@ -38,6 +32,7 @@ fn scenario() -> SwarmConfig {
             round: 7,
             first_n_gets: 2,
         }),
+        ..SwarmConfig::small(20)
     }
 }
 

@@ -12,7 +12,10 @@
 //! engine, optionally varying behavior by spawn index (a counter persisted in `DAEMON_FAKE_STATE`)
 //! so a test can assert "crash once, then succeed on the respawn".
 //!
-//! Scenarios: `ready` (default) | `exit-on-start` | `crash-once`.
+//! Scenarios: `ready` (default) | `exit-on-start` | `crash-once` | `ineligible`.
+//!
+//! `ineligible` answers `AssessRun` with a not-eligible verdict + reasons (the RUN-10 staged-assess
+//! rejection path). `MERGE-3`: the real meta-mode assess lives in the E3 `daemon-train` worker.
 
 use daemon_provision::{CutChannel, CutWriter};
 use daemon_swarm_run::protocol::{self, Command, Eligibility, Event, Hardware, WorkerCapabilities};
@@ -60,15 +63,20 @@ async fn main() {
                 if misbehave {
                     std::process::exit(1);
                 }
-                send(
-                    &writer,
-                    &Event::Assessed(Eligibility {
+                let assessed = if scenario == "ineligible" {
+                    Eligibility {
+                        eligible: false,
+                        reasons: vec!["fake: vram below floor".into()],
+                        headroom: vec![("vram_mb".into(), -2048)],
+                    }
+                } else {
+                    Eligibility {
                         eligible: true,
                         reasons: vec!["fake: fits".into()],
                         headroom: vec![("vram_mb".into(), 4096)],
-                    }),
-                )
-                .await;
+                    }
+                };
+                send(&writer, &Event::Assessed(assessed)).await;
             }
             Command::JoinRun { run_id, .. } => {
                 if misbehave {

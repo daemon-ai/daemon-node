@@ -97,3 +97,64 @@ async fn supervisor_respawn() {
     sup.shutdown().await;
     let _ = std::fs::remove_file(&state);
 }
+
+/// RUN-9 (§10.5): preemption-as-churn. `Throttle{paused}` makes the peer leave the round cleanly;
+/// resume + rejoin re-enter at a boundary — over the **same** worker (pause/resume is churn, not a
+/// crash, so there is no respawn). Real wasm VRAM-free preemption is the E3 worker's side
+/// (`MERGE-3`: point at the daemon-train worker binary).
+#[tokio::test]
+async fn preemption_as_churn_pauses_and_rejoins_without_respawn() {
+    let state = state_path("preempt");
+    let sup = TrainSupervisor::new(cfg("ready", &state));
+
+    sup.join("run-9", "wss://coord", vec![], policy())
+        .await
+        .expect("initial join");
+
+    // Inference preempts training: pause (the worker leaves the round + frees VRAM on the real side).
+    sup.throttle(None, None, true).await.expect("pause");
+    // Resume per policy, then rejoin at the next boundary.
+    sup.throttle(None, None, false).await.expect("resume");
+    sup.join("run-9", "wss://coord", vec![], policy())
+        .await
+        .expect("rejoin after resume");
+
+    assert_eq!(
+        sup.restarts().await,
+        0,
+        "pause/resume is churn over the same worker — never a respawn"
+    );
+
+    sup.shutdown().await;
+    let _ = std::fs::remove_file(&state);
+}
+
+/// RUN-10 (§6.5): assess staging. `AssessRun` against an envelope stages an eligibility verdict over
+/// the worker protocol — both the eligible and the pre-screen-rejected paths.
+#[tokio::test]
+async fn assess_staging_returns_eligibility() {
+    let ok_state = state_path("assess-ok");
+    let sup = TrainSupervisor::new(cfg("ready", &ok_state));
+    let elig = sup
+        .assess(b"frozen-envelope-bytes".to_vec())
+        .await
+        .expect("assess (eligible)");
+    assert!(elig.eligible, "the fits-fake reports eligible");
+    assert!(!elig.headroom.is_empty(), "eligibility carries headroom");
+    sup.shutdown().await;
+    let _ = std::fs::remove_file(&ok_state);
+
+    let no_state = state_path("assess-no");
+    let sup = TrainSupervisor::new(cfg("ineligible", &no_state));
+    let elig = sup
+        .assess(b"frozen-envelope-bytes".to_vec())
+        .await
+        .expect("assess (ineligible)");
+    assert!(!elig.eligible, "the ineligible fake declines the run");
+    assert!(
+        !elig.reasons.is_empty(),
+        "an ineligible assessment carries why-not reasons"
+    );
+    sup.shutdown().await;
+    let _ = std::fs::remove_file(&no_state);
+}

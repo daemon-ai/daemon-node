@@ -43,6 +43,9 @@ xxhash-rust = { workspace = true }
 # external crates reach behind `feature = "harness"`), so the coordinator must be available for tests
 # even with the feature off.
 daemon-swarm-coordinator = { workspace = true }
+# The `[swarm]` config-section extraction test (§10.6) layers a figment the way the node config does;
+# `test` adds `figment::Jail` for hermetic env fixtures. Test-only — the struct itself is serde-only.
+figment = { workspace = true, features = ["test"] }
 
 [lints]
 workspace = true

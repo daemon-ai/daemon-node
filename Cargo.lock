@@ -4333,6 +4333,7 @@ dependencies = [
 name = "daemon-swarm-e2e"
 version = "0.0.1"
 dependencies = [
+ "daemon-swarm-net",
  "daemon-swarm-proto",
  "daemon-swarm-run",
  "tokio",
@@ -4386,6 +4387,7 @@ dependencies = [
  "daemon-swarm-coordinator",
  "daemon-swarm-net",
  "daemon-swarm-proto",
+ "figment",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -13432,6 +13434,21 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "swarm-local"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "ciborium",
+ "clap",
+ "daemon-swarm-proto",
+ "daemon-swarm-run",
+ "daemon-train-client",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "symphonia"

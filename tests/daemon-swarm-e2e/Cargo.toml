@@ -10,11 +10,14 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
-# The peer-side round engine + the TEST-ONLY scripted-coordinator harness (feature-gated). This
-# e2e is the P0 milestone test at Merge 2, at which point the scripted coordinator is swapped for
-# the real `daemon-swarm-coordinator` tick loop (`// MERGE-2`).
+# The peer-side round engine + the local-coordinator harness + churn/failure drill machinery
+# (feature-gated). Merge 2 swapped the scripted coordinator for the real `daemon-swarm-coordinator`
+# tick loop; Wave 3 (R3) adds the drills over the same harness.
 daemon-swarm-run = { workspace = true, features = ["harness"] }
 daemon-swarm-proto = { workspace = true }
+# The payload store + `PayloadStore` trait: the desync drill fetches checkpoint + payload bytes for
+# the offline resync (checkpoint + record replay).
+daemon-swarm-net = { workspace = true }
 tokio = { workspace = true }
 
 [lints]
