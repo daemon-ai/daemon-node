@@ -8,7 +8,8 @@
 //! [`LoopbackGossip`] implementation) and one payload plane ([`PayloadStore`] — opaque objects by
 //! `(run, round, peer)` key + content hash, with the filesystem [`FsPayloadStore`] implementation
 //! and its retention window). The [`ReceiptProducer`] turns store availability into signed
-//! `StorageReceipt` evidence (§6.4 I6).
+//! `StorageReceipt` evidence (§6.4 I6). Artifact fetch ([`ArtifactResolver`]) resolves `file://`
+//! (blake3-verified); `r2`/`hf`/`https` are reserved for the egress plane.
 //!
 //! Engine-agnostic; consumed by `daemon-swarm-run` (§10.1). Outbound HTTP must route through
 //! `daemon_egress::EgressClient` (raw `reqwest::Client` is banned workspace-wide by clippy); no HTTP
@@ -19,12 +20,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod artifact;
 pub mod gossip;
 pub mod receipt;
 pub mod seam;
 pub mod store;
 pub mod transport;
 
+pub use artifact::{ArtifactRef, ArtifactResolver, ArtifactScheme};
 pub use gossip::LoopbackGossip;
 pub use receipt::{ReceiptProducer, ReceiptSigner, SignedReceipt, StorageReceipt, UnsignedSigner};
 pub use seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};
