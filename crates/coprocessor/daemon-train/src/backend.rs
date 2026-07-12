@@ -74,6 +74,53 @@ pub trait OpBackend {
         ignore: i64,
     ) -> TensorId;
 
+    // -- Wave-2 NN / shape forward (fake: forward only; HOST-9 autodiff parity is future) -------
+
+    /// `embedding@1` — gather rows `d`-wide of `w` (`[vocab, d]`) by `ids`.
+    fn embedding(&mut self, w: TensorId, ids: &[usize], d: usize) -> TensorId;
+    /// `rmsnorm@1` — RMS norm of `x` (`rows × d`) scaled by `w` (`[d]`).
+    fn rmsnorm(&mut self, x: TensorId, w: TensorId, rows: usize, d: usize, eps: f64) -> TensorId;
+    /// `silu@1`.
+    fn silu(&mut self, x: TensorId) -> TensorId;
+    /// `softmax@1` over a `[outer, dimlen, inner]` view.
+    fn softmax(&mut self, x: TensorId, outer: usize, dimlen: usize, inner: usize) -> TensorId;
+    /// `rope@1` — rotary position embedding over `[rows, hd]` (rows count `seq`-periodic).
+    #[allow(clippy::too_many_arguments)]
+    fn rope(
+        &mut self,
+        x: TensorId,
+        rows: usize,
+        seq: usize,
+        hd: usize,
+        pos_start: usize,
+        theta: f64,
+        interleaved: bool,
+    ) -> TensorId;
+    /// `flash_attn@1` — fused attention over `[bh, s, d]` groups.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attn(
+        &mut self,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        bh: usize,
+        s: usize,
+        d: usize,
+        causal: bool,
+        scale: f64,
+    ) -> TensorId;
+    /// `transpose@1` — swap axes `d0`/`d1` of a row-major tensor with `shape_in`.
+    fn transpose(&mut self, x: TensorId, shape_in: &[usize], d0: usize, d1: usize) -> TensorId;
+    /// `slice@1` — `start..end` along `dim` of a row-major tensor with `shape_in`.
+    fn slice(
+        &mut self,
+        x: TensorId,
+        shape_in: &[usize],
+        dim: usize,
+        start: usize,
+        end: usize,
+    ) -> TensorId;
+
     /// `backward@1` — Wave-1 fake keeps grads as-is (no tape); HOST-9 autodiff parity is Wave 2.
     fn backward(&mut self, _loss: TensorId) {}
     /// `adamw_step@1` — updates `master` in place (fused, ABI §5.7).
@@ -151,6 +198,34 @@ pub trait OpBackend {
     /// # Errors
     /// [`TrapCode::ShapeMismatch`] on unequal lengths.
     fn det_axpy(&mut self, y: TensorId, alpha: f64, x: TensorId) -> Result<(), TrapCode>;
+
+    // -- Wave-2 compression natives (shared det-core reference; lane-agnostic tensors) ----------
+
+    /// `topk_chunk@1` — per-chunk top-k by magnitude → `(values, indices)` tensors.
+    ///
+    /// # Errors
+    /// [`TrapCode::ShapeMismatch`] on a bad chunk/k layout.
+    fn topk_chunk(
+        &mut self,
+        x: TensorId,
+        chunk: usize,
+        k: usize,
+    ) -> Result<(TensorId, TensorId), TrapCode>;
+    /// `absmax_pack@1` — per-chunk absmax codebook quant to a packed `U8` tensor (§6.6).
+    ///
+    /// # Errors
+    /// [`TrapCode::BadEnum`] for a bad bit width; [`TrapCode::ShapeMismatch`] for a bad layout.
+    fn absmax_pack(&mut self, x: TensorId, chunk: usize, bits: u32) -> Result<TensorId, TrapCode>;
+    /// `dct2@1` — orthonormal 2-D DCT over `tile²` blocks.
+    ///
+    /// # Errors
+    /// [`TrapCode::ShapeMismatch`] on a bad tile layout.
+    fn dct2(&mut self, x: TensorId, tile: usize) -> Result<TensorId, TrapCode>;
+    /// `idct2@1` / `det_idct2@1` — the inverse 2-D DCT.
+    ///
+    /// # Errors
+    /// [`TrapCode::ShapeMismatch`] on a bad tile layout.
+    fn idct2(&mut self, x: TensorId, tile: usize) -> Result<TensorId, TrapCode>;
 }
 
 /// The Wave-1 CPU fake: a `Vec<f32>` tensor arena.
@@ -300,6 +375,155 @@ impl OpBackend for CpuBackend {
         self.insert(vec![mean])
     }
 
+    fn embedding(&mut self, w: TensorId, ids: &[usize], d: usize) -> TensorId {
+        let wv = self.get(w);
+        let mut out = Vec::with_capacity(ids.len() * d);
+        for &id in ids {
+            out.extend_from_slice(&wv[id * d..id * d + d]);
+        }
+        self.insert(out)
+    }
+    fn rmsnorm(&mut self, x: TensorId, w: TensorId, rows: usize, d: usize, eps: f64) -> TensorId {
+        let xv = self.get(x);
+        let wv = self.get(w);
+        let eps = eps as f32;
+        let mut out = vec![0.0_f32; rows * d];
+        for r in 0..rows {
+            let row = &xv[r * d..(r + 1) * d];
+            let ms = row.iter().map(|&e| e * e).sum::<f32>() / d as f32;
+            let inv = 1.0 / (ms + eps).sqrt();
+            for i in 0..d {
+                out[r * d + i] = row[i] * inv * wv[i];
+            }
+        }
+        self.insert(out)
+    }
+    fn silu(&mut self, x: TensorId) -> TensorId {
+        let out: Vec<f32> = self
+            .get(x)
+            .iter()
+            .map(|&v| v / (1.0 + (-v).exp()))
+            .collect();
+        self.insert(out)
+    }
+    fn softmax(&mut self, x: TensorId, outer: usize, dimlen: usize, inner: usize) -> TensorId {
+        let xv = self.get(x);
+        let mut out = vec![0.0_f32; xv.len()];
+        for o in 0..outer {
+            for i in 0..inner {
+                let base = o * dimlen * inner + i;
+                let mut max = f32::NEG_INFINITY;
+                for t in 0..dimlen {
+                    max = max.max(xv[base + t * inner]);
+                }
+                let mut denom = 0.0_f32;
+                for t in 0..dimlen {
+                    let e = (xv[base + t * inner] - max).exp();
+                    out[base + t * inner] = e;
+                    denom += e;
+                }
+                for t in 0..dimlen {
+                    out[base + t * inner] /= denom;
+                }
+            }
+        }
+        self.insert(out)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn rope(
+        &mut self,
+        x: TensorId,
+        rows: usize,
+        seq: usize,
+        hd: usize,
+        pos_start: usize,
+        theta: f64,
+        interleaved: bool,
+    ) -> TensorId {
+        let xv = self.get(x).to_vec();
+        let theta = theta as f32;
+        let mut out = xv.clone();
+        for r in 0..rows {
+            let pos = (pos_start + (r % seq)) as f32;
+            for j in 0..hd / 2 {
+                let freq = 1.0 / theta.powf(2.0 * j as f32 / hd as f32);
+                let angle = pos * freq;
+                let (c, s) = (angle.cos(), angle.sin());
+                let (ia, ib) = if interleaved {
+                    (2 * j, 2 * j + 1)
+                } else {
+                    (j, j + hd / 2)
+                };
+                let (a, b) = (xv[r * hd + ia], xv[r * hd + ib]);
+                out[r * hd + ia] = a * c - b * s;
+                out[r * hd + ib] = a * s + b * c;
+            }
+        }
+        self.insert(out)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attn(
+        &mut self,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        bh: usize,
+        s: usize,
+        d: usize,
+        causal: bool,
+        scale: f64,
+    ) -> TensorId {
+        let qv = self.get(q).to_vec();
+        let kv = self.get(k).to_vec();
+        let vv = self.get(v).to_vec();
+        let scale = scale as f32;
+        let mut out = vec![0.0_f32; qv.len()];
+        for g in 0..bh {
+            let base = g * s * d;
+            for i in 0..s {
+                let jmax = if causal { i + 1 } else { s };
+                let mut scores = vec![0.0_f32; jmax];
+                let mut maxv = f32::NEG_INFINITY;
+                for (j, sc) in scores.iter_mut().enumerate() {
+                    let mut dot = 0.0_f32;
+                    for e in 0..d {
+                        dot += qv[base + i * d + e] * kv[base + j * d + e];
+                    }
+                    *sc = dot * scale;
+                    maxv = maxv.max(*sc);
+                }
+                let mut denom = 0.0_f32;
+                for sc in &mut scores {
+                    *sc = (*sc - maxv).exp();
+                    denom += *sc;
+                }
+                for e in 0..d {
+                    let mut acc = 0.0_f32;
+                    for (j, &p) in scores.iter().enumerate() {
+                        acc += (p / denom) * vv[base + j * d + e];
+                    }
+                    out[base + i * d + e] = acc;
+                }
+            }
+        }
+        self.insert(out)
+    }
+    fn transpose(&mut self, x: TensorId, shape_in: &[usize], d0: usize, d1: usize) -> TensorId {
+        let out = permute_axes(self.get(x), shape_in, d0, d1);
+        self.insert(out)
+    }
+    fn slice(
+        &mut self,
+        x: TensorId,
+        shape_in: &[usize],
+        dim: usize,
+        start: usize,
+        end: usize,
+    ) -> TensorId {
+        let out = slice_dim(self.get(x), shape_in, dim, start, end);
+        self.insert(out)
+    }
+
     fn adamw_step(
         &mut self,
         master: TensorId,
@@ -402,6 +626,92 @@ impl OpBackend for CpuBackend {
         self.write(y, &yv);
         Ok(())
     }
+
+    fn topk_chunk(
+        &mut self,
+        x: TensorId,
+        chunk: usize,
+        k: usize,
+    ) -> Result<(TensorId, TensorId), TrapCode> {
+        let (vals, idx) = det_core::topk_chunk(self.get(x), chunk, k).map_err(det_trap)?;
+        let ivals: Vec<f32> = idx.iter().map(|&i| i as f32).collect();
+        let vh = self.insert(vals);
+        let ih = self.insert(ivals);
+        Ok((vh, ih))
+    }
+    fn absmax_pack(&mut self, x: TensorId, chunk: usize, bits: u32) -> Result<TensorId, TrapCode> {
+        let packed = det_core::absmax_pack(self.get(x), chunk, bits).map_err(det_trap)?;
+        let vals: Vec<f32> = packed.iter().map(|&b| f32::from(b)).collect();
+        Ok(self.insert(vals))
+    }
+    fn dct2(&mut self, x: TensorId, tile: usize) -> Result<TensorId, TrapCode> {
+        let out = det_core::dct2(self.get(x), tile).map_err(det_trap)?;
+        Ok(self.insert(out))
+    }
+    fn idct2(&mut self, x: TensorId, tile: usize) -> Result<TensorId, TrapCode> {
+        let out = det_core::idct2(self.get(x), tile).map_err(det_trap)?;
+        Ok(self.insert(out))
+    }
+}
+
+/// Swap axes `d0`/`d1` of a row-major tensor with `shape_in` (shared by transpose forward).
+fn permute_axes(data: &[f32], shape_in: &[usize], d0: usize, d1: usize) -> Vec<f32> {
+    let mut shape_out = shape_in.to_vec();
+    shape_out.swap(d0, d1);
+    let sin = row_major_strides(shape_in);
+    let sout = row_major_strides(&shape_out);
+    let rank = shape_in.len();
+    let mut out = vec![0.0_f32; data.len()];
+    let mut coord = vec![0usize; rank];
+    for (flat, &val) in data.iter().enumerate() {
+        let mut rem = flat;
+        for r in 0..rank {
+            coord[r] = rem / sin[r];
+            rem %= sin[r];
+        }
+        coord.swap(d0, d1);
+        let mut out_flat = 0usize;
+        for r in 0..rank {
+            out_flat += coord[r] * sout[r];
+        }
+        out[out_flat] = val;
+        coord.swap(d0, d1);
+    }
+    out
+}
+
+/// Copy the `start..end` sub-range along `dim` of a row-major tensor with `shape_in`.
+fn slice_dim(data: &[f32], shape_in: &[usize], dim: usize, start: usize, end: usize) -> Vec<f32> {
+    let mut shape_out = shape_in.to_vec();
+    shape_out[dim] = end - start;
+    let sin = row_major_strides(shape_in);
+    let sout = row_major_strides(&shape_out);
+    let rank = shape_in.len();
+    let n: usize = shape_out.iter().product();
+    let mut out = vec![0.0_f32; n];
+    let mut coord = vec![0usize; rank];
+    for (flat, o) in out.iter_mut().enumerate() {
+        let mut rem = flat;
+        for r in 0..rank {
+            coord[r] = rem / sout[r];
+            rem %= sout[r];
+        }
+        let mut in_flat = 0usize;
+        for r in 0..rank {
+            let c = if r == dim { coord[r] + start } else { coord[r] };
+            in_flat += c * sin[r];
+        }
+        *o = data[in_flat];
+    }
+    out
+}
+
+fn row_major_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for i in (0..shape.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    strides
 }
 
 fn det_trap(e: det_core::DetError) -> TrapCode {
@@ -453,5 +763,50 @@ mod tests {
         b.free(x);
         let y = b.create(vec![2.0]);
         assert_eq!(x, y, "freed slot is reused");
+    }
+
+    #[test]
+    fn embedding_gathers_rows() {
+        let mut b = CpuBackend::new();
+        let w = b.create(vec![0.0, 0.1, 1.0, 1.1, 2.0, 2.1]); // [3,2]
+        let out = b.embedding(w, &[2, 0], 2);
+        assert_eq!(b.view(out), &[2.0, 2.1, 0.0, 0.1]);
+    }
+
+    #[test]
+    fn rmsnorm_normalizes() {
+        let mut b = CpuBackend::new();
+        let x = b.create(vec![3.0, 4.0]); // 1 row, d=2
+        let w = b.create(vec![1.0, 1.0]);
+        let out = b.rmsnorm(x, w, 1, 2, 0.0);
+        // ms = (9+16)/2 = 12.5; inv = 1/sqrt(12.5); y = x*inv.
+        let inv = 1.0 / 12.5_f32.sqrt();
+        assert!((b.view(out)[0] - 3.0 * inv).abs() < 1e-6);
+        assert!((b.view(out)[1] - 4.0 * inv).abs() < 1e-6);
+    }
+
+    #[test]
+    fn flash_attn_causal_first_row_is_first_value() {
+        let mut b = CpuBackend::new();
+        // [b=1,h=1,s=2,d=1]; causal ⇒ row 0 only attends to key 0 ⇒ out[0] = v[0].
+        let q = b.create(vec![1.0, 1.0]);
+        let k = b.create(vec![1.0, 1.0]);
+        let v = b.create(vec![5.0, 9.0]);
+        let out = b.flash_attn(q, k, v, 1, 2, 1, true, 1.0);
+        assert_eq!(b.view(out)[0], 5.0);
+    }
+
+    #[test]
+    fn compression_ops_delegate_to_det_core() {
+        let mut b = CpuBackend::new();
+        let x = b.create(vec![0.1, -0.9, 0.2, 1.0]);
+        let (vals, idx) = b.topk_chunk(x, 4, 2).unwrap();
+        assert_eq!(b.view(vals), &[1.0, -0.9]);
+        assert_eq!(b.view(idx), &[3.0, 1.0]);
+        let cst = b.create(vec![2.0; 16]);
+        let y = b.dct2(cst, 4).unwrap();
+        assert!((b.view(y)[0] - 8.0).abs() < 1e-4);
+        let back = b.idct2(y, 4).unwrap();
+        assert!((b.view(back)[0] - 2.0).abs() < 1e-4);
     }
 }

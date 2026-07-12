@@ -4731,6 +4731,7 @@ dependencies = [
  "burn",
  "ciborium",
  "daemon-swarm-proto",
+ "daemon-train-sdk",
  "det-core",
  "serde",
  "thiserror 2.0.18",

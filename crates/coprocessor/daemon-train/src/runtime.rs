@@ -144,6 +144,9 @@ struct HostState {
     op_budget: u64,
     handle_budget: usize,
     trap: Option<Trap>,
+    /// Every import charged over this instance's life (meta-mode `ops_used`, ABI §6.4). Unlike
+    /// `op_calls` (reset per entry point), this accumulates across the whole probe.
+    ops_used: std::collections::BTreeSet<&'static str>,
 }
 
 impl HostState {
@@ -168,11 +171,13 @@ impl HostState {
             op_budget: cfg.op_budget,
             handle_budget: cfg.max_step_handles,
             trap: None,
+            ops_used: std::collections::BTreeSet::new(),
         }
     }
 
     fn charge_op(&mut self, import: &'static str, phase: Phase) -> Result<(), Trap> {
         self.op_calls += 1;
+        self.ops_used.insert(import);
         if self.op_calls > self.op_budget {
             return Err(Trap::new(
                 TrapCode::BudgetOps,
@@ -730,6 +735,143 @@ impl Instance {
     #[must_use]
     pub fn metrics(&self) -> Vec<(String, f32)> {
         self.store.data().metrics.clone()
+    }
+
+    /// Run the full lifecycle once in `meta` mode and produce the `MetaReport` (ABI §6.4, HOST-8):
+    /// `da_build` → one `da_step` at the representative `(batch, seq)` shape → `da_inner_update` →
+    /// `da_make_update` → `da_ingest_updates` **twice** (1 and 2 staged) to fit the linear per-peer
+    /// ingest cost. This build measures a real execute pass on the CPU backend (see `meta.rs`).
+    ///
+    /// # Errors
+    ///
+    /// [`TrainError::Trap`]/[`TrainError::Sandbox`] on any lifecycle failure.
+    pub fn meta(
+        &mut self,
+        config: &[u8],
+        batch: u32,
+        seq: u32,
+    ) -> Result<crate::MetaReport, TrainError> {
+        let abi = {
+            let f = self
+                .instance
+                .get_typed_func::<(), u32>(&mut self.store, "da_abi")
+                .map_err(|_| Trap::bare(TrapCode::BadModule, "missing da_abi"))?;
+            f.call(&mut self.store, ())
+                .map_err(|e| TrainError::Sandbox(e.to_string()))?
+        };
+
+        self.build(config)?;
+        let op_build = self.store.data().op_calls;
+
+        let b = self.register_batch(vec![0u32; (batch * seq) as usize], batch, seq);
+        self.step(b, 0, 0, 1, batch)?;
+        let op_step = self.store.data().op_calls;
+
+        self.inner_update(0)?;
+        let op_inner = self.store.data().op_calls;
+
+        let container = self.make_update(0)?;
+        let op_make = self.store.data().op_calls;
+        let payload_bytes_est = self.container_bytes(container);
+
+        self.stage(container);
+        self.ingest(0, 1)?;
+        let op_ingest1 = self.store.data().op_calls;
+        self.stage(container);
+        self.ingest(0, 2)?;
+        let op_ingest2 = self.store.data().op_calls;
+        let ingest_op_calls_per_peer = op_ingest2.saturating_sub(op_ingest1);
+
+        let d = self.store.data();
+        let params: Vec<(String, Vec<u32>, u32)> = d
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), p.shape.clone(), p.dtype))
+            .collect();
+        let persistent: Vec<(String, Vec<u32>, u32, u32)> = d
+            .persistents
+            .iter()
+            .map(|s| (s.name.clone(), s.shape.clone(), s.dtype, s.class))
+            .collect();
+        let det_persistent: Vec<(String, Vec<u32>, u32)> = d
+            .det_persistents
+            .iter()
+            .map(|s| (s.name.clone(), s.shape.clone(), s.class))
+            .collect();
+
+        let param_bytes: u64 = d
+            .params
+            .iter()
+            .map(|p| (HostState::numel(&p.shape) * dtype_size(p.dtype)) as u64)
+            .sum();
+        let master_bytes: u64 = d
+            .params
+            .iter()
+            .map(|p| (HostState::numel(&p.shape) * 4) as u64)
+            .sum();
+        let grad_bytes = master_bytes;
+        let max_master: u64 = d
+            .params
+            .iter()
+            .map(|p| (HostState::numel(&p.shape) * 4) as u64)
+            .max()
+            .unwrap_or(0);
+
+        let mut op_calls = std::collections::BTreeMap::new();
+        op_calls.insert("da_build".to_string(), op_build);
+        op_calls.insert("da_step".to_string(), op_step);
+        op_calls.insert("da_inner_update".to_string(), op_inner);
+        op_calls.insert("da_make_update".to_string(), op_make);
+        op_calls.insert("da_ingest_updates".to_string(), op_ingest1);
+
+        let ops_used: Vec<String> = d.ops_used.iter().map(|s| (*s).to_string()).collect();
+
+        Ok(crate::MetaReport {
+            abi,
+            params,
+            persistent,
+            det_persistent,
+            param_bytes,
+            master_bytes,
+            grad_bytes,
+            // Coarse activation proxy (shape-only propagation is a later refinement).
+            act_bytes_est: master_bytes,
+            payload_bytes_est,
+            // Streaming ingest peak ≈ ~2 dense tensors + staged payloads (§5.9).
+            ingest_bytes_est: payload_bytes_est.saturating_mul(2) + 2 * max_master,
+            host_ram_bytes_est: master_bytes * 2 + payload_bytes_est.saturating_mul(2),
+            op_calls,
+            ingest_op_calls_per_peer,
+            ops_used,
+            value_dependent: false,
+        })
+    }
+
+    fn container_bytes(&self, container: u64) -> u64 {
+        if let Some(HandleClass::Update) = handle::classify(container) {
+            let idx = (handle::stable_index(container) - 1) as usize;
+            if let Some(c) = self.store.data().containers.get(idx) {
+                return c
+                    .sections
+                    .iter()
+                    .map(|s| match s {
+                        Section::Bytes(b) => b.len() as u64,
+                        Section::Tensor { data, .. } => (data.len() * 4) as u64,
+                    })
+                    .sum();
+            }
+        }
+        0
+    }
+}
+
+/// Byte size of a stored element of `dtype` (ABI §3.2).
+fn dtype_size(dtype: u32) -> usize {
+    match dtype {
+        3 => 8,     // I64
+        1 | 2 => 2, // BF16 / F16
+        6 | 7 => 1, // U8 / Bool
+        _ => 4,     // F32 / I32 / U32
     }
 }
 
@@ -1532,6 +1674,264 @@ impl HostState {
         Ok(())
     }
 
+    // -- Wave-2 NN / shape (native lane) --------------------------------------------------------
+
+    fn op_embedding(&mut self, w: u64, ids: u64) -> Result<u64, Trap> {
+        let (wt, wsh) = self.native("embedding@1", w)?;
+        if wsh.len() != 2 {
+            return Err(Trap::new(
+                TrapCode::ShapeMismatch,
+                "embedding@1",
+                self.phase,
+                "weight rank",
+            ));
+        }
+        let d = wsh[1] as usize;
+        let (idst, idsh) = self.native("embedding@1", ids)?;
+        let id_usize: Vec<usize> = self
+            .backend
+            .view(idst)
+            .iter()
+            .map(|&f| f as usize)
+            .collect();
+        let out = self.backend.embedding(wt, &id_usize, d);
+        let mut shape = idsh;
+        shape.push(wsh[1]);
+        self.alloc_native(out, shape)
+    }
+
+    fn op_rmsnorm(&mut self, x: u64, w: u64, eps: f64) -> Result<u64, Trap> {
+        let (xt, xsh) = self.native("rmsnorm@1", x)?;
+        let (wt, _) = self.native("rmsnorm@1", w)?;
+        let d = *xsh
+            .last()
+            .ok_or_else(|| Trap::new(TrapCode::ShapeMismatch, "rmsnorm@1", self.phase, "rank"))?
+            as usize;
+        let rows = Self::numel(&xsh) / d;
+        let out = self.backend.rmsnorm(xt, wt, rows, d, eps);
+        self.alloc_native(out, xsh)
+    }
+
+    fn op_silu(&mut self, x: u64) -> Result<u64, Trap> {
+        let (xt, xsh) = self.native("silu@1", x)?;
+        let out = self.backend.silu(xt);
+        self.alloc_native(out, xsh)
+    }
+
+    fn op_softmax(&mut self, x: u64, dim: u32) -> Result<u64, Trap> {
+        let (xt, xsh) = self.native("softmax@1", x)?;
+        let dim = dim as usize;
+        if dim >= xsh.len() {
+            return Err(Trap::new(
+                TrapCode::ShapeMismatch,
+                "softmax@1",
+                self.phase,
+                "dim",
+            ));
+        }
+        let dimlen = xsh[dim] as usize;
+        let inner: usize = xsh[dim + 1..].iter().map(|&d| d as usize).product();
+        let outer: usize = xsh[..dim].iter().map(|&d| d as usize).product();
+        let out = self.backend.softmax(xt, outer, dimlen, inner);
+        self.alloc_native(out, xsh)
+    }
+
+    fn op_rope(
+        &mut self,
+        x: u64,
+        pos_start: u32,
+        theta: f64,
+        interleaved: u32,
+    ) -> Result<u64, Trap> {
+        let (xt, xsh) = self.native("rope@1", x)?;
+        if xsh.len() < 2 {
+            return Err(Trap::new(
+                TrapCode::ShapeMismatch,
+                "rope@1",
+                self.phase,
+                "rank",
+            ));
+        }
+        let hd = xsh[xsh.len() - 1] as usize;
+        let seq = xsh[xsh.len() - 2] as usize;
+        let rows = Self::numel(&xsh) / hd;
+        let out = self.backend.rope(
+            xt,
+            rows,
+            seq,
+            hd,
+            pos_start as usize,
+            theta,
+            interleaved != 0,
+        );
+        self.alloc_native(out, xsh)
+    }
+
+    fn op_flash_attn(
+        &mut self,
+        q: u64,
+        k: u64,
+        v: u64,
+        causal: u32,
+        scale: f64,
+    ) -> Result<u64, Trap> {
+        let (qt, qsh) = self.native("flash_attn@1", q)?;
+        let (kt, _) = self.native("flash_attn@1", k)?;
+        let (vt, _) = self.native("flash_attn@1", v)?;
+        if qsh.len() != 4 {
+            return Err(Trap::new(
+                TrapCode::ShapeMismatch,
+                "flash_attn@1",
+                self.phase,
+                "expects [b,h,s,d]",
+            ));
+        }
+        let (b, h, s, d) = (
+            qsh[0] as usize,
+            qsh[1] as usize,
+            qsh[2] as usize,
+            qsh[3] as usize,
+        );
+        let out = self
+            .backend
+            .flash_attn(qt, kt, vt, b * h, s, d, causal != 0, scale);
+        self.alloc_native(out, qsh)
+    }
+
+    fn op_reshape(&mut self, x: u64, dims: &[u32]) -> Result<u64, Trap> {
+        let (xt, xsh) = self.native("reshape@1", x)?;
+        if Self::numel(&xsh) != Self::numel(dims) {
+            return Err(Trap::new(
+                TrapCode::ShapeMismatch,
+                "reshape@1",
+                self.phase,
+                "numel",
+            ));
+        }
+        let out = self.backend.clone_tensor(xt);
+        self.alloc_native(out, dims.to_vec())
+    }
+
+    fn op_transpose(&mut self, x: u64, d0: u32, d1: u32) -> Result<u64, Trap> {
+        let (xt, xsh) = self.native("transpose@1", x)?;
+        let (d0, d1) = (d0 as usize, d1 as usize);
+        if d0 >= xsh.len() || d1 >= xsh.len() {
+            return Err(Trap::new(
+                TrapCode::ShapeMismatch,
+                "transpose@1",
+                self.phase,
+                "axis",
+            ));
+        }
+        let shape_in: Vec<usize> = xsh.iter().map(|&d| d as usize).collect();
+        let out = self.backend.transpose(xt, &shape_in, d0, d1);
+        let mut shape = xsh;
+        shape.swap(d0, d1);
+        self.alloc_native(out, shape)
+    }
+
+    fn op_slice(&mut self, x: u64, dim: u32, start: u32, end: u32) -> Result<u64, Trap> {
+        let (xt, xsh) = self.native("slice@1", x)?;
+        let (dim, start, end) = (dim as usize, start as usize, end as usize);
+        if dim >= xsh.len() || start > end || end > xsh[dim] as usize {
+            return Err(Trap::new(
+                TrapCode::ShapeMismatch,
+                "slice@1",
+                self.phase,
+                "range",
+            ));
+        }
+        let shape_in: Vec<usize> = xsh.iter().map(|&d| d as usize).collect();
+        let out = self.backend.slice(xt, &shape_in, dim, start, end);
+        let mut shape = xsh;
+        shape[dim] = (end - start) as u32;
+        self.alloc_native(out, shape)
+    }
+
+    // -- Wave-2 compression natives -------------------------------------------------------------
+
+    /// Returns `(values_handle, indices_handle)`; the caller writes the indices to the guest.
+    fn op_topk_chunk(&mut self, x: u64, chunk: u32, k: u32) -> Result<(u64, u64), Trap> {
+        let (xt, xsh) = self.native("topk_chunk@1", x)?;
+        let numel = Self::numel(&xsh);
+        let n_chunks = if chunk == 0 {
+            0
+        } else {
+            numel / chunk as usize
+        };
+        let (vt, it) = self
+            .backend
+            .topk_chunk(xt, chunk as usize, k as usize)
+            .map_err(|c| Trap::new(c, "topk_chunk@1", self.phase, "layout"))?;
+        let shape = vec![n_chunks as u32, k];
+        let vh = self.alloc_native(vt, shape.clone())?;
+        let ih = self.alloc_native(it, shape)?;
+        Ok((vh, ih))
+    }
+
+    fn op_chunk_scatter(
+        &mut self,
+        vals: u64,
+        idx: u64,
+        chunk: u32,
+        dims: &[u32],
+    ) -> Result<u64, Trap> {
+        let (valst, _) = self.native("chunk_scatter@1", vals)?;
+        let (idxt, _) = self.native("chunk_scatter@1", idx)?;
+        let out = self
+            .backend
+            .det_chunk_scatter(valst, idxt, chunk as usize, Self::numel(dims))
+            .map_err(|c| Trap::new(c, "chunk_scatter@1", self.phase, "layout"))?;
+        self.alloc_native(out, dims.to_vec())
+    }
+
+    fn op_absmax_pack(&mut self, x: u64, chunk: u32, bits: u32) -> Result<u64, Trap> {
+        let (xt, _) = self.native("absmax_pack@1", x)?;
+        let out = self
+            .backend
+            .absmax_pack(xt, chunk as usize, bits)
+            .map_err(|c| Trap::new(c, "absmax_pack@1", self.phase, "layout"))?;
+        let n = self.backend.view(out).len() as u32;
+        self.alloc_native(out, vec![n])
+    }
+
+    fn op_absmax_unpack(&mut self, packed: u64, chunk: u32, bits: u32) -> Result<u64, Trap> {
+        let (pt, _) = self.native("absmax_unpack@1", packed)?;
+        let out = self
+            .backend
+            .det_absmax_unpack(pt, chunk as usize, bits)
+            .map_err(|c| Trap::new(c, "absmax_unpack@1", self.phase, "layout"))?;
+        let n = self.backend.view(out).len() as u32;
+        self.alloc_native(out, vec![n])
+    }
+
+    fn op_dct2(&mut self, x: u64, tile: u32, import: &'static str) -> Result<u64, Trap> {
+        let (xt, xsh) = self.native(import, x)?;
+        let out = self
+            .backend
+            .dct2(xt, tile as usize)
+            .map_err(|c| Trap::new(c, import, self.phase, "tile"))?;
+        self.alloc_native(out, xsh)
+    }
+
+    fn op_idct2_native(&mut self, x: u64, tile: u32) -> Result<u64, Trap> {
+        let (xt, xsh) = self.native("idct2@1", x)?;
+        let out = self
+            .backend
+            .idct2(xt, tile as usize)
+            .map_err(|c| Trap::new(c, "idct2@1", self.phase, "tile"))?;
+        self.alloc_native(out, xsh)
+    }
+
+    fn op_det_idct2(&mut self, x: u64, tile: u32) -> Result<u64, Trap> {
+        let (xt, xsh) = self.det("det_idct2@1", x)?;
+        let out = self
+            .backend
+            .idct2(xt, tile as usize)
+            .map_err(|c| Trap::new(c, "det_idct2@1", self.phase, "tile"))?;
+        self.alloc_det(out, xsh)
+    }
+
     fn op_drop(&mut self, h: u64) -> Result<(), Trap> {
         match handle::classify(h) {
             Some(HandleClass::Step(Lane::Native)) => {
@@ -1865,6 +2265,109 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
     import!("det_axpy_param@1", |c, p: u64, x: u64, alpha: f64| -> () {
         enter(&mut c, "det_axpy_param@1")?;
         c.data_mut().op_det_axpy_param(p, x, alpha)
+    });
+    // -- Wave-2 additions -----------------------------------------------------------------------
+    import!("embedding@1", |c, w: u64, ids: u64| -> u64 {
+        enter(&mut c, "embedding@1")?;
+        c.data_mut().op_embedding(w, ids)
+    });
+    import!("rmsnorm@1", |c, x: u64, w: u64, eps: f64| -> u64 {
+        enter(&mut c, "rmsnorm@1")?;
+        c.data_mut().op_rmsnorm(x, w, eps)
+    });
+    import!("softmax@1", |c, x: u64, dim: u32| -> u64 {
+        enter(&mut c, "softmax@1")?;
+        c.data_mut().op_softmax(x, dim)
+    });
+    import!("silu@1", |c, x: u64| -> u64 {
+        enter(&mut c, "silu@1")?;
+        c.data_mut().op_silu(x)
+    });
+    import!("rope@1", |c,
+                       x: u64,
+                       pos: u32,
+                       theta: f64,
+                       il: u32|
+     -> u64 {
+        enter(&mut c, "rope@1")?;
+        c.data_mut().op_rope(x, pos, theta, il)
+    });
+    import!("flash_attn@1", |c,
+                             q: u64,
+                             k: u64,
+                             v: u64,
+                             causal: u32,
+                             scale: f64|
+     -> u64 {
+        enter(&mut c, "flash_attn@1")?;
+        c.data_mut().op_flash_attn(q, k, v, causal, scale)
+    });
+    import!("reshape@1", |c, x: u64, dp: u32, dr: u32| -> u64 {
+        enter(&mut c, "reshape@1")?;
+        let dims = read_dims(&mut c, dp, dr)?;
+        c.data_mut().op_reshape(x, &dims)
+    });
+    import!("transpose@1", |c, x: u64, d0: u32, d1: u32| -> u64 {
+        enter(&mut c, "transpose@1")?;
+        c.data_mut().op_transpose(x, d0, d1)
+    });
+    import!("slice@1", |c,
+                        x: u64,
+                        dim: u32,
+                        start: u32,
+                        end: u32|
+     -> u64 {
+        enter(&mut c, "slice@1")?;
+        c.data_mut().op_slice(x, dim, start, end)
+    });
+    import!("topk_chunk@1", |c,
+                             x: u64,
+                             chunk: u32,
+                             k: u32,
+                             out_idx: u32|
+     -> u64 {
+        enter(&mut c, "topk_chunk@1")?;
+        let (vh, ih) = c.data_mut().op_topk_chunk(x, chunk, k)?;
+        let mem = mem_of(&mut c)?;
+        mem.write(&mut c, out_idx as usize, &ih.to_le_bytes())
+            .map_err(|_| Trap::bare(TrapCode::MemOob, "topk_chunk out_idx"))?;
+        Ok(vh)
+    });
+    import!("chunk_scatter@1", |c,
+                                vals: u64,
+                                idx: u64,
+                                chunk: u32,
+                                dp: u32,
+                                dr: u32|
+     -> u64 {
+        enter(&mut c, "chunk_scatter@1")?;
+        let dims = read_dims(&mut c, dp, dr)?;
+        c.data_mut().op_chunk_scatter(vals, idx, chunk, &dims)
+    });
+    import!("absmax_pack@1", |c, x: u64, chunk: u32, bits: u32| -> u64 {
+        enter(&mut c, "absmax_pack@1")?;
+        c.data_mut().op_absmax_pack(x, chunk, bits)
+    });
+    import!("absmax_unpack@1", |c,
+                                packed: u64,
+                                chunk: u32,
+                                bits: u32,
+                                _dt: u32|
+     -> u64 {
+        enter(&mut c, "absmax_unpack@1")?;
+        c.data_mut().op_absmax_unpack(packed, chunk, bits)
+    });
+    import!("dct2@1", |c, x: u64, tile: u32| -> u64 {
+        enter(&mut c, "dct2@1")?;
+        c.data_mut().op_dct2(x, tile, "dct2@1")
+    });
+    import!("idct2@1", |c, x: u64, tile: u32| -> u64 {
+        enter(&mut c, "idct2@1")?;
+        c.data_mut().op_idct2_native(x, tile)
+    });
+    import!("det_idct2@1", |c, x: u64, tile: u32| -> u64 {
+        enter(&mut c, "det_idct2@1")?;
+        c.data_mut().op_det_idct2(x, tile)
     });
     Ok(())
 }

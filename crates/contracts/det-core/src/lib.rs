@@ -59,6 +59,13 @@ pub enum DetError {
     },
     /// An aggregation was handed an empty operand list (no shape to infer).
     Empty,
+    /// A per-chunk top-k requested more entries than the chunk holds.
+    KTooLarge {
+        /// The requested count.
+        k: usize,
+        /// The chunk size it exceeded.
+        chunk: usize,
+    },
 }
 
 impl fmt::Display for DetError {
@@ -80,6 +87,9 @@ impl fmt::Display for DetError {
                 write!(f, "unsupported absmax bit width {bits} (expected 1/2/4/8)")
             }
             Self::Empty => write!(f, "empty operand list: no shape to infer"),
+            Self::KTooLarge { k, chunk } => {
+                write!(f, "top-k k={k} exceeds chunk size {chunk}")
+            }
         }
     }
 }
@@ -395,6 +405,268 @@ fn read_bits_lsb(bytes: &[u8], bit_pos: usize, bits: u32) -> u32 {
     v
 }
 
+/// Encode a blockwise fp32 payload to the absmax-packed `U8` layout (ABI `absmax_pack@1`, §6.6).
+///
+/// The exact inverse-direction partner of [`det_absmax_unpack`]: `x` is viewed flattened as
+/// `[numel/chunk, chunk]`; for each chunk the per-chunk `absmax = max|value|` is stored as a
+/// little-endian `f16` codebook scalar, then each value is quantized to the nearest symmetric code
+/// `code = round((value/absmax + 1)/2 · (2^bits − 1))` (clamped to `[0, 2^bits − 1]`), packed
+/// LSB-first, chunk-major, zero-padded to a byte boundary. A zero-absmax chunk encodes the midpoint
+/// code (which [`det_absmax_unpack`] decodes back to `0`). `bits ∈ {1,2,4,8}`.
+///
+/// The pack→unpack round-trip is exact up to the codebook quantization; re-packing a decoded payload
+/// is a fixed point (idempotent), which is what makes it a byte-stable wire form.
+///
+/// # Errors
+///
+/// [`DetError::UnsupportedBits`] for a width other than 1/2/4/8; [`DetError::NotDivisible`] if
+/// `x.len()` is not a multiple of `chunk` (or `chunk == 0`).
+pub fn absmax_pack(x: &[f32], chunk: usize, bits: u32) -> Result<Vec<u8>, DetError> {
+    if !matches!(bits, 1 | 2 | 4 | 8) {
+        return Err(DetError::UnsupportedBits { bits });
+    }
+    if chunk == 0 || !x.len().is_multiple_of(chunk) {
+        return Err(DetError::NotDivisible {
+            len: x.len(),
+            divisor: chunk,
+        });
+    }
+    let code_bytes = (chunk * bits as usize).div_ceil(8);
+    let stride = 2 + code_bytes;
+    let n_chunks = x.len() / chunk;
+    let max_code = (1u32 << bits) - 1;
+    let max_code_f = max_code as f32;
+    let mut out = vec![0u8; n_chunks * stride];
+    for c in 0..n_chunks {
+        let block = &x[c * chunk..(c + 1) * chunk];
+        let absmax = block.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
+        // Store the f16 absmax, then read it back so codes quantize against the *stored* scale (the
+        // decoder only ever sees the f16 value) — keeps pack∘unpack∘pack a fixed point.
+        let absmax_h = f32_to_f16_bits(absmax);
+        let off = c * stride;
+        out[off..off + 2].copy_from_slice(&absmax_h.to_le_bytes());
+        let absmax_stored = f16_bits_to_f32(absmax_h);
+        let codes = &mut out[off + 2..off + 2 + code_bytes];
+        for (e, &v) in block.iter().enumerate() {
+            let code = if absmax_stored == 0.0 {
+                // Midpoint: decodes to 0 for even max_code; for odd bit widths the nearest even
+                // split rounds to the lower-middle code, still the smallest-magnitude level.
+                max_code / 2
+            } else {
+                let level = v / absmax_stored; // in [-1, 1]
+                let q = ((level + 1.0) * 0.5 * max_code_f).round();
+                (q.clamp(0.0, max_code_f)) as u32
+            };
+            write_bits_lsb(codes, e * bits as usize, bits, code);
+        }
+    }
+    Ok(out)
+}
+
+/// Per-chunk top-k by magnitude (ABI `topk_chunk@1`, §5.8).
+///
+/// `x` is viewed flattened as `[numel/chunk, chunk]`; each chunk contributes its `k` largest-|value|
+/// entries. Selection order within a chunk is descending magnitude, ties broken by ascending index
+/// — a total order, so the result is deterministic. Returns `(values, indices)` each of length
+/// `n_chunks · k`, with `values[c·k + j]` the signed value and `indices[c·k + j]` its position
+/// **within** the chunk (`0..chunk`), matching [`det_chunk_scatter_add`]'s per-chunk index space.
+///
+/// # Errors
+///
+/// [`DetError::NotDivisible`] if `x.len()` is not a multiple of `chunk` (or `chunk == 0`);
+/// [`DetError::KTooLarge`] if `k > chunk`.
+pub fn topk_chunk(x: &[f32], chunk: usize, k: usize) -> Result<(Vec<f32>, Vec<u32>), DetError> {
+    if chunk == 0 || !x.len().is_multiple_of(chunk) {
+        return Err(DetError::NotDivisible {
+            len: x.len(),
+            divisor: chunk,
+        });
+    }
+    if k > chunk {
+        return Err(DetError::KTooLarge { k, chunk });
+    }
+    let n_chunks = x.len() / chunk;
+    let mut vals = Vec::with_capacity(n_chunks * k);
+    let mut idx = Vec::with_capacity(n_chunks * k);
+    for c in 0..n_chunks {
+        let block = &x[c * chunk..(c + 1) * chunk];
+        // Fixed total order: larger magnitude first, then lower index. Sort a small index vector.
+        let mut order: Vec<u32> = (0..chunk as u32).collect();
+        order.sort_by(|&a, &b| {
+            let (ma, mb) = (block[a as usize].abs(), block[b as usize].abs());
+            // Descending magnitude; NaN-safe via total_cmp on the negated compare.
+            mb.total_cmp(&ma).then(a.cmp(&b))
+        });
+        for &o in order.iter().take(k) {
+            vals.push(block[o as usize]);
+            idx.push(o);
+        }
+    }
+    Ok((vals, idx))
+}
+
+/// Orthonormal 2-D DCT-II over `tile × tile` blocks (ABI `dct2@1`, §5.8).
+///
+/// `x` is viewed as a sequence of `tile × tile` row-major blocks (`x.len()` a multiple of `tile²`);
+/// each block `X` is transformed to `Y = C · X · Cᵀ` where `C` is the orthonormal DCT-II matrix
+/// (`C[k][j] = α(k)·cos(π(2j+1)k / 2·tile)`, `α(0)=√(1/tile)`, `α(k>0)=√(2/tile)`). Intermediate
+/// accumulation is `f64` (one shared reference), cast to `f32` on store — deterministic on one
+/// implementation, so the sim and the host CPU fake agree byte-for-byte (HOST-1).
+///
+/// # Errors
+///
+/// [`DetError::NotDivisible`] if `tile == 0` or `x.len()` is not a multiple of `tile²`.
+pub fn dct2(x: &[f32], tile: usize) -> Result<Vec<f32>, DetError> {
+    transform2(x, tile, false)
+}
+
+/// The inverse orthonormal 2-D DCT (DCT-III), `X = Cᵀ · Y · C` (ABI `idct2@1` / `det_idct2@1`).
+///
+/// Reconstructs [`dct2`]'s input to within fp32 rounding (≤ ~1e-5 relative for the specced tile
+/// sizes). Same fixed-order `f64` accumulation as the forward transform.
+///
+/// # Errors
+///
+/// As [`dct2`].
+pub fn idct2(x: &[f32], tile: usize) -> Result<Vec<f32>, DetError> {
+    transform2(x, tile, true)
+}
+
+/// Shared 2-D DCT engine: `inverse=false` applies `C·X·Cᵀ`, `inverse=true` applies `Cᵀ·Y·C`.
+fn transform2(x: &[f32], tile: usize, inverse: bool) -> Result<Vec<f32>, DetError> {
+    let block = tile
+        .checked_mul(tile)
+        .filter(|&b| b != 0)
+        .ok_or(DetError::NotDivisible {
+            len: x.len(),
+            divisor: 0,
+        })?;
+    if !x.len().is_multiple_of(block) {
+        return Err(DetError::NotDivisible {
+            len: x.len(),
+            divisor: block,
+        });
+    }
+    let c = dct_matrix(tile);
+    let n_blocks = x.len() / block;
+    let mut out = vec![0.0_f32; x.len()];
+    let mut tmp = vec![0.0_f64; block];
+    for bi in 0..n_blocks {
+        let src = &x[bi * block..(bi + 1) * block];
+        let dst = &mut out[bi * block..(bi + 1) * block];
+        if inverse {
+            // M[i][b] = Σ_a C[a][i]·Y[a][b]
+            for i in 0..tile {
+                for b in 0..tile {
+                    let mut acc = 0.0_f64;
+                    for a in 0..tile {
+                        acc += c[a * tile + i] * f64::from(src[a * tile + b]);
+                    }
+                    tmp[i * tile + b] = acc;
+                }
+            }
+            // X[i][j] = Σ_b M[i][b]·C[b][j]
+            for i in 0..tile {
+                for j in 0..tile {
+                    let mut acc = 0.0_f64;
+                    for b in 0..tile {
+                        acc += tmp[i * tile + b] * c[b * tile + j];
+                    }
+                    dst[i * tile + j] = acc as f32;
+                }
+            }
+        } else {
+            // M[a][j] = Σ_i C[a][i]·X[i][j]
+            for a in 0..tile {
+                for j in 0..tile {
+                    let mut acc = 0.0_f64;
+                    for i in 0..tile {
+                        acc += c[a * tile + i] * f64::from(src[i * tile + j]);
+                    }
+                    tmp[a * tile + j] = acc;
+                }
+            }
+            // Y[a][b] = Σ_j M[a][j]·C[b][j]
+            for a in 0..tile {
+                for b in 0..tile {
+                    let mut acc = 0.0_f64;
+                    for j in 0..tile {
+                        acc += tmp[a * tile + j] * c[b * tile + j];
+                    }
+                    dst[a * tile + b] = acc as f32;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The orthonormal DCT-II matrix (row-major `[tile][tile]`), in `f64`.
+fn dct_matrix(tile: usize) -> Vec<f64> {
+    let nf = tile as f64;
+    let mut c = vec![0.0_f64; tile * tile];
+    for k in 0..tile {
+        let alpha = if k == 0 {
+            (1.0 / nf).sqrt()
+        } else {
+            (2.0 / nf).sqrt()
+        };
+        for j in 0..tile {
+            let angle = core::f64::consts::PI * (2.0 * j as f64 + 1.0) * k as f64 / (2.0 * nf);
+            c[k * tile + j] = alpha * angle.cos();
+        }
+    }
+    c
+}
+
+/// Write a `bits`-wide unsigned `code` starting at `bit_pos`, LSB-first, into a byte slice.
+fn write_bits_lsb(bytes: &mut [u8], bit_pos: usize, bits: u32, code: u32) {
+    for b in 0..bits as usize {
+        let abs = bit_pos + b;
+        let bit = ((code >> b) & 1) as u8;
+        bytes[abs / 8] |= bit << (abs % 8);
+    }
+}
+
+/// IEEE-754 single → half, round-to-nearest-even. Hand-rolled (zero-dep). Used by [`absmax_pack`].
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x7f_ffff;
+    if exp == 0xff {
+        // inf / nan
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let unbiased = exp - 127 + 15;
+    if unbiased >= 0x1f {
+        return sign | 0x7c00; // overflow → inf
+    }
+    if unbiased <= 0 {
+        if unbiased < -10 {
+            return sign; // underflow → signed zero
+        }
+        let m = mant | 0x80_0000; // restore implicit leading 1
+        let shift = (14 - unbiased) as u32;
+        let half = m >> shift;
+        let rem = m & ((1u32 << shift) - 1);
+        let round_bit = 1u32 << (shift - 1);
+        let mut h = half;
+        if rem > round_bit || (rem == round_bit && (half & 1) == 1) {
+            h += 1;
+        }
+        return sign | h as u16;
+    }
+    let mant16 = mant >> 13;
+    let rem = mant & 0x1fff;
+    let mut h = ((unbiased as u32) << 10) | mant16;
+    let round_bit = 0x1000;
+    if rem > round_bit || (rem == round_bit && (mant16 & 1) == 1) {
+        h += 1; // a carry into the exponent field is the intended behavior
+    }
+    sign | h as u16
+}
+
 /// IEEE-754 half → single. Hand-rolled (zero-dep); exact widening.
 fn f16_bits_to_f32(h: u16) -> f32 {
     let sign = if (h >> 15) & 1 == 1 { -1.0_f32 } else { 1.0 };
@@ -678,6 +950,133 @@ mod tests {
             det_absmax_unpack(&[0; 4], 4, 2),
             Err(DetError::NotDivisible { len: 4, divisor: 3 })
         );
+    }
+
+    // -- HOST-3: absmax_pack ∘ det_absmax_unpack round-trip + layout --------------------------
+
+    #[test]
+    fn absmax_pack_is_inverse_of_unpack_2bit() {
+        // A single chunk of 4, absmax exactly f16-representable so the codebook is clean.
+        let x = [1.0_f32, -1.0, 1.0 / 3.0, -1.0 / 3.0];
+        let packed = absmax_pack(&x, 4, 2).unwrap();
+        // absmax = 1.0 (f16 0x3C00), codes: 1.0→3, -1.0→0, 1/3→2, -1/3→1  ⇒ 0b01_10_00_11 = 0x63.
+        assert_eq!(packed, vec![0x00, 0x3C, 0x63]);
+        let back = det_absmax_unpack(&packed, 4, 2).unwrap();
+        for (a, b) in x.iter().zip(back.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn absmax_pack_is_idempotent_through_decode() {
+        // Arbitrary payload, 2 chunks of 8, 2-bit: pack → unpack → re-pack must be byte-identical.
+        let x: Vec<f32> = (0..16).map(|n| ((n as f32) - 7.5) * 0.3).collect();
+        let p1 = absmax_pack(&x, 8, 2).unwrap();
+        let decoded = det_absmax_unpack(&p1, 8, 2).unwrap();
+        let p2 = absmax_pack(&decoded, 8, 2).unwrap();
+        assert_eq!(p1, p2, "re-packing a decoded payload is a fixed point");
+    }
+
+    #[test]
+    fn absmax_pack_8bit_full_range() {
+        let x = [1.0_f32, -1.0, 0.0];
+        let packed = absmax_pack(&x, 3, 8).unwrap();
+        // absmax 1.0 → +1 encodes 255, -1 encodes 0, 0 encodes 128 (round((0+1)/2*255)=128).
+        assert_eq!(packed[2], 255);
+        assert_eq!(packed[3], 0);
+        assert_eq!(packed[4], 128);
+    }
+
+    #[test]
+    fn absmax_pack_zero_chunk_decodes_to_zero() {
+        let x = [0.0_f32; 4];
+        let packed = absmax_pack(&x, 4, 2).unwrap();
+        let back = det_absmax_unpack(&packed, 4, 2).unwrap();
+        assert!(back.iter().all(|&v| v == 0.0));
+    }
+
+    // -- HOST-2: topk_chunk ---------------------------------------------------------------------
+
+    #[test]
+    fn topk_chunk_selects_by_magnitude() {
+        // Two chunks of 4, k=2. Chunk 0: |values| pick indices 3,1; chunk 1: pick 0,2.
+        let x = [0.1_f32, -0.9, 0.2, 1.0, -5.0, 0.5, 3.0, -0.1];
+        let (vals, idx) = topk_chunk(&x, 4, 2).unwrap();
+        assert_eq!(idx, vec![3, 1, 0, 2]); // desc magnitude, ties by index
+        assert_eq!(vals, vec![1.0, -0.9, -5.0, 3.0]);
+    }
+
+    #[test]
+    fn topk_chunk_ties_break_by_index() {
+        // Equal magnitudes ⇒ lower index wins, deterministically.
+        let x = [1.0_f32, -1.0, 1.0, -1.0];
+        let (vals, idx) = topk_chunk(&x, 4, 2).unwrap();
+        assert_eq!(idx, vec![0, 1]);
+        assert_eq!(vals, vec![1.0, -1.0]);
+    }
+
+    #[test]
+    fn topk_chunk_errors() {
+        assert_eq!(
+            topk_chunk(&[1.0, 2.0, 3.0], 2, 1),
+            Err(DetError::NotDivisible { len: 3, divisor: 2 })
+        );
+        assert_eq!(
+            topk_chunk(&[1.0, 2.0], 2, 3),
+            Err(DetError::KTooLarge { k: 3, chunk: 2 })
+        );
+    }
+
+    // -- HOST-1: dct2 / idct2 -------------------------------------------------------------------
+
+    #[test]
+    fn dct2_dc_only_for_constant_block() {
+        // A constant 4×4 block: all energy in the DC (0,0) coefficient, everything else ~0.
+        let x = vec![2.0_f32; 16];
+        let y = dct2(&x, 4).unwrap();
+        assert!(
+            (y[0] - 8.0).abs() < 1e-4,
+            "DC = mean·N = 2·4 = 8, got {}",
+            y[0]
+        );
+        for &v in &y[1..] {
+            assert!(v.abs() < 1e-4, "AC coefficient should vanish, got {v}");
+        }
+    }
+
+    #[test]
+    fn dct2_idct2_reconstructs_per_tile() {
+        for &tile in &[4_usize, 8, 16] {
+            let block = tile * tile;
+            let x: Vec<f32> = (0..block * 2)
+                .map(|n| ((n as f32) * 0.017).sin() * 3.0 + 0.5)
+                .collect();
+            let y = dct2(&x, tile).unwrap();
+            let back = idct2(&y, tile).unwrap();
+            for (a, b) in x.iter().zip(back.iter()) {
+                assert!((a - b).abs() < 1e-4, "tile {tile}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn dct2_is_orthonormal_energy_preserving() {
+        // Parseval: ‖X‖² == ‖DCT(X)‖² for an orthonormal transform.
+        let x: Vec<f32> = (0..64).map(|n| ((n as f32) * 0.3).cos()).collect();
+        let y = dct2(&x, 8).unwrap();
+        let ex: f32 = x.iter().map(|v| v * v).sum();
+        let ey: f32 = y.iter().map(|v| v * v).sum();
+        assert!((ex - ey).abs() / ex < 1e-4, "energy {ex} vs {ey}");
+    }
+
+    #[test]
+    fn dct2_is_bit_reproducible() {
+        let x: Vec<f32> = (0..64).map(|n| (n as f32).sin()).collect();
+        let a = dct2(&x, 8).unwrap();
+        let b = dct2(&x, 8).unwrap();
+        for (p, q) in a.iter().zip(b.iter()) {
+            assert_eq!(p.to_bits(), q.to_bits());
+        }
     }
 
     #[test]

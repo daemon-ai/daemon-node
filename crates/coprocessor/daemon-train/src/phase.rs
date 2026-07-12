@@ -79,6 +79,23 @@ pub const PHASE_TABLE: &[(&str, u8)] = &[
     ("matmul@1", STEP | INNER | MAKE),
     ("relu@1", STEP | INNER | MAKE),
     ("cross_entropy@1", STEP | INNER | MAKE),
+    // Wave-2 NN / shape (native lane, §5.3–5.6): step + inner + make
+    ("embedding@1", STEP | INNER | MAKE),
+    ("rmsnorm@1", STEP | INNER | MAKE),
+    ("softmax@1", STEP | INNER | MAKE),
+    ("silu@1", STEP | INNER | MAKE),
+    ("rope@1", STEP | INNER | MAKE),
+    ("flash_attn@1", STEP | INNER | MAKE),
+    ("reshape@1", STEP | INNER | MAKE),
+    ("transpose@1", STEP | INNER | MAKE),
+    ("slice@1", STEP | INNER | MAKE),
+    // Wave-2 compression natives (§5.8): inner + make
+    ("topk_chunk@1", INNER | MAKE),
+    ("chunk_scatter@1", INNER | MAKE),
+    ("absmax_pack@1", INNER | MAKE),
+    ("absmax_unpack@1", INNER | MAKE),
+    ("dct2@1", INNER | MAKE),
+    ("idct2@1", INNER | MAKE),
     // assign / detach
     ("assign@1", STEP | INNER | MAKE),
     // autodiff
@@ -115,6 +132,7 @@ pub const PHASE_TABLE: &[(&str, u8)] = &[
     ("det_param@1", INGEST),
     ("det_reset_param_to_base@1", INGEST),
     ("det_axpy_param@1", INGEST),
+    ("det_idct2@1", INGEST),
     // batch access (step only)
     ("batch_tokens@1", STEP),
     ("batch_size@1", STEP),
