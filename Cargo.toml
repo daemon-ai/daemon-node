@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*/*", "tools/*", "bindings/*", "bins/*", "tests/*", "xtask"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 # matrix-sdk 0.18 (the `daemon-matrix` adapter) sets the workspace MSRV floor at 1.93; the flake's
 # fenix `stable` toolchain (1.96 at lock time) satisfies it. All matrix types stay inside that crate.
