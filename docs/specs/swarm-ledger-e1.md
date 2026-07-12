@@ -63,17 +63,21 @@ chunk-major, zero-padded to a byte boundary; dequant is the symmetric linear cod
 
 ### 2. `tabi@1` import list implemented so far (Merge-1 vocabulary subset)
 
-Host-linked imports wired in `daemon-train` this wave (all `@1`):
+Host-linked imports wired in `daemon-train` this wave (all `@1`; the SDK extern block and the host
+`Linker` agree on this subset name-for-name, and the phase-legality table in `daemon-train/src/phase.rs`
+is the normative source of truth):
 
 `param, persistent, det_persistent, drop, param_round_base, backward, grad, zero_grads, assign,
-zeros, add, sub, mul, mul_s, matmul, relu, cross_entropy, scalar, metric, log, abi_minor,
-adamw_step, batch_tokens, batch_size, batch_seq_len, upd_new, upd_push_bytes, upd_push_tensor,
-upd_sections, upd_kind, upd_bytes_len, upd_read_bytes, upd_tensor, det_zeros, det_sum, det_scale,
-det_l2norm, det_sign, det_absmax_unpack, det_chunk_scatter_add, det_param, det_reset_param_to_base,
-det_axpy_param` — 43 imports. This is a deliberate subset of the full 108-import `tabi@1` (ABI §5):
-the compression natives (`topk_chunk`, `absmax_pack`, `dct2/idct2`), the full elementwise/reduction
-NN vocabulary, and the remaining fused optimizers land in later waves, additively (§9). The SDK's
-extern block and the host Linker agree on this subset name-for-name.
+zeros, ones, full, add, sub, mul, mul_s, matmul, relu, cross_entropy, scalar, metric, log,
+abi_minor, adamw_step, batch_tokens, batch_size, batch_seq_len, upd_new, upd_push_bytes,
+upd_push_tensor, upd_sections, upd_kind, upd_bytes_len, upd_read_bytes, upd_tensor, det_zeros,
+det_sum, det_scale, det_l2norm, det_sign, det_add, det_sub, det_mul, det_absmax_unpack,
+det_chunk_scatter_add, det_chunk_scatter, det_assign, det_param, det_reset_param_to_base,
+det_axpy_param` — **50 imports**. This is a deliberate subset of the full 108-import `tabi@1`
+(ABI §5): the compression natives (`topk_chunk`, `absmax_pack`, `dct2/idct2`), the remaining
+elementwise/reduction/NN vocabulary (`softmax`, `rmsnorm`, `rope`, `flash_attn`, `embedding`,
+`gather`, `sum_dim`, …), the other fused optimizers (`nadamw`, `sgdm`, `signum`), and
+`detach`/`dropout`/`arange`/`cast` land in later waves, additively (§9).
 
 ### 3. SDK `Experiment` trait + `experiment!` macro surface
 
@@ -142,3 +146,15 @@ plus `--features sim` for the SDK)
   lanes/waves extend them **additively** only.
 - `det-core` is on the wasm32 path (via the SDK `sim`→host shared kernels intent); it stays
   zero-dep. Do not add crates to it.
+- **`da_manifest`/`da_defaults` return form** (frozen Rust-ABI wire representation): the `(ptr, len)`
+  CBOR result is returned as a single packed `u64` (`ptr << 32 | len`), not a wasm multi-value pair
+  (Rust's wasm C-ABI does not emit multi-value returns cleanly). The host decodes it and calls
+  `da_free`. The logical ABI signature (§4) is unchanged.
+- **burn is still on the default gate** (declared directly by `daemon-train`, as in the Wave-0
+  scaffold). The program ledger's intent is to feature-gate / lane-split it off the default path;
+  this wave defers that (attempting it triggers a full wasmtime recompile). The `OpBackend` trait is
+  the seam that makes the move a one-crate change. Track as Wave-2 lane-E work.
+- **Shared-disk note:** the swarm worktrees + the reference checkout share one `/home` volume; a
+  full `cargo {test,clippy} --workspace` cold-builds ~all of daemon-node (tens of GB). Lane-E gates
+  were run scoped to the owned crates (all green); a full-workspace run needs the other lanes' crates
+  present and coordinated disk headroom.
