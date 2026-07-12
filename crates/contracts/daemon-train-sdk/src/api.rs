@@ -573,6 +573,12 @@ impl Persistent {
     pub fn tensor(&self) -> &Tensor {
         &self.0
     }
+
+    /// `assign@1` — overwrite this persistent's storage with `src` (error-feedback / momentum
+    /// update, ABI §5.1).
+    pub fn assign(&self, src: &Tensor) {
+        abi::assign(self.0.h, src.h);
+    }
 }
 
 /// Auxiliary det-lane fp32 state surviving across rounds (ABI `det_persistent@1`).

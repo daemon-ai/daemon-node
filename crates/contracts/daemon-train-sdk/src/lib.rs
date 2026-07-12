@@ -153,6 +153,11 @@ pub use api::{
 #[cfg(any(target_arch = "wasm32", feature = "sim"))]
 pub use api::det_chunk_scatter;
 
+/// First-party optimization profiles (`SparseLoco`/`DiLoCo`/`Demo`) as composable library code
+/// (architecture §5.3, ABI §10.3).
+#[cfg(any(target_arch = "wasm32", feature = "sim"))]
+pub mod profiles;
+
 /// The in-crate CPU reference backend (feature `sim`): drives the tensor surface natively so
 /// experiments and profiles are unit-testable with `cargo test --features sim` (ABI §10.4).
 #[cfg(feature = "sim")]
@@ -167,6 +172,7 @@ pub mod rt;
 /// A convenient glob for experiment authors.
 #[cfg(any(target_arch = "wasm32", feature = "sim"))]
 pub mod prelude {
+    pub use crate::profiles;
     pub use crate::{det_sum, det_zeros, embedding, zero_grads};
     pub use crate::{
         experiment, Batch, Config, DetPersistent, DetTensor, Dtype, Experiment, Init, Manifest,

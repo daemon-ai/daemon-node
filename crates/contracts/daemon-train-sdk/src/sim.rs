@@ -274,6 +274,18 @@ pub fn metrics() -> Vec<(String, f32)> {
     with(|s| s.metrics.clone())
 }
 
+/// The element/byte length of section `s` of a built update container (test inspection: profile
+/// compression-ratio assertions). Packed `U8` payloads are stored one byte per element, so a tensor
+/// section's element count equals its wire byte count.
+#[must_use]
+pub fn section_len(ub: &UpdateBuilder, s: usize) -> usize {
+    let (_, idx) = dec(ub.handle());
+    with(|st| match &st.containers[idx].sections[s] {
+        Section::Bytes(b) => b.len(),
+        Section::Tensor { data, .. } => data.len(),
+    })
+}
+
 // -- deterministic init ------------------------------------------------------------------------
 
 fn fnv1a(s: &str) -> u64 {
