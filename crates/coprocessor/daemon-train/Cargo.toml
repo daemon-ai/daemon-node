@@ -30,10 +30,11 @@ serde = { workspace = true }
 ciborium = { workspace = true }
 
 [dev-dependencies]
-# Test-only: the frozen-surface sync check (`tests/abi_surface.rs`) asserts the host `Linker` +
-# phase table agree name-for-name with the guest SDK's `TABI_IMPORTS` list. Path dep (never a
-# runtime edge — the host does not link the guest SDK); compiles to constants on the native gate.
-daemon-train-sdk = { path = "../../contracts/daemon-train-sdk" }
+# Test-only: the frozen-surface sync check (`tests/abi_surface.rs`) reads the guest SDK's
+# `TABI_IMPORTS`, and the guest-lifecycle test builds the `TinyLlamaCfg` the wasm guest parses.
+# `sim` compiles the SDK's `models`/`profiles` (config types) natively for the tests; never a
+# runtime edge (the host does not link the guest SDK).
+daemon-train-sdk = { path = "../../contracts/daemon-train-sdk", features = ["sim"] }
 
 [lints]
 workspace = true

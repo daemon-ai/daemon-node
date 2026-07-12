@@ -92,16 +92,15 @@ impl SparseLoco {
         let (chunk, k, bits) = (self.cfg.chunk, self.cfg.topk, self.cfg.bits);
         let mut ub = UpdateBuilder::new();
         for (i, p) in params.iter().enumerate() {
-            let numel: u32 = p.shape().iter().product();
             let delta = p.round_base().sub(p.tensor());
             let acc = self.ef[i].tensor().mul_s(self.cfg.ef_decay).add(&delta);
             let (vals, idx) = acc.topk_chunk(chunk, k);
             let packed = vals.absmax_pack(k, bits); // per-top-k-row codebook
             ub.push_tensor(&packed);
             ub.push_tensor(&idx);
-            // ef ← acc − chunk_scatter(dequant(sent))  (residual stays local)
+            // ef ← acc − chunk_scatter(dequant(sent))  (residual stays local; param-shaped)
             let sent_vals = packed.absmax_unpack(k, bits, Dtype::F32);
-            let sent = sent_vals.chunk_scatter(&idx, chunk, &[numel]);
+            let sent = sent_vals.chunk_scatter(&idx, chunk, p.shape());
             let ef_new = acc.sub(&sent);
             self.ef[i].assign(&ef_new);
         }
@@ -333,7 +332,6 @@ impl Demo {
         let block = tile * tile;
         let mut ub = UpdateBuilder::new();
         for (i, p) in params.iter().enumerate() {
-            let numel: u32 = p.shape().iter().product();
             let delta = p.round_base().sub(p.tensor());
             let m = self.mom[i]
                 .tensor()
@@ -343,8 +341,8 @@ impl Demo {
             let (vals, idx) = coeffs.topk_chunk(block, k);
             ub.push_tensor(&vals);
             ub.push_tensor(&idx);
-            // M ← M − α·IDCT(scatter(sent))
-            let sent_spatial = vals.chunk_scatter(&idx, block, &[numel]).idct2(tile);
+            // M ← M − α·IDCT(scatter(sent))  (param-shaped so the residual subtract type-checks)
+            let sent_spatial = vals.chunk_scatter(&idx, block, p.shape()).idct2(tile);
             let m_new = m.sub(&sent_spatial.mul_s(self.cfg.alpha));
             self.mom[i].assign(&m_new);
         }

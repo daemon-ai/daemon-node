@@ -158,6 +158,10 @@ pub use api::det_chunk_scatter;
 #[cfg(any(target_arch = "wasm32", feature = "sim"))]
 pub mod profiles;
 
+/// First-party preset experiments (the `TinyLlama` reference decoder, architecture §10.5).
+#[cfg(any(target_arch = "wasm32", feature = "sim"))]
+pub mod models;
+
 /// The in-crate CPU reference backend (feature `sim`): drives the tensor surface natively so
 /// experiments and profiles are unit-testable with `cargo test --features sim` (ABI §10.4).
 #[cfg(feature = "sim")]

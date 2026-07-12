@@ -4,89 +4,14 @@
 //! `tiny-llama` — the reference guest experiment module.
 //!
 //! A `cdylib` compiled to `wasm32-unknown-unknown` and instantiated by the `daemon-train` host in
-//! the wasm sandbox (tensor-ABI spec §5.1). Built through the SDK's [`experiment!`] macro, which
-//! wires all `da_*` exports over the [`Experiment`] impl below. The real LLaMA-family decoder
-//! (RMSNorm + SwiGLU + RoPE + GQA) lands in Wave 2 — this Wave-1 placeholder registers the canonical
-//! state dict and round-trips the lifecycle so the host's `da_abi`/`da_build`/T3 path is exercised.
+//! the wasm sandbox (tensor-ABI spec §5.1). The model itself — a genuinely tiny LLaMA-family decoder
+//! (embedding → N×(rmsnorm → RoPE attention → rmsnorm → SwiGLU) → tied logits, cross-entropy loss,
+//! AdamW inner, wired to a comm profile by config) — is the SDK's first-party preset
+//! [`daemon_train_sdk::models::TinyLlama`] (architecture §10.5), so the wasm guest and the SDK's sim
+//! tests exercise the identical code through the two backends (ABI §10.4). This module is the
+//! one-line `experiment!` binding that emits the `da_*` exports.
 
-use daemon_train_sdk::prelude::*;
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize)]
-struct Cfg {
-    d_model: u32,
-    vocab: u32,
-}
-
-impl Default for Cfg {
-    fn default() -> Self {
-        Self {
-            d_model: 8,
-            vocab: 16,
-        }
-    }
-}
-
-struct TinyLlama {
-    params: Vec<Param>, // [tok.weight, norm.weight] — registration order = state dict
-}
-
-impl Experiment for TinyLlama {
-    fn manifest(_cfg: &Config) -> Manifest {
-        // A per-step cadence placeholder (H = 1); the real model reads H from its profile config.
-        Manifest::new("tiny-llama", env!("CARGO_PKG_VERSION"), 1)
-    }
-
-    fn build(cfg: &Config) -> Self {
-        let cfg: Cfg = cfg.parse();
-        let tok = Param::new(
-            "tok.weight",
-            &[cfg.vocab, cfg.d_model],
-            Dtype::F32,
-            Init::Normal,
-            0.0,
-            0.02,
-        );
-        let norm = Param::new(
-            "norm.weight",
-            &[cfg.d_model],
-            Dtype::F32,
-            Init::Ones,
-            0.0,
-            0.0,
-        );
-        Self {
-            params: vec![tok, norm],
-        }
-    }
-
-    fn step(&mut self, _batch: &Batch, _ctx: &StepCtx) {
-        // Placeholder: the Wave-2 model runs the forward/backward here.
-    }
-
-    fn inner_update(&mut self, _inner_step: u32) {}
-
-    fn make_update(&mut self, _round: u64) -> UpdateBuilder {
-        let mut ub = UpdateBuilder::new();
-        for p in &self.params {
-            let delta = p.round_base().sub(p.tensor());
-            ub.push_tensor(&delta);
-        }
-        ub
-    }
-
-    fn ingest(&mut self, _round: u64, updates: &UpdatesView) {
-        let count = updates.len().max(1) as f64;
-        for (s, p) in self.params.iter().enumerate() {
-            let mut acc = det_zeros(p.shape());
-            for i in 0..updates.len() {
-                acc = acc.add(&updates.get(i).tensor(s as u32));
-            }
-            let mean = acc.scale(1.0 / count);
-            p.det_reset_to_base();
-            p.det_axpy(&mean, -1.0);
-        }
-    }
-}
+use daemon_train_sdk::models::TinyLlama;
+use daemon_train_sdk::Experiment;
 
 daemon_train_sdk::experiment!(TinyLlama);

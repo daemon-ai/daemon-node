@@ -474,6 +474,19 @@ impl Param {
         &self.0
     }
 
+    /// A second handle to the same registered param (stable handles are a pure function of the
+    /// registration index, T3, so duplicating one is free and `Drop`-safe). Used to hand a comm
+    /// profile a `&[Param]` slice without moving the experiment's own fields.
+    #[must_use]
+    pub fn stable_view(&self) -> Param {
+        Param(Tensor {
+            h: self.0.h,
+            shape: self.0.shape.clone(),
+            dtype: self.0.dtype,
+            stable: true,
+        })
+    }
+
     /// `grad@1` — a read-only view of the accumulated fp32 gradient.
     #[must_use]
     pub fn grad(&self) -> Tensor {
