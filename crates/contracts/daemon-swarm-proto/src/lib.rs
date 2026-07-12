@@ -19,6 +19,7 @@
 pub mod bytes;
 pub mod canonical;
 pub mod capability;
+pub mod digest;
 pub mod envelope;
 pub mod error;
 pub mod hash;
@@ -30,6 +31,7 @@ pub mod version;
 pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use capability::{Capability, CapabilitySet};
+pub use digest::{derive_schedule, digest_state, DigestSchedule, StateLayout};
 pub use envelope::{Envelope, FrozenEnvelope, ENVELOPE_SCHEMA_MAJOR};
 pub use error::SwarmProtoError;
 pub use hash::blake3_hash;
