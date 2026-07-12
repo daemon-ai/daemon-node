@@ -139,3 +139,181 @@ lane action; request it from the integration owner (who also re-runs `cargo deny
   `det-core` std-only, `daemon-train-sdk` serde+ciborium) hand-roll their error types
   (`std::error::Error`) instead of using `thiserror`. Keep them lean — `daemon-swarm-proto` and
   `daemon-train-sdk` are on the `wasm32` path.
+
+## Merge 1 — frozen interfaces
+
+Wave-1 lanes P1 (`swarm/p1` @ `3c60271`), R1 (`swarm/r1` @ `806b926`), and E1 (`swarm/e1` @
+`73c7a68`) are merged into `integrations/swarm` (three `--no-ff` merges, lane history preserved).
+The seams below are **frozen**: Wave-2+ extends them **additively** only — any breaking change needs
+a Merge-coordination note here. All gates green on the merged trunk (see the gate list in "Notes for
+lane agents"; plus `cargo test -p daemon-train-sdk --features sim`, `cargo build --target
+wasm32-unknown-unknown -p daemon-swarm-proto`, and `cargo run -p xtask -- build-guests`).
+
+### The two protocols (do not conflate)
+
+- **Swarm control protocol** — `daemon-swarm-proto` (lane P). The signed, consensus-critical wire:
+  canonical CBOR + the `SignedMessage` frame over `daemon-swarm.cddl`. Peer↔coordinator, peer↔peer.
+  Versioned by `SwarmProtoVersion`.
+- **Worker protocol** — `daemon_swarm_run::protocol` (lane R). The node↔`daemon-train` **child**
+  wire (CBOR over a length-framed `daemon_provision::CutChannel` stdio cut, §10.2). NOT a swarm wire;
+  only the shared id/hash types (`PeerId`, blake3 `Hash`) are common. Stays in `daemon-swarm-run`;
+  lane E's worker implements the child side in Wave 3.
+
+### `daemon-swarm-proto` API (the single authority for wire shapes; wasm32-clean)
+
+- Canonical codec: `to_canonical_vec<T: Serialize>`, `from_canonical_slice<T: DeserializeOwned>`
+  (RFC 8949 §4.2 deterministic CBOR — the bit-identity seam; never fork a second encoder).
+- Byte newtypes (all CBOR `bstr`): `PeerId`/`Hash`/`Root`/`Seed`(32), `Signature`(64), `IrohId`(32),
+  `StateDigest`(16). `blake3_hash(&[u8]) -> Hash`. Ordered lexicographically by bytes.
+- Signing (ed25519 over canonical CBOR, deterministic/no-RNG): `SigningKey`/`VerifyingKey`,
+  `peer_id`, `sign_canonical`/`verify_canonical`, `Signed<T>` (`seal`/`verify`).
+- Envelope: `Envelope` (+ `RunSection`/`ExperimentSection`/`Artifact`/`DataSection`/`Requirements`/
+  `Phases`), `validate`, `freeze(&SigningKey) -> FrozenEnvelope`, `FrozenEnvelope::{verify, bytes,
+  hash, config_bytes, signature, signer}`, `ENVELOPE_SCHEMA_MAJOR`.
+- Capability: `Capability { name, version }`, `CapabilitySet::admits`.
+- Set commitment (blake3 merkle over `(peer, hash)` **sorted by peer pubkey bytes**, §6.4 I3):
+  `commit_set`, `SetCommitment { root, count }`, `SetCommitmentTree`, `MembershipProof`,
+  `verify_membership`.
+- Messages (the 7 round msgs + Join/Heartbeat): `RoundOpen`, `Commitment`, `Attestation`,
+  `StorageReceipt` (`{ round, verified: Vec<RecordEntry{peer,hash,size}> }`), `RoundRecord`,
+  `Digest`, `Straggle`, `Join`, `Heartbeat`; enum `SwarmMessage`; frame `SignedMessage { version,
+  payload, signer, sig }` with `sign`/`verify`/`verify_for_run`. Plus `Locator`, `BatchWindow`,
+  `AttestEntry`, `RecordEntry`, `ThroughputClass`, `StraggleStatus`.
+- Version: `SwarmProtoVersion(u16)`, `SWARM_PROTO_VERSION` (= `1`), `accepts`/`check_join`
+  (exact-match join gate).
+- Digest: `StateLayout`, `DigestSchedule`, `derive_schedule`, `digest_state` (seed-keyed xxh3-128).
+
+### `daemon-swarm-net` — `SwarmTransport` seams (lane R)
+
+- `ControlPlane` (`publish(&[u8])` of already-signed bytes, `subscribe() -> ControlSubscription`;
+  content-hash dedupe). `LoopbackGossip` impl. `ControlSubscription::{recv, try_recv}`.
+- `PayloadStore` (`put`/`get`(hash-verify)/`head`(`PayloadStat { hash: Hash, size }`)) keyed by
+  `PayloadKey = (RunId, RoundId, PeerId)`. `FsPayloadStore` impl (rooted at `ContainedRoot`,
+  `prune(run, current_round)` retention, typed `PayloadMiss`).
+- `ReceiptProducer<S>` — polls a `PayloadStore` and emits proto `SignedMessage`s carrying a
+  `StorageReceipt` (`produce(&key)` single-entry; `produce_round(round, keys)` aggregated). Signs
+  with an injected ed25519 `SigningKey` + pinned `SwarmProtoVersion`.
+- `ArtifactResolver` — `ArtifactScheme::{File, R2, Hf, Https}`; only `File` wired (blake3-verified).
+  `R2`/`Hf`/`Https` return `SwarmNetError::SchemeUnsupported` pending `daemon-egress`.
+- Shared vocabulary (`seam`): `ContentHash` = proto `Hash`, `PeerId` = proto `PeerId`, `RoundId`
+  (`u64`), and the local-only `RunId`/`PayloadKey` re-expressed over the proto primitives.
+
+### `daemon-swarm-run` — `TrainerBackend` (the R↔E seam) + data pipeline (lane R)
+
+```rust
+pub trait TrainerBackend: Send {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn build(&mut self, config: &[u8]) -> Result<(), Self::Error>;
+    fn assess(&self, meta: &AssessMeta) -> Result<Assessment, Self::Error>;
+    fn train_step(&mut self, batch: &BatchRef, ctx: StepCtx) -> Result<StepStats, Self::Error>;
+    fn inner_update(&mut self, inner_step: u32) -> Result<(), Self::Error>;
+    fn make_update(&mut self, round: RoundId) -> Result<Vec<u8>, Self::Error>;
+    fn ingest(&mut self, round: RoundId, staged: &[StagedPayload]) -> Result<StateDigest, Self::Error>;
+    fn checkpoint_save(&self) -> Result<Vec<u8>, Self::Error>;
+    fn checkpoint_load(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+}
+```
+
+`ingest` consumes `staged` in caller order; the round loop MUST stage in `RoundRecord` order —
+sorted by node pubkey bytes (§6.4 I3), the **same key proto's `commit_set` uses**. Cross-crate test:
+`daemon-swarm-run/tests/record_ordering.rs` (`staging_order_matches_proto_commit_set`).
+`StubBackend` is the deterministic Wave-1 fake. Data pipeline: `Manifest`/`ShardDesc`/`TokenWidth`,
+`Manifest::{validate, locate, total_*}`, `slice_interval`, `SyntheticCorpus`, `BatchId` (`u64`).
+
+### `daemon-swarm-run::protocol` — worker protocol message set (frozen, node↔worker)
+
+- `Command`: `AssessRun`, `JoinRun`, `Throttle`, `Leave`.
+- `Event`: `Ready`, `Probed(Hardware)`, `Assessed(Eligibility)`, `RunPhase`, `RoundProgress`,
+  `RoundOutcome`, `Metric`, `CheckpointPublished`, `Warning`, `Error`.
+- Codec: `encode<T: Serialize>`/`decode<T: DeserializeOwned>` (CBOR body; the `u32` length prefix is
+  the `CutChannel`'s). Consumed by `daemon-train-client::TrainSupervisor` (spawn/respawn/meltdown).
+
+### `det-core` kernel signatures (fixed-order fp32; lane E)
+
+```rust
+det_sum(&[&[f32]]) -> Result<Vec<f32>, DetError>;   det_l2norm(&[f32]) -> f32;
+det_axpy(&mut [f32], f64, &[f32]) -> Result<(), DetError>;   det_scale(&[f32], f64) -> Vec<f32>;
+det_add / det_sub / det_mul (&[f32], &[f32]) -> Result<Vec<f32>, DetError>;   det_sign(&[f32]) -> Vec<f32>;
+det_chunk_scatter_add(&mut [f32], &[f32], &[u32], usize) -> Result<(), DetError>;
+det_chunk_scatter(&[f32], &[u32], usize, usize) -> Result<Vec<f32>, DetError>;
+det_absmax_unpack(&[u8], usize, u32) -> Result<Vec<f32>, DetError>;
+```
+
+`f64` scalars cast to `f32` **inside** the kernel (one shared cast site, ABI §5.9). `det_absmax_unpack`
+layout frozen (ABI §6.6): per-chunk LE `f16` absmax then `chunk` codes of `bits` width, LSB-first,
+chunk-major, byte-padded; symmetric linear codebook.
+
+### `tabi@1` subset — the frozen 50-import vocabulary (lane E)
+
+Host `Linker` and the SDK extern block agree name-for-name; `daemon-train/src/phase.rs` is the
+normative phase-legality table (frozen with these names). Later waves add the remaining 108-import
+`tabi@1` vocabulary **additively** (§9).
+
+```
+param, persistent, det_persistent, drop, param_round_base, backward, grad, zero_grads, assign,
+zeros, ones, full, add, sub, mul, mul_s, matmul, relu, cross_entropy, scalar, metric, log,
+abi_minor, adamw_step, batch_tokens, batch_size, batch_seq_len, upd_new, upd_push_bytes,
+upd_push_tensor, upd_sections, upd_kind, upd_bytes_len, upd_read_bytes, upd_tensor, det_zeros,
+det_sum, det_scale, det_l2norm, det_sign, det_add, det_sub, det_mul, det_absmax_unpack,
+det_chunk_scatter_add, det_chunk_scatter, det_assign, det_param, det_reset_param_to_base,
+det_axpy_param
+```
+
+SDK surface (frozen): `Experiment` trait (`manifest`/`build`/`step`/`inner_update`/`make_update`/
+`ingest`) + `experiment!` macro (→ `da_abi`/`da_manifest`/`da_defaults`/`da_alloc`/`da_free` +
+`da_build`/`da_step`/`da_inner_update`/`da_make_update`/`da_ingest_updates`); wrapper types
+`Tensor`/`DetTensor`/`Param`/`Persistent`/`DetPersistent`/`Batch`/`StepCtx`/`Config`/`Manifest`/
+`UpdateBuilder`/`UpdatesView`; `--features sim` → in-crate CPU backend over `det-core`.
+`da_manifest`/`da_defaults` return the CBOR `(ptr, len)` packed as one `u64` (`ptr << 32 | len`),
+not wasm multi-value (E1 note). `daemon-train` host: `Worker::{new, load_module, instantiate}` +
+the arena/trap-taxonomy/phase-table/budgets, with `OpBackend`/`CpuBackend`.
+
+### Seam-swap deviations (recorded)
+
+Merge 1 swapped R1's `seam` placeholders + receipt types for proto per plan, with these
+lane-report deltas (none behavioral, none consensus-affecting):
+
+- **`ContentHash` → proto `Hash` by alias.** `daemon_swarm_net::seam::ContentHash` is now
+  `pub use daemon_swarm_proto::Hash as ContentHash` (kept the descriptive net-local name; the type
+  is proto's). Call sites that used `ContentHash::of(b)` now use `daemon_swarm_proto::blake3_hash(b)`
+  (proto has no `Hash::of`). Wire encoding of a hash changed array-of-uint → `bstr` (proto's form),
+  which is what everything crossing a signature/wire now uses.
+- **`Hash` has no `from_hex`.** Proto exposes `to_hex` but no inverse. The one consumer
+  (`daemon-swarm-run` manifest validation of the hex `ShardDesc.blake3` string field) uses a local
+  `is_blake3_hex` predicate expressed over `Hash::LEN` rather than parsing a `Hash`. The manifest
+  hash stays a JSON hex `String` (not a typed `Hash`), unchanged.
+- **`RunId`/`RoundId`/`PayloadKey`/`BatchId` kept local.** Proto keeps run ids as `String`
+  (`Join::run_id`) and rounds/batch ids as bare `u64` (`RoundOpen::round`, `BatchWindow`), so there
+  is no proto newtype to swap for. `RoundId`/`BatchId` are `u64` aliases; `RunId`/`PayloadKey` are
+  local newtypes/structs keyed over the proto `PeerId`. R1's `seam` re-exports are retained as the
+  shared vocabulary module (not deleted) since they now resolve to proto types + these locals.
+- **Receipts re-expressed as proto `SignedMessage`.** R1's local `StorageReceipt`/`SignedReceipt`/
+  `ReceiptSigner`/`UnsignedSigner` are gone. `ReceiptProducer` now emits proto
+  `SwarmMessage::StorageReceipt` inside a real ed25519 `SignedMessage` (via `SignedMessage::sign`).
+  Shape shift: proto's `StorageReceipt` is round-scoped with a `verified: Vec<RecordEntry>` batch and
+  carries **no `run` field** (run is contextual — it stays in the transport `PayloadKey` for store
+  lookup). Per-key `produce` yields a single-entry receipt; `produce_available` was replaced by
+  `produce_round(round, keys)` which aggregates all available keys into one signed message.
+- **No root `Cargo.toml`/`deny.toml`/`flake.nix` change was needed.** The proto path dep was already
+  wired for `daemon-swarm-net`/`daemon-swarm-run` (`daemon-swarm-proto = { workspace = true }`), so
+  the swap added no third-party dependency and required no `cargo deny` re-run beyond the gate. (Net
+  keeps `blake3` — still used directly for gossip dedupe; net's now-unused `ciborium` and run's
+  now-unused direct `blake3` are left declared, harmless to the gates, flagged for `audit-cleanup`.)
+
+### Wave-2 must know
+
+- **`burn` is still on the default gate** (declared directly by `daemon-train`; a full
+  `cargo test/clippy --workspace` cold-builds wasmtime+burn). The `OpBackend` trait is the
+  **one-crate seam** that makes lane-splitting burn/CubeCL off the default path a single-crate change
+  — do it in Wave 2. Do NOT change the `tabi@1` import names or the phase-legality table doing so.
+- **Egress schemes unsupported.** `ArtifactResolver` dispatches `r2`/`hf`/`https` but returns
+  `SchemeUnsupported` until `daemon_egress::EgressClient` is wired (raw `reqwest` is clippy-banned
+  workspace-wide; `daemon-swarm-net` declares `reqwest` but constructs no client). Wire egress before
+  any non-`file://` artifact/payload plane.
+- **Guest `.wasm` location.** Guests build into `guests/target/wasm32-unknown-unknown/release/`
+  (gitignored, separate workspace); `daemon-train`'s guest-lifecycle tests locate via
+  `SWARM_TEST_GUEST_DIR` else the manifest-relative path, building on demand if absent (needs the
+  dev-shell `wasm32-unknown-unknown` rust-std). Verified from the integration worktree at Merge 1.
+- **Additive-only extension.** The proto API, `SwarmTransport` traits, `TrainerBackend`, worker
+  protocol, `tabi@1` subset, det-core signatures, and the phase table are frozen; extend, do not
+  break.
