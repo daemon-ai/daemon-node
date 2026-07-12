@@ -132,3 +132,33 @@ daemon-train worker binary`); the fake worker keeps R3's side testable end to en
   struct + its figment extraction test live here; wiring it into `NodeConfig` is post-MVP node work.
 - **Additive-only extension** of the frozen seams remains the rule; the `local_coordinator` /
   runner-CLI / drill-helper / config seams above freeze at Merge 3.
+
+## Delivered (final)
+
+Commits on `swarm/r3` (base `39c0ebd`, oldest → newest):
+
+| Commit | Subject |
+|---|---|
+| `mirror(R3)` | ledger (this file) |
+| `feat(swarm-run)` | promote `local_coordinator` shell + churn-drill harness + `[swarm]` config |
+| `feat(swarm-e2e)` | churn/failure drills over the local runner |
+| `style(swarm-run)` | clippy `-D warnings` clean |
+| `feat(train-client)` | RUN-9/10 preemption-as-churn + assess staging over the worker protocol |
+| `feat(swarm-run)` | `swarm-local` local runner CLI — stub + worker backends |
+
+- **Binary landed in `bins/swarm-local`** (the `bins/*` glob picks it up — no root `Cargo.toml` edit),
+  not `daemon-swarm-run/src/bin/`.
+- **Drills** (`tests/daemon-swarm-e2e/tests/drills.rs`), each asserting the run completes with all
+  surviving digests equal: `late_join_mid_run_syncs_and_contributes`,
+  `hard_peer_death_dropped_after_absences`, `payload_store_outage_absorbed_by_stall_ladder`,
+  `desync_injection_detected_and_resynced`, `coordinator_restart_mid_run_completes`.
+- **`MERGE-3` marker sites:** `daemon-swarm-run/src/harness.rs` (`quorum_digests` desync-detector
+  stand-in) + `tests/daemon-swarm-e2e/tests/drills.rs` (desync drill) → observe `DesyncVerdict`;
+  `bins/swarm-local/src/main.rs`, `daemon-train-client/tests/supervisor.rs`, and
+  `daemon-train-client/src/bin/fake-train-worker.rs` → the real E3 `daemon-train` worker binary /
+  meta-mode assess. (The R2-carried `checkpoint.rs` resync-quorum `MERGE-2` marker still stands.)
+- **Gates (green):** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `typos docs/specs`, the full swarm-stack `cargo test` (proto/coordinator/net/run/train-client/e2e),
+  and `cargo test --workspace --no-run`. Test counts: `daemon-swarm-run` 32 + `record_ordering` 2,
+  `daemon-swarm-e2e` 5 drills + 2 P0, `daemon-train-client` 2 unit + 4 integration (incl. RUN-9/10),
+  `daemon-swarm-run` config 3.
