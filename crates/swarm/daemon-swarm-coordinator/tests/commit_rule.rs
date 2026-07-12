@@ -13,7 +13,9 @@ use daemon_swarm_proto::{
     commit_set, elect_checkpointer, select_verifiers, Hash, IrohId, PeerId, Seed,
 };
 
-use daemon_swarm_coordinator::commit::{all_evidenced, committed_entries, has_evidence};
+use daemon_swarm_coordinator::commit::{
+    all_evidenced, committed_entries, has_evidence, quorum_root,
+};
 use daemon_swarm_coordinator::epoch::{ready_to_update_epoch, EpochInputs, EpochTrigger};
 use daemon_swarm_coordinator::state::{Member, RoundState};
 use daemon_swarm_coordinator::{tick, Input, Output, Rejection};
@@ -127,6 +129,96 @@ fn proto6_witness_quorum_gate() {
     // A third witness reaches quorum → evidence.
     rs.attestations.insert(witnesses[2], attest(&cover));
     assert!(has_evidence(&rs, &pid(1), &payload_hash(30)));
+}
+
+// ----- §6.4 root-only attestation coverage (Wave 3) -----
+
+fn bare_root_attest(pairs: &[(PeerId, Hash)]) -> Attestation {
+    Attestation {
+        round: 0,
+        set: commit_set(pairs).commitment(),
+        inline: None,
+    }
+}
+
+fn inline_attest(pairs: &[(PeerId, Hash)]) -> Attestation {
+    Attestation {
+        round: 0,
+        set: commit_set(pairs).commitment(),
+        inline: Some(
+            pairs
+                .iter()
+                .map(|(peer, hash)| AttestEntry {
+                    peer: *peer,
+                    hash: *hash,
+                })
+                .collect(),
+        ),
+    }
+}
+
+#[test]
+fn root_only_attestation_covers_at_quorum() {
+    let witnesses: Vec<PeerId> = (10..14).map(pid).collect(); // 4 witnesses → quorum 3
+    let set_pairs = vec![(pid(1), payload_hash(30))];
+    let root = commit_set(&set_pairs).commitment().root;
+
+    let mut rs = slot_with(witnesses.clone());
+    rs.commitments.insert(pid(1), commitment(0, 30));
+
+    // Three witnesses attest a BARE root R (inline omitted) — a quorum agrees on the root …
+    for w in &witnesses[..3] {
+        rs.attestations.insert(*w, bare_root_attest(&set_pairs));
+    }
+    assert_eq!(quorum_root(&rs), Some(root), "3/4 agree on the same root");
+    // … but root agreement alone does not pin membership without an opening or receipt.
+    assert!(!has_evidence(&rs, &pid(1), &payload_hash(30)));
+
+    // The fourth witness supplies the inline opening of R → membership pinned exactly → covered.
+    rs.attestations
+        .insert(witnesses[3], inline_attest(&set_pairs));
+    assert!(has_evidence(&rs, &pid(1), &payload_hash(30)));
+}
+
+#[test]
+fn root_only_below_quorum_not_covered() {
+    let witnesses: Vec<PeerId> = (10..14).map(pid).collect(); // quorum 3
+    let mut rs = slot_with(witnesses.clone());
+    rs.commitments.insert(pid(1), commitment(0, 30));
+
+    let set_pairs = vec![(pid(1), payload_hash(30))];
+    let other_pairs = vec![(pid(2), payload_hash(99))];
+    // Only 2 witnesses agree on R (an inline opening + a bare root); the other 2 attest a different
+    // root — so no root reaches the quorum of 3.
+    rs.attestations
+        .insert(witnesses[0], inline_attest(&set_pairs));
+    rs.attestations
+        .insert(witnesses[1], bare_root_attest(&set_pairs));
+    rs.attestations
+        .insert(witnesses[2], bare_root_attest(&other_pairs));
+    rs.attestations
+        .insert(witnesses[3], bare_root_attest(&other_pairs));
+
+    assert_eq!(quorum_root(&rs), None, "no root reaches quorum");
+    assert!(!has_evidence(&rs, &pid(1), &payload_hash(30)));
+}
+
+#[test]
+fn root_only_agreement_without_opening_is_not_evidence() {
+    let witnesses: Vec<PeerId> = (10..14).map(pid).collect();
+    let set_pairs = vec![(pid(1), payload_hash(30))];
+    let mut rs = slot_with(witnesses.clone());
+    rs.commitments.insert(pid(1), commitment(0, 30));
+
+    // All four witnesses attest the same bare root — full agreement, but nobody opens the set and
+    // there is no StorageReceipt, so the payload cannot enter the record (§6.4: an opening or a
+    // receipt must pin the specific member).
+    for w in &witnesses {
+        rs.attestations.insert(*w, bare_root_attest(&set_pairs));
+    }
+    assert!(quorum_root(&rs).is_some());
+    assert!(!has_evidence(&rs, &pid(1), &payload_hash(30)));
+    assert!(committed_entries(&rs, &[member(1)]).is_empty());
 }
 
 // ----- PROTO-5: bad signature rejected at the frame -----
