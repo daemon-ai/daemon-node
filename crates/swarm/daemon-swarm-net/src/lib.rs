@@ -18,10 +18,17 @@
 //! Merge-1 note: the shared identity/hash vocabulary in [`seam`] is now the canonical
 //! `daemon-swarm-proto` types (blake3 `Hash`, `PeerId`); the [`ReceiptProducer`] emits proto's
 //! signed `StorageReceipt` control message (ed25519 over canonical CBOR).
+//!
+//! Wave-2 (R2) additions: [`Deduper`] — the reusable content-hash dedupe [`LoopbackGossip`]
+//! composes (NET-6); and [`fetch_with_fallback`] — payload fetch with bounded [`RetryPolicy`]
+//! backoff + fallback sources (NET-4), the miss-or-verified-bytes path the §6.4 stall ladder
+//! drives.
 
 #![forbid(unsafe_code)]
 
 pub mod artifact;
+pub mod dedupe;
+pub mod fetch;
 pub mod gossip;
 pub mod receipt;
 pub mod seam;
@@ -29,6 +36,8 @@ pub mod store;
 pub mod transport;
 
 pub use artifact::{ArtifactRef, ArtifactResolver, ArtifactScheme};
+pub use dedupe::Deduper;
+pub use fetch::{fetch_with_fallback, RetryPolicy};
 pub use gossip::LoopbackGossip;
 pub use receipt::ReceiptProducer;
 pub use seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};

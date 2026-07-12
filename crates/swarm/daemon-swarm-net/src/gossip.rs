@@ -12,8 +12,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use daemon_swarm_proto::blake3_hash;
-
+use crate::dedupe::Deduper;
 use crate::seam::ContentHash;
 use crate::transport::{ControlPlane, ControlSubscription};
 use crate::SwarmNetError;
@@ -27,8 +26,8 @@ pub struct LoopbackGossip {
 #[derive(Default)]
 struct Inner {
     subscribers: Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-    /// Content hashes already published, so a WS+gossip double-send fans out once.
-    seen: std::collections::HashSet<[u8; 32]>,
+    /// Content-hash dedupe, so a WS+gossip double-send fans out once (the reusable NET-6 rule).
+    dedupe: Deduper,
 }
 
 impl LoopbackGossip {
@@ -48,10 +47,9 @@ impl LoopbackGossip {
 #[async_trait]
 impl ControlPlane for LoopbackGossip {
     async fn publish(&self, message: &[u8]) -> Result<(), SwarmNetError> {
-        let hash = *blake3::hash(message).as_bytes();
         let mut inner = self.inner.lock().expect("gossip lock");
         // Dedupe: a message already disseminated (e.g. seen on WS then gossip) fans out once.
-        if !inner.seen.insert(hash) {
+        if !inner.dedupe.observe(message) {
             return Ok(());
         }
         // Fan out to every live subscriber, dropping any whose receiver has been closed.
@@ -68,10 +66,10 @@ impl ControlPlane for LoopbackGossip {
     }
 }
 
-/// A convenience: the blake3 message id used for dedupe (proto's [`blake3_hash`]).
+/// A convenience: the blake3 message id used for dedupe ([`Deduper::id`]).
 #[must_use]
 pub fn message_id(message: &[u8]) -> ContentHash {
-    blake3_hash(message)
+    Deduper::id(message)
 }
 
 #[cfg(test)]

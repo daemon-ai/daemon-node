@@ -24,8 +24,6 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 ciborium = { workspace = true }
-# Content addressing for artifacts / payloads / receipts (blake3, §6.4 — not sha256).
-blake3 = { workspace = true }
 
 [lints]
 workspace = true
