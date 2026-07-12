@@ -178,6 +178,18 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
+        # devShell toolchain: the pinned stable toolchain PLUS the wasm32-unknown-unknown rust-std,
+        # combined per fenix's cross recipe (same stable channel, so host and wasm rustc stay in
+        # lockstep). This lets the swarm guest experiment modules (`guests/`, `daemon-train-sdk`)
+        # `cargo build --target wasm32-unknown-unknown` in-shell — the `xtask build-guests` target
+        # (swarm-training-spec.md §10.1). Scoped to the dev shell (`craneLibDev` below) so the
+        # package/build outputs keep using the lean host-only `rustToolchain`.
+        rustToolchainDev = fenix.packages.${system}.combine [
+          rustToolchain
+          fenix.packages.${system}.targets.wasm32-unknown-unknown.stable.rust-std
+        ];
+        craneLibDev = (crane.mkLib pkgs).overrideToolchain rustToolchainDev;
+
         # crane's `cleanCargoSource` keeps only Rust/Cargo files, which drops the non-`.rs` grammar
         # assets `daemon-infer` embeds via `include_str!` (`metta.gbnf` / `metta.lark`) — a from-source
         # `nix build` then fails to compile that crate. Extend the Cargo-source filter to also retain
@@ -921,7 +933,7 @@
         };
 
         devShells = let
-          defaultDevShell = craneLib.devShell {
+          defaultDevShell = craneLibDev.devShell {
             # Worker engine toolchain (clang/libclang for bindgen, cmake for the GPU lanes) is present
             # so a dev can build an engine lane locally. The default `cargo test --workspace` still
             # builds only the stub worker — no engine, no cmake step.
@@ -945,7 +957,7 @@
             NIX_SSL_CERT_FILE = caBundle;
             packages =
               [
-                rustToolchain
+                rustToolchainDev
                 fenix.packages.${system}.rust-analyzer
                 pkgs.rust-cbindgen
                 pkgs.python3Packages.zcbor
