@@ -40,24 +40,34 @@ phase-legality table (`daemon-train/src/phase.rs`) agree name-for-name; the addi
 sync test (`daemon-train/tests/abi_surface.rs`, extended from Wave 1's phase-table coverage) pins
 that agreement.
 
-**Wave-2 additions (all `@1`, additive):**
+**Wave-2 additions — the 16 imports the reference consumers (tiny-llama + the three profiles)
+require, all `@1`, additive** (so the implemented v1 vocabulary is the Merge-1 50 + these = **66**;
+see `daemon_train_sdk::TABI_IMPORTS`, pinned by the sync test):
 
-- **Creation / shape:** `arange`, `reshape`, `transpose`, `slice`, `concat`, `cast`, `gather`,
-  `shape_rank`, `shape_dim`, `numel`, `dtype_of`.
-- **Elementwise:** `div`, `pow`, `maximum`, `minimum`; scalar-RHS `add_s`, `sub_s`, `div_s`,
-  `pow_s`; unary `neg`, `abs`, `sign`, `exp`, `log`, `sqrt`, `rsqrt`, `tanh`, `sigmoid`, `erf`,
-  `silu`, `gelu`; `clamp`.
-- **Reductions:** `sum_all`, `mean_all`, `max_all`, `min_all`, `sum_dim`, `mean_dim`, `max_dim`,
-  `l2_norm`.
-- **NN fused:** `embedding`, `rmsnorm`, `layernorm`, `rope`, `flash_attn`, `softmax`.
-- **Optimizer steps:** `nadamw_step`, `sgdm_step`, `signum_step`.
+- **NN fused:** `embedding`, `rmsnorm`, `softmax`, `silu`, `rope`, `flash_attn`.
+- **Shape:** `reshape`, `transpose`, `slice`.
 - **Compression (native lane, `da_inner_update` + `da_make_update`):** `topk_chunk`,
   `chunk_scatter`, `absmax_pack`, `absmax_unpack`, `dct2`, `idct2`.
 - **Det lane (`da_ingest_updates`):** `det_idct2`.
-- **Autodiff:** `detach`.
 
 Numeric contract for the compression/DCT natives lives in `det-core` (see seam 3), so the sim and
 the host `CpuBackend` share one reference implementation (HOST-1/2/3 goldens).
+
+**Deviation (recorded):** `topk_chunk@1` logically returns `(values, indices)`; because Rust's
+wasm32 C-ABI cannot emit a clean multi-value `(i64, i64)` return (the same limitation the E1
+`da_manifest` packing works around), the guest binding returns the values handle and writes the
+indices handle to a `*mut u64` out-param. The logical ABI signature is unchanged; the sim returns
+the pair directly.
+
+**Named-but-not-yet-implemented (ABI §5, deferred additively — the reference consumers do not need
+them this wave):** the remaining §5.4 elementwise/unary set (`div`/`pow`/`maximum`/`minimum`/
+`*_s`/`neg`/`abs`/`sign`/`exp`/`log`/`sqrt`/`rsqrt`/`tanh`/`sigmoid`/`erf`/`gelu`/`clamp`), §5.3
+`concat`/`cast`/`gather`/`arange`/`shape_rank`/`shape_dim`/`numel`/`dtype_of`, §5.5 reductions
+(`sum_all`/`mean_all`/`max_all`/`min_all`/`sum_dim`/`mean_dim`/`max_dim`/`l2_norm`), §5.6
+`layernorm`, §5.7 `nadamw_step`/`sgdm_step`/`signum_step`, §5.1 `detach`, §5.2 `dropout`. These land
+in a later wave following the E1 precedent of shipping an exercised subset; adding each is the same
+name-for-name pattern (SDK extern block + host Linker + phase table + `TABI_IMPORTS`, guarded by
+the sync test).
 
 ### 2. Profile config CBOR schemas (ABI §10.3, `daemon_train_sdk::profiles`)
 
@@ -102,12 +112,19 @@ TinyLlamaCfg {
   vocab: u32, seq_len: u32, ffn_mult: u32, rope_theta: f64, rmsnorm_eps: f64,
   inner: { lr, beta1, beta2, eps, wd },                 # AdamW inner
   profile: "sparse_loco" | "diloco" | "demo",           # selects the comm profile
-  comm: <profile config, tagged by `profile`>,
+  sparse_loco: SparseLocoCfg,  diloco: DiLoCoCfg,  demo: DemoCfg,   # all present, `#[serde(default)]`
 }
 ```
 
-Tied embeddings (logits reuse `tok.weight`). `da_manifest` reports `steps_per_round` from the
-selected profile (`comm.h` for sparse_loco/diloco, 1 for demo).
+The comm config is carried as three `#[serde(default)]` fields (not a serde-tagged enum) so the CBOR
+codec stays free of internally-tagged buffering; the `profile` string selects which one `build`
+reads. Tied embeddings (logits reuse `tok.weight`). All dimensions are chosen so every parameter's
+element count is a multiple of the profile chunking (`sparse_loco.chunk` / `demo.tile²`), so no
+guest-side padding is needed. `da_manifest`'s name is `"tiny-llama"`; its cadence
+(`steps_per_round`, round modes, interval) comes from the selected profile. `n_kv_heads == n_heads`
+is required in v1 (GQA-repeat is future). The model lives as the first-party SDK preset
+`daemon_train_sdk::models::TinyLlama` (§10.5), so the wasm guest (`experiment!(TinyLlama)`) and the
+sim tests exercise one implementation.
 
 ## Planned slices (commit order; each lane-scoped green)
 
