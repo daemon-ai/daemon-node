@@ -26,13 +26,21 @@
 
 pub mod backend;
 pub mod checkpoint;
+pub mod config;
 pub mod data;
 pub mod engine;
 pub mod protocol;
 pub mod seam;
 
-/// In-process multi-peer test harness + the TEST-ONLY scripted coordinator. Available to external
-/// crates behind the `harness` feature, and to this crate's own tests via `cfg(test)`.
+/// The runnable local-mode coordinator shell (the impure driver around the pure
+/// `daemon-swarm-coordinator` `tick`). Behind the `harness` feature (its coordinator dep is
+/// `harness`-optional), and available to this crate's own tests via `cfg(test)`.
+#[cfg(any(test, feature = "harness"))]
+pub mod local_coordinator;
+
+/// In-process multi-peer harness + the churn/failure drill machinery, driven by the real
+/// [`local_coordinator`] shell. Available to external crates behind the `harness` feature, and to
+/// this crate's own tests via `cfg(test)`.
 #[cfg(any(test, feature = "harness"))]
 pub mod harness;
 

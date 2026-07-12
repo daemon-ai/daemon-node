@@ -48,7 +48,7 @@ use daemon_swarm_proto::{
 };
 
 use crate::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
-use crate::checkpoint::{save_checkpoint, CheckpointManifest};
+use crate::checkpoint::{load_checkpoint, save_checkpoint, CheckpointManifest};
 use crate::data::{slice_interval, BatchInterval, Corpus};
 use crate::seam::{PayloadKey, RoundId, RunId};
 use crate::SwarmRunError;
@@ -258,6 +258,17 @@ where
     #[must_use]
     pub fn peer_id(&self) -> PeerId {
         self.peer
+    }
+
+    /// Load a checkpoint into the backend **before** the round loop, so a late-joining / rejoining
+    /// peer starts from the consensus round base rather than its build-time base (§9 rejoin, the
+    /// late-join drill). Additive to the frozen Merge-2 `RoundEngine` API — call it before
+    /// [`RoundEngine::run`].
+    pub async fn resume_from_checkpoint(
+        &mut self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), SwarmRunError> {
+        load_checkpoint(&self.store, &self.cfg.run, &mut self.backend, manifest).await
     }
 
     /// Run the message-driven round loop until the control plane closes or the stall budget is
