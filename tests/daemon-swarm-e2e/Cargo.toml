@@ -1,0 +1,21 @@
+[package]
+name = "daemon-swarm-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+# The peer-side round engine + the TEST-ONLY scripted-coordinator harness (feature-gated). This
+# e2e is the P0 milestone test at Merge 2, at which point the scripted coordinator is swapped for
+# the real `daemon-swarm-coordinator` tick loop (`// MERGE-2`).
+daemon-swarm-run = { workspace = true, features = ["harness"] }
+daemon-swarm-proto = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
