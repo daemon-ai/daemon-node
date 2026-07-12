@@ -126,3 +126,106 @@ Slices may merge if the gates dictate; every commit passes `cargo fmt --check`,
   `seq_len` (tokens/sequence, for `stop.tokens`), `verification_percent` (default 0, §12) — are
   carried in `CoordinatorParams`, supplied at run creation (Wave-3 authoring), not read from
   `[experiment.config]` at runtime (seam rule §4.3 preserved).
+
+## Wave-2 results — frozen seams (Merge 2)
+
+Landed on `swarm/p2` (base `c1432fa`). Commits (oldest → newest):
+
+| Commit | Subject |
+|---|---|
+| `56a6e9a` | `mirror(P2): ledger` |
+| `43f2026` | `feat(swarm-proto): deterministic assignment — LCG, shuffle, committees, batch windows (green)` |
+| `0c021e7` | `feat(swarm-proto): verifier + checkpointer committee selection (green)` |
+| `8e3fe34` | `feat(swarm-coordinator): pure tick state machine + round protocol + commit rule + admission (green)` |
+
+**Assignment seam** (`daemon_swarm_proto::assignment`, wasm32-clean; re-exported at the crate root):
+
+```rust
+pub struct Lcg;                 // 64-bit MMIX LCG; new/next_u64/below
+pub fn seeded_lcg(seed: &Seed, salt: &[u8]) -> Lcg;
+pub fn deterministic_shuffle<T>(items: &mut [T], rng: &mut Lcg);
+pub fn witness_quorum(n: u32) -> u32;                                   // ⌈⅔n⌉ + small-n specials
+pub fn class_weight(class: ThroughputClass) -> u64;                    // c1=1 c2=4 c3=16 c4=64
+pub fn select_committee(roster: &[PeerId], seed: &Seed, witness_target: u32) -> Committee;
+pub fn select_verifiers(roster: &[PeerId], seed: &Seed, percent: u32) -> Vec<PeerId>; // 0% → empty
+pub fn elect_checkpointer(roster: &[PeerId], seed: &Seed) -> Option<PeerId>;
+pub fn global_batch_at(gb: GlobalBatch, round: u64) -> u64;            // linear ramp
+pub fn advance_cursor(data_index: u64, gb: GlobalBatch, round: u64) -> u64;
+pub fn assign_batches(roster: &[(PeerId, ThroughputClass)], seed: &Seed,
+                      window: BatchWindow, overlap_bps: u32) -> Vec<(PeerId, BatchWindow)>;
+pub struct Committee { pub trainers: Vec<PeerId>, pub witnesses: Vec<PeerId> }
+pub const WITNESS_TARGET_DEFAULT: u32 = 4;
+```
+
+**Coordinator seam** (`daemon_swarm_coordinator`, pure library, wasm32-clean):
+
+```rust
+pub fn tick(state: CoordinatorState, input: Input) -> (CoordinatorState, Vec<Output>);
+pub fn admit(config: &RunConfig, phase: Phase, roster: &[Member], pending: &[Member],
+             cand: &JoinCandidate<'_>) -> Result<(), AdmissionReject>;
+
+pub enum Input   { Clock(u64), Message(SignedMessage), Control(Signed<ControlRequest>) }
+pub enum Output  { Publish(Box<SwarmMessage>), Note(Notice), Reject(Rejection) }
+pub enum Phase   { Uninitialized, WaitingForMembers, Warmup, RoundTrain, RoundWitness,
+                   Cooldown, Finished, Paused }
+pub struct CoordinatorState { /* config, phase, epoch, round, data_index, seed, roster,
+                                 pending, rounds (ring of NUM_STORED_ROUNDS=4), timers,
+                                 tokens_done, rounds_done, … — all canonical-CBOR serializable */ }
+pub struct RunConfig; pub struct CoordinatorParams;  // RunConfig::from_envelope(&Envelope, params)
+pub enum Rejection; pub enum AdmissionReject; pub enum Notice;   // typed reasons/signals
+pub fn ready_to_update_epoch(&EpochInputs) -> EpochTrigger;      // hivemind 3-disjunct port
+```
+
+**Gates** (all green, run via `nix develop --command …` from the worktree root):
+`cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
+`cargo test --workspace` (237 passed, +1 pre-existing flaky
+`daemon-conformance::…detached_notice_reaches_a_parked_durable_parent` — **passes in isolation**,
+outside this lane, unmodified); `cargo build --target wasm32-unknown-unknown -p daemon-swarm-proto`
+(**and** `-p daemon-swarm-coordinator` — the tick is substrate-clean, COORD-3); `typos docs/specs`.
+~47 lane tests authored (proto assignment 8 unit + 9 golden; coordinator 30).
+
+### PROTO coverage map (task labels ↔ tests)
+
+- PROTO-1 `proto1_tick_is_pure_same_input_same_output` · PROTO-2 `proto2_phase_timeouts_walk_the_ladder`
+- PROTO-3 `proto3_ring_wraps_and_cursor_threads`, `cursor_advances_by_global_batch_each_round`
+- PROTO-4 `golden_witness_quorum_ladder`, `witness_quorum_small_n_specials`
+- PROTO-5 `proto5_receipt_evidence_admits_commitment`, `proto5_missing_evidence_holds_the_commit`,
+  `proto5_bad_signature_rejected`
+- PROTO-6 (task label = **witness-quorum gate**) `proto6_witness_quorum_gate`
+- PROTO-7 `proto7_k_absences_drops_and_proto10_rejoin`, `proto7_straggle_within_window_not_dropped`
+- PROTO-8 `assignment_weighted_by_class`, `overlap_10pct_covers_churn`,
+  `assignment_covers_window_exactly_once_property`, `golden_shuffle_of_sixteen`
+- PROTO-9 `proto9_global_batch_ramps_the_cursor`, `proto9_stop_tokens_finishes_run`,
+  `proto9_epoch_boundary_returns_to_waiting` · PROTO-10 `proto10_checkpointer_…` + rejoin (above)
+- PROTO-14 `proto14_halted_states_error`, `proto14_pause_requires_authorized_principal`
+- PROTO-15 `proto15_verifier_noop_at_zero_percent` · PROTO-16 `proto16_tick_is_integer_deterministic`
+- PROTO-17 `proto17_epoch_advance_disjuncts` · PROTO-20 `proto20_run_is_byte_reproducible`,
+  `proto20_state_survives_cbor_round_trip`
+
+### Deviations from the TDD's literal PROTO labels (recorded)
+
+- **PROTO-6** — the TDD text is health-check *accusation* → `Dropped`. There is **no accusation /
+  health-check message in the frozen Wave-1 proto set** (accusation is the iroh-tier path, §6.4), so
+  it is not wire-realizable this wave. The task's own label for PROTO-6 is "witness quorum gate",
+  which is implemented + tested. Liveness-drop is delivered via **K record-absences** (PROTO-7, the
+  daemon Delta), which *is* wire-grounded. If accusation health-checks are wanted, they need an
+  additive `HealthCheck` message at a future merge.
+- **PROTO-10** — task label is "rejoin path" (implemented via tick); the TDD's checkpointer-election
+  half is also delivered (`elect_checkpointer`, tested), so both readings are covered.
+
+### Merge-2 integration must watch for
+
+- **`tick` emits unsigned coordinator messages** — the Wave-3 harness (lane R) MUST sign
+  `RoundOpen`/`RoundRecord` with the coordinator identity before publishing. Determinism is
+  preserved (ed25519 is deterministic).
+- **Warmup exits on the `warmup` timeout only** — per-peer model-ready confirmation is
+  worker-protocol/local (§6.5 step 5); surface it to the coordinator out of band in Wave 3 if an
+  earlier Warmup exit is wanted (no proto change needed; the timeout path already advances).
+- **Attestation coverage rides the `inline` set** (small-roster path). The root-only + membership-
+  proof coverage path is a Wave-3 add (needs the coordinator to hold/verify proofs).
+- **Envelope-hash admission is structural, not wired** — `JoinCandidate::asserted_hash` + the
+  `EnvelopeHashMismatch` reason exist and are tested, but `tick` passes `None` because the frozen
+  `Join` carries no hash. Enforce it once `Join` gains an additive `envelope_hash` field / assessment
+  token.
+- **`daemon-swarm-coordinator` is intentionally a pure library** (no `axum`/`tokio`/`thiserror` this
+  wave). Lane R re-adds server deps when it wires the runnable coordinator in `bins/` (Wave 3).
