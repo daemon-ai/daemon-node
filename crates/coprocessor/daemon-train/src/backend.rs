@@ -36,7 +36,11 @@ pub struct AdamwHp {
 }
 
 /// The numeric engine the host dispatch layer drives. Wave 2 replaces the impl, not the trait.
-pub trait OpBackend {
+///
+/// `Send` (additive supertrait, Wave 3): the wasm host [`crate::Instance`] carries a
+/// `Box<dyn OpBackend>`, and `WasmBackend` (which owns an `Instance`) must be `Send` to satisfy the
+/// `daemon_swarm_run::TrainerBackend: Send` bound. The only impl, [`CpuBackend`], is already `Send`.
+pub trait OpBackend: Send {
     /// Store `data` as a fresh tensor.
     fn create(&mut self, data: Vec<f32>) -> TensorId;
     /// A fresh `n`-element zero tensor.

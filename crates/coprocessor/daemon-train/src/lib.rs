@@ -23,6 +23,7 @@ pub mod meta;
 pub mod phase;
 pub mod runtime;
 pub mod trap;
+pub mod wasm_backend;
 
 pub use backend::{AdamwHp, CpuBackend, OpBackend, TensorId};
 pub use handle::{HandleClass, Lane};
@@ -30,6 +31,7 @@ pub use meta::MetaReport;
 pub use phase::Phase;
 pub use runtime::{EngineConfig, Instance, LoadedModule, Manifest, ParamInfo, Worker};
 pub use trap::{Trap, TrapCode};
+pub use wasm_backend::{WasmBackend, WasmBackendConfig, WasmBackendError};
 
 /// The tensor-ABI major version this worker implements.
 pub const TENSOR_ABI_MAJOR: u32 = 1;

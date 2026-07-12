@@ -119,6 +119,37 @@ struct Container {
     sections: Vec<Section>,
 }
 
+/// The canonical wire form of one update-container section (the opaque payload the swarm moves +
+/// hashes but never parses, ABI §4.3/§7.3). A `da_make_update` container serializes to a
+/// `Vec<SectionWire>`; a received payload deserializes back into host [`Section`]s for ingest.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum SectionWire {
+    /// An experiment-defined opaque byte section (`upd_push_bytes`).
+    Bytes(Vec<u8>),
+    /// A tensor section (`upd_push_tensor`), staged det-lane at ingest.
+    Tensor {
+        /// Row-major fp32 data.
+        data: Vec<f32>,
+        /// The tensor shape.
+        shape: Vec<u32>,
+    },
+}
+
+/// The canonical wire form of the full worker state dict (Wave-3 checkpoint body, §9). Stores every
+/// param master + round base and **all** persistents (both classes) so `load → continue` is
+/// bit-exact; the replicated (`class = 1`) subset a cross-peer resync needs is included.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CheckpointWire {
+    /// Param fp32 masters, registration order.
+    params: Vec<Vec<f32>>,
+    /// Param round bases (the outer-step anchor), registration order.
+    round_base: Vec<Vec<f32>>,
+    /// All native persistents (both classes), registration order.
+    persistents: Vec<Vec<f32>>,
+    /// All det persistents (both classes), registration order.
+    det_persistents: Vec<Vec<f32>>,
+}
+
 struct BatchData {
     tokens: Vec<u32>,
     batch: u32,
@@ -374,6 +405,19 @@ impl Worker {
             .instantiate_pre(&module)
             .map_err(|e| TrainError::Sandbox(e.to_string()))?;
         Ok(LoadedModule { pre })
+    }
+
+    /// The import names a module requests (the peer-side re-validation input, spec §6.5): compile
+    /// the module and list its declared imports (e.g. `matmul@1`). A worker rejects a run whose
+    /// module imports an op outside the host `tabi@1` vocabulary before ever instantiating it.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainError::Sandbox`] if the module fails to validate / compile.
+    pub fn module_imports(&self, wasm: &[u8]) -> Result<Vec<String>, TrainError> {
+        let module =
+            Module::new(&self.engine, wasm).map_err(|e| TrainError::Sandbox(e.to_string()))?;
+        Ok(module.imports().map(|i| i.name().to_string()).collect())
     }
 
     /// Instantiate a loaded module with a fresh host state (T3: always safe at any boundary).
@@ -862,6 +906,223 @@ impl Instance {
             }
         }
         0
+    }
+
+    // -- Wave-3 E↔R wiring (additive) -----------------------------------------------------------
+
+    /// Seal a `da_make_update` container handle to canonical CBOR — the opaque payload the swarm
+    /// moves + hashes (never parses, ABI §4.3/§7.3). Round-trips through [`Self::ingest_payloads`].
+    ///
+    /// # Errors
+    ///
+    /// [`TrainError::Trap`] ([`TrapCode::InvalidHandle`]) if `container` is not an update container;
+    /// [`TrainError::Engine`] on a (should-never-happen) CBOR encode failure.
+    pub fn update_bytes(&self, container: u64) -> Result<Vec<u8>, TrainError> {
+        let idx = match handle::classify(container) {
+            Some(HandleClass::Update) => (handle::stable_index(container) - 1) as usize,
+            _ => return Err(Trap::bare(TrapCode::InvalidHandle, "not an update container").into()),
+        };
+        let c =
+            self.store.data().containers.get(idx).ok_or_else(|| {
+                Trap::bare(TrapCode::InvalidHandle, "update container out of range")
+            })?;
+        let wire: Vec<SectionWire> = c
+            .sections
+            .iter()
+            .map(|s| match s {
+                Section::Bytes(b) => SectionWire::Bytes(b.clone()),
+                Section::Tensor { data, shape } => SectionWire::Tensor {
+                    data: data.clone(),
+                    shape: shape.clone(),
+                },
+            })
+            .collect();
+        let mut buf = Vec::new();
+        ciborium::into_writer(&wire, &mut buf)
+            .map_err(|e| TrainError::Engine(format!("update encode: {e}")))?;
+        Ok(buf)
+    }
+
+    /// Stage the record-ordered committed set (each payload from [`Self::update_bytes`]) through the
+    /// `upd_*` ABI — one container per staged payload, in caller order — then run
+    /// `da_ingest_updates` (the outer step). The post-ingest master becomes the next round base.
+    ///
+    /// The caller MUST stage in `RoundRecord` order (sorted by node pubkey bytes, §6.4 I3); ordering
+    /// is a consensus input.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainError::Engine`] on a payload decode failure; [`TrainError::Trap`] on any ingest trap.
+    pub fn ingest_payloads(&mut self, round: u64, payloads: &[Vec<u8>]) -> Result<(), TrainError> {
+        {
+            let d = self.store.data_mut();
+            // Fresh container arena for this ingest: make_update's container (already sealed to
+            // bytes by the caller) and any prior round's staging are no longer needed.
+            d.containers.clear();
+            d.staged.clear();
+        }
+        for payload in payloads {
+            let wire: Vec<SectionWire> = ciborium::from_reader(payload.as_slice())
+                .map_err(|e| TrainError::Engine(format!("payload decode: {e}")))?;
+            let sections = wire
+                .into_iter()
+                .map(|s| match s {
+                    SectionWire::Bytes(b) => Section::Bytes(b),
+                    SectionWire::Tensor { data, shape } => Section::Tensor { data, shape },
+                })
+                .collect();
+            let d = self.store.data_mut();
+            d.containers.push(Container { sections });
+            let idx = d.containers.len() - 1;
+            d.staged.push(idx);
+        }
+        self.ingest(round, payloads.len() as u32)
+    }
+
+    /// The canonical state bytes the round digest is taken over (spec §5.6): every param fp32 master,
+    /// then the `class = 1` **replicated** native persistents, then the replicated det persistents —
+    /// all in registration order, little-endian. Local (`class = 0`) persistents are excluded (peers
+    /// rebuild them, ABI §5.1). Feed this to `daemon_swarm_proto::digest::digest_state`.
+    #[must_use]
+    pub fn canonical_state_bytes(&self) -> Vec<u8> {
+        let d = self.store.data();
+        let mut buf = Vec::new();
+        for p in &d.params {
+            for v in d.backend.view(p.master) {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for s in d.persistents.iter().filter(|s| s.class == 1) {
+            for v in d.backend.view(s.tensor) {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for s in d.det_persistents.iter().filter(|s| s.class == 1) {
+            for v in d.backend.view(s.tensor) {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Serialize the full worker state dict with blake3 integrity (§9): `blake3(body) ++ body`,
+    /// `body` = canonical CBOR of masters + round bases + all persistents + all det persistents.
+    /// Restored bit-exactly by [`Self::restore_checkpoint`].
+    #[must_use]
+    pub fn checkpoint_bytes(&self) -> Vec<u8> {
+        let d = self.store.data();
+        let wire = CheckpointWire {
+            params: d
+                .params
+                .iter()
+                .map(|p| d.backend.view(p.master).to_vec())
+                .collect(),
+            round_base: d
+                .params
+                .iter()
+                .map(|p| d.backend.view(p.round_base).to_vec())
+                .collect(),
+            persistents: d
+                .persistents
+                .iter()
+                .map(|s| d.backend.view(s.tensor).to_vec())
+                .collect(),
+            det_persistents: d
+                .det_persistents
+                .iter()
+                .map(|s| d.backend.view(s.tensor).to_vec())
+                .collect(),
+        };
+        let mut body = Vec::new();
+        ciborium::into_writer(&wire, &mut body)
+            .expect("CheckpointWire is always CBOR-serializable");
+        let sum = blake3::hash(&body);
+        let mut out = Vec::with_capacity(32 + body.len());
+        out.extend_from_slice(sum.as_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Restore state from [`Self::checkpoint_bytes`], verifying the blake3 integrity prefix and the
+    /// per-slot lengths. Sets each param's master + storage + round base and every persistent, so a
+    /// re-instantiated instance (T3) continues bit-exactly.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainError::Engine`] on a short/corrupt buffer, a blake3 mismatch, or a layout mismatch
+    /// (wrong param/persistent count or element count vs the current registration).
+    pub fn restore_checkpoint(&mut self, bytes: &[u8]) -> Result<(), TrainError> {
+        let (sum, body) = bytes
+            .split_at_checked(32)
+            .ok_or_else(|| TrainError::Engine("checkpoint too short".into()))?;
+        if blake3::hash(body).as_bytes() != sum {
+            return Err(TrainError::Engine("checkpoint blake3 mismatch".into()));
+        }
+        let wire: CheckpointWire = ciborium::from_reader(body)
+            .map_err(|e| TrainError::Engine(format!("checkpoint decode: {e}")))?;
+        let d = self.store.data_mut();
+        let np = d.params.len();
+        if wire.params.len() != np
+            || wire.round_base.len() != np
+            || wire.persistents.len() != d.persistents.len()
+            || wire.det_persistents.len() != d.det_persistents.len()
+        {
+            return Err(TrainError::Engine(
+                "checkpoint layout does not match the built registration".into(),
+            ));
+        }
+        let expect = |got: usize, want: usize, what: &str| {
+            if got == want {
+                Ok(())
+            } else {
+                Err(TrainError::Engine(format!(
+                    "checkpoint {what} length {got} != registered {want}"
+                )))
+            }
+        };
+        for i in 0..np {
+            let (master, storage, rb, want) = (
+                d.params[i].master,
+                d.params[i].storage,
+                d.params[i].round_base,
+                HostState::numel(&d.params[i].shape),
+            );
+            expect(wire.params[i].len(), want, "param")?;
+            expect(wire.round_base[i].len(), want, "round_base")?;
+            d.backend.write(master, &wire.params[i]);
+            d.backend.write(storage, &wire.params[i]);
+            d.backend.write(rb, &wire.round_base[i]);
+        }
+        for (i, s) in d.persistents.iter().enumerate() {
+            expect(
+                wire.persistents[i].len(),
+                HostState::numel(&s.shape),
+                "persistent",
+            )?;
+        }
+        for (i, s) in d.det_persistents.iter().enumerate() {
+            expect(
+                wire.det_persistents[i].len(),
+                HostState::numel(&s.shape),
+                "det_persistent",
+            )?;
+        }
+        let persist_ids: Vec<TensorId> = d.persistents.iter().map(|s| s.tensor).collect();
+        let det_ids: Vec<TensorId> = d.det_persistents.iter().map(|s| s.tensor).collect();
+        for (t, data) in persist_ids.into_iter().zip(&wire.persistents) {
+            d.backend.write(t, data);
+        }
+        for (t, data) in det_ids.into_iter().zip(&wire.det_persistents) {
+            d.backend.write(t, data);
+        }
+        Ok(())
+    }
+
+    /// The number of host imports charged over this instance's life (the HOST-15 manifest-purity
+    /// probe: `da_manifest` must charge zero — it enters no phase, so any import would trap).
+    #[must_use]
+    pub fn imports_charged(&self) -> usize {
+        self.store.data().ops_used.len()
     }
 }
 
