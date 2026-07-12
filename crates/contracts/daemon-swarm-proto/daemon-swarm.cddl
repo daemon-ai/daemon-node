@@ -1,0 +1,114 @@
+; daemon-swarm.cddl — the swarm-training control-plane wire contract (spec §6.4, §7.3).
+;
+; Every peer↔coordinator and peer↔peer control message is deterministic CBOR (serde/ciborium via
+; the crate's canonical RFC 8949 §4.2 encoder), signed by the node identity (§7.2), and versioned by
+; `SwarmProtoVersion` (u16) — independent of the app `WireVersion`. The Rust serde types in
+; `daemon-swarm-proto` are the source of truth; this file is the authoritative schema the
+; `cddl_conformance` test validates real ciborium bytes against.
+;
+; Note on byte lengths: `cddl-cat` (the in-process validator, matching daemon-api's flow) does not
+; enforce `.size N`, so fixed-width byte fields are declared as plain `bstr` here and their lengths
+; are enforced by the Rust newtypes (PeerId/Hash/Root/Seed/Signature = 32 B, Signature = 64 B,
+; StateDigest = 16 B, IrohId = 32 B). Same convention as daemon-api.cddl's `content-hash`.
+
+; ----- scalars / identifiers -----
+swarm-proto-version = uint            ; SwarmProtoVersion (u16)
+round               = uint
+size                = uint
+peer-id             = bstr            ; ed25519 node identity (32 B)
+iroh-id             = bstr            ; iroh NodeId (32 B)
+hash                = bstr            ; blake3 content hash (32 B)
+root                = bstr            ; blake3 merkle root (32 B)
+seed                = bstr            ; round seed (32 B)
+signature           = bstr            ; ed25519 signature (64 B)
+state-digest        = bstr            ; xxh3-128 digest (16 B)
+
+throughput-class = "c1" / "c2" / "c3" / "c4"
+straggle-status  = "fetching" / "stalled" / "catching_up"
+
+; ----- shared shapes -----
+locator = { "store_key": tstr }
+        / { "blob_ticket": tstr }
+
+batch-window   = { "start": uint, "end": uint }
+set-commitment = { "root": root, "count": uint }
+attest-entry   = { "peer": peer-id, "hash": hash }
+record-entry   = { "peer": peer-id, "hash": hash, "size": size }
+capabilities   = [* tstr]             ; sorted name@version tokens
+
+; ----- the seven round messages -----
+round-open = {
+  "round": round,
+  "seed": seed,
+  "roster_digest": hash,
+  "batch": batch-window,
+  "deadline_unix_s": uint,
+}
+
+commitment = {
+  "round": round,
+  "payload": hash,
+  "size": size,
+  "locators": [* locator],
+}
+
+attestation = {
+  "round": round,
+  "set": set-commitment,
+  "inline": ([* attest-entry] / null),
+}
+
+storage-receipt = {
+  "round": round,
+  "verified": [* record-entry],
+}
+
+round-record = {
+  "round": round,
+  "set": set-commitment,
+  "drops": [* peer-id],
+  "next_seed": seed,
+  "set_locator": locator,
+  "inline": ([* record-entry] / null),
+}
+
+digest = {
+  "round": round,
+  "digest": state-digest,
+}
+
+straggle = {
+  "round": round,
+  "status": straggle-status,
+}
+
+; ----- envelope (membership) messages -----
+join = {
+  "run_id": tstr,
+  "iroh_id": iroh-id,
+  "class": throughput-class,
+  "capabilities": capabilities,
+}
+
+heartbeat = {
+  "round": round,
+}
+
+; ----- the externally-tagged message union -----
+swarm-message = { "RoundOpen": round-open }
+              / { "Commitment": commitment }
+              / { "Attestation": attestation }
+              / { "StorageReceipt": storage-receipt }
+              / { "RoundRecord": round-record }
+              / { "Digest": digest }
+              / { "Straggle": straggle }
+              / { "Join": join }
+              / { "Heartbeat": heartbeat }
+
+; ----- the signed wire frame (everything on the wire is one of these) -----
+signed-message = {
+  "version": swarm-proto-version,
+  "payload": swarm-message,
+  "signer": peer-id,
+  "sig": signature,
+}

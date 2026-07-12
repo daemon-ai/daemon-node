@@ -4353,8 +4353,13 @@ dependencies = [
 name = "daemon-swarm-proto"
 version = "0.0.1"
 dependencies = [
+ "blake3",
+ "cddl-cat",
  "ciborium",
+ "ed25519-dalek",
+ "proptest",
  "serde",
+ "xxhash-rust",
 ]
 
 [[package]]

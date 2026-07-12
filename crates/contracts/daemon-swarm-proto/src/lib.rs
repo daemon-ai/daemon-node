@@ -1,62 +1,48 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-swarm-proto` — the swarm-training wire contract.
+//! `daemon-swarm-proto` — the swarm-training consensus / wire contract.
 //!
-//! Envelope schema + validation, the coordinator state machine (`tick`), committee / assignment
-//! math, capability-set types, the swarm CDDL types, and [`SWARM_PROTO_VERSION`]. This crate is
-//! the single authority for the swarm wire shapes shared by the host, the participant runtime, and
-//! the (wasm32) coordinator DO — see `docs/specs/swarm-training-spec.md` §10.1.
+//! Canonical CBOR codec, run-envelope schema + freeze/verify, capability-set admission, merkle set
+//! commitments, the seven round messages + their CDDL, the round state-digest schedule, and the
+//! [`SwarmProtoVersion`]. This crate is the single authority for the swarm wire shapes shared by
+//! the host, the participant runtime, and the (wasm32) coordinator DO — see
+//! `docs/specs/swarm-training-spec.md` §6, §7.3, §10.1, §16.
 //!
-//! **wasm32-clean by construction:** the only dependencies are `serde` (schema) and `ciborium`
-//! (CBOR codec). No `tokio`, no Burn, no wasmtime — nothing that would fail to build for the
-//! `wasm32-unknown-unknown` coordinator target (§11.2).
-//!
-//! Wave-0 scaffold: the concrete envelope/state-machine types land with lane **P**.
+//! **wasm32-clean by construction:** the only dependencies are `serde`, `ciborium`, `blake3`,
+//! `xxhash-rust`, and `ed25519-dalek` — no `tokio`, Burn, or wasmtime — so it builds for the
+//! `wasm32-unknown-unknown` coordinator target (§11.2). Signing uses only deterministic
+//! ed25519 operations (no RNG on the crate's non-test paths).
 
 #![forbid(unsafe_code)]
 
-use std::error::Error;
-use std::fmt;
+pub mod bytes;
+pub mod canonical;
+pub mod capability;
+pub mod digest;
+pub mod envelope;
+pub mod error;
+pub mod hash;
+pub mod merkle;
+pub mod messages;
+pub mod sign;
+pub mod version;
 
-/// The swarm protocol version negotiated between coordinator and participants.
-///
-/// Distinct from the app↔node `WireVersion`: this governs the swarm control-plane envelope only
-/// (swarm-training-spec.md §10.1). Bump on any incompatible envelope change.
-pub const SWARM_PROTO_VERSION: u32 = 0;
-
-/// Errors surfaced when validating or decoding a swarm protocol envelope.
-///
-/// Hand-rolled (rather than via `thiserror`) to keep this crate's dependency surface to `serde` +
-/// `ciborium`, so it stays trivially `wasm32-unknown-unknown`-clean.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum SwarmProtoError {
-    /// An envelope failed schema validation (a field was out of range or inconsistent).
-    Validation(String),
-    /// A CBOR (de)serialization step failed.
-    Codec(String),
-}
-
-impl fmt::Display for SwarmProtoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Validation(detail) => write!(f, "swarm envelope validation failed: {detail}"),
-            Self::Codec(detail) => write!(f, "swarm envelope codec error: {detail}"),
-        }
-    }
-}
-
-impl Error for SwarmProtoError {}
+pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
+pub use canonical::{from_canonical_slice, to_canonical_vec};
+pub use capability::{Capability, CapabilitySet};
+pub use digest::{derive_schedule, digest_state, DigestSchedule, StateLayout};
+pub use envelope::{Envelope, FrozenEnvelope, ENVELOPE_SCHEMA_MAJOR};
+pub use error::SwarmProtoError;
+pub use hash::blake3_hash;
+pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
+pub use messages::{SignedMessage, SwarmMessage};
+pub use sign::{peer_id, sign_canonical, verify_canonical, Signed, SigningKey, VerifyingKey};
+pub use version::{SwarmProtoVersion, SWARM_PROTO_VERSION};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn proto_version_is_stable() {
-        assert_eq!(SWARM_PROTO_VERSION, 0);
-    }
 
     #[test]
     fn error_renders() {
