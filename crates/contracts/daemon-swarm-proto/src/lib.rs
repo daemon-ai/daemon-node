@@ -16,11 +16,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bytes;
 pub mod canonical;
 pub mod error;
+pub mod hash;
+pub mod sign;
 
+pub use bytes::{Hash, PeerId, Root, Seed, Signature};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use error::SwarmProtoError;
+pub use hash::blake3_hash;
+pub use sign::{peer_id, sign_canonical, verify_canonical, Signed, SigningKey, VerifyingKey};
 
 #[cfg(test)]
 mod tests {
