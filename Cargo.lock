@@ -4356,6 +4356,8 @@ dependencies = [
 name = "daemon-swarm-observe"
 version = "0.0.1"
 dependencies = [
+ "ciborium",
+ "daemon-swarm-coordinator",
  "daemon-swarm-proto",
  "serde",
  "thiserror 2.0.18",

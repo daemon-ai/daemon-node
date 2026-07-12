@@ -85,6 +85,9 @@ pub struct Member {
     pub last_seen_round: u64,
     /// Round of the member's most recent `Straggle` (stall-window accounting, PROTO-7).
     pub last_straggle_round: Option<u64>,
+    /// Whether the member has signalled model-readiness in the current `Warmup` (Wave-3 additive
+    /// early-exit, §6.2/§6.5). Reset when a fresh `Warmup` begins; set by a ready [`Heartbeat`].
+    pub warmup_ready: bool,
 }
 
 impl Member {
@@ -100,6 +103,7 @@ impl Member {
             absences: 0,
             last_seen_round: 0,
             last_straggle_round: None,
+            warmup_ready: false,
         }
     }
 

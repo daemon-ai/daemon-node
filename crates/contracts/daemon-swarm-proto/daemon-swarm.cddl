@@ -36,6 +36,12 @@ attest-entry   = { "peer": peer-id, "hash": hash }
 record-entry   = { "peer": peer-id, "hash": hash, "size": size }
 capabilities   = [* tstr]             ; sorted name@version tokens
 
+; ----- stored objects (content-addressed; NOT signed-message frames) -----
+; The `record-set.cbor` object (§6.4, §11.3): the full committed set a RoundRecord's root signs,
+; published next to the round payloads. Canonical CBOR of the sorted `[(peer, hash, size)]` entries;
+; its blake3 is the content-address / locator hash. Not signed (its integrity is the record's root).
+record-set = { "entries": [* record-entry] }
+
 ; ----- the seven round messages -----
 round-open = {
   "round": round,
@@ -92,6 +98,7 @@ join = {
 
 heartbeat = {
   "round": round,
+  ? "ready": bool,          ; optional model-readiness signal during Warmup (§6.2; additive Wave 3)
 }
 
 ; ----- the externally-tagged message union -----
