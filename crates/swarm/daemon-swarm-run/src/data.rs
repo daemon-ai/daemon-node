@@ -319,6 +319,70 @@ impl SyntheticCorpus {
     }
 }
 
+/// An in-memory pre-tokenized corpus: a validated [`Manifest`] plus the shard bytes it describes.
+///
+/// The round engine (Wave 2) reads a peer's assigned micro-batches out of this without any external
+/// download. [`Corpus::sequence`] maps a [`BatchId`] to its `seq_len` token ids (wrapping the id
+/// into range, so a monotonically-advancing round cursor never runs off the end of a fixed test
+/// corpus).
+#[derive(Clone, Debug)]
+pub struct Corpus {
+    manifest: Manifest,
+    shards: Vec<Vec<u8>>,
+}
+
+impl Corpus {
+    /// Build a deterministic synthetic corpus (`num_shards` × `tokens_per_shard` u16 tokens).
+    pub fn synthetic(
+        seed: u64,
+        num_shards: u32,
+        tokens_per_shard: u64,
+        seq_len: u32,
+    ) -> Result<Self, DataError> {
+        let (manifest, blobs) =
+            SyntheticCorpus::generate(seed, num_shards, tokens_per_shard, seq_len)?;
+        let shards = blobs.into_iter().map(|(_, bytes)| bytes).collect();
+        Ok(Self { manifest, shards })
+    }
+
+    /// The corpus manifest.
+    #[must_use]
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// The total number of whole sequences in the corpus.
+    #[must_use]
+    pub fn total_sequences(&self) -> u64 {
+        self.manifest.total_sequences()
+    }
+
+    /// The token ids of the sequence at `batch` (wrapped into range), as `u32`s.
+    pub fn sequence(&self, batch: BatchId) -> Result<Vec<u32>, DataError> {
+        let total = self.total_sequences();
+        if total == 0 {
+            return Err(DataError::EmptyManifest);
+        }
+        let loc = self.manifest.locate(batch % total)?;
+        let seq_len = self.manifest.seq_len as usize;
+        let width = self.manifest.token_width.bytes() as usize;
+        let shard = &self.shards[loc.shard];
+        let start = loc.token_offset as usize * width;
+        let mut tokens = Vec::with_capacity(seq_len);
+        for i in 0..seq_len {
+            let off = start + i * width;
+            let token = match self.manifest.token_width {
+                TokenWidth::U16 => u32::from(u16::from_le_bytes([shard[off], shard[off + 1]])),
+                TokenWidth::U32 => {
+                    u32::from_le_bytes([shard[off], shard[off + 1], shard[off + 2], shard[off + 3]])
+                }
+            };
+            tokens.push(token);
+        }
+        Ok(tokens)
+    }
+}
+
 /// A small, fast, deterministic mixing function (splitmix64) for the synthetic corpus.
 fn splitmix64(x: u64) -> u64 {
     let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -557,6 +621,18 @@ mod tests {
             "different seed -> different bytes"
         );
         assert_eq!(a.len(), 16 * 2, "u16 width");
+    }
+
+    #[test]
+    fn corpus_sequence_reads_tokens_and_wraps() {
+        let corpus = Corpus::synthetic(0xDAE0_7E57, 2, 32, 8).unwrap();
+        assert_eq!(corpus.total_sequences(), 2 * (32 / 8));
+        let s0 = corpus.sequence(0).unwrap();
+        assert_eq!(s0.len(), 8, "one sequence = seq_len tokens");
+        // Wrapping: sequence(total) == sequence(0).
+        assert_eq!(corpus.sequence(corpus.total_sequences()).unwrap(), s0);
+        // Distinct sequences differ (deterministic synthetic tokens).
+        assert_ne!(corpus.sequence(1).unwrap(), s0);
     }
 
     #[test]
