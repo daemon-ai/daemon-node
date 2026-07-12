@@ -1,0 +1,28 @@
+# An example swarm-local run envelope (authoring TOML → the frozen proto envelope, §6.1).
+#
+#   swarm-local --envelope bins/swarm-local/examples/local-demo.toml
+#
+# The runner reads this TOML, builds the resolved proto `Envelope`, freezes + verifies it (the real
+# §6.1 freeze/verify chain), and stands up `--peers` in-process peers + the local coordinator over
+# the deterministic StubBackend (default `--backend stub`).
+
+[run]
+run_id = "local-demo"
+min_peers = 1
+max_peers = 8
+
+[experiment]
+module = "experiment.wasm"
+abi = "tensor-abi@1"
+# Opaque `[experiment.config]` bytes handed to the module's `da_build` (never interpreted by the
+# swarm). The stub backend ignores it; a real worker parses it.
+config = "demo-experiment-config"
+
+[data]
+manifest = "manifest.json"
+steps_per_round = 2
+global_batch = 12
+rounds = 20
+
+[requirements]
+throughput_floor = "c1"
