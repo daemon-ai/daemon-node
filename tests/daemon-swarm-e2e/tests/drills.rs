@@ -14,8 +14,8 @@
 //! - [`payload_store_outage_absorbed_by_stall_ladder`] — a peer's whole-round `get`s are denied for
 //!   a window; the §6.4 stall ladder absorbs it;
 //! - [`desync_injection_detected_and_resynced`] — one peer's ingest is corrupted, the digest outlier
-//!   is detected by a local quorum-digest fold (`MERGE-3`: observe `DesyncVerdict`), and it is
-//!   recovered via checkpoint + record replay;
+//!   is detected by `daemon-swarm-observe`'s `DesyncVerdict` (the observe-driven desync trigger,
+//!   §9), and it is recovered via checkpoint + record replay;
 //! - [`coordinator_restart_mid_run_completes`] — the coordinator shell reloads its `CoordinatorState`
 //!   from canonical CBOR mid-run (PROTO-20 in anger) and the run completes.
 
@@ -251,16 +251,22 @@ async fn desync_injection_detected_and_resynced() {
         );
     }
 
-    // Detection stand-in: a local quorum-digest fold flags the minority peer at the corrupt round.
-    // `MERGE-3`: replace this fold with `daemon-swarm-observe`'s `DesyncVerdict`.
-    let outliers = run.desync_outliers(CORRUPT);
+    // Detection: fold the round's per-peer digests through `daemon-swarm-observe`'s `digest_tally`
+    // (the observe-driven desync trigger, §9). With a 3-peer roster the quorum is 2, so the two
+    // agreeing healthy peers pin the quorum digest and the corrupted peer is the sole outlier.
+    let quorum = daemon_swarm_proto::assignment::witness_quorum(3);
+    let verdict = run.desync_verdict(CORRUPT, quorum);
     assert!(
-        outliers.contains(&desynced),
-        "the desynced peer is the round-{CORRUPT} digest outlier, got {outliers:?}"
+        verdict.is_desync(),
+        "round {CORRUPT} is flagged desynced by the observe verdict: {verdict:?}"
     );
     assert!(
-        !outliers.contains(&healthy0) && !outliers.contains(&healthy1),
-        "the healthy peers are not flagged"
+        verdict.outliers.contains(&desynced),
+        "the desynced peer is the round-{CORRUPT} digest outlier, got {verdict:?}"
+    );
+    assert!(
+        !verdict.outliers.contains(&healthy0) && !verdict.outliers.contains(&healthy1),
+        "the healthy peers are not flagged: {verdict:?}"
     );
 
     // Recovery: resync the outlier via the R2 checkpoint + record replay machinery. Reload the
@@ -309,9 +315,14 @@ async fn desync_injection_detected_and_resynced() {
     )
     .expect("resync replay");
 
-    let quorum = run.quorum_digests();
+    let quorum_digest = StateDigest(
+        verdict
+            .quorum_digest
+            .expect("the observe verdict pins a quorum digest")
+            .0,
+    );
     assert_eq!(
-        recovered, quorum[&CORRUPT],
+        recovered, quorum_digest,
         "checkpoint + record replay recovers the consensus round-{CORRUPT} digest"
     );
 }

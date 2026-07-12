@@ -13,9 +13,10 @@
 //! with the consensus reloads the latest checkpoint and replays the retained `RoundRecord`s (their
 //! root-verified committed sets) + payloads forward to the current round. [`resync_by_replay`] is
 //! that pure fold — `checkpoint_load` then `ingest` each retained round in order — the offline
-//! resync oracle. `// MERGE-2`: the *trigger* (this peer's digest vs the quorum/consensus digest)
-//! is wired from `daemon-swarm-observe` / the coordinator's digest tally; the replay itself is
-//! here.
+//! resync oracle. The *trigger* (this peer's digest vs the quorum/consensus digest) is
+//! `daemon_swarm_observe::digest_tally` / `DesyncVerdict` (folded over the run's `Digest` messages,
+//! §9) — consumed by the harness + drills, which drive this replay on `DesyncVerdict::is_desync()`;
+//! the replay fold itself is here.
 
 use std::sync::Arc;
 

@@ -34,6 +34,7 @@ use daemon_swarm_coordinator::{CoordinatorParams, CoordinatorState, RunConfig};
 use daemon_swarm_net::{
     ControlPlane, FsPayloadStore, LoopbackGossip, PayloadStat, PayloadStore, SwarmNetError,
 };
+use daemon_swarm_observe::{digest_tally, DesyncVerdict};
 use daemon_swarm_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_swarm_proto::messages::{RecordEntry, RoundRecord};
 use daemon_swarm_proto::{
@@ -324,42 +325,48 @@ impl SwarmRun {
         })
     }
 
-    /// The majority (quorum) digest per round: the digest the most peers reported (ties broken by
-    /// digest bytes). This is R3's local **desync-detector stand-in** — `MERGE-3`: replace with
-    /// `daemon-swarm-observe`'s `DesyncVerdict`.
+    /// The observe-driven [`DesyncVerdict`] for `round`: folds the peers' reported digests through
+    /// [`daemon_swarm_observe::digest_tally`] (§9), the authoritative desync trigger. `quorum` is the
+    /// number of agreeing peers a digest needs to count as the quorum digest (e.g.
+    /// [`daemon_swarm_proto::assignment::witness_quorum`] of the roster).
+    ///
+    /// This replaces R3's Wave-3 local quorum-digest fold stand-in with observe's shared verdict, so
+    /// the harness, the drills, and the (future) live coordinator path all consume one detector.
+    #[must_use]
+    pub fn desync_verdict(&self, round: RoundId, quorum: u32) -> DesyncVerdict {
+        let reports = self
+            .digests_by_round()
+            .get(&round)
+            .map(|peers| {
+                peers
+                    .iter()
+                    // Bridge the run-local `StateDigest` to proto's (both `[u8; 16]`), the type
+                    // observe's tally speaks.
+                    .map(|(p, d)| (*p, daemon_swarm_proto::StateDigest(*d.as_bytes())))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        digest_tally(round, reports, quorum)
+    }
+
+    /// The majority (quorum) digest per round, via observe's [`digest_tally`] (`quorum = 1` ⇒ the
+    /// plurality digest). Returned in the run-local [`StateDigest`] newtype for the drill assertions.
     #[must_use]
     pub fn quorum_digests(&self) -> BTreeMap<RoundId, StateDigest> {
         let mut out = BTreeMap::new();
-        for (round, peers) in self.digests_by_round() {
-            // Tally by raw digest bytes (StateDigest is not Ord); keep a representative digest.
-            let mut tally: BTreeMap<[u8; 16], (StateDigest, u32)> = BTreeMap::new();
-            for d in peers.values() {
-                let e = tally.entry(d.0).or_insert((*d, 0));
-                e.1 += 1;
-            }
-            if let Some((_, (d, _))) = tally.into_iter().max_by_key(|(k, (_, c))| (*c, *k)) {
-                out.insert(round, d);
+        for round in self.digests_by_round().keys().copied() {
+            if let Some(q) = self.desync_verdict(round, 1).quorum_digest {
+                out.insert(round, StateDigest(q.0));
             }
         }
         out
     }
 
-    /// The peers whose reported digest for `round` disagrees with the quorum (desync outliers).
+    /// The peers whose reported digest for `round` disagrees with the quorum (desync outliers), from
+    /// observe's [`DesyncVerdict`] (`quorum = 1` ⇒ any minority peer is an outlier).
     #[must_use]
     pub fn desync_outliers(&self, round: RoundId) -> BTreeSet<PeerId> {
-        let quorum = self.quorum_digests();
-        let Some(q) = quorum.get(&round) else {
-            return BTreeSet::new();
-        };
-        self.digests_by_round()
-            .get(&round)
-            .map(|peers| {
-                peers
-                    .iter()
-                    .filter_map(|(p, d)| (d != q).then_some(*p))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.desync_verdict(round, 1).outliers.into_iter().collect()
     }
 
     /// The set of peers that left the run (stall budget exhausted).
