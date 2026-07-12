@@ -26,6 +26,7 @@ pub mod error;
 pub mod hash;
 pub mod merkle;
 pub mod messages;
+pub mod record_set;
 pub mod sign;
 pub mod version;
 
@@ -43,6 +44,7 @@ pub use error::SwarmProtoError;
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
 pub use messages::{SignedMessage, SwarmMessage};
+pub use record_set::RecordSet;
 pub use sign::{peer_id, sign_canonical, verify_canonical, Signed, SigningKey, VerifyingKey};
 pub use version::{SwarmProtoVersion, SWARM_PROTO_VERSION};
 
