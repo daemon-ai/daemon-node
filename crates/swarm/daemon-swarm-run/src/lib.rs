@@ -13,6 +13,8 @@
 //!   slicing into `steps_per_round` × micro-batches, and a deterministic [`SyntheticCorpus`] (§8, §6.3).
 //! - [`backend`] — the [`TrainerBackend`] trait (**the R↔E seam**) and the deterministic
 //!   [`StubBackend`] (§5.1, §10.2, ABI §2.3).
+//! - [`protocol`] — the worker `Command`/`Event` wire types + CBOR codec (§10.2), which lane E's
+//!   `daemon-train` worker implements against in Wave 3.
 //!
 //! Identity/hash types are re-exported from `daemon-swarm-net`'s [`seam`] (MERGE-1 placeholders for
 //! `daemon-swarm-proto`, lane P).
@@ -21,6 +23,7 @@
 
 pub mod backend;
 pub mod data;
+pub mod protocol;
 pub mod seam;
 
 pub use backend::{
