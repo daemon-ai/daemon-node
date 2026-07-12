@@ -10,14 +10,23 @@ path = "src/lib.rs"
 
 [dependencies]
 # Guest-side SDK: it compiles to `wasm32-unknown-unknown` inside experiment modules, so its whole
-# dependency surface is `serde` (composition/profile schema) + `ciborium` (the CBOR codec over the
+# dependency surface is `serde` (config/manifest schema) + `ciborium` (the CBOR codec over the
 # tensor ABI). Nothing host-only (no tokio / wasmtime / Burn) — swarm-training-spec.md §10.1.
 serde = { workspace = true }
 ciborium = { workspace = true }
+# `sim` feature only: the native reference backend shares det-core's fixed-order fp32 kernels with
+# the host worker, so "the sim matches the host" is one shared implementation (ABI §10.4).
+det-core = { workspace = true, optional = true }
+
+[features]
+# Swap the extern `tabi@1` block for an in-crate CPU implementation so experiments and profiles are
+# unit-testable with `cargo test` — no GPU, no wasm host (ABI §10.4).
+sim = ["dep:det-core"]
 
 [lints]
 workspace = true
 
 [package.metadata.cargo-machete]
-# Wired up during Wave-0 scaffolding; the Burn-like composition surface lands with lane E.
+# serde/ciborium are used by the wasm-guest + `sim` code paths (cfg-gated); in the default native
+# gate the crate compiles to its constants + error type only, so machete would see them as unused.
 ignored = ["serde", "ciborium"]

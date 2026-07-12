@@ -9,10 +9,25 @@
 //! — wasmtime (guest sandbox) and Burn (engine) — because it *is* the isolated worker fault domain;
 //! the node process never links them.
 //!
-//! Wave-0 scaffold: the sandbox / engine wiring lands with lane **E**. Present now: the ABI-version
-//! constant and a content-digest helper (blake3 + xxh3) used for artifact / tensor identity.
+//! Present now (lane E, Wave 1): the wasmtime host profile + `InstancePre` re-instantiation, the
+//! generational lane-tagged handle arena, the typed trap taxonomy, the phase-legality table, the
+//! `OpBackend` engine seam (a CPU fake this wave; burn slots in at Wave 2), the budget levers, and
+//! the lifecycle driver against a subset of the `tabi@1` vocabulary. The worker protocol
+//! (CBOR-over-stdio, §10.2) is Wave 3.
 
 #![forbid(unsafe_code)]
+
+pub mod backend;
+pub mod handle;
+pub mod phase;
+pub mod runtime;
+pub mod trap;
+
+pub use backend::{AdamwHp, CpuBackend, OpBackend, TensorId};
+pub use handle::{HandleClass, Lane};
+pub use phase::Phase;
+pub use runtime::{EngineConfig, Instance, LoadedModule, Manifest, ParamInfo, Worker};
+pub use trap::{Trap, TrapCode};
 
 /// The tensor-ABI major version this worker implements.
 pub const TENSOR_ABI_MAJOR: u32 = 1;
@@ -28,12 +43,26 @@ pub const TENSOR_ABI_VERSION: u32 = (TENSOR_ABI_MAJOR << 16) | TENSOR_ABI_MINOR;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TrainError {
-    /// The wasm module sandbox (instantiate / meta / trace / execute) failed.
+    /// A typed trap raised by a host call or mapped from a wasmtime trap (ABI §3.6).
+    #[error("{0}")]
+    Trap(#[from] Trap),
+    /// The wasm engine failed to compile / link / instantiate a module.
     #[error("module sandbox error: {0}")]
     Sandbox(String),
     /// The training engine (build / step / optimize) failed.
     #[error("engine error: {0}")]
     Engine(String),
+}
+
+impl TrainError {
+    /// The trap code, if this error is (or wraps) a typed trap.
+    #[must_use]
+    pub fn trap_code(&self) -> Option<TrapCode> {
+        match self {
+            Self::Trap(t) => Some(t.code),
+            _ => None,
+        }
+    }
 }
 
 /// A stable content digest over `bytes`: the 256-bit blake3 hash plus a fast xxh3-64 checksum.

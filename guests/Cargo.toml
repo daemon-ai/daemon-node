@@ -5,7 +5,7 @@
 # §10.1). Members link `daemon-train-sdk` by path (../crates/contracts/daemon-train-sdk).
 [workspace]
 resolver = "2"
-members = ["tiny-llama"]
+members = ["tiny-llama", "test-abi-basic"]
 
 # wasm size-tuned: the built modules ship as artifacts, so trade a little compile time for size.
 [profile.release]

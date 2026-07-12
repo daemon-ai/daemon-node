@@ -1,0 +1,16 @@
+[package]
+name = "test-abi-basic"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A tiny guest that exercises the ABI surface for the host runtime tests (ABI §11): param
+# registration (da_build), an op call (da_step), and — selected by its config `mode` — a trap trigger
+# (a det op in da_step ⇒ PhaseViolation) and a fuel spin (⇒ BudgetFuel under a low budget).
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+daemon-train-sdk = { path = "../../crates/contracts/daemon-train-sdk" }
+serde = { version = "1", features = ["derive"] }

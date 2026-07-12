@@ -23,10 +23,17 @@ burn = { workspace = true }
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
 thiserror = { workspace = true }
+# The shared fixed-order fp32 det-lane kernels (bit-exact sim ≡ host, ABI §5.9) + the CBOR codec for
+# the manifest/config contract (ABI §6.1/§6.2). det-core is zero-dep; serde/ciborium are already pins.
+det-core = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
 
 [lints]
 workspace = true
 
 [package.metadata.cargo-machete]
-# Wired up during Wave-0 scaffolding; the host runtime + tensor ABI land with lane E.
+# `wasmtime` (host runtime) is used; `burn` is the Wave-2 `OpBackend` engine (declared now, wired
+# then — the CPU fake needs no burn). NOTE (Merge 1): burn should move to a feature-gated / lane-split
+# build off the default gate (program ledger); deferred this wave to avoid a full wasmtime recompile.
 ignored = ["wasmtime", "burn"]
