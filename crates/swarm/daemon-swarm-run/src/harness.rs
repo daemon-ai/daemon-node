@@ -135,6 +135,8 @@ pub struct SwarmConfig {
     pub micro_batch: u32,
     /// Stall-recovery budget (rounds) before a stalled peer leaves.
     pub stall_rounds_max: u32,
+    /// Save a round-boundary checkpoint every N rounds (0 = off).
+    pub checkpoint_every_rounds: u32,
     /// Seed for the synthetic corpus.
     pub corpus_seed: u64,
     /// Optional injected stall.
@@ -151,6 +153,7 @@ impl SwarmConfig {
             steps_per_round: 2,
             micro_batch: 2,
             stall_rounds_max: 2,
+            checkpoint_every_rounds: 0,
             corpus_seed: 0xDAE0_7E57,
             fault: None,
         }
@@ -451,6 +454,7 @@ where
             steps_per_round: cfg.steps_per_round,
             micro_batch: cfg.micro_batch,
             stall_rounds_max: cfg.stall_rounds_max,
+            checkpoint_every_rounds: cfg.checkpoint_every_rounds,
             version,
         };
 

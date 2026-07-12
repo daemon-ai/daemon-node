@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod checkpoint;
 pub mod data;
 pub mod engine;
 pub mod protocol;
@@ -38,6 +39,7 @@ pub mod harness;
 pub use backend::{
     AssessMeta, Assessment, BatchRef, StateDigest, StepCtx, StepStats, StubBackend, TrainerBackend,
 };
+pub use checkpoint::{CheckpointManifest, ReplayStep};
 pub use data::{
     BatchInterval, BatchLocation, Corpus, DataError, InnerStep, Manifest, MicroBatch, ShardDesc,
     SyntheticCorpus, TokenWidth,

@@ -47,6 +47,7 @@ use daemon_swarm_proto::{
 };
 
 use crate::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
+use crate::checkpoint::{save_checkpoint, CheckpointManifest};
 use crate::data::{slice_interval, BatchInterval, Corpus};
 use crate::seam::{PayloadKey, RoundId, RunId};
 use crate::SwarmRunError;
@@ -92,6 +93,8 @@ pub struct EngineConfig {
     pub micro_batch: u32,
     /// Fetch-recovery budget before a stalled peer must leave for the epoch (§6.4 rung 2).
     pub stall_rounds_max: u32,
+    /// Save a round-boundary checkpoint every N ingested rounds (§9). `0` disables checkpointing.
+    pub checkpoint_every_rounds: u32,
     /// The run's pinned swarm proto version (exact-match join gate, §16).
     pub version: SwarmProtoVersion,
 }
@@ -135,6 +138,13 @@ pub enum EngineEvent {
         round: RoundId,
         /// The (late) post-ingest state digest.
         digest: StateDigest,
+    },
+    /// This peer saved a round-boundary checkpoint (§9).
+    Checkpointed {
+        /// The round captured.
+        round: RoundId,
+        /// The checkpoint manifest (round, blake3, digest).
+        manifest: CheckpointManifest,
     },
     /// This peer left the run (stall budget exhausted); it rejoins at the next epoch.
     Left {
@@ -469,6 +479,7 @@ where
                     } else {
                         self.emit(EngineEvent::CaughtUp { round, digest });
                     }
+                    self.maybe_checkpoint(round, digest).await?;
                 }
                 None => break, // head unfetchable — stay (or become) stalled
             }
@@ -520,6 +531,22 @@ where
         // The round's transport scratch is no longer needed once ingested.
         self.rounds.remove(&round);
         Ok(Some(digest))
+    }
+
+    /// Save a round-boundary checkpoint if the cadence calls for it (§9), emitting `Checkpointed`.
+    async fn maybe_checkpoint(
+        &mut self,
+        round: RoundId,
+        digest: StateDigest,
+    ) -> Result<(), SwarmRunError> {
+        let every = self.cfg.checkpoint_every_rounds;
+        if every == 0 || !(round + 1).is_multiple_of(u64::from(every)) {
+            return Ok(());
+        }
+        let manifest =
+            save_checkpoint(&self.store, &self.cfg.run, &self.backend, round, digest).await?;
+        self.emit(EngineEvent::Checkpointed { round, manifest });
+        Ok(())
     }
 
     /// Fetch `peer`'s payload for `round` from the store, verifying it against `hash` (blake3).
@@ -692,6 +719,42 @@ mod tests {
             a.agreed_transcript(),
             b.agreed_transcript(),
             "the digest transcript must be reproducible"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn round_boundary_checkpoints_are_emitted() {
+        // RUN-6: with a cadence, each peer emits a Checkpointed manifest whose digest matches the
+        // round it captured, at the configured boundaries.
+        let cfg = SwarmConfig {
+            checkpoint_every_rounds: 2,
+            ..SwarmConfig::small(8)
+        };
+        let run = run_swarm(cfg).await.unwrap();
+        let by_round = run.digests_by_round();
+        let mut checkpoint_rounds: std::collections::BTreeSet<RoundId> =
+            std::collections::BTreeSet::new();
+        for (_peer, ev) in &run.events {
+            if let EngineEvent::Checkpointed { round, manifest } = ev {
+                checkpoint_rounds.insert(*round);
+                // The manifest's digest is the peer's post-ingest digest for that round.
+                assert_eq!(
+                    manifest.digest, by_round[round][&run.roster[0]],
+                    "checkpoint digest matches the round digest"
+                );
+            }
+        }
+        // Cadence 2 → checkpoints at (round+1) % 2 == 0. Assert the non-final boundaries (a
+        // final-round checkpoint races the harness teardown, so it is not asserted here).
+        assert!(
+            checkpoint_rounds.contains(&1)
+                && checkpoint_rounds.contains(&3)
+                && checkpoint_rounds.contains(&5),
+            "checkpoints at the cadence boundaries, got {checkpoint_rounds:?}"
+        );
+        assert!(
+            checkpoint_rounds.iter().all(|r| (r + 1).is_multiple_of(2)),
+            "checkpoints only at cadence boundaries, got {checkpoint_rounds:?}"
         );
     }
 
