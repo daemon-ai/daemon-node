@@ -66,12 +66,8 @@ pub struct EngineConfig {
     pub witnesses: Vec<PeerId>,     // whose Attestations count (§6.4); default = roster
     pub steps_per_round: u32,
     pub micro_batch: u32,
-    pub seq_len: u32,
     pub stall_rounds_max: u32,      // §6.4 rung 2 budget (default 2)
-    pub digest_block_size: u32,     // §5.6 sampling granularity
-    pub digest_sample_count: u32,
     pub checkpoint_every_rounds: u32,   // 0 = round-boundary checkpoints off
-    pub retry: RetryPolicy,         // payload fetch backoff (NET-4)
     pub version: SwarmProtoVersion,
 }
 
@@ -87,21 +83,30 @@ pub enum EngineEvent {
 
 impl<C: ControlPlane, P: PayloadStore, B: TrainerBackend> RoundEngine<C, P, B> {
     pub fn new(control: Arc<C>, store: Arc<P>, backend: B, key: SigningKey,
-               cfg: EngineConfig, events: mpsc::UnboundedSender<EngineEvent>) -> Self;
+               corpus: Arc<Corpus>, cfg: EngineConfig,
+               events: mpsc::UnboundedSender<EngineEvent>) -> Self;
     pub async fn run(&mut self) -> Result<RunOutcome, SwarmRunError>;
 }
 
-pub enum RunOutcome { Finished { last_round: RoundId }, LeftForEpoch { round: RoundId } }
+pub enum RunOutcome { Finished { last_round: Option<RoundId> }, LeftForEpoch { round: RoundId } }
 ```
 
 The engine subscribes to the control plane at construction. `run()` is the message-driven loop:
 `RoundOpen(r)` → derive interval → train (`train_step` × micro-batches → `inner_update` per inner
 step → `make_update`) → PUT payload → publish signed `Commitment`; prefetch + blake3-verify peers'
 payloads as `Commitment`s arrive (witnesses also publish `Attestation` over their fetch-verified
-set); `RoundRecord(r)` is the **barrier** — verify the committed set against the record root, stage
-in record order (node-pubkey bytes, I3), `ingest` → `Digest`; then round-boundary checkpoint. The
-loop terminates on a sentinel `RoundRecord` with `round == u64::MAX` (scripted-coordinator "done")
-or on stall-budget exhaustion.
+set); `RoundRecord(r)` is enqueued and ingest advances **in strict ascending round order** — the
+first ingestible round is the **barrier** (verify the committed set against the record root, stage
+in record order (node-pubkey bytes, I3), `ingest` → `Digest`, then a cadence checkpoint); a round
+whose set is not yet fetchable blocks every later round behind it (the stall ladder), so no outer
+step is applied out of order. The loop terminates when the control plane closes (`Finished`) or on
+stall-budget exhaustion (`LeftForEpoch`); the harness tears peers down after the last round.
+
+Notes on the delivered API vs the initial sketch: fetch retry/backoff (NET-4 `RetryPolicy` /
+`fetch_with_fallback`) lives at the **net** layer for the real network payload plane — the engine
+uses single-attempt `get` at the barrier and treats *cross-round* re-fetch as the stall-ladder
+retry, which keeps the fault-injected stall test deterministic. Digest sampling params (§5.6) are
+the host/backend's concern (the `TrainerBackend::ingest` return value), not `EngineConfig`.
 
 ## Design decisions (not obvious from the code)
 
