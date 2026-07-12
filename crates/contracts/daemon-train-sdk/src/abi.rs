@@ -141,6 +141,42 @@ mod raw {
         pub(super) fn det_reset_param_to_base(p: u64);
         #[link_name = "det_axpy_param@1"]
         pub(super) fn det_axpy_param(p: u64, x: u64, alpha: f64);
+        // -- Wave-2 additions (additive; §9) --------------------------------------------------
+        #[link_name = "embedding@1"]
+        pub(super) fn embedding(w: u64, ids: u64) -> u64;
+        #[link_name = "rmsnorm@1"]
+        pub(super) fn rmsnorm(x: u64, w: u64, eps: f64) -> u64;
+        #[link_name = "softmax@1"]
+        pub(super) fn softmax(x: u64, dim: u32) -> u64;
+        #[link_name = "silu@1"]
+        pub(super) fn silu(x: u64) -> u64;
+        #[link_name = "rope@1"]
+        pub(super) fn rope(x: u64, pos_start: u32, theta: f64, interleaved: u32) -> u64;
+        #[link_name = "flash_attn@1"]
+        pub(super) fn flash_attn(q: u64, k: u64, v: u64, causal: u32, scale: f64) -> u64;
+        #[link_name = "reshape@1"]
+        pub(super) fn reshape(x: u64, dp: u32, dr: u32) -> u64;
+        #[link_name = "transpose@1"]
+        pub(super) fn transpose(x: u64, d0: u32, d1: u32) -> u64;
+        #[link_name = "slice@1"]
+        pub(super) fn slice(x: u64, dim: u32, start: u32, end: u32) -> u64;
+        // `topk_chunk@1` logically returns (values, indices); Rust's wasm C-ABI cannot emit a clean
+        // multi-value (i64,i64), so — mirroring the da_manifest packing (E1) — the indices handle is
+        // written to a guest `*mut u64` out-param and the values handle is returned (E2 deviation).
+        #[link_name = "topk_chunk@1"]
+        pub(super) fn topk_chunk(x: u64, chunk: u32, k: u32, out_idx: u32) -> u64;
+        #[link_name = "chunk_scatter@1"]
+        pub(super) fn chunk_scatter(vals: u64, idx: u64, chunk: u32, dp: u32, dr: u32) -> u64;
+        #[link_name = "absmax_pack@1"]
+        pub(super) fn absmax_pack(x: u64, chunk: u32, bits: u32) -> u64;
+        #[link_name = "absmax_unpack@1"]
+        pub(super) fn absmax_unpack(packed: u64, chunk: u32, bits: u32, dtype: u32) -> u64;
+        #[link_name = "dct2@1"]
+        pub(super) fn dct2(x: u64, tile: u32) -> u64;
+        #[link_name = "idct2@1"]
+        pub(super) fn idct2(x: u64, tile: u32) -> u64;
+        #[link_name = "det_idct2@1"]
+        pub(super) fn det_idct2(x: u64, tile: u32) -> u64;
     }
 }
 
@@ -564,4 +600,141 @@ pub(crate) fn det_axpy_param(p: RawHandle, x: RawHandle, alpha: f64) {
     wasm_call!(det_axpy_param(p, x, alpha));
     #[cfg(feature = "sim")]
     crate::sim::with(|s| s.det_axpy_param(p, x, alpha));
+}
+
+// -- Wave-2 additions -----------------------------------------------------------------------------
+
+pub(crate) fn embedding(w: RawHandle, ids: RawHandle) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(embedding(w, ids));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.embedding(w, ids));
+}
+
+pub(crate) fn rmsnorm(x: RawHandle, w: RawHandle, eps: f64) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(rmsnorm(x, w, eps));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.rmsnorm(x, w, eps));
+}
+
+pub(crate) fn softmax(x: RawHandle, dim: u32) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(softmax(x, dim));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.softmax(x, dim));
+}
+
+pub(crate) fn silu(x: RawHandle) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(silu(x));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.silu(x));
+}
+
+pub(crate) fn rope(x: RawHandle, pos_start: u32, theta: f64, interleaved: u32) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(rope(x, pos_start, theta, interleaved));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.rope(x, pos_start, theta, interleaved));
+}
+
+pub(crate) fn flash_attn(
+    q: RawHandle,
+    k: RawHandle,
+    v: RawHandle,
+    causal: u32,
+    scale: f64,
+) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(flash_attn(q, k, v, causal, scale));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.flash_attn(q, k, v, causal, scale));
+}
+
+pub(crate) fn reshape(x: RawHandle, dims: &[u32]) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(reshape(x, dims.as_ptr() as u32, dims.len() as u32));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.reshape(x, dims));
+}
+
+pub(crate) fn transpose(x: RawHandle, d0: u32, d1: u32) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(transpose(x, d0, d1));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.transpose(x, d0, d1));
+}
+
+pub(crate) fn slice(x: RawHandle, dim: u32, start: u32, end: u32) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(slice(x, dim, start, end));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.slice(x, dim, start, end));
+}
+
+/// `topk_chunk@1` → `(values, indices)`. On the guest the indices handle is returned via an
+/// out-param (see the extern block note); the sim returns the pair directly.
+pub(crate) fn topk_chunk(x: RawHandle, chunk: u32, k: u32) -> (RawHandle, RawHandle) {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    {
+        let mut idx: u64 = 0;
+        let values = wasm_call!(topk_chunk(x, chunk, k, &mut idx as *mut u64 as u32));
+        return (values, idx);
+    }
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.topk_chunk(x, chunk, k));
+}
+
+pub(crate) fn chunk_scatter(
+    vals: RawHandle,
+    idx: RawHandle,
+    chunk: u32,
+    dims: &[u32],
+) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(chunk_scatter(
+        vals,
+        idx,
+        chunk,
+        dims.as_ptr() as u32,
+        dims.len() as u32
+    ));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.chunk_scatter(vals, idx, chunk, dims));
+}
+
+pub(crate) fn absmax_pack(x: RawHandle, chunk: u32, bits: u32) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(absmax_pack(x, chunk, bits));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.absmax_pack(x, chunk, bits));
+}
+
+pub(crate) fn absmax_unpack(packed: RawHandle, chunk: u32, bits: u32, dtype: u32) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(absmax_unpack(packed, chunk, bits, dtype));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.absmax_unpack(packed, chunk, bits, dtype));
+}
+
+pub(crate) fn dct2(x: RawHandle, tile: u32) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(dct2(x, tile));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.dct2(x, tile));
+}
+
+pub(crate) fn idct2(x: RawHandle, tile: u32) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(idct2(x, tile));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.idct2(x, tile));
+}
+
+pub(crate) fn det_idct2(x: RawHandle, tile: u32) -> RawHandle {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sim")))]
+    return wasm_call!(det_idct2(x, tile));
+    #[cfg(feature = "sim")]
+    return crate::sim::with(|s| s.det_idct2(x, tile));
 }

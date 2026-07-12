@@ -40,6 +40,83 @@ pub const DA_ABI_MINOR: u32 = 0;
 /// before instantiation (swarm-tensor-abi-spec.md §4).
 pub const DA_ABI_VERSION: u32 = (DA_ABI_MAJOR << 16) | DA_ABI_MINOR;
 
+/// The complete `tabi@1` import vocabulary this SDK binds (the extern block in `abi.rs`), in
+/// registration order: the Merge-1 frozen 50-import subset followed by the Wave-2 additions.
+///
+/// This is the **frozen surface**: the host `Linker` (`daemon-train`) and the phase-legality table
+/// must agree with it name-for-name (asserted by `daemon-train/tests/abi_surface.rs`). Growth is
+/// additive only (ABI §9) — append here, never reorder or remove.
+pub const TABI_IMPORTS: &[&str] = &[
+    // --- Merge-1 frozen subset (50) ---
+    "param@1",
+    "persistent@1",
+    "det_persistent@1",
+    "drop@1",
+    "param_round_base@1",
+    "backward@1",
+    "grad@1",
+    "zero_grads@1",
+    "assign@1",
+    "zeros@1",
+    "ones@1",
+    "full@1",
+    "add@1",
+    "sub@1",
+    "mul@1",
+    "mul_s@1",
+    "matmul@1",
+    "relu@1",
+    "cross_entropy@1",
+    "scalar@1",
+    "metric@1",
+    "log@1",
+    "abi_minor@1",
+    "adamw_step@1",
+    "batch_tokens@1",
+    "batch_size@1",
+    "batch_seq_len@1",
+    "upd_new@1",
+    "upd_push_bytes@1",
+    "upd_push_tensor@1",
+    "upd_sections@1",
+    "upd_kind@1",
+    "upd_bytes_len@1",
+    "upd_read_bytes@1",
+    "upd_tensor@1",
+    "det_zeros@1",
+    "det_sum@1",
+    "det_scale@1",
+    "det_l2norm@1",
+    "det_sign@1",
+    "det_add@1",
+    "det_sub@1",
+    "det_mul@1",
+    "det_absmax_unpack@1",
+    "det_chunk_scatter_add@1",
+    "det_chunk_scatter@1",
+    "det_assign@1",
+    "det_param@1",
+    "det_reset_param_to_base@1",
+    "det_axpy_param@1",
+    // --- Wave-2 additions (16) ---
+    "embedding@1",
+    "rmsnorm@1",
+    "softmax@1",
+    "silu@1",
+    "rope@1",
+    "flash_attn@1",
+    "reshape@1",
+    "transpose@1",
+    "slice@1",
+    "topk_chunk@1",
+    "chunk_scatter@1",
+    "absmax_pack@1",
+    "absmax_unpack@1",
+    "dct2@1",
+    "idct2@1",
+    "det_idct2@1",
+];
+
 /// Errors surfaced by the SDK's CBOR (de)serialization helpers.
 ///
 /// Hand-rolled to keep the guest dependency surface to `serde` + `ciborium` only.
@@ -67,9 +144,9 @@ mod abi;
 mod api;
 #[cfg(any(target_arch = "wasm32", feature = "sim"))]
 pub use api::{
-    abi_minor, det_sum, det_zeros, log, zero_grads, Batch, Config, DetPersistent, DetTensor, Dtype,
-    Experiment, Init, Manifest, Param, Persistent, SectionKind, StepCtx, Tensor, UpdateBuilder,
-    UpdateRef, UpdatesView,
+    abi_minor, det_sum, det_zeros, embedding, log, zero_grads, Batch, Config, DetPersistent,
+    DetTensor, Dtype, Experiment, Init, Manifest, Param, Persistent, SectionKind, StepCtx, Tensor,
+    UpdateBuilder, UpdateRef, UpdatesView,
 };
 
 /// `det_chunk_scatter@1` — allocating dense-from-sparse (re-export of [`api::det_chunk_scatter`]).
@@ -90,7 +167,7 @@ pub mod rt;
 /// A convenient glob for experiment authors.
 #[cfg(any(target_arch = "wasm32", feature = "sim"))]
 pub mod prelude {
-    pub use crate::{det_sum, det_zeros, zero_grads};
+    pub use crate::{det_sum, det_zeros, embedding, zero_grads};
     pub use crate::{
         experiment, Batch, Config, DetPersistent, DetTensor, Dtype, Experiment, Init, Manifest,
         Param, Persistent, StepCtx, Tensor, UpdateBuilder, UpdatesView,
@@ -230,5 +307,18 @@ mod tests {
         assert!(SdkError::Codec("bad frame".into())
             .to_string()
             .contains("codec error"));
+    }
+
+    #[test]
+    fn tabi_imports_are_unique_and_complete() {
+        // 50 Merge-1 frozen imports + 16 Wave-2 additions = the frozen v1 vocabulary.
+        assert_eq!(TABI_IMPORTS.len(), 66);
+        let mut names: Vec<&str> = TABI_IMPORTS.to_vec();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "tabi import names must be unique");
+        // Every name carries an explicit @version (additive growth is by version, ABI §9).
+        assert!(TABI_IMPORTS.iter().all(|n| n.contains('@')));
     }
 }

@@ -108,6 +108,64 @@ enum Op {
         targets: Vec<i64>,
         softmax: Vec<f32>,
     },
+    Embedding {
+        w: RawHandle,
+        ids: Vec<usize>,
+        vocab: usize,
+        d: usize,
+    },
+    Rmsnorm {
+        x: RawHandle,
+        w: RawHandle,
+        rows: usize,
+        d: usize,
+        inv_rms: Vec<f32>,
+    },
+    Silu {
+        x: RawHandle,
+    },
+    Softmax {
+        x: RawHandle,
+        outer: usize,
+        dimlen: usize,
+        inner: usize,
+        probs: Vec<f32>,
+    },
+    Rope {
+        x: RawHandle,
+        rows: usize,
+        seq: usize,
+        hd: usize,
+        pos_start: usize,
+        theta: f32,
+        interleaved: bool,
+    },
+    FlashAttn {
+        q: RawHandle,
+        k: RawHandle,
+        v: RawHandle,
+        bh: usize,
+        s: usize,
+        d: usize,
+        scale: f32,
+        probs: Vec<f32>,
+    },
+    Reshape {
+        x: RawHandle,
+    },
+    Transpose {
+        x: RawHandle,
+        d0: usize,
+        d1: usize,
+        shape_in: Vec<usize>,
+    },
+    Slice {
+        x: RawHandle,
+        dim: usize,
+        start: usize,
+        shape_in: Vec<usize>,
+        shape_out: Vec<usize>,
+    },
 }
 
 struct Node {
@@ -294,6 +352,96 @@ fn add_into(dst: &mut [f32], src: &[f32]) {
     for (d, &s) in dst.iter_mut().zip(src.iter()) {
         *d += s;
     }
+}
+
+fn numel_usz(shape: &[usize]) -> usize {
+    shape.iter().product()
+}
+
+fn row_major_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for i in (0..shape.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    strides
+}
+
+/// Swap axes `d0`/`d1` of a row-major tensor (used by transpose forward + backward).
+fn permute_axes(data: &[f32], shape_in: &[usize], d0: usize, d1: usize) -> Vec<f32> {
+    let mut shape_out = shape_in.to_vec();
+    shape_out.swap(d0, d1);
+    let sin = row_major_strides(shape_in);
+    let sout = row_major_strides(&shape_out);
+    let mut out = vec![0.0_f32; data.len()];
+    let rank = shape_in.len();
+    let mut coord = vec![0usize; rank];
+    for (flat, &v) in data.iter().enumerate() {
+        // decode flat → coord in the INPUT layout
+        let mut rem = flat;
+        for r in 0..rank {
+            coord[r] = rem / sin[r];
+            rem %= sin[r];
+        }
+        // swap coords, encode into OUTPUT layout
+        coord.swap(d0, d1);
+        let mut out_flat = 0usize;
+        for r in 0..rank {
+            out_flat += coord[r] * sout[r];
+        }
+        out[out_flat] = v;
+        coord.swap(d0, d1); // restore for reuse
+    }
+    out
+}
+
+/// Copy the `start..end` sub-range along `dim` of a row-major tensor.
+fn slice_dim(data: &[f32], shape_in: &[usize], dim: usize, start: usize, end: usize) -> Vec<f32> {
+    let mut shape_out = shape_in.to_vec();
+    shape_out[dim] = end - start;
+    let sin = row_major_strides(shape_in);
+    let sout = row_major_strides(&shape_out);
+    let rank = shape_in.len();
+    let mut out = vec![0.0_f32; numel_usz(&shape_out)];
+    let mut coord = vec![0usize; rank];
+    for (flat, o) in out.iter_mut().enumerate() {
+        let mut rem = flat;
+        for r in 0..rank {
+            coord[r] = rem / sout[r];
+            rem %= sout[r];
+        }
+        let mut in_flat = 0usize;
+        for r in 0..rank {
+            let c = if r == dim { coord[r] + start } else { coord[r] };
+            in_flat += c * sin[r];
+        }
+        *o = data[in_flat];
+    }
+    out
+}
+
+/// Scatter `grad` (the slice-output grad) back into an input-shaped zero buffer.
+fn unslice_dim(grad: &[f32], shape_in: &[usize], dim: usize, start: usize, end: usize) -> Vec<f32> {
+    let mut shape_out = shape_in.to_vec();
+    shape_out[dim] = end - start;
+    let sin = row_major_strides(shape_in);
+    let sout = row_major_strides(&shape_out);
+    let rank = shape_in.len();
+    let mut full = vec![0.0_f32; numel_usz(shape_in)];
+    let mut coord = vec![0usize; rank];
+    for (flat, &gv) in grad.iter().enumerate() {
+        let mut rem = flat;
+        for r in 0..rank {
+            coord[r] = rem / sout[r];
+            rem %= sout[r];
+        }
+        let mut in_flat = 0usize;
+        for r in 0..rank {
+            let c = if r == dim { coord[r] + start } else { coord[r] };
+            in_flat += c * sin[r];
+        }
+        full[in_flat] = gv;
+    }
+    full
 }
 
 // -- the ABI surface (called via crate::abi's sim branch) ---------------------------------------
@@ -593,6 +741,278 @@ impl Store {
         )
     }
 
+    // -- Wave-2 NN / shape forward (autodiff-recorded) ------------------------------------------
+
+    pub(crate) fn embedding(&mut self, w: RawHandle, ids: RawHandle) -> RawHandle {
+        let wsh = self.native_shape(w);
+        assert_eq!(wsh.len(), 2, "sim embedding weight is [vocab, d]");
+        let (vocab, d) = (wsh[0], wsh[1]);
+        let wv = self.native_value(w);
+        let idsh = self.native_shape(ids);
+        let ids_usize: Vec<usize> = self.native_value(ids).iter().map(|&f| f as usize).collect();
+        let mut value = Vec::with_capacity(ids_usize.len() * d);
+        for &id in &ids_usize {
+            let base = id * d;
+            value.extend_from_slice(&wv[base..base + d]);
+        }
+        let mut shape = idsh;
+        shape.push(d);
+        self.push_node(
+            value,
+            shape,
+            Op::Embedding {
+                w,
+                ids: ids_usize,
+                vocab,
+                d,
+            },
+        )
+    }
+
+    pub(crate) fn rmsnorm(&mut self, x: RawHandle, w: RawHandle, eps: f64) -> RawHandle {
+        let shape = self.native_shape(x);
+        let d = *shape.last().expect("rmsnorm input has rank >= 1");
+        let rows = numel_usz(&shape) / d;
+        let xv = self.native_value(x);
+        let wv = self.native_value(w);
+        let eps = eps as f32;
+        let mut value = vec![0.0_f32; xv.len()];
+        let mut inv_rms = vec![0.0_f32; rows];
+        for r in 0..rows {
+            let row = &xv[r * d..(r + 1) * d];
+            let ms = row.iter().map(|&v| v * v).sum::<f32>() / d as f32;
+            let inv = 1.0 / (ms + eps).sqrt();
+            inv_rms[r] = inv;
+            for i in 0..d {
+                value[r * d + i] = row[i] * inv * wv[i];
+            }
+        }
+        self.push_node(
+            value,
+            shape,
+            Op::Rmsnorm {
+                x,
+                w,
+                rows,
+                d,
+                inv_rms,
+            },
+        )
+    }
+
+    pub(crate) fn silu(&mut self, x: RawHandle) -> RawHandle {
+        let shape = self.native_shape(x);
+        let value: Vec<f32> = self
+            .native_value(x)
+            .iter()
+            .map(|&v| v / (1.0 + (-v).exp()))
+            .collect();
+        self.push_node(value, shape, Op::Silu { x })
+    }
+
+    pub(crate) fn softmax(&mut self, x: RawHandle, dim: u32) -> RawHandle {
+        let shape = self.native_shape(x);
+        let dim = dim as usize;
+        let dimlen = shape[dim];
+        let inner: usize = shape[dim + 1..].iter().product();
+        let outer: usize = shape[..dim].iter().product();
+        let xv = self.native_value(x);
+        let mut probs = vec![0.0_f32; xv.len()];
+        for o in 0..outer {
+            for i in 0..inner {
+                let base = o * dimlen * inner + i;
+                let mut max = f32::NEG_INFINITY;
+                for t in 0..dimlen {
+                    max = max.max(xv[base + t * inner]);
+                }
+                let mut denom = 0.0_f32;
+                for t in 0..dimlen {
+                    let e = (xv[base + t * inner] - max).exp();
+                    probs[base + t * inner] = e;
+                    denom += e;
+                }
+                for t in 0..dimlen {
+                    probs[base + t * inner] /= denom;
+                }
+            }
+        }
+        self.push_node(
+            probs.clone(),
+            shape,
+            Op::Softmax {
+                x,
+                outer,
+                dimlen,
+                inner,
+                probs,
+            },
+        )
+    }
+
+    pub(crate) fn rope(
+        &mut self,
+        x: RawHandle,
+        pos_start: u32,
+        theta: f64,
+        interleaved: u32,
+    ) -> RawHandle {
+        let shape = self.native_shape(x);
+        let rank = shape.len();
+        let (seq, hd) = (shape[rank - 2], shape[rank - 1]);
+        let rows = numel_usz(&shape) / hd;
+        let xv = self.native_value(x);
+        let interleaved = interleaved != 0;
+        let theta = theta as f32;
+        let mut value = xv.clone();
+        for r in 0..rows {
+            let pos = (pos_start as usize + (r % seq)) as f32;
+            for j in 0..hd / 2 {
+                let freq = 1.0 / theta.powf(2.0 * j as f32 / hd as f32);
+                let angle = pos * freq;
+                let (c, s) = (angle.cos(), angle.sin());
+                let (ia, ib) = if interleaved {
+                    (2 * j, 2 * j + 1)
+                } else {
+                    (j, j + hd / 2)
+                };
+                let (a, b) = (xv[r * hd + ia], xv[r * hd + ib]);
+                value[r * hd + ia] = a * c - b * s;
+                value[r * hd + ib] = a * s + b * c;
+            }
+        }
+        self.push_node(
+            value,
+            shape,
+            Op::Rope {
+                x,
+                rows,
+                seq,
+                hd,
+                pos_start: pos_start as usize,
+                theta,
+                interleaved,
+            },
+        )
+    }
+
+    pub(crate) fn flash_attn(
+        &mut self,
+        q: RawHandle,
+        k: RawHandle,
+        v: RawHandle,
+        causal: u32,
+        scale: f64,
+    ) -> RawHandle {
+        let shape = self.native_shape(q);
+        assert_eq!(shape.len(), 4, "sim flash_attn expects [b, h, s, d]");
+        let (b, h, s, d) = (shape[0], shape[1], shape[2], shape[3]);
+        let bh = b * h;
+        let scale = scale as f32;
+        let causal = causal != 0;
+        let qv = self.native_value(q);
+        let kv = self.native_value(k);
+        let vv = self.native_value(v);
+        let mut out = vec![0.0_f32; qv.len()];
+        let mut probs = vec![0.0_f32; bh * s * s];
+        for g in 0..bh {
+            let base = g * s * d;
+            let pbase = g * s * s;
+            for i in 0..s {
+                // scores over j, with causal mask.
+                let jmax = if causal { i + 1 } else { s };
+                let mut scores = vec![f32::NEG_INFINITY; s];
+                let mut maxv = f32::NEG_INFINITY;
+                for j in 0..jmax {
+                    let mut dot = 0.0_f32;
+                    for e in 0..d {
+                        dot += qv[base + i * d + e] * kv[base + j * d + e];
+                    }
+                    let sc = dot * scale;
+                    scores[j] = sc;
+                    maxv = maxv.max(sc);
+                }
+                let mut denom = 0.0_f32;
+                for j in 0..jmax {
+                    let e = (scores[j] - maxv).exp();
+                    probs[pbase + i * s + j] = e;
+                    denom += e;
+                }
+                for j in 0..jmax {
+                    probs[pbase + i * s + j] /= denom;
+                }
+                for e in 0..d {
+                    let mut acc = 0.0_f32;
+                    for j in 0..jmax {
+                        acc += probs[pbase + i * s + j] * vv[base + j * d + e];
+                    }
+                    out[base + i * d + e] = acc;
+                }
+            }
+        }
+        self.push_node(
+            out,
+            shape,
+            Op::FlashAttn {
+                q,
+                k,
+                v,
+                bh,
+                s,
+                d,
+                scale,
+                probs,
+            },
+        )
+    }
+
+    pub(crate) fn reshape(&mut self, x: RawHandle, dims: &[u32]) -> RawHandle {
+        let value = self.native_value(x);
+        self.push_node(
+            value,
+            dims.iter().map(|&d| d as usize).collect(),
+            Op::Reshape { x },
+        )
+    }
+
+    pub(crate) fn transpose(&mut self, x: RawHandle, d0: u32, d1: u32) -> RawHandle {
+        let shape_in = self.native_shape(x);
+        let (d0, d1) = (d0 as usize, d1 as usize);
+        let xv = self.native_value(x);
+        let mut shape_out = shape_in.clone();
+        shape_out.swap(d0, d1);
+        let value = permute_axes(&xv, &shape_in, d0, d1);
+        self.push_node(
+            value,
+            shape_out,
+            Op::Transpose {
+                x,
+                d0,
+                d1,
+                shape_in,
+            },
+        )
+    }
+
+    pub(crate) fn slice(&mut self, x: RawHandle, dim: u32, start: u32, end: u32) -> RawHandle {
+        let shape_in = self.native_shape(x);
+        let (dim, start, end) = (dim as usize, start as usize, end as usize);
+        let mut shape_out = shape_in.clone();
+        shape_out[dim] = end - start;
+        let xv = self.native_value(x);
+        let value = slice_dim(&xv, &shape_in, dim, start, end);
+        self.push_node(
+            value,
+            shape_out.clone(),
+            Op::Slice {
+                x,
+                dim,
+                start,
+                shape_in,
+                shape_out,
+            },
+        )
+    }
+
     pub(crate) fn backward(&mut self, loss: RawHandle) {
         let (tag, li) = dec(loss);
         assert_eq!(tag, TAG_NODE, "sim backward: loss must be a step tensor");
@@ -684,6 +1104,191 @@ impl Store {
                         }
                     }
                     self.add_native_grad(logits, &gl);
+                }
+                Op::Embedding { w, ids, vocab, d } => {
+                    let mut gw = vec![0.0_f32; vocab * d];
+                    for (r, &id) in ids.iter().enumerate() {
+                        for i in 0..d {
+                            gw[id * d + i] += g[r * d + i];
+                        }
+                    }
+                    self.add_native_grad(w, &gw);
+                }
+                Op::Rmsnorm {
+                    x,
+                    w,
+                    rows,
+                    d,
+                    inv_rms,
+                } => {
+                    let xv = self.native_value(x);
+                    let wv = self.native_value(w);
+                    let mut gx = vec![0.0_f32; rows * d];
+                    let mut gw = vec![0.0_f32; d];
+                    for r in 0..rows {
+                        let inv = inv_rms[r];
+                        let xrow = &xv[r * d..(r + 1) * d];
+                        let grow = &g[r * d..(r + 1) * d];
+                        // Σ_i g_i · w_i · x_i
+                        let mut dot = 0.0_f32;
+                        for i in 0..d {
+                            dot += grow[i] * wv[i] * xrow[i];
+                        }
+                        let coef = inv * inv * inv / d as f32 * dot;
+                        for i in 0..d {
+                            gx[r * d + i] = inv * wv[i] * grow[i] - coef * xrow[i];
+                            gw[i] += grow[i] * xrow[i] * inv;
+                        }
+                    }
+                    self.add_native_grad(x, &gx);
+                    self.add_native_grad(w, &gw);
+                }
+                Op::Silu { x } => {
+                    let xv = self.native_value(x);
+                    let gx: Vec<f32> = g
+                        .iter()
+                        .zip(xv.iter())
+                        .map(|(&gv, &xe)| {
+                            let sig = 1.0 / (1.0 + (-xe).exp());
+                            gv * (sig * (1.0 + xe * (1.0 - sig)))
+                        })
+                        .collect();
+                    self.add_native_grad(x, &gx);
+                }
+                Op::Softmax {
+                    x,
+                    outer,
+                    dimlen,
+                    inner,
+                    probs,
+                } => {
+                    let mut gx = vec![0.0_f32; g.len()];
+                    for o in 0..outer {
+                        for i in 0..inner {
+                            let base = o * dimlen * inner + i;
+                            let mut dot = 0.0_f32;
+                            for t in 0..dimlen {
+                                dot += g[base + t * inner] * probs[base + t * inner];
+                            }
+                            for t in 0..dimlen {
+                                let idx = base + t * inner;
+                                gx[idx] = probs[idx] * (g[idx] - dot);
+                            }
+                        }
+                    }
+                    self.add_native_grad(x, &gx);
+                }
+                Op::Rope {
+                    x,
+                    rows,
+                    seq,
+                    hd,
+                    pos_start,
+                    theta,
+                    interleaved,
+                } => {
+                    // Rotation is orthogonal: the input grad is the transpose (inverse) rotation.
+                    let mut gx = vec![0.0_f32; g.len()];
+                    for r in 0..rows {
+                        let pos = (pos_start + (r % seq)) as f32;
+                        for j in 0..hd / 2 {
+                            let freq = 1.0 / theta.powf(2.0 * j as f32 / hd as f32);
+                            let angle = pos * freq;
+                            let (c, s) = (angle.cos(), angle.sin());
+                            let (ia, ib) = if interleaved {
+                                (2 * j, 2 * j + 1)
+                            } else {
+                                (j, j + hd / 2)
+                            };
+                            let (ga, gb) = (g[r * hd + ia], g[r * hd + ib]);
+                            gx[r * hd + ia] = ga * c + gb * s;
+                            gx[r * hd + ib] = -ga * s + gb * c;
+                        }
+                    }
+                    self.add_native_grad(x, &gx);
+                }
+                Op::FlashAttn {
+                    q,
+                    k,
+                    v,
+                    bh,
+                    s,
+                    d,
+                    scale,
+                    probs,
+                } => {
+                    let qv = self.native_value(q);
+                    let kv = self.native_value(k);
+                    let vv = self.native_value(v);
+                    let mut gq = vec![0.0_f32; qv.len()];
+                    let mut gk = vec![0.0_f32; kv.len()];
+                    let mut gv = vec![0.0_f32; vv.len()];
+                    for grp in 0..bh {
+                        let base = grp * s * d;
+                        let pbase = grp * s * s;
+                        for i in 0..s {
+                            // dP[i][j] = Σ_e dO[i][e]·V[j][e]; dV[j][e] += P[i][j]·dO[i][e]
+                            let mut dp = vec![0.0_f32; s];
+                            for j in 0..s {
+                                let p = probs[pbase + i * s + j];
+                                if p == 0.0 {
+                                    continue;
+                                }
+                                let mut dpj = 0.0_f32;
+                                for e in 0..d {
+                                    let go = g[base + i * d + e];
+                                    dpj += go * vv[base + j * d + e];
+                                    gv[base + j * d + e] += p * go;
+                                }
+                                dp[j] = dpj;
+                            }
+                            // dS[i][j] = P[i][j]·(dP[i][j] − Σ_j' P[i][j']·dP[i][j'])
+                            let mut sum = 0.0_f32;
+                            for j in 0..s {
+                                sum += probs[pbase + i * s + j] * dp[j];
+                            }
+                            for j in 0..s {
+                                let p = probs[pbase + i * s + j];
+                                if p == 0.0 {
+                                    continue;
+                                }
+                                let ds = p * (dp[j] - sum) * scale;
+                                for e in 0..d {
+                                    gq[base + i * d + e] += ds * kv[base + j * d + e];
+                                    gk[base + j * d + e] += ds * qv[base + i * d + e];
+                                }
+                            }
+                        }
+                    }
+                    self.add_native_grad(q, &gq);
+                    self.add_native_grad(k, &gk);
+                    self.add_native_grad(v, &gv);
+                }
+                Op::Reshape { x } => {
+                    self.add_native_grad(x, &g);
+                }
+                Op::Transpose {
+                    x,
+                    d0,
+                    d1,
+                    shape_in,
+                } => {
+                    // g is in the OUTPUT (swapped) layout; swapping back yields the input layout.
+                    let mut shape_out = shape_in.clone();
+                    shape_out.swap(d0, d1);
+                    let gx = permute_axes(&g, &shape_out, d0, d1);
+                    self.add_native_grad(x, &gx);
+                }
+                Op::Slice {
+                    x,
+                    dim,
+                    start,
+                    shape_in,
+                    shape_out,
+                } => {
+                    let end = start + shape_out[dim];
+                    let gx = unslice_dim(&g, &shape_in, dim, start, end);
+                    self.add_native_grad(x, &gx);
                 }
             }
         }
@@ -990,5 +1595,79 @@ impl Store {
         det_core::det_axpy(&mut self.params[idx].master, alpha, &xv)
             .expect("det_axpy_param shapes must agree");
         self.params[idx].storage = self.params[idx].master.clone();
+    }
+
+    // -- Wave-2 compression natives (native lane; no autodiff — local payload math) -------------
+
+    pub(crate) fn topk_chunk(
+        &mut self,
+        x: RawHandle,
+        chunk: u32,
+        k: u32,
+    ) -> (RawHandle, RawHandle) {
+        let xv = self.native_value(x);
+        let (vals, idx) =
+            det_core::topk_chunk(&xv, chunk as usize, k as usize).expect("topk_chunk layout");
+        let numel = xv.len();
+        let n_chunks = numel / chunk.max(1) as usize;
+        let shape = vec![n_chunks, k as usize];
+        let vh = self.push_node(vals, shape.clone(), Op::Const);
+        let ivals: Vec<f32> = idx.iter().map(|&i| i as f32).collect();
+        let ih = self.push_node(ivals, shape, Op::Const);
+        (vh, ih)
+    }
+
+    pub(crate) fn chunk_scatter(
+        &mut self,
+        vals: RawHandle,
+        idx: RawHandle,
+        chunk: u32,
+        dims: &[u32],
+    ) -> RawHandle {
+        let valsv = self.native_value(vals);
+        let idxv: Vec<u32> = self.native_value(idx).iter().map(|&f| f as u32).collect();
+        let out = det_core::det_chunk_scatter(&valsv, &idxv, chunk as usize, numel(dims))
+            .expect("chunk_scatter layout");
+        self.push_node(out, dims.iter().map(|&d| d as usize).collect(), Op::Const)
+    }
+
+    pub(crate) fn absmax_pack(&mut self, x: RawHandle, chunk: u32, bits: u32) -> RawHandle {
+        let xv = self.native_value(x);
+        let packed = det_core::absmax_pack(&xv, chunk as usize, bits).expect("absmax_pack layout");
+        let n = packed.len();
+        let vals: Vec<f32> = packed.iter().map(|&b| f32::from(b)).collect();
+        self.push_node(vals, vec![n], Op::Const)
+    }
+
+    pub(crate) fn absmax_unpack(
+        &mut self,
+        packed: RawHandle,
+        chunk: u32,
+        bits: u32,
+        _dtype: u32,
+    ) -> RawHandle {
+        let bytes: Vec<u8> = self.native_value(packed).iter().map(|&f| f as u8).collect();
+        let out = det_core::det_absmax_unpack(&bytes, chunk as usize, bits)
+            .expect("absmax_unpack layout");
+        let n = out.len();
+        self.push_node(out, vec![n], Op::Const)
+    }
+
+    pub(crate) fn dct2(&mut self, x: RawHandle, tile: u32) -> RawHandle {
+        let shape = self.native_shape(x);
+        let out = det_core::dct2(&self.native_value(x), tile as usize).expect("dct2 layout");
+        self.push_node(out, shape, Op::Const)
+    }
+
+    pub(crate) fn idct2(&mut self, x: RawHandle, tile: u32) -> RawHandle {
+        let shape = self.native_shape(x);
+        let out = det_core::idct2(&self.native_value(x), tile as usize).expect("idct2 layout");
+        self.push_node(out, shape, Op::Const)
+    }
+
+    pub(crate) fn det_idct2(&mut self, x: RawHandle, tile: u32) -> RawHandle {
+        let shape = self.det_shape(x);
+        let out = det_core::idct2(&self.det_value(x), tile as usize).expect("det_idct2 layout");
+        self.push_det(out, shape)
     }
 }

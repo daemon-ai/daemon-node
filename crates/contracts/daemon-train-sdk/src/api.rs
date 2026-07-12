@@ -182,6 +182,143 @@ impl Tensor {
     pub fn metric(&self, name: &str) {
         abi::metric(name, self.h);
     }
+
+    // -- Wave-2 elementwise / NN / shape (ABI §5.3–5.6) -----------------------------------------
+
+    /// `silu@1` — `x · sigmoid(x)` (SwiGLU gate activation).
+    #[must_use]
+    pub fn silu(&self) -> Tensor {
+        Tensor::step(abi::silu(self.h), self.shape.clone(), self.dtype)
+    }
+
+    /// `rmsnorm@1` — RMS layer norm scaled by `w` (`[d]`), `eps` for stability (ABI §5.6).
+    #[must_use]
+    pub fn rmsnorm(&self, w: &Tensor, eps: f64) -> Tensor {
+        Tensor::step(
+            abi::rmsnorm(self.h, w.h, eps),
+            self.shape.clone(),
+            self.dtype,
+        )
+    }
+
+    /// `softmax@1` over `dim`.
+    #[must_use]
+    pub fn softmax(&self, dim: u32) -> Tensor {
+        Tensor::step(abi::softmax(self.h, dim), self.shape.clone(), self.dtype)
+    }
+
+    /// `rope@1` — rotary position embedding applied per `[.., s, d]` (ABI §5.6).
+    #[must_use]
+    pub fn rope(&self, pos_start: u32, theta: f64, interleaved: bool) -> Tensor {
+        Tensor::step(
+            abi::rope(self.h, pos_start, theta, u32::from(interleaved)),
+            self.shape.clone(),
+            self.dtype,
+        )
+    }
+
+    /// `flash_attn@1` — fused scaled-dot-product attention over `[b, h, s, d]` (ABI §5.6). `self`
+    /// is the query; `k`/`v` the key/value. Returns `[b, h, s, d]` shaped like the query.
+    #[must_use]
+    pub fn flash_attn(&self, k: &Tensor, v: &Tensor, causal: bool, scale: f64) -> Tensor {
+        Tensor::step(
+            abi::flash_attn(self.h, k.h, v.h, u32::from(causal), scale),
+            self.shape.clone(),
+            self.dtype,
+        )
+    }
+
+    /// `reshape@1` — same data, new `dims` (numel must match).
+    #[must_use]
+    pub fn reshape(&self, dims: &[u32]) -> Tensor {
+        Tensor::step(abi::reshape(self.h, dims), dims.to_vec(), self.dtype)
+    }
+
+    /// `transpose@1` — swap axes `d0` and `d1`.
+    #[must_use]
+    pub fn transpose(&self, d0: u32, d1: u32) -> Tensor {
+        let mut shape = self.shape.clone();
+        shape.swap(d0 as usize, d1 as usize);
+        Tensor::step(abi::transpose(self.h, d0, d1), shape, self.dtype)
+    }
+
+    /// `slice@1` — `x[.., start..end, ..]` along `dim`.
+    #[must_use]
+    pub fn slice(&self, dim: u32, start: u32, end: u32) -> Tensor {
+        let mut shape = self.shape.clone();
+        shape[dim as usize] = end - start;
+        Tensor::step(abi::slice(self.h, dim, start, end), shape, self.dtype)
+    }
+
+    // -- Wave-2 compression natives (ABI §5.8) --------------------------------------------------
+
+    /// `topk_chunk@1` — per-chunk top-k by magnitude → `(values, indices)`, each `[n_chunks, k]`.
+    #[must_use]
+    pub fn topk_chunk(&self, chunk: u32, k: u32) -> (Tensor, Tensor) {
+        let numel: u32 = self.shape.iter().product();
+        let n_chunks = numel.checked_div(chunk).unwrap_or(0);
+        let (vh, ih) = abi::topk_chunk(self.h, chunk, k);
+        (
+            Tensor::step(vh, vec![n_chunks, k], Dtype::F32),
+            Tensor::step(ih, vec![n_chunks, k], Dtype::U32),
+        )
+    }
+
+    /// `chunk_scatter@1` — dense-from-sparse inverse of [`Tensor::topk_chunk`] (ABI §5.8).
+    #[must_use]
+    pub fn chunk_scatter(&self, idx: &Tensor, chunk: u32, dims: &[u32]) -> Tensor {
+        Tensor::step(
+            abi::chunk_scatter(self.h, idx.h, chunk, dims),
+            dims.to_vec(),
+            self.dtype,
+        )
+    }
+
+    /// `absmax_pack@1` — per-chunk absmax codebook quantization to a packed `U8` tensor (§6.6).
+    #[must_use]
+    pub fn absmax_pack(&self, chunk: u32, bits: u32) -> Tensor {
+        let numel: u32 = self.shape.iter().product();
+        let n_chunks = numel.checked_div(chunk).unwrap_or(0);
+        let code_bytes = (chunk * bits).div_ceil(8);
+        let total = n_chunks * (2 + code_bytes);
+        Tensor::step(
+            abi::absmax_pack(self.h, chunk, bits),
+            vec![total],
+            Dtype::U8,
+        )
+    }
+
+    /// `absmax_unpack@1` — decode a packed `U8` tensor back to `dtype` (native lane).
+    #[must_use]
+    pub fn absmax_unpack(&self, chunk: u32, bits: u32, dtype: Dtype) -> Tensor {
+        Tensor::step(
+            abi::absmax_unpack(self.h, chunk, bits, dtype.code()),
+            Vec::new(),
+            dtype,
+        )
+    }
+
+    /// `dct2@1` — orthonormal 2-D DCT over `tile × tile` blocks (ABI §5.8).
+    #[must_use]
+    pub fn dct2(&self, tile: u32) -> Tensor {
+        Tensor::step(abi::dct2(self.h, tile), self.shape.clone(), self.dtype)
+    }
+
+    /// `idct2@1` — the inverse 2-D DCT.
+    #[must_use]
+    pub fn idct2(&self, tile: u32) -> Tensor {
+        Tensor::step(abi::idct2(self.h, tile), self.shape.clone(), self.dtype)
+    }
+}
+
+/// `embedding@1` — gather rows of the weight `w` (`[vocab, d]`) by token `ids` (ABI §5.6). Output
+/// shape is `ids.shape ++ [d]`.
+#[must_use]
+pub fn embedding(w: &Param, ids: &Tensor) -> Tensor {
+    let d = *w.0.shape.last().expect("embedding weight is [vocab, d]");
+    let mut shape = ids.shape.clone();
+    shape.push(d);
+    Tensor::step(abi::embedding(w.0.h, ids.h), shape, w.0.dtype)
 }
 
 impl Drop for Tensor {
@@ -271,6 +408,12 @@ impl DetTensor {
     /// path, ABI §5.9). `self` is the accumulator.
     pub fn chunk_scatter_add(&mut self, vals: &DetTensor, idx: &DetTensor, chunk: u32) {
         abi::det_chunk_scatter_add(self.h, vals.h, idx.h, chunk);
+    }
+
+    /// `det_idct2@1` — det-lane inverse 2-D DCT (the demo-profile decode, ABI §5.9).
+    #[must_use]
+    pub fn idct2(&self, tile: u32) -> DetTensor {
+        DetTensor::step(abi::det_idct2(self.h, tile), self.shape.clone())
     }
 }
 
