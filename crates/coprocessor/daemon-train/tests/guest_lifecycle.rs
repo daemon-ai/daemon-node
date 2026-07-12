@@ -9,6 +9,10 @@
 // if set, else the conventional path relative to this crate; if absent they are BUILT ON DEMAND
 // (exactly what `xtask build-guests` does), so `cargo test --workspace` never silently skips. The
 // dev-shell `wasm32-unknown-unknown` rust-std is required (a bare host cargo cannot cross-compile).
+//
+// This is a dev/test harness (it shells `cargo build` for the guests and reads the `.wasm`, exactly
+// like `xtask build-guests`); the fs/process hardening bans target the shipped node, not tests.
+#![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::process::Command;
