@@ -177,4 +177,121 @@ Every commit passes `cargo fmt --check`, `cargo clippy --workspace --all-targets
 `cargo test --workspace`, `cargo build --target wasm32-unknown-unknown -p daemon-swarm-proto`
 (**and** `-p daemon-swarm-coordinator`), and `typos docs/specs`.
 
-## Notes for Merge 3 integration (what to watch) — filled in at the final ledger update
+## Wave-3 results — frozen seams (Merge 3)
+
+Landed on `swarm/p3` (base `39c0ebd`). Commits (oldest → newest):
+
+| Commit | Subject |
+|---|---|
+| `3325061` | `mirror(P3): ledger` |
+| `e290419` | `feat(swarm-proto): record-set object codec + membership helpers (green)` |
+| `1d333d0` | `feat(swarm-coordinator): root-only attestation coverage in the commit rule (green)` |
+| `37e1d4f` | `feat(swarm-proto): additive Heartbeat readiness flag (green)` |
+| `bba2462` | `feat(swarm-coordinator): warmup early-exit on peer readiness (green)` |
+| `657fa7d` | `feat(swarm-coordinator): envelope-hash admission enforcement tests (green)` |
+| `9915370` | `feat(swarm-observe): message log + replay oracle + digest tally + run health (green)` |
+
+**observe seam** (`daemon_swarm_observe`; node-side std tool):
+
+```rust
+// message log (append-only, canonical-CBOR length-framed, (round, kind) indexed)
+pub struct MessageLog;                        // new/run_id/append/len/is_empty/iter/entries/rounds
+pub enum  MessageKind { RoundOpen, Commitment, Attestation, StorageReceipt,
+                        RoundRecord, Digest, Straggle, Join, Heartbeat }
+impl MessageLog {
+    pub fn by_round(&self, round: u64)                 -> impl Iterator<Item = &SignedMessage>;
+    pub fn by_kind(&self, kind: MessageKind)           -> impl Iterator<Item = &SignedMessage>;
+    pub fn by_round_kind(&self, round: u64, kind: MessageKind) -> impl Iterator<Item = &SignedMessage>;
+    pub fn replay_inputs(&self)                        -> impl Iterator<Item = Input> + '_;
+    pub fn write_to(&self, w: &mut impl std::io::Write) -> Result<(), ObserveError>;
+    pub fn read_from(r: &mut impl std::io::Read)        -> Result<Self, ObserveError>;
+}
+
+// replay oracle (PROTO-20 as a library)
+pub fn genesis_seed(env: &Envelope) -> Result<Seed, ObserveError>;
+pub fn replay(env: &Envelope, params: CoordinatorParams, inputs: impl Iterator<Item = Input>)
+    -> Result<ReplayReport, ReplayError>;
+pub struct ReplayReport   { pub records: Vec<RoundRecord>, pub rounds_verified: u64,
+                            pub final_state_hash: Hash }
+pub struct ReplayDivergence{ pub round: u64, pub recorded: RoundRecord,
+                            pub rederived: Option<RoundRecord>, pub detail: String }
+pub enum   ReplayError    { Setup(ObserveError), Diverged(Box<ReplayDivergence>) }
+
+// desync detection (the observe-driven trigger R3 consumes)
+pub fn digest_tally(round: u64, reports: impl IntoIterator<Item = (PeerId, StateDigest)>, quorum: u32)
+    -> DesyncVerdict;
+pub fn desync::digest_tally_from_log(log: &MessageLog, round: u64, quorum: u32) -> DesyncVerdict;
+pub struct DesyncVerdict  { pub round: u64, pub quorum_digest: Option<StateDigest>,
+                            pub outliers: Vec<PeerId>, pub reporters: u32, pub agreed: bool }
+                            // + is_desync()
+
+// run health (plain serializable projection for CLI/UX)
+pub struct RunHealth   { pub run_id: String, pub rounds: Vec<RoundHealth> }  // RunHealth::from_log
+pub struct RoundHealth { pub round: u64, pub committed: u32, pub attested_coverage: u32,
+                         pub stragglers: Vec<PeerId>, pub drops: Vec<PeerId>,
+                         pub digest_reporters: u32, pub digest_agreed: bool,
+                         pub duration_ticks: u64, pub finalized: bool }
+```
+
+> **Deviation from the brief's literal `replay(...) -> Result<ReplayReport, ReplayDivergence>`:** the
+> concrete return is `Result<ReplayReport, ReplayError>`, where `ReplayError::Diverged(Box<ReplayDivergence>)`
+> carries the pinpointed first divergence and `ReplayError::Setup(ObserveError)` carries an
+> envelope/genesis setup failure (a real, non-divergence error path). The `ReplayDivergence` payload
+> is exactly as specified (round, recorded-vs-rederived output). Boxed to satisfy
+> `clippy::result_large_err`.
+
+**proto seam** (`daemon_swarm_proto`, wasm32-clean): `RecordSet` (`new`/`to_canonical_vec`/
+`from_canonical_slice`/`content_hash`/`commitment`/`verify_against`/`entries`/`len`/`is_empty`);
+`Heartbeat.ready: Option<bool>`. **CDDL additions:** `record-set = { "entries": [* record-entry] }`;
+`heartbeat = { "round": round, ? "ready": bool }`.
+
+**coordinator seam** (`daemon_swarm_coordinator`, wasm32-clean): `commit::has_evidence` (now with the
+root-only path) + `commit::quorum_root`; `Member.warmup_ready: bool` + warmup early-exit in `tick`.
+
+**Warmup early-exit landed** (not documented-out): `Heartbeat` is not literal-constructed by any other
+lane, so the additive `ready` flag + `Member.warmup_ready` + the event-driven exit are complete and
+tested. The `WaitingForMembers → Warmup` transition stays clock-driven (an event-driven variant would
+break `proto2`'s pre-clock assertion).
+
+**Gates** (all green, run via `nix develop --command …` from the worktree root): `cargo fmt --check`;
+`cargo clippy --workspace --all-targets -- -D warnings`; `cargo build --target wasm32-unknown-unknown
+-p daemon-swarm-proto` **and** `-p daemon-swarm-coordinator`; `typos docs/specs`. `cargo test
+--workspace` is green **except** the two pre-existing `daemon-conformance` detached-delegation flakes
+(`detached_fanout_materializes_distinct_children`, `detached_notice_reaches_a_parked_durable_parent`)
+— outside this lane, untouched, and **green in isolation** (`cargo test -p daemon-conformance --lib
+detached_delegation` → 5/5). Test counts (this lane): proto record-set 5 + heartbeat-cddl 1 (+ prior
+suites); coordinator root-only 3 + warmup 2 + envelope-hash 2 (+ prior 27→**34** commit/tick/admission
+tests); observe **6** (`log_roundtrip_canonical`, `replay_matches_live_run`,
+`replay_detects_tampered_record`, `digest_quorum_flags_outlier`, `run_health_projects_per_round_facts`,
++ error-render unit).
+
+## Notes for Merge 3 integration (what to watch)
+
+- **`Join.envelope_hash` is the one deferred, coordinated change.** Apply the additive field
+  `pub envelope_hash: Option<Hash>` (`#[serde(default, skip_serializing_if = "Option::is_none")]`) to
+  `daemon_swarm_proto::messages::Join`, the CDDL rule `join = { …, ? "envelope_hash": hash }`, and in
+  the **same** integration commit fix lane R's single `Join { … }` literal in
+  `daemon-swarm-run/src/harness.rs` (add `envelope_hash: None`). Then thread it through
+  `tick::on_join` (`asserted_hash: j.envelope_hash.as_ref()`); the `admit` check +
+  `AdmissionReject::EnvelopeHashMismatch` are already present and tested. This is the only P3 seam that
+  could not land in isolation (the frozen lane-R literal), so it is left as an explicit integrator task
+  rather than a broken workspace gate.
+- **observe depends additively on `daemon-swarm-coordinator`** (path dep already in the frozen root
+  `[workspace.dependencies]`; lane-owned `Cargo.toml` edit only — no root/`deny`/`flake` change, same
+  pattern R2 used for the harness coordinator dep). Re-run `cargo deny check` at the merge is a no-op
+  (no new third-party dep; `ciborium` dev-dep is already pinned).
+- **`DesyncVerdict` is exported, not wired.** R3 consumes it at `daemon-swarm-run/src/checkpoint.rs`'s
+  desync-trigger marker (the MERGE-2 note): fold the run's `Digest`s (or use `digest_tally_from_log`)
+  and drive resync on `is_desync()`. P3 deliberately does **not** touch `daemon-swarm-run`.
+- **Replay clock sidecar.** `replay` reproduces the coordinator from the recorded `tick` `Input` trace.
+  The message log stores the signed-message subset; timeout/straggler rounds also need the recorded
+  `Input::Clock`s (the driver's sidecar — the Merge-2 harness `CoordinatorReplay` already records the
+  exact input sequence, so observe's `replay` is its library form). The happy path is clock-free thanks
+  to event-driven finalize + the new warmup readiness exit.
+- **State shape changed additively** (`Member.warmup_ready`). `CoordinatorState` CBOR gained a field;
+  same-code replay/round-trip is unaffected (no golden state-byte vectors exist). Any *cross-wave*
+  persisted `CoordinatorState` snapshot from before Merge 3 would need `#[serde(default)]` if replayed
+  by newer code — not a concern within a single run.
+- **`RecordSet` vs `RoundRecord.set_locator`.** `tick` still emits a `StoreKey` locator
+  (`runs/<run>/rounds/<r>/record-set.cbor`); `RecordSet::content_hash` is available for content
+  addressing when the r2/iroh blob plane lands (the MERGE-2 `verify_record_set` object-fetch note).
