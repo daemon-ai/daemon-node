@@ -3,11 +3,22 @@
 
 //! The op backend — the Wave-2 engine seam (ABI §5, architecture §5.1).
 //!
-//! [`OpBackend`] is the numeric engine behind the host dispatch layer. Wave 1 ships [`CpuBackend`],
-//! a plain `Vec<f32>` fake: the **det lane** is the real `det-core` (so HOST-5/6 determinism holds),
-//! the native lane is a functional fp32 forward (no autodiff yet — `backward` is a no-op, HOST-9
-//! parity is Wave 2). Wave 2 slots burn/CubeCL in behind this same trait; the arena, trap taxonomy,
-//! phase table, and budgets above it stay lane-E stable.
+//! [`OpBackend`] is the numeric engine behind the host dispatch layer. [`CpuBackend`] is a plain
+//! `Vec<f32>` engine: the **det lane** is the real `det-core` (so HOST-5/6 determinism holds), and
+//! the native lane is a functional fp32 forward **plus a reverse-mode autodiff tape** (HOST-9) — the
+//! host learns from data. A future wave slots burn/CubeCL in behind this same trait; the arena, trap
+//! taxonomy, phase table, and budgets above it stay lane-E stable.
+//!
+//! ## Autodiff (HOST-9)
+//!
+//! Each differentiable native op records a [`TapeNode`] (output tensor + the op + any saved forward
+//! intermediates). [`CpuBackend::backward`] seeds `d(loss) = 1` and walks the tape in reverse,
+//! accumulating input gradients per [`TensorId`]; the host folds leaf (param) gradients into the
+//! param `grad` tensors that `grad@1` / `adamw_step@1` read. Because the guest frees step tensors
+//! before `backward` (RAII `drop@1`), the backend **defers** step-tensor frees while recording
+//! (`begin_pass`/`end_pass`) so the tape can read its inputs — the same retention the sim gets from
+//! its push-only node arena. Two backends over identical inputs run identical fp32 arithmetic, so
+//! cross-peer digest bit-identity (the MVP guarantee) is preserved.
 //!
 //! Tensors are addressed by [`TensorId`]. Shape validation for native ops is the caller's
 //! ([`crate::runtime`]) responsibility (so host functions never panic across the ABI boundary); the
@@ -125,8 +136,27 @@ pub trait OpBackend: Send {
         end: usize,
     ) -> TensorId;
 
-    /// `backward@1` — Wave-1 fake keeps grads as-is (no tape); HOST-9 autodiff parity is Wave 2.
+    /// `backward@1` — reverse-mode autodiff (HOST-9): seed `d(loss)=1` and walk the recorded tape,
+    /// accumulating input gradients. Leaf (param) gradients are read back via [`OpBackend::grad_of`].
     fn backward(&mut self, _loss: TensorId) {}
+
+    /// Begin a differentiable pass: start recording the autodiff tape and defer step-tensor frees so
+    /// the tape can read its inputs during `backward` (the guest drops intermediates before backward,
+    /// ABI §3.3 Burn-tape semantics). Called by the host at the start of a `da_step` entry.
+    fn begin_pass(&mut self) {}
+    /// End a differentiable pass: stop recording, apply the deferred frees, and clear the tape.
+    fn end_pass(&mut self) {}
+    /// The accumulated gradient of a leaf tensor after [`OpBackend::backward`] (HOST-9). `None` if the
+    /// tensor received no gradient this pass.
+    fn grad_of(&self, _id: TensorId) -> Option<Vec<f32>> {
+        None
+    }
+    /// A shape-only view change (`reshape@1`): a fresh tensor with identical data, recorded on the
+    /// tape as an identity passthrough so gradients flow through. Default: a plain clone (no tape).
+    fn reshape(&mut self, x: TensorId) -> TensorId {
+        self.clone_tensor(x)
+    }
+
     /// `adamw_step@1` — updates `master` in place (fused, ABI §5.7).
     fn adamw_step(
         &mut self,
@@ -232,11 +262,129 @@ pub trait OpBackend: Send {
     fn idct2(&mut self, x: TensorId, tile: usize) -> Result<TensorId, TrapCode>;
 }
 
-/// The Wave-1 CPU fake: a `Vec<f32>` tensor arena.
+/// One recorded reverse-mode autodiff op (HOST-9). Inputs are [`TensorId`]s (read live during
+/// `backward` — retained by the deferred-free discipline); forward-only intermediates the backward
+/// rule needs (softmax / inv-rms / attention probs / gathered ids / targets) are saved inline.
+enum TapeOp {
+    MatMul {
+        a: TensorId,
+        b: TensorId,
+        m: usize,
+        k: usize,
+        n: usize,
+    },
+    Add {
+        a: TensorId,
+        b: TensorId,
+    },
+    AddBias {
+        a: TensorId,
+        b: TensorId,
+        rows: usize,
+        cols: usize,
+    },
+    Sub {
+        a: TensorId,
+        b: TensorId,
+    },
+    Mul {
+        a: TensorId,
+        b: TensorId,
+    },
+    MulS {
+        x: TensorId,
+        s: f32,
+    },
+    Relu {
+        x: TensorId,
+    },
+    CrossEntropy {
+        logits: TensorId,
+        rows: usize,
+        cols: usize,
+        targets: Vec<i64>,
+        ignore: i64,
+        softmax: Vec<f32>,
+    },
+    Embedding {
+        w: TensorId,
+        ids: Vec<usize>,
+        d: usize,
+    },
+    Rmsnorm {
+        x: TensorId,
+        w: TensorId,
+        rows: usize,
+        d: usize,
+        inv_rms: Vec<f32>,
+    },
+    Silu {
+        x: TensorId,
+    },
+    Softmax {
+        x: TensorId,
+        outer: usize,
+        dimlen: usize,
+        inner: usize,
+        probs: Vec<f32>,
+    },
+    Rope {
+        x: TensorId,
+        rows: usize,
+        seq: usize,
+        hd: usize,
+        pos_start: usize,
+        theta: f32,
+        interleaved: bool,
+    },
+    FlashAttn {
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        bh: usize,
+        s: usize,
+        d: usize,
+        scale: f32,
+        probs: Vec<f32>,
+    },
+    Reshape {
+        x: TensorId,
+    },
+    Transpose {
+        x: TensorId,
+        shape_in: Vec<usize>,
+        d0: usize,
+        d1: usize,
+    },
+    Slice {
+        x: TensorId,
+        shape_in: Vec<usize>,
+        dim: usize,
+        start: usize,
+        end: usize,
+    },
+}
+
+/// A tape entry: the op and the tensor it produced.
+struct TapeNode {
+    out: TensorId,
+    op: TapeOp,
+}
+
+/// The CPU engine: a `Vec<f32>` tensor arena plus a reverse-mode autodiff tape (HOST-9).
 #[derive(Default)]
 pub struct CpuBackend {
     tensors: Vec<Option<Vec<f32>>>,
     free: Vec<u32>,
+    /// The autodiff tape for the current differentiable pass (forward order).
+    tape: Vec<TapeNode>,
+    /// Per-`TensorId` accumulated gradients from the last `backward`.
+    grad: Vec<Option<Vec<f32>>>,
+    /// Whether a differentiable pass is recording (defers step-tensor frees so the tape can read
+    /// its inputs during `backward`).
+    recording: bool,
+    /// Step-tensor ids freed while recording — actually recycled at `end_pass`.
+    deferred: Vec<TensorId>,
 }
 
 impl CpuBackend {
@@ -265,6 +413,77 @@ impl CpuBackend {
     fn u32s(&self, id: TensorId) -> Vec<u32> {
         self.get(id).iter().map(|&f| f as u32).collect()
     }
+
+    /// Record a differentiable op that produced `out` (only while a pass is recording).
+    fn record(&mut self, out: TensorId, op: TapeOp) {
+        if self.recording {
+            self.tape.push(TapeNode { out, op });
+        }
+    }
+}
+
+/// Accumulate `g` into the gradient slot for tensor `id` (allocating a zero buffer on first touch).
+fn accumulate(grad: &mut [Option<Vec<f32>>], id: TensorId, g: &[f32]) {
+    let slot = &mut grad[id as usize];
+    match slot {
+        None => *slot = Some(g.to_vec()),
+        Some(existing) => {
+            for (e, &v) in existing.iter_mut().zip(g.iter()) {
+                *e += v;
+            }
+        }
+    }
+}
+
+/// Row-major `a[m,k] · b[k,n]` (fixed-order fp32; the backward helper).
+fn mm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0_f32;
+            for p in 0..k {
+                acc += a[i * k + p] * b[p * n + j];
+            }
+            out[i * n + j] = acc;
+        }
+    }
+    out
+}
+
+/// Transpose a `[rows, cols]` row-major matrix.
+fn transpose2d(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            out[j * rows + i] = a[i * cols + j];
+        }
+    }
+    out
+}
+
+/// Scatter a slice-output gradient back into an input-shaped zero buffer (the `slice@1` backward).
+fn unslice_dim(grad: &[f32], shape_in: &[usize], dim: usize, start: usize, end: usize) -> Vec<f32> {
+    let mut shape_out = shape_in.to_vec();
+    shape_out[dim] = end - start;
+    let sin = row_major_strides(shape_in);
+    let sout = row_major_strides(&shape_out);
+    let rank = shape_in.len();
+    let mut full = vec![0.0_f32; shape_in.iter().product()];
+    let mut coord = vec![0usize; rank];
+    for (flat, &gv) in grad.iter().enumerate() {
+        let mut rem = flat;
+        for r in 0..rank {
+            coord[r] = rem / sout[r];
+            rem %= sout[r];
+        }
+        let mut in_flat = 0usize;
+        for r in 0..rank {
+            let c = if r == dim { coord[r] + start } else { coord[r] };
+            in_flat += c * sin[r];
+        }
+        full[in_flat] = gv;
+    }
+    full
 }
 
 impl OpBackend for CpuBackend {
@@ -286,9 +505,43 @@ impl OpBackend for CpuBackend {
     }
     fn free(&mut self, id: TensorId) {
         if (id as usize) < self.tensors.len() && self.tensors[id as usize].is_some() {
+            // While recording, retain the tensor: the tape may read it during `backward` (the guest
+            // frees intermediates before backward). It is actually recycled at `end_pass`.
+            if self.recording {
+                self.deferred.push(id);
+                return;
+            }
             self.tensors[id as usize] = None;
             self.free.push(id);
         }
+    }
+
+    fn begin_pass(&mut self) {
+        self.recording = true;
+        self.tape.clear();
+    }
+
+    fn end_pass(&mut self) {
+        self.recording = false;
+        for id in std::mem::take(&mut self.deferred) {
+            if (id as usize) < self.tensors.len() && self.tensors[id as usize].is_some() {
+                self.tensors[id as usize] = None;
+                self.free.push(id);
+            }
+        }
+        self.tape.clear();
+        self.grad.clear();
+    }
+
+    fn grad_of(&self, id: TensorId) -> Option<Vec<f32>> {
+        self.grad.get(id as usize).cloned().flatten()
+    }
+
+    fn reshape(&mut self, x: TensorId) -> TensorId {
+        let data = self.get(x).to_vec();
+        let out = self.insert(data);
+        self.record(out, TapeOp::Reshape { x });
+        out
     }
 
     fn matmul(&mut self, a: TensorId, m: usize, k: usize, b: TensorId, n: usize) -> TensorId {
@@ -304,7 +557,9 @@ impl OpBackend for CpuBackend {
                 out[i * n + j] = acc;
             }
         }
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(out, TapeOp::MatMul { a, b, m, k, n });
+        out
     }
     fn add(&mut self, a: TensorId, b: TensorId) -> TensorId {
         let out: Vec<f32> = self
@@ -313,7 +568,9 @@ impl OpBackend for CpuBackend {
             .zip(self.get(b).iter())
             .map(|(&x, &y)| x + y)
             .collect();
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(out, TapeOp::Add { a, b });
+        out
     }
     fn add_bias(&mut self, a: TensorId, b: TensorId, rows: usize, cols: usize) -> TensorId {
         let mut out = self.get(a).to_vec();
@@ -323,7 +580,9 @@ impl OpBackend for CpuBackend {
                 out[i * cols + j] += bias[j];
             }
         }
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(out, TapeOp::AddBias { a, b, rows, cols });
+        out
     }
     fn sub(&mut self, a: TensorId, b: TensorId) -> TensorId {
         let out: Vec<f32> = self
@@ -332,7 +591,9 @@ impl OpBackend for CpuBackend {
             .zip(self.get(b).iter())
             .map(|(&x, &y)| x - y)
             .collect();
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(out, TapeOp::Sub { a, b });
+        out
     }
     fn mul(&mut self, a: TensorId, b: TensorId) -> TensorId {
         let out: Vec<f32> = self
@@ -341,16 +602,22 @@ impl OpBackend for CpuBackend {
             .zip(self.get(b).iter())
             .map(|(&x, &y)| x * y)
             .collect();
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(out, TapeOp::Mul { a, b });
+        out
     }
     fn mul_s(&mut self, x: TensorId, s: f64) -> TensorId {
-        let s = s as f32;
-        let out: Vec<f32> = self.get(x).iter().map(|&e| e * s).collect();
-        self.insert(out)
+        let sf = s as f32;
+        let out: Vec<f32> = self.get(x).iter().map(|&e| e * sf).collect();
+        let out = self.insert(out);
+        self.record(out, TapeOp::MulS { x, s: sf });
+        out
     }
     fn relu(&mut self, x: TensorId) -> TensorId {
         let out: Vec<f32> = self.get(x).iter().map(|&e| e.max(0.0)).collect();
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(out, TapeOp::Relu { x });
+        out
     }
     fn cross_entropy(
         &mut self,
@@ -361,22 +628,42 @@ impl OpBackend for CpuBackend {
         ignore: i64,
     ) -> TensorId {
         let lv = self.get(logits);
+        let mut softmax = vec![0.0_f32; rows * cols];
         let mut loss = 0.0_f32;
         let mut counted = 0.0_f32;
         for i in 0..rows {
-            let t = targets.get(i).copied().unwrap_or(ignore);
-            if t == ignore {
-                continue;
-            }
             let row = &lv[i * cols..(i + 1) * cols];
             let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let denom: f32 = row.iter().map(|&e| (e - max).exp()).sum();
-            let p = ((row[t as usize] - max).exp() / denom).max(1.0e-12);
-            loss -= p.ln();
-            counted += 1.0;
+            let mut denom = 0.0_f32;
+            for j in 0..cols {
+                let e = (row[j] - max).exp();
+                softmax[i * cols + j] = e;
+                denom += e;
+            }
+            for j in 0..cols {
+                softmax[i * cols + j] /= denom;
+            }
+            let t = targets.get(i).copied().unwrap_or(ignore);
+            if t != ignore {
+                let p = softmax[i * cols + t as usize].max(1.0e-12);
+                loss -= p.ln();
+                counted += 1.0;
+            }
         }
         let mean = if counted > 0.0 { loss / counted } else { 0.0 };
-        self.insert(vec![mean])
+        let out = self.insert(vec![mean]);
+        self.record(
+            out,
+            TapeOp::CrossEntropy {
+                logits,
+                rows,
+                cols,
+                targets: targets.to_vec(),
+                ignore,
+                softmax,
+            },
+        );
+        out
     }
 
     fn embedding(&mut self, w: TensorId, ids: &[usize], d: usize) -> TensorId {
@@ -385,22 +672,44 @@ impl OpBackend for CpuBackend {
         for &id in ids {
             out.extend_from_slice(&wv[id * d..id * d + d]);
         }
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(
+            out,
+            TapeOp::Embedding {
+                w,
+                ids: ids.to_vec(),
+                d,
+            },
+        );
+        out
     }
     fn rmsnorm(&mut self, x: TensorId, w: TensorId, rows: usize, d: usize, eps: f64) -> TensorId {
         let xv = self.get(x);
         let wv = self.get(w);
         let eps = eps as f32;
         let mut out = vec![0.0_f32; rows * d];
+        let mut inv_rms = vec![0.0_f32; rows];
         for r in 0..rows {
             let row = &xv[r * d..(r + 1) * d];
             let ms = row.iter().map(|&e| e * e).sum::<f32>() / d as f32;
             let inv = 1.0 / (ms + eps).sqrt();
+            inv_rms[r] = inv;
             for i in 0..d {
                 out[r * d + i] = row[i] * inv * wv[i];
             }
         }
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(
+            out,
+            TapeOp::Rmsnorm {
+                x,
+                w,
+                rows,
+                d,
+                inv_rms,
+            },
+        );
+        out
     }
     fn silu(&mut self, x: TensorId) -> TensorId {
         let out: Vec<f32> = self
@@ -408,7 +717,9 @@ impl OpBackend for CpuBackend {
             .iter()
             .map(|&v| v / (1.0 + (-v).exp()))
             .collect();
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(out, TapeOp::Silu { x });
+        out
     }
     fn softmax(&mut self, x: TensorId, outer: usize, dimlen: usize, inner: usize) -> TensorId {
         let xv = self.get(x);
@@ -431,7 +742,19 @@ impl OpBackend for CpuBackend {
                 }
             }
         }
-        self.insert(out)
+        let probs = out.clone();
+        let out = self.insert(out);
+        self.record(
+            out,
+            TapeOp::Softmax {
+                x,
+                outer,
+                dimlen,
+                inner,
+                probs,
+            },
+        );
+        out
     }
     #[allow(clippy::too_many_arguments)]
     fn rope(
@@ -445,12 +768,12 @@ impl OpBackend for CpuBackend {
         interleaved: bool,
     ) -> TensorId {
         let xv = self.get(x).to_vec();
-        let theta = theta as f32;
+        let thetaf = theta as f32;
         let mut out = xv.clone();
         for r in 0..rows {
             let pos = (pos_start + (r % seq)) as f32;
             for j in 0..hd / 2 {
-                let freq = 1.0 / theta.powf(2.0 * j as f32 / hd as f32);
+                let freq = 1.0 / thetaf.powf(2.0 * j as f32 / hd as f32);
                 let angle = pos * freq;
                 let (c, s) = (angle.cos(), angle.sin());
                 let (ia, ib) = if interleaved {
@@ -463,7 +786,20 @@ impl OpBackend for CpuBackend {
                 out[r * hd + ib] = a * s + b * c;
             }
         }
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(
+            out,
+            TapeOp::Rope {
+                x,
+                rows,
+                seq,
+                hd,
+                pos_start,
+                theta: thetaf,
+                interleaved,
+            },
+        );
+        out
     }
     #[allow(clippy::too_many_arguments)]
     fn flash_attn(
@@ -482,39 +818,70 @@ impl OpBackend for CpuBackend {
         let vv = self.get(v).to_vec();
         let scale = scale as f32;
         let mut out = vec![0.0_f32; qv.len()];
+        // Full normalized attention weights `[bh, s, s]` — saved for the backward rule.
+        let mut probs = vec![0.0_f32; bh * s * s];
         for g in 0..bh {
             let base = g * s * d;
+            let pbase = g * s * s;
             for i in 0..s {
                 let jmax = if causal { i + 1 } else { s };
-                let mut scores = vec![0.0_f32; jmax];
                 let mut maxv = f32::NEG_INFINITY;
-                for (j, sc) in scores.iter_mut().enumerate() {
+                for j in 0..jmax {
                     let mut dot = 0.0_f32;
                     for e in 0..d {
                         dot += qv[base + i * d + e] * kv[base + j * d + e];
                     }
-                    *sc = dot * scale;
-                    maxv = maxv.max(*sc);
+                    let sc = dot * scale;
+                    probs[pbase + i * s + j] = sc;
+                    maxv = maxv.max(sc);
                 }
                 let mut denom = 0.0_f32;
-                for sc in &mut scores {
-                    *sc = (*sc - maxv).exp();
-                    denom += *sc;
+                for j in 0..jmax {
+                    let e = (probs[pbase + i * s + j] - maxv).exp();
+                    probs[pbase + i * s + j] = e;
+                    denom += e;
+                }
+                for j in 0..jmax {
+                    probs[pbase + i * s + j] /= denom;
                 }
                 for e in 0..d {
                     let mut acc = 0.0_f32;
-                    for (j, &p) in scores.iter().enumerate() {
-                        acc += (p / denom) * vv[base + j * d + e];
+                    for j in 0..jmax {
+                        acc += probs[pbase + i * s + j] * vv[base + j * d + e];
                     }
                     out[base + i * d + e] = acc;
                 }
             }
         }
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(
+            out,
+            TapeOp::FlashAttn {
+                q,
+                k,
+                v,
+                bh,
+                s,
+                d,
+                scale,
+                probs,
+            },
+        );
+        out
     }
     fn transpose(&mut self, x: TensorId, shape_in: &[usize], d0: usize, d1: usize) -> TensorId {
         let out = permute_axes(self.get(x), shape_in, d0, d1);
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(
+            out,
+            TapeOp::Transpose {
+                x,
+                shape_in: shape_in.to_vec(),
+                d0,
+                d1,
+            },
+        );
+        out
     }
     fn slice(
         &mut self,
@@ -525,7 +892,293 @@ impl OpBackend for CpuBackend {
         end: usize,
     ) -> TensorId {
         let out = slice_dim(self.get(x), shape_in, dim, start, end);
-        self.insert(out)
+        let out = self.insert(out);
+        self.record(
+            out,
+            TapeOp::Slice {
+                x,
+                shape_in: shape_in.to_vec(),
+                dim,
+                start,
+                end,
+            },
+        );
+        out
+    }
+
+    fn backward(&mut self, loss: TensorId) {
+        let n = self.tensors.len();
+        let mut grad: Vec<Option<Vec<f32>>> = vec![None; n];
+        let seed = vec![1.0_f32; self.get(loss).len().max(1)];
+        grad[loss as usize] = Some(seed);
+
+        // Walk the tape in reverse (consumers before producers): each node distributes its output
+        // gradient to its inputs. Inputs are read live (retained by the deferred-free discipline).
+        for node in self.tape.iter().rev() {
+            let g = match grad[node.out as usize].clone() {
+                Some(g) if g.iter().any(|&x| x != 0.0) => g,
+                _ => continue,
+            };
+            match &node.op {
+                TapeOp::MatMul { a, b, m, k, n } => {
+                    let av = self.get(*a).to_vec();
+                    let bv = self.get(*b).to_vec();
+                    let ga = mm(&g, &transpose2d(&bv, *k, *n), *m, *n, *k);
+                    let gb = mm(&transpose2d(&av, *m, *k), &g, *k, *m, *n);
+                    accumulate(&mut grad, *a, &ga);
+                    accumulate(&mut grad, *b, &gb);
+                }
+                TapeOp::Add { a, b } => {
+                    accumulate(&mut grad, *a, &g);
+                    accumulate(&mut grad, *b, &g);
+                }
+                TapeOp::AddBias { a, b, rows, cols } => {
+                    accumulate(&mut grad, *a, &g);
+                    let mut gb = vec![0.0_f32; *cols];
+                    for i in 0..*rows {
+                        for j in 0..*cols {
+                            gb[j] += g[i * cols + j];
+                        }
+                    }
+                    accumulate(&mut grad, *b, &gb);
+                }
+                TapeOp::Sub { a, b } => {
+                    accumulate(&mut grad, *a, &g);
+                    let neg: Vec<f32> = g.iter().map(|&x| -x).collect();
+                    accumulate(&mut grad, *b, &neg);
+                }
+                TapeOp::Mul { a, b } => {
+                    let av = self.get(*a).to_vec();
+                    let bv = self.get(*b).to_vec();
+                    let ga: Vec<f32> = g.iter().zip(bv.iter()).map(|(&x, &y)| x * y).collect();
+                    let gb: Vec<f32> = g.iter().zip(av.iter()).map(|(&x, &y)| x * y).collect();
+                    accumulate(&mut grad, *a, &ga);
+                    accumulate(&mut grad, *b, &gb);
+                }
+                TapeOp::MulS { x, s } => {
+                    let gx: Vec<f32> = g.iter().map(|&v| v * s).collect();
+                    accumulate(&mut grad, *x, &gx);
+                }
+                TapeOp::Relu { x } => {
+                    let xv = self.get(*x).to_vec();
+                    let gx: Vec<f32> = g
+                        .iter()
+                        .zip(xv.iter())
+                        .map(|(&gv, &xe)| if xe > 0.0 { gv } else { 0.0 })
+                        .collect();
+                    accumulate(&mut grad, *x, &gx);
+                }
+                TapeOp::CrossEntropy {
+                    logits,
+                    rows,
+                    cols,
+                    targets,
+                    ignore,
+                    softmax,
+                } => {
+                    let upstream = g[0];
+                    let counted = targets.iter().filter(|&&t| t != *ignore).count().max(1) as f32;
+                    let mut gl = vec![0.0_f32; rows * cols];
+                    for i in 0..*rows {
+                        let t = targets.get(i).copied().unwrap_or(*ignore);
+                        if t == *ignore {
+                            continue;
+                        }
+                        for j in 0..*cols {
+                            let mut dd = softmax[i * cols + j];
+                            if j == t as usize {
+                                dd -= 1.0;
+                            }
+                            gl[i * cols + j] = upstream * dd / counted;
+                        }
+                    }
+                    accumulate(&mut grad, *logits, &gl);
+                }
+                TapeOp::Embedding { w, ids, d } => {
+                    let vocab = self.get(*w).len() / d;
+                    let mut gw = vec![0.0_f32; vocab * d];
+                    for (r, &id) in ids.iter().enumerate() {
+                        for i in 0..*d {
+                            gw[id * d + i] += g[r * d + i];
+                        }
+                    }
+                    accumulate(&mut grad, *w, &gw);
+                }
+                TapeOp::Rmsnorm {
+                    x,
+                    w,
+                    rows,
+                    d,
+                    inv_rms,
+                } => {
+                    let xv = self.get(*x).to_vec();
+                    let wv = self.get(*w).to_vec();
+                    let mut gx = vec![0.0_f32; rows * d];
+                    let mut gw = vec![0.0_f32; *d];
+                    for r in 0..*rows {
+                        let inv = inv_rms[r];
+                        let xrow = &xv[r * d..(r + 1) * d];
+                        let grow = &g[r * d..(r + 1) * d];
+                        let mut dot = 0.0_f32;
+                        for i in 0..*d {
+                            dot += grow[i] * wv[i] * xrow[i];
+                        }
+                        let coef = inv * inv * inv / *d as f32 * dot;
+                        for i in 0..*d {
+                            gx[r * d + i] = inv * wv[i] * grow[i] - coef * xrow[i];
+                            gw[i] += grow[i] * xrow[i] * inv;
+                        }
+                    }
+                    accumulate(&mut grad, *x, &gx);
+                    accumulate(&mut grad, *w, &gw);
+                }
+                TapeOp::Silu { x } => {
+                    let xv = self.get(*x).to_vec();
+                    let gx: Vec<f32> = g
+                        .iter()
+                        .zip(xv.iter())
+                        .map(|(&gv, &xe)| {
+                            let sig = 1.0 / (1.0 + (-xe).exp());
+                            gv * (sig * (1.0 + xe * (1.0 - sig)))
+                        })
+                        .collect();
+                    accumulate(&mut grad, *x, &gx);
+                }
+                TapeOp::Softmax {
+                    x,
+                    outer,
+                    dimlen,
+                    inner,
+                    probs,
+                } => {
+                    let mut gx = vec![0.0_f32; g.len()];
+                    for o in 0..*outer {
+                        for i in 0..*inner {
+                            let base = o * dimlen * inner + i;
+                            let mut dot = 0.0_f32;
+                            for t in 0..*dimlen {
+                                dot += g[base + t * inner] * probs[base + t * inner];
+                            }
+                            for t in 0..*dimlen {
+                                let idx = base + t * inner;
+                                gx[idx] = probs[idx] * (g[idx] - dot);
+                            }
+                        }
+                    }
+                    accumulate(&mut grad, *x, &gx);
+                }
+                TapeOp::Rope {
+                    x,
+                    rows,
+                    seq,
+                    hd,
+                    pos_start,
+                    theta,
+                    interleaved,
+                } => {
+                    // Rotation is orthogonal: the input grad is the transpose (inverse) rotation.
+                    let mut gx = vec![0.0_f32; g.len()];
+                    for r in 0..*rows {
+                        let pos = (pos_start + (r % seq)) as f32;
+                        for j in 0..hd / 2 {
+                            let freq = 1.0 / theta.powf(2.0 * j as f32 / *hd as f32);
+                            let angle = pos * freq;
+                            let (c, s) = (angle.cos(), angle.sin());
+                            let (ia, ib) = if *interleaved {
+                                (2 * j, 2 * j + 1)
+                            } else {
+                                (j, j + hd / 2)
+                            };
+                            let (ga, gb) = (g[r * hd + ia], g[r * hd + ib]);
+                            gx[r * hd + ia] = ga * c + gb * s;
+                            gx[r * hd + ib] = -ga * s + gb * c;
+                        }
+                    }
+                    accumulate(&mut grad, *x, &gx);
+                }
+                TapeOp::FlashAttn {
+                    q,
+                    k,
+                    v,
+                    bh,
+                    s,
+                    d,
+                    scale,
+                    probs,
+                } => {
+                    let qv = self.get(*q).to_vec();
+                    let kv = self.get(*k).to_vec();
+                    let vv = self.get(*v).to_vec();
+                    let mut gq = vec![0.0_f32; qv.len()];
+                    let mut gk = vec![0.0_f32; kv.len()];
+                    let mut gv = vec![0.0_f32; vv.len()];
+                    for grp in 0..*bh {
+                        let base = grp * s * d;
+                        let pbase = grp * s * s;
+                        for i in 0..*s {
+                            let mut dp = vec![0.0_f32; *s];
+                            for j in 0..*s {
+                                let p = probs[pbase + i * s + j];
+                                if p == 0.0 {
+                                    continue;
+                                }
+                                let mut dpj = 0.0_f32;
+                                for e in 0..*d {
+                                    let go = g[base + i * d + e];
+                                    dpj += go * vv[base + j * d + e];
+                                    gv[base + j * d + e] += p * go;
+                                }
+                                dp[j] = dpj;
+                            }
+                            let mut sum = 0.0_f32;
+                            for j in 0..*s {
+                                sum += probs[pbase + i * s + j] * dp[j];
+                            }
+                            for j in 0..*s {
+                                let p = probs[pbase + i * s + j];
+                                if p == 0.0 {
+                                    continue;
+                                }
+                                let ds = p * (dp[j] - sum) * scale;
+                                for e in 0..*d {
+                                    gq[base + i * d + e] += ds * kv[base + j * d + e];
+                                    gk[base + j * d + e] += ds * qv[base + i * d + e];
+                                }
+                            }
+                        }
+                    }
+                    accumulate(&mut grad, *q, &gq);
+                    accumulate(&mut grad, *k, &gk);
+                    accumulate(&mut grad, *v, &gv);
+                }
+                TapeOp::Reshape { x } => {
+                    accumulate(&mut grad, *x, &g);
+                }
+                TapeOp::Transpose {
+                    x,
+                    shape_in,
+                    d0,
+                    d1,
+                } => {
+                    // g is in the OUTPUT (swapped) layout; swapping back yields the input layout.
+                    let mut shape_out = shape_in.clone();
+                    shape_out.swap(*d0, *d1);
+                    let gx = permute_axes(&g, &shape_out, *d0, *d1);
+                    accumulate(&mut grad, *x, &gx);
+                }
+                TapeOp::Slice {
+                    x,
+                    shape_in,
+                    dim,
+                    start,
+                    end,
+                } => {
+                    let gx = unslice_dim(&g, shape_in, *dim, *start, *end);
+                    accumulate(&mut grad, *x, &gx);
+                }
+            }
+        }
+        self.grad = grad;
     }
 
     fn adamw_step(

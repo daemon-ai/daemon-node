@@ -145,9 +145,10 @@ fn cross_peer_agrees(profile: &str, rounds: u64) -> Vec<StateDigest> {
     let mut transcript = Vec::new();
     for round in 0..rounds {
         // Two peers, same config + same batches (the MVP claim's premise): identical local math →
-        // identical round payloads. (The host `CpuBackend` `backward` is a Wave-1 no-op, so the
-        // payload is currently data-independent regardless; see the module note + the E3 ledger. The
-        // cross-peer bit-identity asserted below holds either way — that is the frozen guarantee.)
+        // identical round payloads. The host `CpuBackend` now runs real reverse-mode autodiff
+        // (HOST-9), so `make_update` is data-dependent; feeding both peers identical batches keeps
+        // the contributions equal, and the cross-peer bit-identity asserted below is the frozen
+        // guarantee that holds because both peers run the same deterministic fp32 arithmetic.
         let salt = 0x1234 ^ round;
         let pa = train_round(&mut a, steps, round, salt);
         let pb = train_round(&mut b, steps, round, salt);
@@ -286,17 +287,11 @@ fn preemption_as_churn_is_digest_neutral() {
 
 // The MVP guarantee is cross-PEER bit-identity (WasmBackend vs WasmBackend, one implementation),
 // asserted above. Sim (`daemon-train-sdk` `sim`) vs host (`WasmBackend`/`CpuBackend`) equality is a
-// nice-to-have that does NOT hold bit-for-bit, for two independent reasons the ABI does not require
-// to agree (ABI §7 makes only the *det lane* a numerics reference):
-//
-//  1. Distinct init RNG: the host seeds params via `runtime::fake_init` (FNV/xorshift by name) while
-//     the sim seeds via `sim::init_values` (a different splitmix/Box-Muller). So even the *initial*
-//     param masters differ before a single step runs.
-//  2. Distinct native lane: the host `CpuBackend::backward` is a Wave-1 no-op (grads stay zero, so
-//     the host does not yet learn from data — only weight decay + the outer step move params),
-//     whereas the sim runs a real reverse-mode tape. Only the det-lane ingest fold shares `det-core`
-//     and is bit-identical. (Host autodiff — HOST-9 — is the outstanding lane-E item that makes
-//     `make_update` data-dependent; the cross-peer identity above does not depend on it.)
+// nice-to-have that does NOT hold bit-for-bit, because the two seed their param init RNG differently
+// (the host seeds via `runtime::fake_init` FNV/xorshift by name; the sim via `sim::init_values`
+// splitmix/Box-Muller), so even the *initial* masters differ before a single step. Both now run a
+// real reverse-mode tape over the shared det-core kernels (HOST-9), so both learn from data; only
+// the det-lane ingest fold is a required numerics reference (ABI §7), and it is bit-identical.
 //
 // So sim-vs-host is exercised as *each backend is internally deterministic* (a re-run reproduces its
 // own transcript), which is the property that matters for reproducibility; cross-lane bit-equality is
@@ -310,4 +305,60 @@ fn host_backend_is_self_consistent() {
         a.windows(2).all(|w| w[0] != w[1]) || a.len() < 2,
         "successive rounds evolve the state"
     );
+}
+
+// -- HOST-9: the host learns from data (loss decreases) -----------------------------------------
+
+/// HOST-9 acceptance: with reverse-mode autodiff on the host path, a `WasmBackend` overfitting a
+/// **fixed** synthetic batch drives the tiny-llama cross-entropy loss **down** over rounds (mirrors
+/// E2's sim evidence, now on the real host `CpuBackend`). Before HOST-9 the host `backward` was a
+/// no-op and the loss was flat; this test would have failed then.
+fn loss_decreases_for(profile: &str) -> (f32, f32, Vec<f32>) {
+    let config = cbor(&tiny_cfg(profile));
+    let mut b = backend(&config);
+    let steps = b.steps_per_round().expect("steps_per_round");
+    // A single fixed batch (same tokens every step + round): the loss must fall as the host learns.
+    let fixed = batch(0xF00D);
+    let mut per_round = Vec::new();
+    let mut first = f32::NAN;
+    for round in 0..8 {
+        let mut last = f32::NAN;
+        for step in 0..steps {
+            let stats = b.train_step(&fixed, ctx(step)).expect("train_step");
+            if first.is_nan() {
+                first = stats.loss;
+            }
+            last = stats.loss;
+            b.inner_update(step).expect("inner_update");
+        }
+        // Keep the round loop honest (make_update + self-ingest exactly like a real round).
+        let payload = b.make_update(round).expect("make_update");
+        b.ingest(round, &[staged(0x01, &payload)]).expect("ingest");
+        per_round.push(last);
+    }
+    (first, *per_round.last().unwrap(), per_round)
+}
+
+#[test]
+fn host_backward_reduces_loss_sparse_loco() {
+    let (first, last, per_round) = loss_decreases_for("sparse_loco");
+    assert!(
+        first.is_finite() && last.is_finite(),
+        "losses are finite (first={first}, last={last})"
+    );
+    assert!(
+        last < first * 0.9,
+        "HOST-9: loss must decrease materially (first={first}, last={last}, per_round={per_round:?})"
+    );
+}
+
+#[test]
+fn host_backward_reduces_loss_all_profiles() {
+    for profile in ["sparse_loco", "diloco", "demo"] {
+        let (first, last, per_round) = loss_decreases_for(profile);
+        assert!(
+            last < first,
+            "HOST-9 [{profile}]: loss must decrease (first={first}, last={last}, per_round={per_round:?})"
+        );
+    }
 }

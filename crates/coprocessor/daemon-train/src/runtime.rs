@@ -539,11 +539,19 @@ impl Instance {
         d.op_calls = 0;
         d.trap = None;
         d.phase = Some(phase);
+        // A `da_step` is a differentiable pass: record the autodiff tape and retain step tensors so
+        // `backward@1` can read its inputs (HOST-9). Other entry points don't build a tape.
+        if phase == Phase::Step {
+            d.backend.begin_pass();
+        }
         Ok(())
     }
 
     fn finish_entry(&mut self, result: Result<(), wasmtime::Error>) -> Result<(), TrainError> {
-        // Free step handles wholesale at return (ABI §3.3), regardless of outcome.
+        // End any differentiable pass first (stop recording so the frees below actually recycle,
+        // apply deferred frees, and clear the tape), then free step handles wholesale at return
+        // (ABI §3.3), regardless of outcome.
+        self.store.data_mut().backend.end_pass();
         let (native_freed, det_freed) = {
             let d = self.store.data_mut();
             (d.step_native.clear(), d.step_det.clear())
@@ -1449,7 +1457,21 @@ impl HostState {
                 "loss numel != 1",
             ));
         }
+        // Reverse-mode autodiff over the recorded tape (HOST-9), then fold each param's
+        // dL/d(storage) into its `grad` tensor — accumulating across micro-batch `da_step` passes
+        // (the guest clears it via `zero_grads@1`). `grad@1` / `adamw_step@1` read that tensor.
         self.backend.backward(lt);
+        let params: Vec<(TensorId, TensorId)> =
+            self.params.iter().map(|p| (p.storage, p.grad)).collect();
+        for (storage, grad_t) in params {
+            if let Some(g) = self.backend.grad_of(storage) {
+                let mut cur = self.backend.view(grad_t).to_vec();
+                for (c, v) in cur.iter_mut().zip(g.iter()) {
+                    *c += v;
+                }
+                self.backend.write(grad_t, &cur);
+            }
+        }
         Ok(())
     }
 
@@ -2069,7 +2091,8 @@ impl HostState {
                 "numel",
             ));
         }
-        let out = self.backend.clone_tensor(xt);
+        // Identity data with a new shape, recorded on the tape so gradients pass through (HOST-9).
+        let out = self.backend.reshape(xt);
         self.alloc_native(out, dims.to_vec())
     }
 
