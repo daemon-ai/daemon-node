@@ -29,6 +29,9 @@ daemon-swarm-coordinator = { workspace = true, optional = true }
 # and observe depends only on proto + coordinator (no cycle back to `daemon-swarm-run`).
 daemon-swarm-observe = { workspace = true, optional = true }
 tokio = { workspace = true }
+# `futures::future::join_all` drives the barrier's bounded-concurrency payload fetch (engine.rs,
+# `RoundEngine::with_download_scheduler`). Already a frozen `[workspace.dependencies]` entry.
+futures = { workspace = true }
 thiserror = { workspace = true }
 # The harness `FaultyStore` implements the async `PayloadStore` trait (harness / test only, gated
 # behind `cfg(any(test, feature = "harness"))`).

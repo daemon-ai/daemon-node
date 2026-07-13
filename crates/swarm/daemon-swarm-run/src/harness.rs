@@ -774,7 +774,7 @@ fn spawn_record_collector(
 }
 
 /// A tiny process-lifetime counter for unique temp-dir names (no external `tempfile` dep).
-fn fastcounter() -> u64 {
+pub(crate) fn fastcounter() -> u64 {
     use std::sync::atomic::AtomicU64;
     static N: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
