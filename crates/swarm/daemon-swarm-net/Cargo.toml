@@ -24,11 +24,24 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 ciborium = { workspace = true }
+# The iroh transport plane (§7): the gossip control plane (`IrohGossip: ControlPlane`, B2 Wave 2) +
+# the self-hosted relay. OPTIONAL — gated behind the `iroh` feature so the default workspace build
+# never compiles the heavy iroh/QUIC/relay tree (spec §10.1). NO iroh-blobs (P4). B2 may add feature
+# tuning (e.g. `iroh-relay/server`, `test-utils`) here — a lane-owned member edit, not a root change.
+iroh = { workspace = true, optional = true }
+iroh-gossip = { workspace = true, optional = true }
+iroh-relay = { workspace = true, optional = true }
+
+[features]
+# Off by default: the default workspace gate builds no iroh. B2 (Wave 2) implements `iroh_gossip.rs`
+# behind this feature; the Wave-0/Merge-1 gate is a compile-only `cargo check --features iroh`.
+iroh = ["dep:iroh", "dep:iroh-gossip", "dep:iroh-relay"]
 
 [lints]
 workspace = true
 
 [package.metadata.cargo-machete]
 # `reqwest` is declared for the egress plane (§7.1) but no HTTP client is constructed this wave
-# (file:// artifact fetch only); r2/hf/https slot in later through daemon-egress.
-ignored = ["reqwest"]
+# (file:// artifact fetch only); r2/hf/https slot in later through daemon-egress. `iroh*` are declared
+# for the B2 gossip plane (behind the `iroh` feature) but not yet referenced in src this wave.
+ignored = ["reqwest", "iroh", "iroh-gossip", "iroh-relay"]

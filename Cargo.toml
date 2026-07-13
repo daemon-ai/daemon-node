@@ -70,6 +70,30 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # MIT/Apache-2.0 + BSD-3-Clause on the curve dep). Declared for the swarm lanes; wired in with the
 # envelope-signing surface (lane P).
 ed25519-dalek = "2"
+# --- swarm transport plane (iroh gossip control plane + self-hosted relay, spec §7) --------------
+# The iroh 1.0 stack: the QUIC/relay endpoint + the mandatory gossip control plane (§7.1 — every peer
+# speaks gossip in every mode) + the self-hosted `iroh-relay` binary/lib (§7.4 — relay URLs pinned in
+# the envelope, a delta from Psyche's hardcoded hostnames). Explicitly **NO iroh-blobs** — the
+# content-addressed blob payload plane is P4 (deferred).
+#
+# PIN DEVIATION (integration owner's call, program Risk 4): the reference pack anchors Psyche at iroh
+# 0.97, but iroh-base 0.97/0.98 pull a PRE-RELEASE crypto stack pinned to `sha2 =0.11.0-rc.{2,5}`,
+# which sits in the same 0.11 compat range as — and is disjoint from — the STABLE `sha2 0.11.0` that
+# `slack-morphism 2.22` (daemon-slack) already locks (`^0.11`). No single sha2 0.11.x satisfies both,
+# so 0.97/0.98 are unresolvable against the existing frozen tree. iroh 1.0 DROPPED the sha2 dependency
+# entirely, so the 1.0 set resolves cleanly. iroh-gossip has no 1.0 tag; its 0.101.0 targets iroh ^1
+# (the matching release). B2's port adapts the Psyche 0.97 patterns to the 1.0 API (record the deltas
+# in the B2 ledger; the endpoint/gossip/relay shapes are largely stable across 0.97→1.0).
+#
+# Default features carry iroh-gossip's `net` (the networked gossip); the `iroh` feature-gated consumer
+# (`daemon-swarm-net`) enables `iroh-relay/server` + `test-utils` locally for the self-hosted relay +
+# the in-process 3-node test harness (B2, Wave 2). Heavy trees: single-sourced here for the pin, but
+# OPT-IN only — `daemon-swarm-net` gates all three behind its `iroh` cargo feature (optional deps), so
+# the default workspace build/gate never compiles iroh (spec §10.1). Relay reachability is part of the
+# §6.5 eligibility probe.
+iroh = "1"
+iroh-gossip = "0.101"
+iroh-relay = "1"
 # property-based CDDL conformance: `arbitrary` derives (feature-gated, never shipped) generate values
 # across every wire variant; `proptest` (dev) drives them; serialized output is validated against
 # daemon-api.cddl so "Rust output always matches the schema" is a test, not a hope.
