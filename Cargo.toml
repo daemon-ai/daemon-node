@@ -387,6 +387,7 @@ daemon-swarm-coordinator = { version = "0", path = "crates/swarm/daemon-swarm-co
 daemon-swarm-observe = { version = "0", path = "crates/swarm/daemon-swarm-observe" }
 daemon-train = { version = "0", path = "crates/coprocessor/daemon-train" }
 daemon-train-client = { version = "0", path = "crates/coprocessor/daemon-train-client" }
+daemon-train-safetensors = { version = "0", path = "crates/coprocessor/daemon-train-safetensors" }
 daemon-pytool = { version = "0", path = "crates/coprocessor/daemon-pytool" }
 daemon-pytool-client = { version = "0", path = "crates/coprocessor/daemon-pytool-client" }
 daemon-tool-metta = { version = "0", path = "tools/daemon-tool-metta" }
