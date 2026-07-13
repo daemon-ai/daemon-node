@@ -182,10 +182,24 @@ Consequences for the three Windows cases:
    per-tensor gate. Capacity/budget still not queryable through wgpu; same DXGI (or
    VK_EXT_memory_budget via ash) story as above.
 
-### 2b. Windows VRAM/UMA detection mechanism — **OPEN** (under active personal research)
+### 2b. Windows VRAM/UMA detection mechanism — **RESOLVED** (Merge 3)
 
-The concrete detection mechanism is deliberately left open; the user is researching it. Candidate
-mechanisms to evaluate (drop findings in under each):
+**RESOLVED (2026-07-13, Merge-3 fold-in).** The concrete detection mechanism is settled by the
+user's verified Windows research and written up as the standalone probe design
+[`swarm-windows-vram-design.md`](swarm-windows-vram-design.md) (API shapes verified against the
+`windows` crate 0.62 docs). The winning mechanism: **DXGI `IDXGIAdapter4::GetDesc3`** for static
+sizes, **D3D12 `CheckFeatureSupport(ARCHITECTURE1).UMA`** as the *authoritative* unified flag
+(which is exactly what wgpu's DX12 `device_type` heuristic is already derived from —
+`wgpu-hal-29.0.4/src/dx12/adapter.rs:196-204` — so there is no tension, the FFI just adds
+`CacheCoherentUMA` + Vulkan-on-Windows correctness), and **`IDXGIAdapter3::QueryVideoMemoryInfo`**
+(LOCAL/NON_LOCAL) for the dynamic OS budget — the Windows analogue of Metal
+`recommendedMaxWorkingSetSize` / VK `heapBudget`, completing the three-platform budget symmetry
+table in that design. The `DeviceLimits` field mapping, the trap rules (WMI `AdapterRAM` u32 cap;
+WARP/WDDM-fallback distrust; AMD "Variable Graphics Memory" reporting), the §10.5 budget-change
+governor hook, the P2 implementation sequence, and an example probe program are all in that file.
+The candidate table below is retained as the evaluation record that led to the decision.
+
+Candidate mechanisms that were evaluated (the DXGI/D3D12 trio above won):
 
 | Candidate | What it gives | Reachability | Findings (fill in) |
 |---|---|---|---|
