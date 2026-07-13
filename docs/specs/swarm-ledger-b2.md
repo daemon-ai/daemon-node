@@ -156,4 +156,71 @@ parametric conformance suite asserts over both impls and what B3's `RoundEngine`
 
 ## Results / deviations
 
-(Filled in as slices land — test counts, any API surprises, what Merge-2 / B3 must know.)
+### Commits (oldest -> newest)
+
+| Commit | Subject |
+|---|---|
+| `mirror(B2): ledger` | this ledger |
+| `feat(swarm-net): IrohGossip control plane over iroh 1.0 gossip (green)` | the plane + config + rebroadcast frame |
+| `feat(swarm-net): parametric ControlPlane conformance suite (loopback + iroh) (green)` | shared behavior suite + iroh harness |
+| `feat(swarm-net): NET-6 + iroh multi-node harness + self-hosted relay dev runner (green)` | NET-6 + churn + relay-path + dev runner |
+| `mirror(B2): ledger results` | this results section |
+
+### Test counts (all green)
+
+- `cargo test -p daemon-swarm-net` (default, no iroh): **69** = 67 lib + 2 loopback conformance.
+- `cargo test -p daemon-swarm-net --features iroh`: **82** = 71 lib (67 + 4 `iroh_gossip` unit
+  tests: frame/topic/relay-map) + 4 conformance (2 loopback + 2 iroh) + 7 `iroh_gossip` integration.
+- B2 net-new: **15** tests (4 unit + 2 loopback-conformance + 2 iroh-conformance + 7 iroh-integration).
+- The 7 iroh integration tests: `signed_gossip_bad_sig_rejected` (NET-6),
+  `ws_gossip_duplicate_message_dedupes` (NET-6), `iroh_fanout_reaches_all_nodes`,
+  `iroh_roster_update_reconnects_new_peer`, `iroh_partition_rejoin_smoke`,
+  `rebroadcast_refloods_without_duplicate_delivery`, `relay_path_delivers_through_self_hosted_relay`.
+  The **relay-path test ran green** (not skipped) — the devShell `iroh-relay` 1.0.0 is on PATH and
+  the plain-HTTP `--dev` relay routed gossip end to end.
+
+### Full gate results
+
+`cargo fmt --check` OK · `cargo clippy --workspace --all-targets -- -D warnings` OK ·
+`cargo clippy -p daemon-swarm-net --features iroh --all-targets -- -D warnings` OK ·
+`cargo test --workspace` OK **except** the documented pre-existing `daemon-conformance`
+detached-delegation/operator-steer trio flake (this run: `injected_input_reaches_a_parked_durable_
+session_via_the_store_seam` failed under the full parallel run, **passes in isolation** — verified;
+never modified, and impossible for B2 to have caused since all iroh code is behind the off-default
+`iroh` feature and is not compiled in the default workspace build) · `cargo test -p daemon-swarm-net`
++ `--features iroh` OK · `typos docs/specs` OK.
+
+### Findings / deviations (what Merge-2 + B3 must know)
+
+1. **Direct loopback mesh forms with NO relay.** The in-process harness uses
+   `RelayMode::Disabled` + `MemoryLookup` seeded with each node's `127.0.0.1:<port>` `EndpointAddr`;
+   the mesh forms and delivers in ~1 s. The relay is only needed for NAT/WAN reachability — the
+   relay-path test proves that path separately.
+2. **`presets::Minimal`, not `presets::N0`.** `N0` adds the public n0 DNS/pkarr discovery; the
+   program prefers explicit roster addressing (no public discovery service), so B2 uses `Minimal`
+   (crypto provider only) + `MemoryLookup`. If a future deployment wants global discovery it is a
+   one-line preset swap, but the envelope-roster path is the sanctioned one.
+3. **Self-delivery is intentional.** `IrohGossip::publish` fans the message to the node's own local
+   subscribers (after dedupe) as well as gossiping it, because a single iroh node does not receive
+   its own broadcast back. This keeps the delivery contract byte-identical to `LoopbackGossip`
+   ("publish -> every subscriber, once"), which the parametric conformance suite asserts over both.
+   B3's `RoundEngine` therefore sees the *same* contract whether it runs on loopback or iroh.
+4. **Rebroadcast/dedupe interplay is verified, not assumed.** `MessageId = blake3(content)` is
+   *validated* by iroh-gossip 0.101 on receive, so the nonce frame is both necessary and sufficient
+   to force a re-flood; `rebroadcast_refloods_without_duplicate_delivery` proves the app `Deduper`
+   still yields exactly one delivery. Default rebroadcast is **on, 10 s, ring 32**; B3 can tune per
+   round-criticality (Commitments/Attestations want it on; Heartbeats can leave it default).
+5. **Relay dev mode is plain HTTP, port 3340, zero certs** (`iroh-relay --dev`). `dev/run-relay.sh`
+   + `dev/README.md` document it; production TLS/ACME is recorded but out of P1 scope (P2 WAN gate).
+6. **One scoped `#[allow(clippy::disallowed_methods)]`** on the test-only `spawn_dev_relay` helper
+   (the workspace bans `std::process::Command::new`; spawning a known dev tool from a test is the
+   sanctioned, documented exception). No production code spawns anything.
+7. **B3 wiring notes:** construct `IrohGossip::connect(IrohGossipConfig{..})` with the node's iroh
+   secret key, the envelope-pinned `relay_urls`, the admission roster (`IrohPeer` per admitted peer,
+   `endpoint_id` = that peer's `Join.iroh_id`), and `topic_input` = `FrozenEnvelope::hash()`. Call
+   `node_id()` to fill the local peer's `Join.iroh_id` at join. Call `update_roster(..)` on every
+   roster change (admission/drop). The plane carries **already-signed** proto `SignedMessage` bytes
+   — sign before `publish`, and `verify()` after `subscribe().recv()` (the plane never verifies).
+8. **The `iroh-relay` crate stays declared-but-unreferenced** (machete-ignored): the relay is an
+   external binary. If a future lane wants an in-process relay for tests, add `iroh/test-utils`
+   (`iroh::test_utils::run_relay_server`) as a dev-feature rather than fighting the `Command` ban.
