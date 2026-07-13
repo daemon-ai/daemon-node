@@ -173,6 +173,25 @@ pub fn elect_checkpointer(roster: &[PeerId], seed: &Seed) -> Option<PeerId> {
     Some(pool[idx])
 }
 
+/// Elect `count` checkpointers deterministically from `(seed, roster)` — the checkpointer committee
+/// (§9; TDD RUN-6). The spec runs **two** elected checkpointers that upload independently and whose
+/// manifests must agree (both-match registration); this returns the first `count` of the
+/// checkpointer-salted shuffle (sorted + deduped roster first, so it is order-independent). Fewer
+/// than `count` members ⇒ all of them (a single-uploader roster degrades, RUN-6).
+#[must_use]
+pub fn elect_checkpointers(roster: &[PeerId], seed: &Seed, count: usize) -> Vec<PeerId> {
+    if roster.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    let mut pool = roster.to_vec();
+    pool.sort_unstable();
+    pool.dedup();
+    let mut rng = seeded_lcg(seed, CHECKPOINTER_SALT);
+    deterministic_shuffle(&mut pool, &mut rng);
+    pool.truncate(count.min(pool.len()));
+    pool
+}
+
 /// Select the round committee. `witness_target == 0` makes every peer a witness (§6.3); otherwise
 /// the first `min(witness_target, roster)` of the witness-salted shuffle are witnesses.
 ///

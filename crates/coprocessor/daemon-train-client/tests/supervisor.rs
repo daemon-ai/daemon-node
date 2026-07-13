@@ -131,6 +131,65 @@ async fn preemption_as_churn_pauses_and_rejoins_without_respawn() {
     let _ = std::fs::remove_file(&state);
 }
 
+/// CLI-4 (§10.5): `Throttle{paused}` — the supervisor half. Pausing while joined delivers the
+/// governor lever as a fire-and-forget oneway and does **not** tear the worker down (the abort of
+/// the in-flight guest call is graceful, worker-side), so the same worker keeps serving afterwards.
+/// The real VRAM-free + CPU-master-retention on the wasm backend is `daemon-train`'s
+/// `worker_protocol.rs`; here we pin that pause is churn over one worker, never a respawn.
+#[tokio::test]
+async fn throttle_aborts_in_flight_call() {
+    let state = state_path("throttle-abort");
+    let sup = TrainSupervisor::new(cfg("ready", &state));
+
+    sup.join("run-4", "wss://coord", vec![], policy())
+        .await
+        .expect("join");
+    // Pause aborts the in-flight round on the worker side; the supervisor's oneway must succeed and
+    // must not classify it as a fault (no worker teardown).
+    sup.throttle(None, None, true).await.expect("pause abort");
+    // The same worker still answers — the abort did not crash or replace it.
+    sup.ping().await.expect("worker survives the abort");
+    assert_eq!(
+        sup.restarts().await,
+        0,
+        "pause is a graceful abort, not a respawn"
+    );
+
+    sup.shutdown().await;
+    let _ = std::fs::remove_file(&state);
+}
+
+/// CLI-4 (§10.5): `Throttle{paused}` frees VRAM on the worker but retains the CPU masters — the
+/// supervisor half is that resume + a subsequent command land on the **same** worker (never a fresh
+/// spawn), which is what "masters retained" means at this layer.
+#[tokio::test]
+async fn throttle_frees_vram_keeps_masters() {
+    let state = state_path("throttle-masters");
+    let sup = TrainSupervisor::new(cfg("ready", &state));
+
+    sup.join("run-4b", "wss://coord", vec![], policy())
+        .await
+        .expect("join");
+    sup.throttle(None, None, true)
+        .await
+        .expect("pause (free VRAM)");
+    sup.throttle(None, None, false)
+        .await
+        .expect("resume (rebuild)");
+    // Resume + rejoin reuse the same worker process → the CPU masters were never discarded.
+    sup.join("run-4b", "wss://coord", vec![], policy())
+        .await
+        .expect("rejoin at boundary");
+    assert_eq!(
+        sup.restarts().await,
+        0,
+        "pause/resume frees VRAM but keeps the worker (and its masters) — no respawn"
+    );
+
+    sup.shutdown().await;
+    let _ = std::fs::remove_file(&state);
+}
+
 /// RUN-10 (§6.5): assess staging. `AssessRun` against an envelope stages an eligibility verdict over
 /// the worker protocol — both the eligible and the pre-screen-rejected paths.
 #[tokio::test]
