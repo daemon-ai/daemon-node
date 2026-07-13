@@ -1517,6 +1517,13 @@ pub struct NodeConfig {
     /// prefixes, and the post-edit `[fs.lint]` command runner. Embedded from the tool crate so
     /// the config surface and the tool cannot drift.
     pub fs: daemon_tool_fs::FsConfig,
+    /// Swarm-training participation tuning (`[swarm]` / `DAEMON_SWARM__*`, spec §10.6): `enabled`
+    /// (off by default), worker path, data-cache budget, default participation policy, module-trust
+    /// posture, coordinator allowlist, iroh relays. Embedded from `daemon-swarm-run` so the config
+    /// surface and the node swarm service cannot drift. Serde-only (no figment on the participant
+    /// build); the node layers it via the standard figment path below.
+    #[serde(default)]
+    pub swarm: daemon_swarm_run::config::SwarmConfig,
     /// Session search/title tuning (`[sessions]`): boot-time FTS backfill + title generation.
     pub sessions: SessionsConfig,
     /// `semantic_search` workspace-index tuning (`[workspace_index]`): enabled by default but only
@@ -1624,6 +1631,7 @@ impl Default for NodeConfig {
             execute_code: ExecuteCodeConfig::default(),
             skills: SkillsConfig::default(),
             fs: daemon_tool_fs::FsConfig::default(),
+            swarm: daemon_swarm_run::config::SwarmConfig::default(),
             sessions: SessionsConfig::default(),
             workspace_index: WorkspaceIndexConfig::default(),
             lcm: LcmOpts::default(),
@@ -2206,6 +2214,56 @@ mod tests {
                 cfg.telemetry.feedback_endpoint.as_deref(),
                 Some("http://localhost:4318")
             );
+            Ok(())
+        });
+    }
+
+    // The `[swarm]` section (spec §10.6) is off by default and rides the standard figment layering:
+    // defaults <- TOML <- `DAEMON_SWARM__*` env. Both a `[swarm]` TOML table and a nested env override
+    // must extract into `NodeConfig.swarm` additively (W1 config embed; TDD config-figment gate).
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
+    #[test]
+    fn swarm_section_defaults_off_and_layers_toml_and_env() {
+        // Default: the swarm section is present and disabled (never spawns a worker by default).
+        let defaults =
+            NodeConfig::from_figment(Figment::from(Serialized::defaults(NodeConfig::default())))
+                .expect("defaults must extract");
+        assert!(!defaults.swarm.enabled, "swarm is off by default (§10.6)");
+        assert_eq!(defaults.swarm.data_cache_gb, 50);
+
+        figment::Jail::expect_with(|jail| {
+            // TOML layer: enable + a partial nested policy table.
+            jail.create_file(
+                "cfg.toml",
+                "[swarm]\n\
+                 enabled = true\n\
+                 data_cache_gb = 100\n\
+                 [swarm.default_policy]\n\
+                 mode = \"scheduled\"\n\
+                 schedule = \"0 3 * * *\"\n",
+            )?;
+            jail.set_env("DAEMON_CONFIG", "cfg.toml");
+            // Env layer wins over TOML for the same key (nested `__` split), and sets a new one.
+            jail.set_env("DAEMON_SWARM__DATA_CACHE_GB", "200");
+            jail.set_env("DAEMON_SWARM__DEFAULT_POLICY__DUTY_CYCLE_PCT", "25");
+            let cfg = NodeConfig::from_figment(NodeConfig::base_figment())
+                .unwrap_or_else(|e| panic!("[swarm] layering must extract: {e:#}"));
+            // TOML applied.
+            assert!(cfg.swarm.enabled);
+            assert_eq!(
+                cfg.swarm.default_policy.mode,
+                daemon_swarm_run::protocol::PolicyMode::Scheduled
+            );
+            assert_eq!(
+                cfg.swarm.default_policy.schedule.as_deref(),
+                Some("0 3 * * *")
+            );
+            // Env wins over TOML for data_cache_gb; nested env override applied.
+            assert_eq!(cfg.swarm.data_cache_gb, 200);
+            assert_eq!(cfg.swarm.default_policy.duty_cycle_pct, 25);
+            // Omitted keys keep the §10.6 defaults.
+            assert_eq!(cfg.swarm.worker_path, "daemon-train");
+            assert_eq!(cfg.swarm.iroh.relays, "default");
             Ok(())
         });
     }

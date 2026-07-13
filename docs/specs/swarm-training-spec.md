@@ -669,7 +669,10 @@ Uninitialized → WaitingForMembers → Warmup → (RoundTrain ⇄ RoundWitness)
   (§5.3.1) behind compute while keeping the pseudo-gradient baseline well-defined.
 - The coordinator's `tick(state, events, now) → (state', effects)` is a **pure Rust function**
   in `daemon-swarm-proto`, so local, private, and cloud deployments execute identical logic
-  (§11.2), and it is property-testable.
+  (§11.2), and it is property-testable. Purity is load-bearing beyond testing: a pure,
+  float-free transition over signed events is also what an anticipated on-chain/zkVM
+  coordinator substrate can re-execute and prove (§18 open q. 14) — which is why the §6.4
+  commit rule consumes only signed evidence (I6) and never performs I/O inline.
 
 ### 6.3 Deterministic assignment (no per-batch RPC)
 
@@ -698,16 +701,26 @@ The precise contract of a round — who ends it, what gets applied, and how peer
 one protocol, owned here. Roles: the **coordinator** (single-writer authority, §6.2), all peers
 as **trainers**, a per-round **witness** committee (§6.3 — every peer fetches every payload for
 ingest anyway; witnesses are just whose attestations count), the **payload store** (§7.1), and
-the always-on **gossip mesh** (§7.1). Six signed CBOR messages in `daemon-swarm.cddl` (§7.3):
+the always-on **gossip mesh** (§7.1). Seven signed CBOR messages in `daemon-swarm.cddl` (§7.3):
 
 | Message | From | Content |
 |---|---|---|
 | `RoundOpen` | coordinator | round, seed, roster digest, batch window, deadline |
 | `Commitment` | trainer | round, payload blake3 + size + locators (store key / blob ticket) |
-| `Attestation` | witness | round, cumulative list of fetch-verified payload hashes (exact, ≤ `max_peers` entries — bloom compaction only if peer counts ever outgrow this, §18) |
-| `RoundRecord` | coordinator | **the consensus artifact**: committed `[(peer, hash, size)]` **ordered by node public-key bytes** (the ed25519 node identity, §7.2 — never the iroh id), drops, next round's seed |
+| `Attestation` | witness | round, **set commitment** over its cumulative fetch-verified set: merkle root over the sorted `(peer, hash)` pairs + count. Constant-size at any roster; the witness's full set rides alongside as an inline list while rosters are small (a transport optimization, never the signed field) |
+| `StorageReceipt` | coordinator-as-storage-client | round, `(peer, hash, size)` it has `HEAD`-verified against the payload store (§7.1) — availability evidence as a *signed message*, so the commit rule stays a pure function of its inputs (§11.2) |
+| `RoundRecord` | coordinator | **the consensus artifact**: the committed set's merkle root + count, drops, next round's seed, and the locator of the full set object (`record-set.cbor`, §11.3) — the ordered `[(peer, hash, size)]` list **sorted by node public-key bytes** (the ed25519 node identity, §7.2 — never the iroh id). Small rosters get the set inlined too; the signed, consensus-critical field is the root either way |
 | `Digest` | every peer | round, post-ingest state digest (§5.6) |
 | `Straggle` | stalled peer | round being recovered, status (rides the heartbeat) |
+
+Attestations and records carry commitments-to-sets rather than the sets themselves so the
+consensus messages are **scale-invariant** (a root is ~32 B at n = 4 and at n = 4000) and
+**substrate-portable**: constant-size signed roots with content-addressed data availability is
+exactly the shape a future on-chain/ZK coordinator substrate needs (§18 open q. 14), while
+losing nothing at v1 scale. Exactness is preserved — a root commits to a definite set,
+membership is provable (O(log n) merkle paths), and there is no false-positive class to
+recover from. (Psyche's witnesses carry the same `broadcast_merkle` root next to their blooms —
+Appendix A.3; we adopt the root and drop the blooms, whose role was substrate-specific.)
 
 ```mermaid
 sequenceDiagram
@@ -722,11 +735,11 @@ sequenceDiagram
         P->>R2: PUT update(r) when trained
         P->>C: Commitment(r) — also gossiped
         Note over P,W: peers prefetch payloads as commitments gossip;<br/>blake3-verify on arrival
-        W->>C: Attestation(r) — verified hashes
-        C->>R2: HEAD committed objects (zero-egress check)
+        W->>C: Attestation(r) — root over verified set
+        C->>R2: HEAD committed objects → signed StorageReceipt(r)
     end
-    C->>P: RoundRecord(r) — on all-accounted or deadline
-    Note over P: BARRIER — finish fetching the committed set,<br/>stage in record order, da_ingest_updates(r),<br/>host snapshots round base + digests
+    C->>P: RoundRecord(r) — set root + record-set object, on all-accounted or deadline
+    Note over P: BARRIER — verify set against root, finish fetching it,<br/>stage in record order, da_ingest_updates(r),<br/>host snapshots round base + digests
     P->>C: Digest(r) — also gossiped
     C->>P: RoundOpen(r+1) — ships with the record;<br/>peer starts r+1 only after its local ingest returns
 ```
@@ -740,15 +753,23 @@ sequenceDiagram
    send + gossip `Commitment(r)`. All peers opportunistically prefetch payloads as commitments
    arrive, verifying blake3 on receipt; witnesses fold each verified fetch into their
    cumulative `Attestation(r)`.
-3. **Commit.** A payload enters the round record iff its commitment arrived **and** its
-   availability is confirmed — R2 `HEAD` by the coordinator (its own storage, zero egress,
-   §11.1) or witness-quorum attestation (the only path for pure-iroh payloads). The record
-   freezes when every roster member is accounted for or at the deadline, whichever first;
-   the coordinator publishes `RoundRecord(r)`. Absent peers are simply not in it.
-4. **Barrier: ingest.** Each peer completes fetching exactly the committed set (usually already
-   prefetched), stages it in record order, and runs `da_ingest_updates(r)` — the det-lane
-   decode → clip → aggregate → outer step (§5.6). The host snapshots the round base (ABI spec
-   §5.9), computes the round digest, and emits `Digest(r)`.
+3. **Commit.** A payload enters the round record iff its commitment arrived **and** signed
+   **availability evidence** exists for it — either a `StorageReceipt` (in the `r2` plane the
+   coordinator `HEAD`s the object it presigned — its own storage, zero egress, §11.1 — and
+   *emits the result as a signed message* rather than consuming it inline) or a witness-quorum
+   `Attestation` covering the payload (the only path for pure-iroh payloads). The commit rule
+   is thereby a **pure function of signed messages** — re-executable, auditable, and provable
+   on substrates that cannot perform I/O (§18 open q. 14). The record freezes when every
+   roster member is accounted for or at the deadline, whichever first; the coordinator
+   publishes `RoundRecord(r)` and stores the full set object next to the payloads (§11.3).
+   Absent peers are simply not in it.
+4. **Barrier: ingest.** Each peer obtains the committed set (inlined at small rosters, else
+   the `record-set.cbor` object — one small fetch on a path already fetching n payloads,
+   covered by the same stall ladder), verifies it against the record's root, completes
+   fetching exactly that set (usually already prefetched), stages it in record order, and runs
+   `da_ingest_updates(r)` — the det-lane decode → clip → aggregate → outer step (§5.6). The
+   host snapshots the round base (ABI spec §5.9), computes the round digest, and emits
+   `Digest(r)`.
 5. **Next round.** `RoundOpen(r+1)` ships with the record; a peer starts training r+1 the
    moment *its own* ingest returns. Digests are compared asynchronously — divergence detection,
    never a round gate.
@@ -759,12 +780,16 @@ sequenceDiagram
   payloads). Anyone can replay a run offline; resync (§9) *is* this replay.
 - **I2 Barrier** — the first `da_step` of round r+1 happens-after `da_ingest_updates(r)`
   returns locally. Transport overlaps; application never does (§6.2).
-- **I3 Exactness** — the ingest set equals the record, totally ordered by node public-key
-  bytes; subset ingest never happens (ABI spec §5.11).
+- **I3 Exactness** — the ingest set equals the set committed by the record's root, totally
+  ordered by node public-key bytes; subset ingest never happens (ABI spec §5.11). No
+  probabilistic structure is ever a consensus input.
 - **I4 Liveness** — the record freezes by deadline regardless of stragglers; a missing peer
   costs only its own contribution (assignment overlap covers its data, §6.3).
-- **I5 Blindness** — the coordinator handles hashes, sizes, and HEAD responses; payload bytes
+- **I5 Blindness** — the coordinator handles hashes, sizes, roots, and receipts; payload bytes
   never enter it (§4.3).
+- **I6 Evidence** — the commit rule consumes only signed messages (`Commitment` ∧
+  (`StorageReceipt` ∨ quorum `Attestation`)); the coordinator performs no unattested side
+  effects inside the rule. This keeps `tick` pure (§6.2) and the round provable end to end.
 
 **Recovery ladder** (escalating; every rung is churn-normal, §13):
 
@@ -834,7 +859,7 @@ run is "too big" is decided by this handshake, not by constants in peer code.
 ### 7.1 One control plane, two payload planes
 
 The **control plane is not tiered**: every peer in every mode speaks (a) WS/HTTP to the
-coordinator and (b) **iroh gossip** — mandatory, all six §6.4 messages travel both. Gossip's
+coordinator and (b) **iroh gossip** — mandatory, all seven §6.4 messages travel both. Gossip's
 sub-4 KB signed messages traverse NAT via iroh relays without hole-punched data channels, so
 "gossip everywhere" costs no reachability assumptions; it is what lets the witness protocol be
 *one* protocol in every deployment instead of forking per transport. Bulk **payloads** then
@@ -842,7 +867,7 @@ move on whichever plane the envelope's `payload_store` names:
 
 | Payload plane | Mechanism | Properties | Used for |
 |---|---|---|---|
-| **`r2` store** (baseline, public swarm default) | Coordinator-issued presigned R2/S3 URLs; peers PUT their update object, GET committed objects; coordinator `HEAD`s for availability (§6.4) | NAT-proof, availability-attestable server-side, zero-egress verification from the DO; latency ~seconds; egress cost on fetch | update exchange, checkpoints, artifacts — the Covenant/Templar production pattern |
+| **`r2` store** (baseline, public swarm default) | Coordinator-issued presigned R2/S3 URLs; peers PUT their update object, GET committed objects; coordinator `HEAD`s for availability and emits signed `StorageReceipt`s (§6.4 I6) | NAT-proof, availability-attestable server-side, zero-egress verification from the DO; latency ~seconds; egress cost on fetch | update exchange, checkpoints, artifacts — the Covenant/Templar production pattern |
 | **`iroh-blobs`** (optimization; private-swarm default; Phase-2 requirement) | content-addressed blob fetch over iroh QUIC (ed25519 `NodeId`), any holder serves; relay servers + hole-punching | direct peer transfer, sub-second latency, swarming redundancy; availability attested by witnesses (§6.4) | update fetch (cheaper+faster than R2 when reachable), P2P model sharing, **all Phase-2 activation traffic** |
 
 Both implement one `SwarmTransport` trait (publish/fetch); commitments carry locators for every
@@ -865,7 +890,7 @@ majority of the old L1/L3 surface.
 
 ### 7.3 Message & payload formats
 
-- **Control plane** (coordinator HTTP/WS, gossip envelopes — the six §6.4 round messages plus
+- **Control plane** (coordinator HTTP/WS, gossip envelopes — the seven §6.4 round messages plus
   join/heartbeat): CBOR with a dedicated CDDL contract (`daemon-swarm.cddl`) and its own
   `SwarmProtoVersion` (u16) — independent of the app `WireVersion` but with the same
   conformance-test discipline (fixtures + arbitrary round-trip). Every message is signed by the
@@ -940,7 +965,8 @@ and addresses artifacts by name only. Supported schemes: `r2://`, `hf://`, `http
   **P2P model sharing** (iroh-blobs: layer-wise blob tickets, Psyche's `p2p_model_sharing`)
   offloads the object store.
 - **Desync recovery = record replay (§6.4 I1):** digest mismatch ⇒ peer drops to `Warmup`,
-  refetches the latest checkpoint, then replays the retained `RoundRecord`s + payloads forward
+  refetches the latest checkpoint, then replays the retained `RoundRecord`s (+ their
+  root-verified set objects) + payloads forward
   to the current round (bounded by `payload_retention_rounds`); if the gap exceeds retention,
   it waits for the next epoch checkpoint. Repeated desync ⇒ leave + alert (§13).
 - **Delivery:** a finished/aborted run's final checkpoint is importable as a local model artifact
@@ -1111,8 +1137,8 @@ from its existing primitives:
 | `POST /swarm/runs` (org-scoped) | D1 + DO instantiation | create run from a frozen envelope (§6.1): schema + signature + artifact hash/size validation only — the cloud never *executes* experiment modules and does not parse wasm; capability/cadence derivation is freeze-tooling-side, and **every peer re-derives it from the module at assess** (§6.5), so registry trust is never load-bearing |
 | `POST /swarm/runs/:id/join` | RunCoordinator DO | roster admission (auth: API key scopes `swarm:join`, org allowlist) |
 | `POST /swarm/runs/:id/control` (author/org-admin) | RunCoordinator DO | pause / resume / abort — the only principals who may move a run to `Paused`/`Finished` manually (§6.2) |
-| `WS /swarm/runs/:id/ws` | **RunCoordinator DO, WebSocket hibernation API** | round protocol messages (§6.4: opens, commitments, attestations, records, digests), heartbeats (hibernation keeps idle-peer cost ~zero) |
-| `POST /swarm/runs/:id/presign` | R2 | presigned PUT/GET for update objects & checkpoints (`r2` payload plane); the DO `HEAD`s the same objects for §6.4 availability at zero egress |
+| `WS /swarm/runs/:id/ws` | **RunCoordinator DO, WebSocket hibernation API** | round protocol messages (§6.4: opens, commitments, attestations, receipts, records, digests), heartbeats (hibernation keeps idle-peer cost ~zero) |
+| `POST /swarm/runs/:id/presign` | R2 | presigned PUT/GET for update objects & checkpoints (`r2` payload plane); the DO `HEAD`s the same objects at zero egress and emits the results as signed `StorageReceipt`s — the §6.4 commit rule consumes only the receipts (I6), never the raw responses |
 | `GET /swarm/runs/:id/data/manifest` | R2 | data manifest handoff |
 
 Usage/metering reuses the queue→R2/D1 pipeline; contribution accounting rows feed future
@@ -1135,6 +1161,12 @@ the other's environment.)
 Region note: a DO is single-location; phase-advance latency is seconds against multi-minute
 rounds, so this is acceptable for v1 (revisit if round cadence ever drops below ~10 s).
 
+Substrate note: the DO is the v1 shell, not the end state — the anticipated T2 substrate is
+Logos/LEZ with the `tick` transition proven in Risc0 (§18 open q. 14). The DO shell already
+holds the shape that migration needs: single-writer event ordering, `tick` as a pure wasm-able
+function, and a commit rule over signed evidence only (§6.4 I6). Moving substrates changes the
+shell and the evidence producers, never the transition function or the message shapes.
+
 ### 11.3 R2 layout
 
 ```
@@ -1146,6 +1178,9 @@ runs/<run_id>/data/manifest.json, shards/* # when R2-hosted (HF-hosted data stay
 runs/<run_id>/checkpoints/round-<r>.safetensors (+ manifest, hash)
 runs/<run_id>/rounds/<r>/record.cbor       # signed RoundRecord (§6.4) — kept with the payloads
                                            #   so resync replay (§9) needs only R2
+runs/<run_id>/rounds/<r>/record-set.cbor   # the committed set the record's root signs (§6.4):
+                                           #   ordered [(peer, hash, size)] — content-addressed
+                                           #   by that root; same retention as the record
 runs/<run_id>/rounds/<r>/<peer_id>.upd     # round payload objects, lifecycle-expired after
                                            #   [phases].payload_retention_rounds (§7.4)
 ```
@@ -1364,15 +1399,35 @@ coordinator (`just swarm-dev`), wired into `just e2e`.
     `da_manifest`/`da_defaults` (§4), footprints/estimates are the meta-mode `MetaReport`
     (§6.4), and streaming metrics go through `metric@1` (§5.12). Residual: display hints for
     the app (chart grouping, units) — decide with the first GUI consumer.
-12. **Attestation compaction at scale:** §6.4 uses exact verified-hash lists (≤ `max_peers`
-    entries — trivial at ≤64 peers). If rosters outgrow that, Psyche's bloom compaction
-    (Appendix A.3) is the known fallback — reintroduce it *as a compaction of the same
-    attestation semantics*, never as the source of the committed set (bloom false positives
-    must never mint record entries).
+12. **Attestation representation — resolved: set commitments, blooms rejected.** §6.4's
+    attestations and records sign merkle roots over the exact sets (constant-size at any
+    roster; inline lists ride alongside only as a small-roster transport optimization). The
+    earlier open question ("bloom compaction when rosters outgrow exact lists?") is dissolved:
+    the signed field never grows with the roster, so there is nothing to compact. Blooms are
+    rejected as consensus inputs on principle — a probabilistic structure can never be the
+    thing peers agree on (I3/I6) — and their role in Psyche was substrate-specific anyway:
+    fixed-size Pod fields that a Solana program can membership-query without proofs, feeding a
+    *health heuristic* where false positives merely mis-score (Appendix A.3). Our v1 roster
+    ceiling is a **payload-plane consequence** (DP all-to-all downlink = n × `update_mb_max`
+    per round), not a control-plane constant — Phase 2/3 sharded aggregation lifts it without
+    changing the shape of these artifacts.
 13. **`pipelined` round mode** (§6.4): one-round-delayed apply is Psyche-proven and
     literature-backed (eager/streaming DiLoCo), but it is an optimization-semantics change —
     land it as a profile-declared capability with its own P-gate ablation (barrier vs
     pipelined at equal wall-clock), not as a transparent host default.
+14. **Anticipated coordinator substrate: Logos/LEZ + Risc0.** The expected T2 coordinator
+    deployment beyond the Durable Object is a private-blockchain substrate (Logos/LEZ) with
+    the state transition proven in a zkVM (Risc0). Several v1 constraints are load-bearing for
+    that move, not incidental, and must not be relaxed: `tick` is a pure, float-free,
+    integer-only function over signed CBOR events (§6.2, open q. 7 — a deterministic RISC-V
+    guest program in all but name); the commit rule consumes only signed evidence and performs
+    no I/O (I6 — a zkVM guest cannot make a `HEAD` call, only verify a signed receipt);
+    consensus messages sign constant-size set commitments with content-addressed data
+    availability (§6.4/open q. 12 — the standard commitment + DA split); and replayability
+    (I1) makes proving a round exactly proving one fold step. What remains open: the evidence
+    classes an LEZ deployment accepts (who signs storage receipts when the coordinator no
+    longer owns the store), proof cadence (per round vs per epoch), and where the DA layer
+    lives. None of these change the v1 message shapes — that is the point of fixing them now.
 
 ---
 
@@ -1628,11 +1683,16 @@ only if the peer floor and witness quorum held (`coordinator.rs:1056-1065`):
 
 **Delta:** the ⅔ ratio gates health scoring and epoch continuation, not the early advance —
 §6.4's commit rule simplifies this to one threshold. The small-n table (1→1, 2→2, 3→2) is
-adopted verbatim (§6.3). **Delta (blooms):** Psyche compacts witness observations into 1024-bit
-blooms (1% FP); §6.4 replaces them with exact verified-hash lists at v1 scale (≤64 peers,
-≤2 KB) because the round record demands exactness — bloom compaction returns, if ever, only as
-an encoding of the same attestations (§18 open q. 12). Psyche's `total_steps` check above is
-also the lineage of `[data].stop` (§6.1/§6.2).
+adopted verbatim (§6.3). **Delta (blooms vs the merkle root):** note the `Witness` struct
+carries *both* — 1024-bit blooms (1% FP) *and* a `broadcast_merkle` root. The blooms exist for
+Psyche's substrate: a Solana program needs fixed-size Pod fields it can membership-query
+without proofs (`trainer_healthy_score_by_witnesses` probes each witness's *partial,
+per-witness-different* observation set — a query a bare root cannot answer), feeding a health
+heuristic where false positives merely mis-score. §6.4 adopts the root (set commitments as the
+signed field of `Attestation`/`RoundRecord`) and drops the blooms: our commit rule needs exact
+set agreement, our coordinator accepts variable-length messages, and no probabilistic
+structure may be a consensus input (I3/I6; §18 open q. 12). Psyche's `total_steps` check above
+is also the lineage of `[data].stop` (§6.1/§6.2).
 
 **Verification is genuinely deferred — the spec's `todo!()` claim, verbatim.**
 `psyche/shared/coordinator/src/coordinator.rs:700-704` and
@@ -2353,12 +2413,12 @@ The test is only "end to end" if the consensus-critical spine is the production 
 |---|---|
 | Envelope authoring → canonical-CBOR freeze → sign → verify (§6.1) | registry = a JSON/CBOR file in `.dev/` |
 | Wasm module: `module check`, static import scan, meta mode, `da_manifest` cadence verification (§6.5) | — (nothing to stub; no I/O in the guest anyway) |
-| The full round protocol: `RoundOpen` → `Commitment` → `RoundRecord` commit rule → barrier ingest → `Digest` (§6.4) | gossip mesh = in-process broadcast channel behind the same trait |
+| The full round protocol: `RoundOpen` → `Commitment` → evidence (`StorageReceipt`/`Attestation`) → `RoundRecord` commit rule (set root verified, I6) → barrier ingest → `Digest` (§6.4) | gossip mesh = in-process broadcast channel behind the same trait |
 | tabi@1 host: execute + meta modes, fuel/op budgets, trap taxonomy, `drop`, det lane | `trace` mode can slip to post-MVP |
 | Worker protocol over CBOR/stdio + supervisor respawn (§10.2) | — (this is exactly the CI shape) |
 | Data pipeline: manifest → `BatchId` → (shard, offset), blake3 verification (§8) | one vendored pre-tokenized shard, `file://` URLs |
 | Checkpoint write/load incl. `replicated` persistents fp32-exact (§9) | single checkpointer (elect-2 verifies trivially at n=2) |
-| Payload store via `SwarmTransport` + coordinator availability check | filesystem dir; `HEAD` = `stat()` |
+| Payload store via `SwarmTransport` + availability evidence as signed `StorageReceipt`s (§6.4 I6) | filesystem dir; the receipt-producer `stat()`s instead of `HEAD`s — the commit rule is identical |
 
 Left out entirely: iroh, R2, the Durable Object, `hf://` fetch, the app surface, throughput classes beyond one, verification committees. Each sits behind a seam the MVP proves exists (the trait object, the pure tick, the envelope).
 
@@ -2388,7 +2448,7 @@ Steps 3–8 are precisely PROTO-20, RUN-5/7/8/9, NET-8-as-fs, and CLI-4 from the
 
 ## Exit criteria
 
-Green means: all five §6.4 invariants held for every round (I1 via the replay tool, I2–I5 via assertions in the harness), zero digest mismatches except the injected ones, the `diloco` rejoiner re-entered bit-identical (replicated state round-tripped), and the whole thing runs in single-digit minutes wired into `just e2e`.
+Green means: all six §6.4 invariants held for every round (I1 via the replay tool, I2–I6 via assertions in the harness — I6 checked by asserting the commit rule's inputs were exclusively signed messages), zero digest mismatches except the injected ones, the `diloco` rejoiner re-entered bit-identical (replicated state round-tripped), and the whole thing runs in single-digit minutes wired into `just e2e`.
 
 What a green MVP deliberately does *not* claim: WAN/NAT behavior, R2 latency and retention economics, DO single-writer semantics under real concurrency, mixed-vendor native-lane tolerances, or convergence quality at scale — those are exactly the P2/P3 gates (§17), and the MVP's value is that by the time you attack them, every remaining risk is in the swapped backends, not the logic.
 

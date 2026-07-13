@@ -510,9 +510,10 @@ Build side (in `da_make_update`):
 | `upd_push_tensor@1` | `(upd: U, x: T)` — serialized as `(dtype, dims, LE data)`; packed `U8` tensors pass through verbatim |
 
 Ingest side (in `da_ingest_updates`): the host has staged `count` peer updates — **exactly the
-signed `RoundRecord`'s committed set for the round (architecture §6.4), in the record's total
-order (ascending node public-key bytes — the ed25519 node identity, never the iroh id)**, each
-hash-verified against its record entry. A peer that cannot assemble the full set does not call
+set committed by the signed `RoundRecord`'s root (architecture §6.4; the host verifies the set
+object against that root before staging), in the set's total order (ascending node public-key
+bytes — the ed25519 node identity, never the iroh id)**, each
+hash-verified against its set entry. A peer that cannot assemble the full set does not call
 ingest at all — it stalls or resyncs per the architecture §6.4 recovery ladder; subset ingest
 never happens. This staging guarantee is a host obligation and a precondition of the
 determinism contract (§7).

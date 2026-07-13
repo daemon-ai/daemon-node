@@ -322,6 +322,13 @@ fn classify(req: &ApiRequest) -> Coverage {
         | CustomProviderList
         | CustomProviderSet { .. }
         | CustomProviderRemove { .. } => NotSessionTouching,
+        // Swarm training (spec §10.4): node-wide operator control, not per-owner session state.
+        SwarmRunList
+        | SwarmRunDetail { .. }
+        | SwarmJoin { .. }
+        | SwarmLeave { .. }
+        | SwarmSetPolicy { .. }
+        | SwarmHardwareReport => NotSessionTouching,
         ProfileList
         | ProfileGet { .. }
         | ProfileCreate { .. }

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*/*", "tools/*", "bindings/*", "bins/*", "tests/*", "xtask"]
+# `guests/` is its OWN cargo workspace (the wasm32 experiment modules): it builds for
+# `wasm32-unknown-unknown` via `xtask build-guests`, links `daemon-train-sdk` by path, and must not
+# be pulled into the host workspace's default (native) gate. Kept out with an explicit exclude.
+exclude = ["guests"]
 
 [workspace.package]
 version = "0.1.0"
@@ -42,6 +46,54 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 ciborium = "0.2"
+# --- swarm training stack (swarm-training-spec.md §10.1) -------------------------------------------
+# The wasm guest sandbox for experiment modules, isolated to the `daemon-train` worker (never the
+# node process). default-features = false trims the defaults we don't need (async, component-model,
+# wat, coredump, profiling/ittapi, parallel-compilation) down to the JIT runtime we do: the
+# cranelift compiler + the pooling instance allocator. Fuel metering and epoch-interrupt preemption
+# (§10.5) are `Config` runtime levers, always available — no cargo feature required. No WASI (the
+# ABI is our own tensor ABI, tensor-ABI spec §5.1).
+wasmtime = { version = "46", default-features = false, features = ["runtime", "cranelift", "pooling-allocator"] }
+# The training engine, isolated to `daemon-train`. default-features = false + the ndarray backend
+# and autodiff only are ALWAYS on (the CPU/G1 lane); GPU backends stay OUT of the default gate. The
+# `wgpu` backend (burn 0.21's `wgpu` feature -> burn-wgpu + cubecl + wgpu 29; the P1 GPU lane targets
+# Vulkan/RADV via the flake's shaderc/vulkan-loader) is reachable but OPT-IN: it is toggled per-lane
+# by `daemon-train`'s own `wgpu` cargo feature (`burn/wgpu`), so a default `cargo build`/`cargo deny`
+# never compiles it (spec §10.1: heavy GPU deps build only as out-of-gate per-backend Nix lanes, like
+# the daemon-infer engine lanes). Keep default-features = false so the feature set stays this list.
+burn = { version = "0.21", default-features = false, features = ["std", "ndarray", "autodiff"] }
+# Canonical content hashing for artifact / tensor / checkpoint identity (blake3), plus the cheap
+# xxh3-64 in-memory change probe. Isolated to the swarm stack.
+blake3 = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# ed25519 signatures for swarm capability leases / witness attestations (§6, §7). v2 (dual
+# MIT/Apache-2.0 + BSD-3-Clause on the curve dep). Declared for the swarm lanes; wired in with the
+# envelope-signing surface (lane P).
+ed25519-dalek = "2"
+# --- swarm transport plane (iroh gossip control plane + self-hosted relay, spec §7) --------------
+# The iroh 1.0 stack: the QUIC/relay endpoint + the mandatory gossip control plane (§7.1 — every peer
+# speaks gossip in every mode) + the self-hosted `iroh-relay` binary/lib (§7.4 — relay URLs pinned in
+# the envelope, a delta from Psyche's hardcoded hostnames). Explicitly **NO iroh-blobs** — the
+# content-addressed blob payload plane is P4 (deferred).
+#
+# PIN DEVIATION (integration owner's call, program Risk 4): the reference pack anchors Psyche at iroh
+# 0.97, but iroh-base 0.97/0.98 pull a PRE-RELEASE crypto stack pinned to `sha2 =0.11.0-rc.{2,5}`,
+# which sits in the same 0.11 compat range as — and is disjoint from — the STABLE `sha2 0.11.0` that
+# `slack-morphism 2.22` (daemon-slack) already locks (`^0.11`). No single sha2 0.11.x satisfies both,
+# so 0.97/0.98 are unresolvable against the existing frozen tree. iroh 1.0 DROPPED the sha2 dependency
+# entirely, so the 1.0 set resolves cleanly. iroh-gossip has no 1.0 tag; its 0.101.0 targets iroh ^1
+# (the matching release). B2's port adapts the Psyche 0.97 patterns to the 1.0 API (record the deltas
+# in the B2 ledger; the endpoint/gossip/relay shapes are largely stable across 0.97→1.0).
+#
+# Default features carry iroh-gossip's `net` (the networked gossip); the `iroh` feature-gated consumer
+# (`daemon-swarm-net`) enables `iroh-relay/server` + `test-utils` locally for the self-hosted relay +
+# the in-process 3-node test harness (B2, Wave 2). Heavy trees: single-sourced here for the pin, but
+# OPT-IN only — `daemon-swarm-net` gates all three behind its `iroh` cargo feature (optional deps), so
+# the default workspace build/gate never compiles iroh (spec §10.1). Relay reachability is part of the
+# §6.5 eligibility probe.
+iroh = "1"
+iroh-gossip = "0.101"
+iroh-relay = "1"
 # property-based CDDL conformance: `arbitrary` derives (feature-gated, never shipped) generate values
 # across every wire variant; `proptest` (dev) drives them; serialized output is validated against
 # daemon-api.cddl so "Rust output always matches the schema" is a test, not a hope.
@@ -325,6 +377,22 @@ daemon-node = { version = "0", path = "crates/node/daemon-node" }
 # (no-hyperon) build; the worker build opts into the engine via `--features hyperon` on the crate.
 daemon-metta = { version = "0", path = "crates/coprocessor/daemon-metta", default-features = false }
 daemon-metta-client = { version = "0", path = "crates/coprocessor/daemon-metta-client" }
+# --- swarm training stack (swarm-training-spec.md §10.1; DAG-ordered) -----------------------------
+daemon-swarm-proto = { version = "0", path = "crates/contracts/daemon-swarm-proto" }
+det-core = { version = "0", path = "crates/contracts/det-core" }
+daemon-train-sdk = { version = "0", path = "crates/contracts/daemon-train-sdk" }
+daemon-swarm-net = { version = "0", path = "crates/swarm/daemon-swarm-net" }
+daemon-swarm-run = { version = "0", path = "crates/swarm/daemon-swarm-run" }
+daemon-swarm-coordinator = { version = "0", path = "crates/swarm/daemon-swarm-coordinator" }
+daemon-swarm-observe = { version = "0", path = "crates/swarm/daemon-swarm-observe" }
+# The node-side swarm-training service (resident `SwarmService` + worker supervisor), bound at boot
+# when `[swarm] enabled = true` (B3, spec §10.4). Promoted to the workspace table at Merge 3 (matches
+# the daemon-train-safetensors precedent from Merge 2) so `bins/daemon` consumes it via
+# `{ workspace = true }`. Default-gate-clean: no burn/wasmtime/iroh (verified by the Merge-3 dep check).
+daemon-swarm-node = { version = "0", path = "crates/swarm/daemon-swarm-node" }
+daemon-train = { version = "0", path = "crates/coprocessor/daemon-train" }
+daemon-train-client = { version = "0", path = "crates/coprocessor/daemon-train-client" }
+daemon-train-safetensors = { version = "0", path = "crates/coprocessor/daemon-train-safetensors" }
 daemon-pytool = { version = "0", path = "crates/coprocessor/daemon-pytool" }
 daemon-pytool-client = { version = "0", path = "crates/coprocessor/daemon-pytool-client" }
 daemon-tool-metta = { version = "0", path = "tools/daemon-tool-metta" }

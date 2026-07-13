@@ -159,6 +159,24 @@ impl EgressRequest {
         }
     }
 
+    /// A raw-body `PUT` of `body` — the presigned R2/S3 upload shape (the swarm `r2` payload plane,
+    /// spec §7.1/§11.3): the URL carries the SigV4 signature in its query, the object bytes are the
+    /// request body. **No `Content-Type` is set here**: a presigned URL only signs the headers it was
+    /// generated with, so forcing a `Content-Type` the presign did not sign would break the signature.
+    /// If the presign *did* sign a content-type, set the exact same value with
+    /// [`EgressRequest::header`] (`.header("content-type", ct)`). The body is retained so a
+    /// method-preserving `307`/`308` redirect re-sends it (`301`/`302`/`303` demote to a bodyless
+    /// `GET`, browser rules — but presigned stores do not redirect uploads, so callers normally use
+    /// [`Redirects::None`]).
+    pub fn put(url: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            method: Method::PUT,
+            url: url.into(),
+            headers: HeaderMap::new(),
+            body: Some(body),
+        }
+    }
+
     /// Set a header (best-effort: an invalid name/value is ignored). Chainable.
     #[must_use]
     pub fn header(mut self, name: &str, value: &str) -> Self {
@@ -217,6 +235,22 @@ impl EgressClient {
         redirects: Redirects,
     ) -> Result<reqwest::Response, EgressError> {
         self.execute(EgressRequest::get(url), redirects).await
+    }
+
+    /// A convenience raw-body `PUT` (the presigned R2/S3 upload path, spec §7.1/§11.3). Like
+    /// [`EgressClient::get`], the initial `url` is **not** re-checked here (the caller's pre-flight
+    /// owns that — a presigned store host may legitimately be a fixed public endpoint) and redirect
+    /// hops are re-validated when `redirects` is [`Redirects::FollowValidated`]. Presigned uploads
+    /// normally pass [`Redirects::None`] (the store does not redirect PUTs). For a presign whose
+    /// signature covers `Content-Type`, build the request via [`EgressRequest::put`] +
+    /// [`EgressRequest::header`] and pass it to [`EgressClient::execute`] instead.
+    pub async fn put(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        redirects: Redirects,
+    ) -> Result<reqwest::Response, EgressError> {
+        self.execute(EgressRequest::put(url, body), redirects).await
     }
 
     /// Execute `req` under `redirects`, returning the final resolved response.
@@ -329,7 +363,7 @@ fn rewrite_method_for_redirect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_bytes, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -436,6 +470,77 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("code=a+b%2Bc"), "{body}");
+    }
+
+    #[test]
+    fn put_builds_raw_body_request_without_forced_content_type() {
+        // The presigned-upload shape: PUT + raw body, and NO Content-Type is forced (a presigned URL
+        // only signs the headers it was minted with, so an unsigned Content-Type would break SigV4).
+        let bytes = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let req = EgressRequest::put(
+            "https://acct.r2.cloudflarestorage.com/runs/r/rounds/0/peer.upd?X-Amz-Signature=abc",
+            bytes.clone(),
+        );
+        assert_eq!(req.method, Method::PUT);
+        assert_eq!(req.body.as_deref(), Some(bytes.as_slice()));
+        assert!(
+            req.headers.get(CONTENT_TYPE).is_none(),
+            "put must not force a Content-Type (presign signature parity)"
+        );
+        // …but a content-type-signed presign can set the exact value it was signed with.
+        let req = req.header("content-type", "application/octet-stream");
+        assert_eq!(
+            req.headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+    }
+
+    /// The `r2` payload plane's PUT: the raw object bytes reach the (presigned-URL) store verbatim.
+    #[tokio::test]
+    async fn put_uploads_raw_body_to_presigned_url() {
+        let server = MockServer::start().await;
+        let body = b"blake3-pinned update object bytes".to_vec();
+        Mock::given(method("PUT"))
+            .and(path("/runs/r/rounds/0/peer.upd"))
+            .and(body_bytes(body.clone()))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let resp = client()
+            .put(
+                &format!("{}/runs/r/rounds/0/peer.upd", server.uri()),
+                body,
+                Redirects::None,
+            )
+            .await
+            .expect("presigned PUT succeeds");
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    /// SSRF parity with `get`: a method-preserving `307` redirect of a PUT into link-local metadata
+    /// space is rejected mid-chain (the body would otherwise be re-sent to the blocked host).
+    #[tokio::test]
+    async fn put_redirect_to_blocked_host_is_rejected_midchain() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", "http://169.254.169.254/latest/meta-data/"),
+            )
+            .mount(&server)
+            .await;
+
+        let err = client()
+            .put(
+                &format!("{}/start", server.uri()),
+                vec![1u8, 2, 3],
+                Redirects::DEFAULT,
+            )
+            .await
+            .expect_err("redirect into blocked space must be rejected");
+        assert!(matches!(err, EgressError::Blocked(_)), "got {err:?}");
     }
 
     #[test]

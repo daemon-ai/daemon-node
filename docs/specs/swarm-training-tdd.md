@@ -31,8 +31,10 @@ what oracle" layer under the spec's "what to build".
    `&mut self` was not.
 2. **Psyche's coordination *math* is well-tested and ports cleanly.** 15 committee-selection
    tests, 3 assignment tests, and the shuffle/merkle/LCG primitive suites are near-1:1 DIRECT
-   ports and become our determinism baseline (bloom's 4 tests are vendored but deferred with
-   the mechanism — spec §6.4 uses exact attestation lists at v1 scale).
+   ports and become our determinism baseline — the merkle suite doubles as the §6.4
+   set-commitment primitive (Psyche's `broadcast_merkle`, adopted). Blooms are N/A: rejected
+   as consensus inputs (spec §18 open q. 12), their Psyche role being a Solana-substrate
+   health heuristic.
 3. **`nousnet/` == `psyche/`** at the same commit (no material delta) — port from `psyche/`.
 4. **Prior-art numerics become GOLDEN vectors, not copy-paste tests.** Everything lives on
    tch-rs `Tensor`; we run Burn/CubeCL behind a wasm tensor-ABI. Compression/optimizer tests are
@@ -96,7 +98,7 @@ template for every wire-contract suite.
 
 | Area (source) | Real upstream tests in scope | Dominant class | Target crate |
 |---|---|---|---|
-| Committee / assignment / shuffle / merkle / LCG / sha256 (+ deferred bloom) (`psyche/shared/{coordinator,core}`) | ~34 | DIRECT / GOLDEN | `daemon-swarm-proto` |
+| Committee / assignment / shuffle / merkle / LCG / sha256 (`psyche/shared/{coordinator,core}`; bloom N/A) | ~34 | DIRECT / GOLDEN | `daemon-swarm-proto` |
 | Coordinator `tick` / witness quorum / health drop / round ring | **0** (integration only) | CONCEPT (author fresh) | `daemon-swarm-proto` |
 | Event sourcing + projection (`psyche/shared/event-sourcing`) | 24 | ADAPT | `daemon-swarm-observe` |
 | Network: download scheduler / iroh router / blob retry (`psyche/shared/network`) | ~19 | DIRECT / ADAPT | `daemon-swarm-net` |
@@ -127,8 +129,8 @@ Serde-only, wasm32-clean, **no tokio/Burn/wasmtime**. This is where determinism 
 | Equal-split assignment (3 tests) | `psyche/shared/coordinator/src/data_selection.rs:167-236` | §6.3 (baseline; weighted variant is a gap) |
 | Swap-or-not shuffle (4) | `psyche/shared/core/src/swap_or_not.rs:36-85` | §6.3 (GOLDEN vectors) |
 | Deterministic shuffle (6) + LCG (7) | `.../deterministic_shuffle.rs:19-80`, `.../lcg.rs:29-90` | §6.3 |
-| Merkle (11) | `.../merkle_tree.rs:335-426` | §6.4 (checkpoint/audit proofs) |
-| Bloom (4) | `.../bloom.rs:331-379` | **deferred** — v1 attestations are exact hash lists (§6.4); vendor the vectors now, activate only if bloom compaction returns (spec §18 open q. 12) |
+| Merkle (11) | `.../merkle_tree.rs:335-426` | §6.4 — the **set-commitment primitive**: `Attestation`/`RoundRecord` sign merkle roots over the committed/verified sets (Psyche's `broadcast_merkle`, adopted); also checkpoint/audit proofs |
+| Bloom (4) | `.../bloom.rs:331-379` | **N/A (recorded)** — blooms are rejected as consensus inputs (spec §18 open q. 12, resolved: set commitments make list growth moot and FPs are inadmissible); Psyche's blooms were Solana-substrate artifacts serving a health heuristic |
 | Content-hash golden | `.../sha256.rs:43` → **re-pin as blake3** (artifacts/payloads/checkpoints); round state digest is xxh3-128 over seed-keyed sampled blocks (§5.6) — no upstream analogue, see PROTO-18 | §5.6, §6.3 |
 
 **Authored fresh (no upstream coverage) — the gap register for this crate:**
@@ -139,7 +141,7 @@ Serde-only, wasm32-clean, **no tokio/Burn/wasmtime**. This is where determinism 
 | PROTO-2 | Phase timeout transitions (warmup→train→witness→train/cooldown) | §6.2 | table-driven `timeout_*` scenarios (port the *intent* of `centralized/testing/integration_tests.rs`) |
 | PROTO-3 | `NUM_STORED_ROUNDS=4` ring; `data_index`/`height` threading; cursor advances by `global_batch` per round (sequences/round semantics) | §6.2, §6.1 | `round_ring_wraps_at_4`, `data_index_threads_across_rounds`, `cursor_advances_per_round` |
 | PROTO-4 | Witness quorum ⌈⅔·n⌉ incl. adopted small-n specials (1→1, 2→2, 3→2) | §6.3 (`coordinator.rs:710-722`, untested upstream) | `witness_quorum_table` (n=1..32) |
-| PROTO-5 | **Round-record commit rule**: entry iff commitment ∧ (HEAD confirm ∨ witness-quorum attestation); freeze on all-accounted or deadline; record ordered by node-pubkey bytes | §6.4 | `record_requires_commit_and_availability`, `record_freezes_at_deadline`, `record_order_is_pubkey_bytes`, `absent_peer_not_in_record` |
+| PROTO-5 | **Round-record commit rule** as a pure function of signed messages (I6): entry iff `Commitment` ∧ (`StorageReceipt` ∨ witness-quorum `Attestation`) — no inline I/O; freeze on all-accounted or deadline; record signs the **set-commitment root**, set ordered by node-pubkey bytes; membership/absence provable against the root | §6.4 | `record_requires_commit_and_evidence`, `commit_rule_consumes_only_signed_messages`, `record_freezes_at_deadline`, `record_root_matches_set`, `set_order_is_pubkey_bytes`, `membership_proof_verifies`, `absent_peer_not_in_record` |
 | PROTO-6 | Health-check accusation → `Dropped`; healthy peer rejects accusation | §6.4, §13 | `health_check_marks_dropped`, `healthy_trainer_rejects_accusation` |
 | PROTO-7 | 15 s heartbeat + **K record-absences** drop counter (daemon Delta); `Straggle` heartbeats don't count as absence during the stall window | §6.4 | `peer_silent_emits_stale`, `k_absences_drops`, `straggle_within_window_not_dropped` |
 | PROTO-8 | Throughput-class-weighted assignment + deliberate 0–10% overlap (daemon Delta vs equal-split); class ladder boundaries (c1..c4) | §6.3, open q.1 | `assignment_weighted_by_class`, `overlap_zero_is_partition`, `overlap_10pct_covers_churn`, `class_ladder_boundaries` |
@@ -153,7 +155,7 @@ Serde-only, wasm32-clean, **no tokio/Burn/wasmtime**. This is where determinism 
 | PROTO-16 | **No-float** / WASM determinism of `tick` (open q.7) | §11.2 | `tick_module_no_float` lint-test + integer-only `proptest` |
 | PROTO-17 | Epoch/progress semantics adopted from hivemind (3 disjuncts of `ready_to_update_epoch`), DHT removed | §2, A.9 (`hivemind/.../progress_tracker.py:128-134`, `test_optimizer.py:221`) | `epoch_advances_on_batch_target`, `_on_global_lead`, `_on_eta` |
 | PROTO-18 | Round state digest: xxh3-128 over seed-keyed sampled blocks — identical block schedule from identical seed; covers params **and** `replicated` persistents; flips on 1-bit change in either | §5.6 | `digest_sampling_schedule_deterministic`, `digest_covers_replicated_persistents`, `digest_changes_on_one_bit` |
-| PROTO-19 | Round-protocol message set (`RoundOpen`/`Commitment`/`Attestation`/`RoundRecord`/`Digest`/`Straggle`) CDDL round-trip + signature-reject fixtures | §6.4, §7.3 | `round_messages_cddl_conformance`, `record_bad_sig_rejected` |
+| PROTO-19 | Round-protocol message set (`RoundOpen`/`Commitment`/`Attestation`/`StorageReceipt`/`RoundRecord`/`Digest`/`Straggle`) CDDL round-trip + signature-reject fixtures; attestation/record roots constant-size regardless of roster | §6.4, §7.3 | `round_messages_cddl_conformance`, `record_bad_sig_rejected`, `message_size_roster_invariant` |
 | PROTO-20 | **Replayability (I1)**: fold (checkpoint, records, payloads) offline → bit-identical post-round state; the resync oracle | §6.4, §9 | `replay_reconstructs_state`, `replay_detects_tampered_payload` |
 
 **Suggested layout** (unit tests beside modules; golden + conformance under `tests/`):
@@ -186,7 +188,7 @@ coordinator handshake (`tcp.rs:342,370,439`) — daemon has no Psyche-TCP coordi
 
 | # | Behavior | Grounds | Proposed test |
 |---|---|---|---|
-| NET-1 | R2-store presigned PUT/GET round-trip + URL expiry + coordinator `HEAD` availability check (no Psyche analogue) | §7.1, §6.4, §11.1 | `store_presign_roundtrip`, `store_presign_expired_rejected`, `head_confirms_size` (mock presign server) |
+| NET-1 | R2-store presigned PUT/GET round-trip + URL expiry; coordinator `HEAD` check emitted as a signed `StorageReceipt` — the commit rule never sees the raw response (I6) | §7.1, §6.4, §11.1 | `store_presign_roundtrip`, `store_presign_expired_rejected`, `head_emits_signed_receipt` (mock presign server) |
 | NET-2 | **blake3** artifact-map verification (Psyche uses sha256) | §8, §12 | `verify_artifact_ok/tamper`, blake3 golden vector |
 | NET-3 | `r2://` / `hf://@rev` / `https://` scheme resolution + revision-pin immutability | §8 | `resolve_hf_pinned_ok`, `unpinned_hf_rejected`, `r2_to_presign` |
 | NET-4 | Per-object payload-plane fallback (blobs↔store) from commitment locators | §7.1 | `blob_fetch_fails_falls_back_store`, `locators_tried_in_cost_order` |
@@ -213,7 +215,7 @@ Psyche `test.rs` spawn pattern), `SwarmTransport` mock tier.
 | # | Behavior | Grounds | Proposed test |
 |---|---|---|---|
 | RUN-1 | `update_mb_max` receive-side rejection **before** guest decode | §7.3, §13 | `payload_over_cap_rejected_before_decode` (mock backend records `decode` not called) |
-| RUN-2 | Commitment-then-payload: verify blake3 against the record entry before staging; mismatch → drop+demerit | §7.3, §6.4, A.10 (`client/state/steps.rs:613`, untested) | `commitment_verify_ok/mismatch`, `stage_rejects_hash_not_in_record` |
+| RUN-2 | Commitment-then-payload: obtain the committed set (inline or `record-set.cbor`), verify it against the record's root, then verify each payload's blake3 against its set entry before staging; mismatch → drop+demerit | §7.3, §6.4, A.10 (`client/state/steps.rs:613`, untested) | `set_verifies_against_record_root`, `tampered_set_object_rejected`, `commitment_verify_ok/mismatch`, `stage_rejects_hash_not_in_set` |
 | RUN-3 | Tokenized `manifest.json` validation + `BatchId`→(shard,offset) local mapping; peer slices its interval into `steps_per_round` × micro-batches | §8, §6.3 | `manifest_batchid_maps`, `invalid_manifest_rejected`, `interval_slices_into_h_steps` |
 | RUN-4 | Artifact LRU cache bounded by `data_cache_gb` | §8, §10.6 | `artifact_cache_lru_evicts` |
 | RUN-5 | Round lifecycle join/warmup/train/cooldown transitions (client is untested upstream), incl. **barrier invariant I2**: first `da_step` of r+1 happens-after `da_ingest_updates(r)` returns; early `RoundOpen(r+1)` doesn't reorder | §10.2, §6.4, ABI §2.3 | `round_lifecycle_transitions`, `ingest_barrier_orders_next_round` (CONCEPT from Psyche E2E) |
@@ -398,7 +400,7 @@ the `llama2/llama3` tokenizers.
 |---|---|---|---|
 | Coordinator tick | `&mut self` (`coordinator.rs:437`) | pure `tick(state,events,now)→(state',effects)` | PROTO-1, COORD-1 |
 | Assignment | equal split (`data_selection.rs`) | throughput-weighted + 0–10% overlap | PROTO-8 |
-| Committed set | witness blooms (1% FP) imply liveness | signed **`RoundRecord`** = exact committed list; attestations are exact hash lists; blooms deferred | PROTO-5/19, RUN-2 |
+| Committed set | witness blooms (1% FP) imply liveness; `broadcast_merkle` root alongside | signed **`RoundRecord`** = merkle **set commitment** over the exact committed set (+ content-addressed `record-set.cbor`); attestations sign roots too; availability evidence = signed messages only (`StorageReceipt` ∨ quorum attestation, I6); blooms rejected | PROTO-5/19, RUN-2 |
 | Apply ordering | round-start apply, one round late (`train.rs:512`) | v1 `barrier`: ingest at round end (I2); Psyche's shape reserved as `pipelined` mode | RUN-5 |
 | Fetch failure | resync or drop | **stall ladder** (`stall_rounds_max`, retention floor) before resync/leave | RUN-8, NET-8 |
 | Content hash | sha256 (`core/sha256.rs`, `steps.rs:613`) | **blake3** (content); xxh3-128 seed-keyed sampled round digest | NET-2, RUN-2, HOST-7, PROTO-18 |

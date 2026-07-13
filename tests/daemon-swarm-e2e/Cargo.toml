@@ -1,0 +1,39 @@
+[package]
+name = "daemon-swarm-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# The live-transport exit gate (`tests/live_transport.rs`): the round engine over a REAL per-node
+# `IrohGossip` mesh + a shared `FsPayloadStore` (B3). Off by default so the standard e2e gate stays
+# fast + iroh-free; run with `cargo test -p daemon-swarm-e2e --features iroh`.
+iroh = ["daemon-swarm-run/iroh"]
+
+[dev-dependencies]
+# The peer-side round engine + the local-coordinator harness + churn/failure drill machinery
+# (feature-gated). Merge 2 swapped the scripted coordinator for the real `daemon-swarm-coordinator`
+# tick loop; Wave 3 (R3) adds the drills over the same harness.
+daemon-swarm-run = { workspace = true, features = ["harness"] }
+daemon-swarm-proto = { workspace = true }
+# The payload store + `PayloadStore` trait: the desync drill fetches checkpoint + payload bytes for
+# the offline resync (checkpoint + record replay).
+daemon-swarm-net = { workspace = true }
+tokio = { workspace = true }
+# The wasm-backed profile e2e (`tests/wasm_profiles.rs`): the real host training backend
+# (`WasmBackend`), the pure coordinator `tick`, and the observe replay oracle (PROTO-20). All are
+# already in the frozen root `[workspace.dependencies]`; no cycle (the e2e crate is a leaf).
+daemon-train = { workspace = true }
+daemon-train-sdk = { path = "../../crates/contracts/daemon-train-sdk", features = ["sim"] }
+daemon-swarm-coordinator = { workspace = true }
+daemon-swarm-observe = { workspace = true }
+ciborium = { workspace = true }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,98 @@
+[package]
+name = "daemon-train"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "daemon-train"
+path = "src/bin/daemon-train.rs"
+
+# The Wave-3 training worker: speaks the frozen `daemon_swarm_run::protocol` over the length-framed
+# stdio cut and drives `WasmBackend` (spec §10.2). The node process never links this binary's engine.
+# Split into `main` (dispatch) + `backend` (probe/assess, G2) + `transport` (JoinRun round loop, B3)
+# modules so the Wave-3 A/B lanes do not collide on one file (swarm-p1-ledger.md).
+[[bin]]
+name = "daemon-train-worker"
+path = "src/bin/daemon-train-worker/main.rs"
+
+[dependencies]
+daemon-swarm-proto = { workspace = true }
+# Host worker runtime: the wasm module sandbox (wasmtime) + the training engine (Burn, ndarray
+# backend + autodiff; NO GPU backends in the default gate) + content hashing for artifact / tensor
+# digests (blake3, xxh3). swarm-training-spec.md §5.1, §10.1. Heavy trees on purpose: this crate is
+# the worker fault domain and is built out-of-gate per backend lane in the real product.
+wasmtime = { workspace = true }
+burn = { workspace = true }
+blake3 = { workspace = true }
+xxhash-rust = { workspace = true }
+thiserror = { workspace = true }
+# The shared fixed-order fp32 det-lane kernels (bit-exact sim ≡ host, ABI §5.9) + the CBOR codec for
+# the manifest/config contract (ABI §6.1/§6.2). det-core is zero-dep; serde/ciborium are already pins.
+det-core = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+# The R↔E seam (`TrainerBackend`) + the frozen node↔worker wire (`daemon_swarm_run::protocol`), lane R
+# (§10.1: `daemon-train` depends on `daemon-swarm-run`). `WasmBackend` implements the trait; the
+# worker binary implements the child side of the protocol. No cycle: `daemon-swarm-run` has no dep on
+# `daemon-train`. Path dep already declared in the frozen root manifest — no root/deny/flake change.
+daemon-swarm-run = { workspace = true }
+# The envelope artifact plane (`ArtifactResolver`, `file://` blake3-verified) the worker uses to
+# fetch its experiment module from the frozen envelope's artifact map (§8). Path dep already in the
+# frozen root manifest; net depends only on proto (no cycle). Used by the worker bin target.
+daemon-swarm-net = { workspace = true }
+# The length-framed `CutChannel` stdio transport the `daemon-train-worker` binary speaks (same
+# supervision contract as the other coprocessor workers, §10.2). Used by the bin target only.
+daemon-provision = { workspace = true }
+# Async runtime for the `daemon-train-worker` binary's stdio command/event loop. Bin target only.
+tokio = { workspace = true }
+
+# Per-backend lane selection (spec §10.1). These features only toggle burn's *dependency* backend
+# features — no code path changes this wave (Wave-0 scaffold): the `OpBackend` seam is still the
+# `CpuBackend` fp32 fake; G1/G2 wire `BurnBackend` behind these lanes in Waves 1–2. burn's `std` +
+# `ndarray` + `autodiff` are always on (the root workspace dep), so `cpu` (default) and `burn-ndarray`
+# both compile the current CPU/ndarray+autodiff graph; `wgpu` additionally pulls burn-wgpu (cubecl +
+# wgpu 29, Vulkan/RADV at runtime via the flake). Kept out of the default gate: `wgpu` is opt-in, so a
+# default `cargo build`/`test`/`deny` never compiles the GPU tree.
+[features]
+default = ["cpu"]
+# The CPU (det-lane fp32) lane — current MVP behavior, no extra backend deps.
+cpu = []
+# burn with the ndarray backend + autodiff — the G1 native lane (burn-ndarray is already on via the
+# root dep; the explicit toggle documents/pins the lane and makes `--features burn-ndarray` a no-op-
+# safe alias for the CI gate).
+burn-ndarray = ["burn/ndarray"]
+# burn with the wgpu backend (cubecl + wgpu 29; targets Vulkan/RADV) — the G2 GPU lane. Opt-in only.
+wgpu = ["burn/wgpu"]
+
+[dev-dependencies]
+# Test-only: the frozen-surface sync check (`tests/abi_surface.rs`) reads the guest SDK's
+# `TABI_IMPORTS`, and the guest-lifecycle test builds the `TinyLlamaCfg` the wasm guest parses.
+# `sim` compiles the SDK's `models`/`profiles` (config types) natively for the tests; never a
+# runtime edge (the host does not link the guest SDK).
+daemon-train-sdk = { path = "../../contracts/daemon-train-sdk", features = ["sim"] }
+# Test-only: the node-side supervisor drives the real `daemon-train-worker` subprocess through the
+# frozen worker protocol (`tests/worker_protocol.rs`). Path dep between workspace members — no root
+# edit — and `daemon-train-client` does not depend on `daemon-train`, so it is a clean dev-dep.
+daemon-train-client = { workspace = true }
+# Test-only: `SessionId` for the lower-level direct-subprocess round-loop test (spawns the worker via
+# `daemon_provision` and drives the protocol to observe `RoundOutcome`).
+daemon-common = { workspace = true }
+# Test-only (M2 reference-parity harness): the state-dict ↔ safetensors converter (M1 seam 4) the
+# parity tests use to compare the tabi path's and the burn reference's weights. Already a
+# `[workspace.dependencies]` entry (added at Merge 2) — a dev-dep on an existing workspace dep, no
+# root/deny/flake change.
+daemon-train-safetensors = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# `wasmtime` (host runtime) is used; `burn` is the Wave-2 `OpBackend` engine (declared now, wired
+# then — the CPU fake needs no burn). NOTE (Merge 1): burn should move to a feature-gated / lane-split
+# build off the default gate (program ledger); deferred this wave to avoid a full wasmtime recompile.
+ignored = ["wasmtime", "burn"]

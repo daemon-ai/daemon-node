@@ -1,0 +1,62 @@
+[package]
+name = "daemon-swarm-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+daemon-swarm-proto = { workspace = true }
+# `ContainedRoot` (openat2 RESOLVE_BENEATH|NO_SYMLINKS) is the sanctioned fs surface: the
+# `FsPayloadStore` is rooted at one so peer-supplied key components can never escape the store root
+# (the workspace-wide clippy fs ban points here).
+daemon-core = { workspace = true }
+# The SSRF-safe outbound HTTP client (B1): the `r2` payload plane (presigned PUT/GET, §7.1/§11.3),
+# the presign HTTP seam (§11.1), and the `https`/`r2`/`hf` artifact schemes (§8) all route through
+# `EgressClient` — raw `reqwest::Client` is clippy-banned outside `daemon-egress` (`disallowed_types`).
+daemon-egress = { workspace = true }
+tokio = { workspace = true }
+# `reqwest::Response` is the return type of the `EgressClient` methods B1 consumes (status/headers/
+# bytes). The banned type is `reqwest::Client`/`ClientBuilder`; naming `Response` is allowed.
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+# The presign HTTP DTOs (§11.1) are JSON; the frozen contract fixtures are `tests/fixtures/presign-*.json`.
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+# The iroh transport plane (§7): the gossip control plane (`IrohGossip: ControlPlane`, B2 Wave 2) +
+# the self-hosted relay. OPTIONAL — gated behind the `iroh` feature so the default workspace build
+# never compiles the heavy iroh/QUIC/relay tree (spec §10.1). NO iroh-blobs (P4). B2 may add feature
+# tuning (e.g. `iroh-relay/server`, `test-utils`) here — a lane-owned member edit, not a root change.
+iroh = { workspace = true, optional = true }
+iroh-gossip = { workspace = true, optional = true }
+iroh-relay = { workspace = true, optional = true }
+# `StreamExt::next` over the `iroh_gossip` `GossipReceiver` event stream (B2). OPTIONAL — pulled in
+# only with the `iroh` feature; the default (no-iroh) build never compiles it.
+futures = { workspace = true, optional = true }
+
+[dev-dependencies]
+# In-process mock presign/object server for the NET-1/3/8 suites (no live network). Already a
+# `[workspace.dependencies]` entry (daemon-matrix / daemon-egress / daemon-models use it) — adds no
+# new third-party dep and needs no frozen-file change.
+wiremock = { workspace = true }
+
+[features]
+# Off by default: the default workspace gate builds no iroh. B2 (Wave 2) implements `iroh_gossip.rs`
+# behind this feature; `iroh`/`iroh-gossip`/`futures` are referenced there. The self-hosted relay is
+# an external runtime binary (`iroh-relay --dev`, devShell), so the `iroh-relay` crate itself stays
+# unreferenced (kept declared for a future in-process-relay path; machete-ignored below).
+iroh = ["dep:iroh", "dep:iroh-gossip", "dep:iroh-relay", "dep:futures"]
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# `iroh-relay` is declared for the self-hosted relay but the relay runs as an external binary
+# (`iroh-relay --dev`), so the crate is not referenced in src. `iroh`/`iroh-gossip`/`futures` are now
+# used by B2's `iroh_gossip.rs` (behind the `iroh` feature).
+ignored = ["iroh-relay"]

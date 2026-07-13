@@ -1,0 +1,31 @@
+[package]
+name = "daemon-train-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fake-train-worker"
+path = "src/bin/fake-train-worker.rs"
+
+[dependencies]
+# Node-side supervisor: spawn / respawn / meltdown + the worker protocol client, mirroring
+# `LocalProvider` / `MettaCoprocessor`. It links only the light node-side crates — never wasmtime /
+# Burn — so the daemon process stays out of the worker fault domain (§10.1).
+daemon-common = { workspace = true }
+daemon-provision = { workspace = true }
+# The worker protocol (§10.2) lives in `daemon-swarm-run` so lane E's worker implements it too.
+daemon-swarm-run = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

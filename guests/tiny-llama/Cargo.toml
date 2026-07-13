@@ -1,0 +1,17 @@
+[package]
+name = "tiny-llama"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A guest experiment module: a `cdylib` the host instantiates in the wasm sandbox (tensor-ABI spec
+# §5.1). The reference consumer of the guest SDK's `experiment!` macro. The real LLaMA-family model
+# is Wave 2; this is a minimal placeholder Experiment that registers params and round-trips the
+# lifecycle (da_abi + da_build + a trivial make_update/ingest).
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+daemon-train-sdk = { path = "../../crates/contracts/daemon-train-sdk" }
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,27 @@
+[package]
+name = "daemon-train-safetensors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# The swarm checkpoint <-> safetensors converter (spec §9, M1 seam). A deliberately light,
+# additive library: it converts a canonical **state dict** (the module's param list in registration
+# order, ABI §6.3) to/from the `safetensors` on-disk format and back, bit-exactly. It sits ALONGSIDE
+# the frozen `TrainerBackend::checkpoint_save`/`load` (never edits them); B3 wires it into the §9
+# `checkpoints/round-<r>.safetensors` export and M2 uses it to init a matched llama-burn reference
+# model. `safetensors` (already in the workspace lock) is preferred over the heavier `burn-store`.
+[dependencies]
+safetensors = "0.4"
+blake3 = { workspace = true }
+
+[dev-dependencies]
+# The round-trip test proves the real 160M canonical param layout (names/shapes/order) survives; the
+# SDK provides that layout (sim feature only pulls det-core, no host/GPU deps).
+daemon-train-sdk = { path = "../../contracts/daemon-train-sdk", features = ["sim"] }
+
+[lints]
+workspace = true

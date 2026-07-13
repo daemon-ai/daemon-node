@@ -21,7 +21,10 @@
 
 #![forbid(unsafe_code)]
 
+mod tokenize;
+
 use clap::{Parser, Subcommand};
+use daemon_swarm_run::data::TokenWidth;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -52,6 +55,44 @@ enum Cmd {
     },
     /// Decode every CBOR fixture with the generated C codec (wire-compat gate).
     VerifyCodec,
+    /// Build the swarm guest experiment modules (`guests/`) for `wasm32-unknown-unknown`.
+    BuildGuests,
+    /// Tokenize a corpus into fixed-width shards + `manifest.json` (spec §8; M1 seam).
+    TokenizeCorpus {
+        /// HF dataset repo id (e.g. `roneneldan/TinyStories`); omit when using `--text`.
+        #[arg(long)]
+        dataset: Option<String>,
+        /// The file within the dataset repo (e.g. `TinyStories-valid.txt`).
+        #[arg(long)]
+        dataset_file: Option<String>,
+        /// Pinned dataset revision (commit SHA / tag).
+        #[arg(long, default_value = "main")]
+        revision: String,
+        /// A local corpus text file — bypasses the HF dataset pull (offline / synthetic).
+        #[arg(long)]
+        text: Option<PathBuf>,
+        /// HF model id for the tokenizer (e.g. `gpt2`) OR a local `tokenizer.json` path.
+        #[arg(long)]
+        tokenizer: String,
+        /// Pinned tokenizer revision (defaults to `main` when pulling from HF).
+        #[arg(long)]
+        tokenizer_revision: Option<String>,
+        /// Output directory for shards + `manifest.json`.
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Tokens per shard (rounded down to a multiple of `--seq-len`).
+        #[arg(long, default_value_t = 1_048_576)]
+        shard_tokens: u64,
+        /// Sequence length (tokens per training sequence).
+        #[arg(long, default_value_t = 1024)]
+        seq_len: u32,
+        /// Token element width: `u16` (vocab ≤ 65 536) or `u32`.
+        #[arg(long, default_value = "u16")]
+        token_width: String,
+        /// Optional cap on total tokens emitted (keeps a vendored fixture small).
+        #[arg(long)]
+        max_tokens: Option<u64>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -61,7 +102,68 @@ fn main() -> anyhow::Result<()> {
         Cmd::ApiFixtures => gen_api_fixtures(),
         Cmd::GenZcbor { cddl, out } => gen_zcbor(cddl, out),
         Cmd::VerifyCodec => verify_codec(),
+        Cmd::BuildGuests => build_guests(),
+        Cmd::TokenizeCorpus {
+            dataset,
+            dataset_file,
+            revision,
+            text,
+            tokenizer,
+            tokenizer_revision,
+            out_dir,
+            shard_tokens,
+            seq_len,
+            token_width,
+            max_tokens,
+        } => {
+            let token_width = match token_width.as_str() {
+                "u16" => TokenWidth::U16,
+                "u32" => TokenWidth::U32,
+                other => anyhow::bail!("--token-width must be u16 or u32, got {other}"),
+            };
+            tokenize::run(tokenize::Args {
+                dataset,
+                dataset_file,
+                revision,
+                text,
+                tokenizer,
+                tokenizer_revision,
+                out_dir,
+                shard_tokens,
+                seq_len,
+                token_width,
+                max_tokens,
+            })
+        }
     }
+}
+
+/// Build the swarm guest experiment modules for `wasm32-unknown-unknown`.
+///
+/// `guests/` is its OWN cargo workspace (excluded from the root workspace), so the host's native
+/// `cargo build/clippy/test` never tries to build a `cdylib` for wasm. This target runs
+/// `cargo build --release --target wasm32-unknown-unknown` inside it (swarm-training-spec.md §10.1).
+/// The `wasm32-unknown-unknown` rust-std is provided by the flake devShell toolchain.
+fn build_guests() -> anyhow::Result<()> {
+    let root = workspace_root();
+    let guests = root.join("guests");
+    anyhow::ensure!(
+        guests.join("Cargo.toml").is_file(),
+        "no guests workspace at {}",
+        guests.display()
+    );
+
+    // xtask is dev tooling; the crate-level `#![allow(clippy::disallowed_methods)]` covers this
+    // developer-controlled spawn.
+    let status = Command::new("cargo")
+        .current_dir(&guests)
+        .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run cargo for the guests workspace: {e}"))?;
+    anyhow::ensure!(status.success(), "building guests failed with {status}");
+
+    println!("built guests in {}", guests.display());
+    Ok(())
 }
 
 /// The workspace root (xtask's manifest dir is `<root>/xtask`).

@@ -50,6 +50,13 @@ hel = "hel"
 mor = "mor"
 alikes = "alikes"
 
+# Vendored pre-tokenized corpus shards are binary u16/u32 token streams (xtask tokenize-corpus).
+# `extend-exclude` above is only honored during directory walks; the pre-commit hook passes staged
+# files explicitly, so a file-type override with `check-file = false` is what actually skips them.
+[type.swarm-corpus-shard]
+extend-glob = ["*.bin"]
+check-file = false
+
 [default.extend-identifiers]
 ratatui = "ratatui"         # the Rust TUI crate
 Ratatui = "Ratatui"

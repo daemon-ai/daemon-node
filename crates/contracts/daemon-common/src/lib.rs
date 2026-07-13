@@ -758,7 +758,12 @@ impl WireVersion {
     /// returns a race-free initial-sync baseline (`{cursor, epoch, revs}`). Bundled into ONE bump
     /// because the rung-1 arm-shape changes are breaking and `is_compatible` is strict-equal
     /// (mirrors the additive v15–v38 bumps); clients feature-detect via the `api/39` Hello feature.
-    pub const CURRENT: Self = Self(39);
+    ///
+    /// (v40) additive `SwarmApi` surface — the `Swarm*` request/response variants + `swarm-*` CDDL
+    /// rules + the `NodeEvent::SwarmChanged` invalidation pointer (Swarm P1, Merge 1). Purely
+    /// additive union arms; strict-equal `is_compatible` still holds, so the bump follows the same
+    /// additive pattern as the earlier versions; clients feature-detect via the `api/40` Hello feature.
+    pub const CURRENT: Self = Self(40);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

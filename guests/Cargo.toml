@@ -1,0 +1,14 @@
+# The swarm guest experiment modules — a SEPARATE cargo workspace, excluded from the root
+# (daemon-node) workspace so the host's native `cargo build/clippy/test` never tries to build a
+# `cdylib` for `wasm32-unknown-unknown`. Built via `cargo run -p xtask -- build-guests`, which runs
+# `cargo build --release --target wasm32-unknown-unknown` in this directory (swarm-training-spec.md
+# §10.1). Members link `daemon-train-sdk` by path (../crates/contracts/daemon-train-sdk).
+[workspace]
+resolver = "2"
+members = ["tiny-llama", "test-abi-basic"]
+
+# wasm size-tuned: the built modules ship as artifacts, so trade a little compile time for size.
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
