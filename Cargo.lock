@@ -3562,7 +3562,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3634,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-acp"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -3652,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-activation"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -3667,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-api"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "arbitrary",
  "async-trait",
@@ -3687,7 +3687,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-api-testkit"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -3697,7 +3697,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-auth"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.2.17",
@@ -3715,7 +3715,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3729,7 +3729,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-common"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "arbitrary",
  "serde",
@@ -3739,7 +3739,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-conformance"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -3792,7 +3792,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-context-lcm"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3813,7 +3813,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -3834,7 +3834,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-core-ffi"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -3851,7 +3851,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-credentials"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "bc-components",
@@ -3863,7 +3863,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-delivery"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -3875,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-demo"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -3889,7 +3889,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-discord"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3910,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-egress"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "daemon-core",
  "reqwest 0.12.28",
@@ -3923,7 +3923,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-ffi"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "daemon-api",
  "daemon-common",
@@ -3939,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-gateway"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3958,7 +3958,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-host"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3999,7 +3999,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-http"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -4021,7 +4021,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-infer"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -4043,7 +4043,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-ingest"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -4054,7 +4054,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-line"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4079,7 +4079,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-matrix"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4102,7 +4102,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-mcp-client"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4119,7 +4119,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-metta"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -4138,7 +4138,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-metta-client"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "daemon-common",
  "daemon-metta",
@@ -4152,7 +4152,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-mnemosyne"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -4181,7 +4181,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-models"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "arc-swap",
  "daemon-common",
@@ -4202,7 +4202,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-node"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-oauth"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4257,7 +4257,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-orchestration"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -4272,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-processes"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4290,7 +4290,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-prompt"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-core",
@@ -4306,7 +4306,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-protocol"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "arbitrary",
  "async-trait",
@@ -4319,7 +4319,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-providers"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4339,7 +4339,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-provision"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4350,7 +4350,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-pytool"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -4367,7 +4367,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-pytool-client"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4384,7 +4384,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-rooms"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -4403,7 +4403,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-sandbox"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "landlock",
  "libc",
@@ -4413,7 +4413,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-schedule"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4422,7 +4422,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-skills"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bc-components",
  "bc-envelope",
@@ -4440,7 +4440,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-slack"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4465,7 +4465,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-store"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -4479,7 +4479,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-supervision"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4490,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-swarm-coordinator"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "daemon-swarm-proto",
  "proptest",
@@ -4499,7 +4499,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-swarm-e2e"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "ciborium",
@@ -4515,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-swarm-net"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -4536,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-swarm-node"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -4555,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-swarm-observe"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "ciborium",
  "daemon-swarm-coordinator",
@@ -4566,7 +4566,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-swarm-proto"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "cddl-cat",
@@ -4579,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-swarm-run"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4599,7 +4599,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-telegram"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4621,7 +4621,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-telemetry"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bc-components",
  "bc-envelope",
@@ -4644,7 +4644,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-browser"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "chromiumoxide",
@@ -4662,7 +4662,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-clarify"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4676,7 +4676,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-cron"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -4689,7 +4689,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-execute-code"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4706,7 +4706,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-fs"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4728,7 +4728,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-metta"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4745,7 +4745,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-orchestrate"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4762,7 +4762,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-process"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4777,7 +4777,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-profile"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-api",
@@ -4796,7 +4796,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-semantic-search"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4812,7 +4812,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-session-search"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4826,7 +4826,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-shell"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4841,7 +4841,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-skill"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4857,7 +4857,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-tkx"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-core",
@@ -4867,7 +4867,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-todo"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4881,7 +4881,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-user-profile"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4897,7 +4897,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-vision"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4915,7 +4915,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-tool-web"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "daemon-common",
@@ -4934,7 +4934,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-train"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "burn",
@@ -4958,7 +4958,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-train-client"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "daemon-common",
  "daemon-provision",
@@ -4971,7 +4971,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-train-safetensors"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "daemon-train-sdk",
@@ -4980,7 +4980,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-train-sdk"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "ciborium",
  "det-core",
@@ -4989,7 +4989,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-transport"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -5008,7 +5008,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-wechat"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5030,7 +5030,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-whatsapp"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5054,7 +5054,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-workspace-index"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "daemon-core",
  "daemon-tool-fs",
@@ -5526,7 +5526,7 @@ dependencies = [
 
 [[package]]
 name = "det-core"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "deunicode"
@@ -15042,7 +15042,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swarm-local"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "ciborium",
@@ -18645,7 +18645,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "blake3",
