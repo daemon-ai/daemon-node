@@ -443,6 +443,33 @@ impl Experiment for TinyLlama {
 mod tests {
     use super::*;
 
+    /// The committed canonical CBOR preset fixtures (`presets/*.cbor` — the bytes `da_build`
+    /// receives) deserialize back to their constructors, and re-serialize byte-identically. These
+    /// are the frozen 160M config-schema seam (Merge 2); regenerate via the documented step in
+    /// `swarm-ledger-m1.md` if the schema changes.
+    #[test]
+    fn preset_cbor_fixtures_parse() {
+        let cases: [(&[u8], TinyLlamaCfg); 2] = [
+            (
+                include_bytes!("../presets/tiny-llama.cbor"),
+                TinyLlamaCfg::default(),
+            ),
+            (
+                include_bytes!("../presets/llama-160m.cbor"),
+                TinyLlamaCfg::llama_160m(),
+            ),
+        ];
+        for (bytes, expected) in cases {
+            let parsed: TinyLlamaCfg = ciborium::from_reader(bytes).expect("preset cbor parses");
+            let mut re = Vec::new();
+            ciborium::into_writer(&parsed, &mut re).unwrap();
+            assert_eq!(re.as_slice(), bytes, "committed preset cbor is canonical");
+            let mut want = Vec::new();
+            ciborium::into_writer(&expected, &mut want).unwrap();
+            assert_eq!(re, want, "preset cbor matches its constructor");
+        }
+    }
+
     /// The exact 160M-preset parameter count (reported in `swarm-ledger-m1.md`): tok 38,597,376 +
     /// 12·9,438,720 + 768 (final norm) = 151,862,784 (≈152M — within bounds of the "160M" spec row).
     const LLAMA_160M_PARAMS: u64 = 151_862_784;
