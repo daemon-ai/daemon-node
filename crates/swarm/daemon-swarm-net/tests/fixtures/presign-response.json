@@ -1,0 +1,7 @@
+{
+  "url": "https://daemon-api-swarm-payloads.r2.cloudflarestorage.com/runs/run-x/rounds/7/aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899.upd?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=900&X-Amz-Signature=EXAMPLE",
+  "expires_at": 1893456000,
+  "headers": {
+    "content-type": "application/octet-stream"
+  }
+}

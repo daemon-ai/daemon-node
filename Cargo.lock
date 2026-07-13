@@ -4487,14 +4487,17 @@ dependencies = [
  "async-trait",
  "ciborium",
  "daemon-core",
+ "daemon-egress",
  "daemon-swarm-proto",
  "iroh",
  "iroh-gossip",
  "iroh-relay",
  "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]

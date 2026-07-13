@@ -1,0 +1,6 @@
+{
+  "kind": "payload",
+  "op": "get",
+  "round": 7,
+  "peer": "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+}
