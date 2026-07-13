@@ -4931,6 +4931,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-train-safetensors"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "daemon-train-sdk",
+ "safetensors 0.4.5",
+]
+
+[[package]]
 name = "daemon-train-sdk"
 version = "0.0.1"
 dependencies = [
