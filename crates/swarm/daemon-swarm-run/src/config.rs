@@ -53,6 +53,46 @@ impl Default for SwarmPolicyConfig {
     }
 }
 
+/// The `swarm:*` credential a registry request carries (`[swarm.registry].auth`, §11.1). Mirrors
+/// `daemon_swarm_net::ws_client::WsAuth` / `RegistryClient`'s auth modes — never hardcoded.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryAuthConfig {
+    /// No auth headers (a bare dev target).
+    #[default]
+    None,
+    /// `Authorization: Bearer <token>` (the gateway `swarm:*` API-key path).
+    Bearer {
+        /// The bearer token.
+        token: String,
+    },
+    /// The internal identity headers (the direct-to-`apps/swarm` dev path).
+    Internal {
+        /// `x-daemon-org-id`.
+        org_id: String,
+        /// `x-daemon-actor`.
+        actor: String,
+    },
+}
+
+/// The coordinator-registry discovery surface (`[swarm.registry]`; A3 — the A1-noted boot follow-on).
+///
+/// When `base` is non-empty, `bins/daemon` constructs a `RegistryClient`-backed `EgressRunDiscovery`
+/// at boot, so `swarm_join` discovers the run, fetches + blake3-verifies the frozen envelope, and
+/// runs the worker's real §6.5 `AssessRun` before `JoinRun`. Empty (the default) keeps
+/// `discovery: None` — the W1 probe-based fallback against the allowlist. **Deploy-swappable by
+/// config only**: the same node targets wrangler-dev (`http://127.0.0.1:8795/api/v1/swarm`) or the
+/// real workers.dev deployment (e.g. `https://daemon-swarm-dev.<acct>.workers.dev/api/v1/swarm`)
+/// without a code change.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RegistryConfig {
+    /// The registry base URL (`""` = no registry → no discovery seam).
+    pub base: String,
+    /// The `swarm:*` credential for registry + presign requests.
+    pub auth: RegistryAuthConfig,
+}
+
 /// The iroh transport knobs (`[swarm].iroh`, §7.1). Gossip is mandatory, so unreachable relays make
 /// the node swarm-ineligible (§6.5); this MVP surface carries only the relay selector.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +126,8 @@ pub struct SwarmConfig {
     pub module_trust: ModuleTrust,
     /// Allowlisted coordinator endpoints (discovery + join, §11.1).
     pub coordinator_allowlist: Vec<String>,
+    /// The coordinator-registry discovery surface (A3; additive — defaults to "no registry").
+    pub registry: RegistryConfig,
     /// iroh transport knobs.
     pub iroh: IrohConfig,
 }
@@ -100,6 +142,7 @@ impl Default for SwarmConfig {
             default_policy: SwarmPolicyConfig::default(),
             module_trust: ModuleTrust::Signed,
             coordinator_allowlist: vec!["https://api.daemon.ai/api/v1/swarm".to_string()],
+            registry: RegistryConfig::default(),
             iroh: IrohConfig::default(),
         }
     }
@@ -157,6 +200,57 @@ mod tests {
         assert_eq!(cfg.data_cache_gb, 50);
         assert_eq!(cfg.default_policy.vram_cap_mb, 0);
         assert_eq!(cfg.iroh.relays, "default");
+    }
+
+    #[test]
+    fn registry_section_extracts_additively() {
+        // The A3 `[swarm.registry]` table: base + auth extract; omitted → the "no registry" default
+        // (discovery stays None at boot). Both auth modes deserialize.
+        let toml = r#"
+            [swarm]
+            enabled = true
+
+            [swarm.registry]
+            base = "http://127.0.0.1:8795/api/v1/swarm"
+
+            [swarm.registry.auth.internal]
+            org_id = "org_live"
+            actor = "key:live"
+        "#;
+        let cfg: SwarmConfig = Figment::new()
+            .merge(Toml::string(toml))
+            .extract_inner("swarm")
+            .expect("extract [swarm]");
+        assert_eq!(cfg.registry.base, "http://127.0.0.1:8795/api/v1/swarm");
+        assert_eq!(
+            cfg.registry.auth,
+            RegistryAuthConfig::Internal {
+                org_id: "org_live".into(),
+                actor: "key:live".into()
+            }
+        );
+
+        // Default: no registry configured.
+        let cfg = SwarmConfig::default();
+        assert!(cfg.registry.base.is_empty());
+        assert_eq!(cfg.registry.auth, RegistryAuthConfig::None);
+
+        // Bearer mode also extracts.
+        let toml = r#"
+            base = "https://daemon-swarm-dev.example.workers.dev/api/v1/swarm"
+            [auth.bearer]
+            token = "sk-test"
+        "#;
+        let reg: RegistryConfig = Figment::new()
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("extract registry");
+        assert_eq!(
+            reg.auth,
+            RegistryAuthConfig::Bearer {
+                token: "sk-test".into()
+            }
+        );
     }
 
     #[test]

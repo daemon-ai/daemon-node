@@ -3029,20 +3029,57 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         n.emit_node_event(ev);
                     }
                 });
+                // A3: construct the `RegistryClient`-backed `EgressRunDiscovery` from the additive
+                // `[swarm.registry]` config (registry base + `swarm:*` creds) — the A1-noted boot
+                // follow-on. An empty base keeps `discovery: None` (the W1 probe fallback against
+                // the allowlist), so existing configs are unchanged. The base/auth are pure config:
+                // the same node targets wrangler-dev or a real workers.dev deployment by config only.
+                let discovery: Option<Arc<dyn daemon_swarm_node::RunDiscovery>> = if cfg
+                    .swarm
+                    .registry
+                    .base
+                    .is_empty()
+                {
+                    None
+                } else {
+                    match daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()) {
+                        Ok(egress) => {
+                            use daemon_swarm_run::config::RegistryAuthConfig;
+                            let mut registry = daemon_swarm_node::RegistryClient::new(
+                                egress,
+                                cfg.swarm.registry.base.clone(),
+                            );
+                            registry = match &cfg.swarm.registry.auth {
+                                RegistryAuthConfig::None => registry,
+                                RegistryAuthConfig::Bearer { token } => {
+                                    registry.with_bearer(token.clone())
+                                }
+                                RegistryAuthConfig::Internal { org_id, actor } => {
+                                    registry.with_internal(org_id.clone(), actor.clone())
+                                }
+                            };
+                            Some(Arc::new(daemon_swarm_node::EgressRunDiscovery::new(
+                                registry,
+                            )))
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "swarm: registry egress client failed; discovery not wired");
+                            None
+                        }
+                    }
+                };
                 let svc = Arc::new(daemon_swarm_node::SwarmService::new(
                     daemon_swarm_node::SwarmServiceParts {
                         config: cfg.swarm.clone(),
                         store,
                         worker,
                         feed: Some(feed),
-                        // A1: no run-discovery seam wired at boot yet (the join flow uses the W1
-                        // probe-based eligibility against the allowlisted coordinator). Wiring a
-                        // `RegistryClient`-backed `EgressRunDiscovery` here needs the coordinator
-                        // registry base + `swarm:*` credentials plumbed from config — a follow-on
-                        // (A3 / integration), tracked in the A1 ledger.
-                        discovery: None,
+                        discovery,
                     },
                 ));
+                // A3: bind the service's own Arc so joins pump the continuous worker event stream
+                // into swarm.db (§10.3/§10.4).
+                svc.bind_self();
                 if let Err(e) = svc.start().await {
                     tracing::error!(error = %e, "swarm: SwarmService::start failed");
                 }
