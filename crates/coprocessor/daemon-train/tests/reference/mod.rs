@@ -79,9 +79,17 @@ fn guest_remap_rustflags() -> String {
     )
 }
 
-/// Stale-guest guard (swarm-p1-ledger Merge-1 follow-on): assert every module in the committed
-/// `guests/guests.blake3` matches the `.wasm` in `dir`, so a stale/mismatched guest fails loud here
-/// instead of surfacing downstream as a NaN loss.
+/// Stale-guest guard (Merge-1 adjudication): compare every module named in the committed
+/// `guests/guests.blake3` against the `.wasm` in `dir`. A **missing / unreadable** module still
+/// fails loud — a genuinely absent or stale guest would otherwise surface downstream as a NaN loss,
+/// which is the failure this guard exists to prevent. A **hash mismatch**, by contrast, only WARNS:
+/// the guest `.wasm` is byte-reproducible run-to-run within one checkout but NOT across worktrees /
+/// machines. cargo derives each path-package's crate-disambiguator (`-C metadata`) from its absolute
+/// manifest dir, and `--remap-path-prefix` does not rewrite that hash, so symbol-hash-ordered codegen
+/// reorders the module's code/type/func/elem sections between worktrees (the remapped path *strings*
+/// are identical; only the ordering shifts). The committed manifest is therefore an advisory record
+/// of one canonical (trunk) build, NOT a cross-machine identity gate — see the Merge-1 decision in
+/// `docs/specs/swarm-p2-ledger.md`. Callers rebuild before loading, so the module in use is fresh.
 fn verify_guest_manifest(dir: &Path) {
     let manifest = guests_root().join("guests.blake3");
     let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {
@@ -97,13 +105,15 @@ fn verify_guest_manifest(dir: &Path) {
         let bytes = std::fs::read(dir.join(name))
             .unwrap_or_else(|e| panic!("read guest module {}/{name}: {e}", dir.display()));
         let got = blake3::hash(&bytes).to_hex();
-        assert_eq!(
-            got.as_str(),
-            hex,
-            "stale/mismatched guest `{name}`: committed guests.blake3 has {hex} but the module in {} \
-             hashes {got}; run `cargo run -p xtask -- build-guests` and commit guests/guests.blake3",
-            dir.display()
-        );
+        if got.as_str() != hex {
+            eprintln!(
+                "warning: guest `{name}` in {} hashes {got} but committed guests.blake3 records \
+                 {hex}. This is expected across worktrees/machines (path-keyed codegen ordering, \
+                 not a stale artifact); the freshly-built module is used. If you changed guest \
+                 source, run `cargo run -p xtask -- build-guests` and commit guests/guests.blake3.",
+                dir.display()
+            );
+        }
     }
 }
 
