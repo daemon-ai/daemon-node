@@ -406,7 +406,7 @@ pub fn coordinator_key() -> SigningKey {
 pub const EXPERIMENT_CONFIG: &[u8] = b"e2e-experiment-config";
 
 /// Build the coordinator's resolved [`RunConfig`] for an in-process run of `cfg`.
-fn build_run_config(run: &RunId, cfg: &SwarmConfig) -> RunConfig {
+pub(crate) fn build_run_config(run: &RunId, cfg: &SwarmConfig) -> RunConfig {
     // Global batch = max-roster × steps × micro-batch, so the per-peer (class-equal) partition is
     // non-empty for every roster size the run will see (bootstrap and post-late-join).
     let g =
@@ -449,7 +449,7 @@ fn build_run_config(run: &RunId, cfg: &SwarmConfig) -> RunConfig {
 }
 
 /// Build a peer's payload store, wrapping the shared FS store with any injected fault for peer `i`.
-fn peer_store(
+pub(crate) fn peer_store(
     fs: &Arc<FsPayloadStore>,
     run: &RunId,
     peer_ids: &[PeerId],
