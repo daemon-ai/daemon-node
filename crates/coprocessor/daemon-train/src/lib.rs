@@ -15,7 +15,11 @@
 //! the lifecycle driver against a subset of the `tabi@1` vocabulary. The worker protocol
 //! (CBOR-over-stdio, §10.2) is Wave 3.
 
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) so the two cfg-gated platform-probe FFI modules in `autotune` can carry a
+// scoped `#[allow(unsafe_code)]` (DXGI/D3D12 on Windows; the Objective-C runtime + `sysctlbyname` on
+// macOS). Every other line of the crate still errors on stray `unsafe`; the worker bin keeps its
+// own `#![forbid(unsafe_code)]` and only calls the safe probe wrappers. See swarm-ledger-p2-c2 D1.
+#![deny(unsafe_code)]
 
 pub mod autotune;
 pub mod backend;

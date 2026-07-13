@@ -4955,6 +4955,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "wasmtime",
+ "windows 0.62.2",
  "xxhash-rust",
 ]
 

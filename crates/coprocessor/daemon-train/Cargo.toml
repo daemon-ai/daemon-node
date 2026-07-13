@@ -20,6 +20,14 @@ path = "src/bin/daemon-train.rs"
 name = "daemon-train-worker"
 path = "src/bin/daemon-train-worker/main.rs"
 
+# A minimal, telemetry-free device-limits readout (C2 fleet validation). Cross-builds + LINKS under
+# MinGW (unlike the full worker, whose always-on `sentry-rust-minidump` path pulls an unresolved
+# UCRT symbol on windows-gnu — see swarm-ledger-p2-c2). Runs the same `daemon_train::autotune` probe
+# the worker's `Probe` path uses, so the reported DeviceLimits are identical to a live `Probe`.
+[[bin]]
+name = "daemon-train-probe"
+path = "src/bin/daemon-train-probe.rs"
+
 [dependencies]
 daemon-swarm-proto = { workspace = true }
 # Host worker runtime: the wasm module sandbox (wasmtime) + the training engine (Burn, ndarray
@@ -54,6 +62,22 @@ tokio = { workspace = true }
 # the worker links heavy native engine trees, so a segfault is a real failure mode). Bin target
 # only; a runtime no-op unless the spawning node injected a DSN + `DAEMON_CRASH_CONSENT=1`.
 daemon-telemetry = { workspace = true }
+
+# Windows GPU-memory probe (swarm-windows-vram-design.md §2): DXGI `GetDesc3`/`QueryVideoMemoryInfo`
+# + D3D12 `CheckFeatureSupport(ARCHITECTURE1)` + `GlobalMemoryStatusEx`. Target-gated so it never
+# enters the Linux/macOS build; consumes the Wave-0 reserved root `windows = "0.62"` workspace entry
+# (a lane-owned target/feature edit — no root Cargo.toml change). Feature modules per design §4
+# (Threading omitted — the §3 budget-change event is not wired at probe time). Compiles for
+# `x86_64-pc-windows-gnu` (MinGW) as well as msvc.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_System_SystemInformation",
+] }
 
 # Per-backend lane selection (spec §10.1). These features only toggle burn's *dependency* backend
 # features — no code path changes this wave (Wave-0 scaffold): the `OpBackend` seam is still the
