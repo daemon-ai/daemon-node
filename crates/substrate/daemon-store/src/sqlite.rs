@@ -2764,7 +2764,7 @@ mod tests {
     /// `credential_labels` account-management tables, the wire-v37 `saved_presences` +
     /// `saved_presence_active` tables, the `custom_providers` table, the wire-v38
     /// `transport_prefs.settings` account-settings column, and the rung-3 (api/39)
-    /// `command_dedup` op-id idempotency table).
+    /// `command_dedup` op-id idempotency table, and the wire-v41 `crash_consent` toggle).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2775,7 +2775,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 17, "fresh DB is stamped to the latest migration");
     }
 
     /// `custom_provider_set`/`list`/`remove` round-trip identically on both the SQLite and in-memory
