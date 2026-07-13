@@ -59,6 +59,7 @@ fn hardware() -> SwarmHardwareReport {
     SwarmHardwareReport {
         gpus: 1,
         vram_mb: 24_000,
+        shared_mb: 120_000,
         ram_mb: 64_000,
         backend_lanes: vec!["cpu".into(), "vulkan".into()],
         capabilities: SwarmCapabilities {

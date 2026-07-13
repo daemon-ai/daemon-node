@@ -2412,18 +2412,18 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v41 (the additive crash-consent
-    /// surface — `CrashConsentGet`/`CrashConsentSet` + `CrashConsent` + `crash-consent-*` CDDL — on
-    /// top of v40's additive `SwarmApi` surface and v39's rungs 1+2+3, spec 09 §10.4). Distinct from
-    /// the transport-envelope [`WIRE_VERSION`] above (= 2), which the mirror rungs did not touch.
-    /// Bumping the contract version is a deliberate act — this assertion is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v42 (the additive
+    /// `SwarmHardwareReport.shared_mb` UMA-spillover mirror, Swarm P2 A1 — on top of v41's
+    /// crash-consent surface, v40's `SwarmApi` surface, and v39's rungs 1+2+3, spec 09 §10.4).
+    /// Distinct from the transport-envelope [`WIRE_VERSION`] above (= 2), which the mirror rungs did
+    /// not touch. Bumping the contract version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v41() {
+    fn contract_wire_version_is_v42() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(41)
+            daemon_common::WireVersion(42)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(41));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(42));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

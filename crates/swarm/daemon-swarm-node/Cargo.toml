@@ -13,6 +13,11 @@ description = "The node-side swarm-training service: durable swarm.db state, wor
 daemon-api = { workspace = true }
 # The frozen worker protocol (Event/Command/Hardware/Eligibility) + the `[swarm]` config type.
 daemon-swarm-run = { workspace = true }
+# Run discovery + frozen-envelope fetch (A1): the `RegistryClient` (registry `GET /runs`,
+# envelope presign+GET+blake3-verify) the `EgressRunDiscovery` seam wraps, so the join flow runs the
+# worker's real §6.5 `AssessRun` before `JoinRun`. Default (no-iroh, no-ws) build — discovery rides
+# `daemon_egress::EgressClient`; the WS control plane / iroh features stay off here.
+daemon-swarm-net = { workspace = true }
 # The training-worker supervisor this service owns (lane B3's crate; consumed read-only). The
 # `WorkerControl` seam wraps it so the service is testable without a live worker subprocess.
 daemon-train-client = { workspace = true }

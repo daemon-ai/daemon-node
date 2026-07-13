@@ -3035,6 +3035,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         store,
                         worker,
                         feed: Some(feed),
+                        // A1: no run-discovery seam wired at boot yet (the join flow uses the W1
+                        // probe-based eligibility against the allowlisted coordinator). Wiring a
+                        // `RegistryClient`-backed `EgressRunDiscovery` here needs the coordinator
+                        // registry base + `swarm:*` credentials plumbed from config — a follow-on
+                        // (A3 / integration), tracked in the A1 ledger.
+                        discovery: None,
                     },
                 ));
                 if let Err(e) = svc.start().await {

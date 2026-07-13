@@ -109,6 +109,13 @@ pub struct SwarmHardwareReport {
     pub gpus: u32,
     /// Total VRAM in MiB (across GPUs).
     pub vram_mb: u64,
+    /// Shared / unified spillover memory in MiB (GTT on an integrated/UMA GPU): the host DRAM the
+    /// GPU can page tensors into beyond [`Self::vram_mb`]; `0` on a classic discrete GPU. The
+    /// effective device budget is `vram_mb + 90%·shared_mb` (§10.5). **Additive (wire v42):**
+    /// `#[serde(default)]` keeps a pre-v42 report decodable (fills `0`) and mirrors the worker
+    /// `Hardware.shared_mb` the node already probes (P1 Merge-2 follow-on).
+    #[serde(default)]
+    pub shared_mb: u64,
     /// Installed host RAM in MiB.
     pub ram_mb: u64,
     /// The backend lanes the worker was built with (`cpu`, `cuda`, `rocm`, `vulkan`).
