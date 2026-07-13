@@ -67,7 +67,7 @@ daemon-swarm-run = { workspace = true }
 # is a direct path dep (not `{ workspace = true }`) to avoid a FROZEN root `Cargo.toml` edit — the
 # integration owner should promote it to `[workspace.dependencies]` at Merge 3. Neither pulls
 # burn/wasmtime/iroh onto the default gate (swarm-ledger-w1.md cargo-tree; re-verified at B3).
-daemon-swarm-node = { path = "../../crates/swarm/daemon-swarm-node" }
+daemon-swarm-node = { version = "0", path = "../../crates/swarm/daemon-swarm-node" }
 daemon-train-client = { workspace = true }
 # The `vision_analyze` tool; opt-in at runtime via `[vision].provider`.
 daemon-tool-vision = { workspace = true }
