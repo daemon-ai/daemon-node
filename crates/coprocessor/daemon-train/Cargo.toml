@@ -14,9 +14,11 @@ path = "src/bin/daemon-train.rs"
 
 # The Wave-3 training worker: speaks the frozen `daemon_swarm_run::protocol` over the length-framed
 # stdio cut and drives `WasmBackend` (spec §10.2). The node process never links this binary's engine.
+# Split into `main` (dispatch) + `backend` (probe/assess, G2) + `transport` (JoinRun round loop, B3)
+# modules so the Wave-3 A/B lanes do not collide on one file (swarm-p1-ledger.md).
 [[bin]]
 name = "daemon-train-worker"
-path = "src/bin/daemon-train-worker.rs"
+path = "src/bin/daemon-train-worker/main.rs"
 
 [dependencies]
 daemon-swarm-proto = { workspace = true }
