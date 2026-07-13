@@ -45,6 +45,13 @@ use std::collections::BTreeMap;
 pub mod op_context;
 pub use op_context::{current_op_id, with_op_id};
 
+pub mod swarm;
+pub use swarm::{
+    SwarmApi, SwarmCapabilities, SwarmContribution, SwarmEligibility, SwarmEvent, SwarmEventStream,
+    SwarmHardwareReport, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode, SwarmRunDetail,
+    SwarmRunSummary,
+};
+
 pub mod profile;
 pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
@@ -2245,9 +2252,16 @@ pub trait AccessControlApi: Send + Sync {
 }
 
 /// The whole node surface: the session, control, model-management, profile/config, credential,
-/// interactive-auth, and access-control sub-surfaces.
+/// interactive-auth, access-control, and swarm-training sub-surfaces.
 pub trait NodeApi:
-    SessionApi + ControlApi + ModelApi + ProfileApi + CredentialApi + AuthApi + AccessControlApi
+    SessionApi
+    + ControlApi
+    + ModelApi
+    + ProfileApi
+    + CredentialApi
+    + AuthApi
+    + AccessControlApi
+    + SwarmApi
 {
 }
 impl<
@@ -2257,7 +2271,8 @@ impl<
             + ProfileApi
             + CredentialApi
             + AuthApi
-            + AccessControlApi,
+            + AccessControlApi
+            + SwarmApi,
     > NodeApi for T
 {
 }
@@ -4695,6 +4710,19 @@ pub enum NodeEvent {
         /// inbound messages / token-incapable adapters.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_op: Option<String>,
+    },
+    /// A swarm run changed (spec §10.4): its phase/round/contribution advanced, a run was
+    /// discovered/joined/left, or an event was appended to its windowed log. A payload-free
+    /// invalidation pointer (ADR-003) — the client refetches [`SwarmRunDetail`] (whose
+    /// `recent_events` carries the windowed [`SwarmEvent`]s, §10.3). This is how a live
+    /// `swarm_subscribe` rides the **existing** `events_subscribe` feed (no new transport). A `None`
+    /// `run_id` is a roster-level change (a run appeared/vanished); the client refetches the list.
+    SwarmChanged {
+        /// The affected run, or `None` for a roster-level change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        /// The coalescing swarm-feed revision (compared to skip an unchanged refetch).
+        rev: u64,
     },
 }
 

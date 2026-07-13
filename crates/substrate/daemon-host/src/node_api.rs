@@ -561,6 +561,12 @@ pub struct NodeApiImpl {
     /// [`NodeEvent::PersonsChanged`](daemon_api::NodeEvent) via
     /// [`emit_persons_changed`](Self::emit_persons_changed) so clients re-list.
     persons: Arc<std::sync::Mutex<crate::person::PersonManager>>,
+    /// The swarm-training service backing the [`daemon_api::SwarmApi`] sub-surface (spec §10.4).
+    /// `None` on a node built without swarm training (`[swarm] enabled = false`, the default): every
+    /// `SwarmApi` call then resolves to [`ApiError::Unsupported`] / an empty stream. Bound at
+    /// assembly via [`with_swarm`](Self::with_swarm) only when the service is enabled — the node
+    /// never spawns a training worker unless a swarm service is present.
+    swarm: Option<Arc<dyn daemon_api::SwarmApi>>,
 }
 
 impl NodeApiImpl {
@@ -726,6 +732,7 @@ mod provisioning;
 mod roster;
 mod routing;
 mod session;
+mod swarm;
 
 mod internals;
 

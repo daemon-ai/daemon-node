@@ -610,6 +610,7 @@ node-event = node-event-session-advanced
            / node-event-notifications-changed
            / node-event-persons-changed
            / node-event-messages-changed
+           / node-event-swarm-changed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 ; rung 3 (api/39): + `? "origin_op"` (carrier 3) — the causing op when the emit site knows it
 ; (a SessionUpdateMeta that carried one); null otherwise.
@@ -645,6 +646,9 @@ node-event-persons-changed      = { "PersonsChanged":     { "rev": uint64 } }
 ; rung 3 (api/39): + `? "origin_op"` (carrier 3) — the client send op stamped at the
 ; `LifecycleSink::chat_message` choke point (the same token as the journal record's `origin_op`).
 node-event-messages-changed     = { "MessagesChanged":    { "transport": transport-id, "conv": tstr, ? "origin_op": (origin-op / null) } }
+; swarm-training run pointer (spec §10.4): payload-free invalidation — the client refetches
+; SwarmRunDetail. `run_id` absent => a roster-level change (a run appeared/vanished).
+node-event-swarm-changed        = { "SwarmChanged":       { ? "run_id": tstr, "rev": uint64 } }
 events-page = {
   "events": [0*64 node-event],
   "next_cursor": uint64,                ; pass as the next EventsSince cursor
@@ -1045,6 +1049,32 @@ provider-kind-wire = "local" / "cloud" / "daemon_cloud"
 ; provider-sign-in (wire v30, CON-15): the node advertises interactive sign-in via an auth family.
 provider-sign-in = { "family": tstr, "label": tstr }
 provider-descriptor = { "id": tstr, "display_name": tstr, "kind": provider-kind-wire, "wire_selector": provider-selector, "requires_key": bool, "supports_model_discovery": bool, "default_base_url": (tstr / null), ? "sign_in": (provider-sign-in / null) }
+
+; ----- swarm training surface DTOs (swarm-training-spec.md §10.4) -----
+; The node is the single authority for swarm participation; the app is a thin mirror (ADR-003):
+; every run row carries the NODE-COMPUTED `eligibility` (§6.5), which the app renders and never
+; re-derives. Numeric telemetry is fixed-point integer (no floats on the wire).
+swarm-policy-mode = "always" / "idle" / "scheduled" / "manual"
+swarm-policy = { "mode": swarm-policy-mode, "vram_cap_mb": uint, "duty_cycle_pct": uint, ? "schedule": tstr }
+swarm-eligibility = { "eligible": bool, "reasons": [* tstr], "headroom": { * tstr => int } }
+swarm-capabilities = { "abi_version": uint, "ops": [* tstr], "payload_stores": [* tstr] }
+swarm-hardware-report = { "gpus": uint, "vram_mb": uint64, "ram_mb": uint64, "backend_lanes": [* tstr], "capabilities": swarm-capabilities, "up_kbps": uint64, "down_kbps": uint64, "disk_free_mb": uint64, "throughput_class": tstr }
+swarm-contribution = { "rounds": uint64, "tokens": uint64, "bytes_up": uint64, "bytes_down": uint64, "witness_count": uint64, "checkpoint_credits": uint64 }
+swarm-run-summary = { "run_id": tstr, "phase": tstr, "joined": bool, "eligibility": swarm-eligibility, ? "policy": swarm-policy, "last_round": uint64 }
+swarm-run-detail = { "summary": swarm-run-summary, "coordinator": tstr, "contribution": swarm-contribution, "recent_events": [* swarm-event] }
+swarm-leave-mode = "graceful" / "immediate"
+swarm-event-phase = { "Phase": { "run_id": tstr, "phase": tstr, "epoch": uint64, "round": uint64 } }
+swarm-event-progress = { "Progress": { "run_id": tstr, "inner_step": uint, "loss_micros": uint64, "tokens_per_s_milli": uint64, "peers": uint } }
+swarm-event-round-outcome = { "RoundOutcome": { "run_id": tstr, "round": uint64, "committed": uint, "ingested": uint, "stalled": bool } }
+swarm-event-contribution = { "Contribution": { "run_id": tstr, "contribution": swarm-contribution } }
+swarm-event-warning = { "Warning": { "run_id": tstr, "class": tstr, "detail": tstr } }
+swarm-event-error = { "Error": { "run_id": tstr, "class": tstr, "detail": tstr } }
+swarm-event = swarm-event-phase
+            / swarm-event-progress
+            / swarm-event-round-outcome
+            / swarm-event-contribution
+            / swarm-event-warning
+            / swarm-event-error
 ; custom-provider (write model): a user-named, persisted OpenAI-compatible provider generalizing
 ; Daemon Cloud. Projected by the node into a provider-descriptor for the catalog read.
 ; `-t` suffix: the enum rule name would otherwise collide with the `custom-provider`.`source` map
@@ -1397,6 +1427,12 @@ model-quantize-args = { "repo": tstr, "revision": (tstr / null), "target_quant":
 request-model-quantize = { "ModelQuantize": model-quantize-args }
 request-model-quantizes = "ModelQuantizes"
 request-model-inspect = { "ModelInspect": { "id": model-id } }
+request-swarm-run-list = "SwarmRunList"
+request-swarm-run-detail = { "SwarmRunDetail": { "run_id": tstr } }
+request-swarm-join = { "SwarmJoin": { "run_id": tstr, "policy": swarm-policy, "op_id": tstr } }
+request-swarm-leave = { "SwarmLeave": { "run_id": tstr, "mode": swarm-leave-mode, "op_id": tstr } }
+request-swarm-set-policy = { "SwarmSetPolicy": { "policy": swarm-policy } }
+request-swarm-hardware-report = "SwarmHardwareReport"
 request-models = { "Models": { ? "after": (tstr / null) } }
 request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
 request-provider-catalog = "ProviderCatalog"
@@ -1680,6 +1716,12 @@ api-request = request-submit
             / request-model-quantize
             / request-model-quantizes
             / request-model-inspect
+            / request-swarm-run-list
+            / request-swarm-run-detail
+            / request-swarm-join
+            / request-swarm-leave
+            / request-swarm-set-policy
+            / request-swarm-hardware-report
             / request-models
             / request-model-current
             / request-provider-catalog
@@ -1855,6 +1897,9 @@ response-model-recommend = { "ModelRecommend": quant-recommendation }
 response-model-quantize-started = { "ModelQuantizeStarted": quantize-id }
 response-model-quantizes = { "ModelQuantizes": [* quantize-status] }
 response-model-inspect = { "ModelInspect": gguf-info }
+response-swarm-runs = { "SwarmRuns": [* swarm-run-summary] }
+response-swarm-run-detail = { "SwarmRunDetail": (swarm-run-detail / null) }
+response-swarm-hardware-report = { "SwarmHardwareReport": swarm-hardware-report }
 response-profiles = { "Profiles": [* profile-info] }
 response-profile = { "Profile": (profile-spec / null) }   ; ProfileGet returns null on a missing id
 response-soul-text = { "SoulText": tstr }                 ; SoulGet returns the persona (SOUL.md) text
@@ -1984,6 +2029,9 @@ api-response = response-ok
              / response-model-quantize-started
              / response-model-quantizes
              / response-model-inspect
+             / response-swarm-runs
+             / response-swarm-run-detail
+             / response-swarm-hardware-report
              / response-profiles
              / response-profile
              / response-soul-text

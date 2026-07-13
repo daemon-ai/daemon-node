@@ -99,7 +99,17 @@ impl NodeApiImpl {
                 crate::notifications::NotificationManager::new(),
             )),
             persons: Arc::new(std::sync::Mutex::new(crate::person::PersonManager::new())),
+            swarm: None,
         }
+    }
+
+    /// Bind the swarm-training service backing the [`daemon_api::SwarmApi`] sub-surface (spec §10.4).
+    /// Call at assembly ONLY when `[swarm] enabled = true` — the node never spawns a training worker
+    /// unless a service is present. Absent, every `SwarmApi` op resolves to [`ApiError::Unsupported`]
+    /// / an empty stream.
+    pub fn with_swarm(mut self, swarm: Arc<dyn daemon_api::SwarmApi>) -> Self {
+        self.swarm = Some(swarm);
+        self
     }
 
     /// Register a node-managed backend resource ([`ManagedResource`](crate::managed::ManagedResource))

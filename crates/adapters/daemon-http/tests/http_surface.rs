@@ -123,6 +123,7 @@ impl daemon_api::ProfileApi for MockApi {}
 impl daemon_api::CredentialApi for MockApi {}
 impl daemon_api::AuthApi for MockApi {}
 impl daemon_api::AccessControlApi for MockApi {}
+impl daemon_api::SwarmApi for MockApi {}
 
 async fn spawn_server() -> String {
     let api: Arc<dyn NodeApi> = Arc::new(MockApi);

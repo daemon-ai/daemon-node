@@ -333,6 +333,35 @@ async fn serve_models(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
     })
 }
 
+/// Swarm training: run discovery/detail, join/leave, policy, hardware report (spec §10.4). The live
+/// `swarm_subscribe` stream is NOT dispatched here — it rides the existing `events_subscribe` feed as
+/// `NodeEvent::SwarmChanged` pointers (no new streaming wire request).
+async fn serve_swarm(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
+    Some(match req {
+        ApiRequest::SwarmRunList => ok_or_err(api.swarm_run_list().await, ApiResponse::SwarmRuns),
+        ApiRequest::SwarmRunDetail { run_id } => ok_or_err(
+            api.swarm_run_detail(run_id).await,
+            ApiResponse::SwarmRunDetail,
+        ),
+        ApiRequest::SwarmJoin {
+            run_id,
+            policy,
+            op_id,
+        } => unit_or_err(api.swarm_join(run_id, policy, op_id).await),
+        ApiRequest::SwarmLeave {
+            run_id,
+            mode,
+            op_id,
+        } => unit_or_err(api.swarm_leave(run_id, mode, op_id).await),
+        ApiRequest::SwarmSetPolicy { policy } => unit_or_err(api.swarm_set_policy(policy).await),
+        ApiRequest::SwarmHardwareReport => ok_or_err(
+            api.swarm_hardware_report().await,
+            ApiResponse::SwarmHardwareReport,
+        ),
+        _ => return None,
+    })
+}
+
 /// Profiles + skills (versioned): CRUD, history/at/revert, distribution import/export.
 async fn serve_profile(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
     Some(match req {
@@ -778,6 +807,9 @@ async fn dispatch_inner(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         return resp;
     }
     if let Some(resp) = serve_models(api, req.clone()).await {
+        return resp;
+    }
+    if let Some(resp) = serve_swarm(api, req.clone()).await {
         return resp;
     }
     if let Some(resp) = serve_profile(api, req.clone()).await {
