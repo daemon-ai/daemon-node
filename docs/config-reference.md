@@ -244,6 +244,16 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `socket_path` | `DAEMON_SOCKET_PATH` | string | `$TMPDIR/daemon-api.sock` |
 | `store` | `DAEMON_STORE` | string | `memory` |
 | `store_path` | `DAEMON_STORE_PATH` | optional | _(unset)_ |
+| `swarm.coordinator_allowlist` | `DAEMON_SWARM__COORDINATOR_ALLOWLIST` | array | `[]` |
+| `swarm.data_cache_gb` | `DAEMON_SWARM__DATA_CACHE_GB` | number | `50` |
+| `swarm.default_policy.duty_cycle_pct` | `DAEMON_SWARM__DEFAULT_POLICY__DUTY_CYCLE_PCT` | number | `100` |
+| `swarm.default_policy.mode` | `DAEMON_SWARM__DEFAULT_POLICY__MODE` | string | `idle` |
+| `swarm.default_policy.schedule` | `DAEMON_SWARM__DEFAULT_POLICY__SCHEDULE` | optional | _(unset)_ |
+| `swarm.default_policy.vram_cap_mb` | `DAEMON_SWARM__DEFAULT_POLICY__VRAM_CAP_MB` | number | `0` |
+| `swarm.enabled` | `DAEMON_SWARM__ENABLED` | bool | `false` |
+| `swarm.iroh.relays` | `DAEMON_SWARM__IROH__RELAYS` | string | `default` |
+| `swarm.module_trust` | `DAEMON_SWARM__MODULE_TRUST` | string | `signed` |
+| `swarm.worker_path` | `DAEMON_SWARM__WORKER_PATH` | string | `daemon-train` |
 | `telegram.api_hash` | `DAEMON_TELEGRAM__API_HASH` | string | `""` |
 | `telegram.api_id` | `DAEMON_TELEGRAM__API_ID` | number | `0` |
 | `telegram.enabled` | `DAEMON_TELEGRAM__ENABLED` | bool | `false` |
