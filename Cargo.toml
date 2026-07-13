@@ -385,6 +385,11 @@ daemon-swarm-net = { version = "0", path = "crates/swarm/daemon-swarm-net" }
 daemon-swarm-run = { version = "0", path = "crates/swarm/daemon-swarm-run" }
 daemon-swarm-coordinator = { version = "0", path = "crates/swarm/daemon-swarm-coordinator" }
 daemon-swarm-observe = { version = "0", path = "crates/swarm/daemon-swarm-observe" }
+# The node-side swarm-training service (resident `SwarmService` + worker supervisor), bound at boot
+# when `[swarm] enabled = true` (B3, spec §10.4). Promoted to the workspace table at Merge 3 (matches
+# the daemon-train-safetensors precedent from Merge 2) so `bins/daemon` consumes it via
+# `{ workspace = true }`. Default-gate-clean: no burn/wasmtime/iroh (verified by the Merge-3 dep check).
+daemon-swarm-node = { version = "0", path = "crates/swarm/daemon-swarm-node" }
 daemon-train = { version = "0", path = "crates/coprocessor/daemon-train" }
 daemon-train-client = { version = "0", path = "crates/coprocessor/daemon-train-client" }
 daemon-train-safetensors = { version = "0", path = "crates/coprocessor/daemon-train-safetensors" }
