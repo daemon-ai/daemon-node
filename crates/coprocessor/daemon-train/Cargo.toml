@@ -96,6 +96,15 @@ cpu = []
 burn-ndarray = ["burn/ndarray"]
 # burn with the wgpu backend (cubecl + wgpu 29; targets Vulkan/RADV) — the G2 GPU lane. Opt-in only.
 wgpu = ["burn/wgpu"]
+# burn with the CUDA backend (cubecl-cuda + cudarc; driver-API + NVRTC JIT at runtime) — the C2/P2
+# RunPod-4090 lane. Opt-in only, and a LANE-OWNED edit by the ledger rule: burn-cuda/cubecl-cuda/
+# cudarc are ALREADY resolved in the committed Cargo.lock (verified byte-unchanged when this feature
+# was first enabled on the RunPod box), so no new third-party dep enters the tree — the feature only
+# compiles crates the lock already pins. Runtime needs the host NVIDIA driver (libcuda, loads clean
+# under nix glibc — cuInit verified on the 4090 container) + libnvrtc (absent from the RunPod
+# container; provided by the `.#cuda` devshell — see swarm-ledger-p2-c2). No `BackendKind::Cuda` arm
+# yet: wiring the engine backend is the Wave-3/G-lane follow-on; this lane pins the dep story.
+cuda = ["burn/cuda"]
 
 [dev-dependencies]
 # Test-only: the frozen-surface sync check (`tests/abi_surface.rs`) reads the guest SDK's

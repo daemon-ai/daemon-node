@@ -40,4 +40,17 @@ fn main() {
              run the real `daemon-train-worker` with DAEMON_TRAIN_PROBE=1 for the sysfs path."
         );
     }
+
+    // CUDA lane runtime smoke (feature `cuda`, C2 RunPod adjudication evidence): bring up the real
+    // burn-cuda backend (host libcuda via cudarc dynamic loading) and run one tensor op, which
+    // exercises the NVRTC JIT path end-to-end. Failure panics loudly — this bin is validation-only.
+    #[cfg(feature = "cuda")]
+    {
+        use burn::backend::cuda::{Cuda, CudaDevice};
+        use burn::tensor::Tensor;
+        let device = CudaDevice::new(0);
+        let t = Tensor::<Cuda<f32, i32>, 1>::from_floats([1.0, 2.0, 3.0], &device);
+        let sum = (t.clone() + t).sum().into_scalar();
+        println!("cuda lane: device 0 up, (t + t).sum() = {sum} (expected 12)");
+    }
 }
