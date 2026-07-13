@@ -17,6 +17,16 @@ daemon-api = { workspace = true }
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }
 serde = { workspace = true }
+# `tokenize-corpus` (M1): the pre-tokenized TinyStories shard writer (spec §8). xtask is dev tooling
+# run by maintainers, not the shipped node, so its egress goes through `hf-hub` (revision-pinned; no
+# raw `reqwest::Client` in xtask code — the clippy `disallowed_types` ban is respected) and the
+# `tokenizers` crate does the BPE. Versions match the workspace lock (tokenizers 0.22, hf-hub 0.5).
+daemon-swarm-run = { workspace = true }
+tokio = { workspace = true }
+blake3 = { workspace = true }
+serde_json = { workspace = true }
+hf-hub = { workspace = true }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 [lints]
 workspace = true
