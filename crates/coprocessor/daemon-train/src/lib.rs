@@ -17,8 +17,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod autotune;
 pub mod backend;
-#[cfg(feature = "burn-ndarray")]
+// The burn autodiff engine backs both the G1 `burn-ndarray` (CPU) and the G2 `wgpu` (Vulkan) lanes;
+// the generic `BurnBackend<B>` impl needs only burn-tensor (always on), so the module compiles when
+// either backend feature is enabled, and each concrete alias is feature-gated inside.
+#[cfg(any(feature = "burn-ndarray", feature = "wgpu"))]
 pub mod burn_backend;
 pub mod handle;
 pub mod meta;
@@ -27,9 +31,14 @@ pub mod runtime;
 pub mod trap;
 pub mod wasm_backend;
 
+pub use autotune::{Autotune, AutotuneVerdict, DeviceLimits, ProbeStep};
 pub use backend::{AdamwHp, CpuBackend, OpBackend, TensorId};
+#[cfg(any(feature = "burn-ndarray", feature = "wgpu"))]
+pub use burn_backend::BurnBackend;
 #[cfg(feature = "burn-ndarray")]
-pub use burn_backend::{BurnBackend, BurnNdarrayBackend};
+pub use burn_backend::BurnNdarrayBackend;
+#[cfg(feature = "wgpu")]
+pub use burn_backend::{wgpu_adapter_available, BurnWgpuBackend};
 pub use handle::{HandleClass, Lane};
 pub use meta::MetaReport;
 pub use phase::Phase;

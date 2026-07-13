@@ -38,7 +38,10 @@
 //! tensor clone that keeps the graph edge). Trade: a 2× host copy, chosen for a clean `view` and
 //! numerical fidelity over speed this wave.
 
-#![cfg(feature = "burn-ndarray")]
+// Compiles for the G1 `burn-ndarray` (CPU) lane and the G2 `wgpu` (Vulkan/RADV) lane. The generic
+// impl below touches only burn-tensor (always on via the root dep); the concrete backend aliases
+// are feature-gated so a single-lane build pulls only its own backend tree.
+#![cfg(any(feature = "burn-ndarray", feature = "wgpu"))]
 
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{activation, Int, Tensor, TensorData};
@@ -47,7 +50,30 @@ use crate::backend::{AdamwHp, OpBackend, TensorId};
 use crate::trap::TrapCode;
 
 /// [`BurnBackend`] on the ndarray CPU backend + autodiff — the G1 native lane.
+#[cfg(feature = "burn-ndarray")]
 pub type BurnNdarrayBackend = BurnBackend<burn::backend::Autodiff<burn::backend::NdArray>>;
+
+/// [`BurnBackend`] on the wgpu backend + autodiff (Vulkan/RADV at runtime) — the G2 GPU lane.
+///
+/// The type parameter is the only change from [`BurnNdarrayBackend`]: `Autodiff<Wgpu>` instead of
+/// `Autodiff<NdArray>` (G1's seam promise). `burn::backend::Wgpu` is `Fusion<CubeBackend<…>>` and
+/// lazily brings up the wgpu runtime on first tensor op on its device.
+#[cfg(feature = "wgpu")]
+pub type BurnWgpuBackend = BurnBackend<burn::backend::Autodiff<burn::backend::Wgpu>>;
+
+/// Whether a usable wgpu adapter can be brought up on the default device (the **GPU-skip test
+/// convention**, TDD §8.1 tier-2). Returns `false` — never panics — when no adapter is available,
+/// so GPU-needing tests skip cleanly on GPU-less runners while the default CI gate stays green.
+///
+/// wgpu has no "is there a GPU?" query, so this delegates to the memoized
+/// [`crate::autotune::probe_wgpu`] (a `catch_unwind` around cubecl's default-device setup — cubecl
+/// panics when no adapter matches). The probe registers the default device's compute client
+/// exactly once; subsequent burn tensor ops reuse it.
+#[cfg(feature = "wgpu")]
+#[must_use]
+pub fn wgpu_adapter_available() -> bool {
+    crate::autotune::probe_wgpu().is_some()
+}
 
 /// One live tensor: the burn tensor + a cached host copy backing [`OpBackend::view`].
 struct Slot<B: AutodiffBackend> {

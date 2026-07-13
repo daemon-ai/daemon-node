@@ -41,6 +41,10 @@ pub enum BackendKind {
     /// The burn-ndarray autodiff engine (native lane = tolerance class; det lane = det-core fp32).
     #[cfg(feature = "burn-ndarray")]
     BurnNdarray,
+    /// The burn-wgpu autodiff engine (Vulkan/RADV; native lane = tolerance class, det lane =
+    /// det-core fp32, bit-identical to `Cpu`). Device chosen by [`EngineConfig::gpu_index`].
+    #[cfg(feature = "wgpu")]
+    Wgpu,
 }
 
 /// Fixed host-side settings that affect observable semantics (ABI §2.2/§8).
@@ -60,6 +64,10 @@ pub struct EngineConfig {
     pub op_budget: u64,
     /// Which [`OpBackend`] to instantiate (G1 seam). Defaults to [`BackendKind::Cpu`].
     pub backend: BackendKind,
+    /// GPU device selection for [`BackendKind::Wgpu`] (G2 seam). `None` = `WgpuDevice::DefaultDevice`
+    /// (the best available adapter, honoring `CUBECL_WGPU_DEFAULT_DEVICE`); `Some(i)` =
+    /// `WgpuDevice::DiscreteGpu(i)`. Ignored by the CPU / ndarray backends.
+    pub gpu_index: Option<u32>,
 }
 
 impl Default for EngineConfig {
@@ -72,6 +80,7 @@ impl Default for EngineConfig {
             max_step_handles: 1 << 20,
             op_budget: 1 << 22,
             backend: BackendKind::Cpu,
+            gpu_index: None,
         }
     }
 }
@@ -205,6 +214,17 @@ impl HostState {
             BackendKind::Cpu => Box::new(CpuBackend::new()),
             #[cfg(feature = "burn-ndarray")]
             BackendKind::BurnNdarray => Box::new(crate::burn_backend::BurnNdarrayBackend::new()),
+            #[cfg(feature = "wgpu")]
+            BackendKind::Wgpu => {
+                // The single G2 site: slot `BurnBackend<Autodiff<Wgpu>>` into the same seam. Device
+                // per `gpu_index` (None = best available). The wgpu runtime is brought up lazily on
+                // the first tensor op, so construction here is cheap.
+                let device = match cfg.gpu_index {
+                    Some(i) => burn::backend::wgpu::WgpuDevice::DiscreteGpu(i as usize),
+                    None => burn::backend::wgpu::WgpuDevice::default(),
+                };
+                Box::new(crate::burn_backend::BurnWgpuBackend::with_device(device))
+            }
         };
         Self {
             phase: None,

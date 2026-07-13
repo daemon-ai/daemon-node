@@ -12,10 +12,15 @@ use std::collections::BTreeSet;
 use daemon_swarm_net::{ArtifactRef, ArtifactResolver};
 use daemon_swarm_proto::{from_canonical_slice, SignedEnvelope};
 use daemon_swarm_run::protocol::{Eligibility, Hardware, WorkerCapabilities};
+use daemon_train::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
 use daemon_train::phase::PHASE_TABLE;
 use daemon_train::{EngineConfig, Worker};
 
 use crate::SEQ;
+
+/// A large sentinel (in MiB) used when a resource dimension is unknown, so the autotune verdict does
+/// not spuriously reject on an unprobed number (`u64::MAX / MiB`).
+const UNKNOWN_BUDGET_MB: u64 = u64::MAX / (1 << 20);
 
 /// The experiment inputs a run resolves to: the `[experiment.config]` CBOR + the module `.wasm`.
 pub(crate) struct ResolvedRun {
@@ -94,19 +99,90 @@ pub(crate) fn host_capabilities() -> WorkerCapabilities {
     }
 }
 
-/// A CPU-only host report (no GPU: this build carries no GPU backend lanes, §10.1). G2 fills in real
-/// GPU count / VRAM here (currently hardcoded zeros in the CPU worker).
+/// Host RAM in MiB from `/proc/meminfo` `MemTotal` (Linux, best effort). `0` if unavailable.
+fn host_ram_mb() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            // `MemTotal:   16384000 kB`
+            if let Some(kb) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                return kb / 1024;
+            }
+        }
+    }
+    0
+}
+
+/// The host hardware + capability report (§10.2). GPU count / VRAM come from a real wgpu adapter
+/// probe when the `wgpu` feature is on; a CPU-only build reports `gpus: 0` and the CPU lane.
+///
+/// **Honesty note (see `autotune` module docs):** wgpu has no total-VRAM query. `vram_mb` therefore
+/// carries the adapter's `max_buffer_size` (the largest single allocation) as a documented
+/// lower-bound proxy; the GPU-governor policy cap (§10.5) is the authoritative VRAM budget.
 pub(crate) fn hardware() -> Hardware {
+    let ram_mb = host_ram_mb();
+    #[cfg(feature = "wgpu")]
+    {
+        if let Some(p) = daemon_train::autotune::probe_wgpu() {
+            return Hardware {
+                gpus: p.gpus,
+                vram_mb: p.max_alloc_mb,
+                ram_mb,
+                backend_lanes: vec!["vulkan".to_string(), "cpu".to_string()],
+                capabilities: host_capabilities(),
+                up_kbps: 0,
+                down_kbps: 0,
+                disk_free_mb: 0,
+                throughput_class: "c1".to_string(),
+            };
+        }
+    }
     Hardware {
         gpus: 0,
         vram_mb: 0,
-        ram_mb: 0,
+        ram_mb,
         backend_lanes: vec!["cpu".to_string()],
         capabilities: host_capabilities(),
         up_kbps: 0,
         down_kbps: 0,
         disk_free_mb: 0,
         throughput_class: "c1".to_string(),
+    }
+}
+
+/// The device budget the autotune verdict is computed against. With the `wgpu` feature + a usable
+/// adapter, VRAM + the per-allocation ceiling come from the probe; otherwise the CPU lane runs in
+/// host RAM (no separate VRAM constraint), so VRAM is budgeted as host RAM. Unknown dimensions use a
+/// large sentinel so an unprobed number never rejects.
+fn device_limits() -> DeviceLimits {
+    let ram_mb = {
+        let r = host_ram_mb();
+        if r == 0 {
+            UNKNOWN_BUDGET_MB
+        } else {
+            r
+        }
+    };
+    #[cfg(feature = "wgpu")]
+    {
+        if let Some(p) = daemon_train::autotune::probe_wgpu() {
+            return DeviceLimits {
+                vram_mb: p.max_alloc_mb,
+                ram_mb,
+                max_alloc_mb: p.max_alloc_mb,
+            };
+        }
+    }
+    DeviceLimits {
+        vram_mb: ram_mb,
+        ram_mb,
+        max_alloc_mb: 0,
     }
 }
 
@@ -145,14 +221,31 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
         .meta(config, 1, SEQ)
         .map_err(|e| format!("meta: {e}"))?;
 
+    // G2 VRAM autotune (§5.1 planning, ABI §8): the meta-report footprint vs the probed device
+    // budget → eligibility + chosen micro-batch. The MetaReport byte footprints are
+    // backend-independent (shapes/dtypes), so the CPU meta pass is authoritative for the estimates;
+    // the verdict compares them against the real device numbers from `device_limits`.
+    let autotune = Autotune::from_meta(&report);
+    let verdict = autotune.verdict(&device_limits(), DEFAULT_MAX_MICROBATCH);
+
     let mib = 1i64 << 20;
+    let mut reasons = vec![format!(
+        "tabi@1 satisfied ({} imports); meta pass ok",
+        imports.len()
+    )];
+    reasons.extend(verdict.reasons.iter().cloned());
+
     Ok(Eligibility {
-        eligible: true,
-        reasons: vec![format!(
-            "tabi@1 satisfied ({} imports); meta pass ok",
-            imports.len()
-        )],
+        eligible: verdict.eligible,
+        reasons,
         headroom: vec![
+            ("micro_batch".to_string(), i64::from(verdict.micro_batch)),
+            ("vram_mb".to_string(), verdict.vram_mb_estimate as i64),
+            ("ram_mb".to_string(), verdict.ram_mb_estimate as i64),
+            (
+                "payload_bytes".to_string(),
+                verdict.payload_bytes_estimate as i64,
+            ),
             (
                 "host_ram_mb".to_string(),
                 (report.host_ram_bytes_est as i64) / mib,

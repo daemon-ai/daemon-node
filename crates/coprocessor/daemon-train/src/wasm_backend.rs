@@ -34,6 +34,7 @@ use daemon_swarm_run::backend::{
 };
 use daemon_swarm_run::seam::RoundId;
 
+use crate::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
 use crate::runtime::{EngineConfig, Instance, LoadedModule, Manifest, Worker};
 use crate::TrainError;
 
@@ -61,14 +62,6 @@ pub enum WasmBackendError {
     NotBuilt,
 }
 
-/// A cached resource footprint (from `da_build`), backing [`WasmBackend::assess`].
-#[derive(Clone, Copy, Debug)]
-struct Footprint {
-    vram_mb: u64,
-    ram_mb: u64,
-    payload_bytes: u64,
-}
-
 /// A [`TrainerBackend`] that drives a real wasm experiment module through the [`Worker`] host.
 pub struct WasmBackend {
     worker: Worker,
@@ -76,7 +69,9 @@ pub struct WasmBackend {
     instance: Option<Instance>,
     /// The `[experiment.config]` bytes (held for churn re-build after a `pause`).
     config: Option<Vec<u8>>,
-    footprint: Option<Footprint>,
+    /// The VRAM/RAM resource model captured at `build` (G2 autotune, from the param layout). The
+    /// worker's meta path carries the higher-fidelity `Autotune::from_meta` (real `act_bytes_est`).
+    autotune: Option<Autotune>,
     /// The checkpoint captured by [`WasmBackend::pause`] (restored on `resume`).
     paused_state: Option<Vec<u8>>,
 }
@@ -97,7 +92,7 @@ impl WasmBackend {
             module,
             instance: None,
             config: None,
-            footprint: None,
+            autotune: None,
             paused_state: None,
         })
     }
@@ -188,47 +183,37 @@ impl TrainerBackend for WasmBackend {
     fn build(&mut self, config: &[u8]) -> Result<(), Self::Error> {
         self.config = Some(config.to_vec());
         let inst = self.fresh_instance()?;
-        let master_bytes: u64 = inst
+        // Capture the resource model from the registered param layout (G2 autotune). The activation
+        // term is a coarse proxy here (no meta pass at build); the worker's assess path runs a real
+        // meta pass and uses `Autotune::from_meta` with the measured `act_bytes_est`.
+        let params: Vec<(Vec<u32>, u32)> = inst
             .params()
             .iter()
-            .map(|p| p.shape.iter().map(|&d| u64::from(d)).product::<u64>() * 4)
-            .sum();
-        let mib = 1u64 << 20;
-        self.footprint = Some(Footprint {
-            // A coarse steady-state estimate: params + fp32 master + grad accumulator (§5.1).
-            vram_mb: (master_bytes * 3).div_ceil(mib).max(1),
-            ram_mb: (master_bytes * 4).div_ceil(mib).max(1),
-            payload_bytes: master_bytes,
-        });
+            .map(|p| (p.shape.clone(), p.dtype))
+            .collect();
+        self.autotune = Some(Autotune::from_params(&params));
         self.instance = Some(inst);
         self.paused_state = None;
         Ok(())
     }
 
     fn assess(&self, meta: &AssessMeta) -> Result<Assessment, Self::Error> {
-        let fp = self.footprint.unwrap_or(Footprint {
-            vram_mb: 1,
-            ram_mb: 1,
-            payload_bytes: 0,
-        });
-        let eligible = meta.effective_vram_mb >= fp.vram_mb && meta.effective_ram_mb >= fp.ram_mb;
-        let reasons = if eligible {
-            vec![format!(
-                "wasm backend fits (~{} MiB VRAM, ~{} MiB host RAM)",
-                fp.vram_mb, fp.ram_mb
-            )]
-        } else {
-            vec![format!(
-                "insufficient resources: need vram>={}MiB ram>={}MiB, have vram={} ram={}",
-                fp.vram_mb, fp.ram_mb, meta.effective_vram_mb, meta.effective_ram_mb
-            )]
+        let autotune = self.autotune.clone().unwrap_or_default();
+        // The node's effective resources are the VRAM/RAM budget (governor policy caps applied,
+        // §10.5). `max_alloc_mb = 0` = unbounded here (the worker's meta+probe path supplies the
+        // wgpu-queryable per-allocation ceiling); this trait path budgets on total resources.
+        let limits = DeviceLimits {
+            vram_mb: meta.effective_vram_mb,
+            ram_mb: meta.effective_ram_mb,
+            max_alloc_mb: 0,
         };
+        let v = autotune.verdict(&limits, DEFAULT_MAX_MICROBATCH);
         Ok(Assessment {
-            eligible,
-            reasons,
-            vram_mb_estimate: fp.vram_mb,
-            ram_mb_estimate: fp.ram_mb,
-            payload_bytes_estimate: fp.payload_bytes,
+            eligible: v.eligible,
+            reasons: v.reasons,
+            vram_mb_estimate: v.vram_mb_estimate,
+            ram_mb_estimate: v.ram_mb_estimate,
+            payload_bytes_estimate: v.payload_bytes_estimate,
         })
     }
 

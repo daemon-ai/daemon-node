@@ -40,6 +40,11 @@ fn guest_dir() -> PathBuf {
 
 static BUILD: Once = Once::new();
 
+// Stale-guest guard (Merge-1 adjudication follow-on): the guest wasm is a gitignored build artifact
+// that does NOT travel with the branch, and a stale module fails as NaN, not loudly. So the harness
+// ALWAYS runs the (incremental, no-op-when-fresh) guest build before loading — rebuilding on source
+// drift instead of merely detecting it — and logs the loaded module's blake3 so any run's guest
+// identity is on the record. `SWARM_TEST_GUEST_DIR` (prebuilt artifacts, e.g. CI) skips the build.
 fn ensure_built() {
     BUILD.call_once(|| {
         if std::env::var("SWARM_TEST_GUEST_DIR").is_ok() {
@@ -55,11 +60,15 @@ fn ensure_built() {
 }
 
 fn tiny_llama_wasm() -> Vec<u8> {
+    ensure_built();
     let path = guest_dir().join("tiny_llama.wasm");
-    if !path.exists() {
-        ensure_built();
-    }
-    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    eprintln!(
+        "guest tiny_llama.wasm: {} bytes, blake3 {}",
+        bytes.len(),
+        blake3_hash(&bytes).to_hex()
+    );
+    bytes
 }
 
 fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
@@ -502,5 +511,121 @@ mod cross_backend {
     #[test]
     fn cross_backend_det_digest_demo() {
         assert_cross_backend("demo");
+    }
+}
+
+// -- cross-backend det-digest equality, cpu vs WGPU (G2 — program Risk 2's tripwire) -------------
+//
+// Same structure as `cross_backend` above, with the burn peer on `BackendKind::Wgpu` (a real Vulkan
+// device). The det lane never touches the GPU (`BurnBackend` materializes host-side and runs
+// det-core, ABI §5.9), so the det digests MUST stay **byte-identical** to the CpuBackend peer while
+// the native lanes (losses, payloads) diverge. GPU-skip convention: skips loudly when no adapter.
+#[cfg(feature = "wgpu")]
+mod cross_backend_wgpu {
+    use super::*;
+    use daemon_train::{wgpu_adapter_available, BackendKind};
+
+    fn backend_with(config: &[u8], kind: BackendKind) -> WasmBackend {
+        let mut b = WasmBackend::new(WasmBackendConfig {
+            wasm: tiny_llama_wasm(),
+            engine: EngineConfig {
+                backend: kind,
+                ..EngineConfig::default()
+            },
+        })
+        .expect("construct WasmBackend");
+        b.build(config).expect("da_build");
+        b
+    }
+
+    fn train_fixed(
+        b: &mut WasmBackend,
+        steps: u32,
+        round: u64,
+        fixed: &BatchRef,
+        first: &mut f32,
+        last: &mut f32,
+    ) -> Vec<u8> {
+        for step in 0..steps {
+            let stats = b.train_step(fixed, ctx(step)).expect("train_step");
+            if first.is_nan() {
+                *first = stats.loss;
+            }
+            *last = stats.loss;
+            b.inner_update(step).expect("inner_update");
+        }
+        b.make_update(round).expect("make_update")
+    }
+
+    /// The full round-loop smoke on wgpu (Merge-2 gate input): the tiny-llama loop trains on the
+    /// GPU (loss decreases), and the det-lane digest transcript is byte-identical to a CpuBackend
+    /// peer ingesting the same committed set — for `rounds` rounds.
+    fn assert_cross_backend_wgpu(profile: &str, rounds: u64) {
+        if !wgpu_adapter_available() {
+            eprintln!(
+                "SKIP cross_backend_wgpu::{profile}: no usable wgpu adapter on this runner \
+                 (run in the .#vulkan devShell — TDD §8.1 tier-2)"
+            );
+            return;
+        }
+        let config = cbor(&tiny_cfg(profile));
+        let mut cpu = backend_with(&config, BackendKind::Cpu);
+        let mut wgpu = backend_with(&config, BackendKind::Wgpu);
+        let steps = cpu.steps_per_round().expect("steps_per_round");
+        let fixed = batch(0xF00D);
+        let (mut cf, mut cl) = (f32::NAN, f32::NAN);
+        let (mut wf, mut wl) = (f32::NAN, f32::NAN);
+        let mut transcript = Vec::new();
+        let mut diverged = false;
+        for round in 0..rounds {
+            let pa = train_fixed(&mut cpu, steps, round, &fixed, &mut cf, &mut cl);
+            let pb = train_fixed(&mut wgpu, steps, round, &fixed, &mut wf, &mut wl);
+            diverged |= pa != pb;
+            let set = vec![staged(0x01, &pa), staged(0x02, &pb)];
+            let da = cpu.ingest(round, &set).expect("ingest cpu");
+            let db = wgpu.ingest(round, &set).expect("ingest wgpu");
+            assert_eq!(
+                da,
+                db,
+                "{profile} r{round}: cpu-vs-wgpu det digest must be bit-identical (cpu {} vs wgpu {})",
+                da.to_hex(),
+                db.to_hex()
+            );
+            transcript.push(da);
+        }
+        assert!(
+            transcript.windows(2).any(|w| w[0] != w[1]),
+            "{profile}: the digest transcript must evolve across rounds"
+        );
+        assert!(
+            diverged,
+            "{profile}: wgpu vs cpu native payloads should differ (tolerance-class native lane)"
+        );
+        assert!(
+            cf.is_finite() && cl.is_finite() && wf.is_finite() && wl.is_finite(),
+            "{profile}: losses finite (cpu {cf}->{cl}, wgpu {wf}->{wl})"
+        );
+        assert!(cl < cf, "{profile}: cpu loss must decrease ({cf} -> {cl})");
+        assert!(wl < wf, "{profile}: wgpu loss must decrease ({wf} -> {wl})");
+        eprintln!(
+            "cross_backend_wgpu::{profile}: {} rounds, digests identical; \
+             cpu loss {cf:.4}->{cl:.4}, wgpu loss {wf:.4}->{wl:.4}",
+            transcript.len()
+        );
+    }
+
+    #[test]
+    fn cross_backend_det_digest_wgpu_sparse_loco() {
+        assert_cross_backend_wgpu("sparse_loco", 6);
+    }
+
+    #[test]
+    fn cross_backend_det_digest_wgpu_diloco() {
+        assert_cross_backend_wgpu("diloco", 6);
+    }
+
+    #[test]
+    fn cross_backend_det_digest_wgpu_demo() {
+        assert_cross_backend_wgpu("demo", 6);
     }
 }
