@@ -126,16 +126,36 @@ the runner with a `BurnBackend(wgpu)` factory.
 Values are measured from the actual ndarray-vs-cpu deltas on the fixed fixtures (headroom left for
 wgpu). `Exact` classes assert byte-identity (both delegate to det-core / are pure data moves).
 
-## Planned slices (TDD-style, each `feat(train): … (green)`)
+## Landed slices (base `d71839a` → HEAD `9219687`)
 
-1. `mirror(G1): ledger` — this file (commit first).
-2. `feat(train): BurnBackend forward+autodiff over the OpBackend seam (green)` — `burn_backend.rs`,
-   backend selector, unit tests in the module.
-3. `feat(train): cross-backend tolerance harness + HOST-9 parity (green)` — `tests/tolerance.rs`,
-   `tests/burn_backend_parity.rs` (`abi_matmul_backward`, `abi_adamw_step_matches_burn`,
-   `grads_invariant_to_accumulation_split`, per-op tolerance tests).
-3. `feat(train): cross-backend det-digest equality tripwire (green)` — extend
-   `tests/wasm_backend_determinism.rs` with the CpuBackend-vs-BurnBackend(ndarray) digest test.
+1. `mirror(G1): ledger` (`66f25fd`) — this file (commit first).
+2. `feat(train): BurnBackend forward+autodiff over the OpBackend seam (green)` (`354fc32`) —
+   `burn_backend.rs` + the `BackendKind` selector on `EngineConfig`/`HostState` (`runtime.rs`,
+   `lib.rs` re-exports).
+3. `feat(train): cross-backend tolerance harness + HOST-9 parity (green)` (`2ed0f8d`) —
+   `tests/tolerance/mod.rs` (shared harness) + `tests/burn_backend_parity.rs` (17 tests:
+   per-op forward/backward tolerance parity, `abi_matmul_backward`, `abi_adamw_step_matches_burn`,
+   `grads_invariant_to_accumulation_split`, det/compression bit-exactness).
+4. `feat(train): cross-backend det-digest equality tripwire (green)` (`9219687`) — extend
+   `tests/wasm_backend_determinism.rs` with the CpuBackend-vs-BurnBackend(ndarray) digest test over
+   the full tiny-llama round loop (sparse_loco / diloco / demo).
+
+## Evidence (Merge 1)
+
+- `cargo fmt --check` ✓; `cargo clippy --workspace --all-targets -- -D warnings` ✓;
+  `cargo clippy -p daemon-train --features burn-ndarray --all-targets -- -D warnings` ✓.
+- `cargo test -p daemon-train` (default) ✓; `cargo test -p daemon-train --features burn-ndarray` ✓
+  (`burn_backend_parity`: 17 passed; `wasm_backend_determinism`: 12 passed incl. the 3
+  `cross_backend::*` digest tests; `worker_protocol`: 4 passed).
+- `cargo test -p daemon-train-sdk --features sim` ✓; `cargo run -p xtask -- build-guests` ✓;
+  `typos docs/specs` ✓.
+- `cargo test --workspace`: all crates pass **except** the pre-existing, out-of-lane
+  `daemon-conformance` detached-delegation/history hang (`operator_assign_wakes_a_parked_durable_child`,
+  `events_since_feed_delivers_fleet_changed_on_delegation`) — flagged as a known flake in the brief
+  ("pass-in-isolation = green; never modify"); untouched by this lane (a different crate).
+- Cross-backend digest evidence: for all three profiles the CpuBackend and BurnBackend(ndarray)
+  peers produce **byte-identical** det-lane digest transcripts every round while their native
+  payloads diverge (asserted `pa != pb`) and both losses fall — the residency tripwire is green.
 
 ## Code grounding (burn 0.21 API anchors, `~/.cargo/registry/.../burn-*-0.21.0`)
 
