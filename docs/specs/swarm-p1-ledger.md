@@ -679,3 +679,321 @@ All green except the documented pre-existing conformance flake:
   build 6.1 s, 4 inner AdamW steps 41.1 s (~10.3 s/step), make_update 42.5 s → 12.46 MB sparse_loco
   payload; loss **10.84 → 10.24 → 9.66 → 9.10** (finite, strictly decreasing); assess ELIGIBLE with
   the real unified probe.
+
+---
+
+## Merge 3 — PROGRAM GATE (integration owner)
+
+**The final gate of the Swarm P1 + Transport program.** Wave-3 integration landed on
+`integrations/swarm-p1`. Base `2f1ce1f` (`mirror(merge-2): freeze Wave-2 interfaces`) →
+**HEAD `1c2c43a`**. Executed on this machine's real RADV GPU (AMD Strix Halo GFX1151, unified
+memory) in the `.#vulkan` devShell; live transport on real per-node iroh meshes + self-hosted
+`iroh-relay`. Both program exit gates PASS; the full gate matrix is green modulo the documented
+`daemon-conformance` flake (pass-in-isolation).
+
+### Commits (first-parent, oldest → newest)
+
+| Commit | Subject |
+|---|---|
+| `91439a8` | `Merge branch 'swarm/m2'` — reference-parity + throughput harness + reduced always-on parity + #[ignore] 160M wgpu gate + UMA docs + throughput doc |
+| `abf53e3` | `Merge branch 'swarm/b3'` — live IrohGossip harness + fetch_record_set/concurrent barrier + swarm-local + 6-test live_transport gate + with_swarm boot binding + worker OOM/micro-batch/governor glue |
+| `4b0c1c1` | `build(workspace): promote daemon-swarm-node to [workspace.dependencies]` — the Merge-3 frozen-file edit |
+| `1c2c43a` | `mirror(merge-3): fold in Windows VRAM/UMA probe design` — windows-vram-design.md + §2b OPEN→RESOLVED |
+
+Lane HEADs merged: **swarm/m2 `85d4a5a`**, **swarm/b3 `50201d5`** (BC `d7c2e94` is in daemon-cloud
+`apps/swarm` — separate repo, not gitlinked; see Handoff). This `mirror(merge-3)` ledger/freeze
+commit sits on top of HEAD.
+
+### Merge conflicts: NONE
+
+Both `--no-ff` merges auto-merged clean (ort); the disjoint file-ownership held exactly as designed.
+- **swarm/m2** touched only `daemon-train/tests/*` (the reference harness — no `src/` edit; it drives
+  the tabi path through the public `Instance`/`WasmBackend` surface), `docs/specs/*` (M2 ledger,
+  throughput doc, the two UMA docs), and a **dev-dep** line on `daemon-train-safetensors` (an existing
+  `[workspace.dependencies]` entry from Merge 2). Only `Cargo.lock` was co-touched; git auto-merged
+  the additive region.
+- **swarm/b3** touched `daemon-swarm-run/{engine,harness,lib,live_harness,bin/swarm-local}`,
+  `tests/daemon-swarm-e2e/*`, the worker `transport`/`main` modules, `daemon-host/node_api{,/*}` +
+  `bins/daemon/{Cargo.toml,src/main.rs}` (the sanctioned `with_swarm` boot-binding cross-lane action),
+  and `daemon-swarm-node/tests/service.rs`. **Disjoint from M2** (tests-vs-src, different crates), so
+  no textual conflict; `Cargo.lock` auto-merged again. Lane ledgers are distinct files. No adjudication
+  fix commit was needed.
+
+### Frozen-file edit (integration-owner scope)
+
+- **Root `Cargo.toml`** (`4b0c1c1`): `daemon-swarm-node = { version = "0", path =
+  "crates/swarm/daemon-swarm-node" }` added to `[workspace.dependencies]` (matching the
+  `daemon-train-safetensors` Merge-2 precedent), and `bins/daemon/Cargo.toml` switched to
+  `{ workspace = true }`. B3 had carried it as a direct path dep with a `version="0"` pin (to dodge the
+  cargo-deny wildcard/unresolved-workspace-dependency ban on the publishable `daemon` crate); the
+  promotion keeps that pin shape. **`Cargo.lock` unchanged** (same path, workspace-routed).
+  **`cargo deny check` green** as-is (advisories/bans/licenses/sources ok) — no new third-party dep, so
+  `deny.toml`/`flake.nix` untouched. This is the only frozen-file edit at Merge 3.
+
+### Windows / UMA docs fold-in (`1c2c43a`)
+
+- Committed `docs/specs/swarm-windows-vram-design.md` (authored from the user's verified Windows
+  research, `windows` crate 0.62 API shapes): the resolved DXGI `GetDesc3` + D3D12
+  `ARCHITECTURE1.UMA` + `QueryVideoMemoryInfo` → autotune `DeviceLimits` mapping, the three-platform
+  budget-symmetry table (macOS `recommendedMaxWorkingSetSize` / Linux VK heapBudget / Windows DXGI
+  `Budget`), trap rules, the §10.5 budget-change governor hook, and the P2 implementation sequence.
+- Amended `swarm-uma-platform-findings.md` §2b **OPEN → RESOLVED** with a pointer to the design (the
+  DXGI/D3D12 trio won over the ash / D3DKMTQueryStatistics candidates). The Windows P2 items are in
+  the **P2 seed list** below.
+
+### ★ P1 EXIT GATE — PASS (spec §17) ★
+
+M2's 160M reference-parity gate **re-run on the merged tree** in `.#vulkan` on the real RADV GPU
+(`cargo test -p daemon-train --features wgpu --release --test reference_parity_wgpu -- --ignored
+--nocapture --test-threads=1`): **3 passed, 261.75 s test wall** (389 s incl. cold release
+wgpu/cubecl compile). Evidence (this Merge-3 run, reproducing M2's numbers on the integrated tree):
+
+- **`loss_parity_within_tolerance_160m`** (4 steps, wgpu, TinyStories, b=1): tabi vs the independent
+  burn reference (matched init via safetensors) is **bit-identical loss step-for-step** —
+  `|Δloss| = 0.000e0` at steps 0–3 (tabi 10.846275/10.217541/9.595667/8.986185 == ref, exactly);
+  **final-weight max Δ = 4.768e-7** vs the `Optimizer` tolerance class (rtol 2e-4 / atol 2e-5) — ~3
+  orders of magnitude tighter than the bound. ✅
+- **`loss_curve_160m_wgpu`** (2 rounds × 30 inner AdamW steps + make_update + self-ingest, b=1
+  TinyStories): build 2.6 s; round 0 = 30 steps 98.3 s + 6.6 s make_update → 12,463,354 B sparse_loco
+  payload, inner loss **10.846 → 4.928**; round 1 = 96.0 s + 6.6 s, **10.605 → 4.948** (the
+  round-boundary re-ascent is the expected DiLoCo-family dynamic for a lossy 1/64-density 2-bit outer
+  update on a single self-peer). Full 60-step series recorded in the test output + `swarm-p1-throughput.md`.
+- **`throughput_within_budget_or_documented`** (160M/wgpu, b=1, 4 measured + 1 warmup): tabi
+  **310.9 tok/s** (step 3.290 s ± 0.149) vs reference **797.0 tok/s** (step 1.284 s ± 0.006) →
+  **2.56× tabi/reference** this run (M2 recorded 2.33×; the spread is host-copy/thermal variance, same
+  regime). The gate is "within 25% **or** a written breakdown"; the breakdown stands: the overhead is
+  the **`BurnBackend` per-op host-copy tax** (`insert_result` → `to_vec_f32`/`to_data` device→host
+  readback + queue flush per op, serializing the GPU pipeline), NOT the wasm ABI dispatch (spec §15.1's
+  "<1%" holds — sub-µs host calls vs multi-second kernels). A lazy host-copy-free `OpBackend` is the
+  P2 perf follow-on. **Gate satisfied as documented.** ✅
+- Always-on portion (rides the default `--features burn-ndarray` gate): `reference_parity.rs` reduced
+  ndarray parity **2 passed** (+ 2 `#[ignore]` 160M-ndarray). ✅
+
+### ★ `tabi@1` VOCABULARY FROZEN (66 ops) — P1 exit gate reached ★
+
+Per spec §16 / the ABI spec §9 freeze process, **the `tabi@1` vocabulary is FROZEN at this Merge-3 P1
+exit gate — HEAD `1c2c43a` on `integrations/swarm-p1`, 2026-07-13**. From here it is **additive-only**
+(new `op@version` fields side-by-side; a breaking change ships `tabi@2`); conformance fixtures (§11)
+are append-only. **66 ops**, verified on the merged tree by `daemon-train`'s `abi_surface` suite (2
+tests: `tabi@1` op count == 66 **and** `phase.rs` table == SDK `TABI_IMPORTS`, both green in the
+Merge-3 `--features burn-ndarray`/`wgpu` runs). No lane spent the additive window this wave — M1 and
+M2 added **no** host op / `TABI_IMPORTS` / `phase.rs` entry (both ledgers confirm "tabi@1 unspent"),
+so the freeze lands on the exact 66-op set frozen at Merge 2.
+
+**Freeze recorded in this ledger (authoritative).** The ABI spec §9 already *states* the freeze
+process ("`tabi@1` is frozen at the P1 exit gate — after that, additive-only") but carries **no
+designated fill-in freeze marker** (no `FROZEN AT: <commit/date>` field), so per the Merge-3 brief the
+freeze is **ledger-recorded only** — a spec §9 annotation with the concrete commit/date is left to the
+human (spec docs are the human's to edit). Handoff item.
+
+### ★ TRANSPORT EXIT GATE — PASS ★
+
+B3's live e2e suite **re-run on the merged tree** (`cargo test -p daemon-swarm-e2e --features iroh
+--test live_transport -- --nocapture --test-threads=1`): **6 passed, 49.19 s test wall** (74 s incl.
+`iroh-relay` cold compile). Every test = real per-node `IrohGossip` QUIC endpoints (distinct
+endpoint per peer + coordinator, loopback binds, roster-seeded mesh) + a shared `FsPayloadStore`:
+
+| Test | Result |
+|---|---|
+| `live_flagship_three_peers_ten_rounds_all_agree` (stub flagship, 10 rounds, per-round byte-identical digests) | ✅ |
+| `live_flagship_tiny_llama_wasm_over_iroh` (real tiny-llama guest, wasmtime training, 10 rounds) | ✅ |
+| `live_stall_ladder_recovers_over_iroh` (RUN-8 live: injected round-5 payload miss → Straggling→CaughtUp, no leave) | ✅ |
+| `live_late_join_resyncs_over_iroh` (4th peer admitted at epoch-1 boundary, resyncs from checkpoint) | ✅ |
+| `live_mid_run_drop_dropped_after_absences` (peer silent after round 2, dropped after K=2 absences, survivors agree) | ✅ |
+| **`live_run_through_self_hosted_relay`** (spawns `iroh-relay --dev` :3340, `RelayMode::Custom`, relay-bearing rosters) — **RAN GREEN, not skipped** (`iroh-relay 1.0.0` on the `.#vulkan`/default PATH) | ✅ |
+
+Plus the **loopback e2e** (`swarm_e2e` 2 + the 5 churn `drills` — all green in the default gate) and
+**B2 `ControlPlane` conformance on BOTH planes** (`control_plane_conformance` 4 — the parametric suite
+over `LoopbackGossip` **and** `IrohGossip`, green) + `iroh_gossip` 7 (NET-6/7 incl. the relay-path
+test). PROTO-20 replay from a live-transport message log is covered inside the live drills (each
+asserts replay-green). **Transport exit satisfied.** ✅
+
+### Full gate matrix (Merge-3, HEAD `1c2c43a`)
+
+All green except the documented `daemon-conformance` detached-delegation flake.
+
+- `cargo fmt --check` ✓ · `cargo clippy --workspace --all-targets -- -D warnings` ✓.
+- Feature-combo clippy `-D warnings`: `-p daemon-train --features burn-ndarray` ✓ · `--features wgpu`
+  (`.#vulkan`) ✓ · `-p daemon-swarm-net --features iroh` ✓ · `-p daemon-swarm-run --features iroh` ✓ ·
+  `-p daemon-swarm-e2e --features iroh` ✓ · `-p daemon-train-sdk --features sim` ✓ · `-p daemon-api
+  --features arbitrary` ✓.
+- `cargo deny check` ✓ (advisories/bans/licenses/sources).
+- `cargo test --workspace` ✓ **except** the known `daemon-conformance` detached-delegation trio (this
+  run: `detached_fanout_materializes_distinct_children` failed under the full parallel run;
+  **re-verified 5/5 green in isolation** — `cargo test -p daemon-conformance --lib
+  node::detached_delegation`; never modified; no swarm lane touches `daemon-conformance`).
+- Feature suites: `daemon-train --features burn-ndarray` (lib 37, abi_surface 2, burn_backend_parity
+  17, guest_lifecycle 9, preset_160m 2+1ig, reference_parity 2+2ig, wasm_backend_determinism 12,
+  worker_protocol 4) ✓ · `daemon-train --features wgpu` (P1 gate above) ✓ · `daemon-swarm-net`
+  default + `--features iroh` (lib 71, conformance 4, iroh_gossip 7) ✓ · `daemon-train-sdk --features
+  sim` (25) ✓ · `daemon-swarm-e2e` default (drills 5, swarm_e2e 2, wasm_profiles 3) + `--features iroh
+  --test live_transport` (6) ✓.
+- Both `wasm32-unknown-unknown` builds (`daemon-swarm-proto`, `daemon-swarm-coordinator`) ✓ ·
+  `cargo run -p xtask -- build-guests` ✓ (rebuilt after both merges — CRITICAL; stale guests fail as
+  NaN, cf. the Merge-1 adjudication) · `typos docs/specs` ✓.
+- **Default-gate dep isolation** (`cargo tree -p daemon -i {burn, wasmtime, iroh, iroh-gossip,
+  cubecl}`): **all ABSENT** — the `with_swarm` boot binding + the `daemon-swarm-node` workspace
+  promotion keep the `daemon` default build free of the training/transport trees. ✓
+
+## Merge 3 — frozen interfaces (FROZEN FOREVER unless a namespace bump)
+
+The P1 exit gate closes the additive window on the tensor ABI and freezes the Wave-3 seams. Extend
+these additively only (new methods/fields/arms with defaults); a breaking change is a new
+crate/version, coordinated by a future integration owner.
+
+1. **`tabi@1` — the 66-op vocabulary + `phase.rs` legality table.** FROZEN (see the freeze record
+   above). Additive-only `op@version` growth; conformance fixtures append-only. This is the strongest
+   freeze in the program — the whole point of the P1 gate.
+2. **Reference-parity harness API + throughput report format (M2).** `tests/reference/mod.rs`:
+   `RefLlama<B: AutodiffBackend>` (`from_state_dict`/`step`/`step_loss`/`adamw`/`state_dict`),
+   `drive_tabi`/`drive_reference` (per-step losses + final `StateDict`), `assert_loss_parity`
+   (`Optimizer` class), `ParityReport { per_step_delta, final_weight_max_delta, class }`,
+   `TokenBatch::{deterministic,tinystories,truncate_seq}`, `throughput_stats`; the tokens/s table shape
+   in `swarm-p1-throughput.md` (`path × backend × {build_s, step_s mean±sd, tokens/s, overhead×}`).
+   Generic over the backend, reused verbatim across ndarray + wgpu.
+3. **`LiveSwarmConfig` / `run_live_swarm{,_with}` — the live-transport e2e harness API (B3).**
+   `daemon_swarm_run::live_harness` behind the `iroh` feature (which turns on
+   `daemon-swarm-net/iroh` + `harness`); drill knobs = peers, rounds, late-join, drop, stall, outage,
+   relay-url. Backends need `Send + Sync` (the `Send`-only `WasmBackend` rides an uncontended `Mutex`
+   adapter — documented on `run_live_swarm_with`).
+4. **`set_swarm` + `emit_node_event` boot shape + the `[swarm]` config binding (W1→B3).**
+   `NodeApiImpl.swarm` is a write-once `OnceLock` with a post-`Arc` `set_swarm(&self, Arc<dyn
+   SwarmApi>)` binder (mirrors `set_gateway`/`register_managed`); the Merge-1 `with_swarm(self, …)`
+   builder is preserved on top of the cell. Additive `NodeApiImpl::emit_node_event(NodeEvent)` routes
+   `SwarmChanged` invalidation pointers onto the existing `events_subscribe` feed (a `Weak` node handle
+   in the `NodeFeed` closure avoids an Arc cycle). `[swarm] enabled=true` + `worker_path` (+
+   `data_dir/swarm.db`) makes `bins/daemon` build `SwarmStore::open` + `TrainSupervisor(worker_path)` +
+   `SwarmService`, call `start()` (durable-intent re-convergence, §10.3), and bind via `set_swarm`.
+   Inert (and dep-free on the default gate) unless enabled.
+5. **Worker lifecycle glue points (B3).** Where the worker `transport` module constructs the
+   `RoundEngine`/round loop; the `Eligibility.headroom["micro_batch"]` verdict consumption threaded
+   into `JoinRun`; the live OOM ladder (a real `TrapCode::BudgetMemory` → instance churn → retry at
+   `mb/2` to floor 1, `autotune::oom_error_class()` naming the class); the `Throttle{paused}` governor
+   lever reaching the worker (on unified boxes it clamps the *combined* budget, Merge-2
+   spec-amendment #1). Telemetry rides stderr (the frozen §10.2 `Event` stream is unchanged).
+6. **The resolved three-platform `DeviceLimits` probe design.** `DeviceLimits { vram_mb, ram_mb,
+   max_alloc_mb, shared_mb, unified }` + the effective-budget (`vram + 0.9·shared`) / unified
+   joint-pool verdict (Merge-2), now with the **three-platform symmetry resolved**: macOS
+   `recommendedMaxWorkingSetSize` (⅔·RAM, measured), Linux Σ VK heapBudget ≈ `vram+gtt` (sysfs, 90%
+   GTT discount, measured), Windows DXGI `QueryVideoMemoryInfo(...).Budget` (LOCAL on UMA / VRAM grant
+   on discrete — `swarm-windows-vram-design.md`). The Linux/macOS probes are implemented; the Windows
+   FFI probe is P2 (seed list).
+7. **The node↔cloud presign/WS HTTP contract (unchanged, re-affirmed).** `tests/fixtures/presign-*.json`
+   remain the byte-frozen contract; BC (daemon-cloud `apps/swarm`, base d7c2e94) implements them
+   verbatim (43 tests green). The coordinator WS/DO surface is spec-derived (no node WS client yet).
+
+## Carried follow-ons (recorded, not in this program's scope)
+
+1. **Worker in-subprocess iroh attach** (B3 deviation 1). The live `RoundEngine`-over-`IrohGossip`+store
+   loop is proven in-process (the 6-test live gate); wiring it *inside* the `daemon-train-worker`
+   subprocess needs (a) the iroh/QUIC tree added to `daemon-train` and (b) `JoinRun.coordinator`
+   discovery plumbing (BC's endpoint). **Integration-owner dep-graph assessment:** do NOT add iroh to
+   `daemon-train` yet. `daemon-train` today is `wasmtime + burn` only; the default `daemon` gate is
+   provably iroh-free (verified this merge). Adding iroh to `daemon-train` would pull the QUIC/relay
+   tree into the worker-binary build for a capability the in-process harness already exercises, and it
+   couples to BC's not-yet-consumed WS coordinator client. The clean sequence is P2: land BC's node WS
+   client first (the `JoinRun.coordinator` consumer), *then* add `daemon-swarm-net/iroh` to the worker
+   behind its own feature — so the attach is a construction change, not a design one. Deferred.
+2. **Protocol telemetry events for micro-batch/OOM** (B3 deviation 2). M2's `worker_protocol` pins the
+   `JoinRun` event stream; the verdict/ladder telemetry goes to stderr. Adding `Metric`/`Warning`
+   frames is a trivial additive change to coordinate with a future M-lane. Deferred.
+3. **COORD-1 wasm-tick parity** (`dual_shell_parity`). Replay one message log through the Rust
+   `LocalCoordinator` shell and BC's `RunCoordinatorDO` shell, assert identical `RoundRecord`s. Needs
+   the Phase-2 `daemon-swarm-coordinator`→wasm32 `tick` loaded into the DO (COORD-3 build is green; the
+   wasm32 builds pass this merge). **The first Merge-3 follow-on** per both the program plan and BC's
+   ledger.
+4. **wiremock → wrangler-dev presign switch.** B3's exit gate uses `FsPayloadStore` (sanctioned — no
+   BC block). BC's recipe (BC ledger): `nix develop --command pnpm -C apps/swarm dev` →
+   `http://127.0.0.1:8795/api/v1/swarm`; point a node `HttpPresignClient` at
+   `coordinator_base = http://127.0.0.1:8795/api/v1/swarm` (presign resolves to
+   `POST {base}/runs/:id/presign`); create a run first (`POST {base}/runs` with the frozen envelope).
+   `swarm-local --store r2` is reserved (rejected with a pointer today). Deferred to the P2 WAN gate.
+5. **BurnBackend host-copy perf follow-on.** The 2.3–2.6× tabi/reference overhead is the per-op
+   device→host readback in `insert_result`; a lazy host-copy-free `OpBackend` (keep results
+   device-resident, materialize only at det-lane ingest / checkpoint) is the fix. P2 perf.
+6. **SigV4 vs real R2** (program Risk 5). BC's mandatory wrangler-dev smoke exercises the object-proxy
+   plane against miniflare R2; the real-bucket SigV4 path (`aws4fetch` against the R2 S3 endpoint) is a
+   P2 WAN-gate checklist item (real credentials + live round-trip).
+7. **Windows VRAM/UMA probe implementation** (see the P2 seed list — the design is resolved, the FFI is
+   P2).
+
+---
+
+## Handoff package (final program deliverable)
+
+### (a) Program summary — what P1 + Transport delivered
+
+The **Swarm P1 + Transport** program took the swarm-training MVP (`e2e08c3`) and delivered, on one
+shared trunk `integrations/swarm-p1` (**final HEAD `1c2c43a`**), through three merges:
+
+- **Workstream A (node wire + GPU training to the P1 gate):** `SwarmApi` wire surface (v40) + node
+  `SwarmService` + `swarm.db` (W1); the `BurnBackend<Autodiff<B>>: OpBackend` seam + tolerance-class
+  harness + cross-backend det-digest tripwire on burn-ndarray (G1), then burn-**wgpu** on Vulkan/RADV +
+  VRAM autotune + real `Hardware` probe (G2); the 160M TinyLlama preset + TinyStories offline data
+  path + safetensors converter (M1); and the **P1 numeric exit gate** (M2): 160M pretrains through the
+  wasm→tabi→BurnBackend/wgpu module path with loss **bit-identical** to an independent burn reference
+  (final-weight max Δ 4.77e-7) and tokens/s measured + explained (2.3–2.6× = the documented host-copy
+  tax). **`tabi@1` (66 ops) is now FROZEN.**
+- **Workstream B (real transport planes):** R2 `PayloadStore` over presigned URLs + `PresignClient` +
+  egress schemes + download scheduler (B1); `IrohGossip: ControlPlane` on iroh 1.0.2 / gossip 0.101 +
+  self-hosted `iroh-relay` + parametric conformance (B2); and the **transport exit gate** (B3): the
+  frozen `RoundEngine` driven over real per-node iroh gossip meshes + a shared object store,
+  `with_swarm` bound at boot, 6/6 live e2e (stub + tiny-llama flagships, stall ladder, late join,
+  mid-run drop, self-hosted relay) green. The daemon-cloud `apps/swarm` coordination plane (presign +
+  run registry + `RunCoordinatorDO` + gateway proxy, 43 tests) landed in daemon-api `swarm/bc`.
+
+**Evidence pointers:** P1 — `swarm-ledger-m2.md` + `swarm-p1-throughput.md` + the Merge-3 P1 gate
+above (`reference_parity_wgpu`). Transport — `swarm-ledger-b3.md` + the Merge-3 transport gate above
+(`live_transport`). Determinism story + tolerance rationale — this ledger's "Determinism story".
+Platform/UMA — `swarm-uma-platform-findings.md` + `swarm-macos-uma-findings.md` +
+`swarm-windows-vram-design.md`. Cloud — `daemon-cloud/daemon-api/docs/swarm-bc-ledger.md`.
+
+### (b) Superproject handoff (the human commits — signed)
+
+daemon-node work stops at this branch; the following are **proposals for the human** in the
+superproject `/home/j/experiments/daemon` (all tooling via `nix develop`/`just`). **Superproject
+commits MUST be GPG-signed and require explicit human approval — the integration owner produces the
+proposal, the human commits.**
+
+1. **WIRE-3 cross-repo half (still pending from Merge 1).** The daemon-node half is done (WireVersion
+   40, CDDL `swarm-*` rules, conformance green). In the superproject, after this branch is the gitlink:
+   ```
+   just update-codec     # regenerate daemon-app's vendored codec from the v40 CDDL (grows swarm-* arms)
+   just codec-drift      # gate: vendored copy == the pinned contract (must be green)
+   just lint             # rustfmt + clippy + clang-tidy/-format + qmllint + secrets + spell
+   ```
+   Until `just update-codec` runs, the app codec is one wire version behind; the node is the source of
+   truth and `codec-drift` is the enforcement point.
+2. **daemon-node gitlink bump** to the final trunk HEAD **`1c2c43a`** (`integrations/swarm-p1`).
+3. **`just swarm-dev` wiring** (W1's proposed superproject recipe; B3 gave it a real runner):
+   `cargo run -p daemon-swarm-run --features iroh --bin swarm-local -- --transport iroh --store fs
+   --peers 3 --rounds 8`. Wire it into `just e2e` per W1's ledger diff.
+4. **BC's proposed daemon-cloud diffs** (BC ledger "Proposed frozen-file diffs" — the human applies in
+   daemon-cloud/daemon-api; **daemon-cloud is not gitlinked to this trunk**): root `package.json`
+   `dev:swarm`/`deploy:swarm` scripts; `docs/monorepo.md` `apps/swarm` row; and the daemon-cloud
+   superproject gitlink bump to the merged `swarm/bc` (`d7c2e94`) — a signed commit / that repo's own
+   review flow. Its `apps/gateway` has 21 **pre-existing** typecheck errors on the base (unrelated to
+   swarm; `routes/swarm.ts` adds zero) — treat like the daemon-node conformance flake.
+5. **tabi@1 spec annotation (optional).** The ABI spec §9 already describes the freeze; a human may add
+   a concrete `FROZEN AT: 1c2c43a, 2026-07-13` marker there. Ledger is authoritative meanwhile.
+
+### (c) P2 program seed list
+
+- **WAN gate ceremony:** real R2 bucket `daemon-api-swarm-payloads` + SigV4 presign against the R2 S3
+  endpoint (BC secrets `R2_ACCOUNT_ID`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`), the wrangler-dev →
+  real-bucket switch, mixed-OS/geo peers, RunCoordinator DO production deployment. (Risk 5.)
+- **COORD-1 `dual_shell_parity`** (the first follow-on): Phase-2 `daemon-swarm-coordinator`→wasm32
+  `tick` in the `RunCoordinatorDO`, replay-log parity vs the Rust `LocalCoordinator`.
+- **BurnBackend host-copy perf follow-on:** lazy, device-resident `OpBackend` results (removes the
+  2.3–2.6× tabi/reference tax; verify spec §15.1's <1% dispatch claim end-to-end).
+- **Windows lane** (design resolved in `swarm-windows-vram-design.md`): (1) target-gated
+  `windows = "0.62"` in the frozen root `Cargo.toml` (`[target.'cfg(windows)'.dependencies]`, worker
+  bin only); (2) a `daemon-train`/worker Windows flake lane beside `daemon-infer-*-windows`
+  (`flake.nix:749/821` precedent); (3) the DXGI/D3D12 probe FFI target-gated behind the §2 mapping;
+  (4) a `smoke-windows` `daemon-train-worker.exe` probe step (Wine = plumbing only); (5) fixture unit
+  tests for the discrete / UMA / Variable-Graphics-Memory / WARP-skip / WDDM-distrust cases; (6) one
+  manual real-Windows Task-Manager cross-check.
+- **iroh-blobs payload plane** (P4, NET-5/7) + proto `Locator::BlobTicket`; worker in-subprocess iroh
+  attach (follow-on 1); protocol telemetry events (follow-on 2); CUDA/ROCm GPU lanes; the app GUI+TUI
+  view-model (WIRE-4, its own P3 program); hivemind-style weighted multi-corpus mixtures; the
+  shape-only meta interpreter (Risk 3).
