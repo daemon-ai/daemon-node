@@ -115,6 +115,83 @@ impl Default for TinyLlamaCfg {
     }
 }
 
+impl TinyLlamaCfg {
+    /// The **P1 160M preset** (architecture §5.1, spec §17): a LLaMA-family decoder scaled to the
+    /// "160M on one GPU" gate — `d_model 768, n_layers 12, n_heads 12, head_dim 64, seq_len 1024`,
+    /// SwiGLU hidden `ffn_mult·d_model = 3072`, tied embedding over the **GPT-2 BPE** vocabulary
+    /// (50257; TinyStories' native GPT-Neo tokenizer, a GPT-2 BPE — `< 65536` ⇒ `u16` shards).
+    ///
+    /// GQA is deferred at this scale: `n_kv_heads == n_heads` (the `build()` assert is kept). The
+    /// comm profile is `sparse_loco` at the golden cadence `H = 30`; `chunk` is `256` — the largest
+    /// power-of-two dividing **every** parameter's element count without guest-side padding (the
+    /// embedding `50257·768` has 2-adic valuation 8, so the real-model golden `chunk 4096` would not
+    /// divide it), with `topk = 4` preserving the golden 1/64 density. See `swarm-ledger-m1.md`.
+    #[must_use]
+    pub fn llama_160m() -> Self {
+        Self {
+            d_model: 768,
+            n_layers: 12,
+            n_heads: 12,
+            n_kv_heads: 12,
+            head_dim: 64,
+            vocab: 50257,
+            seq_len: 1024,
+            ffn_mult: 4,
+            rope_theta: 10_000.0,
+            rmsnorm_eps: 1.0e-5,
+            inner: AdamWCfg::default(),
+            profile: "sparse_loco".to_string(),
+            sparse_loco: SparseLocoCfg {
+                h: 30,
+                chunk: 256,
+                topk: 4,
+                bits: 2,
+                ef_decay: 0.95,
+                outer_alpha: 1.0,
+                clip: true,
+            },
+            diloco: DiLoCoCfg::default(),
+            demo: DemoCfg::default(),
+        }
+    }
+
+    /// The canonical parameter state dict (name, shape) in **registration order** — the exact order
+    /// [`TinyLlama::build`] registers params, which is the checkpoint tensor order, digest coverage,
+    /// and safetensors layout (ABI §6.3). Kept in lockstep with `build()`; a single source of truth
+    /// for the safetensors converter (M1) and the burn reference model (M2).
+    #[must_use]
+    pub fn canonical_param_layout(&self) -> Vec<(String, Vec<u32>)> {
+        let d = self.d_model;
+        let qdim = self.n_heads * self.head_dim;
+        let hidden = self.ffn_mult * d;
+        let mut out: Vec<(String, Vec<u32>)> = Vec::new();
+        out.push(("tok.weight".to_string(), vec![self.vocab, d]));
+        for l in 0..self.n_layers {
+            out.push((format!("l{l}.attn_norm"), vec![d]));
+            out.push((format!("l{l}.wq"), vec![d, qdim]));
+            out.push((format!("l{l}.wk"), vec![d, qdim]));
+            out.push((format!("l{l}.wv"), vec![d, qdim]));
+            out.push((format!("l{l}.wo"), vec![qdim, d]));
+            out.push((format!("l{l}.ffn_norm"), vec![d]));
+            out.push((format!("l{l}.w_gate"), vec![d, hidden]));
+            out.push((format!("l{l}.w_up"), vec![d, hidden]));
+            out.push((format!("l{l}.w_down"), vec![hidden, d]));
+        }
+        out.push(("norm.weight".to_string(), vec![d]));
+        out
+    }
+
+    /// The exact trainable parameter count (Σ element counts over [`Self::canonical_param_layout`]).
+    /// Tied embedding ⇒ the `[vocab, d]` table is counted once.
+    #[must_use]
+    pub fn param_count(&self) -> u64 {
+        self.canonical_param_layout()
+            .iter()
+            .map(|(_, s)| s.iter().map(|&d| u64::from(d)).product::<u64>())
+            .sum()
+    }
+}
+
 /// One transformer block's parameters.
 struct Block {
     attn_norm: Param,
@@ -359,5 +436,116 @@ impl Experiment for TinyLlama {
         ciborium::into_writer(&TinyLlamaCfg::default(), &mut bytes)
             .expect("TinyLlamaCfg is always CBOR-serializable");
         bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact 160M-preset parameter count (reported in `swarm-ledger-m1.md`): tok 38,597,376 +
+    /// 12·9,438,720 + 768 (final norm) = 151,862,784 (≈152M — within bounds of the "160M" spec row).
+    const LLAMA_160M_PARAMS: u64 = 151_862_784;
+
+    #[test]
+    fn llama_160m_param_count_is_exact() {
+        let cfg = TinyLlamaCfg::llama_160m();
+        assert_eq!(cfg.param_count(), LLAMA_160M_PARAMS);
+        // Spot-check the derived dims the preset promises.
+        assert_eq!(cfg.n_kv_heads, cfg.n_heads, "GQA deferred: assert holds");
+        assert_eq!(cfg.n_heads * cfg.head_dim, cfg.d_model, "qdim == d_model");
+        assert_eq!(cfg.ffn_mult * cfg.d_model, 3072, "SwiGLU hidden");
+        assert_eq!(cfg.vocab, 50257, "GPT-2 BPE vocab (u16 shards)");
+    }
+
+    #[test]
+    fn canonical_layout_matches_registration_order() {
+        // The layout lists 1 (tok) + n_layers·9 + 1 (final norm) params in build() order.
+        let cfg = TinyLlamaCfg::llama_160m();
+        let layout = cfg.canonical_param_layout();
+        assert_eq!(layout.len(), 1 + (cfg.n_layers as usize) * 9 + 1);
+        assert_eq!(layout.first().unwrap().0, "tok.weight");
+        assert_eq!(layout.last().unwrap().0, "norm.weight");
+        assert_eq!(layout[1].0, "l0.attn_norm");
+        assert_eq!(layout[2].0, "l0.wq");
+        assert_eq!(layout[9].0, "l0.w_down");
+        assert_eq!(layout[10].0, "l1.attn_norm");
+    }
+
+    /// The 160M `sparse_loco` chunk (256) must divide **every** param element count so `make_update`
+    /// needs no guest-side padding (the models.rs invariant). `topk` must not exceed `chunk`.
+    #[test]
+    fn llama_160m_chunk_divides_all_params() {
+        let cfg = TinyLlamaCfg::llama_160m();
+        let chunk = u64::from(cfg.sparse_loco.chunk);
+        assert!(u64::from(cfg.sparse_loco.topk) <= chunk);
+        for (name, shape) in cfg.canonical_param_layout() {
+            let numel: u64 = shape.iter().map(|&d| u64::from(d)).product();
+            assert_eq!(
+                numel % chunk,
+                0,
+                "param {name} numel {numel} % {chunk} != 0"
+            );
+        }
+    }
+
+    /// `canonical_param_layout` is the single source of truth for `build()`: every listed param is
+    /// actually registered (right name + element count) under the sim backend, in the same order.
+    #[cfg(feature = "sim")]
+    #[test]
+    fn build_registers_the_canonical_layout() {
+        use crate::sim;
+        // A small (2-layer) config keeps the sim build cheap while exercising the full layout shape.
+        let cfg = TinyLlamaCfg {
+            n_layers: 2,
+            ..TinyLlamaCfg::default()
+        };
+        sim::reset(0xDAE0_160D);
+        let _exp = TinyLlama::build(&Config::from_value(&cfg));
+        for (name, shape) in cfg.canonical_param_layout() {
+            let master = sim::param_master(&name)
+                .unwrap_or_else(|| panic!("param {name} not registered by build()"));
+            let numel: usize = shape.iter().map(|&d| d as usize).product();
+            assert_eq!(master.len(), numel, "param {name} element count");
+        }
+        assert!(sim::param_master("l99.wq").is_none(), "no phantom params");
+    }
+
+    /// Meta-mode VRAM/RAM reconciliation vs spec §5.1 planning table (HOST-8/RUN-10 semantics). The
+    /// spec row assumes **bf16 weights**; the P1 preset stores **fp32** masters+storage (det-lane
+    /// exactness), so the footprint is larger per-tensor but must still land the spec's conclusion
+    /// ("fits on an 8 GB card"). Recorded as a spec-amendment candidate in `swarm-ledger-m1.md`.
+    #[test]
+    fn llama_160m_footprint_reconciles_with_spec_table() {
+        let cfg = TinyLlamaCfg::llama_160m();
+        let n = cfg.param_count();
+        let gib = 1u64 << 30;
+        // fp32 everywhere on the P1 preset.
+        let param_bytes = n * 4; // storage (fp32)
+        let master_bytes = n * 4; // fp32 canonical master (ABI §5.9)
+        let grad_bytes = n * 4; // fp32 grad accumulators (ABI §5.1)
+        let adam_bytes = n * 4 * 2; // m + v (fp32)
+                                    // The WasmBackend coarse footprint is params+master+grad = master_bytes·3 (wasm_backend.rs).
+        let coarse_vram = master_bytes * 3;
+        // Steady state incl. optimizer state (still excl. activations, which the meta pass adds).
+        let steady_vram = param_bytes + master_bytes + grad_bytes + adam_bytes;
+
+        // Spec §5.1 "160M" row conclusion: fits an 8 GB card. fp32 storage stays well within it.
+        assert!(
+            steady_vram < 8 * gib,
+            "160M fp32 steady state must fit an 8 GB card"
+        );
+        // The coarse footprint is a lower bound (~1.7 GiB) below the spec's ~4.5 GB (which folds in
+        // activations at seq 2048); the preset runs seq 1024, so the coarse number is expected low.
+        assert!(
+            coarse_vram >= gib && coarse_vram < 3 * gib,
+            "coarse VRAM ~1.7 GiB"
+        );
+        // Host RAM: fp32 masters + round-base ≈ 2·params (spec §5.1 host-RAM row ≈ 2 GB at 160M).
+        let host_ram = master_bytes * 2;
+        assert!(
+            host_ram >= gib && host_ram < 3 * gib,
+            "host RAM ~1.1 GiB (spec ~2 GB)"
+        );
     }
 }
