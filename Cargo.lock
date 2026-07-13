@@ -4499,6 +4499,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-swarm-node"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "daemon-api",
+ "daemon-swarm-run",
+ "daemon-train-client",
+ "futures",
+ "rusqlite",
+ "rusqlite_migration",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "daemon-swarm-observe"
 version = "0.0.1"
 dependencies = [
