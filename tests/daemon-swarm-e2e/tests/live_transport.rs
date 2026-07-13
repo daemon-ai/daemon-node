@@ -17,12 +17,23 @@
 // exception to the workspace `Command` ban, mirroring B2's `spawn_dev_relay`).
 #![allow(clippy::disallowed_methods)]
 
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Once;
 use std::time::Duration;
 
+use ciborium::into_writer;
 use daemon_swarm_proto::peer_id;
+use daemon_swarm_run::backend::{
+    AssessMeta, Assessment, BatchRef, StagedPayload, StateDigest, StepCtx, StepStats,
+    TrainerBackend,
+};
 use daemon_swarm_run::engine::EngineEvent;
 use daemon_swarm_run::harness::{peer_key, LateJoin, SilentDeath, StallFault, SwarmConfig};
-use daemon_swarm_run::live_harness::{run_live_swarm, LiveSwarmConfig};
+use daemon_swarm_run::live_harness::{run_live_swarm, run_live_swarm_with, LiveSwarmConfig};
+use daemon_swarm_run::seam::RoundId;
+use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig, WasmBackendError};
+use daemon_train_sdk::models::TinyLlamaCfg;
 
 /// Assert every round in `run` has a single digest shared by all peers that reported it.
 fn assert_all_agree(run: &daemon_swarm_run::harness::SwarmRun) {
@@ -242,4 +253,174 @@ fn spawn_dev_relay() -> Option<std::process::Child> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()
+}
+
+// ---- flagship on the REAL tiny-llama guest: WasmBackend peers over the live iroh mesh -----------
+
+// -- guest module loading (mirrors tests/wasm_profiles.rs / daemon-train/tests) --
+
+fn guests_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../guests")
+        .canonicalize()
+        .expect("guests workspace path")
+}
+
+fn guest_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SWARM_TEST_GUEST_DIR") {
+        return PathBuf::from(dir);
+    }
+    guests_root().join("target/wasm32-unknown-unknown/release")
+}
+
+static BUILD: Once = Once::new();
+
+fn ensure_built() {
+    BUILD.call_once(|| {
+        if std::env::var("SWARM_TEST_GUEST_DIR").is_ok() {
+            return;
+        }
+        let status = Command::new("cargo")
+            .current_dir(guests_root())
+            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+            .status()
+            .expect("run cargo for guests (dev shell provides the wasm target)");
+        assert!(status.success(), "building guest modules failed");
+    });
+}
+
+fn tiny_llama_wasm() -> Vec<u8> {
+    let path = guest_dir().join("tiny_llama.wasm");
+    if !path.exists() {
+        ensure_built();
+    }
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The live-harness corpus is `Corpus::synthetic` with `seq_len = 8`; the guest is built for
+/// `seq_len = 9` (predicts positions `1..9` from `0..8`) over a small vocab.
+const GUEST_VOCAB: u32 = 64;
+
+fn tiny_cfg_cbor() -> Vec<u8> {
+    let cfg = TinyLlamaCfg {
+        n_layers: 1,
+        seq_len: 9, // corpus seq_len (8) + 1
+        vocab: GUEST_VOCAB,
+        profile: "sparse_loco".to_string(),
+        ..TinyLlamaCfg::default()
+    };
+    let mut b = Vec::new();
+    into_writer(&cfg, &mut b).expect("cbor");
+    b
+}
+
+/// A [`TrainerBackend`] adapter over the real tiny-llama [`WasmBackend`] that (1) maps the synthetic
+/// corpus's u16 token ids (`< 32000`) into the tiny guest's vocabulary (`token % GUEST_VOCAB`)
+/// before each `train_step` — deterministic and identical across peers, so the consensus digests
+/// are unaffected (a test-side stand-in for tokenizing the corpus at this vocab) — and (2) wraps
+/// the `Send`-only `WasmBackend` in a `Mutex` to satisfy the harness's `Sync` bound (the engine
+/// owns its backend exclusively, so the lock is uncontended by construction).
+struct VocabClampBackend {
+    inner: std::sync::Mutex<WasmBackend>,
+}
+
+impl VocabClampBackend {
+    fn lock(&self) -> std::sync::MutexGuard<'_, WasmBackend> {
+        self.inner.lock().expect("wasm backend lock")
+    }
+}
+
+impl TrainerBackend for VocabClampBackend {
+    type Error = WasmBackendError;
+
+    fn build(&mut self, config: &[u8]) -> Result<(), Self::Error> {
+        self.lock().build(config)
+    }
+    fn assess(&self, meta: &AssessMeta) -> Result<Assessment, Self::Error> {
+        self.lock().assess(meta)
+    }
+    fn train_step(&mut self, batch: &BatchRef, ctx: StepCtx) -> Result<StepStats, Self::Error> {
+        let clamped = BatchRef {
+            tokens: batch.tokens.iter().map(|t| t % GUEST_VOCAB).collect(),
+            seq_len: batch.seq_len,
+        };
+        self.lock().train_step(&clamped, ctx)
+    }
+    fn inner_update(&mut self, inner_step: u32) -> Result<(), Self::Error> {
+        self.lock().inner_update(inner_step)
+    }
+    fn make_update(&mut self, round: RoundId) -> Result<Vec<u8>, Self::Error> {
+        self.lock().make_update(round)
+    }
+    fn ingest(
+        &mut self,
+        round: RoundId,
+        staged: &[StagedPayload],
+    ) -> Result<StateDigest, Self::Error> {
+        self.lock().ingest(round, staged)
+    }
+    fn checkpoint_save(&self) -> Result<Vec<u8>, Self::Error> {
+        self.lock().checkpoint_save()
+    }
+    fn checkpoint_load(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.lock().checkpoint_load(bytes)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_flagship_tiny_llama_wasm_over_iroh() {
+    // THE transport exit-gate flagship (TDD §3.8): 3 peers running the REAL tiny-llama guest
+    // (`WasmBackend` — wasmtime host training) drive N≥10 rounds over the real iroh mesh + the
+    // shared payload store, and every round's post-ingest det digest is byte-identical across
+    // peers; the replay verification is green over the live transport's message log.
+    let wasm = tiny_llama_wasm();
+    let config = tiny_cfg_cbor();
+
+    let cfg = LiveSwarmConfig::new(SwarmConfig {
+        num_peers: 3,
+        num_rounds: 10,
+        steps_per_round: 2,
+        micro_batch: 2,
+        ..SwarmConfig::small(10)
+    });
+    let run = run_live_swarm_with(cfg, |_i| {
+        let mut inner = WasmBackend::new(WasmBackendConfig {
+            wasm: wasm.clone(),
+            engine: EngineConfig::default(),
+        })
+        .expect("construct WasmBackend");
+        inner.build(&config).expect("da_build");
+        VocabClampBackend {
+            inner: std::sync::Mutex::new(inner),
+        }
+    })
+    .await
+    .expect("tiny-llama live run");
+
+    assert!(run.left_peers().is_empty(), "no peer should leave");
+    assert_all_agree(&run);
+
+    let by_round = run.digests_by_round();
+    assert_eq!(
+        by_round.len(),
+        10,
+        "10 wasm-backed rounds over the live mesh"
+    );
+    for (round, peers) in &by_round {
+        assert_eq!(peers.len(), 3, "all 3 peers report round {round}");
+    }
+    // The digest transcript evolves (the swarm is learning, not a vacuous constant).
+    let transcript: Vec<_> = run.agreed_transcript().into_values().collect();
+    assert!(
+        transcript.windows(2).any(|w| w[0] != w[1]),
+        "the tiny-llama digest transcript must evolve across rounds"
+    );
+
+    // PROTO-20 from the live-transport run's message log.
+    let replay = run.replay.as_ref().expect("coordinator replay captured");
+    assert_eq!(replay.recorded_rounds(), 10);
+    assert!(
+        replay.verify(),
+        "tiny-llama live-run replay is byte-identical"
+    );
 }

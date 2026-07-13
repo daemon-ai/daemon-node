@@ -159,6 +159,11 @@ pub async fn run_live_swarm(cfg: LiveSwarmConfig) -> Result<SwarmRun, SwarmRunEr
 /// Like [`run_live_swarm`], but each peer's [`TrainerBackend`] is produced by `make_backend(index)`
 /// — so the e2e crate can inject the real tiny-llama `WasmBackend` (which lives outside this crate's
 /// dependency tree) for the flagship live run. The factory MUST return an already-`build`-ed backend.
+///
+/// `Sync` is required by the engine's `&self` async publish path (its future holds `&RoundEngine`).
+/// A `Send`-only backend like `WasmBackend` rides in a `Mutex<T>` newtype adapter (`Mutex<T>: Sync`
+/// for `T: Send`; the engine's exclusive `&mut` access means the lock is uncontended) — see the
+/// tiny-llama flagship in `daemon-swarm-e2e/tests/live_transport.rs`.
 #[allow(clippy::too_many_lines)]
 pub async fn run_live_swarm_with<B, F>(
     cfg: LiveSwarmConfig,
