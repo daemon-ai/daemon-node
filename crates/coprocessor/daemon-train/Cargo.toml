@@ -50,6 +50,10 @@ daemon-swarm-net = { workspace = true }
 daemon-provision = { workspace = true }
 # Async runtime for the `daemon-train-worker` binary's stdio command/event loop. Bin target only.
 tokio = { workspace = true }
+# Consent-gated crash reporting for the `daemon-train-worker` binary (panics + native minidumps —
+# the worker links heavy native engine trees, so a segfault is a real failure mode). Bin target
+# only; a runtime no-op unless the spawning node injected a DSN + `DAEMON_CRASH_CONSENT=1`.
+daemon-telemetry = { workspace = true }
 
 # Per-backend lane selection (spec §10.1). These features only toggle burn's *dependency* backend
 # features — no code path changes this wave (Wave-0 scaffold): the `OpBackend` seam is still the

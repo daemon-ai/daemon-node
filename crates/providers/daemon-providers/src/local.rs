@@ -428,12 +428,17 @@ struct Worker {
 impl Worker {
     /// Spawn the worker, send `Load`, and block until it reports `Ready` (or fails / times out).
     async fn spawn(cfg: &WorkerConfig) -> Result<Worker, Failure> {
+        let session = SessionId::new("daemon-infer-worker");
+        // Crash-reporting correlation: forward the node's DSN + current consent and tag the child
+        // with this placement's session id + our pid, so an infer-worker crash correlates with the
+        // node in one Sentry project. A no-op env-wise when no DSN is set.
+        let mut env = cfg.env.clone();
+        env.extend(daemon_telemetry::correlation_env(session.as_str()));
         let spec = PlacementSpec {
             program: cfg.worker_bin.clone(),
             args: vec!["--engine".to_string(), cfg.engine.as_str().to_string()],
-            env: cfg.env.clone(),
+            env,
         };
-        let session = SessionId::new("daemon-infer-worker");
         let Placement { channel, child } = ProcessProvisioner::new()
             .place(&session, spec)
             .await

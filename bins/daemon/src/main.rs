@@ -101,6 +101,15 @@ struct Cli {
     command: Option<Command>,
     #[command(flatten)]
     overrides: ConfigOverrides,
+    /// Internal: the socket the out-of-process crash-reporter (minidump) monitor listens on. It is
+    /// appended by `minidumper_child` when it re-exec's this binary as the monitor process; users
+    /// never pass it. Declared (global, hidden) only so the monitor copy is not rejected by clap
+    /// before it reaches `init_crash_reporting` — the value itself is consumed from `argv` there.
+    // Read out of `argv` by `minidumper_child`, never through this field; clap only has to tolerate
+    // the flag's presence, so the field itself is intentionally never read.
+    #[allow(dead_code)]
+    #[arg(long = "crash-reporter-server", hide = true, global = true)]
+    crash_reporter_server: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -205,6 +214,19 @@ async fn main() -> anyhow::Result<()> {
     if _telemetry.is_exporting() {
         daemon_core::set_genai_capture(true);
     }
+
+    // Consent-gated crash reporting (Sentry), tagged with the process role so a host crash and a
+    // placed-child / transport-server crash are distinguishable in one project. A no-op unless
+    // `DAEMON_SENTRY_DSN` is set and `DAEMON_CRASH_CONSENT=1`. Held for the whole of `main`. The
+    // component is known post-parse; the minidump monitor re-exec's this binary with a hidden
+    // `--crash-reporter-server` arg (accepted by `Cli` above), so the monitor copy reaches this
+    // init and then exits inside it without running the role dispatch below.
+    let crash_component = match &cli.command {
+        Some(Command::Internal(InternalCmd::PlacedChild)) => "placed-child",
+        Some(Command::Internal(InternalCmd::TransportServer { .. })) => "transport-server",
+        _ => "host",
+    };
+    let _crash = daemon_telemetry::init_crash_reporting(crash_component);
 
     match cli.command {
         Some(Command::Internal(InternalCmd::PlacedChild)) => {

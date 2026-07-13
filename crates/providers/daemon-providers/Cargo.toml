@@ -8,6 +8,9 @@ license.workspace = true
 [dependencies]
 daemon-core = { workspace = true }
 daemon-common = { workspace = true }
+# Crash-reporting correlation env (`crash::correlation_env`) injected into spawned infer workers so
+# a worker crash correlates with the node in one Sentry project. Light dep (no engine libs).
+daemon-telemetry = { workspace = true }
 # The local-inference worker: only the light `protocol` module is needed here (no engine, no ML
 # tree). The workspace dep is default-features = false, so this stays cheap.
 daemon-infer = { workspace = true }

@@ -213,12 +213,16 @@ impl Worker {
             args.push("--state-dir".to_string());
             args.push(dir.to_string_lossy().into_owned());
         }
+        let session = SessionId::new("daemon-metta-worker");
+        // Crash-reporting correlation env (DSN + consent + session id + parent pid); no-op when the
+        // node has no DSN. Mirrors the infer/train worker spawns.
+        let mut env = cfg.env.clone();
+        env.extend(daemon_telemetry::correlation_env(session.as_str()));
         let spec = PlacementSpec {
             program: cfg.worker_bin.clone(),
             args,
-            env: cfg.env.clone(),
+            env,
         };
-        let session = SessionId::new("daemon-metta-worker");
         let Placement { channel, child } = ProcessProvisioner::new()
             .place(&session, spec)
             .await

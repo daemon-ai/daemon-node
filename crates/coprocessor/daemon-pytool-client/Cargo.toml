@@ -14,6 +14,8 @@ daemon-pytool = { workspace = true }
 # The supervised process boundary (spawn + length-framed cut), shared with the metta/infer clients.
 daemon-provision = { workspace = true }
 daemon-common = { workspace = true }
+# Crash-reporting correlation env injected into the spawned pytool worker (light dep, no engine libs).
+daemon-telemetry = { workspace = true }
 # The `Tool` trait the proxy implements + the `ToolDetail` envelope it maps results onto.
 daemon-core = { workspace = true }
 daemon-protocol = { workspace = true }

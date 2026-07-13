@@ -322,12 +322,16 @@ struct Worker {
 impl Worker {
     /// Spawn the worker, complete the `Ready` + `ListTools` handshake, and start the reply router.
     async fn spawn(cfg: &PyToolConfig) -> Result<Arc<Worker>, PyToolError> {
+        let session = SessionId::new("daemon-pytool-worker");
+        // Crash-reporting correlation env (DSN + consent + session id + parent pid); no-op when the
+        // node has no DSN. Mirrors the infer/train worker spawns.
+        let mut env = cfg.env.clone();
+        env.extend(daemon_telemetry::correlation_env(session.as_str()));
         let spec = PlacementSpec {
             program: cfg.program.clone(),
             args: cfg.args.clone(),
-            env: cfg.env.clone(),
+            env,
         };
-        let session = SessionId::new("daemon-pytool-worker");
         let Placement { channel, child } = ProcessProvisioner::new()
             .place(&session, spec)
             .await

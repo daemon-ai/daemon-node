@@ -18,6 +18,9 @@ path = "src/bin/fake-train-worker.rs"
 # Burn — so the daemon process stays out of the worker fault domain (§10.1).
 daemon-common = { workspace = true }
 daemon-provision = { workspace = true }
+# Crash-reporting correlation env (`crash::correlation_env`) injected into the spawned train worker
+# so a worker crash correlates with the node in one Sentry project. Light dep (no engine libs).
+daemon-telemetry = { workspace = true }
 # The worker protocol (§10.2) lives in `daemon-swarm-run` so lane E's worker implements it too.
 daemon-swarm-run = { workspace = true }
 tokio = { workspace = true }

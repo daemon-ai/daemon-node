@@ -46,6 +46,12 @@ enum InferCmd {
 
 #[tokio::main]
 async fn main() {
+    // Consent-gated crash reporting (component = infer-worker). Armed BEFORE clap parses: the
+    // minidump monitor re-exec's this binary with a `--crash-reporter-server` arg the worker CLI
+    // does not declare, so the monitor copy must reach this init (where it runs the server and
+    // exits) before argument parsing would reject that flag. A no-op unless the spawning node
+    // injected a DSN + `DAEMON_CRASH_CONSENT=1`.
+    let _crash = daemon_telemetry::init_crash_reporting("infer-worker");
     let cli = <Cli as clap::Parser>::parse();
     // A one-shot `quantize` subcommand (not part of the stdio protocol).
     if let Some(InferCmd::Quantize { args }) = cli.cmd {

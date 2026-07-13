@@ -309,12 +309,17 @@ struct Worker {
 impl Worker {
     /// Spawn the worker and block until it reports `Ready` (or fails / times out).
     async fn spawn(cfg: &TrainClientConfig) -> Result<Worker, TrainClientError> {
+        let session = SessionId::new("daemon-train-worker");
+        // Crash-reporting correlation: forward the node's DSN + current consent and tag the child
+        // with this placement's session id + our pid, so a train-worker crash correlates with the
+        // node in one Sentry project. A no-op env-wise when no DSN is set.
+        let mut env = cfg.env.clone();
+        env.extend(daemon_telemetry::correlation_env(session.as_str()));
         let spec = PlacementSpec {
             program: cfg.worker_bin.clone(),
             args: cfg.args.clone(),
-            env: cfg.env.clone(),
+            env,
         };
-        let session = SessionId::new("daemon-train-worker");
         let Placement { channel, child } = ProcessProvisioner::new()
             .place(&session, spec)
             .await

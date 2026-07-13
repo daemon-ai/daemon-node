@@ -57,6 +57,11 @@ pub(crate) const SEQ: u32 = 8;
 
 #[tokio::main]
 async fn main() {
+    // Consent-gated crash reporting (component = train-worker). Armed as the first action: the
+    // minidump monitor re-exec's this binary with a `--crash-reporter-server` arg, and this init
+    // runs the monitor server (then exits) in that copy before it touches the stdio cut. A no-op
+    // unless the spawning node injected a DSN + `DAEMON_CRASH_CONSENT=1`.
+    let _crash = daemon_telemetry::init_crash_reporting("train-worker");
     let channel = CutChannel::from_stdio();
     let (writer, mut reader) = channel.split();
 

@@ -13,6 +13,12 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Crash reporting (consent-gated; see `crash.rs`). `sentry` owns the panic hook + event transport;
+# `sentry-rust-minidump` spawns the out-of-process minidump monitor for native crashes. Both are
+# always compiled (no feature gate): the reporter is a runtime no-op unless a DSN is present and
+# `DAEMON_CRASH_CONSENT=1`, so a build with crash reporting "off" still links the same code path.
+sentry = { workspace = true }
+sentry-rust-minidump = { workspace = true }
 # verifiable-trace stack: deterministic CBOR + Gordian Envelope digest tree + ed25519 keys.
 dcbor = { workspace = true }
 bc-envelope = { workspace = true }

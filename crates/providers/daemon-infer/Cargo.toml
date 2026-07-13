@@ -53,6 +53,11 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 daemon-provision = { workspace = true }
+# Consent-gated crash reporting for the worker process (panics + native minidumps). Light deps
+# (no engine libs); the reporter is a no-op unless a DSN + `DAEMON_CRASH_CONSENT=1` are in the
+# environment the spawning node injects. `daemon-common` supplies the release version string.
+daemon-telemetry = { workspace = true }
+daemon-common = { workspace = true }
 # Optional engines — feature-gated, never built in the default/stub workspace gate.
 llama-cpp-4 = { workspace = true, optional = true }
 encoding_rs = { workspace = true, optional = true }

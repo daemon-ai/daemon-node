@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod crash;
 pub mod feedback;
 pub mod fields;
 pub mod journal;
@@ -29,6 +30,7 @@ mod otel;
 pub mod spans;
 pub mod trace;
 
+pub use crash::{correlation_env, init_crash_reporting, init_panic_reporting, CrashGuard};
 pub use journal::{
     decode_entry, encode_entry, segment_root, verify_segment, JournalEntryView, JournalPayload,
     SegmentInput, TraceSigner, VerifyError, VerifyingKey, GENESIS_ROOT,

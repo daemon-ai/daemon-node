@@ -33,6 +33,9 @@ fn default_socket() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Panic-only crash reporting (component = cli). No minidump monitor (hence no re-exec), so
+    // ordering vs. clap does not matter. A no-op unless a DSN + `DAEMON_CRASH_CONSENT=1` are set.
+    let _crash = daemon_telemetry::init_panic_reporting("cli");
     let cli = Cli::parse();
     let socket = cli.socket.clone().unwrap_or_else(default_socket);
     let client = ApiClient::new(socket);

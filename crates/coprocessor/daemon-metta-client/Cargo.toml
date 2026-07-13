@@ -13,6 +13,8 @@ path = "src/lib.rs"
 daemon-metta = { workspace = true }
 daemon-provision = { workspace = true }
 daemon-common = { workspace = true }
+# Crash-reporting correlation env injected into the spawned metta worker (light dep, no engine libs).
+daemon-telemetry = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

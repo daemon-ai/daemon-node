@@ -270,6 +270,16 @@ opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-client", "reqwest-rustls"] }
 tracing-opentelemetry = "0.33"
+# Crash reporting (Sentry SaaS; consent-gated — see `daemon-telemetry::crash`). `sentry` captures
+# Rust panics (the `panic` integration) + enriches events with device/OS `contexts` and native
+# `debug-images` for symbolication; `sentry-rust-minidump` spawns an out-of-process monitor that
+# writes a minidump on a native crash (SIGSEGV / abort / FFI fault). default-features = false drops
+# sentry's native-tls default transport: we pin the `reqwest` transport onto `rustls`, reusing the
+# tree's rustls 0.23 + aws-lc-rs provider (no native-tls/openssl, no second crypto backend). Wired
+# into every long-lived node role from `daemon-telemetry`; upload is armed only when
+# `DAEMON_CRASH_CONSENT=1` and a `DAEMON_SENTRY_DSN` is present (otherwise a disabled no-op).
+sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "rustls"] }
+sentry-rust-minidump = "0.16"
 # read-mostly immutable snapshot publishing (routing/model catalog handles)
 arc-swap = "1"
 # verifiable-trace stack (Blockchain Commons): dcbor for deterministic CBOR,
@@ -425,6 +435,21 @@ strip = "symbols"  # -21% alone: drop .symtab/.strtab; unwinding (.eh_frame) is 
 lto = "thin"       # cross-crate DCE+inlining; -3% size on top of opt-s/cgu1 (-17% on daemon-cli) at ~no wall cost
 opt-level = "s"    # -31% vs opt 3 at same settings; hot compute (ggml, aws-lc-rs, SQLite) is C/asm built at its own -O3, the Rust side is control plane + CBOR framing
 codegen-units = 1  # -17% more (better DCE/less duplication); full rebuild 5m08 -> 6m09 on 32 cores, and thin-LTO link stays parallel
+
+# Crash-symbol profile (Sentry). Inherits the shipped `release` profile EXACTLY but keeps debug
+# line tables and does NOT strip, so a build under this profile yields binaries whose DWARF
+# `sentry-cli debug-files upload --include-sources` can ingest to symbolicate release minidumps.
+# The shipped `release` profile above is UNTOUCHED — normal `--release` builds (and every Nix
+# output, which builds `--release`) stay byte-identical and small; CI builds `--profile
+# release-symbols` as a SEPARATE step purely to extract debug files (the stripped release binaries
+# are what ships). `panic = "unwind"` is preserved (never abort). Closure-size impact: none on the
+# shipped artifacts; the release-symbols binaries are larger (unstripped + line tables) but are
+# upload-only and never packaged. `debug = "line-tables-only"` keeps them far smaller than full
+# `debug = 2` while still giving file/line/function symbolication.
+[profile.release-symbols]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
 
 [profile.dev]
 panic = "unwind"
