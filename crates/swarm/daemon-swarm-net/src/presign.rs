@@ -194,6 +194,9 @@ pub struct HttpPresignClient {
     egress: EgressClient,
     coordinator_base: String,
     bearer: Option<String>,
+    /// The internal identity headers (`x-daemon-org-id` / `x-daemon-actor`) for the
+    /// direct-to-`apps/swarm` dev path (A3, additive — mirrors `RegistryClient::with_internal`).
+    internal: Option<(String, String)>,
     /// Clock-skew safety margin (seconds): a cached URL is reused only while `expires_at > now + margin`.
     skew_margin_s: u64,
     cache: Mutex<HashMap<CacheKey, PresignResponse>>,
@@ -206,6 +209,7 @@ impl HttpPresignClient {
             egress,
             coordinator_base: coordinator_base.into().trim_end_matches('/').to_string(),
             bearer: None,
+            internal: None,
             skew_margin_s: 5,
             cache: Mutex::new(HashMap::new()),
         }
@@ -215,6 +219,15 @@ impl HttpPresignClient {
     #[must_use]
     pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
         self.bearer = Some(token.into());
+        self
+    }
+
+    /// Attach the internal identity headers (the direct-to-`apps/swarm` dev path; A3, additive —
+    /// mirrors [`crate::RegistryClient::with_internal`]). Never hardcoded: sourced from
+    /// `JoinRun.credentials` / node config.
+    #[must_use]
+    pub fn with_internal(mut self, org_id: impl Into<String>, actor: impl Into<String>) -> Self {
+        self.internal = Some((org_id.into(), actor.into()));
         self
     }
 
@@ -248,6 +261,11 @@ impl PresignClient for HttpPresignClient {
             .map_err(|e| SwarmNetError::Transport(format!("encode presign request: {e}")))?;
         if let Some(token) = &self.bearer {
             ereq = ereq.bearer_auth(token);
+        }
+        if let Some((org_id, actor)) = &self.internal {
+            ereq = ereq
+                .header("x-daemon-org-id", org_id)
+                .header("x-daemon-actor", actor);
         }
         let resp = self
             .egress

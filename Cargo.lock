@@ -4501,15 +4501,21 @@ dependencies = [
 name = "daemon-swarm-e2e"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "ciborium",
+ "daemon-api",
+ "daemon-egress",
  "daemon-swarm-coordinator",
  "daemon-swarm-net",
+ "daemon-swarm-node",
  "daemon-swarm-observe",
  "daemon-swarm-proto",
  "daemon-swarm-run",
  "daemon-train",
+ "daemon-train-client",
  "daemon-train-sdk",
+ "serde_json",
  "tokio",
 ]
 

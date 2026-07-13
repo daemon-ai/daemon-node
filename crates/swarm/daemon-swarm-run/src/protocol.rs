@@ -392,6 +392,11 @@ pub struct EngineParams {
     pub corpus_tokens_per_shard: u64,
     /// Synthetic-corpus sequence length (tokens).
     pub corpus_seq_len: u32,
+    /// Clamp corpus token ids into the experiment's vocabulary (`token % clamp`; `0` = no clamp) —
+    /// the deterministic per-token stand-in for tokenizing the corpus at the model's vocab (the B3
+    /// live-e2e shim recipe, applied identically by every peer so digests agree).
+    #[serde(default)]
+    pub corpus_vocab_clamp: u32,
 }
 
 /// The canonical-CBOR body of [`Command::JoinRun`]'s `credentials` (A3, frozen at Merge 2). Authored
@@ -599,6 +604,7 @@ mod tests {
                 corpus_shards: 4,
                 corpus_tokens_per_shard: 256,
                 corpus_seq_len: 8,
+                corpus_vocab_clamp: 64,
             },
         };
         let bytes = creds.to_bytes().expect("encode credentials");

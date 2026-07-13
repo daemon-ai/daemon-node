@@ -180,6 +180,7 @@ pub(crate) async fn join_and_run_live(
         module.to_vec(),
         config.to_vec(),
         out_tx.clone(),
+        creds.engine.corpus_vocab_clamp,
     );
 
     // EngineEvent → protocol::Event forwarder (per-round RunPhase/RoundOutcome/Warning).
@@ -260,12 +261,24 @@ enum WorkerStore {
 fn build_store(run_id: &str, creds: &JoinCredentials) -> Result<WorkerStore, String> {
     match &creds.presign_base {
         Some(base) => {
+            use daemon_swarm_run::protocol::WsAuthSpec;
             let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
                 .map_err(|e| format!("egress client: {e}"))?;
             let presign_egress =
                 daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
                     .map_err(|e| format!("presign egress client: {e}"))?;
-            let presign = HttpPresignClient::new(presign_egress, base.clone());
+            // The presign requests carry the same swarm credential as the WS/registry surfaces
+            // (Bearer on the gateway path, internal identity headers direct-to-apps/swarm).
+            let presign = match &creds.ws_auth {
+                WsAuthSpec::None => HttpPresignClient::new(presign_egress, base.clone()),
+                WsAuthSpec::Bearer(t) => {
+                    HttpPresignClient::new(presign_egress, base.clone()).with_bearer(t.clone())
+                }
+                WsAuthSpec::Internal { org_id, actor } => {
+                    HttpPresignClient::new(presign_egress, base.clone())
+                        .with_internal(org_id.clone(), actor.clone())
+                }
+            };
             Ok(WorkerStore::R2(R2Store::new(
                 presign,
                 egress,
@@ -399,6 +412,9 @@ struct LadderBackend {
     module: Vec<u8>,
     config: Vec<u8>,
     events: UnboundedSender<Event>,
+    /// Clamp corpus token ids into the experiment vocab (`token % clamp`; 0 = off) — the B3 shim
+    /// recipe, applied identically by every peer (deterministic, so digests agree).
+    vocab_clamp: u32,
     round: RoundId,
     halvings: u32,
 }
@@ -409,12 +425,14 @@ impl LadderBackend {
         module: Vec<u8>,
         config: Vec<u8>,
         events: UnboundedSender<Event>,
+        vocab_clamp: u32,
     ) -> Self {
         Self {
             inner: std::sync::Mutex::new(inner),
             module,
             config,
             events,
+            vocab_clamp,
             round: 0,
             halvings: 0,
         }
@@ -445,6 +463,16 @@ impl TrainerBackend for LadderBackend {
         batch: &BatchRef,
         ctx: StepCtx,
     ) -> Result<daemon_swarm_run::backend::StepStats, Self::Error> {
+        let clamped;
+        let batch = if self.vocab_clamp > 0 {
+            clamped = BatchRef {
+                tokens: batch.tokens.iter().map(|t| t % self.vocab_clamp).collect(),
+                seq_len: batch.seq_len,
+            };
+            &clamped
+        } else {
+            batch
+        };
         let first = self
             .inner
             .get_mut()

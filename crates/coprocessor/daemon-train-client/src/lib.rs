@@ -236,12 +236,14 @@ impl TrainSupervisor {
         .await
     }
 
-    /// Leave a run (§10.2). Fire-and-forget.
+    /// Leave a run (§10.2). Fire-and-forget. Ends any streaming join: the pump sink is cleared so
+    /// subsequent request/reply commands (ping/probe) route to the inbox again.
     pub async fn leave(
         &self,
         run_id: impl Into<String>,
         mode: LeaveMode,
     ) -> Result<(), TrainClientError> {
+        *self.inner.pump.lock().expect("pump lock") = None;
         self.send_oneway(Command::Leave {
             run_id: run_id.into(),
             mode,
@@ -381,11 +383,12 @@ impl Worker {
                         if !first {
                             let sink = pump.lock().expect("pump lock").clone();
                             if let Some(tx) = sink {
-                                if tx.send(event).is_err() {
-                                    // The node dropped the stream (run left): back to inbox routing.
-                                    *pump.lock().expect("pump lock") = None;
+                                if tx.send(event.clone()).is_ok() {
+                                    continue;
                                 }
-                                continue;
+                                // The node dropped the stream (run left): clear the sink and fall
+                                // through so THIS event still reaches the request/reply inbox.
+                                *pump.lock().expect("pump lock") = None;
                             }
                         }
                         first = false;
