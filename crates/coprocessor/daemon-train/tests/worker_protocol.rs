@@ -103,9 +103,18 @@ async fn supervisor_probe_assess_join() {
     cfg.op_timeout = Duration::from_secs(60);
     let sup = TrainSupervisor::new(cfg);
 
-    // Probe: a real host capability report — CPU-only, the full tabi@1 vocabulary.
+    // Probe: a real host capability report — the full tabi@1 vocabulary. A default (CPU-only)
+    // build reports gpus = 0; a `wgpu` build reports gpus = 1 iff a usable adapter came up (G2).
     let hw = sup.probe().await.expect("probe");
-    assert_eq!(hw.gpus, 0, "this build has no GPU lane");
+    if cfg!(feature = "wgpu") {
+        assert!(hw.gpus <= 1, "wgpu probe reports 0 or 1 usable adapters");
+        assert!(
+            hw.backend_lanes.iter().any(|l| l == "cpu"),
+            "the cpu lane is always present"
+        );
+    } else {
+        assert_eq!(hw.gpus, 0, "this build has no GPU lane");
+    }
     assert_eq!(hw.capabilities.abi_version, 1);
     assert_eq!(
         hw.capabilities.ops.len(),

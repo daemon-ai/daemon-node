@@ -40,6 +40,10 @@ fn guest_dir() -> PathBuf {
 
 static BUILD: Once = Once::new();
 
+// Stale-guest guard (Merge-1 adjudication follow-on): a stale gitignored `.wasm` fails as NaN, not
+// loudly, so the harness ALWAYS runs the (incremental, no-op-when-fresh) guest build before loading
+// — rebuilding on source drift instead of merely detecting it. `SWARM_TEST_GUEST_DIR` (prebuilt
+// artifacts, e.g. CI) skips the build.
 fn ensure_built() {
     BUILD.call_once(|| {
         if std::env::var("SWARM_TEST_GUEST_DIR").is_ok() {
@@ -55,10 +59,8 @@ fn ensure_built() {
 }
 
 fn wasm(name: &str) -> Vec<u8> {
+    ensure_built();
     let path = guest_dir().join(format!("{}.wasm", name.replace('-', "_")));
-    if !path.exists() {
-        ensure_built();
-    }
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
