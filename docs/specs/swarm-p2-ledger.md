@@ -333,3 +333,209 @@ All green except the documented pre-existing `daemon-conformance` flake (fully g
 - **All lanes:** frozen files (root `Cargo.toml`/`deny.toml`/`flake.nix`) are locked — route new
   third-party deps / features-that-pull-new-crates through the integration owner. Run
   `build-guests` after every checkout/rebase.
+
+---
+
+## Merge 1 — integration record
+
+Integration owner folded **swarm/a1** and **swarm/b1** into `integrations/swarm-p2`, adjudicated the
+guest manifest, ran the first live node↔cloud check against the C1 wasm-tick DO, and decided the three
+lane-flagged Merge-1 items. Base at merge start: trunk `3cd43c1` (Wave-0). daemon-cloud coordination
+branch `swarm/p2-integration` created from `swarm/c1` `3978673` (its master untouched; nothing pushed).
+
+### Merges (`--no-ff`, ort) — ZERO conflicts
+
+| First-parent commit | Subject |
+|---|---|
+| `c05042c` | `Merge branch 'swarm/a1' into integrations/swarm-p2` |
+| `80ec8fe` | `Merge branch 'swarm/b1' into integrations/swarm-p2` |
+| `bb197db` | `fix(guests): downgrade stale-guest guard to warn-and-rebuild (Merge-1 adjudication)` |
+| `3d0f849` | `test(swarm-net): Merge-1 live node↔cloud check — WsControlPlane vs wasm-tick DO` |
+
+Both lane merges were clean (disjoint crates by construction). `Cargo.lock` auto-merged additively.
+The only co-touched file was `guests/guests.blake3` (a1 declined to touch it; b1's merge brought its
+regenerated value) — reconciled below. **No conflict markers, no manual resolution.**
+
+### Guest-manifest adjudication (root cause + decision) — the flagged IMPORTANT item
+
+**Root cause (empirically pinned, not path-string leakage):**
+- `--remap-path-prefix` is working correctly. The remapped path *strings* in the two guests' `.wasm`
+  are byte-identical across worktrees (verified: `/daemon-node/...`, `/cargo/...`, `/rustc/...`,
+  `/nix/store/...` — no raw `home/j/.../daemon-worktree/...` anywhere).
+- The residual drift is a **code-section reordering**: for `test_abi_basic.wasm`, ~45k of 88k bytes
+  differ across worktrees and **44992 of them are in the wasm `code` section** (plus reshuffled
+  `type`/`func`/`elem`/`export` index tables) — the signature of symbol-hash-ordered codegen, not
+  string data. `tiny_llama.wasm` happens to be byte-identical between the integration and b1
+  worktrees but differs in a1 (a hash-bucket coincidence, same mechanism).
+- The build is **deterministic run-to-run within a fixed checkout** (two clean rebuilds in the trunk
+  worktree produced identical bytes; `-Ccodegen-units=1` also stable but different bytes) and
+  **differs per worktree**. So the perturbation is **keyed on the absolute checkout path**, via a
+  channel `--remap-path-prefix` does not touch: cargo derives each **path-package's**
+  crate-disambiguator (`-C metadata`) from its absolute manifest dir; that hash seeds symbol mangling,
+  which the codegen orders by, so the module's section ordering shifts between worktrees.
+- **Not fixable on the pinned stable toolchain this wave.** Neutralizing the disambiguator needs
+  nightly `-Z`/`trim-paths` (already rejected in Wave-0) or building all guests from one canonical
+  fixed path (fragile: path-dep `../../crates/...` canonicalizes to the real checkout). `-Cmetadata`
+  via `RUSTFLAGS` only *adds* salt; it cannot remove cargo's path-derived component.
+
+**Decision — downgrade the guard to warn-and-rebuild (`bb197db`).** The guard's purpose is
+stale-artifact detection, not cross-machine byte identity. In all 9 harness copies
+(`daemon-train/tests/{guest_lifecycle,preset_160m,preset_160m_wgpu,wgpu_lifecycle,worker_protocol,
+wasm_backend_determinism,reference/mod}.rs` + `daemon-swarm-e2e/tests/{live_transport,wasm_profiles}.rs`)
+`verify_guest_manifest` now **warns** on a hash mismatch instead of `assert_eq!`, while a
+**missing/unreadable** module still fails loud (the real NaN risk). `ensure_built()` already rebuilds
+before loading, so the module in use is always fresh; the committed manifest is an **advisory record
+of one canonical build**. **Canonical trunk manifest** = the integration-worktree build:
+`test_abi_basic 034d0e09…`, `tiny_llama 198ee07f…` (re-generated + committed). Validated:
+`guest_lifecycle` 9/9 green with no warning on the trunk (bytes match the canonical manifest).
+**Superproject note:** the proposed CI drift check (`build-guests` then
+`git diff --exit-code guests/guests.blake3`) must NOT be a hard gate on a CI runner at a different
+path — same cross-machine caveat; make it warn-and-rebuild or pin the CI build path.
+
+### Cross-lane LIVE check (the Merge-1 headline) — first real node↔cloud contact — GREEN
+
+A1's `WsControlPlane` (the real node client, `ws` feature) driven against C1's real `RunCoordinatorDO`
+(the compiled wasm `tick`) under `wrangler dev` (port 8795, `pnpm -C apps/swarm dev`). Harness:
+`crates/swarm/daemon-swarm-net/tests/ws_live_do.rs` (`3d0f849`, env-gated by `SWARM_LIVE_WS_URL`, skips
+in the offline gate) + `apps/swarm/scripts/seed_run.mjs` on the cloud branch (`ef9bc8f`) which POSTs a
+valid ed25519-signed `CreateRunRequest`. Evidence (all GREEN):
+- **Registry / DO boot:** `POST /runs` → 201 (descriptor), `GET /runs/:id` → 200 (discovery-complete),
+  `GET /runs/:id/state` → `{phase:"waiting",roster:[],coord_pubkey:…}` (DO `init` seeded the wasm shell).
+- **Framing byte-for-byte:** peer A publishes the committed golden `SignedMessage` `Commitment` frame;
+  the real DO relays the **exact bytes** to peer B (`webSocketMessage` → `broadcast([bytes], ws)`,
+  sender excluded); A self-delivers once; no echo, no duplicate. The DO consumes/relays the frame
+  A1's decoder/encoder and C1's `decodeSignedFrame` agree on, byte-identical to the committed golden.
+- **Reconnect/resubscribe:** both planes connect (`connect_count()==1`, `is_connected()`); a registered
+  resubscribe frame is delivered over the live DO. (Forced server-side sever + reconnect stays covered
+  by A1's mock suite, which can sever; wrangler-dev offers no external sever hook.)
+- **Round progression (RoundEngine-adjacent smoke):** a run-bound `Join` + a readiness `Heartbeat`
+  published over the WS plane drive the wasm-tick DO through admission → warmup → a signed `RoundOpen`
+  the joining peer receives; `GET /state` confirmed `phase waiting→round_train`, `round 0`, roster now
+  carries the peer's `PeerId`. This is the coordinator half of the RoundEngine-over-`WsControlPlane`
+  loop; the full stub-backend multi-round + payload loop is the **Merge-2** node↔cloud↔worker item
+  (gated by A3 worker attach).
+- **Contract finding (adjudicated, NOT a bug):** C1's framing-only `join.cbor` fixture is **rejected
+  with `Admission`** when POSTed to a foreign run — correct: `admit()` (spec §6.5) binds a Join to the
+  run (`run_id` + exact `proto_version` + capability subset + optional envelope hash). The framing
+  fixtures are decode/verify/tag goldens, **not** admissible joins for an arbitrary run; the DO's
+  reject is the right behavior. A properly run-bound Join (built in the live test) is admitted. Both
+  ledgers are consistent; no contract change needed.
+
+### Merge-1 decisions (the three lane-flagged items)
+
+1. **Envelope-derived RunConfig in the DO — DECIDED (shape); implementation → Wave-2 (A2/cloud).**
+   The DO `init` currently bakes T0 default phase timeouts (`WARMUP_TIMEOUT=30`, `ROUND_TIMEOUT=60`,
+   `COOLDOWN=5`, `global_batch`, `witness_target`). The registry MUST NOT parse the envelope
+   (spec §11.1/§12 — cloud never reads module bytes / envelope). **Decision: RunConfig params are
+   *declared in the create request*, not cloud-derived** — the run author (who freezes the envelope
+   and already knows the derived params) declares them in `CreateRunRequest` exactly like the already-
+   declared `min/max_peers`/`rounds`/`update_max_bytes`; the registry forwards them verbatim to
+   `/init` → the wasm `init`, so `init` drops the T0 defaults with **zero** envelope parsing. Additive
+   optional fields (default to today's T0 constants for back-compat): `warmup_timeout_s`,
+   `round_timeout_s`, `cooldown_s`, `global_batch`, `witness_target`. Touches
+   `CreateRunRequest`/`ShellConfig`/the wrapper `init` (daemon-cloud) + the node's run-authoring path
+   that emits them — a **cloud + authoring** change, deferred to Wave-2. (Rejects any reading that the
+   cloud should parse `[phases]`/`[data]` from the envelope.)
+2. **§7.3 receive-side size-cap ownership — DECIDED: the shell (I/O adapter) owns it, NOT the pure
+   tick.** The pure `tick` is byte-portable, transport-policy-free decision logic; a size cap is an
+   I/O-plane concern (like the R2 HEAD for `StorageReceipt`). C1's `WasmShell` already pre-filters an
+   oversize `Commitment` against `update_max_bytes` before the tick — **this is correct and stays.**
+   The node's own live receive path (A3 worker ingesting peer commitments) mirrors the same pre-filter
+   node-side in Wave-2. This keeps `dual_shell_parity` exact (both shells run the identical pure tick;
+   the cap lives in each shell). `update_max_bytes` is the declared per-run bound (already in the
+   descriptor + `/init`). No Merge-1 code change.
+3. **RUN-10 Manifest staleness-tolerance field — DECIDED (shape); implementation → Wave-2 (B-lane).**
+   Add an additive `max_round_interval_ms: Option<u64>` to the SDK `Manifest` (module self-description
+   via `da_manifest`; **config/SDK-level, NOT the SwarmApi wire, NOT `tabi`**): the assess-time (§6.5)
+   soft screen marks a module ineligible when the coordinator's cadence exceeds the module's tolerated
+   max (a real-time demo is stale on a too-slow coordinator) — the mirror of the existing
+   `min_round_interval_ms` floor. **Not implemented in Merge-1**: it changes the guest `Manifest` type,
+   which recompiles the guest `.wasm` (rippling the just-stabilized guest manifest) and needs the
+   assess prescreen wiring + the carried RUN-10 `demo…slow_coordinator` test — B-lane Wave-2 work, not
+   trivial. B1's other two RUN-10 IDs already landed.
+
+### Wire v42 — verified (single bump; superproject codec is the human's signed step)
+
+Single additive 41→42 bump lives entirely on `swarm/a1` (B1 + the cloud lane touch no `daemon-api`
+wire), so the merge is clean and **not re-bumped**. Verified on the merged trunk:
+`daemon_common::WireVersion::CURRENT == 42`; `daemon-api.cddl` header `current = 42` +
+`swarm-hardware-report` carries `"shared_mb": uint64`; `SwarmHardwareReport.shared_mb: u64`
+(`#[serde(default)]`); the pinned gate `contract_wire_version_is_v42` asserts CURRENT == 42 &&
+`API_WIRE_VERSION == 42`; conformance `hardware()` fixture carries `shared_mb`. **Superproject
+follow-on (human, signed):** `just update-codec` + `just codec-drift` to regenerate `daemon-app`'s
+vendored C codec from the v42 CDDL — the daemon-node half is done; the app codec is one wire version
+behind until then.
+
+### Merge 1 — FROZEN interfaces (extend additively only)
+
+- **A1 / node control plane:** `daemon_swarm_net::ws_client` — `WsControlPlane` (`connect`, `endpoint`,
+  `add_resubscribe_frame`, `connect_count`, `is_connected`, `shutdown`; `impl ControlPlane`) +
+  `WsConfig`/`WsAuth`/`ReconnectConfig` (the exact seam in `swarm-ledger-p2-a1.md §1`); `ws` cargo
+  feature (off by default; `rustls-tls-webpki-roots` in `daemon-swarm-net`'s own manifest).
+  `dual_plane::DualPlane` (`new`/`pair`/`plane_count`; publish→all, subscribe→merged+deduped).
+  `daemon_swarm_node::discovery` — `RunDiscovery` trait + `DiscoveredRun` + `EgressRunDiscovery`;
+  `RegistryClient` (`GET /runs`, `GET /runs/:id`, `fetch_envelope` + blake3-verify);
+  `SwarmServiceParts.discovery: Option<Arc<dyn RunDiscovery>>` (additive field). **Delivery contract:**
+  DO/Loopback/Iroh all exclude the sender + dedupe by content hash (NET-6).
+- **A1 / wire:** the v42 delta (`SwarmHardwareReport.shared_mb`) — frozen; further wire additions target
+  v43 and go through the integration owner.
+- **B1 / protocol-SDK:** the `sparse_loco` golden fixture set + oracle provenance (from-definition &
+  pinned-literal; seed `0xDAE0_7E57`); the additive det-core/proto helpers — `elect_checkpointers`,
+  `checkpoint::{register_checkpoint, CheckpointRegistration, plan_resync, ResyncPlan}`,
+  `daemon_swarm_run::assess::{prescreen, verify_manifest}`. No new `tabi` ops (`tabi@1` stays frozen).
+- **C1 / cloud (swarm/c1 @ `3978673`):** the DO wasm-tick shape (`WasmShell` I/O adapter over the
+  compiled `tick`; `machine.ts` retired) + `dual_shell_parity` fixture; the WS framing fixtures
+  (`apps/swarm/test/fixtures/ws-framing/`); the presign SigV4 surface + object-proxy plane; the
+  `RunDescriptor` registry shape. The node↔cloud runtime contract = the canonical-CBOR `SignedMessage`
+  framing (now **live-verified** byte-for-byte) + the presign JSON fixtures.
+- **Guest guard:** the warn-and-rebuild manifest guard + the canonical trunk `guests.blake3`.
+
+### Wave-2 launch notes (A3 / B2-B3 / C2)
+
+- **A3 (worker live attach):** build the live plane as `DualPlane::pair(WsControlPlane, IrohGossip)` —
+  WS base + auth from `JoinRun.coordinator`/`JoinRun.credentials`; register the signed `Join` via
+  `add_resubscribe_frame` so a reconnect re-admits. Mirror the §7.3 `update_max_bytes` pre-filter on
+  the node's receive path (Decision 2). Wire a `RegistryClient`-backed `EgressRunDiscovery` at the
+  `bins/daemon` boot site (currently `discovery: None`) from `[swarm]` config (registry base +
+  `swarm:*` creds). Build the full RoundEngine-over-`WsControlPlane` stub-backend round loop against
+  the live DO (Merge-2 headline); the Merge-1 harness (`ws_live_do.rs`) + `seed_run.mjs` are the
+  starting scaffold. Implement the declared-RunConfig create-request fields (Decision 1) with the
+  cloud lane. `build-guests` after checkout.
+- **B2/B3:** wire `daemon-swarm-observe` (MessageLog/replay oracle/desync tally) into the live runtime
+  + `swarm-local`; lazy device-resident `OpBackend`. Implement the RUN-10 `max_round_interval_ms`
+  Manifest field (Decision 3) — note it recompiles the guest `.wasm`, so re-run `build-guests` +
+  commit the canonical `guests.blake3` after.
+- **C2:** wire the reserved root `windows = "0.62"` dep under `[target.'cfg(windows)'.dependencies]`
+  in the worker crate (design §4 API modules); `Hardware.shared_mb` already rides v42. macOS Metal +
+  Windows DXGI probes per `swarm-windows-vram-design.md`. New CUDA/ROCm flake lanes are integration-
+  owner `flake.nix` edits — request them (Wave-0 recorded the requirements).
+- **C-lanes / cloud follow-ups:** envelope-derived `RunConfig` create-request fields (Decision 1) is a
+  daemon-cloud `CreateRunRequest`/`ShellConfig`/wrapper-`init` change on `swarm/p2-integration`.
+
+### Gate matrix (merged trunk `3d0f849`) — GREEN
+
+All green except the documented pre-existing `daemon-conformance` flakes (green in isolation; no swarm
+lane touches that crate). Jobs capped at 12 (≤ nproc/2 = 16); one build at a time.
+
+- `cargo fmt --all --check` ✓.
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓.
+- Feature-combo clippy `-D warnings`: `-p daemon-swarm-net --features ws` ✓ · `ws,iroh` ✓ · `iroh` ✓ ·
+  `-p daemon-train --features burn-ndarray` ✓ · `--features wgpu` (`.#vulkan`) ✓ ·
+  `-p daemon-train-sdk --features sim` ✓ · `-p daemon-api --features arbitrary` ✓ ·
+  `-p daemon-swarm-run --features iroh` ✓ · `-p daemon-swarm-e2e --features iroh` ✓.
+- `cargo deny check` ✓ (advisories/bans/licenses/sources — the `ws` rustls-webpki-roots feature adds
+  nothing that trips the gate; tungstenite already in the lock).
+- `cargo test --workspace`: 236 pass; the **only** failures were the pre-existing `daemon-conformance`
+  parallel-load flakes — `node::detached_delegation::detached_fanout_materializes_distinct_children`
+  (the documented trio; **4/4 green run alone**) and `node::history::reconnect_reads_back_verified_
+  session_history` (**3/3 green** run as its module in isolation). Both in a crate no swarm lane
+  touches — not a merge regression. Never modified.
+- Per-crate feature suites: `-p daemon-swarm-net --features ws` ✓ · `--features iroh` ✓ ·
+  `-p daemon-train --features burn-ndarray` ✓ · `-p daemon-train-sdk --features sim` ✓ ·
+  `-p daemon-train --features wgpu --test wgpu_lifecycle` **3/3** (real RADV GPU) ✓.
+- `-p daemon-swarm-e2e --features iroh --test live_transport` **6/6** ✓.
+- `cargo build --target wasm32-unknown-unknown --release` for `daemon-swarm-proto` +
+  `daemon-swarm-coordinator` ✓ · `cargo run -p xtask -- build-guests` ✓ (canonical manifest) ·
+  `typos docs/specs` ✓ · guest guard `guest_lifecycle` 9/9 ✓.
+- **Live node↔cloud** (`ws_live_do.rs` against wrangler-dev): 2/2 ✓ (framing byte-for-byte relay +
+  round progression) — see the live-check section above.
