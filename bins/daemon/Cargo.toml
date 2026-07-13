@@ -62,6 +62,13 @@ daemon-tool-fs = { workspace = true }
 # burn/wasmtime (no `daemon-train` dep) and NO iroh (behind daemon-swarm-net's off-by-default `iroh`
 # feature). See swarm-ledger-w1.md for the cargo-tree evidence.
 daemon-swarm-run = { workspace = true }
+# B3: the node-side swarm-training service + worker supervisor, bound post-`Arc` at boot when
+# `[swarm] enabled = true` (spec §10.4; the W1 `with_swarm` integration remainder). `daemon-swarm-node`
+# is a direct path dep (not `{ workspace = true }`) to avoid a FROZEN root `Cargo.toml` edit — the
+# integration owner should promote it to `[workspace.dependencies]` at Merge 3. Neither pulls
+# burn/wasmtime/iroh onto the default gate (swarm-ledger-w1.md cargo-tree; re-verified at B3).
+daemon-swarm-node = { version = "0", path = "../../crates/swarm/daemon-swarm-node" }
+daemon-train-client = { workspace = true }
 # The `vision_analyze` tool; opt-in at runtime via `[vision].provider`.
 daemon-tool-vision = { workspace = true }
 # Core chat tools registered on every role: the per-session `todo` planner and the `clarify` ask.

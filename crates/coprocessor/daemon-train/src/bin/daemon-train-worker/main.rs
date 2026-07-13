@@ -68,9 +68,12 @@ async fn main() {
     )
     .await;
 
-    // Cached across commands: the assessed run (config + module bytes) + the live joined backend.
+    // Cached across commands: the assessed run (config + module bytes) + the live joined backend +
+    // the micro-batch the last `AssessRun` autotune chose (G2's `Eligibility.headroom["micro_batch"]`),
+    // threaded into `JoinRun` so the worker consumes the verdict in-process (B3 lifecycle glue).
     let mut run: Option<backend::ResolvedRun> = None;
     let mut live_backend: Option<WasmBackend> = None;
+    let mut assessed_micro_batch: u32 = SEQS;
 
     while let Some(bytes) = reader.recv().await {
         let cmd: Command = match protocol::decode(&bytes) {
@@ -85,6 +88,13 @@ async fn main() {
             Command::AssessRun { envelope } => match backend::resolve_run(&envelope).await {
                 Ok(resolved) => match backend::assess(&resolved.module, &resolved.config) {
                     Ok(elig) => {
+                        // Consume the autotune micro-batch (G2 rides it in `headroom["micro_batch"]`)
+                        // so `JoinRun` drives / OOM-probes from the node-computed verdict (§10.5).
+                        if let Some((_, mb)) =
+                            elig.headroom.iter().find(|(k, _)| k == "micro_batch")
+                        {
+                            assessed_micro_batch = (*mb).max(1) as u32;
+                        }
                         run = Some(resolved);
                         send(&writer, &Event::Assessed(elig)).await;
                     }
@@ -105,6 +115,7 @@ async fn main() {
                     &resolved.module,
                     &resolved.config,
                     &run_id,
+                    assessed_micro_batch,
                     &writer,
                 )
                 .await

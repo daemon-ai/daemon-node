@@ -37,7 +37,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use daemon_swarm_net::{ControlPlane, ControlSubscription, PayloadStore};
+use daemon_swarm_net::{
+    fetch_record_set, ControlPlane, ControlSubscription, DownloadScheduler, PayloadStore,
+};
 use daemon_swarm_proto::messages::{
     Attestation, Commitment, Digest as DigestMsg, Locator, RecordEntry, RoundOpen, RoundRecord,
     Straggle, StraggleStatus,
@@ -189,6 +191,12 @@ struct RoundState {
     attested: BTreeSet<PeerId>,
 }
 
+/// The reserved payload-plane peer id under which a round's `record-set.cbor` object is stored
+/// (never a real node identity — node pubkeys are ed25519 points, this sentinel is not). Mirrors
+/// [`crate::checkpoint::CHECKPOINT_PEER`]; used by the non-inline [`RoundEngine::resolve_record_set`]
+/// path to fetch the committed set object via the [`PayloadStore`].
+pub const RECORD_SET_PEER: PeerId = PeerId([0x5E; PeerId::LEN]);
+
 /// The peer-side round state machine (§6.4). Generic over the transport + engine seams.
 pub struct RoundEngine<C, P, B> {
     control: Arc<C>,
@@ -201,6 +209,10 @@ pub struct RoundEngine<C, P, B> {
     sub: ControlSubscription,
     peer: PeerId,
     roster: Vec<PeerId>,
+    /// Optional bounded-concurrency scheduler (B1). When set, the barrier fetches uncached committed
+    /// payloads **concurrently** through its capacity gate — the live-plane pipelining the MVP's
+    /// sequential barrier deferred (`// MERGE-2`). `None` = the sequential barrier fetch (default).
+    fetch_scheduler: Option<Arc<DownloadScheduler>>,
     rounds: BTreeMap<RoundId, RoundState>,
     /// Verified round records awaiting ingest, keyed by round. Ingest is strictly in ascending
     /// round order (the barrier, I2): a record whose committed set cannot yet be fetched blocks
@@ -246,12 +258,26 @@ where
             sub,
             peer,
             roster,
+            fetch_scheduler: None,
             rounds: BTreeMap::new(),
             pending: BTreeMap::new(),
             straggling: false,
             stalled_rounds: 0,
             last_ingested: None,
         }
+    }
+
+    /// Enable bounded-concurrency barrier fetch over B1's [`DownloadScheduler`] (spec §6.4, the
+    /// `// MERGE-2` in-peer concurrent-fetch marker — now justified by a real payload plane where a
+    /// GET is a network round-trip). Additive to the frozen Merge-2 `RoundEngine::new` surface: call
+    /// it before [`RoundEngine::run`]. When set, the barrier fetches all still-uncached committed
+    /// payloads for a round **concurrently** (capacity-gated) instead of one-at-a-time; the ingest
+    /// order (barrier I2/I3) is unchanged — only the *fetch* is parallel. `None` (default) keeps the
+    /// sequential barrier fetch, so every existing consumer is behavior-identical.
+    #[must_use]
+    pub fn with_download_scheduler(mut self, scheduler: Arc<DownloadScheduler>) -> Self {
+        self.fetch_scheduler = Some(scheduler);
+        self
     }
 
     /// This peer's node identity.
@@ -465,7 +491,7 @@ where
     /// enqueue it, and try to ingest as far as the queue allows (in order). If `r` itself cannot be
     /// ingested yet (its set — or an earlier round's — is unfetchable), enter the stall ladder.
     async fn on_round_record(&mut self, rr: &RoundRecord) -> Result<(), SwarmRunError> {
-        let entries = verify_record_set(rr)?;
+        let entries = self.resolve_record_set(rr).await?;
         self.pending.insert(rr.round, entries);
         self.advance(Some(rr.round)).await?;
         if self.pending.contains_key(&rr.round) {
@@ -481,6 +507,85 @@ where
                 round: rr.round,
                 status: StraggleStatus::Fetching,
             });
+        }
+        Ok(())
+    }
+
+    /// Resolve a `RoundRecord`'s committed set into record-ordered entries (I3). The **inline** set
+    /// is preferred (small rosters — the exit-gate default) and verified purely by
+    /// [`verify_record_set`]. When the record omits the inline set (large rosters), fetch the
+    /// `record-set.cbor` object from the payload plane (B1's [`fetch_record_set`]) at the reserved
+    /// [`RECORD_SET_PEER`] key, then root-verify the decoded set against the record's **signed**
+    /// commitment (`rr.set`). This wires the B1 net-side fetch into the engine's barrier (the
+    /// `// MERGE-2` marker on `verify_record_set`).
+    async fn resolve_record_set(
+        &self,
+        rr: &RoundRecord,
+    ) -> Result<Vec<RecordEntry>, SwarmRunError> {
+        if rr.inline.is_some() {
+            return verify_record_set(rr);
+        }
+        // Non-inline: fetch record-set.cbor via the store. `head` yields the object's content hash
+        // (B1's `R2Store::head` = presigned GET + hash), which `fetch_record_set` re-verifies on GET;
+        // the load-bearing check is the merkle root the coordinator signed (`verify_against`).
+        let key = PayloadKey::new(self.cfg.run.clone(), rr.round, RECORD_SET_PEER);
+        let stat = self.store.head(&key).await?;
+        let set = fetch_record_set(&*self.store, &key, &stat.hash).await?;
+        set.verify_against(&rr.set).map_err(|e| {
+            SwarmRunError::Lifecycle(format!(
+                "round {} record-set object does not reconstruct the signed root (I3): {e}",
+                rr.round
+            ))
+        })?;
+        Ok(set.entries().to_vec())
+    }
+
+    /// Concurrently pre-fetch every still-uncached committed payload for `round` through the
+    /// [`DownloadScheduler`] capacity gate (only when a scheduler is bound + more than one payload is
+    /// missing). Successes are cached so the sequential staging loop finds them local; misses are
+    /// left for the barrier to observe (→ stall ladder); a hash mismatch propagates (tamper, §12).
+    /// A no-op (default) when no scheduler is bound — so the sequential barrier is unchanged.
+    async fn prefetch_missing(
+        &mut self,
+        round: RoundId,
+        entries: &[RecordEntry],
+    ) -> Result<(), SwarmRunError> {
+        let Some(scheduler) = self.fetch_scheduler.clone() else {
+            return Ok(());
+        };
+        let missing: Vec<(PeerId, Hash)> = {
+            let rs = self.round_mut(round);
+            entries
+                .iter()
+                .filter(|e| !rs.fetched.contains_key(&e.peer))
+                .map(|e| (e.peer, e.hash))
+                .collect()
+        };
+        if missing.len() < 2 {
+            return Ok(()); // concurrency only helps when >1 payload is outstanding
+        }
+        let run = self.cfg.run.clone();
+        let store = self.store.clone();
+        let futures = missing.into_iter().map(|(peer, hash)| {
+            let store = store.clone();
+            let scheduler = scheduler.clone();
+            let key = PayloadKey::new(run.clone(), round, peer);
+            async move {
+                let gated = scheduler.wait_for_capacity().await.is_ok();
+                let res = store.get(&key, &hash).await;
+                if gated {
+                    scheduler.release_capacity();
+                }
+                (peer, res)
+            }
+        });
+        for (peer, res) in futures::future::join_all(futures).await {
+            // Only cache verified hits. Any error (typed miss / tamper / transient) leaves the
+            // payload uncached; the sequential barrier pass re-fetches it and applies the typed
+            // miss (→ stall ladder) or hash-mismatch (→ tamper reject, §12) handling.
+            if let Ok(bytes) = res {
+                self.round_mut(round).fetched.insert(peer, bytes);
+            }
         }
         Ok(())
     }
@@ -521,6 +626,9 @@ where
         round: RoundId,
         entries: &[RecordEntry],
     ) -> Result<Option<StateDigest>, SwarmRunError> {
+        // Pipeline the barrier: pull all still-uncached payloads concurrently (no-op unless a
+        // download scheduler is bound). Ordering below (I3 staging) is unaffected.
+        self.prefetch_missing(round, entries).await?;
         let mut staged = Vec::with_capacity(entries.len());
         for entry in entries {
             let bytes = match self.round_mut(round).fetched.get(&entry.peer).cloned() {
@@ -684,6 +792,106 @@ mod tests {
             set_locator: daemon_swarm_proto::messages::Locator::StoreKey("s".into()),
             inline: Some(entries),
         }
+    }
+
+    /// Build a minimal single-peer engine over loopback + a fresh FS store (for the record-set
+    /// resolution tests). The backend/corpus are unused by `resolve_record_set`.
+    fn resolve_engine() -> (
+        RoundEngine<
+            daemon_swarm_net::LoopbackGossip,
+            daemon_swarm_net::FsPayloadStore,
+            StubBackend,
+        >,
+        Arc<daemon_swarm_net::FsPayloadStore>,
+        RunId,
+    ) {
+        let run = RunId::new("resolve-run");
+        let root = std::env::temp_dir().join(format!(
+            "daemon-swarm-resolve-{}-{}",
+            std::process::id(),
+            crate::harness::fastcounter()
+        ));
+        let store = Arc::new(daemon_swarm_net::FsPayloadStore::open(&root, 16).unwrap());
+        let control = Arc::new(daemon_swarm_net::LoopbackGossip::new());
+        let mut backend = StubBackend::new();
+        backend.build(EXPERIMENT_CONFIG).unwrap();
+        let corpus = Arc::new(crate::data::Corpus::synthetic(1, 2, 64, 4).unwrap());
+        let key = crate::harness::peer_key(0);
+        let cfg = EngineConfig {
+            run: run.clone(),
+            roster: vec![daemon_swarm_proto::peer_id(&key)],
+            witnesses: vec![daemon_swarm_proto::peer_id(&key)],
+            steps_per_round: 1,
+            micro_batch: 1,
+            stall_rounds_max: 2,
+            checkpoint_every_rounds: 0,
+            version: daemon_swarm_proto::SWARM_PROTO_VERSION,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = RoundEngine::new(control, store.clone(), backend, key, corpus, cfg, tx);
+        (engine, store, run)
+    }
+
+    #[tokio::test]
+    async fn resolve_record_set_fetches_non_inline_object() {
+        // RUN-2 (engine side): a RoundRecord with NO inline set is resolved by fetching the
+        // `record-set.cbor` object from the payload plane and root-verifying it against the signed
+        // commitment — the `fetch_record_set` wiring (the `// MERGE-2` marker on verify_record_set).
+        let (engine, store, run) = resolve_engine();
+        let round = 3;
+        let set = daemon_swarm_proto::RecordSet::new([
+            entry(0x99, b"c"),
+            entry(0x11, b"a"),
+            entry(0x55, b"b"),
+        ]);
+        let bytes = set.to_canonical_vec().unwrap();
+        let key = PayloadKey::new(run, round, RECORD_SET_PEER);
+        store.put(&key, &bytes).await.unwrap();
+
+        let rr = RoundRecord {
+            round,
+            set: set.commitment(),
+            drops: Vec::new(),
+            next_seed: Seed([0; 32]),
+            set_locator: daemon_swarm_proto::messages::Locator::StoreKey(
+                "runs/resolve-run/rounds/3/record-set.cbor".into(),
+            ),
+            inline: None,
+        };
+        let entries = engine.resolve_record_set(&rr).await.unwrap();
+        let peers: Vec<PeerId> = entries.iter().map(|e| e.peer).collect();
+        // Fetched set comes back in I3 (node-pubkey-byte) order.
+        assert_eq!(peers, vec![peer(0x11), peer(0x55), peer(0x99)]);
+    }
+
+    #[tokio::test]
+    async fn resolve_record_set_rejects_object_not_matching_signed_root() {
+        // A fetched record-set object that does not reconstruct the record's SIGNED commitment is
+        // rejected (I3 exactness), even though its bytes hash-verify on GET.
+        let (engine, store, run) = resolve_engine();
+        let round = 3;
+        let stored = daemon_swarm_proto::RecordSet::new([entry(0x11, b"a"), entry(0x55, b"b")]);
+        let key = PayloadKey::new(run, round, RECORD_SET_PEER);
+        store
+            .put(&key, &stored.to_canonical_vec().unwrap())
+            .await
+            .unwrap();
+
+        // The record signs a DIFFERENT set's root.
+        let signed = daemon_swarm_proto::RecordSet::new([entry(0x11, b"a"), entry(0x99, b"z")]);
+        let rr = RoundRecord {
+            round,
+            set: signed.commitment(),
+            drops: Vec::new(),
+            next_seed: Seed([0; 32]),
+            set_locator: daemon_swarm_proto::messages::Locator::StoreKey("k".into()),
+            inline: None,
+        };
+        let err = engine.resolve_record_set(&rr).await.unwrap_err();
+        assert!(
+            matches!(&err, SwarmRunError::Lifecycle(m) if m.contains("does not reconstruct")),
+            "expected a signed-root mismatch rejection, got {err:?}"
+        );
     }
 
     #[test]

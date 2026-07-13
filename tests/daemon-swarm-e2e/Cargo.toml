@@ -9,6 +9,12 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[features]
+# The live-transport exit gate (`tests/live_transport.rs`): the round engine over a REAL per-node
+# `IrohGossip` mesh + a shared `FsPayloadStore` (B3). Off by default so the standard e2e gate stays
+# fast + iroh-free; run with `cargo test -p daemon-swarm-e2e --features iroh`.
+iroh = ["daemon-swarm-run/iroh"]
+
 [dev-dependencies]
 # The peer-side round engine + the local-coordinator harness + churn/failure drill machinery
 # (feature-gated). Merge 2 swapped the scripted coordinator for the real `daemon-swarm-coordinator`

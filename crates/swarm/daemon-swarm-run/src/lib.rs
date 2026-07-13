@@ -44,6 +44,15 @@ pub mod local_coordinator;
 #[cfg(any(test, feature = "harness"))]
 pub mod harness;
 
+/// The live-transport multi-peer harness: the round engine over a **real per-node [`IrohGossip`]**
+/// mesh + a shared `FsPayloadStore` (B3, the transport exit-gate lane). Behind the `iroh` feature
+/// (which enables `daemon-swarm-net/iroh` + `harness`). Used by `bins/swarm-local` +
+/// `tests/daemon-swarm-e2e`'s live suite.
+///
+/// [`IrohGossip`]: daemon_swarm_net::IrohGossip
+#[cfg(feature = "iroh")]
+pub mod live_harness;
+
 pub use backend::{
     AssessMeta, Assessment, BatchRef, StateDigest, StepCtx, StepStats, StubBackend, TrainerBackend,
 };

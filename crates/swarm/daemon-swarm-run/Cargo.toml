@@ -8,6 +8,14 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# The local-mode swarm runner (B3): drives the round protocol over a selectable transport
+# (loopback | real iroh mesh) + a filesystem store. Needs `iroh` (which pulls in `harness`), so the
+# default participant build never compiles it.
+[[bin]]
+name = "swarm-local"
+path = "src/bin/swarm-local.rs"
+required-features = ["iroh"]
+
 [features]
 # `harness` exposes the in-process multi-peer test harness + the real `daemon-swarm-coordinator`
 # pure `tick` loop driver (the impure shell that signs/publishes the coordinator's unsigned
@@ -15,6 +23,11 @@ path = "src/lib.rs"
 # Clock inputs) to external crates. Kept out of the default build; the `tests/daemon-swarm-e2e` crate
 # enables it. The crate's own unit tests reach the harness via `cfg(test)` (no feature needed).
 harness = ["dep:daemon-swarm-coordinator", "dep:daemon-swarm-observe"]
+# `iroh` adds the live-transport harness (`live_harness`): the round engine over a real per-node
+# `IrohGossip` mesh + a shared `FsPayloadStore`. It layers on `harness` (the coordinator shell) and
+# turns on `daemon-swarm-net`'s off-default `iroh` feature. Kept out of the default build; the
+# `tests/daemon-swarm-e2e` crate + `bins/swarm-local` enable it. NOT a root Cargo.toml change.
+iroh = ["harness", "daemon-swarm-net/iroh"]
 
 [dependencies]
 daemon-swarm-proto = { workspace = true }
@@ -29,6 +42,9 @@ daemon-swarm-coordinator = { workspace = true, optional = true }
 # and observe depends only on proto + coordinator (no cycle back to `daemon-swarm-run`).
 daemon-swarm-observe = { workspace = true, optional = true }
 tokio = { workspace = true }
+# `futures::future::join_all` drives the barrier's bounded-concurrency payload fetch (engine.rs,
+# `RoundEngine::with_download_scheduler`). Already a frozen `[workspace.dependencies]` entry.
+futures = { workspace = true }
 thiserror = { workspace = true }
 # The harness `FaultyStore` implements the async `PayloadStore` trait (harness / test only, gated
 # behind `cfg(any(test, feature = "harness"))`).

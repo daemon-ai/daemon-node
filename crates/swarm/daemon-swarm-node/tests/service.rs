@@ -26,6 +26,9 @@ struct Calls {
     leaves: Vec<String>,
     throttles: usize,
     probes: usize,
+    /// The args of the most recent `throttle` (the §10.5 governor lever): `(vram_cap_mb,
+    /// duty_cycle_pct, paused)`.
+    last_throttle: Option<(Option<u32>, Option<u8>, bool)>,
 }
 
 struct FakeWorker {
@@ -84,11 +87,13 @@ impl WorkerControl for FakeWorker {
     }
     async fn throttle(
         &self,
-        _vram_cap_mb: Option<u32>,
-        _duty_cycle_pct: Option<u8>,
-        _paused: bool,
+        vram_cap_mb: Option<u32>,
+        duty_cycle_pct: Option<u8>,
+        paused: bool,
     ) -> Result<(), SwarmError> {
-        self.calls().throttles += 1;
+        let mut c = self.calls();
+        c.throttles += 1;
+        c.last_throttle = Some((vram_cap_mb, duty_cycle_pct, paused));
         Ok(())
     }
 }
@@ -283,6 +288,35 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
     assert_eq!(detail.contribution.bytes_down, 200);
     // All four events are in the windowed log (newest last).
     assert_eq!(detail.recent_events.len(), 4);
+}
+
+#[tokio::test]
+async fn governor_throttle_lever_reaches_worker_with_combined_budget_clamp() {
+    // §10.5 governor drill (B3): a synthetic inference-pressure signal arrives as a policy update
+    // clamping the swarm's budget (on a unified box `vram_cap_mb` clamps the *combined* device+host
+    // budget — Merge-2 spec-amendment #1). `swarm_set_policy` must push that lever through to the
+    // worker's `throttle` verbatim, so the co-resident inference tenant is protected.
+    let worker = FakeWorker::new();
+    let svc = service(enabled_config(), worker.clone(), None);
+
+    let pressure = SwarmPolicy {
+        mode: SwarmPolicyMode::Idle,
+        vram_cap_mb: 4_096, // clamp the combined budget under inference pressure
+        duty_cycle_pct: 25, // and throttle the duty cycle
+        schedule: None,
+    };
+    svc.swarm_set_policy(pressure).await.unwrap();
+
+    let c = worker.calls();
+    assert_eq!(
+        c.throttles, 1,
+        "the governor lever reached the worker exactly once"
+    );
+    assert_eq!(
+        c.last_throttle,
+        Some((Some(4_096), Some(25), false)),
+        "the vram cap (combined-budget clamp) + duty cycle are forwarded verbatim (§10.5)"
+    );
 }
 
 #[tokio::test]

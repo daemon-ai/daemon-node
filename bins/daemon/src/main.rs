@@ -2989,6 +2989,43 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // Drain any feedback records left queued by a previous run (best-effort, detached). No-op when
     // export is inert. Per-submit drains ride the `FeedbackSubmit` handler.
     node.spawn_feedback_drain();
+    // B3: bind the swarm-training service post-`Arc` when `[swarm] enabled` (the W1 `with_swarm`
+    // seam — inert by default). When on, the node hosts a `daemon-swarm-node::SwarmService` over a
+    // `daemon-train-client::TrainSupervisor`, re-converges durable join intents (§10.3), and routes
+    // its `SwarmChanged` invalidation pointers onto the existing node feed. A `Weak` feed handle
+    // avoids a node↔service `Arc` cycle. Drags no burn/wasmtime/iroh onto the default build.
+    if cfg.swarm.enabled {
+        match daemon_swarm_node::SwarmStore::open(cfg.data_dir.join("swarm.db")) {
+            Ok(store) => {
+                let worker: Arc<dyn daemon_swarm_node::WorkerControl> =
+                    Arc::new(daemon_train_client::TrainSupervisor::new(
+                        daemon_train_client::TrainClientConfig::new(&cfg.swarm.worker_path),
+                    ));
+                let weak = Arc::downgrade(&node);
+                let feed: daemon_swarm_node::NodeFeed = Arc::new(move |ev| {
+                    if let Some(n) = weak.upgrade() {
+                        n.emit_node_event(ev);
+                    }
+                });
+                let svc = Arc::new(daemon_swarm_node::SwarmService::new(
+                    daemon_swarm_node::SwarmServiceParts {
+                        config: cfg.swarm.clone(),
+                        store,
+                        worker,
+                        feed: Some(feed),
+                    },
+                ));
+                if let Err(e) = svc.start().await {
+                    tracing::error!(error = %e, "swarm: SwarmService::start failed");
+                }
+                node.set_swarm(svc as Arc<dyn daemon_api::SwarmApi>);
+                tracing::info!("swarm: SwarmService bound ([swarm] enabled)");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "swarm: failed to open swarm.db; service not bound")
+            }
+        }
+    }
     // The store handle is cloned in (not moved): the web front's `/healthz` readiness probe below
     // keeps its own reference for the auth check.
     let authenticator = Arc::new(
