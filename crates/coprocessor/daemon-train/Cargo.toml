@@ -54,6 +54,14 @@ tokio = { workspace = true }
 # the worker links heavy native engine trees, so a segfault is a real failure mode). Bin target
 # only; a runtime no-op unless the spawning node injected a DSN + `DAEMON_CRASH_CONSENT=1`.
 daemon-telemetry = { workspace = true }
+# The SSRF-safe outbound HTTP client the `R2Store`/`HttpPresignClient` payload plane rides (A3 live
+# attach). OPTIONAL — pulled in only by the `swarm-net` feature (which also turns on
+# `daemon-swarm-net/{ws,iroh}`); the default worker build never links it. Already a
+# `[workspace.dependencies]` entry (daemon-swarm-net uses it) — no root/deny/flake change.
+daemon-egress = { workspace = true, optional = true }
+# `#[async_trait]` for the worker's concrete `PayloadStore` impl (the R2/Fs store enum, A3 live
+# attach). OPTIONAL — pulled in only by `swarm-net`; already a `[workspace.dependencies]` entry.
+async-trait = { workspace = true, optional = true }
 
 # Per-backend lane selection (spec §10.1). These features only toggle burn's *dependency* backend
 # features — no code path changes this wave (Wave-0 scaffold): the `OpBackend` seam is still the
@@ -72,6 +80,15 @@ cpu = []
 burn-ndarray = ["burn/ndarray"]
 # burn with the wgpu backend (cubecl + wgpu 29; targets Vulkan/RADV) — the G2 GPU lane. Opt-in only.
 wgpu = ["burn/wgpu"]
+# The A3 live coordinator attach: turn on daemon-swarm-net's WS client + iroh gossip transport so the
+# worker's JoinRun path runs a real `RoundEngine` over `DualPlane(WsControlPlane, IrohGossip)` +
+# R2/Fs payload store (the ledger-sequenced dep-graph change). `daemon-swarm-net` is ALREADY a
+# (default-feature) dep for the `file://` ArtifactResolver; this feature only enables its `ws`+`iroh`
+# cargo features. OFF the default gate so a default `cargo build`/`test`/`deny` never compiles the
+# WS/TLS/iroh/QUIC tree — verify with `cargo tree -e features -i daemon-swarm-net`. WS-only is the
+# T0 baseline (iroh stays runtime-optional inside the feature too: absent iroh credentials → the
+# bare `WsControlPlane`).
+swarm-net = ["daemon-swarm-net/ws", "daemon-swarm-net/iroh", "dep:daemon-egress", "dep:async-trait"]
 
 [dev-dependencies]
 # Test-only: the frozen-surface sync check (`tests/abi_surface.rs`) reads the guest SDK's

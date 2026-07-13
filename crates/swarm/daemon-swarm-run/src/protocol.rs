@@ -382,12 +382,14 @@ pub struct EngineParams {
     /// shell's pre-filter (Merge-1 Decision 2).
     #[serde(default)]
     pub update_max_bytes: u64,
-    /// Synthetic-corpus seed (deterministic training data across peers).
+    /// Synthetic-corpus seed (deterministic training data — identical across peers → agreeing
+    /// digests). Mirrors `daemon_swarm_run::data::Corpus::synthetic(seed, shards, tokens_per_shard,
+    /// seq_len)`.
     pub corpus_seed: u64,
-    /// Synthetic-corpus vocabulary size.
-    pub corpus_vocab: u32,
-    /// Synthetic-corpus sequence count.
-    pub corpus_len: u32,
+    /// Synthetic-corpus shard count.
+    pub corpus_shards: u32,
+    /// Synthetic-corpus tokens per shard.
+    pub corpus_tokens_per_shard: u64,
     /// Synthetic-corpus sequence length (tokens).
     pub corpus_seq_len: u32,
 }
@@ -594,8 +596,8 @@ mod tests {
                 checkpoint_every_rounds: 0,
                 update_max_bytes: 1 << 20,
                 corpus_seed: 7,
-                corpus_vocab: 64,
-                corpus_len: 256,
+                corpus_shards: 4,
+                corpus_tokens_per_shard: 256,
                 corpus_seq_len: 8,
             },
         };

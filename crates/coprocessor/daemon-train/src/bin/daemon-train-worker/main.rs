@@ -42,6 +42,10 @@
 //! representative micro-batch shape ([`SEQS`]/[`SEQ`]) both sides use.
 
 mod backend;
+/// The A3 live coordinator attach (RoundEngine over DualPlane + R2/Fs store). Behind the
+/// `swarm-net` feature so the default worker build never links the WS/TLS/iroh/QUIC tree.
+#[cfg(feature = "swarm-net")]
+mod live;
 mod transport;
 
 use daemon_provision::{CutChannel, CutWriter};
@@ -78,6 +82,10 @@ async fn main() {
     // threaded into `JoinRun` so the worker consumes the verdict in-process (B3 lifecycle glue).
     let mut run: Option<backend::ResolvedRun> = None;
     let mut live_backend: Option<WasmBackend> = None;
+    // The A3 live coordinator attach handle (feature `swarm-net`): a running RoundEngine + event
+    // pump, stopped on Leave/Shutdown. `None` on the self-driven (WS-only / no-credentials) path.
+    #[cfg(feature = "swarm-net")]
+    let mut live_run: Option<live::LiveHandle> = None;
     let mut assessed_micro_batch: u32 = SEQS;
 
     while let Some(bytes) = reader.recv().await {
@@ -107,7 +115,12 @@ async fn main() {
                 },
                 Err(detail) => send(&writer, &worker_error(&detail)).await,
             },
-            Command::JoinRun { run_id, .. } => {
+            Command::JoinRun {
+                run_id,
+                coordinator,
+                credentials,
+                ..
+            } => {
                 let Some(resolved) = run.as_ref() else {
                     send(
                         &writer,
@@ -116,6 +129,37 @@ async fn main() {
                     .await;
                     continue;
                 };
+                // A3 live attach (feature `swarm-net`): if the node authored a `JoinCredentials`
+                // body, run the real RoundEngine over the live plane; otherwise fall back to the
+                // self-driven representative round (the T0 baseline, also the default-gate path).
+                #[cfg(feature = "swarm-net")]
+                if let Ok(creds) =
+                    daemon_swarm_run::protocol::JoinCredentials::from_bytes(&credentials)
+                {
+                    match live::join_and_run_live(
+                        &resolved.module,
+                        &resolved.config,
+                        &run_id,
+                        &coordinator,
+                        &creds,
+                        assessed_micro_batch,
+                        &writer,
+                    )
+                    .await
+                    {
+                        Ok(handle) => {
+                            if let Some(old) = live_run.take() {
+                                old.stop().await;
+                            }
+                            live_run = Some(handle);
+                        }
+                        Err(detail) => send(&writer, &worker_error(&detail)).await,
+                    }
+                    continue;
+                }
+                // Self-driven fallback (feature off, or no live credentials authored).
+                let _ = &coordinator;
+                let _ = &credentials;
                 match transport::join_and_run_round(
                     &resolved.module,
                     &resolved.config,
@@ -130,6 +174,16 @@ async fn main() {
                 }
             }
             Command::Throttle { paused, .. } => {
+                // The self-driven backend supports in-place pause/resume; the live-attach engine
+                // owns its backend exclusively, so a live pause is preemption-as-churn — stop the
+                // run (releasing the wasm instance, §10.5) and let the node re-issue JoinRun (durable
+                // intent, §10.3) to resume.
+                #[cfg(feature = "swarm-net")]
+                if paused {
+                    if let Some(handle) = live_run.take() {
+                        handle.stop().await;
+                    }
+                }
                 if let Some(b) = live_backend.as_mut() {
                     let r = if paused { b.pause() } else { b.resume() };
                     if let Err(e) = r {
@@ -137,9 +191,21 @@ async fn main() {
                     }
                 }
             }
-            Command::Leave { .. } => live_backend = None,
+            Command::Leave { .. } => {
+                live_backend = None;
+                #[cfg(feature = "swarm-net")]
+                if let Some(handle) = live_run.take() {
+                    handle.stop().await;
+                }
+            }
             Command::Ping => send(&writer, &Event::Pong).await,
-            Command::Shutdown => break,
+            Command::Shutdown => {
+                #[cfg(feature = "swarm-net")]
+                if let Some(handle) = live_run.take() {
+                    handle.stop().await;
+                }
+                break;
+            }
         }
     }
 }

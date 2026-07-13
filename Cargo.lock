@@ -4938,10 +4938,12 @@ dependencies = [
 name = "daemon-train"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "burn",
  "ciborium",
  "daemon-common",
+ "daemon-egress",
  "daemon-provision",
  "daemon-swarm-net",
  "daemon-swarm-proto",
