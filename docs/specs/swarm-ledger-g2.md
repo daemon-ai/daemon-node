@@ -160,17 +160,94 @@ GPU-needing tests early-return with a loud `eprintln!("SKIP … no wgpu adapter"
   all adapters needs `wgpu::Instance::enumerate_adapters(Backends)`, which requires naming raw
   `wgpu` types — a direct `wgpu` dep = a FROZEN root `Cargo.toml` change (not a lane action). So G2
   reports `gpus = 1` when a usable Vulkan adapter initializes (honest: "≥1 usable adapter"), else 0.
+- **This machine (the verification device):** adapter `Radeon 8060S Graphics (RADV GFX1151)`,
+  backend Vulkan, `max_buffer_size` = **2047 MiB** (the queryable per-allocation ceiling).
+- **Probe init discipline (code-grounded):** cubecl's `ComputeClient::init` panics
+  (`"Can't create a new client on an already registered server"`, `cubecl-runtime-0.10.0/src/
+  client.rs:56`) if the default device's client is already registered, so `probe_wgpu()` is
+  **memoized process-wide** (`OnceLock`) and IS the bring-up; `wgpu_adapter_available()` delegates
+  to it, and later burn tensor ops reuse the registered client. Call order is therefore safe both
+  ways in one process.
 
-<!-- Filled in as slices land. -->
+## Landed slices (base `bd2cb5b` → HEAD, branch `swarm/g2`)
 
-## Landed slices
+1. `mirror(G2): ledger` (`84d3a10`) — this file (commit first).
+2. `feat(train): burn-wgpu backend arm + VRAM autotune + OOM probe (green)` (`f7ae52c`) —
+   `BackendKind::Wgpu` + the single `HostState::new` arm (`runtime.rs`), additive
+   `EngineConfig.gpu_index`, `BurnWgpuBackend` alias + `wgpu_adapter_available` (`burn_backend.rs`,
+   cfg widened to `any(burn-ndarray, wgpu)`), new `autotune.rs` (resource model, verdict,
+   `probe_microbatch` ladder, `probe_wgpu`, `oom_error_class` mapping) with unit tests
+   (`oom_probe_halves_microbatch`, `assess_rejects_insufficient_vram`,
+   `verdict_matches_probe_ladder`), `WasmBackend::assess` on the real budget (`wasm_backend.rs`),
+   real `Hardware` probe + autotune verdict in the worker `backend` module.
+3. `feat(train): wgpu tolerance parity + det-digest tripwire + HOST-3/8/10 on Vulkan (green)`
+   (`21b30a6`) — `tests/burn_wgpu_parity.rs` (18 tests: the full G1 harness re-run with a
+   `BurnWgpuBackend` factory + HOST-3 `absmax_pack_golden` / `absmax_layout_bytes_golden`),
+   `tests/wgpu_lifecycle.rs` (HOST-8 `meta_mode_vram_ram_estimates` vs real device numbers,
+   HOST-10 `ingest_budget_scales_with_count` on wgpu), the `cross_backend_wgpu` det-digest module +
+   round-loop smoke in `tests/wasm_backend_determinism.rs`, the GPU-skip convention
+   (`require_gpu!` + loud stderr), the stale-guest always-rebuild guard, and the
+   `worker_protocol` probe assertion widened for the wgpu build.
 
-_(pending)_
+## Evidence (this machine, RADV GFX1151 via the `.#vulkan` devShell)
 
-## Evidence
-
-_(pending)_
+- **Tolerance parity on Vulkan — NO class widened.** All 18 `burn_wgpu_parity` tests pass within
+  G1's frozen per-op classes (Shape/det/compression **bit-exact**; Elementwise 1e-5/1e-6;
+  MatmulReduce+Normalization 1e-4/1e-5; Attention+Optimizer 2e-4/2e-5). The headroom G1 left was
+  sufficient; there is no per-op widening to justify.
+- **Cross-backend det-digest (Risk 2 tripwire):** `cross_backend_wgpu::cross_backend_det_digest_
+  wgpu_{sparse_loco,diloco,demo}` — 6 rounds each, CpuBackend peer vs BurnBackend(wgpu) peer over
+  the same committed set: det digests **byte-identical every round**, transcripts evolve, native
+  payloads diverge (asserted), and **both losses fall** (the tiny-llama round-loop smoke on wgpu).
+- **HOST-8** `meta_mode_vram_ram_estimates`: meta footprints → `Autotune::from_meta` → verdict vs
+  the real probe (max_alloc 2047 MiB, host RAM): eligible, micro_batch 64, ~13 MiB VRAM at the
+  chosen batch for the 1-layer tiny-llama (fixed ≈ 1 MiB + 176 KiB/mb activation).
+- **HOST-10** `ingest_budget_scales_with_count` (wgpu backend): meta two-point fit base=143,
+  slope=99 ops/peer; a count-scaled budget passes a 6-payload ingest on wgpu; the same ingest under
+  a count-1 budget traps typed `BudgetOps` (worker intact).
+- **HOST-3** `absmax_pack_golden` (1/2/8-bit pack∘unpack∘pack fixed point, byte-exact wgpu-build vs
+  CpuBackend) + `absmax_layout_bytes_golden` (§6.6 literal bytes: 2-bit chunk-4 golden
+  `[00 3C A3 00 34 63]`, 1-bit chunk-8 golden `[00 42 55]` — f16 absmax LE + LSB-first codes).
+- Gates: `cargo fmt --check` ✓ · `cargo clippy --workspace --all-targets -- -D warnings` ✓ ·
+  `cargo clippy -p daemon-train --features wgpu --all-targets -- -D warnings` ✓ ·
+  `cargo test -p daemon-train --features burn-ndarray` ✓ (guest_lifecycle 9, determinism 12,
+  worker_protocol 4, parity 17 + unit) · `.#vulkan cargo test -p daemon-train --features wgpu` ✓
+  (burn_wgpu_parity 18, wgpu_lifecycle 2, determinism 12 incl. 3 wgpu digest tests) ·
+  `cargo run -p xtask -- build-guests` ✓ · `typos docs/specs` ✓ · `cargo test --workspace` ✓
+  modulo the documented pre-existing `daemon-conformance` detached-delegation flake
+  (pass-in-isolation = green; untouched).
 
 ## Deviations / notes for Merge 2 + M2/B3
 
-_(pending)_
+- **HOST-3 honesty (per G1's delegation note, ABI §6.6):** compression natives (absmax/dct2/topk)
+  run **host-side det-core** in `BurnBackend` on every burn backend — there is no GPU-native absmax
+  kernel in this build (future work, as G1 recorded). So the "GPU-vs-CPU parity" half of HOST-3 is
+  asserted byte-exact at the `OpBackend` seam of the wgpu build, and the layout golden pins the §6.6
+  bytes themselves. A future GPU-native absmax lane must keep these goldens green.
+- **`Assessment`/`Eligibility` are frozen shapes** (MVP / Merge-1): the chosen micro-batch does not
+  get a new wire field. It rides `Eligibility.headroom["micro_batch"]` (worker assess) and the
+  `reasons` text (trait assess); `AutotuneVerdict` is the full-fidelity type M1/B3 should consume
+  in-process. If B3 wants micro-batch as a first-class protocol field, that is an additive
+  `Eligibility` change to coordinate at Merge 2/3 — not done unilaterally here.
+- **`Hardware.vram_mb` semantics changed from "0" to "max_alloc proxy"** on wgpu builds (it was a
+  hardcoded 0). Consumers (W1's `SwarmService` hardware report, B3's worker) should treat it as a
+  lower bound, not free VRAM; `backend_lanes` gains `"vulkan"` ahead of `"cpu"` when an adapter is
+  usable. CPU-only builds are unchanged (gpus 0, vram 0; `ram_mb` now real from `/proc/meminfo`).
+- **Runtime OOM mapping is a seam, not yet a live path:** wgpu OOM in burn 0.21 surfaces as a
+  panic/alloc failure inside cubecl rather than a typed Rust error; the worker maps it to
+  `ErrorClass::OutOfMemory` (`autotune::oom_error_class`) and the halving ladder
+  (`probe_microbatch`) is unit-tested deterministically. The *live* trial (catch a real device OOM
+  mid-step, halve, re-probe) belongs to B3's worker round loop when it drives real batch sizes —
+  the ladder + taxonomy are frozen here so that wiring is mechanical.
+- **Stale-guest guard delta from the Merge-1 suggestion:** instead of a committed blake3 manifest
+  (which would couple to M1's in-flight guest changes and go stale by design), the harness now
+  ALWAYS runs the incremental guest build before loading (no-op when fresh — this *rebuilds* on
+  source drift rather than merely failing) and logs the loaded module's blake3 to stderr so any
+  run's guest identity is on record. `SWARM_TEST_GUEST_DIR` (CI prebuilt) skips the build.
+- **Meta pass runs on the CPU engine** in the worker assess path (protocol: "read-only, no GPU
+  allocation"). Byte footprints and op counts are backend-independent (the guest import stream is
+  bit-deterministic, ABI §7.1), so this is sound; the verdict then compares against real device
+  limits. Risk 3 (meta at 160M is a real execute pass, possibly minutes) stands for M1.
+- **`EngineConfig.gpu_index`** maps `Some(i)` → `WgpuDevice::DiscreteGpu(i)`; on this integrated-GPU
+  machine the default (`None` → `DefaultDevice`) is the tested path. Multi-GPU index selection is
+  API-plumbed but not hardware-verified here.
