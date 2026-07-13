@@ -1,0 +1,40 @@
+# The P1 **160M** LLaMA preset — an `[experiment.config]` fragment for the run envelope (spec §6.1,
+# ABI §6.1). The envelope authoring tool canonicalizes this TOML to deterministic CBOR at freeze
+# time; `llama-160m.cbor` (alongside) is the equivalent canonical byte form `da_build` receives.
+#
+# Kept in lockstep with `daemon_train_sdk::models::TinyLlamaCfg::llama_160m()`; the sim test
+# `preset_cbor_fixtures_parse` asserts the committed `.cbor` deserializes back to that constructor.
+#
+# ~151,862,784 trainable params (tied embedding). GQA deferred (`n_kv_heads == n_heads`). GPT-2 BPE
+# vocab (50257) ⇒ `u16` corpus shards. See `swarm-ledger-m1.md`.
+d_model = 768
+n_layers = 12
+n_heads = 12
+n_kv_heads = 12
+head_dim = 64
+vocab = 50257
+seq_len = 1024
+ffn_mult = 4
+rope_theta = 10000.0
+rmsnorm_eps = 1e-5
+profile = "sparse_loco"
+
+# Inner AdamW (TDD §5 golden constants).
+[inner]
+lr = 4e-4
+beta1 = 0.9
+beta2 = 0.95
+eps = 1e-8
+wd = 0.1
+
+# sparse_loco comm profile. chunk 256 is the largest power-of-two dividing every param's element
+# count without guest-side padding (the embedding 50257*768 has 2-adic valuation 8); topk 4 keeps
+# the golden 1/64 density.
+[sparse_loco]
+h = 30
+ef_decay = 0.95
+chunk = 256
+topk = 4
+bits = 2
+outer_alpha = 1.0
+clip = true

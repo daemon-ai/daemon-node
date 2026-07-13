@@ -4931,6 +4931,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-train-safetensors"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "daemon-train-sdk",
+ "safetensors 0.4.5",
+]
+
+[[package]]
 name = "daemon-train-sdk"
 version = "0.0.1"
 dependencies = [
@@ -18254,11 +18263,17 @@ name = "xtask"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "daemon-api",
  "daemon-common",
  "daemon-protocol",
+ "daemon-swarm-run",
+ "hf-hub 0.5.0",
  "serde",
+ "serde_json",
+ "tokenizers 0.22.2",
+ "tokio",
 ]
 
 [[package]]

@@ -60,6 +60,12 @@ pub struct ShardDesc {
 }
 
 /// The pre-tokenized corpus manifest (`manifest.json`, §8).
+///
+/// The provenance fields (`tokenizer`/`tokenizer_revision`/`dataset`/`dataset_revision`) are an
+/// **additive** Wave-2 extension (M1): `#[serde(default)]` + `skip_serializing_if` keeps every
+/// pre-Wave-2 manifest (which carries only `token_width`/`seq_len`/`shards`) valid, and a manifest
+/// written without provenance is byte-identical to the old shape. They record how the shards were
+/// produced (`xtask tokenize-corpus`) so a run is reproducible and auditable (spec §8/§9).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     /// The token element width shared by every shard.
@@ -68,6 +74,18 @@ pub struct Manifest {
     pub seq_len: u32,
     /// The shards, in data-window order.
     pub shards: Vec<ShardDesc>,
+    /// The tokenizer identity the corpus was tokenized with (e.g. `"gpt2"`), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<String>,
+    /// The pinned tokenizer revision (HF commit SHA / tag), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_revision: Option<String>,
+    /// The source dataset identity (e.g. `"roneneldan/TinyStories"`), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    /// The pinned dataset revision (HF commit SHA / tag), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_revision: Option<String>,
 }
 
 /// The location of one sequence within the corpus: which shard, and the token offset into it.
@@ -313,6 +331,10 @@ impl SyntheticCorpus {
             token_width: TokenWidth::U16,
             seq_len,
             shards,
+            tokenizer: None,
+            tokenizer_revision: None,
+            dataset: None,
+            dataset_revision: None,
         };
         manifest.validate()?;
         Ok((manifest, blobs))
@@ -332,6 +354,34 @@ pub struct Corpus {
 }
 
 impl Corpus {
+    /// Build a corpus from a validated manifest + the shard bytes it describes — the **real** data
+    /// path (the runtime fetches shards per the manifest and constructs this; `SyntheticCorpus` is
+    /// the CI stand-in). The shards must match the manifest 1:1 (count + per-shard byte length), and
+    /// each shard's content is blake3-verified against its [`ShardDesc`] (the §8 integrity check), so
+    /// a corrupt or reordered shard is rejected here rather than surfacing as NaN downstream.
+    pub fn from_parts(manifest: Manifest, shards: Vec<Vec<u8>>) -> Result<Self, DataError> {
+        manifest.validate()?;
+        if shards.len() != manifest.shards.len() {
+            return Err(DataError::ShardCountMismatch {
+                manifest: manifest.shards.len(),
+                provided: shards.len(),
+            });
+        }
+        for (i, (desc, bytes)) in manifest.shards.iter().zip(shards.iter()).enumerate() {
+            if bytes.len() as u64 != desc.bytes {
+                return Err(DataError::ShardSizeMismatch {
+                    shard: i,
+                    expected: desc.bytes,
+                    declared: bytes.len() as u64,
+                });
+            }
+            if blake3_hash(bytes).to_hex().as_str() != desc.blake3 {
+                return Err(DataError::ShardHashMismatch { shard: i });
+            }
+        }
+        Ok(Self { manifest, shards })
+    }
+
     /// Build a deterministic synthetic corpus (`num_shards` × `tokens_per_shard` u16 tokens).
     pub fn synthetic(
         seed: u64,
@@ -432,6 +482,20 @@ pub enum DataError {
     /// A shard's blake3 field was not a valid 64-char hex digest.
     #[error("shard {0} has a malformed blake3 hash")]
     BadShardHash(usize),
+    /// The number of provided shards did not match the manifest ([`Corpus::from_parts`]).
+    #[error("manifest declares {manifest} shards but {provided} were provided")]
+    ShardCountMismatch {
+        /// The shard count the manifest declares.
+        manifest: usize,
+        /// The number of shard blobs provided.
+        provided: usize,
+    },
+    /// A provided shard's content blake3 did not match its manifest entry ([`Corpus::from_parts`]).
+    #[error("shard {shard} content blake3 does not match the manifest")]
+    ShardHashMismatch {
+        /// The shard index.
+        shard: usize,
+    },
     /// A `BatchId` fell outside the corpus's sequence range.
     #[error("batch {batch} out of range (total sequences {total})")]
     BatchOutOfRange {
@@ -477,6 +541,10 @@ mod tests {
             token_width: TokenWidth::U16,
             seq_len,
             shards,
+            tokenizer: None,
+            tokenizer_revision: None,
+            dataset: None,
+            dataset_revision: None,
         }
     }
 
@@ -633,6 +701,35 @@ mod tests {
         assert_eq!(corpus.sequence(corpus.total_sequences()).unwrap(), s0);
         // Distinct sequences differ (deterministic synthetic tokens).
         assert_ne!(corpus.sequence(1).unwrap(), s0);
+    }
+
+    #[test]
+    fn manifest_provenance_is_additive_and_back_compatible() {
+        // A pre-Wave-2 manifest (no provenance keys at all) still parses (RUN-3 back-compat).
+        let old = r#"{
+            "token_width": "u16",
+            "seq_len": 4,
+            "shards": [{"name":"a","bytes":16,"tokens":8,
+                "blake3":"0000000000000000000000000000000000000000000000000000000000000000"}]
+        }"#;
+        let m = Manifest::from_json(old).unwrap();
+        assert_eq!(m.tokenizer, None);
+        assert_eq!(m.dataset, None);
+        // A provenance-less manifest serializes WITHOUT the new keys (byte-identical old shape).
+        let json = m.to_json().unwrap();
+        assert!(!json.contains("tokenizer"), "no tokenizer key when unset");
+        assert!(!json.contains("dataset"), "no dataset key when unset");
+
+        // A provenance-carrying manifest round-trips and preserves every field.
+        let mut prov = m.clone();
+        prov.tokenizer = Some("gpt2".into());
+        prov.tokenizer_revision = Some("607a30d783dfa663caf39e06633721c8d4cfcd7e".into());
+        prov.dataset = Some("roneneldan/TinyStories".into());
+        prov.dataset_revision = Some("main".into());
+        let round = Manifest::from_json(&prov.to_json().unwrap()).unwrap();
+        assert_eq!(round, prov);
+        // A new-shape manifest read by any consumer still validates structurally.
+        round.validate().unwrap();
     }
 
     #[test]

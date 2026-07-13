@@ -1,0 +1,19 @@
+# gitleaks configuration for daemon-node.
+#
+# Extends gitleaks' built-in ruleset and adds an allowlist for legitimate PUBLIC content that trips
+# the high-entropy / generic-api-key heuristics — specifically the pinned Hugging Face commit SHAs
+# the swarm training pipeline records for reproducibility (dataset/tokenizer revisions in vendored
+# corpus manifests and the lane ledgers). These are public content-addresses, never secrets.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Swarm training test fixtures + pinned public HF commit SHAs (not secrets)"
+paths = [
+  '''crates/swarm/daemon-swarm-run/tests/fixtures/.*''',
+]
+# Pinned public Hugging Face commit SHAs (40-hex) referenced across the swarm docs/specs + ledgers.
+regexes = [
+  '''607a30d783dfa663caf39e06633721c8d4cfcd7e''',
+  '''f54c09fd23315a6f9c86f9dc80f725de7d8f9c64''',
+]
