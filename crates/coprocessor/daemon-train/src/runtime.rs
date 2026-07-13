@@ -111,8 +111,13 @@ pub struct Manifest {
     pub steps_per_round: u32,
     /// Round modes the module tolerates.
     pub round_modes: Vec<String>,
-    /// Minimum viable round interval (ms).
+    /// Minimum viable round interval (ms) — the cadence floor.
     pub min_round_interval_ms: u32,
+    /// Maximum tolerated round interval (ms); `None = any` — the RUN-10 staleness ceiling (§6.5).
+    /// `#[serde(default)]` so a module built before this field (its `da_manifest` CBOR omits the key)
+    /// still decodes, defaulting to "any cadence".
+    #[serde(default)]
+    pub max_round_interval_ms: Option<u64>,
 }
 
 // -- host state ---------------------------------------------------------------------------------

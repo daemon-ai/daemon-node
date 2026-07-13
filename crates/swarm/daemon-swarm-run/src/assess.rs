@@ -109,6 +109,43 @@ impl core::fmt::Display for ManifestMismatch {
 
 impl std::error::Error for ManifestMismatch {}
 
+/// The round-cadence staleness verdict (RUN-10, §6.5) — the mirror of the `min_round_interval_ms`
+/// floor. A module may declare a `max_round_interval_ms` staleness ceiling in its `da_manifest`
+/// (e.g. the `demo` profile's real-time per-step math): it is ineligible for a run whose coordinator
+/// cadences slower than that ceiling, because its updates would be stale by the time a round closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundCadence {
+    /// The coordinator's cadence is within the module's tolerated interval (or the module set no
+    /// ceiling — it tolerates any cadence).
+    Eligible,
+    /// The coordinator cadences slower than the module tolerates — the module goes stale (§6.5).
+    TooSlow {
+        /// The module's declared staleness ceiling (ms).
+        max_round_interval_ms: u64,
+        /// The coordinator's observed round interval (ms).
+        coordinator_round_interval_ms: u64,
+    },
+}
+
+/// The staleness screen (RUN-10, §6.5): compare a module's declared `max_round_interval_ms` ceiling
+/// (from its `da_manifest`, `None ⇒ any cadence`) against the coordinator's round cadence. A
+/// real-time module is [`RoundCadence::TooSlow`] on a too-slow coordinator — the assess-time soft
+/// screen the mirror of the `min_round_interval_ms` floor. Pure over the two integers, so it is
+/// unit-testable without a worker.
+#[must_use]
+pub fn screen_round_cadence(
+    max_round_interval_ms: Option<u64>,
+    coordinator_round_interval_ms: u64,
+) -> RoundCadence {
+    match max_round_interval_ms {
+        Some(max) if coordinator_round_interval_ms > max => RoundCadence::TooSlow {
+            max_round_interval_ms: max,
+            coordinator_round_interval_ms,
+        },
+        _ => RoundCadence::Eligible,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +198,36 @@ mod tests {
             }
         );
         assert!(err.to_string().contains("!= envelope cadence 30"));
+    }
+
+    #[test]
+    fn demo_module_ineligible_on_slow_coordinator() {
+        // The `demo` profile declares a 2 s staleness ceiling (`profiles::DemoProfile::manifest`
+        // sets `max_round_interval_ms = Some(2000)`): a real-time per-step module (§5.3.3). The
+        // `daemon-train-sdk` side test `demo_manifest_declares_staleness_tolerance` pins that value
+        // at the source; here we assert the assess-time screen that consumes it.
+        const DEMO_MAX_MS: u64 = 2000;
+
+        // A coordinator slower than the ceiling marks the demo ineligible (stale updates).
+        assert_eq!(
+            screen_round_cadence(Some(DEMO_MAX_MS), 5_000),
+            RoundCadence::TooSlow {
+                max_round_interval_ms: DEMO_MAX_MS,
+                coordinator_round_interval_ms: 5_000,
+            }
+        );
+
+        // A coordinator at or under the ceiling is fine (equal is not "exceeds").
+        assert_eq!(
+            screen_round_cadence(Some(DEMO_MAX_MS), 1_500),
+            RoundCadence::Eligible
+        );
+        assert_eq!(
+            screen_round_cadence(Some(DEMO_MAX_MS), DEMO_MAX_MS),
+            RoundCadence::Eligible
+        );
+
+        // A module that declares no ceiling (e.g. `sparse_loco`) tolerates any cadence.
+        assert_eq!(screen_round_cadence(None, u64::MAX), RoundCadence::Eligible);
     }
 }
