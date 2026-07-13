@@ -232,6 +232,15 @@ base64 = "0.22"
 # system memory probe for the hardware-aware quant recommender (RAM budget; VRAM is best-effort via
 # nvidia-smi, no GPU SDK link). default-features off keeps it to the system-info we use.
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# [swarm P2:C2] Windows DXGI/D3D12 VRAM+UMA probe for the swarm training WORKER only, per
+# swarm-windows-vram-design.md §4. Windows-only: the worker wires it under
+# `[target.'cfg(windows)'.dependencies]` and selects the API-module features there (design §4:
+# Win32_Foundation, Win32_Graphics_{Dxgi,Dxgi_Common,Direct3D,Direct3D12},
+# Win32_System_SystemInformation) — this workspace entry only pins the version. INERT until the C2
+# lane references it (no Cargo.lock/deny impact now); the `windows`/`windows-sys` crate family is
+# already resolved in-tree transitively (MIT OR Apache-2.0, already allow-listed). Never linked into
+# the node process and never built in the default (Linux) gate.
+windows = "0.62"
 # pure-Rust GGUF reader for metadata introspection (arch / context / ftype) without loading a model.
 gguf-rs = "0.1"
 clap = { version = "4", features = ["derive"] }
