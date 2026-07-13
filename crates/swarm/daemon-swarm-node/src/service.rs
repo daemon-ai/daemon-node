@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::discovery::RunDiscovery;
 use crate::store::{DesiredState, PersistedRun, StoreError, SwarmStore, EVENT_WINDOW};
 
 /// A node-feed sink: the node passes a closure over `NodeEventFeed::emit` so live swarm updates ride
@@ -44,6 +45,10 @@ pub enum SwarmError {
     /// A worker-control failure (mapped from the supervisor).
     #[error("worker: {0}")]
     Worker(String),
+    /// A run-discovery / envelope-fetch failure (registry unreachable, run unknown, envelope hash
+    /// mismatch — the §6.1/§6.5 join-time discovery seam).
+    #[error("discovery: {0}")]
+    Discovery(String),
     /// The swarm service is disabled (`[swarm] enabled = false`).
     #[error("swarm is disabled")]
     Disabled,
@@ -140,6 +145,10 @@ pub struct SwarmServiceParts {
     pub worker: Arc<dyn WorkerControl>,
     /// The node-feed sink for `SwarmChanged` pointers (`None` on a headless / test build).
     pub feed: Option<NodeFeed>,
+    /// The run-discovery seam (A1). When present, `swarm_join` discovers the run + fetches the frozen
+    /// envelope + runs the worker's real §6.5 `AssessRun` before `JoinRun`. `None` keeps the W1
+    /// probe-based eligibility path (no coordinator configured), so the service stays usable offline.
+    pub discovery: Option<Arc<dyn RunDiscovery>>,
 }
 
 /// The node-side swarm-training service.
@@ -147,6 +156,7 @@ pub struct SwarmService {
     config: SwarmConfig,
     store: SwarmStore,
     worker: Arc<dyn WorkerControl>,
+    discovery: Option<Arc<dyn RunDiscovery>>,
     events_tx: broadcast::Sender<SwarmEvent>,
     feed: Option<NodeFeed>,
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
@@ -165,6 +175,7 @@ impl SwarmService {
             config: parts.config,
             store: parts.store,
             worker: parts.worker,
+            discovery: parts.discovery,
             events_tx,
             feed: parts.feed,
             current_run: Mutex::new(None),
@@ -304,14 +315,42 @@ impl SwarmService {
         }
     }
 
-    /// The coordinator endpoint for a new join: the first allowlisted endpoint (§11.1). Discovery of
-    /// per-run coordinators is a later wave (BC); W1 joins via the node's allowlisted coordinator.
+    /// The fallback coordinator endpoint (the first allowlisted endpoint, §11.1) used when no
+    /// discovery seam is configured (offline / no-registry path).
     fn coordinator(&self) -> String {
         self.config
             .coordinator_allowlist
             .first()
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Resolve the `(coordinator, eligibility)` for a join (A1).
+    ///
+    /// With a discovery seam: `GET /runs/:id` → fetch + blake3-verify the frozen envelope →
+    /// `worker.assess(envelope)` (real §6.5), taking the coordinator from the registry. Without one:
+    /// the W1 probe against the allowlisted coordinator. Eligibility is always node-computed.
+    async fn resolve_join(&self, run_id: &str) -> Result<(String, SwarmEligibility), SwarmError> {
+        if let Some(discovery) = &self.discovery {
+            let run = discovery
+                .get_run(run_id)
+                .await?
+                .ok_or_else(|| SwarmError::Discovery(format!("run {run_id} not found")))?;
+            let envelope = discovery.fetch_envelope(run_id).await?;
+            let verdict = self.worker.assess(envelope).await?;
+            Ok((run.coordinator, eligibility_from_assess(&verdict)))
+        } else {
+            let coordinator = self.coordinator();
+            let eligibility = match self.worker.probe().await {
+                Ok(hw) => eligibility_from_hardware(&hw),
+                Err(_) => SwarmEligibility {
+                    eligible: false,
+                    reasons: vec!["worker probe failed".into()],
+                    headroom: BTreeMap::new(),
+                },
+            };
+            Ok((coordinator, eligibility))
+        }
     }
 }
 
@@ -352,18 +391,13 @@ impl SwarmApi for SwarmService {
         // Idempotency is enforced upstream by the dispatch op-id dedup guard; the store's
         // INSERT-OR-UPDATE keeps a repeated join convergent regardless.
         self.require_enabled().map_err(|e| e.to_api())?;
-        let coordinator = self.coordinator();
-        // Node-computed eligibility (ADR-003): derive it from the worker hardware probe. The
-        // envelope-based AssessRun path (§6.5) lands with coordinator discovery (BC/B3); W1 uses the
-        // probe so the persisted eligibility the app renders is always node-computed, never faked.
-        let eligibility = match self.worker.probe().await {
-            Ok(hw) => eligibility_from_hardware(&hw),
-            Err(_) => SwarmEligibility {
-                eligible: false,
-                reasons: vec!["worker probe failed".into()],
-                headroom: BTreeMap::new(),
-            },
-        };
+        // Node-computed eligibility (ADR-003). A1: when a discovery seam is configured, resolve the
+        // run + fetch the frozen envelope + run the worker's real §6.5 `AssessRun` before `JoinRun`,
+        // and take the coordinator endpoint from discovery. With no discovery configured, fall back
+        // to the W1 probe-based eligibility against the allowlisted coordinator (offline / no-registry
+        // path). Either way the persisted eligibility is node-computed — the app never re-derives it.
+        let (coordinator, eligibility) =
+            self.resolve_join(&run_id).await.map_err(|e| e.to_api())?;
         self.store
             .put_join_intent(&run_id, &coordinator, &policy, None, &eligibility)
             .map_err(|e| SwarmError::from(e).to_api())?;
@@ -485,6 +519,10 @@ fn hardware_report(hw: Hardware) -> SwarmHardwareReport {
     SwarmHardwareReport {
         gpus: hw.gpus,
         vram_mb: hw.vram_mb,
+        // A1 / wire v42: mirror the worker's unified-memory spillover (GTT) into the app-facing DTO
+        // additively (the P1 Merge-2 recorded follow-on), so the GUI's "what can my GPU do" panel
+        // shows the true effective budget on integrated/UMA boxes.
+        shared_mb: hw.shared_mb,
         ram_mb: hw.ram_mb,
         backend_lanes: hw.backend_lanes,
         capabilities: SwarmCapabilities {
@@ -499,8 +537,19 @@ fn hardware_report(hw: Hardware) -> SwarmHardwareReport {
     }
 }
 
-/// A coarse node-computed eligibility from a hardware probe (the W1 placeholder for the §6.5
-/// envelope assess): eligible if the worker reports a usable GPU or backend lane, with VRAM/RAM
+/// Map the worker's real §6.5 `AssessRun` verdict onto the app-facing eligibility DTO (A1). The
+/// worker's `headroom` is an ordered `Vec<(String, i64)>`; the wire DTO is a `BTreeMap`. The app
+/// renders this; it never re-derives eligibility (ADR-003).
+fn eligibility_from_assess(e: &Eligibility) -> SwarmEligibility {
+    SwarmEligibility {
+        eligible: e.eligible,
+        reasons: e.reasons.clone(),
+        headroom: e.headroom.iter().cloned().collect(),
+    }
+}
+
+/// A coarse node-computed eligibility from a hardware probe (the fallback when no discovery seam is
+/// configured): eligible if the worker reports a usable GPU or backend lane, with VRAM/RAM
 /// headroom. The app renders this; it never re-derives eligibility (ADR-003).
 fn eligibility_from_hardware(hw: &Hardware) -> SwarmEligibility {
     let eligible = hw.gpus > 0 || !hw.backend_lanes.is_empty();

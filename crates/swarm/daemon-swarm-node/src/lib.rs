@@ -20,8 +20,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod discovery;
 pub mod service;
 pub mod store;
 
+pub use discovery::{DiscoveredRun, EgressRunDiscovery, RunDiscovery};
 pub use service::{NodeFeed, SwarmError, SwarmService, SwarmServiceParts, WorkerControl};
 pub use store::{DesiredState, PersistedRun, StoreError, SwarmStore, EVENT_WINDOW};

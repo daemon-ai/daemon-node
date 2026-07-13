@@ -57,3 +57,25 @@ async fn iroh_conformance_dedupe() {
     let mut mesh = mesh_from(&nodes);
     conformance_dedupe(&mut mesh, b"commitment").await;
 }
+
+// The parametric suite over the WS plane: N `WsControlPlane`s against one in-process mock
+// `RunCoordinatorDO` implementing the DO's dissemination framing (relay-to-others, no self-echo).
+#[cfg(feature = "ws")]
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_conformance_fanout() {
+    use common::ws_harness::{build_ws_mesh, ws_mesh_from, MockWsCoordinator};
+    let coord = MockWsCoordinator::start().await;
+    let nodes = build_ws_mesh(&coord, 3).await;
+    let mut mesh = ws_mesh_from(&nodes);
+    conformance_fanout(&mut mesh, b"round-open").await;
+}
+
+#[cfg(feature = "ws")]
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_conformance_dedupe() {
+    use common::ws_harness::{build_ws_mesh, ws_mesh_from, MockWsCoordinator};
+    let coord = MockWsCoordinator::start().await;
+    let nodes = build_ws_mesh(&coord, 3).await;
+    let mut mesh = ws_mesh_from(&nodes);
+    conformance_dedupe(&mut mesh, b"commitment").await;
+}

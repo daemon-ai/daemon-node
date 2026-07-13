@@ -769,7 +769,13 @@ impl WireVersion {
     /// distinct from the existing telemetry consent) + their `crash-consent-*` CDDL rules. Purely
     /// additive union arms, mirroring the telemetry-consent verbs; strict-equal `is_compatible`
     /// still holds; clients feature-detect via the `api/41` Hello feature.
-    pub const CURRENT: Self = Self(41);
+    ///
+    /// (v42) additive `SwarmHardwareReport.shared_mb` (Swarm P2, A1) — the app-facing mirror of the
+    /// worker's unified-memory (GTT) spillover the node already probes (`Hardware.shared_mb`), so the
+    /// GUI shows the true effective device budget on integrated/UMA boxes. A single additive DTO
+    /// field (`#[serde(default)]`) + its `swarm-hardware-report` CDDL key; strict-equal
+    /// `is_compatible` still holds; clients feature-detect via the `api/42` Hello feature.
+    pub const CURRENT: Self = Self(42);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
