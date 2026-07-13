@@ -60,6 +60,12 @@ pub struct ShardDesc {
 }
 
 /// The pre-tokenized corpus manifest (`manifest.json`, §8).
+///
+/// The provenance fields (`tokenizer`/`tokenizer_revision`/`dataset`/`dataset_revision`) are an
+/// **additive** Wave-2 extension (M1): `#[serde(default)]` + `skip_serializing_if` keeps every
+/// pre-Wave-2 manifest (which carries only `token_width`/`seq_len`/`shards`) valid, and a manifest
+/// written without provenance is byte-identical to the old shape. They record how the shards were
+/// produced (`xtask tokenize-corpus`) so a run is reproducible and auditable (spec §8/§9).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     /// The token element width shared by every shard.
@@ -68,6 +74,18 @@ pub struct Manifest {
     pub seq_len: u32,
     /// The shards, in data-window order.
     pub shards: Vec<ShardDesc>,
+    /// The tokenizer identity the corpus was tokenized with (e.g. `"gpt2"`), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<String>,
+    /// The pinned tokenizer revision (HF commit SHA / tag), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_revision: Option<String>,
+    /// The source dataset identity (e.g. `"roneneldan/TinyStories"`), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    /// The pinned dataset revision (HF commit SHA / tag), if recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_revision: Option<String>,
 }
 
 /// The location of one sequence within the corpus: which shard, and the token offset into it.
@@ -313,6 +331,10 @@ impl SyntheticCorpus {
             token_width: TokenWidth::U16,
             seq_len,
             shards,
+            tokenizer: None,
+            tokenizer_revision: None,
+            dataset: None,
+            dataset_revision: None,
         };
         manifest.validate()?;
         Ok((manifest, blobs))
@@ -477,6 +499,10 @@ mod tests {
             token_width: TokenWidth::U16,
             seq_len,
             shards,
+            tokenizer: None,
+            tokenizer_revision: None,
+            dataset: None,
+            dataset_revision: None,
         }
     }
 
@@ -633,6 +659,35 @@ mod tests {
         assert_eq!(corpus.sequence(corpus.total_sequences()).unwrap(), s0);
         // Distinct sequences differ (deterministic synthetic tokens).
         assert_ne!(corpus.sequence(1).unwrap(), s0);
+    }
+
+    #[test]
+    fn manifest_provenance_is_additive_and_back_compatible() {
+        // A pre-Wave-2 manifest (no provenance keys at all) still parses (RUN-3 back-compat).
+        let old = r#"{
+            "token_width": "u16",
+            "seq_len": 4,
+            "shards": [{"name":"a","bytes":16,"tokens":8,
+                "blake3":"0000000000000000000000000000000000000000000000000000000000000000"}]
+        }"#;
+        let m = Manifest::from_json(old).unwrap();
+        assert_eq!(m.tokenizer, None);
+        assert_eq!(m.dataset, None);
+        // A provenance-less manifest serializes WITHOUT the new keys (byte-identical old shape).
+        let json = m.to_json().unwrap();
+        assert!(!json.contains("tokenizer"), "no tokenizer key when unset");
+        assert!(!json.contains("dataset"), "no dataset key when unset");
+
+        // A provenance-carrying manifest round-trips and preserves every field.
+        let mut prov = m.clone();
+        prov.tokenizer = Some("gpt2".into());
+        prov.tokenizer_revision = Some("607a30d783dfa663caf39e06633721c8d4cfcd7e".into());
+        prov.dataset = Some("roneneldan/TinyStories".into());
+        prov.dataset_revision = Some("main".into());
+        let round = Manifest::from_json(&prov.to_json().unwrap()).unwrap();
+        assert_eq!(round, prov);
+        // A new-shape manifest read by any consumer still validates structurally.
+        round.validate().unwrap();
     }
 
     #[test]
