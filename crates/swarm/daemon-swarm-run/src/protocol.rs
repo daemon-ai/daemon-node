@@ -91,8 +91,19 @@ pub struct WorkerCapabilities {
 pub struct Hardware {
     /// The number of usable GPUs.
     pub gpus: u32,
-    /// Total VRAM in MiB (across GPUs).
+    /// Dedicated VRAM in MiB (across GPUs). On a unified/integrated GPU this is the small
+    /// dedicated carve-out (sysfs `mem_info_vram_total`), NOT the usable budget — that spills into
+    /// [`Self::shared_mb`].
     pub vram_mb: u64,
+    /// Shared / unified spillover memory in MiB (GTT — sysfs `mem_info_gtt_total`): the host DRAM
+    /// an integrated GPU can page tensors into beyond [`Self::vram_mb`]. `0` = none (a classic
+    /// discrete GPU). **Additive (Merge 2):** `#[serde(default)]` keeps pre-Merge-2 `Hardware`
+    /// payloads (which lack this field) decodable, and a `shared_mb == 0` value serializes
+    /// compatibly. This is the worker↔node protocol type; it does NOT cross the SwarmApi wire (the
+    /// app-facing DTO is `daemon_api::SwarmHardwareReport`, mapped in the node service), so no CDDL
+    /// / wire-version change is implied.
+    #[serde(default)]
+    pub shared_mb: u64,
     /// Installed host RAM in MiB (§5.1 host-RAM planning).
     pub ram_mb: u64,
     /// The backend lanes the worker was built with (`cpu`, `cuda`, `rocm`, `vulkan`).
@@ -330,6 +341,7 @@ mod tests {
         round_trip_event(Event::Probed(Hardware {
             gpus: 2,
             vram_mb: 24_000,
+            shared_mb: 120_000,
             ram_mb: 64_000,
             backend_lanes: vec!["cuda".into()],
             capabilities: WorkerCapabilities {
@@ -395,5 +407,52 @@ mod tests {
             });
         }
         round_trip_event(Event::Pong);
+    }
+
+    /// `hardware_shared_mb_is_additive_back_compatible`: the Merge-2 `shared_mb` field is additive.
+    /// A pre-Merge-2 `Hardware` payload (a CBOR map WITHOUT `shared_mb`) still decodes, with
+    /// `shared_mb` defaulting to 0; and a `shared_mb == 0` value is carried through a round-trip.
+    #[test]
+    fn hardware_shared_mb_is_additive_back_compatible() {
+        // A pre-Merge-2 `Hardware` had no `shared_mb`. Model it with a mirror struct and decode the
+        // legacy bytes into the current type: `#[serde(default)]` fills `shared_mb = 0`.
+        #[derive(serde::Serialize)]
+        struct LegacyHardware {
+            gpus: u32,
+            vram_mb: u64,
+            ram_mb: u64,
+            backend_lanes: Vec<String>,
+            capabilities: WorkerCapabilities,
+            up_kbps: u64,
+            down_kbps: u64,
+            disk_free_mb: u64,
+            throughput_class: String,
+        }
+        let legacy = LegacyHardware {
+            gpus: 1,
+            vram_mb: 4096,
+            ram_mb: 124_419,
+            backend_lanes: vec!["vulkan".into(), "cpu".into()],
+            capabilities: WorkerCapabilities::default(),
+            up_kbps: 0,
+            down_kbps: 0,
+            disk_free_mb: 0,
+            throughput_class: "c1".into(),
+        };
+        let bytes = encode(&legacy).expect("encode legacy");
+        let decoded: Hardware = decode(&bytes).expect("legacy Hardware still decodes");
+        assert_eq!(decoded.shared_mb, 0, "missing field defaults to 0");
+        assert_eq!(decoded.vram_mb, 4096);
+
+        // Full round-trip preserves a real GTT number.
+        let hw = Hardware {
+            gpus: 1,
+            vram_mb: 4096,
+            shared_mb: 120_000,
+            ram_mb: 124_419,
+            ..Hardware::default()
+        };
+        let back: Hardware = decode(&encode(&hw).expect("encode")).expect("decode");
+        assert_eq!(back.shared_mb, 120_000);
     }
 }

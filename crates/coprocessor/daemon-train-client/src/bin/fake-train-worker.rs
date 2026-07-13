@@ -116,6 +116,7 @@ fn hardware() -> Hardware {
     Hardware {
         gpus: 1,
         vram_mb: 24_000,
+        shared_mb: 0,
         ram_mb: 64_000,
         backend_lanes: vec!["cpu".into()],
         capabilities: capabilities(),

@@ -119,20 +119,65 @@ fn host_ram_mb() -> u64 {
     0
 }
 
-/// The host hardware + capability report (§10.2). GPU count / VRAM come from a real wgpu adapter
-/// probe when the `wgpu` feature is on; a CPU-only build reports `gpus: 0` and the CPU lane.
+/// Read an amdgpu sysfs memory-total file for the first DRM card that exposes it, in MiB.
 ///
-/// **Honesty note (see `autotune` module docs):** wgpu has no total-VRAM query. `vram_mb` therefore
-/// carries the adapter's `max_buffer_size` (the largest single allocation) as a documented
-/// lower-bound proxy; the GPU-governor policy cap (§10.5) is the authoritative VRAM budget.
+/// `file` is `mem_info_vram_total` (dedicated VRAM — the true device lower bound) or
+/// `mem_info_gtt_total` (the GTT / unified spillover pool). These are plain byte-count files under
+/// `/sys/class/drm/card*/device/` — a legal direct file read in the worker binary (not the node).
+/// Returns `0` when no card exposes the file (non-amdgpu / non-Linux), so callers fall back.
+///
+/// Parsing is delegated to [`daemon_train::autotune::parse_amdgpu_mem_mb`] (unit-tested with
+/// fixture strings); this wrapper only does the sysfs directory walk + read.
+#[cfg(feature = "wgpu")]
+fn amdgpu_sysfs_mem_mb(file: &str) -> u64 {
+    let Ok(cards) = std::fs::read_dir("/sys/class/drm") else {
+        return 0;
+    };
+    for entry in cards.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Only `cardN` device roots carry `device/mem_info_*` (skip `cardN-<connector>` outputs).
+        if !(name.starts_with("card") && name[4..].bytes().all(|b| b.is_ascii_digit())) {
+            continue;
+        }
+        let path = entry.path().join("device").join(file);
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Some(mb) = daemon_train::autotune::parse_amdgpu_mem_mb(&contents) {
+                if mb > 0 {
+                    return mb;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// The host hardware + capability report (§10.2). GPU count / VRAM come from a real wgpu adapter
+/// probe + sysfs when the `wgpu` feature is on; a CPU-only build reports `gpus: 0` and the CPU lane.
+///
+/// **VRAM source (Merge-2 UMA fix).** wgpu has no total-VRAM query and clamps `max_buffer_size` to
+/// i32::MAX (2047 MiB) on Linux/Mesa — a per-buffer limit, NOT the memory budget. `vram_mb` now
+/// carries the sysfs *dedicated* VRAM (`mem_info_vram_total`, a true lower bound: 4096 MiB on this
+/// box) when available, falling back to the `max_buffer_size` proxy only when sysfs is absent. The
+/// additive `shared_mb` carries the GTT / unified spillover pool (`mem_info_gtt_total`), which is
+/// where an integrated GPU actually pages large tensors.
 pub(crate) fn hardware() -> Hardware {
     let ram_mb = host_ram_mb();
     #[cfg(feature = "wgpu")]
     {
         if let Some(p) = daemon_train::autotune::probe_wgpu() {
+            // Dedicated VRAM from sysfs (true lower bound); fall back to the max-alloc proxy.
+            let vram_sysfs = amdgpu_sysfs_mem_mb("mem_info_vram_total");
+            let vram_mb = if vram_sysfs > 0 {
+                vram_sysfs
+            } else {
+                p.max_alloc_mb
+            };
+            let shared_mb = amdgpu_sysfs_mem_mb("mem_info_gtt_total");
             return Hardware {
                 gpus: p.gpus,
-                vram_mb: p.max_alloc_mb,
+                vram_mb,
+                shared_mb,
                 ram_mb,
                 backend_lanes: vec!["vulkan".to_string(), "cpu".to_string()],
                 capabilities: host_capabilities(),
@@ -146,6 +191,7 @@ pub(crate) fn hardware() -> Hardware {
     Hardware {
         gpus: 0,
         vram_mb: 0,
+        shared_mb: 0,
         ram_mb,
         backend_lanes: vec!["cpu".to_string()],
         capabilities: host_capabilities(),
@@ -156,10 +202,14 @@ pub(crate) fn hardware() -> Hardware {
     }
 }
 
-/// The device budget the autotune verdict is computed against. With the `wgpu` feature + a usable
-/// adapter, VRAM + the per-allocation ceiling come from the probe; otherwise the CPU lane runs in
-/// host RAM (no separate VRAM constraint), so VRAM is budgeted as host RAM. Unknown dimensions use a
-/// large sentinel so an unprobed number never rejects.
+/// The device budget the autotune verdict is computed against (Merge-2 UMA fix).
+///
+/// With the `wgpu` feature + a usable adapter: `vram_mb` = sysfs dedicated VRAM (true lower bound),
+/// `shared_mb` = sysfs GTT (the unified spillover pool), `max_alloc_mb` = the wgpu `max_buffer_size`
+/// per-buffer ceiling, and `unified` = the adapter's device-type (IntegratedGpu/Cpu). On a unified
+/// device the verdict then treats VRAM+GTT+RAM as one physical DRAM pool instead of rejecting
+/// against the 2047 MiB per-buffer clamp. Without a GPU, the CPU lane runs in host RAM (no separate
+/// VRAM constraint). Unknown dimensions use a large sentinel so an unprobed number never rejects.
 fn device_limits() -> DeviceLimits {
     let ram_mb = {
         let r = host_ram_mb();
@@ -172,10 +222,23 @@ fn device_limits() -> DeviceLimits {
     #[cfg(feature = "wgpu")]
     {
         if let Some(p) = daemon_train::autotune::probe_wgpu() {
+            let vram_sysfs = amdgpu_sysfs_mem_mb("mem_info_vram_total");
+            // On a unified device without sysfs VRAM, dedicated VRAM is not a meaningful cap; the
+            // pool is host RAM, so budget VRAM as RAM. On a discrete device fall back to the
+            // per-buffer proxy (the honest lower bound wgpu can give).
+            let vram_mb = if vram_sysfs > 0 {
+                vram_sysfs
+            } else if p.unified {
+                ram_mb
+            } else {
+                p.max_alloc_mb
+            };
             return DeviceLimits {
-                vram_mb: p.max_alloc_mb,
+                vram_mb,
                 ram_mb,
                 max_alloc_mb: p.max_alloc_mb,
+                shared_mb: amdgpu_sysfs_mem_mb("mem_info_gtt_total"),
+                unified: p.unified,
             };
         }
     }
@@ -183,6 +246,8 @@ fn device_limits() -> DeviceLimits {
         vram_mb: ram_mb,
         ram_mb,
         max_alloc_mb: 0,
+        shared_mb: 0,
+        unified: false,
     }
 }
 

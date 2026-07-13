@@ -202,10 +202,15 @@ impl TrainerBackend for WasmBackend {
         // The node's effective resources are the VRAM/RAM budget (governor policy caps applied,
         // §10.5). `max_alloc_mb = 0` = unbounded here (the worker's meta+probe path supplies the
         // wgpu-queryable per-allocation ceiling); this trait path budgets on total resources.
+        // This trait path budgets on the node's total effective resources (governor caps already
+        // applied); it is not device-type aware, so it keeps the discrete (independent VRAM/RAM)
+        // interpretation — `shared_mb = 0`, `unified = false`. The worker's meta+probe path
+        // (`daemon-train-worker/backend.rs`) supplies the real unified-memory limits.
         let limits = DeviceLimits {
             vram_mb: meta.effective_vram_mb,
             ram_mb: meta.effective_ram_mb,
             max_alloc_mb: 0,
+            ..Default::default()
         };
         let v = autotune.verdict(&limits, DEFAULT_MAX_MICROBATCH);
         Ok(Assessment {

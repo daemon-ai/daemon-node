@@ -134,6 +134,7 @@ fn meta_mode_vram_ram_estimates() {
         vram_mb: probe.max_alloc_mb,
         ram_mb: 8192, // a conservative host-RAM floor; the worker probes /proc/meminfo
         max_alloc_mb: probe.max_alloc_mb,
+        ..Default::default()
     };
     let v = autotune.verdict(&limits, DEFAULT_MAX_MICROBATCH);
     eprintln!(
@@ -216,4 +217,129 @@ fn ingest_budget_scales_with_count() {
         "ingest_budget_scales_with_count (wgpu): base={base} slope={slope} n={n} \
          scaled_budget={scaled} tight_budget={tight}"
     );
+}
+
+/// Read an amdgpu sysfs memory-total file (bytes) for the first DRM card, in MiB (test-side mirror
+/// of the worker's `amdgpu_sysfs_mem_mb`, using the same public parser). `0` if absent.
+fn sysfs_mem_mb(file: &str) -> u64 {
+    let Ok(cards) = std::fs::read_dir("/sys/class/drm") else {
+        return 0;
+    };
+    for entry in cards.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !(name.starts_with("card") && name[4..].bytes().all(|b| b.is_ascii_digit())) {
+            continue;
+        }
+        if let Ok(s) = std::fs::read_to_string(entry.path().join("device").join(file)) {
+            if let Some(mb) = daemon_train::autotune::parse_amdgpu_mem_mb(&s) {
+                if mb > 0 {
+                    return mb;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn host_ram_mb() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            if let Some(kb) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                return kb / 1024;
+            }
+        }
+    }
+    0
+}
+
+/// HOST-8 (Merge-2 UMA re-run) `preset_160m_eligible_on_unified_device`: the headline autotune
+/// check. With the real device probe + sysfs on THIS machine — dedicated VRAM (`mem_info_vram_total`
+/// = 4096 MiB), the GTT/shared pool (`mem_info_gtt_total` = 120000 MiB), the wgpu `max_buffer_size`
+/// per-buffer clamp (2047 MiB), and the adapter device type (IntegratedGpu → unified) — the 160M
+/// preset is **eligible**. The same model against the pre-fix clamped limits (VRAM = the 2047 MiB
+/// per-buffer proxy, non-unified, no shared pool) is REJECTED, documenting the fix delta.
+///
+/// The 160M footprint is built analytically from the preset's canonical param layout + the fp32
+/// steady-state (params + master + grad + AdamW m/v = 20·N; host ≈ 8·N; spec §5.1), avoiding the
+/// minutes-long full 160M meta execute pass (program Risk 3) — the full pass is exercised by the
+/// wgpu 160M training smoke.
+#[test]
+fn preset_160m_eligible_on_unified_device() {
+    require_gpu!();
+    let probe = probe_wgpu().expect("adapter probed (require_gpu passed)");
+
+    let cfg = TinyLlamaCfg::llama_160m();
+    let n = cfg.param_count();
+    let max_tensor_bytes = cfg
+        .canonical_param_layout()
+        .iter()
+        .map(|(_, dims)| dims.iter().map(|&d| u64::from(d)).product::<u64>() * 4)
+        .max()
+        .expect("160M has params");
+    const MIB: u64 = 1 << 20;
+    let m160 = Autotune {
+        fixed_vram_bytes: 20 * n, // 4N storage + 4N fp32 master + 4N fp32 grad + 8N AdamW m/v
+        act_bytes_per_mb: 128 * MIB, // representative per-micro-batch activation
+        host_ram_bytes: 8 * n,
+        payload_bytes: 4 * n / 64,
+        max_tensor_bytes,
+    };
+
+    // Real device limits, exactly as the worker's `device_limits()` builds them on this machine.
+    let vram_mb = sysfs_mem_mb("mem_info_vram_total");
+    let shared_mb = sysfs_mem_mb("mem_info_gtt_total");
+    let ram_mb = host_ram_mb().max(1);
+    let limits = DeviceLimits {
+        vram_mb: if vram_mb > 0 {
+            vram_mb
+        } else {
+            probe.max_alloc_mb
+        },
+        ram_mb,
+        max_alloc_mb: probe.max_alloc_mb,
+        shared_mb,
+        unified: probe.unified,
+    };
+    let v = m160.verdict(&limits, DEFAULT_MAX_MICROBATCH);
+    eprintln!(
+        "preset_160m_eligible_on_unified_device: adapter={} device_type={} unified={} \
+         vram_mb={} shared_mb={} max_alloc_mb={} ram_mb={} => {v:?}",
+        probe.adapter,
+        probe.device_type,
+        probe.unified,
+        limits.vram_mb,
+        limits.shared_mb,
+        limits.max_alloc_mb,
+        limits.ram_mb
+    );
+    assert!(
+        v.eligible,
+        "160M must be ELIGIBLE with the real unified-memory probe on this machine: {:?}",
+        v.reasons
+    );
+    assert!(v.micro_batch >= 1);
+
+    // The pre-fix interpretation (VRAM = the 2047 MiB per-buffer clamp, non-unified, no GTT pool)
+    // rejects the same model — this is the exact Merge-2 blocker the UMA fix resolves.
+    let clamped = DeviceLimits {
+        vram_mb: probe.max_alloc_mb, // 2047 on RADV/Mesa
+        ram_mb,
+        max_alloc_mb: probe.max_alloc_mb,
+        shared_mb: 0,
+        unified: false,
+    };
+    let before = m160.verdict(&clamped, DEFAULT_MAX_MICROBATCH);
+    assert!(
+        !before.eligible,
+        "the pre-fix clamped budget must reject 160M (the blocker): {before:?}"
+    );
+    eprintln!("preset_160m (pre-fix clamped 2047 MiB) verdict: {before:?}");
 }

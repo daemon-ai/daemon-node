@@ -219,6 +219,11 @@ impl HostState {
                 // The single G2 site: slot `BurnBackend<Autodiff<Wgpu>>` into the same seam. Device
                 // per `gpu_index` (None = best available). The wgpu runtime is brought up lazily on
                 // the first tensor op, so construction here is cheap.
+                //
+                // Register-or-reuse ordering: run the memoized probe FIRST so it is the canonical
+                // default-device bring-up (it captures adapter info incl. device_type); the backend
+                // below then reuses that registered client instead of racing a second registration.
+                let _ = crate::autotune::probe_wgpu();
                 let device = match cfg.gpu_index {
                     Some(i) => burn::backend::wgpu::WgpuDevice::DiscreteGpu(i as usize),
                     None => burn::backend::wgpu::WgpuDevice::default(),
