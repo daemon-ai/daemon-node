@@ -564,9 +564,11 @@ pub struct NodeApiImpl {
     /// The swarm-training service backing the [`daemon_api::SwarmApi`] sub-surface (spec §10.4).
     /// `None` on a node built without swarm training (`[swarm] enabled = false`, the default): every
     /// `SwarmApi` call then resolves to [`ApiError::Unsupported`] / an empty stream. Bound at
-    /// assembly via [`with_swarm`](Self::with_swarm) only when the service is enabled — the node
-    /// never spawns a training worker unless a swarm service is present.
-    swarm: Option<Arc<dyn daemon_api::SwarmApi>>,
+    /// assembly via [`with_swarm`](Self::with_swarm) OR **post-`Arc`** via
+    /// [`set_swarm`](Self::set_swarm) (B3 — the service is built after the node exists, like the
+    /// gateway/managed backends), only when the service is enabled — the node never spawns a training
+    /// worker unless a swarm service is present. A write-once cell (like a managed backend seam).
+    swarm: std::sync::OnceLock<Arc<dyn daemon_api::SwarmApi>>,
 }
 
 impl NodeApiImpl {

@@ -99,17 +99,26 @@ impl NodeApiImpl {
                 crate::notifications::NotificationManager::new(),
             )),
             persons: Arc::new(std::sync::Mutex::new(crate::person::PersonManager::new())),
-            swarm: None,
+            swarm: std::sync::OnceLock::new(),
         }
     }
 
-    /// Bind the swarm-training service backing the [`daemon_api::SwarmApi`] sub-surface (spec §10.4).
-    /// Call at assembly ONLY when `[swarm] enabled = true` — the node never spawns a training worker
-    /// unless a service is present. Absent, every `SwarmApi` op resolves to [`ApiError::Unsupported`]
-    /// / an empty stream.
-    pub fn with_swarm(mut self, swarm: Arc<dyn daemon_api::SwarmApi>) -> Self {
-        self.swarm = Some(swarm);
+    /// Bind the swarm-training service backing the [`daemon_api::SwarmApi`] sub-surface (spec §10.4)
+    /// **at assembly** (builder form). Call ONLY when `[swarm] enabled = true` — the node never spawns
+    /// a training worker unless a service is present. Absent, every `SwarmApi` op resolves to
+    /// [`ApiError::Unsupported`] / an empty stream. See [`set_swarm`](Self::set_swarm) for the
+    /// post-`Arc` binder B3 uses (the service is built after the node exists).
+    pub fn with_swarm(self, swarm: Arc<dyn daemon_api::SwarmApi>) -> Self {
+        let _ = self.swarm.set(swarm);
         self
+    }
+
+    /// Bind the swarm-training service **post-`Arc`** (B3): the `daemon-swarm-node` `SwarmService`
+    /// owns a `TrainSupervisor` that is constructed after the node exists (mirroring
+    /// [`set_gateway`](Self::set_gateway) / [`register_managed`](Self::register_managed)). Idempotent
+    /// (write-once); a second bind is ignored. Call ONLY when `[swarm] enabled = true`.
+    pub fn set_swarm(&self, swarm: Arc<dyn daemon_api::SwarmApi>) {
+        let _ = self.swarm.set(swarm);
     }
 
     /// Register a node-managed backend resource ([`ManagedResource`](crate::managed::ManagedResource))

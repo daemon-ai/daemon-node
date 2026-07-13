@@ -28,6 +28,16 @@ impl NodeApiImpl {
         self.node_events.clone()
     }
 
+    /// Emit a node-wide [`NodeEvent`](daemon_api::NodeEvent) onto the `events_subscribe` feed (when
+    /// wired). The additive hook the post-`Arc` swarm service (B3) uses to publish its
+    /// `SwarmChanged` invalidation pointers onto the existing feed (§10.4 — the app refetches
+    /// `swarm_run_detail`). A no-op when no feed is wired (tests / headless).
+    pub fn emit_node_event(&self, event: daemon_api::NodeEvent) {
+        if let Some(feed) = self.node_feed() {
+            feed.emit(event);
+        }
+    }
+
     /// Ping the fleet bus that the roster/tree changed (a rename/pin/archive that no producer models
     /// as a subagent transition). Projects a fresh `tree()` snapshot onto the bus off-thread so live
     /// `tree_subscribe` subscribers refresh promptly; a no-op when no bus is wired or there are no
