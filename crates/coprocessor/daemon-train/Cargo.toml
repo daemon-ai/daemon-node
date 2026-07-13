@@ -82,6 +82,11 @@ daemon-train-client = { workspace = true }
 # Test-only: `SessionId` for the lower-level direct-subprocess round-loop test (spawns the worker via
 # `daemon_provision` and drives the protocol to observe `RoundOutcome`).
 daemon-common = { workspace = true }
+# Test-only (M2 reference-parity harness): the state-dict ↔ safetensors converter (M1 seam 4) the
+# parity tests use to compare the tabi path's and the burn reference's weights. Already a
+# `[workspace.dependencies]` entry (added at Merge 2) — a dev-dep on an existing workspace dep, no
+# root/deny/flake change.
+daemon-train-safetensors = { workspace = true }
 
 [lints]
 workspace = true
