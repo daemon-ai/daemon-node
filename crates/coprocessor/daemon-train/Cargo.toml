@@ -49,6 +49,24 @@ daemon-provision = { workspace = true }
 # Async runtime for the `daemon-train-worker` binary's stdio command/event loop. Bin target only.
 tokio = { workspace = true }
 
+# Per-backend lane selection (spec §10.1). These features only toggle burn's *dependency* backend
+# features — no code path changes this wave (Wave-0 scaffold): the `OpBackend` seam is still the
+# `CpuBackend` fp32 fake; G1/G2 wire `BurnBackend` behind these lanes in Waves 1–2. burn's `std` +
+# `ndarray` + `autodiff` are always on (the root workspace dep), so `cpu` (default) and `burn-ndarray`
+# both compile the current CPU/ndarray+autodiff graph; `wgpu` additionally pulls burn-wgpu (cubecl +
+# wgpu 29, Vulkan/RADV at runtime via the flake). Kept out of the default gate: `wgpu` is opt-in, so a
+# default `cargo build`/`test`/`deny` never compiles the GPU tree.
+[features]
+default = ["cpu"]
+# The CPU (det-lane fp32) lane — current MVP behavior, no extra backend deps.
+cpu = []
+# burn with the ndarray backend + autodiff — the G1 native lane (burn-ndarray is already on via the
+# root dep; the explicit toggle documents/pins the lane and makes `--features burn-ndarray` a no-op-
+# safe alias for the CI gate).
+burn-ndarray = ["burn/ndarray"]
+# burn with the wgpu backend (cubecl + wgpu 29; targets Vulkan/RADV) — the G2 GPU lane. Opt-in only.
+wgpu = ["burn/wgpu"]
+
 [dev-dependencies]
 # Test-only: the frozen-surface sync check (`tests/abi_surface.rs`) reads the guest SDK's
 # `TABI_IMPORTS`, and the guest-lifecycle test builds the `TinyLlamaCfg` the wasm guest parses.

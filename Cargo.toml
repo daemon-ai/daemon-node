@@ -55,8 +55,12 @@ ciborium = "0.2"
 # ABI is our own tensor ABI, tensor-ABI spec §5.1).
 wasmtime = { version = "46", default-features = false, features = ["runtime", "cranelift", "pooling-allocator"] }
 # The training engine, isolated to `daemon-train`. default-features = false + the ndarray backend
-# and autodiff only; GPU backends (wgpu/cuda/rocm/vulkan) are deliberately NOT in the default gate —
-# they build as separate Nix flake outputs per lane (like the daemon-infer engine lanes, §10.1).
+# and autodiff only are ALWAYS on (the CPU/G1 lane); GPU backends stay OUT of the default gate. The
+# `wgpu` backend (burn 0.21's `wgpu` feature -> burn-wgpu + cubecl + wgpu 29; the P1 GPU lane targets
+# Vulkan/RADV via the flake's shaderc/vulkan-loader) is reachable but OPT-IN: it is toggled per-lane
+# by `daemon-train`'s own `wgpu` cargo feature (`burn/wgpu`), so a default `cargo build`/`cargo deny`
+# never compiles it (spec §10.1: heavy GPU deps build only as out-of-gate per-backend Nix lanes, like
+# the daemon-infer engine lanes). Keep default-features = false so the feature set stays this list.
 burn = { version = "0.21", default-features = false, features = ["std", "ndarray", "autodiff"] }
 # Canonical content hashing for artifact / tensor / checkpoint identity (blake3), plus the cheap
 # xxh3-64 in-memory change probe. Isolated to the swarm stack.
