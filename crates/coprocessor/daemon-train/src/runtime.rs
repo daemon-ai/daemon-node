@@ -27,6 +27,22 @@ use crate::phase::{self, Phase};
 use crate::trap::{Trap, TrapCode};
 use crate::TrainError;
 
+/// Which [`OpBackend`] the host instantiates behind the ABI dispatch layer (G1 seam).
+///
+/// The default is [`BackendKind::Cpu`] — the frozen fixed-order fp32 tape (`CpuBackend`), the MVP
+/// cross-peer bit-identity engine. [`BackendKind::BurnNdarray`] selects the burn-ndarray autodiff
+/// engine ([`crate::burn_backend::BurnBackend`]); G2 adds a `Wgpu` arm behind the `wgpu` feature.
+/// Nothing burn leaks across the `TrainerBackend`/`WasmBackend` seam — selection is data only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackendKind {
+    /// The `CpuBackend` fixed-order fp32 tape (MVP behavior; det lane is bit-exact everywhere).
+    #[default]
+    Cpu,
+    /// The burn-ndarray autodiff engine (native lane = tolerance class; det lane = det-core fp32).
+    #[cfg(feature = "burn-ndarray")]
+    BurnNdarray,
+}
+
 /// Fixed host-side settings that affect observable semantics (ABI §2.2/§8).
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -42,6 +58,8 @@ pub struct EngineConfig {
     pub max_step_handles: usize,
     /// Host-op-call cap per entry point (ABI §8).
     pub op_budget: u64,
+    /// Which [`OpBackend`] to instantiate (G1 seam). Defaults to [`BackendKind::Cpu`].
+    pub backend: BackendKind,
 }
 
 impl Default for EngineConfig {
@@ -53,6 +71,7 @@ impl Default for EngineConfig {
             max_memory_bytes: 64 * 1024 * 1024,
             max_step_handles: 1 << 20,
             op_budget: 1 << 22,
+            backend: BackendKind::Cpu,
         }
     }
 }
@@ -182,9 +201,14 @@ struct HostState {
 
 impl HostState {
     fn new(cfg: &EngineConfig) -> Self {
+        let backend: Box<dyn OpBackend> = match cfg.backend {
+            BackendKind::Cpu => Box::new(CpuBackend::new()),
+            #[cfg(feature = "burn-ndarray")]
+            BackendKind::BurnNdarray => Box::new(crate::burn_backend::BurnNdarrayBackend::new()),
+        };
         Self {
             phase: None,
-            backend: Box::new(CpuBackend::new()),
+            backend,
             params: Vec::new(),
             persistents: Vec::new(),
             det_persistents: Vec::new(),

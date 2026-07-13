@@ -18,6 +18,8 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+#[cfg(feature = "burn-ndarray")]
+pub mod burn_backend;
 pub mod handle;
 pub mod meta;
 pub mod phase;
@@ -26,9 +28,12 @@ pub mod trap;
 pub mod wasm_backend;
 
 pub use backend::{AdamwHp, CpuBackend, OpBackend, TensorId};
+#[cfg(feature = "burn-ndarray")]
+pub use burn_backend::{BurnBackend, BurnNdarrayBackend};
 pub use handle::{HandleClass, Lane};
 pub use meta::MetaReport;
 pub use phase::Phase;
+pub use runtime::BackendKind;
 pub use runtime::{EngineConfig, Instance, LoadedModule, Manifest, ParamInfo, Worker};
 pub use trap::{Trap, TrapCode};
 pub use wasm_backend::{WasmBackend, WasmBackendConfig, WasmBackendError};

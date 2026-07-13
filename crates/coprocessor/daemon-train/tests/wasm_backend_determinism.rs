@@ -362,3 +362,145 @@ fn host_backward_reduces_loss_all_profiles() {
         );
     }
 }
+
+// -- cross-backend det-digest equality (G1, HOST-7 extension; program Risks 1–2) ----------------
+//
+// The consensus digest is over the **det lane** (post-ingest fp32 masters + replicated persistents),
+// which is backend-independent by construction (ABI §5.9 / §7.2). A `CpuBackend` peer and a
+// `BurnBackend(ndarray)` peer run divergent NATIVE math (different losses, different payloads — burn
+// autodiff is not the CpuBackend tape), yet when both ingest the **same committed set** in the same
+// record order, their det-lane digests MUST be bit-identical every round. This is the early tripwire
+// for a det-lane residency mistake on the burn/GPU path (a real desync, caught late by digests).
+#[cfg(feature = "burn-ndarray")]
+mod cross_backend {
+    use super::*;
+    use daemon_train::BackendKind;
+
+    fn backend_with(config: &[u8], kind: BackendKind) -> WasmBackend {
+        let mut b = WasmBackend::new(WasmBackendConfig {
+            wasm: tiny_llama_wasm(),
+            engine: EngineConfig {
+                backend: kind,
+                ..EngineConfig::default()
+            },
+        })
+        .expect("construct WasmBackend");
+        b.build(config).expect("da_build");
+        b
+    }
+
+    /// Train `steps` inner steps over a **fixed** batch (so the loss falls), then seal the payload.
+    /// Records the first/last observed loss into `first`/`last`.
+    fn train_fixed(
+        b: &mut WasmBackend,
+        steps: u32,
+        round: u64,
+        fixed: &BatchRef,
+        first: &mut f32,
+        last: &mut f32,
+    ) -> Vec<u8> {
+        for step in 0..steps {
+            let stats = b.train_step(fixed, ctx(step)).expect("train_step");
+            if first.is_nan() {
+                *first = stats.loss;
+            }
+            *last = stats.loss;
+            b.inner_update(step).expect("inner_update");
+        }
+        b.make_update(round).expect("make_update")
+    }
+
+    struct Run {
+        cpu: Vec<StateDigest>,
+        burn: Vec<StateDigest>,
+        cpu_loss: (f32, f32),
+        burn_loss: (f32, f32),
+        payloads_diverged: bool,
+    }
+
+    fn run(profile: &str, rounds: u64) -> Run {
+        let config = cbor(&tiny_cfg(profile));
+        let mut cpu = backend_with(&config, BackendKind::Cpu);
+        let mut burn = backend_with(&config, BackendKind::BurnNdarray);
+        let steps = cpu.steps_per_round().expect("steps_per_round");
+        assert_eq!(
+            steps,
+            burn.steps_per_round().expect("steps_per_round"),
+            "both backends run the same module manifest"
+        );
+        let fixed = batch(0xF00D);
+        let (mut cf, mut cl) = (f32::NAN, f32::NAN);
+        let (mut bf, mut bl) = (f32::NAN, f32::NAN);
+        let mut cpu_d = Vec::new();
+        let mut burn_d = Vec::new();
+        let mut diverged = false;
+        for round in 0..rounds {
+            // Each peer runs its own native math (divergent) over identical fixed data.
+            let pa = train_fixed(&mut cpu, steps, round, &fixed, &mut cf, &mut cl);
+            let pb = train_fixed(&mut burn, steps, round, &fixed, &mut bf, &mut bl);
+            diverged |= pa != pb;
+            // The committed set is the SAME union in the SAME record order for both peers.
+            let set = vec![staged(0x01, &pa), staged(0x02, &pb)];
+            let da = cpu.ingest(round, &set).expect("ingest cpu");
+            let db = burn.ingest(round, &set).expect("ingest burn");
+            assert_eq!(
+                da,
+                db,
+                "{profile} r{round}: cross-backend det digest must be bit-identical (cpu {} vs burn {})",
+                da.to_hex(),
+                db.to_hex()
+            );
+            cpu_d.push(da);
+            burn_d.push(db);
+        }
+        Run {
+            cpu: cpu_d,
+            burn: burn_d,
+            cpu_loss: (cf, cl),
+            burn_loss: (bf, bl),
+            payloads_diverged: diverged,
+        }
+    }
+
+    fn assert_cross_backend(profile: &str) {
+        let r = run(profile, 6);
+        // Digests equal every round (asserted per-round in `run`), and the transcript evolves.
+        assert_eq!(
+            r.cpu, r.burn,
+            "{profile}: whole digest transcript must match"
+        );
+        assert!(
+            r.cpu.windows(2).any(|w| w[0] != w[1]),
+            "{profile}: the digest transcript must evolve across rounds"
+        );
+        // The native lanes genuinely diverged (else the test would be a trivial same-engine run).
+        assert!(
+            r.payloads_diverged,
+            "{profile}: burn vs cpu native payloads should differ (tolerance-class native lane)"
+        );
+        // Both backends learn from data (HOST-9): the loss falls on each.
+        let (cf, cl) = r.cpu_loss;
+        let (bf, bl) = r.burn_loss;
+        assert!(
+            cf.is_finite() && cl.is_finite() && bf.is_finite() && bl.is_finite(),
+            "{profile}: losses finite (cpu {cf}->{cl}, burn {bf}->{bl})"
+        );
+        assert!(cl < cf, "{profile}: cpu loss must decrease ({cf} -> {cl})");
+        assert!(bl < bf, "{profile}: burn loss must decrease ({bf} -> {bl})");
+    }
+
+    #[test]
+    fn cross_backend_det_digest_sparse_loco() {
+        assert_cross_backend("sparse_loco");
+    }
+
+    #[test]
+    fn cross_backend_det_digest_diloco() {
+        assert_cross_backend("diloco");
+    }
+
+    #[test]
+    fn cross_backend_det_digest_demo() {
+        assert_cross_backend("demo");
+    }
+}
