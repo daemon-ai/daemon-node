@@ -128,6 +128,7 @@ impl ControlApi for MockApi {
 }
 
 impl ModelApi for MockApi {}
+impl daemon_api::SwarmApi for MockApi {}
 impl daemon_api::ProfileApi for MockApi {}
 impl daemon_api::CredentialApi for MockApi {}
 impl daemon_api::AuthApi for MockApi {}

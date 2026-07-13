@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+[package]
+name = "daemon-swarm-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The node-side swarm-training service: durable swarm.db state, worker supervision, and the SwarmApi surface."
+
+[dependencies]
+# The SwarmApi trait + wire DTOs + NodeEvent this service implements / emits (spec §10.4).
+daemon-api = { workspace = true }
+# The frozen worker protocol (Event/Command/Hardware/Eligibility) + the `[swarm]` config type.
+daemon-swarm-run = { workspace = true }
+# The training-worker supervisor this service owns (lane B3's crate; consumed read-only). The
+# `WorkerControl` seam wraps it so the service is testable without a live worker subprocess.
+daemon-train-client = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+# swarm.db stores policy/eligibility as JSON and the windowed event log as JSON blobs.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# swarm.db: a separate SQLite file (spec §10.3), mirroring the daemon-auth `auth.db` precedent —
+# bundled amalgamation + PRAGMA user_version migrations via rusqlite_migration.
+rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite_migration = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

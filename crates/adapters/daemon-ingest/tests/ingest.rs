@@ -86,6 +86,7 @@ impl daemon_api::ProfileApi for Recorder {}
 impl daemon_api::CredentialApi for Recorder {}
 impl daemon_api::AuthApi for Recorder {}
 impl daemon_api::AccessControlApi for Recorder {}
+impl daemon_api::SwarmApi for Recorder {}
 
 fn origin(chat: &str) -> Origin {
     Origin::new(
