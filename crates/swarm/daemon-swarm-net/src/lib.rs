@@ -30,6 +30,10 @@ pub mod artifact;
 pub mod dedupe;
 pub mod fetch;
 pub mod gossip;
+/// The real iroh-gossip control plane (spec §7.1; B2). Behind the off-default `iroh` feature so the
+/// default workspace build never compiles the iroh/QUIC/relay tree.
+#[cfg(feature = "iroh")]
+pub mod iroh_gossip;
 pub mod presign;
 pub mod r2_store;
 pub mod receipt;
@@ -44,6 +48,8 @@ pub use fetch::{
     RetryConfig, RetryPolicy, RetryQueueResult,
 };
 pub use gossip::LoopbackGossip;
+#[cfg(feature = "iroh")]
+pub use iroh_gossip::{IrohGossip, IrohGossipConfig, IrohPeer, RebroadcastConfig};
 pub use presign::{
     HttpPresignClient, ObjectKind, PresignClient, PresignOp, PresignRequest, PresignResponse,
 };
