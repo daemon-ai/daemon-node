@@ -482,3 +482,200 @@ All green except the documented pre-existing conformance flake:
   largely stable but a few module paths/signatures moved. iroh is behind `daemon-swarm-net`'s
   off-default `iroh` feature (`cargo check --features iroh` is green today, compile-only). No
   iroh-blobs (P4).
+
+---
+
+## Merge 2 — record + frozen interfaces (integration owner)
+
+Wave-2 integration landed on `integrations/swarm-p1`. Base `bd2cb5b` (Merge-1 freeze) → content
+**HEAD `200dea7`** (this `mirror(merge-2)` ledger commit sits on top). Verified on this machine's
+real RADV GPU (AMD Strix Halo, unified memory) in the `.#vulkan` devShell.
+
+### Commits (first-parent, oldest → newest)
+
+| Commit | Subject |
+|---|---|
+| `ed45749` | `Merge branch 'swarm/g2'` — burn-wgpu arm + `EngineConfig.gpu_index` + wgpu tolerance + cpu-vs-wgpu det-digest + `daemon_train::autotune` + real Hardware probe + GPU-skip convention |
+| `bea1dc3` | `Merge branch 'swarm/m1'` — `TinyLlamaCfg::llama_160m()` + xtask tokenize-corpus + vendored TinyStories fixture + additive manifest provenance + `daemon-train-safetensors` + HOST-11 goldens |
+| `4f8666a` | `Merge branch 'swarm/b2'` — `IrohGossip: ControlPlane` (iroh 1.0.2/gossip 0.101) + nonce rebroadcast frame + parametric conformance + dev relay runner + NET-6/7 |
+| `e83eb47` | `build(workspace): daemon-train-safetensors path dep for M2/B3` — frozen-file edit |
+| `200dea7` | `feat(train): unified-memory autotune budget (green)` — the UMA fix |
+
+**Merge conflicts: NONE.** All three lanes merged clean under `--no-ff` (ort). The disjoint
+file-ownership held exactly. G2 owned `daemon-train/src/**` + `daemon-train/tests/*` + the worker
+`backend` module; M1 owned `daemon-train-sdk`, `guests/*`, `daemon-swarm-run/data.rs`, `xtask`, the
+new `daemon-train-safetensors` crate, `tests/fixtures`; B2 owned `daemon-swarm-net/iroh_gossip.rs`
++ its `Cargo.toml`/`dev/`. The anticipated G2-tests-vs-M1-sdk collision did not occur (disjoint
+dirs). `Cargo.lock` was the only multiply-touched file and git auto-merged the additive regions
+(M1 added 15 lines; B2 one; G2 none). Lane ledgers are distinct files. No adjudication commit.
+
+### Frozen-file / coordination edits (integration-owner scope)
+
+- **Root `Cargo.toml`** (`e83eb47`): added `daemon-train-safetensors = { version = "0", path =
+  "crates/coprocessor/daemon-train-safetensors" }` to `[workspace.dependencies]` (M1 seam 4) so
+  M2/B3 consume the converter via `{ workspace = true }`. No new third-party dep → `cargo deny`
+  green.
+- **`.gitleaks.toml` + `typos.toml`** arrived *with the M1 merge* (repo-root config, NOT lane-frozen
+  — the frozen set is root `Cargo.toml`/`deny.toml`/`flake.nix` only). Verified present + correct:
+  `.gitleaks.toml` allowlists the two public HF commit SHAs + the swarm test-fixtures path;
+  `typos.toml` adds `[type.swarm-corpus-shard] check-file=false` for the vendored `*.bin` token
+  shards (the pre-commit hook passes staged files explicitly, so `extend-exclude` alone would not
+  cover them). Both keep the vendored TinyStories fixture from tripping the secrets/spell gates.
+
+### The UMA autotune fix (`200dea7`) — the Merge-2 blocker
+
+**Problem (confirmed on this box):** wgpu-hal clamps `max_buffer_size` to `i32::MAX` (2047 MiB) on
+Linux/Mesa. G2 used that per-buffer proxy as *both* `Hardware.vram_mb` and the whole VRAM budget,
+so `Autotune::verdict` rejected the 160M preset ("insufficient VRAM even at micro_batch=1: need
+3025 MiB, have 2047 MiB") and the 1.2B preset — even though burn provably spills into GTT (unified
+memory). Real numbers here: sysfs `mem_info_vram_total` = 4096 MiB, `mem_info_gtt_total` = 120000
+MiB, `MemTotal` ≈ 124419 MiB, `AdapterInfo.device_type = IntegratedGpu`.
+
+**Fix (diff summary):**
+- `DeviceLimits` (`autotune.rs`) gains additive `shared_mb: u64` (GTT/unified spillover; 0 = none)
+  and `unified: bool` (from `device_type == IntegratedGpu | Cpu`); `#[derive(Default)]` added, so
+  the new fields default to `0`/`false` and every prior construction is behavior-preserving.
+- `Autotune::verdict`: **effective device budget = `vram_mb + 90%·shared_mb`** (documented spill
+  discount; on a discrete GPU `shared_mb == 0` ⇒ reduces to `vram_mb`, path unchanged). When
+  `unified`, the independent VRAM and RAM checks are replaced by a **joint-pool check**: device
+  footprint + host-RAM footprint must fit `min(effective budget, ram_mb)` together. The per-buffer
+  `max_tensor_bytes ≤ max_alloc_mb` gate is kept **verbatim** on both paths.
+- `WgpuProbe` gains `device_type: String` + `unified: bool` (Debug-formatted, no direct `wgpu`-type
+  dep). `probe_wgpu` is now **register-or-reuse**: an "already registered" double-init panic from
+  cubecl is recognized as *adapter present* (returns `Some` reuse marker) instead of caching `None`;
+  the `BackendKind::Wgpu` arm calls `probe_wgpu()` first so the probe is the canonical registration.
+- Worker `device_limits()` (`daemon-train-worker/backend.rs`): `vram_mb` ← sysfs
+  `mem_info_vram_total` (true lower bound; falls back to the `max_alloc` proxy on non-amdgpu),
+  `shared_mb` ← sysfs `mem_info_gtt_total`, `max_alloc_mb` ← wgpu `max_buffer_size`, `unified` ←
+  the probe. Sysfs reads are plain file reads (legal in the worker bin); the byte→MiB parse is the
+  pure, unit-tested `daemon_train::autotune::parse_amdgpu_mem_mb`.
+- `Hardware.vram_mb` (frozen wire field): **SOURCE change only** (sysfs dedicated VRAM = 4096 here,
+  vs the old 2047 proxy) — no schema change.
+
+**New verdict numbers on this machine** (`preset_160m_eligible_on_unified_device`, HOST-8 re-run):
+- effective budget = `4096 + 0.9·120000 = 112096 MiB`; joint pool = `min(112096, 124418) = 112096
+  MiB`.
+- **160M** (N=151,862,784; fp32 fixed ≈ 2897 MiB, host ≈ 1159 MiB): **ELIGIBLE**, `micro_batch = 64`,
+  device est ≈ 11089 MiB, joint ≈ 12248 MiB ≤ 112096. Pre-fix (clamped 2047, non-unified): REJECTED
+  ("need 3025 MiB, have 2047 MiB") — the exact blocker.
+- **1.2B** (representative N=1.2e9; fp32 fixed ≈ 22888 MiB): **ELIGIBLE** in the joint pool.
+- Discrete path unchanged: a 24 GB card admits 160M; a real 2 GB discrete card still (correctly)
+  rejects it; a single tensor > 2047 MiB is still rejected on the per-buffer gate on *both* paths.
+
+### `Hardware.shared_mb` — did it cross the SwarmApi wire? **No.**
+
+`daemon_swarm_run::protocol::Hardware` is the **worker↔node** protocol type (CBOR over the worker
+pipe). The app-facing SwarmApi DTO is the *separate* `daemon_api::SwarmHardwareReport`, mapped from
+`Hardware` in `daemon-swarm-node/src/service.rs::hardware_report`. `daemon-api` does **not** depend
+on `daemon-swarm-run`. So adding `Hardware.shared_mb` (additive, `#[serde(default)]`, back-compat
+proven by `hardware_shared_mb_is_additive_back_compatible`) touches only the worker protocol — it
+does **not** cross the SwarmApi wire, needs **no** `daemon-api.cddl` / conformance change, and the
+**wire version stays 40** (matches the Merge-1 precedent: only a real SwarmApi DTO change bumps the
+wire). Mirroring `shared_mb` into `SwarmHardwareReport` for the GUI is a *future additive DTO+CDDL
+change* (would need `just update-codec` in the superproject) — recorded as a Wave-3/spec follow-on,
+not done unilaterally at Merge 2.
+
+### Spec-amendment candidates (for the human — NOT applied to the spec docs)
+
+1. **§10.5 governor on unified machines (new, from this fix):** the effective device budget is now
+   `vram_mb + 90%·shared_mb` and, when `unified`, device + host compete for one DRAM pool. The
+   policy `vram_cap_mb` (`SwarmPolicy`) is therefore the **only** protection for the co-resident
+   inference tenant on a unified box — it must clamp the *combined effective budget*, not just the
+   dedicated-VRAM term. Spec §10.5 should state this explicitly (today it reads as a VRAM cap).
+2. **§5.1 fp32-vs-bf16 (carried from M1):** the §5.1 planning table assumes bf16 weights (160M row:
+   0.3 GB); the P1 preset stores fp32 masters for det-lane exactness (0.57 GiB, 2×). Annotate the
+   table as bf16-specific + add an fp32-storage note, or adopt bf16 storage in a later G-lane.
+
+### Frozen interfaces (Merge 2) — extend additively only from here
+
+1. **`BackendKind::Wgpu` + `EngineConfig.gpu_index`.** `#[cfg(feature = "wgpu")] Wgpu` arm +
+   `HostState::new` instantiation of `BurnBackend<Autodiff<Wgpu>>`; `gpu_index: Option<u32>`
+   (`None` → `WgpuDevice::default()`, `Some(i)` → `DiscreteGpu(i)`). `burn_backend.rs` gated
+   `any(feature = "burn-ndarray", feature = "wgpu")`. Shapes: `swarm-ledger-g2.md` seam 1.
+2. **Autotune verdict surface, AS AMENDED by the UMA fix.** `daemon_train::autotune`:
+   `DeviceLimits { vram_mb, ram_mb, max_alloc_mb, shared_mb, unified }` (the last two additive,
+   `Default`-preserving); `Autotune { from_meta, from_params, verdict }` with the effective-budget +
+   unified joint-pool semantics above; `AutotuneVerdict`; `probe_microbatch` / `ProbeStep` (§10.5
+   ladder); `oom_error_class`; `parse_amdgpu_mem_mb`; and (feature `wgpu`) `WgpuProbe { gpus,
+   max_alloc_mb, adapter, backend, device_type, unified }` + `probe_wgpu`. `Assessment` /
+   `Eligibility` stay frozen shapes (micro-batch rides `reasons` / `headroom`); `AutotuneVerdict`
+   is the full-fidelity type M2/B3 consume in-process.
+3. **GPU-skip convention.** `wgpu_adapter_available()` + the `require_gpu!` early-return-with-loud-
+   stderr pattern; the always-rebuild stale-guest guard; `SWARM_TEST_GUEST_DIR` to reuse prebuilt
+   guests. Default CI gate stays green GPU-less; `.#vulkan` runs the full suite.
+4. **160M preset schema + example envelope fragment.** `TinyLlamaCfg::llama_160m()` (`d_model 768,
+   n_layers 12, n_heads/n_kv_heads 12, head_dim 64, vocab 50257, seq_len 1024, ffn_mult 4,
+   rope_theta 1e4, rmsnorm_eps 1e-5`; inner AdamW `lr 4e-4/β[0.9,0.95]/eps 1e-8/wd 0.1`; profile
+   `sparse_loco { h 30, chunk 256, topk 4, bits 2, ef_decay 0.95, outer_alpha 1.0, clip }`) +
+   `canonical_param_layout()` + `param_count() = 151_862_784`. Envelope fragments:
+   `daemon-train-sdk/presets/{llama-160m,tiny-llama}.{toml,cbor}`. Shapes: `swarm-ledger-m1.md`
+   seam 1.
+5. **Manifest provenance extensions.** `daemon_swarm_run::data::Manifest` + optional
+   `#[serde(default, skip_serializing_if=…)]` `tokenizer` / `tokenizer_revision` / `dataset` /
+   `dataset_revision`; `Corpus::from_parts(Manifest, Vec<Vec<u8>>)` (blake3-verifies each shard).
+   Back-compat is a test invariant. Shapes: `swarm-ledger-m1.md` seam 2.
+6. **`xtask tokenize-corpus` CLI.** Args + hf-hub (revision-pinned) egress + `tokenizers` BPE →
+   fixed-width LE shards + `manifest.json`; `--text`/`--tokenizer <path>` = fully offline. Shapes:
+   `swarm-ledger-m1.md` seam 3.
+7. **`daemon-train-safetensors` converter surface.** Crate `daemon-train-safetensors`: `StateDict`
+   (`push`/`from_named`/`names`/`to_safetensors`/`from_safetensors`) + `blake3_hex`; fp32 only;
+   deterministic bytes via a single `__metadata__["order"]` key; sits alongside the frozen
+   `TrainerBackend::checkpoint_save/load`. Consumed via the new `[workspace.dependencies]` entry.
+   Shapes: `swarm-ledger-m1.md` seam 4.
+8. **`IrohGossip` construction + roster + dev relay + parametric conformance.**
+   `IrohGossip::connect(IrohGossipConfig{ secret_key, relay_urls, roster, topic_input, rebroadcast,
+   bind_addr })`; `IrohPeer`; `RebroadcastConfig` (default on, 10 s, ring 32); accessors
+   `node_id()` / `local_peer()` / `neighbor_count()`; `update_roster(Vec<IrohPeer>)`
+   (`ensure_gossip_connected` semantics, cap ~3); `shutdown()`. Nonce rebroadcast frame OUTSIDE the
+   signed payload. Dev relay runner `daemon-swarm-net/dev/run-relay.sh` (`iroh-relay --dev`, plain
+   HTTP, port 3340) + `dev/README.md`. Parametric `ControlPlane` conformance suite over
+   `LoopbackGossip` + `IrohGossip`. Pin: **iroh 1.0.2 / iroh-gossip 0.101 / iroh-relay 1** (NOT the
+   plan's 0.97). Shapes + 0.97→1.0 delta table: `swarm-ledger-b2.md`.
+
+### Wave-3 must know
+
+- **M2 (reference parity + throughput):** run on THIS machine in `.#vulkan` (RADV GFX1151, unified).
+  `EngineConfig.gpu_index` is available (`None` = default device is the tested path; multi-GPU index
+  not hardware-verified here). **Expect slow meta/steps at 160M** (Risk 3): measured build 6.1 s,
+  ~10.3 s/inner-step, make_update ~42 s on this box; the full 160M meta pass is minutes. Consume
+  `AutotuneVerdict` in-process; `canonical_param_layout()` is the safetensors↔burn name map for the
+  matched-init reference model. The `sparse_loco chunk 256/topk 4` choice is a *preset config* (2-adic
+  valuation, no guest padding), not a tuned optimum — treat as a knob.
+- **B3 (live transport):** consume `AutotuneVerdict` in-process; micro-batch via
+  `Eligibility.headroom["micro_batch"]`; live OOM trial via `probe_microbatch` (the ladder + taxonomy
+  are frozen; the *live* catch-OOM-mid-step wiring is B3's when it drives real batch sizes). IrohGossip
+  wiring recipe: `IrohGossip::connect` with the node iroh secret key, envelope-pinned `relay_urls`,
+  the admission roster (`IrohPeer.endpoint_id = Join.iroh_id`), `topic_input = FrozenEnvelope::hash()`;
+  `node_id()` fills the local `Join.iroh_id`; `update_roster` on every admission/drop; the plane
+  carries already-signed proto `SignedMessage` bytes (sign before `publish`, `verify()` after `recv`).
+  On unified boxes the `vram_cap_mb` governor must clamp the *combined* budget (spec-amendment #1).
+- **BC (coordinator app):** `PresignClient` JSON fixture contract (`tests/fixtures/presign-*.json`)
+  is unchanged. `Hardware.shared_mb` did not reach the SwarmApi wire, so no daemon-api DTO/CDDL work
+  is implied for BC at this merge.
+
+### Gate results (Merge 2, content HEAD `200dea7`)
+
+All green except the documented pre-existing conformance flake:
+
+- `cargo fmt --check` ✓ · `cargo clippy --workspace --all-targets -- -D warnings` ✓ ·
+  clippy `-p daemon-train --features wgpu` ✓ · `--features burn-ndarray` ✓ ·
+  `-p daemon-swarm-net --features iroh` ✓ · `cargo deny check` ✓ (advisories/bans/licenses/sources).
+- `typos docs/specs` ✓ · `cargo run -p xtask -- build-guests` ✓ · both `wasm32-unknown-unknown`
+  builds (`daemon-swarm-{proto,coordinator}`) ✓.
+- `cargo test --workspace` ✓ **except** the known `daemon-conformance` detached-delegation/
+  operator-steer trio (this run: `detached_notice_reaches_a_parked_durable_parent` +
+  `operator_assign_wakes_a_parked_durable_child` failed under the full parallel run, **both pass in
+  isolation** — verified; never modified; no swarm lane touches `daemon-conformance`).
+- `cargo test -p daemon-train --features burn-ndarray` ✓ · `.#vulkan cargo test -p daemon-train
+  --features wgpu` ✓ (burn_wgpu_parity 18 — no class widened; wasm_backend_determinism 12 incl. the
+  cpu-vs-wgpu det-digest tripwire byte-identical; wgpu_lifecycle 3 incl. the 160M eligibility;
+  worker_protocol 4; abi_surface 2 — tabi@1 still 66, phase table == SDK `TABI_IMPORTS`).
+- `cargo test -p daemon-swarm-net` 69 ✓ · `--features iroh` 82 ✓ (NET-6 + 7 iroh integration incl.
+  the green relay-path test) · `cargo test -p daemon-train-sdk --features sim` ✓ · `daemon-swarm-run`
+  incl. RUN-3 on the real TinyStories fixture (blake3 shard verify) ✓ · `daemon-train-safetensors`
+  6 (round-trip bit-exact + deterministic) ✓ · `daemon-api` 286 + `swarm_conformance` 4 +
+  `protocol_conformance` 75 ✓.
+- **Headline P1 check — 160M on wgpu** (`.#vulkan`, `preset_160m_trains_on_wgpu`, `#[ignore]`d):
+  build 6.1 s, 4 inner AdamW steps 41.1 s (~10.3 s/step), make_update 42.5 s → 12.46 MB sparse_loco
+  payload; loss **10.84 → 10.24 → 9.66 → 9.10** (finite, strictly decreasing); assess ELIGIBLE with
+  the real unified probe.
