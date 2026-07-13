@@ -623,8 +623,8 @@ async fn live_workers_full_loop_via_wrangler_dev() {
     // Worker 0's wire events are payload-free by design (§10.4), so its agreement is transitive
     // through the coordinator's digest-mismatch detection (a mismatch would surface as a desync).
     for (round, d1) in &digests[1] {
-        for i in 2..NUM_WORKERS {
-            if let Some(d2) = digests[i].get(round) {
+        for (i, worker_digests) in digests.iter().enumerate().skip(2) {
+            if let Some(d2) = worker_digests.get(round) {
                 assert_eq!(
                     d1, d2,
                     "round {round}: workers 1 and {i} disagree on the post-ingest digest"
@@ -632,9 +632,9 @@ async fn live_workers_full_loop_via_wrangler_dev() {
             }
         }
     }
-    for i in 2..DROP_INDEX {
+    for (i, worker_digests) in digests.iter().enumerate().take(DROP_INDEX).skip(2) {
         assert_eq!(
-            digests[i].len() as u64,
+            worker_digests.len() as u64,
             NUM_ROUNDS,
             "survivor {i} reported every round"
         );
