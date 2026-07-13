@@ -75,7 +75,9 @@ pub trait SwarmApi: Send + Sync {
 DTOs (all `#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]`, serde, `PartialEq`/`Eq`):
 `SwarmPolicyMode` (`always`/`idle`/`scheduled`/`manual`), `SwarmPolicy`, `SwarmEligibility`,
 `SwarmCapabilities`, `SwarmHardwareReport`, `SwarmContribution`, `SwarmRunSummary`, `SwarmRunDetail`,
-`SwarmLeaveMode` (`graceful`/`immediate`), `SwarmEvent` (+ `SwarmEventKind`).
+`SwarmLeaveMode` (`graceful`/`immediate`), `SwarmEvent` (externally-tagged enum:
+`Phase`/`Progress`/`RoundOutcome`/`Contribution`/`Warning`/`Error`; numeric telemetry is fixed-point
+integer — `loss_micros`, `tokens_per_s_milli` — no floats on the wire).
 `SwarmEventStream = BoxStream<'static, SwarmEvent>`.
 
 **Eligibility is node-computed** (ADR-003 mirror): `SwarmRunSummary` carries `SwarmEligibility`; the
@@ -121,7 +123,7 @@ run, pruned on insert. Intents idempotent via op-id (ADR-006) at the API layer.
 
 `swarm-policy-mode`, `swarm-policy`, `swarm-eligibility`, `swarm-capabilities`,
 `swarm-hardware-report`, `swarm-contribution`, `swarm-run-summary`, `swarm-run-detail`,
-`swarm-leave-mode`, `swarm-event`, `swarm-event-kind`; requests `request-swarm-run-list`,
+`swarm-leave-mode`, `swarm-event` (+ arm rules `swarm-event-phase` … `swarm-event-error`); requests `request-swarm-run-list`,
 `request-swarm-run-detail`, `request-swarm-join`, `request-swarm-leave`, `request-swarm-set-policy`,
 `request-swarm-hardware-report`; responses `response-swarm-run-list`, `response-swarm-run-detail`,
 `response-swarm-hardware-report`; and `node-event-swarm-changed`. Appended to `api-request`,
@@ -188,3 +190,89 @@ until then it documents the intended dev loop.)
 - **`daemon-train-client` is lane B3's** (read-only for W1). Its `TrainSupervisor` exposes no event
   stream yet, so W1's `SwarmService::handle_worker_event` is the translation seam B3 wires the live
   worker event stream into during Wave 3. W1 tests drive it directly.
+- **The `SwarmService` is not wired into the node boot path in W1** (the `with_swarm` seam is ready
+  but unbound). Rationale: (1) it is inert until `[swarm] enabled` (the default is off), so binding
+  it changes nothing for any current build/test; (2) `TrainSupervisor` exposes no live event stream
+  yet (B3, Wave 3), so there is no source to pump into `handle_worker_event` at boot; (3) the boot
+  wiring spans the `NodeAssembly` contract + `bins/daemon` main and adds `daemon-node →
+  daemon-swarm-node`/`daemon-train-client` deps — best applied by the integration owner alongside B3.
+  The exact wiring is below. The seam (`NodeApiImpl::with_swarm` + `SwarmService::{new,start}`) is
+  frozen and ready.
+
+## Boot-wiring integration step (apply alongside B3 / at the integration owner's discretion)
+
+`daemon-node` assembly (`crates/node/daemon-node/src/assembly/mod.rs`), guarded by `cfg.swarm.enabled`
+so it is inert by default. Add path deps `daemon-swarm-node`, `daemon-train-client` to
+`crates/node/daemon-node/Cargo.toml`, then, where the `NodeApiImpl` builder chain runs (it has
+`shared.node_events` + the node `data_dir` in scope):
+
+```rust
+if a.swarm.enabled {
+    let store = daemon_swarm_node::SwarmStore::open(a.data_dir.join("swarm.db"))?;
+    let sup = std::sync::Arc::new(daemon_train_client::TrainSupervisor::new(
+        daemon_train_client::TrainClientConfig::new(&a.swarm.worker_path),
+    ));
+    let feed = shared.node_events.clone();
+    let svc = std::sync::Arc::new(daemon_swarm_node::SwarmService::new(
+        daemon_swarm_node::SwarmServiceParts {
+            config: a.swarm.clone(),
+            store,
+            worker: sup, // Arc<TrainSupervisor> : WorkerControl
+            feed: Some(std::sync::Arc::new(move |ev| feed.emit(ev))),
+        },
+    ));
+    svc.start().await?;          // durable-intent re-convergence (§10.3)
+    node_api = node_api.with_swarm(svc as std::sync::Arc<dyn daemon_api::SwarmApi>);
+}
+```
+
+`NodeAssembly` must carry `swarm: daemon_swarm_run::config::SwarmConfig` + the `data_dir` (populate
+from `NodeConfig` in `bins/daemon/src/main.rs`). B3 additionally spawns a task that drains the
+worker's live `Event` stream into `svc.handle_worker_event(&ev)` once `TrainSupervisor` exposes one.
+
+## Finalize — gate evidence + test counts
+
+Final HEAD: see the commit list below. All W1-scoped gates green:
+
+- `cargo fmt --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean (whole workspace).
+- `cargo test -p daemon-api --features arbitrary` — WIRE-2 green (`arbitrary_api_request/response_matches_cddl`
+  synthesize every `Swarm*` variant + validate against the CDDL).
+- `typos docs/specs` — clean.
+- W1-touched crates, in isolation, all green: `daemon-api` (286 unit + `conformance` 2 + `protocol_conformance`
+  75 + **`swarm_conformance` 4** WIRE-1 + proptest), `daemon-host` (243), **`daemon-swarm-node` (6)**
+  (fanout / persistence-reload re-convergence / migration idempotence / windowed-log / disabled-by-default),
+  `daemon` config (`swarm_section_defaults_off_and_layers_toml_and_env` + 38 config tests),
+  `daemon-{http,delivery,matrix,ingest}` adapter stubs, `daemon-conformance` (ownership matrix + the
+  rest, single-threaded).
+- `cargo tree -p daemon -i {burn,wasmtime,iroh,iroh-gossip,cubecl}` → **none present**: the
+  `bins/daemon → daemon-swarm-run` edge drags no heavy tree onto the default gate. `Cargo.lock` delta
+  is purely additive (the new `daemon-swarm-node` package + one edge); no existing crate version moved.
+
+### Pre-existing failures OUTSIDE this lane (not W1-caused; do not attribute to W1)
+
+`cargo test --workspace` has pre-existing failures on the base trunk (`d71839a`, the Wave-0 scaffold),
+all in the **burn/WASM training-numerics path W1 does not own or touch** (verified: W1's diff touches
+none of `crates/coprocessor/daemon-train`, `det-core`, `daemon-swarm-run` engine/backend, `guests`,
+or `tests/daemon-swarm-e2e`; the `Cargo.lock` delta moved no training-relevant dep version):
+
+- `daemon-train/tests/guest_lifecycle.rs`: `tiny_llama_forward_step_reports_loss`,
+  `meta_report_layout_and_schema`, `abi_gate_and_build_round_trip`.
+- `daemon-train/tests/wasm_backend_determinism.rs`: `host_backward_reduces_loss_{sparse_loco,all_profiles}`.
+- `tests/daemon-swarm-e2e/tests/wasm_profiles.rs`: the 3 `flagship_*_wasm_backed_run` (losses are NaN;
+  identical digests across profiles → the backend produces NaN from step 0, independent of any wire/
+  config/service change).
+
+These are **G1 / integration-owner** territory (the burn-feature scaffold regressed the CPU/WASM
+training numerics to NaN); W1 is forbidden from touching those files and cannot fix them. Plus the
+**known** `daemon-conformance` detached-delegation flake (`detached_fanout_materializes_distinct_children`)
+— fails only under parallel load, **passes in isolation** (verified single-threaded: 5/5 green), per
+the program convention.
+
+## Final commit list (this lane, on `swarm/w1`)
+
+- `mirror(W1): ledger`
+- `feat(api): SwarmApi sub-trait + Swarm* wire + swarm-* CDDL + node forwarding seam (green)`
+- `feat(node): embed [swarm] SwarmConfig in NodeConfig + figment layering test`
+- `feat(swarm-run): daemon-swarm-node service — swarm.db + WorkerControl seam + SwarmApi (green)`
+- `mirror(W1): finalize ledger` (this update)
