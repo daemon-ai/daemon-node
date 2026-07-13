@@ -75,6 +75,11 @@ Bump in the monorepo with `just set-version daemon-node X.Y.Z` (writes `VERSION`
 `Cargo.toml`); standalone, edit `VERSION` and `[workspace.package].version` together. The
 `just check-version` gate (part of `just lint`) fails if they drift.
 
+**Agents MUST NOT bump or otherwise change the version unless the human explicitly asks for a
+version bump.** That covers `VERSION`, `just set-version`, and the mirrored
+`[workspace.package].version`. Landing a feature is NEVER an implicit reason to bump; if a change
+seems to warrant one, flag it in your summary and let the human decide.
+
 ## Features / engines
 
 - The default workspace gate builds default features only. The `llama` / `mistralrs` / `hyperon`
