@@ -1054,8 +1054,8 @@ provider-descriptor = { "id": tstr, "display_name": tstr, "kind": provider-kind-
 ; The node is the single authority for swarm participation; the app is a thin mirror (ADR-003):
 ; every run row carries the NODE-COMPUTED `eligibility` (§6.5), which the app renders and never
 ; re-derives. Numeric telemetry is fixed-point integer (no floats on the wire).
-swarm-policy-mode = "always" / "idle" / "scheduled" / "manual"
-swarm-policy = { "mode": swarm-policy-mode, "vram_cap_mb": uint, "duty_cycle_pct": uint, ? "schedule": tstr }
+swarm-policy-mode-t = "always" / "idle" / "scheduled" / "manual"
+swarm-policy = { "mode": swarm-policy-mode-t, "vram_cap_mb": uint, "duty_cycle_pct": uint, ? "schedule": tstr }
 swarm-eligibility = { "eligible": bool, "reasons": [* tstr], "headroom": { * tstr => int } }
 swarm-capabilities = { "abi_version": uint, "ops": [* tstr], "payload_stores": [* tstr] }
 swarm-hardware-report = { "gpus": uint, "vram_mb": uint64, "ram_mb": uint64, "backend_lanes": [* tstr], "capabilities": swarm-capabilities, "up_kbps": uint64, "down_kbps": uint64, "disk_free_mb": uint64, "throughput_class": tstr }
