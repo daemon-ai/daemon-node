@@ -161,13 +161,76 @@ fn build_guests() -> anyhow::Result<()> {
         // redirects the guests' wasm out of `guests/target/` (where the test harness reads them). The
         // guests are their own workspace, so clear it and let cargo default to `guests/target/`.
         .env_remove("CARGO_TARGET_DIR")
+        // Remap the absolute checkout + cargo-registry prefixes rustc bakes into panic locations, so
+        // the `.wasm` bytes are byte-reproducible across checkouts/machines — a portable committed
+        // `guests.blake3` manifest. The test-harness `ensure_built()` copies apply the SAME remap.
+        .env("RUSTFLAGS", guest_remap_rustflags(&root))
         .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
         .status()
         .map_err(|e| anyhow::anyhow!("failed to run cargo for the guests workspace: {e}"))?;
     anyhow::ensure!(status.success(), "building guests failed with {status}");
 
-    println!("built guests in {}", guests.display());
+    // Stale-guest guard (swarm-p1-ledger Merge-1 follow-on): write the committed blake3 manifest of
+    // the built modules. The wasm-backed test harness asserts the module it loads matches this file,
+    // so a stale/mismatched guest fails loud instead of surfacing downstream as a NaN loss.
+    let manifest = write_guest_manifest(&guests)?;
+    println!(
+        "built guests in {} (manifest {})",
+        guests.display(),
+        manifest.display()
+    );
     Ok(())
+}
+
+/// RUSTFLAGS that make the guest `.wasm` byte-reproducible across checkouts/machines by remapping the
+/// absolute source prefixes rustc embeds in panic locations: the `<checkout>` root (workspace + path
+/// deps like `daemon-train-sdk`) and the cargo registry (`$CARGO_HOME`, else `$HOME/.cargo`). Kept in
+/// lockstep with the `ensure_built()` copies in the wasm-backed test harnesses.
+fn guest_remap_rustflags(checkout: &Path) -> String {
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo"));
+    format!(
+        "--remap-path-prefix={}=/daemon-node --remap-path-prefix={}=/cargo",
+        checkout.display(),
+        cargo_home.display(),
+    )
+}
+
+/// Hash every built `.wasm` in `guests/target/wasm32-unknown-unknown/release` and write the sorted
+/// `guests/guests.blake3` manifest (`<blake3-hex>  <name>.wasm` per line). Returns the manifest path.
+fn write_guest_manifest(guests: &Path) -> anyhow::Result<PathBuf> {
+    let release = guests.join("target/wasm32-unknown-unknown/release");
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for dent in std::fs::read_dir(&release)
+        .map_err(|e| anyhow::anyhow!("read guest output dir {}: {e}", release.display()))?
+    {
+        let path = dent?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("wasm file name")
+                .to_string();
+            let bytes = std::fs::read(&path)
+                .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+            entries.push((name, blake3::hash(&bytes).to_hex().to_string()));
+        }
+    }
+    anyhow::ensure!(
+        !entries.is_empty(),
+        "no guest .wasm modules found under {}",
+        release.display()
+    );
+    entries.sort();
+    let body: String = entries
+        .iter()
+        .map(|(name, hex)| format!("{hex}  {name}\n"))
+        .collect();
+    let manifest = guests.join("guests.blake3");
+    std::fs::write(&manifest, body)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", manifest.display()))?;
+    Ok(manifest)
 }
 
 /// The workspace root (xtask's manifest dir is `<root>/xtask`).
