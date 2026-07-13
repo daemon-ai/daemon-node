@@ -354,6 +354,34 @@ pub struct Corpus {
 }
 
 impl Corpus {
+    /// Build a corpus from a validated manifest + the shard bytes it describes — the **real** data
+    /// path (the runtime fetches shards per the manifest and constructs this; `SyntheticCorpus` is
+    /// the CI stand-in). The shards must match the manifest 1:1 (count + per-shard byte length), and
+    /// each shard's content is blake3-verified against its [`ShardDesc`] (the §8 integrity check), so
+    /// a corrupt or reordered shard is rejected here rather than surfacing as NaN downstream.
+    pub fn from_parts(manifest: Manifest, shards: Vec<Vec<u8>>) -> Result<Self, DataError> {
+        manifest.validate()?;
+        if shards.len() != manifest.shards.len() {
+            return Err(DataError::ShardCountMismatch {
+                manifest: manifest.shards.len(),
+                provided: shards.len(),
+            });
+        }
+        for (i, (desc, bytes)) in manifest.shards.iter().zip(shards.iter()).enumerate() {
+            if bytes.len() as u64 != desc.bytes {
+                return Err(DataError::ShardSizeMismatch {
+                    shard: i,
+                    expected: desc.bytes,
+                    declared: bytes.len() as u64,
+                });
+            }
+            if blake3_hash(bytes).to_hex().as_str() != desc.blake3 {
+                return Err(DataError::ShardHashMismatch { shard: i });
+            }
+        }
+        Ok(Self { manifest, shards })
+    }
+
     /// Build a deterministic synthetic corpus (`num_shards` × `tokens_per_shard` u16 tokens).
     pub fn synthetic(
         seed: u64,
@@ -454,6 +482,20 @@ pub enum DataError {
     /// A shard's blake3 field was not a valid 64-char hex digest.
     #[error("shard {0} has a malformed blake3 hash")]
     BadShardHash(usize),
+    /// The number of provided shards did not match the manifest ([`Corpus::from_parts`]).
+    #[error("manifest declares {manifest} shards but {provided} were provided")]
+    ShardCountMismatch {
+        /// The shard count the manifest declares.
+        manifest: usize,
+        /// The number of shard blobs provided.
+        provided: usize,
+    },
+    /// A provided shard's content blake3 did not match its manifest entry ([`Corpus::from_parts`]).
+    #[error("shard {shard} content blake3 does not match the manifest")]
+    ShardHashMismatch {
+        /// The shard index.
+        shard: usize,
+    },
     /// A `BatchId` fell outside the corpus's sequence range.
     #[error("batch {batch} out of range (total sequences {total})")]
     BatchOutOfRange {
