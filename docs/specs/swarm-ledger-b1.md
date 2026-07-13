@@ -77,9 +77,13 @@ pub struct PresignResponse {
 pub struct R2Store<P: PresignClient> { /* presign + egress + run */ }
 impl<P: PresignClient> R2Store<P> {
     pub fn new(presign: P, egress: EgressClient, run: RunId) -> Self;
+    pub fn run(&self) -> &RunId;
 }
 impl<P: PresignClient> PayloadStore for R2Store<P> { put / get / head }
-pub fn r2_object_key(run: &RunId, round: RoundId, peer: Option<&PeerId>, kind: ObjectKind) -> String;
+// The single source of truth for the §11.3 object-key layout (BC mints presigned URLs at the same
+// keys). Takes the run + the presign request (all four kinds), erroring if a required field is
+// absent — cleaner than the brief's positional `(run, round, peer, kind)` and covers `artifact`.
+pub fn r2_object_key(run: &RunId, req: &PresignRequest) -> Result<String, SwarmNetError>;
 ```
 
 - `put` → presign `payload/put` → `EgressClient::put(url, bytes, Redirects::None)` → 2xx → return
@@ -199,3 +203,41 @@ revision — NET-3 `unpinned_hf_rejected`). Both additive to the `#[non_exhausti
   concurrent in-peer fetch task. Swap wiremock → wrangler-dev when BC's endpoint lands.
 - **B2:** untouched — the `iroh` feature and `iroh_gossip.rs` are yours; B1 builds on the default
   (no-iroh) gate.
+
+## Landed (final)
+
+Commits on `swarm/b1` (base `d71839a`):
+
+1. `mirror(B1): ledger` — this file.
+2. `feat(swarm-net): r2 store + presign seam + egress schemes + scheduler (green)` — the full
+   implementation + in-crate tests + `tests/fixtures/presign-*.json` + the `wiremock` MockR2 harness
+   + `Cargo.lock` dep edges.
+3. `mirror(B1): landed record` — this section.
+
+**Test count:** `cargo test -p daemon-swarm-net` = **67 green** (was 40 pre-lane): NET-1
+(`store_presign_roundtrip`, `store_presign_expired_rejected`, `head_emits_signed_receipt`), NET-2
+(`verify_artifact_ok`/`verify_artifact_tamper` + blake3 golden), NET-3 (`resolve_hf_pinned_ok`,
+`unpinned_hf_rejected`, `r2_to_presign`, + `https_scheme_routes_through_egress`), NET-8
+(`retained_object_fetchable`, `expired_object_typed_miss`), NET-4 (`dyn_fallback_r2_miss_to_fs` +
+two Fs dyn cases), RUN-2 net (`tampered_set_object_rejected`, `record_set_round_trips…`), RUN-4
+(`artifact_cache_lru_evicts` + oversize/from_gb), the 8 ported Psyche scheduler tests, the presign
+fixture-contract + URL-cache tests.
+
+**Gates (all green):** `cargo fmt --check`; `cargo clippy --workspace --all-targets -D warnings`;
+`cargo test --workspace` (only the two documented pre-existing `daemon-conformance` flakes —
+`node::history::…` + `node::detached_delegation::…` — fail under the parallel run and **pass in
+isolation**, never touched by this lane); `cargo test -p daemon-swarm-net`; `typos docs/specs`;
+plus the Merge-1 compile-only `cargo check -p daemon-swarm-net --features iroh`.
+
+**Deviations from the brief:**
+- `PresignRequest` generalised to `{kind, op, round?, peer?, path?}` with `kind=artifact` (one
+  `/presign` endpoint for both round objects and `r2://` artifacts). Documented above; BC validates
+  per kind.
+- `R2Store::head` = presigned GET + hash the body (no `head` op in the contract). Documented above.
+- hf resolver hand-rolled over `EgressClient` (not `daemon-models`/`hf-hub`), keeping all HTTP on the
+  SSRF-safe path. `ArtifactResolver::with_hf_endpoint` added for a private mirror / hermetic tests
+  (mirrors `HfClient::with_endpoint`).
+- RUN-4 `ArtifactCache` landed in `daemon-swarm-net` (`artifact.rs`), NOT `daemon-swarm-run/data.rs`
+  — `data.rs` was left untouched (no Wave-2 collision with M1).
+- `r2_object_key(run, &PresignRequest)` instead of the brief's positional signature (covers all four
+  object kinds; validates required fields).
