@@ -311,3 +311,174 @@ impl EgressClient {
   any new third-party dep or feature-of-a-workspace-dep-that-needs-a-root-change through the
   integration owner. Adding a *feature* of an already-declared workspace dep from your own crate's
   `Cargo.toml` (e.g. `iroh-relay/server`) is a lane-owned edit.
+
+---
+
+## Merge 1 — record + frozen interfaces (integration owner)
+
+Wave-1 integration landed on `integrations/swarm-p1`. Base `d71839a` (Wave-0 scaffold) →
+**HEAD `da97d6a`**. No frozen-file edits were needed (root `Cargo.toml` / `deny.toml` / `flake.nix`
+untouched); `cargo deny check` stayed green as-is.
+
+### Commits (first-parent, oldest → newest)
+
+| Commit | Subject |
+|---|---|
+| `d513608` | `Merge branch 'swarm/g1'` — BurnBackend seam + tolerance harness + cross-backend det-digest |
+| `4f691c4` | `Merge branch 'swarm/b1'` — R2Store + PresignClient + egress schemes + scheduler |
+| `9ff04a4` | `Merge branch 'swarm/w1'` — SwarmApi wire + node SwarmService + swarm.db |
+| `da97d6a` | `feat(api): bump WireVersion to 40 for SwarmApi` — the single coordinated wire bump |
+
+**Merge conflicts: NONE.** All three lanes merged clean under `--no-ff` (ort). The disjoint
+file-ownership held exactly: `Cargo.lock` was the only file all three touched, and git auto-merged
+the additive, non-overlapping regions (a `daemon-swarm-node` package node for W1, a
+`daemon-swarm-run` edge on `daemon`, three lines for B1's dev-deps). The `docs/specs/` lane ledgers
+(`swarm-ledger-{g1,b1,w1}.md`) are distinct files. No adjudication fix commit was needed (see below).
+
+### NaN adjudication — VERDICT: (c) stale-cache artifact on W1's worktree (NOT a regression)
+
+**The highest-value finding.** W1's ledger claimed the burn/WASM NaN failures
+(`daemon-train::guest_lifecycle` ×3, `wasm_backend_determinism` ×2, `daemon-swarm-e2e::wasm_profiles`
+×3) were "pre-existing on the base trunk `d71839a`". **That claim is false.** Evidence:
+
+1. **Clean trunk `d71839a` is fully green.** Freshly built guests + `cargo test -p daemon-train
+   --test guest_lifecycle --test wasm_backend_determinism` = 9 + 9 pass; `cargo test -p
+   daemon-swarm-e2e --test wasm_profiles` = 3 pass. (Matches Wave-0's and G1's green reports.)
+2. **W1's diff does NOT regress it.** On a scratch `d71839a + merge(swarm/w1)` the same three suites
+   are green in isolation (9 + 9 + 3). Hypothesis (b) — Cargo feature unification from the new
+   `daemon-swarm-node` crate flipping a burn feature workspace-wide — is **ruled out**:
+   `cargo tree -e features -p daemon-train` is **byte-identical** before and after the W1 merge
+   (the `Cargo.lock` delta added no burn edge, moved no version, changed no feature).
+3. **Root cause reproduced deterministically.** W1's actual worktree (`…/swarm-proto`) carried a
+   **stale `tiny_llama.wasm` (88 735 bytes, built Jul 12 19:20)** — a fresh `xtask build-guests` at
+   the same commit produces **143 893 bytes** (`sha 0937829f…` vs the stale `sha 57a9b284…`). The
+   guest wasm is the module the failing suites load, and it is a **gitignored build artifact**
+   (`guests/target/**`), never committed, so it does not travel with the branch. Copying W1's stale
+   wasm into a fresh worktree reproduced W1's signature **exactly**: `guest_lifecycle` 3 failures
+   (`step must report a finite loss, got None`), and `wasm_profiles` all 3 with
+   `per_round=[NaN,NaN,NaN,NaN,NaN,NaN]` and **identical digests across all three profiles**
+   (`d9364b25…`/`1074913f…`) — precisely W1's "NaN from step 0, identical digests across profiles".
+   Restoring the freshly built guest → green again.
+
+**Conclusion:** a stale/mismatched guest-wasm build artifact on W1's worktree, not a code defect.
+Nothing to fix in the tree; no adjudication commit. **Process note for all lanes:** `xtask
+build-guests` output lives under the gitignored `guests/target/**`; always rebuild guests after
+checkout / rebase before running the wasm-backed suites (the daemon-train/e2e tests do NOT rebuild
+guests themselves). Consider a follow-on: have the wasm-backed test harness assert the loaded
+guest's blake3 against a committed manifest so a stale module fails loud instead of as NaN.
+
+### update-codec handoff (WIRE-3 cross-repo half — HUMAN runs in the superproject)
+
+The daemon-node half of WIRE-3 is DONE here: `WireVersion` 39→40, the pinned gate test retargeted
+(`contract_wire_version_is_v40`), the CDDL header comment bumped, and the additive `swarm-*` rules
+present with conformance (WIRE-1, 4 tests) + `arbitrary` (WIRE-2) green. The vendored C codec under
+`daemon-app/src/core/daemon/codec/{generated,vendor}` is regenerated from the CDDL and **cannot be
+regenerated from this daemon-node worktree** (the recipe lives in the superproject and writes into
+the `daemon-app` submodule). **Exact sequence for the human, in the superproject
+`/home/j/experiments/daemon`, after this daemon-node branch is the gitlink:**
+
+```
+# in the superproject root (all tooling via nix develop / just)
+just update-codec     # regenerate daemon-app's vendored codec from the v40 CDDL (grows swarm-* arms)
+just codec-drift      # gate: vendored copy == the pinned contract (must be green)
+just lint             # rustfmt + clippy + clang-tidy/-format + qmllint + secrets + spell
+```
+
+Until `just update-codec` runs, the app's codec is one wire version behind; the node is the source
+of truth and the drift gate is the enforcement point.
+
+### Frozen interfaces (Merge 1) — extend additively only from here
+
+1. **`SwarmApi` trait + DTOs + CDDL (wire v40).** The `SwarmApi` sub-trait (7 methods:
+   `swarm_run_list`/`_run_detail`/`_join`/`_leave`/`_set_policy`/`_hardware_report`/`_subscribe`),
+   bound into `NodeApi`, all defaulting `Err(ApiError::Unsupported)`; the `Swarm*` `ApiRequest`/
+   `ApiResponse` variants; the `swarm-*` CDDL rules (appended to the `api-request`/`api-response`/
+   `node-event` unions); the DTO set (`SwarmPolicy{,Mode}`, `SwarmEligibility`, `SwarmCapabilities`,
+   `SwarmHardwareReport`, `SwarmContribution`, `SwarmRunSummary`, `SwarmRunDetail`, `SwarmLeaveMode`,
+   `SwarmEvent`). **Wire rules:** eligibility is node-computed (never re-derived app-side); telemetry
+   is fixed-point integers on the wire (`loss_micros`, `tokens_per_s_milli`) — no floats; live
+   updates ride the existing feed via the payload-free `NodeEvent::SwarmChanged { run_id, rev }`
+   pointer (no new socket pump). Full shapes: `swarm-ledger-w1.md` "Exported seams". Frozen at v40.
+2. **`SwarmService` / `WorkerControl` surface + `swarm.db` schema.** `SwarmStore::open(path)`;
+   `SwarmService::{new(parts), start(), handle_worker_event(&Event)}` implementing `SwarmApi`;
+   inert when `!config.enabled` (default off); durable join-intent re-convergence on `start()`. The
+   `WorkerControl` seam wraps `daemon-train-client`'s `TrainSupervisor` (B3 wires the live event
+   stream Wave 3). `swarm.db` tables `swarm_runs` / `swarm_contrib` / `swarm_events` (windowed ring),
+   `desired_state` drives restart re-convergence, op-id idempotency at the API layer. The
+   `NodeApiImpl::with_swarm` forwarding seam + the boot-wiring diff are ready but **unbound at boot**
+   (applied alongside B3) — see `swarm-ledger-w1.md`.
+3. **`BurnBackend` bound + `BackendKind` + tolerance-harness API.**
+   `BurnBackend<B: burn::tensor::backend::AutodiffBackend>: OpBackend` (`#[cfg(feature =
+   "burn-ndarray")]`), `new()`/`with_device()`; the additive `BackendKind` enum on `EngineConfig`
+   (`#[default] Cpu`, feature-gated `BurnNdarray`; **G2 adds `#[cfg(feature = "wgpu")] Wgpu` as one
+   arm in `HostState::new`**). The tolerance harness (`tests/tolerance/mod.rs`): `OpClass`, `Tol`,
+   `tol_for(class)`, `assert_close(got, want, class, ctx)`, parametric over the backend pair (G2
+   swaps in a wgpu factory). Per-op rtol/atol table + the seed (`0xDAE07E57`) in `swarm-ledger-g1.md`.
+   Det-lane digests stay **backend-independent / bit-exact** — the cross-backend det-digest equality
+   test (CpuBackend vs BurnBackend(ndarray)) is the frozen tripwire (Risks 1–2).
+4. **`PresignClient` trait + JSON fixture contract.** `PresignClient::presign(run, &PresignRequest)
+   -> PresignResponse`; `PresignRequest { kind: ObjectKind, op: PresignOp, round?, peer?, path? }`,
+   `PresignResponse { url, expires_at, headers }`. Object-key layout §11.3 via `r2_object_key`
+   (`payload`/`record-set`/`checkpoint`/`artifact`). **The `tests/fixtures/presign-*.json` files are
+   the FROZEN node↔cloud HTTP contract** — BC (Wave 3) implements `POST /api/v1/swarm/runs/:id/presign`
+   to these bytes verbatim; B3 consumes them. `op=put` must not require a Content-Type unless it
+   returns it in `headers`. (B1 generalised the brief's `{round,peer,kind,op}` to add
+   `kind=artifact`+`path` so one endpoint serves both round objects and `r2://` artifacts.)
+5. **`R2Store` / scheduler / fetch surfaces.** `R2Store<P: PresignClient>: PayloadStore`
+   (`new(presign, egress, run)`; put/get/head; 404/403 → typed `PayloadMiss` feeding the stall
+   ladder; blake3-verify on get; `head` = presigned GET + hash the body).
+   `ReceiptProducer<R2Store<_>>` works unchanged (NET-1 green). `DownloadScheduler` + `RetryConfig`
+   (capacity gate, FIFO waiters, expo-backoff, `max_payload_retries`); `fetch_with_fallback_dyn(&[&dyn
+   PayloadStore], …)` (NET-4 dyn gap); `fetch_record_set(store, key, expected)` (B3 wires engine-side
+   Wave 3). Egress schemes: `https` (`FollowValidated`), `r2://` (presigned GET), `hf://`
+   **pinned-revision-only** (unpinned → `SwarmNetError::UnpinnedRevision`). `ArtifactCache` LRU
+   (`from_gb(data_cache_gb)`). Additive errors: `PresignExpired`, `UnpinnedRevision`. Shapes:
+   `swarm-ledger-b1.md`.
+
+### Gate results (Merge 1, HEAD `da97d6a`)
+
+All green except the documented pre-existing conformance flake:
+
+- `cargo fmt --check` ✓ · `cargo clippy --workspace --all-targets -- -D warnings` ✓ ·
+  `cargo clippy -p daemon-train --features burn-ndarray --all-targets -- -D warnings` ✓ ·
+  `cargo deny check` ✓ (advisories/bans/licenses/sources ok).
+- `cargo test -p daemon-train --features burn-ndarray` ✓ (burn_backend_parity 17,
+  wasm_backend_determinism 12, guest_lifecycle 9, worker_protocol 4, + unit).
+- `cargo test -p daemon-api --features arbitrary` ✓ (WIRE-2) · `swarm_conformance` 4 (WIRE-1) ·
+  `cargo test -p daemon-train-sdk --features sim` ✓ · `cargo check -p daemon-swarm-net --features
+  iroh` ✓ (compile-only) · `cargo build --target wasm32-unknown-unknown -p
+  daemon-swarm-{proto,coordinator}` ✓ · `cargo run -p xtask -- build-guests` ✓ · `typos docs/specs` ✓.
+- Cross-lane: `daemon-swarm-node` 6 ✓ (workspace glob picked it up; `cargo tree -p daemon` and
+  `-p daemon-swarm-node` show **no** burn/wasmtime/iroh on the default gate); `daemon-swarm-net` 67 ✓
+  (NET-1/2/3/8 incl. `ReceiptProducer<R2Store>` + the typed-`PayloadMiss` taxonomy; presign fixtures
+  parse against the DTOs); G1 `BackendKind` and W1 `SwarmService` do not couple (daemon-swarm-node
+  references only `daemon-train-client`'s `TrainSupervisor` via `WorkerControl`, never `BackendKind`/
+  `daemon-train`/burn; daemon-train never references `SwarmService`).
+- `cargo test --workspace`: green **except** the known **`daemon-conformance` detached-delegation/
+  operator-steer trio** — nondeterministic under load AND on full single-threaded runs (a *different*
+  member fails each run: observed `detached_fanout_materializes_distinct_children` and
+  `operator_assign_wakes_a_parked_durable_child`; one whole-crate single-threaded run was fully
+  green). Documented across all three lane ledgers + the program conventions as
+  "pass-in-isolation = green; never modify". No merged lane touches `daemon-conformance`. Untouched.
+
+### Wave-2 must know (G2 / M1 / B2)
+
+- **G2 (burn-wgpu):** slot `BurnBackend<Autodiff<Wgpu>>` into the frozen generic seam — add exactly
+  one `#[cfg(feature = "wgpu")] Wgpu` arm to `BackendKind` + `HostState::new`, and **reuse the
+  tolerance harness** (`tests/tolerance/mod.rs`) by swapping the backend factory; extend the
+  cross-backend det-digest test to CpuBackend-vs-BurnBackend(wgpu) (must stay bit-identical). The
+  `.#vulkan` devShell is the runnable wgpu test lane. Real GPU `Hardware` numbers + VRAM autotune go
+  in the pre-split worker `backend` module. Fidelity notes (f32 adamw drift, rank 1–4 transpose/slice
+  coverage, host-side compression kernels) are in `swarm-ledger-g1.md` "Deviations".
+- **M1 (`tabi@1` additive window):** the 66-op `tabi@1` list + `phase.rs` table is still
+  **additively growable until the P1 exit gate** (Merge 3) — any new op (GQA repeat, attention mask)
+  must land name-for-name across host `Linker` + SDK extern + `phase.rs` + `TABI_IMPORTS` in one
+  slice. After the P1 exit it freezes forever. Also: `ArtifactCache`/`fetch_record_set` already live
+  in `daemon-swarm-net` (B1), so M1's `data.rs` stays collision-free.
+- **B2 (iroh gossip):** the resolved pin is **iroh 1.0 (1.0.2) / iroh-gossip 0.101 / iroh-relay 1**,
+  **NOT the plan's 0.97** (iroh 0.97/0.98 are unresolvable against the frozen `sha2 0.11` tree — see
+  "Resolved dependency pins"). Port the Psyche 0.97 gossip patterns from the reference pack to the
+  iroh **1.0** API and record the deltas; the endpoint/`Gossip::builder`/`Router`/relay shapes are
+  largely stable but a few module paths/signatures moved. iroh is behind `daemon-swarm-net`'s
+  off-default `iroh` feature (`cargo check --features iroh` is green today, compile-only). No
+  iroh-blobs (P4).
