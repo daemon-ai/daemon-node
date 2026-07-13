@@ -282,6 +282,9 @@ fn ensure_built() {
         }
         let status = Command::new("cargo")
             .current_dir(guests_root())
+            // Clear the devShell's `CARGO_TARGET_DIR` (pinned to the parent checkout) so the guests
+            // build into their own `guests/target/` where `guest_dir()` reads them.
+            .env_remove("CARGO_TARGET_DIR")
             .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
             .status()
             .expect("run cargo for guests (dev shell provides the wasm target)");

@@ -157,6 +157,10 @@ fn build_guests() -> anyhow::Result<()> {
     // developer-controlled spawn.
     let status = Command::new("cargo")
         .current_dir(&guests)
+        // The devShell pins `CARGO_TARGET_DIR` to the parent checkout's `target/`; left inherited it
+        // redirects the guests' wasm out of `guests/target/` (where the test harness reads them). The
+        // guests are their own workspace, so clear it and let cargo default to `guests/target/`.
+        .env_remove("CARGO_TARGET_DIR")
         .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
         .status()
         .map_err(|e| anyhow::anyhow!("failed to run cargo for the guests workspace: {e}"))?;
