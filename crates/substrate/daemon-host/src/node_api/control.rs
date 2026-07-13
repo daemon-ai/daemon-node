@@ -707,6 +707,26 @@ impl ControlApi for NodeApiImpl {
         Ok(enabled)
     }
 
+    async fn crash_consent_get(&self) -> Result<bool, ApiError> {
+        Ok(self.store.crash_consent_get().await)
+    }
+
+    async fn crash_consent_set(&self, enabled: bool) -> Result<bool, ApiError> {
+        self.store
+            .crash_consent_set(enabled)
+            .await
+            .map_err(|e| ApiError::Other(format!("set crash consent: {e}")))?;
+        // Env is the live propagation channel to worker spawns (`crash::correlation_env` forwards
+        // `DAEMON_CRASH_CONSENT` from this process). Update it so workers spawned AFTER this toggle
+        // inherit the new decision without a node restart. `set_var` is safe on edition 2021; a
+        // benign race with a concurrent spawn read only affects that single in-flight spawn.
+        std::env::set_var(
+            daemon_telemetry::crash::ENV_CONSENT,
+            if enabled { "1" } else { "0" },
+        );
+        Ok(enabled)
+    }
+
     async fn fingerprint_list(
         &self,
         session: SessionId,

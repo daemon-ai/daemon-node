@@ -1206,6 +1206,17 @@ pub enum ApiRequest {
         /// The new consent state (`true` opts passive telemetry in).
         enabled: bool,
     },
+    /// [`ControlApi::crash_consent_get`] — read the node-owned crash-reporting consent toggle
+    /// (wire v41; default OFF / opt-in; DISTINCT from the telemetry consent above). Answered by
+    /// [`ApiResponse::CrashConsent`].
+    CrashConsentGet,
+    /// [`ControlApi::crash_consent_set`] — set the node-owned crash-reporting consent toggle (wire
+    /// v41); the reply ([`ApiResponse::CrashConsent`]) echoes the new state. On change the node also
+    /// updates the value it injects into future worker spawns (`DAEMON_CRASH_CONSENT`).
+    CrashConsentSet {
+        /// The new consent state (`true` opts crash-report upload in).
+        enabled: bool,
+    },
 
     // -- saved presences (W2-F; wire v37) ------------------------------------------------------
     /// [`ControlApi::presence_list`] — list the saved presences (wire v37). Answered by
@@ -1548,6 +1559,13 @@ pub enum ApiResponse {
     /// The node-owned global telemetry consent toggle (the reply to both
     /// `TelemetryConsentGet` and `TelemetryConsentSet`; the latter echoes the new state).
     TelemetryConsent {
+        /// The current consent state.
+        enabled: bool,
+    },
+    /// The node-owned crash-reporting consent toggle (wire v41; the reply to both
+    /// `CrashConsentGet` and `CrashConsentSet`; the latter echoes the new state). Distinct from the
+    /// telemetry consent above.
+    CrashConsent {
         /// The current consent state.
         enabled: bool,
     },
@@ -2394,18 +2412,18 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed mirror-architecture surface: v40 (the
-    /// additive `SwarmApi` surface — `Swarm*` variants + `swarm-*` CDDL + `NodeEvent::SwarmChanged`,
-    /// Swarm P1 Merge 1 — on top of v39's rungs 1+2+3, spec 09 §10.4). Distinct from the
-    /// transport-envelope [`WIRE_VERSION`] above (= 2), which the mirror rungs did not touch.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v41 (the additive crash-consent
+    /// surface — `CrashConsentGet`/`CrashConsentSet` + `CrashConsent` + `crash-consent-*` CDDL — on
+    /// top of v40's additive `SwarmApi` surface and v39's rungs 1+2+3, spec 09 §10.4). Distinct from
+    /// the transport-envelope [`WIRE_VERSION`] above (= 2), which the mirror rungs did not touch.
     /// Bumping the contract version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v40() {
+    fn contract_wire_version_is_v41() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(40)
+            daemon_common::WireVersion(41)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(40));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(41));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)
@@ -2786,11 +2804,14 @@ mod auth_contract_tests {
         });
         rt_req(&ApiRequest::TelemetryConsentGet);
         rt_req(&ApiRequest::TelemetryConsentSet { enabled: true });
+        rt_req(&ApiRequest::CrashConsentGet);
+        rt_req(&ApiRequest::CrashConsentSet { enabled: true });
         rt_res(&ApiResponse::FeedbackAck(FeedbackAck {
             accepted: true,
             queued: true,
         }));
         rt_res(&ApiResponse::TelemetryConsent { enabled: false });
+        rt_res(&ApiResponse::CrashConsent { enabled: false });
     }
 
     #[test]

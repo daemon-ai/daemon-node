@@ -1297,6 +1297,19 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("telemetry_consent_set".into()))
     }
 
+    /// Read the node-owned crash-reporting consent toggle (wire v41). Default OFF (opt-in); DISTINCT
+    /// from the telemetry consent above. Default: unsupported (a transport with no store).
+    async fn crash_consent_get(&self) -> Result<bool, ApiError> {
+        Err(ApiError::Unsupported("crash_consent_get".into()))
+    }
+
+    /// Set the node-owned crash-reporting consent toggle (wire v41); returns the new state. On
+    /// change the node updates the `DAEMON_CRASH_CONSENT` value injected into future worker spawns.
+    /// Default: unsupported (a transport with no store).
+    async fn crash_consent_set(&self, _enabled: bool) -> Result<bool, ApiError> {
+        Err(ApiError::Unsupported("crash_consent_set".into()))
+    }
+
     /// List scheduled cron jobs (I15). Default: empty (the scheduler is PLANNED; builds on the
     /// `daemon-activation` wake/outbox substrate).
     async fn cron_list(&self) -> Vec<CronJob> {

@@ -1280,6 +1280,17 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
+    /// Read the node-owned crash-reporting consent toggle (wire v41). Default OFF (opt-in): a store
+    /// without the setting reports `false`. Distinct from the telemetry consent above.
+    async fn crash_consent_get(&self) -> bool {
+        false
+    }
+
+    /// Set the node-owned crash-reporting consent toggle (wire v41). Default: no-op.
+    async fn crash_consent_set(&self, _enabled: bool) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Rung 3 (api/39) op-id idempotent dedup: look up a prior result for `(principal, op_id)`,
     /// returning the stored CBOR bytes iff a row exists AND is unexpired at `now_ms` (within
     /// [`COMMAND_DEDUP_TTL_MS`]). An expired row is not served (and is lazily evicted) so the op
@@ -1657,6 +1668,9 @@ struct Inner {
     /// The node-owned global telemetry consent toggle (N1; default OFF / opt-in). In-memory analogue
     /// of the SQLite `telemetry_consent` single-row setting.
     telemetry_consent: bool,
+    /// The node-owned crash-reporting consent toggle (wire v41; default OFF / opt-in; distinct from
+    /// `telemetry_consent`). In-memory analogue of the SQLite `crash_consent` single-row setting.
+    crash_consent: bool,
     /// The node-owned gateway runtime override (`GatewaySet`) as `(enabled, addr)`, if ever set.
     /// In-memory analogue of the SQLite `gateway_config` single-row setting.
     gateway_override: Option<(bool, Option<String>)>,
@@ -2425,6 +2439,15 @@ impl SessionStore for InMemoryStore {
 
     async fn telemetry_consent_set(&self, enabled: bool) -> Result<(), StoreError> {
         self.inner.lock().unwrap().telemetry_consent = enabled;
+        Ok(())
+    }
+
+    async fn crash_consent_get(&self) -> bool {
+        self.inner.lock().unwrap().crash_consent
+    }
+
+    async fn crash_consent_set(&self, enabled: bool) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().crash_consent = enabled;
         Ok(())
     }
 

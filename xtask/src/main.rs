@@ -2107,6 +2107,22 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-telemetry-consent.cbor",
         &ApiResponse::TelemetryConsent { enabled: true },
     )?;
+    // Crash-reporting consent (wire v41): get/set ops + the reply (mirrors telemetry-consent).
+    write_cbor(
+        &out,
+        "request-crash-consent-get.cbor",
+        &ApiRequest::CrashConsentGet,
+    )?;
+    write_cbor(
+        &out,
+        "request-crash-consent-set.cbor",
+        &ApiRequest::CrashConsentSet { enabled: true },
+    )?;
+    write_cbor(
+        &out,
+        "response-crash-consent.cbor",
+        &ApiResponse::CrashConsent { enabled: true },
+    )?;
     // Saved presences (W2-F; wire v37): the list/save/delete/set-active ops + the listing reply.
     {
         use daemon_api::{PresencePrimitive, SavedPresence};

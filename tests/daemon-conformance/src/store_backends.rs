@@ -393,6 +393,24 @@ async fn feedback_suite<S: SessionStore>(store: Arc<S>) {
         .expect("clear consent");
     assert!(!store.telemetry_consent_get().await, "consent cleared");
 
+    // Crash-reporting consent (wire v41) is a separate toggle: defaults OFF, round-trips, and is
+    // independent of the telemetry consent above.
+    assert!(
+        !store.crash_consent_get().await,
+        "crash consent defaults OFF"
+    );
+    store.crash_consent_set(true).await.expect("set crash");
+    assert!(
+        store.crash_consent_get().await,
+        "crash consent persisted on"
+    );
+    assert!(
+        !store.telemetry_consent_get().await,
+        "crash consent does not affect telemetry consent"
+    );
+    store.crash_consent_set(false).await.expect("clear crash");
+    assert!(!store.crash_consent_get().await, "crash consent cleared");
+
     // Enqueue two records out of created order; pending returns oldest first.
     store
         .feedback_enqueue(rec("fb-b", 200))

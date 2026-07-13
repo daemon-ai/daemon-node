@@ -450,9 +450,11 @@ fn classify(req: &ApiRequest) -> Coverage {
         // (FeedbackSubmit -> SessionWrite, consent -> ControlRead/ControlWrite). FeedbackSubmit reads
         // a session's existence for response feedback but does not touch per-owner session state, so
         // it is not per-owner ownership-gated; consent is node-wide.
-        FeedbackSubmit { .. } | TelemetryConsentGet | TelemetryConsentSet { .. } => {
-            NotSessionTouching
-        }
+        FeedbackSubmit { .. }
+        | TelemetryConsentGet
+        | TelemetryConsentSet { .. }
+        | CrashConsentGet
+        | CrashConsentSet { .. } => NotSessionTouching,
         // The notification list is node-wide (not per-owner session state): the coarse ControlRead
         // capability gate governs it (wire v37).
         NotificationList => NotSessionTouching,

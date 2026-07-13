@@ -49,6 +49,10 @@ child          TEXT PRIMARY KEY,
 parent_session TEXT NOT NULL,
 notified       INTEGER NOT NULL DEFAULT 0
 , call_id TEXT);
+CREATE TABLE crash_consent (
+id      INTEGER PRIMARY KEY CHECK (id = 0),
+enabled INTEGER NOT NULL
+);
 CREATE TABLE credential_labels (
 profile TEXT PRIMARY KEY,
 label   TEXT NOT NULL

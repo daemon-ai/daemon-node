@@ -219,6 +219,14 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
                 ApiResponse::TelemetryConsent { enabled }
             })
         }
+        ApiRequest::CrashConsentGet => ok_or_err(api.crash_consent_get().await, |enabled| {
+            ApiResponse::CrashConsent { enabled }
+        }),
+        ApiRequest::CrashConsentSet { enabled } => {
+            ok_or_err(api.crash_consent_set(enabled).await, |enabled| {
+                ApiResponse::CrashConsent { enabled }
+            })
+        }
         // -- saved presences (W2-F; wire v37) -------------------------------------------------
         ApiRequest::PresenceList => ApiResponse::SavedPresences(api.presence_list().await),
         ApiRequest::PresenceSave { presence } => unit_or_err(api.presence_save(presence).await),

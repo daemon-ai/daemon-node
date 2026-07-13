@@ -103,6 +103,11 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         // node-wide control-plane write (operator tier), mirroring Telemetry -> ControlRead.
         TelemetryConsentGet => C::ControlRead,
         TelemetryConsentSet { .. } => C::ControlWrite,
+        // The crash-reporting consent toggle is a separate node-wide control-plane setting: reading
+        // it is a control-plane read, flipping it a control-plane write (operator tier), exactly
+        // like the telemetry-consent toggle above.
+        CrashConsentGet => C::ControlRead,
+        CrashConsentSet { .. } => C::ControlWrite,
         // The node-owned gateway is a resident service: reading its status is a control-plane read;
         // enabling/rebinding it is a node-wide control-plane write (operator tier), mirroring the
         // telemetry-consent toggle above.

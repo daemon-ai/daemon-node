@@ -447,6 +447,16 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
              );\n\
              CREATE INDEX command_dedup_at ON command_dedup (at_ms);",
         ),
+        // M17 (wire v41 — crash-reporting consent): the node-owned crash-report upload consent
+        // toggle, a single-row (`id = 0`) setting mirroring `telemetry_consent` but DISTINCT from
+        // it (a separate opt-in for crash minidumps). Absence = OFF (opt-in). The node reads this at
+        // worker-spawn time to set the `DAEMON_CRASH_CONSENT` env the child crash reporter gates on.
+        M::up(
+            "CREATE TABLE crash_consent (\n\
+                 id      INTEGER PRIMARY KEY CHECK (id = 0),\n\
+                 enabled INTEGER NOT NULL\n\
+             );",
+        ),
     ])
 });
 
@@ -1892,6 +1902,31 @@ impl SessionStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO telemetry_consent (id, enabled) VALUES (0, ?1) \
+             ON CONFLICT(id) DO UPDATE SET enabled = ?1",
+            params![enabled as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn crash_consent_get(&self) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT enabled FROM crash_consent WHERE id = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|v| v != 0)
+        .unwrap_or(false)
+    }
+
+    async fn crash_consent_set(&self, enabled: bool) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO crash_consent (id, enabled) VALUES (0, ?1) \
              ON CONFLICT(id) DO UPDATE SET enabled = ?1",
             params![enabled as i64],
         )

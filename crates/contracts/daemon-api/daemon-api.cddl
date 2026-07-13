@@ -1588,6 +1588,10 @@ feedback-diagnostics = { ? "app_version": (tstr / null), ? "os": (tstr / null) }
 request-feedback-submit = { "FeedbackSubmit": { "kind": feedback-kind, ? "target": (feedback-target / null), ? "rating": (feedback-rating / null), ? "comment": (tstr / null), "include_content": bool, ? "diagnostics": (feedback-diagnostics / null), "surface": tstr } }
 request-telemetry-consent-get = "TelemetryConsentGet"
 request-telemetry-consent-set = { "TelemetryConsentSet": { "enabled": bool } }
+; wire v41: the node-owned crash-reporting consent toggle (default OFF / opt-in; distinct from the
+; telemetry consent above), mirroring the telemetry-consent verbs.
+request-crash-consent-get = "CrashConsentGet"
+request-crash-consent-set = { "CrashConsentSet": { "enabled": bool } }
 ; wire v37: the node's live notification list (read-only; re-listed on NotificationsChanged).
 request-notification-list = "NotificationList"
 
@@ -1833,6 +1837,8 @@ api-request = request-submit
             / request-feedback-submit
             / request-telemetry-consent-get
             / request-telemetry-consent-set
+            / request-crash-consent-get
+            / request-crash-consent-set
             / request-presence-list
             / request-presence-save
             / request-presence-delete
@@ -1975,6 +1981,8 @@ response-who-am-i     = { "WhoAmI": principal-view }
 feedback-ack = { "accepted": bool, "queued": bool }
 response-feedback-ack = { "FeedbackAck": feedback-ack }
 response-telemetry-consent = { "TelemetryConsent": { "enabled": bool } }
+; wire v41: the crash-reporting consent reply (echoes the current/new state).
+response-crash-consent = { "CrashConsent": { "enabled": bool } }
 ; ----- saved presences (W2-F; wire v37) -----
 response-saved-presences = { "SavedPresences": [* saved-presence] }
 
@@ -2098,6 +2106,7 @@ api-response = response-ok
              / response-who-am-i
              / response-feedback-ack
              / response-telemetry-consent
+             / response-crash-consent
              / response-saved-presences
              / response-notifications
              / response-persons

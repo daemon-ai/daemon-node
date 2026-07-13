@@ -763,7 +763,13 @@ impl WireVersion {
     /// rules + the `NodeEvent::SwarmChanged` invalidation pointer (Swarm P1, Merge 1). Purely
     /// additive union arms; strict-equal `is_compatible` still holds, so the bump follows the same
     /// additive pattern as the earlier versions; clients feature-detect via the `api/40` Hello feature.
-    pub const CURRENT: Self = Self(40);
+    ///
+    /// (v41) additive crash-consent surface — the `CrashConsentGet` / `CrashConsentSet` requests +
+    /// the `CrashConsent` response (a dedicated crash-reporting consent toggle, default OFF,
+    /// distinct from the existing telemetry consent) + their `crash-consent-*` CDDL rules. Purely
+    /// additive union arms, mirroring the telemetry-consent verbs; strict-equal `is_compatible`
+    /// still holds; clients feature-detect via the `api/41` Hello feature.
+    pub const CURRENT: Self = Self(41);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
