@@ -2394,17 +2394,18 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed mirror-architecture surface: v39 (the
-    /// single deliberate bump carrying rungs 1+2+3 together, spec 09 §10.4). Distinct from the
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed mirror-architecture surface: v40 (the
+    /// additive `SwarmApi` surface — `Swarm*` variants + `swarm-*` CDDL + `NodeEvent::SwarmChanged`,
+    /// Swarm P1 Merge 1 — on top of v39's rungs 1+2+3, spec 09 §10.4). Distinct from the
     /// transport-envelope [`WIRE_VERSION`] above (= 2), which the mirror rungs did not touch.
     /// Bumping the contract version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v39() {
+    fn contract_wire_version_is_v40() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(39)
+            daemon_common::WireVersion(40)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(39));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(40));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)
