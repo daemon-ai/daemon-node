@@ -3576,6 +3576,7 @@ dependencies = [
  "daemon-slack",
  "daemon-store",
  "daemon-supervision",
+ "daemon-swarm-run",
  "daemon-telegram",
  "daemon-telemetry",
  "daemon-tool-browser",

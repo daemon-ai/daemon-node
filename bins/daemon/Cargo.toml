@@ -56,6 +56,12 @@ daemon-tool-web = { workspace = true }
 # The `[fs]` config table (`FsConfig`) embedded in NodeConfig; the tool itself is registered by
 # daemon-node's role/session registries.
 daemon-tool-fs = { workspace = true }
+# The `[swarm]` config table (`daemon_swarm_run::config::SwarmConfig`, spec §10.6) embedded in
+# NodeConfig. Serde/tokio-only on the default gate: it pulls `daemon-swarm-net`
+# (reqwest via daemon-egress) + `daemon-swarm-proto` (ed25519) — all already in-tree — and NO
+# burn/wasmtime (no `daemon-train` dep) and NO iroh (behind daemon-swarm-net's off-by-default `iroh`
+# feature). See swarm-ledger-w1.md for the cargo-tree evidence.
+daemon-swarm-run = { workspace = true }
 # The `vision_analyze` tool; opt-in at runtime via `[vision].provider`.
 daemon-tool-vision = { workspace = true }
 # Core chat tools registered on every role: the per-session `todo` planner and the `clarify` ask.
