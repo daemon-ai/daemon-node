@@ -19,7 +19,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use daemon_common::SessionId;
@@ -29,8 +29,15 @@ use daemon_provision::{
 use daemon_swarm_run::protocol::{
     self, Command, Eligibility, ErrorClass, Event, Hardware, JoinPolicy, LeaveMode,
 };
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+
+/// A live worker→node event pump sink. When set (by [`TrainSupervisor::join_streaming`]) the
+/// worker's reader task routes every decoded [`Event`] here (the continuous round stream the node's
+/// `SwarmService` consumes) instead of the request/reply inbox; cleared automatically when the
+/// receiver is dropped. Shared with each spawned `Worker`'s reader so a respawn keeps pumping.
+type PumpSink = Arc<StdMutex<Option<UnboundedSender<Event>>>>;
 
 /// Construction + tuning for a [`TrainSupervisor`]'s worker (mirrors `WorkerConfig` / `MettaConfig`).
 #[derive(Clone, Debug)]
@@ -122,6 +129,9 @@ struct Inner {
     restarts: Mutex<Vec<Instant>>,
     /// Total spawns; respawns are spawns beyond the first (observability + backoff gate).
     spawns: Mutex<u32>,
+    /// The live event-pump sink (A3). Shared into every spawned worker's reader so the continuous
+    /// stream survives a respawn; `None` outside a streaming join (request/reply routing).
+    pump: PumpSink,
 }
 
 impl TrainSupervisor {
@@ -134,6 +144,7 @@ impl TrainSupervisor {
                 worker: Mutex::new(None),
                 restarts: Mutex::new(Vec::new()),
                 spawns: Mutex::new(0),
+                pump: Arc::new(StdMutex::new(None)),
             }),
         }
     }
@@ -176,6 +187,38 @@ impl TrainSupervisor {
             _ => None,
         })
         .await
+    }
+
+    /// Join a run and return the **continuous** worker event stream (A3 — the event pump).
+    ///
+    /// Unlike [`join`](Self::join) (which resolves on the first `RunPhase` and drops the rest), this
+    /// installs a pump sink so the worker's reader routes **every** subsequent [`Event`]
+    /// (`RunPhase`/`Metric`/`RoundOutcome`/`Warning` per round, plus the additive `MicroBatch` /
+    /// `OomLadder` telemetry) into the returned receiver. The node's `SwarmService` drains it into
+    /// `handle_worker_event`, so `swarm.db` reflects live round progression (§10.3/§10.4). The sink
+    /// clears automatically when the receiver is dropped (back to request/reply routing).
+    pub async fn join_streaming(
+        &self,
+        run_id: impl Into<String>,
+        coordinator: impl Into<String>,
+        credentials: Vec<u8>,
+        policy: JoinPolicy,
+    ) -> Result<UnboundedReceiver<Event>, TrainClientError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.inner.pump.lock().expect("pump lock") = Some(tx);
+        let cmd = Command::JoinRun {
+            run_id: run_id.into(),
+            coordinator: coordinator.into(),
+            credentials,
+            policy,
+        };
+        // One-way: the worker streams events (incl. the first RunPhase) over the pump, so we do not
+        // block on a reply here. A spawn/transport fault clears the pump + surfaces the error.
+        if let Err(e) = self.send_oneway(cmd).await {
+            *self.inner.pump.lock().expect("pump lock") = None;
+            return Err(e);
+        }
+        Ok(rx)
     }
 
     /// Send a GPU-governor throttle lever (§10.5). Fire-and-forget (no reply frame).
@@ -294,7 +337,7 @@ impl Inner {
             }
             *spawns += 1;
         }
-        Worker::spawn(&self.cfg).await
+        Worker::spawn(&self.cfg, self.pump.clone()).await
     }
 }
 
@@ -308,7 +351,7 @@ struct Worker {
 
 impl Worker {
     /// Spawn the worker and block until it reports `Ready` (or fails / times out).
-    async fn spawn(cfg: &TrainClientConfig) -> Result<Worker, TrainClientError> {
+    async fn spawn(cfg: &TrainClientConfig, pump: PumpSink) -> Result<Worker, TrainClientError> {
         let session = SessionId::new("daemon-train-worker");
         // Crash-reporting correlation: forward the node's DSN + current consent and tag the child
         // with this placement's session id + our pid, so a train-worker crash correlates with the
@@ -328,9 +371,24 @@ impl Worker {
         let (writer, mut framed_reader) = channel.split();
         let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let reader = tokio::spawn(async move {
+            // The first event (`Ready`) always goes to the request/reply inbox so the spawn
+            // handshake completes even during a streaming respawn; subsequent events route to the
+            // live pump sink when one is installed (A3 event pump), else to the inbox.
+            let mut first = true;
             while let Some(bytes) = framed_reader.recv().await {
                 match protocol::decode::<Event>(&bytes) {
                     Ok(event) => {
+                        if !first {
+                            let sink = pump.lock().expect("pump lock").clone();
+                            if let Some(tx) = sink {
+                                if tx.send(event).is_err() {
+                                    // The node dropped the stream (run left): back to inbox routing.
+                                    *pump.lock().expect("pump lock") = None;
+                                }
+                                continue;
+                            }
+                        }
+                        first = false;
                         if ev_tx.send(event).is_err() {
                             break;
                         }

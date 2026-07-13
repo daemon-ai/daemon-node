@@ -249,6 +249,29 @@ pub enum Event {
         /// A short human-readable detail.
         detail: String,
     },
+    /// **Additive (A3, Merge 2).** The autotune micro-batch verdict the worker consumed in-process
+    /// for the joined run (the node's `Eligibility.headroom["micro_batch"]`, §10.5). Emitted once
+    /// per join by the live-attach path (the P1-deferred telemetry-as-protocol-event follow-on 2;
+    /// B3 logged it to stderr). Additive to the frozen §10.2 stream — a new variant only, so every
+    /// pre-A3 decoder still round-trips the existing frames.
+    MicroBatch {
+        /// The chosen micro-batch (sequences per inner step).
+        micro_batch: u32,
+    },
+    /// **Additive (A3, Merge 2).** One rung of the §10.5 OOM-halving ladder: a real `BudgetMemory`
+    /// trap forced the worker to churn the instance and retry at half the micro-batch. Emitted by
+    /// the live-attach path when the ladder fires (B3 logged it to stderr). Additive to the frozen
+    /// §10.2 stream.
+    OomLadder {
+        /// The round the ladder fired on.
+        round: RoundId,
+        /// The micro-batch before halving.
+        from_micro_batch: u32,
+        /// The micro-batch after halving.
+        to_micro_batch: u32,
+        /// Cumulative halvings on this round so far.
+        halvings: u32,
+    },
     /// A classified failure.
     Error {
         /// The failure class (maps to the node's recovery loop).
@@ -281,6 +304,130 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
 /// Decode a CBOR frame body.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     ciborium::from_reader(bytes).map_err(|e| CodecError::Decode(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// JoinRun.credentials contract (A3, frozen at Merge 2)
+// ---------------------------------------------------------------------------
+//
+// `Command::JoinRun.credentials` stays an OPAQUE `Vec<u8>` on the frozen worker wire (§10.2). A3
+// defines the canonical-CBOR **schema** carried in it: the node's `SwarmService` / run-authoring
+// path AUTHORS a [`JoinCredentials`], `to_bytes()` it into `credentials`, and the worker's live
+// attach `from_bytes()` it to construct the live plane + engine. It is a NEW additive type — no
+// `Command`/`Event` shape change — so a worker built without the live-attach feature ignores the
+// bytes exactly as before.
+
+/// The WS coordinator auth for the live attach (the canonical-CBOR mirror of
+/// `daemon_swarm_net::ws_client::WsAuth`, defined here so the dependency-light protocol crate owns
+/// the credentials schema; the worker converts it under the `ws` feature — never hardcoded).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WsAuthSpec {
+    /// No auth (bare `ws://` dev target).
+    #[default]
+    None,
+    /// `Authorization: Bearer <token>` (the gateway `swarm:join` path).
+    Bearer(String),
+    /// The internal identity headers `x-daemon-org-id` / `x-daemon-actor` (direct-to-`apps/swarm`).
+    Internal {
+        /// The org id header value.
+        org_id: String,
+        /// The actor header value.
+        actor: String,
+    },
+}
+
+/// One iroh roster peer (the canonical-CBOR mirror of `daemon_swarm_net::IrohPeer` for the
+/// credentials body: an `endpoint_id` + reachability). Direct addrs are `"ip:port"` strings so the
+/// protocol crate takes no `std::net` serialization dependency; the worker parses them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrohRosterPeer {
+    /// The peer's iroh `EndpointId` (32 raw bytes).
+    pub endpoint_id: [u8; 32],
+    /// Direct socket addresses (`"ip:port"`); may be empty for relay-only reachability.
+    #[serde(default)]
+    pub direct_addrs: Vec<String>,
+    /// Home relay URL (NAT-proof reachability); `None` for direct-only (LAN/loopback).
+    #[serde(default)]
+    pub relay_url: Option<String>,
+}
+
+/// The optional iroh half of the credentials. Present ⇒ the worker builds a
+/// `DualPlane(WsControlPlane, IrohGossip)`; absent ⇒ WS-only (the T0 baseline).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrohCredentials {
+    /// The iroh secret key (32 bytes) — separate from the node ed25519 identity (§7.2).
+    pub secret_key: [u8; 32],
+    /// Envelope-pinned relay URLs (empty ⇒ direct-only / loopback).
+    #[serde(default)]
+    pub relay_urls: Vec<String>,
+    /// The bootstrap roster (may be empty; roster updates arrive dynamically as coordinator frames
+    /// and are wired to `IrohGossip::update_roster`).
+    #[serde(default)]
+    pub roster: Vec<IrohRosterPeer>,
+}
+
+/// The engine + corpus knobs the worker's `RoundEngine` needs (from the run's declared config /
+/// frozen envelope). Deterministic across peers so the digest transcript agrees.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineParams {
+    /// Inner steps per round (§5.1 cadence).
+    pub steps_per_round: u32,
+    /// Micro-batch (sequences) within an inner step (the assess verdict overrides this at runtime).
+    pub micro_batch: u32,
+    /// Fetch-recovery budget before a stalled peer leaves for the epoch (§6.4).
+    pub stall_rounds_max: u32,
+    /// Round-boundary checkpoint cadence (§9); `0` disables.
+    pub checkpoint_every_rounds: u32,
+    /// §7.3 receive-side per-peer payload cap in bytes (`0` = uncapped) — the worker mirrors the DO
+    /// shell's pre-filter (Merge-1 Decision 2).
+    #[serde(default)]
+    pub update_max_bytes: u64,
+    /// Synthetic-corpus seed (deterministic training data across peers).
+    pub corpus_seed: u64,
+    /// Synthetic-corpus vocabulary size.
+    pub corpus_vocab: u32,
+    /// Synthetic-corpus sequence count.
+    pub corpus_len: u32,
+    /// Synthetic-corpus sequence length (tokens).
+    pub corpus_seq_len: u32,
+}
+
+/// The canonical-CBOR body of [`Command::JoinRun`]'s `credentials` (A3, frozen at Merge 2). Authored
+/// node-side, parsed by the worker's live attach.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinCredentials {
+    /// The peer's node ed25519 signing-key seed (32 bytes) — the `RoundEngine`'s `Join` signer
+    /// identity (§7.2). Also the `PeerId` this peer contributes under.
+    pub node_secret: [u8; 32],
+    /// WS coordinator auth.
+    #[serde(default)]
+    pub ws_auth: WsAuthSpec,
+    /// The epoch roster (node pubkeys, 32-byte) the engine folds each round.
+    pub roster: Vec<[u8; 32]>,
+    /// blake3 of the frozen envelope (§6.1) — the iroh topic-derivation input + admission binding.
+    pub envelope_hash: [u8; 32],
+    /// Optional iroh transport (dual-plane). Absent ⇒ WS-only (T0 baseline).
+    #[serde(default)]
+    pub iroh: Option<IrohCredentials>,
+    /// Optional presign base for the `R2Store` payload plane (e.g.
+    /// `http://127.0.0.1:8795/api/v1/swarm`). Absent ⇒ `FsPayloadStore` fallback (tests / LAN).
+    #[serde(default)]
+    pub presign_base: Option<String>,
+    /// The engine + corpus knobs.
+    pub engine: EngineParams,
+}
+
+impl JoinCredentials {
+    /// Encode to the canonical-CBOR bytes carried in `JoinRun.credentials`.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CodecError> {
+        encode(self)
+    }
+
+    /// Decode from `JoinRun.credentials` bytes. An empty / non-`JoinCredentials` buffer decodes to
+    /// an error, which the worker treats as "no live attach" (the self-driven fallback).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
+        decode(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -393,6 +540,14 @@ mod tests {
             class: "straggle".into(),
             detail: "late fetch".into(),
         });
+        // A3 additive telemetry variants.
+        round_trip_event(Event::MicroBatch { micro_batch: 4 });
+        round_trip_event(Event::OomLadder {
+            round: 7,
+            from_micro_batch: 4,
+            to_micro_batch: 2,
+            halvings: 1,
+        });
         for class in [
             ErrorClass::OutOfMemory,
             ErrorClass::Transient,
@@ -407,6 +562,58 @@ mod tests {
             });
         }
         round_trip_event(Event::Pong);
+    }
+
+    /// `join_credentials_round_trip`: the A3 `JoinCredentials` schema carried in
+    /// `JoinRun.credentials` round-trips through the canonical-CBOR codec, incl. the optional iroh /
+    /// presign halves and the WS-auth variants.
+    #[test]
+    fn join_credentials_round_trip() {
+        let creds = JoinCredentials {
+            node_secret: [0x11; 32],
+            ws_auth: WsAuthSpec::Internal {
+                org_id: "org_live".into(),
+                actor: "key:live".into(),
+            },
+            roster: vec![[0x22; 32], [0x33; 32]],
+            envelope_hash: [0xEE; 32],
+            iroh: Some(IrohCredentials {
+                secret_key: [0x44; 32],
+                relay_urls: vec!["http://127.0.0.1:3340".into()],
+                roster: vec![IrohRosterPeer {
+                    endpoint_id: [0x55; 32],
+                    direct_addrs: vec!["127.0.0.1:4550".into()],
+                    relay_url: Some("http://127.0.0.1:3340".into()),
+                }],
+            }),
+            presign_base: Some("http://127.0.0.1:8795/api/v1/swarm".into()),
+            engine: EngineParams {
+                steps_per_round: 2,
+                micro_batch: 2,
+                stall_rounds_max: 3,
+                checkpoint_every_rounds: 0,
+                update_max_bytes: 1 << 20,
+                corpus_seed: 7,
+                corpus_vocab: 64,
+                corpus_len: 256,
+                corpus_seq_len: 8,
+            },
+        };
+        let bytes = creds.to_bytes().expect("encode credentials");
+        let back = JoinCredentials::from_bytes(&bytes).expect("decode credentials");
+        assert_eq!(creds, back);
+
+        // The WS-only baseline (no iroh, no presign) also round-trips, and a non-credentials buffer
+        // is a decode error (the worker's "no live attach → self-driven fallback" signal).
+        let ws_only = JoinCredentials {
+            iroh: None,
+            presign_base: None,
+            ws_auth: WsAuthSpec::None,
+            ..creds
+        };
+        let back2 = JoinCredentials::from_bytes(&ws_only.to_bytes().unwrap()).unwrap();
+        assert_eq!(ws_only, back2);
+        assert!(JoinCredentials::from_bytes(&[]).is_err());
     }
 
     /// `hardware_shared_mb_is_additive_back_compatible`: the Merge-2 `shared_mb` field is additive.

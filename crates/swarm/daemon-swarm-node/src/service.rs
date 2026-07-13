@@ -84,6 +84,21 @@ pub trait WorkerControl: Send + Sync {
         credentials: Vec<u8>,
         policy: JoinPolicy,
     ) -> Result<(), SwarmError>;
+    /// Join a run and return the **continuous** worker event stream (A3 event pump). The default
+    /// delegates to [`join`](Self::join) and returns an already-closed receiver, so test fakes and
+    /// non-streaming workers keep the pre-A3 behavior; `TrainSupervisor` overrides it with the real
+    /// per-round stream.
+    async fn join_streaming(
+        &self,
+        run_id: String,
+        coordinator: String,
+        credentials: Vec<u8>,
+        policy: JoinPolicy,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, SwarmError> {
+        self.join(run_id, coordinator, credentials, policy).await?;
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok(rx)
+    }
     /// Leave a run.
     async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), SwarmError>;
     /// Push a GPU-governor throttle lever (§10.5).
@@ -115,6 +130,17 @@ impl WorkerControl for TrainSupervisor {
         policy: JoinPolicy,
     ) -> Result<(), SwarmError> {
         TrainSupervisor::join(self, run_id, coordinator, credentials, policy)
+            .await
+            .map_err(SwarmError::worker)
+    }
+    async fn join_streaming(
+        &self,
+        run_id: String,
+        coordinator: String,
+        credentials: Vec<u8>,
+        policy: JoinPolicy,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, SwarmError> {
+        TrainSupervisor::join_streaming(self, run_id, coordinator, credentials, policy)
             .await
             .map_err(SwarmError::worker)
     }
@@ -164,6 +190,10 @@ pub struct SwarmService {
     current_run: Mutex<Option<String>>,
     /// The coalescing swarm-feed revision stamped on each `SwarmChanged` pointer.
     rev: AtomicU64,
+    /// The service's own `Arc` handle (A3), bound post-construction via [`bind_self`](Self::bind_self)
+    /// so `swarm_join`/`start` can spawn a detached event-pump task that outlives the `&self` call.
+    /// Unbound (test builds) → the non-streaming `join` path, drained-and-dropped.
+    me: std::sync::OnceLock<std::sync::Weak<SwarmService>>,
 }
 
 impl SwarmService {
@@ -180,6 +210,55 @@ impl SwarmService {
             feed: parts.feed,
             current_run: Mutex::new(None),
             rev: AtomicU64::new(0),
+            me: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Bind the service's own `Arc` handle (A3 event pump), mirroring the node's `set_swarm`
+    /// post-`Arc` binder. After this, `swarm_join` / `start` drive `join_streaming` + a detached pump
+    /// task feeding the worker's continuous event stream into [`handle_worker_event`](Self::handle_worker_event)
+    /// → `NodeEvent::SwarmChanged`, so `swarm.db` reflects live round progression (§10.3/§10.4).
+    /// Idempotent; never bound → the non-streaming join path (unchanged, for tests).
+    pub fn bind_self(self: &Arc<Self>) {
+        let _ = self.me.set(Arc::downgrade(self));
+    }
+
+    /// Join a run and pump its continuous worker event stream into the service (A3). The public entry
+    /// the boot site / e2e use to drive a **live-attach** join with authored `JoinCredentials`; the
+    /// pump feeds each event through `handle_worker_event`. Requires [`bind_self`](Self::bind_self).
+    pub async fn join_and_pump(
+        &self,
+        run_id: String,
+        coordinator: String,
+        credentials: Vec<u8>,
+        policy: JoinPolicy,
+    ) -> Result<(), SwarmError> {
+        let rx = self
+            .worker
+            .join_streaming(run_id, coordinator, credentials, policy)
+            .await?;
+        self.spawn_pump(rx);
+        Ok(())
+    }
+
+    /// Spawn the detached event-pump task that drains a worker event stream into
+    /// [`handle_worker_event`](Self::handle_worker_event). When the service is unbound (tests) it
+    /// drains-and-drops so a streaming worker never backs up.
+    fn spawn_pump(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<protocol::Event>) {
+        match self.me.get().and_then(std::sync::Weak::upgrade) {
+            Some(me) => {
+                tokio::spawn(async move {
+                    while let Some(ev) = rx.recv().await {
+                        // Best-effort fan-out: a persist error never stalls the pump (mirrors the
+                        // existing "a broadcast send error only means no live subscribers" posture;
+                        // the durable log + a SwarmChanged pointer let a client re-baseline).
+                        let _ = me.handle_worker_event(&ev);
+                    }
+                });
+            }
+            None => {
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            }
         }
     }
 
@@ -203,14 +282,18 @@ impl SwarmService {
         let intents = self.store.active_intents()?;
         let mut rejoined = 0;
         for run in &intents {
-            self.worker
-                .join(
+            // A3: re-issue via the streaming path + pump so a re-converged run resumes reporting
+            // live round progression into swarm.db (durable-intent re-convergence, §10.3).
+            let rx = self
+                .worker
+                .join_streaming(
                     run.run_id.clone(),
                     run.coordinator.clone(),
                     Vec::new(),
                     to_join_policy(&run.policy),
                 )
                 .await?;
+            self.spawn_pump(rx);
             rejoined += 1;
         }
         if rejoined > 0 {
@@ -302,6 +385,8 @@ impl SwarmService {
             | protocol::Event::Metric { .. }
             | protocol::Event::CheckpointPublished { .. }
             | protocol::Event::Warning { .. }
+            | protocol::Event::MicroBatch { .. }
+            | protocol::Event::OomLadder { .. }
             | protocol::Event::Error { .. } => self.current_run.lock().unwrap().clone(),
             _ => None,
         }
@@ -401,8 +486,15 @@ impl SwarmApi for SwarmService {
         self.store
             .put_join_intent(&run_id, &coordinator, &policy, None, &eligibility)
             .map_err(|e| SwarmError::from(e).to_api())?;
-        self.worker
-            .join(
+        // A3: join over the streaming path + pump the continuous worker event stream into
+        // `handle_worker_event` so swarm.db reflects live round progression (§10.3/§10.4). The
+        // opaque `JoinRun.credentials` the worker's live attach parses (§2 of the A3 ledger) are
+        // authored where the node identity + roster are known (the e2e / boot join_and_pump path);
+        // an API-initiated join with no authored credentials keeps the worker's self-driven round
+        // (WS-only baseline), still pumped.
+        let rx = self
+            .worker
+            .join_streaming(
                 run_id.clone(),
                 coordinator,
                 Vec::new(),
@@ -410,6 +502,7 @@ impl SwarmApi for SwarmService {
             )
             .await
             .map_err(|e| e.to_api())?;
+        self.spawn_pump(rx);
         self.emit_changed(Some(run_id));
         Ok(())
     }
@@ -610,6 +703,25 @@ fn translate(ev: &protocol::Event, run_id: &str) -> Option<SwarmEvent> {
             run_id: run_id.to_string(),
             class: class.clone(),
             detail: detail.clone(),
+        }),
+        // A3 additive telemetry (§10.5): the micro-batch verdict + OOM-ladder rungs surface as
+        // `Warning`s (no new SwarmApi wire type — telemetry stays off the wire, program ledger).
+        protocol::Event::MicroBatch { micro_batch } => Some(SwarmEvent::Warning {
+            run_id: run_id.to_string(),
+            class: "micro_batch".to_string(),
+            detail: micro_batch.to_string(),
+        }),
+        protocol::Event::OomLadder {
+            round,
+            from_micro_batch,
+            to_micro_batch,
+            halvings,
+        } => Some(SwarmEvent::Warning {
+            run_id: run_id.to_string(),
+            class: "oom_ladder".to_string(),
+            detail: format!(
+                "round {round}: micro_batch {from_micro_batch}->{to_micro_batch} (halving {halvings})"
+            ),
         }),
         protocol::Event::Error { class, detail } => Some(SwarmEvent::Error {
             run_id: run_id.to_string(),
