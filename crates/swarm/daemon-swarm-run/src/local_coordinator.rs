@@ -89,6 +89,19 @@ impl CoordinatorReplay {
         &self.dropped
     }
 
+    /// The `CoordinatorState` the run started from (the replay genesis for the observe capture).
+    #[must_use]
+    pub fn initial_state(&self) -> &CoordinatorState {
+        &self.initial
+    }
+
+    /// The exact ordered `tick` inputs (driving messages + clocks) the coordinator fed — the
+    /// reproducible driver trace `daemon-swarm-observe`'s `RunCapture` records for offline replay.
+    #[must_use]
+    pub fn inputs(&self) -> &[Input] {
+        &self.inputs
+    }
+
     /// Re-run `tick` over the recorded inputs from the initial state and confirm the per-round
     /// canonical-CBOR state trajectory is byte-identical to the live run (I1 / PROTO-20 spirit).
     #[must_use]

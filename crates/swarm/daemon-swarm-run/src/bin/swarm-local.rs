@@ -14,10 +14,16 @@
 //! Usage:
 //! ```text
 //! swarm-local [--transport loopback|iroh] [--store fs] [--peers N] [--rounds N] [--relay <url>]
+//!             [--observe <dir>]
 //! ```
+//!
+//! `--observe <dir>` writes the `daemon-swarm-observe` artifacts (`<run>.dsmlog` message log +
+//! `<run>.dsmcap` replay capture) so `swarm-replay <dir>` can later re-derive + verify the run's
+//! per-round consensus offline (the gate-ceremony instrumentation).
 //!
 //! This bin requires the `iroh` feature (so it can offer both transports from one binary).
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use daemon_swarm_run::harness::{run_swarm, SwarmConfig};
@@ -29,6 +35,7 @@ struct Opts {
     peers: usize,
     rounds: u64,
     relay: Option<String>,
+    observe: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,10 +50,17 @@ fn parse_args() -> Result<Opts, String> {
     let mut rounds = 10u64;
     let mut relay: Option<String> = None;
     let mut store = "fs".to_string();
+    let mut observe: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--observe" => {
+                observe =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "--observe expects a directory".to_string()
+                    })?));
+            }
             "--transport" => {
                 transport = match args.next().as_deref() {
                     Some("loopback") => Transport::Loopback,
@@ -96,6 +110,7 @@ fn parse_args() -> Result<Opts, String> {
         peers,
         rounds,
         relay,
+        observe,
     })
 }
 
@@ -106,7 +121,7 @@ async fn main() -> ExitCode {
         Err(msg) => {
             if msg == "help" {
                 eprintln!(
-                    "swarm-local [--transport loopback|iroh] [--store fs] [--peers N] [--rounds N] [--relay <url>]"
+                    "swarm-local [--transport loopback|iroh] [--store fs] [--peers N] [--rounds N] [--relay <url>] [--observe <dir>]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -148,6 +163,22 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if let Some(dir) = &opts.observe {
+        match run.write_observe(dir) {
+            Ok(()) => println!(
+                "swarm-local: wrote observe artifacts to {}/{}.{{dsmlog,dsmcap}} \
+                 (replay with `swarm-replay {}`)",
+                dir.display(),
+                run.run.as_str(),
+                dir.display()
+            ),
+            Err(e) => {
+                eprintln!("swarm-local: --observe write failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let by_round = run.digests_by_round();
     for (round, digest) in run.agreed_transcript() {

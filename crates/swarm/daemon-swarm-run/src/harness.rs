@@ -34,7 +34,10 @@ use daemon_swarm_coordinator::{CoordinatorParams, CoordinatorState, RunConfig};
 use daemon_swarm_net::{
     ControlPlane, FsPayloadStore, LoopbackGossip, PayloadStat, PayloadStore, SwarmNetError,
 };
-use daemon_swarm_observe::{digest_tally, DesyncVerdict};
+use daemon_swarm_observe::{
+    digest_tally, logged_round_records, replay_capture, DesyncVerdict, MessageLog, ObserveError,
+    RunCapture, RunHealth,
+};
 use daemon_swarm_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_swarm_proto::messages::{RecordEntry, RoundRecord};
 use daemon_swarm_proto::{
@@ -286,6 +289,9 @@ pub struct SwarmRun {
     pub run: RunId,
     /// The committed set per round, captured from the coordinator's `RoundRecord`s.
     pub records: BTreeMap<RoundId, Vec<RecordEntry>>,
+    /// The node-visible signed-message log (every verified `SignedMessage` seen on the control
+    /// plane, arrival order) — the `daemon-swarm-observe` audit artifact `--observe` writes.
+    pub message_log: MessageLog,
 }
 
 impl SwarmRun {
@@ -386,6 +392,135 @@ impl SwarmRun {
             .map(|r| r.dropped().clone())
             .unwrap_or_default()
     }
+
+    /// The observe [`RunCapture`] for this run (the coordinator's reproducible `tick` driver trace),
+    /// if a coordinator replay was captured. Feeds [`daemon_swarm_observe::replay_capture`].
+    #[must_use]
+    pub fn run_capture(&self) -> Option<RunCapture> {
+        self.replay
+            .as_ref()
+            .map(|r| RunCapture::new(r.initial_state().clone(), r.inputs().to_vec()))
+    }
+
+    /// Write the `daemon-swarm-observe` artifacts for this run into `dir` (the `--observe <dir>`
+    /// gate-ceremony instrumentation): `<run_id>.dsmlog` (the node-visible [`MessageLog`]) and, if a
+    /// coordinator replay was captured, `<run_id>.dsmcap` (the [`RunCapture`] `swarm-replay` verifies).
+    ///
+    /// # Errors
+    ///
+    /// [`ObserveError`] on a directory-create / file-write / codec failure.
+    // Plain local-fs writes to an **operator-supplied** gate-ceremony directory (not an
+    // attacker-influenced path); the `harness` feature makes this dev/gate-only. The clippy fs ban
+    // targets attacker-influenced paths (routed through `ContainedRoot`); network stays separately
+    // locked (disallowed-TYPES), so this narrow fs escape cannot re-open anything else.
+    #[allow(clippy::disallowed_methods)]
+    pub fn write_observe(&self, dir: &std::path::Path) -> Result<(), ObserveError> {
+        std::fs::create_dir_all(dir).map_err(|e| ObserveError::Store(e.to_string()))?;
+        let base = self.run.as_str();
+        let mut log_file = std::fs::File::create(dir.join(format!("{base}.dsmlog")))
+            .map_err(|e| ObserveError::Store(e.to_string()))?;
+        self.message_log.write_to(&mut log_file)?;
+        if let Some(capture) = self.run_capture() {
+            let mut cap_file = std::fs::File::create(dir.join(format!("{base}.dsmcap")))
+                .map_err(|e| ObserveError::Store(e.to_string()))?;
+            capture.write_to(&mut cap_file)?;
+        }
+        Ok(())
+    }
+}
+
+/// The verdict of a [`verify_observe_dir`] replay: the run re-derived from its recorded artifacts.
+#[derive(Clone, Debug)]
+pub struct ObserveVerify {
+    /// The run id read from the recorded log.
+    pub run_id: String,
+    /// How many recorded `RoundRecord`s re-derived byte-identically (the digest-equality count).
+    pub rounds_verified: u64,
+    /// How many `RoundRecord`s the wire log carried (the oracle count `rounds_verified` must match).
+    pub logged_records: usize,
+    /// The run-health projection distilled from the recorded message log.
+    pub health: RunHealth,
+}
+
+impl ObserveVerify {
+    /// Whether every logged round record re-derived (full digest-equality over the run).
+    #[must_use]
+    pub fn all_verified(&self) -> bool {
+        self.rounds_verified as usize == self.logged_records && self.logged_records > 0
+    }
+}
+
+/// Replay + verify the `daemon-swarm-observe` artifacts written by [`SwarmRun::write_observe`] into
+/// `dir` (the `swarm-replay` entry point): re-run the pure coordinator `tick` from the recorded
+/// [`RunCapture`] and assert its `RoundRecord`s re-derive byte-identically against the independent
+/// wire [`MessageLog`] (§6.4 I1 / PROTO-20). Also projects [`RunHealth`] from the log.
+///
+/// # Errors
+///
+/// [`SwarmRunError::Lifecycle`] if the artifacts are missing/corrupt, or if the replay diverges
+/// (the first divergent round is included in the message).
+// Reads back the artifacts `write_observe` wrote to an operator-supplied gate directory (same
+// dev/gate-only, not-attacker-influenced rationale as `write_observe`).
+#[allow(clippy::disallowed_methods)]
+pub fn verify_observe_dir(dir: &std::path::Path) -> Result<ObserveVerify, SwarmRunError> {
+    let mut cap_path = None;
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| SwarmRunError::Lifecycle(format!("observe dir {}: {e}", dir.display())))?
+    {
+        let path = entry
+            .map_err(|e| SwarmRunError::Lifecycle(format!("observe dir entry: {e}")))?
+            .path();
+        if path.extension().is_some_and(|e| e == "dsmcap") {
+            cap_path = Some(path);
+            break;
+        }
+    }
+    let cap_path = cap_path.ok_or_else(|| {
+        SwarmRunError::Lifecycle(format!("no .dsmcap capture in {}", dir.display()))
+    })?;
+    let log_path = cap_path.with_extension("dsmlog");
+
+    let mut cap_file = std::fs::File::open(&cap_path)
+        .map_err(|e| SwarmRunError::Lifecycle(format!("open {}: {e}", cap_path.display())))?;
+    let capture = RunCapture::read_from(&mut cap_file)
+        .map_err(|e| SwarmRunError::Lifecycle(format!("read capture: {e}")))?;
+    let mut log_file = std::fs::File::open(&log_path)
+        .map_err(|e| SwarmRunError::Lifecycle(format!("open {}: {e}", log_path.display())))?;
+    let log = MessageLog::read_from(&mut log_file)
+        .map_err(|e| SwarmRunError::Lifecycle(format!("read log: {e}")))?;
+
+    let logged_records = logged_round_records(&log);
+    let health = RunHealth::from_log(&log);
+    let report = replay_capture(capture, &log)
+        .map_err(|e| SwarmRunError::Lifecycle(format!("replay diverged: {e}")))?;
+    Ok(ObserveVerify {
+        run_id: log.run_id().to_string(),
+        rounds_verified: report.rounds_verified,
+        logged_records,
+        health,
+    })
+}
+
+/// Spawn the observe message-log collector: subscribe to `control` and append every verified
+/// `SignedMessage` to the shared [`MessageLog`] in arrival order (the `--observe` capture). Generic
+/// over the control plane so both the loopback and live (iroh) harnesses reuse it.
+pub(crate) fn spawn_message_log<C: ControlPlane>(
+    control: &Arc<C>,
+    version: SwarmProtoVersion,
+    log: Arc<std::sync::Mutex<MessageLog>>,
+) -> JoinHandle<()> {
+    let mut sub = control.subscribe();
+    tokio::spawn(async move {
+        while let Some(bytes) = sub.recv().await {
+            let Ok(msg) = from_canonical_slice::<SignedMessage>(&bytes) else {
+                continue;
+            };
+            if msg.verify_for_run(version).is_err() {
+                continue;
+            }
+            log.lock().expect("observe log lock").append(msg);
+        }
+    })
 }
 
 /// A deterministic per-peer node identity key (index `i`).
@@ -558,6 +693,11 @@ where
         Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let rec_handle = spawn_record_collector(&gossip, version, records.clone());
 
+    // The observe message-log collector: capture every verified signed message (arrival order) into
+    // a shared `MessageLog` — the `--observe` audit artifact + the `swarm-replay` oracle source.
+    let obs_log = Arc::new(std::sync::Mutex::new(MessageLog::new(run.as_str())));
+    let obs_handle = spawn_message_log(&gossip, version, obs_log.clone());
+
     // The real coordinator tick loop (subscribes at construction, before it opens round 0).
     let coord_cfg = LocalCoordinatorConfig {
         run: run.clone(),
@@ -662,11 +802,13 @@ where
         h.abort();
     }
     rec_handle.abort();
+    obs_handle.abort();
     while let Ok((peer, ev)) = col_rx.try_recv() {
         events.push((peer, ev));
     }
 
     let records = records.lock().expect("records lock").clone();
+    let message_log = obs_log.lock().expect("observe log lock").clone();
 
     Ok(SwarmRun {
         roster: boot_roster,
@@ -675,6 +817,7 @@ where
         store: fs,
         run,
         records,
+        message_log,
     })
 }
 

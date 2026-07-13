@@ -29,7 +29,9 @@ use daemon_swarm_run::backend::{
     TrainerBackend,
 };
 use daemon_swarm_run::engine::EngineEvent;
-use daemon_swarm_run::harness::{peer_key, LateJoin, SilentDeath, StallFault, SwarmConfig};
+use daemon_swarm_run::harness::{
+    peer_key, verify_observe_dir, LateJoin, SilentDeath, StallFault, SwarmConfig,
+};
 use daemon_swarm_run::live_harness::{run_live_swarm, run_live_swarm_with, LiveSwarmConfig};
 use daemon_swarm_run::seam::RoundId;
 use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig, WasmBackendError};
@@ -77,6 +79,45 @@ async fn live_flagship_three_peers_ten_rounds_all_agree() {
     assert!(
         replay.verify(),
         "the live-run tick trajectory replays byte-identically"
+    );
+}
+
+// ---- B2: observe record + replay over the real plane (--observe / swarm-replay) -----------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_observe_record_and_replay_green() {
+    // Record a live-transport run (3 peers, real iroh mesh) with observe: the coordinator's node
+    // captures every signed message into the log + the tick driver capture. Then re-derive it offline
+    // via `verify_observe_dir` (what `swarm-replay <dir>` runs) and assert every wire-recorded round
+    // record re-derives byte-identically — the gate-ceremony record+replay over the live plane.
+    let cfg = LiveSwarmConfig::new(SwarmConfig {
+        num_peers: 3,
+        num_rounds: 8,
+        ..SwarmConfig::small(8)
+    });
+    let run = run_live_swarm(cfg).await.expect("live observe run");
+    assert_all_agree(&run);
+
+    let dir = std::env::temp_dir().join(format!(
+        "daemon-swarm-observe-live-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    run.write_observe(&dir).expect("write observe artifacts");
+
+    let report = verify_observe_dir(&dir).expect("live recorded run must re-derive");
+    assert!(
+        report.all_verified(),
+        "all live round records re-derive ({}/{})",
+        report.rounds_verified,
+        report.logged_records
+    );
+    assert_eq!(report.rounds_verified, 8, "8 live rounds re-derived");
+    assert!(
+        report.health.rounds.iter().all(|r| r.finalized),
+        "every live round finalized in the health projection"
     );
 }
 
