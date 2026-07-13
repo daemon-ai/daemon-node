@@ -184,6 +184,130 @@ Workspace `/home/j/experiments/daemon-cloud/daemon-api`.
 
 ## Wave-0 scaffold record
 
-_(This section is appended by the integration owner as the scaffold work lands: resolved dep pins,
-deny.toml changes, flake.nix changes, worker module layout, `EgressClient::put` signature, and any
-feature-combo build notes for the Wave-1 lanes. See the commit list on the trunk.)_
+Landed on `integrations/swarm-p1` (base `e2e08c3`). Commit list (oldest → newest):
+
+| Commit | Subject |
+|---|---|
+| `mirror(P1-prog): ledger` | this ledger (base sha, lanes, frozen rules, determinism story, reference packs) |
+| `build(deps): burn wgpu/ndarray backend lanes as opt-in daemon-train features` | burn feature plumbing |
+| `build(deps): iroh transport stack behind daemon-swarm-net `iroh` feature` | iroh pins + feature gate |
+| `build(nix): swarm transport + wgpu GPU training lanes` | iroh-relay tool + wasm-capable vulkan shell |
+| `refactor(train): split daemon-train-worker into main/backend/transport modules` | worker module split |
+| `feat(egress): EgressClient::put for presigned R2/S3 uploads` | additive egress method |
+
+### Resolved dependency pins
+
+- **burn** (root `[workspace.dependencies]`): unchanged requirement `burn = { version = "0.21",
+  default-features = false, features = ["std", "ndarray", "autodiff"] }` (resolves burn 0.21.0). GPU
+  is opt-in via `daemon-train`'s own cargo features (`crates/coprocessor/daemon-train/Cargo.toml`):
+  - `cpu` (default) — current CPU/det-lane behavior, no extra deps.
+  - `burn-ndarray = ["burn/ndarray"]` — the G1 native lane (ndarray+autodiff; ndarray is already on
+    via the root dep, so this is a no-op-safe CI alias).
+  - `wgpu = ["burn/wgpu"]` — the G2 GPU lane: burn 0.21 `wgpu` feature → burn-wgpu 0.21.0 + cubecl
+    0.10.0 + wgpu 29.0.4, Vulkan/RADV at runtime. Verified `cargo check -p daemon-train`,
+    `--features burn-ndarray`, `--features wgpu` all compile (wgpu needs **no** extra build-time
+    system deps; runtime needs `libvulkan` — present on the default + `.#vulkan` devShell
+    `LD_LIBRARY_PATH`). burn's `vulkan`/`metal`/`webgpu` features layer on top of `wgpu` if G2 wants a
+    backend-locked build.
+- **iroh** (root `[workspace.dependencies]`): `iroh = "1"` (1.0.2), `iroh-gossip = "0.101"`
+  (0.101.0), `iroh-relay = "1"` (1.0.2). Gated behind `daemon-swarm-net`'s `iroh` feature
+  (`dep:iroh`, `dep:iroh-gossip`, `dep:iroh-relay`). **NO iroh-blobs** (P4). Verified
+  `cargo check -p daemon-swarm-net` (no iroh) and `--features iroh` both pass; `cargo tree` shows
+  zero iroh crates on the default graph.
+  - **PIN DEVIATION from the plan's "iroh 0.97" (integration owner's call, Risk 4):** iroh-base
+    0.97/0.98 pull a pre-release crypto stack pinned to `sha2 =0.11.0-rc.{2,5}`, which is in the same
+    0.11 semver-compat range as — and disjoint from — the **stable** `sha2 0.11.0` that
+    `slack-morphism 2.22` (daemon-slack) already locks (`^0.11`). No single sha2 0.11.x satisfies
+    both requirements, so **iroh 0.97/0.98 are unresolvable against the existing frozen tree**. iroh
+    **1.0 dropped the sha2 dependency entirely**, resolving cleanly. iroh-gossip has no 1.0 tag; its
+    0.101.0 targets `iroh ^1` (the matching release). Practical impact for **B2**: port the Psyche
+    0.97 gossip patterns (reference pack) to the iroh **1.0** API and record the deltas — the
+    endpoint / `Gossip::builder` / `Router` / relay shapes are largely stable across 0.97→1.0, but a
+    few module paths / signatures moved. iroh-base 1.0 uses `ed25519-dalek =3.0.0-rc.0` /
+    `curve25519-dalek =5.0.0-rc.0` (distinct major ranges from our stable `ed25519-dalek 2`, so they
+    coexist; `--features iroh` also pulls a second `reqwest 0.13` — a duplicate-version *warning*
+    only, allowed by `bans.multiple-versions = "warn"`).
+
+### deny.toml — no change needed
+
+`cargo deny check` is **fully green** with both new trees in `Cargo.lock` (advisories ok, bans ok,
+licenses ok, sources ok). The iroh 1.0 + burn-wgpu/cubecl/wgpu trees introduced **no** new advisory,
+license, or source findings — their crates are MIT/Apache/BSD (already allow-listed) and carry no
+unmaintained-status advisory that is not already ignored. The `bans.multiple-versions = "warn"`
+duplicates (rand, reqwest 0.12/0.13, tungstenite, …) are warnings, not gate failures. No documented
+ignore was added (none warranted).
+
+### flake.nix changes
+
+- **Default devShell**: `iroh-relay` binary added to `packages` for B2's self-hosted relay (spec
+  §7.4), pulled from the pinned nixpkgs when present (the `logos-co/nixpkgs/mingw-integration` fork
+  ships **iroh-relay 1.0.0** — verified on PATH) and skipped gracefully via
+  `lib.optionals (pkgs ? iroh-relay)` otherwise. **Fallback if a future nixpkgs bump drops it:**
+  `cargo install --locked iroh-relay@1` into `.dev/` (a runtime tool only; the relay speaks the
+  cross-1.0.x relay protocol, so the 1.0.0 tool ↔ 1.0.2 lib pin is fine).
+- **`.#vulkan` devShell**: switched `craneLib` → `craneLibDev` so the wasm32-unknown-unknown rust-std
+  is on the toolchain — this is now the **burn-wgpu GPU training test lane** (G2): the existing
+  `vulkan-loader` on `LD_LIBRARY_PATH` resolves the RADV ICD for
+  `cargo test -p daemon-train --features wgpu`, and the daemon-train guest-lifecycle tests can build
+  the wasm guests (the host-only toolchain could not). `vulkan-headers`/`vulkan-loader`/`shaderc`
+  were already present.
+- No new package **output** for a `daemon-train-vulkan` compile lane this wave (G2 adds it in Wave 2,
+  mirroring the `daemon-infer-vulkan` pattern ~`flake.nix:418`) — kept out of Wave-0 scope per the
+  "don't sink hours into nix packaging" guidance; the devShell path above already gives G2 a runnable
+  wgpu test lane.
+
+### Worker binary module layout (`daemon-train-worker`)
+
+`crates/coprocessor/daemon-train/src/bin/daemon-train-worker/` (bin `path` → `main.rs`):
+
+- `main.rs` — `#[tokio::main]` command-dispatch loop; crate-level `#![allow(clippy::disallowed_methods)]`
+  + `#![forbid(unsafe_code)]` (inherited by the submodules); shared `send`/`worker_error` helpers +
+  the `SEQS`/`SEQ` micro-batch shape.
+- `backend.rs` — **G2 owns.** `Probe` (`hardware`/`host_capabilities`/`host_ops`), the `AssessRun`
+  envelope→`(config, module)` resolution (`ResolvedRun`, `resolve_run`, `resolve_module`,
+  `module_from_env`), and the meta-mode `assess`. G2 grows real GPU `Hardware` numbers + VRAM
+  autotune here.
+- `transport.rs` — **B3 owns.** The `JoinRun` handler `join_and_run_round` (today the self-driven
+  round loop; B3 replaces it with a live `JoinRun.coordinator` attach over `IrohGossip` + `R2Store`).
+
+Pure mechanical split — behavior identical; all daemon-train tests green incl. the 4 `worker_protocol`
+integration tests.
+
+### `EgressClient::put` signature (for B1)
+
+```rust
+// crates/engine/daemon-egress/src/lib.rs
+impl EgressRequest {
+    pub fn put(url: impl Into<String>, body: Vec<u8>) -> Self;   // raw-body PUT, no forced Content-Type
+}
+impl EgressClient {
+    pub async fn put(&self, url: &str, body: Vec<u8>, redirects: Redirects)
+        -> Result<reqwest::Response, EgressError>;
+}
+```
+
+- **No `Content-Type` is forced** — a presigned URL only signs the headers it was minted with, so
+  forcing an unsigned `Content-Type` would break SigV4. For a content-type-signed presign, build via
+  `EgressRequest::put(url, body).header("content-type", ct)` and call `EgressClient::execute`.
+- **`redirects` is surfaced per-call** (house style, like `get`): presigned uploads normally pass
+  `Redirects::None`. SSRF posture matches `get`: the initial URL is not re-checked (caller
+  pre-flight), redirect hops are re-validated with `check_url` (a `307`/`308` into private/metadata
+  space is rejected mid-chain — tested).
+
+### Wave-1 lanes — what to know beyond the ledger
+
+- **G1** (`--features burn-ndarray`): the lane is enabled and compiles today; `burn/ndarray` is
+  already on the root dep so the feature is effectively a CI alias. Build `BurnBackend` behind the
+  frozen `OpBackend` seam; the cross-backend det-digest equality test (CpuBackend vs
+  BurnBackend(ndarray)) is the determinism tripwire (see Determinism story). The worker `backend`
+  module is pre-split for you (G2 extends it in Wave 2; G1 stays in `daemon-train` src).
+- **W1**: no scaffold blockers — `SwarmApi` + `swarm.db` + config embed are yours; do NOT bump
+  WireVersion in-lane (Merge 1 does 39→40 once).
+- **B1**: `EgressClient::put` is ready (signature above). The `daemon-swarm-net` `iroh` feature is
+  off by default, so your `r2_store.rs`/`presign.rs`/`artifact.rs`/`fetch.rs` build on the default
+  (no-iroh) gate; wire outbound HTTP through `daemon_egress::EgressClient` (raw `reqwest` is
+  clippy-banned). Port the Psyche download-scheduler DIRECT tests onto the retry layer.
+- **All lanes**: the frozen files (root `Cargo.toml`, `deny.toml`, `flake.nix`) are locked — route
+  any new third-party dep or feature-of-a-workspace-dep-that-needs-a-root-change through the
+  integration owner. Adding a *feature* of an already-declared workspace dep from your own crate's
+  `Cargo.toml` (e.g. `iroh-relay/server`) is a lane-owned edit.
