@@ -137,8 +137,84 @@ the gap).
 5. `mirror(M2): P1 exit-gate evidence — parity deltas, tokens/s, loss series` — the throughput doc +
    this ledger's Evidence section, filled from the one-shot session runs.
 
-## Evidence — HEAD `TBD` (filled after the session runs)
+## Final — base `2f1ce1f`, branch `swarm/m2`
 
-_(per-step loss deltas, final-weight max delta + tolerance class, tokens/s table tabi-vs-reference on
-cpu/wgpu, the 160M loss series, and the byte-identical cpu-vs-wgpu det-digest check are recorded here
-and in `swarm-p1-throughput.md` after the one-shot P1 runs.)_
+### Commit list (oldest → newest)
+
+| Commit | Subject |
+|---|---|
+| `mirror(M2): land UMA platform findings from Merge-2 investigation` | housekeeping (the two UMA docs) |
+| `mirror(M2): ledger` | this file |
+| `test(train): burn reference-parity harness + reduced always-on parity (green)` | harness + reduced ndarray + throughput probe + dev-dep |
+| `test(train): 160M reference parity + throughput gate tests (green)` | 160M wgpu parity + throughput + loss-curve |
+| `mirror(M2): P1 exit-gate evidence — parity deltas, tokens/s, loss series` | throughput doc + this Evidence section |
+
+### Parity evidence (P1 gate — "loss within tolerance of a reference run") ✅
+
+Tolerance bound: **`Optimizer` class** `rtol 2e-4 / atol 2e-5`. **Achieved fidelity is ~3 orders of
+magnitude tighter** — the tabi (module) path is numerically transparent vs the independent burn
+reference (matched init, identical TinyStories batches):
+
+| Run | Backend | Steps | max per-step \|Δloss\| | final-weight max Δ | loss first→last |
+|---|---|---:|---:|---:|---|
+| reduced 2-layer (always-on) | ndarray CPU | 8 | 4.77e-7 | 2.29e-7 | 4.169 → 3.904 |
+| medium d256/L4/seq128 (TinyStories, `#[ignore]`) | ndarray CPU | 20 | 4.77e-7 | 5.96e-7 | 10.838 → 7.055 |
+| **160M preset (TinyStories, `#[ignore]`)** | **wgpu RADV** | **4** | **0.000 (bit-identical)** | **4.77e-7** | **10.846 → 8.986** |
+
+The 160M wgpu run is **bit-identical loss step-for-step**; the ndarray deltas are at the f32
+round-off floor (≤ 1 ULP at loss ≈ 10). The `Optimizer` tolerance is never approached.
+
+### Throughput (tokens/s, tabi vs reference)
+
+| Path | Backend | Config | step time | tokens/s | tabi/reference |
+|---|---|---|---|---:|---:|
+| tabi / reference | ndarray CPU | reduced (b2,seq9) | 0.731 / 0.443 s (8) | 175.0 / 288.9 | **1.65×** |
+| tabi / reference | ndarray CPU | medium (b2,seq128) | 30.21 / 14.73 s (8) | 67.3 / 137.9 | **2.05×** |
+| **tabi / reference** | **wgpu RADV** | **160M (b1,seq1024)** | **3.728±0.082 / 1.597±0.022 s** | **274.4 / 640.6** | **2.33×** |
+
+**Overhead accounting (honest):** the 2.33× is **not** the wasm ABI dispatch (spec §15.1's "<1%" is
+correct — sub-µs host calls vs multi-second kernels). It is the **`BurnBackend` per-op host-copy tax**
+— `insert_result` calls `to_vec_f32`/`to_data` after every op (`burn_backend.rs` module docs: "a 2×
+host copy, chosen for a clean `view` and numerical fidelity over speed this wave"), which forces a
+device→host readback + queue flush per op on wgpu and serializes the GPU pipeline. It scales with
+ops/step (1.65×→2.05× CPU, 2.33× GPU), consistent with a per-op copy, not a per-call dispatch. **P1
+requires tokens/s be measured + reported — done; the fix (a lazy host-copy-free `OpBackend`) is a
+P2/perf follow-on**, not P1 scope. Full detail: `swarm-p1-throughput.md`.
+
+### Loss-curve evidence run (160M, wgpu, ≥2 full rounds)
+
+`loss_curve_160m_wgpu`: 2 rounds × 30 inner AdamW steps + `make_update` + self-`ingest`, b=1
+TinyStories, `build 3.0 s`. Round 0: 30 steps 107.4 s (~3.6 s/step), make_update+ingest 6.8 s →
+12,463,354 B `sparse_loco` payload, inner loss **10.846 → 4.928**. Round 1: 119.5 s + 7.9 s, inner
+loss **10.605 → 4.948** (the round boundary re-ascent is the expected DiLoCo-family dynamic — the
+1/64-density 2-bit outer update is deliberately lossy for a single self-peer). Full 60-step series in
+`swarm-p1-throughput.md`. The byte-identical **cpu-vs-wgpu det-lane digest** invariant is covered by
+the G2 `wasm_backend_determinism.rs::cross_backend_wgpu` tests (the det lane never runs on the GPU).
+
+### Frozen-file need? NO. Deviations / Merge-3 must-know
+
+- **No frozen-file edit** (root `Cargo.toml`/`deny.toml`/`flake.nix` untouched); the one manifest
+  edit is a **dev-dep** on `daemon-train-safetensors`, an *already-declared* `[workspace.dependencies]`
+  entry (Merge 2) — a lane-owned change, no `cargo deny` impact. No `daemon-train/src/*` edit (the
+  harness drives the tabi path through the already-public `Instance`/`WasmBackend` surface). **No
+  integration-owner ledger note required.**
+- **`llama-burn` was NOT added** — the reference is built directly on burn (spec §5.1/§15.3 sanction
+  this; avoids a frozen `Cargo.toml` edit + a large model-zoo tree). This is the stronger independent
+  reference and the P1-gate reading.
+- **ndarray parity is at a medium config (not 160M)**: a 160M fp32 execute pass on CPU is
+  impractically slow (Risk 3) — which is *why* 160M needs a GPU. The ndarray lane proves many-step
+  (20) curve tracking cheaply; **the full-160M parity + loss-curve run is on wgpu** (≥4 parity steps
+  + 2 full rounds), where the gate model belongs. Both use real TinyStories tokens.
+- **`tabi@1` unspent by M2** (matches M1): the harness adds no host op / no `TABI_IMPORTS` /
+  `phase.rs` change. The additive window closes at Merge 3 (spec §16) — nothing here blocks the freeze.
+- **Merge 3 re-verify:** `nix develop .#vulkan --command cargo test -p daemon-train --features wgpu
+  --release --test reference_parity_wgpu -- --ignored --nocapture --test-threads=1` (the P1 gate);
+  the always-on `reference_parity_reduced_ndarray` rides the normal `--features burn-ndarray` suite.
+  Known flake outside swarm: the `daemon-conformance` detached-delegation trio (pass-in-isolation).
+
+## Seams exported (freeze at Merge 3) — as-built
+
+Unchanged from the "Seams M2 exports" section above; the as-built shapes are in
+`tests/reference/mod.rs` (`RefLlama::{from_state_dict,step,state_dict}`, `drive_tabi`,
+`drive_reference`, `TokenBatch::{deterministic,tinystories,truncate_seq}`, `assert_parity →
+ParityReport`, `throughput_stats`) and the `swarm-p1-throughput.md` table format.
