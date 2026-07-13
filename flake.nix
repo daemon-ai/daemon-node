@@ -955,6 +955,21 @@
             LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.vulkan-loader}/lib:${pkgs.gcc.cc.lib}/lib";
             SSL_CERT_FILE = caBundle;
             NIX_SSL_CERT_FILE = caBundle;
+            # Pin cargo's build dir to the CHECKOUT's own target/, overriding any ambient
+            # CARGO_TARGET_DIR pointing into a temp dir. Agent/tool sandboxes (e.g. Cursor's shell)
+            # export CARGO_TARGET_DIR=/tmp/**/cursor-sandbox-cache/<per-session-hash>/cargo-target,
+            # which silently defeats ALL incremental reuse: every invocation cold-builds the whole
+            # ~50-crate workspace (observed: repeated full rebuilds saturating every core until the
+            # host thrashed into swap, plus ~68 GB of dead artifacts in /tmp). A repo-local target/
+            # keeps builds warm across shells, sessions, and worktrees. A deliberate NON-tmp
+            # override still wins (kept for e.g. shared-cache setups).
+            shellHook = ''
+              case "''${CARGO_TARGET_DIR:-}" in
+                ""|/tmp/*|"''${TMPDIR:-/nonexistent}"/*)
+                  export CARGO_TARGET_DIR="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")/target"
+                  ;;
+              esac
+            '';
             packages =
               [
                 rustToolchainDev
