@@ -8,6 +8,14 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# The local-mode swarm runner (B3): drives the round protocol over a selectable transport
+# (loopback | real iroh mesh) + a filesystem store. Needs `iroh` (which pulls in `harness`), so the
+# default participant build never compiles it.
+[[bin]]
+name = "swarm-local"
+path = "src/bin/swarm-local.rs"
+required-features = ["iroh"]
+
 [features]
 # `harness` exposes the in-process multi-peer test harness + the real `daemon-swarm-coordinator`
 # pure `tick` loop driver (the impure shell that signs/publishes the coordinator's unsigned
