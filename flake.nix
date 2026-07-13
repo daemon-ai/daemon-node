@@ -975,7 +975,15 @@
                 pkgs.python3 # execute_code tool: the child interpreter for its subprocess tests
                 pkgs.bubblewrap # execute_code tool: the OS sandbox (bwrap); tests guard on usability
               ]
-              ++ engineNativeInputs;
+              ++ engineNativeInputs
+              # Swarm transport lane (spec §7.4): the self-hosted `iroh-relay` binary B2 stands up
+              # locally for the gossip control plane (relay URLs are pinned in the envelope). Added
+              # from the pinned nixpkgs when it provides the package (flake-native), and skipped
+              # gracefully otherwise so the devShell still evaluates — the documented fallback is
+              # `cargo install --locked iroh-relay@1` into `.dev/` (see swarm-p1-ledger.md). NOTE the
+              # relay is a runtime tool only; the iroh Rust deps are gated behind `daemon-swarm-net`'s
+              # `iroh` feature and never enter the default build.
+              ++ lib.optionals (pkgs ? iroh-relay) [ pkgs.iroh-relay ];
           };
         in
         {
@@ -1078,7 +1086,7 @@
         # (`cargo build -p daemon-infer --features cuda` / `--features vulkan`). Linux-only; the CUDA
         # shell needs an unfree-permitting nixpkgs, so it is built lazily and only on Linux.
         // lib.optionalAttrs pkgs.stdenv.isLinux {
-          vulkan = craneLib.devShell {
+          vulkan = craneLibDev.devShell {
             LIBCLANG_PATH = libclangPath;
             # Same CPU+Vulkan prebuilt as the default shell, so `cargo build -p daemon-infer
             # --features llama,dynamic-link` links a Vulkan-capable llama.cpp and skips cmake.
@@ -1086,13 +1094,19 @@
             # Vulkan loader (`libvulkan.so` -> RADV ICD under `/run/opengl-driver`), and libgomp at
             # runtime. The Vulkan SDK pieces on `packages` also let a from-source `--features vulkan`
             # build work here (it just recompiles llama.cpp via the crate's cmake path).
+            #
+            # This is ALSO the swarm burn-wgpu GPU training test lane (spec §10.1; G2, Wave 2): the
+            # Vulkan loader above resolves the RADV ICD for `cargo test -p daemon-train --features
+            # wgpu` (burn-wgpu -> cubecl -> wgpu 29 over Vulkan). It uses `craneLibDev` (not
+            # `craneLib`) so the wasm32-unknown-unknown rust-std is on the toolchain — the daemon-train
+            # guest-lifecycle tests build the wasm guests, which the host-only toolchain cannot do.
             LLAMA_PREBUILT_DIR = "${llamaCpp}";
             LLAMA_PREBUILT_SHARED = "1";
             LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.vulkan-loader}/lib:${pkgs.gcc.cc.lib}/lib";
             SSL_CERT_FILE = caBundle;
             NIX_SSL_CERT_FILE = caBundle;
             packages =
-              [ rustToolchain pkgs.rust-cbindgen ]
+              [ rustToolchainDev pkgs.rust-cbindgen ]
               ++ engineNativeInputs
               ++ [ pkgs.vulkan-headers pkgs.vulkan-loader pkgs.shaderc ];
           };
