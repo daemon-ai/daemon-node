@@ -399,11 +399,24 @@ fn to_ws_auth(spec: &daemon_swarm_run::protocol::WsAuthSpec) -> WsAuth {
     }
 }
 
+/// The host engine profile for the live worker's `WasmBackend`, with the backend/GPU chosen by the
+/// worker probe (§10.5 verdict path; swarm-ledger-p3-g D4): the CPU det lane by default, or the CUDA
+/// native lane when the `cuda` feature + a device are present. The det lane stays host fp32 on either
+/// backend, so a CUDA peer's per-round digests remain byte-identical to CPU peers (consensus-invariant).
+fn worker_engine_config() -> WasmEngineConfig {
+    let (backend, gpu_index) = crate::backend::select_backend();
+    WasmEngineConfig {
+        backend,
+        gpu_index,
+        ..WasmEngineConfig::default()
+    }
+}
+
 /// Build + `da_build` a fresh [`WasmBackend`] (also the OOM-churn rebuild).
 fn build_wasm_backend(module: &[u8], config: &[u8]) -> Result<WasmBackend, String> {
     let mut backend = WasmBackend::new(WasmBackendConfig {
         wasm: module.to_vec(),
-        engine: WasmEngineConfig::default(),
+        engine: worker_engine_config(),
     })
     .map_err(|e| e.to_string())?;
     backend.build(config).map_err(|e| e.to_string())?;
@@ -504,7 +517,7 @@ impl TrainerBackend for LadderBackend {
                 });
                 let mut fresh = WasmBackend::new(WasmBackendConfig {
                     wasm: self.module.clone(),
-                    engine: WasmEngineConfig::default(),
+                    engine: worker_engine_config(),
                 })?;
                 fresh.build(&self.config)?;
                 let stats = fresh.train_step(batch, ctx)?;

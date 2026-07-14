@@ -4949,6 +4949,7 @@ dependencies = [
  "blake3",
  "burn",
  "ciborium",
+ "cudarc 0.19.8",
  "daemon-common",
  "daemon-egress",
  "daemon-provision",
