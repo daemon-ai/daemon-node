@@ -264,6 +264,14 @@ fn guest_dir() -> PathBuf {
 static BUILD: Once = Once::new();
 
 fn ensure_built() -> PathBuf {
+    // Operator-supplied prebuilt worker (P3 Merge-2): the 160M ceremony spawns a RELEASE local
+    // worker (debug cubecl at 160M is slow + memory-hungry); the harness itself stays a debug test
+    // binary. When set, skip the cargo build entirely and trust the given path.
+    if let Ok(bin) = std::env::var("SWARM_FLEET_LOCAL_BIN") {
+        let bin = PathBuf::from(bin);
+        assert!(bin.exists(), "SWARM_FLEET_LOCAL_BIN at {}", bin.display());
+        return bin;
+    }
     BUILD.call_once(|| {
         // The LOCAL peer's feature set. Default `swarm-net` (the P2 tiny-llama CPU-det path); the P3
         // 160M ceremony sets `SWARM_FLEET_WORKER_FEATURES=swarm-net,wgpu` so the local Strix/RADV peer
