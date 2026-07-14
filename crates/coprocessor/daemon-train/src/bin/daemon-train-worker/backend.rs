@@ -58,8 +58,19 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
     }
 }
 
-/// Resolve the experiment module bytes for a verified envelope: `DAEMON_TRAIN_MODULE` if set
-/// (override), else the envelope's `experiment.module` artifact via the `file://` resolver.
+/// Resolve the experiment module bytes for a verified envelope (P3 lane S — fetch-by-hash):
+///
+/// 1. `DAEMON_TRAIN_MODULE` set → read the local file (the **explicit** dev/test override — the only
+///    remaining local-path path; the P2 pre-staging is gone).
+/// 2. else, resolve the envelope's `experiment.module` artifact by its content hash. Under the
+///    `swarm-net` feature a network URL (`r2://` / `https://` / `hf://`) is fetched from the payload
+///    store via a presigned GET (context from the node-set env, [`store_fetch_context`]) and cached
+///    content-addressed on disk ([`ContentCache`]); a `file://` URL uses the file-only resolver.
+/// 3. default build: `file://` only (network schemes are `SchemeUnsupported`, as before).
+///
+/// Every path blake3-verifies the bytes against the artifact-map hash **before** `assess`/
+/// instantiation ([`ArtifactResolver::fetch`] / [`ContentCache`]), so a tampered module is rejected
+/// before the wasm engine loads it (§6.5, §12).
 async fn resolve_module(frozen: &daemon_swarm_proto::FrozenEnvelope) -> Result<Vec<u8>, String> {
     if let Some(bytes) = module_from_env() {
         return bytes;
@@ -73,10 +84,117 @@ async fn resolve_module(frozen: &daemon_swarm_proto::FrozenEnvelope) -> Result<V
         .get(name)
         .ok_or_else(|| format!("experiment module `{name}` absent from [artifacts]"))?;
     let art = ArtifactRef::new(artifact.url.clone(), artifact.blake3);
+
+    // Content-addressed fetch from the payload store (fleet distribution) — feature-gated because
+    // egress/presign live behind `swarm-net`.
+    #[cfg(feature = "swarm-net")]
+    if !artifact.url.starts_with("file://") {
+        return fetch_artifact_from_store(&art)
+            .await
+            .map_err(|e| format!("fetch module `{name}` ({}) from store: {e}", artifact.url));
+    }
+
     ArtifactResolver::new()
         .fetch(&art)
         .await
         .map_err(|e| format!("resolve module `{name}` ({}): {e}", artifact.url))
+}
+
+/// The presign context the node sets when spawning the worker for a live run (small env strings, NOT
+/// a pre-staged artifact): the coordinator base, run id, auth, and the on-disk cache dir/budget. This
+/// is the fetch-by-hash analogue of `DAEMON_TRAIN_MODULE` — a node-controlled input at assess time.
+#[cfg(feature = "swarm-net")]
+pub(crate) struct StoreFetchContext {
+    pub(crate) presign_base: Option<String>,
+    pub(crate) run_id: String,
+    pub(crate) ws_auth: daemon_swarm_run::protocol::WsAuthSpec,
+    pub(crate) cache_dir: std::path::PathBuf,
+    pub(crate) cache_gb: u32,
+}
+
+#[cfg(feature = "swarm-net")]
+pub(crate) fn store_fetch_context() -> StoreFetchContext {
+    use daemon_swarm_run::protocol::WsAuthSpec;
+    let ws_auth = if let Ok(bearer) = std::env::var("DAEMON_SWARM_BEARER") {
+        WsAuthSpec::Bearer(bearer)
+    } else if let (Ok(org_id), Ok(actor)) = (
+        std::env::var("DAEMON_SWARM_ORG"),
+        std::env::var("DAEMON_SWARM_ACTOR"),
+    ) {
+        WsAuthSpec::Internal { org_id, actor }
+    } else {
+        WsAuthSpec::None
+    };
+    let cache_dir = std::env::var_os("DAEMON_SWARM_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("daemon-swarm-cache"));
+    let cache_gb = std::env::var("DAEMON_SWARM_CACHE_GB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    StoreFetchContext {
+        presign_base: std::env::var("DAEMON_SWARM_PRESIGN_BASE").ok(),
+        run_id: std::env::var("DAEMON_SWARM_RUN_ID").unwrap_or_else(|_| "run-unknown".to_string()),
+        ws_auth,
+        cache_dir,
+        cache_gb,
+    }
+}
+
+/// Build a content-addressed [`daemon_swarm_net::ContentCache`] from the node-set context.
+#[cfg(feature = "swarm-net")]
+pub(crate) fn open_content_cache(
+    ctx: &StoreFetchContext,
+) -> Result<daemon_swarm_net::ContentCache, String> {
+    daemon_swarm_net::ContentCache::open_gb(&ctx.cache_dir, ctx.cache_gb)
+        .map_err(|e| format!("open content cache {}: {e}", ctx.cache_dir.display()))
+}
+
+/// Build an [`ArtifactResolver`] wired for the network schemes from the node-set presign context
+/// (egress for `https`/`hf`; egress + presign for `r2://`).
+#[cfg(feature = "swarm-net")]
+pub(crate) fn store_resolver(ctx: &StoreFetchContext) -> Result<ArtifactResolver, String> {
+    use daemon_swarm_net::{HttpPresignClient, PresignClient, RunId};
+    let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
+        .map_err(|e| format!("egress client: {e}"))?;
+    let mut resolver = ArtifactResolver::with_egress(egress);
+    if let Some(base) = &ctx.presign_base {
+        use daemon_swarm_run::protocol::WsAuthSpec;
+        let presign_egress =
+            daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
+                .map_err(|e| format!("presign egress client: {e}"))?;
+        let presign = match &ctx.ws_auth {
+            WsAuthSpec::None => HttpPresignClient::new(presign_egress, base.clone()),
+            WsAuthSpec::Bearer(t) => {
+                HttpPresignClient::new(presign_egress, base.clone()).with_bearer(t.clone())
+            }
+            WsAuthSpec::Internal { org_id, actor } => {
+                HttpPresignClient::new(presign_egress, base.clone())
+                    .with_internal(org_id.clone(), actor.clone())
+            }
+        };
+        let presign: std::sync::Arc<dyn PresignClient> = std::sync::Arc::new(presign);
+        resolver = resolver.with_presign(presign, RunId::new(&ctx.run_id));
+    }
+    Ok(resolver)
+}
+
+/// Fetch `art` from the payload store (presigned GET), checking the on-disk content cache first and
+/// caching the verified bytes on a miss (P3 lane S — the fleet distribution path).
+#[cfg(feature = "swarm-net")]
+pub(crate) async fn fetch_artifact_from_store(art: &ArtifactRef) -> Result<Vec<u8>, String> {
+    let ctx = store_fetch_context();
+    let cache = open_content_cache(&ctx)?;
+    if let Some(bytes) = cache.get(&art.blake3).await.map_err(|e| e.to_string())? {
+        return Ok(bytes);
+    }
+    let resolver = store_resolver(&ctx)?;
+    let bytes = resolver.fetch(art).await.map_err(|e| e.to_string())?;
+    // Best-effort cache write (a cache failure must not fail a run whose bytes are already verified).
+    if let Err(e) = cache.insert(&art.blake3, &bytes).await {
+        eprintln!("[daemon-train-worker] content cache insert failed (continuing): {e}");
+    }
+    Ok(bytes)
 }
 
 /// The `.wasm` module bytes from `DAEMON_TRAIN_MODULE` (the dev / node-controlled override), if set.
