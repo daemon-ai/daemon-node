@@ -539,3 +539,266 @@ lane touches that crate). Jobs capped at 12 (≤ nproc/2 = 16); one build at a t
   `typos docs/specs` ✓ · guest guard `guest_lifecycle` 9/9 ✓.
 - **Live node↔cloud** (`ws_live_do.rs` against wrangler-dev): 2/2 ✓ (framing byte-for-byte relay +
   round progression) — see the live-check section above.
+
+---
+
+## Merge 2 — integration record
+
+Integration owner (Merge-2 owner) folded **swarm/a3**, **swarm/b2b3**, **swarm/c2** into
+`integrations/swarm-p2`, merged **swarm/deploy-dev** into the daemon-cloud coordination branch
+`swarm/p2-integration`, ran the cross-lane seam checks, drove the full node↔cloud↔worker live loop on
+both **wrangler-dev** and the **real Cloudflare substrate**, rehearsed observe/replay over a live run,
+and adjudicated the six lane-flagged items. Base at merge start: trunk `4e821cd` (Merge 1).
+
+- **Trunk HEAD (daemon-node):** `c8a7f01` (`integrations/swarm-p2`).
+- **Cloud HEAD (daemon-api):** `b13f51d` (`swarm/p2-integration`; master untouched, nothing pushed).
+- **Live substrate:** coordinator `https://daemon-swarm-dev.me-dc6.workers.dev` (redeployed with the
+  merged coordinator — version `95cbb0f1`, was `69c25e30`); iroh relay `http://51.159.120.241:3340`
+  (M1 mini, reachable, `generate_204` → 204).
+
+### Merges (`--no-ff`, ort) + conflict resolutions
+
+| First-parent commit | Subject | Conflicts |
+|---|---|---|
+| `2dc9d6a` | `Merge branch 'swarm/a3' into integrations/swarm-p2` | **none** (disjoint crates) |
+| `6546522` | `Merge branch 'swarm/b2b3' into integrations/swarm-p2` | `guests/guests.blake3` only |
+| `833b112` | `Merge branch 'swarm/c2' into integrations/swarm-p2` | `daemon-train/Cargo.toml` only (`Cargo.lock` auto-merged) |
+| `fe7506f` | `fix(guests): regenerate canonical blake3 manifest on the Merge-2 trunk` | — |
+| `c8a7f01` | `fix(swarm-net,train): install aws-lc-rs CryptoProvider for wss:// + surface live engine errors` | — |
+
+- **a3 → clean.** Zero conflicts (A3's files are disjoint from the trunk; `Cargo.lock` spin bump
+  auto-merged additively).
+- **b2b3 → one conflict (`guests/guests.blake3`).** Expected: B2B3's RUN-10 `Manifest` change
+  recompiles the guest `.wasm`. Resolved by taking b2b3's side, then **regenerating canonically on the
+  merged trunk** (`fe7506f`) — the guest bytes are keyed on the absolute checkout path (Merge-1
+  guest-manifest adjudication), so neither lane's manifest is byte-canonical for the integration
+  worktree. Canonical trunk manifest: `test_abi_basic e2a8780e…`, `tiny_llama 3bf68973…` (guard is
+  warn-and-rebuild; `guest_lifecycle` 9/9 green with no warning on the trunk).
+- **c2 → one conflict (`daemon-train/Cargo.toml`, `[features]`).** A3 added the `swarm-net` feature,
+  C2 added the `cuda` feature; both belong — resolved by keeping **both** feature lines. The worker
+  `main.rs` auto-merged (A3's live-attach + event pump AND C2's `DAEMON_TRAIN_PROBE` early-exit both
+  present); `Cargo.lock` spin bump auto-merged (identical on both lanes — no lock conflict).
+- **cloud (`swarm/deploy-dev`) → clean.** Zero conflicts (deploy-dev touches only `apps/swarm`
+  deploy config: `wrangler.dev.jsonc`, `deploy-dev.sh`, `live-smoke.mjs`, `env.ts` + the 1-line
+  `presign.ts` `SWARM_R2_BUCKET` override, `.gitignore`, `pnpm-lock.yaml`). Merge commit `b13f51d`.
+
+### Cloud gate (Task 2)
+
+- `pnpm -C apps/swarm typecheck` ✓ · `pnpm -C packages/shared typecheck` ✓.
+- `pnpm -C apps/swarm test` — **vitest 38/38** ✓ (incl. declared-RunConfig forwarding + the
+  `coordinator-parity` `dual_shell_parity` trio with the rebuilt wasm).
+- `pnpm -r typecheck` — the **only** failures are the pre-existing `apps/gateway` errors
+  (`proxy.ts`/`streamUsage.ts`/`subscriptions.ts`/`validation.ts`); deploy-dev touches no gateway
+  file, so **not worsened** (matches A3's stashed-baseline verification).
+
+### Cross-lane seam checks (Task 3) — GREEN
+
+- **A3 worker engine × B3 lazy backend** (parity/digest/tolerance on `.#vulkan`, merged trunk):
+  `daemon-train --features wgpu` full suite (**burn_wgpu_parity 18/18** incl. `det_lane_bit_exact` +
+  `compression_natives_bit_exact`, `wgpu_lifecycle 3/3`, `wasm_backend_determinism 12/12`,
+  `worker_protocol 4/4`) — 0 failures. **160M reference-parity** (`reference_parity_wgpu --ignored`,
+  3/3): per-step loss **byte-identical** (|Δ| = 0.000e0, 4 steps), final-weight max Δ = **4.768e-7**
+  (Optimizer rtol 2e-4/atol 2e-5), loss curve converging 10.85→4.93. The B3 lazy device-resident
+  backend holds det-digest exactness after all merges.
+- **B3 RUN-10 screen × A3 JoinCredentials** compose: `assess` suite (4/4 incl.
+  `demo_module_ineligible_on_slow_coordinator` + `screen_round_cadence`) green; the `swarm-net` worker
+  build (which pulls `daemon-swarm-run::assess`) compiles + runs the live loop, so the assess-time
+  cadence screen (§6.5, pre-`JoinRun`) composes with A3's `resolve_join` → `AssessRun` → `JoinRun`
+  credentials path (assess runs before the engine consumes `EngineParams`).
+- **C2 probes × A3 worker** (probe path untouched by A3): `daemon-train --lib autotune` **14/14**;
+  `worker_protocol 4/4` (the frozen self-driven stream). A3 touched only the worker
+  `transport.rs`/`live.rs`/`main.rs`; C2 owns `autotune.rs` + `backend.rs` (additive) + the
+  `DAEMON_TRAIN_PROBE` early-exit — both present in the merged `main.rs`, clippy + suites green.
+
+### The Merge-2 exit criterion (Task 4) — the headline — ALL GREEN
+
+`ws_live_workers.rs` (4 real `daemon-train-worker` subprocesses, `swarm-net` feature, tiny-llama
+guest, object-proxy R2 payloads, declared RunConfig warmup=8s/round=20s/cooldown=1s/gb=16, 8 rounds,
+mid-run kill of worker 3 → coordinator K-absence drop → floor-breach park → supervisor respawn +
+re-assess + rejoin → finish), run on the merged trunk (`c8a7f01`):
+
+| Substrate | Transport | Run id | Wall | Result |
+|---|---|---|---|---|
+| **wrangler-dev** (merged cloud, local) | WS-only | `run-a3-e2e-1783992261` | **127.6 s** | 8 rounds, 3 survivors byte-identical, drop→rejoin(6,7)→finished r8 ✓ |
+| **wrangler-dev** + local `iroh-relay --dev` | WS + iroh | `run-a3-e2e-1783992435` | **131.6 s** | dual-plane `DualPlane(WS,IrohGossip)`, same assertions ✓ |
+| **real Cloudflare** `daemon-swarm-dev` | WS-only | `run-a3-e2e-1783995994` | **131.2 s** | 8 rounds, 3 survivors byte-identical, drop→rejoin(5,6,7)→finished r8 ✓ |
+| **real Cloudflare** + **M1 relay** (WAN) | WS + iroh | `run-a3-e2e-1783996154` | **128.5 s** | dual-plane over WAN, same assertions ✓ |
+
+**Two real bugs the real-substrate rehearsal caught (both fixed) — invisible to the wrangler-dev gate
+because wrangler-dev is plaintext `ws://` and never exercised TLS:**
+
+1. **rustls `CryptoProvider` panic on the first `wss://` dial (`c8a7f01`).** The `swarm-net` worker
+   tree compiles BOTH aws-lc-rs (tree posture — reqwest/`daemon-egress`) and `ring` (via
+   `rustls-platform-verifier`), so rustls 0.23 cannot auto-select a process-default provider and
+   tokio-tungstenite's `ClientConfig::builder()` panicked in every worker (`Could not automatically
+   determine the process-level CryptoProvider`). **Fix:** install the aws-lc-rs provider once
+   (`Once`-guarded) at the top of `ws_client::dial`; `rustls` added to workspace deps + the
+   `daemon-swarm-net` `ws` feature (lock-unchanged — `rustls 0.23.41` already pinned; `deny` green).
+2. **Stale deployed coordinator ignored the declared `global_batch` → data-partition error.** After
+   the TLS fix the workers joined (roster populated, wss handshake OK) but never committed: all four
+   errored at round 0 with `interval of 1 sequences does not divide into 2 steps` /
+   `cannot slice an empty interval`. Root cause pinned precisely: the deployed `daemon-swarm-dev`
+   coordinator predated A3's declared-RunConfig (cloud `316db6e`), so `global_batch` fell back to the
+   `InitConfig` default **1** (`coordinator-wasm/src/lib.rs`, `ic.global_batch.unwrap_or(1)`); a
+   window of 1 sequence split across 4 peers gives 3 empty intervals + one 1-sequence interval — the
+   exact two errors. The engine `run()` error was being swallowed (only stored in the JoinHandle) —
+   `c8a7f01` also **surfaces it** as `Warning{class="engine_error"}` + stderr (the diagnostic that
+   pinned this). **Fix:** redeployed the merged coordinator (declared-RunConfig + object-proxy) to
+   `daemon-swarm-dev` via the sanctioned `deploy-dev.sh` render + `wrangler deploy` (reused the
+   existing KV/R2/HMAC secret — no rotation); version `95cbb0f1`. Confirmed by the two real-substrate
+   green runs above. **This is a dev-substrate fix, not a Cloudflare-behavior issue** — DO
+   hibernation (`acceptWebSocket`/`getWebSockets`) + alarms verified healthy via `wrangler tail`;
+   object-proxy presign PUT/GET/HEAD byte-round-trip verified against real R2.
+
+### Observe composed with a live run (Task 5) — GREEN
+
+`swarm-local --transport iroh --store fs --peers 3 --rounds 8 --relay http://51.159.120.241:3340
+--observe <dir>` — a **live iroh-mesh** run (real gossip over the M1 WAN relay, not loopback), 8
+rounds all-agree, captured `<run>.dsmlog` + `<run>.dsmcap`; then `swarm-replay <dir>` re-derived
+**8/8 round records byte-identically** (`committed=3 attested=3 finalized=true digest_agreed=true`
+every round). The gate-ceremony instrumentation rehearsal holds over a live run. *(Note: the observe
+surface rides the `daemon-swarm-run` harness path — `swarm-local`/`live_transport`; the cloud-DO
+`ws_live_workers` worker loop drives `TrainSupervisor`+`SwarmService` directly and does not yet wire
+`--observe`. Wiring observe into the worker-subprocess loop is a small Wave-3 follow-on.)*
+
+### Adjudications (Task 6)
+
+- **(a) observe file-IO clippy allow vs `ContainedRoot` — ACCEPT the scoped allow.** B2's
+  `#[allow(clippy::disallowed_methods)]` is scoped to `write_observe`/`verify_observe_dir` (plain
+  local-fs on an **operator-supplied** gate directory, `harness`-gated dev/gate tooling). The fs ban
+  targets attacker-influenced paths via `ContainedRoot`; network stays separately locked
+  (disallowed-TYPES). Routing through `ContainedRoot` would add a `daemon_core` dep to
+  `daemon-swarm-run` for **no security gain** on an operator path. **Keep** (same exception the e2e
+  test files already take).
+- **(b) daemon-core `mode_t` one-liner (`c443934`) — REVIEWED, KEEP.**
+  `Mode::from_bits_retain(mode as rustix::fs::RawMode)` in `contained.rs::set_mode_sync`: on Linux
+  `RawMode` is `u32` → the cast is a **no-op**, bit-identical; on darwin `RawMode` is `u16` →
+  truncation is safe (permission bits ≤ 0o7777 fit). `cargo test --workspace` green on Linux
+  (daemon-core exec tests included). No restructuring; the cross-lane one-liner was required for the
+  M4 deliverable (darwin build). Keep as-is.
+- **(c) `.#cuda` devshell stanza — cargo feature LANDED; flake stanza → Wave 3.** The `cuda` cargo
+  feature (`burn/cuda`) is in the merged trunk (clippy-green on the AMD box — cudarc is
+  runtime-dlopen, no toolkit at build; lock-neutral). The `.#cuda` **flake** stanza is **not** added
+  at Merge 2: nixpkgs-unstable has dropped the driver-matched nvrtc (the RunPod 4090's 12.4 driver
+  rejects nvrtc 12.6 PTX; the working combo was NVIDIA's pip wheel `nvidia-cuda-nvrtc-cu12==12.4.127`).
+  **Wave-3 integration-owner flake item** (honest shape: unfree-scoped `cudaPackages_12_x.cuda_nvrtc`
+  keyed to the box driver + `cuda_cudart` headers + a `CUDA_PATH`/`LD_LIBRARY_PATH` wrapper incl. host
+  driver libs; build on the CUDA box, one sealed `nix build`).
+- **(d) A3 sharp edge — joins land roster-direct only in `WaitingForMembers` — SPEC NOTE (human).**
+  A join during Warmup/rounds is staged `pending` and (with `epoch_rounds=0`) never materializes
+  mid-run, so a live deployment where N workers join a `min_peers<N` run races the warmup transition.
+  **Proposed spec §6.2 operational note (LEDGER-ONLY — spec is the human's to edit):** *"Declared-run
+  authors MUST set `min_peers` = the expected initial roster size; a join arriving after the
+  `WaitingForMembers`→Warmup transition is staged until the next epoch boundary (never mid-run when
+  `epoch_rounds=0`)."* The `ws_live_workers` harness already encodes this (`min_peers = NUM_WORKERS`).
+- **(e) API-initiated `swarm_join` credential authoring (A3 deviation 1) — Wave 3, A-lane/app
+  boundary.** `SwarmService::swarm_join` still passes empty credentials (self-driven fallback) because
+  the node identity / roster / engine-params authoring source for an app-initiated join (where the
+  node's swarm signing key lives) is a P3/WIRE-4 app-surface decision. The live attach is driven via
+  the public `SwarmService::join_and_pump` (used by the e2e + the boot site). **Owner: A-lane, Wave 3
+  / P3 app-surface program.**
+- **(f) sentry `_invoke_watson` MinGW link blocker — daemon-telemetry follow-on, Wave 3.** The full
+  `daemon-train-worker` does not LINK under `x86_64-pc-windows-gnu` (`daemon-telemetry`'s always-on
+  `sentry-rust-minidump` → `crash-handler` references a UCRT symbol mingw-w64's msvcrt import lib
+  lacks). C2's telemetry-free `daemon-train-probe` links + validated on the real 5090. **Wave-3
+  daemon-telemetry item:** target-gate the minidump path (`cfg(not(all(windows, target_env="gnu")))`)
+  or add a worker `no-crash-reporting` feature — either unblocks a true `daemon-train-worker.exe`.
+
+### Merge 2 — FROZEN interfaces (extend additively only)
+
+- **A3 worker live-attach:** the `JoinCredentials` canonical-CBOR contract
+  (`JoinCredentials`/`WsAuthSpec`/`IrohCredentials`/`IrohRosterPeer`/`EngineParams`, verbatim in
+  `swarm-ledger-p2-a3.md §2`); the `swarm-net` `daemon-train` feature gate
+  (`daemon-swarm-net/{ws,iroh}` + `dep:daemon-egress` + `dep:async-trait`, off the default gate);
+  `[swarm.registry]` node config (registry base + `swarm:*` creds) → boot-wired `EgressRunDiscovery`.
+- **Event pump + telemetry:** `TrainSupervisor::join_streaming`, `SwarmService::{join_and_pump,
+  bind_self}`; additive `protocol::Event` variants `MicroBatch` + `OomLadder`; the new
+  `Warning{class="engine_error"}` surface (`c8a7f01`). No SwarmApi wire change (telemetry rides
+  `SwarmEvent::Warning` classes). The two additive `daemon-swarm-net` builders
+  (`DualPlane::with_receive_size_cap`, `HttpPresignClient::with_internal`).
+- **Declared-RunConfig (both halves):** `CreateRunRequest.{warmup_timeout_s,round_timeout_s,
+  cooldown_s,global_batch,witness_target}` (additive optional) → `registry.ts` validate + verbatim
+  `/init` forward → `ShellConfig` → `coordinator-wasm InitConfig` `#[serde(default)] Option`s
+  (declared-over-default; registry never parses the envelope); node authoring via
+  `swarm-local --emit-create-request`.
+- **B3 lazy backend host-boundary inventory** (the residency contract, ABI §5.9 unchanged): det lane,
+  scalar/metric readouts, `canonical_state_bytes`, `checkpoint_bytes`, `upd_push_tensor`, `grad@1`
+  fold, `MetaReport`. `OpBackend`/`TrainerBackend` traits unchanged.
+- **B2 observe surface:** `--observe <dir>` (`<run>.dsmlog`+`<run>.dsmcap`), `swarm-replay <dir>`,
+  `SwarmRun::{message_log,run_capture,write_observe}`, `verify_observe_dir`,
+  `daemon_swarm_observe::{RunCapture,replay_from_state,replay_capture,logged_round_records}`.
+- **B2/B1 RUN-10:** `Manifest.max_round_interval_ms` (SDK + runtime, `#[serde(default)]`) +
+  `assess::screen_round_cadence`.
+- **C2 per-platform `device_limits()` sources:** Windows DXGI/D3D12 FFI, macOS Metal FFI, Linux
+  sysfs; pure mappers `autotune::{windows_device_limits,macos_device_limits}`. Frozen `DeviceLimits`
+  shape unchanged. The `cuda` cargo feature (`burn/cuda`, lock-neutral, no engine arm yet). The
+  `daemon-train-probe-windows` MinGW flake package + darwin devShell eval gates.
+- **NEW (`c8a7f01`):** the aws-lc-rs `CryptoProvider` install in `ws_client::dial` (the process-wide
+  wss:// TLS provider); `rustls` workspace dep (behind `daemon-swarm-net/ws`).
+- **Live endpoints (dev substrate):** coordinator `https://daemon-swarm-dev.me-dc6.workers.dev`
+  (`/api/v1/swarm`; wss `…/runs/:id/ws`; object-proxy presign plane; `x-daemon-org-id`/`x-daemon-actor`
+  internal-identity headers on workers.dev — no gateway) + relay `http://51.159.120.241:3340`.
+- **Wire:** unchanged at **v42** (no Merge-2 wire addition; telemetry stays off-wire).
+- **Guest guard:** warn-and-rebuild; canonical trunk manifest `test_abi_basic e2a8780e…`,
+  `tiny_llama 3bf68973…` (`fe7506f`).
+
+### Gate matrix (merged trunk `c8a7f01`) — GREEN
+
+Jobs capped at 16 (≤ nproc/2 = 16); one build at a time.
+
+- `cargo fmt --all --check` ✓ · `cargo clippy --workspace --all-targets -- -D warnings` ✓.
+- Feature-combo clippy `-D warnings`: `daemon-train --features swarm-net` ✓ · `burn-ndarray` ✓ ·
+  **`cuda`** ✓ (AMD box; cudarc runtime-dlopen) · **`wgpu`** (`.#vulkan`) ✓ · `daemon-swarm-net
+  --features ws` ✓ · `iroh` ✓ · `ws,iroh` ✓ · `daemon-swarm-run --features iroh` ✓ ·
+  `daemon-swarm-e2e --features iroh` ✓ · `daemon-train-sdk --features sim` ✓ ·
+  `daemon-api --features arbitrary` ✓.
+- `cargo deny check` ✓ (advisories/bans/licenses/sources; the `rustls` ws-feature dep is
+  lock-unchanged — `0.23.41` already pinned).
+- `cargo test --workspace` ✓ — **zero failures** (the documented `daemon-conformance`
+  detached-delegation flake did not fire this run).
+- Per-crate/feature suites: `daemon-swarm-net --features ws` ✓ (incl. `receive_size_cap`) · `iroh` ✓
+  (`iroh_gossip 7`) · `daemon-train --features burn-ndarray` ✓ · `--features wgpu` (RADV):
+  `burn_wgpu_parity 18/18`, `wgpu_lifecycle 3/3`, `wasm_backend_determinism 12/12`,
+  `reference_parity_wgpu --ignored 3/3` (byte-identical loss) · `daemon-train --lib autotune 14/14`
+  (C2 probes) · `daemon-swarm-run assess 4/4` (RUN-10) · `daemon-swarm-e2e` default ✓ (incl.
+  `observe_record_and_replay_green`) · **`live_transport` 7/7** (incl.
+  `live_observe_record_and_replay_green`) · `daemon-train-sdk --features sim` ✓.
+- `cargo build --target wasm32-unknown-unknown --release` (`daemon-swarm-proto` +
+  `daemon-swarm-coordinator`) ✓ · `cargo run -p xtask -- build-guests` ✓ (canonical manifest, no
+  drift) · `typos docs/specs` ✓ · guest guard `guest_lifecycle` 9/9 ✓.
+- **Live loop:** wrangler-dev (WS-only + WS+iroh) **2/2** ✓; real Cloudflare substrate (WS-only +
+  WS+iroh over the M1 WAN relay) **2/2** ✓ — see the exit-criterion table above.
+- **Observe/replay over a live run:** `swarm-local --transport iroh --observe` + `swarm-replay` 8/8
+  byte-identical ✓.
+- **Cloud:** `apps/swarm` vitest 38/38 ✓; `apps/swarm`+`shared` typecheck ✓; `pnpm -r typecheck`
+  gateway pre-existing-only (not worsened) ✓.
+
+### Hygiene (Task 9)
+
+Pruned the finished lane build dirs after the merges verified (via
+`daemon-worktree/clean-lane-target.sh`): **freed ~161 GiB** — `p2-a3/target` 80G + `p2-a3/guests/target`
+64M + `p2-b2/target` 81G + `p2-b2/guests/target` 64M (`p2-c2` had no local `target` — C2 built on the
+RunPod 4090 / M4 boxes). `$HOME` free 296G → 456G. **Worktrees + branches preserved** (not removed).
+
+### Wave-3 launch notes (C3 + gate prep)
+
+- **C3 CI tiers + gate prep:** per-lane scheduled runners; baselines (160M/500M centralized reference
+  loss curve — reuse the M2 parity harness); fleet provisioning; the hardware-in-loop gate-ceremony
+  runbook.
+- **Remaining B suites** (carry per the plan's B-lane list not in Wave 2).
+- **Observe over the cloud-DO worker loop:** wire `--observe` into the `ws_live_workers`
+  worker-subprocess path (Task-5 follow-on — the observe surface currently rides the `swarm-local`
+  harness only).
+- **Adjudication follow-ons landing in Wave 3:** (c) `.#cuda` flake stanza (pinned nvrtc 12.4);
+  (e) API-initiated `swarm_join` credential authoring (A-lane/P3); (f) daemon-telemetry MinGW
+  minidump gating (unblocks `daemon-train-worker.exe`).
+- **WAN-gate peers (Merge-3):** this box (Strix Halo, Vulkan/RADV — the ROCm/Vulkan peer, ready);
+  **M4 Metal** (devShell eval fixed at C2 — needs the worker built on-box, `swarm-net` off until the
+  WS/TLS tree is validated on aarch64-darwin); **Windows 5090** (worker `.exe` link blocked by (f) —
+  decide: probe-only peer, fix the sentry gating, or cross-compile without the telemetry feature);
+  **RunPod 4090** (CUDA lane + libnvrtc per (c)). §6.2 note (d) is load-bearing for any live
+  `min_peers` run at the gate. The Merge-2 real-substrate loop (Cloudflare coordinator + M1 relay,
+  churn + drop-recovery, byte-identical digests) is the WAN-gate rehearsal on one heterogeneous peer.
+- **Rebuild-the-dev-substrate rule:** the dev coordinator must track the merged coordinator — bug 2
+  above was a stale deployment. Re-run `deploy-dev.sh` (or a rendered `wrangler deploy`) after any
+  daemon-cloud coordination-branch change that touches `coordinator-wasm`/`registry.ts`/`shell.ts`.
