@@ -253,6 +253,8 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `swarm.enabled` | `DAEMON_SWARM__ENABLED` | bool | `false` |
 | `swarm.iroh.relays` | `DAEMON_SWARM__IROH__RELAYS` | string | `default` |
 | `swarm.module_trust` | `DAEMON_SWARM__MODULE_TRUST` | string | `signed` |
+| `swarm.registry.auth` | `DAEMON_SWARM__REGISTRY__AUTH` | string | `none` |
+| `swarm.registry.base` | `DAEMON_SWARM__REGISTRY__BASE` | string | `""` |
 | `swarm.worker_path` | `DAEMON_SWARM__WORKER_PATH` | string | `daemon-train` |
 | `telegram.api_hash` | `DAEMON_TELEGRAM__API_HASH` | string | `""` |
 | `telegram.api_id` | `DAEMON_TELEGRAM__API_ID` | number | `0` |
