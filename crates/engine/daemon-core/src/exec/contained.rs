@@ -220,7 +220,11 @@ mod imp {
 
         fn set_mode_sync(&self, rel: &Path, mode: u32) -> io::Result<()> {
             let fd = self.open_at(rel, OFlags::RDONLY, Mode::empty())?;
-            rustix::fs::fchmod(&fd, Mode::from_bits_retain(mode)).map_err(to_io)
+            // `mode_t` is u32 on Linux but u16 on macOS; go through `RawMode` so this compiles on
+            // both (permission bits always fit). The cast is a no-op on Linux.
+            #[allow(clippy::unnecessary_cast, clippy::cast_possible_truncation)]
+            rustix::fs::fchmod(&fd, Mode::from_bits_retain(mode as rustix::fs::RawMode))
+                .map_err(to_io)
         }
 
         /// Prove `rel` names a directory reachable with no symlink escape and return its verified

@@ -66,6 +66,16 @@ async fn main() {
     // runs the monitor server (then exits) in that copy before it touches the stdio cut. A no-op
     // unless the spawning node injected a DSN + `DAEMON_CRASH_CONSENT=1`.
     let _crash = daemon_telemetry::init_crash_reporting("train-worker");
+
+    // Fleet-validation readout (C2): print the same `hardware()` + `device_limits()` the live
+    // `Probe`/assess path computes, then exit — so a cross-built worker on a bare fleet box (Windows
+    // cmd.exe, macOS, RunPod) can report its DeviceLimits without hand-framing a CBOR `Probe`.
+    if std::env::var_os("DAEMON_TRAIN_PROBE").is_some() {
+        println!("hardware = {:#?}", backend::hardware());
+        println!("device_limits = {:#?}", backend::device_limits());
+        return;
+    }
+
     let channel = CutChannel::from_stdio();
     let (writer, mut reader) = channel.split();
 
