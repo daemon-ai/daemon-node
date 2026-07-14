@@ -629,6 +629,374 @@ fn hex16(d: &[u8; 16]) -> String {
     s
 }
 
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// **Merge-3 P2 WAN-gate ceremony driver — heterogeneous peers + forced churn.**
+///
+/// The runbook's recommended ceremony driver (§2/§6): the configurable-peer heterogeneity of
+/// `fleet_heterogeneous_det_lane_agrees` (each peer a local binary OR a remote `ssh -T` process) PLUS
+/// the churn-robust drop→park→rejoin recovery loop of the Merge-2 `ws_live_workers.rs` (which only
+/// ever spawned LOCAL peers). `TrainSupervisor` re-execs its configured spawn command on rejoin, so
+/// the recovery works transparently for a remote peer (a fresh `ssh` dial) — this is the contained
+/// synthesis the lean `fleet_heterogeneous_det_lane_agrees` (no rejoin) could not do, and is why a
+/// 4-peer WAN run stalls there but completes here.
+///
+/// Env: the same `SWARM_FLEET_*` knobs (`author_envelope`/`create_run_request` read them) plus
+/// `SWARM_GATE_DROP_INDEX` (peer to kill mid-run; default = last peer) and `SWARM_GATE_DROP_AFTER_ROUND`
+/// (default 2). `author_envelope` sets `min_peers = N` so the kill breaches the floor → the run parks
+/// in `WaitingForMembers` → the killed peer rejoins (§6.5) → the run resumes and FINISHES.
+///
+/// Gate assertions (spec §17 / runbook §7): every peer that reports a round agrees on the det digest
+/// byte-for-byte (consensus); the kill→park→rejoin cycle is exercised; the run reaches Finished. Per
+/// B4's design note (live-worker checkpoint-resync is NOT wired), the rejoiner's POST-rejoin digests
+/// are fresh-state and deliberately OUTSIDE the byte-identity assertion — the gate asserts "the run
+/// finishes after churn", not "the rejoiner is byte-identical".
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn fleet_gate_ceremony_with_churn() {
+    let Some(env) = fleet_env() else {
+        eprintln!(
+            "SKIP fleet_gate_ceremony_with_churn: set SWARM_FLEET_WS_URL (+ SWARM_FLEET_PEERS) — see the module docs"
+        );
+        return;
+    };
+    let local_bin = ensure_built();
+    let module_path = tiny_llama_wasm_path();
+    let module_bytes = std::fs::read(&module_path).expect("read tiny_llama.wasm");
+
+    let peers = parse_peers(&local_bin, &module_path);
+    let n = peers.len();
+    assert!(n >= 2, "need >= 2 peers for a churn ceremony");
+    let drop_index = env_usize("SWARM_GATE_DROP_INDEX", n - 1).min(n - 1);
+    let drop_after_round: u64 = env_u64("SWARM_GATE_DROP_AFTER_ROUND", 2);
+    let global_batch = n as u32 * STEPS_PER_ROUND * MICRO_BATCH;
+    let rounds = env.rounds;
+    let last_round = rounds - 1;
+    println!(
+        "GATE CEREMONY: {n} peers {:?}, {rounds} rounds, WS{}, drop peer {} ({}) after round {}",
+        peers.iter().map(|p| &p.label).collect::<Vec<_>>(),
+        if env.relay_url.is_some() {
+            "+iroh"
+        } else {
+            "-only"
+        },
+        drop_index,
+        peers[drop_index].label,
+        drop_after_round,
+    );
+
+    let run_id = format!("run-gate-p2-{}", now_secs());
+    let envelope = author_envelope(
+        &run_id,
+        &module_path,
+        &module_bytes,
+        n as u32,
+        rounds,
+        global_batch,
+    );
+    envelope.validate().expect("envelope validates");
+    let author = SigningKey::from_bytes(&[0x63u8; 32]);
+    let frozen = envelope.freeze(&author).expect("freeze envelope");
+    frozen.verify().expect("verify frozen envelope");
+    let envelope_hash = frozen.hash().0;
+    let wire = to_canonical_vec(&frozen.to_wire()).expect("encode signed envelope");
+
+    let egress = EgressClient::new(EgressConfig::default()).expect("egress client");
+    let request = create_run_request(&envelope, &frozen, &module_bytes, rounds, global_batch);
+    let (status, text) = post_json(&egress, &env, &format!("{}/runs", env.ws_base), &request).await;
+    assert_eq!(status, 201, "POST /runs: {text}");
+    println!("created {run_id}");
+
+    // Spawn + assess + join every peer.
+    let mut supervisors = Vec::new();
+    let mut streams: Vec<Option<tokio::sync::mpsc::UnboundedReceiver<Event>>> = Vec::new();
+    let build_sup = |peer: &PeerSpec| {
+        let mut cfg = TrainClientConfig::new(&peer.program);
+        cfg.args = peer.args.clone();
+        if peer.is_local {
+            cfg.env.push((
+                "DAEMON_TRAIN_MODULE".to_string(),
+                module_path.to_string_lossy().into_owned(),
+            ));
+        }
+        cfg.spawn_timeout = Duration::from_secs(90);
+        cfg.op_timeout = Duration::from_secs(240);
+        Arc::new(TrainSupervisor::new(cfg))
+    };
+    for (i, peer) in peers.iter().enumerate() {
+        // Spawn+assess with bounded retry: a remote peer over ssh can transiently fail to spawn
+        // (e.g. the Windows box's sshd rate-limits a fresh dial) — a fresh supervisor + short backoff
+        // recovers it instead of aborting the whole heterogeneous run at one flaky connection.
+        let mut attempt = 0u32;
+        let (sup, elig) = loop {
+            attempt += 1;
+            let sup = build_sup(peer);
+            match sup.assess(wire.clone()).await {
+                Ok(elig) => break (sup, elig),
+                Err(e) if attempt < 4 => {
+                    eprintln!(
+                        "peer {i} ({}) assess attempt {attempt} failed: {e} — retrying in 6s",
+                        peer.label
+                    );
+                    sup.shutdown().await;
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                }
+                Err(e) => panic!(
+                    "peer {i} ({}) assess (after {attempt} attempts): {e}",
+                    peer.label
+                ),
+            }
+        };
+        assert!(
+            elig.eligible,
+            "peer {i} ({}) eligible: {:?}",
+            peer.label, elig.reasons
+        );
+        let creds = credentials_for(i, n, &env, envelope_hash, global_batch)
+            .to_bytes()
+            .expect("encode credentials");
+        let rx = sup
+            .join_streaming(run_id.clone(), env.ws_base.clone(), creds, policy())
+            .await
+            .unwrap_or_else(|e| panic!("peer {i} ({}) join_streaming: {e}", peer.label));
+        supervisors.push(sup);
+        streams.push(Some(rx));
+    }
+
+    // digests[peer][round] = pre-drop det digests (byte-identity domain). The dropped peer's
+    // POST-rejoin digests land in `rejoined_digests` (fresh-state, excluded from identity — B4).
+    let mut digests: Vec<BTreeMap<u64, [u8; 16]>> = vec![BTreeMap::new(); n];
+    let mut rejoined_digests: BTreeMap<u64, [u8; 16]> = BTreeMap::new();
+    let mut rejoined_stream: Option<tokio::sync::mpsc::UnboundedReceiver<Event>> = None;
+    let state_url = format!("{}/runs/{run_id}/state", env.ws_base);
+
+    // Admission gate + diagnostic: with min_peers = N the run cannot leave WaitingForMembers until
+    // all N peers attach. A peer whose worker started (assess ok) but whose WS Join never registered
+    // (e.g. a bad remote env) would otherwise hang the barrier for the whole budget — so identify it
+    // fast. Print each peer's node PeerId, then wait for roster == N (or phase past waiting).
+    for (i, peer) in peers.iter().enumerate() {
+        let pid = peer_id(&SigningKey::from_bytes(&node_secret(i))).0;
+        let hex: String = pid.iter().map(|b| format!("{b:02x}")).collect();
+        println!("peer {i} ({}) node_peer_id={hex}", peer.label);
+    }
+    let admit_deadline = Instant::now() + Duration::from_secs(declared_warmup_s() + 90);
+    loop {
+        let (_st, state) = get_json(&egress, &env, &state_url).await;
+        let roster = state["data"]["roster"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0);
+        let phase = state["data"]["phase"].as_str().unwrap_or("").to_string();
+        if roster >= n || phase != "waiting" {
+            println!("admission: roster={roster}/{n} phase={phase}");
+            break;
+        }
+        if Instant::now() >= admit_deadline {
+            let ids: Vec<String> = state["data"]["roster"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.chars().take(16).collect()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            panic!(
+                "only {roster}/{n} peers admitted after warmup+90s; roster id-prefixes={ids:?} \
+                 — a peer's WS Join never registered (match against node_peer_id above)"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let budget = Duration::from_secs(300 + rounds * (declared_round_timeout_s() + 60));
+    let deadline = Instant::now() + budget;
+    let mut dropped = false;
+    let mut rejoined = false;
+    let mut last_phase = String::new();
+
+    'collect: loop {
+        assert!(
+            Instant::now() < deadline,
+            "run budget {budget:?} exceeded; rounds so far: {:?} (rejoined: {})",
+            digests.iter().map(BTreeMap::len).collect::<Vec<_>>(),
+            rejoined_digests.len()
+        );
+        for (i, slot) in streams.iter_mut().enumerate() {
+            if let Some(rx) = slot.as_mut() {
+                while let Ok(ev) = rx.try_recv() {
+                    match ev {
+                        Event::RoundOutcome { round, digest, .. } => {
+                            digests[i].insert(round, digest);
+                        }
+                        Event::Error { class, detail } => {
+                            eprintln!("peer {i} ({}) ERROR {class:?}: {detail}", peers[i].label);
+                        }
+                        Event::Warning { class, detail } => {
+                            eprintln!("peer {i} ({}) WARN [{class}]: {detail}", peers[i].label);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(rx) = rejoined_stream.as_mut() {
+            while let Ok(ev) = rx.try_recv() {
+                if let Event::RoundOutcome { round, digest, .. } = ev {
+                    rejoined_digests.insert(round, digest);
+                }
+            }
+        }
+
+        // Kill drill: once the drop target reported `drop_after_round`, kill it.
+        if !dropped && digests[drop_index].contains_key(&drop_after_round) {
+            println!(
+                "CHURN: killing peer {drop_index} ({}) after round {drop_after_round}",
+                peers[drop_index].label
+            );
+            supervisors[drop_index]
+                .leave(run_id.clone(), LeaveMode::Immediate)
+                .await
+                .ok();
+            supervisors[drop_index].shutdown().await;
+            streams[drop_index] = None;
+            dropped = true;
+        }
+
+        // Rejoin drill: once the coordinator parks (floor breach → WaitingForMembers), the killed
+        // peer's supervisor re-assesses + rejoins (§6.5 previously-Dropped member rejoin). For a
+        // remote peer this re-execs a fresh `ssh` dial.
+        if dropped && !rejoined {
+            let (st, state) = get_json(&egress, &env, &state_url).await;
+            assert_eq!(st, 200, "GET /state during churn");
+            let ph = format!(
+                "{} round={}",
+                state["data"]["phase"], state["data"]["round"]
+            );
+            if ph != last_phase {
+                eprintln!("churn-poll: phase={ph}");
+                last_phase = ph;
+            }
+            if state["data"]["phase"] == serde_json::json!("waiting") {
+                println!(
+                    "CHURN: coordinator parked (floor breach at round {}); rejoining peer {drop_index}",
+                    state["data"]["round"]
+                );
+                let sup = &supervisors[drop_index];
+                let elig = sup
+                    .assess(wire.clone())
+                    .await
+                    .expect("re-assess on respawn");
+                assert!(elig.eligible, "respawned peer {drop_index} eligible");
+                let creds = credentials_for(drop_index, n, &env, envelope_hash, global_batch)
+                    .to_bytes()
+                    .expect("encode credentials");
+                let rx = sup
+                    .join_streaming(run_id.clone(), env.ws_base.clone(), creds, policy())
+                    .await
+                    .expect("respawned peer rejoins");
+                rejoined_stream = Some(rx);
+                rejoined = true;
+            }
+        }
+
+        // Finished when every SURVIVOR reported the last round.
+        let survivors_done = (0..n)
+            .filter(|&i| i != drop_index)
+            .all(|i| digests[i].contains_key(&last_round));
+        if survivors_done && dropped {
+            break 'collect;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        dropped && rejoined,
+        "the kill→park→rejoin churn cycle was exercised"
+    );
+
+    // Transcript (ledger evidence).
+    for round in 0..rounds {
+        let cols: Vec<String> = (0..n)
+            .map(|i| {
+                digests[i]
+                    .get(&round)
+                    .map(hex16)
+                    .unwrap_or_else(|| "--".into())
+            })
+            .collect();
+        let rj = rejoined_digests
+            .get(&round)
+            .map(hex16)
+            .map(|s| format!("  [rejoin:{s}]"))
+            .unwrap_or_default();
+        println!("round {round}: {}{rj}", cols.join("  "));
+    }
+
+    // Gate assertion (consensus): every peer that reported a round agrees byte-for-byte.
+    for round in 0..rounds {
+        let mut reference: Option<(usize, [u8; 16])> = None;
+        for (i, d) in digests.iter().enumerate() {
+            if let Some(dig) = d.get(&round) {
+                match reference {
+                    None => reference = Some((i, *dig)),
+                    Some((ri, rd)) => assert_eq!(
+                        rd, *dig,
+                        "round {round}: peer {ri} ({}) and peer {i} ({}) det digests diverge — \
+                         cross-platform consensus BROKEN",
+                        peers[ri].label, peers[i].label
+                    ),
+                }
+            }
+        }
+    }
+    // Survivors completed every round.
+    for i in (0..n).filter(|&i| i != drop_index) {
+        assert_eq!(
+            digests[i].len() as u64,
+            rounds,
+            "survivor {i} ({}) completed every round",
+            peers[i].label
+        );
+    }
+    // The dropped peer contributed its pre-drop rounds.
+    assert!(
+        digests[drop_index].len() as u64 > drop_after_round,
+        "dropped peer {drop_index} ({}) contributed rounds 0..={drop_after_round} before the kill",
+        peers[drop_index].label
+    );
+
+    // The run reaches Finished despite the churn.
+    let finish_deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (st, state) = get_json(&egress, &env, &state_url).await;
+        assert_eq!(st, 200, "GET /state");
+        if state["data"]["finished"] == serde_json::Value::Bool(true) {
+            println!("final DO state: {}", state["data"]);
+            break;
+        }
+        assert!(
+            Instant::now() < finish_deadline,
+            "run did not finish: {state}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    for sup in &supervisors {
+        sup.leave(run_id.clone(), LeaveMode::Immediate).await.ok();
+        sup.shutdown().await;
+    }
+    println!(
+        "GATE CEREMONY GREEN: {n} heterogeneous peers, {rounds} rounds, det digests byte-identical, \
+         churn (kill peer {drop_index} → park → rejoin) survived, run Finished. rejoiner reported {} \
+         post-rejoin round(s): {:?}",
+        rejoined_digests.len(),
+        rejoined_digests.keys().collect::<Vec<_>>()
+    );
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

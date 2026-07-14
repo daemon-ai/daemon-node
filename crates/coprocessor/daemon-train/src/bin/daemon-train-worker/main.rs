@@ -167,6 +167,23 @@ async fn main() {
                     }
                     continue;
                 }
+                // A `swarm-net`-less build handed real live-attach credentials must fail LOUD:
+                // silently self-driving here starves the coordinator's min_peers barrier with no
+                // client-visible error (Merge-3 ceremony: a drifted RunPod artifact built without
+                // `swarm-net` stalled the WAN run this exact way — the Join was never dialed).
+                #[cfg(not(feature = "swarm-net"))]
+                if daemon_swarm_run::protocol::JoinCredentials::from_bytes(&credentials).is_ok() {
+                    send(
+                        &writer,
+                        &worker_error(
+                            "JoinRun carried live JoinCredentials but this worker was built \
+                             without the `swarm-net` feature — it cannot attach to a live \
+                             coordinator; rebuild with `--features swarm-net`",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
                 // Self-driven fallback (feature off, or no live credentials authored).
                 let _ = &coordinator;
                 let _ = &credentials;
