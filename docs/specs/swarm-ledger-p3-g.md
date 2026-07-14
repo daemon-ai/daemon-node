@@ -195,12 +195,16 @@ contract clean and gates on readiness:
   - it need NOT ship `libcuda`/`libnvidia-nvvm`/`libnvidia-ptxjitcompiler` — those are the box
     **driver's own userspace** and load from the system path (host libcuda under nix glibc is proven,
     C2 D5); the RunPod staging dir includes them only as convenience symlinks.
-  - cudart **headers** (`include/cuda_runtime.h` + its tree) inside the runtime dir, and the
-    launcher must export `CUDA_PATH=$DAEMON_CUDA_RUNTIME_DIR` (in addition to the `LD_LIBRARY_PATH`
-    prepend). This is a **runtime** need, not just build-time: cubecl-cuda re-includes
-    `cuda_runtime.h` on every NVRTC kernel JIT and panics without it (the live-smoke finding above).
-    The staged `/root/cuda-rt-124` already carries `include/`; the NVIDIA wheel path for it is
-    `nvidia-cuda-runtime-cu12`'s `include/` (or the `cuda_cudart` package matching the driver level).
+  - cudart **headers** — the **complete** `include/` tree, not a top-level subset — inside the
+    runtime dir, and the launcher must export `CUDA_PATH=$DAEMON_CUDA_RUNTIME_DIR` (in addition to
+    the `LD_LIBRARY_PATH` prepend). This is a **runtime** need, not just build-time: cubecl-cuda
+    re-includes `cuda_runtime.h` on every NVRTC kernel JIT and panics without it, and the headers
+    are self-referential — the first live smoke with a partial tree failed with
+    `mma.h(55): catastrophic error: cannot open source file "crt/mma.h"` (the `crt/`,
+    `cooperative_groups/`, `cuda/std/` subtrees are required; the complete `cuda_cudart`+cccl
+    include set is ~186 entries). Source: the NVIDIA wheel `nvidia-cuda-runtime-cu12`'s `include/`
+    (or the nixpkgs `cuda_cudart` + `cuda_cccl` includes) matching the driver level; the pod's
+    `/root/cuda-rt-124/include` was completed from the devShell's `cuda-merged-12.9` store path.
   - **Readiness vs downgrade detection:** the fetcher's success criterion IS `cuda_nvrtc_ready()`
     flipping to `true` in a fresh process (dlopen search paths + `CUDA_PATH` are process-start
     state; a worker restarts after staging). No sentinel files, no version parsing at probe time —
@@ -258,7 +262,158 @@ contract clean and gates on readiness:
 live attach. Known flake (never modified): the `daemon-conformance` detached-delegation trio —
 green-in-isolation.
 
-## Results — (filled at lane close)
+## Results — lane close (4090 evidence, deviations, Merge-1 notes)
 
-_Pending: commit list, 4090 suite results + tolerance evidence, the 160M parity + throughput record,
-live-attach smoke evidence, deviations, what Merge-1 must know._
+### Commit list (base `245aef6`, oldest → newest)
+
+| Commit | Subject |
+|---|---|
+| `e52321c` | `mirror(G): ledger` |
+| `d3e3ee1` | `feat(train): BackendKind::Cuda engine arm + probe + autotune device-limits (green)` |
+| `82eae25` | `test(train): cuda parity/det-digest/160M suites (green)` |
+| `b34dc89` | `feat(train): fat-worker probe-order degradation + nvrtc fetch-on-demand readiness gate (green)` |
+| `acc9969` | `fix(train): cuda readiness gate also requires the cudart JIT headers (green)` |
+| (this) | `mirror(G): finalize ledger — Merge-1 seams + 4090 results` |
+
+### 4090 suite results (on-box, `/root/daemon-node-p3g` = a clean git clone of `swarm/g`, rebuilt
+### on-box at every HEAD — the P2 artifact-drift lesson; worker sha256 fingerprints logged per run)
+
+All run in `.#cuda-train` with `DAEMON_CUDA_RUNTIME_DIR=/root/cuda-rt-124`, HEAD `acc9969`:
+
+- **Full `daemon-train` suite `--features cuda,burn-ndarray`** — green across every target
+  (lib 43 + autotune 15, burn_backend_parity 17, guest_lifecycle 9, worker_protocol 4,
+  wasm_backend_determinism 15 incl. the new `cross_backend_cuda` trio, cuda_lifecycle 3,
+  reference_parity 2, preset_160m 2, abi_surface 2, …). First pass (HEAD `b34dc89`) had ONE failure:
+  `worker_protocol::supervisor_probe_assess_join` asserted `gpus == 0` for non-wgpu builds — the
+  pre-existing assertion didn't know a cuda build reports a GPU; fixed to admit any GPU-featured
+  build (`gpus <= 1`), green on re-run.
+- **Cross-backend det-digest byte-identity (the consensus tripwire):**
+  `cross_backend_cuda::cross_backend_det_digest_{sparse_loco,diloco,demo}` — 6 rounds each,
+  **cpu-vs-CUDA det digests bit-identical every round**, native payloads diverge (tolerance-class),
+  both losses fall. The det lane is byte-identical **by construction** (host fp32 det-core shared
+  with `CpuBackend`; the CUDA arm never touches it) — these tests are the guard, and they are green
+  on the real 4090.
+- **Autotune / §10.5 verdict (Scope 6):** `meta_mode_estimates_vs_cuda_probe` green with the real
+  probe — `DeviceLimits { vram_mb: 24210, ram_mb: 127935, max_alloc_mb: 24210, shared_mb: 0,
+  unified: false }` (the driver-honest discrete numbers; `cuDeviceTotalMem` = 24210 MiB on this
+  container ≈ nvidia-smi's 24564 total minus reserve) → tiny-llama fits at micro_batch 64;
+  `preset_160m_eligible_on_cuda_discrete` green (160M eligible with margin on the discrete path —
+  dedicated VRAM budget, no UMA joint pool). `hardware()` reports
+  `backend_lanes ["cuda","cpu"]`, vram 24210, shared 0.
+- **Tolerance class:** CUDA joins the wgpu tolerance class — the 160M parity run (below) lands
+  final-weight max Δ = 4.746e-6, well inside Optimizer (rtol 2e-4/atol 2e-5); per-step losses were
+  byte-equal to the reference on this run. No per-op fixture divergence observed.
+
+### 160M single-host on the 4090 — the exit criterion (headline)
+
+Full record + method + honest interpretation in
+[`swarm-p3-throughput.md`](swarm-p3-throughput.md). Summary:
+
+- **Parity (release, 4 steps, TinyStories b=1, matched init):** per-step loss **byte-identical**
+  (|Δ| = 0.000e0; 10.846266 → 8.986223), final-weight max Δ = **4.746e-6** (Optimizer class) —
+  `loss_parity_within_tolerance_160m_cuda` GREEN.
+- **Throughput (release, 3 warmup + 10 measured):** tabi **357.9 tok/s** (2.859 s ± 0.065 s/step),
+  reference **933.4 tok/s** (1.096 s ± 0.003 s), ratio **2.61×** — vs the P2 wgpu RADV record
+  (tabi 383.9, ref 753.4, 1.96×). The 4090's straight-burn reference is the fastest in the program
+  (+24% over RADV); tabi converges to the §5.9 host-residency bound on both boxes (the PCIe-vs-UMA
+  analysis in the throughput doc).
+- **Preset smoke (dev):** build 8.8 s, 7.0 s/step, `make_update` 46.3 s → 12.5 MB sparse_loco
+  payload, loss 10.843 → 9.100 — `preset_160m_trains_on_cuda` GREEN.
+
+### Live-attach smoke (Scope 5) — GREEN, with two real findings en route
+
+Final run: `fleet_heterogeneous_det_lane_agrees` — local Linux peer + the 4090 worker
+(`--features swarm-net,cuda`, spawned over `ssh -p 13988 -T`, env
+`DAEMON_TRAIN_MODULE=… DAEMON_CUDA_RUNTIME_DIR=/root/cuda-rt-124 LD_LIBRARY_PATH=/root/cuda-rt-124
+CUDA_PATH=/root/cuda-rt-124`) against the real Cloudflare dev coordinator
+(`https://daemon-swarm-dev.me-dc6.workers.dev`), run **`run-c3-fleet-1784023517`**: worker log shows
+**“selecting CUDA native lane (device 0: NVIDIA GeForce RTX 4090, 24210 MiB VRAM)”**, 4 rounds,
+**det digests byte-identical every round** (`9fa9a6b0…`, `4446c13e…`, `bf39a25e…`, `1198ea6a…`),
+run Finished, zero panics/errors in the transcript. The CUDA engine arm rides the live plane.
+
+The two findings the smoke surfaced (both fixed + recorded):
+
+1. **JIT headers are a runtime requirement (→ `acc9969` + D6).** The first attempt spawned the
+   worker without `CUDA_PATH`: the readiness gate (then libnvrtc-only) passed, the worker selected
+   CUDA, and cubecl-cuda **panicked on every kernel JIT** (`CUDA installation not found`) — the run
+   still finished byte-identical (det lane is host fp32; the round loop tolerated the dead native
+   lane on this tiny model), but the CUDA lane was effectively off. Fix: `cuda_nvrtc_ready()` gained
+   the header leg (D6), so an unstaged box now downgrades loudly instead of panic-spamming.
+2. **The include tree must be complete.** With `CUDA_PATH` set but the staged `include/` partial,
+   NVRTC failed with `mma.h(55): catastrophic error: cannot open source file "crt/mma.h"` and the
+   pod peer starved (0 rounds committed; local peer 3 — run budget exceeded). Fix: completed
+   `/root/cuda-rt-124/include` from the devShell's `cuda-merged-12.9` store path (186 entries incl.
+   `crt/`); D6's fetcher contract now requires the full tree.
+
+### Gate matrix (final HEAD `acc9969` + the finalize-ledger commit)
+
+- Host (this box, default devShell): `cargo fmt --check` ✓ · `cargo clippy --workspace
+  --all-targets -- -D warnings` ✓ · `cargo deny check` ✓ (advisories/bans/licenses/sources —
+  cudarc adds NO new crate) ·   `cargo test --workspace` ✓ except known parallel-load flakes, all on the program's standing
+  known-flake list and all **green in isolation** this session: the `daemon-conformance`
+  detached-delegation trio member `detached_fanout_materializes_distinct_children` (module 5/5
+  isolated; the final `--no-fail-fast` run's ONLY failure), `f1_approvals_pending_is_owner_scoped`
+  (1/1 isolated; flaked once early-session), and `drills.rs::late_join_mid_run_syncs_and_contributes`
+  (1/1 isolated; flaked once while Lane S's live 160M rehearsal loaded the box). None are swarm-lane
+  files this lane touches · `cargo run -p xtask -- build-guests` ✓ · wasm32
+  `daemon-swarm-proto` + `daemon-swarm-coordinator` ✓ · `typos docs/specs` ✓.
+- Feature combos (`.#cuda-train`): clippy `-p daemon-train --features cuda --all-targets` ✓ ·
+  `--features swarm-net,cuda` ✓ · `--features swarm-net,cuda,wgpu` (the fat-worker union) ✓ —
+  all `-D warnings`.
+- Dep proof: default graph unchanged (`cargo tree -p daemon-train -e normal` — no cudarc/burn-cuda/
+  cubecl-cuda); `Cargo.lock` delta = exactly one edge line (`"cudarc 0.19.8"` on the daemon-train
+  node; the `[[package]]` entry pre-existed via cubecl-cuda). **No new root dep** — the brief's
+  STOP trigger did not fire.
+- On-pod (4090): the cuda suites green (above); 160M parity + throughput green; live smoke green.
+
+### Deviations (recorded honestly)
+
+1. **`worker_protocol` assertion widened** (`gpus == 0` → GPU-featured builds assert `gpus <= 1`):
+   a test file this lane didn't originally own but whose assertion was factually outdated by the
+   cuda lane; one-line, behavior-preserving for every existing build shape.
+2. **The wgpu rung of `select_backend` also lights up the wgpu live path** (previously the live
+   worker always ran CPU even when built `--features wgpu`). Additive and probe-gated; consensus
+   unaffected (det lane host fp32). Called out for Merge-1 review since it changes what a
+   wgpu-featured live worker *does* (trains its native lane on the GPU).
+3. **`max_alloc_mb` on CUDA = total VRAM** (no per-buffer ceiling exists in the driver API the way
+   wgpu's `max_buffer_size` does); the verdict's per-tensor gate then only rejects tensors larger
+   than the card, which is the honest semantic on CUDA.
+4. **The pod's `cuDeviceTotalMem` reports 24210 MiB** (vs nvidia-smi 24564): the driver's usable
+   figure; recorded as-is (a true lower bound, the right budgeting number).
+5. **First smoke attempt ran with a stale-featured env** (no `CUDA_PATH`) — caught by the run
+   transcript, root-caused, fixed as D6 leg 2, re-run clean. No binary drift: every pod run was
+   preceded by an on-box rebuild at the exact lane HEAD with a printed sha256.
+
+### What Merge-1 must know
+
+1. **Freeze (additive):** `BackendKind::Cuda` + `BurnCudaBackend` + `cuda_adapter_available()`;
+   `autotune::{CudaProbe, probe_cuda, cuda_nvrtc_ready, cuda_device_limits}`; the worker's
+   `select_backend()` probe order (cuda → wgpu → cpu) + `DAEMON_TRAIN_BACKEND=cpu` escape hatch.
+   `OpBackend`/`TrainerBackend`/`EngineConfig` shapes unchanged; no tabi ops; wire stays v42.
+2. **The fat-worker packaging decision (D5) is implemented and verified** — graceful degradation on
+   non-NVIDIA proven on the AMD box (`cuda_probe_degrades_cleanly_without_nvidia`, no GPU-skip) +
+   ELF `DT_NEEDED` clean (dlopen mode). Nothing in the dep graph forces link-mode cudarc.
+3. **The nvrtc fetch-on-demand contract (D6) is documented + gated** (two-leg readiness: loadable
+   libnvrtc AND the complete cudart include tree at `CUDA_PATH`); the fetch machinery itself is the
+   agreed Merge-1/later item. Launchers must export BOTH `DAEMON_CUDA_RUNTIME_DIR` (LD path) and
+   `CUDA_PATH` — consider folding the `CUDA_PATH` export into the `.#cuda-train` shellHook when the
+   runtime dir is set (a one-line flake follow-on; NOT made this lane — flake untouched).
+4. **No flake edits were needed** (the C3 `.#cuda-train` shell + staged runtime dir sufficed);
+   `Cargo.lock` carries the one cudarc edge line; `deny` green.
+5. **Lane S / the fleet:** the 4090 peer now contributes a real GPU-native lane on the live plane
+   (this lane's smoke is the small-run proof; run `run-c3-fleet-1784023517`). For the 160M fleet
+   run, stage the complete include tree + nvrtc per D6 on the pod (already done at
+   `/root/cuda-rt-124`) and spawn the worker with the three env vars above.
+6. **Known follow-on from Lane R (recorded, no action this wave): exclude local state from
+   `checkpoint_save` so cross-peer checkpoints can mean byte-identical.** Lane R found checkpoint
+   objects are per-peer byte-divergent because `CheckpointWire` (runtime.rs, this crate) serializes
+   **all** persistents — including `class = 0` **local** optimizer state (AdamW m/v), which
+   legitimately differs per peer (each peer runs its own native lane). The `class = 1` replicated
+   subset + masters + round bases are the cross-peer-identical part; a future slice should either
+   split the wire shape (replicated body + local sidecar) or emit a canonical replicated-only
+   variant for the resync path. Lane G touched `checkpoint_save`'s callers but NOT its shape —
+   nothing here worsens the divergence (the CUDA arm keeps m/v in the same persistent slots the CPU
+   backend uses; `restore_checkpoint` stays bit-exact per-peer, which is all §9 resume needs today).
+7. **Good-guest ledger (pod):** `/root/daemon-node-p3g` (clean clone + target), `/root/swarm-g*.bundle`,
+   `/root/p3g-*.{sh,log}`, and `/root/cuda-rt-124/include` completed (added headers; nothing
+   removed). `/root/daemon-node-c3` untouched. All on the ephemeral container's local disk.
