@@ -302,6 +302,7 @@ fn credentials_for(
             corpus_seq_len: 8,
             corpus_vocab_clamp: GUEST_VOCAB,
             payload_retention_rounds: 16,
+            corpus: None,
         },
     }
 }
