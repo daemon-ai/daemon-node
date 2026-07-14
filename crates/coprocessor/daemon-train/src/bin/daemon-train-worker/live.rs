@@ -39,10 +39,7 @@ use daemon_swarm_run::engine::{EngineConfig, EngineEvent, RoundEngine};
 use daemon_swarm_run::protocol::{Event, JoinCredentials};
 use daemon_swarm_run::seam::RoundId;
 use daemon_swarm_run::SwarmRunError;
-use daemon_train::{
-    EngineConfig as WasmEngineConfig, TrainError, TrapCode, WasmBackend, WasmBackendConfig,
-    WasmBackendError,
-};
+use daemon_train::{TrainError, TrapCode, WasmBackend, WasmBackendConfig, WasmBackendError};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 
@@ -506,11 +503,13 @@ fn to_ws_auth(spec: &daemon_swarm_run::protocol::WsAuthSpec) -> WsAuth {
     }
 }
 
-/// Build + `da_build` a fresh [`WasmBackend`] (also the OOM-churn rebuild).
+/// Build + `da_build` a fresh [`WasmBackend`] (also the OOM-churn rebuild). The engine config honors
+/// `DAEMON_TRAIN_BACKEND` (cpu | burn-ndarray | wgpu; P3 lane S — Vulkan for 160M-scale rounds) with
+/// the roomy 160M budgets when set; default = the tiny-model CPU det lane, unchanged.
 fn build_wasm_backend(module: &[u8], config: &[u8]) -> Result<WasmBackend, String> {
     let mut backend = WasmBackend::new(WasmBackendConfig {
         wasm: module.to_vec(),
-        engine: WasmEngineConfig::default(),
+        engine: crate::backend::engine_config_from_env(),
     })
     .map_err(|e| e.to_string())?;
     backend.build(config).map_err(|e| e.to_string())?;
@@ -611,7 +610,7 @@ impl TrainerBackend for LadderBackend {
                 });
                 let mut fresh = WasmBackend::new(WasmBackendConfig {
                     wasm: self.module.clone(),
-                    engine: WasmEngineConfig::default(),
+                    engine: crate::backend::engine_config_from_env(),
                 })?;
                 fresh.build(&self.config)?;
                 let stats = fresh.train_step(batch, ctx)?;

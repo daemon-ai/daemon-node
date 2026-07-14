@@ -336,6 +336,42 @@ fn module_from_env() -> Option<Result<Vec<u8>, String>> {
     Some(std::fs::read(&path).map_err(|e| format!("reading module {path}: {e}")))
 }
 
+/// The engine config for this worker's wasm host, honoring `DAEMON_TRAIN_BACKEND` (P3 lane S — the
+/// 160M staging rehearsal's Vulkan lane): `cpu` (default), `burn-ndarray`, or `wgpu` (feature-gated;
+/// an unavailable selection falls back to the CPU det lane with a loud stderr note, never silently
+/// changing semantics — the det digests are byte-identical across backends by the B3 contract, so
+/// backend choice affects wall-clock only). When the var is set the roomy 160M-scale sandbox budgets
+/// are applied (the defaults are tuned for the tiny reference model; a 768-wide model's real fp32
+/// steps trip the 5 s epoch watchdog — mirrors `preset_160m.rs::roomy_engine`).
+pub(crate) fn engine_config_from_env() -> daemon_train::EngineConfig {
+    use std::time::Duration;
+    let Ok(kind) = std::env::var("DAEMON_TRAIN_BACKEND") else {
+        return daemon_train::EngineConfig::default();
+    };
+    let backend = match kind.as_str() {
+        "cpu" | "" => daemon_train::BackendKind::Cpu,
+        #[cfg(feature = "burn-ndarray")]
+        "burn-ndarray" => daemon_train::BackendKind::BurnNdarray,
+        #[cfg(feature = "wgpu")]
+        "wgpu" => daemon_train::BackendKind::Wgpu,
+        other => {
+            eprintln!(
+                "[daemon-train-worker] DAEMON_TRAIN_BACKEND={other} not available in this build \
+                 (feature not compiled?) — falling back to the CPU det lane"
+            );
+            daemon_train::BackendKind::Cpu
+        }
+    };
+    daemon_train::EngineConfig {
+        fuel_per_call: 1 << 34,
+        epoch_deadline: Duration::from_secs(600),
+        op_budget: 1 << 30,
+        max_step_handles: 1 << 24,
+        backend,
+        ..daemon_train::EngineConfig::default()
+    }
+}
+
 /// The host `tabi@1` vocabulary (name-for-name with the phase table / SDK `TABI_IMPORTS`, all 66).
 fn host_ops() -> Vec<String> {
     PHASE_TABLE.iter().map(|(n, _)| (*n).to_string()).collect()
@@ -555,7 +591,18 @@ pub(crate) fn device_limits() -> DeviceLimits {
 /// The peer-side re-validation (spec §6.5): a static import scan of the module vs the host `tabi@1`
 /// vocabulary, then a host meta-mode pass over the config → an [`Eligibility`] verdict.
 pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String> {
-    let worker = Worker::new(EngineConfig::default()).map_err(|e| format!("engine: {e}"))?;
+    // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (the meta pass over a real-scale
+    // param layout exceeds the tiny-model defaults). The meta pass itself stays on the CPU-cheap
+    // path (footprint estimation, backend-independent).
+    let engine = if std::env::var_os("DAEMON_TRAIN_BACKEND").is_some() {
+        EngineConfig {
+            backend: daemon_train::BackendKind::Cpu,
+            ..engine_config_from_env()
+        }
+    } else {
+        EngineConfig::default()
+    };
+    let worker = Worker::new(engine).map_err(|e| format!("engine: {e}"))?;
     let vocabulary: BTreeSet<String> = host_ops().into_iter().collect();
     let imports = worker
         .module_imports(module)
