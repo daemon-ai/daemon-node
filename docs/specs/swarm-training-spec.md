@@ -658,6 +658,13 @@ Uninitialized → WaitingForMembers → Warmup → (RoundTrain ⇄ RoundWitness)
   window once at the scheduled `global_batch`); pending joins/leaves or a peer-floor breach
   end it early. Joins and leaves take effect only at epoch boundaries (roster frozen in
   `Warmup`), which is what makes epoch checkpoints sufficient entry points for joiners (§9).
+  - **Operational note (declared-run authoring).** A join is applied **roster-direct** only while
+    the run is still `WaitingForMembers`; a join that arrives **after** the
+    `WaitingForMembers → Warmup` transition is staged `pending` and materializes only at the next
+    epoch boundary — so with `epoch_rounds = 0` (a single-epoch run) it never materializes mid-run.
+    Declared-run authors MUST therefore set `min_peers` = the **expected initial roster size**, or a
+    worker that races the warmup transition is stranded pending for the whole run. (Enforced by the
+    coordinator `tick`; pinned by `daemon-swarm-coordinator` `tests/pending_join.rs`.)
 - **Termination**: `[data].stop` (tokens or rounds) is the `Finished` trigger, evaluated at
   round boundaries; `Paused` is an operator state — only the run author / org admins may
   pause or resume (coordinator-authenticated intent, §11.1), and peers treat it like an idle
