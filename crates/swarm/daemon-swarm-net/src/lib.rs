@@ -27,6 +27,9 @@
 #![forbid(unsafe_code)]
 
 pub mod artifact;
+/// A blake3-keyed, on-disk, size-bounded content cache (spec §8/§10.6; P3 lane S) — the persistent
+/// half of the artifact/shard cache the fleet warms once and never re-downloads.
+pub mod content_cache;
 pub mod dedupe;
 /// Multiplex several [`ControlPlane`]s (WS + iroh gossip) with cross-plane content-hash dedupe
 /// (spec §7.1; A1) — the run survives one plane degrading.
@@ -51,6 +54,7 @@ pub mod transport;
 pub mod ws_client;
 
 pub use artifact::{ArtifactCache, ArtifactRef, ArtifactResolver, ArtifactScheme};
+pub use content_cache::ContentCache;
 pub use dedupe::Deduper;
 pub use dual_plane::DualPlane;
 pub use fetch::{
