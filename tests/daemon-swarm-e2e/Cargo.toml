@@ -34,6 +34,17 @@ daemon-swarm-coordinator = { workspace = true }
 daemon-swarm-observe = { workspace = true }
 ciborium = { workspace = true }
 blake3 = { workspace = true }
+# The A3 live worker-subprocess e2e (`tests/ws_live_workers.rs`, env-gated on wrangler-dev): the
+# node-side supervisor spawns REAL `daemon-train-worker` subprocesses, the SwarmService proves the
+# event pump into swarm.db, EgressClient POSTs the create-run request + reads DO state, and
+# serde_json/base64 author the request body. All existing `[workspace.dependencies]` entries — the
+# e2e crate stays a leaf.
+daemon-train-client = { workspace = true }
+daemon-swarm-node = { workspace = true }
+daemon-api = { workspace = true }
+daemon-egress = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
 
 [lints]
 workspace = true

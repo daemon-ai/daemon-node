@@ -30,6 +30,10 @@ serde = { workspace = true }
 # `[experiment.config]` is carried as an opaque CBOR value in the frozen envelope.
 ciborium = { workspace = true }
 anyhow = { workspace = true }
+# `--emit-create-request` (A3, Merge-1 Decision 1): the registry CreateRunRequest JSON body with
+# the declared RunConfig fields. Both already `[workspace.dependencies]` entries — no root change.
+serde_json = { workspace = true }
+base64 = { workspace = true }
 
 [lints]
 workspace = true
