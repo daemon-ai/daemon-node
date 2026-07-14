@@ -371,7 +371,14 @@ fn open_corpus_cache() -> Result<ContentCache, String> {
 
 /// Build an [`ArtifactResolver`] for the corpus fetch from the live credentials (egress + presign for
 /// `r2://`). The presign auth mirrors the payload-store auth (bearer / internal identity).
+///
+/// The presign **scope** is `DAEMON_SWARM_RUN_ID` when set (the shared asset prefix
+/// `runs/<scope>/corpus/…` — content-addressed objects are published once and consumed by many runs;
+/// the presign endpoint scopes keys, it does not require the id to be a live run), else the joined
+/// run id. Mirrors `backend::store_fetch_context` so module + corpus resolve under one scope.
 fn corpus_resolver(run_id: &str, creds: &JoinCredentials) -> Result<ArtifactResolver, String> {
+    let scope = std::env::var("DAEMON_SWARM_RUN_ID").unwrap_or_else(|_| run_id.to_string());
+    let run_id: &str = &scope;
     let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
         .map_err(|e| format!("egress client: {e}"))?;
     let mut resolver = ArtifactResolver::with_egress(egress);
