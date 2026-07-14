@@ -722,8 +722,30 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
 /// selects a backend, so it is gated with its sole caller (`live.rs`).
 #[cfg(feature = "swarm-net")]
 pub(crate) fn select_backend() -> (daemon_train::BackendKind, Option<u32>) {
-    if std::env::var("DAEMON_TRAIN_BACKEND").as_deref() == Ok("cpu") {
+    let requested = std::env::var("DAEMON_TRAIN_BACKEND").ok();
+    if requested.as_deref() == Ok("cpu") {
         return (daemon_train::BackendKind::Cpu, None);
+    }
+    // Explicit operator override (P3 Merge-2): `DAEMON_TRAIN_BACKEND=wgpu` pins the wgpu rung even
+    // when a CUDA device is present — the honest escape hatch for a box whose CUDA lane is unusable
+    // (the Merge-2 fleet run hit a cubecl-cuda VRAM-exhaustion panic in the fleet engine loop that
+    // the OOM ladder cannot catch: cubecl panics on its own thread instead of returning a
+    // BudgetMemory trap; single-host 160M CUDA is green — recorded in swarm-p3-ledger). Probe-gated:
+    // if the requested rung has no usable adapter, fall through the normal ladder below.
+    #[cfg(feature = "wgpu")]
+    if requested.as_deref() == Ok("wgpu") {
+        if let Some(p) = daemon_train::autotune::probe_wgpu() {
+            eprintln!(
+                "daemon-train-worker: DAEMON_TRAIN_BACKEND=wgpu override — selecting wgpu native \
+                 lane (adapter: {}, backend {}); det lane stays host fp32 (consensus-invariant)",
+                p.adapter, p.backend
+            );
+            return (daemon_train::BackendKind::Wgpu, None);
+        }
+        eprintln!(
+            "daemon-train-worker: DAEMON_TRAIN_BACKEND=wgpu requested but no usable adapter — \
+             falling through the probe ladder"
+        );
     }
     #[cfg(feature = "cuda")]
     {
