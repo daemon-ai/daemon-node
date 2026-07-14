@@ -579,22 +579,59 @@ fn probe_cuda_uncached() -> Option<CudaProbe> {
 /// operator (or the future fetch-on-demand stager) provides it via `DAEMON_CUDA_RUNTIME_DIR` on
 /// `LD_LIBRARY_PATH`; cudarc dlopens `libnvrtc.so.12` by soname on first use.
 ///
-/// This check compiles-and-frees a trivial NVRTC program inside `catch_unwind`: in cudarc's dlopen
-/// mode a missing `libnvrtc` surfaces as a panic on first symbol resolution, which is caught and
-/// reported as **not ready** — the worker's fat-binary probe order then downgrades to wgpu/CPU
-/// instead of failing on the first tensor op. Memoized process-wide (dlopen'd libraries stay loaded).
+/// This check has **two legs**, both required (live-attach smoke finding, swarm-ledger-p3-g D6):
+///
+/// 1. **`libnvrtc` loadability** — compile-and-free a trivial NVRTC program inside `catch_unwind`:
+///    in cudarc's dlopen mode a missing `libnvrtc` surfaces as a panic on first symbol resolution,
+///    which is caught and reported as **not ready**.
+/// 2. **cudart JIT headers** — cubecl-cuda resolves `#include <cuda_runtime.h>` for every kernel it
+///    JITs via its `cuda_path()` rule (`$CUDA_PATH`, else `/usr/local/cuda`, `/opt/cuda`, or `/usr`
+///    when `/usr/bin/nvcc` exists) and **panics at kernel-compile time** when none resolves. The lib
+///    being loadable is NOT sufficient — a worker that passed leg 1 alone would select CUDA and then
+///    panic-spam on the first tensor op (observed live on the 4090 when spawned without `CUDA_PATH`).
+///    So readiness also requires `<cuda_path>/include/cuda_runtime.h` to exist (the same search rule,
+///    checked here without panicking).
+///
+/// The worker's fat-binary probe order downgrades to wgpu/CPU when either leg fails. Memoized
+/// process-wide (dlopen'd libraries + the env are process-start state).
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn cuda_nvrtc_ready() -> bool {
     use std::sync::OnceLock;
     static READY: OnceLock<bool> = OnceLock::new();
     *READY.get_or_init(|| {
+        if !cuda_jit_headers_present() {
+            return false;
+        }
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let attempt = std::panic::catch_unwind(cuda_ffi::nvrtc_loads);
         std::panic::set_hook(prev);
         matches!(attempt, Ok(true))
     })
+}
+
+/// Whether cubecl-cuda's JIT include path resolves to a real `cuda_runtime.h` — leg 2 of
+/// [`cuda_nvrtc_ready`]. Mirrors cubecl's `cuda_path()` search order exactly (`$CUDA_PATH`, then
+/// `/usr/local/cuda`, `/opt/cuda`, `/usr` iff `/usr/bin/nvcc`) but returns `false` instead of
+/// panicking, and additionally requires the header itself (an empty/incomplete dir is not ready).
+/// The fetch-on-demand stager satisfies this by shipping the cudart `include/` inside the runtime
+/// dir and the launcher exporting `CUDA_PATH=$DAEMON_CUDA_RUNTIME_DIR` (the staged
+/// `/root/cuda-rt-124` already carries `include/cuda_runtime.h`).
+#[cfg(feature = "cuda")]
+fn cuda_jit_headers_present() -> bool {
+    let base = if let Ok(p) = std::env::var("CUDA_PATH") {
+        Some(std::path::PathBuf::from(p))
+    } else if std::path::Path::new("/usr/local/cuda").exists() {
+        Some(std::path::PathBuf::from("/usr/local/cuda"))
+    } else if std::path::Path::new("/opt/cuda").exists() {
+        Some(std::path::PathBuf::from("/opt/cuda"))
+    } else if std::path::Path::new("/usr/bin/nvcc").exists() {
+        Some(std::path::PathBuf::from("/usr"))
+    } else {
+        None
+    };
+    base.is_some_and(|b| b.join("include").join("cuda_runtime.h").exists())
 }
 
 // The one cudarc-touching module. `cuDeviceTotalMem` / `destroy_program` are `cudarc` `unsafe fn`s,

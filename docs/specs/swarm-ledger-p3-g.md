@@ -169,11 +169,19 @@ indirection the `.#cuda-train` shell already exports onto `LD_LIBRARY_PATH`); un
 **downgrades to Vulkan/CPU**. Lane G does NOT build the fetch machinery — it keeps the runtime-dir
 contract clean and gates on readiness:
 
-- **Readiness gate:** `autotune::cuda_nvrtc_ready()` (memoized, `catch_unwind`) creates + frees a
-  trivial NVRTC program via cudarc — proving `libnvrtc.so.12` dlopens and its symbols resolve.
-  `select_backend()` requires `probe_cuda().is_some() && cuda_nvrtc_ready()` before choosing
-  `BackendKind::Cuda`; a CUDA device with unstaged NVRTC logs a loud "stage DAEMON_CUDA_RUNTIME_DIR"
-  note and falls through to wgpu/CPU (never fails on the first tensor op).
+- **Readiness gate (two legs, both required):** `autotune::cuda_nvrtc_ready()` (memoized,
+  `catch_unwind`) requires (1) a **loadable `libnvrtc`** — creates + frees a trivial NVRTC program
+  via cudarc, proving `libnvrtc.so.12` dlopens and its symbols resolve — AND (2) the **cudart JIT
+  headers**: cubecl-cuda resolves `#include <cuda_runtime.h>` per its `cuda_path()` rule
+  (`$CUDA_PATH`, else `/usr/local/cuda` / `/opt/cuda` / `/usr`-with-nvcc) and **panics at
+  kernel-compile time** when none resolves — a live-attach smoke on the 4090 caught exactly this
+  (worker spawned over bare ssh without `CUDA_PATH`: probe passed, first tensor op panic-spammed;
+  the run still finished byte-identical because the det lane is host fp32, but the CUDA lane was
+  effectively dead). `cuda_jit_headers_present()` mirrors the search rule non-panicking and requires
+  `<cuda_path>/include/cuda_runtime.h`. `select_backend()` requires
+  `probe_cuda().is_some() && cuda_nvrtc_ready()` before choosing `BackendKind::Cuda`; anything less
+  logs a loud "stage DAEMON_CUDA_RUNTIME_DIR + CUDA_PATH" note and falls through to wgpu/CPU (never
+  fails on the first tensor op).
 - **What the future fetcher must provide (the contract, from the C2/C3 findings + this lane's runs):**
   a directory (to be exported as `DAEMON_CUDA_RUNTIME_DIR` and prepended to `LD_LIBRARY_PATH` by the
   launcher — the `.#cuda-train` shellHook already does the prepend) containing, at minimum:
@@ -187,12 +195,16 @@ contract clean and gates on readiness:
   - it need NOT ship `libcuda`/`libnvidia-nvvm`/`libnvidia-ptxjitcompiler` — those are the box
     **driver's own userspace** and load from the system path (host libcuda under nix glibc is proven,
     C2 D5); the RunPod staging dir includes them only as convenience symlinks.
-  - cudart **headers** are a build-time-only need (`CUDA_PATH`, from the devShell's `cuda_cudart`);
-    the fetcher does not provide headers.
+  - cudart **headers** (`include/cuda_runtime.h` + its tree) inside the runtime dir, and the
+    launcher must export `CUDA_PATH=$DAEMON_CUDA_RUNTIME_DIR` (in addition to the `LD_LIBRARY_PATH`
+    prepend). This is a **runtime** need, not just build-time: cubecl-cuda re-includes
+    `cuda_runtime.h` on every NVRTC kernel JIT and panics without it (the live-smoke finding above).
+    The staged `/root/cuda-rt-124` already carries `include/`; the NVIDIA wheel path for it is
+    `nvidia-cuda-runtime-cu12`'s `include/` (or the `cuda_cudart` package matching the driver level).
   - **Readiness vs downgrade detection:** the fetcher's success criterion IS `cuda_nvrtc_ready()`
-    flipping to `true` in a fresh process (dlopen search paths are process-start state; a worker
-    restarts after staging). No sentinel files, no version parsing at probe time — loadability is
-    the test.
+    flipping to `true` in a fresh process (dlopen search paths + `CUDA_PATH` are process-start
+    state; a worker restarts after staging). No sentinel files, no version parsing at probe time —
+    loadability + header presence is the test.
 
 ## Additive extensions made (freeze at Merge 1) — exact
 

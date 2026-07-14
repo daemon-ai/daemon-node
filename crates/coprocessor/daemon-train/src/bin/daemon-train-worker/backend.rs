@@ -439,9 +439,11 @@ pub(crate) fn select_backend() -> (daemon_train::BackendKind, Option<u32>) {
                 return (daemon_train::BackendKind::Cuda, Some(0));
             }
             eprintln!(
-                "daemon-train-worker: CUDA device present ({}) but libnvrtc is not loadable — \
-                 stage the driver-matched NVRTC runtime (DAEMON_CUDA_RUNTIME_DIR) to enable the \
-                 CUDA lane; downgrading (probe order: cuda -> wgpu -> cpu)",
+                "daemon-train-worker: CUDA device present ({}) but the JIT runtime is not staged \
+                 (libnvrtc loadable + CUDA_PATH/include/cuda_runtime.h required) — stage the \
+                 driver-matched NVRTC runtime (DAEMON_CUDA_RUNTIME_DIR, export \
+                 CUDA_PATH=$DAEMON_CUDA_RUNTIME_DIR) to enable the CUDA lane; downgrading \
+                 (probe order: cuda -> wgpu -> cpu)",
                 p.adapter
             );
         } else {
