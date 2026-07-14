@@ -221,6 +221,76 @@ fn root_only_agreement_without_opening_is_not_evidence() {
     assert!(committed_entries(&rs, &[member(1)]).is_empty());
 }
 
+// ----- §A.3 small-n witness-quorum edges in the commit rule -----
+
+#[test]
+fn small_n_attestation_quorum_covers_at_the_special_case_boundary() {
+    // The §A.3 adopted small-n quorum specials (⌈⅔n⌉ with 1→1, 2→2, 3→2) must hold in the *commit
+    // rule*, not just the pure `witness_quorum` helper: a payload is covered by the attestation path
+    // exactly when a quorum of witnesses supplies an inline opening of its set. Below the quorum it
+    // is held out; at the quorum it is admitted. Pins the small rosters the gate's ≥4-peer run and
+    // any degraded (churned-down) epoch pass through.
+    use daemon_swarm_proto::assignment::witness_quorum;
+
+    for n in 1u32..=3 {
+        let witnesses: Vec<PeerId> = (10..10 + n as u8).map(pid).collect();
+        let quorum = witness_quorum(n) as usize;
+        assert_eq!(
+            quorum,
+            match n {
+                1 => 1,
+                2 => 2,
+                3 => 2,
+                _ => unreachable!(),
+            },
+            "small-n special quorum for n={n}"
+        );
+
+        let set_pairs = vec![(pid(1), payload_hash(30))];
+        let mut rs = slot_with(witnesses.clone());
+        rs.commitments.insert(pid(1), commitment(0, 30));
+
+        // One short of quorum: not covered.
+        for w in witnesses.iter().take(quorum - 1) {
+            rs.attestations.insert(*w, inline_attest(&set_pairs));
+        }
+        assert!(
+            !has_evidence(&rs, &pid(1), &payload_hash(30)),
+            "n={n}: {} of {quorum} witnesses is below quorum",
+            quorum - 1
+        );
+
+        // Exactly quorum witnesses open the set → covered.
+        rs.attestations
+            .insert(witnesses[quorum - 1], inline_attest(&set_pairs));
+        assert!(
+            has_evidence(&rs, &pid(1), &payload_hash(30)),
+            "n={n}: a quorum of {quorum} witnesses covers the commitment"
+        );
+    }
+}
+
+#[test]
+fn single_peer_round_finalizes_on_self_evidence() {
+    // n=1 degenerate roster: a one-peer round is `all_evidenced` once its single member is covered
+    // (quorum(1)=1 — the sole witness's inline opening, or equivalently a StorageReceipt). The commit
+    // rule must not deadlock at n=1 (the smallest churn floor a gate epoch can shrink to).
+    let roster = vec![member(1)];
+    let mut rs = slot_with(vec![pid(1)]);
+    rs.commitments.insert(pid(1), commitment(0, 42));
+    assert!(!all_evidenced(&rs, &roster), "no evidence yet");
+
+    rs.attestations
+        .insert(pid(1), inline_attest(&[(pid(1), payload_hash(42))]));
+    assert!(
+        all_evidenced(&rs, &roster),
+        "the sole peer's self-attestation (quorum 1) evidences the round"
+    );
+    let entries = committed_entries(&rs, &roster);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].peer, pid(1));
+}
+
 // ----- PROTO-5: bad signature rejected at the frame -----
 
 #[test]

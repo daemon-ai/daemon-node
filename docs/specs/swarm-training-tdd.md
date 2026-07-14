@@ -3,7 +3,10 @@
 **Status:** test-planning companion to
 [`swarm-training-spec.md`](swarm-training-spec.md) (architecture design) and
 [`swarm-tensor-abi-spec.md`](swarm-tensor-abi-spec.md) (interface contract; its §11 conformance
-surface is owned here as HOST-12..15, §3.5). Not yet scheduled.
+surface is owned here as HOST-12..15, §3.5). **P0/P1/P2 suites landed** through the P2 waves
+(B1's SDK/HOST/PROTO/RUN/CLI suites, B2B3's observe/replay + RUN-10, B4's §6.2 pending-join +
+small-n quorum + checkpoint-resync proof); the authoritative per-ID coverage map (TDD ID →
+status → suite) is `swarm-ledger-p2-b4.md`. P4/P5 items (§7) remain future debt.
 **Purpose:** enumerate the reference-codebase tests worth **porting** for a test-driven build of
 the swarm-training stack, classify each by portability, pin the **golden numeric constants**
 parity tests must reproduce, and register the behaviors the spec requires that have **no upstream
