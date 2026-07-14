@@ -303,6 +303,45 @@ mod tests {
         );
     }
 
+    /// The end-to-end fetch-by-hash distribution path (P3 lane S): a module published at the
+    /// content-addressed key `modules/<blake3>.wasm` is fetched via a presigned GET + blake3-verified
+    /// by [`ArtifactResolver`], cached here, and served from cache on the second fetch — even after
+    /// the object is evicted server-side (the fleet-warm property).
+    #[tokio::test]
+    async fn fetch_by_hash_then_serve_from_cache() {
+        use crate::mock_r2::MockR2;
+        use crate::{ArtifactRef, ArtifactResolver, RunId};
+        use std::sync::Arc;
+
+        let mock = MockR2::start().await;
+        let module = b"experiment-160m-wasm-bytes".to_vec();
+        let hash = blake3_hash(&module);
+        let key_path = format!("modules/{}.wasm", hash.to_hex());
+        // The artifact key layout is `runs/<run>/<path>` (spec §11.3 / cloud keys.ts).
+        mock.seed(&format!("runs/run-x/{key_path}"), module.clone());
+
+        let resolver = ArtifactResolver::with_egress(mock.egress())
+            .with_presign(Arc::new(mock.presign_client()), RunId::new("run-x"));
+        let art = ArtifactRef::new(format!("r2://{key_path}"), hash);
+
+        let dir = temp_root("content-cache-fetch");
+        let cache = ContentCache::open(dir.path(), 1 << 30).unwrap();
+
+        // Miss → fetch from the store (presigned GET, blake3-verified) → cache.
+        assert_eq!(cache.get(&hash).await.unwrap(), None);
+        let fetched = resolver.fetch(&art).await.unwrap();
+        assert_eq!(fetched, module);
+        cache.insert(&hash, &fetched).await.unwrap();
+
+        // Evict the object server-side; the warmed cache still serves it (no re-download).
+        mock.evict(&format!("runs/run-x/{key_path}"));
+        assert!(
+            resolver.fetch(&art).await.is_err(),
+            "object is gone server-side"
+        );
+        assert_eq!(cache.get(&hash).await.unwrap(), Some(module));
+    }
+
     #[tokio::test]
     async fn persists_across_reopen() {
         let dir = temp_root("content-cache-persist");
