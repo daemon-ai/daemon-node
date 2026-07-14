@@ -174,14 +174,14 @@ pub(crate) async fn join_and_run_live(
     let _ = out_tx.send(Event::MicroBatch { micro_batch });
 
     // The backend: a §10.5 OOM-ladder wrapper around the WasmBackend that emits Metric{loss} +
-    // OomLadder telemetry through the same pump.
+    // OomLadder telemetry through the same pump. Constructs the backend on its host — a dedicated
+    // device thread for the CUDA lane (cubecl per-thread stream discipline), in place otherwise.
     let backend = LadderBackend::new(
-        build_wasm_backend(module, config)?,
         module.to_vec(),
         config.to_vec(),
         out_tx.clone(),
         creds.engine.corpus_vocab_clamp,
-    );
+    )?;
 
     // EngineEvent → protocol::Event forwarder (per-round RunPhase/RoundOutcome/Warning). It also
     // publishes each `Checkpointed` manifest to the coordinator's checkpoint-pointer surface
@@ -792,12 +792,110 @@ fn build_wasm_backend(module: &[u8], config: &[u8]) -> Result<WasmBackend, Strin
 /// the additive `OomLadder` telemetry. Tiny-llama never OOMs, so the ladder is a defensive recovery
 /// seam exercised only under real memory pressure.
 ///
-/// The `WasmBackend` is `Send` but **not** `Sync` (its `dyn OpBackend`), while the spawned engine
-/// future must be `Send` — which requires the backend be `Sync` (the engine holds `&self` across the
-/// publish `.await`). So it rides in a `Mutex` (`Mutex<T>: Sync` for `T: Send`); the engine owns the
-/// backend exclusively, so the lock is uncontended (B3's live-harness adapter recipe).
+/// One boxed backend operation, executed on the pinned device thread.
+#[cfg(feature = "cuda")]
+type DeviceJob = Box<dyn FnOnce(&mut WasmBackend) + Send>;
+
+/// A dedicated OS thread that OWNS the `WasmBackend` — construction and every subsequent call
+/// happen on this one thread (the daemon-infer GPU-worker pattern, channel-serialized).
+///
+/// **Why (P3 Merge-2, the CUDA-live fix).** The engine future runs under tokio and migrates
+/// across worker threads at `.await` points, so the backend's sync methods execute on whichever
+/// thread polls the future. cubecl derives its CUDA stream + memory-pool registry from the
+/// *calling thread* (`cubecl_common::StreamId::current()` is a thread-local), so cross-thread
+/// polls split the pool bookkeeping across per-thread streams. At small scale the split pools
+/// merely waste memory; at 160M (~24 GiB pool, paging active) a handle allocated under one
+/// thread's stream is looked up under another's → cubecl-cuda `server.rs:124` "can't allocate
+/// buffer" / `stream.rs:101` "Memory page 0 doesn't exist" panics (ceremony5/7/11 + the 160M
+/// live bisect; single-host — one thread — is green at the same scale, reduced-live — low
+/// pressure — is green too). Pinning every backend call to the context-owning thread restores
+/// cubecl's single-stream discipline. Calls block the caller until the device thread replies —
+/// byte-identical semantics to the previous in-place call, just on a fixed thread.
+#[cfg(feature = "cuda")]
+struct DeviceThread {
+    tx: std::sync::mpsc::Sender<DeviceJob>,
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceThread {
+    /// Spawn the device thread and construct the backend ON it (CUDA context + streams are then
+    /// owned by this thread for the process lifetime).
+    fn spawn(module: Vec<u8>, config: Vec<u8>) -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::channel::<DeviceJob>();
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        std::thread::Builder::new()
+            .name("gpu-device".into())
+            .spawn(move || {
+                let mut backend = match build_wasm_backend(&module, &config) {
+                    Ok(b) => {
+                        let _ = init_tx.send(Ok(()));
+                        b
+                    }
+                    Err(e) => {
+                        let _ = init_tx.send(Err(e));
+                        return;
+                    }
+                };
+                while let Ok(job) = rx.recv() {
+                    job(&mut backend);
+                }
+            })
+            .map_err(|e| format!("spawn gpu device thread: {e}"))?;
+        init_rx
+            .recv()
+            .map_err(|e| format!("gpu device thread init: {e}"))??;
+        Ok(Self { tx })
+    }
+
+    /// Run `f` on the device thread, blocking until it replies.
+    fn call<R, F>(&self, f: F) -> R
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut WasmBackend) -> R + Send + 'static,
+    {
+        let (rtx, rrx) = std::sync::mpsc::sync_channel::<R>(1);
+        self.tx
+            .send(Box::new(move |b| {
+                let _ = rtx.send(f(b));
+            }))
+            .expect("gpu device thread alive");
+        rrx.recv().expect("gpu device thread reply")
+    }
+}
+
+/// Where the `WasmBackend` lives.
+///
+/// `Direct`: in-place behind a `Mutex` (the B3 live-harness recipe — the `WasmBackend` is `Send`
+/// but not `Sync`, the engine future must be `Send`, and the engine owns the backend exclusively
+/// so the lock is uncontended). Used for the CPU and wgpu lanes: the CPU lane has no device
+/// state, and wgpu's queue submission is internally synchronized (proven green at gate scale) —
+/// don't change what's proven.
+///
+/// `Pinned`: on a [`DeviceThread`] — the CUDA lane (see there for why).
+enum BackendHost {
+    Direct(Box<std::sync::Mutex<WasmBackend>>),
+    #[cfg(feature = "cuda")]
+    Pinned(DeviceThread),
+}
+
+impl BackendHost {
+    fn with<R, F>(&self, f: F) -> R
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut WasmBackend) -> R + Send + 'static,
+    {
+        match self {
+            BackendHost::Direct(m) => f(&mut m.lock().expect("backend lock")),
+            #[cfg(feature = "cuda")]
+            BackendHost::Pinned(t) => t.call(f),
+        }
+    }
+}
+
+/// The §10.5 OOM-ladder / event-emitting [`TrainerBackend`] wrapper around the [`WasmBackend`]
+/// (hosted per [`BackendHost`]).
 struct LadderBackend {
-    inner: std::sync::Mutex<WasmBackend>,
+    host: BackendHost,
     module: Vec<u8>,
     config: Vec<u8>,
     events: UnboundedSender<Event>,
@@ -809,22 +907,37 @@ struct LadderBackend {
 }
 
 impl LadderBackend {
+    /// Build the backend, pinning the CUDA lane to a dedicated device thread (see
+    /// [`DeviceThread`]); every other lane constructs in place (unchanged).
     fn new(
-        inner: WasmBackend,
         module: Vec<u8>,
         config: Vec<u8>,
         events: UnboundedSender<Event>,
         vocab_clamp: u32,
-    ) -> Self {
-        Self {
-            inner: std::sync::Mutex::new(inner),
+    ) -> Result<Self, String> {
+        let (kind, _gpu) = crate::backend::select_backend();
+        let host = match kind {
+            #[cfg(feature = "cuda")]
+            daemon_train::BackendKind::Cuda => {
+                eprintln!(
+                    "daemon-train-worker: pinning the CUDA backend to a dedicated device thread \
+                     (cubecl per-thread stream discipline)"
+                );
+                BackendHost::Pinned(DeviceThread::spawn(module.clone(), config.clone())?)
+            }
+            _ => BackendHost::Direct(Box::new(std::sync::Mutex::new(build_wasm_backend(
+                &module, &config,
+            )?))),
+        };
+        Ok(Self {
+            host,
             module,
             config,
             events,
             vocab_clamp,
             round: 0,
             halvings: 0,
-        }
+        })
     }
 }
 
@@ -839,38 +952,37 @@ impl TrainerBackend for LadderBackend {
     type Error = WasmBackendError;
 
     fn build(&mut self, config: &[u8]) -> Result<(), Self::Error> {
-        self.inner.get_mut().expect("backend lock").build(config)
+        let config = config.to_vec();
+        self.host.with(move |b| b.build(&config))
     }
     fn assess(
         &self,
         meta: &daemon_swarm_run::backend::AssessMeta,
     ) -> Result<daemon_swarm_run::backend::Assessment, Self::Error> {
-        self.inner.lock().expect("backend lock").assess(meta)
+        let meta = *meta;
+        self.host.with(move |b| b.assess(&meta))
     }
     fn train_step(
         &mut self,
         batch: &BatchRef,
         ctx: StepCtx,
     ) -> Result<daemon_swarm_run::backend::StepStats, Self::Error> {
-        let clamped;
         let batch = if self.vocab_clamp > 0 {
-            clamped = BatchRef {
+            BatchRef {
                 tokens: batch.tokens.iter().map(|t| t % self.vocab_clamp).collect(),
                 seq_len: batch.seq_len,
-            };
-            &clamped
+            }
         } else {
-            batch
+            batch.clone()
         };
-        let first = self
-            .inner
-            .get_mut()
-            .expect("backend lock")
-            .train_step(batch, ctx);
+        let step_batch = batch.clone();
+        let first = self.host.with(move |b| b.train_step(&step_batch, ctx));
         let stats = match first {
             Ok(s) => s,
             Err(e) if is_oom(&e) => {
                 // §10.5 churn: a fresh instance releases the OOMing instance's memory; retry once.
+                // The rebuild happens ON the backend's host (device thread for CUDA) so the fresh
+                // context/streams stay thread-owned.
                 self.halvings += 1;
                 let _ = self.events.send(Event::OomLadder {
                     round: self.round,
@@ -878,14 +990,18 @@ impl TrainerBackend for LadderBackend {
                     to_micro_batch: ctx.step_seqs.max(2) / 2,
                     halvings: self.halvings,
                 });
-                let mut fresh = WasmBackend::new(WasmBackendConfig {
-                    wasm: self.module.clone(),
-                    engine: worker_engine_config(),
-                })?;
-                fresh.build(&self.config)?;
-                let stats = fresh.train_step(batch, ctx)?;
-                *self.inner.get_mut().expect("backend lock") = fresh;
-                stats
+                let module = self.module.clone();
+                let config = self.config.clone();
+                self.host.with(move |slot| {
+                    let mut fresh = WasmBackend::new(WasmBackendConfig {
+                        wasm: module,
+                        engine: worker_engine_config(),
+                    })?;
+                    fresh.build(&config)?;
+                    let stats = fresh.train_step(&batch, ctx)?;
+                    *slot = fresh;
+                    Ok::<_, WasmBackendError>(stats)
+                })?
             }
             Err(e) => return Err(e),
         };
@@ -896,16 +1012,10 @@ impl TrainerBackend for LadderBackend {
         Ok(stats)
     }
     fn inner_update(&mut self, inner_step: u32) -> Result<(), Self::Error> {
-        self.inner
-            .get_mut()
-            .expect("backend lock")
-            .inner_update(inner_step)
+        self.host.with(move |b| b.inner_update(inner_step))
     }
     fn make_update(&mut self, round: RoundId) -> Result<Vec<u8>, Self::Error> {
-        self.inner
-            .get_mut()
-            .expect("backend lock")
-            .make_update(round)
+        self.host.with(move |b| b.make_update(round))
     }
     fn ingest(
         &mut self,
@@ -914,18 +1024,14 @@ impl TrainerBackend for LadderBackend {
     ) -> Result<StateDigest, Self::Error> {
         self.round = round;
         self.halvings = 0;
-        self.inner
-            .get_mut()
-            .expect("backend lock")
-            .ingest(round, staged)
+        let staged = staged.to_vec();
+        self.host.with(move |b| b.ingest(round, &staged))
     }
     fn checkpoint_save(&self) -> Result<Vec<u8>, Self::Error> {
-        self.inner.lock().expect("backend lock").checkpoint_save()
+        self.host.with(|b| b.checkpoint_save())
     }
     fn checkpoint_load(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.inner
-            .get_mut()
-            .expect("backend lock")
-            .checkpoint_load(bytes)
+        let bytes = bytes.to_vec();
+        self.host.with(move |b| b.checkpoint_load(&bytes))
     }
 }

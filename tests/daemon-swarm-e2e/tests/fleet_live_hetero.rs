@@ -173,6 +173,17 @@ fn micro_batch() -> u32 {
 // every 2 rounds guarantees one is published + registered before the default kill (after round 2),
 // so the rejoiner resumes from it. Retention comfortably exceeds any short-run replay gap.
 const CHECKPOINT_EVERY_ROUNDS: u32 = 2;
+/// Env-overridable checkpoint cadence (`SWARM_FLEET_CHECKPOINT_EVERY`, default 2; `0` = never).
+/// Diagnostic knob (P3 Merge-2): the 160M CUDA-live pod panic fires exactly at the first
+/// checkpoint round — `checkpoint_save`'s device readback staging on a cubecl pool already at
+/// ~24.1/24.5 GiB. Setting 0 isolates the trigger. The churn ceremony REQUIRES a checkpoint
+/// (resync drill), so this stays 2 there.
+fn checkpoint_every_rounds() -> u32 {
+    env_u64(
+        "SWARM_FLEET_CHECKPOINT_EVERY",
+        u64::from(CHECKPOINT_EVERY_ROUNDS),
+    ) as u32
+}
 const PAYLOAD_RETENTION_ROUNDS: u64 = 16;
 
 // ---- env config ----------------------------------------------------------------------------------
@@ -580,7 +591,7 @@ fn credentials_for(
             // Checkpoint every 2 rounds (§9) so a registered checkpoint exists BEFORE the churn kill
             // (drop_after_round default 2 ⇒ a post-round-1 checkpoint is published first) — the
             // rejoiner then resumes from it + replays retained rounds (lane R live resync).
-            checkpoint_every_rounds: CHECKPOINT_EVERY_ROUNDS,
+            checkpoint_every_rounds: checkpoint_every_rounds(),
             update_max_bytes,
             corpus_seed: 7,
             corpus_shards: 4,
