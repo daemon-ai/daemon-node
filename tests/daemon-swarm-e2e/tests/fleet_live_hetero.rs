@@ -159,8 +159,16 @@ fn declared_cooldown_s() -> u64 {
     env_u64("SWARM_FLEET_COOLDOWN_S", 2)
 }
 // Must divide across `peers × steps_per_round × micro_batch`; set from the peer count at run time.
-const STEPS_PER_ROUND: u32 = 2;
-const MICRO_BATCH: u32 = 2;
+// Data-partition shape. Env-overridable (`SWARM_FLEET_STEPS_PER_ROUND` / `SWARM_FLEET_MICRO_BATCH`,
+// default 2/2 = the P2 tiny-llama shape) so the 160M ceremony can dial them to 1/1 — a CPU-det peer
+// (the sealed Windows cross-build carries no GPU backend) then does one 160M step/round, tractable
+// within the barrier round timeout.
+fn steps_per_round() -> u32 {
+    env_u64("SWARM_FLEET_STEPS_PER_ROUND", 2) as u32
+}
+fn micro_batch() -> u32 {
+    env_u64("SWARM_FLEET_MICRO_BATCH", 2) as u32
+}
 // §9 checkpoint cadence + resync-replay window used by the churn ceremony (lane R): a checkpoint
 // every 2 rounds guarantees one is published + registered before the default kill (after round 2),
 // so the rejoiner resumes from it. Retention comfortably exceeds any short-run replay gap.
@@ -376,7 +384,7 @@ fn author_envelope(
         artifacts,
         data: DataSection {
             manifest: manifest_name,
-            steps_per_round: STEPS_PER_ROUND,
+            steps_per_round: steps_per_round(),
             global_batch: GlobalBatch {
                 start: global_batch,
                 end: global_batch,
@@ -558,8 +566,8 @@ fn credentials_for(
         iroh,
         presign_base: Some(env.presign_base.clone()),
         engine: EngineParams {
-            steps_per_round: STEPS_PER_ROUND,
-            micro_batch: MICRO_BATCH,
+            steps_per_round: steps_per_round(),
+            micro_batch: micro_batch(),
             stall_rounds_max: 3,
             // Checkpoint every 2 rounds (§9) so a registered checkpoint exists BEFORE the churn kill
             // (drop_after_round default 2 ⇒ a post-round-1 checkpoint is published first) — the
@@ -632,7 +640,7 @@ async fn fleet_heterogeneous_det_lane_agrees() {
         n >= 2,
         "need >= 2 peers for a cross-peer agreement assertion"
     );
-    let global_batch = n as u32 * STEPS_PER_ROUND * MICRO_BATCH;
+    let global_batch = n as u32 * steps_per_round() * micro_batch();
     let rounds = env.rounds;
     println!(
         "fleet rehearsal: {n} peers {:?}, {rounds} rounds, WS{}",
@@ -863,7 +871,7 @@ async fn fleet_gate_ceremony_with_churn() {
     assert!(n >= 2, "need >= 2 peers for a churn ceremony");
     let drop_index = env_usize("SWARM_GATE_DROP_INDEX", n - 1).min(n - 1);
     let drop_after_round: u64 = env_u64("SWARM_GATE_DROP_AFTER_ROUND", 2);
-    let global_batch = n as u32 * STEPS_PER_ROUND * MICRO_BATCH;
+    let global_batch = n as u32 * steps_per_round() * micro_batch();
     let rounds = env.rounds;
     let last_round = rounds - 1;
     println!(
@@ -1333,7 +1341,7 @@ async fn timed_local_run(
     rounds: u64,
     tag: &str,
 ) -> Vec<f64> {
-    let global_batch = n as u32 * STEPS_PER_ROUND * MICRO_BATCH;
+    let global_batch = n as u32 * steps_per_round() * micro_batch();
     let run_id = format!("run-c3-oh-{tag}-{}", now_secs());
     let envelope = author_envelope(
         &run_id,
