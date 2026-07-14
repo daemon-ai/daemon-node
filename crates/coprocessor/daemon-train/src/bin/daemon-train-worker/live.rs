@@ -31,7 +31,9 @@ use daemon_swarm_proto::{
     SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
 use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
-use daemon_swarm_run::checkpoint::{plan_resync, CheckpointManifest, ReplayStep, ResyncPlan};
+use daemon_swarm_run::checkpoint::{
+    plan_resync, CheckpointManifest, ReplayStep, ResyncPlan, CHECKPOINT_PEER,
+};
 use daemon_swarm_run::data::Corpus;
 use daemon_swarm_run::engine::{EngineConfig, EngineEvent, RoundEngine};
 use daemon_swarm_run::protocol::{ErrorClass, Event, JoinCredentials};
@@ -420,18 +422,6 @@ fn build_registry(coordinator: &str, creds: &JoinCredentials) -> Result<Registry
     })
 }
 
-/// Parse a 64-char lowercase-hex blake3 into a [`Hash`], or `None` if malformed.
-fn hash_from_hex(hex: &str) -> Option<Hash> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut arr = [0u8; 32];
-    for (i, byte) in arr.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(Hash::new(arr))
-}
-
 /// **Live checkpoint-resync on (re)join (spec §9; lane R).** Query the coordinator's latest
 /// checkpoint pointer; if the run is mid-flight, reload the checkpoint and replay the retained
 /// rounds forward through the engine so this peer rejoins byte-identical to the survivors. Every
@@ -456,7 +446,10 @@ async fn resync_on_join(
     let state = match registry.fetch_state(run_id).await {
         Ok(Some(s)) => s,
         // Run not initialized yet, or no state — a genuinely fresh join. Nothing to resync.
-        Ok(None) => return,
+        Ok(None) => {
+            warn("coordinator /state 404 (run not initialized); fresh-state rejoin".to_string());
+            return;
+        }
         Err(e) => {
             warn(format!(
                 "coordinator state fetch failed ({e}); fresh-state rejoin"
@@ -467,19 +460,40 @@ async fn resync_on_join(
 
     // No checkpoint published yet (first epoch, §9) → fresh-state (current behavior).
     let Some(ptr) = state.checkpoint else {
-        return;
-    };
-    let Some(blake3) = hash_from_hex(&ptr.hash) else {
         warn(format!(
-            "coordinator checkpoint pointer has a malformed hash ({:?}); fresh-state rejoin",
-            ptr.hash
+            "no checkpoint pointer at rejoin (phase={} round={}); fresh-state rejoin",
+            state.phase, state.round
         ));
         return;
     };
+    warn(format!(
+        "resync plan: checkpoint round {} size {}, current round {} phase {}",
+        ptr.round, ptr.size, state.round, state.phase
+    ));
+    // Resolve the checkpoint object actually stored at round `ptr.round` and load THAT (verified by
+    // its own content hash), rather than requiring a byte match to the pointer's hash. A checkpoint
+    // captures the deterministic CONSENSUS state (params + replicated persistents, §9) PLUS per-peer
+    // LOCAL optimizer state (Adam moments) that legitimately differs across peers — so peers write
+    // byte-divergent checkpoint objects to the shared key even though their post-round digest agrees.
+    // The digest (§5.6) and the replay fold depend only on the consensus half, so loading whichever
+    // valid post-`round` checkpoint is stored + replaying reproduces the exact consensus digest; the
+    // pointer's role is to name the round (and prove a checkpoint exists). HEAD yields the stored
+    // object's real hash for the content-verified load.
+    let ckpt_key = PayloadKey::new(RunId::new(run_id), ptr.round, CHECKPOINT_PEER);
+    let stat = match store.head(&ckpt_key).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn(format!(
+                "checkpoint object for round {} unavailable ({e}); fresh-state rejoin",
+                ptr.round
+            ));
+            return;
+        }
+    };
     let manifest = CheckpointManifest {
         round: ptr.round,
-        blake3,
-        size: ptr.size,
+        blake3: stat.hash,
+        size: stat.size,
         digest: StateDigest([0u8; 16]), // load verifies by blake3; the digest field is unused there
     };
 
