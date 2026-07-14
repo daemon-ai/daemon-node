@@ -93,6 +93,27 @@ impl<P: PresignClient> R2Store<P> {
         &self.run
     }
 
+    /// **Live checkpoint-resync (§9; lane R).** Fetch + decode the committed-set object
+    /// (`record-set.cbor`) the coordinator wrote for `round`
+    /// (`runs/<run>/rounds/<round>/record-set.cbor`, spec §11.3). A rejoining peer uses this to
+    /// learn which `(peer, hash, size)` payloads to stage when replaying a retained round forward
+    /// from a checkpoint. Presigns a `record-set` GET (the frozen §11.1 contract), fetches, and
+    /// decodes; a 404/403 → a typed [`SwarmNetError::PayloadMiss`] (the stall-ladder signal — the
+    /// caller falls back to fresh-state per §9). The per-payload blake3 verify (RUN-2) happens when
+    /// the caller fetches each entry's payload, so a decode here is sufficient.
+    pub async fn fetch_record_set_object(
+        &self,
+        round: crate::seam::RoundId,
+    ) -> Result<daemon_swarm_proto::RecordSet, SwarmNetError> {
+        let req = PresignRequest::record_set(PresignOp::Get, round);
+        let resp = self.presign.presign(&self.run, &req).await?;
+        let bytes = self.get_object(&resp).await?.ok_or_else(|| {
+            SwarmNetError::PayloadMiss(format!("{}@r{round}/record-set.cbor", self.run.as_str()))
+        })?;
+        daemon_swarm_proto::RecordSet::from_canonical_slice(&bytes)
+            .map_err(|e| SwarmNetError::Fetch(format!("decode record-set r{round}: {e}")))
+    }
+
     /// Presign one payload op for `key`.
     async fn presign_payload(
         &self,

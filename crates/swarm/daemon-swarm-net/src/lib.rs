@@ -65,7 +65,7 @@ pub use presign::{
 };
 pub use r2_store::{r2_object_key, R2Store};
 pub use receipt::ReceiptProducer;
-pub use registry::{RegistryClient, RunArtifact, RunDescriptor};
+pub use registry::{CheckpointPointer, RegistryClient, RunArtifact, RunDescriptor, RunState};
 pub use seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};
 pub use store::FsPayloadStore;
 pub use transport::{ControlPlane, ControlSubscription, PayloadStat, PayloadStore};

@@ -89,6 +89,11 @@ fn declared_cooldown_s() -> u64 {
 // Must divide across `peers × steps_per_round × micro_batch`; set from the peer count at run time.
 const STEPS_PER_ROUND: u32 = 2;
 const MICRO_BATCH: u32 = 2;
+// §9 checkpoint cadence + resync-replay window used by the churn ceremony (lane R): a checkpoint
+// every 2 rounds guarantees one is published + registered before the default kill (after round 2),
+// so the rejoiner resumes from it. Retention comfortably exceeds any short-run replay gap.
+const CHECKPOINT_EVERY_ROUNDS: u32 = 2;
+const PAYLOAD_RETENTION_ROUNDS: u64 = 16;
 
 // ---- env config ----------------------------------------------------------------------------------
 
@@ -406,13 +411,18 @@ fn credentials_for(
             steps_per_round: STEPS_PER_ROUND,
             micro_batch: MICRO_BATCH,
             stall_rounds_max: 3,
-            checkpoint_every_rounds: 0,
+            // Checkpoint every 2 rounds (§9) so a registered checkpoint exists BEFORE the churn kill
+            // (drop_after_round default 2 ⇒ a post-round-1 checkpoint is published first) — the
+            // rejoiner then resumes from it + replays retained rounds (lane R live resync).
+            checkpoint_every_rounds: CHECKPOINT_EVERY_ROUNDS,
             update_max_bytes: 1 << 20,
             corpus_seed: 7,
             corpus_shards: 4,
             corpus_tokens_per_shard: 256,
             corpus_seq_len: 8,
             corpus_vocab_clamp: GUEST_VOCAB,
+            // §9 resync-replay window — mirrors the envelope's `payload_retention_rounds`.
+            payload_retention_rounds: PAYLOAD_RETENTION_ROUNDS,
         },
     }
 }
@@ -652,10 +662,14 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// in `WaitingForMembers` → the killed peer rejoins (§6.5) → the run resumes and FINISHES.
 ///
 /// Gate assertions (spec §17 / runbook §7): every peer that reports a round agrees on the det digest
-/// byte-for-byte (consensus); the kill→park→rejoin cycle is exercised; the run reaches Finished. Per
-/// B4's design note (live-worker checkpoint-resync is NOT wired), the rejoiner's POST-rejoin digests
-/// are fresh-state and deliberately OUTSIDE the byte-identity assertion — the gate asserts "the run
-/// finishes after churn", not "the rejoiner is byte-identical".
+/// byte-for-byte (consensus); the kill→park→rejoin cycle is exercised; the run reaches Finished.
+///
+/// **Lane R (P3) upgrade — the rejoiner is now byte-identical.** With live checkpoint-resync wired
+/// (the worker fetches the coordinator's latest checkpoint pointer → `resume_from_checkpoint` →
+/// replays the retained rounds), the rejoined peer's POST-rejoin per-round digests are folded back
+/// into the main byte-identity assertion (B4's documented exclusion is REMOVED). The gate now asserts
+/// "the rejoiner is byte-identical to the survivors after churn", not merely "the run finishes". The
+/// drill configures `checkpoint_every_rounds` so a checkpoint exists before the kill.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn fleet_gate_ceremony_with_churn() {
     let Some(env) = fleet_env() else {
@@ -767,10 +781,12 @@ async fn fleet_gate_ceremony_with_churn() {
         streams.push(Some(rx));
     }
 
-    // digests[peer][round] = pre-drop det digests (byte-identity domain). The dropped peer's
-    // POST-rejoin digests land in `rejoined_digests` (fresh-state, excluded from identity — B4).
+    // digests[peer][round] = det digests, byte-identity domain. Lane R: the dropped peer's POST-rejoin
+    // digests are folded back into `digests[drop_index]` (checkpoint-resync makes them byte-identical
+    // to survivors), so they are IN the identity assertion — B4's exclusion is removed.
     let mut digests: Vec<BTreeMap<u64, [u8; 16]>> = vec![BTreeMap::new(); n];
-    let mut rejoined_digests: BTreeMap<u64, [u8; 16]> = BTreeMap::new();
+    // Rounds the rejoiner reported AFTER resync (for the transcript + the "resync contributed" check).
+    let mut rejoined_rounds: BTreeMap<u64, [u8; 16]> = BTreeMap::new();
     let mut rejoined_stream: Option<tokio::sync::mpsc::UnboundedReceiver<Event>> = None;
     let state_url = format!("{}/runs/{run_id}/state", env.ws_base);
 
@@ -821,9 +837,9 @@ async fn fleet_gate_ceremony_with_churn() {
     'collect: loop {
         assert!(
             Instant::now() < deadline,
-            "run budget {budget:?} exceeded; rounds so far: {:?} (rejoined: {})",
+            "run budget {budget:?} exceeded; rounds so far: {:?} (rejoined rounds: {})",
             digests.iter().map(BTreeMap::len).collect::<Vec<_>>(),
-            rejoined_digests.len()
+            rejoined_rounds.len()
         );
         for (i, slot) in streams.iter_mut().enumerate() {
             if let Some(rx) = slot.as_mut() {
@@ -845,8 +861,30 @@ async fn fleet_gate_ceremony_with_churn() {
         }
         if let Some(rx) = rejoined_stream.as_mut() {
             while let Ok(ev) = rx.try_recv() {
-                if let Event::RoundOutcome { round, digest, .. } = ev {
-                    rejoined_digests.insert(round, digest);
+                match ev {
+                    Event::RoundOutcome { round, digest, .. } => {
+                        // Lane R: fold the rejoiner's post-resync rounds into the identity domain.
+                        digests[drop_index].insert(round, digest);
+                        rejoined_rounds.insert(round, digest);
+                    }
+                    Event::ResyncProgress {
+                        round,
+                        from_checkpoint,
+                        replayed,
+                        total,
+                    } => {
+                        eprintln!(
+                            "peer {drop_index} ({}) RESYNC replayed round {round} from checkpoint {from_checkpoint} ({replayed}/{total})",
+                            peers[drop_index].label
+                        );
+                    }
+                    Event::Warning { class, detail } => {
+                        eprintln!(
+                            "peer {drop_index} ({}) WARN [{class}]: {detail}",
+                            peers[drop_index].label
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -903,11 +941,11 @@ async fn fleet_gate_ceremony_with_churn() {
             }
         }
 
-        // Finished when every SURVIVOR reported the last round.
-        let survivors_done = (0..n)
-            .filter(|&i| i != drop_index)
-            .all(|i| digests[i].contains_key(&last_round));
-        if survivors_done && dropped {
+        // Lane R: finished when EVERY peer — including the rejoiner (byte-identical via
+        // checkpoint-resync) — reported the last round. `min_peers = N` means the run cannot reach
+        // the last round without the rejoiner back, so this also proves resync let it re-contribute.
+        let all_done = dropped && rejoined && (0..n).all(|i| digests[i].contains_key(&last_round));
+        if all_done {
             break 'collect;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -917,7 +955,8 @@ async fn fleet_gate_ceremony_with_churn() {
         "the kill→park→rejoin churn cycle was exercised"
     );
 
-    // Transcript (ledger evidence).
+    // Transcript (ledger evidence). A `*` marks a round the rejoiner reported POST-resync — folded
+    // into the identity domain (lane R), so its column must match the survivors byte-for-byte.
     for round in 0..rounds {
         let cols: Vec<String> = (0..n)
             .map(|i| {
@@ -927,11 +966,11 @@ async fn fleet_gate_ceremony_with_churn() {
                     .unwrap_or_else(|| "--".into())
             })
             .collect();
-        let rj = rejoined_digests
-            .get(&round)
-            .map(hex16)
-            .map(|s| format!("  [rejoin:{s}]"))
-            .unwrap_or_default();
+        let rj = if rejoined_rounds.contains_key(&round) {
+            "  [rejoiner resynced ✓]"
+        } else {
+            ""
+        };
         println!("round {round}: {}{rj}", cols.join("  "));
     }
 
@@ -961,10 +1000,21 @@ async fn fleet_gate_ceremony_with_churn() {
             peers[i].label
         );
     }
-    // The dropped peer contributed its pre-drop rounds.
+    // Lane R headline: the rejoiner contributed POST-resync rounds (proving it re-attached via
+    // checkpoint-resync, not that it merely finished), and — folded into the identity loop above —
+    // those digests are byte-identical to the survivors. It reported the last round too.
     assert!(
-        digests[drop_index].len() as u64 > drop_after_round,
-        "dropped peer {drop_index} ({}) contributed rounds 0..={drop_after_round} before the kill",
+        !rejoined_rounds.is_empty(),
+        "the rejoined peer {drop_index} ({}) contributed at least one post-resync round",
+        peers[drop_index].label
+    );
+    assert!(
+        rejoined_rounds.keys().any(|&r| r > drop_after_round),
+        "the rejoiner's post-resync rounds are past the drop point (round > {drop_after_round})"
+    );
+    assert!(
+        digests[drop_index].contains_key(&last_round),
+        "the rejoined peer {drop_index} ({}) reported the last round byte-identically after resync",
         peers[drop_index].label
     );
 
@@ -989,11 +1039,12 @@ async fn fleet_gate_ceremony_with_churn() {
         sup.shutdown().await;
     }
     println!(
-        "GATE CEREMONY GREEN: {n} heterogeneous peers, {rounds} rounds, det digests byte-identical, \
-         churn (kill peer {drop_index} → park → rejoin) survived, run Finished. rejoiner reported {} \
-         post-rejoin round(s): {:?}",
-        rejoined_digests.len(),
-        rejoined_digests.keys().collect::<Vec<_>>()
+        "GATE CEREMONY GREEN: {n} heterogeneous peers, {rounds} rounds, det digests byte-identical \
+         (incl. the rejoiner), churn (kill peer {drop_index} → park → checkpoint-resync → rejoin) \
+         survived, run Finished. rejoiner reported {} post-resync round(s) BYTE-IDENTICAL to \
+         survivors: {:?}",
+        rejoined_rounds.len(),
+        rejoined_rounds.keys().collect::<Vec<_>>()
     );
 }
 

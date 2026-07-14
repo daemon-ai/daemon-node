@@ -77,6 +77,46 @@ struct DataEnvelope<T> {
     data: T,
 }
 
+/// The coordinator's latest published-checkpoint pointer (spec §9; lane R), read from
+/// `GET {base}/runs/:id/state`.`data.checkpoint`. `None` there ⇒ no checkpoint published yet (a
+/// rejoining peer falls back to fresh-state, §9 first-epoch). Mirrors the cloud `CheckpointPointer`
+/// (`apps/swarm/src/coordinator/checkpoint.ts`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointPointer {
+    /// The round the checkpoint captures (post-ingest state).
+    pub round: u64,
+    /// blake3 of the checkpoint bytes, 64 lowercase hex chars (the content address to verify).
+    pub hash: String,
+    /// The checkpoint byte length.
+    #[serde(default)]
+    pub size: u64,
+    /// Whether ≥2 checkpointers uploaded byte-identical manifests (else registered-but-degraded).
+    #[serde(default)]
+    pub cross_checked: bool,
+}
+
+/// The coordinator run-state projection (`GET {base}/runs/:id/state`.`data`), the queryable surface
+/// a rejoining peer reads for the current round + the latest checkpoint pointer (lane R). Only the
+/// fields the rejoin path needs are decoded; the rest are ignored.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RunState {
+    /// The coordinator phase (`waiting` / `warmup` / `round_train` / `cooldown` / …).
+    #[serde(default)]
+    pub phase: String,
+    /// The coordinator's current round.
+    #[serde(default)]
+    pub round: u64,
+    /// The current epoch.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Whether the run has finished.
+    #[serde(default)]
+    pub finished: bool,
+    /// The latest published-checkpoint pointer, or `None` if none published yet.
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointPointer>,
+}
+
 /// The `swarm:*` credential the registry + presign requests carry (never hardcoded — sourced from
 /// `JoinRun.credentials` / node config, mirroring [`crate::ws_client::WsAuth`]).
 #[derive(Clone, Debug, Default)]
@@ -166,6 +206,64 @@ impl RegistryClient {
         let env: DataEnvelope<RunDescriptor> = serde_json::from_slice(&body)
             .map_err(|e| SwarmNetError::Transport(format!("decode run {run_id}: {e}")))?;
         Ok(Some(env.data))
+    }
+
+    /// Fetch the coordinator run-state projection (`GET {base}/runs/:id/state`), the queryable
+    /// surface a rejoining peer reads for the current round + the latest checkpoint pointer (spec
+    /// §9; lane R). `Ok(None)` on a 404 (run not initialized).
+    pub async fn fetch_state(&self, run_id: &str) -> Result<Option<RunState>, SwarmNetError> {
+        let url = format!("{}/runs/{run_id}/state", self.base_url);
+        let req = self.authed_request(EgressRequest::get(&url));
+        let resp = self
+            .egress
+            .execute(req, Redirects::None)
+            .await
+            .map_err(|e| SwarmNetError::Transport(format!("get state {run_id}: {e}")))?;
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| SwarmNetError::Transport(format!("read state {run_id}: {e}")))?;
+        if !status.is_success() {
+            return Err(SwarmNetError::Transport(format!(
+                "get state {run_id} returned {status}"
+            )));
+        }
+        let env: DataEnvelope<RunState> = serde_json::from_slice(&body)
+            .map_err(|e| SwarmNetError::Transport(format!("decode state {run_id}: {e}")))?;
+        Ok(Some(env.data))
+    }
+
+    /// Publish this peer's latest checkpoint manifest to the coordinator (spec §9; lane R):
+    /// `POST {base}/runs/:id/checkpoint` with `{round, hash, size}`. The coordinator tracks the
+    /// latest pointer + cross-checks a two-checkpointer both-match (RUN-6). Best-effort — a failure
+    /// is a soft warning (the pointer is advisory; the run is unaffected).
+    pub async fn publish_checkpoint(
+        &self,
+        run_id: &str,
+        round: u64,
+        hash: &str,
+        size: u64,
+    ) -> Result<(), SwarmNetError> {
+        let url = format!("{}/runs/{run_id}/checkpoint", self.base_url);
+        let body = serde_json::json!({ "round": round, "hash": hash, "size": size });
+        let ereq = EgressRequest::post_json(&url, &body)
+            .map_err(|e| SwarmNetError::Transport(format!("encode checkpoint pointer: {e}")))?;
+        let resp = self
+            .egress
+            .execute(self.authed_request(ereq), Redirects::None)
+            .await
+            .map_err(|e| SwarmNetError::Transport(format!("publish checkpoint {run_id}: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(SwarmNetError::Transport(format!(
+                "publish checkpoint {run_id} returned {}",
+                resp.status()
+            )));
+        }
+        Ok(())
     }
 
     /// Fetch the frozen envelope for `run` and **blake3-verify** it against `descriptor.envelope_hash`.
@@ -292,5 +390,28 @@ mod tests {
         assert_eq!(d.proto_version, 3);
         assert_eq!(d.rounds, Some(10));
         assert_eq!(d.artifacts.len(), 1);
+    }
+
+    #[test]
+    fn run_state_decodes_checkpoint_pointer_and_null() {
+        // The `GET /state` shape (lane R): the `data.checkpoint` pointer a rejoining peer reads.
+        let with = r#"{"data":{"phase":"round_train","round":6,"epoch":1,"finished":false,
+            "roster":["aa"],"committed":[],"coord_pubkey":"bb",
+            "checkpoint":{"round":3,"hash":"cc","size":4096,"cross_checked":true,"uploads":2}}}"#;
+        let env: DataEnvelope<RunState> = serde_json::from_str(with).unwrap();
+        let s = env.data;
+        assert_eq!(s.phase, "round_train");
+        assert_eq!(s.round, 6);
+        let ckpt = s.checkpoint.expect("pointer present");
+        assert_eq!(ckpt.round, 3);
+        assert_eq!(ckpt.hash, "cc");
+        assert_eq!(ckpt.size, 4096);
+        assert!(ckpt.cross_checked);
+
+        // No checkpoint published yet → `None` (the fresh-state fallback trigger).
+        let without = r#"{"data":{"phase":"waiting","round":0,"epoch":0,"finished":false,
+            "roster":[],"committed":[],"coord_pubkey":"bb","checkpoint":null}}"#;
+        let env2: DataEnvelope<RunState> = serde_json::from_str(without).unwrap();
+        assert!(env2.data.checkpoint.is_none());
     }
 }

@@ -44,6 +44,7 @@ fn manifest(round: RoundId, tag: &[u8], digest: StateDigest) -> CheckpointManife
     CheckpointManifest {
         round,
         blake3: blake3_hash(tag),
+        size: tag.len() as u64,
         digest,
     }
 }

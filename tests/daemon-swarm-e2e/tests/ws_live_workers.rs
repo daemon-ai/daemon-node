@@ -383,6 +383,11 @@ fn credentials_for(i: usize, env: &LiveEnv, envelope_hash: [u8; 32]) -> JoinCred
             corpus_tokens_per_shard: 256,
             corpus_seq_len: 8,
             corpus_vocab_clamp: GUEST_VOCAB,
+            // A3's loop keeps `checkpoint_every_rounds: 0` (no checkpoint), so a rejoin here stays
+            // fresh-state (its digests remain outside the identity assertion). Live checkpoint-resync
+            // + the rejoiner-byte-identity assertion are exercised by `checkpoint_resync.rs` and the
+            // `fleet_gate_ceremony_with_churn` ceremony (lane R). Additive field for the compile.
+            payload_retention_rounds: 16,
         },
     }
 }
