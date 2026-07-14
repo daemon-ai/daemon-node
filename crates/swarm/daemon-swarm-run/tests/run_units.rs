@@ -173,6 +173,76 @@ fn good_round1_digest(s0: &[StagedPayload], s1: &[StagedPayload]) -> StateDigest
 }
 
 #[test]
+fn worker_rejoin_via_checkpoint_reaches_consensus_fresh_state_does_not() {
+    // Task-4 (§9): the cloud-DO `ws_live_workers` drop→park→rejoin drill currently rejoins
+    // **fresh-state** — the respawned worker rebuilds from the envelope base and does NOT fold the
+    // rounds it missed, so its post-rejoin digests are deliberately outside the byte-identity
+    // assertion. This pins, deterministically, WHY that is and what the stronger churn drill needs:
+    //
+    //   - a fresh-state rejoin (rebuild + ingest the current round) reaches a digest that does NOT
+    //     match consensus, because the missed history is absent from its outer-step base (§5.6); vs
+    //   - a checkpoint-resync rejoin (`resync_by_replay` = the fold behind
+    //     `RoundEngine::resume_from_checkpoint`) reloads the latest checkpoint and replays the missed
+    //     committed sets in record order, recovering the EXACT consensus digest (§9 I1).
+    //
+    // Wiring real resync into the live worker rejoin (design note, swarm-ledger-p2-b4.md) is what
+    // makes the gate's churn drill assert byte-identity across a rejoin, not merely "the run finishes".
+    let sets = [
+        [staged(1, b"r0-a"), staged(2, b"r0-b")],
+        [staged(1, b"r1-a"), staged(2, b"r1-b")],
+        [staged(1, b"r2-a"), staged(2, b"r2-b")],
+        [staged(1, b"r3-a"), staged(2, b"r3-b")],
+    ];
+
+    // The in-sync reference peer folds every round; its base accumulates round over round.
+    let mut consensus = built(b"cfg");
+    consensus.ingest(0, &sets[0]).unwrap();
+    consensus.ingest(1, &sets[1]).unwrap();
+    let checkpoint = consensus.checkpoint_save().unwrap(); // checkpoint after round 1
+    consensus.ingest(2, &sets[2]).unwrap();
+    let target = consensus.ingest(3, &sets[3]).unwrap();
+
+    // (1) Fresh-state rejoin at round 3: rebuild from the base and ingest only the current round.
+    // Its outer-step base lacks rounds 0..2, so it cannot reproduce the consensus digest.
+    let mut fresh = built(b"cfg");
+    let fresh_digest = fresh.ingest(3, &sets[3]).unwrap();
+    assert_ne!(
+        fresh_digest, target,
+        "a fresh-state rejoin cannot reproduce the consensus digest (missed history absent)"
+    );
+
+    // (2) Checkpoint-resync rejoin: reload the round-1 checkpoint, replay rounds 2 and 3 in record
+    // order (within the retention floor per `plan_resync`), recovering the exact consensus digest.
+    assert_eq!(
+        plan_resync(1, 3, 4),
+        ResyncPlan::ReplayFromCheckpoint {
+            from_round: 1,
+            steps: 2
+        }
+    );
+    let mut rejoiner = StubBackend::new();
+    let recovered = resync_by_replay(
+        &mut rejoiner,
+        &checkpoint,
+        &[
+            ReplayStep {
+                round: 2,
+                staged: sets[2].to_vec(),
+            },
+            ReplayStep {
+                round: 3,
+                staged: sets[3].to_vec(),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        recovered, target,
+        "checkpoint-resync recovers the EXACT consensus digest the rejoining worker must reach (§9 I1)"
+    );
+}
+
+#[test]
 fn resync_beyond_retention_waits_for_epoch() {
     // A desync older than the payload-retention floor cannot replay (the records/payloads are gone),
     // so the peer waits for the next epoch checkpoint to rejoin.
