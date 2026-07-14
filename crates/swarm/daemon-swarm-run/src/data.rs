@@ -12,6 +12,8 @@
 //! [`SyntheticCorpus`] generates a deterministic seeded corpus (u16 tokens) for tests, so the round
 //! loop (Wave 2) and the worker (Wave 3) have a data source with no external download.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 use daemon_swarm_proto::{blake3_hash, Hash};
@@ -178,6 +180,52 @@ impl Manifest {
             batch,
             total: self.total_sequences(),
         })
+    }
+
+    /// The set of shard indices covering the sequence window `[start_seq, start_seq + seq_count)`,
+    /// wrapping modulo [`Manifest::total_sequences`] (a peer stages **only** these shards — the §8
+    /// RAM-bounded windowing, P3 lane S). `seq_count == 0` (or `>= total`) means the whole corpus.
+    ///
+    /// `start_seq` is taken modulo the total, matching [`Corpus::sequence`]'s wrap. A window that
+    /// runs off the end wraps to the front (two contiguous ranges), so a run whose data cursor wraps
+    /// still stages the shards it will read.
+    #[must_use]
+    pub fn shards_covering(&self, start_seq: u64, seq_count: u64) -> BTreeSet<usize> {
+        let total = self.total_sequences();
+        if total == 0 {
+            return BTreeSet::new();
+        }
+        if seq_count == 0 || seq_count >= total {
+            return (0..self.shards.len()).collect();
+        }
+        let seq_len = u64::from(self.seq_len);
+        // Per-shard sequence bounds `[start, end)` in the global sequence index space.
+        let mut bounds = Vec::with_capacity(self.shards.len());
+        let mut cum = 0u64;
+        for s in &self.shards {
+            let seqs = s.tokens / seq_len;
+            bounds.push((cum, cum + seqs));
+            cum += seqs;
+        }
+        let start = start_seq % total;
+        // The window is one contiguous range, or two when it wraps past `total`.
+        let ranges: [(u64, u64); 2] = if start + seq_count <= total {
+            [(start, start + seq_count), (0, 0)]
+        } else {
+            [(start, total), (0, (start + seq_count) - total)]
+        };
+        let mut out = BTreeSet::new();
+        for (rs, re) in ranges {
+            if rs >= re {
+                continue;
+            }
+            for (i, (bs, be)) in bounds.iter().enumerate() {
+                if *bs < re && rs < *be {
+                    out.insert(i);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -350,7 +398,10 @@ impl SyntheticCorpus {
 #[derive(Clone, Debug)]
 pub struct Corpus {
     manifest: Manifest,
-    shards: Vec<Vec<u8>>,
+    /// One slot per manifest shard. `Some` = resident bytes; `None` = not staged (a **windowed**
+    /// corpus stages only the shards its assignment touches — P3 lane S). A fully-resident corpus
+    /// (`from_parts`/`synthetic`) has every slot `Some`.
+    shards: Vec<Option<Vec<u8>>>,
 }
 
 impl Corpus {
@@ -368,16 +419,35 @@ impl Corpus {
             });
         }
         for (i, (desc, bytes)) in manifest.shards.iter().zip(shards.iter()).enumerate() {
-            if bytes.len() as u64 != desc.bytes {
-                return Err(DataError::ShardSizeMismatch {
-                    shard: i,
-                    expected: desc.bytes,
-                    declared: bytes.len() as u64,
-                });
-            }
-            if blake3_hash(bytes).to_hex().as_str() != desc.blake3 {
-                return Err(DataError::ShardHashMismatch { shard: i });
-            }
+            verify_shard(i, desc, bytes)?;
+        }
+        Ok(Self {
+            manifest,
+            shards: shards.into_iter().map(Some).collect(),
+        })
+    }
+
+    /// Build a **windowed** corpus: a validated manifest plus only the shards a peer has staged
+    /// (`resident`: shard-index → bytes) — the P3 lane-S fetch-only-assigned-shards path (spec §8).
+    /// Each resident shard is blake3-verified against its [`ShardDesc`]; a non-resident shard is left
+    /// `None` and addressing it via [`Corpus::sequence`] is a typed [`DataError::ShardNotResident`]
+    /// (never a silent NaN). Use [`Manifest::shards_covering`] to compute which indices to stage.
+    pub fn windowed(
+        manifest: Manifest,
+        resident: BTreeMap<usize, Vec<u8>>,
+    ) -> Result<Self, DataError> {
+        manifest.validate()?;
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; manifest.shards.len()];
+        for (idx, bytes) in resident {
+            let desc = manifest
+                .shards
+                .get(idx)
+                .ok_or(DataError::ShardIndexOutOfRange {
+                    shard: idx,
+                    total: manifest.shards.len(),
+                })?;
+            verify_shard(idx, desc, &bytes)?;
+            shards[idx] = Some(bytes);
         }
         Ok(Self { manifest, shards })
     }
@@ -391,8 +461,15 @@ impl Corpus {
     ) -> Result<Self, DataError> {
         let (manifest, blobs) =
             SyntheticCorpus::generate(seed, num_shards, tokens_per_shard, seq_len)?;
-        let shards = blobs.into_iter().map(|(_, bytes)| bytes).collect();
+        let shards = blobs.into_iter().map(|(_, bytes)| Some(bytes)).collect();
         Ok(Self { manifest, shards })
+    }
+
+    /// The number of shards resident in memory (`== manifest.shards.len()` for a full corpus; fewer
+    /// for a windowed one).
+    #[must_use]
+    pub fn resident_shards(&self) -> usize {
+        self.shards.iter().filter(|s| s.is_some()).count()
     }
 
     /// The corpus manifest.
@@ -416,7 +493,9 @@ impl Corpus {
         let loc = self.manifest.locate(batch % total)?;
         let seq_len = self.manifest.seq_len as usize;
         let width = self.manifest.token_width.bytes() as usize;
-        let shard = &self.shards[loc.shard];
+        let shard = self.shards[loc.shard]
+            .as_deref()
+            .ok_or(DataError::ShardNotResident { shard: loc.shard })?;
         let start = loc.token_offset as usize * width;
         let mut tokens = Vec::with_capacity(seq_len);
         for i in 0..seq_len {
@@ -431,6 +510,22 @@ impl Corpus {
         }
         Ok(tokens)
     }
+}
+
+/// Verify one shard's bytes against its [`ShardDesc`] (byte length + blake3 content hash) — the §8
+/// fetch-time integrity check shared by [`Corpus::from_parts`] and [`Corpus::windowed`].
+fn verify_shard(index: usize, desc: &ShardDesc, bytes: &[u8]) -> Result<(), DataError> {
+    if bytes.len() as u64 != desc.bytes {
+        return Err(DataError::ShardSizeMismatch {
+            shard: index,
+            expected: desc.bytes,
+            declared: bytes.len() as u64,
+        });
+    }
+    if blake3_hash(bytes).to_hex().as_str() != desc.blake3 {
+        return Err(DataError::ShardHashMismatch { shard: index });
+    }
+    Ok(())
 }
 
 /// A small, fast, deterministic mixing function (splitmix64) for the synthetic corpus.
@@ -494,6 +589,21 @@ pub enum DataError {
     #[error("shard {shard} content blake3 does not match the manifest")]
     ShardHashMismatch {
         /// The shard index.
+        shard: usize,
+    },
+    /// A [`Corpus::windowed`] resident entry named a shard index outside the manifest.
+    #[error("resident shard index {shard} out of range (manifest has {total} shards)")]
+    ShardIndexOutOfRange {
+        /// The offending shard index.
+        shard: usize,
+        /// The number of shards in the manifest.
+        total: usize,
+    },
+    /// A [`BatchId`] addressed a shard that was not staged in a windowed corpus ([`Corpus::windowed`]).
+    /// The peer must stage every shard its assignment touches (see [`Manifest::shards_covering`]).
+    #[error("shard {shard} is not resident (windowed corpus: stage the assigned shards first)")]
+    ShardNotResident {
+        /// The non-resident shard index.
         shard: usize,
     },
     /// A `BatchId` fell outside the corpus's sequence range.
@@ -751,5 +861,77 @@ mod tests {
                 token_offset: 0
             }
         );
+    }
+
+    #[test]
+    fn shards_covering_selects_only_the_window() {
+        // 4 shards × 4 seqs each (16 tokens, seq_len 4) → 16 sequences total.
+        let m = manifest(
+            4,
+            vec![
+                shard("a", 16, TokenWidth::U16),
+                shard("b", 16, TokenWidth::U16),
+                shard("c", 16, TokenWidth::U16),
+                shard("d", 16, TokenWidth::U16),
+            ],
+        );
+        m.validate().unwrap();
+        assert_eq!(m.total_sequences(), 16);
+        // Window [0,8) covers shards 0,1 only — NOT the whole corpus.
+        assert_eq!(
+            m.shards_covering(0, 8),
+            BTreeSet::from([0, 1]),
+            "a peer stages only the shards its window touches"
+        );
+        // A window that spans a boundary picks up both neighbours.
+        assert_eq!(m.shards_covering(3, 3), BTreeSet::from([0, 1]));
+        // Wrap-around: [14,18) → seqs 14,15 (shard 3) + 0,1 (shard 0).
+        assert_eq!(m.shards_covering(14, 4), BTreeSet::from([0, 3]));
+        // seq_count 0 or >= total means the whole corpus.
+        assert_eq!(m.shards_covering(0, 0), BTreeSet::from([0, 1, 2, 3]));
+        assert_eq!(m.shards_covering(0, 999), BTreeSet::from([0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn windowed_corpus_serves_resident_and_rejects_absent() {
+        // A real (full) synthetic corpus gives us the manifest + true shard bytes.
+        let (manifest, blobs) = SyntheticCorpus::generate(0xD1CE, 4, 32, 8).unwrap();
+        // Stage only shards 0 and 2 (a windowed subset).
+        let mut resident = BTreeMap::new();
+        resident.insert(0usize, blobs[0].1.clone());
+        resident.insert(2usize, blobs[2].1.clone());
+        let windowed = Corpus::windowed(manifest.clone(), resident).unwrap();
+        assert_eq!(windowed.resident_shards(), 2);
+
+        // total_sequences is the manifest's (all shards) → 4 × 4 = 16.
+        assert_eq!(windowed.total_sequences(), 16);
+        // Shard 0 covers batches 0..4; a resident batch reads cleanly + matches the full corpus.
+        let full =
+            Corpus::from_parts(manifest, blobs.into_iter().map(|(_, b)| b).collect()).unwrap();
+        assert_eq!(windowed.sequence(0).unwrap(), full.sequence(0).unwrap());
+        // Shard 1 (batches 4..8) is NOT resident → typed ShardNotResident, never a silent read.
+        assert!(matches!(
+            windowed.sequence(4),
+            Err(DataError::ShardNotResident { shard: 1 })
+        ));
+    }
+
+    #[test]
+    fn windowed_corpus_rejects_bad_index_and_tampered_shard() {
+        let (manifest, blobs) = SyntheticCorpus::generate(0xD1CE, 2, 32, 8).unwrap();
+        // Out-of-range index.
+        let mut bad_idx = BTreeMap::new();
+        bad_idx.insert(9usize, blobs[0].1.clone());
+        assert!(matches!(
+            Corpus::windowed(manifest.clone(), bad_idx),
+            Err(DataError::ShardIndexOutOfRange { shard: 9, .. })
+        ));
+        // Tampered bytes for a valid index.
+        let mut tampered = BTreeMap::new();
+        tampered.insert(0usize, vec![0xFFu8; blobs[0].1.len()]);
+        assert!(matches!(
+            Corpus::windowed(manifest, tampered),
+            Err(DataError::ShardHashMismatch { shard: 0 })
+        ));
     }
 }

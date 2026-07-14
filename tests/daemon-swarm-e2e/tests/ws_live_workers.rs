@@ -388,6 +388,7 @@ fn credentials_for(i: usize, env: &LiveEnv, envelope_hash: [u8; 32]) -> JoinCred
             // + the rejoiner-byte-identity assertion are exercised by `checkpoint_resync.rs` and the
             // `fleet_gate_ceremony_with_churn` ceremony (lane R). Additive field for the compile.
             payload_retention_rounds: 16,
+            corpus: None,
         },
     }
 }

@@ -76,6 +76,29 @@ async fn main() {
         return;
     }
 
+    // Fleet cache-warming mode (P3 lane S): fetch the run's module/corpus by content hash from the
+    // payload store into the on-disk content cache, print per-object evidence, then exit — the
+    // fleet-staging entry point (replaces P2's scp pre-staging). Like DAEMON_TRAIN_PROBE, it runs on
+    // a bare box with no CBOR framing.
+    if std::env::var_os("DAEMON_TRAIN_PREFETCH").is_some() {
+        #[cfg(feature = "swarm-net")]
+        {
+            if let Err(e) = backend::prefetch_main().await {
+                eprintln!("daemon-train-worker: prefetch FAILED: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "swarm-net"))]
+        {
+            eprintln!(
+                "daemon-train-worker: DAEMON_TRAIN_PREFETCH needs a worker built with \
+                 `--features swarm-net` (the store fetch path)"
+            );
+            std::process::exit(1);
+        }
+    }
+
     let channel = CutChannel::from_stdio();
     let (writer, mut reader) = channel.split();
 

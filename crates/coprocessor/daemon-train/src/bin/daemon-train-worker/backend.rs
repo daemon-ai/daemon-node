@@ -58,8 +58,19 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
     }
 }
 
-/// Resolve the experiment module bytes for a verified envelope: `DAEMON_TRAIN_MODULE` if set
-/// (override), else the envelope's `experiment.module` artifact via the `file://` resolver.
+/// Resolve the experiment module bytes for a verified envelope (P3 lane S — fetch-by-hash):
+///
+/// 1. `DAEMON_TRAIN_MODULE` set → read the local file (the **explicit** dev/test override — the only
+///    remaining local-path path; the P2 pre-staging is gone).
+/// 2. else, resolve the envelope's `experiment.module` artifact by its content hash. Under the
+///    `swarm-net` feature a network URL (`r2://` / `https://` / `hf://`) is fetched from the payload
+///    store via a presigned GET (context from the node-set env, [`store_fetch_context`]) and cached
+///    content-addressed on disk ([`ContentCache`]); a `file://` URL uses the file-only resolver.
+/// 3. default build: `file://` only (network schemes are `SchemeUnsupported`, as before).
+///
+/// Every path blake3-verifies the bytes against the artifact-map hash **before** `assess`/
+/// instantiation ([`ArtifactResolver::fetch`] / [`ContentCache`]), so a tampered module is rejected
+/// before the wasm engine loads it (§6.5, §12).
 async fn resolve_module(frozen: &daemon_swarm_proto::FrozenEnvelope) -> Result<Vec<u8>, String> {
     if let Some(bytes) = module_from_env() {
         return bytes;
@@ -73,10 +84,249 @@ async fn resolve_module(frozen: &daemon_swarm_proto::FrozenEnvelope) -> Result<V
         .get(name)
         .ok_or_else(|| format!("experiment module `{name}` absent from [artifacts]"))?;
     let art = ArtifactRef::new(artifact.url.clone(), artifact.blake3);
+
+    // Content-addressed fetch from the payload store (fleet distribution) — feature-gated because
+    // egress/presign live behind `swarm-net`.
+    #[cfg(feature = "swarm-net")]
+    if !artifact.url.starts_with("file://") {
+        return fetch_artifact_from_store(&art)
+            .await
+            .map_err(|e| format!("fetch module `{name}` ({}) from store: {e}", artifact.url));
+    }
+
     ArtifactResolver::new()
         .fetch(&art)
         .await
         .map_err(|e| format!("resolve module `{name}` ({}): {e}", artifact.url))
+}
+
+/// The presign context the node sets when spawning the worker for a live run (small env strings, NOT
+/// a pre-staged artifact): the coordinator base, run id, auth, and the on-disk cache dir/budget. This
+/// is the fetch-by-hash analogue of `DAEMON_TRAIN_MODULE` — a node-controlled input at assess time.
+#[cfg(feature = "swarm-net")]
+pub(crate) struct StoreFetchContext {
+    pub(crate) presign_base: Option<String>,
+    pub(crate) run_id: String,
+    pub(crate) ws_auth: daemon_swarm_run::protocol::WsAuthSpec,
+    pub(crate) cache_dir: std::path::PathBuf,
+    pub(crate) cache_gb: u32,
+}
+
+#[cfg(feature = "swarm-net")]
+pub(crate) fn store_fetch_context() -> StoreFetchContext {
+    use daemon_swarm_run::protocol::WsAuthSpec;
+    let ws_auth = if let Ok(bearer) = std::env::var("DAEMON_SWARM_BEARER") {
+        WsAuthSpec::Bearer(bearer)
+    } else if let (Ok(org_id), Ok(actor)) = (
+        std::env::var("DAEMON_SWARM_ORG"),
+        std::env::var("DAEMON_SWARM_ACTOR"),
+    ) {
+        WsAuthSpec::Internal { org_id, actor }
+    } else {
+        WsAuthSpec::None
+    };
+    let cache_dir = std::env::var_os("DAEMON_SWARM_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("daemon-swarm-cache"));
+    let cache_gb = std::env::var("DAEMON_SWARM_CACHE_GB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    StoreFetchContext {
+        presign_base: std::env::var("DAEMON_SWARM_PRESIGN_BASE").ok(),
+        run_id: std::env::var("DAEMON_SWARM_RUN_ID").unwrap_or_else(|_| "run-unknown".to_string()),
+        ws_auth,
+        cache_dir,
+        cache_gb,
+    }
+}
+
+/// Build a content-addressed [`daemon_swarm_net::ContentCache`] from the node-set context.
+#[cfg(feature = "swarm-net")]
+pub(crate) fn open_content_cache(
+    ctx: &StoreFetchContext,
+) -> Result<daemon_swarm_net::ContentCache, String> {
+    daemon_swarm_net::ContentCache::open_gb(&ctx.cache_dir, ctx.cache_gb)
+        .map_err(|e| format!("open content cache {}: {e}", ctx.cache_dir.display()))
+}
+
+/// Build an [`ArtifactResolver`] wired for the network schemes from the node-set presign context
+/// (egress for `https`/`hf`; egress + presign for `r2://`).
+#[cfg(feature = "swarm-net")]
+pub(crate) fn store_resolver(ctx: &StoreFetchContext) -> Result<ArtifactResolver, String> {
+    use daemon_swarm_net::{HttpPresignClient, PresignClient, RunId};
+    let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
+        .map_err(|e| format!("egress client: {e}"))?;
+    let mut resolver = ArtifactResolver::with_egress(egress);
+    if let Some(base) = &ctx.presign_base {
+        use daemon_swarm_run::protocol::WsAuthSpec;
+        let presign_egress =
+            daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
+                .map_err(|e| format!("presign egress client: {e}"))?;
+        let presign = match &ctx.ws_auth {
+            WsAuthSpec::None => HttpPresignClient::new(presign_egress, base.clone()),
+            WsAuthSpec::Bearer(t) => {
+                HttpPresignClient::new(presign_egress, base.clone()).with_bearer(t.clone())
+            }
+            WsAuthSpec::Internal { org_id, actor } => {
+                HttpPresignClient::new(presign_egress, base.clone())
+                    .with_internal(org_id.clone(), actor.clone())
+            }
+        };
+        let presign: std::sync::Arc<dyn PresignClient> = std::sync::Arc::new(presign);
+        resolver = resolver.with_presign(presign, RunId::new(&ctx.run_id));
+    }
+    Ok(resolver)
+}
+
+/// Fetch `art` from the payload store (presigned GET), checking the on-disk content cache first and
+/// caching the verified bytes on a miss (P3 lane S — the fleet distribution path).
+#[cfg(feature = "swarm-net")]
+pub(crate) async fn fetch_artifact_from_store(art: &ArtifactRef) -> Result<Vec<u8>, String> {
+    let ctx = store_fetch_context();
+    let cache = open_content_cache(&ctx)?;
+    if let Some(bytes) = cache.get(&art.blake3).await.map_err(|e| e.to_string())? {
+        return Ok(bytes);
+    }
+    let resolver = store_resolver(&ctx)?;
+    let bytes = resolver.fetch(art).await.map_err(|e| e.to_string())?;
+    // Best-effort cache write (a cache failure must not fail a run whose bytes are already verified).
+    if let Err(e) = cache.insert(&art.blake3, &bytes).await {
+        eprintln!("[daemon-train-worker] content cache insert failed (continuing): {e}");
+    }
+    Ok(bytes)
+}
+
+/// Decode a 64-char lowercase-hex blake3 into a content hash.
+#[cfg(feature = "swarm-net")]
+pub(crate) fn hash_from_hex(s: &str) -> Option<daemon_swarm_net::ContentHash> {
+    use daemon_swarm_net::ContentHash;
+    let s = s.trim();
+    if s.len() != ContentHash::LEN * 2 {
+        return None;
+    }
+    let mut out = [0u8; ContentHash::LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(ContentHash::new(out))
+}
+
+/// The `DAEMON_TRAIN_PREFETCH` cache-warming mode (P3 lane S — the fleet staging entry point).
+///
+/// Runs on a bare fleet box (Windows cmd.exe, macOS, a RunPod container) with no CBOR framing:
+/// fetch the run's module and/or corpus (manifest + windowed shards) **by content hash** from the
+/// payload store into the on-disk [`daemon_swarm_net::ContentCache`], verify blake3, print per-object
+/// `key / bytes / blake3 / source(cache|store) / ms`, then exit. A subsequent live run on the box
+/// finds every artifact cache-warm. Idempotent (re-running is all cache hits).
+///
+/// Env (mirrors the assess-time fetch context; all plain strings so `set X=… && worker.exe` works):
+/// `DAEMON_SWARM_PRESIGN_BASE`, `DAEMON_SWARM_RUN_ID`, `DAEMON_SWARM_ORG`/`DAEMON_SWARM_ACTOR` (or
+/// `DAEMON_SWARM_BEARER`), `DAEMON_SWARM_CACHE_DIR`/`DAEMON_SWARM_CACHE_GB`, plus what to warm:
+/// `DAEMON_TRAIN_PREFETCH_MODULE=<blake3-hex>`, `DAEMON_TRAIN_PREFETCH_MANIFEST=<blake3-hex>`,
+/// `DAEMON_TRAIN_PREFETCH_WINDOW=<start>:<count>` (optional; absent/0 = every shard).
+#[cfg(feature = "swarm-net")]
+pub(crate) async fn prefetch_main() -> Result<(), String> {
+    let ctx = store_fetch_context();
+    if ctx.presign_base.is_none() {
+        return Err("DAEMON_TRAIN_PREFETCH needs DAEMON_SWARM_PRESIGN_BASE".to_string());
+    }
+    let cache = open_content_cache(&ctx)?;
+    let resolver = store_resolver(&ctx)?;
+    println!(
+        "prefetch: run={} presign_base={} cache_dir={} cache_gb={}",
+        ctx.run_id,
+        ctx.presign_base.as_deref().unwrap_or("-"),
+        ctx.cache_dir.display(),
+        ctx.cache_gb
+    );
+
+    /// Fetch one object, cache-first, printing the staging-evidence line.
+    async fn warm(
+        cache: &daemon_swarm_net::ContentCache,
+        resolver: &ArtifactResolver,
+        label: &str,
+        art: &ArtifactRef,
+    ) -> Result<Vec<u8>, String> {
+        let t0 = std::time::Instant::now();
+        let (bytes, source) = match cache.get(&art.blake3).await.map_err(|e| e.to_string())? {
+            Some(b) => (b, "cache"),
+            None => {
+                let b = resolver
+                    .fetch(art)
+                    .await
+                    .map_err(|e| format!("{label} ({}): {e}", art.url))?;
+                if let Err(e) = cache.insert(&art.blake3, &b).await {
+                    eprintln!("prefetch: cache insert failed for {label} (continuing): {e}");
+                }
+                (b, "store")
+            }
+        };
+        println!(
+            "prefetch: {label} bytes={} blake3={} source={source} ms={}",
+            bytes.len(),
+            art.blake3.to_hex(),
+            t0.elapsed().as_millis()
+        );
+        Ok(bytes)
+    }
+
+    let mut warmed = 0u32;
+    if let Ok(hex) = std::env::var("DAEMON_TRAIN_PREFETCH_MODULE") {
+        let hash =
+            hash_from_hex(&hex).ok_or_else(|| format!("bad DAEMON_TRAIN_PREFETCH_MODULE {hex}"))?;
+        let art = ArtifactRef::new(format!("r2://modules/{}.wasm", hash.to_hex()), hash);
+        warm(&cache, &resolver, "module", &art).await?;
+        warmed += 1;
+    }
+    if let Ok(hex) = std::env::var("DAEMON_TRAIN_PREFETCH_MANIFEST") {
+        let hash = hash_from_hex(&hex)
+            .ok_or_else(|| format!("bad DAEMON_TRAIN_PREFETCH_MANIFEST {hex}"))?;
+        let art = ArtifactRef::new(format!("r2://corpus/{}.json", hash.to_hex()), hash);
+        let manifest_bytes = warm(&cache, &resolver, "manifest", &art).await?;
+        let manifest = daemon_swarm_run::data::Manifest::from_json(
+            std::str::from_utf8(&manifest_bytes).map_err(|e| format!("manifest utf8: {e}"))?,
+        )
+        .map_err(|e| format!("parse corpus manifest: {e}"))?;
+
+        let (start, count) = std::env::var("DAEMON_TRAIN_PREFETCH_WINDOW")
+            .ok()
+            .and_then(|w| {
+                let (s, c) = w.split_once(':')?;
+                Some((s.parse().ok()?, c.parse().ok()?))
+            })
+            .unwrap_or((0u64, 0u64));
+        let indices = manifest.shards_covering(start, count);
+        println!(
+            "prefetch: corpus window start={start} count={count} -> {}/{} shards",
+            indices.len(),
+            manifest.shards.len()
+        );
+        for idx in indices {
+            let desc = &manifest.shards[idx];
+            let hash = hash_from_hex(&desc.blake3)
+                .ok_or_else(|| format!("shard {idx} malformed blake3"))?;
+            let art = ArtifactRef::new(format!("r2://corpus/{}.bin", desc.blake3), hash);
+            warm(
+                &cache,
+                &resolver,
+                &format!("shard[{idx}] {}", desc.name),
+                &art,
+            )
+            .await?;
+            warmed += 1;
+        }
+        warmed += 1;
+    }
+    if warmed == 0 {
+        return Err(
+            "DAEMON_TRAIN_PREFETCH set but neither DAEMON_TRAIN_PREFETCH_MODULE nor \
+             DAEMON_TRAIN_PREFETCH_MANIFEST given — nothing to warm"
+                .to_string(),
+        );
+    }
+    println!("prefetch: OK ({warmed} objects verified + cache-warm)");
+    Ok(())
 }
 
 /// The `.wasm` module bytes from `DAEMON_TRAIN_MODULE` (the dev / node-controlled override), if set.
@@ -84,6 +334,47 @@ async fn resolve_module(frozen: &daemon_swarm_proto::FrozenEnvelope) -> Result<V
 fn module_from_env() -> Option<Result<Vec<u8>, String>> {
     let path = std::env::var("DAEMON_TRAIN_MODULE").ok()?;
     Some(std::fs::read(&path).map_err(|e| format!("reading module {path}: {e}")))
+}
+
+/// The engine config for this worker's wasm host, honoring `DAEMON_TRAIN_BACKEND` (P3 lane S — the
+/// 160M staging rehearsal's Vulkan lane): `cpu` (default), `burn-ndarray`, or `wgpu` (feature-gated;
+/// an unavailable selection falls back to the CPU det lane with a loud stderr note, never silently
+/// changing semantics — the det digests are byte-identical across backends by the B3 contract, so
+/// backend choice affects wall-clock only). When the var is set the roomy 160M-scale sandbox budgets
+/// are applied (the defaults are tuned for the tiny reference model; a 768-wide model's real fp32
+/// steps trip the 5 s epoch watchdog — mirrors `preset_160m.rs::roomy_engine`).
+pub(crate) fn engine_config_from_env() -> daemon_train::EngineConfig {
+    use std::time::Duration;
+    let Ok(kind) = std::env::var("DAEMON_TRAIN_BACKEND") else {
+        return daemon_train::EngineConfig::default();
+    };
+    let backend = match kind.as_str() {
+        "cpu" | "" => daemon_train::BackendKind::Cpu,
+        #[cfg(feature = "burn-ndarray")]
+        "burn-ndarray" => daemon_train::BackendKind::BurnNdarray,
+        #[cfg(feature = "wgpu")]
+        "wgpu" => daemon_train::BackendKind::Wgpu,
+        // P3 Merge-2: the CUDA lane (RunPod 4090) sets `DAEMON_TRAIN_BACKEND=cuda` for the roomy
+        // 160M budgets; the actual backend/gpu is still chosen by `select_backend()`'s probe ladder
+        // (NVRTC-readiness-gated), which composes over this via `worker_engine_config()`.
+        #[cfg(feature = "cuda")]
+        "cuda" => daemon_train::BackendKind::Cuda,
+        other => {
+            eprintln!(
+                "[daemon-train-worker] DAEMON_TRAIN_BACKEND={other} not available in this build \
+                 (feature not compiled?) — falling back to the CPU det lane"
+            );
+            daemon_train::BackendKind::Cpu
+        }
+    };
+    daemon_train::EngineConfig {
+        fuel_per_call: 1 << 34,
+        epoch_deadline: Duration::from_secs(600),
+        op_budget: 1 << 30,
+        max_step_handles: 1 << 24,
+        backend,
+        ..daemon_train::EngineConfig::default()
+    }
 }
 
 /// The host `tabi@1` vocabulary (name-for-name with the phase table / SDK `TABI_IMPORTS`, all 66).
@@ -333,7 +624,18 @@ pub(crate) fn device_limits() -> DeviceLimits {
 /// The peer-side re-validation (spec §6.5): a static import scan of the module vs the host `tabi@1`
 /// vocabulary, then a host meta-mode pass over the config → an [`Eligibility`] verdict.
 pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String> {
-    let worker = Worker::new(EngineConfig::default()).map_err(|e| format!("engine: {e}"))?;
+    // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (the meta pass over a real-scale
+    // param layout exceeds the tiny-model defaults). The meta pass itself stays on the CPU-cheap
+    // path (footprint estimation, backend-independent).
+    let engine = if std::env::var_os("DAEMON_TRAIN_BACKEND").is_some() {
+        EngineConfig {
+            backend: daemon_train::BackendKind::Cpu,
+            ..engine_config_from_env()
+        }
+    } else {
+        EngineConfig::default()
+    };
+    let worker = Worker::new(engine).map_err(|e| format!("engine: {e}"))?;
     let vocabulary: BTreeSet<String> = host_ops().into_iter().collect();
     let imports = worker
         .module_imports(module)

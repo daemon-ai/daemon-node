@@ -13,7 +13,10 @@ path = "src/lib.rs"
 # The live-transport exit gate (`tests/live_transport.rs`): the round engine over a REAL per-node
 # `IrohGossip` mesh + a shared `FsPayloadStore` (B3). Off by default so the standard e2e gate stays
 # fast + iroh-free; run with `cargo test -p daemon-swarm-e2e --features iroh`.
-iroh = ["daemon-swarm-run/iroh"]
+# P3 lane S additively pulls `daemon-swarm-net/ws` under the same live-gate feature: the 160M staging
+# rehearsal (`tests/staging_160m.rs`) taps the run's WS control plane as a passive observer to write
+# the `<run>.dsmlog` message-log capture. The default gate stays WS/TLS/iroh-free.
+iroh = ["daemon-swarm-run/iroh", "daemon-swarm-net/ws"]
 
 [dev-dependencies]
 # The peer-side round engine + the local-coordinator harness + churn/failure drill machinery

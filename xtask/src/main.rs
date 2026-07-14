@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+mod publish;
 mod tokenize;
 
 use clap::{Parser, Subcommand};
@@ -99,6 +100,68 @@ enum Cmd {
         #[arg(long)]
         max_tokens: Option<u64>,
     },
+    /// Publish an experiment module to the payload store at `modules/<blake3>.wasm` (P3 lane S).
+    PublishModule {
+        /// The `.wasm` module to upload.
+        #[arg(long)]
+        module: PathBuf,
+        /// The run id whose prefix the object lives under (`runs/<run>/modules/…`).
+        #[arg(long)]
+        run: String,
+        /// The coordinator presign base (e.g. `https://…/api/v1/swarm`).
+        #[arg(long)]
+        presign_base: String,
+        /// `swarm:*`-scoped bearer token (gateway path).
+        #[arg(long)]
+        bearer: Option<String>,
+        /// Internal identity org id (direct-to-`apps/swarm` dev path; pair with `--actor`).
+        #[arg(long)]
+        org: Option<String>,
+        /// Internal identity actor (pair with `--org`).
+        #[arg(long)]
+        actor: Option<String>,
+    },
+    /// Publish a pre-tokenized corpus (shards + manifest) to the payload store by content hash (P3 S).
+    PublishCorpus {
+        /// The `manifest.json` produced by `tokenize-corpus` (its shards sit beside it).
+        #[arg(long)]
+        manifest: PathBuf,
+        /// The run id whose prefix the objects live under (`runs/<run>/corpus/…`).
+        #[arg(long)]
+        run: String,
+        /// The coordinator presign base.
+        #[arg(long)]
+        presign_base: String,
+        /// `swarm:*`-scoped bearer token (gateway path).
+        #[arg(long)]
+        bearer: Option<String>,
+        /// Internal identity org id (pair with `--actor`).
+        #[arg(long)]
+        org: Option<String>,
+        /// Internal identity actor (pair with `--org`).
+        #[arg(long)]
+        actor: Option<String>,
+    },
+}
+
+/// Build a [`publish::Target`] from the shared CLI auth flags.
+fn publish_target(
+    run: String,
+    presign_base: String,
+    bearer: Option<String>,
+    org: Option<String>,
+    actor: Option<String>,
+) -> publish::Target {
+    let internal = match (org, actor) {
+        (Some(org), Some(actor)) => Some((org, actor)),
+        _ => None,
+    };
+    publish::Target {
+        presign_base,
+        run,
+        bearer,
+        internal,
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -142,6 +205,28 @@ fn main() -> anyhow::Result<()> {
                 max_tokens,
             })
         }
+        Cmd::PublishModule {
+            module,
+            run,
+            presign_base,
+            bearer,
+            org,
+            actor,
+        } => publish::publish_module(
+            module,
+            publish_target(run, presign_base, bearer, org, actor),
+        ),
+        Cmd::PublishCorpus {
+            manifest,
+            run,
+            presign_base,
+            bearer,
+            org,
+            actor,
+        } => publish::publish_corpus(
+            manifest,
+            publish_target(run, presign_base, bearer, org, actor),
+        ),
     }
 }
 

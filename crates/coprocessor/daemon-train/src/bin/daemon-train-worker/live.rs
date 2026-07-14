@@ -19,11 +19,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::BTreeMap;
+
 use daemon_provision::CutWriter;
 use daemon_swarm_net::{
-    ContentHash, ControlPlane, DualPlane, FsPayloadStore, HttpPresignClient, IrohGossip,
-    IrohGossipConfig, IrohPeer, PayloadKey, PayloadStat, PayloadStore, R2Store, RebroadcastConfig,
-    ReconnectConfig, RegistryClient, RunId, SwarmNetError, WsAuth, WsConfig, WsControlPlane,
+    ArtifactRef, ArtifactResolver, ContentCache, ContentHash, ControlPlane, DualPlane,
+    FsPayloadStore, HttpPresignClient, IrohGossip, IrohGossipConfig, IrohPeer, PayloadKey,
+    PayloadStat, PayloadStore, PresignClient, R2Store, RebroadcastConfig, ReconnectConfig,
+    RegistryClient, RunId, SwarmNetError, WsAuth, WsConfig, WsControlPlane,
 };
 use daemon_swarm_proto::messages::{Join, RecordEntry, ThroughputClass};
 use daemon_swarm_proto::{
@@ -34,7 +37,7 @@ use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, T
 use daemon_swarm_run::checkpoint::{
     plan_resync, CheckpointManifest, ReplayStep, ResyncPlan, CHECKPOINT_PEER,
 };
-use daemon_swarm_run::data::Corpus;
+use daemon_swarm_run::data::{Corpus, Manifest};
 use daemon_swarm_run::engine::{EngineConfig, EngineEvent, RoundEngine};
 use daemon_swarm_run::protocol::{ErrorClass, Event, JoinCredentials};
 use daemon_swarm_run::seam::RoundId;
@@ -133,15 +136,9 @@ pub(crate) async fn join_and_run_live(
     let store = Arc::new(build_store(run_id, creds)?);
 
     // -- corpus + engine config (deterministic across peers → agreeing digests) --------------------
-    let corpus = Arc::new(
-        Corpus::synthetic(
-            creds.engine.corpus_seed,
-            creds.engine.corpus_shards,
-            creds.engine.corpus_tokens_per_shard,
-            creds.engine.corpus_seq_len,
-        )
-        .map_err(|e| format!("synthetic corpus: {e}"))?,
-    );
+    // P3 lane S: a content-addressed corpus (`engine.corpus`) is fetched by hash from the store and
+    // windowed to the run's active shards; else the synthetic fallback (CI/test).
+    let corpus = Arc::new(build_corpus(run_id, creds).await?);
     let roster: Vec<PeerId> = creds.roster.iter().map(|b| PeerId(*b)).collect();
     let micro_batch = assessed_micro_batch
         .max(1)
@@ -360,6 +357,123 @@ fn build_store(run_id: &str, creds: &JoinCredentials) -> Result<WorkerStore, Str
         }
     }
 }
+
+/// Build the peer's [`Corpus`] (P3 lane S). A content-addressed `engine.corpus` reference triggers a
+/// fetch-by-hash: the manifest object and the peer's **assigned** shards (the active data window,
+/// [`Manifest::shards_covering`]) are pulled from the payload store, blake3-verified, and cached
+/// content-addressed on disk, then assembled into a **windowed** corpus (only the run's shards held
+/// in memory — the M4 32 GB RAM-budget guard). Absent ⇒ the deterministic synthetic corpus.
+async fn build_corpus(run_id: &str, creds: &JoinCredentials) -> Result<Corpus, String> {
+    let Some(cref) = &creds.engine.corpus else {
+        return Corpus::synthetic(
+            creds.engine.corpus_seed,
+            creds.engine.corpus_shards,
+            creds.engine.corpus_tokens_per_shard,
+            creds.engine.corpus_seq_len,
+        )
+        .map_err(|e| format!("synthetic corpus: {e}"));
+    };
+
+    let cache = open_corpus_cache()?;
+    let resolver = corpus_resolver(run_id, creds)?;
+
+    // 1. Fetch + verify the manifest object (`corpus/<manifest_blake3>.json`).
+    let manifest_hash = ContentHash::new(cref.manifest_blake3);
+    let manifest_url = format!("r2://corpus/{}.json", manifest_hash.to_hex());
+    let manifest_bytes = fetch_cached(
+        &cache,
+        &resolver,
+        &ArtifactRef::new(manifest_url, manifest_hash),
+    )
+    .await?;
+    let manifest = Manifest::from_json(
+        std::str::from_utf8(&manifest_bytes).map_err(|e| format!("manifest utf8: {e}"))?,
+    )
+    .map_err(|e| format!("parse corpus manifest: {e}"))?;
+
+    // 2. Stage ONLY the shards the active window touches (§8 windowing), verified + cached.
+    let indices = manifest.shards_covering(cref.window_start, cref.window_sequences);
+    let mut resident: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    for idx in indices {
+        let desc = manifest
+            .shards
+            .get(idx)
+            .ok_or_else(|| format!("shard index {idx} out of manifest range"))?;
+        let shard_hash = hash_from_hex(&desc.blake3)
+            .ok_or_else(|| format!("shard {idx} has a malformed blake3 hash"))?;
+        let url = format!("r2://corpus/{}.bin", desc.blake3);
+        let bytes = fetch_cached(&cache, &resolver, &ArtifactRef::new(url, shard_hash)).await?;
+        resident.insert(idx, bytes);
+    }
+
+    Corpus::windowed(manifest, resident).map_err(|e| format!("windowed corpus: {e}"))
+}
+
+/// Open the on-disk content cache for corpus shards (`DAEMON_SWARM_CACHE_DIR` / `_CACHE_GB`).
+fn open_corpus_cache() -> Result<ContentCache, String> {
+    let dir = std::env::var_os("DAEMON_SWARM_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("daemon-swarm-cache"));
+    let gb = std::env::var("DAEMON_SWARM_CACHE_GB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    ContentCache::open_gb(&dir, gb)
+        .map_err(|e| format!("open content cache {}: {e}", dir.display()))
+}
+
+/// Build an [`ArtifactResolver`] for the corpus fetch from the live credentials (egress + presign for
+/// `r2://`). The presign auth mirrors the payload-store auth (bearer / internal identity).
+///
+/// The presign **scope** is `DAEMON_SWARM_RUN_ID` when set (the shared asset prefix
+/// `runs/<scope>/corpus/…` — content-addressed objects are published once and consumed by many runs;
+/// the presign endpoint scopes keys, it does not require the id to be a live run), else the joined
+/// run id. Mirrors `backend::store_fetch_context` so module + corpus resolve under one scope.
+fn corpus_resolver(run_id: &str, creds: &JoinCredentials) -> Result<ArtifactResolver, String> {
+    let scope = std::env::var("DAEMON_SWARM_RUN_ID").unwrap_or_else(|_| run_id.to_string());
+    let run_id: &str = &scope;
+    let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
+        .map_err(|e| format!("egress client: {e}"))?;
+    let mut resolver = ArtifactResolver::with_egress(egress);
+    if let Some(base) = &creds.presign_base {
+        use daemon_swarm_run::protocol::WsAuthSpec;
+        let presign_egress =
+            daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
+                .map_err(|e| format!("presign egress client: {e}"))?;
+        let presign = match &creds.ws_auth {
+            WsAuthSpec::None => HttpPresignClient::new(presign_egress, base.clone()),
+            WsAuthSpec::Bearer(t) => {
+                HttpPresignClient::new(presign_egress, base.clone()).with_bearer(t.clone())
+            }
+            WsAuthSpec::Internal { org_id, actor } => {
+                HttpPresignClient::new(presign_egress, base.clone())
+                    .with_internal(org_id.clone(), actor.clone())
+            }
+        };
+        let presign: Arc<dyn PresignClient> = Arc::new(presign);
+        resolver = resolver.with_presign(presign, RunId::new(run_id));
+    }
+    Ok(resolver)
+}
+
+/// Fetch `art` (content cache first, then a presigned store GET), caching verified bytes on a miss.
+async fn fetch_cached(
+    cache: &ContentCache,
+    resolver: &ArtifactResolver,
+    art: &ArtifactRef,
+) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = cache.get(&art.blake3).await.map_err(|e| e.to_string())? {
+        return Ok(bytes);
+    }
+    let bytes = resolver.fetch(art).await.map_err(|e| e.to_string())?;
+    if let Err(e) = cache.insert(&art.blake3, &bytes).await {
+        eprintln!("[daemon-train-worker] corpus cache insert failed (continuing): {e}");
+    }
+    Ok(bytes)
+}
+
+/// Decode a 64-char lowercase-hex blake3 into a [`ContentHash`] (shared with the prefetch mode).
+use crate::backend::hash_from_hex;
 
 #[async_trait::async_trait]
 impl PayloadStore for WorkerStore {
@@ -644,16 +758,20 @@ fn to_ws_auth(spec: &daemon_swarm_run::protocol::WsAuthSpec) -> WsAuth {
     }
 }
 
-/// The host engine profile for the live worker's `WasmBackend`, with the backend/GPU chosen by the
-/// worker probe (§10.5 verdict path; swarm-ledger-p3-g D4): the CPU det lane by default, or the CUDA
-/// native lane when the `cuda` feature + a device are present. The det lane stays host fp32 on either
-/// backend, so a CUDA peer's per-round digests remain byte-identical to CPU peers (consensus-invariant).
+/// The host engine profile for the live worker's `WasmBackend` (Merge-2 reconciliation of the G and S
+/// lanes): the **backend + GPU index come from the probe ladder** [`crate::backend::select_backend`]
+/// (§10.5 verdict path; swarm-ledger-p3-g D4 — CUDA → wgpu → CPU, with the `DAEMON_TRAIN_BACKEND=cpu`
+/// escape hatch + the D6 NVRTC-readiness gate), composed **over the roomy 160M sandbox budgets** from
+/// [`crate::backend::engine_config_from_env`] (P3 lane S — a 768-wide model's real fp32 steps trip the
+/// tiny-model 5 s epoch watchdog; the budgets apply when `DAEMON_TRAIN_BACKEND` is set, tiny-model
+/// defaults otherwise). The det lane stays host fp32 on every backend, so a CUDA/wgpu peer's per-round
+/// digests remain byte-identical to CPU peers (the consensus invariant is unchanged).
 fn worker_engine_config() -> WasmEngineConfig {
     let (backend, gpu_index) = crate::backend::select_backend();
     WasmEngineConfig {
         backend,
         gpu_index,
-        ..WasmEngineConfig::default()
+        ..crate::backend::engine_config_from_env()
     }
 }
 

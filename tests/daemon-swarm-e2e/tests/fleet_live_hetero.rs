@@ -423,6 +423,7 @@ fn credentials_for(
             corpus_vocab_clamp: GUEST_VOCAB,
             // §9 resync-replay window — mirrors the envelope's `payload_retention_rounds`.
             payload_retention_rounds: PAYLOAD_RETENTION_ROUNDS,
+            corpus: None,
         },
     }
 }
