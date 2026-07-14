@@ -57,6 +57,12 @@ enum Cmd {
     VerifyCodec,
     /// Build the swarm guest experiment modules (`guests/`) for `wasm32-unknown-unknown`.
     BuildGuests,
+    /// Run the swarm **CI tier-1** suite: the CPU-only, consensus-critical determinism / round-
+    /// protocol / codec / wasm-guest suites (TDD §8.1 tier 1). Builds the guests first, then runs the
+    /// pinned suite list, failing on the first red. No GPU, no live substrate (env-gated live tests
+    /// skip). This is the single in-repo definition of the per-PR swarm gate — the superproject CI
+    /// job and a local operator both invoke `cargo run -p xtask -- swarm-ci-det`.
+    SwarmCiDet,
     /// Tokenize a corpus into fixed-width shards + `manifest.json` (spec §8; M1 seam).
     TokenizeCorpus {
         /// HF dataset repo id (e.g. `roneneldan/TinyStories`); omit when using `--text`.
@@ -103,6 +109,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::GenZcbor { cddl, out } => gen_zcbor(cddl, out),
         Cmd::VerifyCodec => verify_codec(),
         Cmd::BuildGuests => build_guests(),
+        Cmd::SwarmCiDet => swarm_ci_det(),
         Cmd::TokenizeCorpus {
             dataset,
             dataset_file,
@@ -179,6 +186,88 @@ fn build_guests() -> anyhow::Result<()> {
         guests.display(),
         manifest.display()
     );
+    Ok(())
+}
+
+/// Run the swarm CI tier-1 suite (TDD §8.1 tier 1: the per-PR, hosted-CI, no-GPU gate).
+///
+/// Every bit-exact / cross-peer-consensus claim is a CPU property by contract (the det lane is CPU
+/// fp32, spec §5.6), so this tier runs on plain runners. It covers the shared det kernels; the round
+/// protocol, assignment, envelope schema, and canonical CBOR; the harness, assess, and replay
+/// (loopback); the observe/replay oracle; the WS/gossip framing and dedupe codecs (no network); the
+/// worker det lane, cross-backend digest identity, and wasm-guest determinism; the SDK profile
+/// goldens; the e2e drills and observe-replay (no iroh/live); and the wire codec conformance (see the
+/// pinned list below).
+///
+/// The GPU (`wgpu`/`cuda`) and live-substrate lanes are deliberately EXCLUDED: those are the scheduled
+/// per-lane tier 2 and the manual hardware-in-loop gate tier 3 (see swarm-p2-gate-runbook.md).
+///
+/// The `daemon-conformance` detached-delegation trio (a known parallel-load flake, pass-in-isolation
+/// = green) is NOT a swarm crate and NOT in this list, so it never gates the swarm tier.
+fn swarm_ci_det() -> anyhow::Result<()> {
+    let root = workspace_root();
+    build_guests()?;
+    // (label, cargo test args). Each runs in its own process; the first red aborts.
+    let suites: &[(&str, &[&str])] = &[
+        (
+            "det-core (shared det kernels: sim ≡ host)",
+            &["-p", "det-core"],
+        ),
+        (
+            "daemon-swarm-proto (state machine + assignment + envelope + canonical CBOR)",
+            &["-p", "daemon-swarm-proto"],
+        ),
+        (
+            "daemon-swarm-run (harness + assess + replay, loopback)",
+            &["-p", "daemon-swarm-run"],
+        ),
+        (
+            "daemon-swarm-observe (MessageLog + replay oracle + desync tally)",
+            &["-p", "daemon-swarm-observe"],
+        ),
+        (
+            "daemon-swarm-net (framing + dedupe codecs, no network)",
+            &["-p", "daemon-swarm-net"],
+        ),
+        (
+            "daemon-train (det lane + cross-backend digests + wasm-guest determinism)",
+            &["-p", "daemon-train", "--features", "burn-ndarray"],
+        ),
+        (
+            "daemon-train-sdk (SDK profile goldens: sparse_loco/diloco)",
+            &["-p", "daemon-train-sdk", "--features", "sim"],
+        ),
+        (
+            "daemon-swarm-e2e (drills + observe-replay, no iroh/live)",
+            &["-p", "daemon-swarm-e2e"],
+        ),
+        (
+            "daemon-api conformance (serde wire ↔ CDDL, pos+neg)",
+            &["-p", "daemon-api", "--test", "conformance"],
+        ),
+        (
+            "daemon-api conformance_proptest (arbitrary values ↔ CDDL)",
+            &[
+                "-p",
+                "daemon-api",
+                "--features",
+                "arbitrary",
+                "--test",
+                "conformance_proptest",
+            ],
+        ),
+    ];
+    for (label, args) in suites {
+        println!("\n== swarm-ci-det: {label} ==");
+        let status = Command::new("cargo")
+            .current_dir(&root)
+            .arg("test")
+            .args(*args)
+            .status()
+            .map_err(|e| anyhow::anyhow!("running cargo test {args:?}: {e}"))?;
+        anyhow::ensure!(status.success(), "swarm CI tier-1 suite failed: {label}");
+    }
+    println!("\nswarm-ci-det: all tier-1 (CPU consensus-critical) swarm suites green");
     Ok(())
 }
 
