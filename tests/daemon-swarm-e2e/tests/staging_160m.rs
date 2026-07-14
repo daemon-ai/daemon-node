@@ -382,6 +382,9 @@ fn credentials_for(
             stall_rounds_max: 3,
             checkpoint_every_rounds: 0,
             update_max_bytes: 64 << 20,
+            // Merge-2: R's §9 resync-replay window (additive; the staging rehearsal keeps no
+            // checkpoints so this is inert here, but the field is required by the merged struct).
+            payload_retention_rounds: 16,
             // Synthetic fallback fields — UNUSED when `corpus` is Some (kept for the wire shape).
             corpus_seed: 0,
             corpus_shards: 0,
