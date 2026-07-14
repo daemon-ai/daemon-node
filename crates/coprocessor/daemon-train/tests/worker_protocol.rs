@@ -167,10 +167,11 @@ async fn supervisor_probe_assess_join() {
     let sup = TrainSupervisor::new(cfg);
 
     // Probe: a real host capability report — the full tabi@1 vocabulary. A default (CPU-only)
-    // build reports gpus = 0; a `wgpu` build reports gpus = 1 iff a usable adapter came up (G2).
+    // build reports gpus = 0; a GPU-featured build (`wgpu` G2, `cuda` P3 Lane G) reports gpus = 1
+    // iff a usable device came up (the fat-worker probe order — swarm-ledger-p3-g D5).
     let hw = sup.probe().await.expect("probe");
-    if cfg!(feature = "wgpu") {
-        assert!(hw.gpus <= 1, "wgpu probe reports 0 or 1 usable adapters");
+    if cfg!(any(feature = "wgpu", feature = "cuda")) {
+        assert!(hw.gpus <= 1, "the GPU probe reports 0 or 1 usable devices");
         assert!(
             hw.backend_lanes.iter().any(|l| l == "cpu"),
             "the cpu lane is always present"

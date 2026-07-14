@@ -400,16 +400,21 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
 }
 
 /// The engine backend + GPU index the live worker drives its **native** lane on (§10.5 verdict path;
-/// swarm-ledger-p3-g D4).
+/// swarm-ledger-p3-g D4 + the P3 fat-worker packaging decision).
 ///
-/// When the `cuda` feature is built AND a CUDA device is present, select the CUDA arm (device 0);
-/// otherwise the CPU det-lane default. The det lane stays host fp32 on either backend, so a CUDA
-/// peer's post-ingest digests are byte-identical to CPU peers ingesting the same committed set (the
-/// consensus invariant is unchanged — the CUDA arm only accelerates the tolerance-class native lane).
+/// Probe-ordered graceful degradation for the one-fat-binary packaging (ndarray + wgpu + cuda
+/// unioned; runtime probe selects the arm): **CUDA → wgpu → CPU**. Each rung is taken only when its
+/// feature is built AND its probe reports a usable device, so a cuda-featured worker on a non-NVIDIA
+/// machine falls through to wgpu (if built + adapter present) or the CPU det lane — no panic, no
+/// link-time dependency (cudarc is in dlopen mode; the memoized `probe_cuda` catches the
+/// missing-libcuda unwind and reports `None`). The det lane stays host fp32 on every backend, so a
+/// GPU peer's post-ingest digests are byte-identical to CPU peers ingesting the same committed set
+/// (the consensus invariant is unchanged — the GPU arms only accelerate the tolerance-class native
+/// lane).
 ///
-/// `DAEMON_TRAIN_BACKEND=cpu` forces the CPU lane even when a GPU is present (an operator escape hatch
-/// for a box whose driver-matched NVRTC is not staged — the backend would otherwise fail on the first
-/// device op). Returns `(BackendKind, gpu_index)` for the [`daemon_train::EngineConfig`].
+/// `DAEMON_TRAIN_BACKEND=cpu` forces the CPU lane even when a GPU is present (an operator escape
+/// hatch for a box whose driver-matched NVRTC is not staged — the backend would otherwise fail on
+/// the first device op). Returns `(BackendKind, gpu_index)` for the [`daemon_train::EngineConfig`].
 ///
 /// Only the live-attach path (`swarm-net`) consumes this; a probe-only or default worker never
 /// selects a backend, so it is gated with its sole caller (`live.rs`).
@@ -421,16 +426,42 @@ pub(crate) fn select_backend() -> (daemon_train::BackendKind, Option<u32>) {
     #[cfg(feature = "cuda")]
     {
         if let Some(p) = daemon_train::autotune::probe_cuda() {
+            // NVRTC readiness gate (fetch-on-demand contract, swarm-ledger-p3-g D6): the device
+            // alone is not enough — burn-cuda JITs through libnvrtc, which must be staged
+            // driver-matched (DAEMON_CUDA_RUNTIME_DIR). Until it is, downgrade to wgpu/CPU
+            // instead of failing on the first tensor op.
+            if daemon_train::autotune::cuda_nvrtc_ready() {
+                eprintln!(
+                    "daemon-train-worker: selecting CUDA native lane (device 0: {}, {} MiB VRAM); \
+                     det lane stays host fp32 (consensus-invariant)",
+                    p.adapter, p.vram_mb
+                );
+                return (daemon_train::BackendKind::Cuda, Some(0));
+            }
             eprintln!(
-                "daemon-train-worker: selecting CUDA native lane (device 0: {}, {} MiB VRAM); \
-                 det lane stays host fp32 (consensus-invariant)",
-                p.adapter, p.vram_mb
+                "daemon-train-worker: CUDA device present ({}) but libnvrtc is not loadable — \
+                 stage the driver-matched NVRTC runtime (DAEMON_CUDA_RUNTIME_DIR) to enable the \
+                 CUDA lane; downgrading (probe order: cuda -> wgpu -> cpu)",
+                p.adapter
             );
-            return (daemon_train::BackendKind::Cuda, Some(0));
+        } else {
+            eprintln!(
+                "daemon-train-worker: cuda feature built but no CUDA device present — degrading \
+                 (fat-worker probe order: cuda -> wgpu -> cpu)"
+            );
         }
-        eprintln!(
-            "daemon-train-worker: cuda feature built but no CUDA device present — CPU det lane"
-        );
+    }
+    #[cfg(feature = "wgpu")]
+    {
+        if let Some(p) = daemon_train::autotune::probe_wgpu() {
+            eprintln!(
+                "daemon-train-worker: selecting wgpu native lane (adapter: {}, backend {}); \
+                 det lane stays host fp32 (consensus-invariant)",
+                p.adapter, p.backend
+            );
+            return (daemon_train::BackendKind::Wgpu, None);
+        }
+        eprintln!("daemon-train-worker: wgpu feature built but no usable adapter — CPU det lane");
     }
     (daemon_train::BackendKind::Cpu, None)
 }

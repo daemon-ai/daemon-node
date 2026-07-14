@@ -571,10 +571,36 @@ fn probe_cuda_uncached() -> Option<CudaProbe> {
     attempt.ok().flatten()
 }
 
-// The one cudarc-touching module. `cuDeviceTotalMem` is a `cudarc` `unsafe fn`, so this module carries
-// the scoped `#[allow(unsafe_code)]` under the crate's `#![deny(unsafe_code)]` — the identical pattern
-// the Windows/macOS FFI probes use (swarm-ledger-p2-c2 D1). cudarc is a cuda-gated, lock-neutral dep
-// (already resolved via cubecl-cuda; swarm-ledger-p3-g D3).
+/// Whether the NVRTC runtime library is loadable (feature `cuda`) — the **fetch-on-demand readiness
+/// gate** (swarm-ledger-p3-g D6). A CUDA *device* being present ([`probe_cuda`]) is necessary but not
+/// sufficient for the CUDA engine arm: burn-cuda JIT-compiles kernels through NVRTC, which most
+/// containers do not ship and which must be **driver-matched** (an nvrtc newer than the driver's CUDA
+/// level emits PTX the driver rejects — `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`, the P2 C2 finding). The
+/// operator (or the future fetch-on-demand stager) provides it via `DAEMON_CUDA_RUNTIME_DIR` on
+/// `LD_LIBRARY_PATH`; cudarc dlopens `libnvrtc.so.12` by soname on first use.
+///
+/// This check compiles-and-frees a trivial NVRTC program inside `catch_unwind`: in cudarc's dlopen
+/// mode a missing `libnvrtc` surfaces as a panic on first symbol resolution, which is caught and
+/// reported as **not ready** — the worker's fat-binary probe order then downgrades to wgpu/CPU
+/// instead of failing on the first tensor op. Memoized process-wide (dlopen'd libraries stay loaded).
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn cuda_nvrtc_ready() -> bool {
+    use std::sync::OnceLock;
+    static READY: OnceLock<bool> = OnceLock::new();
+    *READY.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let attempt = std::panic::catch_unwind(cuda_ffi::nvrtc_loads);
+        std::panic::set_hook(prev);
+        matches!(attempt, Ok(true))
+    })
+}
+
+// The one cudarc-touching module. `cuDeviceTotalMem` / `destroy_program` are `cudarc` `unsafe fn`s,
+// so this module carries the scoped `#[allow(unsafe_code)]` under the crate's `#![deny(unsafe_code)]`
+// — the identical pattern the Windows/macOS FFI probes use (swarm-ledger-p2-c2 D1). cudarc is a
+// cuda-gated, lock-neutral dep (already resolved via cubecl-cuda; swarm-ledger-p3-g D3).
 #[cfg(feature = "cuda")]
 #[allow(unsafe_code)]
 mod cuda_ffi {
@@ -600,6 +626,23 @@ mod cuda_ffi {
             adapter,
             unified: false,
         })
+    }
+
+    /// Create (and free) a trivial NVRTC program — proves `libnvrtc` dlopens and its symbols
+    /// resolve. Panics (caught by the caller) when the library is absent; `false` on a soft error.
+    pub(super) fn nvrtc_loads() -> bool {
+        use cudarc::nvrtc::result::{create_program, destroy_program};
+        match create_program(
+            c"extern \"C\" __global__ void daemon_nvrtc_probe() {}",
+            None,
+        ) {
+            Ok(prog) => {
+                // SAFETY: `prog` was just created by `create_program` and not yet destroyed.
+                let _ = unsafe { destroy_program(prog) };
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 

@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 
-use daemon_train::autotune::{cuda_device_limits, probe_cuda, Autotune, DEFAULT_MAX_MICROBATCH};
+use daemon_train::autotune::{
+    cuda_device_limits, cuda_nvrtc_ready, probe_cuda, Autotune, DEFAULT_MAX_MICROBATCH,
+};
 use daemon_train::{cuda_adapter_available, EngineConfig, Worker};
 use daemon_train_sdk::models::TinyLlamaCfg;
 use serde::Serialize;
@@ -143,6 +145,55 @@ fn host_ram_mb() -> u64 {
         }
     }
     0
+}
+
+/// The fat-worker graceful-degradation guarantee (P3 packaging decision): a cuda-featured build on a
+/// machine WITHOUT an NVIDIA driver must degrade cleanly — `probe_cuda()` returns `None` (no panic,
+/// no abort; cudarc is in dlopen mode so there is no link-time libcuda dependency), and the CPU det
+/// lane still constructs and runs. This test runs on EVERY machine (no GPU skip — that is the point):
+/// on the AMD dev box it exercises the fallback path end-to-end; on the 4090 it exercises the
+/// present path. Either way the probe must be non-panicking, memoization-consistent, and coherent
+/// with `cuda_adapter_available()`.
+#[test]
+fn cuda_probe_degrades_cleanly_without_nvidia() {
+    // The probe itself must never panic — a missing libcuda dlopen is caught and reported as None.
+    let first = probe_cuda();
+    let second = probe_cuda();
+    assert_eq!(first, second, "probe is memoized and consistent");
+    assert_eq!(
+        cuda_adapter_available(),
+        first.is_some(),
+        "availability delegates to the probe"
+    );
+    match &first {
+        Some(p) => {
+            assert!(p.vram_mb > 0 && p.gpus == 1 && !p.unified);
+            eprintln!(
+                "cuda_probe_degrades_cleanly_without_nvidia: CUDA present ({}, {} MiB)",
+                p.adapter, p.vram_mb
+            );
+        }
+        None => {
+            eprintln!(
+                "cuda_probe_degrades_cleanly_without_nvidia: no NVIDIA driver — clean None \
+                 (the fat-worker fallback path)"
+            );
+        }
+    }
+    // The NVRTC readiness gate (fetch-on-demand contract) must likewise never panic: absent
+    // libnvrtc → `false` (the probe downgrades to wgpu/CPU); with the staged runtime dir → `true`.
+    // The select path requires the device probe first, so no invariant beyond "did not panic" +
+    // memoization is pinned here; the value is recorded for the run log.
+    let nvrtc = cuda_nvrtc_ready();
+    assert_eq!(nvrtc, cuda_nvrtc_ready(), "readiness gate is memoized");
+    eprintln!("cuda_probe_degrades_cleanly_without_nvidia: cuda_nvrtc_ready = {nvrtc}");
+    // Regardless of the probe outcome, the CPU det lane (the degradation target) still works: a
+    // cuda-featured binary on a non-NVIDIA box runs the consensus lane untouched.
+    let worker = Worker::new(EngineConfig::default()).expect("CPU engine constructs");
+    let module = worker.load_module(&tiny_llama_wasm()).expect("module");
+    let mut inst = worker.instantiate(&module).expect("instantiate");
+    inst.build(&cbor(&tiny_cfg()))
+        .expect("da_build on the CPU det lane");
 }
 
 /// HOST-8 `meta_mode_estimates_vs_cuda_probe`: the meta-pass byte footprints feed the autotune, whose

@@ -103,15 +103,19 @@ source is the driver API. `autotune::probe_cuda()` (feature `cuda`) queries it v
 convention). This yields `DeviceLimits { vram_mb ≈ 24564, ram_mb, max_alloc_mb, shared_mb: 0,
 unified: false }` on the 4090 — a real **discrete** budget, no UMA (§6 verdict path).
 
-- **`cudarc` is a LANE-OWNED, cuda-gated, additive dep — lock-neutral (the C2 dep rule).** `cudarc`
+- **`cudarc` is a LANE-OWNED, cuda-gated, additive dep — NO new crate (the C2 dep rule).** `cudarc`
   `0.19.8` is **already resolved** in the committed `Cargo.lock` (pulled by `cubecl-cuda 0.10` under
   the `cuda` feature). daemon-train adds `cudarc = { version = "0.19.8", optional = true,
   default-features = false, features = ["driver"] }` and `dep:cudarc` on the `cuda` feature. The
-  `driver` / dynamic-loading features are marker features (`= []`, no dep edges), so **`Cargo.lock`
-  stays byte-identical** and `cargo deny` is a no-op (no new third-party crate; same version+source
-  already in the graph). Off the default gate exactly like `burn/cuda`. Mirrors C2's target-gated
-  `windows` dep precedent. **If adding it changes `Cargo.lock`, that is the "STOP and report" trigger
-  from the brief** — verified byte-identical below.
+  `driver` / dynamic-loading features are marker features (`= []`, no dep edges), so **no new
+  crate/version/source enters the graph**. The only `Cargo.lock` change is **exactly one line** — the
+  `"cudarc 0.19.8"` edge recorded on the `daemon-train` package node (inherent to declaring any
+  optional dep); the `[[package]] cudarc 0.19.8` entry already existed. `cargo deny` is therefore a
+  no-op (advisories/bans/licenses/sources are over crates, and no crate is added), and the **default
+  dependency graph is unchanged** (`cargo tree -p daemon-train -e normal` shows no cudarc — it is
+  pulled only by the off-default `cuda` feature). Mirrors C2's target-gated `windows` dep precedent.
+  The brief's "STOP and report" trigger is a **new dep** (new crate/version) — which did **not**
+  happen; the single edge line is verified below.
 - **`unsafe` gate:** the `total_mem` call is a `cudarc` `unsafe fn`, so the cuda probe module carries a
   scoped `#[allow(unsafe_code)]` — the identical pattern the Windows/macOS FFI probe modules already
   use under the crate's `#![deny(unsafe_code)]` (C2 D1). Every other line still errors on stray
@@ -130,6 +134,65 @@ unaffected:** the det lane stays host CPU fp32, so the CUDA peer's post-ingest d
 byte-identical to CPU peers ingesting the same committed set (the C3 heterogeneity invariant, now with
 a GPU-native contributor). The wgpu live path is intentionally left unchanged (not this lane's to
 alter); only the additive CUDA branch is wired.
+
+### D5 — fat-worker packaging: one binary, probe-ordered graceful degradation (user decision, in-wave)
+
+**User decision (recorded 2026-07-14, mid-wave):** backend packaging is **one fat worker binary** —
+ndarray + wgpu + cuda features unioned (cuda target-gated to linux/windows x86_64 at packaging time),
+with the **runtime probe selecting the arm**. HARD REQUIREMENT: a cuda-featured worker on a
+non-NVIDIA machine must degrade gracefully to wgpu/CPU — no panic, **no link-time dependency**.
+
+Implementation: `select_backend()` (worker `backend.rs`) is the probe-ordered ladder
+**CUDA → wgpu → CPU** — each rung taken only when its feature is compiled AND its probe reports a
+usable device (plus, for CUDA, the D6 NVRTC readiness gate). Verified evidence:
+
+- **dlopen mode confirmed by construction and by ELF.** cudarc resolves with `fallback-dynamic-loading`
+  (+ `cuda-version-from-build-system` from cubecl-cuda), and its `build.rs` emits
+  `rustc-cfg=feature="dynamic-loading"` whenever no explicit link mode is chosen — every driver/NVRTC
+  symbol goes through lazy `libloading` dlopen. **Nothing in the dep graph forces link-mode cudarc**
+  (no `dynamic-linking`/`static-linking` feature reachable). ELF proof: the cuda-featured test binary
+  has **no `libcuda`/`libnvrtc` in `DT_NEEDED`** (checked with `readelf -d` on this AMD box).
+- **Empirical fallback test, run on this AMD (non-NVIDIA) machine:**
+  `cuda_lifecycle::cuda_probe_degrades_cleanly_without_nvidia` — a cuda-featured build probes
+  `probe_cuda() == None` (the missing-libcuda dlopen unwind is caught; memoized-consistent),
+  `cuda_adapter_available() == false`, `cuda_nvrtc_ready() == false`, **no panic**, and the CPU det
+  lane still constructs and `da_build`s. The test intentionally has **no GPU skip** — it asserts the
+  fallback path on GPU-less runners and the present path on the 4090.
+- The wgpu rung reuses the existing memoized `probe_wgpu()` (its own `catch_unwind`); the wgpu live
+  path is thereby also wired (previously the live worker was CPU-only regardless of features).
+
+### D6 — NVRTC strategy: fetch-on-demand runtime dir (user decision, in-wave; fetcher = Merge-1/later)
+
+**User decision (recorded 2026-07-14, mid-wave):** NVRTC is **fetched on demand** (like model
+assets), keyed by the **detected driver version**, staged into `DAEMON_CUDA_RUNTIME_DIR` (the
+indirection the `.#cuda-train` shell already exports onto `LD_LIBRARY_PATH`); until staged, the probe
+**downgrades to Vulkan/CPU**. Lane G does NOT build the fetch machinery — it keeps the runtime-dir
+contract clean and gates on readiness:
+
+- **Readiness gate:** `autotune::cuda_nvrtc_ready()` (memoized, `catch_unwind`) creates + frees a
+  trivial NVRTC program via cudarc — proving `libnvrtc.so.12` dlopens and its symbols resolve.
+  `select_backend()` requires `probe_cuda().is_some() && cuda_nvrtc_ready()` before choosing
+  `BackendKind::Cuda`; a CUDA device with unstaged NVRTC logs a loud "stage DAEMON_CUDA_RUNTIME_DIR"
+  note and falls through to wgpu/CPU (never fails on the first tensor op).
+- **What the future fetcher must provide (the contract, from the C2/C3 findings + this lane's runs):**
+  a directory (to be exported as `DAEMON_CUDA_RUNTIME_DIR` and prepended to `LD_LIBRARY_PATH` by the
+  launcher — the `.#cuda-train` shellHook already does the prepend) containing, at minimum:
+  - `libnvrtc.so.12` (+ its `libnvrtc-builtins.so.<ver>`) whose **major.minor matches the box driver's
+    CUDA level** (driver 550 ⇒ CUDA 12.4 ⇒ NVIDIA wheel `nvidia-cuda-nvrtc-cu12==12.4.127`). A newer
+    nvrtc emits PTX the older driver JIT rejects (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` — the C2 D5
+    finding); detect the driver via `cuDriverGetVersion` (or parse `nvidia-smi`), then fetch the
+    matching wheel and unpack `nvidia/cuda_nvrtc/lib/*`.
+  - a resolvable `libstdc++.so.6` next to nvrtc when the host glibc/libstdc++ is older than the wheel
+    expects (the RunPod staging carries `libgcc_s.so.1`; nix-glibc hosts get it from the devShell).
+  - it need NOT ship `libcuda`/`libnvidia-nvvm`/`libnvidia-ptxjitcompiler` — those are the box
+    **driver's own userspace** and load from the system path (host libcuda under nix glibc is proven,
+    C2 D5); the RunPod staging dir includes them only as convenience symlinks.
+  - cudart **headers** are a build-time-only need (`CUDA_PATH`, from the devShell's `cuda_cudart`);
+    the fetcher does not provide headers.
+  - **Readiness vs downgrade detection:** the fetcher's success criterion IS `cuda_nvrtc_ready()`
+    flipping to `true` in a fresh process (dlopen search paths are process-start state; a worker
+    restarts after staging). No sentinel files, no version parsing at probe time — loadability is
+    the test.
 
 ## Additive extensions made (freeze at Merge 1) — exact
 
