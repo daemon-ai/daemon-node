@@ -465,13 +465,24 @@ async fn staging_160m_fetch_by_hash_rehearsal() {
         .expect("observer WS connect"),
     );
     let mut obs_sub = observer.subscribe();
+    // The tap stops on an explicit signal: the subscription's sender lives on the plane handle (not
+    // its task), so `recv()` alone would never observe a close while the observer Arc is alive.
+    let (obs_stop_tx, mut obs_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let log_task = {
         let run_id = run_id.clone();
         tokio::spawn(async move {
             let mut log = MessageLog::new(run_id);
-            while let Some(bytes) = obs_sub.recv().await {
-                if let Ok(msg) = from_canonical_slice::<SignedMessage>(&bytes) {
-                    log.append(msg);
+            loop {
+                tokio::select! {
+                    _ = &mut obs_stop_rx => break,
+                    m = obs_sub.recv() => match m {
+                        Some(bytes) => {
+                            if let Ok(msg) = from_canonical_slice::<SignedMessage>(&bytes) {
+                                log.append(msg);
+                            }
+                        }
+                        None => break,
+                    },
                 }
             }
             log
@@ -611,12 +622,10 @@ async fn staging_160m_fetch_by_hash_rehearsal() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    for sup in &supervisors {
-        sup.leave(run_id.clone(), LeaveMode::Immediate).await.ok();
-        sup.shutdown().await;
-    }
-
     // ---- observe capture: stop the tap, write <run>.dsmlog, verify offline ----------------------
+    // (BEFORE the worker teardown: a 160M wgpu worker can be slow to exit on Leave, and the capture
+    // evidence must not depend on teardown promptness.)
+    let _ = obs_stop_tx.send(());
     observer.shutdown().await;
     let log = log_task.await.expect("observer log task");
     std::fs::create_dir_all(&env.observe_dir).expect("create observe dir");
@@ -655,4 +664,15 @@ async fn staging_160m_fetch_by_hash_rehearsal() {
          (no pre-staging), {} rounds, det digests byte-identical, observe log captured + verified",
         env.rounds
     );
+
+    // Teardown last, bounded: a 160M wgpu worker can be slow to service Leave (its engine task owns
+    // the device). The assertions above are already complete; don't let teardown hang the harness.
+    for sup in &supervisors {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            sup.leave(run_id.clone(), LeaveMode::Immediate),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(30), sup.shutdown()).await;
+    }
 }

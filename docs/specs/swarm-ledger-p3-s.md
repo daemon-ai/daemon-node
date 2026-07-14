@@ -39,6 +39,18 @@ version. Lane S's layout is deliberately **kind-agnostic** so that lands without
   (url + blake3) — nothing module-specific. The nvrtc fetcher itself is **NOT** built here (explicit
   non-goal); only the layout is kept generic.
 
+### 0b. Lane-R coordination note (recorded mid-lane)
+
+Lane R's live checkpoint-resync **reads the existing §11.3 keys** (`record-set.cbor`, round payloads,
+`checkpoints/round-<r>.safetensors`) — no new payload-plane surface from S. **Constraint S honors:**
+R2 lifecycle must retain **checkpoint objects for at least `payload_retention_rounds`** for
+fleet-scale resync. Lane S compliance check: the [`ContentCache`] eviction is a **worker-local disk
+cache** of immutable content-addressed artifacts (modules/shards) — it never deletes store-side
+objects; the only store-side pruning in the tree is the pre-existing `FsPayloadStore::prune`, which
+prunes **round-payload dirs only** (never `checkpoints/`). The actual R2 lifecycle rule is bucket
+config (cloud side, Lane R / integration owner) — flagged here so the Merge-1/2 owner sets the bucket
+lifecycle with the checkpoint-retention floor, not just the round-payload TTL.
+
 ### 1. Content-addressed on-disk cache — `daemon_swarm_net::content_cache::ContentCache`
 
 A new additive module in `daemon-swarm-net` (the artifact-fetch crate). A blake3-keyed on-disk cache:
