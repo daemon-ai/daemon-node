@@ -257,6 +257,11 @@ static BUILD: Once = Once::new();
 
 fn ensure_built() -> PathBuf {
     BUILD.call_once(|| {
+        // The LOCAL peer's feature set. Default `swarm-net` (the P2 tiny-llama CPU-det path); the P3
+        // 160M ceremony sets `SWARM_FLEET_WORKER_FEATURES=swarm-net,wgpu` so the local Strix/RADV peer
+        // runs the wgpu native lane (160M on the CPU det lane is intractably slow — S deviation 1).
+        let features = std::env::var("SWARM_FLEET_WORKER_FEATURES")
+            .unwrap_or_else(|_| "swarm-net".to_string());
         let status = Command::new("cargo")
             .current_dir(workspace_root())
             .args([
@@ -264,7 +269,7 @@ fn ensure_built() -> PathBuf {
                 "-p",
                 "daemon-train",
                 "--features",
-                "swarm-net",
+                &features,
                 "--bin",
                 "daemon-train-worker",
             ])
