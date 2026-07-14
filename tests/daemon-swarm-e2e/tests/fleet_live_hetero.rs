@@ -52,17 +52,89 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
+use daemon_swarm_net::{ControlPlane, ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
+use daemon_swarm_observe::desync::digest_tally_from_log;
+use daemon_swarm_observe::{MessageLog, RunHealth};
 use daemon_swarm_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
 };
-use daemon_swarm_proto::{peer_id, to_canonical_vec, SigningKey};
+use daemon_swarm_proto::{
+    from_canonical_slice, peer_id, to_canonical_vec, SignedMessage, SigningKey,
+};
 use daemon_swarm_run::protocol::{
-    EngineParams, Event, IrohCredentials, IrohRosterPeer, JoinCredentials, JoinPolicy, LeaveMode,
-    PolicyMode, WsAuthSpec,
+    CorpusRef, EngineParams, Event, IrohCredentials, IrohRosterPeer, JoinCredentials, JoinPolicy,
+    LeaveMode, PolicyMode, WsAuthSpec,
 };
 use daemon_train_client::{TrainClientConfig, TrainSupervisor};
 use daemon_train_sdk::models::TinyLlamaCfg;
+
+// ---- P3 Merge-2: the 160M content-addressed ceremony mode ----------------------------------------
+//
+// The P2 ceremony (below) ran tiny-llama with a synthetic corpus and pre-staged the module via
+// `DAEMON_TRAIN_MODULE`. The program gate converts that into the real 160M fleet measurement: the
+// experiment module + the tokenized TinyStories corpus are fetched BY CONTENT HASH from the payload
+// store (lane S). When the `SWARM_GATE_MODULE_BLAKE3` + `SWARM_GATE_MANIFEST_BLAKE3` env are set, the
+// shared authoring below emits the content-addressed 160M envelope + `EngineParams.corpus`, and LOCAL
+// peers carry the `DAEMON_SWARM_*` fetch context + `DAEMON_TRAIN_BACKEND` instead of a module path
+// (remote peers carry that env in their ssh command, per the artifact-distribution runbook §3-§4).
+// Absent that env, everything is byte-identical to the P2 tiny-llama path.
+
+/// The content-addressed 160M ceremony assets (lane S published), from env. `None` ⇒ the P2
+/// tiny-llama synthetic-corpus path (unchanged).
+struct GateAssets {
+    module_blake3: [u8; 32],
+    module_size: u64,
+    manifest_blake3: [u8; 32],
+    manifest_size: u64,
+    asset_scope: String,
+    backend: String,
+    reduced: bool,
+}
+
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn gate_assets() -> Option<GateAssets> {
+    let module_blake3 = hex32(&std::env::var("SWARM_GATE_MODULE_BLAKE3").ok()?)?;
+    let manifest_blake3 = hex32(&std::env::var("SWARM_GATE_MANIFEST_BLAKE3").ok()?)?;
+    Some(GateAssets {
+        module_blake3,
+        module_size: env_u64("SWARM_GATE_MODULE_SIZE", 0),
+        manifest_blake3,
+        manifest_size: env_u64("SWARM_GATE_MANIFEST_SIZE", 0),
+        asset_scope: std::env::var("SWARM_GATE_ASSET_SCOPE")
+            .unwrap_or_else(|_| "assets-p3s".into()),
+        backend: std::env::var("SWARM_GATE_BACKEND").unwrap_or_else(|_| "wgpu".into()),
+        reduced: std::env::var_os("SWARM_GATE_REDUCED").is_some(),
+    })
+}
+
+fn gate_cfg(g: &GateAssets) -> TinyLlamaCfg {
+    if g.reduced {
+        TinyLlamaCfg {
+            n_layers: 1,
+            d_model: 256,
+            n_heads: 4,
+            n_kv_heads: 4,
+            head_dim: 64,
+            vocab: 50257,
+            seq_len: 1024,
+            ..TinyLlamaCfg::llama_160m()
+        }
+    } else {
+        TinyLlamaCfg::llama_160m()
+    }
+}
 
 const NUM_ROUNDS_DEFAULT: u64 = 6;
 const GUEST_VOCAB: u32 = 64;
@@ -235,14 +307,54 @@ fn author_envelope(
     rounds: u64,
     global_batch: u32,
 ) -> Envelope {
-    let mut artifacts = std::collections::BTreeMap::new();
-    artifacts.insert(
-        "tiny_llama.wasm".to_string(),
-        Artifact {
-            url: format!("file://{}", module_path.display()),
-            blake3: daemon_swarm_proto::blake3_hash(module_bytes),
-        },
-    );
+    // P3 gate mode: content-addressed 160M module + corpus manifest, fetched by hash (no local path).
+    let (artifacts, module_name, manifest_name, config, update_mb_max) =
+        if let Some(g) = gate_assets() {
+            let module_hex: String = g.module_blake3.iter().map(|b| format!("{b:02x}")).collect();
+            let manifest_hex: String = g
+                .manifest_blake3
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let mut artifacts = std::collections::BTreeMap::new();
+            artifacts.insert(
+                "experiment.wasm".to_string(),
+                Artifact {
+                    url: format!("r2://modules/{module_hex}.wasm"),
+                    blake3: daemon_swarm_proto::Hash::new(g.module_blake3),
+                },
+            );
+            artifacts.insert(
+                "data.manifest".to_string(),
+                Artifact {
+                    url: format!("r2://corpus/{manifest_hex}.json"),
+                    blake3: daemon_swarm_proto::Hash::new(g.manifest_blake3),
+                },
+            );
+            (
+                artifacts,
+                "experiment.wasm".to_string(),
+                "data.manifest".to_string(),
+                cfg_value(&gate_cfg(&g)),
+                64u32,
+            )
+        } else {
+            let mut artifacts = std::collections::BTreeMap::new();
+            artifacts.insert(
+                "tiny_llama.wasm".to_string(),
+                Artifact {
+                    url: format!("file://{}", module_path.display()),
+                    blake3: daemon_swarm_proto::blake3_hash(module_bytes),
+                },
+            );
+            (
+                artifacts,
+                "tiny_llama.wasm".to_string(),
+                "tiny_llama.wasm".to_string(),
+                tiny_cfg(),
+                1u32,
+            )
+        };
     Envelope {
         run: RunSection {
             schema: ENVELOPE_SCHEMA_MAJOR,
@@ -252,13 +364,13 @@ fn author_envelope(
             access: Access::Org,
         },
         experiment: ExperimentSection {
-            module: "tiny_llama.wasm".to_string(),
+            module: module_name,
             abi: "tabi@1".to_string(),
-            config: tiny_cfg(),
+            config,
         },
         artifacts,
         data: DataSection {
-            manifest: "tiny_llama.wasm".to_string(),
+            manifest: manifest_name,
             steps_per_round: STEPS_PER_ROUND,
             global_batch: GlobalBatch {
                 start: global_batch,
@@ -274,7 +386,7 @@ fn author_envelope(
             downlink_mbps_min: 0,
             disk_gb_min: 0,
             throughput_floor: "c1".to_string(),
-            update_mb_max: 1,
+            update_mb_max,
             capabilities: Vec::new(),
             payload_store: "r2".to_string(),
         },
@@ -290,6 +402,10 @@ fn author_envelope(
             payload_retention_rounds: 16,
         },
     }
+}
+
+fn cfg_value(cfg: &TinyLlamaCfg) -> ciborium::value::Value {
+    ciborium::value::Value::serialized(cfg).expect("preset config serializes")
 }
 
 // ---- registry HTTP -------------------------------------------------------------------------------
@@ -335,6 +451,24 @@ fn create_run_request(
     global_batch: u32,
 ) -> serde_json::Value {
     use base64::Engine as _;
+    let artifacts = if let Some(g) = gate_assets() {
+        let module_hex: String = g.module_blake3.iter().map(|b| format!("{b:02x}")).collect();
+        let manifest_hex: String = g
+            .manifest_blake3
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        serde_json::json!([
+            { "path": format!("modules/{module_hex}.wasm"), "blake3": module_hex, "size": g.module_size },
+            { "path": format!("corpus/{manifest_hex}.json"), "blake3": manifest_hex, "size": g.manifest_size },
+        ])
+    } else {
+        serde_json::json!([{
+            "path": "tiny_llama.wasm",
+            "blake3": daemon_swarm_proto::blake3_hash(module_bytes).to_hex(),
+            "size": module_bytes.len(),
+        }])
+    };
     serde_json::json!({
         "run_id": envelope.run.run_id,
         "schema": ENVELOPE_SCHEMA_MAJOR,
@@ -342,11 +476,7 @@ fn create_run_request(
         "envelope_b64": base64::engine::general_purpose::STANDARD.encode(frozen.bytes()),
         "author_pubkey": frozen.signer().to_hex(),
         "signature": frozen.signature().to_hex(),
-        "artifacts": [{
-            "path": "tiny_llama.wasm",
-            "blake3": daemon_swarm_proto::blake3_hash(module_bytes).to_hex(),
-            "size": module_bytes.len(),
-        }],
+        "artifacts": artifacts,
         "update_max_bytes": u64::from(envelope.requirements.update_mb_max) * 1024 * 1024,
         "min_peers": envelope.run.min_peers,
         "max_peers": envelope.run.max_peers,
@@ -396,7 +526,22 @@ fn credentials_for(
             })
             .collect(),
     });
-    let _ = global_batch;
+    // P3 gate mode: the run consumes the real TinyStories corpus by content hash over an active
+    // window sized to the run (rounds × global_batch sequences). Absent gate assets ⇒ the synthetic
+    // corpus (unchanged). `corpus_vocab_clamp = 0` in gate mode: real GPT-2 BPE tokens are in-vocab.
+    let (corpus, vocab_clamp, update_max_bytes) = match gate_assets() {
+        Some(g) => (
+            Some(CorpusRef {
+                manifest_blake3: g.manifest_blake3,
+                manifest_size: g.manifest_size,
+                window_start: 0,
+                window_sequences: env.rounds * u64::from(global_batch),
+            }),
+            0,
+            64 << 20,
+        ),
+        None => (None, GUEST_VOCAB, 1 << 20),
+    };
     JoinCredentials {
         node_secret: node_secret(i),
         ws_auth: WsAuthSpec::Internal {
@@ -415,17 +560,42 @@ fn credentials_for(
             // (drop_after_round default 2 ⇒ a post-round-1 checkpoint is published first) — the
             // rejoiner then resumes from it + replays retained rounds (lane R live resync).
             checkpoint_every_rounds: CHECKPOINT_EVERY_ROUNDS,
-            update_max_bytes: 1 << 20,
+            update_max_bytes,
             corpus_seed: 7,
             corpus_shards: 4,
             corpus_tokens_per_shard: 256,
             corpus_seq_len: 8,
-            corpus_vocab_clamp: GUEST_VOCAB,
+            corpus_vocab_clamp: vocab_clamp,
             // §9 resync-replay window — mirrors the envelope's `payload_retention_rounds`.
             payload_retention_rounds: PAYLOAD_RETENTION_ROUNDS,
-            corpus: None,
+            corpus,
         },
     }
+}
+
+/// Push the P3 gate-mode fetch context (`DAEMON_SWARM_*`) + `DAEMON_TRAIN_BACKEND` onto a LOCAL peer's
+/// worker env instead of `DAEMON_TRAIN_MODULE` — the module + corpus travel by content hash from the
+/// store (lane S). Remote (ssh) peers carry this env in their spawn command (runbook §3-§4), so this
+/// only touches LOCAL peers. Returns true iff gate mode is active (caller then skips DAEMON_TRAIN_MODULE).
+fn push_gate_fetch_env(cfg: &mut TrainClientConfig, env: &FleetEnv, cache_tag: &str) -> bool {
+    let Some(g) = gate_assets() else {
+        return false;
+    };
+    let cache_dir = std::env::temp_dir().join(cache_tag);
+    cfg.env
+        .push(("DAEMON_SWARM_PRESIGN_BASE".into(), env.presign_base.clone()));
+    cfg.env
+        .push(("DAEMON_SWARM_RUN_ID".into(), g.asset_scope.clone()));
+    cfg.env.push(("DAEMON_SWARM_ORG".into(), env.org.clone()));
+    cfg.env
+        .push(("DAEMON_SWARM_ACTOR".into(), env.actor.clone()));
+    cfg.env.push((
+        "DAEMON_SWARM_CACHE_DIR".into(),
+        cache_dir.to_string_lossy().into_owned(),
+    ));
+    cfg.env
+        .push(("DAEMON_TRAIN_BACKEND".into(), g.backend.clone()));
+    true
 }
 
 fn policy() -> JoinPolicy {
@@ -504,14 +674,14 @@ async fn fleet_heterogeneous_det_lane_agrees() {
     for (i, peer) in peers.iter().enumerate() {
         let mut cfg = TrainClientConfig::new(&peer.program);
         cfg.args = peer.args.clone();
-        if peer.is_local {
+        if peer.is_local && !push_gate_fetch_env(&mut cfg, &env, "daemon-swarm-cache-fleet") {
             cfg.env.push((
                 "DAEMON_TRAIN_MODULE".to_string(),
                 module_path.to_string_lossy().into_owned(),
             ));
         }
-        cfg.spawn_timeout = Duration::from_secs(60);
-        cfg.op_timeout = Duration::from_secs(180);
+        cfg.spawn_timeout = Duration::from_secs(90);
+        cfg.op_timeout = Duration::from_secs(600);
         let sup = Arc::new(TrainSupervisor::new(cfg));
         let elig = sup
             .assess(wire.clone())
@@ -726,20 +896,63 @@ async fn fleet_gate_ceremony_with_churn() {
     assert_eq!(status, 201, "POST /runs: {text}");
     println!("created {run_id}");
 
+    // ---- observer tap (the message-log half of the observe capture, carried follow-on 3) --------
+    // A passive WsControlPlane subscription records every signed message → `<run>.dsmlog`, verified
+    // offline after the run (digest tally + run health). This is the worker-subprocess-loop observe
+    // evidence for the ceremony (the P2 gate captured this only via a parallel swarm-local mesh).
+    let observe_dir = std::env::var("SWARM_GATE_OBSERVE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("gate-ceremony-observe"));
+    let observer = Arc::new(
+        WsControlPlane::connect(WsConfig {
+            base_url: env.ws_base.clone(),
+            run_id: run_id.clone(),
+            auth: WsAuth::Internal {
+                org_id: env.org.clone(),
+                actor: env.actor.clone(),
+            },
+            reconnect: ReconnectConfig::default(),
+        })
+        .await
+        .expect("observer WS connect"),
+    );
+    let mut obs_sub = observer.subscribe();
+    let (obs_stop_tx, mut obs_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let log_task = {
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            let mut log = MessageLog::new(run_id);
+            loop {
+                tokio::select! {
+                    _ = &mut obs_stop_rx => break,
+                    m = obs_sub.recv() => match m {
+                        Some(bytes) => {
+                            if let Ok(msg) = from_canonical_slice::<SignedMessage>(&bytes) {
+                                log.append(msg);
+                            }
+                        }
+                        None => break,
+                    },
+                }
+            }
+            log
+        })
+    };
+
     // Spawn + assess + join every peer.
     let mut supervisors = Vec::new();
     let mut streams: Vec<Option<tokio::sync::mpsc::UnboundedReceiver<Event>>> = Vec::new();
     let build_sup = |peer: &PeerSpec| {
         let mut cfg = TrainClientConfig::new(&peer.program);
         cfg.args = peer.args.clone();
-        if peer.is_local {
+        if peer.is_local && !push_gate_fetch_env(&mut cfg, &env, "daemon-swarm-cache-gate") {
             cfg.env.push((
                 "DAEMON_TRAIN_MODULE".to_string(),
                 module_path.to_string_lossy().into_owned(),
             ));
         }
         cfg.spawn_timeout = Duration::from_secs(90);
-        cfg.op_timeout = Duration::from_secs(240);
+        cfg.op_timeout = Duration::from_secs(600);
         Arc::new(TrainSupervisor::new(cfg))
     };
     for (i, peer) in peers.iter().enumerate() {
@@ -1035,17 +1248,61 @@ async fn fleet_gate_ceremony_with_churn() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
+    // ---- observe capture: stop the tap, write <run>.dsmlog, verify offline ----------------------
+    // (Before the worker teardown: a 160M GPU worker can be slow to exit on Leave, and the capture
+    // evidence must not depend on teardown promptness.) The rejoiner leaves a gap while parked, so a
+    // round's reporter count over the whole log can be < n during the churn window; assert agreement
+    // among the reporters that DID report (never a divergence), which is the consensus bar.
+    let _ = obs_stop_tx.send(());
+    observer.shutdown().await;
+    let log = log_task.await.expect("observer log task");
+    std::fs::create_dir_all(&observe_dir).expect("create observe dir");
+    let log_path = observe_dir.join(format!("{run_id}.dsmlog"));
+    let mut file = std::fs::File::create(&log_path).expect("create dsmlog");
+    log.write_to(&mut file).expect("write dsmlog");
+    println!(
+        "observe: wrote {} ({} messages, rounds {:?})",
+        log_path.display(),
+        log.len(),
+        log.rounds()
+    );
+    let mut reader = std::fs::File::open(&log_path).expect("open dsmlog");
+    let reread = MessageLog::read_from(&mut reader).expect("read dsmlog back");
+    assert_eq!(reread.len(), log.len(), "dsmlog round-trips");
+    let health = RunHealth::from_log(&reread);
+    for round in 0..rounds {
+        let verdict = digest_tally_from_log(&reread, round, n as u32);
+        println!(
+            "observe: round {round} digest tally — reporters={} agreed={} outliers={:?}",
+            verdict.reporters, verdict.agreed, verdict.outliers
+        );
+        assert!(
+            verdict.agreed,
+            "round {round}: offline digest tally disagreed (outliers {:?}) — consensus BROKEN",
+            verdict.outliers
+        );
+    }
+    println!(
+        "observe: run health — {} rounds projected from the log",
+        health.rounds.len()
+    );
+
     for sup in &supervisors {
-        sup.leave(run_id.clone(), LeaveMode::Immediate).await.ok();
-        sup.shutdown().await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            sup.leave(run_id.clone(), LeaveMode::Immediate),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(30), sup.shutdown()).await;
     }
     println!(
         "GATE CEREMONY GREEN: {n} heterogeneous peers, {rounds} rounds, det digests byte-identical \
          (incl. the rejoiner), churn (kill peer {drop_index} → park → checkpoint-resync → rejoin) \
          survived, run Finished. rejoiner reported {} post-resync round(s) BYTE-IDENTICAL to \
-         survivors: {:?}",
+         survivors: {:?}. observe log: {}",
         rejoined_rounds.len(),
-        rejoined_rounds.keys().collect::<Vec<_>>()
+        rejoined_rounds.keys().collect::<Vec<_>>(),
+        log_path.display(),
     );
 }
 
@@ -1095,12 +1352,14 @@ async fn timed_local_run(
     let mut streams = Vec::new();
     for i in 0..n {
         let mut cfg = TrainClientConfig::new(local_bin);
-        cfg.env.push((
-            "DAEMON_TRAIN_MODULE".to_string(),
-            module_path.to_string_lossy().into_owned(),
-        ));
-        cfg.spawn_timeout = Duration::from_secs(60);
-        cfg.op_timeout = Duration::from_secs(180);
+        if !push_gate_fetch_env(&mut cfg, env, "daemon-swarm-cache-oh") {
+            cfg.env.push((
+                "DAEMON_TRAIN_MODULE".to_string(),
+                module_path.to_string_lossy().into_owned(),
+            ));
+        }
+        cfg.spawn_timeout = Duration::from_secs(90);
+        cfg.op_timeout = Duration::from_secs(600);
         let sup = Arc::new(TrainSupervisor::new(cfg));
         let elig = sup.assess(wire.clone()).await.expect("assess");
         assert!(elig.eligible, "peer {i} eligible ({tag})");
