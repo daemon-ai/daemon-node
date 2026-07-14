@@ -723,7 +723,7 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
 #[cfg(feature = "swarm-net")]
 pub(crate) fn select_backend() -> (daemon_train::BackendKind, Option<u32>) {
     let requested = std::env::var("DAEMON_TRAIN_BACKEND").ok();
-    if requested.as_deref() == Ok("cpu") {
+    if requested.as_deref() == Some("cpu") {
         return (daemon_train::BackendKind::Cpu, None);
     }
     // Explicit operator override (P3 Merge-2): `DAEMON_TRAIN_BACKEND=wgpu` pins the wgpu rung even
@@ -733,7 +733,7 @@ pub(crate) fn select_backend() -> (daemon_train::BackendKind, Option<u32>) {
     // BudgetMemory trap; single-host 160M CUDA is green — recorded in swarm-p3-ledger). Probe-gated:
     // if the requested rung has no usable adapter, fall through the normal ladder below.
     #[cfg(feature = "wgpu")]
-    if requested.as_deref() == Ok("wgpu") {
+    if requested.as_deref() == Some("wgpu") {
         if let Some(p) = daemon_train::autotune::probe_wgpu() {
             eprintln!(
                 "daemon-train-worker: DAEMON_TRAIN_BACKEND=wgpu override — selecting wgpu native \
