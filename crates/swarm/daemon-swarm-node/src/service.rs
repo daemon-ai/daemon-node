@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::discovery::RunDiscovery;
 use crate::store::{DesiredState, PersistedRun, StoreError, SwarmStore, EVENT_WINDOW};
 
 /// A node-feed sink: the node passes a closure over `NodeEventFeed::emit` so live swarm updates ride
@@ -44,6 +45,10 @@ pub enum SwarmError {
     /// A worker-control failure (mapped from the supervisor).
     #[error("worker: {0}")]
     Worker(String),
+    /// A run-discovery / envelope-fetch failure (registry unreachable, run unknown, envelope hash
+    /// mismatch — the §6.1/§6.5 join-time discovery seam).
+    #[error("discovery: {0}")]
+    Discovery(String),
     /// The swarm service is disabled (`[swarm] enabled = false`).
     #[error("swarm is disabled")]
     Disabled,
@@ -79,6 +84,21 @@ pub trait WorkerControl: Send + Sync {
         credentials: Vec<u8>,
         policy: JoinPolicy,
     ) -> Result<(), SwarmError>;
+    /// Join a run and return the **continuous** worker event stream (A3 event pump). The default
+    /// delegates to [`join`](Self::join) and returns an already-closed receiver, so test fakes and
+    /// non-streaming workers keep the pre-A3 behavior; `TrainSupervisor` overrides it with the real
+    /// per-round stream.
+    async fn join_streaming(
+        &self,
+        run_id: String,
+        coordinator: String,
+        credentials: Vec<u8>,
+        policy: JoinPolicy,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, SwarmError> {
+        self.join(run_id, coordinator, credentials, policy).await?;
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok(rx)
+    }
     /// Leave a run.
     async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), SwarmError>;
     /// Push a GPU-governor throttle lever (§10.5).
@@ -113,6 +133,17 @@ impl WorkerControl for TrainSupervisor {
             .await
             .map_err(SwarmError::worker)
     }
+    async fn join_streaming(
+        &self,
+        run_id: String,
+        coordinator: String,
+        credentials: Vec<u8>,
+        policy: JoinPolicy,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, SwarmError> {
+        TrainSupervisor::join_streaming(self, run_id, coordinator, credentials, policy)
+            .await
+            .map_err(SwarmError::worker)
+    }
     async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), SwarmError> {
         TrainSupervisor::leave(self, run_id, mode)
             .await
@@ -140,6 +171,10 @@ pub struct SwarmServiceParts {
     pub worker: Arc<dyn WorkerControl>,
     /// The node-feed sink for `SwarmChanged` pointers (`None` on a headless / test build).
     pub feed: Option<NodeFeed>,
+    /// The run-discovery seam (A1). When present, `swarm_join` discovers the run + fetches the frozen
+    /// envelope + runs the worker's real §6.5 `AssessRun` before `JoinRun`. `None` keeps the W1
+    /// probe-based eligibility path (no coordinator configured), so the service stays usable offline.
+    pub discovery: Option<Arc<dyn RunDiscovery>>,
 }
 
 /// The node-side swarm-training service.
@@ -147,6 +182,7 @@ pub struct SwarmService {
     config: SwarmConfig,
     store: SwarmStore,
     worker: Arc<dyn WorkerControl>,
+    discovery: Option<Arc<dyn RunDiscovery>>,
     events_tx: broadcast::Sender<SwarmEvent>,
     feed: Option<NodeFeed>,
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
@@ -154,6 +190,10 @@ pub struct SwarmService {
     current_run: Mutex<Option<String>>,
     /// The coalescing swarm-feed revision stamped on each `SwarmChanged` pointer.
     rev: AtomicU64,
+    /// The service's own `Arc` handle (A3), bound post-construction via [`bind_self`](Self::bind_self)
+    /// so `swarm_join`/`start` can spawn a detached event-pump task that outlives the `&self` call.
+    /// Unbound (test builds) → the non-streaming `join` path, drained-and-dropped.
+    me: std::sync::OnceLock<std::sync::Weak<SwarmService>>,
 }
 
 impl SwarmService {
@@ -165,10 +205,60 @@ impl SwarmService {
             config: parts.config,
             store: parts.store,
             worker: parts.worker,
+            discovery: parts.discovery,
             events_tx,
             feed: parts.feed,
             current_run: Mutex::new(None),
             rev: AtomicU64::new(0),
+            me: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Bind the service's own `Arc` handle (A3 event pump), mirroring the node's `set_swarm`
+    /// post-`Arc` binder. After this, `swarm_join` / `start` drive `join_streaming` + a detached pump
+    /// task feeding the worker's continuous event stream into [`handle_worker_event`](Self::handle_worker_event)
+    /// → `NodeEvent::SwarmChanged`, so `swarm.db` reflects live round progression (§10.3/§10.4).
+    /// Idempotent; never bound → the non-streaming join path (unchanged, for tests).
+    pub fn bind_self(self: &Arc<Self>) {
+        let _ = self.me.set(Arc::downgrade(self));
+    }
+
+    /// Join a run and pump its continuous worker event stream into the service (A3). The public entry
+    /// the boot site / e2e use to drive a **live-attach** join with authored `JoinCredentials`; the
+    /// pump feeds each event through `handle_worker_event`. Requires [`bind_self`](Self::bind_self).
+    pub async fn join_and_pump(
+        &self,
+        run_id: String,
+        coordinator: String,
+        credentials: Vec<u8>,
+        policy: JoinPolicy,
+    ) -> Result<(), SwarmError> {
+        let rx = self
+            .worker
+            .join_streaming(run_id, coordinator, credentials, policy)
+            .await?;
+        self.spawn_pump(rx);
+        Ok(())
+    }
+
+    /// Spawn the detached event-pump task that drains a worker event stream into
+    /// [`handle_worker_event`](Self::handle_worker_event). When the service is unbound (tests) it
+    /// drains-and-drops so a streaming worker never backs up.
+    fn spawn_pump(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<protocol::Event>) {
+        match self.me.get().and_then(std::sync::Weak::upgrade) {
+            Some(me) => {
+                tokio::spawn(async move {
+                    while let Some(ev) = rx.recv().await {
+                        // Best-effort fan-out: a persist error never stalls the pump (mirrors the
+                        // existing "a broadcast send error only means no live subscribers" posture;
+                        // the durable log + a SwarmChanged pointer let a client re-baseline).
+                        let _ = me.handle_worker_event(&ev);
+                    }
+                });
+            }
+            None => {
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            }
         }
     }
 
@@ -192,14 +282,18 @@ impl SwarmService {
         let intents = self.store.active_intents()?;
         let mut rejoined = 0;
         for run in &intents {
-            self.worker
-                .join(
+            // A3: re-issue via the streaming path + pump so a re-converged run resumes reporting
+            // live round progression into swarm.db (durable-intent re-convergence, §10.3).
+            let rx = self
+                .worker
+                .join_streaming(
                     run.run_id.clone(),
                     run.coordinator.clone(),
                     Vec::new(),
                     to_join_policy(&run.policy),
                 )
                 .await?;
+            self.spawn_pump(rx);
             rejoined += 1;
         }
         if rejoined > 0 {
@@ -291,6 +385,8 @@ impl SwarmService {
             | protocol::Event::Metric { .. }
             | protocol::Event::CheckpointPublished { .. }
             | protocol::Event::Warning { .. }
+            | protocol::Event::MicroBatch { .. }
+            | protocol::Event::OomLadder { .. }
             | protocol::Event::Error { .. } => self.current_run.lock().unwrap().clone(),
             _ => None,
         }
@@ -304,14 +400,42 @@ impl SwarmService {
         }
     }
 
-    /// The coordinator endpoint for a new join: the first allowlisted endpoint (§11.1). Discovery of
-    /// per-run coordinators is a later wave (BC); W1 joins via the node's allowlisted coordinator.
+    /// The fallback coordinator endpoint (the first allowlisted endpoint, §11.1) used when no
+    /// discovery seam is configured (offline / no-registry path).
     fn coordinator(&self) -> String {
         self.config
             .coordinator_allowlist
             .first()
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Resolve the `(coordinator, eligibility)` for a join (A1).
+    ///
+    /// With a discovery seam: `GET /runs/:id` → fetch + blake3-verify the frozen envelope →
+    /// `worker.assess(envelope)` (real §6.5), taking the coordinator from the registry. Without one:
+    /// the W1 probe against the allowlisted coordinator. Eligibility is always node-computed.
+    async fn resolve_join(&self, run_id: &str) -> Result<(String, SwarmEligibility), SwarmError> {
+        if let Some(discovery) = &self.discovery {
+            let run = discovery
+                .get_run(run_id)
+                .await?
+                .ok_or_else(|| SwarmError::Discovery(format!("run {run_id} not found")))?;
+            let envelope = discovery.fetch_envelope(run_id).await?;
+            let verdict = self.worker.assess(envelope).await?;
+            Ok((run.coordinator, eligibility_from_assess(&verdict)))
+        } else {
+            let coordinator = self.coordinator();
+            let eligibility = match self.worker.probe().await {
+                Ok(hw) => eligibility_from_hardware(&hw),
+                Err(_) => SwarmEligibility {
+                    eligible: false,
+                    reasons: vec!["worker probe failed".into()],
+                    headroom: BTreeMap::new(),
+                },
+            };
+            Ok((coordinator, eligibility))
+        }
     }
 }
 
@@ -352,23 +476,25 @@ impl SwarmApi for SwarmService {
         // Idempotency is enforced upstream by the dispatch op-id dedup guard; the store's
         // INSERT-OR-UPDATE keeps a repeated join convergent regardless.
         self.require_enabled().map_err(|e| e.to_api())?;
-        let coordinator = self.coordinator();
-        // Node-computed eligibility (ADR-003): derive it from the worker hardware probe. The
-        // envelope-based AssessRun path (§6.5) lands with coordinator discovery (BC/B3); W1 uses the
-        // probe so the persisted eligibility the app renders is always node-computed, never faked.
-        let eligibility = match self.worker.probe().await {
-            Ok(hw) => eligibility_from_hardware(&hw),
-            Err(_) => SwarmEligibility {
-                eligible: false,
-                reasons: vec!["worker probe failed".into()],
-                headroom: BTreeMap::new(),
-            },
-        };
+        // Node-computed eligibility (ADR-003). A1: when a discovery seam is configured, resolve the
+        // run + fetch the frozen envelope + run the worker's real §6.5 `AssessRun` before `JoinRun`,
+        // and take the coordinator endpoint from discovery. With no discovery configured, fall back
+        // to the W1 probe-based eligibility against the allowlisted coordinator (offline / no-registry
+        // path). Either way the persisted eligibility is node-computed — the app never re-derives it.
+        let (coordinator, eligibility) =
+            self.resolve_join(&run_id).await.map_err(|e| e.to_api())?;
         self.store
             .put_join_intent(&run_id, &coordinator, &policy, None, &eligibility)
             .map_err(|e| SwarmError::from(e).to_api())?;
-        self.worker
-            .join(
+        // A3: join over the streaming path + pump the continuous worker event stream into
+        // `handle_worker_event` so swarm.db reflects live round progression (§10.3/§10.4). The
+        // opaque `JoinRun.credentials` the worker's live attach parses (§2 of the A3 ledger) are
+        // authored where the node identity + roster are known (the e2e / boot join_and_pump path);
+        // an API-initiated join with no authored credentials keeps the worker's self-driven round
+        // (WS-only baseline), still pumped.
+        let rx = self
+            .worker
+            .join_streaming(
                 run_id.clone(),
                 coordinator,
                 Vec::new(),
@@ -376,6 +502,7 @@ impl SwarmApi for SwarmService {
             )
             .await
             .map_err(|e| e.to_api())?;
+        self.spawn_pump(rx);
         self.emit_changed(Some(run_id));
         Ok(())
     }
@@ -485,6 +612,10 @@ fn hardware_report(hw: Hardware) -> SwarmHardwareReport {
     SwarmHardwareReport {
         gpus: hw.gpus,
         vram_mb: hw.vram_mb,
+        // A1 / wire v42: mirror the worker's unified-memory spillover (GTT) into the app-facing DTO
+        // additively (the P1 Merge-2 recorded follow-on), so the GUI's "what can my GPU do" panel
+        // shows the true effective budget on integrated/UMA boxes.
+        shared_mb: hw.shared_mb,
         ram_mb: hw.ram_mb,
         backend_lanes: hw.backend_lanes,
         capabilities: SwarmCapabilities {
@@ -499,8 +630,19 @@ fn hardware_report(hw: Hardware) -> SwarmHardwareReport {
     }
 }
 
-/// A coarse node-computed eligibility from a hardware probe (the W1 placeholder for the §6.5
-/// envelope assess): eligible if the worker reports a usable GPU or backend lane, with VRAM/RAM
+/// Map the worker's real §6.5 `AssessRun` verdict onto the app-facing eligibility DTO (A1). The
+/// worker's `headroom` is an ordered `Vec<(String, i64)>`; the wire DTO is a `BTreeMap`. The app
+/// renders this; it never re-derives eligibility (ADR-003).
+fn eligibility_from_assess(e: &Eligibility) -> SwarmEligibility {
+    SwarmEligibility {
+        eligible: e.eligible,
+        reasons: e.reasons.clone(),
+        headroom: e.headroom.iter().cloned().collect(),
+    }
+}
+
+/// A coarse node-computed eligibility from a hardware probe (the fallback when no discovery seam is
+/// configured): eligible if the worker reports a usable GPU or backend lane, with VRAM/RAM
 /// headroom. The app renders this; it never re-derives eligibility (ADR-003).
 fn eligibility_from_hardware(hw: &Hardware) -> SwarmEligibility {
     let eligible = hw.gpus > 0 || !hw.backend_lanes.is_empty();
@@ -561,6 +703,25 @@ fn translate(ev: &protocol::Event, run_id: &str) -> Option<SwarmEvent> {
             run_id: run_id.to_string(),
             class: class.clone(),
             detail: detail.clone(),
+        }),
+        // A3 additive telemetry (§10.5): the micro-batch verdict + OOM-ladder rungs surface as
+        // `Warning`s (no new SwarmApi wire type — telemetry stays off the wire, program ledger).
+        protocol::Event::MicroBatch { micro_batch } => Some(SwarmEvent::Warning {
+            run_id: run_id.to_string(),
+            class: "micro_batch".to_string(),
+            detail: micro_batch.to_string(),
+        }),
+        protocol::Event::OomLadder {
+            round,
+            from_micro_batch,
+            to_micro_batch,
+            halvings,
+        } => Some(SwarmEvent::Warning {
+            run_id: run_id.to_string(),
+            class: "oom_ladder".to_string(),
+            detail: format!(
+                "round {round}: micro_batch {from_micro_batch}->{to_micro_batch} (halving {halvings})"
+            ),
         }),
         protocol::Event::Error { class, detail } => Some(SwarmEvent::Error {
             run_id: run_id.to_string(),

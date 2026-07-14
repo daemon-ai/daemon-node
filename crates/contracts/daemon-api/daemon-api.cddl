@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 40)
+wire_version = uint                 ; daemon-common WireVersion (current = 42)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -1058,7 +1058,7 @@ swarm-policy-mode-t = "always" / "idle" / "scheduled" / "manual"
 swarm-policy = { "mode": swarm-policy-mode-t, "vram_cap_mb": uint, "duty_cycle_pct": uint, ? "schedule": tstr }
 swarm-eligibility = { "eligible": bool, "reasons": [* tstr], "headroom": { * tstr => int } }
 swarm-capabilities = { "abi_version": uint, "ops": [* tstr], "payload_stores": [* tstr] }
-swarm-hardware-report = { "gpus": uint, "vram_mb": uint64, "ram_mb": uint64, "backend_lanes": [* tstr], "capabilities": swarm-capabilities, "up_kbps": uint64, "down_kbps": uint64, "disk_free_mb": uint64, "throughput_class": tstr }
+swarm-hardware-report = { "gpus": uint, "vram_mb": uint64, "shared_mb": uint64, "ram_mb": uint64, "backend_lanes": [* tstr], "capabilities": swarm-capabilities, "up_kbps": uint64, "down_kbps": uint64, "disk_free_mb": uint64, "throughput_class": tstr }   ; shared_mb additive wire v42 (UMA spillover mirror)
 swarm-contribution = { "rounds": uint64, "tokens": uint64, "bytes_up": uint64, "bytes_down": uint64, "witness_count": uint64, "checkpoint_credits": uint64 }
 swarm-run-summary = { "run_id": tstr, "phase": tstr, "joined": bool, "eligibility": swarm-eligibility, ? "policy": swarm-policy, "last_round": uint64 }
 swarm-run-detail = { "summary": swarm-run-summary, "coordinator": tstr, "contribution": swarm-contribution, "recent_events": [* swarm-event] }

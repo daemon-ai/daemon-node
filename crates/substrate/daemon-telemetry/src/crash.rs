@@ -7,8 +7,14 @@
 //! - **Rust panics** — captured by Sentry's default panic integration (works under `panic =
 //!   "unwind"`, which the workspace profile pins and this module must NOT change).
 //! - **native crashes** (SIGSEGV / abort / stack corruption / FFI faults in `unsafe`, `llama.cpp`,
-//!   `burn`, …) — captured by [`sentry_rust_minidump`], which spawns an *out-of-process* monitor
+//!   `burn`, …) — captured by `sentry_rust_minidump`, which spawns an *out-of-process* monitor
 //!   (a re-exec of the current binary) that writes a minidump and uploads it as a Sentry event.
+//!   This native-minidump path is compiled on every target **except `x86_64-pc-windows-gnu`**: on
+//!   that one target `crash-handler` references a UCRT symbol (`_invoke_watson`) the mingw-w64
+//!   msvcrt import lib does not export, so any linking binary fails to link (the MinGW cross-built
+//!   training worker). There the crate is not even a dependency (see the manifest's target-gated
+//!   `sentry-rust-minidump`), and [`init_crash_reporting`] falls back to panic-only capture, which
+//!   still links and arms. No behavior change on Linux/macOS/msvc-windows. (swarm-p2 adjudication f.)
 //!
 //! Every reporting process reports into the ONE Sentry project, correlated by tags: `component`
 //! (the process role), plus `session_id` / `parent_pid` propagated from the spawning node through
@@ -56,7 +62,10 @@ pub struct CrashGuard {
     sentry: Option<sentry::ClientInitGuard>,
     // The minidump monitor client handle; dropping it tears the IPC link to the monitor. Held for
     // the process lifetime. `None` when the native monitor could not start (panic capture still
-    // works through the Sentry guard alone).
+    // works through the Sentry guard alone). Absent entirely on `x86_64-pc-windows-gnu`, where the
+    // native-minidump path is compiled out (the `crash-handler` UCRT `_invoke_watson` link blocker —
+    // see the crate manifest + module docs); panic capture via the Sentry guard is unaffected.
+    #[cfg(not(all(windows, target_env = "gnu")))]
     _minidump: Option<sentry_rust_minidump::Handle>,
 }
 
@@ -185,18 +194,35 @@ pub fn init_crash_reporting(component: &str) -> CrashGuard {
     };
 
     // Native crash capture. In the re-exec'd monitor process this call runs the server loop and
-    // never returns (the process exits inside it — see module docs).
-    let minidump = match sentry_rust_minidump::init(&guard) {
-        Ok(handle) => Some(handle),
-        Err(error) => {
-            tracing::warn!(%error, component, "crash reporting: minidump monitor failed to start");
-            None
-        }
-    };
+    // never returns (the process exits inside it — see module docs). Compiled out on
+    // `x86_64-pc-windows-gnu` (the `crash-handler` `_invoke_watson` MinGW link blocker): there the
+    // guard arms panic capture only, exactly like `init_panic_reporting`.
+    #[cfg(not(all(windows, target_env = "gnu")))]
+    {
+        let minidump = match sentry_rust_minidump::init(&guard) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::warn!(%error, component, "crash reporting: minidump monitor failed to start");
+                None
+            }
+        };
 
-    CrashGuard {
-        sentry: Some(guard),
-        _minidump: minidump,
+        CrashGuard {
+            sentry: Some(guard),
+            _minidump: minidump,
+        }
+    }
+
+    #[cfg(all(windows, target_env = "gnu"))]
+    {
+        tracing::debug!(
+            component,
+            "crash reporting: native minidump monitor unavailable on x86_64-pc-windows-gnu \
+             (crash-handler _invoke_watson link blocker); panic capture armed"
+        );
+        CrashGuard {
+            sentry: Some(guard),
+        }
     }
 }
 
@@ -207,6 +233,7 @@ pub fn init_crash_reporting(component: &str) -> CrashGuard {
 pub fn init_panic_reporting(component: &str) -> CrashGuard {
     CrashGuard {
         sentry: init_sentry(component),
+        #[cfg(not(all(windows, target_env = "gnu")))]
         _minidump: None,
     }
 }

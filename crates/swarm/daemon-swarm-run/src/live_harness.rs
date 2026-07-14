@@ -54,12 +54,13 @@ use crate::backend::{StubBackend, TrainerBackend};
 use crate::checkpoint::CheckpointManifest;
 use crate::engine::{EngineConfig, EngineEvent, RoundEngine};
 use crate::harness::{
-    build_run_config, coordinator_key, peer_key, peer_store, SwarmConfig, SwarmRun,
-    EXPERIMENT_CONFIG,
+    build_run_config, coordinator_key, peer_key, peer_store, spawn_message_log, SwarmConfig,
+    SwarmRun, EXPERIMENT_CONFIG,
 };
 use crate::local_coordinator::{LocalCoordinator, LocalCoordinatorConfig};
 use crate::seam::{RoundId, RunId};
 use crate::SwarmRunError;
+use daemon_swarm_observe::MessageLog;
 
 /// Live-transport run configuration: the shared drill knobs ([`SwarmConfig`]) plus the two
 /// live-only knobs (relay selection + concurrent barrier fetch). The exit-gate harness API.
@@ -257,6 +258,11 @@ where
         Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let rec_handle = spawn_record_collector(coord_node.clone(), version, records.clone());
 
+    // Observe message-log collector on the coordinator's node (it sees every peer publish over the
+    // mesh + its own self-delivered outputs) — the `--observe` capture + `swarm-replay` oracle.
+    let obs_log = Arc::new(std::sync::Mutex::new(MessageLog::new(run.as_str())));
+    let obs_handle = spawn_message_log(&coord_node, version, obs_log.clone());
+
     // -- the real coordinator tick loop over its own iroh node -----------------------------------
     let coord_cfg = LocalCoordinatorConfig {
         run: run.clone(),
@@ -372,6 +378,7 @@ where
         h.abort();
     }
     rec_handle.abort();
+    obs_handle.abort();
     while let Ok((peer, ev)) = col_rx.try_recv() {
         events.push((peer, ev));
     }
@@ -380,6 +387,7 @@ where
     }
 
     let records = records.lock().expect("records lock").clone();
+    let message_log = obs_log.lock().expect("observe log lock").clone();
     Ok(SwarmRun {
         roster: boot_roster,
         events,
@@ -387,6 +395,7 @@ where
         store: fs,
         run,
         records,
+        message_log,
     })
 }
 

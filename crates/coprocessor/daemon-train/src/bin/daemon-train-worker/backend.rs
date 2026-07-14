@@ -163,6 +163,44 @@ fn amdgpu_sysfs_mem_mb(file: &str) -> u64 {
 /// where an integrated GPU actually pages large tensors.
 pub(crate) fn hardware() -> Hardware {
     let ram_mb = host_ram_mb();
+    // Windows: the DXGI/D3D12 probe (swarm-windows-vram-design.md §2) is authoritative and needs no
+    // wgpu adapter — it queries D3D12 `ARCHITECTURE1.UMA` + DXGI budgets directly.
+    #[cfg(windows)]
+    {
+        if let Some(dl) = daemon_train::autotune::probe_windows_device_limits() {
+            return Hardware {
+                gpus: 1,
+                vram_mb: dl.vram_mb,
+                shared_mb: dl.shared_mb,
+                ram_mb: if dl.ram_mb > 0 { dl.ram_mb } else { ram_mb },
+                backend_lanes: vec!["dx12".to_string(), "vulkan".to_string(), "cpu".to_string()],
+                capabilities: host_capabilities(),
+                up_kbps: 0,
+                down_kbps: 0,
+                disk_free_mb: 0,
+                throughput_class: "c1".to_string(),
+            };
+        }
+    }
+    // macOS: the Metal probe (swarm-macos-uma-findings.md §4) sources the working-set budget +
+    // maxBufferLength directly; unified => shared_mb == ram_mb (one DRAM pool).
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(dl) = daemon_train::autotune::probe_macos_device_limits() {
+            return Hardware {
+                gpus: 1,
+                vram_mb: dl.vram_mb,
+                shared_mb: dl.shared_mb,
+                ram_mb: if dl.ram_mb > 0 { dl.ram_mb } else { ram_mb },
+                backend_lanes: vec!["metal".to_string(), "cpu".to_string()],
+                capabilities: host_capabilities(),
+                up_kbps: 0,
+                down_kbps: 0,
+                disk_free_mb: 0,
+                throughput_class: "c1".to_string(),
+            };
+        }
+    }
     #[cfg(feature = "wgpu")]
     {
         if let Some(p) = daemon_train::autotune::probe_wgpu() {
@@ -210,7 +248,7 @@ pub(crate) fn hardware() -> Hardware {
 /// device the verdict then treats VRAM+GTT+RAM as one physical DRAM pool instead of rejecting
 /// against the 2047 MiB per-buffer clamp. Without a GPU, the CPU lane runs in host RAM (no separate
 /// VRAM constraint). Unknown dimensions use a large sentinel so an unprobed number never rejects.
-fn device_limits() -> DeviceLimits {
+pub(crate) fn device_limits() -> DeviceLimits {
     let ram_mb = {
         let r = host_ram_mb();
         if r == 0 {
@@ -219,6 +257,19 @@ fn device_limits() -> DeviceLimits {
             r
         }
     };
+    // Windows / macOS: the platform FFI probes are authoritative and need no wgpu feature.
+    #[cfg(windows)]
+    {
+        if let Some(dl) = daemon_train::autotune::probe_windows_device_limits() {
+            return dl;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(dl) = daemon_train::autotune::probe_macos_device_limits() {
+            return dl;
+        }
+    }
     #[cfg(feature = "wgpu")]
     {
         if let Some(p) = daemon_train::autotune::probe_wgpu() {

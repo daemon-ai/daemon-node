@@ -18,7 +18,7 @@
 
 use daemon_swarm_proto::peer_id;
 use daemon_swarm_run::engine::EngineEvent;
-use daemon_swarm_run::harness::{peer_key, run_swarm, StallFault, SwarmConfig};
+use daemon_swarm_run::harness::{peer_key, run_swarm, verify_observe_dir, StallFault, SwarmConfig};
 
 /// The 20-round, 3-peer scenario with a stall at round 7 and catch-up at round 8.
 fn scenario() -> SwarmConfig {
@@ -100,5 +100,60 @@ async fn digest_transcript_is_byte_identical_across_runs() {
     assert_eq!(
         ta, tb,
         "the digest transcript must be reproducible byte-for-byte"
+    );
+}
+
+/// B2: `--observe` records the run (message log + replay capture) and `swarm-replay` re-derives every
+/// round record byte-identically (`verify_observe_dir`) — the gate-ceremony record + replay path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observe_record_and_replay_green() {
+    let run = run_swarm(scenario()).await.expect("swarm run");
+    assert!(
+        run.all_agree(),
+        "peers agree so the digest tally is unanimous"
+    );
+
+    // The observe message log captured every round record on the wire.
+    assert_eq!(
+        run.message_log
+            .by_kind(daemon_swarm_observe::MessageKind::RoundRecord)
+            .count(),
+        20,
+        "one round record per round on the wire"
+    );
+    // Digest tally over the peers' reported digests shows unanimous agreement, no desync outliers.
+    for round in 0..20u64 {
+        assert!(
+            run.desync_outliers(round).is_empty(),
+            "round {round} has no desync outlier"
+        );
+    }
+
+    // Write the artifacts, then replay + verify them offline (what `swarm-replay <dir>` does).
+    let dir = std::env::temp_dir().join(format!(
+        "daemon-swarm-observe-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    run.write_observe(&dir).expect("write observe artifacts");
+
+    let report = verify_observe_dir(&dir).expect("replay must re-derive the recorded run");
+    assert!(
+        report.all_verified(),
+        "all recorded round records re-derive ({}/{})",
+        report.rounds_verified,
+        report.logged_records
+    );
+    assert_eq!(report.rounds_verified, 20, "20 rounds re-derived");
+    assert_eq!(
+        report.health.rounds.len(),
+        20,
+        "run health projects 20 rounds"
+    );
+    assert!(
+        report.health.rounds.iter().all(|r| r.finalized),
+        "every round finalized in the health projection"
     );
 }

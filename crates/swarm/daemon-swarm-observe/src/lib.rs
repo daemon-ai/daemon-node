@@ -25,15 +25,20 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capture;
 pub mod desync;
 pub mod health;
 pub mod log;
 pub mod replay;
 
+pub use capture::RunCapture;
 pub use desync::{digest_tally, DesyncVerdict};
 pub use health::{RoundHealth, RunHealth};
 pub use log::{MessageKind, MessageLog};
-pub use replay::{genesis_seed, replay, ReplayDivergence, ReplayError, ReplayReport};
+pub use replay::{
+    genesis_seed, logged_round_records, replay, replay_capture, replay_from_state,
+    ReplayDivergence, ReplayError, ReplayReport,
+};
 
 /// Errors surfaced by the run-log store and its projections.
 #[derive(Debug, thiserror::Error)]

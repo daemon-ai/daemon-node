@@ -20,8 +20,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod discovery;
 pub mod service;
 pub mod store;
 
+pub use discovery::{DiscoveredRun, EgressRunDiscovery, RunDiscovery};
+// Re-exported so the boot site constructs the registry-backed discovery seam without a direct
+// `daemon-swarm-net` dep edge (A3 boot wiring; additive).
+pub use daemon_swarm_net::RegistryClient;
 pub use service::{NodeFeed, SwarmError, SwarmService, SwarmServiceParts, WorkerControl};
 pub use store::{DesiredState, PersistedRun, StoreError, SwarmStore, EVENT_WINDOW};

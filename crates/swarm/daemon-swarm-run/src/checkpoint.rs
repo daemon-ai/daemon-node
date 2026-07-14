@@ -124,6 +124,80 @@ pub fn resync_by_replay<B: TrainerBackend>(
     last.ok_or_else(|| SwarmRunError::Lifecycle("resync replay had no steps".into()))
 }
 
+// -- RUN-6: two-checkpointer both-match registration + degraded mode ----------------------------
+
+/// The outcome of registering a round checkpoint from the elected checkpointers' uploads (§9,
+/// TDD RUN-6). The spec elects **two** checkpointers that upload independently; a checkpoint
+/// registers only when both agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointRegistration {
+    /// Both checkpointers uploaded byte-identical manifests → registered with cross-check.
+    Registered(CheckpointManifest),
+    /// Only one checkpointer uploaded (the other churned) → registered, but flagged degraded (no
+    /// cross-check this round; the run continues and the observer is warned).
+    Degraded(CheckpointManifest),
+    /// The checkpointers uploaded divergent manifests → rejected (a checkpointer is faulty).
+    Mismatch,
+    /// No checkpointer uploaded.
+    Missing,
+}
+
+/// Register a round checkpoint from the elected checkpointers' uploaded manifests (RUN-6, §9).
+///
+/// Registers only on a **both-match** (all uploads byte-identical: same round, blake3, and digest).
+/// A single upload registers in **degraded** mode; divergent uploads are rejected as a fault.
+#[must_use]
+pub fn register_checkpoint(uploads: &[CheckpointManifest]) -> CheckpointRegistration {
+    match uploads {
+        [] => CheckpointRegistration::Missing,
+        [only] => CheckpointRegistration::Degraded(*only),
+        [first, rest @ ..] => {
+            if rest.iter().all(|m| m == first) {
+                CheckpointRegistration::Registered(*first)
+            } else {
+                CheckpointRegistration::Mismatch
+            }
+        }
+    }
+}
+
+// -- RUN-7: resync-vs-retention decision --------------------------------------------------------
+
+/// How a desynced peer recovers, given the payload-retention floor (§6.4/§9, TDD RUN-7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResyncPlan {
+    /// Replay from the latest checkpoint forward over the retained records/payloads (I1).
+    ReplayFromCheckpoint {
+        /// The checkpoint round to reload from.
+        from_round: RoundId,
+        /// The number of rounds to replay forward to reach `current_round`.
+        steps: u64,
+    },
+    /// The desync predates the retention floor: the records/payloads needed to replay are gone, so
+    /// the peer waits for the next epoch checkpoint to rejoin (the stall ladder's terminal arm).
+    WaitForEpoch,
+}
+
+/// Decide how a desynced peer at `current_round` recovers, given the latest checkpoint at
+/// `checkpoint_round` and the payload `retention_rounds` floor (RUN-7). If every round since the
+/// checkpoint is still retained, replay; otherwise the payloads are gone → wait for the epoch.
+#[must_use]
+pub fn plan_resync(
+    checkpoint_round: RoundId,
+    current_round: RoundId,
+    retention_rounds: u64,
+) -> ResyncPlan {
+    let steps = current_round.saturating_sub(checkpoint_round);
+    if steps <= retention_rounds {
+        ResyncPlan::ReplayFromCheckpoint {
+            from_round: checkpoint_round,
+            steps,
+        }
+    } else {
+        ResyncPlan::WaitForEpoch
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

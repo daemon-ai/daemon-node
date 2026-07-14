@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assess;
 pub mod backend;
 pub mod checkpoint;
 pub mod config;

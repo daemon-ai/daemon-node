@@ -213,3 +213,248 @@ pub mod iroh_harness {
         Mesh { planes, subs }
     }
 }
+
+/// An in-process mock of the cloud `RunCoordinatorDO` WS surface (feature-gated): it accepts peer
+/// WebSocket upgrades on loopback and **disseminates** every inbound binary frame to the *other*
+/// connected peers (never echoes the sender) — the `webSocketMessage` `broadcast([bytes], ws)`
+/// contract from `apps/swarm/src/coordinator/do.ts`. It can also `broadcast` a coordinator emission
+/// to ALL peers, `sever` every live socket (force reconnect), capture the upgrade headers (auth
+/// assertion), and count received frames. Enough of the DO framing for the parametric `ControlPlane`
+/// conformance suite + the reconnect/resubscribe + dual-plane dedupe drills — NOT a full coordinator
+/// (no signature verify / round-state; C1 owns the cloud side, Merge 1 does the live cross-lane check).
+#[cfg(feature = "ws")]
+pub mod ws_harness {
+    use super::*;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+    use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
+    use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    use tokio_tungstenite::tungstenite::Message;
+
+    use daemon_swarm_net::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
+
+    struct Inner {
+        peers: Mutex<HashMap<u64, UnboundedSender<Message>>>,
+        next_id: AtomicU64,
+        received: AtomicU64,
+        headers: Mutex<Vec<(String, String)>>,
+        sever: Notify,
+        relay: AtomicBool,
+    }
+
+    /// A running mock coordinator WS server.
+    pub struct MockWsCoordinator {
+        addr: SocketAddr,
+        inner: Arc<Inner>,
+        accept_task: JoinHandle<()>,
+    }
+
+    impl Drop for MockWsCoordinator {
+        fn drop(&mut self) {
+            self.accept_task.abort();
+        }
+    }
+
+    impl MockWsCoordinator {
+        /// Bind on loopback and start accepting connections.
+        pub async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock ws");
+            let addr = listener.local_addr().expect("local addr");
+            let inner = Arc::new(Inner {
+                peers: Mutex::new(HashMap::new()),
+                next_id: AtomicU64::new(0),
+                received: AtomicU64::new(0),
+                headers: Mutex::new(Vec::new()),
+                sever: Notify::new(),
+                relay: AtomicBool::new(true),
+            });
+            let inner2 = inner.clone();
+            let accept_task = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(handle_conn(stream, inner2.clone()));
+                }
+            });
+            Self {
+                addr,
+                inner,
+                accept_task,
+            }
+        }
+
+        /// The coordinator base URL a [`WsControlPlane`] dials (`{addr}/api/v1/swarm`).
+        pub fn base_url(&self) -> String {
+            format!("http://{}/api/v1/swarm", self.addr)
+        }
+
+        /// Connect a [`WsControlPlane`] client to this coordinator for `run_id`.
+        pub async fn client(
+            &self,
+            run_id: &str,
+            auth: WsAuth,
+            reconnect: ReconnectConfig,
+        ) -> WsControlPlane {
+            WsControlPlane::connect(WsConfig {
+                base_url: self.base_url(),
+                run_id: run_id.to_string(),
+                auth,
+                reconnect,
+            })
+            .await
+            .expect("connect ws control plane")
+        }
+
+        /// A coordinator emission to ALL connected peers (RoundOpen / StorageReceipt / RoundRecord).
+        pub fn broadcast(&self, frame: Vec<u8>) {
+            let peers = self.inner.peers.lock().expect("peers lock");
+            for tx in peers.values() {
+                let _ = tx.send(Message::binary(frame.clone()));
+            }
+        }
+
+        /// Close every currently-connected socket (force the clients to reconnect).
+        pub fn sever(&self) {
+            self.inner.sever.notify_waiters();
+        }
+
+        /// Whether inbound frames are relayed to the other peers (default true).
+        pub fn set_relay(&self, on: bool) {
+            self.inner.relay.store(on, Ordering::Relaxed);
+        }
+
+        /// Frames received from all peers so far.
+        pub fn received(&self) -> u64 {
+            self.inner.received.load(Ordering::Relaxed)
+        }
+
+        /// Currently-connected peer count.
+        pub fn peer_count(&self) -> usize {
+            self.inner.peers.lock().expect("peers lock").len()
+        }
+
+        /// The captured upgrade headers of the most recent connection (auth assertion).
+        pub fn last_headers(&self) -> Vec<(String, String)> {
+            self.inner.headers.lock().expect("headers lock").clone()
+        }
+
+        /// Block until at least `n` peers are connected (mesh formed), or panic after 10 s.
+        pub async fn wait_peers(&self, n: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.peer_count() < n {
+                if Instant::now() > deadline {
+                    panic!("only {} of {n} ws peers connected", self.peer_count());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    // tungstenite's handshake `Callback` returns `Result<Response, ErrorResponse>`; the `Err` variant
+    // is large but is the library's fixed shape (mirrors `daemon_host::ws`).
+    #[allow(clippy::result_large_err)]
+    async fn handle_conn(stream: TcpStream, inner: Arc<Inner>) {
+        let hdr_slot = inner.clone();
+        let callback = move |req: &Request, resp: Response| {
+            let mut hs = hdr_slot.headers.lock().expect("headers lock");
+            hs.clear();
+            for (name, value) in req.headers() {
+                if let Ok(v) = value.to_str() {
+                    hs.push((name.as_str().to_string(), v.to_string()));
+                }
+            }
+            Ok::<Response, ErrorResponse>(resp)
+        };
+        let ws = match accept_hdr_async(stream, callback).await {
+            Ok(ws) => ws,
+            Err(_) => return,
+        };
+        let (mut write, mut read) = ws.split();
+        let (tx, mut rx) = unbounded_channel::<Message>();
+        let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+        inner.peers.lock().expect("peers lock").insert(id, tx);
+
+        loop {
+            tokio::select! {
+                biased;
+                () = inner.sever.notified() => {
+                    let _ = write.close().await;
+                    break;
+                }
+                out = rx.recv() => match out {
+                    Some(msg) => {
+                        if write.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                inbound = read.next() => match inbound {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        inner.received.fetch_add(1, Ordering::Relaxed);
+                        if inner.relay.load(Ordering::Relaxed) {
+                            let peers = inner.peers.lock().expect("peers lock");
+                            for (pid, ptx) in peers.iter() {
+                                if *pid != id {
+                                    let _ = ptx.send(Message::binary(bytes.clone()));
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                },
+            }
+        }
+        inner.peers.lock().expect("peers lock").remove(&id);
+    }
+
+    /// Build an N-client WS mesh against `coord` (all subscribed, all connected).
+    pub async fn build_ws_mesh(coord: &MockWsCoordinator, n: usize) -> Vec<Arc<WsControlPlane>> {
+        let mut nodes = Vec::with_capacity(n);
+        for _ in 0..n {
+            nodes.push(Arc::new(
+                coord.client("run-conf", WsAuth::None, no_reconnect()).await,
+            ));
+        }
+        coord.wait_peers(n).await;
+        nodes
+    }
+
+    /// Wrap live WS clients as a [`Mesh`] (subscribe each once).
+    pub fn ws_mesh_from(nodes: &[Arc<WsControlPlane>]) -> Mesh {
+        let planes = nodes
+            .iter()
+            .map(|n| n.clone() as Arc<dyn ControlPlane>)
+            .collect();
+        let subs = nodes.iter().map(|n| n.subscribe()).collect();
+        Mesh { planes, subs }
+    }
+
+    /// A one-shot (no-reconnect) policy for conformance meshes.
+    pub fn no_reconnect() -> ReconnectConfig {
+        ReconnectConfig {
+            enabled: false,
+            ..ReconnectConfig::default()
+        }
+    }
+
+    /// A fast-reconnect policy for the reconnect drill.
+    pub fn fast_reconnect() -> ReconnectConfig {
+        ReconnectConfig {
+            enabled: true,
+            initial_backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_millis(200),
+            max_attempts: None,
+        }
+    }
+}

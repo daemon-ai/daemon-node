@@ -499,6 +499,361 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
     }
 }
 
+// =====================================================================================
+// Windows DXGI/D3D12 device-memory probe (swarm-windows-vram-design.md §2 mapping).
+// The pure mapper + raw struct are unconditional (fixture-tested on every platform); the
+// actual DXGI/D3D12 FFI is `#[cfg(windows)]` + target-gated `windows` dep.
+// =====================================================================================
+
+/// Static + live memory numbers for one DXGI adapter, gathered by the Windows FFI (or a fixture).
+/// All byte counts as reported by the OS; the pure [`windows_device_limits`] mapper turns these
+/// into [`DeviceLimits`] per the design's §2 field mapping and its trap rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DxgiAdapterMemory {
+    /// `GetDesc3().DedicatedVideoMemory` — physical VRAM on discrete (correct > 4 GiB); on an APU's
+    /// "Variable Graphics Memory" this is the *configured allocation*, not physical RAM.
+    pub dedicated_video: u64,
+    /// `GetDesc3().DedicatedSystemMemory` — BIOS carve-out some iGPUs reserve (usually 0). Carried
+    /// as a telemetry note; **never folded into `vram_mb`**.
+    pub dedicated_system: u64,
+    /// `GetDesc3().SharedSystemMemory` — the static **ceiling** on borrowable system RAM (~½ RAM),
+    /// a limit, NOT usage.
+    pub shared_system: u64,
+    /// `DXGI_ADAPTER_FLAG3_SOFTWARE` — the WARP software rasterizer; skip during enumeration.
+    pub is_software: bool,
+    /// `D3D12_FEATURE_DATA_ARCHITECTURE1.UMA` — authoritative unified flag (queried, not inferred).
+    pub uma: bool,
+    /// `D3D12_FEATURE_DATA_ARCHITECTURE1.CacheCoherentUMA` — coherent cache hierarchy (telemetry).
+    pub cache_coherent_uma: bool,
+    /// `QueryVideoMemoryInfo(node 0, LOCAL).Budget` — the live OS-granted budget for the LOCAL
+    /// segment group (on UMA this is the shared-pool grant; on discrete ≈ 0.9 × VRAM, the number
+    /// Task Manager's GPU tab shows). Same WDDM source as Task Manager → trivial cross-check.
+    pub budget_local: u64,
+    /// `QueryVideoMemoryInfo(node 0, NON_LOCAL).Budget` — the live NON_LOCAL budget (≈ ½ RAM on
+    /// discrete; ≈ 0 on UMA). Recorded for telemetry; contributes **0** to the discrete GPU budget.
+    pub budget_non_local: u64,
+}
+
+/// Map one non-WARP DXGI adapter's memory numbers to [`DeviceLimits`] (design §2).
+///
+/// - `unified` ← `ARCHITECTURE1.UMA` (authoritative; replaces-and-validates the wgpu heuristic).
+/// - `vram_mb` ← `DedicatedVideoMemory` (physical VRAM / configured VGM allocation).
+/// - `shared_mb`: **UMA** → `min(SharedSystemMemory, LOCAL.Budget)` (on UMA everything is LOCAL, so
+///   the live LOCAL budget is the shared-pool grant, statically capped by `SharedSystemMemory`);
+///   **discrete** → **0** (NON_LOCAL spill is PCIe-speed and contributes 0 to the effective GPU
+///   budget by default, per the program's discrete-spill rule — the NON_LOCAL budget is recorded on
+///   [`DxgiAdapterMemory`] for telemetry, not fed to the verdict).
+/// - `max_alloc_mb` ← wgpu `max_buffer_size` (passed in; the DX12 `i32::MAX` constant when wgpu is
+///   absent) — the per-tensor gate, unchanged.
+/// - `ram_mb` ← `GlobalMemoryStatusEx().ullTotalPhys` (passed in).
+///
+/// Returns `None` for a WARP / software adapter (the caller skips it during enumeration).
+///
+/// **VGM safety:** on Variable-Graphics-Memory APUs `dedicated_video` can present tens of GB of
+/// unified RAM; because the [`Autotune::verdict`] unified path clamps the joint pool to
+/// `min(vram + 90%·shared, ram)`, the physical-RAM ceiling caps the inflated VRAM figure — the
+/// design's "never conflate configured allocation with physical RAM" rule is enforced by the
+/// verdict, and `ram_mb` is the true physical bound.
+#[must_use]
+pub fn windows_device_limits(
+    adapter: &DxgiAdapterMemory,
+    ram_mb: u64,
+    max_alloc_mb: u64,
+) -> Option<DeviceLimits> {
+    if adapter.is_software {
+        return None; // WARP / software rasterizer — skip (trap rule).
+    }
+    let shared_mb = if adapter.uma {
+        // UMA: the LOCAL budget is the live shared-pool grant; SharedSystemMemory caps it statically.
+        adapter.shared_system.min(adapter.budget_local) / MIB
+    } else {
+        // Discrete: NON_LOCAL spill contributes 0 to the effective GPU budget by default.
+        0
+    };
+    Some(DeviceLimits {
+        vram_mb: adapter.dedicated_video / MIB,
+        ram_mb,
+        max_alloc_mb,
+        shared_mb,
+        unified: adapter.uma,
+    })
+}
+
+/// The DX12 per-buffer ceiling wgpu reports (`max_buffer_size`) when the probe has no live wgpu
+/// adapter: `i32::MAX` bytes ("Dx12 does not expose a maximum buffer size in the API",
+/// `wgpu-hal dx12/adapter.rs:891-894`). In MiB (2047) — a wgpu-enforced per-tensor gate, never a
+/// capacity number.
+pub const DX12_MAX_BUFFER_MB: u64 = (i32::MAX as u64) / MIB;
+
+// =====================================================================================
+// macOS Metal device-budget probe (swarm-macos-uma-findings.md §4 mapping).
+// =====================================================================================
+
+/// Metal device scalars gathered by the macOS FFI (or a fixture). All byte counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetalAdapterMemory {
+    /// `MTLDevice.recommendedMaxWorkingSetSize` — the "allocate up to this" GPU budget (≈ ⅔ RAM on
+    /// Apple Silicon); the working-set analogue of the three-platform budget symmetry.
+    pub recommended_working_set: u64,
+    /// `MTLDevice.maxBufferLength` — the per-allocation ceiling (≈ ½ RAM); honest on Metal (wgpu's
+    /// `max_buffer_size` agrees exactly, so this doubles as `max_alloc_mb`).
+    pub max_buffer_length: u64,
+    /// `sysctl hw.memsize` (== `ProcessInfo.physicalMemory`) — full physical RAM.
+    pub phys_ram: u64,
+    /// `MTLDevice.hasUnifiedMemory` — Apple Silicon is always true.
+    pub has_unified: bool,
+}
+
+/// Map Metal device scalars to [`DeviceLimits`] (findings §4): `vram_mb` = the working-set budget
+/// (NOT 0, NOT `max_buffer_size`), `shared_mb` = `ram_mb` (the unified physical pool that drives the
+/// joint check), `max_alloc_mb` = `maxBufferLength`, `unified` = `hasUnifiedMemory`.
+#[must_use]
+pub fn macos_device_limits(metal: &MetalAdapterMemory) -> DeviceLimits {
+    let ram_mb = metal.phys_ram / MIB;
+    DeviceLimits {
+        vram_mb: metal.recommended_working_set / MIB,
+        ram_mb,
+        max_alloc_mb: metal.max_buffer_length / MIB,
+        // The unified physical pool CPU+GPU jointly draw from; drives the joint-pool check so
+        // `fixed_vram + host_ram` is validated against one pool. On Apple Silicon = physical RAM.
+        shared_mb: if metal.has_unified { ram_mb } else { 0 },
+        unified: metal.has_unified,
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// Windows FFI (DXGI/D3D12). Compiled only for the Windows target; the `windows` crate is a
+// target-gated dep. All decision logic lives in `windows_device_limits` above (fixture-tested
+// everywhere); this module only gathers raw scalars.
+// -------------------------------------------------------------------------------------
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod win_ffi {
+    use super::{DeviceLimits, DxgiAdapterMemory, DX12_MAX_BUFFER_MB, MIB};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12CreateDevice, ID3D12Device, D3D12_FEATURE_ARCHITECTURE1,
+        D3D12_FEATURE_DATA_ARCHITECTURE1,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, IDXGIAdapter4, IDXGIFactory6, DXGI_ADAPTER_FLAG3_SOFTWARE,
+        DXGI_CREATE_FACTORY_FLAGS, DXGI_GPU_PREFERENCE_UNSPECIFIED,
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+        DXGI_QUERY_VIDEO_MEMORY_INFO,
+    };
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    /// Physical RAM in MiB from `GlobalMemoryStatusEx().ullTotalPhys`; `0` on failure.
+    fn ram_mb() -> u64 {
+        let mut status = MEMORYSTATUSEX {
+            dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `status` is a valid, `dwLength`-initialized MEMORYSTATUSEX out-pointer.
+        match unsafe { GlobalMemoryStatusEx(&mut status) } {
+            Ok(()) => status.ullTotalPhys / MIB,
+            Err(_) => 0,
+        }
+    }
+
+    /// Probe the first non-WARP DXGI adapter → [`DeviceLimits`], plus the raw numbers for logging.
+    /// Returns `None` when no usable adapter is found (or DXGI is unavailable).
+    pub(super) fn probe() -> Option<(DeviceLimits, DxgiAdapterMemory)> {
+        let ram = ram_mb();
+        // SAFETY: DXGI factory/adapter/device calls with correctly-typed out-pointers; every result
+        // is checked. COM objects are dropped at scope end (windows-crate RAII).
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let mut i = 0u32;
+            loop {
+                let adapter: IDXGIAdapter4 =
+                    match factory.EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_UNSPECIFIED) {
+                        Ok(a) => a,
+                        Err(_) => return None, // exhausted enumeration with no usable adapter
+                    };
+                i += 1;
+
+                let desc = match adapter.GetDesc3() {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let is_software = (desc.Flags.0 & DXGI_ADAPTER_FLAG3_SOFTWARE.0) != 0;
+                if is_software {
+                    continue; // skip WARP (trap rule)
+                }
+
+                // UMA is queried via a D3D12 device (authoritative), not inferred.
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).is_err() {
+                    continue;
+                }
+                let Some(device) = device else { continue };
+                let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE1::default();
+                let _ = device.CheckFeatureSupport(
+                    D3D12_FEATURE_ARCHITECTURE1,
+                    (&mut arch as *mut D3D12_FEATURE_DATA_ARCHITECTURE1).cast(),
+                    size_of::<D3D12_FEATURE_DATA_ARCHITECTURE1>() as u32,
+                );
+
+                let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                let _ =
+                    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local);
+                let _ = adapter.QueryVideoMemoryInfo(
+                    0,
+                    DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+                    &mut non_local,
+                );
+
+                let raw = DxgiAdapterMemory {
+                    dedicated_video: desc.DedicatedVideoMemory as u64,
+                    dedicated_system: desc.DedicatedSystemMemory as u64,
+                    shared_system: desc.SharedSystemMemory as u64,
+                    is_software,
+                    uma: arch.UMA.as_bool(),
+                    cache_coherent_uma: arch.CacheCoherentUMA.as_bool(),
+                    budget_local: local.Budget,
+                    budget_non_local: non_local.Budget,
+                };
+                // wgpu's DX12 `max_buffer_size` is the fixed i32::MAX constant; use it directly (no
+                // live wgpu adapter is needed for the probe-only cross build).
+                let limits = super::windows_device_limits(&raw, ram, DX12_MAX_BUFFER_MB)?;
+                let _ = HANDLE::default(); // (budget-change event handle wiring is §3, not probe-time)
+                return Some((limits, raw));
+            }
+        }
+    }
+}
+
+/// Probe Windows GPU memory via DXGI/D3D12 → [`DeviceLimits`] (design §2). `None` off Windows or
+/// when no usable (non-WARP) adapter is found. Safe wrapper over the `#[cfg(windows)]` FFI.
+#[must_use]
+pub fn probe_windows_device_limits() -> Option<DeviceLimits> {
+    #[cfg(windows)]
+    {
+        win_ffi::probe().map(|(limits, raw)| {
+            eprintln!(
+                "daemon-train probe (windows/DXGI): {raw:?} dedicated_system_mb={} \
+                 budget_local_mb={} budget_non_local_mb={} -> {limits:?}",
+                raw.dedicated_system / MIB,
+                raw.budget_local / MIB,
+                raw.budget_non_local / MIB,
+            );
+            limits
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// macOS FFI (Metal + libSystem sysctl). Compiled only for macOS. No new dependency — raw `extern`
+// FFI to the Objective-C runtime + Metal/Foundation frameworks + libSystem `sysctlbyname`. All
+// mapping lives in `macos_device_limits` above (fixture-tested everywhere).
+// -------------------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod mac_ffi {
+    use super::{macos_device_limits, DeviceLimits, MetalAdapterMemory};
+    use core::ffi::{c_char, c_void};
+
+    #[link(name = "Metal", kind = "framework")]
+    unsafe extern "C" {
+        fn MTLCreateSystemDefaultDevice() -> *mut c_void;
+    }
+    unsafe extern "C" {
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+
+    /// `[obj selector]` returning an unsigned integer (NSUInteger / u64).
+    unsafe fn msg_u64(obj: *mut c_void, sel: *mut c_void) -> u64 {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 =
+            unsafe { core::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+        unsafe { f(obj, sel) }
+    }
+
+    /// `[obj selector]` returning an Objective-C `BOOL` (a signed char on arm64 macOS).
+    unsafe fn msg_bool(obj: *mut c_void, sel: *mut c_void) -> bool {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool =
+            unsafe { core::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+        unsafe { f(obj, sel) }
+    }
+
+    unsafe fn sel(name: &core::ffi::CStr) -> *mut c_void {
+        unsafe { sel_registerName(name.as_ptr()) }
+    }
+
+    fn sysctl_u64(name: &core::ffi::CStr) -> u64 {
+        let mut val: u64 = 0;
+        let mut len = size_of::<u64>();
+        // SAFETY: `val`/`len` are valid out-pointers sized for a u64 sysctl scalar.
+        let rc = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                (&mut val as *mut u64).cast(),
+                &mut len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 {
+            val
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn probe() -> Option<DeviceLimits> {
+        // SAFETY: MTLCreateSystemDefaultDevice returns a valid MTLDevice (or null → bail); the
+        // selectors are no-argument accessors returning scalar NSUInteger/BOOL, called via a
+        // correctly-typed objc_msgSend. The device is intentionally leaked (probe runs once).
+        unsafe {
+            let device = MTLCreateSystemDefaultDevice();
+            if device.is_null() {
+                return None;
+            }
+            let working_set = msg_u64(device, sel(c"recommendedMaxWorkingSetSize"));
+            let max_buffer = msg_u64(device, sel(c"maxBufferLength"));
+            let has_unified = msg_bool(device, sel(c"hasUnifiedMemory"));
+            let metal = MetalAdapterMemory {
+                recommended_working_set: working_set,
+                max_buffer_length: max_buffer,
+                phys_ram: sysctl_u64(c"hw.memsize"),
+                has_unified,
+            };
+            let limits = macos_device_limits(&metal);
+            eprintln!("daemon-train probe (macos/Metal): {metal:?} -> {limits:?}");
+            Some(limits)
+        }
+    }
+}
+
+/// Probe macOS GPU budget via Metal (`recommendedMaxWorkingSetSize`/`maxBufferLength`/
+/// `hasUnifiedMemory`) + `sysctl hw.memsize` → [`DeviceLimits`] (findings §4). `None` off macOS or
+/// when no Metal device is available.
+#[must_use]
+pub fn probe_macos_device_limits() -> Option<DeviceLimits> {
+    #[cfg(target_os = "macos")]
+    {
+        mac_ffi::probe()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,5 +1156,145 @@ mod tests {
         // Non-numeric / empty → None (caller falls back to another source).
         assert_eq!(parse_amdgpu_mem_mb(""), None);
         assert_eq!(parse_amdgpu_mem_mb("N/A"), None);
+    }
+
+    // ---- Windows DXGI/D3D12 probe mapping (swarm-windows-vram-design.md §2) ----
+
+    const GIB: u64 = 1024 * MIB;
+
+    /// `windows_discrete_maps_dedicated_vram_shared_zero`: a discrete card (RTX-5090-shaped: 32 GiB
+    /// dedicated, NON_LOCAL budget ≈ ½ RAM) maps to `vram_mb = DedicatedVideoMemory`, `shared_mb = 0`
+    /// (NON_LOCAL spill contributes 0 by default), `unified = false`. The NON_LOCAL budget is carried
+    /// on the raw struct for telemetry but never enters the verdict.
+    #[test]
+    fn windows_discrete_maps_dedicated_vram_shared_zero() {
+        let adapter = DxgiAdapterMemory {
+            dedicated_video: 32 * GIB,
+            dedicated_system: 0,
+            shared_system: 32 * GIB, // ≈ ½ of 64 GiB RAM
+            is_software: false,
+            uma: false,
+            cache_coherent_uma: false,
+            budget_local: 30 * GIB, // ≈ 0.9 × VRAM (what Task Manager shows)
+            budget_non_local: 30 * GIB, // ≈ ½ RAM (telemetry only)
+        };
+        let limits =
+            windows_device_limits(&adapter, 64 * 1024, DX12_MAX_BUFFER_MB).expect("not WARP");
+        assert_eq!(limits.vram_mb, 32 * 1024);
+        assert_eq!(limits.shared_mb, 0, "discrete NON_LOCAL contributes 0");
+        assert!(!limits.unified);
+        assert_eq!(limits.max_alloc_mb, DX12_MAX_BUFFER_MB); // 2047 — the DX12 constant
+                                                             // Effective budget on the discrete path = vram only (shared 0).
+        let effective = limits.vram_mb + limits.shared_mb * 9 / 10;
+        assert_eq!(effective, 32 * 1024);
+    }
+
+    /// `windows_uma_uses_local_budget`: an integrated/UMA adapter (small dedicated carve-out, large
+    /// LOCAL budget) maps to `unified = true`, `shared_mb = min(SharedSystemMemory, LOCAL.Budget)`.
+    #[test]
+    fn windows_uma_uses_local_budget() {
+        let adapter = DxgiAdapterMemory {
+            dedicated_video: 512 * MIB, // iGPU carve-out
+            dedicated_system: 0,
+            shared_system: 16 * GIB, // static ceiling (~½ of 32 GiB)
+            is_software: false,
+            uma: true,
+            cache_coherent_uma: true,
+            budget_local: 12 * GIB, // live shared-pool grant (< static ceiling)
+            budget_non_local: 0,    // UMA => ~0
+        };
+        let limits =
+            windows_device_limits(&adapter, 32 * 1024, DX12_MAX_BUFFER_MB).expect("not WARP");
+        assert!(limits.unified);
+        assert_eq!(limits.vram_mb, 512);
+        // min(16 GiB ceiling, 12 GiB live budget) = 12 GiB.
+        assert_eq!(limits.shared_mb, 12 * 1024);
+    }
+
+    /// `windows_variable_graphics_memory_clamped_to_ram`: the AMD "Variable Graphics Memory" trap —
+    /// a Strix-Halo-on-Windows APU can present tens of GB as `DedicatedVideoMemory`. The mapper keeps
+    /// the configured allocation in `vram_mb` (never conflated with RAM) and the verdict clamps the
+    /// joint pool to physical `ram_mb`, so an inflated VRAM figure cannot overstate capacity.
+    #[test]
+    fn windows_variable_graphics_memory_clamped_to_ram() {
+        let adapter = DxgiAdapterMemory {
+            dedicated_video: 48 * GIB, // configured VGM allocation (huge)
+            dedicated_system: 0,
+            shared_system: 60 * GIB,
+            is_software: false,
+            uma: true,
+            cache_coherent_uma: true,
+            budget_local: 56 * GIB,
+            budget_non_local: 0,
+        };
+        let ram_mb = 128 * 1024; // 128 GiB physical
+        let limits = windows_device_limits(&adapter, ram_mb, DX12_MAX_BUFFER_MB).expect("not WARP");
+        assert_eq!(limits.vram_mb, 48 * 1024, "configured allocation, not RAM");
+        assert!(limits.unified);
+        // `vram_mb` holds only the configured allocation — it is NOT summed with `shared_mb` into a
+        // fake capacity (the design's cardinal VGM trap rule).
+        assert!(limits.vram_mb < limits.vram_mb + limits.shared_mb);
+        // The joint pool = min(vram + 90%·shared, ram) is bounded by physical `ram_mb`, so no VGM
+        // configuration can admit a model whose footprint exceeds physical RAM.
+        let over_ram = Autotune {
+            fixed_vram_bytes: 200 * GIB, // far beyond 128 GiB RAM
+            act_bytes_per_mb: MIB,
+            host_ram_bytes: MIB,
+            payload_bytes: 0,
+            max_tensor_bytes: MIB,
+        };
+        let v = over_ram.verdict(&limits, DEFAULT_MAX_MICROBATCH);
+        assert!(!v.eligible, "VGM must not admit a >RAM model: {v:?}");
+        // A model that fits physical RAM IS admitted (the configured VGM allocation is usable).
+        let fits = llama_model(1_200_000_000, 50_257, 2048, 256 * MIB); // ~22 GiB fixed
+        assert!(
+            fits.verdict(&limits, DEFAULT_MAX_MICROBATCH).eligible,
+            "a RAM-fitting model must be eligible on VGM: {:?}",
+            fits.verdict(&limits, DEFAULT_MAX_MICROBATCH)
+        );
+    }
+
+    /// `windows_warp_skipped`: a software (WARP) adapter maps to `None` so enumeration skips it.
+    #[test]
+    fn windows_warp_skipped() {
+        let warp = DxgiAdapterMemory {
+            dedicated_video: 0,
+            is_software: true,
+            ..Default::default()
+        };
+        assert!(windows_device_limits(&warp, 16 * 1024, DX12_MAX_BUFFER_MB).is_none());
+    }
+
+    // ---- macOS Metal probe mapping (swarm-macos-uma-findings.md §4) ----
+
+    /// `macos_m1_working_set_and_joint_pool`: the measured M1-mini numbers (8 GiB) map to
+    /// `vram_mb = recommendedMaxWorkingSetSize` (⅔ RAM), `max_alloc_mb = maxBufferLength` (½ RAM),
+    /// `shared_mb = ram_mb`, `unified = true`; the joint pool then admits 160M and rejects 1.2B.
+    #[test]
+    fn macos_m1_working_set_and_joint_pool() {
+        let metal = MetalAdapterMemory {
+            recommended_working_set: 5_726_633_984, // 5461 MiB (⅔ of 8 GiB, measured)
+            max_buffer_length: 4 * GIB,             // 4096 MiB (½ of 8 GiB, measured)
+            phys_ram: 8 * GIB,
+            has_unified: true,
+        };
+        let limits = macos_device_limits(&metal);
+        assert_eq!(limits.vram_mb, 5461);
+        assert_eq!(limits.max_alloc_mb, 4096);
+        assert_eq!(limits.ram_mb, 8192);
+        assert_eq!(limits.shared_mb, 8192);
+        assert!(limits.unified);
+
+        // 160M ELIGIBLE, 1.2B INELIGIBLE on this 8 GiB M1 (findings §3).
+        let m160 = llama_model(151_862_784, 50_257, 768, 8 * MIB);
+        assert!(
+            m160.verdict(&limits, DEFAULT_MAX_MICROBATCH).eligible,
+            "160M must fit an 8 GiB M1"
+        );
+        let b1_2 = llama_model(1_200_000_000, 50_257, 2048, 512 * MIB);
+        assert!(
+            !b1_2.verdict(&limits, DEFAULT_MAX_MICROBATCH).eligible,
+            "1.2B cannot fit an 8 GiB M1"
+        );
     }
 }

@@ -14,11 +14,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Crash reporting (consent-gated; see `crash.rs`). `sentry` owns the panic hook + event transport;
-# `sentry-rust-minidump` spawns the out-of-process minidump monitor for native crashes. Both are
-# always compiled (no feature gate): the reporter is a runtime no-op unless a DSN is present and
-# `DAEMON_CRASH_CONSENT=1`, so a build with crash reporting "off" still links the same code path.
+# it is compiled on every target (a runtime no-op unless a DSN is present and `DAEMON_CRASH_CONSENT=1`,
+# so a build with crash reporting "off" still links the same panic-capture path).
 sentry = { workspace = true }
-sentry-rust-minidump = { workspace = true }
 # verifiable-trace stack: deterministic CBOR + Gordian Envelope digest tree + ed25519 keys.
 dcbor = { workspace = true }
 bc-envelope = { workspace = true }
@@ -30,6 +28,17 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+
+# The out-of-process native-minidump monitor (native crashes: SIGSEGV/abort/FFI faults in unsafe,
+# llama.cpp, burn, …). Compiled on every target EXCEPT `x86_64-pc-windows-gnu`: its `crash-handler`
+# dependency references a UCRT symbol (`_invoke_watson`) the mingw-w64 msvcrt import lib does not
+# export, so ANY binary that links it fails to link under MinGW (the cross-built training worker —
+# swarm-p2-ledger adjudication (f)). On that one target the native-minidump path is cfg-compiled out
+# in `crash.rs`; Rust-panic capture via `sentry` (above) still arms. No behavior change on any other
+# target (Linux/macOS/msvc-windows keep the full native-crash monitor). Lock-neutral: the crate stays
+# resolved for the host targets; it simply is not a dependency edge for windows-gnu.
+[target.'cfg(not(all(windows, target_env = "gnu")))'.dependencies]
+sentry-rust-minidump = { workspace = true }
 
 [features]
 # OFF by default: pull the OpenTelemetry stack and install the OTLP trace-export layer. The layer is

@@ -27,7 +27,8 @@ use daemon_swarm_coordinator::{
 
 use daemon_swarm_observe::desync::digest_tally_from_log;
 use daemon_swarm_observe::{
-    digest_tally, genesis_seed, replay, MessageKind, MessageLog, ReplayError, RunHealth,
+    digest_tally, genesis_seed, replay, replay_capture, replay_from_state, MessageKind, MessageLog,
+    ReplayError, RunCapture, RunHealth,
 };
 
 const RUN_ID: &str = "obs-run";
@@ -298,6 +299,69 @@ fn replay_matches_live_run() {
     // The re-derived final state is byte-identical to the live coordinator's (I1 replayability).
     let live_hash = daemon_swarm_proto::blake3_hash(&to_canonical_vec(&live_final).unwrap());
     assert_eq!(report.final_state_hash, live_hash);
+}
+
+// ----- OBS: RunCapture replays a recorded run (the --observe / swarm-replay path) -----
+
+#[test]
+fn run_capture_replays_recorded_run() {
+    let env = sample_envelope(3);
+    let params = CoordinatorParams::default();
+    let (live_final, trace) = live_run(&env, &params, 3);
+
+    // The node-visible message log: every signed message on the wire (incl. the coordinator's own
+    // published RoundRecords, which live_run appends to the trace as it would broadcast them).
+    let mut log = MessageLog::new(RUN_ID);
+    for input in &trace {
+        if let Input::Message(sm) = input {
+            log.append(sm.clone());
+        }
+    }
+
+    // The reproducible driver capture: the initial state + the driving inputs (messages + clocks),
+    // WITHOUT the coordinator's own RoundRecord publications (those are the oracle, re-supplied from
+    // the log by `replay_capture`).
+    let initial = CoordinatorState::new(
+        RunConfig::from_envelope(&env, params).unwrap(),
+        genesis_seed(&env).unwrap(),
+        0,
+    );
+    let driving: Vec<Input> = trace
+        .into_iter()
+        .filter(|i| {
+            !matches!(
+                i,
+                Input::Message(sm)
+                    if matches!(sm.payload, SwarmMessage::RoundRecord(_) | SwarmMessage::RoundOpen(_))
+            )
+        })
+        .collect();
+    let capture = RunCapture::new(initial.clone(), driving.clone());
+
+    // The capture round-trips through its on-disk framing byte-identically.
+    let mut bytes = Vec::new();
+    capture.write_to(&mut bytes).unwrap();
+    let read = RunCapture::read_from(&mut bytes.as_slice()).unwrap();
+    assert_eq!(read, capture);
+
+    // replay_capture re-derives every logged RoundRecord byte-identically (digest equality).
+    let report = replay_capture(capture, &log).expect("recorded run must re-derive");
+    assert_eq!(
+        report.rounds_verified, 3,
+        "all 3 recorded records re-derived"
+    );
+    let live_hash = daemon_swarm_proto::blake3_hash(&to_canonical_vec(&live_final).unwrap());
+    assert_eq!(
+        report.final_state_hash, live_hash,
+        "final state byte-identical"
+    );
+
+    // replay_from_state over driving-inputs-only produces the records with nothing to compare
+    // (no oracle in the stream) — it still re-derives 3 records, verifying 0.
+    let bare = replay_from_state(initial, driving.into_iter()).unwrap();
+    assert_eq!(bare.records.len(), 3);
+    assert_eq!(bare.rounds_verified, 0);
+    assert_eq!(bare.final_state_hash, live_hash);
 }
 
 // ----- OBS: a tampered record is caught, first-divergence pinpointed -----

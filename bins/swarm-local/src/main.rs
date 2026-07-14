@@ -74,6 +74,14 @@ struct Args {
     /// Worker binary for `--backend worker` (the real `daemon-train-worker`).
     #[arg(long, default_value = "daemon-train-worker")]
     worker_bin: PathBuf,
+    /// Write the registry `CreateRunRequest` JSON for this envelope to a file and exit (A3 —
+    /// the run-authoring half of Merge-1 Decision 1). The request carries the **declared
+    /// RunConfig** fields (`warmup_timeout_s`/`round_timeout_s`/`cooldown_s`/`global_batch`)
+    /// derived from the frozen envelope by THIS authoring tool, so the cloud registry forwards
+    /// them verbatim to the DO `init` with zero envelope parsing cloud-side (§11.1/§12). POST it:
+    /// `curl -X POST {base}/runs -H content-type:application/json -d @<path>`.
+    #[arg(long)]
+    emit_create_request: Option<PathBuf>,
 }
 
 /// The authoring TOML the runner parses (a small, operator-friendly subset of §6.1). The proto crate
@@ -267,6 +275,19 @@ async fn main() -> Result<()> {
     let frozen: FrozenEnvelope = envelope.freeze(&author).context("freeze envelope")?;
     frozen.verify().context("verify frozen envelope")?;
 
+    // A3 (Merge-1 Decision 1, the authoring half): emit the registry CreateRunRequest with the
+    // DECLARED RunConfig fields — the run author derives them from the envelope it just froze, so
+    // the cloud forwards them verbatim to the DO `init` with zero envelope parsing (§11.1/§12).
+    if let Some(path) = &args.emit_create_request {
+        let request = create_run_request(&envelope, &frozen)?;
+        write_create_request(path, &request)?;
+        println!(
+            "create-run request written : {} (declared warmup/round/cooldown/global_batch)",
+            path.display()
+        );
+        return Ok(());
+    }
+
     let peers = args.peers.clamp(min_peers.max(1), max_peers.max(1));
 
     println!("swarm-local — local run");
@@ -402,4 +423,57 @@ async fn run_worker(
 /// The run id from the frozen envelope's decoded body.
 fn frozen_run_id(frozen: &FrozenEnvelope) -> Result<String> {
     Ok(frozen.decode().context("decode envelope")?.run.run_id)
+}
+
+/// Build the cloud registry `CreateRunRequest` JSON body for a frozen envelope, carrying the
+/// **declared RunConfig** (Merge-1 Decision 1; A3): the coordination params
+/// (`warmup_timeout_s`/`round_timeout_s`/`cooldown_s`/`global_batch`) come from the envelope THIS
+/// authoring tool resolved + froze — the cloud never re-derives them. Matches the
+/// `packages/shared/src/swarm/types.ts` `CreateRunRequest` shape verbatim.
+fn create_run_request(envelope: &Envelope, frozen: &FrozenEnvelope) -> Result<serde_json::Value> {
+    use base64::Engine as _;
+    let artifacts: Vec<serde_json::Value> = envelope
+        .artifacts
+        .iter()
+        .map(|(name, art)| {
+            serde_json::json!({
+                "path": name,
+                "blake3": art.blake3.to_hex(),
+                "size": 0,
+            })
+        })
+        .collect();
+    let rounds = match envelope.data.stop {
+        StopCondition::Rounds(r) => Some(r),
+        _ => None,
+    };
+    Ok(serde_json::json!({
+        "run_id": envelope.run.run_id,
+        "schema": ENVELOPE_SCHEMA_MAJOR,
+        "proto_version": daemon_swarm_proto::SWARM_PROTO_VERSION,
+        "envelope_b64": base64::engine::general_purpose::STANDARD.encode(frozen.bytes()),
+        "author_pubkey": frozen.signer().to_hex(),
+        "signature": frozen.signature().to_hex(),
+        "artifacts": artifacts,
+        "update_max_bytes": u64::from(envelope.requirements.update_mb_max) * 1024 * 1024,
+        "min_peers": envelope.run.min_peers,
+        "max_peers": envelope.run.max_peers,
+        "rounds": rounds,
+        // Declared RunConfig (Merge-1 Decision 1) — envelope-derived, author-declared.
+        "warmup_timeout_s": envelope.phases.warmup,
+        "round_timeout_s": envelope.phases.round_train_max,
+        "cooldown_s": envelope.phases.cooldown,
+        "global_batch": envelope.data.global_batch.start,
+    }))
+}
+
+/// Write the emitted create-run request (a local dev-authoring output path — the same declared
+/// `#[allow]` rationale as [`read_envelope`]).
+#[allow(clippy::disallowed_methods)]
+fn write_create_request(path: &Path, request: &serde_json::Value) -> Result<()> {
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(request).context("encode request")?,
+    )
+    .with_context(|| format!("write create request {}", path.display()))
 }

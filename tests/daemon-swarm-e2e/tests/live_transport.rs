@@ -17,7 +17,7 @@
 // exception to the workspace `Command` ban, mirroring B2's `spawn_dev_relay`).
 #![allow(clippy::disallowed_methods)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 use std::time::Duration;
@@ -29,7 +29,9 @@ use daemon_swarm_run::backend::{
     TrainerBackend,
 };
 use daemon_swarm_run::engine::EngineEvent;
-use daemon_swarm_run::harness::{peer_key, LateJoin, SilentDeath, StallFault, SwarmConfig};
+use daemon_swarm_run::harness::{
+    peer_key, verify_observe_dir, LateJoin, SilentDeath, StallFault, SwarmConfig,
+};
 use daemon_swarm_run::live_harness::{run_live_swarm, run_live_swarm_with, LiveSwarmConfig};
 use daemon_swarm_run::seam::RoundId;
 use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig, WasmBackendError};
@@ -77,6 +79,45 @@ async fn live_flagship_three_peers_ten_rounds_all_agree() {
     assert!(
         replay.verify(),
         "the live-run tick trajectory replays byte-identically"
+    );
+}
+
+// ---- B2: observe record + replay over the real plane (--observe / swarm-replay) -----------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_observe_record_and_replay_green() {
+    // Record a live-transport run (3 peers, real iroh mesh) with observe: the coordinator's node
+    // captures every signed message into the log + the tick driver capture. Then re-derive it offline
+    // via `verify_observe_dir` (what `swarm-replay <dir>` runs) and assert every wire-recorded round
+    // record re-derives byte-identically — the gate-ceremony record+replay over the live plane.
+    let cfg = LiveSwarmConfig::new(SwarmConfig {
+        num_peers: 3,
+        num_rounds: 8,
+        ..SwarmConfig::small(8)
+    });
+    let run = run_live_swarm(cfg).await.expect("live observe run");
+    assert_all_agree(&run);
+
+    let dir = std::env::temp_dir().join(format!(
+        "daemon-swarm-observe-live-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    run.write_observe(&dir).expect("write observe artifacts");
+
+    let report = verify_observe_dir(&dir).expect("live recorded run must re-derive");
+    assert!(
+        report.all_verified(),
+        "all live round records re-derive ({}/{})",
+        report.rounds_verified,
+        report.logged_records
+    );
+    assert_eq!(report.rounds_verified, 8, "8 live rounds re-derived");
+    assert!(
+        report.health.rounds.iter().all(|r| r.finalized),
+        "every live round finalized in the health projection"
     );
 }
 
@@ -273,19 +314,82 @@ fn guest_dir() -> PathBuf {
     guests_root().join("target/wasm32-unknown-unknown/release")
 }
 
+/// RUSTFLAGS that make the guest `.wasm` byte-reproducible across checkouts/machines by remapping the
+/// absolute prefixes rustc embeds in panic locations (the `<checkout>` root + the cargo registry).
+/// MUST match `xtask build-guests` (`guest_remap_rustflags`) so a local rebuild reproduces the bytes
+/// recorded in the committed `guests/guests.blake3`.
+fn guest_remap_rustflags() -> String {
+    let root = guests_root();
+    let checkout = root.parent().unwrap_or(&root).to_path_buf();
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo"));
+    format!(
+        "--remap-path-prefix={}=/daemon-node --remap-path-prefix={}=/cargo",
+        checkout.display(),
+        cargo_home.display(),
+    )
+}
+
+/// Stale-guest guard (Merge-1 adjudication): compare every module named in the committed
+/// `guests/guests.blake3` against the `.wasm` in `dir`. A **missing / unreadable** module still
+/// fails loud — a genuinely absent or stale guest would otherwise surface downstream as a NaN loss,
+/// which is the failure this guard exists to prevent. A **hash mismatch**, by contrast, only WARNS:
+/// the guest `.wasm` is byte-reproducible run-to-run within one checkout but NOT across worktrees /
+/// machines. cargo derives each path-package's crate-disambiguator (`-C metadata`) from its absolute
+/// manifest dir, and `--remap-path-prefix` does not rewrite that hash, so symbol-hash-ordered codegen
+/// reorders the module's code/type/func/elem sections between worktrees (the remapped path *strings*
+/// are identical; only the ordering shifts). The committed manifest is therefore an advisory record
+/// of one canonical (trunk) build, NOT a cross-machine identity gate — see the Merge-1 decision in
+/// `docs/specs/swarm-p2-ledger.md`. Callers rebuild before loading, so the module in use is fresh.
+fn verify_guest_manifest(dir: &Path) {
+    let manifest = guests_root().join("guests.blake3");
+    let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {
+        panic!(
+            "read guest manifest {}: {e} — run `cargo run -p xtask -- build-guests`",
+            manifest.display()
+        )
+    });
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let (hex, name) = line
+            .split_once("  ")
+            .expect("guests.blake3 line must be `<blake3-hex>  <name>.wasm`");
+        let bytes = std::fs::read(dir.join(name))
+            .unwrap_or_else(|e| panic!("read guest module {}/{name}: {e}", dir.display()));
+        let got = blake3::hash(&bytes).to_hex();
+        if got.as_str() != hex {
+            eprintln!(
+                "warning: guest `{name}` in {} hashes {got} but committed guests.blake3 records \
+                 {hex}. This is expected across worktrees/machines (path-keyed codegen ordering, \
+                 not a stale artifact); the freshly-built module is used. If you changed guest \
+                 source, run `cargo run -p xtask -- build-guests` and commit guests/guests.blake3.",
+                dir.display()
+            );
+        }
+    }
+}
+
 static BUILD: Once = Once::new();
 
 fn ensure_built() {
     BUILD.call_once(|| {
         if std::env::var("SWARM_TEST_GUEST_DIR").is_ok() {
+            verify_guest_manifest(&guest_dir());
             return;
         }
         let status = Command::new("cargo")
             .current_dir(guests_root())
+            // Clear the devShell's `CARGO_TARGET_DIR` (pinned to the parent checkout) so the guests
+            // build into their own `guests/target/` where `guest_dir()` reads them, and remap the
+            // absolute source/registry prefixes so the built `.wasm` bytes stay byte-reproducible
+            // (matching the committed `guests.blake3` the stale-guest guard asserts).
+            .env_remove("CARGO_TARGET_DIR")
+            .env("RUSTFLAGS", guest_remap_rustflags())
             .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
             .status()
             .expect("run cargo for guests (dev shell provides the wasm target)");
         assert!(status.success(), "building guest modules failed");
+        verify_guest_manifest(&guest_dir());
     });
 }
 

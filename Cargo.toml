@@ -232,6 +232,15 @@ base64 = "0.22"
 # system memory probe for the hardware-aware quant recommender (RAM budget; VRAM is best-effort via
 # nvidia-smi, no GPU SDK link). default-features off keeps it to the system-info we use.
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# [swarm P2:C2] Windows DXGI/D3D12 VRAM+UMA probe for the swarm training WORKER only, per
+# swarm-windows-vram-design.md §4. Windows-only: the worker wires it under
+# `[target.'cfg(windows)'.dependencies]` and selects the API-module features there (design §4:
+# Win32_Foundation, Win32_Graphics_{Dxgi,Dxgi_Common,Direct3D,Direct3D12},
+# Win32_System_SystemInformation) — this workspace entry only pins the version. INERT until the C2
+# lane references it (no Cargo.lock/deny impact now); the `windows`/`windows-sys` crate family is
+# already resolved in-tree transitively (MIT OR Apache-2.0, already allow-listed). Never linked into
+# the node process and never built in the default (Linux) gate.
+windows = "0.62"
 # pure-Rust GGUF reader for metadata introspection (arch / context / ftype) without loading a model.
 gguf-rs = "0.1"
 clap = { version = "4", features = ["derive"] }
@@ -257,6 +266,14 @@ axum = { version = "0.8", features = ["ws"] }
 # Already resolved in the tree via axum's ws feature (same 0.29), so this adds no new crates. No
 # TLS features on purpose: `wss://` terminates at a reverse proxy for now.
 tokio-tungstenite = "0.29"
+# rustls 0.23 — already resolved transitively (the tree's aws-lc-rs TLS backbone). Declared here so
+# `daemon-swarm-net`'s WS client (the `ws` feature) can install the aws-lc-rs `CryptoProvider` as the
+# process default before its first `wss://` dial: the tree compiles BOTH aws-lc-rs (reqwest/egress —
+# the tree posture) and `ring` (pulled by `rustls-platform-verifier`), so rustls 0.23 cannot
+# auto-select a default provider and tokio-tungstenite's `ClientConfig::builder()` would panic. Kept
+# behind the `ws` feature (no default gate impact); default features carry aws_lc_rs, matching the
+# rest of the tree (no second crypto backend). Lock-unchanged (same 0.23.41 already pinned).
+rustls = "0.23"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

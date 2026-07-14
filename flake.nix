@@ -829,6 +829,77 @@
           }
         );
 
+        # ------------------------------------------------------------------------------------
+        # Windows device-probe lane (x86_64-pc-windows-gnu). The `daemon-train-probe` binary cross-
+        # built via the same MinGW toolchain as `daemon-windows`, so the DXGI/D3D12 VRAM/UMA probe
+        # (swarm-windows-vram-design.md; target-gated `windows` crate) can be deployed to and
+        # validated on the real RTX-5090 box (never build on-box). DEFAULT features only (`cpu`) —
+        # NO `wgpu`: the probe queries D3D12 `ARCHITECTURE1.UMA` + DXGI budgets directly, so it needs
+        # neither the DX12/Vulkan burn tree nor a live adapter, and the probe FFI is
+        # `#[cfg(windows)]`-gated (not feature-gated), so it is compiled in regardless.
+        #
+        # NB (recorded for Merge 2): the FULL `daemon-train-worker` bin cross-COMPILES cleanly under
+        # MinGW (`cargo check` green — wasmtime/burn/`windows` 0.62 all cross), but does NOT LINK: its
+        # always-on `sentry-rust-minidump` → `crash-handler` native-minidump path references the UCRT
+        # symbol `_invoke_watson`, which the mingw-w64 msvcrt import lib does not export. That is a
+        # daemon-telemetry/toolchain blocker (substrate crate), NOT the probe. The probe bin links +
+        # runs the identical `autotune` probe, so it is the honest validation artifact this wave.
+        # swarm-ledger-p2-c2 flake edit #2 (ADDITIVE lane output; Merge-2 review).
+        daemonTrainProbeWindowsDeps = craneLibWindows.buildDepsOnly (
+          windowsCommonArgs
+          // {
+            pname = "daemon-train-probe-windows-deps";
+            cargoExtraArgs = "-p daemon-train --bin daemon-train-probe";
+          }
+        );
+        daemon-train-probe-windows = craneLibWindows.buildPackage (
+          windowsCommonArgs
+          // {
+            pname = "daemon-train-probe-windows";
+            version = baseVersion;
+            cargoArtifacts = daemonTrainProbeWindowsDeps;
+            cargoExtraArgs = "-p daemon-train --bin daemon-train-probe";
+            DAEMON_BUILD_ID = buildId;
+          }
+        );
+
+        # ------------------------------------------------------------------------------------
+        # Windows training-worker lane (x86_64-pc-windows-gnu). The FULL `daemon-train-worker`
+        # cross-built via the same MinGW toolchain as `daemon-windows`, WITH the `swarm-net` feature
+        # (WS control plane + iroh gossip) so it live-attaches to the dev coordinator as a real
+        # heterogeneity peer at the P2 WAN gate. Deployed to the RTX-5090 box (never build on-box).
+        #
+        # UNBLOCKED by the Wave-3 daemon-telemetry fix (swarm-p2-ledger adjudication (f)): the
+        # always-on `sentry-rust-minidump` → `crash-handler` native-minidump path (UCRT
+        # `_invoke_watson`, unresolved by mingw-w64's msvcrt import lib) is now cfg-compiled OUT for
+        # `x86_64-pc-windows-gnu` (target-gated dep + `#[cfg]` in `daemon-telemetry/crash.rs`), so the
+        # worker LINKS. Rust-panic crash capture via `sentry` is retained; only the native-minidump
+        # monitor is absent on this one target (no behavior change on Linux/macOS/msvc-windows).
+        #
+        # Feature set = default `cpu` det lane + `swarm-net`; NO `wgpu`/`cuda`. The det lane — the
+        # cross-peer consensus bar — is CPU fp32 by contract (spec §5.6), so a Windows peer needs no
+        # GPU backend to byte-match Linux; the GPU heterogeneity at the gate rides the RADV/CUDA/Metal
+        # peers. aws-lc-sys (rustls' provider, pulled by `swarm-net`'s wss:// TLS) already cross-builds
+        # here via `windowsCommonArgs` (nasm + TARGET_CC), exactly like daemon-host's TLS stack.
+        # swarm-p2 C3 flake edit (ADDITIVE lane output; integration-owner-delegated flake rights).
+        daemonTrainWorkerWindowsDeps = craneLibWindows.buildDepsOnly (
+          windowsCommonArgs
+          // {
+            pname = "daemon-train-worker-windows-deps";
+            cargoExtraArgs = "-p daemon-train --bin daemon-train-worker --features swarm-net";
+          }
+        );
+        daemon-train-worker-windows = craneLibWindows.buildPackage (
+          windowsCommonArgs
+          // {
+            pname = "daemon-train-worker-windows";
+            version = baseVersion;
+            cargoArtifacts = daemonTrainWorkerWindowsDeps;
+            cargoExtraArgs = "-p daemon-train --bin daemon-train-worker --features swarm-net";
+            DAEMON_BUILD_ID = buildId;
+          }
+        );
+
         # The MeTTa symbolic-coprocessor worker, built WITH the real engine (`--features hyperon`).
         # This is a deliberately separate output, NOT part of the default workspace gate: the default
         # `daemon-metta` (fallback engine) and every other crate never link `hyperon`. The hyperon
@@ -872,6 +943,8 @@
             daemon-cli-windows
             daemon-infer-llama-windows
             daemon-infer-mistralrs-windows
+            daemon-train-probe-windows
+            daemon-train-worker-windows
             ;
           # Prebuilt llama.cpp (shared, CPU + Vulkan) matching the crate's vendored commit; consumed
           # by the dev shells via `LLAMA_PREBUILT_DIR` to compile the llama lane without cmake.
@@ -933,7 +1006,7 @@
         };
 
         devShells = let
-          defaultDevShell = craneLibDev.devShell {
+          defaultDevShell = craneLibDev.devShell ({
             # Worker engine toolchain (clang/libclang for bindgen, cmake for the GPU lanes) is present
             # so a dev can build an engine lane locally. The default `cargo test --workspace` still
             # builds only the stub worker — no engine, no cmake step.
@@ -950,9 +1023,6 @@
             # also makes the shared llama/ggml libs + libgomp resolvable when the worker runs in-shell
             # (e.g. `cargo test`, `cargo run`).
             LIBCLANG_PATH = libclangPath;
-            LLAMA_PREBUILT_DIR = "${llamaCpp}";
-            LLAMA_PREBUILT_SHARED = "1";
-            LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.vulkan-loader}/lib:${pkgs.gcc.cc.lib}/lib";
             SSL_CERT_FILE = caBundle;
             NIX_SSL_CERT_FILE = caBundle;
             # Pin cargo's build dir to the CHECKOUT's own target/, overriding any ambient
@@ -988,8 +1058,15 @@
                 pkgs.nodejs # provides npx for jscpd (not packaged in nixpkgs)
                 pkgs.just # task runner: the justfile recipes (lint / deny / test / coverage)
                 pkgs.python3 # execute_code tool: the child interpreter for its subprocess tests
-                pkgs.bubblewrap # execute_code tool: the OS sandbox (bwrap); tests guard on usability
               ]
+              # bubblewrap (bwrap) is the execute_code OS sandbox, but it is a Linux-only package
+              # (`meta.platforms = linux`) — pulling it unconditionally made `nix develop` REFUSE TO
+              # EVALUATE on aarch64-darwin ("Refusing to evaluate package 'bubblewrap-…' … not
+              # available on the requested hostPlatform"), blocking the M4 Mac fleet peer from
+              # building daemon-train at all (fleet-report-p2 §3). Gate it to Linux: bwrap has no
+              # macOS analogue and the sandbox tests already guard on its usability, so a mac dev
+              # shell simply omits it. Minimal honest fix (swarm-ledger-p2-c2 flake edit #1).
+              ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.bubblewrap ]
               ++ engineNativeInputs
               # Swarm transport lane (spec §7.4): the self-hosted `iroh-relay` binary B2 stands up
               # locally for the gossip control plane (relay URLs are pinned in the envelope). Added
@@ -999,7 +1076,21 @@
               # relay is a runtime tool only; the iroh Rust deps are gated behind `daemon-swarm-net`'s
               # `iroh` feature and never enter the default build.
               ++ lib.optionals (pkgs ? iroh-relay) [ pkgs.iroh-relay ];
-          };
+          }
+          # The prebuilt llama.cpp (LLAMA_PREBUILT_DIR + LD_LIBRARY_PATH) is a devshell CONVENIENCE
+          # for the Linux infer lanes, but realizing it forces a from-source llama.cpp build on shell
+          # ENTRY — and its Linux-shaped derivation FAILS on aarch64-darwin (cmake emits .dylib, the
+          # postInstall gate greps for libmtmd.so → "FATAL: libmtmd.so missing"), which blocked the
+          # M4 from entering the default shell at all (the second eval/realize blocker after
+          # bubblewrap; observed on the real M4, 2026-07-13). Darwin has its own Metal lanes
+          # (`daemon-infer-metal`, built via buildEngineWorker, not the prebuilt), so gate the
+          # prebuilt convenience to Linux: a mac default shell compiles the llama lane from source if
+          # ever needed. Minimal honest fix (swarm-ledger-p2-c2 flake edit #1b).
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            LLAMA_PREBUILT_DIR = "${llamaCpp}";
+            LLAMA_PREBUILT_SHARED = "1";
+            LD_LIBRARY_PATH = "${llamaCpp}/lib:${pkgs.vulkan-loader}/lib:${pkgs.gcc.cc.lib}/lib";
+          });
         in
         {
           default = defaultDevShell;
@@ -1139,6 +1230,55 @@
               NIX_SSL_CERT_FILE = caBundle;
               packages =
                 [ rustToolchain pkgs.rust-cbindgen ]
+                ++ engineNativeInputs
+                ++ [ cudaPkgs.cudatoolkit ];
+            };
+
+          # The swarm burn-cuda TRAINING lane (spec §10.1; the C2/P2 RunPod-4090 lane, Merge-2
+          # adjudication (c)). Distinct from the infer `.#cuda` shell above (which builds llama.cpp
+          # CUDA via cudatoolkit): this targets `cargo {build,test} -p daemon-train --features cuda`
+          # (burn-cuda -> cubecl-cuda -> cudarc; driver-API + NVRTC JIT at runtime) and the swarm
+          # det/parity suites, so it uses `craneLibDev` for the wasm32 guest toolchain (like
+          # `.#vulkan`). C3 flake edit (ADDITIVE lane output; integration-owner-delegated flake rights).
+          #
+          # HONEST nvrtc SHAPE (C2 finding, swarm-ledger-p2-c2 D5): nixpkgs-unstable has DROPPED the
+          # driver-matched nvrtc for the RunPod 4090's CUDA 12.4 driver (550.127.05) — it ships >=12.6,
+          # whose PTX the 12.4 driver rejects (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`). So nix supplies
+          # only the BUILD-TIME pieces (cudart headers via `CUDA_PATH`, libstdc++); the RUNTIME
+          # driver-matched nvrtc 12.4 (NVIDIA's pip wheel `nvidia-cuda-nvrtc-cu12==12.4.127`) + the host
+          # driver libs (libcuda / libnvidia-ptxjitcompiler / libnvidia-nvvm) are an OPERATOR-STAGED
+          # impure input for that one box, referenced via `DAEMON_CUDA_RUNTIME_DIR` (C2 staged it at
+          # `/root/cuda-rt-124`). This quarantines the single unavoidable impurity — the box's own
+          # driver userspace, which by construction cannot come from nix — to one env var; the flake
+          # stays pure + portable. cudarc dlopen's `libnvrtc.so.12` by soname, so the staged dir being
+          # FIRST on LD_LIBRARY_PATH wins over anything else. NB: there is NO cuda engine arm yet (C2
+          # adjudication): `--features cuda` compiles the dep tree and the det lane still runs CPU fp32
+          # (the consensus bar), so the det/parity suites PASS WITHOUT nvrtc; the staged runtime is
+          # needed only to construct an actual burn-cuda backend (C2's `(t+t).sum()=12` smoke).
+          cuda-train =
+            let
+              cudaPkgs = import nixpkgs {
+                inherit system;
+                config.allowUnfree = true;
+              };
+            in
+            craneLibDev.devShell {
+              LIBCLANG_PATH = libclangPath;
+              # Build-time cudart headers (NVRTC's `#include <cuda_runtime.h>`); NOT the toolkit's
+              # nvrtc (wrong CUDA level for the box driver — see above).
+              CUDA_PATH = "${cudaPkgs.cudatoolkit}";
+              LD_LIBRARY_PATH = "${pkgs.gcc.cc.lib}/lib";
+              SSL_CERT_FILE = caBundle;
+              NIX_SSL_CERT_FILE = caBundle;
+              shellHook = ''
+                if [ -n "''${DAEMON_CUDA_RUNTIME_DIR:-}" ]; then
+                  export LD_LIBRARY_PATH="''${DAEMON_CUDA_RUNTIME_DIR}:''${LD_LIBRARY_PATH}"
+                else
+                  echo "note(.#cuda-train): DAEMON_CUDA_RUNTIME_DIR unset — det/parity suites run on the CPU det lane (the consensus bar). To construct a burn-cuda backend, set it to the box's driver-matched CUDA runtime dir (nvrtc 12.4 + host driver libs; RunPod: /root/cuda-rt-124)." >&2
+                fi
+              '';
+              packages =
+                [ rustToolchainDev pkgs.rust-cbindgen ]
                 ++ engineNativeInputs
                 ++ [ cudaPkgs.cudatoolkit ];
             };

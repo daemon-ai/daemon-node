@@ -85,8 +85,17 @@ fn loss_parity_within_tolerance_160m() {
 fn throughput_within_budget_or_documented() {
     require_gpu!();
     let cfg = TinyLlamaCfg::llama_160m();
-    let warmup = 1usize;
-    let measured = 4u32;
+    // Warmup drops leading steps (lazy GPU bringup + cubecl autotune kernel compile); measured is the
+    // sample the mean±sd is taken over. Defaults keep the P1 gate identical (1 warmup + 4 measured);
+    // `M2_WGPU_WARMUP` / `M2_WGPU_MEASURED` raise them for a low-variance evidence run (B3 ledger).
+    let warmup: usize = std::env::var("M2_WGPU_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let measured: u32 = std::env::var("M2_WGPU_MEASURED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
     let steps = measured + warmup as u32;
     let batch = TokenBatch::tinystories(1);
 

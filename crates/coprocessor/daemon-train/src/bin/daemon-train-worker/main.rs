@@ -42,6 +42,10 @@
 //! representative micro-batch shape ([`SEQS`]/[`SEQ`]) both sides use.
 
 mod backend;
+/// The A3 live coordinator attach (RoundEngine over DualPlane + R2/Fs store). Behind the
+/// `swarm-net` feature so the default worker build never links the WS/TLS/iroh/QUIC tree.
+#[cfg(feature = "swarm-net")]
+mod live;
 mod transport;
 
 use daemon_provision::{CutChannel, CutWriter};
@@ -62,6 +66,16 @@ async fn main() {
     // runs the monitor server (then exits) in that copy before it touches the stdio cut. A no-op
     // unless the spawning node injected a DSN + `DAEMON_CRASH_CONSENT=1`.
     let _crash = daemon_telemetry::init_crash_reporting("train-worker");
+
+    // Fleet-validation readout (C2): print the same `hardware()` + `device_limits()` the live
+    // `Probe`/assess path computes, then exit — so a cross-built worker on a bare fleet box (Windows
+    // cmd.exe, macOS, RunPod) can report its DeviceLimits without hand-framing a CBOR `Probe`.
+    if std::env::var_os("DAEMON_TRAIN_PROBE").is_some() {
+        println!("hardware = {:#?}", backend::hardware());
+        println!("device_limits = {:#?}", backend::device_limits());
+        return;
+    }
+
     let channel = CutChannel::from_stdio();
     let (writer, mut reader) = channel.split();
 
@@ -78,6 +92,10 @@ async fn main() {
     // threaded into `JoinRun` so the worker consumes the verdict in-process (B3 lifecycle glue).
     let mut run: Option<backend::ResolvedRun> = None;
     let mut live_backend: Option<WasmBackend> = None;
+    // The A3 live coordinator attach handle (feature `swarm-net`): a running RoundEngine + event
+    // pump, stopped on Leave/Shutdown. `None` on the self-driven (WS-only / no-credentials) path.
+    #[cfg(feature = "swarm-net")]
+    let mut live_run: Option<live::LiveHandle> = None;
     let mut assessed_micro_batch: u32 = SEQS;
 
     while let Some(bytes) = reader.recv().await {
@@ -107,7 +125,12 @@ async fn main() {
                 },
                 Err(detail) => send(&writer, &worker_error(&detail)).await,
             },
-            Command::JoinRun { run_id, .. } => {
+            Command::JoinRun {
+                run_id,
+                coordinator,
+                credentials,
+                ..
+            } => {
                 let Some(resolved) = run.as_ref() else {
                     send(
                         &writer,
@@ -116,6 +139,54 @@ async fn main() {
                     .await;
                     continue;
                 };
+                // A3 live attach (feature `swarm-net`): if the node authored a `JoinCredentials`
+                // body, run the real RoundEngine over the live plane; otherwise fall back to the
+                // self-driven representative round (the T0 baseline, also the default-gate path).
+                #[cfg(feature = "swarm-net")]
+                if let Ok(creds) =
+                    daemon_swarm_run::protocol::JoinCredentials::from_bytes(&credentials)
+                {
+                    match live::join_and_run_live(
+                        &resolved.module,
+                        &resolved.config,
+                        &run_id,
+                        &coordinator,
+                        &creds,
+                        assessed_micro_batch,
+                        &writer,
+                    )
+                    .await
+                    {
+                        Ok(handle) => {
+                            if let Some(old) = live_run.take() {
+                                old.stop().await;
+                            }
+                            live_run = Some(handle);
+                        }
+                        Err(detail) => send(&writer, &worker_error(&detail)).await,
+                    }
+                    continue;
+                }
+                // A `swarm-net`-less build handed real live-attach credentials must fail LOUD:
+                // silently self-driving here starves the coordinator's min_peers barrier with no
+                // client-visible error (Merge-3 ceremony: a drifted RunPod artifact built without
+                // `swarm-net` stalled the WAN run this exact way — the Join was never dialed).
+                #[cfg(not(feature = "swarm-net"))]
+                if daemon_swarm_run::protocol::JoinCredentials::from_bytes(&credentials).is_ok() {
+                    send(
+                        &writer,
+                        &worker_error(
+                            "JoinRun carried live JoinCredentials but this worker was built \
+                             without the `swarm-net` feature — it cannot attach to a live \
+                             coordinator; rebuild with `--features swarm-net`",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                // Self-driven fallback (feature off, or no live credentials authored).
+                let _ = &coordinator;
+                let _ = &credentials;
                 match transport::join_and_run_round(
                     &resolved.module,
                     &resolved.config,
@@ -130,6 +201,16 @@ async fn main() {
                 }
             }
             Command::Throttle { paused, .. } => {
+                // The self-driven backend supports in-place pause/resume; the live-attach engine
+                // owns its backend exclusively, so a live pause is preemption-as-churn — stop the
+                // run (releasing the wasm instance, §10.5) and let the node re-issue JoinRun (durable
+                // intent, §10.3) to resume.
+                #[cfg(feature = "swarm-net")]
+                if paused {
+                    if let Some(handle) = live_run.take() {
+                        handle.stop().await;
+                    }
+                }
                 if let Some(b) = live_backend.as_mut() {
                     let r = if paused { b.pause() } else { b.resume() };
                     if let Err(e) = r {
@@ -137,9 +218,21 @@ async fn main() {
                     }
                 }
             }
-            Command::Leave { .. } => live_backend = None,
+            Command::Leave { .. } => {
+                live_backend = None;
+                #[cfg(feature = "swarm-net")]
+                if let Some(handle) = live_run.take() {
+                    handle.stop().await;
+                }
+            }
             Command::Ping => send(&writer, &Event::Pong).await,
-            Command::Shutdown => break,
+            Command::Shutdown => {
+                #[cfg(feature = "swarm-net")]
+                if let Some(handle) = live_run.take() {
+                    handle.stop().await;
+                }
+                break;
+            }
         }
     }
 }

@@ -28,6 +28,9 @@
 
 pub mod artifact;
 pub mod dedupe;
+/// Multiplex several [`ControlPlane`]s (WS + iroh gossip) with cross-plane content-hash dedupe
+/// (spec §7.1; A1) — the run survives one plane degrading.
+pub mod dual_plane;
 pub mod fetch;
 pub mod gossip;
 /// The real iroh-gossip control plane (spec §7.1; B2). Behind the off-default `iroh` feature so the
@@ -37,12 +40,19 @@ pub mod iroh_gossip;
 pub mod presign;
 pub mod r2_store;
 pub mod receipt;
+/// Run discovery + envelope fetch against the coordinator registry (spec §6.1/§11.1; A1).
+pub mod registry;
 pub mod seam;
 pub mod store;
 pub mod transport;
+/// The node WS coordinator client as a [`ControlPlane`] (spec §11.2; A1). Behind the off-default
+/// `ws` feature so the default workspace build never compiles the WS/TLS tree.
+#[cfg(feature = "ws")]
+pub mod ws_client;
 
 pub use artifact::{ArtifactCache, ArtifactRef, ArtifactResolver, ArtifactScheme};
 pub use dedupe::Deduper;
+pub use dual_plane::DualPlane;
 pub use fetch::{
     fetch_record_set, fetch_with_fallback, fetch_with_fallback_dyn, DownloadScheduler, ReadyRetry,
     RetryConfig, RetryPolicy, RetryQueueResult,
@@ -55,9 +65,12 @@ pub use presign::{
 };
 pub use r2_store::{r2_object_key, R2Store};
 pub use receipt::ReceiptProducer;
+pub use registry::{RegistryClient, RunArtifact, RunDescriptor};
 pub use seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};
 pub use store::FsPayloadStore;
 pub use transport::{ControlPlane, ControlSubscription, PayloadStat, PayloadStore};
+#[cfg(feature = "ws")]
+pub use ws_client::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
 
 /// Errors surfaced by the swarm transport.
 #[derive(Debug, thiserror::Error)]

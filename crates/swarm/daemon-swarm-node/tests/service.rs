@@ -14,7 +14,9 @@ use daemon_api::{
     NodeEvent, SwarmApi, SwarmEligibility, SwarmEvent, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode,
 };
 use daemon_swarm_node::service::{NodeFeed, SwarmError, WorkerControl};
-use daemon_swarm_node::{SwarmService, SwarmServiceParts, SwarmStore, EVENT_WINDOW};
+use daemon_swarm_node::{
+    DiscoveredRun, RunDiscovery, SwarmService, SwarmServiceParts, SwarmStore, EVENT_WINDOW,
+};
 use daemon_swarm_run::config::SwarmConfig;
 use daemon_swarm_run::protocol::{self, Eligibility, ErrorClass, Hardware, JoinPolicy, LeaveMode};
 use futures::StreamExt;
@@ -26,6 +28,8 @@ struct Calls {
     leaves: Vec<String>,
     throttles: usize,
     probes: usize,
+    /// The envelope bytes passed to each `assess` (proves the join flow fetched + assessed).
+    assessed_envelopes: Vec<Vec<u8>>,
     /// The args of the most recent `throttle` (the §10.5 governor lever): `(vram_cap_mb,
     /// duty_cycle_pct, paused)`.
     last_throttle: Option<(Option<u32>, Option<u8>, bool)>,
@@ -64,11 +68,13 @@ impl WorkerControl for FakeWorker {
         self.calls().probes += 1;
         Ok(self.hardware.clone())
     }
-    async fn assess(&self, _envelope: Vec<u8>) -> Result<Eligibility, SwarmError> {
+    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, SwarmError> {
+        self.calls().assessed_envelopes.push(envelope);
+        // A distinctive verdict so a test can tell the §6.5 assess path from the probe fallback.
         Ok(Eligibility {
             eligible: true,
-            reasons: vec![],
-            headroom: vec![],
+            reasons: vec!["assessed against envelope".into()],
+            headroom: vec![("assessed_micro_batch".into(), 64)],
         })
     }
     async fn join(
@@ -120,6 +126,7 @@ fn service(config: SwarmConfig, worker: Arc<FakeWorker>, feed: Option<NodeFeed>)
         store: SwarmStore::open_in_memory().unwrap(),
         worker,
         feed,
+        discovery: None,
     })
 }
 
@@ -158,6 +165,7 @@ async fn join_persists_and_reload_reconverges() {
             store: SwarmStore::open(&path).unwrap(),
             worker: worker.clone(),
             feed: None,
+            discovery: None,
         });
         svc.swarm_join("run-a".into(), policy(), "op-a".into())
             .await
@@ -181,6 +189,7 @@ async fn join_persists_and_reload_reconverges() {
             store: SwarmStore::open(&path).unwrap(),
             worker: worker.clone(),
             feed: None,
+            discovery: None,
         });
         let rejoined = svc.start().await.unwrap();
         assert_eq!(rejoined, 1, "only the active intent re-converges");
@@ -389,6 +398,91 @@ fn swarm_events_log_is_windowed() {
     } else {
         panic!("expected Phase");
     }
+}
+
+/// A fake discovery seam: resolves one run to a fixed coordinator + envelope, recording the calls.
+struct FakeDiscovery {
+    coordinator: String,
+    envelope: Vec<u8>,
+}
+
+#[async_trait]
+impl RunDiscovery for FakeDiscovery {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, SwarmError> {
+        Ok(vec![self.run("run-disc")])
+    }
+    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, SwarmError> {
+        Ok(Some(self.run(run_id)))
+    }
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, SwarmError> {
+        Ok(self.envelope.clone())
+    }
+}
+
+impl FakeDiscovery {
+    fn run(&self, run_id: &str) -> DiscoveredRun {
+        DiscoveredRun {
+            run_id: run_id.to_string(),
+            coordinator: self.coordinator.clone(),
+            envelope_hash: "deadbeef".into(),
+            proto_version: 3,
+        }
+    }
+}
+
+/// With a discovery seam, `swarm_join` discovers the run, fetches the frozen envelope, and derives
+/// eligibility from the worker's real §6.5 `AssessRun` (not the probe), taking the coordinator from
+/// discovery — the A1 join flow.
+#[tokio::test]
+async fn join_discovers_fetches_envelope_and_assesses() {
+    let worker = FakeWorker::new();
+    let discovery = Arc::new(FakeDiscovery {
+        coordinator: "https://coord.example/api/v1/swarm".into(),
+        envelope: b"frozen-envelope-bytes".to_vec(),
+    });
+    let svc = SwarmService::new(SwarmServiceParts {
+        config: enabled_config(),
+        store: SwarmStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(discovery),
+    });
+
+    svc.swarm_join("run-disc".into(), policy(), "op".into())
+        .await
+        .unwrap();
+
+    // The envelope was fetched and handed to AssessRun; the probe path was NOT taken.
+    {
+        let c = worker.calls();
+        assert_eq!(
+            c.assessed_envelopes,
+            vec![b"frozen-envelope-bytes".to_vec()]
+        );
+        assert_eq!(
+            c.probes, 0,
+            "assess supersedes the probe when discovery is configured"
+        );
+        assert_eq!(c.joins, vec!["run-disc"]);
+    }
+
+    // The persisted run carries the discovery coordinator + the assess-derived eligibility.
+    let detail = svc
+        .swarm_run_detail("run-disc".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.coordinator, "https://coord.example/api/v1/swarm");
+    assert!(detail.summary.eligibility.eligible);
+    assert_eq!(
+        detail
+            .summary
+            .eligibility
+            .headroom
+            .get("assessed_micro_batch"),
+        Some(&64),
+        "eligibility came from AssessRun, not the hardware probe"
+    );
 }
 
 /// Drain `n` items from a subscription stream (with a timeout so a bug can't hang the test).

@@ -16,6 +16,14 @@ name = "swarm-local"
 path = "src/bin/swarm-local.rs"
 required-features = ["iroh"]
 
+# The recorded-run verification entry point (B2): replays `--observe` artifacts through the pure
+# coordinator `tick` and asserts per-round consensus re-derives. Needs `harness` (observe + the
+# coordinator shell) but NOT `iroh` — it verifies offline from files, so it builds transport-free.
+[[bin]]
+name = "swarm-replay"
+path = "src/bin/swarm-replay.rs"
+required-features = ["harness"]
+
 [features]
 # `harness` exposes the in-process multi-peer test harness + the real `daemon-swarm-coordinator`
 # pure `tick` loop driver (the impure shell that signs/publishes the coordinator's unsigned
