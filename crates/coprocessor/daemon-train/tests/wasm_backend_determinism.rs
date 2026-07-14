@@ -692,3 +692,121 @@ mod cross_backend_wgpu {
         assert_cross_backend_wgpu("demo", 6);
     }
 }
+
+// -- cross-backend det-digest equality, cpu vs CUDA (P3 Lane G — program Risk 2's tripwire) --------
+//
+// Same structure as `cross_backend_wgpu` above, with the burn peer on `BackendKind::Cuda` (a real
+// NVIDIA device). The det lane never touches the GPU (`BurnBackend` materializes host-side and runs
+// det-core, ABI §5.9), so the det digests MUST stay **byte-identical** to the CpuBackend peer while
+// the native lanes (losses, payloads) diverge — the "byte-identical by construction" claim (both
+// peers ingest the SAME committed set; the CUDA peer's own native math differs but the shared det-lane
+// fold is bit-exact). GPU-skip convention: skips loudly when no CUDA device.
+#[cfg(feature = "cuda")]
+mod cross_backend_cuda {
+    use super::*;
+    use daemon_train::{cuda_adapter_available, BackendKind};
+
+    fn backend_with(config: &[u8], kind: BackendKind) -> WasmBackend {
+        let mut b = WasmBackend::new(WasmBackendConfig {
+            wasm: tiny_llama_wasm(),
+            engine: EngineConfig {
+                backend: kind,
+                ..EngineConfig::default()
+            },
+        })
+        .expect("construct WasmBackend");
+        b.build(config).expect("da_build");
+        b
+    }
+
+    fn train_fixed(
+        b: &mut WasmBackend,
+        steps: u32,
+        round: u64,
+        fixed: &BatchRef,
+        first: &mut f32,
+        last: &mut f32,
+    ) -> Vec<u8> {
+        for step in 0..steps {
+            let stats = b.train_step(fixed, ctx(step)).expect("train_step");
+            if first.is_nan() {
+                *first = stats.loss;
+            }
+            *last = stats.loss;
+            b.inner_update(step).expect("inner_update");
+        }
+        b.make_update(round).expect("make_update")
+    }
+
+    /// The full round-loop smoke on CUDA (the Lane G det-digest gate): the tiny-llama loop trains on
+    /// the GPU (loss decreases), and the det-lane digest transcript is byte-identical to a CpuBackend
+    /// peer ingesting the same committed set — for `rounds` rounds.
+    fn assert_cross_backend_cuda(profile: &str, rounds: u64) {
+        if !cuda_adapter_available() {
+            eprintln!(
+                "SKIP cross_backend_cuda::{profile}: no usable CUDA device on this runner \
+                 (run in .#cuda-train on a CUDA box — swarm-ledger-p3-g)"
+            );
+            return;
+        }
+        let config = cbor(&tiny_cfg(profile));
+        let mut cpu = backend_with(&config, BackendKind::Cpu);
+        let mut cuda = backend_with(&config, BackendKind::Cuda);
+        let steps = cpu.steps_per_round().expect("steps_per_round");
+        let fixed = batch(0xF00D);
+        let (mut cf, mut cl) = (f32::NAN, f32::NAN);
+        let (mut gf, mut gl) = (f32::NAN, f32::NAN);
+        let mut transcript = Vec::new();
+        let mut diverged = false;
+        for round in 0..rounds {
+            let pa = train_fixed(&mut cpu, steps, round, &fixed, &mut cf, &mut cl);
+            let pb = train_fixed(&mut cuda, steps, round, &fixed, &mut gf, &mut gl);
+            diverged |= pa != pb;
+            let set = vec![staged(0x01, &pa), staged(0x02, &pb)];
+            let da = cpu.ingest(round, &set).expect("ingest cpu");
+            let db = cuda.ingest(round, &set).expect("ingest cuda");
+            assert_eq!(
+                da,
+                db,
+                "{profile} r{round}: cpu-vs-cuda det digest must be bit-identical (cpu {} vs cuda {})",
+                da.to_hex(),
+                db.to_hex()
+            );
+            transcript.push(da);
+        }
+        assert!(
+            transcript.windows(2).any(|w| w[0] != w[1]),
+            "{profile}: the digest transcript must evolve across rounds"
+        );
+        assert!(
+            diverged,
+            "{profile}: cuda vs cpu native payloads should differ (tolerance-class native lane)"
+        );
+        assert!(
+            cf.is_finite() && cl.is_finite() && gf.is_finite() && gl.is_finite(),
+            "{profile}: losses finite (cpu {cf}->{cl}, cuda {gf}->{gl})"
+        );
+        assert!(cl < cf, "{profile}: cpu loss must decrease ({cf} -> {cl})");
+        assert!(gl < gf, "{profile}: cuda loss must decrease ({gf} -> {gl})");
+        eprintln!(
+            "cross_backend_cuda::{profile}: {} rounds, digests identical; \
+             cpu loss {cf:.4}->{cl:.4}, cuda loss {gf:.4}->{gl:.4}",
+            transcript.len()
+        );
+    }
+
+    #[test]
+    fn cross_backend_det_digest_cuda_sparse_loco() {
+        assert_cross_backend_cuda("sparse_loco", 6);
+    }
+
+    #[test]
+    fn cross_backend_det_digest_cuda_diloco() {
+        assert_cross_backend_cuda("diloco", 6);
+    }
+
+    #[test]
+    fn cross_backend_det_digest_cuda_demo() {
+        assert_cross_backend_cuda("demo", 6);
+    }
+}
