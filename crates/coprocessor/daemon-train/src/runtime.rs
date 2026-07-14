@@ -45,6 +45,12 @@ pub enum BackendKind {
     /// det-core fp32, bit-identical to `Cpu`). Device chosen by [`EngineConfig::gpu_index`].
     #[cfg(feature = "wgpu")]
     Wgpu,
+    /// The burn-cuda autodiff engine (NVIDIA CUDA / NVRTC JIT; native lane = tolerance class, det
+    /// lane = det-core fp32, bit-identical to `Cpu`). Device chosen by [`EngineConfig::gpu_index`].
+    /// The 4090-validated discrete lane (swarm-ledger-p3-g); mirrors the `Wgpu` arm exactly (a burn
+    /// `AutodiffBackend` type-parameter swap behind the same `BurnBackend<B>`).
+    #[cfg(feature = "cuda")]
+    Cuda,
 }
 
 /// Fixed host-side settings that affect observable semantics (ABI §2.2/§8).
@@ -234,6 +240,18 @@ impl HostState {
                     None => burn::backend::wgpu::WgpuDevice::default(),
                 };
                 Box::new(crate::burn_backend::BurnWgpuBackend::with_device(device))
+            }
+            #[cfg(feature = "cuda")]
+            BackendKind::Cuda => {
+                // The CUDA analogue of the wgpu arm (swarm-ledger-p3-g D2): run the memoized probe
+                // first as the canonical device bring-up (cuInit + total-VRAM query + a device
+                // handle), then slot `BurnBackend<Autodiff<Cuda>>` into the same seam. Device per
+                // `gpu_index` (None = device 0). cudarc dlopens libcuda + JITs via NVRTC lazily on
+                // the first tensor op, so construction here is cheap.
+                let _ = crate::autotune::probe_cuda();
+                let device =
+                    burn::backend::cuda::CudaDevice::new(cfg.gpu_index.unwrap_or(0) as usize);
+                Box::new(crate::burn_backend::BurnCudaBackend::with_device(device))
             }
         };
         Self {

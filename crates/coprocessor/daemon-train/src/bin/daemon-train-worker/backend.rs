@@ -201,6 +201,26 @@ pub(crate) fn hardware() -> Hardware {
             };
         }
     }
+    // CUDA (P3 Lane G): the driver exposes total dedicated VRAM directly (`cuDeviceTotalMem`), so a
+    // discrete NVIDIA box reports real VRAM + `["cuda","cpu"]` lanes, no UMA (swarm-ledger-p3-g).
+    // Checked before wgpu so a box built `--features cuda` (RunPod 4090) reports the CUDA lane.
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(p) = daemon_train::autotune::probe_cuda() {
+            return Hardware {
+                gpus: p.gpus,
+                vram_mb: p.vram_mb,
+                shared_mb: 0,
+                ram_mb,
+                backend_lanes: vec!["cuda".to_string(), "cpu".to_string()],
+                capabilities: host_capabilities(),
+                up_kbps: 0,
+                down_kbps: 0,
+                disk_free_mb: 0,
+                throughput_class: "c1".to_string(),
+            };
+        }
+    }
     #[cfg(feature = "wgpu")]
     {
         if let Some(p) = daemon_train::autotune::probe_wgpu() {
@@ -268,6 +288,14 @@ pub(crate) fn device_limits() -> DeviceLimits {
     {
         if let Some(dl) = daemon_train::autotune::probe_macos_device_limits() {
             return dl;
+        }
+    }
+    // CUDA (P3 Lane G): discrete-device budget from the driver's total-VRAM query (24 GB on the
+    // 4090), `shared_mb = 0`, `unified = false` — the discrete verdict path (swarm-ledger-p3-g D3).
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(p) = daemon_train::autotune::probe_cuda() {
+            return daemon_train::autotune::cuda_device_limits(p.vram_mb, p.max_alloc_mb, ram_mb);
         }
     }
     #[cfg(feature = "wgpu")]
@@ -369,4 +397,40 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
             ("param_bytes".to_string(), report.param_bytes as i64),
         ],
     })
+}
+
+/// The engine backend + GPU index the live worker drives its **native** lane on (§10.5 verdict path;
+/// swarm-ledger-p3-g D4).
+///
+/// When the `cuda` feature is built AND a CUDA device is present, select the CUDA arm (device 0);
+/// otherwise the CPU det-lane default. The det lane stays host fp32 on either backend, so a CUDA
+/// peer's post-ingest digests are byte-identical to CPU peers ingesting the same committed set (the
+/// consensus invariant is unchanged — the CUDA arm only accelerates the tolerance-class native lane).
+///
+/// `DAEMON_TRAIN_BACKEND=cpu` forces the CPU lane even when a GPU is present (an operator escape hatch
+/// for a box whose driver-matched NVRTC is not staged — the backend would otherwise fail on the first
+/// device op). Returns `(BackendKind, gpu_index)` for the [`daemon_train::EngineConfig`].
+///
+/// Only the live-attach path (`swarm-net`) consumes this; a probe-only or default worker never
+/// selects a backend, so it is gated with its sole caller (`live.rs`).
+#[cfg(feature = "swarm-net")]
+pub(crate) fn select_backend() -> (daemon_train::BackendKind, Option<u32>) {
+    if std::env::var("DAEMON_TRAIN_BACKEND").as_deref() == Ok("cpu") {
+        return (daemon_train::BackendKind::Cpu, None);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(p) = daemon_train::autotune::probe_cuda() {
+            eprintln!(
+                "daemon-train-worker: selecting CUDA native lane (device 0: {}, {} MiB VRAM); \
+                 det lane stays host fp32 (consensus-invariant)",
+                p.adapter, p.vram_mb
+            );
+            return (daemon_train::BackendKind::Cuda, Some(0));
+        }
+        eprintln!(
+            "daemon-train-worker: cuda feature built but no CUDA device present — CPU det lane"
+        );
+    }
+    (daemon_train::BackendKind::Cpu, None)
 }

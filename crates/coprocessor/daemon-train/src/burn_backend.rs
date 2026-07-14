@@ -56,10 +56,11 @@
 //! rank internally and flatten back; `reshape@1` is an autodiff identity (a tensor clone that keeps
 //! the graph edge).
 
-// Compiles for the G1 `burn-ndarray` (CPU) lane and the G2 `wgpu` (Vulkan/RADV) lane. The generic
-// impl below touches only burn-tensor (always on via the root dep); the concrete backend aliases
-// are feature-gated so a single-lane build pulls only its own backend tree.
-#![cfg(any(feature = "burn-ndarray", feature = "wgpu"))]
+// Compiles for the G1 `burn-ndarray` (CPU) lane, the G2 `wgpu` (Vulkan/RADV) lane, and the P3 Lane-G
+// `cuda` (NVIDIA/NVRTC) lane. The generic impl below touches only burn-tensor (always on via the root
+// dep); the concrete backend aliases are feature-gated so a single-lane build pulls only its own
+// backend tree.
+#![cfg(any(feature = "burn-ndarray", feature = "wgpu", feature = "cuda"))]
 
 use std::cell::OnceCell;
 
@@ -81,6 +82,16 @@ pub type BurnNdarrayBackend = BurnBackend<burn::backend::Autodiff<burn::backend:
 #[cfg(feature = "wgpu")]
 pub type BurnWgpuBackend = BurnBackend<burn::backend::Autodiff<burn::backend::Wgpu>>;
 
+/// [`BurnBackend`] on the CUDA backend + autodiff (NVIDIA/NVRTC at runtime) — the P3 Lane-G GPU lane
+/// (RunPod 4090, swarm-ledger-p3-g). Like [`BurnWgpuBackend`], the type parameter is the *only*
+/// change from [`BurnNdarrayBackend`]: `Autodiff<Cuda>` instead of `Autodiff<NdArray>`. `burn::backend::Cuda`
+/// is `Fusion<CubeBackend<CudaRuntime, …>>`; cudarc dlopens libcuda and cubecl JITs kernels via NVRTC
+/// lazily on the first tensor op on its device. The det lane still runs `det_core` host-side fp32
+/// (§5.9), so the consensus digest stays byte-identical to `Cpu` (the cross-backend digest test guards
+/// it).
+#[cfg(feature = "cuda")]
+pub type BurnCudaBackend = BurnBackend<burn::backend::Autodiff<burn::backend::Cuda>>;
+
 /// Whether a usable wgpu adapter can be brought up on the default device (the **GPU-skip test
 /// convention**, TDD §8.1 tier-2). Returns `false` — never panics — when no adapter is available,
 /// so GPU-needing tests skip cleanly on GPU-less runners while the default CI gate stays green.
@@ -93,6 +104,17 @@ pub type BurnWgpuBackend = BurnBackend<burn::backend::Autodiff<burn::backend::Wg
 #[must_use]
 pub fn wgpu_adapter_available() -> bool {
     crate::autotune::probe_wgpu().is_some()
+}
+
+/// Whether a usable CUDA device can be brought up (the **GPU-skip test convention**, TDD §8.1
+/// tier-2) — the CUDA analogue of [`wgpu_adapter_available`]. Returns `false` — never panics — when
+/// no device / driver is present, so CUDA-needing tests skip cleanly on GPU-less runners while the
+/// default CI gate stays green. Delegates to the memoized [`crate::autotune::probe_cuda`], which
+/// wraps the `cuInit`/device query in `catch_unwind`.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn cuda_adapter_available() -> bool {
+    crate::autotune::probe_cuda().is_some()
 }
 
 /// One live tensor: the burn tensor + a **lazily-materialized** host cache backing

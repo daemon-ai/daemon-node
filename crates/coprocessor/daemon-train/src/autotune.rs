@@ -500,6 +500,110 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
 }
 
 // =====================================================================================
+// CUDA device-memory probe (P3 Lane G — swarm-ledger-p3-g D3). Unlike wgpu, the CUDA driver exposes
+// total device memory (`cuDeviceTotalMem`), so `vram_mb` is the real dedicated VRAM (24564 MiB on the
+// RunPod 4090) — a discrete-device honest number (no UMA on this card). The pure mapper is
+// unconditional (fixture-tested); the driver query is `#[cfg(feature = "cuda")]` (dlopen'd libcuda).
+// =====================================================================================
+
+/// Map probed CUDA device numbers to [`DeviceLimits`] — a **discrete** NVIDIA GPU: dedicated
+/// `vram_mb` (from `cuDeviceTotalMem`), **no** shared spill pool, **no** UMA. Unconditional + pure so
+/// it is fixture-tested on every platform; the `catch_unwind`-wrapped driver query
+/// ([`probe_cuda`]) is feature-gated.
+///
+/// `shared_mb = 0` / `unified = false` put the [`Autotune::verdict`] on the discrete path (dedicated
+/// VRAM is the whole GPU budget; the joint-pool UMA math never applies), matching the P2 probe matrix
+/// for the 4090 (24 GB discrete).
+#[must_use]
+pub fn cuda_device_limits(vram_mb: u64, max_alloc_mb: u64, ram_mb: u64) -> DeviceLimits {
+    DeviceLimits {
+        vram_mb,
+        ram_mb,
+        max_alloc_mb,
+        shared_mb: 0,
+        unified: false,
+    }
+}
+
+/// A honest snapshot of what a CUDA device exposes for resource planning (feature `cuda`).
+///
+/// The CUDA driver DOES expose total VRAM (unlike wgpu), so [`Self::vram_mb`] is the real dedicated
+/// memory. CUDA has no wgpu-style per-buffer ceiling (a single `cudaMalloc` may span most of VRAM), so
+/// [`Self::max_alloc_mb`] reports total VRAM as an honest upper bound (the verdict's per-buffer gate
+/// then only rejects a single tensor larger than the whole card). Discrete NVIDIA ⇒ `unified = false`.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CudaProbe {
+    /// Usable devices found (`1` when device 0 initializes; multi-device enumeration is not needed
+    /// for the single-host lane).
+    pub gpus: u32,
+    /// Total dedicated VRAM in MiB (`cuDeviceTotalMem`) — the true device budget (24564 on the 4090).
+    pub vram_mb: u64,
+    /// Largest single allocation in MiB — reported as total VRAM (no CUDA per-buffer ceiling).
+    pub max_alloc_mb: u64,
+    /// The device name (`cuDeviceGetName`, e.g. "NVIDIA GeForce RTX 4090").
+    pub adapter: String,
+    /// Discrete NVIDIA GPUs do not share host DRAM: always `false` (the verdict's discrete path).
+    pub unified: bool,
+}
+
+/// Probe CUDA device 0 for its total VRAM + name (feature `cuda`). Returns `None` (never panics) when
+/// no device / driver is present — the GPU-skip convention (mirrors [`probe_wgpu`]).
+///
+/// **Memoized process-wide.** The query is `cuInit` + `cuDeviceGet` + `cuDeviceTotalMem` +
+/// `cuDeviceGetName` via `cudarc` (which dlopens libcuda under nix glibc — proven on the 4090
+/// container, swarm-ledger-p2-c2). Wrapped in `catch_unwind` so a missing-libcuda dlopen panic (e.g.
+/// on a CUDA-less host running the feature build) reports "no device" instead of aborting the process.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn probe_cuda() -> Option<CudaProbe> {
+    use std::sync::OnceLock;
+    static PROBE: OnceLock<Option<CudaProbe>> = OnceLock::new();
+    PROBE.get_or_init(probe_cuda_uncached).clone()
+}
+
+#[cfg(feature = "cuda")]
+fn probe_cuda_uncached() -> Option<CudaProbe> {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let attempt = std::panic::catch_unwind(cuda_ffi::query_device0);
+    std::panic::set_hook(prev);
+    attempt.ok().flatten()
+}
+
+// The one cudarc-touching module. `cuDeviceTotalMem` is a `cudarc` `unsafe fn`, so this module carries
+// the scoped `#[allow(unsafe_code)]` under the crate's `#![deny(unsafe_code)]` — the identical pattern
+// the Windows/macOS FFI probes use (swarm-ledger-p2-c2 D1). cudarc is a cuda-gated, lock-neutral dep
+// (already resolved via cubecl-cuda; swarm-ledger-p3-g D3).
+#[cfg(feature = "cuda")]
+#[allow(unsafe_code)]
+mod cuda_ffi {
+    use super::{CudaProbe, MIB};
+
+    /// Query device 0's total VRAM + name via the CUDA driver API. `None` on any driver error.
+    pub(super) fn query_device0() -> Option<CudaProbe> {
+        use cudarc::driver::result::{device, init};
+        init().ok()?;
+        let dev = device::get(0).ok()?;
+        // SAFETY: `dev` is a `CUdevice` handle just returned by `device::get(0)`, the exact contract
+        // `total_mem`'s safety comment requires.
+        let total_bytes = unsafe { device::total_mem(dev) }.ok()?;
+        let vram_mb = (total_bytes as u64) / MIB;
+        if vram_mb == 0 {
+            return None;
+        }
+        let adapter = device::get_name(dev).unwrap_or_else(|_| "NVIDIA CUDA device".to_string());
+        Some(CudaProbe {
+            gpus: 1,
+            vram_mb,
+            max_alloc_mb: vram_mb,
+            adapter,
+            unified: false,
+        })
+    }
+}
+
+// =====================================================================================
 // Windows DXGI/D3D12 device-memory probe (swarm-windows-vram-design.md §2 mapping).
 // The pure mapper + raw struct are unconditional (fixture-tested on every platform); the
 // actual DXGI/D3D12 FFI is `#[cfg(windows)]` + target-gated `windows` dep.
@@ -1252,6 +1356,32 @@ mod tests {
             "a RAM-fitting model must be eligible on VGM: {:?}",
             fits.verdict(&limits, DEFAULT_MAX_MICROBATCH)
         );
+    }
+
+    /// `cuda_discrete_maps_dedicated_vram_no_uma` (P3 Lane G): the RunPod-4090 numbers map to a
+    /// discrete budget — `vram_mb` = dedicated VRAM (`cuDeviceTotalMem`), `shared_mb = 0`,
+    /// `unified = false` — and the 160M preset is eligible with margin on the discrete verdict path
+    /// (no UMA joint pool). Pure mapper test (the driver query is feature-gated).
+    #[test]
+    fn cuda_discrete_maps_dedicated_vram_no_uma() {
+        // 4090: 24564 MiB dedicated VRAM, 124 GiB host RAM (RunPod container).
+        let limits = cuda_device_limits(24_564, 24_564, 124_000);
+        assert_eq!(limits.vram_mb, 24_564);
+        assert_eq!(limits.shared_mb, 0, "discrete: no shared spill pool");
+        assert!(!limits.unified, "no UMA on the 4090");
+        // Discrete-path budget = vram only (shared 0), and 160M (~2.9 GiB fixed) fits with margin.
+        let effective = limits.vram_mb + limits.shared_mb * 9 / 10;
+        assert_eq!(effective, 24_564);
+        let m160 = llama_model(151_862_784, 50_257, 768, 128 * MIB);
+        let v = m160.verdict(&limits, DEFAULT_MAX_MICROBATCH);
+        assert!(v.eligible, "160M eligible on a 24 GB discrete 4090: {v:?}");
+        assert!(v.micro_batch >= 1);
+        // A single tensor larger than the whole card is still (correctly) rejected.
+        let oversized = Autotune {
+            max_tensor_bytes: 25_000 * MIB,
+            ..llama_model(151_862_784, 50_257, 768, 128 * MIB)
+        };
+        assert!(!oversized.verdict(&limits, DEFAULT_MAX_MICROBATCH).eligible);
     }
 
     /// `windows_warp_skipped`: a software (WARP) adapter maps to `None` so enumeration skips it.
