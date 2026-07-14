@@ -876,17 +876,22 @@
         # worker LINKS. Rust-panic crash capture via `sentry` is retained; only the native-minidump
         # monitor is absent on this one target (no behavior change on Linux/macOS/msvc-windows).
         #
-        # Feature set = default `cpu` det lane + `swarm-net`; NO `wgpu`/`cuda`. The det lane — the
-        # cross-peer consensus bar — is CPU fp32 by contract (spec §5.6), so a Windows peer needs no
-        # GPU backend to byte-match Linux; the GPU heterogeneity at the gate rides the RADV/CUDA/Metal
-        # peers. aws-lc-sys (rustls' provider, pulled by `swarm-net`'s wss:// TLS) already cross-builds
+        # Feature set = `swarm-net` + `wgpu` (P3 Merge-2, the D5 fat-worker alignment). The P2-era
+        # shape was `swarm-net` ONLY ("the det lane needs no GPU backend to byte-match Linux") —
+        # correct for consensus at tiny-llama scale, but it contradicts the D5 packaging decision
+        # (ndarray+wgpu+cuda unioned, runtime probe ladder) and collapses at 160M: a CPU-det Windows
+        # peer cannot meet the barrier round wall (confirmed live at the Merge-2 ceremony — GPU peers
+        # finished a 160M round in seconds, the CPU-det 5090 box needed >15 min). `wgpu` gives the
+        # honest Windows GPU rung (DX12/Vulkan via windows-rs/ash — pure Rust, MinGW-crossable); NO
+        # `cuda` on windows this wave (the D6 nvrtc fetch-on-demand fetcher is not built yet).
+        # aws-lc-sys (rustls' provider, pulled by `swarm-net`'s wss:// TLS) already cross-builds
         # here via `windowsCommonArgs` (nasm + TARGET_CC), exactly like daemon-host's TLS stack.
-        # swarm-p2 C3 flake edit (ADDITIVE lane output; integration-owner-delegated flake rights).
+        # Integration-owner flake edit (frozen-file rule), recorded in swarm-p3-ledger Merge-2.
         daemonTrainWorkerWindowsDeps = craneLibWindows.buildDepsOnly (
           windowsCommonArgs
           // {
             pname = "daemon-train-worker-windows-deps";
-            cargoExtraArgs = "-p daemon-train --bin daemon-train-worker --features swarm-net";
+            cargoExtraArgs = "-p daemon-train --bin daemon-train-worker --features swarm-net,wgpu";
           }
         );
         daemon-train-worker-windows = craneLibWindows.buildPackage (
@@ -895,7 +900,7 @@
             pname = "daemon-train-worker-windows";
             version = baseVersion;
             cargoArtifacts = daemonTrainWorkerWindowsDeps;
-            cargoExtraArgs = "-p daemon-train --bin daemon-train-worker --features swarm-net";
+            cargoExtraArgs = "-p daemon-train --bin daemon-train-worker --features swarm-net,wgpu";
             DAEMON_BUILD_ID = buildId;
           }
         );
