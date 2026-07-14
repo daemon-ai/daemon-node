@@ -323,6 +323,10 @@ impl Demo {
         let mut m = Manifest::new("demo", env!("CARGO_PKG_VERSION"), 1);
         m.round_modes = vec!["barrier".into(), "pipelined".into()];
         m.min_round_interval_ms = 1000;
+        // A real-time per-step demo (§5.3.3) goes stale if the coordinator cadences slower than 2 s
+        // between rounds — the RUN-10 staleness ceiling (mirror of the 1 s floor above). A too-slow
+        // coordinator marks this module ineligible at assess time (`assess::screen_round_cadence`).
+        m.max_round_interval_ms = Some(2000);
         m
     }
 
@@ -388,5 +392,27 @@ fn median_of(norms: &[f64]) -> f64 {
         v[n / 2]
     } else {
         0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
+
+#[cfg(test)]
+mod run10_tests {
+    use super::*;
+
+    #[test]
+    fn demo_manifest_declares_staleness_tolerance() {
+        // RUN-10: the real-time `demo` module self-describes a max round interval so a too-slow
+        // coordinator marks it ineligible (`assess::screen_round_cadence`). The floor + ceiling
+        // bracket its live cadence; `sparse_loco` (a compression module) declares no ceiling.
+        let demo = Demo::manifest(&DemoCfg::default());
+        assert_eq!(demo.max_round_interval_ms, Some(2000));
+        assert_eq!(demo.min_round_interval_ms, 1000);
+        assert!(demo.max_round_interval_ms.unwrap() > u64::from(demo.min_round_interval_ms));
+
+        let sparse = SparseLoco::manifest(&SparseLocoCfg::default());
+        assert_eq!(
+            sparse.max_round_interval_ms, None,
+            "sparse_loco tolerates any cadence"
+        );
     }
 }

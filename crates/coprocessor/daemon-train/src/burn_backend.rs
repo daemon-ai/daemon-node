@@ -30,18 +30,38 @@
 //! (`digest_state` over the post-ingest masters, all written by det ops) is thus **backend-
 //! independent** and bit-identical to [`CpuBackend`] — the cross-backend digest test is the guard.
 //!
-//! ## Tensor representation
+//! ## Tensor representation — lazy device residency (B3, P2 perf follow-on)
 //!
-//! Each tensor is a flat rank-1 `Tensor<B, 1>` plus a cached host `Vec<f32>` so [`OpBackend::view`]
-//! stays a cheap `&[f32]`. Shape-carrying ops (`matmul`, `transpose`, `slice`, `rmsnorm`, …) reshape
-//! to the needed const rank internally and flatten back; `reshape@1` is an autodiff identity (a
-//! tensor clone that keeps the graph edge). Trade: a 2× host copy, chosen for a clean `view` and
-//! numerical fidelity over speed this wave.
+//! Each tensor is a flat rank-1 `Tensor<B, 1>` plus a **lazily-materialized** host cache
+//! ([`OnceCell<Vec<f32>>`](std::cell::OnceCell)). Native op results ([`Self::insert_result`]) leave
+//! the cache **empty** — the value stays **device-resident** across the op chain, and no
+//! device→host readback (`to_data`) is issued. The host copy is filled (once, then cached) **only
+//! at a genuine host boundary** — the first [`OpBackend::view`]/[`Self::host`] read: the det lane
+//! (every `det_*` op + compression native runs `det_core` on host fp32), scalar/metric readouts
+//! (loss), the consensus digest (`canonical_state_bytes`), checkpoints, and `upd_push_tensor`
+//! staging. Leaves ([`Self::insert_leaf`]) and writes seed the cache eagerly (the caller already
+//! holds the bytes — params, det results, requantized masters), so no boundary re-reads them.
+//!
+//! This removes the per-op host-copy tax the P1 M2 gate measured (2.3–2.6× tokens/s vs a straight
+//! burn reference at 160M on wgpu, `swarm-p1-throughput.md §"Honest overhead accounting"`): the hot
+//! forward/backward now pipelines on the GPU exactly like the reference, materializing host data
+//! only where the det/consensus/metrics lanes actually need it. The frozen [`OpBackend`] trait is
+//! **unchanged** — `view(&self) -> &[f32]` still returns a borrowed slice; the `OnceCell`'s
+//! `get_or_init` fills-and-caches through `&self` (interior mutability), so laziness needs no
+//! additive trait method. The residual tabi-vs-reference gap is now the intrinsic det/compression
+//! host boundary (`make_update`/`ingest` materialize + run det-core on host fp32), documented in
+//! `swarm-p2-throughput.md`.
+//!
+//! Shape-carrying ops (`matmul`, `transpose`, `slice`, `rmsnorm`, …) reshape to the needed const
+//! rank internally and flatten back; `reshape@1` is an autodiff identity (a tensor clone that keeps
+//! the graph edge).
 
 // Compiles for the G1 `burn-ndarray` (CPU) lane and the G2 `wgpu` (Vulkan/RADV) lane. The generic
 // impl below touches only burn-tensor (always on via the root dep); the concrete backend aliases
 // are feature-gated so a single-lane build pulls only its own backend tree.
 #![cfg(any(feature = "burn-ndarray", feature = "wgpu"))]
+
+use std::cell::OnceCell;
 
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{activation, Int, Tensor, TensorData};
@@ -75,10 +95,32 @@ pub fn wgpu_adapter_available() -> bool {
     crate::autotune::probe_wgpu().is_some()
 }
 
-/// One live tensor: the burn tensor + a cached host copy backing [`OpBackend::view`].
+/// One live tensor: the burn tensor + a **lazily-materialized** host cache backing
+/// [`OpBackend::view`]. `host` is empty for a device-resident native result and filled once, on the
+/// first host read, by [`BurnBackend::host`] (`get_or_init`) — the B3 lazy-residency change that
+/// drops the per-op `to_data` readback. Leaves/writes seed it eagerly (the bytes are already in
+/// hand). `OnceCell` gives interior mutability so `view(&self) -> &[f32]` stays a borrowed slice
+/// without touching the frozen trait.
 struct Slot<B: AutodiffBackend> {
     t: Tensor<B, 1>,
-    host: Vec<f32>,
+    host: OnceCell<Vec<f32>>,
+}
+
+impl<B: AutodiffBackend> Slot<B> {
+    /// A device-resident result whose host copy is materialized lazily on first read.
+    fn lazy(t: Tensor<B, 1>) -> Self {
+        Self {
+            t,
+            host: OnceCell::new(),
+        }
+    }
+
+    /// A slot whose host copy is already known (a leaf / write — the caller holds the bytes).
+    fn eager(t: Tensor<B, 1>, host: Vec<f32>) -> Self {
+        let cell = OnceCell::new();
+        let _ = cell.set(host);
+        Self { t, host: cell }
+    }
 }
 
 /// A [`OpBackend`] driven by a Burn [`AutodiffBackend`] (native lane) + `det_core` (det lane).
@@ -152,14 +194,19 @@ impl<B: AutodiffBackend> BurnBackend<B> {
     }
 
     fn insert_leaf(&mut self, data: Vec<f32>) -> TensorId {
+        // A leaf: the caller holds the bytes, so seed the host cache eagerly (params, det results,
+        // requantized values are read at a boundary immediately — no need to round-trip via the
+        // device to read back what we just uploaded).
         let host = data.clone();
         let t = self.leaf(data);
-        self.insert(Slot { t, host })
+        self.insert(Slot::eager(t, host))
     }
 
     fn insert_result(&mut self, t: Tensor<B, 1>) -> TensorId {
-        let host = to_vec_f32(&t);
-        self.insert(Slot { t, host })
+        // A native op result: keep it **device-resident** — no `to_data` readback here. The host
+        // copy materializes lazily on the first `view`/`host` read (a det/scalar/digest boundary).
+        // This is the B3 per-op host-copy-tax removal (module docs, `swarm-p2-throughput.md`).
+        self.insert(Slot::lazy(t))
     }
 
     fn slot(&self, id: TensorId) -> &Slot<B> {
@@ -172,8 +219,12 @@ impl<B: AutodiffBackend> BurnBackend<B> {
         self.slot(id).t.clone()
     }
 
+    /// The tensor's host copy, materialized (once) from the device on first read and cached — the
+    /// single device→host boundary. `get_or_init` runs the `to_data` readback lazily, so a
+    /// device-resident intermediate that is never read never leaves the GPU.
     fn host(&self, id: TensorId) -> &[f32] {
-        &self.slot(id).host
+        let slot = self.slot(id);
+        slot.host.get_or_init(|| to_vec_f32(&slot.t)).as_slice()
     }
 
     fn u32s(&self, id: TensorId) -> Vec<u32> {
@@ -267,10 +318,11 @@ impl<B: AutodiffBackend> OpBackend for BurnBackend<B> {
     }
     fn write(&mut self, id: TensorId, data: &[f32]) {
         // A write installs a fresh leaf: the next differentiable pass differentiates through it
-        // (params re-synced after an optimizer step, det doorway masters — ABI §5.9).
+        // (params re-synced after an optimizer step, det doorway masters — ABI §5.9). Host cache
+        // seeded eagerly (we hold the bytes; masters/persistents are read at a boundary next).
         let host = data.to_vec();
-        let t = self.leaf(host.clone());
-        self.tensors[id as usize] = Some(Slot { t, host });
+        let t = self.leaf(data.to_vec());
+        self.tensors[id as usize] = Some(Slot::eager(t, host));
     }
     fn free(&mut self, id: TensorId) {
         if (id as usize) < self.tensors.len() && self.tensors[id as usize].is_some() {
@@ -585,12 +637,12 @@ impl<B: AutodiffBackend> OpBackend for BurnBackend<B> {
             .mul_scalar(1.0 - hp.lr * hp.wd)
             .sub(mhat.div(denom).mul_scalar(hp.lr));
 
-        let mh = to_vec_f32(&m1);
-        let vh = to_vec_f32(&v1);
-        let wh = to_vec_f32(&w1);
-        self.tensors[m as usize] = Some(Slot { t: m1, host: mh });
-        self.tensors[v as usize] = Some(Slot { t: v1, host: vh });
-        self.tensors[master as usize] = Some(Slot { t: w1, host: wh });
+        // Keep the fused-step results device-resident (lazy host): `m`/`v` are only read at a
+        // checkpoint boundary, and `master` is materialized on demand by the caller's storage sync
+        // (`op_adamw_step` reads `view(master)` once). Removes 3 per-param per-inner-step readbacks.
+        self.tensors[m as usize] = Some(Slot::lazy(m1));
+        self.tensors[v as usize] = Some(Slot::lazy(v1));
+        self.tensors[master as usize] = Some(Slot::lazy(w1));
     }
 
     // -- det lane (real det-core kernels; host-side materialization, §5.9) ----------------------

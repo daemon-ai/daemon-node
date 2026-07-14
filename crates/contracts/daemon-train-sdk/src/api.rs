@@ -741,8 +741,15 @@ pub struct Manifest {
     pub steps_per_round: u32,
     /// Apply orderings this experiment's math tolerates (`"barrier"` / `"pipelined"`).
     pub round_modes: Vec<String>,
-    /// Minimum viable round interval (ms); `0 = any`.
+    /// Minimum viable round interval (ms); `0 = any`. The **floor** — a module that needs *time*
+    /// between rounds (e.g. a heavy inner loop) is ineligible on a coordinator that cadences faster.
     pub min_round_interval_ms: u32,
+    /// Maximum tolerated round interval (ms); `None = any` (no upper bound). The **staleness ceiling**
+    /// (RUN-10, §6.5): a real-time / low-latency module (e.g. the `demo` profile) is ineligible when
+    /// the coordinator's round cadence exceeds it — the mirror of [`Self::min_round_interval_ms`].
+    /// Additive + optional so an older module (no field) deserializes unchanged and defaults to "any".
+    #[serde(default)]
+    pub max_round_interval_ms: Option<u64>,
 }
 
 impl Manifest {
@@ -756,6 +763,7 @@ impl Manifest {
             steps_per_round,
             round_modes: vec!["barrier".to_string()],
             min_round_interval_ms: 0,
+            max_round_interval_ms: None,
         }
     }
 

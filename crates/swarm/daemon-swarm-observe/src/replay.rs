@@ -22,6 +22,8 @@ use daemon_swarm_coordinator::{
     tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
 };
 
+use crate::capture::RunCapture;
+use crate::log::{MessageKind, MessageLog};
 use crate::ObserveError;
 
 /// The deterministic genesis seed for a run, derived from its envelope (domain-separated blake3), so
@@ -85,7 +87,29 @@ pub fn replay(
     let config =
         RunConfig::from_envelope(env, params).map_err(|e| ObserveError::Replay(e.to_string()))?;
     let seed = genesis_seed(env)?;
-    let mut state = CoordinatorState::new(config, seed, 0);
+    let state = CoordinatorState::new(config, seed, 0);
+    replay_from_state(state, inputs)
+}
+
+/// Re-run `tick` from a **given initial [`CoordinatorState`]** over `inputs` and verify recorded
+/// records match — the same oracle as [`replay`] without envelope resolution (§6.4 I1, PROTO-20).
+///
+/// This is the entry point for a recorded local/gate run: the coordinator's genesis is not derived
+/// from an envelope (the in-process harness / gate ceremony builds `RunConfig` directly), so the
+/// exact starting state is captured in a [`RunCapture`](crate::capture::RunCapture) and replayed
+/// here. `inputs` carries the driving trace (messages + clocks) followed by the wire-recorded
+/// `RoundRecord`s as the oracle (see [`replay_capture`]). Same rule as [`replay`]: a `RoundRecord`
+/// in the stream is **compared**, never fed back to `tick`; `RoundOpen` is skipped; all else drives.
+///
+/// # Errors
+///
+/// [`ReplayError::Diverged`] on the first recorded record that disagrees with the re-derivation;
+/// [`ReplayError::Setup`] on a final-state hashing/codec failure.
+pub fn replay_from_state(
+    initial: CoordinatorState,
+    inputs: impl Iterator<Item = Input>,
+) -> Result<ReplayReport, ReplayError> {
+    let mut state = initial;
 
     // The last record `tick` produced for each round (records[idx_by_round]).
     let mut produced_by_round: std::collections::BTreeMap<u64, RoundRecord> =
@@ -148,4 +172,37 @@ pub fn replay(
         rounds_verified,
         final_state_hash,
     })
+}
+
+/// Verify a recorded run: re-run `tick` from the [`RunCapture`]'s initial state over its driving
+/// trace, using the **independent** wire [`MessageLog`]'s `RoundRecord`s as the oracle (§6.4 I1).
+///
+/// The capture supplies the driving inputs (messages + clocks) the coordinator fed `tick`; the log
+/// supplies what the coordinator actually broadcast. Re-derivation reproduces a `RoundRecord` per
+/// round; each logged record is appended to the input stream as the oracle to compare against. A
+/// successful [`ReplayReport`] with `rounds_verified` equal to the logged record count proves the
+/// run's per-round consensus (committed set + drops = the round digest) is byte-reproducible — the
+/// `swarm-replay` gate-ceremony assertion.
+///
+/// # Errors
+///
+/// [`ReplayError::Diverged`] at the first logged record that does not re-derive; [`ReplayError::Setup`]
+/// on a codec failure.
+pub fn replay_capture(
+    capture: RunCapture,
+    oracle: &MessageLog,
+) -> Result<ReplayReport, ReplayError> {
+    let oracle_records: Vec<Input> = oracle
+        .by_kind(MessageKind::RoundRecord)
+        .cloned()
+        .map(Input::Message)
+        .collect();
+    let inputs = capture.inputs.into_iter().chain(oracle_records);
+    replay_from_state(capture.initial, inputs)
+}
+
+/// How many `RoundRecord`s a [`MessageLog`] carries (the count `replay_capture` verifies against).
+#[must_use]
+pub fn logged_round_records(log: &MessageLog) -> usize {
+    log.by_kind(MessageKind::RoundRecord).count()
 }
