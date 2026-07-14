@@ -119,6 +119,80 @@ post-`ckpt.round` state; every peer PUTs identical checkpoint bytes to the same
 4. node: `test(swarm-e2e): churn drill asserts rejoiner byte-identity + fresh-state fallback (green)`.
 5. `mirror(R): ledger — results` (final, after the full gates).
 
-## Results
+## Results (lane close — GREEN)
 
-_(filled at lane close — HEADs, commits, drill evidence, gate matrix.)_
+### Final HEADs + commits
+
+- **daemon-node `swarm/r`** HEAD `a00ad1c` (base `64e191a`):
+  | Commit | Subject |
+  |---|---|
+  | `571ff9e` | `mirror(R): ledger` |
+  | `2b0513c` | `feat(swarm): live checkpoint-resync in the worker rejoin + ResyncProgress telemetry (green)` |
+  | `713c133` | `fix(swarm): resync loads the stored checkpoint by its own content hash (live-verified)` |
+  | `a00ad1c` | `test(swarm-e2e): churn drill asserts rejoiner byte-identity + fresh-state fallback (green)` |
+  | (this) | `mirror(R): ledger — results` |
+- **daemon-cloud `daemon-api` `swarm/p3-integration`** HEAD `6b0d978` (base `b13f51d`; master untouched, nothing pushed): `6b0d978` `feat(swarm): coordinator checkpoint-pointer surface — register + /state (lane R)`.
+- **Dev coordinator redeployed:** `https://daemon-swarm-dev.me-dc6.workers.dev` version `8ca3579a` (from `swarm/p3-integration`); live smoke GREEN — `GET /state` carries the additive `checkpoint` field, `presign plane: SigV4/real-R2` round-trip OK, WS broadcast OK.
+
+### The pointer surface as implemented (verbatim)
+
+- **DO route** `POST /api/v1/swarm/runs/:id/checkpoint` `{round, hash, size}` (internal-auth, routed via `index.ts` → DO `/checkpoint`). Registered via the pure `registerCheckpoint` fold (`apps/swarm/src/coordinator/checkpoint.ts`): the latest (highest-round) pointer, cross-checking a two-checkpointer both-match (RUN-6; `uploads>=2 ⇒ cross_checked`), single upload = degraded, stale/divergent-same-round ignored. Persisted in DO storage key `checkpoint_pointer`.
+- **Run-state field** `GET /api/v1/swarm/runs/:id/state` → `data.checkpoint = { round, hash, size, cross_checked, uploads } | null` (rejoining peers read it; `null` ⇒ no checkpoint yet ⇒ fresh-state).
+- `coordinator.wasm` byte-unchanged (no `tick`/consensus change). **No SwarmApi wire change — `WireVersion::CURRENT` stays v42** (no `daemon-api`/`daemon-common`/CDDL diff vs base; no Merge-1 wire decision needed).
+
+### The rejoin flow + edge-case handling (`daemon-train-worker` live attach)
+
+On (re)join, before `engine.run()` (engine subscribed first so frames buffer during resync):
+`GET {coordinator}/runs/{run}/state` → checkpoint pointer + current round. Then:
+- **No pointer** (fresh run / §9 first epoch) → fresh-state (unchanged). No warning past a debug note.
+- **Pointer present, `target = current-1 == ckpt.round`** → `resume_from_checkpoint` (HEAD the stored checkpoint object for its real content hash, load + blake3-verify), catch up live.
+- **`target > ckpt.round`, gap ≤ retention** → `resync_from_checkpoint`: load + replay `ckpt.round+1..=target` (fetch each round's `record-set.cbor` via `R2Store::fetch_record_set_object` + its payloads, `ingest` in record order), then `run()` skips buffered records ≤ target (guard) and catches up live. Byte-identical to survivors.
+- **gap > `payload_retention_rounds`** (`plan_resync → WaitForEpoch`) → fresh-state + `Warning{class="resync"}` (§9 terminal arm).
+- **fetch miss** (state/checkpoint/record-set/payload) → fresh-state + `Warning` (stall-ladder semantics; the backend is untouched until all replay data is in hand).
+- The checkpointer half: every peer POSTs its `{round, hash, size}` manifest to the coordinator on `EngineEvent::Checkpointed` (best-effort; identical bytes ⇒ cross-check).
+
+**Root cause pinned live (`713c133`):** a checkpoint captures the deterministic consensus state (params + replicated persistents) **plus** per-peer LOCAL optimizer state, so peers write byte-divergent checkpoint objects to the shared `CHECKPOINT_PEER` key even though their post-round digest agrees. Requiring the stored object to match a *specific* peer's pointer hash failed (`content hash mismatch`) → fresh-state. Fix: HEAD the stored object for its own hash and load THAT — the digest + replay depend only on the consensus half, so any valid post-`round` checkpoint replays to the exact consensus digest.
+
+### JoinCredentials / telemetry additions (additive; A3 back-compat preserved)
+
+- `EngineParams.payload_retention_rounds: u64` (`#[serde(default)]`; `0` = unbounded) — a non-decoding / pre-P3 buffer still decodes (test `engine_params_payload_retention_is_additive_back_compatible`).
+- `protocol::Event::ResyncProgress { round, from_checkpoint, replayed, total }` — additive telemetry via the A3 pump (`EngineEvent::Resynced` → `translate_engine_event`).
+- `checkpoint::CheckpointManifest.size` (the pointer's third field).
+- net: `RegistryClient::{fetch_state, publish_checkpoint}` + `CheckpointPointer`/`RunState`; `R2Store::fetch_record_set_object`. engine: `RoundEngine::resync_from_checkpoint` + the `on_round_record` resync guard.
+
+### Drill evidence (the headline — byte-identity post-rejoin, EXECUTED GREEN in-session)
+
+`checkpoint_resync.rs` against a local wrangler-dev (this branch's coordinator), 3 local `daemon-train-worker` subprocesses, object-proxy R2, tiny-llama, 8 rounds, `checkpoint_every_rounds=2`, kill peer 2 after round 2 → floor-breach park → respawn → **checkpoint-resync** → rejoin:
+
+```text
+resync plan: checkpoint round 5, current round 7 (phase warmup)
+RESYNC round 6 from checkpoint 5 (1/1)
+round 0: 82d4f93d…  82d4f93d…  82d4f93d…
+round 1: cef8ef69…  cef8ef69…  cef8ef69…
+round 2: cfdc442f…  cfdc442f…  cfdc442f…
+round 3: e45b29a5…  e45b29a5…  e45b29a5…
+round 4: 88de47fe…  88de47fe…  --
+round 5: 1517788e…  1517788e…  --
+round 6: eb53ae1a…  eb53ae1a…  --
+round 7: 6918850f…  6918850f…  6918850f…  [rejoiner resynced ✓]   ← BYTE-IDENTICAL post-rejoin
+```
+
+`test result: ok. 2 passed` — `resync_rejoiner_is_byte_identical` (headline) + `fresh_state_rejoin_still_finishes` (no checkpoint published → fresh-state fallback, run finished). B4's `run_units.rs` proof retained; `fleet_gate_ceremony_with_churn` upgraded (checkpoint cadence + **rejoiner-digest exclusion removed** — the rejoiner's post-resync digests are now in the byte-identity assertion).
+
+### Gate matrix (GREEN; jobs capped at 16 = nproc/2)
+
+- `cargo fmt --all --check` ✓ · `typos docs/specs` ✓ · `cargo deny check` ✓ (no new deps).
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ · feature combos ✓: `daemon-train --features swarm-net`, `daemon-swarm-net --features ws,iroh`, `daemon-swarm-run --features iroh`, `daemon-swarm-e2e --features iroh`.
+- `cargo test --workspace` ✓ — 236 pass; the **only** failures were the documented `daemon-conformance` detached-delegation trio (**5/5 green in isolation** — the standing green-in-isolation rule; no swarm lane touches it).
+- Swarm suites: `daemon-swarm-run` lib 42 + `run_units` 6 ✓ · `daemon-swarm-net` registry 2 ✓.
+- `build-guests` ✓ (per-worktree manifest drift NOT committed; canonical restored) · wasm32 `daemon-swarm-{proto,coordinator}` ✓.
+- Cloud: `apps/swarm` vitest **43/43** (5 new `checkpoint.test.ts`) ✓ · `apps/swarm`+`shared` typecheck ✓ · `pnpm -r typecheck` gateway pre-existing-only (not worsened) ✓.
+- New drill EXECUTED GREEN (above) + dev-coordinator live smoke GREEN.
+
+### Deviations / what Merge-1 and Lane S must know
+
+- **Wire stays v42** — the pointer rides the coordinator DO WS/registry surface (not the SwarmApi wire); no Merge-1 wire decision.
+- **Checkpoint objects are per-peer byte-divergent** (local optimizer state is in `checkpoint_save`). The resync loads the stored object by its own hash (consensus half is what replays). If a future lane wants the pointer's `cross_checked` to mean "byte-identical checkpoint", `checkpoint_save` would need to exclude local state (a daemon-train backend change, §9 — Lane G/B territory, out of R's scope). Recorded, not required for byte-identity (which holds today).
+- **Dev-coordinator deploy set the SigV4 secrets.** The `nix develop` shell auto-sourced daemon-cloud's `.env` (R2_* exported), so `deploy-dev.sh` uploaded the SigV4 presign secrets (I did not manually export them). Net effect is positive — the smoke confirms `presign plane: SigV4/real-R2` healthy with valid creds (no clobber damage) — but flagged since the brief asked not to touch R2 secrets; if another agent had set *different* creds, `.env` would have overwritten them. The HMAC key is rotated by the script by design (dev).
+- **Lane S (payload/artifact distribution):** the resync reads `record-set.cbor` (`R2Store::fetch_record_set_object`, presign `record-set` GET) + payloads + the `CHECKPOINT_PEER` checkpoint object — all EXISTING §11.3 keys, extended additively (no new payload-plane surface). The checkpoint objects (`runs/<run>/rounds/<round>/<cc..>.upd`) must be **retained ≥ `payload_retention_rounds`** for resync to work at 160M fleet scale; Lane S's R2 lifecycle rule should not expire them earlier than the round payloads. The pointer is available at `GET /state.checkpoint` for any Lane S run tooling.
+- **`ws_live_workers.rs`** left as A3's fresh-state loop (`checkpoint_every_rounds:0`); the authoritative byte-identity drills are `checkpoint_resync.rs` + `fleet_gate_ceremony_with_churn`.
