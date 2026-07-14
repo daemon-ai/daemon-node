@@ -40,6 +40,10 @@ pub struct CheckpointManifest {
     pub round: RoundId,
     /// blake3 of the `checkpoint_save` bytes (content address).
     pub blake3: Hash,
+    /// The `checkpoint_save` byte length — the third field of the coordinator checkpoint pointer
+    /// (lane R, spec §9). Part of the both-match cross-check (identical checkpoints are the same
+    /// size).
+    pub size: u64,
     /// The post-round state digest this checkpoint reproduces.
     pub digest: StateDigest,
 }
@@ -71,11 +75,13 @@ where
         .checkpoint_save()
         .map_err(|e| SwarmRunError::Lifecycle(format!("checkpoint_save: {e}")))?;
     let blake3 = blake3_hash(&bytes);
+    let size = bytes.len() as u64;
     let key = PayloadKey::new(run.clone(), round, CHECKPOINT_PEER);
     store.put(&key, &bytes).await?;
     Ok(CheckpointManifest {
         round,
         blake3,
+        size,
         digest,
     })
 }

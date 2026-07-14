@@ -50,7 +50,7 @@ use daemon_swarm_proto::{
 };
 
 use crate::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
-use crate::checkpoint::{load_checkpoint, save_checkpoint, CheckpointManifest};
+use crate::checkpoint::{load_checkpoint, save_checkpoint, CheckpointManifest, ReplayStep};
 use crate::data::{slice_interval, BatchInterval, Corpus};
 use crate::seam::{PayloadKey, RoundId, RunId};
 use crate::SwarmRunError;
@@ -158,6 +158,20 @@ pub enum EngineEvent {
         round: RoundId,
         /// The checkpoint manifest (round, blake3, digest).
         manifest: CheckpointManifest,
+    },
+    /// **Additive (R, P3).** This (rejoining) peer replayed one retained round forward from the
+    /// latest checkpoint during a live resync (§9 I1). Emitted per replayed round by
+    /// [`RoundEngine::resync_from_checkpoint`]; the live-attach forwarder surfaces it as
+    /// `protocol::Event::ResyncProgress`.
+    Resynced {
+        /// The round just re-ingested during replay.
+        round: RoundId,
+        /// The checkpoint round the replay resumed from.
+        from_checkpoint: RoundId,
+        /// Retained rounds replayed so far (1-based within this resync).
+        replayed: u32,
+        /// Total retained rounds this resync replays.
+        total: u32,
     },
     /// This peer left the run (stall budget exhausted); it rejoins at the next epoch.
     Left {
@@ -294,7 +308,46 @@ where
         &mut self,
         manifest: &CheckpointManifest,
     ) -> Result<(), SwarmRunError> {
-        load_checkpoint(&self.store, &self.cfg.run, &mut self.backend, manifest).await
+        load_checkpoint(&self.store, &self.cfg.run, &mut self.backend, manifest).await?;
+        self.last_ingested = Some(manifest.round);
+        Ok(())
+    }
+
+    /// **Live checkpoint-resync (§9 I1; R, P3).** Reload the latest checkpoint into the backend, then
+    /// replay `steps` (the retained rounds' committed sets, in record order) forward — recovering the
+    /// exact post-`target` consensus state a survivor holds. Marks each replayed round ingested
+    /// (`last_ingested`), so the subsequent [`RoundEngine::run`] loop **skips** any buffered
+    /// `RoundRecord` at or below the replay target (the `on_round_record` guard) and catches the run
+    /// up from `target + 1` live. Emits [`EngineEvent::Resynced`] per replayed round for the pump.
+    ///
+    /// This is the fold behind B4's `resync_by_replay` proof, wired onto the live engine: additive to
+    /// the frozen Merge-2 API — call it (instead of / after `resume_from_checkpoint`) before `run()`.
+    /// Returns the post-replay digest of the last replayed round, or the checkpoint's own digest when
+    /// there are no retained rounds to replay (`steps` empty — the checkpoint is already current).
+    pub async fn resync_from_checkpoint(
+        &mut self,
+        manifest: &CheckpointManifest,
+        steps: &[ReplayStep],
+    ) -> Result<StateDigest, SwarmRunError> {
+        load_checkpoint(&self.store, &self.cfg.run, &mut self.backend, manifest).await?;
+        self.last_ingested = Some(manifest.round);
+        let total = steps.len() as u32;
+        let mut last = manifest.digest;
+        for (i, step) in steps.iter().enumerate() {
+            let digest = self
+                .backend
+                .ingest(step.round, &step.staged)
+                .map_err(lifecycle)?;
+            self.last_ingested = Some(step.round);
+            last = digest;
+            self.emit(EngineEvent::Resynced {
+                round: step.round,
+                from_checkpoint: manifest.round,
+                replayed: i as u32 + 1,
+                total,
+            });
+        }
+        Ok(last)
     }
 
     /// Run the message-driven round loop until the control plane closes or the stall budget is
@@ -491,6 +544,16 @@ where
     /// enqueue it, and try to ingest as far as the queue allows (in order). If `r` itself cannot be
     /// ingested yet (its set — or an earlier round's — is unfetchable), enter the stall ladder.
     async fn on_round_record(&mut self, rr: &RoundRecord) -> Result<(), SwarmRunError> {
+        // Resync-composability guard (R, P3): a rejoining peer that replayed retained rounds from a
+        // checkpoint (`resync_from_checkpoint`) has already ingested every round up to
+        // `last_ingested`. A buffered / late `RoundRecord` at or below that watermark must NOT be
+        // re-ingested (a double outer-step would diverge the digest). On the normal monotonic path
+        // records never repeat, so this is a no-op.
+        if let Some(last) = self.last_ingested {
+            if rr.round <= last {
+                return Ok(());
+            }
+        }
         let entries = self.resolve_record_set(rr).await?;
         self.pending.insert(rr.round, entries);
         self.advance(Some(rr.round)).await?;

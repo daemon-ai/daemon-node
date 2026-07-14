@@ -23,17 +23,18 @@ use daemon_provision::CutWriter;
 use daemon_swarm_net::{
     ContentHash, ControlPlane, DualPlane, FsPayloadStore, HttpPresignClient, IrohGossip,
     IrohGossipConfig, IrohPeer, PayloadKey, PayloadStat, PayloadStore, R2Store, RebroadcastConfig,
-    ReconnectConfig, RunId, SwarmNetError, WsAuth, WsConfig, WsControlPlane,
+    ReconnectConfig, RegistryClient, RunId, SwarmNetError, WsAuth, WsConfig, WsControlPlane,
 };
-use daemon_swarm_proto::messages::{Join, ThroughputClass};
+use daemon_swarm_proto::messages::{Join, RecordEntry, ThroughputClass};
 use daemon_swarm_proto::{
     peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SignedMessage, SigningKey,
     SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
 use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
+use daemon_swarm_run::checkpoint::{plan_resync, CheckpointManifest, ReplayStep, ResyncPlan};
 use daemon_swarm_run::data::Corpus;
 use daemon_swarm_run::engine::{EngineConfig, EngineEvent, RoundEngine};
-use daemon_swarm_run::protocol::{Event, JoinCredentials};
+use daemon_swarm_run::protocol::{ErrorClass, Event, JoinCredentials};
 use daemon_swarm_run::seam::RoundId;
 use daemon_swarm_run::SwarmRunError;
 use daemon_train::{
@@ -183,13 +184,34 @@ pub(crate) async fn join_and_run_live(
         creds.engine.corpus_vocab_clamp,
     );
 
-    // EngineEvent → protocol::Event forwarder (per-round RunPhase/RoundOutcome/Warning).
+    // EngineEvent → protocol::Event forwarder (per-round RunPhase/RoundOutcome/Warning). It also
+    // publishes each `Checkpointed` manifest to the coordinator's checkpoint-pointer surface
+    // (spec §9; lane R) so a later rejoiner can resume_from_checkpoint — best-effort, a POST failure
+    // is a soft warning (the pointer is advisory).
     let (ev_tx, mut ev_rx) = unbounded_channel::<EngineEvent>();
     let out_for_fwd = out_tx.clone();
     let run_id_for_fwd = run_id.to_string();
     let roster_len = creds.roster.len().max(1) as u32;
+    let registry_fwd = build_registry(coordinator, creds)?;
+    let run_id_fwd_publish = run_id.to_string();
     let forwarder_task = tokio::spawn(async move {
         while let Some(ev) = ev_rx.recv().await {
+            if let EngineEvent::Checkpointed { round, manifest } = &ev {
+                if let Err(e) = registry_fwd
+                    .publish_checkpoint(
+                        &run_id_fwd_publish,
+                        *round,
+                        &manifest.blake3.to_hex(),
+                        manifest.size,
+                    )
+                    .await
+                {
+                    let _ = out_for_fwd.send(Event::Warning {
+                        class: "checkpoint_publish".to_string(),
+                        detail: format!("register checkpoint r{round} pointer failed: {e}"),
+                    });
+                }
+            }
             for out in translate_engine_event(&ev, &run_id_for_fwd, roster_len) {
                 if out_for_fwd.send(out).is_err() {
                     return;
@@ -198,7 +220,33 @@ pub(crate) async fn join_and_run_live(
         }
     });
 
-    let engine = RoundEngine::new(control, store, backend, key, corpus, engine_cfg, ev_tx);
+    let mut engine = RoundEngine::new(
+        control,
+        store.clone(),
+        backend,
+        key,
+        corpus,
+        engine_cfg,
+        ev_tx,
+    );
+
+    // LIVE checkpoint-resync (§9; lane R): before running the round loop, learn the latest
+    // coordinator-published checkpoint pointer and — if the run is mid-flight — reload it and replay
+    // the retained rounds forward, so this (re)join reaches state byte-identical to the survivors.
+    // Best-effort: no checkpoint / a too-old gap / a fetch miss all fall back to the fresh-state
+    // rejoin (current behavior). The engine already subscribed (above), so frames published during
+    // resync buffer and are caught up by `run()`.
+    let registry = build_registry(coordinator, creds)?;
+    resync_on_join(
+        &mut engine,
+        &store,
+        &registry,
+        run_id,
+        creds.engine.payload_retention_rounds,
+        &out_tx,
+    )
+    .await;
+
     let out_for_engine = out_tx.clone();
     let engine_task = tokio::spawn(async move {
         let mut engine = engine;
@@ -337,6 +385,178 @@ impl PayloadStore for WorkerStore {
     }
 }
 
+impl WorkerStore {
+    /// Fetch the committed set (`record-set.cbor`) the coordinator wrote for `round` — the
+    /// `(peer, hash, size)` membership a rejoining peer stages when replaying that round forward
+    /// during a live checkpoint-resync (§9; lane R). Only the R2 plane carries it (the coordinator
+    /// wrote it to R2); the FS fallback plane has no coordinator, so resync there degrades to
+    /// fresh-state.
+    async fn committed_set(&self, round: RoundId) -> Result<Vec<RecordEntry>, SwarmNetError> {
+        match self {
+            WorkerStore::R2(s) => Ok(s.fetch_record_set_object(round).await?.entries().to_vec()),
+            WorkerStore::Fs(_) => Err(SwarmNetError::Fetch(
+                "record-set fetch unsupported on the FS payload plane — resync falls back to \
+                 fresh-state"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+/// Build a [`RegistryClient`] against the coordinator base with the credentials' `swarm:*` auth —
+/// used for the checkpoint-pointer surface (fetch on rejoin, publish on checkpoint). The base is the
+/// same `{…}/api/v1/swarm` the WS client dials; the client trims a trailing slash.
+fn build_registry(coordinator: &str, creds: &JoinCredentials) -> Result<RegistryClient, String> {
+    use daemon_swarm_run::protocol::WsAuthSpec;
+    let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
+        .map_err(|e| format!("registry egress client: {e}"))?;
+    let client = RegistryClient::new(egress, coordinator.to_string());
+    Ok(match &creds.ws_auth {
+        WsAuthSpec::None => client,
+        WsAuthSpec::Bearer(t) => client.with_bearer(t.clone()),
+        WsAuthSpec::Internal { org_id, actor } => {
+            client.with_internal(org_id.clone(), actor.clone())
+        }
+    })
+}
+
+/// Parse a 64-char lowercase-hex blake3 into a [`Hash`], or `None` if malformed.
+fn hash_from_hex(hex: &str) -> Option<Hash> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    for (i, byte) in arr.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(Hash::new(arr))
+}
+
+/// **Live checkpoint-resync on (re)join (spec §9; lane R).** Query the coordinator's latest
+/// checkpoint pointer; if the run is mid-flight, reload the checkpoint and replay the retained
+/// rounds forward through the engine so this peer rejoins byte-identical to the survivors. Every
+/// honest edge — no checkpoint yet, a gap wider than the retention floor, a fetch miss — falls back
+/// to the fresh-state rejoin (the pre-P3 behavior) with a `Warning`. Progress is surfaced as
+/// `Event::ResyncProgress` telemetry by the engine.
+async fn resync_on_join(
+    engine: &mut RoundEngine<DualPlane, WorkerStore, LadderBackend>,
+    store: &Arc<WorkerStore>,
+    registry: &RegistryClient,
+    run_id: &str,
+    retention: u64,
+    out_tx: &UnboundedSender<Event>,
+) {
+    let warn = |detail: String| {
+        let _ = out_tx.send(Event::Warning {
+            class: "resync".to_string(),
+            detail,
+        });
+    };
+
+    let state = match registry.fetch_state(run_id).await {
+        Ok(Some(s)) => s,
+        // Run not initialized yet, or no state — a genuinely fresh join. Nothing to resync.
+        Ok(None) => return,
+        Err(e) => {
+            warn(format!(
+                "coordinator state fetch failed ({e}); fresh-state rejoin"
+            ));
+            return;
+        }
+    };
+
+    // No checkpoint published yet (first epoch, §9) → fresh-state (current behavior).
+    let Some(ptr) = state.checkpoint else {
+        return;
+    };
+    let Some(blake3) = hash_from_hex(&ptr.hash) else {
+        warn(format!(
+            "coordinator checkpoint pointer has a malformed hash ({:?}); fresh-state rejoin",
+            ptr.hash
+        ));
+        return;
+    };
+    let manifest = CheckpointManifest {
+        round: ptr.round,
+        blake3,
+        size: ptr.size,
+        digest: StateDigest([0u8; 16]), // load verifies by blake3; the digest field is unused there
+    };
+
+    // The newest finalized round (the coordinator's current open round − 1) is the resync target.
+    let target = state.round.saturating_sub(1);
+    if target <= ptr.round {
+        // The checkpoint already covers the newest finalized round: reload it (no replay) and let
+        // the engine catch up from there live.
+        if let Err(e) = engine.resume_from_checkpoint(&manifest).await {
+            warn(format!(
+                "checkpoint resume failed ({e}); fresh-state rejoin"
+            ));
+        }
+        return;
+    }
+
+    // §9 resync-replay window: replay only if the whole gap is still retained (else wait for epoch).
+    let effective_retention = if retention == 0 { u64::MAX } else { retention };
+    let from_round = match plan_resync(ptr.round, target, effective_retention) {
+        ResyncPlan::ReplayFromCheckpoint { from_round, .. } => from_round,
+        ResyncPlan::WaitForEpoch => {
+            warn(format!(
+                "resync gap {}->{target} exceeds retention {retention}; fresh-state rejoin \
+                 (waiting for the next epoch checkpoint, §9)",
+                ptr.round
+            ));
+            return;
+        }
+    };
+
+    // Assemble the replay steps FIRST (all fetches complete before the backend is touched) so a
+    // network miss falls back to fresh-state with the backend still clean.
+    let mut steps = Vec::new();
+    for round in (from_round + 1)..=target {
+        let entries = match store.committed_set(round).await {
+            Ok(e) => e,
+            Err(e) => {
+                warn(format!(
+                    "retained committed set for round {round} unavailable ({e}); fresh-state rejoin"
+                ));
+                return;
+            }
+        };
+        let mut staged = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let key = PayloadKey::new(RunId::new(run_id), round, entry.peer);
+            match store.get(&key, &entry.hash).await {
+                Ok(bytes) => staged.push(StagedPayload {
+                    peer: entry.peer,
+                    hash: entry.hash,
+                    bytes,
+                }),
+                Err(e) => {
+                    warn(format!(
+                        "retained payload r{round}/{} unavailable ({e}); fresh-state rejoin",
+                        entry.peer.to_hex()
+                    ));
+                    return;
+                }
+            }
+        }
+        steps.push(ReplayStep { round, staged });
+    }
+
+    match engine.resync_from_checkpoint(&manifest, &steps).await {
+        Ok(_) => {} // per-round `ResyncProgress` telemetry emitted by the engine
+        Err(e) => {
+            // The checkpoint + replay data are in hand but the fold failed (a real fault): surface a
+            // typed Desync so the supervisor's respawn-and-retry loop (§9) handles it.
+            let _ = out_tx.send(Event::Error {
+                class: ErrorClass::Desync,
+                detail: format!("checkpoint resync replay failed: {e}"),
+            });
+        }
+    }
+}
+
 /// Translate an [`EngineEvent`] into the worker protocol [`Event`]s the node's `SwarmService`
 /// consumes (a run's phase / round outcome / warnings; §10.3/§10.4).
 fn translate_engine_event(ev: &EngineEvent, run_id: &str, roster_len: u32) -> Vec<Event> {
@@ -377,6 +597,17 @@ fn translate_engine_event(ev: &EngineEvent, run_id: &str, roster_len: u32) -> Ve
             round: *round,
             hash: manifest.blake3.to_hex(),
             location: format!("runs/{run_id}/rounds/{round}/checkpoint"),
+        }],
+        EngineEvent::Resynced {
+            round,
+            from_checkpoint,
+            replayed,
+            total,
+        } => vec![Event::ResyncProgress {
+            round: *round,
+            from_checkpoint: *from_checkpoint,
+            replayed: *replayed,
+            total: *total,
         }],
         EngineEvent::Left { round, reason } => vec![Event::Warning {
             class: "left".to_string(),

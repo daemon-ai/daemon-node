@@ -272,6 +272,21 @@ pub enum Event {
         /// Cumulative halvings on this round so far.
         halvings: u32,
     },
+    /// **Additive (R, P3).** Live checkpoint-resync progress on a worker rejoin (spec §9): the
+    /// rejoining worker reloaded the latest coordinator-published checkpoint and is replaying the
+    /// retained rounds forward to reach byte-identity with the survivors. Emitted per replayed round
+    /// by the live-attach resync path; additive to the frozen §10.2 stream (a new variant only).
+    ResyncProgress {
+        /// The round just re-ingested during replay (`from_checkpoint < round <= from_checkpoint +
+        /// total`).
+        round: RoundId,
+        /// The checkpoint round the replay resumed from.
+        from_checkpoint: RoundId,
+        /// How many retained rounds have been replayed so far (1-based within this resync).
+        replayed: u32,
+        /// The total number of retained rounds this resync replays.
+        total: u32,
+    },
     /// A classified failure.
     Error {
         /// The failure class (maps to the node's recovery loop).
@@ -378,6 +393,12 @@ pub struct EngineParams {
     pub stall_rounds_max: u32,
     /// Round-boundary checkpoint cadence (§9); `0` disables.
     pub checkpoint_every_rounds: u32,
+    /// §9 resync-replay window: the payload-retention floor (rounds) a rejoining peer may replay
+    /// forward from the latest checkpoint. A desync/rejoin gap wider than this waits for the next
+    /// epoch checkpoint instead (`plan_resync`). Additive (R, P3): `#[serde(default)]` keeps
+    /// pre-P3 credential buffers decodable; `0` ⇒ unbounded (replay whatever is retained).
+    #[serde(default)]
+    pub payload_retention_rounds: u64,
     /// §7.3 receive-side per-peer payload cap in bytes (`0` = uncapped) — the worker mirrors the DO
     /// shell's pre-filter (Merge-1 Decision 2).
     #[serde(default)]
@@ -555,6 +576,13 @@ mod tests {
             to_micro_batch: 2,
             halvings: 1,
         });
+        // R (P3) additive resync telemetry.
+        round_trip_event(Event::ResyncProgress {
+            round: 5,
+            from_checkpoint: 3,
+            replayed: 2,
+            total: 2,
+        });
         for class in [
             ErrorClass::OutOfMemory,
             ErrorClass::Transient,
@@ -605,6 +633,7 @@ mod tests {
                 corpus_tokens_per_shard: 256,
                 corpus_seq_len: 8,
                 corpus_vocab_clamp: 64,
+                payload_retention_rounds: 16,
             },
         };
         let bytes = creds.to_bytes().expect("encode credentials");
@@ -622,6 +651,46 @@ mod tests {
         let back2 = JoinCredentials::from_bytes(&ws_only.to_bytes().unwrap()).unwrap();
         assert_eq!(ws_only, back2);
         assert!(JoinCredentials::from_bytes(&[]).is_err());
+    }
+
+    /// `engine_params_payload_retention_is_additive_back_compatible`: the P3 (R) field
+    /// `payload_retention_rounds` is additive. A pre-P3 `EngineParams` (a CBOR map WITHOUT the
+    /// field) still decodes, defaulting to `0` (unbounded) — keeping A3's back-compat contract
+    /// (a non-decoding-in-full buffer never regresses existing joiners).
+    #[test]
+    fn engine_params_payload_retention_is_additive_back_compatible() {
+        #[derive(serde::Serialize)]
+        struct LegacyEngineParams {
+            steps_per_round: u32,
+            micro_batch: u32,
+            stall_rounds_max: u32,
+            checkpoint_every_rounds: u32,
+            update_max_bytes: u64,
+            corpus_seed: u64,
+            corpus_shards: u32,
+            corpus_tokens_per_shard: u64,
+            corpus_seq_len: u32,
+            corpus_vocab_clamp: u32,
+        }
+        let legacy = LegacyEngineParams {
+            steps_per_round: 2,
+            micro_batch: 2,
+            stall_rounds_max: 3,
+            checkpoint_every_rounds: 2,
+            update_max_bytes: 0,
+            corpus_seed: 7,
+            corpus_shards: 4,
+            corpus_tokens_per_shard: 256,
+            corpus_seq_len: 8,
+            corpus_vocab_clamp: 64,
+        };
+        let decoded: EngineParams =
+            decode(&encode(&legacy).expect("encode legacy")).expect("decode");
+        assert_eq!(
+            decoded.payload_retention_rounds, 0,
+            "missing field defaults to 0 (unbounded)"
+        );
+        assert_eq!(decoded.checkpoint_every_rounds, 2);
     }
 
     /// `hardware_shared_mb_is_additive_back_compatible`: the Merge-2 `shared_mb` field is additive.
