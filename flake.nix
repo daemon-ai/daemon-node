@@ -1273,6 +1273,14 @@
               shellHook = ''
                 if [ -n "''${DAEMON_CUDA_RUNTIME_DIR:-}" ]; then
                   export LD_LIBRARY_PATH="''${DAEMON_CUDA_RUNTIME_DIR}:''${LD_LIBRARY_PATH}"
+                  # P3 Merge-1 (Lane G D6 follow-on): when a driver-matched CUDA runtime dir is
+                  # staged, point CUDA_PATH at it too. cubecl-cuda re-includes `cuda_runtime.h` on
+                  # every NVRTC kernel JIT and resolves it via `$CUDA_PATH`; without this it would
+                  # use the build-time nix cudatoolkit headers (a different CUDA level than the box
+                  # driver's staged nvrtc), which G's 4090 live-attach smoke proved must match. This
+                  # only fires when the runtime dir is staged, so the default (unset) build headers
+                  # are unchanged.
+                  export CUDA_PATH="''${DAEMON_CUDA_RUNTIME_DIR}"
                 else
                   echo "note(.#cuda-train): DAEMON_CUDA_RUNTIME_DIR unset — det/parity suites run on the CPU det lane (the consensus bar). To construct a burn-cuda backend, set it to the box's driver-matched CUDA runtime dir (nvrtc 12.4 + host driver libs; RunPod: /root/cuda-rt-124)." >&2
                 fi

@@ -333,3 +333,271 @@ Sanity-only (it is master — expected green):
 - `nix develop --command cargo fmt --check` — recorded below.
 - `cargo run -p xtask -- swarm-ci-det` (tier-1 gate: builds guests + pinned CPU consensus suites) —
   recorded below.
+
+---
+
+## Merge-1 integration record (G + R)
+
+Merge-1 lands the two engine follow-ons — **Lane G** (CUDA engine arm) and **Lane R** (live
+checkpoint-resync) — onto the shared trunk. Lane S (160M fleet staging) is **NOT** in this merge; it
+lands at Merge-2 (the program gate). Integration owner: Merge-1 owner. Verified 2026-07-14 on the
+Strix Halo (AMD RADV) dev box + the RunPod 4090 evidence carried from Lane G + the deployed dev
+coordinator.
+
+### HEADs
+
+| Repo | Branch | HEAD | Note |
+|---|---|---|---|
+| daemon-node | `integrations/swarm-p3` | see `git log` (this ledger commit) | trunk after both `--no-ff` merges + the flake follow-on |
+| daemon-node | `swarm/g` | `011dd4f` | merged (`mirror(G): finalize ledger — Merge-1 seams + 4090 results + P3 throughput record`) |
+| daemon-node | `swarm/r` | `afdc129` | merged (`mirror(R): ledger — results`) |
+| daemon-node | `swarm/s` | `3afec18` | **NOT merged** — lands at Merge-2 (Lane S still running; worktree/branch untouched) |
+| daemon-cloud `daemon-api` | `swarm/p3-integration` | `6b0d978` | R's cloud half; **deployed** to the dev coordinator as version `8ca3579a`; `master` untouched; nothing pushed |
+
+### Merge commits + conflicts
+
+- `Merge branch 'swarm/g' into integrations/swarm-p3` (ort, `--no-ff`) — clean; 15 files (the
+  daemon-train engine/backend/autotune arm + cuda suites + the G ledger + throughput doc + the
+  one-line `Cargo.lock` cudarc edge).
+- `Merge branch 'swarm/r' into integrations/swarm-p3` (ort, `--no-ff`) — 12 files;
+  **`daemon-train-worker/live.rs` auto-merged** (the only co-touched engine file). G inserts
+  `worker_engine_config()`/`select_backend()` wiring at the `build_wasm_backend` + `LadderBackend`
+  call sites; R inserts the resync path (`resync_on_join`, `build_registry`, `WorkerStore::committed_set`,
+  the `Checkpointed`-publish forwarder, the `EngineEvent::Resynced` arm). The two lanes touch
+  **disjoint base-line regions** of `live.rs`, so ort composed them with no textual conflict — verified
+  post-merge: both `build_wasm_backend` call sites route through `worker_engine_config()` → `select_backend()`,
+  and the rejoin/resync path is intact.
+- **`Cargo.lock`:** G's single additive `cudarc 0.19.8` edge line only; R added no deps → no lock
+  conflict. **Guests:** neither lane changed a guest `.wasm` source (both list `guests/` off-limits);
+  the committed canonical manifest (`test_abi_basic e2a8780e…`, `tiny_llama 3bf68973…`) is identical
+  on both lane HEADs, so no manifest conflict. `build-guests` re-run on the trunk; the resulting
+  per-worktree path-keyed drift (`d370038…`/`d9aa630…` in this checkout) is **NOT committed** (the
+  standing path-keyed-codegen rule; `ensure_built()` rebuilds before load so the module in use is
+  fresh — the guard's warn-and-rebuild is the mechanism, seen firing green in the runs below).
+
+### Hard gates (the two user gates, on the MERGED trunk, this AMD box)
+
+1. **Fat-worker graceful degradation on non-NVIDIA — PASS.**
+   `cargo test -p daemon-train --features cuda --test cuda_lifecycle cuda_probe_degrades_cleanly_without_nvidia`
+   green on this AMD box: `probe_cuda()` → clean `None` (missing-libcuda dlopen unwind caught,
+   memoized-consistent), `cuda_adapter_available() == false`, `cuda_nvrtc_ready() == false`, **no
+   panic/abort**, and the CPU det lane still constructs + `da_build`s. Re-ran on the merged trunk (G
+   originally proved it on its lane HEAD).
+2. **No link-mode cudarc in the merged graph — PASS.**
+   - `cargo tree -p daemon-train -e normal` → **no** cudarc / cubecl-cuda / burn-cuda (default graph
+     clean; the `cuda` feature is off-default).
+   - `cargo tree -p daemon-train --features cuda` → cudarc `0.19.8` activated features =
+     `cuda-version-from-build-system, driver, fallback-dynamic-loading, fallback-latest, nccl,
+     nccl-02030, nvrtc, std` — **no `dynamic-linking` / `static-linking`** feature anywhere (dlopen
+     mode).
+   - ELF `readelf -d` on the built fat worker (`daemon-train-worker --features swarm-net,cuda`):
+     `DT_NEEDED` = `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2` — **no
+     `libcuda`/`libnvrtc`/`libcudart`/`libnvidia-*`**. Confirmed no link-time CUDA dependency; the
+     driver/NVRTC symbols go through lazy `libloading` dlopen.
+
+### Adjudications (verdicts)
+
+1. **Lane G deviation 2 — the wgpu rung of `select_backend()` now activates wgpu in LIVE workers
+   (previously CPU-only). VERDICT: ADOPT (keep enabled). Safe for the Merge-2 fleet run.**
+   - **Probe-gated:** the wgpu rung fires only when the `wgpu` feature is built **and** the memoized
+     `catch_unwind`-wrapped `probe_wgpu()` reports a usable adapter; otherwise it falls to the CPU det
+     lane. `DAEMON_TRAIN_BACKEND=cpu` is the operator escape hatch.
+   - **Consensus-invariant:** the det lane materializes host fp32 (`self.host` + `det_core`, shared
+     with `CpuBackend`) for every `det_*` op, so `canonical_state_bytes` (the consensus digest) is
+     backend-independent. Only the tolerance-class native lane (forward/backward/AdamW) runs on the
+     GPU. **Verified on `.#vulkan` (RADV):** `wasm_backend_determinism::cross_backend_wgpu::*`
+     (sparse_loco / diloco / demo, 6 rounds each) — **cpu-vs-wgpu det digests byte-identical every
+     round**, native payloads diverge (tolerance-class), both losses fall. This is the exact
+     consensus tripwire and it is green on the merged trunk.
+   - **Why ADOPT, not just tolerate:** at 160M the CPU native lane is intractably slow on the
+     Metal/RADV fleet peers; enabling the probe-selected GPU native lane is what makes the Merge-2
+     fleet measurement run tractable end-to-end, while the det/consensus bar is provably unchanged.
+     This is the intended shape of the program gate (real GPU peers: CUDA on the 4090, wgpu on
+     RADV/Metal). Recorded as a frozen Merge-1 seam (below).
+2. **Lane G deviation 1 — `worker_protocol` GPU-count assertion widened (`gpus == 0` →
+   `gpus <= 1` for GPU-featured builds). VERDICT: ACCEPT.** The prior assertion was factually
+   outdated by the cuda arm (a cuda/wgpu build legitimately reports one GPU); one-line,
+   behavior-preserving for every existing build shape; `worker_protocol` green on `.#vulkan` (4
+   tests) and in the cuda suite.
+3. **Lane R finding — checkpoint objects are per-peer byte-divergent (local Adam optimizer state is
+   in `checkpoint_save`). VERDICT: ACCEPT as-is for Merge-1; record the follow-on.** Byte-identity of
+   the *rejoiner* holds today because the resync loads whichever valid post-`round` checkpoint object
+   is stored (verified by its own blake3) and replays — the digest + replay depend only on the
+   **consensus half** (params + replicated persistents). The DO pointer's `cross_checked` therefore
+   means "≥2 peers uploaded a manifest", **not** "byte-identical checkpoint bytes" (the live drills
+   below show `cross_checked:false, uploads:1` yet byte-identical rejoin). **Follow-on (Lane G/B
+   territory, §9, NOT Merge-1):** if a future lane wants `cross_checked` to imply byte-identical
+   checkpoint bytes, `checkpoint_save` must exclude per-peer local state — a daemon-train backend
+   change, out of R's scope.
+
+### Cross-lane composition evidence (on the MERGED trunk)
+
+- **R's resync drill WITH G's `select_backend` present** — `checkpoint_resync.rs` (merged-trunk
+  worker built `--features swarm-net`, so `select_backend()` is compiled + exercised, resolving to
+  `Cpu` on this box) run against the **deployed `8ca3579a` coordinator**: `resync_rejoiner_is_byte_identical`
+  + `fresh_state_rejoin_still_finishes` both GREEN. Rejoiner resynced from checkpoint round 5;
+  post-resync rounds 6 & 7 digests byte-identical across all 3 peers incl. the rejoiner. (This run
+  doubles as the trunk↔cloud coherence check — see below.)
+- **Upgraded ceremony harness** — `fleet_gate_ceremony_with_churn` compiles (`--features iroh`) and
+  its **local variant is GREEN** with 3 local peers / 8 rounds against the deployed coordinator: drop
+  peer 2 after round 2 → coordinator parks (floor breach at round 6) → checkpoint-resync rejoin →
+  rounds 6 & 7 byte-identical to survivors, run Finished, B4's rejoiner-digest exclusion removed and
+  the rejoiner IS in the byte-identity assertion. **Harness note:** the *default* 2-LOCAL-peer
+  self-check does NOT drive the drop→park→rejoin cycle (a lone survivor finishes the run before the
+  floor breaches), so the churn ceremony needs **≥3 peers** — a non-issue for the Merge-2 fleet run
+  (≥4 peers) but recorded so future local runs configure `SWARM_FLEET_PEERS` with ≥3.
+- **Full parity/digest suites on `.#vulkan`** — `cargo test -p daemon-train --features wgpu` GREEN:
+  lib 43, `burn_wgpu_parity` 18, `wasm_backend_determinism` 12 (incl. `cross_backend_wgpu`),
+  `wgpu_lifecycle` 3, `worker_protocol` 4, `guest_lifecycle` 9, `preset_160m` 2, `abi_surface` 2. The
+  `#[ignore]`'d 160M-release wgpu parity cases (`reference_parity_wgpu` ×3, `preset_160m_wgpu` ×1) are
+  the heavy Merge-2 fleet-ceremony runs, deferred by design (P2 already holds the RADV 160M record).
+- **Fat-union clippy** — `-p daemon-train --features swarm-net,cuda,wgpu -D warnings` GREEN (plus
+  `cuda`, `swarm-net,cuda`), in `.#cuda-train`.
+
+### Trunk↔cloud coherence (optional user task — DONE)
+
+R's live resync drill (merged-trunk worker) ran GREEN against the already-deployed dev coordinator
+`8ca3579a` (R's cloud half `swarm/p3-integration`@`6b0d978`). The coordinator's `/state` carries the
+additive `checkpoint` pointer, the checkpointer-publish POST registers it, and the rejoiner reads it
++ resyncs byte-identically — proving the merged node trunk and the deployed cloud half are coherent.
+(No cloud redeploy in Merge-1: the deployed `8ca3579a` already matches the coordination branch tip.)
+
+### Packaging design decisions (formalized — user decisions, recorded in the lane ledgers this wave)
+
+- **D5 — ONE fat worker binary.** Backend packaging is a single worker with `ndarray + wgpu + cuda`
+  features unioned (cuda target-gated to linux/windows x86_64 at packaging time), the **runtime probe
+  ladder** (`select_backend()`: **CUDA → wgpu → CPU**) selecting the arm. HARD GATE (proven above):
+  a cuda-featured worker on non-NVIDIA degrades cleanly — no panic, **no link-time CUDA dependency**
+  (dlopen mode; ELF `DT_NEEDED` clean).
+- **D6 — nvrtc = fetch-on-demand (asset-style), driver-keyed.** NVRTC is fetched on demand keyed by
+  the detected driver version, staged into `DAEMON_CUDA_RUNTIME_DIR`; until staged, the probe
+  downgrades to wgpu/CPU (two-leg readiness gate: a **loadable `libnvrtc`** AND the **complete cudart
+  JIT include tree** at `CUDA_PATH`). Building the fetcher is a later item; the **contract** is frozen
+  here (see "Frozen Merge-1 seams"). The launcher must export **both** `DAEMON_CUDA_RUNTIME_DIR` (→
+  `LD_LIBRARY_PATH`) and `CUDA_PATH` (→ the driver-matched include tree). Merge-1 codifies the
+  `CUDA_PATH` export into the `.#cuda-train` shellHook (below).
+- **No-Nix-at-runtime for the shipped base distribution (user constraint, recorded).** The shipped
+  base distribution MUST NOT depend on Nix at runtime; the dlopen targets are the **end-user system's
+  standard paths** — Windows `System32\nvcuda.dll`, Linux ldconfig `libcuda.so.1`. (The `.#cuda-train`
+  devShell + `DAEMON_CUDA_RUNTIME_DIR` are the *developer/CI* staging mechanism, not the shipped
+  runtime contract.)
+- **Static-linkage wrinkle (packaging follow-on, NOT this merge).** dlopen from a fully-static binary
+  is the open question for the bundle work: the fat worker's final linkage shape (fully-static vs
+  dynamic libc) must be verified to still permit `libloading` dlopen of the system driver when
+  packaging lands. Recorded as a bundle-work follow-on; worker linkage shape to be verified then.
+
+### Flake follow-on applied (integration-owner right; documented)
+
+Applied G's one-line `.#cuda-train` shellHook follow-on: when `DAEMON_CUDA_RUNTIME_DIR` is set, also
+`export CUDA_PATH="$DAEMON_CUDA_RUNTIME_DIR"` (so cubecl-cuda's NVRTC kernel JIT resolves
+`#include <cuda_runtime.h>` against the **driver-matched** staged include tree, not the build-time
+nix `cudatoolkit` — a different CUDA level; G's 4090 live-attach smoke proved this must match).
+**Trivially safe:** guarded on the var being set, so it is a **no-op on this AMD box** (var unset →
+`CUDA_PATH` stays the nix `cuda-merged-12.9`, the note prints) — verified by re-entering the shell
+both ways (unset → nix path; set → the runtime dir, with `LD_LIBRARY_PATH` head matching). `nix
+develop` re-eval is instant (no derivation/package change). This is the daemon-node submodule
+`flake.nix` (no signing); FROZEN-file edit made by the integration owner per the frozen-file rule.
+
+### Frozen Merge-1 seams (extend additively only)
+
+Everything the P1+P2 frozen sections list remains authoritative. Merge-1 additionally freezes (all
+additive; `tabi@1` untouched, **wire stays v42**):
+
+- **Lane G — the backend selection ladder + CUDA engine arm:**
+  - `daemon_train::BackendKind::Cuda` (feature `cuda`) + `BurnCudaBackend = BurnBackend<Autodiff<Cuda>>`
+    + `cuda_adapter_available()`. A type-parameter swap behind the unchanged generic `BurnBackend<B>`;
+    `OpBackend`/`TrainerBackend`/`EngineConfig`/`WasmBackend` shapes unchanged (rides the existing
+    `EngineConfig.backend` + `gpu_index`). Honors the B3 §5.9 lazy host-boundary residency contract by
+    construction (shared generic).
+  - `daemon_train::autotune::{CudaProbe, probe_cuda, cuda_nvrtc_ready, cuda_device_limits}` (feature
+    `cuda`). **DeviceLimits CUDA source:** discrete — `vram_mb` from the driver `cuDeviceTotalMem`
+    (24210 MiB on the 4090 container), `shared_mb = 0`, `unified = false`, `max_alloc_mb = total VRAM`
+    (no per-buffer driver ceiling). Distinct from the wgpu/sysfs and Windows/macOS FFI sources.
+  - The worker `select_backend()` **probe order CUDA → wgpu → CPU** (feature-gated, `swarm-net`-only;
+    each rung requires its feature built + a usable probe, cuda additionally requires the D6 NVRTC
+    readiness gate) + the `DAEMON_TRAIN_BACKEND=cpu` escape hatch. The wgpu rung is **live** (adopted
+    above). `hardware()`/`device_limits()` report the cuda lane before wgpu when a device is present.
+  - **The nvrtc fetch-on-demand contract (D6):** the runtime dir named by `DAEMON_CUDA_RUNTIME_DIR`
+    must carry a driver-matched `libnvrtc.so.12` (+ `libnvrtc-builtins`), a resolvable `libstdc++`,
+    and the **complete** cudart include tree (~186 entries incl. `crt/`, `cooperative_groups/`,
+    `cuda/std/`); readiness = `cuda_nvrtc_ready()` flipping true in a fresh process (no sentinels).
+    Base distribution dlopens the box driver's own userspace from standard system paths (no Nix at
+    runtime).
+- **Lane R — the checkpoint-pointer surface + resync ladder:**
+  - **Cloud (DO) checkpoint-pointer surface** (`daemon-api` `swarm/p3-integration`, deployed
+    `8ca3579a`): `POST /api/v1/swarm/runs/:id/checkpoint {round, hash, size}` (internal-auth) →
+    `registerCheckpoint` fold → DO storage `checkpoint_pointer`; `GET /runs/:id/state` →
+    `data.checkpoint = {round, hash, size, cross_checked, uploads} | null`. `coordinator.wasm`
+    byte-unchanged (no `tick`/consensus change).
+  - **Node resync ladder** (`daemon-train-worker` live attach, `resync_on_join`): GET `/state` →
+    decide via `plan_resync` — no pointer / first epoch → fresh-state; `target == ckpt.round` →
+    `resume_from_checkpoint` (HEAD the stored object for its own hash, blake3-verified load); gap ≤
+    retention → `resync_from_checkpoint` (replay `record-set.cbor` + payloads via
+    `R2Store::fetch_record_set_object`, in record order); gap > retention (`WaitForEpoch`) or any
+    fetch miss → fresh-state + `Warning{class="resync"}`. Best-effort, never hard-fails the rejoin
+    (a real fold fault surfaces `Event::Error{Desync}`).
+  - **Additive proto/engine surfaces:** `EngineParams.payload_retention_rounds: u64`
+    (`#[serde(default)]`; `0` = unbounded) — the §9 resync-replay window; `Event::ResyncProgress
+    {round, from_checkpoint, replayed, total}` — additive off-wire telemetry via the A3 pump;
+    `CheckpointManifest.size`; `RoundEngine::resync_from_checkpoint` + the `on_round_record`
+    `<= last_ingested` resync-composability guard; net `RegistryClient::{fetch_state,
+    publish_checkpoint}` + `CheckpointPointer`/`RunState`. `JoinCredentials`/`EngineParams` back-compat
+    preserved (a pre-P3 buffer still decodes).
+
+### Gate matrix (MERGED trunk — all green unless noted)
+
+Run via `nix develop --command …`; builds capped at `CARGO_BUILD_JOBS=16` (nproc/2 = 16); one build
+at a time.
+
+- `cargo fmt --all --check` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- Feature combos `-D warnings` ✓: (default shell) `daemon-swarm-net ws,iroh` · `daemon-swarm-run
+  iroh` · `daemon-swarm-e2e iroh` · `daemon-train swarm-net` · `daemon-train wgpu` · `daemon-train
+  swarm-net,wgpu`; (`.#cuda-train`) `daemon-train cuda` · `daemon-train swarm-net,cuda` ·
+  **`daemon-train swarm-net,cuda,wgpu`** (the fat-worker union).
+- `cargo deny check` ✓ (advisories/bans/licenses/sources — cudarc adds no crate).
+- `cargo test --workspace --no-fail-fast` — **3327 passed, 2 failed**; the 2 failures are the standing
+  known flake `daemon-conformance::node::detached_delegation` under full parallel load — **green in
+  isolation** (`-p daemon-conformance --lib node::detached_delegation --test-threads=1` → 5/5 pass).
+  No swarm-lane file involved; the green-in-isolation disposition applies.
+- `.#vulkan` suites ✓ (full `daemon-train --features wgpu` suite; the cross-backend det digest
+  adjudication evidence above).
+- `live_transport` (`daemon-swarm-e2e --features iroh`) ✓ — 7/7 (incl. `live_late_join_resyncs_over_iroh`,
+  `live_flagship_three_peers_ten_rounds_all_agree`, `live_stall_ladder_recovers_over_iroh`).
+- wasm32 `daemon-swarm-proto` + `daemon-swarm-coordinator` ✓.
+- `cargo run -p xtask -- build-guests` ✓ (path-keyed drift not committed).
+- `typos docs/specs` ✓.
+- `cargo run -p xtask -- swarm-ci-det` (tier-1 CPU consensus gate) ✓.
+
+Known flakes (green-in-isolation rule, never modified): the `daemon-conformance` detached-delegation
+trio (observed + verified green in isolation this session), `f1_approvals_pending_is_owner_scoped`,
+`drills.rs::late_join_mid_run_syncs_and_contributes`.
+
+## Merge-2 launch notes (the program gate)
+
+Merge-2 = the 160M fleet measurement run (Lane S) with G's CUDA peer + R's resync active — the
+strongest end-to-end evidence the stack produces; converts spec §16/§17's two scale caveats
+(ε-convergence, <15% round overhead) into direct measurements.
+
+- **Lane S lands at Merge-2.** `swarm/s` @ `3afec18` was untouched by Merge-1 (still running in
+  `/home/j/experiments/daemon-worktree/p3-s`). Merge-2 merges `swarm/s` into `integrations/swarm-p3`
+  on top of this Merge-1 trunk; expect co-touched `Cargo.lock` (additive) + `live.rs`/worker-bin
+  edges (S's content-hash module fetch vs the merged select_backend + resync path — reconcile as
+  Merge-1 did) + `guests/guests.blake3` (regenerate canonically).
+- **The 160M fleet measurement ceremony** runs through `fleet_gate_ceremony_with_churn` /
+  `fleet_live_hetero.rs` with `SWARM_FLEET_PEERS` = the ≥4-peer heterogeneous fleet (Strix RADV /
+  RunPod 4090 CUDA / Windows 5090 / one Mac Metal), `SWARM_FLEET_WS_URL` = the dev coordinator,
+  `--observe` + `swarm-replay` for evidence. G's live GPU rungs (CUDA + the adopted wgpu rung) mean
+  each peer trains its native lane on its GPU while the det/consensus lane stays host fp32
+  (byte-identical). Configure ≥3 peers for any churn variant (the 2-peer self-check does not park).
+- **Checkpoint-retention requirement Lane S MUST honor:** R's resync reads the retained
+  `record-set.cbor` + round payloads + the `CHECKPOINT_PEER` checkpoint object (all existing §11.3
+  keys). Lane S's R2 lifecycle rule **must retain the checkpoint objects
+  (`runs/<run>/rounds/<round>/<cc..>.upd`) and record-sets ≥ `payload_retention_rounds`** — do not
+  expire them earlier than the round payloads, or a fleet-scale rejoiner falls back to fresh-state.
+  The pointer is queryable at `GET /state.checkpoint` for Lane S run tooling.
+- **Cloud:** the deployed `8ca3579a` coordinator already carries R's checkpoint-pointer surface + the
+  SigV4 presign plane (R2_* secrets set). If Merge-2 touches `coordinator-wasm`/`registry.ts`/`shell.ts`,
+  redeploy via `deploy-dev.sh` per the KEEP-IN-SYNC rule (a stale deployment was a real P2 bug).
+- **Handoff after Merge-2:** ledgers, the superproject gitlink bump (human GPG signature), and the
+  spec §16/§17 caveat removal — none of which are agent-committed on the superproject.
