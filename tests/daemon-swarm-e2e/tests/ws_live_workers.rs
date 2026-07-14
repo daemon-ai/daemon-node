@@ -383,6 +383,7 @@ fn credentials_for(i: usize, env: &LiveEnv, envelope_hash: [u8; 32]) -> JoinCred
             corpus_tokens_per_shard: 256,
             corpus_seq_len: 8,
             corpus_vocab_clamp: GUEST_VOCAB,
+            corpus: None,
         },
     }
 }
