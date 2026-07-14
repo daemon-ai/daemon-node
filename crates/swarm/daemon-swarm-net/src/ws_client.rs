@@ -379,8 +379,26 @@ fn deliver(shared: &Arc<Mutex<Shared>>, payload: Vec<u8>) {
     }
 }
 
+/// Install the aws-lc-rs [`CryptoProvider`](rustls::crypto::CryptoProvider) as the process default,
+/// once, before the first `wss://` dial.
+///
+/// rustls 0.23 refuses to auto-select a default provider when more than one is compiled in, and this
+/// tree carries BOTH aws-lc-rs (the tree posture — reqwest/`daemon-egress`) and `ring` (pulled by
+/// `rustls-platform-verifier`/iroh). tokio-tungstenite's `wss://` `ClientConfig::builder()` then
+/// panics with "Could not automatically determine the process-level CryptoProvider". aws-lc-rs
+/// matches the rest of the tree. Idempotent: a lost race (another component installed first) is fine
+/// — any already-default provider is acceptable for outbound webpki server auth. Exposed by the
+/// Merge-2 real-substrate rehearsal (wrangler-dev is plaintext `ws://` and never exercised TLS).
+fn ensure_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 /// Dial the coordinator WS endpoint with the auth headers applied (TLS auto-selected for `wss://`).
 async fn dial(endpoint: &str, auth: &WsAuth) -> Result<WsStream, SwarmNetError> {
+    ensure_crypto_provider();
     let mut request = endpoint
         .into_client_request()
         .map_err(|e| SwarmNetError::Transport(format!("bad ws url {endpoint}: {e}")))?;

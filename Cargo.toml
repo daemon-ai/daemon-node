@@ -266,6 +266,14 @@ axum = { version = "0.8", features = ["ws"] }
 # Already resolved in the tree via axum's ws feature (same 0.29), so this adds no new crates. No
 # TLS features on purpose: `wss://` terminates at a reverse proxy for now.
 tokio-tungstenite = "0.29"
+# rustls 0.23 — already resolved transitively (the tree's aws-lc-rs TLS backbone). Declared here so
+# `daemon-swarm-net`'s WS client (the `ws` feature) can install the aws-lc-rs `CryptoProvider` as the
+# process default before its first `wss://` dial: the tree compiles BOTH aws-lc-rs (reqwest/egress —
+# the tree posture) and `ring` (pulled by `rustls-platform-verifier`), so rustls 0.23 cannot
+# auto-select a default provider and tokio-tungstenite's `ClientConfig::builder()` would panic. Kept
+# behind the `ws` feature (no default gate impact); default features carry aws_lc_rs, matching the
+# rest of the tree (no second crypto backend). Lock-unchanged (same 0.23.41 already pinned).
+rustls = "0.23"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

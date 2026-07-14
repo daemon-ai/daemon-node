@@ -199,9 +199,22 @@ pub(crate) async fn join_and_run_live(
     });
 
     let engine = RoundEngine::new(control, store, backend, key, corpus, engine_cfg, ev_tx);
+    let out_for_engine = out_tx.clone();
     let engine_task = tokio::spawn(async move {
         let mut engine = engine;
-        engine.run().await
+        let result = engine.run().await;
+        // The RoundEngine `run()` error was previously only stored in this JoinHandle and never
+        // surfaced — a live-attach failure (e.g. a payload/transport fault mid-round) then looked
+        // like a silent stall to the node + the operator. Surface it as a `Warning` through the
+        // pump AND on stderr (inherited by the supervisor) so a failed round is diagnosable.
+        if let Err(e) = &result {
+            let _ = out_for_engine.send(Event::Warning {
+                class: "engine_error".to_string(),
+                detail: format!("live RoundEngine run() ended: {e}"),
+            });
+            eprintln!("[daemon-train-worker] live RoundEngine run() ended with error: {e}");
+        }
+        result
     });
 
     let _ = peer; // peer id is the Join signer; kept for parity with the harness recipe.
