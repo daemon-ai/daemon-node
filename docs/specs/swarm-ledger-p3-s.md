@@ -25,6 +25,20 @@ pre-staging. This is the staging half of the Merge-2 program gate.
 
 ## Design (as implemented)
 
+### 0. Asset-generality decision (user, mid-lane — recorded)
+
+A later wave will fetch the **CUDA runtime (nvrtc)** on demand like an asset, keyed by driver
+version. Lane S's layout is deliberately **kind-agnostic** so that lands without reshaping anything:
+
+- **On-disk cache:** [`ContentCache`] stores bare `objects/<hex-blake3>` — no module/corpus kind in
+  the key. Any future asset (an nvrtc archive, a tokenizer, a checkpoint base) caches identically.
+- **Store keys:** the R2 side rides the frozen `artifact` presign kind (`runs/<run>/<path>`); the
+  per-kind prefixes (`modules/…`, `corpus/…`) are just path conventions — a future `assets/<blake3>`
+  (or `assets/nvrtc/<driver>/<blake3>`) prefix is purely additive, no contract change.
+- **Fetch machinery:** `fetch_cached` / `fetch_artifact_from_store` take an `ArtifactRef`
+  (url + blake3) — nothing module-specific. The nvrtc fetcher itself is **NOT** built here (explicit
+  non-goal); only the layout is kept generic.
+
 ### 1. Content-addressed on-disk cache — `daemon_swarm_net::content_cache::ContentCache`
 
 A new additive module in `daemon-swarm-net` (the artifact-fetch crate). A blake3-keyed on-disk cache:

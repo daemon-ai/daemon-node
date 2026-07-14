@@ -415,17 +415,8 @@ async fn fetch_cached(
     Ok(bytes)
 }
 
-/// Decode a 64-char lowercase-hex blake3 into a [`ContentHash`].
-fn hash_from_hex(s: &str) -> Option<ContentHash> {
-    if s.len() != ContentHash::LEN * 2 {
-        return None;
-    }
-    let mut out = [0u8; ContentHash::LEN];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(ContentHash::new(out))
-}
+/// Decode a 64-char lowercase-hex blake3 into a [`ContentHash`] (shared with the prefetch mode).
+use crate::backend::hash_from_hex;
 
 #[async_trait::async_trait]
 impl PayloadStore for WorkerStore {

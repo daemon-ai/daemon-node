@@ -197,6 +197,138 @@ pub(crate) async fn fetch_artifact_from_store(art: &ArtifactRef) -> Result<Vec<u
     Ok(bytes)
 }
 
+/// Decode a 64-char lowercase-hex blake3 into a content hash.
+#[cfg(feature = "swarm-net")]
+pub(crate) fn hash_from_hex(s: &str) -> Option<daemon_swarm_net::ContentHash> {
+    use daemon_swarm_net::ContentHash;
+    let s = s.trim();
+    if s.len() != ContentHash::LEN * 2 {
+        return None;
+    }
+    let mut out = [0u8; ContentHash::LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(ContentHash::new(out))
+}
+
+/// The `DAEMON_TRAIN_PREFETCH` cache-warming mode (P3 lane S — the fleet staging entry point).
+///
+/// Runs on a bare fleet box (Windows cmd.exe, macOS, a RunPod container) with no CBOR framing:
+/// fetch the run's module and/or corpus (manifest + windowed shards) **by content hash** from the
+/// payload store into the on-disk [`daemon_swarm_net::ContentCache`], verify blake3, print per-object
+/// `key / bytes / blake3 / source(cache|store) / ms`, then exit. A subsequent live run on the box
+/// finds every artifact cache-warm. Idempotent (re-running is all cache hits).
+///
+/// Env (mirrors the assess-time fetch context; all plain strings so `set X=… && worker.exe` works):
+/// `DAEMON_SWARM_PRESIGN_BASE`, `DAEMON_SWARM_RUN_ID`, `DAEMON_SWARM_ORG`/`DAEMON_SWARM_ACTOR` (or
+/// `DAEMON_SWARM_BEARER`), `DAEMON_SWARM_CACHE_DIR`/`DAEMON_SWARM_CACHE_GB`, plus what to warm:
+/// `DAEMON_TRAIN_PREFETCH_MODULE=<blake3-hex>`, `DAEMON_TRAIN_PREFETCH_MANIFEST=<blake3-hex>`,
+/// `DAEMON_TRAIN_PREFETCH_WINDOW=<start>:<count>` (optional; absent/0 = every shard).
+#[cfg(feature = "swarm-net")]
+pub(crate) async fn prefetch_main() -> Result<(), String> {
+    let ctx = store_fetch_context();
+    if ctx.presign_base.is_none() {
+        return Err("DAEMON_TRAIN_PREFETCH needs DAEMON_SWARM_PRESIGN_BASE".to_string());
+    }
+    let cache = open_content_cache(&ctx)?;
+    let resolver = store_resolver(&ctx)?;
+    println!(
+        "prefetch: run={} presign_base={} cache_dir={} cache_gb={}",
+        ctx.run_id,
+        ctx.presign_base.as_deref().unwrap_or("-"),
+        ctx.cache_dir.display(),
+        ctx.cache_gb
+    );
+
+    /// Fetch one object, cache-first, printing the staging-evidence line.
+    async fn warm(
+        cache: &daemon_swarm_net::ContentCache,
+        resolver: &ArtifactResolver,
+        label: &str,
+        art: &ArtifactRef,
+    ) -> Result<Vec<u8>, String> {
+        let t0 = std::time::Instant::now();
+        let (bytes, source) = match cache.get(&art.blake3).await.map_err(|e| e.to_string())? {
+            Some(b) => (b, "cache"),
+            None => {
+                let b = resolver
+                    .fetch(art)
+                    .await
+                    .map_err(|e| format!("{label} ({}): {e}", art.url))?;
+                if let Err(e) = cache.insert(&art.blake3, &b).await {
+                    eprintln!("prefetch: cache insert failed for {label} (continuing): {e}");
+                }
+                (b, "store")
+            }
+        };
+        println!(
+            "prefetch: {label} bytes={} blake3={} source={source} ms={}",
+            bytes.len(),
+            art.blake3.to_hex(),
+            t0.elapsed().as_millis()
+        );
+        Ok(bytes)
+    }
+
+    let mut warmed = 0u32;
+    if let Ok(hex) = std::env::var("DAEMON_TRAIN_PREFETCH_MODULE") {
+        let hash =
+            hash_from_hex(&hex).ok_or_else(|| format!("bad DAEMON_TRAIN_PREFETCH_MODULE {hex}"))?;
+        let art = ArtifactRef::new(format!("r2://modules/{}.wasm", hash.to_hex()), hash);
+        warm(&cache, &resolver, "module", &art).await?;
+        warmed += 1;
+    }
+    if let Ok(hex) = std::env::var("DAEMON_TRAIN_PREFETCH_MANIFEST") {
+        let hash = hash_from_hex(&hex)
+            .ok_or_else(|| format!("bad DAEMON_TRAIN_PREFETCH_MANIFEST {hex}"))?;
+        let art = ArtifactRef::new(format!("r2://corpus/{}.json", hash.to_hex()), hash);
+        let manifest_bytes = warm(&cache, &resolver, "manifest", &art).await?;
+        let manifest = daemon_swarm_run::data::Manifest::from_json(
+            std::str::from_utf8(&manifest_bytes).map_err(|e| format!("manifest utf8: {e}"))?,
+        )
+        .map_err(|e| format!("parse corpus manifest: {e}"))?;
+
+        let (start, count) = std::env::var("DAEMON_TRAIN_PREFETCH_WINDOW")
+            .ok()
+            .and_then(|w| {
+                let (s, c) = w.split_once(':')?;
+                Some((s.parse().ok()?, c.parse().ok()?))
+            })
+            .unwrap_or((0u64, 0u64));
+        let indices = manifest.shards_covering(start, count);
+        println!(
+            "prefetch: corpus window start={start} count={count} -> {}/{} shards",
+            indices.len(),
+            manifest.shards.len()
+        );
+        for idx in indices {
+            let desc = &manifest.shards[idx];
+            let hash = hash_from_hex(&desc.blake3)
+                .ok_or_else(|| format!("shard {idx} malformed blake3"))?;
+            let art = ArtifactRef::new(format!("r2://corpus/{}.bin", desc.blake3), hash);
+            warm(
+                &cache,
+                &resolver,
+                &format!("shard[{idx}] {}", desc.name),
+                &art,
+            )
+            .await?;
+            warmed += 1;
+        }
+        warmed += 1;
+    }
+    if warmed == 0 {
+        return Err(
+            "DAEMON_TRAIN_PREFETCH set but neither DAEMON_TRAIN_PREFETCH_MODULE nor \
+             DAEMON_TRAIN_PREFETCH_MANIFEST given — nothing to warm"
+                .to_string(),
+        );
+    }
+    println!("prefetch: OK ({warmed} objects verified + cache-warm)");
+    Ok(())
+}
+
 /// The `.wasm` module bytes from `DAEMON_TRAIN_MODULE` (the dev / node-controlled override), if set.
 /// `Some(Err(..))` means the var is set but the read failed.
 fn module_from_env() -> Option<Result<Vec<u8>, String>> {
