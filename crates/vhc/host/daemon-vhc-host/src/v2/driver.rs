@@ -251,10 +251,6 @@ struct PumpState {
     /// The final bridge canonical state, exported by the guest thread before it drops the
     /// store (the parity-oracle hook: the digest input, §3.6 tier-3 comparisons).
     bridge_final_state: Option<Vec<u8>>,
-    /// Sealed-container watermark + the newest sealed update wire (Phase-A plumbing-owned
-    /// sealing at the commit seam; see the publish import).
-    sealed_containers: usize,
-    latest_sealed_update: Option<(usize, Vec<u8>)>,
     /// The per-instance buffer table (kind 8, architecture §3.4) — shared between the guest
     /// thread's imports and completion-arrival minting, behind this pump lock.
     buffers: BufferTable,
@@ -620,19 +616,6 @@ impl PumpHandle {
         Ok(())
     }
 
-    /// Take the newest plumbing-sealed update container: `(container index, canonical wire)`.
-    /// Set at the commit seam (a publish that followed a `da_make_update` in the same run);
-    /// `take` semantics so the session stages each sealed container exactly once (§5.11).
-    #[must_use]
-    pub fn take_sealed_update(&self) -> Option<(usize, Vec<u8>)> {
-        self.shared
-            .state
-            .lock()
-            .expect("pump lock")
-            .latest_sealed_update
-            .take()
-    }
-
     /// The bridge's final canonical state bytes (the digest input), exported by the guest thread
     /// before it dropped the store. `None` until the run ends, or when no bridge was linked.
     #[must_use]
@@ -718,6 +701,9 @@ struct V2Host {
     // Whether the open slice consumed a staged update (read_back kind 2) — its close is the v1
     // ingest epilogue: the §5.9 barrier snapshot (post-ingest master → next round's base).
     slice_ingested: bool,
+    // Sealed-container watermark (B1 sealing-gap retirement): containers the bridge has built
+    // that were already sealed + announced to the guest at a slice boundary.
+    sealed_containers: usize,
     // signing (§12.1)
     signing: SigningKey,
     identity: RunIdentity,
@@ -889,6 +875,36 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                             format!("retry with buf_cap {buf_cap} < required {required} (§4.1)"),
                         ));
                     }
+                }
+                // B1 (the sealing-gap retirement): a bridge container completed in the slice
+                // that just ended is sealed HERE — at the slice boundary — and ANNOUNCED to the
+                // guest as PayloadReady kind 0. Bridge-plane serialization stays a host service
+                // until Phase C's compute export, but the guest now owns the commitment path:
+                // read_back → create_from → payload_put → author the commitment over the
+                // completion hash. Watermarked, so a NeedCapacity retry never double-stages.
+                let sealed: Option<Vec<u8>> = {
+                    let d = c.data_mut();
+                    match d.tabi.as_ref() {
+                        Some(tabi) => {
+                            // GUEST-BUILT containers only: an inbound-staged container (read_back
+                            // kind 2) must never be re-announced as the guest's own.
+                            let n = tabi.guest_container_count();
+                            if n > d.sealed_containers {
+                                let bytes = tabi.seal_guest_container_of(n - 1);
+                                d.sealed_containers = n;
+                                bytes
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(bytes) = sealed {
+                    let sh = c.data().shared.clone();
+                    let mut st = sh.state.lock().expect("pump lock");
+                    stage_own_bytes(&mut st, bytes)
+                        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
                 }
                 let shared = c.data().shared.clone();
                 // Park until an event is deliverable, firing due timers ourselves (§6.3).
@@ -1483,22 +1499,6 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                     .publish(u64::from(channel_id), seq, &payload, &frame)
                     .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
                 st.published.push((u64::from(channel_id), seq, frame));
-                // Phase-A plumbing-owned sealing: if this run's bridge built a new update
-                // container since the last publish, seal the newest to its canonical wire at
-                // the commit point — v1's host sealing relocated to the v2 commit seam, so the
-                // session can stage the committed set at the barrier. The guest-visible sealing
-                // path (Phase B `payload_put`) retires this.
-                {
-                    let d = c.data();
-                    if let Some(tabi) = d.tabi.as_ref() {
-                        let n = tabi.container_count();
-                        if n > st.sealed_containers {
-                            st.latest_sealed_update =
-                                tabi.seal_container_of(n - 1).map(|b| (n - 1, b));
-                            st.sealed_containers = n;
-                        }
-                    }
-                }
                 Ok(seq)
             })(&mut c);
             stash(&mut c, r)
@@ -1630,6 +1630,38 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     Ok(())
 }
 
+/// Stage the guest's own sealed container bytes and announce them as `PayloadReady` kind 0 —
+/// the slice-boundary half of the B1 sealing-gap retirement (see the `next_event` body).
+fn stage_own_bytes(st: &mut PumpState, bytes: Vec<u8>) -> Result<(), SinkError> {
+    if st.stop_enqueued {
+        return Ok(()); // no deliveries after Stop (§4.4)
+    }
+    let hash = *blake3::hash(&bytes).as_bytes();
+    let staging_id = st.next_host_staging_id;
+    st.next_host_staging_id += 1;
+    let size = bytes.len() as u64;
+    st.staged.insert(staging_id, (STAGED_KIND_BYTES, bytes));
+    let ev = EventV2::PayloadReady {
+        staging_id,
+        hash,
+        meta: PayloadMeta {
+            size,
+            kind: STAGED_KIND_BYTES,
+            channel: None,
+        },
+    };
+    let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
+    st.queue.push_back(QueuedEvent {
+        frame_bytes,
+        tag: daemon_vhc_abi::EV_TAG_PAYLOAD_READY,
+        signed: None,
+        payload_hash: Some(hash),
+        timer_id: None,
+        is_budget: false,
+    });
+    Ok(())
+}
+
 /// Move due timers into the queue as `Timer` events, in `(fire_at, timer_id)` order (§6.3).
 fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
     if !st.timers.iter().any(|t| t.fire_at <= now) {
@@ -1749,8 +1781,6 @@ pub fn start_run(
             logs: Vec::new(),
             published: Vec::new(),
             bridge_final_state: None,
-            sealed_containers: 0,
-            latest_sealed_update: None,
             // Generation-seeded by the instantiation counter (0: this driver instantiates once
             // per start_run; trap-restart re-seeding rides the tag-13 counter, ABI §7.1).
             buffers: BufferTable::new(0, run.max_live_buffer_handles, run.max_live_buffer_bytes),
@@ -1811,6 +1841,7 @@ pub fn start_run(
                 tabi: bridge.then(|| crate::runtime::HostState::new(&engine_cfg)),
                 slice_pass_open: false,
                 slice_ingested: false,
+                sealed_containers: 0,
                 signing,
                 identity: run.identity.clone(),
                 sender,
@@ -2059,8 +2090,6 @@ mod tests {
             logs: Vec::new(),
             published: Vec::new(),
             bridge_final_state: None,
-            sealed_containers: 0,
-            latest_sealed_update: None,
             buffers: BufferTable::new(0, 0, 0),
             ops: OpTable::new(0, 0),
             op_requests: Vec::new(),
@@ -2134,6 +2163,7 @@ mod tests {
             tabi: None,
             slice_pass_open: false,
             slice_ingested: false,
+            sealed_containers: 0,
             signing,
             identity: RunIdentity {
                 run_id: [1u8; 32],

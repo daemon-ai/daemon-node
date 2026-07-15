@@ -15,12 +15,28 @@ extern "C" {
     fn abi_next_event(buf_ptr: u32, buf_cap: u32) -> u64;
     #[link_name = "read_back"]
     fn abi_read_back(src: u64, kind: u32, out_ptr: u32, out_cap: u32) -> u64;
+    // -- minor 1 (Phase B, track B1): the buffer layer + cancellation (§3.4/§7.5) --------------
+    #[link_name = "create_from"]
+    fn abi_create_from(ptr: u32, len: u32) -> u64;
+    #[link_name = "read_into"]
+    fn abi_read_into(buffer: u64, offset: u64, out_ptr: u32, out_cap: u32) -> u64;
+    #[link_name = "buffer_len"]
+    fn abi_buffer_len(buffer: u64) -> u64;
+    #[link_name = "buffer_release"]
+    fn abi_buffer_release(buffer: u64);
+    #[link_name = "cancel"]
+    fn abi_cancel(op: u64) -> u32;
 }
 
 #[link(wasm_import_module = "net@2")]
 extern "C" {
     #[link_name = "publish"]
     fn abi_publish(channel_id: u32, payload_ptr: u32, payload_len: u32) -> u64;
+    // -- minor 1: content-addressed payloads by handle (§3.4) — complete via Event::Completion --
+    #[link_name = "payload_put"]
+    fn abi_payload_put(buffer: u64) -> u64;
+    #[link_name = "payload_get"]
+    fn abi_payload_get(hash_ptr: u32) -> u64;
 }
 
 #[link(wasm_import_module = "sys@2")]
@@ -142,4 +158,62 @@ pub fn publish(channel: u32, payload: &[u8]) -> u64 {
 pub fn set_timer(delay_ms: u64) -> u64 {
     // SAFETY: plain-value import.
     unsafe { abi_set_timer(delay_ms) }
+}
+
+// -- minor 1 (Phase B, track B1): buffers + the completion protocol (§3.4/§7.5) -------------------
+
+/// Seal `bytes` into a host buffer (the budgeted linear-memory OUT path; sealed at creation).
+/// Returns the kind-8 `BufferHandle`. Requires declaring abi minor ≥ 1.
+pub fn create_from(bytes: &[u8]) -> u64 {
+    // SAFETY: `bytes` is a live guest span for the call's duration.
+    unsafe { abi_create_from(bytes.as_ptr() as u32, bytes.len() as u32) }
+}
+
+/// Read a sealed buffer back into guest memory in full (the budgeted linear-memory IN path,
+/// charged against the per-slice readback allowance).
+#[must_use]
+pub fn read_buffer(buffer: u64) -> Vec<u8> {
+    // SAFETY: plain-value import.
+    let len = unsafe { abi_buffer_len(buffer) } as usize;
+    let mut out = vec![0u8; len];
+    if len > 0 {
+        // SAFETY: `out` is a live guest span for the call's duration.
+        let n = unsafe { abi_read_into(buffer, 0, out.as_mut_ptr() as u32, len as u32) };
+        out.truncate(n as usize);
+    }
+    out
+}
+
+/// The sealed length of a buffer (deterministic bookkeeping).
+#[must_use]
+pub fn buffer_len(buffer: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_buffer_len(buffer) }
+}
+
+/// Release the guest's hold on a buffer (frees its quota; §3.4 ownership).
+pub fn buffer_release(buffer: u64) {
+    // SAFETY: plain-value import.
+    unsafe { abi_buffer_release(buffer) };
+}
+
+/// Cancel an outstanding op (§7.5): `0` = accepted (its completion will report `Cancelled`),
+/// `1` = already completed/cancelled or unknown.
+pub fn cancel(op: u64) -> u32 {
+    // SAFETY: plain-value import.
+    unsafe { abi_cancel(op) }
+}
+
+/// Store a sealed buffer on the run's payload plane (§3.4). Returns the `OpId`; completes with
+/// `Ok(hash)` — the content commitment computed host-side over exactly the sealed bytes.
+pub fn payload_put(buffer: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_payload_put(buffer) }
+}
+
+/// Fetch content-addressed bytes (§3.4). Returns the `OpId`; completes with `Ok(BufferHandle)`
+/// after host-side hash verification.
+pub fn payload_get(hash: &[u8; 32]) -> u64 {
+    // SAFETY: `hash` is a live 32-byte guest span for the call's duration.
+    unsafe { abi_payload_get(hash.as_ptr() as u32) }
 }

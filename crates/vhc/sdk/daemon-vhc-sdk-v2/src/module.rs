@@ -18,6 +18,10 @@ pub struct ModuleDecl {
     pub name: &'static str,
     /// Module version (manifest `version`).
     pub version: &'static str,
+    /// The declared major-2 ABI **minor** (ABI §1.1): MUST be ≥ the highest introducing minor of
+    /// the module's static imports (§1.3 step 5) and ≤ the host's implemented minor. `0` = the
+    /// Phase-A closed subset; `1` = the B1 buffer/completion surface.
+    pub abi_minor: u32,
     /// Channels the module publishes/subscribes on (manifest `channels`, §6.2).
     pub channels: Vec<u32>,
     /// Long-lived host-accountable state bytes (params, queues, config) — the module's floor.
@@ -128,7 +132,7 @@ pub fn manifest_bytes(decl: &ModuleDecl) -> Vec<u8> {
         (text("name"), text(decl.name)),
         (text("version"), text(decl.version)),
         (text("sdk"), text("daemon-vhc-sdk-v2")),
-        (text("abi"), uint(u64::from(2u32 << 16))),
+        (text("abi"), uint(u64::from((2u32 << 16) | decl.abi_minor))),
         (
             text("channels"),
             ciborium::value::Value::Array(

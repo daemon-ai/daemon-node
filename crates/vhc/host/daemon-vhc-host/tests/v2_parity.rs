@@ -174,6 +174,16 @@ fn guest_cfg_bytes() -> Vec<u8> {
 fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while pump.published().len() < n {
+        // Service the guest's payload_put (the B1 guest-authored sealing path): the harness is
+        // the async-runtime seat; the pump computes the commitment hash itself.
+        for (op, request) in pump.take_op_requests() {
+            match request {
+                daemon_vhc_host::v2::OpRequest::PayloadPut { .. } => pump
+                    .complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
+                    .expect("put completion"),
+                other => panic!("unexpected op request from the parity guest: {other:?}"),
+            }
+        }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {n} publishes (have {})",
