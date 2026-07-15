@@ -32,6 +32,7 @@ pub mod data;
 pub mod engine;
 pub mod protocol;
 pub mod seam;
+pub mod v2_attach;
 // The A2 dependency inversion (refactor §5 A2 item 3): the session links the HOST (never the
 // reverse — the host stopped linking run policy). `WasmBackend` — the TrainerBackend seam filled
 // by the wasm host runtime — moved here from `daemon-vhc-host` with the inversion: the trait it
