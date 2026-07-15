@@ -451,7 +451,7 @@ mod tests {
     fn any_vhc_v2_import_selects_v2_even_with_tabi_bridge() {
         // A major-2 module MAY also link the tabi@1 bridge (ABI §2.5); the candidate is still V2.
         let ns = ns_set(&[NS_VHC_V2, NS_SYS_V2, NS_TABI_V1]);
-        let exports = ns_set(&V2_REQUIRED_EXPORTS.to_vec());
+        let exports = ns_set(V2_REQUIRED_EXPORTS);
         assert_eq!(
             select_candidate(&ns, &exports).unwrap(),
             CandidateDriver::V2
