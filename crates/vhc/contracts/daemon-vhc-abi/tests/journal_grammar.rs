@@ -63,7 +63,7 @@ fn sample_records() -> Vec<(u8, Value)> {
                     ("role", t("trainer")),
                     ("instance", u(42)),
                     ("module", b(&H32)),
-                    ("abi", u((2 << 16) | 0)),
+                    ("abi", u(2 << 16)),
                     (
                         "worlds",
                         Value::Map(vec![(t("vhc"), u(0)), (t("net"), u(0))]),

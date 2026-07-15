@@ -28,12 +28,16 @@
 pub mod capture;
 pub mod desync;
 pub mod health;
+pub mod journal;
 pub mod log;
 pub mod replay;
 
 pub use capture::RunCapture;
 pub use desync::{digest_tally, DesyncVerdict};
 pub use health::{RoundHealth, RunHealth};
+pub use journal::{
+    Body, ExecIdentity, Journal, JournalError, JournalPaths, Record, RotatePolicy, SidecarError,
+};
 pub use log::{MessageKind, MessageLog};
 pub use replay::{
     genesis_seed, logged_round_records, replay, replay_capture, replay_from_state,
