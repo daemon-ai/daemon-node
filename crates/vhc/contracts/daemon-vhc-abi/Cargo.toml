@@ -15,5 +15,13 @@ path = "src/lib.rs"
 # contracts ground). Keeping it dep-free lets both the guest SDK and the host runtime pin the same
 # frozen surface without either side pulling the other (deletes the host->SDK dev-dep wart).
 
+[dev-dependencies]
+# Grammar-validity gate ONLY (dev-only; never on the runtime/wasm32 surface, so the zero-dep rule
+# above is preserved). The `journal_grammar` test asserts the normative §8.3 journal CDDL
+# (`JOURNAL_CDDL`) parses + validates as-is under the same validator + exact pin the proto/daemon-api
+# conformance suites use. `ciborium` builds the per-tag CBOR samples the grammar is checked against.
+cddl-cat = "=0.7.1"
+ciborium = { workspace = true }
+
 [lints]
 workspace = true

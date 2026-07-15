@@ -1,0 +1,136 @@
+; daemon-vhc-journal.cddl — the VHC journal record grammar (ABI companion §8.2/§8.3/§8.5).
+;
+; This is the NORMATIVE, machine-valid, complete tagged-union grammar for the crash-safe segmented
+; journal (ABI §8.3). It lives verbatim in `daemon-vhc-abi` (the shared contracts ground), it MUST
+; validate as-is under a CDDL validator (`cddl-cat`), and tier-1 CI validates every record of every
+; conformance-run journal against it (§13) — a journal containing a record the grammar rejects fails
+; the gate. Tags are permanent; the union is additive by minor (tags 18–63 reserved). Bodies are
+; canonical-CBOR maps with explicit string keys; every enumeration is an assigned numeric value.
+;
+; The Rust record types + canonical codec live host-side in `daemon-vhc-observe::journal` (the abi
+; crate is dep-free / dual-compiled for wasm32, so it holds the grammar, not a serde encoder). The
+; observe `journal_grammar` test encodes a sample of every tag and validates it against this file;
+; the abi `journal_grammar` test validates the grammar itself parses (machine-valid).
+;
+; Note on byte lengths: matching daemon-swarm.cddl / daemon-api.cddl, `cddl-cat` parses but does not
+; enforce `.size N`; fixed-width byte fields carry their `.size` here verbatim from the spec (the
+; Rust newtypes enforce the actual length). `hash32` is a 32-byte blake3.
+
+; ===================================================================================================
+; §8.3 — the journal record grammar (root: `journal-record`)
+; ===================================================================================================
+
+journal-record = run-header-rec / event-rec / read-back-rec / clock-rec / publish-rec
+               / timer-arm-rec / timer-cancel-rec / drop-rec / throttle-rec / terminal-rec
+               / snapshot-rec / init-rec / signed-frame-rec / instantiation-rec
+               / completion-rec / device-profile-rec / condition-rec / seal-rec
+
+hash32 = bstr .size 32
+ord    = uint                        ; per-journal monotone record ordinal
+
+run-header-rec = [0, ord, {
+  "run_id": hash32, "epoch": uint, "role": tstr, "instance": uint, "module": hash32,
+  "abi": uint,                       ; negotiated (major << 16) | minor
+  "worlds": { * tstr => uint },      ; negotiated per-world minors
+  "bridge": bool,
+  "manifest": bstr, "config": bstr, "grants": bstr, "claim": bstr,
+  "channels": bstr, "device": bstr,  ; each: verbatim canonical-CBOR bytes of the admitted value
+  "format": uint,                    ; journal format version (1)
+}]
+
+event-rec = [1, ord, {
+  "at": uint,                        ; logical delivery time (§6.5), sampled before delivery
+  "frame": bstr,                     ; the exact frame bytes returned by next_event
+}]
+
+read-back-rec = [2, ord, {
+  "src": uint, "kind": uint, "status": uint,
+  ("value": bstr //                  ; inline iff plaintext <= READBACK_INLINE_MAX (§8.5)
+   "sidecar": sidecar-ref),          ; else an encrypted content-addressed sidecar (§8.5)
+}]
+
+clock-rec        = [3, ord, { "now": uint }]
+
+publish-rec = [4, ord, {
+  "channel": uint, "seq": uint,
+  "hash": hash32,                    ; blake3 of the guest payload
+  "frame": bstr,                     ; the COMPLETE signed wire frame (§8.6, §12)
+}]
+
+timer-arm-rec    = [5, ord, { "id": uint, "delay": uint, "armed_at": uint }]
+timer-cancel-rec = [6, ord, { "id": uint, "status": uint }]
+
+drop-rec = [7, ord, {
+  "class": uint,                     ; 0 = payload-ready, 1 = timer, 2 = gossip, 3 = budget
+  "rule": uint,                      ; coalesce code (§2.3): 0 dedup-hash, 1 latest-wins, 2 drop-oldest
+  "dropped": drop-id,
+}]
+drop-id = {
+  ? "hash": hash32, ? "timer_id": uint, ? "channel": uint, ? "sender": hash32, ? "seq": uint,
+}
+
+throttle-rec = [8, ord, { "paused": bool, "duty_pct": uint, "vram_cap_bytes": uint }]
+
+terminal-rec = [9, ord, {
+  "kind": uint,                      ; 0 = outcome, 1 = trap, 2 = forced interruption
+  ? "outcome": uint,                 ; present iff kind = 0
+  ? "trap": trap-info,               ; present iff kind = 1 or 2
+}]
+trap-info = { "code": tstr, "import": tstr, "context": tstr, "detail": tstr }
+
+snapshot-rec = [10, ord, { "manifest": bstr }]   ; verbatim accepted state-manifest bytes (§10.2)
+
+init-rec = [11, ord, {
+  "config_hash": hash32, "grants_hash": hash32,  ; MUST equal blake3 of tag-0 config/grants bytes
+  "status": uint,                                ; the da_init return (§9.4 step 11)
+}]
+
+signed-frame-rec = [12, ord, {
+  "channel": uint, "seq": uint, "sender": hash32,
+  ("frame": bstr //                  ; inline original signed wire frame (Phase A)
+   "evidence": evidence-ref),        ; archive reference once durably archived (Phase D)
+}]
+evidence-ref = { "hash": hash32, "locator": tstr }
+
+instantiation-rec = [13, ord, {
+  "counter": uint,                   ; the generation seed of §7.1
+  "reason": uint,                    ; 0 = initial, 1 = trap-restart, 2 = upgrade-activation
+  "at": uint,                        ; logical time of instantiation (the da_init now() value, §6.5)
+}]
+
+completion-rec     = [14, ord, { "op": uint, "result": bstr }]   ; reserved (Phase B)
+device-profile-rec = [15, ord, { "profile": bstr }]              ; reserved (Phase B)
+condition-rec      = [16, ord, { "code": tstr, "detail": tstr }] ; §6.7 run conditions
+
+seal-rec = [17, ord, {
+  "segment_blake3": hash32,          ; hash of this segment EXCLUDING this seal record (§8.2)
+  "records": uint,
+}]
+
+sidecar-ref = { "hash": hash32, "size": uint, "seg": uint }      ; §8.5
+
+; ===================================================================================================
+; §8.2 — segment header body (root: `segment-header-body`)
+;
+; The on-disk segment framing (magic || format_version || prev_segment_blake3 || len || body || CRC)
+; is byte-level and not expressible in CDDL; the canonical-CBOR header BODY is:
+; ===================================================================================================
+
+segment-header-body = {
+  "run_id": hash32, "epoch": uint, "role": tstr, "instance": uint,
+  "module": hash32, "segment": uint,          ; segment ordinal, 0-based
+}
+
+; ===================================================================================================
+; §8.5 — encrypted content-addressed sidecar header (root: `sidecar-header`)
+;
+; File layout: magic "DVHCSC01" || u32-LE len || sidecar-header (canonical CBOR) || ciphertext ||
+; 16-byte Poly1305 tag, with the header as AEAD AAD.
+; ===================================================================================================
+
+sidecar-header = {
+  "run_id": hash32, "epoch": uint, "role": tstr, "instance": uint, "module": hash32,
+  "ord": uint,                      ; referencing record ordinal (nonce input)
+  "hash": hash32,                   ; blake3 of the PLAINTEXT (the content address)
+  "size": uint,                     ; plaintext size
+}

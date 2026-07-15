@@ -4867,6 +4867,10 @@ dependencies = [
 [[package]]
 name = "daemon-vhc-abi"
 version = "0.0.1"
+dependencies = [
+ "cddl-cat",
+ "ciborium",
+]
 
 [[package]]
 name = "daemon-vhc-coordinator"

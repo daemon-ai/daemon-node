@@ -27,6 +27,65 @@ pub const DA_ABI_MINOR: u32 = 0;
 /// before instantiation (swarm-tensor-abi-spec.md §4).
 pub const DA_ABI_VERSION: u32 = (DA_ABI_MAJOR << 16) | DA_ABI_MINOR;
 
+// ================================================================================================
+// The journal (ABI companion §8): the normative record grammar + its framing constants.
+//
+// The crash-safe segmented journal makes policy-determinism operational (ABI §8, architecture
+// §3.6). Its record format is a versioned ABI artifact that lives *here* (ABI §8.3: "it lives
+// verbatim in `daemon-vhc-abi`"), because both the substrate that writes it (`daemon-vhc-observe`)
+// and any conformance validator must agree on one authoritative grammar. This crate stays
+// dependency-free / dual-compiled for wasm32, so it holds the grammar text + the framing constants
+// only; the Rust record types + canonical CBOR codec live host-side in
+// `daemon-vhc-observe::journal` and validate their output against [`JOURNAL_CDDL`].
+// ================================================================================================
+
+/// The normative, machine-valid, complete journal record grammar (ABI §8.2/§8.3/§8.5).
+///
+/// This is the authoritative CDDL artifact: it MUST validate as-is under `cddl-cat`, and tier-1 CI
+/// validates every record of every conformance-run journal against it (ABI §13). Root rules:
+/// `journal-record` (the §8.3 tagged union), `segment-header-body` (§8.2), and `sidecar-header`
+/// (§8.5). Growth is additive by minor — tags 18–63 are reserved; tags are permanent.
+pub const JOURNAL_CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/journal.cddl"));
+
+/// The on-disk magic identifying a VHC journal segment file (ABI §8.2 header).
+pub const JOURNAL_SEGMENT_MAGIC: &[u8; 8] = b"DVHCJRN2";
+
+/// The on-disk magic identifying a VHC encrypted sidecar file (ABI §8.5 file layout).
+pub const JOURNAL_SIDECAR_MAGIC: &[u8; 8] = b"DVHCSC01";
+
+/// The journal format version carried in every segment header and the run-header record (ABI §8.2
+/// `format_version`, §8.3 tag-0 `format`).
+pub const JOURNAL_FORMAT_VERSION: u32 = 1;
+
+/// The inline/sidecar threshold for `read_back` values (ABI §8.5): a value whose plaintext exceeds
+/// this many bytes is stored as an encrypted content-addressed sidecar rather than inline in the
+/// record. An ABI constant so writer and replay agree on the boundary.
+pub const READBACK_INLINE_MAX: usize = 4096;
+
+/// The numeric tag of every journal record variant (ABI §8.3). Tags are permanent and additive by
+/// minor; the reserved range is 18–63. Kept as an explicit list so the substrate and any conformance
+/// tool share one source of truth for "the complete record set".
+pub const JOURNAL_RECORD_TAGS: &[u8] = &[
+    0,  // run-header
+    1,  // event
+    2,  // read-back
+    3,  // clock
+    4,  // publish
+    5,  // timer-arm
+    6,  // timer-cancel
+    7,  // drop
+    8,  // throttle
+    9,  // terminal
+    10, // snapshot
+    11, // init
+    12, // signed-frame
+    13, // instantiation
+    14, // completion (reserved, Phase B)
+    15, // device-profile (reserved, Phase B)
+    16, // condition
+    17, // seal
+];
+
 /// The complete `tabi@1` import vocabulary the guest SDK binds (the extern block in the SDK's
 /// `abi.rs`), in registration order: the Merge-1 frozen 50-import subset followed by the Wave-2
 /// additions.
