@@ -38,15 +38,15 @@ pub enum BackendKind {
     /// The `CpuBackend` fixed-order fp32 tape (MVP behavior; det lane is bit-exact everywhere).
     #[default]
     Cpu,
-    /// The burn-ndarray autodiff engine (native lane = tolerance class; det lane = det-core fp32).
+    /// The burn-ndarray autodiff engine (native lane = tolerance class; det lane = daemon-vhc-det fp32).
     #[cfg(feature = "burn-ndarray")]
     BurnNdarray,
     /// The burn-wgpu autodiff engine (Vulkan/RADV; native lane = tolerance class, det lane =
-    /// det-core fp32, bit-identical to `Cpu`). Device chosen by [`EngineConfig::gpu_index`].
+    /// daemon-vhc-det fp32, bit-identical to `Cpu`). Device chosen by [`EngineConfig::gpu_index`].
     #[cfg(feature = "wgpu")]
     Wgpu,
     /// The burn-cuda autodiff engine (NVIDIA CUDA / NVRTC JIT; native lane = tolerance class, det
-    /// lane = det-core fp32, bit-identical to `Cpu`). Device chosen by [`EngineConfig::gpu_index`].
+    /// lane = daemon-vhc-det fp32, bit-identical to `Cpu`). Device chosen by [`EngineConfig::gpu_index`].
     /// The 4090-validated discrete lane (swarm-ledger-p3-g); mirrors the `Wgpu` arm exactly (a burn
     /// `AutodiffBackend` type-parameter swap behind the same `BurnBackend<B>`).
     #[cfg(feature = "cuda")]
@@ -1062,7 +1062,7 @@ impl Instance {
     /// The canonical state bytes the round digest is taken over (spec §5.6): every param fp32 master,
     /// then the `class = 1` **replicated** native persistents, then the replicated det persistents —
     /// all in registration order, little-endian. Local (`class = 0`) persistents are excluded (peers
-    /// rebuild them, ABI §5.1). Feed this to `daemon_swarm_proto::digest::digest_state`.
+    /// rebuild them, ABI §5.1). Feed this to `daemon_vhc_proto::digest::digest_state`.
     #[must_use]
     pub fn canonical_state_bytes(&self) -> Vec<u8> {
         let d = self.store.data();

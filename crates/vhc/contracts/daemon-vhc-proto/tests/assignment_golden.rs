@@ -7,13 +7,13 @@
 //! (the upstream Psyche swap-or-not sources are not vendored, ledger-P2 deviation): they lock the
 //! LCG/shuffle output so any future change to the assignment math is a visible, deliberate break.
 
-use daemon_swarm_proto::assignment::{
+use daemon_vhc_proto::assignment::{
     assign_batches, deterministic_shuffle, seeded_lcg, select_committee, witness_quorum,
     ASSIGN_SALT, WITNESS_SALT,
 };
-use daemon_swarm_proto::envelope::GlobalBatch;
-use daemon_swarm_proto::messages::{BatchWindow, ThroughputClass};
-use daemon_swarm_proto::{advance_cursor, global_batch_at, Lcg, PeerId, Seed};
+use daemon_vhc_proto::envelope::GlobalBatch;
+use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
+use daemon_vhc_proto::{advance_cursor, global_batch_at, Lcg, PeerId, Seed};
 
 const GOLDEN_SEED_RAW: u64 = 0xDAE0_7E57;
 

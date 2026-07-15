@@ -54,18 +54,18 @@ use daemon_swarm_net::ControlPlane;
 use daemon_swarm_net::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
 use daemon_swarm_observe::desync::digest_tally_from_log;
 use daemon_swarm_observe::{MessageLog, RunHealth};
-use daemon_swarm_proto::envelope::{
-    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
-    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
-};
-use daemon_swarm_proto::{
-    from_canonical_slice, peer_id, to_canonical_vec, SignedMessage, SigningKey,
-};
 use daemon_swarm_run::protocol::{
     CorpusRef, EngineParams, Event, JoinCredentials, JoinPolicy, LeaveMode, PolicyMode, WsAuthSpec,
 };
 use daemon_train_client::{TrainClientConfig, TrainSupervisor};
 use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_proto::envelope::{
+    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
+    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
+};
+use daemon_vhc_proto::{
+    from_canonical_slice, peer_id, to_canonical_vec, SignedMessage, SigningKey,
+};
 
 const STEPS_PER_ROUND: u32 = 2;
 const MICRO_BATCH: u32 = 1;
@@ -217,14 +217,14 @@ fn author_envelope(env: &StageEnv, run_id: &str, peers: u32, global_batch: u32) 
         "experiment.wasm".to_string(),
         Artifact {
             url: format!("r2://modules/{module_hex}.wasm"),
-            blake3: daemon_swarm_proto::Hash::new(env.module_blake3),
+            blake3: daemon_vhc_proto::Hash::new(env.module_blake3),
         },
     );
     artifacts.insert(
         "data.manifest".to_string(),
         Artifact {
             url: format!("r2://corpus/{manifest_hex}.json"),
-            blake3: daemon_swarm_proto::Hash::new(env.manifest_blake3),
+            blake3: daemon_vhc_proto::Hash::new(env.manifest_blake3),
         },
     );
     Envelope {
@@ -312,7 +312,7 @@ async fn get_json(egress: &EgressClient, env: &StageEnv, url: &str) -> (u16, ser
 fn create_run_request(
     env: &StageEnv,
     envelope: &Envelope,
-    frozen: &daemon_swarm_proto::FrozenEnvelope,
+    frozen: &daemon_vhc_proto::FrozenEnvelope,
     global_batch: u32,
 ) -> serde_json::Value {
     use base64::Engine as _;
@@ -329,7 +329,7 @@ fn create_run_request(
     serde_json::json!({
         "run_id": envelope.run.run_id,
         "schema": ENVELOPE_SCHEMA_MAJOR,
-        "proto_version": daemon_swarm_proto::SWARM_PROTO_VERSION,
+        "proto_version": daemon_vhc_proto::SWARM_PROTO_VERSION,
         "envelope_b64": base64::engine::general_purpose::STANDARD.encode(frozen.bytes()),
         "author_pubkey": frozen.signer().to_hex(),
         "signature": frozen.signature().to_hex(),

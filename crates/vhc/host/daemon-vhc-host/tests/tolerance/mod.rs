@@ -7,7 +7,7 @@
 //! sequence on a **backend-under-test** and a **reference** [`OpBackend`], asserting forward outputs
 //! and backward grads agree within the op's class. The native lane is not bit-identical across
 //! backends (burn autodiff vs the CpuBackend tape, later wgpu) so equality is *by class*, never
-//! exact — except the det lane / compression natives, which delegate to `det_core` host-side and
+//! exact — except the det lane / compression natives, which delegate to `daemon_vhc_det` host-side and
 //! MUST be byte-identical (`OpClass::Exact`).
 //!
 //! This module is a shared test harness (a subdirectory module, so cargo does not build it as its
@@ -23,7 +23,7 @@ use daemon_train::OpBackend;
 /// The tolerance class of an op (the HOST-3 machinery). Pinned in [`tol_for`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpClass {
-    /// Bit-exact: det lane + compression natives (both delegate to `det_core` host-side).
+    /// Bit-exact: det lane + compression natives (both delegate to `daemon_vhc_det` host-side).
     Exact,
     /// Pure data moves (reshape/transpose/slice) — bit-exact permutations.
     Shape,

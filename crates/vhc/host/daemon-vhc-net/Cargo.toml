@@ -9,7 +9,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-daemon-swarm-proto = { workspace = true }
+daemon-vhc-proto = { workspace = true }
 # `ContainedRoot` (openat2 RESOLVE_BENEATH|NO_SYMLINKS) is the sanctioned fs surface: the
 # `FsPayloadStore` is rooted at one so peer-supplied key components can never escape the store root
 # (the workspace-wide clippy fs ban points here).

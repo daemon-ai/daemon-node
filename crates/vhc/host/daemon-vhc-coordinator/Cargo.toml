@@ -16,7 +16,7 @@ path = "src/lib.rs"
 # lean-contract convention. The runnable local coordinator (axum/WS) + its deps land in Wave 3
 # (lane R owns `bins/`), which re-adds the server dependencies then. Root Cargo.toml is FROZEN and
 # untouched.
-daemon-swarm-proto = { workspace = true }
+daemon-vhc-proto = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

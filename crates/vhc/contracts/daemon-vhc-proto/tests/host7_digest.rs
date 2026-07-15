@@ -12,8 +12,8 @@
 // as the host does (params, then replicated persistents, in registration order, ABI §6.3), and the
 // digest is the shared `digest_state` pure function; two peers computing it must agree.
 
-use daemon_swarm_proto::bytes::Seed;
-use daemon_swarm_proto::digest::{derive_schedule, digest_state, StateLayout};
+use daemon_vhc_proto::bytes::Seed;
+use daemon_vhc_proto::digest::{derive_schedule, digest_state, StateLayout};
 
 const BLOCK: u32 = 64;
 

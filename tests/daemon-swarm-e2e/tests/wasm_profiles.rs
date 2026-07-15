@@ -36,22 +36,22 @@ use daemon_swarm_coordinator::{
     tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
 };
 use daemon_swarm_observe::{genesis_seed, replay};
-use daemon_swarm_proto::envelope::{
-    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
-    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
-};
-use daemon_swarm_proto::messages::{
-    Commitment, Digest, Join, Locator, RecordEntry, RoundRecord, StorageReceipt, ThroughputClass,
-};
-use daemon_swarm_proto::{
-    peer_id, CapabilitySet, Hash, IrohId, PeerId, SignedMessage, SigningKey, StateDigest,
-    SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
-};
 use daemon_swarm_run::backend::{
     BatchRef, StagedPayload, StateDigest as RunDigest, StepCtx, TrainerBackend,
 };
 use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig};
 use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_proto::envelope::{
+    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
+    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
+};
+use daemon_vhc_proto::messages::{
+    Commitment, Digest, Join, Locator, RecordEntry, RoundRecord, StorageReceipt, ThroughputClass,
+};
+use daemon_vhc_proto::{
+    peer_id, CapabilitySet, Hash, IrohId, PeerId, SignedMessage, SigningKey, StateDigest,
+    SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
+};
 
 // -- guest module loading (mirrors daemon-train/tests) ------------------------------------------
 

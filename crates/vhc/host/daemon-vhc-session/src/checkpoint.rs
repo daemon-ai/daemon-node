@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use daemon_swarm_proto::{blake3_hash, Hash, PeerId};
+use daemon_vhc_proto::{blake3_hash, Hash, PeerId};
 
 use crate::backend::{StagedPayload, StateDigest, TrainerBackend};
 use crate::seam::{PayloadKey, RoundId, RunId};

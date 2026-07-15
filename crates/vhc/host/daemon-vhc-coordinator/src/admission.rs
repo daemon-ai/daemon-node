@@ -14,8 +14,8 @@
 //! different envelope is rejected with `EnvelopeHashMismatch`; a legacy join that omits the hash
 //! passes `None` and skips the check (back-compat).
 
-use daemon_swarm_proto::messages::Join;
-use daemon_swarm_proto::{CapabilitySet, Hash, PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::messages::Join;
+use daemon_vhc_proto::{CapabilitySet, Hash, PeerId, SwarmProtoVersion};
 
 use crate::config::RunConfig;
 use crate::io::AdmissionReject;

@@ -16,9 +16,9 @@
 //! This is the P0 milestone: the swap from R2's TEST-ONLY scripted coordinator to the real tick
 //! loop landed at Merge 2.
 
-use daemon_swarm_proto::peer_id;
 use daemon_swarm_run::engine::EngineEvent;
 use daemon_swarm_run::harness::{peer_key, run_swarm, verify_observe_dir, StallFault, SwarmConfig};
+use daemon_vhc_proto::peer_id;
 
 /// The 20-round, 3-peer scenario with a stall at round 7 and catch-up at round 8.
 fn scenario() -> SwarmConfig {

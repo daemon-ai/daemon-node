@@ -34,16 +34,16 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
-use daemon_swarm_proto::envelope::{
-    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
-    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
-};
-use daemon_swarm_proto::{peer_id, to_canonical_vec, SigningKey};
 use daemon_swarm_run::protocol::{
     EngineParams, Event, JoinCredentials, JoinPolicy, LeaveMode, PolicyMode, WsAuthSpec,
 };
 use daemon_train_client::{TrainClientConfig, TrainSupervisor};
 use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_proto::envelope::{
+    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
+    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
+};
+use daemon_vhc_proto::{peer_id, to_canonical_vec, SigningKey};
 
 const NUM_WORKERS: usize = 3;
 const ROUNDS: u64 = 8;
@@ -146,7 +146,7 @@ fn author_envelope(
         "tiny_llama.wasm".to_string(),
         Artifact {
             url: format!("file://{}", module_path.display()),
-            blake3: daemon_swarm_proto::blake3_hash(module_bytes),
+            blake3: daemon_vhc_proto::blake3_hash(module_bytes),
         },
     );
     Envelope {
@@ -235,7 +235,7 @@ async fn get_json(egress: &EgressClient, env: &LiveEnv, url: &str) -> (u16, serd
 
 fn create_run_request(
     envelope: &Envelope,
-    frozen: &daemon_swarm_proto::FrozenEnvelope,
+    frozen: &daemon_vhc_proto::FrozenEnvelope,
     module_bytes: &[u8],
     global_batch: u32,
 ) -> serde_json::Value {
@@ -243,13 +243,13 @@ fn create_run_request(
     serde_json::json!({
         "run_id": envelope.run.run_id,
         "schema": ENVELOPE_SCHEMA_MAJOR,
-        "proto_version": daemon_swarm_proto::SWARM_PROTO_VERSION,
+        "proto_version": daemon_vhc_proto::SWARM_PROTO_VERSION,
         "envelope_b64": base64::engine::general_purpose::STANDARD.encode(frozen.bytes()),
         "author_pubkey": frozen.signer().to_hex(),
         "signature": frozen.signature().to_hex(),
         "artifacts": [{
             "path": "tiny_llama.wasm",
-            "blake3": daemon_swarm_proto::blake3_hash(module_bytes).to_hex(),
+            "blake3": daemon_vhc_proto::blake3_hash(module_bytes).to_hex(),
             "size": module_bytes.len(),
         }],
         "update_max_bytes": u64::from(envelope.requirements.update_mb_max) * 1024 * 1024,

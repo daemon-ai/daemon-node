@@ -5,15 +5,15 @@
 // golden completion). This is the P2 golden completion of the profile machinery P1 shipped: the
 // DCT/chunk/top-k pipeline, error-feedback accumulation across rounds, quantization legality,
 // compression-ratio invariants, and cross-round determinism — driven through the `sim` backend
-// (ABI §10.4), whose det lane delegates to the shared `det-core` kernels so "sim ≡ host".
+// (ABI §10.4), whose det lane delegates to the shared `daemon-vhc-det` kernels so "sim ≡ host".
 //
 // Oracle provenance (swarm-ledger-p2-b1.md "Golden oracle provenance"):
 //  - Pinned-literal goldens are recorded from the bit-reproducible `sim` reference at the daemon
-//    seed 0xDAE0_7E57 (matches det-core's SEED). The det lane is CPU fp32 with fixed evaluation
+//    seed 0xDAE0_7E57 (matches daemon-vhc-det's SEED). The det lane is CPU fp32 with fixed evaluation
 //    order (spec §5.6), so these literals are stable across targets/vendors by construction; a drift
 //    is a deliberate break in the profile math.
 //  - From-definition goldens recompute the expected value by an independent expression of the spec
-//    math (a direct `det-core` call path) and assert bit-for-bit against the profile pipeline.
+//    math (a direct `daemon-vhc-det` call path) and assert bit-for-bit against the profile pipeline.
 #![cfg(feature = "sim")]
 
 use daemon_train_sdk::profiles::{Demo, DemoCfg, DiLoCo, DiLoCoCfg, SparseLoco, SparseLocoCfg};
@@ -264,7 +264,7 @@ fn sdk2_quantization_legality_and_compression_ratio() {
 // ===== SDK-3: chunk-top-k index codec fits within 12 bits per value =============================
 
 /// TDD SDK-3: indices are `< chunk`, so within the paper's 4096 chunk each retained index fits in
-/// ≤12 bits (`2^12 = 4096`). Verified from-definition against the shared `det-core::topk_chunk`
+/// ≤12 bits (`2^12 = 4096`). Verified from-definition against the shared `daemon-vhc-det::topk_chunk`
 /// (the exact kernel `sparse_loco` composes) over a deterministic sweep of chunk contents.
 #[test]
 fn sdk3_topk_indices_fit_within_12_bits() {
@@ -281,7 +281,7 @@ fn sdk3_topk_indices_fit_within_12_bits() {
             ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
         })
         .collect();
-    let (_vals, idx) = det_core::topk_chunk(&x, chunk, k).unwrap();
+    let (_vals, idx) = daemon_vhc_det::topk_chunk(&x, chunk, k).unwrap();
     assert_eq!(idx.len(), (numel / chunk) * k);
     for &i in &idx {
         assert!(i < chunk as u32, "index must be within the chunk");

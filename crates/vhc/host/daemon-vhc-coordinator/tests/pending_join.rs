@@ -18,19 +18,19 @@
 mod common;
 
 use common::*;
-use daemon_swarm_proto::peer_id;
+use daemon_vhc_proto::peer_id;
 
 use daemon_swarm_coordinator::{tick, Input, Phase};
 
-fn keys(n: u8) -> Vec<daemon_swarm_proto::SigningKey> {
+fn keys(n: u8) -> Vec<daemon_vhc_proto::SigningKey> {
     (1..=n).map(key).collect()
 }
 
 /// Drive one full round to completion via the commit + storage-receipt fast path (no timeouts).
 fn complete_round(
     mut state: daemon_swarm_coordinator::CoordinatorState,
-    ks: &[daemon_swarm_proto::SigningKey],
-    coord: &daemon_swarm_proto::SigningKey,
+    ks: &[daemon_vhc_proto::SigningKey],
+    coord: &daemon_vhc_proto::SigningKey,
     round: u64,
     seed: u8,
 ) -> daemon_swarm_coordinator::CoordinatorState {
@@ -38,7 +38,7 @@ fn complete_round(
         let (s, _) = tick(state, Input::Message(commitment_msg(k, round, seed)));
         state = s;
     }
-    let entries: Vec<(daemon_swarm_proto::PeerId, u8)> =
+    let entries: Vec<(daemon_vhc_proto::PeerId, u8)> =
         ks.iter().map(|k| (peer_id(k), seed)).collect();
     let (s, _) = tick(state, Input::Message(receipt_msg(coord, round, &entries)));
     s
@@ -114,7 +114,7 @@ fn pending_join_materializes_at_epoch_boundary() {
     let mut cfg = base_config();
     cfg.min_peers = 2;
     cfg.epoch_rounds = 2;
-    cfg.stop = daemon_swarm_proto::envelope::StopCondition::Rounds(100);
+    cfg.stop = daemon_vhc_proto::envelope::StopCondition::Rounds(100);
     let coord = key(200);
     let ks = keys(2);
     let mut state = to_first_round(cfg.clone(), &ks);
@@ -160,7 +160,7 @@ fn pending_join_never_materializes_mid_run_when_epoch_rounds_zero() {
     let mut cfg = base_config();
     cfg.min_peers = 2;
     cfg.epoch_rounds = 0; // single epoch — no mid-run roster refreeze
-    cfg.stop = daemon_swarm_proto::envelope::StopCondition::Rounds(100);
+    cfg.stop = daemon_vhc_proto::envelope::StopCondition::Rounds(100);
     let coord = key(200);
     let ks = keys(2);
     let mut state = to_first_round(cfg, &ks);

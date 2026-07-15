@@ -12,7 +12,7 @@
 //! `tick`.
 //!
 //! [`crate::replay::replay_from_state`] re-runs `tick` from the captured initial state over that
-//! trace and verifies the coordinator's [`RoundRecord`](daemon_swarm_proto::messages::RoundRecord)s
+//! trace and verifies the coordinator's [`RoundRecord`](daemon_vhc_proto::messages::RoundRecord)s
 //! re-derive; a companion [`MessageLog`] supplies the **independent** wire-recorded records as the
 //! oracle to compare against (PROTO-20 / §6.4 I1). Serializes as `magic + one canonical-CBOR blob`,
 //! so two writes of one capture are byte-identical.
@@ -20,7 +20,7 @@
 use std::io::{Read, Write};
 
 use daemon_swarm_coordinator::{CoordinatorState, Input};
-use daemon_swarm_proto::{from_canonical_slice, to_canonical_vec};
+use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec};
 
 use crate::ObserveError;
 

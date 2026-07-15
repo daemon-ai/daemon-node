@@ -10,10 +10,10 @@
 
 use std::collections::BTreeMap;
 
-use daemon_swarm_proto::messages::{
+use daemon_vhc_proto::messages::{
     Attestation, BatchWindow, Commitment, RecordEntry, RoundRecord, ThroughputClass,
 };
-use daemon_swarm_proto::{IrohId, PeerId, Seed, StateDigest};
+use daemon_vhc_proto::{IrohId, PeerId, Seed, StateDigest};
 use serde::{Deserialize, Serialize};
 
 use crate::config::RunConfig;

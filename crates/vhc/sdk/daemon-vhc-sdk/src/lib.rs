@@ -8,14 +8,14 @@
 //! (ABI §4/§10.2), and — under the `sim` feature — an in-crate CPU reference backend so experiments
 //! are unit-testable natively without a GPU or the wasm host (ABI §10.4). It targets
 //! `wasm32-unknown-unknown` (it runs inside the sandboxed module, ABI §5.1); its entire dependency
-//! surface is `serde` + `ciborium` (+ `det-core` under `sim`).
+//! surface is `serde` + `ciborium` (+ `daemon-vhc-det` under `sim`).
 //!
 //! ## Build shapes (why the `cfg` gating looks like this)
 //!
 //! - **wasm guest** (`target_arch = "wasm32"`, no `sim`): the real `tabi@1` extern block + `da_*`
 //!   export trampolines. This is the shipped module.
 //! - **sim** (`feature = "sim"`, native): the extern block is replaced by an in-crate CPU backend
-//!   (`det-core`-backed det lane + a tiny reverse-mode tape) so `cargo test --features sim` runs a
+//!   (`daemon-vhc-det`-backed det lane + a tiny reverse-mode tape) so `cargo test --features sim` runs a
 //!   toy experiment end to end.
 //! - **native, no `sim`** (the default workspace gate): the crate compiles down to its constants +
 //!   error type only. The tensor surface needs a backend, so it is `cfg`-gated to the two shapes

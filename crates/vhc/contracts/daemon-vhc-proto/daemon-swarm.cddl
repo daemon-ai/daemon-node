@@ -3,7 +3,7 @@
 ; Every peer↔coordinator and peer↔peer control message is deterministic CBOR (serde/ciborium via
 ; the crate's canonical RFC 8949 §4.2 encoder), signed by the node identity (§7.2), and versioned by
 ; `SwarmProtoVersion` (u16) — independent of the app `WireVersion`. The Rust serde types in
-; `daemon-swarm-proto` are the source of truth; this file is the authoritative schema the
+; `daemon-vhc-proto` are the source of truth; this file is the authoritative schema the
 ; `cddl_conformance` test validates real ciborium bytes against.
 ;
 ; Note on byte lengths: `cddl-cat` (the in-process validator, matching daemon-api's flow) does not

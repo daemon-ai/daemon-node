@@ -10,7 +10,7 @@
 //! shape cites its Psyche `file:line` anchor and records the 0.97 -> 1.0 delta inline.
 //!
 //! The plane carries **already-signed opaque bytes** — signing/verification is proto's surface
-//! (`daemon_swarm_proto::SignedMessage`, canonical CBOR + ed25519), not the transport's (§7.1:
+//! (`daemon_vhc_proto::SignedMessage`, canonical CBOR + ed25519), not the transport's (§7.1:
 //! gossip is dissemination, never arbitration). Delivery matches [`LoopbackGossip`]
 //! (crate::gossip::LoopbackGossip), the conformance twin: publish -> every subscriber, once.
 //!
@@ -43,7 +43,7 @@ use iroh_gossip::proto::{HyparviewConfig, PlumtreeConfig, TopicId};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use daemon_swarm_proto::blake3_hash;
+use daemon_vhc_proto::blake3_hash;
 
 use crate::dedupe::Deduper;
 use crate::transport::{ControlPlane, ControlSubscription};

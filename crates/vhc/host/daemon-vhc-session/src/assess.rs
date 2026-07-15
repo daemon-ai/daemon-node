@@ -17,7 +17,7 @@
 //! Both are pure + engine-free, so they are unit-testable without a worker (the eligibility *verdict*
 //! over the real worker protocol is `daemon-train-client`'s `assess`, RUN-10's supervisor half).
 
-use daemon_swarm_proto::capability::{Capability, CapabilitySet};
+use daemon_vhc_proto::capability::{Capability, CapabilitySet};
 
 /// The pre-screen verdict (before module fetch).
 #[derive(Clone, Debug, PartialEq, Eq)]

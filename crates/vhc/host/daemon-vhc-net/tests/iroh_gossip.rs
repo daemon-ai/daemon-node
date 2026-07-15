@@ -13,7 +13,7 @@ mod common;
 use std::time::Duration;
 
 use daemon_swarm_net::{ControlPlane, IrohPeer, RebroadcastConfig};
-use daemon_swarm_proto::{from_canonical_slice, SignedMessage};
+use daemon_vhc_proto::{from_canonical_slice, SignedMessage};
 
 use common::iroh_harness::{
     build_mesh, connect_node, connect_relay_node, no_rebroadcast, wait_for_mesh, wire_roster,

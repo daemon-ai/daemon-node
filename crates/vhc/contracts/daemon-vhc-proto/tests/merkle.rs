@@ -3,8 +3,8 @@
 
 //! Merkle set-commitment conformance (TDD PROTO-5 root/proof half, spec §6.4).
 
-use daemon_swarm_proto::merkle::{commit_set, MembershipProof};
-use daemon_swarm_proto::{Hash, PeerId};
+use daemon_vhc_proto::merkle::{commit_set, MembershipProof};
+use daemon_vhc_proto::{Hash, PeerId};
 
 fn peer(n: u32) -> PeerId {
     let mut b = [0u8; 32];

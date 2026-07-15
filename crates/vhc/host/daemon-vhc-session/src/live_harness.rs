@@ -41,9 +41,9 @@ use daemon_swarm_net::{
     DownloadScheduler, FsPayloadStore, IrohGossip, IrohGossipConfig, IrohPeer, RebroadcastConfig,
     RetryConfig,
 };
-use daemon_swarm_proto::envelope::StopCondition;
-use daemon_swarm_proto::messages::{RecordEntry, RoundRecord};
-use daemon_swarm_proto::{
+use daemon_vhc_proto::envelope::StopCondition;
+use daemon_vhc_proto::messages::{RecordEntry, RoundRecord};
+use daemon_vhc_proto::{
     from_canonical_slice, peer_id, PeerId, SignedMessage, SigningKey, SwarmMessage,
     SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
@@ -270,7 +270,7 @@ where
         version,
         state: CoordinatorState::new(
             build_run_config(&run, base),
-            daemon_swarm_proto::Seed([0xAB; 32]),
+            daemon_vhc_proto::Seed([0xAB; 32]),
             0,
         ),
         bootstrap_keys: boot_keys.clone(),

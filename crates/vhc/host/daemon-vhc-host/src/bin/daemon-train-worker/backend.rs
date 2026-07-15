@@ -10,11 +10,11 @@
 use std::collections::BTreeSet;
 
 use daemon_swarm_net::{ArtifactRef, ArtifactResolver};
-use daemon_swarm_proto::{from_canonical_slice, SignedEnvelope};
 use daemon_swarm_run::protocol::{Eligibility, Hardware, WorkerCapabilities};
 use daemon_train::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
 use daemon_train::phase::PHASE_TABLE;
 use daemon_train::{EngineConfig, Worker};
+use daemon_vhc_proto::{from_canonical_slice, SignedEnvelope};
 
 use crate::SEQ;
 
@@ -71,7 +71,7 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
 /// Every path blake3-verifies the bytes against the artifact-map hash **before** `assess`/
 /// instantiation ([`ArtifactResolver::fetch`] / [`ContentCache`]), so a tampered module is rejected
 /// before the wasm engine loads it (§6.5, §12).
-async fn resolve_module(frozen: &daemon_swarm_proto::FrozenEnvelope) -> Result<Vec<u8>, String> {
+async fn resolve_module(frozen: &daemon_vhc_proto::FrozenEnvelope) -> Result<Vec<u8>, String> {
     if let Some(bytes) = module_from_env() {
         return bytes;
     }

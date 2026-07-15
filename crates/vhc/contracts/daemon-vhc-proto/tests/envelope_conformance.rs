@@ -6,11 +6,11 @@
 use std::collections::BTreeMap;
 
 use ciborium::value::Value;
-use daemon_swarm_proto::envelope::{
+use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition,
 };
-use daemon_swarm_proto::{blake3_hash, to_canonical_vec, Hash, SigningKey};
+use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, SigningKey};
 
 fn text(s: &str) -> Value {
     Value::Text(s.into())
@@ -168,15 +168,15 @@ fn verify_signature_rejects_tamper() {
     let mut bytes = frozen.bytes().to_vec();
     bytes[10] ^= 0x01;
     let reopened =
-        daemon_swarm_proto::FrozenEnvelope::open(bytes, *frozen.signature(), *frozen.signer());
+        daemon_vhc_proto::FrozenEnvelope::open(bytes, *frozen.signature(), *frozen.signer());
     assert!(reopened.is_err(), "tampered envelope must fail to open");
 
     // A wrong signer is also rejected on a pristine body.
     let other = SigningKey::from_bytes(&[0x11; 32]);
-    let bad = daemon_swarm_proto::FrozenEnvelope::open(
+    let bad = daemon_vhc_proto::FrozenEnvelope::open(
         frozen.bytes().to_vec(),
         *frozen.signature(),
-        daemon_swarm_proto::peer_id(&other),
+        daemon_vhc_proto::peer_id(&other),
     );
     assert!(bad.is_err());
 }

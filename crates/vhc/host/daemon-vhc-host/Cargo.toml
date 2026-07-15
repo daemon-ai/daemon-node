@@ -29,7 +29,7 @@ name = "daemon-train-probe"
 path = "src/bin/daemon-train-probe.rs"
 
 [dependencies]
-daemon-swarm-proto = { workspace = true }
+daemon-vhc-proto = { workspace = true }
 # Host worker runtime: the wasm module sandbox (wasmtime) + the training engine (Burn, ndarray
 # backend + autodiff; NO GPU backends in the default gate) + content hashing for artifact / tensor
 # digests (blake3, xxh3). swarm-training-spec.md §5.1, §10.1. Heavy trees on purpose: this crate is
@@ -40,8 +40,8 @@ blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
 thiserror = { workspace = true }
 # The shared fixed-order fp32 det-lane kernels (bit-exact sim ≡ host, ABI §5.9) + the CBOR codec for
-# the manifest/config contract (ABI §6.1/§6.2). det-core is zero-dep; serde/ciborium are already pins.
-det-core = { workspace = true }
+# the manifest/config contract (ABI §6.1/§6.2). daemon-vhc-det is zero-dep; serde/ciborium are already pins.
+daemon-vhc-det = { workspace = true }
 serde = { workspace = true }
 ciborium = { workspace = true }
 # The R↔E seam (`TrainerBackend`) + the frozen node↔worker wire (`daemon_swarm_run::protocol`), lane R

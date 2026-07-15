@@ -25,14 +25,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
-use daemon_swarm_proto::envelope::{
-    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
-    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
-};
-use daemon_swarm_proto::{to_canonical_vec, FrozenEnvelope, Hash, SigningKey};
 use daemon_swarm_run::harness::{run_swarm, SwarmConfig};
 use daemon_swarm_run::protocol::{JoinPolicy, LeaveMode, PolicyMode};
 use daemon_train_client::{TrainClientConfig, TrainSupervisor};
+use daemon_vhc_proto::envelope::{
+    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
+    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
+};
+use daemon_vhc_proto::{to_canonical_vec, FrozenEnvelope, Hash, SigningKey};
 
 /// The peer backend the runner drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -264,7 +264,7 @@ async fn main() -> Result<()> {
         if let Ok(bytes) = read_module(abs) {
             if let Some(art) = envelope.artifacts.get_mut(&module_name) {
                 art.url = format!("file://{}", abs.display());
-                art.blake3 = daemon_swarm_proto::blake3_hash(&bytes);
+                art.blake3 = daemon_vhc_proto::blake3_hash(&bytes);
             }
         }
     }
@@ -450,7 +450,7 @@ fn create_run_request(envelope: &Envelope, frozen: &FrozenEnvelope) -> Result<se
     Ok(serde_json::json!({
         "run_id": envelope.run.run_id,
         "schema": ENVELOPE_SCHEMA_MAJOR,
-        "proto_version": daemon_swarm_proto::SWARM_PROTO_VERSION,
+        "proto_version": daemon_vhc_proto::SWARM_PROTO_VERSION,
         "envelope_b64": base64::engine::general_purpose::STANDARD.encode(frozen.bytes()),
         "author_pubkey": frozen.signer().to_hex(),
         "signature": frozen.signature().to_hex(),

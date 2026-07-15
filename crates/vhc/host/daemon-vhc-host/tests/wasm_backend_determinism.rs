@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 
-use daemon_swarm_proto::{blake3_hash, PeerId};
 use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
 use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig};
 use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_proto::{blake3_hash, PeerId};
 use serde::Serialize;
 
 // -- guest module loading (mirrors tests/guest_lifecycle.rs) ------------------------------------
@@ -362,7 +362,7 @@ fn preemption_as_churn_is_digest_neutral() {
 // nice-to-have that does NOT hold bit-for-bit, because the two seed their param init RNG differently
 // (the host seeds via `runtime::fake_init` FNV/xorshift by name; the sim via `sim::init_values`
 // splitmix/Box-Muller), so even the *initial* masters differ before a single step. Both now run a
-// real reverse-mode tape over the shared det-core kernels (HOST-9), so both learn from data; only
+// real reverse-mode tape over the shared daemon-vhc-det kernels (HOST-9), so both learn from data; only
 // the det-lane ingest fold is a required numerics reference (ABI §7), and it is bit-identical.
 //
 // So sim-vs-host is exercised as *each backend is internally deterministic* (a re-run reproduces its
@@ -581,7 +581,7 @@ mod cross_backend {
 //
 // Same structure as `cross_backend` above, with the burn peer on `BackendKind::Wgpu` (a real Vulkan
 // device). The det lane never touches the GPU (`BurnBackend` materializes host-side and runs
-// det-core, ABI §5.9), so the det digests MUST stay **byte-identical** to the CpuBackend peer while
+// daemon-vhc-det, ABI §5.9), so the det digests MUST stay **byte-identical** to the CpuBackend peer while
 // the native lanes (losses, payloads) diverge. GPU-skip convention: skips loudly when no adapter.
 #[cfg(feature = "wgpu")]
 mod cross_backend_wgpu {
@@ -697,7 +697,7 @@ mod cross_backend_wgpu {
 //
 // Same structure as `cross_backend_wgpu` above, with the burn peer on `BackendKind::Cuda` (a real
 // NVIDIA device). The det lane never touches the GPU (`BurnBackend` materializes host-side and runs
-// det-core, ABI §5.9), so the det digests MUST stay **byte-identical** to the CpuBackend peer while
+// daemon-vhc-det, ABI §5.9), so the det digests MUST stay **byte-identical** to the CpuBackend peer while
 // the native lanes (losses, payloads) diverge — the "byte-identical by construction" claim (both
 // peers ingest the SAME committed set; the CUDA peer's own native math differs but the shared det-lane
 // fold is bit-exact). GPU-skip convention: skips loudly when no CUDA device.

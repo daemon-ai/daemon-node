@@ -295,12 +295,12 @@ fn swarm_ci_det() -> anyhow::Result<()> {
     // (label, cargo test args). Each runs in its own process; the first red aborts.
     let suites: &[(&str, &[&str])] = &[
         (
-            "det-core (shared det kernels: sim ≡ host)",
-            &["-p", "det-core"],
+            "daemon-vhc-det (shared det kernels: sim ≡ host)",
+            &["-p", "daemon-vhc-det"],
         ),
         (
-            "daemon-swarm-proto (state machine + assignment + envelope + canonical CBOR)",
-            &["-p", "daemon-swarm-proto"],
+            "daemon-vhc-proto (state machine + assignment + envelope + canonical CBOR)",
+            &["-p", "daemon-vhc-proto"],
         ),
         (
             "daemon-swarm-run (harness + assess + replay, loopback)",

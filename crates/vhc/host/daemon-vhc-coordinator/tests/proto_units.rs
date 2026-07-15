@@ -13,8 +13,8 @@ mod common;
 
 use common::*;
 use daemon_swarm_coordinator::{tick, ClientState, CoordinatorState, Input, Notice, Output, Phase};
-use daemon_swarm_proto::assignment::elect_checkpointer;
-use daemon_swarm_proto::{peer_id, PeerId, Seed};
+use daemon_vhc_proto::assignment::elect_checkpointer;
+use daemon_vhc_proto::{peer_id, PeerId, Seed};
 
 /// Drive round `round` to finalize: `committers` commit + are storage-receipted. If the committed
 /// set is the full healthy roster the receipt fast-path finalizes immediately; otherwise (silent
@@ -22,8 +22,8 @@ use daemon_swarm_proto::{peer_id, PeerId, Seed};
 /// one carrying the `RoundRecord` + any drop notices).
 fn finalize_round_timeout(
     mut state: CoordinatorState,
-    committers: &[daemon_swarm_proto::SigningKey],
-    coord: &daemon_swarm_proto::SigningKey,
+    committers: &[daemon_vhc_proto::SigningKey],
+    coord: &daemon_vhc_proto::SigningKey,
     round: u64,
 ) -> (CoordinatorState, Vec<Output>) {
     for k in committers {
@@ -158,7 +158,7 @@ fn epoch_ends_at_epoch_rounds() {
     // Cooldown at the epoch boundary (roster re-freeze), not before.
     let mut cfg = base_config();
     cfg.epoch_rounds = 3;
-    cfg.stop = daemon_swarm_proto::envelope::StopCondition::Rounds(1_000);
+    cfg.stop = daemon_vhc_proto::envelope::StopCondition::Rounds(1_000);
     let a = key(1);
     let b = key(2);
     let coord = key(200);

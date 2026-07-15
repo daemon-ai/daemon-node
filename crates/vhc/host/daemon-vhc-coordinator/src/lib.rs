@@ -9,7 +9,7 @@
 //! [`Input::Control`] — so the same logic runs identically in a local server, a private node, and the
 //! cloud Durable Object (§11.2), is property-testable, and is the foundation of the offline replay
 //! oracle (I1, TDD PROTO-20). The deterministic per-round assignment it relies on lives in the
-//! wasm-clean [`daemon_swarm_proto::assignment`] module (re-exported below).
+//! wasm-clean [`daemon_vhc_proto::assignment`] module (re-exported below).
 //!
 //! The runnable local coordinator (axum/WS wiring, the tick loop over a real clock and transport)
 //! is Wave 3 — lane R owns `bins/`. This crate never performs I/O and never signs (see the ledger).
@@ -38,7 +38,7 @@ pub use tick::tick;
 
 // Re-export the assignment seam so consumers get committee/batch math without a second import
 // (it is the proto crate's authority; the coordinator does not fork it).
-pub use daemon_swarm_proto::assignment::{
+pub use daemon_vhc_proto::assignment::{
     assign_batches, deterministic_shuffle, elect_checkpointer, global_batch_at, seeded_lcg,
     select_committee, select_verifiers, witness_quorum, Committee, Lcg,
 };
@@ -50,7 +50,7 @@ pub use daemon_swarm_proto::assignment::{
 #[non_exhaustive]
 pub enum CoordinatorError {
     /// A proto-contract step failed (canonicalization, capability parse, envelope validation).
-    Proto(daemon_swarm_proto::SwarmProtoError),
+    Proto(daemon_vhc_proto::SwarmProtoError),
     /// The run configuration was inconsistent.
     Config(String),
 }
@@ -73,8 +73,8 @@ impl Error for CoordinatorError {
     }
 }
 
-impl From<daemon_swarm_proto::SwarmProtoError> for CoordinatorError {
-    fn from(e: daemon_swarm_proto::SwarmProtoError) -> Self {
+impl From<daemon_vhc_proto::SwarmProtoError> for CoordinatorError {
+    fn from(e: daemon_vhc_proto::SwarmProtoError) -> Self {
         Self::Proto(e)
     }
 }

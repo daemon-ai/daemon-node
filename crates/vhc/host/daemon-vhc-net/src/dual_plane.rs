@@ -69,8 +69,8 @@ impl DualPlane {
 /// receive-side pre-filter must drop. Undecodable / non-`Commitment` frames are never dropped here
 /// (the engine's own `verify_for_run` handles bad frames; only the size policy lives at the edge).
 fn commitment_over_cap(bytes: &[u8], cap: u64) -> bool {
-    use daemon_swarm_proto::messages::SwarmMessage;
-    match daemon_swarm_proto::from_canonical_slice::<daemon_swarm_proto::SignedMessage>(bytes) {
+    use daemon_vhc_proto::messages::SwarmMessage;
+    match daemon_vhc_proto::from_canonical_slice::<daemon_vhc_proto::SignedMessage>(bytes) {
         Ok(msg) => matches!(&msg.payload, SwarmMessage::Commitment(c) if c.size > cap),
         Err(_) => false,
     }
@@ -157,12 +157,12 @@ mod tests {
     /// delivery, while an under-cap `Commitment` (and any non-`Commitment` frame) passes.
     #[tokio::test]
     async fn receive_size_cap_drops_oversize_commitment() {
-        use daemon_swarm_proto::messages::{Commitment, SwarmMessage};
-        use daemon_swarm_proto::{to_canonical_vec, Hash, SigningKey, SWARM_PROTO_VERSION};
+        use daemon_vhc_proto::messages::{Commitment, SwarmMessage};
+        use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey, SWARM_PROTO_VERSION};
 
         fn commit_frame(size: u64) -> Vec<u8> {
             let key = SigningKey::from_bytes(&[9u8; 32]);
-            let signed = daemon_swarm_proto::SignedMessage::sign(
+            let signed = daemon_vhc_proto::SignedMessage::sign(
                 &key,
                 SWARM_PROTO_VERSION,
                 SwarmMessage::Commitment(Commitment {

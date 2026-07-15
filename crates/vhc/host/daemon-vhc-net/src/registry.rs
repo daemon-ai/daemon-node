@@ -19,7 +19,7 @@
 //! identity headers for a direct-to-worker dev target) — never hardcoded.
 
 use daemon_egress::{EgressClient, EgressRequest, Redirects};
-use daemon_swarm_proto::blake3_hash;
+use daemon_vhc_proto::blake3_hash;
 use serde::{Deserialize, Serialize};
 
 use crate::presign::{PresignOp, PresignRequest, PresignResponse};

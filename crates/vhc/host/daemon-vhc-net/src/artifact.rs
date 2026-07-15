@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use daemon_egress::{EgressClient, Redirects};
-use daemon_swarm_proto::blake3_hash;
+use daemon_vhc_proto::blake3_hash;
 
 use crate::presign::{PresignClient, PresignOp, PresignRequest};
 use crate::seam::{ContentHash, RunId};

@@ -40,11 +40,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use daemon_swarm_net::{
     fetch_record_set, ControlPlane, ControlSubscription, DownloadScheduler, PayloadStore,
 };
-use daemon_swarm_proto::messages::{
+use daemon_vhc_proto::messages::{
     Attestation, Commitment, Digest as DigestMsg, Locator, RecordEntry, RoundOpen, RoundRecord,
     Straggle, StraggleStatus,
 };
-use daemon_swarm_proto::{
+use daemon_vhc_proto::{
     commit_set, from_canonical_slice, to_canonical_vec, Hash, PeerId, Root, SigningKey,
     SwarmMessage, SwarmProtoVersion,
 };
@@ -58,16 +58,16 @@ use crate::SwarmRunError;
 /// Per-round batch assignment: P2's throughput-weighted deterministic split (§6.3, PROTO-8).
 ///
 /// Merge 2 resolved the R2 `// MERGE-2` marker here by swapping the equal-split placeholder for
-/// `daemon_swarm_proto::assignment::assign_batches` — the single pure authority the coordinator and
+/// `daemon_vhc_proto::assignment::assign_batches` — the single pure authority the coordinator and
 /// every peer re-derive byte-identically from `(round_seed, roster, window)`. The MVP StubBackend
 /// peers are all class-equal (`ThroughputClass::C1`), so the partition sizes stay even, but the
 /// peer→interval mapping is now seed-shuffled (transcript changes vs the old equal split, while
 /// cross-peer agreement is unaffected since every peer folds the same committed set).
 pub mod assignment {
     use super::{BatchInterval, PeerId};
-    use daemon_swarm_proto::assignment::assign_batches;
-    use daemon_swarm_proto::messages::{BatchWindow, ThroughputClass};
-    use daemon_swarm_proto::Seed;
+    use daemon_vhc_proto::assignment::assign_batches;
+    use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
+    use daemon_vhc_proto::Seed;
 
     /// The `[start, end)` sub-interval `assign_batches` assigns to `peer` for the round seeded by
     /// `seed` over `window`. Class-equal roster (StubBackend), zero overlap (exact partition). Falls
@@ -258,7 +258,7 @@ where
         events: UnboundedSender<EngineEvent>,
     ) -> Self {
         let sub = control.subscribe();
-        let peer = daemon_swarm_proto::peer_id(&key);
+        let peer = daemon_vhc_proto::peer_id(&key);
         let mut roster = cfg.roster.clone();
         roster.sort_unstable();
         Self {
@@ -354,7 +354,7 @@ where
     /// exhausted (`LeftForEpoch`).
     pub async fn run(&mut self) -> Result<RunOutcome, SwarmRunError> {
         while let Some(bytes) = self.sub.recv().await {
-            let Ok(msg) = from_canonical_slice::<daemon_swarm_proto::SignedMessage>(&bytes) else {
+            let Ok(msg) = from_canonical_slice::<daemon_vhc_proto::SignedMessage>(&bytes) else {
                 continue; // undecodable frame — gossip is best-effort dissemination
             };
             // Verification lives here, not in the transport (§7.1): drop bad-sig / wrong-version.
@@ -523,7 +523,7 @@ where
         let commitment = tree.commitment();
         let inline = entries
             .iter()
-            .map(|(p, h)| daemon_swarm_proto::messages::AttestEntry { peer: *p, hash: *h })
+            .map(|(p, h)| daemon_vhc_proto::messages::AttestEntry { peer: *p, hash: *h })
             .collect();
         let _ = (peer, hash);
         self.publish(SwarmMessage::Attestation(Attestation {
@@ -718,7 +718,7 @@ where
         self.last_ingested = Some(round);
         self.publish(SwarmMessage::Digest(DigestMsg {
             round,
-            digest: daemon_swarm_proto::StateDigest::new(*digest.as_bytes()),
+            digest: daemon_vhc_proto::StateDigest::new(*digest.as_bytes()),
         }))
         .await?;
         // The round's transport scratch is no longer needed once ingested.
@@ -768,7 +768,7 @@ where
     /// Sign `payload` with the node identity and publish the canonical-CBOR frame on the control
     /// plane (already-signed bytes, §7.1).
     async fn publish(&self, payload: SwarmMessage) -> Result<(), SwarmRunError> {
-        let signed = daemon_swarm_proto::SignedMessage::sign(&self.key, self.cfg.version, payload)
+        let signed = daemon_vhc_proto::SignedMessage::sign(&self.key, self.cfg.version, payload)
             .map_err(|e| SwarmRunError::Lifecycle(format!("sign control message: {e}")))?;
         let bytes = to_canonical_vec(&signed)
             .map_err(|e| SwarmRunError::Lifecycle(format!("encode control message: {e}")))?;
@@ -828,8 +828,8 @@ mod tests {
     use super::*;
     use crate::backend::{AssessMeta, Assessment, BatchRef, StepStats, StubBackend};
     use crate::harness::{run_swarm, run_swarm_with, StallFault, SwarmConfig, EXPERIMENT_CONFIG};
-    use daemon_swarm_proto::messages::RoundRecord;
-    use daemon_swarm_proto::{blake3_hash, commit_set, Seed};
+    use daemon_vhc_proto::messages::RoundRecord;
+    use daemon_vhc_proto::{blake3_hash, commit_set, Seed};
     use std::sync::{Arc, Mutex};
 
     fn peer(b: u8) -> PeerId {
@@ -852,7 +852,7 @@ mod tests {
             set: tree.commitment(),
             drops: Vec::new(),
             next_seed: Seed([0; 32]),
-            set_locator: daemon_swarm_proto::messages::Locator::StoreKey("s".into()),
+            set_locator: daemon_vhc_proto::messages::Locator::StoreKey("s".into()),
             inline: Some(entries),
         }
     }
@@ -882,13 +882,13 @@ mod tests {
         let key = crate::harness::peer_key(0);
         let cfg = EngineConfig {
             run: run.clone(),
-            roster: vec![daemon_swarm_proto::peer_id(&key)],
-            witnesses: vec![daemon_swarm_proto::peer_id(&key)],
+            roster: vec![daemon_vhc_proto::peer_id(&key)],
+            witnesses: vec![daemon_vhc_proto::peer_id(&key)],
             steps_per_round: 1,
             micro_batch: 1,
             stall_rounds_max: 2,
             checkpoint_every_rounds: 0,
-            version: daemon_swarm_proto::SWARM_PROTO_VERSION,
+            version: daemon_vhc_proto::SWARM_PROTO_VERSION,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let engine = RoundEngine::new(control, store.clone(), backend, key, corpus, cfg, tx);
@@ -902,7 +902,7 @@ mod tests {
         // commitment — the `fetch_record_set` wiring (the `// MERGE-2` marker on verify_record_set).
         let (engine, store, run) = resolve_engine();
         let round = 3;
-        let set = daemon_swarm_proto::RecordSet::new([
+        let set = daemon_vhc_proto::RecordSet::new([
             entry(0x99, b"c"),
             entry(0x11, b"a"),
             entry(0x55, b"b"),
@@ -916,7 +916,7 @@ mod tests {
             set: set.commitment(),
             drops: Vec::new(),
             next_seed: Seed([0; 32]),
-            set_locator: daemon_swarm_proto::messages::Locator::StoreKey(
+            set_locator: daemon_vhc_proto::messages::Locator::StoreKey(
                 "runs/resolve-run/rounds/3/record-set.cbor".into(),
             ),
             inline: None,
@@ -933,7 +933,7 @@ mod tests {
         // rejected (I3 exactness), even though its bytes hash-verify on GET.
         let (engine, store, run) = resolve_engine();
         let round = 3;
-        let stored = daemon_swarm_proto::RecordSet::new([entry(0x11, b"a"), entry(0x55, b"b")]);
+        let stored = daemon_vhc_proto::RecordSet::new([entry(0x11, b"a"), entry(0x55, b"b")]);
         let key = PayloadKey::new(run, round, RECORD_SET_PEER);
         store
             .put(&key, &stored.to_canonical_vec().unwrap())
@@ -941,13 +941,13 @@ mod tests {
             .unwrap();
 
         // The record signs a DIFFERENT set's root.
-        let signed = daemon_swarm_proto::RecordSet::new([entry(0x11, b"a"), entry(0x99, b"z")]);
+        let signed = daemon_vhc_proto::RecordSet::new([entry(0x11, b"a"), entry(0x99, b"z")]);
         let rr = RoundRecord {
             round,
             set: signed.commitment(),
             drops: Vec::new(),
             next_seed: Seed([0; 32]),
-            set_locator: daemon_swarm_proto::messages::Locator::StoreKey("k".into()),
+            set_locator: daemon_vhc_proto::messages::Locator::StoreKey("k".into()),
             inline: None,
         };
         let err = engine.resolve_record_set(&rr).await.unwrap_err();
@@ -974,7 +974,7 @@ mod tests {
         // A record whose signed root disagrees with its inline set is rejected (I3 exactness).
         let mut rr = record_for(4, vec![entry(0x11, b"a"), peer_entry_tampered()]);
         // Tamper the committed root so it no longer matches the inline set.
-        rr.set.root = daemon_swarm_proto::Root([0xAB; 32]);
+        rr.set.root = daemon_vhc_proto::Root([0xAB; 32]);
         let err = verify_record_set(&rr).unwrap_err();
         assert!(
             matches!(err, SwarmRunError::Lifecycle(m) if m.contains("does not match")),
@@ -1072,7 +1072,7 @@ mod tests {
         let by_round = run.digests_by_round();
         assert_eq!(by_round[&3].len(), 3, "the stalled peer catches up round 3");
 
-        let stalled = daemon_swarm_proto::peer_id(&crate::harness::peer_key(1));
+        let stalled = daemon_vhc_proto::peer_id(&crate::harness::peer_key(1));
         let mine: Vec<&EngineEvent> = run
             .events
             .iter()
@@ -1106,7 +1106,7 @@ mod tests {
             ..SwarmConfig::small(8)
         };
         let run = run_swarm(cfg).await.unwrap();
-        let stalled = daemon_swarm_proto::peer_id(&crate::harness::peer_key(1));
+        let stalled = daemon_vhc_proto::peer_id(&crate::harness::peer_key(1));
         assert!(
             run.left_peers().contains(&stalled),
             "the peer leaves once the stall budget is exhausted"

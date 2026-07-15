@@ -5,13 +5,13 @@
 
 #![allow(dead_code)]
 
-use daemon_swarm_proto::envelope::{GlobalBatch, StopCondition};
-use daemon_swarm_proto::messages::{
+use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
+use daemon_vhc_proto::messages::{
     AttestEntry, Attestation, Commitment, Digest, Heartbeat, Join, Locator, RecordEntry,
     SignedMessage, StorageReceipt, Straggle, StraggleStatus, SwarmMessage, ThroughputClass,
 };
-use daemon_swarm_proto::sign::Signed;
-use daemon_swarm_proto::{
+use daemon_vhc_proto::sign::Signed;
+use daemon_vhc_proto::{
     commit_set, peer_id, CapabilitySet, Hash, IrohId, PeerId, Seed, SigningKey, StateDigest,
     SwarmProtoVersion, SWARM_PROTO_VERSION,
 };

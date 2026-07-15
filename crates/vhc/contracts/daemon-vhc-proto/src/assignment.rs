@@ -6,7 +6,7 @@
 //! Every peer independently derives the same committee roles and batch intervals from
 //! `(round_seed, roster)` — no per-batch RPC. This module is the **pure** authority for that math,
 //! so the coordinator, every peer, and (later) the replay oracle all re-derive byte-identical
-//! assignments. It lives in `daemon-swarm-proto` (not the coordinator) precisely so the oracle can
+//! assignments. It lives in `daemon-vhc-proto` (not the coordinator) precisely so the oracle can
 //! consume it without a coordinator dependency; the coordinator re-exports what it uses.
 //!
 //! Randomness is a documented 64-bit [`Lcg`] (Knuth MMIX constants) seeded from
@@ -34,7 +34,7 @@ pub const WITNESS_TARGET_DEFAULT: u32 = 4;
 /// A deterministic 64-bit linear congruential generator (Knuth MMIX constants).
 ///
 /// Not cryptographic — its only job is a reproducible permutation. Seed it via [`seeded_lcg`] so a
-/// round seed + salt produce an independent stream. `daemon-swarm-proto`'s golden vectors pin its
+/// round seed + salt produce an independent stream. `daemon-vhc-proto`'s golden vectors pin its
 /// output; the constants are frozen with [`crate::SwarmProtoVersion`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lcg {

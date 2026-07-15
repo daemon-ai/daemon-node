@@ -6,7 +6,7 @@
 //! drift, every downstream hash and signature drifts with them (spec §5.6).
 
 use ciborium::value::Value;
-use daemon_swarm_proto::to_canonical_vec;
+use daemon_vhc_proto::to_canonical_vec;
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -159,6 +159,6 @@ fn definite_lengths_and_struct_roundtrip() {
     // Map head is major-5 definite length 3 (0xa3); keys sort "nums" (length 4) < "alpha" < "zebra"
     // (both length 5, then bytewise: 0x61 < 0x7a).
     assert_eq!(bytes[0], 0xa3, "definite-length map head");
-    let back: Demo = daemon_swarm_proto::from_canonical_slice(&bytes).unwrap();
+    let back: Demo = daemon_vhc_proto::from_canonical_slice(&bytes).unwrap();
     assert_eq!(back, d);
 }

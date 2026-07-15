@@ -24,7 +24,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use daemon_swarm_proto::RecordSet;
+use daemon_vhc_proto::RecordSet;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::seam::{ContentHash, PayloadKey};
@@ -465,7 +465,7 @@ mod tests {
     use crate::seam::{PeerId, RunId};
     use crate::store::FsPayloadStore;
     use crate::test_support::temp_root;
-    use daemon_swarm_proto::blake3_hash;
+    use daemon_vhc_proto::blake3_hash;
 
     fn key(peer: u8) -> PayloadKey {
         PayloadKey::new(RunId::new("run-f"), 4, PeerId([peer; 32]))
@@ -609,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_set_round_trips_and_content_verifies() {
-        use daemon_swarm_proto::messages::RecordEntry;
+        use daemon_vhc_proto::messages::RecordEntry;
 
         let dir = temp_root("recordset-ok");
         let store = FsPayloadStore::open(dir.path(), 8).unwrap();

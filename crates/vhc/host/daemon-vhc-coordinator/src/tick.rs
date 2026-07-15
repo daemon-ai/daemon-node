@@ -9,13 +9,13 @@
 //! yields identical `(state', outputs)` — the replay-oracle foundation (I1, PROTO-20). The commit
 //! rule ([`crate::commit`]) consumes only signed evidence (I6).
 
-use daemon_swarm_proto::envelope::StopCondition;
-use daemon_swarm_proto::messages::{
+use daemon_vhc_proto::envelope::StopCondition;
+use daemon_vhc_proto::messages::{
     Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RoundOpen, RoundRecord,
     SignedMessage, StorageReceipt, Straggle, SwarmMessage,
 };
-use daemon_swarm_proto::sign::Signed;
-use daemon_swarm_proto::{
+use daemon_vhc_proto::sign::Signed;
+use daemon_vhc_proto::{
     blake3_hash, commit_set, global_batch_at, select_committee, Hash, PeerId, Seed,
     SwarmProtoVersion,
 };

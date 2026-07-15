@@ -24,9 +24,9 @@
 
 use std::collections::BTreeMap;
 
-use daemon_swarm_proto::assignment::witness_quorum;
-use daemon_swarm_proto::messages::RecordEntry;
-use daemon_swarm_proto::{commit_set, Hash, PeerId, Root};
+use daemon_vhc_proto::assignment::witness_quorum;
+use daemon_vhc_proto::messages::RecordEntry;
+use daemon_vhc_proto::{commit_set, Hash, PeerId, Root};
 
 use crate::state::{Member, RoundState};
 

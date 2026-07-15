@@ -8,15 +8,15 @@
 use std::collections::BTreeMap;
 
 use ciborium::value::Value;
-use daemon_swarm_proto::envelope::{
+use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition,
 };
-use daemon_swarm_proto::messages::{
+use daemon_vhc_proto::messages::{
     Commitment, Digest, Heartbeat, Join, Locator, RecordEntry, SignedMessage, StorageReceipt,
     Straggle, StraggleStatus, SwarmMessage, ThroughputClass,
 };
-use daemon_swarm_proto::{
+use daemon_vhc_proto::{
     peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SigningKey, StateDigest,
     SWARM_PROTO_VERSION,
 };
@@ -297,7 +297,7 @@ fn replay_matches_live_run() {
     assert_eq!(report.records.len(), 3);
 
     // The re-derived final state is byte-identical to the live coordinator's (I1 replayability).
-    let live_hash = daemon_swarm_proto::blake3_hash(&to_canonical_vec(&live_final).unwrap());
+    let live_hash = daemon_vhc_proto::blake3_hash(&to_canonical_vec(&live_final).unwrap());
     assert_eq!(report.final_state_hash, live_hash);
 }
 
@@ -350,7 +350,7 @@ fn run_capture_replays_recorded_run() {
         report.rounds_verified, 3,
         "all 3 recorded records re-derived"
     );
-    let live_hash = daemon_swarm_proto::blake3_hash(&to_canonical_vec(&live_final).unwrap());
+    let live_hash = daemon_vhc_proto::blake3_hash(&to_canonical_vec(&live_final).unwrap());
     assert_eq!(
         report.final_state_hash, live_hash,
         "final state byte-identical"

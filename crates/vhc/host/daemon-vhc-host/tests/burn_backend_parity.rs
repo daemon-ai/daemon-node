@@ -7,7 +7,7 @@
 // program ledger "Determinism story", spec §7.2). These tests pin the per-op rtol/atol via the
 // shared `tolerance` harness and prove `BurnBackend` maps every native op onto burn tensor ops with
 // matching forward outputs + backward grads, while the det lane / compression natives stay
-// **bit-exact** (both delegate to det-core). G2 reuses the harness with a wgpu backend.
+// **bit-exact** (both delegate to daemon-vhc-det). G2 reuses the harness with a wgpu backend.
 #![cfg(feature = "burn-ndarray")]
 
 mod tolerance;

@@ -42,7 +42,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use daemon_core::ContainedRoot;
-use daemon_swarm_proto::{blake3_hash, Hash};
+use daemon_vhc_proto::{blake3_hash, Hash};
 
 use crate::SwarmNetError;
 

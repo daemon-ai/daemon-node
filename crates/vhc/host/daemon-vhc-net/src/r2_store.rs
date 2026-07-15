@@ -22,7 +22,7 @@
 
 use async_trait::async_trait;
 use daemon_egress::{EgressClient, EgressRequest, Redirects};
-use daemon_swarm_proto::blake3_hash;
+use daemon_vhc_proto::blake3_hash;
 
 use crate::presign::{ObjectKind, PresignClient, PresignOp, PresignRequest, PresignResponse};
 use crate::seam::{ContentHash, PayloadKey, RunId};
@@ -104,13 +104,13 @@ impl<P: PresignClient> R2Store<P> {
     pub async fn fetch_record_set_object(
         &self,
         round: crate::seam::RoundId,
-    ) -> Result<daemon_swarm_proto::RecordSet, SwarmNetError> {
+    ) -> Result<daemon_vhc_proto::RecordSet, SwarmNetError> {
         let req = PresignRequest::record_set(PresignOp::Get, round);
         let resp = self.presign.presign(&self.run, &req).await?;
         let bytes = self.get_object(&resp).await?.ok_or_else(|| {
             SwarmNetError::PayloadMiss(format!("{}@r{round}/record-set.cbor", self.run.as_str()))
         })?;
-        daemon_swarm_proto::RecordSet::from_canonical_slice(&bytes)
+        daemon_vhc_proto::RecordSet::from_canonical_slice(&bytes)
             .map_err(|e| SwarmNetError::Fetch(format!("decode record-set r{round}: {e}")))
     }
 
@@ -311,7 +311,7 @@ mod tests {
     use crate::receipt::ReceiptProducer;
     use crate::store::FsPayloadStore;
     use crate::test_support::temp_root;
-    use daemon_swarm_proto::{blake3_hash, SigningKey, SwarmMessage, SWARM_PROTO_VERSION};
+    use daemon_vhc_proto::{blake3_hash, SigningKey, SwarmMessage, SWARM_PROTO_VERSION};
 
     fn pkey(round: RoundId, peer: u8) -> PayloadKey {
         PayloadKey::new(RunId::new("run-x"), round, PeerId([peer; 32]))

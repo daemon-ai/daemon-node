@@ -16,7 +16,7 @@
 //! client is constructed this wave.
 //!
 //! Merge-1 note: the shared identity/hash vocabulary in [`seam`] is now the canonical
-//! `daemon-swarm-proto` types (blake3 `Hash`, `PeerId`); the [`ReceiptProducer`] emits proto's
+//! `daemon-vhc-proto` types (blake3 `Hash`, `PeerId`); the [`ReceiptProducer`] emits proto's
 //! signed `StorageReceipt` control message (ed25519 over canonical CBOR).
 //!
 //! Wave-2 (R2) additions: [`Deduper`] — the reusable content-hash dedupe [`LoopbackGossip`]

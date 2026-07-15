@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use daemon_swarm_proto::{from_canonical_slice, peer_id, to_canonical_vec, PeerId};
+use daemon_vhc_proto::{from_canonical_slice, peer_id, to_canonical_vec, PeerId};
 
 use daemon_swarm_coordinator::{tick, CoordinatorState, Input, Output};
 use proptest::prelude::*;
@@ -108,8 +108,8 @@ fn cmd_strategy() -> impl Strategy<Value = Cmd> {
 fn apply(
     state: CoordinatorState,
     cmd: Cmd,
-    ks: &[daemon_swarm_proto::SigningKey],
-    coord: &daemon_swarm_proto::SigningKey,
+    ks: &[daemon_vhc_proto::SigningKey],
+    coord: &daemon_vhc_proto::SigningKey,
 ) -> CoordinatorState {
     let round = state.round;
     let input = match cmd {

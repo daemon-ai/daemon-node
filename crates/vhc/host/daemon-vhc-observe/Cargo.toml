@@ -12,7 +12,7 @@ path = "src/lib.rs"
 # The wire contract (message types, canonical codec, envelope, hashes) + the pure coordinator `tick`
 # the replay oracle re-runs (PROTO-20). Both path deps are already in the frozen root
 # `[workspace.dependencies]`, so declaring them here is a lane-owned edit — no root Cargo.toml change.
-daemon-swarm-proto = { workspace = true }
+daemon-vhc-proto = { workspace = true }
 daemon-swarm-coordinator = { workspace = true }
 serde = { workspace = true }
 # Node-side tool: observe uses std freely (std::io message-log framing) and follows its scaffold's

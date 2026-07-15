@@ -20,7 +20,6 @@
 //!   from canonical CBOR mid-run (PROTO-20 in anger) and the run completes.
 
 use daemon_swarm_net::PayloadStore;
-use daemon_swarm_proto::peer_id;
 use daemon_swarm_run::backend::{
     AssessMeta, Assessment, BatchRef, StagedPayload, StateDigest, StepCtx, StepStats, StubBackend,
     TrainerBackend,
@@ -32,6 +31,7 @@ use daemon_swarm_run::harness::{
     EXPERIMENT_CONFIG,
 };
 use daemon_swarm_run::seam::{PayloadKey, RoundId};
+use daemon_vhc_proto::peer_id;
 
 /// Assert every round in `run` has a single digest shared by all peers that reported it.
 fn assert_all_agree(run: &daemon_swarm_run::harness::SwarmRun) {
@@ -254,7 +254,7 @@ async fn desync_injection_detected_and_resynced() {
     // Detection: fold the round's per-peer digests through `daemon-swarm-observe`'s `digest_tally`
     // (the observe-driven desync trigger, §9). With a 3-peer roster the quorum is 2, so the two
     // agreeing healthy peers pin the quorum digest and the corrupted peer is the sole outlier.
-    let quorum = daemon_swarm_proto::assignment::witness_quorum(3);
+    let quorum = daemon_vhc_proto::assignment::witness_quorum(3);
     let verdict = run.desync_verdict(CORRUPT, quorum);
     assert!(
         verdict.is_desync(),

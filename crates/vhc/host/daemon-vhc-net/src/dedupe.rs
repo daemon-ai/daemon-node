@@ -11,13 +11,13 @@
 //! re-implementing it — the NET-6 property "the same message via WS and gossip dedupes" is one
 //! implementation, shared.
 //!
-//! The dedupe key is proto's canonical [`blake3_hash`](daemon_swarm_proto::blake3_hash) over the
+//! The dedupe key is proto's canonical [`blake3_hash`](daemon_vhc_proto::blake3_hash) over the
 //! opaque message bytes — the same content address the payload plane and the signed envelope use,
 //! so a message's identity is stable across re-encodings that preserve its bytes.
 
 use std::collections::HashSet;
 
-use daemon_swarm_proto::{blake3_hash, Hash};
+use daemon_vhc_proto::{blake3_hash, Hash};
 
 /// A content-hash dedupe set over opaque control-message bytes.
 ///

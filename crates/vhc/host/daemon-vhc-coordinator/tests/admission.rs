@@ -6,8 +6,8 @@
 mod common;
 
 use common::*;
-use daemon_swarm_proto::messages::{Join, ThroughputClass};
-use daemon_swarm_proto::{
+use daemon_vhc_proto::messages::{Join, ThroughputClass};
+use daemon_vhc_proto::{
     peer_id, CapabilitySet, Hash, IrohId, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
 

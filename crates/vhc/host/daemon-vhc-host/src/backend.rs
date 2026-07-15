@@ -4,7 +4,7 @@
 //! The op backend — the Wave-2 engine seam (ABI §5, architecture §5.1).
 //!
 //! [`OpBackend`] is the numeric engine behind the host dispatch layer. [`CpuBackend`] is a plain
-//! `Vec<f32>` engine: the **det lane** is the real `det-core` (so HOST-5/6 determinism holds), and
+//! `Vec<f32>` engine: the **det lane** is the real `daemon-vhc-det` (so HOST-5/6 determinism holds), and
 //! the native lane is a functional fp32 forward **plus a reverse-mode autodiff tape** (HOST-9) — the
 //! host learns from data. A future wave slots burn/CubeCL in behind this same trait; the arena, trap
 //! taxonomy, phase table, and budgets above it stay lane-E stable.
@@ -167,7 +167,7 @@ pub trait OpBackend: Send {
         hp: AdamwHp,
     );
 
-    // -- det lane (real det-core kernels) -------------------------------------------------------
+    // -- det lane (real daemon-vhc-det kernels) -------------------------------------------------------
 
     /// `det_sum@1`.
     ///
@@ -233,7 +233,7 @@ pub trait OpBackend: Send {
     /// [`TrapCode::ShapeMismatch`] on unequal lengths.
     fn det_axpy(&mut self, y: TensorId, alpha: f64, x: TensorId) -> Result<(), TrapCode>;
 
-    // -- Wave-2 compression natives (shared det-core reference; lane-agnostic tensors) ----------
+    // -- Wave-2 compression natives (shared daemon-vhc-det reference; lane-agnostic tensors) ----------
 
     /// `topk_chunk@1` — per-chunk top-k by magnitude → `(values, indices)` tensors.
     ///
@@ -1215,30 +1215,30 @@ impl OpBackend for CpuBackend {
     fn det_sum(&mut self, xs: &[TensorId]) -> Result<TensorId, TrapCode> {
         let vecs: Vec<Vec<f32>> = xs.iter().map(|&id| self.get(id).to_vec()).collect();
         let refs: Vec<&[f32]> = vecs.iter().map(Vec::as_slice).collect();
-        let out = det_core::det_sum(&refs).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_sum(&refs).map_err(det_trap)?;
         Ok(self.insert(out))
     }
     fn det_scale(&mut self, x: TensorId, alpha: f64) -> TensorId {
-        let out = det_core::det_scale(self.get(x), alpha);
+        let out = daemon_vhc_det::det_scale(self.get(x), alpha);
         self.insert(out)
     }
     fn det_l2norm(&self, x: TensorId) -> f32 {
-        det_core::det_l2norm(self.get(x))
+        daemon_vhc_det::det_l2norm(self.get(x))
     }
     fn det_sign(&mut self, x: TensorId) -> TensorId {
-        let out = det_core::det_sign(self.get(x));
+        let out = daemon_vhc_det::det_sign(self.get(x));
         self.insert(out)
     }
     fn det_add(&mut self, a: TensorId, b: TensorId) -> Result<TensorId, TrapCode> {
-        let out = det_core::det_add(self.get(a), self.get(b)).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_add(self.get(a), self.get(b)).map_err(det_trap)?;
         Ok(self.insert(out))
     }
     fn det_sub(&mut self, a: TensorId, b: TensorId) -> Result<TensorId, TrapCode> {
-        let out = det_core::det_sub(self.get(a), self.get(b)).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_sub(self.get(a), self.get(b)).map_err(det_trap)?;
         Ok(self.insert(out))
     }
     fn det_mul(&mut self, a: TensorId, b: TensorId) -> Result<TensorId, TrapCode> {
-        let out = det_core::det_mul(self.get(a), self.get(b)).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_mul(self.get(a), self.get(b)).map_err(det_trap)?;
         Ok(self.insert(out))
     }
     fn det_absmax_unpack(
@@ -1248,7 +1248,7 @@ impl OpBackend for CpuBackend {
         bits: u32,
     ) -> Result<TensorId, TrapCode> {
         let bytes: Vec<u8> = self.get(packed).iter().map(|&f| f as u8).collect();
-        let out = det_core::det_absmax_unpack(&bytes, chunk, bits).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_absmax_unpack(&bytes, chunk, bits).map_err(det_trap)?;
         Ok(self.insert(out))
     }
     fn det_chunk_scatter_add(
@@ -1261,7 +1261,7 @@ impl OpBackend for CpuBackend {
         let valsv = self.get(vals).to_vec();
         let idxv = self.u32s(idx);
         let mut accv = self.get(acc).to_vec();
-        det_core::det_chunk_scatter_add(&mut accv, &valsv, &idxv, chunk).map_err(det_trap)?;
+        daemon_vhc_det::det_chunk_scatter_add(&mut accv, &valsv, &idxv, chunk).map_err(det_trap)?;
         self.write(acc, &accv);
         Ok(())
     }
@@ -1272,14 +1272,15 @@ impl OpBackend for CpuBackend {
         chunk: usize,
         out_len: usize,
     ) -> Result<TensorId, TrapCode> {
-        let out = det_core::det_chunk_scatter(self.get(vals), &self.u32s(idx), chunk, out_len)
-            .map_err(det_trap)?;
+        let out =
+            daemon_vhc_det::det_chunk_scatter(self.get(vals), &self.u32s(idx), chunk, out_len)
+                .map_err(det_trap)?;
         Ok(self.insert(out))
     }
     fn det_axpy(&mut self, y: TensorId, alpha: f64, x: TensorId) -> Result<(), TrapCode> {
         let xv = self.get(x).to_vec();
         let mut yv = self.get(y).to_vec();
-        det_core::det_axpy(&mut yv, alpha, &xv).map_err(det_trap)?;
+        daemon_vhc_det::det_axpy(&mut yv, alpha, &xv).map_err(det_trap)?;
         self.write(y, &yv);
         Ok(())
     }
@@ -1290,23 +1291,23 @@ impl OpBackend for CpuBackend {
         chunk: usize,
         k: usize,
     ) -> Result<(TensorId, TensorId), TrapCode> {
-        let (vals, idx) = det_core::topk_chunk(self.get(x), chunk, k).map_err(det_trap)?;
+        let (vals, idx) = daemon_vhc_det::topk_chunk(self.get(x), chunk, k).map_err(det_trap)?;
         let ivals: Vec<f32> = idx.iter().map(|&i| i as f32).collect();
         let vh = self.insert(vals);
         let ih = self.insert(ivals);
         Ok((vh, ih))
     }
     fn absmax_pack(&mut self, x: TensorId, chunk: usize, bits: u32) -> Result<TensorId, TrapCode> {
-        let packed = det_core::absmax_pack(self.get(x), chunk, bits).map_err(det_trap)?;
+        let packed = daemon_vhc_det::absmax_pack(self.get(x), chunk, bits).map_err(det_trap)?;
         let vals: Vec<f32> = packed.iter().map(|&b| f32::from(b)).collect();
         Ok(self.insert(vals))
     }
     fn dct2(&mut self, x: TensorId, tile: usize) -> Result<TensorId, TrapCode> {
-        let out = det_core::dct2(self.get(x), tile).map_err(det_trap)?;
+        let out = daemon_vhc_det::dct2(self.get(x), tile).map_err(det_trap)?;
         Ok(self.insert(out))
     }
     fn idct2(&mut self, x: TensorId, tile: usize) -> Result<TensorId, TrapCode> {
-        let out = det_core::idct2(self.get(x), tile).map_err(det_trap)?;
+        let out = daemon_vhc_det::idct2(self.get(x), tile).map_err(det_trap)?;
         Ok(self.insert(out))
     }
 }
@@ -1371,9 +1372,9 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-fn det_trap(e: det_core::DetError) -> TrapCode {
+fn det_trap(e: daemon_vhc_det::DetError) -> TrapCode {
     match e {
-        det_core::DetError::UnsupportedBits { .. } => TrapCode::BadEnum,
+        daemon_vhc_det::DetError::UnsupportedBits { .. } => TrapCode::BadEnum,
         _ => TrapCode::ShapeMismatch,
     }
 }
@@ -1395,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn det_ops_use_det_core() {
+    fn det_ops_use_daemon_vhc_det() {
         let mut b = CpuBackend::new();
         let x = b.create(vec![1.0, 2.0, 3.0]);
         let y = b.create(vec![10.0, 20.0, 30.0]);
@@ -1454,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn compression_ops_delegate_to_det_core() {
+    fn compression_ops_delegate_to_daemon_vhc_det() {
         let mut b = CpuBackend::new();
         let x = b.create(vec![0.1, -0.9, 0.2, 1.0]);
         let (vals, idx) = b.topk_chunk(x, 4, 2).unwrap();

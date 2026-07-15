@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // TDD §3.5 HOST-1/2/5/6 full det-lane kernel suites (spec §5.6, ABI §5.8/§5.9). These extend the
-// det-core `#[cfg(test)]` unit tests into the "full suite" the P2 gate requires: DCT orthonormality
+// daemon-vhc-det `#[cfg(test)]` unit tests into the "full suite" the P2 gate requires: DCT orthonormality
 // across tile sizes 8..128 (HOST-1), `topk_chunk@1` semantics incl. ties + empty/all-zero chunks +
 // k boundaries (HOST-2), `det_sum` streaming≡batch equivalence in record order (HOST-5), and the
 // det outer-step composition `det_reset_param_to_base`+`det_axpy_param` (HOST-6, modelled at the
@@ -12,7 +12,7 @@
 // Oracle provenance (swarm-ledger-p2-b1.md): from-definition (an independent Rust expression of the
 // spec math) and hand-derived pinned literals; the daemon fixture seed is 0xDAE0_7E57.
 
-use det_core::{
+use daemon_vhc_det::{
     absmax_pack, dct2, det_absmax_unpack, det_axpy, det_chunk_scatter, det_chunk_scatter_add,
     det_scale, det_sum, idct2, topk_chunk,
 };

@@ -16,8 +16,8 @@ use std::time::Duration;
 use common::ws_harness::{fast_reconnect, no_reconnect, MockWsCoordinator};
 use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
 use daemon_swarm_net::{ControlPlane, WsAuth};
-use daemon_swarm_proto::messages::{Commitment, Locator};
-use daemon_swarm_proto::{
+use daemon_vhc_proto::messages::{Commitment, Locator};
+use daemon_vhc_proto::{
     from_canonical_slice, to_canonical_vec, Hash, SignedMessage, SwarmMessage, SWARM_PROTO_VERSION,
 };
 

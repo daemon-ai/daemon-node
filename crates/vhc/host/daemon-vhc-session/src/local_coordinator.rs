@@ -44,10 +44,10 @@ use std::time::Duration;
 
 use daemon_swarm_coordinator::{tick, CoordinatorState, Input, Notice, Output, Phase};
 use daemon_swarm_net::{ControlPlane, FsPayloadStore, PayloadStore};
-use daemon_swarm_proto::messages::{
+use daemon_vhc_proto::messages::{
     Commitment, Join, RecordEntry, StorageReceipt, Straggle, StraggleStatus, ThroughputClass,
 };
-use daemon_swarm_proto::{
+use daemon_vhc_proto::{
     from_canonical_slice, peer_id, to_canonical_vec, CapabilitySet, IrohId, PeerId, SignedMessage,
     SigningKey, SwarmMessage, SwarmProtoVersion,
 };

@@ -358,7 +358,7 @@ pub enum StubError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daemon_swarm_proto::blake3_hash;
+    use daemon_vhc_proto::blake3_hash;
 
     fn built(config: &[u8]) -> StubBackend {
         let mut b = StubBackend::new();

@@ -28,11 +28,6 @@ use daemon_swarm_net::{
     PayloadStat, PayloadStore, PresignClient, R2Store, RebroadcastConfig, ReconnectConfig,
     RegistryClient, RunId, SwarmNetError, WsAuth, WsConfig, WsControlPlane,
 };
-use daemon_swarm_proto::messages::{Join, RecordEntry, ThroughputClass};
-use daemon_swarm_proto::{
-    peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SignedMessage, SigningKey,
-    SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
-};
 use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
 use daemon_swarm_run::checkpoint::{
     plan_resync, CheckpointManifest, ReplayStep, ResyncPlan, CHECKPOINT_PEER,
@@ -45,6 +40,11 @@ use daemon_swarm_run::SwarmRunError;
 use daemon_train::{
     EngineConfig as WasmEngineConfig, TrainError, TrapCode, WasmBackend, WasmBackendConfig,
     WasmBackendError,
+};
+use daemon_vhc_proto::messages::{Join, RecordEntry, ThroughputClass};
+use daemon_vhc_proto::{
+    peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SignedMessage, SigningKey,
+    SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;

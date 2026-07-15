@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-swarm-proto` — the swarm-training consensus / wire contract.
+//! `daemon-vhc-proto` — the swarm-training consensus / wire contract.
 //!
 //! Canonical CBOR codec, run-envelope schema + freeze/verify, capability-set admission, merkle set
 //! commitments, the seven round messages + their CDDL, the round state-digest schedule, and the

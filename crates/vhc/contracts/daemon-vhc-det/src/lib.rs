@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `det-core` — fixed-order fp32 deterministic kernels.
+//! `daemon-vhc-det` — fixed-order fp32 deterministic kernels.
 //!
 //! The bit-exact fp32 reference kernels shared verbatim by the host worker (`daemon-train`) and
 //! the guest SDK simulator (`daemon-train-sdk`'s `sim` feature) so that "the sim matches the host"

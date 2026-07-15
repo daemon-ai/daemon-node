@@ -21,10 +21,10 @@
 //! (program ledger "Determinism story", spec §7.2). The `tests/tolerance.rs` harness pins the
 //! per-op rtol/atol.
 //!
-//! ## Det lane — det-core CPU fp32, bit-exact (ABI §5.9 residency contract)
+//! ## Det lane — daemon-vhc-det CPU fp32, bit-exact (ABI §5.9 residency contract)
 //!
 //! Every `det_*` op and every compression native materializes the tensor **host-side** (`to_data`),
-//! runs the same `det_core` kernel [`CpuBackend`] runs, and re-inserts the result. This is the
+//! runs the same `daemon_vhc_det` kernel [`CpuBackend`] runs, and re-inserts the result. This is the
 //! §5.9 "materialized CPU-side at the ingest boundary" residency contract: burn tensors on the
 //! native side, fp32 masters host-side, requantize on `det_axpy`/writes. The consensus digest
 //! (`digest_state` over the post-ingest masters, all written by det ops) is thus **backend-
@@ -37,7 +37,7 @@
 //! the cache **empty** — the value stays **device-resident** across the op chain, and no
 //! device→host readback (`to_data`) is issued. The host copy is filled (once, then cached) **only
 //! at a genuine host boundary** — the first [`OpBackend::view`]/[`Self::host`] read: the det lane
-//! (every `det_*` op + compression native runs `det_core` on host fp32), scalar/metric readouts
+//! (every `det_*` op + compression native runs `daemon_vhc_det` on host fp32), scalar/metric readouts
 //! (loss), the consensus digest (`canonical_state_bytes`), checkpoints, and `upd_push_tensor`
 //! staging. Leaves ([`Self::insert_leaf`]) and writes seed the cache eagerly (the caller already
 //! holds the bytes — params, det results, requantized masters), so no boundary re-reads them.
@@ -49,7 +49,7 @@
 //! **unchanged** — `view(&self) -> &[f32]` still returns a borrowed slice; the `OnceCell`'s
 //! `get_or_init` fills-and-caches through `&self` (interior mutability), so laziness needs no
 //! additive trait method. The residual tabi-vs-reference gap is now the intrinsic det/compression
-//! host boundary (`make_update`/`ingest` materialize + run det-core on host fp32), documented in
+//! host boundary (`make_update`/`ingest` materialize + run daemon-vhc-det on host fp32), documented in
 //! `swarm-p2-throughput.md`.
 //!
 //! Shape-carrying ops (`matmul`, `transpose`, `slice`, `rmsnorm`, …) reshape to the needed const
@@ -86,7 +86,7 @@ pub type BurnWgpuBackend = BurnBackend<burn::backend::Autodiff<burn::backend::Wg
 /// (RunPod 4090, swarm-ledger-p3-g). Like [`BurnWgpuBackend`], the type parameter is the *only*
 /// change from [`BurnNdarrayBackend`]: `Autodiff<Cuda>` instead of `Autodiff<NdArray>`. `burn::backend::Cuda`
 /// is `Fusion<CubeBackend<CudaRuntime, …>>`; cudarc dlopens libcuda and cubecl JITs kernels via NVRTC
-/// lazily on the first tensor op on its device. The det lane still runs `det_core` host-side fp32
+/// lazily on the first tensor op on its device. The det lane still runs `daemon_vhc_det` host-side fp32
 /// (§5.9), so the consensus digest stays byte-identical to `Cpu` (the cross-backend digest test guards
 /// it).
 #[cfg(feature = "cuda")]
@@ -145,7 +145,7 @@ impl<B: AutodiffBackend> Slot<B> {
     }
 }
 
-/// A [`OpBackend`] driven by a Burn [`AutodiffBackend`] (native lane) + `det_core` (det lane).
+/// A [`OpBackend`] driven by a Burn [`AutodiffBackend`] (native lane) + `daemon_vhc_det` (det lane).
 pub struct BurnBackend<B: AutodiffBackend> {
     device: B::Device,
     tensors: Vec<Option<Slot<B>>>,
@@ -254,10 +254,10 @@ impl<B: AutodiffBackend> BurnBackend<B> {
     }
 }
 
-/// Map a `det_core` error to the ABI trap taxonomy (same mapping as [`CpuBackend`]).
-fn det_trap(e: det_core::DetError) -> TrapCode {
+/// Map a `daemon_vhc_det` error to the ABI trap taxonomy (same mapping as [`CpuBackend`]).
+fn det_trap(e: daemon_vhc_det::DetError) -> TrapCode {
     match e {
-        det_core::DetError::UnsupportedBits { .. } => TrapCode::BadEnum,
+        daemon_vhc_det::DetError::UnsupportedBits { .. } => TrapCode::BadEnum,
         _ => TrapCode::ShapeMismatch,
     }
 }
@@ -667,35 +667,35 @@ impl<B: AutodiffBackend> OpBackend for BurnBackend<B> {
         self.tensors[master as usize] = Some(Slot::lazy(w1));
     }
 
-    // -- det lane (real det-core kernels; host-side materialization, §5.9) ----------------------
+    // -- det lane (real daemon-vhc-det kernels; host-side materialization, §5.9) ----------------------
 
     fn det_sum(&mut self, xs: &[TensorId]) -> Result<TensorId, TrapCode> {
         let vecs: Vec<Vec<f32>> = xs.iter().map(|&id| self.host(id).to_vec()).collect();
         let refs: Vec<&[f32]> = vecs.iter().map(Vec::as_slice).collect();
-        let out = det_core::det_sum(&refs).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_sum(&refs).map_err(det_trap)?;
         Ok(self.insert_leaf(out))
     }
     fn det_scale(&mut self, x: TensorId, alpha: f64) -> TensorId {
-        let out = det_core::det_scale(self.host(x), alpha);
+        let out = daemon_vhc_det::det_scale(self.host(x), alpha);
         self.insert_leaf(out)
     }
     fn det_l2norm(&self, x: TensorId) -> f32 {
-        det_core::det_l2norm(self.host(x))
+        daemon_vhc_det::det_l2norm(self.host(x))
     }
     fn det_sign(&mut self, x: TensorId) -> TensorId {
-        let out = det_core::det_sign(self.host(x));
+        let out = daemon_vhc_det::det_sign(self.host(x));
         self.insert_leaf(out)
     }
     fn det_add(&mut self, a: TensorId, b: TensorId) -> Result<TensorId, TrapCode> {
-        let out = det_core::det_add(self.host(a), self.host(b)).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_add(self.host(a), self.host(b)).map_err(det_trap)?;
         Ok(self.insert_leaf(out))
     }
     fn det_sub(&mut self, a: TensorId, b: TensorId) -> Result<TensorId, TrapCode> {
-        let out = det_core::det_sub(self.host(a), self.host(b)).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_sub(self.host(a), self.host(b)).map_err(det_trap)?;
         Ok(self.insert_leaf(out))
     }
     fn det_mul(&mut self, a: TensorId, b: TensorId) -> Result<TensorId, TrapCode> {
-        let out = det_core::det_mul(self.host(a), self.host(b)).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_mul(self.host(a), self.host(b)).map_err(det_trap)?;
         Ok(self.insert_leaf(out))
     }
     fn det_absmax_unpack(
@@ -705,7 +705,7 @@ impl<B: AutodiffBackend> OpBackend for BurnBackend<B> {
         bits: u32,
     ) -> Result<TensorId, TrapCode> {
         let bytes: Vec<u8> = self.host(packed).iter().map(|&f| f as u8).collect();
-        let out = det_core::det_absmax_unpack(&bytes, chunk, bits).map_err(det_trap)?;
+        let out = daemon_vhc_det::det_absmax_unpack(&bytes, chunk, bits).map_err(det_trap)?;
         Ok(self.insert_leaf(out))
     }
     fn det_chunk_scatter_add(
@@ -718,7 +718,7 @@ impl<B: AutodiffBackend> OpBackend for BurnBackend<B> {
         let valsv = self.host(vals).to_vec();
         let idxv = self.u32s(idx);
         let mut accv = self.host(acc).to_vec();
-        det_core::det_chunk_scatter_add(&mut accv, &valsv, &idxv, chunk).map_err(det_trap)?;
+        daemon_vhc_det::det_chunk_scatter_add(&mut accv, &valsv, &idxv, chunk).map_err(det_trap)?;
         self.write(acc, &accv);
         Ok(())
     }
@@ -729,14 +729,15 @@ impl<B: AutodiffBackend> OpBackend for BurnBackend<B> {
         chunk: usize,
         out_len: usize,
     ) -> Result<TensorId, TrapCode> {
-        let out = det_core::det_chunk_scatter(self.host(vals), &self.u32s(idx), chunk, out_len)
-            .map_err(det_trap)?;
+        let out =
+            daemon_vhc_det::det_chunk_scatter(self.host(vals), &self.u32s(idx), chunk, out_len)
+                .map_err(det_trap)?;
         Ok(self.insert_leaf(out))
     }
     fn det_axpy(&mut self, y: TensorId, alpha: f64, x: TensorId) -> Result<(), TrapCode> {
         let xv = self.host(x).to_vec();
         let mut yv = self.host(y).to_vec();
-        det_core::det_axpy(&mut yv, alpha, &xv).map_err(det_trap)?;
+        daemon_vhc_det::det_axpy(&mut yv, alpha, &xv).map_err(det_trap)?;
         self.write(y, &yv);
         Ok(())
     }
@@ -747,23 +748,23 @@ impl<B: AutodiffBackend> OpBackend for BurnBackend<B> {
         chunk: usize,
         k: usize,
     ) -> Result<(TensorId, TensorId), TrapCode> {
-        let (vals, idx) = det_core::topk_chunk(self.host(x), chunk, k).map_err(det_trap)?;
+        let (vals, idx) = daemon_vhc_det::topk_chunk(self.host(x), chunk, k).map_err(det_trap)?;
         let ivals: Vec<f32> = idx.iter().map(|&i| i as f32).collect();
         let vh = self.insert_leaf(vals);
         let ih = self.insert_leaf(ivals);
         Ok((vh, ih))
     }
     fn absmax_pack(&mut self, x: TensorId, chunk: usize, bits: u32) -> Result<TensorId, TrapCode> {
-        let packed = det_core::absmax_pack(self.host(x), chunk, bits).map_err(det_trap)?;
+        let packed = daemon_vhc_det::absmax_pack(self.host(x), chunk, bits).map_err(det_trap)?;
         let vals: Vec<f32> = packed.iter().map(|&b| f32::from(b)).collect();
         Ok(self.insert_leaf(vals))
     }
     fn dct2(&mut self, x: TensorId, tile: usize) -> Result<TensorId, TrapCode> {
-        let out = det_core::dct2(self.host(x), tile).map_err(det_trap)?;
+        let out = daemon_vhc_det::dct2(self.host(x), tile).map_err(det_trap)?;
         Ok(self.insert_leaf(out))
     }
     fn idct2(&mut self, x: TensorId, tile: usize) -> Result<TensorId, TrapCode> {
-        let out = det_core::idct2(self.host(x), tile).map_err(det_trap)?;
+        let out = daemon_vhc_det::idct2(self.host(x), tile).map_err(det_trap)?;
         Ok(self.insert_leaf(out))
     }
 }

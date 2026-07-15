@@ -4,9 +4,9 @@
 //! The `record-set.cbor` object: roundtrip, content-hash stability, commitment equality, and
 //! membership-proof spot-checks (spec §6.4/§11.3; TDD PROTO-5 / RUN-2).
 
-use daemon_swarm_proto::merkle::commit_set;
-use daemon_swarm_proto::messages::{Locator, RecordEntry, RoundRecord};
-use daemon_swarm_proto::{to_canonical_vec, Hash, PeerId, RecordSet, Root, Seed};
+use daemon_vhc_proto::merkle::commit_set;
+use daemon_vhc_proto::messages::{Locator, RecordEntry, RoundRecord};
+use daemon_vhc_proto::{to_canonical_vec, Hash, PeerId, RecordSet, Root, Seed};
 
 const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-swarm.cddl"));
 

@@ -3,9 +3,9 @@
 
 //! Shared swarm identity / hash vocabulary.
 //!
-//! Merge 1 swapped the Wave-1 placeholders for the canonical [`daemon_swarm_proto`] types: the
-//! content hash is proto's blake3 [`Hash`](daemon_swarm_proto::Hash) (re-exported here as
-//! [`ContentHash`]) and the peer identity is proto's [`PeerId`](daemon_swarm_proto::PeerId). The
+//! Merge 1 swapped the Wave-1 placeholders for the canonical [`daemon_vhc_proto`] types: the
+//! content hash is proto's blake3 [`Hash`](daemon_vhc_proto::Hash) (re-exported here as
+//! [`ContentHash`]) and the peer identity is proto's [`PeerId`](daemon_vhc_proto::PeerId). The
 //! run-scoped locator types proto does not model — run ids stay opaque strings (proto carries
 //! `run_id: String`), and the payload-store key is a transport concern — remain local, but are
 //! re-expressed over the proto primitives (`PayloadKey` keys on the proto `PeerId`).
@@ -16,17 +16,17 @@ use serde::{Deserialize, Serialize};
 ///
 /// The whole swarm integrity model — artifacts, round payloads, checkpoints — is blake3-addressed
 /// (spec §6.4, the delta from Psyche's sha256). Compute one with
-/// [`daemon_swarm_proto::blake3_hash`].
+/// [`daemon_vhc_proto::blake3_hash`].
 ///
-/// [`Hash`]: daemon_swarm_proto::Hash
-pub use daemon_swarm_proto::Hash as ContentHash;
+/// [`Hash`]: daemon_vhc_proto::Hash
+pub use daemon_vhc_proto::Hash as ContentHash;
 
 /// A peer's ed25519 **node** identity public key (spec §7.2 — never the iroh `NodeId`).
 ///
-/// Proto's [`PeerId`](daemon_swarm_proto::PeerId): 32 raw bytes, ordered lexicographically by those
+/// Proto's [`PeerId`](daemon_vhc_proto::PeerId): 32 raw bytes, ordered lexicographically by those
 /// bytes, which is the total order the `RoundRecord`'s committed set and proto's `commit_set` use
 /// (§6.4 I3).
-pub use daemon_swarm_proto::PeerId;
+pub use daemon_vhc_proto::PeerId;
 
 /// A round number within a run.
 ///
@@ -79,7 +79,7 @@ impl PayloadKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daemon_swarm_proto::blake3_hash;
+    use daemon_vhc_proto::blake3_hash;
 
     #[test]
     fn content_hash_is_proto_blake3() {

@@ -3,8 +3,8 @@
 
 //! Capability subset admission (TDD PROTO-12, spec §6.5/§16).
 
-use daemon_swarm_proto::capability::CapabilitySet;
-use daemon_swarm_proto::to_canonical_vec;
+use daemon_vhc_proto::capability::CapabilitySet;
+use daemon_vhc_proto::to_canonical_vec;
 
 fn advertised() -> CapabilitySet {
     CapabilitySet::from_tokens([

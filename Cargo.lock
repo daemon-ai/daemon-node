@@ -4492,7 +4492,7 @@ dependencies = [
 name = "daemon-swarm-coordinator"
 version = "0.0.1"
 dependencies = [
- "daemon-swarm-proto",
+ "daemon-vhc-proto",
  "proptest",
  "serde",
 ]
@@ -4510,11 +4510,11 @@ dependencies = [
  "daemon-swarm-net",
  "daemon-swarm-node",
  "daemon-swarm-observe",
- "daemon-swarm-proto",
  "daemon-swarm-run",
  "daemon-train",
  "daemon-train-client",
  "daemon-train-sdk",
+ "daemon-vhc-proto",
  "serde_json",
  "tokio",
 ]
@@ -4527,7 +4527,7 @@ dependencies = [
  "ciborium",
  "daemon-core",
  "daemon-egress",
- "daemon-swarm-proto",
+ "daemon-vhc-proto",
  "futures",
  "iroh",
  "iroh-gossip",
@@ -4568,22 +4568,9 @@ version = "0.0.1"
 dependencies = [
  "ciborium",
  "daemon-swarm-coordinator",
- "daemon-swarm-proto",
+ "daemon-vhc-proto",
  "serde",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "daemon-swarm-proto"
-version = "0.0.1"
-dependencies = [
- "blake3",
- "cddl-cat",
- "ciborium",
- "ed25519-dalek 2.2.0",
- "proptest",
- "serde",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -4596,7 +4583,7 @@ dependencies = [
  "daemon-swarm-coordinator",
  "daemon-swarm-net",
  "daemon-swarm-observe",
- "daemon-swarm-proto",
+ "daemon-vhc-proto",
  "figment",
  "futures",
  "serde",
@@ -4954,13 +4941,13 @@ dependencies = [
  "daemon-egress",
  "daemon-provision",
  "daemon-swarm-net",
- "daemon-swarm-proto",
  "daemon-swarm-run",
  "daemon-telemetry",
  "daemon-train-client",
  "daemon-train-safetensors",
  "daemon-train-sdk",
- "det-core",
+ "daemon-vhc-det",
+ "daemon-vhc-proto",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -4996,7 +4983,7 @@ name = "daemon-train-sdk"
 version = "0.0.1"
 dependencies = [
  "ciborium",
- "det-core",
+ "daemon-vhc-det",
  "serde",
 ]
 
@@ -5017,6 +5004,23 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "daemon-vhc-det"
+version = "0.0.1"
+
+[[package]]
+name = "daemon-vhc-proto"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "cddl-cat",
+ "ciborium",
+ "ed25519-dalek 2.2.0",
+ "proptest",
+ "serde",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -5536,10 +5540,6 @@ dependencies = [
  "regex-syntax",
  "strum 0.28.0",
 ]
-
-[[package]]
-name = "det-core"
-version = "0.0.1"
 
 [[package]]
 name = "deunicode"
@@ -15061,10 +15061,10 @@ dependencies = [
  "base64 0.22.1",
  "ciborium",
  "clap",
- "daemon-swarm-proto",
  "daemon-swarm-run",
  "daemon-train-client",
  "daemon-train-sdk",
+ "daemon-vhc-proto",
  "serde",
  "serde_json",
  "tokio",

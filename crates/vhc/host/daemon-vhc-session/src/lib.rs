@@ -20,7 +20,7 @@
 //!   `daemon-train` worker implements against in Wave 3.
 //!
 //! Identity/hash types are re-exported from `daemon-swarm-net`'s [`seam`], which (as of Merge 1)
-//! resolves them to the canonical `daemon-swarm-proto` types (blake3 `Hash`, `PeerId`).
+//! resolves them to the canonical `daemon-vhc-proto` types (blake3 `Hash`, `PeerId`).
 
 #![forbid(unsafe_code)]
 

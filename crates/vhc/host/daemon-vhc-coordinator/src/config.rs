@@ -9,10 +9,10 @@
 //! [`crate::CoordinatorState`] and therefore canonical-CBOR-serializable (the replay foundation,
 //! PROTO-20).
 
-use daemon_swarm_proto::assignment::WITNESS_TARGET_DEFAULT;
-use daemon_swarm_proto::canonical::to_canonical_vec;
-use daemon_swarm_proto::envelope::{Envelope, GlobalBatch, StopCondition};
-use daemon_swarm_proto::{blake3_hash, CapabilitySet, Hash, PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::assignment::WITNESS_TARGET_DEFAULT;
+use daemon_vhc_proto::canonical::to_canonical_vec;
+use daemon_vhc_proto::envelope::{Envelope, GlobalBatch, StopCondition};
+use daemon_vhc_proto::{blake3_hash, CapabilitySet, Hash, PeerId, SwarmProtoVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::CoordinatorError;
@@ -105,7 +105,7 @@ impl RunConfig {
     /// Project a resolved [`Envelope`] + coordinator params into a [`RunConfig`].
     ///
     /// The `envelope_hash` is recomputed from the envelope's canonical CBOR (blake3), byte-identical
-    /// to [`daemon_swarm_proto::FrozenEnvelope::hash`]. Fails if the envelope is invalid (§6.1) or a
+    /// to [`daemon_vhc_proto::FrozenEnvelope::hash`]. Fails if the envelope is invalid (§6.1) or a
     /// capability token is malformed.
     pub fn from_envelope(
         env: &Envelope,
@@ -118,7 +118,7 @@ impl RunConfig {
             CapabilitySet::from_tokens(env.requirements.capabilities.iter())?;
         Ok(Self {
             run_id: env.run.run_id.clone(),
-            proto_version: daemon_swarm_proto::SWARM_PROTO_VERSION,
+            proto_version: daemon_vhc_proto::SWARM_PROTO_VERSION,
             envelope_hash,
             required_capabilities,
             min_peers: env.run.min_peers,

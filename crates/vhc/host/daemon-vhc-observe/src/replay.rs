@@ -14,9 +14,9 @@
 //! the trace is pure messages; timeout/straggler rounds additionally carry the recorded
 //! `Input::Clock`s (the driver's sidecar — clocks are not signed messages, §14).
 
-use daemon_swarm_proto::envelope::Envelope;
-use daemon_swarm_proto::messages::{RoundRecord, SwarmMessage};
-use daemon_swarm_proto::{blake3_hash, to_canonical_vec, Hash, Seed};
+use daemon_vhc_proto::envelope::Envelope;
+use daemon_vhc_proto::messages::{RoundRecord, SwarmMessage};
+use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, Seed};
 
 use daemon_swarm_coordinator::{
     tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,

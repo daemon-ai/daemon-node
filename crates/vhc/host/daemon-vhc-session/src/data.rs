@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use daemon_swarm_proto::{blake3_hash, Hash};
+use daemon_vhc_proto::{blake3_hash, Hash};
 
 use crate::seam::BatchId;
 

@@ -27,13 +27,13 @@
 //! remainder (see the ledger "Deviations").
 
 use daemon_provision::CutWriter;
-use daemon_swarm_proto::{blake3_hash, PeerId};
 use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
 use daemon_swarm_run::protocol::Event;
 use daemon_train::autotune::oom_error_class;
 use daemon_train::{
     EngineConfig, TrainError, TrapCode, WasmBackend, WasmBackendConfig, WasmBackendError,
 };
+use daemon_vhc_proto::{blake3_hash, PeerId};
 
 use crate::{send, SEQ, SEQS};
 

@@ -17,7 +17,7 @@
 //!
 //! - `Probe` → a real host capability report (`tabi@1`, all 66 host ops; GPU absent = CPU-only).
 //! - `AssessRun{envelope}` → the peer-side re-validation (spec §6.5). The `envelope` bytes are the
-//!   canonical [`daemon_swarm_proto::SignedEnvelope`] wire form of the run's `FrozenEnvelope`: the
+//!   canonical [`daemon_vhc_proto::SignedEnvelope`] wire form of the run's `FrozenEnvelope`: the
 //!   worker **verifies** it, extracts the `[experiment.config]`, and **resolves the module** from the
 //!   envelope's artifact map via [`daemon_swarm_net::ArtifactResolver`] (`file://`, blake3-verified).
 //!   `DAEMON_TRAIN_MODULE`, if set, overrides the artifact resolution (dev / node-controlled). It then

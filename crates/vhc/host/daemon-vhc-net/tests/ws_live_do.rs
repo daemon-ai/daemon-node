@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
 use daemon_swarm_net::{ControlPlane, ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
-use daemon_swarm_proto::messages::{Commitment, Heartbeat, Join, Locator, ThroughputClass};
-use daemon_swarm_proto::{
+use daemon_vhc_proto::messages::{Commitment, Heartbeat, Join, Locator, ThroughputClass};
+use daemon_vhc_proto::{
     from_canonical_slice, to_canonical_vec, CapabilitySet, Hash, IrohId, SignedMessage,
     SwarmMessage, SWARM_PROTO_VERSION,
 };

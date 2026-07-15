@@ -10,8 +10,8 @@
 
 use std::collections::BTreeSet;
 
-use daemon_swarm_proto::messages::SwarmMessage;
-use daemon_swarm_proto::PeerId;
+use daemon_vhc_proto::messages::SwarmMessage;
+use daemon_vhc_proto::PeerId;
 use serde::{Deserialize, Serialize};
 
 use crate::log::{round_of, MessageKind, MessageLog};

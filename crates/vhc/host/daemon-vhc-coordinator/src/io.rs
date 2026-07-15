@@ -9,10 +9,10 @@
 //! keeping `tick` key-free while the round stays provable from signed evidence (I6). Every input class
 //! yields at least one output class (PROTO-1).
 
-use daemon_swarm_proto::capability::Capability;
-use daemon_swarm_proto::messages::{SignedMessage, SwarmMessage};
-use daemon_swarm_proto::sign::Signed;
-use daemon_swarm_proto::{PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::capability::Capability;
+use daemon_vhc_proto::messages::{SignedMessage, SwarmMessage};
+use daemon_vhc_proto::sign::Signed;
+use daemon_vhc_proto::{PeerId, SwarmProtoVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::state::Phase;

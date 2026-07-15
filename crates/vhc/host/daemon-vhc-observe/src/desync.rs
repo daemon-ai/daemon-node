@@ -3,7 +3,7 @@
 
 //! Digest tally / desync detection (spec §5.6, §6.4, §9; TDD §3.9).
 //!
-//! Every peer emits a post-ingest [`Digest`](daemon_swarm_proto::messages::Digest) per round (§5.6).
+//! Every peer emits a post-ingest [`Digest`](daemon_vhc_proto::messages::Digest) per round (§5.6).
 //! Folding a round's digests yields a **quorum digest** (the value a quorum of peers agree on) and
 //! the **outlier** set (peers that diverged) — the observe-driven desync trigger the runtime lane's
 //! resync path consumes (§9). This crate produces the [`DesyncVerdict`]; wiring it into
@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use daemon_swarm_proto::{PeerId, StateDigest};
+use daemon_vhc_proto::{PeerId, StateDigest};
 use serde::{Deserialize, Serialize};
 
 use crate::log::{MessageKind, MessageLog};
@@ -41,7 +41,7 @@ impl DesyncVerdict {
 
 /// Fold a round's `(peer, digest)` reports into a [`DesyncVerdict`]. `quorum` is the number of
 /// agreeing peers required for a digest to count as the quorum digest (e.g.
-/// [`daemon_swarm_proto::assignment::witness_quorum`] of the roster). The last report from a peer
+/// [`daemon_vhc_proto::assignment::witness_quorum`] of the roster). The last report from a peer
 /// wins (a peer only has one true post-ingest digest per round).
 #[must_use]
 pub fn digest_tally(
@@ -92,7 +92,7 @@ pub fn digest_tally_from_log(log: &MessageLog, round: u64, quorum: u32) -> Desyn
     let reports = log
         .by_round_kind(round, MessageKind::Digest)
         .filter_map(|m| match &m.payload {
-            daemon_swarm_proto::messages::SwarmMessage::Digest(d) => Some((m.signer, d.digest)),
+            daemon_vhc_proto::messages::SwarmMessage::Digest(d) => Some((m.signer, d.digest)),
             _ => None,
         });
     digest_tally(round, reports, quorum)

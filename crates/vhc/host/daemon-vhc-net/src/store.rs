@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use daemon_core::ContainedRoot;
-use daemon_swarm_proto::blake3_hash;
+use daemon_vhc_proto::blake3_hash;
 
 use crate::seam::{ContentHash, PayloadKey, RoundId, RunId};
 use crate::transport::{PayloadStat, PayloadStore};

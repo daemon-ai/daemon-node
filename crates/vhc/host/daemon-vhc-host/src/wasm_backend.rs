@@ -16,7 +16,7 @@
 //! dict ([`crate::Instance::checkpoint_bytes`] / [`crate::Instance::restore_checkpoint`]).
 //!
 //! **Digest**: the post-ingest state digest is [`crate::Instance::canonical_state_bytes`] (params +
-//! replicated persistents) fed to `daemon_swarm_proto::digest_state` (seed-keyed xxh3-128, seeded
+//! replicated persistents) fed to `daemon_vhc_proto::digest_state` (seed-keyed xxh3-128, seeded
 //! by the round, full sampling) — the frozen proto digest, not a re-derived one. Two `WasmBackend`s
 //! over the same module + config + batches + staged set are **bit-identical** every round (ABI §7 /
 //! the MVP's core claim; see `tests/wasm_backend_determinism.rs`).
@@ -27,12 +27,12 @@
 //!
 //! [`RoundEngine`]: daemon_swarm_run::engine::RoundEngine
 
-use daemon_swarm_proto::{digest_state, Seed};
 use daemon_swarm_run::backend::{
     AssessMeta, Assessment, BatchRef, StagedPayload, StateDigest, StepCtx, StepStats,
     TrainerBackend,
 };
 use daemon_swarm_run::seam::RoundId;
+use daemon_vhc_proto::{digest_state, Seed};
 
 use crate::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
 use crate::runtime::{EngineConfig, Instance, LoadedModule, Manifest, Worker};

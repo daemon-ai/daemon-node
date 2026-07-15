@@ -6,23 +6,23 @@
 mod common;
 
 use common::*;
-use daemon_swarm_proto::envelope::{GlobalBatch, StopCondition};
-use daemon_swarm_proto::messages::SwarmMessage;
-use daemon_swarm_proto::{peer_id, to_canonical_vec, PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
+use daemon_vhc_proto::messages::SwarmMessage;
+use daemon_vhc_proto::{peer_id, to_canonical_vec, PeerId, SwarmProtoVersion};
 
 use daemon_swarm_coordinator::{
     tick, ClientState, ControlAction, CoordinatorState, Input, Notice, Output, Phase,
 };
 
-fn keys(n: u8) -> Vec<daemon_swarm_proto::SigningKey> {
+fn keys(n: u8) -> Vec<daemon_vhc_proto::SigningKey> {
     (1..=n).map(key).collect()
 }
 
 /// Drive one full round to completion via the commit + storage-receipt fast path (no timeouts).
 fn complete_round(
     state: CoordinatorState,
-    ks: &[daemon_swarm_proto::SigningKey],
-    coord: &daemon_swarm_proto::SigningKey,
+    ks: &[daemon_vhc_proto::SigningKey],
+    coord: &daemon_vhc_proto::SigningKey,
     round: u64,
     seed: u8,
 ) -> (CoordinatorState, Vec<Output>) {
@@ -289,10 +289,10 @@ fn proto14_pause_requires_authorized_principal() {
 /// Drive a round to completion by timeout (A/B commit + receipt; C behaves per `c_action`).
 fn timeout_round_without_c(
     mut state: CoordinatorState,
-    ab: &[daemon_swarm_proto::SigningKey],
-    coord: &daemon_swarm_proto::SigningKey,
+    ab: &[daemon_vhc_proto::SigningKey],
+    coord: &daemon_vhc_proto::SigningKey,
     round: u64,
-    c_straggle: Option<&daemon_swarm_proto::SigningKey>,
+    c_straggle: Option<&daemon_vhc_proto::SigningKey>,
 ) -> CoordinatorState {
     for k in ab {
         let (s, _) = tick(state, Input::Message(commitment_msg(k, round, 7)));

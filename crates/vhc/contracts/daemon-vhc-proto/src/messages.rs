@@ -23,7 +23,7 @@ use crate::merkle::SetCommitment;
 use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
 use crate::version::SwarmProtoVersion;
 
-/// A measured throughput class (§6.3). Boundaries are `daemon-swarm-proto` constants, versioned
+/// A measured throughput class (§6.3). Boundaries are `daemon-vhc-proto` constants, versioned
 /// with [`SwarmProtoVersion`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

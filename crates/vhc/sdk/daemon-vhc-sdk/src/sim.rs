@@ -5,7 +5,7 @@
 //!
 //! It swaps the extern block for a native fp32 store so experiments and profiles are unit-testable
 //! with `cargo test --features sim` — no GPU, no wasm host. The **det lane** delegates to the shared
-//! `det-core` kernels (so "sim ≡ host" is one implementation, ABI §5.6/§10.1); the native lane runs
+//! `daemon-vhc-det` kernels (so "sim ≡ host" is one implementation, ABI §5.6/§10.1); the native lane runs
 //! a tiny reverse-mode tape (enough for a dense MLP: matmul / bias-add / relu / cross-entropy),
 //! which is *semantics*-reference, not performance-reference.
 //!
@@ -1495,7 +1495,7 @@ impl Store {
     pub(crate) fn det_sum(&mut self, handles: &[RawHandle]) -> RawHandle {
         let vecs: Vec<Vec<f32>> = handles.iter().map(|&h| self.det_value(h)).collect();
         let refs: Vec<&[f32]> = vecs.iter().map(Vec::as_slice).collect();
-        let out = det_core::det_sum(&refs).expect("det_sum shapes must agree");
+        let out = daemon_vhc_det::det_sum(&refs).expect("det_sum shapes must agree");
         let shape = handles
             .first()
             .map(|&h| self.det_shape(h))
@@ -1513,38 +1513,38 @@ impl Store {
     }
 
     pub(crate) fn det_scale(&mut self, x: RawHandle, alpha: f64) -> RawHandle {
-        let out = det_core::det_scale(&self.det_value(x), alpha);
+        let out = daemon_vhc_det::det_scale(&self.det_value(x), alpha);
         let shape = self.det_shape(x);
         self.push_det(out, shape)
     }
 
     pub(crate) fn det_l2norm(&mut self, x: RawHandle) -> f64 {
-        f64::from(det_core::det_l2norm(&self.det_value(x)))
+        f64::from(daemon_vhc_det::det_l2norm(&self.det_value(x)))
     }
 
     pub(crate) fn det_sign(&mut self, x: RawHandle) -> RawHandle {
-        let out = det_core::det_sign(&self.det_value(x));
+        let out = daemon_vhc_det::det_sign(&self.det_value(x));
         let shape = self.det_shape(x);
         self.push_det(out, shape)
     }
 
     pub(crate) fn det_add(&mut self, a: RawHandle, b: RawHandle) -> RawHandle {
-        let out =
-            det_core::det_add(&self.det_value(a), &self.det_value(b)).expect("det_add shapes");
+        let out = daemon_vhc_det::det_add(&self.det_value(a), &self.det_value(b))
+            .expect("det_add shapes");
         let shape = self.det_shape(a);
         self.push_det(out, shape)
     }
 
     pub(crate) fn det_sub(&mut self, a: RawHandle, b: RawHandle) -> RawHandle {
-        let out =
-            det_core::det_sub(&self.det_value(a), &self.det_value(b)).expect("det_sub shapes");
+        let out = daemon_vhc_det::det_sub(&self.det_value(a), &self.det_value(b))
+            .expect("det_sub shapes");
         let shape = self.det_shape(a);
         self.push_det(out, shape)
     }
 
     pub(crate) fn det_mul(&mut self, a: RawHandle, b: RawHandle) -> RawHandle {
-        let out =
-            det_core::det_mul(&self.det_value(a), &self.det_value(b)).expect("det_mul shapes");
+        let out = daemon_vhc_det::det_mul(&self.det_value(a), &self.det_value(b))
+            .expect("det_mul shapes");
         let shape = self.det_shape(a);
         self.push_det(out, shape)
     }
@@ -1556,7 +1556,7 @@ impl Store {
         bits: u32,
     ) -> RawHandle {
         let bytes: Vec<u8> = self.det_value(packed).iter().map(|&f| f as u8).collect();
-        let out = det_core::det_absmax_unpack(&bytes, chunk as usize, bits)
+        let out = daemon_vhc_det::det_absmax_unpack(&bytes, chunk as usize, bits)
             .expect("det_absmax_unpack layout");
         let n = out.len();
         self.push_det(out, vec![n])
@@ -1572,8 +1572,13 @@ impl Store {
         let vals_v = self.det_value(vals);
         let idx_v: Vec<u32> = self.det_value(idx).iter().map(|&f| f as u32).collect();
         let (_, ai) = dec(acc);
-        det_core::det_chunk_scatter_add(&mut self.dets[ai].data, &vals_v, &idx_v, chunk as usize)
-            .expect("det_chunk_scatter_add layout");
+        daemon_vhc_det::det_chunk_scatter_add(
+            &mut self.dets[ai].data,
+            &vals_v,
+            &idx_v,
+            chunk as usize,
+        )
+        .expect("det_chunk_scatter_add layout");
     }
 
     pub(crate) fn det_chunk_scatter(
@@ -1585,7 +1590,7 @@ impl Store {
     ) -> RawHandle {
         let vals_v = self.det_value(vals);
         let idx_v: Vec<u32> = self.det_value(idx).iter().map(|&f| f as u32).collect();
-        let out = det_core::det_chunk_scatter(&vals_v, &idx_v, chunk as usize, numel(dims))
+        let out = daemon_vhc_det::det_chunk_scatter(&vals_v, &idx_v, chunk as usize, numel(dims))
             .expect("det_chunk_scatter layout");
         self.push_det(out, dims.iter().map(|&d| d as usize).collect())
     }
@@ -1616,7 +1621,7 @@ impl Store {
     pub(crate) fn det_axpy_param(&mut self, p: RawHandle, x: RawHandle, alpha: f64) {
         let xv = self.det_value(x);
         let (_, idx) = dec(p);
-        det_core::det_axpy(&mut self.params[idx].master, alpha, &xv)
+        daemon_vhc_det::det_axpy(&mut self.params[idx].master, alpha, &xv)
             .expect("det_axpy_param shapes must agree");
         self.params[idx].storage = self.params[idx].master.clone();
     }
@@ -1631,7 +1636,7 @@ impl Store {
     ) -> (RawHandle, RawHandle) {
         let xv = self.native_value(x);
         let (vals, idx) =
-            det_core::topk_chunk(&xv, chunk as usize, k as usize).expect("topk_chunk layout");
+            daemon_vhc_det::topk_chunk(&xv, chunk as usize, k as usize).expect("topk_chunk layout");
         let numel = xv.len();
         let n_chunks = numel / chunk.max(1) as usize;
         let shape = vec![n_chunks, k as usize];
@@ -1650,14 +1655,15 @@ impl Store {
     ) -> RawHandle {
         let valsv = self.native_value(vals);
         let idxv: Vec<u32> = self.native_value(idx).iter().map(|&f| f as u32).collect();
-        let out = det_core::det_chunk_scatter(&valsv, &idxv, chunk as usize, numel(dims))
+        let out = daemon_vhc_det::det_chunk_scatter(&valsv, &idxv, chunk as usize, numel(dims))
             .expect("chunk_scatter layout");
         self.push_node(out, dims.iter().map(|&d| d as usize).collect(), Op::Const)
     }
 
     pub(crate) fn absmax_pack(&mut self, x: RawHandle, chunk: u32, bits: u32) -> RawHandle {
         let xv = self.native_value(x);
-        let packed = det_core::absmax_pack(&xv, chunk as usize, bits).expect("absmax_pack layout");
+        let packed =
+            daemon_vhc_det::absmax_pack(&xv, chunk as usize, bits).expect("absmax_pack layout");
         let n = packed.len();
         let vals: Vec<f32> = packed.iter().map(|&b| f32::from(b)).collect();
         self.push_node(vals, vec![n], Op::Const)
@@ -1671,7 +1677,7 @@ impl Store {
         _dtype: u32,
     ) -> RawHandle {
         let bytes: Vec<u8> = self.native_value(packed).iter().map(|&f| f as u8).collect();
-        let out = det_core::det_absmax_unpack(&bytes, chunk as usize, bits)
+        let out = daemon_vhc_det::det_absmax_unpack(&bytes, chunk as usize, bits)
             .expect("absmax_unpack layout");
         let n = out.len();
         self.push_node(out, vec![n], Op::Const)
@@ -1679,19 +1685,21 @@ impl Store {
 
     pub(crate) fn dct2(&mut self, x: RawHandle, tile: u32) -> RawHandle {
         let shape = self.native_shape(x);
-        let out = det_core::dct2(&self.native_value(x), tile as usize).expect("dct2 layout");
+        let out = daemon_vhc_det::dct2(&self.native_value(x), tile as usize).expect("dct2 layout");
         self.push_node(out, shape, Op::Const)
     }
 
     pub(crate) fn idct2(&mut self, x: RawHandle, tile: u32) -> RawHandle {
         let shape = self.native_shape(x);
-        let out = det_core::idct2(&self.native_value(x), tile as usize).expect("idct2 layout");
+        let out =
+            daemon_vhc_det::idct2(&self.native_value(x), tile as usize).expect("idct2 layout");
         self.push_node(out, shape, Op::Const)
     }
 
     pub(crate) fn det_idct2(&mut self, x: RawHandle, tile: u32) -> RawHandle {
         let shape = self.det_shape(x);
-        let out = det_core::idct2(&self.det_value(x), tile as usize).expect("det_idct2 layout");
+        let out =
+            daemon_vhc_det::idct2(&self.det_value(x), tile as usize).expect("det_idct2 layout");
         self.push_det(out, shape)
     }
 }

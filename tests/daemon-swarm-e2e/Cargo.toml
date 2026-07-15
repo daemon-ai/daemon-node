@@ -23,7 +23,7 @@ iroh = ["daemon-swarm-run/iroh", "daemon-swarm-net/ws"]
 # (feature-gated). Merge 2 swapped the scripted coordinator for the real `daemon-swarm-coordinator`
 # tick loop; Wave 3 (R3) adds the drills over the same harness.
 daemon-swarm-run = { workspace = true, features = ["harness"] }
-daemon-swarm-proto = { workspace = true }
+daemon-vhc-proto = { workspace = true }
 # The payload store + `PayloadStore` trait: the desync drill fetches checkpoint + payload bytes for
 # the offline resync (checkpoint + record replay).
 daemon-swarm-net = { workspace = true }

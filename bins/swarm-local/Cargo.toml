@@ -14,7 +14,7 @@ path = "src/main.rs"
 # The participant runtime + the local-coordinator shell + in-process peer harness (`harness`).
 daemon-swarm-run = { workspace = true, features = ["harness"] }
 # The frozen envelope schema + freeze/verify chain (§6.1).
-daemon-swarm-proto = { workspace = true }
+daemon-vhc-proto = { workspace = true }
 # The node-side worker supervisor for `--backend worker` (spawn/probe/assess/join over §10.2).
 daemon-train-client = { workspace = true }
 # The tiny-llama preset config the demo envelope embeds when the authoring TOML leaves

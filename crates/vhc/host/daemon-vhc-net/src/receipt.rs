@@ -11,14 +11,14 @@
 //!
 //! Lane R models the *receipt-producer* half: a small component that polls/checks a
 //! [`PayloadStore`] via `head` (`stat`) and, when the object is available, produces a signed
-//! [`StorageReceipt`](daemon_swarm_proto::messages::StorageReceipt). Merge 1 re-expressed this over
+//! [`StorageReceipt`](daemon_vhc_proto::messages::StorageReceipt). Merge 1 re-expressed this over
 //! proto: the message shape is proto's CDDL `StorageReceipt` (a round + its verified
 //! `(peer, hash, size)` [`RecordEntry`] set), and the signature is the real ed25519 node-identity
 //! [`SignedMessage`] frame produced by [`SignedMessage::sign`] over canonical CBOR (§7.3). Net
 //! never *defines* the message or signature type — it only assembles store evidence into proto's.
 
-use daemon_swarm_proto::messages::{RecordEntry, StorageReceipt};
-use daemon_swarm_proto::{SignedMessage, SigningKey, SwarmMessage, SwarmProtoVersion};
+use daemon_vhc_proto::messages::{RecordEntry, StorageReceipt};
+use daemon_vhc_proto::{SignedMessage, SigningKey, SwarmMessage, SwarmProtoVersion};
 
 use crate::seam::{PayloadKey, RoundId};
 use crate::transport::PayloadStore;
@@ -106,7 +106,7 @@ mod tests {
     use crate::seam::{PeerId, RunId};
     use crate::store::FsPayloadStore;
     use crate::test_support::temp_root;
-    use daemon_swarm_proto::SWARM_PROTO_VERSION;
+    use daemon_vhc_proto::SWARM_PROTO_VERSION;
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[0x42; 32])

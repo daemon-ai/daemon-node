@@ -8,7 +8,7 @@
 // `BurnWgpuBackend` — the exact reuse the harness was built for. The native lane is a *tolerance
 // class* (GPU kernels vs the CpuBackend fixed-order fp32 tape, spec §7.2); the det lane +
 // compression natives are **bit-exact** because `BurnBackend` materializes host-side and delegates
-// to the same `det_core` kernels regardless of the burn backend (ABI §5.9 residency contract).
+// to the same `daemon_vhc_det` kernels regardless of the burn backend (ABI §5.9 residency contract).
 //
 // GPU-skip convention (TDD §8.1 tier-2): every test that needs a device first checks
 // `wgpu_adapter_available()` and skips with a loud stderr note when absent, so the default CI gate
@@ -386,7 +386,7 @@ fn abi_adamw_step_matches_burn() {
 // -- det lane + compression: bit-exact on the GPU build too (§5.9) -------------------------------
 //
 // Honesty note (G1's delegation, re-affirmed here): the compression natives (absmax_pack/unpack,
-// dct2/idct2, topk_chunk) and every det_* op run **host-side det-core** in `BurnBackend` regardless
+// dct2/idct2, topk_chunk) and every det_* op run **host-side daemon-vhc-det** in `BurnBackend` regardless
 // of the burn backend — there is no GPU-native absmax kernel in this build (recorded as future work
 // in G1's ledger). So HOST-3's "GPU-vs-CPU parity" is asserted at the `OpBackend` seam of the wgpu
 // *build* (byte-exact, because both delegate), plus the §6.6 layout golden below, which pins the
@@ -435,7 +435,7 @@ fn absmax_pack_golden() {
             let t = bk.create(x.clone());
             let packed = bk.absmax_pack(t, 16, bits).unwrap();
             let unpacked = bk.det_absmax_unpack(packed, 16, bits).unwrap();
-            // pack(unpack(pack(x))) is a fixed point (det-core's stored-scale discipline).
+            // pack(unpack(pack(x))) is a fixed point (daemon-vhc-det's stored-scale discipline).
             let repacked = bk.absmax_pack(unpacked, 16, bits).unwrap();
             vec![
                 bk.view(packed).to_vec(),
@@ -449,7 +449,7 @@ fn absmax_pack_golden() {
 /// HOST-3 `absmax_layout_bytes_golden`: the §6.6 packed layout, pinned to literal bytes — per chunk
 /// a little-endian f16 absmax codebook scalar, then `bits`-wide codes packed LSB-first, chunk-major.
 /// Asserted through the wgpu build's `OpBackend::absmax_pack` (bytes carried as f32 values at the
-/// seam) AND against `det_core::absmax_pack` directly, so the golden pins both the layout and the
+/// seam) AND against `daemon_vhc_det::absmax_pack` directly, so the golden pins both the layout and the
 /// delegation.
 #[test]
 fn absmax_layout_bytes_golden() {
@@ -460,9 +460,9 @@ fn absmax_layout_bytes_golden() {
     let x = vec![1.0_f32, -1.0, 0.5, 0.0, 0.25, -0.25, 0.125, -0.125];
     let want: Vec<u8> = vec![0x00, 0x3C, 0xA3, 0x00, 0x34, 0x63];
     assert_eq!(
-        det_core::absmax_pack(&x, 4, 2).unwrap(),
+        daemon_vhc_det::absmax_pack(&x, 4, 2).unwrap(),
         want,
-        "det-core §6.6 2-bit layout golden"
+        "daemon-vhc-det §6.6 2-bit layout golden"
     );
 
     let mut bk = BurnWgpuBackend::new();
@@ -475,9 +475,9 @@ fn absmax_layout_bytes_golden() {
     let x1 = vec![3.0_f32, -3.0, 1.5, -1.5, 0.75, -0.75, 3.0, -3.0];
     let want1: Vec<u8> = vec![0x00, 0x42, 0x55];
     assert_eq!(
-        det_core::absmax_pack(&x1, 8, 1).unwrap(),
+        daemon_vhc_det::absmax_pack(&x1, 8, 1).unwrap(),
         want1,
-        "det-core §6.6 1-bit layout golden"
+        "daemon-vhc-det §6.6 1-bit layout golden"
     );
     let t1 = bk.create(x1);
     let packed1 = bk.absmax_pack(t1, 8, 1).unwrap();

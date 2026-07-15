@@ -8,16 +8,16 @@
 //! test. Fixtures are generated in-process (no committed blobs, no `xtask` edit — the whole crate
 //! surface is here). Plus signature-reject and roster-size-invariant checks.
 
-use daemon_swarm_proto::bytes::{Hash, IrohId, PeerId, Seed, StateDigest};
-use daemon_swarm_proto::capability::CapabilitySet;
-use daemon_swarm_proto::merkle::commit_set;
-use daemon_swarm_proto::messages::{
+use daemon_vhc_proto::bytes::{Hash, IrohId, PeerId, Seed, StateDigest};
+use daemon_vhc_proto::capability::CapabilitySet;
+use daemon_vhc_proto::merkle::commit_set;
+use daemon_vhc_proto::messages::{
     Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RecordEntry, RoundOpen,
     RoundRecord, SignedMessage, StorageReceipt, Straggle, StraggleStatus, SwarmMessage,
     ThroughputClass,
 };
-use daemon_swarm_proto::version::SWARM_PROTO_VERSION;
-use daemon_swarm_proto::{to_canonical_vec, SigningKey};
+use daemon_vhc_proto::version::SWARM_PROTO_VERSION;
+use daemon_vhc_proto::{to_canonical_vec, SigningKey};
 
 const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-swarm.cddl"));
 
@@ -102,7 +102,7 @@ fn all_sample_messages() -> Vec<SwarmMessage> {
             capabilities: CapabilitySet::from_tokens(["tensor-abi@1", "det_sum@1"]).unwrap(),
             // Exercise the additive optional envelope-hash carrier against the `? "envelope_hash"`
             // CDDL rule (Wave 3).
-            envelope_hash: Some(daemon_swarm_proto::blake3_hash(b"smollm-500m-01-envelope")),
+            envelope_hash: Some(daemon_vhc_proto::blake3_hash(b"smollm-500m-01-envelope")),
         }),
         SwarmMessage::Heartbeat(Heartbeat {
             round: 42,
@@ -113,7 +113,7 @@ fn all_sample_messages() -> Vec<SwarmMessage> {
 
 #[test]
 fn heartbeat_ready_flag_cddl_conforms_and_roundtrips() {
-    use daemon_swarm_proto::from_canonical_slice;
+    use daemon_vhc_proto::from_canonical_slice;
 
     // A legacy heartbeat omits `ready` on the wire; a Wave-3 ready heartbeat carries the bool.
     let legacy = Heartbeat {
@@ -217,7 +217,7 @@ fn record_bad_sig_rejected() {
 
 #[test]
 fn wrong_run_version_rejected() {
-    use daemon_swarm_proto::version::SwarmProtoVersion;
+    use daemon_vhc_proto::version::SwarmProtoVersion;
     let msg = SignedMessage::sign(
         &key(),
         SwarmProtoVersion(2),
@@ -253,7 +253,7 @@ fn message_size_roster_invariant() {
             Some(
                 tree.entries()
                     .iter()
-                    .map(|(p, h)| daemon_swarm_proto::messages::AttestEntry { peer: *p, hash: *h })
+                    .map(|(p, h)| daemon_vhc_proto::messages::AttestEntry { peer: *p, hash: *h })
                     .collect(),
             )
         } else {

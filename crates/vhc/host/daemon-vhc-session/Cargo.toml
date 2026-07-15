@@ -38,7 +38,7 @@ harness = ["dep:daemon-swarm-coordinator", "dep:daemon-swarm-observe"]
 iroh = ["harness", "daemon-swarm-net/iroh"]
 
 [dependencies]
-daemon-swarm-proto = { workspace = true }
+daemon-vhc-proto = { workspace = true }
 daemon-swarm-net = { workspace = true }
 # The pure coordinator `tick` state machine — driven by the Merge-2 harness shell (feature-gated, so
 # it stays out of the default participant-runtime build). Not a root Cargo.toml change: the path dep

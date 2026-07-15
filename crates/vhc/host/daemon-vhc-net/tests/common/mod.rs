@@ -7,7 +7,7 @@
 //! [`Mesh`] — a set of N connected control planes each with one subscriber — so the *same* behavior
 //! tests exercise both [`LoopbackGossip`](daemon_swarm_net::LoopbackGossip) (a shared in-process bus)
 //! and [`IrohGossip`](daemon_swarm_net::IrohGossip) (N real iroh endpoints on loopback). The signed-
-//! message helpers build canonical-CBOR `daemon_swarm_proto::SignedMessage` bytes — the opaque
+//! message helpers build canonical-CBOR `daemon_vhc_proto::SignedMessage` bytes — the opaque
 //! already-signed payloads the plane carries (NET-6).
 
 #![allow(dead_code)]
@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daemon_swarm_net::{ControlPlane, ControlSubscription};
-use daemon_swarm_proto::messages::Heartbeat;
-use daemon_swarm_proto::{
+use daemon_vhc_proto::messages::Heartbeat;
+use daemon_vhc_proto::{
     from_canonical_slice, to_canonical_vec, SignedMessage, SigningKey, SwarmMessage,
     SWARM_PROTO_VERSION,
 };
