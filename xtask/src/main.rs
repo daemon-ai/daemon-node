@@ -517,6 +517,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
              engine) retires with the v1 engine at sunset [dev-dep]",
         ),
         (
+            "daemon-swarm-e2e",
+            "daemon-vhc-sdk-v2",
+            "Phase E — the B2 corpus-windowing equivalence oracle (SDK policy vs the v1 host \
+             pipeline `session::data`) retires with the v1 pipeline at sunset [dev-dep]",
+        ),
+        (
             "daemon-vhc-safetensors",
             "daemon-vhc-sdk",
             "Phase E — safetensors is wired into the checkpoint path (state-dict layout) [dev-dep]",
