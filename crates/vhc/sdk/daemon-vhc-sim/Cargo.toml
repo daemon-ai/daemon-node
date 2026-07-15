@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = """
+The SDK-side simulation layer (architecture §6): native implementations of the four capability
+worlds — a reference CPU backend (the shared daemon-vhc-det kernels, bit-identical to the host),
+a virtual network with trace-driven latency / churn / session-length models, a virtual corpus,
+and a virtual logical clock — plus a deterministic discrete-event runtime that runs NATIVE policy
+code (whole runs: a coordinator + N workers) for fast iteration and native coordinator tests.
+
+It links SDK crates only and NEVER host/*: the production wasm blobs run under the host-side
+host/daemon-vhc-testkit instead (§6, the two-layer split on opposite sides of the wasm boundary).
+It grows BESIDE the v1 SDK's `sim` feature rather than extracting it — extracting `sim` out of
+daemon-vhc-sdk perturbs the byte-pinned tiny_llama.wasm (the A0 fixture), the same sibling
+discipline daemon-vhc-sdk-v2 records.
+"""
+
+[dependencies]
+# The shared ABI vocabulary both sides of the wasm boundary agree on: event tags, the Phase-A
+# channel table, status packing, stop/quiesce reasons, the §12.1 domain tag. A contracts/* crate,
+# so an sdk/* -> contracts/* edge (allowed).
+daemon-vhc-abi = { workspace = true }
+# The bit-exact fixed-order fp32 consensus kernels — the reference CPU backend's det lane, shared
+# with the host worker so "sim ≡ host" is one implementation (ABI §10.4).
+daemon-vhc-det = { workspace = true }
+# The v1 guest SDK, `sim` feature: the reference CPU backend (native fp32 tape + the shared det
+# kernels) and the first-party models/profiles native policy code iterates against. Re-exported as
+# `backend` — vhc-sim grows beside this feature, it does not extract it.
+daemon-vhc-sdk = { workspace = true, features = ["sim"] }
+# The DiLoCo-shaped round driver (BarrierRound) and the major-2 module scaffolding — re-exported so
+# native policy code (round experiments, hand-written loops) is authored against one surface here.
+daemon-vhc-sdk-rounds = { workspace = true }
+daemon-vhc-sdk-v2 = { path = "../daemon-vhc-sdk-v2" }
+serde = { workspace = true, features = ["derive"] }
+ciborium = { workspace = true }
+# Content-addressing for the virtual net's payloads and the deterministic decision transcript
+# (publish payload hashes) — the same blake3 the proto/journal use.
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

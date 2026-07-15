@@ -5050,6 +5050,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-sim"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "daemon-vhc-abi",
+ "daemon-vhc-det",
+ "daemon-vhc-sdk",
+ "daemon-vhc-sdk-rounds",
+ "daemon-vhc-sdk-v2",
+ "serde",
+]
+
+[[package]]
 name = "daemon-vhc-supervisor"
 version = "0.0.1"
 dependencies = [
