@@ -459,6 +459,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "Phase B — e2e runs production wasm blobs under host/daemon-vhc-testkit [dev-dep]",
         ),
         (
+            "daemon-swarm-e2e",
+            "daemon-vhc-sdk-rounds",
+            "Phase E — the A2 choreography bridging oracle (relocated round logic vs the v1 \
+             engine) retires with the v1 engine at sunset [dev-dep]",
+        ),
+        (
             "daemon-vhc-safetensors",
             "daemon-vhc-sdk",
             "Phase E — safetensors is wired into the checkpoint path (state-dict layout) [dev-dep]",

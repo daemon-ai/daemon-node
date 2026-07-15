@@ -4513,6 +4513,7 @@ dependencies = [
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk",
+ "daemon-vhc-sdk-rounds",
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
  "serde_json",
