@@ -35,7 +35,8 @@ pub mod runtime;
 pub mod select;
 pub mod trap;
 pub mod v2;
-pub mod wasm_backend;
+// (A2 inversion): `wasm_backend` moved to `daemon-vhc-session` — the host no longer links the
+// session, so the TrainerBackend seam impl lives with the trait (refactor §5 A2 item 3).
 
 pub use autotune::{Autotune, AutotuneVerdict, DeviceLimits, ProbeStep};
 pub use backend::{AdamwHp, CpuBackend, OpBackend, TensorId};
@@ -54,7 +55,6 @@ pub use runtime::BackendKind;
 pub use runtime::{EngineConfig, Instance, LoadedModule, Manifest, ParamInfo, Worker};
 pub use select::{select_driver, Selection};
 pub use trap::{Trap, TrapCode};
-pub use wasm_backend::{WasmBackend, WasmBackendConfig, WasmBackendError};
 
 /// The tensor-ABI major version this worker implements.
 pub const TENSOR_ABI_MAJOR: u32 = 1;

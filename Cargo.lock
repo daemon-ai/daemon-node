@@ -5027,6 +5027,7 @@ dependencies = [
  "blake3",
  "ciborium",
  "daemon-vhc-coordinator",
+ "daemon-vhc-host",
  "daemon-vhc-net",
  "daemon-vhc-observe",
  "daemon-vhc-proto",

@@ -566,6 +566,15 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                     "{from} -> {to} [{kind}]: sdk/* must not link host/*"
                 ));
             }
+            // The A2 dependency inversion (refactor §5 A2 item 3; architecture §7 SESS → HOSTC):
+            // the session links the host — the host must NEVER re-grow a runtime edge onto the
+            // session (run policy). A dev-only edge (fixture/parity tests) is permitted.
+            if from == "daemon-vhc-host" && to == "daemon-vhc-session" && kind != "dev" {
+                violations.push(format!(
+                    "{from} -> {to} [{kind}]: the A2 inversion is one-way — the host must not \
+                     link the session at runtime (session → host is the direction)"
+                ));
+            }
         }
     }
 

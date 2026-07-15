@@ -17,11 +17,10 @@ use std::process::Command;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use daemon_vhc_host::{
-    cuda_adapter_available, BackendKind, EngineConfig, WasmBackend, WasmBackendConfig,
-};
+use daemon_vhc_host::{cuda_adapter_available, BackendKind, EngineConfig};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 use daemon_vhc_session::backend::{BatchRef, StepCtx, TrainerBackend};
+use daemon_vhc_session::{WasmBackend, WasmBackendConfig};
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

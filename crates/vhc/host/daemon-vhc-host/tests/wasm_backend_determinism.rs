@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 
-use daemon_vhc_host::{EngineConfig, WasmBackend, WasmBackendConfig};
+use daemon_vhc_host::EngineConfig;
 use daemon_vhc_proto::{blake3_hash, PeerId};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 use daemon_vhc_session::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
+use daemon_vhc_session::{WasmBackend, WasmBackendConfig};
 use serde::Serialize;
 
 // -- guest module loading (mirrors tests/guest_lifecycle.rs) ------------------------------------

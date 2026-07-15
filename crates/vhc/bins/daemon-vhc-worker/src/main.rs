@@ -49,8 +49,8 @@ mod live;
 mod transport;
 
 use daemon_provision::{CutChannel, CutWriter};
-use daemon_vhc_host::WasmBackend;
 use daemon_vhc_session::protocol::{self, Command, ErrorClass, Event};
+use daemon_vhc_session::WasmBackend;
 
 /// A representative meta/self-drive micro-batch shape (sequences × tokens-per-sequence). All-zero
 /// token ids are valid for any vocabulary (id 0 always exists), so the worker stays experiment

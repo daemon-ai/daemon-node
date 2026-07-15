@@ -33,7 +33,7 @@ use blake3::hash as blake3_hash_raw;
 use ciborium::into_writer;
 
 use daemon_vhc_coordinator::{tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig};
-use daemon_vhc_host::{EngineConfig, WasmBackend, WasmBackendConfig};
+use daemon_vhc_host::EngineConfig;
 use daemon_vhc_observe::{genesis_seed, replay};
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
@@ -50,6 +50,7 @@ use daemon_vhc_sdk::models::TinyLlamaCfg;
 use daemon_vhc_session::backend::{
     BatchRef, StagedPayload, StateDigest as RunDigest, StepCtx, TrainerBackend,
 };
+use daemon_vhc_session::{WasmBackend, WasmBackendConfig};
 
 // -- guest module loading (mirrors daemon-vhc-host/tests) ------------------------------------------
 

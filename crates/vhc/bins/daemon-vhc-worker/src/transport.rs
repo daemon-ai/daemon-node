@@ -27,13 +27,18 @@
 //! remainder (see the ledger "Deviations").
 
 use daemon_provision::CutWriter;
-use daemon_vhc_host::autotune::oom_error_class;
-use daemon_vhc_host::{
-    EngineConfig, TrainError, TrapCode, WasmBackend, WasmBackendConfig, WasmBackendError,
-};
+use daemon_vhc_host::{EngineConfig, TrainError, TrapCode};
 use daemon_vhc_proto::{blake3_hash, PeerId};
 use daemon_vhc_session::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
-use daemon_vhc_session::protocol::Event;
+use daemon_vhc_session::protocol::{ErrorClass, Event};
+use daemon_vhc_session::{WasmBackend, WasmBackendConfig, WasmBackendError};
+
+/// The wire error class a GPU/host allocation failure surfaces as (§10.5) — moved here from
+/// `daemon_vhc_host::autotune` with the A2 dependency inversion (the host no longer links the
+/// session's wire vocabulary; this binary links both sides).
+fn oom_error_class() -> ErrorClass {
+    ErrorClass::OutOfMemory
+}
 
 use crate::{send, SEQ, SEQS};
 
