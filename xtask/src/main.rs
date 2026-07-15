@@ -491,11 +491,6 @@ fn vhc_dep_check() -> anyhow::Result<()> {
     // later phase removes. Format: (dependent crate, sdk crate, why it exists / when it goes).
     const EXCEPTIONS: &[(&str, &str, &str)] = &[
         (
-            "swarm-local",
-            "daemon-vhc-sdk",
-            "Phase B — the demo harness's SDK(sim) link is replaced by vhc-sim [normal dep]",
-        ),
-        (
             "daemon-swarm-e2e",
             "daemon-vhc-sdk",
             "Phase B — e2e runs production wasm blobs under host/daemon-vhc-testkit [dev-dep]",
@@ -585,14 +580,26 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             };
             let kind = d["kind"].as_str().unwrap_or("normal"); // null == normal
 
-            // Every edge into sdk/* (from a non-sdk crate) must be a tracked exception.
+            // Edges into sdk/*. The SDK-side native sim (`daemon-vhc-sim`) is the DESIGNED entry
+            // for native harnesses (architecture §6: "policy code compiled natively runs against
+            // it"): any crate that is NOT host/* or contracts/* may link it without an exception.
+            // The wasm-boundary wall still holds — host/* and contracts/* linking sdk/* (including
+            // vhc-sim) remains a violation (enforced by the same branch + the hard rules below), so
+            // host/daemon-vhc-testkit can never reach across into the SDK sim. Every OTHER sdk/*
+            // edge from a non-sdk crate must be a tracked exception.
             if to_role == "sdk" && from_role != Some("sdk") {
-                if is_exception(&from, &to) {
+                let sim_native_harness = to == "daemon-vhc-sim"
+                    && from_role != Some("host")
+                    && from_role != Some("contracts");
+                if sim_native_harness {
+                    // allowed: a native harness (e.g. bins/swarm-local, tests/*) linking the
+                    // SDK-side sim — its whole purpose (refactor §6/§11).
+                } else if is_exception(&from, &to) {
                     seen.insert((from.clone(), to.clone()));
                 } else {
                     violations.push(format!(
-                        "{from} -> {to} [{kind}]: nothing but the guests workspace may link sdk/* \
-                         (no tracked exception)"
+                        "{from} -> {to} [{kind}]: only the guests workspace and native harnesses \
+                         (via daemon-vhc-sim) may link sdk/* (no tracked exception)"
                     ));
                 }
             }
