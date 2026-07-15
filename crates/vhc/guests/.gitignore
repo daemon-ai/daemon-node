@@ -1,5 +1,6 @@
 # The guest build tree + the compiled wasm artifacts are never committed (built on demand via
-# `xtask build-guests`).
+# `xtask build-guests`). Cargo.lock IS committed (B3 sitting 2): without it, registry patch
+# versions float between builds and every SDK-linking guest's bytes (and its guests.blake3 pin)
+# drift over time — the lockfile is what makes the byte-identity gate reproducible.
 /target
-Cargo.lock
 *.wasm
