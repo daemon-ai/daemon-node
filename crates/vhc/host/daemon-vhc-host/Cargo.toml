@@ -147,6 +147,9 @@ cuda = ["burn/cuda", "dep:cudarc"]
 # wasm32 toolchain or guest workspace in the tier-1 lane. Already resolved in Cargo.lock (a
 # wasmtime/cranelift transitive), so this dev-dep adds no new crate to the graph.
 wasm-encoder = { workspace = true }
+# Test-only: the A0 frozen fixture's `expected.json` (pins + transcript) is JSON for human review;
+# the replay test parses it. Already a workspace pin.
+serde_json = { workspace = true }
 # Test-only: the guest-lifecycle / parity tests build the `TinyLlamaCfg` the wasm guest parses.
 # `sim` compiles the SDK's `models`/`profiles` (config types) natively for the tests; never a
 # runtime edge (the host does not link the guest SDK). NOTE: this remaining host->SDK dev-dep is a
