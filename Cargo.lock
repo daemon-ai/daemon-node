@@ -5024,6 +5024,8 @@ name = "daemon-vhc-sdk-v2"
 version = "0.0.1"
 dependencies = [
  "ciborium",
+ "daemon-vhc-proto",
+ "serde",
 ]
 
 [[package]]

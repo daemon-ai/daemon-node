@@ -421,6 +421,14 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-sdk", "--features", "sim"],
         ),
         (
+            // A2 migrate/main! scaffolding (refactor §5 A2 item 4; ABI §10): state round-trips
+            // in sim through the typed manifest protocol; the SDK-derived claim/manifest match
+            // the §9.1/§6.2 wire schema the admission funnel decodes. The macro's exports are
+            // exercised for real by the tiny-llama-v2 guest under the parity lane.
+            "daemon-vhc-sdk-v2 (main!/migrate scaffolding: sim round-trips + derivations)",
+            &["-p", "daemon-vhc-sdk-v2"],
+        ),
+        (
             "daemon-swarm-e2e (drills + observe-replay, no iroh/live)",
             &["-p", "daemon-swarm-e2e"],
         ),

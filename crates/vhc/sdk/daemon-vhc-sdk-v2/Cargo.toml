@@ -8,20 +8,18 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
 description = """
-Minimal-honest major-2 guest bindings (ABI §4.1/§6): the raw vhc@2/net@2/sys@2 externs + the
-small safe wrappers a hand-wired v2 module needs. A SIBLING of daemon-vhc-sdk, deliberately NOT
-a module inside it: the v1 SDK's bytes feed the frozen guest pins (guests.blake3 / the A0
-fixture), so the major-2 tier must not perturb its codegen. Folds into the SDK proper with the
-main!/claim macro layer (the next scaffolding sitting); wasm32-only (empty native build).
+The major-2 guest SDK tier: raw vhc@2/net@2/sys@2 bindings, the module layer + SDK-derived
+claim/manifest, migration scaffolding (ABI §10), and the main! export macro. A PERMANENT SIBLING
+of daemon-vhc-sdk, deliberately NOT a module inside it: the v1 SDK's source feeds the frozen v1
+guest pins (guests.blake3 / the A0 fixture), and any edit to it — even an unused cfg-gated
+module — perturbs its codegen and the pinned tiny_llama.wasm bytes (measured, sittings 8-9).
+The crates merge only when the v1 SDK is next deliberately re-pinned (Phase E at the earliest).
 """
 
 [dependencies]
 ciborium = { workspace = true }
-
-[package.metadata.cargo-machete]
-# ciborium is used by the wasm-guest code path (the whole crate is cfg-gated to wasm32); the
-# native build is deliberately empty, so dependency scanners see it as unused there.
-ignored = ["ciborium"]
+daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }
+serde = { workspace = true, features = ["derive"] }
 
 [lints]
 workspace = true

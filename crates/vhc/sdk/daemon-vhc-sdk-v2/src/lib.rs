@@ -1,134 +1,151 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Minimal-honest major-2 guest bindings (ABI §4.1/§6): the raw `vhc@2`/`net@2`/`sys@2` externs
-//! plus the small safe wrappers a hand-wired v2 module (e.g. `BarrierRound<TinyLlama>`) needs.
-//! The full `main!`/claim-generation macro layer is the next scaffolding step; this crate is the
-//! ABI-floor tier of the SDK table (architecture §6) for the event loop, exactly as the SDK's
-//! `abi.rs` is for the frozen tensor vocabulary (which major-2 modules keep linking as the §2.5
-//! bridge).
+//! The major-2 guest SDK tier: raw `vhc@2`/`net@2`/`sys@2` bindings ([`abi`]), the module layer
+//! with SDK-side claim generation ([`module`]), migration scaffolding ([`migrate`], ABI §10.2),
+//! and the [`main!`] macro emitting the v2 exports (ABI §2.1/§10.1) — the v2 analogue of the
+//! v1 SDK's `experiment!`.
 //!
-//! A SIBLING crate of `daemon-vhc-sdk`, deliberately not a module inside it: the v1 SDK's source
-//! feeds the frozen v1 guest bytes (`guests.blake3` / the A0 fixture pins), and any edit to it —
-//! even an unused, cfg-gated module — perturbs cargo's crate metadata and reorders the emitted
-//! wasm sections. It folds into the SDK proper when the macro layer lands (a deliberate,
-//! repinning change). wasm32-only: the crate is empty on native targets (the native path
-//! virtualizes these worlds in Phase B's `vhc-sim`).
-#![cfg(target_arch = "wasm32")]
+//! ## Why this is a SIBLING of `daemon-vhc-sdk`, permanently — not a module inside it
+//!
+//! The v1 SDK's source feeds the frozen v1 guest bytes (`guests.blake3` / the A0 fixture pins).
+//! Measured twice in this tree (sittings 8–9): ANY edit to `daemon-vhc-sdk` — even an unused,
+//! cfg-gated module — perturbs cargo's crate metadata and reorders `tiny_llama.wasm`'s emitted
+//! sections (pin `57ae15…` → different bytes), while growing THIS crate leaves the v1 pin
+//! byte-identical. The plan to "fold into the SDK when the macro layer lands" is therefore
+//! **rescinded**: the fold would trade the A0 byte-identity invariant (refactor invariant 2)
+//! for cosmetics. The two crates merge only when the v1 SDK itself is next deliberately
+//! re-pinned (a v1-sunsetting change, Phase E at the earliest).
 
-use ciborium::value::Value;
+#[cfg(target_arch = "wasm32")]
+pub mod abi;
+#[cfg(target_arch = "wasm32")]
+pub use abi::{next_event, publish, read_back_bytes, read_back_uint, set_timer, Event};
 
-#[link(wasm_import_module = "vhc@2")]
-extern "C" {
-    #[link_name = "next_event"]
-    fn abi_next_event(buf_ptr: u32, buf_cap: u32) -> u64;
-    #[link_name = "read_back"]
-    fn abi_read_back(src: u64, kind: u32, out_ptr: u32, out_cap: u32) -> u64;
-}
+pub mod migrate;
+pub mod module;
 
-#[link(wasm_import_module = "net@2")]
-extern "C" {
-    #[link_name = "publish"]
-    fn abi_publish(channel_id: u32, payload_ptr: u32, payload_len: u32) -> u64;
-}
+pub use migrate::{
+    build_manifest, MigrateState, MigrationDescriptor, MigrationSection, OwnedSection, SectionDecl,
+    SectionReader, SimSections, StateManifest,
+};
+pub use module::{derive_claim, manifest_bytes, ModuleDecl, V2Module};
 
-#[link(wasm_import_module = "sys@2")]
-extern "C" {
-    #[link_name = "set_timer"]
-    fn abi_set_timer(delay_ms: u64) -> u64;
-}
+/// A [`crate::migrate::SectionReader`] over the live `read_back(kind = 3)` restore capability —
+/// what `main!`'s `da_migrate` hands the module (§6.6: kind 3 is legal exactly there).
+#[cfg(target_arch = "wasm32")]
+pub struct AbiSections;
 
-/// One decoded event: the §4.2 tag plus the positional fields (tag included at index 0).
-pub struct Event {
-    /// The leading event tag (`EV_TAG_*`).
-    pub tag: u64,
-    /// The full positional array, tag included.
-    pub items: Vec<Value>,
-}
-
-impl Event {
-    /// Positional field `i` as a u64 (0 when absent/mistyped — callers know their tag's shape).
-    #[must_use]
-    pub fn uint(&self, i: usize) -> u64 {
-        self.items
-            .get(i)
-            .and_then(Value::as_integer)
-            .map(|n| u64::try_from(i128::from(n)).unwrap_or(u64::MAX))
-            .unwrap_or(0)
-    }
-
-    /// Positional field `i` as bytes (empty when absent/mistyped).
-    #[must_use]
-    pub fn bytes(&self, i: usize) -> Vec<u8> {
-        match self.items.get(i) {
-            Some(Value::Bytes(b)) => b.clone(),
-            _ => Vec::new(),
-        }
+#[cfg(target_arch = "wasm32")]
+impl migrate::SectionReader for AbiSections {
+    fn read(&mut self, staging_id: u64) -> Vec<u8> {
+        abi::read_back_bytes(staging_id, 3)
     }
 }
 
-/// Pull the next event, honoring the mandatory `NeedCapacity` retry (§4.1). Fails closed
-/// (`unreachable` → `GuestPanic`) on an unknown status or a malformed frame (§5.2).
-#[must_use]
-pub fn next_event(buf: &mut Vec<u8>) -> Event {
-    loop {
-        // SAFETY: the span handed to the host is exactly `buf`'s live allocation.
-        let packed = unsafe { abi_next_event(buf.as_mut_ptr() as u32, buf.capacity() as u32) };
-        let (status, len) = (packed >> 32, (packed & 0xffff_ffff) as usize);
-        match status {
-            0 => {
-                // SAFETY: the host wrote exactly `len` bytes (§4.1).
-                unsafe { buf.set_len(len) };
-                let v: Value = ciborium::from_reader(buf.as_slice())
-                    .unwrap_or_else(|_| unreachable!("malformed event frame"));
-                let Value::Array(items) = v else {
-                    unreachable!("event frame is not a positional array")
+/// Emit the required major-2 exports (ABI §2.1) for a [`module::V2Module`] type: `da_abi`,
+/// `da_alloc`/`da_free`, `da_manifest`, `da_claim` (both SDK-derived from the declaration),
+/// `da_init`, `da_run`, and `da_migrate` (ABI §10.1 — always exported; the manifest's
+/// `migratable: true` echo is therefore truthful, and a module that does not override
+/// [`module::V2Module::migrate`] answers `Incompatible` honestly at runtime).
+///
+/// Expands to nothing on non-wasm targets, exactly like the v1 `experiment!` — sim tests call
+/// the trait methods directly.
+#[macro_export]
+macro_rules! main {
+    ($module:ty) => {
+        #[cfg(target_arch = "wasm32")]
+        const _: () = {
+            use ::core::cell::RefCell;
+
+            ::std::thread_local! {
+                static MODULE: RefCell<Option<$module>> = const { RefCell::new(None) };
+            }
+
+            #[no_mangle]
+            pub extern "C" fn da_abi() -> u32 {
+                2 << 16
+            }
+
+            #[no_mangle]
+            pub extern "C" fn da_alloc(size: u32, align: u32) -> u32 {
+                $crate::module::rt::da_alloc(size, align)
+            }
+
+            #[no_mangle]
+            pub extern "C" fn da_free(ptr: u32, size: u32, align: u32) {
+                $crate::module::rt::da_free(ptr, size, align)
+            }
+
+            #[no_mangle]
+            pub extern "C" fn da_manifest(_cfg: u32, _cfg_len: u32) -> u64 {
+                let decl = <$module as $crate::module::V2Module>::decl();
+                $crate::module::rt::emit_cbor(&$crate::module::manifest_bytes(&decl))
+            }
+
+            #[no_mangle]
+            pub extern "C" fn da_claim(_c: u32, _cl: u32, _g: u32, _gl: u32) -> u64 {
+                let decl = <$module as $crate::module::V2Module>::decl();
+                $crate::module::rt::emit_cbor(&$crate::module::derive_claim(&decl))
+            }
+
+            /// # Safety
+            /// The host writes both spans before the call (ABI §2.3/§9.4 step 11).
+            #[no_mangle]
+            pub unsafe extern "C" fn da_init(
+                cfg_ptr: u32,
+                cfg_len: u32,
+                grants_ptr: u32,
+                grants_len: u32,
+            ) -> u32 {
+                let read = |ptr: u32, len: u32| -> Vec<u8> {
+                    if len == 0 {
+                        Vec::new()
+                    } else {
+                        ::std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec()
+                    }
                 };
-                let tag = items
-                    .first()
-                    .and_then(Value::as_integer)
-                    .map(|n| u64::try_from(i128::from(n)).unwrap_or(u64::MAX))
-                    .unwrap_or_else(|| unreachable!("missing event tag"));
-                return Event { tag, items };
+                let config = read(cfg_ptr, cfg_len);
+                let grants = read(grants_ptr, grants_len);
+                match <$module as $crate::module::V2Module>::init(&config, &grants) {
+                    Ok(m) => {
+                        MODULE.with(|s| *s.borrow_mut() = Some(m));
+                        0
+                    }
+                    Err(code) => code,
+                }
             }
-            1 => buf.reserve(len),
-            _ => unreachable!("unknown next_event status (fail closed, §5.2)"),
-        }
-    }
-}
 
-/// `read_back` a staged item that resolves to a CBOR uint — the bridge kinds (1 = batch handle,
-/// 2 = update staging index, §6.4) — honoring the mandatory retry.
-#[must_use]
-pub fn read_back_uint(src: u64, kind: u32) -> u64 {
-    let mut buf = vec![0u8; 16];
-    loop {
-        // SAFETY: `buf` is a live guest span for the call's duration.
-        let packed = unsafe { abi_read_back(src, kind, buf.as_mut_ptr() as u32, buf.len() as u32) };
-        let (status, len) = (packed >> 32, (packed & 0xffff_ffff) as usize);
-        match status {
-            0 => {
-                let v: Value = ciborium::from_reader(&buf[..len])
-                    .unwrap_or_else(|_| unreachable!("read_back uint cbor"));
-                return v
-                    .as_integer()
-                    .map(|n| u64::try_from(i128::from(n)).unwrap_or(u64::MAX))
-                    .unwrap_or_else(|| unreachable!("read_back uint"));
+            #[no_mangle]
+            pub extern "C" fn da_run() -> u32 {
+                MODULE.with(|s| {
+                    let mut m = s.borrow_mut();
+                    let m = m.as_mut().expect("da_init ran (host contract, §9.4)");
+                    <$module as $crate::module::V2Module>::run(m)
+                })
             }
-            1 => buf.resize(len, 0),
-            _ => unreachable!("unknown read_back status (fail closed, §5.2)"),
-        }
-    }
-}
 
-/// Publish opaque payload bytes on `channel` (§6.2); returns the durable channel-scoped seq.
-pub fn publish(channel: u32, payload: &[u8]) -> u64 {
-    // SAFETY: `payload` is a live guest span for the call's duration.
-    unsafe { abi_publish(channel, payload.as_ptr() as u32, payload.len() as u32) }
-}
-
-/// Arm a one-shot logical-clock timer (§6.3); returns the timer id.
-pub fn set_timer(delay_ms: u64) -> u64 {
-    // SAFETY: plain-value import.
-    unsafe { abi_set_timer(delay_ms) }
+            /// # Safety
+            /// The host writes the descriptor span before the call (ABI §10.2).
+            #[no_mangle]
+            pub unsafe extern "C" fn da_migrate(descriptor_ptr: u32, descriptor_len: u32) -> u32 {
+                let bytes = ::std::slice::from_raw_parts(
+                    descriptor_ptr as *const u8,
+                    descriptor_len as usize,
+                )
+                .to_vec();
+                let Ok(descriptor) = $crate::migrate::MigrationDescriptor::from_wire(&bytes) else {
+                    return 1; // Incompatible: undecodable descriptor (§10.2)
+                };
+                MODULE.with(|s| {
+                    let mut m = s.borrow_mut();
+                    let m = m
+                        .as_mut()
+                        .expect("da_init ran before da_migrate (§10.3 step 4)");
+                    let mut reader = $crate::AbiSections;
+                    <$module as $crate::module::V2Module>::migrate(m, &descriptor, &mut reader)
+                })
+            }
+        };
+    };
 }
