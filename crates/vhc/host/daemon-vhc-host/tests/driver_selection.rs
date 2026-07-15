@@ -105,23 +105,21 @@ fn v1_shaped_module_selects_v1_driver() {
     assert_eq!((sel.major, sel.minor), (1, 0));
 }
 
-// -- A0 acceptance: a well-formed major-2 module is refused typed, naming the missing driver -----
+// -- A2: a well-formed major-2 module is ADMITTED to the event-loop driver (was: A0's clean
+// AbiUnsupportedMajor refusal; the expectation flipped in the same commit the driver first ran a
+// module end-to-end — refactor §5 A2) --------------------------------------------------------------
 
 #[test]
-fn v2_module_refused_abi_unsupported_major() {
+fn v2_module_selects_the_event_loop_driver() {
     let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 0));
-    let err = select_driver(&worker(), &wasm, Some(blake3::hash(&wasm).as_bytes()))
-        .expect_err("major 2 has no driver in A0");
-    assert_eq!(err.code, AbiRefusalCode::AbiUnsupportedMajor);
-    assert!(
-        err.detail.contains("A2"),
-        "the refusal names the missing v2 driver (Phase A2): {}",
-        err.detail
-    );
+    let sel = select_driver(&worker(), &wasm, Some(blake3::hash(&wasm).as_bytes()))
+        .expect("major 2 selects the A2 event-loop driver");
+    assert_eq!(sel.driver, CandidateDriver::V2);
+    assert_eq!((sel.major, sel.minor), (2, 0));
 }
 
 /// A major-2 module additionally linking the frozen `tabi@1` bridge is still a major-2 candidate
-/// (ABI §1.2: bridge imports never make a module major-1) — same clean refusal in A0.
+/// (ABI §1.2: bridge imports never make a module major-1) — admitted as major 2 since A2.
 #[test]
 fn v2_module_with_tabi_bridge_still_selects_major2() {
     let wasm = build_module(
@@ -129,8 +127,24 @@ fn v2_module_with_tabi_bridge_still_selects_major2() {
         V2_EXPORTS,
         pack(2, 0),
     );
-    let err = select_driver(&worker(), &wasm, None).expect_err("bridge module is major-2");
-    assert_eq!(err.code, AbiRefusalCode::AbiUnsupportedMajor);
+    let sel = select_driver(&worker(), &wasm, None).expect("bridge module is major-2");
+    assert_eq!(sel.driver, CandidateDriver::V2);
+}
+
+/// The AbiUnsupportedMajor guard survives the flip, one major further out: a future major 3 is
+/// not implemented. (Since both import-shape candidates now map to implemented majors, the
+/// selection path reaches this refusal only via a future import shape — the constant probe is
+/// the honest pin; a declared major 3 over a v2 shape is a declaration mismatch first, asserted
+/// by `v2_shape_declaring_major1_is_declaration_mismatch`'s mirror below.)
+#[test]
+fn future_major_is_not_implemented() {
+    assert_eq!(daemon_vhc_abi::host_minor_for(3), None);
+    assert!(!daemon_vhc_abi::HOST_IMPLEMENTED_MAJORS.contains(&3));
+    // A v2-shaped module declaring major 3: the import-derived candidate (2) wins — declaration
+    // mismatch, not a silent admit.
+    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(3, 0));
+    let err = select_driver(&worker(), &wasm, None).expect_err("major 3 contradiction");
+    assert_eq!(err.code, AbiRefusalCode::AbiDeclarationMismatch);
 }
 
 // -- da_abi cross-check: declaration contradicting the import shape --------------------------------
@@ -252,9 +266,11 @@ fn v1_candidate_missing_da_manifest_is_bad_module() {
 #[test]
 fn refusals_never_reuse_the_v1_trap_slug_vocabulary() {
     // The split codes are their own taxonomy: none of them stringifies to the retained v1 trap
-    // umbrella `AbiMismatch` (decisions D2: never a reused TrapCode::AbiMismatch).
-    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 0));
+    // umbrella `AbiMismatch` (decisions D2: never a reused TrapCode::AbiMismatch). Since A2
+    // admits well-formed major-2 modules, the refused probe is a minor-too-new declaration.
+    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 9));
     let err = select_driver(&worker(), &wasm, None).unwrap_err();
+    assert_eq!(err.code, AbiRefusalCode::AbiMinorTooNew);
     assert_ne!(err.code.slug(), "AbiMismatch");
     assert_ne!(
         err.code.slug(),

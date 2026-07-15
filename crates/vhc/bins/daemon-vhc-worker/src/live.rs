@@ -22,10 +22,7 @@ use std::time::Duration;
 use std::collections::BTreeMap;
 
 use daemon_provision::CutWriter;
-use daemon_vhc_host::{
-    EngineConfig as WasmEngineConfig, TrainError, TrapCode, WasmBackend, WasmBackendConfig,
-    WasmBackendError,
-};
+use daemon_vhc_host::{EngineConfig as WasmEngineConfig, TrainError, TrapCode};
 use daemon_vhc_net::{
     ArtifactRef, ArtifactResolver, ContentCache, ContentHash, ControlPlane, DualPlane,
     FsPayloadStore, HttpPresignClient, IrohGossip, IrohGossipConfig, IrohPeer, PayloadKey,
@@ -46,6 +43,7 @@ use daemon_vhc_session::engine::{EngineConfig, EngineEvent, RoundEngine};
 use daemon_vhc_session::protocol::{ErrorClass, Event, JoinCredentials};
 use daemon_vhc_session::seam::RoundId;
 use daemon_vhc_session::SwarmRunError;
+use daemon_vhc_session::{WasmBackend, WasmBackendConfig, WasmBackendError};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 

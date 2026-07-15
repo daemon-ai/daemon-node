@@ -16,9 +16,10 @@
 //! to a clean `AbiUnsupportedMajor` refusal (decisions D5 — the fixture is never deleted).
 
 use daemon_vhc_abi::CandidateDriver;
-use daemon_vhc_host::{select_driver, EngineConfig, WasmBackend, WasmBackendConfig, Worker};
+use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::{blake3_hash, from_canonical_slice, PeerId, SignedEnvelope};
 use daemon_vhc_session::backend::{BatchRef, StagedPayload, StepCtx, TrainerBackend};
+use daemon_vhc_session::{WasmBackend, WasmBackendConfig};
 
 const MODULE: &[u8] = include_bytes!("fixtures/a0-frozen-v1/tiny_llama.pre-refactor.wasm");
 const ENVELOPE_WIRE: &[u8] = include_bytes!("fixtures/a0-frozen-v1/envelope.signed.cbor");

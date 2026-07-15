@@ -23,7 +23,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use ciborium::into_writer;
-use daemon_vhc_host::{EngineConfig, WasmBackend, WasmBackendConfig, WasmBackendError};
+use daemon_vhc_host::EngineConfig;
 use daemon_vhc_proto::peer_id;
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 use daemon_vhc_session::backend::{
@@ -36,6 +36,7 @@ use daemon_vhc_session::harness::{
 };
 use daemon_vhc_session::live_harness::{run_live_swarm, run_live_swarm_with, LiveSwarmConfig};
 use daemon_vhc_session::seam::RoundId;
+use daemon_vhc_session::{WasmBackend, WasmBackendConfig, WasmBackendError};
 
 /// Assert every round in `run` has a single digest shared by all peers that reported it.
 fn assert_all_agree(run: &daemon_vhc_session::harness::SwarmRun) {

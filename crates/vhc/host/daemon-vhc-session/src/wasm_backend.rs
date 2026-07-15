@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! [`WasmBackend`] — a [`daemon_vhc_session::backend::TrainerBackend`] over the wasm host runtime.
+//! [`WasmBackend`] — a [`crate::backend::TrainerBackend`] over the wasm host runtime.
 //!
 //! This is the E↔R wiring (spec §5.1/§10.2): the participant [`RoundEngine`] (lane R) drives the
 //! round structure over the engine-agnostic `TrainerBackend` seam; `WasmBackend` fills in the math
-//! by driving a real wasm experiment module through the [`crate::Worker`] host runtime. Nothing
+//! by driving a real wasm experiment module through the [`daemon_vhc_host::Worker`] host runtime. Nothing
 //! wasm/burn leaks across the trait — payloads and checkpoints cross it as opaque bytes.
 //!
 //! Lifecycle mapping (ABI §2.3): `build` → `da_abi` gate + `da_manifest` + `da_build`; `train_step`
 //! → `register_batch` + `da_step`; `inner_update` → `da_inner_update`; `make_update` →
-//! `da_make_update` sealed to canonical CBOR ([`crate::Instance::update_bytes`]); `ingest` → the
+//! `da_make_update` sealed to canonical CBOR ([`daemon_vhc_host::Instance::update_bytes`]); `ingest` → the
 //! record-ordered payloads staged through the `upd_*` ABI + `da_ingest_updates`
-//! ([`crate::Instance::ingest_payloads`]); `checkpoint_save`/`load` → the blake3-tagged full state
-//! dict ([`crate::Instance::checkpoint_bytes`] / [`crate::Instance::restore_checkpoint`]).
+//! ([`daemon_vhc_host::Instance::ingest_payloads`]); `checkpoint_save`/`load` → the blake3-tagged full state
+//! dict ([`daemon_vhc_host::Instance::checkpoint_bytes`] / [`daemon_vhc_host::Instance::restore_checkpoint`]).
 //!
-//! **Digest**: the post-ingest state digest is [`crate::Instance::canonical_state_bytes`] (params +
+//! **Digest**: the post-ingest state digest is [`daemon_vhc_host::Instance::canonical_state_bytes`] (params +
 //! replicated persistents) fed to `daemon_vhc_proto::digest_state` (seed-keyed xxh3-128, seeded
 //! by the round, full sampling) — the frozen proto digest, not a re-derived one. Two `WasmBackend`s
 //! over the same module + config + batches + staged set are **bit-identical** every round (ABI §7 /
@@ -25,18 +25,18 @@
 //! (releasing wasm/GPU memory, keeping the CPU checkpoint); [`WasmBackend::resume`] re-instantiates
 //! from the `InstancePre`, re-runs `da_build`, and restores — bit-identical to the pre-pause state.
 //!
-//! [`RoundEngine`]: daemon_vhc_session::engine::RoundEngine
+//! [`RoundEngine`]: crate::engine::RoundEngine
 
-use daemon_vhc_proto::{digest_state, Seed};
-use daemon_vhc_session::backend::{
+use crate::backend::{
     AssessMeta, Assessment, BatchRef, StagedPayload, StateDigest, StepCtx, StepStats,
     TrainerBackend,
 };
-use daemon_vhc_session::seam::RoundId;
+use crate::seam::RoundId;
+use daemon_vhc_proto::{digest_state, Seed};
 
-use crate::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
-use crate::runtime::{EngineConfig, Instance, LoadedModule, Manifest, Worker};
-use crate::TrainError;
+use daemon_vhc_host::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
+use daemon_vhc_host::runtime::{EngineConfig, Instance, LoadedModule, Manifest, Worker};
+use daemon_vhc_host::TrainError;
 
 /// Construction inputs for a [`WasmBackend`]: the experiment module bytes + the host engine profile.
 ///

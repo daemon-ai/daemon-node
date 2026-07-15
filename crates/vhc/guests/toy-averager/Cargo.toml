@@ -1,0 +1,20 @@
+[package]
+name = "toy-averager"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The Phase-A expressiveness proof (refactor §5 A2 acceptance): a NON-ROUND, timer-driven averager
+# using only the declared A2 subset — timers + publish (+ the mandatory next_event pull). No
+# rounds, no barrier, no coordinator vocabulary, no compute: it runs under the v2 event-loop
+# driver with zero host changes. Deliberately SDK-free: it binds the raw `vhc@2`/`net@2`/`sys@2`
+# imports directly (the SDK's v2 capability bindings arrive with the migrate/main! scaffolding),
+# so it also pins the raw ABI surface a hand-written module author sees (architecture §6 "dropping
+# to the layer below is always possible").
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Event frames are canonical CBOR (ABI §5.1); ciborium decodes them (pure Rust, wasm32-clean).
+ciborium = "0.2"

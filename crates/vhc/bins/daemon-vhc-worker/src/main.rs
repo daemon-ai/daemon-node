@@ -47,10 +47,11 @@ mod backend;
 #[cfg(feature = "swarm-net")]
 mod live;
 mod transport;
+mod v2_session;
 
 use daemon_provision::{CutChannel, CutWriter};
-use daemon_vhc_host::WasmBackend;
 use daemon_vhc_session::protocol::{self, Command, ErrorClass, Event};
+use daemon_vhc_session::WasmBackend;
 
 /// A representative meta/self-drive micro-batch shape (sequences × tokens-per-sequence). All-zero
 /// token ids are valid for any vocabulary (id 0 always exists), so the worker stays experiment
@@ -114,6 +115,11 @@ async fn main() {
     // the micro-batch the last `AssessRun` autotune chose (G2's `Eligibility.headroom["micro_batch"]`),
     // threaded into `JoinRun` so the worker consumes the verdict in-process (B3 lifecycle glue).
     let mut run: Option<backend::ResolvedRun> = None;
+    // Whether the assessed run selected the major-2 event-loop driver: its assess path is the A2
+    // claim funnel, but the v2 JOIN wiring (session pump attach) is not in this worker yet — a v2
+    // JoinRun is refused loud rather than falling into the v1 self-drive (which would surface a
+    // misleading AbiMismatch from the five-phase driver).
+    let mut run_is_v2 = false;
     let mut live_backend: Option<WasmBackend> = None;
     // The A3 live coordinator attach handle (feature `swarm-net`): a running RoundEngine + event
     // pump, stopped on Leave/Shutdown. `None` on the self-driven (WS-only / no-credentials) path.
@@ -136,8 +142,10 @@ async fn main() {
                     &resolved.module,
                     &resolved.config,
                     resolved.module_blake3.as_ref(),
+                    resolved.device_min.as_ref(),
                 ) {
-                    Ok(elig) => {
+                    Ok((elig, is_v2)) => {
+                        run_is_v2 = is_v2;
                         // Consume the autotune micro-batch (G2 rides it in `headroom["micro_batch"]`)
                         // so `JoinRun` drives / OOM-probes from the node-computed verdict (§10.5).
                         if let Some((_, mb)) =
@@ -166,6 +174,37 @@ async fn main() {
                     .await;
                     continue;
                 };
+                if run_is_v2 {
+                    // The v2 join (A2 close-out): the session event-pump attach, driven by the
+                    // in-process native coordinator over the run's frozen envelope. A raw-config
+                    // AssessRun has no envelope, hence no coordinator config — refused loud.
+                    let Some(envelope) = resolved.envelope.clone() else {
+                        send(
+                            &writer,
+                            &worker_error(
+                                "JoinRun for a major-2 module without a signed run envelope: \
+                                 the v2 session needs the envelope (the coordinator-config \
+                                 source); author a SignedEnvelope AssessRun instead of raw \
+                                 config bytes",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    };
+                    match v2_session::join_and_run_v2(
+                        &resolved.module,
+                        &resolved.config,
+                        &envelope,
+                        &run_id,
+                        &writer,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(detail) => send(&writer, &worker_error(&detail)).await,
+                    }
+                    continue;
+                }
                 // A3 live attach (feature `swarm-net`): if the node authored a `JoinCredentials`
                 // body, run the real RoundEngine over the live plane; otherwise fall back to the
                 // self-driven representative round (the T0 baseline, also the default-gate path).

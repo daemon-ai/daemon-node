@@ -158,7 +158,7 @@ impl Autotune {
         }
     }
 
-    /// A resource model from a raw param layout (name, dims, dtype) — the [`crate::WasmBackend`]
+    /// A resource model from a raw param layout (name, dims, dtype) — the session-side `WasmBackend`
     /// build path, which has the registered params but not a full meta pass. The activation cost is
     /// a coarse proxy (`master_bytes`, i.e. one fp32 copy of the model per sequence); the worker's
     /// meta path ([`Self::from_meta`]) carries the real `act_bytes_est`.
@@ -372,17 +372,10 @@ pub fn probe_microbatch(
     }
 }
 
-/// The trap taxonomy a GPU allocation failure maps into (§10.5): the worker replaces the instance
-/// and re-probes the micro-batch. Recorded here as the single mapping point so the OOM path is
-/// discoverable (the runtime already maps a wasmtime "memory" trap to
-/// [`crate::TrapCode::BudgetMemory`]; a wgpu allocation panic surfaces at the worker as an
-/// [`ErrorClass::OutOfMemory`]).
-///
-/// [`ErrorClass::OutOfMemory`]: daemon_vhc_session::protocol::ErrorClass::OutOfMemory
-#[must_use]
-pub fn oom_error_class() -> daemon_vhc_session::protocol::ErrorClass {
-    daemon_vhc_session::protocol::ErrorClass::OutOfMemory
-}
+// (A2 inversion): `oom_error_class` — the one host→session symbol beyond the seam — moved to the
+// worker binary (`daemon-vhc-worker::transport`), which links both sides. The runtime still maps
+// a wasmtime "memory" trap to [`crate::TrapCode::BudgetMemory`]; the wire ErrorClass mapping is
+// the worker's business.
 
 /// Parse an amdgpu sysfs memory-total file (`mem_info_vram_total` / `mem_info_gtt_total`) into MiB.
 ///
@@ -1199,13 +1192,7 @@ mod tests {
         assert!(no_alloc.reasons[0].contains("max single allocation"));
     }
 
-    #[test]
-    fn oom_error_class_is_out_of_memory() {
-        assert_eq!(
-            oom_error_class(),
-            daemon_vhc_session::protocol::ErrorClass::OutOfMemory
-        );
-    }
+    // (A2 inversion): the `oom_error_class` pin moved to the worker binary with the helper.
 
     // ---- UMA / unified-memory autotune (the Merge-2 fix) ----
 

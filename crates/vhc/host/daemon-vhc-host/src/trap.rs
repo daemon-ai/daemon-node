@@ -56,6 +56,23 @@ pub enum TrapCode {
     AbiMismatch,
     /// A required `da_*` export was missing or had the wrong signature (ABI §4/§2.1).
     BadModule,
+    // -- major-2 codes (ABI Draft 3 §7.6, "New v2 trap codes") ------------------------------------
+    /// A capability import was called in the assessment instance (deny-on-call stub, ABI §9.2).
+    ClaimCapabilityDenied,
+    /// A call exceeded a grant/channel bound: undeclared or rx-only channel, rate, per-slice
+    /// readback bytes, a `read_back` kind not granted (ABI §7.6).
+    GrantViolation,
+    /// The guest violated the event protocol in a host-detectable way — e.g. breaking the
+    /// mandatory `NeedCapacity` retry rule of `next_event`/`read_back` (ABI §4.1/§6.4).
+    BadEvent,
+    /// `read_back` named a `(src, kind)` that stages nothing (ABI §7.6).
+    ReadBackUnavailable,
+    /// `da_migrate` exceeded its bounded fuel/memory (ABI §10.3). Reserved until Phase E wires the
+    /// upgrade transaction; part of the taxonomy now.
+    MigrateBudget,
+    /// The guest failed to return from a `Quiesce` drain before the effective deadline; forced
+    /// epoch interruption (ABI §4.4/§11.3).
+    QuiesceDeadlineExceeded,
 }
 
 impl TrapCode {
@@ -84,6 +101,12 @@ impl TrapCode {
             Self::BadEnum => "BadEnum",
             Self::AbiMismatch => "AbiMismatch",
             Self::BadModule => "BadModule",
+            Self::ClaimCapabilityDenied => "ClaimCapabilityDenied",
+            Self::GrantViolation => "GrantViolation",
+            Self::BadEvent => "BadEvent",
+            Self::ReadBackUnavailable => "ReadBackUnavailable",
+            Self::MigrateBudget => "MigrateBudget",
+            Self::QuiesceDeadlineExceeded => "QuiesceDeadlineExceeded",
         }
     }
 }
@@ -177,6 +200,12 @@ mod tests {
             TrapCode::BadEnum,
             TrapCode::AbiMismatch,
             TrapCode::BadModule,
+            TrapCode::ClaimCapabilityDenied,
+            TrapCode::GrantViolation,
+            TrapCode::BadEvent,
+            TrapCode::ReadBackUnavailable,
+            TrapCode::MigrateBudget,
+            TrapCode::QuiesceDeadlineExceeded,
         ];
         let mut slugs: Vec<&str> = codes.iter().map(|c| c.slug()).collect();
         slugs.sort_unstable();

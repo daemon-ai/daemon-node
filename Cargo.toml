@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 # Explicit per-group globs rather than a blanket `crates/*/*`: the `crates/vhc/` tree nests one
-# level deeper (`crates/vhc/{contracts,sdk,host}/*`), and a `crates/*/*` glob would match the
-# `crates/vhc/{contracts,sdk,host}` grouping dirs (which carry no manifest) and fail to load.
+# level deeper (`crates/vhc/{contracts,sdk,host,bins}/*`), and a `crates/*/*` glob would match the
+# `crates/vhc/{contracts,sdk,host,bins}` grouping dirs (which carry no manifest) and fail to load.
 members = [
     "crates/adapters/*",
     "crates/contracts/*",
@@ -18,6 +18,7 @@ members = [
     "crates/vhc/contracts/*",
     "crates/vhc/sdk/*",
     "crates/vhc/host/*",
+    "crates/vhc/bins/*",
     "tools/*",
     "bindings/*",
     "bins/*",
@@ -437,6 +438,7 @@ daemon-vhc-abi = { version = "0", path = "crates/vhc/contracts/daemon-vhc-abi" }
 daemon-vhc-proto = { version = "0", path = "crates/vhc/contracts/daemon-vhc-proto" }
 daemon-vhc-det = { version = "0", path = "crates/vhc/contracts/daemon-vhc-det" }
 daemon-vhc-sdk = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk" }
+daemon-vhc-sdk-rounds = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk-rounds" }
 daemon-vhc-net = { version = "0", path = "crates/vhc/host/daemon-vhc-net" }
 daemon-vhc-session = { version = "0", path = "crates/vhc/host/daemon-vhc-session" }
 daemon-vhc-coordinator = { version = "0", path = "crates/vhc/host/daemon-vhc-coordinator" }

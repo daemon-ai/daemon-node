@@ -360,12 +360,83 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "driver_selection"],
         ),
         (
+            // The A2 event-loop acceptance (refactor §5 A2): the non-round toy-averager guest
+            // (timers + publish only) end-to-end under the real major-2 driver — selection
+            // admits, da_init/da_run dispatch, §12.1 signed frames with durable seqs, journaled
+            // through the real A1 substrate — plus the undeclared-channel GrantViolation
+            // negative. Named as its own lane (like the A0 fixture) so the standing
+            // expressiveness proof is visible; also covered by the host crate suite above.
+            "A2 v2 event loop (toy-averager expressiveness + typed channel trap)",
+            &["-p", "daemon-vhc-host", "--test", "v2_event_loop"],
+        ),
+        (
+            // The A2 claim + admission-funnel acceptance (refactor §5 A2; §10 gate row "Claim
+            // rejection / over-claim / under-claim traps"): over-claim vs owner policy (stage 5),
+            // claim outside lane bounds (stage 4), ClaimInconsistent, GrantsExceedLane, the
+            // attributable under-claim cap trap at run time, and claim determinism — all through
+            // the real restricted assessment instance (test-claim-v2 guest).
+            "A2 claim + admission funnel (over/under-claim, lane bounds, typed refusals)",
+            &["-p", "daemon-vhc-host", "--test", "v2_claim_funnel"],
+        ),
+        (
+            // The §2.5 tabi@1 bridge under major-2 (the choreography sitting): the SAME frozen
+            // dispatch as the v1 driver, genericized over the store — registration only in
+            // da_init (PhaseViolation otherwise), slice-class arenas cleared per Delivered
+            // (StaleHandle across a boundary), nr-class readouts journaled under §2.7 kinds.
+            // The A0 fixture lane above is the byte-for-byte v1-untouched proof.
+            "A2 tabi@1 bridge under the v2 driver (§2.5 legality + slice arenas + nr journal)",
+            &["-p", "daemon-vhc-host", "--test", "v2_bridge"],
+        ),
+        (
+            // THE Phase-A acceptance (refactor §5 A2): TinyLlama on BarrierRound under the v2
+            // driver + bridge reproduces the v1 WasmBackend's det-lane state digests — cpu +
+            // burn-ndarray tiers here; wgpu/cuda tiers are hardware-gated in the same test file
+            // (the scheduled GPU lanes, like reference_parity_{wgpu,cuda}).
+            "A2 det-digest parity: TinyLlama-on-BarrierRound v2 ≡ v1 (cpu + burn-ndarray)",
+            &[
+                "-p",
+                "daemon-vhc-host",
+                "--test",
+                "v2_parity",
+                "--features",
+                "burn-ndarray",
+            ],
+        ),
+        (
+            // The v2 input-replay step (refactor §5 A1→A2 acceptance; §12.6 journal soak for
+            // v2): recorded runs (toy averager: timers/clock; bridge guest: nr readouts +
+            // staged kinds 1/2) re-driven from the journal alone through the §8.7 verifier
+            // (observe contract over the host replay engine) — every decision bit-for-bit;
+            // tampered/incomplete journals are typed divergences. The TinyLlama acceptance run
+            // replays inside the parity lane above.
+            "A2 v2 input-replay: journal-only re-drive ≡ recorded decisions (§8.7)",
+            &["-p", "daemon-vhc-host", "--test", "v2_replay"],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),
         (
+            // The frozen worker protocol over the REAL `daemon-vhc-worker` binary (probe → assess
+            // → join → one self-driven round; envelope seam; preemption churn). Lived inside the
+            // `daemon-vhc-host` suite above until the A2 worker-bin split moved the bin (and its
+            // CARGO_BIN_EXE-spawning test) to `crates/vhc/bins/daemon-vhc-worker`; same features
+            // as before the split (burn-ndarray forwards into the host lib), so coverage is
+            // unchanged.
+            "daemon-vhc-worker (frozen worker protocol over the real binary)",
+            &["-p", "daemon-vhc-worker", "--features", "burn-ndarray"],
+        ),
+        (
             "daemon-vhc-sdk (SDK profile goldens: sparse_loco/diloco)",
             &["-p", "daemon-vhc-sdk", "--features", "sim"],
+        ),
+        (
+            // A2 migrate/main! scaffolding (refactor §5 A2 item 4; ABI §10): state round-trips
+            // in sim through the typed manifest protocol; the SDK-derived claim/manifest match
+            // the §9.1/§6.2 wire schema the admission funnel decodes. The macro's exports are
+            // exercised for real by the tiny-llama-v2 guest under the parity lane.
+            "daemon-vhc-sdk-v2 (main!/migrate scaffolding: sim round-trips + derivations)",
+            &["-p", "daemon-vhc-sdk-v2"],
         ),
         (
             "daemon-swarm-e2e (drills + observe-replay, no iroh/live)",
@@ -430,6 +501,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "Phase B — e2e runs production wasm blobs under host/daemon-vhc-testkit [dev-dep]",
         ),
         (
+            "daemon-swarm-e2e",
+            "daemon-vhc-sdk-rounds",
+            "Phase E — the A2 choreography bridging oracle (relocated round logic vs the v1 \
+             engine) retires with the v1 engine at sunset [dev-dep]",
+        ),
+        (
             "daemon-vhc-safetensors",
             "daemon-vhc-sdk",
             "Phase E — safetensors is wired into the checkpoint path (state-dict layout) [dev-dep]",
@@ -438,6 +515,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "daemon-vhc-host",
             "daemon-vhc-sdk",
             "Phase C — model presets (TinyLlamaCfg/profiles) leave the SDK for guests/ [dev-dep]",
+        ),
+        (
+            "daemon-vhc-worker",
+            "daemon-vhc-sdk",
+            "Phase C — TinyLlamaCfg in the moved worker-protocol test leaves the SDK for guests/ \
+             [dev-dep] (split from daemon-vhc-host's identical exception at the A2 bin split)",
         ),
     ];
 
@@ -456,12 +539,16 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("parsing cargo metadata json: {e}"))?;
 
     // Classify a workspace crate by where its manifest lives in the crates/vhc/ tree.
+    // `bins/` (the worker binary, split out of daemon-vhc-host at A2) is host-side by
+    // construction — same rule as host/*: it never links sdk/* (architecture §7).
     fn role(manifest_path: &str) -> Option<&'static str> {
         if manifest_path.contains("/crates/vhc/contracts/") {
             Some("contracts")
         } else if manifest_path.contains("/crates/vhc/sdk/") {
             Some("sdk")
-        } else if manifest_path.contains("/crates/vhc/host/") {
+        } else if manifest_path.contains("/crates/vhc/host/")
+            || manifest_path.contains("/crates/vhc/bins/")
+        {
             Some("host")
         } else {
             None
@@ -519,6 +606,15 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             if from_role == Some("sdk") && to_role == "host" {
                 violations.push(format!(
                     "{from} -> {to} [{kind}]: sdk/* must not link host/*"
+                ));
+            }
+            // The A2 dependency inversion (refactor §5 A2 item 3; architecture §7 SESS → HOSTC):
+            // the session links the host — the host must NEVER re-grow a runtime edge onto the
+            // session (run policy). A dev-only edge (fixture/parity tests) is permitted.
+            if from == "daemon-vhc-host" && to == "daemon-vhc-session" && kind != "dev" {
+                violations.push(format!(
+                    "{from} -> {to} [{kind}]: the A2 inversion is one-way — the host must not \
+                     link the session at runtime (session → host is the direction)"
                 ));
             }
         }

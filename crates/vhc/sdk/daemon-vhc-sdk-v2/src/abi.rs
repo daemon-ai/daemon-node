@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+//! The raw `vhc@2`/`net@2`/`sys@2` externs + the small safe wrappers (ABI §4.1/§6): the ABI-floor
+//! tier of the SDK table (architecture §6) for the event loop, exactly as the v1 SDK's `abi.rs`
+//! is for the frozen tensor vocabulary (which major-2 modules keep linking as the §2.5 bridge).
+//!
+//! wasm32-only: the native path virtualizes these worlds in Phase B's `vhc-sim`.
+
+use ciborium::value::Value;
+
+#[link(wasm_import_module = "vhc@2")]
+extern "C" {
+    #[link_name = "next_event"]
+    fn abi_next_event(buf_ptr: u32, buf_cap: u32) -> u64;
+    #[link_name = "read_back"]
+    fn abi_read_back(src: u64, kind: u32, out_ptr: u32, out_cap: u32) -> u64;
+}
+
+#[link(wasm_import_module = "net@2")]
+extern "C" {
+    #[link_name = "publish"]
+    fn abi_publish(channel_id: u32, payload_ptr: u32, payload_len: u32) -> u64;
+}
+
+#[link(wasm_import_module = "sys@2")]
+extern "C" {
+    #[link_name = "set_timer"]
+    fn abi_set_timer(delay_ms: u64) -> u64;
+}
+
+/// One decoded event: the §4.2 tag plus the positional fields (tag included at index 0).
+pub struct Event {
+    /// The leading event tag (`EV_TAG_*`).
+    pub tag: u64,
+    /// The full positional array, tag included.
+    pub items: Vec<Value>,
+}
+
+impl Event {
+    /// Positional field `i` as a u64 (0 when absent/mistyped — callers know their tag's shape).
+    #[must_use]
+    pub fn uint(&self, i: usize) -> u64 {
+        self.items
+            .get(i)
+            .and_then(Value::as_integer)
+            .map(|n| u64::try_from(i128::from(n)).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Positional field `i` as bytes (empty when absent/mistyped).
+    #[must_use]
+    pub fn bytes(&self, i: usize) -> Vec<u8> {
+        match self.items.get(i) {
+            Some(Value::Bytes(b)) => b.clone(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Pull the next event, honoring the mandatory `NeedCapacity` retry (§4.1). Fails closed
+/// (`unreachable` → `GuestPanic`) on an unknown status or a malformed frame (§5.2).
+#[must_use]
+pub fn next_event(buf: &mut Vec<u8>) -> Event {
+    loop {
+        // SAFETY: the span handed to the host is exactly `buf`'s live allocation.
+        let packed = unsafe { abi_next_event(buf.as_mut_ptr() as u32, buf.capacity() as u32) };
+        let (status, len) = (packed >> 32, (packed & 0xffff_ffff) as usize);
+        match status {
+            0 => {
+                // SAFETY: the host wrote exactly `len` bytes (§4.1).
+                unsafe { buf.set_len(len) };
+                let v: Value = ciborium::from_reader(buf.as_slice())
+                    .unwrap_or_else(|_| unreachable!("malformed event frame"));
+                let Value::Array(items) = v else {
+                    unreachable!("event frame is not a positional array")
+                };
+                let tag = items
+                    .first()
+                    .and_then(Value::as_integer)
+                    .map(|n| u64::try_from(i128::from(n)).unwrap_or(u64::MAX))
+                    .unwrap_or_else(|| unreachable!("missing event tag"));
+                return Event { tag, items };
+            }
+            1 => buf.reserve(len),
+            _ => unreachable!("unknown next_event status (fail closed, §5.2)"),
+        }
+    }
+}
+
+/// `read_back` a staged item that resolves to a CBOR uint — the bridge kinds (1 = batch handle,
+/// 2 = update staging index, §6.4) — honoring the mandatory retry.
+#[must_use]
+pub fn read_back_uint(src: u64, kind: u32) -> u64 {
+    let mut buf = vec![0u8; 16];
+    loop {
+        // SAFETY: `buf` is a live guest span for the call's duration.
+        let packed = unsafe { abi_read_back(src, kind, buf.as_mut_ptr() as u32, buf.len() as u32) };
+        let (status, len) = (packed >> 32, (packed & 0xffff_ffff) as usize);
+        match status {
+            0 => {
+                let v: Value = ciborium::from_reader(&buf[..len])
+                    .unwrap_or_else(|_| unreachable!("read_back uint cbor"));
+                return v
+                    .as_integer()
+                    .map(|n| u64::try_from(i128::from(n)).unwrap_or(u64::MAX))
+                    .unwrap_or_else(|| unreachable!("read_back uint"));
+            }
+            1 => buf.resize(len, 0),
+            _ => unreachable!("unknown read_back status (fail closed, §5.2)"),
+        }
+    }
+}
+
+/// `read_back` a staged item's raw bytes (kind 0 verbatim; kind 3 state-section during
+/// `da_migrate`, §6.6/§10.2) — honoring the mandatory retry.
+#[must_use]
+pub fn read_back_bytes(src: u64, kind: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 256];
+    loop {
+        // SAFETY: `buf` is a live guest span for the call's duration.
+        let packed = unsafe { abi_read_back(src, kind, buf.as_mut_ptr() as u32, buf.len() as u32) };
+        let (status, len) = (packed >> 32, (packed & 0xffff_ffff) as usize);
+        match status {
+            0 => {
+                buf.truncate(len);
+                return buf;
+            }
+            1 => buf.resize(len, 0),
+            _ => unreachable!("unknown read_back status (fail closed, §5.2)"),
+        }
+    }
+}
+
+/// Publish opaque payload bytes on `channel` (§6.2); returns the durable channel-scoped seq.
+pub fn publish(channel: u32, payload: &[u8]) -> u64 {
+    // SAFETY: `payload` is a live guest span for the call's duration.
+    unsafe { abi_publish(channel, payload.as_ptr() as u32, payload.len() as u32) }
+}
+
+/// Arm a one-shot logical-clock timer (§6.3); returns the timer id.
+pub fn set_timer(delay_ms: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_set_timer(delay_ms) }
+}

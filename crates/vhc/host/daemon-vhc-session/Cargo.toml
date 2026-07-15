@@ -40,6 +40,11 @@ iroh = ["harness", "daemon-vhc-net/iroh"]
 [dependencies]
 daemon-vhc-proto = { workspace = true }
 daemon-vhc-net = { workspace = true }
+# The A2 dependency INVERSION (refactor §5 A2; architecture §7: SESS → HOSTC): the session links
+# the host runtime — never the reverse (the old daemon-vhc-host → daemon-vhc-session edge is gone;
+# xtask's vhc_dep_check enforces the direction). `wasm_backend.rs` (the TrainerBackend seam over
+# the wasm host) moved here with the inversion.
+daemon-vhc-host = { workspace = true }
 # The pure coordinator `tick` state machine — driven by the Merge-2 harness shell (feature-gated, so
 # it stays out of the default participant-runtime build). Not a root Cargo.toml change: the path dep
 # is already declared in the frozen `[workspace.dependencies]`.

@@ -4513,6 +4513,7 @@ dependencies = [
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk",
+ "daemon-vhc-sdk-rounds",
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
  "serde_json",
@@ -4898,27 +4899,20 @@ version = "0.0.1"
 name = "daemon-vhc-host"
 version = "0.0.1"
 dependencies = [
- "async-trait",
  "blake3",
  "burn",
  "ciborium",
  "cudarc 0.19.8",
- "daemon-common",
- "daemon-egress",
- "daemon-provision",
- "daemon-telemetry",
  "daemon-vhc-abi",
  "daemon-vhc-det",
- "daemon-vhc-net",
+ "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-safetensors",
  "daemon-vhc-sdk",
  "daemon-vhc-session",
- "daemon-vhc-supervisor",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tokio",
  "wasm-encoder",
  "wasmtime",
  "windows 0.62.2",
@@ -5018,6 +5012,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-sdk-rounds"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "daemon-vhc-proto",
+]
+
+[[package]]
+name = "daemon-vhc-sdk-v2"
+version = "0.0.1"
+dependencies = [
+ "ciborium",
+ "daemon-vhc-proto",
+ "serde",
+]
+
+[[package]]
 name = "daemon-vhc-session"
 version = "0.0.1"
 dependencies = [
@@ -5025,6 +5036,7 @@ dependencies = [
  "blake3",
  "ciborium",
  "daemon-vhc-coordinator",
+ "daemon-vhc-host",
  "daemon-vhc-net",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
@@ -5048,6 +5060,28 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "daemon-vhc-worker"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "ciborium",
+ "daemon-common",
+ "daemon-egress",
+ "daemon-provision",
+ "daemon-telemetry",
+ "daemon-vhc-abi",
+ "daemon-vhc-coordinator",
+ "daemon-vhc-host",
+ "daemon-vhc-net",
+ "daemon-vhc-proto",
+ "daemon-vhc-sdk",
+ "daemon-vhc-session",
+ "daemon-vhc-supervisor",
+ "tokio",
 ]
 
 [[package]]

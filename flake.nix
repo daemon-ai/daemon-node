@@ -891,7 +891,9 @@
           windowsCommonArgs
           // {
             pname = "daemon-vhc-worker-windows-deps";
-            cargoExtraArgs = "-p daemon-vhc-host --bin daemon-vhc-worker --features swarm-net,wgpu";
+            # A2 worker-bin split: the worker is its own crate (crates/vhc/bins/daemon-vhc-worker);
+            # feature names are unchanged (they forward into daemon-vhc-host's lanes).
+            cargoExtraArgs = "-p daemon-vhc-worker --bin daemon-vhc-worker --features swarm-net,wgpu";
           }
         );
         daemon-vhc-worker-windows = craneLibWindows.buildPackage (
@@ -900,7 +902,7 @@
             pname = "daemon-vhc-worker-windows";
             version = baseVersion;
             cargoArtifacts = daemonTrainWorkerWindowsDeps;
-            cargoExtraArgs = "-p daemon-vhc-host --bin daemon-vhc-worker --features swarm-net,wgpu";
+            cargoExtraArgs = "-p daemon-vhc-worker --bin daemon-vhc-worker --features swarm-net,wgpu";
             DAEMON_BUILD_ID = buildId;
           }
         );

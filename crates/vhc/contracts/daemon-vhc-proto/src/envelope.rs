@@ -236,6 +236,26 @@ impl Envelope {
     }
 }
 
+/// The additive `device_min` envelope section (ABI §9.3 `device-minimums`; raw bytes and bps,
+/// never MB/Mbps): the run author's device floor, evaluated at funnel stage 3 **before the
+/// module is downloaded**. All fields optional — absent means "no constraint". `gpu` follows the
+/// lane convention: 0 = forbidden, 1 = optional, 2 = required.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceMinimums {
+    /// 0 = forbidden, 1 = optional, 2 = required.
+    pub gpu: Option<u64>,
+    /// Minimum device memory, bytes.
+    pub vram_bytes: Option<u64>,
+    /// Minimum host RAM, bytes.
+    pub ram_bytes: Option<u64>,
+    /// Minimum free disk, bytes.
+    pub disk_bytes: Option<u64>,
+    /// Minimum uplink, bits/s.
+    pub up_bps: Option<u64>,
+    /// Minimum downlink, bits/s.
+    pub down_bps: Option<u64>,
+}
+
 /// A frozen, hashed, signed envelope — the immutable run snapshot (spec §6.1, §11.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrozenEnvelope {
@@ -303,6 +323,42 @@ impl FrozenEnvelope {
     /// Decode the resolved envelope from the frozen bytes.
     pub fn decode(&self) -> Result<Envelope, SwarmProtoError> {
         crate::canonical::from_canonical_slice(&self.bytes)
+    }
+
+    /// The additive host-readable `device_min` section (ABI §9.3 pre-D0; D3 cell 5), parsed from
+    /// the **raw frozen bytes at the CBOR-value level** — never through the typed [`Envelope`],
+    /// which silently discards unknown keys (the exact decode→re-freeze trap the cell-5 provisos
+    /// guard against). `None` when the envelope carries no such section (the pre-A2 common case);
+    /// a malformed section is `None` too — an author who wants pre-screening writes it correctly.
+    #[must_use]
+    pub fn device_min(&self) -> Option<DeviceMinimums> {
+        let v: ciborium::value::Value = ciborium::de::from_reader(self.bytes.as_slice()).ok()?;
+        let ciborium::value::Value::Map(entries) = v else {
+            return None;
+        };
+        let section = entries.iter().find_map(|(k, v)| match k {
+            ciborium::value::Value::Text(t) if t == "device_min" => Some(v),
+            _ => None,
+        })?;
+        let ciborium::value::Value::Map(fields) = section else {
+            return None;
+        };
+        let uint = |name: &str| -> Option<u64> {
+            fields.iter().find_map(|(k, v)| match k {
+                ciborium::value::Value::Text(t) if t == name => v
+                    .as_integer()
+                    .and_then(|n| u64::try_from(i128::from(n)).ok()),
+                _ => None,
+            })
+        };
+        Some(DeviceMinimums {
+            gpu: uint("gpu"),
+            vram_bytes: uint("vram_bytes"),
+            ram_bytes: uint("ram_bytes"),
+            disk_bytes: uint("disk_bytes"),
+            up_bps: uint("up_bps"),
+            down_bps: uint("down_bps"),
+        })
     }
 
     /// Verify integrity: the stored hash matches blake3 of the bytes, and the signature verifies.

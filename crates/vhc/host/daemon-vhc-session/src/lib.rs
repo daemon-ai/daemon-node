@@ -32,6 +32,12 @@ pub mod data;
 pub mod engine;
 pub mod protocol;
 pub mod seam;
+pub mod v2_attach;
+// The A2 dependency inversion (refactor §5 A2 item 3): the session links the HOST (never the
+// reverse — the host stopped linking run policy). `WasmBackend` — the TrainerBackend seam filled
+// by the wasm host runtime — moved here from `daemon-vhc-host` with the inversion: the trait it
+// implements is session-owned, and the session is where seam plumbing consolidates (decisions D1).
+pub mod wasm_backend;
 
 /// The runnable local-mode coordinator shell (the impure driver around the pure
 /// `daemon-vhc-coordinator` `tick`). Behind the `harness` feature (its coordinator dep is
@@ -64,6 +70,7 @@ pub use data::{
 };
 pub use engine::{EngineConfig, EngineEvent, RoundEngine, RunOutcome};
 pub use seam::BatchId;
+pub use wasm_backend::{WasmBackend, WasmBackendConfig, WasmBackendError};
 
 /// Errors surfaced by the participant runtime.
 #[derive(Debug, thiserror::Error)]
