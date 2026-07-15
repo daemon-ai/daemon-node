@@ -207,7 +207,7 @@ fn pull_tag2(buf: &mut Vec<u8>) -> (u64, u64) {
                 };
                 return (uint(0), uint(1));
             }
-            1 => buf.reserve(len.saturating_sub(buf.capacity())),
+            1 => buf.reserve(len),
             _ => unreachable!(),
         }
     }

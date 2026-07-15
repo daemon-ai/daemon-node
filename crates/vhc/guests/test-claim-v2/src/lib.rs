@@ -206,7 +206,7 @@ fn pull_event(buf: &mut Vec<u8>) -> u64 {
                     .map(|i| u64::try_from(i128::from(i)).unwrap_or(u64::MAX))
                     .expect("tag");
             }
-            1 => buf.reserve(len.saturating_sub(buf.capacity())),
+            1 => buf.reserve(len),
             _ => unreachable!("unknown next_event status"),
         }
     }

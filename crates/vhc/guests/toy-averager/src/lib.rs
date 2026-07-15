@@ -227,7 +227,7 @@ fn pull_event(buf: &mut Vec<u8>) -> Vec<u8> {
             }
             1 => {
                 // Immediate mandatory retry with an enlarged buffer (§4.1).
-                buf.reserve(len.saturating_sub(buf.capacity()));
+                buf.reserve(len);
             }
             // Unknown status: fail closed (§5.2).
             _ => unreachable!("unknown next_event status"),

@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-sdk-v2"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = """
+Minimal-honest major-2 guest bindings (ABI §4.1/§6): the raw vhc@2/net@2/sys@2 externs + the
+small safe wrappers a hand-wired v2 module needs. A SIBLING of daemon-vhc-sdk, deliberately NOT
+a module inside it: the v1 SDK's bytes feed the frozen guest pins (guests.blake3 / the A0
+fixture), so the major-2 tier must not perturb its codegen. Folds into the SDK proper with the
+main!/claim macro layer (the next scaffolding sitting); wasm32-only (empty native build).
+"""
+
+[dependencies]
+ciborium = { workspace = true }
+
+[package.metadata.cargo-machete]
+# ciborium is used by the wasm-guest code path (the whole crate is cfg-gated to wasm32); the
+# native build is deliberately empty, so dependency scanners see it as unused there.
+ignored = ["ciborium"]
+
+[lints]
+workspace = true
