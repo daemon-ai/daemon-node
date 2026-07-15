@@ -4898,27 +4898,19 @@ version = "0.0.1"
 name = "daemon-vhc-host"
 version = "0.0.1"
 dependencies = [
- "async-trait",
  "blake3",
  "burn",
  "ciborium",
  "cudarc 0.19.8",
- "daemon-common",
- "daemon-egress",
- "daemon-provision",
- "daemon-telemetry",
  "daemon-vhc-abi",
  "daemon-vhc-det",
- "daemon-vhc-net",
  "daemon-vhc-proto",
  "daemon-vhc-safetensors",
  "daemon-vhc-sdk",
  "daemon-vhc-session",
- "daemon-vhc-supervisor",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tokio",
  "wasm-encoder",
  "wasmtime",
  "windows 0.62.2",
@@ -5048,6 +5040,27 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "daemon-vhc-worker"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "ciborium",
+ "daemon-common",
+ "daemon-egress",
+ "daemon-provision",
+ "daemon-telemetry",
+ "daemon-vhc-abi",
+ "daemon-vhc-host",
+ "daemon-vhc-net",
+ "daemon-vhc-proto",
+ "daemon-vhc-sdk",
+ "daemon-vhc-session",
+ "daemon-vhc-supervisor",
+ "tokio",
 ]
 
 [[package]]

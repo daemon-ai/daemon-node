@@ -1,0 +1,85 @@
+[package]
+name = "daemon-vhc-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The worker binary — split out of `daemon-vhc-host`'s `[[bin]]` targets at Phase A2 per refactor
+# §3/§11 ("splits into `bins/daemon-vhc-worker` when A0 gives it real work") and architecture §7's
+# tree (`crates/vhc/bins/daemon-vhc-worker`). A strictly mechanical move: the child side of the
+# frozen worker protocol (§10.2) over the length-framed stdio cut, driving the `daemon-vhc-host`
+# wasm runtime. Runs ANY role's module once the v2 driver lands; the node side stays a library
+# (`daemon-vhc-node` + `daemon-vhc-supervisor`, embedded by the product's node binary — never here).
+# `daemon-vhc-probe` and the `daemon-vhc` CLI remain `[[bin]]` targets of `daemon-vhc-host` (the
+# probe is the MinGW-linkable fleet-validation artifact and links none of this worker's stdio/crash
+# stack; nothing about this split forces them to move).
+[[bin]]
+name = "daemon-vhc-worker"
+path = "src/main.rs"
+
+[dependencies]
+# The shared ABI contract (driver-selection vocabulary + refusal taxonomy) the assess path names.
+daemon-vhc-abi = { workspace = true }
+# The host worker runtime this binary drives: `WasmBackend`, driver selection (`select_driver`),
+# the autotune/device probe, `EngineConfig`, and the per-backend lanes (forwarded features below).
+daemon-vhc-host = { workspace = true }
+# The R↔E seam + the frozen node↔worker wire (`daemon_vhc_session::protocol`) this binary speaks.
+daemon-vhc-session = { workspace = true }
+# Envelope open/verify (`SignedEnvelope`) on the assess path.
+daemon-vhc-proto = { workspace = true }
+# The envelope artifact plane (`ArtifactResolver`, `file://` blake3-verified) the worker uses to
+# fetch its experiment module from the frozen envelope's artifact map (§8).
+daemon-vhc-net = { workspace = true }
+# The length-framed `CutChannel` stdio transport (same supervision contract as the other
+# coprocessor workers, §10.2).
+daemon-provision = { workspace = true }
+# Async runtime for the stdio command/event loop.
+tokio = { workspace = true }
+# Consent-gated crash reporting (panics + native minidumps — the worker links heavy native engine
+# trees, so a segfault is a real failure mode). A runtime no-op unless the spawning node injected
+# a DSN + `DAEMON_CRASH_CONSENT=1`.
+daemon-telemetry = { workspace = true }
+# The SSRF-safe outbound HTTP client the `R2Store`/`HttpPresignClient` payload plane rides (A3
+# live attach). OPTIONAL — pulled in only by the `swarm-net` feature.
+daemon-egress = { workspace = true, optional = true }
+# `#[async_trait]` for the worker's concrete `PayloadStore` impl (the R2/Fs store enum). OPTIONAL —
+# pulled in only by `swarm-net`.
+async-trait = { workspace = true, optional = true }
+
+# Per-backend lane selection: this bin crate FORWARDS its lanes into `daemon-vhc-host`, whose lib
+# code (`burn_backend.rs`/`runtime.rs`/`autotune.rs`) is what the features actually gate — the
+# `cfg(feature = …)` blocks in this binary's own `backend.rs`/`main.rs` select the matching
+# `BackendKind` at spawn. Feature names are unchanged from the pre-split `daemon-vhc-host` bin
+# lanes, so `--features swarm-net,wgpu` invocations only re-point `-p`.
+[features]
+default = ["cpu"]
+# The CPU (det-lane fp32) lane — no extra backend deps.
+cpu = ["daemon-vhc-host/cpu"]
+# burn with the ndarray backend + autodiff — the G1 native lane.
+burn-ndarray = ["daemon-vhc-host/burn-ndarray"]
+# burn with the wgpu backend (Vulkan/RADV at runtime) — the G2 GPU lane. Opt-in only.
+wgpu = ["daemon-vhc-host/wgpu"]
+# burn with the CUDA backend (driver-API + NVRTC JIT at runtime) — the C2/P3 lane. Opt-in only.
+cuda = ["daemon-vhc-host/cuda"]
+# The A3 live coordinator attach: RoundEngine over DualPlane(WsControlPlane[, IrohGossip]) +
+# R2/Fs payload store. OFF the default gate so a default `cargo build`/`test`/`deny` never
+# compiles the WS/TLS/iroh/QUIC tree. (This feature lives wholly here post-split: the host lib
+# has no swarm-net-gated code — the attach is worker-binary plumbing.)
+swarm-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress", "dep:async-trait"]
+
+[dev-dependencies]
+# tests/worker_protocol.rs (moved with the bin — `env!("CARGO_BIN_EXE_daemon-vhc-worker")` only
+# resolves in the crate that owns the `[[bin]]` target): spawns the REAL worker binary through the
+# node-side supervisor and directly over the provision cut, against a real tiny-llama `.wasm`.
+daemon-vhc-supervisor = { workspace = true }
+daemon-common = { workspace = true }
+# Test-only: `TinyLlamaCfg` for the guest config the worker assesses. NOTE: a tracked
+# dependency-direction exception (model presets leave the SDK for `guests/` in Phase C) —
+# registered in xtask's `vhc_dep_check` EXCEPTIONS.
+daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
+blake3 = { workspace = true }
+ciborium = { workspace = true }
+
+[lints]
+workspace = true

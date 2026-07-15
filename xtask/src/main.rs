@@ -364,6 +364,16 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),
         (
+            // The frozen worker protocol over the REAL `daemon-vhc-worker` binary (probe → assess
+            // → join → one self-driven round; envelope seam; preemption churn). Lived inside the
+            // `daemon-vhc-host` suite above until the A2 worker-bin split moved the bin (and its
+            // CARGO_BIN_EXE-spawning test) to `crates/vhc/bins/daemon-vhc-worker`; same features
+            // as before the split (burn-ndarray forwards into the host lib), so coverage is
+            // unchanged.
+            "daemon-vhc-worker (frozen worker protocol over the real binary)",
+            &["-p", "daemon-vhc-worker", "--features", "burn-ndarray"],
+        ),
+        (
             "daemon-vhc-sdk (SDK profile goldens: sparse_loco/diloco)",
             &["-p", "daemon-vhc-sdk", "--features", "sim"],
         ),
@@ -439,6 +449,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "daemon-vhc-sdk",
             "Phase C — model presets (TinyLlamaCfg/profiles) leave the SDK for guests/ [dev-dep]",
         ),
+        (
+            "daemon-vhc-worker",
+            "daemon-vhc-sdk",
+            "Phase C — TinyLlamaCfg in the moved worker-protocol test leaves the SDK for guests/ \
+             [dev-dep] (split from daemon-vhc-host's identical exception at the A2 bin split)",
+        ),
     ];
 
     let root = workspace_root();
@@ -456,12 +472,16 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("parsing cargo metadata json: {e}"))?;
 
     // Classify a workspace crate by where its manifest lives in the crates/vhc/ tree.
+    // `bins/` (the worker binary, split out of daemon-vhc-host at A2) is host-side by
+    // construction — same rule as host/*: it never links sdk/* (architecture §7).
     fn role(manifest_path: &str) -> Option<&'static str> {
         if manifest_path.contains("/crates/vhc/contracts/") {
             Some("contracts")
         } else if manifest_path.contains("/crates/vhc/sdk/") {
             Some("sdk")
-        } else if manifest_path.contains("/crates/vhc/host/") {
+        } else if manifest_path.contains("/crates/vhc/host/")
+            || manifest_path.contains("/crates/vhc/bins/")
+        {
             Some("host")
         } else {
             None

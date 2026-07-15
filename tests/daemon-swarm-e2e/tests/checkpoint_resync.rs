@@ -98,7 +98,7 @@ fn ensure_built() -> PathBuf {
             .args([
                 "build",
                 "-p",
-                "daemon-vhc-host",
+                "daemon-vhc-worker",
                 "--features",
                 "swarm-net",
                 "--bin",
