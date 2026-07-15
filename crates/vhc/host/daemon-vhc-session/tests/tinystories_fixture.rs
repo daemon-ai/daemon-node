@@ -12,7 +12,7 @@
 //!   --dataset roneneldan/TinyStories --dataset-file TinyStories-valid.txt \
 //!   --revision f54c09fd23315a6f9c86f9dc80f725de7d8f9c64 \
 //!   --tokenizer gpt2 --tokenizer-revision 607a30d783dfa663caf39e06633721c8d4cfcd7e \
-//!   --out-dir crates/swarm/daemon-swarm-run/tests/fixtures/tinystories \
+//!   --out-dir crates/vhc/host/daemon-vhc-session/tests/fixtures/tinystories \
 //!   --shard-tokens 262144 --seq-len 1024 --token-width u16 --max-tokens 1048576
 //! ```
 

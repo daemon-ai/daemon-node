@@ -5,7 +5,7 @@
 # The relay carries gossip for all peers that pin its URL in the run envelope / IrohGossipConfig.
 #
 # Usage:
-#   nix develop --command crates/swarm/daemon-swarm-net/dev/run-relay.sh          # port 3340
+#   nix develop --command crates/vhc/host/daemon-vhc-net/dev/run-relay.sh          # port 3340
 #   IROH_RELAY_PORT=4455 nix develop --command .../dev/run-relay.sh               # custom port
 #
 # Then point clients at the printed relay URL (IrohGossipConfig.relay_urls / envelope [phases]):

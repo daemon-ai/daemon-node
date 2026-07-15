@@ -32,7 +32,7 @@ tokio = { workspace = true }
 # (`WasmBackend`), the pure coordinator `tick`, and the observe replay oracle (PROTO-20). All are
 # already in the frozen root `[workspace.dependencies]`; no cycle (the e2e crate is a leaf).
 daemon-train = { workspace = true }
-daemon-train-sdk = { path = "../../crates/contracts/daemon-train-sdk", features = ["sim"] }
+daemon-train-sdk = { path = "../../crates/vhc/sdk/daemon-vhc-sdk", features = ["sim"] }
 daemon-swarm-coordinator = { workspace = true }
 daemon-swarm-observe = { workspace = true }
 ciborium = { workspace = true }

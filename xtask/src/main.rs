@@ -238,7 +238,7 @@ fn main() -> anyhow::Result<()> {
 /// The `wasm32-unknown-unknown` rust-std is provided by the flake devShell toolchain.
 fn build_guests() -> anyhow::Result<()> {
     let root = workspace_root();
-    let guests = root.join("guests");
+    let guests = root.join("crates/vhc/guests");
     anyhow::ensure!(
         guests.join("Cargo.toml").is_file(),
         "no guests workspace at {}",

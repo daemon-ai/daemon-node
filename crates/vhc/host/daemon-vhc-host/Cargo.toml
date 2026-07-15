@@ -140,7 +140,7 @@ cuda = ["burn/cuda", "dep:cudarc"]
 # `TABI_IMPORTS`, and the guest-lifecycle test builds the `TinyLlamaCfg` the wasm guest parses.
 # `sim` compiles the SDK's `models`/`profiles` (config types) natively for the tests; never a
 # runtime edge (the host does not link the guest SDK).
-daemon-train-sdk = { path = "../../contracts/daemon-train-sdk", features = ["sim"] }
+daemon-train-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
 # Test-only: the node-side supervisor drives the real `daemon-train-worker` subprocess through the
 # frozen worker protocol (`tests/worker_protocol.rs`). Path dep between workspace members — no root
 # edit — and `daemon-train-client` does not depend on `daemon-train`, so it is a clean dev-dep.

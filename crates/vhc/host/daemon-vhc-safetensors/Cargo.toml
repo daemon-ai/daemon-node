@@ -21,7 +21,7 @@ blake3 = { workspace = true }
 [dev-dependencies]
 # The round-trip test proves the real 160M canonical param layout (names/shapes/order) survives; the
 # SDK provides that layout (sim feature only pulls det-core, no host/GPU deps).
-daemon-train-sdk = { path = "../../contracts/daemon-train-sdk", features = ["sim"] }
+daemon-train-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
 
 [lints]
 workspace = true

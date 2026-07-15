@@ -1,10 +1,33 @@
 [workspace]
 resolver = "2"
-members = ["crates/*/*", "tools/*", "bindings/*", "bins/*", "tests/*", "xtask"]
-# `guests/` is its OWN cargo workspace (the wasm32 experiment modules): it builds for
-# `wasm32-unknown-unknown` via `xtask build-guests`, links `daemon-train-sdk` by path, and must not
+# Explicit per-group globs rather than a blanket `crates/*/*`: the `crates/vhc/` tree nests one
+# level deeper (`crates/vhc/{contracts,sdk,host}/*`), and a `crates/*/*` glob would match the
+# `crates/vhc/{contracts,sdk,host}` grouping dirs (which carry no manifest) and fail to load.
+members = [
+    "crates/adapters/*",
+    "crates/contracts/*",
+    "crates/coprocessor/*",
+    "crates/engine/*",
+    "crates/memory/*",
+    "crates/node/*",
+    "crates/orchestration/*",
+    "crates/prompt/*",
+    "crates/providers/*",
+    "crates/skills/*",
+    "crates/substrate/*",
+    "crates/vhc/contracts/*",
+    "crates/vhc/sdk/*",
+    "crates/vhc/host/*",
+    "tools/*",
+    "bindings/*",
+    "bins/*",
+    "tests/*",
+    "xtask",
+]
+# `crates/vhc/guests/` is its OWN cargo workspace (the wasm32 experiment modules): it builds for
+# `wasm32-unknown-unknown` via `xtask build-guests`, links `daemon-vhc-sdk` by path, and must not
 # be pulled into the host workspace's default (native) gate. Kept out with an explicit exclude.
-exclude = ["guests"]
+exclude = ["crates/vhc/guests"]
 
 [workspace.package]
 version = "0.0.1"
@@ -405,21 +428,21 @@ daemon-node = { version = "0", path = "crates/node/daemon-node" }
 daemon-metta = { version = "0", path = "crates/coprocessor/daemon-metta", default-features = false }
 daemon-metta-client = { version = "0", path = "crates/coprocessor/daemon-metta-client" }
 # --- swarm training stack (swarm-training-spec.md §10.1; DAG-ordered) -----------------------------
-daemon-swarm-proto = { version = "0", path = "crates/contracts/daemon-swarm-proto" }
-det-core = { version = "0", path = "crates/contracts/det-core" }
-daemon-train-sdk = { version = "0", path = "crates/contracts/daemon-train-sdk" }
-daemon-swarm-net = { version = "0", path = "crates/swarm/daemon-swarm-net" }
-daemon-swarm-run = { version = "0", path = "crates/swarm/daemon-swarm-run" }
-daemon-swarm-coordinator = { version = "0", path = "crates/swarm/daemon-swarm-coordinator" }
-daemon-swarm-observe = { version = "0", path = "crates/swarm/daemon-swarm-observe" }
+daemon-swarm-proto = { version = "0", path = "crates/vhc/contracts/daemon-vhc-proto" }
+det-core = { version = "0", path = "crates/vhc/contracts/daemon-vhc-det" }
+daemon-train-sdk = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk" }
+daemon-swarm-net = { version = "0", path = "crates/vhc/host/daemon-vhc-net" }
+daemon-swarm-run = { version = "0", path = "crates/vhc/host/daemon-vhc-session" }
+daemon-swarm-coordinator = { version = "0", path = "crates/vhc/host/daemon-vhc-coordinator" }
+daemon-swarm-observe = { version = "0", path = "crates/vhc/host/daemon-vhc-observe" }
 # The node-side swarm-training service (resident `SwarmService` + worker supervisor), bound at boot
 # when `[swarm] enabled = true` (B3, spec §10.4). Promoted to the workspace table at Merge 3 (matches
 # the daemon-train-safetensors precedent from Merge 2) so `bins/daemon` consumes it via
 # `{ workspace = true }`. Default-gate-clean: no burn/wasmtime/iroh (verified by the Merge-3 dep check).
-daemon-swarm-node = { version = "0", path = "crates/swarm/daemon-swarm-node" }
-daemon-train = { version = "0", path = "crates/coprocessor/daemon-train" }
-daemon-train-client = { version = "0", path = "crates/coprocessor/daemon-train-client" }
-daemon-train-safetensors = { version = "0", path = "crates/coprocessor/daemon-train-safetensors" }
+daemon-swarm-node = { version = "0", path = "crates/vhc/host/daemon-vhc-node" }
+daemon-train = { version = "0", path = "crates/vhc/host/daemon-vhc-host" }
+daemon-train-client = { version = "0", path = "crates/vhc/host/daemon-vhc-supervisor" }
+daemon-train-safetensors = { version = "0", path = "crates/vhc/host/daemon-vhc-safetensors" }
 daemon-pytool = { version = "0", path = "crates/coprocessor/daemon-pytool" }
 daemon-pytool-client = { version = "0", path = "crates/coprocessor/daemon-pytool-client" }
 daemon-tool-metta = { version = "0", path = "tools/daemon-tool-metta" }
