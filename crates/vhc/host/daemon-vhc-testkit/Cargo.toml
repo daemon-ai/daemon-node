@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = """
+The host-side integration runner (architecture §6): wasmtime + simulated capability providers for
+the PRODUCTION wasm blobs — whole-run integration gates, adversarial suites, trace-replay
+regressions. It generalizes the A2 t2 join-run into reusable infrastructure: start a major-2 module
+under the real host event-loop driver, journal it, then re-drive the recorded journal through the
+§8.7 input-replay engine and assert every decision reproduces bit-for-bit.
+
+It links host/* only and NEVER sdk/* — the SDK-side native twin is sdk/daemon-vhc-sim (§6, the
+two-layer split on opposite sides of the wasm boundary). vhc_dep_check enforces the direction.
+"""
+
+[dependencies]
+# The wasmtime sandbox + the major-2 event-loop driver, admission, the in-memory JournalSink, and
+# the §8.7 replay engine (`replay_v2`). host/* -> host/* (allowed).
+daemon-vhc-host = { workspace = true }
+# The native coordinator (the pure `tick` state machine + envelope config) the whole-run harness
+# drives in-process — the "native coordinator + wasm workers" shape (refactor §6). host/* -> host/*.
+daemon-vhc-coordinator = { workspace = true }
+# The shared ABI vocabulary (event tags, channel table, stop reasons, outcome codes). contracts/*.
+daemon-vhc-abi = { workspace = true }
+# The signed control-plane wire (SignedMessage / SwarmMessage), envelope, blake3. contracts/*.
+daemon-vhc-proto = { workspace = true }
+blake3 = { workspace = true }
+ciborium = { workspace = true }
+
+[lints]
+workspace = true

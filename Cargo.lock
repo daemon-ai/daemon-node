@@ -5077,6 +5077,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-testkit"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "daemon-vhc-abi",
+ "daemon-vhc-coordinator",
+ "daemon-vhc-host",
+ "daemon-vhc-proto",
+]
+
+[[package]]
 name = "daemon-vhc-worker"
 version = "0.0.1"
 dependencies = [

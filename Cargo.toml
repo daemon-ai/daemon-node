@@ -454,6 +454,9 @@ daemon-vhc-node = { version = "0", path = "crates/vhc/host/daemon-vhc-node" }
 daemon-vhc-host = { version = "0", path = "crates/vhc/host/daemon-vhc-host" }
 daemon-vhc-supervisor = { version = "0", path = "crates/vhc/host/daemon-vhc-supervisor" }
 daemon-vhc-safetensors = { version = "0", path = "crates/vhc/host/daemon-vhc-safetensors" }
+# The host-side integration runner: wasmtime + simulated capability providers for the PRODUCTION
+# wasm blobs (whole-run gates, adversarial suites, trace replay). Links host/* only, never sdk/*.
+daemon-vhc-testkit = { version = "0", path = "crates/vhc/host/daemon-vhc-testkit" }
 daemon-pytool = { version = "0", path = "crates/coprocessor/daemon-pytool" }
 daemon-pytool-client = { version = "0", path = "crates/coprocessor/daemon-pytool-client" }
 daemon-tool-metta = { version = "0", path = "tools/daemon-tool-metta" }

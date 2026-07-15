@@ -64,6 +64,13 @@ enum Cmd {
     /// skip). This is the single in-repo definition of the per-PR swarm gate — the superproject CI
     /// job and a local operator both invoke `cargo run -p xtask -- swarm-ci-det`.
     SwarmCiDet,
+    /// Run the swarm **CI tier-2** whole-run suites (decisions D4): the deterministic sim/testkit
+    /// whole runs as they land — SDK-side `daemon-vhc-sim` native whole runs (the SPARTA
+    /// continuous-averaging toy over the virtual worlds) and host-side `daemon-vhc-testkit` whole
+    /// runs over the PRODUCTION wasm blobs (wasmtime + simulated capability providers, journaled,
+    /// §8.7 replay-verified). Heavier than tier-1 (wasmtime + guest builds), so it is a separate
+    /// gate invoked as `cargo run -p xtask -- swarm-ci-t2`, never part of `swarm-ci-det`.
+    SwarmCiT2,
     /// Enforce the daemon-vhc dependency-direction rules (architecture §7): `host/*` never links
     /// `sdk/*`, `contracts/*` links neither, `sdk/*` never links `host/*`. The honest current
     /// exceptions are listed inline and each is tracked to the phase that removes it.
@@ -177,6 +184,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::VerifyCodec => verify_codec(),
         Cmd::BuildGuests => build_guests(),
         Cmd::SwarmCiDet => swarm_ci_det(),
+        Cmd::SwarmCiT2 => swarm_ci_t2(),
         Cmd::VhcDepCheck => vhc_dep_check(),
         Cmd::TokenizeCorpus {
             dataset,
@@ -469,6 +477,55 @@ fn swarm_ci_det() -> anyhow::Result<()> {
         anyhow::ensure!(status.success(), "swarm CI tier-1 suite failed: {label}");
     }
     println!("\nswarm-ci-det: all tier-1 (CPU consensus-critical) swarm suites green");
+    Ok(())
+}
+
+/// Run the swarm **CI tier-2** whole-run suites (decisions D4; refactor §6, §10 gate table).
+///
+/// The two-layer simulation split (architecture §6): SDK-side `daemon-vhc-sim` runs NATIVE policy
+/// code (the SPARTA continuous-averaging toy over the virtual worlds — deterministic whole run),
+/// and host-side `daemon-vhc-testkit` runs the PRODUCTION wasm blobs under wasmtime + simulated
+/// capability providers, journaled and §8.7 replay-verified. This is heavier than tier-1 (it builds
+/// the wasm guests + compiles wasmtime), so it is a separate gate — never folded into
+/// `swarm-ci-det`, which stays the CPU-only deterministic tier-1 bar.
+fn swarm_ci_t2() -> anyhow::Result<()> {
+    let root = workspace_root();
+    // Same dependency-direction preflight as tier-1, then the guests the testkit runs.
+    println!("\n== swarm-ci-t2: daemon-vhc dependency-direction check ==");
+    vhc_dep_check()?;
+    build_guests()?;
+    let suites: &[(&str, &[&str])] = &[
+        (
+            // SDK-side native whole run (architecture §6): the SPARTA-shaped continuous-averaging
+            // toy (timers + gossip, no rounds, no coordinator) converges over the virtual worlds;
+            // the run is bit-for-bit deterministic (the SDK-side analogue of §8.7 input replay) and
+            // stays bounded under a lossy/churn trace.
+            "daemon-vhc-sim (SDK-side native whole run: SPARTA averager over the virtual worlds)",
+            &["-p", "daemon-vhc-sim"],
+        ),
+        (
+            // Host-side whole run over the PRODUCTION toy_averager.wasm blob: wasmtime + simulated
+            // capability providers, journaled end-to-end, then re-driven through the §8.7 input-
+            // replay engine — every decision reproduced bit-for-bit. Includes the reusable native-
+            // coordinator building block (the "native coordinator + wasm workers" shape).
+            "daemon-vhc-testkit (host-side whole run over the production blob: journaled + §8.7 replay)",
+            &["-p", "daemon-vhc-testkit"],
+        ),
+    ];
+    for (label, args) in suites {
+        println!("\n== swarm-ci-t2: {label} ==");
+        let status = Command::new("cargo")
+            .current_dir(&root)
+            .arg("test")
+            .args(*args)
+            .status()
+            .map_err(|e| anyhow::anyhow!("running cargo test {args:?}: {e}"))?;
+        anyhow::ensure!(
+            status.success(),
+            "swarm CI tier-2 whole-run suite failed: {label}"
+        );
+    }
+    println!("\nswarm-ci-t2: all tier-2 (sim/testkit) whole-run suites green");
     Ok(())
 }
 
