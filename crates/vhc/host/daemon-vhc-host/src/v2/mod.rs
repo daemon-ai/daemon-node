@@ -19,6 +19,7 @@ pub mod admission;
 pub mod driver;
 pub mod event;
 pub mod journal;
+pub mod replay;
 
 pub use admission::{
     admit_v2, AdmissionV2, DeviceProfile, FunnelRefusal, MemoryClaim, OwnerPolicy,
@@ -27,3 +28,4 @@ pub use admission::{
 pub use driver::{start_run, PumpHandle, RunEnd, RunIdentity, V2Error, V2Run, V2RunConfig};
 pub use event::{decode_event_frame, encode_event_frame, EventCodecError, EventV2, PayloadMeta};
 pub use journal::{JournalSink, MemorySink, SinkEntry, SinkError};
+pub use replay::{replay_v2, ReplayEnd, ReplayScript, ReplayedDecision, ReplayedRun};
