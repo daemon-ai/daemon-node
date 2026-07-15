@@ -140,6 +140,34 @@ fn staged_mint_pins_record_listed_order_verification_and_byte_identity() {
     );
 }
 
+// -- the host-staged repr (the bridge's payload form) -------------------------------------------------
+
+#[test]
+fn host_staged_mint_keeps_order_and_all_or_nothing_with_delegated_verification() {
+    use daemon_vhc_sdk_rounds::HostStaged;
+    let (a, b) = (peer(2), peer(1));
+    // Hashes are the RECORD's (host-verified at staging, ABI §4.3); the repr is a staging token.
+    let entries = vec![entry(a, b"pay-a"), entry(b, b"pay-b")];
+    let mut source: BTreeMap<(u64, PeerId), HostStaged> = BTreeMap::new();
+    source.insert((3, a), HostStaged(11));
+    source.insert((3, b), HostStaged(12));
+
+    let staged = Staged::mint(3, &entries, &mut source).expect("mint");
+    let order: Vec<(PeerId, u64)> = staged.items().iter().map(|i| (i.peer, i.bytes.0)).collect();
+    assert_eq!(
+        order,
+        vec![(a, 11), (b, 12)],
+        "record-listed order over tokens"
+    );
+
+    // All-or-nothing stands: a missing token refuses exactly like missing bytes.
+    source.remove(&(3, b));
+    assert_eq!(
+        Staged::mint(3, &entries, &mut source).unwrap_err(),
+        MintError::Missing { peer: b }
+    );
+}
+
 // -- the train-loop order ---------------------------------------------------------------------------
 
 #[test]

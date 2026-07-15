@@ -63,7 +63,7 @@ use daemon_vhc_abi::{
 };
 use daemon_vhc_proto::{peer_id, sign_canonical, to_canonical_vec, SigningKey};
 
-use crate::runtime::{EngineConfig, Worker};
+use crate::runtime::{EngineConfig, TabiHost, Worker};
 use crate::trap::{Trap, TrapCode};
 use crate::v2::event::{encode_event_frame, EventV2, PayloadMeta};
 use crate::v2::journal::{JournalSink, SinkError};
@@ -322,6 +322,77 @@ impl PumpHandle {
         Ok(staging_id)
     }
 
+    /// Stage a batch for the bridge (`read_back` kind 1, §2.5 rule 2): the tokens/shape encode as
+    /// canonical CBOR `[sequences, seq_len, tokens-le-bytes]`, announced with `meta.kind = 1`.
+    /// Identical batches may repeat, so no dedup applies (unlike kind-0 bytes).
+    pub fn stage_batch(
+        &self,
+        tokens: &[u32],
+        sequences: u32,
+        seq_len: u32,
+        channel: Option<u32>,
+    ) -> Result<u64, SinkError> {
+        let mut le = Vec::with_capacity(tokens.len() * 4);
+        for t in tokens {
+            le.extend_from_slice(&t.to_le_bytes());
+        }
+        let v = Value::Array(vec![
+            Value::from(sequences),
+            Value::from(seq_len),
+            Value::Bytes(le),
+        ]);
+        let bytes = to_canonical_vec(&v).map_err(|e| SinkError(format!("batch encode: {e}")))?;
+        self.stage_kinded(bytes, daemon_vhc_abi::STAGED_KIND_BATCH, channel)
+    }
+
+    /// Stage an update-container payload for the bridge (`read_back` kind 2, §2.5 rule 2): the
+    /// opaque committed payload wire bytes, announced with `meta.kind = 2`.
+    pub fn stage_update(&self, payload: Vec<u8>, channel: Option<u32>) -> Result<u64, SinkError> {
+        self.stage_kinded(
+            payload,
+            daemon_vhc_abi::STAGED_KIND_UPDATE_CONTAINER,
+            channel,
+        )
+    }
+
+    fn stage_kinded(
+        &self,
+        bytes: Vec<u8>,
+        staged_kind: u64,
+        channel: Option<u32>,
+    ) -> Result<u64, SinkError> {
+        let hash = *blake3::hash(&bytes).as_bytes();
+        let mut st = self.shared.state.lock().expect("pump lock");
+        if st.stop_enqueued {
+            return Err(SinkError("run is stopping; no further deliveries".into()));
+        }
+        let staging_id = st.next_host_staging_id;
+        st.next_host_staging_id += 1;
+        let size = bytes.len() as u64;
+        st.staged.insert(staging_id, (staged_kind, bytes));
+        let ev = EventV2::PayloadReady {
+            staging_id,
+            hash,
+            meta: PayloadMeta {
+                size,
+                kind: staged_kind,
+                channel,
+            },
+        };
+        let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
+        st.queue.push_back(QueuedEvent {
+            frame_bytes,
+            tag: daemon_vhc_abi::EV_TAG_PAYLOAD_READY,
+            signed: None,
+            payload_hash: None,
+            timer_id: None,
+            is_budget: false,
+        });
+        drop(st);
+        self.shared.wake.notify_all();
+        Ok(staging_id)
+    }
+
     /// Deliver a `Budget` notification (host-fixed depth 1, latest-wins — §4.3/§4.7).
     pub fn budget(
         &self,
@@ -455,6 +526,10 @@ struct SliceState {
     pending_next: Option<u64>,
     /// A pending mandatory `read_back` retry: `(src, kind, required)` (§6.4).
     pending_readback: Option<(u64, u32, u64)>,
+    /// The already-computed value behind a pending `read_back` retry: bridge kinds (1/2) mutate
+    /// the tabi state exactly once (register batch / stage container), so the retry re-delivers
+    /// the SAME value instead of re-registering (§6.4 "the staged value remains available").
+    pending_readback_value: Option<Vec<u8>>,
 }
 
 /// The wasmtime `Store` data for a v2 run instance.
@@ -624,6 +699,11 @@ fn build_signed_frame(
 /// How long a parked `next_event` waits between wake checks when no timer bounds the wait.
 const PARK_RECHECK: Duration = Duration::from_millis(50);
 
+/// The pump shared state behind a caller (borrow helper for the import bodies).
+fn shared_of(c: &Caller<'_, V2Host>) -> Arc<PumpShared> {
+    c.data().shared.clone()
+}
+
 #[allow(clippy::too_many_lines)]
 fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     // ---- vhc@2::next_event — THE blocking pull (§4.1) -------------------------------------------
@@ -760,33 +840,135 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         ));
                     }
                 }
-                if kind != READBACK_KIND_STAGED_BYTES {
-                    // Bridge kinds (1/2) arrive with the bridge; state-section (3) with migrate.
+                // kind → the staged-kind it consumes (ABI §6.4 table): 0 bytes, 1 batch (bridge),
+                // 2 update container (bridge). State-section (3) arrives with migrate.
+                let want_staged_kind = match kind {
+                    READBACK_KIND_STAGED_BYTES => daemon_vhc_abi::STAGED_KIND_BYTES,
+                    daemon_vhc_abi::READBACK_KIND_STAGED_BATCH => daemon_vhc_abi::STAGED_KIND_BATCH,
+                    daemon_vhc_abi::READBACK_KIND_STAGED_UPDATE => {
+                        daemon_vhc_abi::STAGED_KIND_UPDATE_CONTAINER
+                    }
+                    _ => {
+                        return Err(Trap::new(
+                            TrapCode::ReadBackUnavailable,
+                            "read_back",
+                            None,
+                            format!("kind {kind} stages nothing in this Phase-A driver"),
+                        ))
+                    }
+                };
+                // A pending retry re-delivers the already-computed value (no re-mutation, §6.4).
+                if let Some(v) = c.data().slice.pending_readback_value.clone() {
+                    let len = v.len() as u64;
+                    if len > u64::from(out_cap) {
+                        return Ok(pack_status_len(RET_STATUS_NEED_CAPACITY, len as u32));
+                    }
+                    {
+                        let d = c.data_mut();
+                        d.slice.readback_bytes += len;
+                        if d.slice.readback_bytes > d.max_readback_bytes {
+                            return Err(Trap::new(
+                                TrapCode::GrantViolation,
+                                "read_back",
+                                None,
+                                "per-slice readback-byte allowance exhausted (§5.5)",
+                            ));
+                        }
+                    }
+                    {
+                        let sh = shared_of(c);
+                        let mut st = sh.state.lock().expect("pump lock");
+                        st.sink
+                            .read_back(src, u64::from(kind), RET_STATUS_DELIVERED, &v)
+                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    }
+                    write_guest(c, out_ptr, &v)?;
+                    let d = c.data_mut();
+                    d.slice.pending_readback = None;
+                    d.slice.pending_readback_value = None;
+                    return Ok(pack_status_len(RET_STATUS_DELIVERED, len as u32));
+                }
+                if want_staged_kind != daemon_vhc_abi::STAGED_KIND_BYTES && c.data().tabi.is_none()
+                {
                     return Err(Trap::new(
                         TrapCode::ReadBackUnavailable,
                         "read_back",
                         None,
-                        format!("kind {kind} stages nothing in this Phase-A driver"),
+                        "bridge staging kinds need the tabi@1 bridge linked (§2.5)",
                     ));
                 }
                 let shared = c.data().shared.clone();
-                let value = {
+                let staged_bytes = {
                     let st = shared.state.lock().expect("pump lock");
                     match st.staged.get(&src) {
-                        Some((k, bytes)) if *k == STAGED_KIND_BYTES => bytes.clone(),
+                        Some((k, bytes)) if *k == want_staged_kind => bytes.clone(),
                         _ => {
                             return Err(Trap::new(
                                 TrapCode::ReadBackUnavailable,
                                 "read_back",
                                 None,
-                                format!("staging id {src} names nothing stageable"),
+                                format!("staging id {src} names nothing stageable as kind {kind}"),
                             ))
                         }
                     }
                 };
+                // Bridge kinds resolve to a tiny CBOR uint (§6.4): kind 1 registers the batch and
+                // yields its kind-7 handle; kind 2 stages the container and yields the upd index.
+                // The staged entry is CONSUMED (a re-read would double-register — deterministic
+                // refusal instead). Kind 0 delivers the bytes verbatim, re-readable.
+                let value = match kind {
+                    daemon_vhc_abi::READBACK_KIND_STAGED_BATCH => {
+                        let v: ciborium::value::Value =
+                            ciborium::de::from_reader(staged_bytes.as_slice()).map_err(|e| {
+                                Trap::bare(TrapCode::BadModule, format!("staged batch: {e}"))
+                            })?;
+                        let ciborium::value::Value::Array(items) = v else {
+                            return Err(Trap::bare(TrapCode::BadModule, "staged batch shape"));
+                        };
+                        let uint = |i: usize| -> u32 {
+                            items
+                                .get(i)
+                                .and_then(ciborium::value::Value::as_integer)
+                                .map(|n| u32::try_from(i128::from(n)).unwrap_or(0))
+                                .unwrap_or(0)
+                        };
+                        let (sequences, seq_len) = (uint(0), uint(1));
+                        let tokens: Vec<u32> = match items.get(2) {
+                            Some(ciborium::value::Value::Bytes(b)) => b
+                                .chunks_exact(4)
+                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect(),
+                            _ => return Err(Trap::bare(TrapCode::BadModule, "staged tokens")),
+                        };
+                        let handle = c
+                            .data_mut()
+                            .tabi()
+                            .stage_bridge_batch(tokens, sequences, seq_len);
+                        let mut out = Vec::new();
+                        ciborium::into_writer(&ciborium::value::Value::from(handle), &mut out)
+                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                        shared.state.lock().expect("pump lock").staged.remove(&src);
+                        out
+                    }
+                    daemon_vhc_abi::READBACK_KIND_STAGED_UPDATE => {
+                        let idx = c
+                            .data_mut()
+                            .tabi()
+                            .stage_bridge_update(&staged_bytes)
+                            .map_err(|e| Trap::bare(TrapCode::BadModule, e))?;
+                        let mut out = Vec::new();
+                        ciborium::into_writer(&ciborium::value::Value::from(idx), &mut out)
+                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                        shared.state.lock().expect("pump lock").staged.remove(&src);
+                        out
+                    }
+                    _ => staged_bytes,
+                };
                 let len = value.len() as u64;
                 if len > u64::from(out_cap) {
-                    c.data_mut().slice.pending_readback = Some((src, kind, len));
+                    let d = c.data_mut();
+                    d.slice.pending_readback = Some((src, kind, len));
+                    d.slice.pending_readback_value = Some(value);
                     return Ok(pack_status_len(RET_STATUS_NEED_CAPACITY, len as u32));
                 }
                 // Charge the per-slice readback-byte budget (§5.5) before the bytes cross.
@@ -810,7 +992,9 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
                 }
                 write_guest(c, out_ptr, &value)?;
-                c.data_mut().slice.pending_readback = None;
+                let d = c.data_mut();
+                d.slice.pending_readback = None;
+                d.slice.pending_readback_value = None;
                 Ok(pack_status_len(RET_STATUS_DELIVERED, len as u32))
             })(&mut c);
             stash(&mut c, r)
@@ -1226,6 +1410,7 @@ pub fn start_run(
                     readback_bytes: 0,
                     pending_next: None,
                     pending_readback: None,
+                    pending_readback_value: None,
                 },
                 fuel_per_slice: engine_cfg.fuel_per_call,
                 op_budget: engine_cfg.op_budget,
@@ -1523,6 +1708,7 @@ mod tests {
                 readback_bytes: 0,
                 pending_next: None,
                 pending_readback: None,
+                pending_readback_value: None,
             },
             fuel_per_slice: 0,
             op_budget: 0,

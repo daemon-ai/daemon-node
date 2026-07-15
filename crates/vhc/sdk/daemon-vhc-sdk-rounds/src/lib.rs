@@ -68,7 +68,7 @@ pub struct StepCtx {
 /// `RoundExperiment`"): the four math points the barrier choreography calls. How the math happens
 /// is the implementor's business — a guest drives the `tabi@1` bridge / `compute@2`; a native
 /// test counts calls; Phase C authors write ordinary Burn.
-pub trait RoundExperiment {
+pub trait RoundExperiment<P = Vec<u8>> {
     /// One inner training step over one assigned micro-window.
     fn train_step(&mut self, ctx: &StepCtx);
     /// The inner-optimizer application after an inner step's micro-batches.
@@ -76,19 +76,61 @@ pub trait RoundExperiment {
     /// Seal this round's outer update as opaque payload bytes.
     fn make_update(&mut self, round: RoundId) -> Vec<u8>;
     /// The barrier ingest of the verified, record-ordered committed set → the det-lane digest.
-    fn ingest(&mut self, round: RoundId, staged: &Staged) -> [u8; 16];
+    fn ingest(&mut self, round: RoundId, staged: &Staged<P>) -> [u8; 16];
 }
 
-/// Where committed payload bytes come from at the barrier. Sans-io: `None` = not (yet) fetchable
-/// (→ the stall ladder), never an await. Guests answer from staged `read_back`s; the session
-/// answers from its verified cache; tests answer from a map.
-pub trait PayloadSource {
-    /// The payload bytes committed by `peer` for `round`, if fetchable now.
-    fn payload(&mut self, round: RoundId, peer: &PeerId) -> Option<Vec<u8>>;
+/// How a payload representation proves itself against the record-listed hash at mint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadCheck {
+    /// The repr carries the bytes and they hash to the listed value.
+    Verified,
+    /// The repr carries the bytes and they DO NOT hash to the listed value (tamper — refuse).
+    Mismatch,
+    /// The repr is a host staging token: the host hash-verified the content before announcing it
+    /// (`PayloadReady` is delivered only after blake3 verification, ABI §4.3), so the in-guest
+    /// check is delegated — the oracle semantics (record-listed order, all-or-nothing) still hold.
+    HostVerified,
 }
 
-impl PayloadSource for BTreeMap<(RoundId, PeerId), Vec<u8>> {
-    fn payload(&mut self, round: RoundId, peer: &PeerId) -> Option<Vec<u8>> {
+/// A committed payload's representation at the barrier: in-guest bytes (native tests, the
+/// session's verified cache) or a host staging token (the bridge's `read_back` kinds — guest
+/// payloads never enter linear memory wholesale, architecture §3.4).
+pub trait PayloadRepr: Clone + PartialEq {
+    /// Check this repr against the record-listed blake3.
+    fn check(&self, expected: &Hash) -> PayloadCheck;
+}
+
+impl PayloadRepr for Vec<u8> {
+    fn check(&self, expected: &Hash) -> PayloadCheck {
+        if blake3_hash(self) == *expected {
+            PayloadCheck::Verified
+        } else {
+            PayloadCheck::Mismatch
+        }
+    }
+}
+
+/// A host-staged payload token: the staging id / `upd_*` index `read_back` yielded. The host
+/// verified the content hash before announcing it (ABI §4.3), so the mint delegates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostStaged(pub u64);
+
+impl PayloadRepr for HostStaged {
+    fn check(&self, _expected: &Hash) -> PayloadCheck {
+        PayloadCheck::HostVerified
+    }
+}
+
+/// Where committed payloads come from at the barrier. Sans-io: `None` = not (yet) fetchable
+/// (→ the stall ladder), never an await. Guests answer with staged tokens; the session answers
+/// from its verified cache; tests answer from a map.
+pub trait PayloadSource<P = Vec<u8>> {
+    /// The payload committed by `peer` for `round`, if fetchable now.
+    fn payload(&mut self, round: RoundId, peer: &PeerId) -> Option<P>;
+}
+
+impl<P: Clone> PayloadSource<P> for BTreeMap<(RoundId, PeerId), P> {
+    fn payload(&mut self, round: RoundId, peer: &PeerId) -> Option<P> {
         self.get(&(round, *peer)).cloned()
     }
 }
@@ -98,19 +140,19 @@ impl PayloadSource for BTreeMap<(RoundId, PeerId), Vec<u8>> {
 /// re-type it as `Committed<T>` with byte-identical behavior. Constructible only through
 /// [`Staged::mint`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Staged {
-    items: Vec<StagedItem>,
+pub struct Staged<P = Vec<u8>> {
+    items: Vec<StagedItem<P>>,
 }
 
 /// One verified committed payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedItem {
+pub struct StagedItem<P = Vec<u8>> {
     /// The contributing peer.
     pub peer: PeerId,
     /// The record-listed blake3 (verified against `bytes` at mint).
     pub hash: Hash,
-    /// The payload bytes.
-    pub bytes: Vec<u8>,
+    /// The payload representation (bytes, or a host staging token).
+    pub bytes: P,
 }
 
 /// Why a [`Staged::mint`] refused.
@@ -128,7 +170,7 @@ pub enum MintError {
     },
 }
 
-impl Staged {
+impl<P: PayloadRepr> Staged<P> {
     /// Mint the staged set from a record's listed entries: **record-listed order** (I3 — never
     /// arrival or map order), every item's bytes **blake3-verified** against its listed hash. A
     /// missing payload refuses with [`MintError::Missing`] (the stall ladder's input); a mismatch
@@ -139,14 +181,14 @@ impl Staged {
     pub fn mint(
         round: RoundId,
         entries: &[RecordEntry],
-        source: &mut impl PayloadSource,
+        source: &mut impl PayloadSource<P>,
     ) -> Result<Self, MintError> {
         let mut items = Vec::with_capacity(entries.len());
         for entry in entries {
             let Some(bytes) = source.payload(round, &entry.peer) else {
                 return Err(MintError::Missing { peer: entry.peer });
             };
-            if blake3_hash(&bytes) != entry.hash {
+            if bytes.check(&entry.hash) == PayloadCheck::Mismatch {
                 return Err(MintError::HashMismatch { peer: entry.peer });
             }
             items.push(StagedItem {
@@ -160,7 +202,7 @@ impl Staged {
 
     /// The verified items, in record-listed order.
     #[must_use]
-    pub fn items(&self) -> &[StagedItem] {
+    pub fn items(&self) -> &[StagedItem<P>] {
         &self.items
     }
 }
@@ -221,7 +263,7 @@ pub enum Outbound {
 }
 
 /// The barrier-mode round driver: the engine's round logic as a reusable, sans-io library core.
-pub struct BarrierRound<E> {
+pub struct BarrierRound<E, P = Vec<u8>> {
     experiment: E,
     cfg: RoundCfg,
     /// Records not yet ingested, ascending round order (the barrier queue).
@@ -232,9 +274,10 @@ pub struct BarrierRound<E> {
     stalled_rounds: u32,
     /// Resync watermark: rounds at/below never re-ingest (a double outer-step would diverge).
     last_ingested: Option<RoundId>,
+    _payload: std::marker::PhantomData<P>,
 }
 
-impl<E: RoundExperiment> BarrierRound<E> {
+impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
     /// Wrap an experiment with the barrier choreography.
     pub fn new(experiment: E, cfg: RoundCfg) -> Self {
         Self {
@@ -244,6 +287,7 @@ impl<E: RoundExperiment> BarrierRound<E> {
             straggling: false,
             stalled_rounds: 0,
             last_ingested: None,
+            _payload: std::marker::PhantomData,
         }
     }
 
@@ -258,7 +302,7 @@ impl<E: RoundExperiment> BarrierRound<E> {
     pub fn on_round_open(
         &mut self,
         ro: &RoundOpen,
-        source: &mut impl PayloadSource,
+        source: &mut impl PayloadSource<P>,
     ) -> Vec<Outbound> {
         let mut out = Vec::new();
         self.advance(None, source, &mut out);
@@ -319,7 +363,7 @@ impl<E: RoundExperiment> BarrierRound<E> {
         &mut self,
         rr: &RoundRecord,
         entries: Vec<RecordEntry>,
-        source: &mut impl PayloadSource,
+        source: &mut impl PayloadSource<P>,
     ) -> Vec<Outbound> {
         let mut out = Vec::new();
         if let Some(last) = self.last_ingested {
@@ -345,7 +389,7 @@ impl<E: RoundExperiment> BarrierRound<E> {
     fn advance(
         &mut self,
         trigger: Option<RoundId>,
-        source: &mut impl PayloadSource,
+        source: &mut impl PayloadSource<P>,
         out: &mut Vec<Outbound>,
     ) {
         while let Some(round) = self.pending.keys().next().copied() {

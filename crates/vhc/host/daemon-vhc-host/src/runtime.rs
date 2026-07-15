@@ -1311,6 +1311,34 @@ impl HostState {
             self.backend.free(t);
         }
     }
+
+    /// Bridge staging, `read_back` kind 1 (ABI §2.5 rule 2 / §6.4): register a host-staged batch —
+    /// the v1 `Instance::register_batch` body, on the state — yielding the kind-7 batch handle
+    /// (instance-class: survives slices until restart, §7.1).
+    pub(crate) fn stage_bridge_batch(&mut self, tokens: Vec<u32>, batch: u32, seq: u32) -> u64 {
+        self.batches.push(BatchData { tokens, batch, seq });
+        handle::batch_handle(self.batches.len() as u32)
+    }
+
+    /// Bridge staging, `read_back` kind 2 (ABI §2.5 rule 2 / §6.4): decode + stage one update
+    /// container — the per-payload half of the v1 `Instance::ingest_payloads` — yielding the
+    /// staging index the `upd_*@1` vocabulary consumes. Containers accumulate for the instance's
+    /// life (instance-class, §7.1); consumers use the RETURNED index, never a 0-based recount.
+    pub(crate) fn stage_bridge_update(&mut self, payload: &[u8]) -> Result<u32, String> {
+        let wire: Vec<SectionWire> =
+            ciborium::from_reader(payload).map_err(|e| format!("payload decode: {e}"))?;
+        let sections = wire
+            .into_iter()
+            .map(|s| match s {
+                SectionWire::Bytes(b) => Section::Bytes(b),
+                SectionWire::Tensor { data, shape } => Section::Tensor { data, shape },
+            })
+            .collect();
+        self.containers.push(Container { sections });
+        let idx = self.containers.len() - 1;
+        self.staged.push(idx);
+        Ok((self.staged.len() - 1) as u32)
+    }
 }
 
 // -- memory helpers (host-function side) --------------------------------------------------------

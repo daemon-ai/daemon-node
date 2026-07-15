@@ -16,6 +16,8 @@ use std::alloc::{alloc, dealloc, Layout};
 extern "C" {
     #[link_name = "next_event"]
     fn abi_next_event(buf_ptr: u32, buf_cap: u32) -> u64;
+    #[link_name = "read_back"]
+    fn abi_read_back(src: u64, kind: u32, out_ptr: u32, out_cap: u32) -> u64;
 }
 
 #[link(wasm_import_module = "net@2")]
@@ -40,6 +42,23 @@ extern "C" {
     fn tabi_add(a: u64, b: u64) -> u64;
     #[link_name = "scalar@1"]
     fn tabi_scalar(x: u64) -> f64;
+    #[link_name = "batch_size@1"]
+    fn tabi_batch_size(b: u64) -> u32;
+    #[link_name = "upd_sections@1"]
+    fn tabi_upd_sections(i: u32) -> u32;
+}
+
+/// `read_back` a staged item as a CBOR uint (bridge kinds 1/2 — the handle / staging index).
+fn read_back_uint(src: u64, kind: u32) -> u64 {
+    let mut buf = [0u8; 16];
+    // SAFETY: `buf` is a live guest span for the call's duration.
+    let packed = unsafe { abi_read_back(src, kind, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    let (status, len) = (packed >> 32, (packed & 0xffff_ffff) as usize);
+    assert!(status == 0 && len <= buf.len(), "tiny CBOR uint fits");
+    let v: ciborium::value::Value = ciborium::from_reader(&buf[..len]).expect("uint cbor");
+    v.as_integer()
+        .map(|i| u64::try_from(i128::from(i)).unwrap_or(u64::MAX))
+        .expect("uint")
 }
 
 // ---- allocator + CBOR-return glue (ABI §2.4/§2.1, same as the sibling raw-ABI guests) ------------
@@ -160,10 +179,12 @@ pub unsafe extern "C" fn da_init(cfg_ptr: u32, cfg_len: u32, _g: u32, _gl: u32) 
     0
 }
 
+const EV_PAYLOAD_READY: u64 = 1;
 const EV_TIMER: u64 = 2;
 const EV_STOP: u64 = 4;
 
-fn pull_tag(buf: &mut Vec<u8>) -> u64 {
+/// Pull one event; returns `(tag, staging_id-if-PayloadReady)`.
+fn pull_tag2(buf: &mut Vec<u8>) -> (u64, u64) {
     loop {
         // SAFETY: the span is buf's live allocation.
         let packed = unsafe { abi_next_event(buf.as_mut_ptr() as u32, buf.capacity() as u32) };
@@ -177,11 +198,14 @@ fn pull_tag(buf: &mut Vec<u8>) -> u64 {
                 let ciborium::value::Value::Array(items) = v else {
                     unreachable!()
                 };
-                return items
-                    .first()
-                    .and_then(|t| t.as_integer())
-                    .map(|i| u64::try_from(i128::from(i)).unwrap_or(u64::MAX))
-                    .expect("tag");
+                let uint = |i: usize| {
+                    items
+                        .get(i)
+                        .and_then(|t| t.as_integer())
+                        .map(|n| u64::try_from(i128::from(n)).unwrap_or(u64::MAX))
+                        .unwrap_or(u64::MAX)
+                };
+                return (uint(0), uint(1));
             }
             1 => buf.reserve(len.saturating_sub(buf.capacity())),
             _ => unreachable!(),
@@ -200,9 +224,32 @@ pub extern "C" fn da_run() -> u32 {
     let mut stale_probe: u64 = 0;
     let mut slices = 0u32;
     loop {
-        let tag = pull_tag(&mut buf);
+        let (tag, staging_id) = pull_tag2(&mut buf);
         if tag == EV_STOP {
             return 0;
+        }
+        // Staging modes (§2.5 rule 2): consume a host-staged batch (3) / update container (4)
+        // through read_back kinds 1/2 and publish the bridge readout as the proof.
+        if tag == EV_PAYLOAD_READY {
+            // SAFETY: plain-value imports over guest-owned spans.
+            unsafe {
+                match mode {
+                    3 => {
+                        let handle = read_back_uint(staging_id, 1);
+                        let n = tabi_batch_size(handle);
+                        let p = n.to_le_bytes();
+                        abi_publish(0, p.as_ptr() as u32, p.len() as u32);
+                    }
+                    4 => {
+                        let idx = read_back_uint(staging_id, 2);
+                        let n = tabi_upd_sections(idx as u32);
+                        let p = n.to_le_bytes();
+                        abi_publish(0, p.as_ptr() as u32, p.len() as u32);
+                    }
+                    _ => {}
+                }
+            }
+            continue;
         }
         if tag != EV_TIMER {
             continue;

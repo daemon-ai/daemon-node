@@ -136,6 +136,121 @@ fn bridge_ops_run_in_slices_and_the_scalar_readout_is_journaled() {
     );
 }
 
+/// The §2.5 staged-batch path end to end: envelope-side tokens → `PumpHandle::stage_batch`
+/// (host-verified announce, `meta.kind = 1`) → guest `read_back` kind 1 → a live kind-7 batch
+/// handle whose `batch_size@1` readout (an nr import, journaled kind 130) round-trips.
+#[test]
+fn staged_batch_flows_through_read_back_kind_1() {
+    let wasm = bridge_wasm();
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    let identity = RunIdentity {
+        run_id: [0xEE; 32],
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance: 4,
+        module: *blake3::hash(&wasm).as_bytes(),
+    };
+    let run_cfg = V2RunConfig::new(identity, [0x72; 32], vec![3u8], Vec::new());
+    let sink = Arc::new(Mutex::new(MemorySink::new()));
+    let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
+    let pump = run.pump.clone();
+
+    // Two sequences of three tokens each.
+    pump.stage_batch(&[1, 2, 3, 4, 5, 6], 2, 3, None)
+        .expect("stage");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while pump.published().is_empty() {
+        assert!(Instant::now() < deadline, "timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
+        .expect("stop");
+    assert!(matches!(run.wait().expect("join"), RunEnd::Outcome(0)));
+
+    // The guest read batch_size@1 = 2 off the staged batch and published it.
+    let frame: ciborium::value::Value =
+        ciborium::de::from_reader(pump.published()[0].2.as_slice()).expect("frame");
+    let ciborium::value::Value::Array(parts) = frame else {
+        panic!("shape")
+    };
+    let ciborium::value::Value::Bytes(payload) = &parts[1] else {
+        panic!("payload")
+    };
+    assert_eq!(
+        u32::from_le_bytes(payload.as_slice().try_into().unwrap()),
+        2
+    );
+
+    // Journal: the kind-1 readback Ok (the CBOR handle) + the kind-130 nr readout.
+    let entries = &sink.lock().expect("sink").entries;
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, SinkEntry::ReadBack { kind: 1, .. })));
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, SinkEntry::ReadBack { kind: 130, value, .. }
+            if u32::from_le_bytes(value.as_slice().try_into().unwrap()) == 2)));
+}
+
+/// The §2.5 staged-update path end to end: committed payload wire bytes →
+/// `PumpHandle::stage_update` (`meta.kind = 2`) → guest `read_back` kind 2 → the `upd_*@1`
+/// staging index, with `upd_sections@1` (nr, journaled kind 132) counting the sections.
+#[test]
+fn staged_update_flows_through_read_back_kind_2() {
+    let wasm = bridge_wasm();
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    let identity = RunIdentity {
+        run_id: [0xEF; 32],
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance: 5,
+        module: *blake3::hash(&wasm).as_bytes(),
+    };
+    let run_cfg = V2RunConfig::new(identity, [0x73; 32], vec![4u8], Vec::new());
+    let sink = Arc::new(Mutex::new(MemorySink::new()));
+    let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
+    let pump = run.pump.clone();
+
+    // A one-section container in the v1 SectionWire wire form (externally-tagged serde enum).
+    let wire = ciborium::value::Value::Array(vec![ciborium::value::Value::Map(vec![(
+        ciborium::value::Value::Text("Bytes".into()),
+        ciborium::value::Value::Bytes(vec![0xAB; 16]),
+    )])]);
+    let mut payload = Vec::new();
+    ciborium::into_writer(&wire, &mut payload).expect("wire");
+    pump.stage_update(payload, None).expect("stage");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while pump.published().is_empty() {
+        assert!(Instant::now() < deadline, "timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
+        .expect("stop");
+    assert!(matches!(run.wait().expect("join"), RunEnd::Outcome(0)));
+
+    let frame: ciborium::value::Value =
+        ciborium::de::from_reader(pump.published()[0].2.as_slice()).expect("frame");
+    let ciborium::value::Value::Array(parts) = frame else {
+        panic!("shape")
+    };
+    let ciborium::value::Value::Bytes(payload) = &parts[1] else {
+        panic!("payload")
+    };
+    assert_eq!(
+        u32::from_le_bytes(payload.as_slice().try_into().unwrap()),
+        1,
+        "one staged section counted through upd_sections@1"
+    );
+    let entries = &sink.lock().expect("sink").entries;
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, SinkEntry::ReadBack { kind: 2, .. })));
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, SinkEntry::ReadBack { kind: 132, .. })));
+}
+
 #[test]
 fn registration_inside_a_slice_traps_phase_violation() {
     let (end, _sink, _published) = run_mode(1, 2);
