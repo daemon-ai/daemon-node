@@ -128,6 +128,67 @@ pub fn v2_namespace_symbols(ns: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+// -- the v2 symbol registry: every symbol's introducing minor (ABI §1.3 step 3, §1.4) ------------
+//
+// "A0: `daemon-vhc-abi` gains the v2 constants AND the symbol registry §1.3 step 3 consults to map
+// each static import to its introducing minor" (decisions D2). The registry is how additive minor
+// growth stays checkable: a host admits a symbol iff its introducing minor ≤ the host's implemented
+// minor for that namespace's major, and a module's DECLARED minor must be ≥ the highest introducing
+// minor among its imports (a declared minor below what the imports require is
+// `AbiDeclarationMismatch`, ABI §1.3 step 5). Minor-1 entries are track B1's Phase-B surface:
+// buffers (§3.4/§7.4), the async completion protocol (§3.3/§7.5), and net payload put/get.
+
+/// Every `(namespace, symbol, introducing minor)` of the major-2 import surface. Growth is
+/// append-only; a symbol's introducing minor is permanent.
+pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
+    // -- minor 0 (Phase A) --
+    (NS_VHC_V2, "next_event", 0),
+    (NS_VHC_V2, "read_back", 0),
+    (NS_VHC_V2, "stage_state", 0),
+    (NS_VHC_V2, "snapshot_state", 0),
+    (NS_NET_V2, "publish", 0),
+    (NS_SYS_V2, "set_timer", 0),
+    (NS_SYS_V2, "cancel_timer", 0),
+    (NS_SYS_V2, "now", 0),
+    (NS_SYS_V2, "emit_metric", 0),
+    (NS_SYS_V2, "log", 0),
+    // -- minor 1 (Phase B, track B1): buffers + the async completion protocol ------------------
+    // The two budgeted linear-memory paths (§3.4): OUT of linear memory (sealed at creation) and
+    // INTO it (charged against the per-slice readback allowance).
+    (NS_VHC_V2, "create_from", 1),
+    (NS_VHC_V2, "read_into", 1),
+    // Deterministic buffer bookkeeping: length + explicit guest release (§3.4 ownership).
+    (NS_VHC_V2, "buffer_len", 1),
+    (NS_VHC_V2, "buffer_release", 1),
+    // The completion protocol's cancellation import (§3.3/§7.5): the op completes `Cancelled`.
+    (NS_VHC_V2, "cancel", 1),
+    // Content-addressed payload plane by handle (§3.4): both complete via `Event::Completion`.
+    (NS_NET_V2, "payload_put", 1),
+    (NS_NET_V2, "payload_get", 1),
+];
+
+/// The minor at which `(namespace, symbol)` was introduced, or `None` if it is not a registered
+/// v2 symbol (ABI §1.3 step 3).
+#[must_use]
+pub fn v2_symbol_minor(namespace: &str, symbol: &str) -> Option<u32> {
+    V2_SYMBOL_REGISTRY
+        .iter()
+        .find(|(ns, sym, _)| *ns == namespace && *sym == symbol)
+        .map(|(_, _, minor)| *minor)
+}
+
+/// The minimum major-2 minor a module's static v2 imports require: the highest introducing minor
+/// among them (0 when none are v2 symbols). A module MUST declare at least this minor — declaring
+/// below what the imports require is `AbiDeclarationMismatch` (ABI §1.3 step 5).
+#[must_use]
+pub fn required_v2_minor(imports: &[(&str, &str)]) -> u32 {
+    imports
+        .iter()
+        .filter_map(|(ns, sym)| v2_symbol_minor(ns, sym))
+        .max()
+        .unwrap_or(0)
+}
+
 /// The candidate driver selected from a module's *static import shape* (ABI §1.3 step 2). This is
 /// the input the host acts on before it can call `da_abi` (which requires an already-linked,
 /// instantiated module); `da_abi` is then the declaration cross-checked against this (ABI §1.1).
@@ -289,19 +350,24 @@ pub fn select_candidate(
 ///
 /// - `tabi@1` symbols MUST be in the frozen [`TABI_IMPORTS`] vocabulary, else
 ///   [`AbiRefusalCode::WorldMinorUnsupported`] (a `tabi@1` symbol the host lacks);
-/// - `vhc@2`/`net@2`/`sys@2`/`data@2`/`compute@2` symbols MUST be in that namespace's Phase-A
-///   vocabulary ([`v2_namespace_symbols`]), else [`AbiRefusalCode::WorldMinorUnsupported`];
+/// - `vhc@2`/`net@2`/`sys@2`/`data@2`/`compute@2` symbols MUST be in the
+///   [`V2_SYMBOL_REGISTRY`] **at an introducing minor ≤ the host's implemented major-2 minor**,
+///   else [`AbiRefusalCode::WorldMinorUnsupported`] (an unregistered symbol and a
+///   registered-but-too-new symbol are the same refusal: this host cannot serve the import);
 /// - any wholly unknown namespace ⇒ [`AbiRefusalCode::BadModule`].
 ///
 /// This subsumes "missing import for a known namespace" (ABI §1.3 step 3). The `tabi@1`-under-major-2
 /// bridge is accepted here (the bridge is advertised through Phase C, ABI §2.5); a bridge-retired
-/// host is a Phase-C concern ([`AbiRefusalCode::BridgeRetired`]).
+/// host is a Phase-C concern ([`AbiRefusalCode::BridgeRetired`]). The complementary declaration-side
+/// rule — a declared minor below [`required_v2_minor`] — is the selector's step-5 cross-check
+/// (`AbiDeclarationMismatch`), not this function's.
 ///
 /// # Errors
 ///
-/// [`AbiRefusalCode::WorldMinorUnsupported`] for an unknown symbol in a known namespace;
+/// [`AbiRefusalCode::WorldMinorUnsupported`] for an unknown/too-new symbol in a known namespace;
 /// [`AbiRefusalCode::BadModule`] for an unknown namespace.
 pub fn validate_imports(imports: &[(&str, &str)]) -> Result<(), AbiRefusal> {
+    let host_v2_minor = host_minor_for(DA_ABI_MAJOR_V2).unwrap_or(0);
     for (namespace, symbol) in imports {
         if *namespace == NS_TABI_V1 {
             if !TABI_IMPORTS.contains(symbol) {
@@ -310,14 +376,27 @@ pub fn validate_imports(imports: &[(&str, &str)]) -> Result<(), AbiRefusal> {
                     format!("tabi@1 symbol `{symbol}` is not in the frozen host vocabulary"),
                 ));
             }
-        } else if let Some(vocab) = v2_namespace_symbols(namespace) {
-            if !vocab.contains(symbol) {
-                return Err(AbiRefusal::new(
-                    AbiRefusalCode::WorldMinorUnsupported,
-                    format!(
-                        "namespace `{namespace}` symbol `{symbol}` is beyond the host's Phase-A minor"
-                    ),
-                ));
+        } else if v2_namespace_symbols(namespace).is_some() {
+            match v2_symbol_minor(namespace, symbol) {
+                Some(introduced) if introduced <= host_v2_minor => {}
+                Some(introduced) => {
+                    return Err(AbiRefusal::new(
+                        AbiRefusalCode::WorldMinorUnsupported,
+                        format!(
+                            "namespace `{namespace}` symbol `{symbol}` was introduced at minor \
+                             {introduced}, beyond this host's implemented minor {host_v2_minor}"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(AbiRefusal::new(
+                        AbiRefusalCode::WorldMinorUnsupported,
+                        format!(
+                            "namespace `{namespace}` symbol `{symbol}` is not in the v2 symbol \
+                             registry"
+                        ),
+                    ));
+                }
             }
         } else {
             return Err(AbiRefusal::new(
@@ -1238,6 +1317,79 @@ mod tests {
         assert_eq!(slugs.len(), n, "comp-error slugs must be unique");
         assert_eq!(comp_err_slug(COMP_ERR_RESERVED_MIN), None);
         assert_eq!(comp_err_slug(u64::MAX), None);
+    }
+
+    #[test]
+    fn v2_symbol_registry_is_consistent_and_derives_required_minor() {
+        // Registry entries are unique per (ns, symbol) and the introducing minor is permanent.
+        let mut keys: Vec<(&str, &str)> = V2_SYMBOL_REGISTRY
+            .iter()
+            .map(|(ns, sym, _)| (*ns, *sym))
+            .collect();
+        let n = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), n, "registry entries must be unique");
+        // The minor-0 slice of the registry is exactly the Phase-A vocabulary consts.
+        for (ns, vocab) in [
+            (NS_VHC_V2, VHC_V2_SYMBOLS),
+            (NS_NET_V2, NET_V2_SYMBOLS),
+            (NS_SYS_V2, SYS_V2_SYMBOLS),
+        ] {
+            let minor0: Vec<&str> = V2_SYMBOL_REGISTRY
+                .iter()
+                .filter(|(rns, _, m)| *rns == ns && *m == 0)
+                .map(|(_, sym, _)| *sym)
+                .collect();
+            assert_eq!(minor0, vocab.to_vec(), "minor-0 registry slice for {ns}");
+        }
+        // Required-minor derivation (ABI §1.3 step 5): the max introducing minor of the imports.
+        assert_eq!(
+            required_v2_minor(&[("vhc@2", "next_event"), ("net@2", "publish")]),
+            0
+        );
+        assert_eq!(
+            required_v2_minor(&[("vhc@2", "next_event"), ("net@2", "payload_put")]),
+            1,
+            "a minor-1 import raises the required minor"
+        );
+        assert_eq!(
+            required_v2_minor(&[("tabi@1", "add@1")]),
+            0,
+            "bridge imports are not v2"
+        );
+        // The B1 minor-1 surface is registered.
+        for sym in [
+            "create_from",
+            "read_into",
+            "buffer_len",
+            "buffer_release",
+            "cancel",
+        ] {
+            assert_eq!(v2_symbol_minor(NS_VHC_V2, sym), Some(1), "vhc@2::{sym}");
+        }
+        for sym in ["payload_put", "payload_get"] {
+            assert_eq!(v2_symbol_minor(NS_NET_V2, sym), Some(1), "net@2::{sym}");
+        }
+        assert_eq!(v2_symbol_minor(NS_VHC_V2, "bogus"), None);
+    }
+
+    #[test]
+    fn validate_imports_gates_minor1_symbols_on_the_host_minor() {
+        // A minor-1 symbol is admitted iff the host's implemented major-2 minor is >= 1; below
+        // that it is a typed WorldMinorUnsupported naming the introducing minor (ABI §1.3 step 3).
+        let r = validate_imports(&[("net@2", "payload_put")]);
+        if host_minor_for(DA_ABI_MAJOR_V2).unwrap_or(0) >= 1 {
+            r.unwrap();
+        } else {
+            let err = r.unwrap_err();
+            assert_eq!(err.code, AbiRefusalCode::WorldMinorUnsupported);
+            assert!(
+                err.detail.contains("introduced at minor 1"),
+                "{}",
+                err.detail
+            );
+        }
     }
 
     #[test]
