@@ -403,6 +403,16 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             ],
         ),
         (
+            // The v2 input-replay step (refactor §5 A1→A2 acceptance; §12.6 journal soak for
+            // v2): recorded runs (toy averager: timers/clock; bridge guest: nr readouts +
+            // staged kinds 1/2) re-driven from the journal alone through the §8.7 verifier
+            // (observe contract over the host replay engine) — every decision bit-for-bit;
+            // tampered/incomplete journals are typed divergences. The TinyLlama acceptance run
+            // replays inside the parity lane above.
+            "A2 v2 input-replay: journal-only re-drive ≡ recorded decisions (§8.7)",
+            &["-p", "daemon-vhc-host", "--test", "v2_replay"],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),
