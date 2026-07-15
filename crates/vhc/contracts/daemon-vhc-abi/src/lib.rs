@@ -698,6 +698,180 @@ pub const DA_MIGRATE_INCOMPATIBLE: u32 = 1;
 /// collide and guest IDs need no journal record (counter-derived, replay-reproducible).
 pub const GUEST_STAGING_ID_TOP_BIT: u64 = 1 << 63;
 
+// ================================================================================================
+// Resource handles: the bit layout, the kinds, and the three resource classes (ABI §7.1/§7.2).
+//
+// A handle is an opaque nonzero `u64` naming a host-side resource; `0` is never a live handle. The
+// v1 bit layout (`daemon-vhc-host::handle`) is retained verbatim and lifted here so every side of
+// the boundary — the host arena, the guest SDK, the journal/replay verifier — packs and inspects
+// handles against one source of truth. Kinds 1–7 are the frozen `tabi@1` bridge resources; kinds
+// 8/9/10 (BufferHandle / StreamHandle / OpId) are Phase B (this track) — reserved-numbered here so
+// the buffer + completion layers land without renumbering. Growth is additive (kinds 11–255
+// reserved); a kind's class is permanent.
+// ================================================================================================
+
+/// The bit position of the 8-bit `kind` field in a handle (ABI §7.2).
+pub const HANDLE_KIND_SHIFT: u32 = 56;
+/// The bit position of the 24-bit `generation` field in a handle (ABI §7.2).
+pub const HANDLE_GENERATION_SHIFT: u32 = 32;
+/// The 24-bit mask applied to a handle's `generation` field (ABI §7.2).
+pub const HANDLE_GENERATION_MASK: u64 = 0x00FF_FFFF;
+/// The largest representable handle generation (24 bits). A slot whose generation would wrap past
+/// this MUST be **permanently retired** (never returned to the free list), making ABA reuse of a
+/// `(kind, generation, index)` triple impossible within an instance (ABI §7.1).
+pub const HANDLE_MAX_GENERATION: u32 = 0x00FF_FFFF;
+/// The 32-bit mask applied to a handle's `index` field (1-based, ABI §7.2).
+pub const HANDLE_INDEX_MASK: u64 = 0xFFFF_FFFF;
+
+/// Handle kind 1: a native step tensor — bridge, slice-class (ABI §7.2).
+pub const HANDLE_KIND_STEP_TENSOR_NATIVE: u8 = 1;
+/// Handle kind 2: a det step tensor — bridge, slice-class (ABI §7.2).
+pub const HANDLE_KIND_STEP_TENSOR_DET: u8 = 2;
+/// Handle kind 3: a param — bridge, registered-class (ABI §7.2).
+pub const HANDLE_KIND_PARAM: u8 = 3;
+/// Handle kind 4: a persistent — bridge, registered-class (ABI §7.2).
+pub const HANDLE_KIND_PERSISTENT: u8 = 4;
+/// Handle kind 5: a det persistent — bridge, registered-class (ABI §7.2).
+pub const HANDLE_KIND_DET_PERSISTENT: u8 = 5;
+/// Handle kind 6: an update container — bridge, instance-class (ABI §7.2).
+pub const HANDLE_KIND_UPDATE_CONTAINER: u8 = 6;
+/// Handle kind 7: a batch — bridge, instance-class (ABI §7.2).
+pub const HANDLE_KIND_BATCH: u8 = 7;
+/// Handle kind 8: a [`BufferHandle`](https://example.invalid) — the sealed, host-owned byte region
+/// every world speaks (ABI §7.4); instance-class. **Phase B (this track).**
+pub const HANDLE_KIND_BUFFER: u8 = 8;
+/// Handle kind 9: a stream handle for a direct peer stream (ABI §7.2); instance-class. **Phase B.**
+pub const HANDLE_KIND_STREAM: u8 = 9;
+/// Handle kind 10: an `OpId` — an outstanding async operation completing via `Event::Completion`
+/// (ABI §7.2/§7.5); instance-class. **Phase B (this track).**
+pub const HANDLE_KIND_OP_ID: u8 = 10;
+
+/// The three resource classes (ABI §7.1): the class fixes a handle's lifetime, its generation
+/// behavior, and its restart semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceClass {
+    /// Registered in `da_init`; lives the run instance; handles re-derived deterministically from
+    /// 1-based registration order (generation 0) after any restart (ABI §7.1).
+    Registered,
+    /// Lives until explicit release or instance end; a generational handle from a dead instance
+    /// traps `StaleHandle`; re-acquired through capability calls (ABI §7.1).
+    Instance,
+    /// Lives until the current event slice ends; invalidated wholesale at each slice boundary
+    /// (ABI §7.1).
+    Slice,
+}
+
+/// The [`ResourceClass`] of a handle `kind`, or `None` if `kind` is unassigned (ABI §7.1/§7.2).
+///
+/// The kind→class mapping is permanent: kinds 1–2 are slice-class, 3–5 registered-class, 6–10
+/// instance-class (buffers/streams/`OpId`s join the bridge's batches/containers as instance-class).
+#[must_use]
+pub fn handle_class(kind: u8) -> Option<ResourceClass> {
+    match kind {
+        HANDLE_KIND_STEP_TENSOR_NATIVE | HANDLE_KIND_STEP_TENSOR_DET => Some(ResourceClass::Slice),
+        HANDLE_KIND_PARAM | HANDLE_KIND_PERSISTENT | HANDLE_KIND_DET_PERSISTENT => {
+            Some(ResourceClass::Registered)
+        }
+        HANDLE_KIND_UPDATE_CONTAINER
+        | HANDLE_KIND_BATCH
+        | HANDLE_KIND_BUFFER
+        | HANDLE_KIND_STREAM
+        | HANDLE_KIND_OP_ID => Some(ResourceClass::Instance),
+        _ => None,
+    }
+}
+
+/// Pack a `(kind, generation, index)` triple into the opaque `u64` handle layout (ABI §7.2):
+/// `(kind << 56) | ((generation & 0xFF_FFFF) << 32) | index`. `index` is 1-based; a `0` index (with
+/// `kind`/`generation` also 0) yields the reserved non-handle `0`.
+#[must_use]
+pub const fn pack_handle(kind: u8, generation: u32, index: u32) -> u64 {
+    ((kind as u64) << HANDLE_KIND_SHIFT)
+        | (((generation as u64) & HANDLE_GENERATION_MASK) << HANDLE_GENERATION_SHIFT)
+        | (index as u64)
+}
+
+/// The 8-bit `kind` field of a handle (ABI §7.2).
+#[must_use]
+pub const fn handle_kind(handle: u64) -> u8 {
+    (handle >> HANDLE_KIND_SHIFT) as u8
+}
+
+/// The 24-bit `generation` field of a handle (ABI §7.2).
+#[must_use]
+pub const fn handle_generation(handle: u64) -> u32 {
+    ((handle >> HANDLE_GENERATION_SHIFT) & HANDLE_GENERATION_MASK) as u32
+}
+
+/// The 32-bit 1-based `index` field of a handle (ABI §7.2).
+#[must_use]
+pub const fn handle_index(handle: u64) -> u32 {
+    (handle & HANDLE_INDEX_MASK) as u32
+}
+
+// ================================================================================================
+// The async completion-result wire vocabulary (ABI §7.5): the numeric assignments the completion
+// codec (`daemon-vhc-host::v2`), the guest SDK, and the journal/replay verifier must agree on.
+//
+// Any capability call that cannot complete immediately returns an `OpId` (kind 10) and completes
+// via `Event::Completion(op, result)` (event tag 6). None of it is linked at Phase A, but §7.5
+// FIXES the wire encoding now so journals (tag 14, opaque `bstr`) and SDKs are stable. The grammar
+// of the decoded result bytes is [`COMPLETION_RESULT_CDDL`]; these constants are its numeric
+// assignments. The variant set is additive within major 2; unknown `comp-error` codes fail closed
+// (ABI §5.2).
+// ================================================================================================
+
+/// The normative `completion-result` wire grammar (ABI §7.5): the decoded shape of a
+/// `Event::Completion` result and of a journal tag-14 `completion-rec.result` byte string.
+///
+/// Root rule `completion-result`. It MUST validate as-is under `cddl-cat`; the `completion_grammar`
+/// test asserts it is machine-valid and that a representative of each variant validates. The journal
+/// stores these bytes opaquely (`completion-rec.result: bstr`, [`JOURNAL_CDDL`]).
+pub const COMPLETION_RESULT_CDDL: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/completion.cddl"));
+
+/// `completion-result` variant discriminant 0: success (ABI §7.5 `[0, success-payload]`).
+pub const COMPLETION_RESULT_OK: u64 = 0;
+/// `completion-result` variant discriminant 1: failure (ABI §7.5 `[1, comp-error]`).
+pub const COMPLETION_RESULT_ERR: u64 = 1;
+
+/// `comp-error` code 0: the operation was cancelled (`vhc@2::cancel`, ABI §7.5).
+pub const COMP_ERR_CANCELLED: u64 = 0;
+/// `comp-error` code 1: the network destination was unreachable (ABI §7.5).
+pub const COMP_ERR_NET_UNREACHABLE: u64 = 1;
+/// `comp-error` code 2: the operation timed out (guest timer policy surfaces here, ABI §7.5).
+pub const COMP_ERR_TIMEOUT: u64 = 2;
+/// `comp-error` code 3: the payload store refused the operation (ABI §7.5).
+pub const COMP_ERR_STORE_REFUSED: u64 = 3;
+/// `comp-error` code 4: a fetched/verified byte range did not match its content hash (ABI §7.5).
+pub const COMP_ERR_HASH_MISMATCH: u64 = 4;
+/// `comp-error` code 5: a stream write exceeded its writable credit (ABI §7.5, credit flow control).
+pub const COMP_ERR_CREDIT_EXHAUSTED: u64 = 5;
+/// `comp-error` code 6: the peer closed the stream (ABI §7.5).
+pub const COMP_ERR_PEER_CLOSED: u64 = 6;
+/// `comp-error` code 7: a grant/quota bound was exhausted (ABI §7.5).
+pub const COMP_ERR_GRANT_EXHAUSTED: u64 = 7;
+/// `comp-error` codes at or above this are reserved (additive by minor); a guest MUST fail closed on
+/// an unknown code (ABI §5.2/§7.5).
+pub const COMP_ERR_RESERVED_MIN: u64 = 8;
+
+/// The stable machine-readable slug for a `comp-error` code, or `None` if `code` is reserved/unknown
+/// (ABI §7.5). Used to render the `detail`-free failure category in host logs / node surfaces.
+#[must_use]
+pub fn comp_err_slug(code: u64) -> Option<&'static str> {
+    match code {
+        COMP_ERR_CANCELLED => Some("Cancelled"),
+        COMP_ERR_NET_UNREACHABLE => Some("NetUnreachable"),
+        COMP_ERR_TIMEOUT => Some("Timeout"),
+        COMP_ERR_STORE_REFUSED => Some("StoreRefused"),
+        COMP_ERR_HASH_MISMATCH => Some("HashMismatch"),
+        COMP_ERR_CREDIT_EXHAUSTED => Some("CreditExhausted"),
+        COMP_ERR_PEER_CLOSED => Some("PeerClosed"),
+        COMP_ERR_GRANT_EXHAUSTED => Some("GrantExhausted"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,6 +1068,105 @@ mod tests {
     fn frame_envelope_domain_is_major_scoped() {
         // The domain-separation tag is frozen at A2 and major-scoped (ABI §12.1).
         assert_eq!(FRAME_ENVELOPE_DOMAIN_V2, "daemon-vhc/frame/2");
+    }
+
+    #[test]
+    fn handle_layout_round_trips_and_masks_fields() {
+        // ABI §7.2: (kind << 56) | ((gen & 0xFF_FFFF) << 32) | index; index 1-based, 32 bits.
+        let h = pack_handle(HANDLE_KIND_BUFFER, 0x00AB_CDEF, 0x1234_5678);
+        assert_eq!(handle_kind(h), HANDLE_KIND_BUFFER);
+        assert_eq!(handle_generation(h), 0x00AB_CDEF);
+        assert_eq!(handle_index(h), 0x1234_5678);
+        // Generation is 24 bits: a value with high bits set is masked down, not aliased into kind.
+        let wrapped = pack_handle(HANDLE_KIND_OP_ID, 0xFFFF_FFFF, 1);
+        assert_eq!(
+            handle_kind(wrapped),
+            HANDLE_KIND_OP_ID,
+            "gen overflow never bleeds into kind"
+        );
+        assert_eq!(handle_generation(wrapped), HANDLE_MAX_GENERATION);
+        assert_eq!(handle_index(wrapped), 1);
+        // `0` is never a live handle (ABI §7.2): the all-zero triple packs to 0.
+        assert_eq!(pack_handle(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn handle_kinds_are_assigned_and_classed_permanently() {
+        // Kinds 1..=10 are the assigned set; 8/9/10 are the Phase-B buffer/stream/op-id (ABI §7.2).
+        assert_eq!(
+            [
+                HANDLE_KIND_STEP_TENSOR_NATIVE,
+                HANDLE_KIND_STEP_TENSOR_DET,
+                HANDLE_KIND_PARAM,
+                HANDLE_KIND_PERSISTENT,
+                HANDLE_KIND_DET_PERSISTENT,
+                HANDLE_KIND_UPDATE_CONTAINER,
+                HANDLE_KIND_BATCH,
+                HANDLE_KIND_BUFFER,
+                HANDLE_KIND_STREAM,
+                HANDLE_KIND_OP_ID,
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        );
+        // The kind→class mapping (ABI §7.1): slice 1–2, registered 3–5, instance 6–10.
+        assert_eq!(
+            handle_class(HANDLE_KIND_STEP_TENSOR_NATIVE),
+            Some(ResourceClass::Slice)
+        );
+        assert_eq!(
+            handle_class(HANDLE_KIND_STEP_TENSOR_DET),
+            Some(ResourceClass::Slice)
+        );
+        for k in [
+            HANDLE_KIND_PARAM,
+            HANDLE_KIND_PERSISTENT,
+            HANDLE_KIND_DET_PERSISTENT,
+        ] {
+            assert_eq!(handle_class(k), Some(ResourceClass::Registered));
+        }
+        for k in [
+            HANDLE_KIND_UPDATE_CONTAINER,
+            HANDLE_KIND_BATCH,
+            HANDLE_KIND_BUFFER,
+            HANDLE_KIND_STREAM,
+            HANDLE_KIND_OP_ID,
+        ] {
+            assert_eq!(
+                handle_class(k),
+                Some(ResourceClass::Instance),
+                "buffers/streams/op-ids are instance-class (ABI §7.1)"
+            );
+        }
+        // An unassigned kind has no class (reserved 11–255, ABI §7.2).
+        assert_eq!(handle_class(11), None);
+        assert_eq!(handle_class(255), None);
+    }
+
+    #[test]
+    fn completion_result_and_comp_error_codes_are_assigned_and_additive() {
+        // ABI §7.5: variant discriminants + the 0..=7 comp-error codes, 8..=63 reserved.
+        assert_eq!((COMPLETION_RESULT_OK, COMPLETION_RESULT_ERR), (0, 1));
+        let codes = [
+            COMP_ERR_CANCELLED,
+            COMP_ERR_NET_UNREACHABLE,
+            COMP_ERR_TIMEOUT,
+            COMP_ERR_STORE_REFUSED,
+            COMP_ERR_HASH_MISMATCH,
+            COMP_ERR_CREDIT_EXHAUSTED,
+            COMP_ERR_PEER_CLOSED,
+            COMP_ERR_GRANT_EXHAUSTED,
+        ];
+        assert_eq!(codes, [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(COMP_ERR_RESERVED_MIN, 8);
+        // Every assigned code has a unique, stable slug; reserved/unknown codes have none (fail
+        // closed, ABI §5.2/§7.5).
+        let mut slugs: Vec<&str> = codes.iter().map(|c| comp_err_slug(*c).unwrap()).collect();
+        let n = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), n, "comp-error slugs must be unique");
+        assert_eq!(comp_err_slug(COMP_ERR_RESERVED_MIN), None);
+        assert_eq!(comp_err_slug(u64::MAX), None);
     }
 
     #[test]
