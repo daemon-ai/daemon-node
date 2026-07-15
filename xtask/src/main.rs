@@ -379,6 +379,15 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_claim_funnel"],
         ),
         (
+            // The §2.5 tabi@1 bridge under major-2 (the choreography sitting): the SAME frozen
+            // dispatch as the v1 driver, genericized over the store — registration only in
+            // da_init (PhaseViolation otherwise), slice-class arenas cleared per Delivered
+            // (StaleHandle across a boundary), nr-class readouts journaled under §2.7 kinds.
+            // The A0 fixture lane above is the byte-for-byte v1-untouched proof.
+            "A2 tabi@1 bridge under the v2 driver (§2.5 legality + slice arenas + nr journal)",
+            &["-p", "daemon-vhc-host", "--test", "v2_bridge"],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),

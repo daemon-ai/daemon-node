@@ -1240,16 +1240,93 @@ fn dtype_size(dtype: u32) -> usize {
     }
 }
 
+// -- the tabi dispatch seam over the two stores (ABI §2.5 — the A2 bridge) -----------------------
+//
+// The frozen 66-import dispatch is ONE body of code linked under two store types: the v1 driver's
+// `Store<HostState>` (behavior byte-for-byte unchanged — `HostState`'s impl below reproduces the
+// old `enter`/`stash` verbatim) and the v2 event-loop driver's `Store<V2Host>` (which embeds a
+// `HostState` and substitutes the §2.5 temporal-legality rules for the v1 phase table). This is a
+// genericization, not a fork: the import bodies and every op method are untouched.
+
+/// What the shared `tabi@1` dispatch needs from a store type.
+pub(crate) trait TabiHost: Send {
+    /// The dispatch state (params/persistents/arenas/backend) — the v1 store IS it; the v2 store
+    /// embeds it.
+    fn tabi(&mut self) -> &mut HostState;
+    /// Immutable access for the read-only ops.
+    fn tabi_ref(&self) -> &HostState;
+    /// The per-call legality + budget gate: v1 = the phase table (unchanged); v2 = the §2.5 rules
+    /// (registration only during `da_init`; everything else in `da_run` slices) + the per-slice
+    /// op budget (§5.5).
+    fn enter_tabi(&mut self, import: &'static str) -> Result<(), Trap>;
+    /// Stash a typed trap for the driver's error mapping.
+    fn stash_trap(&mut self, t: Trap);
+    /// Journal a bridge nr-class result (ABI §2.7 reserved kinds ≥ 128). The v1 driver records
+    /// nothing here (worker-side v1 journaling was never wired — A1 scoped it to v2); the v2
+    /// store routes it to its `JournalSink`.
+    fn journal_bridge_nr(&mut self, kind: u32, value: &[u8]);
+}
+
+impl TabiHost for HostState {
+    fn tabi(&mut self) -> &mut HostState {
+        self
+    }
+    fn tabi_ref(&self) -> &HostState {
+        self
+    }
+    fn enter_tabi(&mut self, import: &'static str) -> Result<(), Trap> {
+        // The v1 `enter`, verbatim: phase presence → phase-legality table → per-entry op budget.
+        let phase = self.phase.ok_or_else(|| {
+            Trap::new(
+                TrapCode::PhaseViolation,
+                import,
+                None,
+                "outside an entry point",
+            )
+        })?;
+        phase::guard(import, phase)?;
+        self.charge_op(import, phase)?;
+        Ok(())
+    }
+    fn stash_trap(&mut self, t: Trap) {
+        self.trap = Some(t);
+    }
+    fn journal_bridge_nr(&mut self, _kind: u32, _value: &[u8]) {}
+}
+
+impl HostState {
+    /// Start a v2 event slice's differentiable pass (the v1 `prep_entry` tape rule, per-slice
+    /// under the bridge — §2.5 rule 4: v1 step tensors are slice-class).
+    pub(crate) fn begin_slice_pass(&mut self) {
+        self.backend.begin_pass();
+    }
+
+    /// End a v2 event slice: the v1 `finish_entry` teardown verbatim — end the pass, clear the
+    /// step arenas wholesale, free the tensors (ABI §7.1 slice class; §7.3 wholesale bump).
+    pub(crate) fn end_slice_pass_and_clear(&mut self) {
+        self.backend.end_pass();
+        let native_freed = self.step_native.clear();
+        let det_freed = self.step_det.clear();
+        for t in native_freed.into_iter().chain(det_freed) {
+            self.backend.free(t);
+        }
+    }
+}
+
 // -- memory helpers (host-function side) --------------------------------------------------------
 
-fn mem_of(caller: &mut Caller<'_, HostState>) -> Result<Memory, Trap> {
+fn mem_of<T: TabiHost>(caller: &mut Caller<'_, T>) -> Result<Memory, Trap> {
     caller
         .get_export("memory")
         .and_then(wasmtime::Extern::into_memory)
         .ok_or_else(|| Trap::bare(TrapCode::BadModule, "module has no exported memory"))
 }
 
-fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> Result<Vec<u8>, Trap> {
+fn read_bytes<T: TabiHost>(
+    caller: &mut Caller<'_, T>,
+    ptr: u32,
+    len: u32,
+) -> Result<Vec<u8>, Trap> {
     let mem = mem_of(caller)?;
     let data = mem.data(&caller);
     let (start, end) = (ptr as usize, ptr as usize + len as usize);
@@ -1258,12 +1335,16 @@ fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> Result<
         .ok_or_else(|| Trap::bare(TrapCode::MemOob, "span out of bounds"))
 }
 
-fn read_str(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> Result<String, Trap> {
+fn read_str<T: TabiHost>(caller: &mut Caller<'_, T>, ptr: u32, len: u32) -> Result<String, Trap> {
     let bytes = read_bytes(caller, ptr, len)?;
     String::from_utf8(bytes).map_err(|_| Trap::bare(TrapCode::MemOob, "name is not utf-8"))
 }
 
-fn read_dims(caller: &mut Caller<'_, HostState>, ptr: u32, rank: u32) -> Result<Vec<u32>, Trap> {
+fn read_dims<T: TabiHost>(
+    caller: &mut Caller<'_, T>,
+    ptr: u32,
+    rank: u32,
+) -> Result<Vec<u32>, Trap> {
     if rank > 8 {
         return Err(Trap::bare(TrapCode::RankOverflow, "rank > 8"));
     }
@@ -1274,8 +1355,8 @@ fn read_dims(caller: &mut Caller<'_, HostState>, ptr: u32, rank: u32) -> Result<
         .collect())
 }
 
-fn read_handles(
-    caller: &mut Caller<'_, HostState>,
+fn read_handles<T: TabiHost>(
+    caller: &mut Caller<'_, T>,
     ptr: u32,
     count: u32,
 ) -> Result<Vec<u64>, Trap> {
@@ -1286,26 +1367,19 @@ fn read_handles(
         .collect())
 }
 
-fn stash<T>(caller: &mut Caller<'_, HostState>, r: Result<T, Trap>) -> Result<T, wasmtime::Error> {
+fn stash<S: TabiHost, T>(
+    caller: &mut Caller<'_, S>,
+    r: Result<T, Trap>,
+) -> Result<T, wasmtime::Error> {
     r.map_err(|t| {
         let msg = t.to_string();
-        caller.data_mut().trap = Some(t);
+        caller.data_mut().stash_trap(t);
         wasmtime::Error::msg(msg)
     })
 }
 
-fn enter(caller: &mut Caller<'_, HostState>, import: &'static str) -> Result<Phase, Trap> {
-    let phase = caller.data().phase.ok_or_else(|| {
-        Trap::new(
-            TrapCode::PhaseViolation,
-            import,
-            None,
-            "outside an entry point",
-        )
-    })?;
-    phase::guard(import, phase)?;
-    caller.data_mut().charge_op(import, phase)?;
-    Ok(phase)
+fn enter<T: TabiHost>(caller: &mut Caller<'_, T>, import: &'static str) -> Result<(), Trap> {
+    caller.data_mut().enter_tabi(import)
 }
 
 fn fake_init(name: &str, n: usize, init: u32, p0: f64, p1: f64) -> Vec<f32> {
@@ -2349,13 +2423,15 @@ impl HostState {
 
 /// Wire every `tabi@1` import this host implements (the Merge-1 vocabulary subset) into `linker`.
 #[allow(clippy::too_many_lines)]
-fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+pub(crate) fn link_tabi<T: TabiHost + 'static>(
+    linker: &mut Linker<T>,
+) -> Result<(), wasmtime::Error> {
     macro_rules! import {
         ($name:literal, |$c:ident $(, $a:ident : $t:ty)*| -> $ret:ty $body:block) => {
             linker.func_wrap(
                 "tabi@1",
                 $name,
-                |mut $c: Caller<'_, HostState> $(, $a: $t)*| -> Result<$ret, wasmtime::Error> {
+                |mut $c: Caller<'_, T> $(, $a: $t)*| -> Result<$ret, wasmtime::Error> {
                     let r: Result<$ret, Trap> = (|| { $body })();
                     stash(&mut $c, r)
                 },
@@ -2376,7 +2452,9 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
         enter(&mut c, "param@1")?;
         let name = read_str(&mut c, np, nl)?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().register_param(&name, &dims, dt, init, p0, p1)
+        c.data_mut()
+            .tabi()
+            .register_param(&name, &dims, dt, init, p0, p1)
     });
     import!("persistent@1", |c,
                              np: u32,
@@ -2389,7 +2467,9 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
         enter(&mut c, "persistent@1")?;
         let name = read_str(&mut c, np, nl)?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().register_persistent(&name, &dims, dt, class)
+        c.data_mut()
+            .tabi()
+            .register_persistent(&name, &dims, dt, class)
     });
     import!("det_persistent@1", |c,
                                  np: u32,
@@ -2401,42 +2481,44 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
         enter(&mut c, "det_persistent@1")?;
         let name = read_str(&mut c, np, nl)?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().register_det_persistent(&name, &dims, class)
+        c.data_mut()
+            .tabi()
+            .register_det_persistent(&name, &dims, class)
     });
     import!("drop@1", |c, h: u64| -> () {
         enter(&mut c, "drop@1")?;
-        c.data_mut().op_drop(h)
+        c.data_mut().tabi().op_drop(h)
     });
     import!("param_round_base@1", |c, p: u64| -> u64 {
         enter(&mut c, "param_round_base@1")?;
-        c.data_mut().op_param_round_base(p)
+        c.data_mut().tabi().op_param_round_base(p)
     });
     import!("backward@1", |c, loss: u64| -> () {
         enter(&mut c, "backward@1")?;
-        c.data_mut().op_backward(loss)
+        c.data_mut().tabi().op_backward(loss)
     });
     import!("grad@1", |c, p: u64| -> u64 {
         enter(&mut c, "grad@1")?;
-        c.data_mut().op_grad(p)
+        c.data_mut().tabi().op_grad(p)
     });
     import!("zero_grads@1", |c| -> () {
         enter(&mut c, "zero_grads@1")?;
-        c.data_mut().op_zero_grads();
+        c.data_mut().tabi().op_zero_grads();
         Ok(())
     });
     import!("assign@1", |c, dst: u64, src: u64| -> () {
         enter(&mut c, "assign@1")?;
-        c.data_mut().op_assign(dst, src)
+        c.data_mut().tabi().op_assign(dst, src)
     });
     import!("zeros@1", |c, dp: u32, dr: u32, _dt: u32| -> u64 {
         enter(&mut c, "zeros@1")?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().op_create(&dims, 0.0)
+        c.data_mut().tabi().op_create(&dims, 0.0)
     });
     import!("ones@1", |c, dp: u32, dr: u32, _dt: u32| -> u64 {
         enter(&mut c, "ones@1")?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().op_create(&dims, 1.0)
+        c.data_mut().tabi().op_create(&dims, 1.0)
     });
     import!("full@1", |c,
                        dp: u32,
@@ -2446,31 +2528,31 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
      -> u64 {
         enter(&mut c, "full@1")?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().op_create(&dims, value as f32)
+        c.data_mut().tabi().op_create(&dims, value as f32)
     });
     import!("add@1", |c, a: u64, b: u64| -> u64 {
         enter(&mut c, "add@1")?;
-        c.data_mut().op_add(a, b)
+        c.data_mut().tabi().op_add(a, b)
     });
     import!("sub@1", |c, a: u64, b: u64| -> u64 {
         enter(&mut c, "sub@1")?;
-        c.data_mut().op_binary_same("sub@1", a, b)
+        c.data_mut().tabi().op_binary_same("sub@1", a, b)
     });
     import!("mul@1", |c, a: u64, b: u64| -> u64 {
         enter(&mut c, "mul@1")?;
-        c.data_mut().op_binary_same("mul@1", a, b)
+        c.data_mut().tabi().op_binary_same("mul@1", a, b)
     });
     import!("mul_s@1", |c, x: u64, v: f64| -> u64 {
         enter(&mut c, "mul_s@1")?;
-        c.data_mut().op_mul_s(x, v)
+        c.data_mut().tabi().op_mul_s(x, v)
     });
     import!("matmul@1", |c, a: u64, b: u64| -> u64 {
         enter(&mut c, "matmul@1")?;
-        c.data_mut().op_matmul(a, b)
+        c.data_mut().tabi().op_matmul(a, b)
     });
     import!("relu@1", |c, x: u64| -> u64 {
         enter(&mut c, "relu@1")?;
-        c.data_mut().op_relu(x)
+        c.data_mut().tabi().op_relu(x)
     });
     import!("cross_entropy@1", |c,
                                 logits: u64,
@@ -2478,7 +2560,9 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                                 ignore: i64|
      -> u64 {
         enter(&mut c, "cross_entropy@1")?;
-        c.data_mut().op_cross_entropy(logits, targets, ignore)
+        c.data_mut()
+            .tabi()
+            .op_cross_entropy(logits, targets, ignore)
     });
     import!("adamw_step@1", |c,
                              p: u64,
@@ -2494,28 +2578,35 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
      -> () {
         enter(&mut c, "adamw_step@1")?;
         c.data_mut()
+            .tabi()
             .op_adamw_step(p, g, m, v, step, lr, b1, b2, eps, wd)
     });
     import!("batch_tokens@1", |c, b: u64| -> u64 {
         enter(&mut c, "batch_tokens@1")?;
-        c.data_mut().op_batch_tokens(b)
+        c.data_mut().tabi().op_batch_tokens(b)
     });
     import!("batch_size@1", |c, b: u64| -> u32 {
         enter(&mut c, "batch_size@1")?;
-        Ok(c.data().batch_ref("batch_size@1", b)?.batch)
+        let v = c.data().tabi_ref().batch_ref("batch_size@1", b)?.batch;
+        c.data_mut().journal_bridge_nr(130, &v.to_le_bytes());
+        Ok(v)
     });
     import!("batch_seq_len@1", |c, b: u64| -> u32 {
         enter(&mut c, "batch_seq_len@1")?;
-        Ok(c.data().batch_ref("batch_seq_len@1", b)?.seq)
+        let v = c.data().tabi_ref().batch_ref("batch_seq_len@1", b)?.seq;
+        c.data_mut().journal_bridge_nr(131, &v.to_le_bytes());
+        Ok(v)
     });
     import!("scalar@1", |c, x: u64| -> f64 {
         enter(&mut c, "scalar@1")?;
-        c.data().op_scalar(x)
+        let v = c.data().tabi_ref().op_scalar(x)?;
+        c.data_mut().journal_bridge_nr(128, &v.to_le_bytes());
+        Ok(v)
     });
     import!("metric@1", |c, np: u32, nl: u32, x: u64| -> () {
         enter(&mut c, "metric@1")?;
         let name = read_str(&mut c, np, nl)?;
-        c.data_mut().op_metric(&name, x)
+        c.data_mut().tabi().op_metric(&name, x)
     });
     import!("log@1", |c, _level: u32, _mp: u32, _ml: u32| -> () {
         enter(&mut c, "log@1")?;
@@ -2523,32 +2614,40 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
     });
     import!("abi_minor@1", |c| -> u32 {
         enter(&mut c, "abi_minor@1")?;
+        c.data_mut()
+            .journal_bridge_nr(129, &crate::TENSOR_ABI_MINOR.to_le_bytes());
         Ok(crate::TENSOR_ABI_MINOR)
     });
     import!("upd_new@1", |c| -> u64 {
         enter(&mut c, "upd_new@1")?;
-        Ok(c.data_mut().op_upd_new())
+        Ok(c.data_mut().tabi().op_upd_new())
     });
     import!("upd_push_bytes@1", |c, u: u64, dp: u32, dl: u32| -> () {
         enter(&mut c, "upd_push_bytes@1")?;
         let data = read_bytes(&mut c, dp, dl)?;
-        c.data_mut().op_upd_push_bytes(u, data)
+        c.data_mut().tabi().op_upd_push_bytes(u, data)
     });
     import!("upd_push_tensor@1", |c, u: u64, x: u64| -> () {
         enter(&mut c, "upd_push_tensor@1")?;
-        c.data_mut().op_upd_push_tensor(u, x)
+        c.data_mut().tabi().op_upd_push_tensor(u, x)
     });
     import!("upd_sections@1", |c, i: u32| -> u32 {
         enter(&mut c, "upd_sections@1")?;
-        c.data().op_upd_sections(i)
+        let v = c.data().tabi_ref().op_upd_sections(i)?;
+        c.data_mut().journal_bridge_nr(132, &v.to_le_bytes());
+        Ok(v)
     });
     import!("upd_kind@1", |c, i: u32, s: u32| -> u32 {
         enter(&mut c, "upd_kind@1")?;
-        c.data().op_upd_kind(i, s)
+        let v = c.data().tabi_ref().op_upd_kind(i, s)?;
+        c.data_mut().journal_bridge_nr(133, &v.to_le_bytes());
+        Ok(v)
     });
     import!("upd_bytes_len@1", |c, i: u32, s: u32| -> u32 {
         enter(&mut c, "upd_bytes_len@1")?;
-        c.data().op_upd_bytes_len(i, s)
+        let v = c.data().tabi_ref().op_upd_bytes_len(i, s)?;
+        c.data_mut().journal_bridge_nr(134, &v.to_le_bytes());
+        Ok(v)
     });
     import!("upd_read_bytes@1", |c,
                                  i: u32,
@@ -2557,8 +2656,9 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                                  dl: u32|
      -> u32 {
         enter(&mut c, "upd_read_bytes@1")?;
-        let bytes = c.data().op_upd_bytes(i, s)?;
+        let bytes = c.data().tabi_ref().op_upd_bytes(i, s)?;
         let n = (bytes.len()).min(dl as usize);
+        c.data_mut().journal_bridge_nr(135, &bytes[..n]);
         let mem = mem_of(&mut c)?;
         mem.write(&mut c, dp as usize, &bytes[..n])
             .map_err(|_| Trap::bare(TrapCode::MemOob, "upd_read_bytes dst"))?;
@@ -2566,41 +2666,43 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
     });
     import!("upd_tensor@1", |c, i: u32, s: u32| -> u64 {
         enter(&mut c, "upd_tensor@1")?;
-        c.data_mut().op_upd_tensor(i, s)
+        c.data_mut().tabi().op_upd_tensor(i, s)
     });
     import!("det_zeros@1", |c, dp: u32, dr: u32| -> u64 {
         enter(&mut c, "det_zeros@1")?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().op_det_zeros(&dims)
+        c.data_mut().tabi().op_det_zeros(&dims)
     });
     import!("det_sum@1", |c, hp: u32, hc: u32| -> u64 {
         enter(&mut c, "det_sum@1")?;
         let handles = read_handles(&mut c, hp, hc)?;
-        c.data_mut().op_det_sum(&handles)
+        c.data_mut().tabi().op_det_sum(&handles)
     });
     import!("det_scale@1", |c, x: u64, alpha: f64| -> u64 {
         enter(&mut c, "det_scale@1")?;
-        c.data_mut().op_det_scale(x, alpha)
+        c.data_mut().tabi().op_det_scale(x, alpha)
     });
     import!("det_l2norm@1", |c, x: u64| -> f64 {
         enter(&mut c, "det_l2norm@1")?;
-        c.data().op_det_l2norm(x)
+        let v = c.data().tabi_ref().op_det_l2norm(x)?;
+        c.data_mut().journal_bridge_nr(136, &v.to_le_bytes());
+        Ok(v)
     });
     import!("det_sign@1", |c, x: u64| -> u64 {
         enter(&mut c, "det_sign@1")?;
-        c.data_mut().op_det_sign(x)
+        c.data_mut().tabi().op_det_sign(x)
     });
     import!("det_add@1", |c, a: u64, b: u64| -> u64 {
         enter(&mut c, "det_add@1")?;
-        c.data_mut().op_det_binary("det_add@1", a, b)
+        c.data_mut().tabi().op_det_binary("det_add@1", a, b)
     });
     import!("det_sub@1", |c, a: u64, b: u64| -> u64 {
         enter(&mut c, "det_sub@1")?;
-        c.data_mut().op_det_binary("det_sub@1", a, b)
+        c.data_mut().tabi().op_det_binary("det_sub@1", a, b)
     });
     import!("det_mul@1", |c, a: u64, b: u64| -> u64 {
         enter(&mut c, "det_mul@1")?;
-        c.data_mut().op_det_binary("det_mul@1", a, b)
+        c.data_mut().tabi().op_det_binary("det_mul@1", a, b)
     });
     import!("det_absmax_unpack@1", |c,
                                     packed: u64,
@@ -2608,7 +2710,9 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                                     bits: u32|
      -> u64 {
         enter(&mut c, "det_absmax_unpack@1")?;
-        c.data_mut().op_det_absmax_unpack(packed, chunk, bits)
+        c.data_mut()
+            .tabi()
+            .op_det_absmax_unpack(packed, chunk, bits)
     });
     import!("det_chunk_scatter_add@1", |c,
                                         acc: u64,
@@ -2617,7 +2721,9 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                                         chunk: u32|
      -> () {
         enter(&mut c, "det_chunk_scatter_add@1")?;
-        c.data_mut().op_det_chunk_scatter_add(acc, vals, idx, chunk)
+        c.data_mut()
+            .tabi()
+            .op_det_chunk_scatter_add(acc, vals, idx, chunk)
     });
     import!("det_chunk_scatter@1", |c,
                                     vals: u64,
@@ -2628,40 +2734,42 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
      -> u64 {
         enter(&mut c, "det_chunk_scatter@1")?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().op_det_chunk_scatter(vals, idx, chunk, &dims)
+        c.data_mut()
+            .tabi()
+            .op_det_chunk_scatter(vals, idx, chunk, &dims)
     });
     import!("det_assign@1", |c, dst: u64, src: u64| -> () {
         enter(&mut c, "det_assign@1")?;
-        c.data_mut().op_det_assign(dst, src)
+        c.data_mut().tabi().op_det_assign(dst, src)
     });
     import!("det_param@1", |c, p: u64| -> u64 {
         enter(&mut c, "det_param@1")?;
-        c.data_mut().op_det_param(p)
+        c.data_mut().tabi().op_det_param(p)
     });
     import!("det_reset_param_to_base@1", |c, p: u64| -> () {
         enter(&mut c, "det_reset_param_to_base@1")?;
-        c.data_mut().op_det_reset_param_to_base(p)
+        c.data_mut().tabi().op_det_reset_param_to_base(p)
     });
     import!("det_axpy_param@1", |c, p: u64, x: u64, alpha: f64| -> () {
         enter(&mut c, "det_axpy_param@1")?;
-        c.data_mut().op_det_axpy_param(p, x, alpha)
+        c.data_mut().tabi().op_det_axpy_param(p, x, alpha)
     });
     // -- Wave-2 additions -----------------------------------------------------------------------
     import!("embedding@1", |c, w: u64, ids: u64| -> u64 {
         enter(&mut c, "embedding@1")?;
-        c.data_mut().op_embedding(w, ids)
+        c.data_mut().tabi().op_embedding(w, ids)
     });
     import!("rmsnorm@1", |c, x: u64, w: u64, eps: f64| -> u64 {
         enter(&mut c, "rmsnorm@1")?;
-        c.data_mut().op_rmsnorm(x, w, eps)
+        c.data_mut().tabi().op_rmsnorm(x, w, eps)
     });
     import!("softmax@1", |c, x: u64, dim: u32| -> u64 {
         enter(&mut c, "softmax@1")?;
-        c.data_mut().op_softmax(x, dim)
+        c.data_mut().tabi().op_softmax(x, dim)
     });
     import!("silu@1", |c, x: u64| -> u64 {
         enter(&mut c, "silu@1")?;
-        c.data_mut().op_silu(x)
+        c.data_mut().tabi().op_silu(x)
     });
     import!("rope@1", |c,
                        x: u64,
@@ -2670,7 +2778,7 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                        il: u32|
      -> u64 {
         enter(&mut c, "rope@1")?;
-        c.data_mut().op_rope(x, pos, theta, il)
+        c.data_mut().tabi().op_rope(x, pos, theta, il)
     });
     import!("flash_attn@1", |c,
                              q: u64,
@@ -2680,16 +2788,16 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                              scale: f64|
      -> u64 {
         enter(&mut c, "flash_attn@1")?;
-        c.data_mut().op_flash_attn(q, k, v, causal, scale)
+        c.data_mut().tabi().op_flash_attn(q, k, v, causal, scale)
     });
     import!("reshape@1", |c, x: u64, dp: u32, dr: u32| -> u64 {
         enter(&mut c, "reshape@1")?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().op_reshape(x, &dims)
+        c.data_mut().tabi().op_reshape(x, &dims)
     });
     import!("transpose@1", |c, x: u64, d0: u32, d1: u32| -> u64 {
         enter(&mut c, "transpose@1")?;
-        c.data_mut().op_transpose(x, d0, d1)
+        c.data_mut().tabi().op_transpose(x, d0, d1)
     });
     import!("slice@1", |c,
                         x: u64,
@@ -2698,7 +2806,7 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                         end: u32|
      -> u64 {
         enter(&mut c, "slice@1")?;
-        c.data_mut().op_slice(x, dim, start, end)
+        c.data_mut().tabi().op_slice(x, dim, start, end)
     });
     import!("topk_chunk@1", |c,
                              x: u64,
@@ -2707,7 +2815,7 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                              out_idx: u32|
      -> u64 {
         enter(&mut c, "topk_chunk@1")?;
-        let (vh, ih) = c.data_mut().op_topk_chunk(x, chunk, k)?;
+        let (vh, ih) = c.data_mut().tabi().op_topk_chunk(x, chunk, k)?;
         let mem = mem_of(&mut c)?;
         mem.write(&mut c, out_idx as usize, &ih.to_le_bytes())
             .map_err(|_| Trap::bare(TrapCode::MemOob, "topk_chunk out_idx"))?;
@@ -2722,11 +2830,13 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
      -> u64 {
         enter(&mut c, "chunk_scatter@1")?;
         let dims = read_dims(&mut c, dp, dr)?;
-        c.data_mut().op_chunk_scatter(vals, idx, chunk, &dims)
+        c.data_mut()
+            .tabi()
+            .op_chunk_scatter(vals, idx, chunk, &dims)
     });
     import!("absmax_pack@1", |c, x: u64, chunk: u32, bits: u32| -> u64 {
         enter(&mut c, "absmax_pack@1")?;
-        c.data_mut().op_absmax_pack(x, chunk, bits)
+        c.data_mut().tabi().op_absmax_pack(x, chunk, bits)
     });
     import!("absmax_unpack@1", |c,
                                 packed: u64,
@@ -2735,19 +2845,19 @@ fn link_tabi(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
                                 _dt: u32|
      -> u64 {
         enter(&mut c, "absmax_unpack@1")?;
-        c.data_mut().op_absmax_unpack(packed, chunk, bits)
+        c.data_mut().tabi().op_absmax_unpack(packed, chunk, bits)
     });
     import!("dct2@1", |c, x: u64, tile: u32| -> u64 {
         enter(&mut c, "dct2@1")?;
-        c.data_mut().op_dct2(x, tile, "dct2@1")
+        c.data_mut().tabi().op_dct2(x, tile, "dct2@1")
     });
     import!("idct2@1", |c, x: u64, tile: u32| -> u64 {
         enter(&mut c, "idct2@1")?;
-        c.data_mut().op_idct2_native(x, tile)
+        c.data_mut().tabi().op_idct2_native(x, tile)
     });
     import!("det_idct2@1", |c, x: u64, tile: u32| -> u64 {
         enter(&mut c, "det_idct2@1")?;
-        c.data_mut().op_det_idct2(x, tile)
+        c.data_mut().tabi().op_det_idct2(x, tile)
     });
     Ok(())
 }

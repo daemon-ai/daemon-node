@@ -36,11 +36,10 @@
 //!
 //! ## Deliberate Phase-A bounds (recorded)
 //!
-//! - The `tabi@1` compute bridge is **not yet wired** into this driver: a major-2 module that
-//!   imports `tabi@1` is refused [`V2Error::BridgeUnwired`] at [`start_run`] (a clear, typed,
-//!   pre-instantiation error). Selection (§1.3) already admits such modules as major-2 candidates;
-//!   the bridge dispatch rides the choreography sitting, where the first bridge consumer
-//!   (TinyLlama on `BarrierRound`) arrives. Escalated in the sitting report.
+//! - The `tabi@1` compute bridge IS wired (the choreography sitting): the frozen dispatch is
+//!   genericized over the store (`runtime::TabiHost`) and linked for any major-2 module that
+//!   imports it, under the §2.5 legality rules (registration only in `da_init`; slice-class
+//!   arenas cleared at each Delivered boundary; nr-class results journaled under §2.7 kinds).
 //! - `snapshot_state` returns `SectionMissing` during a drain (no state-manifest verification yet
 //!   — the §10.2 protocol lands with the migrate scaffolding); outside a drain it traps
 //!   `PhaseViolation` per §6.6. `stage_state` is fully functional.
@@ -153,9 +152,8 @@ pub enum V2Error {
     /// Engine/linker/instantiation plumbing failed.
     #[error("v2 sandbox error: {0}")]
     Sandbox(String),
-    /// The module imports `tabi@1` under major 2, and this driver has not wired the bridge
-    /// dispatch yet (a deliberate Phase-A bound — see the module docs; the bridge lands with the
-    /// choreography move).
+    /// RETIRED at the choreography move (kept for wire/type stability this phase): the bridge is
+    /// linked for every major-2 module that imports `tabi@1`; no path constructs this any more.
     #[error("tabi@1 bridge not wired into the v2 driver yet: {0}")]
     BridgeUnwired(String),
     /// A journal-sink write failed (journaling is load-bearing, §8.4).
@@ -474,6 +472,11 @@ struct V2Host {
     // the claim's hard-accountable host-tier cap (standing, not per-slice — ABI §9.1/§5.5)
     hard_accountable_host_bytes: u64,
     accountable_staged_bytes: u64,
+    // The §2.5 compute bridge: the SAME frozen tabi@1 dispatch state the v1 driver uses,
+    // embedded (params/persistents/arenas/backend). None when the module imports no tabi@1.
+    tabi: Option<crate::runtime::HostState>,
+    // Whether a bridge slice pass is open (begin/end at Delivered boundaries, §2.5 rule 4).
+    slice_pass_open: bool,
     // signing (§12.1)
     signing: SigningKey,
     identity: RunIdentity,
@@ -693,6 +696,16 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                 // epoch re-arms on Delivered only.
                 write_guest(c, buf_ptr, &frame.frame_bytes)?;
                 let d = c.data_mut();
+                // Bridge slice lifecycle (§2.5 rule 4 / §7.1 slice class): end the previous
+                // slice's pass (clear step arenas wholesale, free tensors — the v1 finish_entry
+                // teardown) and begin the new slice's differentiable pass.
+                if let Some(tabi) = d.tabi.as_mut() {
+                    if d.slice_pass_open {
+                        tabi.end_slice_pass_and_clear();
+                    }
+                    tabi.begin_slice_pass();
+                    d.slice_pass_open = true;
+                }
                 d.slice.pending_next = None;
                 d.slice.now = at;
                 d.slice.op_calls = 0;
@@ -1118,9 +1131,9 @@ impl V2Run {
 /// instantiate with the real Phase-A capability providers, run `da_init` then `da_run` (§3.1,
 /// §9.4 steps 10–12), journaling throughout.
 ///
-/// The caller has already run ABI §1.3 selection (`select_driver` → `CandidateDriver::V2`);
-/// this function additionally refuses `tabi@1`-importing modules ([`V2Error::BridgeUnwired`] —
-/// see the module docs).
+/// The caller has already run ABI §1.3 selection (`select_driver` → `CandidateDriver::V2`).
+/// A module importing the `tabi@1` bridge gets the frozen dispatch linked beside the v2
+/// namespaces (§2.5).
 ///
 /// # Errors
 /// [`V2Error`] on setup/journal failure. Guest traps and init refusals are [`RunEnd`]s.
@@ -1131,20 +1144,10 @@ pub fn start_run(
     mut sink: Box<dyn JournalSink>,
 ) -> Result<V2Run, V2Error> {
     let module = Module::new(worker.engine(), wasm).map_err(|e| V2Error::Sandbox(e.to_string()))?;
-    // Deliberate Phase-A bound: the bridge dispatch is not yet generic over the v2 store.
-    let bridge_imports: Vec<String> = module
-        .imports()
-        .filter(|i| i.module() == NS_TABI_V1)
-        .map(|i| i.name().to_string())
-        .collect();
-    if !bridge_imports.is_empty() {
-        return Err(V2Error::BridgeUnwired(format!(
-            "module imports {} tabi@1 symbol(s) (e.g. `{}`); the bridge lands with the \
-             choreography move",
-            bridge_imports.len(),
-            bridge_imports[0]
-        )));
-    }
+    // The §2.5 compute bridge: a major-2 module MAY link the frozen tabi@1 vocabulary; the host
+    // links the SAME dispatch the v1 driver uses (genericized over the store — never forked)
+    // while the bridge is advertised. This retires the sitting-3 `BridgeUnwired` bound.
+    let bridge = module.imports().any(|i| i.module() == NS_TABI_V1);
 
     let engine_cfg: EngineConfig = worker.config().clone();
     let abi_packed = u64::from(daemon_vhc_abi::DA_ABI_MAJOR_V2) << 16;
@@ -1158,7 +1161,7 @@ pub fn start_run(
     sink.run_header(
         abi_packed,
         &worlds,
-        false,
+        bridge,
         &run.manifest_bytes,
         &run.config,
         &run.grants,
@@ -1192,6 +1195,10 @@ pub fn start_run(
 
     let mut linker: Linker<V2Host> = Linker::new(worker.engine());
     link_v2(&mut linker).map_err(|e| V2Error::Sandbox(e.to_string()))?;
+    if bridge {
+        // The identical frozen dispatch the v1 linker carries, monomorphized over V2Host (§2.5).
+        crate::runtime::link_tabi(&mut linker).map_err(|e| V2Error::Sandbox(e.to_string()))?;
+    }
 
     let signing = SigningKey::from_bytes(&run.signing_seed);
     let sender = peer_id(&signing).0;
@@ -1227,6 +1234,8 @@ pub fn start_run(
                 max_frame_bytes: run.max_frame_bytes,
                 hard_accountable_host_bytes: run.hard_accountable_host_bytes,
                 accountable_staged_bytes: 0,
+                tabi: bridge.then(|| crate::runtime::HostState::new(&engine_cfg)),
+                slice_pass_open: false,
                 signing,
                 identity: run.identity.clone(),
                 sender,
@@ -1360,6 +1369,69 @@ fn take_trap(store: &mut Store<V2Host>, e: wasmtime::Error) -> Trap {
     Trap::bare(code, msg)
 }
 
+impl crate::runtime::TabiHost for V2Host {
+    fn tabi(&mut self) -> &mut crate::runtime::HostState {
+        self.tabi
+            .as_mut()
+            .expect("bridge linked only when tabi imports exist")
+    }
+    fn tabi_ref(&self) -> &crate::runtime::HostState {
+        self.tabi
+            .as_ref()
+            .expect("bridge linked only when tabi imports exist")
+    }
+    /// The §2.5 temporal-legality rules (the v1 phase table does NOT apply): registration imports
+    /// are legal ONLY during `da_init`; every other bridge import is legal in any `da_run` slice;
+    /// every call charges the v2 per-slice op budget (§5.5) and honors the mandatory-retry rules.
+    fn enter_tabi(&mut self, import: &'static str) -> Result<(), Trap> {
+        if self.slice.stopped {
+            return Err(Trap::new(
+                TrapCode::PhaseViolation,
+                import,
+                None,
+                "bridge import after Stop was consumed (§4.4)",
+            ));
+        }
+        if self.slice.pending_next.is_some() || self.slice.pending_readback.is_some() {
+            return Err(Trap::new(
+                TrapCode::BadEvent,
+                import,
+                None,
+                "NeedCapacity requires an immediate retry before any other import (§4.1/§6.4)",
+            ));
+        }
+        let registration = matches!(import, "param@1" | "persistent@1" | "det_persistent@1");
+        if registration != self.slice.in_init {
+            return Err(Trap::new(
+                TrapCode::PhaseViolation,
+                import,
+                None,
+                if registration {
+                    "bridge registration imports are legal only during da_init (§2.5)"
+                } else {
+                    "non-registration bridge imports are illegal during da_init (§2.5)"
+                },
+            ));
+        }
+        self.charge_op(import)
+    }
+    fn stash_trap(&mut self, t: Trap) {
+        self.trap = Some(t);
+    }
+    /// Bridge nr-class results are journaled verbatim under the §2.7 reserved kinds (≥ 128) so
+    /// input replay can feed them back without re-running native kernels.
+    fn journal_bridge_nr(&mut self, kind: u32, value: &[u8]) {
+        let shared = self.shared.clone();
+        let mut st = shared.state.lock().expect("pump lock");
+        // A sink failure here is a host fault; surface it as a stashed trap on the next boundary
+        // rather than swallowing (journaling is load-bearing, §8.4).
+        if let Err(e) = st.sink.read_back(0, u64::from(kind), 0, value) {
+            drop(st);
+            self.trap = Some(Trap::bare(TrapCode::BadModule, e.to_string()));
+        }
+    }
+}
+
 fn journal_terminal_trap(shared: &Arc<PumpShared>, trap: &Trap) -> Result<(), SinkError> {
     let mut st = shared.state.lock().expect("pump lock");
     st.sink.terminal(
@@ -1459,6 +1531,8 @@ mod tests {
             max_frame_bytes: 0,
             hard_accountable_host_bytes: 0,
             accountable_staged_bytes: 0,
+            tabi: None,
+            slice_pass_open: false,
             signing,
             identity: RunIdentity {
                 run_id: [1u8; 32],
