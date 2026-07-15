@@ -33,6 +33,10 @@ extern "C" {
     fn abi_rng_seed(out_ptr: u32) -> u32;
     #[link_name = "device_profile"]
     fn abi_device_profile(out_ptr: u32, out_cap: u32) -> u64;
+    #[link_name = "hash"]
+    fn abi_hash(in_ptr: u32, in_len: u32, out_ptr: u32) -> u32;
+    #[link_name = "verify_sig"]
+    fn abi_verify_sig(pk_ptr: u32, sig_ptr: u32, msg_ptr: u32, msg_len: u32) -> u32;
 }
 
 /// One decoded event: the §4.2 tag plus the positional fields (tag included at index 0).
@@ -168,6 +172,46 @@ pub fn rng_seed() -> [u8; 32] {
         unreachable!("unknown rng_seed status (fail closed, §5.2)");
     }
     seed
+}
+
+/// The `sys@2::hash` crypto acceleration: blake3-256 of `data` (the det-lane pattern — the
+/// in-guest fallback is `daemon_vhc_proto::crypto::hash`, this is the host fast path; the two
+/// are bit-identical by construction and gated in tier-1). Deterministic — never journaled.
+#[must_use]
+pub fn hash_accel(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    // SAFETY: `data`/`out` are live guest spans for the call's duration.
+    let status = unsafe {
+        abi_hash(
+            data.as_ptr() as u32,
+            data.len() as u32,
+            out.as_mut_ptr() as u32,
+        )
+    };
+    if status != 0 {
+        unreachable!("unknown hash status (fail closed, §5.2)");
+    }
+    out
+}
+
+/// The `sys@2::verify_sig` crypto acceleration: ed25519 verify, returning the tri-state
+/// `daemon_vhc_proto::crypto::VerifyOutcome` code (0 valid / 1 invalid / 2 malformed — unknown
+/// codes fail closed). In-guest fallback: `daemon_vhc_proto::crypto::verify_sig`.
+#[must_use]
+pub fn verify_sig_accel(public_key: &[u8; 32], signature: &[u8; 64], message: &[u8]) -> u32 {
+    // SAFETY: all three are live guest spans for the call's duration.
+    let code = unsafe {
+        abi_verify_sig(
+            public_key.as_ptr() as u32,
+            signature.as_ptr() as u32,
+            message.as_ptr() as u32,
+            message.len() as u32,
+        )
+    };
+    if code > 2 {
+        unreachable!("unknown verify_sig outcome (fail closed, §5.2)");
+    }
+    code
 }
 
 /// The device profile the probe measures (architecture §3.5 — what makes module autotune
