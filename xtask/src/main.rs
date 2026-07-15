@@ -388,6 +388,21 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_bridge"],
         ),
         (
+            // THE Phase-A acceptance (refactor §5 A2): TinyLlama on BarrierRound under the v2
+            // driver + bridge reproduces the v1 WasmBackend's det-lane state digests — cpu +
+            // burn-ndarray tiers here; wgpu/cuda tiers are hardware-gated in the same test file
+            // (the scheduled GPU lanes, like reference_parity_{wgpu,cuda}).
+            "A2 det-digest parity: TinyLlama-on-BarrierRound v2 ≡ v1 (cpu + burn-ndarray)",
+            &[
+                "-p",
+                "daemon-vhc-host",
+                "--test",
+                "v2_parity",
+                "--features",
+                "burn-ndarray",
+            ],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),
