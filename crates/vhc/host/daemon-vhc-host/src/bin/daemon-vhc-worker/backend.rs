@@ -22,10 +22,13 @@ use crate::SEQ;
 /// not spuriously reject on an unprobed number (`u64::MAX / MiB`).
 const UNKNOWN_BUDGET_MB: u64 = u64::MAX / (1 << 20);
 
-/// The experiment inputs a run resolves to: the `[experiment.config]` CBOR + the module `.wasm`.
+/// The experiment inputs a run resolves to: the `[experiment.config]` CBOR + the module `.wasm`,
+/// plus the envelope's per-role blake3 pin when one exists (the ABI §1.3 step-1 verify-before-
+/// compile input; `None` on the legacy `DAEMON_TRAIN_MODULE`/raw-config paths, which carry no pin).
 pub(crate) struct ResolvedRun {
     pub(crate) config: Vec<u8>,
     pub(crate) module: Vec<u8>,
+    pub(crate) module_blake3: Option<[u8; 32]>,
 }
 
 /// Resolve the `AssessRun` envelope bytes into `(config, module)` (the §6.1/§6.5 seam).
@@ -41,8 +44,12 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
             // A signed-envelope wrapper: verify it (re-derives hash + config, checks the signature).
             let frozen = wire.open().map_err(|e| format!("verify envelope: {e}"))?;
             let config = frozen.config_bytes().to_vec();
-            let module = resolve_module(&frozen).await?;
-            Ok(ResolvedRun { config, module })
+            let (module, module_blake3) = resolve_module(&frozen).await?;
+            Ok(ResolvedRun {
+                config,
+                module,
+                module_blake3,
+            })
         }
         // Not a signed-envelope wrapper: the legacy raw `[experiment.config]` CBOR path.
         Err(_) => {
@@ -53,6 +60,7 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
             Ok(ResolvedRun {
                 config: envelope_bytes.to_vec(),
                 module,
+                module_blake3: None,
             })
         }
     }
@@ -71,9 +79,14 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
 /// Every path blake3-verifies the bytes against the artifact-map hash **before** `assess`/
 /// instantiation ([`ArtifactResolver::fetch`] / [`ContentCache`]), so a tampered module is rejected
 /// before the wasm engine loads it (§6.5, §12).
-async fn resolve_module(frozen: &daemon_vhc_proto::FrozenEnvelope) -> Result<Vec<u8>, String> {
+async fn resolve_module(
+    frozen: &daemon_vhc_proto::FrozenEnvelope,
+) -> Result<(Vec<u8>, Option<[u8; 32]>), String> {
     if let Some(bytes) = module_from_env() {
-        return bytes;
+        // The explicit dev/node-controlled override deliberately bypasses the artifact map, so it
+        // carries no envelope pin (the operator chose the bytes; there is nothing to verify them
+        // against — matching the pre-A0 behavior of this path).
+        return bytes.map(|b| (b, None));
     }
     let envelope = frozen
         .decode()
@@ -83,6 +96,7 @@ async fn resolve_module(frozen: &daemon_vhc_proto::FrozenEnvelope) -> Result<Vec
         .artifacts
         .get(name)
         .ok_or_else(|| format!("experiment module `{name}` absent from [artifacts]"))?;
+    let pin = Some(artifact.blake3.0);
     let art = ArtifactRef::new(artifact.url.clone(), artifact.blake3);
 
     // Content-addressed fetch from the payload store (fleet distribution) — feature-gated because
@@ -91,12 +105,14 @@ async fn resolve_module(frozen: &daemon_vhc_proto::FrozenEnvelope) -> Result<Vec
     if !artifact.url.starts_with("file://") {
         return fetch_artifact_from_store(&art)
             .await
+            .map(|b| (b, pin))
             .map_err(|e| format!("fetch module `{name}` ({}) from store: {e}", artifact.url));
     }
 
     ArtifactResolver::new()
         .fetch(&art)
         .await
+        .map(|b| (b, pin))
         .map_err(|e| format!("resolve module `{name}` ({}): {e}", artifact.url))
 }
 
@@ -625,9 +641,25 @@ pub(crate) fn device_limits() -> DeviceLimits {
     }
 }
 
-/// The peer-side re-validation (spec §6.5): a static import scan of the module vs the host `tabi@1`
-/// vocabulary, then a host meta-mode pass over the config → an [`Eligibility`] verdict.
-pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String> {
+/// The peer-side re-validation, A0 dual-dispatch shape (ABI Draft 3 §1.3; decisions D2):
+///
+/// 1. **Driver selection first** — [`daemon_vhc_host::select_driver`] runs the normative order
+///    (hash-verify before compile → static-import inspection → candidate linker → instantiate →
+///    `da_abi` cross-check). Any failure is a **typed admission refusal** returned as an
+///    ineligible [`Eligibility`] carrying the split `refusal_code` slug — an `Assessed` outcome,
+///    never an `Event::Error` (ABI §1.5).
+/// 2. A module selecting the **v1 driver** proceeds down the byte-for-byte unchanged v1 assess:
+///    the static import scan vs the host `tabi@1` vocabulary, then the host meta-mode pass +
+///    autotune verdict.
+/// 3. A module selecting the **v2 driver** cannot happen in A0 (major 2 is not in
+///    `HOST_IMPLEMENTED_MAJORS`, so selection already refused it `AbiUnsupportedMajor` naming the
+///    missing event-loop driver); the arm is still written defensively so flipping the constant in
+///    A2 without shipping the driver stays a refusal, not a panic.
+pub(crate) fn assess(
+    module: &[u8],
+    config: &[u8],
+    module_blake3: Option<&[u8; 32]>,
+) -> Result<Eligibility, String> {
     // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (the meta pass over a real-scale
     // param layout exceeds the tiny-model defaults). The meta pass itself stays on the CPU-cheap
     // path (footprint estimation, backend-independent).
@@ -640,6 +672,39 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
         EngineConfig::default()
     };
     let worker = Worker::new(engine).map_err(|e| format!("engine: {e}"))?;
+
+    // ABI §1.3 steps 1–6: hash-verify → compile+inspect → candidate → instantiate → cross-check.
+    match daemon_vhc_host::select_driver(&worker, module, module_blake3) {
+        Ok(sel) if sel.driver == daemon_vhc_abi::CandidateDriver::V1 => {
+            // Fall through to the retained v1 assess below — unchanged behavior.
+        }
+        Ok(sel) => {
+            // Defensive A2 seam: selection admitted a non-v1 driver this worker does not carry.
+            return Ok(Eligibility {
+                eligible: false,
+                reasons: vec![format!(
+                    "AbiUnsupportedMajor: module selected the major-{} event-loop driver, but \
+                     this worker ships no v2 driver (it lands in Phase A2)",
+                    sel.major
+                )],
+                headroom: Vec::new(),
+                refusal_code: Some(
+                    daemon_vhc_abi::AbiRefusalCode::AbiUnsupportedMajor
+                        .slug()
+                        .to_string(),
+                ),
+            });
+        }
+        Err(refusal) => {
+            return Ok(Eligibility {
+                eligible: false,
+                reasons: vec![refusal.to_string()],
+                headroom: Vec::new(),
+                refusal_code: Some(refusal.code.slug().to_string()),
+            });
+        }
+    }
+
     let vocabulary: BTreeSet<String> = host_ops().into_iter().collect();
     let imports = worker
         .module_imports(module)
@@ -658,6 +723,7 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
                 missing.join(", ")
             )],
             headroom: Vec::new(),
+            refusal_code: None,
         });
     }
 
@@ -688,6 +754,7 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
     Ok(Eligibility {
         eligible: verdict.eligible,
         reasons,
+        refusal_code: None,
         headroom: vec![
             ("micro_batch".to_string(), i64::from(verdict.micro_batch)),
             ("vram_mb".to_string(), verdict.vram_mb_estimate as i64),

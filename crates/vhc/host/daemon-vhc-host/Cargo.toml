@@ -30,6 +30,12 @@ path = "src/bin/daemon-vhc-probe.rs"
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+# The shared ABI contract (frozen `tabi@1` vocabulary + the v2 constants, import-namespace
+# vocabulary, candidate-selection helpers, and the split admission-refusal taxonomy). A0 uses it
+# for driver selection (ABI §1.3) — promoted from a dev-dep (the `abi_surface` sync check) to a
+# normal dep now that the runtime consumes the selection API. contracts/ crate: links neither
+# sdk/* nor host/*, so the dependency-direction gate is unaffected.
+daemon-vhc-abi = { workspace = true }
 # Host worker runtime: the wasm module sandbox (wasmtime) + the training engine (Burn, ndarray
 # backend + autodiff; NO GPU backends in the default gate) + content hashing for artifact / tensor
 # digests (blake3, xxh3). swarm-training-spec.md §5.1, §10.1. Heavy trees on purpose: this crate is
@@ -136,10 +142,11 @@ swarm-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress", "d
 cuda = ["burn/cuda", "dep:cudarc"]
 
 [dev-dependencies]
-# Test-only: the frozen-surface sync check (`tests/abi_surface.rs`) asserts the host `Linker` +
-# phase table name-for-name against the ABI contract crate's `TABI_IMPORTS` — the shared, dual-
-# compiled `contracts/` ground, so this check no longer dev-deps the guest SDK (host->SDK wart).
-daemon-vhc-abi = { workspace = true }
+# Test-only: hand-built wasm fixtures (the driver-selection negative tests) are assembled with
+# `wasm-encoder` — precise control over import namespaces + the `da_abi` constant, with no
+# wasm32 toolchain or guest workspace in the tier-1 lane. Already resolved in Cargo.lock (a
+# wasmtime/cranelift transitive), so this dev-dep adds no new crate to the graph.
+wasm-encoder = { workspace = true }
 # Test-only: the guest-lifecycle / parity tests build the `TinyLlamaCfg` the wasm guest parses.
 # `sim` compiles the SDK's `models`/`profiles` (config types) natively for the tests; never a
 # runtime edge (the host does not link the guest SDK). NOTE: this remaining host->SDK dev-dep is a

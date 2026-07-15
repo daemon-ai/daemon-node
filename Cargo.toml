@@ -77,6 +77,11 @@ ciborium = "0.2"
 # (§10.5) are `Config` runtime levers, always available — no cargo feature required. No WASI (the
 # ABI is our own tensor ABI, tensor-ABI spec §5.1).
 wasmtime = { version = "46", default-features = false, features = ["runtime", "cranelift", "pooling-allocator"] }
+# Test-only wasm assembler for the A0 driver-selection negative fixtures (hand-built modules with
+# precise import namespaces + a `da_abi` constant). Version tracks the wasm-tools stack wasmtime 46
+# already pins in Cargo.lock (0.251), so this is a lock-neutral dev-dep — no new crate/source enters
+# the graph. Never a normal dependency; only `daemon-vhc-host`'s dev-deps use it.
+wasm-encoder = { version = "0.251", default-features = false }
 # The training engine, isolated to `daemon-vhc-host`. default-features = false + the ndarray backend
 # and autodiff only are ALWAYS on (the CPU/G1 lane); GPU backends stay OUT of the default gate. The
 # `wgpu` backend (burn 0.21's `wgpu` feature -> burn-wgpu + cubecl + wgpu 29; the P1 GPU lane targets
