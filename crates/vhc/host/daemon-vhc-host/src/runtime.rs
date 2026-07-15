@@ -1312,6 +1312,41 @@ impl HostState {
         }
     }
 
+    /// The §5.9 barrier snapshot — the host-side epilogue `Instance::ingest` runs after
+    /// `da_ingest_updates` returns: the post-ingest master becomes the next round's base. The v2
+    /// driver applies it at the close of any slice that consumed a staged update (`read_back`
+    /// kind 2) — the bridge's ingest slice.
+    pub(crate) fn snapshot_round_bases(&mut self) {
+        for p in 0..self.params.len() {
+            let base = self.backend.view(self.params[p].master).to_vec();
+            self.backend.write(self.params[p].round_base, &base);
+        }
+    }
+
+    /// The canonical state bytes the round digest is taken over — the `Instance` method's body,
+    /// on the state, so the v2 driver can export it for the parity oracle before the guest
+    /// thread drops the store (params' fp32 masters, then replicated persistents, then
+    /// replicated det persistents, registration order, little-endian).
+    pub(crate) fn canonical_state_bytes_of(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for p in &self.params {
+            for v in self.backend.view(p.master) {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for s in self.persistents.iter().filter(|s| s.class == 1) {
+            for v in self.backend.view(s.tensor) {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for s in self.det_persistents.iter().filter(|s| s.class == 1) {
+            for v in self.backend.view(s.tensor) {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        buf
+    }
+
     /// Bridge staging, `read_back` kind 1 (ABI §2.5 rule 2 / §6.4): register a host-staged batch —
     /// the v1 `Instance::register_batch` body, on the state — yielding the kind-7 batch handle
     /// (instance-class: survives slices until restart, §7.1).
@@ -1324,7 +1359,17 @@ impl HostState {
     /// container — the per-payload half of the v1 `Instance::ingest_payloads` — yielding the
     /// staging index the `upd_*@1` vocabulary consumes. Containers accumulate for the instance's
     /// life (instance-class, §7.1); consumers use the RETURNED index, never a 0-based recount.
-    pub(crate) fn stage_bridge_update(&mut self, payload: &[u8]) -> Result<u32, String> {
+    pub(crate) fn stage_bridge_update(
+        &mut self,
+        payload: &[u8],
+        fresh_window: bool,
+    ) -> Result<u32, String> {
+        // The v1 ingest prologue (per-entry `staged.clear()`): each ingest slice stages a FRESH
+        // window, so `upd_*@1` indices are `0..count` per round exactly as `da_ingest_updates`
+        // presents them — the SDK's `UpdatesView::with_count` reads unchanged under the bridge.
+        if fresh_window {
+            self.staged.clear();
+        }
         let wire: Vec<SectionWire> =
             ciborium::from_reader(payload).map_err(|e| format!("payload decode: {e}"))?;
         let sections = wire

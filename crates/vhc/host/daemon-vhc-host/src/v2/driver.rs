@@ -212,6 +212,9 @@ struct PumpState {
     logs: Vec<(u32, String)>,
     /// Published frames, for embedder-side assertions: `(channel, seq, signed frame bytes)`.
     published: Vec<(u64, u64, Vec<u8>)>,
+    /// The final bridge canonical state, exported by the guest thread before it drops the
+    /// store (the parity-oracle hook: the digest input, §3.6 tier-3 comparisons).
+    bridge_final_state: Option<Vec<u8>>,
     /// A `Stop` has been enqueued — no further deliveries will be accepted after it.
     stop_enqueued: bool,
     /// A `Quiesce` drain is open: Frame/PayloadReady/Timer deliveries are frozen (§4.4).
@@ -482,6 +485,18 @@ impl PumpHandle {
         Ok(())
     }
 
+    /// The bridge's final canonical state bytes (the digest input), exported by the guest thread
+    /// before it dropped the store. `None` until the run ends, or when no bridge was linked.
+    #[must_use]
+    pub fn bridge_final_state(&self) -> Option<Vec<u8>> {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .bridge_final_state
+            .clone()
+    }
+
     /// Signed frames the guest has published so far: `(channel, seq, signed frame bytes)`.
     #[must_use]
     pub fn published(&self) -> Vec<(u64, u64, Vec<u8>)> {
@@ -552,6 +567,9 @@ struct V2Host {
     tabi: Option<crate::runtime::HostState>,
     // Whether a bridge slice pass is open (begin/end at Delivered boundaries, §2.5 rule 4).
     slice_pass_open: bool,
+    // Whether the open slice consumed a staged update (read_back kind 2) — its close is the v1
+    // ingest epilogue: the §5.9 barrier snapshot (post-ingest master → next round's base).
+    slice_ingested: bool,
     // signing (§12.1)
     signing: SigningKey,
     identity: RunIdentity,
@@ -780,6 +798,13 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                 // slice's pass (clear step arenas wholesale, free tensors — the v1 finish_entry
                 // teardown) and begin the new slice's differentiable pass.
                 if let Some(tabi) = d.tabi.as_mut() {
+                    // The v1 ingest epilogue at the slice that ingested (§5.9): the post-ingest
+                    // master is the next round's base. v1 runs it as `Instance::ingest` returns;
+                    // the bridge's equivalent boundary is the close of the ingesting slice.
+                    if d.slice_ingested {
+                        tabi.snapshot_round_bases();
+                        d.slice_ingested = false;
+                    }
                     if d.slice_pass_open {
                         tabi.end_slice_pass_and_clear();
                     }
@@ -951,11 +976,17 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         out
                     }
                     daemon_vhc_abi::READBACK_KIND_STAGED_UPDATE => {
+                        // The slice's first staged update opens a FRESH window (v1's per-ingest
+                        // `staged.clear()`), so `upd_*@1` indices are 0-based per round.
+                        let fresh_window = !c.data().slice_ingested;
                         let idx = c
                             .data_mut()
                             .tabi()
-                            .stage_bridge_update(&staged_bytes)
+                            .stage_bridge_update(&staged_bytes, fresh_window)
                             .map_err(|e| Trap::bare(TrapCode::BadModule, e))?;
+                        // This slice is an ingest slice: its close runs the §5.9 barrier
+                        // snapshot (v1's ingest epilogue).
+                        c.data_mut().slice_ingested = true;
                         let mut out = Vec::new();
                         ciborium::into_writer(&ciborium::value::Value::from(idx), &mut out)
                             .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
@@ -1367,6 +1398,7 @@ pub fn start_run(
             metrics: Vec::new(),
             logs: Vec::new(),
             published: Vec::new(),
+            bridge_final_state: None,
             stop_enqueued: false,
             draining: false,
         }),
@@ -1421,6 +1453,7 @@ pub fn start_run(
                 accountable_staged_bytes: 0,
                 tabi: bridge.then(|| crate::runtime::HostState::new(&engine_cfg)),
                 slice_pass_open: false,
+                slice_ingested: false,
                 signing,
                 identity: run.identity.clone(),
                 sender,
@@ -1507,7 +1540,20 @@ pub fn start_run(
             let da_run = instance
                 .get_typed_func::<(), u32>(&mut store, "da_run")
                 .map_err(|_| V2Error::Sandbox("missing/mis-typed da_run".into()))?;
-            match da_run.call(&mut store, ()) {
+            let run_result = da_run.call(&mut store, ());
+            // The parity-oracle hook: export the bridge's final canonical state through the pump
+            // BEFORE this thread drops the store (guest-thread-owned teardown, §11.3) — the
+            // digest input the det-lane comparisons consume (§3.6).
+            {
+                let final_state = store
+                    .data()
+                    .tabi
+                    .as_ref()
+                    .map(crate::runtime::HostState::canonical_state_bytes_of);
+                let mut st = shared.state.lock().expect("pump lock");
+                st.bridge_final_state = final_state;
+            }
+            match run_result {
                 Ok(outcome) => {
                     let mut st = shared.state.lock().expect("pump lock");
                     st.sink.terminal(0, Some(u64::from(outcome)), None)?;
@@ -1650,6 +1696,7 @@ mod tests {
             metrics: Vec::new(),
             logs: Vec::new(),
             published: Vec::new(),
+            bridge_final_state: None,
             stop_enqueued: false,
             draining: false,
         }
@@ -1719,6 +1766,7 @@ mod tests {
             accountable_staged_bytes: 0,
             tabi: None,
             slice_pass_open: false,
+            slice_ingested: false,
             signing,
             identity: RunIdentity {
                 run_id: [1u8; 32],
