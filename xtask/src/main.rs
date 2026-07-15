@@ -413,6 +413,16 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_replay"],
         ),
         (
+            // The sys@2 crypto-acceleration conformance gate (Phase B; architecture §3.2/§3.7,
+            // refactor §6): the host `hash`/`verify_sig` accel bodies ≡ the dual-compiled
+            // `daemon_vhc_proto::crypto` contract (the in-guest fallback is that same contract
+            // compiled to wasm — bit-exact by construction, the det-lane pattern) over a wide
+            // deterministic sweep + known-answer vectors + tri-state verify semantics. Named as
+            // its own lane (also covered by the host crate suite below).
+            "B2 sys@2 crypto accel conformance (host ≡ in-guest contract: hash/verify_sig)",
+            &["-p", "daemon-vhc-host", "--test", "v2_crypto"],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),

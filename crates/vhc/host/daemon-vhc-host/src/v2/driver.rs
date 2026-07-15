@@ -729,6 +729,28 @@ fn build_signed_frame(
         .map_err(|e| Trap::bare(TrapCode::BadModule, format!("frame encoding: {e}")))
 }
 
+// -- sys@2 crypto accelerations (the det/crypto-lane fast path, §3.2/§3.7) --------------------------
+
+/// The host `sys@2::hash` acceleration body: blake3-256 over `data`, pinned by the dual-compiled
+/// [`daemon_vhc_proto::crypto`] contract. Because the in-guest fallback is that *same* contract
+/// compiled to wasm, host-op ≡ in-guest-op is bit-exact **by construction** (architecture §3.2, the
+/// det-lane pattern). Exposed (crate-public) so the tier-1 conformance gate exercises the exact
+/// body the live import runs. Deterministic → the import carries **no journal record** (§2.7 `dc`
+/// class); replay re-executes it (see [`super::replay`]).
+#[must_use]
+pub fn host_crypto_hash(data: &[u8]) -> [u8; daemon_vhc_proto::HASH_LEN] {
+    daemon_vhc_proto::crypto_hash(data)
+}
+
+/// The host `sys@2::verify_sig` acceleration body: the ABI status code of the tri-state
+/// [`daemon_vhc_proto::VerifyOutcome`] (0 = valid, 1 = invalid, 2 = malformed). Same
+/// dual-compiled-contract / by-construction-parity story as [`host_crypto_hash`]; deterministic,
+/// not journaled.
+#[must_use]
+pub fn host_crypto_verify(public_key: &[u8], signature: &[u8], message: &[u8]) -> u32 {
+    daemon_vhc_proto::verify_sig(public_key, signature, message).code()
+}
+
 // -- the v2 linker ----------------------------------------------------------------------------------
 
 /// How long a parked `next_event` waits between wake checks when no timer bounds the wait.
@@ -1305,6 +1327,55 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                 let mut st = shared.state.lock().expect("pump lock");
                 st.logs.push((level.min(5), msg));
                 Ok(())
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- sys@2::hash — crypto acceleration: blake3-256 over guest bytes (§3.2/§3.7) -------------
+    // The det/crypto-lane fast path: the in-guest fallback (daemon_vhc_proto::crypto) is always
+    // available, this host import accelerates it, and the two are bit-identical by construction.
+    // `(in_ptr, in_len, out_ptr) -> status`; writes HASH_LEN bytes to `out_ptr`, returns 0 (Ok).
+    // Deterministic function of the input → no journal record (§2.7 dc class).
+    linker.func_wrap(
+        NS_SYS_V2,
+        "hash",
+        |mut c: Caller<'_, V2Host>,
+         in_ptr: u32,
+         in_len: u32,
+         out_ptr: u32|
+         -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("hash")?;
+                let data = read_guest(c, in_ptr, in_len)?;
+                let digest = host_crypto_hash(&data);
+                write_guest(c, out_ptr, &digest)?;
+                Ok(0)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- sys@2::verify_sig — crypto acceleration: ed25519 verify (§3.2/§3.7) --------------------
+    // `(pk_ptr, sig_ptr, msg_ptr, msg_len) -> VerifyOutcome code` (0 valid / 1 invalid / 2
+    // malformed). Fixed-length key/sig spans; a bad-length span is a MemOob trap (an out-of-bounds
+    // read), a structurally-bad-but-in-bounds key/sig is `Malformed` (2). Deterministic → not
+    // journaled; replay re-executes it.
+    linker.func_wrap(
+        NS_SYS_V2,
+        "verify_sig",
+        |mut c: Caller<'_, V2Host>,
+         pk_ptr: u32,
+         sig_ptr: u32,
+         msg_ptr: u32,
+         msg_len: u32|
+         -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("verify_sig")?;
+                let pk = read_guest(c, pk_ptr, daemon_vhc_proto::VERIFY_PUBLIC_KEY_LEN as u32)?;
+                let sig = read_guest(c, sig_ptr, daemon_vhc_proto::VERIFY_SIGNATURE_LEN as u32)?;
+                let msg = read_guest(c, msg_ptr, msg_len)?;
+                Ok(host_crypto_verify(&pk, &sig, &msg))
             })(&mut c);
             stash(&mut c, r)
         },

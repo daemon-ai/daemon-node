@@ -314,6 +314,43 @@ fn dispatch(
         }
         // Advisory sinks: no recorded product, no decision (§6.3) — accepted and dropped.
         ("sys@2", "emit_metric" | "log") => Ok(()),
+        // Crypto accelerations are deterministic functions of guest memory (no host observation, so
+        // never journaled, §2.7 dc class): replay RE-EXECUTES them over the reproduced linear
+        // memory and gets the identical answer — the same `daemon_vhc_proto::crypto` contract the
+        // live host accel uses.
+        ("sys@2", "hash") => {
+            let (in_ptr, in_len, out_ptr) = (p_u32(params, 0), p_u32(params, 1), p_u32(params, 2));
+            let mem = mem_of(caller)?;
+            let mut data = vec![0u8; in_len as usize];
+            mem.read(&mut *caller, in_ptr as usize, &mut data)
+                .map_err(|e| wasmtime::Error::msg(format!("hash input read: {e}")))?;
+            let digest = super::driver::host_crypto_hash(&data);
+            let mem = mem_of(caller)?;
+            mem.write(&mut *caller, out_ptr as usize, &digest)
+                .map_err(|e| wasmtime::Error::msg(format!("hash output write: {e}")))?;
+            results[0] = Val::I32(0);
+            Ok(())
+        }
+        ("sys@2", "verify_sig") => {
+            let (pk_ptr, sig_ptr, msg_ptr, msg_len) = (
+                p_u32(params, 0),
+                p_u32(params, 1),
+                p_u32(params, 2),
+                p_u32(params, 3),
+            );
+            let mem = mem_of(caller)?;
+            let mut pk = vec![0u8; daemon_vhc_proto::VERIFY_PUBLIC_KEY_LEN];
+            let mut sig = vec![0u8; daemon_vhc_proto::VERIFY_SIGNATURE_LEN];
+            let mut msg = vec![0u8; msg_len as usize];
+            mem.read(&mut *caller, pk_ptr as usize, &mut pk)
+                .map_err(|e| wasmtime::Error::msg(format!("verify pk read: {e}")))?;
+            mem.read(&mut *caller, sig_ptr as usize, &mut sig)
+                .map_err(|e| wasmtime::Error::msg(format!("verify sig read: {e}")))?;
+            mem.read(&mut *caller, msg_ptr as usize, &mut msg)
+                .map_err(|e| wasmtime::Error::msg(format!("verify msg read: {e}")))?;
+            results[0] = Val::I32(super::driver::host_crypto_verify(&pk, &sig, &msg) as i32);
+            Ok(())
+        }
         ("tabi@1", _) => {
             if let Some((_, want_kind)) = NR_IMPORTS.iter().find(|(n, _)| *n == name) {
                 let (kind, value) = caller.data_mut().script.nr.pop_front().ok_or_else(|| {

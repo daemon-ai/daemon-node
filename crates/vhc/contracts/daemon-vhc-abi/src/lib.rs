@@ -90,8 +90,37 @@ pub const NS_COMPUTE_V2: &str = "compute@2";
 pub const VHC_V2_SYMBOLS: &[&str] = &["next_event", "read_back", "stage_state", "snapshot_state"];
 /// The `net@2` Phase-A symbol vocabulary (ABI §2.2).
 pub const NET_V2_SYMBOLS: &[&str] = &["publish"];
-/// The `sys@2` Phase-A symbol vocabulary (ABI §2.2).
-pub const SYS_V2_SYMBOLS: &[&str] = &["set_timer", "cancel_timer", "now", "emit_metric", "log"];
+/// The `sys@2` **Phase-A** symbol vocabulary (ABI §2.2 table row `sys@2`, Phase A column).
+pub const SYS_V2_PHASE_A_SYMBOLS: &[&str] =
+    &["set_timer", "cancel_timer", "now", "emit_metric", "log"];
+
+/// The `sys@2` **crypto acceleration** symbols (Phase B; ABI §2.2 "later phases", architecture
+/// §3.2/§3.7): `hash` and `verify_sig`, following the det-lane pattern — semantics pinned by the
+/// dual-compiled `daemon-vhc-proto::crypto` contract, an in-guest fallback always available, the
+/// host import as the fast path. Their guest-visible results are **deterministic functions of
+/// their inputs** (no host observation), so they carry no journal record — replay re-executes
+/// them over the reproduced guest memory (the `dc`/`dd` replay classes, ABI §2.7).
+///
+/// Cross-track note (B1/B3): adding import symbols is an *additive-minor* growth (ABI §1.4). The
+/// shared `DA_ABI_MINOR_V2` bump to the collective Phase-B minor — and the per-symbol
+/// introduced-minor map §1.3 step 3 wants — is a single change all three Phase-B tracks share; it
+/// is deliberately **not** made here so the tracks can agree on one Phase-B minor at merge and the
+/// v2 guest blobs are re-pinned once, not three times. A module declaring minor 0 that does not
+/// import these symbols is unaffected; the host links them for any module that does.
+pub const SYS_V2_CRYPTO_SYMBOLS: &[&str] = &["hash", "verify_sig"];
+
+/// The full `sys@2` symbol vocabulary the host provides (Phase-A subset + the Phase-B crypto
+/// accelerations). The candidate-selection/import-validation path ([`validate_imports`]) checks
+/// membership against this.
+pub const SYS_V2_SYMBOLS: &[&str] = &[
+    "set_timer",
+    "cancel_timer",
+    "now",
+    "emit_metric",
+    "log",
+    "hash",
+    "verify_sig",
+];
 
 /// The v1 five-phase lifecycle exports whose presence (with a `tabi@1`-only import shape) marks a
 /// **candidate major-1** module (ABI §1.3 step 2: "exports include the v1 lifecycle (`da_build` …)").
@@ -894,6 +923,23 @@ mod tests {
     fn frame_envelope_domain_is_major_scoped() {
         // The domain-separation tag is frozen at A2 and major-scoped (ABI §12.1).
         assert_eq!(FRAME_ENVELOPE_DOMAIN_V2, "daemon-vhc/frame/2");
+    }
+
+    #[test]
+    fn sys_v2_vocab_is_phase_a_plus_crypto() {
+        // The full sys@2 vocabulary is the Phase-A subset followed by the Phase-B crypto accels;
+        // both sub-lists are subsets of it, and `validate_imports` accepts every member.
+        for s in SYS_V2_PHASE_A_SYMBOLS {
+            assert!(SYS_V2_SYMBOLS.contains(s), "phase-a symbol {s} missing");
+        }
+        for s in SYS_V2_CRYPTO_SYMBOLS {
+            assert!(SYS_V2_SYMBOLS.contains(s), "crypto symbol {s} missing");
+        }
+        assert_eq!(
+            SYS_V2_SYMBOLS.len(),
+            SYS_V2_PHASE_A_SYMBOLS.len() + SYS_V2_CRYPTO_SYMBOLS.len()
+        );
+        validate_imports(&[("sys@2", "hash"), ("sys@2", "verify_sig")]).unwrap();
     }
 
     #[test]
