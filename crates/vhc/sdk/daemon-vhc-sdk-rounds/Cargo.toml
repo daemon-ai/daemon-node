@@ -1,0 +1,26 @@
+[package]
+name = "daemon-vhc-sdk-rounds"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# `BarrierRound<E>` — DiLoCo-shaped round choreography as LIBRARY code (architecture §6 drivers
+# row; refactor §5 A2 item 3): the round logic that lived in `daemon-vhc-session::RoundEngine`
+# (assignment consumption, train-loop order, the barrier, the straggle ladder), re-expressed as a
+# sans-io reactive core an SDK author links. Created at A2 per the choreography move; the v1
+# native `RoundEngine` remains in the session for the retained v1 cells until the Phase-E sunset.
+#
+# Dependency rules (architecture §7, CI-enforced): sdk/* links contracts/* and lower sdk layers
+# ONLY — never host/*. This crate links exactly `daemon-vhc-proto` (assignment math STAYS in the
+# proto until D0 — refactor §5 A2: "moving it is coupled to the envelope schema, not this phase")
+# and blake3 (the `Staged` mint verification).
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+daemon-vhc-proto = { workspace = true }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

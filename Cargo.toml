@@ -438,6 +438,7 @@ daemon-vhc-abi = { version = "0", path = "crates/vhc/contracts/daemon-vhc-abi" }
 daemon-vhc-proto = { version = "0", path = "crates/vhc/contracts/daemon-vhc-proto" }
 daemon-vhc-det = { version = "0", path = "crates/vhc/contracts/daemon-vhc-det" }
 daemon-vhc-sdk = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk" }
+daemon-vhc-sdk-rounds = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk-rounds" }
 daemon-vhc-net = { version = "0", path = "crates/vhc/host/daemon-vhc-net" }
 daemon-vhc-session = { version = "0", path = "crates/vhc/host/daemon-vhc-session" }
 daemon-vhc-coordinator = { version = "0", path = "crates/vhc/host/daemon-vhc-coordinator" }
