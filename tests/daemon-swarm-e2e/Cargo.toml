@@ -37,6 +37,12 @@ daemon-vhc-sdk = { path = "../../crates/vhc/sdk/daemon-vhc-sdk", features = ["si
 # relocated round logic against the v1 engine — a tracked dependency-direction exception
 # (registered in xtask vhc_dep_check), removed when the v1 engine dissolves at sunset.
 daemon-vhc-sdk-rounds = { workspace = true }
+# The B2 corpus-windowing equivalence oracle (tests/corpus_windowing_oracle.rs): the SDK-side
+# windowing policy (`daemon-vhc-sdk-v2::corpus`) must match the v1 host pipeline
+# (`daemon-vhc-session::data`) decision-for-decision. This leaf test crate is the one place both
+# sides link legally (same rationale as the daemon-vhc-sdk entry above). Path dep like the sdk
+# entry (sdk-v2 is deliberately not in the frozen root [workspace.dependencies]).
+daemon-vhc-sdk-v2 = { path = "../../crates/vhc/sdk/daemon-vhc-sdk-v2" }
 daemon-vhc-coordinator = { workspace = true }
 daemon-vhc-observe = { workspace = true }
 ciborium = { workspace = true }

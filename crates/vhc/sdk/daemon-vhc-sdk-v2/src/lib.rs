@@ -25,9 +25,11 @@ pub use abi::{
     set_timer, Event,
 };
 
+pub mod corpus;
 pub mod migrate;
 pub mod module;
 
+pub use corpus::{BatchLocation, CorpusError, CorpusWindow, Manifest, ShardDesc, TokenWidth};
 pub use migrate::{
     build_manifest, MigrateState, MigrationDescriptor, MigrationSection, OwnedSection, SectionDecl,
     SectionReader, SimSections, StateManifest,
