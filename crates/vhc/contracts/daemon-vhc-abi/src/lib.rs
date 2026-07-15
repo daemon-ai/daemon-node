@@ -1052,7 +1052,9 @@ mod tests {
         // unimplemented major (e.g. a future 3) stays a clean AbiUnsupportedMajor.
         assert_eq!(HOST_IMPLEMENTED_MAJORS, &[1, 2]);
         assert_eq!(host_minor_for(DA_ABI_MAJOR), Some(0));
-        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(0));
+        // B1 bumped the major-2 minor to 1 in the same commit that made Completion delivery
+        // real (the ratified additive path, ABI §1.4/§4.6); minor 2 stays AbiMinorTooNew.
+        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(1));
         assert_eq!(host_minor_for(3), None);
     }
 
