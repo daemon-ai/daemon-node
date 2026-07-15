@@ -872,6 +872,77 @@ pub fn comp_err_slug(code: u64) -> Option<&'static str> {
     }
 }
 
+// ================================================================================================
+// The grants + manifest vocabulary (ABI §2.3 / §2.6): the single canonical shape naming everything
+// a role-instance may reach.
+//
+// This is the vocabulary B1 extends for the Phase-B worlds — per-grant bounds (net topics/rates/
+// payload bytes via `grant-bound`), buffer quota (`buffer-req`), and advisory queue depths
+// (`event-caps`) — additively on the v1 schema (refactor §6); the full envelope reshape is D0. It is
+// the vocabulary B2/B3 consume: the guest SDK authors a `manifest`, the host derives the admitted
+// `grants-doc` as `lane ∩ envelope ∩ owner ∩ manifest` (§2.6), and both key against these exact
+// field names. The abi crate is dependency-free / dual-compiled, so it holds the grammar +
+// key-name constants; the Rust request/grant types live host-side.
+// ================================================================================================
+
+/// The normative grants + manifest grammar (ABI §2.3 `manifest`/`world-req`/`event-caps`/
+/// `buffer-req`/`grant-bound`; §2.6 `grants-doc`/`world-grant`/`migration-grant`/`channel-decl`).
+///
+/// Root rules `grants-doc` (the admitted grants) and `manifest` (the module request). It MUST
+/// validate as-is under `cddl-cat`; the `grants_grammar` test asserts it is machine-valid and that
+/// representatives of both roots validate. The admitted `grants-doc` bytes are journaled verbatim in
+/// the run header ([`JOURNAL_CDDL`] tag 0 `grants`).
+pub const GRANTS_CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/grants.cddl"));
+
+/// The grants-document schema version this contract defines (`grants-doc.version`, ABI §2.6).
+pub const GRANTS_DOC_VERSION: u64 = 1;
+
+// -- `grant-bound` keys (ABI §2.3): the shared per-grant bound vocabulary ------------------------
+
+/// `grant-bound` key: per-item byte ceiling (publish payload, readback value, payload bytes) (§2.3).
+pub const GRANT_BOUND_KEY_MAX_BYTES: &str = "max_bytes";
+/// `grant-bound` key: per-event-slice call ceiling for this grant (§2.3).
+pub const GRANT_BOUND_KEY_MAX_PER_SLICE: &str = "max_per_slice";
+/// `grant-bound` key: sustained rate ceiling (token bucket, per minute) (§2.3).
+pub const GRANT_BOUND_KEY_RATE_PER_MIN: &str = "rate_per_min";
+/// `grant-bound` key: concurrent-operation ceiling — the Phase-B completion outstanding cap (§2.3).
+pub const GRANT_BOUND_KEY_MAX_OUTSTANDING: &str = "max_outstanding";
+/// `grant-bound` key: the enumerated allowed values (topics, dataset hashes, sources) (§2.3).
+pub const GRANT_BOUND_KEY_VALUES: &str = "values";
+
+// -- `world-req` / `world-grant` keys (ABI §2.3 / §2.6) ------------------------------------------
+
+/// `world-req` key: the world/namespace name (`"vhc"`/`"net"`/`"sys"`/`"data"`/`"compute"`/`"tabi"`).
+pub const WORLD_KEY_WORLD: &str = "world";
+/// `world-req`/`world-grant` key: the requested/admitted namespace minor (§2.3/§2.6).
+pub const WORLD_KEY_MINOR: &str = "minor";
+/// `world-req` key: the requested per-grant bounds map (§2.3).
+pub const WORLD_KEY_GRANTS: &str = "grants";
+/// `world-grant` key: the admitted per-grant bounds map (§2.6).
+pub const WORLD_GRANT_KEY_BOUNDS: &str = "bounds";
+
+// -- `buffer-req` keys (ABI §2.3): the live-resource + linear-memory-crossing quotas -------------
+
+/// `buffer-req` key: standing live-resource ceiling across all instance-class handles (§2.3/§7.3).
+pub const BUFFER_REQ_KEY_MAX_LIVE_HANDLES: &str = "max_live_handles";
+/// `buffer-req` key: standing live-buffer byte ceiling — the Phase-B buffer quota (§2.3/§7.4).
+pub const BUFFER_REQ_KEY_MAX_LIVE_BYTES: &str = "max_live_bytes";
+/// `buffer-req` key: per-slice ceiling on bytes crossing into linear memory via `read_into` (§2.3).
+pub const BUFFER_REQ_KEY_MAX_READBACK_BYTES: &str = "max_readback_bytes";
+
+// -- `event-caps` keys + advisory class names (ABI §2.3 / §4.7): advisory queue depths ------------
+
+/// `event-caps` per-class key: the declared advisory queue depth (§2.3).
+pub const EVENT_CAP_KEY_DEPTH: &str = "depth";
+/// `event-caps` per-class key: the fixed coalescing rule (`COALESCE_*`) (§2.3).
+pub const EVENT_CAP_KEY_COALESCE: &str = "coalesce";
+/// `event-caps` class key: the `PayloadReady` advisory class (dedup-by-hash, §4.7).
+pub const EVENT_CLASS_PAYLOAD_READY: &str = "payload-ready";
+/// `event-caps` class key: the `Timer` advisory class (latest-wins, §4.7).
+pub const EVENT_CLASS_TIMER: &str = "timer";
+/// `event-caps` class key: the gossip advisory class (drop-oldest, §4.7).
+pub const EVENT_CLASS_GOSSIP: &str = "gossip";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,6 +1238,42 @@ mod tests {
         assert_eq!(slugs.len(), n, "comp-error slugs must be unique");
         assert_eq!(comp_err_slug(COMP_ERR_RESERVED_MIN), None);
         assert_eq!(comp_err_slug(u64::MAX), None);
+    }
+
+    #[test]
+    fn grant_vocabulary_keys_are_unique_and_stable() {
+        // ABI §2.3/§2.6: the structural key names both `manifest` and `grants-doc` consumers key
+        // against. They must be unique so B2/B3 (adding their worlds' bounds) reference one set.
+        let keys = [
+            GRANT_BOUND_KEY_MAX_BYTES,
+            GRANT_BOUND_KEY_MAX_PER_SLICE,
+            GRANT_BOUND_KEY_RATE_PER_MIN,
+            GRANT_BOUND_KEY_MAX_OUTSTANDING,
+            GRANT_BOUND_KEY_VALUES,
+            WORLD_KEY_WORLD,
+            WORLD_KEY_MINOR,
+            WORLD_KEY_GRANTS,
+            WORLD_GRANT_KEY_BOUNDS,
+            BUFFER_REQ_KEY_MAX_LIVE_HANDLES,
+            BUFFER_REQ_KEY_MAX_LIVE_BYTES,
+            BUFFER_REQ_KEY_MAX_READBACK_BYTES,
+            EVENT_CAP_KEY_DEPTH,
+            EVENT_CAP_KEY_COALESCE,
+            EVENT_CLASS_PAYLOAD_READY,
+            EVENT_CLASS_TIMER,
+            EVENT_CLASS_GOSSIP,
+        ];
+        let mut sorted: Vec<&str> = keys.to_vec();
+        let n = sorted.len();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), n, "grant vocabulary keys must be unique");
+        assert_eq!(GRANTS_DOC_VERSION, 1);
+        // The advisory event classes align with their fixed coalescing rules (§4.7): payload-ready
+        // dedup-by-hash, timer latest-wins, gossip drop-oldest.
+        assert_eq!(COALESCE_DEDUP_HASH, 0);
+        assert_eq!(COALESCE_LATEST_WINS, 1);
+        assert_eq!(COALESCE_DROP_OLDEST, 2);
     }
 
     #[test]
