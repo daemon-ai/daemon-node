@@ -9,7 +9,12 @@
 //!
 //! - `da_init` parses its config (`[n: u8]` — how many timer ticks to average over) and arms
 //!   nothing (imports are illegal during `da_init`, ABI §6.6).
-//! - `da_run` arms the first timer, then pulls events. On each `Timer` event it folds `fired_at`
+//! - `da_run` first performs **module autotune** (architecture §3.5, Phase B): it reads the
+//!   host's device profile (`sys@2::device_profile` — a journaled tag-15 nondeterministic input)
+//!   and picks its own micro-batch size from `vram_bytes`, and reads the identity-derived
+//!   deterministic seed (`sys@2::rng_seed` — §2.7 dc class, replay re-derives it), voicing both
+//!   as advisory metrics the harness pins.
+//! - It then arms the first timer and pulls events. On each `Timer` event it folds `fired_at`
 //!   into a running mean, publishes the mean (8-byte LE f64 payload — opaque bytes to every layer
 //!   below) on the `control` channel, and re-arms until `n` ticks have been averaged.
 //! - It then keeps pulling until `Stop` and returns Outcome `Ok` (0).
@@ -42,6 +47,12 @@ extern "C" {
 extern "C" {
     #[link_name = "set_timer"]
     fn abi_set_timer(delay_ms: u64) -> u64;
+    #[link_name = "emit_metric"]
+    fn abi_emit_metric(name_ptr: u32, name_len: u32, value: f64);
+    #[link_name = "rng_seed"]
+    fn abi_rng_seed(out_ptr: u32) -> u32;
+    #[link_name = "device_profile"]
+    fn abi_device_profile(out_ptr: u32, out_cap: u32) -> u64;
 }
 
 // ---- guest allocator (ABI §2.4, the retained v1 convention) ---------------------------------------
@@ -250,11 +261,82 @@ fn decode_frame(bytes: &[u8]) -> (u64, Vec<ciborium::value::Value>) {
     (tag, items)
 }
 
+/// Pull the device profile honoring the mandatory NeedCapacity retry (ABI §6.4 discipline).
+fn read_device_profile() -> Vec<u8> {
+    let mut buf = vec![0u8; 64];
+    loop {
+        // SAFETY: `buf` is a live guest span for the call's duration.
+        let packed = unsafe { abi_device_profile(buf.as_mut_ptr() as u32, buf.len() as u32) };
+        let (status, len) = (packed >> 32, (packed & 0xffff_ffff) as usize);
+        match status {
+            0 => {
+                // SAFETY: the host wrote exactly `len` bytes.
+                buf.truncate(len);
+                return buf;
+            }
+            1 => buf.resize(len, 0),
+            _ => unreachable!("unknown device_profile status (fail closed, §5.2)"),
+        }
+    }
+}
+
+/// **Module autotune** (architecture §3.5: "micro-batch autotune moves inside the module"):
+/// the module — not the host — picks its batch size from the profile's `vram_bytes`. The exact
+/// ladder is arbitrary module policy; what the harness pins is that the choice is a function of
+/// the host-journaled profile.
+fn autotune_micro(profile: &[u8]) -> u64 {
+    if profile.is_empty() {
+        return 1; // no profile delivered (e.g. a harness without one): a safe floor
+    }
+    let v: ciborium::value::Value =
+        ciborium::from_reader(profile).unwrap_or_else(|_| unreachable!("malformed profile"));
+    let vram = match &v {
+        ciborium::value::Value::Map(m) => m
+            .iter()
+            .find_map(|(k, val)| match k {
+                ciborium::value::Value::Text(t) if t == "vram_bytes" => val.as_integer(),
+                _ => None,
+            })
+            .map(|i| u64::try_from(i128::from(i)).unwrap_or(0))
+            .unwrap_or(0),
+        _ => 0,
+    };
+    if vram >= 8 << 30 {
+        8
+    } else if vram >= 2 << 30 {
+        4
+    } else {
+        1
+    }
+}
+
+fn emit_metric(name: &str, value: f64) {
+    // SAFETY: `name` is a live guest span for the call's duration.
+    unsafe { abi_emit_metric(name.as_ptr() as u32, name.len() as u32, value) };
+}
+
 /// The module main loop (ABI §3.1): arm → pull → fold → publish → re-arm → … → `Stop` → `Ok`.
 #[no_mangle]
 pub extern "C" fn da_run() -> u32 {
     // SAFETY: wasm is single-threaded; the host calls da_run exactly once (ABI §3.1).
     let st = unsafe { &mut *core::ptr::addr_of_mut!(STATE) };
+
+    // Module autotune (architecture §3.5) + seeded determinism, voiced as advisory metrics the
+    // harness pins: the batch size is a guest decision over the journaled (tag-15) profile, and
+    // the seed is the identity-derived `rng_seed` (deterministic — replay re-derives it).
+    let micro = autotune_micro(&read_device_profile());
+    #[allow(clippy::cast_precision_loss)]
+    emit_metric("autotune.micro_batch", micro as f64);
+    let mut seed = [0u8; 32];
+    // SAFETY: `seed` is a live 32-byte guest span for the call's duration.
+    let rng_status = unsafe { abi_rng_seed(seed.as_mut_ptr() as u32) };
+    if rng_status != 0 {
+        unreachable!("unknown rng_seed status (fail closed, §5.2)");
+    }
+    emit_metric(
+        "rng.seed0",
+        f64::from(u32::from_le_bytes([seed[0], seed[1], seed[2], seed[3]])),
+    );
 
     // Arm the first tick (legal before the first slice — §6.6 rule 2).
     // SAFETY: plain-value import call.

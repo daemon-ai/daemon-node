@@ -233,6 +233,17 @@ impl JournalSink for JournalAdapter {
             .map_err(|e| SinkError(e.to_string()))
     }
 
+    fn device_profile(&mut self, profile: &[u8]) -> Result<(), SinkError> {
+        self.journal
+            .append(Body::DeviceProfile(
+                daemon_vhc_observe::journal::record::DeviceProfileRec {
+                    profile: profile.to_vec(),
+                },
+            ))
+            .map(|_| ())
+            .map_err(|e| SinkError(e.to_string()))
+    }
+
     fn drop_coalesced(
         &mut self,
         class: u64,
@@ -341,8 +352,17 @@ fn toy_averager_runs_end_to_end_under_the_v2_driver() {
         },
     }));
 
-    // Config: average over 3 timer ticks.
-    let run_cfg = V2RunConfig::new(identity, [0x51; 32], vec![3u8], b"grants-tbd".to_vec());
+    // Config: average over 3 timer ticks. The device profile (8 GiB VRAM) feeds the guest's
+    // module autotune (architecture §3.5); the identity feeds the deterministic rng_seed.
+    let device = daemon_vhc_host::v2::DeviceProfile {
+        gpu: true,
+        vram_bytes: 8 << 30,
+        ram_bytes: 16 << 30,
+        disk_bytes: 100 << 30,
+    };
+    let expected_seed = daemon_vhc_host::v2::driver::derive_rng_seed(&identity);
+    let mut run_cfg = V2RunConfig::new(identity, [0x51; 32], vec![3u8], b"grants-tbd".to_vec());
+    run_cfg.device_bytes = device.to_wire();
     let run = start_run(&worker, &wasm, run_cfg, Box::new(adapter.clone())).expect("start run");
 
     // The guest arms its own timers (5 ms) and publishes after each — wait for the 3 publishes.
@@ -369,6 +389,34 @@ fn toy_averager_runs_end_to_end_under_the_v2_driver() {
         RunEnd::Outcome(code) => assert_eq!(code, daemon_vhc_abi::OUTCOME_OK),
         other => panic!("expected Outcome(Ok), got {other:?}"),
     }
+
+    // -- module autotune (architecture §3.5): the GUEST picked its batch size from the profile --
+    // 8 GiB VRAM → the toy's ladder answers 8; the seed metric is the identity-derived
+    // `derive_rng_seed` value — proving the module read the same profile the probe measures and
+    // the same seed replay will re-derive.
+    let metrics = pump.metrics();
+    let metric = |name: &str| -> f64 {
+        metrics
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("metric {name} missing: {metrics:?}"))
+            .1
+    };
+    assert_eq!(
+        metric("autotune.micro_batch"),
+        8.0,
+        "the module adapted its micro-batch to the journaled profile"
+    );
+    assert_eq!(
+        metric("rng.seed0"),
+        f64::from(u32::from_le_bytes([
+            expected_seed[0],
+            expected_seed[1],
+            expected_seed[2],
+            expected_seed[3]
+        ])),
+        "the guest observed the identity-derived deterministic seed"
+    );
 
     // -- the publishes: §12.1 signed frames with channel-scoped durable seqs ----------------------
     let published = pump.published();
@@ -438,6 +486,21 @@ fn toy_averager_runs_end_to_end_under_the_v2_driver() {
             "delivered events journaled (tag 1): {tags:?}"
         );
         assert_eq!(count(4), 3, "exactly 3 publishes journaled (tag 4)");
+        assert_eq!(
+            count(15),
+            1,
+            "the device-profile delivery journaled once (tag 15): {tags:?}"
+        );
+        // The recorded profile is byte-identical to the admitted one (replay's input).
+        let Some(Body::DeviceProfile(dp)) = records.iter().map(|r| &r.body).find(|b| b.tag() == 15)
+        else {
+            panic!("device-profile record present");
+        };
+        assert_eq!(
+            dp.profile,
+            device.to_wire(),
+            "tag 15 records the delivered bytes"
+        );
         assert_eq!(count(9), 1, "exactly one terminal fact (tag 9)");
         assert_eq!(tags.last(), Some(&9), "the terminal record is last");
 

@@ -25,7 +25,7 @@ use daemon_vhc_host::v2::{
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_observe::journal::record::{
-    Body, ClockRec, EventRec, PublishRec, ReadBackRec, Record, TerminalRec,
+    Body, ClockRec, DeviceProfileRec, EventRec, PublishRec, ReadBackRec, Record, TerminalRec,
 };
 use daemon_vhc_observe::journal::verifier::{
     run_replay, ExpectedDecision, GuestUnderReplay, PayloadSource, ReplayOutcome, ReplayPlan,
@@ -72,6 +72,18 @@ fn guest(name: &str) -> Vec<u8> {
 
 /// Record a v2 run through a `MemorySink`; `drive` gets the pump for staging etc., then the
 /// harness waits for `publishes` frames, stops, and returns the recorded entries + the end.
+/// The recording identity for one test run (shared with `verify` so the replay script's
+/// `rng_seed` re-derivation sees the same identity the recording driver derived from).
+fn identity_for(wasm: &[u8], instance: u64) -> RunIdentity {
+    RunIdentity {
+        run_id: [0xBB; 32],
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance,
+        module: *blake3::hash(wasm).as_bytes(),
+    }
+}
+
 fn record(
     wasm: &[u8],
     config: Vec<u8>,
@@ -80,13 +92,7 @@ fn record(
     drive: impl FnOnce(&daemon_vhc_host::v2::PumpHandle),
 ) -> (Vec<SinkEntry>, RunEnd) {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
-    let identity = RunIdentity {
-        run_id: [0xBB; 32],
-        epoch: 0,
-        role: "trainer".to_string(),
-        instance,
-        module: *blake3::hash(wasm).as_bytes(),
-    };
+    let identity = identity_for(wasm, instance);
     let run_cfg = V2RunConfig::new(identity, [0x61; 32], config, Vec::new());
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, run_cfg, Box::new(sink.clone())).expect("start");
@@ -130,6 +136,9 @@ fn to_records(entries: &[SinkEntry]) -> Vec<Record> {
                 sidecar: None,
             }),
             SinkEntry::Clock { now } => Body::Clock(ClockRec { now: *now }),
+            SinkEntry::DeviceProfile { profile } => Body::DeviceProfile(DeviceProfileRec {
+                profile: profile.clone(),
+            }),
             SinkEntry::Publish {
                 channel,
                 seq,
@@ -236,10 +245,18 @@ impl PayloadSource for NoSidecars {
     }
 }
 
-/// Record → replay → verify: the full §8.7 wiring for one run.
-fn verify(wasm: &[u8], config: &[u8], entries: &[SinkEntry]) -> (ReplayOutcome, ReplayEnd) {
+/// Record → replay → verify: the full §8.7 wiring for one run. `instance` names the recording
+/// identity (the deterministic `rng_seed` re-derivation input — the run header's job in a real
+/// journal).
+fn verify(
+    wasm: &[u8],
+    config: &[u8],
+    entries: &[SinkEntry],
+    instance: u64,
+) -> (ReplayOutcome, ReplayEnd) {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
-    let script = ReplayScript::from_entries(entries);
+    let mut script = ReplayScript::from_entries(entries);
+    script.identity = Some(identity_for(wasm, instance));
     let replayed = replay_v2(&worker, wasm, config, &[], script).expect("replay harness");
     let plan = ReplayPlan::from_records(&to_records(entries));
     let mut guest = ReplayedDecisions::new(&replayed, &plan);
@@ -255,7 +272,7 @@ fn toy_averager_replay_reproduces_every_decision_bit_for_bit() {
     let (entries, end) = record(&wasm, vec![3u8], 1, 3, |_| {});
     assert!(matches!(end, RunEnd::Outcome(0)), "recorded end: {end:?}");
 
-    let (outcome, replay_end) = verify(&wasm, &[3u8], &entries);
+    let (outcome, replay_end) = verify(&wasm, &[3u8], &entries, 1);
     assert_eq!(replay_end, ReplayEnd::Outcome(0));
     match outcome {
         ReplayOutcome::Pass { decisions } => assert_eq!(decisions, 3),
@@ -274,7 +291,7 @@ fn bridge_staged_batch_run_replays_bit_for_bit() {
     });
     assert!(matches!(end, RunEnd::Outcome(0)), "recorded end: {end:?}");
 
-    let (outcome, replay_end) = verify(&wasm, &[3u8], &entries);
+    let (outcome, replay_end) = verify(&wasm, &[3u8], &entries, 2);
     assert_eq!(replay_end, ReplayEnd::Outcome(0));
     match outcome {
         ReplayOutcome::Pass { decisions } => assert_eq!(decisions, 1),
@@ -302,7 +319,7 @@ fn bridge_staged_update_run_replays_bit_for_bit() {
     });
     assert!(matches!(end, RunEnd::Outcome(0)), "recorded end: {end:?}");
 
-    let (outcome, replay_end) = verify(&wasm, &[4u8], &entries);
+    let (outcome, replay_end) = verify(&wasm, &[4u8], &entries, 3);
     assert_eq!(replay_end, ReplayEnd::Outcome(0));
     assert!(matches!(outcome, ReplayOutcome::Pass { decisions: 1 }));
 }
@@ -325,7 +342,7 @@ fn tampered_recorded_publish_is_a_typed_divergence() {
         .is_some();
     assert!(tampered, "a publish record exists to tamper");
 
-    let (outcome, replay_end) = verify(&wasm, &[3u8], &entries);
+    let (outcome, replay_end) = verify(&wasm, &[3u8], &entries, 4);
     assert_eq!(
         replay_end,
         ReplayEnd::Outcome(0),

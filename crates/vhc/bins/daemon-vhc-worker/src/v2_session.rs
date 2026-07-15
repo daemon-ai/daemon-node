@@ -115,7 +115,7 @@ pub(crate) async fn join_and_run_v2(
         instance: 1,
         module: module_hash,
     };
-    let run_cfg = V2RunConfig::new(identity, worker_key_seed, config.to_vec(), grants);
+    let run_cfg = V2RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, module, run_cfg, Box::new(sink.clone()))
         .map_err(|e| format!("v2 start_run: {e}"))?;
@@ -283,7 +283,10 @@ pub(crate) async fn join_and_run_v2(
 
     // -- inline replay soak (refactor §12.6): the recorded run must re-drive bit-for-bit ---------
     let entries: Vec<SinkEntry> = sink.lock().expect("sink").entries.clone();
-    let script = ReplayScript::from_entries(&entries);
+    let mut script = ReplayScript::from_entries(&entries);
+    // The identity behind the recorded run: what `sys@2::rng_seed` re-derives from at replay
+    // (in a real journal this rides the tag-0 run header).
+    script.identity = Some(identity);
     let replayed = replay_v2(&worker, module, config, &derive_grants(), script)
         .map_err(|e| format!("replay harness: {e}"))?;
     if replayed.end != ReplayEnd::Outcome(0) {

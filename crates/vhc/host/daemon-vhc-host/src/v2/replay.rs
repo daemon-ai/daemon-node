@@ -65,6 +65,13 @@ pub struct ReplayScript {
     pub timer_arms: VecDeque<(u64, u64)>,
     /// Timer cancels (tag 6): `(id, status)`.
     pub timer_cancels: VecDeque<(u64, u64)>,
+    /// Device-profile deliveries (tag 15): the recorded profile bytes, in delivery order — replay
+    /// feeds the recorded observation, never a fresh probe.
+    pub device_profiles: VecDeque<Vec<u8>>,
+    /// The execution identity behind the journal (the tag-0 run header): what `sys@2::rng_seed`
+    /// re-derives from (the seed is deterministic — §2.7 dc class — so it is re-computed at
+    /// replay, not recorded). `None` is fine for guests that never read the seed.
+    pub identity: Option<super::driver::RunIdentity>,
 }
 
 impl ReplayScript {
@@ -88,6 +95,9 @@ impl ReplayScript {
                 SinkEntry::TimerArm { id, delay, .. } => s.timer_arms.push_back((*id, *delay)),
                 SinkEntry::TimerCancel { id, status } => {
                     s.timer_cancels.push_back((*id, *status));
+                }
+                SinkEntry::DeviceProfile { profile } => {
+                    s.device_profiles.push_back(profile.clone());
                 }
                 _ => {}
             }
@@ -314,6 +324,38 @@ fn dispatch(
         }
         // Advisory sinks: no recorded product, no decision (§6.3) — accepted and dropped.
         ("sys@2", "emit_metric" | "log") => Ok(()),
+        // The run-scoped RNG seed is DETERMINISTIC (a pure function of the execution identity,
+        // §2.7 dc class): re-derive it — nothing was recorded, exactly like the crypto accels.
+        ("sys@2", "rng_seed") => {
+            let out_ptr = p_u32(params, 0);
+            let identity = caller.data().script.identity.clone().ok_or_else(|| {
+                diverged("guest read rng_seed but the replay script carries no identity")
+            })?;
+            let seed = super::driver::derive_rng_seed(&identity);
+            let mem = mem_of(caller)?;
+            mem.write(&mut *caller, out_ptr as usize, &seed)
+                .map_err(|e| wasmtime::Error::msg(format!("rng_seed write: {e}")))?;
+            results[0] = Val::I32(0);
+            Ok(())
+        }
+        // The device profile is a RECORDED nondeterministic input (tag 15): feed the recorded
+        // bytes with the NeedCapacity protocol (peek, pop on delivery — a retry re-reads).
+        ("sys@2", "device_profile") => {
+            let (ptr, cap) = (p_u32(params, 0), p_u32(params, 1));
+            let profile = caller
+                .data()
+                .script
+                .device_profiles
+                .front()
+                .cloned()
+                .ok_or_else(|| {
+                    diverged("guest read the device profile with none recorded (tag 15)")
+                })?;
+            if deliver_span(caller, &profile, ptr, cap, results)? {
+                caller.data_mut().script.device_profiles.pop_front();
+            }
+            Ok(())
+        }
         // Crypto accelerations are deterministic functions of guest memory (no host observation, so
         // never journaled, §2.7 dc class): replay RE-EXECUTES them over the reproduced linear
         // memory and gets the identical answer — the same `daemon_vhc_proto::crypto` contract the

@@ -62,6 +62,14 @@ pub enum ReplayStep {
         /// The recorded `now` value.
         now: u64,
     },
+    /// A recorded device-profile delivery (tag 15, Phase B): the probe's measurement is a
+    /// nondeterministic input — replay feeds the recorded bytes, never a fresh probe.
+    DeviceProfile {
+        /// The record ordinal.
+        ord: u64,
+        /// The recorded profile bytes.
+        profile: Vec<u8>,
+    },
     /// The recorded terminal fact (tag 9) to inject as the replay outcome.
     Terminal {
         /// The record ordinal.
@@ -139,6 +147,10 @@ impl ReplayPlan {
                 Body::Clock(c) => plan.steps.push(ReplayStep::Clock {
                     ord: record.ord,
                     now: c.now,
+                }),
+                Body::DeviceProfile(d) => plan.steps.push(ReplayStep::DeviceProfile {
+                    ord: record.ord,
+                    profile: d.profile.clone(),
                 }),
                 Body::Publish(p) => plan.expected.push(ExpectedDecision::Publish {
                     ord: record.ord,
@@ -245,7 +257,9 @@ pub fn run_replay<G: GuestUnderReplay, P: PayloadSource>(
                 }
                 guest.supply_import(step);
             }
-            ReplayStep::ReadBack { .. } | ReplayStep::Clock { .. } => {
+            ReplayStep::ReadBack { .. }
+            | ReplayStep::Clock { .. }
+            | ReplayStep::DeviceProfile { .. } => {
                 guest.supply_import(step);
             }
             ReplayStep::Terminal { ord, kind } => {

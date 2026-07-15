@@ -109,9 +109,18 @@ pub const SYS_V2_PHASE_A_SYMBOLS: &[&str] =
 /// import these symbols is unaffected; the host links them for any module that does.
 pub const SYS_V2_CRYPTO_SYMBOLS: &[&str] = &["hash", "verify_sig"];
 
+/// The `sys@2` **ambient Phase-B** symbols (ABI §2.2 "later phases": "seeded RNG, device
+/// profile"): `rng_seed` (the run-scoped deterministic seed — a pure function of the execution
+/// identity, so deterministic per §2.7 dc class, no journal record; replay re-derives it) and
+/// `device_profile` (the same profile the permanent probe measures, architecture §3.5 — a
+/// **nondeterministic input**, journaled as the §8.3 tag-15 record on every delivery). The same
+/// minor-bump note as [`SYS_V2_CRYPTO_SYMBOLS`] applies: the shared Phase-B minor lands once, at
+/// the B1→B2→B3 merge.
+pub const SYS_V2_AMBIENT_B_SYMBOLS: &[&str] = &["rng_seed", "device_profile"];
+
 /// The full `sys@2` symbol vocabulary the host provides (Phase-A subset + the Phase-B crypto
-/// accelerations). The candidate-selection/import-validation path ([`validate_imports`]) checks
-/// membership against this.
+/// accelerations + the Phase-B ambient symbols). The candidate-selection/import-validation path
+/// ([`validate_imports`]) checks membership against this.
 pub const SYS_V2_SYMBOLS: &[&str] = &[
     "set_timer",
     "cancel_timer",
@@ -120,7 +129,21 @@ pub const SYS_V2_SYMBOLS: &[&str] = &[
     "log",
     "hash",
     "verify_sig",
+    "rng_seed",
+    "device_profile",
 ];
+
+/// The domain-separation context for the run-scoped RNG seed (`sys@2::rng_seed`): the seed is
+/// `blake3::derive_key(RNG_SEED_DOMAIN_V2, material)` where `material` is the unambiguous
+/// concatenation of the frozen execution identity (§8.1) —
+/// `run_id ‖ epoch_le ‖ role_len_le ‖ role ‖ instance_le ‖ module_hash`. A pure function of the
+/// identity: two role-instances never share a seed, a trap-restart of the SAME incarnation
+/// reproduces it (policy determinism, architecture §3.6 claim 1), and replay re-derives it from
+/// the journal's run header instead of recording it.
+pub const RNG_SEED_DOMAIN_V2: &str = "daemon-vhc/rng/2";
+
+/// The byte length of the `sys@2::rng_seed` output.
+pub const RNG_SEED_LEN: usize = 32;
 
 /// The v1 five-phase lifecycle exports whose presence (with a `tabi@1`-only import shape) marks a
 /// **candidate major-1** module (ABI §1.3 step 2: "exports include the v1 lifecycle (`da_build` …)").
@@ -926,20 +949,32 @@ mod tests {
     }
 
     #[test]
-    fn sys_v2_vocab_is_phase_a_plus_crypto() {
-        // The full sys@2 vocabulary is the Phase-A subset followed by the Phase-B crypto accels;
-        // both sub-lists are subsets of it, and `validate_imports` accepts every member.
+    fn sys_v2_vocab_is_phase_a_plus_crypto_plus_ambient() {
+        // The full sys@2 vocabulary is the Phase-A subset + the Phase-B crypto accels + the
+        // Phase-B ambient symbols; every sub-list is a subset, and `validate_imports` accepts
+        // every member.
         for s in SYS_V2_PHASE_A_SYMBOLS {
             assert!(SYS_V2_SYMBOLS.contains(s), "phase-a symbol {s} missing");
         }
         for s in SYS_V2_CRYPTO_SYMBOLS {
             assert!(SYS_V2_SYMBOLS.contains(s), "crypto symbol {s} missing");
         }
+        for s in SYS_V2_AMBIENT_B_SYMBOLS {
+            assert!(SYS_V2_SYMBOLS.contains(s), "ambient symbol {s} missing");
+        }
         assert_eq!(
             SYS_V2_SYMBOLS.len(),
-            SYS_V2_PHASE_A_SYMBOLS.len() + SYS_V2_CRYPTO_SYMBOLS.len()
+            SYS_V2_PHASE_A_SYMBOLS.len()
+                + SYS_V2_CRYPTO_SYMBOLS.len()
+                + SYS_V2_AMBIENT_B_SYMBOLS.len()
         );
-        validate_imports(&[("sys@2", "hash"), ("sys@2", "verify_sig")]).unwrap();
+        validate_imports(&[
+            ("sys@2", "hash"),
+            ("sys@2", "verify_sig"),
+            ("sys@2", "rng_seed"),
+            ("sys@2", "device_profile"),
+        ])
+        .unwrap();
     }
 
     #[test]

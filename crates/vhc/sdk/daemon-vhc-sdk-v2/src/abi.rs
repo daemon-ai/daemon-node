@@ -27,6 +27,12 @@ extern "C" {
 extern "C" {
     #[link_name = "set_timer"]
     fn abi_set_timer(delay_ms: u64) -> u64;
+    #[link_name = "emit_metric"]
+    fn abi_emit_metric(name_ptr: u32, name_len: u32, value: f64);
+    #[link_name = "rng_seed"]
+    fn abi_rng_seed(out_ptr: u32) -> u32;
+    #[link_name = "device_profile"]
+    fn abi_device_profile(out_ptr: u32, out_cap: u32) -> u64;
 }
 
 /// One decoded event: the §4.2 tag plus the positional fields (tag included at index 0).
@@ -142,4 +148,45 @@ pub fn publish(channel: u32, payload: &[u8]) -> u64 {
 pub fn set_timer(delay_ms: u64) -> u64 {
     // SAFETY: plain-value import.
     unsafe { abi_set_timer(delay_ms) }
+}
+
+/// Emit an advisory metric (§6.5 — egress only, rate-limited host-side, never journaled).
+pub fn emit_metric(name: &str, value: f64) {
+    // SAFETY: `name` is a live guest span for the call's duration.
+    unsafe { abi_emit_metric(name.as_ptr() as u32, name.len() as u32, value) }
+}
+
+/// The run-scoped deterministic RNG seed (architecture §3.2 "seeded randomness"): a pure
+/// function of the execution identity, identical across trap-restarts of the same incarnation
+/// and at replay (§2.7 dc class — never journaled, always re-derivable).
+#[must_use]
+pub fn rng_seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    // SAFETY: `seed` is a live 32-byte guest span for the call's duration.
+    let status = unsafe { abi_rng_seed(seed.as_mut_ptr() as u32) };
+    if status != 0 {
+        unreachable!("unknown rng_seed status (fail closed, §5.2)");
+    }
+    seed
+}
+
+/// The device profile the probe measures (architecture §3.5 — what makes module autotune
+/// possible), as canonical-CBOR bytes; honors the mandatory NeedCapacity retry. The host
+/// journals every delivery (tag 15) — it is a nondeterministic input.
+#[must_use]
+pub fn device_profile() -> Vec<u8> {
+    let mut buf = vec![0u8; 128];
+    loop {
+        // SAFETY: `buf` is a live guest span for the call's duration.
+        let packed = unsafe { abi_device_profile(buf.as_mut_ptr() as u32, buf.len() as u32) };
+        let (status, len) = (packed >> 32, (packed & 0xffff_ffff) as usize);
+        match status {
+            0 => {
+                buf.truncate(len);
+                return buf;
+            }
+            1 => buf.resize(len, 0),
+            _ => unreachable!("unknown device_profile status (fail closed, §5.2)"),
+        }
+    }
 }

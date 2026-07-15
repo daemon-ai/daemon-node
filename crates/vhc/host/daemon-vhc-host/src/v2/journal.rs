@@ -103,6 +103,11 @@ pub trait JournalSink: Send {
         value: &[u8],
     ) -> Result<(), SinkError>;
 
+    /// tag 15 — a `device_profile` delivery (§8.3; Phase B): the profile is a nondeterministic
+    /// input (the probe's measurement), recorded verbatim per delivery so replay feeds the
+    /// recorded bytes rather than re-probing.
+    fn device_profile(&mut self, profile: &[u8]) -> Result<(), SinkError>;
+
     /// tag 7 — an advisory drop/coalesce (§4.7: every drop or coalesce MUST be journaled).
     /// `class`: 0 payload-ready, 1 timer, 2 gossip, 3 budget; `rule`: the fixed coalesce code.
     fn drop_coalesced(
@@ -207,6 +212,9 @@ impl<S: JournalSink> JournalSink for std::sync::Arc<std::sync::Mutex<S>> {
             .expect("sink lock")
             .read_back(src, kind, status, value)
     }
+    fn device_profile(&mut self, profile: &[u8]) -> Result<(), SinkError> {
+        self.lock().expect("sink lock").device_profile(profile)
+    }
     fn drop_coalesced(
         &mut self,
         class: u64,
@@ -280,6 +288,9 @@ pub enum SinkEntry {
         status: u64,
         value: Vec<u8>,
     },
+    DeviceProfile {
+        profile: Vec<u8>,
+    },
     Drop {
         class: u64,
         rule: u64,
@@ -309,6 +320,7 @@ impl SinkEntry {
             Self::Init { .. } => 11,
             Self::SignedFrame { .. } => 12,
             Self::Instantiation { .. } => 13,
+            Self::DeviceProfile { .. } => 15,
         }
     }
 }
@@ -445,6 +457,13 @@ impl JournalSink for MemorySink {
             kind,
             status,
             value: value.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn device_profile(&mut self, profile: &[u8]) -> Result<(), SinkError> {
+        self.entries.push(SinkEntry::DeviceProfile {
+            profile: profile.to_vec(),
         });
         Ok(())
     }

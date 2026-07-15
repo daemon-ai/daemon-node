@@ -558,6 +558,9 @@ struct SliceState {
     pending_next: Option<u64>,
     /// A pending mandatory `read_back` retry: `(src, kind, required)` (§6.4).
     pending_readback: Option<(u64, u32, u64)>,
+    /// A pending mandatory `device_profile` retry: the required capacity (same §4.1/§6.4
+    /// mandatory-retry discipline — the profile is delivered, and journaled, exactly once).
+    pending_device: Option<u64>,
     /// The already-computed value behind a pending `read_back` retry: bridge kinds (1/2) mutate
     /// the tabi state exactly once (register batch / stage container), so the retry re-delivers
     /// the SAME value instead of re-registering (§6.4 "the staged value remains available").
@@ -591,6 +594,10 @@ struct V2Host {
     signing: SigningKey,
     identity: RunIdentity,
     sender: [u8; 32],
+    // sys@2 ambient inputs: the admitted device-profile bytes (nondeterministic input — journaled
+    // tag 15 per delivery) and the identity-derived RNG seed (deterministic — never journaled).
+    device_bytes: Vec<u8>,
+    rng_seed: [u8; 32],
 }
 
 impl V2Host {
@@ -640,6 +647,14 @@ impl V2Host {
                 import,
                 None,
                 "NeedCapacity from read_back requires an immediate retry (§6.4)",
+            ));
+        }
+        if self.slice.pending_device.is_some() && import != "device_profile" {
+            return Err(Trap::new(
+                TrapCode::BadEvent,
+                import,
+                None,
+                "NeedCapacity from device_profile requires an immediate retry (§6.4)",
             ));
         }
         self.charge_op(import)
@@ -727,6 +742,28 @@ fn build_signed_frame(
     ]);
     to_canonical_vec(&frame)
         .map_err(|e| Trap::bare(TrapCode::BadModule, format!("frame encoding: {e}")))
+}
+
+// -- sys@2 seeded deterministic randomness (architecture §3.2 "seeded randomness") ------------------
+
+/// Derive the run-scoped RNG seed for one execution identity (`sys@2::rng_seed`): a **pure
+/// function of the frozen §8.1 identity**, domain-separated under
+/// [`daemon_vhc_abi::RNG_SEED_DOMAIN_V2`]. Deterministic per the §2.7 `dc` class — the import
+/// carries **no journal record**; replay re-derives the identical seed from the run header's
+/// identity (see [`super::replay`]). Two role-instances never share a seed; a trap-restart of the
+/// same incarnation reproduces it (the seed is an *identity* property, not an *instantiation*
+/// property — restarted policy must be able to re-derive its own randomness).
+#[must_use]
+pub fn derive_rng_seed(identity: &RunIdentity) -> [u8; 32] {
+    // Unambiguous concatenation: fixed-width fields + a length prefix on the one variable field.
+    let mut material = Vec::with_capacity(32 + 8 + 4 + identity.role.len() + 8 + 32);
+    material.extend_from_slice(&identity.run_id);
+    material.extend_from_slice(&identity.epoch.to_le_bytes());
+    material.extend_from_slice(&(identity.role.len() as u32).to_le_bytes());
+    material.extend_from_slice(identity.role.as_bytes());
+    material.extend_from_slice(&identity.instance.to_le_bytes());
+    material.extend_from_slice(&identity.module);
+    blake3::derive_key(daemon_vhc_abi::RNG_SEED_DOMAIN_V2, &material)
 }
 
 // -- sys@2 crypto accelerations (the det/crypto-lane fast path, §3.2/§3.7) --------------------------
@@ -1381,6 +1418,65 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
         },
     )?;
 
+    // ---- sys@2::rng_seed — the run-scoped deterministic seed (architecture §3.2) ----------------
+    // `(out_ptr) -> status 0`; writes RNG_SEED_LEN bytes. A pure function of the execution
+    // identity (derive_rng_seed) — §2.7 dc class, no journal record; replay re-derives it.
+    linker.func_wrap(
+        NS_SYS_V2,
+        "rng_seed",
+        |mut c: Caller<'_, V2Host>, out_ptr: u32| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("rng_seed")?;
+                let seed = c.data().rng_seed;
+                write_guest(c, out_ptr, &seed)?;
+                Ok(0)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- sys@2::device_profile — the probe's device profile, guest-readable (§3.5) --------------
+    // `(out_ptr, out_cap) -> (status << 32) | len` with the §4.1/§6.4 NeedCapacity protocol. The
+    // profile is what makes module autotune possible ("micro-batch autotune moves inside the
+    // module", architecture §3.5). It is a NONDETERMINISTIC INPUT — the same probe measurement
+    // admission judged — so every `Ok` delivery is journaled as the §8.3 tag-15 record and replay
+    // feeds the recorded bytes, never a fresh probe.
+    linker.func_wrap(
+        NS_SYS_V2,
+        "device_profile",
+        |mut c: Caller<'_, V2Host>, out_ptr: u32, out_cap: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("device_profile")?;
+                // Mandatory-retry rule: after NeedCapacity the re-call must be big enough.
+                if let Some(required) = c.data().slice.pending_device {
+                    if u64::from(out_cap) < required {
+                        return Err(Trap::new(
+                            TrapCode::BadEvent,
+                            "device_profile",
+                            None,
+                            format!("retry with out_cap {out_cap} < required {required} (§6.4)"),
+                        ));
+                    }
+                }
+                let bytes = c.data().device_bytes.clone();
+                let len = bytes.len() as u64;
+                if len > u64::from(out_cap) {
+                    c.data_mut().slice.pending_device = Some(len);
+                    return Ok(pack_status_len(RET_STATUS_NEED_CAPACITY, len as u32));
+                }
+                write_guest(c, out_ptr, &bytes)?;
+                c.data_mut().slice.pending_device = None;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.sink
+                    .device_profile(&bytes)
+                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                Ok(pack_status_len(RET_STATUS_DELIVERED, len as u32))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
     Ok(())
 }
 
@@ -1549,6 +1645,7 @@ pub fn start_run(
                     pending_next: None,
                     pending_readback: None,
                     pending_readback_value: None,
+                    pending_device: None,
                 },
                 fuel_per_slice: engine_cfg.fuel_per_call,
                 op_budget: engine_cfg.op_budget,
@@ -1561,6 +1658,8 @@ pub fn start_run(
                 slice_pass_open: false,
                 slice_ingested: false,
                 signing,
+                rng_seed: derive_rng_seed(&run.identity),
+                device_bytes: run.device_bytes.clone(),
                 identity: run.identity.clone(),
                 sender,
             };
@@ -1864,6 +1963,7 @@ mod tests {
                 pending_next: None,
                 pending_readback: None,
                 pending_readback_value: None,
+                pending_device: None,
             },
             fuel_per_slice: 0,
             op_budget: 0,
@@ -1876,6 +1976,8 @@ mod tests {
             slice_pass_open: false,
             slice_ingested: false,
             signing,
+            rng_seed: [0u8; 32],
+            device_bytes: Vec::new(),
             identity: RunIdentity {
                 run_id: [1u8; 32],
                 epoch: 4,

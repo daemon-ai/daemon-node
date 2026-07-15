@@ -20,7 +20,10 @@
 #[cfg(target_arch = "wasm32")]
 pub mod abi;
 #[cfg(target_arch = "wasm32")]
-pub use abi::{next_event, publish, read_back_bytes, read_back_uint, set_timer, Event};
+pub use abi::{
+    device_profile, emit_metric, next_event, publish, read_back_bytes, read_back_uint, rng_seed,
+    set_timer, Event,
+};
 
 pub mod migrate;
 pub mod module;
