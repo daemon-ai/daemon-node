@@ -196,7 +196,7 @@ struct BatchData {
 }
 
 /// The per-instance host state (the wasmtime `Store` data).
-struct HostState {
+pub(crate) struct HostState {
     phase: Option<Phase>,
     backend: Box<dyn OpBackend>,
     params: Vec<ParamReg>,
@@ -220,7 +220,7 @@ struct HostState {
 }
 
 impl HostState {
-    fn new(cfg: &EngineConfig) -> Self {
+    pub(crate) fn new(cfg: &EngineConfig) -> Self {
         let backend: Box<dyn OpBackend> = match cfg.backend {
             BackendKind::Cpu => Box::new(CpuBackend::new()),
             #[cfg(feature = "burn-ndarray")]
@@ -525,6 +525,30 @@ impl Worker {
         let d = self.config.epoch_deadline.as_millis();
         let t = self.config.epoch_tick.as_millis().max(1);
         (d / t).max(1) as u64
+    }
+
+    /// The wasmtime [`Engine`] (fuel/epoch/NaN-canonicalized, pooling) — used by the admission-time
+    /// driver-selection layer ([`crate::select`], ABI §1.3) to compile + inspect + assessment-read a
+    /// module without touching the v1 lifecycle driver.
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// The engine config (fuel/epoch budgets the assessment read reuses, ABI §9.2).
+    pub(crate) fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+
+    /// The v1 `tabi@1` linker — the candidate-major-1 instantiation path of the driver-selection
+    /// layer ([`crate::select`], ABI §1.3 step 4). The selection cross-check instantiates under
+    /// this linker but calls only the pure `da_abi` export.
+    pub(crate) fn linker(&self) -> &Linker<HostState> {
+        &self.linker
+    }
+
+    /// The epoch-deadline tick count for one entry point (shared with the assessment read).
+    pub(crate) fn epoch_ticks_pub(&self) -> u64 {
+        self.epoch_ticks()
     }
 }
 

@@ -324,6 +324,18 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-net"],
         ),
         (
+            // The A0 frozen v1 compatibility fixture (refactor §5 A0; decisions D3 cell 1): the
+            // pinned pre-refactor tiny-llama bundle replays bit-exact under the v1 driver. Named
+            // explicitly (also covered by the crate suite below) so the standing regression is a
+            // visible tier-1 lane of its own.
+            "A0 frozen v1 fixture replay (pre-refactor tiny-llama digest parity)",
+            &["-p", "daemon-vhc-host", "--test", "a0_frozen_fixture"],
+        ),
+        (
+            "daemon-vhc-host driver selection (ABI §1.3 typed refusals)",
+            &["-p", "daemon-vhc-host", "--test", "driver_selection"],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),

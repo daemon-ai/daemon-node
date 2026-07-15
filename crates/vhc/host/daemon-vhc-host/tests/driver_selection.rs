@@ -1,0 +1,263 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+//! A0 driver-selection conformance (ABI Draft 3 §1.3/§1.5; decisions D2; refactor §5 A0).
+//!
+//! Every module here is **hand-built** with `wasm-encoder` — precise control over the static
+//! import namespaces, the export list, and the `da_abi` constant, with no wasm32 toolchain in the
+//! tier-1 lane. The suite pins the A0 acceptance: a v2-major module is cleanly refused by the
+//! typed `AbiUnsupportedMajor` (naming the missing A2 event-loop driver); a declaration that
+//! contradicts the import shape is `AbiDeclarationMismatch`; a hash mismatch refuses **before
+//! compile**; unknown symbols/namespaces split into `WorldMinorUnsupported`/`BadModule` — all as
+//! admission refusals ([`daemon_vhc_abi::AbiRefusal`]), never traps.
+
+use daemon_vhc_abi::{AbiRefusalCode, CandidateDriver, DA_ABI_MAJOR_V2};
+use daemon_vhc_host::{select_driver, EngineConfig, Worker};
+use wasm_encoder::{
+    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
+    Module, TypeSection, ValType,
+};
+
+/// Assemble a minimal valid module: `imports` as `(namespace, symbol)` function imports (all typed
+/// `() -> i32`), `exports` as named functions (all `() -> i32` returning 0), plus a `da_abi`
+/// export returning `da_abi_value`.
+fn build_module(imports: &[(&str, &str)], exports: &[&str], da_abi_value: u32) -> Vec<u8> {
+    let mut module = Module::new();
+
+    // Type 0: () -> i32 — shared by every import and export in these fixtures.
+    let mut types = TypeSection::new();
+    types.ty().function([], [ValType::I32]);
+    module.section(&types);
+
+    let mut import_sec = ImportSection::new();
+    for (ns, sym) in imports {
+        import_sec.import(ns, sym, EntityType::Function(0));
+    }
+    module.section(&import_sec);
+
+    let n_imports = imports.len() as u32;
+    let n_funcs = exports.len() as u32 + 1; // + da_abi
+    let mut funcs = FunctionSection::new();
+    for _ in 0..n_funcs {
+        funcs.function(0);
+    }
+    module.section(&funcs);
+
+    let mut export_sec = ExportSection::new();
+    for (i, name) in exports.iter().enumerate() {
+        export_sec.export(name, ExportKind::Func, n_imports + i as u32);
+    }
+    export_sec.export("da_abi", ExportKind::Func, n_imports + exports.len() as u32);
+    module.section(&export_sec);
+
+    let mut code = CodeSection::new();
+    for _ in 0..exports.len() {
+        let mut f = Function::new([]);
+        f.instructions().i32_const(0).end();
+        code.function(&f);
+    }
+    let mut da_abi = Function::new([]);
+    da_abi.instructions().i32_const(da_abi_value as i32).end();
+    code.function(&da_abi);
+    module.section(&code);
+
+    module.finish()
+}
+
+/// The v1 lifecycle export set (candidate-major-1 shape; no imports needed — ∅ ⊆ {tabi@1}).
+const V1_EXPORTS: &[&str] = &[
+    "da_alloc",
+    "da_free",
+    "da_manifest",
+    "da_build",
+    "da_step",
+    "da_inner_update",
+    "da_make_update",
+    "da_ingest_updates",
+];
+
+/// The major-2 required export set minus `da_abi` (which `build_module` always appends).
+const V2_EXPORTS: &[&str] = &[
+    "da_alloc",
+    "da_free",
+    "da_manifest",
+    "da_claim",
+    "da_init",
+    "da_run",
+];
+
+fn worker() -> Worker {
+    Worker::new(EngineConfig::default()).expect("engine")
+}
+
+fn pack(major: u32, minor: u32) -> u32 {
+    (major << 16) | minor
+}
+
+// -- positive: the v1 shape still selects the v1 driver ------------------------------------------
+
+#[test]
+fn v1_shaped_module_selects_v1_driver() {
+    let wasm = build_module(&[], V1_EXPORTS, pack(1, 0));
+    let sel = select_driver(&worker(), &wasm, Some(blake3::hash(&wasm).as_bytes()))
+        .expect("v1 module admitted");
+    assert_eq!(sel.driver, CandidateDriver::V1);
+    assert_eq!((sel.major, sel.minor), (1, 0));
+}
+
+// -- A0 acceptance: a well-formed major-2 module is refused typed, naming the missing driver -----
+
+#[test]
+fn v2_module_refused_abi_unsupported_major() {
+    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 0));
+    let err = select_driver(&worker(), &wasm, Some(blake3::hash(&wasm).as_bytes()))
+        .expect_err("major 2 has no driver in A0");
+    assert_eq!(err.code, AbiRefusalCode::AbiUnsupportedMajor);
+    assert!(
+        err.detail.contains("A2"),
+        "the refusal names the missing v2 driver (Phase A2): {}",
+        err.detail
+    );
+}
+
+/// A major-2 module additionally linking the frozen `tabi@1` bridge is still a major-2 candidate
+/// (ABI §1.2: bridge imports never make a module major-1) — same clean refusal in A0.
+#[test]
+fn v2_module_with_tabi_bridge_still_selects_major2() {
+    let wasm = build_module(
+        &[("vhc@2", "next_event"), ("tabi@1", "batch_size@1")],
+        V2_EXPORTS,
+        pack(2, 0),
+    );
+    let err = select_driver(&worker(), &wasm, None).expect_err("bridge module is major-2");
+    assert_eq!(err.code, AbiRefusalCode::AbiUnsupportedMajor);
+}
+
+// -- da_abi cross-check: declaration contradicting the import shape --------------------------------
+
+#[test]
+fn v1_shape_declaring_major2_is_declaration_mismatch() {
+    // Import shape says v1 (tabi@1-only + lifecycle exports); da_abi lies and says major 2.
+    let wasm = build_module(&[], V1_EXPORTS, pack(DA_ABI_MAJOR_V2, 0));
+    let err = select_driver(&worker(), &wasm, None).expect_err("contradiction must refuse");
+    assert_eq!(err.code, AbiRefusalCode::AbiDeclarationMismatch);
+}
+
+#[test]
+fn v2_shape_declaring_major1_is_declaration_mismatch() {
+    // Import shape says v2 (a vhc@2 import); da_abi declares major 1. The cross-check fires
+    // BEFORE the host-support check, so this is a declaration mismatch, not unsupported-major.
+    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(1, 0));
+    let err = select_driver(&worker(), &wasm, None).expect_err("contradiction must refuse");
+    assert_eq!(err.code, AbiRefusalCode::AbiDeclarationMismatch);
+}
+
+// -- minor gate -----------------------------------------------------------------------------------
+
+#[test]
+fn v1_minor_above_host_is_minor_too_new() {
+    let wasm = build_module(&[], V1_EXPORTS, pack(1, 7));
+    let err = select_driver(&worker(), &wasm, None).expect_err("minor 7 > host minor 0");
+    assert_eq!(err.code, AbiRefusalCode::AbiMinorTooNew);
+}
+
+// -- step 1: hash mismatch refuses BEFORE compile ---------------------------------------------------
+
+#[test]
+fn hash_mismatch_refused_before_compile() {
+    // Deliberately NOT valid wasm: if compilation ran before the hash check this would surface as
+    // BadModule. The typed ModuleHashMismatch proves no byte reached wasmtime (ABI §1.3 step 1).
+    let not_wasm = b"definitely not a wasm module";
+    let wrong_pin = *blake3::hash(b"some other bytes").as_bytes();
+    let err =
+        select_driver(&worker(), not_wasm, Some(&wrong_pin)).expect_err("pin mismatch must refuse");
+    assert_eq!(err.code, AbiRefusalCode::ModuleHashMismatch);
+}
+
+#[test]
+fn correct_pin_with_invalid_wasm_is_bad_module() {
+    // Control for the test above: the hash gate passes, then compilation fails typed.
+    let not_wasm = b"definitely not a wasm module";
+    let err = select_driver(&worker(), not_wasm, Some(blake3::hash(not_wasm).as_bytes()))
+        .expect_err("invalid wasm must refuse");
+    assert_eq!(err.code, AbiRefusalCode::BadModule);
+}
+
+// -- step 3: compatibility tuple ---------------------------------------------------------------------
+
+#[test]
+fn unknown_symbol_in_known_namespace_is_world_minor_unsupported() {
+    let wasm = build_module(
+        &[("vhc@2", "next_event"), ("vhc@2", "symbol_from_the_future")],
+        V2_EXPORTS,
+        pack(2, 0),
+    );
+    let err = select_driver(&worker(), &wasm, None).expect_err("unknown symbol must refuse");
+    assert_eq!(err.code, AbiRefusalCode::WorldMinorUnsupported);
+    assert!(err.detail.contains("symbol_from_the_future"));
+}
+
+#[test]
+fn unknown_tabi_symbol_is_world_minor_unsupported() {
+    let wasm = build_module(&[("tabi@1", "bogus_op@1")], V1_EXPORTS, pack(1, 0));
+    let err = select_driver(&worker(), &wasm, None).expect_err("unknown tabi op must refuse");
+    assert_eq!(err.code, AbiRefusalCode::WorldMinorUnsupported);
+}
+
+#[test]
+fn unknown_namespace_is_bad_module() {
+    let wasm = build_module(
+        &[("wasi_snapshot_preview1", "fd_write")],
+        V1_EXPORTS,
+        pack(1, 0),
+    );
+    let err = select_driver(&worker(), &wasm, None).expect_err("unknown namespace must refuse");
+    assert_eq!(err.code, AbiRefusalCode::BadModule);
+}
+
+// -- step 2: no recognizable driver shape ------------------------------------------------------------
+
+#[test]
+fn tabi_only_without_v1_lifecycle_is_bad_module() {
+    let wasm = build_module(&[], &["da_alloc", "da_free"], pack(1, 0));
+    let err = select_driver(&worker(), &wasm, None).expect_err("shapeless module must refuse");
+    assert_eq!(err.code, AbiRefusalCode::BadModule);
+}
+
+// -- step 6: required exports for the selected major -------------------------------------------------
+
+#[test]
+fn v1_candidate_missing_da_manifest_is_bad_module() {
+    let wasm = build_module(
+        &[],
+        &[
+            "da_alloc",
+            "da_free",
+            // no da_manifest
+            "da_build",
+            "da_step",
+            "da_inner_update",
+            "da_make_update",
+            "da_ingest_updates",
+        ],
+        pack(1, 0),
+    );
+    let err = select_driver(&worker(), &wasm, None).expect_err("missing export must refuse");
+    assert_eq!(err.code, AbiRefusalCode::BadModule);
+    assert!(err.detail.contains("da_manifest"));
+}
+
+// -- refusals are admission outcomes, not traps ------------------------------------------------------
+
+#[test]
+fn refusals_never_reuse_the_v1_trap_slug_vocabulary() {
+    // The split codes are their own taxonomy: none of them stringifies to the retained v1 trap
+    // umbrella `AbiMismatch` (decisions D2: never a reused TrapCode::AbiMismatch).
+    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 0));
+    let err = select_driver(&worker(), &wasm, None).unwrap_err();
+    assert_ne!(err.code.slug(), "AbiMismatch");
+    assert_ne!(
+        err.code.slug(),
+        daemon_vhc_host::TrapCode::AbiMismatch.slug()
+    );
+}

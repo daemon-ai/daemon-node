@@ -129,6 +129,14 @@ pub struct Eligibility {
     pub reasons: Vec<String>,
     /// Per-dimension headroom (e.g. `"vram_mb" => 4096`).
     pub headroom: Vec<(String, i64)>,
+    /// The split typed admission-refusal code slug (ABI Draft 3 §1.5 — e.g.
+    /// `"AbiUnsupportedMajor"`, `"AbiDeclarationMismatch"`, `"ModuleHashMismatch"`), set when
+    /// ineligibility is a driver-selection/ABI admission refusal rather than a resource verdict.
+    /// Additive `#[serde(default)]` field (the established wire discipline): pre-A0 frames decode
+    /// to `None`, and refusals stay admission *outcomes* on the `Assessed` surface — never a
+    /// runtime `Event::Error`, never a reused v1 `TrapCode::AbiMismatch` (decisions D2).
+    #[serde(default)]
+    pub refusal_code: Option<String>,
 }
 
 /// A parent → worker command frame (§10.2).
@@ -563,6 +571,13 @@ mod tests {
             eligible: false,
             reasons: vec!["vram below floor".into()],
             headroom: vec![("vram_mb".into(), -2048), ("ram_mb".into(), 16_000)],
+            refusal_code: None,
+        }));
+        round_trip_event(Event::Assessed(Eligibility {
+            eligible: false,
+            reasons: vec!["AbiUnsupportedMajor: module declares abi major 2".into()],
+            headroom: Vec::new(),
+            refusal_code: Some("AbiUnsupportedMajor".into()),
         }));
         round_trip_event(Event::RunPhase {
             run_id: "run-42".into(),

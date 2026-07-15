@@ -32,6 +32,7 @@ pub mod handle;
 pub mod meta;
 pub mod phase;
 pub mod runtime;
+pub mod select;
 pub mod trap;
 pub mod wasm_backend;
 
@@ -50,6 +51,7 @@ pub use meta::MetaReport;
 pub use phase::Phase;
 pub use runtime::BackendKind;
 pub use runtime::{EngineConfig, Instance, LoadedModule, Manifest, ParamInfo, Worker};
+pub use select::{select_driver, Selection};
 pub use trap::{Trap, TrapCode};
 pub use wasm_backend::{WasmBackend, WasmBackendConfig, WasmBackendError};
 

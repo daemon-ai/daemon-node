@@ -132,7 +132,11 @@ async fn main() {
         match cmd {
             Command::Probe => send(&writer, &Event::Probed(backend::hardware())).await,
             Command::AssessRun { envelope } => match backend::resolve_run(&envelope).await {
-                Ok(resolved) => match backend::assess(&resolved.module, &resolved.config) {
+                Ok(resolved) => match backend::assess(
+                    &resolved.module,
+                    &resolved.config,
+                    resolved.module_blake3.as_ref(),
+                ) {
                     Ok(elig) => {
                         // Consume the autotune micro-batch (G2 rides it in `headroom["micro_batch"]`)
                         // so `JoinRun` drives / OOM-probes from the node-computed verdict (§10.5).

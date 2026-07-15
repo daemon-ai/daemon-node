@@ -72,12 +72,14 @@ async fn main() {
                         eligible: false,
                         reasons: vec!["fake: vram below floor".into()],
                         headroom: vec![("vram_mb".into(), -2048)],
+                        refusal_code: None,
                     }
                 } else {
                     Eligibility {
                         eligible: true,
                         reasons: vec!["fake: fits".into()],
                         headroom: vec![("vram_mb".into(), 4096)],
+                        refusal_code: None,
                     }
                 };
                 send(&writer, &Event::Assessed(assessed)).await;
