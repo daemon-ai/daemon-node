@@ -14,15 +14,32 @@ path = "src/lib.rs"
 # `[workspace.dependencies]`, so declaring them here is a lane-owned edit — no root Cargo.toml change.
 daemon-vhc-proto = { workspace = true }
 daemon-vhc-coordinator = { workspace = true }
+# The journal record grammar + framing constants (ABI companion §8.2/§8.3/§8.5). This crate encodes
+# journal records and validates them against `daemon_vhc_abi::JOURNAL_CDDL` (the authoritative CDDL);
+# the abi crate stays dep-free / dual-compiled, so the Rust record types + codec live here (host).
+daemon-vhc-abi = { workspace = true }
 serde = { workspace = true }
 # Node-side tool: observe uses std freely (std::io message-log framing) and follows its scaffold's
 # `thiserror` errors. It is NOT on the wasm32 substrate path (proto + coordinator stay wasm-clean).
 thiserror = { workspace = true }
+# The segmented journal (ABI §8) is a host-side on-disk substrate: the CBOR value tree the canonical
+# encoder walks (ciborium), byte-string journal fields (serde_bytes), the BLAKE3 segment hash chain
+# + sidecar content addressing (blake3). All in the frozen root workspace deps.
+ciborium = { workspace = true }
+serde_bytes = { workspace = true }
+blake3 = { workspace = true }
+# CRC32C (Castagnoli) per-record checksum (ABI §8.2). Lane-owned dev/runtime dep at a concrete pin
+# (not in the root workspace table, like daemon-vhc-proto's cddl-cat): pure-Rust, permissive-licensed.
+crc32c = "0.6"
+# XChaCha20-Poly1305 sidecar encryption profile (ABI §8.5). Already resolved in the frozen tree
+# (transitively) at 0.10; pinned here for the sidecar store. default-features carry `alloc` (the
+# header-as-AAD `Payload` path). The node-local key is a construction input via a key-provider trait.
+chacha20poly1305 = "0.10"
 
 [dev-dependencies]
-# Tests build a resolved `Envelope` whose `[experiment.config]` is a `ciborium::value::Value` (the
-# proto envelope's opaque config type). Dev-only; already in the frozen root workspace deps.
-ciborium = { workspace = true }
+# Journal grammar conformance: encode each record and validate it against `daemon_vhc_abi::JOURNAL_CDDL`
+# under the same validator + exact pin the proto/daemon-api conformance suites use.
+cddl-cat = "=0.7.1"
 
 [lints]
 workspace = true

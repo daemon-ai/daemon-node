@@ -286,8 +286,11 @@ fn build_guests() -> anyhow::Result<()> {
 /// protocol, assignment, envelope schema, and canonical CBOR; the harness, assess, and replay
 /// (loopback); the observe/replay oracle; the WS/gossip framing and dedupe codecs (no network); the
 /// worker det lane, cross-backend digest identity, and wasm-guest determinism; the SDK profile
-/// goldens; the e2e drills and observe-replay (no iroh/live); and the wire codec conformance (see the
-/// pinned list below).
+/// goldens; the e2e drills and observe-replay (no iroh/live); the wire codec conformance; and — from
+/// A1 — the crash-safe segmented journal substrate: the ABI §8.3 record-grammar validity + per-tag
+/// round-trips, crash safety (torn-write/CRC/chain recovery, durable seq never reused), and the
+/// coordinator oracle re-derived byte-identically over the journal (the journal-soak gate, refactor
+/// G6 / Decision 4) — see the pinned list below.
 ///
 /// The GPU (`wgpu`/`cuda`) and live-substrate lanes are deliberately EXCLUDED: those are the scheduled
 /// per-lane tier 2 and the manual hardware-in-loop gate tier 3 (see swarm-p2-gate-runbook.md).
@@ -304,6 +307,10 @@ fn swarm_ci_det() -> anyhow::Result<()> {
     // (label, cargo test args). Each runs in its own process; the first red aborts.
     let suites: &[(&str, &[&str])] = &[
         (
+            "daemon-vhc-abi (journal §8.3 CDDL grammar validity + per-tag samples)",
+            &["-p", "daemon-vhc-abi"],
+        ),
+        (
             "daemon-vhc-det (shared det kernels: sim ≡ host)",
             &["-p", "daemon-vhc-det"],
         ),
@@ -318,6 +325,23 @@ fn swarm_ci_det() -> anyhow::Result<()> {
         (
             "daemon-vhc-observe (MessageLog + replay oracle + desync tally)",
             &["-p", "daemon-vhc-observe"],
+        ),
+        (
+            // A1 journal-soak gate (refactor G6 / Decision 4): the crash-safe segmented journal
+            // (grammar conformance + per-tag round-trips), crash safety (torn-write/CRC/chain
+            // recovery, seq never reused), and the coordinator oracle re-derived byte-identically
+            // over the journal substrate. Additive + fast (re-runs already-built test binaries).
+            "daemon-vhc-observe journal + input replay (grammar, crash-safety, oracle-over-journal)",
+            &[
+                "-p",
+                "daemon-vhc-observe",
+                "--test",
+                "journal",
+                "--test",
+                "journal_crash",
+                "--test",
+                "journal_oracle",
+            ],
         ),
         (
             "daemon-vhc-net (framing + dedupe codecs, no network)",
