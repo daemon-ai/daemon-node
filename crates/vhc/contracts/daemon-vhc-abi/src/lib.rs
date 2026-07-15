@@ -47,12 +47,12 @@ pub const DA_ABI_MINOR_V2: u32 = 0;
 
 /// The set of ABI **majors this host generation implements** (i.e. carries a driver for).
 ///
-/// A0 ships the retained v1 five-phase driver only; the major-2 event-loop driver arrives in Phase
-/// A2. A module whose declared major is not in this set is refused
-/// [`AbiRefusalCode::AbiUnsupportedMajor`] *after* its declaration is cross-checked against its
-/// import shape (ABI §1.3 step 5). Adding `2` here is the one-line switch A2 flips once the v2
-/// driver + assessment linker land.
-pub const HOST_IMPLEMENTED_MAJORS: &[u32] = &[DA_ABI_MAJOR];
+/// A0 shipped the retained v1 five-phase driver only; **A2 flipped this to `[1, 2]`** in the same
+/// commit the major-2 event-loop driver (`daemon-vhc-host::v2::driver`) first ran a module end to
+/// end (refusal → driver, refactor §5 A2). A module whose declared major is not in this set is
+/// refused [`AbiRefusalCode::AbiUnsupportedMajor`] *after* its declaration is cross-checked
+/// against its import shape (ABI §1.3 step 5).
+pub const HOST_IMPLEMENTED_MAJORS: &[u32] = &[DA_ABI_MAJOR, DA_ABI_MAJOR_V2];
 
 /// The host's supported *minor* for an implemented `major` (`None` if the major is not implemented).
 ///
@@ -62,7 +62,7 @@ pub const HOST_IMPLEMENTED_MAJORS: &[u32] = &[DA_ABI_MAJOR];
 pub fn host_minor_for(major: u32) -> Option<u32> {
     match major {
         DA_ABI_MAJOR => Some(DA_ABI_MINOR),
-        // DA_ABI_MAJOR_V2 => Some(DA_ABI_MINOR_V2),  // ← A2 enables this alongside the v2 driver.
+        DA_ABI_MAJOR_V2 => Some(DA_ABI_MINOR_V2),
         _ => None,
     }
 }
@@ -170,8 +170,9 @@ pub enum AbiRefusalCode {
     WorldMinorUnsupported,
     /// A major-2 module imports `tabi@1` on a bridge-retired host (Phase C; ABI §1.3 step 3, §2.5).
     BridgeRetired,
-    /// The declared `major` is not implemented by this host (ABI §1.3 step 5). In A0 this is how a
-    /// well-formed major-2 module is cleanly refused — the v2 event-loop driver arrives in A2.
+    /// The declared `major` is not implemented by this host (ABI §1.3 step 5). Through A0 this is
+    /// how a well-formed major-2 module was cleanly refused; since A2 landed the event-loop
+    /// driver, it guards majors outside [`HOST_IMPLEMENTED_MAJORS`].
     AbiUnsupportedMajor,
     /// The declared `minor` exceeds the host's for that major (ABI §1.3 step 5).
     AbiMinorTooNew,
@@ -689,12 +690,14 @@ mod tests {
     }
 
     #[test]
-    fn v2_constants_pack_and_host_supports_only_v1_in_a0() {
+    fn v2_constants_pack_and_host_implements_both_majors_from_a2() {
         assert_eq!(DA_ABI_MAJOR_V2, 2);
-        assert_eq!(HOST_IMPLEMENTED_MAJORS, &[1]);
+        // A2 flipped the majors alongside the working event-loop driver (refactor §5 A2); an
+        // unimplemented major (e.g. a future 3) stays a clean AbiUnsupportedMajor.
+        assert_eq!(HOST_IMPLEMENTED_MAJORS, &[1, 2]);
         assert_eq!(host_minor_for(DA_ABI_MAJOR), Some(0));
-        // The v2 driver is Phase A2 — A0 does NOT implement major 2 (a clean AbiUnsupportedMajor).
-        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), None);
+        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(0));
+        assert_eq!(host_minor_for(3), None);
     }
 
     #[test]

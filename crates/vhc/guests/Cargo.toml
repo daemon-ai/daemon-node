@@ -5,7 +5,7 @@
 # §10.1). Members link `daemon-vhc-sdk` by path (../sdk/daemon-vhc-sdk).
 [workspace]
 resolver = "2"
-members = ["tiny-llama", "test-abi-basic"]
+members = ["tiny-llama", "test-abi-basic", "toy-averager"]
 
 # wasm size-tuned: the built modules ship as artifacts, so trade a little compile time for size.
 [profile.release]

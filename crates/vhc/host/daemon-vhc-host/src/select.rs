@@ -19,9 +19,9 @@
 //!    calling any of them traps — ABI §9.2), under minimal fuel + a tight epoch deadline.
 //! 5. **Cross-check the declaration** — call `da_abi()`; `major` ≠ candidate ⇒
 //!    [`AbiRefusalCode::AbiDeclarationMismatch`]; `major` not implemented by this host ⇒
-//!    [`AbiRefusalCode::AbiUnsupportedMajor`] (in A0 this is how a *well-formed* major-2 module is
-//!    cleanly refused: the v2 event-loop driver arrives in A2); `minor` above the host's ⇒
-//!    [`AbiRefusalCode::AbiMinorTooNew`].
+//!    [`AbiRefusalCode::AbiUnsupportedMajor`] (through A0 this refused well-formed major-2
+//!    modules; since A2's event-loop driver landed, majors 1 and 2 both select); `minor` above
+//!    the host's ⇒ [`AbiRefusalCode::AbiMinorTooNew`].
 //! 6. **Check required exports** for the selected major ⇒ `BadModule` when missing/mis-typed.
 //!
 //! Every failure is a **typed admission refusal** ([`AbiRefusal`]) — an `AssessRun`/instantiate
@@ -142,8 +142,7 @@ pub fn select_driver(
         return Err(AbiRefusal::new(
             AbiRefusalCode::AbiUnsupportedMajor,
             format!(
-                "module declares abi major {major}, but this host implements only majors \
-                 {:?} — the major-2 event-loop driver lands in Phase A2",
+                "module declares abi major {major}, but this host implements only majors {:?}",
                 daemon_vhc_abi::HOST_IMPLEMENTED_MAJORS
             ),
         ));

@@ -4904,6 +4904,7 @@ dependencies = [
  "cudarc 0.19.8",
  "daemon-vhc-abi",
  "daemon-vhc-det",
+ "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-safetensors",
  "daemon-vhc-sdk",

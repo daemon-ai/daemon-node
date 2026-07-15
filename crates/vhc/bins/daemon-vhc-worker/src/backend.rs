@@ -679,20 +679,22 @@ pub(crate) fn assess(
             // Fall through to the retained v1 assess below — unchanged behavior.
         }
         Ok(sel) => {
-            // Defensive A2 seam: selection admitted a non-v1 driver this worker does not carry.
+            // The major-2 event-loop driver exists (daemon-vhc-host::v2, this phase), but this
+            // worker's ASSESS/JOIN wiring for it — the claim()-based admission funnel (ABI §9.3)
+            // and the session event-pump attach — lands with the A2 funnel + choreography moves.
+            // Until then a v2 module is selection-admitted but not yet joinable through this
+            // worker: an honest ineligible Assessed outcome with NO refusal code (this is a
+            // not-yet-wired seam, not an ABI refusal — AbiUnsupportedMajor would be a lie now
+            // that HOST_IMPLEMENTED_MAJORS is [1, 2]).
             return Ok(Eligibility {
                 eligible: false,
                 reasons: vec![format!(
-                    "AbiUnsupportedMajor: module selected the major-{} event-loop driver, but \
-                     this worker ships no v2 driver (it lands in Phase A2)",
+                    "module selected the major-{} event-loop driver; the worker's v2 \
+                     claim()-admission + run wiring lands with the A2 funnel/choreography moves",
                     sel.major
                 )],
                 headroom: Vec::new(),
-                refusal_code: Some(
-                    daemon_vhc_abi::AbiRefusalCode::AbiUnsupportedMajor
-                        .slug()
-                        .to_string(),
-                ),
+                refusal_code: None,
             });
         }
         Err(refusal) => {

@@ -360,6 +360,16 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "driver_selection"],
         ),
         (
+            // The A2 event-loop acceptance (refactor §5 A2): the non-round toy-averager guest
+            // (timers + publish only) end-to-end under the real major-2 driver — selection
+            // admits, da_init/da_run dispatch, §12.1 signed frames with durable seqs, journaled
+            // through the real A1 substrate — plus the undeclared-channel GrantViolation
+            // negative. Named as its own lane (like the A0 fixture) so the standing
+            // expressiveness proof is visible; also covered by the host crate suite above.
+            "A2 v2 event loop (toy-averager expressiveness + typed channel trap)",
+            &["-p", "daemon-vhc-host", "--test", "v2_event_loop"],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),
