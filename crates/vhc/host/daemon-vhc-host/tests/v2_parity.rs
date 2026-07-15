@@ -186,10 +186,14 @@ fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
 /// Drive the v2 guest through the identical schedule, feeding the v1 oracle's update bytes at the
 /// barrier; return the final canonical state digest.
 fn v2_run(engine: EngineConfig, v1_updates: &[Vec<u8>]) -> StateDigest {
-    v2_run_n(engine, v1_updates, ROUNDS)
+    v2_run_n(engine, v1_updates, ROUNDS).0
 }
 
-fn v2_run_n(engine: EngineConfig, v1_updates: &[Vec<u8>], rounds: u64) -> StateDigest {
+fn v2_run_n(
+    engine: EngineConfig,
+    v1_updates: &[Vec<u8>],
+    rounds: u64,
+) -> (StateDigest, Vec<daemon_vhc_host::v2::SinkEntry>) {
     let wasm = guest("tiny_llama_v2");
     let worker = Worker::new(engine).expect("engine");
     let sel = daemon_vhc_host::select_driver(&worker, &wasm, Some(blake3::hash(&wasm).as_bytes()))
@@ -205,7 +209,7 @@ fn v2_run_n(engine: EngineConfig, v1_updates: &[Vec<u8>], rounds: u64) -> StateD
     };
     let run_cfg = V2RunConfig::new(identity, [0x81; 32], guest_cfg_bytes(), Vec::new());
     let sink = Arc::new(Mutex::new(MemorySink::new()));
-    let run = start_run(&worker, &wasm, run_cfg, Box::new(sink)).expect("start");
+    let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
     let pump = run.pump.clone();
     let peer = PeerId(PEER);
     let mut seq = 0u64;
@@ -267,18 +271,59 @@ fn v2_run_n(engine: EngineConfig, v1_updates: &[Vec<u8>], rounds: u64) -> StateD
     let state = pump
         .bridge_final_state()
         .expect("the digest-extraction hook exported the bridge state");
-    StateDigest(digest_of_state(&state, rounds - 1))
+    let entries = sink.lock().expect("sink").entries.clone();
+    (StateDigest(digest_of_state(&state, rounds - 1)), entries)
 }
 
-/// The named Phase-A acceptance lane, CPU tier: v1 driver ≡ v2 BarrierRound det digests.
+/// The named Phase-A acceptance lane, CPU tier: v1 driver ≡ v2 BarrierRound det digests — and
+/// the recorded run REPLAYS bit-for-bit through the §8.7 input-replay engine (the richest
+/// record mix: bridge compute, nr readouts, staged kinds 1/2, control frames, publishes).
 #[test]
 fn tiny_llama_on_barrier_round_reproduces_v1_digests_cpu() {
     let (updates, v1_digest) = v1_oracle(EngineConfig::default());
-    let v2_digest = v2_run(EngineConfig::default(), &updates);
+    let (v2_digest, entries) = v2_run_n(EngineConfig::default(), &updates, ROUNDS);
     assert_eq!(
         v1_digest, v2_digest,
         "the control inversion must not change the det-lane math (refactor §5 A2)"
     );
+
+    // Input replay (§8.7): re-drive the SAME module from the journal alone; every publish and
+    // the outcome must reproduce exactly (kernels not re-executed — nr readouts answered from
+    // the record). The full verifier-contract wiring lives in tests/v2_replay.rs; this asserts
+    // the invariant holds on the Phase-A acceptance run itself.
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    let script = daemon_vhc_host::v2::ReplayScript::from_entries(&entries);
+    let replayed = daemon_vhc_host::v2::replay_v2(
+        &worker,
+        &guest("tiny_llama_v2"),
+        &guest_cfg_bytes(),
+        &[],
+        script,
+    )
+    .expect("replay harness");
+    assert_eq!(replayed.end, daemon_vhc_host::v2::ReplayEnd::Outcome(0));
+    let recorded: Vec<(u64, u64, [u8; 32])> = entries
+        .iter()
+        .filter_map(|e| match e {
+            daemon_vhc_host::v2::SinkEntry::Publish {
+                channel,
+                seq,
+                payload_hash,
+                ..
+            } => Some((*channel, *seq, *payload_hash)),
+            _ => None,
+        })
+        .collect();
+    let replayed_decisions: Vec<(u64, u64, [u8; 32])> = replayed
+        .decisions
+        .iter()
+        .map(|d| (d.channel, d.seq, d.payload_hash))
+        .collect();
+    assert_eq!(
+        recorded, replayed_decisions,
+        "every recorded decision reproduces bit-for-bit (refactor §12.6 journal soak, v2)"
+    );
+    assert!(!recorded.is_empty(), "the run decided things");
 }
 
 /// The burn-ndarray tier (runs under the host suite's `--features burn-ndarray` lane).
