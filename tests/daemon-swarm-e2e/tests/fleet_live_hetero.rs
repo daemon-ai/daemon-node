@@ -266,7 +266,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn guests_root() -> PathBuf {
-    workspace_root().join("guests")
+    workspace_root().join("crates/vhc/guests")
 }
 
 fn guest_dir() -> PathBuf {

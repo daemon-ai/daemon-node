@@ -119,7 +119,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn guests_root() -> PathBuf {
-    workspace_root().join("guests")
+    workspace_root().join("crates/vhc/guests")
 }
 
 fn guest_dir() -> PathBuf {
@@ -131,7 +131,7 @@ fn guest_dir() -> PathBuf {
 
 fn guest_remap_rustflags() -> String {
     let root = guests_root();
-    let checkout = root.parent().unwrap_or(&root).to_path_buf();
+    let checkout = root.ancestors().nth(3).unwrap_or(&root).to_path_buf();
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo"));

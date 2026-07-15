@@ -302,7 +302,7 @@ fn spawn_dev_relay() -> Option<std::process::Child> {
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../guests")
+        .join("../../crates/vhc/guests")
         .canonicalize()
         .expect("guests workspace path")
 }
@@ -320,7 +320,7 @@ fn guest_dir() -> PathBuf {
 /// recorded in the committed `guests/guests.blake3`.
 fn guest_remap_rustflags() -> String {
     let root = guests_root();
-    let checkout = root.parent().unwrap_or(&root).to_path_buf();
+    let checkout = root.ancestors().nth(3).unwrap_or(&root).to_path_buf();
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo"));
