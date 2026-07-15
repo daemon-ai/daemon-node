@@ -17,8 +17,12 @@
 //!   signature-verified here, above the pump, and the pre-verified payload is delivered with
 //!   the original signed bytes as tag-12 evidence. (Worker-plane §12.1 v2 frames verify through
 //!   `daemon_vhc_session::v2_attach` — the same seam, different wire.)
-//! - **Batch staging**: zero-token batches shaped by the envelope schedule (corpus-backed v2
-//!   batch derivation is the `data@2` world, Phase B).
+//! - **Batch staging (corpus-backed since B2)**: the plumbing stages REAL token windows cut
+//!   from a corpus — the same `Corpus` shape the live fetch path (`live.rs::build_corpus`,
+//!   fetch-by-hash + blake3 verify + content cache) yields; the in-process t2 run assembles it
+//!   deterministically instead of fetching. Window arithmetic mirrors the module's own SDK math
+//!   (proto assignment + the same slicing — windowing is MODULE policy, the plumbing stages
+//!   content in the module's training order); the kind-1 staging encoding is unchanged.
 //! - **Inline replay soak** (refactor §12.6): after the run, the recorded journal is re-driven
 //!   through the §8.7 replay engine and every decision must reproduce bit-for-bit — a
 //!   diverging run is a join FAILURE, not a warning.
@@ -76,8 +80,53 @@ const T2_ROUNDS: u64 = 2;
 /// `global_batch`/`steps_per_round` schedule fixes the counts).
 const T2_BATCH_SEQS: u32 = 1;
 
-/// Tokens per sequence for the zero-token staged batches (Phase-A; `data@2` owns real corpora).
+/// Tokens per sequence — the corpus's `seq_len` and the guest model's (`TinyLlamaCfg.seq_len`).
 const T2_SEQ_LEN: u32 = 9;
+
+/// Build the t2 run's corpus: deterministic small-vocab shards assembled into the **same
+/// `Corpus` the live fetch path yields** (`live.rs::build_corpus` — manifest + shards fetched by
+/// hash, blake3-verified, windowed). The in-process t2 run has no store to fetch from, so it
+/// assembles the fetch path's product deterministically; `Corpus::from_parts` re-runs the same
+/// per-shard integrity verification a fetch would.
+///
+/// Tokens are embedding indices, so the vocabulary is strictly below the guest model's
+/// (`TinyLlamaCfg::default().vocab` = 64).
+fn t2_corpus() -> Result<daemon_vhc_session::data::Corpus, String> {
+    use daemon_vhc_session::data::{Manifest, ShardDesc, TokenWidth};
+    const SHARDS: u64 = 2;
+    const TOKENS_PER_SHARD: u64 = 2 * T2_SEQ_LEN as u64; // two sequences per shard
+    const VOCAB: u64 = 64;
+    let mut shards = Vec::new();
+    let mut blobs = Vec::new();
+    for i in 0..SHARDS {
+        let mut bytes = Vec::with_capacity(TOKENS_PER_SHARD as usize * 2);
+        let mut s = 0xDAE0_7E57u64 ^ i;
+        for _ in 0..TOKENS_PER_SHARD {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bytes.extend_from_slice(&(((s >> 33) % VOCAB) as u16).to_le_bytes());
+        }
+        shards.push(ShardDesc {
+            name: format!("shard-{i:04}.bin"),
+            bytes: bytes.len() as u64,
+            tokens: TOKENS_PER_SHARD,
+            blake3: blake3_hash(&bytes).to_hex(),
+        });
+        blobs.push(bytes);
+    }
+    let manifest = Manifest {
+        token_width: TokenWidth::U16,
+        seq_len: T2_SEQ_LEN,
+        shards,
+        tokenizer: None,
+        tokenizer_revision: None,
+        dataset: None,
+        dataset_revision: None,
+    };
+    daemon_vhc_session::data::Corpus::from_parts(manifest, blobs)
+        .map_err(|e| format!("t2 corpus: {e}"))
+}
 
 /// Drive one self-driven v2 run: the whole-run t2 shape. Returns the final det-lane digest.
 #[allow(clippy::too_many_lines)]
@@ -179,7 +228,8 @@ pub(crate) async fn join_and_run_v2(
     )
     .await;
 
-    let window = envelope.data.global_batch.start;
+    // The corpus the staging path reads (the fetch-path product — see `t2_corpus`).
+    let corpus = t2_corpus()?;
     let mut rounds_done = 0u64;
     let mut last_round = 0u64;
     while rounds_done < T2_ROUNDS {
@@ -202,16 +252,32 @@ pub(crate) async fn join_and_run_v2(
         match &msg {
             SwarmMessage::RoundOpen(ro) => {
                 last_round = ro.round;
-                // Stage the round's zero-token batches (training order): one per inner step.
-                let seqs = u64::from(window.max(1));
-                for _ in 0..seqs.div_ceil(u64::from(T2_BATCH_SEQS)) {
-                    pump.stage_batch(
-                        &vec![0u32; (T2_BATCH_SEQS * T2_SEQ_LEN) as usize],
-                        T2_BATCH_SEQS,
-                        T2_SEQ_LEN,
-                        None,
-                    )
-                    .map_err(|e| format!("stage batch: {e}"))?;
+                // Corpus-backed staging (B2): slice the round's batch window exactly as the
+                // module's SDK math does (single-peer roster ⇒ assignment yields the whole
+                // window), then stage each micro-window's REAL tokens from the corpus, in
+                // training order — content is mechanism, the window arithmetic is the module's
+                // policy mirrored (the bridge-era contract; kind-1 encoding unchanged).
+                let interval =
+                    daemon_vhc_session::data::BatchInterval::new(ro.batch.start, ro.batch.end);
+                let steps = daemon_vhc_session::data::slice_interval(
+                    interval,
+                    envelope.data.steps_per_round,
+                    T2_BATCH_SEQS,
+                )
+                .map_err(|e| format!("t2 window slicing: {e}"))?;
+                for step in &steps {
+                    for mb in &step.micro_batches {
+                        let mut tokens = Vec::new();
+                        for id in mb.start..mb.end {
+                            tokens.extend(
+                                corpus
+                                    .sequence(id)
+                                    .map_err(|e| format!("corpus sequence {id}: {e}"))?,
+                            );
+                        }
+                        pump.stage_batch(&tokens, (mb.end - mb.start) as u32, T2_SEQ_LEN, None)
+                            .map_err(|e| format!("stage batch: {e}"))?;
+                    }
                 }
                 deliver_coordinator_msg(&pump, &coord_key, &msg)?;
                 // The guest trains and voices its Commitment: per round, one Commitment then
