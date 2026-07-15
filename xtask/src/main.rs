@@ -370,6 +370,15 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_event_loop"],
         ),
         (
+            // The A2 claim + admission-funnel acceptance (refactor §5 A2; §10 gate row "Claim
+            // rejection / over-claim / under-claim traps"): over-claim vs owner policy (stage 5),
+            // claim outside lane bounds (stage 4), ClaimInconsistent, GrantsExceedLane, the
+            // attributable under-claim cap trap at run time, and claim determinism — all through
+            // the real restricted assessment instance (test-claim-v2 guest).
+            "A2 claim + admission funnel (over/under-claim, lane bounds, typed refusals)",
+            &["-p", "daemon-vhc-host", "--test", "v2_claim_funnel"],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),

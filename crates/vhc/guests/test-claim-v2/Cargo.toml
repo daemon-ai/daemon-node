@@ -1,0 +1,19 @@
+[package]
+name = "test-claim-v2"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The A2 claim-path exerciser guest (refactor §5 A2 acceptance; ABI §9): its `da_claim` /
+# `da_manifest` / `da_run` behaviors are selected by the raw config bytes `[mode, param]` so ONE
+# pinned module drives every claim acceptance lane — honest tiny claim (0), nondeterministic claim
+# → ClaimInconsistent (1), manifest naming an unadmitted channel → GrantsExceedLane (2),
+# under-claim that stages past its own hard-accountable cap → the typed attributable trap (3),
+# and a param-GiB device claim for lane-bounds / owner-cap refusals (4). Raw-ABI like
+# toy-averager; ciborium authors the claim/manifest CBOR.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ciborium = "0.2"

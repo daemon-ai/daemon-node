@@ -111,6 +111,13 @@ pub struct V2RunConfig {
     pub max_readback_bytes_per_slice: u64,
     /// Bounded advisory queue depth (manifest-declared once the funnel lands; a default here).
     pub advisory_depth: usize,
+    /// The claim's **hard-accountable host-tier cap** in raw bytes (`0` = uncapped): the
+    /// enforceable tier the host meters EXACTLY (ABI §9.1). At Phase A the metered
+    /// guest-attributable allocations are the staged bytes (`stage_state`); tensors/buffers join
+    /// the meter with the bridge/Phase-B buffer layer. Breach is the typed attributable
+    /// `BudgetMemory` trap — the under-claim acceptance (refactor §5 A2). The admission funnel
+    /// (`v2::admission`) supplies this from the evaluated claim.
+    pub hard_accountable_host_bytes: u64,
 }
 
 impl V2RunConfig {
@@ -134,6 +141,7 @@ impl V2RunConfig {
             max_frame_bytes: 1 << 20,
             max_readback_bytes_per_slice: 1 << 20,
             advisory_depth: 64,
+            hard_accountable_host_bytes: 0,
         }
     }
 }
@@ -463,6 +471,9 @@ struct V2Host {
     epoch_ticks: u64,
     max_readback_bytes: u64,
     max_frame_bytes: u32,
+    // the claim's hard-accountable host-tier cap (standing, not per-slice — ABI §9.1/§5.5)
+    hard_accountable_host_bytes: u64,
+    accountable_staged_bytes: u64,
     // signing (§12.1)
     signing: SigningKey,
     identity: RunIdentity,
@@ -801,6 +812,27 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
             let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
                 c.data_mut().enter("stage_state")?;
                 let bytes = read_guest(c, ptr, len)?;
+                // The hard-accountable cap (ABI §9.1): staged bytes are the Phase-A metered
+                // guest-attributable allocation. Breach is the typed ATTRIBUTABLE trap — the
+                // module claimed less than it uses (the under-claim acceptance, refactor §5 A2).
+                {
+                    let d = c.data_mut();
+                    d.accountable_staged_bytes += bytes.len() as u64;
+                    if d.hard_accountable_host_bytes != 0
+                        && d.accountable_staged_bytes > d.hard_accountable_host_bytes
+                    {
+                        return Err(Trap::new(
+                            TrapCode::BudgetMemory,
+                            "stage_state",
+                            None,
+                            format!(
+                                "hard-accountable host cap breached: staged {} > claimed {} \
+                                 (attributable to the module, ABI §9.1)",
+                                d.accountable_staged_bytes, d.hard_accountable_host_bytes
+                            ),
+                        ));
+                    }
+                }
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
                 let id = daemon_vhc_abi::GUEST_STAGING_ID_TOP_BIT | st.next_guest_staging_id;
@@ -1193,6 +1225,8 @@ pub fn start_run(
                 epoch_ticks,
                 max_readback_bytes: run.max_readback_bytes_per_slice,
                 max_frame_bytes: run.max_frame_bytes,
+                hard_accountable_host_bytes: run.hard_accountable_host_bytes,
+                accountable_staged_bytes: 0,
                 signing,
                 identity: run.identity.clone(),
                 sender,
@@ -1423,6 +1457,8 @@ mod tests {
             epoch_ticks: 1,
             max_readback_bytes: 0,
             max_frame_bytes: 0,
+            hard_accountable_host_bytes: 0,
+            accountable_staged_bytes: 0,
             signing,
             identity: RunIdentity {
                 run_id: [1u8; 32],

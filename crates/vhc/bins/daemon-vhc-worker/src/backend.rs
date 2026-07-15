@@ -651,15 +651,18 @@ pub(crate) fn device_limits() -> DeviceLimits {
 /// 2. A module selecting the **v1 driver** proceeds down the byte-for-byte unchanged v1 assess:
 ///    the static import scan vs the host `tabi@1` vocabulary, then the host meta-mode pass +
 ///    autotune verdict.
-/// 3. A module selecting the **v2 driver** cannot happen in A0 (major 2 is not in
-///    `HOST_IMPLEMENTED_MAJORS`, so selection already refused it `AbiUnsupportedMajor` naming the
-///    missing event-loop driver); the arm is still written defensively so flipping the constant in
-///    A2 without shipping the driver stays a refusal, not a panic.
+/// 3. A module selecting the **v2 driver** runs the A2 claim()-admission funnel ([`assess_v2`]):
+///    lane floor, restricted-instance `da_manifest`/`da_claim`, lane claim bounds, owner
+///    authorization — the ABI §9.3 owner-bracketed order.
+///
+/// Returns the eligibility verdict plus whether the module selected the **major-2** driver (the
+/// `JoinRun` dispatch needs it: the v2 run path — session pump attach — is not wired in this
+/// worker yet, so a v2 join is refused loud instead of falling into the v1 self-drive).
 pub(crate) fn assess(
     module: &[u8],
     config: &[u8],
     module_blake3: Option<&[u8; 32]>,
-) -> Result<Eligibility, String> {
+) -> Result<(Eligibility, bool), String> {
     // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (the meta pass over a real-scale
     // param layout exceeds the tiny-model defaults). The meta pass itself stays on the CPU-cheap
     // path (footprint estimation, backend-independent).
@@ -678,32 +681,22 @@ pub(crate) fn assess(
         Ok(sel) if sel.driver == daemon_vhc_abi::CandidateDriver::V1 => {
             // Fall through to the retained v1 assess below — unchanged behavior.
         }
-        Ok(sel) => {
-            // The major-2 event-loop driver exists (daemon-vhc-host::v2, this phase), but this
-            // worker's ASSESS/JOIN wiring for it — the claim()-based admission funnel (ABI §9.3)
-            // and the session event-pump attach — lands with the A2 funnel + choreography moves.
-            // Until then a v2 module is selection-admitted but not yet joinable through this
-            // worker: an honest ineligible Assessed outcome with NO refusal code (this is a
-            // not-yet-wired seam, not an ABI refusal — AbiUnsupportedMajor would be a lie now
-            // that HOST_IMPLEMENTED_MAJORS is [1, 2]).
-            return Ok(Eligibility {
-                eligible: false,
-                reasons: vec![format!(
-                    "module selected the major-{} event-loop driver; the worker's v2 \
-                     claim()-admission + run wiring lands with the A2 funnel/choreography moves",
-                    sel.major
-                )],
-                headroom: Vec::new(),
-                refusal_code: None,
-            });
+        Ok(_sel) => {
+            // The major-2 path: the claim()-based admission funnel (ABI §9.3, A2). Selection
+            // re-runs inside admit_v2 (§9.4 step 1–3 order is normative); the arms below map the
+            // funnel outcome onto the typed `Assessed` surface.
+            return Ok((assess_v2(&worker, module, config, module_blake3), true));
         }
         Err(refusal) => {
-            return Ok(Eligibility {
-                eligible: false,
-                reasons: vec![refusal.to_string()],
-                headroom: Vec::new(),
-                refusal_code: Some(refusal.code.slug().to_string()),
-            });
+            return Ok((
+                Eligibility {
+                    eligible: false,
+                    reasons: vec![refusal.to_string()],
+                    headroom: Vec::new(),
+                    refusal_code: Some(refusal.code.slug().to_string()),
+                },
+                false,
+            ));
         }
     }
 
@@ -718,15 +711,18 @@ pub(crate) fn assess(
         .collect();
 
     if !missing.is_empty() {
-        return Ok(Eligibility {
-            eligible: false,
-            reasons: vec![format!(
-                "module imports ops outside host tabi@1: {}",
-                missing.join(", ")
-            )],
-            headroom: Vec::new(),
-            refusal_code: None,
-        });
+        return Ok((
+            Eligibility {
+                eligible: false,
+                reasons: vec![format!(
+                    "module imports ops outside host tabi@1: {}",
+                    missing.join(", ")
+                )],
+                headroom: Vec::new(),
+                refusal_code: None,
+            },
+            false,
+        ));
     }
 
     let loaded = worker
@@ -753,25 +749,105 @@ pub(crate) fn assess(
     )];
     reasons.extend(verdict.reasons.iter().cloned());
 
-    Ok(Eligibility {
-        eligible: verdict.eligible,
-        reasons,
-        refusal_code: None,
-        headroom: vec![
-            ("micro_batch".to_string(), i64::from(verdict.micro_batch)),
-            ("vram_mb".to_string(), verdict.vram_mb_estimate as i64),
-            ("ram_mb".to_string(), verdict.ram_mb_estimate as i64),
-            (
-                "payload_bytes".to_string(),
-                verdict.payload_bytes_estimate as i64,
-            ),
-            (
-                "host_ram_mb".to_string(),
-                (report.host_ram_bytes_est as i64) / mib,
-            ),
-            ("param_bytes".to_string(), report.param_bytes as i64),
-        ],
-    })
+    Ok((
+        Eligibility {
+            eligible: verdict.eligible,
+            reasons,
+            refusal_code: None,
+            headroom: vec![
+                ("micro_batch".to_string(), i64::from(verdict.micro_batch)),
+                ("vram_mb".to_string(), verdict.vram_mb_estimate as i64),
+                ("ram_mb".to_string(), verdict.ram_mb_estimate as i64),
+                (
+                    "payload_bytes".to_string(),
+                    verdict.payload_bytes_estimate as i64,
+                ),
+                (
+                    "host_ram_mb".to_string(),
+                    (report.host_ram_bytes_est as i64) / mib,
+                ),
+                ("param_bytes".to_string(), report.param_bytes as i64),
+            ],
+        },
+        false,
+    ))
+}
+
+/// The major-2 assess arm: the owner-bracketed claim()-admission funnel (ABI §9.3;
+/// `daemon_vhc_host::v2::admission::admit_v2`), mapped onto the typed `Assessed` surface.
+///
+/// Funnel inputs at the worker seam:
+/// - **Stage 1 (owner participation)** is `true` here by construction: the node client — the
+///   owner's agent — gates participation BEFORE issuing `AssessRun` (architecture §3.5 stage 1
+///   lives node-side; the funnel function keeps the stage so host-level tests exercise it).
+/// - **Stage 2 lane**: the ratified launch **Trainer** profile with its deployment-config
+///   defaults (GPU required, the 16 GiB-class floor). On a CPU-only box a v2 module is refused
+///   "below lane floor" — the ratified behavior (Trainer is the only enabled lane; numbers are
+///   node configuration, overridable when node-side lane config lands).
+/// - **Stage 5 owner caps** are uncapped at assess time: the standing resource policy
+///   (`JoinPolicy{vram_cap_mb, …}`) arrives with `JoinRun`, where the join-time re-check judges
+///   it (§9.4 step 10 re-runs stage 5 against the recorded claim; that wiring rides the v2 join
+///   path, next sitting).
+fn assess_v2(
+    worker: &Worker,
+    module: &[u8],
+    config: &[u8],
+    module_blake3: Option<&[u8; 32]>,
+) -> Eligibility {
+    let lane = daemon_vhc_host::v2::ParticipationLane::trainer_launch_defaults();
+    let hw = hardware();
+    let dl = device_limits();
+    let device = daemon_vhc_host::v2::DeviceProfile {
+        gpu: hw.gpus > 0,
+        vram_bytes: dl.vram_mb << 20,
+        ram_bytes: dl.ram_mb << 20,
+        disk_bytes: hw.disk_free_mb << 20,
+    };
+    let owner = daemon_vhc_host::v2::OwnerPolicy {
+        participation_enabled: true,
+        vram_cap_bytes: 0,
+        host_cap_bytes: 0,
+    };
+    // Phase-A grants: the derived grants document lands with the v2 join wiring; assess evaluates
+    // the claim against empty grants (a pure-function input the module must tolerate, §9.1).
+    match daemon_vhc_host::v2::admit_v2(
+        worker,
+        module,
+        module_blake3,
+        config,
+        &[],
+        &lane,
+        &device,
+        &owner,
+    ) {
+        Ok(admission) => Eligibility {
+            eligible: true,
+            reasons: vec![format!(
+                "major-2 claim admitted: device {} B / host {} B (disjoint tier sums), \
+                 pressure order {:?}",
+                admission.claim.device_total(),
+                admission.claim.host_total(),
+                admission.claim.under_pressure,
+            )],
+            headroom: vec![
+                (
+                    "claim_device_bytes".to_string(),
+                    admission.claim.device_total() as i64,
+                ),
+                (
+                    "claim_host_bytes".to_string(),
+                    admission.claim.host_total() as i64,
+                ),
+            ],
+            refusal_code: None,
+        },
+        Err(refusal) => Eligibility {
+            eligible: false,
+            reasons: vec![refusal.to_string()],
+            headroom: Vec::new(),
+            refusal_code: refusal.code.map(|c| c.slug().to_string()),
+        },
+    }
 }
 
 /// The engine backend + GPU index the live worker drives its **native** lane on (§10.5 verdict path;

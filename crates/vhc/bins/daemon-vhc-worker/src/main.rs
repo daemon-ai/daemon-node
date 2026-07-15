@@ -114,6 +114,11 @@ async fn main() {
     // the micro-batch the last `AssessRun` autotune chose (G2's `Eligibility.headroom["micro_batch"]`),
     // threaded into `JoinRun` so the worker consumes the verdict in-process (B3 lifecycle glue).
     let mut run: Option<backend::ResolvedRun> = None;
+    // Whether the assessed run selected the major-2 event-loop driver: its assess path is the A2
+    // claim funnel, but the v2 JOIN wiring (session pump attach) is not in this worker yet — a v2
+    // JoinRun is refused loud rather than falling into the v1 self-drive (which would surface a
+    // misleading AbiMismatch from the five-phase driver).
+    let mut run_is_v2 = false;
     let mut live_backend: Option<WasmBackend> = None;
     // The A3 live coordinator attach handle (feature `swarm-net`): a running RoundEngine + event
     // pump, stopped on Leave/Shutdown. `None` on the self-driven (WS-only / no-credentials) path.
@@ -137,7 +142,8 @@ async fn main() {
                     &resolved.config,
                     resolved.module_blake3.as_ref(),
                 ) {
-                    Ok(elig) => {
+                    Ok((elig, is_v2)) => {
+                        run_is_v2 = is_v2;
                         // Consume the autotune micro-batch (G2 rides it in `headroom["micro_batch"]`)
                         // so `JoinRun` drives / OOM-probes from the node-computed verdict (§10.5).
                         if let Some((_, mb)) =
@@ -166,6 +172,19 @@ async fn main() {
                     .await;
                     continue;
                 };
+                if run_is_v2 {
+                    send(
+                        &writer,
+                        &worker_error(
+                            "JoinRun for a major-2 module: assess (claim funnel) succeeded, but \
+                             this worker's v2 run wiring (the session event-pump attach) lands \
+                             with the A2 choreography move — join refused loud rather than \
+                             mis-driving the v1 five-phase path",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
                 // A3 live attach (feature `swarm-net`): if the node authored a `JoinCredentials`
                 // body, run the real RoundEngine over the live plane; otherwise fall back to the
                 // self-driven representative round (the T0 baseline, also the default-gate path).

@@ -12,10 +12,18 @@
 //!   `next_event` bridge, `publish` under the §12.1 signed-frame envelope, timers, staging +
 //!   `read_back`, per-slice budgets, and `da_init`/`da_run` dispatch.
 
+//! - [`admission`] — `claim()` evaluation in the restricted assessment instance and the
+//!   owner-bracketed five-stage funnel (architecture §3.5; ABI §9).
+
+pub mod admission;
 pub mod driver;
 pub mod event;
 pub mod journal;
 
+pub use admission::{
+    admit_v2, AdmissionV2, DeviceProfile, FunnelRefusal, MemoryClaim, OwnerPolicy,
+    ParticipationLane, TierBytes,
+};
 pub use driver::{start_run, PumpHandle, RunEnd, RunIdentity, V2Error, V2Run, V2RunConfig};
 pub use event::{decode_event_frame, encode_event_frame, EventCodecError, EventV2, PayloadMeta};
 pub use journal::{JournalSink, MemorySink, SinkEntry, SinkError};

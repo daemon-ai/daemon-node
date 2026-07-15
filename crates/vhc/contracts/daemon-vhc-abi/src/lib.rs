@@ -648,6 +648,29 @@ pub const CLAIM_PRESSURE_DENY_NEW_BUFFERS: u64 = 0;
 /// `under_pressure` step 1: trap the current slice (ABI §9.1).
 pub const CLAIM_PRESSURE_TRAP_CURRENT_SLICE: u64 = 1;
 
+// -- the `da_claim` memory-claim contract (ABI §9.1) -----------------------------------------------
+//
+// The tiered memory envelope every major-2 module reports as a deterministic, cheap, compute-free
+// function of (config, grants). The canonical-CBOR map keys are fixed here so the guest-side
+// authors/SDK and the host-side evaluator (`daemon-vhc-host::v2::admission`) agree on one
+// vocabulary; the schema itself is ratified in the ABI companion (§9.1 `memory-claim`).
+
+/// `memory-claim` key: resources the host meters EXACTLY — the enforceable cap (breach is a typed
+/// attributable trap, ABI §9.1).
+pub const CLAIM_KEY_HARD_ACCOUNTABLE: &str = "hard_accountable";
+/// `memory-claim` key: the expected high-water mark, judged at admission against owner policy.
+pub const CLAIM_KEY_DECLARED_PEAK: &str = "declared_peak";
+/// `memory-claim` key: host-side costs the module cannot see and is never blamed for.
+pub const CLAIM_KEY_WORKSPACE: &str = "workspace";
+/// `memory-claim` key: the ordered degradation steps (`CLAIM_PRESSURE_*`).
+pub const CLAIM_KEY_UNDER_PRESSURE: &str = "under_pressure";
+/// `memory-claim` optional key: free-form notes.
+pub const CLAIM_KEY_NOTES: &str = "notes";
+/// `tier-bytes` key: device-tier bytes.
+pub const CLAIM_TIER_KEY_DEVICE: &str = "device";
+/// `tier-bytes` key: host-tier bytes.
+pub const CLAIM_TIER_KEY_HOST: &str = "host";
+
 // -- migration scaffolding return codes (ABI §6.3, §10.2, §10.3) ----------------------------------
 
 /// `cancel_timer` status 0: the timer was cancelled before firing; its `Timer` event MUST NOT be
