@@ -16,6 +16,7 @@
 //!   owner-bracketed five-stage funnel (architecture §3.5; ABI §9).
 
 pub mod admission;
+pub mod completion;
 pub mod driver;
 pub mod event;
 pub mod journal;
@@ -25,6 +26,7 @@ pub use admission::{
     admit_v2, AdmissionV2, DeviceProfile, FunnelRefusal, MemoryClaim, OwnerPolicy,
     ParticipationLane, TierBytes,
 };
+pub use completion::{CompError, CompletionCodecError, CompletionResult, SuccessPayload};
 pub use driver::{start_run, PumpHandle, RunEnd, RunIdentity, V2Error, V2Run, V2RunConfig};
 pub use event::{decode_event_frame, encode_event_frame, EventCodecError, EventV2, PayloadMeta};
 pub use journal::{JournalSink, MemorySink, SinkEntry, SinkError};
