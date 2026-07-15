@@ -4865,6 +4865,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-abi"
+version = "0.0.1"
+
+[[package]]
 name = "daemon-vhc-coordinator"
 version = "0.0.1"
 dependencies = [
@@ -4890,6 +4894,7 @@ dependencies = [
  "daemon-egress",
  "daemon-provision",
  "daemon-telemetry",
+ "daemon-vhc-abi",
  "daemon-vhc-det",
  "daemon-vhc-net",
  "daemon-vhc-proto",
@@ -4986,6 +4991,7 @@ name = "daemon-vhc-sdk"
 version = "0.0.1"
 dependencies = [
  "ciborium",
+ "daemon-vhc-abi",
  "daemon-vhc-det",
  "serde",
 ]

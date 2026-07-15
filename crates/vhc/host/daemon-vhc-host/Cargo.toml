@@ -136,10 +136,14 @@ swarm-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress", "d
 cuda = ["burn/cuda", "dep:cudarc"]
 
 [dev-dependencies]
-# Test-only: the frozen-surface sync check (`tests/abi_surface.rs`) reads the guest SDK's
-# `TABI_IMPORTS`, and the guest-lifecycle test builds the `TinyLlamaCfg` the wasm guest parses.
+# Test-only: the frozen-surface sync check (`tests/abi_surface.rs`) asserts the host `Linker` +
+# phase table name-for-name against the ABI contract crate's `TABI_IMPORTS` — the shared, dual-
+# compiled `contracts/` ground, so this check no longer dev-deps the guest SDK (host->SDK wart).
+daemon-vhc-abi = { workspace = true }
+# Test-only: the guest-lifecycle / parity tests build the `TinyLlamaCfg` the wasm guest parses.
 # `sim` compiles the SDK's `models`/`profiles` (config types) natively for the tests; never a
-# runtime edge (the host does not link the guest SDK).
+# runtime edge (the host does not link the guest SDK). NOTE: this remaining host->SDK dev-dep is a
+# tracked dependency-direction exception (model presets leave the SDK for `guests/` in Phase C).
 daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
 # Test-only: the node-side supervisor drives the real `daemon-vhc-worker` subprocess through the
 # frozen worker protocol (`tests/worker_protocol.rs`). Path dep between workspace members — no root

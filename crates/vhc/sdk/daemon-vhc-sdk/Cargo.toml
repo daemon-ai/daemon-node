@@ -9,6 +9,10 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# The frozen ABI surface (version constants + the `tabi@1` import vocabulary). Extracted to a
+# `contracts/` crate both sides of the wasm boundary link; the SDK re-exports it so guest code keeps
+# its `daemon_vhc_sdk::{DA_ABI_VERSION, TABI_IMPORTS, …}` paths (ABI §4/§9).
+daemon-vhc-abi = { workspace = true }
 # Guest-side SDK: it compiles to `wasm32-unknown-unknown` inside experiment modules, so its whole
 # dependency surface is `serde` (config/manifest schema) + `ciborium` (the CBOR codec over the
 # tensor ABI). Nothing host-only (no tokio / wasmtime / Burn) — swarm-training-spec.md §10.1.

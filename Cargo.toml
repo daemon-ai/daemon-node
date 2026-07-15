@@ -428,6 +428,7 @@ daemon-node = { version = "0", path = "crates/node/daemon-node" }
 daemon-metta = { version = "0", path = "crates/coprocessor/daemon-metta", default-features = false }
 daemon-metta-client = { version = "0", path = "crates/coprocessor/daemon-metta-client" }
 # --- swarm training stack (swarm-training-spec.md §10.1; DAG-ordered) -----------------------------
+daemon-vhc-abi = { version = "0", path = "crates/vhc/contracts/daemon-vhc-abi" }
 daemon-vhc-proto = { version = "0", path = "crates/vhc/contracts/daemon-vhc-proto" }
 daemon-vhc-det = { version = "0", path = "crates/vhc/contracts/daemon-vhc-det" }
 daemon-vhc-sdk = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk" }
