@@ -34,6 +34,7 @@ pub mod phase;
 pub mod runtime;
 pub mod select;
 pub mod trap;
+pub mod v2;
 pub mod wasm_backend;
 
 pub use autotune::{Autotune, AutotuneVerdict, DeviceLimits, ProbeStep};
