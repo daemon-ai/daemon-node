@@ -465,6 +465,215 @@ pub const TABI_IMPORTS: &[&str] = &[
     "det_idct2@1",
 ];
 
+// ================================================================================================
+// The major-2 event-loop wire vocabulary (ABI §4–§12): the numeric assignments the event-loop
+// driver (`daemon-vhc-host`), the session event pump (`daemon-vhc-session`), the guest SDK
+// (`daemon-vhc-sdk`), and the journal/replay verifier (`daemon-vhc-observe`) must ALL agree on.
+//
+// Like the A0 additions above (v2 namespaces, required exports, refusal taxonomy), these land in
+// the shared contract crate *before* the driver that consumes them, so every side is compiled
+// against one source of truth. They are pure normative constants — additive, no behavior change —
+// and MUST NOT be reordered/renumbered (tags are permanent, ABI §5.2). `HOST_IMPLEMENTED_MAJORS`
+// stays `[1]` here: these constants describe the wire the driver WILL speak; flipping the host to
+// implement major 2 is coupled to the driver + assessment linker landing (see that constant's doc).
+// ================================================================================================
+
+// -- event tags (ABI §4.2): the leading integer of every canonical-CBOR event frame (§5.1) -------
+
+/// `Frame` — a verified signed control frame (ABI §4.2/§4.3).
+pub const EV_TAG_FRAME: u64 = 0;
+/// `PayloadReady` — content-addressed staged bytes announced by `staging_id` (ABI §4.2/§4.3).
+pub const EV_TAG_PAYLOAD_READY: u64 = 1;
+/// `Timer` — a one-shot logical-clock timer elapsed (ABI §4.2/§4.3, §6.3).
+pub const EV_TAG_TIMER: u64 = 2;
+/// `Budget` — a host-initiated budget/pressure/throttle notification (ABI §4.2/§4.3).
+pub const EV_TAG_BUDGET: u64 = 3;
+/// `Stop` — terminal; after delivery every import traps `PhaseViolation` (ABI §4.2/§4.4).
+pub const EV_TAG_STOP: u64 = 4;
+/// `Fence` — RESERVED (Phase C `compute@2`); host MUST NOT deliver at major-2 minor 0 (ABI §4.6).
+pub const EV_TAG_FENCE: u64 = 5;
+/// `Completion` — RESERVED (Phase B async protocol); not delivered at minor 0 (ABI §4.6, §7.5).
+pub const EV_TAG_COMPLETION: u64 = 6;
+/// `Quiesce` — opens a bounded drain to `QuiesceReady` (ABI §4.2/§4.4).
+pub const EV_TAG_QUIESCE: u64 = 7;
+
+/// The Phase-A closed event subset a major-2-minor-0 host delivers and a module MUST handle
+/// (ABI §4.2: `{Frame, PayloadReady, Timer, Budget, Stop, Quiesce}`).
+pub const PHASE_A_EVENT_TAGS: &[u64] = &[
+    EV_TAG_FRAME,
+    EV_TAG_PAYLOAD_READY,
+    EV_TAG_TIMER,
+    EV_TAG_BUDGET,
+    EV_TAG_STOP,
+    EV_TAG_QUIESCE,
+];
+
+// -- `next_event` / `read_back` return status (ABI §4.1, §6.4): `(status << 32) | length` ---------
+
+/// `next_event`/`read_back` status: the frame/value was written into the guest buffer.
+pub const RET_STATUS_DELIVERED: u64 = 0;
+/// `next_event`/`read_back` status: buffer too small; `length` = exact required capacity, value NOT
+/// consumed. Mandatory-retry with an enlarged buffer before any other import (ABI §4.1, §6.4).
+pub const RET_STATUS_NEED_CAPACITY: u64 = 1;
+
+/// Pack a `(status, length)` pair into the `(status << 32) | length` return convention shared by
+/// `next_event` (ABI §4.1) and `read_back` (ABI §6.4).
+#[must_use]
+pub const fn pack_status_len(status: u64, length: u32) -> u64 {
+    (status << 32) | (length as u64)
+}
+
+// -- `read_back` kinds (ABI §6.4) -----------------------------------------------------------------
+
+/// `read_back` kind 0: the staged payload bytes (raw); any `PayloadReady` with `meta.kind = 0`.
+pub const READBACK_KIND_STAGED_BYTES: u32 = 0;
+/// `read_back` kind 1: a `tabi@1` batch handle (bridge only, ABI §2.5; `meta.kind = 1`).
+pub const READBACK_KIND_STAGED_BATCH: u32 = 1;
+/// `read_back` kind 2: the staging index for `upd_*@1` (bridge only, ABI §2.5; `meta.kind = 2`).
+pub const READBACK_KIND_STAGED_UPDATE: u32 = 2;
+/// `read_back` kind 3: bytes of a named state-manifest section (migration restore, ABI §10.2;
+/// requires the restore grant; the one kind legal during `da_migrate`, ABI §6.6).
+pub const READBACK_KIND_STATE_SECTION: u32 = 3;
+/// `read_back` kinds ≥ this are the reserved bridge-op journal kinds (ABI §2.5/§2.7); never valid as
+/// call arguments (ABI §6.4).
+pub const READBACK_KIND_BRIDGE_JOURNAL_MIN: u32 = 128;
+
+// -- `da_run` Outcome codes (ABI §4.5) ------------------------------------------------------------
+
+/// Outcome 0: clean finish after a `Stop` (ABI §4.5).
+pub const OUTCOME_OK: u32 = 0;
+/// Outcome 1: the module chose to leave the run (ABI §4.5).
+pub const OUTCOME_LEFT: u32 = 1;
+/// Outcome 2: returned during a `Quiesce` drain; snapshot manifest published (ABI §4.5, §10.2).
+pub const OUTCOME_QUIESCE_READY: u32 = 2;
+/// Outcomes ≥ this are module-defined; journaled verbatim, treated by the host as `Left` (ABI §4.5).
+pub const OUTCOME_MODULE_DEFINED_MIN: u32 = 16;
+
+// -- stop / quiesce reasons (ABI §4.2) ------------------------------------------------------------
+
+/// `stop-reason` 0: the run completed (ABI §4.2).
+pub const STOP_REASON_RUN_COMPLETE: u64 = 0;
+/// `stop-reason` 1: leave requested (ABI §4.2).
+pub const STOP_REASON_LEAVE_REQUESTED: u64 = 1;
+/// `stop-reason` 2: fault (ABI §4.2; also the `SpoolExhausted`/`SequenceGapUnrecoverable` escalation
+/// target, ABI §6.7).
+pub const STOP_REASON_FAULT: u64 = 2;
+/// `stop-reason` 3: owner policy (ABI §4.2).
+pub const STOP_REASON_OWNER_POLICY: u64 = 3;
+
+/// `quiesce-reason` 0: an epoch-fenced module upgrade drain (ABI §4.4, §10.3).
+pub const QUIESCE_REASON_UPGRADE: u64 = 0;
+/// `quiesce-reason` 1: a throttle drain (ABI §4.4, §11.3).
+pub const QUIESCE_REASON_THROTTLE: u64 = 1;
+
+// -- `payload-meta.kind` staged-kinds (ABI §4.2) --------------------------------------------------
+
+/// Staged-kind 0: plain bytes (`read_back` kind 0).
+pub const STAGED_KIND_BYTES: u64 = 0;
+/// Staged-kind 1: a bridge batch (`read_back` kind 1, ABI §2.5).
+pub const STAGED_KIND_BATCH: u64 = 1;
+/// Staged-kind 2: a bridge update container (`read_back` kind 2, ABI §2.5).
+pub const STAGED_KIND_UPDATE_CONTAINER: u64 = 2;
+
+// -- the channel table (ABI §6.2) -----------------------------------------------------------------
+
+/// Channel class 0: authoritative — reliable, ordered per sender, durable spool + gap detection
+/// (ABI §4.7, §6.2).
+pub const CHANNEL_CLASS_AUTHORITATIVE: u64 = 0;
+/// Channel class 1: advisory/gossip — bounded queue, fixed coalescing, journaled drops (ABI §4.7).
+pub const CHANNEL_CLASS_ADVISORY: u64 = 1;
+
+/// Channel direction 0: rx-only (publishing traps `GrantViolation`, ABI §6.2).
+pub const CHANNEL_DIR_RX_ONLY: u64 = 0;
+/// Channel direction 1: tx-only (ABI §6.2).
+pub const CHANNEL_DIR_TX_ONLY: u64 = 1;
+/// Channel direction 2: bidirectional (ABI §6.2).
+pub const CHANNEL_DIR_BIDIRECTIONAL: u64 = 2;
+
+/// The `control` channel id in the Phase-A default channel table (ABI §6.2).
+pub const DEFAULT_CHANNEL_CONTROL_ID: u32 = 0;
+/// The `control` channel name (ABI §6.2).
+pub const DEFAULT_CHANNEL_CONTROL_NAME: &str = "control";
+
+/// The identity of a channel in the **Phase-A default channel table** (ABI §6.2). The table is a
+/// driver-provided constant here, versioned with the ABI minor; at minor 0 it declares exactly one
+/// channel (`control`). Size/rate/spool **bounds are NOT part of this identity** — they come from
+/// the selected `ParticipationLane` profile at admission (ABI §6.2, §9.6), which is node-side
+/// configuration, not an ABI constant. From D0 the full `channel-decl` (with bounds) moves into the
+/// genesis envelope; the ABI surface (`publish(channel_id, …)`, `frame-ev.channel`, the §12 scope
+/// tuple) is unchanged by that move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultChannel {
+    /// The channel id the guest passes to `publish` / receives on `frame-ev.channel`.
+    pub id: u32,
+    /// The channel name.
+    pub name: &'static str,
+    /// The delivery class ([`CHANNEL_CLASS_AUTHORITATIVE`] / [`CHANNEL_CLASS_ADVISORY`]).
+    pub class: u64,
+    /// The direction ([`CHANNEL_DIR_RX_ONLY`] / `_TX_ONLY` / `_BIDIRECTIONAL`).
+    pub direction: u64,
+}
+
+/// The Phase-A (major-2 minor-0) default channel table (ABI §6.2): exactly one authoritative,
+/// bidirectional `control` channel that maps onto today's `SignedMessage` control plane. Its bounds
+/// are supplied by the lane profile at admission.
+pub const PHASE_A_DEFAULT_CHANNEL_TABLE: &[DefaultChannel] = &[DefaultChannel {
+    id: DEFAULT_CHANNEL_CONTROL_ID,
+    name: DEFAULT_CHANNEL_CONTROL_NAME,
+    class: CHANNEL_CLASS_AUTHORITATIVE,
+    direction: CHANNEL_DIR_BIDIRECTIONAL,
+}];
+
+// -- advisory-class coalescing rules (ABI §2.3 `coalesce`, §4.7) ----------------------------------
+
+/// Coalesce rule 0: dedup-by-hash (`PayloadReady`, ABI §4.7).
+pub const COALESCE_DEDUP_HASH: u64 = 0;
+/// Coalesce rule 1: latest-wins (`Timer`/`Budget`, ABI §4.7).
+pub const COALESCE_LATEST_WINS: u64 = 1;
+/// Coalesce rule 2: drop-oldest (gossip, ABI §4.7).
+pub const COALESCE_DROP_OLDEST: u64 = 2;
+
+// -- the domain-separated signed-frame envelope (ABI §12.1 — lands at A2) --------------------------
+
+/// The domain-separation tag every major-2 signed frame commits to (ABI §12.1). D1 adds certified
+/// keys + `Authority` around this envelope but MUST NOT add/remove/change any envelope field — the
+/// fields that give a Phase-A sequence its evidentiary meaning are frozen here at A2 (ABI §12.1/§12.2).
+pub const FRAME_ENVELOPE_DOMAIN_V2: &str = "daemon-vhc/frame/2";
+
+// -- `claim()` under-pressure degradation order (ABI §9.1) ----------------------------------------
+
+/// `under_pressure` step 0: deny new buffers (ABI §9.1).
+pub const CLAIM_PRESSURE_DENY_NEW_BUFFERS: u64 = 0;
+/// `under_pressure` step 1: trap the current slice (ABI §9.1).
+pub const CLAIM_PRESSURE_TRAP_CURRENT_SLICE: u64 = 1;
+
+// -- migration scaffolding return codes (ABI §6.3, §10.2, §10.3) ----------------------------------
+
+/// `cancel_timer` status 0: the timer was cancelled before firing; its `Timer` event MUST NOT be
+/// delivered (ABI §6.3).
+pub const CANCEL_TIMER_CANCELLED: u32 = 0;
+/// `cancel_timer` status 1: already fired/delivered/cancelled or never issued (ABI §6.3).
+pub const CANCEL_TIMER_ALREADY_FIRED_OR_UNKNOWN: u32 = 1;
+
+/// `snapshot_state` return 0: the manifest was accepted (ABI §10.2).
+pub const SNAPSHOT_STATE_ACCEPTED: u32 = 0;
+/// `snapshot_state` return 1: a declared section was not staged (ABI §10.2).
+pub const SNAPSHOT_STATE_SECTION_MISSING: u32 = 1;
+/// `snapshot_state` return 2: a staged section's hash did not match its declaration (ABI §10.2).
+pub const SNAPSHOT_STATE_HASH_MISMATCH: u32 = 2;
+/// `snapshot_state` return 3: staging exceeded the migration grant (ABI §10.2).
+pub const SNAPSHOT_STATE_GRANT_EXCEEDED: u32 = 3;
+
+/// `da_migrate` return 0: state reconstructed and validated (ABI §10.2).
+pub const DA_MIGRATE_READY: u32 = 0;
+/// `da_migrate` return 1: this module cannot consume the descriptor's manifest (ABI §10.2).
+pub const DA_MIGRATE_INCOMPATIBLE: u32 = 1;
+
+/// The top bit set on **guest-created** staging IDs (`stage_state`, ABI §10.2), distinguishing them
+/// from host-announced (`PayloadReady`) staging IDs (top bit clear) so the two namespaces never
+/// collide and guest IDs need no journal record (counter-derived, replay-reproducible).
+pub const GUEST_STAGING_ID_TOP_BIT: u64 = 1 << 63;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +794,80 @@ mod tests {
         slugs.sort_unstable();
         slugs.dedup();
         assert_eq!(slugs.len(), count, "refusal slugs must be unique");
+    }
+
+    #[test]
+    fn event_tags_are_permanent_and_unique() {
+        // Tags are permanent + never renumbered (ABI §5.2); the positional assignments of §4.2.
+        let tags = [
+            EV_TAG_FRAME,
+            EV_TAG_PAYLOAD_READY,
+            EV_TAG_TIMER,
+            EV_TAG_BUDGET,
+            EV_TAG_STOP,
+            EV_TAG_FENCE,
+            EV_TAG_COMPLETION,
+            EV_TAG_QUIESCE,
+        ];
+        assert_eq!(tags, [0, 1, 2, 3, 4, 5, 6, 7]);
+        let mut sorted = tags.to_vec();
+        let n = sorted.len();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), n, "event tags must be unique");
+        // The Phase-A closed subset excludes the reserved Fence/Completion tags (ABI §4.2/§4.6).
+        assert!(!PHASE_A_EVENT_TAGS.contains(&EV_TAG_FENCE));
+        assert!(!PHASE_A_EVENT_TAGS.contains(&EV_TAG_COMPLETION));
+        assert_eq!(PHASE_A_EVENT_TAGS.len(), 6);
+    }
+
+    #[test]
+    fn status_len_packing_round_trips() {
+        // The `(status << 32) | length` convention shared by next_event/read_back (ABI §4.1/§6.4).
+        let packed = pack_status_len(RET_STATUS_NEED_CAPACITY, 4096);
+        assert_eq!(packed >> 32, RET_STATUS_NEED_CAPACITY);
+        assert_eq!(packed & 0xffff_ffff, 4096);
+        assert_eq!(pack_status_len(RET_STATUS_DELIVERED, 0), 0);
+    }
+
+    #[test]
+    fn phase_a_default_channel_table_is_single_control_channel() {
+        // ABI §6.2 minor-0 default table: exactly one authoritative bidirectional `control` channel.
+        assert_eq!(PHASE_A_DEFAULT_CHANNEL_TABLE.len(), 1);
+        let control = PHASE_A_DEFAULT_CHANNEL_TABLE[0];
+        assert_eq!(control.id, DEFAULT_CHANNEL_CONTROL_ID);
+        assert_eq!(control.name, DEFAULT_CHANNEL_CONTROL_NAME);
+        assert_eq!(control.class, CHANNEL_CLASS_AUTHORITATIVE);
+        assert_eq!(control.direction, CHANNEL_DIR_BIDIRECTIONAL);
+    }
+
+    #[test]
+    fn readback_kinds_and_bridge_reserve_do_not_overlap_call_kinds() {
+        // Call kinds 0..=3 are distinct and below the reserved bridge-journal floor (ABI §6.4).
+        let call_kinds = [
+            READBACK_KIND_STAGED_BYTES,
+            READBACK_KIND_STAGED_BATCH,
+            READBACK_KIND_STAGED_UPDATE,
+            READBACK_KIND_STATE_SECTION,
+        ];
+        assert_eq!(call_kinds, [0, 1, 2, 3]);
+        assert!(call_kinds
+            .iter()
+            .all(|k| *k < READBACK_KIND_BRIDGE_JOURNAL_MIN));
+        assert_eq!(READBACK_KIND_BRIDGE_JOURNAL_MIN, 128);
+    }
+
+    #[test]
+    fn guest_staging_id_top_bit_is_high_bit() {
+        // Guest-created staging IDs carry the top bit; host-announced ones clear it (ABI §10.2).
+        assert_eq!(GUEST_STAGING_ID_TOP_BIT, 0x8000_0000_0000_0000);
+        assert_eq!(GUEST_STAGING_ID_TOP_BIT & 1, 0);
+    }
+
+    #[test]
+    fn frame_envelope_domain_is_major_scoped() {
+        // The domain-separation tag is frozen at A2 and major-scoped (ABI §12.1).
+        assert_eq!(FRAME_ENVELOPE_DOMAIN_V2, "daemon-vhc/frame/2");
     }
 
     #[test]
