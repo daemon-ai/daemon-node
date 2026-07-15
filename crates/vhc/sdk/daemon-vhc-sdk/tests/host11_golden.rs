@@ -12,8 +12,8 @@
 // sim-only: under the default no-sim gate the tensor surface is cfg'd out.
 #![cfg(feature = "sim")]
 
-use daemon_train_sdk::sim;
-use daemon_train_sdk::{Dtype, Init, Param, Tensor};
+use daemon_vhc_sdk::sim;
+use daemon_vhc_sdk::{Dtype, Init, Param, Tensor};
 
 const SEED: u64 = 0xDAE0_7E57;
 /// Relative+absolute closeness for the fp32 op vs the fp64 oracle (native lane is fp32).

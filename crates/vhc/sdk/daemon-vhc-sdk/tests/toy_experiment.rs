@@ -10,8 +10,8 @@
 // tensor surface is `cfg`-gated out, so this compiles to an empty test crate.
 #![cfg(feature = "sim")]
 
-use daemon_train_sdk::prelude::*;
-use daemon_train_sdk::sim;
+use daemon_vhc_sdk::prelude::*;
+use daemon_vhc_sdk::sim;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -282,4 +282,4 @@ fn ingest_averages_multiple_peers() {
 }
 
 // The macro must at least expand (to nothing under `sim`) for a real Experiment type.
-daemon_train_sdk::experiment!(Toy);
+daemon_vhc_sdk::experiment!(Toy);

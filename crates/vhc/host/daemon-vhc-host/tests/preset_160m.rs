@@ -22,7 +22,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use daemon_train::{EngineConfig, Worker};
-use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 /// Sandbox budgets scaled for the 160M-shaped preset. The default `EngineConfig` is tuned for the
 /// tiny (`d_model 64`) reference model; a 768-wide model's real fp32 matmuls take longer wall-clock

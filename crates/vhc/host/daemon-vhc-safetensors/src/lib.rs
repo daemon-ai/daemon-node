@@ -324,7 +324,7 @@ mod tests {
     /// tiny default config (small tensors) but the identical layout machinery the 160M preset uses.
     #[test]
     fn canonical_llama_layout_round_trips() {
-        use daemon_train_sdk::models::TinyLlamaCfg;
+        use daemon_vhc_sdk::models::TinyLlamaCfg;
         let cfg = TinyLlamaCfg::default();
         let layout = cfg.canonical_param_layout();
         let mut sd = StateDict::new();

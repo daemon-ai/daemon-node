@@ -19,7 +19,7 @@ use daemon_swarm_run::backend::{BatchRef, StepCtx, TrainerBackend};
 use daemon_train::{
     wgpu_adapter_available, BackendKind, EngineConfig, WasmBackend, WasmBackendConfig,
 };
-use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

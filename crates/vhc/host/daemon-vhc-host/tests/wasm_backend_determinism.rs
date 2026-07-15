@@ -18,8 +18,8 @@ use std::sync::Once;
 
 use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
 use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig};
-use daemon_train_sdk::models::TinyLlamaCfg;
 use daemon_vhc_proto::{blake3_hash, PeerId};
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 use serde::Serialize;
 
 // -- guest module loading (mirrors tests/guest_lifecycle.rs) ------------------------------------
@@ -358,7 +358,7 @@ fn preemption_as_churn_is_digest_neutral() {
 // -- sim ↔ host parity (documented cross-check) -------------------------------------------------
 
 // The MVP guarantee is cross-PEER bit-identity (WasmBackend vs WasmBackend, one implementation),
-// asserted above. Sim (`daemon-train-sdk` `sim`) vs host (`WasmBackend`/`CpuBackend`) equality is a
+// asserted above. Sim (`daemon-vhc-sdk` `sim`) vs host (`WasmBackend`/`CpuBackend`) equality is a
 // nice-to-have that does NOT hold bit-for-bit, because the two seed their param init RNG differently
 // (the host seeds via `runtime::fake_init` FNV/xorshift by name; the sim via `sim::init_values`
 // splitmix/Box-Muller), so even the *initial* masters differ before a single step. Both now run a

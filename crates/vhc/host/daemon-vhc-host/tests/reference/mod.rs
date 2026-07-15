@@ -42,7 +42,7 @@ use burn::tensor::{activation, Int, Tensor, TensorData};
 
 use daemon_train::{BackendKind, EngineConfig, Worker};
 use daemon_train_safetensors::StateDict;
-use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 use crate::tolerance::{assert_close, tol_for, OpClass};
 

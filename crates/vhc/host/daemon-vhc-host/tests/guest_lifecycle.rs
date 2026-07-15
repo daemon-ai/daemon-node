@@ -21,7 +21,7 @@ use std::process::Command;
 use std::sync::Once;
 
 use daemon_train::{EngineConfig, TrapCode, Worker};
-use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 use serde::Serialize;
 
 fn guests_root() -> PathBuf {

@@ -204,7 +204,7 @@ mod tests {
     fn demo_module_ineligible_on_slow_coordinator() {
         // The `demo` profile declares a 2 s staleness ceiling (`profiles::DemoProfile::manifest`
         // sets `max_round_interval_ms = Some(2000)`): a real-time per-step module (§5.3.3). The
-        // `daemon-train-sdk` side test `demo_manifest_declares_staleness_tolerance` pins that value
+        // `daemon-vhc-sdk` side test `demo_manifest_declares_staleness_tolerance` pins that value
         // at the source; here we assert the assess-time screen that consumes it.
         const DEMO_MAX_MS: u64 = 2000;
 

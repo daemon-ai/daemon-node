@@ -20,12 +20,12 @@ use daemon_common::SessionId;
 use daemon_provision::{Placement, PlacementSpec, ProcessProvisioner, Provisioner};
 use daemon_swarm_run::protocol::{self, Command as WCmd, Event, JoinPolicy, PolicyMode};
 use daemon_train_client::{TrainClientConfig, TrainSupervisor};
-use daemon_train_sdk::models::TinyLlamaCfg;
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey};
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 // -- guest module loading (mirrors tests/guest_lifecycle.rs) ------------------------------------
 

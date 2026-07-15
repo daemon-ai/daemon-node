@@ -430,7 +430,7 @@ daemon-metta-client = { version = "0", path = "crates/coprocessor/daemon-metta-c
 # --- swarm training stack (swarm-training-spec.md §10.1; DAG-ordered) -----------------------------
 daemon-vhc-proto = { version = "0", path = "crates/vhc/contracts/daemon-vhc-proto" }
 daemon-vhc-det = { version = "0", path = "crates/vhc/contracts/daemon-vhc-det" }
-daemon-train-sdk = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk" }
+daemon-vhc-sdk = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk" }
 daemon-swarm-net = { version = "0", path = "crates/vhc/host/daemon-vhc-net" }
 daemon-swarm-run = { version = "0", path = "crates/vhc/host/daemon-vhc-session" }
 daemon-swarm-coordinator = { version = "0", path = "crates/vhc/host/daemon-vhc-coordinator" }

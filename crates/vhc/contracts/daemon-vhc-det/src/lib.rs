@@ -4,7 +4,7 @@
 //! `daemon-vhc-det` — fixed-order fp32 deterministic kernels.
 //!
 //! The bit-exact fp32 reference kernels shared verbatim by the host worker (`daemon-train`) and
-//! the guest SDK simulator (`daemon-train-sdk`'s `sim` feature) so that "the sim matches the host"
+//! the guest SDK simulator (`daemon-vhc-sdk`'s `sim` feature) so that "the sim matches the host"
 //! is a property of one shared implementation rather than two that happen to agree
 //! (`docs/specs/swarm-tensor-abi-spec.md` §5.9; `swarm-training-spec.md` §5.6/§10.1).
 //!

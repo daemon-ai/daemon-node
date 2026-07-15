@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-train-sdk` — the guest experiment SDK.
+//! `daemon-vhc-sdk` — the guest experiment SDK.
 //!
 //! The guest-side SDK an experiment module links against: safe wrapper types over the tensor ABI
 //! (`tabi@1`, ABI §5), the [`Experiment`] trait + [`experiment!`] macro that wire the `da_*` exports

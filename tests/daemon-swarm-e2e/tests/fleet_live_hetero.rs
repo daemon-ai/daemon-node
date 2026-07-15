@@ -60,7 +60,6 @@ use daemon_swarm_run::protocol::{
     LeaveMode, PolicyMode, WsAuthSpec,
 };
 use daemon_train_client::{TrainClientConfig, TrainSupervisor};
-use daemon_train_sdk::models::TinyLlamaCfg;
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
@@ -68,6 +67,7 @@ use daemon_vhc_proto::envelope::{
 use daemon_vhc_proto::{
     from_canonical_slice, peer_id, to_canonical_vec, SignedMessage, SigningKey,
 };
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 // ---- P3 Merge-2: the 160M content-addressed ceremony mode ----------------------------------------
 //

@@ -10,7 +10,7 @@
 //! - `2` fuel spin: a large pure-guest loop ⇒ the host traps `BudgetFuel` under a low fuel budget
 //!   (ABI §8).
 
-use daemon_train_sdk::prelude::*;
+use daemon_vhc_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -66,4 +66,4 @@ impl Experiment for TestAbi {
     fn ingest(&mut self, _round: u64, _updates: &UpdatesView) {}
 }
 
-daemon_train_sdk::experiment!(TestAbi);
+daemon_vhc_sdk::experiment!(TestAbi);

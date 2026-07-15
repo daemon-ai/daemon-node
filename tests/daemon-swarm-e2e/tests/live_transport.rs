@@ -34,8 +34,8 @@ use daemon_swarm_run::harness::{
 use daemon_swarm_run::live_harness::{run_live_swarm, run_live_swarm_with, LiveSwarmConfig};
 use daemon_swarm_run::seam::RoundId;
 use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig, WasmBackendError};
-use daemon_train_sdk::models::TinyLlamaCfg;
 use daemon_vhc_proto::peer_id;
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 /// Assert every round in `run` has a single digest shared by all peers that reported it.
 fn assert_all_agree(run: &daemon_swarm_run::harness::SwarmRun) {

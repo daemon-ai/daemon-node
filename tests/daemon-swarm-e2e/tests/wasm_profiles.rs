@@ -40,7 +40,6 @@ use daemon_swarm_run::backend::{
     BatchRef, StagedPayload, StateDigest as RunDigest, StepCtx, TrainerBackend,
 };
 use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig};
-use daemon_train_sdk::models::TinyLlamaCfg;
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
@@ -52,6 +51,7 @@ use daemon_vhc_proto::{
     peer_id, CapabilitySet, Hash, IrohId, PeerId, SignedMessage, SigningKey, StateDigest,
     SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 // -- guest module loading (mirrors daemon-train/tests) ------------------------------------------
 

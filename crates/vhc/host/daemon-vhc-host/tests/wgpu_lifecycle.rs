@@ -18,7 +18,7 @@ use std::sync::Once;
 
 use daemon_train::autotune::{probe_wgpu, Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
 use daemon_train::{wgpu_adapter_available, BackendKind, EngineConfig, TrapCode, Worker};
-use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 use serde::Serialize;
 
 macro_rules! require_gpu {

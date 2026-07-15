@@ -16,9 +16,9 @@
 //    math (a direct `daemon-vhc-det` call path) and assert bit-for-bit against the profile pipeline.
 #![cfg(feature = "sim")]
 
-use daemon_train_sdk::profiles::{Demo, DemoCfg, DiLoCo, DiLoCoCfg, SparseLoco, SparseLocoCfg};
-use daemon_train_sdk::sim;
-use daemon_train_sdk::{Dtype, Init, Param, Persistent, Tensor, UpdatesView};
+use daemon_vhc_sdk::profiles::{Demo, DemoCfg, DiLoCo, DiLoCoCfg, SparseLoco, SparseLocoCfg};
+use daemon_vhc_sdk::sim;
+use daemon_vhc_sdk::{Dtype, Init, Param, Persistent, Tensor, UpdatesView};
 
 const SEED: u64 = 0xDAE0_7E57;
 
@@ -65,7 +65,7 @@ impl Model {
                 1e-8,
                 0.0,
             );
-            daemon_train_sdk::zero_grads();
+            daemon_vhc_sdk::zero_grads();
         }
     }
 }

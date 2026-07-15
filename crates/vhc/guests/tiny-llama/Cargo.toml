@@ -13,5 +13,5 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-daemon-train-sdk = { path = "../../sdk/daemon-vhc-sdk" }
+daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk" }
 serde = { version = "1", features = ["derive"] }

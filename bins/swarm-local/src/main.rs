@@ -171,11 +171,11 @@ impl EnvelopeToml {
                 // experiment config), so `--backend worker` drives a real training round rather than
                 // choking on a placeholder. A non-empty string is carried verbatim (opaque, §4.3).
                 config: if self.experiment.config.trim().is_empty() {
-                    ciborium::value::Value::serialized(&daemon_train_sdk::models::TinyLlamaCfg {
+                    ciborium::value::Value::serialized(&daemon_vhc_sdk::models::TinyLlamaCfg {
                         n_layers: 1,
                         seq_len: 9,
                         vocab: 64,
-                        ..daemon_train_sdk::models::TinyLlamaCfg::default()
+                        ..daemon_vhc_sdk::models::TinyLlamaCfg::default()
                     })
                     .expect("tiny-llama default config is serializable")
                 } else {

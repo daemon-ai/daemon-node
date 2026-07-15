@@ -2,14 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // Frozen-surface sync (ABI §9): the host `Linker` + phase-legality table (`daemon-train`) must
-// agree name-for-name with the guest SDK's `tabi@1` import list (`daemon_train_sdk::TABI_IMPORTS`).
+// agree name-for-name with the guest SDK's `tabi@1` import list (`daemon_vhc_sdk::TABI_IMPORTS`).
 // Extended from Wave 1's phase-table coverage: the vocabulary grows additively (Merge-1 50 + the
 // Wave-2 additions), and this test is the tripwire that a new op landed on BOTH sides or neither.
 
 use std::collections::BTreeSet;
 
 use daemon_train::phase::PHASE_TABLE;
-use daemon_train_sdk::TABI_IMPORTS;
+use daemon_vhc_sdk::TABI_IMPORTS;
 
 #[test]
 fn phase_table_matches_sdk_import_list_name_for_name() {

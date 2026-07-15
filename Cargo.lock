@@ -4513,8 +4513,8 @@ dependencies = [
  "daemon-swarm-run",
  "daemon-train",
  "daemon-train-client",
- "daemon-train-sdk",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk",
  "serde_json",
  "tokio",
 ]
@@ -4945,9 +4945,9 @@ dependencies = [
  "daemon-telemetry",
  "daemon-train-client",
  "daemon-train-safetensors",
- "daemon-train-sdk",
  "daemon-vhc-det",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -4974,17 +4974,8 @@ name = "daemon-train-safetensors"
 version = "0.0.1"
 dependencies = [
  "blake3",
- "daemon-train-sdk",
+ "daemon-vhc-sdk",
  "safetensors 0.4.5",
-]
-
-[[package]]
-name = "daemon-train-sdk"
-version = "0.0.1"
-dependencies = [
- "ciborium",
- "daemon-vhc-det",
- "serde",
 ]
 
 [[package]]
@@ -5021,6 +5012,15 @@ dependencies = [
  "proptest",
  "serde",
  "xxhash-rust",
+]
+
+[[package]]
+name = "daemon-vhc-sdk"
+version = "0.0.1"
+dependencies = [
+ "ciborium",
+ "daemon-vhc-det",
+ "serde",
 ]
 
 [[package]]
@@ -15063,8 +15063,8 @@ dependencies = [
  "clap",
  "daemon-swarm-run",
  "daemon-train-client",
- "daemon-train-sdk",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk",
  "serde",
  "serde_json",
  "tokio",

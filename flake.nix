@@ -180,7 +180,7 @@
 
         # devShell toolchain: the pinned stable toolchain PLUS the wasm32-unknown-unknown rust-std,
         # combined per fenix's cross recipe (same stable channel, so host and wasm rustc stay in
-        # lockstep). This lets the swarm guest experiment modules (`guests/`, `daemon-train-sdk`)
+        # lockstep). This lets the swarm guest experiment modules (`guests/`, `daemon-vhc-sdk`)
         # `cargo build --target wasm32-unknown-unknown` in-shell — the `xtask build-guests` target
         # (swarm-training-spec.md §10.1). Scoped to the dev shell (`craneLibDev` below) so the
         # package/build outputs keep using the lean host-only `rustToolchain`.

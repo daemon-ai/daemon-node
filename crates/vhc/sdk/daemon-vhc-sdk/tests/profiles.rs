@@ -6,9 +6,9 @@
 // state, with per-profile sparsity/compression assertions. sim-only.
 #![cfg(feature = "sim")]
 
-use daemon_train_sdk::profiles::{Demo, DemoCfg, DiLoCo, DiLoCoCfg, SparseLoco, SparseLocoCfg};
-use daemon_train_sdk::sim;
-use daemon_train_sdk::{Dtype, Init, Param, Persistent, Tensor, UpdatesView};
+use daemon_vhc_sdk::profiles::{Demo, DemoCfg, DiLoCo, DiLoCoCfg, SparseLoco, SparseLocoCfg};
+use daemon_vhc_sdk::sim;
+use daemon_vhc_sdk::{Dtype, Init, Param, Persistent, Tensor, UpdatesView};
 
 /// A minimal one-weight model with AdamW inner state — enough to drive a real pseudo-gradient
 /// (Δ = θ⁽ᵗ⁾ − θ) through a profile's compress → ingest loop.
@@ -55,7 +55,7 @@ impl Model {
                 1e-8,
                 0.0,
             );
-            daemon_train_sdk::zero_grads();
+            daemon_vhc_sdk::zero_grads();
         }
     }
 }

@@ -319,8 +319,8 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-train", "--features", "burn-ndarray"],
         ),
         (
-            "daemon-train-sdk (SDK profile goldens: sparse_loco/diloco)",
-            &["-p", "daemon-train-sdk", "--features", "sim"],
+            "daemon-vhc-sdk (SDK profile goldens: sparse_loco/diloco)",
+            &["-p", "daemon-vhc-sdk", "--features", "sim"],
         ),
         (
             "daemon-swarm-e2e (drills + observe-replay, no iroh/live)",
@@ -358,7 +358,7 @@ fn swarm_ci_det() -> anyhow::Result<()> {
 
 /// RUSTFLAGS that make the guest `.wasm` byte-reproducible across checkouts/machines by remapping the
 /// absolute source prefixes rustc embeds in panic locations: the `<checkout>` root (workspace + path
-/// deps like `daemon-train-sdk`) and the cargo registry (`$CARGO_HOME`, else `$HOME/.cargo`). Kept in
+/// deps like `daemon-vhc-sdk`) and the cargo registry (`$CARGO_HOME`, else `$HOME/.cargo`). Kept in
 /// lockstep with the `ensure_built()` copies in the wasm-backed test harnesses.
 fn guest_remap_rustflags(checkout: &Path) -> String {
     let cargo_home = std::env::var_os("CARGO_HOME")

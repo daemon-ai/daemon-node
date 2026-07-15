@@ -14,7 +14,7 @@ mod reference;
 mod tolerance;
 
 use daemon_train::{wgpu_adapter_available, BackendKind, Worker};
-use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 use reference::{
     assert_parity, cfg_cbor, drive_reference, drive_tabi, engine_for, throughput_stats,

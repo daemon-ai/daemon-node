@@ -22,7 +22,7 @@ mod reference;
 mod tolerance;
 
 use daemon_train::BackendKind;
-use daemon_train_sdk::models::{AdamWCfg, TinyLlamaCfg};
+use daemon_vhc_sdk::models::{AdamWCfg, TinyLlamaCfg};
 
 use reference::{assert_parity, drive_reference, drive_tabi, TokenBatch};
 use tolerance::OpClass;
@@ -39,7 +39,7 @@ fn reduced_cfg() -> TinyLlamaCfg {
 /// small enough to run 20 CPU steps quickly. `vocab = 50257` so real TinyStories (GPT-2) tokens are
 /// in range; `chunk 64` divides every param (build's sparse_loco registration is happy).
 fn medium_cfg() -> TinyLlamaCfg {
-    use daemon_train_sdk::profiles::SparseLocoCfg;
+    use daemon_vhc_sdk::profiles::SparseLocoCfg;
     TinyLlamaCfg {
         d_model: 256,
         n_layers: 4,

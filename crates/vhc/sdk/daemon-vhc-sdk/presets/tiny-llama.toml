@@ -2,7 +2,7 @@
 # `TinyLlamaCfg::default()`: a genuinely small LLaMA-family decoder for the deterministic sim/host
 # lifecycle tests (the wasm guest and the sim backend run the identical `TinyLlama` code). The
 # canonical byte form is `tiny-llama.cbor` (alongside). Kept in lockstep with
-# `daemon_train_sdk::models::TinyLlamaCfg::default()`.
+# `daemon_vhc_sdk::models::TinyLlamaCfg::default()`.
 d_model = 64
 n_layers = 2
 n_heads = 4

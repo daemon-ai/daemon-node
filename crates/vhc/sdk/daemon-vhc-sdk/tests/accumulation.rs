@@ -8,8 +8,8 @@
 // the accumulation matches within fp32 exactness on the CPU sim. sim-only.
 #![cfg(feature = "sim")]
 
-use daemon_train_sdk::sim;
-use daemon_train_sdk::{Dtype, Init, Param, StepCtx, Tensor};
+use daemon_vhc_sdk::sim;
+use daemon_vhc_sdk::{Dtype, Init, Param, StepCtx, Tensor};
 
 const TOTAL: u32 = 8;
 const D: u32 = 4;

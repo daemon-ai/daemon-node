@@ -9,9 +9,9 @@
 // sim-only (the wasm guest exercises the identical `TinyLlama` code through the real ABI).
 #![cfg(feature = "sim")]
 
-use daemon_train_sdk::models::{TinyLlama, TinyLlamaCfg};
-use daemon_train_sdk::sim;
-use daemon_train_sdk::{Config, Experiment, StepCtx, UpdatesView};
+use daemon_vhc_sdk::models::{TinyLlama, TinyLlamaCfg};
+use daemon_vhc_sdk::sim;
+use daemon_vhc_sdk::{Config, Experiment, StepCtx, UpdatesView};
 
 /// A deterministic synthetic corpus: token `t+1 = (t·7 + 1) mod vocab` — a fixed successor map the
 /// model can learn (next-token prediction), identical every call so runs are reproducible.

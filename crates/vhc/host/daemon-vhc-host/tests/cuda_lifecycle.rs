@@ -19,7 +19,7 @@ use daemon_train::autotune::{
     cuda_device_limits, cuda_nvrtc_ready, probe_cuda, Autotune, DEFAULT_MAX_MICROBATCH,
 };
 use daemon_train::{cuda_adapter_available, EngineConfig, Worker};
-use daemon_train_sdk::models::TinyLlamaCfg;
+use daemon_vhc_sdk::models::TinyLlamaCfg;
 use serde::Serialize;
 
 const MIB: u64 = 1 << 20;

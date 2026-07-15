@@ -2,7 +2,7 @@
 # ABI §6.1). The envelope authoring tool canonicalizes this TOML to deterministic CBOR at freeze
 # time; `llama-160m.cbor` (alongside) is the equivalent canonical byte form `da_build` receives.
 #
-# Kept in lockstep with `daemon_train_sdk::models::TinyLlamaCfg::llama_160m()`; the sim test
+# Kept in lockstep with `daemon_vhc_sdk::models::TinyLlamaCfg::llama_160m()`; the sim test
 # `preset_cbor_fixtures_parse` asserts the committed `.cbor` deserializes back to that constructor.
 #
 # ~151,862,784 trainable params (tied embedding). GQA deferred (`n_kv_heads == n_heads`). GPT-2 BPE
