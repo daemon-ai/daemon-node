@@ -508,11 +508,14 @@ fn swarm_ci_t2() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-sim"],
         ),
         (
-            // Host-side whole run over the PRODUCTION toy_averager.wasm blob: wasmtime + simulated
-            // capability providers, journaled end-to-end, then re-driven through the §8.7 input-
-            // replay engine — every decision reproduced bit-for-bit. Includes the reusable native-
-            // coordinator building block (the "native coordinator + wasm workers" shape).
-            "daemon-vhc-testkit (host-side whole run over the production blob: journaled + §8.7 replay)",
+            // Host-side whole runs over the PRODUCTION blobs: wasmtime + simulated capability
+            // providers, journaled end-to-end, re-driven through the §8.7 input-replay engine —
+            // every decision reproduced bit-for-bit. Covers the toy_averager whole run, the
+            // tiny_llama_v2 barrier whole runs under the in-process native coordinator (single-
+            // and 2-worker with cross-worker det-digest agreement; SDK-free raw-CBOR config), and
+            // the adversarial-rig pinned cases (duplicate record deduped; delayed payloads →
+            // straggle → catch-up).
+            "daemon-vhc-testkit (production-blob whole runs + barrier rounds + adversarial rig)",
             &["-p", "daemon-vhc-testkit"],
         ),
     ];

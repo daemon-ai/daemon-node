@@ -25,9 +25,14 @@
 //! The first whole-run gate wired into tier-2 CI is the SPARTA-shaped `toy_averager.wasm` production
 //! blob (timers + publish, no coordinator) — deterministic, journaled, replay-verified.
 
+pub mod barrier;
 pub mod coordinator;
 pub mod run;
 
+pub use barrier::{
+    barrier_whole_run, BarrierRunReport, BarrierSpec, FaultAction, FaultPlan, FaultRule, FrameKind,
+    WorkerReport,
+};
 pub use coordinator::NativeCoordinator;
 pub use run::{whole_run, ReplayReport, RunSpec, WholeRunReport};
 

@@ -74,6 +74,29 @@ impl NativeCoordinator {
         self.now_s
     }
 
+    /// The coordinator's sender identity bytes (its `PeerId`) — what a worker pump sees as the
+    /// authoritative frame sender.
+    #[must_use]
+    pub fn sender(&self) -> [u8; 32] {
+        daemon_vhc_proto::peer_id(&self.key).0
+    }
+
+    /// Advance the clock one second at a time until the coordinator produces a message, bounded
+    /// by `max_ticks` — the timeout-driven drive (warmup, round cadence) with a typed failure
+    /// instead of a hang when the coordinator goes quiet.
+    ///
+    /// # Errors
+    /// On a coordinator rejection, or if `max_ticks` elapse without any output.
+    pub fn advance_bounded(&mut self, max_ticks: u32) -> Result<(), String> {
+        for _ in 0..max_ticks {
+            self.advance_clock(1)?;
+            if !self.outbox.is_empty() {
+                return Ok(());
+            }
+        }
+        Err("coordinator went quiet (advance_bounded exhausted)".into())
+    }
+
     fn feed(&mut self, input: Input) -> Result<(), String> {
         let (next, outputs) = tick(self.state.clone(), input);
         self.state = next;
