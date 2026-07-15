@@ -64,6 +64,10 @@ enum Cmd {
     /// skip). This is the single in-repo definition of the per-PR swarm gate — the superproject CI
     /// job and a local operator both invoke `cargo run -p xtask -- swarm-ci-det`.
     SwarmCiDet,
+    /// Enforce the daemon-vhc dependency-direction rules (architecture §7): `host/*` never links
+    /// `sdk/*`, `contracts/*` links neither, `sdk/*` never links `host/*`. The honest current
+    /// exceptions are listed inline and each is tracked to the phase that removes it.
+    VhcDepCheck,
     /// Tokenize a corpus into fixed-width shards + `manifest.json` (spec §8; M1 seam).
     TokenizeCorpus {
         /// HF dataset repo id (e.g. `roneneldan/TinyStories`); omit when using `--text`.
@@ -173,6 +177,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::VerifyCodec => verify_codec(),
         Cmd::BuildGuests => build_guests(),
         Cmd::SwarmCiDet => swarm_ci_det(),
+        Cmd::VhcDepCheck => vhc_dep_check(),
         Cmd::TokenizeCorpus {
             dataset,
             dataset_file,
@@ -291,6 +296,10 @@ fn build_guests() -> anyhow::Result<()> {
 /// = green) is NOT a swarm crate and NOT in this list, so it never gates the swarm tier.
 fn swarm_ci_det() -> anyhow::Result<()> {
     let root = workspace_root();
+    // Dependency-direction invariant (architecture §7) first — cheap (metadata only) and fails fast
+    // on a host/*->sdk/* regression before spending a compile.
+    println!("\n== swarm-ci-det: daemon-vhc dependency-direction check ==");
+    vhc_dep_check()?;
     build_guests()?;
     // (label, cargo test args). Each runs in its own process; the first red aborts.
     let suites: &[(&str, &[&str])] = &[
@@ -353,6 +362,154 @@ fn swarm_ci_det() -> anyhow::Result<()> {
         anyhow::ensure!(status.success(), "swarm CI tier-1 suite failed: {label}");
     }
     println!("\nswarm-ci-det: all tier-1 (CPU consensus-critical) swarm suites green");
+    Ok(())
+}
+
+/// Enforce the daemon-vhc dependency-direction rules (architecture §7): the wasm boundary is
+/// visible as `sdk/` vs `host/`, and `contracts/` is the only shared ground.
+///
+/// - `host/*` never links `sdk/*` (the host runs production wasm blobs; native policy testing is
+///   `vhc-sim`'s job SDK-side, integration testing is the testkit's job host-side).
+/// - `contracts/*` links neither `sdk/*` nor `host/*`.
+/// - `sdk/*` never links `host/*`.
+///
+/// Enforced over `cargo metadata` (normal + dev + build edges). The real `sdk/*` consumers are the
+/// `guests/` modules, which are a separate cargo workspace outside this gate — so *every* edge into
+/// `sdk/*` from this workspace is a transitional wart, listed as an honest exception and tracked to
+/// the phase that removes it. A new, un-listed `*/ -> sdk/*` edge fails the gate.
+fn vhc_dep_check() -> anyhow::Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // The honest current exceptions (Phase 0): each is a transitional edge into `sdk/*` that a
+    // later phase removes. Format: (dependent crate, sdk crate, why it exists / when it goes).
+    const EXCEPTIONS: &[(&str, &str, &str)] = &[
+        (
+            "swarm-local",
+            "daemon-vhc-sdk",
+            "Phase B — the demo harness's SDK(sim) link is replaced by vhc-sim [normal dep]",
+        ),
+        (
+            "daemon-swarm-e2e",
+            "daemon-vhc-sdk",
+            "Phase B — e2e runs production wasm blobs under host/daemon-vhc-testkit [dev-dep]",
+        ),
+        (
+            "daemon-vhc-safetensors",
+            "daemon-vhc-sdk",
+            "Phase E — safetensors is wired into the checkpoint path (state-dict layout) [dev-dep]",
+        ),
+        (
+            "daemon-vhc-host",
+            "daemon-vhc-sdk",
+            "Phase C — model presets (TinyLlamaCfg/profiles) leave the SDK for guests/ [dev-dep]",
+        ),
+    ];
+
+    let root = workspace_root();
+    let out = Command::new("cargo")
+        .current_dir(&root)
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("running cargo metadata: {e}"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| anyhow::anyhow!("parsing cargo metadata json: {e}"))?;
+
+    // Classify a workspace crate by where its manifest lives in the crates/vhc/ tree.
+    fn role(manifest_path: &str) -> Option<&'static str> {
+        if manifest_path.contains("/crates/vhc/contracts/") {
+            Some("contracts")
+        } else if manifest_path.contains("/crates/vhc/sdk/") {
+            Some("sdk")
+        } else if manifest_path.contains("/crates/vhc/host/") {
+            Some("host")
+        } else {
+            None
+        }
+    }
+
+    let packages = meta["packages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("metadata.packages is not an array"))?;
+    let mut roles: BTreeMap<String, &'static str> = BTreeMap::new();
+    for p in packages {
+        if let (Some(name), Some(mp)) = (p["name"].as_str(), p["manifest_path"].as_str()) {
+            if let Some(r) = role(mp) {
+                roles.insert(name.to_string(), r);
+            }
+        }
+    }
+
+    let is_exception =
+        |from: &str, to: &str| EXCEPTIONS.iter().any(|(f, t, _)| *f == from && *t == to);
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+
+    for p in packages {
+        let from = p["name"].as_str().unwrap_or_default().to_string();
+        let from_role = roles.get(&from).copied();
+        let deps = p["dependencies"].as_array().cloned().unwrap_or_default();
+        for d in &deps {
+            let to = d["name"].as_str().unwrap_or_default().to_string();
+            // Only edges within the crates/vhc/ tree are governed by these rules.
+            let Some(to_role) = roles.get(&to).copied() else {
+                continue;
+            };
+            let kind = d["kind"].as_str().unwrap_or("normal"); // null == normal
+
+            // Every edge into sdk/* (from a non-sdk crate) must be a tracked exception.
+            if to_role == "sdk" && from_role != Some("sdk") {
+                if is_exception(&from, &to) {
+                    seen.insert((from.clone(), to.clone()));
+                } else {
+                    violations.push(format!(
+                        "{from} -> {to} [{kind}]: nothing but the guests workspace may link sdk/* \
+                         (no tracked exception)"
+                    ));
+                }
+            }
+            // contracts/* links neither sdk/* nor host/* (hard).
+            if from_role == Some("contracts") && (to_role == "sdk" || to_role == "host") {
+                violations.push(format!(
+                    "{from} -> {to} [{kind}]: contracts/* must link neither sdk/* nor host/*"
+                ));
+            }
+            // sdk/* never links host/* (hard).
+            if from_role == Some("sdk") && to_role == "host" {
+                violations.push(format!(
+                    "{from} -> {to} [{kind}]: sdk/* must not link host/*"
+                ));
+            }
+        }
+    }
+
+    println!("daemon-vhc dependency-direction check (architecture §7)");
+    println!(
+        "  rule: host/* never links sdk/* · contracts/* links neither · sdk/* never links host/*"
+    );
+    println!("\ntracked exceptions (honest; each removed by the noted phase):");
+    for (f, t, note) in EXCEPTIONS {
+        let mark = if seen.contains(&((*f).to_string(), (*t).to_string())) {
+            "present"
+        } else {
+            "STALE — listed but not in the graph; drop it from EXCEPTIONS"
+        };
+        println!("  [{mark}] {f} -> {t}: {note}");
+    }
+
+    if !violations.is_empty() {
+        eprintln!("\ndependency-direction VIOLATIONS:");
+        for v in &violations {
+            eprintln!("  x {v}");
+        }
+        anyhow::bail!("{} dependency-direction violation(s)", violations.len());
+    }
+    println!("\nok: no dependency-direction violations");
     Ok(())
 }
 
