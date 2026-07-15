@@ -42,8 +42,17 @@ pub const DA_ABI_VERSION: u32 = (DA_ABI_MAJOR << 16) | DA_ABI_MINOR;
 
 /// The major-2 (event-loop driver) ABI major (ABI §0.4, §1.2).
 pub const DA_ABI_MAJOR_V2: u32 = 2;
-/// The major-2 ABI minor defined by ABI Draft 3 (`da_abi` major 2, minor 0).
-pub const DA_ABI_MINOR_V2: u32 = 0;
+/// The major-2 ABI minor this host generation implements.
+///
+/// **Minor 1 is track B1's Phase-B surface** (buffers + the async completion protocol + net
+/// payload put/get — the [`V2_SYMBOL_REGISTRY`] minor-1 entries), bumped in the same commit that
+/// made `Event::Completion` delivery real in the driver — the ratified additive evolution path
+/// (ABI §1.4/§4.6: reserved variants deliverable only above the minor that reserved them),
+/// mirroring how the A2 majors flip was coupled to the working event-loop driver. A module
+/// declaring minor 0 keeps the Phase-A closed subset: it cannot import a completion-generating
+/// symbol (registry-gated), and the host delivers it no tag-6 event. `AbiMinorTooNew` continues
+/// to refuse declarations above this constant.
+pub const DA_ABI_MINOR_V2: u32 = 1;
 
 /// The set of ABI **majors this host generation implements** (i.e. carries a driver for).
 ///

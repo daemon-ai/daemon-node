@@ -25,7 +25,21 @@
 //!
 //! The two budgeted linear-memory crossing paths (`create_from` — sealed at creation — and
 //! `read_into`) are driver imports over this table; the table itself never touches guest memory.
+//!
+//! ## Two index partitions (replay determinism, ABI §7.1)
+//!
+//! Buffer handles are minted from two disjoint index domains:
+//!
+//! - **Guest partition** (indices `1 .. HOST_INDEX_BASE`): `create_from` allocations — a reusing,
+//!   generation-bumping arena whose state is a pure function of the guest's own call order.
+//! - **Host partition** (indices `≥ HOST_INDEX_BASE`): buffers minted at **completion arrival**
+//!   (`payload_get` results). Arrival interleaves nondeterministically with guest calls, so these
+//!   take monotone, **never-reused** indices at the fixed seed generation — the handle value is a
+//!   pure function of the *journaled completion order*, and the guest arena's state never depends
+//!   on embedder timing. Replay re-derives both partitions bit-exactly (§7.1 "handle generations
+//!   derive from journaled instantiation counters, never host randomness").
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use daemon_vhc_abi::{
@@ -34,6 +48,9 @@ use daemon_vhc_abi::{
 };
 
 use crate::trap::TrapCode;
+
+/// The first index of the host (completion-minted) partition. Guest-arena indices stay below.
+pub const HOST_INDEX_BASE: u32 = 0x8000_0000;
 
 /// One buffer slot: the current generation plus the sealed bytes (`None` = free).
 struct BufferSlot {
@@ -48,6 +65,9 @@ pub struct BufferTable {
     /// The §7.1 generation seed: fresh slots start at `instantiation counter + 1` (counter 0 ⇒
     /// generation 1, the v1 discipline; generation 0 is reserved for registered-class handles).
     generation_seed: u32,
+    /// The host partition: completion-minted buffers, monotone never-reused indices.
+    host_slots: BTreeMap<u32, Arc<Vec<u8>>>,
+    next_host_index: u32,
     live_handles: u64,
     live_bytes: u64,
     max_live_handles: u64,
@@ -66,6 +86,8 @@ impl BufferTable {
             generation_seed: (u32::try_from(instantiation_counter).unwrap_or(u32::MAX)
                 & HANDLE_MAX_GENERATION)
                 .wrapping_add(1),
+            host_slots: BTreeMap::new(),
+            next_host_index: HOST_INDEX_BASE,
             live_handles: 0,
             live_bytes: 0,
             max_live_handles,
@@ -85,29 +107,38 @@ impl BufferTable {
         self.live_bytes
     }
 
-    /// Seal `bytes` into a fresh buffer and return its kind-8 handle. Quota-checked BEFORE the
-    /// slot is taken, so a refused create leaves the table unchanged.
+    fn charge(&mut self, len: u64) -> Result<(), TrapCode> {
+        if self.max_live_handles != 0 && self.live_handles + 1 > self.max_live_handles {
+            return Err(TrapCode::BudgetHandles);
+        }
+        if self.max_live_bytes != 0 && self.live_bytes + len > self.max_live_bytes {
+            return Err(TrapCode::BudgetMemory);
+        }
+        self.live_handles += 1;
+        self.live_bytes += len;
+        Ok(())
+    }
+
+    /// Seal `bytes` into a fresh **guest-partition** buffer (`create_from`) and return its kind-8
+    /// handle. Quota-checked BEFORE the slot is taken, so a refused create leaves the table
+    /// unchanged.
     ///
     /// # Errors
     ///
     /// [`TrapCode::BudgetHandles`] / [`TrapCode::BudgetMemory`] on a `buffer-req` quota breach
     /// (typed, attributable to the module — ABI §9.1).
     pub fn create(&mut self, bytes: Arc<Vec<u8>>) -> Result<u64, TrapCode> {
-        if self.max_live_handles != 0 && self.live_handles + 1 > self.max_live_handles {
-            return Err(TrapCode::BudgetHandles);
-        }
-        let len = bytes.len() as u64;
-        if self.max_live_bytes != 0 && self.live_bytes + len > self.max_live_bytes {
-            return Err(TrapCode::BudgetMemory);
-        }
-        self.live_handles += 1;
-        self.live_bytes += len;
+        self.charge(bytes.len() as u64)?;
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.data = Some(bytes);
             Ok(pack_handle(HANDLE_KIND_BUFFER, slot.generation, index + 1))
         } else {
             let index = self.slots.len() as u32;
+            debug_assert!(
+                index + 1 < HOST_INDEX_BASE,
+                "guest arena below the host partition"
+            );
             self.slots.push(BufferSlot {
                 generation: self.generation_seed,
                 data: Some(bytes),
@@ -120,7 +151,22 @@ impl BufferTable {
         }
     }
 
-    fn slot_of(&self, handle: u64) -> Result<usize, TrapCode> {
+    /// Seal `bytes` into a fresh **host-partition** buffer — the completion-arrival mint
+    /// (`payload_get` results): a monotone, never-reused index at the seed generation, so the
+    /// handle value is a pure function of the journaled completion order (module docs). `None`
+    /// on a quota breach — completion-time creation is not a guest call, so quota pressure is
+    /// "deny new buffers" (the completion reports `GrantExhausted`, the declared first
+    /// degradation step of ABI §9.1), never a trap.
+    pub fn create_host(&mut self, bytes: Arc<Vec<u8>>) -> Option<u64> {
+        self.charge(bytes.len() as u64).ok()?;
+        let index = self.next_host_index;
+        self.next_host_index += 1;
+        self.host_slots.insert(index, bytes);
+        Some(pack_handle(HANDLE_KIND_BUFFER, self.generation_seed, index))
+    }
+
+    /// Which partition + slot a handle names, checked live + generation-valid.
+    fn locate(&self, handle: u64) -> Result<Location, TrapCode> {
         if handle_kind(handle) != HANDLE_KIND_BUFFER {
             return Err(TrapCode::InvalidHandle);
         }
@@ -128,12 +174,24 @@ impl BufferTable {
         if idx1 == 0 {
             return Err(TrapCode::InvalidHandle);
         }
+        if idx1 >= HOST_INDEX_BASE {
+            if handle_generation(handle) != self.generation_seed {
+                return Err(TrapCode::StaleHandle);
+            }
+            if idx1 >= self.next_host_index {
+                return Err(TrapCode::InvalidHandle);
+            }
+            if !self.host_slots.contains_key(&idx1) {
+                return Err(TrapCode::StaleHandle);
+            }
+            return Ok(Location::Host(idx1));
+        }
         let index = (idx1 - 1) as usize;
         let slot = self.slots.get(index).ok_or(TrapCode::InvalidHandle)?;
         if slot.data.is_none() || slot.generation != handle_generation(handle) {
             return Err(TrapCode::StaleHandle);
         }
-        Ok(index)
+        Ok(Location::Guest(index))
     }
 
     /// Resolve a live buffer handle to its sealed bytes (a cheap [`Arc`] clone — the refcount).
@@ -143,30 +201,43 @@ impl BufferTable {
     /// [`TrapCode::InvalidHandle`] for a non-buffer/out-of-range handle;
     /// [`TrapCode::StaleHandle`] for a released or wrong-generation one.
     pub fn resolve(&self, handle: u64) -> Result<Arc<Vec<u8>>, TrapCode> {
-        let index = self.slot_of(handle)?;
-        Ok(self.slots[index].data.clone().expect("slot checked live"))
+        match self.locate(handle)? {
+            Location::Guest(index) => {
+                Ok(self.slots[index].data.clone().expect("slot checked live"))
+            }
+            Location::Host(index) => Ok(self.host_slots[&index].clone()),
+        }
     }
 
-    /// Release the guest's hold on a buffer, freeing its quota. The slot's generation advances
-    /// (a retained handle traps `StaleHandle`); a slot at the generation ceiling is permanently
-    /// retired instead of refreed (no ABA, ABI §7.1). Returns the freed byte count. The bytes
-    /// themselves live until the last in-flight [`Arc`] holder drops.
+    /// Release the guest's hold on a buffer, freeing its quota. A guest-partition slot's
+    /// generation advances and refrees (permanent retirement at the ceiling — no ABA, ABI §7.1);
+    /// a host-partition index is simply removed (never reminted). Returns the freed byte count.
+    /// The bytes themselves live until the last in-flight [`Arc`] holder drops.
     ///
     /// # Errors
     ///
     /// As [`BufferTable::resolve`].
     pub fn release(&mut self, handle: u64) -> Result<u64, TrapCode> {
-        let index = self.slot_of(handle)?;
-        let slot = &mut self.slots[index];
-        let len = slot.data.take().expect("slot checked live").len() as u64;
+        let len = match self.locate(handle)? {
+            Location::Guest(index) => {
+                let slot = &mut self.slots[index];
+                let len = slot.data.take().expect("slot checked live").len() as u64;
+                if slot.generation >= HANDLE_MAX_GENERATION {
+                    // Permanent retirement: never back on the free list (ABI §7.1 wrap rule).
+                } else {
+                    slot.generation += 1;
+                    self.free.push(index as u32);
+                }
+                len
+            }
+            Location::Host(index) => self
+                .host_slots
+                .remove(&index)
+                .expect("located host slot live")
+                .len() as u64,
+        };
         self.live_handles -= 1;
         self.live_bytes -= len;
-        if slot.generation >= HANDLE_MAX_GENERATION {
-            // Permanent retirement: never back on the free list (ABI §7.1 wrap rule).
-        } else {
-            slot.generation += 1;
-            self.free.push(index as u32);
-        }
         Ok(len)
     }
 
@@ -182,9 +253,16 @@ impl BufferTable {
                 self.free.push(index as u32);
             }
         }
+        self.host_slots.clear();
         self.live_handles = 0;
         self.live_bytes = 0;
     }
+}
+
+/// A located live buffer: guest-arena slot index or host-partition index.
+enum Location {
+    Guest(usize),
+    Host(u32),
 }
 
 #[cfg(test)]
@@ -282,6 +360,37 @@ mod tests {
             2,
             "retired slot is never refreed"
         );
+    }
+
+    #[test]
+    fn host_partition_mints_monotone_never_reused_indices() {
+        // Completion-minted buffers: index sequence is a pure function of mint ORDER (the
+        // journaled completion order) — never interleaved with the guest arena's reuse.
+        let mut t = BufferTable::new(0, 0, 0);
+        let g1 = t.create(arc(b"guest")).unwrap();
+        let h1 = t.create_host(arc(b"net-1")).unwrap();
+        let h2 = t.create_host(arc(b"net-2")).unwrap();
+        assert_eq!(daemon_vhc_abi::handle_index(h1), HOST_INDEX_BASE);
+        assert_eq!(daemon_vhc_abi::handle_index(h2), HOST_INDEX_BASE + 1);
+        assert!(daemon_vhc_abi::handle_index(g1) < HOST_INDEX_BASE);
+        assert_eq!(t.resolve(h1).unwrap().as_slice(), b"net-1");
+        // Release + re-mint: the index is NEVER reused; the released handle is stale.
+        assert_eq!(t.release(h1).unwrap(), 5);
+        let h3 = t.create_host(arc(b"net-3")).unwrap();
+        assert_eq!(daemon_vhc_abi::handle_index(h3), HOST_INDEX_BASE + 2);
+        assert_eq!(t.resolve(h1), Err(TrapCode::StaleHandle));
+        // Host buffers meter the same quotas.
+        assert_eq!(t.live_handles(), 3, "guest + net-2 + net-3");
+    }
+
+    #[test]
+    fn host_partition_quota_pressure_denies_not_traps() {
+        // Completion-time creation under quota pressure is "deny new buffers" (None), never a
+        // trap — the completion path reports GrantExhausted (ABI §9.1 degradation step 0).
+        let mut t = BufferTable::new(0, 1, 0);
+        let _g = t.create(arc(b"held")).unwrap();
+        assert!(t.create_host(arc(b"denied")).is_none());
+        assert_eq!(t.live_handles(), 1, "denied mint is a no-op");
     }
 
     #[test]

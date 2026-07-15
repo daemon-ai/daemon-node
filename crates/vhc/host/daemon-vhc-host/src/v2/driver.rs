@@ -56,17 +56,20 @@ use ciborium::value::Value;
 use wasmtime::{Caller, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 use daemon_vhc_abi::{
-    pack_status_len, CHANNEL_DIR_RX_ONLY, EV_TAG_FRAME, EV_TAG_STOP, FRAME_ENVELOPE_DOMAIN_V2,
-    NS_NET_V2, NS_SYS_V2, NS_TABI_V1, NS_VHC_V2, PHASE_A_DEFAULT_CHANNEL_TABLE,
-    READBACK_KIND_STAGED_BYTES, RET_STATUS_DELIVERED, RET_STATUS_NEED_CAPACITY,
-    SNAPSHOT_STATE_SECTION_MISSING, STAGED_KIND_BYTES,
+    pack_status_len, CHANNEL_DIR_RX_ONLY, COMP_ERR_GRANT_EXHAUSTED, COMP_ERR_HASH_MISMATCH,
+    EV_TAG_FRAME, EV_TAG_STOP, FRAME_ENVELOPE_DOMAIN_V2, NS_NET_V2, NS_SYS_V2, NS_TABI_V1,
+    NS_VHC_V2, PHASE_A_DEFAULT_CHANNEL_TABLE, READBACK_KIND_STAGED_BYTES, RET_STATUS_DELIVERED,
+    RET_STATUS_NEED_CAPACITY, SNAPSHOT_STATE_SECTION_MISSING, STAGED_KIND_BYTES,
 };
 use daemon_vhc_proto::{peer_id, sign_canonical, to_canonical_vec, SigningKey};
 
 use crate::runtime::{EngineConfig, TabiHost, Worker};
 use crate::trap::{Trap, TrapCode};
+use crate::v2::buffer::BufferTable;
+use crate::v2::completion::{CompError, CompletionResult, SuccessPayload};
 use crate::v2::event::{encode_event_frame, EventV2, PayloadMeta};
 use crate::v2::journal::{JournalSink, SinkError};
+use crate::v2::ops::{OpRequest, OpTable};
 
 /// The frozen execution-identity five-tuple (ABI §8.1) as the driver consumes it.
 #[derive(Debug, Clone)]
@@ -117,6 +120,15 @@ pub struct V2RunConfig {
     /// `BudgetMemory` trap — the under-claim acceptance (refactor §5 A2). The admission funnel
     /// (`v2::admission`) supplies this from the evaluated claim.
     pub hard_accountable_host_bytes: u64,
+    /// `buffer-req.max_live_handles` (ABI §2.3): the standing live-buffer handle ceiling
+    /// (`0` = unbounded by this grant). Breach traps `BudgetHandles` (§7.3).
+    pub max_live_buffer_handles: u64,
+    /// `buffer-req.max_live_bytes` (ABI §2.3): the standing live-buffer byte ceiling — track B1's
+    /// buffer quota (`0` = unbounded by this grant). Breach traps `BudgetMemory`.
+    pub max_live_buffer_bytes: u64,
+    /// `grant-bound.max_outstanding` (ABI §2.3): the concurrent-operation ceiling for the async
+    /// completion protocol (`0` = unbounded by this grant). Breach traps `GrantViolation`.
+    pub max_outstanding_ops: u64,
 }
 
 impl V2RunConfig {
@@ -141,6 +153,9 @@ impl V2RunConfig {
             max_readback_bytes_per_slice: 1 << 20,
             advisory_depth: 64,
             hard_accountable_host_bytes: 0,
+            max_live_buffer_handles: 64,
+            max_live_buffer_bytes: 1 << 26,
+            max_outstanding_ops: 16,
         }
     }
 }
@@ -159,6 +174,27 @@ pub enum V2Error {
     /// A journal-sink write failed (journaling is load-bearing, §8.4).
     #[error(transparent)]
     Sink(#[from] SinkError),
+}
+
+/// The embedder's answer to one serviced op request (see [`PumpHandle::complete_op`]).
+#[derive(Debug)]
+pub enum OpOutcome {
+    /// A `payload_put` was durably stored; the pump computes the commitment hash itself.
+    PutDone,
+    /// A `payload_get` fetched these bytes; the pump hash-verifies before delivery.
+    GetDone {
+        /// The fetched bytes (verified against the op's requested hash by the pump).
+        bytes: Vec<u8>,
+    },
+    /// The operation failed (`COMP_ERR_*`, e.g. `NetUnreachable` for a connection failure —
+    /// connection establishment/failure are completions of the op that needed the connection,
+    /// architecture §3.3).
+    Failed {
+        /// The `comp-error` code (ABI §7.5).
+        code: u64,
+        /// A human-readable detail.
+        detail: String,
+    },
 }
 
 /// How a run ended (the guest-thread join result).
@@ -219,10 +255,45 @@ struct PumpState {
     /// sealing at the commit seam; see the publish import).
     sealed_containers: usize,
     latest_sealed_update: Option<(usize, Vec<u8>)>,
+    /// The per-instance buffer table (kind 8, architecture §3.4) — shared between the guest
+    /// thread's imports and completion-arrival minting, behind this pump lock.
+    buffers: BufferTable,
+    /// The outstanding-op table (kind 10, ABI §7.5).
+    ops: OpTable,
+    /// Requests awaiting the embedder (the async-runtime bridge): `(op, request)` in issue order.
+    op_requests: Vec<(u64, OpRequest)>,
     /// A `Stop` has been enqueued — no further deliveries will be accepted after it.
     stop_enqueued: bool,
     /// A `Quiesce` drain is open: Frame/PayloadReady/Timer deliveries are frozen (§4.4).
     draining: bool,
+}
+
+impl PumpState {
+    /// Enqueue + journal one completion (ABI §4.6/§7.5): the tag-14 record captures the
+    /// nondeterministic ARRIVAL (result + order) before the event is deliverable; the frame then
+    /// rides the ordinary event queue (tag 1 at delivery, §8.4 rule 4). Completions still deliver
+    /// during a `Quiesce` drain (§4.4 "already-outstanding operations") but never after `Stop`.
+    fn enqueue_completion(&mut self, op: u64, result: &CompletionResult) -> Result<(), SinkError> {
+        if self.stop_enqueued {
+            return Ok(()); // the host delivers no further events after Stop (§4.4)
+        }
+        let result_bytes = result.encode().map_err(|e| SinkError(e.to_string()))?;
+        self.sink.completion(op, &result_bytes)?;
+        let frame_bytes = encode_event_frame(&EventV2::Completion {
+            op,
+            result: result.clone(),
+        })
+        .map_err(|e| SinkError(e.to_string()))?;
+        self.queue.push_back(QueuedEvent {
+            frame_bytes,
+            tag: daemon_vhc_abi::EV_TAG_COMPLETION,
+            signed: None,
+            payload_hash: None,
+            timer_id: None,
+            is_budget: false,
+        });
+        Ok(())
+    }
 }
 
 struct PumpShared {
@@ -484,6 +555,66 @@ impl PumpHandle {
             timer_id: None,
             is_budget: false,
         });
+        drop(st);
+        self.shared.wake.notify_all();
+        Ok(())
+    }
+
+    /// Drain the outstanding-op requests awaiting service (the async-runtime bridge, architecture
+    /// §3.3: "all actual waiting lives in the host's async runtime"). Each request is handed out
+    /// exactly once; the embedder answers through [`PumpHandle::complete_op`] whenever it likes —
+    /// completion order is a nondeterministic input the journal captures (tag 14).
+    #[must_use]
+    pub fn take_op_requests(&self) -> Vec<(u64, OpRequest)> {
+        std::mem::take(&mut self.shared.state.lock().expect("pump lock").op_requests)
+    }
+
+    /// Complete an outstanding op with the embedder's outcome. The pump — not the embedder — owns
+    /// the trust steps (architecture §3.4): a put's hash is computed here over the op's own sealed
+    /// bytes; a get's bytes are hash-verified against the requested hash BEFORE the completion is
+    /// delivered (a mismatch completes `HashMismatch`, and the guest never sees the bytes). A
+    /// completion for an op that is no longer outstanding (it was cancelled) is the raced-cancel
+    /// no-op: the guest was already told `Cancelled`.
+    ///
+    /// # Errors
+    /// A journal-sink failure, or an outcome that contradicts the op's request shape (an embedder
+    /// bug, surfaced loudly).
+    pub fn complete_op(&self, op: u64, outcome: OpOutcome) -> Result<(), SinkError> {
+        let mut st = self.shared.state.lock().expect("pump lock");
+        let Some(request) = st.ops.finish(op) else {
+            return Ok(()); // cancelled while in service — Cancelled was already delivered
+        };
+        let result = match (request, outcome) {
+            (OpRequest::PayloadPut { bytes }, OpOutcome::PutDone) => {
+                CompletionResult::Ok(SuccessPayload::Hash(*blake3::hash(&bytes).as_bytes()))
+            }
+            (OpRequest::PayloadGet { hash }, OpOutcome::GetDone { bytes }) => {
+                if blake3::hash(&bytes).as_bytes() == &hash {
+                    match st.buffers.create_host(Arc::new(bytes)) {
+                        Some(handle) => CompletionResult::Ok(SuccessPayload::Handle(handle)),
+                        None => CompletionResult::Err(CompError {
+                            code: COMP_ERR_GRANT_EXHAUSTED,
+                            detail: Some("buffer quota exhausted (deny new buffers)".into()),
+                        }),
+                    }
+                } else {
+                    CompletionResult::Err(CompError {
+                        code: COMP_ERR_HASH_MISMATCH,
+                        detail: Some("fetched bytes do not hash to the requested content".into()),
+                    })
+                }
+            }
+            (_, OpOutcome::Failed { code, detail }) => CompletionResult::Err(CompError {
+                code,
+                detail: Some(detail),
+            }),
+            (req, outcome) => {
+                return Err(SinkError(format!(
+                    "op outcome shape mismatch: request {req:?} answered with {outcome:?}"
+                )))
+            }
+        };
+        st.enqueue_completion(op, &result)?;
         drop(st);
         self.shared.wake.notify_all();
         Ok(())
@@ -1113,6 +1244,192 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
         },
     )?;
 
+    // ---- vhc@2 minor 1: the buffer layer (architecture §3.4; ABI §7.4) --------------------------
+    // create_from — the budgeted linear-memory path OUT: seal guest bytes into a kind-8 buffer.
+    linker.func_wrap(
+        NS_VHC_V2,
+        "create_from",
+        |mut c: Caller<'_, V2Host>, ptr: u32, len: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("create_from")?;
+                let bytes = read_guest(c, ptr, len)?;
+                // The hard-accountable claim meter covers guest-initiated allocations (ABI §9.1
+                // "tensors, buffers, handles the host meters exactly").
+                {
+                    let d = c.data_mut();
+                    d.accountable_staged_bytes += u64::from(len);
+                    if d.hard_accountable_host_bytes != 0
+                        && d.accountable_staged_bytes > d.hard_accountable_host_bytes
+                    {
+                        return Err(Trap::new(
+                            TrapCode::BudgetMemory,
+                            "create_from",
+                            None,
+                            "hard-accountable host cap breached (attributable, ABI §9.1)",
+                        ));
+                    }
+                }
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.buffers
+                    .create(Arc::new(bytes))
+                    .map_err(|code| Trap::new(code, "create_from", None, "buffer quota (§7.3)"))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // read_into — the budgeted linear-memory path IN: copy a window of a sealed buffer into guest
+    // memory. Charged against the per-slice readback-byte allowance (§5.5); recordless — buffer
+    // contents are deterministic at replay (create_from bytes) or content-addressed (payload_get).
+    linker.func_wrap(
+        NS_VHC_V2,
+        "read_into",
+        |mut c: Caller<'_, V2Host>,
+         buffer: u64,
+         offset: u64,
+         out_ptr: u32,
+         out_cap: u32|
+         -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("read_into")?;
+                let shared = c.data().shared.clone();
+                let data = {
+                    let st = shared.state.lock().expect("pump lock");
+                    st.buffers
+                        .resolve(buffer)
+                        .map_err(|code| Trap::new(code, "read_into", None, "buffer handle"))?
+                };
+                let start = usize::try_from(offset).unwrap_or(usize::MAX);
+                let window = data.len().saturating_sub(start.min(data.len()));
+                let n = window.min(out_cap as usize);
+                {
+                    let d = c.data_mut();
+                    d.slice.readback_bytes += n as u64;
+                    if d.slice.readback_bytes > d.max_readback_bytes {
+                        return Err(Trap::new(
+                            TrapCode::GrantViolation,
+                            "read_into",
+                            None,
+                            "per-slice readback-byte allowance exhausted (§5.5)",
+                        ));
+                    }
+                }
+                if n > 0 {
+                    let slice = data[start..start + n].to_vec();
+                    write_guest(c, out_ptr, &slice)?;
+                }
+                Ok(n as u64)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // buffer_len — deterministic bookkeeping (no journal record).
+    linker.func_wrap(
+        NS_VHC_V2,
+        "buffer_len",
+        |mut c: Caller<'_, V2Host>, buffer: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("buffer_len")?;
+                let shared = c.data().shared.clone();
+                let st = shared.state.lock().expect("pump lock");
+                st.buffers
+                    .resolve(buffer)
+                    .map(|d| d.len() as u64)
+                    .map_err(|code| Trap::new(code, "buffer_len", None, "buffer handle"))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // buffer_release — the guest's explicit release (§3.4 ownership); frees quota + claim meter.
+    linker.func_wrap(
+        NS_VHC_V2,
+        "buffer_release",
+        |mut c: Caller<'_, V2Host>, buffer: u64| -> Result<(), wasmtime::Error> {
+            let r: Result<(), Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("buffer_release")?;
+                let shared = c.data().shared.clone();
+                let freed = {
+                    let mut st = shared.state.lock().expect("pump lock");
+                    st.buffers
+                        .release(buffer)
+                        .map_err(|code| Trap::new(code, "buffer_release", None, "buffer handle"))?
+                };
+                let d = c.data_mut();
+                d.accountable_staged_bytes = d.accountable_staged_bytes.saturating_sub(freed);
+                Ok(())
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // cancel — the completion protocol's cancellation (§3.3/§7.5): an outstanding op is retired
+    // NOW and its completion (reporting Cancelled) is enqueued deterministically; a late service
+    // outcome is ignored. Recordless: the journaled completion result captures the race (§8.3).
+    linker.func_wrap(
+        NS_VHC_V2,
+        "cancel",
+        |mut c: Caller<'_, V2Host>, op: u64| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("cancel")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                if st.ops.finish(op).is_some() {
+                    st.enqueue_completion(op, &CompletionResult::cancelled())
+                        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    Ok(0) // cancel accepted: the op's completion reports Cancelled
+                } else {
+                    Ok(1) // already completed/cancelled or never issued
+                }
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- net@2 minor 1: content-addressed payloads by handle (§3.4) — both complete async -------
+    linker.func_wrap(
+        NS_NET_V2,
+        "payload_put",
+        |mut c: Caller<'_, V2Host>, buffer: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("payload_put")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let bytes = st
+                    .buffers
+                    .resolve(buffer)
+                    .map_err(|code| Trap::new(code, "payload_put", None, "buffer handle"))?;
+                let request = OpRequest::PayloadPut { bytes };
+                let op = st.ops.begin(request.clone()).map_err(|code| {
+                    Trap::new(code, "payload_put", None, "max_outstanding grant (§2.3)")
+                })?;
+                st.op_requests.push((op, request));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_NET_V2,
+        "payload_get",
+        |mut c: Caller<'_, V2Host>, hash_ptr: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("payload_get")?;
+                let hash_bytes = read_guest(c, hash_ptr, 32)?;
+                let hash: [u8; 32] = hash_bytes.as_slice().try_into().expect("32-byte span");
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st
+                    .ops
+                    .begin(OpRequest::PayloadGet { hash })
+                    .map_err(|code| {
+                        Trap::new(code, "payload_get", None, "max_outstanding grant (§2.3)")
+                    })?;
+                st.op_requests.push((op, OpRequest::PayloadGet { hash }));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
     // ---- net@2::publish — the signed, sequenced, durable egress door (§6.2/§12) -----------------
     linker.func_wrap(
         NS_NET_V2,
@@ -1434,6 +1751,11 @@ pub fn start_run(
             bridge_final_state: None,
             sealed_containers: 0,
             latest_sealed_update: None,
+            // Generation-seeded by the instantiation counter (0: this driver instantiates once
+            // per start_run; trap-restart re-seeding rides the tag-13 counter, ABI §7.1).
+            buffers: BufferTable::new(0, run.max_live_buffer_handles, run.max_live_buffer_bytes),
+            ops: OpTable::new(0, run.max_outstanding_ops),
+            op_requests: Vec::new(),
             stop_enqueued: false,
             draining: false,
         }),
@@ -1587,6 +1909,11 @@ pub fn start_run(
                     .map(crate::runtime::HostState::canonical_state_bytes_of);
                 let mut st = shared.state.lock().expect("pump lock");
                 st.bridge_final_state = final_state;
+                // Force-reclaim the instance's buffers + outstanding ops through the per-instance
+                // tables (architecture §3.4; ABI §7.3) — the guest-thread-owned teardown.
+                st.buffers.clear();
+                st.ops.clear();
+                st.op_requests.clear();
             }
             match run_result {
                 Ok(outcome) => {
@@ -1734,6 +2061,9 @@ mod tests {
             bridge_final_state: None,
             sealed_containers: 0,
             latest_sealed_update: None,
+            buffers: BufferTable::new(0, 0, 0),
+            ops: OpTable::new(0, 0),
+            op_requests: Vec::new(),
             stop_enqueued: false,
             draining: false,
         }

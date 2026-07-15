@@ -16,7 +16,14 @@
 //! captured by the journaled completion result (`Cancelled` vs anything else), so replay derives
 //! the cancel return from the recorded event stream instead of a dedicated record (the same
 //! rationale as the `NeedCapacity` recordlessness, ABI §8.3).
+//!
+//! **`OpId` values are a pure function of guest call order** (replay determinism, ABI §7.1):
+//! indices are monotone and **never reused**, because an op retires at completion *arrival* —
+//! embedder timing the guest never observes — and a reusing free-list would let that timing leak
+//! into subsequently minted handle values. Monotone indices make every `OpId` derivable from the
+//! `begin()` sequence alone; the generation is the fixed instantiation-counter seed.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use daemon_vhc_abi::{
@@ -45,18 +52,12 @@ pub enum OpRequest {
     },
 }
 
-/// One outstanding op slot.
-struct OpSlot {
-    generation: u32,
-    live: Option<OpRequest>,
-}
-
 /// The per-instance outstanding-operation table (see module docs).
 pub struct OpTable {
-    slots: Vec<OpSlot>,
-    free: Vec<u32>,
+    /// Outstanding ops by index (monotone, never reused — module docs).
+    live: BTreeMap<u32, OpRequest>,
+    next_index: u32,
     generation_seed: u32,
-    outstanding: u64,
     max_outstanding: u64,
 }
 
@@ -66,12 +67,11 @@ impl OpTable {
     #[must_use]
     pub fn new(instantiation_counter: u64, max_outstanding: u64) -> Self {
         Self {
-            slots: Vec::new(),
-            free: Vec::new(),
+            live: BTreeMap::new(),
+            next_index: 1,
             generation_seed: (u32::try_from(instantiation_counter).unwrap_or(u32::MAX)
                 & HANDLE_MAX_GENERATION)
                 .wrapping_add(1),
-            outstanding: 0,
             max_outstanding,
         }
     }
@@ -79,7 +79,7 @@ impl OpTable {
     /// Outstanding (issued, not yet completed/cancelled) operations.
     #[must_use]
     pub fn outstanding(&self) -> u64 {
-        self.outstanding
+        self.live.len() as u64
     }
 
     /// Issue a fresh `OpId` for `request`.
@@ -89,75 +89,39 @@ impl OpTable {
     /// [`TrapCode::GrantViolation`] when the `max_outstanding` grant bound is exhausted (a typed,
     /// attributable refusal of the CALL — the outstanding set is unchanged).
     pub fn begin(&mut self, request: OpRequest) -> Result<u64, TrapCode> {
-        if self.max_outstanding != 0 && self.outstanding + 1 > self.max_outstanding {
+        if self.max_outstanding != 0 && self.outstanding() + 1 > self.max_outstanding {
             return Err(TrapCode::GrantViolation);
         }
-        self.outstanding += 1;
-        if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index as usize];
-            slot.live = Some(request);
-            Ok(pack_handle(HANDLE_KIND_OP_ID, slot.generation, index + 1))
-        } else {
-            let index = self.slots.len() as u32;
-            self.slots.push(OpSlot {
-                generation: self.generation_seed,
-                live: Some(request),
-            });
-            Ok(pack_handle(
-                HANDLE_KIND_OP_ID,
-                self.generation_seed,
-                index + 1,
-            ))
-        }
+        let index = self.next_index;
+        self.next_index += 1;
+        self.live.insert(index, request);
+        Ok(pack_handle(HANDLE_KIND_OP_ID, self.generation_seed, index))
     }
 
-    fn slot_of(&self, op: u64) -> Option<usize> {
-        if handle_kind(op) != HANDLE_KIND_OP_ID {
+    fn index_of(&self, op: u64) -> Option<u32> {
+        if handle_kind(op) != HANDLE_KIND_OP_ID || handle_generation(op) != self.generation_seed {
             return None;
         }
-        let idx1 = handle_index(op);
-        if idx1 == 0 {
-            return None;
-        }
-        let index = (idx1 - 1) as usize;
-        let slot = self.slots.get(index)?;
-        (slot.live.is_some() && slot.generation == handle_generation(op)).then_some(index)
+        let index = handle_index(op);
+        self.live.contains_key(&index).then_some(index)
     }
 
     /// Whether `op` is still outstanding.
     #[must_use]
     pub fn is_outstanding(&self, op: u64) -> bool {
-        self.slot_of(op).is_some()
+        self.index_of(op).is_some()
     }
 
     /// Retire `op` (completion enqueued, or cancel accepted), returning its request. `None` when
     /// the op is not outstanding — the raced-cancel case a late `complete_op` must tolerate.
     pub fn finish(&mut self, op: u64) -> Option<OpRequest> {
-        let index = self.slot_of(op)?;
-        let slot = &mut self.slots[index];
-        let request = slot.live.take();
-        self.outstanding -= 1;
-        if slot.generation >= HANDLE_MAX_GENERATION {
-            // Permanent retirement at the generation ceiling (no ABA, ABI §7.1).
-        } else {
-            slot.generation += 1;
-            self.free.push(index as u32);
-        }
-        request
+        let index = self.index_of(op)?;
+        self.live.remove(&index)
     }
 
     /// Force-reclaim every outstanding op (trap/teardown, ABI §7.3).
     pub fn clear(&mut self) {
-        self.free.clear();
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.live.take().is_some() && slot.generation < HANDLE_MAX_GENERATION {
-                slot.generation += 1;
-            }
-            if slot.generation < HANDLE_MAX_GENERATION {
-                self.free.push(index as u32);
-            }
-        }
-        self.outstanding = 0;
+        self.live.clear();
     }
 }
 
@@ -203,12 +167,16 @@ mod tests {
     }
 
     #[test]
-    fn generations_advance_on_reuse_and_stale_ops_are_not_outstanding() {
+    fn op_indices_are_monotone_and_never_reused() {
+        // The replay-determinism property (module docs): OpId values are a pure function of the
+        // guest's begin() order, independent of WHEN the embedder retired earlier ops.
         let mut t = OpTable::new(2, 0);
         let op = t.begin(OpRequest::PayloadGet { hash: [1u8; 32] }).unwrap();
         assert_eq!(handle_generation(op), 3, "seeded from counter 2");
+        assert_eq!(handle_index(op), 1);
         t.finish(op);
         let op2 = t.begin(OpRequest::PayloadGet { hash: [2u8; 32] }).unwrap();
+        assert_eq!(handle_index(op2), 2, "retired index 1 is never reminted");
         assert_ne!(op, op2);
         assert!(!t.is_outstanding(op), "retired handle is stale");
         assert!(t.is_outstanding(op2));
