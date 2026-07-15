@@ -36,6 +36,10 @@
 // Test harness: builds the worker binary + guests via cargo (the sanctioned dev-tool exception,
 // mirroring `live_transport.rs`), reads operator-local files, and prints progress.
 #![allow(clippy::disallowed_methods)]
+// Live WS worker-subprocess drill: rides the WS control plane (`daemon-vhc-net/ws`, pulled by the
+// e2e crate's `iroh` feature). Guarded like its siblings `live_transport.rs` / `staging_160m.rs`
+// so the default (no-iroh) tier-1 gate compiles this crate.
+#![cfg(feature = "iroh")]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
