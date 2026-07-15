@@ -130,6 +130,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
         &lane(),
         &device(),
         &owner_uncapped(),
+        None,
     )
     .expect("honest claim admits");
     assert_eq!(admission.claim.hard_accountable.host, 1 << 16);
@@ -147,6 +148,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
         &lane(),
         &device(),
         &owner_uncapped(),
+        None,
     )
     .expect("second assessment");
     assert_eq!(admission.claim_bytes, again.claim_bytes);
@@ -188,6 +190,7 @@ fn over_claim_rejected_against_owner_policy() {
         &lane(),
         &device(),
         &owner,
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 5);
@@ -211,6 +214,7 @@ fn claim_outside_lane_bounds_refused() {
         &lane(),
         &device(),
         &owner_uncapped(),
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 4);
@@ -232,6 +236,7 @@ fn inconsistent_claim_refused() {
         &lane(),
         &device(),
         &owner_uncapped(),
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 4);
@@ -252,6 +257,7 @@ fn manifest_channel_beyond_table_refused_grants_exceed_lane() {
         &lane(),
         &device(),
         &owner_uncapped(),
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 4);
@@ -275,6 +281,7 @@ fn under_claim_traps_attributably_at_the_hard_cap() {
         &lane(),
         &device(),
         &owner_uncapped(),
+        None,
     )
     .expect("the under-claimer's CLAIM is well-formed and within bounds — it admits");
     assert_eq!(admission.claim.hard_accountable.host, 512);
@@ -301,4 +308,84 @@ fn under_claim_traps_attributably_at_the_hard_cap() {
     assert!(entries
         .iter()
         .any(|e| matches!(e, daemon_vhc_host::v2::SinkEntry::Terminal { kind: 1, .. })));
+}
+
+// -- D3 cell 5, admission side: the additive `device_min` pre-screen (funnel stage 3) ------------
+//
+// The three-proviso envelope fixture (`daemon-vhc-proto/tests/cell5_envelope.rs`) is green, so
+// cell 5 shipped interim-supported and stage 3 consumes the section — parsed from the RAW frozen
+// bytes, threaded here exactly as the worker's `resolve_run → assess` path does. An envelope may
+// only TIGHTEN the lane floor (§9.5).
+
+/// Below the envelope's minimums: refused at stage 3, BEFORE any module work (fetch/compile).
+#[test]
+fn cell5_device_below_envelope_minimums_refuses_at_stage_3() {
+    let min = daemon_vhc_proto::DeviceMinimums {
+        ram_bytes: Some(64 << 30), // device() has 16 GiB
+        ..daemon_vhc_proto::DeviceMinimums::default()
+    };
+    // Garbage wasm proves stage order: stage 3 must refuse before stage 4 ever sees the bytes.
+    let err = admit_v2(
+        &worker(),
+        b"not wasm",
+        None,
+        &[],
+        &[],
+        &lane(),
+        &device(),
+        &owner_uncapped(),
+        Some(&min),
+    )
+    .unwrap_err();
+    assert_eq!(err.stage, 3);
+    assert!(err.reason.contains("envelope"), "{}", err.reason);
+}
+
+/// A GPU-required envelope on a GPU-less device: stage-3 refusal with the named cause.
+#[test]
+fn cell5_gpu_required_by_envelope_refuses_on_gpu_less_device() {
+    let min = daemon_vhc_proto::DeviceMinimums {
+        gpu: Some(2),
+        ..daemon_vhc_proto::DeviceMinimums::default()
+    };
+    let err = admit_v2(
+        &worker(),
+        b"not wasm",
+        None,
+        &[],
+        &[],
+        &lane(),
+        &device(),
+        &owner_uncapped(),
+        Some(&min),
+    )
+    .unwrap_err();
+    assert_eq!(err.stage, 3);
+    assert!(err.reason.contains("GPU"), "{}", err.reason);
+}
+
+/// Minimums met: the funnel proceeds through assessment and admits the real v2 module —
+/// the positive half of the cell-5 admission gate.
+#[test]
+fn cell5_device_meeting_envelope_minimums_admits_the_v2_module() {
+    let wasm = test_claim_wasm();
+    let min = daemon_vhc_proto::DeviceMinimums {
+        gpu: Some(1),
+        ram_bytes: Some(8 << 30),
+        disk_bytes: Some(1 << 30),
+        ..daemon_vhc_proto::DeviceMinimums::default()
+    };
+    let admission = admit_v2(
+        &worker(),
+        &wasm,
+        Some(blake3::hash(&wasm).as_bytes()),
+        &[0u8, 0u8],
+        &[],
+        &lane(),
+        &device(),
+        &owner_uncapped(),
+        Some(&min),
+    )
+    .expect("minima met: the pre-screen passes and assessment admits");
+    assert!(admission.claim.host_total() > 0);
 }

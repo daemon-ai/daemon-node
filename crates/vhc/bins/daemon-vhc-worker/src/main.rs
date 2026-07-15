@@ -141,6 +141,7 @@ async fn main() {
                     &resolved.module,
                     &resolved.config,
                     resolved.module_blake3.as_ref(),
+                    resolved.device_min.as_ref(),
                 ) {
                     Ok((elig, is_v2)) => {
                         run_is_v2 = is_v2;

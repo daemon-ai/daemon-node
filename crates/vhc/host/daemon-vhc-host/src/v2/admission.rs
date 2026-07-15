@@ -226,6 +226,7 @@ pub fn admit_v2(
     lane: &ParticipationLane,
     device: &DeviceProfile,
     owner: &OwnerPolicy,
+    envelope_min: Option<&daemon_vhc_proto::DeviceMinimums>,
 ) -> Result<AdmissionV2, FunnelRefusal> {
     // -- stage 1: owner participation policy — free, local, before ANY other work ----------------
     if !owner.participation_enabled {
@@ -262,10 +263,34 @@ pub fn admit_v2(
     }
 
     // -- stage 3: run pre-screen — `max(lane floor, envelope minimums)` ---------------------------
-    // Branch B (recorded determination — module docs above): pre-D0 the envelope's additive
-    // `device_min` section is NOT relied upon (the D3 cell-5 fixture has not run), so the
-    // effective floor is `max(lane floor, ∅)` — already enforced by stage 2. This stage becomes
-    // real at D0, when the genesis schema carries mandatory per-role minimums.
+    // Branch shipped (D3 cell 5, recorded per the ratified conditional): the three-proviso
+    // envelope fixture is GREEN (`daemon-vhc-proto/tests/cell5_envelope.rs` — old-reader open,
+    // bytes/hash end-to-end, decode→re-freeze strip canary), so cell 5 is **interim-supported**
+    // and the additive `device_min` section is consumed here. The section is parsed from the RAW
+    // frozen bytes at the CBOR-value level (`FrozenEnvelope::device_min`), never via the typed
+    // `Envelope` (which silently drops unknown keys — the proviso-3 trap). An envelope may only
+    // TIGHTEN the lane floor (§9.5): each present field refuses below its minimum; absent fields
+    // constrain nothing. Mandatory per-role minimums arrive with the D0 genesis schema.
+    if let Some(min) = envelope_min {
+        if min.gpu == Some(2) && !device.gpu {
+            return Err(FunnelRefusal::local(
+                3,
+                "run pre-screen: envelope requires a GPU (device_min.gpu = 2)",
+            ));
+        }
+        let below = |have: u64, want: Option<u64>| want.is_some_and(|w| have < w);
+        if below(
+            if device.gpu { device.vram_bytes } else { 0 },
+            min.vram_bytes,
+        ) || below(device.ram_bytes, min.ram_bytes)
+            || below(device.disk_bytes, min.disk_bytes)
+        {
+            return Err(FunnelRefusal::local(
+                3,
+                "run pre-screen: device < max(lane floor, envelope minimums)",
+            ));
+        }
+    }
 
     // -- stage 4: module fetch + assessment — selection, manifest, claim (§9.4 steps 1–7) ---------
     let selection = select_driver(worker, wasm, expected_blake3)
@@ -684,6 +709,7 @@ mod tests {
             &lane(),
             &DeviceProfile::default(),
             &owner,
+            None,
         )
         .unwrap_err();
         assert_eq!(err.stage, 1);
@@ -709,6 +735,7 @@ mod tests {
             &l,
             &DeviceProfile::default(),
             &owner,
+            None,
         )
         .unwrap_err();
         assert_eq!(err.stage, 2);

@@ -29,6 +29,9 @@ pub(crate) struct ResolvedRun {
     pub(crate) config: Vec<u8>,
     pub(crate) module: Vec<u8>,
     pub(crate) module_blake3: Option<[u8; 32]>,
+    /// The envelope's additive `device_min` section (ABI §9.3 stage-3 pre-screen; D3 cell 5
+    /// interim-supported), parsed from the RAW frozen bytes — `None` on the legacy raw-config path.
+    pub(crate) device_min: Option<daemon_vhc_proto::DeviceMinimums>,
 }
 
 /// Resolve the `AssessRun` envelope bytes into `(config, module)` (the §6.1/§6.5 seam).
@@ -44,11 +47,13 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
             // A signed-envelope wrapper: verify it (re-derives hash + config, checks the signature).
             let frozen = wire.open().map_err(|e| format!("verify envelope: {e}"))?;
             let config = frozen.config_bytes().to_vec();
+            let device_min = frozen.device_min();
             let (module, module_blake3) = resolve_module(&frozen).await?;
             Ok(ResolvedRun {
                 config,
                 module,
                 module_blake3,
+                device_min,
             })
         }
         // Not a signed-envelope wrapper: the legacy raw `[experiment.config]` CBOR path.
@@ -61,6 +66,7 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
                 config: envelope_bytes.to_vec(),
                 module,
                 module_blake3: None,
+                device_min: None,
             })
         }
     }
@@ -662,6 +668,7 @@ pub(crate) fn assess(
     module: &[u8],
     config: &[u8],
     module_blake3: Option<&[u8; 32]>,
+    device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
 ) -> Result<(Eligibility, bool), String> {
     // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (the meta pass over a real-scale
     // param layout exceeds the tiny-model defaults). The meta pass itself stays on the CPU-cheap
@@ -685,7 +692,10 @@ pub(crate) fn assess(
             // The major-2 path: the claim()-based admission funnel (ABI §9.3, A2). Selection
             // re-runs inside admit_v2 (§9.4 step 1–3 order is normative); the arms below map the
             // funnel outcome onto the typed `Assessed` surface.
-            return Ok((assess_v2(&worker, module, config, module_blake3), true));
+            return Ok((
+                assess_v2(&worker, module, config, module_blake3, device_min),
+                true,
+            ));
         }
         Err(refusal) => {
             return Ok((
@@ -793,6 +803,7 @@ fn assess_v2(
     module: &[u8],
     config: &[u8],
     module_blake3: Option<&[u8; 32]>,
+    device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
 ) -> Eligibility {
     let lane = daemon_vhc_host::v2::ParticipationLane::trainer_launch_defaults();
     let hw = hardware();
@@ -819,6 +830,7 @@ fn assess_v2(
         &lane,
         &device,
         &owner,
+        device_min,
     ) {
         Ok(admission) => Eligibility {
             eligible: true,
