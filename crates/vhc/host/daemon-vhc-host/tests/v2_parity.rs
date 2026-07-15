@@ -185,6 +185,10 @@ fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
 
 /// Drive the v2 guest through the identical schedule, feeding the v1 oracle's update bytes at the
 /// barrier; return the final canonical state digest.
+///
+/// Only the GPU/burn tier tests below call this; the default (no-feature) tier drives `v2_run_n`
+/// directly, so gate it to keep a plain `--all-targets` clippy pass dead-code-clean.
+#[cfg(any(feature = "burn-ndarray", feature = "wgpu", feature = "cuda"))]
 fn v2_run(engine: EngineConfig, v1_updates: &[Vec<u8>]) -> StateDigest {
     v2_run_n(engine, v1_updates, ROUNDS).0
 }
