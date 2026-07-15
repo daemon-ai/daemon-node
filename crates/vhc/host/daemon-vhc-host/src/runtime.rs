@@ -1295,6 +1295,33 @@ impl HostState {
         }
     }
 
+    /// Seal bridge container `idx` to the canonical `SectionWire` CBOR — the SAME encode as
+    /// `Instance::update_bytes` (the v1 host-sealing path), exposed on the state so the v2
+    /// driver can seal a committed container at publish time (Phase-A plumbing-owned payloads;
+    /// the guest-visible sealing path is Phase B's `payload_put`).
+    pub(crate) fn seal_container_of(&self, idx: usize) -> Option<Vec<u8>> {
+        let c = self.containers.get(idx)?;
+        let wire: Vec<SectionWire> = c
+            .sections
+            .iter()
+            .map(|s| match s {
+                Section::Bytes(b) => SectionWire::Bytes(b.clone()),
+                Section::Tensor { data, shape } => SectionWire::Tensor {
+                    data: data.clone(),
+                    shape: shape.clone(),
+                },
+            })
+            .collect();
+        let mut buf = Vec::new();
+        ciborium::into_writer(&wire, &mut buf).ok()?;
+        Some(buf)
+    }
+
+    /// The number of built update containers (the v2 driver's sealing watermark).
+    pub(crate) fn container_count(&self) -> usize {
+        self.containers.len()
+    }
+
     /// The §5.9 barrier snapshot — the host-side epilogue `Instance::ingest` runs after
     /// `da_ingest_updates` returns: the post-ingest master becomes the next round's base. The v2
     /// driver applies it at the close of any slice that consumed a staged update (`read_back`

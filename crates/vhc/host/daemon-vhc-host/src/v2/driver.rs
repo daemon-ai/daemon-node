@@ -215,6 +215,10 @@ struct PumpState {
     /// The final bridge canonical state, exported by the guest thread before it drops the
     /// store (the parity-oracle hook: the digest input, §3.6 tier-3 comparisons).
     bridge_final_state: Option<Vec<u8>>,
+    /// Sealed-container watermark + the newest sealed update wire (Phase-A plumbing-owned
+    /// sealing at the commit seam; see the publish import).
+    sealed_containers: usize,
+    latest_sealed_update: Option<(usize, Vec<u8>)>,
     /// A `Stop` has been enqueued — no further deliveries will be accepted after it.
     stop_enqueued: bool,
     /// A `Quiesce` drain is open: Frame/PayloadReady/Timer deliveries are frozen (§4.4).
@@ -483,6 +487,19 @@ impl PumpHandle {
         drop(st);
         self.shared.wake.notify_all();
         Ok(())
+    }
+
+    /// Take the newest plumbing-sealed update container: `(container index, canonical wire)`.
+    /// Set at the commit seam (a publish that followed a `da_make_update` in the same run);
+    /// `take` semantics so the session stages each sealed container exactly once (§5.11).
+    #[must_use]
+    pub fn take_sealed_update(&self) -> Option<(usize, Vec<u8>)> {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .latest_sealed_update
+            .take()
     }
 
     /// The bridge's final canonical state bytes (the digest input), exported by the guest thread
@@ -1149,6 +1166,22 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                     .publish(u64::from(channel_id), seq, &payload, &frame)
                     .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
                 st.published.push((u64::from(channel_id), seq, frame));
+                // Phase-A plumbing-owned sealing: if this run's bridge built a new update
+                // container since the last publish, seal the newest to its canonical wire at
+                // the commit point — v1's host sealing relocated to the v2 commit seam, so the
+                // session can stage the committed set at the barrier. The guest-visible sealing
+                // path (Phase B `payload_put`) retires this.
+                {
+                    let d = c.data();
+                    if let Some(tabi) = d.tabi.as_ref() {
+                        let n = tabi.container_count();
+                        if n > st.sealed_containers {
+                            st.latest_sealed_update =
+                                tabi.seal_container_of(n - 1).map(|b| (n - 1, b));
+                            st.sealed_containers = n;
+                        }
+                    }
+                }
                 Ok(seq)
             })(&mut c);
             stash(&mut c, r)
@@ -1399,6 +1432,8 @@ pub fn start_run(
             logs: Vec::new(),
             published: Vec::new(),
             bridge_final_state: None,
+            sealed_containers: 0,
+            latest_sealed_update: None,
             stop_enqueued: false,
             draining: false,
         }),
@@ -1697,6 +1732,8 @@ mod tests {
             logs: Vec::new(),
             published: Vec::new(),
             bridge_final_state: None,
+            sealed_containers: 0,
+            latest_sealed_update: None,
             stop_enqueued: false,
             draining: false,
         }
