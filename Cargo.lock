@@ -5020,6 +5020,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-sdk-v2"
+version = "0.0.1"
+dependencies = [
+ "ciborium",
+]
+
+[[package]]
 name = "daemon-vhc-session"
 version = "0.0.1"
 dependencies = [
