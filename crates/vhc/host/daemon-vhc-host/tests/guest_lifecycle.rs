@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 
-use daemon_train::{EngineConfig, TrapCode, Worker};
+use daemon_vhc_host::{EngineConfig, TrapCode, Worker};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 use serde::Serialize;
 
@@ -257,7 +257,7 @@ fn meta_report_layout_and_schema() {
     }
     // The ingest cost fit is a non-negative per-peer slope, and the report round-trips as CBOR.
     let bytes = report.to_cbor();
-    let back: daemon_train::MetaReport = ciborium::from_reader(bytes.as_slice()).unwrap();
+    let back: daemon_vhc_host::MetaReport = ciborium::from_reader(bytes.as_slice()).unwrap();
     assert_eq!(back.params.len(), report.params.len());
     assert_eq!(back.ops_used, report.ops_used);
 }

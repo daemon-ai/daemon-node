@@ -6,7 +6,7 @@
 // loss overfits *down*) + make_update, all finite. Plus the worker-shape autotune assess reporting
 // ELIGIBLE with the real unified-memory probe (the UMA fix). This is `#[ignore]`d: a real ~152M
 // execute pass on the GPU is minutes/GBs (program Risk 3), so it is opt-in and run in the wgpu lane
-// (`nix develop .#vulkan --command cargo test -p daemon-train --features wgpu --test preset_160m_wgpu -- --ignored --nocapture`).
+// (`nix develop .#vulkan --command cargo test -p daemon-vhc-host --features wgpu --test preset_160m_wgpu -- --ignored --nocapture`).
 #![cfg(feature = "wgpu")]
 #![allow(clippy::disallowed_methods)]
 
@@ -15,11 +15,11 @@ use std::process::Command;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use daemon_swarm_run::backend::{BatchRef, StepCtx, TrainerBackend};
-use daemon_train::{
+use daemon_vhc_host::{
     wgpu_adapter_available, BackendKind, EngineConfig, WasmBackend, WasmBackendConfig,
 };
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::backend::{BatchRef, StepCtx, TrainerBackend};
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -9,7 +9,7 @@
 //! - **micro-batch from the autotune verdict** — the node's `Eligibility.headroom["micro_batch"]`
 //!   (G2's `Autotune`) is threaded in and consumed in-process (reported as a `Metric`), and seeds the
 //!   OOM-probe ladder start.
-//! - **live OOM trial** — the round runs inside a `daemon_train::autotune::probe_microbatch`-style
+//! - **live OOM trial** — the round runs inside a `daemon_vhc_host::autotune::probe_microbatch`-style
 //!   halving ladder (§10.5): on a `BudgetMemory` trap the worker churns the instance (releasing its
 //!   memory) and retries at half the micro-batch until it fits or hits the floor. The `wasmtime`
 //!   memory trap → `TrapCode::BudgetMemory` mapping (`runtime.rs`) makes this a **real** catch, not a
@@ -21,19 +21,19 @@
 //!
 //! The full **live multi-round attach** — construct a `RoundEngine` over `IrohGossip` + `R2Store`
 //! inside the worker subprocess and run the coordinator loop — is proven end to end by
-//! `daemon-swarm-run::live_harness` (which builds exactly that `RoundEngine`-over-live-transport
+//! `daemon-vhc-session::live_harness` (which builds exactly that `RoundEngine`-over-live-transport
 //! wiring) and the `daemon-swarm-e2e` live gate; wiring it into the worker *subprocess* (adding the
-//! iroh/QUIC tree to the `daemon-train` binary + the join credentials plumbing) is the recorded B3
+//! iroh/QUIC tree to the `daemon-vhc-host` binary + the join credentials plumbing) is the recorded B3
 //! remainder (see the ledger "Deviations").
 
 use daemon_provision::CutWriter;
-use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
-use daemon_swarm_run::protocol::Event;
-use daemon_train::autotune::oom_error_class;
-use daemon_train::{
+use daemon_vhc_host::autotune::oom_error_class;
+use daemon_vhc_host::{
     EngineConfig, TrainError, TrapCode, WasmBackend, WasmBackendConfig, WasmBackendError,
 };
 use daemon_vhc_proto::{blake3_hash, PeerId};
+use daemon_vhc_session::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
+use daemon_vhc_session::protocol::Event;
 
 use crate::{send, SEQ, SEQS};
 
@@ -67,9 +67,9 @@ pub(crate) async fn join_and_run_round(
     // Consume the node's autotune verdict in-process (G2's Eligibility.headroom["micro_batch"]): it
     // seeds the OOM-probe ladder start + the driven shape (clamped below). Logged (not a new protocol
     // event — the frozen worker `Event` stream, §10.2, is pinned by `worker_protocol`).
-    eprintln!("daemon-train-worker: autotune micro_batch={assessed_micro_batch} (§10.5 verdict)");
+    eprintln!("daemon-vhc-worker: autotune micro_batch={assessed_micro_batch} (§10.5 verdict)");
 
-    // §10.5 live OOM ladder (mirrors `daemon_train::autotune::probe_microbatch`): run the round at
+    // §10.5 live OOM ladder (mirrors `daemon_vhc_host::autotune::probe_microbatch`): run the round at
     // `mb`; on a real `BudgetMemory` trap, churn the instance (fresh instance releases memory) and
     // retry at half until it fits or hits the floor 1. The driven shape is budget-sized (SEQS) so the
     // ladder never fires for tiny-llama, but the recovery seam G2 left mechanical is now wired.
@@ -81,7 +81,7 @@ pub(crate) async fn join_and_run_round(
             Err(e) if is_oom(&e) && mb > 1 => {
                 let next = mb / 2;
                 eprintln!(
-                    "daemon-train-worker: {:?} at micro_batch={mb}; halving to {next} and re-probing (§10.5)",
+                    "daemon-vhc-worker: {:?} at micro_batch={mb}; halving to {next} and re-probing (§10.5)",
                     oom_error_class()
                 );
                 halvings += 1;
@@ -94,9 +94,7 @@ pub(crate) async fn join_and_run_round(
         }
     };
     if halvings > 0 {
-        eprintln!(
-            "daemon-train-worker: recovered after {halvings} OOM halving(s); micro_batch={mb}"
-        );
+        eprintln!("daemon-vhc-worker: recovered after {halvings} OOM halving(s); micro_batch={mb}");
     }
 
     send(

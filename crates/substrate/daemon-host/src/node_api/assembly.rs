@@ -113,7 +113,7 @@ impl NodeApiImpl {
         self
     }
 
-    /// Bind the swarm-training service **post-`Arc`** (B3): the `daemon-swarm-node` `SwarmService`
+    /// Bind the swarm-training service **post-`Arc`** (B3): the `daemon-vhc-node` `SwarmService`
     /// owns a `TrainSupervisor` that is constructed after the node exists (mirroring
     /// [`set_gateway`](Self::set_gateway) / [`register_managed`](Self::register_managed)). Idempotent
     /// (write-once); a second bind is ignored. Call ONLY when `[swarm] enabled = true`.

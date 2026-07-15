@@ -8,7 +8,7 @@
 // `#[ignore]`d (a real ~152M fp32 execute pass on the GPU is minutes/GBs — Risk 3) and use the CUDA
 // GPU-skip convention, so the default gate stays green GPU-less and the full gate runs on the RunPod
 // 4090 in `.#cuda-train`:
-//   nix develop .#cuda-train --command cargo test -p daemon-train --features cuda \
+//   nix develop .#cuda-train --command cargo test -p daemon-vhc-host --features cuda \
 //     --test reference_parity_cuda -- --ignored --nocapture --test-threads=1
 // (with DAEMON_CUDA_RUNTIME_DIR=/root/cuda-rt-124 so NVRTC 12.4 is on LD_LIBRARY_PATH — see the C3
 // ledger; without a device / runtime dir the tests skip loudly.)
@@ -18,7 +18,7 @@
 mod reference;
 mod tolerance;
 
-use daemon_train::{cuda_adapter_available, BackendKind, Worker};
+use daemon_vhc_host::{cuda_adapter_available, BackendKind, Worker};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 use reference::{

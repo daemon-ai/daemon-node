@@ -830,7 +830,7 @@
         );
 
         # ------------------------------------------------------------------------------------
-        # Windows device-probe lane (x86_64-pc-windows-gnu). The `daemon-train-probe` binary cross-
+        # Windows device-probe lane (x86_64-pc-windows-gnu). The `daemon-vhc-probe` binary cross-
         # built via the same MinGW toolchain as `daemon-windows`, so the DXGI/D3D12 VRAM/UMA probe
         # (swarm-windows-vram-design.md; target-gated `windows` crate) can be deployed to and
         # validated on the real RTX-5090 box (never build on-box). DEFAULT features only (`cpu`) —
@@ -838,7 +838,7 @@
         # neither the DX12/Vulkan burn tree nor a live adapter, and the probe FFI is
         # `#[cfg(windows)]`-gated (not feature-gated), so it is compiled in regardless.
         #
-        # NB (recorded for Merge 2): the FULL `daemon-train-worker` bin cross-COMPILES cleanly under
+        # NB (recorded for Merge 2): the FULL `daemon-vhc-worker` bin cross-COMPILES cleanly under
         # MinGW (`cargo check` green — wasmtime/burn/`windows` 0.62 all cross), but does NOT LINK: its
         # always-on `sentry-rust-minidump` → `crash-handler` native-minidump path references the UCRT
         # symbol `_invoke_watson`, which the mingw-w64 msvcrt import lib does not export. That is a
@@ -848,23 +848,23 @@
         daemonTrainProbeWindowsDeps = craneLibWindows.buildDepsOnly (
           windowsCommonArgs
           // {
-            pname = "daemon-train-probe-windows-deps";
-            cargoExtraArgs = "-p daemon-train --bin daemon-train-probe";
+            pname = "daemon-vhc-probe-windows-deps";
+            cargoExtraArgs = "-p daemon-vhc-host --bin daemon-vhc-probe";
           }
         );
-        daemon-train-probe-windows = craneLibWindows.buildPackage (
+        daemon-vhc-probe-windows = craneLibWindows.buildPackage (
           windowsCommonArgs
           // {
-            pname = "daemon-train-probe-windows";
+            pname = "daemon-vhc-probe-windows";
             version = baseVersion;
             cargoArtifacts = daemonTrainProbeWindowsDeps;
-            cargoExtraArgs = "-p daemon-train --bin daemon-train-probe";
+            cargoExtraArgs = "-p daemon-vhc-host --bin daemon-vhc-probe";
             DAEMON_BUILD_ID = buildId;
           }
         );
 
         # ------------------------------------------------------------------------------------
-        # Windows training-worker lane (x86_64-pc-windows-gnu). The FULL `daemon-train-worker`
+        # Windows training-worker lane (x86_64-pc-windows-gnu). The FULL `daemon-vhc-worker`
         # cross-built via the same MinGW toolchain as `daemon-windows`, WITH the `swarm-net` feature
         # (WS control plane + iroh gossip) so it live-attaches to the dev coordinator as a real
         # heterogeneity peer at the P2 WAN gate. Deployed to the RTX-5090 box (never build on-box).
@@ -890,17 +890,17 @@
         daemonTrainWorkerWindowsDeps = craneLibWindows.buildDepsOnly (
           windowsCommonArgs
           // {
-            pname = "daemon-train-worker-windows-deps";
-            cargoExtraArgs = "-p daemon-train --bin daemon-train-worker --features swarm-net,wgpu";
+            pname = "daemon-vhc-worker-windows-deps";
+            cargoExtraArgs = "-p daemon-vhc-host --bin daemon-vhc-worker --features swarm-net,wgpu";
           }
         );
-        daemon-train-worker-windows = craneLibWindows.buildPackage (
+        daemon-vhc-worker-windows = craneLibWindows.buildPackage (
           windowsCommonArgs
           // {
-            pname = "daemon-train-worker-windows";
+            pname = "daemon-vhc-worker-windows";
             version = baseVersion;
             cargoArtifacts = daemonTrainWorkerWindowsDeps;
-            cargoExtraArgs = "-p daemon-train --bin daemon-train-worker --features swarm-net,wgpu";
+            cargoExtraArgs = "-p daemon-vhc-host --bin daemon-vhc-worker --features swarm-net,wgpu";
             DAEMON_BUILD_ID = buildId;
           }
         );
@@ -948,8 +948,8 @@
             daemon-cli-windows
             daemon-infer-llama-windows
             daemon-infer-mistralrs-windows
-            daemon-train-probe-windows
-            daemon-train-worker-windows
+            daemon-vhc-probe-windows
+            daemon-vhc-worker-windows
             ;
           # Prebuilt llama.cpp (shared, CPU + Vulkan) matching the crate's vendored commit; consumed
           # by the dev shells via `LLAMA_PREBUILT_DIR` to compile the llama lane without cmake.
@@ -1068,7 +1068,7 @@
               # (`meta.platforms = linux`) — pulling it unconditionally made `nix develop` REFUSE TO
               # EVALUATE on aarch64-darwin ("Refusing to evaluate package 'bubblewrap-…' … not
               # available on the requested hostPlatform"), blocking the M4 Mac fleet peer from
-              # building daemon-train at all (fleet-report-p2 §3). Gate it to Linux: bwrap has no
+              # building daemon-vhc-host at all (fleet-report-p2 §3). Gate it to Linux: bwrap has no
               # macOS analogue and the sandbox tests already guard on its usability, so a mac dev
               # shell simply omits it. Minimal honest fix (swarm-ledger-p2-c2 flake edit #1).
               ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.bubblewrap ]
@@ -1078,7 +1078,7 @@
               # from the pinned nixpkgs when it provides the package (flake-native), and skipped
               # gracefully otherwise so the devShell still evaluates — the documented fallback is
               # `cargo install --locked iroh-relay@1` into `.dev/` (see swarm-p1-ledger.md). NOTE the
-              # relay is a runtime tool only; the iroh Rust deps are gated behind `daemon-swarm-net`'s
+              # relay is a runtime tool only; the iroh Rust deps are gated behind `daemon-vhc-net`'s
               # `iroh` feature and never enter the default build.
               ++ lib.optionals (pkgs ? iroh-relay) [ pkgs.iroh-relay ];
           }
@@ -1207,9 +1207,9 @@
             # build work here (it just recompiles llama.cpp via the crate's cmake path).
             #
             # This is ALSO the swarm burn-wgpu GPU training test lane (spec §10.1; G2, Wave 2): the
-            # Vulkan loader above resolves the RADV ICD for `cargo test -p daemon-train --features
+            # Vulkan loader above resolves the RADV ICD for `cargo test -p daemon-vhc-host --features
             # wgpu` (burn-wgpu -> cubecl -> wgpu 29 over Vulkan). It uses `craneLibDev` (not
-            # `craneLib`) so the wasm32-unknown-unknown rust-std is on the toolchain — the daemon-train
+            # `craneLib`) so the wasm32-unknown-unknown rust-std is on the toolchain — the daemon-vhc-host
             # guest-lifecycle tests build the wasm guests, which the host-only toolchain cannot do.
             LLAMA_PREBUILT_DIR = "${llamaCpp}";
             LLAMA_PREBUILT_SHARED = "1";
@@ -1241,7 +1241,7 @@
 
           # The swarm burn-cuda TRAINING lane (spec §10.1; the C2/P2 RunPod-4090 lane, Merge-2
           # adjudication (c)). Distinct from the infer `.#cuda` shell above (which builds llama.cpp
-          # CUDA via cudatoolkit): this targets `cargo {build,test} -p daemon-train --features cuda`
+          # CUDA via cudatoolkit): this targets `cargo {build,test} -p daemon-vhc-host --features cuda`
           # (burn-cuda -> cubecl-cuda -> cudarc; driver-API + NVRTC JIT at runtime) and the swarm
           # det/parity suites, so it uses `craneLibDev` for the wasm32 guest toolchain (like
           # `.#vulkan`). C3 flake edit (ADDITIVE lane output; integration-owner-delegated flake rights).

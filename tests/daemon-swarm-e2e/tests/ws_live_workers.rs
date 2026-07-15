@@ -4,7 +4,7 @@
 //! **A3 live worker-subprocess e2e — the Merge-2 rehearsal.**
 //!
 //! Extends the Merge-1 `ws_live_do.rs` + `seed_run.mjs` scaffold into the full node↔cloud↔worker
-//! loop: a wrangler-dev `RunCoordinatorDO` + registry, N REAL `daemon-train-worker` subprocesses
+//! loop: a wrangler-dev `RunCoordinatorDO` + registry, N REAL `daemon-vhc-worker` subprocesses
 //! (built with the `swarm-net` feature) spawned via `TrainSupervisor`, each running a `RoundEngine`
 //! over `DualPlane(WsControlPlane[, IrohGossip])` + the **object-proxy R2 store** (payload PUT/GET
 //! through the live presign endpoint), the tiny-llama guest as the experiment, N≥5 rounds:
@@ -44,17 +44,17 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
-use daemon_swarm_run::protocol::{
-    EngineParams, Event, IrohCredentials, IrohRosterPeer, JoinCredentials, JoinPolicy, LeaveMode,
-    PolicyMode, WsAuthSpec,
-};
-use daemon_train_client::{TrainClientConfig, TrainSupervisor};
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{peer_id, to_canonical_vec, SigningKey};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::protocol::{
+    EngineParams, Event, IrohCredentials, IrohRosterPeer, JoinCredentials, JoinPolicy, LeaveMode,
+    PolicyMode, WsAuthSpec,
+};
+use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
 // ---- knobs ---------------------------------------------------------------------------------------
 
@@ -141,7 +141,7 @@ fn guest_remap_rustflags() -> String {
 static BUILD: Once = Once::new();
 
 /// Build the guest wasm (warn-and-rebuild guard semantics — the freshly built module is used) and
-/// the `daemon-train-worker` binary WITH the `swarm-net` feature (the live attach).
+/// the `daemon-vhc-worker` binary WITH the `swarm-net` feature (the live attach).
 fn ensure_built() -> PathBuf {
     BUILD.call_once(|| {
         if std::env::var("SWARM_TEST_GUEST_DIR").is_err() {
@@ -159,20 +159,20 @@ fn ensure_built() -> PathBuf {
             .args([
                 "build",
                 "-p",
-                "daemon-train",
+                "daemon-vhc-host",
                 "--features",
                 "swarm-net",
                 "--bin",
-                "daemon-train-worker",
+                "daemon-vhc-worker",
             ])
             .status()
             .expect("run cargo for the live worker binary");
-        assert!(status.success(), "building daemon-train-worker failed");
+        assert!(status.success(), "building daemon-vhc-worker failed");
     });
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("target"));
-    let bin = target.join("debug/daemon-train-worker");
+    let bin = target.join("debug/daemon-vhc-worker");
     assert!(bin.exists(), "worker binary at {}", bin.display());
     bin
 }
@@ -456,10 +456,10 @@ async fn live_workers_full_loop_via_wrangler_dev() {
     }
 
     // -- worker 0 joins THROUGH a SwarmService (the event-pump assertion path) --------------------
-    let store = daemon_swarm_node::SwarmStore::open_in_memory().expect("in-memory swarm.db");
-    let svc = Arc::new(daemon_swarm_node::SwarmService::new(
-        daemon_swarm_node::SwarmServiceParts {
-            config: daemon_swarm_run::config::SwarmConfig {
+    let store = daemon_vhc_node::SwarmStore::open_in_memory().expect("in-memory swarm.db");
+    let svc = Arc::new(daemon_vhc_node::SwarmService::new(
+        daemon_vhc_node::SwarmServiceParts {
+            config: daemon_vhc_session::config::SwarmConfig {
                 enabled: true,
                 ..Default::default()
             },

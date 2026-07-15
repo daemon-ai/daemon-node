@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-train-safetensors` — the swarm-checkpoint ↔ safetensors converter (spec §9).
+//! `daemon-vhc-safetensors` — the swarm-checkpoint ↔ safetensors converter (spec §9).
 //!
 //! A small, additive library that maps a canonical **state dict** — the module's parameter list in
 //! registration order (ABI §6.3), which is the checkpoint tensor order and digest coverage — to and
@@ -12,7 +12,7 @@
 //! ## Where it lands (single-writer / frozen-surface hygiene)
 //!
 //! `TrainerBackend::checkpoint_save`/`checkpoint_load` are **frozen** (they carry the blake3-tagged
-//! CBOR `CheckpointWire`, `daemon-train/runtime.rs`). This crate does **not** touch them — it is an
+//! CBOR `CheckpointWire`, `daemon-vhc-host/runtime.rs`). This crate does **not** touch them — it is an
 //! *export/import alongside*. A caller assembles a [`StateDict`] from the live instance
 //! (`Instance::params()` for the ordered `(name, shape)` list + `Instance::param_master(name)` for
 //! each fp32 master) and calls [`StateDict::to_safetensors`]; the reverse rebuilds a `StateDict` a

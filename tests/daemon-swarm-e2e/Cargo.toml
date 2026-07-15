@@ -13,37 +13,37 @@ path = "src/lib.rs"
 # The live-transport exit gate (`tests/live_transport.rs`): the round engine over a REAL per-node
 # `IrohGossip` mesh + a shared `FsPayloadStore` (B3). Off by default so the standard e2e gate stays
 # fast + iroh-free; run with `cargo test -p daemon-swarm-e2e --features iroh`.
-# P3 lane S additively pulls `daemon-swarm-net/ws` under the same live-gate feature: the 160M staging
+# P3 lane S additively pulls `daemon-vhc-net/ws` under the same live-gate feature: the 160M staging
 # rehearsal (`tests/staging_160m.rs`) taps the run's WS control plane as a passive observer to write
 # the `<run>.dsmlog` message-log capture. The default gate stays WS/TLS/iroh-free.
-iroh = ["daemon-swarm-run/iroh", "daemon-swarm-net/ws"]
+iroh = ["daemon-vhc-session/iroh", "daemon-vhc-net/ws"]
 
 [dev-dependencies]
 # The peer-side round engine + the local-coordinator harness + churn/failure drill machinery
-# (feature-gated). Merge 2 swapped the scripted coordinator for the real `daemon-swarm-coordinator`
+# (feature-gated). Merge 2 swapped the scripted coordinator for the real `daemon-vhc-coordinator`
 # tick loop; Wave 3 (R3) adds the drills over the same harness.
-daemon-swarm-run = { workspace = true, features = ["harness"] }
+daemon-vhc-session = { workspace = true, features = ["harness"] }
 daemon-vhc-proto = { workspace = true }
 # The payload store + `PayloadStore` trait: the desync drill fetches checkpoint + payload bytes for
 # the offline resync (checkpoint + record replay).
-daemon-swarm-net = { workspace = true }
+daemon-vhc-net = { workspace = true }
 tokio = { workspace = true }
 # The wasm-backed profile e2e (`tests/wasm_profiles.rs`): the real host training backend
 # (`WasmBackend`), the pure coordinator `tick`, and the observe replay oracle (PROTO-20). All are
 # already in the frozen root `[workspace.dependencies]`; no cycle (the e2e crate is a leaf).
-daemon-train = { workspace = true }
+daemon-vhc-host = { workspace = true }
 daemon-vhc-sdk = { path = "../../crates/vhc/sdk/daemon-vhc-sdk", features = ["sim"] }
-daemon-swarm-coordinator = { workspace = true }
-daemon-swarm-observe = { workspace = true }
+daemon-vhc-coordinator = { workspace = true }
+daemon-vhc-observe = { workspace = true }
 ciborium = { workspace = true }
 blake3 = { workspace = true }
 # The A3 live worker-subprocess e2e (`tests/ws_live_workers.rs`, env-gated on wrangler-dev): the
-# node-side supervisor spawns REAL `daemon-train-worker` subprocesses, the SwarmService proves the
+# node-side supervisor spawns REAL `daemon-vhc-worker` subprocesses, the SwarmService proves the
 # event pump into swarm.db, EgressClient POSTs the create-run request + reads DO state, and
 # serde_json/base64 author the request body. All existing `[workspace.dependencies]` entries — the
 # e2e crate stays a leaf.
-daemon-train-client = { workspace = true }
-daemon-swarm-node = { workspace = true }
+daemon-vhc-supervisor = { workspace = true }
+daemon-vhc-node = { workspace = true }
 daemon-api = { workspace = true }
 daemon-egress = { workspace = true }
 serde_json = { workspace = true }

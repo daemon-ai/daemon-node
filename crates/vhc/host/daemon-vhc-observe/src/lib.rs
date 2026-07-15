@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-swarm-observe` — the observer / replay-oracle for a swarm run.
+//! `daemon-vhc-observe` — the observer / replay-oracle for a swarm run.
 //!
 //! A node-side tool that consumes **only signed messages + published objects** (never privileged
 //! coordinator state) and turns them into audit + recovery primitives (swarm-training-spec.md §14,
@@ -10,12 +10,12 @@
 //! * [`MessageLog`] — an append-only, replayable log of [`SignedMessage`](daemon_vhc_proto::messages::SignedMessage)
 //!   in arrival order, canonical-CBOR framed, indexed by `(round, kind)`. Writer + reader.
 //! * [`replay`] — the replay oracle (PROTO-20 as a library): re-run
-//!   [`daemon_swarm_coordinator::tick`] from genesis over a recorded `Input` trace and verify the
+//!   [`daemon_vhc_coordinator::tick`] from genesis over a recorded `Input` trace and verify the
 //!   recorded [`RoundRecord`](daemon_vhc_proto::messages::RoundRecord)s match the pure function's —
 //!   the "anyone can re-derive the coordinator" property, with the first divergence pinpointed.
 //! * [`digest_tally`] / [`DesyncVerdict`] — fold `Digest` messages per round into a quorum digest +
 //!   outlier set (the observe-driven desync trigger the runtime lane consumes — this crate does not
-//!   wire it into `daemon-swarm-run`).
+//!   wire it into `daemon-vhc-session`).
 //! * [`RunHealth`] / [`RoundHealth`] — per-round facts (committed count, attested coverage,
 //!   stragglers, drops, round span) as plain serializable types — the base for CLI/UX.
 //!

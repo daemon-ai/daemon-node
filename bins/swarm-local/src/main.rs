@@ -6,11 +6,11 @@
 //! It reads an authoring TOML envelope, builds the resolved [`Envelope`], **freezes + verifies** it
 //! (the real §6.1 chain), and stands up an in-process run:
 //!
-//! - `--backend stub` (default): N [`RoundEngine`](daemon_swarm_run::engine::RoundEngine) peers over
-//!   the deterministic `StubBackend` + the [`LocalCoordinator`](daemon_swarm_run::local_coordinator)
+//! - `--backend stub` (default): N [`RoundEngine`](daemon_vhc_session::engine::RoundEngine) peers over
+//!   the deterministic `StubBackend` + the [`LocalCoordinator`](daemon_vhc_session::local_coordinator)
 //!   shell (tick + signing + receipt production over a shared payload store). Prints the agreed
 //!   per-round digest transcript + the offline replay check (PROTO-20).
-//! - `--backend worker`: one supervised `daemon-train-worker` per peer over the frozen worker
+//! - `--backend worker`: one supervised `daemon-vhc-worker` per peer over the frozen worker
 //!   protocol (probe → assess the **real** signed envelope → join). The worker verifies the frozen
 //!   envelope, extracts `[experiment.config]`, resolves its `.wasm` module from the envelope artifact
 //!   map (`file://`, blake3-verified), and drives real host training (`WasmBackend`).
@@ -25,21 +25,21 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
-use daemon_swarm_run::harness::{run_swarm, SwarmConfig};
-use daemon_swarm_run::protocol::{JoinPolicy, LeaveMode, PolicyMode};
-use daemon_train_client::{TrainClientConfig, TrainSupervisor};
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{to_canonical_vec, FrozenEnvelope, Hash, SigningKey};
+use daemon_vhc_session::harness::{run_swarm, SwarmConfig};
+use daemon_vhc_session::protocol::{JoinPolicy, LeaveMode, PolicyMode};
+use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
 /// The peer backend the runner drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Backend {
     /// In-process `RoundEngine` peers over the deterministic `StubBackend`.
     Stub,
-    /// One supervised `daemon-train` worker per peer over the frozen worker protocol.
+    /// One supervised `daemon-vhc-host` worker per peer over the frozen worker protocol.
     Worker,
 }
 
@@ -71,8 +71,8 @@ struct Args {
     /// Experiment profile passthrough (recorded in the run header).
     #[arg(long)]
     profile: Option<String>,
-    /// Worker binary for `--backend worker` (the real `daemon-train-worker`).
-    #[arg(long, default_value = "daemon-train-worker")]
+    /// Worker binary for `--backend worker` (the real `daemon-vhc-worker`).
+    #[arg(long, default_value = "daemon-vhc-worker")]
     worker_bin: PathBuf,
     /// Write the registry `CreateRunRequest` JSON for this envelope to a file and exit (A3 —
     /// the run-authoring half of Merge-1 Decision 1). The request carries the **declared
@@ -363,7 +363,7 @@ async fn run_stub(peers: usize, rounds: u64, steps_per_round: u32, seed: u64) ->
     Ok(())
 }
 
-/// Worker mode: spawn one supervised `daemon-train-worker` per peer over the frozen worker protocol
+/// Worker mode: spawn one supervised `daemon-vhc-worker` per peer over the frozen worker protocol
 /// (probe → assess the **real** signed envelope → join). Each worker verifies the envelope, resolves
 /// its module from the artifact map (or the `DAEMON_TRAIN_MODULE` override), and drives real host
 /// training (`WasmBackend`, self-driven round).

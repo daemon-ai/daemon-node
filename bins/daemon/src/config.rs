@@ -1519,11 +1519,11 @@ pub struct NodeConfig {
     pub fs: daemon_tool_fs::FsConfig,
     /// Swarm-training participation tuning (`[swarm]` / `DAEMON_SWARM__*`, spec §10.6): `enabled`
     /// (off by default), worker path, data-cache budget, default participation policy, module-trust
-    /// posture, coordinator allowlist, iroh relays. Embedded from `daemon-swarm-run` so the config
+    /// posture, coordinator allowlist, iroh relays. Embedded from `daemon-vhc-session` so the config
     /// surface and the node swarm service cannot drift. Serde-only (no figment on the participant
     /// build); the node layers it via the standard figment path below.
     #[serde(default)]
-    pub swarm: daemon_swarm_run::config::SwarmConfig,
+    pub swarm: daemon_vhc_session::config::SwarmConfig,
     /// Session search/title tuning (`[sessions]`): boot-time FTS backfill + title generation.
     pub sessions: SessionsConfig,
     /// `semantic_search` workspace-index tuning (`[workspace_index]`): enabled by default but only
@@ -1631,7 +1631,7 @@ impl Default for NodeConfig {
             execute_code: ExecuteCodeConfig::default(),
             skills: SkillsConfig::default(),
             fs: daemon_tool_fs::FsConfig::default(),
-            swarm: daemon_swarm_run::config::SwarmConfig::default(),
+            swarm: daemon_vhc_session::config::SwarmConfig::default(),
             sessions: SessionsConfig::default(),
             workspace_index: WorkspaceIndexConfig::default(),
             lcm: LcmOpts::default(),
@@ -2252,7 +2252,7 @@ mod tests {
             assert!(cfg.swarm.enabled);
             assert_eq!(
                 cfg.swarm.default_policy.mode,
-                daemon_swarm_run::protocol::PolicyMode::Scheduled
+                daemon_vhc_session::protocol::PolicyMode::Scheduled
             );
             assert_eq!(
                 cfg.swarm.default_policy.schedule.as_deref(),
@@ -2262,7 +2262,7 @@ mod tests {
             assert_eq!(cfg.swarm.data_cache_gb, 200);
             assert_eq!(cfg.swarm.default_policy.duty_cycle_pct, 25);
             // Omitted keys keep the §10.6 defaults.
-            assert_eq!(cfg.swarm.worker_path, "daemon-train");
+            assert_eq!(cfg.swarm.worker_path, "daemon-vhc");
             assert_eq!(cfg.swarm.iroh.relays, "default");
             Ok(())
         });

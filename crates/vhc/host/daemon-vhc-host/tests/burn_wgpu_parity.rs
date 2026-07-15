@@ -17,7 +17,7 @@
 
 mod tolerance;
 
-use daemon_train::{wgpu_adapter_available, AdamwHp, BurnWgpuBackend, CpuBackend, OpBackend};
+use daemon_vhc_host::{wgpu_adapter_available, AdamwHp, BurnWgpuBackend, CpuBackend, OpBackend};
 use tolerance::{assert_close, assert_parity, Fixture, OpClass};
 
 /// The GPU-skip convention: bail loudly (stderr) when no usable wgpu adapter exists.

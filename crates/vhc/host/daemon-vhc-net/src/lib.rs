@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-swarm-net` — the swarm transport.
+//! `daemon-vhc-net` — the swarm transport.
 //!
 //! The [`SwarmTransport`](transport) seam (spec §7.1): one control plane
 //! ([`ControlPlane`] — publish/subscribe of already-signed message bytes, with the in-process
@@ -11,7 +11,7 @@
 //! `StorageReceipt` evidence (§6.4 I6). Artifact fetch ([`ArtifactResolver`]) resolves `file://`
 //! (blake3-verified); `r2`/`hf`/`https` are reserved for the egress plane.
 //!
-//! Engine-agnostic; consumed by `daemon-swarm-run` (§10.1). Outbound HTTP must route through
+//! Engine-agnostic; consumed by `daemon-vhc-session` (§10.1). Outbound HTTP must route through
 //! `daemon_egress::EgressClient` (raw `reqwest::Client` is banned workspace-wide by clippy); no HTTP
 //! client is constructed this wave.
 //!
@@ -162,7 +162,7 @@ pub(crate) mod test_support {
             .expect("clock")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "daemon-swarm-net-{tag}-{pid}-{n}-{nanos}",
+            "daemon-vhc-net-{tag}-{pid}-{n}-{nanos}",
             pid = std::process::id()
         ));
         TempRoot { path }

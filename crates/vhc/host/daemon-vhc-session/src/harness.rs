@@ -30,11 +30,11 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use daemon_swarm_coordinator::{CoordinatorParams, CoordinatorState, RunConfig};
-use daemon_swarm_net::{
+use daemon_vhc_coordinator::{CoordinatorParams, CoordinatorState, RunConfig};
+use daemon_vhc_net::{
     ControlPlane, FsPayloadStore, LoopbackGossip, PayloadStat, PayloadStore, SwarmNetError,
 };
-use daemon_swarm_observe::{
+use daemon_vhc_observe::{
     digest_tally, logged_round_records, replay_capture, DesyncVerdict, MessageLog, ObserveError,
     RunCapture, RunHealth,
 };
@@ -290,7 +290,7 @@ pub struct SwarmRun {
     /// The committed set per round, captured from the coordinator's `RoundRecord`s.
     pub records: BTreeMap<RoundId, Vec<RecordEntry>>,
     /// The node-visible signed-message log (every verified `SignedMessage` seen on the control
-    /// plane, arrival order) — the `daemon-swarm-observe` audit artifact `--observe` writes.
+    /// plane, arrival order) — the `daemon-vhc-observe` audit artifact `--observe` writes.
     pub message_log: MessageLog,
 }
 
@@ -332,7 +332,7 @@ impl SwarmRun {
     }
 
     /// The observe-driven [`DesyncVerdict`] for `round`: folds the peers' reported digests through
-    /// [`daemon_swarm_observe::digest_tally`] (§9), the authoritative desync trigger. `quorum` is the
+    /// [`daemon_vhc_observe::digest_tally`] (§9), the authoritative desync trigger. `quorum` is the
     /// number of agreeing peers a digest needs to count as the quorum digest (e.g.
     /// [`daemon_vhc_proto::assignment::witness_quorum`] of the roster).
     ///
@@ -394,7 +394,7 @@ impl SwarmRun {
     }
 
     /// The observe [`RunCapture`] for this run (the coordinator's reproducible `tick` driver trace),
-    /// if a coordinator replay was captured. Feeds [`daemon_swarm_observe::replay_capture`].
+    /// if a coordinator replay was captured. Feeds [`daemon_vhc_observe::replay_capture`].
     #[must_use]
     pub fn run_capture(&self) -> Option<RunCapture> {
         self.replay
@@ -402,7 +402,7 @@ impl SwarmRun {
             .map(|r| RunCapture::new(r.initial_state().clone(), r.inputs().to_vec()))
     }
 
-    /// Write the `daemon-swarm-observe` artifacts for this run into `dir` (the `--observe <dir>`
+    /// Write the `daemon-vhc-observe` artifacts for this run into `dir` (the `--observe <dir>`
     /// gate-ceremony instrumentation): `<run_id>.dsmlog` (the node-visible [`MessageLog`]) and, if a
     /// coordinator replay was captured, `<run_id>.dsmcap` (the [`RunCapture`] `swarm-replay` verifies).
     ///
@@ -450,7 +450,7 @@ impl ObserveVerify {
     }
 }
 
-/// Replay + verify the `daemon-swarm-observe` artifacts written by [`SwarmRun::write_observe`] into
+/// Replay + verify the `daemon-vhc-observe` artifacts written by [`SwarmRun::write_observe`] into
 /// `dir` (the `swarm-replay` entry point): re-run the pure coordinator `tick` from the recorded
 /// [`RunCapture`] and assert its `RoundRecord`s re-derive byte-identically against the independent
 /// wire [`MessageLog`] (§6.4 I1 / PROTO-20). Also projects [`RunHealth`] from the log.

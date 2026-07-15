@@ -4,7 +4,7 @@
 //! **C3 heterogeneous-fleet live-attach harness — the P2 WAN-gate heterogeneity rehearsal.**
 //!
 //! The Merge-2 `ws_live_workers.rs` proved the full node↔cloud↔worker loop + churn drill with N
-//! **local** `daemon-train-worker` subprocesses (all one platform). This harness proves the *new*
+//! **local** `daemon-vhc-worker` subprocesses (all one platform). This harness proves the *new*
 //! P2-gate property: peers on **different platforms / GPU vendors** completing the same run reach
 //! **byte-identical det-lane digests** — the consensus bar (spec §5.6: the det lane is CPU fp32 by
 //! contract, so a cross-compiled worker on real Windows/macOS/CUDA must agree bit-for-bit with the
@@ -27,11 +27,11 @@
 //! ```
 //!
 //! `SWARM_FLEET_PEERS` is a `;;`-separated list; each entry is `label|program|arg0|arg1|…`. The
-//! special program `LOCAL` means "the locally-built `daemon-train-worker` with `DAEMON_TRAIN_MODULE`
+//! special program `LOCAL` means "the locally-built `daemon-vhc-worker` with `DAEMON_TRAIN_MODULE`
 //! set to the local guest". Any other program is spawned verbatim (args follow) — for a remote peer,
 //! bake the module env into the command. Example (Windows 5090 over ssh + one local Linux peer):
 //! ```text
-//! SWARM_FLEET_PEERS='linux-vulkan|LOCAL;;win-5090|ssh|-T|usergpu356@37.230.134.194|set DAEMON_TRAIN_MODULE=C:\Users\Administrator\tiny_llama.wasm && daemon-train-worker.exe'
+//! SWARM_FLEET_PEERS='linux-vulkan|LOCAL;;win-5090|ssh|-T|usergpu356@37.230.134.194|set DAEMON_TRAIN_MODULE=C:\Users\Administrator\tiny_llama.wasm && daemon-vhc-worker.exe'
 //! ```
 //!
 //! Drive it:
@@ -52,14 +52,9 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
-use daemon_swarm_net::{ControlPlane, ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
-use daemon_swarm_observe::desync::digest_tally_from_log;
-use daemon_swarm_observe::{MessageLog, RunHealth};
-use daemon_swarm_run::protocol::{
-    CorpusRef, EngineParams, Event, IrohCredentials, IrohRosterPeer, JoinCredentials, JoinPolicy,
-    LeaveMode, PolicyMode, WsAuthSpec,
-};
-use daemon_train_client::{TrainClientConfig, TrainSupervisor};
+use daemon_vhc_net::{ControlPlane, ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
+use daemon_vhc_observe::desync::digest_tally_from_log;
+use daemon_vhc_observe::{MessageLog, RunHealth};
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
@@ -68,6 +63,11 @@ use daemon_vhc_proto::{
     from_canonical_slice, peer_id, to_canonical_vec, SignedMessage, SigningKey,
 };
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::protocol::{
+    CorpusRef, EngineParams, Event, IrohCredentials, IrohRosterPeer, JoinCredentials, JoinPolicy,
+    LeaveMode, PolicyMode, WsAuthSpec,
+};
+use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
 // ---- P3 Merge-2: the 160M content-addressed ceremony mode ----------------------------------------
 //
@@ -294,20 +294,20 @@ fn ensure_built() -> PathBuf {
             .args([
                 "build",
                 "-p",
-                "daemon-train",
+                "daemon-vhc-host",
                 "--features",
                 &features,
                 "--bin",
-                "daemon-train-worker",
+                "daemon-vhc-worker",
             ])
             .status()
             .expect("run cargo for the live worker binary");
-        assert!(status.success(), "building daemon-train-worker failed");
+        assert!(status.success(), "building daemon-vhc-worker failed");
     });
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("target"));
-    let bin = target.join("debug/daemon-train-worker");
+    let bin = target.join("debug/daemon-vhc-worker");
     assert!(bin.exists(), "worker binary at {}", bin.display());
     bin
 }

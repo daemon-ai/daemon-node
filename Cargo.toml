@@ -70,18 +70,18 @@ serde_bytes = "0.11"
 serde_json = "1"
 ciborium = "0.2"
 # --- swarm training stack (swarm-training-spec.md §10.1) -------------------------------------------
-# The wasm guest sandbox for experiment modules, isolated to the `daemon-train` worker (never the
+# The wasm guest sandbox for experiment modules, isolated to the `daemon-vhc-host` worker (never the
 # node process). default-features = false trims the defaults we don't need (async, component-model,
 # wat, coredump, profiling/ittapi, parallel-compilation) down to the JIT runtime we do: the
 # cranelift compiler + the pooling instance allocator. Fuel metering and epoch-interrupt preemption
 # (§10.5) are `Config` runtime levers, always available — no cargo feature required. No WASI (the
 # ABI is our own tensor ABI, tensor-ABI spec §5.1).
 wasmtime = { version = "46", default-features = false, features = ["runtime", "cranelift", "pooling-allocator"] }
-# The training engine, isolated to `daemon-train`. default-features = false + the ndarray backend
+# The training engine, isolated to `daemon-vhc-host`. default-features = false + the ndarray backend
 # and autodiff only are ALWAYS on (the CPU/G1 lane); GPU backends stay OUT of the default gate. The
 # `wgpu` backend (burn 0.21's `wgpu` feature -> burn-wgpu + cubecl + wgpu 29; the P1 GPU lane targets
 # Vulkan/RADV via the flake's shaderc/vulkan-loader) is reachable but OPT-IN: it is toggled per-lane
-# by `daemon-train`'s own `wgpu` cargo feature (`burn/wgpu`), so a default `cargo build`/`cargo deny`
+# by `daemon-vhc-host`'s own `wgpu` cargo feature (`burn/wgpu`), so a default `cargo build`/`cargo deny`
 # never compiles it (spec §10.1: heavy GPU deps build only as out-of-gate per-backend Nix lanes, like
 # the daemon-infer engine lanes). Keep default-features = false so the feature set stays this list.
 burn = { version = "0.21", default-features = false, features = ["std", "ndarray", "autodiff"] }
@@ -109,9 +109,9 @@ ed25519-dalek = "2"
 # in the B2 ledger; the endpoint/gossip/relay shapes are largely stable across 0.97→1.0).
 #
 # Default features carry iroh-gossip's `net` (the networked gossip); the `iroh` feature-gated consumer
-# (`daemon-swarm-net`) enables `iroh-relay/server` + `test-utils` locally for the self-hosted relay +
+# (`daemon-vhc-net`) enables `iroh-relay/server` + `test-utils` locally for the self-hosted relay +
 # the in-process 3-node test harness (B2, Wave 2). Heavy trees: single-sourced here for the pin, but
-# OPT-IN only — `daemon-swarm-net` gates all three behind its `iroh` cargo feature (optional deps), so
+# OPT-IN only — `daemon-vhc-net` gates all three behind its `iroh` cargo feature (optional deps), so
 # the default workspace build/gate never compiles iroh (spec §10.1). Relay reachability is part of the
 # §6.5 eligibility probe.
 iroh = "1"
@@ -290,7 +290,7 @@ axum = { version = "0.8", features = ["ws"] }
 # TLS features on purpose: `wss://` terminates at a reverse proxy for now.
 tokio-tungstenite = "0.29"
 # rustls 0.23 — already resolved transitively (the tree's aws-lc-rs TLS backbone). Declared here so
-# `daemon-swarm-net`'s WS client (the `ws` feature) can install the aws-lc-rs `CryptoProvider` as the
+# `daemon-vhc-net`'s WS client (the `ws` feature) can install the aws-lc-rs `CryptoProvider` as the
 # process default before its first `wss://` dial: the tree compiles BOTH aws-lc-rs (reqwest/egress —
 # the tree posture) and `ring` (pulled by `rustls-platform-verifier`), so rustls 0.23 cannot
 # auto-select a default provider and tokio-tungstenite's `ClientConfig::builder()` would panic. Kept
@@ -431,18 +431,18 @@ daemon-metta-client = { version = "0", path = "crates/coprocessor/daemon-metta-c
 daemon-vhc-proto = { version = "0", path = "crates/vhc/contracts/daemon-vhc-proto" }
 daemon-vhc-det = { version = "0", path = "crates/vhc/contracts/daemon-vhc-det" }
 daemon-vhc-sdk = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk" }
-daemon-swarm-net = { version = "0", path = "crates/vhc/host/daemon-vhc-net" }
-daemon-swarm-run = { version = "0", path = "crates/vhc/host/daemon-vhc-session" }
-daemon-swarm-coordinator = { version = "0", path = "crates/vhc/host/daemon-vhc-coordinator" }
-daemon-swarm-observe = { version = "0", path = "crates/vhc/host/daemon-vhc-observe" }
+daemon-vhc-net = { version = "0", path = "crates/vhc/host/daemon-vhc-net" }
+daemon-vhc-session = { version = "0", path = "crates/vhc/host/daemon-vhc-session" }
+daemon-vhc-coordinator = { version = "0", path = "crates/vhc/host/daemon-vhc-coordinator" }
+daemon-vhc-observe = { version = "0", path = "crates/vhc/host/daemon-vhc-observe" }
 # The node-side swarm-training service (resident `SwarmService` + worker supervisor), bound at boot
 # when `[swarm] enabled = true` (B3, spec §10.4). Promoted to the workspace table at Merge 3 (matches
-# the daemon-train-safetensors precedent from Merge 2) so `bins/daemon` consumes it via
+# the daemon-vhc-safetensors precedent from Merge 2) so `bins/daemon` consumes it via
 # `{ workspace = true }`. Default-gate-clean: no burn/wasmtime/iroh (verified by the Merge-3 dep check).
-daemon-swarm-node = { version = "0", path = "crates/vhc/host/daemon-vhc-node" }
-daemon-train = { version = "0", path = "crates/vhc/host/daemon-vhc-host" }
-daemon-train-client = { version = "0", path = "crates/vhc/host/daemon-vhc-supervisor" }
-daemon-train-safetensors = { version = "0", path = "crates/vhc/host/daemon-vhc-safetensors" }
+daemon-vhc-node = { version = "0", path = "crates/vhc/host/daemon-vhc-node" }
+daemon-vhc-host = { version = "0", path = "crates/vhc/host/daemon-vhc-host" }
+daemon-vhc-supervisor = { version = "0", path = "crates/vhc/host/daemon-vhc-supervisor" }
+daemon-vhc-safetensors = { version = "0", path = "crates/vhc/host/daemon-vhc-safetensors" }
 daemon-pytool = { version = "0", path = "crates/coprocessor/daemon-pytool" }
 daemon-pytool-client = { version = "0", path = "crates/coprocessor/daemon-pytool-client" }
 daemon-tool-metta = { version = "0", path = "tools/daemon-tool-metta" }

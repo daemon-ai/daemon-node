@@ -36,8 +36,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon_swarm_coordinator::CoordinatorState;
-use daemon_swarm_net::{
+use daemon_vhc_coordinator::CoordinatorState;
+use daemon_vhc_net::{
     DownloadScheduler, FsPayloadStore, IrohGossip, IrohGossipConfig, IrohPeer, RebroadcastConfig,
     RetryConfig,
 };
@@ -60,7 +60,7 @@ use crate::harness::{
 use crate::local_coordinator::{LocalCoordinator, LocalCoordinatorConfig};
 use crate::seam::{RoundId, RunId};
 use crate::SwarmRunError;
-use daemon_swarm_observe::MessageLog;
+use daemon_vhc_observe::MessageLog;
 
 /// Live-transport run configuration: the shared drill knobs ([`SwarmConfig`]) plus the two
 /// live-only knobs (relay selection + concurrent barrier fetch). The exit-gate harness API.
@@ -470,7 +470,7 @@ fn spawn_record_collector(
     version: SwarmProtoVersion,
     records: Arc<std::sync::Mutex<BTreeMap<RoundId, Vec<RecordEntry>>>>,
 ) -> JoinHandle<()> {
-    use daemon_swarm_net::ControlPlane;
+    use daemon_vhc_net::ControlPlane;
     let mut sub = node.subscribe();
     tokio::spawn(async move {
         while let Some(bytes) = sub.recv().await {

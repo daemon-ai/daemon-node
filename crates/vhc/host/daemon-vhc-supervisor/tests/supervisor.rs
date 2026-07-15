@@ -9,14 +9,14 @@
 //!
 //! CLI-3 (crash-loop meltdown over a bogus binary) is a unit test in the library; here we exercise
 //! the real spawn → handshake → command path and the respawn-after-crash flow against a fixture
-//! worker that speaks the true `daemon_swarm_run::protocol`.
+//! worker that speaks the true `daemon_vhc_session::protocol`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use daemon_swarm_run::protocol::{JoinPolicy, PolicyMode};
-use daemon_train_client::{TrainClientConfig, TrainClientError, TrainSupervisor};
+use daemon_vhc_session::protocol::{JoinPolicy, PolicyMode};
+use daemon_vhc_supervisor::{TrainClientConfig, TrainClientError, TrainSupervisor};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -28,7 +28,7 @@ fn state_path(tag: &str) -> PathBuf {
         .expect("clock")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "daemon-train-client-{tag}-{pid}-{n}-{nanos}.state",
+        "daemon-vhc-supervisor-{tag}-{pid}-{n}-{nanos}.state",
         pid = std::process::id()
     ))
 }
@@ -101,9 +101,9 @@ async fn supervisor_respawn() {
 /// RUN-9 (§10.5): preemption-as-churn. `Throttle{paused}` makes the peer leave the round cleanly;
 /// resume + rejoin re-enter at a boundary — over the **same** worker (pause/resume is churn, not a
 /// crash, so there is no respawn). This fixture-worker test pins the supervision semantics (no
-/// respawn on pause/resume); the **real** `daemon-train-worker` preemption (wasm VRAM-free
-/// pause/resume via `WasmBackend`) is exercised in `daemon-train/tests/worker_protocol.rs`
-/// (`daemon-train-client` cannot depend on `daemon-train` — that would be a dependency cycle).
+/// respawn on pause/resume); the **real** `daemon-vhc-worker` preemption (wasm VRAM-free
+/// pause/resume via `WasmBackend`) is exercised in `daemon-vhc-host/tests/worker_protocol.rs`
+/// (`daemon-vhc-supervisor` cannot depend on `daemon-vhc-host` — that would be a dependency cycle).
 #[tokio::test]
 async fn preemption_as_churn_pauses_and_rejoins_without_respawn() {
     let state = state_path("preempt");
@@ -134,7 +134,7 @@ async fn preemption_as_churn_pauses_and_rejoins_without_respawn() {
 /// CLI-4 (§10.5): `Throttle{paused}` — the supervisor half. Pausing while joined delivers the
 /// governor lever as a fire-and-forget oneway and does **not** tear the worker down (the abort of
 /// the in-flight guest call is graceful, worker-side), so the same worker keeps serving afterwards.
-/// The real VRAM-free + CPU-master-retention on the wasm backend is `daemon-train`'s
+/// The real VRAM-free + CPU-master-retention on the wasm backend is `daemon-vhc-host`'s
 /// `worker_protocol.rs`; here we pin that pause is churn over one worker, never a respawn.
 #[tokio::test]
 async fn throttle_aborts_in_flight_call() {

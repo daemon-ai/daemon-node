@@ -13,12 +13,10 @@ use daemon_vhc_proto::{
     commit_set, elect_checkpointer, select_verifiers, Hash, IrohId, PeerId, Seed,
 };
 
-use daemon_swarm_coordinator::commit::{
-    all_evidenced, committed_entries, has_evidence, quorum_root,
-};
-use daemon_swarm_coordinator::epoch::{ready_to_update_epoch, EpochInputs, EpochTrigger};
-use daemon_swarm_coordinator::state::{Member, RoundState};
-use daemon_swarm_coordinator::{tick, Input, Output, Rejection};
+use daemon_vhc_coordinator::commit::{all_evidenced, committed_entries, has_evidence, quorum_root};
+use daemon_vhc_coordinator::epoch::{ready_to_update_epoch, EpochInputs, EpochTrigger};
+use daemon_vhc_coordinator::state::{Member, RoundState};
+use daemon_vhc_coordinator::{tick, Input, Output, Rejection};
 
 fn member(seed: u8) -> Member {
     Member::joining(pid(seed), IrohId([seed; 32]), ThroughputClass::C2, 0)

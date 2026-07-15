@@ -9,11 +9,11 @@
 //! discovery: resolve the run from the coordinator registry, fetch + blake3-verify the frozen
 //! envelope, and hand it to the worker's existing `AssessRun` for a real §6.5 verdict **before**
 //! `JoinRun`. This trait is the seam (a [`EgressRunDiscovery`] over
-//! [`daemon_swarm_net::RegistryClient`] in production, a fake in tests) so the service is testable
+//! [`daemon_vhc_net::RegistryClient`] in production, a fake in tests) so the service is testable
 //! without a live coordinator.
 
 use async_trait::async_trait;
-use daemon_swarm_net::{RegistryClient, RunId};
+use daemon_vhc_net::{RegistryClient, RunId};
 
 use crate::service::SwarmError;
 

@@ -3,7 +3,7 @@
 
 //! Stub swarm end-to-end (spec §6.4; the Merge-2 P0 milestone test).
 //!
-//! N = 3 peers + the **real** `daemon-swarm-coordinator` pure `tick` loop (signed + published by the
+//! N = 3 peers + the **real** `daemon-vhc-coordinator` pure `tick` loop (signed + published by the
 //! harness shell) drive the full round protocol over `LoopbackGossip` + a shared `FsPayloadStore` +
 //! the deterministic `StubBackend` for 20 rounds:
 //!
@@ -16,9 +16,11 @@
 //! This is the P0 milestone: the swap from R2's TEST-ONLY scripted coordinator to the real tick
 //! loop landed at Merge 2.
 
-use daemon_swarm_run::engine::EngineEvent;
-use daemon_swarm_run::harness::{peer_key, run_swarm, verify_observe_dir, StallFault, SwarmConfig};
 use daemon_vhc_proto::peer_id;
+use daemon_vhc_session::engine::EngineEvent;
+use daemon_vhc_session::harness::{
+    peer_key, run_swarm, verify_observe_dir, StallFault, SwarmConfig,
+};
 
 /// The 20-round, 3-peer scenario with a stall at round 7 and catch-up at round 8.
 fn scenario() -> SwarmConfig {
@@ -116,7 +118,7 @@ async fn observe_record_and_replay_green() {
     // The observe message log captured every round record on the wire.
     assert_eq!(
         run.message_log
-            .by_kind(daemon_swarm_observe::MessageKind::RoundRecord)
+            .by_kind(daemon_vhc_observe::MessageKind::RoundRecord)
             .count(),
         20,
         "one round record per round on the wire"
@@ -131,7 +133,7 @@ async fn observe_record_and_replay_green() {
 
     // Write the artifacts, then replay + verify them offline (what `swarm-replay <dir>` does).
     let dir = std::env::temp_dir().join(format!(
-        "daemon-swarm-observe-e2e-{}-{}",
+        "daemon-vhc-observe-e2e-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

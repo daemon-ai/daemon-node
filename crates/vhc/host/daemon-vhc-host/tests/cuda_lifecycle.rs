@@ -15,10 +15,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 
-use daemon_train::autotune::{
+use daemon_vhc_host::autotune::{
     cuda_device_limits, cuda_nvrtc_ready, probe_cuda, Autotune, DEFAULT_MAX_MICROBATCH,
 };
-use daemon_train::{cuda_adapter_available, EngineConfig, Worker};
+use daemon_vhc_host::{cuda_adapter_available, EngineConfig, Worker};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 use serde::Serialize;
 

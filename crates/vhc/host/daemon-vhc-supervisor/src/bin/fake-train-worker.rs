@@ -5,9 +5,9 @@
 // daemon-controlled. Raw fs allowed file-wide (mirrors `fake-infer-worker`).
 #![allow(clippy::disallowed_methods)]
 
-//! A scripted fake `daemon-train` worker for [`TrainSupervisor`] integration tests.
+//! A scripted fake `daemon-vhc-host` worker for [`TrainSupervisor`] integration tests.
 //!
-//! It speaks the real [`daemon_swarm_run::protocol`] over the same length-framed stdio cut as the
+//! It speaks the real [`daemon_vhc_session::protocol`] over the same length-framed stdio cut as the
 //! production worker, but plays a scenario selected by `DAEMON_FAKE_SCENARIO` instead of running an
 //! engine, optionally varying behavior by spawn index (a counter persisted in `DAEMON_FAKE_STATE`)
 //! so a test can assert "crash once, then succeed on the respawn".
@@ -16,11 +16,13 @@
 //!
 //! `ineligible` answers `AssessRun` with a not-eligible verdict + reasons (the RUN-10 staged-assess
 //! rejection path). The real meta-mode assess (static import scan + host meta pass) lives in the
-//! `daemon-train-worker` binary; this fixture stays scripted so the supervision tests
+//! `daemon-vhc-worker` binary; this fixture stays scripted so the supervision tests
 //! (respawn / meltdown / crash-once) do not need the wasm engine.
 
 use daemon_provision::{CutChannel, CutWriter};
-use daemon_swarm_run::protocol::{self, Command, Eligibility, Event, Hardware, WorkerCapabilities};
+use daemon_vhc_session::protocol::{
+    self, Command, Eligibility, Event, Hardware, WorkerCapabilities,
+};
 
 #[tokio::main]
 async fn main() {

@@ -3,7 +3,7 @@
 
 //! `tiny-llama` — the reference guest experiment module.
 //!
-//! A `cdylib` compiled to `wasm32-unknown-unknown` and instantiated by the `daemon-train` host in
+//! A `cdylib` compiled to `wasm32-unknown-unknown` and instantiated by the `daemon-vhc-host` host in
 //! the wasm sandbox (tensor-ABI spec §5.1). The model itself — a genuinely tiny LLaMA-family decoder
 //! (embedding → N×(rmsnorm → RoPE attention → rmsnorm → SwiGLU) → tied logits, cross-entropy loss,
 //! AdamW inner, wired to a comm profile by config) — is the SDK's first-party preset

@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 
-use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
-use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig};
+use daemon_vhc_host::{EngineConfig, WasmBackend, WasmBackendConfig};
 use daemon_vhc_proto::{blake3_hash, PeerId};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
 use serde::Serialize;
 
 // -- guest module loading (mirrors tests/guest_lifecycle.rs) ------------------------------------
@@ -446,7 +446,7 @@ fn host_backward_reduces_loss_all_profiles() {
 #[cfg(feature = "burn-ndarray")]
 mod cross_backend {
     use super::*;
-    use daemon_train::BackendKind;
+    use daemon_vhc_host::BackendKind;
 
     fn backend_with(config: &[u8], kind: BackendKind) -> WasmBackend {
         let mut b = WasmBackend::new(WasmBackendConfig {
@@ -586,7 +586,7 @@ mod cross_backend {
 #[cfg(feature = "wgpu")]
 mod cross_backend_wgpu {
     use super::*;
-    use daemon_train::{wgpu_adapter_available, BackendKind};
+    use daemon_vhc_host::{wgpu_adapter_available, BackendKind};
 
     fn backend_with(config: &[u8], kind: BackendKind) -> WasmBackend {
         let mut b = WasmBackend::new(WasmBackendConfig {
@@ -704,7 +704,7 @@ mod cross_backend_wgpu {
 #[cfg(feature = "cuda")]
 mod cross_backend_cuda {
     use super::*;
-    use daemon_train::{cuda_adapter_available, BackendKind};
+    use daemon_vhc_host::{cuda_adapter_available, BackendKind};
 
     fn backend_with(config: &[u8], kind: BackendKind) -> WasmBackend {
         let mut b = WasmBackend::new(WasmBackendConfig {

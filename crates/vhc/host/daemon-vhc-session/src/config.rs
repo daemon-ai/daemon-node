@@ -6,7 +6,7 @@
 //! [`SwarmConfig`] is the typed projection of the figment `[swarm]` table the node layers
 //! (defaults ← TOML ← env ← CLI). It is defined **here** (lane R) rather than in the node's main
 //! config crate — that crate is outside lane R's file set, so the struct + its extraction test land
-//! in `daemon-swarm-run` and the node wiring (embedding it in `NodeConfig`) is post-MVP node work.
+//! in `daemon-vhc-session` and the node wiring (embedding it in `NodeConfig`) is post-MVP node work.
 //!
 //! The struct is `serde`-only (no figment on the default participant build); the extraction test
 //! exercises the figment layering as a dev-dependency, proving the `[swarm]` keys deserialize
@@ -23,7 +23,7 @@ pub enum ModuleTrust {
     /// Any author-signed module (the permissioned-org default).
     #[default]
     Signed,
-    /// Only `daemon-train`'s preset experiments.
+    /// Only `daemon-vhc-host`'s preset experiments.
     FirstParty,
 }
 
@@ -54,7 +54,7 @@ impl Default for SwarmPolicyConfig {
 }
 
 /// The `swarm:*` credential a registry request carries (`[swarm.registry].auth`, §11.1). Mirrors
-/// `daemon_swarm_net::ws_client::WsAuth` / `RegistryClient`'s auth modes — never hardcoded.
+/// `daemon_vhc_net::ws_client::WsAuth` / `RegistryClient`'s auth modes — never hardcoded.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RegistryAuthConfig {
@@ -116,7 +116,7 @@ impl Default for IrohConfig {
 pub struct SwarmConfig {
     /// Master switch (default off; the feature-gated worker must also be installed).
     pub enabled: bool,
-    /// Path to the `daemon-train` worker binary (resolved like the `daemon-infer` worker).
+    /// Path to the `daemon-vhc-host` worker binary (resolved like the `daemon-infer` worker).
     pub worker_path: String,
     /// Data/artifact cache budget in GiB (the artifact LRU bound, §8, RUN-4).
     pub data_cache_gb: u32,
@@ -137,7 +137,7 @@ impl Default for SwarmConfig {
         // Mirrors the spec §10.6 TOML defaults verbatim.
         Self {
             enabled: false,
-            worker_path: "daemon-train".to_string(),
+            worker_path: "daemon-vhc".to_string(),
             data_cache_gb: 50,
             default_policy: SwarmPolicyConfig::default(),
             module_trust: ModuleTrust::Signed,
@@ -158,7 +158,7 @@ mod tests {
     fn defaults_match_spec() {
         let cfg = SwarmConfig::default();
         assert!(!cfg.enabled);
-        assert_eq!(cfg.worker_path, "daemon-train");
+        assert_eq!(cfg.worker_path, "daemon-vhc");
         assert_eq!(cfg.data_cache_gb, 50);
         assert_eq!(cfg.default_policy.mode, PolicyMode::Idle);
         assert_eq!(cfg.default_policy.duty_cycle_pct, 100);
@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(cfg.default_policy.duty_cycle_pct, 40);
         assert_eq!(cfg.default_policy.schedule.as_deref(), Some("0 2 * * *"));
         // Omitted keys keep their defaults.
-        assert_eq!(cfg.worker_path, "daemon-train");
+        assert_eq!(cfg.worker_path, "daemon-vhc");
         assert_eq!(cfg.data_cache_gb, 50);
         assert_eq!(cfg.default_policy.vram_cap_mb, 0);
         assert_eq!(cfg.iroh.relays, "default");

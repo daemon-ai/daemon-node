@@ -1,5 +1,5 @@
 [package]
-name = "daemon-swarm-run"
+name = "daemon-vhc-session"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -25,30 +25,30 @@ path = "src/bin/swarm-replay.rs"
 required-features = ["harness"]
 
 [features]
-# `harness` exposes the in-process multi-peer test harness + the real `daemon-swarm-coordinator`
+# `harness` exposes the in-process multi-peer test harness + the real `daemon-vhc-coordinator`
 # pure `tick` loop driver (the impure shell that signs/publishes the coordinator's unsigned
 # RoundOpen/RoundRecord outputs and feeds it signed peer messages + StorageReceipt evidence + scripted
 # Clock inputs) to external crates. Kept out of the default build; the `tests/daemon-swarm-e2e` crate
 # enables it. The crate's own unit tests reach the harness via `cfg(test)` (no feature needed).
-harness = ["dep:daemon-swarm-coordinator", "dep:daemon-swarm-observe"]
+harness = ["dep:daemon-vhc-coordinator", "dep:daemon-vhc-observe"]
 # `iroh` adds the live-transport harness (`live_harness`): the round engine over a real per-node
 # `IrohGossip` mesh + a shared `FsPayloadStore`. It layers on `harness` (the coordinator shell) and
-# turns on `daemon-swarm-net`'s off-default `iroh` feature. Kept out of the default build; the
+# turns on `daemon-vhc-net`'s off-default `iroh` feature. Kept out of the default build; the
 # `tests/daemon-swarm-e2e` crate + `bins/swarm-local` enable it. NOT a root Cargo.toml change.
-iroh = ["harness", "daemon-swarm-net/iroh"]
+iroh = ["harness", "daemon-vhc-net/iroh"]
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
-daemon-swarm-net = { workspace = true }
+daemon-vhc-net = { workspace = true }
 # The pure coordinator `tick` state machine — driven by the Merge-2 harness shell (feature-gated, so
 # it stays out of the default participant-runtime build). Not a root Cargo.toml change: the path dep
 # is already declared in the frozen `[workspace.dependencies]`.
-daemon-swarm-coordinator = { workspace = true, optional = true }
+daemon-vhc-coordinator = { workspace = true, optional = true }
 # Observe drives the desync verdict (digest tally / `DesyncVerdict`, §9) the harness + checkpoint
 # resync trigger consume. Node-side std tool, `harness`-gated so it stays off the default
 # participant build. Path dep already in the frozen root `[workspace.dependencies]` (no root edit),
-# and observe depends only on proto + coordinator (no cycle back to `daemon-swarm-run`).
-daemon-swarm-observe = { workspace = true, optional = true }
+# and observe depends only on proto + coordinator (no cycle back to `daemon-vhc-session`).
+daemon-vhc-observe = { workspace = true, optional = true }
 tokio = { workspace = true }
 # `futures::future::join_all` drives the barrier's bounded-concurrency payload fetch (engine.rs,
 # `RoundEngine::with_download_scheduler`). Already a frozen `[workspace.dependencies]` entry.
@@ -71,10 +71,10 @@ xxhash-rust = { workspace = true }
 # The crate's own `cfg(test)` harness tests exercise the real coordinator `tick` loop (the same code
 # external crates reach behind `feature = "harness"`), so the coordinator must be available for tests
 # even with the feature off.
-daemon-swarm-coordinator = { workspace = true }
+daemon-vhc-coordinator = { workspace = true }
 # Same as the coordinator: the `cfg(test)` harness build uses observe's `digest_tally` / `DesyncVerdict`
 # (the desync trigger) even with the `harness` feature off.
-daemon-swarm-observe = { workspace = true }
+daemon-vhc-observe = { workspace = true }
 # The `[swarm]` config-section extraction test (§10.6) layers a figment the way the node config does;
 # `test` adds `figment::Jail` for hermetic env fixtures. Test-only — the struct itself is serde-only.
 figment = { workspace = true, features = ["test"] }

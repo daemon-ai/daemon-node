@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-swarm-run` — the participant runtime.
+//! `daemon-vhc-session` — the participant runtime.
 //!
 //! The join / warmup / round loops, artifact + data pipeline, checkpoint manager, and digest
 //! checks (swarm-training-spec.md §10.1). It is **engine-agnostic**: it drives an abstract
@@ -17,9 +17,9 @@
 //! - [`engine`] — Wave-2's [`RoundEngine`]: the peer-side round state machine over the frozen seams
 //!   (round protocol, barrier I2, record-order staging I3, stall ladder — §6.4).
 //! - [`protocol`] — the worker `Command`/`Event` wire types + CBOR codec (§10.2), which lane E's
-//!   `daemon-train` worker implements against in Wave 3.
+//!   `daemon-vhc-host` worker implements against in Wave 3.
 //!
-//! Identity/hash types are re-exported from `daemon-swarm-net`'s [`seam`], which (as of Merge 1)
+//! Identity/hash types are re-exported from `daemon-vhc-net`'s [`seam`], which (as of Merge 1)
 //! resolves them to the canonical `daemon-vhc-proto` types (blake3 `Hash`, `PeerId`).
 
 #![forbid(unsafe_code)]
@@ -34,7 +34,7 @@ pub mod protocol;
 pub mod seam;
 
 /// The runnable local-mode coordinator shell (the impure driver around the pure
-/// `daemon-swarm-coordinator` `tick`). Behind the `harness` feature (its coordinator dep is
+/// `daemon-vhc-coordinator` `tick`). Behind the `harness` feature (its coordinator dep is
 /// `harness`-optional), and available to this crate's own tests via `cfg(test)`.
 #[cfg(any(test, feature = "harness"))]
 pub mod local_coordinator;
@@ -47,10 +47,10 @@ pub mod harness;
 
 /// The live-transport multi-peer harness: the round engine over a **real per-node [`IrohGossip`]**
 /// mesh + a shared `FsPayloadStore` (B3, the transport exit-gate lane). Behind the `iroh` feature
-/// (which enables `daemon-swarm-net/iroh` + `harness`). Used by `bins/swarm-local` +
+/// (which enables `daemon-vhc-net/iroh` + `harness`). Used by `bins/swarm-local` +
 /// `tests/daemon-swarm-e2e`'s live suite.
 ///
-/// [`IrohGossip`]: daemon_swarm_net::IrohGossip
+/// [`IrohGossip`]: daemon_vhc_net::IrohGossip
 #[cfg(feature = "iroh")]
 pub mod live_harness;
 
@@ -71,7 +71,7 @@ pub use seam::BatchId;
 pub enum SwarmRunError {
     /// The transport (control or payload plane) failed.
     #[error(transparent)]
-    Net(#[from] daemon_swarm_net::SwarmNetError),
+    Net(#[from] daemon_vhc_net::SwarmNetError),
     /// The data pipeline (manifest / batch mapping) failed.
     #[error(transparent)]
     Data(#[from] data::DataError),
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn wraps_net_errors() {
-        let err: SwarmRunError = daemon_swarm_net::SwarmNetError::Transport("gossip".into()).into();
+        let err: SwarmRunError = daemon_vhc_net::SwarmNetError::Transport("gossip".into()).into();
         assert!(err.to_string().contains("gossip"));
     }
 

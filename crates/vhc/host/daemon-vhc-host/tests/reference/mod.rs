@@ -10,7 +10,7 @@
 //!
 //! ## Independence
 //!
-//! The tabi path is `tiny_llama.wasm` → wasm ABI → [`daemon_train::WasmBackend`] → the `OpBackend`
+//! The tabi path is `tiny_llama.wasm` → wasm ABI → [`daemon_vhc_host::WasmBackend`] → the `OpBackend`
 //! engine (`BurnBackend<Autodiff<B>>`) → burn. [`RefLlama`] issues **burn tensor ops directly** — no
 //! wasm sandbox, no ABI dispatch, no handle arena, no `OpBackend` indirection — differentiated by
 //! burn's own `Autodiff` decorator (`Tensor::backward`). It is therefore independent of the *tabi
@@ -40,8 +40,8 @@ use std::sync::Once;
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{activation, Int, Tensor, TensorData};
 
-use daemon_train::{BackendKind, EngineConfig, Worker};
-use daemon_train_safetensors::StateDict;
+use daemon_vhc_host::{BackendKind, EngineConfig, Worker};
+use daemon_vhc_safetensors::StateDict;
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 use crate::tolerance::{assert_close, tol_for, OpClass};
@@ -201,13 +201,13 @@ impl TokenBatch {
     /// GPT-2 tokens — the same corpus the swarm/tabi data path serves.
     #[must_use]
     pub fn tinystories(b: u32) -> Self {
-        use daemon_swarm_run::data::Corpus;
+        use daemon_vhc_session::data::Corpus;
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../swarm/daemon-swarm-run/tests/fixtures/tinystories");
+            .join("../../swarm/daemon-vhc-session/tests/fixtures/tinystories");
         let manifest_json =
             std::fs::read_to_string(dir.join("manifest.json")).expect("read fixture manifest");
         let manifest =
-            daemon_swarm_run::data::Manifest::from_json(&manifest_json).expect("parse manifest");
+            daemon_vhc_session::data::Manifest::from_json(&manifest_json).expect("parse manifest");
         let shards: Vec<Vec<u8>> = manifest
             .shards
             .iter()
@@ -638,7 +638,7 @@ pub fn drive_tabi(
     let mut inst = worker.instantiate(&module).expect("instantiate");
     inst.build(&cfg_cbor(cfg)).expect("da_build");
 
-    let read_state = |inst: &daemon_train::Instance| -> StateDict {
+    let read_state = |inst: &daemon_vhc_host::Instance| -> StateDict {
         let mut sd = StateDict::new();
         for p in inst.params() {
             let data = inst.param_master(&p.name).expect("param master");

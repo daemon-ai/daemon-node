@@ -595,7 +595,7 @@ impl Store {
     pub(crate) fn drop_handle(&mut self, _h: RawHandle) {
         // The autodiff graph retains what backward needs (Burn-tape semantics, ABI §3.3), so a
         // step-handle drop is a no-op for the sim's correctness; eager-free budgeting is a HOST
-        // property (tested in daemon-train), not a numeric-reference one.
+        // property (tested in daemon-vhc-host), not a numeric-reference one.
     }
 
     // state / autodiff --------------------------------------------------------------------------

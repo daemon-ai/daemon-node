@@ -1,5 +1,5 @@
 [package]
-name = "daemon-swarm-observe"
+name = "daemon-vhc-observe"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ path = "src/lib.rs"
 # the replay oracle re-runs (PROTO-20). Both path deps are already in the frozen root
 # `[workspace.dependencies]`, so declaring them here is a lane-owned edit — no root Cargo.toml change.
 daemon-vhc-proto = { workspace = true }
-daemon-swarm-coordinator = { workspace = true }
+daemon-vhc-coordinator = { workspace = true }
 serde = { workspace = true }
 # Node-side tool: observe uses std freely (std::io message-log framing) and follows its scaffold's
 # `thiserror` errors. It is NOT on the wasm32 substrate path (proto + coordinator stay wasm-clean).

@@ -9,8 +9,8 @@
 //! `PeerId` byte order (then hash) before committing. This test pins the two to the *same* key so a
 //! future reorder in either lane is a loud failure, not a silent consensus fork.
 
-use daemon_swarm_run::backend::StagedPayload;
 use daemon_vhc_proto::{blake3_hash, commit_set, Hash, PeerId};
+use daemon_vhc_session::backend::StagedPayload;
 
 fn peer(b: u8) -> PeerId {
     PeerId([b; 32])
@@ -64,7 +64,7 @@ fn staging_order_matches_proto_commit_set() {
 
 #[test]
 fn ingest_is_sensitive_to_record_order() {
-    use daemon_swarm_run::backend::{StubBackend, TrainerBackend};
+    use daemon_vhc_session::backend::{StubBackend, TrainerBackend};
 
     let mk = |peers: [u8; 3]| -> Vec<StagedPayload> {
         peers

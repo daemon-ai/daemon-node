@@ -14,7 +14,7 @@
 //! root-verified committed sets) + payloads forward to the current round. [`resync_by_replay`] is
 //! that pure fold — `checkpoint_load` then `ingest` each retained round in order — the offline
 //! resync oracle. The *trigger* (this peer's digest vs the quorum/consensus digest) is
-//! `daemon_swarm_observe::digest_tally` / `DesyncVerdict` (folded over the run's `Digest` messages,
+//! `daemon_vhc_observe::digest_tally` / `DesyncVerdict` (folded over the run's `Digest` messages,
 //! §9) — consumed by the harness + drills, which drive this replay on `DesyncVerdict::is_desync()`;
 //! the replay fold itself is here.
 
@@ -24,7 +24,7 @@ use daemon_vhc_proto::{blake3_hash, Hash, PeerId};
 
 use crate::backend::{StagedPayload, StateDigest, TrainerBackend};
 use crate::seam::{PayloadKey, RoundId, RunId};
-use daemon_swarm_net::PayloadStore;
+use daemon_vhc_net::PayloadStore;
 
 use crate::SwarmRunError;
 
@@ -208,7 +208,7 @@ pub fn plan_resync(
 mod tests {
     use super::*;
     use crate::backend::StubBackend;
-    use daemon_swarm_net::FsPayloadStore;
+    use daemon_vhc_net::FsPayloadStore;
 
     fn temp_store() -> Arc<FsPayloadStore> {
         let root = std::env::temp_dir().join(format!(

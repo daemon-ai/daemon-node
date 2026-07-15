@@ -7,8 +7,8 @@
 //! them (the §12 tamper path).
 
 use daemon_egress::{EgressClient, EgressConfig};
-use daemon_swarm_net::RunId;
-use daemon_swarm_net::{RegistryClient, RunDescriptor, SwarmNetError};
+use daemon_vhc_net::RunId;
+use daemon_vhc_net::{RegistryClient, RunDescriptor, SwarmNetError};
 use daemon_vhc_proto::blake3_hash;
 use serde_json::json;
 use wiremock::matchers::{method, path};

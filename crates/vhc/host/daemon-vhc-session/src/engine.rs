@@ -27,7 +27,7 @@
 //! usually finds the set already local. (`// MERGE-2`: a dedicated in-peer concurrent fetch task
 //! becomes worthwhile once the real iroh/r2 payload plane replaces the fast `FsPayloadStore`.)
 //!
-//! As of Merge 2 the harness drives this engine with the **real** `daemon-swarm-coordinator` pure
+//! As of Merge 2 the harness drives this engine with the **real** `daemon-vhc-coordinator` pure
 //! `tick` loop (signed + published by the harness shell); the engine still builds only the peer side
 //! against the frozen proto message types, consuming whatever signed `RoundOpen`/`RoundRecord` the
 //! coordinator emits.
@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use daemon_swarm_net::{
+use daemon_vhc_net::{
     fetch_record_set, ControlPlane, ControlSubscription, DownloadScheduler, PayloadStore,
 };
 use daemon_vhc_proto::messages::{
@@ -494,7 +494,7 @@ where
                 self.round_mut(round).fetched.insert(peer, bytes);
                 self.maybe_attest(round, peer, commitment.payload).await?;
             }
-            Err(SwarmRunError::Net(daemon_swarm_net::SwarmNetError::PayloadMiss(_))) => {}
+            Err(SwarmRunError::Net(daemon_vhc_net::SwarmNetError::PayloadMiss(_))) => {}
             Err(e) => return Err(e),
         }
         Ok(())
@@ -701,7 +701,7 @@ where
                         self.round_mut(round).fetched.insert(entry.peer, b.clone());
                         b
                     }
-                    Err(SwarmRunError::Net(daemon_swarm_net::SwarmNetError::PayloadMiss(_))) => {
+                    Err(SwarmRunError::Net(daemon_vhc_net::SwarmNetError::PayloadMiss(_))) => {
                         return Ok(None);
                     }
                     Err(e) => return Err(e),
@@ -860,12 +860,8 @@ mod tests {
     /// Build a minimal single-peer engine over loopback + a fresh FS store (for the record-set
     /// resolution tests). The backend/corpus are unused by `resolve_record_set`.
     fn resolve_engine() -> (
-        RoundEngine<
-            daemon_swarm_net::LoopbackGossip,
-            daemon_swarm_net::FsPayloadStore,
-            StubBackend,
-        >,
-        Arc<daemon_swarm_net::FsPayloadStore>,
+        RoundEngine<daemon_vhc_net::LoopbackGossip, daemon_vhc_net::FsPayloadStore, StubBackend>,
+        Arc<daemon_vhc_net::FsPayloadStore>,
         RunId,
     ) {
         let run = RunId::new("resolve-run");
@@ -874,8 +870,8 @@ mod tests {
             std::process::id(),
             crate::harness::fastcounter()
         ));
-        let store = Arc::new(daemon_swarm_net::FsPayloadStore::open(&root, 16).unwrap());
-        let control = Arc::new(daemon_swarm_net::LoopbackGossip::new());
+        let store = Arc::new(daemon_vhc_net::FsPayloadStore::open(&root, 16).unwrap());
+        let control = Arc::new(daemon_vhc_net::LoopbackGossip::new());
         let mut backend = StubBackend::new();
         backend.build(EXPERIMENT_CONFIG).unwrap();
         let corpus = Arc::new(crate::data::Corpus::synthetic(1, 2, 64, 4).unwrap());

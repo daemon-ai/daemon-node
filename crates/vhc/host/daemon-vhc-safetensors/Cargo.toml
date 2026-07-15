@@ -1,5 +1,5 @@
 [package]
-name = "daemon-train-safetensors"
+name = "daemon-vhc-safetensors"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

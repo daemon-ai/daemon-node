@@ -15,7 +15,7 @@
 //!    cadence a peer paces to must be the one the envelope froze).
 //!
 //! Both are pure + engine-free, so they are unit-testable without a worker (the eligibility *verdict*
-//! over the real worker protocol is `daemon-train-client`'s `assess`, RUN-10's supervisor half).
+//! over the real worker protocol is `daemon-vhc-supervisor`'s `assess`, RUN-10's supervisor half).
 
 use daemon_vhc_proto::capability::{Capability, CapabilitySet};
 

@@ -4,16 +4,16 @@
 //! The training-worker wire protocol (spec §10.2) — [`Command`] (down) / [`Event`] (up) + a CBOR
 //! codec.
 //!
-//! The node-side supervisor (`daemon-train-client`) and the `daemon-train` worker exchange these
+//! The node-side supervisor (`daemon-vhc-supervisor`) and the `daemon-vhc-host` worker exchange these
 //! frames over a length-framed stdio cut (`daemon_provision::CutChannel`, `Framing::Length`), same
 //! supervision contract as `daemon-infer` (respawn with backoff, crash-loop meltdown). Each frame
 //! body is CBOR; the `u32`-length prefix is handled by the channel, so this module owns only the
 //! body [`encode`]/[`decode`] — the exact conventions of [`daemon_infer::protocol`].
 //!
-//! This is the **worker** protocol (node ↔ `daemon-train` child) — distinct from the **swarm**
-//! control protocol (`daemon-swarm.cddl`, lane P). It lives in `daemon-swarm-run` (not the client)
-//! so lane E's `daemon-train` worker implements the worker side against it in Wave 3 (§10.1:
-//! `daemon-train` depends on `daemon-swarm-run`).
+//! This is the **worker** protocol (node ↔ `daemon-vhc-host` child) — distinct from the **swarm**
+//! control protocol (`daemon-swarm.cddl`, lane P). It lives in `daemon-vhc-session` (not the client)
+//! so lane E's `daemon-vhc-host` worker implements the worker side against it in Wave 3 (§10.1:
+//! `daemon-vhc-host` depends on `daemon-vhc-session`).
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -333,7 +333,7 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
 // bytes exactly as before.
 
 /// The WS coordinator auth for the live attach (the canonical-CBOR mirror of
-/// `daemon_swarm_net::ws_client::WsAuth`, defined here so the dependency-light protocol crate owns
+/// `daemon_vhc_net::ws_client::WsAuth`, defined here so the dependency-light protocol crate owns
 /// the credentials schema; the worker converts it under the `ws` feature — never hardcoded).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WsAuthSpec {
@@ -351,7 +351,7 @@ pub enum WsAuthSpec {
     },
 }
 
-/// One iroh roster peer (the canonical-CBOR mirror of `daemon_swarm_net::IrohPeer` for the
+/// One iroh roster peer (the canonical-CBOR mirror of `daemon_vhc_net::IrohPeer` for the
 /// credentials body: an `endpoint_id` + reachability). Direct addrs are `"ip:port"` strings so the
 /// protocol crate takes no `std::net` serialization dependency; the worker parses them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,7 +429,7 @@ pub struct EngineParams {
     #[serde(default)]
     pub update_max_bytes: u64,
     /// Synthetic-corpus seed (deterministic training data — identical across peers → agreeing
-    /// digests). Mirrors `daemon_swarm_run::data::Corpus::synthetic(seed, shards, tokens_per_shard,
+    /// digests). Mirrors `daemon_vhc_session::data::Corpus::synthetic(seed, shards, tokens_per_shard,
     /// seq_len)`.
     pub corpus_seed: u64,
     /// Synthetic-corpus shard count.

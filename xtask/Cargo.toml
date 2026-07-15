@@ -21,11 +21,11 @@ serde = { workspace = true }
 # run by maintainers, not the shipped node, so its egress goes through `hf-hub` (revision-pinned; no
 # raw `reqwest::Client` in xtask code — the clippy `disallowed_types` ban is respected) and the
 # `tokenizers` crate does the BPE. Versions match the workspace lock (tokenizers 0.22, hf-hub 0.5).
-daemon-swarm-run = { workspace = true }
+daemon-vhc-session = { workspace = true }
 # `publish-module` / `publish-corpus` (P3 lane S): upload artifacts to the payload store by content
 # hash (presigned PUT direct-to-R2). Both are existing workspace deps already in the lock via
-# daemon-swarm-net, so no new third-party crate / deny change.
-daemon-swarm-net = { workspace = true }
+# daemon-vhc-net, so no new third-party crate / deny change.
+daemon-vhc-net = { workspace = true }
 daemon-egress = { workspace = true }
 tokio = { workspace = true }
 blake3 = { workspace = true }

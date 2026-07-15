@@ -6,7 +6,7 @@
 // and single-uploader degraded mode (RUN-6), fp32-exact checkpoint roundtrip (RUN-6), the
 // digest-mismatch → replay-resync recovery (RUN-7), and the retention-floor decision that sends a
 // too-old desync to an epoch rejoin instead of a replay (RUN-7). RUN-10's staged-assess prescreen +
-// manifest-cadence checks are unit-tested in `daemon_swarm_run::assess`.
+// manifest-cadence checks are unit-tested in `daemon_vhc_session::assess`.
 //
 // Oracle provenance (swarm-ledger-p2-b1.md): from-definition — the StubBackend outer step is
 // deterministic + record-ordered, so resync replay recovering the in-sync digest is a bit-exact
@@ -15,12 +15,12 @@
 use daemon_vhc_proto::assignment::elect_checkpointers;
 use daemon_vhc_proto::{blake3_hash, PeerId, Seed};
 
-use daemon_swarm_run::backend::{StagedPayload, StateDigest, StubBackend, TrainerBackend};
-use daemon_swarm_run::checkpoint::{
+use daemon_vhc_session::backend::{StagedPayload, StateDigest, StubBackend, TrainerBackend};
+use daemon_vhc_session::checkpoint::{
     plan_resync, register_checkpoint, resync_by_replay, CheckpointManifest, CheckpointRegistration,
     ReplayStep, ResyncPlan,
 };
-use daemon_swarm_run::seam::RoundId;
+use daemon_vhc_session::seam::RoundId;
 
 fn pk(n: u8) -> PeerId {
     PeerId([n; 32])

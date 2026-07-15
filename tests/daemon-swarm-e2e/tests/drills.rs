@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
 //! Wave-3 churn / failure drills (spec §6.4, §13; TDD §3.8 E2E, RUN-7/8) over the local runner
-//! machinery ([`daemon_swarm_run::harness`] + [`daemon_swarm_run::local_coordinator`]).
+//! machinery ([`daemon_vhc_session::harness`] + [`daemon_vhc_session::local_coordinator`]).
 //!
 //! Each drill injects one failure mode into the in-process N-peer swarm and asserts the run
 //! **completes with all surviving peers' digests equal every round**:
@@ -14,27 +14,27 @@
 //! - [`payload_store_outage_absorbed_by_stall_ladder`] — a peer's whole-round `get`s are denied for
 //!   a window; the §6.4 stall ladder absorbs it;
 //! - [`desync_injection_detected_and_resynced`] — one peer's ingest is corrupted, the digest outlier
-//!   is detected by `daemon-swarm-observe`'s `DesyncVerdict` (the observe-driven desync trigger,
+//!   is detected by `daemon-vhc-observe`'s `DesyncVerdict` (the observe-driven desync trigger,
 //!   §9), and it is recovered via checkpoint + record replay;
 //! - [`coordinator_restart_mid_run_completes`] — the coordinator shell reloads its `CoordinatorState`
 //!   from canonical CBOR mid-run (PROTO-20 in anger) and the run completes.
 
-use daemon_swarm_net::PayloadStore;
-use daemon_swarm_run::backend::{
+use daemon_vhc_net::PayloadStore;
+use daemon_vhc_proto::peer_id;
+use daemon_vhc_session::backend::{
     AssessMeta, Assessment, BatchRef, StagedPayload, StateDigest, StepCtx, StepStats, StubBackend,
     TrainerBackend,
 };
-use daemon_swarm_run::checkpoint::{resync_by_replay, ReplayStep, CHECKPOINT_PEER};
-use daemon_swarm_run::engine::EngineEvent;
-use daemon_swarm_run::harness::{
+use daemon_vhc_session::checkpoint::{resync_by_replay, ReplayStep, CHECKPOINT_PEER};
+use daemon_vhc_session::engine::EngineEvent;
+use daemon_vhc_session::harness::{
     peer_key, run_swarm, run_swarm_with, LateJoin, SilentDeath, StoreOutage, SwarmConfig,
     EXPERIMENT_CONFIG,
 };
-use daemon_swarm_run::seam::{PayloadKey, RoundId};
-use daemon_vhc_proto::peer_id;
+use daemon_vhc_session::seam::{PayloadKey, RoundId};
 
 /// Assert every round in `run` has a single digest shared by all peers that reported it.
-fn assert_all_agree(run: &daemon_swarm_run::harness::SwarmRun) {
+fn assert_all_agree(run: &daemon_vhc_session::harness::SwarmRun) {
     assert!(
         run.all_agree(),
         "surviving peers must agree on every round's digest"
@@ -251,7 +251,7 @@ async fn desync_injection_detected_and_resynced() {
         );
     }
 
-    // Detection: fold the round's per-peer digests through `daemon-swarm-observe`'s `digest_tally`
+    // Detection: fold the round's per-peer digests through `daemon-vhc-observe`'s `digest_tally`
     // (the observe-driven desync trigger, §9). With a 3-peer roster the quorum is 2, so the two
     // agreeing healthy peers pin the quorum digest and the corrupted peer is the sole outlier.
     let quorum = daemon_vhc_proto::assignment::witness_quorum(3);

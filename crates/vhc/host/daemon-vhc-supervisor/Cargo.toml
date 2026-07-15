@@ -1,5 +1,5 @@
 [package]
-name = "daemon-train-client"
+name = "daemon-vhc-supervisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,8 +21,8 @@ daemon-provision = { workspace = true }
 # Crash-reporting correlation env (`crash::correlation_env`) injected into the spawned train worker
 # so a worker crash correlates with the node in one Sentry project. Light dep (no engine libs).
 daemon-telemetry = { workspace = true }
-# The worker protocol (§10.2) lives in `daemon-swarm-run` so lane E's worker implements it too.
-daemon-swarm-run = { workspace = true }
+# The worker protocol (§10.2) lives in `daemon-vhc-session` so lane E's worker implements it too.
+daemon-vhc-session = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

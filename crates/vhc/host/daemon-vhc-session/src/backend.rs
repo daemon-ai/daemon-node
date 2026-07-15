@@ -3,7 +3,7 @@
 
 //! [`TrainerBackend`] — the R↔E seam (spec §5.1/§10.2, ABI §2.3 lifecycle).
 //!
-//! The participant runtime (lane R) drives the round structure; the engine (lane E's `daemon-train`
+//! The participant runtime (lane R) drives the round structure; the engine (lane E's `daemon-vhc-host`
 //! worker) fills in the math. This trait is that boundary, deliberately **engine-agnostic**: every
 //! signature is opaque bytes + plain structs — no `burn`, no `wasmtime`, no tensor types leak
 //! across it, so the same round loop (Wave 2) hosts the [`StubBackend`] here and the real Burn/wasm

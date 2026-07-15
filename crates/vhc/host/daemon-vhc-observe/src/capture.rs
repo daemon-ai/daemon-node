@@ -19,7 +19,7 @@
 
 use std::io::{Read, Write};
 
-use daemon_swarm_coordinator::{CoordinatorState, Input};
+use daemon_vhc_coordinator::{CoordinatorState, Input};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec};
 
 use crate::ObserveError;

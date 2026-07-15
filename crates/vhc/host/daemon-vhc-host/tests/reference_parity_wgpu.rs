@@ -6,14 +6,14 @@
 // straight-burn reference, and tokens/s is measured + reported. All tests here are `#[ignore]`d
 // (a real ~152M fp32 execute pass on the GPU is minutes/GBs — program Risk 3) and use the G2
 // `require_gpu!` skip convention, so the default gate stays green GPU-less and the full gate runs in
-// `nix develop .#vulkan --command cargo test -p daemon-train --features wgpu --test reference_parity_wgpu -- --ignored --nocapture`.
+// `nix develop .#vulkan --command cargo test -p daemon-vhc-host --features wgpu --test reference_parity_wgpu -- --ignored --nocapture`.
 #![cfg(feature = "wgpu")]
 #![allow(clippy::disallowed_methods)]
 
 mod reference;
 mod tolerance;
 
-use daemon_train::{wgpu_adapter_available, BackendKind, Worker};
+use daemon_vhc_host::{wgpu_adapter_available, BackendKind, Worker};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 use reference::{

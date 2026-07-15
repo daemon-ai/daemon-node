@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use common::ws_harness::{no_reconnect, MockWsCoordinator};
 use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
-use daemon_swarm_net::{ControlPlane, DualPlane, LoopbackGossip, WsAuth};
+use daemon_vhc_net::{ControlPlane, DualPlane, LoopbackGossip, WsAuth};
 
 /// Two dual-plane peers share a loopback gossip bus and a mock coordinator. A publish from peer 1
 /// reaches peer 2 over BOTH planes (WS relay + gossip fanout); the merged subscription dedupes them

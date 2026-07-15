@@ -12,11 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 # The participant runtime + the local-coordinator shell + in-process peer harness (`harness`).
-daemon-swarm-run = { workspace = true, features = ["harness"] }
+daemon-vhc-session = { workspace = true, features = ["harness"] }
 # The frozen envelope schema + freeze/verify chain (§6.1).
 daemon-vhc-proto = { workspace = true }
 # The node-side worker supervisor for `--backend worker` (spawn/probe/assess/join over §10.2).
-daemon-train-client = { workspace = true }
+daemon-vhc-supervisor = { workspace = true }
 # The tiny-llama preset config the demo envelope embeds when the authoring TOML leaves
 # `[experiment.config]` empty (so `--backend worker` drives a real, non-trivial training round). The
 # `sim` feature compiles the config/model types natively for this host binary. Path dep already in

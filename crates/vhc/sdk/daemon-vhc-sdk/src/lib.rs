@@ -43,8 +43,8 @@ pub const DA_ABI_VERSION: u32 = (DA_ABI_MAJOR << 16) | DA_ABI_MINOR;
 /// The complete `tabi@1` import vocabulary this SDK binds (the extern block in `abi.rs`), in
 /// registration order: the Merge-1 frozen 50-import subset followed by the Wave-2 additions.
 ///
-/// This is the **frozen surface**: the host `Linker` (`daemon-train`) and the phase-legality table
-/// must agree with it name-for-name (asserted by `daemon-train/tests/abi_surface.rs`). Growth is
+/// This is the **frozen surface**: the host `Linker` (`daemon-vhc-host`) and the phase-legality table
+/// must agree with it name-for-name (asserted by `daemon-vhc-host/tests/abi_surface.rs`). Growth is
 /// additive only (ABI §9) — append here, never reorder or remove.
 pub const TABI_IMPORTS: &[&str] = &[
     // --- Merge-1 frozen subset (50) ---

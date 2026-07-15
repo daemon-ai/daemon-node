@@ -9,13 +9,13 @@
 //! `#![allow(clippy::disallowed_methods)]`). It pulls a dataset text + a tokenizer (both by pinned
 //! revision, or from local paths for hermetic/offline runs), tokenizes with the `tokenizers` crate,
 //! and writes fixed-width `u16`/`u32` LE shards + a `manifest.json` carrying the additive tokenizer/
-//! dataset provenance (`daemon_swarm_run::data::Manifest`). The shards are the exact format the
+//! dataset provenance (`daemon_vhc_session::data::Manifest`). The shards are the exact format the
 //! participant runtime reads (`data.rs`), so a vendored fixture needs no egress in CI (RUN-3).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use daemon_swarm_run::data::{Manifest, ShardDesc, TokenWidth};
+use daemon_vhc_session::data::{Manifest, ShardDesc, TokenWidth};
 
 /// Arguments for `tokenize-corpus` (the frozen CLI seam — see `swarm-ledger-m1.md`).
 pub struct Args {

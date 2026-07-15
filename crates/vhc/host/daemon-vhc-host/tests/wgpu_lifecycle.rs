@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 
-use daemon_train::autotune::{probe_wgpu, Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
-use daemon_train::{wgpu_adapter_available, BackendKind, EngineConfig, TrapCode, Worker};
+use daemon_vhc_host::autotune::{probe_wgpu, Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
+use daemon_vhc_host::{wgpu_adapter_available, BackendKind, EngineConfig, TrapCode, Worker};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 use serde::Serialize;
 
@@ -243,7 +243,7 @@ fn ingest_budget_scales_with_count() {
     let n = usize::try_from((op_build.max(op_make) / slope) + 4).unwrap();
     let cost = |count: u64| base + (count - 1) * slope;
 
-    let run = |op_budget: u64| -> Result<(), daemon_train::TrainError> {
+    let run = |op_budget: u64| -> Result<(), daemon_vhc_host::TrainError> {
         let worker = Worker::new(EngineConfig {
             backend: BackendKind::Wgpu,
             op_budget,
@@ -295,7 +295,7 @@ fn sysfs_mem_mb(file: &str) -> u64 {
             continue;
         }
         if let Ok(s) = std::fs::read_to_string(entry.path().join("device").join(file)) {
-            if let Some(mb) = daemon_train::autotune::parse_amdgpu_mem_mb(&s) {
+            if let Some(mb) = daemon_vhc_host::autotune::parse_amdgpu_mem_mb(&s) {
                 if mb > 0 {
                     return mb;
                 }

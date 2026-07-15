@@ -1,5 +1,5 @@
 [package]
-name = "daemon-swarm-coordinator"
+name = "daemon-vhc-coordinator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-swarm-observe` behavior tests (spec §6.4/§14; TDD §3.9 + PROTO-20):
+//! `daemon-vhc-observe` behavior tests (spec §6.4/§14; TDD §3.9 + PROTO-20):
 //! `log_roundtrip_canonical`, `replay_matches_live_run`, `replay_detects_tampered_record`,
 //! `digest_quorum_flags_outlier`, plus run-health projection.
 
@@ -21,12 +21,10 @@ use daemon_vhc_proto::{
     SWARM_PROTO_VERSION,
 };
 
-use daemon_swarm_coordinator::{
-    tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
-};
+use daemon_vhc_coordinator::{tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig};
 
-use daemon_swarm_observe::desync::digest_tally_from_log;
-use daemon_swarm_observe::{
+use daemon_vhc_observe::desync::digest_tally_from_log;
+use daemon_vhc_observe::{
     digest_tally, genesis_seed, replay, replay_capture, replay_from_state, MessageKind, MessageLog,
     ReplayError, RunCapture, RunHealth,
 };

@@ -4,7 +4,7 @@
 //! The replay oracle — PROTO-20 as a library (spec §6.4 I1, §9, §11.2).
 //!
 //! Given the run envelope + the recorded `tick` input trace, re-run
-//! [`daemon_swarm_coordinator::tick`] from genesis and verify that every recorded
+//! [`daemon_vhc_coordinator::tick`] from genesis and verify that every recorded
 //! [`RoundRecord`] matches what the pure coordinator function re-derives — the "anyone can re-derive
 //! the coordinator" property, and the substrate under resync (§9). The oracle consumes only signed
 //! messages + published records: the coordinator's own published `RoundRecord`s carried in the input
@@ -18,9 +18,7 @@ use daemon_vhc_proto::envelope::Envelope;
 use daemon_vhc_proto::messages::{RoundRecord, SwarmMessage};
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, Seed};
 
-use daemon_swarm_coordinator::{
-    tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
-};
+use daemon_vhc_coordinator::{tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig};
 
 use crate::capture::RunCapture;
 use crate::log::{MessageKind, MessageLog};

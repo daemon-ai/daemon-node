@@ -22,8 +22,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
-use daemon_swarm_net::{HttpPresignClient, PresignClient, PresignOp, PresignRequest, RunId};
-use daemon_swarm_run::data::Manifest;
+use daemon_vhc_net::{HttpPresignClient, PresignClient, PresignOp, PresignRequest, RunId};
+use daemon_vhc_session::data::Manifest;
 
 /// The presign coordinator target + auth (mirrors the worker's `JoinCredentials` auth choices).
 pub struct Target {

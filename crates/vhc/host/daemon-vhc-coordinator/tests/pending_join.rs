@@ -20,7 +20,7 @@ mod common;
 use common::*;
 use daemon_vhc_proto::peer_id;
 
-use daemon_swarm_coordinator::{tick, Input, Phase};
+use daemon_vhc_coordinator::{tick, Input, Phase};
 
 fn keys(n: u8) -> Vec<daemon_vhc_proto::SigningKey> {
     (1..=n).map(key).collect()
@@ -28,12 +28,12 @@ fn keys(n: u8) -> Vec<daemon_vhc_proto::SigningKey> {
 
 /// Drive one full round to completion via the commit + storage-receipt fast path (no timeouts).
 fn complete_round(
-    mut state: daemon_swarm_coordinator::CoordinatorState,
+    mut state: daemon_vhc_coordinator::CoordinatorState,
     ks: &[daemon_vhc_proto::SigningKey],
     coord: &daemon_vhc_proto::SigningKey,
     round: u64,
     seed: u8,
-) -> daemon_swarm_coordinator::CoordinatorState {
+) -> daemon_vhc_coordinator::CoordinatorState {
     for k in ks {
         let (s, _) = tick(state, Input::Message(commitment_msg(k, round, seed)));
         state = s;
@@ -87,7 +87,7 @@ fn join_after_warmup_transition_is_staged_pending() {
     assert!(
         out.iter().any(|o| matches!(
             o,
-            daemon_swarm_coordinator::Output::Note(daemon_swarm_coordinator::Notice::Admitted(_))
+            daemon_vhc_coordinator::Output::Note(daemon_vhc_coordinator::Notice::Admitted(_))
         )),
         "a mid-run join that passes admission is Admitted (as pending)"
     );

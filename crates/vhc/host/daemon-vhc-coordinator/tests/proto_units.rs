@@ -12,7 +12,7 @@
 mod common;
 
 use common::*;
-use daemon_swarm_coordinator::{tick, ClientState, CoordinatorState, Input, Notice, Output, Phase};
+use daemon_vhc_coordinator::{tick, ClientState, CoordinatorState, Input, Notice, Output, Phase};
 use daemon_vhc_proto::assignment::elect_checkpointer;
 use daemon_vhc_proto::{peer_id, PeerId, Seed};
 

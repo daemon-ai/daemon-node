@@ -3,11 +3,11 @@
 
 //! `swarm-replay` — the recorded-run verification entry point (spec §6.4 I1, §14; TDD PROTO-20; B2).
 //!
-//! Reads the two `daemon-swarm-observe` artifacts a `swarm-local --observe <dir>` (or a live gate
+//! Reads the two `daemon-vhc-observe` artifacts a `swarm-local --observe <dir>` (or a live gate
 //! run) wrote: `<run>.dsmlog` (the node-visible signed
-//! [`MessageLog`](daemon_swarm_observe::MessageLog)) and `<run>.dsmcap` (the coordinator's
-//! reproducible `tick` [`RunCapture`](daemon_swarm_observe::RunCapture)). It re-runs the **pure**
-//! `daemon-swarm-coordinator` `tick` from the captured genesis and asserts every wire-recorded
+//! [`MessageLog`](daemon_vhc_observe::MessageLog)) and `<run>.dsmcap` (the coordinator's
+//! reproducible `tick` [`RunCapture`](daemon_vhc_observe::RunCapture)). It re-runs the **pure**
+//! `daemon-vhc-coordinator` `tick` from the captured genesis and asserts every wire-recorded
 //! `RoundRecord` re-derives byte-identically (the run's per-round consensus / digest is
 //! reproducible), prints the per-round health projection, and exits non-zero on any divergence —
 //! the gate-ceremony "anyone can re-derive the coordinator" check.
@@ -16,7 +16,7 @@
 
 use std::process::ExitCode;
 
-use daemon_swarm_run::harness::verify_observe_dir;
+use daemon_vhc_session::harness::verify_observe_dir;
 
 fn main() -> ExitCode {
     let Some(dir) = std::env::args().nth(1) else {

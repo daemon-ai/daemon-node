@@ -10,7 +10,7 @@ use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_vhc_proto::messages::SwarmMessage;
 use daemon_vhc_proto::{peer_id, to_canonical_vec, PeerId, SwarmProtoVersion};
 
-use daemon_swarm_coordinator::{
+use daemon_vhc_coordinator::{
     tick, ClientState, ControlAction, CoordinatorState, Input, Notice, Output, Phase,
 };
 
@@ -220,7 +220,7 @@ fn proto14_halted_states_error() {
         let (_, out) = tick(state.clone(), Input::Clock(5));
         assert_eq!(
             out,
-            vec![Output::Reject(daemon_swarm_coordinator::Rejection::Halted(
+            vec![Output::Reject(daemon_vhc_coordinator::Rejection::Halted(
                 halted
             ))],
             "clock in {halted:?} must error"
@@ -228,9 +228,7 @@ fn proto14_halted_states_error() {
         let (_, out) = tick(state, Input::Message(heartbeat_msg(&key(1), 0)));
         assert!(matches!(
             out.as_slice(),
-            [Output::Reject(daemon_swarm_coordinator::Rejection::Halted(
-                _
-            ))]
+            [Output::Reject(daemon_vhc_coordinator::Rejection::Halted(_))]
         ));
     }
 }
@@ -248,7 +246,7 @@ fn proto14_pause_requires_authorized_principal() {
     assert_eq!(
         out,
         vec![Output::Reject(
-            daemon_swarm_coordinator::Rejection::Unauthorized
+            daemon_vhc_coordinator::Rejection::Unauthorized
         )]
     );
     assert_ne!(state.phase, Phase::Paused);
@@ -261,7 +259,7 @@ fn proto14_pause_requires_authorized_principal() {
     let (state, out) = tick(state, Input::Message(heartbeat_msg(&ks[0], 0)));
     assert!(matches!(
         out.as_slice(),
-        [Output::Reject(daemon_swarm_coordinator::Rejection::Halted(
+        [Output::Reject(daemon_vhc_coordinator::Rejection::Halted(
             Phase::Paused
         ))]
     ));
@@ -274,7 +272,7 @@ fn proto14_pause_requires_authorized_principal() {
     assert_eq!(
         out,
         vec![Output::Reject(
-            daemon_swarm_coordinator::Rejection::Unauthorized
+            daemon_vhc_coordinator::Rejection::Unauthorized
         )]
     );
     let (state, _) = tick(
@@ -396,7 +394,7 @@ fn message_with_wrong_version_rejected() {
     assert!(matches!(
         out.as_slice(),
         [Output::Reject(
-            daemon_swarm_coordinator::Rejection::VersionMismatch { .. }
+            daemon_vhc_coordinator::Rejection::VersionMismatch { .. }
         )]
     ));
 }

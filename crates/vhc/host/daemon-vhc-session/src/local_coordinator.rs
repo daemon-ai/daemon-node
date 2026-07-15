@@ -4,8 +4,8 @@
 //! [`LocalCoordinator`] — the runnable local-mode coordinator shell (spec §6.2, §10.4, §11.2).
 //!
 //! Wave 3 graduates the Merge-2 test-only `TickCoordinator` fixture into this public library module:
-//! the **impure shell** around lane P2's pure [`tick`](daemon_swarm_coordinator::tick). The pure
-//! state machine stays in `daemon-swarm-coordinator`; this shell owns the impure edges the pure
+//! the **impure shell** around lane P2's pure [`tick`](daemon_vhc_coordinator::tick). The pure
+//! state machine stays in `daemon-vhc-coordinator`; this shell owns the impure edges the pure
 //! function refuses to touch —
 //!
 //! - **clock**: it feeds `Input::Clock` to drive the timeout-based phase transitions (warmup, the
@@ -42,8 +42,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon_swarm_coordinator::{tick, CoordinatorState, Input, Notice, Output, Phase};
-use daemon_swarm_net::{ControlPlane, FsPayloadStore, PayloadStore};
+use daemon_vhc_coordinator::{tick, CoordinatorState, Input, Notice, Output, Phase};
+use daemon_vhc_net::{ControlPlane, FsPayloadStore, PayloadStore};
 use daemon_vhc_proto::messages::{
     Commitment, Join, RecordEntry, StorageReceipt, Straggle, StraggleStatus, ThroughputClass,
 };
@@ -96,7 +96,7 @@ impl CoordinatorReplay {
     }
 
     /// The exact ordered `tick` inputs (driving messages + clocks) the coordinator fed — the
-    /// reproducible driver trace `daemon-swarm-observe`'s `RunCapture` records for offline replay.
+    /// reproducible driver trace `daemon-vhc-observe`'s `RunCapture` records for offline replay.
     #[must_use]
     pub fn inputs(&self) -> &[Input] {
         &self.inputs

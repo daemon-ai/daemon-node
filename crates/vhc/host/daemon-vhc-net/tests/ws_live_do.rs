@@ -14,14 +14,14 @@
 //! It SKIPS cleanly (like C1's `r2-smoke`) unless `SWARM_LIVE_WS_URL` is set, so it never runs in the
 //! offline workspace gate. Drive it after seeding a run against wrangler-dev (port 8795):
 //!   SWARM_LIVE_WS_URL=http://127.0.0.1:8795/api/v1/swarm SWARM_LIVE_RUN_ID=run-live \
-//!     cargo test -p daemon-swarm-net --features ws --test ws_live_do -- --nocapture
+//!     cargo test -p daemon-vhc-net --features ws --test ws_live_do -- --nocapture
 
 mod common;
 
 use std::time::{Duration, Instant};
 
 use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
-use daemon_swarm_net::{ControlPlane, ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
+use daemon_vhc_net::{ControlPlane, ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
 use daemon_vhc_proto::messages::{Commitment, Heartbeat, Join, Locator, ThroughputClass};
 use daemon_vhc_proto::{
     from_canonical_slice, to_canonical_vec, CapabilitySet, Hash, IrohId, SignedMessage,
@@ -127,7 +127,7 @@ async fn live_ws_framing_relay_and_resubscribe_against_wrangler_dev() {
 /// RoundEngine-adjacent progression smoke: a run-bound `Join` + a readiness `Heartbeat` published
 /// over the WS plane drive the real wasm-tick DO through admission → warmup → a signed `RoundOpen`
 /// coordinator emission that reaches the joining peer. Proves the DO's decision core (the compiled
-/// `daemon_swarm_coordinator::tick`) advances the run in response to A1-client frames — the
+/// `daemon_vhc_coordinator::tick`) advances the run in response to A1-client frames — the
 /// coordinator half of the RoundEngine-over-WsControlPlane loop (the full stub-backend round loop is
 /// the Merge-2 node↔cloud↔worker item, gated by A3 worker attach).
 #[tokio::test(flavor = "multi_thread")]

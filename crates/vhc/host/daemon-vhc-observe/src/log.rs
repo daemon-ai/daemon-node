@@ -12,7 +12,7 @@
 
 use std::io::{Read, Write};
 
-use daemon_swarm_coordinator::Input;
+use daemon_vhc_coordinator::Input;
 use daemon_vhc_proto::messages::{SignedMessage, SwarmMessage};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec};
 

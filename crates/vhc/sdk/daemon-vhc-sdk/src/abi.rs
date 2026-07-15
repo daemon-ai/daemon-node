@@ -10,7 +10,7 @@
 //! - `sim`: forward to the in-crate CPU store ([`crate::sim`]).
 //!
 //! The subset wired here is Merge-1's frozen `tabi@1` vocabulary (see `swarm-ledger-e1.md`); it maps
-//! name-for-name onto the host Linker in `daemon-train`. Growth is additive (ABI §9).
+//! name-for-name onto the host Linker in `daemon-vhc-host`. Growth is additive (ABI §9).
 
 /// An opaque `tabi@1` handle (nonzero when valid; `0` is never a live handle, ABI §3.3).
 pub(crate) type RawHandle = u64;

@@ -3,7 +3,7 @@
 
 //! [`SwarmApi`] on [`NodeApiImpl`] — a thin forwarding seam onto the optional node swarm service
 //! (spec §10.4). The real request→supervisor-command + store-read mapping lives in the
-//! `daemon-swarm-node` service (bound via [`NodeApiImpl::with_swarm`] only when `[swarm] enabled`);
+//! `daemon-vhc-node` service (bound via [`NodeApiImpl::with_swarm`] only when `[swarm] enabled`);
 //! absent it, every op resolves to [`ApiError::Unsupported`] / an empty stream, so a node built
 //! without swarm training (the default) never spawns a training worker.
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-train` — the training worker library + host runtime.
+//! `daemon-vhc-host` — the training worker library + host runtime.
 //!
 //! The worker binary's engine: the tensor ABI + module sandbox (meta / trace / execute, tensor-ABI
 //! spec §5.1), the lifecycle driver, param / persistent storage, the deterministic ops + kernels,

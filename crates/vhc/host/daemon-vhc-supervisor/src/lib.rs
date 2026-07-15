@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-train-client` — the node-side training-worker supervisor.
+//! `daemon-vhc-supervisor` — the node-side training-worker supervisor.
 //!
-//! [`TrainSupervisor`] is to the `daemon-train` worker what `LocalProvider` is to the inference
+//! [`TrainSupervisor`] is to the `daemon-vhc-host` worker what `LocalProvider` is to the inference
 //! worker and `MettaCoprocessor` is to the MeTTa worker: it lazily spawns the child over a
 //! length-framed [`CutChannel`], speaks the worker protocol
-//! ([`daemon_swarm_run::protocol`], swarm-training-spec.md §10.2), respawns with backoff after a
+//! ([`daemon_vhc_session::protocol`], swarm-training-spec.md §10.2), respawns with backoff after a
 //! crash / transport fault, and trips a crash-loop "meltdown" to [`TrainClientError::Fatal`] when
 //! restarts exceed a budget within a sliding window (§13).
 //!
@@ -26,7 +26,7 @@ use daemon_common::SessionId;
 use daemon_provision::{
     ChildGuard, CutWriter, Placement, PlacementSpec, ProcessProvisioner, Provisioner,
 };
-use daemon_swarm_run::protocol::{
+use daemon_vhc_session::protocol::{
     self, Command, Eligibility, ErrorClass, Event, Hardware, JoinPolicy, LeaveMode,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -42,7 +42,7 @@ type PumpSink = Arc<StdMutex<Option<UnboundedSender<Event>>>>;
 /// Construction + tuning for a [`TrainSupervisor`]'s worker (mirrors `WorkerConfig` / `MettaConfig`).
 #[derive(Clone, Debug)]
 pub struct TrainClientConfig {
-    /// Path to the `daemon-train` worker binary.
+    /// Path to the `daemon-vhc-host` worker binary.
     pub worker_bin: PathBuf,
     /// Arguments passed to the worker (e.g. `--backend cpu`).
     pub args: Vec<String>,
@@ -118,7 +118,7 @@ impl TrainClientError {
     }
 }
 
-/// A supervised client over a single `daemon-train` worker process.
+/// A supervised client over a single `daemon-vhc-host` worker process.
 pub struct TrainSupervisor {
     inner: Arc<Inner>,
 }
@@ -324,7 +324,7 @@ impl Inner {
             restarts.retain(|t| now.duration_since(*t) < self.cfg.restart_window);
             if restarts.len() as u32 >= self.cfg.max_restarts {
                 return Err(TrainClientError::Fatal(format!(
-                    "daemon-train worker crash-loop: {} restarts within {:?}",
+                    "daemon-vhc-host worker crash-loop: {} restarts within {:?}",
                     restarts.len(),
                     self.cfg.restart_window
                 )));
@@ -354,7 +354,7 @@ struct Worker {
 impl Worker {
     /// Spawn the worker and block until it reports `Ready` (or fails / times out).
     async fn spawn(cfg: &TrainClientConfig, pump: PumpSink) -> Result<Worker, TrainClientError> {
-        let session = SessionId::new("daemon-train-worker");
+        let session = SessionId::new("daemon-vhc-worker");
         // Crash-reporting correlation: forward the node's DSN + current consent and tag the child
         // with this placement's session id + our pid, so a train-worker crash correlates with the
         // node in one Sentry project. A no-op env-wise when no DSN is set.
@@ -368,7 +368,9 @@ impl Worker {
         let Placement { channel, child } = ProcessProvisioner::new()
             .place(&session, spec)
             .await
-            .map_err(|e| TrainClientError::Transient(format!("spawn daemon-train worker: {e}")))?;
+            .map_err(|e| {
+                TrainClientError::Transient(format!("spawn daemon-vhc-host worker: {e}"))
+            })?;
 
         let (writer, mut framed_reader) = channel.split();
         let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
@@ -396,7 +398,9 @@ impl Worker {
                             break;
                         }
                     }
-                    Err(e) => tracing::warn!(error = %e, "daemon-train: undecodable event frame"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "daemon-vhc-host: undecodable event frame")
+                    }
                 }
             }
         });
@@ -490,7 +494,7 @@ mod tests {
 
     #[test]
     fn config_has_defaults() {
-        let cfg = TrainClientConfig::new("/usr/bin/daemon-train");
+        let cfg = TrainClientConfig::new("/usr/bin/daemon-vhc");
         assert_eq!(cfg.max_restarts, 3);
         assert_eq!(cfg.spawn_timeout, Duration::from_secs(30));
     }
@@ -499,7 +503,7 @@ mod tests {
     /// meltdown to `Fatal` after `max_restarts` attempts within the window (CLI-3).
     #[tokio::test]
     async fn supervisor_meltdown() {
-        let mut cfg = TrainClientConfig::new("/nonexistent/daemon-train-worker-binary");
+        let mut cfg = TrainClientConfig::new("/nonexistent/daemon-vhc-worker-binary");
         cfg.max_restarts = 2;
         cfg.restart_window = Duration::from_secs(60);
         cfg.respawn_backoff = Duration::from_millis(1);

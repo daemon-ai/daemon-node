@@ -10,7 +10,7 @@ useDefault = true
 [allowlist]
 description = "Swarm training test fixtures + pinned public HF commit SHAs (not secrets)"
 paths = [
-  '''crates/swarm/daemon-swarm-run/tests/fixtures/.*''',
+  '''crates/swarm/daemon-vhc-session/tests/fixtures/.*''',
 ]
 # Pinned public Hugging Face commit SHAs (40-hex) referenced across the swarm docs/specs + ledgers.
 regexes = [

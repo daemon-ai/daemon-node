@@ -10,7 +10,7 @@
 //     identical preset code path in seconds;
 //   * an #[ignore]d FULL 160M variant (12 layers, vocab 50257, seq 1024) — a real execute-mode pass
 //     over ~152M params costs GBs + minutes on the CPU backend (spec §5.1 / Risk 3), so it is
-//     opt-in (`cargo test -p daemon-train --test preset_160m -- --ignored`).
+//     opt-in (`cargo test -p daemon-vhc-host --test preset_160m -- --ignored`).
 //
 // Dev/test harness (shells `cargo build` for the guests + reads the `.wasm`, like `xtask
 // build-guests`); the fs/process hardening bans target the shipped node, not tests.
@@ -21,7 +21,7 @@ use std::process::Command;
 use std::sync::Once;
 use std::time::Duration;
 
-use daemon_train::{EngineConfig, Worker};
+use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 /// Sandbox budgets scaled for the 160M-shaped preset. The default `EngineConfig` is tuned for the

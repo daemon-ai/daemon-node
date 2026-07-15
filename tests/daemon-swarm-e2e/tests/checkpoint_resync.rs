@@ -34,16 +34,16 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
-use daemon_swarm_run::protocol::{
-    EngineParams, Event, JoinCredentials, JoinPolicy, LeaveMode, PolicyMode, WsAuthSpec,
-};
-use daemon_train_client::{TrainClientConfig, TrainSupervisor};
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{peer_id, to_canonical_vec, SigningKey};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::protocol::{
+    EngineParams, Event, JoinCredentials, JoinPolicy, LeaveMode, PolicyMode, WsAuthSpec,
+};
+use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
 const NUM_WORKERS: usize = 3;
 const ROUNDS: u64 = 8;
@@ -98,20 +98,20 @@ fn ensure_built() -> PathBuf {
             .args([
                 "build",
                 "-p",
-                "daemon-train",
+                "daemon-vhc-host",
                 "--features",
                 "swarm-net",
                 "--bin",
-                "daemon-train-worker",
+                "daemon-vhc-worker",
             ])
             .status()
             .expect("run cargo for the live worker binary");
-        assert!(status.success(), "building daemon-train-worker failed");
+        assert!(status.success(), "building daemon-vhc-worker failed");
     });
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("target"));
-    let bin = target.join("debug/daemon-train-worker");
+    let bin = target.join("debug/daemon-vhc-worker");
     assert!(bin.exists(), "worker binary at {}", bin.display());
     bin
 }

@@ -17,7 +17,7 @@
 //! ineligible if even a single sequence does not fit). [`probe_microbatch`] is the *runtime* form
 //! for the same halving ladder driven by a real trial: on a GPU OOM the worker halves the
 //! micro-batch and re-probes (the §10.5 recovery rung, mapped into the trap taxonomy as
-//! [`crate::TrapCode::BudgetMemory`] / `daemon_swarm_run::protocol::ErrorClass::OutOfMemory` — see
+//! [`crate::TrapCode::BudgetMemory`] / `daemon_vhc_session::protocol::ErrorClass::OutOfMemory` — see
 //! [`oom_error_class`]).
 //!
 //! ## What wgpu exposes for VRAM probing (honest inventory)
@@ -104,7 +104,7 @@ pub struct Autotune {
 
 /// The autotune verdict: eligibility + the chosen micro-batch + footprint estimates. This is the
 /// authoritative G2 verdict type (M1's 160M preset and B3's worker consume it); the frozen
-/// `daemon_swarm_run::backend::Assessment` / `protocol::Eligibility` shapes carry a projection of it
+/// `daemon_vhc_session::backend::Assessment` / `protocol::Eligibility` shapes carry a projection of it
 /// (the micro-batch rides in `reasons` / `headroom`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AutotuneVerdict {
@@ -378,10 +378,10 @@ pub fn probe_microbatch(
 /// [`crate::TrapCode::BudgetMemory`]; a wgpu allocation panic surfaces at the worker as an
 /// [`ErrorClass::OutOfMemory`]).
 ///
-/// [`ErrorClass::OutOfMemory`]: daemon_swarm_run::protocol::ErrorClass::OutOfMemory
+/// [`ErrorClass::OutOfMemory`]: daemon_vhc_session::protocol::ErrorClass::OutOfMemory
 #[must_use]
-pub fn oom_error_class() -> daemon_swarm_run::protocol::ErrorClass {
-    daemon_swarm_run::protocol::ErrorClass::OutOfMemory
+pub fn oom_error_class() -> daemon_vhc_session::protocol::ErrorClass {
+    daemon_vhc_session::protocol::ErrorClass::OutOfMemory
 }
 
 /// Parse an amdgpu sysfs memory-total file (`mem_info_vram_total` / `mem_info_gtt_total`) into MiB.
@@ -918,7 +918,7 @@ pub fn probe_windows_device_limits() -> Option<DeviceLimits> {
     {
         win_ffi::probe().map(|(limits, raw)| {
             eprintln!(
-                "daemon-train probe (windows/DXGI): {raw:?} dedicated_system_mb={} \
+                "daemon-vhc-host probe (windows/DXGI): {raw:?} dedicated_system_mb={} \
                  budget_local_mb={} budget_non_local_mb={} -> {limits:?}",
                 raw.dedicated_system / MIB,
                 raw.budget_local / MIB,
@@ -1017,7 +1017,7 @@ mod mac_ffi {
                 has_unified,
             };
             let limits = macos_device_limits(&metal);
-            eprintln!("daemon-train probe (macos/Metal): {metal:?} -> {limits:?}");
+            eprintln!("daemon-vhc-host probe (macos/Metal): {metal:?} -> {limits:?}");
             Some(limits)
         }
     }
@@ -1203,7 +1203,7 @@ mod tests {
     fn oom_error_class_is_out_of_memory() {
         assert_eq!(
             oom_error_class(),
-            daemon_swarm_run::protocol::ErrorClass::OutOfMemory
+            daemon_vhc_session::protocol::ErrorClass::OutOfMemory
         );
     }
 

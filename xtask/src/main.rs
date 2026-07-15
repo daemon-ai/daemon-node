@@ -25,7 +25,7 @@ mod publish;
 mod tokenize;
 
 use clap::{Parser, Subcommand};
-use daemon_swarm_run::data::TokenWidth;
+use daemon_vhc_session::data::TokenWidth;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -303,20 +303,20 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-proto"],
         ),
         (
-            "daemon-swarm-run (harness + assess + replay, loopback)",
-            &["-p", "daemon-swarm-run"],
+            "daemon-vhc-session (harness + assess + replay, loopback)",
+            &["-p", "daemon-vhc-session"],
         ),
         (
-            "daemon-swarm-observe (MessageLog + replay oracle + desync tally)",
-            &["-p", "daemon-swarm-observe"],
+            "daemon-vhc-observe (MessageLog + replay oracle + desync tally)",
+            &["-p", "daemon-vhc-observe"],
         ),
         (
-            "daemon-swarm-net (framing + dedupe codecs, no network)",
-            &["-p", "daemon-swarm-net"],
+            "daemon-vhc-net (framing + dedupe codecs, no network)",
+            &["-p", "daemon-vhc-net"],
         ),
         (
-            "daemon-train (det lane + cross-backend digests + wasm-guest determinism)",
-            &["-p", "daemon-train", "--features", "burn-ndarray"],
+            "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
+            &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),
         (
             "daemon-vhc-sdk (SDK profile goldens: sparse_loco/diloco)",

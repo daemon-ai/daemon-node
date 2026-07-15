@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // The flagship MVP scenario, compressed for CI: 3 in-process `WasmBackend` peers (real host training
-// over the tiny-llama `.wasm`) driven by the **real** `daemon_swarm_coordinator::tick` loop, one run
+// over the tiny-llama `.wasm`) driven by the **real** `daemon_vhc_coordinator::tick` loop, one run
 // per comm profile (sparse_loco / diloco / demo). Each round every peer trains H inner steps on its
 // own data slice, seals a payload, and ingests the record-ordered committed set; the coordinator
 // admits the roster, opens rounds, and finalizes each from the peers' signed commitments +
@@ -13,12 +13,12 @@
 //     applies the canonical aggregate);
 //   * the digest transcript **evolves** (the swarm is learning, not frozen) and the tiny-llama
 //     **loss decreases** over the run (the host reverse-mode autodiff, HOST-9, actually learns);
-//   * the coordinator produced one `RoundRecord` per round and `daemon_swarm_observe::replay`
+//   * the coordinator produced one `RoundRecord` per round and `daemon_vhc_observe::replay`
 //     re-derives them byte-for-byte from the recorded `tick` input trace (PROTO-20) — the replay
 //     oracle, now over a **wasm-backed** run.
 //
-// The `daemon-train-worker` **binary** path is exercised separately (real spawn + envelope seam) in
-// `daemon-train/tests/worker_protocol.rs`; here the peers run the WasmBackend in-process so the
+// The `daemon-vhc-worker` **binary** path is exercised separately (real spawn + envelope seam) in
+// `daemon-vhc-host/tests/worker_protocol.rs`; here the peers run the WasmBackend in-process so the
 // per-profile matrix stays CI-light (no subprocess per peer).
 //
 // The guest `.wasm` is located via `SWARM_TEST_GUEST_DIR` else built on demand; this is a dev/test
@@ -32,14 +32,9 @@ use std::sync::Once;
 use blake3::hash as blake3_hash_raw;
 use ciborium::into_writer;
 
-use daemon_swarm_coordinator::{
-    tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
-};
-use daemon_swarm_observe::{genesis_seed, replay};
-use daemon_swarm_run::backend::{
-    BatchRef, StagedPayload, StateDigest as RunDigest, StepCtx, TrainerBackend,
-};
-use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig};
+use daemon_vhc_coordinator::{tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig};
+use daemon_vhc_host::{EngineConfig, WasmBackend, WasmBackendConfig};
+use daemon_vhc_observe::{genesis_seed, replay};
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
@@ -52,8 +47,11 @@ use daemon_vhc_proto::{
     SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::backend::{
+    BatchRef, StagedPayload, StateDigest as RunDigest, StepCtx, TrainerBackend,
+};
 
-// -- guest module loading (mirrors daemon-train/tests) ------------------------------------------
+// -- guest module loading (mirrors daemon-vhc-host/tests) ------------------------------------------
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

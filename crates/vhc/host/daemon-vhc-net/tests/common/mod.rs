@@ -5,8 +5,8 @@
 //!
 //! The parametric conformance suite ([`conformance_fanout`] / [`conformance_dedupe`]) runs over any
 //! [`Mesh`] — a set of N connected control planes each with one subscriber — so the *same* behavior
-//! tests exercise both [`LoopbackGossip`](daemon_swarm_net::LoopbackGossip) (a shared in-process bus)
-//! and [`IrohGossip`](daemon_swarm_net::IrohGossip) (N real iroh endpoints on loopback). The signed-
+//! tests exercise both [`LoopbackGossip`](daemon_vhc_net::LoopbackGossip) (a shared in-process bus)
+//! and [`IrohGossip`](daemon_vhc_net::IrohGossip) (N real iroh endpoints on loopback). The signed-
 //! message helpers build canonical-CBOR `daemon_vhc_proto::SignedMessage` bytes — the opaque
 //! already-signed payloads the plane carries (NET-6).
 
@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon_swarm_net::{ControlPlane, ControlSubscription};
+use daemon_vhc_net::{ControlPlane, ControlSubscription};
 use daemon_vhc_proto::messages::Heartbeat;
 use daemon_vhc_proto::{
     from_canonical_slice, to_canonical_vec, SignedMessage, SigningKey, SwarmMessage,
@@ -117,7 +117,7 @@ pub mod iroh_harness {
     use super::*;
     use std::net::SocketAddr;
 
-    use daemon_swarm_net::{IrohGossip, IrohGossipConfig, IrohPeer, RebroadcastConfig};
+    use daemon_vhc_net::{IrohGossip, IrohGossipConfig, IrohPeer, RebroadcastConfig};
 
     /// A fresh loopback bind address (OS-assigned port).
     pub fn loopback() -> SocketAddr {
@@ -240,7 +240,7 @@ pub mod ws_harness {
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     use tokio_tungstenite::tungstenite::Message;
 
-    use daemon_swarm_net::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
+    use daemon_vhc_net::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
 
     struct Inner {
         peers: Mutex<HashMap<u64, UnboundedSender<Message>>>,

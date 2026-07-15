@@ -4,12 +4,12 @@
 //! `swarm-local` — the local-mode swarm runner (spec §10.1; B3).
 //!
 //! Drives an in-process N-peer swarm through the full round protocol against the real
-//! `daemon-swarm-coordinator` `tick` loop, over a **selectable transport** — the in-process
+//! `daemon-vhc-coordinator` `tick` loop, over a **selectable transport** — the in-process
 //! `LoopbackGossip` (`--transport loopback`, the default) or a **real per-node `IrohGossip` mesh**
 //! (`--transport iroh`) — with a filesystem payload store (`--store fs`). It prints the agreed
 //! per-round digest transcript so a human can eyeball a run or wire it into `just swarm-dev`
 //! (W1's proposed recipe). The deterministic `StubBackend` is used so a run is reproducible without
-//! a GPU / guest build; the worker-backed backend rides the `daemon-train-worker` binary path.
+//! a GPU / guest build; the worker-backed backend rides the `daemon-vhc-worker` binary path.
 //!
 //! Usage:
 //! ```text
@@ -17,7 +17,7 @@
 //!             [--observe <dir>]
 //! ```
 //!
-//! `--observe <dir>` writes the `daemon-swarm-observe` artifacts (`<run>.dsmlog` message log +
+//! `--observe <dir>` writes the `daemon-vhc-observe` artifacts (`<run>.dsmlog` message log +
 //! `<run>.dsmcap` replay capture) so `swarm-replay <dir>` can later re-derive + verify the run's
 //! per-round consensus offline (the gate-ceremony instrumentation).
 //!
@@ -26,8 +26,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use daemon_swarm_run::harness::{run_swarm, SwarmConfig};
-use daemon_swarm_run::live_harness::{run_live_swarm, LiveSwarmConfig};
+use daemon_vhc_session::harness::{run_swarm, SwarmConfig};
+use daemon_vhc_session::live_harness::{run_live_swarm, LiveSwarmConfig};
 
 /// Parsed CLI options.
 struct Opts {

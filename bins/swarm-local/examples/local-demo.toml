@@ -5,7 +5,7 @@
 # The runner reads this TOML, builds the resolved proto `Envelope`, freezes + verifies it (the real
 # §6.1 freeze/verify chain), and stands up `--peers` in-process peers + the local coordinator. The
 # default `--backend stub` ignores the experiment config; `--backend worker` spawns the real
-# `daemon-train-worker`, which builds the tiny-llama module from `[experiment.config]`.
+# `daemon-vhc-worker`, which builds the tiny-llama module from `[experiment.config]`.
 
 [run]
 run_id = "local-demo"

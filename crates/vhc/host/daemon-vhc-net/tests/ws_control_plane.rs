@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use common::ws_harness::{fast_reconnect, no_reconnect, MockWsCoordinator};
 use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
-use daemon_swarm_net::{ControlPlane, WsAuth};
+use daemon_vhc_net::{ControlPlane, WsAuth};
 use daemon_vhc_proto::messages::{Commitment, Locator};
 use daemon_vhc_proto::{
     from_canonical_slice, to_canonical_vec, Hash, SignedMessage, SwarmMessage, SWARM_PROTO_VERSION,
@@ -43,7 +43,7 @@ fn golden_commitment_frame() -> Vec<u8> {
 
 /// Regeneration helper (vendored/generated golden, per the A1 brief): rewrite the committed frame
 /// fixture. Run explicitly after an intentional proto change:
-/// `cargo test -p daemon-swarm-net --features ws regenerate_ws_frame_fixture -- --ignored`.
+/// `cargo test -p daemon-vhc-net --features ws regenerate_ws_frame_fixture -- --ignored`.
 #[test]
 #[ignore = "regeneration helper; writes the committed golden fixture"]
 fn regenerate_ws_frame_fixture() {

@@ -9,12 +9,12 @@
 
 use std::collections::BTreeSet;
 
-use daemon_swarm_net::{ArtifactRef, ArtifactResolver};
-use daemon_swarm_run::protocol::{Eligibility, Hardware, WorkerCapabilities};
-use daemon_train::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
-use daemon_train::phase::PHASE_TABLE;
-use daemon_train::{EngineConfig, Worker};
+use daemon_vhc_host::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
+use daemon_vhc_host::phase::PHASE_TABLE;
+use daemon_vhc_host::{EngineConfig, Worker};
+use daemon_vhc_net::{ArtifactRef, ArtifactResolver};
 use daemon_vhc_proto::{from_canonical_slice, SignedEnvelope};
+use daemon_vhc_session::protocol::{Eligibility, Hardware, WorkerCapabilities};
 
 use crate::SEQ;
 
@@ -107,14 +107,14 @@ async fn resolve_module(frozen: &daemon_vhc_proto::FrozenEnvelope) -> Result<Vec
 pub(crate) struct StoreFetchContext {
     pub(crate) presign_base: Option<String>,
     pub(crate) run_id: String,
-    pub(crate) ws_auth: daemon_swarm_run::protocol::WsAuthSpec,
+    pub(crate) ws_auth: daemon_vhc_session::protocol::WsAuthSpec,
     pub(crate) cache_dir: std::path::PathBuf,
     pub(crate) cache_gb: u32,
 }
 
 #[cfg(feature = "swarm-net")]
 pub(crate) fn store_fetch_context() -> StoreFetchContext {
-    use daemon_swarm_run::protocol::WsAuthSpec;
+    use daemon_vhc_session::protocol::WsAuthSpec;
     let ws_auth = if let Ok(bearer) = std::env::var("DAEMON_SWARM_BEARER") {
         WsAuthSpec::Bearer(bearer)
     } else if let (Ok(org_id), Ok(actor)) = (
@@ -141,12 +141,12 @@ pub(crate) fn store_fetch_context() -> StoreFetchContext {
     }
 }
 
-/// Build a content-addressed [`daemon_swarm_net::ContentCache`] from the node-set context.
+/// Build a content-addressed [`daemon_vhc_net::ContentCache`] from the node-set context.
 #[cfg(feature = "swarm-net")]
 pub(crate) fn open_content_cache(
     ctx: &StoreFetchContext,
-) -> Result<daemon_swarm_net::ContentCache, String> {
-    daemon_swarm_net::ContentCache::open_gb(&ctx.cache_dir, ctx.cache_gb)
+) -> Result<daemon_vhc_net::ContentCache, String> {
+    daemon_vhc_net::ContentCache::open_gb(&ctx.cache_dir, ctx.cache_gb)
         .map_err(|e| format!("open content cache {}: {e}", ctx.cache_dir.display()))
 }
 
@@ -154,12 +154,12 @@ pub(crate) fn open_content_cache(
 /// (egress for `https`/`hf`; egress + presign for `r2://`).
 #[cfg(feature = "swarm-net")]
 pub(crate) fn store_resolver(ctx: &StoreFetchContext) -> Result<ArtifactResolver, String> {
-    use daemon_swarm_net::{HttpPresignClient, PresignClient, RunId};
+    use daemon_vhc_net::{HttpPresignClient, PresignClient, RunId};
     let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
         .map_err(|e| format!("egress client: {e}"))?;
     let mut resolver = ArtifactResolver::with_egress(egress);
     if let Some(base) = &ctx.presign_base {
-        use daemon_swarm_run::protocol::WsAuthSpec;
+        use daemon_vhc_session::protocol::WsAuthSpec;
         let presign_egress =
             daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
                 .map_err(|e| format!("presign egress client: {e}"))?;
@@ -192,15 +192,15 @@ pub(crate) async fn fetch_artifact_from_store(art: &ArtifactRef) -> Result<Vec<u
     let bytes = resolver.fetch(art).await.map_err(|e| e.to_string())?;
     // Best-effort cache write (a cache failure must not fail a run whose bytes are already verified).
     if let Err(e) = cache.insert(&art.blake3, &bytes).await {
-        eprintln!("[daemon-train-worker] content cache insert failed (continuing): {e}");
+        eprintln!("[daemon-vhc-worker] content cache insert failed (continuing): {e}");
     }
     Ok(bytes)
 }
 
 /// Decode a 64-char lowercase-hex blake3 into a content hash.
 #[cfg(feature = "swarm-net")]
-pub(crate) fn hash_from_hex(s: &str) -> Option<daemon_swarm_net::ContentHash> {
-    use daemon_swarm_net::ContentHash;
+pub(crate) fn hash_from_hex(s: &str) -> Option<daemon_vhc_net::ContentHash> {
+    use daemon_vhc_net::ContentHash;
     let s = s.trim();
     if s.len() != ContentHash::LEN * 2 {
         return None;
@@ -216,7 +216,7 @@ pub(crate) fn hash_from_hex(s: &str) -> Option<daemon_swarm_net::ContentHash> {
 ///
 /// Runs on a bare fleet box (Windows cmd.exe, macOS, a RunPod container) with no CBOR framing:
 /// fetch the run's module and/or corpus (manifest + windowed shards) **by content hash** from the
-/// payload store into the on-disk [`daemon_swarm_net::ContentCache`], verify blake3, print per-object
+/// payload store into the on-disk [`daemon_vhc_net::ContentCache`], verify blake3, print per-object
 /// `key / bytes / blake3 / source(cache|store) / ms`, then exit. A subsequent live run on the box
 /// finds every artifact cache-warm. Idempotent (re-running is all cache hits).
 ///
@@ -243,7 +243,7 @@ pub(crate) async fn prefetch_main() -> Result<(), String> {
 
     /// Fetch one object, cache-first, printing the staging-evidence line.
     async fn warm(
-        cache: &daemon_swarm_net::ContentCache,
+        cache: &daemon_vhc_net::ContentCache,
         resolver: &ArtifactResolver,
         label: &str,
         art: &ArtifactRef,
@@ -284,7 +284,7 @@ pub(crate) async fn prefetch_main() -> Result<(), String> {
             .ok_or_else(|| format!("bad DAEMON_TRAIN_PREFETCH_MANIFEST {hex}"))?;
         let art = ArtifactRef::new(format!("r2://corpus/{}.json", hash.to_hex()), hash);
         let manifest_bytes = warm(&cache, &resolver, "manifest", &art).await?;
-        let manifest = daemon_swarm_run::data::Manifest::from_json(
+        let manifest = daemon_vhc_session::data::Manifest::from_json(
             std::str::from_utf8(&manifest_bytes).map_err(|e| format!("manifest utf8: {e}"))?,
         )
         .map_err(|e| format!("parse corpus manifest: {e}"))?;
@@ -343,37 +343,37 @@ fn module_from_env() -> Option<Result<Vec<u8>, String>> {
 /// backend choice affects wall-clock only). When the var is set the roomy 160M-scale sandbox budgets
 /// are applied (the defaults are tuned for the tiny reference model; a 768-wide model's real fp32
 /// steps trip the 5 s epoch watchdog — mirrors `preset_160m.rs::roomy_engine`).
-pub(crate) fn engine_config_from_env() -> daemon_train::EngineConfig {
+pub(crate) fn engine_config_from_env() -> daemon_vhc_host::EngineConfig {
     use std::time::Duration;
     let Ok(kind) = std::env::var("DAEMON_TRAIN_BACKEND") else {
-        return daemon_train::EngineConfig::default();
+        return daemon_vhc_host::EngineConfig::default();
     };
     let backend = match kind.as_str() {
-        "cpu" | "" => daemon_train::BackendKind::Cpu,
+        "cpu" | "" => daemon_vhc_host::BackendKind::Cpu,
         #[cfg(feature = "burn-ndarray")]
-        "burn-ndarray" => daemon_train::BackendKind::BurnNdarray,
+        "burn-ndarray" => daemon_vhc_host::BackendKind::BurnNdarray,
         #[cfg(feature = "wgpu")]
-        "wgpu" => daemon_train::BackendKind::Wgpu,
+        "wgpu" => daemon_vhc_host::BackendKind::Wgpu,
         // P3 Merge-2: the CUDA lane (RunPod 4090) sets `DAEMON_TRAIN_BACKEND=cuda` for the roomy
         // 160M budgets; the actual backend/gpu is still chosen by `select_backend()`'s probe ladder
         // (NVRTC-readiness-gated), which composes over this via `worker_engine_config()`.
         #[cfg(feature = "cuda")]
-        "cuda" => daemon_train::BackendKind::Cuda,
+        "cuda" => daemon_vhc_host::BackendKind::Cuda,
         other => {
             eprintln!(
-                "[daemon-train-worker] DAEMON_TRAIN_BACKEND={other} not available in this build \
+                "[daemon-vhc-worker] DAEMON_TRAIN_BACKEND={other} not available in this build \
                  (feature not compiled?) — falling back to the CPU det lane"
             );
-            daemon_train::BackendKind::Cpu
+            daemon_vhc_host::BackendKind::Cpu
         }
     };
-    daemon_train::EngineConfig {
+    daemon_vhc_host::EngineConfig {
         fuel_per_call: 1 << 34,
         epoch_deadline: Duration::from_secs(600),
         op_budget: 1 << 30,
         max_step_handles: 1 << 24,
         backend,
-        ..daemon_train::EngineConfig::default()
+        ..daemon_vhc_host::EngineConfig::default()
     }
 }
 
@@ -384,7 +384,7 @@ fn host_ops() -> Vec<String> {
 
 pub(crate) fn host_capabilities() -> WorkerCapabilities {
     WorkerCapabilities {
-        abi_version: daemon_train::TENSOR_ABI_MAJOR as u16,
+        abi_version: daemon_vhc_host::TENSOR_ABI_MAJOR as u16,
         ops: host_ops(),
         payload_stores: Vec::new(),
     }
@@ -417,7 +417,7 @@ fn host_ram_mb() -> u64 {
 /// `/sys/class/drm/card*/device/` — a legal direct file read in the worker binary (not the node).
 /// Returns `0` when no card exposes the file (non-amdgpu / non-Linux), so callers fall back.
 ///
-/// Parsing is delegated to [`daemon_train::autotune::parse_amdgpu_mem_mb`] (unit-tested with
+/// Parsing is delegated to [`daemon_vhc_host::autotune::parse_amdgpu_mem_mb`] (unit-tested with
 /// fixture strings); this wrapper only does the sysfs directory walk + read.
 #[cfg(feature = "wgpu")]
 fn amdgpu_sysfs_mem_mb(file: &str) -> u64 {
@@ -433,7 +433,7 @@ fn amdgpu_sysfs_mem_mb(file: &str) -> u64 {
         }
         let path = entry.path().join("device").join(file);
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Some(mb) = daemon_train::autotune::parse_amdgpu_mem_mb(&contents) {
+            if let Some(mb) = daemon_vhc_host::autotune::parse_amdgpu_mem_mb(&contents) {
                 if mb > 0 {
                     return mb;
                 }
@@ -458,7 +458,7 @@ pub(crate) fn hardware() -> Hardware {
     // wgpu adapter — it queries D3D12 `ARCHITECTURE1.UMA` + DXGI budgets directly.
     #[cfg(windows)]
     {
-        if let Some(dl) = daemon_train::autotune::probe_windows_device_limits() {
+        if let Some(dl) = daemon_vhc_host::autotune::probe_windows_device_limits() {
             return Hardware {
                 gpus: 1,
                 vram_mb: dl.vram_mb,
@@ -477,7 +477,7 @@ pub(crate) fn hardware() -> Hardware {
     // maxBufferLength directly; unified => shared_mb == ram_mb (one DRAM pool).
     #[cfg(target_os = "macos")]
     {
-        if let Some(dl) = daemon_train::autotune::probe_macos_device_limits() {
+        if let Some(dl) = daemon_vhc_host::autotune::probe_macos_device_limits() {
             return Hardware {
                 gpus: 1,
                 vram_mb: dl.vram_mb,
@@ -497,7 +497,7 @@ pub(crate) fn hardware() -> Hardware {
     // Checked before wgpu so a box built `--features cuda` (RunPod 4090) reports the CUDA lane.
     #[cfg(feature = "cuda")]
     {
-        if let Some(p) = daemon_train::autotune::probe_cuda() {
+        if let Some(p) = daemon_vhc_host::autotune::probe_cuda() {
             return Hardware {
                 gpus: p.gpus,
                 vram_mb: p.vram_mb,
@@ -514,7 +514,7 @@ pub(crate) fn hardware() -> Hardware {
     }
     #[cfg(feature = "wgpu")]
     {
-        if let Some(p) = daemon_train::autotune::probe_wgpu() {
+        if let Some(p) = daemon_vhc_host::autotune::probe_wgpu() {
             // Dedicated VRAM from sysfs (true lower bound); fall back to the max-alloc proxy.
             let vram_sysfs = amdgpu_sysfs_mem_mb("mem_info_vram_total");
             let vram_mb = if vram_sysfs > 0 {
@@ -571,13 +571,13 @@ pub(crate) fn device_limits() -> DeviceLimits {
     // Windows / macOS: the platform FFI probes are authoritative and need no wgpu feature.
     #[cfg(windows)]
     {
-        if let Some(dl) = daemon_train::autotune::probe_windows_device_limits() {
+        if let Some(dl) = daemon_vhc_host::autotune::probe_windows_device_limits() {
             return dl;
         }
     }
     #[cfg(target_os = "macos")]
     {
-        if let Some(dl) = daemon_train::autotune::probe_macos_device_limits() {
+        if let Some(dl) = daemon_vhc_host::autotune::probe_macos_device_limits() {
             return dl;
         }
     }
@@ -585,13 +585,17 @@ pub(crate) fn device_limits() -> DeviceLimits {
     // 4090), `shared_mb = 0`, `unified = false` — the discrete verdict path (swarm-ledger-p3-g D3).
     #[cfg(feature = "cuda")]
     {
-        if let Some(p) = daemon_train::autotune::probe_cuda() {
-            return daemon_train::autotune::cuda_device_limits(p.vram_mb, p.max_alloc_mb, ram_mb);
+        if let Some(p) = daemon_vhc_host::autotune::probe_cuda() {
+            return daemon_vhc_host::autotune::cuda_device_limits(
+                p.vram_mb,
+                p.max_alloc_mb,
+                ram_mb,
+            );
         }
     }
     #[cfg(feature = "wgpu")]
     {
-        if let Some(p) = daemon_train::autotune::probe_wgpu() {
+        if let Some(p) = daemon_vhc_host::autotune::probe_wgpu() {
             let vram_sysfs = amdgpu_sysfs_mem_mb("mem_info_vram_total");
             // On a unified device without sysfs VRAM, dedicated VRAM is not a meaningful cap; the
             // pool is host RAM, so budget VRAM as RAM. On a discrete device fall back to the
@@ -629,7 +633,7 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
     // path (footprint estimation, backend-independent).
     let engine = if std::env::var_os("DAEMON_TRAIN_BACKEND").is_some() {
         EngineConfig {
-            backend: daemon_train::BackendKind::Cpu,
+            backend: daemon_vhc_host::BackendKind::Cpu,
             ..engine_config_from_env()
         }
     } else {
@@ -716,15 +720,15 @@ pub(crate) fn assess(module: &[u8], config: &[u8]) -> Result<Eligibility, String
 ///
 /// `DAEMON_TRAIN_BACKEND=cpu` forces the CPU lane even when a GPU is present (an operator escape
 /// hatch for a box whose driver-matched NVRTC is not staged — the backend would otherwise fail on
-/// the first device op). Returns `(BackendKind, gpu_index)` for the [`daemon_train::EngineConfig`].
+/// the first device op). Returns `(BackendKind, gpu_index)` for the [`daemon_vhc_host::EngineConfig`].
 ///
 /// Only the live-attach path (`swarm-net`) consumes this; a probe-only or default worker never
 /// selects a backend, so it is gated with its sole caller (`live.rs`).
 #[cfg(feature = "swarm-net")]
-pub(crate) fn select_backend() -> (daemon_train::BackendKind, Option<u32>) {
+pub(crate) fn select_backend() -> (daemon_vhc_host::BackendKind, Option<u32>) {
     let requested = std::env::var("DAEMON_TRAIN_BACKEND").ok();
     if requested.as_deref() == Some("cpu") {
-        return (daemon_train::BackendKind::Cpu, None);
+        return (daemon_vhc_host::BackendKind::Cpu, None);
     }
     // Explicit operator override (P3 Merge-2): `DAEMON_TRAIN_BACKEND=wgpu` pins the wgpu rung even
     // when a CUDA device is present — the honest escape hatch for a box whose CUDA lane is unusable
@@ -734,36 +738,36 @@ pub(crate) fn select_backend() -> (daemon_train::BackendKind, Option<u32>) {
     // if the requested rung has no usable adapter, fall through the normal ladder below.
     #[cfg(feature = "wgpu")]
     if requested.as_deref() == Some("wgpu") {
-        if let Some(p) = daemon_train::autotune::probe_wgpu() {
+        if let Some(p) = daemon_vhc_host::autotune::probe_wgpu() {
             eprintln!(
-                "daemon-train-worker: DAEMON_TRAIN_BACKEND=wgpu override — selecting wgpu native \
+                "daemon-vhc-worker: DAEMON_TRAIN_BACKEND=wgpu override — selecting wgpu native \
                  lane (adapter: {}, backend {}); det lane stays host fp32 (consensus-invariant)",
                 p.adapter, p.backend
             );
-            return (daemon_train::BackendKind::Wgpu, None);
+            return (daemon_vhc_host::BackendKind::Wgpu, None);
         }
         eprintln!(
-            "daemon-train-worker: DAEMON_TRAIN_BACKEND=wgpu requested but no usable adapter — \
+            "daemon-vhc-worker: DAEMON_TRAIN_BACKEND=wgpu requested but no usable adapter — \
              falling through the probe ladder"
         );
     }
     #[cfg(feature = "cuda")]
     {
-        if let Some(p) = daemon_train::autotune::probe_cuda() {
+        if let Some(p) = daemon_vhc_host::autotune::probe_cuda() {
             // NVRTC readiness gate (fetch-on-demand contract, swarm-ledger-p3-g D6): the device
             // alone is not enough — burn-cuda JITs through libnvrtc, which must be staged
             // driver-matched (DAEMON_CUDA_RUNTIME_DIR). Until it is, downgrade to wgpu/CPU
             // instead of failing on the first tensor op.
-            if daemon_train::autotune::cuda_nvrtc_ready() {
+            if daemon_vhc_host::autotune::cuda_nvrtc_ready() {
                 eprintln!(
-                    "daemon-train-worker: selecting CUDA native lane (device 0: {}, {} MiB VRAM); \
+                    "daemon-vhc-worker: selecting CUDA native lane (device 0: {}, {} MiB VRAM); \
                      det lane stays host fp32 (consensus-invariant)",
                     p.adapter, p.vram_mb
                 );
-                return (daemon_train::BackendKind::Cuda, Some(0));
+                return (daemon_vhc_host::BackendKind::Cuda, Some(0));
             }
             eprintln!(
-                "daemon-train-worker: CUDA device present ({}) but the JIT runtime is not staged \
+                "daemon-vhc-worker: CUDA device present ({}) but the JIT runtime is not staged \
                  (libnvrtc loadable + CUDA_PATH/include/cuda_runtime.h required) — stage the \
                  driver-matched NVRTC runtime (DAEMON_CUDA_RUNTIME_DIR, export \
                  CUDA_PATH=$DAEMON_CUDA_RUNTIME_DIR) to enable the CUDA lane; downgrading \
@@ -772,22 +776,22 @@ pub(crate) fn select_backend() -> (daemon_train::BackendKind, Option<u32>) {
             );
         } else {
             eprintln!(
-                "daemon-train-worker: cuda feature built but no CUDA device present — degrading \
+                "daemon-vhc-worker: cuda feature built but no CUDA device present — degrading \
                  (fat-worker probe order: cuda -> wgpu -> cpu)"
             );
         }
     }
     #[cfg(feature = "wgpu")]
     {
-        if let Some(p) = daemon_train::autotune::probe_wgpu() {
+        if let Some(p) = daemon_vhc_host::autotune::probe_wgpu() {
             eprintln!(
-                "daemon-train-worker: selecting wgpu native lane (adapter: {}, backend {}); \
+                "daemon-vhc-worker: selecting wgpu native lane (adapter: {}, backend {}); \
                  det lane stays host fp32 (consensus-invariant)",
                 p.adapter, p.backend
             );
-            return (daemon_train::BackendKind::Wgpu, None);
+            return (daemon_vhc_host::BackendKind::Wgpu, None);
         }
-        eprintln!("daemon-train-worker: wgpu feature built but no usable adapter — CPU det lane");
+        eprintln!("daemon-vhc-worker: wgpu feature built but no usable adapter — CPU det lane");
     }
-    (daemon_train::BackendKind::Cpu, None)
+    (daemon_vhc_host::BackendKind::Cpu, None)
 }

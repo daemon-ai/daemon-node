@@ -22,30 +22,30 @@ use std::time::Duration;
 use std::collections::BTreeMap;
 
 use daemon_provision::CutWriter;
-use daemon_swarm_net::{
+use daemon_vhc_host::{
+    EngineConfig as WasmEngineConfig, TrainError, TrapCode, WasmBackend, WasmBackendConfig,
+    WasmBackendError,
+};
+use daemon_vhc_net::{
     ArtifactRef, ArtifactResolver, ContentCache, ContentHash, ControlPlane, DualPlane,
     FsPayloadStore, HttpPresignClient, IrohGossip, IrohGossipConfig, IrohPeer, PayloadKey,
     PayloadStat, PayloadStore, PresignClient, R2Store, RebroadcastConfig, ReconnectConfig,
     RegistryClient, RunId, SwarmNetError, WsAuth, WsConfig, WsControlPlane,
-};
-use daemon_swarm_run::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
-use daemon_swarm_run::checkpoint::{
-    plan_resync, CheckpointManifest, ReplayStep, ResyncPlan, CHECKPOINT_PEER,
-};
-use daemon_swarm_run::data::{Corpus, Manifest};
-use daemon_swarm_run::engine::{EngineConfig, EngineEvent, RoundEngine};
-use daemon_swarm_run::protocol::{ErrorClass, Event, JoinCredentials};
-use daemon_swarm_run::seam::RoundId;
-use daemon_swarm_run::SwarmRunError;
-use daemon_train::{
-    EngineConfig as WasmEngineConfig, TrainError, TrapCode, WasmBackend, WasmBackendConfig,
-    WasmBackendError,
 };
 use daemon_vhc_proto::messages::{Join, RecordEntry, ThroughputClass};
 use daemon_vhc_proto::{
     peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SignedMessage, SigningKey,
     SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
+use daemon_vhc_session::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
+use daemon_vhc_session::checkpoint::{
+    plan_resync, CheckpointManifest, ReplayStep, ResyncPlan, CHECKPOINT_PEER,
+};
+use daemon_vhc_session::data::{Corpus, Manifest};
+use daemon_vhc_session::engine::{EngineConfig, EngineEvent, RoundEngine};
+use daemon_vhc_session::protocol::{ErrorClass, Event, JoinCredentials};
+use daemon_vhc_session::seam::RoundId;
+use daemon_vhc_session::SwarmRunError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 
@@ -54,7 +54,7 @@ use crate::send;
 /// A running live attach: the engine + forwarder + translator tasks and the plane handles, so the
 /// command loop can stop cleanly on `Leave`/`Shutdown` (preemption-as-churn, §10.5).
 pub(crate) struct LiveHandle {
-    engine_task: JoinHandle<Result<daemon_swarm_run::engine::RunOutcome, SwarmRunError>>,
+    engine_task: JoinHandle<Result<daemon_vhc_session::engine::RunOutcome, SwarmRunError>>,
     forwarder_task: JoinHandle<()>,
     translator_task: JoinHandle<()>,
     ws: Arc<WsControlPlane>,
@@ -259,7 +259,7 @@ pub(crate) async fn join_and_run_live(
                 class: "engine_error".to_string(),
                 detail: format!("live RoundEngine run() ended: {e}"),
             });
-            eprintln!("[daemon-train-worker] live RoundEngine run() ended with error: {e}");
+            eprintln!("[daemon-vhc-worker] live RoundEngine run() ended with error: {e}");
         }
         result
     });
@@ -321,7 +321,7 @@ enum WorkerStore {
 fn build_store(run_id: &str, creds: &JoinCredentials) -> Result<WorkerStore, String> {
     match &creds.presign_base {
         Some(base) => {
-            use daemon_swarm_run::protocol::WsAuthSpec;
+            use daemon_vhc_session::protocol::WsAuthSpec;
             let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
                 .map_err(|e| format!("egress client: {e}"))?;
             let presign_egress =
@@ -347,7 +347,7 @@ fn build_store(run_id: &str, creds: &JoinCredentials) -> Result<WorkerStore, Str
         }
         None => {
             let root = std::env::temp_dir().join(format!(
-                "daemon-train-worker-fs-{}-{run_id}",
+                "daemon-vhc-worker-fs-{}-{run_id}",
                 std::process::id()
             ));
             let retention = 64;
@@ -436,7 +436,7 @@ fn corpus_resolver(run_id: &str, creds: &JoinCredentials) -> Result<ArtifactReso
         .map_err(|e| format!("egress client: {e}"))?;
     let mut resolver = ArtifactResolver::with_egress(egress);
     if let Some(base) = &creds.presign_base {
-        use daemon_swarm_run::protocol::WsAuthSpec;
+        use daemon_vhc_session::protocol::WsAuthSpec;
         let presign_egress =
             daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
                 .map_err(|e| format!("presign egress client: {e}"))?;
@@ -467,7 +467,7 @@ async fn fetch_cached(
     }
     let bytes = resolver.fetch(art).await.map_err(|e| e.to_string())?;
     if let Err(e) = cache.insert(&art.blake3, &bytes).await {
-        eprintln!("[daemon-train-worker] corpus cache insert failed (continuing): {e}");
+        eprintln!("[daemon-vhc-worker] corpus cache insert failed (continuing): {e}");
     }
     Ok(bytes)
 }
@@ -523,7 +523,7 @@ impl WorkerStore {
 /// used for the checkpoint-pointer surface (fetch on rejoin, publish on checkpoint). The base is the
 /// same `{…}/api/v1/swarm` the WS client dials; the client trims a trailing slash.
 fn build_registry(coordinator: &str, creds: &JoinCredentials) -> Result<RegistryClient, String> {
-    use daemon_swarm_run::protocol::WsAuthSpec;
+    use daemon_vhc_session::protocol::WsAuthSpec;
     let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
         .map_err(|e| format!("registry egress client: {e}"))?;
     let client = RegistryClient::new(egress, coordinator.to_string());
@@ -746,8 +746,8 @@ fn translate_engine_event(ev: &EngineEvent, run_id: &str, roster_len: u32) -> Ve
     }
 }
 
-fn to_ws_auth(spec: &daemon_swarm_run::protocol::WsAuthSpec) -> WsAuth {
-    use daemon_swarm_run::protocol::WsAuthSpec;
+fn to_ws_auth(spec: &daemon_vhc_session::protocol::WsAuthSpec) -> WsAuth {
+    use daemon_vhc_session::protocol::WsAuthSpec;
     match spec {
         WsAuthSpec::None => WsAuth::None,
         WsAuthSpec::Bearer(t) => WsAuth::Bearer(t.clone()),
@@ -918,9 +918,9 @@ impl LadderBackend {
         let (kind, _gpu) = crate::backend::select_backend();
         let host = match kind {
             #[cfg(feature = "cuda")]
-            daemon_train::BackendKind::Cuda => {
+            daemon_vhc_host::BackendKind::Cuda => {
                 eprintln!(
-                    "daemon-train-worker: pinning the CUDA backend to a dedicated device thread \
+                    "daemon-vhc-worker: pinning the CUDA backend to a dedicated device thread \
                      (cubecl per-thread stream discipline)"
                 );
                 BackendHost::Pinned(DeviceThread::spawn(module.clone(), config.clone())?)
@@ -957,8 +957,8 @@ impl TrainerBackend for LadderBackend {
     }
     fn assess(
         &self,
-        meta: &daemon_swarm_run::backend::AssessMeta,
-    ) -> Result<daemon_swarm_run::backend::Assessment, Self::Error> {
+        meta: &daemon_vhc_session::backend::AssessMeta,
+    ) -> Result<daemon_vhc_session::backend::Assessment, Self::Error> {
         let meta = *meta;
         self.host.with(move |b| b.assess(&meta))
     }
@@ -966,7 +966,7 @@ impl TrainerBackend for LadderBackend {
         &mut self,
         batch: &BatchRef,
         ctx: StepCtx,
-    ) -> Result<daemon_swarm_run::backend::StepStats, Self::Error> {
+    ) -> Result<daemon_vhc_session::backend::StepStats, Self::Error> {
         let batch = if self.vocab_clamp > 0 {
             BatchRef {
                 tokens: batch.tokens.iter().map(|t| t % self.vocab_clamp).collect(),

@@ -8,18 +8,18 @@
 #![allow(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
-//! The `daemon-train-worker` binary — the child side of the frozen worker protocol (§10.2).
+//! The `daemon-vhc-worker` binary — the child side of the frozen worker protocol (§10.2).
 //!
-//! Speaks [`daemon_swarm_run::protocol`] `Command`/`Event` frames over the length-framed
+//! Speaks [`daemon_vhc_session::protocol`] `Command`/`Event` frames over the length-framed
 //! [`daemon_provision::CutChannel`] stdio cut (exactly like `fake-train-worker`, and consumed by
-//! `daemon-train-client::TrainSupervisor`), but drives the real [`daemon_train::WasmBackend`] host
+//! `daemon-vhc-supervisor::TrainSupervisor`), but drives the real [`daemon_vhc_host::WasmBackend`] host
 //! runtime instead of a script:
 //!
 //! - `Probe` → a real host capability report (`tabi@1`, all 66 host ops; GPU absent = CPU-only).
 //! - `AssessRun{envelope}` → the peer-side re-validation (spec §6.5). The `envelope` bytes are the
 //!   canonical [`daemon_vhc_proto::SignedEnvelope`] wire form of the run's `FrozenEnvelope`: the
 //!   worker **verifies** it, extracts the `[experiment.config]`, and **resolves the module** from the
-//!   envelope's artifact map via [`daemon_swarm_net::ArtifactResolver`] (`file://`, blake3-verified).
+//!   envelope's artifact map via [`daemon_vhc_net::ArtifactResolver`] (`file://`, blake3-verified).
 //!   `DAEMON_TRAIN_MODULE`, if set, overrides the artifact resolution (dev / node-controlled). It then
 //!   runs the static import scan vs the host vocabulary + a host meta-mode pass → `Assessed`, caching
 //!   the config + module bytes for the subsequent `JoinRun`. A raw-config-CBOR envelope (no signature
@@ -49,8 +49,8 @@ mod live;
 mod transport;
 
 use daemon_provision::{CutChannel, CutWriter};
-use daemon_swarm_run::protocol::{self, Command, ErrorClass, Event};
-use daemon_train::WasmBackend;
+use daemon_vhc_host::WasmBackend;
+use daemon_vhc_session::protocol::{self, Command, ErrorClass, Event};
 
 /// A representative meta/self-drive micro-batch shape (sequences × tokens-per-sequence). All-zero
 /// token ids are valid for any vocabulary (id 0 always exists), so the worker stays experiment
@@ -84,7 +84,7 @@ async fn main() {
         #[cfg(feature = "swarm-net")]
         {
             if let Err(e) = backend::prefetch_main().await {
-                eprintln!("daemon-train-worker: prefetch FAILED: {e}");
+                eprintln!("daemon-vhc-worker: prefetch FAILED: {e}");
                 std::process::exit(1);
             }
             return;
@@ -92,7 +92,7 @@ async fn main() {
         #[cfg(not(feature = "swarm-net"))]
         {
             eprintln!(
-                "daemon-train-worker: DAEMON_TRAIN_PREFETCH needs a worker built with \
+                "daemon-vhc-worker: DAEMON_TRAIN_PREFETCH needs a worker built with \
                  `--features swarm-net` (the store fetch path)"
             );
             std::process::exit(1);
@@ -125,7 +125,7 @@ async fn main() {
         let cmd: Command = match protocol::decode(&bytes) {
             Ok(cmd) => cmd,
             Err(e) => {
-                eprintln!("daemon-train-worker: undecodable command: {e}");
+                eprintln!("daemon-vhc-worker: undecodable command: {e}");
                 continue;
             }
         };
@@ -167,7 +167,7 @@ async fn main() {
                 // self-driven representative round (the T0 baseline, also the default-gate path).
                 #[cfg(feature = "swarm-net")]
                 if let Ok(creds) =
-                    daemon_swarm_run::protocol::JoinCredentials::from_bytes(&credentials)
+                    daemon_vhc_session::protocol::JoinCredentials::from_bytes(&credentials)
                 {
                     match live::join_and_run_live(
                         &resolved.module,
@@ -195,7 +195,7 @@ async fn main() {
                 // client-visible error (Merge-3 ceremony: a drifted RunPod artifact built without
                 // `swarm-net` stalled the WAN run this exact way — the Join was never dialed).
                 #[cfg(not(feature = "swarm-net"))]
-                if daemon_swarm_run::protocol::JoinCredentials::from_bytes(&credentials).is_ok() {
+                if daemon_vhc_session::protocol::JoinCredentials::from_bytes(&credentials).is_ok() {
                     send(
                         &writer,
                         &worker_error(
@@ -274,6 +274,6 @@ pub(crate) async fn send(writer: &CutWriter, event: &Event) {
         Ok(bytes) => {
             let _ = writer.send(&bytes).await;
         }
-        Err(e) => eprintln!("daemon-train-worker: encode event: {e}"),
+        Err(e) => eprintln!("daemon-vhc-worker: encode event: {e}"),
     }
 }

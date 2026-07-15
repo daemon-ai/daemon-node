@@ -3,7 +3,7 @@
 
 //! [`SwarmService`] — the resident node-side swarm-training service (spec §10.3/§10.4).
 //!
-//! It owns a worker-control seam ([`WorkerControl`], implemented for `daemon-train-client`'s
+//! It owns a worker-control seam ([`WorkerControl`], implemented for `daemon-vhc-supervisor`'s
 //! `TrainSupervisor`), the durable [`SwarmStore`] (`swarm.db`), and a broadcast of [`SwarmEvent`]s.
 //! It:
 //!
@@ -21,9 +21,11 @@ use daemon_api::{
     SwarmEventStream, SwarmHardwareReport, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode,
     SwarmRunDetail, SwarmRunSummary,
 };
-use daemon_swarm_run::config::SwarmConfig;
-use daemon_swarm_run::protocol::{self, Eligibility, Hardware, JoinPolicy, LeaveMode, PolicyMode};
-use daemon_train_client::TrainSupervisor;
+use daemon_vhc_session::config::SwarmConfig;
+use daemon_vhc_session::protocol::{
+    self, Eligibility, Hardware, JoinPolicy, LeaveMode, PolicyMode,
+};
+use daemon_vhc_supervisor::TrainSupervisor;
 use futures::StreamExt;
 use std::collections::BTreeMap;
 use tokio::sync::broadcast;
@@ -68,7 +70,7 @@ impl SwarmError {
 }
 
 /// The worker-supervision seam the service drives (join/leave/probe/assess/throttle). Implemented for
-/// `daemon-train-client`'s `TrainSupervisor` (real worker); a fake impl in tests exercises the
+/// `daemon-vhc-supervisor`'s `TrainSupervisor` (real worker); a fake impl in tests exercises the
 /// service without a subprocess.
 #[async_trait]
 pub trait WorkerControl: Send + Sync {

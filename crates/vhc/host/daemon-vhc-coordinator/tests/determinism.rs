@@ -8,7 +8,7 @@ mod common;
 use common::*;
 use daemon_vhc_proto::{from_canonical_slice, peer_id, to_canonical_vec, PeerId};
 
-use daemon_swarm_coordinator::{tick, CoordinatorState, Input, Output};
+use daemon_vhc_coordinator::{tick, CoordinatorState, Input, Output};
 use proptest::prelude::*;
 
 /// A full scripted run as an input sequence: joins → warmup → three complete rounds.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! [`WasmBackend`] — a [`daemon_swarm_run::backend::TrainerBackend`] over the wasm host runtime.
+//! [`WasmBackend`] — a [`daemon_vhc_session::backend::TrainerBackend`] over the wasm host runtime.
 //!
 //! This is the E↔R wiring (spec §5.1/§10.2): the participant [`RoundEngine`] (lane R) drives the
 //! round structure over the engine-agnostic `TrainerBackend` seam; `WasmBackend` fills in the math
@@ -25,14 +25,14 @@
 //! (releasing wasm/GPU memory, keeping the CPU checkpoint); [`WasmBackend::resume`] re-instantiates
 //! from the `InstancePre`, re-runs `da_build`, and restores — bit-identical to the pre-pause state.
 //!
-//! [`RoundEngine`]: daemon_swarm_run::engine::RoundEngine
+//! [`RoundEngine`]: daemon_vhc_session::engine::RoundEngine
 
-use daemon_swarm_run::backend::{
+use daemon_vhc_proto::{digest_state, Seed};
+use daemon_vhc_session::backend::{
     AssessMeta, Assessment, BatchRef, StagedPayload, StateDigest, StepCtx, StepStats,
     TrainerBackend,
 };
-use daemon_swarm_run::seam::RoundId;
-use daemon_vhc_proto::{digest_state, Seed};
+use daemon_vhc_session::seam::RoundId;
 
 use crate::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
 use crate::runtime::{EngineConfig, Instance, LoadedModule, Manifest, Worker};
@@ -205,7 +205,7 @@ impl TrainerBackend for WasmBackend {
         // This trait path budgets on the node's total effective resources (governor caps already
         // applied); it is not device-type aware, so it keeps the discrete (independent VRAM/RAM)
         // interpretation — `shared_mb = 0`, `unified = false`. The worker's meta+probe path
-        // (`daemon-train-worker/backend.rs`) supplies the real unified-memory limits.
+        // (`daemon-vhc-worker/backend.rs`) supplies the real unified-memory limits.
         let limits = DeviceLimits {
             vram_mb: meta.effective_vram_mb,
             ram_mb: meta.effective_ram_mb,

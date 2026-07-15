@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-swarm-coordinator` — the purified coordinator state machine (spec §6.2, §6.4, §11.2).
+//! `daemon-vhc-coordinator` — the purified coordinator state machine (spec §6.2, §6.4, §11.2).
 //!
 //! Wave 2 ships this as a **pure library**: the [`tick`] state machine plus its
 //! canonical-CBOR-serializable types. `tick(state, input) -> (state', outputs)` is I/O-free —

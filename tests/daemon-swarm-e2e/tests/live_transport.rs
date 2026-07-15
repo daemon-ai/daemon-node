@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 //! The **live-transport exit gate** (spec §6.4, §7.1; TDD §3.8, RUN-5/8, PROTO-20 over a real
-//! plane; B3). Every test here drives the frozen `RoundEngine` + the real `daemon-swarm-coordinator`
+//! plane; B3). Every test here drives the frozen `RoundEngine` + the real `daemon-vhc-coordinator`
 //! `tick` loop over a **real per-node `IrohGossip` mesh** (QUIC gossip on loopback, explicit roster
 //! addressing, no public discovery) + a shared `FsPayloadStore` — the transports swapped behind the
 //! frozen `ControlPlane`/`PayloadStore` traits, nothing else changed. This is where B2's
@@ -23,22 +23,22 @@ use std::sync::Once;
 use std::time::Duration;
 
 use ciborium::into_writer;
-use daemon_swarm_run::backend::{
+use daemon_vhc_host::{EngineConfig, WasmBackend, WasmBackendConfig, WasmBackendError};
+use daemon_vhc_proto::peer_id;
+use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::backend::{
     AssessMeta, Assessment, BatchRef, StagedPayload, StateDigest, StepCtx, StepStats,
     TrainerBackend,
 };
-use daemon_swarm_run::engine::EngineEvent;
-use daemon_swarm_run::harness::{
+use daemon_vhc_session::engine::EngineEvent;
+use daemon_vhc_session::harness::{
     peer_key, verify_observe_dir, LateJoin, SilentDeath, StallFault, SwarmConfig,
 };
-use daemon_swarm_run::live_harness::{run_live_swarm, run_live_swarm_with, LiveSwarmConfig};
-use daemon_swarm_run::seam::RoundId;
-use daemon_train::{EngineConfig, WasmBackend, WasmBackendConfig, WasmBackendError};
-use daemon_vhc_proto::peer_id;
-use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::live_harness::{run_live_swarm, run_live_swarm_with, LiveSwarmConfig};
+use daemon_vhc_session::seam::RoundId;
 
 /// Assert every round in `run` has a single digest shared by all peers that reported it.
-fn assert_all_agree(run: &daemon_swarm_run::harness::SwarmRun) {
+fn assert_all_agree(run: &daemon_vhc_session::harness::SwarmRun) {
     assert!(
         run.all_agree(),
         "surviving peers must agree on every round's digest over the live plane"
@@ -99,7 +99,7 @@ async fn live_observe_record_and_replay_green() {
     assert_all_agree(&run);
 
     let dir = std::env::temp_dir().join(format!(
-        "daemon-swarm-observe-live-{}-{}",
+        "daemon-vhc-observe-live-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -298,7 +298,7 @@ fn spawn_dev_relay() -> Option<std::process::Child> {
 
 // ---- flagship on the REAL tiny-llama guest: WasmBackend peers over the live iroh mesh -----------
 
-// -- guest module loading (mirrors tests/wasm_profiles.rs / daemon-train/tests) --
+// -- guest module loading (mirrors tests/wasm_profiles.rs / daemon-vhc-host/tests) --
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

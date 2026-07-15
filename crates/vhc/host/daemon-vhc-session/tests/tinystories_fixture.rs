@@ -16,7 +16,7 @@
 //!   --shard-tokens 262144 --seq-len 1024 --token-width u16 --max-tokens 1048576
 //! ```
 
-use daemon_swarm_run::data::{slice_interval, BatchInterval, BatchLocation, Corpus, Manifest};
+use daemon_vhc_session::data::{slice_interval, BatchInterval, BatchLocation, Corpus, Manifest};
 
 const MANIFEST: &str = include_str!("fixtures/tinystories/manifest.json");
 const SHARD0: &[u8] = include_bytes!("fixtures/tinystories/shard-0000.bin");

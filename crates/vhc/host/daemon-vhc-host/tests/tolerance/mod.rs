@@ -18,7 +18,7 @@
 
 #![allow(dead_code)]
 
-use daemon_train::OpBackend;
+use daemon_vhc_host::OpBackend;
 
 /// The tolerance class of an op (the HOST-3 machinery). Pinned in [`tol_for`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

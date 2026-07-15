@@ -1,5 +1,5 @@
 [package]
-name = "daemon-train"
+name = "daemon-vhc-host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,24 +9,24 @@ license.workspace = true
 path = "src/lib.rs"
 
 [[bin]]
-name = "daemon-train"
-path = "src/bin/daemon-train.rs"
+name = "daemon-vhc"
+path = "src/bin/daemon-vhc.rs"
 
-# The Wave-3 training worker: speaks the frozen `daemon_swarm_run::protocol` over the length-framed
+# The Wave-3 training worker: speaks the frozen `daemon_vhc_session::protocol` over the length-framed
 # stdio cut and drives `WasmBackend` (spec §10.2). The node process never links this binary's engine.
 # Split into `main` (dispatch) + `backend` (probe/assess, G2) + `transport` (JoinRun round loop, B3)
 # modules so the Wave-3 A/B lanes do not collide on one file (swarm-p1-ledger.md).
 [[bin]]
-name = "daemon-train-worker"
-path = "src/bin/daemon-train-worker/main.rs"
+name = "daemon-vhc-worker"
+path = "src/bin/daemon-vhc-worker/main.rs"
 
 # A minimal, telemetry-free device-limits readout (C2 fleet validation). Cross-builds + LINKS under
 # MinGW (unlike the full worker, whose always-on `sentry-rust-minidump` path pulls an unresolved
-# UCRT symbol on windows-gnu — see swarm-ledger-p2-c2). Runs the same `daemon_train::autotune` probe
+# UCRT symbol on windows-gnu — see swarm-ledger-p2-c2). Runs the same `daemon_vhc_host::autotune` probe
 # the worker's `Probe` path uses, so the reported DeviceLimits are identical to a live `Probe`.
 [[bin]]
-name = "daemon-train-probe"
-path = "src/bin/daemon-train-probe.rs"
+name = "daemon-vhc-probe"
+path = "src/bin/daemon-vhc-probe.rs"
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
@@ -44,28 +44,28 @@ thiserror = { workspace = true }
 daemon-vhc-det = { workspace = true }
 serde = { workspace = true }
 ciborium = { workspace = true }
-# The R↔E seam (`TrainerBackend`) + the frozen node↔worker wire (`daemon_swarm_run::protocol`), lane R
-# (§10.1: `daemon-train` depends on `daemon-swarm-run`). `WasmBackend` implements the trait; the
-# worker binary implements the child side of the protocol. No cycle: `daemon-swarm-run` has no dep on
-# `daemon-train`. Path dep already declared in the frozen root manifest — no root/deny/flake change.
-daemon-swarm-run = { workspace = true }
+# The R↔E seam (`TrainerBackend`) + the frozen node↔worker wire (`daemon_vhc_session::protocol`), lane R
+# (§10.1: `daemon-vhc-host` depends on `daemon-vhc-session`). `WasmBackend` implements the trait; the
+# worker binary implements the child side of the protocol. No cycle: `daemon-vhc-session` has no dep on
+# `daemon-vhc-host`. Path dep already declared in the frozen root manifest — no root/deny/flake change.
+daemon-vhc-session = { workspace = true }
 # The envelope artifact plane (`ArtifactResolver`, `file://` blake3-verified) the worker uses to
 # fetch its experiment module from the frozen envelope's artifact map (§8). Path dep already in the
 # frozen root manifest; net depends only on proto (no cycle). Used by the worker bin target.
-daemon-swarm-net = { workspace = true }
-# The length-framed `CutChannel` stdio transport the `daemon-train-worker` binary speaks (same
+daemon-vhc-net = { workspace = true }
+# The length-framed `CutChannel` stdio transport the `daemon-vhc-worker` binary speaks (same
 # supervision contract as the other coprocessor workers, §10.2). Used by the bin target only.
 daemon-provision = { workspace = true }
-# Async runtime for the `daemon-train-worker` binary's stdio command/event loop. Bin target only.
+# Async runtime for the `daemon-vhc-worker` binary's stdio command/event loop. Bin target only.
 tokio = { workspace = true }
-# Consent-gated crash reporting for the `daemon-train-worker` binary (panics + native minidumps —
+# Consent-gated crash reporting for the `daemon-vhc-worker` binary (panics + native minidumps —
 # the worker links heavy native engine trees, so a segfault is a real failure mode). Bin target
 # only; a runtime no-op unless the spawning node injected a DSN + `DAEMON_CRASH_CONSENT=1`.
 daemon-telemetry = { workspace = true }
 # The SSRF-safe outbound HTTP client the `R2Store`/`HttpPresignClient` payload plane rides (A3 live
 # attach). OPTIONAL — pulled in only by the `swarm-net` feature (which also turns on
-# `daemon-swarm-net/{ws,iroh}`); the default worker build never links it. Already a
-# `[workspace.dependencies]` entry (daemon-swarm-net uses it) — no root/deny/flake change.
+# `daemon-vhc-net/{ws,iroh}`); the default worker build never links it. Already a
+# `[workspace.dependencies]` entry (daemon-vhc-net uses it) — no root/deny/flake change.
 daemon-egress = { workspace = true, optional = true }
 # `#[async_trait]` for the worker's concrete `PayloadStore` impl (the R2/Fs store enum, A3 live
 # attach). OPTIONAL — pulled in only by `swarm-net`; already a `[workspace.dependencies]` entry.
@@ -115,15 +115,15 @@ cpu = []
 burn-ndarray = ["burn/ndarray"]
 # burn with the wgpu backend (cubecl + wgpu 29; targets Vulkan/RADV) — the G2 GPU lane. Opt-in only.
 wgpu = ["burn/wgpu"]
-# The A3 live coordinator attach: turn on daemon-swarm-net's WS client + iroh gossip transport so the
+# The A3 live coordinator attach: turn on daemon-vhc-net's WS client + iroh gossip transport so the
 # worker's JoinRun path runs a real `RoundEngine` over `DualPlane(WsControlPlane, IrohGossip)` +
-# R2/Fs payload store (the ledger-sequenced dep-graph change). `daemon-swarm-net` is ALREADY a
+# R2/Fs payload store (the ledger-sequenced dep-graph change). `daemon-vhc-net` is ALREADY a
 # (default-feature) dep for the `file://` ArtifactResolver; this feature only enables its `ws`+`iroh`
 # cargo features. OFF the default gate so a default `cargo build`/`test`/`deny` never compiles the
-# WS/TLS/iroh/QUIC tree — verify with `cargo tree -e features -i daemon-swarm-net`. WS-only is the
+# WS/TLS/iroh/QUIC tree — verify with `cargo tree -e features -i daemon-vhc-net`. WS-only is the
 # T0 baseline (iroh stays runtime-optional inside the feature too: absent iroh credentials → the
 # bare `WsControlPlane`).
-swarm-net = ["daemon-swarm-net/ws", "daemon-swarm-net/iroh", "dep:daemon-egress", "dep:async-trait"]
+swarm-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress", "dep:async-trait"]
 # burn with the CUDA backend (cubecl-cuda + cudarc; driver-API + NVRTC JIT at runtime) — the C2/P2
 # RunPod-4090 lane. Opt-in only, and a LANE-OWNED edit by the ledger rule: burn-cuda/cubecl-cuda/
 # cudarc are ALREADY resolved in the committed Cargo.lock (verified byte-unchanged when this feature
@@ -141,10 +141,10 @@ cuda = ["burn/cuda", "dep:cudarc"]
 # `sim` compiles the SDK's `models`/`profiles` (config types) natively for the tests; never a
 # runtime edge (the host does not link the guest SDK).
 daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
-# Test-only: the node-side supervisor drives the real `daemon-train-worker` subprocess through the
+# Test-only: the node-side supervisor drives the real `daemon-vhc-worker` subprocess through the
 # frozen worker protocol (`tests/worker_protocol.rs`). Path dep between workspace members — no root
-# edit — and `daemon-train-client` does not depend on `daemon-train`, so it is a clean dev-dep.
-daemon-train-client = { workspace = true }
+# edit — and `daemon-vhc-supervisor` does not depend on `daemon-vhc-host`, so it is a clean dev-dep.
+daemon-vhc-supervisor = { workspace = true }
 # Test-only: `SessionId` for the lower-level direct-subprocess round-loop test (spawns the worker via
 # `daemon_provision` and drives the protocol to observe `RoundOutcome`).
 daemon-common = { workspace = true }
@@ -152,7 +152,7 @@ daemon-common = { workspace = true }
 # parity tests use to compare the tabi path's and the burn reference's weights. Already a
 # `[workspace.dependencies]` entry (added at Merge 2) — a dev-dep on an existing workspace dep, no
 # root/deny/flake change.
-daemon-train-safetensors = { workspace = true }
+daemon-vhc-safetensors = { workspace = true }
 
 [lints]
 workspace = true

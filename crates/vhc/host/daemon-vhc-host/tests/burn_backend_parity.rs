@@ -12,7 +12,7 @@
 
 mod tolerance;
 
-use daemon_train::{AdamwHp, BurnNdarrayBackend, CpuBackend, OpBackend};
+use daemon_vhc_host::{AdamwHp, BurnNdarrayBackend, CpuBackend, OpBackend};
 use tolerance::{assert_close, assert_parity, Fixture, OpClass};
 
 fn backends() -> (BurnNdarrayBackend, CpuBackend) {

@@ -4,7 +4,7 @@
 //! **P3 lane S — the 160M staging rehearsal (the Merge-2 pre-staging exit criterion).**
 //!
 //! The P2 gate pre-staged the experiment `.wasm` on every fleet box (`DAEMON_TRAIN_MODULE`) and used
-//! a synthetic corpus. This harness proves the replacement end to end: N local `daemon-train-worker`
+//! a synthetic corpus. This harness proves the replacement end to end: N local `daemon-vhc-worker`
 //! subprocesses join a real live run and fetch **everything** from the payload store by content hash
 //! — the module (`modules/<blake3>.wasm`, resolved at assess via the envelope artifact map) and the
 //! pre-tokenized corpus (`corpus/<blake3>.{json,bin}`, resolved at join via `EngineParams.corpus`) —
@@ -50,14 +50,10 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
-use daemon_swarm_net::ControlPlane;
-use daemon_swarm_net::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
-use daemon_swarm_observe::desync::digest_tally_from_log;
-use daemon_swarm_observe::{MessageLog, RunHealth};
-use daemon_swarm_run::protocol::{
-    CorpusRef, EngineParams, Event, JoinCredentials, JoinPolicy, LeaveMode, PolicyMode, WsAuthSpec,
-};
-use daemon_train_client::{TrainClientConfig, TrainSupervisor};
+use daemon_vhc_net::ControlPlane;
+use daemon_vhc_net::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
+use daemon_vhc_observe::desync::digest_tally_from_log;
+use daemon_vhc_observe::{MessageLog, RunHealth};
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
@@ -66,6 +62,10 @@ use daemon_vhc_proto::{
     from_canonical_slice, peer_id, to_canonical_vec, SignedMessage, SigningKey,
 };
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::protocol::{
+    CorpusRef, EngineParams, Event, JoinCredentials, JoinPolicy, LeaveMode, PolicyMode, WsAuthSpec,
+};
+use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
 const STEPS_PER_ROUND: u32 = 2;
 const MICRO_BATCH: u32 = 1;
@@ -159,20 +159,20 @@ fn ensure_built() -> PathBuf {
             .args([
                 "build",
                 "-p",
-                "daemon-train",
+                "daemon-vhc-host",
                 "--features",
                 &features,
                 "--bin",
-                "daemon-train-worker",
+                "daemon-vhc-worker",
             ])
             .status()
             .expect("run cargo for the live worker binary");
-        assert!(status.success(), "building daemon-train-worker failed");
+        assert!(status.success(), "building daemon-vhc-worker failed");
     });
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("target"));
-    let bin = target.join("debug/daemon-train-worker");
+    let bin = target.join("debug/daemon-vhc-worker");
     assert!(bin.exists(), "worker binary at {}", bin.display());
     bin
 }

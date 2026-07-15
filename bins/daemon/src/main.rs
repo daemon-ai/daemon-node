@@ -3012,19 +3012,19 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // export is inert. Per-submit drains ride the `FeedbackSubmit` handler.
     node.spawn_feedback_drain();
     // B3: bind the swarm-training service post-`Arc` when `[swarm] enabled` (the W1 `with_swarm`
-    // seam — inert by default). When on, the node hosts a `daemon-swarm-node::SwarmService` over a
-    // `daemon-train-client::TrainSupervisor`, re-converges durable join intents (§10.3), and routes
+    // seam — inert by default). When on, the node hosts a `daemon-vhc-node::SwarmService` over a
+    // `daemon-vhc-supervisor::TrainSupervisor`, re-converges durable join intents (§10.3), and routes
     // its `SwarmChanged` invalidation pointers onto the existing node feed. A `Weak` feed handle
     // avoids a node↔service `Arc` cycle. Drags no burn/wasmtime/iroh onto the default build.
     if cfg.swarm.enabled {
-        match daemon_swarm_node::SwarmStore::open(cfg.data_dir.join("swarm.db")) {
+        match daemon_vhc_node::SwarmStore::open(cfg.data_dir.join("swarm.db")) {
             Ok(store) => {
-                let worker: Arc<dyn daemon_swarm_node::WorkerControl> =
-                    Arc::new(daemon_train_client::TrainSupervisor::new(
-                        daemon_train_client::TrainClientConfig::new(&cfg.swarm.worker_path),
+                let worker: Arc<dyn daemon_vhc_node::WorkerControl> =
+                    Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(
+                        daemon_vhc_supervisor::TrainClientConfig::new(&cfg.swarm.worker_path),
                     ));
                 let weak = Arc::downgrade(&node);
-                let feed: daemon_swarm_node::NodeFeed = Arc::new(move |ev| {
+                let feed: daemon_vhc_node::NodeFeed = Arc::new(move |ev| {
                     if let Some(n) = weak.upgrade() {
                         n.emit_node_event(ev);
                     }
@@ -3034,7 +3034,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 // follow-on. An empty base keeps `discovery: None` (the W1 probe fallback against
                 // the allowlist), so existing configs are unchanged. The base/auth are pure config:
                 // the same node targets wrangler-dev or a real workers.dev deployment by config only.
-                let discovery: Option<Arc<dyn daemon_swarm_node::RunDiscovery>> = if cfg
+                let discovery: Option<Arc<dyn daemon_vhc_node::RunDiscovery>> = if cfg
                     .swarm
                     .registry
                     .base
@@ -3044,8 +3044,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 } else {
                     match daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()) {
                         Ok(egress) => {
-                            use daemon_swarm_run::config::RegistryAuthConfig;
-                            let mut registry = daemon_swarm_node::RegistryClient::new(
+                            use daemon_vhc_session::config::RegistryAuthConfig;
+                            let mut registry = daemon_vhc_node::RegistryClient::new(
                                 egress,
                                 cfg.swarm.registry.base.clone(),
                             );
@@ -3058,9 +3058,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                                     registry.with_internal(org_id.clone(), actor.clone())
                                 }
                             };
-                            Some(Arc::new(daemon_swarm_node::EgressRunDiscovery::new(
-                                registry,
-                            )))
+                            Some(Arc::new(daemon_vhc_node::EgressRunDiscovery::new(registry)))
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "swarm: registry egress client failed; discovery not wired");
@@ -3068,8 +3066,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         }
                     }
                 };
-                let svc = Arc::new(daemon_swarm_node::SwarmService::new(
-                    daemon_swarm_node::SwarmServiceParts {
+                let svc = Arc::new(daemon_vhc_node::SwarmService::new(
+                    daemon_vhc_node::SwarmServiceParts {
                         config: cfg.swarm.clone(),
                         store,
                         worker,

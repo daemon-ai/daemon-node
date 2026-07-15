@@ -6,7 +6,7 @@
 // inner AdamW steps over a fixed batch (so the loss overfits *down*) + make_update, all finite. This
 // is `#[ignore]`d: a real ~152M execute pass on the GPU is minutes/GBs (Risk 3), so it is opt-in and
 // run in the CUDA lane on the RunPod 4090:
-//   nix develop .#cuda-train --command cargo test -p daemon-train --features cuda \
+//   nix develop .#cuda-train --command cargo test -p daemon-vhc-host --features cuda \
 //     --test preset_160m_cuda -- --ignored --nocapture
 // (DAEMON_CUDA_RUNTIME_DIR=/root/cuda-rt-124 for NVRTC 12.4 — swarm-ledger-p3-g).
 #![cfg(feature = "cuda")]
@@ -17,11 +17,11 @@ use std::process::Command;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use daemon_swarm_run::backend::{BatchRef, StepCtx, TrainerBackend};
-use daemon_train::{
+use daemon_vhc_host::{
     cuda_adapter_available, BackendKind, EngineConfig, WasmBackend, WasmBackendConfig,
 };
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::backend::{BatchRef, StepCtx, TrainerBackend};
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

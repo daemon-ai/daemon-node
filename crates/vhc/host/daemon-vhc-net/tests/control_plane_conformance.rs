@@ -7,14 +7,14 @@
 //! exactly once, and a duplicate publish (WS + gossip paths) still delivers once (content-hash
 //! dedupe). Loopback-only timing semantics (late-subscriber) stay in `gossip.rs`'s unit tests.
 //!
-//! [`LoopbackGossip`]: daemon_swarm_net::LoopbackGossip
-//! [`IrohGossip`]: daemon_swarm_net::IrohGossip
+//! [`LoopbackGossip`]: daemon_vhc_net::LoopbackGossip
+//! [`IrohGossip`]: daemon_vhc_net::IrohGossip
 
 mod common;
 
 use std::sync::Arc;
 
-use daemon_swarm_net::{ControlPlane, LoopbackGossip};
+use daemon_vhc_net::{ControlPlane, LoopbackGossip};
 
 use common::{conformance_dedupe, conformance_fanout, Mesh};
 

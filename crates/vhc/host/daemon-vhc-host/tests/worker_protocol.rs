@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
-// The `daemon-train-worker` binary speaks the frozen `daemon_swarm_run::protocol` over the
+// The `daemon-vhc-worker` binary speaks the frozen `daemon_vhc_session::protocol` over the
 // length-framed stdio cut. Two integration paths:
-//   * through `daemon-train-client::TrainSupervisor` (the node-side supervisor) — probe/assess/join;
+//   * through `daemon-vhc-supervisor::TrainSupervisor` (the node-side supervisor) — probe/assess/join;
 //   * a lower-level direct subprocess drive — observe the self-driven one-round `RoundOutcome`.
 // Both spawn the real binary against a real tiny-llama `.wasm`.
 //
@@ -18,14 +18,14 @@ use std::time::Duration;
 
 use daemon_common::SessionId;
 use daemon_provision::{Placement, PlacementSpec, ProcessProvisioner, Provisioner};
-use daemon_swarm_run::protocol::{self, Command as WCmd, Event, JoinPolicy, PolicyMode};
-use daemon_train_client::{TrainClientConfig, TrainSupervisor};
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_session::protocol::{self, Command as WCmd, Event, JoinPolicy, PolicyMode};
+use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
 // -- guest module loading (mirrors tests/guest_lifecycle.rs) ------------------------------------
 
@@ -147,7 +147,7 @@ fn tiny_cfg_cbor() -> Vec<u8> {
 }
 
 fn worker_bin() -> String {
-    env!("CARGO_BIN_EXE_daemon-train-worker").to_string()
+    env!("CARGO_BIN_EXE_daemon-vhc-worker").to_string()
 }
 
 // -- through TrainSupervisor (the node-side supervisor) ------------------------------------------
@@ -371,7 +371,7 @@ async fn worker_drives_one_round() {
         )],
     };
     let Placement { channel, mut child } = ProcessProvisioner::new()
-        .place(&SessionId::new("daemon-train-worker-e3"), spec)
+        .place(&SessionId::new("daemon-vhc-worker-e3"), spec)
         .await
         .expect("spawn worker");
     let (writer, mut reader) = channel.split();

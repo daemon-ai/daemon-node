@@ -13,12 +13,14 @@ use async_trait::async_trait;
 use daemon_api::{
     NodeEvent, SwarmApi, SwarmEligibility, SwarmEvent, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode,
 };
-use daemon_swarm_node::service::{NodeFeed, SwarmError, WorkerControl};
-use daemon_swarm_node::{
+use daemon_vhc_node::service::{NodeFeed, SwarmError, WorkerControl};
+use daemon_vhc_node::{
     DiscoveredRun, RunDiscovery, SwarmService, SwarmServiceParts, SwarmStore, EVENT_WINDOW,
 };
-use daemon_swarm_run::config::SwarmConfig;
-use daemon_swarm_run::protocol::{self, Eligibility, ErrorClass, Hardware, JoinPolicy, LeaveMode};
+use daemon_vhc_session::config::SwarmConfig;
+use daemon_vhc_session::protocol::{
+    self, Eligibility, ErrorClass, Hardware, JoinPolicy, LeaveMode,
+};
 use futures::StreamExt;
 
 /// A recording fake of the worker-control seam.

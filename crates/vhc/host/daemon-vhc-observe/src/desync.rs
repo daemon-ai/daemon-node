@@ -7,7 +7,7 @@
 //! Folding a round's digests yields a **quorum digest** (the value a quorum of peers agree on) and
 //! the **outlier** set (peers that diverged) — the observe-driven desync trigger the runtime lane's
 //! resync path consumes (§9). This crate produces the [`DesyncVerdict`]; wiring it into
-//! `daemon-swarm-run`'s `checkpoint.rs` is lane R3's side (the marker it awaits).
+//! `daemon-vhc-session`'s `checkpoint.rs` is lane R3's side (the marker it awaits).
 
 use std::collections::BTreeMap;
 

@@ -21,7 +21,7 @@
 mod reference;
 mod tolerance;
 
-use daemon_train::BackendKind;
+use daemon_vhc_host::BackendKind;
 use daemon_vhc_sdk::models::{AdamWCfg, TinyLlamaCfg};
 
 use reference::{assert_parity, drive_reference, drive_tabi, TokenBatch};
