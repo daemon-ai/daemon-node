@@ -32,6 +32,9 @@ pub(crate) struct ResolvedRun {
     /// The envelope's additive `device_min` section (ABI §9.3 stage-3 pre-screen; D3 cell 5
     /// interim-supported), parsed from the RAW frozen bytes — `None` on the legacy raw-config path.
     pub(crate) device_min: Option<daemon_vhc_proto::DeviceMinimums>,
+    /// The decoded typed envelope (the coordinator-config source for the v2 self-driven join);
+    /// `None` on the legacy raw-config path (which has no coordinator to drive).
+    pub(crate) envelope: Option<daemon_vhc_proto::Envelope>,
 }
 
 /// Resolve the `AssessRun` envelope bytes into `(config, module)` (the §6.1/§6.5 seam).
@@ -48,12 +51,14 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
             let frozen = wire.open().map_err(|e| format!("verify envelope: {e}"))?;
             let config = frozen.config_bytes().to_vec();
             let device_min = frozen.device_min();
+            let envelope = frozen.decode().ok();
             let (module, module_blake3) = resolve_module(&frozen).await?;
             Ok(ResolvedRun {
                 config,
                 module,
                 module_blake3,
                 device_min,
+                envelope,
             })
         }
         // Not a signed-envelope wrapper: the legacy raw `[experiment.config]` CBOR path.
@@ -67,6 +72,7 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
                 module,
                 module_blake3: None,
                 device_min: None,
+                envelope: None,
             })
         }
     }
@@ -805,7 +811,21 @@ fn assess_v2(
     module_blake3: Option<&[u8; 32]>,
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
 ) -> Eligibility {
-    let lane = daemon_vhc_host::v2::ParticipationLane::trainer_launch_defaults();
+    // The owner's node-side lane configuration seam (§9.6: "numbers are deployment config").
+    // Until the node client carries lane config, `DAEMON_VHC_LANE_GPU_OPTIONAL=1` selects a
+    // CPU-admitting dev/t2 lane (GPU optional, no device floors, the same claim bounds) — the
+    // owner's explicit choice, exactly like `DAEMON_TRAIN_BACKEND=cpu` on the v1 path.
+    let lane = if std::env::var_os("DAEMON_VHC_LANE_GPU_OPTIONAL").is_some_and(|v| v == "1") {
+        daemon_vhc_host::v2::ParticipationLane {
+            gpu: 1,
+            vram_bytes: 0,
+            ram_bytes: 0,
+            disk_bytes: 0,
+            ..daemon_vhc_host::v2::ParticipationLane::trainer_launch_defaults()
+        }
+    } else {
+        daemon_vhc_host::v2::ParticipationLane::trainer_launch_defaults()
+    };
     let hw = hardware();
     let dl = device_limits();
     let device = daemon_vhc_host::v2::DeviceProfile {
@@ -819,14 +839,15 @@ fn assess_v2(
         vram_cap_bytes: 0,
         host_cap_bytes: 0,
     };
-    // Phase-A grants: the derived grants document lands with the v2 join wiring; assess evaluates
-    // the claim against empty grants (a pure-function input the module must tolerate, §9.1).
+    // The derived grants document (§2.6 stand-in): the SAME deterministic derivation the v2 join
+    // uses, so assess and join evaluate byte-identical (config, grants) pairs (§9.4 pinning).
+    let grants = crate::v2_session::derive_grants();
     match daemon_vhc_host::v2::admit_v2(
         worker,
         module,
         module_blake3,
         config,
-        &[],
+        &grants,
         &lane,
         &device,
         &owner,

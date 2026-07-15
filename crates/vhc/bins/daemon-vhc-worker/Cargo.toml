@@ -26,6 +26,9 @@ daemon-vhc-abi = { workspace = true }
 daemon-vhc-host = { workspace = true }
 # The R↔E seam + the frozen node↔worker wire (`daemon_vhc_session::protocol`) this binary speaks.
 daemon-vhc-session = { workspace = true }
+# The pure native coordinator tick the v2 self-driven join drives in-process (the D3 cell-5/6
+# whole-run shape: v2 worker module × native coordinator × envelope v1).
+daemon-vhc-coordinator = { workspace = true }
 # Envelope open/verify (`SignedEnvelope`) on the assess path.
 daemon-vhc-proto = { workspace = true }
 # The envelope artifact plane (`ArtifactResolver`, `file://` blake3-verified) the worker uses to
@@ -36,6 +39,10 @@ daemon-vhc-net = { workspace = true }
 daemon-provision = { workspace = true }
 # Async runtime for the stdio command/event loop.
 tokio = { workspace = true }
+# Grants-document + coordinator-message CBOR on the v2 join path; payload hashing at the commit
+# seam (plumbing-owned sealing, Phase A).
+ciborium = { workspace = true }
+blake3 = { workspace = true }
 # Consent-gated crash reporting (panics + native minidumps — the worker links heavy native engine
 # trees, so a segfault is a real failure mode). A runtime no-op unless the spawning node injected
 # a DSN + `DAEMON_CRASH_CONSENT=1`.

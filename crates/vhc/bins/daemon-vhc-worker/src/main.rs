@@ -47,6 +47,7 @@ mod backend;
 #[cfg(feature = "swarm-net")]
 mod live;
 mod transport;
+mod v2_session;
 
 use daemon_provision::{CutChannel, CutWriter};
 use daemon_vhc_session::protocol::{self, Command, ErrorClass, Event};
@@ -174,16 +175,34 @@ async fn main() {
                     continue;
                 };
                 if run_is_v2 {
-                    send(
+                    // The v2 join (A2 close-out): the session event-pump attach, driven by the
+                    // in-process native coordinator over the run's frozen envelope. A raw-config
+                    // AssessRun has no envelope, hence no coordinator config — refused loud.
+                    let Some(envelope) = resolved.envelope.clone() else {
+                        send(
+                            &writer,
+                            &worker_error(
+                                "JoinRun for a major-2 module without a signed run envelope: \
+                                 the v2 session needs the envelope (the coordinator-config \
+                                 source); author a SignedEnvelope AssessRun instead of raw \
+                                 config bytes",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    };
+                    match v2_session::join_and_run_v2(
+                        &resolved.module,
+                        &resolved.config,
+                        &envelope,
+                        &run_id,
                         &writer,
-                        &worker_error(
-                            "JoinRun for a major-2 module: assess (claim funnel) succeeded, but \
-                             this worker's v2 run wiring (the session event-pump attach) lands \
-                             with the A2 choreography move — join refused loud rather than \
-                             mis-driving the v1 five-phase path",
-                        ),
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(detail) => send(&writer, &worker_error(&detail)).await,
+                    }
                     continue;
                 }
                 // A3 live attach (feature `swarm-net`): if the node authored a `JoinCredentials`

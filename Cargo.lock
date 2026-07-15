@@ -5074,6 +5074,7 @@ dependencies = [
  "daemon-provision",
  "daemon-telemetry",
  "daemon-vhc-abi",
+ "daemon-vhc-coordinator",
  "daemon-vhc-host",
  "daemon-vhc-net",
  "daemon-vhc-proto",
