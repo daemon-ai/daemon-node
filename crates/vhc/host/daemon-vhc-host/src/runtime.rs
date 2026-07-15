@@ -1089,24 +1089,7 @@ impl Instance {
     /// rebuild them, ABI §5.1). Feed this to `daemon_vhc_proto::digest::digest_state`.
     #[must_use]
     pub fn canonical_state_bytes(&self) -> Vec<u8> {
-        let d = self.store.data();
-        let mut buf = Vec::new();
-        for p in &d.params {
-            for v in d.backend.view(p.master) {
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        for s in d.persistents.iter().filter(|s| s.class == 1) {
-            for v in d.backend.view(s.tensor) {
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        for s in d.det_persistents.iter().filter(|s| s.class == 1) {
-            for v in d.backend.view(s.tensor) {
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        buf
+        self.store.data().canonical_state_bytes_of()
     }
 
     /// Serialize the full worker state dict with blake3 integrity (§9): `blake3(body) ++ body`,
