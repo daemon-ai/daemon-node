@@ -27,7 +27,9 @@
 #![forbid(unsafe_code)]
 
 pub mod assignment;
+pub mod attestation;
 pub mod authority;
+pub mod checkpoint;
 pub mod committed;
 pub mod coordinator;
 
@@ -37,9 +39,17 @@ pub use assignment::{
     witness_quorum, Committee, Lcg, ASSIGN_SALT, CHECKPOINTER_SALT, VERIFIER_SALT, WITNESS_SALT,
     WITNESS_TARGET_DEFAULT,
 };
+pub use attestation::{
+    AttestationBody, AttestationError, AttestationLedger, AttestationPolicy, AttestationTier,
+    JoinEligibility, SignedAttestation, ATTEST_DOMAIN,
+};
 pub use authority::{
     AuthError, Authority, AuthorityConfig, AuthorityContract, Authorized, FaultThreshold, Finality,
     Reconfiguration, RecordSig, SingleKey, ThresholdKeys, Topology, DEFAULT_RECORDS_CHANNEL,
+};
+pub use checkpoint::{
+    CheckpointError, CheckpointManifest as TypedCheckpointManifest, CheckpointManifestBuilder,
+    CheckpointSection, SectionClass, SectionKind, CHECKPOINT_MANIFEST_SCHEMA,
 };
 pub use committed::{
     Committed, CommittedItem, HostStaged, MintError, PayloadCheck, PayloadRepr, PayloadSource,

@@ -26,6 +26,8 @@
 
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
+pub use daemon_vhc_safetensors::StateDict;
+
 use crate::seam::{ContentHash, PeerId, RoundId};
 
 /// The engine seam the participant runtime drives (ABI §2.3 lifecycle).
@@ -65,6 +67,20 @@ pub trait TrainerBackend: Send {
 
     /// Restore state from [`TrainerBackend::checkpoint_save`] bytes (resync / rejoin, §9).
     fn checkpoint_load(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+
+    /// Export the module's state as a **typed** [`StateDict`] (parameter list in registration
+    /// order, ABI §6.3) for the checkpoint bridge's typed `module` section (Phase E, refactor §9).
+    ///
+    /// This is the point where `daemon-vhc-safetensors` wires into the checkpoint path: a backend
+    /// that can present its state as fp32 named tensors returns `Some`, and
+    /// [`crate::checkpoint::save_typed_checkpoint`] serializes it into a portable, content-addressed
+    /// safetensors `module` section — the typed serialization *before* manifests reshape it. The
+    /// authoritative bit-exact restore still rides [`TrainerBackend::checkpoint_save`] bytes (kept
+    /// as a `worker-local` section), so this export never weakens exact recovery. The default is
+    /// `None` (no typed export; the opaque bytes are the module section).
+    fn export_state_dict(&self) -> Result<Option<StateDict>, Self::Error> {
+        Ok(None)
+    }
 }
 
 /// Meta-mode inputs: this peer's effective resources after policy (§6.5).
@@ -341,6 +357,31 @@ impl TrainerBackend for StubBackend {
         self.accum = accum;
         Ok(())
     }
+
+    /// A typed [`StateDict`] view of the stub's state, exercising the safetensors checkpoint bridge
+    /// (Phase E). The stub's state dict is `u64`, so each word is carried **bit-losslessly** as two
+    /// `f32` (its high/low `u32` halves via `f32::from_bits`) in a `[n, 2]` tensor — safetensors
+    /// round-trips fp32 bit-for-bit ([`daemon_vhc_safetensors`] tests), so the export re-imports
+    /// exactly. `params` and `base` are the two canonical tensors, in registration order.
+    fn export_state_dict(&self) -> Result<Option<StateDict>, StubError> {
+        let params = self.params()?;
+        let base = self.base()?;
+        let mut sd = StateDict::new();
+        sd.push("params", vec![params.len(), 2], words_to_f32(params));
+        sd.push("base", vec![base.len(), 2], words_to_f32(base));
+        Ok(Some(sd))
+    }
+}
+
+/// Split each `u64` into its `[high_u32, low_u32]` halves reinterpreted as `f32` bits — a lossless
+/// `u64 → 2×f32` mapping (safetensors preserves fp32 bit patterns, including NaNs).
+fn words_to_f32(words: &[u64]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(words.len() * 2);
+    for &w in words {
+        out.push(f32::from_bits((w >> 32) as u32));
+        out.push(f32::from_bits((w & 0xffff_ffff) as u32));
+    }
+    out
 }
 
 /// Errors surfaced by [`StubBackend`].
