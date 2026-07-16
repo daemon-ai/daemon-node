@@ -143,10 +143,9 @@ wasm-encoder = { workspace = true }
 # the replay test parses it. Already a workspace pin.
 serde_json = { workspace = true }
 # Test-only: the guest-lifecycle / parity tests build the `TinyLlamaCfg` the wasm guest parses.
-# `sim` compiles the SDK's `models`/`profiles` (config types) natively for the tests; never a
-# runtime edge (the host does not link the guest SDK). NOTE: this remaining host->SDK dev-dep is a
-# tracked dependency-direction exception (model presets leave the SDK for `guests/` in Phase C).
-daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
+# (Phase-E sunset) the host->SDK dev-dep for the v1 oracle/reference/determinism harnesses was
+# REMOVED with those harnesses (decisions D5); the parity tests consume the RECORDED
+# v1-parity-oracle fixture instead.
 # Test-only (C3 models-exodus parity harness): the re-expressed profiles crate is the NATIVE
 # oracle half of the C3b lowering gate (the same det-lane transition the guest runs in wasm32,
 # executed natively against the dual-compiled model source). A tracked dependency-direction

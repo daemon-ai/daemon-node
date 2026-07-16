@@ -3,25 +3,26 @@
 
 //! `daemon-vhc-host` — the training worker library + host runtime.
 //!
-//! The worker binary's engine: the tensor ABI + module sandbox (meta / trace / execute, tensor-ABI
-//! spec §5.1), the lifecycle driver, param / persistent storage, the deterministic ops + kernels,
-//! and the first-party preset experiments (swarm-training-spec.md §10.1). It links the heavy trees
-//! — wasmtime (guest sandbox) and Burn (engine) — because it *is* the isolated worker fault domain;
-//! the node process never links them.
+//! The worker binary's engine: the module sandbox (wasmtime, ABI §2.2), the major-2 event-loop
+//! driver ([`v2`]) with the §2.5 `tabi@1` compute bridge, the ABI §1.3 driver-selection front
+//! door ([`select`]), the `compute@2` runner ([`compute`]), the permanent device probe
+//! ([`probe`]), and the deterministic ops + kernels. It links the heavy trees — wasmtime (guest
+//! sandbox) and Burn (engine) — because it *is* the isolated worker fault domain; the node
+//! process never links them.
 //!
-//! Present now (lane E, Wave 1): the wasmtime host profile + `InstancePre` re-instantiation, the
-//! generational lane-tagged handle arena, the typed trap taxonomy, the phase-legality table, the
-//! `OpBackend` engine seam (a CPU fake this wave; burn slots in at Wave 2), the budget levers, and
-//! the lifecycle driver against a subset of the `tabi@1` vocabulary. The worker protocol
-//! (CBOR-over-stdio, §10.2) is Wave 3.
+//! **The v1 five-phase driver retired at the Phase-E sunset** (decisions D5): the `Instance`
+//! lifecycle dispatch, the phase-legality table, and the autotune admission were removed in one
+//! auditable step; a major-1 module now meets a typed `AbiUnsupportedMajor` admission refusal
+//! (the flipped A0 fixture is the standing regression). The `TENSOR_ABI_MAJOR`/`VERSION`
+//! constants and the frozen 66-import vocabulary (`daemon-vhc-abi`) remain as the historical
+//! record and the live §2.5 bridge surface.
 
-// `deny` (not `forbid`) so the two cfg-gated platform-probe FFI modules in `autotune` can carry a
+// `deny` (not `forbid`) so the two cfg-gated platform-probe FFI modules in `probe` can carry a
 // scoped `#[allow(unsafe_code)]` (DXGI/D3D12 on Windows; the Objective-C runtime + `sysctlbyname` on
 // macOS). Every other line of the crate still errors on stray `unsafe`; the worker bin keeps its
 // own `#![forbid(unsafe_code)]` and only calls the safe probe wrappers. See swarm-ledger-p2-c2 D1.
 #![deny(unsafe_code)]
 
-pub mod autotune;
 pub mod backend;
 // The burn autodiff engine backs the G1 `burn-ndarray` (CPU), G2 `wgpu` (Vulkan), and P3 Lane-G
 // `cuda` (NVIDIA) lanes; the generic `BurnBackend<B>` impl needs only burn-tensor (always on), so the
@@ -33,8 +34,9 @@ pub mod burn_backend;
 // `burn` dep pins `ndarray`+`autodiff`); wgpu/cuda ride the same generic seam behind their features.
 pub mod compute;
 pub mod handle;
-pub mod meta;
-pub mod phase;
+// The PERMANENT device probe (decisions D5: "the device probe stays forever") — split out of the
+// retired autotune-admission module at the Phase-E sunset.
+pub mod probe;
 pub mod runtime;
 pub mod select;
 pub mod trap;
@@ -42,7 +44,6 @@ pub mod v2;
 // (A2 inversion): `wasm_backend` moved to `daemon-vhc-session` — the host no longer links the
 // session, so the TrainerBackend seam impl lives with the trait (refactor §5 A2 item 3).
 
-pub use autotune::{Autotune, AutotuneVerdict, DeviceLimits, ProbeStep};
 pub use backend::{AdamwHp, CpuBackend, OpBackend, TensorId};
 #[cfg(any(feature = "burn-ndarray", feature = "wgpu", feature = "cuda"))]
 pub use burn_backend::BurnBackend;
@@ -54,21 +55,20 @@ pub use burn_backend::{cuda_adapter_available, BurnCudaBackend};
 pub use burn_backend::{wgpu_adapter_available, BurnWgpuBackend};
 pub use compute::{unservable_op, ComputeError, ComputeRunner, HostReal};
 pub use handle::{HandleClass, Lane};
-pub use meta::MetaReport;
-pub use phase::Phase;
+pub use probe::DeviceLimits;
 pub use runtime::BackendKind;
-pub use runtime::{EngineConfig, Instance, LoadedModule, Manifest, ParamInfo, Worker};
+pub use runtime::{EngineConfig, Worker};
 pub use select::{select_driver, Selection};
 pub use trap::{Trap, TrapCode};
 
-/// The tensor-ABI major version this worker implements.
+/// The retired v1 tensor-ABI major (the FROZEN historical record — decisions D5: the sunset
+/// removed the DRIVER, not the vocabulary; `tabi@1` lives on as the §2.5 bridge under major 2).
 pub const TENSOR_ABI_MAJOR: u32 = 1;
-/// The tensor-ABI minor version this worker implements.
+/// The retired v1 tensor-ABI minor (frozen historical record).
 pub const TENSOR_ABI_MINOR: u32 = 0;
 
-/// The tensor-ABI version this worker implements, packed as `(major << 16) | minor`.
-///
-/// Must match the guest's `da_abi` export for a module to be instantiated (tensor-ABI spec).
+/// The v1 tensor-ABI version, packed as `(major << 16) | minor` (frozen historical record; a
+/// module declaring it is refused `AbiUnsupportedMajor` since the Phase-E sunset).
 pub const TENSOR_ABI_VERSION: u32 = (TENSOR_ABI_MAJOR << 16) | TENSOR_ABI_MINOR;
 
 /// Errors surfaced by the worker host runtime.

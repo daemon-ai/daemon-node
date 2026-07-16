@@ -94,15 +94,19 @@ fn pack(major: u32, minor: u32) -> u32 {
     (major << 16) | minor
 }
 
-// -- positive: the v1 shape still selects the v1 driver ------------------------------------------
+// -- Phase-E sunset FLIP (decisions D5): the v1 shape is refused typed, never admitted ------------
+// (Through the dual-driver transition this was the positive "v1 module admitted to the v1 driver"
+// pin; the sunset removed the driver, so the SAME well-formed module now meets the clean
+// AbiUnsupportedMajor — the candidate/declaration cross-check passes, then the host refuses the
+// unimplemented major. The A0 frozen fixture pins this over the real pre-refactor bytes.)
 
 #[test]
-fn v1_shaped_module_selects_v1_driver() {
+fn v1_shaped_module_is_refused_abi_unsupported_major_post_sunset() {
     let wasm = build_module(&[], V1_EXPORTS, pack(1, 0));
-    let sel = select_driver(&worker(), &wasm, Some(blake3::hash(&wasm).as_bytes()))
-        .expect("v1 module admitted");
-    assert_eq!(sel.driver, CandidateDriver::V1);
-    assert_eq!((sel.major, sel.minor), (1, 0));
+    let err = select_driver(&worker(), &wasm, Some(blake3::hash(&wasm).as_bytes()))
+        .expect_err("a v1 module is refused on a post-sunset host");
+    assert_eq!(err.code, AbiRefusalCode::AbiUnsupportedMajor);
+    assert!(err.detail.contains("major 1"));
 }
 
 // -- A2: a well-formed major-2 module is ADMITTED to the event-loop driver (was: A0's clean
@@ -169,10 +173,13 @@ fn v2_shape_declaring_major1_is_declaration_mismatch() {
 // -- minor gate -----------------------------------------------------------------------------------
 
 #[test]
-fn v1_minor_above_host_is_minor_too_new() {
+fn v1_any_minor_is_unsupported_major_post_sunset() {
+    // Pre-sunset this pinned AbiMinorTooNew (minor 7 > host v1 minor 0); with major 1 no longer
+    // implemented the major check fires first — the refusal is AbiUnsupportedMajor regardless of
+    // the declared minor (the minor gate remains pinned by the v2 arms below).
     let wasm = build_module(&[], V1_EXPORTS, pack(1, 7));
-    let err = select_driver(&worker(), &wasm, None).expect_err("minor 7 > host minor 0");
-    assert_eq!(err.code, AbiRefusalCode::AbiMinorTooNew);
+    let err = select_driver(&worker(), &wasm, None).expect_err("major 1 is not implemented");
+    assert_eq!(err.code, AbiRefusalCode::AbiUnsupportedMajor);
 }
 
 // -- the B1 minor-0→1 bump: both-side pins (ABI §1.3 step 5, §1.4) ----------------------------------
@@ -289,7 +296,10 @@ fn tabi_only_without_v1_lifecycle_is_bad_module() {
 // -- step 6: required exports for the selected major -------------------------------------------------
 
 #[test]
-fn v1_candidate_missing_da_manifest_is_bad_module() {
+fn v1_candidate_missing_da_manifest_is_unsupported_major_post_sunset() {
+    // Pre-sunset this pinned the step-6 BadModule ("required export `da_manifest` missing");
+    // post-sunset the step-5 major refusal fires first — the v1 candidate never reaches the
+    // export check (the v2 step-6 arm keeps that stage pinned via V2_REQUIRED_EXPORTS tests).
     let wasm = build_module(
         &[],
         &[
@@ -304,9 +314,8 @@ fn v1_candidate_missing_da_manifest_is_bad_module() {
         ],
         pack(1, 0),
     );
-    let err = select_driver(&worker(), &wasm, None).expect_err("missing export must refuse");
-    assert_eq!(err.code, AbiRefusalCode::BadModule);
-    assert!(err.detail.contains("da_manifest"));
+    let err = select_driver(&worker(), &wasm, None).expect_err("v1 candidate must refuse");
+    assert_eq!(err.code, AbiRefusalCode::AbiUnsupportedMajor);
 }
 
 // -- refusals are admission outcomes, not traps ------------------------------------------------------

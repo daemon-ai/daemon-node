@@ -11,11 +11,6 @@ path = "src/lib.rs"
 # The local-mode swarm runner (B3): drives the round protocol over a selectable transport
 # (loopback | real iroh mesh) + a filesystem store. Needs `iroh` (which pulls in `harness`), so the
 # default participant build never compiles it.
-[[bin]]
-name = "swarm-local"
-path = "src/bin/swarm-local.rs"
-required-features = ["iroh"]
-
 # The recorded-run verification entry point (B2): replays `--observe` artifacts through the pure
 # coordinator `tick` and asserts per-round consensus re-derives. Needs `harness` (observe + the
 # coordinator shell) but NOT `iroh` — it verifies offline from files, so it builds transport-free.
@@ -31,10 +26,10 @@ required-features = ["harness"]
 # Clock inputs) to external crates. Kept out of the default build; the `tests/daemon-swarm-e2e` crate
 # enables it. The crate's own unit tests reach the harness via `cfg(test)` (no feature needed).
 harness = ["dep:daemon-vhc-observe"]
-# `iroh` adds the live-transport harness (`live_harness`): the round engine over a real per-node
-# `IrohGossip` mesh + a shared `FsPayloadStore`. It layers on `harness` (the coordinator shell) and
-# turns on `daemon-vhc-net`'s off-default `iroh` feature. Kept out of the default build; the
-# `tests/daemon-swarm-e2e` crate + `bins/swarm-local` enable it. NOT a root Cargo.toml change.
+# `iroh` layered the live-transport harness (`live_harness`) on `harness`; that harness RETIRED
+# with the v1 driver at the Phase-E sunset (it drove the v1 WasmBackend over the engine). The
+# feature is kept as a passthrough so external `--features iroh` invocations stay valid, but it
+# gates no session code any more.
 iroh = ["harness", "daemon-vhc-net/iroh"]
 
 [dependencies]
