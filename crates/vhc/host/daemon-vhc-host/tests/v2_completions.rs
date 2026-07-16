@@ -352,9 +352,15 @@ fn minor0_module_never_sees_tag6_and_declaration_below_imports_is_refused() {
         1
     );
 
-    // (c) A declared minor above the host's stays AbiMinorTooNew: 2.2 > 2.1.
-    assert!(daemon_vhc_abi::host_minor_for(2) == Some(1));
-    // (Selection-level 2.2 refusal is pinned in driver_selection.rs alongside the wasm-encoder
-    // fixtures; here the constant is the honest pin.)
+    // (c) A declared minor above the host's stays AbiMinorTooNew — pin the host's implemented
+    // minor through the constant, not a literal (it moves with each phase's bump: B1 took it to
+    // 1, C1's Phase-C bump to 2).
+    assert!(daemon_vhc_abi::host_minor_for(2) == Some(daemon_vhc_abi::DA_ABI_MINOR_V2));
+    assert!(
+        daemon_vhc_abi::DA_ABI_MINOR_V2 >= 1,
+        "completions are implemented"
+    );
+    // (Selection-level above-host refusal is pinned in driver_selection.rs alongside the
+    // wasm-encoder fixtures; here the constant is the honest pin.)
     let _ = AbiRefusalCode::AbiMinorTooNew;
 }
