@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Once;
 
-use daemon_vhc_abi::CandidateDriver;
+use daemon_vhc_abi::{AbiRefusalCode, CandidateDriver};
 use daemon_vhc_host::v2::RunEnd;
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::{peek_schema, peer_id, Hash, SigningKey, GENESIS_SCHEMA_MAJOR};
@@ -133,17 +133,20 @@ fn cell8_two_workers_agree_on_the_det_lane_digest() {
 
 // -- cells 3/7: wasm coordinator × envelope v1 — REFUSED, typed ------------------------------------
 
-/// Cell 3: a v1 worker module (the pinned pre-refactor tiny-llama fixture — `select_driver`
-/// proves the axis) under a wasm coordinator and envelope v1. The coordinator-side refusal fires
-/// regardless of the worker: envelope v1 cannot pin a coordinator module or name an Authority.
+/// Cell 3: a v1 worker module under a wasm coordinator and envelope v1. **Post-sunset the cell
+/// is doubly refused** (decisions D5): the worker axis itself now meets the typed
+/// `AbiUnsupportedMajor` at the §1.3 front door (the v1 driver retired — pre-sunset this
+/// asserted `CandidateDriver::V1` selection), and the coordinator-side refusal fires regardless:
+/// envelope v1 cannot pin a coordinator module or name an Authority.
 #[test]
 fn cell3_v1_worker_wasm_coordinator_envelope_v1_refused_typed() {
-    // The worker-module axis: the v1 fixture selects the v1 five-phase driver.
+    // The worker-module axis: the v1 module is refused typed at driver selection (the sunset).
     let v1_worker = guest_wasm("tiny_llama");
     let engine = Worker::new(EngineConfig::default()).expect("engine");
     let hash = *blake3::hash(&v1_worker).as_bytes();
-    let sel = select_driver(&engine, &v1_worker, Some(&hash)).expect("v1 selection");
-    assert_eq!(sel.driver, CandidateDriver::V1, "the worker axis is v1");
+    let refusal = select_driver(&engine, &v1_worker, Some(&hash))
+        .expect_err("the v1 worker axis is refused post-sunset");
+    assert_eq!(refusal.code, AbiRefusalCode::AbiUnsupportedMajor);
 
     // The coordinator axis: envelope v1 cannot configure a wasm coordinator — typed refusal.
     let bytes = frozen_v1_envelope_bytes();
@@ -178,12 +181,15 @@ fn cell7_v2_worker_wasm_coordinator_envelope_v1_refused_typed() {
 /// v1 path — never a silent misparse.
 #[test]
 fn cell4_v1_worker_wasm_coordinator_envelope_v2_refused_typed() {
-    // The worker-module axis: v1.
+    // The worker-module axis: v1 — refused typed at driver selection since the Phase-E sunset
+    // (pre-sunset this asserted `CandidateDriver::V1` selection; the cell stays refused, now
+    // doubly: unsupported worker major AND the v1 opener refusing genesis bytes below).
     let v1_worker = guest_wasm("tiny_llama");
     let engine = Worker::new(EngineConfig::default()).expect("engine");
     let hash = *blake3::hash(&v1_worker).as_bytes();
-    let sel = select_driver(&engine, &v1_worker, Some(&hash)).expect("v1 selection");
-    assert_eq!(sel.driver, CandidateDriver::V1);
+    let refusal = select_driver(&engine, &v1_worker, Some(&hash))
+        .expect_err("the v1 worker axis is refused post-sunset");
+    assert_eq!(refusal.code, AbiRefusalCode::AbiUnsupportedMajor);
 
     // A well-formed genesis envelope v2 (the same authoring the cell-8 positive uses).
     let coordinator = guest_wasm("coordinator_quorum");
