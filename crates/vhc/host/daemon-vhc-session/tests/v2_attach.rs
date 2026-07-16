@@ -9,7 +9,7 @@
 
 use ciborium::value::Value;
 use daemon_vhc_proto::sign::{peer_id, sign_canonical};
-use daemon_vhc_proto::SigningKey;
+use daemon_vhc_proto::{Hash, RunKeyCertificate, SigningKey};
 use daemon_vhc_session::v2_attach::{InboundFrames, InboundVerdict};
 
 const RUN: [u8; 32] = [0xA1; 32];
@@ -132,5 +132,47 @@ fn a_frame_from_another_run_scope_is_refused() {
     assert!(matches!(
         v.accept(&frame(&key, 0, 0, b"x")),
         InboundVerdict::ScopeMismatch(_)
+    ));
+}
+
+// -- D1 certified per-run keys, layered around the retained A2 verifier (architecture §4.3) --------
+
+#[test]
+fn certified_sender_delivers_and_an_uncertified_one_is_downgrade_refused() {
+    // The frame builder signs with `key` under scope (RUN, epoch 0, role "trainer", instance 1).
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let base = SigningKey::from_bytes(&[7; 32]); // the trusted base machine identity
+                                                 // The base certifies `key`'s per-run key for exactly this scope, epochs 0..=3.
+    let cert = RunKeyCertificate::issue(&base, Hash(RUN), "trainer", 1, 0, 3, peer_id(&key))
+        .expect("issue cert");
+    let mut v = InboundFrames::with_certs(RUN, 0, peer_id(&base), vec![cert]);
+
+    // A v2 signer (certified per-run key) is accepted — the cell that should accept it does.
+    assert!(matches!(
+        v.accept(&frame(&key, 0, 0, b"hello")),
+        InboundVerdict::Deliver { .. }
+    ));
+
+    // An uncertified sender (a different per-run key, no cert) — signature verifies, but the key is
+    // not certified: the signature-downgrade refusal, never a delivery.
+    let uncertified = SigningKey::from_bytes(&[42; 32]);
+    match v.accept(&frame(&uncertified, 0, 0, b"hello")) {
+        InboundVerdict::UncertifiedSender { sender, .. } => {
+            assert_eq!(sender, peer_id(&uncertified).0);
+        }
+        other => panic!("expected UncertifiedSender, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_transition_path_without_certs_delivers_an_uncertified_sender() {
+    // `InboundFrames::new` is the retained A2 verifier: it checks the frame signature over `sender`
+    // but does NOT require certification. An uncertified sender still delivers — the dual-support
+    // transition (old verifier retained through D1).
+    let uncertified = SigningKey::from_bytes(&[42; 32]);
+    let mut v = InboundFrames::new(RUN, 0);
+    assert!(matches!(
+        v.accept(&frame(&uncertified, 0, 0, b"hello")),
+        InboundVerdict::Deliver { .. }
     ));
 }
