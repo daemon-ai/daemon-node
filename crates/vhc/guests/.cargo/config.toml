@@ -1,0 +1,10 @@
+# Guest-workspace-local cargo config. This directory is a SEPARATE workspace (excluded from the
+# root daemon-node workspace), and this file applies only to cargo invocations rooted here — the
+# host build at the checkout root never sees it (a `.cargo` dir is consulted from the cwd upward,
+# and this one is a descendant, not an ancestor, of the root).
+#
+# `rustc-wrapper` pins the guest `.wasm` bytes to be path-independent across checkouts; see
+# `guest-rustc-shim.sh` for the full rationale. The path is resolved relative to this workspace
+# root (the parent of `.cargo`).
+[build]
+rustc-wrapper = "./guest-rustc-shim.sh"

@@ -85,18 +85,19 @@ fn guest_remap_rustflags() -> String {
 /// otherwise surface downstream as a NaN loss, which is the failure this guard exists to prevent.
 ///
 /// Since the guests workspace committed its `Cargo.lock` (B3 sitting 2), the guest `.wasm` is
-/// **byte-reproducible across clean rebuilds within one checkout path, modulo toolchain** — the
-/// lockfile removed the drift where floating registry patch versions re-hashed every SDK-linking
-/// guest over time (measured: two consecutive clean `build-guests` runs are byte-identical). A
-/// **hash mismatch** still only WARNS, because ONE variance source remains across worktrees /
-/// machines: cargo derives each path-package's crate-disambiguator (`-C metadata`) from its
-/// absolute manifest dir, and `--remap-path-prefix` does not rewrite that hash, so
-/// symbol-hash-ordered codegen reorders the module's code/type/func/elem sections between
-/// worktrees (the remapped path *strings* are identical; only the ordering shifts — measured:
-/// same lockfile, two worktrees, SDK-linking guests differ while path-dep-free guests are
-/// byte-stable everywhere). The committed manifest is the record of one canonical (trunk) build —
-/// see the Merge-1 decision in `docs/specs/swarm-p2-ledger.md`. Callers rebuild before loading,
-/// so the module in use is fresh.
+/// byte-reproducible across clean rebuilds within one checkout path — the lockfile removed the
+/// drift where floating registry patch versions re-hashed every SDK-linking guest over time
+/// (measured: two consecutive clean `build-guests` runs are byte-identical). The former
+/// cross-worktree/machine variance — cargo derives each path-package's crate-disambiguator
+/// (`-C metadata`) from its absolute manifest dir, which reorders symbol-hash-ordered codegen even
+/// though `--remap-path-prefix` normalises every path *string* — is now **removed** by the guests
+/// workspace's `rustc-wrapper` (`guest-rustc-shim.sh`, wired in `crates/vhc/guests/.cargo/config.toml`,
+/// C2 lead-in), which pins those crates' `-C metadata` to a crate-name-derived value. Measured:
+/// with the wrapper, all guests are byte-identical across two worktree paths. A **hash mismatch**
+/// therefore now indicates a toolchain change or genuinely changed guest source (rebuild + re-pin
+/// via `xtask build-guests`); it still only WARNS rather than failing, since the committed manifest
+/// records one canonical (devShell-toolchain) build — see the Merge-1 decision in
+/// `docs/specs/swarm-p2-ledger.md`. Callers rebuild before loading, so the module in use is fresh.
 fn verify_guest_manifest(dir: &Path) {
     let manifest = guests_root().join("guests.blake3");
     let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {

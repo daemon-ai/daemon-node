@@ -359,6 +359,14 @@ pub fn admit_v2(
         }
     }
 
+    // Custom-op admission (§9.4 step 6; architecture §3.2): every custom op the manifest requires
+    // MUST be advertised by the host custom-op registry, else a clean typed refusal — never a
+    // trap. `flash_attn@1` is the first registered fusion; the RESERVED compute@2 OperationIr::Custom
+    // wire (owned/refused by C1) resolves NAMED ops through this same registry (C2:custom-op).
+    crate::v2::custom_op::CustomOpRegistry::default()
+        .admit(&assessed.manifest_custom_ops)
+        .map_err(|refusal| FunnelRefusal::typed(4, refusal))?;
+
     // Claim-vs-lane sanity bounds (§9.3 stage 4 tail: "claim within the lane's claim bounds").
     let claim = &assessed.claim;
     let dt = claim.device_total();
@@ -423,6 +431,7 @@ struct Assessed {
     manifest_bytes: Vec<u8>,
     manifest_abi: u64,
     manifest_channels: Vec<u64>,
+    manifest_custom_ops: Vec<String>,
 }
 
 /// The fuel budget for the whole assessment pass (`da_manifest` + `da_claim` ×2): minimal — a
@@ -510,7 +519,7 @@ fn assess_instance(
         "da_manifest",
         &[cfg_ptr, config.len() as u32],
     )?;
-    let (manifest_abi, manifest_channels) = decode_manifest(&manifest_bytes)?;
+    let (manifest_abi, manifest_channels, manifest_custom_ops) = decode_manifest(&manifest_bytes)?;
 
     // da_claim — twice, byte-identical, deterministic (§9.2): `ClaimInconsistent` on divergence.
     let args = [
@@ -539,6 +548,7 @@ fn assess_instance(
         manifest_bytes,
         manifest_abi,
         manifest_channels,
+        manifest_custom_ops,
     })
     // `store` drops here — the assessment instance is discarded, never promoted (§9.2).
 }
@@ -607,8 +617,9 @@ fn call_cbor_export(
         })
 }
 
-/// Decode the §2.3 manifest fields the Phase-A funnel checks: the `abi` echo and `channels`.
-fn decode_manifest(bytes: &[u8]) -> Result<(u64, Vec<u64>), AbiRefusal> {
+/// Decode the §2.3 manifest fields the Phase-A funnel checks: the `abi` echo, `channels`, and the
+/// versioned `custom_ops` the host custom-op registry admits (architecture §3.2).
+fn decode_manifest(bytes: &[u8]) -> Result<(u64, Vec<u64>, Vec<String>), AbiRefusal> {
     let v: ciborium::value::Value = ciborium::de::from_reader(bytes)
         .map_err(|e| AbiRefusal::new(AbiRefusalCode::BadModule, format!("manifest CBOR: {e}")))?;
     let ciborium::value::Value::Map(entries) = v else {
@@ -635,7 +646,17 @@ fn decode_manifest(bytes: &[u8]) -> Result<(u64, Vec<u64>), AbiRefusal> {
             .collect(),
         _ => Vec::new(),
     };
-    Ok((abi, channels))
+    let custom_ops = match get("custom_ops") {
+        Some(ciborium::value::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                ciborium::value::Value::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok((abi, channels, custom_ops))
 }
 
 /// Decode the §9.1 `memory-claim` map. Malformed → `BadModule` (the module violated its own
@@ -759,6 +780,34 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.stage, 2);
         assert!(err.reason.contains("below lane floor"));
+    }
+
+    #[test]
+    fn decode_manifest_extracts_custom_ops_and_registry_gates_them() {
+        // A manifest declaring one advertised + one unknown custom op.
+        let manifest = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("abi".into()),
+                ciborium::value::Value::Integer(0x2_0001.into()),
+            ),
+            (
+                ciborium::value::Value::Text("custom_ops".into()),
+                ciborium::value::Value::Array(vec![
+                    ciborium::value::Value::Text("flash_attn@1".into()),
+                    ciborium::value::Value::Text("fused_moe@1".into()),
+                ]),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&manifest, &mut bytes).unwrap();
+        let (_abi, channels, custom_ops) = decode_manifest(&bytes).unwrap();
+        assert!(channels.is_empty());
+        assert_eq!(custom_ops, vec!["flash_attn@1", "fused_moe@1"]);
+        // The registry that stage 4 runs refuses the unadvertised op, typed (not a trap).
+        let err = crate::v2::custom_op::CustomOpRegistry::default()
+            .admit(&custom_ops)
+            .unwrap_err();
+        assert_eq!(err.code, AbiRefusalCode::CustomOpUnsupported);
     }
 
     #[test]
