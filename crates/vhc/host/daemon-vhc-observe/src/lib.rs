@@ -36,7 +36,9 @@ pub use capture::RunCapture;
 pub use desync::{digest_tally, DesyncVerdict};
 pub use health::{RoundHealth, RunHealth};
 pub use journal::{
-    Body, ExecIdentity, Journal, JournalError, JournalPaths, Record, RotatePolicy, SidecarError,
+    detect_fork, ArchiveError, Body, ChainHead, ExecIdentity, ForkEvidence, Journal, JournalError,
+    JournalPaths, Record, RecordArchive, ReplicationPolicy, RetentionPolicy, RotatePolicy,
+    SidecarError, SignedHead,
 };
 pub use log::{MessageKind, MessageLog};
 pub use replay::{

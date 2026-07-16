@@ -35,6 +35,7 @@
 // shared-lint coupling residual is inert.
 #![allow(clippy::disallowed_methods)]
 
+pub mod archive;
 pub mod oracle;
 pub mod record;
 pub mod segment;
@@ -46,6 +47,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub use archive::{
+    detect_fork, ArchiveError, ChainHead, ForkEvidence, RecordArchive, ReplicationPolicy,
+    RetentionPolicy, SignedHead,
+};
 pub use record::{Body, ExecIdentity, Record};
 pub use segment::{scan_bytes, scan_file, ScanResult, SegmentHeader, SegmentWriter};
 pub use sidecar::{KeyProvider, SidecarError, SidecarStore, StaticKey};
