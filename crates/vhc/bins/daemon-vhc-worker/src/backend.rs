@@ -43,8 +43,9 @@ pub(crate) struct ResolvedRun {
 }
 
 /// A resolved envelope-v2 (genesis) run: the decoded envelope, its hash (the cryptographic
-/// `RunId`, ABI §8.1), and the role labels the join drives — the joining worker role and the
-/// coordinator role the cell-6 adapter reads its config from.
+/// `RunId`, ABI §8.1), and the joining worker role. A genesis run's COORDINATION is its wasm
+/// coordinator module (mixed-fleet cell 8) — the transitional cell-6 native-coordinator adapter
+/// was retired at D2, so no coordinator-role config is read host-side anymore.
 pub(crate) struct GenesisRun {
     pub(crate) env: daemon_vhc_proto::GenesisEnvelope,
     /// The genesis hash — the cryptographic `RunId` (architecture §5.1).
@@ -52,8 +53,6 @@ pub(crate) struct GenesisRun {
     /// The worker role this node assessed/joins (the first non-coordinator role — the
     /// single-worker interim of decisions D6; role *selection* is node policy from Phase E).
     pub(crate) worker_role: String,
-    /// The coordinator role label (the cell-6 adapter's config source).
-    pub(crate) coordinator_role: String,
 }
 
 impl ResolvedRun {
@@ -129,12 +128,6 @@ async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String
     let env = frozen
         .decode()
         .map_err(|e| format!("decode genesis: {e}"))?;
-    let coordinator_role = env
-        .roles
-        .keys()
-        .find(|r| r.contains("coordinator"))
-        .cloned()
-        .ok_or("genesis envelope has no coordinator role (validate should have refused)")?;
     let worker_role = env
         .roles
         .keys()
@@ -171,16 +164,7 @@ async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String
                 )
             })?;
             let run_id = *frozen.run_id().as_bytes();
-            return finish_genesis_run(
-                config,
-                bytes,
-                pin,
-                device_min,
-                env,
-                run_id,
-                worker_role,
-                coordinator_role,
-            );
+            return finish_genesis_run(config, bytes, pin, device_min, env, run_id, worker_role);
         }
         let bytes = ArtifactResolver::new()
             .fetch(&art)
@@ -197,7 +181,6 @@ async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String
         env,
         run_id,
         worker_role,
-        coordinator_role,
     )
 }
 
@@ -212,7 +195,6 @@ fn finish_genesis_run(
     env: daemon_vhc_proto::GenesisEnvelope,
     run_id: [u8; 32],
     worker_role: String,
-    coordinator_role: String,
 ) -> Result<ResolvedRun, String> {
     Ok(ResolvedRun {
         config,
@@ -224,7 +206,6 @@ fn finish_genesis_run(
             env,
             run_id,
             worker_role,
-            coordinator_role,
         }),
     })
 }

@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
-// **The D3 cell-6 positive t2 whole-run** (decisions D3; refactor §8/D1 deliverable "the
-// envelope-v2 join flow end-to-end"): a REAL v2 worker module (tiny-llama-v2) under an
-// **envelope-v2 genesis** — role set, opaque per-role configs, grants — driven by the **native
-// coordinator through the transitional cell-6 adapter** (`RunConfig::from_genesis`; exists only
-// through D1, retired at D2), through the real worker protocol: probe → assess (claim funnel +
-// the worker role's `device_min` pre-screen + the role grants threaded into the admission seam,
-// replacing the pre-D1 `None`) → join (quotas derived from role grants ∩ lane, applied to the run
-// config; execution identity anchored on the genesis hash = the cryptographic RunId) → two full
-// rounds → replay-soaked digest.
+// **The D3 cell-6 RETIREMENT pin** (decisions D3: the transitional native-coordinator adapter
+// "exists only through D1 and is retired at D2"). Through D1 this file was the cell-6 positive
+// whole-run; at D2 the adapter (`RunConfig::from_genesis`) was DELETED and the cell's verdict
+// flipped: the supported v2×v2 combination is **cell 8** (wasm coordinator × envelope v2), pinned
+// positive in the testkit's cell-8 whole-run lanes. What this test now pins, over the real worker
+// protocol:
 //
-// The v1-envelope twin (v2_join.rs, cell 5) stays green beside this — the mixed-fleet matrix's
-// two supported worker-v2 cells, each with its positive pinning test.
+// - the genesis ASSESS path survives the retirement untouched (D1's lasting work): claim funnel +
+//   the worker role's `device_min` pre-screen + the role grants threaded into the admission seam;
+// - a genesis JOIN attempting the in-process native-coordinator drive is a TYPED refusal that
+//   names the retirement and routes the author to the wasm coordinator (cell 8) — never a silent
+//   fallback onto a coordinator shape that no longer exists.
+//
+// The v1-envelope twin (v2_join.rs, cell 5) stays green beside this until the Phase-E sunset.
 
 // Dev/test harness: shells cargo for the guest build (same pattern as v2_join.rs); the env/spawn
 // bans target the shipped node, so they are allowed file-wide here.
@@ -25,14 +27,13 @@ use std::sync::Once;
 use std::time::Duration;
 
 use ciborium::value::Value;
-use daemon_vhc_proto::envelope::{Access, DeviceMinimums, GlobalBatch, StopCondition};
+use daemon_vhc_proto::envelope::{Access, DeviceMinimums};
 use daemon_vhc_proto::genesis::{
     ChannelDecl, Identities, RoleEntry, RoleGrants, RunSectionV2, SnapshotArtifact,
     TransportSelection, GENESIS_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{to_canonical_vec, GenesisEnvelope, Hash, SignedEnvelope, SigningKey};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
-use daemon_vhc_sdk_consensus::coordinator::CoordinatorRoleConfig;
 use daemon_vhc_session::protocol::{Event, JoinPolicy, PolicyMode};
 use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
@@ -97,26 +98,16 @@ fn worker_role_config() -> Value {
     ])
 }
 
-/// The coordinator role's opaque config — the `[data]`/`[phases]` policy that left the v1
-/// envelope at D0, decoded by the cell-6 adapter (`RunConfig::from_genesis`). Values mirror the
-/// cell-5 twin's `[data]`/`[phases]` sections.
+/// The coordinator role's opaque config — module-defined CBOR the HOST NEVER reads (the seam
+/// rule, architecture §5.1). Since the cell-6 adapter's retirement at D2 no host-side decoder for
+/// this exists at all: the wasm coordinator module is its only consumer. Authored here as an
+/// arbitrary opaque map to prove the host treats it as such.
 fn coordinator_role_config() -> Value {
-    Value::serialized(&CoordinatorRoleConfig {
-        global_batch: GlobalBatch {
-            start: 2,
-            end: 2,
-            ramp_rounds: 1,
-        },
-        stop: StopCondition::Tokens(1_000_000),
-        steps_per_round: 2,
-        warmup: 1,
-        round_train_max: 60,
-        round_witness: 1,
-        cooldown: 1,
-        epoch_rounds: 10,
-        stall_rounds_max: 2,
-    })
-    .expect("coordinator role config value")
+    Value::Map(vec![
+        (Value::from("steps_per_round"), Value::from(2u32)),
+        (Value::from("warmup"), Value::from(1u32)),
+        (Value::from("opaque-to-the-host"), Value::from(true)),
+    ])
 }
 
 /// Author + freeze the genesis envelope, returning the `SignedEnvelope` wire bytes the worker's
@@ -225,10 +216,14 @@ fn policy() -> JoinPolicy {
     }
 }
 
-/// probe → assess (genesis grants seam) → join (cell-6 adapter) → two rounds → replay-soaked
-/// digest.
+/// **The post-D2 cell-6 verdict, pinned** (decisions D3: the transitional native-coordinator
+/// adapter "exists only through D1 and is retired at D2"): the genesis ASSESS path — D1's
+/// lasting work (device_min pre-screen + role grants threaded into the admission seam) — stays
+/// green, but a JOIN attempting the retired in-process native-coordinator drive is a typed
+/// refusal routing the author to the wasm coordinator (mixed-fleet cell 8, pinned positive in
+/// the testkit's cell-8 whole-run lanes).
 #[tokio::test]
-async fn v2_worker_joins_a_genesis_run_under_the_cell6_adapter() {
+async fn genesis_join_refuses_the_retired_cell6_adapter_and_routes_to_cell8() {
     let module = module_path();
     assert!(module.exists(), "tiny_llama_v2.wasm missing");
     let mut cfg = TrainClientConfig::new(env!("CARGO_BIN_EXE_daemon-vhc-worker").to_string());
@@ -244,55 +239,41 @@ async fn v2_worker_joins_a_genesis_run_under_the_cell6_adapter() {
     cfg.op_timeout = Duration::from_secs(180);
     let sup = TrainSupervisor::new(cfg);
 
-    // Assess through the REAL funnel: the genesis worker role's device_min feeds stage 3 and its
-    // grant list feeds stage 4.0 (the seam that carried `None` before D1).
+    // Assess through the REAL funnel — unchanged by the retirement: the genesis worker role's
+    // device_min feeds stage 3 and its grant list feeds stage 4.0 (D1 deliverable 4).
     let elig = sup.assess(genesis_wire()).await.expect("assess");
     assert!(
         elig.eligible,
-        "v2 module admits under the genesis role grants: {:?}",
+        "v2 module still admits under the genesis role grants: {:?}",
         elig.reasons
     );
 
-    // Join: the worker's v2 session — pump attach + the native coordinator through the cell-6
-    // adapter (RunConfig::from_genesis over the coordinator role's opaque config).
+    // Join: the in-process native-coordinator drive for a genesis run no longer exists — the
+    // typed refusal names the retirement and the superseding cell.
     let mut events = sup
         .join_streaming(RUN_LABEL, "local://native-tick", vec![], policy())
         .await
-        .expect("join");
+        .expect("join command accepted (the refusal arrives as the worker's typed error)");
 
-    let mut replay_decisions = None;
-    let mut outcome = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-    while outcome.is_none() {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
         let ev = tokio::time::timeout_at(deadline, events.recv())
             .await
             .expect("worker event stream stalled")
             .expect("worker event stream closed early");
         match ev {
-            Event::Metric { name, value } if name == "replay_decisions" => {
-                replay_decisions = Some(value);
+            Event::Error { detail, .. } => {
+                assert!(
+                    detail.contains("cell 6 retired") && detail.contains("cell 8"),
+                    "the refusal names the retirement and routes to the wasm coordinator: \
+                     {detail}"
+                );
+                break;
             }
-            Event::RoundOutcome {
-                round,
-                committed,
-                ingested,
-                stalled,
-                digest,
-            } => {
-                assert_eq!(round, 1, "two rounds ran (0 and 1)");
-                assert_eq!((committed, ingested, stalled), (1, 1, false));
-                assert_ne!(digest, [0u8; 16], "a real det-lane digest");
-                outcome = Some(digest);
+            Event::RoundOutcome { .. } => {
+                panic!("a genesis run must NOT drive the retired native-coordinator session")
             }
-            Event::Error { detail, .. } => panic!("worker error: {detail}"),
             _ => {}
         }
     }
-
-    // The inline §12.6 replay soak ran and reproduced every decision (2 rounds × 2 publishes).
-    assert_eq!(
-        replay_decisions,
-        Some(4.0),
-        "the recorded journal re-drove bit-for-bit before the outcome was reported"
-    );
 }

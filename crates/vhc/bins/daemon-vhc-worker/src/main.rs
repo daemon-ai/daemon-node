@@ -178,16 +178,28 @@ async fn main() {
                     continue;
                 };
                 if run_is_v2 {
-                    // The v2 join (A2 close-out + D1 deliverable 4): the session event-pump
-                    // attach, driven by the in-process native coordinator over the run's
-                    // envelope — the frozen v1 form (cell 5) or the genesis v2 form through the
-                    // transitional cell-6 adapter. A raw-config AssessRun has neither — refused
-                    // loud.
-                    let source = if let Some(genesis) = resolved.genesis.as_ref() {
-                        v2_session::V2RunSource::Genesis(genesis)
-                    } else if let Some(envelope) = resolved.envelope.as_ref() {
-                        v2_session::V2RunSource::V1(envelope)
-                    } else {
+                    // The v2 join (A2 close-out): the session event-pump attach, driven by the
+                    // in-process native coordinator over the run's frozen v1 envelope (cell 5).
+                    // The genesis (envelope-v2) form's in-process drive — the transitional
+                    // cell-6 native-coordinator adapter — was RETIRED at D2 (decisions D3
+                    // cell 6): a genesis run is coordinated by its wasm coordinator module
+                    // (mixed-fleet cell 8), refused typed here. A raw-config AssessRun has no
+                    // envelope at all — refused loud.
+                    if resolved.genesis.is_some() {
+                        send(
+                            &writer,
+                            &worker_error(
+                                "cell 6 retired at D2: a genesis (envelope-v2) run is \
+                                 coordinated by its wasm coordinator module (mixed-fleet \
+                                 cell 8) — the transitional native-coordinator adapter no \
+                                 longer exists; the in-process self-driven join serves the \
+                                 v1 envelope form (cell 5) only",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                    let Some(envelope) = resolved.envelope.as_ref() else {
                         send(
                             &writer,
                             &worker_error(
@@ -203,7 +215,7 @@ async fn main() {
                     match v2_session::join_and_run_v2(
                         &resolved.module,
                         &resolved.config,
-                        &source,
+                        envelope,
                         &run_id,
                         &writer,
                     )

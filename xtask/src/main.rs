@@ -692,9 +692,9 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         (
             "daemon-vhc-worker",
             "daemon-vhc-sdk-consensus",
-            "D2 — the transitional cell-6 native-coordinator self-driven join drives the native \
-             `tick` in-process (the shape the D2 wasm coordinator retires); goes when the worker \
-             bin re-seats onto the wasm coordinator [normal]",
+            "Phase E — the cell-5 (v1-envelope) self-driven t2 join drives the native `tick` \
+             in-process; the cell-6 (genesis) arm was RETIRED at D2 with the adapter, so this \
+             edge now retires with the v1 path at the Phase-E sunset [normal]",
         ),
     ];
 

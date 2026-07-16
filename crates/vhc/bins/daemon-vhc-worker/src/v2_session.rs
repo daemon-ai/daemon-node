@@ -43,21 +43,15 @@ use daemon_vhc_proto::{
 };
 use daemon_vhc_sdk_consensus::coordinator::{tick, CoordinatorState, Input, Output};
 
-use crate::backend::GenesisRun;
 use crate::send;
 use daemon_provision::CutWriter;
 use daemon_vhc_session::protocol::Event;
 
-/// Which envelope form configures the v2 run (D1 deliverable 4): the v1 frozen envelope
-/// (mixed-fleet cell 5 — the A2 shape) or the envelope-v2 genesis (cell 6, through the
-/// transitional native-coordinator adapter that retires at D2).
-pub(crate) enum V2RunSource<'a> {
-    /// The v1 envelope: coordinator config from `[data]`/`[phases]` (`RunConfig::from_envelope`).
-    V1(&'a Envelope),
-    /// The genesis envelope: coordinator config from the coordinator role's opaque config via the
-    /// cell-6 adapter (`RunConfig::from_genesis`); role grants tighten the run quotas.
-    Genesis(&'a GenesisRun),
-}
+// The envelope-v2 (genesis) arm of this drive — the transitional cell-6 native-coordinator
+// adapter (`RunConfig::from_genesis`) — was RETIRED at D2 (decisions D3 cell 6): a genesis run's
+// coordination is its wasm coordinator module (mixed-fleet cell 8, pinned in the testkit's
+// cell-8 whole-run lanes). This self-driven t2 join keeps only the v1-envelope form (cell 5),
+// which retires with the v1 path at the Phase-E sunset.
 
 /// The Phase-A derived grants document (§2.6 stand-in until node-side lane config lands): the
 /// admitted channel table + the worlds the Phase-A driver links. Deterministic, so assess and
@@ -215,7 +209,7 @@ fn t2_corpus_via_store(
 pub(crate) async fn join_and_run_v2(
     module: &[u8],
     config: &[u8],
-    source: &V2RunSource<'_>,
+    envelope: &Envelope,
     run_id: &str,
     writer: &CutWriter,
 ) -> Result<(), String> {
@@ -239,48 +233,21 @@ pub(crate) async fn join_and_run_v2(
     let worker_key = SigningKey::from_bytes(&worker_key_seed);
     let worker_peer = peer_id(&worker_key);
 
-    // The execution identity (ABI §8.1): on the genesis path the run_id IS the genesis hash (the
-    // cryptographic RunId) and the role is the envelope's worker-role label; the v1 path keeps the
-    // A2 label-derived stand-in.
-    let identity = match source {
-        V2RunSource::V1(_) => RunIdentity {
-            run_id: *blake3::hash(run_id.as_bytes()).as_bytes(),
-            epoch: 0,
-            role: "trainer".to_string(),
-            instance: 1,
-            module: module_hash,
-        },
-        V2RunSource::Genesis(g) => RunIdentity {
-            run_id: g.run_id,
-            epoch: 0,
-            role: g.worker_role.clone(),
-            instance: 1,
-            module: module_hash,
-        },
+    // The execution identity (ABI §8.1): the v1-envelope path keeps the A2 label-derived
+    // stand-in. (Genesis identities — run_id = genesis hash, envelope role labels — ride the
+    // cell-8 wasm-coordinator path in the testkit; the cell-6 self-drive is retired.)
+    let identity = RunIdentity {
+        run_id: *blake3::hash(run_id.as_bytes()).as_bytes(),
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance: 1,
+        module: module_hash,
     };
     // The t2 artifact store: ONE fetch path (B2) — the session's staging reads and any guest
     // data@2::fetch are both answered through T2Artifacts::fetch; the run's artifact grants are
     // exactly the store's committed hashes (which artifacts a module may touch is a grant).
     let (artifacts, manifest_hash) = t2_corpus_artifacts()?;
     let mut run_cfg = V2RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
-    // Genesis path (D1 deliverable 4): tighten the run quotas from the worker role's envelope
-    // grants ∩ the selected lane — the SAME derivation assess ran (byte-identical inputs), so
-    // assess and join agree by construction (§9.4 step 10).
-    if let V2RunSource::Genesis(g) = source {
-        let role = g
-            .env
-            .roles
-            .get(&g.worker_role)
-            .ok_or("worker role absent from the genesis role set at join")?;
-        let run_artifacts = g.env.artifacts.values().map(|a| a.blake3).collect();
-        let quotas = daemon_vhc_proto::derive_admitted_quotas(
-            &role.grants,
-            &crate::backend::selected_lane().ceilings,
-            &run_artifacts,
-        )
-        .map_err(|e| format!("join grants derivation: {e}"))?;
-        daemon_vhc_host::v2::apply_admitted_quotas(&quotas, &mut run_cfg);
-    }
     // The t2 corpus stands in for the run's artifact map on this in-process drive: the staged
     // shards/manifest are generated here, so the fetch allow-list is the store's committed hashes
     // (the envelope-derived set names the real artifact map the live path fetches instead).
@@ -299,24 +266,13 @@ pub(crate) async fn join_and_run_v2(
         verification_percent: 0,
         authorized: Vec::new(),
     };
-    // The coordinator's projected config: `from_envelope` on the v1 path (cell 5), the D1
-    // transitional cell-6 adapter `from_genesis` on the envelope-v2 path (retired at D2, when the
-    // wasm coordinator supersedes the native tick).
-    let config_c = match source {
-        V2RunSource::V1(envelope) => {
-            daemon_vhc_sdk_consensus::coordinator::RunConfig::from_envelope(envelope, params)
-        }
-        V2RunSource::Genesis(g) => daemon_vhc_sdk_consensus::coordinator::RunConfig::from_genesis(
-            &g.env,
-            &g.coordinator_role,
-            params,
-        ),
-    }
-    .map_err(|e| format!("coordinator config: {e}"))?;
+    // The coordinator's projected config: `from_envelope` — the v1 path (cell 5). The genesis
+    // form's `from_genesis` adapter was retired at D2 (module note above).
+    let config_c =
+        daemon_vhc_sdk_consensus::coordinator::RunConfig::from_envelope(envelope, params)
+            .map_err(|e| format!("coordinator config: {e}"))?;
     let envelope_hash = config_c.envelope_hash;
-    // The drive's pacing knobs, read from the PROJECTED config so both envelope forms pace
-    // identically (these came verbatim from `[data]`/`[phases]` on v1 and from the coordinator
-    // role's opaque config on genesis).
+    // The drive's pacing knobs, read from the PROJECTED config (verbatim from `[data]`/`[phases]`).
     let warmup_s = config_c.warmup_s;
     let round_train_max_s = config_c.round_train_max_s;
     let steps_per_round = config_c.steps_per_round;
