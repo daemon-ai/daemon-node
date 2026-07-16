@@ -578,6 +578,83 @@ pub fn plan_late_join(
     }
 }
 
+/// Build the record-replay catch-up steps from **archive-recovered** [`RoundRecord`]s (refactor §9:
+/// "record-replay catch-up — the archive fetch from Phase B/D2"). This is the offline twin of the
+/// engine's live `resolve_record_set` path, feeding [`resync_by_replay`]: for each record, the
+/// committed inline set is ordered by node-pubkey bytes (§6.4 I3 record order), every payload is
+/// fetched by content hash from `fetch` and blake3+size-verified, and the record's set commitment
+/// is **recomputed and checked** (the D2 consensus-replay discipline — an unverifiable record is a
+/// typed error, never a silent pass).
+///
+/// `records` are the recovered records *after* the checkpoint round, in round order (a late joiner
+/// obtains them via `daemon-vhc-observe::recover_chain_from_archive` +
+/// `extract_consensus_capture`); `fetch` resolves a content hash to payload bytes (the
+/// content-addressed payload plane).
+///
+/// # Errors
+/// A typed [`SwarmRunError::Lifecycle`] on a record without an inline set (the full set-object
+/// resolution is the live engine's path), a missing/mismatched payload, or a set commitment that
+/// does not recompute.
+pub fn steps_from_round_records<F>(
+    records: &[daemon_vhc_proto::messages::RoundRecord],
+    mut fetch: F,
+) -> Result<Vec<ReplayStep>, SwarmRunError>
+where
+    F: FnMut(&Hash) -> Option<Vec<u8>>,
+{
+    use daemon_vhc_proto::commit_set;
+
+    let mut steps = Vec::with_capacity(records.len());
+    for record in records {
+        let entries = record.inline.as_ref().ok_or_else(|| {
+            SwarmRunError::Lifecycle(format!(
+                "round {} record has no inline set (resolve the set object via the live path)",
+                record.round
+            ))
+        })?;
+        // Record order is a consensus input (§6.4 I3): sorted by node public-key bytes.
+        let mut ordered = entries.clone();
+        ordered.sort_by_key(|e| e.peer.0);
+
+        let mut staged = Vec::with_capacity(ordered.len());
+        let mut pairs = Vec::with_capacity(ordered.len());
+        for entry in &ordered {
+            let bytes = fetch(&entry.hash).ok_or_else(|| {
+                SwarmRunError::Lifecycle(format!(
+                    "round {}: committed payload {} missing from the payload plane",
+                    record.round,
+                    entry.hash.to_hex()
+                ))
+            })?;
+            if blake3_hash(&bytes) != entry.hash || bytes.len() as u64 != entry.size {
+                return Err(SwarmRunError::Lifecycle(format!(
+                    "round {}: payload does not re-verify against its committed entry",
+                    record.round
+                )));
+            }
+            pairs.push((entry.peer, entry.hash));
+            staged.push(StagedPayload {
+                peer: entry.peer,
+                hash: entry.hash,
+                bytes,
+            });
+        }
+        // The record's committed set commitment must recompute from the verified pairs (the D2
+        // consensus-replay discipline, applied at the catch-up boundary).
+        if commit_set(&pairs).commitment() != record.set {
+            return Err(SwarmRunError::Lifecycle(format!(
+                "round {}: set commitment does not recompute from the payload set",
+                record.round
+            )));
+        }
+        steps.push(ReplayStep {
+            round: record.round,
+            staged,
+        });
+    }
+    Ok(steps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,6 +902,93 @@ mod tests {
         assert_eq!(
             joiner.ingest(1, &next).unwrap(),
             a.ingest(1, &next).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn late_join_catches_up_from_archived_round_records() {
+        // The late-join composition end to end (refactor §9: admission → attested checkpoint →
+        // restore → record-replay catch-up), with the catch-up sourced from RoundRecords as the
+        // record archive recovers them (D2's seam): typed checkpoint at round 0 → records for
+        // rounds 1..=2 with committed inline sets → steps_from_round_records verifies payloads +
+        // recomputes set commitments → resync_by_replay reaches the in-sync digest.
+        use daemon_vhc_proto::messages::{Locator, RecordEntry, RoundRecord};
+        use daemon_vhc_proto::{commit_set, Seed};
+        use std::collections::BTreeMap;
+
+        let store = temp_store();
+        let run = RunId::new("late-join");
+        let mut reference = built(b"cfg");
+        let d0 = reference
+            .ingest(0, &[staged(1, b"a0"), staged(2, b"b0")])
+            .unwrap();
+        let saved = save_typed_checkpoint(
+            &store,
+            &run,
+            &ident(),
+            &reference,
+            CheckpointCapture {
+                round: 0,
+                digest: d0,
+                data_cursor: 0,
+                journal_position: 3,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Rounds 1..=2 proceed; the archive's records commit their sets.
+        let mut payload_plane: BTreeMap<Hash, Vec<u8>> = BTreeMap::new();
+        let mut records = Vec::new();
+        let mut target = d0;
+        for round in 1..=2u64 {
+            let staged_set = [
+                staged(1, format!("a{round}").as_bytes()),
+                staged(2, format!("b{round}").as_bytes()),
+            ];
+            target = reference.ingest(round, &staged_set).unwrap();
+            let mut entries = Vec::new();
+            let mut pairs = Vec::new();
+            for s in &staged_set {
+                payload_plane.insert(s.hash, s.bytes.clone());
+                entries.push(RecordEntry {
+                    peer: s.peer,
+                    hash: s.hash,
+                    size: s.bytes.len() as u64,
+                });
+                pairs.push((s.peer, s.hash));
+            }
+            records.push(RoundRecord {
+                round,
+                set: commit_set(&pairs).commitment(),
+                drops: Vec::new(),
+                next_seed: Seed([round as u8; 32]),
+                set_locator: Locator::StoreKey(format!("r{round}")),
+                inline: Some(entries),
+            });
+        }
+
+        // The late joiner: restore the typed checkpoint, then catch up over the records.
+        let mut joiner = built(b"unrelated-config");
+        load_typed_checkpoint(&store, &run, &mut joiner, &saved.pointer)
+            .await
+            .unwrap();
+        let steps = steps_from_round_records(&records, |h| payload_plane.get(h).cloned()).unwrap();
+        let ckpt_bytes = joiner.checkpoint_save().unwrap();
+        let recovered = resync_by_replay(&mut joiner, &ckpt_bytes, &steps).unwrap();
+        assert_eq!(recovered, target, "catch-up reaches the in-sync digest");
+
+        // Negatives: a withheld payload and a tampered set commitment are typed errors.
+        let mut missing = payload_plane.clone();
+        let victim = *missing.keys().next().unwrap();
+        missing.remove(&victim);
+        assert!(steps_from_round_records(&records, |h| missing.get(h).cloned()).is_err());
+
+        let mut forged = records.clone();
+        forged[0].set = commit_set(&[(PeerId([9; 32]), blake3_hash(b"nope"))]).commitment();
+        assert!(
+            steps_from_round_records(&forged, |h| payload_plane.get(h).cloned()).is_err(),
+            "a set commitment that does not recompute is refused"
         );
     }
 
