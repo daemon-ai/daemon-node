@@ -32,6 +32,12 @@ pub mod data;
 pub mod engine;
 pub mod protocol;
 pub mod seam;
+// The host-enforced upgrade transaction (Phase E; architecture §5.4, ABI §10.3): the LOCAL half of
+// the two-key model — quiesce → snapshot → owner-law re-check (grant-expanding fails closed) →
+// migrate → validate → activate locally → rollback-and-retry-or-leave. Composes the committed
+// transition chain (`daemon_vhc_proto::TransitionChain`, deliverable 1); the wasm-guest step
+// adapters and drills live in the host testkit.
+pub mod upgrade;
 pub mod v2_attach;
 // The A2 dependency inversion (refactor §5 A2 item 3): the session links the HOST (never the
 // reverse — the host stopped linking run policy). `WasmBackend` — the TrainerBackend seam filled
