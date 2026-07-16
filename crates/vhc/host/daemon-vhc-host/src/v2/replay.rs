@@ -13,13 +13,20 @@
 //! **Replay semantics (the fixed A1 contract):** re-feeding the recorded inputs reproduces every
 //! guest decision bit-for-bit. Inputs answered FROM THE JOURNAL, never re-executed:
 //!
-//! - delivered event frames (tag 1) — re-fed verbatim through `next_event`;
+//! - delivered event frames (tag 1) — re-fed verbatim through `next_event`; **completion events
+//!   (tag 6 frames) re-fed in journaled order** — completion order is a nondeterministic input
+//!   (§8.1), and the journaled order IS the replayed order. A delivered completion retires its op;
+//!   a `payload_get` success materializes its buffer from the script's content-addressed payload
+//!   table (§8.7 re-fetch; a missing payload is the typed `ReplayMissingPayload` divergence);
 //! - guest-requested staged read-backs (tag 2, kinds < 128) — the recorded value, after
 //!   verifying the guest asked for the same `(src, kind)`;
 //! - §2.7 bridge nr-class readouts (tag 2, kinds 128–136) — the recorded value, after verifying
 //!   the guest called the same nr import;
 //! - clock readings (tag 3) and timer arms/cancels (tags 5/6) — the recorded ids/values, after
-//!   verifying the armed delay matches.
+//!   verifying the armed delay matches;
+//! - buffers + `OpId`s (kinds 8/10) — re-derived from deterministic bookkeeping (the same
+//!   §7.1-seeded arenas as the recording), never journaled; `cancel` returns are recordless-
+//!   deterministic (the journaled completion result captures the race — `v2::ops` docs).
 //!
 //! Bridge COMPUTE imports (`ones@1`, `add@1`, `backward@1`, …) are pure state transformers whose
 //! only guest-visible products are opaque handles and the nr readouts above; replay stubs them
@@ -29,12 +36,16 @@
 //! compared too. Any mismatch between what the guest asks/does and what the journal recorded is
 //! a typed [`ReplayEnd::Diverged`] carrying the first divergence.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use wasmtime::{Caller, Extern, ExternType, Linker, Memory, Module, Store, Val};
 
 use super::journal::SinkEntry;
 use crate::runtime::Worker;
+use crate::v2::buffer::BufferTable;
+use crate::v2::completion::{CompletionResult, SuccessPayload};
+use crate::v2::ops::{OpRequest, OpTable};
 use crate::v2::V2Error;
 
 /// The §2.7 nr-class bridge imports and their journal kinds (runtime.rs `journal_bridge_nr`).
@@ -72,6 +83,11 @@ pub struct ReplayScript {
     /// re-derives from (the seed is deterministic — §2.7 dc class — so it is re-computed at
     /// replay, not recorded). `None` is fine for guests that never read the seed.
     pub identity: Option<super::driver::RunIdentity>,
+    /// Content-addressed payload bytes by blake3 — the §8.7 "bulk payloads are not copied; they
+    /// are content-addressed and re-fetched at replay" table. A `payload_get`-completed buffer's
+    /// bytes come from here; a missing entry is the typed `ReplayMissingPayload` divergence,
+    /// never a silent pass.
+    pub payloads: HashMap<[u8; 32], Vec<u8>>,
 }
 
 impl ReplayScript {
@@ -154,10 +170,33 @@ struct ReplayHost {
     next_handle: u64,
     /// Per-channel dense seq counters (mirrors the recording driver's allocation).
     seqs: std::collections::HashMap<u64, u64>,
+    /// Guest-partition buffers: the SAME deterministic arena as the recording (quotas were
+    /// enforced then; replay re-derives identical `create_from` handle values).
+    buffers: BufferTable,
+    /// The op mint (monotone indices — identical `OpId` values to the recording).
+    ops: OpTable,
+    /// `payload_get` op → requested hash (guest-authored, deterministic).
+    op_hashes: HashMap<u64, [u8; 32]>,
+    /// Host-partition (completion-minted) buffers, keyed by the handle the journaled completion
+    /// frame carries, materialized from `script.payloads` at delivery.
+    host_buffers: HashMap<u64, Arc<Vec<u8>>>,
 }
 
 fn diverged(msg: impl std::fmt::Display) -> wasmtime::Error {
     wasmtime::Error::msg(format!("{DIVERGENCE_MARKER}{msg}"))
+}
+
+/// Resolve a buffer in either replay partition: the deterministic guest arena (`create_from`) or
+/// the completion-materialized host map.
+fn resolve_replay_buffer(host: &ReplayHost, handle: u64) -> Option<Arc<Vec<u8>>> {
+    host.buffers
+        .resolve(handle)
+        .ok()
+        .or_else(|| host.host_buffers.get(&handle).cloned())
+}
+
+fn hex8(hash: &[u8; 32]) -> String {
+    hash[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 const DIVERGENCE_MARKER: &str = "replay divergence: ";
@@ -227,9 +266,127 @@ fn dispatch(
             };
             if deliver_span(caller, &frame.1.clone(), ptr, cap, results)? {
                 caller.data_mut().events_delivered += 1;
+                // A delivered Completion retires its op and, for a payload_get success,
+                // materializes the completion-minted buffer from the content-addressed payload
+                // table (§8.7 — bulk payloads are re-fetched, never copied into the journal).
+                if let Ok(crate::v2::event::EventV2::Completion { op, result }) =
+                    crate::v2::event::decode_event_frame(&frame.1)
+                {
+                    let host = caller.data_mut();
+                    host.ops.finish(op);
+                    if let CompletionResult::Ok(SuccessPayload::Handle(h)) = result {
+                        if let Some(hash) = host.op_hashes.remove(&op) {
+                            let Some(bytes) = host.script.payloads.get(&hash) else {
+                                return Err(diverged(format!(
+                                    "ReplayMissingPayload: completion for op {op:#x} names \
+                                     content {} but the replay payload table lacks it",
+                                    hex8(&hash)
+                                )));
+                            };
+                            host.host_buffers.insert(h, Arc::new(bytes.clone()));
+                        }
+                    }
+                }
             } else {
                 caller.data_mut().pending_event = Some(frame);
             }
+            Ok(())
+        }
+        ("vhc@2", "create_from") => {
+            let (ptr, len) = (p_u32(params, 0), p_u32(params, 1));
+            let mem = mem_of(caller)?;
+            let mut bytes = vec![0u8; len as usize];
+            mem.read(&mut *caller, ptr as usize, &mut bytes)
+                .map_err(|e| wasmtime::Error::msg(format!("create_from read: {e}")))?;
+            let handle = caller
+                .data_mut()
+                .buffers
+                .create(Arc::new(bytes))
+                .map_err(|c| diverged(format!("create_from refused at replay: {c:?}")))?;
+            results[0] = Val::I64(handle as i64);
+            Ok(())
+        }
+        ("vhc@2", "read_into") => {
+            let (buffer, offset) = (p_u64(params, 0), p_u64(params, 1));
+            let (ptr, cap) = (p_u32(params, 2), p_u32(params, 3));
+            let data = resolve_replay_buffer(caller.data(), buffer)
+                .ok_or_else(|| diverged(format!("read_into on unknown buffer {buffer:#x}")))?;
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(data.len());
+            let n = (data.len() - start).min(cap as usize);
+            if n > 0 {
+                let window = data[start..start + n].to_vec();
+                let mem = mem_of(caller)?;
+                mem.write(&mut *caller, ptr as usize, &window)
+                    .map_err(|e| wasmtime::Error::msg(format!("read_into write: {e}")))?;
+            }
+            results[0] = Val::I64(n as i64);
+            Ok(())
+        }
+        ("vhc@2", "buffer_len") => {
+            let buffer = p_u64(params, 0);
+            let data = resolve_replay_buffer(caller.data(), buffer)
+                .ok_or_else(|| diverged(format!("buffer_len on unknown buffer {buffer:#x}")))?;
+            results[0] = Val::I64(data.len() as i64);
+            Ok(())
+        }
+        ("vhc@2", "buffer_release") => {
+            let buffer = p_u64(params, 0);
+            let host = caller.data_mut();
+            if host.buffers.release(buffer).is_err() && host.host_buffers.remove(&buffer).is_none()
+            {
+                return Err(diverged(format!(
+                    "buffer_release on unknown buffer {buffer:#x}"
+                )));
+            }
+            Ok(())
+        }
+        ("vhc@2", "cancel") => {
+            // Recordless-deterministic (v2::ops docs): the journaled completion result captures
+            // the race — cancel returned 0 iff the op's (yet-undelivered) completion is Cancelled.
+            let op = p_u64(params, 0);
+            let host = caller.data_mut();
+            let accepted = host.ops.is_outstanding(op)
+                && host.script.events.iter().any(|(_, f)| {
+                    matches!(
+                        crate::v2::event::decode_event_frame(f),
+                        Ok(crate::v2::event::EventV2::Completion { op: o, result })
+                            if o == op && result == CompletionResult::cancelled()
+                    )
+                });
+            if accepted {
+                host.ops.finish(op);
+                host.op_hashes.remove(&op);
+            }
+            results[0] = Val::I32(i32::from(!accepted));
+            Ok(())
+        }
+        ("net@2", "payload_put") => {
+            let buffer = p_u64(params, 0);
+            let bytes = resolve_replay_buffer(caller.data(), buffer)
+                .ok_or_else(|| diverged(format!("payload_put on unknown buffer {buffer:#x}")))?;
+            let op = caller
+                .data_mut()
+                .ops
+                .begin(OpRequest::PayloadPut { bytes })
+                .map_err(|c| diverged(format!("payload_put refused at replay: {c:?}")))?;
+            results[0] = Val::I64(op as i64);
+            Ok(())
+        }
+        ("net@2", "payload_get") => {
+            let hash_ptr = p_u32(params, 0);
+            let mem = mem_of(caller)?;
+            let mut hash = [0u8; 32];
+            mem.read(&mut *caller, hash_ptr as usize, &mut hash)
+                .map_err(|e| wasmtime::Error::msg(format!("payload_get read: {e}")))?;
+            let host = caller.data_mut();
+            let op = host
+                .ops
+                .begin(OpRequest::PayloadGet { hash })
+                .map_err(|c| diverged(format!("payload_get refused at replay: {c:?}")))?;
+            host.op_hashes.insert(op, hash);
+            results[0] = Val::I64(op as i64);
             Ok(())
         }
         ("vhc@2", "read_back") => {
@@ -507,6 +664,11 @@ pub fn replay_v2(
         pending_event: None,
         next_handle: 0x5EED_0000_0000,
         seqs: std::collections::HashMap::new(),
+        // Quotas 0 (unbounded): the recording already enforced them; replay re-derives handles.
+        buffers: BufferTable::new(0, 0, 0),
+        ops: OpTable::new(0, 0),
+        op_hashes: HashMap::new(),
+        host_buffers: HashMap::new(),
     };
     let mut store = Store::new(worker.engine(), host);
     // Replay is not the sandbox gate — the recording already enforced budgets; give the replay

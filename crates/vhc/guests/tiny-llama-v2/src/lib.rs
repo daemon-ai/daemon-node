@@ -17,21 +17,23 @@
 //! `Frame(control)` decodes a `SwarmMessage` (`RoundOpen` → train + commit; `RoundRecord` →
 //! barrier ingest); `Stop` → `Ok`.
 //!
-//! OUTBOUND SEALING GAP (Phase-A structural, recorded for the B1 brief): a bridge guest cannot
-//! serialize its own update container to payload bytes (`update_bytes` is host-side; the
-//! guest-visible path is Phase B's `payload_put`/`create_from`). `make_update` therefore builds
-//! the container (the same math/registration side effects as v1) and returns EMPTY payload bytes;
-//! the commitment's evidentiary hash at Phase A comes from the plumbing. The parity oracle covers
-//! the gap transitively: the ingested state digest is a function of the same params the container
-//! derived from, so identical digests ⇒ identical container inputs.
+//! THE OUTBOUND SEALING GAP IS RETIRED (B1): the guest now authors its own commitment evidence.
+//! `make_update` builds the bridge container (the same math/registration side effects as v1) and
+//! the driver seals + announces it back as `PayloadReady{kind 0}` at the slice boundary
+//! (bridge-plane serialization stays a host service until Phase C's compute export). The guest
+//! then walks the §3.4 path itself: `read_back` (budgeted IN) → `create_from` (budgeted OUT,
+//! sealed) → `payload_put` → on `Completion(op, Ok(hash))` it publishes the Commitment **over the
+//! hash its own payload_put completed with** — commitment hash ≡ the staged bytes, by
+//! construction. The `Outbound::Commit` the round core emits is held (`pending_commit`) until
+//! that completion arrives; the Commitment frame is the guest's voice, not the plumbing's.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use daemon_vhc_sdk_v2::{ModuleDecl, V2Module};
 
-use daemon_vhc_proto::messages::{Digest, Straggle, StraggleStatus, SwarmMessage};
-use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, PeerId};
+use daemon_vhc_proto::messages::{Commitment, Digest, Straggle, StraggleStatus, SwarmMessage};
+use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId};
 use daemon_vhc_sdk::models::{TinyLlama, TinyLlamaCfg};
 use daemon_vhc_sdk::prelude::*;
 use daemon_vhc_sdk_rounds::{
@@ -87,8 +89,10 @@ impl RoundExperiment<HostStaged> for TinyLlamaRound {
     }
 
     fn make_update(&mut self, round: u64) -> Vec<u8> {
-        // Same math + container registration as v1; the sealed bytes stay host-side (the
-        // OUTBOUND SEALING GAP in the module docs — Phase B's payload_put closes it).
+        // Same math + container registration as v1. The sealed wire arrives back through the
+        // driver's slice-boundary PayloadReady announcement; the guest authors its commitment
+        // over its own payload_put completion (module docs) — so the round core's immediate
+        // Commit outbound is HELD, not published (see `emit`).
         let _container = self.model.make_update(round);
         Vec::new()
     }
@@ -141,6 +145,9 @@ impl V2Module for TinyLlamaV2 {
         ModuleDecl {
             name: "tiny-llama-v2",
             version: env!("CARGO_PKG_VERSION"),
+            // Minor 1: this module consumes the B1 buffer + completion surface (the
+            // guest-authored sealing path).
+            abi_minor: 1,
             channels: vec![0],
             // The tiny parity model: ~1 MiB accountable state (params + queues), ~1 MiB
             // transient decode/staging scratch; device residency is host mechanism (§2.5).
@@ -192,18 +199,36 @@ daemon_vhc_sdk_v2::main!(TinyLlamaV2);
 const EV_FRAME: u64 = 0;
 const EV_PAYLOAD_READY: u64 = 1;
 const EV_STOP: u64 = 4;
+const EV_COMPLETION: u64 = 6;
+const STAGED_KIND_BYTES: u64 = 0;
 const STAGED_KIND_BATCH: u64 = 1;
 const STAGED_KIND_UPDATE: u64 = 2;
 
-/// Voice the round core's outbound actions on the control channel (§6.2): commitments, straggle
-/// heartbeats, and round digests — module-authored payloads the host signs + sequences.
-fn emit(out: Vec<daemon_vhc_sdk_rounds::Outbound>) {
+/// The guest-authored sealing state machine (module docs): the held commitment + the in-flight
+/// payload_put.
+#[derive(Default)]
+struct SealState {
+    /// The round core's Commit, held until the guest's own payload_put completes.
+    pending_commit: Option<Commitment>,
+    /// The sealed `create_from` buffer awaiting its put completion (released on completion).
+    sealed_buffer: Option<u64>,
+    /// The put's size (the commitment's `size` field — the bytes the guest itself sealed).
+    sealed_size: u64,
+    /// The outstanding payload_put op.
+    put_op: Option<u64>,
+}
+
+/// Voice the round core's outbound actions on the control channel (§6.2): straggle heartbeats and
+/// round digests publish immediately; a `Commit` is HELD in the seal state until the guest's own
+/// `payload_put` completes with the commitment hash (the B1 guest-authored sealing path).
+fn emit(out: Vec<daemon_vhc_sdk_rounds::Outbound>, seal: &mut SealState) {
     use daemon_vhc_sdk_rounds::Outbound;
     for o in out {
         let msg = match o {
-            // Phase A: the sealed payload stays host-side (the outbound sealing gap — module
-            // docs); the commitment frame still voices the round's completion.
-            Outbound::Commit { commitment, .. } => SwarmMessage::Commitment(commitment),
+            Outbound::Commit { commitment, .. } => {
+                seal.pending_commit = Some(commitment);
+                continue; // published on the put completion, with the completed hash
+            }
             Outbound::RoundComplete { round, digest } | Outbound::CaughtUp { round, digest } => {
                 SwarmMessage::Digest(Digest {
                     round,
@@ -232,6 +257,7 @@ fn event_loop(
     updates: &mut FifoUpdates,
 ) -> u32 {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut seal = SealState::default();
     loop {
         let ev = daemon_vhc_sdk_v2::next_event(&mut buf);
         match ev.tag {
@@ -259,7 +285,49 @@ fn event_loop(
                             .push_back(staging_id);
                     }
                     STAGED_KIND_UPDATE => updates.queue.push_back(staging_id),
+                    // The guest's OWN sealed container, announced back at the slice boundary
+                    // (module docs): seal it into a buffer and put it — the §3.4 walk.
+                    STAGED_KIND_BYTES if seal.pending_commit.is_some() => {
+                        let bytes = daemon_vhc_sdk_v2::read_back_bytes(staging_id, 0);
+                        let buffer = daemon_vhc_sdk_v2::create_from(&bytes);
+                        seal.sealed_size = bytes.len() as u64;
+                        seal.sealed_buffer = Some(buffer);
+                        seal.put_op = Some(daemon_vhc_sdk_v2::payload_put(buffer));
+                    }
                     _ => {}
+                }
+            }
+            EV_COMPLETION => {
+                // [6, op, [variant, payload]] — the put completion carries the commitment hash.
+                let op = ev.uint(1);
+                if seal.put_op != Some(op) {
+                    continue;
+                }
+                seal.put_op = None;
+                if let Some(buffer) = seal.sealed_buffer.take() {
+                    daemon_vhc_sdk_v2::buffer_release(buffer);
+                }
+                let Some(ciborium::value::Value::Array(result)) = ev.items.get(2) else {
+                    continue;
+                };
+                let ok = result
+                    .first()
+                    .and_then(|v| v.as_integer())
+                    .is_some_and(|n| i128::from(n) == 0);
+                let hash: Option<[u8; 32]> = match result.get(1) {
+                    Some(ciborium::value::Value::Bytes(b)) => b.as_slice().try_into().ok(),
+                    _ => None,
+                };
+                if let (true, Some(hash), Some(mut commitment)) =
+                    (ok, hash, seal.pending_commit.take())
+                {
+                    // The guest-authored evidence: the hash its OWN put completed with, over the
+                    // bytes it sealed itself — commitment hash ≡ staged bytes by construction.
+                    commitment.payload = Hash(hash);
+                    commitment.size = seal.sealed_size;
+                    if let Ok(bytes) = to_canonical_vec(&SwarmMessage::Commitment(commitment)) {
+                        let _ = daemon_vhc_sdk_v2::publish(0, &bytes);
+                    }
                 }
             }
             EV_FRAME => {
@@ -275,7 +343,7 @@ fn event_loop(
                     }
                     _ => Vec::new(),
                 };
-                emit(out);
+                emit(out, &mut seal);
             }
             _ => {}
         }

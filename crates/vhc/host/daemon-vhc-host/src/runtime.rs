@@ -205,6 +205,10 @@ pub(crate) struct HostState {
     step_native: StepArena,
     step_det: StepArena,
     containers: Vec<Container>,
+    /// Indices into `containers` of GUEST-BUILT containers (`upd_new@1`) — distinct from
+    /// inbound-staged ones, so the v2 driver's slice-boundary sealing (B1) never re-announces a
+    /// container the guest merely ingested.
+    guest_built: Vec<usize>,
     staged: Vec<usize>,
     batches: Vec<BatchData>,
     metrics: Vec<(String, f32)>,
@@ -263,6 +267,7 @@ impl HostState {
             step_native: StepArena::new(Lane::Native),
             step_det: StepArena::new(Lane::Det),
             containers: Vec::new(),
+            guest_built: Vec::new(),
             staged: Vec::new(),
             batches: Vec::new(),
             metrics: Vec::new(),
@@ -1318,8 +1323,15 @@ impl HostState {
     }
 
     /// The number of built update containers (the v2 driver's sealing watermark).
-    pub(crate) fn container_count(&self) -> usize {
-        self.containers.len()
+    /// How many containers the GUEST has built (`upd_new@1`) — the v2 slice-boundary sealing
+    /// watermark input (B1): inbound-staged containers never count.
+    pub(crate) fn guest_container_count(&self) -> usize {
+        self.guest_built.len()
+    }
+
+    /// Seal the `ordinal`-th guest-built container to its canonical wire (B1 sealing service).
+    pub(crate) fn seal_guest_container_of(&self, ordinal: usize) -> Option<Vec<u8>> {
+        self.seal_container_of(*self.guest_built.get(ordinal)?)
     }
 
     /// The §5.9 barrier snapshot — the host-side epilogue `Instance::ingest` runs after
@@ -1945,6 +1957,7 @@ impl HostState {
         self.containers.push(Container {
             sections: Vec::new(),
         });
+        self.guest_built.push(self.containers.len() - 1);
         handle::update_handle(self.containers.len() as u32)
     }
 

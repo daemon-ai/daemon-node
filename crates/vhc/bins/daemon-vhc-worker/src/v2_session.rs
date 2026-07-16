@@ -9,10 +9,11 @@
 //! whole-run shape: a v2 worker module under a v1 envelope + the native coordinator.
 //!
 //! Phase-A seams, stated where they live:
-//! - **Plumbing-owned payloads** (the outbound sealing gap, resolved by B1 `payload_put`): the
-//!   guest's `Commitment` frame is its voice, but the payload the barrier stages is the
-//!   PLUMBING-sealed container (the v1 host-sealing relocated to the v2 commit seam), so the
-//!   commitment evidence fed to the coordinator is plumbing-authored over those sealed bytes.
+//! - **Guest-authored payloads (the B1 sealing-gap retirement)**: the guest seals its own
+//!   container (`read_back` → `create_from`) and `payload_put`s it; this session is the
+//!   async-runtime seat servicing the put (capturing the bytes), and the commitment evidence fed
+//!   to the coordinator is decoded FROM THE GUEST'S OWN Commitment frame — verified here to hash
+//!   exactly the serviced bytes (commitment hash ≡ staged bytes) before it is relayed.
 //! - **Coordinator-plane verification**: the coordinator speaks v1 `SignedMessage`s; each is
 //!   signature-verified here, above the pump, and the pre-verified payload is delivered with
 //!   the original signed bytes as tag-12 evidence. (Worker-plane §12.1 v2 frames verify through
@@ -36,7 +37,7 @@ use daemon_vhc_host::v2::{
     V2RunConfig,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
-use daemon_vhc_proto::messages::{Commitment, Join, StorageReceipt, ThroughputClass};
+use daemon_vhc_proto::messages::{Join, StorageReceipt, ThroughputClass};
 use daemon_vhc_proto::{
     blake3_hash, digest_state, peer_id, to_canonical_vec, CapabilitySet, Envelope, IrohId, Seed,
     SignedMessage, SigningKey, SwarmMessage,
@@ -232,6 +233,8 @@ pub(crate) async fn join_and_run_v2(
     let corpus = t2_corpus()?;
     let mut rounds_done = 0u64;
     let mut last_round = 0u64;
+    // Sealed bytes captured while servicing the guest's payload_put ops (the async-runtime seat).
+    let mut puts: Vec<Vec<u8>> = Vec::new();
     while rounds_done < T2_ROUNDS {
         // The coordinator's next authoritative message.
         let Some(msg) = outbox.first().cloned() else {
@@ -280,25 +283,42 @@ pub(crate) async fn join_and_run_v2(
                     }
                 }
                 deliver_coordinator_msg(&pump, &coord_key, &msg)?;
-                // The guest trains and voices its Commitment: per round, one Commitment then
-                // one Digest — so after round r's open, publishes reach 2r + 1.
-                wait_publishes(&pump, (rounds_done as usize) * 2 + 1)?;
-                // Plumbing-owned sealing (module docs): the committed payload is the sealed
-                // container; the coordinator's evidence is authored over THOSE bytes.
-                let (_, sealed) = pump
-                    .take_sealed_update()
-                    .ok_or("no sealed container after commit (bridge module expected)")?;
-                let hash = blake3_hash(&sealed);
-                let commitment = SwarmMessage::Commitment(Commitment {
-                    round: ro.round,
-                    payload: hash,
-                    size: sealed.len() as u64,
-                    locators: Vec::new(),
-                });
+                // The guest trains, seals its own container, payload_puts it, and voices its
+                // Commitment over the completion hash: per round, one Commitment then one
+                // Digest — so after round r's open, publishes reach 2r + 1. This session is the
+                // async-runtime seat: it services the put, capturing the sealed bytes.
+                let published =
+                    wait_publishes_servicing(&pump, (rounds_done as usize) * 2 + 1, &mut puts)?;
+                let sealed = puts
+                    .last()
+                    .cloned()
+                    .ok_or("no payload_put serviced after commit (bridge module expected)")?;
+                // The GUEST-authored commitment (the B1 sealing-gap retirement): decode the
+                // guest's own frame, and verify its evidence hashes exactly the serviced bytes.
+                let commitment_frame = &published[(rounds_done as usize) * 2].2;
+                let SwarmMessage::Commitment(commitment) = decode_v2_payload(commitment_frame)?
+                else {
+                    return Err("publish 2r is not the guest's Commitment".into());
+                };
+                if commitment.payload != blake3_hash(&sealed) {
+                    return Err(format!(
+                        "guest commitment hash {} != staged bytes hash {} (evidence must be \
+                         authored over the guest's own sealed bytes)",
+                        commitment.payload.to_hex(),
+                        blake3_hash(&sealed).to_hex()
+                    ));
+                }
+                if commitment.round != ro.round {
+                    return Err("guest commitment names the wrong round".into());
+                }
+                let hash = commitment.payload;
+                let size = commitment.size;
+                // Relay the guest's evidence onto the v1 coordinator plane (the proto-plane
+                // shim, exactly as deliver_coordinator_msg shims the other direction).
                 let signed = SignedMessage::sign(
                     &worker_key,
                     daemon_vhc_proto::SWARM_PROTO_VERSION,
-                    commitment,
+                    SwarmMessage::Commitment(commitment),
                 )
                 .map_err(|e| format!("commitment sign: {e}"))?;
                 feed(&mut state, Input::Message(signed), &mut outbox)?;
@@ -308,7 +328,7 @@ pub(crate) async fn join_and_run_v2(
                     verified: vec![daemon_vhc_proto::messages::RecordEntry {
                         peer: worker_peer,
                         hash,
-                        size: sealed.len() as u64,
+                        size,
                     }],
                 });
                 let signed =
@@ -319,14 +339,14 @@ pub(crate) async fn join_and_run_v2(
                 now_s += u64::from(envelope.phases.round_train_max) + 1;
                 feed(&mut state, Input::Clock(now_s), &mut outbox)?;
                 // Stage the committed set for the barrier BEFORE the record arrives (§5.11:
-                // record-listed order; single peer = the one sealed payload).
+                // record-listed order; single peer = the one guest-put payload).
                 pump.stage_update(sealed, None)
                     .map_err(|e| format!("stage update: {e}"))?;
             }
             SwarmMessage::RoundRecord(_) => {
                 deliver_coordinator_msg(&pump, &coord_key, &msg)?;
                 // The guest ingests and voices its round digest: publishes reach 2(r + 1).
-                wait_publishes(&pump, (rounds_done as usize) * 2 + 2)?;
+                wait_publishes_servicing(&pump, (rounds_done as usize) * 2 + 2, &mut puts)?;
                 rounds_done += 1;
             }
             _ => { /* Digest/witness chatter — not part of the Phase-A closed drive */ }
@@ -438,13 +458,27 @@ fn next_coord_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Wait (bounded) until the pump has published at least `target` frames in total.
-fn wait_publishes(
+/// Wait (bounded) until the pump has published at least `target` frames in total, servicing the
+/// guest's `payload_put` ops meanwhile (the async-runtime seat): the pump computes the completion
+/// hash over the op's own sealed bytes; this session captures them into `puts` — the bytes the
+/// barrier will stage, and the bytes the guest's commitment evidence must hash.
+fn wait_publishes_servicing(
     pump: &daemon_vhc_host::v2::PumpHandle,
     target: usize,
+    puts: &mut Vec<Vec<u8>>,
 ) -> Result<Vec<(u64, u64, Vec<u8>)>, String> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
+        for (op, request) in pump.take_op_requests() {
+            match request {
+                daemon_vhc_host::v2::OpRequest::PayloadPut { bytes } => {
+                    puts.push(bytes.to_vec());
+                    pump.complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
+                        .map_err(|e| format!("put completion: {e}"))?;
+                }
+                other => return Err(format!("unexpected op request from the guest: {other:?}")),
+            }
+        }
         let published = pump.published();
         if published.len() >= target {
             return Ok(published);
@@ -457,4 +491,18 @@ fn wait_publishes(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Decode the module-authored payload of a §12.1 signed frame `[envelope, payload, sig]` as a
+/// `SwarmMessage` (the guest's voice on the control channel).
+fn decode_v2_payload(frame: &[u8]) -> Result<SwarmMessage, String> {
+    let v: ciborium::value::Value =
+        ciborium::de::from_reader(frame).map_err(|e| format!("frame cbor: {e}"))?;
+    let ciborium::value::Value::Array(parts) = v else {
+        return Err("frame is not [envelope, payload, sig]".into());
+    };
+    let Some(ciborium::value::Value::Bytes(payload)) = parts.get(1) else {
+        return Err("frame payload is not bytes".into());
+    };
+    daemon_vhc_proto::from_canonical_slice(payload).map_err(|e| format!("payload decode: {e}"))
 }

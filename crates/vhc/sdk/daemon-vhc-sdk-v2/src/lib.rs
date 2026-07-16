@@ -21,7 +21,8 @@
 pub mod abi;
 #[cfg(target_arch = "wasm32")]
 pub use abi::{
-    device_profile, emit_metric, hash_accel, next_event, publish, read_back_bytes, read_back_uint,
+    buffer_len, buffer_release, cancel, create_from, device_profile, emit_metric, hash_accel,
+    next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint, read_buffer,
     rng_seed, set_timer, verify_sig_accel, Event,
 };
 
@@ -69,7 +70,10 @@ macro_rules! main {
 
             #[no_mangle]
             pub extern "C" fn da_abi() -> u32 {
-                2 << 16
+                // The declaration is cross-checked against the import shape at selection
+                // (ABI §1.3 step 5): the declared minor must cover every imported symbol's
+                // introducing minor.
+                (2 << 16) | <$module as $crate::module::V2Module>::decl().abi_minor
             }
 
             #[no_mangle]

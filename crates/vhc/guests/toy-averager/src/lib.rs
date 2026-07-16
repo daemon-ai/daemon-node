@@ -93,10 +93,12 @@ fn emit_cbor(bytes: &[u8]) -> u64 {
 
 // ---- required exports (ABI §2.1) -------------------------------------------------------------------
 
-/// `(major << 16) | minor` — major 2, minor 0 (ABI §1.1).
+/// `(major << 16) | minor` — major 2, minor 1 (ABI §1.1): since B2 the module consumes the
+/// minor-1 `sys@2` ambient surface (`rng_seed`/`device_profile`), so it declares the minor its
+/// imports require (declaring below them is a typed `AbiDeclarationMismatch`, §1.3 step 5).
 #[no_mangle]
 pub extern "C" fn da_abi() -> u32 {
-    2 << 16
+    (2 << 16) | 1
 }
 
 /// The static-requirements manifest (ABI §2.3): worlds + the single `control` channel.
@@ -119,7 +121,7 @@ pub extern "C" fn da_manifest(_cfg_ptr: u32, _cfg_len: u32) -> u64 {
         ),
         (
             ciborium::value::Value::Text("abi".into()),
-            ciborium::value::Value::Integer((2u32 << 16).into()),
+            ciborium::value::Value::Integer(((2u32 << 16) | 1).into()),
         ),
         (
             ciborium::value::Value::Text("channels".into()),

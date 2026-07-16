@@ -267,6 +267,18 @@ impl JournalSink for JournalAdapter {
             .map_err(|e| SinkError(e.to_string()))
     }
 
+    fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError> {
+        self.journal
+            .append(Body::Completion(
+                daemon_vhc_observe::journal::record::CompletionRec {
+                    op,
+                    result: result.to_vec(),
+                },
+            ))
+            .map(|_| ())
+            .map_err(|e| SinkError(e.to_string()))
+    }
+
     fn terminal(
         &mut self,
         kind: u64,
@@ -316,7 +328,8 @@ fn toy_averager_runs_end_to_end_under_the_v2_driver() {
     let sel = select_driver(&worker, &wasm, Some(blake3::hash(&wasm).as_bytes()))
         .expect("major-2 module admitted to the event-loop driver");
     assert_eq!(sel.driver, daemon_vhc_abi::CandidateDriver::V2);
-    assert_eq!((sel.major, sel.minor), (2, 0));
+    // Minor 1 since B2: the toy consumes the sys@2 ambient surface (rng_seed/device_profile).
+    assert_eq!((sel.major, sel.minor), (2, 1));
 
     // The real A1 journal, keyed by the frozen execution identity (§8.1).
     let identity = RunIdentity {

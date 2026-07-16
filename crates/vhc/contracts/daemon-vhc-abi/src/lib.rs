@@ -42,8 +42,17 @@ pub const DA_ABI_VERSION: u32 = (DA_ABI_MAJOR << 16) | DA_ABI_MINOR;
 
 /// The major-2 (event-loop driver) ABI major (ABI §0.4, §1.2).
 pub const DA_ABI_MAJOR_V2: u32 = 2;
-/// The major-2 ABI minor defined by ABI Draft 3 (`da_abi` major 2, minor 0).
-pub const DA_ABI_MINOR_V2: u32 = 0;
+/// The major-2 ABI minor this host generation implements.
+///
+/// **Minor 1 is track B1's Phase-B surface** (buffers + the async completion protocol + net
+/// payload put/get — the [`V2_SYMBOL_REGISTRY`] minor-1 entries), bumped in the same commit that
+/// made `Event::Completion` delivery real in the driver — the ratified additive evolution path
+/// (ABI §1.4/§4.6: reserved variants deliverable only above the minor that reserved them),
+/// mirroring how the A2 majors flip was coupled to the working event-loop driver. A module
+/// declaring minor 0 keeps the Phase-A closed subset: it cannot import a completion-generating
+/// symbol (registry-gated), and the host delivers it no tag-6 event. `AbiMinorTooNew` continues
+/// to refuse declarations above this constant.
+pub const DA_ABI_MINOR_V2: u32 = 1;
 
 /// The set of ABI **majors this host generation implements** (i.e. carries a driver for).
 ///
@@ -178,6 +187,75 @@ pub fn v2_namespace_symbols(ns: &str) -> Option<&'static [&'static str]> {
         NS_DATA_V2 | NS_COMPUTE_V2 => Some(&[]),
         _ => None,
     }
+}
+
+// -- the v2 symbol registry: every symbol's introducing minor (ABI §1.3 step 3, §1.4) ------------
+//
+// "A0: `daemon-vhc-abi` gains the v2 constants AND the symbol registry §1.3 step 3 consults to map
+// each static import to its introducing minor" (decisions D2). The registry is how additive minor
+// growth stays checkable: a host admits a symbol iff its introducing minor ≤ the host's implemented
+// minor for that namespace's major, and a module's DECLARED minor must be ≥ the highest introducing
+// minor among its imports (a declared minor below what the imports require is
+// `AbiDeclarationMismatch`, ABI §1.3 step 5). Minor-1 entries are track B1's Phase-B surface:
+// buffers (§3.4/§7.4), the async completion protocol (§3.3/§7.5), and net payload put/get.
+
+/// Every `(namespace, symbol, introducing minor)` of the major-2 import surface. Growth is
+/// append-only; a symbol's introducing minor is permanent.
+pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
+    // -- minor 0 (Phase A) --
+    (NS_VHC_V2, "next_event", 0),
+    (NS_VHC_V2, "read_back", 0),
+    (NS_VHC_V2, "stage_state", 0),
+    (NS_VHC_V2, "snapshot_state", 0),
+    (NS_NET_V2, "publish", 0),
+    (NS_SYS_V2, "set_timer", 0),
+    (NS_SYS_V2, "cancel_timer", 0),
+    (NS_SYS_V2, "now", 0),
+    (NS_SYS_V2, "emit_metric", 0),
+    (NS_SYS_V2, "log", 0),
+    // -- minor 1 (Phase B, track B1): buffers + the async completion protocol ------------------
+    // The two budgeted linear-memory paths (§3.4): OUT of linear memory (sealed at creation) and
+    // INTO it (charged against the per-slice readback allowance).
+    (NS_VHC_V2, "create_from", 1),
+    (NS_VHC_V2, "read_into", 1),
+    // Deterministic buffer bookkeeping: length + explicit guest release (§3.4 ownership).
+    (NS_VHC_V2, "buffer_len", 1),
+    (NS_VHC_V2, "buffer_release", 1),
+    // The completion protocol's cancellation import (§3.3/§7.5): the op completes `Cancelled`.
+    (NS_VHC_V2, "cancel", 1),
+    // Content-addressed payload plane by handle (§3.4): both complete via `Event::Completion`.
+    (NS_NET_V2, "payload_put", 1),
+    (NS_NET_V2, "payload_get", 1),
+    // -- minor 1 (Phase B, track B2): sys@2 crypto accels + ambient inputs ----------------------
+    // The det-lane-pattern crypto accelerations (deterministic, unjournaled — §2.7 dc class).
+    (NS_SYS_V2, "hash", 1),
+    (NS_SYS_V2, "verify_sig", 1),
+    // The identity-derived deterministic seed (unjournaled; replay re-derives it).
+    (NS_SYS_V2, "rng_seed", 1),
+    // The probe's device profile (nondeterministic input — journaled tag 15 per delivery).
+    (NS_SYS_V2, "device_profile", 1),
+];
+
+/// The minor at which `(namespace, symbol)` was introduced, or `None` if it is not a registered
+/// v2 symbol (ABI §1.3 step 3).
+#[must_use]
+pub fn v2_symbol_minor(namespace: &str, symbol: &str) -> Option<u32> {
+    V2_SYMBOL_REGISTRY
+        .iter()
+        .find(|(ns, sym, _)| *ns == namespace && *sym == symbol)
+        .map(|(_, _, minor)| *minor)
+}
+
+/// The minimum major-2 minor a module's static v2 imports require: the highest introducing minor
+/// among them (0 when none are v2 symbols). A module MUST declare at least this minor — declaring
+/// below what the imports require is `AbiDeclarationMismatch` (ABI §1.3 step 5).
+#[must_use]
+pub fn required_v2_minor(imports: &[(&str, &str)]) -> u32 {
+    imports
+        .iter()
+        .filter_map(|(ns, sym)| v2_symbol_minor(ns, sym))
+        .max()
+        .unwrap_or(0)
 }
 
 /// The candidate driver selected from a module's *static import shape* (ABI §1.3 step 2). This is
@@ -341,19 +419,24 @@ pub fn select_candidate(
 ///
 /// - `tabi@1` symbols MUST be in the frozen [`TABI_IMPORTS`] vocabulary, else
 ///   [`AbiRefusalCode::WorldMinorUnsupported`] (a `tabi@1` symbol the host lacks);
-/// - `vhc@2`/`net@2`/`sys@2`/`data@2`/`compute@2` symbols MUST be in that namespace's Phase-A
-///   vocabulary ([`v2_namespace_symbols`]), else [`AbiRefusalCode::WorldMinorUnsupported`];
+/// - `vhc@2`/`net@2`/`sys@2`/`data@2`/`compute@2` symbols MUST be in the
+///   [`V2_SYMBOL_REGISTRY`] **at an introducing minor ≤ the host's implemented major-2 minor**,
+///   else [`AbiRefusalCode::WorldMinorUnsupported`] (an unregistered symbol and a
+///   registered-but-too-new symbol are the same refusal: this host cannot serve the import);
 /// - any wholly unknown namespace ⇒ [`AbiRefusalCode::BadModule`].
 ///
 /// This subsumes "missing import for a known namespace" (ABI §1.3 step 3). The `tabi@1`-under-major-2
 /// bridge is accepted here (the bridge is advertised through Phase C, ABI §2.5); a bridge-retired
-/// host is a Phase-C concern ([`AbiRefusalCode::BridgeRetired`]).
+/// host is a Phase-C concern ([`AbiRefusalCode::BridgeRetired`]). The complementary declaration-side
+/// rule — a declared minor below [`required_v2_minor`] — is the selector's step-5 cross-check
+/// (`AbiDeclarationMismatch`), not this function's.
 ///
 /// # Errors
 ///
-/// [`AbiRefusalCode::WorldMinorUnsupported`] for an unknown symbol in a known namespace;
+/// [`AbiRefusalCode::WorldMinorUnsupported`] for an unknown/too-new symbol in a known namespace;
 /// [`AbiRefusalCode::BadModule`] for an unknown namespace.
 pub fn validate_imports(imports: &[(&str, &str)]) -> Result<(), AbiRefusal> {
+    let host_v2_minor = host_minor_for(DA_ABI_MAJOR_V2).unwrap_or(0);
     for (namespace, symbol) in imports {
         if *namespace == NS_TABI_V1 {
             if !TABI_IMPORTS.contains(symbol) {
@@ -362,14 +445,27 @@ pub fn validate_imports(imports: &[(&str, &str)]) -> Result<(), AbiRefusal> {
                     format!("tabi@1 symbol `{symbol}` is not in the frozen host vocabulary"),
                 ));
             }
-        } else if let Some(vocab) = v2_namespace_symbols(namespace) {
-            if !vocab.contains(symbol) {
-                return Err(AbiRefusal::new(
-                    AbiRefusalCode::WorldMinorUnsupported,
-                    format!(
-                        "namespace `{namespace}` symbol `{symbol}` is beyond the host's Phase-A minor"
-                    ),
-                ));
+        } else if v2_namespace_symbols(namespace).is_some() {
+            match v2_symbol_minor(namespace, symbol) {
+                Some(introduced) if introduced <= host_v2_minor => {}
+                Some(introduced) => {
+                    return Err(AbiRefusal::new(
+                        AbiRefusalCode::WorldMinorUnsupported,
+                        format!(
+                            "namespace `{namespace}` symbol `{symbol}` was introduced at minor \
+                             {introduced}, beyond this host's implemented minor {host_v2_minor}"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(AbiRefusal::new(
+                        AbiRefusalCode::WorldMinorUnsupported,
+                        format!(
+                            "namespace `{namespace}` symbol `{symbol}` is not in the v2 symbol \
+                             registry"
+                        ),
+                    ));
+                }
             }
         } else {
             return Err(AbiRefusal::new(
@@ -750,6 +846,251 @@ pub const DA_MIGRATE_INCOMPATIBLE: u32 = 1;
 /// collide and guest IDs need no journal record (counter-derived, replay-reproducible).
 pub const GUEST_STAGING_ID_TOP_BIT: u64 = 1 << 63;
 
+// ================================================================================================
+// Resource handles: the bit layout, the kinds, and the three resource classes (ABI §7.1/§7.2).
+//
+// A handle is an opaque nonzero `u64` naming a host-side resource; `0` is never a live handle. The
+// v1 bit layout (`daemon-vhc-host::handle`) is retained verbatim and lifted here so every side of
+// the boundary — the host arena, the guest SDK, the journal/replay verifier — packs and inspects
+// handles against one source of truth. Kinds 1–7 are the frozen `tabi@1` bridge resources; kinds
+// 8/9/10 (BufferHandle / StreamHandle / OpId) are Phase B (this track) — reserved-numbered here so
+// the buffer + completion layers land without renumbering. Growth is additive (kinds 11–255
+// reserved); a kind's class is permanent.
+// ================================================================================================
+
+/// The bit position of the 8-bit `kind` field in a handle (ABI §7.2).
+pub const HANDLE_KIND_SHIFT: u32 = 56;
+/// The bit position of the 24-bit `generation` field in a handle (ABI §7.2).
+pub const HANDLE_GENERATION_SHIFT: u32 = 32;
+/// The 24-bit mask applied to a handle's `generation` field (ABI §7.2).
+pub const HANDLE_GENERATION_MASK: u64 = 0x00FF_FFFF;
+/// The largest representable handle generation (24 bits). A slot whose generation would wrap past
+/// this MUST be **permanently retired** (never returned to the free list), making ABA reuse of a
+/// `(kind, generation, index)` triple impossible within an instance (ABI §7.1).
+pub const HANDLE_MAX_GENERATION: u32 = 0x00FF_FFFF;
+/// The 32-bit mask applied to a handle's `index` field (1-based, ABI §7.2).
+pub const HANDLE_INDEX_MASK: u64 = 0xFFFF_FFFF;
+
+/// Handle kind 1: a native step tensor — bridge, slice-class (ABI §7.2).
+pub const HANDLE_KIND_STEP_TENSOR_NATIVE: u8 = 1;
+/// Handle kind 2: a det step tensor — bridge, slice-class (ABI §7.2).
+pub const HANDLE_KIND_STEP_TENSOR_DET: u8 = 2;
+/// Handle kind 3: a param — bridge, registered-class (ABI §7.2).
+pub const HANDLE_KIND_PARAM: u8 = 3;
+/// Handle kind 4: a persistent — bridge, registered-class (ABI §7.2).
+pub const HANDLE_KIND_PERSISTENT: u8 = 4;
+/// Handle kind 5: a det persistent — bridge, registered-class (ABI §7.2).
+pub const HANDLE_KIND_DET_PERSISTENT: u8 = 5;
+/// Handle kind 6: an update container — bridge, instance-class (ABI §7.2).
+pub const HANDLE_KIND_UPDATE_CONTAINER: u8 = 6;
+/// Handle kind 7: a batch — bridge, instance-class (ABI §7.2).
+pub const HANDLE_KIND_BATCH: u8 = 7;
+/// Handle kind 8: a [`BufferHandle`](https://example.invalid) — the sealed, host-owned byte region
+/// every world speaks (ABI §7.4); instance-class. **Phase B (this track).**
+pub const HANDLE_KIND_BUFFER: u8 = 8;
+/// Handle kind 9: a stream handle for a direct peer stream (ABI §7.2); instance-class. **Phase B.**
+pub const HANDLE_KIND_STREAM: u8 = 9;
+/// Handle kind 10: an `OpId` — an outstanding async operation completing via `Event::Completion`
+/// (ABI §7.2/§7.5); instance-class. **Phase B (this track).**
+pub const HANDLE_KIND_OP_ID: u8 = 10;
+
+/// The three resource classes (ABI §7.1): the class fixes a handle's lifetime, its generation
+/// behavior, and its restart semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceClass {
+    /// Registered in `da_init`; lives the run instance; handles re-derived deterministically from
+    /// 1-based registration order (generation 0) after any restart (ABI §7.1).
+    Registered,
+    /// Lives until explicit release or instance end; a generational handle from a dead instance
+    /// traps `StaleHandle`; re-acquired through capability calls (ABI §7.1).
+    Instance,
+    /// Lives until the current event slice ends; invalidated wholesale at each slice boundary
+    /// (ABI §7.1).
+    Slice,
+}
+
+/// The [`ResourceClass`] of a handle `kind`, or `None` if `kind` is unassigned (ABI §7.1/§7.2).
+///
+/// The kind→class mapping is permanent: kinds 1–2 are slice-class, 3–5 registered-class, 6–10
+/// instance-class (buffers/streams/`OpId`s join the bridge's batches/containers as instance-class).
+#[must_use]
+pub fn handle_class(kind: u8) -> Option<ResourceClass> {
+    match kind {
+        HANDLE_KIND_STEP_TENSOR_NATIVE | HANDLE_KIND_STEP_TENSOR_DET => Some(ResourceClass::Slice),
+        HANDLE_KIND_PARAM | HANDLE_KIND_PERSISTENT | HANDLE_KIND_DET_PERSISTENT => {
+            Some(ResourceClass::Registered)
+        }
+        HANDLE_KIND_UPDATE_CONTAINER
+        | HANDLE_KIND_BATCH
+        | HANDLE_KIND_BUFFER
+        | HANDLE_KIND_STREAM
+        | HANDLE_KIND_OP_ID => Some(ResourceClass::Instance),
+        _ => None,
+    }
+}
+
+/// Pack a `(kind, generation, index)` triple into the opaque `u64` handle layout (ABI §7.2):
+/// `(kind << 56) | ((generation & 0xFF_FFFF) << 32) | index`. `index` is 1-based; a `0` index (with
+/// `kind`/`generation` also 0) yields the reserved non-handle `0`.
+#[must_use]
+pub const fn pack_handle(kind: u8, generation: u32, index: u32) -> u64 {
+    ((kind as u64) << HANDLE_KIND_SHIFT)
+        | (((generation as u64) & HANDLE_GENERATION_MASK) << HANDLE_GENERATION_SHIFT)
+        | (index as u64)
+}
+
+/// The 8-bit `kind` field of a handle (ABI §7.2).
+#[must_use]
+pub const fn handle_kind(handle: u64) -> u8 {
+    (handle >> HANDLE_KIND_SHIFT) as u8
+}
+
+/// The 24-bit `generation` field of a handle (ABI §7.2).
+#[must_use]
+pub const fn handle_generation(handle: u64) -> u32 {
+    ((handle >> HANDLE_GENERATION_SHIFT) & HANDLE_GENERATION_MASK) as u32
+}
+
+/// The 32-bit 1-based `index` field of a handle (ABI §7.2).
+#[must_use]
+pub const fn handle_index(handle: u64) -> u32 {
+    (handle & HANDLE_INDEX_MASK) as u32
+}
+
+// ================================================================================================
+// The async completion-result wire vocabulary (ABI §7.5): the numeric assignments the completion
+// codec (`daemon-vhc-host::v2`), the guest SDK, and the journal/replay verifier must agree on.
+//
+// Any capability call that cannot complete immediately returns an `OpId` (kind 10) and completes
+// via `Event::Completion(op, result)` (event tag 6). None of it is linked at Phase A, but §7.5
+// FIXES the wire encoding now so journals (tag 14, opaque `bstr`) and SDKs are stable. The grammar
+// of the decoded result bytes is [`COMPLETION_RESULT_CDDL`]; these constants are its numeric
+// assignments. The variant set is additive within major 2; unknown `comp-error` codes fail closed
+// (ABI §5.2).
+// ================================================================================================
+
+/// The normative `completion-result` wire grammar (ABI §7.5): the decoded shape of a
+/// `Event::Completion` result and of a journal tag-14 `completion-rec.result` byte string.
+///
+/// Root rule `completion-result`. It MUST validate as-is under `cddl-cat`; the `completion_grammar`
+/// test asserts it is machine-valid and that a representative of each variant validates. The journal
+/// stores these bytes opaquely (`completion-rec.result: bstr`, [`JOURNAL_CDDL`]).
+pub const COMPLETION_RESULT_CDDL: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/completion.cddl"));
+
+/// `completion-result` variant discriminant 0: success (ABI §7.5 `[0, success-payload]`).
+pub const COMPLETION_RESULT_OK: u64 = 0;
+/// `completion-result` variant discriminant 1: failure (ABI §7.5 `[1, comp-error]`).
+pub const COMPLETION_RESULT_ERR: u64 = 1;
+
+/// `comp-error` code 0: the operation was cancelled (`vhc@2::cancel`, ABI §7.5).
+pub const COMP_ERR_CANCELLED: u64 = 0;
+/// `comp-error` code 1: the network destination was unreachable (ABI §7.5).
+pub const COMP_ERR_NET_UNREACHABLE: u64 = 1;
+/// `comp-error` code 2: the operation timed out (guest timer policy surfaces here, ABI §7.5).
+pub const COMP_ERR_TIMEOUT: u64 = 2;
+/// `comp-error` code 3: the payload store refused the operation (ABI §7.5).
+pub const COMP_ERR_STORE_REFUSED: u64 = 3;
+/// `comp-error` code 4: a fetched/verified byte range did not match its content hash (ABI §7.5).
+pub const COMP_ERR_HASH_MISMATCH: u64 = 4;
+/// `comp-error` code 5: a stream write exceeded its writable credit (ABI §7.5, credit flow control).
+pub const COMP_ERR_CREDIT_EXHAUSTED: u64 = 5;
+/// `comp-error` code 6: the peer closed the stream (ABI §7.5).
+pub const COMP_ERR_PEER_CLOSED: u64 = 6;
+/// `comp-error` code 7: a grant/quota bound was exhausted (ABI §7.5).
+pub const COMP_ERR_GRANT_EXHAUSTED: u64 = 7;
+/// `comp-error` codes at or above this are reserved (additive by minor); a guest MUST fail closed on
+/// an unknown code (ABI §5.2/§7.5).
+pub const COMP_ERR_RESERVED_MIN: u64 = 8;
+
+/// The stable machine-readable slug for a `comp-error` code, or `None` if `code` is reserved/unknown
+/// (ABI §7.5). Used to render the `detail`-free failure category in host logs / node surfaces.
+#[must_use]
+pub fn comp_err_slug(code: u64) -> Option<&'static str> {
+    match code {
+        COMP_ERR_CANCELLED => Some("Cancelled"),
+        COMP_ERR_NET_UNREACHABLE => Some("NetUnreachable"),
+        COMP_ERR_TIMEOUT => Some("Timeout"),
+        COMP_ERR_STORE_REFUSED => Some("StoreRefused"),
+        COMP_ERR_HASH_MISMATCH => Some("HashMismatch"),
+        COMP_ERR_CREDIT_EXHAUSTED => Some("CreditExhausted"),
+        COMP_ERR_PEER_CLOSED => Some("PeerClosed"),
+        COMP_ERR_GRANT_EXHAUSTED => Some("GrantExhausted"),
+        _ => None,
+    }
+}
+
+// ================================================================================================
+// The grants + manifest vocabulary (ABI §2.3 / §2.6): the single canonical shape naming everything
+// a role-instance may reach.
+//
+// This is the vocabulary B1 extends for the Phase-B worlds — per-grant bounds (net topics/rates/
+// payload bytes via `grant-bound`), buffer quota (`buffer-req`), and advisory queue depths
+// (`event-caps`) — additively on the v1 schema (refactor §6); the full envelope reshape is D0. It is
+// the vocabulary B2/B3 consume: the guest SDK authors a `manifest`, the host derives the admitted
+// `grants-doc` as `lane ∩ envelope ∩ owner ∩ manifest` (§2.6), and both key against these exact
+// field names. The abi crate is dependency-free / dual-compiled, so it holds the grammar +
+// key-name constants; the Rust request/grant types live host-side.
+// ================================================================================================
+
+/// The normative grants + manifest grammar (ABI §2.3 `manifest`/`world-req`/`event-caps`/
+/// `buffer-req`/`grant-bound`; §2.6 `grants-doc`/`world-grant`/`migration-grant`/`channel-decl`).
+///
+/// Root rules `grants-doc` (the admitted grants) and `manifest` (the module request). It MUST
+/// validate as-is under `cddl-cat`; the `grants_grammar` test asserts it is machine-valid and that
+/// representatives of both roots validate. The admitted `grants-doc` bytes are journaled verbatim in
+/// the run header ([`JOURNAL_CDDL`] tag 0 `grants`).
+pub const GRANTS_CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/grants.cddl"));
+
+/// The grants-document schema version this contract defines (`grants-doc.version`, ABI §2.6).
+pub const GRANTS_DOC_VERSION: u64 = 1;
+
+// -- `grant-bound` keys (ABI §2.3): the shared per-grant bound vocabulary ------------------------
+
+/// `grant-bound` key: per-item byte ceiling (publish payload, readback value, payload bytes) (§2.3).
+pub const GRANT_BOUND_KEY_MAX_BYTES: &str = "max_bytes";
+/// `grant-bound` key: per-event-slice call ceiling for this grant (§2.3).
+pub const GRANT_BOUND_KEY_MAX_PER_SLICE: &str = "max_per_slice";
+/// `grant-bound` key: sustained rate ceiling (token bucket, per minute) (§2.3).
+pub const GRANT_BOUND_KEY_RATE_PER_MIN: &str = "rate_per_min";
+/// `grant-bound` key: concurrent-operation ceiling — the Phase-B completion outstanding cap (§2.3).
+pub const GRANT_BOUND_KEY_MAX_OUTSTANDING: &str = "max_outstanding";
+/// `grant-bound` key: the enumerated allowed values (topics, dataset hashes, sources) (§2.3).
+pub const GRANT_BOUND_KEY_VALUES: &str = "values";
+
+// -- `world-req` / `world-grant` keys (ABI §2.3 / §2.6) ------------------------------------------
+
+/// `world-req` key: the world/namespace name (`"vhc"`/`"net"`/`"sys"`/`"data"`/`"compute"`/`"tabi"`).
+pub const WORLD_KEY_WORLD: &str = "world";
+/// `world-req`/`world-grant` key: the requested/admitted namespace minor (§2.3/§2.6).
+pub const WORLD_KEY_MINOR: &str = "minor";
+/// `world-req` key: the requested per-grant bounds map (§2.3).
+pub const WORLD_KEY_GRANTS: &str = "grants";
+/// `world-grant` key: the admitted per-grant bounds map (§2.6).
+pub const WORLD_GRANT_KEY_BOUNDS: &str = "bounds";
+
+// -- `buffer-req` keys (ABI §2.3): the live-resource + linear-memory-crossing quotas -------------
+
+/// `buffer-req` key: standing live-resource ceiling across all instance-class handles (§2.3/§7.3).
+pub const BUFFER_REQ_KEY_MAX_LIVE_HANDLES: &str = "max_live_handles";
+/// `buffer-req` key: standing live-buffer byte ceiling — the Phase-B buffer quota (§2.3/§7.4).
+pub const BUFFER_REQ_KEY_MAX_LIVE_BYTES: &str = "max_live_bytes";
+/// `buffer-req` key: per-slice ceiling on bytes crossing into linear memory via `read_into` (§2.3).
+pub const BUFFER_REQ_KEY_MAX_READBACK_BYTES: &str = "max_readback_bytes";
+
+// -- `event-caps` keys + advisory class names (ABI §2.3 / §4.7): advisory queue depths ------------
+
+/// `event-caps` per-class key: the declared advisory queue depth (§2.3).
+pub const EVENT_CAP_KEY_DEPTH: &str = "depth";
+/// `event-caps` per-class key: the fixed coalescing rule (`COALESCE_*`) (§2.3).
+pub const EVENT_CAP_KEY_COALESCE: &str = "coalesce";
+/// `event-caps` class key: the `PayloadReady` advisory class (dedup-by-hash, §4.7).
+pub const EVENT_CLASS_PAYLOAD_READY: &str = "payload-ready";
+/// `event-caps` class key: the `Timer` advisory class (latest-wins, §4.7).
+pub const EVENT_CLASS_TIMER: &str = "timer";
+/// `event-caps` class key: the gossip advisory class (drop-oldest, §4.7).
+pub const EVENT_CLASS_GOSSIP: &str = "gossip";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,7 +1112,9 @@ mod tests {
         // unimplemented major (e.g. a future 3) stays a clean AbiUnsupportedMajor.
         assert_eq!(HOST_IMPLEMENTED_MAJORS, &[1, 2]);
         assert_eq!(host_minor_for(DA_ABI_MAJOR), Some(0));
-        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(0));
+        // B1 bumped the major-2 minor to 1 in the same commit that made Completion delivery
+        // real (the ratified additive path, ABI §1.4/§4.6); minor 2 stays AbiMinorTooNew.
+        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(1));
         assert_eq!(host_minor_for(3), None);
     }
 
@@ -952,7 +1295,8 @@ mod tests {
     fn sys_v2_vocab_is_phase_a_plus_crypto_plus_ambient() {
         // The full sys@2 vocabulary is the Phase-A subset + the Phase-B crypto accels + the
         // Phase-B ambient symbols; every sub-list is a subset, and `validate_imports` accepts
-        // every member.
+        // every member (the Phase-B symbols are minor-1 registry entries, admitted since the B1
+        // minor bump).
         for s in SYS_V2_PHASE_A_SYMBOLS {
             assert!(SYS_V2_SYMBOLS.contains(s), "phase-a symbol {s} missing");
         }
@@ -975,6 +1319,226 @@ mod tests {
             ("sys@2", "device_profile"),
         ])
         .unwrap();
+        // The B2 sys@2 Phase-B surface registers at minor 1 (the shared Phase-B minor).
+        for sym in ["hash", "verify_sig", "rng_seed", "device_profile"] {
+            assert_eq!(v2_symbol_minor(NS_SYS_V2, sym), Some(1), "sys@2::{sym}");
+        }
+    }
+
+    #[test]
+    fn handle_layout_round_trips_and_masks_fields() {
+        // ABI §7.2: (kind << 56) | ((gen & 0xFF_FFFF) << 32) | index; index 1-based, 32 bits.
+        let h = pack_handle(HANDLE_KIND_BUFFER, 0x00AB_CDEF, 0x1234_5678);
+        assert_eq!(handle_kind(h), HANDLE_KIND_BUFFER);
+        assert_eq!(handle_generation(h), 0x00AB_CDEF);
+        assert_eq!(handle_index(h), 0x1234_5678);
+        // Generation is 24 bits: a value with high bits set is masked down, not aliased into kind.
+        let wrapped = pack_handle(HANDLE_KIND_OP_ID, 0xFFFF_FFFF, 1);
+        assert_eq!(
+            handle_kind(wrapped),
+            HANDLE_KIND_OP_ID,
+            "gen overflow never bleeds into kind"
+        );
+        assert_eq!(handle_generation(wrapped), HANDLE_MAX_GENERATION);
+        assert_eq!(handle_index(wrapped), 1);
+        // `0` is never a live handle (ABI §7.2): the all-zero triple packs to 0.
+        assert_eq!(pack_handle(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn handle_kinds_are_assigned_and_classed_permanently() {
+        // Kinds 1..=10 are the assigned set; 8/9/10 are the Phase-B buffer/stream/op-id (ABI §7.2).
+        assert_eq!(
+            [
+                HANDLE_KIND_STEP_TENSOR_NATIVE,
+                HANDLE_KIND_STEP_TENSOR_DET,
+                HANDLE_KIND_PARAM,
+                HANDLE_KIND_PERSISTENT,
+                HANDLE_KIND_DET_PERSISTENT,
+                HANDLE_KIND_UPDATE_CONTAINER,
+                HANDLE_KIND_BATCH,
+                HANDLE_KIND_BUFFER,
+                HANDLE_KIND_STREAM,
+                HANDLE_KIND_OP_ID,
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        );
+        // The kind→class mapping (ABI §7.1): slice 1–2, registered 3–5, instance 6–10.
+        assert_eq!(
+            handle_class(HANDLE_KIND_STEP_TENSOR_NATIVE),
+            Some(ResourceClass::Slice)
+        );
+        assert_eq!(
+            handle_class(HANDLE_KIND_STEP_TENSOR_DET),
+            Some(ResourceClass::Slice)
+        );
+        for k in [
+            HANDLE_KIND_PARAM,
+            HANDLE_KIND_PERSISTENT,
+            HANDLE_KIND_DET_PERSISTENT,
+        ] {
+            assert_eq!(handle_class(k), Some(ResourceClass::Registered));
+        }
+        for k in [
+            HANDLE_KIND_UPDATE_CONTAINER,
+            HANDLE_KIND_BATCH,
+            HANDLE_KIND_BUFFER,
+            HANDLE_KIND_STREAM,
+            HANDLE_KIND_OP_ID,
+        ] {
+            assert_eq!(
+                handle_class(k),
+                Some(ResourceClass::Instance),
+                "buffers/streams/op-ids are instance-class (ABI §7.1)"
+            );
+        }
+        // An unassigned kind has no class (reserved 11–255, ABI §7.2).
+        assert_eq!(handle_class(11), None);
+        assert_eq!(handle_class(255), None);
+    }
+
+    #[test]
+    fn completion_result_and_comp_error_codes_are_assigned_and_additive() {
+        // ABI §7.5: variant discriminants + the 0..=7 comp-error codes, 8..=63 reserved.
+        assert_eq!((COMPLETION_RESULT_OK, COMPLETION_RESULT_ERR), (0, 1));
+        let codes = [
+            COMP_ERR_CANCELLED,
+            COMP_ERR_NET_UNREACHABLE,
+            COMP_ERR_TIMEOUT,
+            COMP_ERR_STORE_REFUSED,
+            COMP_ERR_HASH_MISMATCH,
+            COMP_ERR_CREDIT_EXHAUSTED,
+            COMP_ERR_PEER_CLOSED,
+            COMP_ERR_GRANT_EXHAUSTED,
+        ];
+        assert_eq!(codes, [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(COMP_ERR_RESERVED_MIN, 8);
+        // Every assigned code has a unique, stable slug; reserved/unknown codes have none (fail
+        // closed, ABI §5.2/§7.5).
+        let mut slugs: Vec<&str> = codes.iter().map(|c| comp_err_slug(*c).unwrap()).collect();
+        let n = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), n, "comp-error slugs must be unique");
+        assert_eq!(comp_err_slug(COMP_ERR_RESERVED_MIN), None);
+        assert_eq!(comp_err_slug(u64::MAX), None);
+    }
+
+    #[test]
+    fn v2_symbol_registry_is_consistent_and_derives_required_minor() {
+        // Registry entries are unique per (ns, symbol) and the introducing minor is permanent.
+        let mut keys: Vec<(&str, &str)> = V2_SYMBOL_REGISTRY
+            .iter()
+            .map(|(ns, sym, _)| (*ns, *sym))
+            .collect();
+        let n = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), n, "registry entries must be unique");
+        // The minor-0 slice of the registry is exactly the Phase-A vocabulary consts (for sys@2
+        // that is the Phase-A subset — the B2 crypto/ambient symbols are minor-1 entries).
+        for (ns, vocab) in [
+            (NS_VHC_V2, VHC_V2_SYMBOLS),
+            (NS_NET_V2, NET_V2_SYMBOLS),
+            (NS_SYS_V2, SYS_V2_PHASE_A_SYMBOLS),
+        ] {
+            let minor0: Vec<&str> = V2_SYMBOL_REGISTRY
+                .iter()
+                .filter(|(rns, _, m)| *rns == ns && *m == 0)
+                .map(|(_, sym, _)| *sym)
+                .collect();
+            assert_eq!(minor0, vocab.to_vec(), "minor-0 registry slice for {ns}");
+        }
+        // Every provided sys@2 symbol is registered (full-vocab ↔ registry agreement).
+        for sym in SYS_V2_SYMBOLS {
+            assert!(
+                v2_symbol_minor(NS_SYS_V2, sym).is_some(),
+                "sys@2::{sym} missing from the registry"
+            );
+        }
+        // Required-minor derivation (ABI §1.3 step 5): the max introducing minor of the imports.
+        assert_eq!(
+            required_v2_minor(&[("vhc@2", "next_event"), ("net@2", "publish")]),
+            0
+        );
+        assert_eq!(
+            required_v2_minor(&[("vhc@2", "next_event"), ("net@2", "payload_put")]),
+            1,
+            "a minor-1 import raises the required minor"
+        );
+        assert_eq!(
+            required_v2_minor(&[("tabi@1", "add@1")]),
+            0,
+            "bridge imports are not v2"
+        );
+        // The B1 minor-1 surface is registered.
+        for sym in [
+            "create_from",
+            "read_into",
+            "buffer_len",
+            "buffer_release",
+            "cancel",
+        ] {
+            assert_eq!(v2_symbol_minor(NS_VHC_V2, sym), Some(1), "vhc@2::{sym}");
+        }
+        for sym in ["payload_put", "payload_get"] {
+            assert_eq!(v2_symbol_minor(NS_NET_V2, sym), Some(1), "net@2::{sym}");
+        }
+        assert_eq!(v2_symbol_minor(NS_VHC_V2, "bogus"), None);
+    }
+
+    #[test]
+    fn validate_imports_gates_minor1_symbols_on_the_host_minor() {
+        // A minor-1 symbol is admitted iff the host's implemented major-2 minor is >= 1; below
+        // that it is a typed WorldMinorUnsupported naming the introducing minor (ABI §1.3 step 3).
+        let r = validate_imports(&[("net@2", "payload_put")]);
+        if host_minor_for(DA_ABI_MAJOR_V2).unwrap_or(0) >= 1 {
+            r.unwrap();
+        } else {
+            let err = r.unwrap_err();
+            assert_eq!(err.code, AbiRefusalCode::WorldMinorUnsupported);
+            assert!(
+                err.detail.contains("introduced at minor 1"),
+                "{}",
+                err.detail
+            );
+        }
+    }
+
+    #[test]
+    fn grant_vocabulary_keys_are_unique_and_stable() {
+        // ABI §2.3/§2.6: the structural key names both `manifest` and `grants-doc` consumers key
+        // against. They must be unique so B2/B3 (adding their worlds' bounds) reference one set.
+        let keys = [
+            GRANT_BOUND_KEY_MAX_BYTES,
+            GRANT_BOUND_KEY_MAX_PER_SLICE,
+            GRANT_BOUND_KEY_RATE_PER_MIN,
+            GRANT_BOUND_KEY_MAX_OUTSTANDING,
+            GRANT_BOUND_KEY_VALUES,
+            WORLD_KEY_WORLD,
+            WORLD_KEY_MINOR,
+            WORLD_KEY_GRANTS,
+            WORLD_GRANT_KEY_BOUNDS,
+            BUFFER_REQ_KEY_MAX_LIVE_HANDLES,
+            BUFFER_REQ_KEY_MAX_LIVE_BYTES,
+            BUFFER_REQ_KEY_MAX_READBACK_BYTES,
+            EVENT_CAP_KEY_DEPTH,
+            EVENT_CAP_KEY_COALESCE,
+            EVENT_CLASS_PAYLOAD_READY,
+            EVENT_CLASS_TIMER,
+            EVENT_CLASS_GOSSIP,
+        ];
+        let mut sorted: Vec<&str> = keys.to_vec();
+        let n = sorted.len();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), n, "grant vocabulary keys must be unique");
+        assert_eq!(GRANTS_DOC_VERSION, 1);
+        // The advisory event classes align with their fixed coalescing rules (§4.7): payload-ready
+        // dedup-by-hash, timer latest-wins, gossip drop-oldest.
+        assert_eq!(COALESCE_DEDUP_HASH, 0);
+        assert_eq!(COALESCE_LATEST_WINS, 1);
+        assert_eq!(COALESCE_DROP_OLDEST, 2);
     }
 
     #[test]

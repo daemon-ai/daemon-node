@@ -106,6 +106,7 @@ fn decl() -> ModuleDecl {
     ModuleDecl {
         name: "toy",
         version: "0.0.1",
+        abi_minor: 0,
         channels: vec![0],
         host_state_bytes: 5000,  // → 8192 page-rounded
         host_scratch_bytes: 100, // → 4096

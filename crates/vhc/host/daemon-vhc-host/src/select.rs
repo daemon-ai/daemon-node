@@ -153,6 +153,20 @@ pub fn select_driver(
             format!("module declares abi {major}.{minor}, host supports {major}.{host_minor}"),
         ));
     }
+    // A declared minor below what the imports require is a lying declaration (ABI §1.3 step 5:
+    // "a declared `minor` below what the imports require is `AbiDeclarationMismatch`").
+    if candidate == CandidateDriver::V2 {
+        let required = daemon_vhc_abi::required_v2_minor(&import_refs);
+        if minor < required {
+            return Err(AbiRefusal::new(
+                AbiRefusalCode::AbiDeclarationMismatch,
+                format!(
+                    "da_abi declares minor {minor} but the static imports require minor \
+                     {required} (the declaration is below what the imports need)"
+                ),
+            ));
+        }
+    }
 
     // Step 6 — required exports for the selected major, by name (signatures are enforced by the
     // driver's typed `get_typed_func` calls before any guest code runs).
