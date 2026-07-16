@@ -439,6 +439,17 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_crypto"],
         ),
         (
+            // The Phase-C det-reclassification conformance gate (architecture §3.2/§3.6, refactor
+            // §7; §10 gate row "Det host-op ≡ in-guest-crate"): the host `det_*` accel bodies the
+            // worker runs (OpBackend, via the reference CpuBackend) ≡ the normative dual-compiled
+            // `daemon_vhc_det` crate the in-guest fallback also compiles — bit-identical (equality
+            // class) for EVERY det accel op over a wide deterministic sweep, plus the DET_ACCEL_OPS
+            // coverage guard. The det twin of the crypto lane above; also covered by the host crate
+            // suite below.
+            "C2 det reclassification conformance (host det_* ≡ in-guest daemon-vhc-det)",
+            &["-p", "daemon-vhc-host", "--test", "v2_det_conformance"],
+        ),
+        (
             // The B2 data@2 fetch conformance (architecture §3.2 the data world): the corpus
             // window fetched by committed hash + policy-chosen range, completing Ok(BufferHandle)
             // (tag 6) after whole-artifact verification; grant negative (GrantViolation),

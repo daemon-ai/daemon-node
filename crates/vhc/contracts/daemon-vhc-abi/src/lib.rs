@@ -645,6 +645,47 @@ pub const TABI_IMPORTS: &[&str] = &[
 ];
 
 // ================================================================================================
+// Det reclassification (Phase C; architecture §3.2/§3.6, refactor §7).                    [C2:det]
+//
+// `daemon-vhc-det` is the NORMATIVE definition of the consensus math; the host `det_*` (and the
+// det-lane pack/transform) imports are an ACCELERATION of that one crate, and the always-available
+// compatibility path is the same crate compiled in-guest (the SDK `sim` wasm build) — bit-identical
+// by construction under wasm's deterministic core semantics. This vocabulary names the det
+// acceleration ops the tier-1 host-op ≡ in-guest-crate conformance gate covers
+// (`daemon-vhc-host/tests/v2_det_conformance.rs`), the det twin of the `sys@2` crypto gate.
+//
+// Kept in its own delimited section so the serial Phase-C merge with the C1 `compute@2` sections is
+// mechanical: this block is det-only; C1 appends the `OperationIr`-wire vocabulary separately.
+// ================================================================================================
+
+/// The det acceleration ops asserted host ≡ in-guest-crate by the tier-1 det conformance gate
+/// (architecture §3.2 "the conformance suite asserts host-op ≡ in-guest-crate bitwise").
+///
+/// Each entry has (a) a `daemon-vhc-det` normative kernel, (b) a host `OpBackend` `det_*` method
+/// that delegates to it (the acceleration), and (c) the in-guest fallback (the same crate compiled
+/// to wasm). These are a subset of [`TABI_IMPORTS`] (the frozen bridge surface) singled out as the
+/// **equality-class** det lane — as opposed to the native (tolerance-class) lane. The conformance
+/// gate's coverage guard asserts this list and its exercised set stay in lockstep, so a new det
+/// import forces a matching conformance arm.
+pub const DET_ACCEL_OPS: &[&str] = &[
+    "det_sum@1",
+    "det_scale@1",
+    "det_l2norm@1",
+    "det_sign@1",
+    "det_add@1",
+    "det_sub@1",
+    "det_mul@1",
+    "det_axpy@1",
+    "det_chunk_scatter@1",
+    "det_chunk_scatter_add@1",
+    "det_absmax_unpack@1",
+    "absmax_pack@1",
+    "topk_chunk@1",
+    "dct2@1",
+    "idct2@1",
+];
+
+// ================================================================================================
 // The major-2 event-loop wire vocabulary (ABI §4–§12): the numeric assignments the event-loop
 // driver (`daemon-vhc-host`), the session event pump (`daemon-vhc-session`), the guest SDK
 // (`daemon-vhc-sdk`), and the journal/replay verifier (`daemon-vhc-observe`) must ALL agree on.
