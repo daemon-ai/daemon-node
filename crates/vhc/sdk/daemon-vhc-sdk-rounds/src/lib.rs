@@ -10,10 +10,10 @@
 //! **the choreography is the same state machine, relocated**, which is what the TinyLlama
 //! det-digest parity acceptance asserts end to end. Ported one-to-one from the engine:
 //!
-//! - **Assignment consumption** — `daemon_vhc_proto::assignment::assign_batches` over the
-//!   class-equal roster (assignment math STAYS in the proto until D0), sliced into
-//!   `steps_per_round` inner steps × `micro_batch` micro-windows exactly as the engine's
-//!   `slice_interval` does.
+//! - **Assignment consumption** — [`daemon_vhc_sdk_consensus::assign_batches`] over the
+//!   class-equal roster (assignment math moved to the consensus SDK layer at D0, refactor §8/D0),
+//!   sliced into `steps_per_round` inner steps × `micro_batch` micro-windows exactly as the
+//!   engine's `slice_interval` does.
 //! - **Train-loop order** — per inner step: every micro-batch through
 //!   [`RoundExperiment::train_step`], then one [`RoundExperiment::inner_update`]; after all
 //!   steps, one [`RoundExperiment::make_update`] → a `Commit` action.
@@ -435,8 +435,8 @@ pub struct InnerStep {
 }
 
 /// The peer's assigned `[start, end)` interval — `assign_batches` over the class-equal roster
-/// with zero overlap, exactly the engine's `assignment::interval_for` (assignment math stays in
-/// `daemon-vhc-proto` until D0). Public for the bridging oracle.
+/// with zero overlap, exactly the engine's `assignment::interval_for` (assignment math lives in
+/// `daemon-vhc-sdk-consensus` from D0). Public for the bridging oracle.
 #[must_use]
 pub fn interval_for(
     window: BatchWindow,
@@ -444,8 +444,8 @@ pub fn interval_for(
     roster: &[PeerId],
     peer: &PeerId,
 ) -> MicroWindow {
-    use daemon_vhc_proto::assignment::assign_batches;
     use daemon_vhc_proto::messages::ThroughputClass;
+    use daemon_vhc_sdk_consensus::assign_batches;
     let weighted: Vec<(PeerId, ThroughputClass)> =
         roster.iter().map(|p| (*p, ThroughputClass::C1)).collect();
     assign_batches(&weighted, &seed, window, 0)

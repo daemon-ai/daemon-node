@@ -334,7 +334,7 @@ impl SwarmRun {
     /// The observe-driven [`DesyncVerdict`] for `round`: folds the peers' reported digests through
     /// [`daemon_vhc_observe::digest_tally`] (§9), the authoritative desync trigger. `quorum` is the
     /// number of agreeing peers a digest needs to count as the quorum digest (e.g.
-    /// [`daemon_vhc_proto::assignment::witness_quorum`] of the roster).
+    /// [`daemon_vhc_sdk_consensus::witness_quorum`] of the roster).
     ///
     /// This replaces R3's Wave-3 local quorum-digest fold stand-in with observe's shared verdict, so
     /// the harness, the drills, and the (future) live coordinator path all consume one detector.

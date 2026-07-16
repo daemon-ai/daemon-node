@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-vhc-proto` — the swarm-training consensus / wire contract.
+//! `daemon-vhc-proto` — the swarm-training wire contract (**algorithm-free from D0**).
 //!
-//! Canonical CBOR codec, run-envelope schema + freeze/verify, capability-set admission, merkle set
-//! commitments, the seven round messages + their CDDL, the round state-digest schedule, and the
-//! [`SwarmProtoVersion`]. This crate is the single authority for the swarm wire shapes shared by
-//! the host, the participant runtime, and the (wasm32) coordinator DO — see
-//! `docs/specs/swarm-training-spec.md` §6, §7.3, §10.1, §16.
+//! Canonical CBOR codec, run-envelope schemas (v1 + the D0 genesis v2) + freeze/verify,
+//! capability-set admission, merkle set commitments, the seven round messages + their CDDL, the
+//! round state-digest schedule, and the [`SwarmProtoVersion`]. This crate is the single authority
+//! for the swarm wire shapes shared by the host, the participant runtime, and the (wasm32)
+//! coordinator DO — see `docs/specs/swarm-training-spec.md` §6, §7.3, §10.1, §16.
+//!
+//! **Algorithm-free (D0 invariant, dep-check-enforced):** the deterministic assignment math that
+//! lived here as `proto::assignment` moved to `sdk/daemon-vhc-sdk-consensus` at D0 (refactor
+//! §8/D0; architecture §7 rule 1 — "daemon-vhc-proto stays algorithm-free: no assignment math, no
+//! round vocabulary"). This crate carries wire *mechanism* only.
 //!
 //! **wasm32-clean by construction:** the only dependencies are `serde`, `ciborium`, `blake3`,
 //! `xxhash-rust`, and `ed25519-dalek` — no `tokio`, Burn, or wasmtime — so it builds for the
@@ -16,7 +21,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod assignment;
 pub mod bytes;
 pub mod canonical;
 pub mod capability;
@@ -33,11 +37,6 @@ pub mod record_set;
 pub mod sign;
 pub mod version;
 
-pub use assignment::{
-    advance_cursor, assign_batches, class_weight, deterministic_shuffle, elect_checkpointer,
-    global_batch_at, seeded_lcg, select_committee, select_verifiers, witness_quorum, Committee,
-    Lcg, WITNESS_TARGET_DEFAULT,
-};
 pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use capability::{Capability, CapabilitySet};

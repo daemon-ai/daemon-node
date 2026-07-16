@@ -327,8 +327,15 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-det"],
         ),
         (
-            "daemon-vhc-proto (state machine + assignment + envelope + canonical CBOR)",
+            "daemon-vhc-proto (wire mechanism: envelopes v1+v2, grants, canonical CBOR)",
             &["-p", "daemon-vhc-proto"],
+        ),
+        (
+            // D0: assignment math moved out of the proto (refactor §8/D0). The golden vectors
+            // (LCG stream, shuffle, quorum ladder, class weights) moved with it — this lane keeps
+            // them tier-1 so any drift in the moved math stays a visible, deliberate break.
+            "daemon-vhc-sdk-consensus (assignment math + golden vectors, moved at D0)",
+            &["-p", "daemon-vhc-sdk-consensus"],
         ),
         (
             "daemon-vhc-session (harness + assess + replay, loopback)",
@@ -607,6 +614,29 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "Phase C — TinyLlamaCfg in the moved worker-protocol test leaves the SDK for guests/ \
              [dev-dep] (split from daemon-vhc-host's identical exception at the A2 bin split)",
         ),
+        // --- D0: proto::assignment -> sdk/daemon-vhc-sdk-consensus (refactor §8/D0). The proto
+        // is algorithm-free from D0 (enforced below); its old host-side assignment consumers
+        // relink to the consensus SDK layer as explicit transitional edges, each retiring at D2.
+        (
+            "daemon-vhc-coordinator",
+            "daemon-vhc-sdk-consensus",
+            "D2 — the native coordinator dissolves at D2 into sdk-consensus + \
+             guests/coordinator-quorum; native coordination for tests moves to SDK-side vhc-sim \
+             (which links sdk-consensus legitimately) [normal]",
+        ),
+        (
+            "daemon-vhc-session",
+            "daemon-vhc-sdk-consensus",
+            "D2 — the retained v1 RoundEngine's assignment consumption; reviewed/retired as D2 \
+             re-seats consumers (the engine itself retires with the v1 driver at the Phase-E \
+             sunset) [normal]",
+        ),
+        (
+            "daemon-vhc-testkit",
+            "daemon-vhc-sdk-consensus",
+            "D2 — the barrier harness re-derives worker windows natively; reviewed/retired as D2 \
+             re-seats consumers on the wasm coordinator [normal]",
+        ),
     ];
 
     let root = workspace_root();
@@ -717,10 +747,34 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         }
     }
 
+    // --- D0 tightening: daemon-vhc-proto is ALGORITHM-FREE from D0 on (refactor §8/D0;
+    // architecture §7 rule 1 — "no assignment math, no round vocabulary"). The assignment module
+    // moved to sdk/daemon-vhc-sdk-consensus; a re-grown `assignment` module (or file) in the
+    // proto fails this gate from now on.
+    {
+        let proto_src = root.join("crates/vhc/contracts/daemon-vhc-proto/src");
+        if proto_src.join("assignment.rs").exists() {
+            violations.push(
+                "daemon-vhc-proto: src/assignment.rs exists — the proto is algorithm-free from \
+                 D0; assignment math lives in sdk/daemon-vhc-sdk-consensus"
+                    .to_string(),
+            );
+        }
+        let lib = std::fs::read_to_string(proto_src.join("lib.rs")).unwrap_or_default();
+        if lib.contains("mod assignment") {
+            violations.push(
+                "daemon-vhc-proto: lib.rs declares an `assignment` module — the proto is \
+                 algorithm-free from D0 (refactor §8/D0)"
+                    .to_string(),
+            );
+        }
+    }
+
     println!("daemon-vhc dependency-direction check (architecture §7)");
     println!(
         "  rule: host/* never links sdk/* · contracts/* links neither · sdk/* never links host/*"
     );
+    println!("  rule (D0): daemon-vhc-proto is algorithm-free (assignment lives in sdk-consensus)");
     println!("\ntracked exceptions (honest; each removed by the noted phase):");
     for (f, t, note) in EXCEPTIONS {
         let mark = if seen.contains(&((*f).to_string(), (*t).to_string())) {

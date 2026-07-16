@@ -12,14 +12,15 @@ license.workspace = true
 # native `RoundEngine` remains in the session for the retained v1 cells until the Phase-E sunset.
 #
 # Dependency rules (architecture §7, CI-enforced): sdk/* links contracts/* and lower sdk layers
-# ONLY — never host/*. This crate links exactly `daemon-vhc-proto` (assignment math STAYS in the
-# proto until D0 — refactor §5 A2: "moving it is coupled to the envelope schema, not this phase")
+# ONLY — never host/*. This crate links `daemon-vhc-proto` (wire types), the consensus SDK layer
+# `daemon-vhc-sdk-consensus` (assignment math — moved out of the proto at D0 per refactor §8/D0),
 # and blake3 (the `Staged` mint verification).
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+daemon-vhc-sdk-consensus = { workspace = true }
 blake3 = { workspace = true }
 
 [lints]

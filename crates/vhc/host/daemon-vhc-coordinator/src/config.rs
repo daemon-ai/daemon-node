@@ -9,10 +9,10 @@
 //! [`crate::CoordinatorState`] and therefore canonical-CBOR-serializable (the replay foundation,
 //! PROTO-20).
 
-use daemon_vhc_proto::assignment::WITNESS_TARGET_DEFAULT;
 use daemon_vhc_proto::canonical::to_canonical_vec;
 use daemon_vhc_proto::envelope::{Envelope, GlobalBatch, StopCondition};
 use daemon_vhc_proto::{blake3_hash, CapabilitySet, Hash, PeerId, SwarmProtoVersion};
+use daemon_vhc_sdk_consensus::assignment::WITNESS_TARGET_DEFAULT;
 use serde::{Deserialize, Serialize};
 
 use crate::CoordinatorError;

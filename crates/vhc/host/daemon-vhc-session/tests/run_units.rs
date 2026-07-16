@@ -12,8 +12,8 @@
 // deterministic + record-ordered, so resync replay recovering the in-sync digest is a bit-exact
 // property; registration/retention are pure decision functions asserted directly.
 
-use daemon_vhc_proto::assignment::elect_checkpointers;
 use daemon_vhc_proto::{blake3_hash, PeerId, Seed};
+use daemon_vhc_sdk_consensus::elect_checkpointers;
 
 use daemon_vhc_session::backend::{StagedPayload, StateDigest, StubBackend, TrainerBackend};
 use daemon_vhc_session::checkpoint::{

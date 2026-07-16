@@ -58,16 +58,17 @@ use crate::SwarmRunError;
 /// Per-round batch assignment: P2's throughput-weighted deterministic split (§6.3, PROTO-8).
 ///
 /// Merge 2 resolved the R2 `// MERGE-2` marker here by swapping the equal-split placeholder for
-/// `daemon_vhc_proto::assignment::assign_batches` — the single pure authority the coordinator and
-/// every peer re-derive byte-identically from `(round_seed, roster, window)`. The MVP StubBackend
+/// `assign_batches` — the single pure authority the coordinator and
+/// every peer re-derive byte-identically from `(round_seed, roster, window)` (in
+/// `daemon-vhc-sdk-consensus` from D0; the proto is algorithm-free). The MVP StubBackend
 /// peers are all class-equal (`ThroughputClass::C1`), so the partition sizes stay even, but the
 /// peer→interval mapping is now seed-shuffled (transcript changes vs the old equal split, while
 /// cross-peer agreement is unaffected since every peer folds the same committed set).
 pub mod assignment {
     use super::{BatchInterval, PeerId};
-    use daemon_vhc_proto::assignment::assign_batches;
     use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
     use daemon_vhc_proto::Seed;
+    use daemon_vhc_sdk_consensus::assign_batches;
 
     /// The `[start, end)` sub-interval `assign_batches` assigns to `peer` for the round seeded by
     /// `seed` over `window`. Class-equal roster (StubBackend), zero overlap (exact partition). Falls

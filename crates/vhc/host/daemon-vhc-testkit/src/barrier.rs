@@ -524,7 +524,7 @@ fn straggled_for(msgs: &[SwarmMessage], round: u64) -> bool {
 fn assigned_len(window: BatchWindow, seed: Seed, roster: &[PeerId], peer: &PeerId) -> u64 {
     let weighted: Vec<(PeerId, ThroughputClass)> =
         roster.iter().map(|p| (*p, ThroughputClass::C1)).collect();
-    daemon_vhc_proto::assignment::assign_batches(&weighted, &seed, window, 0)
+    daemon_vhc_sdk_consensus::assign_batches(&weighted, &seed, window, 0)
         .into_iter()
         .find(|(p, _)| p == peer)
         .map_or(0, |(_, w)| w.end.saturating_sub(w.start))

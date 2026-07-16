@@ -5,9 +5,12 @@
 //!
 //! Every peer independently derives the same committee roles and batch intervals from
 //! `(round_seed, roster)` — no per-batch RPC. This module is the **pure** authority for that math,
-//! so the coordinator, every peer, and (later) the replay oracle all re-derive byte-identical
-//! assignments. It lives in `daemon-vhc-proto` (not the coordinator) precisely so the oracle can
-//! consume it without a coordinator dependency; the coordinator re-exports what it uses.
+//! so the coordinator, every peer, and the replay oracle all re-derive byte-identical
+//! assignments. It lived in `daemon-vhc-proto` until D0; it now lives in the consensus SDK layer
+//! (`sdk/daemon-vhc-sdk-consensus`, architecture §7/§8 — "assignment math: SDK library, linked
+//! identically by worker drivers, coordinator drivers, simulator, and replay"), and
+//! `daemon-vhc-proto` is algorithm-free wire mechanism from D0 on. The math is byte-identical to
+//! the pre-move proto module (the golden vectors moved with it).
 //!
 //! Randomness is a documented 64-bit [`Lcg`] (Knuth MMIX constants) seeded from
 //! `blake3(seed ‖ salt)`, driving a Fisher–Yates [`deterministic_shuffle`]. Salted shuffles
@@ -18,10 +21,10 @@
 //! the assignment is bit-reproducible on any target (including the `wasm32`/zkVM coordinator
 //! substrate, §11.2).
 
-use crate::bytes::{PeerId, Seed};
-use crate::envelope::GlobalBatch;
-use crate::hash::blake3_hash;
-use crate::messages::{BatchWindow, ThroughputClass};
+use daemon_vhc_proto::bytes::{PeerId, Seed};
+use daemon_vhc_proto::envelope::GlobalBatch;
+use daemon_vhc_proto::hash::blake3_hash;
+use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
 
 /// Salt for the witness-committee shuffle (§6.3).
 pub const WITNESS_SALT: &[u8] = b"daemon-swarm/witness/v1";
@@ -35,7 +38,7 @@ pub const WITNESS_TARGET_DEFAULT: u32 = 4;
 ///
 /// Not cryptographic — its only job is a reproducible permutation. Seed it via [`seeded_lcg`] so a
 /// round seed + salt produce an independent stream. `daemon-vhc-proto`'s golden vectors pin its
-/// output; the constants are frozen with [`crate::SwarmProtoVersion`].
+/// output; the constants are frozen with [`daemon_vhc_proto::SwarmProtoVersion`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lcg {
     state: u64,
@@ -112,7 +115,7 @@ pub fn witness_quorum(n: u32) -> u32 {
 
 /// The integer assignment weight of a throughput class (§6.3). Ratios track the `~4×` class ladder
 /// (`c1<1k, c2 1–4k, c3 4–16k, c4 >16k` tok/s) so a `c4` peer is assigned ~64× a `c1` peer's data.
-/// Frozen with [`crate::SwarmProtoVersion`].
+/// Frozen with [`daemon_vhc_proto::SwarmProtoVersion`].
 #[must_use]
 pub fn class_weight(class: ThroughputClass) -> u64 {
     match class {
