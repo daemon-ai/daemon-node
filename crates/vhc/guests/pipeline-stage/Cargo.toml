@@ -12,4 +12,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
+# Phase-C graduation (refactor §7 "the pipeline toy graduates to tensor buffers here"): the
+# exchanged payloads are EXPORTED TENSORS — device tensors crossed to sealed buffers via
+# compute@2::export and re-imported on the consumer side.
+daemon-vhc-sdk-compute = { path = "../../sdk/daemon-vhc-sdk-compute" }
+burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
 ciborium = "0.2"

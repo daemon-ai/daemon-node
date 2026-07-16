@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! **The Phase-B pipeline acceptance toy** (refactor §6 acceptance; architecture §9's "SWARM
-//! pipeline stage" row, net-buffer version — tensor `export`/`import` graduates in Phase C):
-//! two `pipeline-stage` module instances exchange **opaque net buffers over credit-controlled
-//! streams**, over an in-memory transport (the iroh/WS wiring is run configuration, not
-//! architecture — the transport seat here is the same `take_op_requests`/`complete_op`/
+//! **The pipeline acceptance toy, graduated to tensor buffers** (Phase C, refactor §7 "the
+//! pipeline toy graduates to tensor buffers here"; architecture §9's "SWARM pipeline stage" row):
+//! two `pipeline-stage` module instances exchange **exported device tensors over
+//! credit-controlled streams** — `compute.export` → `BufferHandle` → `stream_write` on the
+//! producer; `stream_read` → `compute.import` → an on-device transform (`t * 2`) → re-export on
+//! the consumer — over an in-memory transport (the same `take_op_requests`/`complete_op`/
 //! `grant_credit` seam the session will drive).
 //!
-//! Flow-control pin: the producer issues ALL its writes at once against a one-chunk credit
-//! window, so the pump provably HOLDS the surplus (their transport requests appear only after
-//! the consumer's reads replenish credit) — asserted over the transport's event log, which is
-//! deterministic because the hold/release ordering is pump-enforced.
+//! Flow-control pin (unchanged from Phase B): the producer issues ALL its writes at once against
+//! a one-chunk credit window, so the pump provably HOLDS the surplus (their transport requests
+//! appear only after the consumer's reads replenish credit) — asserted over the transport's
+//! event log, which is deterministic because the hold/release ordering is pump-enforced.
 //!
 //! Dev/test harness: shells `cargo build` for the guests, so fs/process bans are allowed
 //! file-wide.
@@ -30,9 +31,8 @@ use daemon_vhc_host::v2::{
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 
 const N_CHUNKS: u8 = 3;
+/// f32 elements per chunk tensor (the Phase-B byte recipe, widened to floats).
 const CHUNK_LEN: u8 = 16;
-/// One chunk of writable credit: the producer's 3-write burst must hold 2 writes.
-const CREDIT: u64 = CHUNK_LEN as u64;
 
 const PEER_A: [u8; 32] = [0xAA; 32];
 const PEER_B: [u8; 32] = [0xBB; 32];
@@ -74,11 +74,26 @@ fn pipeline_wasm() -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Chunk `i` exactly as the guest derives it.
-fn chunk(i: u8) -> Vec<u8> {
+/// Chunk `i`'s f32 elements exactly as the guest derives them.
+fn chunk_floats(i: u8) -> Vec<f32> {
     (0..CHUNK_LEN)
-        .map(|j| i.wrapping_mul(31).wrapping_add(j))
+        .map(|j| f32::from(i.wrapping_mul(31).wrapping_add(j)))
         .collect()
+}
+
+/// The `CBOR(TensorData)` bytes an export of `values` produces (the host runner and the test
+/// serialize with the same ciborium writer over the same pinned burn `TensorData`).
+fn tensor_bytes(values: Vec<f32>) -> Vec<u8> {
+    let data = burn::tensor::TensorData::new(values, [CHUNK_LEN as usize]);
+    let mut out = Vec::new();
+    ciborium::into_writer(&data, &mut out).expect("TensorData encodes");
+    out
+}
+
+/// One exported chunk tensor's wire size = one chunk of writable credit: the producer's 3-write
+/// burst must hold 2 writes.
+fn credit() -> u64 {
+    tensor_bytes(chunk_floats(0)).len() as u64
 }
 
 fn config(role: u8, peer: [u8; 32]) -> Vec<u8> {
@@ -165,12 +180,12 @@ impl MemNet {
             if let Some(accept_op) = self.pending_accepts[target].pop_front() {
                 let sa = pumps[from]
                     .0
-                    .complete_op(open_op, OpOutcome::OpenDone { credit: CREDIT })
+                    .complete_op(open_op, OpOutcome::OpenDone { credit: credit() })
                     .expect("open")
                     .expect("minted stream");
                 let sb = pumps[target]
                     .0
-                    .complete_op(accept_op, OpOutcome::AcceptDone { credit: CREDIT })
+                    .complete_op(accept_op, OpOutcome::AcceptDone { credit: credit() })
                     .expect("accept")
                     .expect("minted stream");
                 self.pairs.insert((from, sa), (target, sb));
@@ -221,12 +236,16 @@ fn frame_payload(frame: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn two_stage_pipeline_exchanges_net_buffers_under_credit_flow_control() {
+fn two_stage_pipeline_exchanges_exported_tensors_under_credit_flow_control() {
     let wasm = pipeline_wasm();
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let sel = select_driver(&worker, &wasm, Some(blake3::hash(&wasm).as_bytes()))
         .expect("pipeline guest admitted");
-    assert_eq!((sel.major, sel.minor), (2, 1));
+    assert_eq!(
+        (sel.major, sel.minor),
+        (2, daemon_vhc_abi::COMPUTE_MINOR_V2),
+        "the graduated toy imports compute@2, so selection lands at the Phase-C minor"
+    );
 
     let mk = |role: u8, instance: u64, peer: [u8; 32], seed: u8| {
         let identity = RunIdentity {
@@ -260,19 +279,22 @@ fn two_stage_pipeline_exchanges_net_buffers_under_credit_flow_control() {
         std::thread::sleep(Duration::from_millis(2));
     }
 
-    // The acceptance: B committed EXACTLY the produced bytes, content-addressed.
-    let expected: Vec<u8> = (0..N_CHUNKS).flat_map(chunk).collect();
+    // The acceptance: B committed EXACTLY the produced tensors, DOUBLED ON-DEVICE — the tensor
+    // path end to end (produce → export → stream → import → transform → re-export → commit).
+    let expected: Vec<u8> = (0..N_CHUNKS)
+        .flat_map(|i| tensor_bytes(chunk_floats(i).into_iter().map(|v| v * 2.0).collect()))
+        .collect();
     let expected_hash = *blake3::hash(&expected).as_bytes();
     assert_eq!(frame_payload(&run_a.pump.published()[0].2), b"sent");
     assert_eq!(
         frame_payload(&run_b.pump.published()[0].2),
         expected_hash.to_vec(),
-        "the consumer's commitment hash covers exactly the produced chunks"
+        "the consumer's commitment hash covers exactly the doubled chunk tensors"
     );
     assert_eq!(
         net.store.get(&expected_hash),
         Some(&expected),
-        "the committed content round-tripped the stream intact"
+        "the transformed tensor content round-tripped the stream intact"
     );
 
     // The flow-control pin: with a one-chunk window, the producer's 2nd/3rd write REQUESTS only

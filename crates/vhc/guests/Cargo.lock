@@ -3506,7 +3506,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "pipeline-stage"
 version = "0.0.1"
 dependencies = [
+ "burn",
  "ciborium",
+ "daemon-vhc-sdk-compute",
  "daemon-vhc-sdk-v2",
 ]
 
