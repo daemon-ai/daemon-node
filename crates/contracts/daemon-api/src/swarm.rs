@@ -168,6 +168,34 @@ pub struct SwarmRunSummary {
     pub policy: Option<SwarmPolicy>,
     /// The last-known round the node observed for the run.
     pub last_round: u64,
+    // -- D0 additive run-identity + sunset-observability fields (envelope v2; decisions D1/D5).
+    // The node decides, the app renders (never re-derives): these mirror the swarm.db M2
+    // columns. All optional — absent on pre-D0 nodes and for fields a v1 run never acquires.
+    /// The cryptographic `RunId` — lowercase hex of the 32-byte genesis-envelope hash — once
+    /// known (v2 runs; absent for a v1-only run, whose identity is the `run_id` label alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id_hash: Option<String>,
+    /// The transition-chain epoch of the run's execution identity (present with `run_id_hash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
+    /// The envelope-level role label this node serves (present with `run_id_hash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The never-reused u64 role-instance incarnation id (present with `run_id_hash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<u64>,
+    /// Sunset observability (decisions D5): the run's envelope schema major (1 = v1, 2 = v2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_schema_major: Option<u32>,
+    /// Sunset observability: the admitted worker module's `da_abi` major (1 or 2), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_abi_major: Option<u32>,
+    /// Sunset observability: the selected driver (`"v1"` / `"v2"`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_driver: Option<String>,
+    /// Sunset observability: lowercase hex of the current pinned module blake3, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_hash: Option<String>,
 }
 
 /// The full detail view for one run (spec §10.4): the summary + coordinator endpoint + contribution
