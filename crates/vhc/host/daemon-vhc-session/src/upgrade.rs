@@ -53,23 +53,25 @@
 //! drills that drive a real migratable guest through these steps live in the host testkit.
 
 use daemon_vhc_proto::{AdmittedQuotas, EpochDescriptor, Hash};
+use daemon_vhc_sdk_consensus::checkpoint::CheckpointManifest;
 
-/// The **labelled snapshot seam** (architecture §5.3/§5.4; ABI §10.3 step 2). The upgrade
-/// transaction's "snapshot state + journal cursor" is captured here as an **opaque blob plus a
-/// journal cursor**, deliberately *without* naming any manifest section vocabulary.
+/// The **labelled snapshot seam** (architecture §5.3/§5.4; ABI §10.3 step 2): the upgrade
+/// transaction's "snapshot state + journal cursor".
 ///
-/// E1 (the checkpoint bridge + typed manifests track) OWNS the manifest format and merges first;
-/// at that merge [`SnapshotSeam::blob`] is replaced — mechanically — by E1's typed checkpoint /
-/// state manifest. Everything in this crate treats the blob as opaque bytes, so the swap touches
-/// only this type's field and the two adapter methods that produce/consume it.
+/// E1 (the checkpoint bridge + typed manifests track) OWNS the manifest format and merged first;
+/// this seam's interim opaque blob was swapped — mechanically, as designed — for E1's
+/// [`CheckpointManifest`] at that merge ("checkpointing and migration are one discipline", the
+/// checkpoint module's own words). The orchestrator never inspects the manifest's sections; the
+/// producing/consuming adapters do, so the seam stays a label, not a vocabulary fork.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotSeam {
-    /// The opaque snapshot payload the old module produced at the quiesce fence (the accepted
-    /// state-manifest bytes + its staged sections, serialized by the producing adapter). **Opaque
-    /// here by design** — E1's typed manifest replaces this field at merge.
-    pub blob: Vec<u8>,
+    /// E1's typed checkpoint manifest describing the snapshot captured at the quiesce fence:
+    /// content-addressed sections (module state et al.) + the consensus digest.
+    pub manifest: CheckpointManifest,
     /// The journal cursor at the quiesce fence (§10.3 step 2): the ordinal the new instance's
-    /// journal continues from, so replay of the pre-upgrade prefix is exact.
+    /// journal continues from, so replay of the pre-upgrade prefix is exact. (Also expressible
+    /// as the manifest's `JournalPosition` section; carried explicitly so the orchestrator can
+    /// log it without section decoding.)
     pub journal_cursor: u64,
 }
 
@@ -483,9 +485,25 @@ mod tests {
 
     impl ScriptedSteps {
         fn happy() -> Self {
+            // A minimal E1 typed manifest (the swapped-in seam format): one module-state section.
+            let manifest = CheckpointManifest::builder(
+                hash(1),
+                1,
+                0,
+                hash(42),
+                daemon_vhc_proto::StateDigest([0u8; 16]),
+            )
+            .section(
+                "module",
+                daemon_vhc_sdk_consensus::checkpoint::SectionKind::Module,
+                1,
+                b"state",
+            )
+            .build()
+            .expect("drill manifest");
             Self {
                 quiesce: Ok(SnapshotSeam {
-                    blob: vec![1, 2, 3],
+                    manifest,
                     journal_cursor: 42,
                 }),
                 readmit: Ok(base_grants()),

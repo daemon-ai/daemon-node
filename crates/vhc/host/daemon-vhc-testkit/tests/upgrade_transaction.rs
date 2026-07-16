@@ -52,6 +52,7 @@ use daemon_vhc_proto::{
     AdmittedQuotas, BufferReq, CertError, EpochDescriptor, Hash, PeerId, RunKeyCertificate,
     SigningKey, TransitionChain, UpgradeAuthority, UpgradeRecord,
 };
+use daemon_vhc_sdk_consensus::checkpoint::{CheckpointManifest, SectionKind};
 use daemon_vhc_session::upgrade::{
     run_local_upgrade, LeaveReason, LocalUpgradeOutcome, SnapshotSeam, StepFailure, UpgradeSteps,
 };
@@ -306,6 +307,7 @@ struct WasmSteps<'w> {
     old_run: Option<V2Run>,
     old_pump: PumpHandle,
     old_sink: Arc<Mutex<MemorySink>>,
+    old_module: Hash,
     // a frame that arrives DURING the drain (must spool, §4.4)
     late_frame: Option<(u64, [u8; 32], Vec<u8>)>,
     // the NEW module + its admission inputs
@@ -367,11 +369,32 @@ impl UpgradeSteps for WasmSteps<'_> {
             .snapshot_capture()
             .ok_or_else(|| StepFailure::new("no accepted snapshot in the drain"))?;
         self.spooled = self.old_pump.take_spooled_frames();
-        // The labelled seam: an OPAQUE blob + the journal cursor — E1's typed manifest swaps in
-        // here at merge (the session module's SnapshotSeam docs).
+        // The labelled seam, in E1's typed-manifest format (swapped in at the E1 merge, as the
+        // cross-track design fixed): the captured module-state section, content-addressed, plus
+        // the journal cursor — "checkpointing and migration are one discipline".
+        let journal_cursor = self.old_sink.lock().expect("sink").entries.len() as u64;
+        let mut builder = CheckpointManifest::builder(
+            Hash(self.new_identity.run_id),
+            0, // the snapshot captures the OLD epoch's state, produced by the OLD module
+            0,
+            self.old_module,
+            daemon_vhc_proto::StateDigest([0u8; 16]),
+        );
+        for (name, bytes) in &capture.sections {
+            builder = builder.section(name.clone(), SectionKind::Module, 1, bytes);
+        }
+        let manifest = builder
+            .section(
+                "journal-position",
+                SectionKind::JournalPosition,
+                1,
+                &journal_cursor.to_le_bytes(),
+            )
+            .build()
+            .map_err(|e| StepFailure::new(format!("seam manifest: {e:?}")))?;
         let seam = SnapshotSeam {
-            blob: capture.manifest.clone(),
-            journal_cursor: self.old_sink.lock().expect("sink").entries.len() as u64,
+            manifest,
+            journal_cursor,
         };
         self.capture = Some(capture);
         Ok(seam)
@@ -409,9 +432,15 @@ impl UpgradeSteps for WasmSteps<'_> {
 
     fn migrate(&mut self, seam: &SnapshotSeam) -> Result<(), StepFailure> {
         let capture = self.capture.clone().expect("quiesce captured");
+        // The typed seam content-addresses exactly the captured module state (E1's format).
+        let module_section = seam
+            .manifest
+            .section(SectionKind::Module)
+            .expect("seam carries the module-state section");
         assert_eq!(
-            seam.blob, capture.manifest,
-            "the seam carries the captured manifest opaquely"
+            module_section.hash,
+            blake3_hash(&capture.sections[0].1),
+            "the seam's module section content-addresses the captured snapshot"
         );
         let fuel = self.migrate_fuel.get(self.attempt).copied().flatten();
         self.attempt += 1;
@@ -592,6 +621,7 @@ fn assemble<'w>(
         old_run: Some(old_run),
         old_pump: old_pump.clone(),
         old_sink: old_sink.clone(),
+        old_module,
         late_frame: late_frame.then(|| (frames, sender, b"late".to_vec())),
         new_wasm,
         new_identity: RunIdentity {
