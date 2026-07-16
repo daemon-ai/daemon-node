@@ -31,12 +31,19 @@ use std::collections::BTreeMap;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::arbiter::{AdmitRefusal, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId};
 use crate::discovery::RunDiscovery;
 use crate::store::{DesiredState, PersistedRun, StoreError, SwarmStore, EVENT_WINDOW};
 
 /// A node-feed sink: the node passes a closure over `NodeEventFeed::emit` so live swarm updates ride
 /// the existing `events_subscribe` channel as `SwarmChanged` pointers (no new transport).
 pub type NodeFeed = Arc<dyn Fn(NodeEvent) + Send + Sync>;
+
+/// A per-role-instance worker factory (Phase E multi-instance supervision, decisions D1/D6):
+/// when configured, every admitted join gets its **own** supervised child (one sandbox = one
+/// role-instance) instead of sharing the single default worker. In production this spawns a
+/// fresh `TrainSupervisor`; tests hand out recording fakes.
+pub type WorkerFactory = Arc<dyn Fn() -> Arc<dyn WorkerControl> + Send + Sync>;
 
 /// A swarm-service error.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +58,10 @@ pub enum SwarmError {
     /// mismatch — the §6.1/§6.5 join-time discovery seam).
     #[error("discovery: {0}")]
     Discovery(String),
+    /// The owner arbiter refused the join: an aggregate resource ledger is exhausted (decisions
+    /// D6 — the admission funnel's last, supreme stage; the owner can always refuse).
+    #[error("owner arbitration refused the join: {0}")]
+    Resources(#[from] AdmitRefusal),
     /// The swarm service is disabled (`[swarm] enabled = false`).
     #[error("swarm is disabled")]
     Disabled,
@@ -110,6 +121,9 @@ pub trait WorkerControl: Send + Sync {
         duty_cycle_pct: Option<u8>,
         paused: bool,
     ) -> Result<(), SwarmError>;
+    /// Tear the worker down (a factory child that was refused admission or whose run left —
+    /// Phase E multi-instance supervision). Default no-op for fakes/shared workers.
+    async fn shutdown(&self) {}
 }
 
 #[async_trait]
@@ -161,6 +175,9 @@ impl WorkerControl for TrainSupervisor {
             .await
             .map_err(SwarmError::worker)
     }
+    async fn shutdown(&self) {
+        TrainSupervisor::shutdown(self).await;
+    }
 }
 
 /// Construction parts for a [`SwarmService`].
@@ -169,7 +186,8 @@ pub struct SwarmServiceParts {
     pub config: SwarmConfig,
     /// The durable `swarm.db` store.
     pub store: SwarmStore,
-    /// The worker-control seam (a real `TrainSupervisor` in production).
+    /// The default worker-control seam (a real `TrainSupervisor` in production) — the probe
+    /// surface, and the shared child when no [`SwarmServiceParts::worker_factory`] is set.
     pub worker: Arc<dyn WorkerControl>,
     /// The node-feed sink for `SwarmChanged` pointers (`None` on a headless / test build).
     pub feed: Option<NodeFeed>,
@@ -177,6 +195,19 @@ pub struct SwarmServiceParts {
     /// envelope + runs the worker's real §6.5 `AssessRun` before `JoinRun`. `None` keeps the W1
     /// probe-based eligibility path (no coordinator configured), so the service stays usable offline.
     pub discovery: Option<Arc<dyn RunDiscovery>>,
+    /// The owner's aggregate resource grants (decisions D6). `None` = permissive
+    /// ([`OwnerBudget::unbounded`]) — arbitration still keys/tracks every instance, it just
+    /// never runs out.
+    pub budget: Option<OwnerBudget>,
+    /// The per-role-instance worker factory (Phase E N-sandbox supervision). `None` = every run
+    /// shares the single default worker (the pre-E single-child behavior).
+    pub worker_factory: Option<WorkerFactory>,
+}
+
+/// One live supervised role-instance: its ledger identity and its worker child.
+struct InstanceEntry {
+    id: RoleInstanceId,
+    worker: Arc<dyn WorkerControl>,
 }
 
 /// The node-side swarm-training service.
@@ -185,6 +216,12 @@ pub struct SwarmService {
     store: SwarmStore,
     worker: Arc<dyn WorkerControl>,
     discovery: Option<Arc<dyn RunDiscovery>>,
+    /// The D6 owner arbiter: every join is admitted against the aggregate typed ledgers before
+    /// any child is touched, and released only on observed teardown.
+    arbiter: OwnerArbiter,
+    /// Per-role-instance children (Phase E N-sandbox supervision), keyed by `RunLabel`.
+    instances: Mutex<BTreeMap<String, InstanceEntry>>,
+    worker_factory: Option<WorkerFactory>,
     events_tx: broadcast::Sender<SwarmEvent>,
     feed: Option<NodeFeed>,
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
@@ -208,12 +245,20 @@ impl SwarmService {
             store: parts.store,
             worker: parts.worker,
             discovery: parts.discovery,
+            arbiter: OwnerArbiter::new(parts.budget.unwrap_or_else(OwnerBudget::unbounded)),
+            instances: Mutex::new(BTreeMap::new()),
+            worker_factory: parts.worker_factory,
             events_tx,
             feed: parts.feed,
             current_run: Mutex::new(None),
             rev: AtomicU64::new(0),
             me: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The owner arbiter (observability / tests): remaining ledgers + live instance count.
+    pub fn arbiter(&self) -> &OwnerArbiter {
+        &self.arbiter
     }
 
     /// Bind the service's own `Arc` handle (A3 event pump), mirroring the node's `set_swarm`
@@ -277,6 +322,15 @@ impl SwarmService {
     /// Start the service: **no-op when disabled** (the worker is never spawned). When enabled,
     /// re-issue `JoinRun` for every persisted active join-intent — durable-intent re-convergence, so
     /// a restart rejoins without app involvement (§10.3). Returns the number of runs re-joined.
+    ///
+    /// Re-convergence is also the arbiter's restart reconciliation for this supervision model:
+    /// the children died with the node (stdio cut), so the fresh ledger is re-charged exactly by
+    /// re-admitting each persisted intent (decisions D6 point 7 — the ledger converges to the
+    /// genuinely-running set). A persisted intent the (possibly shrunk) owner budget no longer
+    /// fits is surfaced LOUD as a persisted `SwarmEvent::Error` and skipped — one refused run
+    /// never blocks the rest of re-convergence. The persisted incarnation is retained (a process
+    /// restart retains the logical instance id, decisions D1); only a genuinely new
+    /// role-instance mints a new one.
     pub async fn start(&self) -> Result<usize, SwarmError> {
         if !self.config.enabled {
             return Ok(0);
@@ -284,17 +338,66 @@ impl SwarmService {
         let intents = self.store.active_intents()?;
         let mut rejoined = 0;
         for run in &intents {
+            let worker = self.instance_worker();
+            let id = RoleInstanceId {
+                run_id: run
+                    .run_id_hash
+                    .unwrap_or_else(|| *blake3::hash(run.run_id.as_bytes()).as_bytes()),
+                epoch: run.epoch,
+                role: if run.role.is_empty() {
+                    "trainer".to_string()
+                } else {
+                    run.role.clone()
+                },
+                instance: if run.instance > 0 {
+                    run.instance
+                } else {
+                    self.store.mint_incarnation()?
+                },
+            };
+            let charge = self.derive_charge(&run.eligibility, &run.policy);
+            let priority = self.store.run_priority(&run.run_id)?;
+            if let Err(refusal) = self.admit_placed(&id, charge, priority) {
+                if self.worker_factory.is_some() {
+                    worker.shutdown().await;
+                }
+                let mut emitted = Vec::new();
+                let _ = self.emit(
+                    SwarmEvent::Error {
+                        run_id: run.run_id.clone(),
+                        class: "owner_arbitration".to_string(),
+                        detail: format!("re-convergence refused: {refusal}"),
+                    },
+                    &mut emitted,
+                );
+                continue;
+            }
+            if run.instance == 0 {
+                self.store
+                    .set_execution_identity(&run.run_id, id.epoch, &id.role, id.instance)?;
+            }
             // A3: re-issue via the streaming path + pump so a re-converged run resumes reporting
             // live round progression into swarm.db (durable-intent re-convergence, §10.3).
-            let rx = self
-                .worker
+            let rx = match worker
                 .join_streaming(
                     run.run_id.clone(),
                     run.coordinator.clone(),
                     Vec::new(),
                     to_join_policy(&run.policy),
                 )
-                .await?;
+                .await
+            {
+                Ok(rx) => rx,
+                Err(e) => {
+                    // No child came up — surrender the reservation (nothing to observe tear down).
+                    self.arbiter.release(&id);
+                    return Err(e);
+                }
+            };
+            self.instances
+                .lock()
+                .unwrap()
+                .insert(run.run_id.clone(), InstanceEntry { id, worker });
             self.spawn_pump(rx);
             rejoined += 1;
         }
@@ -302,6 +405,66 @@ impl SwarmService {
             self.emit_changed(None);
         }
         Ok(rejoined)
+    }
+
+    /// The worker child for a new role-instance: a fresh factory child when configured (one
+    /// sandbox = one role-instance, decisions D1), else the shared default worker.
+    fn instance_worker(&self) -> Arc<dyn WorkerControl> {
+        match &self.worker_factory {
+            Some(f) => f(),
+            None => self.worker.clone(),
+        }
+    }
+
+    /// Derive a role-instance's ledger charge (decisions D6 point 3, the v1-era mapping): the
+    /// device-memory estimate is the assess verdict's `vram_mb` headroom when present (the
+    /// autotune verdict), else the per-run policy's `vram_cap_mb` tightening cap; duty is the
+    /// policy's `duty_cycle_pct`. Net/disk charges arrive with the v2 claim mapping. The device
+    /// is placed by [`Self::admit_placed`] (first-fit) — a placeholder here.
+    fn derive_charge(
+        &self,
+        eligibility: &SwarmEligibility,
+        policy: &SwarmPolicy,
+    ) -> InstanceCharge {
+        const MIB: u64 = 1 << 20;
+        let vram_mb = eligibility
+            .headroom
+            .get("vram_mb")
+            .copied()
+            .filter(|v| *v > 0)
+            .map_or(u64::from(policy.vram_cap_mb), |v| v as u64);
+        InstanceCharge::device_memory(
+            String::new(),
+            vram_mb.saturating_mul(MIB),
+            policy.duty_cycle_pct.min(100) as u8,
+        )
+    }
+
+    /// Node-side placement (decisions D6 point 2 — one accelerator per role-instance): try the
+    /// owner's device ledgers first-fit in deterministic (id) order; the reservation is committed
+    /// atomically on the first device that admits. Returns the FIRST device's refusal when none
+    /// fits (deterministic, names a concrete ledger).
+    fn admit_placed(
+        &self,
+        id: &RoleInstanceId,
+        charge: InstanceCharge,
+        priority: u8,
+    ) -> Result<(), AdmitRefusal> {
+        let devices = self.arbiter.devices();
+        let mut first_refusal = None;
+        for device in devices {
+            let mut placed = charge.clone();
+            placed.device = device;
+            match self.arbiter.admit(id.clone(), placed, priority) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if first_refusal.is_none() {
+                        first_refusal = Some(e);
+                    }
+                }
+            }
+        }
+        Err(first_refusal.unwrap_or(AdmitRefusal::MaxInstances { max: 0 }))
     }
 
     /// Translate + persist + fan out a worker event (spec §10.3 "all are persisted / fanned out by
@@ -412,23 +575,28 @@ impl SwarmService {
             .unwrap_or_default()
     }
 
-    /// Resolve the `(coordinator, eligibility)` for a join (A1).
+    /// Resolve the `(coordinator, eligibility)` for a join (A1), against the role-instance's own
+    /// `worker` (per-instance children run their own §6.5 assess).
     ///
     /// With a discovery seam: `GET /runs/:id` → fetch + blake3-verify the frozen envelope →
     /// `worker.assess(envelope)` (real §6.5), taking the coordinator from the registry. Without one:
     /// the W1 probe against the allowlisted coordinator. Eligibility is always node-computed.
-    async fn resolve_join(&self, run_id: &str) -> Result<(String, SwarmEligibility), SwarmError> {
+    async fn resolve_join(
+        &self,
+        worker: &Arc<dyn WorkerControl>,
+        run_id: &str,
+    ) -> Result<(String, SwarmEligibility), SwarmError> {
         if let Some(discovery) = &self.discovery {
             let run = discovery
                 .get_run(run_id)
                 .await?
                 .ok_or_else(|| SwarmError::Discovery(format!("run {run_id} not found")))?;
             let envelope = discovery.fetch_envelope(run_id).await?;
-            let verdict = self.worker.assess(envelope).await?;
+            let verdict = worker.assess(envelope).await?;
             Ok((run.coordinator, eligibility_from_assess(&verdict)))
         } else {
             let coordinator = self.coordinator();
-            let eligibility = match self.worker.probe().await {
+            let eligibility = match worker.probe().await {
                 Ok(hw) => eligibility_from_hardware(&hw),
                 Err(_) => SwarmEligibility {
                     eligible: false,
@@ -478,24 +646,108 @@ impl SwarmApi for SwarmService {
         // Idempotency is enforced upstream by the dispatch op-id dedup guard; the store's
         // INSERT-OR-UPDATE keeps a repeated join convergent regardless.
         self.require_enabled().map_err(|e| e.to_api())?;
+
+        // A repeated join of a LIVE role-instance re-converges on the existing child + its
+        // standing reservation — it never double-charges the ledgers.
+        let existing = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .get(&run_id)
+                .map(|e| (e.id.clone(), e.worker.clone()))
+        };
+        let worker = existing
+            .as_ref()
+            .map_or_else(|| self.instance_worker(), |(_, w)| w.clone());
+        // A freshly-spawned factory child serves probe/assess (the assessment instance precedes
+        // arbitration — the claim is arbitration's input); if the join is later refused, that
+        // child is torn down, never left idling.
+        let fresh_child = existing.is_none() && self.worker_factory.is_some();
+
         // Node-computed eligibility (ADR-003). A1: when a discovery seam is configured, resolve the
         // run + fetch the frozen envelope + run the worker's real §6.5 `AssessRun` before `JoinRun`,
         // and take the coordinator endpoint from discovery. With no discovery configured, fall back
         // to the W1 probe-based eligibility against the allowlisted coordinator (offline / no-registry
         // path). Either way the persisted eligibility is node-computed — the app never re-derives it.
-        let (coordinator, eligibility) =
-            self.resolve_join(&run_id).await.map_err(|e| e.to_api())?;
-        self.store
-            .put_join_intent(&run_id, &coordinator, &policy, None, &eligibility)
-            .map_err(|e| SwarmError::from(e).to_api())?;
+        let (coordinator, eligibility) = self
+            .resolve_join(&worker, &run_id)
+            .await
+            .map_err(|e| e.to_api())?;
+
+        // The admission funnel's LAST stage (decisions D6 point 5; architecture §3.5): the
+        // aggregate owner arbitration — an atomic check-and-reserve against the remaining
+        // per-device + host-wide ledgers, committed BEFORE the run instance is created. Owner
+        // priority comes from the node-side policy store, never the envelope.
+        let id = match &existing {
+            Some((id, _)) => id.clone(),
+            None => {
+                let persisted = self
+                    .store
+                    .get_run(&run_id)
+                    .map_err(|e| SwarmError::from(e).to_api())?;
+                let (epoch, role, persisted_instance, run_hash) = persisted
+                    .as_ref()
+                    .filter(|r| r.desired_state == DesiredState::Joined)
+                    .map_or((0, String::new(), 0, None), |r| {
+                        (r.epoch, r.role.clone(), r.instance, r.run_id_hash)
+                    });
+                let id = RoleInstanceId {
+                    // The cryptographic RunId when backfilled; a v1-era run keys its node-local
+                    // ledger entry by blake3(RunLabel) until then (decisions D1 lazy backfill).
+                    run_id: run_hash.unwrap_or_else(|| *blake3::hash(run_id.as_bytes()).as_bytes()),
+                    epoch,
+                    role: if role.is_empty() {
+                        "trainer".to_string()
+                    } else {
+                        role
+                    },
+                    // A restart-re-join retains the logical incarnation; a genuinely new
+                    // role-instance mints a never-reused one (decisions D1).
+                    instance: if persisted_instance > 0 {
+                        persisted_instance
+                    } else {
+                        self.store
+                            .mint_incarnation()
+                            .map_err(|e| SwarmError::from(e).to_api())?
+                    },
+                };
+                let charge = self.derive_charge(&eligibility, &policy);
+                let priority = self
+                    .store
+                    .run_priority(&run_id)
+                    .map_err(|e| SwarmError::from(e).to_api())?;
+                if let Err(refusal) = self.admit_placed(&id, charge, priority) {
+                    if fresh_child {
+                        worker.shutdown().await;
+                    }
+                    return Err(SwarmError::from(refusal).to_api());
+                }
+                id
+            }
+        };
+
+        if let Err(e) =
+            self.store
+                .put_join_intent(&run_id, &coordinator, &policy, None, &eligibility)
+        {
+            if existing.is_none() {
+                self.arbiter.release(&id);
+                if fresh_child {
+                    worker.shutdown().await;
+                }
+            }
+            return Err(SwarmError::from(e).to_api());
+        }
+        let _ = self
+            .store
+            .set_execution_identity(&run_id, id.epoch, &id.role, id.instance);
+
         // A3: join over the streaming path + pump the continuous worker event stream into
         // `handle_worker_event` so swarm.db reflects live round progression (§10.3/§10.4). The
         // opaque `JoinRun.credentials` the worker's live attach parses (§2 of the A3 ledger) are
         // authored where the node identity + roster are known (the e2e / boot join_and_pump path);
         // an API-initiated join with no authored credentials keeps the worker's self-driven round
         // (WS-only baseline), still pumped.
-        let rx = self
-            .worker
+        let rx = match worker
             .join_streaming(
                 run_id.clone(),
                 coordinator,
@@ -503,7 +755,24 @@ impl SwarmApi for SwarmService {
                 to_join_policy(&policy),
             )
             .await
-            .map_err(|e| e.to_api())?;
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                // The child never joined: the reservation is surrendered (a fresh admission
+                // only — a live instance keeps its) and a fresh factory child is torn down.
+                if existing.is_none() {
+                    self.arbiter.release(&id);
+                    if fresh_child {
+                        worker.shutdown().await;
+                    }
+                }
+                return Err(e.to_api());
+            }
+        };
+        self.instances
+            .lock()
+            .unwrap()
+            .insert(run_id.clone(), InstanceEntry { id, worker });
         self.spawn_pump(rx);
         self.emit_changed(Some(run_id));
         Ok(())
@@ -519,27 +788,50 @@ impl SwarmApi for SwarmService {
         self.store
             .set_desired_state(&run_id, DesiredState::Left)
             .map_err(|e| SwarmError::from(e).to_api())?;
-        self.worker
+        let entry = self.instances.lock().unwrap().remove(&run_id);
+        let worker = entry
+            .as_ref()
+            .map_or_else(|| self.worker.clone(), |e| e.worker.clone());
+        worker
             .leave(run_id.clone(), to_leave_mode(mode))
             .await
             .map_err(|e| e.to_api())?;
+        // Observed teardown → release (decisions D6 point 6): the leave has been accepted by the
+        // child's serial command loop (which drops the run's wasm instance + device allocations
+        // before servicing anything else), so the ledger entry is surrendered only NOW — never
+        // optimistically before the victim gave the memory back.
+        if let Some(e) = &entry {
+            self.arbiter.release(&e.id);
+        }
         self.emit_changed(Some(run_id));
         Ok(())
     }
 
     async fn swarm_set_policy(&self, policy: SwarmPolicy) -> Result<(), ApiError> {
         self.require_enabled().map_err(|e| e.to_api())?;
-        // W1: push the governor levers to the worker (§10.5). The persisted default-policy slot for
-        // future joins is the config `[swarm].default_policy`; a durable override lands with the
-        // policy store in a later wave.
+        // W1: push the governor levers to the worker (§10.5) — and, under multi-instance
+        // supervision, to every live role-instance child (the owner lever is host-wide). The
+        // persisted default-policy slot for future joins is the config `[swarm].default_policy`;
+        // a durable override lands with the policy store in a later wave.
+        let vram = Some(policy.vram_cap_mb);
+        let duty = Some(policy.duty_cycle_pct.min(100) as u8);
         self.worker
-            .throttle(
-                Some(policy.vram_cap_mb),
-                Some(policy.duty_cycle_pct.min(100) as u8),
-                false,
-            )
+            .throttle(vram, duty, false)
             .await
             .map_err(|e| e.to_api())?;
+        let children: Vec<Arc<dyn WorkerControl>> = {
+            let instances = self.instances.lock().unwrap();
+            instances.values().map(|e| e.worker.clone()).collect()
+        };
+        for child in children {
+            // The shared worker was already throttled above; factory children are distinct.
+            if !Arc::ptr_eq(&child, &self.worker) {
+                child
+                    .throttle(vram, duty, false)
+                    .await
+                    .map_err(|e| e.to_api())?;
+            }
+        }
         Ok(())
     }
 

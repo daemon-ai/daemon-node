@@ -2,32 +2,41 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // The `daemon-vhc-worker` binary speaks the frozen `daemon_vhc_session::protocol` over the
-// length-framed stdio cut. Two integration paths:
-//   * through `daemon-vhc-supervisor::TrainSupervisor` (the node-side supervisor) — probe/assess/join;
-//   * a lower-level direct subprocess drive — observe the self-driven one-round `RoundOutcome`.
-// Both spawn the real binary against a real tiny-llama `.wasm`.
+// length-framed stdio cut, through `daemon-vhc-supervisor::TrainSupervisor` (probe / assess /
+// join / throttle) against real guest modules.
 //
-// Dev/test harness: it shells `cargo build` for the guests and reads the `.wasm`, so the fs/process
-// bans (which target the shipped node) are allowed file-wide.
+// **Post-sunset shape (decisions D5)**: the v1 five-phase driver retired at the Phase-E sunset,
+// so this suite's positive arms drive the REAL major-2 module (`tiny_llama_v2.wasm` — the v2
+// whole-run itself is `tests/v2_join.rs`), and the suite carries the WIRE-LEVEL sunset
+// regressions over the real binary:
+//   * assessing the v1 `tiny_llama.wasm` returns an INELIGIBLE verdict with the typed
+//     `AbiUnsupportedMajor` refusal code — an `Assessed` outcome, never an `Event::Error`, never
+//     a crash (the protocol twin of the flipped A0 fixture);
+//   * the D0 `UnsignedEnvelopeRetired` refusal is unchanged;
+//   * `Throttle` never respawns the worker (preemption-as-churn is node-side post-sunset: the
+//     arbiter pauses/stops and re-issues JoinRun on the durable intent).
+//
+// Dev/test harness: it shells `cargo build` for the guests and reads the `.wasm`, so the
+// fs/process bans (which target the shipped node) are allowed file-wide.
 #![allow(clippy::disallowed_methods)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 use std::time::Duration;
 
-use daemon_common::SessionId;
-use daemon_provision::{Placement, PlacementSpec, ProcessProvisioner, Provisioner};
+use ciborium::value::Value;
 use daemon_vhc_proto::envelope::{
     Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
-use daemon_vhc_session::protocol::{self, Command as WCmd, Event, JoinPolicy, PolicyMode};
+
 use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
-// -- guest module loading (mirrors tests/guest_lifecycle.rs) ------------------------------------
+// -- guest module loading (mirrors tests/v2_join.rs) ---------------------------------------------
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -62,15 +71,8 @@ fn guest_remap_rustflags() -> String {
 
 /// Stale-guest guard (Merge-1 adjudication): compare every module named in the committed
 /// `guests/guests.blake3` against the `.wasm` in `dir`. A **missing / unreadable** module still
-/// fails loud — a genuinely absent or stale guest would otherwise surface downstream as a NaN loss,
-/// which is the failure this guard exists to prevent. A **hash mismatch**, by contrast, only WARNS:
-/// the guest `.wasm` is byte-reproducible run-to-run within one checkout but NOT across worktrees /
-/// machines. cargo derives each path-package's crate-disambiguator (`-C metadata`) from its absolute
-/// manifest dir, and `--remap-path-prefix` does not rewrite that hash, so symbol-hash-ordered codegen
-/// reorders the module's code/type/func/elem sections between worktrees (the remapped path *strings*
-/// are identical; only the ordering shifts). The committed manifest is therefore an advisory record
-/// of one canonical (trunk) build, NOT a cross-machine identity gate — see the Merge-1 decision in
-/// `docs/specs/swarm-p2-ledger.md`. Callers rebuild before loading, so the module in use is fresh.
+/// fails loud; a **hash mismatch** only WARNS (guest bytes are byte-reproducible within one
+/// checkout, not across worktrees — see the Merge-1 decision in `docs/specs/swarm-p2-ledger.md`).
 fn verify_guest_manifest(dir: &Path) {
     let manifest = guests_root().join("guests.blake3");
     let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {
@@ -108,10 +110,6 @@ fn ensure_built() {
         }
         let status = Command::new("cargo")
             .current_dir(guests_root())
-            // Clear the devShell's `CARGO_TARGET_DIR` (pinned to the parent checkout) so the guests
-            // build into their own `guests/target/` where `guest_dir()` reads them, and remap the
-            // absolute source/registry prefixes so the built `.wasm` bytes stay byte-reproducible
-            // (matching the committed `guests.blake3` the stale-guest guard asserts).
             .env_remove("CARGO_TARGET_DIR")
             .env("RUSTFLAGS", guest_remap_rustflags())
             .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
@@ -122,145 +120,80 @@ fn ensure_built() {
     });
 }
 
-fn module_path() -> PathBuf {
-    let path = guest_dir().join("tiny_llama.wasm");
+fn module_path(name: &str) -> PathBuf {
+    let path = guest_dir().join(name);
     if !path.exists() {
         ensure_built();
     }
-    assert!(
-        path.exists(),
-        "tiny_llama.wasm missing at {}",
-        path.display()
-    );
+    assert!(path.exists(), "{name} missing at {}", path.display());
     path
-}
-
-fn tiny_cfg_cbor() -> Vec<u8> {
-    let cfg = TinyLlamaCfg {
-        n_layers: 1,
-        seq_len: 9,
-        ..TinyLlamaCfg::default()
-    };
-    let mut b = Vec::new();
-    ciborium::into_writer(&cfg, &mut b).expect("cbor");
-    b
 }
 
 fn worker_bin() -> String {
     env!("CARGO_BIN_EXE_daemon-vhc-worker").to_string()
 }
 
-// -- through TrainSupervisor (the node-side supervisor) ------------------------------------------
-
-/// CLI-1 / RUN-9 worker side: the supervisor spawns the real worker, and probe → assess → join all
-/// succeed against a real tiny-llama module.
-#[tokio::test]
-async fn supervisor_probe_assess_join() {
-    let module = module_path();
-    let mut cfg = TrainClientConfig::new(worker_bin());
-    cfg.env = vec![(
-        "DAEMON_TRAIN_MODULE".to_string(),
-        module.to_string_lossy().into_owned(),
-    )];
-    cfg.spawn_timeout = Duration::from_secs(30);
-    cfg.op_timeout = Duration::from_secs(60);
-    let sup = TrainSupervisor::new(cfg);
-
-    // Probe: a real host capability report — the full tabi@1 vocabulary. A default (CPU-only)
-    // build reports gpus = 0; a GPU-featured build (`wgpu` G2, `cuda` P3 Lane G) reports gpus = 1
-    // iff a usable device came up (the fat-worker probe order — swarm-ledger-p3-g D5).
-    let hw = sup.probe().await.expect("probe");
-    if cfg!(any(feature = "wgpu", feature = "cuda")) {
-        assert!(hw.gpus <= 1, "the GPU probe reports 0 or 1 usable devices");
-        assert!(
-            hw.backend_lanes.iter().any(|l| l == "cpu"),
-            "the cpu lane is always present"
-        );
-    } else {
-        assert_eq!(hw.gpus, 0, "this build has no GPU lane");
-    }
-    assert_eq!(hw.capabilities.abi_version, 1);
-    assert_eq!(
-        hw.capabilities.ops.len(),
-        66,
-        "the host reports the full frozen tabi@1 vocabulary"
-    );
-    assert!(hw.capabilities.ops.iter().any(|o| o == "flash_attn@1"));
-
-    // Assess: a signed envelope (the unsigned raw-config path retired at D0); the module still
-    // resolves through the DAEMON_TRAIN_MODULE override inside the signed path.
-    let elig = sup.assess(signed_envelope_wire()).await.expect("assess");
-    assert!(
-        elig.eligible,
-        "tiny-llama must be eligible: {:?}",
-        elig.reasons
-    );
-
-    // Join: the worker emits RunPhase{train} (the supervisor's join resolves here) then self-drives.
-    sup.join("run-e3", "wss://coord.example/swarm", vec![], policy())
-        .await
-        .expect("join");
-
-    sup.shutdown().await;
-}
-
-fn policy() -> JoinPolicy {
-    JoinPolicy {
-        mode: PolicyMode::Always,
-        vram_cap_mb: 0,
-        duty_cycle_pct: 100,
-        schedule: None,
-    }
-}
-
-/// A real signed run envelope whose `tiny-llama.wasm` artifact points at the built module by
-/// `file://` + real blake3, with the tiny-llama preset as `[experiment.config]`. Reopened + verified
-/// by the worker, which resolves the module through `ArtifactResolver` (no `DAEMON_TRAIN_MODULE`).
-fn signed_envelope_wire() -> Vec<u8> {
-    let module = module_path();
-    let bytes = std::fs::read(&module).expect("read module");
-    let blake3 = Hash(*blake3::hash(&bytes).as_bytes());
-    let mut artifacts = std::collections::BTreeMap::new();
-    artifacts.insert(
-        "tiny-llama.wasm".to_string(),
-        Artifact {
-            url: format!("file://{}", module.display()),
-            blake3,
-        },
-    );
-    artifacts.insert(
-        "manifest.json".to_string(),
-        Artifact {
-            url: "file://manifest.json".to_string(),
-            blake3: Hash([0u8; 32]),
-        },
-    );
-    let cfg = TinyLlamaCfg {
+/// The tiny-llama-v2 guest config (`GuestCfg`) — the v2_join shape: single-peer roster, 2 inner
+/// steps, one sequence per micro window.
+fn v2_guest_config() -> Value {
+    let model = Value::serialized(&TinyLlamaCfg {
         n_layers: 1,
         seq_len: 9,
         ..TinyLlamaCfg::default()
-    };
+    })
+    .expect("model value");
+    Value::Map(vec![
+        (Value::from("model"), model),
+        (Value::from("peer"), Value::Bytes(vec![7u8; 32])),
+        (
+            Value::from("roster"),
+            Value::Array(vec![Value::Bytes(vec![7u8; 32])]),
+        ),
+        (Value::from("steps_per_round"), Value::from(2u32)),
+        (Value::from("micro_batch"), Value::from(1u32)),
+        (Value::from("stall_rounds_max"), Value::from(2u32)),
+    ])
+}
+
+/// A real signed schema-major-1 run envelope for `module` (resolved via `DAEMON_TRAIN_MODULE`
+/// inside the signed path; the artifact entry is a placeholder the override substitutes).
+fn signed_envelope_wire(run_id: &str, config: Value) -> Vec<u8> {
+    let mut artifacts = BTreeMap::new();
+    artifacts.insert(
+        "experiment.wasm".to_string(),
+        Artifact {
+            url: "file:///dev/null".into(),
+            blake3: Hash([1; 32]),
+        },
+    );
+    artifacts.insert(
+        "data.manifest".to_string(),
+        Artifact {
+            url: "file:///dev/null".into(),
+            blake3: Hash([2; 32]),
+        },
+    );
     let env = Envelope {
         run: RunSection {
             schema: ENVELOPE_SCHEMA_MAJOR,
-            run_id: "worker-seam".to_string(),
+            run_id: run_id.to_string(),
             min_peers: 1,
             max_peers: 4,
             access: Access::Org,
         },
         experiment: ExperimentSection {
-            module: "tiny-llama.wasm".to_string(),
+            module: "experiment.wasm".to_string(),
             abi: "tensor-abi@1".to_string(),
-            config: ciborium::value::Value::serialized(&cfg).expect("cfg value"),
+            config,
         },
         artifacts,
         data: DataSection {
-            manifest: "manifest.json".to_string(),
-            steps_per_round: 3,
+            manifest: "data.manifest".to_string(),
+            steps_per_round: 2,
             global_batch: GlobalBatch {
-                start: 12,
-                end: 12,
-                ramp_rounds: 0,
+                start: 2,
+                end: 2,
+                ramp_rounds: 1,
             },
             stop: StopCondition::Rounds(4),
         },
@@ -278,8 +211,8 @@ fn signed_envelope_wire() -> Vec<u8> {
         phases: Phases {
             round_mode: RoundMode::Barrier,
             warmup: 1,
-            round_train_max: 1_000,
-            round_witness: 1_000,
+            round_train_max: 60,
+            round_witness: 1,
             cooldown: 1,
             epoch_rounds: 0,
             checkpoint_every_epochs: 0,
@@ -292,52 +225,122 @@ fn signed_envelope_wire() -> Vec<u8> {
     to_canonical_vec(&frozen.to_wire()).expect("encode signed envelope")
 }
 
-/// The Merge-3 envelope seam: the worker receives the **real** signed envelope, verifies it, extracts
-/// `[experiment.config]`, and resolves the module from the artifact map via `ArtifactResolver`
-/// (`file://`, blake3-verified) — **no `DAEMON_TRAIN_MODULE` override**. Assess is eligible and join
-/// drives a real round.
-#[tokio::test]
-async fn worker_resolves_module_from_signed_envelope() {
-    // Ensure the module exists on disk for the artifact resolver (no env override is set).
-    let _ = module_path();
+fn supervisor_for(module: &Path) -> TrainSupervisor {
     let mut cfg = TrainClientConfig::new(worker_bin());
+    cfg.env = vec![
+        (
+            "DAEMON_TRAIN_MODULE".to_string(),
+            module.to_string_lossy().into_owned(),
+        ),
+        // The owner's node-side lane choice (§9.6 numbers-are-config): CPU-admitting t2 lane.
+        ("DAEMON_VHC_LANE_GPU_OPTIONAL".to_string(), "1".to_string()),
+    ];
     cfg.spawn_timeout = Duration::from_secs(30);
-    cfg.op_timeout = Duration::from_secs(60);
-    let sup = TrainSupervisor::new(cfg);
+    cfg.op_timeout = Duration::from_secs(180);
+    TrainSupervisor::new(cfg)
+}
+
+// -- probe: the frozen capability report ----------------------------------------------------------
+
+/// CLI-1 / RUN-9 worker side: the supervisor spawns the real worker; the probe reports the
+/// implemented ABI major (2 since the sunset) and the full frozen 66-op `tabi@1` vocabulary (the
+/// live §2.5 bridge surface — the sunset removed the DRIVER, not the vocabulary).
+#[tokio::test]
+async fn supervisor_probe_reports_major2_and_the_frozen_vocabulary() {
+    let module = module_path("tiny_llama_v2.wasm");
+    let sup = supervisor_for(&module);
+
+    let hw = sup.probe().await.expect("probe");
+    if cfg!(any(feature = "wgpu", feature = "cuda")) {
+        assert!(hw.gpus <= 1, "the GPU probe reports 0 or 1 usable devices");
+        assert!(
+            hw.backend_lanes.iter().any(|l| l == "cpu"),
+            "the cpu lane is always present"
+        );
+    } else {
+        assert_eq!(hw.gpus, 0, "this build has no GPU lane");
+    }
+    assert_eq!(
+        hw.capabilities.abi_version, 2,
+        "the implemented major is 2 post-sunset"
+    );
+    assert_eq!(
+        hw.capabilities.ops.len(),
+        66,
+        "the host reports the full frozen tabi@1 vocabulary"
+    );
+    assert!(hw.capabilities.ops.iter().any(|o| o == "flash_attn@1"));
+    sup.shutdown().await;
+}
+
+// -- THE SUNSET REGRESSION over the real binary (the flipped A0's protocol twin) ------------------
+
+/// Assessing the pinned **v1** module post-sunset yields an INELIGIBLE `Assessed` verdict whose
+/// refusal code is exactly `AbiUnsupportedMajor` — typed, attributable, never an `Event::Error`,
+/// never a worker crash; the worker stays healthy and serves subsequent commands.
+#[tokio::test]
+async fn v1_module_assess_is_refused_abi_unsupported_major() {
+    let module = module_path("tiny_llama.wasm");
+    let sup = supervisor_for(&module);
+
+    let cfg = TinyLlamaCfg {
+        n_layers: 1,
+        seq_len: 9,
+        ..TinyLlamaCfg::default()
+    };
+    let elig = sup
+        .assess(signed_envelope_wire(
+            "sunset-v1",
+            Value::serialized(&cfg).expect("cfg value"),
+        ))
+        .await
+        .expect("assess is an outcome, not a transport error");
+    assert!(!elig.eligible, "a v1 module is refused post-sunset");
+    assert_eq!(
+        elig.refusal_code.as_deref(),
+        Some("AbiUnsupportedMajor"),
+        "the clean typed refusal (decisions D5), got: {:?}",
+        elig.reasons
+    );
+    // The worker is unharmed: it still answers on the same process.
+    sup.ping().await.expect("worker healthy after the refusal");
+    assert_eq!(sup.restarts().await, 0, "no respawn");
+    sup.shutdown().await;
+}
+
+// -- the v2 positive over the signed-envelope seam ------------------------------------------------
+
+/// The Merge-3 envelope seam, post-sunset: the worker receives the real signed envelope, verifies
+/// it, and the **major-2** module assesses eligible through the claim funnel (the full v2
+/// whole-run join is `tests/v2_join.rs`).
+#[tokio::test]
+async fn v2_module_assesses_eligible_over_the_signed_envelope() {
+    let module = module_path("tiny_llama_v2.wasm");
+    let sup = supervisor_for(&module);
 
     let elig = sup
-        .assess(signed_envelope_wire())
+        .assess(signed_envelope_wire("worker-seam", v2_guest_config()))
         .await
         .expect("assess over the signed envelope");
     assert!(
         elig.eligible,
-        "the worker resolved its module from the envelope + assessed eligible: {:?}",
+        "the v2 module assesses eligible: {:?}",
         elig.reasons
     );
-    sup.join("worker-seam", "wss://coord.example/swarm", vec![], policy())
-        .await
-        .expect("join after envelope-resolved assess");
     sup.shutdown().await;
 }
 
 /// D0: the unsigned legacy envelope path is RETIRED with a typed refusal (refactor §8/D0). Raw
-/// `[experiment.config]` CBOR (no `SignedEnvelope` wrapper) — the pre-A0 direct-drive — is
-/// refused with the stable `UnsignedEnvelopeRetired` slug even when `DAEMON_TRAIN_MODULE` is
-/// set; the override survives only INSIDE the signed path (the tests above prove that half).
+/// config CBOR (no `SignedEnvelope` wrapper) — the pre-A0 direct-drive — is refused with the
+/// stable `UnsignedEnvelopeRetired` slug even when `DAEMON_TRAIN_MODULE` is set.
 #[tokio::test]
 async fn unsigned_raw_config_assess_is_refused_with_typed_slug() {
-    let module = module_path();
-    let mut cfg = TrainClientConfig::new(worker_bin());
-    cfg.env = vec![(
-        "DAEMON_TRAIN_MODULE".to_string(),
-        module.to_string_lossy().into_owned(),
-    )];
-    cfg.spawn_timeout = Duration::from_secs(30);
-    cfg.op_timeout = Duration::from_secs(60);
-    let sup = TrainSupervisor::new(cfg);
+    let module = module_path("tiny_llama_v2.wasm");
+    let sup = supervisor_for(&module);
 
+    let raw = to_canonical_vec(&v2_guest_config()).expect("raw config cbor");
     let err = sup
-        .assess(tiny_cfg_cbor())
+        .assess(raw)
         .await
         .expect_err("raw-config assess must refuse (retired at D0)");
     assert!(
@@ -347,141 +350,26 @@ async fn unsigned_raw_config_assess_is_refused_with_typed_slug() {
     sup.shutdown().await;
 }
 
-/// RUN-9 (§10.5) over the **real** worker: preemption-as-churn. After a join, `Throttle{paused}`
-/// pauses the `WasmBackend` (checkpoint + drop the wasm instance) and resume re-instantiates; a
-/// subsequent join re-enters — all over the **same** worker (pause/resume is churn, never a respawn).
+/// RUN-9 (§10.5) post-sunset: `Throttle` never harms or respawns the worker — preemption-as-churn
+/// moved node-side (the arbiter stops the instance and re-issues JoinRun on the durable intent);
+/// the worker survives the lever and serves a fresh assess on the same process.
 #[tokio::test]
-async fn real_worker_preemption_pause_resume_rejoins_without_respawn() {
-    let module = module_path();
-    let mut cfg = TrainClientConfig::new(worker_bin());
-    cfg.env = vec![(
-        "DAEMON_TRAIN_MODULE".to_string(),
-        module.to_string_lossy().into_owned(),
-    )];
-    cfg.spawn_timeout = Duration::from_secs(30);
-    cfg.op_timeout = Duration::from_secs(60);
-    let sup = TrainSupervisor::new(cfg);
+async fn throttle_is_harmless_and_never_respawns() {
+    let module = module_path("tiny_llama_v2.wasm");
+    let sup = supervisor_for(&module);
 
-    sup.assess(signed_envelope_wire()).await.expect("assess");
-    sup.join("run-9", "wss://coord", vec![], policy())
+    sup.assess(signed_envelope_wire("run-9", v2_guest_config()))
         .await
-        .expect("initial join");
-
-    // Inference preempts training: pause frees the wasm instance, resume re-instantiates.
+        .expect("assess");
     sup.throttle(None, None, true).await.expect("pause");
     sup.throttle(None, None, false).await.expect("resume");
-    // Rejoin at the next boundary — a fresh backend over the same worker process.
-    sup.join("run-9", "wss://coord", vec![], policy())
+    sup.assess(signed_envelope_wire("run-9", v2_guest_config()))
         .await
-        .expect("rejoin after resume");
-
+        .expect("assess after the lever");
     assert_eq!(
         sup.restarts().await,
         0,
-        "pause/resume is churn over the same worker — never a respawn"
+        "the throttle lever is churn-free on the worker process"
     );
     sup.shutdown().await;
-}
-
-// -- direct subprocess drive (observe the one-round RoundOutcome) --------------------------------
-
-/// Drive the worker subprocess directly over the protocol and observe the full self-driven round:
-/// `RunPhase{train}` → `Metric{loss}` → `RoundOutcome{round:0, digest}` (a 16-byte state digest).
-#[tokio::test]
-async fn worker_drives_one_round() {
-    let module = module_path();
-    let spec = PlacementSpec {
-        program: PathBuf::from(worker_bin()),
-        args: Vec::new(),
-        env: vec![(
-            "DAEMON_TRAIN_MODULE".to_string(),
-            module.to_string_lossy().into_owned(),
-        )],
-    };
-    let Placement { channel, mut child } = ProcessProvisioner::new()
-        .place(&SessionId::new("daemon-vhc-worker-e3"), spec)
-        .await
-        .expect("spawn worker");
-    let (writer, mut reader) = channel.split();
-
-    // Ready handshake.
-    assert!(
-        matches!(read_event(&mut reader).await, Some(Event::Ready { .. })),
-        "worker announces Ready first"
-    );
-
-    // Assess (caches the config for the join), then join and drive the round. Signed envelope
-    // only — the unsigned raw-config drive was retired at D0 (typed refusal, test below).
-    send(
-        &writer,
-        &WCmd::AssessRun {
-            envelope: signed_envelope_wire(),
-        },
-    )
-    .await;
-    assert!(
-        matches!(read_event(&mut reader).await, Some(Event::Assessed(e)) if e.eligible),
-        "assess is eligible"
-    );
-
-    send(
-        &writer,
-        &WCmd::JoinRun {
-            run_id: "run-e3".to_string(),
-            coordinator: "wss://coord.example/swarm".to_string(),
-            credentials: Vec::new(),
-            policy: policy(),
-        },
-    )
-    .await;
-
-    // Collect the round's event stream until RoundOutcome (or the worker dies).
-    let mut saw_run_phase = false;
-    let mut saw_metric = false;
-    let mut outcome = None;
-    for _ in 0..16 {
-        match read_event(&mut reader).await {
-            Some(Event::RunPhase { phase, .. }) => {
-                assert_eq!(phase, "train");
-                saw_run_phase = true;
-            }
-            Some(Event::Metric { name, .. }) if name == "loss" => saw_metric = true,
-            Some(Event::RoundOutcome {
-                round,
-                digest,
-                committed,
-                ingested,
-                ..
-            }) => {
-                assert_eq!(round, 0);
-                assert_eq!((committed, ingested), (1, 1));
-                outcome = Some(digest);
-                break;
-            }
-            Some(Event::Error { class, detail }) => panic!("worker error ({class:?}): {detail}"),
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    assert!(saw_run_phase, "worker emitted RunPhase{{train}}");
-    assert!(saw_metric, "worker emitted a loss metric");
-    let digest = outcome.expect("worker emitted a RoundOutcome");
-    assert_eq!(
-        digest.len(),
-        16,
-        "the round outcome carries a 16-byte state digest"
-    );
-
-    send(&writer, &WCmd::Shutdown).await;
-    child.shutdown().await;
-}
-
-async fn send(writer: &daemon_provision::CutWriter, cmd: &WCmd) {
-    let bytes = protocol::encode(cmd).expect("encode command");
-    writer.send(&bytes).await.expect("send command");
-}
-
-async fn read_event(reader: &mut daemon_provision::CutReader) -> Option<Event> {
-    let bytes = reader.recv().await?;
-    Some(protocol::decode::<Event>(&bytes).expect("decode event"))
 }

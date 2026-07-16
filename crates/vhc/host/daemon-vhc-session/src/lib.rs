@@ -39,11 +39,10 @@ pub mod seam;
 // adapters and drills live in the host testkit.
 pub mod upgrade;
 pub mod v2_attach;
-// The A2 dependency inversion (refactor §5 A2 item 3): the session links the HOST (never the
-// reverse — the host stopped linking run policy). `WasmBackend` — the TrainerBackend seam filled
-// by the wasm host runtime — moved here from `daemon-vhc-host` with the inversion: the trait it
-// implements is session-owned, and the session is where seam plumbing consolidates (decisions D1).
-pub mod wasm_backend;
+// `wasm_backend` (the v1 five-phase driver's TrainerBackend binding, moved here at the A2
+// inversion) RETIRED at the Phase-E v1 sunset (decisions D5) together with the host's Instance
+// lifecycle: the trait seam + `StubBackend` remain (the harness/checkpoint/cold-join substrate);
+// no wasm TrainerBackend exists — major-2 modules run under the v2 event-loop driver.
 
 /// The runnable local-mode coordinator shell (the impure driver around the pure
 /// `daemon-vhc-coordinator` `tick`). Behind the `harness` feature (its coordinator dep is
@@ -57,14 +56,9 @@ pub mod local_coordinator;
 #[cfg(any(test, feature = "harness"))]
 pub mod harness;
 
-/// The live-transport multi-peer harness: the round engine over a **real per-node [`IrohGossip`]**
-/// mesh + a shared `FsPayloadStore` (B3, the transport exit-gate lane). Behind the `iroh` feature
-/// (which enables `daemon-vhc-net/iroh` + `harness`). Used by `bins/swarm-local` +
-/// `tests/daemon-swarm-e2e`'s live suite.
-///
-/// [`IrohGossip`]: daemon_vhc_net::IrohGossip
-#[cfg(feature = "iroh")]
-pub mod live_harness;
+// `live_harness` (the iroh live-transport harness driving the v1 WasmBackend over the RoundEngine)
+// RETIRED with the v1 driver at the Phase-E sunset; the loopback `harness` (StubBackend) remains
+// the deterministic multi-peer substrate, and the live v2 lanes are the testkit's.
 
 pub use backend::{
     AssessMeta, Assessment, BatchRef, StateDigest, StepCtx, StepStats, StubBackend, TrainerBackend,
@@ -76,7 +70,6 @@ pub use data::{
 };
 pub use engine::{EngineConfig, EngineEvent, RoundEngine, RunOutcome};
 pub use seam::BatchId;
-pub use wasm_backend::{WasmBackend, WasmBackendConfig, WasmBackendError};
 
 /// Errors surfaced by the participant runtime.
 #[derive(Debug, thiserror::Error)]

@@ -13,7 +13,8 @@
 //! - `--backend worker`: one supervised `daemon-vhc-worker` per peer over the frozen worker
 //!   protocol (probe → assess the **real** signed envelope → join). The worker verifies the frozen
 //!   envelope, extracts `[experiment.config]`, resolves its `.wasm` module from the envelope artifact
-//!   map (`file://`, blake3-verified), and drives real host training (`WasmBackend`).
+//!   map (`file://`, blake3-verified), and drives real host training (major-2 modules only
+//!   post-sunset — a v1 module assesses ineligible with the typed AbiUnsupportedMajor).
 //!
 //! This is a local developer runnable (like `xtask`): it reads an operator-supplied envelope path on
 //! the operator's own machine, so the file read carries a declared `#[allow]` rather than the
@@ -366,9 +367,9 @@ async fn run_stub(peers: usize, rounds: u64, steps_per_round: u32, seed: u64) ->
 }
 
 /// Worker mode: spawn one supervised `daemon-vhc-worker` per peer over the frozen worker protocol
-/// (probe → assess the **real** signed envelope → join). Each worker verifies the envelope, resolves
-/// its module from the artifact map (or the `DAEMON_TRAIN_MODULE` override), and drives real host
-/// training (`WasmBackend`, self-driven round).
+/// (probe → assess the **real** signed envelope → join). Each worker verifies the envelope and
+/// resolves its module from the artifact map (or the `DAEMON_TRAIN_MODULE` override); post-sunset
+/// only a major-2 module assesses eligible (a v1 module reports the typed AbiUnsupportedMajor).
 async fn run_worker(
     peers: usize,
     worker_bin: &Path,
@@ -418,7 +419,7 @@ async fn run_worker(
         }
         sup.shutdown().await;
     }
-    println!("\nworker-backed run over the frozen protocol (real host training via WasmBackend).");
+    println!("\nworker-backed run over the frozen protocol.");
     Ok(())
 }
 

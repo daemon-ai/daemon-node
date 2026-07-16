@@ -5,13 +5,22 @@
 // driver + the §2.5 tabi bridge reproduces the v1 det-lane state digests — the evidence that the
 // control inversion changed the choreography's HOME, not the math.
 //
-// Harness (the recorded sitting-7 design): single-peer roster; the v1 `WasmBackend` oracle runs
-// first on identical inputs (same model config, same zero-token batches, same step/micro
-// schedule); its per-round sealed update bytes feed the v2 run's kind-2 staged ingest (the
-// OUTBOUND SEALING GAP: a bridge guest cannot seal its own container — Phase B's payload_put
-// closes it; the state digest covers the gap transitively, since the container is a function of
-// the same params the digest hashes); the v2 run's final canonical state is exported through the
-// pump hook and digested exactly as `WasmBackend::digest_of` does. Equal digests ⇒ equal math.
+// Harness (the recorded sitting-7 design): single-peer roster; the v1 oracle's per-round sealed
+// update bytes feed the v2 run's kind-2 staged ingest (the OUTBOUND SEALING GAP: a bridge guest
+// cannot seal its own container — Phase B's payload_put closes it; the state digest covers the
+// gap transitively, since the container is a function of the same params the digest hashes); the
+// v2 run's final canonical state is exported through the pump hook and digested exactly as the
+// v1 driver's `digest_of` did. Equal digests ⇒ equal math.
+//
+// THE ORACLE IS A RECORDING (Phase E sunset; decisions D5): before the sunset the v1 side ran
+// LIVE (`WasmBackend`, the v1 five-phase driver) on every test execution; the sunset deletes
+// that driver, so the oracle was frozen FIRST as the content-addressed
+// `tests/fixtures/v1-parity-oracle/` bundle (captured at pre-sunset commit `1390f0b7` by the
+// bundled capture crate — see its README). The two frozen parity pins below keep their names
+// and their meaning: v2 must still reproduce the v1-derived digests, now sourced from the
+// recording instead of a live v1 run. One CPU-lane recording serves every backend tier because
+// the det lane is bit-identical across backends (refactor §12.1, the standing invariant) and
+// the v1 op backends were pinned bit-exact against each other (burn_backend_parity.rs).
 #![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
@@ -27,9 +36,7 @@ use daemon_vhc_proto::messages::{
     BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, SwarmMessage,
 };
 use daemon_vhc_proto::{blake3_hash, digest_state, to_canonical_vec, Hash, PeerId, Seed};
-use daemon_vhc_sdk::models::TinyLlamaCfg;
-use daemon_vhc_session::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
-use daemon_vhc_session::{WasmBackend, WasmBackendConfig};
+use daemon_vhc_session::backend::StateDigest;
 
 const ROUNDS: u64 = 2;
 const STEPS_PER_ROUND: u32 = 2;
@@ -74,25 +81,11 @@ fn guest(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-fn model_cfg() -> TinyLlamaCfg {
-    TinyLlamaCfg {
-        n_layers: 1,
-        seq_len: SEQ_LEN,
-        ..TinyLlamaCfg::default()
-    }
-}
-
-fn model_cfg_bytes() -> Vec<u8> {
-    let mut b = Vec::new();
-    ciborium::into_writer(&model_cfg(), &mut b).expect("cfg cbor");
-    b
-}
-
 fn zero_tokens() -> Vec<u32> {
     vec![0u32; (MICRO_BATCH * SEQ_LEN) as usize]
 }
 
-/// The digest exactly as `WasmBackend::digest_of` computes it (round-seeded, full sampling).
+/// The digest exactly as the v1 driver's `digest_of` computed it (round-seeded, full sampling).
 fn digest_of_state(state: &[u8], round: u64) -> [u8; 16] {
     let mut seed = [0u8; 32];
     seed[..8].copy_from_slice(&round.to_le_bytes());
@@ -100,62 +93,82 @@ fn digest_of_state(state: &[u8], round: u64) -> [u8; 16] {
     *d.as_bytes()
 }
 
-/// The v1 oracle: drive `WasmBackend` through the identical schedule; return the per-round sealed
-/// update bytes and the final round's digest.
-fn v1_oracle(engine: EngineConfig) -> (Vec<Vec<u8>>, StateDigest) {
-    v1_oracle_n(engine, ROUNDS)
+// -- the recorded v1 oracle (tests/fixtures/v1-parity-oracle; decisions D5) ----------------------
+
+const ORACLE_EXPECTED: &str = include_str!("fixtures/v1-parity-oracle/expected.json");
+
+fn oracle_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1-parity-oracle")
 }
 
-fn v1_oracle_n(engine: EngineConfig, rounds: u64) -> (Vec<Vec<u8>>, StateDigest) {
-    let mut b = WasmBackend::new(WasmBackendConfig {
-        wasm: guest("tiny_llama"),
-        engine,
-    })
-    .expect("v1 backend");
-    b.build(&model_cfg_bytes()).expect("build");
-    let peer = PeerId(PEER);
-    let mut updates = Vec::new();
-    let mut last = None;
-    for round in 0..rounds {
-        for h in 0..STEPS_PER_ROUND {
-            b.train_step(
-                &BatchRef {
-                    tokens: zero_tokens(),
-                    seq_len: SEQ_LEN,
-                },
-                StepCtx {
-                    inner_step: h,
-                    mb_index: 0,
-                    mb_count: 1,
-                    step_seqs: MICRO_BATCH,
-                },
-            )
-            .expect("step");
-            b.inner_update(h).expect("inner");
-        }
-        let bytes = b.make_update(round).expect("make_update");
-        let digest = b
-            .ingest(
-                round,
-                &[StagedPayload {
-                    peer,
-                    hash: blake3_hash(&bytes),
-                    bytes: bytes.clone(),
-                }],
-            )
-            .expect("ingest");
-        updates.push(bytes);
-        last = Some(digest);
-    }
-    (updates, last.expect("rounds ran"))
+fn hex_bytes(s: &str) -> Vec<u8> {
+    assert!(s.len().is_multiple_of(2), "even hex");
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// Load + content-verify one recorded fixture file against its `expected.json` entry.
+fn oracle_file(entry: &serde_json::Value) -> Vec<u8> {
+    let rel = entry["file"].as_str().expect("file");
+    let bytes = std::fs::read(oracle_root().join(rel))
+        .unwrap_or_else(|e| panic!("read recorded oracle file {rel}: {e}"));
+    assert_eq!(
+        blake3_hash(&bytes).to_hex().to_string(),
+        entry["blake3"].as_str().expect("blake3"),
+        "recorded oracle file {rel} is content-addressed — bytes must match the pin"
+    );
+    assert_eq!(bytes.len() as u64, entry["bytes"].as_u64().expect("bytes"));
+    bytes
+}
+
+/// The recorded v1 oracle: the per-round sealed update bytes + the final round's digest, exactly
+/// as the live v1 driver produced them at capture (backend-independent — see the header note).
+fn recorded_v1_oracle() -> (Vec<Vec<u8>>, StateDigest) {
+    let expected: serde_json::Value = serde_json::from_str(ORACLE_EXPECTED).expect("expected.json");
+    let v2p = &expected["v2_parity"];
+    // The recording pins the exact schedule this harness drives; drift here means the fixture
+    // and the test have diverged — re-capture (pre-sunset) or fix the harness, never fudge.
+    let sched = &v2p["schedule"];
+    assert_eq!(
+        (
+            sched["rounds"].as_u64().unwrap(),
+            sched["steps_per_round"].as_u64().unwrap(),
+            sched["micro_batch"].as_u64().unwrap(),
+            sched["seq_len"].as_u64().unwrap(),
+        ),
+        (
+            ROUNDS,
+            u64::from(STEPS_PER_ROUND),
+            u64::from(MICRO_BATCH),
+            u64::from(SEQ_LEN)
+        ),
+        "the recorded oracle's schedule must match the harness constants"
+    );
+    let updates: Vec<Vec<u8>> = v2p["updates"]
+        .as_array()
+        .expect("updates")
+        .iter()
+        .map(oracle_file)
+        .collect();
+    assert_eq!(updates.len() as u64, ROUNDS);
+    let digest: [u8; 16] = hex_bytes(v2p["final_digest"].as_str().expect("digest"))
+        .try_into()
+        .expect("digest16");
+    (updates, StateDigest(digest))
+}
+
+/// The recorded v1 experiment config (the exact canonical CBOR the v1 oracle was built with),
+/// decoded as a CBOR value so the v2 guest config embeds the identical `model` map.
+fn recorded_model_value() -> Value {
+    let expected: serde_json::Value = serde_json::from_str(ORACLE_EXPECTED).expect("expected.json");
+    let bytes = oracle_file(&expected["v2_parity"]["model_cfg"]);
+    ciborium::de::from_reader(bytes.as_slice()).expect("model cfg cbor")
 }
 
 fn guest_cfg_bytes() -> Vec<u8> {
     let cfg = Value::Map(vec![
-        (
-            Value::Text("model".into()),
-            Value::serialized(&model_cfg()).expect("model value"),
-        ),
+        (Value::Text("model".into()), recorded_model_value()),
         (Value::Text("peer".into()), Value::Bytes(PEER.to_vec())),
         (
             Value::Text("roster".into()),
@@ -410,7 +423,7 @@ fn v2_run_catchup(
 /// bit-for-bit (drops/straggles are advisory; the journal records what was delivered).
 #[test]
 fn catch_up_after_straggle_reproduces_v1_digests_cpu() {
-    let (updates, v1_digest) = v1_oracle(EngineConfig::default());
+    let (updates, v1_digest) = recorded_v1_oracle();
     let (v2_digest, entries) = v2_run_catchup(EngineConfig::default(), &updates);
     assert_eq!(
         v1_digest, v2_digest,
@@ -458,7 +471,7 @@ fn catch_up_after_straggle_reproduces_v1_digests_cpu() {
 /// record mix: bridge compute, nr readouts, staged kinds 1/2, control frames, publishes).
 #[test]
 fn tiny_llama_on_barrier_round_reproduces_v1_digests_cpu() {
-    let (updates, v1_digest) = v1_oracle(EngineConfig::default());
+    let (updates, v1_digest) = recorded_v1_oracle();
     let (v2_digest, entries) = v2_run_n(EngineConfig::default(), &updates, ROUNDS);
     assert_eq!(
         v1_digest, v2_digest,
@@ -512,7 +525,7 @@ fn tiny_llama_on_barrier_round_reproduces_v1_digests_burn_ndarray() {
         backend: daemon_vhc_host::BackendKind::BurnNdarray,
         ..EngineConfig::default()
     };
-    let (updates, v1_digest) = v1_oracle(engine.clone());
+    let (updates, v1_digest) = recorded_v1_oracle();
     let v2_digest = v2_run(engine, &updates);
     assert_eq!(v1_digest, v2_digest);
 }
@@ -530,7 +543,7 @@ fn tiny_llama_on_barrier_round_reproduces_v1_digests_wgpu() {
         backend: daemon_vhc_host::BackendKind::Wgpu,
         ..EngineConfig::default()
     };
-    let (updates, v1_digest) = v1_oracle(engine.clone());
+    let (updates, v1_digest) = recorded_v1_oracle();
     let v2_digest = v2_run(engine, &updates);
     assert_eq!(v1_digest, v2_digest);
 }
@@ -547,7 +560,7 @@ fn tiny_llama_on_barrier_round_reproduces_v1_digests_cuda() {
         backend: daemon_vhc_host::BackendKind::Cuda,
         ..EngineConfig::default()
     };
-    let (updates, v1_digest) = v1_oracle(engine.clone());
+    let (updates, v1_digest) = recorded_v1_oracle();
     let v2_digest = v2_run(engine, &updates);
     assert_eq!(v1_digest, v2_digest);
 }

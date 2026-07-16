@@ -32,7 +32,9 @@ tokio = { workspace = true }
 # (`WasmBackend`), the pure coordinator `tick`, and the observe replay oracle (PROTO-20). All are
 # already in the frozen root `[workspace.dependencies]`; no cycle (the e2e crate is a leaf).
 daemon-vhc-host = { workspace = true }
-daemon-vhc-sdk = { path = "../../crates/vhc/sdk/daemon-vhc-sdk", features = ["sim"] }
+# (Phase-E sunset) the e2e->daemon-vhc-sdk dev-dep was REMOVED with the WasmBackend suites
+# (wasm_profiles / typed_checkpoint_bridge); the remaining oracles link sdk-rounds/sdk-v2/
+# sdk-consensus only (tracked exceptions).
 # The A2 choreography-move bridging oracle (tests/rounds_bridging_oracle.rs) compares the
 # relocated round logic against the v1 engine — a tracked dependency-direction exception
 # (registered in xtask vhc_dep_check), removed when the v1 engine dissolves at sunset.

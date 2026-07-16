@@ -167,8 +167,29 @@ ALTER TABLE swarm_runs ADD COLUMN selected_driver TEXT;
 ALTER TABLE swarm_runs ADD COLUMN module_hash BLOB;
 ";
 
+/// M3 (Phase E, decisions D6/D1): the node-durable **incarnation counter** — the never-reused,
+/// monotonic u64 role-instance incarnation id the execution identity carries (ABI §8.1; a
+/// reusable slot value would let a fresh role-instance inherit a retired incarnation's durable
+/// sequence stream) — and the **owner-priority store** (D6 point 4: preemption priority is
+/// node-side owner state, never the envelope). Append-only.
+const M3_ARBITER: &str = "\
+CREATE TABLE IF NOT EXISTS swarm_counters (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO swarm_counters (name, value) VALUES ('incarnation', 0);
+CREATE TABLE IF NOT EXISTS swarm_owner_priority (
+    run_id   TEXT PRIMARY KEY,
+    priority INTEGER NOT NULL
+);
+";
+
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(SCHEMA), M::up(M2_IDENTITY_OBSERVABILITY)])
+    Migrations::new(vec![
+        M::up(SCHEMA),
+        M::up(M2_IDENTITY_OBSERVABILITY),
+        M::up(M3_ARBITER),
+    ])
 }
 
 /// The column list every `swarm_runs` read shares — kept as one constant so the three readers
@@ -517,6 +538,64 @@ impl SwarmStore {
         Ok(out)
     }
 
+    /// The **D5 sunset audit** (decisions D5; refactor §9): the active-intent runs that still
+    /// need the retired v1 driver, judged from the D0 observability columns — never an
+    /// inference. Scoped to **local desired-run state** (`desired_state = 'joined'`): local
+    /// durable state cannot witness the whole world; the registry half of D5's criterion (a) and
+    /// criterion (b) (registries stop accepting v1 genesis) are registry-side facts.
+    ///
+    /// A run needs the v1 driver iff its **module** is v1: `selected_driver = 'v1'`, or
+    /// `module_abi_major = 1`, or — conservatively — a run whose module major was never recorded
+    /// under a schema-major-1 envelope (a pre-observability v1-era row). A schema-major-1
+    /// envelope with a **major-2 module** is mixed-fleet cell 5 — interim-supported, NOT flagged.
+    pub fn v1_sunset_audit(&self) -> Result<Vec<PersistedRun>, StoreError> {
+        self.query_runs(&format!(
+            "SELECT {RUN_COLUMNS} FROM swarm_runs WHERE desired_state = 'joined' AND (\
+                 selected_driver = 'v1' \
+                 OR module_abi_major = 1 \
+                 OR (module_abi_major IS NULL AND envelope_schema_major = 1)\
+             ) ORDER BY run_id"
+        ))
+    }
+
+    /// Mint the next **role-instance incarnation id** — never-reused, node-durable, monotonic
+    /// (ABI §8.1; decisions D1). The first minted id is `1` (`0` is the pre-multi-instance
+    /// default in existing rows). Atomic: the increment and the read are one SQL statement.
+    pub fn mint_incarnation(&self) -> Result<u64, StoreError> {
+        let conn = self.lock();
+        let value: i64 = conn.query_row(
+            "UPDATE swarm_counters SET value = value + 1 WHERE name = 'incarnation' \
+             RETURNING value",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(value as u64)
+    }
+
+    /// Set the owner's preemption priority for a run (decisions D6 point 4: node-side owner
+    /// state — the envelope can never set or influence its own priority). Idempotent upsert.
+    pub fn set_run_priority(&self, run_id: &str, priority: u8) -> Result<(), StoreError> {
+        self.lock().execute(
+            "INSERT INTO swarm_owner_priority (run_id, priority) VALUES (?1, ?2)
+             ON CONFLICT(run_id) DO UPDATE SET priority = excluded.priority",
+            params![run_id, i64::from(priority)],
+        )?;
+        Ok(())
+    }
+
+    /// The owner's preemption priority for a run (default `100` when unset).
+    pub fn run_priority(&self, run_id: &str) -> Result<u8, StoreError> {
+        let conn = self.lock();
+        let p: Option<i64> = conn
+            .query_row(
+                "SELECT priority FROM swarm_owner_priority WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(p.map_or(100, |v| u8::try_from(v).unwrap_or(u8::MAX)))
+    }
+
     /// The number of events retained for a run (test/observability helper).
     pub fn event_count(&self, run_id: &str) -> Result<usize, StoreError> {
         let conn = self.lock();
@@ -660,6 +739,88 @@ mod tests {
             store.backfill_run_id("run-A", &other),
             Err(StoreError::IdentityMismatch { .. })
         ));
+    }
+
+    /// M3: the incarnation counter is durable, monotonic, and never reuses a value (mints
+    /// survive across store re-opens on one db); owner priority round-trips with the 100
+    /// default (decisions D6/D1).
+    #[test]
+    fn m3_incarnation_counter_and_owner_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swarm.db");
+
+        let store = SwarmStore::open(&path).unwrap();
+        assert_eq!(store.mint_incarnation().unwrap(), 1);
+        assert_eq!(store.mint_incarnation().unwrap(), 2);
+        drop(store);
+        // A re-open (node restart) continues the durable counter — never reuses an id.
+        let store = SwarmStore::open(&path).unwrap();
+        assert_eq!(store.mint_incarnation().unwrap(), 3);
+
+        assert_eq!(store.run_priority("run-X").unwrap(), 100, "default");
+        store.set_run_priority("run-X", 7).unwrap();
+        assert_eq!(store.run_priority("run-X").unwrap(), 7);
+    }
+
+    /// THE sunset gate's observability assert (E3 brief; decisions D5): the D0 fields
+    /// (`envelope_schema_major` / `module_abi_major` / `selected_driver` / `module_hash`) are
+    /// present in `swarm.db` and the "no live v1 runs" audit is a QUERY over them — a v1-module
+    /// run and a pre-observability v1-era row are flagged; a cell-5 run (v1 envelope, major-2
+    /// module), a v2-genesis run, and a LEFT v1 run are not.
+    #[test]
+    fn v1_sunset_audit_is_a_query_over_the_d0_observability_fields() {
+        let store = SwarmStore::open_in_memory().unwrap();
+        let put = |id: &str| {
+            store
+                .put_join_intent(id, "c", &v1_policy(), None, &SwarmEligibility::default())
+                .unwrap();
+        };
+        // A v1-module run (the thing the sunset drains).
+        put("v1-module");
+        store
+            .set_observability("v1-module", 1, Some(1), Some("v1"), None)
+            .unwrap();
+        // A pre-observability v1-era row: schema-major-1, module major never recorded.
+        put("v1-era-unknown");
+        store
+            .set_observability("v1-era-unknown", 1, None, None, None)
+            .unwrap();
+        // Cell 5: a major-2 module under a v1 envelope — interim-supported, NOT flagged.
+        put("cell5");
+        store
+            .set_observability("cell5", 1, Some(2), Some("v2"), Some(&[0x55; 32]))
+            .unwrap();
+        // A v2-genesis run.
+        put("v2-genesis");
+        store
+            .set_observability("v2-genesis", 2, Some(2), Some("v2"), Some(&[0x66; 32]))
+            .unwrap();
+        // A v1 run that already LEFT (desired_state != joined): outside "live" scope.
+        put("v1-left");
+        store
+            .set_observability("v1-left", 1, Some(1), Some("v1"), None)
+            .unwrap();
+        store
+            .set_desired_state("v1-left", DesiredState::Left)
+            .unwrap();
+
+        let flagged: Vec<String> = store
+            .v1_sunset_audit()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(flagged, ["v1-era-unknown", "v1-module"]);
+
+        // Draining the flagged intents empties the audit — the D5 "no live v1 runs" half (a),
+        // scoped to local desired-run state.
+        store
+            .set_desired_state("v1-module", DesiredState::Left)
+            .unwrap();
+        store
+            .set_desired_state("v1-era-unknown", DesiredState::Left)
+            .unwrap();
+        assert!(store.v1_sunset_audit().unwrap().is_empty());
     }
 
     /// The v2 execution-identity + observability writers populate the D0 columns for the sunset

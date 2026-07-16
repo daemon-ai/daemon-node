@@ -130,8 +130,11 @@ pub struct Trap {
     pub code: TrapCode,
     /// The import that raised it (`""` for lifecycle/host-origin traps).
     pub import: &'static str,
-    /// The entry point in flight when it raised (`None` outside an entry point).
-    pub entry_point: Option<crate::phase::Phase>,
+    /// The guest entry point in flight when it raised (`None` outside one). Since the Phase-E v1
+    /// sunset retired the five-phase lifecycle (and its `Phase` enum with the phase-legality
+    /// table, decisions D5), this is the entry's export name (e.g. `"da_init"`); v2 traps carry
+    /// `None` — the slice context rides `detail`.
+    pub entry_point: Option<&'static str>,
     /// A human-readable detail.
     pub detail: String,
 }
@@ -142,7 +145,7 @@ impl Trap {
     pub fn new(
         code: TrapCode,
         import: &'static str,
-        entry_point: Option<crate::phase::Phase>,
+        entry_point: Option<&'static str>,
         detail: impl Into<String>,
     ) -> Self {
         Self {
@@ -167,7 +170,7 @@ impl fmt::Display for Trap {
             write!(f, " in {}", self.import)?;
         }
         if let Some(p) = self.entry_point {
-            write!(f, " ({})", p.entry_name())?;
+            write!(f, " ({p})")?;
         }
         if !self.detail.is_empty() {
             write!(f, ": {}", self.detail)?;
@@ -226,12 +229,12 @@ mod tests {
         let t = Trap::new(
             TrapCode::LaneMismatch,
             "matmul@1",
-            Some(crate::phase::Phase::Step),
+            Some("da_init"),
             "det handle in a native op",
         );
         let s = t.to_string();
         assert!(s.contains("LaneMismatch"));
         assert!(s.contains("matmul@1"));
-        assert!(s.contains("da_step"));
+        assert!(s.contains("da_init"));
     }
 }

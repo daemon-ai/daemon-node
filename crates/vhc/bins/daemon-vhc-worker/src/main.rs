@@ -4,7 +4,7 @@
 // The worker reads its module path from an env var and the module bytes from disk (developer /
 // node-controlled inputs, mirroring `fake-train-worker`); the fs/env hardening bans target the
 // shipped node process, not this isolated worker binary. Allowed file-wide (crate-level, so the
-// `transport`/`backend` submodules inherit it too).
+// `backend`/`v2_session` submodules inherit it too).
 #![allow(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
@@ -12,55 +12,28 @@
 //!
 //! Speaks [`daemon_vhc_session::protocol`] `Command`/`Event` frames over the length-framed
 //! [`daemon_provision::CutChannel`] stdio cut (exactly like `fake-train-worker`, and consumed by
-//! `daemon-vhc-supervisor::TrainSupervisor`), but drives the real [`daemon_vhc_host::WasmBackend`] host
-//! runtime instead of a script:
+//! `daemon-vhc-supervisor::TrainSupervisor`), driving the real `daemon-vhc-host` runtime:
 //!
-//! - `Probe` → a real host capability report (`tabi@1`, all 66 host ops; GPU absent = CPU-only).
-//! - `AssessRun{envelope}` → the peer-side re-validation (spec §6.5). The `envelope` bytes are the
-//!   canonical [`daemon_vhc_proto::SignedEnvelope`] wire form of the run's `FrozenEnvelope`: the
-//!   worker **verifies** it, extracts the `[experiment.config]`, and **resolves the module** from the
-//!   envelope's artifact map via [`daemon_vhc_net::ArtifactResolver`] (`file://`, blake3-verified).
-//!   `DAEMON_TRAIN_MODULE`, if set, overrides the artifact resolution (dev / node-controlled). It then
-//!   runs the static import scan vs the host vocabulary + a host meta-mode pass → `Assessed`, caching
-//!   the config + module bytes for the subsequent `JoinRun`. **A raw-config-CBOR envelope (no
-//!   signature wrapper) is REFUSED — the unsigned legacy path was retired at D0 with the typed
-//!   `UnsignedEnvelopeRetired` refusal** (refactor §8/D0); `DAEMON_TRAIN_MODULE` survives as the
-//!   module-source override inside the signed path only.
-//! - `JoinRun` → construct a `WasmBackend`, emit `RunPhase{train}`, self-drive one round
-//!   (train × H → make_update → ingest) and stream `Metric`/`RoundOutcome`.
-//! - `Throttle{paused}` → `WasmBackend::pause`/`resume` (preemption-as-churn, §10.5).
+//! - `Probe` → a real host capability report (the frozen 66-op vocabulary; GPU absent = CPU-only).
+//! - `AssessRun{envelope}` → the peer-side re-validation (spec §6.5): verify the canonical
+//!   [`daemon_vhc_proto::SignedEnvelope`], resolve the module from the artifact map
+//!   (blake3-verified; `DAEMON_TRAIN_MODULE` overrides the source inside the signed path), then
+//!   the ABI §1.3 driver selection + the A2 claim()-admission funnel → `Assessed`. **A raw
+//!   config-CBOR envelope is refused typed (`UnsignedEnvelopeRetired`, D0), and a major-1 module
+//!   is refused typed (`AbiUnsupportedMajor`)** — the Phase-E v1 sunset removed the five-phase
+//!   driver, its autotune admission, and the self-driven v1 round together (decisions D5); the
+//!   flipped A0 fixture pins the refusal.
+//! - `JoinRun` → the v2 session run (`v2_session::join_and_run_v2`): the event pump over the
+//!   in-process native coordinator (mixed-fleet cell 5 — a v2 module under a v1 envelope).
 //! - `Leave`/`Shutdown`/`Ping` → as the protocol requires.
 //!
 //! A trapping module surfaces as `Event::Error{class: Module, …}` — the worker is never harmed.
-//!
-//! ## Module layout (Wave-0 scaffold split — see swarm-p1-ledger.md)
-//!
-//! This binary is split into two sides so the Wave-3 A/B lanes do not collide on one file:
-//! - [`backend`] — the `WasmBackend` construction / assess / probe side (**G2** owns it).
-//! - [`transport`] — the `JoinRun` / coordinator-attach side; today the self-driven round loop,
-//!   which **B3** replaces with a live coordinator connection (`JoinRun.coordinator`) in Wave 3.
-//!
-//! `main` is the thin command dispatch loop plus the shared `send`/`worker_error` helpers and the
-//! representative micro-batch shape ([`SEQS`]/[`SEQ`]) both sides use.
 
 mod backend;
-/// The A3 live coordinator attach (RoundEngine over DualPlane + R2/Fs store). Behind the
-/// `swarm-net` feature so the default worker build never links the WS/TLS/iroh/QUIC tree.
-#[cfg(feature = "swarm-net")]
-mod live;
-mod transport;
 mod v2_session;
 
 use daemon_provision::{CutChannel, CutWriter};
 use daemon_vhc_session::protocol::{self, Command, ErrorClass, Event};
-use daemon_vhc_session::WasmBackend;
-
-/// A representative meta/self-drive micro-batch shape (sequences × tokens-per-sequence). All-zero
-/// token ids are valid for any vocabulary (id 0 always exists), so the worker stays experiment
-/// agnostic (it drives `da_*`, it does not know the model's vocab). Shared by `backend`'s meta pass
-/// and `transport`'s self-driven round.
-pub(crate) const SEQS: u32 = 2;
-pub(crate) const SEQ: u32 = 8;
 
 #[tokio::main]
 async fn main() {
@@ -113,21 +86,11 @@ async fn main() {
     )
     .await;
 
-    // Cached across commands: the assessed run (config + module bytes) + the live joined backend +
-    // the micro-batch the last `AssessRun` autotune chose (G2's `Eligibility.headroom["micro_batch"]`),
-    // threaded into `JoinRun` so the worker consumes the verdict in-process (B3 lifecycle glue).
+    // Cached across commands: the assessed run (config + module bytes). Post-sunset every
+    // eligible assessment selected the major-2 driver; `run_is_v2` records it so a JoinRun after
+    // an ineligible/refused assess fails loud instead of guessing.
     let mut run: Option<backend::ResolvedRun> = None;
-    // Whether the assessed run selected the major-2 event-loop driver: its assess path is the A2
-    // claim funnel, but the v2 JOIN wiring (session pump attach) is not in this worker yet — a v2
-    // JoinRun is refused loud rather than falling into the v1 self-drive (which would surface a
-    // misleading AbiMismatch from the five-phase driver).
     let mut run_is_v2 = false;
-    let mut live_backend: Option<WasmBackend> = None;
-    // The A3 live coordinator attach handle (feature `swarm-net`): a running RoundEngine + event
-    // pump, stopped on Leave/Shutdown. `None` on the self-driven (WS-only / no-credentials) path.
-    #[cfg(feature = "swarm-net")]
-    let mut live_run: Option<live::LiveHandle> = None;
-    let mut assessed_micro_batch: u32 = SEQS;
 
     while let Some(bytes) = reader.recv().await {
         let cmd: Command = match protocol::decode(&bytes) {
@@ -149,13 +112,6 @@ async fn main() {
                 ) {
                     Ok((elig, is_v2)) => {
                         run_is_v2 = is_v2;
-                        // Consume the autotune micro-batch (G2 rides it in `headroom["micro_batch"]`)
-                        // so `JoinRun` drives / OOM-probes from the node-computed verdict (§10.5).
-                        if let Some((_, mb)) =
-                            elig.headroom.iter().find(|(k, _)| k == "micro_batch")
-                        {
-                            assessed_micro_batch = (*mb).max(1) as u32;
-                        }
                         run = Some(resolved);
                         send(&writer, &Event::Assessed(elig)).await;
                     }
@@ -163,12 +119,7 @@ async fn main() {
                 },
                 Err(detail) => send(&writer, &worker_error(&detail)).await,
             },
-            Command::JoinRun {
-                run_id,
-                coordinator,
-                credentials,
-                ..
-            } => {
+            Command::JoinRun { run_id, .. } => {
                 let Some(resolved) = run.as_ref() else {
                     send(
                         &writer,
@@ -177,147 +128,76 @@ async fn main() {
                     .await;
                     continue;
                 };
-                if run_is_v2 {
-                    // The v2 join (A2 close-out): the session event-pump attach, driven by the
-                    // in-process native coordinator over the run's frozen v1 envelope (cell 5).
-                    // The genesis (envelope-v2) form's in-process drive — the transitional
-                    // cell-6 native-coordinator adapter — was RETIRED at D2 (decisions D3
-                    // cell 6): a genesis run is coordinated by its wasm coordinator module
-                    // (mixed-fleet cell 8), refused typed here. A raw-config AssessRun has no
-                    // envelope at all — refused loud.
-                    if resolved.genesis.is_some() {
-                        send(
-                            &writer,
-                            &worker_error(
-                                "cell 6 retired at D2: a genesis (envelope-v2) run is \
-                                 coordinated by its wasm coordinator module (mixed-fleet \
-                                 cell 8) — the transitional native-coordinator adapter no \
-                                 longer exists; the in-process self-driven join serves the \
-                                 v1 envelope form (cell 5) only",
-                            ),
-                        )
-                        .await;
-                        continue;
-                    }
-                    let Some(envelope) = resolved.envelope.as_ref() else {
-                        send(
-                            &writer,
-                            &worker_error(
-                                "JoinRun for a major-2 module without a signed run envelope: \
-                                 the v2 session needs the envelope (the coordinator-config \
-                                 source); author a SignedEnvelope AssessRun instead of raw \
-                                 config bytes",
-                            ),
-                        )
-                        .await;
-                        continue;
-                    };
-                    match v2_session::join_and_run_v2(
-                        &resolved.module,
-                        &resolved.config,
-                        envelope,
-                        &run_id,
-                        &writer,
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(detail) => send(&writer, &worker_error(&detail)).await,
-                    }
-                    continue;
-                }
-                // A3 live attach (feature `swarm-net`): if the node authored a `JoinCredentials`
-                // body, run the real RoundEngine over the live plane; otherwise fall back to the
-                // self-driven representative round (the T0 baseline, also the default-gate path).
-                #[cfg(feature = "swarm-net")]
-                if let Ok(creds) =
-                    daemon_vhc_session::protocol::JoinCredentials::from_bytes(&credentials)
-                {
-                    match live::join_and_run_live(
-                        &resolved.module,
-                        &resolved.config,
-                        &run_id,
-                        &coordinator,
-                        &creds,
-                        assessed_micro_batch,
-                        &writer,
-                    )
-                    .await
-                    {
-                        Ok(handle) => {
-                            if let Some(old) = live_run.take() {
-                                old.stop().await;
-                            }
-                            live_run = Some(handle);
-                        }
-                        Err(detail) => send(&writer, &worker_error(&detail)).await,
-                    }
-                    continue;
-                }
-                // A `swarm-net`-less build handed real live-attach credentials must fail LOUD:
-                // silently self-driving here starves the coordinator's min_peers barrier with no
-                // client-visible error (Merge-3 ceremony: a drifted RunPod artifact built without
-                // `swarm-net` stalled the WAN run this exact way — the Join was never dialed).
-                #[cfg(not(feature = "swarm-net"))]
-                if daemon_vhc_session::protocol::JoinCredentials::from_bytes(&credentials).is_ok() {
+                if !run_is_v2 {
+                    // Unreachable for an eligible assess post-sunset (every admitted module is
+                    // major 2); a caller that joins past a refused assess fails loud + typed.
                     send(
                         &writer,
                         &worker_error(
-                            "JoinRun carried live JoinCredentials but this worker was built \
-                             without the `swarm-net` feature — it cannot attach to a live \
-                             coordinator; rebuild with `--features swarm-net`",
+                            "JoinRun for a run whose assess did not select the major-2 driver: \
+                             the v1 five-phase driver retired at the Phase-E sunset \
+                             (AbiUnsupportedMajor; decisions D5) — author a major-2 module",
                         ),
                     )
                     .await;
                     continue;
                 }
-                // Self-driven fallback (feature off, or no live credentials authored).
-                let _ = &coordinator;
-                let _ = &credentials;
-                match transport::join_and_run_round(
+                // The v2 session run. The genesis (envelope-v2) in-process drive — the
+                // transitional cell-6 native-coordinator adapter — was RETIRED at D2
+                // (decisions D3 cell 6): a genesis run is coordinated by its wasm coordinator
+                // module (mixed-fleet cell 8), refused typed here. A raw-config AssessRun has
+                // no envelope at all — refused loud.
+                if resolved.genesis.is_some() {
+                    send(
+                        &writer,
+                        &worker_error(
+                            "cell 6 retired at D2: a genesis (envelope-v2) run is \
+                             coordinated by its wasm coordinator module (mixed-fleet \
+                             cell 8) — the transitional native-coordinator adapter no \
+                             longer exists; the in-process self-driven join serves the \
+                             v1 envelope form (cell 5) only",
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                let Some(envelope) = resolved.envelope.as_ref() else {
+                    send(
+                        &writer,
+                        &worker_error(
+                            "JoinRun for a major-2 module without a signed run envelope: \
+                             the v2 session needs the envelope (the coordinator-config \
+                             source); author a SignedEnvelope AssessRun instead of raw \
+                             config bytes",
+                        ),
+                    )
+                    .await;
+                    continue;
+                };
+                match v2_session::join_and_run_v2(
                     &resolved.module,
                     &resolved.config,
+                    envelope,
                     &run_id,
-                    assessed_micro_batch,
                     &writer,
                 )
                 .await
                 {
-                    Ok(b) => live_backend = Some(b),
+                    Ok(()) => {}
                     Err(detail) => send(&writer, &worker_error(&detail)).await,
                 }
             }
-            Command::Throttle { paused, .. } => {
-                // The self-driven backend supports in-place pause/resume; the live-attach engine
-                // owns its backend exclusively, so a live pause is preemption-as-churn — stop the
-                // run (releasing the wasm instance, §10.5) and let the node re-issue JoinRun (durable
-                // intent, §10.3) to resume.
-                #[cfg(feature = "swarm-net")]
-                if paused {
-                    if let Some(handle) = live_run.take() {
-                        handle.stop().await;
-                    }
-                }
-                if let Some(b) = live_backend.as_mut() {
-                    let r = if paused { b.pause() } else { b.resume() };
-                    if let Err(e) = r {
-                        send(&writer, &worker_error(&e.to_string())).await;
-                    }
-                }
+            Command::Throttle { .. } => {
+                // The v2 session owns its sandbox exclusively; a live pause is
+                // preemption-as-churn at the node (stop + re-issue JoinRun on the durable
+                // intent, §10.3/§10.5). Nothing to do in-process here.
             }
             Command::Leave { .. } => {
-                live_backend = None;
-                #[cfg(feature = "swarm-net")]
-                if let Some(handle) = live_run.take() {
-                    handle.stop().await;
-                }
+                // The v2 session run drives itself to completion within JoinRun; the durable
+                // intent lives at the node. Nothing held here to tear down.
             }
             Command::Ping => send(&writer, &Event::Pong).await,
             Command::Shutdown => {
-                #[cfg(feature = "swarm-net")]
-                if let Some(handle) = live_run.take() {
-                    handle.stop().await;
-                }
                 break;
             }
         }
@@ -332,7 +212,7 @@ pub(crate) fn worker_error(detail: &str) -> Event {
     }
 }
 
-/// Encode and send an [`Event`] over the stdio cut (shared by `main` and `transport`).
+/// Encode and send an [`Event`] over the stdio cut (shared by `main` and `v2_session`).
 pub(crate) async fn send(writer: &CutWriter, event: &Event) {
     match protocol::encode(event) {
         Ok(bytes) => {

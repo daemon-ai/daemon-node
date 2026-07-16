@@ -42,6 +42,8 @@ pub enum MessageKind {
     Join,
     /// [`SwarmMessage::Heartbeat`].
     Heartbeat,
+    /// [`SwarmMessage::CheckpointAttestation`] (Phase E cold join).
+    CheckpointAttestation,
 }
 
 impl MessageKind {
@@ -58,6 +60,7 @@ impl MessageKind {
             SwarmMessage::Straggle(_) => Self::Straggle,
             SwarmMessage::Join(_) => Self::Join,
             SwarmMessage::Heartbeat(_) => Self::Heartbeat,
+            SwarmMessage::CheckpointAttestation(_) => Self::CheckpointAttestation,
         }
     }
 }
@@ -74,6 +77,7 @@ pub fn round_of(m: &SwarmMessage) -> Option<u64> {
         SwarmMessage::Digest(x) => Some(x.round),
         SwarmMessage::Straggle(x) => Some(x.round),
         SwarmMessage::Heartbeat(x) => Some(x.round),
+        SwarmMessage::CheckpointAttestation(x) => Some(x.round),
         SwarmMessage::Join(_) => None,
     }
 }

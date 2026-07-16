@@ -50,6 +50,10 @@ daemon-vhc-observe = { workspace = true }
 # admit_v2 re-admission, start_run_migrating). host/* -> host/* (architecture §7: TESTKIT → SESS),
 # test-only.
 daemon-vhc-session = { workspace = true }
+# The Phase-E colocation-under-arbitration acceptance (refactor §9; decisions D6): the node's
+# OwnerArbiter admits the trainer + verifier role-instances the tier-2 lane colocates.
+# host/* -> host/* (allowed), test-only.
+daemon-vhc-node = { workspace = true }
 
 [lints]
 workspace = true

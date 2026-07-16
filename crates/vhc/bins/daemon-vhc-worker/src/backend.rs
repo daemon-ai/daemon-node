@@ -7,16 +7,12 @@
 //! meta-mode eligibility pass. **G2** (Wave 2) evolves this file: real GPU `Hardware` numbers, VRAM
 //! autotune / OOM probe, and the burn-wgpu backend behind `WasmBackend::assess`.
 
-use std::collections::BTreeSet;
-
-use daemon_vhc_host::autotune::{Autotune, DeviceLimits, DEFAULT_MAX_MICROBATCH};
-use daemon_vhc_host::phase::PHASE_TABLE;
+use daemon_vhc_abi::TABI_IMPORTS;
+use daemon_vhc_host::probe::DeviceLimits;
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_net::{ArtifactRef, ArtifactResolver};
 use daemon_vhc_proto::{from_canonical_slice, SignedEnvelope};
 use daemon_vhc_session::protocol::{Eligibility, Hardware, WorkerCapabilities};
-
-use crate::SEQ;
 
 /// A large sentinel (in MiB) used when a resource dimension is unknown, so the autotune verdict does
 /// not spuriously reject on an unprobed number (`u64::MAX / MiB`).
@@ -520,14 +516,19 @@ pub(crate) fn engine_config_from_env() -> daemon_vhc_host::EngineConfig {
     }
 }
 
-/// The host `tabi@1` vocabulary (name-for-name with the phase table / SDK `TABI_IMPORTS`, all 66).
+/// The host `tabi@1` vocabulary — the frozen 66-import list from the dual-compiled contract
+/// crate (post-sunset the phase table is gone; the vocabulary itself is the historical record +
+/// the live §2.5 bridge surface).
 fn host_ops() -> Vec<String> {
-    PHASE_TABLE.iter().map(|(n, _)| (*n).to_string()).collect()
+    TABI_IMPORTS.iter().map(|n| (*n).to_string()).collect()
 }
 
 pub(crate) fn host_capabilities() -> WorkerCapabilities {
     WorkerCapabilities {
-        abi_version: daemon_vhc_host::TENSOR_ABI_MAJOR as u16,
+        // The implemented ABI major (ABI §1.6): 2 since the Phase-E sunset removed the v1
+        // driver. The advertised `ops` stay the frozen 66-import tabi@1 vocabulary — the live
+        // §2.5 bridge surface under major 2.
+        abi_version: daemon_vhc_abi::DA_ABI_MAJOR_V2 as u16,
         ops: host_ops(),
         payload_stores: Vec::new(),
     }
@@ -768,23 +769,22 @@ pub(crate) fn device_limits() -> DeviceLimits {
     }
 }
 
-/// The peer-side re-validation, A0 dual-dispatch shape (ABI Draft 3 §1.3; decisions D2):
+/// The peer-side re-validation (ABI Draft 3 §1.3; decisions D2/D5):
 ///
 /// 1. **Driver selection first** — [`daemon_vhc_host::select_driver`] runs the normative order
 ///    (hash-verify before compile → static-import inspection → candidate linker → instantiate →
 ///    `da_abi` cross-check). Any failure is a **typed admission refusal** returned as an
 ///    ineligible [`Eligibility`] carrying the split `refusal_code` slug — an `Assessed` outcome,
-///    never an `Event::Error` (ABI §1.5).
-/// 2. A module selecting the **v1 driver** proceeds down the byte-for-byte unchanged v1 assess:
-///    the static import scan vs the host `tabi@1` vocabulary, then the host meta-mode pass +
-///    autotune verdict.
-/// 3. A module selecting the **v2 driver** runs the A2 claim()-admission funnel ([`assess_v2`]):
+///    never an `Event::Error` (ABI §1.5). **Since the Phase-E v1 sunset a v1 module lands here
+///    with `AbiUnsupportedMajor`** — the retained-v1 assess (import scan → meta pass → autotune
+///    verdict) retired with the driver in the same step (decisions D5).
+/// 2. A module selecting the **v2 driver** runs the A2 claim()-admission funnel ([`assess_v2`]):
 ///    lane floor, restricted-instance `da_manifest`/`da_claim`, lane claim bounds, owner
 ///    authorization — the ABI §9.3 owner-bracketed order.
 ///
-/// Returns the eligibility verdict plus whether the module selected the **major-2** driver (the
-/// `JoinRun` dispatch needs it: the v2 run path — session pump attach — is not wired in this
-/// worker yet, so a v2 join is refused loud instead of falling into the v1 self-drive).
+/// Returns the eligibility verdict plus whether the module selected the **major-2** driver
+/// (post-sunset: `true` on every eligible verdict; the flag stays so the `JoinRun` dispatch shape
+/// is unchanged on the wire side).
 pub(crate) fn assess(
     module: &[u8],
     config: &[u8],
@@ -792,9 +792,8 @@ pub(crate) fn assess(
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
     envelope_grants: Option<&daemon_vhc_host::v2::EnvelopeRoleGrants>,
 ) -> Result<(Eligibility, bool), String> {
-    // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (the meta pass over a real-scale
-    // param layout exceeds the tiny-model defaults). The meta pass itself stays on the CPU-cheap
-    // path (footprint estimation, backend-independent).
+    // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (real-scale param layouts exceed
+    // the tiny-model defaults). Assessment itself stays on the CPU-cheap path.
     let engine = if std::env::var_os("DAEMON_TRAIN_BACKEND").is_some() {
         EngineConfig {
             backend: daemon_vhc_host::BackendKind::Cpu,
@@ -807,14 +806,11 @@ pub(crate) fn assess(
 
     // ABI §1.3 steps 1–6: hash-verify → compile+inspect → candidate → instantiate → cross-check.
     match daemon_vhc_host::select_driver(&worker, module, module_blake3) {
-        Ok(sel) if sel.driver == daemon_vhc_abi::CandidateDriver::V1 => {
-            // Fall through to the retained v1 assess below — unchanged behavior.
-        }
         Ok(_sel) => {
             // The major-2 path: the claim()-based admission funnel (ABI §9.3, A2). Selection
             // re-runs inside admit_v2 (§9.4 step 1–3 order is normative); the arms below map the
             // funnel outcome onto the typed `Assessed` surface.
-            return Ok((
+            Ok((
                 assess_v2(
                     &worker,
                     module,
@@ -824,92 +820,18 @@ pub(crate) fn assess(
                     envelope_grants,
                 ),
                 true,
-            ));
+            ))
         }
-        Err(refusal) => {
-            return Ok((
-                Eligibility {
-                    eligible: false,
-                    reasons: vec![refusal.to_string()],
-                    headroom: Vec::new(),
-                    refusal_code: Some(refusal.code.slug().to_string()),
-                },
-                false,
-            ));
-        }
-    }
-
-    let vocabulary: BTreeSet<String> = host_ops().into_iter().collect();
-    let imports = worker
-        .module_imports(module)
-        .map_err(|e| format!("module import scan: {e}"))?;
-    let missing: Vec<String> = imports
-        .iter()
-        .filter(|name| !vocabulary.contains(name.as_str()))
-        .cloned()
-        .collect();
-
-    if !missing.is_empty() {
-        return Ok((
+        Err(refusal) => Ok((
             Eligibility {
                 eligible: false,
-                reasons: vec![format!(
-                    "module imports ops outside host tabi@1: {}",
-                    missing.join(", ")
-                )],
+                reasons: vec![refusal.to_string()],
                 headroom: Vec::new(),
-                refusal_code: None,
+                refusal_code: Some(refusal.code.slug().to_string()),
             },
             false,
-        ));
+        )),
     }
-
-    let loaded = worker
-        .load_module(module)
-        .map_err(|e| format!("load module: {e}"))?;
-    let mut inst = worker
-        .instantiate(&loaded)
-        .map_err(|e| format!("instantiate: {e}"))?;
-    let report = inst
-        .meta(config, 1, SEQ)
-        .map_err(|e| format!("meta: {e}"))?;
-
-    // G2 VRAM autotune (§5.1 planning, ABI §8): the meta-report footprint vs the probed device
-    // budget → eligibility + chosen micro-batch. The MetaReport byte footprints are
-    // backend-independent (shapes/dtypes), so the CPU meta pass is authoritative for the estimates;
-    // the verdict compares them against the real device numbers from `device_limits`.
-    let autotune = Autotune::from_meta(&report);
-    let verdict = autotune.verdict(&device_limits(), DEFAULT_MAX_MICROBATCH);
-
-    let mib = 1i64 << 20;
-    let mut reasons = vec![format!(
-        "tabi@1 satisfied ({} imports); meta pass ok",
-        imports.len()
-    )];
-    reasons.extend(verdict.reasons.iter().cloned());
-
-    Ok((
-        Eligibility {
-            eligible: verdict.eligible,
-            reasons,
-            refusal_code: None,
-            headroom: vec![
-                ("micro_batch".to_string(), i64::from(verdict.micro_batch)),
-                ("vram_mb".to_string(), verdict.vram_mb_estimate as i64),
-                ("ram_mb".to_string(), verdict.ram_mb_estimate as i64),
-                (
-                    "payload_bytes".to_string(),
-                    verdict.payload_bytes_estimate as i64,
-                ),
-                (
-                    "host_ram_mb".to_string(),
-                    (report.host_ram_bytes_est as i64) / mib,
-                ),
-                ("param_bytes".to_string(), report.param_bytes as i64),
-            ],
-        },
-        false,
-    ))
 }
 
 /// The owner's node-side lane configuration seam (§9.6: "numbers are deployment config").

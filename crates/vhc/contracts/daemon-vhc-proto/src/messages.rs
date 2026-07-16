@@ -208,6 +208,37 @@ pub struct Join {
     pub envelope_hash: Option<Hash>,
 }
 
+/// `CheckpointAttestation` — a peer's signed two-tier checkpoint attestation (architecture §5.3;
+/// Phase E cold join). The wire mirror of the E1 attestation vocabulary
+/// (`daemon-vhc-sdk-consensus::attestation::SignedAttestation`): `sig` is the **inner**,
+/// domain-separated (`daemon-vhc/checkpoint-attestation/v1`) ed25519 signature by `signer` over
+/// the attestation body — self-authenticating independent of the outer [`SignedMessage`] wrapper
+/// (which authenticates the *relayer*; a coordinator may re-broadcast another peer's
+/// attestation verbatim). The coordinator records verified attestations into its consensus-state
+/// ledger, deduped by `(checkpoint, tier, signer)`; K-digest join gating and restore preference
+/// are policy over that ledger (the E3 cold-join flow). This crate carries the vocabulary only —
+/// verification lives with the attestation types (proto is wire mechanism).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointAttestation {
+    /// The claim tier's permanent wire tag: `0` = digest (consistency with consensus state),
+    /// `1` = restore (recoverability — the signer loaded the full manifest and it verified).
+    pub tier: u64,
+    /// The run identity the checkpoint belongs to.
+    pub run_id: Hash,
+    /// The epoch the checkpoint captures.
+    pub epoch: u64,
+    /// The round the checkpoint captures.
+    pub round: u64,
+    /// The attested checkpoint's content hash (the typed manifest's blake3).
+    pub checkpoint: Hash,
+    /// The consensus-state digest the checkpoint reproduces.
+    pub digest: StateDigest,
+    /// The attesting peer (ed25519 public key) — bound in the signed body.
+    pub signer: PeerId,
+    /// The inner domain-separated signature by `signer` (see the struct doc).
+    pub sig: Signature,
+}
+
 /// `Heartbeat` — a peer's liveness ping (WS, ~15 s; §6.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Heartbeat {
@@ -242,6 +273,9 @@ pub enum SwarmMessage {
     Join(Join),
     /// Peer liveness ping.
     Heartbeat(Heartbeat),
+    /// Peer attests a typed checkpoint (Phase E cold join; appended additively — existing
+    /// variants' wire encodings are untouched).
+    CheckpointAttestation(CheckpointAttestation),
 }
 
 /// The signed preimage: the exact bytes an ed25519 signature covers.

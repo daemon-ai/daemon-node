@@ -371,11 +371,12 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-net"],
         ),
         (
-            // The A0 frozen v1 compatibility fixture (refactor §5 A0; decisions D3 cell 1): the
-            // pinned pre-refactor tiny-llama bundle replays bit-exact under the v1 driver. Named
-            // explicitly (also covered by the crate suite below) so the standing regression is a
-            // visible tier-1 lane of its own.
-            "A0 frozen v1 fixture replay (pre-refactor tiny-llama digest parity)",
+            // The A0 frozen v1 compatibility fixture — expectation FLIPPED at the Phase-E sunset
+            // (decisions D5; never deleted): the pinned pre-refactor tiny-llama bundle (every
+            // content-address still verified) now meets a clean typed AbiUnsupportedMajor
+            // admission refusal, the standing regression that v1 support is gone and gone
+            // gracefully. Named explicitly so the sunset regression is a visible tier-1 lane.
+            "A0 frozen v1 fixture (FLIPPED at sunset: typed AbiUnsupportedMajor refusal)",
             &["-p", "daemon-vhc-host", "--test", "a0_frozen_fixture"],
         ),
         (
@@ -497,7 +498,7 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_data_fetch"],
         ),
         (
-            "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
+            "daemon-vhc-host (det lane + cross-backend digests + the v2 driver suites)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),
         (
@@ -667,52 +668,56 @@ fn vhc_dep_check() -> anyhow::Result<()> {
 
     // The honest current exceptions (Phase 0): each is a transitional edge into `sdk/*` that a
     // later phase removes. Format: (dependent crate, sdk crate, why it exists / when it goes).
+    // Reviewed at the Phase-E v1 sunset (decisions D5): the exceptions whose consumers retired
+    // WITH the v1 driver were removed here in the sunset commit (`daemon-vhc-host ->
+    // daemon-vhc-sdk`: the v1 oracle/reference/160M/determinism harnesses; `daemon-swarm-e2e ->
+    // daemon-vhc-sdk`: the wasm_profiles / typed_checkpoint_bridge WasmBackend suites). The rest
+    // were re-reviewed and RETAINED with honest post-sunset notes — the RoundEngine survived the
+    // sunset as the deterministic harness / cold-join substrate (D5 names the five-phase driver,
+    // batch_tokens@1's driver surface, autotune admission, and the phase table; not the session
+    // choreography), so notes that anticipated "retires with the v1 engine at sunset" now track
+    // the engine's own re-seat onto vhc-sim instead.
     const EXCEPTIONS: &[(&str, &str, &str)] = &[
         (
             "daemon-swarm-e2e",
-            "daemon-vhc-sdk",
-            "Phase B — e2e runs production wasm blobs under host/daemon-vhc-testkit [dev-dep]",
-        ),
-        (
-            "daemon-swarm-e2e",
             "daemon-vhc-sdk-rounds",
-            "Phase E — the A2 choreography bridging oracle (relocated round logic vs the v1 \
-             engine) retires with the v1 engine at sunset [dev-dep]",
+            "post-E — the A2 choreography bridging oracle (relocated round logic vs the retained \
+             RoundEngine harness substrate); retires when the engine re-seats onto vhc-sim \
+             [dev-dep]",
         ),
         (
             "daemon-swarm-e2e",
             "daemon-vhc-sdk-v2",
-            "Phase E — the B2 corpus-windowing equivalence oracle (SDK policy vs the v1 host \
-             pipeline `session::data`) retires with the v1 pipeline at sunset [dev-dep]",
+            "post-E — the B2 corpus-windowing equivalence oracle (SDK policy vs the retained \
+             host pipeline `session::data`); retires with that pipeline [dev-dep]",
         ),
         (
             "daemon-swarm-e2e",
             "daemon-vhc-sdk-consensus",
-            "D2/E — the drills + wasm-profile oracle drive the coordinator `tick` (relocated here \
-             at D2) + observe oracle; retires with the v1 engine/harness at sunset [dev-dep]",
+            "D2/post-E — the StubBackend drills drive the coordinator `tick` (relocated here at \
+             D2) + observe oracle; retires when the drills re-seat onto vhc-sim/testkit [dev-dep]",
         ),
         (
             "daemon-vhc-safetensors",
             "daemon-vhc-sdk",
-            "Phase E — safetensors is wired into the checkpoint path (state-dict layout) [dev-dep]",
-        ),
-        (
-            "daemon-vhc-host",
-            "daemon-vhc-sdk",
-            "Phase C — model presets (TinyLlamaCfg/profiles) leave the SDK for guests/ [dev-dep]",
+            "RETAINED post-E1 — the state-dict layout oracle in the converter's tests (the \
+             checkpoint wiring itself landed at E1); retires if the oracle re-seats onto a \
+             recorded layout fixture [dev-dep]",
         ),
         (
             "daemon-vhc-host",
             "daemon-vhc-sdk-profiles",
-            "Phase E — the C3 parity harness runs the re-expressed profile natively as the \
-             lowering oracle beside the dual-compiled guest model; retires with the v1 oracle at \
-             sunset [dev-dep]",
+            "post-E — the C3 parity harness runs the re-expressed profile natively as the \
+             lowering oracle beside the dual-compiled guest model (the v1 digest side is the \
+             RECORDED v1-parity-oracle fixture since the sunset); retires when the native A/B \
+             leg re-seats onto vhc-sim [dev-dep]",
         ),
         (
             "daemon-vhc-worker",
             "daemon-vhc-sdk",
-            "Phase C — TinyLlamaCfg in the moved worker-protocol test leaves the SDK for guests/ \
-             [dev-dep] (split from daemon-vhc-host's identical exception at the A2 bin split)",
+            "post-E — TinyLlamaCfg authors the tiny-llama-v2 guest config in the worker protocol \
+             + v2-join suites (the guest itself links the SDK preset — the frozen parity pins' \
+             module); retires if the suites inline recorded config bytes [dev-dep]",
         ),
         // --- D0/D2: host/* -> sdk/daemon-vhc-sdk-consensus. The assignment math moved out of the
         // proto at D0 (proto is algorithm-free, enforced below); the pure coordinator `tick`
@@ -724,9 +729,10 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         (
             "daemon-vhc-session",
             "daemon-vhc-sdk-consensus",
-            "D2/E — the retained v1 RoundEngine's assignment consumption AND (relocated at D2) the \
-             coordinator `tick` the harness shell (local_coordinator) drives; both retire with the \
-             v1 driver at the Phase-E sunset [normal]",
+            "D2/post-E — the retained RoundEngine's assignment consumption, the coordinator \
+             `tick` the harness shell (local_coordinator) drives, and the E1/E3 checkpoint \
+             attestation vocabulary (ledger + signed attestations on the engine's typed lane); \
+             retires when the engine/harness re-seat onto vhc-sim [normal]",
         ),
         (
             "daemon-vhc-testkit",
@@ -749,9 +755,10 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         (
             "daemon-vhc-worker",
             "daemon-vhc-sdk-consensus",
-            "Phase E — the cell-5 (v1-envelope) self-driven t2 join drives the native `tick` \
-             in-process; the cell-6 (genesis) arm was RETIRED at D2 with the adapter, so this \
-             edge now retires with the v1 path at the Phase-E sunset [normal]",
+            "post-E — the cell-5 (v2 module × v1 envelope) self-driven t2 join drives the native \
+             `tick` in-process; cell 5 SURVIVED the sunset (D5 retired the v1 DRIVER, not the v1 \
+             envelope), so this edge retires when the in-process join re-seats onto the wasm \
+             coordinator (cell 8) [normal]",
         ),
     ];
 

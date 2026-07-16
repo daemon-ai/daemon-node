@@ -1,25 +1,30 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! **The A0 frozen v1 compatibility fixture replay** (refactor §5 A0; decisions D3 cell 1's
-//! tier-1 positive pin; invariant 2 "the A0 fixture stays green under the v1 driver").
+//! **The A0 frozen v1 compatibility fixture — expectation FLIPPED at the Phase-E v1 sunset**
+//! (decisions D5; refactor §9/§12.2). Historical compatibility tests are never deleted: this is
+//! the SAME content-addressed bundle A0 froze (`tests/fixtures/a0-frozen-v1/` — the immutable
+//! pre-refactor `tiny-llama` wasm bytes, the exact schema-major-1 signed envelope, the pinned
+//! corpus, the recorded transcript), kept as the **standing regression that v1 support is gone
+//! and gone gracefully**:
 //!
-//! Reloads the content-addressed bundle under `tests/fixtures/a0-frozen-v1/` — the immutable
-//! pre-refactor `tiny-llama` wasm bytes (pinned by blake3, captured from the pre-Phase-0-rename
-//! tree, never recompiled), the exact schema-major-1 signed envelope, the pinned corpus
-//! shard/window derivation, and the recorded expected transcript — and replays it through the
-//! **current tree's v1 driver** on the deterministic CPU backend. The per-round payload blake3s
-//! and post-ingest det-lane state digests must reproduce **bit-for-bit**. See the bundle's
-//! `README.md` for contents, hashes, and the documented capture command.
+//! - through the sunset the bundle replayed bit-for-bit under the v1 five-phase driver (the
+//!   "admitted and green" expectation, decisions D3 cell 1);
+//! - since the sunset removed that driver (with `batch_tokens@1`'s driver surface, the autotune
+//!   admission, and the phase-legality table, in one auditable step), the SAME pinned module now
+//!   meets a **clean, typed `AbiUnsupportedMajor` admission refusal** (ABI §1.5) at the §1.3
+//!   front door — a typed `AssessRun` outcome, never a crash, never a silent hang, and no
+//!   `da_init`/`da_run`/`da_step` guest code executes.
 //!
-//! Every later phase must keep this test green until the Phase E v1 sunset flips its expectation
-//! to a clean `AbiUnsupportedMajor` refusal (decisions D5 — the fixture is never deleted).
+//! Every content-address pin of the bundle is still verified on every run (the bundle's
+//! integrity itself remains regression-tested); only the outcome expectation flipped. The
+//! recorded transcript stays in `expected.json` as the permanent historical record of what the
+//! v1 driver produced. See the bundle's `README.md` for contents, hashes, and the (pre-sunset)
+//! capture command.
 
-use daemon_vhc_abi::CandidateDriver;
+use daemon_vhc_abi::AbiRefusalCode;
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
-use daemon_vhc_proto::{blake3_hash, from_canonical_slice, PeerId, SignedEnvelope};
-use daemon_vhc_session::backend::{BatchRef, StagedPayload, StepCtx, TrainerBackend};
-use daemon_vhc_session::{WasmBackend, WasmBackendConfig};
+use daemon_vhc_proto::{blake3_hash, from_canonical_slice, SignedEnvelope};
 
 const MODULE: &[u8] = include_bytes!("fixtures/a0-frozen-v1/tiny_llama.pre-refactor.wasm");
 const ENVELOPE_WIRE: &[u8] = include_bytes!("fixtures/a0-frozen-v1/envelope.signed.cbor");
@@ -33,36 +38,13 @@ const CORPUS_MANIFEST: &[u8] =
 const SHARD0: &[u8] =
     include_bytes!("../../daemon-vhc-session/tests/fixtures/tinystories/shard-0000.bin");
 
-/// The pinned batch-derivation rule (documented in `expected.json`/`README.md`; textually
-/// mirrors the capture crate): token `i` of batch `b` is
-/// `raw[(window_start + b*16 + i) % raw.len()] % vocab`.
-fn batch_tokens(
-    raw: &[u32],
-    window_start: usize,
-    vocab: u32,
-    seqs: u32,
-    seq: u32,
-    b: u64,
-) -> Vec<u32> {
-    let n = (seqs * seq) as usize;
-    let base = window_start + (b as usize) * n;
-    (0..n)
-        .map(|i| raw[(base + i) % raw.len()] % vocab)
-        .collect()
-}
-
-fn decode_u16_le(bytes: &[u8]) -> Vec<u32> {
-    bytes
-        .chunks_exact(2)
-        .map(|p| u32::from(u16::from_le_bytes([p[0], p[1]])))
-        .collect()
-}
-
+/// The flipped expectation (decisions D5): the pinned pre-refactor v1 module is refused with a
+/// clean, typed `AbiUnsupportedMajor` — the sunset's permanent regression.
 #[test]
-fn a0_frozen_fixture_replays_v1_driver() {
+fn a0_frozen_fixture_refused_abi_unsupported_major_post_sunset() {
     let expected: serde_json::Value = serde_json::from_str(EXPECTED).expect("expected.json");
 
-    // -- content addressing: every input is verified against its recorded blake3 -------------
+    // -- content addressing: every input of the historical bundle is still verified -----------
     assert_eq!(
         blake3_hash(MODULE).to_hex(),
         expected["module"]["blake3"].as_str().unwrap(),
@@ -87,8 +69,16 @@ fn a0_frozen_fixture_replays_v1_driver() {
         expected["corpus"]["shard0_blake3"].as_str().unwrap(),
         "corpus shard 0 must match the recorded pin"
     );
+    // The recorded v1 transcript remains the bundle's historical record (never deleted).
+    let transcript = expected["transcript"].as_array().unwrap();
+    assert_eq!(
+        transcript.len() as u64,
+        expected["run"]["rounds"].as_u64().unwrap()
+    );
 
-    // -- the exact schema-major-1 envelope opens + signature-verifies on the current tree ------
+    // -- the exact schema-major-1 envelope still opens + signature-verifies --------------------
+    // (Envelope v1 support did not retire — a v2 module under a v1 envelope is mixed-fleet
+    // cell 5. What retired is the major-1 DRIVER.)
     let wire: SignedEnvelope = from_canonical_slice(ENVELOPE_WIRE).expect("decode SignedEnvelope");
     let frozen = wire.open().expect("open + verify the frozen envelope");
     assert_eq!(
@@ -98,87 +88,39 @@ fn a0_frozen_fixture_replays_v1_driver() {
     assert_eq!(
         blake3_hash(frozen.config_bytes()).to_hex(),
         expected["envelope"]["config_blake3"].as_str().unwrap(),
-        "the da_build config byte chain must be intact"
+        "the config byte chain must be intact"
     );
     let envelope = frozen.decode().expect("decode envelope");
     assert_eq!(envelope.run.schema, 1, "the fixture is schema-major 1");
     let module_pin = envelope.artifacts["tiny-llama"].blake3;
 
-    // -- the A0 dual-dispatch front door admits the pinned module through the v1 driver --------
+    // -- THE FLIP: the §1.3 front door refuses the v1 module with the typed code ---------------
+    // The refusal is an admission outcome raised at step 5 (the da_abi cross-check passes —
+    // candidate major 1 == declared major 1 — and then the host, which no longer implements
+    // major 1, refuses): typed, attributable, pre-guest-execution. Not a trap, not a crash,
+    // not BadModule/AbiDeclarationMismatch — exactly `AbiUnsupportedMajor` (ABI §1.5).
     let worker = Worker::new(EngineConfig::default()).expect("engine");
-    let sel = select_driver(&worker, MODULE, Some(&module_pin.0))
-        .expect("the frozen v1 module must pass ABI §1.3 selection");
-    assert_eq!(sel.driver, CandidateDriver::V1);
-    assert_eq!((sel.major, sel.minor), (1, 0));
-
-    // -- replay: the recorded run, re-executed on today's v1 driver ----------------------------
-    let run = &expected["run"];
-    let corpus = &expected["corpus"];
-    let rounds = run["rounds"].as_u64().unwrap();
-    let seqs = run["seqs_per_batch"].as_u64().unwrap() as u32;
-    let seq = run["seq_len"].as_u64().unwrap() as u32;
-    let window_start = corpus["window_start"].as_u64().unwrap() as usize;
-    let vocab = corpus["vocab_mod"].as_u64().unwrap() as u32;
-    let raw = decode_u16_le(SHARD0);
-    assert_eq!(raw.len() as u64, corpus["shard0_tokens"].as_u64().unwrap());
-
-    let mut backend = WasmBackend::new(WasmBackendConfig {
-        wasm: MODULE.to_vec(),
-        engine: EngineConfig::default(),
-    })
-    .expect("construct WasmBackend");
-    backend.build(frozen.config_bytes()).expect("da_build");
-    let steps = backend.steps_per_round().expect("steps_per_round");
-    assert_eq!(u64::from(steps), run["steps_per_round"].as_u64().unwrap());
-
-    let transcript = expected["transcript"].as_array().unwrap();
-    assert_eq!(transcript.len() as u64, rounds);
-    let mut digests = Vec::new();
-    for round in 0..rounds {
-        for step in 0..steps {
-            let b = BatchRef {
-                tokens: batch_tokens(
-                    &raw,
-                    window_start,
-                    vocab,
-                    seqs,
-                    seq,
-                    round * u64::from(steps) + u64::from(step),
-                ),
-                seq_len: seq,
-            };
-            let ctx = StepCtx {
-                inner_step: step,
-                mb_index: 0,
-                mb_count: 1,
-                step_seqs: seqs,
-            };
-            backend.train_step(&b, ctx).expect("train_step");
-            backend.inner_update(step).expect("inner_update");
-        }
-        let payload = backend.make_update(round).expect("make_update");
-        let want = &transcript[round as usize];
-        assert_eq!(
-            blake3_hash(&payload).to_hex(),
-            want["payload_blake3"].as_str().unwrap(),
-            "round {round}: the sealed round payload must reproduce the pre-refactor bytes"
-        );
-        let staged = StagedPayload {
-            peer: PeerId([1; 32]),
-            hash: blake3_hash(&payload),
-            bytes: payload,
-        };
-        let digest = backend.ingest(round, &[staged]).expect("ingest");
-        assert_eq!(
-            digest.to_hex(),
-            want["digest"].as_str().unwrap(),
-            "round {round}: the post-ingest det-lane state digest must reproduce bit-for-bit"
-        );
-        digests.push(digest);
-    }
-    // Non-degenerate: the pinned transcript genuinely evolves.
-    assert!(
-        digests.windows(2).any(|w| w[0] != w[1]),
-        "the fixture transcript must evolve across rounds"
+    let refusal = select_driver(&worker, MODULE, Some(&module_pin.0))
+        .expect_err("a v1 module must be refused on a post-sunset host");
+    assert_eq!(
+        refusal.code,
+        AbiRefusalCode::AbiUnsupportedMajor,
+        "the sunset's refusal is the clean typed AbiUnsupportedMajor, got: {refusal}"
     );
+    assert!(
+        refusal.detail.contains("major 1"),
+        "the refusal names the offending declared major (observed vs supported): {}",
+        refusal.detail
+    );
+    assert!(
+        refusal.detail.contains("[2]"),
+        "the refusal names the host's implemented majors: {}",
+        refusal.detail
+    );
+
+    // A wrong-pin module is still refused EARLIER (step 1, before any byte reaches the
+    // compiler) — the front door's order survives the sunset.
+    let refusal = select_driver(&worker, MODULE, Some(&[0u8; 32]))
+        .expect_err("a mismatched pin is refused before compile");
+    assert_eq!(refusal.code, AbiRefusalCode::ModuleHashMismatch);
 }

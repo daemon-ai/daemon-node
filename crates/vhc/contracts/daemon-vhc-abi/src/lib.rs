@@ -64,21 +64,26 @@ pub const DA_ABI_MINOR_V2: u32 = 2;
 
 /// The set of ABI **majors this host generation implements** (i.e. carries a driver for).
 ///
-/// A0 shipped the retained v1 five-phase driver only; **A2 flipped this to `[1, 2]`** in the same
+/// A0 shipped the retained v1 five-phase driver only; A2 flipped this to `[1, 2]` in the same
 /// commit the major-2 event-loop driver (`daemon-vhc-host::v2::driver`) first ran a module end to
-/// end (refusal → driver, refactor §5 A2). A module whose declared major is not in this set is
-/// refused [`AbiRefusalCode::AbiUnsupportedMajor`] *after* its declaration is cross-checked
-/// against its import shape (ABI §1.3 step 5).
-pub const HOST_IMPLEMENTED_MAJORS: &[u32] = &[DA_ABI_MAJOR, DA_ABI_MAJOR_V2];
+/// end (refusal → driver, refactor §5 A2). **The Phase-E v1 sunset (decisions D5) removed major
+/// 1**: the v1 five-phase driver, its autotune admission, and the phase-legality table retired
+/// together, so this is `[2]` — a module whose declared major is `1` now meets a clean
+/// [`AbiRefusalCode::AbiUnsupportedMajor`] *after* its declaration is cross-checked against its
+/// import shape (ABI §1.3 step 5; the flipped A0 fixture pins this forever). [`DA_ABI_MAJOR`],
+/// [`DA_ABI_VERSION`], and the 66-import [`TABI_IMPORTS`] vocabulary remain as the frozen
+/// historical record — the sunset removed the DRIVER, not the vocabulary (refactor §9; `tabi@1`
+/// lives on as the §2.5 bridge under major 2).
+pub const HOST_IMPLEMENTED_MAJORS: &[u32] = &[DA_ABI_MAJOR_V2];
 
 /// The host's supported *minor* for an implemented `major` (`None` if the major is not implemented).
 ///
 /// A module declaring `minor > host_minor_for(major)` is refused [`AbiRefusalCode::AbiMinorTooNew`]
-/// (ABI §1.3 step 5); a module declaring a lower minor MUST be admitted (ABI §1.4).
+/// (ABI §1.3 step 5); a module declaring a lower minor MUST be admitted (ABI §1.4). Major 1 is
+/// `None` since the Phase-E sunset (`AbiUnsupportedMajor`).
 #[must_use]
 pub fn host_minor_for(major: u32) -> Option<u32> {
     match major {
-        DA_ABI_MAJOR => Some(DA_ABI_MINOR),
         DA_ABI_MAJOR_V2 => Some(DA_ABI_MINOR_V2),
         _ => None,
     }
@@ -1308,12 +1313,14 @@ mod tests {
     }
 
     #[test]
-    fn v2_constants_pack_and_host_implements_both_majors_from_a2() {
+    fn v2_constants_pack_and_only_major_2_is_implemented_post_sunset() {
         assert_eq!(DA_ABI_MAJOR_V2, 2);
-        // A2 flipped the majors alongside the working event-loop driver (refactor §5 A2); an
-        // unimplemented major (e.g. a future 3) stays a clean AbiUnsupportedMajor.
-        assert_eq!(HOST_IMPLEMENTED_MAJORS, &[1, 2]);
-        assert_eq!(host_minor_for(DA_ABI_MAJOR), Some(0));
+        // The Phase-E sunset (decisions D5) removed the v1 driver: major 1 is no longer
+        // implemented (AbiUnsupportedMajor), while the constants + the 66-import vocabulary
+        // remain the frozen historical record. An unimplemented major (e.g. a future 3) stays a
+        // clean AbiUnsupportedMajor too.
+        assert_eq!(HOST_IMPLEMENTED_MAJORS, &[2]);
+        assert_eq!(host_minor_for(DA_ABI_MAJOR), None);
         // B1 bumped the major-2 minor to 1 with Completion delivery; C1 bumped it to 2 with
         // Fence delivery + the compute@2 shim (the ratified coupled-to-the-working-driver path,
         // ABI §1.4/§4.6); minor 3 stays AbiMinorTooNew.

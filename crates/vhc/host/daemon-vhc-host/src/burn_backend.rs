@@ -97,24 +97,24 @@ pub type BurnCudaBackend = BurnBackend<burn::backend::Autodiff<burn::backend::Cu
 /// so GPU-needing tests skip cleanly on GPU-less runners while the default CI gate stays green.
 ///
 /// wgpu has no "is there a GPU?" query, so this delegates to the memoized
-/// [`crate::autotune::probe_wgpu`] (a `catch_unwind` around cubecl's default-device setup — cubecl
+/// [`crate::probe::probe_wgpu`] (a `catch_unwind` around cubecl's default-device setup — cubecl
 /// panics when no adapter matches). The probe registers the default device's compute client
 /// exactly once; subsequent burn tensor ops reuse it.
 #[cfg(feature = "wgpu")]
 #[must_use]
 pub fn wgpu_adapter_available() -> bool {
-    crate::autotune::probe_wgpu().is_some()
+    crate::probe::probe_wgpu().is_some()
 }
 
 /// Whether a usable CUDA device can be brought up (the **GPU-skip test convention**, TDD §8.1
 /// tier-2) — the CUDA analogue of [`wgpu_adapter_available`]. Returns `false` — never panics — when
 /// no device / driver is present, so CUDA-needing tests skip cleanly on GPU-less runners while the
-/// default CI gate stays green. Delegates to the memoized [`crate::autotune::probe_cuda`], which
+/// default CI gate stays green. Delegates to the memoized [`crate::probe::probe_cuda`], which
 /// wraps the `cuInit`/device query in `catch_unwind`.
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn cuda_adapter_available() -> bool {
-    crate::autotune::probe_cuda().is_some()
+    crate::probe::probe_cuda().is_some()
 }
 
 /// One live tensor: the burn tensor + a **lazily-materialized** host cache backing

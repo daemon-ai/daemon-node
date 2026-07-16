@@ -4511,7 +4511,6 @@ dependencies = [
  "daemon-vhc-node",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
- "daemon-vhc-sdk",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-sdk-rounds",
  "daemon-vhc-sdk-v2",
@@ -4905,7 +4904,6 @@ dependencies = [
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-safetensors",
- "daemon-vhc-sdk",
  "daemon-vhc-sdk-profiles",
  "daemon-vhc-session",
  "serde",
@@ -4945,6 +4943,7 @@ name = "daemon-vhc-node"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "blake3",
  "daemon-api",
  "daemon-vhc-net",
  "daemon-vhc-session",
@@ -5123,6 +5122,7 @@ dependencies = [
  "ciborium",
  "daemon-vhc-abi",
  "daemon-vhc-host",
+ "daemon-vhc-node",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",

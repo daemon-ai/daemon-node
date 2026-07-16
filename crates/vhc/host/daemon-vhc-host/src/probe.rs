@@ -1,24 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! VRAM autotune + OOM-probe micro-batch sizing (G2 — spec §5.1 VRAM planning, §10.5 OOM path,
-//! ABI §8 host-side budgets).
+//! The **permanent device probe** (architecture §3.5; decisions D5 "the device probe stays
+//! forever") — per-platform device-memory/limit readouts feeding the admission funnel's lane
+//! feature floor and run pre-screen.
 //!
-//! The MVP's `assess` used a coarse `master_bytes × 3` VRAM guess. G2 replaces it with a real
-//! budget: a resource model ([`Autotune`]) derived from the module's [`crate::MetaReport`] fields
-//! (`param_bytes`/`master_bytes`/`grad_bytes` + persistents = the fixed cost; `act_bytes_est` = the
-//! per-micro-batch activation cost, since the meta pass runs at batch = 1) compared against probed
-//! device limits ([`DeviceLimits`]) → an [`AutotuneVerdict`] (eligibility + chosen micro-batch).
-//!
-//! ## The verdict + the OOM probe (§10.5)
-//!
-//! [`Autotune::verdict`] is the *analytical* form: start at the largest power-of-two micro-batch
-//! ≤ `max_microbatch` and halve until `fixed + micro_batch · act` fits the VRAM budget (floor 1 →
-//! ineligible if even a single sequence does not fit). [`probe_microbatch`] is the *runtime* form
-//! for the same halving ladder driven by a real trial: on a GPU OOM the worker halves the
-//! micro-batch and re-probes (the §10.5 recovery rung, mapped into the trap taxonomy as
-//! [`crate::TrapCode::BudgetMemory`] / `daemon_vhc_session::protocol::ErrorClass::OutOfMemory` — see
-//! [`oom_error_class`]).
+//! Until the Phase-E v1 sunset this module also carried the v1 driver's **autotune admission**
+//! (the `MetaReport`-derived resource model + micro-batch verdict + OOM-probe halving ladder);
+//! that path retired with the v1 five-phase driver (decisions D5 — "only *module-measuring*
+//! autotune retires"; major-2 admission is the `claim()` funnel). What remains is the
+//! module-independent probe machinery: [`DeviceLimits`] and the per-platform sources
+//! (amdgpu sysfs, wgpu adapter limits, CUDA, DXGI, Metal).
 //!
 //! ## What wgpu exposes for VRAM probing (honest inventory)
 //!
@@ -29,39 +21,9 @@
 //! ([`DeviceLimits::vram_mb`]) is sourced by the caller from the GPU-governor policy cap (§10.5) or
 //! the node's effective-resource computation, not from wgpu. See [`WgpuProbe`] (feature `wgpu`).
 
-use crate::meta::MetaReport;
-
 const MIB: u64 = 1 << 20;
 
-/// The default micro-batch ceiling the autotune search starts from (a power of two; the verdict
-/// halves down from here to whatever fits VRAM). Chosen so a small preset gets a sensible batch and
-/// a large one halves down deterministically.
-pub const DEFAULT_MAX_MICROBATCH: u32 = 64;
-
-/// Byte size of a stored element of `dtype` (ABI §3.2), mirroring `runtime::dtype_size`.
-fn dtype_size(dtype: u32) -> u64 {
-    match dtype {
-        3 => 8,     // I64
-        1 | 2 => 2, // BF16 / F16
-        6 | 7 => 1, // U8 / Bool
-        _ => 4,     // F32 / I32 / U32
-    }
-}
-
-fn numel(dims: &[u32]) -> u64 {
-    dims.iter().map(|&d| u64::from(d)).product()
-}
-
-/// The largest power of two `<= n` (and `>= 1`).
-fn pow2_floor(n: u32) -> u32 {
-    if n <= 1 {
-        1
-    } else {
-        1u32 << (31 - n.leading_zeros())
-    }
-}
-
-/// Probed (or policy-capped) device limits the autotune compares the resource model against.
+/// Probed (or policy-capped) device limits the admission funnel compares against.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceLimits {
     /// Dedicated VRAM in MiB — the device's own memory (sysfs `mem_info_vram_total` on
@@ -84,292 +46,6 @@ pub struct DeviceLimits {
     /// host footprints as competing for ONE physical DRAM pool (a joint budget), instead of two
     /// independent VRAM / RAM budgets. Additive; `Default` = `false` preserves the discrete path.
     pub unified: bool,
-}
-
-/// A resource model of one built module, derived from its [`MetaReport`]. VRAM cost is
-/// `fixed_vram_bytes + micro_batch · act_bytes_per_mb` (§8 host-side accounting).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Autotune {
-    /// Micro-batch-independent VRAM: params (storage dtype) + fp32 master + fp32 grad + persistents.
-    pub fixed_vram_bytes: u64,
-    /// Per-micro-batch activation bytes (the meta pass measured this at batch = 1).
-    pub act_bytes_per_mb: u64,
-    /// CPU-side working set (masters + round base + offloaded persistents + staging), §5.1.
-    pub host_ram_bytes: u64,
-    /// Per-round payload estimate (bytes).
-    pub payload_bytes: u64,
-    /// Largest single param master (bytes) — checked against the device's max single allocation.
-    pub max_tensor_bytes: u64,
-}
-
-/// The autotune verdict: eligibility + the chosen micro-batch + footprint estimates. This is the
-/// authoritative G2 verdict type (M1's 160M preset and B3's worker consume it); the frozen
-/// `daemon_vhc_session::backend::Assessment` / `protocol::Eligibility` shapes carry a projection of it
-/// (the micro-batch rides in `reasons` / `headroom`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AutotuneVerdict {
-    /// Whether the module fits at micro-batch ≥ 1 under the device limits.
-    pub eligible: bool,
-    /// The chosen micro-batch (largest power of two ≤ `max_microbatch` that fits); `0` if ineligible.
-    pub micro_batch: u32,
-    /// VRAM estimate at the chosen micro-batch, in MiB.
-    pub vram_mb_estimate: u64,
-    /// Host-RAM estimate, in MiB.
-    pub ram_mb_estimate: u64,
-    /// Per-round payload estimate, in bytes.
-    pub payload_bytes_estimate: u64,
-    /// Halvings the search applied from the `max_microbatch` power-of-two start to the chosen batch.
-    pub oom_retries: u32,
-    /// Human-readable reasons (why-not, or informational headroom + chosen micro-batch).
-    pub reasons: Vec<String>,
-}
-
-impl Autotune {
-    /// Build the resource model from a module's [`MetaReport`].
-    #[must_use]
-    pub fn from_meta(report: &MetaReport) -> Self {
-        let persistent_bytes: u64 = report
-            .persistent
-            .iter()
-            .map(|(_, dims, dt, _)| numel(dims) * dtype_size(*dt))
-            .sum::<u64>()
-            + report
-                .det_persistent
-                .iter()
-                .map(|(_, dims, _)| numel(dims) * 4)
-                .sum::<u64>();
-        let max_tensor_bytes = report
-            .params
-            .iter()
-            .map(|(_, dims, _)| numel(dims) * 4)
-            .max()
-            .unwrap_or(0);
-        Self {
-            fixed_vram_bytes: report.param_bytes
-                + report.master_bytes
-                + report.grad_bytes
-                + persistent_bytes,
-            // `act_bytes_est` is the meta pass's activation estimate at batch = 1; floor at 1 byte so
-            // the halving search always makes progress even for a degenerate (activation-free) module.
-            act_bytes_per_mb: report.act_bytes_est.max(1),
-            host_ram_bytes: report.host_ram_bytes_est,
-            payload_bytes: report.payload_bytes_est,
-            max_tensor_bytes,
-        }
-    }
-
-    /// A resource model from a raw param layout (name, dims, dtype) — the session-side `WasmBackend`
-    /// build path, which has the registered params but not a full meta pass. The activation cost is
-    /// a coarse proxy (`master_bytes`, i.e. one fp32 copy of the model per sequence); the worker's
-    /// meta path ([`Self::from_meta`]) carries the real `act_bytes_est`.
-    #[must_use]
-    pub fn from_params(params: &[(Vec<u32>, u32)]) -> Self {
-        let param_bytes: u64 = params
-            .iter()
-            .map(|(d, dt)| numel(d) * dtype_size(*dt))
-            .sum();
-        let master_bytes: u64 = params.iter().map(|(d, _)| numel(d) * 4).sum();
-        let max_tensor_bytes = params.iter().map(|(d, _)| numel(d) * 4).max().unwrap_or(0);
-        Self {
-            fixed_vram_bytes: param_bytes + master_bytes + master_bytes, // storage + master + grad
-            act_bytes_per_mb: master_bytes.max(1),
-            host_ram_bytes: master_bytes * 2,
-            payload_bytes: master_bytes,
-            max_tensor_bytes,
-        }
-    }
-
-    /// The eligibility verdict + chosen micro-batch under `limits`, searching down from the largest
-    /// power-of-two micro-batch ≤ `max_microbatch` (§5.1 planning; the §10.5 halving ladder in
-    /// analytical form). Floor of 1 → ineligible if a single sequence does not fit.
-    ///
-    /// ## Unified-memory budget (the UMA fix — spec §5.1/§10.5 amendment)
-    ///
-    /// The **effective device budget** is `vram_mb + 90% of shared_mb`: dedicated VRAM plus a
-    /// documented spill discount on the shared (GTT/unified) pool the device can page into. On a
-    /// classic discrete GPU `shared_mb == 0`, so this reduces to `vram_mb` and the path below is
-    /// unchanged.
-    ///
-    /// On a **unified** device (`limits.unified`, e.g. an integrated GPU where VRAM and host RAM
-    /// are the SAME physical DRAM), the independent VRAM and host-RAM checks are wrong: they would
-    /// double-count one pool and, worse, reject against a driver-clamped `max_buffer_size` VRAM
-    /// proxy (2047 MiB on Linux/Mesa) even though the runtime provably spills into GTT. So the
-    /// unified path replaces them with a single **joint pool** check: the device footprint plus the
-    /// host-RAM footprint must fit together in `min(effective budget, ram_mb)`. The per-buffer
-    /// `max_tensor_bytes ≤ max_alloc_mb` gate is kept exactly as-is on both paths (it is a hard
-    /// single-allocation ceiling, not a total-memory budget).
-    #[must_use]
-    pub fn verdict(&self, limits: &DeviceLimits, max_microbatch: u32) -> AutotuneVerdict {
-        let ram_budget = limits.ram_mb.saturating_mul(MIB);
-        let max_alloc = if limits.max_alloc_mb == 0 {
-            u64::MAX
-        } else {
-            limits.max_alloc_mb.saturating_mul(MIB)
-        };
-        // Effective device budget: dedicated VRAM + a 90% spill discount on the shared pool.
-        let effective_vram_mb = limits
-            .vram_mb
-            .saturating_add(limits.shared_mb.saturating_mul(9) / 10);
-        let effective_vram = effective_vram_mb.saturating_mul(MIB);
-
-        let ineligible = |reason: String| AutotuneVerdict {
-            eligible: false,
-            micro_batch: 0,
-            vram_mb_estimate: self.fixed_vram_bytes.div_ceil(MIB).max(1),
-            ram_mb_estimate: self.host_ram_bytes.div_ceil(MIB).max(1),
-            payload_bytes_estimate: self.payload_bytes,
-            oom_retries: 0,
-            reasons: vec![reason],
-        };
-
-        // A single param master must fit one GPU buffer (the wgpu-queryable hard ceiling). Kept
-        // verbatim on both the discrete and unified paths.
-        if self.max_tensor_bytes > max_alloc {
-            return ineligible(format!(
-                "largest tensor {} MiB exceeds max single allocation {} MiB",
-                self.max_tensor_bytes.div_ceil(MIB),
-                limits.max_alloc_mb
-            ));
-        }
-
-        if limits.unified {
-            // Joint pool: device + host footprints compete for one physical DRAM (§5.1 UMA).
-            let pool = effective_vram.min(ram_budget);
-            let start = pow2_floor(max_microbatch.max(1));
-            let mut mb = start;
-            let mut retries = 0u32;
-            loop {
-                let device_need = self
-                    .fixed_vram_bytes
-                    .saturating_add(self.act_bytes_per_mb.saturating_mul(u64::from(mb)));
-                let joint_need = device_need.saturating_add(self.host_ram_bytes);
-                if joint_need <= pool {
-                    return AutotuneVerdict {
-                        eligible: true,
-                        micro_batch: mb,
-                        vram_mb_estimate: device_need.div_ceil(MIB).max(1),
-                        ram_mb_estimate: self.host_ram_bytes.div_ceil(MIB).max(1),
-                        payload_bytes_estimate: self.payload_bytes,
-                        oom_retries: retries,
-                        reasons: vec![format!(
-                            "fits at micro_batch={mb} (unified pool ~{} MiB: device ~{} MiB + host \
-                             ~{} MiB, budget {} MiB = min(vram {} + 90%·gtt {}, ram {})){}",
-                            joint_need.div_ceil(MIB),
-                            device_need.div_ceil(MIB),
-                            self.host_ram_bytes.div_ceil(MIB),
-                            pool / MIB,
-                            limits.vram_mb,
-                            limits.shared_mb,
-                            limits.ram_mb,
-                            if retries > 0 {
-                                format!("; halved {retries}× from {start}")
-                            } else {
-                                String::new()
-                            }
-                        )],
-                    };
-                }
-                if mb <= 1 {
-                    let device_need = self.fixed_vram_bytes.saturating_add(self.act_bytes_per_mb);
-                    return ineligible(format!(
-                        "insufficient unified memory even at micro_batch=1: need {} MiB (device {} \
-                         + host {}), have {} MiB",
-                        device_need
-                            .saturating_add(self.host_ram_bytes)
-                            .div_ceil(MIB),
-                        device_need.div_ceil(MIB),
-                        self.host_ram_bytes.div_ceil(MIB),
-                        pool / MIB
-                    ));
-                }
-                mb /= 2;
-                retries += 1;
-            }
-        }
-
-        // Discrete path (unchanged behavior; `effective_vram == vram_mb` when `shared_mb == 0`).
-        // Host RAM is micro-batch-independent (masters + round base + staging, §5.1).
-        if self.host_ram_bytes > ram_budget {
-            return ineligible(format!(
-                "insufficient host RAM: need {} MiB, have {} MiB",
-                self.host_ram_bytes.div_ceil(MIB),
-                limits.ram_mb
-            ));
-        }
-
-        let start = pow2_floor(max_microbatch.max(1));
-        let mut mb = start;
-        let mut retries = 0u32;
-        loop {
-            let need = self
-                .fixed_vram_bytes
-                .saturating_add(self.act_bytes_per_mb.saturating_mul(u64::from(mb)));
-            if need <= effective_vram {
-                return AutotuneVerdict {
-                    eligible: true,
-                    micro_batch: mb,
-                    vram_mb_estimate: need.div_ceil(MIB).max(1),
-                    ram_mb_estimate: self.host_ram_bytes.div_ceil(MIB).max(1),
-                    payload_bytes_estimate: self.payload_bytes,
-                    oom_retries: retries,
-                    reasons: vec![format!(
-                        "fits at micro_batch={mb} (~{} MiB VRAM, ~{} MiB host RAM){}",
-                        need.div_ceil(MIB),
-                        self.host_ram_bytes.div_ceil(MIB),
-                        if retries > 0 {
-                            format!("; halved {retries}× from {start}")
-                        } else {
-                            String::new()
-                        }
-                    )],
-                };
-            }
-            if mb <= 1 {
-                return ineligible(format!(
-                    "insufficient VRAM even at micro_batch=1: need {} MiB, have {} MiB",
-                    self.fixed_vram_bytes
-                        .saturating_add(self.act_bytes_per_mb)
-                        .div_ceil(MIB),
-                    effective_vram_mb
-                ));
-            }
-            mb /= 2;
-            retries += 1;
-        }
-    }
-}
-
-/// One step of the runtime OOM probe: did the trial micro-batch fit, or OOM?
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProbeStep {
-    /// The trial micro-batch ran without an allocation failure.
-    Fits,
-    /// The trial hit a GPU/host allocation failure (OOM).
-    Oom,
-}
-
-/// The §10.5 OOM-probe halving ladder driven by a real trial: run at `start`, and on an `Oom` halve
-/// and retry until it `Fits` or drops below `floor`. Returns the largest fitting micro-batch, or
-/// `None` if even `floor` OOMs (→ ineligible). Deterministic and backend-agnostic, so the halving
-/// logic is unit-tested without a GPU (the real wgpu trial wraps a step in `catch_unwind`).
-pub fn probe_microbatch(
-    start: u32,
-    floor: u32,
-    mut trial: impl FnMut(u32) -> ProbeStep,
-) -> Option<u32> {
-    let floor = floor.max(1);
-    let mut mb = start.max(floor);
-    loop {
-        match trial(mb) {
-            ProbeStep::Fits => return Some(mb),
-            ProbeStep::Oom => {
-                if mb <= floor {
-                    return None;
-                }
-                mb = (mb / 2).max(floor);
-            }
-        }
-    }
 }
 
 // (A2 inversion): `oom_error_class` — the one host→session symbol beyond the seam — moved to the
@@ -1035,289 +711,6 @@ pub fn probe_macos_device_limits() -> Option<DeviceLimits> {
 mod tests {
     use super::*;
 
-    fn meta_fixture(
-        param_bytes: u64,
-        act: u64,
-        host_ram: u64,
-        max_tensor_dims: &[u32],
-    ) -> MetaReport {
-        MetaReport {
-            abi: 1 << 16,
-            params: vec![("w".into(), max_tensor_dims.to_vec(), 0)],
-            persistent: Vec::new(),
-            det_persistent: Vec::new(),
-            param_bytes,
-            master_bytes: param_bytes,
-            grad_bytes: param_bytes,
-            act_bytes_est: act,
-            payload_bytes_est: 128,
-            ingest_bytes_est: 0,
-            host_ram_bytes_est: host_ram,
-            op_calls: std::collections::BTreeMap::new(),
-            ingest_op_calls_per_peer: 0,
-            ops_used: Vec::new(),
-            value_dependent: false,
-        }
-    }
-
-    #[test]
-    fn pow2_floor_rounds_down() {
-        assert_eq!(pow2_floor(1), 1);
-        assert_eq!(pow2_floor(2), 2);
-        assert_eq!(pow2_floor(3), 2);
-        assert_eq!(pow2_floor(63), 32);
-        assert_eq!(pow2_floor(64), 64);
-        assert_eq!(pow2_floor(0), 1);
-    }
-
-    /// `oom_probe_halves_microbatch`: the halving ladder finds the largest fitting micro-batch.
-    #[test]
-    fn oom_probe_halves_microbatch() {
-        // A device where anything > 2 OOMs: 8 → 4 → 2 (fits), i.e. two halvings.
-        let chosen = probe_microbatch(8, 1, |mb| {
-            if mb > 2 {
-                ProbeStep::Oom
-            } else {
-                ProbeStep::Fits
-            }
-        });
-        assert_eq!(chosen, Some(2));
-
-        // Fits immediately at the start.
-        assert_eq!(probe_microbatch(8, 1, |_| ProbeStep::Fits), Some(8));
-
-        // Even the floor OOMs → ineligible (None).
-        assert_eq!(probe_microbatch(8, 1, |_| ProbeStep::Oom), None);
-
-        // Floor is respected (never probes below it): floor 4, everything OOMs → None after 4.
-        let mut seen = Vec::new();
-        let out = probe_microbatch(16, 4, |mb| {
-            seen.push(mb);
-            ProbeStep::Oom
-        });
-        assert_eq!(out, None);
-        assert_eq!(seen, vec![16, 8, 4]); // stops at the floor, does not go to 2
-    }
-
-    /// The analytical verdict agrees with the runtime probe on the same budget.
-    #[test]
-    fn verdict_matches_probe_ladder() {
-        // fixed = 3 MiB, act = 1 MiB/mb. Budget 6 MiB → fits at mb where 3 + mb ≤ 6 → mb ≤ 3 → 2.
-        let a = Autotune {
-            fixed_vram_bytes: 3 * MIB,
-            act_bytes_per_mb: MIB,
-            host_ram_bytes: MIB,
-            payload_bytes: 0,
-            max_tensor_bytes: MIB,
-        };
-        let limits = DeviceLimits {
-            vram_mb: 6,
-            ram_mb: 64,
-            max_alloc_mb: 0,
-            ..Default::default()
-        };
-        let v = a.verdict(&limits, 8);
-        assert!(v.eligible);
-        assert_eq!(v.micro_batch, 2);
-        assert_eq!(v.oom_retries, 2); // 8 → 4 → 2
-
-        let probe = probe_microbatch(pow2_floor(8), 1, |mb| {
-            if 3 * MIB + u64::from(mb) * MIB <= 6 * MIB {
-                ProbeStep::Fits
-            } else {
-                ProbeStep::Oom
-            }
-        });
-        assert_eq!(probe, Some(v.micro_batch));
-    }
-
-    /// `assess_rejects_insufficient_vram`: a device with less VRAM than a single sequence needs is
-    /// ineligible; a device below the host-RAM need is ineligible; an oversized tensor is rejected.
-    #[test]
-    fn assess_rejects_insufficient_vram() {
-        // 100 MiB fixed model, 10 MiB/mb activation.
-        let a = Autotune::from_meta(&meta_fixture(100 * MIB, 10 * MIB, 50 * MIB, &[16, 16]));
-
-        // Plenty of VRAM + RAM → eligible, largest pow2 ≤ 64 that fits.
-        let ok = a.verdict(
-            &DeviceLimits {
-                vram_mb: 8192,
-                ram_mb: 8192,
-                max_alloc_mb: 0,
-                ..Default::default()
-            },
-            64,
-        );
-        assert!(ok.eligible && ok.micro_batch >= 1);
-
-        // Not enough VRAM for even one sequence (fixed 100 + 10 = 110 MiB > 64) → ineligible.
-        let no_vram = a.verdict(
-            &DeviceLimits {
-                vram_mb: 64,
-                ram_mb: 8192,
-                max_alloc_mb: 0,
-                ..Default::default()
-            },
-            64,
-        );
-        assert!(!no_vram.eligible);
-        assert_eq!(no_vram.micro_batch, 0);
-        assert!(no_vram.reasons[0].contains("VRAM"));
-
-        // Enough VRAM but not enough host RAM → ineligible on the RAM gate.
-        let no_ram = a.verdict(
-            &DeviceLimits {
-                vram_mb: 8192,
-                ram_mb: 8,
-                max_alloc_mb: 0,
-                ..Default::default()
-            },
-            64,
-        );
-        assert!(!no_ram.eligible);
-        assert!(no_ram.reasons[0].contains("RAM"));
-
-        // A single tensor larger than the max allocation → ineligible on the alloc ceiling.
-        let big = Autotune::from_meta(&meta_fixture(100 * MIB, 1, 1, &[1024, 1024])); // 4 MiB tensor
-        let no_alloc = big.verdict(
-            &DeviceLimits {
-                vram_mb: 8192,
-                ram_mb: 8192,
-                max_alloc_mb: 2,
-                ..Default::default()
-            },
-            64,
-        );
-        assert!(!no_alloc.eligible);
-        assert!(no_alloc.reasons[0].contains("max single allocation"));
-    }
-
-    // (A2 inversion): the `oom_error_class` pin moved to the worker binary with the helper.
-
-    // ---- UMA / unified-memory autotune (the Merge-2 fix) ----
-
-    /// A representative fp32 resource model for an N-parameter LLaMA (spec §5.1 fp32 storage): the
-    /// fixed device term is params + fp32 master + fp32 grad + AdamW m/v persistents = 20·N bytes;
-    /// host RAM ≈ masters + round base = 8·N; the largest single tensor is the tied embedding
-    /// (`vocab·d_model` fp32). `act_per_mb` is a representative per-micro-batch activation cost.
-    fn llama_model(n_params: u64, vocab: u64, d_model: u64, act_per_mb: u64) -> Autotune {
-        Autotune {
-            fixed_vram_bytes: 20 * n_params, // 4N storage + 4N master + 4N grad + 8N Adam m/v
-            act_bytes_per_mb: act_per_mb,
-            host_ram_bytes: 8 * n_params,
-            payload_bytes: 4 * n_params / 64, // sparse_loco 1/64 density, illustrative
-            max_tensor_bytes: vocab * d_model * 4,
-        }
-    }
-
-    /// The Strix Halo (this machine) unified-memory limits: dedicated VRAM 4096 MiB, GTT/shared
-    /// 120000 MiB, host RAM ~124419 MiB, per-buffer clamp 2047 MiB (wgpu-hal's i32::MAX on
-    /// Linux/Mesa), `unified = true`.
-    fn strix_halo() -> DeviceLimits {
-        DeviceLimits {
-            vram_mb: 4096,
-            ram_mb: 124_419,
-            max_alloc_mb: 2047,
-            shared_mb: 120_000,
-            unified: true,
-        }
-    }
-
-    /// `unified_verdict_admits_160m_and_1_2b`: on a unified device the joint-pool budget
-    /// (`min(vram + 90%·gtt, ram)`) admits both the 160M and 1.2B presets that the old
-    /// VRAM-vs-`max_buffer_size` (2047 MiB) check wrongly rejected — while the per-buffer ceiling
-    /// still bites an oversized single tensor.
-    #[test]
-    fn unified_verdict_admits_160m_and_1_2b() {
-        let limits = strix_halo();
-        // Effective budget = 4096 + 0.9·120000 = 112096 MiB; joint pool = min(112096, 124419).
-        let effective = 4096 + 120_000 * 9 / 10;
-        assert_eq!(effective, 112_096);
-
-        // 160M preset (M1: N=151,862,784, vocab 50257, d_model 768). fixed ≈ 2897 MiB, host ≈ 1159.
-        let m160 = llama_model(151_862_784, 50_257, 768, 128 * MIB);
-        let v = m160.verdict(&limits, DEFAULT_MAX_MICROBATCH);
-        assert!(v.eligible, "160M must be eligible on unified DRAM: {v:?}");
-        assert!(v.micro_batch >= 1);
-        // The device footprint alone (≈2897 fixed) exceeds the 2047 MiB per-buffer proxy the old
-        // path used as the whole VRAM budget — proof the joint pool is what admits it.
-        assert!((m160.fixed_vram_bytes / MIB) > limits.max_alloc_mb);
-
-        // 1.2B preset (representative: N=1.2e9, vocab 50257, d_model 2048). fixed ≈ 22888 MiB.
-        let b1_2 = llama_model(1_200_000_000, 50_257, 2048, 512 * MIB);
-        let v = b1_2.verdict(&limits, DEFAULT_MAX_MICROBATCH);
-        assert!(v.eligible, "1.2B must be eligible on unified DRAM: {v:?}");
-        assert!(v.micro_batch >= 1);
-
-        // The per-buffer gate is untouched: a single tensor > 2047 MiB is rejected even on unified.
-        let oversized = Autotune {
-            max_tensor_bytes: 2100 * MIB,
-            ..llama_model(151_862_784, 50_257, 768, 128 * MIB)
-        };
-        let v = oversized.verdict(&limits, DEFAULT_MAX_MICROBATCH);
-        assert!(!v.eligible);
-        assert!(v.reasons[0].contains("max single allocation"));
-    }
-
-    /// `unified_bug_repro_and_fix`: the exact Merge-2 blocker. With the pre-fix limits (VRAM = the
-    /// 2047 MiB `max_buffer_size` proxy, non-unified, no shared pool) the 160M preset is rejected
-    /// ("insufficient VRAM"); flipping to the real unified limits makes it eligible. Same model,
-    /// only the device-limits interpretation changed.
-    #[test]
-    fn unified_bug_repro_and_fix() {
-        let m160 = llama_model(151_862_784, 50_257, 768, 128 * MIB);
-
-        // Pre-fix: the old code fed `vram_mb = max_alloc_mb = 2047`, non-unified, shared 0.
-        let clamped = DeviceLimits {
-            vram_mb: 2047,
-            ram_mb: 124_419,
-            max_alloc_mb: 2047,
-            shared_mb: 0,
-            unified: false,
-        };
-        let before = m160.verdict(&clamped, DEFAULT_MAX_MICROBATCH);
-        assert!(!before.eligible, "reproduces the blocker: {before:?}");
-        assert!(before.reasons[0].contains("VRAM"));
-
-        // Post-fix: real unified limits (sysfs VRAM 4096 + GTT 120000, unified).
-        let after = m160.verdict(&strix_halo(), DEFAULT_MAX_MICROBATCH);
-        assert!(after.eligible, "the UMA fix admits 160M: {after:?}");
-    }
-
-    /// `discrete_path_unchanged`: a classic discrete GPU (`unified = false`, `shared_mb = 0`) keeps
-    /// the independent VRAM + RAM checks exactly as before — a big card admits the model, a
-    /// genuinely VRAM-starved card still rejects it (the clamp is only wrong for unified memory).
-    #[test]
-    fn discrete_path_unchanged() {
-        let m160 = llama_model(151_862_784, 50_257, 768, 128 * MIB);
-
-        // 24 GB discrete card, no shared pool → eligible via the discrete VRAM loop.
-        let big = DeviceLimits {
-            vram_mb: 24_000,
-            ram_mb: 64_000,
-            max_alloc_mb: 4096,
-            shared_mb: 0,
-            unified: false,
-        };
-        assert!(m160.verdict(&big, DEFAULT_MAX_MICROBATCH).eligible);
-
-        // A genuinely 2 GB discrete card with ample RAM → still (correctly) ineligible on VRAM.
-        let tiny = DeviceLimits {
-            vram_mb: 2047,
-            ram_mb: 64_000,
-            max_alloc_mb: 2047,
-            shared_mb: 0,
-            unified: false,
-        };
-        let v = m160.verdict(&tiny, DEFAULT_MAX_MICROBATCH);
-        assert!(
-            !v.eligible,
-            "a real 2 GB discrete card cannot fit 160M: {v:?}"
-        );
-        assert!(v.reasons[0].contains("VRAM"));
-    }
-
-    /// `parse_amdgpu_mem_mb_fixtures`: the sysfs byte-count parser (amdgpu `mem_info_*_total`).
     #[test]
     fn parse_amdgpu_mem_mb_fixtures() {
         // This machine's real values: 4 GiB VRAM, 120000 MiB GTT.
@@ -1330,13 +723,15 @@ mod tests {
     }
 
     // ---- Windows DXGI/D3D12 probe mapping (swarm-windows-vram-design.md §2) ----
+    //
+    // The mapper tests survive the Phase-E sunset (the probe is permanent, decisions D5); the
+    // Autotune-verdict legs that used to ride them retired with the autotune admission.
 
     const GIB: u64 = 1024 * MIB;
 
-    /// `windows_discrete_maps_dedicated_vram_shared_zero`: a discrete card (RTX-5090-shaped: 32 GiB
-    /// dedicated, NON_LOCAL budget ≈ ½ RAM) maps to `vram_mb = DedicatedVideoMemory`, `shared_mb = 0`
-    /// (NON_LOCAL spill contributes 0 by default), `unified = false`. The NON_LOCAL budget is carried
-    /// on the raw struct for telemetry but never enters the verdict.
+    /// A discrete card (RTX-5090-shaped: 32 GiB dedicated, NON_LOCAL budget ≈ ½ RAM) maps to
+    /// `vram_mb = DedicatedVideoMemory`, `shared_mb = 0` (NON_LOCAL spill contributes 0 by
+    /// default), `unified = false`.
     #[test]
     fn windows_discrete_maps_dedicated_vram_shared_zero() {
         let adapter = DxgiAdapterMemory {
@@ -1355,13 +750,10 @@ mod tests {
         assert_eq!(limits.shared_mb, 0, "discrete NON_LOCAL contributes 0");
         assert!(!limits.unified);
         assert_eq!(limits.max_alloc_mb, DX12_MAX_BUFFER_MB); // 2047 — the DX12 constant
-                                                             // Effective budget on the discrete path = vram only (shared 0).
-        let effective = limits.vram_mb + limits.shared_mb * 9 / 10;
-        assert_eq!(effective, 32 * 1024);
     }
 
-    /// `windows_uma_uses_local_budget`: an integrated/UMA adapter (small dedicated carve-out, large
-    /// LOCAL budget) maps to `unified = true`, `shared_mb = min(SharedSystemMemory, LOCAL.Budget)`.
+    /// An integrated/UMA adapter (small dedicated carve-out, large LOCAL budget) maps to
+    /// `unified = true`, `shared_mb = min(SharedSystemMemory, LOCAL.Budget)`.
     #[test]
     fn windows_uma_uses_local_budget() {
         let adapter = DxgiAdapterMemory {
@@ -1382,10 +774,9 @@ mod tests {
         assert_eq!(limits.shared_mb, 12 * 1024);
     }
 
-    /// `windows_variable_graphics_memory_clamped_to_ram`: the AMD "Variable Graphics Memory" trap —
-    /// a Strix-Halo-on-Windows APU can present tens of GB as `DedicatedVideoMemory`. The mapper keeps
-    /// the configured allocation in `vram_mb` (never conflated with RAM) and the verdict clamps the
-    /// joint pool to physical `ram_mb`, so an inflated VRAM figure cannot overstate capacity.
+    /// The AMD "Variable Graphics Memory" trap — a Strix-Halo-on-Windows APU can present tens of
+    /// GB as `DedicatedVideoMemory`. The mapper keeps the configured allocation in `vram_mb`
+    /// (never conflated with RAM); it is never summed with `shared_mb` into a fake capacity.
     #[test]
     fn windows_variable_graphics_memory_clamped_to_ram() {
         let adapter = DxgiAdapterMemory {
@@ -1402,33 +793,11 @@ mod tests {
         let limits = windows_device_limits(&adapter, ram_mb, DX12_MAX_BUFFER_MB).expect("not WARP");
         assert_eq!(limits.vram_mb, 48 * 1024, "configured allocation, not RAM");
         assert!(limits.unified);
-        // `vram_mb` holds only the configured allocation — it is NOT summed with `shared_mb` into a
-        // fake capacity (the design's cardinal VGM trap rule).
-        assert!(limits.vram_mb < limits.vram_mb + limits.shared_mb);
-        // The joint pool = min(vram + 90%·shared, ram) is bounded by physical `ram_mb`, so no VGM
-        // configuration can admit a model whose footprint exceeds physical RAM.
-        let over_ram = Autotune {
-            fixed_vram_bytes: 200 * GIB, // far beyond 128 GiB RAM
-            act_bytes_per_mb: MIB,
-            host_ram_bytes: MIB,
-            payload_bytes: 0,
-            max_tensor_bytes: MIB,
-        };
-        let v = over_ram.verdict(&limits, DEFAULT_MAX_MICROBATCH);
-        assert!(!v.eligible, "VGM must not admit a >RAM model: {v:?}");
-        // A model that fits physical RAM IS admitted (the configured VGM allocation is usable).
-        let fits = llama_model(1_200_000_000, 50_257, 2048, 256 * MIB); // ~22 GiB fixed
-        assert!(
-            fits.verdict(&limits, DEFAULT_MAX_MICROBATCH).eligible,
-            "a RAM-fitting model must be eligible on VGM: {:?}",
-            fits.verdict(&limits, DEFAULT_MAX_MICROBATCH)
-        );
+        assert_eq!(limits.ram_mb, ram_mb);
     }
 
-    /// `cuda_discrete_maps_dedicated_vram_no_uma` (P3 Lane G): the RunPod-4090 numbers map to a
-    /// discrete budget — `vram_mb` = dedicated VRAM (`cuDeviceTotalMem`), `shared_mb = 0`,
-    /// `unified = false` — and the 160M preset is eligible with margin on the discrete verdict path
-    /// (no UMA joint pool). Pure mapper test (the driver query is feature-gated).
+    /// The RunPod-4090 numbers map to a discrete budget — `vram_mb` = dedicated VRAM
+    /// (`cuDeviceTotalMem`), `shared_mb = 0`, `unified = false` (P3 Lane G).
     #[test]
     fn cuda_discrete_maps_dedicated_vram_no_uma() {
         // 4090: 24564 MiB dedicated VRAM, 124 GiB host RAM (RunPod container).
@@ -1436,22 +805,9 @@ mod tests {
         assert_eq!(limits.vram_mb, 24_564);
         assert_eq!(limits.shared_mb, 0, "discrete: no shared spill pool");
         assert!(!limits.unified, "no UMA on the 4090");
-        // Discrete-path budget = vram only (shared 0), and 160M (~2.9 GiB fixed) fits with margin.
-        let effective = limits.vram_mb + limits.shared_mb * 9 / 10;
-        assert_eq!(effective, 24_564);
-        let m160 = llama_model(151_862_784, 50_257, 768, 128 * MIB);
-        let v = m160.verdict(&limits, DEFAULT_MAX_MICROBATCH);
-        assert!(v.eligible, "160M eligible on a 24 GB discrete 4090: {v:?}");
-        assert!(v.micro_batch >= 1);
-        // A single tensor larger than the whole card is still (correctly) rejected.
-        let oversized = Autotune {
-            max_tensor_bytes: 25_000 * MIB,
-            ..llama_model(151_862_784, 50_257, 768, 128 * MIB)
-        };
-        assert!(!oversized.verdict(&limits, DEFAULT_MAX_MICROBATCH).eligible);
     }
 
-    /// `windows_warp_skipped`: a software (WARP) adapter maps to `None` so enumeration skips it.
+    /// A software (WARP) adapter maps to `None` so enumeration skips it.
     #[test]
     fn windows_warp_skipped() {
         let warp = DxgiAdapterMemory {
@@ -1464,9 +820,8 @@ mod tests {
 
     // ---- macOS Metal probe mapping (swarm-macos-uma-findings.md §4) ----
 
-    /// `macos_m1_working_set_and_joint_pool`: the measured M1-mini numbers (8 GiB) map to
-    /// `vram_mb = recommendedMaxWorkingSetSize` (⅔ RAM), `max_alloc_mb = maxBufferLength` (½ RAM),
-    /// `shared_mb = ram_mb`, `unified = true`; the joint pool then admits 160M and rejects 1.2B.
+    /// The measured M1-mini numbers (8 GiB) map to `vram_mb = recommendedMaxWorkingSetSize`
+    /// (⅔ RAM), `max_alloc_mb = maxBufferLength` (½ RAM), `shared_mb = ram_mb`, `unified = true`.
     #[test]
     fn macos_m1_working_set_and_joint_pool() {
         let metal = MetalAdapterMemory {
@@ -1481,17 +836,5 @@ mod tests {
         assert_eq!(limits.ram_mb, 8192);
         assert_eq!(limits.shared_mb, 8192);
         assert!(limits.unified);
-
-        // 160M ELIGIBLE, 1.2B INELIGIBLE on this 8 GiB M1 (findings §3).
-        let m160 = llama_model(151_862_784, 50_257, 768, 8 * MIB);
-        assert!(
-            m160.verdict(&limits, DEFAULT_MAX_MICROBATCH).eligible,
-            "160M must fit an 8 GiB M1"
-        );
-        let b1_2 = llama_model(1_200_000_000, 50_257, 2048, 512 * MIB);
-        assert!(
-            !b1_2.verdict(&limits, DEFAULT_MAX_MICROBATCH).eligible,
-            "1.2B cannot fit an 8 GiB M1"
-        );
     }
 }

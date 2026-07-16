@@ -792,6 +792,26 @@ where
                 round,
                 pointer: typed.pointer,
             });
+            // E3: voice this peer's DIGEST attestation into the coordinator flow (architecture
+            // §5.3 — "the checkpoint's declared digest equals my consensus state at this fence",
+            // signable immediately since the peer just computed that digest). Every peer's typed
+            // capture is deterministic (det-lane state + round-granular cursors), so the roster
+            // converges on one checkpoint content hash and the coordinator's ledger accumulates
+            // the K distinct digest attestations that gate cold-join eligibility.
+            use daemon_vhc_sdk_consensus::attestation::{AttestationBody, AttestationTier};
+            let att = AttestationBody {
+                tier: AttestationTier::Digest,
+                run_id: ident.run_id,
+                epoch: ident.epoch,
+                round,
+                checkpoint: typed.content_hash,
+                digest: daemon_vhc_proto::StateDigest(digest.0),
+                signer: self.peer,
+            }
+            .sign(&self.key)
+            .map_err(|e| SwarmRunError::Lifecycle(format!("sign checkpoint attestation: {e}")))?;
+            self.publish(SwarmMessage::CheckpointAttestation(att.to_wire()))
+                .await?;
         }
         Ok(())
     }
@@ -1210,6 +1230,249 @@ mod tests {
         assert_eq!(
             recovered, last_agreed,
             "the late joiner reaches the run's agreed digest at round {last_round}"
+        );
+    }
+
+    /// THE Phase-E **cold-join acceptance** (refactor §9; the E1 `restore_attestation_round_trip`
+    /// seed grown to the full flow against a LIVE run): admission → attested checkpoint →
+    /// restore → record-replay catch-up, with the attestation frames flowing **through the
+    /// coordinator** (`SwarmMessage::CheckpointAttestation` → `tick` → the consensus ledger) —
+    /// the K-digest gate and the restore-attestation preference evaluated over the ledger the
+    /// coordinator actually accumulated on the wire, never a hand-built one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cold_join_via_coordinator_attestation_flow() {
+        use crate::checkpoint::{
+            load_typed_checkpoint, plan_late_join, resync_by_replay, steps_from_round_records,
+            CheckpointCandidate, LateJoinPlan, ResyncPlan,
+        };
+        use daemon_vhc_proto::messages::{Locator, RoundRecord as ProtoRoundRecord};
+        use daemon_vhc_sdk_consensus::attestation::{
+            AttestationBody, AttestationLedger, AttestationPolicy, AttestationTier,
+            SignedAttestation,
+        };
+        use daemon_vhc_sdk_consensus::coordinator::{tick, Input};
+
+        let cfg = SwarmConfig {
+            checkpoint_every_rounds: 2,
+            typed_checkpoints: true,
+            ..SwarmConfig::small(6)
+        };
+        let num_peers = u32::try_from(cfg.num_peers).unwrap();
+        let run = run_swarm(cfg).await.unwrap();
+        assert!(run.all_agree());
+
+        // -- the coordinator flow: fold the pure tick over the recorded live inputs -------------
+        // The engines voiced one digest attestation per peer per cadence boundary as
+        // CheckpointAttestation frames; the LocalCoordinator fed every inbound frame to `tick`.
+        // Re-deriving the final state from the recorded trajectory proves the ledger was
+        // populated THROUGH the coordinator flow (and is what any node recovers offline).
+        let replay = run.replay.as_ref().expect("coordinator replay captured");
+        let mut folded = replay.initial_state().clone();
+        // Keep the last LIVE (non-halted) state beside the final fold: a real joiner attests
+        // while the run is live, and a halted coordinator rightly refuses new inputs (PROTO-14).
+        let mut state = folded.clone();
+        for input in replay.inputs() {
+            folded = tick(folded, input.clone()).0;
+            if !folded.phase.is_halted() {
+                state = folded.clone();
+            }
+        }
+        let ledger: &AttestationLedger = &state.attestations;
+
+        // The roster converged on ONE typed checkpoint per cadence round (deterministic capture),
+        // and every peer's digest attestation was recorded: K distinct signers per checkpoint.
+        let mut typed: std::collections::BTreeMap<RoundId, CheckpointManifest> =
+            std::collections::BTreeMap::new();
+        for (_peer, ev) in &run.events {
+            if let EngineEvent::TypedCheckpointed { round, pointer } = ev {
+                if let Some(prev) = typed.insert(*round, *pointer) {
+                    assert_eq!(
+                        prev.blake3, pointer.blake3,
+                        "round {round}: every peer captured the identical typed checkpoint"
+                    );
+                }
+            }
+        }
+        assert!(typed.contains_key(&1) && typed.contains_key(&3));
+        for (round, ptr) in &typed {
+            assert_eq!(
+                ledger.count(&ptr.blake3, AttestationTier::Digest),
+                num_peers,
+                "round {round}: the coordinator recorded every peer's digest attestation"
+            );
+        }
+
+        // -- admission: the K-digest gate over the coordinator-accumulated ledger ---------------
+        let candidates: Vec<CheckpointCandidate> = typed
+            .iter()
+            .map(|(round, ptr)| CheckpointCandidate {
+                content_hash: ptr.blake3,
+                round: *round,
+            })
+            .collect();
+        let current_round = *run.records.keys().last().expect("rounds ran");
+        // A K above the roster size gates the join CLOSED (AwaitAttested — not enough distinct
+        // digest attestations exist anywhere).
+        let strict = AttestationPolicy::new(num_peers + 1);
+        assert!(matches!(
+            plan_late_join(&strict, ledger, &candidates, current_round, 8),
+            LateJoinPlan::AwaitAttested { .. }
+        ));
+        // K = roster size: join-eligible. No restore attestation exists yet, so preference falls
+        // to the deterministic tie-break among the eligible candidates.
+        let policy = AttestationPolicy::new(num_peers);
+        let plan = plan_late_join(&policy, ledger, &candidates, current_round, 8);
+        assert!(matches!(plan, LateJoinPlan::Restore { .. }));
+
+        // -- restore preference: a restore-attested checkpoint wins once it exists --------------
+        // A prior joiner restored the round-3 checkpoint and voiced a RESTORE attestation as the
+        // same wire frame; feed it through `tick` exactly as the coordinator would.
+        let restorer = SigningKey::from_bytes(&[0x77; 32]);
+        let restore_att = AttestationBody {
+            tier: AttestationTier::Restore,
+            run_id: daemon_vhc_proto::blake3_hash(run.run.as_str().as_bytes()),
+            epoch: 0,
+            round: 3,
+            checkpoint: typed[&3].blake3,
+            digest: daemon_vhc_proto::StateDigest(typed[&3].digest.0),
+            signer: daemon_vhc_proto::peer_id(&restorer),
+        }
+        .sign(&restorer)
+        .unwrap();
+        let frame = daemon_vhc_proto::SignedMessage::sign(
+            &restorer,
+            daemon_vhc_proto::SWARM_PROTO_VERSION,
+            SwarmMessage::CheckpointAttestation(restore_att.to_wire()),
+        )
+        .unwrap();
+        let (state, _) = tick(state, Input::Message(frame));
+        assert!(state.attestations.is_restore_attested(&typed[&3].blake3));
+        let plan = plan_late_join(&policy, &state.attestations, &candidates, current_round, 8);
+        let LateJoinPlan::Restore {
+            checkpoint,
+            from_round,
+            catch_up,
+        } = plan
+        else {
+            panic!("expected Restore, got {plan:?}");
+        };
+        assert_eq!(
+            checkpoint, typed[&3].blake3,
+            "the restore-attested checkpoint is preferred (recoverability > consistency)"
+        );
+        assert_eq!(from_round, 3);
+        let ResyncPlan::ReplayFromCheckpoint { steps, .. } = catch_up else {
+            panic!("retained window covers the gap, got {catch_up:?}");
+        };
+        assert!(steps >= 1, "rounds past the checkpoint remain to replay");
+
+        // -- restore: the cold joiner loads the full typed manifest (it verifies) ---------------
+        let mut joiner = crate::backend::StubBackend::new();
+        joiner.build(b"cold-joiner-unrelated-config").unwrap();
+        load_typed_checkpoint(&run.store, &run.run, &mut joiner, &typed[&3])
+            .await
+            .expect("restore from the attested checkpoint");
+        // … and voices its own restore attestation through the coordinator flow (round-trip:
+        // the E1 named test's step, now on the wire).
+        let joiner_key = SigningKey::from_bytes(&[0x78; 32]);
+        let joiner_att = AttestationBody {
+            tier: AttestationTier::Restore,
+            run_id: daemon_vhc_proto::blake3_hash(run.run.as_str().as_bytes()),
+            epoch: 0,
+            round: 3,
+            checkpoint: typed[&3].blake3,
+            digest: daemon_vhc_proto::StateDigest(typed[&3].digest.0),
+            signer: daemon_vhc_proto::peer_id(&joiner_key),
+        }
+        .sign(&joiner_key)
+        .unwrap();
+        let frame = daemon_vhc_proto::SignedMessage::sign(
+            &joiner_key,
+            daemon_vhc_proto::SWARM_PROTO_VERSION,
+            SwarmMessage::CheckpointAttestation(joiner_att.to_wire()),
+        )
+        .unwrap();
+        let (state, _) = tick(state, Input::Message(frame));
+        assert_eq!(
+            state
+                .attestations
+                .signers(&typed[&3].blake3, AttestationTier::Restore)
+                .len(),
+            2,
+            "both restore attestations recorded, distinct signers"
+        );
+        // A tampered attestation (wrong inner signature for the claimed signer) is REJECTED by
+        // the coordinator flow and never inflates the ledger.
+        let mut forged = joiner_att.clone();
+        forged.body.signer = daemon_vhc_proto::peer_id(&SigningKey::from_bytes(&[0x79; 32]));
+        let forged_frame = daemon_vhc_proto::SignedMessage::sign(
+            &joiner_key,
+            daemon_vhc_proto::SWARM_PROTO_VERSION,
+            SwarmMessage::CheckpointAttestation(
+                SignedAttestation {
+                    body: forged.body,
+                    sig: forged.sig,
+                }
+                .to_wire(),
+            ),
+        )
+        .unwrap();
+        let (state, outputs) = tick(state, Input::Message(forged_frame));
+        assert!(
+            outputs.iter().any(|o| matches!(
+                o,
+                daemon_vhc_sdk_consensus::coordinator::Output::Reject(
+                    daemon_vhc_sdk_consensus::coordinator::Rejection::BadSignature
+                )
+            )),
+            "a forged attestation is a typed rejection"
+        );
+        assert_eq!(
+            state
+                .attestations
+                .signers(&typed[&3].blake3, AttestationTier::Restore)
+                .len(),
+            2,
+            "the forged attestation never entered the ledger"
+        );
+
+        // -- record-replay catch-up: rounds past the checkpoint, then the agreed digest ---------
+        let records: Vec<ProtoRoundRecord> = run
+            .records
+            .iter()
+            .filter(|(round, _)| **round > 3)
+            .map(|(round, entries)| {
+                let pairs: Vec<(PeerId, Hash)> = entries.iter().map(|e| (e.peer, e.hash)).collect();
+                ProtoRoundRecord {
+                    round: *round,
+                    set: daemon_vhc_proto::commit_set(&pairs).commitment(),
+                    drops: Vec::new(),
+                    next_seed: daemon_vhc_proto::Seed([0; 32]),
+                    set_locator: Locator::StoreKey(String::new()),
+                    inline: Some(entries.clone()),
+                }
+            })
+            .collect();
+        assert!(!records.is_empty());
+        let last_round = records.last().expect("records").round;
+        let mut plane: std::collections::BTreeMap<Hash, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for record in &records {
+            for e in record.inline.iter().flatten() {
+                let key = PayloadKey::new(run.run.clone(), record.round, e.peer);
+                let bytes = run.store.get(&key, &e.hash).await.expect("payload bytes");
+                plane.insert(e.hash, bytes);
+            }
+        }
+        let steps = steps_from_round_records(&records, |h| plane.get(h).cloned()).unwrap();
+        let ckpt = joiner.checkpoint_save().unwrap();
+        let recovered = resync_by_replay(&mut joiner, &ckpt, &steps).unwrap();
+        assert_eq!(
+            recovered,
+            *run.agreed_transcript()
+                .get(&last_round)
+                .expect("agreed digest"),
+            "the cold joiner reaches the live run's agreed digest — cold join green"
         );
     }
 

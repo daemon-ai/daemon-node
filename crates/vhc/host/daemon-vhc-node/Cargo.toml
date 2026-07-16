@@ -33,6 +33,9 @@ thiserror = { workspace = true }
 # bundled amalgamation + PRAGMA user_version migrations via rusqlite_migration.
 rusqlite = { version = "0.37", features = ["bundled"] }
 rusqlite_migration = { workspace = true }
+# The arbiter's ledger keys carry the 32-byte run identity; a v1-era run (no genesis hash yet)
+# uses blake3(RunLabel) as its node-local stand-in (decisions D6 wiring).
+blake3 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
