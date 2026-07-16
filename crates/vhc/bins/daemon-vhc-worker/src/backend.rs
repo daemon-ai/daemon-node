@@ -42,14 +42,13 @@ pub(crate) struct ResolvedRun {
     pub(crate) genesis: Option<GenesisRun>,
 }
 
-/// A resolved envelope-v2 (genesis) run: the decoded envelope, its hash (the cryptographic
-/// `RunId`, ABI §8.1), and the joining worker role. A genesis run's COORDINATION is its wasm
-/// coordinator module (mixed-fleet cell 8) — the transitional cell-6 native-coordinator adapter
-/// was retired at D2, so no coordinator-role config is read host-side anymore.
+/// A resolved envelope-v2 (genesis) run: the decoded envelope and the joining worker role. A
+/// genesis run's COORDINATION is its wasm coordinator module (mixed-fleet cell 8) — the
+/// transitional cell-6 native-coordinator adapter was retired at D2, so no coordinator-role
+/// config is read host-side anymore, and the cryptographic `RunId` (the genesis hash) is
+/// re-derived from the frozen bytes wherever a join path needs it.
 pub(crate) struct GenesisRun {
     pub(crate) env: daemon_vhc_proto::GenesisEnvelope,
-    /// The genesis hash — the cryptographic `RunId` (architecture §5.1).
-    pub(crate) run_id: [u8; 32],
     /// The worker role this node assessed/joins (the first non-coordinator role — the
     /// single-worker interim of decisions D6; role *selection* is node policy from Phase E).
     pub(crate) worker_role: String,
@@ -163,8 +162,7 @@ async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String
                     role.module, artifact.url
                 )
             })?;
-            let run_id = *frozen.run_id().as_bytes();
-            return finish_genesis_run(config, bytes, pin, device_min, env, run_id, worker_role);
+            return finish_genesis_run(config, bytes, pin, device_min, env, worker_role);
         }
         let bytes = ArtifactResolver::new()
             .fetch(&art)
@@ -172,28 +170,17 @@ async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String
             .map_err(|e| format!("resolve module `{}` ({}): {e}", role.module, artifact.url))?;
         (bytes, pin)
     };
-    let run_id = *frozen.run_id().as_bytes();
-    finish_genesis_run(
-        config,
-        module,
-        module_blake3,
-        device_min,
-        env,
-        run_id,
-        worker_role,
-    )
+    finish_genesis_run(config, module, module_blake3, device_min, env, worker_role)
 }
 
 /// Assemble the genesis [`ResolvedRun`] (split out so the feature-gated store-fetch arm can share
 /// the tail without duplicating it).
-#[allow(clippy::too_many_arguments)]
 fn finish_genesis_run(
     config: Vec<u8>,
     module: Vec<u8>,
     module_blake3: Option<[u8; 32]>,
     device_min: Option<daemon_vhc_proto::DeviceMinimums>,
     env: daemon_vhc_proto::GenesisEnvelope,
-    run_id: [u8; 32],
     worker_role: String,
 ) -> Result<ResolvedRun, String> {
     Ok(ResolvedRun {
@@ -202,11 +189,7 @@ fn finish_genesis_run(
         module_blake3,
         device_min,
         envelope: None,
-        genesis: Some(GenesisRun {
-            env,
-            run_id,
-            worker_role,
-        }),
+        genesis: Some(GenesisRun { env, worker_role }),
     })
 }
 
