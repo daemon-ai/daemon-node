@@ -187,8 +187,9 @@ async fn supervisor_probe_assess_join() {
     );
     assert!(hw.capabilities.ops.iter().any(|o| o == "flash_attn@1"));
 
-    // Assess: the static import scan + meta pass over the tiny config → eligible.
-    let elig = sup.assess(tiny_cfg_cbor()).await.expect("assess");
+    // Assess: a signed envelope (the unsigned raw-config path retired at D0); the module still
+    // resolves through the DAEMON_TRAIN_MODULE override inside the signed path.
+    let elig = sup.assess(signed_envelope_wire()).await.expect("assess");
     assert!(
         elig.eligible,
         "tiny-llama must be eligible: {:?}",
@@ -319,6 +320,33 @@ async fn worker_resolves_module_from_signed_envelope() {
     sup.shutdown().await;
 }
 
+/// D0: the unsigned legacy envelope path is RETIRED with a typed refusal (refactor §8/D0). Raw
+/// `[experiment.config]` CBOR (no `SignedEnvelope` wrapper) — the pre-A0 direct-drive — is
+/// refused with the stable `UnsignedEnvelopeRetired` slug even when `DAEMON_TRAIN_MODULE` is
+/// set; the override survives only INSIDE the signed path (the tests above prove that half).
+#[tokio::test]
+async fn unsigned_raw_config_assess_is_refused_with_typed_slug() {
+    let module = module_path();
+    let mut cfg = TrainClientConfig::new(worker_bin());
+    cfg.env = vec![(
+        "DAEMON_TRAIN_MODULE".to_string(),
+        module.to_string_lossy().into_owned(),
+    )];
+    cfg.spawn_timeout = Duration::from_secs(30);
+    cfg.op_timeout = Duration::from_secs(60);
+    let sup = TrainSupervisor::new(cfg);
+
+    let err = sup
+        .assess(tiny_cfg_cbor())
+        .await
+        .expect_err("raw-config assess must refuse (retired at D0)");
+    assert!(
+        err.to_string().contains("UnsignedEnvelopeRetired"),
+        "the refusal carries the stable typed slug, got: {err}"
+    );
+    sup.shutdown().await;
+}
+
 /// RUN-9 (§10.5) over the **real** worker: preemption-as-churn. After a join, `Throttle{paused}`
 /// pauses the `WasmBackend` (checkpoint + drop the wasm instance) and resume re-instantiates; a
 /// subsequent join re-enters — all over the **same** worker (pause/resume is churn, never a respawn).
@@ -334,7 +362,7 @@ async fn real_worker_preemption_pause_resume_rejoins_without_respawn() {
     cfg.op_timeout = Duration::from_secs(60);
     let sup = TrainSupervisor::new(cfg);
 
-    sup.assess(tiny_cfg_cbor()).await.expect("assess");
+    sup.assess(signed_envelope_wire()).await.expect("assess");
     sup.join("run-9", "wss://coord", vec![], policy())
         .await
         .expect("initial join");
@@ -382,11 +410,12 @@ async fn worker_drives_one_round() {
         "worker announces Ready first"
     );
 
-    // Assess (caches the config for the join), then join and drive the round.
+    // Assess (caches the config for the join), then join and drive the round. Signed envelope
+    // only — the unsigned raw-config drive was retired at D0 (typed refusal, test below).
     send(
         &writer,
         &WCmd::AssessRun {
-            envelope: tiny_cfg_cbor(),
+            envelope: signed_envelope_wire(),
         },
     )
     .await;

@@ -24,58 +24,60 @@ const UNKNOWN_BUDGET_MB: u64 = u64::MAX / (1 << 20);
 
 /// The experiment inputs a run resolves to: the `[experiment.config]` CBOR + the module `.wasm`,
 /// plus the envelope's per-role blake3 pin when one exists (the ABI §1.3 step-1 verify-before-
-/// compile input; `None` on the legacy `DAEMON_TRAIN_MODULE`/raw-config paths, which carry no pin).
+/// compile input; `None` under the explicit `DAEMON_TRAIN_MODULE` module-source override, which
+/// deliberately bypasses the artifact map and so carries no pin).
 pub(crate) struct ResolvedRun {
     pub(crate) config: Vec<u8>,
     pub(crate) module: Vec<u8>,
     pub(crate) module_blake3: Option<[u8; 32]>,
     /// The envelope's additive `device_min` section (ABI §9.3 stage-3 pre-screen; D3 cell 5
-    /// interim-supported), parsed from the RAW frozen bytes — `None` on the legacy raw-config path.
+    /// interim-supported), parsed from the RAW frozen bytes — `None` when the envelope carries
+    /// no such section.
     pub(crate) device_min: Option<daemon_vhc_proto::DeviceMinimums>,
-    /// The decoded typed envelope (the coordinator-config source for the v2 self-driven join);
-    /// `None` on the legacy raw-config path (which has no coordinator to drive).
+    /// The decoded typed envelope (the coordinator-config source for the v2 self-driven join).
     pub(crate) envelope: Option<daemon_vhc_proto::Envelope>,
 }
 
+/// The typed refusal slug for the D0-retired unsigned legacy envelope path (refactor §8/D0:
+/// "the worker's unsigned legacy envelope path is retired here with a typed refusal"). Stable —
+/// tests and the node key on it, exactly like the ABI §1.5 refusal slugs.
+pub(crate) const UNSIGNED_ENVELOPE_RETIRED: &str = "UnsignedEnvelopeRetired";
+
 /// Resolve the `AssessRun` envelope bytes into `(config, module)` (the §6.1/§6.5 seam).
 ///
-/// The bytes are the canonical [`SignedEnvelope`] wire form: verify it, take `config_bytes()`, and
-/// resolve the module from the envelope's artifact map via [`ArtifactResolver`] (`file://`,
-/// blake3-verified). `DAEMON_TRAIN_MODULE` overrides the artifact fetch. If the bytes are not a
-/// signed-envelope wrapper, fall back to treating them as raw `[experiment.config]` CBOR with the
-/// module from `DAEMON_TRAIN_MODULE` (the legacy direct-drive path).
+/// The bytes MUST be the canonical [`SignedEnvelope`] wire form: verify it, take
+/// `config_bytes()`, and resolve the module from the envelope's artifact map via
+/// [`ArtifactResolver`] (`file://`, blake3-verified). `DAEMON_TRAIN_MODULE` remains the explicit
+/// dev/node-controlled **module-source override inside the signed path** (it substitutes the
+/// artifact fetch, never the envelope).
+///
+/// **D0: the unsigned legacy path is RETIRED.** Bytes that are not a signed-envelope wrapper
+/// (the pre-A0 raw `[experiment.config]` CBOR direct-drive) are refused with the typed
+/// [`UNSIGNED_ENVELOPE_RETIRED`] slug — never accepted, never guessed at. Dev/test drives that
+/// used raw config author a signed envelope instead (the worker-protocol suite's
+/// `signed_envelope_wire()` shape), optionally keeping `DAEMON_TRAIN_MODULE` as the module
+/// source.
 pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, String> {
-    match from_canonical_slice::<SignedEnvelope>(envelope_bytes) {
-        Ok(wire) => {
-            // A signed-envelope wrapper: verify it (re-derives hash + config, checks the signature).
-            let frozen = wire.open().map_err(|e| format!("verify envelope: {e}"))?;
-            let config = frozen.config_bytes().to_vec();
-            let device_min = frozen.device_min();
-            let envelope = frozen.decode().ok();
-            let (module, module_blake3) = resolve_module(&frozen).await?;
-            Ok(ResolvedRun {
-                config,
-                module,
-                module_blake3,
-                device_min,
-                envelope,
-            })
-        }
-        // Not a signed-envelope wrapper: the legacy raw `[experiment.config]` CBOR path.
-        Err(_) => {
-            let module = module_from_env().ok_or_else(|| {
-                "AssessRun envelope is neither a signed envelope nor is DAEMON_TRAIN_MODULE set"
-                    .to_string()
-            })??;
-            Ok(ResolvedRun {
-                config: envelope_bytes.to_vec(),
-                module,
-                module_blake3: None,
-                device_min: None,
-                envelope: None,
-            })
-        }
-    }
+    let wire = from_canonical_slice::<SignedEnvelope>(envelope_bytes).map_err(|e| {
+        format!(
+            "{UNSIGNED_ENVELOPE_RETIRED}: AssessRun bytes are not a SignedEnvelope wire form \
+             (the unsigned legacy raw-config path was retired at D0; author a signed envelope — \
+             DAEMON_TRAIN_MODULE still overrides the module source inside it): {e}"
+        )
+    })?;
+    // Verify (re-derives hash + config over the received bytes, checks the signature).
+    let frozen = wire.open().map_err(|e| format!("verify envelope: {e}"))?;
+    let config = frozen.config_bytes().to_vec();
+    let device_min = frozen.device_min();
+    let envelope = frozen.decode().ok();
+    let (module, module_blake3) = resolve_module(&frozen).await?;
+    Ok(ResolvedRun {
+        config,
+        module,
+        module_blake3,
+        device_min,
+        envelope,
+    })
 }
 
 /// Resolve the experiment module bytes for a verified envelope (P3 lane S — fetch-by-hash):
