@@ -18,6 +18,7 @@ use daemon_vhc_proto::messages::{
 use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{blake3_hash, commit_set, Hash, PeerId, Seed, SwarmProtoVersion};
 
+use crate::authority::Authorized;
 use crate::coordinator::admission::{admit, JoinCandidate};
 use crate::coordinator::commit::{all_committed, all_evidenced, committed_entries};
 use crate::coordinator::io::{ControlAction, ControlRequest, Input, Notice, Output, Rejection};
@@ -35,30 +36,34 @@ pub fn tick(mut state: CoordinatorState, input: Input) -> (CoordinatorState, Vec
     (state, out)
 }
 
-/// Advance the coordinator by an **already-authenticated** message — the D2 thin `Authority`
-/// seam (a stub awaiting D1's `Authority` trait in this crate).
+/// Advance the coordinator by a message whose delivery authority is attested by D1's
+/// [`Authorized`] token — the reconciled D2 seam (formerly the pre-D1 `SingleKey` stub).
 ///
 /// Rationale (architecture §4.2/§4.3): the wasm `coordinator-quorum` guest receives worker
 /// messages as **host-verified** `Frame` events — the host authenticated the §12 signed-frame
-/// envelope above the sandbox and delivers only the opaque payload + the (authenticated) sender,
-/// never a re-checkable ed25519 signature. So the guest cannot run [`tick`]'s `Input::Message`
-/// path (which re-verifies `sm.verify()`); it feeds the authenticated `(signer, version, payload)`
-/// here instead. Today's implicit trust is **`SingleKey`** — a frame from the host-authenticated
-/// sender is accepted — which is exactly what D1 will formalize; until then this seam is thin and
-/// deliberately isolated so D1's reconciliation is mechanical: it replaces the trust decision (who
-/// may send) with `Authority::accept`, leaving the dispatch below untouched.
+/// envelope above the sandbox on a **declared authoritative channel** and delivers only the
+/// opaque payload + the (authenticated) sender, never a re-checkable ed25519 signature. That is
+/// exactly the provenance [`Authorized::from_authoritative_channel`] encodes (D1's host-delivery
+/// bridge path); the in-guest signature path obtains the same token from `Authority::authorize`.
+/// Either way, the caller cannot reach the dispatch below without having gone through D1's
+/// authority vocabulary — the trust decision lives in the token's mint, not here.
 ///
 /// The decision logic is **identical** to [`tick`]'s message path after signature verification
 /// (both funnel through the private `dispatch_payload`), so a native reference fed validly-signed
 /// frames and this guest fed the same host-authenticated payloads produce byte-identical outputs —
-/// the dual-compilation identity property (refactor §8/D2 acceptance).
+/// the dual-compilation identity property (refactor §8/D2 acceptance). The token itself carries no
+/// decision-relevant data (the channel is delivery provenance), so it cannot perturb identity.
 #[must_use]
 pub fn tick_authenticated(
     mut state: CoordinatorState,
     signer: PeerId,
     version: SwarmProtoVersion,
     payload: SwarmMessage,
+    authorized: Authorized,
 ) -> (CoordinatorState, Vec<Output>) {
+    // The token is the proof-of-provenance; its channel is not a dispatch input (delivery routing
+    // is host mechanism, ABI §6.2). Consume it explicitly so the requirement is visible.
+    let _ = authorized.channel();
     let mut out = Vec::new();
     if version != state.config.proto_version {
         out.push(Output::Reject(Rejection::VersionMismatch {

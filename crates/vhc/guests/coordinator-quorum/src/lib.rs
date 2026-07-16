@@ -16,8 +16,10 @@
 //! - **`Frame`** — a worker's control message (`Join`/`Commitment`/`StorageReceipt`/…), delivered
 //!   host-verified (the host authenticated the §12 signed-frame envelope above the sandbox; the
 //!   guest sees the authenticated `sender` + opaque payload, never a re-checkable signature). The
-//!   guest decodes the payload as a [`SwarmMessage`] and feeds it through the D2 thin `Authority`
-//!   seam [`tick_authenticated`] — today's implicit `SingleKey` trust (D1 formalizes `Authority`).
+//!   guest accepts frames **only on the declared authoritative records channel**, mints D1's
+//!   [`Authorized`] token for that host-verified delivery
+//!   (`Authorized::from_authoritative_channel` — the bridge path of the D1 contract), and feeds
+//!   the decoded [`SwarmMessage`] through [`tick_authenticated`] with it.
 //! - **`Timer`** — drives the logical clock for deadline-based transitions (warmup / round
 //!   timeouts) in a live run.
 //!
@@ -36,6 +38,7 @@ use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, PeerId, SwarmMess
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, tick_authenticated, CoordinatorState, Input, Output,
 };
+use daemon_vhc_sdk_consensus::{Authorized, DEFAULT_RECORDS_CHANNEL};
 use daemon_vhc_sdk_v2::module::{ModuleDecl, V2Module};
 use serde::Deserialize;
 
@@ -127,18 +130,29 @@ impl V2Module for Coordinator {
             let ev = daemon_vhc_sdk_v2::abi::next_event(&mut buf);
             match ev.tag {
                 t if t == EV_TAG_FRAME => {
+                    let channel = ev.uint(1);
                     let sender = ev.bytes(3);
                     let payload = ev.bytes(4);
-                    if let Ok(arr) = <[u8; 32]>::try_from(sender.as_slice()) {
-                        if let Ok(msg) = from_canonical_slice::<SwarmMessage>(&payload) {
-                            let (next, outputs) = tick_authenticated(
-                                self.state.clone(),
-                                PeerId(arr),
-                                proto_version,
-                                msg,
-                            );
-                            self.state = next;
-                            self.emit(&outputs);
+                    // D1's Authority vocabulary (the reconciled seam): a delivered Frame on the
+                    // declared authoritative records channel was signature-verified above the
+                    // pump — exactly the provenance `Authorized::from_authoritative_channel`
+                    // encodes. Frames on any other channel carry no record authority and never
+                    // reach the tick (ignoring a delivered event is module policy, §5.2).
+                    if channel == u64::from(DEFAULT_RECORDS_CHANNEL) {
+                        let authorized =
+                            Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
+                        if let Ok(arr) = <[u8; 32]>::try_from(sender.as_slice()) {
+                            if let Ok(msg) = from_canonical_slice::<SwarmMessage>(&payload) {
+                                let (next, outputs) = tick_authenticated(
+                                    self.state.clone(),
+                                    PeerId(arr),
+                                    proto_version,
+                                    msg,
+                                    authorized,
+                                );
+                                self.state = next;
+                                self.emit(&outputs);
+                            }
                         }
                     }
                     // Event-driven synthetic clock: one tick per delivered frame so the

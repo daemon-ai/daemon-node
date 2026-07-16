@@ -10,11 +10,11 @@
 //! content-addressed payloads can re-verify every consensus decision and every digest. This
 //! module is that third party's verifier:
 //!
-//! 1. **Chain walk from signed heads** — the gossiped [`SignedHead`]s name the sealed segments;
-//!    each is judged through the archive's `SingleKey` seam
-//!    ([`RecordArchive::head_is_authoritative`] — D1's `Authority::accept` replaces exactly that
-//!    judgment), checked for chain contiguity (`prev_hash` extends the previous head), fetched
-//!    **by content address**, and re-hashed (a third party trusts no store).
+//! 1. **Chain walk from attested heads** — the gossiped [`AttestedHead`]s name the sealed
+//!    segments; each is judged through the run's declared `Authority`
+//!    ([`RecordArchive::head_authorize`] over D1's `AuthorityConfig` — `SingleKey` and
+//!    `ThresholdKeys` alike), checked for chain contiguity (`prev_hash` extends the previous
+//!    head), fetched **by content address**, and re-hashed (a third party trusts no store).
 //! 2. **Record recovery** — the §8.3 records are recovered from the segment bytes alone: the
 //!    tag-10 snapshot is the initial coordinator state, tag-1/tag-3 records are the driving
 //!    inputs, and tag-4 publishes carry the coordinator's own signed `RoundOpen`/`RoundRecord`
@@ -38,7 +38,7 @@ use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 
 use crate::replay::{replay_from_state, ReplayError, ReplayReport};
 
-use super::archive::{RecordArchive, SignedHead};
+use super::archive::{AttestedHead, RecordArchive};
 use super::record::{Body, Record};
 use super::segment::scan_bytes;
 
@@ -195,18 +195,18 @@ pub struct RecoveredChain {
     pub records: Vec<Record>,
 }
 
-/// Walk the signed head chain and recover every record from the archive alone (steps 1–2 of the
-/// module contract). Also the failover drill's standby recovery path (refactor §8/D2: a standby
-/// "resumes from archive + journal" — this is the archive half).
+/// Walk the attested head chain and recover every record from the archive alone (steps 1–2 of
+/// the module contract). Also the failover drill's standby recovery path (refactor §8/D2: a
+/// standby "resumes from archive + journal" — this is the archive half).
 ///
 /// # Errors
 /// A typed [`ConsensusReplayError`] on an unauthoritative head, a broken chain, a missing or
 /// content-mismatched segment, or an unscannable segment.
 pub fn recover_chain_from_archive(
     archive: &RecordArchive,
-    heads: &[SignedHead],
+    heads: &[AttestedHead],
 ) -> Result<RecoveredChain, ConsensusReplayError> {
-    let mut by_segment: BTreeMap<u64, &SignedHead> = BTreeMap::new();
+    let mut by_segment: BTreeMap<u64, &AttestedHead> = BTreeMap::new();
     for head in heads {
         if !archive.head_is_authoritative(head) {
             return Err(ConsensusReplayError::Unauthoritative {
@@ -268,7 +268,7 @@ pub fn recover_chain_from_archive(
 }
 
 /// Re-verify a run's consensus from the record archive and the content-addressed payloads alone
-/// (see module docs). `heads` are the gossiped signed chain heads naming the sealed segments —
+/// (see module docs). `heads` are the gossiped attested chain heads naming the sealed segments —
 /// they MUST cover a contiguous chain from segment 0; `payloads` maps content hash → payload
 /// bytes (the run's update containers, fetched from any payload store).
 ///
@@ -276,7 +276,7 @@ pub fn recover_chain_from_archive(
 /// A typed [`ConsensusReplayError`]; an incomplete verification is never a pass.
 pub fn replay_consensus_from_archive(
     archive: &RecordArchive,
-    heads: &[SignedHead],
+    heads: &[AttestedHead],
     payloads: &BTreeMap<Hash, Vec<u8>>,
 ) -> Result<ConsensusReplayReport, ConsensusReplayError> {
     // -- 1./2. chain walk + record recovery, from the archive alone ------------------------------

@@ -23,19 +23,19 @@ use daemon_vhc_observe::journal::segment::scan_file;
 use daemon_vhc_observe::journal::store::{Journal, RotatePolicy};
 use daemon_vhc_observe::journal::StaticKey;
 use daemon_vhc_observe::{
-    replay_consensus_from_archive, ConsensusReplayError, ReplicationPolicy, RetentionPolicy,
-    SignedHead,
+    replay_consensus_from_archive, AttestedHead, ConsensusReplayError, ReplicationPolicy,
+    RetentionPolicy,
 };
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_vhc_proto::messages::{
     Commitment, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
 };
-use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, Seed,
     SignedMessage, SigningKey, SwarmMessage, SWARM_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{tick, CoordinatorState, Input, Output, RunConfig};
+use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
 const ROUNDS: u64 = 6;
 const RUN_LABEL: &str = "consensus-replay";
@@ -103,14 +103,21 @@ fn run_config() -> RunConfig {
 /// the heads, the payload table, and the coordinator authority.
 struct Fixture {
     archive: RecordArchive,
-    heads: Vec<SignedHead>,
+    heads: Vec<AttestedHead>,
     payloads: BTreeMap<Hash, Vec<u8>>,
-    authority: PeerId,
+    authority: AuthorityConfig,
+}
+
+fn single_key(authority: PeerId) -> AuthorityConfig {
+    AuthorityConfig {
+        topology: Topology::SingleKey(SingleKey::new(authority)),
+        records_channel: DEFAULT_RECORDS_CHANNEL,
+    }
 }
 
 fn build_fixture() -> Fixture {
     let coord_key = key(1);
-    let authority = peer_id(&coord_key);
+    let authority = single_key(peer_id(&coord_key));
     let worker_keys = [key(2), key(3)];
     let peers: Vec<PeerId> = worker_keys.iter().map(peer_id).collect();
 
@@ -246,9 +253,9 @@ fn build_fixture() -> Fixture {
     // Seal the tail so the WHOLE run is archived (the archive holds sealed segments only).
     journal.roll().expect("final roll");
 
-    // Publish every sealed segment content-addressed + build the signed head chain.
+    // Publish every sealed segment content-addressed + build the attested head chain.
     let mut archive = RecordArchive::new(
-        authority,
+        authority.clone(),
         ReplicationPolicy { factor: 1 },
         RetentionPolicy::default(),
     );
@@ -262,7 +269,7 @@ fn build_fixture() -> Fixture {
         }
         let bytes = std::fs::read(journal.paths().segment(ord)).expect("read segment");
         let addr = archive.publish_segment(bytes).expect("publish");
-        let head = Signed::seal(
+        let head = AttestedHead::single(
             &coord_key,
             ChainHead {
                 run_id: ident().run_id,
@@ -276,7 +283,7 @@ fn build_fixture() -> Fixture {
                 records: scan.records.len() as u64,
             },
         )
-        .expect("sign head");
+        .expect("attest head");
         archive.ingest_head(head.clone()).expect("head accepted");
         heads.push(head);
         prev = addr;
@@ -354,10 +361,11 @@ fn withheld_segment_breaks_the_walk_typed() {
 fn forged_or_gappy_heads_are_typed_refusals() {
     let fx = build_fixture();
 
-    // A head signed by an impostor is unauthoritative (the SingleKey seam).
+    // A head attested by an impostor fails AuthorityConfig::authorize (WrongSigner under the
+    // SingleKey topology — D1's typed refusal).
     let impostor = key(9);
     let mut forged = fx.heads.clone();
-    forged[0] = Signed::seal(&impostor, forged[0].body.clone()).expect("forged head");
+    forged[0] = AttestedHead::single(&impostor, forged[0].body.clone()).expect("forged head");
     let err = replay_consensus_from_archive(&fx.archive, &forged, &fx.payloads).unwrap_err();
     assert!(
         matches!(err, ConsensusReplayError::Unauthoritative { segment: 0 }),
@@ -365,7 +373,7 @@ fn forged_or_gappy_heads_are_typed_refusals() {
     );
 
     // Heads missing segment 0 cannot anchor the chain.
-    let gappy: Vec<SignedHead> = fx.heads[1..].to_vec();
+    let gappy: Vec<AttestedHead> = fx.heads[1..].to_vec();
     let err = replay_consensus_from_archive(&fx.archive, &gappy, &fx.payloads).unwrap_err();
     assert!(
         matches!(err, ConsensusReplayError::ChainBroken { segment: 0, .. }),

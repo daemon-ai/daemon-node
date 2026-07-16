@@ -19,19 +19,20 @@
 //!   no difference: the coordinator is unconfigurable before any worker is considered).
 //! - **schema 2 (genesis)** → derive the [`WasmCoordinatorSpec`]: the coordinator role's pinned
 //!   module hash, its **verbatim opaque config bytes** (the host never interprets them — they are
-//!   byte-identically the guest's `da_init` input, architecture §5.1 seam rule), and the
-//!   envelope-named `SingleKey` coordinator identity. This is **cell 8**'s configuration half.
+//!   byte-identically the guest's `da_init` input, architecture §5.1 seam rule), and the run's
+//!   declared [`AuthorityConfig`] decoded from the opaque `authority` section. This is **cell
+//!   8**'s configuration half.
 //!
 //! This derivation is harness-level infrastructure: the *production* admission seat for the
-//! genesis join flow (threading `RoleGrants` through `admit_v2`, certified keys) is D1's
-//! in-flight work — this module deliberately duplicates none of it.
+//! genesis join flow (threading `RoleGrants` through `admit_v2`, certified keys) is D1's landed
+//! work — this module deliberately duplicates none of it.
 //!
-//! ## The `SingleKey` seam (awaiting D1)
+//! ## The `Authority` seam (reconciled onto D1's contract — sitting 3)
 //!
-//! [`WasmCoordinatorSpec::authority`] is today's implicit trust made explicit: the envelope-named
-//! coordinator identity whose signature makes records/heads authoritative. D1's `Authority::accept`
-//! replaces the places this identity is *judged* (the archive's `head_is_authoritative`, the
-//! guest-side `tick_authenticated` seam); this spec field is just the envelope's naming of it.
+//! [`WasmCoordinatorSpec::authority`] is D1's typed `AuthorityConfig`; every judgment goes through
+//! `AuthorityConfig::authorize` — the network seat's frame check
+//! ([`authorize_coordinator_frame`]), the archive's head check, and the guest-side
+//! `tick_authenticated` token. The pre-D1 identity-comparison stubs are gone.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -45,9 +46,10 @@ use daemon_vhc_host::v2::{
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::{
-    from_canonical_slice, peek_schema, to_canonical_vec, FrozenGenesis, Hash, PeerId,
-    SignedMessage, SwarmMessage, GENESIS_SCHEMA_MAJOR,
+    from_canonical_slice, peek_schema, to_canonical_vec, FrozenGenesis, Hash, SignedMessage,
+    SwarmMessage, GENESIS_SCHEMA_MAJOR,
 };
+use daemon_vhc_sdk_consensus::{AuthorityConfig, RecordSig};
 
 /// Typed refusals from the wasm-coordinator configuration seat (decisions D3 cells 3/7 negatives
 /// + cell-8 well-formedness).
@@ -72,11 +74,11 @@ pub enum WasmCoordError {
     /// The coordinator role's module key is missing from the artifact map (envelope authoring).
     #[error("coordinator role module `{0}` absent from the genesis artifact map")]
     ModuleUnpinned(String),
-    /// A wasm coordinator needs the envelope-named `SingleKey` identity (launch trust topology,
-    /// architecture §4.2/§4.4) — a genesis without `[identities].coordinator` cannot name whose
-    /// records count.
-    #[error("genesis envelope names no coordinator identity ([identities].coordinator)")]
-    NoAuthority,
+    /// The genesis envelope's opaque `authority` section does not decode as D1's typed
+    /// `AuthorityConfig` — the run declares no usable trust topology, so a wasm coordinator's
+    /// records could never be judged (architecture §4.2/§5.1).
+    #[error("genesis authority section does not decode: {0}")]
+    NoAuthority(String),
     /// The genesis bytes failed to decode/verify.
     #[error("genesis decode: {0}")]
     Genesis(String),
@@ -90,8 +92,10 @@ pub struct WasmCoordinatorSpec {
     /// The role's **verbatim** opaque config bytes — byte-identically the guest's `da_init`
     /// input; the host never decodes them (architecture §5.1 seam rule).
     pub config_bytes: Vec<u8>,
-    /// The envelope-named `SingleKey` coordinator identity (the D2 thin `Authority` seam).
-    pub authority: PeerId,
+    /// The run's declared trust topology — D1's typed [`AuthorityConfig`], decoded from the
+    /// genesis envelope's opaque `authority` section (the reconciled seam: judgments go through
+    /// [`AuthorityConfig::authorize`], never an identity comparison).
+    pub authority: AuthorityConfig,
     /// The run's cryptographic `RunId` (the genesis hash).
     pub run_id: Hash,
 }
@@ -116,10 +120,8 @@ pub fn configure_wasm_coordinator(
         .artifacts
         .get(&role.module)
         .ok_or_else(|| WasmCoordError::ModuleUnpinned(role.module.clone()))?;
-    let authority = env
-        .identities
-        .coordinator
-        .ok_or(WasmCoordError::NoAuthority)?;
+    let authority = AuthorityConfig::decode(&env.authority)
+        .map_err(|e| WasmCoordError::NoAuthority(e.to_string()))?;
     let config_bytes = frozen
         .role_config_bytes(role_name)
         .map_err(|e| WasmCoordError::Genesis(e.to_string()))?
@@ -145,6 +147,49 @@ pub fn refuse_unconfigurable_envelope(bytes: &[u8]) -> Result<(), WasmCoordError
         Some(major) => Err(WasmCoordError::EnvelopeCannotConfigure(major)),
         None => Err(WasmCoordError::UnknownSchema),
     }
+}
+
+/// The network seat's record-authority judgment over one §12.1 signed frame — the reconciled D2
+/// seam (formerly a sender-identity comparison): the frame envelope's canonical bytes are the
+/// signed preimage and its `(sender, sig)` the presented [`RecordSig`], judged through
+/// [`AuthorityConfig::authorize`]. Returns the authenticated sender + D1's `Authorized` token.
+///
+/// Layering note: a §12.1 transport frame carries exactly one host-oracle signature, so this seat
+/// authorizes under `SingleKey`; a `ThresholdKeys` run's record quorum rides **record-level**
+/// signature sets judged at the archive/head seam ([`daemon_vhc_sdk_consensus::Authority`]) — a
+/// single transport signature correctly FAILS a threshold topology here (sub-quorum), which the
+/// adversarial suite pins.
+///
+/// # Errors
+/// The topology's typed `AuthError`, or a `Config` error for a malformed frame.
+pub fn authorize_coordinator_frame(
+    config: &AuthorityConfig,
+    frame_bytes: &[u8],
+) -> Result<([u8; 32], daemon_vhc_sdk_consensus::Authorized), daemon_vhc_sdk_consensus::AuthError> {
+    let malformed = |reason: &str| daemon_vhc_sdk_consensus::AuthError::Config {
+        reason: reason.to_string(),
+    };
+    let v: Value = ciborium::de::from_reader(frame_bytes)
+        .map_err(|e| malformed(&format!("frame decode: {e}")))?;
+    let Value::Array(parts) = &v else {
+        return Err(malformed("frame is not [envelope, payload, sig]"));
+    };
+    let (Some(envelope), Some(Value::Bytes(sig))) = (parts.first(), parts.get(2)) else {
+        return Err(malformed("frame missing envelope or signature"));
+    };
+    let sender = frame_sender(&v).map_err(|e| malformed(&e))?;
+    let preimage =
+        to_canonical_vec(envelope).map_err(|e| malformed(&format!("envelope encode: {e}")))?;
+    let sig64: [u8; 64] = sig
+        .as_slice()
+        .try_into()
+        .map_err(|_| daemon_vhc_sdk_consensus::AuthError::Malformed)?;
+    let rs = RecordSig {
+        signer: daemon_vhc_proto::PeerId(sender),
+        sig: daemon_vhc_proto::Signature(sig64),
+    };
+    let token = config.authorize(&preimage, &[rs])?;
+    Ok((sender, token))
 }
 
 /// A production `coordinator_quorum.wasm` blob running under the real major-2 driver, with the

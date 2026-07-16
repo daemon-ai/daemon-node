@@ -23,11 +23,18 @@
 // 5. The remaining rounds are delivered to the standby; its decisions must be **byte-identical**
 //    to what an uninterrupted reference run would have produced — resumption, not approximation.
 //
-// **The explicitly-marked gap (sitting 3, post-D1):** the standby signs its §12.1 frames under a
-// NEW key — this drill asserts that honestly (`standby_sender != envelope authority`). Deciding
-// who may SIGN next — split-brain prevention, fencing the old signer, seq continuity — is the
-// `Authority` contract's signer-transfer protocol (architecture §4.4), deliberately NOT built
-// here. Until D1, records from a standby are correct but not yet *authoritative*.
+// **Signer transfer per the Authority contract (sitting 3, D1 merged):** the run's trust root is
+// the envelope-named `SingleKey` **base identity** (`Reconfiguration::SingleSigner`: "a standby
+// is a journal-replicated warm spare and transfer is a key-custody problem — fence the old
+// signer via a signed epoch-fence record"). Run traffic is signed by **certified per-run keys**
+// (D1's `RunKeyCertificate`, chained to the base): the primary's incarnation-0 run key carries
+// cert 0; at takeover the base issues the standby's incarnation-1 certificate — that base-signed
+// issuance IS the transfer statement, and ingesting it **fences every lower incarnation** (the
+// cert store refuses instance-0 senders from then on; incarnation monotonicity gives the
+// ordering, §8.1 never-reused). The drill asserts: pre-kill frames authenticate via the cert
+// chain; an UNcertified standby key is refused (`NoCertifiedChain`); after the transfer the
+// standby authenticates via ITS certificate and the fenced old signer is refused. What remains
+// for tier-3 live: the same protocol over a real fleet (lease expiry, WAN cert distribution).
 //
 // Dev/test harness: shells `cargo build` for guests; journal writes real files.
 #![allow(clippy::disallowed_methods)]
@@ -40,7 +47,7 @@ use std::time::Duration;
 use ciborium::value::Value;
 
 use daemon_vhc_host::v2::RunEnd;
-use daemon_vhc_observe::journal::archive::ChainHead;
+use daemon_vhc_observe::journal::archive::{AttestedHead, ChainHead};
 use daemon_vhc_observe::journal::oracle::{record_initial_state, record_input, record_run_header};
 use daemon_vhc_observe::journal::record::ExecIdentity;
 use daemon_vhc_observe::journal::segment::scan_file;
@@ -50,10 +57,10 @@ use daemon_vhc_observe::{
     extract_consensus_capture, recover_chain_from_archive, RecordArchive, ReplicationPolicy,
     RetentionPolicy,
 };
+use daemon_vhc_proto::cert::{verify_certified_sender, CertError, RunKeyCertificate};
 use daemon_vhc_proto::messages::{
     Commitment, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
 };
-use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SignedMessage,
     SigningKey, SwarmMessage, SWARM_PROTO_VERSION,
@@ -61,6 +68,7 @@ use daemon_vhc_proto::{
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, tick_authenticated, CoordinatorState, Input, Output,
 };
+use daemon_vhc_sdk_consensus::{Authorized, DEFAULT_RECORDS_CHANNEL};
 use daemon_vhc_testkit::barrier::phase_a_grants;
 use daemon_vhc_testkit::{
     cell8_genesis, configure_wasm_coordinator, WasmCoordinator, WasmCoordinatorSpec,
@@ -202,7 +210,9 @@ fn reference_publishes(initial: CoordinatorState, script: &[ScriptMsg]) -> Vec<S
     let mut state = initial;
     let mut published = Vec::new();
     for sm in script {
-        let (next, outputs) = tick_authenticated(state, peer_id(&sm.key), version, sm.msg.clone());
+        let token = Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
+        let (next, outputs) =
+            tick_authenticated(state, peer_id(&sm.key), version, sm.msg.clone(), token);
         state = next;
         for o in &outputs {
             if let Output::Publish(m) = o {
@@ -219,6 +229,57 @@ fn reference_publishes(initial: CoordinatorState, script: &[ScriptMsg]) -> Vec<S
         }
     }
     published
+}
+
+/// The receivers' run-key certificate store — the signer-transfer seat (architecture §4.4 under
+/// `Reconfiguration::SingleSigner`). It trusts certificates chained to the run's base identity
+/// and enforces **fencing by incarnation monotonicity**: ingesting the base-signed certificate of
+/// a NEWER coordinator incarnation (the transfer statement) fences every lower incarnation — a
+/// fenced instance's frames are refused even though its certificate once verified. Incarnations
+/// are never reused (§8.1), so the ordering is total and rollback-free.
+struct CoordinatorCertStore {
+    run_id: Hash,
+    trusted_base: PeerId,
+    certs: Vec<RunKeyCertificate>,
+    /// The lowest live coordinator incarnation; anything below is fenced.
+    live_floor: u64,
+}
+
+impl CoordinatorCertStore {
+    fn new(run_id: Hash, trusted_base: PeerId) -> Self {
+        Self {
+            run_id,
+            trusted_base,
+            certs: Vec::new(),
+            live_floor: 0,
+        }
+    }
+
+    /// Ingest a base-signed run-key certificate. A certificate for a newer incarnation is the
+    /// signer-transfer statement: the live floor advances and every lower incarnation is fenced.
+    fn ingest(&mut self, cert: RunKeyCertificate) {
+        assert!(cert.verify_chain().is_ok(), "only chain-valid certs ingest");
+        self.live_floor = self.live_floor.max(cert.body.instance);
+        self.certs.push(cert);
+    }
+
+    /// Authenticate a coordinator frame's `sender` for `instance` at `epoch`: refused if the
+    /// incarnation is fenced, else the D1 certified-sender check against the trusted base.
+    fn accept(&self, instance: u64, epoch: u64, sender: &PeerId) -> Result<(), CertError> {
+        if instance < self.live_floor {
+            // The fence: a base-signed transfer to a newer incarnation supersedes this signer.
+            return Err(CertError::NoCertifiedChain);
+        }
+        verify_certified_sender(
+            &self.run_id,
+            "coordinator",
+            instance,
+            epoch,
+            sender,
+            &self.trusted_base,
+            &self.certs,
+        )
+    }
 }
 
 /// Decode the coordinator's initial state out of its opaque `{state: …}` config bytes.
@@ -243,20 +304,42 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     let wasm = coordinator_quorum_wasm();
     let coord_hash = Hash(*blake3::hash(&wasm).as_bytes());
 
-    // Identities: the primary's §12.1 frame key IS the envelope-named SingleKey identity.
+    // Identities per D1's cert layering (architecture §4.3): the envelope-named SingleKey
+    // authority is the coordinator's BASE identity (the trust root; it signs certificates and
+    // holds head custody); run traffic is signed by per-run keys certified by it. The primary is
+    // incarnation 0 under run key 0; the standby will be incarnation 1 under run key 1.
+    let base_key = SigningKey::from_bytes(blake3::hash(b"failover/base-identity").as_bytes());
+    let base_id = peer_id(&base_key);
     let primary_key_seed = *blake3::hash(b"failover/primary-key").as_bytes();
-    let authority = peer_id(&SigningKey::from_bytes(&primary_key_seed));
+    let primary_sender = peer_id(&SigningKey::from_bytes(&primary_key_seed));
+    let standby_key_seed = *blake3::hash(b"failover/standby-key").as_bytes();
+    let standby_sender = peer_id(&SigningKey::from_bytes(&standby_key_seed));
     let worker_keys = [
         SigningKey::from_bytes(blake3::hash(b"failover/worker/0").as_bytes()),
         SigningKey::from_bytes(blake3::hash(b"failover/worker/1").as_bytes()),
     ];
 
     // The genesis envelope v2 + the coordinator spec derived from it (the cell-8 seat).
-    let genesis = cell8_genesis(RUN_LABEL, coord_hash, Hash([0x77; 32]), authority, 2, 2, 4);
+    let genesis = cell8_genesis(RUN_LABEL, coord_hash, Hash([0x77; 32]), base_id, 2, 2, 4);
     let author = SigningKey::from_bytes(blake3::hash(b"failover/author").as_bytes());
     let frozen = genesis.freeze(&author).expect("genesis freeze");
     let spec = configure_wasm_coordinator(&frozen).expect("coordinator configurable");
     let initial = initial_state_of(&spec);
+
+    // The receivers' cert store: the base certifies the primary's incarnation-0 run key.
+    let mut certs = CoordinatorCertStore::new(spec.run_id, base_id);
+    certs.ingest(
+        RunKeyCertificate::issue(
+            &base_key,
+            spec.run_id,
+            "coordinator",
+            0,
+            0,
+            0,
+            primary_sender,
+        )
+        .expect("issue primary cert"),
+    );
 
     // The persistence seat: the A1 journal the primary's inputs are recorded into.
     let ident = ExecIdentity {
@@ -305,25 +388,24 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     journal.commit().expect("tail barrier (§8.4)");
     let tail_segment = cut_ord.expect("the cut happened");
 
-    // Drain the primary's decisions up to the kill point (records 0..4 + opens) and assert the
-    // primary signed as the envelope-named identity.
+    // Drain the primary's decisions up to the kill point (records 0..4 + opens): each frame's
+    // sender authenticates through the D1 certified-sender check — the cert chain to the base
+    // identity, incarnation 0, epoch 0 (the reconciled signer seat).
     let mut primary_decisions = Vec::new();
     let expected_pre = reference_publishes(initial.clone(), &pre_kill);
     while primary_decisions.len() < expected_pre.len() {
         let (sender, _, msg) = primary
             .next_decision(Duration::from_secs(60))
             .expect("primary decision");
-        assert_eq!(
-            sender, authority.0,
-            "primary signs as the SingleKey identity"
-        );
+        certs
+            .accept(0, 0, &PeerId(sender))
+            .expect("primary frame authenticates via its run-key certificate");
         primary_decisions.push(msg);
     }
 
-    // -- 2. publish the sealed prefix to the record archive under signed heads -------------------
-    let head_signer = SigningKey::from_bytes(&primary_key_seed);
+    // -- 2. publish the sealed prefix to the record archive under attested heads (base custody) --
     let mut archive = RecordArchive::new(
-        authority,
+        spec.authority.clone(),
         ReplicationPolicy { factor: 1 },
         RetentionPolicy::default(),
     );
@@ -334,8 +416,8 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
         assert!(scan.sealed, "archived prefix segments are sealed");
         let bytes = std::fs::read(journal.paths().segment(ord)).expect("read segment");
         let addr = archive.publish_segment(bytes).expect("publish");
-        let head = Signed::seal(
-            &head_signer,
+        let head = AttestedHead::single(
+            &base_key,
             ChainHead {
                 run_id: ident.run_id,
                 epoch: 0,
@@ -348,7 +430,7 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
                 records: scan.records.len() as u64,
             },
         )
-        .expect("sign head");
+        .expect("attest head");
         archive.ingest_head(head.clone()).expect("head accepted");
         heads.push(head);
         prev = addr;
@@ -389,7 +471,34 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
         "the reconstructed state stands at the next un-opened round"
     );
 
-    // -- 5. boot the standby (fresh incarnation, reconstructed state as config) and resume -------
+    // -- 5. SIGNER TRANSFER per the Authority contract (architecture §4.4, SingleSigner) ---------
+    // Before the transfer, the standby's run key is UNcertified: receivers refuse it typed.
+    assert_eq!(
+        certs.accept(1, 0, &standby_sender),
+        Err(CertError::NoCertifiedChain),
+        "an uncertified standby key is refused before the transfer"
+    );
+    // The base identity issues the standby's incarnation-1 certificate — the base-signed transfer
+    // statement. Ingesting it advances the live floor: incarnation 0 is FENCED from here on.
+    certs.ingest(
+        RunKeyCertificate::issue(
+            &base_key,
+            spec.run_id,
+            "coordinator",
+            1,
+            0,
+            0,
+            standby_sender,
+        )
+        .expect("issue standby cert"),
+    );
+    assert_eq!(
+        certs.accept(0, 0, &primary_sender),
+        Err(CertError::NoCertifiedChain),
+        "the fenced old signer is refused after the transfer (split-brain prevention)"
+    );
+
+    // -- 6. boot the standby (fresh incarnation, reconstructed state as config) and resume -------
     let standby_config = {
         let v = Value::Map(vec![(
             Value::Text("state".into()),
@@ -400,11 +509,9 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     let standby_spec = WasmCoordinatorSpec {
         module_hash: spec.module_hash,
         config_bytes: standby_config,
-        authority: spec.authority,
+        authority: spec.authority.clone(),
         run_id: spec.run_id,
     };
-    // The standby's OWN key (incarnation 1): signer transfer is the marked Authority gap.
-    let standby_key_seed = *blake3::hash(b"failover/standby-key").as_bytes();
     let mut standby =
         WasmCoordinator::start(&wasm, &standby_spec, phase_a_grants(), 1, standby_key_seed)
             .unwrap();
@@ -428,7 +535,6 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
             == ROUNDS_AFTER as usize,
         "the reference records the post-kill rounds"
     );
-    let standby_sender = peer_id(&SigningKey::from_bytes(&standby_key_seed));
     for (i, expected) in expected_post.iter().enumerate() {
         let (sender, _, msg) = standby
             .next_decision(Duration::from_secs(60))
@@ -438,14 +544,12 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
             to_canonical_vec(expected).unwrap(),
             "standby decision {i} diverged from the uninterrupted reference"
         );
-        // THE MARKED GAP (sitting 3, post-D1): the standby's records are byte-correct but signed
-        // under a NEW identity — not the envelope-named authority. Judging/fencing that signer is
-        // the Authority contract's signer-transfer protocol (architecture §4.4), not built here.
+        // The sitting-2 gap, CLOSED: the standby's frames now authenticate through the certified
+        // path — its incarnation-1 run key chains to the base identity via the transfer cert.
+        certs
+            .accept(1, 0, &PeerId(sender))
+            .expect("standby frame authenticates via the transfer certificate");
         assert_eq!(sender, standby_sender.0, "standby signs under its own key");
-        assert_ne!(
-            sender, authority.0,
-            "signer transfer is NOT performed by this drill (the Authority gap)"
-        );
     }
 
     // The resumed decisions continue the primary's timeline: together they equal one

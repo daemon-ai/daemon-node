@@ -7,41 +7,42 @@
 //! hash-chained control frames. The **record archive** publishes the A1 segmented journal's sealed
 //! segments ([`super::segment`]) as **content-addressed** blobs (the content address is the
 //! segment's BLAKE3 — the same `complete_file_blake3` the §8.2 chain already threads), each covered
-//! by a **signed chain head** ([`SignedHead`]), with declared **replication**, **retention**, and
-//! **GC keyed to checkpoint attestation**. Consequences (architecture §4.4):
+//! by an **attested chain head** ([`AttestedHead`]), with declared **replication**, **retention**,
+//! and **GC keyed to checkpoint attestation**. Consequences (architecture §4.4):
 //!
 //! - **State reconstruction is deterministic**: any node holding the archived segments rebuilds the
 //!   coordinator state bit-exactly — a standby is a late joiner of the coordinator role.
 //! - **Every decision is offline re-verifiable**: the segments are the substrate the D2 consensus
 //!   replay tier re-verifies digests from (architecture §3.6).
-//! - **Fork detection**: honest peers gossip signed chain heads; **two heads that do not extend one
-//!   another are self-contained, third-party-verifiable evidence** ([`ForkEvidence`], architecture
-//!   §4.3/§10) — the equivocation drill's portable output.
+//! - **Fork detection**: honest peers gossip attested chain heads; **two heads that do not extend
+//!   one another are self-contained, third-party-verifiable evidence** ([`ForkEvidence`],
+//!   architecture §4.3/§10) — the equivocation drill's portable output.
 //!
-//! ## The thin `Authority` seam (D2 stub, awaiting D1)
+//! ## The `Authority` seam (reconciled onto D1's contract — D2 sitting 3)
 //!
-//! "Is this chain head authoritative?" is an `Authority` question. Until D1 lands the `Authority`
-//! trait in `sdk-consensus`, this module uses the launch topology's implicit **`SingleKey`** rule
-//! (architecture §4.2, §4.4): a head is authoritative iff it is signed by the envelope-named
-//! coordinator identity ([`RecordArchive::authority`]). D1's reconciliation is mechanical — it
-//! replaces [`RecordArchive::head_is_authoritative`] with an `Authority::accept`, leaving the
-//! content-addressing, replication, retention, and fork-comparison mechanism untouched (the host
-//! contributes mechanism a guest cannot fake — content-hash verification and the journal —
-//! architecture §4.2).
+//! "Is this chain head authoritative?" is an `Authority` question, answered by D1's contract: the
+//! archive holds the run's typed [`AuthorityConfig`] (decoded from the genesis envelope's opaque
+//! `authority` section) and judges every head through [`AuthorityConfig::authorize`] over the
+//! head's canonical preimage + presented [`RecordSig`]s — `SingleKey` (one coordinator signature)
+//! and `ThresholdKeys` (an `m`-of-`n` quorum with typed sub-quorum/duplicate/unknown-signer
+//! refusals) both work unchanged through this one seam. The pre-D1 identity-comparison stub is
+//! gone; the content-addressing, replication, retention, and fork-comparison mechanism is
+//! untouched (the host contributes mechanism a guest cannot fake — content-hash verification and
+//! the journal — architecture §4.2).
 
 use std::collections::BTreeMap;
 
-use daemon_vhc_proto::sign::Signed;
-use daemon_vhc_proto::{Hash, PeerId};
+use daemon_vhc_proto::{sign_canonical, to_canonical_vec, Hash, SigningKey};
+use daemon_vhc_sdk_consensus::{AuthorityConfig, RecordSig};
 use serde::{Deserialize, Serialize};
 
 use super::segment::{scan_bytes, SegmentHeader};
 use super::JournalError;
 
-/// A signed chain head — the gossiped, third-party-verifiable claim "segment `segment` of this
-/// run's coordinator journal has content address `segment_hash`, extending `prev_hash`"
-/// (architecture §4.3/§4.4). Every field of the execution-identity scope travels with it, so an
-/// equivocation comparison needs nothing outside two heads (§4.3, §12.2).
+/// A chain head — the gossiped, third-party-verifiable claim "segment `segment` of this run's
+/// coordinator journal has content address `segment_hash`, extending `prev_hash`" (architecture
+/// §4.3/§4.4). Every field of the execution-identity scope travels with it, so an equivocation
+/// comparison needs nothing outside two heads (§4.3, §12.2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainHead {
     /// The genesis/frozen-envelope run id (§8.1).
@@ -64,12 +65,60 @@ pub struct ChainHead {
     pub records: u64,
 }
 
-/// A chain head sealed under a signing identity (`Signed<ChainHead>`).
-pub type SignedHead = Signed<ChainHead>;
+/// A chain head carrying the signatures that make it authoritative under the run's declared
+/// `Authority` (D1's contract, architecture §4.2): one [`RecordSig`] under `SingleKey`, an
+/// `m`-of-`n` quorum under `ThresholdKeys`. The preimage every signature covers is the canonical
+/// CBOR of [`ChainHead`]; whether the presented set suffices is judged by
+/// [`AuthorityConfig::authorize`] — never by an identity comparison here (the D2 sitting-3
+/// reconciliation of the old labelled `SingleKey` seam).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttestedHead {
+    /// The head claim (the signed preimage's value).
+    pub body: ChainHead,
+    /// The presented signatures over the head's canonical bytes.
+    pub sigs: Vec<RecordSig>,
+}
+
+impl AttestedHead {
+    /// Attest a head under one signing key (the `SingleKey` custody path — also one member's
+    /// share of a threshold quorum).
+    ///
+    /// # Errors
+    /// [`JournalError::Codec`] if the head cannot be canonically encoded/signed.
+    pub fn single(key: &SigningKey, body: ChainHead) -> Result<Self, JournalError> {
+        Self::attest(std::slice::from_ref(key), body)
+    }
+
+    /// Attest a head under several signing keys (a `ThresholdKeys` quorum: each member signs the
+    /// same canonical head preimage).
+    ///
+    /// # Errors
+    /// [`JournalError::Codec`] if the head cannot be canonically encoded/signed.
+    pub fn attest(keys: &[SigningKey], body: ChainHead) -> Result<Self, JournalError> {
+        let mut sigs = Vec::with_capacity(keys.len());
+        for key in keys {
+            let sig = sign_canonical(key, &body)
+                .map_err(|e| JournalError::Codec(format!("head sign: {e}")))?;
+            sigs.push(RecordSig {
+                signer: daemon_vhc_proto::peer_id(key),
+                sig,
+            });
+        }
+        Ok(Self { body, sigs })
+    }
+
+    /// The canonical signed preimage (what every [`RecordSig`] covers).
+    ///
+    /// # Errors
+    /// [`JournalError::Codec`] on a canonical-encode failure.
+    pub fn preimage(&self) -> Result<Vec<u8>, JournalError> {
+        to_canonical_vec(&self.body).map_err(|e| JournalError::Codec(format!("head encode: {e}")))
+    }
+}
 
 /// Portable, self-contained fork evidence (architecture §4.3/§10) — verifiable by any third party
-/// from the two signed heads alone.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// from the two attested heads plus the run's declared `AuthorityConfig` alone.
+#[derive(Clone, Debug, PartialEq)]
 pub enum ForkEvidence {
     /// Two authoritative heads at the **same** chain height `(run_id, epoch, role, instance,
     /// segment)` with **different** `segment_hash`: the authority served divergent histories at one
@@ -77,17 +126,17 @@ pub enum ForkEvidence {
     /// each an internally-consistent history is exposed the moment the two heads meet (§10).
     DivergentHead {
         /// The accepted head at this height.
-        a: Box<SignedHead>,
+        a: Box<AttestedHead>,
         /// The conflicting head at the same height.
-        b: Box<SignedHead>,
+        b: Box<AttestedHead>,
     },
     /// A head at segment `N+1` whose `prev_hash` does not match the accepted segment `N`'s content
     /// address: its chain does not extend the accepted one (a non-extending head, §10).
     NonExtending {
         /// The accepted head at segment `N`.
-        accepted: Box<SignedHead>,
+        accepted: Box<AttestedHead>,
         /// The head at `N+1` that fails to extend it.
-        conflicting: Box<SignedHead>,
+        conflicting: Box<AttestedHead>,
     },
 }
 
@@ -131,8 +180,10 @@ pub enum ArchiveError {
     /// are archivable — §8.2).
     #[error("segment is not sealed (only sealed segments are archivable)")]
     NotSealed,
-    /// A chain head failed the `Authority` check (§4.2 `SingleKey`: wrong signer or bad signature).
-    #[error("chain head is not authoritative (SingleKey: {0})")]
+    /// A chain head failed the run's declared `Authority` (D1's typed [`AuthError`]
+    /// (`daemon_vhc_sdk_consensus::AuthError`): wrong/unknown/duplicate signer, bad signature,
+    /// sub-quorum, malformed).
+    #[error("chain head is not authoritative ({0})")]
     Unauthoritative(String),
     /// The underlying journal scan failed (bad header / broken chain).
     #[error("journal error: {0}")]
@@ -155,25 +206,28 @@ struct StoredSegment {
 
 /// The record archive: a content-addressed store of signed, hash-chained sealed journal segments
 /// with declared replication, retention, and attestation-keyed GC, plus fork detection over
-/// gossiped signed heads (architecture §4.4).
+/// gossiped attested heads (architecture §4.4).
 pub struct RecordArchive {
-    /// The `SingleKey` authority the heads must be signed by (the D2 thin seam, awaiting D1).
-    authority: PeerId,
+    /// The run's declared trust topology (D1's typed `AuthorityConfig`, decoded from the genesis
+    /// envelope's opaque `authority` section): every head is judged through
+    /// [`AuthorityConfig::authorize`].
+    authority: AuthorityConfig,
     replication: ReplicationPolicy,
     retention: RetentionPolicy,
     /// segment content address -> stored segment.
     segments: BTreeMap<Hash, StoredSegment>,
     /// segment ordinal -> the first accepted authoritative head at that height.
-    accepted: BTreeMap<u64, SignedHead>,
+    accepted: BTreeMap<u64, AttestedHead>,
     /// The latest checkpoint-attested segment ordinal (the GC floor when attestation-keyed).
     attested_segment: Option<u64>,
 }
 
 impl RecordArchive {
-    /// A fresh archive for a run whose coordinator `Authority` is the `SingleKey` `authority`.
+    /// A fresh archive for a run whose trust topology is `authority` (the D1 contract: `SingleKey`
+    /// or `ThresholdKeys`, plus the declared records channel).
     #[must_use]
     pub fn new(
-        authority: PeerId,
+        authority: AuthorityConfig,
         replication: ReplicationPolicy,
         retention: RetentionPolicy,
     ) -> Self {
@@ -187,12 +241,36 @@ impl RecordArchive {
         }
     }
 
-    /// The D2 thin `Authority` seam: `SingleKey` — a head is authoritative iff signed by the
-    /// envelope-named coordinator identity and its signature verifies. D1 replaces this body with
-    /// `Authority::accept` (see module docs).
+    /// The run's declared `AuthorityConfig` (what heads are judged through).
     #[must_use]
-    pub fn head_is_authoritative(&self, head: &SignedHead) -> bool {
-        head.signer == self.authority && head.verify().is_ok()
+    pub fn authority(&self) -> &AuthorityConfig {
+        &self.authority
+    }
+
+    /// Whether a head carries sufficient authority under the run's declared topology — the
+    /// reconciled D1 seam: the head's canonical preimage + presented [`RecordSig`]s go through
+    /// [`AuthorityConfig::authorize`] (`SingleKey`: the one coordinator signature; `ThresholdKeys`:
+    /// an `m`-of-`n` quorum). Identity comparison no longer lives here.
+    #[must_use]
+    pub fn head_is_authoritative(&self, head: &AttestedHead) -> bool {
+        self.head_authorize(head).is_ok()
+    }
+
+    /// The typed form of [`RecordArchive::head_is_authoritative`]: D1's `AuthError` on refusal
+    /// (the adversarial suite asserts *which* guard fired).
+    ///
+    /// # Errors
+    /// The topology's `AuthError` (wrong/unknown/duplicate signer, bad signature, sub-quorum).
+    pub fn head_authorize(
+        &self,
+        head: &AttestedHead,
+    ) -> Result<(), daemon_vhc_sdk_consensus::AuthError> {
+        let preimage =
+            head.preimage()
+                .map_err(|e| daemon_vhc_sdk_consensus::AuthError::Config {
+                    reason: e.to_string(),
+                })?;
+        self.authority.authorize(&preimage, &head.sigs).map(|_| ())
     }
 
     /// Publish a sealed segment's complete file bytes content-addressed (architecture §4.4). The
@@ -249,12 +327,13 @@ impl RecordArchive {
 
     /// The accepted authoritative head at a given segment height, if any.
     #[must_use]
-    pub fn head_at(&self, segment: u64) -> Option<&SignedHead> {
+    pub fn head_at(&self, segment: u64) -> Option<&AttestedHead> {
         self.accepted.get(&segment)
     }
 
-    /// Ingest a gossiped signed chain head (architecture §4.4). Verifies the `Authority` (§4.2
-    /// `SingleKey`), then checks for a fork against the accepted chain:
+    /// Ingest a gossiped attested chain head (architecture §4.4). Judges it through the run's
+    /// declared `Authority` ([`AuthorityConfig::authorize`]), then checks for a fork against the
+    /// accepted chain:
     ///
     /// - a **different** authoritative head at the **same** height → [`ForkEvidence::DivergentHead`];
     /// - a head at `N+1` whose `prev_hash` ≠ the accepted segment `N`'s hash →
@@ -265,14 +344,13 @@ impl RecordArchive {
     /// the caller now holds portable evidence), `Ok(None)` on a clean accept.
     ///
     /// # Errors
-    /// [`ArchiveError::Unauthoritative`] if the head is not signed by the run's coordinator identity
-    /// or its signature does not verify.
-    pub fn ingest_head(&mut self, head: SignedHead) -> Result<Option<ForkEvidence>, ArchiveError> {
-        if !self.head_is_authoritative(&head) {
-            return Err(ArchiveError::Unauthoritative(
-                "wrong signer or invalid signature".into(),
-            ));
-        }
+    /// [`ArchiveError::Unauthoritative`] carrying the topology's typed `AuthError`.
+    pub fn ingest_head(
+        &mut self,
+        head: AttestedHead,
+    ) -> Result<Option<ForkEvidence>, ArchiveError> {
+        self.head_authorize(&head)
+            .map_err(|e| ArchiveError::Unauthoritative(e.to_string()))?;
         // Same-height divergence: the authority served two different segment-N histories.
         if let Some(existing) = self.accepted.get(&head.body.segment) {
             if existing.body.segment_hash != head.body.segment_hash {
@@ -359,14 +437,18 @@ impl RecordArchive {
     }
 }
 
-/// Stand-alone fork detection over a set of gossiped signed heads, all attributed to one
-/// `authority` (architecture §4.3/§10): the equivocation-drill primitive. Returns the first pair
+/// Stand-alone fork detection over a set of gossiped attested heads under the run's declared
+/// `Authority` (architecture §4.3/§10): the equivocation-drill primitive. Returns the first pair
 /// of authoritative heads at the same height with different content — self-contained, portable
-/// evidence needing nothing beyond the two heads. Heads that fail the `Authority` check are
-/// ignored (unsigned noise cannot manufacture a fork).
+/// evidence needing nothing beyond the two heads and the run's `AuthorityConfig`. Heads that fail
+/// [`AuthorityConfig::authorize`] are ignored (unsigned/forged/sub-quorum noise cannot manufacture
+/// a fork).
 #[must_use]
-pub fn detect_fork(heads: &[SignedHead], authority: &PeerId) -> Option<ForkEvidence> {
-    let authoritative = |h: &SignedHead| h.signer == *authority && h.verify().is_ok();
+pub fn detect_fork(heads: &[AttestedHead], authority: &AuthorityConfig) -> Option<ForkEvidence> {
+    let authoritative = |h: &AttestedHead| {
+        h.preimage()
+            .is_ok_and(|p| authority.authorize(&p, &h.sigs).is_ok())
+    };
     for (i, a) in heads.iter().enumerate() {
         if !authoritative(a) {
             continue;

@@ -50,6 +50,7 @@ use daemon_vhc_proto::{
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, tick_authenticated, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
 };
+use daemon_vhc_sdk_consensus::{Authorized, DEFAULT_RECORDS_CHANNEL};
 
 // -- guest build (the established testkit pattern) -------------------------------------------------
 
@@ -287,7 +288,9 @@ fn run_native(mut state: CoordinatorState, script: &[ScriptMsg]) -> Vec<SwarmMes
     let mut published = Vec::new();
     let mut now_s = 0u64;
     for sm in script {
-        let (next, outputs) = tick_authenticated(state, sm.signer, version, sm.msg.clone());
+        // The same D1 token the guest mints for a host-verified authoritative-channel delivery.
+        let token = Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
+        let (next, outputs) = tick_authenticated(state, sm.signer, version, sm.msg.clone(), token);
         state = next;
         collect(&outputs, &mut published);
         now_s += 1;

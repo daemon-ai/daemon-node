@@ -12,11 +12,11 @@
 use daemon_vhc_observe::journal::record::{Body, ClockRec, ExecIdentity, Record};
 use daemon_vhc_observe::journal::segment::{SegmentHeader, SegmentWriter};
 use daemon_vhc_observe::{
-    detect_fork, ArchiveError, ChainHead, ForkEvidence, RecordArchive, ReplicationPolicy,
-    RetentionPolicy, SignedHead,
+    detect_fork, ArchiveError, AttestedHead, ChainHead, ForkEvidence, RecordArchive,
+    ReplicationPolicy, RetentionPolicy,
 };
-use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{peer_id, Hash, PeerId, SigningKey};
+use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
 fn h(b: u8) -> Hash {
     Hash([b; 32])
@@ -83,8 +83,8 @@ fn unsealed_segment(marker: u64) -> Vec<u8> {
     std::fs::read(&path).unwrap()
 }
 
-fn head(signer: &SigningKey, seg: u64, seg_hash: Hash, prev: Hash) -> SignedHead {
-    Signed::seal(
+fn head(signer: &SigningKey, seg: u64, seg_hash: Hash, prev: Hash) -> AttestedHead {
+    AttestedHead::single(
         signer,
         ChainHead {
             run_id: h(1),
@@ -101,9 +101,16 @@ fn head(signer: &SigningKey, seg: u64, seg_hash: Hash, prev: Hash) -> SignedHead
     .unwrap()
 }
 
+fn single_key(authority: PeerId) -> AuthorityConfig {
+    AuthorityConfig {
+        topology: Topology::SingleKey(SingleKey::new(authority)),
+        records_channel: DEFAULT_RECORDS_CHANNEL,
+    }
+}
+
 fn archive(authority: PeerId) -> RecordArchive {
     RecordArchive::new(
-        authority,
+        single_key(authority),
         ReplicationPolicy { factor: 2 },
         RetentionPolicy::default(),
     )
@@ -149,11 +156,19 @@ fn divergent_heads_are_portable_fork_evidence() {
     let head_a = head(&coord, 0, addr_a, h(0));
     let head_b = head(&coord, 0, addr_b, h(0));
 
-    // Stand-alone detection over gossiped heads: the equivocation-drill primitive.
-    match detect_fork(&[head_a.clone(), head_b.clone()], &authority) {
+    // Stand-alone detection over gossiped heads: the equivocation-drill primitive, judged
+    // through D1's AuthorityConfig::authorize.
+    let config = single_key(authority);
+    match detect_fork(&[head_a.clone(), head_b.clone()], &config) {
         Some(ForkEvidence::DivergentHead { a, b }) => {
-            // Portable: both signed heads verify on their own, needing nothing external (§4.3).
-            assert!(a.verify().is_ok() && b.verify().is_ok());
+            // Portable: both heads authorize on their own under the declared topology, needing
+            // nothing beyond the two heads + the run's AuthorityConfig (§4.3).
+            let ok = |head: &AttestedHead| {
+                config
+                    .authorize(&head.preimage().unwrap(), &head.sigs)
+                    .is_ok()
+            };
+            assert!(ok(&a) && ok(&b));
             assert_eq!(a.body.segment, b.body.segment);
             assert_ne!(a.body.segment_hash, b.body.segment_hash);
         }
@@ -211,7 +226,10 @@ fn unauthoritative_head_is_refused_and_ignored() {
     // genuine authoritative head at the same height with different content.
     let (_, addr2) = sealed_segment(0, [0u8; 32], 200);
     let genuine = head(&coord, 0, addr2, h(0));
-    assert_eq!(detect_fork(&[forged, genuine], &authority), None);
+    assert_eq!(
+        detect_fork(&[forged, genuine], &single_key(authority)),
+        None
+    );
 }
 
 #[test]

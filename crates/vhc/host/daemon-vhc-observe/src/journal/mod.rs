@@ -49,8 +49,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub use archive::{
-    detect_fork, ArchiveError, ChainHead, ForkEvidence, RecordArchive, ReplicationPolicy,
-    RetentionPolicy, SignedHead,
+    detect_fork, ArchiveError, AttestedHead, ChainHead, ForkEvidence, RecordArchive,
+    ReplicationPolicy, RetentionPolicy,
 };
 pub use consensus::{
     extract_consensus_capture, recover_chain_from_archive, replay_consensus_from_archive,

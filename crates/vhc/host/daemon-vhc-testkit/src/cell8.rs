@@ -47,10 +47,13 @@ use daemon_vhc_proto::{
     GENESIS_SCHEMA_MAJOR, SWARM_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
+use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
 use crate::barrier::{phase_a_grants, tiny_llama_config, SEQ_LEN};
 use crate::run::Decision;
-use crate::wasm_coordinator::{configure_wasm_coordinator, WasmCoordinator};
+use crate::wasm_coordinator::{
+    authorize_coordinator_frame, configure_wasm_coordinator, WasmCoordinator,
+};
 
 /// How a cell-8 whole run is set up.
 pub struct Cell8Spec {
@@ -239,7 +242,14 @@ pub fn cell8_genesis(
         },
         roles,
         artifacts,
-        authority: Value::Map(vec![]),
+        // The run's declared trust topology (D1's typed AuthorityConfig, encoded into the opaque
+        // section the host never interprets): launch SingleKey over the coordinator identity,
+        // records on the default authoritative channel.
+        authority: AuthorityConfig {
+            topology: Topology::SingleKey(SingleKey::new(coordinator_identity)),
+            records_channel: DEFAULT_RECORDS_CHANNEL,
+        }
+        .encode(),
         transport: TransportSelection {
             control: vec![ControlTransport::Mem],
             payload_store: "fs".into(),
@@ -501,11 +511,13 @@ pub fn cell8_whole_run(
     let mut coordinator_records = 0u64;
     while rounds_done < spec.rounds {
         let (sender, evidence, msg) = coord.next_decision(spec.timeout)?;
-        // The network seat's SingleKey check (the D2 thin Authority seam, awaiting D1's
-        // `Authority::accept`): only frames from the envelope-named identity are relayed.
-        if sender != coord_spec.authority.0 {
-            return Err("coordinator frame not from the envelope-named identity".into());
-        }
+        // The network seat's record-authority judgment (the reconciled D1 seam): the §12.1
+        // frame's signature is authorized through the run's declared AuthorityConfig — only
+        // authoritative frames are relayed. An identity comparison no longer lives here.
+        let (auth_sender, _token) =
+            authorize_coordinator_frame(&coord_spec.authority, &evidence)
+                .map_err(|e| format!("coordinator frame not authoritative: {e}"))?;
+        debug_assert_eq!(auth_sender, sender);
 
         match &msg {
             SwarmMessage::RoundOpen(ro) => {
