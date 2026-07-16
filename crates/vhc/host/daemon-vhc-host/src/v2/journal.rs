@@ -170,6 +170,11 @@ pub trait JournalSink: Send {
     /// (§8.1).
     fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError>;
 
+    /// tag 10 — an accepted snapshot: the verbatim accepted state-manifest bytes (§10.2). MUST be
+    /// committed (barrier crossed) before `snapshot_state` returns `Accepted` to the guest —
+    /// §8.4 rule 2's "acknowledged to the upgrade transaction" durability point.
+    fn snapshot(&mut self, manifest: &[u8]) -> Result<(), SinkError>;
+
     /// tag 9 — the terminal fact (kind 0 = outcome, 1 = trap, 2 = forced interruption). MUST be
     /// committed before it is reported (§8.4 rule 2).
     fn terminal(
@@ -278,6 +283,9 @@ impl<S: JournalSink> JournalSink for std::sync::Arc<std::sync::Mutex<S>> {
     fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError> {
         self.lock().expect("sink lock").completion(op, result)
     }
+    fn snapshot(&mut self, manifest: &[u8]) -> Result<(), SinkError> {
+        self.lock().expect("sink lock").snapshot(manifest)
+    }
     fn terminal(
         &mut self,
         kind: u64,
@@ -356,6 +364,9 @@ pub enum SinkEntry {
         op: u64,
         result: Vec<u8>,
     },
+    Snapshot {
+        manifest: Vec<u8>,
+    },
     Terminal {
         kind: u64,
         outcome: Option<u64>,
@@ -376,6 +387,7 @@ impl SinkEntry {
             Self::TimerCancel { .. } => 6,
             Self::Drop { .. } => 7,
             Self::Terminal { .. } => 9,
+            Self::Snapshot { .. } => 10,
             Self::Init { .. } => 11,
             Self::SignedFrame { .. } => 12,
             Self::Instantiation { .. } => 13,
@@ -550,6 +562,13 @@ impl JournalSink for MemorySink {
         self.entries.push(SinkEntry::Completion {
             op,
             result: result.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn snapshot(&mut self, manifest: &[u8]) -> Result<(), SinkError> {
+        self.entries.push(SinkEntry::Snapshot {
+            manifest: manifest.to_vec(),
         });
         Ok(())
     }

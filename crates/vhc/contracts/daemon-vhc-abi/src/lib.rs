@@ -914,6 +914,10 @@ pub const STAGED_KIND_BYTES: u64 = 0;
 pub const STAGED_KIND_BATCH: u64 = 1;
 /// Staged-kind 2: a bridge update container (`read_back` kind 2, ABI §2.5).
 pub const STAGED_KIND_UPDATE_CONTAINER: u64 = 2;
+/// Staged-kind 3: a migration state section (`read_back` kind 3, legal only during `da_migrate` —
+/// ABI §6.4/§6.6/§10.2). Host-staged on the NEW run instance from the accepted snapshot; the
+/// restore staging IDs travel in the migration descriptor, never as `PayloadReady` events.
+pub const STAGED_KIND_STATE_SECTION: u64 = 3;
 
 // -- the channel table (ABI §6.2) -----------------------------------------------------------------
 

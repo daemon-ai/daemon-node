@@ -162,6 +162,13 @@ pub struct V2RunConfig {
     /// fence (`0` = unbounded by this grant). Breach traps `GrantViolation` — the guest must
     /// fence (and handle `Event::Fence`) to reclaim depth.
     pub compute_queue_depth: u64,
+    // ---- migration grant (Phase E, ABI §2.6 `migration-grant` / §10.2) ------------------------
+    /// `migration-grant.max_sections`: the max sections one `snapshot_state` manifest may declare
+    /// (`0` = unbounded by this grant). Exceeding it returns `SNAPSHOT_STATE_GRANT_EXCEEDED`.
+    pub migration_max_sections: u64,
+    /// `migration-grant.max_section_bytes`: the per-section byte ceiling (`0` = unbounded).
+    /// Exceeding it returns `SNAPSHOT_STATE_GRANT_EXCEEDED`.
+    pub migration_max_section_bytes: u64,
     /// **Deferred-device-fault injection (test/testkit seam — the simulated-providers pattern).**
     /// `Some(n)`: a synthetic device fault is latched after the `n`-th accepted `submit_op`
     /// (0-based: `n = 0` faults the first op), surfacing at the next fence (typed
@@ -202,6 +209,8 @@ impl V2RunConfig {
             max_live_buffer_bytes: 1 << 26,
             max_outstanding_ops: 16,
             compute_queue_depth: 1024,
+            migration_max_sections: 0,
+            migration_max_section_bytes: 0,
             compute_fault_after_ops: None,
         }
     }
@@ -295,8 +304,58 @@ pub enum RunEnd {
     Outcome(u32),
     /// `da_init` returned nonzero — journaled (tag 11), torn down, the join refused (§9.4 step 11).
     InitRefused(u32),
+    /// `da_migrate` returned non-`Ready` (`Incompatible` or a module-defined detail ≥ 16) on a
+    /// migrating instance (§10.2/§10.3 step 5): the validate step failed, the instance tore down
+    /// without ever entering `da_run`, and the upgrade transaction rolls back (§10.3 step 7).
+    MigrateRefused(u32),
     /// The guest trapped (typed, journaled as terminal kind 1); the subprocess survives (§7.6).
     Trapped(Trap),
+}
+
+/// The accepted snapshot an upgrade transaction carries across the module switch (ABI §10.2/§10.3
+/// step 2): the verbatim accepted state-manifest bytes plus the staged section bytes, in manifest
+/// order. Captured by `snapshot_state` on the OLD instance (via
+/// [`PumpHandle::snapshot_capture`]); consumed by [`MigrationInput`] on the NEW one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotCapture {
+    /// The accepted state-manifest bytes, verbatim (journaled as tag 10).
+    pub manifest: Vec<u8>,
+    /// `(section name, section bytes)` in the manifest's declared order.
+    pub sections: Vec<(String, Vec<u8>)>,
+}
+
+/// One authoritative frame that spooled undelivered through a Quiesce drain (§4.4), as
+/// [`PumpHandle::take_spooled_frames`] returns it — the exact [`PumpHandle::deliver_frame`]
+/// argument set, so re-delivery into the new instance's pump is mechanical (§10.3 step 6).
+#[derive(Debug, Clone)]
+pub struct SpooledFrame {
+    /// The channel the frame arrived on.
+    pub channel: u32,
+    /// The sender's durable channel-scoped sequence number.
+    pub seq: u64,
+    /// The sender identity.
+    pub sender: [u8; 32],
+    /// The module-authored payload bytes.
+    pub payload: Vec<u8>,
+    /// The complete original signed wire frame (tag-12 evidence).
+    pub original_signed_frame: Vec<u8>,
+}
+
+/// The migration input to a NEW run instance (ABI §10.3 step 4): the old module's accepted
+/// snapshot, the restore grant, and the migrate budget. Handing this to [`start_run_migrating`]
+/// stages the sections host-side, journals the tag-13 instantiation as reason 2
+/// (upgrade-activation), and calls `da_migrate(descriptor)` under budget between `da_init` and
+/// `da_run`.
+#[derive(Debug, Clone)]
+pub struct MigrationInput {
+    /// The accepted snapshot from the old instance's quiesce drain.
+    pub capture: SnapshotCapture,
+    /// The `migration-grant.restore` bit (ABI §2.6/§10.2): whether `read_back(kind = 3)` is
+    /// granted during `da_migrate`. `false` fails closed (`GrantViolation`).
+    pub restore: bool,
+    /// The explicit migrate fuel budget (§10.2 "under an explicit bounded budget"); `None` uses
+    /// the engine's per-call fuel. Exhaustion traps `MigrateBudget`.
+    pub migrate_fuel: Option<u64>,
 }
 
 // -- the pump (shared between the guest thread and the embedder) ----------------------------------
@@ -376,6 +435,10 @@ struct PumpState {
     stop_enqueued: bool,
     /// A `Quiesce` drain is open: Frame/PayloadReady/Timer deliveries are frozen (§4.4).
     draining: bool,
+    /// The snapshot `snapshot_state` accepted during this drain (§10.2): the upgrade transaction
+    /// reads it through [`PumpHandle::snapshot_capture`]. At most one per drain (a second
+    /// successful submission is `BadEvent`).
+    accepted_snapshot: Option<SnapshotCapture>,
 }
 
 impl PumpState {
@@ -834,6 +897,53 @@ impl PumpHandle {
 
     /// Open a `Quiesce{reason, deadline_ms}` drain (§4.4): new Frame/PayloadReady/Timer
     /// deliveries freeze (spool/coalesce); the guest is expected to return `QuiesceReady`.
+    /// The snapshot `snapshot_state` accepted during this drain, if any (§10.2): the upgrade
+    /// transaction's step-2 capture. `None` until the guest achieves one successful submission.
+    #[must_use]
+    pub fn snapshot_capture(&self) -> Option<SnapshotCapture> {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .accepted_snapshot
+            .clone()
+    }
+
+    /// Drain the authoritative frames that spooled undelivered during the Quiesce drain (§4.4),
+    /// in arrival order — the upgrade transaction re-delivers them into the NEW instance's pump
+    /// at activation (§10.3 step 6 "spooled frames drain into the new instance"). Each
+    /// [`SpooledFrame`] carries exactly the [`PumpHandle::deliver_frame`] argument tuple.
+    #[must_use]
+    pub fn take_spooled_frames(&self) -> Vec<SpooledFrame> {
+        let mut st = self.shared.state.lock().expect("pump lock");
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < st.queue.len() {
+            if st.queue[i].tag == EV_TAG_FRAME && st.queue[i].signed.is_some() {
+                let ev = st.queue.remove(i).expect("index checked");
+                let (channel, seq, sender, original) = ev.signed.expect("checked signed");
+                st.auth_spooled = st.auth_spooled.saturating_sub(1);
+                if let Some(n) = st.auth_per_sender.get_mut(&sender) {
+                    *n = n.saturating_sub(1);
+                }
+                let payload = match crate::v2::event::decode_event_frame(&ev.frame_bytes) {
+                    Ok(EventV2::Frame { payload, .. }) => payload,
+                    _ => Vec::new(),
+                };
+                out.push(SpooledFrame {
+                    channel: u32::try_from(channel).unwrap_or(u32::MAX),
+                    seq,
+                    sender,
+                    payload,
+                    original_signed_frame: original,
+                });
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
     pub fn quiesce(&self, reason: u64, deadline_ms: u64) -> Result<(), SinkError> {
         let frame_bytes = encode_event_frame(&EventV2::Quiesce {
             reason,
@@ -1060,6 +1170,9 @@ impl PumpHandle {
 struct SliceState {
     /// Inside `da_init` (imports illegal, §6.6 rule 1).
     in_init: bool,
+    /// Inside `da_migrate` (every import illegal EXCEPT `read_back(kind = 3)` — the one §6.6
+    /// exception, §10.2).
+    in_migrate: bool,
     /// `Stop` has been consumed (every import traps `PhaseViolation`, §4.4).
     stopped: bool,
     /// A `Quiesce` drain is open (freezes some behaviors, §4.4).
@@ -1126,6 +1239,11 @@ struct V2Host {
     // the claim's hard-accountable host-tier cap (standing, not per-slice — ABI §9.1/§5.5)
     hard_accountable_host_bytes: u64,
     accountable_staged_bytes: u64,
+    // the migration grant (ABI §2.6): snapshot bounds on the producing side; the restore bit on
+    // the consuming (migrating) side (`read_back(kind = 3)` legality, §10.2)
+    migration_max_sections: u64,
+    migration_max_section_bytes: u64,
+    migration_restore: bool,
     // The §2.5 compute bridge: the SAME frozen tabi@1 dispatch state the v1 driver uses,
     // embedded (params/persistents/arenas/backend). None when the module imports no tabi@1.
     tabi: Option<crate::runtime::HostState>,
@@ -1194,6 +1312,14 @@ impl V2Host {
                 import,
                 None,
                 "capability import during da_init (§6.6)",
+            ));
+        }
+        if self.slice.in_migrate && import != "read_back" {
+            return Err(Trap::new(
+                TrapCode::PhaseViolation,
+                import,
+                None,
+                "only read_back(kind = state-section) is legal during da_migrate (§6.6/§10.2)",
             ));
         }
         if self.slice.pending_next.is_some() && import != "next_event" {
@@ -1432,8 +1558,19 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         if !st.draining && !st.stop_enqueued {
                             fire_due_timers(&mut st, now)?;
                         }
-                        if let Some(front) = st.queue.front() {
-                            let len = front.frame_bytes.len() as u64;
+                        // During a Quiesce drain, authoritative `Frame` deliveries are FROZEN:
+                        // they spool undelivered (§4.4) and drain into the NEW instance after an
+                        // upgrade activation (§10.3 step 6, `PumpHandle::take_spooled_frames`).
+                        // Everything else (Quiesce itself, Budget, Fence, Completion) delivers.
+                        let candidate = if st.draining {
+                            st.queue.iter().position(|q| q.tag != EV_TAG_FRAME)
+                        } else if st.queue.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        };
+                        if let Some(pos) = candidate {
+                            let len = st.queue[pos].frame_bytes.len() as u64;
                             if len > u64::from(buf_cap) {
                                 // Not consumed; no journal record; budgets do not reset (§4.1).
                                 c.data_mut().slice.pending_next = Some(len);
@@ -1441,7 +1578,7 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                             }
                             // Deliver: sample once, journal BEFORE the guest observes (§8.4 r4).
                             let at = shared.now_ms();
-                            let ev = st.queue.pop_front().expect("front checked");
+                            let ev = st.queue.remove(pos).expect("candidate position exists");
                             // Spool accounting (§4.7): a delivered authoritative frame frees its
                             // spool slot + its sender's quota; draining below the bound closes
                             // the exhaustion episode.
@@ -1557,12 +1694,33 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                     }
                 }
                 // kind → the staged-kind it consumes (ABI §6.4 table): 0 bytes, 1 batch (bridge),
-                // 2 update container (bridge). State-section (3) arrives with migrate.
+                // 2 update container (bridge), 3 state-section (migrate restore, §10.2).
                 let want_staged_kind = match kind {
                     READBACK_KIND_STAGED_BYTES => daemon_vhc_abi::STAGED_KIND_BYTES,
                     daemon_vhc_abi::READBACK_KIND_STAGED_BATCH => daemon_vhc_abi::STAGED_KIND_BATCH,
                     daemon_vhc_abi::READBACK_KIND_STAGED_UPDATE => {
                         daemon_vhc_abi::STAGED_KIND_UPDATE_CONTAINER
+                    }
+                    daemon_vhc_abi::READBACK_KIND_STATE_SECTION => {
+                        // Legal EXACTLY during `da_migrate` (§6.6's one exception), and only
+                        // under the migration grant's restore bit (§10.2 — fail closed).
+                        if !c.data().slice.in_migrate {
+                            return Err(Trap::new(
+                                TrapCode::PhaseViolation,
+                                "read_back",
+                                None,
+                                "state-section readback outside da_migrate (§6.6/§10.2)",
+                            ));
+                        }
+                        if !c.data().migration_restore {
+                            return Err(Trap::new(
+                                TrapCode::GrantViolation,
+                                "read_back",
+                                None,
+                                "migration-grant.restore is not granted (§2.6/§10.2)",
+                            ));
+                        }
+                        daemon_vhc_abi::STAGED_KIND_STATE_SECTION
                     }
                     _ => {
                         return Err(Trap::new(
@@ -1573,6 +1731,16 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         ))
                     }
                 };
+                // Conversely, inside da_migrate ONLY the state-section kind is legal (§6.6).
+                if c.data().slice.in_migrate && kind != daemon_vhc_abi::READBACK_KIND_STATE_SECTION
+                {
+                    return Err(Trap::new(
+                        TrapCode::PhaseViolation,
+                        "read_back",
+                        None,
+                        "only read_back(kind = state-section) is legal during da_migrate (§6.6)",
+                    ));
+                }
                 // A pending retry re-delivers the already-computed value (no re-mutation, §6.4).
                 if let Some(v) = c.data().slice.pending_readback_value.clone() {
                     let len = v.len() as u64;
@@ -1787,11 +1955,11 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
         },
     )?;
 
-    // ---- vhc@2::snapshot_state — quiesce-scoped (§10.2; verification lands with migrate) --------
+    // ---- vhc@2::snapshot_state — quiesce-scoped (§10.2): verify + journal + capture ------------
     linker.func_wrap(
         NS_VHC_V2,
         "snapshot_state",
-        |mut c: Caller<'_, V2Host>, _ptr: u32, _len: u32| -> Result<u32, wasmtime::Error> {
+        |mut c: Caller<'_, V2Host>, ptr: u32, len: u32| -> Result<u32, wasmtime::Error> {
             let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
                 c.data_mut().enter("snapshot_state")?;
                 if !c.data().slice.draining {
@@ -1802,9 +1970,78 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         "snapshot_state outside a Quiesce drain (§10.2)",
                     ));
                 }
-                // State-manifest verification is the migrate-scaffolding sitting; until then no
-                // declared section can be verified staged, which is exactly `SectionMissing`.
-                Ok(SNAPSHOT_STATE_SECTION_MISSING)
+                let manifest_bytes = read_guest(c, ptr, len)?;
+                // Decode the §10.2 state-manifest at the CBOR-value level (the host never links
+                // the SDK's typed manifest — dependency wall; the bytes are journaled verbatim
+                // and handed to `da_migrate` verbatim, so no re-encode ever happens host-side).
+                let sections = match decode_manifest_sections(&manifest_bytes) {
+                    Ok(s) => s,
+                    Err(detail) => {
+                        return Err(Trap::new(
+                            TrapCode::BadEvent,
+                            "snapshot_state",
+                            None,
+                            format!("malformed state-manifest: {detail}"),
+                        ))
+                    }
+                };
+                let (max_sections, max_section_bytes) = {
+                    let d = c.data();
+                    (d.migration_max_sections, d.migration_max_section_bytes)
+                };
+                if max_sections != 0 && sections.len() as u64 > max_sections {
+                    return Ok(daemon_vhc_abi::SNAPSHOT_STATE_GRANT_EXCEEDED);
+                }
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                // A second successful submission in one drain is BadEvent (§10.2).
+                if st.accepted_snapshot.is_some() {
+                    return Err(Trap::new(
+                        TrapCode::BadEvent,
+                        "snapshot_state",
+                        None,
+                        "a snapshot was already accepted in this drain (§10.2)",
+                    ));
+                }
+                // Verify every declared section is guest-staged and hash-consistent; rejected
+                // attempts MAY be corrected and retried within the drain (never "exactly once").
+                let mut captured: Vec<(String, Vec<u8>)> = Vec::with_capacity(sections.len());
+                for decl in &sections {
+                    if max_section_bytes != 0 && decl.size > max_section_bytes {
+                        return Ok(daemon_vhc_abi::SNAPSHOT_STATE_GRANT_EXCEEDED);
+                    }
+                    // Match a guest-staged (§10.2 top-bit id) plain-bytes entry by content hash.
+                    let found = st.staged.iter().find(|(id, (kind, bytes))| {
+                        *id & daemon_vhc_abi::GUEST_STAGING_ID_TOP_BIT != 0
+                            && *kind == STAGED_KIND_BYTES
+                            && bytes.len() as u64 == decl.size
+                            && blake3::hash(bytes).as_bytes() == &decl.hash
+                    });
+                    match found {
+                        Some((_, (_, bytes))) => captured.push((decl.name.clone(), bytes.clone())),
+                        None => {
+                            // Distinguish the §10.2 statuses: staged-but-mutated vs never staged.
+                            let name_sized = st.staged.values().any(|(kind, bytes)| {
+                                *kind == STAGED_KIND_BYTES && bytes.len() as u64 == decl.size
+                            });
+                            return Ok(if name_sized {
+                                daemon_vhc_abi::SNAPSHOT_STATE_HASH_MISMATCH
+                            } else {
+                                SNAPSHOT_STATE_SECTION_MISSING
+                            });
+                        }
+                    }
+                }
+                // Accepted: journal the manifest verbatim (tag 10) under the sink's durability
+                // barrier (§8.4 rule 2), then capture for the upgrade transaction.
+                st.sink
+                    .snapshot(&manifest_bytes)
+                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                st.accepted_snapshot = Some(SnapshotCapture {
+                    manifest: manifest_bytes,
+                    sections: captured,
+                });
+                Ok(daemon_vhc_abi::SNAPSHOT_STATE_ACCEPTED)
             })(&mut c);
             stash(&mut c, r)
         },
@@ -2778,7 +3015,27 @@ pub fn start_run(
     worker: &Worker,
     wasm: &[u8],
     run: V2RunConfig,
+    sink: Box<dyn JournalSink>,
+) -> Result<V2Run, V2Error> {
+    start_run_migrating(worker, wasm, run, sink, None)
+}
+
+/// [`start_run`] with an optional **migration input** (ABI §10.3 step 4): when `migration` is
+/// `Some`, the instantiation record is journaled as tag-13 **reason 2** (upgrade-activation),
+/// the snapshot's sections are staged host-side after `da_init`, and `da_migrate(descriptor)`
+/// runs under its explicit budget before `da_run`. A non-`Ready` return tears the instance down
+/// as [`RunEnd::MigrateRefused`] (the transaction's validate failure — roll back, §10.3 step 7);
+/// budget exhaustion inside `da_migrate` traps the typed `MigrateBudget`.
+///
+/// # Errors
+/// [`V2Error`] on setup/journal failure. Guest traps, init refusals, and migrate refusals are
+/// [`RunEnd`]s.
+pub fn start_run_migrating(
+    worker: &Worker,
+    wasm: &[u8],
+    run: V2RunConfig,
     mut sink: Box<dyn JournalSink>,
+    migration: Option<MigrationInput>,
 ) -> Result<V2Run, V2Error> {
     let module = Module::new(worker.engine(), wasm).map_err(|e| V2Error::Sandbox(e.to_string()))?;
     // The §2.5 compute bridge: a major-2 module MAY link the frozen tabi@1 vocabulary; the host
@@ -2840,6 +3097,7 @@ pub fn start_run(
             op_requests: Vec::new(),
             stop_enqueued: false,
             draining: false,
+            accepted_snapshot: None,
         }),
         wake: Condvar::new(),
         t0: Instant::now(),
@@ -2875,6 +3133,7 @@ pub fn start_run(
                 trap: None,
                 slice: SliceState {
                     in_init: false,
+                    in_migrate: false,
                     stopped: false,
                     draining: false,
                     now: shared.now_ms(),
@@ -2892,6 +3151,9 @@ pub fn start_run(
                 max_frame_bytes: run.max_frame_bytes,
                 hard_accountable_host_bytes: run.hard_accountable_host_bytes,
                 accountable_staged_bytes: 0,
+                migration_max_sections: run.migration_max_sections,
+                migration_max_section_bytes: run.migration_max_section_bytes,
+                migration_restore: migration.as_ref().is_some_and(|m| m.restore),
                 tabi: bridge.then(|| crate::runtime::HostState::new(&engine_cfg)),
                 slice_pass_open: false,
                 ingest_phase: IngestPhase::Idle,
@@ -2929,11 +3191,14 @@ pub fn start_run(
                 .instantiate(&mut store, &module)
                 .map_err(|e| V2Error::Sandbox(format!("v2 instantiation: {e}")))?;
 
-            // tag 13 at instantiation, before any guest code (§8.3/§10.3): counter 0, initial.
+            // tag 13 at instantiation, before any guest code (§8.3/§10.3): counter 0; reason 0
+            // (initial) — or reason 2 (upgrade-activation) on a migrating instance, journaled at
+            // instantiation, BEFORE `da_init`/`da_migrate` (§10.3 step 4, never deferred).
             let inst_at = shared.now_ms();
             {
                 let mut st = shared.state.lock().expect("pump lock");
-                st.sink.instantiation(0, 0, inst_at)?;
+                let reason = if migration.is_some() { 2 } else { 0 };
+                st.sink.instantiation(0, reason, inst_at)?;
             }
             store.data_mut().slice.now = inst_at;
 
@@ -2994,6 +3259,86 @@ pub fn start_run(
             if init_status != 0 {
                 // Journal, tear down, refuse the join (§9.4 step 11). Store drops on this thread.
                 return Ok(RunEnd::InitRefused(init_status));
+            }
+
+            // -- the migrate step (§10.3 steps 4–5), on a migrating instance only ----------------
+            if let Some(mig) = &migration {
+                // Stage the snapshot's sections host-side under kind-3 staging IDs; the restore
+                // IDs travel IN the descriptor (§10.2 — the module is not in `da_run` and sees
+                // no PayloadReady).
+                let bindings: Vec<(String, u64)> = {
+                    let mut st = shared.state.lock().expect("pump lock");
+                    mig.capture
+                        .sections
+                        .iter()
+                        .map(|(name, bytes)| {
+                            let id = st.next_host_staging_id;
+                            st.next_host_staging_id += 1;
+                            st.staged.insert(
+                                id,
+                                (daemon_vhc_abi::STAGED_KIND_STATE_SECTION, bytes.clone()),
+                            );
+                            (name.clone(), id)
+                        })
+                        .collect()
+                };
+                let descriptor = build_migration_descriptor(&mig.capture.manifest, &bindings)
+                    .map_err(|e| V2Error::Sandbox(format!("migration descriptor: {e}")))?;
+                let desc_ptr = write_span(&mut store, &descriptor)?;
+
+                let da_migrate = instance
+                    .get_typed_func::<(u32, u32), u32>(&mut store, "da_migrate")
+                    .map_err(|_| V2Error::Sandbox("missing/mis-typed da_migrate".into()))?;
+                // The explicit bounded budget (§10.2): fuel + the epoch deadline; exceeding it is
+                // the typed `MigrateBudget` trap and the host rolls back.
+                store
+                    .set_fuel(mig.migrate_fuel.unwrap_or(engine_cfg.fuel_per_call))
+                    .map_err(|e| V2Error::Sandbox(e.to_string()))?;
+                store.set_epoch_deadline(epoch_ticks);
+                store.data_mut().slice.in_migrate = true;
+                let migrate_status =
+                    match da_migrate.call(&mut store, (desc_ptr, descriptor.len() as u32)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let mut trap = take_trap(&mut store, e);
+                            // Budget exhaustion inside da_migrate is the typed MigrateBudget (§10.2).
+                            if matches!(trap.code, TrapCode::BudgetFuel | TrapCode::BudgetEpoch) {
+                                trap = Trap::new(
+                                    TrapCode::MigrateBudget,
+                                    "da_migrate",
+                                    None,
+                                    format!("migrate budget exhausted: {}", trap.detail),
+                                );
+                            }
+                            journal_terminal_trap(&shared, &trap)?;
+                            return Ok(RunEnd::Trapped(trap));
+                        }
+                    };
+                store.data_mut().slice.in_migrate = false;
+                store
+                    .set_fuel(engine_cfg.fuel_per_call)
+                    .map_err(|e| V2Error::Sandbox(e.to_string()))?;
+                if migrate_status != daemon_vhc_abi::DA_MIGRATE_READY {
+                    // Validate failed (§10.3 step 5): journal the fact (a typed condition + the
+                    // forced-interruption terminal — the instance never entered da_run) and tear
+                    // down; the upgrade transaction rolls back and retries or leaves (step 7).
+                    let mut st = shared.state.lock().expect("pump lock");
+                    st.sink.condition(
+                        "MigrateIncompatible",
+                        &format!("da_migrate returned {migrate_status} (§10.2)"),
+                    )?;
+                    st.sink.terminal(
+                        2,
+                        None,
+                        Some((
+                            "MigrateIncompatible".to_string(),
+                            "da_migrate".to_string(),
+                            "da_migrate".to_string(),
+                            format!("da_migrate returned {migrate_status}"),
+                        )),
+                    )?;
+                    return Ok(RunEnd::MigrateRefused(migrate_status));
+                }
             }
 
             // da_run — exactly once; the module owns its loop from here (§3.1).
@@ -3149,6 +3494,96 @@ impl crate::runtime::TabiHost for V2Host {
     }
 }
 
+/// Build the §10.2 migration-descriptor bytes: the old module's accepted manifest **verbatim**
+/// (decoded and re-embedded as a CBOR value — the bytes were journaled verbatim as tag 10; the
+/// descriptor is a fresh encoding whose `manifest` field decodes to the identical value) plus the
+/// restore bindings in manifest order. Built at the CBOR-value level for the same dependency-wall
+/// reason as [`decode_manifest_sections`].
+fn build_migration_descriptor(
+    manifest: &[u8],
+    bindings: &[(String, u64)],
+) -> Result<Vec<u8>, String> {
+    use ciborium::value::Value;
+    let manifest_value: Value = ciborium::de::from_reader(manifest).map_err(|e| e.to_string())?;
+    let sections = bindings
+        .iter()
+        .map(|(name, id)| {
+            Value::Map(vec![
+                (Value::Text("name".into()), Value::Text(name.clone())),
+                (
+                    Value::Text("staging_id".into()),
+                    Value::Integer((*id).into()),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let descriptor = Value::Map(vec![
+        (Value::Text("manifest".into()), manifest_value),
+        (Value::Text("sections".into()), Value::Array(sections)),
+    ]);
+    let mut out = Vec::new();
+    ciborium::into_writer(&descriptor, &mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// One decoded `state-section-decl` (ABI §10.2) — the fields the HOST verifies (name for the
+/// descriptor binding, hash + size for the staged-consistency check). Decoded at the CBOR-value
+/// level: the host never links the SDK's typed manifest, and the bytes stay verbatim.
+struct SectionDeclWire {
+    name: String,
+    hash: [u8; 32],
+    size: u64,
+}
+
+/// Decode the §10.2 `state-manifest`'s `sections` array from its verbatim CBOR bytes.
+fn decode_manifest_sections(manifest: &[u8]) -> Result<Vec<SectionDeclWire>, String> {
+    use ciborium::value::Value;
+    let v: Value = ciborium::de::from_reader(manifest).map_err(|e| e.to_string())?;
+    let Value::Map(entries) = v else {
+        return Err("state-manifest is not a map".into());
+    };
+    let sections = entries
+        .iter()
+        .find_map(|(k, val)| match k {
+            Value::Text(t) if t == "sections" => Some(val),
+            _ => None,
+        })
+        .ok_or("state-manifest has no `sections`")?;
+    let Value::Array(items) = sections else {
+        return Err("`sections` is not an array".into());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Value::Map(fields) = item else {
+            return Err("a section decl is not a map".into());
+        };
+        let field = |name: &str| {
+            fields.iter().find_map(|(k, val)| match k {
+                Value::Text(t) if t == name => Some(val),
+                _ => None,
+            })
+        };
+        let name = match field("name") {
+            Some(Value::Text(t)) => t.clone(),
+            _ => return Err("section decl missing `name`".into()),
+        };
+        let hash: [u8; 32] = match field("hash") {
+            Some(Value::Bytes(b)) => b
+                .as_slice()
+                .try_into()
+                .map_err(|_| "section `hash` is not 32 bytes".to_string())?,
+            _ => return Err("section decl missing `hash`".into()),
+        };
+        let size = match field("size") {
+            Some(Value::Integer(i)) => u64::try_from(i128::from(*i))
+                .map_err(|_| "section `size` out of range".to_string())?,
+            _ => return Err("section decl missing `size`".into()),
+        };
+        out.push(SectionDeclWire { name, hash, size });
+    }
+    Ok(out)
+}
+
 fn journal_terminal_trap(shared: &Arc<PumpShared>, trap: &Trap) -> Result<(), SinkError> {
     let mut st = shared.state.lock().expect("pump lock");
     st.sink.terminal(
@@ -3197,6 +3632,7 @@ mod tests {
             op_requests: Vec::new(),
             stop_enqueued: false,
             draining: false,
+            accepted_snapshot: None,
         }
     }
 
@@ -3356,6 +3792,70 @@ mod tests {
     }
 
     #[test]
+    fn manifest_sections_decode_and_descriptor_round_trips() {
+        use ciborium::value::Value;
+        // A minimal §10.2 state-manifest: schema/module + one section decl.
+        let section_bytes = b"counter-state".to_vec();
+        let manifest = Value::Map(vec![
+            (Value::Text("schema".into()), Value::Integer(1.into())),
+            (Value::Text("module".into()), Value::Bytes(vec![7u8; 32])),
+            (
+                Value::Text("sections".into()),
+                Value::Array(vec![Value::Map(vec![
+                    (Value::Text("name".into()), Value::Text("counter".into())),
+                    (Value::Text("schema".into()), Value::Integer(1.into())),
+                    (
+                        Value::Text("hash".into()),
+                        Value::Bytes(blake3::hash(&section_bytes).as_bytes().to_vec()),
+                    ),
+                    (
+                        Value::Text("size".into()),
+                        Value::Integer((section_bytes.len() as u64).into()),
+                    ),
+                    (Value::Text("class".into()), Value::Integer(0.into())),
+                ])]),
+            ),
+        ]);
+        let mut manifest_bytes = Vec::new();
+        ciborium::into_writer(&manifest, &mut manifest_bytes).unwrap();
+
+        let decls = decode_manifest_sections(&manifest_bytes).expect("decodes");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "counter");
+        assert_eq!(decls[0].size, section_bytes.len() as u64);
+        assert_eq!(&decls[0].hash, blake3::hash(&section_bytes).as_bytes());
+
+        // The descriptor embeds the manifest value verbatim + the restore bindings (§10.2).
+        let desc =
+            build_migration_descriptor(&manifest_bytes, &[("counter".into(), 42)]).expect("builds");
+        let v: Value = ciborium::de::from_reader(desc.as_slice()).unwrap();
+        let Value::Map(entries) = v else {
+            panic!("descriptor is a map")
+        };
+        let get = |name: &str| {
+            entries
+                .iter()
+                .find_map(|(k, val)| match k {
+                    Value::Text(t) if t == name => Some(val.clone()),
+                    _ => None,
+                })
+                .expect("descriptor key")
+        };
+        assert_eq!(get("manifest"), manifest, "manifest embedded verbatim");
+        let Value::Array(sections) = get("sections") else {
+            panic!("sections is an array")
+        };
+        assert_eq!(sections.len(), 1);
+
+        // Malformed manifests are refused, not misread.
+        assert!(decode_manifest_sections(b"not-cbor").is_err());
+        assert!(
+            decode_manifest_sections(&[0xa0]).is_err(),
+            "empty map: no sections"
+        );
+    }
+
+    #[test]
     fn signed_frame_carries_the_full_scope_tuple_and_verifies() {
         // §12.1: [envelope, payload, sig]; the signature over the canonical envelope; every scope
         // field host-built. Verify with the plain proto primitives a third party would use.
@@ -3372,6 +3872,7 @@ mod tests {
             trap: None,
             slice: SliceState {
                 in_init: false,
+                in_migrate: false,
                 stopped: false,
                 draining: false,
                 now: 0,
@@ -3389,6 +3890,9 @@ mod tests {
             max_frame_bytes: 0,
             hard_accountable_host_bytes: 0,
             accountable_staged_bytes: 0,
+            migration_max_sections: 0,
+            migration_max_section_bytes: 0,
+            migration_restore: false,
             tabi: None,
             slice_pass_open: false,
             ingest_phase: IngestPhase::Idle,

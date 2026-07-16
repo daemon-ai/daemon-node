@@ -290,6 +290,19 @@ impl JournalSink for JournalAdapter {
             .map_err(|e| SinkError(e.to_string()))
     }
 
+    fn snapshot(&mut self, manifest: &[u8]) -> Result<(), SinkError> {
+        // tag 10, committed: §8.4 rule 2 — the barrier crosses before `snapshot_state` returns
+        // `Accepted` to the guest (the upgrade transaction's durability point).
+        self.journal
+            .append_committed(Body::Snapshot(
+                daemon_vhc_observe::journal::record::SnapshotRec {
+                    manifest: manifest.to_vec(),
+                },
+            ))
+            .map(|_| ())
+            .map_err(|e| SinkError(e.to_string()))
+    }
+
     fn terminal(
         &mut self,
         kind: u64,

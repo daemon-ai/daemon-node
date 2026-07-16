@@ -34,8 +34,8 @@ pub use buffer::BufferTable;
 pub use completion::{CompError, CompletionCodecError, CompletionResult, SuccessPayload};
 pub use custom_op::CustomOpRegistry;
 pub use driver::{
-    start_run, DeliverVerdict, OpOutcome, PumpHandle, RunEnd, RunIdentity, V2Error, V2Run,
-    V2RunConfig,
+    start_run, start_run_migrating, DeliverVerdict, MigrationInput, OpOutcome, PumpHandle, RunEnd,
+    RunIdentity, SnapshotCapture, SpooledFrame, V2Error, V2Run, V2RunConfig,
 };
 pub use event::{decode_event_frame, encode_event_frame, EventCodecError, EventV2, PayloadMeta};
 pub use journal::{Dropped, JournalSink, MemorySink, SinkEntry, SinkError};
