@@ -8,12 +8,9 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
-# The local-mode swarm runner (B3): drives the round protocol over a selectable transport
-# (loopback | real iroh mesh) + a filesystem store. Needs `iroh` (which pulls in `harness`), so the
-# default participant build never compiles it.
 # The recorded-run verification entry point (B2): replays `--observe` artifacts through the pure
 # coordinator `tick` and asserts per-round consensus re-derives. Needs `harness` (observe + the
-# coordinator shell) but NOT `iroh` — it verifies offline from files, so it builds transport-free.
+# coordinator shell) — it verifies offline from files, so it builds transport-free.
 [[bin]]
 name = "swarm-replay"
 path = "src/bin/swarm-replay.rs"
@@ -26,11 +23,11 @@ required-features = ["harness"]
 # Clock inputs) to external crates. Kept out of the default build; the `tests/daemon-swarm-e2e` crate
 # enables it. The crate's own unit tests reach the harness via `cfg(test)` (no feature needed).
 harness = ["dep:daemon-vhc-observe"]
-# `iroh` layered the live-transport harness (`live_harness`) on `harness`; that harness RETIRED
-# with the v1 driver at the Phase-E sunset (it drove the v1 WasmBackend over the engine). The
-# feature is kept as a passthrough so external `--features iroh` invocations stay valid, but it
-# gates no session code any more.
-iroh = ["harness", "daemon-vhc-net/iroh"]
+# (Phase-E sunset cleanup) The `iroh` feature is GONE: it layered the live-transport harness
+# (`live_harness`) on `harness`, and that harness retired with the v1 driver at the sunset (it
+# drove the v1 WasmBackend over the engine). The passthrough kept "external `--features iroh`
+# invocations valid" — a back-compat accommodation the ratified no-backcompat posture removes;
+# its only in-repo invoker was `daemon-swarm-e2e`'s equally dead `iroh` feature.
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }

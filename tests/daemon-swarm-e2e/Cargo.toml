@@ -9,14 +9,9 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
-[features]
-# The live-transport exit gate (`tests/live_transport.rs`): the round engine over a REAL per-node
-# `IrohGossip` mesh + a shared `FsPayloadStore` (B3). Off by default so the standard e2e gate stays
-# fast + iroh-free; run with `cargo test -p daemon-swarm-e2e --features iroh`.
-# P3 lane S additively pulls `daemon-vhc-net/ws` under the same live-gate feature: the 160M staging
-# rehearsal (`tests/staging_160m.rs`) taps the run's WS control plane as a passive observer to write
-# the `<run>.dsmlog` message-log capture. The default gate stays WS/TLS/iroh-free.
-iroh = ["daemon-vhc-session/iroh", "daemon-vhc-net/ws"]
+# (Phase-E sunset cleanup) The `iroh` feature is GONE: it gated only the retired live-transport /
+# staging suites (`live_transport.rs`, `staging_160m.rs`, `ws_live_workers.rs`, deleted with the v1
+# driver), so post-sunset it enabled dependency features no remaining test consumed.
 
 [dev-dependencies]
 # The peer-side round engine + the local-coordinator harness + churn/failure drill machinery
@@ -28,42 +23,30 @@ daemon-vhc-proto = { workspace = true }
 # the offline resync (checkpoint + record replay).
 daemon-vhc-net = { workspace = true }
 tokio = { workspace = true }
-# The wasm-backed profile e2e (`tests/wasm_profiles.rs`): the real host training backend
-# (`WasmBackend`), the pure coordinator `tick`, and the observe replay oracle (PROTO-20). All are
-# already in the frozen root `[workspace.dependencies]`; no cycle (the e2e crate is a leaf).
-daemon-vhc-host = { workspace = true }
-# (Phase-E sunset) the e2e->daemon-vhc-sdk dev-dep was REMOVED with the WasmBackend suites
-# (wasm_profiles / typed_checkpoint_bridge); the remaining oracles link sdk-rounds/sdk-v2/
-# sdk-consensus only (tracked exceptions).
+# (Phase-E sunset) the dev-deps whose consumer suites the sunset deleted are GONE:
+# daemon-vhc-sdk went with the WasmBackend suites (wasm_profiles / typed_checkpoint_bridge) in the
+# sunset commit itself; daemon-vhc-host, daemon-vhc-supervisor, daemon-vhc-node, daemon-api,
+# daemon-egress, serde_json, base64 and ciborium (consumers: wasm_profiles / ws_live_workers /
+# live_transport / staging_160m / checkpoint_resync) in the post-merge cleanup. The remaining
+# oracles link sdk-rounds/sdk-v2/sdk-consensus only (tracked exceptions).
 # The A2 choreography-move bridging oracle (tests/rounds_bridging_oracle.rs) compares the
-# relocated round logic against the v1 engine — a tracked dependency-direction exception
-# (registered in xtask vhc_dep_check), removed when the v1 engine dissolves at sunset.
+# relocated round logic against the retained RoundEngine (the engine SURVIVED the sunset as the
+# harness / cold-join substrate) — a tracked dependency-direction exception (registered in xtask
+# vhc_dep_check), removed when the engine re-seats onto vhc-sim.
 daemon-vhc-sdk-rounds = { workspace = true }
 # The B2 corpus-windowing equivalence oracle (tests/corpus_windowing_oracle.rs): the SDK-side
-# windowing policy (`daemon-vhc-sdk-v2::corpus`) must match the v1 host pipeline
+# windowing policy (`daemon-vhc-sdk-v2::corpus`) must match the retained host pipeline
 # (`daemon-vhc-session::data`) decision-for-decision. This leaf test crate is the one place both
-# sides link legally (same rationale as the daemon-vhc-sdk entry above). Path dep like the sdk
-# entry (sdk-v2 is deliberately not in the frozen root [workspace.dependencies]).
+# sides link legally (same rationale as the daemon-vhc-sdk-rounds entry above). Path dep
+# (sdk-v2 is deliberately not in the frozen root [workspace.dependencies]).
 daemon-vhc-sdk-v2 = { path = "../../crates/vhc/sdk/daemon-vhc-sdk-v2" }
-# The pure coordinator `tick` loop (drills.rs / wasm_profiles.rs) + observe replay oracle.
+# The pure coordinator `tick` loop (drills.rs) + observe replay oracle.
 # Relocated at D2 from the dissolved daemon-vhc-coordinator into sdk/daemon-vhc-sdk-consensus's
 # `coordinator` module; this leaf e2e crate links it directly (same both-sides-link rationale as
-# the daemon-vhc-sdk entries above). Tracked in xtask vhc_dep_check.
+# the entries above). Tracked in xtask vhc_dep_check.
 daemon-vhc-sdk-consensus = { workspace = true }
 daemon-vhc-observe = { workspace = true }
-ciborium = { workspace = true }
 blake3 = { workspace = true }
-# The A3 live worker-subprocess e2e (`tests/ws_live_workers.rs`, env-gated on wrangler-dev): the
-# node-side supervisor spawns REAL `daemon-vhc-worker` subprocesses, the SwarmService proves the
-# event pump into swarm.db, EgressClient POSTs the create-run request + reads DO state, and
-# serde_json/base64 author the request body. All existing `[workspace.dependencies]` entries — the
-# e2e crate stays a leaf.
-daemon-vhc-supervisor = { workspace = true }
-daemon-vhc-node = { workspace = true }
-daemon-api = { workspace = true }
-daemon-egress = { workspace = true }
-serde_json = { workspace = true }
-base64 = { workspace = true }
 
 [lints]
 workspace = true

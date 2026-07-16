@@ -4501,22 +4501,14 @@ dependencies = [
 name = "daemon-swarm-e2e"
 version = "0.0.1"
 dependencies = [
- "base64 0.22.1",
  "blake3",
- "ciborium",
- "daemon-api",
- "daemon-egress",
- "daemon-vhc-host",
  "daemon-vhc-net",
- "daemon-vhc-node",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-sdk-rounds",
  "daemon-vhc-sdk-v2",
  "daemon-vhc-session",
- "daemon-vhc-supervisor",
- "serde_json",
  "tokio",
 ]
 
