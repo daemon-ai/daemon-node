@@ -459,6 +459,16 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_custom_op"],
         ),
         (
+            // The Phase-C MODEL-AGNOSTIC acceptance (refactor §7: "a non-LLaMA toy authored with
+            // zero host changes … proving the compute ABI is model-agnostic"): the `toy-mlp` guest
+            // — a two-layer MLP trained by SGD, authored purely over daemon-vhc-sdk-compute +
+            // daemon-vhc-sdk-v2 — runs against the SAME compute@2 runner/driver/journal as the
+            // LLaMA reference, exports a trained weight bit-exact vs a native Autodiff<NdArray> run
+            // of the identical loop, and replays bit-for-bit (§8.7). No host code is model-specific.
+            "C3 model-agnostic compute@2 (toy-mlp: distinct model, zero host changes, bit-exact + replay)",
+            &["-p", "daemon-vhc-host", "--test", "toy_mlp"],
+        ),
+        (
             // The B2 data@2 fetch conformance (architecture §3.2 the data world): the corpus
             // window fetched by committed hash + policy-chosen range, completing Ok(BufferHandle)
             // (tag 6) after whole-artifact verification; grant negative (GrantViolation),

@@ -4845,6 +4845,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "toy-mlp"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "ciborium",
+ "daemon-vhc-sdk-compute",
+ "daemon-vhc-sdk-v2",
+]
+
+[[package]]
 name = "tracel-llvm"
 version = "20.1.4-7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
