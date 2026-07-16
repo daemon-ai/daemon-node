@@ -52,7 +52,7 @@ pub use burn_backend::BurnNdarrayBackend;
 pub use burn_backend::{cuda_adapter_available, BurnCudaBackend};
 #[cfg(feature = "wgpu")]
 pub use burn_backend::{wgpu_adapter_available, BurnWgpuBackend};
-pub use compute::{reserved_reason, ComputeError, ComputeRunner, HostReal};
+pub use compute::{unservable_op, ComputeError, ComputeRunner, HostReal};
 pub use handle::{HandleClass, Lane};
 pub use meta::MetaReport;
 pub use phase::Phase;

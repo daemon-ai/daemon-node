@@ -269,11 +269,13 @@ fn autodiff_tape_is_guest_side_over_the_handle_boundary() {
 }
 
 #[test]
-fn custom_op_ir_is_a_clean_reserved_refusal() {
-    // ABI §15: OperationIr::Custom (custom/fused kernels) stays in C2's host-side custom-op
-    // registry — the host refuses it cleanly (typed), never the panic the upstream runner produces.
-    // (The QFloat arms — Float(Quantize)/Float(Dequantize) — are the identical match mechanism in
-    // reserved_reason; both are RESERVED until specified.)
+fn custom_op_ir_refuses_with_the_c2_vocabulary_code() {
+    // ABI §15: OperationIr::Custom does not dispatch through the generic IR wire — named custom
+    // ops are C2's host-side registry (v2::CustomOpRegistry) and actual Custom-IR dispatch stays
+    // deferred. The refusal is clean and typed, carrying C2's `CustomOpUnsupported` vocabulary
+    // code — never the panic the upstream runner produces. (The QFloat arms —
+    // Float(Quantize)/Float(Dequantize) — are the identical match mechanism in unservable_op;
+    // both stay RESERVED until specified.)
     let mut runner = ComputeRunner::ndarray_cpu();
     let custom = OperationIr::Custom(CustomOpIr {
         id: "flash_attn@1".to_string(),
@@ -283,11 +285,65 @@ fn custom_op_ir_is_a_clean_reserved_refusal() {
     let mut buf = Vec::new();
     ciborium::into_writer(&custom, &mut buf).unwrap();
     let err = runner.submit_op(&buf).unwrap_err();
-    assert!(
-        matches!(err, ComputeError::Reserved(_)),
-        "custom op must be a clean Reserved refusal, got {err:?}"
+    match &err {
+        ComputeError::CustomOpUnsupported(name) => assert_eq!(name, "flash_attn@1"),
+        other => panic!("expected CustomOpUnsupported, got {other:?}"),
+    }
+    assert_eq!(
+        err.refusal_code(),
+        Some(daemon_vhc_abi::AbiRefusalCode::CustomOpUnsupported),
+        "the runtime refusal speaks the C2 admission vocabulary"
     );
     assert_eq!(err.trap_code().slug(), "BadEnum");
+    assert!(err.to_string().contains("CustomOpUnsupported"));
+}
+
+#[test]
+fn injected_device_fault_defers_to_fence_and_readback() {
+    // Deferred-error semantics (architecture §3.3, the ndarray-tier injectable-fault seam): a
+    // device fault parked at enqueue time NEVER surfaces at submit_op — the next fence (or
+    // readback) reports it, exactly once, as a typed Device error (trap twin: ComputeFault;
+    // completion twin: COMP_ERR_DEVICE).
+    let mut runner = ComputeRunner::ndarray_cpu();
+    let data = BackendTensorData::new(vec![1.0f32, 2.0], [2usize]);
+    runner.import_tensor(7, &ser(&data)).unwrap();
+    runner.fence().expect("clean fence before the fault");
+
+    runner.inject_device_fault("simulated async device fault");
+    // Enqueue against the poisoned queue still succeeds (enqueue is infallible, §3.3).
+    let drop_op = OperationIr::Drop(TensorIr {
+        id: TensorId::new(7),
+        shape: Shape::from(vec![2usize]),
+        status: TensorStatus::ReadWrite,
+        dtype: DType::F32,
+    });
+    runner
+        .submit_op(&ser(&drop_op))
+        .expect("enqueue infallible");
+    // The fault surfaces at the fence — once.
+    let err = runner.fence().unwrap_err();
+    assert!(
+        matches!(&err, ComputeError::Device(reason) if reason.contains("simulated")),
+        "got {err:?}"
+    );
+    assert_eq!(err.trap_code().slug(), "ComputeFault");
+    runner.fence().expect("the fault surfaced exactly once");
+
+    // And the readback path surfaces a latched fault the same way.
+    let mut runner = ComputeRunner::ndarray_cpu();
+    runner.import_tensor(9, &ser(&data)).unwrap();
+    runner.inject_device_fault("fault before readback");
+    let ir = TensorIr {
+        id: TensorId::new(9),
+        shape: Shape::from(vec![2usize]),
+        status: TensorStatus::ReadOnly,
+        dtype: DType::F32,
+    };
+    let err = runner.read_tensor(&ser(&ir)).unwrap_err();
+    assert!(matches!(err, ComputeError::Device(_)), "got {err:?}");
+    runner
+        .read_tensor(&ser(&ir))
+        .expect("readback clean after the fault surfaced");
 }
 
 #[test]
@@ -304,7 +360,7 @@ fn malformed_op_blob_fails_closed() {
 fn unknown_and_stale_tensor_handles_are_typed_faults() {
     // The Phase-C obligation (ABI §15): a stale/unknown handle is a typed StaleHandle/InvalidHandle
     // trap, NEVER the host crash the upstream runner would produce.
-    let runner = ComputeRunner::ndarray_cpu();
+    let mut runner = ComputeRunner::ndarray_cpu();
     let ir = TensorIr {
         id: TensorId::new(9_999_999),
         shape: Shape::from(vec![2usize, 2usize]),

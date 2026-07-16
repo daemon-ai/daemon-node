@@ -48,11 +48,19 @@ pub const DA_ABI_MAJOR_V2: u32 = 2;
 /// payload put/get — the [`V2_SYMBOL_REGISTRY`] minor-1 entries), bumped in the same commit that
 /// made `Event::Completion` delivery real in the driver — the ratified additive evolution path
 /// (ABI §1.4/§4.6: reserved variants deliverable only above the minor that reserved them),
-/// mirroring how the A2 majors flip was coupled to the working event-loop driver. A module
-/// declaring minor 0 keeps the Phase-A closed subset: it cannot import a completion-generating
-/// symbol (registry-gated), and the host delivers it no tag-6 event. `AbiMinorTooNew` continues
-/// to refuse declarations above this constant.
-pub const DA_ABI_MINOR_V2: u32 = 1;
+/// mirroring how the A2 majors flip was coupled to the working event-loop driver.
+///
+/// **Minor 2 is the Phase-C `compute@2` surface** ([`COMPUTE_MINOR_V2`]; decisions D8, ABI §15):
+/// the four-symbol import shim over the `CBOR(burn_ir::OperationIr)` op-stream plus `Event::Fence`
+/// (tag 5) delivery, bumped — per the same coupled-to-the-working-driver discipline — in the
+/// commit that wired the compute command queue + fence delivery into the event-loop driver
+/// (track C1 owns this bump; C2's named-op vocabulary registers at the same minor in its own
+/// section). Minor-gating is structural, exactly the tag-6 completions precedent: a `Fence` event
+/// can only ever arise from a `compute@2::fence` call, and importing any `compute@2` symbol
+/// forces a declared minor ≥ 2 (§1.3 step 5 `AbiDeclarationMismatch` otherwise) — so a module
+/// declaring minor ≤ 1 can never receive a tag-5 event. `AbiMinorTooNew` continues to refuse
+/// declarations above this constant.
+pub const DA_ABI_MINOR_V2: u32 = 2;
 
 /// The set of ABI **majors this host generation implements** (i.e. carries a driver for).
 ///
@@ -199,19 +207,15 @@ pub const RNG_SEED_LEN: usize = 32;
 /// hard ABI floor.
 ///
 /// **Minor-bump note (mirrors [`SYS_V2_CRYPTO_SYMBOLS`]):** these symbols register at
-/// [`COMPUTE_MINOR_V2`] (the shared Phase-C minor). Like the B1→B2→B3 Phase-B minor, the single
-/// [`DA_ABI_MINOR_V2`] bump to the collective Phase-C minor — flipping the host to *implement*
-/// compute (and thus admit compute-importing modules and deliver [`EV_TAG_FENCE`]) — is a change
-/// the parallel Phase-C tracks (C1 compute, C2 det/custom-ops) share; it lands **once, at the
-/// track merge**, so the v2 guest blobs are re-pinned once, not per track. Registered-but-not-yet-
-/// implemented means `validate_imports` cleanly refuses a compute import as
-/// [`AbiRefusalCode::WorldMinorUnsupported`] until the bump — the honest pre-merge state.
+/// [`COMPUTE_MINOR_V2`] (the shared Phase-C minor). Track C1 owns the [`DA_ABI_MINOR_V2`] bump to
+/// it (orchestrator ruling, sitting 2), landed — per B1's precedent — in the commit that wired the
+/// compute command queue + `Event::Fence` delivery into the event-loop driver; C2's named-op
+/// vocabulary registers at the same minor in its own delimited section and the merge unions.
 pub const COMPUTE_V2_SYMBOLS: &[&str] = &["submit_op", "fence", "export", "import"];
 
 /// The shared Phase-C major-2 minor at which the `compute@2` surface ([`COMPUTE_V2_SYMBOLS`]) and
-/// the [`EV_TAG_FENCE`] event are introduced (ABI §15, decisions D8). The host advertises this
-/// minor — and thus admits compute-importing modules and delivers `Fence` — only once
-/// [`DA_ABI_MINOR_V2`] is bumped to it at the Phase-C track merge (see [`COMPUTE_V2_SYMBOLS`]).
+/// the [`EV_TAG_FENCE`] event are introduced (ABI §15, decisions D8). [`DA_ABI_MINOR_V2`] reached
+/// this minor with the C1 driver wiring (see its doc for the structural minor-gating argument).
 pub const COMPUTE_MINOR_V2: u32 = 2;
 
 /// The pinned Burn version the `compute@2` wire (`CBOR(burn_ir::OperationIr)`) is defined against
@@ -862,6 +866,14 @@ pub const READBACK_KIND_STATE_SECTION: u32 = 3;
 /// valid `read_back` CALL argument at this minor (the same never-callable discipline as the
 /// ≥ 128 bridge journal kinds).
 pub const READBACK_KIND_STREAM_BYTES: u32 = 4;
+/// Kind 5 — **journal-record kind only** (assigned by the C1 compute minor): the `CBOR(TensorData)`
+/// bytes behind a `compute@2::export` completion. An exported tensor's bytes are a
+/// **nondeterministic input** (device-produced — native-lane arithmetic, architecture §3.6 claim
+/// 3), so — exactly like kind-4 stream bytes — they are journaled verbatim (a §8.3 tag-2 record,
+/// `src` = the export's `OpId`) at completion arrival; replay materializes the completion's
+/// buffer from that record and re-executes no kernel (§8.7). Never a valid `read_back` CALL
+/// argument (the same never-callable discipline as kind 4 and the ≥ 128 bridge journal kinds).
+pub const READBACK_KIND_TENSOR_EXPORT: u32 = 5;
 /// `read_back` kinds ≥ this are the reserved bridge-op journal kinds (ABI §2.5/§2.7); never valid as
 /// call arguments (ABI §6.4).
 pub const READBACK_KIND_BRIDGE_JOURNAL_MIN: u32 = 128;
@@ -1178,9 +1190,15 @@ pub const COMP_ERR_CREDIT_EXHAUSTED: u64 = 5;
 pub const COMP_ERR_PEER_CLOSED: u64 = 6;
 /// `comp-error` code 7: a grant/quota bound was exhausted (ABI §7.5).
 pub const COMP_ERR_GRANT_EXHAUSTED: u64 = 7;
+/// `comp-error` code 8: a **deferred device execution error** surfaced at a `compute@2`
+/// export/readback completion (CUDA-style deferred semantics, architecture §3.3; the C1 compute
+/// minor's addition — additive per §7.5's "8–63 reserved (additive by minor)"). The trap-shaped
+/// twin (a device error at a *fence*) is `TrapCode::ComputeFault`; a stale/unknown tensor handle
+/// is never this code — it is the typed `StaleHandle`/`InvalidHandle` trap at the call (ABI §15).
+pub const COMP_ERR_DEVICE: u64 = 8;
 /// `comp-error` codes at or above this are reserved (additive by minor); a guest MUST fail closed on
 /// an unknown code (ABI §5.2/§7.5).
-pub const COMP_ERR_RESERVED_MIN: u64 = 8;
+pub const COMP_ERR_RESERVED_MIN: u64 = 9;
 
 /// The stable machine-readable slug for a `comp-error` code, or `None` if `code` is reserved/unknown
 /// (ABI §7.5). Used to render the `detail`-free failure category in host logs / node surfaces.
@@ -1195,6 +1213,7 @@ pub fn comp_err_slug(code: u64) -> Option<&'static str> {
         COMP_ERR_CREDIT_EXHAUSTED => Some("CreditExhausted"),
         COMP_ERR_PEER_CLOSED => Some("PeerClosed"),
         COMP_ERR_GRANT_EXHAUSTED => Some("GrantExhausted"),
+        COMP_ERR_DEVICE => Some("DeviceError"),
         _ => None,
     }
 }
@@ -1291,9 +1310,10 @@ mod tests {
         // unimplemented major (e.g. a future 3) stays a clean AbiUnsupportedMajor.
         assert_eq!(HOST_IMPLEMENTED_MAJORS, &[1, 2]);
         assert_eq!(host_minor_for(DA_ABI_MAJOR), Some(0));
-        // B1 bumped the major-2 minor to 1 in the same commit that made Completion delivery
-        // real (the ratified additive path, ABI §1.4/§4.6); minor 2 stays AbiMinorTooNew.
-        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(1));
+        // B1 bumped the major-2 minor to 1 with Completion delivery; C1 bumped it to 2 with
+        // Fence delivery + the compute@2 shim (the ratified coupled-to-the-working-driver path,
+        // ABI §1.4/§4.6); minor 3 stays AbiMinorTooNew.
+        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(COMPUTE_MINOR_V2));
         assert_eq!(host_minor_for(3), None);
     }
 
@@ -1454,10 +1474,14 @@ mod tests {
         assert!(call_kinds
             .iter()
             .all(|k| *k < READBACK_KIND_BRIDGE_JOURNAL_MIN));
-        // Kind 4 is a JOURNAL-record kind (stream-read completion bytes, B1) — distinct from
-        // every call kind and below the bridge journal floor, never callable at this minor.
+        // Kinds 4/5 are JOURNAL-record kinds (stream-read completion bytes, B1; tensor-export
+        // completion bytes, C1) — distinct from every call kind and below the bridge journal
+        // floor, never callable.
         assert_eq!(READBACK_KIND_STREAM_BYTES, 4);
+        assert_eq!(READBACK_KIND_TENSOR_EXPORT, 5);
         assert!(!call_kinds.contains(&READBACK_KIND_STREAM_BYTES));
+        assert!(!call_kinds.contains(&READBACK_KIND_TENSOR_EXPORT));
+        assert_ne!(READBACK_KIND_TENSOR_EXPORT, READBACK_KIND_STREAM_BYTES);
         assert_eq!(READBACK_KIND_BRIDGE_JOURNAL_MIN, 128);
     }
 
@@ -1649,9 +1673,10 @@ mod tests {
             COMP_ERR_CREDIT_EXHAUSTED,
             COMP_ERR_PEER_CLOSED,
             COMP_ERR_GRANT_EXHAUSTED,
+            COMP_ERR_DEVICE,
         ];
-        assert_eq!(codes, [0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(COMP_ERR_RESERVED_MIN, 8);
+        assert_eq!(codes, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(COMP_ERR_RESERVED_MIN, 9);
         // Every assigned code has a unique, stable slug; reserved/unknown codes have none (fail
         // closed, ABI §5.2/§7.5).
         let mut slugs: Vec<&str> = codes.iter().map(|c| comp_err_slug(*c).unwrap()).collect();

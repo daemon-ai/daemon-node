@@ -26,6 +26,7 @@ success-payload = uint                         ; a handle (buffer/tensor/stream)
 comp-error = {
   "code":   uint,      ; 0 = Cancelled, 1 = NetUnreachable, 2 = Timeout, 3 = StoreRefused,
                        ; 4 = HashMismatch, 5 = CreditExhausted, 6 = PeerClosed,
-                       ; 7 = GrantExhausted; 8..=63 reserved (additive by minor)
+                       ; 7 = GrantExhausted, 8 = DeviceError (compute@2 deferred device error,
+                       ; the C1 compute-minor addition); 9..=63 reserved (additive by minor)
   ? "detail": tstr,
 }

@@ -53,8 +53,10 @@ use crate::trap::TrapCode;
 pub type HostReal = NdArray<f32, i64, i8>;
 
 /// A typed `compute@2` fault (decisions D8, ABI §7.6/§15). Enqueue is infallible in the
-/// command-queue model (architecture §3.3); these surface at `submit_op` argument validation, at a
-/// fence, or at a readback.
+/// command-queue model (architecture §3.3) — a *device* failure never surfaces at `submit_op`;
+/// these arise at `submit_op` **argument validation** (stale/invalid handles, reserved variants,
+/// undecodable blobs — programming errors, which trap immediately per §7.6), or as **deferred
+/// device errors** at a fence/readback.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ComputeError {
@@ -66,8 +68,14 @@ pub enum ComputeError {
     /// A tensor handle that was NEVER registered — maps to [`TrapCode::InvalidHandle`].
     #[error("invalid tensor handle {0}: never registered")]
     InvalidHandle(u64),
-    /// A RESERVED op variant refused cleanly until specified (ABI §15): custom ops (C2 registry)
-    /// or quantization/`QFloat`.
+    /// `OperationIr::Custom{id}` — named custom ops do not dispatch through the generic IR wire
+    /// (they are C2's host-side custom-op registry, `v2::CustomOpRegistry`; actual Custom-IR
+    /// dispatch is deferred until specified). Carries the C2 refusal vocabulary
+    /// ([`daemon_vhc_abi::AbiRefusalCode::CustomOpUnsupported`]) so both halves of the Phase-C
+    /// seam speak one code.
+    #[error("CustomOpUnsupported: custom op `{0}` does not dispatch through the compute@2 IR wire (C2 registry seam, ABI §15)")]
+    CustomOpUnsupported(String),
+    /// A RESERVED op variant refused cleanly until specified (ABI §15): quantization/`QFloat`.
     #[error("reserved compute operation refused: {0}")]
     Reserved(&'static str),
     /// The op-blob / tensor-data was not decodable canonical CBOR of the pinned IR (a malformed
@@ -76,53 +84,66 @@ pub enum ComputeError {
     #[error("compute op decode failed: {0}")]
     Decode(String),
     /// A deferred device execution error surfaced at fence/readback (CUDA-style, architecture
-    /// §3.3). Tier-1 ndarray is synchronous so this is rare; the wgpu/cuda tiers exercise the
-    /// deferred timing.
+    /// §3.3): the tier-1 trap twin is [`TrapCode::ComputeFault`]; the completion twin is
+    /// [`daemon_vhc_abi::COMP_ERR_DEVICE`]. Synchronous ndarray defers dispatch faults through
+    /// [`ComputeRunner`]'s pending-error latch; the wgpu/cuda tiers ride the same seam with real
+    /// async timing.
     #[error("device execution error: {0}")]
     Device(String),
 }
 
 impl ComputeError {
-    /// The host trap code this fault surfaces as at a readback / fence (ABI §7.6). Stale/unknown
-    /// handles are the load-bearing mapping (§15); reserved/undecodable ops fail closed as
-    /// `BadEnum`/`BadEvent`; a device error surfaces as a `BudgetOps`-free typed compute fault.
+    /// The host trap code this fault surfaces as (ABI §7.6). Stale/unknown handles are the
+    /// load-bearing mapping (§15); reserved/custom/undecodable ops fail closed as
+    /// `BadEnum`/`BadEvent` (the custom-op trap detail carries the C2
+    /// `CustomOpUnsupported` vocabulary code via `Display`); a deferred device error at a fence
+    /// is the typed compute fault.
     #[must_use]
     pub fn trap_code(&self) -> TrapCode {
         match self {
             Self::StaleHandle(_) => TrapCode::StaleHandle,
             Self::InvalidHandle(_) => TrapCode::InvalidHandle,
-            // A reserved op variant is an op the host does not serve — fail closed as an unknown
-            // enum value (the guest sent an op outside the pinned/served set).
-            Self::Reserved(_) => TrapCode::BadEnum,
+            // An op variant the host does not serve — fail closed as an unknown enum value.
+            Self::CustomOpUnsupported(_) | Self::Reserved(_) => TrapCode::BadEnum,
             Self::Decode(_) => TrapCode::BadEvent,
-            // A deferred device error at readback is a compute fault, not a resource breach; the
-            // async completion path maps it to a `comp-error` instead (driver shim).
             Self::Device(_) => TrapCode::ComputeFault,
+        }
+    }
+
+    /// The admission-vocabulary refusal code this fault corresponds to, where one exists: the
+    /// C2 seam's [`daemon_vhc_abi::AbiRefusalCode::CustomOpUnsupported`] for a submitted
+    /// `OperationIr::Custom` (the manifest-level twin is `CustomOpRegistry::admit`).
+    #[must_use]
+    pub fn refusal_code(&self) -> Option<daemon_vhc_abi::AbiRefusalCode> {
+        match self {
+            Self::CustomOpUnsupported(_) => {
+                Some(daemon_vhc_abi::AbiRefusalCode::CustomOpUnsupported)
+            }
+            _ => None,
         }
     }
 }
 
-/// Classify an [`OperationIr`] as a RESERVED variant refused until specified (ABI §15), returning a
-/// human-readable reason, or `None` for a servable op. This is the one governance point beyond the
-/// pinned IR schema: it names exactly the variants the router runner does not lower today.
+/// Classify an [`OperationIr`] the generic IR wire does not serve (ABI §15), or `None` for a
+/// servable op. This is the one governance point beyond the pinned IR schema: it names exactly
+/// the variants the router runner does not lower today.
+///
+/// - `Custom` → [`ComputeError::CustomOpUnsupported`] carrying the op's versioned name: named
+///   custom ops resolve through C2's `v2::CustomOpRegistry` at admission; actual Custom-IR
+///   dispatch stays deferred (the runner panics "Can't execute custom operation here" by design —
+///   C1 refuses cleanly instead, with the C2 vocabulary code).
+/// - Quantization/`QFloat` (`Float(Quantize/Dequantize)`) → [`ComputeError::Reserved`]: `todo!()`
+///   in the router runner — quantized tensors do not lower today.
 #[must_use]
-pub fn reserved_reason(op: &OperationIr) -> Option<&'static str> {
+pub fn unservable_op(op: &OperationIr) -> Option<ComputeError> {
     match op {
-        // Custom/fused kernels cross the boundary as registered names, not as generic IR — they
-        // stay in C2's host-side custom-op registry (architecture §3.2). The runner panics
-        // ("Can't execute custom operation here") by design; C1 refuses cleanly instead.
-        OperationIr::Custom(_) => Some(
-            "OperationIr::Custom — custom/fused kernels are the C2 host-side custom-op registry \
-             (architecture §3.2; ABI §15 RESERVED)",
-        ),
-        // Quantization / QFloat: `Quantize`/`Dequantize` are `todo!()` in the router runner —
-        // quantized tensors do not lower today (ABI §15 RESERVED).
-        OperationIr::Float(_, FloatOperationIr::Quantize(_)) => Some(
+        OperationIr::Custom(c) => Some(ComputeError::CustomOpUnsupported(c.id.clone())),
+        OperationIr::Float(_, FloatOperationIr::Quantize(_)) => Some(ComputeError::Reserved(
             "OperationIr::Float(Quantize) — quantization/QFloat does not lower (ABI §15 RESERVED)",
-        ),
-        OperationIr::Float(_, FloatOperationIr::Dequantize(_)) => Some(
+        )),
+        OperationIr::Float(_, FloatOperationIr::Dequantize(_)) => Some(ComputeError::Reserved(
             "OperationIr::Float(Dequantize) — quantization/QFloat does not lower (ABI §15 RESERVED)",
-        ),
+        )),
         _ => None,
     }
 }
@@ -141,6 +162,14 @@ pub struct ComputeRunner<B: BackendIr> {
     /// `TensorId`s ever registered — distinguishes a dropped handle (`StaleHandle`) from one that
     /// was never valid (`InvalidHandle`).
     seen: BTreeSet<u64>,
+    /// The **deferred-error latch** (CUDA-style semantics, architecture §3.3): a device execution
+    /// fault parked here at enqueue surfaces at the NEXT fence or readback, never at `submit_op`.
+    /// Synchronous ndarray populates it from a caught dispatch fault; async device tiers
+    /// (wgpu/cuda) populate it from their queue-drain results at the same seam; tests inject
+    /// through [`Self::inject_device_fault`] (the testkit simulated-providers pattern) — so the
+    /// deferred *timing* is exercised even on the CPU tier (the true-GPU timing gap is reported,
+    /// not silent).
+    pending_device_error: Option<String>,
 }
 
 impl ComputeRunner<HostReal> {
@@ -160,6 +189,22 @@ impl<B: BackendIr> ComputeRunner<B> {
             runner: Runner::new(device),
             live: BTreeSet::new(),
             seen: BTreeSet::new(),
+            pending_device_error: None,
+        }
+    }
+
+    /// Park a device fault to surface at the next fence/readback (deferred-error semantics,
+    /// architecture §3.3). The injectable-fault seam for the deferred-error conformance tests and
+    /// the async device tiers.
+    pub fn inject_device_fault(&mut self, reason: impl Into<String>) {
+        self.pending_device_error.get_or_insert(reason.into());
+    }
+
+    /// Take the parked device fault, if any (it surfaces exactly once).
+    fn take_device_fault(&mut self) -> Result<(), ComputeError> {
+        match self.pending_device_error.take() {
+            Some(reason) => Err(ComputeError::Device(reason)),
+            None => Ok(()),
         }
     }
 
@@ -179,22 +224,23 @@ impl<B: BackendIr> ComputeRunner<B> {
         }
     }
 
-    /// `compute@2::submit_op` — decode + dispatch one `CBOR(OperationIr)` op-blob (command-queue
-    /// enqueue; ABI §3.3). RESERVED variants are refused; every read operand is validated live
-    /// *before* dispatch so the runner never panics on an unknown id; output handles become live.
+    /// `compute@2::submit_op` — decode + enqueue one `CBOR(OperationIr)` op-blob (command-queue
+    /// enqueue; ABI §3.3). Validation faults (undecodable blob, unservable variant, non-live read
+    /// operand) are **programming errors and trap at the call** (§7.6); a **device** fault never
+    /// surfaces here — it parks in the deferred-error latch and surfaces at the next
+    /// fence/readback (§3.3). Output handles become live.
     ///
     /// # Errors
     ///
     /// [`ComputeError::Decode`] (malformed op-blob / undecodable variant),
-    /// [`ComputeError::Reserved`] (custom/QFloat), [`ComputeError::StaleHandle`] /
-    /// [`ComputeError::InvalidHandle`] (a non-live read operand), or [`ComputeError::Device`] (a
-    /// residual runner fault, defensively caught rather than crashing the host).
+    /// [`ComputeError::CustomOpUnsupported`] / [`ComputeError::Reserved`] (custom / QFloat), or
+    /// [`ComputeError::StaleHandle`] / [`ComputeError::InvalidHandle`] (a non-live read operand).
     pub fn submit_op(&mut self, op_cbor: &[u8]) -> Result<(), ComputeError> {
         let op: OperationIr =
             ciborium::from_reader(op_cbor).map_err(|e| ComputeError::Decode(e.to_string()))?;
 
-        if let Some(reason) = reserved_reason(&op) {
-            return Err(ComputeError::Reserved(reason));
+        if let Some(err) = unservable_op(&op) {
+            return Err(err);
         }
 
         // `Drop` retires a handle: it must be one we hold (else it is a stale/invalid free), and it
@@ -206,7 +252,7 @@ impl<B: BackendIr> ComputeRunner<B> {
             }
             self.live.remove(&id);
             // Register the Drop so the runner frees its buffer; it holds the id, so this is safe.
-            self.dispatch(op)?;
+            self.dispatch(op);
             return Ok(());
         }
 
@@ -217,9 +263,11 @@ impl<B: BackendIr> ComputeRunner<B> {
             }
         }
 
-        // Collect output ids before moving `op` into the runner.
+        // Collect output ids before moving `op` into the runner. Outputs become live even when
+        // the device queue is poisoned (a latched fault): the guest keeps enqueueing against a
+        // consistent handle space and the fault surfaces, once, at the fence/readback.
         let outputs: Vec<u64> = op.outputs().map(|t| t.id.value()).collect();
-        self.dispatch(op)?;
+        self.dispatch(op);
         for id in outputs {
             self.live.insert(id);
             self.seen.insert(id);
@@ -227,18 +275,24 @@ impl<B: BackendIr> ComputeRunner<B> {
         Ok(())
     }
 
-    /// Dispatch an already-validated op through the runner, defensively catching any residual
-    /// panic (an id our liveness tracking somehow missed) and surfacing it as a typed fault rather
-    /// than a host crash (ABI §7.6 / §15: "never a host crash").
-    fn dispatch(&self, op: OperationIr) -> Result<(), ComputeError> {
+    /// Dispatch an already-validated op through the runner. A residual runner fault (an id the
+    /// liveness tracking somehow missed, an internal backend failure) is caught and **parked in
+    /// the deferred-error latch** — never a host crash (ABI §7.6/§15), never a `submit_op` error
+    /// (enqueue is infallible, §3.3). A poisoned queue (already-latched fault) skips dispatch:
+    /// real device queues stop executing after a fault, and the first fault is the one reported.
+    fn dispatch(&mut self, op: OperationIr) {
+        if self.pending_device_error.is_some() {
+            return;
+        }
         let runner = &self.runner;
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let res = std::panic::catch_unwind(AssertUnwindSafe(|| runner.register_op(op)));
         std::panic::set_hook(prev);
-        res.map_err(|_| {
-            ComputeError::Device("runner panicked dispatching an op (unknown handle?)".to_string())
-        })
+        if res.is_err() {
+            self.pending_device_error
+                .get_or_insert("runner fault dispatching an op".to_string());
+        }
     }
 
     /// `compute@2::import` — register host-owned `CBOR(TensorData)` under the guest-minted `id`
@@ -259,20 +313,22 @@ impl<B: BackendIr> ComputeRunner<B> {
 
     /// `compute@2::export` / the readback path — read a live tensor named by `CBOR(TensorIr)` back
     /// to `CBOR(TensorData)` (device → staging). Blocking (architecture §3.2 second blocking
-    /// point); deferred device errors surface here (§3.3).
+    /// point); **deferred device errors surface here** (§3.3) — a latched fault is taken before
+    /// any read.
     ///
     /// # Errors
     ///
     /// [`ComputeError::Decode`] (bad `TensorIr`), [`ComputeError::StaleHandle`] /
     /// [`ComputeError::InvalidHandle`] (the tensor is not live), or [`ComputeError::Device`] (a
-    /// deferred device execution error).
-    pub fn read_tensor(&self, ir_cbor: &[u8]) -> Result<Vec<u8>, ComputeError> {
+    /// deferred device execution error — latched or raised by the read itself).
+    pub fn read_tensor(&mut self, ir_cbor: &[u8]) -> Result<Vec<u8>, ComputeError> {
         let ir: TensorIr =
             ciborium::from_reader(ir_cbor).map_err(|e| ComputeError::Decode(e.to_string()))?;
         let id = ir.id.value();
         if !self.live.contains(&id) {
             return Err(self.absent_handle_fault(id));
         }
+        self.take_device_fault()?;
         let runner = &self.runner;
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
@@ -293,15 +349,16 @@ impl<B: BackendIr> ComputeRunner<B> {
         Ok(buf)
     }
 
-    /// `compute@2::fence` — drain the command queue to a consistent point (architecture §3.3). For
-    /// the synchronous tier-1 backend this is a no-op success; on wgpu/cuda it awaits the device
-    /// and surfaces a deferred error here. The driver delivers `Event::Fence(id)` after a
-    /// successful fence.
+    /// `compute@2::fence` — drain the command queue to a consistent point (architecture §3.3):
+    /// **deferred device errors surface here** (a latched fault is taken first, then the device
+    /// sync). For the synchronous tier-1 backend the sync is immediate; on wgpu/cuda it awaits
+    /// the device. The driver delivers `Event::Fence(id)` only after a successful fence.
     ///
     /// # Errors
     ///
     /// [`ComputeError::Device`] when the device reports a deferred execution error.
-    pub fn fence(&self) -> Result<(), ComputeError> {
+    pub fn fence(&mut self) -> Result<(), ComputeError> {
+        self.take_device_fault()?;
         RunnerClient::sync(&self.runner).map_err(|e| ComputeError::Device(format!("{e}")))
     }
 
