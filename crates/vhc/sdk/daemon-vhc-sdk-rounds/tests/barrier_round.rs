@@ -18,7 +18,7 @@ use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::messages::{BatchWindow, RecordEntry, RoundOpen, RoundRecord};
 use daemon_vhc_proto::{blake3_hash, Hash, PeerId, Seed};
 use daemon_vhc_sdk_rounds::{
-    BarrierRound, MintError, Outbound, RoundCfg, RoundExperiment, Staged, StepCtx,
+    Authorized, BarrierRound, Committed, MintError, Outbound, RoundCfg, RoundExperiment, StepCtx,
 };
 
 fn peer(b: u8) -> PeerId {
@@ -54,10 +54,10 @@ impl RoundExperiment for Recorder {
         self.calls.push(format!("make r{round}"));
         format!("update-r{round}").into_bytes()
     }
-    fn ingest(&mut self, round: u64, staged: &Staged) -> [u8; 16] {
+    fn ingest(&mut self, round: u64, committed: &Committed) -> [u8; 16] {
         self.calls.push(format!("ingest r{round}"));
         self.ingested
-            .push((round, staged.items().iter().map(|i| i.peer).collect()));
+            .push((round, committed.items().iter().map(|i| i.peer).collect()));
         let mut d = [0u8; 16];
         d[..8].copy_from_slice(&round.to_le_bytes());
         d
@@ -99,10 +99,10 @@ fn round_record(round: u64, entries: &[RecordEntry]) -> RoundRecord {
     }
 }
 
-// -- the Staged bridging oracle --------------------------------------------------------------------
+// -- the Committed mint (the re-typed Staged bridging oracle) ----------------------------------------
 
 #[test]
-fn staged_mint_pins_record_listed_order_verification_and_byte_identity() {
+fn committed_mint_pins_record_listed_order_verification_and_byte_identity() {
     let (a, b, c) = (peer(3), peer(1), peer(2));
     // Deliberately NOT pubkey-sorted: the mint must follow the RECORD-LISTED order, nothing else.
     let entries = vec![entry(a, b"pay-a"), entry(b, b"pay-b"), entry(c, b"pay-c")];
@@ -110,9 +110,10 @@ fn staged_mint_pins_record_listed_order_verification_and_byte_identity() {
     source.insert((7, a), b"pay-a".to_vec());
     source.insert((7, b), b"pay-b".to_vec());
     source.insert((7, c), b"pay-c".to_vec());
+    let auth = Authorized::from_authoritative_channel(0);
 
-    let staged = Staged::mint(7, &entries, &mut source).expect("mint");
-    let order: Vec<PeerId> = staged.items().iter().map(|i| i.peer).collect();
+    let committed = Committed::mint(&auth, 7, &entries, &mut source).expect("mint");
+    let order: Vec<PeerId> = committed.items().iter().map(|i| i.peer).collect();
     assert_eq!(
         order,
         vec![a, b, c],
@@ -121,21 +122,21 @@ fn staged_mint_pins_record_listed_order_verification_and_byte_identity() {
 
     // Byte-identity across mints (the Phase-D re-typing contract).
     assert_eq!(
-        staged,
-        Staged::mint(7, &entries, &mut source).expect("mint again")
+        committed,
+        Committed::mint(&auth, 7, &entries, &mut source).expect("mint again")
     );
 
     // A missing payload refuses (the stall ladder's input) — all-or-nothing.
     source.remove(&(7, b));
     assert_eq!(
-        Staged::mint(7, &entries, &mut source).unwrap_err(),
+        Committed::mint(&auth, 7, &entries, &mut source).unwrap_err(),
         MintError::Missing { peer: b }
     );
 
     // Tampered bytes refuse with the offending peer named.
     source.insert((7, b), b"pay-B".to_vec());
     assert_eq!(
-        Staged::mint(7, &entries, &mut source).unwrap_err(),
+        Committed::mint(&auth, 7, &entries, &mut source).unwrap_err(),
         MintError::HashMismatch { peer: b }
     );
 }
@@ -151,9 +152,14 @@ fn host_staged_mint_keeps_order_and_all_or_nothing_with_delegated_verification()
     let mut source: BTreeMap<(u64, PeerId), HostStaged> = BTreeMap::new();
     source.insert((3, a), HostStaged(11));
     source.insert((3, b), HostStaged(12));
+    let auth = Authorized::from_authoritative_channel(0);
 
-    let staged = Staged::mint(3, &entries, &mut source).expect("mint");
-    let order: Vec<(PeerId, u64)> = staged.items().iter().map(|i| (i.peer, i.bytes.0)).collect();
+    let committed = Committed::mint(&auth, 3, &entries, &mut source).expect("mint");
+    let order: Vec<(PeerId, u64)> = committed
+        .items()
+        .iter()
+        .map(|i| (i.peer, i.bytes.0))
+        .collect();
     assert_eq!(
         order,
         vec![(a, 11), (b, 12)],
@@ -163,7 +169,7 @@ fn host_staged_mint_keeps_order_and_all_or_nothing_with_delegated_verification()
     // All-or-nothing stands: a missing token refuses exactly like missing bytes.
     source.remove(&(3, b));
     assert_eq!(
-        Staged::mint(3, &entries, &mut source).unwrap_err(),
+        Committed::mint(&auth, 3, &entries, &mut source).unwrap_err(),
         MintError::Missing { peer: b }
     );
 }

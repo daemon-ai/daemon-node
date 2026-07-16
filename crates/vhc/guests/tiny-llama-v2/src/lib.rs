@@ -37,7 +37,7 @@ use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId};
 use daemon_vhc_sdk::models::{TinyLlama, TinyLlamaCfg};
 use daemon_vhc_sdk::prelude::*;
 use daemon_vhc_sdk_rounds::{
-    BarrierRound, HostStaged, PayloadSource, RoundCfg, RoundExperiment, Staged,
+    BarrierRound, Committed, HostStaged, PayloadSource, RoundCfg, RoundExperiment,
     StepCtx as RoundStepCtx,
 };
 use serde::Deserialize;
@@ -97,12 +97,12 @@ impl RoundExperiment<HostStaged> for TinyLlamaRound {
         Vec::new()
     }
 
-    fn ingest(&mut self, round: u64, staged: &Staged<HostStaged>) -> [u8; 16] {
+    fn ingest(&mut self, round: u64, committed: &Committed<HostStaged>) -> [u8; 16] {
         // Resolve each host-staged token to its upd_* index (record-listed order). The bridge
         // opens a fresh staged window per ingest slice (v1's per-entry `staged.clear()`), so the
         // indices are 0-based per round and the plain SDK `UpdatesView` reads them unchanged.
         let mut count = 0u32;
-        for item in staged.items() {
+        for item in committed.items() {
             let idx = daemon_vhc_sdk_v2::read_back_uint(item.bytes.0, 2);
             debug_assert_eq!(u64::from(count), idx, "record-listed staging order");
             count += 1;
@@ -118,7 +118,7 @@ impl RoundExperiment<HostStaged> for TinyLlamaRound {
 }
 
 /// The guest's payload source: kind-2 staging tokens FIFO, positional per record entry (the
-/// plumbing stages in record-listed order — single-lookup-per-entry, matching `Staged::mint`'s
+/// plumbing stages in record-listed order — single-lookup-per-entry, matching `Committed::mint`'s
 /// iteration order).
 struct FifoUpdates {
     queue: VecDeque<u64>,
