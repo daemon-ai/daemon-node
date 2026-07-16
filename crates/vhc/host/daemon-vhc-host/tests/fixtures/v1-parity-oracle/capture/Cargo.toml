@@ -1,0 +1,34 @@
+# The v1-parity-oracle CAPTURE crate (Phase E sunset prerequisite — refactor §9, decisions D5).
+#
+# The two frozen parity pins (`tiny_llama_on_barrier_round_reproduces_v1_digests_cpu`,
+# `catch_up_after_straggle_reproduces_v1_digests_cpu` in daemon-vhc-host/tests/v2_parity.rs) and
+# the C3 parity lanes (tests/c3_parity.rs) compare v2 runs against v1-DERIVED values. Before the
+# Phase-E v1 sunset those values were computed LIVE by the v1 five-phase driver on every test run;
+# the sunset deletes that driver, so this crate freezes the oracle as a content-addressed recorded
+# fixture (the A0 pattern) FIRST, and the pins consume the recording thereafter.
+#
+# This is a deliberately detached, standalone workspace (the empty [workspace] table below): it is
+# NOT a member of the daemon-node workspace, and its dependencies point BY PATH into the
+# PRE-SUNSET tree — the commit recorded in ../expected.json `captured_from.commit`, where the v1
+# driver (`daemon_vhc_session::WasmBackend`, `daemon_vhc_host::Instance` five-phase dispatch) and
+# the SDK preset (`daemon_vhc_sdk::models::TinyLlamaCfg`) still exist. On a post-sunset tree this
+# crate DOES NOT BUILD — by design: regeneration is only meaningful from the pre-sunset driver.
+#
+# Capture command (from ../README.md): build the guests first, then run this crate — see there.
+[package]
+name = "v1-parity-oracle-capture"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+daemon-vhc-host = { path = "../../../..", features = ["burn-ndarray"] }
+daemon-vhc-session = { path = "../../../../../daemon-vhc-session" }
+daemon-vhc-sdk = { path = "../../../../../../sdk/daemon-vhc-sdk", features = ["sim"] }
+daemon-vhc-proto = { path = "../../../../../../contracts/daemon-vhc-proto" }
+blake3 = "1"
+ciborium = "0.2"
+serde_json = "1"

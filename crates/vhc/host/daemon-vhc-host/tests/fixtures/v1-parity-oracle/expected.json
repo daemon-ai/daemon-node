@@ -1,0 +1,139 @@
+{
+  "backend_independence": "det-lane bit-identity (refactor §12.1) + the v1 op backend parity suites (burn_backend_parity.rs) make this recording valid for every backend tier (cpu / burn-ndarray / wgpu / cuda)",
+  "c3_parity": {
+    "digests": [
+      "abcf2612d53960d1930e46772e02d718",
+      "574cf418f3b526b2066bd9134cfc4286"
+    ],
+    "engine": "burn-ndarray",
+    "init": {
+      "blake3": "d31eb76052d96d280742389def0bfb00501b65eaac24a4eac580c31e24a0d454",
+      "bytes": 180992,
+      "file": "c3/init.f32le.bin"
+    },
+    "model_cfg": {
+      "adam_eps": 1e-8,
+      "beta1": 0.9,
+      "beta2": 0.95,
+      "d_model": 64,
+      "ffn_mult": 2,
+      "head_dim": 16,
+      "lr": 0.0004,
+      "n_heads": 4,
+      "n_layers": 1,
+      "rmsnorm_eps": 0.00001,
+      "rope_theta": 10000.0,
+      "seq_len": 9,
+      "vocab": 64,
+      "wd": 0.1
+    },
+    "param_names": [
+      "tok.weight",
+      "l0.attn_norm",
+      "l0.wq",
+      "l0.wk",
+      "l0.wv",
+      "l0.wo",
+      "l0.ffn_norm",
+      "l0.w_gate",
+      "l0.w_up",
+      "l0.w_down",
+      "norm.weight"
+    ],
+    "param_numels": [
+      4096,
+      64,
+      4096,
+      4096,
+      4096,
+      4096,
+      64,
+      8192,
+      8192,
+      8192,
+      64
+    ],
+    "payloads": [
+      {
+        "blake3": "71459bdb64933f447afc0a25523a27dd29bc5f9a09500881afb3b37297b8284b",
+        "bytes": 26026,
+        "file": "c3/payload-round-0.bin"
+      },
+      {
+        "blake3": "01153cd1d868f5b679c98a58ddeea0a634d4379b2024c21379e4fc10268195ca",
+        "bytes": 26026,
+        "file": "c3/payload-round-1.bin"
+      }
+    ],
+    "profile_cfg": {
+      "bits": 2,
+      "chunk": 64,
+      "clip": false,
+      "ef_decay": 0.95,
+      "h": 3,
+      "outer_alpha": 1.0,
+      "topk": 8
+    },
+    "schedule": {
+      "micro_batch": 2,
+      "peer": "[7; 32]",
+      "rounds": 2,
+      "seq_len": 9,
+      "steps_per_round": 2,
+      "tokens": "token[i] of (round, step) = ((i + 1000*step + 100000*round + 1) * 2654435761) % 64"
+    },
+    "trained": [
+      {
+        "blake3": "6db5ab11b25aee3e2321c51dd64641a62168bf0c326f5633232b167cdf7388af",
+        "bytes": 180992,
+        "file": "c3/trained-round-0.f32le.bin"
+      },
+      {
+        "blake3": "a3869e930114e04ae11a3c9f09e8baec9952e3ff29d14367622103528058bcbe",
+        "bytes": 180992,
+        "file": "c3/trained-round-1.f32le.bin"
+      }
+    ]
+  },
+  "captured_from": {
+    "capture": "tests/fixtures/v1-parity-oracle/capture (see README.md)",
+    "commit": "1390f0b7",
+    "driver": "v1 five-phase (daemon-vhc-session WasmBackend / daemon-vhc-host Instance)",
+    "tree": "vhc/e3-sunset (pre-sunset — the last tree with the live v1 driver)"
+  },
+  "module": {
+    "blake3": "badbf43b3243fae97617fe1bc4551a589d4f1b92ce29c1afd808c205fd06de69",
+    "bytes": 143944,
+    "name": "tiny_llama.wasm",
+    "source": "guests/target build at capture (byte-identical across checkout paths via the guests workspace rustc shim; pinned in guests.blake3 at the capture commit)"
+  },
+  "v2_parity": {
+    "engine": "cpu (EngineConfig::default())",
+    "final_digest": "5dfdade3210a7da2c243f0b022484304",
+    "model_cfg": {
+      "blake3": "1d4781d999d42ef19786ba73320256d80dd21f8c0a7a378d9af084ff630dbef1",
+      "bytes": 438,
+      "file": "model-cfg.v1.cbor"
+    },
+    "schedule": {
+      "micro_batch": 2,
+      "peer": "[7; 32]",
+      "rounds": 2,
+      "seq_len": 9,
+      "steps_per_round": 2,
+      "tokens": "all-zero"
+    },
+    "updates": [
+      {
+        "blake3": "235dd4f02a00936b32e51436242c9da6dd7d1c3826ddf4f0a0d4da9298784175",
+        "bytes": 26026,
+        "file": "updates/v2p-round-0.bin"
+      },
+      {
+        "blake3": "bc64a491bc05a513dbb78fc5f5896593a6204bd2f75850b6397c89a1bdad2861",
+        "bytes": 26026,
+        "file": "updates/v2p-round-1.bin"
+      }
+    ]
+  }
+}

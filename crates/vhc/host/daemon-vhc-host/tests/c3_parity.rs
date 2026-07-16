@@ -3,8 +3,9 @@
 //
 // The C3 models-exodus acceptance (refactor §7): the **re-authored** `tiny-llama-c3` guest — a
 // real Burn model over `Autodiff<HostBackend>` + the C3a `sdk-profiles` det-lane — driven through
-// a barrier whole-run against the **v1 digest oracle** (the frozen `tiny_llama.wasm` v1 module on
-// the tabi host). Two legs, deliberately split:
+// a barrier whole-run against the **v1 digest oracle**. Since the Phase-E sunset the oracle is
+// the RECORDED `tests/fixtures/v1-parity-oracle/` bundle (captured pre-sunset from the live v1
+// driver over the frozen `tiny_llama.wasm`; decisions D5). Two legs, deliberately split:
 //
 // - **C3b — bit-exact lowering** (`c3_guest_training_lowers_bit_exact_vs_native`): the guest's
 //   trained θ (published per round) equals a native `Autodiff<NdArray>` run of the SAME
@@ -39,13 +40,12 @@ use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
 use daemon_vhc_host::v2::{start_run, MemorySink, RunEnd, RunIdentity, V2RunConfig};
-use daemon_vhc_host::{BackendKind, EngineConfig, Worker};
+use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::messages::{
     BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, SwarmMessage,
 };
-use daemon_vhc_proto::{blake3_hash, digest_state, to_canonical_vec, Hash, PeerId, Seed};
-use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId, Seed};
 use daemon_vhc_sdk_profiles::{IngestParam, SparseLoco, SparseLocoCfg};
 
 use c3_model::{C3Llama, ModelCfg};
@@ -101,47 +101,50 @@ fn guest(name: &str) -> Vec<u8> {
 
 // -- the shared schedule --------------------------------------------------------------------------
 
-/// The v1 experiment config: the frozen-pin parity shape (1 layer, seq 9) — `sparse_loco`
-/// `chunk 64 / topk 8 / clip false` per the default.
-fn v1_cfg() -> TinyLlamaCfg {
-    TinyLlamaCfg {
-        n_layers: 1,
-        seq_len: SEQ_LEN,
-        ..TinyLlamaCfg::default()
-    }
+/// The model/profile config literals the run reconstructs — recorded in the frozen oracle bundle
+/// (`expected.json` `c3_parity.model_cfg` / `.profile_cfg`, written from the live v1
+/// `TinyLlamaCfg` at capture, so nothing here was transcribed by hand). The frozen-pin parity
+/// shape: 1 layer, seq 9, `sparse_loco` `chunk 64 / topk 8 / clip false`.
+fn oracle_expected() -> serde_json::Value {
+    serde_json::from_str(ORACLE_EXPECTED).expect("expected.json")
 }
 
-/// The c3 model config mirroring [`v1_cfg`] (flat field view).
+/// The c3 model config, reconstructed from the recorded oracle's config literals.
 fn c3_cfg() -> ModelCfg {
-    let v1 = v1_cfg();
+    let j = oracle_expected();
+    let m = &j["c3_parity"]["model_cfg"];
+    let u = |k: &str| u32::try_from(m[k].as_u64().unwrap_or_else(|| panic!("{k}"))).expect("u32");
+    let f = |k: &str| m[k].as_f64().unwrap_or_else(|| panic!("{k}"));
     ModelCfg {
-        d_model: v1.d_model,
-        n_layers: v1.n_layers,
-        n_heads: v1.n_heads,
-        head_dim: v1.head_dim,
-        vocab: v1.vocab,
-        seq_len: v1.seq_len,
-        ffn_mult: v1.ffn_mult,
-        rope_theta: v1.rope_theta,
-        rmsnorm_eps: v1.rmsnorm_eps,
-        lr: v1.inner.lr,
-        beta1: v1.inner.beta1,
-        beta2: v1.inner.beta2,
-        adam_eps: v1.inner.eps,
-        wd: v1.inner.wd,
+        d_model: u("d_model"),
+        n_layers: u("n_layers"),
+        n_heads: u("n_heads"),
+        head_dim: u("head_dim"),
+        vocab: u("vocab"),
+        seq_len: u("seq_len"),
+        ffn_mult: u("ffn_mult"),
+        rope_theta: f("rope_theta"),
+        rmsnorm_eps: f("rmsnorm_eps"),
+        lr: f("lr"),
+        beta1: f("beta1"),
+        beta2: f("beta2"),
+        adam_eps: f("adam_eps"),
+        wd: f("wd"),
     }
 }
 
 fn profile_cfg() -> SparseLocoCfg {
-    let v1 = v1_cfg();
+    let j = oracle_expected();
+    let p = &j["c3_parity"]["profile_cfg"];
+    let u = |k: &str| u32::try_from(p[k].as_u64().unwrap_or_else(|| panic!("{k}"))).expect("u32");
     SparseLocoCfg {
-        h: v1.sparse_loco.h,
-        ef_decay: v1.sparse_loco.ef_decay,
-        chunk: v1.sparse_loco.chunk,
-        topk: v1.sparse_loco.topk,
-        bits: v1.sparse_loco.bits,
-        outer_alpha: v1.sparse_loco.outer_alpha,
-        clip: v1.sparse_loco.clip,
+        h: u("h"),
+        ef_decay: p["ef_decay"].as_f64().expect("ef_decay"),
+        chunk: u("chunk"),
+        topk: u("topk"),
+        bits: u("bits"),
+        outer_alpha: p["outer_alpha"].as_f64().expect("outer_alpha"),
+        clip: p["clip"].as_bool().expect("clip"),
     }
 }
 
@@ -156,7 +159,14 @@ fn tokens_for(round: u64, step: u32) -> Vec<u32> {
         .collect()
 }
 
-// -- the v1 digest oracle (the frozen v1 module on the tabi host, driven via Instance) ------------
+// -- the v1 digest oracle (RECORDED — tests/fixtures/v1-parity-oracle; decisions D5) --------------
+//
+// Before the Phase-E sunset this oracle ran the frozen v1 module LIVE via `Instance` on every
+// test execution; the sunset deleted the v1 driver, so the oracle values were frozen FIRST as
+// the content-addressed `v1-parity-oracle` bundle (captured at pre-sunset commit `1390f0b7` by
+// the bundled capture crate). "The v1 digests remain the oracle" — now as a recording.
+
+const ORACLE_EXPECTED: &str = include_str!("fixtures/v1-parity-oracle/expected.json");
 
 struct V1Run {
     /// The matched init (canonical registration order).
@@ -169,52 +179,105 @@ struct V1Run {
     digests: Vec<[u8; 16]>,
 }
 
-fn digest_of_state(state: &[u8], round: u64) -> [u8; 16] {
-    let mut seed = [0u8; 32];
-    seed[..8].copy_from_slice(&round.to_le_bytes());
-    let d = digest_state(&Seed(seed), 64, u32::MAX, state);
-    *d.as_bytes()
+fn oracle_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1-parity-oracle")
+}
+
+fn hex_bytes(s: &str) -> Vec<u8> {
+    assert!(s.len() % 2 == 0, "even hex");
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// Load + content-verify one recorded fixture file against its `expected.json` entry.
+fn oracle_file(entry: &serde_json::Value) -> Vec<u8> {
+    let rel = entry["file"].as_str().expect("file");
+    let bytes = std::fs::read(oracle_root().join(rel))
+        .unwrap_or_else(|e| panic!("read recorded oracle file {rel}: {e}"));
+    assert_eq!(
+        blake3_hash(&bytes).to_hex().to_string(),
+        entry["blake3"].as_str().expect("blake3"),
+        "recorded oracle file {rel} is content-addressed — bytes must match the pin"
+    );
+    assert_eq!(bytes.len() as u64, entry["bytes"].as_u64().expect("bytes"));
+    bytes
+}
+
+/// Split a flat little-endian f32 buffer into the recorded per-param layout.
+fn split_params(flat_le: &[u8], numels: &[usize]) -> Vec<Vec<f32>> {
+    let flat: Vec<f32> = flat_le
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut out = Vec::with_capacity(numels.len());
+    let mut off = 0;
+    for &n in numels {
+        out.push(flat[off..off + n].to_vec());
+        off += n;
+    }
+    assert_eq!(off, flat.len(), "flat buffer matches the recorded numels");
+    out
 }
 
 fn v1_oracle() -> V1Run {
-    let engine = EngineConfig {
-        backend: BackendKind::BurnNdarray,
-        ..EngineConfig::default()
-    };
-    let worker = Worker::new(engine).expect("v1 engine");
-    let module = worker.load_module(&guest("tiny_llama")).expect("v1 module");
-    let mut inst = worker.instantiate(&module).expect("v1 instance");
-    let mut cfg_bytes = Vec::new();
-    ciborium::into_writer(&v1_cfg(), &mut cfg_bytes).expect("cfg cbor");
-    inst.build(&cfg_bytes).expect("da_build");
-
-    let read_state = |inst: &daemon_vhc_host::Instance| -> Vec<Vec<f32>> {
-        inst.params()
-            .iter()
-            .map(|p| inst.param_master(&p.name).expect("param master"))
-            .collect()
-    };
-    let init = read_state(&inst);
-
-    let mut trained = Vec::new();
-    let mut payloads = Vec::new();
-    let mut digests = Vec::new();
-    for round in 0..ROUNDS {
-        for h in 0..STEPS_PER_ROUND {
-            let bh = inst.register_batch(tokens_for(round, h), MICRO_BATCH, SEQ_LEN);
-            // mb_index 0, mb_count 1, step_seqs = MICRO_BATCH ⇒ loss_scale 1.0 (the v2_parity
-            // schedule shape).
-            inst.step(bh, h, 0, 1, MICRO_BATCH).expect("da_step");
-            inst.inner_update(h).expect("da_inner_update");
-        }
-        trained.push(read_state(&inst));
-        let container = inst.make_update(round).expect("da_make_update");
-        let payload = inst.update_bytes(container).expect("update bytes");
-        inst.ingest_payloads(round, std::slice::from_ref(&payload))
-            .expect("ingest");
-        payloads.push(payload);
-        digests.push(digest_of_state(&inst.canonical_state_bytes(), round));
-    }
+    let j = oracle_expected();
+    let c3 = &j["c3_parity"];
+    let sched = &c3["schedule"];
+    assert_eq!(
+        (
+            sched["rounds"].as_u64().unwrap(),
+            sched["steps_per_round"].as_u64().unwrap(),
+            sched["micro_batch"].as_u64().unwrap(),
+            sched["seq_len"].as_u64().unwrap(),
+        ),
+        (
+            ROUNDS,
+            u64::from(STEPS_PER_ROUND),
+            u64::from(MICRO_BATCH),
+            u64::from(SEQ_LEN)
+        ),
+        "the recorded oracle's schedule must match the harness constants"
+    );
+    let numels: Vec<usize> = c3["param_numels"]
+        .as_array()
+        .expect("numels")
+        .iter()
+        .map(|n| usize::try_from(n.as_u64().expect("numel")).expect("usize"))
+        .collect();
+    // The dual-compiled model source must still agree with the recorded layout — a drifted
+    // model config would silently misalign every comparison below.
+    assert_eq!(
+        numels,
+        c3_cfg().param_numels(),
+        "recorded param layout ≡ the dual-compiled model's layout"
+    );
+    let init = split_params(&oracle_file(&c3["init"]), &numels);
+    let trained: Vec<Vec<Vec<f32>>> = c3["trained"]
+        .as_array()
+        .expect("trained")
+        .iter()
+        .map(|e| split_params(&oracle_file(e), &numels))
+        .collect();
+    let payloads: Vec<Vec<u8>> = c3["payloads"]
+        .as_array()
+        .expect("payloads")
+        .iter()
+        .map(oracle_file)
+        .collect();
+    let digests: Vec<[u8; 16]> = c3["digests"]
+        .as_array()
+        .expect("digests")
+        .iter()
+        .map(|d| {
+            hex_bytes(d.as_str().expect("hex"))
+                .try_into()
+                .expect("digest16")
+        })
+        .collect();
+    assert_eq!(trained.len() as u64, ROUNDS);
+    assert_eq!(payloads.len() as u64, ROUNDS);
+    assert_eq!(digests.len() as u64, ROUNDS);
     V1Run {
         init,
         trained,
