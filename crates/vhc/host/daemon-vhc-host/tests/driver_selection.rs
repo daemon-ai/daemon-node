@@ -213,9 +213,13 @@ fn minor0_declaration_without_minor1_imports_stays_admitted() {
 
 #[test]
 fn v2_minor_above_host_is_minor_too_new() {
-    // 2.2 > the host's 2.1: AbiMinorTooNew continues to protect the other direction.
-    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 2));
-    let err = select_driver(&worker(), &wasm, None).expect_err("minor 2 > host minor 1");
+    // One above the host's implemented minor (derived, not hard-coded — the constant moves with
+    // each phase's bump; C1's Phase-C bump took it to 2): AbiMinorTooNew continues to protect
+    // the other direction.
+    let above = daemon_vhc_abi::DA_ABI_MINOR_V2 + 1;
+    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, above));
+    let err = select_driver(&worker(), &wasm, None)
+        .expect_err("a declared minor above the host's must refuse");
     assert_eq!(err.code, AbiRefusalCode::AbiMinorTooNew);
 }
 
