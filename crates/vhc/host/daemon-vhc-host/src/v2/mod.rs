@@ -18,6 +18,7 @@
 pub mod admission;
 pub mod buffer;
 pub mod completion;
+pub mod custom_op;
 pub mod driver;
 pub mod event;
 pub mod journal;
@@ -31,6 +32,7 @@ pub use admission::{
 };
 pub use buffer::BufferTable;
 pub use completion::{CompError, CompletionCodecError, CompletionResult, SuccessPayload};
+pub use custom_op::CustomOpRegistry;
 pub use driver::{
     start_run, DeliverVerdict, OpOutcome, PumpHandle, RunEnd, RunIdentity, V2Error, V2Run,
     V2RunConfig,

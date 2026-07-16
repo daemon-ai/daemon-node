@@ -350,6 +350,10 @@ pub enum AbiRefusalCode {
     /// `switch_module` targets a module without `da_migrate` — always an admission refusal, never a
     /// trap (ABI §1.5, §10.3). Reserved for Phase E; part of the taxonomy now.
     MigrateUnsupported,
+    /// The manifest requires a versioned custom op (`manifest.custom_ops`, ABI §2.3) this host does
+    /// not advertise in its custom-op registry ([`HOST_CUSTOM_OPS`]) — a clean admission refusal,
+    /// never a trap (architecture §3.2 "admission fails cleanly on hosts that lack them"). [C2:custom-op]
+    CustomOpUnsupported,
 }
 
 impl AbiRefusalCode {
@@ -368,6 +372,7 @@ impl AbiRefusalCode {
             Self::ClaimExceedsPolicy => "ClaimExceedsPolicy",
             Self::ClaimInconsistent => "ClaimInconsistent",
             Self::MigrateUnsupported => "MigrateUnsupported",
+            Self::CustomOpUnsupported => "CustomOpUnsupported",
         }
     }
 }
@@ -684,6 +689,38 @@ pub const DET_ACCEL_OPS: &[&str] = &[
     "dct2@1",
     "idct2@1",
 ];
+
+// ================================================================================================
+// Custom-op registry (Phase C; architecture §3.2, refactor §7).                    [C2:custom-op]
+//
+// Fused kernels (flash-attention variants, fused optimizer steps) cannot cross the wasm boundary
+// as code; they register HOST-side under versioned names. A module's manifest lists the custom ops
+// it needs (`manifest.custom_ops`, ABI §2.3) and admission fails CLEANLY — a typed refusal, never
+// a trap — on a host that lacks a required one (architecture §3.2, §5.2). This is the named-op
+// admission/dispatch seam that fills the RESERVED `compute@2` `OperationIr::Custom` variant
+// (ABI §15): C1 owns the `OperationIr` wire and refuses the Custom IR variant; the host resolves
+// the NAMED op through this registry. Coordinated by vocabulary, not shared code — kept in its own
+// delimited section so the serial Phase-C merge with C1's compute@2 sections stays mechanical.
+// ================================================================================================
+
+/// The first registered custom op and the template for future fusions: a fused (causal/full)
+/// attention kernel, versioned `@1`. Versioning is part of the name: a new kernel or an
+/// incompatible revision is a distinct entry (`flash_attn@2`), never a silent redefinition — the
+/// admission contract (`required ⊆ advertised`) is over these exact versioned strings.
+pub const CUSTOM_OP_FLASH_ATTN_V1: &str = "flash_attn@1";
+
+/// The versioned named custom ops this host advertises — the "advertised" set of admission's
+/// `required ⊆ granted ⊆ advertised` (architecture §3.2). A module whose `manifest.custom_ops`
+/// names an entry absent here is refused [`AbiRefusalCode::CustomOpUnsupported`] at admission (the
+/// one place new research can still require a host release — by design rare). Growth is additive;
+/// entries are permanent and version-suffixed, so a host only ever *adds* fusions it implements.
+pub const HOST_CUSTOM_OPS: &[&str] = &[CUSTOM_OP_FLASH_ATTN_V1];
+
+/// Whether this host advertises the versioned custom op `name` in its registry ([`HOST_CUSTOM_OPS`]).
+#[must_use]
+pub fn host_supports_custom_op(name: &str) -> bool {
+    HOST_CUSTOM_OPS.contains(&name)
+}
 
 // ================================================================================================
 // The major-2 event-loop wire vocabulary (ABI §4–§12): the numeric assignments the event-loop

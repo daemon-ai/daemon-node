@@ -450,6 +450,15 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_det_conformance"],
         ),
         (
+            // The Phase-C custom-op registry gate (architecture §3.2, refactor §7): versioned
+            // named fused kernels register host-side (flash_attn@1 the first entry); a manifest
+            // requiring an op the host does not advertise is refused CLEANLY (typed
+            // CustomOpUnsupported, never a trap). Pins the shared ABI vocabulary (the seam C1's
+            // compute@2 OperationIr::Custom resolves through) + the registry admission behaviour.
+            "C2 custom-op registry (flash_attn@1; typed refusal on absent required op)",
+            &["-p", "daemon-vhc-host", "--test", "v2_custom_op"],
+        ),
+        (
             // The B2 data@2 fetch conformance (architecture §3.2 the data world): the corpus
             // window fetched by committed hash + policy-chosen range, completing Ok(BufferHandle)
             // (tag 6) after whole-artifact verification; grant negative (GrantViolation),
