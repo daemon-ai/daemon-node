@@ -43,8 +43,8 @@ use burn::tensor::{DType, Shape, Tensor, TensorData};
 use burn_ir::{
     FullOpIr, NumericOperationIr, OperationIr, ScalarIr, TensorId, TensorIr, TensorStatus,
 };
-use daemon_vhc_host::autotune::{cuda_nvrtc_ready, probe_cuda};
 use daemon_vhc_host::compute::ComputeError;
+use daemon_vhc_host::probe::{cuda_nvrtc_ready, probe_cuda};
 use daemon_vhc_host::{cuda_adapter_available, ComputeRunner};
 
 type CudaReal = burn::backend::Cuda;

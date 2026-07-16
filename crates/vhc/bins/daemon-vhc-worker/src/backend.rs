@@ -494,8 +494,8 @@ pub(crate) fn engine_config_from_env() -> daemon_vhc_host::EngineConfig {
         #[cfg(feature = "wgpu")]
         "wgpu" => daemon_vhc_host::BackendKind::Wgpu,
         // P3 Merge-2: the CUDA lane (RunPod 4090) sets `DAEMON_TRAIN_BACKEND=cuda` for the roomy
-        // 160M budgets; the actual backend/gpu is still chosen by `select_backend()`'s probe ladder
-        // (NVRTC-readiness-gated), which composes over this via `worker_engine_config()`.
+        // 160M budgets. (The v1 live-attach probe ladder that composed over this —
+        // `select_backend()` — retired with `live.rs` at the Phase-E sunset.)
         #[cfg(feature = "cuda")]
         "cuda" => daemon_vhc_host::BackendKind::Cuda,
         other => {
@@ -561,7 +561,7 @@ fn host_ram_mb() -> u64 {
 /// `/sys/class/drm/card*/device/` — a legal direct file read in the worker binary (not the node).
 /// Returns `0` when no card exposes the file (non-amdgpu / non-Linux), so callers fall back.
 ///
-/// Parsing is delegated to [`daemon_vhc_host::autotune::parse_amdgpu_mem_mb`] (unit-tested with
+/// Parsing is delegated to [`daemon_vhc_host::probe::parse_amdgpu_mem_mb`] (unit-tested with
 /// fixture strings); this wrapper only does the sysfs directory walk + read.
 #[cfg(feature = "wgpu")]
 fn amdgpu_sysfs_mem_mb(file: &str) -> u64 {
@@ -577,7 +577,7 @@ fn amdgpu_sysfs_mem_mb(file: &str) -> u64 {
         }
         let path = entry.path().join("device").join(file);
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Some(mb) = daemon_vhc_host::autotune::parse_amdgpu_mem_mb(&contents) {
+            if let Some(mb) = daemon_vhc_host::probe::parse_amdgpu_mem_mb(&contents) {
                 if mb > 0 {
                     return mb;
                 }
@@ -602,7 +602,7 @@ pub(crate) fn hardware() -> Hardware {
     // wgpu adapter — it queries D3D12 `ARCHITECTURE1.UMA` + DXGI budgets directly.
     #[cfg(windows)]
     {
-        if let Some(dl) = daemon_vhc_host::autotune::probe_windows_device_limits() {
+        if let Some(dl) = daemon_vhc_host::probe::probe_windows_device_limits() {
             return Hardware {
                 gpus: 1,
                 vram_mb: dl.vram_mb,
@@ -621,7 +621,7 @@ pub(crate) fn hardware() -> Hardware {
     // maxBufferLength directly; unified => shared_mb == ram_mb (one DRAM pool).
     #[cfg(target_os = "macos")]
     {
-        if let Some(dl) = daemon_vhc_host::autotune::probe_macos_device_limits() {
+        if let Some(dl) = daemon_vhc_host::probe::probe_macos_device_limits() {
             return Hardware {
                 gpus: 1,
                 vram_mb: dl.vram_mb,
@@ -641,7 +641,7 @@ pub(crate) fn hardware() -> Hardware {
     // Checked before wgpu so a box built `--features cuda` (RunPod 4090) reports the CUDA lane.
     #[cfg(feature = "cuda")]
     {
-        if let Some(p) = daemon_vhc_host::autotune::probe_cuda() {
+        if let Some(p) = daemon_vhc_host::probe::probe_cuda() {
             return Hardware {
                 gpus: p.gpus,
                 vram_mb: p.vram_mb,
@@ -658,7 +658,7 @@ pub(crate) fn hardware() -> Hardware {
     }
     #[cfg(feature = "wgpu")]
     {
-        if let Some(p) = daemon_vhc_host::autotune::probe_wgpu() {
+        if let Some(p) = daemon_vhc_host::probe::probe_wgpu() {
             // Dedicated VRAM from sysfs (true lower bound); fall back to the max-alloc proxy.
             let vram_sysfs = amdgpu_sysfs_mem_mb("mem_info_vram_total");
             let vram_mb = if vram_sysfs > 0 {
@@ -715,13 +715,13 @@ pub(crate) fn device_limits() -> DeviceLimits {
     // Windows / macOS: the platform FFI probes are authoritative and need no wgpu feature.
     #[cfg(windows)]
     {
-        if let Some(dl) = daemon_vhc_host::autotune::probe_windows_device_limits() {
+        if let Some(dl) = daemon_vhc_host::probe::probe_windows_device_limits() {
             return dl;
         }
     }
     #[cfg(target_os = "macos")]
     {
-        if let Some(dl) = daemon_vhc_host::autotune::probe_macos_device_limits() {
+        if let Some(dl) = daemon_vhc_host::probe::probe_macos_device_limits() {
             return dl;
         }
     }
@@ -729,17 +729,13 @@ pub(crate) fn device_limits() -> DeviceLimits {
     // 4090), `shared_mb = 0`, `unified = false` — the discrete verdict path (swarm-ledger-p3-g D3).
     #[cfg(feature = "cuda")]
     {
-        if let Some(p) = daemon_vhc_host::autotune::probe_cuda() {
-            return daemon_vhc_host::autotune::cuda_device_limits(
-                p.vram_mb,
-                p.max_alloc_mb,
-                ram_mb,
-            );
+        if let Some(p) = daemon_vhc_host::probe::probe_cuda() {
+            return daemon_vhc_host::probe::cuda_device_limits(p.vram_mb, p.max_alloc_mb, ram_mb);
         }
     }
     #[cfg(feature = "wgpu")]
     {
-        if let Some(p) = daemon_vhc_host::autotune::probe_wgpu() {
+        if let Some(p) = daemon_vhc_host::probe::probe_wgpu() {
             let vram_sysfs = amdgpu_sysfs_mem_mb("mem_info_vram_total");
             // On a unified device without sysfs VRAM, dedicated VRAM is not a meaningful cap; the
             // pool is host RAM, so budget VRAM as RAM. On a discrete device fall back to the
@@ -938,95 +934,4 @@ fn assess_v2(
             refusal_code: refusal.code.map(|c| c.slug().to_string()),
         },
     }
-}
-
-/// The engine backend + GPU index the live worker drives its **native** lane on (§10.5 verdict path;
-/// swarm-ledger-p3-g D4 + the P3 fat-worker packaging decision).
-///
-/// Probe-ordered graceful degradation for the one-fat-binary packaging (ndarray + wgpu + cuda
-/// unioned; runtime probe selects the arm): **CUDA → wgpu → CPU**. Each rung is taken only when its
-/// feature is built AND its probe reports a usable device, so a cuda-featured worker on a non-NVIDIA
-/// machine falls through to wgpu (if built + adapter present) or the CPU det lane — no panic, no
-/// link-time dependency (cudarc is in dlopen mode; the memoized `probe_cuda` catches the
-/// missing-libcuda unwind and reports `None`). The det lane stays host fp32 on every backend, so a
-/// GPU peer's post-ingest digests are byte-identical to CPU peers ingesting the same committed set
-/// (the consensus invariant is unchanged — the GPU arms only accelerate the tolerance-class native
-/// lane).
-///
-/// `DAEMON_TRAIN_BACKEND=cpu` forces the CPU lane even when a GPU is present (an operator escape
-/// hatch for a box whose driver-matched NVRTC is not staged — the backend would otherwise fail on
-/// the first device op). Returns `(BackendKind, gpu_index)` for the [`daemon_vhc_host::EngineConfig`].
-///
-/// Only the live-attach path (`swarm-net`) consumes this; a probe-only or default worker never
-/// selects a backend, so it is gated with its sole caller (`live.rs`).
-#[cfg(feature = "swarm-net")]
-pub(crate) fn select_backend() -> (daemon_vhc_host::BackendKind, Option<u32>) {
-    let requested = std::env::var("DAEMON_TRAIN_BACKEND").ok();
-    if requested.as_deref() == Some("cpu") {
-        return (daemon_vhc_host::BackendKind::Cpu, None);
-    }
-    // Explicit operator override (P3 Merge-2): `DAEMON_TRAIN_BACKEND=wgpu` pins the wgpu rung even
-    // when a CUDA device is present — the honest escape hatch for a box whose CUDA lane is unusable
-    // (the Merge-2 fleet run hit a cubecl-cuda VRAM-exhaustion panic in the fleet engine loop that
-    // the OOM ladder cannot catch: cubecl panics on its own thread instead of returning a
-    // BudgetMemory trap; single-host 160M CUDA is green — recorded in swarm-p3-ledger). Probe-gated:
-    // if the requested rung has no usable adapter, fall through the normal ladder below.
-    #[cfg(feature = "wgpu")]
-    if requested.as_deref() == Some("wgpu") {
-        if let Some(p) = daemon_vhc_host::autotune::probe_wgpu() {
-            eprintln!(
-                "daemon-vhc-worker: DAEMON_TRAIN_BACKEND=wgpu override — selecting wgpu native \
-                 lane (adapter: {}, backend {}); det lane stays host fp32 (consensus-invariant)",
-                p.adapter, p.backend
-            );
-            return (daemon_vhc_host::BackendKind::Wgpu, None);
-        }
-        eprintln!(
-            "daemon-vhc-worker: DAEMON_TRAIN_BACKEND=wgpu requested but no usable adapter — \
-             falling through the probe ladder"
-        );
-    }
-    #[cfg(feature = "cuda")]
-    {
-        if let Some(p) = daemon_vhc_host::autotune::probe_cuda() {
-            // NVRTC readiness gate (fetch-on-demand contract, swarm-ledger-p3-g D6): the device
-            // alone is not enough — burn-cuda JITs through libnvrtc, which must be staged
-            // driver-matched (DAEMON_CUDA_RUNTIME_DIR). Until it is, downgrade to wgpu/CPU
-            // instead of failing on the first tensor op.
-            if daemon_vhc_host::autotune::cuda_nvrtc_ready() {
-                eprintln!(
-                    "daemon-vhc-worker: selecting CUDA native lane (device 0: {}, {} MiB VRAM); \
-                     det lane stays host fp32 (consensus-invariant)",
-                    p.adapter, p.vram_mb
-                );
-                return (daemon_vhc_host::BackendKind::Cuda, Some(0));
-            }
-            eprintln!(
-                "daemon-vhc-worker: CUDA device present ({}) but the JIT runtime is not staged \
-                 (libnvrtc loadable + CUDA_PATH/include/cuda_runtime.h required) — stage the \
-                 driver-matched NVRTC runtime (DAEMON_CUDA_RUNTIME_DIR, export \
-                 CUDA_PATH=$DAEMON_CUDA_RUNTIME_DIR) to enable the CUDA lane; downgrading \
-                 (probe order: cuda -> wgpu -> cpu)",
-                p.adapter
-            );
-        } else {
-            eprintln!(
-                "daemon-vhc-worker: cuda feature built but no CUDA device present — degrading \
-                 (fat-worker probe order: cuda -> wgpu -> cpu)"
-            );
-        }
-    }
-    #[cfg(feature = "wgpu")]
-    {
-        if let Some(p) = daemon_vhc_host::autotune::probe_wgpu() {
-            eprintln!(
-                "daemon-vhc-worker: selecting wgpu native lane (adapter: {}, backend {}); \
-                 det lane stays host fp32 (consensus-invariant)",
-                p.adapter, p.backend
-            );
-            return (daemon_vhc_host::BackendKind::Wgpu, None);
-        }
-        eprintln!("daemon-vhc-worker: wgpu feature built but no usable adapter — CPU det lane");
-    }
-    (daemon_vhc_host::BackendKind::Cpu, None)
 }
