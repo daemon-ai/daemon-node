@@ -724,6 +724,14 @@ fn translate_engine_event(ev: &EngineEvent, run_id: &str, roster_len: u32) -> Ve
             hash: manifest.blake3.to_hex(),
             location: format!("runs/{run_id}/rounds/{round}/checkpoint"),
         }],
+        // The E1 typed lane (opt-in via with_typed_checkpoints; not enabled on this live path yet —
+        // E3's late-join flow turns it on): rendered as the same CheckpointPublished surface with a
+        // typed location, additively.
+        EngineEvent::TypedCheckpointed { round, pointer } => vec![Event::CheckpointPublished {
+            round: *round,
+            hash: pointer.blake3.to_hex(),
+            location: format!("runs/{run_id}/rounds/{round}/checkpoint.typed"),
+        }],
         EngineEvent::Resynced {
             round,
             from_checkpoint,

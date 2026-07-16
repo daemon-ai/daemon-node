@@ -226,6 +226,10 @@ pub struct SwarmConfig {
     pub late_join: Option<LateJoin>,
     /// If set, reload the coordinator state from canonical CBOR after finalizing this round.
     pub restart_after_round: Option<RoundId>,
+    /// Enable the E1 typed checkpoint lane (Phase E): each cadence checkpoint also publishes the
+    /// typed sectioned manifest and emits `EngineEvent::TypedCheckpointed`. Default off — every
+    /// pre-E harness run is behavior-identical.
+    pub typed_checkpoints: bool,
 }
 
 impl Default for SwarmConfig {
@@ -246,6 +250,7 @@ impl Default for SwarmConfig {
             silent_death: None,
             late_join: None,
             restart_after_round: None,
+            typed_checkpoints: false,
         }
     }
 }
@@ -875,6 +880,15 @@ where
         engine_cfg,
         ev_tx,
     );
+    if cfg.typed_checkpoints {
+        // The harness's pre-D0 execution identity: run_id = blake3(label), epoch 0, and a
+        // domain-separated placeholder module hash (the StubBackend is not a wasm blob).
+        engine = engine.with_typed_checkpoints(crate::checkpoint::CheckpointIdent {
+            run_id: daemon_vhc_proto::blake3_hash(run.as_str().as_bytes()),
+            epoch: 0,
+            module: daemon_vhc_proto::blake3_hash(b"daemon-vhc-session/harness/stub-backend"),
+        });
+    }
     let engine_h = tokio::spawn(async move {
         if let Some(manifest) = resume {
             engine.resume_from_checkpoint(&manifest).await?;
