@@ -138,8 +138,17 @@ fn replay_under_coalescing_reproduces_decisions_bit_exact() {
     );
 
     // THE GATE: replay from the journal alone — the drops are invisible to it (§8.7: "replay is
-    // exact regardless of drops"); every decision reproduces bit-exact.
-    let script = ReplayScript::from_entries(&entries);
+    // exact regardless of drops"); every decision reproduces bit-exact. Since B2 the averager
+    // reads the identity-derived `rng_seed` (deterministic, re-derived at replay), so the script
+    // carries the recording identity — the run header's job in a real journal.
+    let mut script = ReplayScript::from_entries(&entries);
+    script.identity = Some(RunIdentity {
+        run_id: [0xD1; 32],
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance: 1,
+        module: *blake3::hash(&wasm).as_bytes(),
+    });
     let replayed = replay_v2(&worker, &wasm, &config, &[], script).expect("replay harness");
     assert_eq!(replayed.end, ReplayEnd::Outcome(0));
     let recorded: Vec<(u64, u64, [u8; 32])> = entries
