@@ -1074,7 +1074,7 @@ struct SliceState {
 ///
 /// - a kind-2 read while `Idle` opens a FRESH staged window (v1's per-ingest `staged.clear()`);
 /// - further kind-2 reads with no intervening non-window ops continue the SAME window (a
-///   record's N entries are read back-to-back by `Staged::mint`);
+///   record's N entries are read back-to-back by `Committed::mint`);
 /// - any other bridge op marks the window's ingest MATH as begun (aggregate + apply);
 /// - the epilogue fires at the first boundary AFTER the math: the next kind-1 batch read
 ///   (training resumes — the catch-up path), a kind-2 read that OPENS THE NEXT window

@@ -8,15 +8,17 @@
 //
 // - assignment + slicing: session::{assignment::interval_for, slice_interval} ≡
 //   sdk_rounds::{interval_for, slice_interval} over a seed/roster/window sweep;
-// - staging semantics: the engine's record-ordered `StagedPayload` sequence ≡ `Staged::mint`'s
-//   record-listed order over the same entries (the Committed<T> re-typing contract's baseline).
+// - staging semantics: the engine's record-ordered `StagedPayload` sequence ≡ `Committed::mint`'s
+//   record-listed order over the same entries (the D1 Committed<T> re-typing of the A2 `Staged`
+//   bridging oracle — the mint is byte-identical, now gated by an `Authorized` token).
 
 use std::collections::BTreeMap;
 
 use daemon_vhc_proto::messages::{BatchWindow, RecordEntry};
 use daemon_vhc_proto::{blake3_hash, PeerId, Seed};
 use daemon_vhc_sdk_rounds::{
-    interval_for as sdk_interval_for, slice_interval as sdk_slice, MicroWindow, Staged,
+    interval_for as sdk_interval_for, slice_interval as sdk_slice, Authorized, Committed,
+    MicroWindow,
 };
 use daemon_vhc_session::backend::StagedPayload;
 use daemon_vhc_session::data::{slice_interval as v1_slice, BatchInterval};
@@ -64,9 +66,9 @@ fn relocated_assignment_and_slicing_match_the_v1_engine() {
 }
 
 #[test]
-fn staged_mint_matches_the_engine_record_ordered_staging() {
+fn committed_mint_matches_the_engine_record_ordered_staging() {
     // The engine stages `StagedPayload`s by iterating the record entries in listed order
-    // (engine::try_ingest); the SDK `Staged::mint` must produce the identical sequence.
+    // (engine::try_ingest); the SDK `Committed::mint` must produce the identical sequence.
     let entries: Vec<RecordEntry> = [3u8, 1, 2]
         .iter()
         .map(|b| {
@@ -93,9 +95,10 @@ fn staged_mint_matches_the_engine_record_ordered_staging() {
         })
         .collect();
 
-    let staged = Staged::mint(5, &entries, &mut source).expect("mint");
-    assert_eq!(staged.items().len(), v1.len());
-    for (a, b) in staged.items().iter().zip(&v1) {
+    let authorized = Authorized::from_authoritative_channel(0);
+    let committed = Committed::mint(&authorized, 5, &entries, &mut source).expect("mint");
+    assert_eq!(committed.items().len(), v1.len());
+    for (a, b) in committed.items().iter().zip(&v1) {
         assert_eq!(a.peer, b.peer);
         assert_eq!(a.hash, b.hash);
         assert_eq!(
