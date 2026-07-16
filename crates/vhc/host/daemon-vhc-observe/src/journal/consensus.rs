@@ -131,19 +131,65 @@ pub enum ConsensusReplayError {
     Codec(String),
 }
 
-/// Re-verify a run's consensus from the record archive and the content-addressed payloads alone
-/// (see module docs). `heads` are the gossiped signed chain heads naming the sealed segments —
-/// they MUST cover a contiguous chain from segment 0; `payloads` maps content hash → payload
-/// bytes (the run's update containers, fetched from any payload store).
+/// The §8.3 record stream's consensus projection: the tag-10 initial state (if any), the tag-1/3
+/// driving inputs, and the tag-4 published decisions, in record order. Shared by the archive
+/// verifier below and the D2 failover drill's standby recovery (which appends the unsealed local
+/// journal *tail*'s records after the archived prefix — "resumes from archive + journal").
 ///
 /// # Errors
-/// A typed [`ConsensusReplayError`]; an incomplete verification is never a pass.
-pub fn replay_consensus_from_archive(
+/// [`ConsensusReplayError::Codec`] on an undecodable snapshot/event/publish body.
+pub fn extract_consensus_capture(
+    records: &[Record],
+) -> Result<(Option<CoordinatorState>, Vec<Input>, Vec<SignedMessage>), ConsensusReplayError> {
+    let mut initial: Option<CoordinatorState> = None;
+    let mut inputs: Vec<Input> = Vec::new();
+    let mut published: Vec<SignedMessage> = Vec::new();
+    for record in records {
+        match &record.body {
+            Body::Snapshot(s) => {
+                if initial.is_none() {
+                    initial = Some(
+                        from_canonical_slice(&s.manifest)
+                            .map_err(|e| ConsensusReplayError::Codec(e.to_string()))?,
+                    );
+                }
+            }
+            Body::Clock(c) => inputs.push(Input::Clock(c.now)),
+            Body::Event(e) => inputs.push(
+                from_canonical_slice(&e.frame)
+                    .map_err(|e| ConsensusReplayError::Codec(e.to_string()))?,
+            ),
+            Body::Publish(p) => published.push(
+                from_canonical_slice(&p.frame)
+                    .map_err(|e| ConsensusReplayError::Codec(e.to_string()))?,
+            ),
+            _ => {}
+        }
+    }
+    Ok((initial, inputs, published))
+}
+
+/// What the archive chain walk recovered: the verified sealed-segment count and the §8.3 records
+/// across them (seals excluded), in order.
+#[derive(Debug)]
+pub struct RecoveredChain {
+    /// Sealed segments walked (authenticated heads, contiguous chain, content re-hashed).
+    pub segments_verified: u64,
+    /// The recovered records.
+    pub records: Vec<Record>,
+}
+
+/// Walk the signed head chain and recover every record from the archive alone (steps 1–2 of the
+/// module contract). Also the failover drill's standby recovery path (refactor §8/D2: a standby
+/// "resumes from archive + journal" — this is the archive half).
+///
+/// # Errors
+/// A typed [`ConsensusReplayError`] on an unauthoritative head, a broken chain, a missing or
+/// content-mismatched segment, or an unscannable segment.
+pub fn recover_chain_from_archive(
     archive: &RecordArchive,
     heads: &[SignedHead],
-    payloads: &BTreeMap<Hash, Vec<u8>>,
-) -> Result<ConsensusReplayReport, ConsensusReplayError> {
-    // -- 1. authenticate + order the heads, then walk the chain from segment 0 -------------------
+) -> Result<RecoveredChain, ConsensusReplayError> {
     let mut by_segment: BTreeMap<u64, &SignedHead> = BTreeMap::new();
     for head in heads {
         if !archive.head_is_authoritative(head) {
@@ -199,34 +245,29 @@ pub fn replay_consensus_from_archive(
         }
         prev_hash = Some(head.body.segment_hash);
     }
-    let records_recovered = records.len() as u64;
+    Ok(RecoveredChain {
+        segments_verified: count,
+        records,
+    })
+}
 
-    // -- 2. recover (initial state, driving inputs, published decisions) from the records --------
-    let mut initial: Option<CoordinatorState> = None;
-    let mut inputs: Vec<Input> = Vec::new();
-    let mut published: Vec<SignedMessage> = Vec::new();
-    for record in &records {
-        match &record.body {
-            Body::Snapshot(s) => {
-                if initial.is_none() {
-                    initial = Some(
-                        from_canonical_slice(&s.manifest)
-                            .map_err(|e| ConsensusReplayError::Codec(e.to_string()))?,
-                    );
-                }
-            }
-            Body::Clock(c) => inputs.push(Input::Clock(c.now)),
-            Body::Event(e) => inputs.push(
-                from_canonical_slice(&e.frame)
-                    .map_err(|e| ConsensusReplayError::Codec(e.to_string()))?,
-            ),
-            Body::Publish(p) => published.push(
-                from_canonical_slice(&p.frame)
-                    .map_err(|e| ConsensusReplayError::Codec(e.to_string()))?,
-            ),
-            _ => {}
-        }
-    }
+/// Re-verify a run's consensus from the record archive and the content-addressed payloads alone
+/// (see module docs). `heads` are the gossiped signed chain heads naming the sealed segments —
+/// they MUST cover a contiguous chain from segment 0; `payloads` maps content hash → payload
+/// bytes (the run's update containers, fetched from any payload store).
+///
+/// # Errors
+/// A typed [`ConsensusReplayError`]; an incomplete verification is never a pass.
+pub fn replay_consensus_from_archive(
+    archive: &RecordArchive,
+    heads: &[SignedHead],
+    payloads: &BTreeMap<Hash, Vec<u8>>,
+) -> Result<ConsensusReplayReport, ConsensusReplayError> {
+    // -- 1./2. chain walk + record recovery, from the archive alone ------------------------------
+    let chain = recover_chain_from_archive(archive, heads)?;
+    let count = chain.segments_verified;
+    let records_recovered = chain.records.len() as u64;
+    let (initial, inputs, published) = extract_consensus_capture(&chain.records)?;
     let initial = initial.ok_or(ConsensusReplayError::NoSnapshot)?;
 
     // -- 3. re-derive: the pure tick over the inputs; archived records are the oracle ------------

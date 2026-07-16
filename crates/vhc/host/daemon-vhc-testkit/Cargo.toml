@@ -41,5 +41,10 @@ ciborium = { workspace = true }
 # Typed harness errors (the D2 wasm-coordinator configuration seat's matrix refusals).
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# The failover drill (refactor §8/D2): the A1 journal + the D2 record archive / chain recovery
+# the standby coordinator resumes from. host/* -> host/* (allowed), test-only.
+daemon-vhc-observe = { workspace = true }
+
 [lints]
 workspace = true

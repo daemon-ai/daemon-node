@@ -5109,6 +5109,7 @@ dependencies = [
  "ciborium",
  "daemon-vhc-abi",
  "daemon-vhc-host",
+ "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
  "thiserror 2.0.18",

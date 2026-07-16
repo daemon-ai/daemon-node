@@ -36,10 +36,11 @@ pub use capture::RunCapture;
 pub use desync::{digest_tally, DesyncVerdict};
 pub use health::{RoundHealth, RunHealth};
 pub use journal::{
-    detect_fork, replay_consensus_from_archive, ArchiveError, Body, ChainHead,
-    ConsensusReplayError, ConsensusReplayReport, ExecIdentity, ForkEvidence, Journal, JournalError,
-    JournalPaths, Record, RecordArchive, ReplicationPolicy, RetentionPolicy, RotatePolicy,
-    SidecarError, SignedHead,
+    detect_fork, extract_consensus_capture, recover_chain_from_archive,
+    replay_consensus_from_archive, ArchiveError, Body, ChainHead, ConsensusReplayError,
+    ConsensusReplayReport, ExecIdentity, ForkEvidence, Journal, JournalError, JournalPaths, Record,
+    RecordArchive, RecoveredChain, ReplicationPolicy, RetentionPolicy, RotatePolicy, SidecarError,
+    SignedHead,
 };
 pub use log::{MessageKind, MessageLog};
 pub use replay::{
