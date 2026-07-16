@@ -32,10 +32,38 @@ pub(crate) struct ResolvedRun {
     pub(crate) module_blake3: Option<[u8; 32]>,
     /// The envelope's additive `device_min` section (ABI §9.3 stage-3 pre-screen; D3 cell 5
     /// interim-supported), parsed from the RAW frozen bytes — `None` when the envelope carries
-    /// no such section.
+    /// no such section. On the genesis path this is the worker role's typed `device_min`.
     pub(crate) device_min: Option<daemon_vhc_proto::DeviceMinimums>,
-    /// The decoded typed envelope (the coordinator-config source for the v2 self-driven join).
+    /// The decoded typed v1 envelope (the coordinator-config source for the v2 self-driven join,
+    /// mixed-fleet cell 5). `None` on the genesis path.
     pub(crate) envelope: Option<daemon_vhc_proto::Envelope>,
+    /// The resolved genesis run (envelope v2 — mixed-fleet cell 6, D1 deliverable 4). `None` on
+    /// the v1 path.
+    pub(crate) genesis: Option<GenesisRun>,
+}
+
+/// A resolved envelope-v2 (genesis) run: the decoded envelope, its hash (the cryptographic
+/// `RunId`, ABI §8.1), and the role labels the join drives — the joining worker role and the
+/// coordinator role the cell-6 adapter reads its config from.
+pub(crate) struct GenesisRun {
+    pub(crate) env: daemon_vhc_proto::GenesisEnvelope,
+    /// The genesis hash — the cryptographic `RunId` (architecture §5.1).
+    pub(crate) run_id: [u8; 32],
+    /// The worker role this node assessed/joins (the first non-coordinator role — the
+    /// single-worker interim of decisions D6; role *selection* is node policy from Phase E).
+    pub(crate) worker_role: String,
+    /// The coordinator role label (the cell-6 adapter's config source).
+    pub(crate) coordinator_role: String,
+}
+
+impl ResolvedRun {
+    /// The envelope-v2 grants input for the admission funnel (D1 deliverable 4): the worker
+    /// role's grant list + the run's artifact-map hashes, derived from the genesis envelope.
+    /// `None` on the v1 path — the funnel's pre-D0 defaults stand there.
+    pub(crate) fn envelope_grants(&self) -> Option<daemon_vhc_host::v2::EnvelopeRoleGrants> {
+        let g = self.genesis.as_ref()?;
+        daemon_vhc_host::v2::EnvelopeRoleGrants::from_genesis(&g.env, &g.worker_role)
+    }
 }
 
 /// The typed refusal slug for the D0-retired unsigned legacy envelope path (refactor §8/D0:
@@ -65,6 +93,12 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
              DAEMON_TRAIN_MODULE still overrides the module source inside it): {e}"
         )
     })?;
+    // Route on the schema sniff (decisions D3: the dual-driver worker enforces the mixed-fleet
+    // matrix from the raw bytes — a v2 genesis run resolves through the genesis path, a v1 run
+    // through the frozen-envelope path, byte-for-byte as before).
+    if daemon_vhc_proto::peek_schema(&wire.bytes) == Some(daemon_vhc_proto::GENESIS_SCHEMA_MAJOR) {
+        return resolve_genesis_run(wire).await;
+    }
     // Verify (re-derives hash + config over the received bytes, checks the signature).
     let frozen = wire.open().map_err(|e| format!("verify envelope: {e}"))?;
     let config = frozen.config_bytes().to_vec();
@@ -77,6 +111,121 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
         module_blake3,
         device_min,
         envelope,
+        genesis: None,
+    })
+}
+
+/// Resolve an envelope-v2 **genesis** run (D1 deliverable 4; mixed-fleet cell 6): verify the
+/// signed genesis (hash re-derived over the received bytes, author signature checked), select the
+/// worker + coordinator roles from the role set, decode the worker role's opaque config, and
+/// resolve the worker role's module by its pinned artifact hash.
+///
+/// Role selection is the single-worker interim (decisions D6): the first non-coordinator role is
+/// the joining worker role, exactly the well-formedness split `GenesisEnvelope::validate`
+/// guarantees exists; per-node role *selection* policy arrives with Phase-E multi-instance.
+async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String> {
+    let frozen = daemon_vhc_proto::FrozenGenesis::open(wire.bytes, wire.signature, wire.signer)
+        .map_err(|e| format!("verify genesis envelope: {e}"))?;
+    let env = frozen
+        .decode()
+        .map_err(|e| format!("decode genesis: {e}"))?;
+    let coordinator_role = env
+        .roles
+        .keys()
+        .find(|r| r.contains("coordinator"))
+        .cloned()
+        .ok_or("genesis envelope has no coordinator role (validate should have refused)")?;
+    let worker_role = env
+        .roles
+        .keys()
+        .find(|r| !r.contains("coordinator"))
+        .cloned()
+        .ok_or("genesis envelope has no worker role (validate should have refused)")?;
+    let role = &env.roles[&worker_role];
+    let config = frozen
+        .role_config_bytes(&worker_role)
+        .map_err(|e| format!("role config: {e}"))?
+        .ok_or("worker role vanished between decode and config extraction")?;
+    let device_min = Some(role.device_min.clone());
+
+    // Resolve the worker role's module by its pinned artifact hash — same override + fetch
+    // discipline as the v1 path (DAEMON_TRAIN_MODULE is the explicit dev/node-controlled
+    // module-source override inside the signed path).
+    let (module, module_blake3) = if let Some(bytes) = module_from_env() {
+        (bytes?, None)
+    } else {
+        let artifact = env.artifacts.get(&role.module).ok_or_else(|| {
+            format!(
+                "worker role module `{}` absent from the genesis artifact map",
+                role.module
+            )
+        })?;
+        let pin = Some(artifact.blake3.0);
+        let art = ArtifactRef::new(artifact.url.clone(), artifact.blake3);
+        #[cfg(feature = "swarm-net")]
+        if !artifact.url.starts_with("file://") {
+            let bytes = fetch_artifact_from_store(&art).await.map_err(|e| {
+                format!(
+                    "fetch module `{}` ({}) from store: {e}",
+                    role.module, artifact.url
+                )
+            })?;
+            let run_id = *frozen.run_id().as_bytes();
+            return finish_genesis_run(
+                config,
+                bytes,
+                pin,
+                device_min,
+                env,
+                run_id,
+                worker_role,
+                coordinator_role,
+            );
+        }
+        let bytes = ArtifactResolver::new()
+            .fetch(&art)
+            .await
+            .map_err(|e| format!("resolve module `{}` ({}): {e}", role.module, artifact.url))?;
+        (bytes, pin)
+    };
+    let run_id = *frozen.run_id().as_bytes();
+    finish_genesis_run(
+        config,
+        module,
+        module_blake3,
+        device_min,
+        env,
+        run_id,
+        worker_role,
+        coordinator_role,
+    )
+}
+
+/// Assemble the genesis [`ResolvedRun`] (split out so the feature-gated store-fetch arm can share
+/// the tail without duplicating it).
+#[allow(clippy::too_many_arguments)]
+fn finish_genesis_run(
+    config: Vec<u8>,
+    module: Vec<u8>,
+    module_blake3: Option<[u8; 32]>,
+    device_min: Option<daemon_vhc_proto::DeviceMinimums>,
+    env: daemon_vhc_proto::GenesisEnvelope,
+    run_id: [u8; 32],
+    worker_role: String,
+    coordinator_role: String,
+) -> Result<ResolvedRun, String> {
+    Ok(ResolvedRun {
+        config,
+        module,
+        module_blake3,
+        device_min,
+        envelope: None,
+        genesis: Some(GenesisRun {
+            env,
+            run_id,
+            worker_role,
+            coordinator_role,
+        }),
     })
 }
 
@@ -677,6 +826,7 @@ pub(crate) fn assess(
     config: &[u8],
     module_blake3: Option<&[u8; 32]>,
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
+    envelope_grants: Option<&daemon_vhc_host::v2::EnvelopeRoleGrants>,
 ) -> Result<(Eligibility, bool), String> {
     // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (the meta pass over a real-scale
     // param layout exceeds the tiny-model defaults). The meta pass itself stays on the CPU-cheap
@@ -701,7 +851,14 @@ pub(crate) fn assess(
             // re-runs inside admit_v2 (§9.4 step 1–3 order is normative); the arms below map the
             // funnel outcome onto the typed `Assessed` surface.
             return Ok((
-                assess_v2(&worker, module, config, module_blake3, device_min),
+                assess_v2(
+                    &worker,
+                    module,
+                    config,
+                    module_blake3,
+                    device_min,
+                    envelope_grants,
+                ),
                 true,
             ));
         }
@@ -791,33 +948,13 @@ pub(crate) fn assess(
     ))
 }
 
-/// The major-2 assess arm: the owner-bracketed claim()-admission funnel (ABI §9.3;
-/// `daemon_vhc_host::v2::admission::admit_v2`), mapped onto the typed `Assessed` surface.
-///
-/// Funnel inputs at the worker seam:
-/// - **Stage 1 (owner participation)** is `true` here by construction: the node client — the
-///   owner's agent — gates participation BEFORE issuing `AssessRun` (architecture §3.5 stage 1
-///   lives node-side; the funnel function keeps the stage so host-level tests exercise it).
-/// - **Stage 2 lane**: the ratified launch **Trainer** profile with its deployment-config
-///   defaults (GPU required, the 16 GiB-class floor). On a CPU-only box a v2 module is refused
-///   "below lane floor" — the ratified behavior (Trainer is the only enabled lane; numbers are
-///   node configuration, overridable when node-side lane config lands).
-/// - **Stage 5 owner caps** are uncapped at assess time: the standing resource policy
-///   (`JoinPolicy{vram_cap_mb, …}`) arrives with `JoinRun`, where the join-time re-check judges
-///   it (§9.4 step 10 re-runs stage 5 against the recorded claim; that wiring rides the v2 join
-///   path, next sitting).
-fn assess_v2(
-    worker: &Worker,
-    module: &[u8],
-    config: &[u8],
-    module_blake3: Option<&[u8; 32]>,
-    device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
-) -> Eligibility {
-    // The owner's node-side lane configuration seam (§9.6: "numbers are deployment config").
-    // Until the node client carries lane config, `DAEMON_VHC_LANE_GPU_OPTIONAL=1` selects a
-    // CPU-admitting dev/t2 lane (GPU optional, no device floors, the same claim bounds) — the
-    // owner's explicit choice, exactly like `DAEMON_TRAIN_BACKEND=cpu` on the v1 path.
-    let lane = if std::env::var_os("DAEMON_VHC_LANE_GPU_OPTIONAL").is_some_and(|v| v == "1") {
+/// The owner's node-side lane configuration seam (§9.6: "numbers are deployment config").
+/// Until the node client carries lane config, `DAEMON_VHC_LANE_GPU_OPTIONAL=1` selects a
+/// CPU-admitting dev/t2 lane (GPU optional, no device floors, the same claim bounds) — the
+/// owner's explicit choice, exactly like `DAEMON_TRAIN_BACKEND=cpu` on the v1 path. Shared by
+/// assess and the v2 join so both stages evaluate the identical lane (§9.4 step-10 re-check).
+pub(crate) fn selected_lane() -> daemon_vhc_host::v2::ParticipationLane {
+    if std::env::var_os("DAEMON_VHC_LANE_GPU_OPTIONAL").is_some_and(|v| v == "1") {
         daemon_vhc_host::v2::ParticipationLane {
             gpu: 1,
             vram_bytes: 0,
@@ -827,7 +964,34 @@ fn assess_v2(
         }
     } else {
         daemon_vhc_host::v2::ParticipationLane::trainer_launch_defaults()
-    };
+    }
+}
+
+/// The major-2 assess arm: the owner-bracketed claim()-admission funnel (ABI §9.3;
+/// `daemon_vhc_host::v2::admission::admit_v2`), mapped onto the typed `Assessed` surface.
+///
+/// Funnel inputs at the worker seam:
+/// - **Stage 1 (owner participation)** is `true` here by construction: the node client — the
+///   owner's agent — gates participation BEFORE issuing `AssessRun` (architecture §3.5 stage 1
+///   lives node-side; the funnel function keeps the stage so host-level tests exercise it).
+/// - **Stage 2 lane**: [`selected_lane`] — the ratified launch **Trainer** profile with its
+///   deployment-config defaults (GPU required, the 16 GiB-class floor). On a CPU-only box a v2
+///   module is refused "below lane floor" — the ratified behavior (Trainer is the only enabled
+///   lane; numbers are node configuration, overridable when node-side lane config lands).
+/// - **Stage 4.0 envelope grants** (D1): on the genesis path the worker role's grant list is
+///   intersected tighten-only against the lane; `None` on the v1-envelope path.
+/// - **Stage 5 owner caps** are uncapped at assess time: the standing resource policy
+///   (`JoinPolicy{vram_cap_mb, …}`) arrives with `JoinRun`, where the join-time re-check judges
+///   it (§9.4 step 10 re-runs stage 5 against the recorded claim).
+fn assess_v2(
+    worker: &Worker,
+    module: &[u8],
+    config: &[u8],
+    module_blake3: Option<&[u8; 32]>,
+    device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
+    envelope_grants: Option<&daemon_vhc_host::v2::EnvelopeRoleGrants>,
+) -> Eligibility {
+    let lane = selected_lane();
     let hw = hardware();
     let dl = device_limits();
     let device = daemon_vhc_host::v2::DeviceProfile {
@@ -854,10 +1018,11 @@ fn assess_v2(
         &device,
         &owner,
         device_min,
-        // No envelope-v2 role grants on this path yet: assess still arrives with the v1 signed
-        // envelope (the genesis-envelope join threads its RoleGrants here with the D0→D1
-        // native-coordinator adapter, mixed-fleet cell 6).
-        None,
+        // The envelope-v2 role grants (D1 deliverable 4): present on the genesis path — the
+        // worker role's grant list from the genesis role set, intersected tighten-only against
+        // the lane at stage 4.0 (mixed-fleet cell 6). `None` on the v1-envelope path, where the
+        // funnel's pre-D0 defaults stand.
+        envelope_grants,
     ) {
         Ok(admission) => Eligibility {
             eligible: true,

@@ -43,9 +43,21 @@ use daemon_vhc_proto::{
     SignedMessage, SigningKey, SwarmMessage,
 };
 
+use crate::backend::GenesisRun;
 use crate::send;
 use daemon_provision::CutWriter;
 use daemon_vhc_session::protocol::Event;
+
+/// Which envelope form configures the v2 run (D1 deliverable 4): the v1 frozen envelope
+/// (mixed-fleet cell 5 — the A2 shape) or the envelope-v2 genesis (cell 6, through the
+/// transitional native-coordinator adapter that retires at D2).
+pub(crate) enum V2RunSource<'a> {
+    /// The v1 envelope: coordinator config from `[data]`/`[phases]` (`RunConfig::from_envelope`).
+    V1(&'a Envelope),
+    /// The genesis envelope: coordinator config from the coordinator role's opaque config via the
+    /// cell-6 adapter (`RunConfig::from_genesis`); role grants tighten the run quotas.
+    Genesis(&'a GenesisRun),
+}
 
 /// The Phase-A derived grants document (§2.6 stand-in until node-side lane config lands): the
 /// admitted channel table + the worlds the Phase-A driver links. Deterministic, so assess and
@@ -203,7 +215,7 @@ fn t2_corpus_via_store(
 pub(crate) async fn join_and_run_v2(
     module: &[u8],
     config: &[u8],
-    envelope: &Envelope,
+    source: &V2RunSource<'_>,
     run_id: &str,
     writer: &CutWriter,
 ) -> Result<(), String> {
@@ -227,25 +239,58 @@ pub(crate) async fn join_and_run_v2(
     let worker_key = SigningKey::from_bytes(&worker_key_seed);
     let worker_peer = peer_id(&worker_key);
 
-    let identity = RunIdentity {
-        run_id: *blake3::hash(run_id.as_bytes()).as_bytes(),
-        epoch: 0,
-        role: "trainer".to_string(),
-        instance: 1,
-        module: module_hash,
+    // The execution identity (ABI §8.1): on the genesis path the run_id IS the genesis hash (the
+    // cryptographic RunId) and the role is the envelope's worker-role label; the v1 path keeps the
+    // A2 label-derived stand-in.
+    let identity = match source {
+        V2RunSource::V1(_) => RunIdentity {
+            run_id: *blake3::hash(run_id.as_bytes()).as_bytes(),
+            epoch: 0,
+            role: "trainer".to_string(),
+            instance: 1,
+            module: module_hash,
+        },
+        V2RunSource::Genesis(g) => RunIdentity {
+            run_id: g.run_id,
+            epoch: 0,
+            role: g.worker_role.clone(),
+            instance: 1,
+            module: module_hash,
+        },
     };
     // The t2 artifact store: ONE fetch path (B2) — the session's staging reads and any guest
     // data@2::fetch are both answered through T2Artifacts::fetch; the run's artifact grants are
     // exactly the store's committed hashes (which artifacts a module may touch is a grant).
     let (artifacts, manifest_hash) = t2_corpus_artifacts()?;
     let mut run_cfg = V2RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
+    // Genesis path (D1 deliverable 4): tighten the run quotas from the worker role's envelope
+    // grants ∩ the selected lane — the SAME derivation assess ran (byte-identical inputs), so
+    // assess and join agree by construction (§9.4 step 10).
+    if let V2RunSource::Genesis(g) = source {
+        let role = g
+            .env
+            .roles
+            .get(&g.worker_role)
+            .ok_or("worker role absent from the genesis role set at join")?;
+        let run_artifacts = g.env.artifacts.values().map(|a| a.blake3).collect();
+        let quotas = daemon_vhc_proto::derive_admitted_quotas(
+            &role.grants,
+            &crate::backend::selected_lane().ceilings,
+            &run_artifacts,
+        )
+        .map_err(|e| format!("join grants derivation: {e}"))?;
+        daemon_vhc_host::v2::apply_admitted_quotas(&quotas, &mut run_cfg);
+    }
+    // The t2 corpus stands in for the run's artifact map on this in-process drive: the staged
+    // shards/manifest are generated here, so the fetch allow-list is the store's committed hashes
+    // (the envelope-derived set names the real artifact map the live path fetches instead).
     run_cfg.granted_artifacts = artifacts.granted();
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, module, run_cfg, Box::new(sink.clone()))
         .map_err(|e| format!("v2 start_run: {e}"))?;
     let pump = run.pump.clone();
 
-    // -- the native coordinator, in-process: the pure tick over the run's frozen envelope --------
+    // -- the native coordinator, in-process: the pure tick over the run's envelope ----------------
     let params = daemon_vhc_coordinator::CoordinatorParams {
         seq_len: u64::from(T2_SEQ_LEN),
         witness_target: 0,
@@ -254,9 +299,25 @@ pub(crate) async fn join_and_run_v2(
         verification_percent: 0,
         authorized: Vec::new(),
     };
-    let config_c = daemon_vhc_coordinator::RunConfig::from_envelope(envelope, params)
-        .map_err(|e| format!("coordinator config: {e}"))?;
+    // The coordinator's projected config: `from_envelope` on the v1 path (cell 5), the D1
+    // transitional cell-6 adapter `from_genesis` on the envelope-v2 path (retired at D2, when the
+    // wasm coordinator supersedes the native tick).
+    let config_c = match source {
+        V2RunSource::V1(envelope) => {
+            daemon_vhc_coordinator::RunConfig::from_envelope(envelope, params)
+        }
+        V2RunSource::Genesis(g) => {
+            daemon_vhc_coordinator::RunConfig::from_genesis(&g.env, &g.coordinator_role, params)
+        }
+    }
+    .map_err(|e| format!("coordinator config: {e}"))?;
     let envelope_hash = config_c.envelope_hash;
+    // The drive's pacing knobs, read from the PROJECTED config so both envelope forms pace
+    // identically (these came verbatim from `[data]`/`[phases]` on v1 and from the coordinator
+    // role's opaque config on genesis).
+    let warmup_s = config_c.warmup_s;
+    let round_train_max_s = config_c.round_train_max_s;
+    let steps_per_round = config_c.steps_per_round;
     let mut state = CoordinatorState::new(config_c, Seed([0x33; 32]), 0);
     let mut now_s = 0u64;
     let mut outbox: Vec<SwarmMessage> = Vec::new();
@@ -289,7 +350,7 @@ pub(crate) async fn join_and_run_v2(
     feed(&mut state, Input::Message(signed), &mut outbox)?;
 
     // Clock past warmup so round 0 opens.
-    now_s += u64::from(envelope.phases.warmup) + 1;
+    now_s += warmup_s + 1;
     feed(&mut state, Input::Clock(now_s), &mut outbox)?;
 
     send(
@@ -338,7 +399,7 @@ pub(crate) async fn join_and_run_v2(
                     daemon_vhc_session::data::BatchInterval::new(ro.batch.start, ro.batch.end);
                 let steps = daemon_vhc_session::data::slice_interval(
                     interval,
-                    envelope.data.steps_per_round,
+                    steps_per_round,
                     T2_BATCH_SEQS,
                 )
                 .map_err(|e| format!("t2 window slicing: {e}"))?;
@@ -414,7 +475,7 @@ pub(crate) async fn join_and_run_v2(
                         .map_err(|e| format!("receipt sign: {e}"))?;
                 feed(&mut state, Input::Message(signed), &mut outbox)?;
                 // Clock forward so the round closes into a record.
-                now_s += u64::from(envelope.phases.round_train_max) + 1;
+                now_s += round_train_max_s + 1;
                 feed(&mut state, Input::Clock(now_s), &mut outbox)?;
                 // Stage the committed set for the barrier BEFORE the record arrives (§5.11:
                 // record-listed order; single peer = the one guest-put payload).

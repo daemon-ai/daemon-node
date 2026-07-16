@@ -145,6 +145,7 @@ async fn main() {
                     &resolved.config,
                     resolved.module_blake3.as_ref(),
                     resolved.device_min.as_ref(),
+                    resolved.envelope_grants().as_ref(),
                 ) {
                     Ok((elig, is_v2)) => {
                         run_is_v2 = is_v2;
@@ -177,10 +178,16 @@ async fn main() {
                     continue;
                 };
                 if run_is_v2 {
-                    // The v2 join (A2 close-out): the session event-pump attach, driven by the
-                    // in-process native coordinator over the run's frozen envelope. A raw-config
-                    // AssessRun has no envelope, hence no coordinator config — refused loud.
-                    let Some(envelope) = resolved.envelope.clone() else {
+                    // The v2 join (A2 close-out + D1 deliverable 4): the session event-pump
+                    // attach, driven by the in-process native coordinator over the run's
+                    // envelope — the frozen v1 form (cell 5) or the genesis v2 form through the
+                    // transitional cell-6 adapter. A raw-config AssessRun has neither — refused
+                    // loud.
+                    let source = if let Some(genesis) = resolved.genesis.as_ref() {
+                        v2_session::V2RunSource::Genesis(genesis)
+                    } else if let Some(envelope) = resolved.envelope.as_ref() {
+                        v2_session::V2RunSource::V1(envelope)
+                    } else {
                         send(
                             &writer,
                             &worker_error(
@@ -196,7 +203,7 @@ async fn main() {
                     match v2_session::join_and_run_v2(
                         &resolved.module,
                         &resolved.config,
-                        &envelope,
+                        &source,
                         &run_id,
                         &writer,
                     )

@@ -256,22 +256,36 @@ impl AdmissionV2 {
     /// grants (the config's Phase-A defaults stand). `granted_artifacts` REPLACES the config's
     /// set (the envelope is the authority; empty grants = no artifacts, fail closed).
     pub fn apply_quotas(&self, cfg: &mut crate::v2::V2RunConfig) {
-        let Some(q) = &self.quotas else { return };
-        // `0` admitted = "unbounded by this grant" (ABI §2.3): the driver treats 0 the same way,
-        // so the values copy through verbatim.
-        cfg.max_frame_bytes = u32::try_from(q.max_frame_bytes).unwrap_or(u32::MAX);
-        cfg.advisory_depth = usize::try_from(q.advisory_depth).unwrap_or(usize::MAX);
-        cfg.payload_depth = usize::try_from(q.payload_depth).unwrap_or(usize::MAX);
-        cfg.gossip_depth = usize::try_from(q.gossip_depth).unwrap_or(usize::MAX);
-        cfg.spool_frames = usize::try_from(q.spool_frames).unwrap_or(usize::MAX);
-        cfg.per_sender_quota = usize::try_from(q.per_sender_quota).unwrap_or(usize::MAX);
-        cfg.max_readback_bytes_per_slice = q.max_readback_bytes;
-        cfg.max_live_buffer_handles = q.max_live_handles;
-        cfg.max_live_buffer_bytes = q.max_live_bytes;
-        cfg.max_outstanding_ops = q.max_outstanding_ops;
-        cfg.compute_queue_depth = q.compute_queue_depth;
-        cfg.granted_artifacts = q.granted_artifacts.iter().map(|h| h.0).collect();
+        if let Some(q) = &self.quotas {
+            apply_admitted_quotas(q, cfg);
+        }
     }
+}
+
+/// Copy one derived [`daemon_vhc_proto::AdmittedQuotas`] into a [`crate::v2::V2RunConfig`] — the
+/// single quota→config mapping shared by [`AdmissionV2::apply_quotas`] and the worker's
+/// envelope-v2 join path (D1 deliverable 4: the join derives the role's quotas from the genesis
+/// grants and applies them here, so assess and join agree on the mapping by construction).
+///
+/// `granted_artifacts` REPLACES the config's set (the envelope is the authority; empty grants =
+/// no artifacts, fail closed). `0` admitted = "unbounded by this grant" (ABI §2.3): the driver
+/// treats 0 the same way, so the values copy through verbatim.
+pub fn apply_admitted_quotas(
+    q: &daemon_vhc_proto::AdmittedQuotas,
+    cfg: &mut crate::v2::V2RunConfig,
+) {
+    cfg.max_frame_bytes = u32::try_from(q.max_frame_bytes).unwrap_or(u32::MAX);
+    cfg.advisory_depth = usize::try_from(q.advisory_depth).unwrap_or(usize::MAX);
+    cfg.payload_depth = usize::try_from(q.payload_depth).unwrap_or(usize::MAX);
+    cfg.gossip_depth = usize::try_from(q.gossip_depth).unwrap_or(usize::MAX);
+    cfg.spool_frames = usize::try_from(q.spool_frames).unwrap_or(usize::MAX);
+    cfg.per_sender_quota = usize::try_from(q.per_sender_quota).unwrap_or(usize::MAX);
+    cfg.max_readback_bytes_per_slice = q.max_readback_bytes;
+    cfg.max_live_buffer_handles = q.max_live_handles;
+    cfg.max_live_buffer_bytes = q.max_live_bytes;
+    cfg.max_outstanding_ops = q.max_outstanding_ops;
+    cfg.compute_queue_depth = q.compute_queue_depth;
+    cfg.granted_artifacts = q.granted_artifacts.iter().map(|h| h.0).collect();
 }
 
 /// A funnel refusal: which stage refused, the typed code where one is ratified (§9.5: stages 1–3
