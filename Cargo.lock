@@ -4887,6 +4887,7 @@ dependencies = [
 name = "daemon-vhc-coordinator"
 version = "0.0.1"
 dependencies = [
+ "ciborium",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
  "proptest",

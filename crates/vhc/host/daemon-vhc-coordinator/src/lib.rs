@@ -29,7 +29,7 @@ use std::error::Error;
 use std::fmt;
 
 pub use admission::{admit, JoinCandidate};
-pub use config::{CoordinatorParams, RunConfig, K_ABSENCES_DEFAULT};
+pub use config::{CoordinatorParams, CoordinatorRoleConfig, RunConfig, K_ABSENCES_DEFAULT};
 pub use epoch::{ready_to_update_epoch, EpochInputs, EpochTrigger};
 pub use io::{AdmissionReject, ControlAction, ControlRequest, Input, Notice, Output, Rejection};
 pub use state::{

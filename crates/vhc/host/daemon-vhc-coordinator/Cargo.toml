@@ -29,6 +29,9 @@ serde = { workspace = true }
 # Integer-only property testing of `tick` determinism (TDD PROTO-16). Dev-only: does not affect the
 # crate's wasm-clean normal-dependency surface.
 proptest = { workspace = true }
+# Dev-only: constructs the opaque `RoleEntry::config` CBOR values the cell-6 genesis-adapter test
+# feeds `RunConfig::from_genesis`. Does not affect the crate's normal-dependency surface.
+ciborium = { workspace = true }
 
 [lints]
 workspace = true
