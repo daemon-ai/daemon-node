@@ -1,0 +1,31 @@
+; daemon-vhc-completion.cddl — the async completion-result wire grammar (ABI companion §7.5).
+;
+; The `completion-result` is the decoded content of an `Event::Completion(op, result)` (event tag 6,
+; ABI §4.2/§4.6) and of a `completion-rec.result` byte string (journal tag 14, §8.3). The journal
+; stores it OPAQUELY as a `bstr`; this grammar is the normative shape of those bytes. Per ABI §7.5
+; the encoding is "fixed now" — before any completion is linked (Phase B) — precisely so journals
+; and SDKs are stable across the phase that makes it real. It lives verbatim in `daemon-vhc-abi`
+; (the shared contracts ground), MUST validate as-is under `cddl-cat`, and the `completion_grammar`
+; test asserts it is machine-valid and that a representative of each variant validates.
+;
+; The result-variant set is additive within major 2 (ABI §1.4); unknown `comp-error` codes fail
+; closed (§5.2). Note on byte lengths: matching journal.cddl / daemon-swarm.cddl, `cddl-cat` parses
+; but does not enforce `.size N`; the fixed-width `bstr .size 32` (a blake3 content hash) carries its
+; size verbatim from the spec (the Rust codec enforces the actual length).
+
+completion-result = [0, success-payload]      ; success (COMPLETION_RESULT_OK)
+                  / [1, comp-error]            ; failure (COMPLETION_RESULT_ERR)
+
+; A success carries exactly one of: an opaque handle (buffer/tensor/stream — kind-tagged per §7.2),
+; a 32-byte content hash (the payload_put commitment), or unit (stream_write / publish-ack / a
+; cancel whose target had no result).
+success-payload = uint                         ; a handle (buffer/tensor/stream), kind-tagged §7.2
+                / bstr .size 32                ; a content hash (payload_put)
+                / null                         ; unit success (stream_write, publish-ack, cancel-target)
+
+comp-error = {
+  "code":   uint,      ; 0 = Cancelled, 1 = NetUnreachable, 2 = Timeout, 3 = StoreRefused,
+                       ; 4 = HashMismatch, 5 = CreditExhausted, 6 = PeerClosed,
+                       ; 7 = GrantExhausted; 8..=63 reserved (additive by minor)
+  ? "detail": tstr,
+}

@@ -1,0 +1,113 @@
+; daemon-vhc-grants.cddl — the grants + manifest vocabulary (ABI companion §2.3 / §2.6).
+;
+; The single canonical vocabulary naming everything a role-instance may reach: the module's
+; admission REQUEST (`manifest`, §2.3) and the host-derived ADMITTED grants (`grants-doc`, §2.6).
+; It lives verbatim in `daemon-vhc-abi` (the shared contracts ground) so every consumer keys against
+; one source of truth: the guest SDK authors a manifest, the host derives the grants-doc as the
+; pointwise intersection `lane ∩ envelope ∩ owner ∩ manifest` (§2.6), the run header journals the
+; admitted bytes verbatim (§8.3 tag 0 `grants`), and B2/B3 add their worlds' grant bounds against
+; these same shapes. Growth is additive (per-world minors, appended optional fields); a `grant-bound`
+; with a key absent means "unbounded by this grant" — still bounded by the lane ceiling (§9.6).
+;
+; This grammar MUST validate as-is under `cddl-cat`; the `grants_grammar` test asserts it is
+; machine-valid and that representatives of `manifest` and `grants-doc` validate. Note (matching
+; journal.cddl): `cddl-cat` parses but does not enforce `.size N`; `hash32` is a 32-byte blake3 whose
+; length the Rust types enforce.
+
+hash32 = bstr .size 32
+
+; ===================================================================================================
+; §2.6 — the admitted grants document (root: `grants-doc`)
+;
+; One canonical byte string serves every consumer: passed to `da_claim`/`da_init`, journaled in the
+; run header, re-checked at upgrade re-admission, and consulted for migration restore authorization.
+; Its blake3 is the grants hash used for assess→join pinning and the tag-11 cross-check (§2.6).
+; ===================================================================================================
+
+grants-doc = {
+  "version":      uint,               ; grants-schema version; 1 in this document
+  "run_id":       hash32,
+  "epoch":        uint,
+  "role":         tstr,
+  "instance":     uint,               ; role-instance incarnation — never-reused durable u64 (§8.1)
+  "lane":         tstr,
+  "lane_version": uint,
+  "worlds":       { * tstr => world-grant },
+  "custom_ops":   [* tstr],
+  "channels":     [* channel-decl],   ; the ADMITTED channel table (§6.2)
+  "events":       event-caps,         ; admitted advisory depths (≤ manifest request)
+  "buffers":      buffer-req,          ; admitted quotas (≤ manifest request)
+  ? "migration":  migration-grant,
+}
+
+world-grant     = { "minor": uint, "bounds": { * tstr => grant-bound } }
+migration-grant = { "restore": bool, "max_sections": uint, "max_section_bytes": uint }
+
+; ===================================================================================================
+; §6.2 — a channel declaration (the admitted channel table entry). Authoritative-only fields are
+; optional; from D0 the full table moves into the genesis envelope, the ABI surface unchanged.
+; ===================================================================================================
+
+channel-decl = {
+  "id":               uint,
+  "name":             tstr,
+  "class":            uint,           ; 0 = authoritative, 1 = advisory/gossip
+  "direction":        uint,           ; 0 = rx-only, 1 = tx-only, 2 = bidirectional
+  "max_frame_bytes":  uint,
+  "rate_per_min":     uint,           ; tx token bucket
+  ? "spool_frames":     uint,         ; authoritative: bounded durable spool depth
+  ? "replay_window":    uint,         ; authoritative: dedup window (frames)
+  ? "per_sender_quota": uint,         ; authoritative: rx per-sender outstanding quota
+}
+
+; ===================================================================================================
+; §2.3 — the module manifest (root: `manifest`) — the module's static admission REQUEST. The host
+; checks `worlds`/`custom_ops`/`channels`/`events`/`buffers` against the role's grants and the lane's
+; bounds (§9.4 step 6): a request beyond grants → `GrantsExceedLane`.
+; ===================================================================================================
+
+manifest = {
+  "name":       tstr,
+  "version":    tstr,
+  "sdk":        tstr,
+  "abi":        uint,                 ; da_abi() echoed, cross-checked (§9.4 step 6)
+  "worlds":     [* world-req],        ; every namespace the module statically imports MUST appear
+  "custom_ops": [* tstr],             ; versioned host custom-op names
+  "channels":   [* uint],             ; channel IDs the module will publish/subscribe (§6.2)
+  "events":     event-caps,           ; advisory-class queue depth + coalescing declaration
+  "buffers":    buffer-req,           ; live resource quotas (§7)
+  ? "migratable": bool,               ; default false; MUST be true iff da_migrate is exported
+}
+
+world-req = {
+  "world":  tstr,                     ; "vhc" / "net" / "sys" / "data" / "compute" / "tabi"
+  "minor":  uint,                     ; namespace minor required (for "tabi": always 1)
+  "grants": { * tstr => grant-bound },   ; requested per-grant bounds
+}
+
+; ===================================================================================================
+; §2.3 — the shared per-grant / per-class / buffer bound vocabulary (used by both `manifest` and
+; `grants-doc`). This is the vocabulary B1 extends for the Phase-B worlds (net topics/rates/payload
+; bytes via `grant-bound`, buffer quota via `buffer-req`, queue depths via `event-caps`).
+; ===================================================================================================
+
+grant-bound = {
+  ? "max_bytes":       uint,          ; per-item byte ceiling (publish payload, readback value, …)
+  ? "max_per_slice":   uint,          ; per-event-slice call ceiling for this grant
+  ? "rate_per_min":    uint,          ; sustained rate ceiling (token bucket, per minute)
+  ? "max_outstanding": uint,          ; concurrent-operation ceiling (Phase B completions)
+  ? "values":          [* tstr],      ; enumerated allowed values (topics, dataset hashes, sources)
+}
+
+event-caps = {
+  ; advisory classes with the declared depth + fixed coalescing rule the host enforces (§4.7/§5.4).
+  ; class keys: "payload-ready" / "timer" / "gossip"; coalesce: 0 dedup-by-hash, 1 latest-wins,
+  ; 2 drop-oldest. Authoritative channels are NOT declared here (their bounds are in the channel).
+  * tstr => { "depth": uint, "coalesce": uint }
+}
+
+buffer-req = {
+  "max_live_handles":   uint,         ; standing live-resource ceiling (all instance-class resources)
+  "max_live_bytes":     uint,         ; standing live-buffer byte ceiling (Phase B buffers)
+  "max_readback_bytes": uint,         ; per-slice ceiling on bytes crossing into linear memory
+}

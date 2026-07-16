@@ -256,6 +256,18 @@ impl JournalSink for JournalAdapter {
             .map_err(|e| SinkError(e.to_string()))
     }
 
+    fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError> {
+        self.journal
+            .append(Body::Completion(
+                daemon_vhc_observe::journal::record::CompletionRec {
+                    op,
+                    result: result.to_vec(),
+                },
+            ))
+            .map(|_| ())
+            .map_err(|e| SinkError(e.to_string()))
+    }
+
     fn terminal(
         &mut self,
         kind: u64,

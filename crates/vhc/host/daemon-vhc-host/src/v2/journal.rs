@@ -113,6 +113,12 @@ pub trait JournalSink: Send {
         hash: Option<[u8; 32]>,
     ) -> Result<(), SinkError>;
 
+    /// tag 14 — a completion arrival (ABI §7.5/§8.3, Phase B): the op plus its standalone
+    /// canonical `completion-result` bytes. Written at ARRIVAL (enqueue), before the completion
+    /// event is deliverable — completion results and their order are nondeterministic inputs
+    /// (§8.1).
+    fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError>;
+
     /// tag 9 — the terminal fact (kind 0 = outcome, 1 = trap, 2 = forced interruption). MUST be
     /// committed before it is reported (§8.4 rule 2).
     fn terminal(
@@ -218,6 +224,9 @@ impl<S: JournalSink> JournalSink for std::sync::Arc<std::sync::Mutex<S>> {
             .expect("sink lock")
             .drop_coalesced(class, rule, timer_id, hash)
     }
+    fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError> {
+        self.lock().expect("sink lock").completion(op, result)
+    }
     fn terminal(
         &mut self,
         kind: u64,
@@ -286,6 +295,10 @@ pub enum SinkEntry {
         timer_id: Option<u64>,
         hash: Option<[u8; 32]>,
     },
+    Completion {
+        op: u64,
+        result: Vec<u8>,
+    },
     Terminal {
         kind: u64,
         outcome: Option<u64>,
@@ -309,6 +322,7 @@ impl SinkEntry {
             Self::Init { .. } => 11,
             Self::SignedFrame { .. } => 12,
             Self::Instantiation { .. } => 13,
+            Self::Completion { .. } => 14,
         }
     }
 }
@@ -461,6 +475,14 @@ impl JournalSink for MemorySink {
             rule,
             timer_id,
             hash,
+        });
+        Ok(())
+    }
+
+    fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError> {
+        self.entries.push(SinkEntry::Completion {
+            op,
+            result: result.to_vec(),
         });
         Ok(())
     }
