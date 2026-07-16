@@ -45,6 +45,10 @@ thiserror = { workspace = true }
 # The failover drill (refactor §8/D2): the A1 journal + the D2 record archive / chain recovery
 # the standby coordinator resumes from. host/* -> host/* (allowed), test-only.
 daemon-vhc-observe = { workspace = true }
+# The Phase-E colocation-under-arbitration acceptance (refactor §9; decisions D6): the node's
+# OwnerArbiter admits the trainer + verifier role-instances the tier-2 lane colocates.
+# host/* -> host/* (allowed), test-only.
+daemon-vhc-node = { workspace = true }
 
 [lints]
 workspace = true

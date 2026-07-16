@@ -4945,6 +4945,7 @@ name = "daemon-vhc-node"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "blake3",
  "daemon-api",
  "daemon-vhc-net",
  "daemon-vhc-session",
@@ -5123,6 +5124,7 @@ dependencies = [
  "ciborium",
  "daemon-vhc-abi",
  "daemon-vhc-host",
+ "daemon-vhc-node",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",

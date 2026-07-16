@@ -3023,6 +3023,16 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                     Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(
                         daemon_vhc_supervisor::TrainClientConfig::new(&cfg.swarm.worker_path),
                     ));
+                // Phase E multi-instance supervision (decisions D1/D6): every admitted join gets
+                // its OWN supervised worker subprocess (one sandbox = one role-instance) — the
+                // pre-E single-shared-child interim is lifted. Admission is arbitrated by the
+                // service's OwnerArbiter (permissive until an owner budget is configured).
+                let worker_path = cfg.swarm.worker_path.clone();
+                let worker_factory: daemon_vhc_node::service::WorkerFactory = Arc::new(move || {
+                    Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(
+                        daemon_vhc_supervisor::TrainClientConfig::new(&worker_path),
+                    )) as Arc<dyn daemon_vhc_node::WorkerControl>
+                });
                 let weak = Arc::downgrade(&node);
                 let feed: daemon_vhc_node::NodeFeed = Arc::new(move |ev| {
                     if let Some(n) = weak.upgrade() {
@@ -3073,6 +3083,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         worker,
                         feed: Some(feed),
                         discovery,
+                        budget: None,
+                        worker_factory: Some(worker_factory),
                     },
                 ));
                 // A3: bind the service's own Arc so joins pump the continuous worker event stream

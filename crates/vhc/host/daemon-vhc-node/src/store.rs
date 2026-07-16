@@ -167,8 +167,29 @@ ALTER TABLE swarm_runs ADD COLUMN selected_driver TEXT;
 ALTER TABLE swarm_runs ADD COLUMN module_hash BLOB;
 ";
 
+/// M3 (Phase E, decisions D6/D1): the node-durable **incarnation counter** — the never-reused,
+/// monotonic u64 role-instance incarnation id the execution identity carries (ABI §8.1; a
+/// reusable slot value would let a fresh role-instance inherit a retired incarnation's durable
+/// sequence stream) — and the **owner-priority store** (D6 point 4: preemption priority is
+/// node-side owner state, never the envelope). Append-only.
+const M3_ARBITER: &str = "\
+CREATE TABLE IF NOT EXISTS swarm_counters (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO swarm_counters (name, value) VALUES ('incarnation', 0);
+CREATE TABLE IF NOT EXISTS swarm_owner_priority (
+    run_id   TEXT PRIMARY KEY,
+    priority INTEGER NOT NULL
+);
+";
+
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(SCHEMA), M::up(M2_IDENTITY_OBSERVABILITY)])
+    Migrations::new(vec![
+        M::up(SCHEMA),
+        M::up(M2_IDENTITY_OBSERVABILITY),
+        M::up(M3_ARBITER),
+    ])
 }
 
 /// The column list every `swarm_runs` read shares — kept as one constant so the three readers
@@ -517,6 +538,44 @@ impl SwarmStore {
         Ok(out)
     }
 
+    /// Mint the next **role-instance incarnation id** — never-reused, node-durable, monotonic
+    /// (ABI §8.1; decisions D1). The first minted id is `1` (`0` is the pre-multi-instance
+    /// default in existing rows). Atomic: the increment and the read are one SQL statement.
+    pub fn mint_incarnation(&self) -> Result<u64, StoreError> {
+        let conn = self.lock();
+        let value: i64 = conn.query_row(
+            "UPDATE swarm_counters SET value = value + 1 WHERE name = 'incarnation' \
+             RETURNING value",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(value as u64)
+    }
+
+    /// Set the owner's preemption priority for a run (decisions D6 point 4: node-side owner
+    /// state — the envelope can never set or influence its own priority). Idempotent upsert.
+    pub fn set_run_priority(&self, run_id: &str, priority: u8) -> Result<(), StoreError> {
+        self.lock().execute(
+            "INSERT INTO swarm_owner_priority (run_id, priority) VALUES (?1, ?2)
+             ON CONFLICT(run_id) DO UPDATE SET priority = excluded.priority",
+            params![run_id, i64::from(priority)],
+        )?;
+        Ok(())
+    }
+
+    /// The owner's preemption priority for a run (default `100` when unset).
+    pub fn run_priority(&self, run_id: &str) -> Result<u8, StoreError> {
+        let conn = self.lock();
+        let p: Option<i64> = conn
+            .query_row(
+                "SELECT priority FROM swarm_owner_priority WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(p.map_or(100, |v| u8::try_from(v).unwrap_or(u8::MAX)))
+    }
+
     /// The number of events retained for a run (test/observability helper).
     pub fn event_count(&self, run_id: &str) -> Result<usize, StoreError> {
         let conn = self.lock();
@@ -660,6 +719,27 @@ mod tests {
             store.backfill_run_id("run-A", &other),
             Err(StoreError::IdentityMismatch { .. })
         ));
+    }
+
+    /// M3: the incarnation counter is durable, monotonic, and never reuses a value (mints
+    /// survive across store re-opens on one db); owner priority round-trips with the 100
+    /// default (decisions D6/D1).
+    #[test]
+    fn m3_incarnation_counter_and_owner_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swarm.db");
+
+        let store = SwarmStore::open(&path).unwrap();
+        assert_eq!(store.mint_incarnation().unwrap(), 1);
+        assert_eq!(store.mint_incarnation().unwrap(), 2);
+        drop(store);
+        // A re-open (node restart) continues the durable counter — never reuses an id.
+        let store = SwarmStore::open(&path).unwrap();
+        assert_eq!(store.mint_incarnation().unwrap(), 3);
+
+        assert_eq!(store.run_priority("run-X").unwrap(), 100, "default");
+        store.set_run_priority("run-X", 7).unwrap();
+        assert_eq!(store.run_priority("run-X").unwrap(), 7);
     }
 
     /// The v2 execution-identity + observability writers populate the D0 columns for the sunset

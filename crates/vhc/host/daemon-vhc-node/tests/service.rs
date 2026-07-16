@@ -130,6 +130,8 @@ fn service(config: SwarmConfig, worker: Arc<FakeWorker>, feed: Option<NodeFeed>)
         worker,
         feed,
         discovery: None,
+        budget: None,
+        worker_factory: None,
     })
 }
 
@@ -169,6 +171,8 @@ async fn join_persists_and_reload_reconverges() {
             worker: worker.clone(),
             feed: None,
             discovery: None,
+            budget: None,
+            worker_factory: None,
         });
         svc.swarm_join("run-a".into(), policy(), "op-a".into())
             .await
@@ -193,6 +197,8 @@ async fn join_persists_and_reload_reconverges() {
             worker: worker.clone(),
             feed: None,
             discovery: None,
+            budget: None,
+            worker_factory: None,
         });
         let rejoined = svc.start().await.unwrap();
         assert_eq!(rejoined, 1, "only the active intent re-converges");
@@ -449,6 +455,8 @@ async fn join_discovers_fetches_envelope_and_assesses() {
         worker: worker.clone(),
         feed: None,
         discovery: Some(discovery),
+        budget: None,
+        worker_factory: None,
     });
 
     svc.swarm_join("run-disc".into(), policy(), "op".into())

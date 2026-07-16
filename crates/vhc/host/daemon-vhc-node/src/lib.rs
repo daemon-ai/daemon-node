@@ -9,21 +9,30 @@
 //! - [`SwarmStore`] — the durable `swarm.db` (spec §10.3): joined-run intents + status
 //!   (`swarm_runs`), per-run contribution counters (`swarm_contrib`), and a windowed event log
 //!   (`swarm_events`). Durable join-intent drives restart re-convergence.
-//! - [`SwarmService`] — owns a [`WorkerControl`] (the `daemon-vhc-supervisor` `TrainSupervisor` seam),
-//!   translates worker events into [`SwarmEvent`](daemon_api::SwarmEvent)s (persisted + fanned out +
-//!   `NodeEvent::SwarmChanged` on the node feed), re-issues `JoinRun` for persisted intents on start,
-//!   and implements [`daemon_api::SwarmApi`]. **OFF by default** — a disabled service never spawns a
-//!   worker.
+//! - [`SwarmService`] — supervises **N worker instances** (one sandbox = one role-instance,
+//!   decisions D1/D6; each a [`WorkerControl`], in production a `daemon-vhc-supervisor`
+//!   `TrainSupervisor` child) under the owner's aggregate grants, translates worker events into
+//!   [`SwarmEvent`](daemon_api::SwarmEvent)s (persisted + fanned out + `NodeEvent::SwarmChanged`
+//!   on the node feed), re-issues `JoinRun` for persisted intents on start, and implements
+//!   [`daemon_api::SwarmApi`]. **OFF by default** — a disabled service never spawns a worker.
+//! - [`OwnerArbiter`] — the D6 owner-scoped resource arbiter (Phase E): per-device + host-wide
+//!   typed ledgers, atomic check-and-reserve admission, release-before-replacement preemption
+//!   ordering, and crash reconciliation, across every role-instance on the host.
 //!
 //! The node binds an `Arc<SwarmService>` as its `Arc<dyn SwarmApi>` (via `NodeApiImpl::with_swarm`)
 //! only when `[swarm] enabled = true`.
 
 #![forbid(unsafe_code)]
 
+pub mod arbiter;
 pub mod discovery;
 pub mod service;
 pub mod store;
 
+pub use arbiter::{
+    AdmitRefusal, BudgetSnapshot, ClaimTiers, InstanceCharge, OwnerArbiter, OwnerBudget,
+    RoleInstanceId, TierBytes,
+};
 pub use discovery::{DiscoveredRun, EgressRunDiscovery, RunDiscovery};
 // Re-exported so the boot site constructs the registry-backed discovery seam without a direct
 // `daemon-vhc-net` dep edge (A3 boot wiring; additive).

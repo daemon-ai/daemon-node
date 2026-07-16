@@ -471,6 +471,8 @@ async fn live_workers_full_loop_via_wrangler_dev() {
             worker: supervisors[0].clone(),
             feed: None,
             discovery: None,
+            budget: None,
+            worker_factory: None,
         },
     ));
     svc.bind_self();
