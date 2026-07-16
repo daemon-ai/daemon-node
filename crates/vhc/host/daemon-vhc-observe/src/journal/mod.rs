@@ -36,6 +36,7 @@
 #![allow(clippy::disallowed_methods)]
 
 pub mod archive;
+pub mod consensus;
 pub mod oracle;
 pub mod record;
 pub mod segment;
@@ -51,6 +52,7 @@ pub use archive::{
     detect_fork, ArchiveError, ChainHead, ForkEvidence, RecordArchive, ReplicationPolicy,
     RetentionPolicy, SignedHead,
 };
+pub use consensus::{replay_consensus_from_archive, ConsensusReplayError, ConsensusReplayReport};
 pub use record::{Body, ExecIdentity, Record};
 pub use segment::{scan_bytes, scan_file, ScanResult, SegmentHeader, SegmentWriter};
 pub use sidecar::{KeyProvider, SidecarError, SidecarStore, StaticKey};

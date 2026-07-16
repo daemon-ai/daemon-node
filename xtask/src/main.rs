@@ -563,11 +563,24 @@ fn swarm_ci_t2() -> anyhow::Result<()> {
             // providers, journaled end-to-end, re-driven through the §8.7 input-replay engine —
             // every decision reproduced bit-for-bit. Covers the toy_averager whole run, the
             // tiny_llama_v2 barrier whole runs under the in-process native coordinator (single-
-            // and 2-worker with cross-worker det-digest agreement; SDK-free raw-CBOR config), and
-            // the adversarial-rig pinned cases (duplicate record deduped; delayed payloads →
-            // straggle → catch-up).
-            "daemon-vhc-testkit (production-blob whole runs + barrier rounds + adversarial rig)",
+            // and 2-worker with cross-worker det-digest agreement; SDK-free raw-CBOR config), the
+            // adversarial-rig pinned cases (duplicate record deduped; delayed payloads →
+            // straggle → catch-up), and — from D2 — the wasm-coordinator lanes: the 20-round
+            // dual-compilation identity gate, the mixed-fleet matrix cells for
+            // {wasm coordinator × v1/v2 workers} (cell 8 positive + cells 3/4/7 typed negatives),
+            // the pump-hold back-pressure rig, and the failover drill.
+            "daemon-vhc-testkit (production-blob whole runs + D2 wasm-coordinator lanes)",
             &["-p", "daemon-vhc-testkit"],
+        ),
+        (
+            // D2's CONSENSUS REPLAY — the third replay tier (architecture §3.6; refactor §10 gate
+            // row "Consensus replay from archive alone", tier-2): a third party re-verifies every
+            // consensus decision and every digest from the record archive's signed, hash-chained,
+            // content-addressed sealed segments + the content-addressed payloads ALONE (no live
+            // journal, no coordinator). Positive + the typed incompleteness negatives (missing
+            // payload, withheld segment, forged/gappy heads).
+            "D2 consensus replay (third tier: digests re-verified from archive + payloads alone)",
+            &["-p", "daemon-vhc-observe", "--test", "consensus_replay"],
         ),
     ];
     for (label, args) in suites {
@@ -670,9 +683,11 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         (
             "daemon-vhc-observe",
             "daemon-vhc-sdk-consensus",
-            "D2 — the coordinator replay oracle re-runs the native `tick` (relocated here at D2); \
-             re-seats onto the wasm coordinator blob via the host runtime when the D2 \
-             consensus-replay verifier lands, retiring this edge [normal]",
+            "post-D1 — the coordinator oracle AND the D2 consensus-replay verifier re-run the \
+             native `tick` (legitimate for a third-party verifier: the dual-compilation gate \
+             proves native ≡ blob); the edge retires when the oracle machinery re-seats onto the \
+             blob via the host runtime, cleanest after D1's Authority swap lands in these same \
+             seams [normal]",
         ),
         (
             "daemon-vhc-worker",
