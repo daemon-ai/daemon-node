@@ -67,6 +67,21 @@ fn section_peer(kind: SectionKind) -> PeerId {
     PeerId(b)
 }
 
+/// The payload-plane key of a typed checkpoint's **manifest** at `(run, round)` — how a late joiner
+/// (E3) fetches the manifest it was pointed at, verifying against the pointer's content hash.
+#[must_use]
+pub fn typed_manifest_key(run: &RunId, round: RoundId) -> PayloadKey {
+    PayloadKey::new(run.clone(), round, manifest_peer())
+}
+
+/// The payload-plane key of a typed checkpoint's **section** of `kind` at `(run, round)` —
+/// deterministically reconstructible from the manifest alone (one section per kind), verified
+/// against the section's declared blake3 on fetch.
+#[must_use]
+pub fn typed_section_key(run: &RunId, round: RoundId, kind: SectionKind) -> PayloadKey {
+    PayloadKey::new(run.clone(), round, section_peer(kind))
+}
+
 /// The manifest of one checkpoint (§9): the round it captures, the blake3 of its bytes, and the
 /// post-round state digest (§5.6) it should reproduce on reload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
