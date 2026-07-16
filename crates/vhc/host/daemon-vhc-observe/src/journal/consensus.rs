@@ -131,16 +131,28 @@ pub enum ConsensusReplayError {
     Codec(String),
 }
 
-/// The §8.3 record stream's consensus projection: the tag-10 initial state (if any), the tag-1/3
-/// driving inputs, and the tag-4 published decisions, in record order. Shared by the archive
-/// verifier below and the D2 failover drill's standby recovery (which appends the unsealed local
-/// journal *tail*'s records after the archived prefix — "resumes from archive + journal").
+/// The §8.3 record stream's consensus projection (what [`extract_consensus_capture`] recovers).
+#[derive(Debug)]
+pub struct ConsensusCapture {
+    /// The tag-10 initial coordinator state, if the stream carries one.
+    pub initial: Option<CoordinatorState>,
+    /// The tag-1/3 driving inputs, in record order.
+    pub inputs: Vec<Input>,
+    /// The tag-4 published decisions (signed), in record order.
+    pub published: Vec<SignedMessage>,
+}
+
+/// Project a §8.3 record stream into its consensus capture: the tag-10 initial state (if any),
+/// the tag-1/3 driving inputs, and the tag-4 published decisions, in record order. Shared by the
+/// archive verifier below and the D2 failover drill's standby recovery (which appends the
+/// unsealed local journal *tail*'s records after the archived prefix — "resumes from archive +
+/// journal").
 ///
 /// # Errors
 /// [`ConsensusReplayError::Codec`] on an undecodable snapshot/event/publish body.
 pub fn extract_consensus_capture(
     records: &[Record],
-) -> Result<(Option<CoordinatorState>, Vec<Input>, Vec<SignedMessage>), ConsensusReplayError> {
+) -> Result<ConsensusCapture, ConsensusReplayError> {
     let mut initial: Option<CoordinatorState> = None;
     let mut inputs: Vec<Input> = Vec::new();
     let mut published: Vec<SignedMessage> = Vec::new();
@@ -166,7 +178,11 @@ pub fn extract_consensus_capture(
             _ => {}
         }
     }
-    Ok((initial, inputs, published))
+    Ok(ConsensusCapture {
+        initial,
+        inputs,
+        published,
+    })
 }
 
 /// What the archive chain walk recovered: the verified sealed-segment count and the §8.3 records
@@ -267,17 +283,18 @@ pub fn replay_consensus_from_archive(
     let chain = recover_chain_from_archive(archive, heads)?;
     let count = chain.segments_verified;
     let records_recovered = chain.records.len() as u64;
-    let (initial, inputs, published) = extract_consensus_capture(&chain.records)?;
-    let initial = initial.ok_or(ConsensusReplayError::NoSnapshot)?;
+    let capture = extract_consensus_capture(&chain.records)?;
+    let initial = capture.initial.ok_or(ConsensusReplayError::NoSnapshot)?;
 
     // -- 3. re-derive: the pure tick over the inputs; archived records are the oracle ------------
-    let oracle_records: Vec<Input> = published
+    let oracle_records: Vec<Input> = capture
+        .published
         .iter()
         .filter(|sm| matches!(sm.payload, SwarmMessage::RoundRecord(_)))
         .cloned()
         .map(Input::Message)
         .collect();
-    let replay = replay_from_state(initial, inputs.into_iter().chain(oracle_records))?;
+    let replay = replay_from_state(initial, capture.inputs.into_iter().chain(oracle_records))?;
 
     // -- 4. digests from payloads alone: every committed entry + every set commitment ------------
     let mut payload_entries_verified = 0u64;

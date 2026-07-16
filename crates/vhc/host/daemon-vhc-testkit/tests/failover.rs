@@ -372,14 +372,15 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     );
     let mut records = chain.records;
     records.extend(tail_scan.records);
-    let (rec_initial, rec_inputs, _) =
-        extract_consensus_capture(&records).expect("capture extraction");
-    let rec_initial = rec_initial.expect("the archived prefix carries the snapshot");
+    let capture = extract_consensus_capture(&records).expect("capture extraction");
+    let rec_initial = capture
+        .initial
+        .expect("the archived prefix carries the snapshot");
 
     // Deterministic state reconstruction (architecture §4.4): fold the pure tick natively —
     // native ≡ blob by the D2 dual-compilation gate.
     let mut state = rec_initial;
-    for input in rec_inputs {
+    for input in capture.inputs {
         let (next, _) = tick(state, input);
         state = next;
     }

@@ -591,7 +591,7 @@ pub fn cell8_whole_run(
                             sealed
                                 .get(&e.peer)
                                 .cloned()
-                                .ok_or_else(|| format!("record entry for unknown peer"))
+                                .ok_or_else(|| "record entry for unknown peer".to_string())
                         })
                         .collect::<Result<_, String>>()?;
                     for p in &ordered {

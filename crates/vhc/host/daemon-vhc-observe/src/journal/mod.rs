@@ -54,7 +54,7 @@ pub use archive::{
 };
 pub use consensus::{
     extract_consensus_capture, recover_chain_from_archive, replay_consensus_from_archive,
-    ConsensusReplayError, ConsensusReplayReport, RecoveredChain,
+    ConsensusCapture, ConsensusReplayError, ConsensusReplayReport, RecoveredChain,
 };
 pub use record::{Body, ExecIdentity, Record};
 pub use segment::{scan_bytes, scan_file, ScanResult, SegmentHeader, SegmentWriter};
