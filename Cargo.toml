@@ -91,6 +91,21 @@ wasm-encoder = { version = "0.251", default-features = false }
 # never compiles it (spec §10.1: heavy GPU deps build only as out-of-gate per-backend Nix lanes, like
 # the daemon-infer engine lanes). Keep default-features = false so the feature set stays this list.
 burn = { version = "0.21", default-features = false, features = ["std", "ndarray", "autodiff"] }
+# The Burn IR + router layer the Phase-C `compute@2` surface is built on (decisions D8; ABI §15).
+# The wire is `CBOR(burn_ir::OperationIr)` at the pinned Burn version, and the host reuses the
+# `burn-router` runner dispatch as the op inventory. All four crates are ALREADY resolved at 0.21.0
+# in the committed Cargo.lock (transitive under `burn`); adding these explicit edges pins the exact
+# version the compute wire is defined against and changes only dependency edges — no new crate,
+# version, or source enters the graph, so `cargo deny` is a no-op. `default-features = false` +
+# `std` keeps the feature set a subset of what `burn` already unifies (no lock churn). Isolated to
+# `daemon-vhc-host` (host-side dispatch); the guest-side `HostBackend` links them wasm32-side.
+burn-ir = { version = "0.21", default-features = false }
+burn-router = { version = "0.21", default-features = false, features = ["std"] }
+burn-backend = { version = "0.21", default-features = false, features = ["std"] }
+burn-ndarray = { version = "0.21", default-features = false, features = ["std"] }
+# The `burn_std::future::DynFut` return type of `burn_router::RunnerClient::read_tensor_async`
+# (needed only by the compute-conformance harness that impls the guest client). Already in the lock.
+burn-std = { version = "0.21", default-features = false, features = ["std"] }
 # Canonical content hashing for artifact / tensor / checkpoint identity (blake3), plus the cheap
 # xxh3-64 in-memory change probe. Isolated to the swarm stack.
 blake3 = "1"

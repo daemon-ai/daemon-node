@@ -39,6 +39,15 @@ daemon-vhc-abi = { workspace = true }
 # the worker fault domain and is built out-of-gate per backend lane in the real product.
 wasmtime = { workspace = true }
 burn = { workspace = true }
+# Phase-C `compute@2` (track C1, decisions D8 / ABI §15): the wire is `CBOR(burn_ir::OperationIr)`
+# at the pinned Burn version and the host reuses the `burn-router` runner dispatch as the op
+# inventory (`src/compute.rs`). Already resolved at 0.21.0 in Cargo.lock (transitive under `burn`),
+# so these are lock-neutral edges (see the root workspace note). burn-ndarray is the tier-1 backend;
+# wgpu/cuda ride the same `BackendIr` seam behind the existing feature lanes.
+burn-ir = { workspace = true }
+burn-router = { workspace = true }
+burn-backend = { workspace = true }
+burn-ndarray = { workspace = true }
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
 thiserror = { workspace = true }
@@ -145,6 +154,11 @@ daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
 # `[workspace.dependencies]` entry (added at Merge 2) — a dev-dep on an existing workspace dep, no
 # root/deny/flake change.
 daemon-vhc-safetensors = { workspace = true }
+# Test-only: the `compute@2` conformance harness (`tests/compute_conformance.rs`) impls the
+# guest-side `burn_router::RunnerChannel`/`RunnerClient` routing every op through the production
+# `ComputeRunner`, and `read_tensor_async` returns `burn_std::future::DynFut`. Already in the lock
+# (transitive under burn-router); a dev-only edge, no new crate enters the graph.
+burn-std = { workspace = true }
 
 [lints]
 workspace = true

@@ -28,6 +28,10 @@ pub mod backend;
 // module compiles when any backend feature is enabled, and each concrete alias is feature-gated inside.
 #[cfg(any(feature = "burn-ndarray", feature = "wgpu", feature = "cuda"))]
 pub mod burn_backend;
+// The Phase-C `compute@2` host runner: `CBOR(burn_ir::OperationIr)` wire + burn-router dispatch
+// (decisions D8, ABI §15). Unconditional — the tier-1 ndarray backend is always compiled (the root
+// `burn` dep pins `ndarray`+`autodiff`); wgpu/cuda ride the same generic seam behind their features.
+pub mod compute;
 pub mod handle;
 pub mod meta;
 pub mod phase;
@@ -48,6 +52,7 @@ pub use burn_backend::BurnNdarrayBackend;
 pub use burn_backend::{cuda_adapter_available, BurnCudaBackend};
 #[cfg(feature = "wgpu")]
 pub use burn_backend::{wgpu_adapter_available, BurnWgpuBackend};
+pub use compute::{reserved_reason, ComputeError, ComputeRunner, HostReal};
 pub use handle::{HandleClass, Lane};
 pub use meta::MetaReport;
 pub use phase::Phase;

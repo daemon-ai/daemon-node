@@ -4902,6 +4902,11 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "burn",
+ "burn-backend",
+ "burn-ir",
+ "burn-ndarray",
+ "burn-router",
+ "burn-std",
  "ciborium",
  "cudarc 0.19.8",
  "daemon-vhc-abi",

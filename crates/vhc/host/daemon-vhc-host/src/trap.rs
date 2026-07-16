@@ -73,6 +73,11 @@ pub enum TrapCode {
     /// The guest failed to return from a `Quiesce` drain before the effective deadline; forced
     /// epoch interruption (ABI §4.4/§11.3).
     QuiesceDeadlineExceeded,
+    /// A `compute@2` op reported a deferred device execution error at a fence/readback (CUDA-style
+    /// deferred error semantics, architecture §3.3; the Phase-C mapping of Burn's `ExecutionError`
+    /// / runner faults, ABI §7.6/§15). A stale/unknown tensor handle is [`Self::StaleHandle`] /
+    /// [`Self::InvalidHandle`] instead — this code is the *device* failure, never the handle one.
+    ComputeFault,
 }
 
 impl TrapCode {
@@ -107,6 +112,7 @@ impl TrapCode {
             Self::ReadBackUnavailable => "ReadBackUnavailable",
             Self::MigrateBudget => "MigrateBudget",
             Self::QuiesceDeadlineExceeded => "QuiesceDeadlineExceeded",
+            Self::ComputeFault => "ComputeFault",
         }
     }
 }
@@ -206,6 +212,7 @@ mod tests {
             TrapCode::ReadBackUnavailable,
             TrapCode::MigrateBudget,
             TrapCode::QuiesceDeadlineExceeded,
+            TrapCode::ComputeFault,
         ];
         let mut slugs: Vec<&str> = codes.iter().map(|c| c.slug()).collect();
         slugs.sort_unstable();
