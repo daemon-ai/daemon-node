@@ -678,6 +678,34 @@ struct SliceState {
     pending_readback_value: Option<Vec<u8>>,
 }
 
+/// The bridge staged-update ingest phase (§2.5/§5.9) — the state machine behind the v1 ingest
+/// epilogue's placement (the B3-found catch-up defect):
+///
+/// v1 ran `snapshot_round_bases` (post-ingest master → next round's base) when
+/// `da_ingest_updates` RETURNED — i.e. at the **ingest→training boundary**, before any later
+/// math. The v2 bridge has no "ingest returns" moment, and deferring the epilogue to the
+/// Delivered slice close diverges on the straggle **catch-up path**, where `BarrierRound`
+/// ingests round r and trains round r+1 in ONE slice (round r+1 then trains against a
+/// pre-ingest base). The equivalent boundary, driver-visible:
+///
+/// - a kind-2 read while `Idle` opens a FRESH staged window (v1's per-ingest `staged.clear()`);
+/// - further kind-2 reads with no intervening non-window ops continue the SAME window (a
+///   record's N entries are read back-to-back by `Staged::mint`);
+/// - any other bridge op marks the window's ingest MATH as begun (aggregate + apply);
+/// - the epilogue fires at the first boundary AFTER the math: the next kind-1 batch read
+///   (training resumes — the catch-up path), a kind-2 read that OPENS THE NEXT window
+///   (multi-round catch-up), or the slice close (the normal path, timing unchanged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestPhase {
+    /// No staged-update window is being consumed.
+    Idle,
+    /// A window is open; `math_seen` = a non-window bridge op ran since its last kind-2 read.
+    Consuming {
+        /// Whether ingest math has begun on this window.
+        math_seen: bool,
+    },
+}
+
 /// The wasmtime `Store` data for a v2 run instance.
 struct V2Host {
     shared: Arc<PumpShared>,
@@ -698,9 +726,10 @@ struct V2Host {
     tabi: Option<crate::runtime::HostState>,
     // Whether a bridge slice pass is open (begin/end at Delivered boundaries, §2.5 rule 4).
     slice_pass_open: bool,
-    // Whether the open slice consumed a staged update (read_back kind 2) — its close is the v1
-    // ingest epilogue: the §5.9 barrier snapshot (post-ingest master → next round's base).
-    slice_ingested: bool,
+    // The bridge ingest phase (§5.9): tracks a staged-update window from its first kind-2
+    // consumption to the boundary where the v1 ingest epilogue (post-ingest master → next
+    // round's base) must run. See [`IngestPhase`].
+    ingest_phase: IngestPhase,
     // Sealed-container watermark (B1 sealing-gap retirement): containers the bridge has built
     // that were already sealed + announced to the guest at a slice boundary.
     sealed_containers: usize,
@@ -962,12 +991,12 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                 // slice's pass (clear step arenas wholesale, free tensors — the v1 finish_entry
                 // teardown) and begin the new slice's differentiable pass.
                 if let Some(tabi) = d.tabi.as_mut() {
-                    // The v1 ingest epilogue at the slice that ingested (§5.9): the post-ingest
-                    // master is the next round's base. v1 runs it as `Instance::ingest` returns;
-                    // the bridge's equivalent boundary is the close of the ingesting slice.
-                    if d.slice_ingested {
+                    // The §5.9 epilogue's slice-close backstop (the normal path, where the
+                    // ingesting slice ends without further training — timing unchanged from
+                    // A2). The catch-up boundaries fire earlier, in read_back (IngestPhase).
+                    if d.ingest_phase != IngestPhase::Idle {
                         tabi.snapshot_round_bases();
-                        d.slice_ingested = false;
+                        d.ingest_phase = IngestPhase::Idle;
                     }
                     if d.slice_pass_open {
                         tabi.end_slice_pass_and_clear();
@@ -1129,6 +1158,16 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                                 .collect(),
                             _ => return Err(Trap::bare(TrapCode::BadModule, "staged tokens")),
                         };
+                        // A batch read is the ingest→TRAINING boundary (the catch-up path,
+                        // §5.9 / IngestPhase docs): the epilogue fires BEFORE the batch
+                        // registers, so training sees the post-ingest round base.
+                        {
+                            let d = c.data_mut();
+                            if d.ingest_phase != IngestPhase::Idle {
+                                d.tabi().snapshot_round_bases();
+                                d.ingest_phase = IngestPhase::Idle;
+                            }
+                        }
                         let handle = c
                             .data_mut()
                             .tabi()
@@ -1140,17 +1179,30 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         out
                     }
                     daemon_vhc_abi::READBACK_KIND_STAGED_UPDATE => {
-                        // The slice's first staged update opens a FRESH window (v1's per-ingest
-                        // `staged.clear()`), so `upd_*@1` indices are 0-based per round.
-                        let fresh_window = !c.data().slice_ingested;
+                        // Window boundaries (IngestPhase docs): the first kind-2 read of a
+                        // window — or one following the previous window's ingest MATH (the
+                        // multi-round catch-up boundary, which also fires the epilogue) —
+                        // opens a FRESH window (v1's per-ingest `staged.clear()`), so
+                        // `upd_*@1` indices are 0-based per round.
+                        let fresh_window = {
+                            let d = c.data_mut();
+                            match d.ingest_phase {
+                                IngestPhase::Idle => true,
+                                IngestPhase::Consuming { math_seen: false } => false,
+                                IngestPhase::Consuming { math_seen: true } => {
+                                    // The previous window's ingest finished: epilogue, then
+                                    // a fresh window for this round.
+                                    d.tabi().snapshot_round_bases();
+                                    true
+                                }
+                            }
+                        };
                         let idx = c
                             .data_mut()
                             .tabi()
                             .stage_bridge_update(&staged_bytes, fresh_window)
                             .map_err(|e| Trap::bare(TrapCode::BadModule, e))?;
-                        // This slice is an ingest slice: its close runs the §5.9 barrier
-                        // snapshot (v1's ingest epilogue).
-                        c.data_mut().slice_ingested = true;
+                        c.data_mut().ingest_phase = IngestPhase::Consuming { math_seen: false };
                         let mut out = Vec::new();
                         ciborium::into_writer(&ciborium::value::Value::from(idx), &mut out)
                             .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
@@ -1840,7 +1892,7 @@ pub fn start_run(
                 accountable_staged_bytes: 0,
                 tabi: bridge.then(|| crate::runtime::HostState::new(&engine_cfg)),
                 slice_pass_open: false,
-                slice_ingested: false,
+                ingest_phase: IngestPhase::Idle,
                 sealed_containers: 0,
                 signing,
                 identity: run.identity.clone(),
@@ -2037,6 +2089,26 @@ impl crate::runtime::TabiHost for V2Host {
                 },
             ));
         }
+        // Ingest-phase tracking (§5.9 / IngestPhase docs): any bridge op that is not a pure
+        // window reader marks the open staged window's ingest MATH as begun — the next window
+        // (or batch read, or slice close) is then the epilogue boundary.
+        if let IngestPhase::Consuming { math_seen: false } = self.ingest_phase {
+            let window_reader = matches!(
+                import,
+                "upd_sections@1"
+                    | "upd_kind@1"
+                    | "upd_bytes_len@1"
+                    | "upd_read_bytes@1"
+                    | "upd_tensor@1"
+                    | "drop@1"
+                    | "metric@1"
+                    | "log@1"
+                    | "abi_minor@1"
+            );
+            if !window_reader {
+                self.ingest_phase = IngestPhase::Consuming { math_seen: true };
+            }
+        }
         self.charge_op(import)
     }
     fn stash_trap(&mut self, t: Trap) {
@@ -2162,7 +2234,7 @@ mod tests {
             accountable_staged_bytes: 0,
             tabi: None,
             slice_pass_open: false,
-            slice_ingested: false,
+            ingest_phase: IngestPhase::Idle,
             sealed_containers: 0,
             signing,
             identity: RunIdentity {
