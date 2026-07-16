@@ -17,8 +17,8 @@
 //   driver's config source is the v1 envelope's [data]/[phases], which envelope v2 does not carry;
 //   the v1 opener refuses genesis bytes and the schema sniff routes v2 away from the v1 path.
 //
-// The cell-6 native-coordinator adapter (v2 × native × v2) is NOT retired here — D1 is
-// building/threading it; retirement happens after D1's merge.
+// The cell-6 native-coordinator adapter (v2 × native × v2) WAS retired at D2 (decisions D3
+// cell 6): a genesis run's coordination is its wasm coordinator module (cell 8).
 //
 // Dev/test harness: shells `cargo build` for the guests (the established pattern).
 #![allow(clippy::disallowed_methods)]

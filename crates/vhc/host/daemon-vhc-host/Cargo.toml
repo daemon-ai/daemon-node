@@ -19,7 +19,7 @@ path = "src/bin/daemon-vhc.rs"
 
 # A minimal, telemetry-free device-limits readout (C2 fleet validation). Cross-builds + LINKS under
 # MinGW (unlike the full worker, whose always-on `sentry-rust-minidump` path pulls an unresolved
-# UCRT symbol on windows-gnu — see swarm-ledger-p2-c2). Runs the same `daemon_vhc_host::autotune` probe
+# UCRT symbol on windows-gnu — see swarm-ledger-p2-c2). Runs the same `daemon_vhc_host::probe` code
 # the worker's `Probe` path uses, so the reported DeviceLimits are identical to a live `Probe`.
 [[bin]]
 name = "daemon-vhc-probe"
@@ -59,8 +59,9 @@ ciborium = { workspace = true }
 # (A2 dependency INVERSION, refactor §5 A2 item 3): the daemon-vhc-session dep is GONE — the host
 # no longer links run policy; the session links the host (architecture §7: SESS → HOSTC), and
 # `wasm_backend.rs` (the TrainerBackend seam impl) moved to the session with it. The session
-# remains a DEV-dependency only (tests that drive WasmBackend/the A0 fixture), which cargo permits
-# alongside the session→host normal edge; xtask's vhc_dep_check enforces the runtime direction.
+# remains a DEV-dependency only (the v2 parity/data-fetch suites need its protocol types), which
+# cargo permits alongside the session→host normal edge; xtask's vhc_dep_check enforces the runtime
+# direction.
 # (A2 worker-bin split): daemon-vhc-net, daemon-provision, tokio, daemon-telemetry, and the
 # optional daemon-egress/async-trait pair were worker-bin-only deps — they moved to
 # `crates/vhc/bins/daemon-vhc-worker` with the bin. The lib keeps none of them.
@@ -130,9 +131,10 @@ cuda = ["burn/cuda", "dep:cudarc"]
 # dependency direction stays observe → host (the replay verifiers drive modules through the host
 # runtime), which A2's verifier wiring adds — never the reverse as a normal dep.
 daemon-vhc-observe = { workspace = true }
-# Test-only since the A2 inversion: the determinism/fixture/parity tests drive `WasmBackend`
-# (now session-owned) and the frozen worker protocol types. A dev-dep beside the session→host
-# normal edge is cargo-legal and carries no runtime direction.
+# Test-only since the A2 inversion: the v2 parity/data-fetch suites and the A0 refusal fixture
+# (`v2_parity.rs`, `v2_data_fetch.rs`, `a0_frozen_fixture.rs`) consume the session's data/protocol
+# types. A dev-dep beside the session→host normal edge is cargo-legal and carries no runtime
+# direction.
 daemon-vhc-session = { workspace = true }
 # Test-only: hand-built wasm fixtures (the driver-selection negative tests) are assembled with
 # `wasm-encoder` — precise control over import namespaces + the `da_abi` constant, with no

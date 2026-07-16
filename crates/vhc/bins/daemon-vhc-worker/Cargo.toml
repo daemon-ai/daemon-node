@@ -21,8 +21,8 @@ path = "src/main.rs"
 [dependencies]
 # The shared ABI contract (driver-selection vocabulary + refusal taxonomy) the assess path names.
 daemon-vhc-abi = { workspace = true }
-# The host worker runtime this binary drives: `WasmBackend`, driver selection (`select_driver`),
-# the autotune/device probe, `EngineConfig`, and the per-backend lanes (forwarded features below).
+# The host worker runtime this binary drives: driver selection (`select_driver`), the device
+# probe, `EngineConfig`, and the per-backend lanes (forwarded features below).
 daemon-vhc-host = { workspace = true }
 # The R↔E seam + the frozen node↔worker wire (`daemon_vhc_session::protocol`) this binary speaks.
 daemon-vhc-session = { workspace = true }
@@ -59,7 +59,7 @@ daemon-egress = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 
 # Per-backend lane selection: this bin crate FORWARDS its lanes into `daemon-vhc-host`, whose lib
-# code (`burn_backend.rs`/`runtime.rs`/`autotune.rs`) is what the features actually gate — the
+# code (`burn_backend.rs`/`runtime.rs`/`probe.rs`) is what the features actually gate — the
 # `cfg(feature = …)` blocks in this binary's own `backend.rs`/`main.rs` select the matching
 # `BackendKind` at spawn. Feature names are unchanged from the pre-split `daemon-vhc-host` bin
 # lanes, so `--features swarm-net,wgpu` invocations only re-point `-p`.

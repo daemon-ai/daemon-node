@@ -1,7 +1,7 @@
 # Swarm training guests — experiment modules
 
 This directory is a **separate Cargo workspace** (excluded from the root `daemon-node` workspace) of
-`wasm32-unknown-unknown` experiment modules. Each is a `cdylib` the `daemon-train` host instantiates
+`wasm32-unknown-unknown` experiment modules. Each is a `cdylib` the `daemon-vhc-host` runtime instantiates
 in a wasmtime sandbox and drives through the tensor ABI (`tabi@1`). The guest is untrusted, sandboxed
 code: it can only call the frozen `tabi@1` import vocabulary, under a phase-legality table and
 fuel / epoch / memory / op-count budgets (swarm-tensor-abi-spec.md §2, §3.5, §8).
@@ -9,7 +9,8 @@ fuel / epoch / memory / op-count budgets (swarm-tensor-abi-spec.md §2, §3.5, �
 Members:
 
 - `tiny-llama` — the reference LLaMA-family decoder (the shipped preset), a one-line
-  `experiment!(TinyLlama)` over `daemon_train_sdk::models::TinyLlama`.
+  `experiment!(TinyLlama)` over `daemon_vhc_sdk::models::TinyLlama`.
+
 ## Building
 
 Guests build via the repo `xtask` (which runs `cargo build --release --target
@@ -22,18 +23,18 @@ nix develop --command cargo run -p xtask -- build-guests
 ```
 
 Artifacts land in `guests/target/wasm32-unknown-unknown/release/<name>.wasm` (gitignored). The
-`daemon-train` host tests locate them via `SWARM_TEST_GUEST_DIR` if set, else this conventional path,
+`daemon-vhc-host` tests locate them via `SWARM_TEST_GUEST_DIR` if set, else this conventional path,
 building on demand if absent. Release modules are size-tuned (`opt-level = "s"`, LTO, strip) and stay
 well under a few hundred KB.
 
 ## Authoring an experiment
 
-An experiment implements `daemon_train_sdk::Experiment` and is wired to the `da_*` exports with the
+An experiment implements `daemon_vhc_sdk::Experiment` and is wired to the `da_*` exports with the
 `experiment!` macro. The SDK's safe wrappers map 1:1 onto `tabi@1`; nothing here computes tensor math
 itself — the host does, behind the ABI.
 
 ```rust
-use daemon_train_sdk::prelude::*;
+use daemon_vhc_sdk::prelude::*;
 
 struct MyExperiment { w: Param, m: Persistent, v: Persistent /* … */ }
 
@@ -57,7 +58,7 @@ impl Experiment for MyExperiment {
     fn ingest(&mut self, round: u64, updates: &UpdatesView) { /* profile.ingest(&params, updates) */ }
 }
 
-daemon_train_sdk::experiment!(MyExperiment);
+daemon_vhc_sdk::experiment!(MyExperiment);
 ```
 
 ### Lanes (the bit-exactness contract)
@@ -70,7 +71,7 @@ daemon_train_sdk::experiment!(MyExperiment);
 
 ### Comm profiles
 
-Reuse a first-party profile (`daemon_train_sdk::profiles`) rather than hand-rolling the compression:
+Reuse a first-party profile (`daemon_vhc_sdk::profiles`) rather than hand-rolling the compression:
 
 - `SparseLoco` — chunked top-k + 2-bit absmax values + error feedback (the consumer-uplink flagship).
 - `DiLoCo` — dense/int8 pseudo-gradient + outer (Nesterov) SGD on a **replicated** det momentum.
@@ -95,8 +96,8 @@ The SDK's `sim` feature swaps the `tabi@1` extern block for an in-crate CPU back
 is unit-testable natively:
 
 ```
-nix develop --command cargo test -p daemon-train-sdk --features sim
+nix develop --command cargo test -p daemon-vhc-sdk --features sim
 ```
 
-`daemon-train`'s host integration tests then run the same model through the real wasm sandbox
-(`cargo test -p daemon-train`), including the `WasmBackend` cross-peer determinism suite.
+`daemon-vhc-host`'s integration suites then run the built guest modules through the real wasm
+sandbox (`cargo run -p xtask -- swarm-ci-det` builds the guests and runs those suites).

@@ -12,8 +12,8 @@
 //   - an under-claimer trapping ATTRIBUTABLY at its own hard-accountable cap at run time;
 //   - determinism: same (config, grants) → byte-identical claim across whole assessments.
 //
-// The v1 path's autotune admission is byte-for-byte untouched — pinned by the A0 frozen-fixture
-// lane, not re-tested here.
+// The v1 path's typed refusal (AbiUnsupportedMajor since the Phase-E sunset) is pinned by the A0
+// frozen-fixture lane, not re-tested here.
 //
 // Dev/test harness: shells `cargo build` for the guests (same pattern as worker_protocol.rs).
 #![allow(clippy::disallowed_methods)]

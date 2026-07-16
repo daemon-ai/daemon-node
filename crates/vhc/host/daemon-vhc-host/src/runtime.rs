@@ -39,7 +39,7 @@ use crate::TrainError;
 /// The default is [`BackendKind::Cpu`] — the frozen fixed-order fp32 tape (`CpuBackend`), the MVP
 /// cross-peer bit-identity engine. [`BackendKind::BurnNdarray`] selects the burn-ndarray autodiff
 /// engine ([`crate::burn_backend::BurnBackend`]); G2 adds a `Wgpu` arm behind the `wgpu` feature.
-/// Nothing burn leaks across the `TrainerBackend`/`WasmBackend` seam — selection is data only.
+/// Nothing burn leaks across the session's `TrainerBackend` seam — selection is data only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BackendKind {
     /// The `CpuBackend` fixed-order fp32 tape (MVP behavior; det lane is bit-exact everywhere).

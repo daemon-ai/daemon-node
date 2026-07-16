@@ -42,7 +42,7 @@ pub struct DeviceLimits {
     /// the pre-UMA behavior.
     pub shared_mb: u64,
     /// Whether the device shares host DRAM (an integrated/unified GPU, or the CPU lane — from
-    /// `AdapterInfo.device_type == IntegratedGpu | Cpu`). When set, the verdict treats device +
+    /// `AdapterInfo.device_type == IntegratedGpu | Cpu`). When set, the budget math treats device +
     /// host footprints as competing for ONE physical DRAM pool (a joint budget), instead of two
     /// independent VRAM / RAM budgets. Additive; `Default` = `false` preserves the discrete path.
     pub unified: bool,
@@ -86,7 +86,7 @@ pub struct WgpuProbe {
     /// "Cpu"). Debug-formatted so no direct `wgpu`-type dependency is needed.
     pub device_type: String,
     /// Whether this is a unified-memory device (`device_type` is `IntegratedGpu` or `Cpu`): the GPU
-    /// shares host DRAM, so the autotune verdict uses a joint memory pool (see [`DeviceLimits`]).
+    /// shares host DRAM, so the budget math uses a joint memory pool (see [`DeviceLimits`]).
     pub unified: bool,
 }
 
@@ -180,7 +180,7 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
 /// it is fixture-tested on every platform; the `catch_unwind`-wrapped driver query
 /// ([`probe_cuda`]) is feature-gated.
 ///
-/// `shared_mb = 0` / `unified = false` put the [`Autotune::verdict`] on the discrete path (dedicated
+/// `shared_mb = 0` / `unified = false` put the budget math on the discrete path (dedicated
 /// VRAM is the whole GPU budget; the joint-pool UMA math never applies), matching the P2 probe matrix
 /// for the 4090 (24 GB discrete).
 #[must_use]
@@ -198,7 +198,7 @@ pub fn cuda_device_limits(vram_mb: u64, max_alloc_mb: u64, ram_mb: u64) -> Devic
 ///
 /// The CUDA driver DOES expose total VRAM (unlike wgpu), so [`Self::vram_mb`] is the real dedicated
 /// memory. CUDA has no wgpu-style per-buffer ceiling (a single `cudaMalloc` may span most of VRAM), so
-/// [`Self::max_alloc_mb`] reports total VRAM as an honest upper bound (the verdict's per-buffer gate
+/// [`Self::max_alloc_mb`] reports total VRAM as an honest upper bound (the per-buffer gate
 /// then only rejects a single tensor larger than the whole card). Discrete NVIDIA ⇒ `unified = false`.
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,7 +212,7 @@ pub struct CudaProbe {
     pub max_alloc_mb: u64,
     /// The device name (`cuDeviceGetName`, e.g. "NVIDIA GeForce RTX 4090").
     pub adapter: String,
-    /// Discrete NVIDIA GPUs do not share host DRAM: always `false` (the verdict's discrete path).
+    /// Discrete NVIDIA GPUs do not share host DRAM: always `false` (the discrete budget path).
     pub unified: bool,
 }
 
@@ -395,7 +395,7 @@ pub struct DxgiAdapterMemory {
 ///   the live LOCAL budget is the shared-pool grant, statically capped by `SharedSystemMemory`);
 ///   **discrete** → **0** (NON_LOCAL spill is PCIe-speed and contributes 0 to the effective GPU
 ///   budget by default, per the program's discrete-spill rule — the NON_LOCAL budget is recorded on
-///   [`DxgiAdapterMemory`] for telemetry, not fed to the verdict).
+///   [`DxgiAdapterMemory`] for telemetry, not fed to the budget math).
 /// - `max_alloc_mb` ← wgpu `max_buffer_size` (passed in; the DX12 `i32::MAX` constant when wgpu is
 ///   absent) — the per-tensor gate, unchanged.
 /// - `ram_mb` ← `GlobalMemoryStatusEx().ullTotalPhys` (passed in).
@@ -403,10 +403,10 @@ pub struct DxgiAdapterMemory {
 /// Returns `None` for a WARP / software adapter (the caller skips it during enumeration).
 ///
 /// **VGM safety:** on Variable-Graphics-Memory APUs `dedicated_video` can present tens of GB of
-/// unified RAM; because the [`Autotune::verdict`] unified path clamps the joint pool to
+/// unified RAM; because the unified-path budget math clamps the joint pool to
 /// `min(vram + 90%·shared, ram)`, the physical-RAM ceiling caps the inflated VRAM figure — the
-/// design's "never conflate configured allocation with physical RAM" rule is enforced by the
-/// verdict, and `ram_mb` is the true physical bound.
+/// design's "never conflate configured allocation with physical RAM" rule holds, and `ram_mb` is
+/// the true physical bound.
 #[must_use]
 pub fn windows_device_limits(
     adapter: &DxgiAdapterMemory,

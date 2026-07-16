@@ -6,8 +6,8 @@
 //! Admission is a funnel **ordered by cost and bracketed by the owner at both ends**: cheap local
 //! policy gates first, the claim-dependent resource authorization last. No later stage runs before
 //! an earlier one passes; nothing before stage 4 fetches or executes guest code (refactor
-//! invariant 8). [`admit_v2`] implements the stages for the major-2 path; the v1 path's
-//! autotune-based admission is byte-for-byte untouched (it retires only at the Phase-E sunset).
+//! invariant 8). [`admit_v2`] implements the stages for the major-2 path — the only admission
+//! path since the Phase-E sunset retired the v1 driver's autotune-based admission.
 //!
 //! ## The Phase-A pre-screen branch (recorded determination — decisions D3 cell 5 / D7; ABI §9.3)
 //!
@@ -443,7 +443,8 @@ pub fn admit_v2(
     if selection.driver != CandidateDriver::V2 {
         return Err(FunnelRefusal::local(
             4,
-            "admit_v2 is the major-2 funnel; the v1 path keeps autotune admission (refactor §5 A2)",
+            "admit_v2 is the major-2 funnel; no other driver is admissible (the v1 driver \
+             retired at the Phase-E sunset)",
         ));
     }
     let module = Module::new(worker.engine(), wasm)

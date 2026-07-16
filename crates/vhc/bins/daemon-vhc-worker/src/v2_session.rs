@@ -19,9 +19,9 @@
 //!   the original signed bytes as tag-12 evidence. (Worker-plane §12.1 v2 frames verify through
 //!   `daemon_vhc_session::v2_attach` — the same seam, different wire.)
 //! - **Batch staging (corpus-backed since B2)**: the plumbing stages REAL token windows cut
-//!   from a corpus — the same `Corpus` shape the live fetch path (`live.rs::build_corpus`,
-//!   fetch-by-hash + blake3 verify + content cache) yields; the in-process t2 run assembles it
-//!   deterministically instead of fetching. Window arithmetic mirrors the module's own SDK math
+//!   from a corpus — the same `Corpus` shape the retired v1 live fetch path (`live.rs`,
+//!   fetch-by-hash + blake3 verify + content cache) used to yield; the in-process t2 run assembles
+//!   it deterministically instead of fetching. Window arithmetic mirrors the module's own SDK math
 //!   (proto assignment + the same slicing — windowing is MODULE policy, the plumbing stages
 //!   content in the module's training order); the kind-1 staging encoding is unchanged.
 //! - **Inline replay soak** (refactor §12.6): after the run, the recorded journal is re-driven
@@ -51,7 +51,8 @@ use daemon_vhc_session::protocol::Event;
 // adapter (`RunConfig::from_genesis`) — was RETIRED at D2 (decisions D3 cell 6): a genesis run's
 // coordination is its wasm coordinator module (mixed-fleet cell 8, pinned in the testkit's
 // cell-8 whole-run lanes). This self-driven t2 join keeps only the v1-envelope form (cell 5),
-// which retires with the v1 path at the Phase-E sunset.
+// which SURVIVED the Phase-E sunset (D5 retired the v1 driver, not the v1 envelope) and retires
+// when the in-process join re-seats onto the wasm coordinator (cell 8).
 
 /// The Phase-A derived grants document (§2.6 stand-in until node-side lane config lands): the
 /// admitted channel table + the worlds the Phase-A driver links. Deterministic, so assess and
@@ -105,9 +106,8 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
 /// The t2 run's **artifact store** — the one fetch path (B2 tier-d unification). Every corpus
 /// byte the session stages AND every guest `data@2::fetch` is answered from here, through
 /// [`T2Artifacts::fetch`]'s single fetch-and-verify discipline: content addressed by the
-/// committed blake3, verified on every read (exactly what `live.rs::fetch_cached` + the
-/// resolver do against a real store — this is the in-process seat of the same mechanism, not a
-/// second path).
+/// committed blake3, verified on every read (exactly what the artifact resolver does against a
+/// real store — this is the in-process seat of the same mechanism, not a second path).
 struct T2Artifacts {
     by_hash: std::collections::HashMap<[u8; 32], Vec<u8>>,
 }
@@ -133,9 +133,8 @@ impl T2Artifacts {
 }
 
 /// Build the t2 run's corpus artifacts: deterministic small-vocab shards + their manifest, as
-/// content-addressed blobs — the in-process stand-in for the envelope's artifact map (the live
-/// path fetches the same shapes by hash through `live.rs::build_corpus`). Returns the store and
-/// the manifest's committed hash.
+/// content-addressed blobs — the in-process stand-in for the envelope's artifact map. Returns the
+/// store and the manifest's committed hash.
 ///
 /// Tokens are embedding indices, so the vocabulary is strictly below the guest model's
 /// (`TinyLlamaCfg::default().vocab` = 64).

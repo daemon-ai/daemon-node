@@ -102,8 +102,8 @@ async fn supervisor_respawn() {
 /// resume + rejoin re-enter at a boundary — over the **same** worker (pause/resume is churn, not a
 /// crash, so there is no respawn). This fixture-worker test pins the supervision semantics (no
 /// respawn on pause/resume); the **real** `daemon-vhc-worker` preemption (wasm VRAM-free
-/// pause/resume via `WasmBackend`) is exercised in `daemon-vhc-host/tests/worker_protocol.rs`
-/// (`daemon-vhc-supervisor` cannot depend on `daemon-vhc-host` — that would be a dependency cycle).
+/// pause/resume) is exercised in `bins/daemon-vhc-worker/tests/worker_protocol.rs`
+/// (`daemon-vhc-supervisor` cannot depend on the worker's host stack — that would be a cycle).
 #[tokio::test]
 async fn preemption_as_churn_pauses_and_rejoins_without_respawn() {
     let state = state_path("preempt");

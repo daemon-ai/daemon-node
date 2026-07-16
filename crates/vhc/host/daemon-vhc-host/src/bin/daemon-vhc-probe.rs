@@ -13,7 +13,7 @@
 //! three-platform probe matrix end-to-end. It links **none** of the worker's stdio/crash-reporting
 //! stack (the always-on `sentry-rust-minidump` native-minidump path does not link under MinGW — see
 //! swarm-ledger-p2-c2), so this is the linkable Windows validation artifact. The actual VRAM/UMA
-//! decision logic is the shared `autotune` code, so the numbers are identical to a live `Probe`.
+//! decision logic is the shared `probe` code, so the numbers are identical to a live `Probe`.
 
 fn main() {
     println!("daemon-vhc-probe — device limits (swarm P2 C2)");

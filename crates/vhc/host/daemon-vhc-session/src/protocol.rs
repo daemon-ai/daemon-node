@@ -420,7 +420,7 @@ pub struct CorpusRef {
 pub struct EngineParams {
     /// Inner steps per round (§5.1 cadence).
     pub steps_per_round: u32,
-    /// Micro-batch (sequences) within an inner step (the assess verdict overrides this at runtime).
+    /// Micro-batch (sequences) within an inner step.
     pub micro_batch: u32,
     /// Fetch-recovery budget before a stalled peer leaves for the epoch (§6.4).
     pub stall_rounds_max: u32,

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The `WasmBackend` construction / assess / probe side of the worker (§6.5, §10.2).
+//! The assess / probe side of the worker (§6.5, §10.2).
 //!
 //! Owns the `Probe` hardware report, the `AssessRun` envelope→`(config, module)` resolution, and the
-//! meta-mode eligibility pass. **G2** (Wave 2) evolves this file: real GPU `Hardware` numbers, VRAM
-//! autotune / OOM probe, and the burn-wgpu backend behind `WasmBackend::assess`.
+//! v2 claim()-funnel eligibility pass ([`assess_v2`]). (The v1 `WasmBackend` construction / autotune
+//! assess this file also carried retired with the v1 driver at the Phase-E sunset.)
 
 use daemon_vhc_abi::TABI_IMPORTS;
 use daemon_vhc_host::probe::DeviceLimits;
@@ -14,8 +14,8 @@ use daemon_vhc_net::{ArtifactRef, ArtifactResolver};
 use daemon_vhc_proto::{from_canonical_slice, SignedEnvelope};
 use daemon_vhc_session::protocol::{Eligibility, Hardware, WorkerCapabilities};
 
-/// A large sentinel (in MiB) used when a resource dimension is unknown, so the autotune verdict does
-/// not spuriously reject on an unprobed number (`u64::MAX / MiB`).
+/// A large sentinel (in MiB) used when a resource dimension is unknown, so the admission budget math
+/// does not spuriously reject on an unprobed number (`u64::MAX / MiB`).
 const UNKNOWN_BUDGET_MB: u64 = u64::MAX / (1 << 20);
 
 /// The experiment inputs a run resolves to: the `[experiment.config]` CBOR + the module `.wasm`,
@@ -695,12 +695,13 @@ pub(crate) fn hardware() -> Hardware {
     }
 }
 
-/// The device budget the autotune verdict is computed against (Merge-2 UMA fix).
+/// The device budget the admission math is computed against (Merge-2 UMA fix) — post-sunset it
+/// feeds the v2 claim funnel's [`daemon_vhc_host::v2::DeviceProfile`].
 ///
 /// With the `wgpu` feature + a usable adapter: `vram_mb` = sysfs dedicated VRAM (true lower bound),
 /// `shared_mb` = sysfs GTT (the unified spillover pool), `max_alloc_mb` = the wgpu `max_buffer_size`
 /// per-buffer ceiling, and `unified` = the adapter's device-type (IntegratedGpu/Cpu). On a unified
-/// device the verdict then treats VRAM+GTT+RAM as one physical DRAM pool instead of rejecting
+/// device the budget math then treats VRAM+GTT+RAM as one physical DRAM pool instead of rejecting
 /// against the 2047 MiB per-buffer clamp. Without a GPU, the CPU lane runs in host RAM (no separate
 /// VRAM constraint). Unknown dimensions use a large sentinel so an unprobed number never rejects.
 pub(crate) fn device_limits() -> DeviceLimits {
