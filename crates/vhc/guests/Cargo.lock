@@ -4527,14 +4527,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "test-abi-basic"
-version = "0.0.1"
-dependencies = [
- "daemon-vhc-sdk",
- "serde",
-]
-
-[[package]]
 name = "test-bridge-v2"
 version = "0.0.1"
 dependencies = [

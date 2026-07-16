@@ -10,8 +10,6 @@ Members:
 
 - `tiny-llama` — the reference LLaMA-family decoder (the shipped preset), a one-line
   `experiment!(TinyLlama)` over `daemon_train_sdk::models::TinyLlama`.
-- `test-abi-basic` — a tiny ABI-surface exerciser used by the host runtime tests.
-
 ## Building
 
 Guests build via the repo `xtask` (which runs `cargo build --release --target
