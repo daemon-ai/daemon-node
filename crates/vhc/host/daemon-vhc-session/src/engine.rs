@@ -50,7 +50,10 @@ use daemon_vhc_proto::{
 };
 
 use crate::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
-use crate::checkpoint::{load_checkpoint, save_checkpoint, CheckpointManifest, ReplayStep};
+use crate::checkpoint::{
+    load_checkpoint, save_checkpoint, save_typed_checkpoint, CheckpointCapture, CheckpointIdent,
+    CheckpointManifest, ReplayStep,
+};
 use crate::data::{slice_interval, BatchInterval, Corpus};
 use crate::seam::{PayloadKey, RoundId, RunId};
 use crate::SwarmRunError;
@@ -160,6 +163,17 @@ pub enum EngineEvent {
         /// The checkpoint manifest (round, blake3, digest).
         manifest: CheckpointManifest,
     },
+    /// **Additive (E1, Phase E).** This peer also published the **typed** sectioned checkpoint (the
+    /// parallel content-addressed object, architecture §5.3) at the same cadence boundary. Emitted
+    /// only when [`RoundEngine::with_typed_checkpoints`] enabled the typed lane. The pointer's
+    /// `blake3` is the typed manifest's content address — the identity attestations sign over and a
+    /// late joiner fetches by (`load_typed_checkpoint`).
+    TypedCheckpointed {
+        /// The round captured.
+        round: RoundId,
+        /// The coordinator-facing pointer to the typed manifest (`blake3` = its content address).
+        pointer: CheckpointManifest,
+    },
     /// **Additive (R, P3).** This (rejoining) peer replayed one retained round forward from the
     /// latest checkpoint during a live resync (§9 I1). Emitted per replayed round by
     /// [`RoundEngine::resync_from_checkpoint`]; the live-attach forwarder surfaces it as
@@ -239,6 +253,10 @@ pub struct RoundEngine<C, P, B> {
     /// Consecutive `RoundOpen`s observed while stalled (the §6.4 rung-2 budget).
     stalled_rounds: u32,
     last_ingested: Option<RoundId>,
+    /// When set, `maybe_checkpoint` ALSO publishes the typed sectioned checkpoint (the E1 parallel
+    /// content-addressed object, architecture §5.3) under this execution identity. `None` (default)
+    /// keeps the frozen opaque-only cadence, so every existing consumer is behavior-identical.
+    typed_checkpoints: Option<CheckpointIdent>,
 }
 
 impl<C, P, B> RoundEngine<C, P, B>
@@ -279,7 +297,19 @@ where
             straggling: false,
             stalled_rounds: 0,
             last_ingested: None,
+            typed_checkpoints: None,
         }
+    }
+
+    /// Enable the E1 **typed checkpoint lane** (Phase E, architecture §5.3): at every checkpoint
+    /// cadence boundary the engine additionally publishes the typed sectioned manifest (safetensors
+    /// module section + opaque worker-local restore section, content-addressed on the payload
+    /// plane) under `ident`, emitting [`EngineEvent::TypedCheckpointed`]. Additive to the frozen
+    /// engine surface — the opaque `Checkpointed` path is byte-identical with or without this.
+    #[must_use]
+    pub fn with_typed_checkpoints(mut self, ident: CheckpointIdent) -> Self {
+        self.typed_checkpoints = Some(ident);
+        self
     }
 
     /// Enable bounded-concurrency barrier fetch over B1's [`DownloadScheduler`] (spec §6.4, the
@@ -740,6 +770,29 @@ where
         let manifest =
             save_checkpoint(&self.store, &self.cfg.run, &self.backend, round, digest).await?;
         self.emit(EngineEvent::Checkpointed { round, manifest });
+        // The E1 typed lane (opt-in, additive): the parallel sectioned, content-addressed object.
+        // The data cursor / journal position are engine-visible proxies here: the last-ingested
+        // round is the corpus-window cursor at round granularity, and the v1 engine has no A1
+        // journal — E2/E3 thread the real journal ordinal through this seam.
+        if let Some(ident) = self.typed_checkpoints {
+            let typed = save_typed_checkpoint(
+                &self.store,
+                &self.cfg.run,
+                &ident,
+                &self.backend,
+                CheckpointCapture {
+                    round,
+                    digest,
+                    data_cursor: round,
+                    journal_position: 0,
+                },
+            )
+            .await?;
+            self.emit(EngineEvent::TypedCheckpointed {
+                round,
+                pointer: typed.pointer,
+            });
+        }
         Ok(())
     }
 
@@ -1045,6 +1098,118 @@ mod tests {
         assert!(
             checkpoint_rounds.iter().all(|r| (r + 1).is_multiple_of(2)),
             "checkpoints only at cadence boundaries, got {checkpoint_rounds:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn typed_checkpoint_lane_publishes_and_late_joiner_restores() {
+        // E1: with the typed lane enabled, each cadence boundary ALSO publishes the typed sectioned
+        // manifest (safetensors module section + opaque worker-local restore) — and a late joiner
+        // restores from the live-published typed object + catches up over the captured records to
+        // the run's final agreed digest (the refactor-§9 late-join shape over the REAL engine
+        // cadence). The opaque Checkpointed lane is asserted unchanged beside it.
+        use crate::checkpoint::{
+            load_typed_checkpoint, resync_by_replay, steps_from_round_records,
+            MODULE_SCHEMA_SAFETENSORS,
+        };
+        use daemon_vhc_proto::messages::{Locator, RoundRecord as ProtoRoundRecord};
+
+        let cfg = SwarmConfig {
+            checkpoint_every_rounds: 2,
+            typed_checkpoints: true,
+            ..SwarmConfig::small(6)
+        };
+        let run = run_swarm(cfg).await.unwrap();
+        assert!(run.all_agree());
+
+        // Both lanes emitted at every cadence boundary; the typed pointer's digest matches the
+        // opaque manifest's for the same round (one capture, two serializations).
+        let mut typed: std::collections::BTreeMap<RoundId, CheckpointManifest> =
+            std::collections::BTreeMap::new();
+        let mut opaque: std::collections::BTreeMap<RoundId, CheckpointManifest> =
+            std::collections::BTreeMap::new();
+        for (_peer, ev) in &run.events {
+            match ev {
+                EngineEvent::TypedCheckpointed { round, pointer } => {
+                    typed.insert(*round, *pointer);
+                }
+                EngineEvent::Checkpointed { round, manifest } => {
+                    opaque.insert(*round, *manifest);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            typed.contains_key(&1) && typed.contains_key(&3),
+            "typed checkpoints at the cadence boundaries, got {:?}",
+            typed.keys().collect::<Vec<_>>()
+        );
+        for (round, ptr) in &typed {
+            assert_eq!(
+                opaque[round].digest, ptr.digest,
+                "typed + opaque lanes capture the same digest at round {round}"
+            );
+        }
+
+        // A late joiner restores from the round-3 typed object and catches up over the captured
+        // round-4/5 records + payload plane to the final agreed digest.
+        let pointer = typed[&3];
+        let mut joiner = crate::backend::StubBackend::new();
+        joiner.build(b"late-joiner-unrelated-config").unwrap();
+        let manifest = load_typed_checkpoint(&run.store, &run.run, &mut joiner, &pointer)
+            .await
+            .expect("restore from the live-published typed checkpoint");
+        assert_eq!(
+            manifest
+                .section(daemon_vhc_sdk_consensus::checkpoint::SectionKind::Module)
+                .expect("module section")
+                .schema,
+            MODULE_SCHEMA_SAFETENSORS,
+            "the StubBackend's typed export rode the live cadence"
+        );
+
+        // Catch up over every captured record past the checkpoint. (The final round's record can
+        // race the harness teardown — same caveat as the cadence test above — so the target is the
+        // last round actually captured, not a fixed constant.)
+        let records: Vec<ProtoRoundRecord> = run
+            .records
+            .iter()
+            .filter(|(round, _)| **round > 3)
+            .map(|(round, entries)| {
+                let pairs: Vec<(PeerId, Hash)> = entries.iter().map(|e| (e.peer, e.hash)).collect();
+                ProtoRoundRecord {
+                    round: *round,
+                    set: daemon_vhc_proto::commit_set(&pairs).commitment(),
+                    drops: Vec::new(),
+                    next_seed: daemon_vhc_proto::Seed([0; 32]),
+                    set_locator: Locator::StoreKey(String::new()),
+                    inline: Some(entries.clone()),
+                }
+            })
+            .collect();
+        assert!(!records.is_empty(), "at least round 4 remains to catch up");
+        let last_round = records.last().expect("records").round;
+
+        // Resolve payloads from the shared store (content-addressed by (run, round, peer)).
+        let mut plane: std::collections::BTreeMap<Hash, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for record in &records {
+            for e in record.inline.iter().flatten() {
+                let key = PayloadKey::new(run.run.clone(), record.round, e.peer);
+                let bytes = run.store.get(&key, &e.hash).await.expect("payload bytes");
+                plane.insert(e.hash, bytes);
+            }
+        }
+        let steps = steps_from_round_records(&records, |h| plane.get(h).cloned()).unwrap();
+        let ckpt = joiner.checkpoint_save().unwrap();
+        let recovered = resync_by_replay(&mut joiner, &ckpt, &steps).unwrap();
+        let last_agreed = *run
+            .agreed_transcript()
+            .get(&last_round)
+            .expect("agreed digest for the last caught-up round");
+        assert_eq!(
+            recovered, last_agreed,
+            "the late joiner reaches the run's agreed digest at round {last_round}"
         );
     }
 

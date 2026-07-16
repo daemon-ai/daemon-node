@@ -213,7 +213,7 @@ impl TokenBatch {
     pub fn tinystories(b: u32) -> Self {
         use daemon_vhc_session::data::Corpus;
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../swarm/daemon-vhc-session/tests/fixtures/tinystories");
+            .join("../../host/daemon-vhc-session/tests/fixtures/tinystories");
         let manifest_json =
             std::fs::read_to_string(dir.join("manifest.json")).expect("read fixture manifest");
         let manifest =

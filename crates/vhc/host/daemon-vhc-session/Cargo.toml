@@ -52,6 +52,10 @@ daemon-vhc-net = { workspace = true }
 # xtask's vhc_dep_check enforces the direction). `wasm_backend.rs` (the TrainerBackend seam over
 # the wasm host) moved here with the inversion.
 daemon-vhc-host = { workspace = true }
+# The E1 checkpoint bridge (refactor §9; architecture §5.3): the state-dict ↔ safetensors converter
+# wired into the checkpoint path so the typed `module` section is a portable, content-addressed
+# safetensors serialization (host/* -> host/*, no sdk edge).
+daemon-vhc-safetensors = { workspace = true }
 # Observe drives the desync verdict (digest tally / `DesyncVerdict`, §9) the harness + checkpoint
 # resync trigger consume. Node-side std tool, `harness`-gated so it stays off the default
 # participant build. Path dep already in the frozen root `[workspace.dependencies]` (no root edit),
