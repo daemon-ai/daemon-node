@@ -35,6 +35,44 @@ pub fn tick(mut state: CoordinatorState, input: Input) -> (CoordinatorState, Vec
     (state, out)
 }
 
+/// Advance the coordinator by an **already-authenticated** message — the D2 thin `Authority`
+/// seam (a stub awaiting D1's `Authority` trait in this crate).
+///
+/// Rationale (architecture §4.2/§4.3): the wasm `coordinator-quorum` guest receives worker
+/// messages as **host-verified** `Frame` events — the host authenticated the §12 signed-frame
+/// envelope above the sandbox and delivers only the opaque payload + the (authenticated) sender,
+/// never a re-checkable ed25519 signature. So the guest cannot run [`tick`]'s `Input::Message`
+/// path (which re-verifies `sm.verify()`); it feeds the authenticated `(signer, version, payload)`
+/// here instead. Today's implicit trust is **`SingleKey`** — a frame from the host-authenticated
+/// sender is accepted — which is exactly what D1 will formalize; until then this seam is thin and
+/// deliberately isolated so D1's reconciliation is mechanical: it replaces the trust decision (who
+/// may send) with `Authority::accept`, leaving the dispatch below untouched.
+///
+/// The decision logic is **identical** to [`tick`]'s message path after signature verification
+/// (both funnel through the private `dispatch_payload`), so a native reference fed validly-signed
+/// frames and this guest fed the same host-authenticated payloads produce byte-identical outputs —
+/// the dual-compilation identity property (refactor §8/D2 acceptance).
+#[must_use]
+pub fn tick_authenticated(
+    mut state: CoordinatorState,
+    signer: PeerId,
+    version: SwarmProtoVersion,
+    payload: SwarmMessage,
+) -> (CoordinatorState, Vec<Output>) {
+    let mut out = Vec::new();
+    if version != state.config.proto_version {
+        out.push(Output::Reject(Rejection::VersionMismatch {
+            expected: state.config.proto_version,
+            got: version,
+        }));
+    } else if state.phase.is_halted() {
+        out.push(Output::Reject(Rejection::Halted(state.phase)));
+    } else {
+        dispatch_payload(&mut state, &mut out, signer, version, payload);
+    }
+    (state, out)
+}
+
 // ----- clock -----
 
 fn on_clock(state: &mut CoordinatorState, out: &mut Vec<Output>, now: u64) {
@@ -108,9 +146,21 @@ fn on_message(state: &mut CoordinatorState, out: &mut Vec<Output>, sm: SignedMes
         out.push(Output::Reject(Rejection::Halted(state.phase)));
         return;
     }
-    let signer = sm.signer;
-    let version = sm.version;
-    match sm.payload {
+    dispatch_payload(state, out, sm.signer, sm.version, sm.payload);
+}
+
+/// Dispatch an authenticated, phase-legal message to its per-type handler (the shared tail of the
+/// [`tick`] `Input::Message` path and the [`tick_authenticated`] seam). Both callers have already
+/// established version match, signature/authenticity, and non-halted phase — this is the pure
+/// decision logic, so the two entry paths make byte-identical decisions on identical payloads.
+fn dispatch_payload(
+    state: &mut CoordinatorState,
+    out: &mut Vec<Output>,
+    signer: PeerId,
+    version: SwarmProtoVersion,
+    payload: SwarmMessage,
+) {
+    match payload {
         SwarmMessage::Join(j) => on_join(state, out, signer, version, j),
         SwarmMessage::Commitment(c) => on_commitment(state, out, signer, c),
         SwarmMessage::Attestation(a) => on_attestation(state, out, signer, a),

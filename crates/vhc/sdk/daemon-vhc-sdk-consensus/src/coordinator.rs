@@ -41,7 +41,7 @@ pub use io::{AdmissionReject, ControlAction, ControlRequest, Input, Notice, Outp
 pub use state::{
     ClientState, CoordinatorState, Member, Phase, RoundRing, RoundState, NUM_STORED_ROUNDS,
 };
-pub use tick::tick;
+pub use tick::{tick, tick_authenticated};
 
 // Re-export the assignment seam so consumers get committee/batch math without a second import
 // (it is this crate's own lower layer; the coordinator does not fork it). Preserves the ergonomics
