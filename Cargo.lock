@@ -5077,6 +5077,7 @@ dependencies = [
  "daemon-vhc-net",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
+ "daemon-vhc-safetensors",
  "daemon-vhc-sdk-consensus",
  "figment",
  "futures",

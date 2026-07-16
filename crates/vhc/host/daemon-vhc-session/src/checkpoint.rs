@@ -21,6 +21,12 @@
 use std::sync::Arc;
 
 use daemon_vhc_proto::{blake3_hash, Hash, PeerId};
+use daemon_vhc_sdk_consensus::attestation::{
+    AttestationLedger, AttestationPolicy, JoinEligibility,
+};
+use daemon_vhc_sdk_consensus::checkpoint::{
+    CheckpointManifest as TypedCheckpointManifest, SectionKind,
+};
 
 use crate::backend::{StagedPayload, StateDigest, TrainerBackend};
 use crate::seam::{PayloadKey, RoundId, RunId};
@@ -31,6 +37,35 @@ use crate::SwarmRunError;
 /// The reserved payload-plane peer id under which a run's checkpoints are stored (never a real node
 /// identity — node pubkeys are ed25519 points, this sentinel is not).
 pub const CHECKPOINT_PEER: PeerId = PeerId([0xCC; PeerId::LEN]);
+
+/// Section-schema tag: the `module` section bytes are the backend's opaque `checkpoint_save` bytes
+/// (the authoritative bit-exact restore serialization).
+pub const MODULE_SCHEMA_OPAQUE: u64 = 1;
+/// Section-schema tag: the `module` section bytes are a safetensors serialization of the module's
+/// typed state dict (the portable, inspectable typed export — the E1 safetensors bridge).
+pub const MODULE_SCHEMA_SAFETENSORS: u64 = 2;
+/// Section-schema tag for the host-owned sections (consensus digest, data cursor, journal position).
+pub const HOST_SECTION_SCHEMA: u64 = 1;
+
+/// The payload-plane sentinel peer under which the typed checkpoint manifest itself is stored (a
+/// distinct reserved byte pattern, never a real identity — cf. [`CHECKPOINT_PEER`]).
+#[must_use]
+fn manifest_peer() -> PeerId {
+    let mut b = [0xCC; PeerId::LEN];
+    b[1] = 0xFF;
+    PeerId(b)
+}
+
+/// The payload-plane sentinel peer under which a typed checkpoint's section of `kind` is stored.
+/// Distinct per kind (`b[1] = kind.tag()`), and a manifest carries at most one section per kind, so
+/// the key is collision-free and deterministically reconstructible by a late joiner from the
+/// manifest alone.
+#[must_use]
+fn section_peer(kind: SectionKind) -> PeerId {
+    let mut b = [0xCC; PeerId::LEN];
+    b[1] = kind.tag() as u8;
+    PeerId(b)
+}
 
 /// The manifest of one checkpoint (§9): the round it captures, the blake3 of its bytes, and the
 /// post-round state digest (§5.6) it should reproduce on reload.
@@ -204,6 +239,345 @@ pub fn plan_resync(
     }
 }
 
+// -- E1: the typed checkpoint bridge (refactor §9; architecture §5.3) ---------------------------
+
+/// The cryptographic execution identity a typed checkpoint manifest carries (architecture §5.1),
+/// kept distinct from the payload-plane [`RunId`] *label* (D1 `RunLabel` vs `RunId`): the genesis
+/// hash, the epoch, and the producing module hash. E2/D0 thread the real values; a pre-D0 caller
+/// may pass `blake3(label)` / `epoch = 0` / the module blob hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointIdent {
+    /// The run identity (genesis hash, architecture §5.1).
+    pub run_id: Hash,
+    /// The epoch this checkpoint captures (transition-chain head).
+    pub epoch: u64,
+    /// The producing module hash.
+    pub module: Hash,
+}
+
+/// What one checkpoint captures at a round boundary: the round, the post-ingest state digest, and
+/// the two host-owned cursors (data cursor + journal position, architecture §5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointCapture {
+    /// The round this checkpoint captures (post-ingest state).
+    pub round: RoundId,
+    /// The post-round consensus-state digest (the det-lane agreement probe, §5.6).
+    pub digest: StateDigest,
+    /// How far this replica has consumed its corpus window.
+    pub data_cursor: u64,
+    /// The execution-identity journal ordinal the checkpoint captures (catch-up resumes here).
+    pub journal_position: u64,
+}
+
+/// A saved typed checkpoint: the [`TypedCheckpointManifest`] (architecture §5.3), its content
+/// address, and the coordinator-facing [`CheckpointManifest`] pointer (round + manifest hash + size
+/// + digest) — the pointer a coordinator record names, now referencing the *typed manifest*.
+#[derive(Clone, Debug)]
+pub struct TypedCheckpoint {
+    /// The sectioned, content-addressed manifest.
+    pub manifest: TypedCheckpointManifest,
+    /// The manifest's content address (blake3 of its canonical CBOR) — the checkpoint identity an
+    /// attestation signs over ([`daemon_vhc_sdk_consensus::attestation`]).
+    pub content_hash: Hash,
+    /// The coordinator-facing pointer, `blake3` = [`TypedCheckpoint::content_hash`].
+    pub pointer: CheckpointManifest,
+}
+
+fn to_proto_digest(d: StateDigest) -> daemon_vhc_proto::StateDigest {
+    daemon_vhc_proto::StateDigest(d.0)
+}
+
+/// Save a **typed** checkpoint (architecture §5.3, Phase E): assemble the sectioned manifest, wire
+/// the safetensors typed serialization into the `module` section when the backend exports a state
+/// dict, content-address every section + the manifest, and PUT them to the payload plane.
+///
+/// Sections (architecture §5.3): `consensus` (the det-lane digest — the consensus-canonical section
+/// a digest attestation signs), `module` (the module/role state — safetensors when
+/// [`TrainerBackend::export_state_dict`] is `Some`, else the opaque `checkpoint_save` bytes),
+/// `worker-local` (the opaque `checkpoint_save` bytes carried as the authoritative bit-exact
+/// restore serialization *whenever* the `module` section is the typed safetensors export),
+/// `data-cursor`, and `journal-position`. The authoritative restore path is therefore **never**
+/// weaker than today's opaque round-trip.
+///
+/// # Errors
+/// A backend serialization error, a store error, or a manifest-assembly error.
+pub async fn save_typed_checkpoint<P, B>(
+    store: &Arc<P>,
+    run: &RunId,
+    ident: &CheckpointIdent,
+    backend: &B,
+    capture: CheckpointCapture,
+) -> Result<TypedCheckpoint, SwarmRunError>
+where
+    P: PayloadStore,
+    B: TrainerBackend,
+{
+    let CheckpointCapture {
+        round,
+        digest,
+        data_cursor,
+        journal_position,
+    } = capture;
+    let opaque = backend
+        .checkpoint_save()
+        .map_err(|e| SwarmRunError::Lifecycle(format!("checkpoint_save: {e}")))?;
+    let typed = backend
+        .export_state_dict()
+        .map_err(|e| SwarmRunError::Lifecycle(format!("export_state_dict: {e}")))?;
+
+    let mut builder = TypedCheckpointManifest::builder(
+        ident.run_id,
+        ident.epoch,
+        round,
+        ident.module,
+        to_proto_digest(digest),
+    )
+    .section(
+        "consensus",
+        SectionKind::Consensus,
+        HOST_SECTION_SCHEMA,
+        digest.as_bytes(),
+    );
+
+    // The module section: the safetensors typed serialization when available (the E1 bridge), with
+    // the opaque bytes retained as the authoritative worker-local restore section; otherwise the
+    // opaque bytes are the module section directly.
+    let mut section_bytes: Vec<(SectionKind, Vec<u8>)> = Vec::new();
+    section_bytes.push((SectionKind::Consensus, digest.as_bytes().to_vec()));
+    if let Some(sd) = typed {
+        let st = sd
+            .to_safetensors()
+            .map_err(|e| SwarmRunError::Lifecycle(format!("safetensors serialize: {e}")))?;
+        builder = builder
+            .section(
+                "module",
+                SectionKind::Module,
+                MODULE_SCHEMA_SAFETENSORS,
+                &st,
+            )
+            .section(
+                "worker-local",
+                SectionKind::WorkerLocal,
+                MODULE_SCHEMA_OPAQUE,
+                &opaque,
+            );
+        section_bytes.push((SectionKind::Module, st));
+        section_bytes.push((SectionKind::WorkerLocal, opaque));
+    } else {
+        builder = builder.section("module", SectionKind::Module, MODULE_SCHEMA_OPAQUE, &opaque);
+        section_bytes.push((SectionKind::Module, opaque));
+    }
+
+    let cursor_bytes = data_cursor.to_le_bytes().to_vec();
+    let journal_bytes = journal_position.to_le_bytes().to_vec();
+    builder = builder
+        .section(
+            "data-cursor",
+            SectionKind::DataCursor,
+            HOST_SECTION_SCHEMA,
+            &cursor_bytes,
+        )
+        .section(
+            "journal-position",
+            SectionKind::JournalPosition,
+            HOST_SECTION_SCHEMA,
+            &journal_bytes,
+        );
+    section_bytes.push((SectionKind::DataCursor, cursor_bytes));
+    section_bytes.push((SectionKind::JournalPosition, journal_bytes));
+
+    let manifest = builder
+        .build()
+        .map_err(|e| SwarmRunError::Lifecycle(format!("checkpoint manifest: {e}")))?;
+
+    // Store each section on the payload plane under its per-kind sentinel key; the put returns the
+    // content hash, which MUST equal the hash the manifest declared.
+    for (kind, bytes) in &section_bytes {
+        let key = PayloadKey::new(run.clone(), round, section_peer(*kind));
+        let put = store.put(&key, bytes).await?;
+        let declared = manifest.section(*kind).expect("declared section").hash;
+        debug_assert_eq!(put, declared, "section {kind:?} hash");
+    }
+
+    // Store the manifest itself, content-addressed.
+    let wire = manifest
+        .to_wire()
+        .map_err(|e| SwarmRunError::Lifecycle(format!("manifest wire: {e}")))?;
+    let content_hash = blake3_hash(&wire);
+    let mkey = PayloadKey::new(run.clone(), round, manifest_peer());
+    store.put(&mkey, &wire).await?;
+
+    Ok(TypedCheckpoint {
+        pointer: CheckpointManifest {
+            round,
+            blake3: content_hash,
+            size: wire.len() as u64,
+            digest,
+        },
+        content_hash,
+        manifest,
+    })
+}
+
+/// Restore a **typed** checkpoint (architecture §5.3, Phase E): fetch + verify the manifest against
+/// the pointer's content hash, then restore the backend bit-exactly from the authoritative section
+/// (the `worker-local` opaque bytes when the module section is the typed safetensors export, else
+/// the opaque `module` section). The typed `module` safetensors section, when present, is fetched
+/// and parsed as an integrity check (it must decode as a valid state dict). Returns the decoded
+/// manifest.
+///
+/// # Errors
+/// A store / hash-verification error, a manifest decode/validate error, a malformed safetensors
+/// section, or a backend restore error.
+pub async fn load_typed_checkpoint<P, B>(
+    store: &Arc<P>,
+    run: &RunId,
+    backend: &mut B,
+    pointer: &CheckpointManifest,
+) -> Result<TypedCheckpointManifest, SwarmRunError>
+where
+    P: PayloadStore,
+    B: TrainerBackend,
+{
+    let mkey = PayloadKey::new(run.clone(), pointer.round, manifest_peer());
+    let wire = store.get(&mkey, &pointer.blake3).await?;
+    let manifest = TypedCheckpointManifest::from_wire(&wire)
+        .map_err(|e| SwarmRunError::Lifecycle(format!("manifest decode: {e}")))?;
+    manifest
+        .validate()
+        .map_err(|e| SwarmRunError::Lifecycle(format!("manifest validate: {e}")))?;
+    let content_hash = manifest
+        .content_hash()
+        .map_err(|e| SwarmRunError::Lifecycle(format!("manifest hash: {e}")))?;
+    if content_hash != pointer.blake3 {
+        return Err(SwarmRunError::Lifecycle(
+            "typed checkpoint manifest content hash != pointer".into(),
+        ));
+    }
+
+    // The authoritative bit-exact restore section: worker-local opaque bytes when present, else the
+    // module section (which is then guaranteed opaque).
+    let restore = manifest
+        .section(SectionKind::WorkerLocal)
+        .or_else(|| manifest.section(SectionKind::Module))
+        .ok_or_else(|| SwarmRunError::Lifecycle("checkpoint has no restore section".into()))?;
+    let restore_bytes = store
+        .get(
+            &PayloadKey::new(run.clone(), pointer.round, section_peer(restore.kind)),
+            &restore.hash,
+        )
+        .await?;
+    backend
+        .checkpoint_load(&restore_bytes)
+        .map_err(|e| SwarmRunError::Lifecycle(format!("checkpoint_load: {e}")))?;
+
+    // Integrity-check the typed safetensors module section, if that is what the module section is.
+    if let Some(module) = manifest.section(SectionKind::Module) {
+        if module.schema == MODULE_SCHEMA_SAFETENSORS {
+            let st = store
+                .get(
+                    &PayloadKey::new(
+                        run.clone(),
+                        pointer.round,
+                        section_peer(SectionKind::Module),
+                    ),
+                    &module.hash,
+                )
+                .await?;
+            daemon_vhc_safetensors::StateDict::from_safetensors(&st).map_err(|e| {
+                SwarmRunError::Lifecycle(format!("typed module section not valid safetensors: {e}"))
+            })?;
+        }
+    }
+
+    Ok(manifest)
+}
+
+// -- E1: late-join foundation (refactor §9) -----------------------------------------------------
+
+/// One candidate checkpoint a late joiner may restore from: its content address + the round it
+/// captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointCandidate {
+    /// The typed manifest content hash (the attestation subject + payload-plane identity).
+    pub content_hash: Hash,
+    /// The round the checkpoint captured (post-ingest).
+    pub round: RoundId,
+}
+
+/// The generalized late-join path shape (architecture §5.3; refactor §9): **admission → attested
+/// checkpoint → restore/`migrate` → record-replay catch-up**. This is the manifest/attestation
+/// layer E3 drives to full cold-join acceptance; it composes the E1 primitives — the attestation
+/// tiers ([`AttestationPolicy`]) for the "attested checkpoint" step and [`plan_resync`] (which rides
+/// the record archive / consensus replay from Phase B/D2) for the "record-replay catch-up" step.
+///
+/// D2's standby-coordinator drill is the same flow, so this reuses the same seams rather than
+/// inventing parallel ones (refactor §9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LateJoinPlan {
+    /// No join-eligible checkpoint yet: not enough digest attestations on any candidate. The joiner
+    /// waits and re-evaluates as attestations accrue (the K-digest gate, architecture §5.3).
+    AwaitAttested {
+        /// The eligibility verdict for the best candidate considered.
+        eligibility: JoinEligibility,
+    },
+    /// Restore from the attestation-preferred checkpoint, then catch up by record replay.
+    Restore {
+        /// The chosen checkpoint (restore-attested-preferred among join-eligible candidates).
+        checkpoint: Hash,
+        /// The round it captured.
+        from_round: RoundId,
+        /// How to reach `current_round` from there (replay vs wait-for-epoch), via [`plan_resync`].
+        catch_up: ResyncPlan,
+    },
+}
+
+/// Plan a late join (refactor §9): choose the attestation-preferred, K-digest-eligible checkpoint
+/// among `candidates`, then plan the record-replay catch-up to `current_round` under the payload
+/// `retention_rounds` floor. Returns [`LateJoinPlan::AwaitAttested`] if no candidate has gathered K
+/// digest attestations yet (initial join-eligibility is gated on the K-digest tier, architecture
+/// §5.3).
+#[must_use]
+pub fn plan_late_join(
+    policy: &AttestationPolicy,
+    ledger: &AttestationLedger,
+    candidates: &[CheckpointCandidate],
+    current_round: RoundId,
+    retention_rounds: u64,
+) -> LateJoinPlan {
+    let hashes: Vec<Hash> = candidates.iter().map(|c| c.content_hash).collect();
+    match policy.preferred_checkpoint(ledger, &hashes) {
+        Some(chosen) => {
+            let from_round = candidates
+                .iter()
+                .find(|c| c.content_hash == chosen)
+                .map_or(current_round, |c| c.round);
+            LateJoinPlan::Restore {
+                checkpoint: chosen,
+                from_round,
+                catch_up: plan_resync(from_round, current_round, retention_rounds),
+            }
+        }
+        None => {
+            // Report the best eligibility verdict observed for diagnostics.
+            let eligibility = hashes
+                .iter()
+                .map(|h| policy.join_eligibility(ledger, h))
+                .max_by_key(|e| match e {
+                    JoinEligibility::Eligible {
+                        digest_attestations,
+                    } => *digest_attestations,
+                    JoinEligibility::Ineligible { have, .. } => *have,
+                })
+                .unwrap_or(JoinEligibility::Ineligible {
+                    have: 0,
+                    need: policy.k_digest,
+                });
+            LateJoinPlan::AwaitAttested { eligibility }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +648,184 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SwarmRunError::Net(_)), "got {err:?}");
+    }
+
+    use daemon_vhc_proto::{peer_id, SigningKey};
+    use daemon_vhc_sdk_consensus::attestation::{
+        AttestationBody, AttestationLedger, AttestationPolicy, AttestationTier,
+    };
+    use daemon_vhc_sdk_consensus::checkpoint::SectionClass;
+
+    fn ident() -> CheckpointIdent {
+        CheckpointIdent {
+            run_id: blake3_hash(b"e1-run"),
+            epoch: 0,
+            module: blake3_hash(b"e1-module"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_checkpoint_round_trips_and_restores_bit_exactly() {
+        // Save a typed sectioned checkpoint (safetensors module + opaque worker-local + consensus /
+        // data-cursor / journal-position sections), reload it into a fresh backend, and reach the
+        // same digest on the next ingest — the authoritative restore is never weaker than opaque.
+        let store = temp_store();
+        let run = RunId::new("typed-ckpt");
+        let mut a = built(b"cfg");
+        let d0 = a.ingest(0, &[staged(1, b"x"), staged(2, b"y")]).unwrap();
+
+        let saved = save_typed_checkpoint(
+            &store,
+            &run,
+            &ident(),
+            &a,
+            CheckpointCapture {
+                round: 0,
+                digest: d0,
+                data_cursor: 0,
+                journal_position: 42,
+            },
+        )
+        .await
+        .unwrap();
+        // The manifest is sectioned per architecture §5.3, content-addressed + schema-versioned.
+        assert_eq!(saved.pointer.blake3, saved.content_hash);
+        assert_eq!(saved.manifest.round, 0);
+        let m = &saved.manifest;
+        assert_eq!(
+            m.section(SectionKind::Consensus).unwrap().class,
+            SectionClass::ConsensusCanonical
+        );
+        // StubBackend exports a state dict → the module section is the safetensors typed export, and
+        // the opaque bytes are retained as the authoritative worker-local restore section.
+        assert_eq!(
+            m.section(SectionKind::Module).unwrap().schema,
+            MODULE_SCHEMA_SAFETENSORS
+        );
+        assert_eq!(
+            m.section(SectionKind::WorkerLocal).unwrap().schema,
+            MODULE_SCHEMA_OPAQUE
+        );
+        assert!(m.section(SectionKind::DataCursor).is_some());
+        assert!(m.section(SectionKind::JournalPosition).is_some());
+
+        // Restore into a differently-built backend; the next identical ingest must match.
+        let mut b = built(b"totally-different-config");
+        let restored = load_typed_checkpoint(&store, &run, &mut b, &saved.pointer)
+            .await
+            .unwrap();
+        assert_eq!(restored, saved.manifest);
+        let next = [staged(1, b"p"), staged(2, b"q")];
+        assert_eq!(b.ingest(1, &next).unwrap(), a.ingest(1, &next).unwrap());
+    }
+
+    #[tokio::test]
+    async fn restore_attestation_round_trip() {
+        // The NAMED attestation round-trip (refactor §9): K digest attestations gate initial
+        // join-eligibility; a peer that loads the full manifest and it verifies emits a restore
+        // attestation; the late-join planner then prefers the restore-attested checkpoint and plans
+        // the record-replay catch-up. NOT folded into "cold join works".
+        let store = temp_store();
+        let run = RunId::new("attest-run");
+        let id = ident();
+        let mut a = built(b"cfg");
+        let d0 = a.ingest(0, &[staged(1, b"x"), staged(2, b"y")]).unwrap();
+        let saved = save_typed_checkpoint(
+            &store,
+            &run,
+            &id,
+            &a,
+            CheckpointCapture {
+                round: 0,
+                digest: d0,
+                data_cursor: 0,
+                journal_position: 7,
+            },
+        )
+        .await
+        .unwrap();
+        let ckpt = saved.content_hash;
+
+        let policy = AttestationPolicy::new(2);
+        let mut ledger = AttestationLedger::new();
+        let candidates = [CheckpointCandidate {
+            content_hash: ckpt,
+            round: 0,
+        }];
+
+        // Before K digest attestations: not join-eligible → the planner awaits.
+        assert!(matches!(
+            plan_late_join(&policy, &ledger, &candidates, 3, 8),
+            LateJoinPlan::AwaitAttested { .. }
+        ));
+
+        // Two live peers sign digest attestations ("declared digest == my consensus state").
+        let digest_att = |sk: &SigningKey| {
+            AttestationBody {
+                tier: AttestationTier::Digest,
+                run_id: id.run_id,
+                epoch: id.epoch,
+                round: 0,
+                checkpoint: ckpt,
+                digest: to_proto_digest(d0),
+                signer: peer_id(sk),
+            }
+            .sign(sk)
+            .unwrap()
+        };
+        for seed in 1..=2u8 {
+            ledger
+                .record(digest_att(&SigningKey::from_bytes(&[seed; 32])))
+                .unwrap();
+        }
+
+        // Now join-eligible: the plan restores from this checkpoint and plans catch-up.
+        let plan = plan_late_join(&policy, &ledger, &candidates, 3, 8);
+        let LateJoinPlan::Restore {
+            checkpoint,
+            from_round,
+            catch_up,
+        } = plan
+        else {
+            panic!("expected Restore, got {plan:?}");
+        };
+        assert_eq!(checkpoint, ckpt);
+        assert_eq!(from_round, 0);
+        assert_eq!(
+            catch_up,
+            ResyncPlan::ReplayFromCheckpoint {
+                from_round: 0,
+                steps: 3,
+            }
+        );
+
+        // A late joiner performs the restore step: load the full manifest (it verifies) …
+        let restorer_sk = SigningKey::from_bytes(&[9u8; 32]);
+        let mut joiner = built(b"fresh-joiner-config");
+        load_typed_checkpoint(&store, &run, &mut joiner, &saved.pointer)
+            .await
+            .unwrap();
+        // … then signs a RESTORE attestation ("I loaded the full manifest and it verified").
+        let restore_att = AttestationBody {
+            tier: AttestationTier::Restore,
+            run_id: id.run_id,
+            epoch: id.epoch,
+            round: 0,
+            checkpoint: ckpt,
+            digest: to_proto_digest(d0),
+            signer: peer_id(&restorer_sk),
+        }
+        .sign(&restorer_sk)
+        .unwrap();
+        ledger.record(restore_att).unwrap();
+        assert!(ledger.is_restore_attested(&ckpt));
+
+        // The restored joiner reaches the in-sync digest on the next ingest (recoverability proven).
+        let next = [staged(1, b"p"), staged(2, b"q")];
+        assert_eq!(
+            joiner.ingest(1, &next).unwrap(),
+            a.ingest(1, &next).unwrap()
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //! [`RoundEngine`]: crate::engine::RoundEngine
 
 use crate::backend::{
-    AssessMeta, Assessment, BatchRef, StagedPayload, StateDigest, StepCtx, StepStats,
+    AssessMeta, Assessment, BatchRef, StagedPayload, StateDict, StateDigest, StepCtx, StepStats,
     TrainerBackend,
 };
 use crate::seam::RoundId;
@@ -282,5 +282,29 @@ impl TrainerBackend for WasmBackend {
         }
         self.inst_mut()?.restore_checkpoint(bytes)?;
         Ok(())
+    }
+
+    /// The live module's parameter masters as a typed [`StateDict`] in **registration order** (ABI
+    /// §6.3) — the `checkpoints/round-<r>.safetensors` typed serialization the checkpoint bridge
+    /// wires in (Phase E, refactor §9). Assembled exactly as `daemon-vhc-safetensors` documents:
+    /// `Instance::params()` for the ordered `(name, shape)` list + `Instance::param_master` for each
+    /// fp32 master. `None` before `build` (no live instance). The authoritative bit-exact restore
+    /// still rides the opaque `checkpoint_save` bytes; this is the portable, inspectable export.
+    fn export_state_dict(&self) -> Result<Option<StateDict>, Self::Error> {
+        let Some(inst) = self.instance.as_ref() else {
+            return Ok(None);
+        };
+        let mut sd = StateDict::new();
+        for p in inst.params() {
+            let master = inst
+                .param_master(&p.name)
+                .ok_or(WasmBackendError::NotBuilt)?;
+            sd.push(
+                p.name,
+                p.shape.iter().map(|&d| d as usize).collect(),
+                master,
+            );
+        }
+        Ok(Some(sd))
     }
 }
