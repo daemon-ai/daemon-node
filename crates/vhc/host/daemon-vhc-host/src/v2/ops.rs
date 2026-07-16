@@ -89,6 +89,23 @@ pub enum OpRequest {
         /// The stream.
         stream: u64,
     },
+    // ---- compute@2 (track C1, ABI §15; architecture §3.4) — PUMP-INTERNAL requests -------------
+    // The compute runner is host-local (same process, guest thread), so these two are serviced
+    // AT THE CALL, inside the import body — they are never pushed to `op_requests` and an
+    // embedder/servicer never sees them (no new arms needed in transport seats). They exist as
+    // variants so the OpId mint is uniform (§7.1 replay determinism: every OpId derives from the
+    // one `begin()` sequence) and so replay can re-mint identical ids.
+    /// `compute.export(tensor)` — device → staging: completes `Ok(BufferHandle)` carrying the
+    /// tensor's `CBOR(TensorData)` (journaled verbatim as the kind-5 tag-2 record — device bytes
+    /// are a nondeterministic input); a deferred device error completes
+    /// `Err(COMP_ERR_DEVICE)`.
+    TensorExport,
+    /// `compute.import(buffer, tensor_id)` — staging → device: registers the sealed buffer's
+    /// `CBOR(TensorData)` under the guest-minted `TensorId`; completes `Ok(())`.
+    TensorImport {
+        /// The guest-minted `TensorId` the tensor registers under.
+        tensor_id: u64,
+    },
 }
 
 /// The per-instance outstanding-operation table (see module docs).
@@ -251,6 +268,10 @@ mod tests {
                     },
                 ) => s1 == s2 && b1 == b2,
                 (Self::StreamRead { stream: a }, Self::StreamRead { stream: b }) => a == b,
+                (Self::TensorExport, Self::TensorExport) => true,
+                (Self::TensorImport { tensor_id: a }, Self::TensorImport { tensor_id: b }) => {
+                    a == b
+                }
                 _ => false,
             }
         }

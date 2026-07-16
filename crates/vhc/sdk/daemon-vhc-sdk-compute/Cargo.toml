@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-sdk-compute"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = """
+The guest-side Burn compute tier (Phase C, track C1; architecture §3.2/§6 "Model code" +
+"Capability bindings" rows): `HostBackend` — an ordinary `burn::tensor::backend::Backend` whose
+every tensor op lowers to a CBOR(burn_ir::OperationIr) blob submitted through the `compute@2`
+import shim (daemon-vhc-sdk-v2's byte-level bindings) — plus `Autodiff<HostBackend>` (the
+guest-side autodiff tape: graph + backward closures over opaque handles, zero intermediate
+readbacks — decisions D8) and the export/import helpers over sealed buffers (§3.4). A SEPARATE
+sdk crate so non-compute guests never compile the Burn tree.
+"""
+
+[dependencies]
+daemon-vhc-sdk-v2 = { path = "../daemon-vhc-sdk-v2" }
+# The pinned Burn the compute@2 wire is defined against (decisions D8: `burn = 0.21.0`; a Burn
+# bump is an ABI event). `std` + `autodiff` only: the guest holds NO real backend — every kernel
+# runs host-side; burn-ndarray is pulled ONLY for its `NdArrayDevice` token (a plain enum
+# implementing `DeviceOps`; no ndarray compute is ever invoked guest-side).
+burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
+burn-router = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-ir = { version = "=0.21.0", default-features = false }
+burn-backend = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-std = { version = "=0.21.0", default-features = false, features = ["std"] }
+burn-ndarray = { version = "=0.21.0", default-features = false, features = ["std"] }
+ciborium = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+# The wasm32 `custom` getrandom backend this crate DEFINES (`__getrandom_v03_custom`): the Burn
+# tree pulls `rand` -> `getrandom`, which refuses to compile for wasm32-unknown-unknown without a
+# backend; a wasmtime guest has no JS host, so the guest build selects `custom` (the guests
+# workspace rustc shim appends the cfg) and this crate provides the deterministic definition.
+# Module RNG policy is `sys@2::rng_seed` — ambient entropy deliberately does not exist in-guest.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", default-features = false }
+
+[lints]
+workspace = true

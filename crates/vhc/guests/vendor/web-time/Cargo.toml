@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+#
+# JS-free `web-time` shim for the guest workspace (C1 compute lead-in). The upstream crate maps
+# `Instant`/`SystemTime` onto the browser's `performance.now()` via js-sys/wasm-bindgen on every
+# `target_family = "wasm"` — but a daemon-vhc guest is a *wasmtime* module with NO JS host, and
+# linking wasm-bindgen poisons the `.wasm` with `__wbindgen_placeholder__` imports the sandbox
+# (rightly) refuses as `BadModule`. This shim re-exports `std::time` instead: identical API, and
+# `Instant::now()` on wasm32-unknown-unknown panics IF CALLED — honest for a sandboxed module
+# whose only time surface is `sys@2::now` (a conforming guest never reaches ambient time).
+[package]
+name = "web-time"
+version = "1.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"

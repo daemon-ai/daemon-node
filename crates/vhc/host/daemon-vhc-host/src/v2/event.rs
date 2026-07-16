@@ -13,24 +13,27 @@
 //! other consensus-critical byte in the tree.
 //!
 //! This host-side codec covers the Phase A closed subset (`{Frame, PayloadReady, Timer, Budget,
-//! Stop, Quiesce}`, ABI §4.2) **plus the Phase B `Completion` variant** (tag 6, ABI §4.6/§7.5 —
-//! track B1's async completion protocol): every non-immediate capability call returns an `OpId` and
-//! completes through `Event::Completion(op, result)`. The reserved `Fence` tag (5) is still **not a
-//! variant** of [`EventV2`], so a host without `compute@2` cannot deliver it by construction (§4.6);
-//! it arrives with Phase C. Decoding accepts and ignores trailing fields beyond those known
-//! (additive minors, §5.2) and fails closed on an unknown tag — the decoder here serves the
-//! journal/replay verifier and tests; the guest-side fail-closed trap (§5.2) is the SDK's
-//! obligation.
+//! Stop, Quiesce}`, ABI §4.2), **the Phase B `Completion` variant** (tag 6, ABI §4.6/§7.5 — track
+//! B1's async completion protocol: every non-immediate capability call returns an `OpId` and
+//! completes through `Event::Completion(op, result)`), **and the Phase C `Fence` variant** (tag 5,
+//! ABI §4.6/§15 — track C1's compute command queue: a `compute@2::fence(id)` marker the device has
+//! passed delivers as `Event::Fence(id)`, architecture §3.3). Decoding accepts and ignores
+//! trailing fields beyond those known (additive minors, §5.2) and fails closed on an unknown tag —
+//! the decoder here serves the journal/replay verifier and tests; the guest-side fail-closed trap
+//! (§5.2) is the SDK's obligation.
 //!
-//! Whether the host *delivers* a `Completion` is governed by minor negotiation (a minor-0 host with
-//! no completion sources never produces one); representability here is what lets the completion
-//! protocol, journal (§8.3 tag 14), and replay verifier all speak one shape.
+//! Whether the host *delivers* a `Completion`/`Fence` is governed by minor negotiation, enforced
+//! **structurally**: each only ever arises from a capability call whose import symbol forces the
+//! module's declared minor at selection (§1.3 step 5) — a minor-0 module cannot import a
+//! completion-generating symbol, a minor-≤1 module cannot import `compute@2::fence`.
+//! Representability here is what lets the protocols, journal (§8.3 tags 14/1), and replay verifier
+//! all speak one shape.
 
 use ciborium::value::Value;
 
 use daemon_vhc_abi::{
-    EV_TAG_BUDGET, EV_TAG_COMPLETION, EV_TAG_FRAME, EV_TAG_PAYLOAD_READY, EV_TAG_QUIESCE,
-    EV_TAG_STOP, EV_TAG_TIMER,
+    EV_TAG_BUDGET, EV_TAG_COMPLETION, EV_TAG_FENCE, EV_TAG_FRAME, EV_TAG_PAYLOAD_READY,
+    EV_TAG_QUIESCE, EV_TAG_STOP, EV_TAG_TIMER,
 };
 use daemon_vhc_proto::to_canonical_vec;
 
@@ -70,12 +73,10 @@ pub struct BudgetReport {
 }
 
 /// A major-2 event: the Phase-A closed subset (ABI §4.2) plus the Phase-B `Completion` variant
-/// (tag 6, §4.6/§7.5 — track B1).
+/// (tag 6, §4.6/§7.5 — track B1) and the Phase-C `Fence` variant (tag 5, §4.6/§15 — track C1).
 ///
-/// The reserved `Fence` (tag 5) variant is deliberately absent: a host without `compute@2` MUST NOT
-/// deliver it (§4.6), and leaving it unrepresentable makes that a compile-time property of the pump
-/// (it arrives with Phase C). `Completion` **is** representable now: track B1's completion protocol
-/// generalizes every non-immediate capability call to an `OpId` + `Event::Completion(op, result)`.
+/// Delivery of the two post-Phase-A variants is minor-gated structurally (module docs): each can
+/// only arise from a capability call whose import forces the declaring minor at selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventV2 {
     /// Tag 0 — a verified signed control frame (§4.3). `payload` is opaque module-authored bytes.
@@ -109,6 +110,14 @@ pub enum EventV2 {
     Budget {
         /// The fully-defined report body.
         report: BudgetReport,
+    },
+    /// Tag 5 — a compute-queue marker the guest inserted with `compute@2::fence(id)` has been
+    /// passed by the device (§4.6/§15, track C1; architecture §3.3). Delivered only after a
+    /// SUCCESSFUL fence — a deferred device error at the fence is the typed `ComputeFault` trap
+    /// instead, so a delivered `Fence` is the guest's consistency point.
+    Fence {
+        /// The marker id the guest passed to `compute@2::fence`.
+        fence_id: u64,
     },
     /// Tag 6 — the async result of a non-immediate capability call (§4.6/§7.5, track B1).
     Completion {
@@ -208,6 +217,9 @@ pub fn encode_event_frame(event: &EventV2) -> Result<Vec<u8>, EventCodecError> {
                 ),
             ]),
         ]),
+        EventV2::Fence { fence_id } => {
+            Value::Array(vec![Value::from(EV_TAG_FENCE), Value::from(*fence_id)])
+        }
         EventV2::Completion { op, result } => Value::Array(vec![
             Value::from(EV_TAG_COMPLETION),
             Value::from(*op),
@@ -233,9 +245,9 @@ pub fn encode_event_frame(event: &EventV2) -> Result<Vec<u8>, EventCodecError> {
 ///
 /// # Errors
 ///
-/// [`EventCodecError::UnknownTag`] for a tag outside the Phase-A deliverable subset (including
-/// the reserved `Fence`/`Completion` tags); [`EventCodecError::Malformed`] for anything that is
-/// not a well-formed frame of the tagged shape.
+/// [`EventCodecError::UnknownTag`] for an unassigned tag (a future minor's variant — fail
+/// closed); [`EventCodecError::Malformed`] for anything that is not a well-formed frame of the
+/// tagged shape.
 pub fn decode_event_frame(bytes: &[u8]) -> Result<EventV2, EventCodecError> {
     let tree: Value = ciborium::de::from_reader(bytes)
         .map_err(|e| EventCodecError::Malformed(format!("decode: {e}")))?;
@@ -263,6 +275,9 @@ pub fn decode_event_frame(bytes: &[u8]) -> Result<EventV2, EventCodecError> {
         }),
         t if t == EV_TAG_BUDGET => Ok(EventV2::Budget {
             report: decode_budget(items.get(1))?,
+        }),
+        t if t == EV_TAG_FENCE => Ok(EventV2::Fence {
+            fence_id: as_u64(items.get(1), "fence_id")?,
         }),
         t if t == EV_TAG_COMPLETION => Ok(EventV2::Completion {
             op: as_u64(items.get(1), "op")?,
@@ -379,8 +394,8 @@ mod tests {
     use super::*;
     use crate::v2::completion::{CompError, SuccessPayload};
     use daemon_vhc_abi::{
-        COMP_ERR_TIMEOUT, EV_TAG_COMPLETION, EV_TAG_FENCE, HANDLE_KIND_BUFFER,
-        QUIESCE_REASON_UPGRADE, STOP_REASON_RUN_COMPLETE,
+        COMP_ERR_TIMEOUT, EV_TAG_COMPLETION, HANDLE_KIND_BUFFER, QUIESCE_REASON_UPGRADE,
+        STOP_REASON_RUN_COMPLETE,
     };
 
     fn samples() -> Vec<EventV2> {
@@ -439,6 +454,7 @@ mod tests {
                     detail: Some("fetch deadline".into()),
                 }),
             },
+            EventV2::Fence { fence_id: 11 },
             EventV2::Stop {
                 reason: STOP_REASON_RUN_COMPLETE,
             },
@@ -475,24 +491,26 @@ mod tests {
     }
 
     #[test]
-    fn fence_and_future_tags_fail_closed_but_completion_decodes() {
-        // ABI §4.6/§5.2: `Fence` (tag 5) is still reserved (Phase C) and a future-minor tag is
-        // unknown — both fail closed. `Completion` (tag 6) is now representable (track B1).
-        for tag in [EV_TAG_FENCE, 63u64] {
-            let bytes =
-                to_canonical_vec(&Value::Array(vec![Value::from(tag), Value::from(1u64)])).unwrap();
-            assert_eq!(
-                decode_event_frame(&bytes).unwrap_err(),
-                EventCodecError::UnknownTag(tag)
-            );
-        }
-        // A well-formed completion frame decodes to the `Completion` variant.
+    fn future_tags_fail_closed_but_completion_and_fence_decode() {
+        // ABI §5.2: an unassigned future-minor tag fails closed. `Completion` (tag 6, B1) and
+        // `Fence` (tag 5, C1) are now representable.
+        let bytes =
+            to_canonical_vec(&Value::Array(vec![Value::from(63u64), Value::from(1u64)])).unwrap();
+        assert_eq!(
+            decode_event_frame(&bytes).unwrap_err(),
+            EventCodecError::UnknownTag(63)
+        );
+        // Well-formed completion + fence frames decode to their variants.
         let completion = EventV2::Completion {
             op: 5,
             result: CompletionResult::cancelled(),
         };
         let bytes = encode_event_frame(&completion).unwrap();
         assert_eq!(decode_event_frame(&bytes).unwrap(), completion);
+        let fence = EventV2::Fence { fence_id: 3 };
+        let bytes = encode_event_frame(&fence).unwrap();
+        assert_eq!(bytes[1], 0x05, "leading integer event tag 5 (Fence)");
+        assert_eq!(decode_event_frame(&bytes).unwrap(), fence);
     }
 
     #[test]

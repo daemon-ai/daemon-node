@@ -54,6 +54,22 @@ extern "C" {
     fn abi_data_fetch(hash_ptr: u32, range_off: u64, range_len: u64) -> u64;
 }
 
+#[link(wasm_import_module = "compute@2")]
+extern "C" {
+    // -- minor 2 (Phase C, track C1): the Burn-IR command queue (ABI §15; architecture §3.3/§3.4).
+    // These byte-level bindings carry no Burn type — the op/ir blobs are CBOR(burn_ir::…) at the
+    // pinned Burn version, authored by the compute SDK layer (or hand-built by conformance
+    // guests). Importing any of these forces a declared abi_minor >= 2 (§1.3 step 5).
+    #[link_name = "submit_op"]
+    fn abi_compute_submit_op(op_ptr: u32, op_len: u32);
+    #[link_name = "fence"]
+    fn abi_compute_fence(fence_id: u64);
+    #[link_name = "export"]
+    fn abi_compute_export(ir_ptr: u32, ir_len: u32) -> u64;
+    #[link_name = "import"]
+    fn abi_compute_import(buffer: u64, tensor_id: u64) -> u64;
+}
+
 #[link(wasm_import_module = "sys@2")]
 extern "C" {
     #[link_name = "set_timer"]
@@ -335,6 +351,41 @@ pub fn payload_get(hash: &[u8; 32]) -> u64 {
 pub fn data_fetch(hash: &[u8; 32], range_off: u64, range_len: u64) -> u64 {
     // SAFETY: `hash` is a live 32-byte guest span for the call's duration.
     unsafe { abi_data_fetch(hash.as_ptr() as u32, range_off, range_len) }
+}
+
+// -- minor 2 (Phase C, track C1): the compute@2 command queue (ABI §15) ---------------------------
+
+/// Enqueue one `CBOR(burn_ir::OperationIr)` op-blob on the compute command queue (architecture
+/// §3.3: enqueue returns immediately; device errors defer to fence/export). Validation faults
+/// (stale/invalid handle, unservable variant, malformed blob) trap typed at the call.
+pub fn compute_submit_op(op_cbor: &[u8]) {
+    // SAFETY: `op_cbor` is a live guest span for the call's duration.
+    unsafe { abi_compute_submit_op(op_cbor.as_ptr() as u32, op_cbor.len() as u32) }
+}
+
+/// Insert a fence marker into the compute queue (§3.3): `Event::Fence(fence_id)` (tag 5) delivers
+/// when the device passes it. A deferred device error surfaces HERE as a typed `ComputeFault`
+/// trap — a delivered `Fence` is a real consistency point. Fencing resets the queue-depth grant.
+pub fn compute_fence(fence_id: u64) {
+    // SAFETY: plain-value import.
+    unsafe { abi_compute_fence(fence_id) }
+}
+
+/// Export a device tensor named by `CBOR(burn_ir::TensorIr)` to a sealed buffer (§3.4: bulk bytes
+/// ride the `BufferHandle`, never the op-stream). Returns the `OpId`; completes
+/// `Ok(BufferHandle)` carrying the tensor's `CBOR(TensorData)`, or `Err(DeviceError)` for a
+/// deferred device fault.
+pub fn compute_export(ir_cbor: &[u8]) -> u64 {
+    // SAFETY: `ir_cbor` is a live guest span for the call's duration.
+    unsafe { abi_compute_export(ir_cbor.as_ptr() as u32, ir_cbor.len() as u32) }
+}
+
+/// Import a sealed buffer's `CBOR(TensorData)` as a device tensor under the guest-minted
+/// `tensor_id` (§3.4). Returns the `OpId`; completes `Ok(())`. The tensor is usable in ops
+/// immediately after this call returns (registration is synchronous host-side).
+pub fn compute_import(buffer: u64, tensor_id: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_compute_import(buffer, tensor_id) }
 }
 
 /// Open a direct stream to `peer` (§3.3). Returns the `OpId`; completes with `Ok(StreamHandle)`.

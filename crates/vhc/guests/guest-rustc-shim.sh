@@ -33,6 +33,24 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   esac
 done
 
+# getrandom backend selection (C1 compute lead-in): the Burn tree the compute guests link pulls
+# `rand` -> `getrandom`, whose wasm32-unknown-unknown build REFUSES to compile without an explicit
+# backend choice. The right backend for a wasmtime guest (no JS host!) is `custom` — the
+# `__getrandom_v03_custom` definition lives in `daemon-vhc-sdk-compute` (deterministic fill;
+# module RNG policy is `sys@2::rng_seed`, never ambient entropy). The cfg is consumed only by
+# getrandom's own build, so it is appended here — the one seat EVERY guest-workspace rustc
+# invocation passes through (xtask build-guests, the host test harnesses' ensure_built, manual
+# builds), exactly the no-per-call-site-coordination argument the metadata pin above uses. Scoped
+# to the getrandom crate on wasm32 so no other crate sees an unexpected cfg.
+if [[ "$crate_name" == "getrandom" ]]; then
+  for a in "${args[@]}"; do
+    if [[ "$a" == "wasm32-unknown-unknown" ]]; then
+      args+=("--cfg" 'getrandom_backend="custom"')
+      break
+    fi
+  done
+fi
+
 if [[ "$is_local" == 1 && -n "$crate_name" ]]; then
   newargs=()
   for ((i = 0; i < ${#args[@]}; i++)); do

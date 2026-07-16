@@ -57,8 +57,8 @@ use wasmtime::{Caller, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBu
 
 use daemon_vhc_abi::{
     pack_status_len, CHANNEL_DIR_RX_ONLY, COMP_ERR_GRANT_EXHAUSTED, COMP_ERR_HASH_MISMATCH,
-    EV_TAG_FRAME, EV_TAG_STOP, FRAME_ENVELOPE_DOMAIN_V2, NS_DATA_V2, NS_NET_V2, NS_SYS_V2,
-    NS_TABI_V1, NS_VHC_V2, PHASE_A_DEFAULT_CHANNEL_TABLE, READBACK_KIND_STAGED_BYTES,
+    EV_TAG_FRAME, EV_TAG_STOP, FRAME_ENVELOPE_DOMAIN_V2, NS_COMPUTE_V2, NS_DATA_V2, NS_NET_V2,
+    NS_SYS_V2, NS_TABI_V1, NS_VHC_V2, PHASE_A_DEFAULT_CHANNEL_TABLE, READBACK_KIND_STAGED_BYTES,
     RET_STATUS_DELIVERED, RET_STATUS_NEED_CAPACITY, SNAPSHOT_STATE_SECTION_MISSING,
     STAGED_KIND_BYTES,
 };
@@ -153,6 +153,21 @@ pub struct V2RunConfig {
     /// `grant-bound.max_outstanding` (ABI §2.3): the concurrent-operation ceiling for the async
     /// completion protocol (`0` = unbounded by this grant). Breach traps `GrantViolation`.
     pub max_outstanding_ops: u64,
+    // ---- compute@2 (track C1, ABI §15; architecture §3.3) — CLEARLY DELIMITED for the D0 union
+    // merge: D0's envelope-derived AdmittedQuotas should tighten these exactly like the Phase-B
+    // bound fields above (defaults here; grants derivation at admission). ---------------------
+    /// The **queue-depth grant** (architecture §3.3 "a queue-depth grant bounds outstanding
+    /// device work"): the maximum ops enqueued on the compute command queue since the last
+    /// fence (`0` = unbounded by this grant). Breach traps `GrantViolation` — the guest must
+    /// fence (and handle `Event::Fence`) to reclaim depth.
+    pub compute_queue_depth: u64,
+    /// **Deferred-device-fault injection (test/testkit seam — the simulated-providers pattern).**
+    /// `Some(n)`: a synthetic device fault is latched after the `n`-th accepted `submit_op`
+    /// (0-based: `n = 0` faults the first op), surfacing at the next fence (typed
+    /// `ComputeFault` trap) or export (`COMP_ERR_DEVICE` completion) — the CUDA/wgpu
+    /// deferred-error *timing* shape, exercised without a GPU (the ndarray tier is synchronous;
+    /// real async faults ride the same `ComputeRunner` latch). `None` in production.
+    pub compute_fault_after_ops: Option<u64>,
 }
 
 impl V2RunConfig {
@@ -185,6 +200,8 @@ impl V2RunConfig {
             max_live_buffer_handles: 64,
             max_live_buffer_bytes: 1 << 26,
             max_outstanding_ops: 16,
+            compute_queue_depth: 1024,
+            compute_fault_after_ops: None,
         }
     }
 }
@@ -416,6 +433,29 @@ impl PumpState {
         self.queue.push_back(QueuedEvent {
             frame_bytes,
             tag: daemon_vhc_abi::EV_TAG_COMPLETION,
+            signed: None,
+            payload_hash: None,
+            timer_id: None,
+            is_budget: false,
+            gossip_id: None,
+        });
+        Ok(())
+    }
+
+    /// Enqueue one `Event::Fence(fence_id)` (ABI §4.6/§15, tag 5): the guest's compute-queue
+    /// marker passed the device. Like completions, fences are precise markers — never coalesced,
+    /// never dropped, still deliverable during a `Quiesce` drain (§4.4 "already-outstanding
+    /// operations"), never after `Stop`. Journaled as the ordinary tag-1 delivered event; the
+    /// fence *call* is deterministic guest output and needs no record of its own.
+    fn enqueue_fence(&mut self, fence_id: u64) -> Result<(), SinkError> {
+        if self.stop_enqueued {
+            return Ok(()); // the host delivers no further events after Stop (§4.4)
+        }
+        let frame_bytes = encode_event_frame(&EventV2::Fence { fence_id })
+            .map_err(|e| SinkError(e.to_string()))?;
+        self.queue.push_back(QueuedEvent {
+            frame_bytes,
+            tag: daemon_vhc_abi::EV_TAG_FENCE,
             signed: None,
             payload_hash: None,
             timer_id: None,
@@ -1088,6 +1128,18 @@ struct V2Host {
     // data@2: the admitted artifact set ("which artifacts a module may touch is a grant") — the
     // envelope's edge-pinned artifact map ∩ the role's grants. Fail closed when empty.
     granted_artifacts: std::collections::BTreeSet<[u8; 32]>,
+    // compute@2 (track C1, ABI §15): the per-instance command-queue runner over the tier-1 real
+    // backend, guest-thread-local like the bridge (device work belongs to the guest thread,
+    // §11.1/§11.3 — the runner drops with the Store). `None` when the module imports no
+    // compute@2 symbol. wgpu/cuda ride the same generic `ComputeRunner<B>` seam behind the host
+    // feature lanes; driver-side backend selection is deferred with them.
+    compute: Option<crate::compute::ComputeRunner<crate::compute::HostReal>>,
+    // The queue-depth grant + its ledger: ops enqueued since the last successful fence.
+    compute_queue_depth: u64,
+    compute_ops_since_fence: u64,
+    // The deferred-fault injection seam (see `V2RunConfig::compute_fault_after_ops`).
+    compute_fault_after_ops: Option<u64>,
+    compute_ops_total: u64,
 }
 
 impl V2Host {
@@ -2370,6 +2422,209 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
         },
     )?;
 
+    // ==== compute@2 (track C1, ABI §15; architecture §3.3/§3.4) — the Burn-IR command queue ======
+    // The wire is CBOR(burn_ir::OperationIr) at the pinned Burn version; dispatch is the
+    // ComputeRunner (burn-router runner + typed handle faults + the deferred-error latch).
+    // Validation faults trap at the call (§7.6 programming errors); DEVICE faults defer to
+    // fence (ComputeFault trap) / export (COMP_ERR_DEVICE completion) — §3.3.
+
+    // ---- compute@2::submit_op — enqueue one op-blob (infallible for device faults) --------------
+    linker.func_wrap(
+        NS_COMPUTE_V2,
+        "submit_op",
+        |mut c: Caller<'_, V2Host>, op_ptr: u32, op_len: u32| -> Result<(), wasmtime::Error> {
+            let r: Result<(), Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("submit_op")?;
+                let op_cbor = read_guest(c, op_ptr, op_len)?;
+                let d = c.data_mut();
+                if d.compute.is_none() {
+                    return Err(Trap::bare(
+                        TrapCode::BadModule,
+                        "compute@2 import without a compute runner (linker invariant)",
+                    ));
+                }
+                // The queue-depth grant (architecture §3.3): outstanding device work is bounded;
+                // the guest reclaims depth by fencing.
+                if d.compute_queue_depth != 0 && d.compute_ops_since_fence >= d.compute_queue_depth
+                {
+                    return Err(Trap::new(
+                        TrapCode::GrantViolation,
+                        "submit_op",
+                        None,
+                        format!(
+                            "compute queue depth {} reached — fence to reclaim (§3.3)",
+                            d.compute_queue_depth
+                        ),
+                    ));
+                }
+                let compute = d.compute.as_mut().expect("checked above");
+                compute
+                    .submit_op(&op_cbor)
+                    .map_err(|e| Trap::new(e.trap_code(), "submit_op", None, e.to_string()))?;
+                d.compute_ops_since_fence += 1;
+                d.compute_ops_total += 1;
+                // The deferred-fault injection seam (V2RunConfig::compute_fault_after_ops).
+                if d.compute_fault_after_ops == Some(d.compute_ops_total - 1) {
+                    d.compute
+                        .as_mut()
+                        .expect("checked above")
+                        .inject_device_fault("injected deferred device fault (test seam)");
+                }
+                Ok(())
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- compute@2::fence — insert a marker; Event::Fence(id) delivers when the device passes it
+    linker.func_wrap(
+        NS_COMPUTE_V2,
+        "fence",
+        |mut c: Caller<'_, V2Host>, fence_id: u64| -> Result<(), wasmtime::Error> {
+            let r: Result<(), Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("fence")?;
+                let d = c.data_mut();
+                let Some(compute) = d.compute.as_mut() else {
+                    return Err(Trap::bare(
+                        TrapCode::BadModule,
+                        "compute@2 import without a compute runner (linker invariant)",
+                    ));
+                };
+                // Deferred device errors surface HERE, typed (§3.3): the fence event is
+                // delivered only on a successful drain, so a delivered Fence is a real
+                // consistency point.
+                compute
+                    .fence()
+                    .map_err(|e| Trap::new(e.trap_code(), "fence", None, e.to_string()))?;
+                d.compute_ops_since_fence = 0;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.enqueue_fence(fence_id)
+                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                drop(st);
+                shared.wake.notify_all();
+                Ok(())
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- compute@2::export — device tensor → sealed buffer (bulk bytes ride the BufferHandle,
+    // §3.4 — never inline in the op-stream). Returns an OpId; completes Ok(BufferHandle) with the
+    // CBOR(TensorData), journaled verbatim (kind-5 tag-2 — device bytes are a nondeterministic
+    // input); a deferred device error completes Err(COMP_ERR_DEVICE) — the readback twin of the
+    // fence trap.
+    linker.func_wrap(
+        NS_COMPUTE_V2,
+        "export",
+        |mut c: Caller<'_, V2Host>, ir_ptr: u32, ir_len: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("export")?;
+                let ir_cbor = read_guest(c, ir_ptr, ir_len)?;
+                let d = c.data_mut();
+                let Some(compute) = d.compute.as_mut() else {
+                    return Err(Trap::bare(
+                        TrapCode::BadModule,
+                        "compute@2 import without a compute runner (linker invariant)",
+                    ));
+                };
+                // Stale/invalid handles and undecodable IR are programming errors → trap at the
+                // call (§7.6); only the DEVICE fault defers into the completion.
+                let read = match compute.read_tensor(&ir_cbor) {
+                    Ok(data) => Ok(data),
+                    Err(e @ crate::compute::ComputeError::Device(_)) => Err(e),
+                    Err(e) => return Err(Trap::new(e.trap_code(), "export", None, e.to_string())),
+                };
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st.ops.begin(OpRequest::TensorExport).map_err(|code| {
+                    Trap::new(code, "export", None, "max_outstanding grant (§2.3)")
+                })?;
+                // Pump-internal service AT THE CALL (the runner is host-local): the op never
+                // reaches `op_requests`, so transport seats never see a TensorExport.
+                st.ops.finish(op);
+                let result = match read {
+                    Ok(data) => {
+                        // Journal the device bytes verbatim (kind 5) BEFORE the completion
+                        // record — the stream-read (kind 4) discipline: replay materializes the
+                        // completion's buffer from this record and re-executes no kernel (§8.7).
+                        st.sink
+                            .read_back(
+                                op,
+                                u64::from(daemon_vhc_abi::READBACK_KIND_TENSOR_EXPORT),
+                                daemon_vhc_abi::RET_STATUS_DELIVERED,
+                                &data,
+                            )
+                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                        match st.buffers.create_host(Arc::new(data)) {
+                            Some(handle) => CompletionResult::Ok(SuccessPayload::Handle(handle)),
+                            None => CompletionResult::Err(CompError {
+                                code: COMP_ERR_GRANT_EXHAUSTED,
+                                detail: Some("buffer quota exhausted (deny new buffers)".into()),
+                            }),
+                        }
+                    }
+                    Err(e) => CompletionResult::Err(CompError {
+                        code: daemon_vhc_abi::COMP_ERR_DEVICE,
+                        detail: Some(e.to_string()),
+                    }),
+                };
+                st.enqueue_completion(op, &result)
+                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                drop(st);
+                shared.wake.notify_all();
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- compute@2::import — sealed buffer → device tensor under the guest-minted TensorId.
+    // Returns an OpId; completes Ok(()). Deterministic (guest bytes by way of the sealed buffer):
+    // no journal record beyond the tag-14 completion.
+    linker.func_wrap(
+        NS_COMPUTE_V2,
+        "import",
+        |mut c: Caller<'_, V2Host>, buffer: u64, tensor_id: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("import")?;
+                let shared = c.data().shared.clone();
+                let bytes = {
+                    let st = shared.state.lock().expect("pump lock");
+                    st.buffers
+                        .resolve(buffer)
+                        .map_err(|code| Trap::new(code, "import", None, "buffer handle"))?
+                };
+                let d = c.data_mut();
+                let Some(compute) = d.compute.as_mut() else {
+                    return Err(Trap::bare(
+                        TrapCode::BadModule,
+                        "compute@2 import without a compute runner (linker invariant)",
+                    ));
+                };
+                // The buffer must hold decodable CBOR(TensorData) — a malformed import is a
+                // programming error at the call (§7.6), not a completion error.
+                compute
+                    .import_tensor(tensor_id, &bytes)
+                    .map_err(|e| Trap::new(e.trap_code(), "import", None, e.to_string()))?;
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st
+                    .ops
+                    .begin(OpRequest::TensorImport { tensor_id })
+                    .map_err(|code| {
+                        Trap::new(code, "import", None, "max_outstanding grant (§2.3)")
+                    })?;
+                st.ops.finish(op); // pump-internal service at the call (see export)
+                st.enqueue_completion(op, &CompletionResult::Ok(SuccessPayload::Unit))
+                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                drop(st);
+                shared.wake.notify_all();
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
     Ok(())
 }
 
@@ -2499,6 +2754,9 @@ pub fn start_run(
     // links the SAME dispatch the v1 driver uses (genericized over the store — never forked)
     // while the bridge is advertised. This retires the sitting-3 `BridgeUnwired` bound.
     let bridge = module.imports().any(|i| i.module() == NS_TABI_V1);
+    // The compute@2 command queue (track C1, ABI §15): a per-instance ComputeRunner over the
+    // tier-1 real backend, constructed only for modules that import the world.
+    let compute = module.imports().any(|i| i.module() == NS_COMPUTE_V2);
 
     let engine_cfg: EngineConfig = worker.config().clone();
     let abi_packed = u64::from(daemon_vhc_abi::DA_ABI_MAJOR_V2) << 16;
@@ -2606,6 +2864,21 @@ pub fn start_run(
                 slice_pass_open: false,
                 ingest_phase: IngestPhase::Idle,
                 sealed_containers: 0,
+                compute: compute.then(|| {
+                    let runner = crate::compute::ComputeRunner::ndarray_cpu();
+                    // Host-side RNG (Float/Random ops) seeded deterministically from the
+                    // identity-derived seed: two runs of one incarnation reproduce it, and
+                    // replay never re-runs kernels anyway (kind-5 records feed readbacks).
+                    let seed_bytes = derive_rng_seed(&run.identity);
+                    runner.seed(u64::from_le_bytes(
+                        seed_bytes[..8].try_into().expect("8-byte slice"),
+                    ));
+                    runner
+                }),
+                compute_queue_depth: run.compute_queue_depth,
+                compute_ops_since_fence: 0,
+                compute_fault_after_ops: run.compute_fault_after_ops,
+                compute_ops_total: 0,
                 signing,
                 rng_seed: derive_rng_seed(&run.identity),
                 device_bytes: run.device_bytes.clone(),
@@ -3086,6 +3359,11 @@ mod tests {
             slice_pass_open: false,
             ingest_phase: IngestPhase::Idle,
             sealed_containers: 0,
+            compute: None,
+            compute_queue_depth: 0,
+            compute_ops_since_fence: 0,
+            compute_fault_after_ops: None,
+            compute_ops_total: 0,
             signing,
             rng_seed: [0u8; 32],
             device_bytes: Vec::new(),

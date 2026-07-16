@@ -5,10 +5,25 @@
 # §10.1). Members link `daemon-vhc-sdk` by path (../sdk/daemon-vhc-sdk).
 [workspace]
 resolver = "2"
-members = ["tiny-llama", "tiny-llama-v2", "test-abi-basic", "toy-averager", "test-claim-v2", "test-bridge-v2", "test-net-v2", "test-data-v2", "pipeline-stage"]
+members = ["tiny-llama", "tiny-llama-v2", "test-abi-basic", "toy-averager", "test-claim-v2", "test-bridge-v2", "test-net-v2", "test-data-v2", "pipeline-stage", "test-compute-v2"]
 
 # wasm size-tuned: the built modules ship as artifacts, so trade a little compile time for size.
 [profile.release]
 opt-level = "s"
 lto = true
 strip = true
+
+# JS-free `web-time` (C1 compute lead-in): the Burn tree (burn-std -> cubecl-common) pulls
+# `web-time`, which on EVERY `target_family = "wasm"` maps time onto the browser's
+# `performance.now()` through js-sys/wasm-bindgen — poisoning the guest `.wasm` with
+# `__wbindgen_placeholder__` imports the sandbox refuses as `BadModule`. Guests are wasmtime
+# modules with no JS host; `vendor/web-time` re-exports `std::time` (identical API; panics only
+# if ambient time is actually read, which a conforming module never does — `sys@2::now` is the
+# time surface). Applies to this workspace only; the host workspace never resolves web-time
+# for wasm.
+[patch.crates-io]
+web-time = { path = "vendor/web-time" }
+# Same rationale, second edge: cubecl-common's `future::spawn` browser path. Stubbed so no
+# wasm-bindgen/js-sys object ever links into a guest (`spawn_local` panics if reached — a guest
+# has no in-guest executor; architecture §3.3).
+wasm-bindgen-futures = { path = "vendor/wasm-bindgen-futures" }

@@ -92,6 +92,11 @@ pub struct ReplayScript {
     /// order — opaque stream payloads have no content address, so the journal carries them
     /// verbatim and replay materializes each read's buffer from here.
     pub stream_bytes: VecDeque<(u64, Vec<u8>)>,
+    /// Tensor-export completion bytes (the ABI kind-5 tag-2 records, track C1): `(op,
+    /// CBOR(TensorData))` in arrival order — device-produced bytes are a nondeterministic input
+    /// (native-lane arithmetic), journaled verbatim exactly like stream bytes; replay
+    /// materializes each export's buffer from here and re-executes no kernel (§8.7).
+    pub tensor_exports: VecDeque<(u64, Vec<u8>)>,
 }
 
 impl ReplayScript {
@@ -111,6 +116,9 @@ impl ReplayScript {
                         // Journal-record-only kind (never a guest call): completion-carried
                         // stream bytes, consumed at completion delivery — not by read_back.
                         s.stream_bytes.push_back((*src, value.clone()));
+                    } else if *kind == u64::from(daemon_vhc_abi::READBACK_KIND_TENSOR_EXPORT) {
+                        // Journal-record-only kind (C1): completion-carried tensor-export bytes.
+                        s.tensor_exports.push_back((*src, value.clone()));
                     } else {
                         s.readbacks.push_back((*src, *kind, value.clone()));
                     }
@@ -191,6 +199,8 @@ struct ReplayHost {
     op_fetches: HashMap<u64, ([u8; 32], u64, u64)>,
     /// `stream_read` ops awaiting their journaled kind-4 bytes at completion delivery.
     stream_read_ops: std::collections::HashSet<u64>,
+    /// `compute.export` ops awaiting their journaled kind-5 tensor bytes at completion delivery.
+    tensor_export_ops: std::collections::HashSet<u64>,
     /// Host-partition (completion-minted) buffers, keyed by the handle the journaled completion
     /// frame carries, materialized from `script.payloads` / `script.stream_bytes` at delivery.
     host_buffers: HashMap<u64, Arc<Vec<u8>>>,
@@ -335,6 +345,21 @@ fn dispatch(
                             if src != op {
                                 return Err(diverged(format!(
                                     "journaled stream bytes belong to op {src:#x}, not {op:#x}"
+                                )));
+                            }
+                            host.host_buffers.insert(h, Arc::new(bytes));
+                        } else if host.tensor_export_ops.remove(&op) {
+                            // Device-produced tensor bytes: materialize from the journaled
+                            // kind-5 record (C1) — kernels are never re-executed (§8.7).
+                            let Some((src, bytes)) = host.script.tensor_exports.pop_front() else {
+                                return Err(diverged(format!(
+                                    "tensor-export completion for op {op:#x} has no journaled \
+                                     kind-5 bytes record"
+                                )));
+                            };
+                            if src != op {
+                                return Err(diverged(format!(
+                                    "journaled tensor bytes belong to op {src:#x}, not {op:#x}"
                                 )));
                             }
                             host.host_buffers.insert(h, Arc::new(bytes));
@@ -512,6 +537,33 @@ fn dispatch(
                 .begin(OpRequest::StreamRead { stream })
                 .map_err(|c| diverged(format!("stream_read refused at replay: {c:?}")))?;
             host.stream_read_ops.insert(op);
+            results[0] = Val::I64(op as i64);
+            Ok(())
+        }
+        // ---- compute@2 (track C1, ABI §15): kernels are NEVER re-executed at replay (§8.7) ------
+        // submit_op/fence are deterministic guest output with no guest-visible result (a fence's
+        // Event::Fence re-feeds from the recorded event stream): accepted, dispatched nowhere.
+        ("compute@2", "submit_op" | "fence") => Ok(()),
+        ("compute@2", "export") => {
+            // Deterministic bookkeeping (the recording validated handles/grants): mint the
+            // identical OpId; the tensor bytes materialize from the journaled kind-5 record at
+            // the completion's delivery.
+            let host = caller.data_mut();
+            let op = host
+                .ops
+                .begin(OpRequest::TensorExport)
+                .map_err(|c| diverged(format!("export refused at replay: {c:?}")))?;
+            host.tensor_export_ops.insert(op);
+            results[0] = Val::I64(op as i64);
+            Ok(())
+        }
+        ("compute@2", "import") => {
+            let tensor_id = p_u64(params, 1);
+            let op = caller
+                .data_mut()
+                .ops
+                .begin(OpRequest::TensorImport { tensor_id })
+                .map_err(|c| diverged(format!("import refused at replay: {c:?}")))?;
             results[0] = Val::I64(op as i64);
             Ok(())
         }
@@ -796,6 +848,7 @@ pub fn replay_v2(
         op_hashes: HashMap::new(),
         op_fetches: HashMap::new(),
         stream_read_ops: std::collections::HashSet::new(),
+        tensor_export_ops: std::collections::HashSet::new(),
         host_buffers: HashMap::new(),
     };
     let mut store = Store::new(worker.engine(), host);

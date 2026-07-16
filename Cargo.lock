@@ -5018,6 +5018,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-sdk-compute"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "burn-backend",
+ "burn-ir",
+ "burn-ndarray",
+ "burn-router",
+ "burn-std",
+ "ciborium",
+ "daemon-vhc-sdk-v2",
+ "getrandom 0.4.3",
+ "serde",
+]
+
+[[package]]
 name = "daemon-vhc-sdk-rounds"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+#
+# JS-free `wasm-bindgen-futures` stub for the guest workspace (C1 compute lead-in; see the
+# `web-time` shim beside it). `cubecl-common` (via burn-std) pulls this on every
+# `target_family = "wasm"` for its `future::spawn` path — browser machinery a wasmtime guest
+# neither has nor may link (wasm-bindgen leaves `__wbindgen_placeholder__` imports the sandbox
+# refuses as `BadModule`). The one consumed symbol (`spawn_local`) panics IF CALLED: a
+# daemon-vhc guest has no in-guest executor — all actual waiting lives in the host's async
+# runtime (architecture §3.3), and a conforming module never spawns.
+[package]
+name = "wasm-bindgen-futures"
+version = "0.4.76"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Feature names other lock residents request (upstream parity; all no-ops in the stub).
+[features]
+default = ["std"]
+std = []
+futures-core-03-stream = []
