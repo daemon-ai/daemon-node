@@ -142,6 +142,24 @@ pub const SYS_V2_SYMBOLS: &[&str] = &[
     "device_profile",
 ];
 
+/// The `data@2` symbol vocabulary (Phase B, track B2; architecture §3.2 "the data world"):
+/// `fetch(artifact_blake3, range_off, range_len) -> OpId`, completing
+/// `Ok(BufferHandle)` through `Event::Completion` (tag 6) after **whole-artifact** blake3
+/// verification host-side. The guest names artifacts **by content hash only** — never by URL or
+/// locator: resolution happened once, at the edge (the envelope's committed artifact map,
+/// architecture §5.1 snapshot pinning); hosts fetch-and-verify against the committed hash and
+/// never resolve independently; fetch credentials are host-held and never enter the sandbox.
+/// Which artifacts a module may touch is a **grant** — a fetch outside the admitted artifact
+/// set traps `GrantViolation` (typed, attributable).
+///
+/// **Sub-resource (range) verification rule:** there are no per-range hashes in the artifact
+/// map, so a range is verified as a slice OF hash-verified content — the host fetches and
+/// verifies the whole artifact against its committed blake3 (LRU content cache makes repeated
+/// ranged reads cheap), then slices `[range_off, range_off + range_len)` (`range_len == 0` =
+/// to the end) into the completion buffer. An out-of-bounds range completes
+/// `Err(StoreRefused)` — a completion error, not a trap (bounds are unknowable at call time).
+pub const DATA_V2_SYMBOLS: &[&str] = &["fetch"];
+
 /// The domain-separation context for the run-scoped RNG seed (`sys@2::rng_seed`): the seed is
 /// `blake3::derive_key(RNG_SEED_DOMAIN_V2, material)` where `material` is the unambiguous
 /// concatenation of the frozen execution identity (§8.1) —
@@ -184,7 +202,8 @@ pub fn v2_namespace_symbols(ns: &str) -> Option<&'static [&'static str]> {
         NS_VHC_V2 => Some(VHC_V2_SYMBOLS),
         NS_NET_V2 => Some(NET_V2_SYMBOLS),
         NS_SYS_V2 => Some(SYS_V2_SYMBOLS),
-        NS_DATA_V2 | NS_COMPUTE_V2 => Some(&[]),
+        NS_DATA_V2 => Some(DATA_V2_SYMBOLS),
+        NS_COMPUTE_V2 => Some(&[]),
         _ => None,
     }
 }
@@ -234,6 +253,10 @@ pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
     (NS_SYS_V2, "rng_seed", 1),
     // The probe's device profile (nondeterministic input — journaled tag 15 per delivery).
     (NS_SYS_V2, "device_profile", 1),
+    // -- minor 1 (Phase B, track B2): the data world (architecture §3.2) ------------------------
+    // Artifact fetch by committed hash + range, completing Ok(BufferHandle) (see
+    // `DATA_V2_SYMBOLS` for the pinning/grant/range rules).
+    (NS_DATA_V2, "fetch", 1),
 ];
 
 /// The minor at which `(namespace, symbol)` was introduced, or `None` if it is not a registered

@@ -423,6 +423,16 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_crypto"],
         ),
         (
+            // The B2 data@2 fetch conformance (architecture §3.2 the data world): the corpus
+            // window fetched by committed hash + policy-chosen range, completing Ok(BufferHandle)
+            // (tag 6) after whole-artifact verification; grant negative (GrantViolation),
+            // range negative (StoreRefused), tamper negative (HashMismatch — fetch-and-verify
+            // against the committed hash); tag-14 journaling + bit-exact replay with artifacts
+            // materialized from the content-addressed payload table.
+            "B2 data@2 fetch conformance (grants, pinning, range, journal + replay)",
+            &["-p", "daemon-vhc-host", "--test", "v2_data_fetch"],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "test-data-v2"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ciborium = "0.2"
+# The SDK bindings under test (data_fetch/read_buffer/…) + the corpus-windowing policy layer
+# (Manifest::locate decides the byte range the module fetches — windowing is MODULE policy).
+daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }

@@ -177,6 +177,10 @@ struct ReplayHost {
     ops: OpTable,
     /// `payload_get` op → requested hash (guest-authored, deterministic).
     op_hashes: HashMap<u64, [u8; 32]>,
+    /// `data.fetch` op → `(artifact hash, range_off, range_len)` (guest-authored,
+    /// deterministic): the completion buffer materializes as the RANGE SLICE of the
+    /// content-addressed artifact bytes — the same payload table, extended for artifacts.
+    op_fetches: HashMap<u64, ([u8; 32], u64, u64)>,
     /// Host-partition (completion-minted) buffers, keyed by the handle the journaled completion
     /// frame carries, materialized from `script.payloads` at delivery.
     host_buffers: HashMap<u64, Arc<Vec<u8>>>,
@@ -284,6 +288,31 @@ fn dispatch(
                                 )));
                             };
                             host.host_buffers.insert(h, Arc::new(bytes.clone()));
+                        } else if let Some((hash, off, len)) = host.op_fetches.remove(&op) {
+                            // A data.fetch success: materialize the RANGE SLICE of the
+                            // content-addressed artifact (the recording's complete_op sliced
+                            // exactly this window from the verified artifact).
+                            let Some(artifact) = host.script.payloads.get(&hash) else {
+                                return Err(diverged(format!(
+                                    "ReplayMissingPayload: fetch completion for op {op:#x} \
+                                     names artifact {} but the replay payload table lacks it",
+                                    hex8(&hash)
+                                )));
+                            };
+                            let total = artifact.len() as u64;
+                            let end = if len == 0 {
+                                total
+                            } else {
+                                off.saturating_add(len)
+                            };
+                            if off > total || end > total {
+                                return Err(diverged(format!(
+                                    "fetch completion for op {op:#x} succeeded but the range \
+                                     [{off}, {end}) exceeds the artifact ({total} bytes)"
+                                )));
+                            }
+                            let slice = artifact[off as usize..end as usize].to_vec();
+                            host.host_buffers.insert(h, Arc::new(slice));
                         }
                     }
                 }
@@ -358,6 +387,7 @@ fn dispatch(
             if accepted {
                 host.ops.finish(op);
                 host.op_hashes.remove(&op);
+                host.op_fetches.remove(&op);
             }
             results[0] = Val::I32(i32::from(!accepted));
             Ok(())
@@ -386,6 +416,29 @@ fn dispatch(
                 .begin(OpRequest::PayloadGet { hash })
                 .map_err(|c| diverged(format!("payload_get refused at replay: {c:?}")))?;
             host.op_hashes.insert(op, hash);
+            results[0] = Val::I64(op as i64);
+            Ok(())
+        }
+        ("data@2", "fetch") => {
+            // Deterministic bookkeeping only: the op mint reproduces the recorded OpId (§7.1);
+            // the grant check happened at recording (a violation would have trapped there); the
+            // artifact bytes materialize at the journaled completion's delivery.
+            let hash_ptr = p_u32(params, 0);
+            let (off, len) = (p_u64(params, 1), p_u64(params, 2));
+            let mem = mem_of(caller)?;
+            let mut hash = [0u8; 32];
+            mem.read(&mut *caller, hash_ptr as usize, &mut hash)
+                .map_err(|e| wasmtime::Error::msg(format!("fetch read: {e}")))?;
+            let host = caller.data_mut();
+            let op = host
+                .ops
+                .begin(OpRequest::ArtifactFetch {
+                    hash,
+                    range_off: off,
+                    range_len: len,
+                })
+                .map_err(|c| diverged(format!("fetch refused at replay: {c:?}")))?;
+            host.op_fetches.insert(op, (hash, off, len));
             results[0] = Val::I64(op as i64);
             Ok(())
         }
@@ -668,6 +721,7 @@ pub fn replay_v2(
         buffers: BufferTable::new(0, 0, 0),
         ops: OpTable::new(0, 0),
         op_hashes: HashMap::new(),
+        op_fetches: HashMap::new(),
         host_buffers: HashMap::new(),
     };
     let mut store = Store::new(worker.engine(), host);

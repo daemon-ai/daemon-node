@@ -50,6 +50,20 @@ pub enum OpRequest {
         /// The requested blake3.
         hash: [u8; 32],
     },
+    /// `data.fetch(artifact, range)` — fetch a committed artifact's bytes (track B2; architecture
+    /// §3.2 the data world). The embedder services the WHOLE artifact (resolver + content cache —
+    /// the host fetch mechanism); the pump verifies it against the committed hash and slices the
+    /// range before the completion is delivered. Deliberately carries ONLY the content hash and
+    /// the range — no URL, no locator, no credential can flow through this request (snapshot
+    /// pinning at the edge: resolution happened when the envelope's artifact map was committed).
+    ArtifactFetch {
+        /// The committed artifact blake3 (granted at admission).
+        hash: [u8; 32],
+        /// Range start (bytes into the artifact).
+        range_off: u64,
+        /// Range length in bytes (`0` = to the end of the artifact).
+        range_len: u64,
+    },
 }
 
 /// The per-instance outstanding-operation table (see module docs).
@@ -187,6 +201,18 @@ mod tests {
             match (self, other) {
                 (Self::PayloadPut { bytes: a }, Self::PayloadPut { bytes: b }) => a == b,
                 (Self::PayloadGet { hash: a }, Self::PayloadGet { hash: b }) => a == b,
+                (
+                    Self::ArtifactFetch {
+                        hash: a,
+                        range_off: ao,
+                        range_len: al,
+                    },
+                    Self::ArtifactFetch {
+                        hash: b,
+                        range_off: bo,
+                        range_len: bl,
+                    },
+                ) => a == b && ao == bo && al == bl,
                 _ => false,
             }
         }

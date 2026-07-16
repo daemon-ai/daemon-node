@@ -57,9 +57,10 @@ use wasmtime::{Caller, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBu
 
 use daemon_vhc_abi::{
     pack_status_len, CHANNEL_DIR_RX_ONLY, COMP_ERR_GRANT_EXHAUSTED, COMP_ERR_HASH_MISMATCH,
-    EV_TAG_FRAME, EV_TAG_STOP, FRAME_ENVELOPE_DOMAIN_V2, NS_NET_V2, NS_SYS_V2, NS_TABI_V1,
-    NS_VHC_V2, PHASE_A_DEFAULT_CHANNEL_TABLE, READBACK_KIND_STAGED_BYTES, RET_STATUS_DELIVERED,
-    RET_STATUS_NEED_CAPACITY, SNAPSHOT_STATE_SECTION_MISSING, STAGED_KIND_BYTES,
+    EV_TAG_FRAME, EV_TAG_STOP, FRAME_ENVELOPE_DOMAIN_V2, NS_DATA_V2, NS_NET_V2, NS_SYS_V2,
+    NS_TABI_V1, NS_VHC_V2, PHASE_A_DEFAULT_CHANNEL_TABLE, READBACK_KIND_STAGED_BYTES,
+    RET_STATUS_DELIVERED, RET_STATUS_NEED_CAPACITY, SNAPSHOT_STATE_SECTION_MISSING,
+    STAGED_KIND_BYTES,
 };
 use daemon_vhc_proto::{peer_id, sign_canonical, to_canonical_vec, SigningKey};
 
@@ -120,6 +121,13 @@ pub struct V2RunConfig {
     /// `BudgetMemory` trap — the under-claim acceptance (refactor §5 A2). The admission funnel
     /// (`v2::admission`) supplies this from the evaluated claim.
     pub hard_accountable_host_bytes: u64,
+    /// The **admitted artifact set** (track B2, architecture §3.2 `data@`): the blake3 hashes of
+    /// the envelope's committed artifact map, intersected with the role's artifact grants ("which
+    /// artifacts a module may touch is a grant"). A `data.fetch` naming a hash outside this set
+    /// traps `GrantViolation` — and because the set descends from the envelope's edge-pinned
+    /// snapshot descriptors (§5.1), an unpinned source is unreachable by construction. Empty =
+    /// no artifacts granted (fail closed).
+    pub granted_artifacts: std::collections::BTreeSet<[u8; 32]>,
     /// `buffer-req.max_live_handles` (ABI §2.3): the standing live-buffer handle ceiling
     /// (`0` = unbounded by this grant). Breach traps `BudgetHandles` (§7.3).
     pub max_live_buffer_handles: u64,
@@ -153,6 +161,7 @@ impl V2RunConfig {
             max_readback_bytes_per_slice: 1 << 20,
             advisory_depth: 64,
             hard_accountable_host_bytes: 0,
+            granted_artifacts: std::collections::BTreeSet::new(),
             max_live_buffer_handles: 64,
             max_live_buffer_bytes: 1 << 26,
             max_outstanding_ops: 16,
@@ -185,6 +194,13 @@ pub enum OpOutcome {
     GetDone {
         /// The fetched bytes (verified against the op's requested hash by the pump).
         bytes: Vec<u8>,
+    },
+    /// A `data.fetch` serviced the WHOLE artifact (resolver + content cache); the pump verifies
+    /// it against the op's committed hash, then slices the op's range before delivery (the
+    /// sub-resource verification rule: a range is a slice OF hash-verified content).
+    FetchDone {
+        /// The complete artifact bytes (verified + sliced by the pump, never the embedder).
+        artifact: Vec<u8>,
     },
     /// The operation failed (`COMP_ERR_*`, e.g. `NetUnreachable` for a connection failure —
     /// connection establishment/failure are completions of the op that needed the connection,
@@ -600,6 +616,51 @@ impl PumpHandle {
                     })
                 }
             }
+            (
+                OpRequest::ArtifactFetch {
+                    hash,
+                    range_off,
+                    range_len,
+                },
+                OpOutcome::FetchDone { artifact },
+            ) => {
+                // §3.4 "verification unchanged": the pump — not the embedder — verifies the
+                // WHOLE artifact against the committed hash, then slices the range. A range is
+                // thereby verified as a slice of hash-verified content (the sub-resource rule).
+                if blake3::hash(&artifact).as_bytes() != &hash {
+                    CompletionResult::Err(CompError {
+                        code: COMP_ERR_HASH_MISMATCH,
+                        detail: Some(
+                            "fetched artifact does not hash to the committed value".into(),
+                        ),
+                    })
+                } else {
+                    let total = artifact.len() as u64;
+                    let end = if range_len == 0 {
+                        total
+                    } else {
+                        range_off.saturating_add(range_len)
+                    };
+                    if range_off > total || end > total {
+                        CompletionResult::Err(CompError {
+                            code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                            detail: Some(format!(
+                                "range [{range_off}, {end}) out of bounds (artifact is {total} \
+                                 bytes)"
+                            )),
+                        })
+                    } else {
+                        let slice = artifact[range_off as usize..end as usize].to_vec();
+                        match st.buffers.create_host(Arc::new(slice)) {
+                            Some(handle) => CompletionResult::Ok(SuccessPayload::Handle(handle)),
+                            None => CompletionResult::Err(CompError {
+                                code: COMP_ERR_GRANT_EXHAUSTED,
+                                detail: Some("buffer quota exhausted (deny new buffers)".into()),
+                            }),
+                        }
+                    }
+                }
+            }
             (_, OpOutcome::Failed { code, detail }) => CompletionResult::Err(CompError {
                 code,
                 detail: Some(detail),
@@ -715,6 +776,9 @@ struct V2Host {
     // tag 15 per delivery) and the identity-derived RNG seed (deterministic — never journaled).
     device_bytes: Vec<u8>,
     rng_seed: [u8; 32],
+    // data@2: the admitted artifact set ("which artifacts a module may touch is a grant") — the
+    // envelope's edge-pinned artifact map ∩ the role's grants. Fail closed when empty.
+    granted_artifacts: std::collections::BTreeSet<[u8; 32]>,
 }
 
 impl V2Host {
@@ -1505,6 +1569,57 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
         },
     )?;
 
+    // ---- data@2::fetch — artifact fetch by committed hash + range (track B2; §3.2) --------------
+    // The guest names CONTENT, never location: the only inputs are the committed blake3 (edge-
+    // pinned in the envelope's artifact map, §5.1) and a byte range — no URL, no locator, no
+    // credential crosses this boundary (the resolver + its credentials stay embedder-side).
+    // Which artifacts a module may touch is a GRANT: a hash outside the admitted set traps
+    // GrantViolation before any op is issued. Completes Ok(BufferHandle) via tag 6 after the
+    // pump whole-artifact-verifies + range-slices (see complete_op).
+    linker.func_wrap(
+        NS_DATA_V2,
+        "fetch",
+        |mut c: Caller<'_, V2Host>,
+         hash_ptr: u32,
+         range_off: u64,
+         range_len: u64|
+         -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("fetch")?;
+                let hash_bytes = read_guest(c, hash_ptr, 32)?;
+                let hash: [u8; 32] = hash_bytes.as_slice().try_into().expect("32-byte span");
+                if !c.data().granted_artifacts.contains(&hash) {
+                    return Err(Trap::new(
+                        TrapCode::GrantViolation,
+                        "fetch",
+                        None,
+                        format!(
+                            "artifact {} is not in the admitted artifact set (which artifacts a \
+                             module may touch is a grant, architecture §3.2)",
+                            hash[..4]
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        ),
+                    ));
+                }
+                let request = OpRequest::ArtifactFetch {
+                    hash,
+                    range_off,
+                    range_len,
+                };
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st.ops.begin(request.clone()).map_err(|code| {
+                    Trap::new(code, "fetch", None, "max_outstanding grant (§2.3)")
+                })?;
+                st.op_requests.push((op, request));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
     // ---- net@2::publish — the signed, sequenced, durable egress door (§6.2/§12) -----------------
     linker.func_wrap(
         NS_NET_V2,
@@ -2013,6 +2128,7 @@ pub fn start_run(
                 signing,
                 rng_seed: derive_rng_seed(&run.identity),
                 device_bytes: run.device_bytes.clone(),
+                granted_artifacts: run.granted_artifacts.clone(),
                 identity: run.identity.clone(),
                 sender,
             };
@@ -2338,6 +2454,7 @@ mod tests {
             signing,
             rng_seed: [0u8; 32],
             device_bytes: Vec::new(),
+            granted_artifacts: std::collections::BTreeSet::new(),
             identity: RunIdentity {
                 run_id: [1u8; 32],
                 epoch: 4,

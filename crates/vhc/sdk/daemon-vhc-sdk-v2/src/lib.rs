@@ -21,9 +21,9 @@
 pub mod abi;
 #[cfg(target_arch = "wasm32")]
 pub use abi::{
-    buffer_len, buffer_release, cancel, create_from, device_profile, emit_metric, hash_accel,
-    next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint, read_buffer,
-    rng_seed, set_timer, verify_sig_accel, Event,
+    buffer_len, buffer_release, cancel, create_from, data_fetch, device_profile, emit_metric,
+    hash_accel, next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint,
+    read_buffer, rng_seed, set_timer, verify_sig_accel, Event,
 };
 
 pub mod corpus;

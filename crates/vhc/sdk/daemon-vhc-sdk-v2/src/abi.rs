@@ -39,6 +39,12 @@ extern "C" {
     fn abi_payload_get(hash_ptr: u32) -> u64;
 }
 
+#[link(wasm_import_module = "data@2")]
+extern "C" {
+    #[link_name = "fetch"]
+    fn abi_data_fetch(hash_ptr: u32, range_off: u64, range_len: u64) -> u64;
+}
+
 #[link(wasm_import_module = "sys@2")]
 extern "C" {
     #[link_name = "set_timer"]
@@ -307,4 +313,17 @@ pub fn payload_put(buffer: u64) -> u64 {
 pub fn payload_get(hash: &[u8; 32]) -> u64 {
     // SAFETY: `hash` is a live 32-byte guest span for the call's duration.
     unsafe { abi_payload_get(hash.as_ptr() as u32) }
+}
+
+// -- minor 1 (Phase B, track B2): the data world (architecture §3.2) ------------------------------
+
+/// Fetch a committed artifact's byte range (`data@2::fetch`): `hash` names content from the
+/// envelope's edge-pinned artifact map (which artifacts a module may touch is a grant — an
+/// ungranted hash traps `GrantViolation`); `range_len == 0` means to the end. Returns the
+/// `OpId`; completes `Ok(BufferHandle)` via `Event::Completion` after the host verifies the
+/// whole artifact against the committed hash and slices the range (the sub-resource rule). No
+/// URL, locator, or credential exists on this surface — resolution happened at the edge.
+pub fn data_fetch(hash: &[u8; 32], range_off: u64, range_len: u64) -> u64 {
+    // SAFETY: `hash` is a live 32-byte guest span for the call's duration.
+    unsafe { abi_data_fetch(hash.as_ptr() as u32, range_off, range_len) }
 }

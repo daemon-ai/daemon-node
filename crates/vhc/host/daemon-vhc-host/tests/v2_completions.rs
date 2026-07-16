@@ -117,6 +117,7 @@ fn service_ops(pump: &PumpHandle, store: Arc<Mutex<std::collections::HashMap<[u8
                 pump.complete_op(op, OpOutcome::GetDone { bytes })
                     .expect("get done");
             }
+            other => panic!("the net guest issues no data@ requests, got {other:?}"),
         }
     }
 }
@@ -318,7 +319,7 @@ fn minor0_module_never_sees_tag6_and_declaration_below_imports_is_refused() {
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
     let deadline = Instant::now() + Duration::from_secs(30);
-    while run.pump.published().len() < 1 {
+    while run.pump.published().is_empty() {
         assert!(Instant::now() < deadline, "bridge guest publishes");
         std::thread::sleep(Duration::from_millis(5));
     }
