@@ -33,7 +33,7 @@ use daemon_vhc_proto::envelope::{
 };
 use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey};
 use daemon_vhc_sdk::models::TinyLlamaCfg;
-use daemon_vhc_session::protocol::{JoinPolicy, PolicyMode};
+
 use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
 // -- guest module loading (mirrors tests/v2_join.rs) ---------------------------------------------
@@ -131,15 +131,6 @@ fn module_path(name: &str) -> PathBuf {
 
 fn worker_bin() -> String {
     env!("CARGO_BIN_EXE_daemon-vhc-worker").to_string()
-}
-
-fn policy() -> JoinPolicy {
-    JoinPolicy {
-        mode: PolicyMode::Always,
-        vram_cap_mb: 0,
-        duty_cycle_pct: 100,
-        schedule: None,
-    }
 }
 
 /// The tiny-llama-v2 guest config (`GuestCfg`) — the v2_join shape: single-peer roster, 2 inner
