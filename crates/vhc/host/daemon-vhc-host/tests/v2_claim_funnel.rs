@@ -79,6 +79,7 @@ fn lane() -> ParticipationLane {
         disk_bytes: 0,
         claim_bounds_device: [0, 4 << 30],
         claim_bounds_host: [0, 4 << 30],
+        ceilings: ParticipationLane::trainer_launch_defaults().ceilings,
     }
 }
 
@@ -131,6 +132,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
         &device(),
         &owner_uncapped(),
         None,
+        None,
     )
     .expect("honest claim admits");
     assert_eq!(admission.claim.hard_accountable.host, 1 << 16);
@@ -148,6 +150,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
         &lane(),
         &device(),
         &owner_uncapped(),
+        None,
         None,
     )
     .expect("second assessment");
@@ -191,6 +194,7 @@ fn over_claim_rejected_against_owner_policy() {
         &device(),
         &owner,
         None,
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 5);
@@ -215,6 +219,7 @@ fn claim_outside_lane_bounds_refused() {
         &device(),
         &owner_uncapped(),
         None,
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 4);
@@ -237,6 +242,7 @@ fn inconsistent_claim_refused() {
         &device(),
         &owner_uncapped(),
         None,
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 4);
@@ -257,6 +263,7 @@ fn manifest_channel_beyond_table_refused_grants_exceed_lane() {
         &lane(),
         &device(),
         &owner_uncapped(),
+        None,
         None,
     )
     .unwrap_err();
@@ -281,6 +288,7 @@ fn under_claim_traps_attributably_at_the_hard_cap() {
         &lane(),
         &device(),
         &owner_uncapped(),
+        None,
         None,
     )
     .expect("the under-claimer's CLAIM is well-formed and within bounds — it admits");
@@ -335,6 +343,7 @@ fn cell5_device_below_envelope_minimums_refuses_at_stage_3() {
         &device(),
         &owner_uncapped(),
         Some(&min),
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 3);
@@ -358,6 +367,7 @@ fn cell5_gpu_required_by_envelope_refuses_on_gpu_less_device() {
         &device(),
         &owner_uncapped(),
         Some(&min),
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 3);
@@ -385,6 +395,7 @@ fn cell5_device_meeting_envelope_minimums_admits_the_v2_module() {
         &device(),
         &owner_uncapped(),
         Some(&min),
+        None,
     )
     .expect("minima met: the pre-screen passes and assessment admits");
     assert!(admission.claim.host_total() > 0);

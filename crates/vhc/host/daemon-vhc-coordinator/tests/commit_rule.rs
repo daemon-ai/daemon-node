@@ -6,12 +6,11 @@
 mod common;
 
 use common::*;
+use daemon_vhc_coordinator::{elect_checkpointer, select_verifiers};
 use daemon_vhc_proto::messages::{
     AttestEntry, Attestation, BatchWindow, Commitment, Locator, RecordEntry, ThroughputClass,
 };
-use daemon_vhc_proto::{
-    commit_set, elect_checkpointer, select_verifiers, Hash, IrohId, PeerId, Seed,
-};
+use daemon_vhc_proto::{commit_set, Hash, IrohId, PeerId, Seed};
 
 use daemon_vhc_coordinator::commit::{all_evidenced, committed_entries, has_evidence, quorum_root};
 use daemon_vhc_coordinator::epoch::{ready_to_update_epoch, EpochInputs, EpochTrigger};
@@ -228,7 +227,7 @@ fn small_n_attestation_quorum_covers_at_the_special_case_boundary() {
     // exactly when a quorum of witnesses supplies an inline opening of its set. Below the quorum it
     // is held out; at the quorum it is admitted. Pins the small rosters the gate's ≥4-peer run and
     // any degraded (churned-down) epoch pass through.
-    use daemon_vhc_proto::assignment::witness_quorum;
+    use daemon_vhc_coordinator::witness_quorum;
 
     for n in 1u32..=3 {
         let witnesses: Vec<PeerId> = (10..10 + n as u8).map(pid).collect();

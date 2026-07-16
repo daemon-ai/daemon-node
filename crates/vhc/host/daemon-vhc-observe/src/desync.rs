@@ -41,7 +41,7 @@ impl DesyncVerdict {
 
 /// Fold a round's `(peer, digest)` reports into a [`DesyncVerdict`]. `quorum` is the number of
 /// agreeing peers required for a digest to count as the quorum digest (e.g.
-/// [`daemon_vhc_proto::assignment::witness_quorum`] of the roster). The last report from a peer
+/// [`daemon_vhc_coordinator::witness_quorum`] of the roster). The last report from a peer
 /// wins (a peer only has one true post-ingest digest per round).
 #[must_use]
 pub fn digest_tally(

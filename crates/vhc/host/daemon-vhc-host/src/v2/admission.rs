@@ -106,6 +106,11 @@ pub struct ParticipationLane {
     pub claim_bounds_device: [u64; 2],
     /// Claim sanity bounds: `[min, max]` bytes the claim's host total must fall within.
     pub claim_bounds_host: [u64; 2],
+    /// The lane's grant/channel ceilings (ABI §9.6 `channel_ceilings` + event/buffer/op bounds +
+    /// offered worlds/custom-ops) — the "lane profile ceilings" contributor to the §2.6 grants
+    /// derivation. D0: an envelope role grant list is intersected against these, tighten-only
+    /// (`daemon_vhc_proto::derive_admitted_quotas`); exceeding them is `GrantsExceedLane`.
+    pub ceilings: daemon_vhc_proto::LaneCeilings,
 }
 
 impl ParticipationLane {
@@ -124,6 +129,35 @@ impl ParticipationLane {
             disk_bytes: 10 << 30,
             claim_bounds_device: [0, 64 << 30],
             claim_bounds_host: [0, 64 << 30],
+            ceilings: daemon_vhc_proto::LaneCeilings {
+                max_frame_bytes: 16 << 20,
+                spool_frames: 1024,
+                per_sender_quota: 256,
+                replay_window: 4096,
+                rate_per_min: 6000,
+                advisory_depth: 1024,
+                payload_depth: 1024,
+                gossip_depth: 1024,
+                max_live_handles: 1024,
+                max_live_bytes: 1 << 30,
+                max_readback_bytes: 64 << 20,
+                max_outstanding_ops: 256,
+                // The compute@2 queue-depth ceiling (C1; mirrors the `V2RunConfig` default).
+                compute_queue_depth: 1024,
+                // The worlds a Trainer-lane role may be granted (§9.6: all four capability
+                // worlds; `vhc` loop mechanics always; `tabi` while the bridge is advertised).
+                worlds: ["vhc", "net", "sys", "data", "compute", "tabi"]
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                // The lane offers exactly what the host custom-op registry advertises (C2's
+                // `HOST_CUSTOM_OPS` — `flash_attn@1` today); D0's tighten-only `custom_ops ⊆
+                // lane` check composes with C2's stage-4.2½ registry gate.
+                custom_ops: daemon_vhc_abi::HOST_CUSTOM_OPS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            },
         }
     }
 }
@@ -174,8 +208,32 @@ pub struct OwnerPolicy {
     pub host_cap_bytes: u64,
 }
 
-/// A successful admission: the selection, the decoded claim, and the verbatim canonical bytes the
-/// run header journals (§8.3 tag 0 `claim` / `manifest`).
+/// The envelope-v2 grants input to the funnel (D0): one role's grant list from the genesis
+/// envelope plus the run's committed artifact-map hashes. `None` at the funnel means "no envelope
+/// grants" — the pre-D0 (v1-envelope / Phase-A default) path, where the driver defaults stand.
+#[derive(Debug, Clone)]
+pub struct EnvelopeRoleGrants {
+    /// The role's grant list (`GenesisEnvelope::roles[role].grants`).
+    pub grants: daemon_vhc_proto::RoleGrants,
+    /// The blake3 hashes of the run's artifact map (granted artifacts must be a subset).
+    pub run_artifacts: std::collections::BTreeSet<daemon_vhc_proto::Hash>,
+}
+
+impl EnvelopeRoleGrants {
+    /// Extract one role's grants input from a decoded genesis envelope. `None` if the role is not
+    /// in the envelope's role set (the caller refuses upstream — an unknown role never admits).
+    #[must_use]
+    pub fn from_genesis(env: &daemon_vhc_proto::GenesisEnvelope, role: &str) -> Option<Self> {
+        env.roles.get(role).map(|entry| Self {
+            grants: entry.grants.clone(),
+            run_artifacts: env.artifacts.values().map(|a| a.blake3).collect(),
+        })
+    }
+}
+
+/// A successful admission: the selection, the decoded claim, the verbatim canonical bytes the
+/// run header journals (§8.3 tag 0 `claim` / `manifest`), and — when the run carried envelope-v2
+/// grants — the tighten-derived quotas the run config consumes.
 #[derive(Debug, Clone)]
 pub struct AdmissionV2 {
     /// The ABI §1.3 selection (driver, major, minor).
@@ -186,6 +244,34 @@ pub struct AdmissionV2 {
     pub claim_bytes: Vec<u8>,
     /// The manifest's verbatim CBOR bytes.
     pub manifest_bytes: Vec<u8>,
+    /// The admitted numeric quotas derived from `lane ∩ envelope role grants` (D0, ABI §2.6 core;
+    /// tighten-only). `None` on the pre-D0 path (no envelope grants) — the `V2RunConfig` defaults
+    /// stand there.
+    pub quotas: Option<daemon_vhc_proto::AdmittedQuotas>,
+}
+
+impl AdmissionV2 {
+    /// Copy the admitted quotas into a [`crate::v2::V2RunConfig`] — the D0 envelope→admission→
+    /// run-config derivation seam (deliverable 2). A no-op when the admission carried no envelope
+    /// grants (the config's Phase-A defaults stand). `granted_artifacts` REPLACES the config's
+    /// set (the envelope is the authority; empty grants = no artifacts, fail closed).
+    pub fn apply_quotas(&self, cfg: &mut crate::v2::V2RunConfig) {
+        let Some(q) = &self.quotas else { return };
+        // `0` admitted = "unbounded by this grant" (ABI §2.3): the driver treats 0 the same way,
+        // so the values copy through verbatim.
+        cfg.max_frame_bytes = u32::try_from(q.max_frame_bytes).unwrap_or(u32::MAX);
+        cfg.advisory_depth = usize::try_from(q.advisory_depth).unwrap_or(usize::MAX);
+        cfg.payload_depth = usize::try_from(q.payload_depth).unwrap_or(usize::MAX);
+        cfg.gossip_depth = usize::try_from(q.gossip_depth).unwrap_or(usize::MAX);
+        cfg.spool_frames = usize::try_from(q.spool_frames).unwrap_or(usize::MAX);
+        cfg.per_sender_quota = usize::try_from(q.per_sender_quota).unwrap_or(usize::MAX);
+        cfg.max_readback_bytes_per_slice = q.max_readback_bytes;
+        cfg.max_live_buffer_handles = q.max_live_handles;
+        cfg.max_live_buffer_bytes = q.max_live_bytes;
+        cfg.max_outstanding_ops = q.max_outstanding_ops;
+        cfg.compute_queue_depth = q.compute_queue_depth;
+        cfg.granted_artifacts = q.granted_artifacts.iter().map(|h| h.0).collect();
+    }
 }
 
 /// A funnel refusal: which stage refused, the typed code where one is ratified (§9.5: stages 1–3
@@ -246,6 +332,7 @@ pub fn admit_v2(
     device: &DeviceProfile,
     owner: &OwnerPolicy,
     envelope_min: Option<&daemon_vhc_proto::DeviceMinimums>,
+    envelope_grants: Option<&EnvelopeRoleGrants>,
 ) -> Result<AdmissionV2, FunnelRefusal> {
     // -- stage 1: owner participation policy — free, local, before ANY other work ----------------
     if !owner.participation_enabled {
@@ -312,6 +399,31 @@ pub fn admit_v2(
     }
 
     // -- stage 4: module fetch + assessment — selection, manifest, claim (§9.4 steps 1–7) ---------
+    //
+    // Stage-4 gates run in cost order, and the funnel stays COMPOSABLE (ratified admission-funnel
+    // design):
+    //   4.0  envelope grants vs lane (tighten-only derivation — pure, needs no module byte);
+    //   4.1  hash-verify → compile → driver selection (§1.3);
+    //   4.2  manifest decode + ABI echo + channel-table membership (vs the ADMITTED table);
+    //   4.2½ C2's custom-op registry gate (after manifest decode — the manifest names the ops);
+    //   4.3  claim evaluation vs lane claim bounds.
+    //
+    // 4.0 — the D0 grants derivation (ABI §2.6 lane ∩ envelope core): an envelope role grant list
+    // exceeding the lane's ceilings is refused `GrantsExceedLane` BEFORE any module byte is
+    // compiled (architecture §3.5 — "grants exceeding the lane's bounds are refused").
+    let quotas = match envelope_grants {
+        Some(eg) => Some(
+            daemon_vhc_proto::derive_admitted_quotas(&eg.grants, &lane.ceilings, &eg.run_artifacts)
+                .map_err(|e| {
+                    FunnelRefusal::typed(
+                        4,
+                        AbiRefusal::new(AbiRefusalCode::GrantsExceedLane, e.to_string()),
+                    )
+                })?,
+        ),
+        None => None,
+    };
+
     let selection = select_driver(worker, wasm, expected_blake3)
         .map_err(|refusal| FunnelRefusal::typed(4, refusal))?;
     if selection.driver != CandidateDriver::V2 {
@@ -341,11 +453,18 @@ pub fn admit_v2(
             ),
         ));
     }
+    // The ADMITTED channel table (§6.2): from D0 the per-role table comes from the genesis
+    // envelope's grant list when present; the Phase-A default table serves the pre-D0 path.
+    let channel_admitted = |ch: u64| -> bool {
+        match envelope_grants {
+            Some(eg) => eg.grants.channels.iter().any(|d| u64::from(d.id) == ch),
+            None => PHASE_A_DEFAULT_CHANNEL_TABLE
+                .iter()
+                .any(|d| u64::from(d.id) == ch),
+        }
+    };
     for ch in &assessed.manifest_channels {
-        if !PHASE_A_DEFAULT_CHANNEL_TABLE
-            .iter()
-            .any(|d| u64::from(d.id) == *ch)
-        {
+        if !channel_admitted(*ch) {
             return Err(FunnelRefusal::typed(
                 4,
                 AbiRefusal::new(
@@ -421,6 +540,7 @@ pub fn admit_v2(
         claim: assessed.claim,
         claim_bytes: assessed.claim_bytes,
         manifest_bytes: assessed.manifest_bytes,
+        quotas,
     })
 }
 
@@ -728,6 +848,7 @@ mod tests {
             disk_bytes: 0,
             claim_bounds_device: [0, 4 << 30],
             claim_bounds_host: [0, 4 << 30],
+            ceilings: ParticipationLane::trainer_launch_defaults().ceilings,
         }
     }
 
@@ -749,6 +870,7 @@ mod tests {
             &lane(),
             &DeviceProfile::default(),
             &owner,
+            None,
             None,
         )
         .unwrap_err();
@@ -776,10 +898,119 @@ mod tests {
             &DeviceProfile::default(),
             &owner,
             None,
+            None,
         )
         .unwrap_err();
         assert_eq!(err.stage, 2);
         assert!(err.reason.contains("below lane floor"));
+    }
+
+    /// D0 deliverable 2: an envelope role grant list exceeding the lane's ceilings is a typed
+    /// stage-4 `GrantsExceedLane` refusal — raised at gate 4.0, BEFORE any module byte is
+    /// compiled (garbage wasm proves the ordering: the grants gate fires, not `BadModule`).
+    #[test]
+    fn stage4_envelope_grants_exceeding_lane_refused_before_compile() {
+        let worker = Worker::new(crate::runtime::EngineConfig::default()).unwrap();
+        let owner = OwnerPolicy {
+            participation_enabled: true,
+            vram_cap_bytes: 0,
+            host_cap_bytes: 0,
+        };
+        let mut grants = daemon_vhc_proto::RoleGrants::default();
+        grants.channels.push(daemon_vhc_proto::ChannelDecl {
+            id: 0,
+            name: "control".into(),
+            class: 0,
+            direction: 2,
+            // Wider than the trainer lane's 16 MiB frame ceiling — tighten-only must refuse.
+            max_frame_bytes: 1 << 30,
+            rate_per_min: 60,
+            spool_frames: Some(8),
+            replay_window: Some(64),
+            per_sender_quota: Some(4),
+        });
+        let eg = EnvelopeRoleGrants {
+            grants,
+            run_artifacts: std::collections::BTreeSet::new(),
+        };
+        let err = admit_v2(
+            &worker,
+            b"not wasm",
+            None,
+            &[],
+            &[],
+            &lane(),
+            &DeviceProfile::default(),
+            &owner,
+            None,
+            Some(&eg),
+        )
+        .unwrap_err();
+        assert_eq!(err.stage, 4);
+        assert_eq!(err.code, Some(AbiRefusalCode::GrantsExceedLane));
+        assert!(err.reason.contains("max_frame_bytes"));
+    }
+
+    /// D0 deliverable 2: the admitted quotas copy into `V2RunConfig` (the Phase-B seam) —
+    /// tightened values replace the defaults; the granted-artifact set replaces the config's.
+    #[test]
+    fn apply_quotas_copies_admitted_values_into_run_config() {
+        let quotas = daemon_vhc_proto::AdmittedQuotas {
+            max_frame_bytes: 4096,
+            spool_frames: 32,
+            per_sender_quota: 8,
+            advisory_depth: 16,
+            payload_depth: 24,
+            gossip_depth: 12,
+            max_live_handles: 40,
+            max_live_bytes: 1 << 16,
+            max_readback_bytes: 1 << 14,
+            max_outstanding_ops: 6,
+            compute_queue_depth: 48,
+            granted_artifacts: [daemon_vhc_proto::Hash([7u8; 32])].into_iter().collect(),
+        };
+        let admission = AdmissionV2 {
+            selection: Selection {
+                driver: CandidateDriver::V2,
+                major: 2,
+                minor: 0,
+            },
+            claim: MemoryClaim {
+                hard_accountable: TierBytes::default(),
+                declared_peak: TierBytes::default(),
+                workspace: TierBytes::default(),
+                under_pressure: Vec::new(),
+            },
+            claim_bytes: Vec::new(),
+            manifest_bytes: Vec::new(),
+            quotas: Some(quotas),
+        };
+        let identity = crate::v2::RunIdentity {
+            run_id: [0u8; 32],
+            epoch: 0,
+            role: "worker".into(),
+            instance: 1,
+            module: [0u8; 32],
+        };
+        let mut cfg = crate::v2::V2RunConfig::new(identity, [0u8; 32], vec![], vec![]);
+        admission.apply_quotas(&mut cfg);
+        assert_eq!(cfg.max_frame_bytes, 4096);
+        assert_eq!(cfg.spool_frames, 32);
+        assert_eq!(cfg.per_sender_quota, 8);
+        assert_eq!(cfg.advisory_depth, 16);
+        assert_eq!(cfg.payload_depth, 24);
+        assert_eq!(cfg.gossip_depth, 12);
+        assert_eq!(cfg.max_live_buffer_handles, 40);
+        assert_eq!(cfg.max_live_buffer_bytes, 1 << 16);
+        assert_eq!(cfg.max_readback_bytes_per_slice, 1 << 14);
+        assert_eq!(cfg.max_outstanding_ops, 6);
+        assert_eq!(cfg.compute_queue_depth, 48);
+        assert_eq!(
+            cfg.granted_artifacts,
+            [[7u8; 32]]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
     }
 
     #[test]

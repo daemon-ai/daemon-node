@@ -22,8 +22,10 @@
 //!   envelope's artifact map via [`daemon_vhc_net::ArtifactResolver`] (`file://`, blake3-verified).
 //!   `DAEMON_TRAIN_MODULE`, if set, overrides the artifact resolution (dev / node-controlled). It then
 //!   runs the static import scan vs the host vocabulary + a host meta-mode pass → `Assessed`, caching
-//!   the config + module bytes for the subsequent `JoinRun`. A raw-config-CBOR envelope (no signature
-//!   wrapper) is still accepted as a legacy path (module from `DAEMON_TRAIN_MODULE`).
+//!   the config + module bytes for the subsequent `JoinRun`. **A raw-config-CBOR envelope (no
+//!   signature wrapper) is REFUSED — the unsigned legacy path was retired at D0 with the typed
+//!   `UnsignedEnvelopeRetired` refusal** (refactor §8/D0); `DAEMON_TRAIN_MODULE` survives as the
+//!   module-source override inside the signed path only.
 //! - `JoinRun` → construct a `WasmBackend`, emit `RunPhase{train}`, self-drive one round
 //!   (train × H → make_update → ingest) and stream `Metric`/`RoundOutcome`.
 //! - `Throttle{paused}` → `WasmBackend::pause`/`resume` (preemption-as-churn, §10.5).

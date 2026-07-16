@@ -1544,11 +1544,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-sdk-consensus"
+version = "0.0.1"
+dependencies = [
+ "daemon-vhc-proto",
+]
+
+[[package]]
 name = "daemon-vhc-sdk-rounds"
 version = "0.0.1"
 dependencies = [
  "blake3",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
 ]
 
 [[package]]

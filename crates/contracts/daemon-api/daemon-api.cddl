@@ -1060,7 +1060,14 @@ swarm-eligibility = { "eligible": bool, "reasons": [* tstr], "headroom": { * tst
 swarm-capabilities = { "abi_version": uint, "ops": [* tstr], "payload_stores": [* tstr] }
 swarm-hardware-report = { "gpus": uint, "vram_mb": uint64, "shared_mb": uint64, "ram_mb": uint64, "backend_lanes": [* tstr], "capabilities": swarm-capabilities, "up_kbps": uint64, "down_kbps": uint64, "disk_free_mb": uint64, "throughput_class": tstr }   ; shared_mb additive wire v42 (UMA spillover mirror)
 swarm-contribution = { "rounds": uint64, "tokens": uint64, "bytes_up": uint64, "bytes_down": uint64, "witness_count": uint64, "checkpoint_credits": uint64 }
-swarm-run-summary = { "run_id": tstr, "phase": tstr, "joined": bool, "eligibility": swarm-eligibility, ? "policy": swarm-policy, "last_round": uint64 }
+; D0 additive (envelope v2; node-decides/apps-render): the optional run-identity fields mirror the
+; swarm.db M2 columns — `run_id_hash` is lowercase hex of the 32-byte genesis RunId (absent for a
+; v1-only run); `epoch`/`role`/`instance` complete the execution identity; the trailing four are
+; the D5 sunset-observability fields (envelope schema major, module da_abi major, selected driver,
+; current module blake3 hex). Absent on pre-D0 nodes — pure additive rev.
+swarm-run-summary = { "run_id": tstr, "phase": tstr, "joined": bool, "eligibility": swarm-eligibility, ? "policy": swarm-policy, "last_round": uint64,
+                      ? "run_id_hash": tstr, ? "epoch": uint64, ? "role": tstr, ? "instance": uint64,
+                      ? "envelope_schema_major": uint, ? "module_abi_major": uint, ? "selected_driver": tstr, ? "module_hash": tstr }
 swarm-run-detail = { "summary": swarm-run-summary, "coordinator": tstr, "contribution": swarm-contribution, "recent_events": [* swarm-event] }
 swarm-leave-mode = "graceful" / "immediate"
 swarm-event-phase = { "Phase": { "run_id": tstr, "phase": tstr, "epoch": uint64, "round": uint64 } }

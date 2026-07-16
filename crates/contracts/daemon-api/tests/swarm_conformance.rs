@@ -132,6 +132,24 @@ fn summary(joined: bool, policy: Option<SwarmPolicy>) -> SwarmRunSummary {
         eligibility: eligibility(),
         policy,
         last_round: 17,
+        // The D0 additive fields absent — the pre-D0 / v1-only-row encoding (skip-if-none).
+        ..SwarmRunSummary::default()
+    }
+}
+
+/// A v2-identified run row carrying every D0 additive field (envelope v2: the hex RunId,
+/// execution-identity trio, and the D5 sunset-observability fields).
+fn summary_v2() -> SwarmRunSummary {
+    SwarmRunSummary {
+        run_id_hash: Some("ab".repeat(32)),
+        epoch: Some(3),
+        role: Some("worker".into()),
+        instance: Some(42),
+        envelope_schema_major: Some(2),
+        module_abi_major: Some(2),
+        selected_driver: Some("v2".into()),
+        module_hash: Some("22".repeat(32)),
+        ..summary(true, Some(policy(SwarmPolicyMode::Idle, None)))
     }
 }
 
@@ -204,6 +222,8 @@ fn swarm_responses_validate() {
             ApiResponse::SwarmRuns(vec![
                 summary(false, None),
                 summary(true, Some(policy(SwarmPolicyMode::Manual, None))),
+                // D0 additive: a v2-identified row with the full run-identity + observability set.
+                summary_v2(),
             ]),
         ),
         (

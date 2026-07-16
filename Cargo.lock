@@ -4888,6 +4888,7 @@ name = "daemon-vhc-coordinator"
 version = "0.0.1"
 dependencies = [
  "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
  "proptest",
  "serde",
 ]
@@ -5034,11 +5035,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-sdk-consensus"
+version = "0.0.1"
+dependencies = [
+ "daemon-vhc-proto",
+]
+
+[[package]]
 name = "daemon-vhc-sdk-rounds"
 version = "0.0.1"
 dependencies = [
  "blake3",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
 ]
 
 [[package]]
@@ -5064,6 +5073,7 @@ dependencies = [
  "daemon-vhc-net",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
  "figment",
  "futures",
  "serde",
@@ -5110,6 +5120,7 @@ dependencies = [
  "daemon-vhc-coordinator",
  "daemon-vhc-host",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
 ]
 
 [[package]]

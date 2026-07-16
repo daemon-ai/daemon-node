@@ -575,6 +575,17 @@ impl SwarmApi for SwarmService {
 
 fn run_summary(run: PersistedRun) -> SwarmRunSummary {
     let joined = run.desired_state == DesiredState::Joined;
+    let hex = |bytes: &[u8; 32]| {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    };
+    // The D0 execution-identity trio travels only once the run is v2-identified (its RunId is
+    // backfilled); a v1-only row keeps them absent — its identity is the RunLabel alone
+    // (decisions D1 lazy backfill).
+    let v2_identified = run.run_id_hash.is_some();
     SwarmRunSummary {
         run_id: run.run_id,
         phase: run.last_phase,
@@ -582,6 +593,14 @@ fn run_summary(run: PersistedRun) -> SwarmRunSummary {
         eligibility: run.eligibility,
         policy: if joined { Some(run.policy) } else { None },
         last_round: run.last_round,
+        run_id_hash: run.run_id_hash.as_ref().map(hex),
+        epoch: v2_identified.then_some(run.epoch),
+        role: v2_identified.then(|| run.role.clone()),
+        instance: v2_identified.then_some(run.instance),
+        envelope_schema_major: Some(run.envelope_schema_major),
+        module_abi_major: run.module_abi_major,
+        selected_driver: run.selected_driver,
+        module_hash: run.module_hash.as_ref().map(hex),
     }
 }
 

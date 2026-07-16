@@ -30,6 +30,12 @@ daemon-vhc-coordinator = { workspace = true }
 daemon-vhc-abi = { workspace = true }
 # The signed control-plane wire (SignedMessage / SwarmMessage), envelope, blake3. contracts/*.
 daemon-vhc-proto = { workspace = true }
+# Assignment math (moved from the proto to the consensus SDK layer at D0, refactor §8/D0) — the
+# barrier harness re-derives worker windows with the same `assign_batches` the guests use.
+# TRACKED dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/* is transitional
+# and is reviewed/retired as D2 re-seats consumers (the whole-run harness then drives the wasm
+# coordinator, and native assignment re-derivation moves to SDK-side vhc-sim).
+daemon-vhc-sdk-consensus = { workspace = true }
 blake3 = { workspace = true }
 ciborium = { workspace = true }
 

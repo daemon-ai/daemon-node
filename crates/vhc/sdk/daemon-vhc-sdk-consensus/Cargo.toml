@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-sdk-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The consensus SDK layer (architecture §7 `sdk/daemon-vhc-sdk-consensus`; refactor §8/D0):
+# deterministic batch-window **assignment math** moved out of `daemon-vhc-proto` at D0 — the proto
+# is algorithm-free wire mechanism from D0 on (dep-check-enforced). D1 adds `Authority` +
+# `Committed<T>` here; D2 adds the coordinator drivers. Linked by worker drivers
+# (daemon-vhc-sdk-rounds), coordinator drivers, the simulator, and — transitionally, as tracked
+# dep-check exceptions retiring at D2 — the native coordinator, the session's v1 RoundEngine, and
+# the testkit's barrier harness.
+#
+# Dependency rules (architecture §7, CI-enforced): sdk/* links contracts/* and lower sdk layers
+# ONLY — never host/*. This crate links exactly `daemon-vhc-proto` (wire types: PeerId/Seed/
+# GlobalBatch/BatchWindow/ThroughputClass + blake3 hashing), staying wasm32-clean.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+daemon-vhc-proto = { workspace = true }
+
+[lints]
+workspace = true

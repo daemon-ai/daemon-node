@@ -12,8 +12,8 @@
 mod common;
 
 use common::*;
+use daemon_vhc_coordinator::elect_checkpointer;
 use daemon_vhc_coordinator::{tick, ClientState, CoordinatorState, Input, Notice, Output, Phase};
-use daemon_vhc_proto::assignment::elect_checkpointer;
 use daemon_vhc_proto::{peer_id, PeerId, Seed};
 
 /// Drive round `round` to finalize: `committers` commit + are storage-receipted. If the committed

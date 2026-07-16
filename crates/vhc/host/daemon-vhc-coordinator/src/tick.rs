@@ -15,10 +15,8 @@ use daemon_vhc_proto::messages::{
     SignedMessage, StorageReceipt, Straggle, SwarmMessage,
 };
 use daemon_vhc_proto::sign::Signed;
-use daemon_vhc_proto::{
-    blake3_hash, commit_set, global_batch_at, select_committee, Hash, PeerId, Seed,
-    SwarmProtoVersion,
-};
+use daemon_vhc_proto::{blake3_hash, commit_set, Hash, PeerId, Seed, SwarmProtoVersion};
+use daemon_vhc_sdk_consensus::{global_batch_at, select_committee};
 
 use crate::admission::{admit, JoinCandidate};
 use crate::commit::{all_committed, all_evidenced, committed_entries};

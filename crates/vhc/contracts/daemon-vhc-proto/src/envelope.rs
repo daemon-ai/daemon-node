@@ -240,20 +240,30 @@ impl Envelope {
 /// never MB/Mbps): the run author's device floor, evaluated at funnel stage 3 **before the
 /// module is downloaded**. All fields optional — absent means "no constraint". `gpu` follows the
 /// lane convention: 0 = forbidden, 1 = optional, 2 = required.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceMinimums {
     /// 0 = forbidden, 1 = optional, 2 = required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<u64>,
     /// Minimum device memory, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vram_bytes: Option<u64>,
     /// Minimum host RAM, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_bytes: Option<u64>,
     /// Minimum free disk, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_bytes: Option<u64>,
     /// Minimum uplink, bits/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up_bps: Option<u64>,
     /// Minimum downlink, bits/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down_bps: Option<u64>,
+    /// Acceptable device backend classes (e.g. `"cuda"`, `"vulkan"`); empty means "no
+    /// constraint" (ABI §9.3 `backend_class`). Additive: absent in the v1 `device_min` section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backend_class: Vec<String>,
 }
 
 /// A frozen, hashed, signed envelope — the immutable run snapshot (spec §6.1, §11.3).
@@ -351,6 +361,24 @@ impl FrozenEnvelope {
                 _ => None,
             })
         };
+        let backend_class = fields
+            .iter()
+            .find_map(|(k, v)| match k {
+                ciborium::value::Value::Text(t) if t == "backend_class" => match v {
+                    ciborium::value::Value::Array(items) => Some(
+                        items
+                            .iter()
+                            .filter_map(|i| match i {
+                                ciborium::value::Value::Text(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or_default();
         Some(DeviceMinimums {
             gpu: uint("gpu"),
             vram_bytes: uint("vram_bytes"),
@@ -358,6 +386,7 @@ impl FrozenEnvelope {
             disk_bytes: uint("disk_bytes"),
             up_bps: uint("up_bps"),
             down_bps: uint("down_bps"),
+            backend_class,
         })
     }
 

@@ -17,6 +17,12 @@ path = "src/lib.rs"
 # (lane R owns `bins/`), which re-adds the server dependencies then. Root Cargo.toml is FROZEN and
 # untouched.
 daemon-vhc-proto = { workspace = true }
+# The assignment math this native coordinator drives moved to the consensus SDK layer at D0
+# (refactor §8/D0). This is a TRACKED dependency-direction exception (xtask vhc_dep_check):
+# host/* -> sdk/* is transitional here and retires at D2, when this crate dissolves into
+# `sdk-consensus` + `guests/coordinator-quorum` and native coordination moves to SDK-side
+# `vhc-sim` (which may link sdk-consensus legitimately).
+daemon-vhc-sdk-consensus = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

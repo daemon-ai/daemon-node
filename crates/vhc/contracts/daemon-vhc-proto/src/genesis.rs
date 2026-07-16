@@ -1,0 +1,646 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+//! The **genesis envelope v2** — the D0 schema migration (architecture §5.1; refactor §8/D0).
+//!
+//! This is an **additive** schema that lives beside the frozen v1 [`crate::envelope::Envelope`]
+//! (schema major 1), which is untouched. A genesis envelope is `[run].schema == 2` and carries
+//! **mechanism only** (architecture §5.1):
+//!
+//! - **role set** — `{role → (lane selector, module blake3, opaque config, grant list)}`
+//!   ([`RoleEntry`]). Roles are envelope-level labels the host never interprets beyond the lane
+//!   selection and the per-role device minimums (architecture §3.5, §5.1). The same module hash
+//!   may serve several roles with different configs.
+//! - **host-readable minimum device requirements per role** ([`crate::envelope::DeviceMinimums`])
+//!   — the pre-screen filter (ABI §9.3), checked from the envelope alone before any module fetch;
+//!   tighten-only against the selected lane (the host computes `max(lane floor, envelope
+//!   minimums)` at admission).
+//! - **artifact map with pinned snapshot descriptors** ([`SnapshotArtifact`]) — the mutable-source
+//!   pin at the edge (architecture §3.4/§5.1): a source like `hf://repo@rev` is resolved **once,
+//!   globally**, into a content-addressed descriptor whose `blake3` is committed into the genesis
+//!   hash; hosts only fetch-and-verify.
+//! - **opaque `Authority` configuration** ([`GenesisEnvelope::authority`]) — a raw CBOR value the
+//!   host never interprets; D1's `daemon-vhc-sdk-consensus` gives it meaning (architecture §4.2).
+//! - **transport selection** ([`TransportSelection`]) — which control-plane transports the hosts
+//!   bring up; the always-on `DualPlane` becomes envelope config, iroh-only default (architecture
+//!   §2).
+//! - **identities** ([`Identities`]) — the coordinator identity/keyset and the upgrade-authority
+//!   keys (architecture §5.1). The cryptographic **`RunId`** is *not* stored: it **is** the
+//!   genesis hash ([`FrozenGenesis::run_id`]); the human/registry-facing **`RunLabel`** lives in
+//!   [`RunSectionV2::run_label`] (decisions D1 — the string→`RunLabel`, hash→`RunId` split).
+//!
+//! The host-visible `[data]` schedule and `[phases]` policy of the v1 envelope **do not exist**
+//! here — they became worker-module and coordinator-module opaque config respectively (each role's
+//! [`RoleEntry::config`]); admission no longer pre-screens `round_mode` (refactor §8/D0).
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::bytes::{Hash, PeerId, Signature};
+use crate::canonical::{from_canonical_slice, to_canonical_vec};
+use crate::envelope::{Access, DeviceMinimums};
+use crate::error::SwarmProtoError;
+use crate::hash::blake3_hash;
+use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
+
+/// The genesis-envelope schema major this build understands (architecture §5.1; the v2 cell of the
+/// ratified mixed-fleet matrix — decisions D3). Distinct from the v1
+/// [`crate::envelope::ENVELOPE_SCHEMA_MAJOR`] (`1`).
+pub const GENESIS_SCHEMA_MAJOR: u32 = 2;
+
+/// A control-plane transport a run may bring up (architecture §2 — "the envelope declares which
+/// transports a run uses; the default is iroh-only"). `DualPlane` stops being an always-on host
+/// constant and becomes this selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlTransport {
+    /// iroh gossip/streams (with a self-run relay) — the default.
+    Iroh,
+    /// WebSocket control plane.
+    WebSocket,
+    /// In-memory (simulation only).
+    Mem,
+}
+
+/// `[transport]` — control-plane transports + the bulk payload store selector (architecture §2,
+/// §7.1). `control` is ordered by preference; the default is iroh-only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportSelection {
+    /// The control-plane transports the hosts bring up (ordered; iroh-only default).
+    pub control: Vec<ControlTransport>,
+    /// The bulk payload plane selector (e.g. `"r2"`, `"fs"`); §7.1.
+    pub payload_store: String,
+}
+
+impl Default for TransportSelection {
+    fn default() -> Self {
+        Self {
+            control: vec![ControlTransport::Iroh],
+            payload_store: "r2".to_string(),
+        }
+    }
+}
+
+/// A single external object, **pinned by a content-addressed snapshot descriptor** (architecture
+/// §3.4/§5.1). `url` is the author's source (`hf://repo@rev`, `r2://`, `https://`, `file://`); it
+/// was resolved once at authoring time into `blake3`, the committed content hash the host verifies
+/// on fetch. An unpinned `hf://` source (no `@rev`) is an authoring error the author must fix
+/// before freeze — the host never resolves a mutable source itself (admission-time resolution
+/// could bind different snapshots on different hosts).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotArtifact {
+    /// The author's source URL (already edge-resolved to a pinned revision).
+    pub url: String,
+    /// The committed blake3 content hash the host fetches and verifies against.
+    pub blake3: Hash,
+    /// The pinned byte size where the author recorded it (`None` = not pinned).
+    pub size: Option<u64>,
+}
+
+/// A per-grant numeric/enumerated bound (ABI §2.3 `grant-bound`). Every field is optional; an
+/// absent field means "unbounded by this grant" (still bounded by the lane ceiling at admission).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantBound {
+    /// Per-item byte ceiling (e.g. publish payload, readback value).
+    pub max_bytes: Option<u64>,
+    /// Per-event-slice call ceiling for this grant.
+    pub max_per_slice: Option<u64>,
+    /// Sustained rate ceiling (token bucket, per minute).
+    pub rate_per_min: Option<u64>,
+    /// Concurrent-operation ceiling (Phase B completions).
+    pub max_outstanding: Option<u64>,
+    /// Enumerated allowed values (topics, dataset hashes, sources).
+    pub values: Vec<String>,
+}
+
+/// A per-world grant (ABI §2.6 `world-grant`): the namespace minor + its per-grant bounds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldGrant {
+    /// The negotiated namespace minor.
+    pub minor: u64,
+    /// Per-grant bounds keyed by grant name.
+    pub bounds: BTreeMap<String, GrantBound>,
+}
+
+/// A channel declaration (ABI §6.2 `channel-decl`). From D0 the per-role channel table lives in
+/// the envelope (the ABI surface — `publish(channel_id, …)`, `frame-ev.channel`, the §12 scope
+/// tuple — is unchanged). Authoritative-channel bounds (`spool_frames`, `replay_window`,
+/// `per_sender_quota`) are `None` for advisory/gossip channels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelDecl {
+    /// The channel id the guest selects in `publish` / matches in `frame-ev`.
+    pub id: u32,
+    /// A human name.
+    pub name: String,
+    /// Delivery class: 0 = authoritative, 1 = advisory/gossip.
+    pub class: u8,
+    /// Direction: 0 = rx-only, 1 = tx-only, 2 = bidirectional.
+    pub direction: u8,
+    /// Per-frame byte ceiling.
+    pub max_frame_bytes: u64,
+    /// tx token bucket, per minute.
+    pub rate_per_min: u64,
+    /// Authoritative-only: bounded durable spool depth.
+    pub spool_frames: Option<u64>,
+    /// Authoritative-only: dedup window (frames).
+    pub replay_window: Option<u64>,
+    /// Authoritative-only: rx per-sender outstanding quota.
+    pub per_sender_quota: Option<u64>,
+}
+
+/// One advisory-class queue declaration (ABI §2.3 `event-caps`): `{depth, coalesce}` where
+/// `coalesce` is the fixed per-class code (0 = dedup-by-hash, 1 = latest-wins, 2 = drop-oldest).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCap {
+    /// Bounded queue depth.
+    pub depth: u64,
+    /// The fixed coalescing code for this class.
+    pub coalesce: u64,
+}
+
+/// The advisory-class depth/coalescing declarations (ABI §2.3 `event-caps`), keyed by class name
+/// (`"payload-ready"` / `"timer"` / `"gossip"`). Authoritative channels are NOT declared here —
+/// their bounds live in the channel table.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCaps {
+    /// Class → `{depth, coalesce}`.
+    pub classes: BTreeMap<String, EventCap>,
+}
+
+/// Live-resource quotas (ABI §2.3 `buffer-req`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BufferReq {
+    /// Standing live-resource ceiling (all instance-class resources).
+    pub max_live_handles: u64,
+    /// Standing live-buffer byte ceiling (Phase B buffers).
+    pub max_live_bytes: u64,
+    /// Per-slice ceiling on bytes crossing into linear memory.
+    pub max_readback_bytes: u64,
+}
+
+/// The migration grant (ABI §2.6 `migration-grant`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationGrant {
+    /// Whether `read_back(kind = state-section)` restore is permitted during `da_migrate`.
+    pub restore: bool,
+    /// Max migration sections.
+    pub max_sections: u64,
+    /// Max bytes per section.
+    pub max_section_bytes: u64,
+}
+
+/// The **envelope role grant list** (architecture §5.1; the "envelope role grant list" contributor
+/// to the ABI §2.6 derived grants document). This is what a role's module *may* reach; the host
+/// intersects it with the selected lane's ceilings and the owner's standing policy to derive the
+/// admitted grants (tighten-only — a role whose grants exceed the lane's bounds is refused at
+/// admission, architecture §3.5). The fields mirror the ABI grant vocabulary and map onto the
+/// Phase-B `V2RunConfig` quotas (`payload_depth`/`advisory_depth`/`gossip_depth`, spool bounds,
+/// stream credit, `granted_artifacts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleGrants {
+    /// Per-world grants (`"vhc"`/`"net"`/`"sys"`/`"data"`/`"compute"`).
+    pub worlds: BTreeMap<String, WorldGrant>,
+    /// Versioned host custom-op names required (architecture §3.2).
+    pub custom_ops: Vec<String>,
+    /// The role's channel table (ABI §6.2).
+    pub channels: Vec<ChannelDecl>,
+    /// Advisory-class depths + coalescing.
+    pub events: EventCaps,
+    /// Live-resource quotas.
+    pub buffers: BufferReq,
+    /// The granted artifact hashes — a subset of the run's [`GenesisEnvelope::artifacts`] this role
+    /// may `data.fetch` ("which artifacts a module may touch is a grant", architecture §3.2).
+    pub artifacts: BTreeSet<Hash>,
+    /// Async-completion concurrent-operation ceiling (`grant-bound.max_outstanding`).
+    pub max_outstanding_ops: u64,
+    /// compute@2 command-queue depth grant (C1, ABI §15; D0∩C1 union). `0` = unspecified —
+    /// inherits the lane ceiling at derivation (tighten-only, like the other quotas).
+    #[serde(default)]
+    pub compute_queue_depth: u64,
+    /// The migration grant, when the role participates in live upgrades.
+    pub migration: Option<MigrationGrant>,
+}
+
+/// One role in the run's role set (architecture §5.1): `role → (lane selector, module blake3,
+/// opaque config, grant list)` plus the host-readable device minimums.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoleEntry {
+    /// The **lane selector** — which versioned `ParticipationLane` this role admits under
+    /// (`"trainer"` / `"verifier"` / `"coordinator"`). The host maps this to a node-side lane
+    /// profile at admission; the envelope may tighten a lane, never weaken it.
+    pub lane: String,
+    /// The artifact-map key of this role's wasm module (its `blake3` is the pinned module hash).
+    pub module: String,
+    /// The tensor/loop ABI the module targets, e.g. `"vhc@2"` (informational; the host derives the
+    /// driver from the module's static imports, ABI §1.3).
+    pub abi: String,
+    /// The role's **opaque module config** — the worker's data schedule / the coordinator's phase
+    /// policy live here now (refactor §8/D0). Never interpreted by the host (the seam rule).
+    pub config: ciborium::value::Value,
+    /// The role's grant list.
+    pub grants: RoleGrants,
+    /// The host-readable per-role device minimums (ABI §9.3), tighten-only vs the lane floor.
+    pub device_min: DeviceMinimums,
+}
+
+/// `[identities]` — the run's cryptographic identities (architecture §5.1). Opaque-ish to the host
+/// (it stamps the coordinator identity into certificates); D1's `Authority` gives the keyset
+/// meaning.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identities {
+    /// The launch coordinator identity (`SingleKey`, architecture §4.2).
+    pub coordinator: Option<PeerId>,
+    /// The coordinator keyset (`ThresholdKeys`, D1); empty for `SingleKey`.
+    pub coordinator_set: Vec<PeerId>,
+    /// The upgrade-authority keys (architecture §5.4 two-key model).
+    pub upgrade_authority: Vec<PeerId>,
+}
+
+/// `[run]` for a genesis envelope (architecture §5.1). Distinct from v1 [`crate::envelope::
+/// RunSection`] in that identity is the cryptographic **`RunId`** (the genesis hash) — carried
+/// here only as the human/registry-facing **`RunLabel`** string (decisions D1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSectionV2 {
+    /// Envelope schema major — MUST be [`GENESIS_SCHEMA_MAJOR`].
+    pub schema: u32,
+    /// The human/registry-facing run handle (the old string `run_id`, renamed — decisions D1). The
+    /// cryptographic `RunId` is the genesis hash, not stored here.
+    pub run_label: String,
+    /// Minimum healthy peers to leave `WaitingForMembers`.
+    pub min_peers: u32,
+    /// Roster ceiling.
+    pub max_peers: u32,
+    /// Admission policy.
+    pub access: Access,
+}
+
+/// A resolved **genesis envelope** (architecture §5.1) — envelope schema v2.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GenesisEnvelope {
+    /// `[run]`.
+    pub run: RunSectionV2,
+    /// The role set — `role → (lane, module, opaque config, grants, device minimums)`.
+    pub roles: BTreeMap<String, RoleEntry>,
+    /// `[artifacts]` — name → pinned snapshot descriptor.
+    pub artifacts: BTreeMap<String, SnapshotArtifact>,
+    /// Opaque `Authority` configuration — interpreted by modules (D1), never by the host.
+    pub authority: ciborium::value::Value,
+    /// Control-plane transport selection + payload store.
+    pub transport: TransportSelection,
+    /// The run's cryptographic identities.
+    pub identities: Identities,
+}
+
+impl GenesisEnvelope {
+    /// Validate the resolved genesis envelope against the schema rules the host enforces from the
+    /// envelope **alone** (architecture §5.1) — a known schema major, a sane peer floor/ceiling,
+    /// at least a coordinator and a worker role, every role's module + granted artifacts present
+    /// in the artifact map, and a non-empty lane selector per role.
+    ///
+    /// Grants-exceed-lane and device-below-floor are **admission-time** judgments (they need the
+    /// node's lane profiles and device probe, architecture §3.5), not envelope-internal — they are
+    /// not checked here.
+    pub fn validate(&self) -> Result<(), SwarmProtoError> {
+        if self.run.schema != GENESIS_SCHEMA_MAJOR {
+            return Err(SwarmProtoError::Validation(format!(
+                "unknown genesis schema major {} (this build understands \
+                 {GENESIS_SCHEMA_MAJOR})",
+                self.run.schema
+            )));
+        }
+        if self.run.min_peers == 0 {
+            return Err(SwarmProtoError::Validation("min_peers must be >= 1".into()));
+        }
+        if self.run.max_peers < self.run.min_peers {
+            return Err(SwarmProtoError::Validation(
+                "max_peers must be >= min_peers".into(),
+            ));
+        }
+        if self.roles.is_empty() {
+            return Err(SwarmProtoError::Validation(
+                "a genesis envelope must declare at least one role".into(),
+            ));
+        }
+        // "Every run has at least a coordinator role and one worker role" (architecture §5.1).
+        // Roles are opaque labels the host never interprets, so this checks for the two canonical
+        // label prefixes only as a well-formedness floor (an author may name either explicitly).
+        let has_coordinator = self.roles.keys().any(|r| r.contains("coordinator"));
+        let has_worker = self.roles.keys().any(|r| !r.contains("coordinator"));
+        if !has_coordinator || !has_worker {
+            return Err(SwarmProtoError::Validation(
+                "a genesis envelope must declare at least a coordinator role and one worker role \
+                 (architecture §5.1)"
+                    .into(),
+            ));
+        }
+        let artifact_hashes: BTreeSet<Hash> = self.artifacts.values().map(|a| a.blake3).collect();
+        for (name, role) in &self.roles {
+            if role.lane.is_empty() {
+                return Err(SwarmProtoError::Validation(format!(
+                    "role `{name}` has an empty lane selector"
+                )));
+            }
+            let Some(module) = self.artifacts.get(&role.module) else {
+                return Err(SwarmProtoError::Validation(format!(
+                    "role `{name}` module `{}` is not present in [artifacts]",
+                    role.module
+                )));
+            };
+            // Snapshot descriptors must be pinned: a zero size where declared is fine, but the
+            // blake3 is the pin and is always present (byte newtype). Guard the obvious authoring
+            // slip of an all-zero hash on a role's module.
+            if module.blake3 == Hash([0u8; 32]) {
+                return Err(SwarmProtoError::Validation(format!(
+                    "role `{name}` module `{}` has an unpinned (all-zero) blake3",
+                    role.module
+                )));
+            }
+            for granted in &role.grants.artifacts {
+                if !artifact_hashes.contains(granted) {
+                    return Err(SwarmProtoError::Validation(format!(
+                        "role `{name}` grants artifact {} absent from the artifact map",
+                        granted.to_hex()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Freeze the genesis envelope: validate, serialize to canonical CBOR, hash (blake3), and sign
+    /// the hash with the author's key. The hash **is** the run's cryptographic `RunId`
+    /// (architecture §5.1). The returned [`FrozenGenesis`] is the only form peers and the
+    /// coordinator ever see.
+    pub fn freeze(&self, key: &SigningKey) -> Result<FrozenGenesis, SwarmProtoError> {
+        self.validate()?;
+        let bytes = to_canonical_vec(self)?;
+        let hash = blake3_hash(&bytes);
+        let signature = sign_canonical(key, &hash)?;
+        Ok(FrozenGenesis {
+            bytes,
+            hash,
+            signature,
+            signer: peer_id(key),
+        })
+    }
+}
+
+/// A frozen, hashed, signed genesis envelope — the immutable run snapshot whose hash is the
+/// cryptographic `RunId` (architecture §5.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenGenesis {
+    bytes: Vec<u8>,
+    hash: Hash,
+    signature: Signature,
+    signer: PeerId,
+}
+
+impl FrozenGenesis {
+    /// Reconstruct from bytes received over the wire, verifying the signature. The canonical form
+    /// is re-derived so a peer never trusts a supplied hash (`FrozenEnvelope::open` discipline —
+    /// the hash is always over the received bytes).
+    pub fn open(
+        bytes: Vec<u8>,
+        signature: Signature,
+        signer: PeerId,
+    ) -> Result<Self, SwarmProtoError> {
+        let envelope: GenesisEnvelope = from_canonical_slice(&bytes)?;
+        envelope.validate()?;
+        let hash = blake3_hash(&bytes);
+        let frozen = Self {
+            bytes,
+            hash,
+            signature,
+            signer,
+        };
+        frozen.verify()?;
+        Ok(frozen)
+    }
+
+    /// The canonical CBOR bytes of the resolved genesis envelope.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The blake3 genesis hash — **this is the cryptographic `RunId`** (architecture §5.1; ABI
+    /// §8.1 `run_id: bstr .size 32`).
+    #[must_use]
+    pub fn run_id(&self) -> &Hash {
+        &self.hash
+    }
+
+    /// The human/registry-facing `RunLabel` (decisions D1). When a node carries both a `RunLabel`
+    /// and a `RunId`, they must agree — a `RunLabel` resolving to a different genesis hash is a
+    /// typed refusal (that cross-check is a host/node concern; this accessor is the label side).
+    pub fn run_label(&self) -> Result<String, SwarmProtoError> {
+        Ok(self.decode()?.run.run_label)
+    }
+
+    /// The author's ed25519 signature over [`FrozenGenesis::run_id`].
+    #[must_use]
+    pub fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    /// The author's node identity.
+    #[must_use]
+    pub fn signer(&self) -> &PeerId {
+        &self.signer
+    }
+
+    /// Decode the resolved genesis envelope from the frozen bytes.
+    pub fn decode(&self) -> Result<GenesisEnvelope, SwarmProtoError> {
+        from_canonical_slice(&self.bytes)
+    }
+
+    /// The canonical CBOR of a role's opaque module config — byte-identically what that role's
+    /// module receives as its `da_init`/`da_build` config input (the per-role analogue of v1's
+    /// single `[experiment.config]`). `None` for an unknown role.
+    pub fn role_config_bytes(&self, role: &str) -> Result<Option<Vec<u8>>, SwarmProtoError> {
+        let env = self.decode()?;
+        match env.roles.get(role) {
+            Some(entry) => Ok(Some(to_canonical_vec(&entry.config)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Verify integrity: the stored hash matches blake3 of the bytes, and the signature verifies.
+    pub fn verify(&self) -> Result<(), SwarmProtoError> {
+        let recomputed = blake3_hash(&self.bytes);
+        if recomputed != self.hash {
+            return Err(SwarmProtoError::Validation(
+                "genesis hash does not match its bytes".into(),
+            ));
+        }
+        verify_canonical(&self.signer, &self.signature, &self.hash)
+    }
+}
+
+/// Peek at the `[run].schema` major of a frozen envelope's raw bytes **without** committing to a
+/// typed decode — the schema sniff the dual-driver worker and the node use to route a run to the
+/// v1 vs v2 path and to enforce the ratified mixed-fleet matrix refusals (decisions D3: a v1
+/// driver under envelope v2 is a typed refusal, and vice versa). Returns `None` if the bytes are
+/// not a CBOR map or carry no integer `schema` key.
+#[must_use]
+pub fn peek_schema(bytes: &[u8]) -> Option<u32> {
+    let v: ciborium::value::Value = ciborium::de::from_reader(bytes).ok()?;
+    let ciborium::value::Value::Map(entries) = v else {
+        return None;
+    };
+    // Both v1 `Envelope` and v2 `GenesisEnvelope` nest schema under `[run].schema`.
+    let run = entries.iter().find_map(|(k, val)| match k {
+        ciborium::value::Value::Text(t) if t == "run" => Some(val),
+        _ => None,
+    })?;
+    let ciborium::value::Value::Map(run_fields) = run else {
+        return None;
+    };
+    run_fields.iter().find_map(|(k, val)| match k {
+        ciborium::value::Value::Text(t) if t == "schema" => val
+            .as_integer()
+            .and_then(|n| u32::try_from(i128::from(n)).ok()),
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sign::SigningKey;
+
+    fn hash(n: u8) -> Hash {
+        Hash([n; 32])
+    }
+
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn sample() -> GenesisEnvelope {
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert(
+            "worker-mod".to_string(),
+            SnapshotArtifact {
+                url: "r2://mods/worker.wasm".into(),
+                blake3: hash(1),
+                size: Some(4096),
+            },
+        );
+        artifacts.insert(
+            "coord-mod".to_string(),
+            SnapshotArtifact {
+                url: "r2://mods/coord.wasm".into(),
+                blake3: hash(2),
+                size: Some(2048),
+            },
+        );
+        artifacts.insert(
+            "corpus".to_string(),
+            SnapshotArtifact {
+                url: "hf://org/corpus@abc123".into(),
+                blake3: hash(3),
+                size: None,
+            },
+        );
+
+        let mut roles = BTreeMap::new();
+        let mut worker_grants = RoleGrants::default();
+        worker_grants.artifacts.insert(hash(3));
+        worker_grants.max_outstanding_ops = 16;
+        roles.insert(
+            "worker".to_string(),
+            RoleEntry {
+                lane: "trainer".into(),
+                module: "worker-mod".into(),
+                abi: "vhc@2".into(),
+                config: ciborium::value::Value::Map(vec![]),
+                grants: worker_grants,
+                device_min: DeviceMinimums {
+                    gpu: Some(2),
+                    vram_bytes: Some(16 << 30),
+                    backend_class: vec!["cuda".into()],
+                    ..Default::default()
+                },
+            },
+        );
+        roles.insert(
+            "coordinator".to_string(),
+            RoleEntry {
+                lane: "coordinator".into(),
+                module: "coord-mod".into(),
+                abi: "vhc@2".into(),
+                config: ciborium::value::Value::Map(vec![]),
+                grants: RoleGrants::default(),
+                device_min: DeviceMinimums::default(),
+            },
+        );
+
+        GenesisEnvelope {
+            run: RunSectionV2 {
+                schema: GENESIS_SCHEMA_MAJOR,
+                run_label: "demo-run".into(),
+                min_peers: 1,
+                max_peers: 64,
+                access: Access::Org,
+            },
+            roles,
+            artifacts,
+            authority: ciborium::value::Value::Map(vec![]),
+            transport: TransportSelection::default(),
+            identities: Identities::default(),
+        }
+    }
+
+    #[test]
+    fn freeze_open_roundtrip_and_run_id_is_hash() {
+        let env = sample();
+        let frozen = env.freeze(&key()).unwrap();
+        let wire = frozen.bytes().to_vec();
+        let reopened = FrozenGenesis::open(wire, *frozen.signature(), *frozen.signer()).unwrap();
+        assert_eq!(reopened.run_id(), frozen.run_id());
+        assert_eq!(reopened.decode().unwrap(), env);
+        assert_eq!(reopened.run_label().unwrap(), "demo-run");
+    }
+
+    #[test]
+    fn schema_sniff_distinguishes_v1_and_v2() {
+        let frozen = sample().freeze(&key()).unwrap();
+        assert_eq!(peek_schema(frozen.bytes()), Some(GENESIS_SCHEMA_MAJOR));
+    }
+
+    #[test]
+    fn tamper_breaks_hash_and_signature() {
+        let frozen = sample().freeze(&key()).unwrap();
+        let mut bytes = frozen.bytes().to_vec();
+        bytes[0] ^= 0xff;
+        assert!(FrozenGenesis::open(bytes, *frozen.signature(), *frozen.signer()).is_err());
+    }
+
+    #[test]
+    fn validate_requires_coordinator_and_worker() {
+        let mut env = sample();
+        env.roles.remove("coordinator");
+        assert!(env.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_grant_of_unmapped_artifact() {
+        let mut env = sample();
+        env.roles
+            .get_mut("worker")
+            .unwrap()
+            .grants
+            .artifacts
+            .insert(hash(99));
+        assert!(env.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_module_absent_from_artifacts() {
+        let mut env = sample();
+        env.roles.get_mut("worker").unwrap().module = "nope".into();
+        assert!(env.validate().is_err());
+    }
+}

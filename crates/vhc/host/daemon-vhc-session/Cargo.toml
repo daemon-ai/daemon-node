@@ -39,6 +39,11 @@ iroh = ["harness", "daemon-vhc-net/iroh"]
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+# Assignment math moved from the proto to the consensus SDK layer at D0 (refactor §8/D0); the
+# retained v1 RoundEngine consumes it here. TRACKED dependency-direction exception (xtask
+# vhc_dep_check): host/* -> sdk/* is transitional and is reviewed/retired as D2 re-seats the
+# engine's consumers (the engine itself retires with the v1 driver at the Phase-E sunset).
+daemon-vhc-sdk-consensus = { workspace = true }
 daemon-vhc-net = { workspace = true }
 # The A2 dependency INVERSION (refactor §5 A2; architecture §7: SESS → HOSTC): the session links
 # the host runtime — never the reverse (the old daemon-vhc-host → daemon-vhc-session edge is gone;
