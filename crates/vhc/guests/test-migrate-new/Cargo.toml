@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+#
+# The Phase-E upgrade-transaction drill pair, NEW side (ABI §10.2 consuming): a raw-ABI module
+# whose `da_migrate` restores the old counter through `read_back(kind = 3)` and whose `da_run`
+# resumes counting from the migrated value. Raw-ABI on purpose (no SDK link — pin stability).
+[package]
+name = "test-migrate-new"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ciborium = { version = "0.2", default-features = false }

@@ -4568,6 +4568,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-migrate-new"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+]
+
+[[package]]
+name = "test-migrate-old"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ciborium",
+]
+
+[[package]]
 name = "test-net-v2"
 version = "0.0.1"
 dependencies = [

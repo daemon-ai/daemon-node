@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+#
+# The Phase-E upgrade-transaction drill pair, OLD side (ABI §10.2 producing): a raw-ABI counter
+# module that snapshots its state (`stage_state` → `snapshot_state`) during a `Quiesce{Upgrade}`
+# drain and returns `QuiesceReady`. Raw-ABI on purpose (no SDK link): the frozen guest pins
+# (`guests.blake3`) must not be perturbed by SDK-crate growth.
+[package]
+name = "test-migrate-old"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ciborium = { version = "0.2", default-features = false }
+blake3 = { version = "1", default-features = false }

@@ -5125,6 +5125,7 @@ dependencies = [
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
+ "daemon-vhc-session",
  "thiserror 2.0.18",
 ]
 

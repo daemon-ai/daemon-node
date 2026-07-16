@@ -1772,7 +1772,10 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                     d.slice.pending_readback_value = None;
                     return Ok(pack_status_len(RET_STATUS_DELIVERED, len as u32));
                 }
-                if want_staged_kind != daemon_vhc_abi::STAGED_KIND_BYTES && c.data().tabi.is_none()
+                if !matches!(
+                    want_staged_kind,
+                    daemon_vhc_abi::STAGED_KIND_BYTES | daemon_vhc_abi::STAGED_KIND_STATE_SECTION
+                ) && c.data().tabi.is_none()
                 {
                     return Err(Trap::new(
                         TrapCode::ReadBackUnavailable,
@@ -2998,6 +3001,14 @@ impl V2Run {
         self.thread
             .join()
             .map_err(|_| V2Error::Sandbox("guest thread panicked".into()))?
+    }
+
+    /// Whether the guest thread has ended (non-blocking): the upgrade transaction's migrate step
+    /// polls this to distinguish "migrated and running" from "tore down before `da_run`"
+    /// (`InitRefused`/`MigrateRefused`/trapped) without consuming the run.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
     }
 }
 
