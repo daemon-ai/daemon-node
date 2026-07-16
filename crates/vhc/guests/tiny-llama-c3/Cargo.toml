@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "tiny-llama-c3"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
+# The guest-side Burn compute tier: Autodiff<HostBackend> over the compute@2 shim (C1).
+daemon-vhc-sdk-compute = { path = "../../sdk/daemon-vhc-sdk-compute" }
+# The re-expressed comm/optimizer profiles (C3a): det-lane ingest runs IN-GUEST with zero host
+# support (the daemon-vhc-det compatibility path, architecture §3.2).
+daemon-vhc-sdk-profiles = { path = "../../sdk/daemon-vhc-sdk-profiles" }
+# Round choreography as library code (BarrierRound) + the wire vocabulary/digest (wasm-clean).
+daemon-vhc-sdk-rounds = { path = "../../sdk/daemon-vhc-sdk-rounds" }
+daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }
+burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }

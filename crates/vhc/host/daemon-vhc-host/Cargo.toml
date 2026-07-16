@@ -147,6 +147,11 @@ serde_json = { workspace = true }
 # runtime edge (the host does not link the guest SDK). NOTE: this remaining host->SDK dev-dep is a
 # tracked dependency-direction exception (model presets leave the SDK for `guests/` in Phase C).
 daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
+# Test-only (C3 models-exodus parity harness): the re-expressed profiles crate is the NATIVE
+# oracle half of the C3b lowering gate (the same det-lane transition the guest runs in wasm32,
+# executed natively against the dual-compiled model source). A tracked dependency-direction
+# exception like `daemon-vhc-sdk` above; never a runtime edge.
+daemon-vhc-sdk-profiles = { workspace = true }
 # (A2 worker-bin split): the daemon-vhc-supervisor + daemon-common dev-deps served only
 # tests/worker_protocol.rs, which moved to `crates/vhc/bins/daemon-vhc-worker` with the bin.
 # Test-only (M2 reference-parity harness): the state-dict ↔ safetensors converter (M1 seam 4) the

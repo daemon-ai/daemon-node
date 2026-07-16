@@ -458,6 +458,7 @@ daemon-vhc-sdk-rounds = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk-r
 # proto is algorithm-free from D0, dep-check-enforced); D1 adds Authority/Committed<T>, D2 the
 # coordinator drivers.
 daemon-vhc-sdk-consensus = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk-consensus" }
+daemon-vhc-sdk-profiles = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk-profiles" }
 # The SDK-side simulation layer (native virtual worlds + discrete-event runtime for native policy
 # iteration; links sdk/* only, never host/*). B3 creates it beside the v1 SDK's `sim` feature.
 daemon-vhc-sim = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sim" }

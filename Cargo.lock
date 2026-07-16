@@ -4917,6 +4917,7 @@ dependencies = [
  "daemon-vhc-proto",
  "daemon-vhc-safetensors",
  "daemon-vhc-sdk",
+ "daemon-vhc-sdk-profiles",
  "daemon-vhc-session",
  "serde",
  "serde_json",
@@ -5041,6 +5042,17 @@ version = "0.0.1"
 dependencies = [
  "ciborium",
  "daemon-vhc-proto",
+]
+
+[[package]]
+name = "daemon-vhc-sdk-profiles"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "ciborium",
+ "daemon-vhc-det",
+ "daemon-vhc-sdk",
+ "serde",
 ]
 
 [[package]]

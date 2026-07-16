@@ -466,6 +466,27 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_custom_op"],
         ),
         (
+            // The Phase-C MODEL-AGNOSTIC acceptance (refactor §7: "a non-LLaMA toy authored with
+            // zero host changes … proving the compute ABI is model-agnostic"): the `toy-mlp` guest
+            // — a two-layer MLP trained by SGD, authored purely over daemon-vhc-sdk-compute +
+            // daemon-vhc-sdk-v2 — runs against the SAME compute@2 runner/driver/journal as the
+            // LLaMA reference, exports a trained weight bit-exact vs a native Autodiff<NdArray> run
+            // of the identical loop, and replays bit-for-bit (§8.7). No host code is model-specific.
+            "C3 model-agnostic compute@2 (toy-mlp: distinct model, zero host changes, bit-exact + replay)",
+            &["-p", "daemon-vhc-host", "--test", "toy_mlp"],
+        ),
+        (
+            // The Phase-C compute-REPLAY tier (refactor §7: "compute replay … the second of the
+            // three replay tiers"; architecture §3.6 "compute replay, tolerance-equivalent"): a
+            // recorded compute@2 op-journal, re-executed against a (possibly different) backend,
+            // reproduces the trajectory within the native lane's tolerance class. The tier-1 lane
+            // pins the ndarray↔ndarray DEGENERATE case (tolerance 0 — bit-exact — so the harness
+            // itself is always exercised); the wgpu cross-backend tier is hardware-gated in the
+            // same file.
+            "C3 compute replay (ndarray↔ndarray degenerate: same op-journal, bit-exact re-execution)",
+            &["-p", "daemon-vhc-host", "--test", "compute_replay"],
+        ),
+        (
             // The B2 data@2 fetch conformance (architecture §3.2 the data world): the corpus
             // window fetched by committed hash + policy-chosen range, completing Ok(BufferHandle)
             // (tag 6) after whole-artifact verification; grant negative (GrantViolation),
@@ -492,6 +513,35 @@ fn swarm_ci_det() -> anyhow::Result<()> {
         (
             "daemon-vhc-sdk (SDK profile goldens: sparse_loco/diloco)",
             &["-p", "daemon-vhc-sdk", "--features", "sim"],
+        ),
+        (
+            // The C3a models-exodus profiles gate (refactor §7 "profiles re-express over Burn
+            // tensors + det math in sdk/daemon-vhc-sdk-profiles"): the re-expressed
+            // SparseLoco/DiLoCo/Demo reproduce the CURRENT SDK profile implementation bit-for-bit
+            // (live A/B over the sim oracle + the pinned sparse_loco_golden literals), and the
+            // Section payload wire is byte-identical to the v1 container encoding.
+            "C3a sdk-profiles ≡ current SDK profiles (bit-exact A/B + pinned goldens + wire)",
+            &["-p", "daemon-vhc-sdk-profiles"],
+        ),
+        (
+            // The C3 models-exodus acceptance (refactor §7 "models leave the SDK" + "re-authored
+            // tiny-llama matches reference parity within the existing tolerance class"): the
+            // re-authored `tiny-llama-c3` guest — a real Burn model over Autodiff<HostBackend> +
+            // the C3a profiles' in-guest det lane — through a 2-round barrier whole-run vs the
+            // frozen v1 digest oracle. C3b: guest training ≡ native Autodiff<NdArray> of the SAME
+            // dual-compiled model source, bit-exact. C3c: det-lane digests ≡ the v1 oracle
+            // bit-exact (equality class); trained θ within the OpClass::Optimizer band
+            // (tolerance class). The frozen pins (v2_parity) and the A0 fixture run beside this
+            // lane in the same gate.
+            "C3 re-authored tiny-llama parity (bit-exact lowering + det digests ≡ v1 + Optimizer band)",
+            &[
+                "-p",
+                "daemon-vhc-host",
+                "--test",
+                "c3_parity",
+                "--features",
+                "burn-ndarray",
+            ],
         ),
         (
             // A2 migrate/main! scaffolding (refactor §5 A2 item 4; ABI §10): state round-trips
@@ -631,6 +681,13 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "daemon-vhc-host",
             "daemon-vhc-sdk",
             "Phase C — model presets (TinyLlamaCfg/profiles) leave the SDK for guests/ [dev-dep]",
+        ),
+        (
+            "daemon-vhc-host",
+            "daemon-vhc-sdk-profiles",
+            "Phase E — the C3 parity harness runs the re-expressed profile natively as the \
+             lowering oracle beside the dual-compiled guest model; retires with the v1 oracle at \
+             sunset [dev-dep]",
         ),
         (
             "daemon-vhc-worker",

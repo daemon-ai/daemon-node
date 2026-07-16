@@ -1508,6 +1508,10 @@ name = "daemon-vhc-abi"
 version = "0.0.1"
 
 [[package]]
+name = "daemon-vhc-det"
+version = "0.0.1"
+
+[[package]]
 name = "daemon-vhc-proto"
 version = "0.0.1"
 dependencies = [
@@ -1549,6 +1553,16 @@ version = "0.0.1"
 dependencies = [
  "ciborium",
  "daemon-vhc-proto",
+]
+
+[[package]]
+name = "daemon-vhc-sdk-profiles"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "ciborium",
+ "daemon-vhc-det",
+ "serde",
 ]
 
 [[package]]
@@ -4641,6 +4655,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiny-llama-c3"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "ciborium",
+ "daemon-vhc-proto",
+ "daemon-vhc-sdk-compute",
+ "daemon-vhc-sdk-profiles",
+ "daemon-vhc-sdk-rounds",
+ "daemon-vhc-sdk-v2",
+ "serde",
+]
+
+[[package]]
 name = "tiny-llama-v2"
 version = "0.0.1"
 dependencies = [
@@ -4851,6 +4879,16 @@ name = "toy-averager"
 version = "0.0.1"
 dependencies = [
  "ciborium",
+]
+
+[[package]]
+name = "toy-mlp"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "ciborium",
+ "daemon-vhc-sdk-compute",
+ "daemon-vhc-sdk-v2",
 ]
 
 [[package]]

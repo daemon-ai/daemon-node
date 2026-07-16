@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "toy-mlp"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
+# The guest-side Burn compute tier: HostBackend + Autodiff<HostBackend> over the compute@2 shim.
+# This is the WHOLE dependency surface a model author needs — no host edit, no SDK model code.
+daemon-vhc-sdk-compute = { path = "../../sdk/daemon-vhc-sdk-compute" }
+burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
+ciborium = "0.2"
