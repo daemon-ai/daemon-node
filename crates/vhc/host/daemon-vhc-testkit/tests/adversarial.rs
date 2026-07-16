@@ -160,23 +160,20 @@ fn delayed_committed_payloads_straggle_then_catch_up() {
     assert_eq!(w.replay_decisions, 5);
     assert!(faulted.is_green());
 
-    // KNOWN DEFECT — pinned divergent, flip to `assert_eq!` when the driver fix lands
-    // (escalated, B3 sitting 2). v1 parity requires the catch-up run to end in the IDENTICAL
-    // det-lane state as the clean run: v1 ran the ingest epilogue (`snapshot_round_bases`, the
-    // §5.9 barrier snapshot) as `Instance::ingest` returned — always between a catch-up ingest
-    // and any subsequent training, which were separate export calls. The v2 bridge defers the
-    // epilogue to the CLOSE of the ingesting slice (`driver.rs` slice lifecycle), and on the
-    // straggle path the guest driver ingests round r and trains round r+1 within ONE slice
-    // (`BarrierRound::on_round_open`: `advance` then `train_and_commit`) — so round r+1's
-    // `make_update` reads a round base that predates the round-r ingest, and its committed
-    // update (hence the ingested state) diverges from v1 math. The fix belongs in the v2
-    // driver's bridge slice lifecycle (run the epilogue at the ingest→training boundary within
-    // a slice, e.g. before the first post-ingest `batch_tokens@1`); it is deliberately NOT made
-    // here because B1 is mid-flight in the same driver — this assertion documents the defect
-    // loudly and will fail the moment the fix lands, forcing the flip.
-    assert_ne!(
+    // Catch-up parity (the FLIPPED pin — defect found by this rig in B3 sitting 2, fixed by
+    // B1's §5.9 IngestPhase state machine, flip witnessed on the merge of `vhc-integration`
+    // @ 372cd0a: the previous `assert_ne!` divergence pin went red with byte-identical
+    // digests). v1 parity holds through the straggle detour: the ingest epilogue
+    // (`snapshot_round_bases`) now fires at the first boundary after the ingest math — so when
+    // `BarrierRound::on_round_open` ingests round r and trains round r+1 within one slice,
+    // round r+1 commits against the POST-ingest round base, exactly as v1's separate
+    // `Instance::ingest` export boundary guaranteed. The detour changes the path, never the
+    // state. (B1's own `catch_up_after_straggle_reproduces_v1_digests_cpu` pins the same
+    // property against the v1 engine oracle; this pin exercises it through the adversarial
+    // rig's payload-delay fault.)
+    assert_eq!(
         w.digest, clean.workers[0].digest,
-        "the straggle catch-up divergence is FIXED — flip this pin to assert_eq! \
-         (see the KNOWN DEFECT comment above)"
+        "the straggle detour must change the path, not the state: identical det-lane end state \
+         (v1 catch-up parity, §5.9 ingest epilogue at the ingest→training boundary)"
     );
 }

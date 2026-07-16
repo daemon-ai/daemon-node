@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
 use daemon_vhc_host::v2::{
-    replay_v2, start_run, MemorySink, PumpHandle, ReplayEnd, ReplayScript, RunEnd, RunIdentity,
-    SinkEntry, V2RunConfig,
+    replay_v2, start_run, DeliverVerdict, MemorySink, OpOutcome, OpRequest, PumpHandle, ReplayEnd,
+    ReplayScript, RunEnd, RunIdentity, SinkEntry, V2RunConfig,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::envelope::{
@@ -43,7 +43,7 @@ use daemon_vhc_proto::envelope::{
     RunSection, StopCondition,
 };
 use daemon_vhc_proto::messages::{
-    BatchWindow, Commitment, RecordEntry, StorageReceipt, SwarmMessage, ThroughputClass,
+    BatchWindow, RecordEntry, StorageReceipt, SwarmMessage, ThroughputClass,
 };
 use daemon_vhc_proto::{
     blake3_hash, digest_state, from_canonical_slice, peer_id, to_canonical_vec, Envelope, Hash,
@@ -357,6 +357,7 @@ impl BarrierRunReport {
 struct LiveWorker {
     key: SigningKey,
     peer: PeerId,
+    identity: RunIdentity,
     config: Vec<u8>,
     pump: PumpHandle,
     sink: Arc<Mutex<MemorySink>>,
@@ -366,31 +367,18 @@ struct LiveWorker {
     coord_seq: u64,
     /// Sealed containers awaiting delayed staging: round → record-ordered payloads.
     held_payloads: BTreeMap<u64, Vec<Vec<u8>>>,
+    /// The guest's `payload_put` bytes, serviced by the harness (the async-runtime seat): the
+    /// B1 sealing-gap retirement means the GUEST seals + puts its own container, and the
+    /// embedder captures the bytes here (commitment evidence + barrier staging input).
+    puts: Vec<Vec<u8>>,
 }
 
 impl LiveWorker {
-    /// Deliver a coordinator message: sign, verify above the pump (the seam under test), deliver
-    /// with the original signed bytes as tag-12 evidence.
-    fn deliver(&mut self, coord: &NativeCoordinator, msg: &SwarmMessage) -> Result<(), String> {
-        let signed = coord.sign(msg.clone())?;
-        signed
-            .verify()
-            .map_err(|e| format!("coordinator frame REFUSED above the pump: {e}"))?;
-        let payload = to_canonical_vec(msg).map_err(|e| format!("payload encode: {e}"))?;
-        let evidence = to_canonical_vec(&signed).map_err(|e| format!("evidence encode: {e}"))?;
-        let seq = self.coord_seq;
-        self.coord_seq += 1;
-        self.pump
-            .deliver_frame(0, seq, coord.sender(), payload, evidence)
-            .map_err(|e| format!("deliver: {e}"))
-    }
-
-    /// Re-deliver the same message with the SAME seq — a true duplicate (the Phase-A pump has no
-    /// §4.7 dedup machinery yet; the round driver's watermark is the dedup under test).
-    fn deliver_duplicate(
+    fn deliver_signed(
         &mut self,
         coord: &NativeCoordinator,
         msg: &SwarmMessage,
+        seq: u64,
     ) -> Result<(), String> {
         let signed = coord.sign(msg.clone())?;
         signed
@@ -398,10 +386,37 @@ impl LiveWorker {
             .map_err(|e| format!("coordinator frame REFUSED above the pump: {e}"))?;
         let payload = to_canonical_vec(msg).map_err(|e| format!("payload encode: {e}"))?;
         let evidence = to_canonical_vec(&signed).map_err(|e| format!("evidence encode: {e}"))?;
-        let seq = self.coord_seq.saturating_sub(1);
-        self.pump
+        match self
+            .pump
             .deliver_frame(0, seq, coord.sender(), payload, evidence)
-            .map_err(|e| format!("duplicate deliver: {e}"))
+            .map_err(|e| format!("deliver: {e}"))?
+        {
+            DeliverVerdict::Accepted => Ok(()),
+            other => Err(format!(
+                "coordinator frame back-pressured/refused ({other:?}) — the barrier drive \
+                 never fills the spool (a SpoolFull adversarial case sets its own expectations)"
+            )),
+        }
+    }
+
+    /// Deliver a coordinator message: sign, verify above the pump (the seam under test), deliver
+    /// with the original signed bytes as tag-12 evidence.
+    fn deliver(&mut self, coord: &NativeCoordinator, msg: &SwarmMessage) -> Result<(), String> {
+        let seq = self.coord_seq;
+        self.coord_seq += 1;
+        self.deliver_signed(coord, msg, seq)
+    }
+
+    /// Re-deliver the same message with the SAME seq — a true duplicate (the round driver's
+    /// watermark is the dedup under test; B1's per-sender quota admits the re-delivery because
+    /// the first copy has already drained by the time the case asserts).
+    fn deliver_duplicate(
+        &mut self,
+        coord: &NativeCoordinator,
+        msg: &SwarmMessage,
+    ) -> Result<(), String> {
+        let seq = self.coord_seq.saturating_sub(1);
+        self.deliver_signed(coord, msg, seq)
     }
 
     /// The worker's publishes decoded as control messages (signed frame → payload → SwarmMessage).
@@ -409,15 +424,39 @@ impl LiveWorker {
         decode_published(&self.pump.published())
     }
 
-    /// Wait (bounded) until the worker's decoded publish stream satisfies `pred`.
+    /// Service the guest's outstanding op requests (the async-runtime seat): `payload_put`
+    /// bytes are captured into [`Self::puts`]; anything else is unexpected in the barrier drive
+    /// (tiny-llama-v2 stages batches through the kind-1 path, not `data.fetch`).
+    fn service_ops(&mut self) -> Result<(), String> {
+        for (op, request) in self.pump.take_op_requests() {
+            match request {
+                OpRequest::PayloadPut { bytes } => {
+                    self.puts.push(bytes.to_vec());
+                    self.pump
+                        .complete_op(op, OpOutcome::PutDone)
+                        .map_err(|e| format!("put completion: {e}"))?;
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected op request from the barrier guest: {other:?}"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait (bounded) until the worker's decoded publish stream satisfies `pred`, servicing the
+    /// guest's ops meanwhile (a parked put would otherwise deadlock the commit seam).
     fn wait_for(
-        &self,
+        &mut self,
         timeout: Duration,
         what: &str,
         pred: impl Fn(&[SwarmMessage]) -> bool,
     ) -> Result<Vec<SwarmMessage>, String> {
         let deadline = Instant::now() + timeout;
         loop {
+            self.service_ops()?;
             let msgs = self.messages();
             if pred(&msgs) {
                 return Ok(msgs);
@@ -557,12 +596,13 @@ pub fn barrier_whole_run(wasm: &[u8], spec: &BarrierSpec) -> Result<BarrierRunRe
         let key_seed =
             *blake3::hash(format!("frame-key/{}/{i}", spec.run_id).as_bytes()).as_bytes();
         let sink = Arc::new(Mutex::new(MemorySink::new()));
-        let run_cfg = V2RunConfig::new(identity, key_seed, config.clone(), grants.clone());
+        let run_cfg = V2RunConfig::new(identity.clone(), key_seed, config.clone(), grants.clone());
         let run = start_run(&engine, wasm, run_cfg, Box::new(sink.clone()))
             .map_err(|e| format!("worker {i} start_run: {e}"))?;
         workers.push(LiveWorker {
             key: key.clone(),
             peer,
+            identity,
             config,
             pump: run.pump.clone(),
             sink,
@@ -570,6 +610,7 @@ pub fn barrier_whole_run(wasm: &[u8], spec: &BarrierSpec) -> Result<BarrierRunRe
             engine,
             coord_seq: 0,
             held_payloads: BTreeMap::new(),
+            puts: Vec::new(),
         });
     }
 
@@ -638,31 +679,40 @@ pub fn barrier_whole_run(wasm: &[u8], spec: &BarrierSpec) -> Result<BarrierRunRe
                     }
                 }
 
-                // Each live worker trains + voices its commitment; the plumbing seals the
-                // container and authors the evidentiary commitment over the sealed bytes.
+                // Each live worker trains, seals + `payload_put`s its OWN container (the B1
+                // sealing-gap retirement), and voices its commitment over the put's hash; the
+                // harness services the put (async-runtime seat) and verifies the guest's
+                // evidence hashes exactly the serviced bytes before relaying it.
                 let mut sealed_by_peer: BTreeMap<PeerId, Vec<u8>> = BTreeMap::new();
                 for (i, w) in workers.iter_mut().enumerate() {
                     if spec.faults.action(i, round, FrameKind::Open) == Some(FaultAction::Drop) {
                         continue; // the open never arrived; this worker sits the round out
                     }
-                    w.wait_for(spec.timeout, "commitment", |m| {
+                    let msgs = w.wait_for(spec.timeout, "commitment", |m| {
                         commitments_for(m, round) >= 1
                     })?;
-                    let (_, sealed) = w
-                        .pump
-                        .take_sealed_update()
-                        .ok_or_else(|| format!("worker {i}: no sealed container after commit"))?;
-                    let hash = blake3_hash(&sealed);
-                    let commitment = SwarmMessage::Commitment(Commitment {
-                        round,
-                        payload: hash,
-                        size: sealed.len() as u64,
-                        locators: Vec::new(),
-                    });
+                    let sealed = w
+                        .puts
+                        .last()
+                        .cloned()
+                        .ok_or_else(|| format!("worker {i}: no payload_put after commit"))?;
+                    let Some(SwarmMessage::Commitment(commitment)) = msgs
+                        .iter()
+                        .find(|m| matches!(m, SwarmMessage::Commitment(c) if c.round == round))
+                        .cloned()
+                    else {
+                        return Err(format!("worker {i}: commitment frame missing"));
+                    };
+                    if commitment.payload != blake3_hash(&sealed) {
+                        return Err(format!(
+                            "worker {i}: guest commitment hash != serviced put bytes (evidence \
+                             must be authored over the guest's own sealed bytes)"
+                        ));
+                    }
                     let signed = SignedMessage::sign(
                         &w.key,
                         daemon_vhc_proto::SWARM_PROTO_VERSION,
-                        commitment,
+                        SwarmMessage::Commitment(commitment),
                     )
                     .map_err(|e| format!("commitment sign: {e}"))?;
                     coord.feed_message(signed)?;
@@ -735,7 +785,7 @@ pub fn barrier_whole_run(wasm: &[u8], spec: &BarrierSpec) -> Result<BarrierRunRe
                         None => worker.deliver(&coord, &msg)?,
                     }
                 }
-                for (i, w) in workers.iter().enumerate() {
+                for (i, w) in workers.iter_mut().enumerate() {
                     if spec.faults.action(i, round, FrameKind::Record) == Some(FaultAction::Drop) {
                         continue;
                     }
@@ -831,7 +881,10 @@ pub fn barrier_whole_run(wasm: &[u8], spec: &BarrierSpec) -> Result<BarrierRunRe
                 _ => None,
             })
             .collect();
-        let script = ReplayScript::from_entries(&entries);
+        let mut script = ReplayScript::from_entries(&entries);
+        // The identity behind the recorded run (the tag-0 run header in a real journal): what
+        // `sys@2::rng_seed` re-derives from at replay.
+        script.identity = Some(w.identity.clone());
         let replayed = replay_v2(&w.engine, wasm, &w.config, &phase_a_grants(), script)
             .map_err(|e| format!("worker {i} replay harness: {e}"))?;
         let redriven: Vec<Decision> = replayed

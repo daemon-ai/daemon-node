@@ -143,8 +143,11 @@ pub fn whole_run(worker: &Worker, wasm: &[u8], spec: RunSpec) -> Result<WholeRun
     let entries: Vec<SinkEntry> = sink.lock().expect("sink lock").entries.clone();
     let recorded_publishes = publishes(&entries);
 
-    // §8.7: re-drive the recorded journal and compare every decision.
-    let script = ReplayScript::from_entries(&entries);
+    // §8.7: re-drive the recorded journal and compare every decision. The identity rides along
+    // (the tag-0 run header in a real journal): `sys@2::rng_seed` re-derives from it at replay
+    // (the merged toy-averager is abi 2.1 and reads its identity-derived seed).
+    let mut script = ReplayScript::from_entries(&entries);
+    script.identity = Some(spec.identity.clone());
     let replayed = replay_v2(worker, wasm, &spec.config, &spec.grants, script)
         .map_err(|e| format!("replay harness: {e}"))?;
     let decisions: Vec<Decision> = replayed
