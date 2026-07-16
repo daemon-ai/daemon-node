@@ -31,9 +31,10 @@ pub use admission::{
 pub use buffer::BufferTable;
 pub use completion::{CompError, CompletionCodecError, CompletionResult, SuccessPayload};
 pub use driver::{
-    start_run, OpOutcome, PumpHandle, RunEnd, RunIdentity, V2Error, V2Run, V2RunConfig,
+    start_run, DeliverVerdict, OpOutcome, PumpHandle, RunEnd, RunIdentity, V2Error, V2Run,
+    V2RunConfig,
 };
 pub use event::{decode_event_frame, encode_event_frame, EventCodecError, EventV2, PayloadMeta};
-pub use journal::{JournalSink, MemorySink, SinkEntry, SinkError};
+pub use journal::{Dropped, JournalSink, MemorySink, SinkEntry, SinkError};
 pub use ops::{OpRequest, OpTable};
 pub use replay::{replay_v2, ReplayEnd, ReplayScript, ReplayedDecision, ReplayedRun};

@@ -247,8 +247,11 @@ fn v2_run_n(
             deadline_unix_s: 0,
         });
         let payload = to_canonical_vec(&ro).expect("ro");
-        pump.deliver_frame(0, seq, sender, payload.clone(), payload)
-            .expect("deliver RoundOpen");
+        assert_eq!(
+            pump.deliver_frame(0, seq, sender, payload.clone(), payload)
+                .expect("deliver"),
+            daemon_vhc_host::v2::DeliverVerdict::Accepted
+        );
         seq += 1;
         wait_published(&pump, (round as usize) * 2 + 1); // + this round's Commitment
 
@@ -270,8 +273,11 @@ fn v2_run_n(
             inline: Some(vec![entry]),
         });
         let payload = to_canonical_vec(&rr).expect("rr");
-        pump.deliver_frame(0, seq, sender, payload.clone(), payload)
-            .expect("deliver RoundRecord");
+        assert_eq!(
+            pump.deliver_frame(0, seq, sender, payload.clone(), payload)
+                .expect("deliver"),
+            daemon_vhc_host::v2::DeliverVerdict::Accepted
+        );
         seq += 1;
         wait_published(&pump, (round as usize) * 2 + 2); // + this round's Digest
     }
@@ -346,8 +352,11 @@ fn v2_run_catchup(
     };
     let deliver = |msg: &SwarmMessage, seq: &mut u64| {
         let payload = to_canonical_vec(msg).expect("msg");
-        pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
-            .expect("deliver");
+        assert_eq!(
+            pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
+                .expect("deliver"),
+            daemon_vhc_host::v2::DeliverVerdict::Accepted
+        );
         *seq += 1;
     };
 

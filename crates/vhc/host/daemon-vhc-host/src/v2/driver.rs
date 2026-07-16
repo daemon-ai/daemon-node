@@ -111,8 +111,23 @@ pub struct V2RunConfig {
     pub max_frame_bytes: u32,
     /// Per-slice ceiling on bytes `read_back` may write into linear memory (§5.5).
     pub max_readback_bytes_per_slice: u64,
-    /// Bounded advisory queue depth (manifest-declared once the funnel lands; a default here).
+    /// Bounded advisory `Timer` queue depth (manifest-declared `event-caps` once the funnel
+    /// wiring lands; a default here). Overflow is latest-wins on the queue: the oldest queued
+    /// `Timer` drops, journaled (§4.7).
     pub advisory_depth: usize,
+    /// Bounded advisory `PayloadReady` queue depth (§2.3 `event-caps`; §4.7 class rule
+    /// dedup-by-hash). Overflow beyond distinct hashes drops the oldest announcement, journaled.
+    pub payload_depth: usize,
+    /// Bounded advisory gossip-class queue depth (§4.7 drop-oldest, journaled).
+    pub gossip_depth: usize,
+    /// Authoritative bounded spool: max undelivered authoritative frames (§4.7/§6.2
+    /// `spool_frames`). Overflow BACK-PRESSURES the deliverer (never drops); hitting the bound
+    /// journals the typed `SpoolExhausted` run condition (§6.7) once per exhaustion episode.
+    pub spool_frames: usize,
+    /// Authoritative per-sender outstanding quota (§4.7/§6.2 `per_sender_quota`): a single
+    /// sender cannot use the reliable class as a memory-DoS vector. Overflow back-pressures
+    /// that sender only.
+    pub per_sender_quota: usize,
     /// The claim's **hard-accountable host-tier cap** in raw bytes (`0` = uncapped): the
     /// enforceable tier the host meters EXACTLY (ABI §9.1). At Phase A the metered
     /// guest-attributable allocations are the staged bytes (`stage_state`); tensors/buffers join
@@ -152,6 +167,10 @@ impl V2RunConfig {
             max_frame_bytes: 1 << 20,
             max_readback_bytes_per_slice: 1 << 20,
             advisory_depth: 64,
+            payload_depth: 64,
+            gossip_depth: 64,
+            spool_frames: 256,
+            per_sender_quota: 64,
             hard_accountable_host_bytes: 0,
             max_live_buffer_handles: 64,
             max_live_buffer_bytes: 1 << 26,
@@ -174,6 +193,24 @@ pub enum V2Error {
     /// A journal-sink write failed (journaling is load-bearing, §8.4).
     #[error(transparent)]
     Sink(#[from] SinkError),
+}
+
+/// The verdict on one authoritative-frame delivery (ABI §4.7): the reliable class NEVER drops —
+/// overload back-pressures the network reader, which must hold the frame and retry. (The session
+/// seam rewinds its dedup/gap cursor on back-pressure so the retry is not a duplicate.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliverVerdict {
+    /// Enqueued for delivery.
+    Accepted,
+    /// The bounded spool is at `spool_frames` — hold + retry; the typed `SpoolExhausted` run
+    /// condition (§6.7) was journaled at the episode's first refusal.
+    SpoolFull,
+    /// This sender is at `per_sender_quota` outstanding frames — hold + retry (the per-sender
+    /// DoS bound; other senders are unaffected).
+    SenderQuota,
+    /// The frame exceeds the channel's `max_frame_bytes` — a protocol violation by the sender,
+    /// refused outright (never enqueued, never retried).
+    FrameTooLarge,
 }
 
 /// The embedder's answer to one serviced op request (see [`PumpHandle::complete_op`]).
@@ -224,6 +261,9 @@ struct QueuedEvent {
     timer_id: Option<u64>,
     /// `Budget` marker (host-fixed depth 1, latest-wins).
     is_budget: bool,
+    /// Advisory gossip-class identity `(channel, arrival seq, sender)` — present iff this is a
+    /// gossip frame (drop-oldest accounting + the tag-7 drop identity, §4.7).
+    gossip_id: Option<(u32, u64, [u8; 32])>,
 }
 
 struct ArmedTimer {
@@ -243,6 +283,24 @@ struct PumpState {
     sink: Box<dyn JournalSink>,
     /// The advisory `Timer`-queue depth (manifest-declared once the funnel lands; §4.7).
     timer_depth: usize,
+    /// The advisory `PayloadReady`-queue depth (§4.7 dedup-by-hash class).
+    payload_depth: usize,
+    /// The advisory gossip-class queue depth (§4.7 drop-oldest).
+    gossip_depth: usize,
+    /// Authoritative spool bound (`spool_frames`, §4.7) + per-sender outstanding quota.
+    spool_frames: usize,
+    per_sender_quota: usize,
+    /// Undelivered authoritative frames (the spool occupancy).
+    auth_spooled: usize,
+    /// Undelivered authoritative frames per sender (the quota ledger).
+    auth_per_sender: std::collections::HashMap<[u8; 32], usize>,
+    /// Whether the current spool-exhaustion episode was already journaled (§6.7, once per
+    /// episode; cleared when the spool drains below the bound).
+    spool_exhausted_reported: bool,
+    /// Per-channel arrival counters for advisory (gossip-class) frames — advisory channels have
+    /// no durable sequence semantics (§4.7); this dense arrival ordinal fills the frame's `seq`
+    /// field deterministically for replay (the journaled delivered sequence is authoritative).
+    gossip_arrivals: std::collections::HashMap<u32, u64>,
     /// Egress captured for the embedder (metrics/log are not journaled — outputs, not inputs).
     metrics: Vec<(String, f64)>,
     logs: Vec<(u32, String)>,
@@ -265,6 +323,43 @@ struct PumpState {
 }
 
 impl PumpState {
+    /// Bound the advisory `PayloadReady` queue at its declared depth (§4.7 class 0): dedup by
+    /// hash happens at staging; a distinct-hash announcement beyond the depth drops the OLDEST
+    /// queued announcement — its staged bytes are unstaged with it — journaled (tag 7).
+    fn enforce_payload_depth(&mut self) -> Result<(), SinkError> {
+        if self.payload_depth == 0 {
+            return Ok(());
+        }
+        let queued = self
+            .queue
+            .iter()
+            .filter(|q| q.tag == daemon_vhc_abi::EV_TAG_PAYLOAD_READY)
+            .count();
+        if queued < self.payload_depth {
+            return Ok(());
+        }
+        if let Some(pos) = self
+            .queue
+            .iter()
+            .position(|q| q.tag == daemon_vhc_abi::EV_TAG_PAYLOAD_READY)
+        {
+            let old = self.queue.remove(pos).expect("position exists");
+            // The frame names what was dropped (staging id + hash); unstage the bytes too.
+            if let Ok(EventV2::PayloadReady {
+                staging_id, hash, ..
+            }) = crate::v2::event::decode_event_frame(&old.frame_bytes)
+            {
+                self.staged.remove(&staging_id);
+                self.sink.drop_coalesced(
+                    0,
+                    daemon_vhc_abi::COALESCE_DEDUP_HASH,
+                    crate::v2::journal::Dropped::payload(hash),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Enqueue + journal one completion (ABI §4.6/§7.5): the tag-14 record captures the
     /// nondeterministic ARRIVAL (result + order) before the event is deliverable; the frame then
     /// rides the ordinary event queue (tag 1 at delivery, §8.4 rule 4). Completions still deliver
@@ -287,6 +382,7 @@ impl PumpState {
             payload_hash: None,
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
         });
         Ok(())
     }
@@ -317,6 +413,12 @@ impl PumpHandle {
     /// Deliver a **pre-verified** authoritative control frame (see module docs): `payload` is the
     /// module-authored bytes; `original_signed_frame` is the complete signed wire frame journaled
     /// as tag-12 evidence (§8.6).
+    ///
+    /// The reliable class is bounded but NEVER drops (§4.7): a [`DeliverVerdict::SpoolFull`] /
+    /// [`DeliverVerdict::SenderQuota`] verdict back-pressures the caller, which MUST hold the
+    /// frame and retry; genuine spool exhaustion journals the typed `SpoolExhausted` run
+    /// condition (§6.7). Escalation policy (sustained exhaustion → `Stop{Fault}` and leave the
+    /// run) is the embedder's, over these verdicts.
     pub fn deliver_frame(
         &self,
         channel: u32,
@@ -324,7 +426,7 @@ impl PumpHandle {
         sender: [u8; 32],
         payload: Vec<u8>,
         original_signed_frame: Vec<u8>,
-    ) -> Result<(), SinkError> {
+    ) -> Result<DeliverVerdict, SinkError> {
         let ev = EventV2::Frame {
             channel,
             seq,
@@ -336,6 +438,24 @@ impl PumpHandle {
         if st.stop_enqueued {
             return Err(SinkError("run is stopping; no further deliveries".into()));
         }
+        if st.spool_frames != 0 && st.auth_spooled >= st.spool_frames {
+            if !st.spool_exhausted_reported {
+                st.spool_exhausted_reported = true;
+                let detail = format!(
+                    "authoritative spool at capacity ({} frames); back-pressuring",
+                    st.spool_frames
+                );
+                st.sink.condition("SpoolExhausted", &detail)?;
+            }
+            return Ok(DeliverVerdict::SpoolFull);
+        }
+        if st.per_sender_quota != 0
+            && st.auth_per_sender.get(&sender).copied().unwrap_or(0) >= st.per_sender_quota
+        {
+            return Ok(DeliverVerdict::SenderQuota);
+        }
+        st.auth_spooled += 1;
+        *st.auth_per_sender.entry(sender).or_insert(0) += 1;
         st.queue.push_back(QueuedEvent {
             frame_bytes,
             tag: EV_TAG_FRAME,
@@ -343,6 +463,72 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
+        });
+        drop(st);
+        self.shared.wake.notify_all();
+        Ok(DeliverVerdict::Accepted)
+    }
+
+    /// Deliver an **advisory (gossip-class) frame** (§4.7): an unsequenced observation on an
+    /// advisory channel. Bounded per-class queue at the declared depth with the fixed
+    /// drop-oldest rule, every drop journaled (tag 7, class 2). The frame's `seq` is a dense
+    /// per-channel arrival ordinal (advisory channels have no durable sequence semantics).
+    pub fn deliver_gossip(
+        &self,
+        channel: u32,
+        sender: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<(), SinkError> {
+        let mut st = self.shared.state.lock().expect("pump lock");
+        if st.stop_enqueued {
+            return Err(SinkError("run is stopping; no further deliveries".into()));
+        }
+        if st.draining {
+            // Advisory deliveries are frozen during a drain (§4.4); a gossip observation simply
+            // coalesces away (journaled as a drop of the newest — nothing was ever queued).
+            let seq = st.gossip_arrivals.get(&channel).copied().unwrap_or(0);
+            st.sink.drop_coalesced(
+                2,
+                daemon_vhc_abi::COALESCE_DROP_OLDEST,
+                crate::v2::journal::Dropped::gossip(u64::from(channel), sender, seq),
+            )?;
+            return Ok(());
+        }
+        let seq = {
+            let c = st.gossip_arrivals.entry(channel).or_insert(0);
+            let s = *c;
+            *c += 1;
+            s
+        };
+        let ev = EventV2::Frame {
+            channel,
+            seq,
+            sender,
+            payload,
+        };
+        let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
+        // Drop-oldest at the declared depth (§4.7 gossip rule), journaled.
+        let queued = st.queue.iter().filter(|q| q.gossip_id.is_some()).count();
+        if st.gossip_depth != 0 && queued >= st.gossip_depth {
+            if let Some(pos) = st.queue.iter().position(|q| q.gossip_id.is_some()) {
+                let old = st.queue.remove(pos).expect("position exists");
+                let (och, oseq, osender) = old.gossip_id.expect("gossip event has its id");
+                st.sink.drop_coalesced(
+                    2,
+                    daemon_vhc_abi::COALESCE_DROP_OLDEST,
+                    crate::v2::journal::Dropped::gossip(u64::from(och), osender, oseq),
+                )?;
+            }
+        }
+        st.queue.push_back(QueuedEvent {
+            frame_bytes,
+            tag: EV_TAG_FRAME,
+            signed: None,
+            payload_hash: None,
+            timer_id: None,
+            is_budget: false,
+            gossip_id: Some((channel, seq, sender)),
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -359,7 +545,11 @@ impl PumpHandle {
         }
         // Advisory dedup by hash: an undelivered announcement for identical bytes coalesces.
         if st.queue.iter().any(|q| q.payload_hash == Some(hash)) {
-            st.sink.drop_coalesced(0, 0, None, Some(hash))?;
+            st.sink.drop_coalesced(
+                0,
+                daemon_vhc_abi::COALESCE_DEDUP_HASH,
+                crate::v2::journal::Dropped::payload(hash),
+            )?;
             // The staged bytes are already announced; find its id for the caller.
             if let Some((&id, _)) = st
                 .staged
@@ -369,6 +559,7 @@ impl PumpHandle {
                 return Ok(id);
             }
         }
+        st.enforce_payload_depth()?;
         let staging_id = st.next_host_staging_id;
         st.next_host_staging_id += 1;
         let size = bytes.len() as u64;
@@ -390,6 +581,7 @@ impl PumpHandle {
             payload_hash: Some(hash),
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -440,6 +632,7 @@ impl PumpHandle {
         if st.stop_enqueued {
             return Err(SinkError("run is stopping; no further deliveries".into()));
         }
+        st.enforce_payload_depth()?;
         let staging_id = st.next_host_staging_id;
         st.next_host_staging_id += 1;
         let size = bytes.len() as u64;
@@ -461,6 +654,7 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -495,7 +689,11 @@ impl PumpHandle {
         // Latest-wins at depth 1: replace any queued Budget, journaling the coalesce (§4.7).
         if let Some(pos) = st.queue.iter().position(|q| q.is_budget) {
             st.queue.remove(pos);
-            st.sink.drop_coalesced(3, 1, None, None)?;
+            st.sink.drop_coalesced(
+                3,
+                daemon_vhc_abi::COALESCE_LATEST_WINS,
+                crate::v2::journal::Dropped::default(),
+            )?;
         }
         st.queue.push_back(QueuedEvent {
             frame_bytes,
@@ -504,6 +702,7 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: true,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -527,6 +726,7 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -550,6 +750,7 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -956,6 +1157,18 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                             // Deliver: sample once, journal BEFORE the guest observes (§8.4 r4).
                             let at = shared.now_ms();
                             let ev = st.queue.pop_front().expect("front checked");
+                            // Spool accounting (§4.7): a delivered authoritative frame frees its
+                            // spool slot + its sender's quota; draining below the bound closes
+                            // the exhaustion episode.
+                            if let Some((_, _, sender, _)) = ev.signed {
+                                st.auth_spooled = st.auth_spooled.saturating_sub(1);
+                                if let Some(n) = st.auth_per_sender.get_mut(&sender) {
+                                    *n = n.saturating_sub(1);
+                                }
+                                if st.auth_spooled < st.spool_frames {
+                                    st.spool_exhausted_reported = false;
+                                }
+                            }
                             st.sink
                                 .event(at, &ev.frame_bytes)
                                 .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
@@ -1689,6 +1902,7 @@ fn stage_own_bytes(st: &mut PumpState, bytes: Vec<u8>) -> Result<(), SinkError> 
         return Ok(()); // no deliveries after Stop (§4.4)
     }
     let hash = *blake3::hash(&bytes).as_bytes();
+    st.enforce_payload_depth()?;
     let staging_id = st.next_host_staging_id;
     st.next_host_staging_id += 1;
     let size = bytes.len() as u64;
@@ -1710,6 +1924,7 @@ fn stage_own_bytes(st: &mut PumpState, bytes: Vec<u8>) -> Result<(), SinkError> 
         payload_hash: Some(hash),
         timer_id: None,
         is_budget: false,
+        gossip_id: None,
     });
     Ok(())
 }
@@ -1736,9 +1951,17 @@ fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
         let queued_timers = st.queue.iter().filter(|q| q.timer_id.is_some()).count();
         if queued_timers >= st.timer_depth {
             if let Some(pos) = st.queue.iter().position(|q| q.timer_id.is_some()) {
-                let dropped = st.queue.remove(pos).and_then(|q| q.timer_id);
+                let dropped = st
+                    .queue
+                    .remove(pos)
+                    .and_then(|q| q.timer_id)
+                    .expect("positioned on a queued Timer");
                 st.sink
-                    .drop_coalesced(1, 1, dropped, None)
+                    .drop_coalesced(
+                        1,
+                        daemon_vhc_abi::COALESCE_LATEST_WINS,
+                        crate::v2::journal::Dropped::timer(dropped),
+                    )
                     .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
             }
         }
@@ -1749,6 +1972,7 @@ fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
             payload_hash: None,
             timer_id: Some(t.id),
             is_budget: false,
+            gossip_id: None,
         });
     }
     Ok(())
@@ -1829,6 +2053,14 @@ pub fn start_run(
             next_guest_staging_id: 1,
             sink,
             timer_depth: run.advisory_depth,
+            payload_depth: run.payload_depth,
+            gossip_depth: run.gossip_depth,
+            spool_frames: run.spool_frames,
+            per_sender_quota: run.per_sender_quota,
+            auth_spooled: 0,
+            auth_per_sender: std::collections::HashMap::new(),
+            spool_exhausted_reported: false,
+            gossip_arrivals: std::collections::HashMap::new(),
             metrics: Vec::new(),
             logs: Vec::new(),
             published: Vec::new(),
@@ -2145,7 +2377,7 @@ fn journal_terminal_trap(shared: &Arc<PumpShared>, trap: &Trap) -> Result<(), Si
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::journal::MemorySink;
+    use crate::v2::journal::{MemorySink, SinkEntry};
     use daemon_vhc_proto::sign::verify_bytes;
 
     fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
@@ -2158,6 +2390,14 @@ mod tests {
             next_guest_staging_id: 1,
             sink,
             timer_depth: 2,
+            payload_depth: 4,
+            gossip_depth: 2,
+            spool_frames: 4,
+            per_sender_quota: 2,
+            auth_spooled: 0,
+            auth_per_sender: std::collections::HashMap::new(),
+            spool_exhausted_reported: false,
+            gossip_arrivals: std::collections::HashMap::new(),
             metrics: Vec::new(),
             logs: Vec::new(),
             published: Vec::new(),
@@ -2168,6 +2408,130 @@ mod tests {
             stop_enqueued: false,
             draining: false,
         }
+    }
+
+    fn test_pump(sink: Box<dyn JournalSink>) -> PumpHandle {
+        PumpHandle {
+            shared: Arc::new(PumpShared {
+                state: Mutex::new(test_state(sink)),
+                wake: Condvar::new(),
+                t0: Instant::now(),
+            }),
+        }
+    }
+
+    fn signed_stub() -> Vec<u8> {
+        b"signed-frame-stub".to_vec()
+    }
+
+    #[test]
+    fn authoritative_spool_backpressures_and_journals_the_typed_stall() {
+        // test_state: spool_frames = 4, per_sender_quota = 2 (§4.7: bounded, never drops).
+        let sink = Arc::new(Mutex::new(MemorySink::new()));
+        let pump = test_pump(Box::new(sink.clone()));
+        let s1 = [1u8; 32];
+        let s2 = [2u8; 32];
+        let s3 = [3u8; 32];
+        // Per-sender quota: sender 1's third undelivered frame back-pressures HIM only.
+        assert_eq!(
+            pump.deliver_frame(0, 0, s1, b"a".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::Accepted
+        );
+        assert_eq!(
+            pump.deliver_frame(0, 1, s1, b"b".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::Accepted
+        );
+        assert_eq!(
+            pump.deliver_frame(0, 2, s1, b"c".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::SenderQuota,
+            "per-sender quota bounds the DoS vector (§4.7)"
+        );
+        // Other senders proceed until the SPOOL bound (4).
+        assert_eq!(
+            pump.deliver_frame(0, 0, s2, b"d".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::Accepted
+        );
+        assert_eq!(
+            pump.deliver_frame(0, 1, s2, b"e".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::Accepted
+        );
+        assert_eq!(
+            pump.deliver_frame(0, 0, s3, b"f".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::SpoolFull,
+            "genuine spool exhaustion back-pressures (never a drop)"
+        );
+        // The typed stall was journaled ONCE for the episode (§6.7 tag 16), even on a re-hit.
+        assert_eq!(
+            pump.deliver_frame(0, 0, s3, b"f".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::SpoolFull
+        );
+        let entries = &sink.lock().unwrap().entries;
+        let stalls: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e, SinkEntry::Condition { code, .. } if code == "SpoolExhausted"))
+            .collect();
+        assert_eq!(stalls.len(), 1, "one condition per exhaustion episode");
+        // Nothing was dropped: the reliable class holds every accepted frame.
+        assert!(!entries.iter().any(|e| matches!(e, SinkEntry::Drop { .. })));
+    }
+
+    #[test]
+    fn gossip_class_drops_oldest_at_depth_and_journals_identity() {
+        // test_state: gossip_depth = 2 (§4.7 drop-oldest, journaled tag 7 class 2).
+        let sink = Arc::new(Mutex::new(MemorySink::new()));
+        let pump = test_pump(Box::new(sink.clone()));
+        let g = [9u8; 32];
+        pump.deliver_gossip(5, g, b"g0".to_vec()).unwrap();
+        pump.deliver_gossip(5, g, b"g1".to_vec()).unwrap();
+        pump.deliver_gossip(5, g, b"g2".to_vec()).unwrap();
+        let entries = &sink.lock().unwrap().entries;
+        let drops: Vec<&SinkEntry> = entries
+            .iter()
+            .filter(|e| matches!(e, SinkEntry::Drop { class: 2, .. }))
+            .collect();
+        assert_eq!(drops.len(), 1, "third arrival drops the OLDEST");
+        let SinkEntry::Drop { rule, dropped, .. } = drops[0] else {
+            unreachable!()
+        };
+        assert_eq!(*rule, daemon_vhc_abi::COALESCE_DROP_OLDEST);
+        assert_eq!(
+            (dropped.channel, dropped.sender, dropped.seq),
+            (Some(5), Some(g), Some(0)),
+            "the drop names the oldest arrival's full identity"
+        );
+    }
+
+    #[test]
+    fn payload_ready_dedups_by_hash_and_bounds_depth() {
+        // test_state: payload_depth = 4 (§4.7 class 0: dedup-by-hash + bounded queue).
+        let sink = Arc::new(Mutex::new(MemorySink::new()));
+        let pump = test_pump(Box::new(sink.clone()));
+        // Identical bytes coalesce: one announcement, one journaled dedup.
+        let id1 = pump.stage_payload(b"same".to_vec(), None).unwrap();
+        let id2 = pump.stage_payload(b"same".to_vec(), None).unwrap();
+        assert_eq!(id1, id2, "dedup returns the already-staged id");
+        // Distinct hashes beyond the depth drop the OLDEST announcement (and unstage it).
+        for i in 0u8..4 {
+            pump.stage_payload(vec![i], None).unwrap();
+        }
+        let entries = &sink.lock().unwrap().entries;
+        let dedups = entries
+            .iter()
+            .filter(
+                |e| matches!(e, SinkEntry::Drop { class: 0, rule, .. } if *rule == daemon_vhc_abi::COALESCE_DEDUP_HASH),
+            )
+            .count();
+        assert!(
+            dedups >= 2,
+            "the dedup + the depth drop are journaled: {entries:?}"
+        );
     }
 
     #[test]

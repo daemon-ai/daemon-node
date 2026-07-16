@@ -65,6 +65,17 @@ pub enum InboundVerdict {
         /// The seq the frame carries.
         got: u64,
     },
+    /// Verified and in-sequence, but the pump's bounded spool (or this sender's quota) is full
+    /// (§4.7): the frame was NOT delivered and the cursor was rewound — hold + retry the same
+    /// frame; the reliable class never drops.
+    Backpressure {
+        /// The sending peer.
+        sender: [u8; 32],
+        /// The channel.
+        channel: u64,
+        /// The held frame's seq (the retry re-presents it).
+        seq: u64,
+    },
 }
 
 /// Inbound §12.1 verification state for one run attach: the expected run scope + per
@@ -167,6 +178,24 @@ impl InboundFrames {
         }
 
         // 4. Sequence position per (sender, channel): dense from 0 (§12.2).
+        self.judge(sender, channel, seq, payload)
+    }
+
+    /// Rewind a sender's channel cursor by one — the back-pressure path: an accepted-but-undelivered
+    /// frame will be re-presented, and must be in-sequence again rather than a duplicate (§4.7).
+    pub fn rewind(&mut self, sender: [u8; 32], channel: u64) {
+        if let Some(cursor) = self.cursors.get_mut(&(sender, channel)) {
+            *cursor = cursor.saturating_sub(1);
+        }
+    }
+
+    fn judge(
+        &mut self,
+        sender: [u8; 32],
+        channel: u64,
+        seq: u64,
+        payload: &[u8],
+    ) -> InboundVerdict {
         let cursor = self.cursors.entry((sender, channel)).or_insert(0);
         match seq.cmp(cursor) {
             std::cmp::Ordering::Less => InboundVerdict::Duplicate {
@@ -186,7 +215,7 @@ impl InboundFrames {
                     channel,
                     seq,
                     sender,
-                    payload: payload.clone(),
+                    payload: payload.to_vec(),
                 }
             }
         }
@@ -217,6 +246,12 @@ impl V2Attach {
 
     /// Verify + (iff verified, first-sighted, in-sequence) deliver one inbound wire frame.
     ///
+    /// The pump's reliable class is bounded and back-pressures rather than drops (§4.7): on a
+    /// [`daemon_vhc_host::v2::DeliverVerdict::SpoolFull`]/`SenderQuota` verdict this seam
+    /// **rewinds the sender's sequence cursor** and returns [`InboundVerdict::Backpressure`], so
+    /// the caller's retry of the very same frame is in-sequence again — never a duplicate, never
+    /// a silent skip.
+    ///
     /// # Errors
     /// A pump/journal error while delivering an already-verified frame.
     pub fn deliver(
@@ -231,13 +266,31 @@ impl V2Attach {
             payload,
         } = &verdict
         {
-            self.pump.deliver_frame(
+            let pump_verdict = self.pump.deliver_frame(
                 u32::try_from(*channel).unwrap_or(u32::MAX),
                 *seq,
                 *sender,
                 payload.clone(),
                 frame.to_vec(),
             )?;
+            match pump_verdict {
+                daemon_vhc_host::v2::DeliverVerdict::Accepted => {}
+                daemon_vhc_host::v2::DeliverVerdict::SpoolFull
+                | daemon_vhc_host::v2::DeliverVerdict::SenderQuota => {
+                    // Held, not delivered: rewind so the retry is in-sequence (§4.7).
+                    self.frames.rewind(*sender, *channel);
+                    return Ok(InboundVerdict::Backpressure {
+                        sender: *sender,
+                        channel: *channel,
+                        seq: *seq,
+                    });
+                }
+                daemon_vhc_host::v2::DeliverVerdict::FrameTooLarge => {
+                    return Ok(InboundVerdict::Malformed(
+                        "frame exceeds the channel's max_frame_bytes".into(),
+                    ));
+                }
+            }
         }
         Ok(verdict)
     }

@@ -377,8 +377,16 @@ fn deliver_coordinator_msg(
     let payload = to_canonical_vec(msg).map_err(|e| format!("payload encode: {e}"))?;
     let evidence = to_canonical_vec(&signed).map_err(|e| format!("evidence encode: {e}"))?;
     let seq = next_coord_seq();
-    pump.deliver_frame(0, seq, peer_id(coord_key).0, payload, evidence)
-        .map_err(|e| format!("deliver: {e}"))
+    match pump
+        .deliver_frame(0, seq, peer_id(coord_key).0, payload, evidence)
+        .map_err(|e| format!("deliver: {e}"))?
+    {
+        daemon_vhc_host::v2::DeliverVerdict::Accepted => Ok(()),
+        other => Err(format!(
+            "coordinator frame back-pressured/refused ({other:?}) — the t2 drive never fills \
+             the spool"
+        )),
+    }
 }
 
 /// Coordinator-plane delivery seq (per-process monotone; the §12.2 dense-seq discipline for the
