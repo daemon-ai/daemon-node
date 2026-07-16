@@ -12,7 +12,7 @@
 use daemon_vhc_proto::capability::Capability;
 use daemon_vhc_proto::messages::{SignedMessage, SwarmMessage};
 use daemon_vhc_proto::sign::Signed;
-use daemon_vhc_proto::{PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::{Hash, PeerId, SwarmProtoVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator::state::Phase;
@@ -69,6 +69,18 @@ pub enum Notice {
     },
     /// The run reached `[data].stop` and finished (§6.2).
     Finished,
+    /// A checkpoint attestation was verified + newly recorded into the consensus ledger
+    /// (Phase E cold join; a duplicate `(checkpoint, tier, signer)` re-send emits nothing).
+    CheckpointAttested {
+        /// The attested checkpoint's content hash.
+        checkpoint: Hash,
+        /// The claim tier's wire tag (`0` digest / `1` restore).
+        tier: u64,
+        /// The attesting peer.
+        signer: PeerId,
+        /// Distinct digest-tier attestations now on this checkpoint (the K-gate input).
+        digest_count: u32,
+    },
 }
 
 /// Why an input was rejected (typed).

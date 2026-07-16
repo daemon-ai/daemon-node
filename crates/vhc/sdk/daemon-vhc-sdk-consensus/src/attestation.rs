@@ -22,6 +22,7 @@
 //! signature is meaningless in any other protocol/run and forgery is an ed25519 problem. Signing
 //! reuses the same primitives as [`crate::authority`] (`sign_canonical` / `verify_sig`).
 
+use daemon_vhc_proto::messages::CheckpointAttestation as WireAttestation;
 use daemon_vhc_proto::{
     peer_id, sign_canonical, to_canonical_vec, verify_sig, Hash, PeerId, Signature, SigningKey,
     StateDigest, VerifyOutcome,
@@ -143,11 +144,51 @@ impl SignedAttestation {
             VerifyOutcome::Malformed => Err(AttestationError::Malformed),
         }
     }
+
+    /// Project onto the control-plane wire form (`SwarmMessage::CheckpointAttestation`) — the E3
+    /// coordinator-flow carrier. Field-for-field; the inner signature rides verbatim.
+    #[must_use]
+    pub fn to_wire(&self) -> WireAttestation {
+        WireAttestation {
+            tier: self.body.tier.tag(),
+            run_id: self.body.run_id,
+            epoch: self.body.epoch,
+            round: self.body.round,
+            checkpoint: self.body.checkpoint,
+            digest: self.body.digest,
+            signer: self.body.signer,
+            sig: self.sig,
+        }
+    }
+
+    /// Reconstruct from the control-plane wire form. Decodes the tier tag; does **not** verify —
+    /// call [`verify`](Self::verify) (the coordinator's `tick` does).
+    ///
+    /// # Errors
+    /// [`AttestationError::UnknownTier`] on an unrecognized tier tag.
+    pub fn from_wire(wire: &WireAttestation) -> Result<Self, AttestationError> {
+        Ok(Self {
+            body: AttestationBody {
+                tier: AttestationTier::try_from(wire.tier)?,
+                run_id: wire.run_id,
+                epoch: wire.epoch,
+                round: wire.round,
+                checkpoint: wire.checkpoint,
+                digest: wire.digest,
+                signer: wire.signer,
+            },
+            sig: wire.sig,
+        })
+    }
 }
 
 /// An accumulating set of **verified** checkpoint attestations, deduped by
 /// `(checkpoint, tier, signer)` so one peer's re-sent attestation never inflates a count.
-#[derive(Debug, Clone, Default)]
+///
+/// Serializable + comparable because the coordinator carries it in `CoordinatorState` (the E3
+/// coordinator flow): the ledger is consensus-visible state that must round-trip the state
+/// snapshot byte-identically.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationLedger {
     entries: Vec<SignedAttestation>,
 }

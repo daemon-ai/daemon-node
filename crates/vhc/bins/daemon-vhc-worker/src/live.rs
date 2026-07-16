@@ -225,7 +225,17 @@ pub(crate) async fn join_and_run_live(
         corpus,
         engine_cfg,
         ev_tx,
-    );
+    )
+    // E3: the typed checkpoint lane is ON for the live worker path (E1 landed it opt-in and
+    // off) — every cadence boundary also publishes the typed sectioned manifest and voices this
+    // peer's digest attestation into the coordinator flow (the cold-join eligibility inputs).
+    // Execution identity: the frozen-envelope hash is the run identity (pre-genesis runs),
+    // epoch 0 (the v1 path has no transition chain), module = the pinned blob hash.
+    .with_typed_checkpoints(daemon_vhc_session::checkpoint::CheckpointIdent {
+        run_id: Hash::new(creds.envelope_hash),
+        epoch: 0,
+        module: daemon_vhc_proto::blake3_hash(module),
+    });
 
     // LIVE checkpoint-resync (§9; lane R): before running the round loop, learn the latest
     // coordinator-published checkpoint pointer and — if the run is mid-flight — reload it and replay

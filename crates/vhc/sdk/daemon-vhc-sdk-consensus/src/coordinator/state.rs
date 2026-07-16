@@ -266,6 +266,12 @@ pub struct CoordinatorState {
     pub paused_from: Option<Phase>,
     /// Highest round any peer has reported (epoch global-lead disjunct, PROTO-17).
     pub max_reported_round: u64,
+    /// The checkpoint-attestation ledger (Phase E cold join, architecture §5.3): every verified
+    /// `CheckpointAttestation` frame, deduped by `(checkpoint, tier, signer)`. Consensus-visible
+    /// state — the K-digest join gate and the restore preference are policy over it. Additive
+    /// (`serde(default)`), so pre-E state snapshots reload with an empty ledger.
+    #[serde(default)]
+    pub attestations: crate::attestation::AttestationLedger,
 }
 
 impl CoordinatorState {
@@ -289,6 +295,7 @@ impl CoordinatorState {
             rounds_done: 0,
             paused_from: None,
             max_reported_round: 0,
+            attestations: crate::attestation::AttestationLedger::new(),
         }
     }
 

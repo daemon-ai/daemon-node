@@ -173,9 +173,45 @@ fn dispatch_payload(
         SwarmMessage::Digest(d) => on_digest(state, out, signer, d),
         SwarmMessage::Straggle(s) => on_straggle(state, signer, s),
         SwarmMessage::Heartbeat(h) => on_heartbeat(state, out, signer, h),
+        SwarmMessage::CheckpointAttestation(ca) => on_checkpoint_attestation(state, out, &ca),
         SwarmMessage::RoundOpen(_) | SwarmMessage::RoundRecord(_) => {
             out.push(Output::Reject(Rejection::UnexpectedMessage));
         }
+    }
+}
+
+/// Record a checkpoint attestation into the consensus ledger (Phase E cold join, architecture
+/// §5.3). The attestation is **self-authenticating**: its inner domain-separated signature by the
+/// bound `signer` is verified here (independent of the outer frame's signer, which may be a
+/// relayer re-broadcasting another peer's attestation verbatim — that is why the outer `signer`
+/// is deliberately not an input). Verified + newly-recorded attestations emit
+/// [`Notice::CheckpointAttested`] with the checkpoint's fresh digest-tier count (the K-gate
+/// input); a duplicate `(checkpoint, tier, signer)` re-send is idempotently silent; an invalid
+/// tier or signature is a typed rejection.
+fn on_checkpoint_attestation(
+    state: &mut CoordinatorState,
+    out: &mut Vec<Output>,
+    ca: &daemon_vhc_proto::messages::CheckpointAttestation,
+) {
+    let Ok(att) = crate::attestation::SignedAttestation::from_wire(ca) else {
+        out.push(Output::Reject(Rejection::UnexpectedMessage)); // unknown tier tag
+        return;
+    };
+    let (checkpoint, tier, signer) = (att.body.checkpoint, att.body.tier, att.body.signer);
+    match state.attestations.record(att) {
+        Ok(true) => {
+            let digest_count = state
+                .attestations
+                .count(&checkpoint, crate::attestation::AttestationTier::Digest);
+            out.push(Output::Note(Notice::CheckpointAttested {
+                checkpoint,
+                tier: tier.tag(),
+                signer,
+                digest_count,
+            }));
+        }
+        Ok(false) => {} // idempotent duplicate
+        Err(_) => out.push(Output::Reject(Rejection::BadSignature)),
     }
 }
 
