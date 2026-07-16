@@ -53,7 +53,8 @@ impl DesiredState {
 /// A persisted run row (spec §10.3 `swarm_runs`), decoded into typed form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedRun {
-    /// The run id.
+    /// The run's **`RunLabel`** — the human/registry-facing handle and the `swarm_runs` primary
+    /// key (decisions D1; the old string `run_id`, unchanged on the wire).
     pub run_id: String,
     /// The coordinator endpoint discovery/join used.
     pub coordinator: String,
@@ -69,6 +70,23 @@ pub struct PersistedRun {
     pub last_phase: String,
     /// The last-known round.
     pub last_round: u64,
+    /// The cryptographic **`RunId`** — the 32-byte genesis-envelope hash (ABI §8.1). `None` for a
+    /// v1 row that has never joined a v2 (genesis-hash) envelope (decisions D1 lazy backfill).
+    pub run_id_hash: Option<[u8; 32]>,
+    /// The transition-chain epoch this row's execution identity is at (D0; `0` for v1 rows).
+    pub epoch: u64,
+    /// The envelope-level role label (D0; empty for v1 rows — the implicit single Trainer).
+    pub role: String,
+    /// The never-reused durable u64 role-instance incarnation id (ABI §8.1; `0` for v1 rows).
+    pub instance: u64,
+    /// Sunset observability (decisions D5): the envelope schema major (1 vs 2).
+    pub envelope_schema_major: u32,
+    /// Sunset observability: the admitted worker module's `da_abi` major (1 vs 2), if known.
+    pub module_abi_major: Option<u32>,
+    /// Sunset observability: the selected driver (`"v1"` / `"v2"`), if known.
+    pub selected_driver: Option<String>,
+    /// Sunset observability: the current pinned module blake3, if known.
+    pub module_hash: Option<[u8; 32]>,
 }
 
 /// A `swarm.db` error.
@@ -83,6 +101,18 @@ pub enum StoreError {
     /// A JSON (de)serialization failure for a stored policy / eligibility / event blob.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// The `RunLabel` ↔ `RunId` cross-check failed: the row already carries a different genesis
+    /// hash than the one presented (decisions D1 — a mismatched pair is a stale label or a spoof,
+    /// surfaced as a typed refusal, never silently overwritten).
+    #[error("run identity mismatch for `{run_id}`: row has {existing}, presented {presented}")]
+    IdentityMismatch {
+        /// The `RunLabel` (row key).
+        run_id: String,
+        /// The hex of the hash already stored.
+        existing: String,
+        /// The hex of the presented hash.
+        presented: String,
+    },
 }
 
 /// M1: the full schema (spec §10.3). `IF NOT EXISTS` makes a fresh open idempotent; later schema
@@ -118,8 +148,43 @@ CREATE TABLE IF NOT EXISTS swarm_events (
 CREATE INDEX IF NOT EXISTS swarm_events_run ON swarm_events (run_id, seq);
 ";
 
+/// M2 (D0): migrate `swarm.db` to the run/epoch/role-instance execution-identity model
+/// (decisions D1) and add the D5 sunset-observability columns (decisions D5). **Append-only** —
+/// never edit `SCHEMA`/M1. All adds are nullable or defaulted, so an existing M1 db (v1 rows)
+/// migrates in place: the `run_id` TEXT primary key remains the **`RunLabel`**; the cryptographic
+/// **`RunId`** (32-byte genesis hash) is the new nullable `run_id_hash`, backfilled lazily when a
+/// row is next touched by a join against a v2 (genesis-hash) envelope (a v1-only row keeps a NULL
+/// hash for its whole life — decisions D1 point 5). `envelope_schema_major` defaults to `1` so
+/// legacy rows read as v1 for the sunset audit without a data migration.
+const M2_IDENTITY_OBSERVABILITY: &str = "\
+ALTER TABLE swarm_runs ADD COLUMN run_id_hash BLOB;
+ALTER TABLE swarm_runs ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE swarm_runs ADD COLUMN role TEXT NOT NULL DEFAULT '';
+ALTER TABLE swarm_runs ADD COLUMN instance INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE swarm_runs ADD COLUMN envelope_schema_major INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE swarm_runs ADD COLUMN module_abi_major INTEGER;
+ALTER TABLE swarm_runs ADD COLUMN selected_driver TEXT;
+ALTER TABLE swarm_runs ADD COLUMN module_hash BLOB;
+";
+
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(SCHEMA)])
+    Migrations::new(vec![M::up(SCHEMA), M::up(M2_IDENTITY_OBSERVABILITY)])
+}
+
+/// The column list every `swarm_runs` read shares — kept as one constant so the three readers
+/// ([`SwarmStore::get_run`], [`SwarmStore::list_runs`], [`SwarmStore::active_intents`]) and
+/// [`row_to_run`] never drift apart.
+const RUN_COLUMNS: &str = "run_id, coordinator, policy_json, desired_state, credentials_ref, \
+     eligibility_json, last_phase, last_round, run_id_hash, epoch, role, instance, \
+     envelope_schema_major, module_abi_major, selected_driver, module_hash";
+
+fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn now_ms() -> i64 {
@@ -244,13 +309,86 @@ impl SwarmStore {
         Ok(())
     }
 
+    /// Record a run's D0 execution identity (decisions D1): the transition-chain `epoch`, the
+    /// envelope-level `role`, and the never-reused durable u64 `instance` incarnation. Idempotent.
+    pub fn set_execution_identity(
+        &self,
+        run_id: &str,
+        epoch: u64,
+        role: &str,
+        instance: u64,
+    ) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE swarm_runs SET epoch = ?2, role = ?3, instance = ?4, updated_ms = ?5 \
+             WHERE run_id = ?1",
+            params![run_id, epoch as i64, role, instance as i64, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Record the D5 sunset-observability fields for a run: the envelope schema major, the worker
+    /// module's `da_abi` major, the selected driver (`"v1"`/`"v2"`), and the current module hash.
+    /// The sunset audit ("no live v1 runs") is a query over these columns (decisions D5).
+    pub fn set_observability(
+        &self,
+        run_id: &str,
+        envelope_schema_major: u32,
+        module_abi_major: Option<u32>,
+        selected_driver: Option<&str>,
+        module_hash: Option<&[u8; 32]>,
+    ) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE swarm_runs SET envelope_schema_major = ?2, module_abi_major = ?3, \
+             selected_driver = ?4, module_hash = ?5, updated_ms = ?6 WHERE run_id = ?1",
+            params![
+                run_id,
+                envelope_schema_major as i64,
+                module_abi_major.map(|v| v as i64),
+                selected_driver,
+                module_hash.map(<[u8; 32]>::as_slice),
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Deterministic-lazy **`RunLabel` → `RunId` backfill with cross-check** (decisions D1 point 5):
+    /// write the 32-byte genesis hash into a row whose `run_id_hash` is still NULL; if the row
+    /// already carries a hash, it MUST equal `run_id_hash` or this returns
+    /// [`StoreError::IdentityMismatch`] (a typed refusal — a `RunLabel` resolving to a different
+    /// genesis is a stale label or a spoof). A v1-only row is never forced to synthesize a hash;
+    /// this is called only when a row is touched by a join against a v2 (genesis-hash) envelope.
+    pub fn backfill_run_id(&self, run_id: &str, run_id_hash: &[u8; 32]) -> Result<(), StoreError> {
+        let conn = self.lock();
+        let existing: Option<Option<Vec<u8>>> = conn
+            .query_row(
+                "SELECT run_id_hash FROM swarm_runs WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(Some(bytes)) = existing {
+            if bytes.as_slice() != run_id_hash.as_slice() {
+                return Err(StoreError::IdentityMismatch {
+                    run_id: run_id.to_string(),
+                    existing: hex_of(&bytes),
+                    presented: hex_of(run_id_hash),
+                });
+            }
+            return Ok(()); // already backfilled + agrees
+        }
+        conn.execute(
+            "UPDATE swarm_runs SET run_id_hash = ?2, updated_ms = ?3 WHERE run_id = ?1",
+            params![run_id, run_id_hash.as_slice(), now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Fetch one run row, decoded (`None` if unknown).
     pub fn get_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT run_id, coordinator, policy_json, desired_state, credentials_ref,
-                    eligibility_json, last_phase, last_round
-             FROM swarm_runs WHERE run_id = ?1",
+            &format!("SELECT {RUN_COLUMNS} FROM swarm_runs WHERE run_id = ?1"),
             params![run_id],
             row_to_run,
         )
@@ -260,20 +398,17 @@ impl SwarmStore {
 
     /// All run rows in `run_id` order.
     pub fn list_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
-        self.query_runs(
-            "SELECT run_id, coordinator, policy_json, desired_state, credentials_ref, \
-             eligibility_json, last_phase, last_round FROM swarm_runs ORDER BY run_id",
-        )
+        self.query_runs(&format!(
+            "SELECT {RUN_COLUMNS} FROM swarm_runs ORDER BY run_id"
+        ))
     }
 
     /// The runs with an active join-intent (`desired_state = 'joined'`) — the set the service
     /// re-issues `JoinRun` for on restart (re-convergence).
     pub fn active_intents(&self) -> Result<Vec<PersistedRun>, StoreError> {
-        self.query_runs(
-            "SELECT run_id, coordinator, policy_json, desired_state, credentials_ref, \
-             eligibility_json, last_phase, last_round FROM swarm_runs \
-             WHERE desired_state = 'joined' ORDER BY run_id",
-        )
+        self.query_runs(&format!(
+            "SELECT {RUN_COLUMNS} FROM swarm_runs WHERE desired_state = 'joined' ORDER BY run_id"
+        ))
     }
 
     fn query_runs(&self, sql: &str) -> Result<Vec<PersistedRun>, StoreError> {
@@ -406,6 +541,14 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, 
     let elig_json: String = row.get(5)?;
     let last_phase: String = row.get(6)?;
     let last_round: i64 = row.get(7)?;
+    let run_id_hash: Option<Vec<u8>> = row.get(8)?;
+    let epoch: i64 = row.get(9)?;
+    let role: String = row.get(10)?;
+    let instance: i64 = row.get(11)?;
+    let envelope_schema_major: i64 = row.get(12)?;
+    let module_abi_major: Option<i64> = row.get(13)?;
+    let selected_driver: Option<String> = row.get(14)?;
+    let module_hash: Option<Vec<u8>> = row.get(15)?;
     Ok((|| {
         Ok(PersistedRun {
             run_id,
@@ -416,6 +559,138 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, 
             eligibility: serde_json::from_str(&elig_json)?,
             last_phase,
             last_round: last_round as u64,
+            run_id_hash: run_id_hash.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()),
+            epoch: epoch as u64,
+            role,
+            instance: instance as u64,
+            envelope_schema_major: envelope_schema_major as u32,
+            module_abi_major: module_abi_major.map(|v| v as u32),
+            selected_driver,
+            module_hash: module_hash.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()),
         })
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_api::SwarmPolicyMode;
+
+    fn v1_policy() -> SwarmPolicy {
+        SwarmPolicy {
+            mode: SwarmPolicyMode::Idle,
+            vram_cap_mb: 8_000,
+            duty_cycle_pct: 90,
+            schedule: None,
+        }
+    }
+
+    /// The D0 `M2` migration must upgrade an existing **M1** db (a pre-D0 v1 row) in place:
+    /// the row survives, the new execution-identity columns default (RunId NULL — lazy backfill),
+    /// and the observability columns read v1 (decisions D1/D5; refactor §8/D0 "upgrade test").
+    #[test]
+    fn m2_upgrade_preserves_v1_rows_and_defaults_new_columns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Bring the db to **M1 only** (the pre-D0 schema), then insert a legacy v1 row.
+        Migrations::new(vec![M::up(SCHEMA)])
+            .to_latest(&mut conn)
+            .unwrap();
+        let policy_json = serde_json::to_string(&v1_policy()).unwrap();
+        let elig_json = serde_json::to_string(&SwarmEligibility::default()).unwrap();
+        conn.execute(
+            "INSERT INTO swarm_runs (run_id, coordinator, policy_json, desired_state, \
+             eligibility_json) VALUES ('legacy-run', 'ws://c', ?1, 'joined', ?2)",
+            params![policy_json, elig_json],
+        )
+        .unwrap();
+
+        // Now run the FULL ladder (M1 + M2). rusqlite_migration applies only the missing M2.
+        migrations().to_latest(&mut conn).unwrap();
+
+        let store = SwarmStore {
+            conn: Mutex::new(conn),
+        };
+        let run = store
+            .get_run("legacy-run")
+            .unwrap()
+            .expect("row survives M2");
+        assert_eq!(run.run_id, "legacy-run");
+        assert_eq!(run.desired_state, DesiredState::Joined);
+        assert_eq!(run.policy, v1_policy(), "v1 policy preserved verbatim");
+        // Execution-identity columns default; RunId is NULL (lazy backfill — decisions D1).
+        assert_eq!(run.run_id_hash, None);
+        assert_eq!(run.epoch, 0);
+        assert_eq!(run.role, "");
+        assert_eq!(run.instance, 0);
+        // Sunset observability: a legacy row reads as v1 without a data migration (decisions D5).
+        assert_eq!(run.envelope_schema_major, 1);
+        assert_eq!(run.module_abi_major, None);
+        assert_eq!(run.selected_driver, None);
+        assert_eq!(run.module_hash, None);
+    }
+
+    /// The deterministic-lazy `RunLabel → RunId` backfill writes a NULL hash once, is idempotent
+    /// on agreement, and refuses a conflicting hash with a typed [`StoreError::IdentityMismatch`]
+    /// (decisions D1 cross-check).
+    #[test]
+    fn run_id_backfill_is_lazy_idempotent_and_cross_checked() {
+        let store = SwarmStore::open_in_memory().unwrap();
+        store
+            .put_join_intent(
+                "run-A",
+                "ws://c",
+                &v1_policy(),
+                None,
+                &SwarmEligibility::default(),
+            )
+            .unwrap();
+        assert_eq!(store.get_run("run-A").unwrap().unwrap().run_id_hash, None);
+
+        let genesis = [0xABu8; 32];
+        store.backfill_run_id("run-A", &genesis).unwrap();
+        assert_eq!(
+            store.get_run("run-A").unwrap().unwrap().run_id_hash,
+            Some(genesis)
+        );
+        // Idempotent on agreement.
+        store.backfill_run_id("run-A", &genesis).unwrap();
+        // A different genesis for the same RunLabel is a typed refusal.
+        let other = [0x11u8; 32];
+        assert!(matches!(
+            store.backfill_run_id("run-A", &other),
+            Err(StoreError::IdentityMismatch { .. })
+        ));
+    }
+
+    /// The v2 execution-identity + observability writers populate the D0 columns for the sunset
+    /// audit query (decisions D5).
+    #[test]
+    fn v2_identity_and_observability_writers() {
+        let store = SwarmStore::open_in_memory().unwrap();
+        store
+            .put_join_intent(
+                "run-B",
+                "iroh://c",
+                &v1_policy(),
+                None,
+                &SwarmEligibility::default(),
+            )
+            .unwrap();
+        store
+            .set_execution_identity("run-B", 3, "worker", 42)
+            .unwrap();
+        let mh = [0x22u8; 32];
+        store
+            .set_observability("run-B", 2, Some(2), Some("v2"), Some(&mh))
+            .unwrap();
+        let run = store.get_run("run-B").unwrap().unwrap();
+        assert_eq!(
+            (run.epoch, run.role.as_str(), run.instance),
+            (3, "worker", 42)
+        );
+        assert_eq!(run.envelope_schema_major, 2);
+        assert_eq!(run.module_abi_major, Some(2));
+        assert_eq!(run.selected_driver.as_deref(), Some("v2"));
+        assert_eq!(run.module_hash, Some(mh));
+    }
 }
