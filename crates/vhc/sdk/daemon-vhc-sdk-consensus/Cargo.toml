@@ -24,6 +24,10 @@ path = "src/lib.rs"
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+# The envelope's opaque `authority` section is a `ciborium::value::Value` (D0); D1's typed
+# `AuthorityConfig` decodes from it. ciborium is the same wasm32-clean codec `daemon-vhc-proto`
+# already links, so this keeps the crate guest-buildable.
+ciborium = { workspace = true }
 
 [lints]
 workspace = true
