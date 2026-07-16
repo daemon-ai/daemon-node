@@ -469,6 +469,17 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "toy_mlp"],
         ),
         (
+            // The Phase-C compute-REPLAY tier (refactor §7: "compute replay … the second of the
+            // three replay tiers"; architecture §3.6 "compute replay, tolerance-equivalent"): a
+            // recorded compute@2 op-journal, re-executed against a (possibly different) backend,
+            // reproduces the trajectory within the native lane's tolerance class. The tier-1 lane
+            // pins the ndarray↔ndarray DEGENERATE case (tolerance 0 — bit-exact — so the harness
+            // itself is always exercised); the wgpu cross-backend tier is hardware-gated in the
+            // same file.
+            "C3 compute replay (ndarray↔ndarray degenerate: same op-journal, bit-exact re-execution)",
+            &["-p", "daemon-vhc-host", "--test", "compute_replay"],
+        ),
+        (
             // The B2 data@2 fetch conformance (architecture §3.2 the data world): the corpus
             // window fetched by committed hash + policy-chosen range, completing Ok(BufferHandle)
             // (tag 6) after whole-artifact verification; grant negative (GrantViolation),
