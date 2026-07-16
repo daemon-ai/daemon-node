@@ -1,31 +1,38 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `compute@2` on the **CUDA tier** — the true-device closure of the C1 deferred-error gap
+//! `compute@2` on the **CUDA tier** — a true-backend probe of the C1 deferred-error gap
 //! ("a genuine device-side fault path was only ever simulated via the injectable latch;
 //! wgpu/AMD covered the async-queue shape, but real CUDA sticky-error semantics are
 //! unexercised"). `burn-cubecl` implements `BackendIr`, so [`ComputeRunner`] instantiates over
 //! the real `Cuda` backend UNCHANGED — the same codec, handle-liveness, RESERVED refusals, and
 //! deferred-error latch as tier-1/wgpu, now over the real NVRTC-JIT CUDA queue.
 //!
-//! The genuine-fault lane: a `Full` creation op sized past the device's physical VRAM forces a
-//! real driver-reported `CUDA_ERROR_OUT_OF_MEMORY`. **Observed true-CUDA semantics (RTX 4090,
-//! burn 0.21 / cubecl 0.10, validated 2026-07-16):** the allocation failure panics cubecl's
-//! device-stream thread (`DSD-0-0`, `server.rs` alloc unwrap), NOT the submitting thread — so
-//! enqueue stays infallible (§3.3 holds) and the dispatch-seam `catch_unwind` never fires. The
-//! fault then surfaces at **readback of the affected tensor** as the typed
-//! [`ComputeError::Device`] (trap twin `ComputeFault`) via the readback `catch_unwind` — never
-//! a host panic/abort. **Reported gap:** `fence()` (burn-router `RunnerClient::sync`) does NOT
-//! observe the dead stream and returns `Ok` — on real CUDA the deferred fault is
-//! readback-visible but not fence-visible, unlike the injectable-latch model where both report.
-//! The assertions below accept a fence-side error if a future burn/cubecl starts reporting one,
-//! but require the readback-side typed surfacing. The host + device survive to serve subsequent
-//! ops (alloc failure is a non-sticky CUDA error — the context is NOT poisoned; a true sticky
-//! fault needs an illegal-address kernel, which the pinned op set cannot express).
+//! The non-injected fault lane: a `Full` creation op whose single output buffer is ~2× the
+//! device's physical VRAM. **Observed semantics (RTX 4090, burn 0.21 / cubecl 0.10, run
+//! 2026-07-16; wording corrected same day after an adversarial audit of the logs):** the
+//! request is rejected HOST-SIDE by cubecl's memory pools (`IoError::BufferTooBig` — no pool's
+//! `max_alloc_size` accepts it) before any `cuMemAlloc`; the driver is never engaged and no
+//! `CUDA_ERROR_OUT_OF_MEMORY` occurs. The rejection panics the task on cubecl's device-stream
+//! thread (`DSD-0-0`: `initialize_memory` unwraps the fallible reserve), NOT the submitting
+//! thread — so enqueue stays infallible (§3.3 holds) and the dispatch-seam `catch_unwind`
+//! never fires. cubecl catches that panic per-task, so the stream and runner keep serving; the
+//! fault is scoped to the one unbacked handle and surfaces at **readback of the affected
+//! tensor** as the typed [`ComputeError::Device`] (trap twin `ComputeFault`) — a generic
+//! "runner panicked" fault for that handle, not an allocation diagnostic — never a host
+//! panic/abort. **Reported gap:** `fence()` (burn-router `RunnerClient::sync`) returns `Ok`
+//! after the fault — cubecl's alloc path panics instead of pushing the error into the stream's
+//! error queue the way its `launch` path does, so no error state exists for `sync` to drain;
+//! the deferred fault is readback-visible but not fence-visible, unlike the injectable-latch
+//! model where both report. The assertions below accept a fence-side error if a future
+//! burn/cubecl starts reporting one, but require the readback-side typed surfacing. The host +
+//! runner survive to serve subsequent ops. Residual (C1's escalated gap stays open): genuine
+//! driver-reported `CUDA_ERROR_OUT_OF_MEMORY` and sticky-error semantics (an illegal-address
+//! kernel, which the pinned op set cannot express) remain unvalidated.
 //!
-//! Open follow-up (out of scope here, needs remote-hardware iteration): if fence-visibility is a
-//! hard ABI requirement, bridge cubecl's stream health into `sync` so `fence()` reports the dead
-//! stream instead of `Ok` (upstream: cubecl swallows the dead-stream state).
+//! Open follow-up (out of scope here, needs remote-hardware iteration): make cubecl-cuda's
+//! alloc path record errors like its launch path (push into the stream's error queue) so
+//! `fence()`/`sync` can drain the typed fault instead of returning `Ok`.
 //!
 //! Opt-in (`--features cuda`), self-skipping without a usable CUDA device + staged
 //! driver-matched NVRTC (`DAEMON_CUDA_RUNTIME_DIR`; tier-2 discipline: GPU lanes are never the
@@ -115,21 +122,22 @@ fn cuda_tier_round_trips_and_defers_errors_to_the_fence() {
     runner.fence().expect("the fault surfaced exactly once");
 }
 
-/// **The genuine device-fault lane** (the C1 escalated gap, closed on real hardware): an op whose
-/// output cannot physically fit the device forces a real `CUDA_ERROR_OUT_OF_MEMORY` from the
-/// driver. The conformance obligations, on true CUDA (see the module doc for the observed
-/// fence-visibility gap):
+/// **The non-injected fault lane** (probing the C1 escalated gap — narrowed, not closed): an op
+/// whose single output buffer cannot physically fit the device is rejected host-side by cubecl's
+/// memory pools (`IoError::BufferTooBig`; the driver is never engaged — see the module doc). The
+/// conformance obligations (see the module doc for the observed fence-visibility gap):
 ///
-/// 1. enqueue is infallible — `submit_op` returns `Ok` even though the device faults (§3.3);
+/// 1. enqueue is infallible — `submit_op` returns `Ok` even though the allocation is refused
+///    (§3.3);
 /// 2. the fault is DEFERRED and surfaces typed — `ComputeError::Device` (trap twin
 ///    `ComputeFault`) at the readback of the affected tensor (and at the fence too, if the
 ///    backend reports it there) — never a host panic, never a process abort;
 /// 3. enqueue stays infallible in the faulted window;
-/// 4. the host AND the CUDA context survive: the same runner serves a fresh import → fence →
-///    readback afterwards (OOM is a non-sticky CUDA error), and a second runner on the same
-///    device also works — the driver was not wedged.
+/// 4. the host AND the runner survive: the fault is scoped to the unbacked handle, so the same
+///    runner serves a fresh import → fence → readback afterwards, and a second runner on the
+///    same device also works — the driver was never engaged, let alone wedged.
 #[test]
-fn genuine_cuda_oom_defers_to_readback_typed_and_the_host_survives() {
+fn oversized_alloc_reject_defers_to_readback_typed_and_the_host_survives() {
     require_cuda!();
     let probe = probe_cuda().expect("device probed (require_cuda passed)");
     let device = Default::default();
@@ -140,32 +148,34 @@ fn genuine_cuda_oom_defers_to_readback_typed_and_the_host_survives() {
     runner.import_tensor(1, &ser(&data)).expect("import");
     runner.fence().expect("clean fence before the fault");
 
-    // An output sized ~2x the device's total VRAM (f32 elements). One contiguous buffer, so the
-    // driver must refuse the allocation: a GENUINE device-side fault, not an injected one.
+    // An output sized ~2x the device's total VRAM (f32 elements). One contiguous buffer, so no
+    // cubecl memory pool's `max_alloc_size` accepts it: the host-side allocator rejects it
+    // (`IoError::BufferTooBig`) before any `cuMemAlloc` — a real (if host-side) allocation
+    // failure, not an injected one; the driver is never engaged.
     let vram_bytes = probe.vram_mb * 1024 * 1024;
-    let oom_elems = usize::try_from(vram_bytes * 2 / 4).expect("fits usize on x86_64");
+    let huge_elems = usize::try_from(vram_bytes * 2 / 4).expect("fits usize on x86_64");
     eprintln!(
-        "forcing a genuine CUDA OOM: requesting {} MiB against {} MiB of VRAM",
-        oom_elems as u64 * 4 / (1024 * 1024),
+        "forcing a host-side pool-cap rejection: requesting {} MiB against {} MiB of VRAM",
+        huge_elems as u64 * 4 / (1024 * 1024),
         probe.vram_mb
     );
-    let oom_out = TensorIr {
+    let huge_out = TensorIr {
         id: TensorId::new(100),
-        shape: Shape::from(vec![oom_elems]),
+        shape: Shape::from(vec![huge_elems]),
         status: TensorStatus::NotInit,
         dtype: DType::F32,
     };
-    let oom_op = OperationIr::NumericFloat(
+    let huge_op = OperationIr::NumericFloat(
         DType::F32,
         NumericOperationIr::Full(FullOpIr {
-            out: oom_out,
+            out: huge_out,
             value: ScalarIr::Float(1.0),
         }),
     );
-    // (1) Enqueue is infallible even though the device faults.
+    // (1) Enqueue is infallible even though the allocation is refused.
     runner
-        .submit_op(&ser(&oom_op))
-        .expect("enqueue is infallible — the device fault must NOT surface at submit_op");
+        .submit_op(&ser(&huge_op))
+        .expect("enqueue is infallible — the fault must NOT surface at submit_op");
 
     // (3) The faulted window: another enqueue still succeeds.
     let data2 = TensorData::new(vec![9.0f32], [1usize]);
@@ -173,30 +183,33 @@ fn genuine_cuda_oom_defers_to_readback_typed_and_the_host_survives() {
         .import_tensor(2, &ser(&data2))
         .expect("enqueue stays infallible in the faulted window");
 
-    // (2) The fault never crashes the host at the fence. Observed on real CUDA: the dead stream
-    // is NOT fence-visible (burn-router sync returns Ok — the reported gap); a future backend
-    // reporting it here as the typed Device fault is also conformant.
+    // (2) The fault never crashes the host at the fence. Observed on real CUDA: the fault is
+    // NOT fence-visible (burn-router sync returns Ok — cubecl's alloc path panics instead of
+    // queueing the error for sync to drain; the reported gap); a future backend reporting it
+    // here as the typed Device fault is also conformant.
     match runner.fence() {
-        Ok(()) => eprintln!("fence after genuine OOM: Ok (fault is readback-visible only — the observed cubecl 0.10 shape)"),
+        Ok(()) => eprintln!("fence after the alloc rejection: Ok (fault is readback-visible only — the observed cubecl 0.10 shape)"),
         Err(err) => {
             let ComputeError::Device(reason) = &err else {
                 panic!("expected the typed deferred Device fault at the fence, got {err:?}");
             };
-            eprintln!("genuine CUDA fault surfaced at the fence: {reason}");
+            eprintln!("the alloc-rejection fault surfaced at the fence: {reason}");
             assert_eq!(err.trap_code().slug(), "ComputeFault");
         }
     }
 
     // (2) The readback of the affected tensor MUST surface the typed deferred Device fault —
-    // never a host panic/abort.
-    let err = runner.read_tensor(&read_ir(100, oom_elems)).unwrap_err();
+    // never a host panic/abort. (It is a generic "runner panicked" fault scoped to this handle,
+    // not an allocation diagnostic.)
+    let err = runner.read_tensor(&read_ir(100, huge_elems)).unwrap_err();
     let ComputeError::Device(reason) = &err else {
         panic!("expected the typed deferred Device fault at readback, got {err:?}");
     };
-    eprintln!("genuine CUDA fault surfaced at readback: {reason}");
+    eprintln!("the alloc-rejection fault surfaced at readback: {reason}");
     assert_eq!(err.trap_code().slug(), "ComputeFault");
 
-    // (4) Survival: the same runner serves fresh work (OOM is non-sticky — the context lives)...
+    // (4) Survival: the same runner serves fresh work (the fault is scoped to the unbacked
+    // handle — cubecl caught the per-task panic and the stream keeps serving)...
     runner.import_tensor(3, &ser(&data)).expect("fresh import");
     runner.fence().expect("clean fence after the fault");
     let exported = runner
@@ -208,7 +221,8 @@ fn genuine_cuda_oom_defers_to_readback_typed_and_the_host_survives() {
         data.to_vec::<f32>().expect("f32")
     );
 
-    // ...and a second runner on the same device also constructs and works: the driver is sane.
+    // ...and a second runner on the same device also constructs and works: the driver (never
+    // engaged by the rejected request) is sane.
     let mut second = ComputeRunner::<CudaReal>::new(Default::default());
     second.import_tensor(1, &ser(&data)).expect("import");
     second.fence().expect("a fresh runner is clean");
@@ -217,6 +231,6 @@ fn genuine_cuda_oom_defers_to_readback_typed_and_the_host_survives() {
     assert_eq!(
         round.to_vec::<f32>().expect("f32"),
         data.to_vec::<f32>().expect("f32"),
-        "the host refused/absorbed the device fault and the driver survived to serve new work"
+        "the host absorbed the allocation rejection and the device serves new work"
     );
 }
