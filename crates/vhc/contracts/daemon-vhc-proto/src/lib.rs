@@ -20,6 +20,7 @@ pub mod assignment;
 pub mod bytes;
 pub mod canonical;
 pub mod capability;
+pub mod crypto;
 pub mod digest;
 pub mod envelope;
 pub mod error;
@@ -38,6 +39,10 @@ pub use assignment::{
 pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use capability::{Capability, CapabilitySet};
+pub use crypto::{
+    hash as crypto_hash, verify_sig, VerifyOutcome, HASH_LEN, VERIFY_PUBLIC_KEY_LEN,
+    VERIFY_SIGNATURE_LEN,
+};
 pub use digest::{derive_schedule, digest_state, DigestSchedule, StateLayout};
 pub use envelope::{
     DeviceMinimums, Envelope, FrozenEnvelope, SignedEnvelope, ENVELOPE_SCHEMA_MAJOR,

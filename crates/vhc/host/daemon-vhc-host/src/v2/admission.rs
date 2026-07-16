@@ -142,6 +142,25 @@ pub struct DeviceProfile {
     pub disk_bytes: u64,
 }
 
+impl DeviceProfile {
+    /// The guest-readable canonical-CBOR wire form: the bytes the run header journals (§8.3
+    /// tag 0 `device`), `sys@2::device_profile` delivers (journaled per delivery as tag 15), and
+    /// a module's autotune reads (architecture §3.5 — "the module reads the same device profile
+    /// the probe measures"). A string-keyed map with raw-byte units, additive by minor.
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        let uint = |v: u64| ciborium::value::Value::Integer(v.into());
+        let text = |s: &str| ciborium::value::Value::Text(s.into());
+        let v = ciborium::value::Value::Map(vec![
+            (text("gpu"), ciborium::value::Value::Bool(self.gpu)),
+            (text("vram_bytes"), uint(self.vram_bytes)),
+            (text("ram_bytes"), uint(self.ram_bytes)),
+            (text("disk_bytes"), uint(self.disk_bytes)),
+        ]);
+        daemon_vhc_proto::to_canonical_vec(&v).expect("device profile cbor")
+    }
+}
+
 /// The owner's standing policy inputs to the funnel's two bracketing stages (architecture §3.5).
 /// The A2 shape is scalar caps under the single-instance guard; the typed per-device ledgers are
 /// Phase E (decisions D6).

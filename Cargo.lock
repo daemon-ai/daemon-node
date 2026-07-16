@@ -4514,6 +4514,7 @@ dependencies = [
  "daemon-vhc-proto",
  "daemon-vhc-sdk",
  "daemon-vhc-sdk-rounds",
+ "daemon-vhc-sdk-v2",
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
  "serde_json",
@@ -5023,9 +5024,11 @@ dependencies = [
 name = "daemon-vhc-sdk-v2"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "ciborium",
  "daemon-vhc-proto",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

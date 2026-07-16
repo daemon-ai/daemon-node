@@ -15,18 +15,59 @@ extern "C" {
     fn abi_next_event(buf_ptr: u32, buf_cap: u32) -> u64;
     #[link_name = "read_back"]
     fn abi_read_back(src: u64, kind: u32, out_ptr: u32, out_cap: u32) -> u64;
+    // -- minor 1 (Phase B, track B1): the buffer layer + cancellation (§3.4/§7.5) --------------
+    #[link_name = "create_from"]
+    fn abi_create_from(ptr: u32, len: u32) -> u64;
+    #[link_name = "read_into"]
+    fn abi_read_into(buffer: u64, offset: u64, out_ptr: u32, out_cap: u32) -> u64;
+    #[link_name = "buffer_len"]
+    fn abi_buffer_len(buffer: u64) -> u64;
+    #[link_name = "buffer_release"]
+    fn abi_buffer_release(buffer: u64);
+    #[link_name = "cancel"]
+    fn abi_cancel(op: u64) -> u32;
 }
 
 #[link(wasm_import_module = "net@2")]
 extern "C" {
     #[link_name = "publish"]
     fn abi_publish(channel_id: u32, payload_ptr: u32, payload_len: u32) -> u64;
+    // -- minor 1: content-addressed payloads by handle (§3.4) — complete via Event::Completion --
+    #[link_name = "payload_put"]
+    fn abi_payload_put(buffer: u64) -> u64;
+    #[link_name = "payload_get"]
+    fn abi_payload_get(hash_ptr: u32) -> u64;
+    // -- minor 1: direct peer streams under credit flow control (§3.3/§3.4) ---------------------
+    #[link_name = "stream_open"]
+    fn abi_stream_open(peer_ptr: u32) -> u64;
+    #[link_name = "stream_accept"]
+    fn abi_stream_accept() -> u64;
+    #[link_name = "stream_write"]
+    fn abi_stream_write(stream: u64, buffer: u64) -> u64;
+    #[link_name = "stream_read"]
+    fn abi_stream_read(stream: u64) -> u64;
+}
+
+#[link(wasm_import_module = "data@2")]
+extern "C" {
+    #[link_name = "fetch"]
+    fn abi_data_fetch(hash_ptr: u32, range_off: u64, range_len: u64) -> u64;
 }
 
 #[link(wasm_import_module = "sys@2")]
 extern "C" {
     #[link_name = "set_timer"]
     fn abi_set_timer(delay_ms: u64) -> u64;
+    #[link_name = "emit_metric"]
+    fn abi_emit_metric(name_ptr: u32, name_len: u32, value: f64);
+    #[link_name = "rng_seed"]
+    fn abi_rng_seed(out_ptr: u32) -> u32;
+    #[link_name = "device_profile"]
+    fn abi_device_profile(out_ptr: u32, out_cap: u32) -> u64;
+    #[link_name = "hash"]
+    fn abi_hash(in_ptr: u32, in_len: u32, out_ptr: u32) -> u32;
+    #[link_name = "verify_sig"]
+    fn abi_verify_sig(pk_ptr: u32, sig_ptr: u32, msg_ptr: u32, msg_len: u32) -> u32;
 }
 
 /// One decoded event: the §4.2 tag plus the positional fields (tag included at index 0).
@@ -142,4 +183,184 @@ pub fn publish(channel: u32, payload: &[u8]) -> u64 {
 pub fn set_timer(delay_ms: u64) -> u64 {
     // SAFETY: plain-value import.
     unsafe { abi_set_timer(delay_ms) }
+}
+
+/// Emit an advisory metric (§6.5 — egress only, rate-limited host-side, never journaled).
+pub fn emit_metric(name: &str, value: f64) {
+    // SAFETY: `name` is a live guest span for the call's duration.
+    unsafe { abi_emit_metric(name.as_ptr() as u32, name.len() as u32, value) }
+}
+
+/// The run-scoped deterministic RNG seed (architecture §3.2 "seeded randomness"): a pure
+/// function of the execution identity, identical across trap-restarts of the same incarnation
+/// and at replay (§2.7 dc class — never journaled, always re-derivable).
+#[must_use]
+pub fn rng_seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    // SAFETY: `seed` is a live 32-byte guest span for the call's duration.
+    let status = unsafe { abi_rng_seed(seed.as_mut_ptr() as u32) };
+    if status != 0 {
+        unreachable!("unknown rng_seed status (fail closed, §5.2)");
+    }
+    seed
+}
+
+/// The `sys@2::hash` crypto acceleration: blake3-256 of `data` (the det-lane pattern — the
+/// in-guest fallback is `daemon_vhc_proto::crypto::hash`, this is the host fast path; the two
+/// are bit-identical by construction and gated in tier-1). Deterministic — never journaled.
+#[must_use]
+pub fn hash_accel(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    // SAFETY: `data`/`out` are live guest spans for the call's duration.
+    let status = unsafe {
+        abi_hash(
+            data.as_ptr() as u32,
+            data.len() as u32,
+            out.as_mut_ptr() as u32,
+        )
+    };
+    if status != 0 {
+        unreachable!("unknown hash status (fail closed, §5.2)");
+    }
+    out
+}
+
+/// The `sys@2::verify_sig` crypto acceleration: ed25519 verify, returning the tri-state
+/// `daemon_vhc_proto::crypto::VerifyOutcome` code (0 valid / 1 invalid / 2 malformed — unknown
+/// codes fail closed). In-guest fallback: `daemon_vhc_proto::crypto::verify_sig`.
+#[must_use]
+pub fn verify_sig_accel(public_key: &[u8; 32], signature: &[u8; 64], message: &[u8]) -> u32 {
+    // SAFETY: all three are live guest spans for the call's duration.
+    let code = unsafe {
+        abi_verify_sig(
+            public_key.as_ptr() as u32,
+            signature.as_ptr() as u32,
+            message.as_ptr() as u32,
+            message.len() as u32,
+        )
+    };
+    if code > 2 {
+        unreachable!("unknown verify_sig outcome (fail closed, §5.2)");
+    }
+    code
+}
+
+/// The device profile the probe measures (architecture §3.5 — what makes module autotune
+/// possible), as canonical-CBOR bytes; honors the mandatory NeedCapacity retry. The host
+/// journals every delivery (tag 15) — it is a nondeterministic input.
+#[must_use]
+pub fn device_profile() -> Vec<u8> {
+    let mut buf = vec![0u8; 128];
+    loop {
+        // SAFETY: `buf` is a live guest span for the call's duration.
+        let packed = unsafe { abi_device_profile(buf.as_mut_ptr() as u32, buf.len() as u32) };
+        let (status, len) = (packed >> 32, (packed & 0xffff_ffff) as usize);
+        match status {
+            0 => {
+                buf.truncate(len);
+                return buf;
+            }
+            1 => buf.resize(len, 0),
+            _ => unreachable!("unknown device_profile status (fail closed, §5.2)"),
+        }
+    }
+}
+
+// -- minor 1 (Phase B, track B1): buffers + the completion protocol (§3.4/§7.5) -------------------
+
+/// Seal `bytes` into a host buffer (the budgeted linear-memory OUT path; sealed at creation).
+/// Returns the kind-8 `BufferHandle`. Requires declaring abi minor ≥ 1.
+pub fn create_from(bytes: &[u8]) -> u64 {
+    // SAFETY: `bytes` is a live guest span for the call's duration.
+    unsafe { abi_create_from(bytes.as_ptr() as u32, bytes.len() as u32) }
+}
+
+/// Read a sealed buffer back into guest memory in full (the budgeted linear-memory IN path,
+/// charged against the per-slice readback allowance).
+#[must_use]
+pub fn read_buffer(buffer: u64) -> Vec<u8> {
+    // SAFETY: plain-value import.
+    let len = unsafe { abi_buffer_len(buffer) } as usize;
+    let mut out = vec![0u8; len];
+    if len > 0 {
+        // SAFETY: `out` is a live guest span for the call's duration.
+        let n = unsafe { abi_read_into(buffer, 0, out.as_mut_ptr() as u32, len as u32) };
+        out.truncate(n as usize);
+    }
+    out
+}
+
+/// The sealed length of a buffer (deterministic bookkeeping).
+#[must_use]
+pub fn buffer_len(buffer: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_buffer_len(buffer) }
+}
+
+/// Release the guest's hold on a buffer (frees its quota; §3.4 ownership).
+pub fn buffer_release(buffer: u64) {
+    // SAFETY: plain-value import.
+    unsafe { abi_buffer_release(buffer) };
+}
+
+/// Cancel an outstanding op (§7.5): `0` = accepted (its completion will report `Cancelled`),
+/// `1` = already completed/cancelled or unknown.
+pub fn cancel(op: u64) -> u32 {
+    // SAFETY: plain-value import.
+    unsafe { abi_cancel(op) }
+}
+
+/// Store a sealed buffer on the run's payload plane (§3.4). Returns the `OpId`; completes with
+/// `Ok(hash)` — the content commitment computed host-side over exactly the sealed bytes.
+pub fn payload_put(buffer: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_payload_put(buffer) }
+}
+
+/// Fetch content-addressed bytes (§3.4). Returns the `OpId`; completes with `Ok(BufferHandle)`
+/// after host-side hash verification.
+pub fn payload_get(hash: &[u8; 32]) -> u64 {
+    // SAFETY: `hash` is a live 32-byte guest span for the call's duration.
+    unsafe { abi_payload_get(hash.as_ptr() as u32) }
+}
+
+// -- minor 1 (Phase B, track B2): the data world (architecture §3.2) ------------------------------
+
+/// Fetch a committed artifact's byte range (`data@2::fetch`): `hash` names content from the
+/// envelope's edge-pinned artifact map (which artifacts a module may touch is a grant — an
+/// ungranted hash traps `GrantViolation`); `range_len == 0` means to the end. Returns the
+/// `OpId`; completes `Ok(BufferHandle)` via `Event::Completion` after the host verifies the
+/// whole artifact against the committed hash and slices the range (the sub-resource rule). No
+/// URL, locator, or credential exists on this surface — resolution happened at the edge.
+pub fn data_fetch(hash: &[u8; 32], range_off: u64, range_len: u64) -> u64 {
+    // SAFETY: `hash` is a live 32-byte guest span for the call's duration.
+    unsafe { abi_data_fetch(hash.as_ptr() as u32, range_off, range_len) }
+}
+
+/// Open a direct stream to `peer` (§3.3). Returns the `OpId`; completes with `Ok(StreamHandle)`.
+pub fn stream_open(peer: &[u8; 32]) -> u64 {
+    // SAFETY: `peer` is a live 32-byte guest span for the call's duration.
+    unsafe { abi_stream_open(peer.as_ptr() as u32) }
+}
+
+/// Stand an accept for an incoming stream (§3.3). Returns the `OpId`; completes with
+/// `Ok(StreamHandle)` when a peer opens.
+pub fn stream_accept() -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_stream_accept() }
+}
+
+/// Write a sealed buffer to a stream (§3.4): consumes writable credit; a write beyond the window
+/// is held host-side and completes when the receiver's reads replenish credit — the completion IS
+/// the credit signal. Returns the `OpId`; completes `Ok(())`.
+pub fn stream_write(stream: u64, buffer: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_stream_write(stream, buffer) }
+}
+
+/// Read the next chunk from a stream (§3.4). Returns the `OpId`; completes with
+/// `Ok(BufferHandle)` of the received opaque bytes.
+pub fn stream_read(stream: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_stream_read(stream) }
 }

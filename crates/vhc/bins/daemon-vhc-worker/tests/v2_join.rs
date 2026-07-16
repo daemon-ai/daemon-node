@@ -72,7 +72,8 @@ fn module_path() -> PathBuf {
 }
 
 /// The guest config (`GuestCfg`): the tiny parity model on a 2-step round, one sequence per
-/// micro window (matching the worker's Phase-A zero-token staging shape).
+/// micro window (matching the worker's corpus-backed staging: real token windows cut from the
+/// t2 corpus in training order, one staged batch per train_step — B2).
 fn guest_config() -> Value {
     let model = Value::serialized(&TinyLlamaCfg {
         n_layers: 1,

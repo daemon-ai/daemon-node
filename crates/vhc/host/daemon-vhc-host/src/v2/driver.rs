@@ -56,17 +56,22 @@ use ciborium::value::Value;
 use wasmtime::{Caller, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 use daemon_vhc_abi::{
-    pack_status_len, CHANNEL_DIR_RX_ONLY, EV_TAG_FRAME, EV_TAG_STOP, FRAME_ENVELOPE_DOMAIN_V2,
-    NS_NET_V2, NS_SYS_V2, NS_TABI_V1, NS_VHC_V2, PHASE_A_DEFAULT_CHANNEL_TABLE,
-    READBACK_KIND_STAGED_BYTES, RET_STATUS_DELIVERED, RET_STATUS_NEED_CAPACITY,
-    SNAPSHOT_STATE_SECTION_MISSING, STAGED_KIND_BYTES,
+    pack_status_len, CHANNEL_DIR_RX_ONLY, COMP_ERR_GRANT_EXHAUSTED, COMP_ERR_HASH_MISMATCH,
+    EV_TAG_FRAME, EV_TAG_STOP, FRAME_ENVELOPE_DOMAIN_V2, NS_DATA_V2, NS_NET_V2, NS_SYS_V2,
+    NS_TABI_V1, NS_VHC_V2, PHASE_A_DEFAULT_CHANNEL_TABLE, READBACK_KIND_STAGED_BYTES,
+    RET_STATUS_DELIVERED, RET_STATUS_NEED_CAPACITY, SNAPSHOT_STATE_SECTION_MISSING,
+    STAGED_KIND_BYTES,
 };
 use daemon_vhc_proto::{peer_id, sign_canonical, to_canonical_vec, SigningKey};
 
 use crate::runtime::{EngineConfig, TabiHost, Worker};
 use crate::trap::{Trap, TrapCode};
+use crate::v2::buffer::BufferTable;
+use crate::v2::completion::{CompError, CompletionResult, SuccessPayload};
 use crate::v2::event::{encode_event_frame, EventV2, PayloadMeta};
 use crate::v2::journal::{JournalSink, SinkError};
+use crate::v2::ops::{OpRequest, OpTable};
+use crate::v2::streams::StreamTable;
 
 /// The frozen execution-identity five-tuple (ABI §8.1) as the driver consumes it.
 #[derive(Debug, Clone)]
@@ -108,8 +113,23 @@ pub struct V2RunConfig {
     pub max_frame_bytes: u32,
     /// Per-slice ceiling on bytes `read_back` may write into linear memory (§5.5).
     pub max_readback_bytes_per_slice: u64,
-    /// Bounded advisory queue depth (manifest-declared once the funnel lands; a default here).
+    /// Bounded advisory `Timer` queue depth (manifest-declared `event-caps` once the funnel
+    /// wiring lands; a default here). Overflow is latest-wins on the queue: the oldest queued
+    /// `Timer` drops, journaled (§4.7).
     pub advisory_depth: usize,
+    /// Bounded advisory `PayloadReady` queue depth (§2.3 `event-caps`; §4.7 class rule
+    /// dedup-by-hash). Overflow beyond distinct hashes drops the oldest announcement, journaled.
+    pub payload_depth: usize,
+    /// Bounded advisory gossip-class queue depth (§4.7 drop-oldest, journaled).
+    pub gossip_depth: usize,
+    /// Authoritative bounded spool: max undelivered authoritative frames (§4.7/§6.2
+    /// `spool_frames`). Overflow BACK-PRESSURES the deliverer (never drops); hitting the bound
+    /// journals the typed `SpoolExhausted` run condition (§6.7) once per exhaustion episode.
+    pub spool_frames: usize,
+    /// Authoritative per-sender outstanding quota (§4.7/§6.2 `per_sender_quota`): a single
+    /// sender cannot use the reliable class as a memory-DoS vector. Overflow back-pressures
+    /// that sender only.
+    pub per_sender_quota: usize,
     /// The claim's **hard-accountable host-tier cap** in raw bytes (`0` = uncapped): the
     /// enforceable tier the host meters EXACTLY (ABI §9.1). At Phase A the metered
     /// guest-attributable allocations are the staged bytes (`stage_state`); tensors/buffers join
@@ -117,6 +137,22 @@ pub struct V2RunConfig {
     /// `BudgetMemory` trap — the under-claim acceptance (refactor §5 A2). The admission funnel
     /// (`v2::admission`) supplies this from the evaluated claim.
     pub hard_accountable_host_bytes: u64,
+    /// The **admitted artifact set** (track B2, architecture §3.2 `data@`): the blake3 hashes of
+    /// the envelope's committed artifact map, intersected with the role's artifact grants ("which
+    /// artifacts a module may touch is a grant"). A `data.fetch` naming a hash outside this set
+    /// traps `GrantViolation` — and because the set descends from the envelope's edge-pinned
+    /// snapshot descriptors (§5.1), an unpinned source is unreachable by construction. Empty =
+    /// no artifacts granted (fail closed).
+    pub granted_artifacts: std::collections::BTreeSet<[u8; 32]>,
+    /// `buffer-req.max_live_handles` (ABI §2.3): the standing live-buffer handle ceiling
+    /// (`0` = unbounded by this grant). Breach traps `BudgetHandles` (§7.3).
+    pub max_live_buffer_handles: u64,
+    /// `buffer-req.max_live_bytes` (ABI §2.3): the standing live-buffer byte ceiling — track B1's
+    /// buffer quota (`0` = unbounded by this grant). Breach traps `BudgetMemory`.
+    pub max_live_buffer_bytes: u64,
+    /// `grant-bound.max_outstanding` (ABI §2.3): the concurrent-operation ceiling for the async
+    /// completion protocol (`0` = unbounded by this grant). Breach traps `GrantViolation`.
+    pub max_outstanding_ops: u64,
 }
 
 impl V2RunConfig {
@@ -140,7 +176,15 @@ impl V2RunConfig {
             max_frame_bytes: 1 << 20,
             max_readback_bytes_per_slice: 1 << 20,
             advisory_depth: 64,
+            payload_depth: 64,
+            gossip_depth: 64,
+            spool_frames: 256,
+            per_sender_quota: 64,
             hard_accountable_host_bytes: 0,
+            granted_artifacts: std::collections::BTreeSet::new(),
+            max_live_buffer_handles: 64,
+            max_live_buffer_bytes: 1 << 26,
+            max_outstanding_ops: 16,
         }
     }
 }
@@ -159,6 +203,71 @@ pub enum V2Error {
     /// A journal-sink write failed (journaling is load-bearing, §8.4).
     #[error(transparent)]
     Sink(#[from] SinkError),
+}
+
+/// The verdict on one authoritative-frame delivery (ABI §4.7): the reliable class NEVER drops —
+/// overload back-pressures the network reader, which must hold the frame and retry. (The session
+/// seam rewinds its dedup/gap cursor on back-pressure so the retry is not a duplicate.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliverVerdict {
+    /// Enqueued for delivery.
+    Accepted,
+    /// The bounded spool is at `spool_frames` — hold + retry; the typed `SpoolExhausted` run
+    /// condition (§6.7) was journaled at the episode's first refusal.
+    SpoolFull,
+    /// This sender is at `per_sender_quota` outstanding frames — hold + retry (the per-sender
+    /// DoS bound; other senders are unaffected).
+    SenderQuota,
+    /// The frame exceeds the channel's `max_frame_bytes` — a protocol violation by the sender,
+    /// refused outright (never enqueued, never retried).
+    FrameTooLarge,
+}
+
+/// The embedder's answer to one serviced op request (see [`PumpHandle::complete_op`]).
+#[derive(Debug)]
+pub enum OpOutcome {
+    /// A `payload_put` was durably stored; the pump computes the commitment hash itself.
+    PutDone,
+    /// A `payload_get` fetched these bytes; the pump hash-verifies before delivery.
+    GetDone {
+        /// The fetched bytes (verified against the op's requested hash by the pump).
+        bytes: Vec<u8>,
+    },
+    /// A `data.fetch` serviced the WHOLE artifact (resolver + content cache); the pump verifies
+    /// it against the op's committed hash, then slices the op's range before delivery (the
+    /// sub-resource verification rule: a range is a slice OF hash-verified content).
+    FetchDone {
+        /// The complete artifact bytes (verified + sliced by the pump, never the embedder).
+        artifact: Vec<u8>,
+    },
+    /// A `stream_open` connected; the pump mints the kind-9 handle with this receiver-granted
+    /// initial writable credit (§3.3).
+    OpenDone {
+        /// Initial writable credit (bytes).
+        credit: u64,
+    },
+    /// A standing `stream_accept` matched an incoming stream; the pump mints the handle.
+    AcceptDone {
+        /// Initial writable credit (bytes) for THIS side's writes on the accepted stream.
+        credit: u64,
+    },
+    /// A `stream_write`'s bytes were accepted by the transport (unit completion, §3.4).
+    WriteDone,
+    /// A `stream_read` received these opaque bytes (journaled verbatim at completion — stream
+    /// payloads are not content-addressed; ABI kind-4 record).
+    ReadDone {
+        /// The received bytes.
+        bytes: Vec<u8>,
+    },
+    /// The operation failed (`COMP_ERR_*`, e.g. `NetUnreachable` for a connection failure —
+    /// connection establishment/failure are completions of the op that needed the connection,
+    /// architecture §3.3).
+    Failed {
+        /// The `comp-error` code (ABI §7.5).
+        code: u64,
+        /// A human-readable detail.
+        detail: String,
+    },
 }
 
 /// How a run ended (the guest-thread join result).
@@ -188,6 +297,9 @@ struct QueuedEvent {
     timer_id: Option<u64>,
     /// `Budget` marker (host-fixed depth 1, latest-wins).
     is_budget: bool,
+    /// Advisory gossip-class identity `(channel, arrival seq, sender)` — present iff this is a
+    /// gossip frame (drop-oldest accounting + the tag-7 drop identity, §4.7).
+    gossip_id: Option<(u32, u64, [u8; 32])>,
 }
 
 struct ArmedTimer {
@@ -207,6 +319,24 @@ struct PumpState {
     sink: Box<dyn JournalSink>,
     /// The advisory `Timer`-queue depth (manifest-declared once the funnel lands; §4.7).
     timer_depth: usize,
+    /// The advisory `PayloadReady`-queue depth (§4.7 dedup-by-hash class).
+    payload_depth: usize,
+    /// The advisory gossip-class queue depth (§4.7 drop-oldest).
+    gossip_depth: usize,
+    /// Authoritative spool bound (`spool_frames`, §4.7) + per-sender outstanding quota.
+    spool_frames: usize,
+    per_sender_quota: usize,
+    /// Undelivered authoritative frames (the spool occupancy).
+    auth_spooled: usize,
+    /// Undelivered authoritative frames per sender (the quota ledger).
+    auth_per_sender: std::collections::HashMap<[u8; 32], usize>,
+    /// Whether the current spool-exhaustion episode was already journaled (§6.7, once per
+    /// episode; cleared when the spool drains below the bound).
+    spool_exhausted_reported: bool,
+    /// Per-channel arrival counters for advisory (gossip-class) frames — advisory channels have
+    /// no durable sequence semantics (§4.7); this dense arrival ordinal fills the frame's `seq`
+    /// field deterministically for replay (the journaled delivered sequence is authoritative).
+    gossip_arrivals: std::collections::HashMap<u32, u64>,
     /// Egress captured for the embedder (metrics/log are not journaled — outputs, not inputs).
     metrics: Vec<(String, f64)>,
     logs: Vec<(u32, String)>,
@@ -215,14 +345,85 @@ struct PumpState {
     /// The final bridge canonical state, exported by the guest thread before it drops the
     /// store (the parity-oracle hook: the digest input, §3.6 tier-3 comparisons).
     bridge_final_state: Option<Vec<u8>>,
-    /// Sealed-container watermark + the newest sealed update wire (Phase-A plumbing-owned
-    /// sealing at the commit seam; see the publish import).
-    sealed_containers: usize,
-    latest_sealed_update: Option<(usize, Vec<u8>)>,
+    /// The per-instance buffer table (kind 8, architecture §3.4) — shared between the guest
+    /// thread's imports and completion-arrival minting, behind this pump lock.
+    buffers: BufferTable,
+    /// The outstanding-op table (kind 10, ABI §7.5).
+    ops: OpTable,
+    /// The stream table (kind 9, §3.3 credit flow control).
+    streams: StreamTable,
+    /// Requests awaiting the embedder (the async-runtime bridge): `(op, request)` in issue order.
+    op_requests: Vec<(u64, OpRequest)>,
     /// A `Stop` has been enqueued — no further deliveries will be accepted after it.
     stop_enqueued: bool,
     /// A `Quiesce` drain is open: Frame/PayloadReady/Timer deliveries are frozen (§4.4).
     draining: bool,
+}
+
+impl PumpState {
+    /// Bound the advisory `PayloadReady` queue at its declared depth (§4.7 class 0): dedup by
+    /// hash happens at staging; a distinct-hash announcement beyond the depth drops the OLDEST
+    /// queued announcement — its staged bytes are unstaged with it — journaled (tag 7).
+    fn enforce_payload_depth(&mut self) -> Result<(), SinkError> {
+        if self.payload_depth == 0 {
+            return Ok(());
+        }
+        let queued = self
+            .queue
+            .iter()
+            .filter(|q| q.tag == daemon_vhc_abi::EV_TAG_PAYLOAD_READY)
+            .count();
+        if queued < self.payload_depth {
+            return Ok(());
+        }
+        if let Some(pos) = self
+            .queue
+            .iter()
+            .position(|q| q.tag == daemon_vhc_abi::EV_TAG_PAYLOAD_READY)
+        {
+            let old = self.queue.remove(pos).expect("position exists");
+            // The frame names what was dropped (staging id + hash); unstage the bytes too.
+            if let Ok(EventV2::PayloadReady {
+                staging_id, hash, ..
+            }) = crate::v2::event::decode_event_frame(&old.frame_bytes)
+            {
+                self.staged.remove(&staging_id);
+                self.sink.drop_coalesced(
+                    0,
+                    daemon_vhc_abi::COALESCE_DEDUP_HASH,
+                    crate::v2::journal::Dropped::payload(hash),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue + journal one completion (ABI §4.6/§7.5): the tag-14 record captures the
+    /// nondeterministic ARRIVAL (result + order) before the event is deliverable; the frame then
+    /// rides the ordinary event queue (tag 1 at delivery, §8.4 rule 4). Completions still deliver
+    /// during a `Quiesce` drain (§4.4 "already-outstanding operations") but never after `Stop`.
+    fn enqueue_completion(&mut self, op: u64, result: &CompletionResult) -> Result<(), SinkError> {
+        if self.stop_enqueued {
+            return Ok(()); // the host delivers no further events after Stop (§4.4)
+        }
+        let result_bytes = result.encode().map_err(|e| SinkError(e.to_string()))?;
+        self.sink.completion(op, &result_bytes)?;
+        let frame_bytes = encode_event_frame(&EventV2::Completion {
+            op,
+            result: result.clone(),
+        })
+        .map_err(|e| SinkError(e.to_string()))?;
+        self.queue.push_back(QueuedEvent {
+            frame_bytes,
+            tag: daemon_vhc_abi::EV_TAG_COMPLETION,
+            signed: None,
+            payload_hash: None,
+            timer_id: None,
+            is_budget: false,
+            gossip_id: None,
+        });
+        Ok(())
+    }
 }
 
 struct PumpShared {
@@ -250,6 +451,12 @@ impl PumpHandle {
     /// Deliver a **pre-verified** authoritative control frame (see module docs): `payload` is the
     /// module-authored bytes; `original_signed_frame` is the complete signed wire frame journaled
     /// as tag-12 evidence (§8.6).
+    ///
+    /// The reliable class is bounded but NEVER drops (§4.7): a [`DeliverVerdict::SpoolFull`] /
+    /// [`DeliverVerdict::SenderQuota`] verdict back-pressures the caller, which MUST hold the
+    /// frame and retry; genuine spool exhaustion journals the typed `SpoolExhausted` run
+    /// condition (§6.7). Escalation policy (sustained exhaustion → `Stop{Fault}` and leave the
+    /// run) is the embedder's, over these verdicts.
     pub fn deliver_frame(
         &self,
         channel: u32,
@@ -257,7 +464,7 @@ impl PumpHandle {
         sender: [u8; 32],
         payload: Vec<u8>,
         original_signed_frame: Vec<u8>,
-    ) -> Result<(), SinkError> {
+    ) -> Result<DeliverVerdict, SinkError> {
         let ev = EventV2::Frame {
             channel,
             seq,
@@ -269,6 +476,24 @@ impl PumpHandle {
         if st.stop_enqueued {
             return Err(SinkError("run is stopping; no further deliveries".into()));
         }
+        if st.spool_frames != 0 && st.auth_spooled >= st.spool_frames {
+            if !st.spool_exhausted_reported {
+                st.spool_exhausted_reported = true;
+                let detail = format!(
+                    "authoritative spool at capacity ({} frames); back-pressuring",
+                    st.spool_frames
+                );
+                st.sink.condition("SpoolExhausted", &detail)?;
+            }
+            return Ok(DeliverVerdict::SpoolFull);
+        }
+        if st.per_sender_quota != 0
+            && st.auth_per_sender.get(&sender).copied().unwrap_or(0) >= st.per_sender_quota
+        {
+            return Ok(DeliverVerdict::SenderQuota);
+        }
+        st.auth_spooled += 1;
+        *st.auth_per_sender.entry(sender).or_insert(0) += 1;
         st.queue.push_back(QueuedEvent {
             frame_bytes,
             tag: EV_TAG_FRAME,
@@ -276,6 +501,72 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
+        });
+        drop(st);
+        self.shared.wake.notify_all();
+        Ok(DeliverVerdict::Accepted)
+    }
+
+    /// Deliver an **advisory (gossip-class) frame** (§4.7): an unsequenced observation on an
+    /// advisory channel. Bounded per-class queue at the declared depth with the fixed
+    /// drop-oldest rule, every drop journaled (tag 7, class 2). The frame's `seq` is a dense
+    /// per-channel arrival ordinal (advisory channels have no durable sequence semantics).
+    pub fn deliver_gossip(
+        &self,
+        channel: u32,
+        sender: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<(), SinkError> {
+        let mut st = self.shared.state.lock().expect("pump lock");
+        if st.stop_enqueued {
+            return Err(SinkError("run is stopping; no further deliveries".into()));
+        }
+        if st.draining {
+            // Advisory deliveries are frozen during a drain (§4.4); a gossip observation simply
+            // coalesces away (journaled as a drop of the newest — nothing was ever queued).
+            let seq = st.gossip_arrivals.get(&channel).copied().unwrap_or(0);
+            st.sink.drop_coalesced(
+                2,
+                daemon_vhc_abi::COALESCE_DROP_OLDEST,
+                crate::v2::journal::Dropped::gossip(u64::from(channel), sender, seq),
+            )?;
+            return Ok(());
+        }
+        let seq = {
+            let c = st.gossip_arrivals.entry(channel).or_insert(0);
+            let s = *c;
+            *c += 1;
+            s
+        };
+        let ev = EventV2::Frame {
+            channel,
+            seq,
+            sender,
+            payload,
+        };
+        let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
+        // Drop-oldest at the declared depth (§4.7 gossip rule), journaled.
+        let queued = st.queue.iter().filter(|q| q.gossip_id.is_some()).count();
+        if st.gossip_depth != 0 && queued >= st.gossip_depth {
+            if let Some(pos) = st.queue.iter().position(|q| q.gossip_id.is_some()) {
+                let old = st.queue.remove(pos).expect("position exists");
+                let (och, oseq, osender) = old.gossip_id.expect("gossip event has its id");
+                st.sink.drop_coalesced(
+                    2,
+                    daemon_vhc_abi::COALESCE_DROP_OLDEST,
+                    crate::v2::journal::Dropped::gossip(u64::from(och), osender, oseq),
+                )?;
+            }
+        }
+        st.queue.push_back(QueuedEvent {
+            frame_bytes,
+            tag: EV_TAG_FRAME,
+            signed: None,
+            payload_hash: None,
+            timer_id: None,
+            is_budget: false,
+            gossip_id: Some((channel, seq, sender)),
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -292,7 +583,11 @@ impl PumpHandle {
         }
         // Advisory dedup by hash: an undelivered announcement for identical bytes coalesces.
         if st.queue.iter().any(|q| q.payload_hash == Some(hash)) {
-            st.sink.drop_coalesced(0, 0, None, Some(hash))?;
+            st.sink.drop_coalesced(
+                0,
+                daemon_vhc_abi::COALESCE_DEDUP_HASH,
+                crate::v2::journal::Dropped::payload(hash),
+            )?;
             // The staged bytes are already announced; find its id for the caller.
             if let Some((&id, _)) = st
                 .staged
@@ -302,6 +597,7 @@ impl PumpHandle {
                 return Ok(id);
             }
         }
+        st.enforce_payload_depth()?;
         let staging_id = st.next_host_staging_id;
         st.next_host_staging_id += 1;
         let size = bytes.len() as u64;
@@ -323,6 +619,7 @@ impl PumpHandle {
             payload_hash: Some(hash),
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -373,6 +670,7 @@ impl PumpHandle {
         if st.stop_enqueued {
             return Err(SinkError("run is stopping; no further deliveries".into()));
         }
+        st.enforce_payload_depth()?;
         let staging_id = st.next_host_staging_id;
         st.next_host_staging_id += 1;
         let size = bytes.len() as u64;
@@ -394,6 +692,7 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -428,7 +727,11 @@ impl PumpHandle {
         // Latest-wins at depth 1: replace any queued Budget, journaling the coalesce (§4.7).
         if let Some(pos) = st.queue.iter().position(|q| q.is_budget) {
             st.queue.remove(pos);
-            st.sink.drop_coalesced(3, 1, None, None)?;
+            st.sink.drop_coalesced(
+                3,
+                daemon_vhc_abi::COALESCE_LATEST_WINS,
+                crate::v2::journal::Dropped::default(),
+            )?;
         }
         st.queue.push_back(QueuedEvent {
             frame_bytes,
@@ -437,6 +740,7 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: true,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -460,6 +764,7 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -483,23 +788,173 @@ impl PumpHandle {
             payload_hash: None,
             timer_id: None,
             is_budget: false,
+            gossip_id: None,
         });
         drop(st);
         self.shared.wake.notify_all();
         Ok(())
     }
 
-    /// Take the newest plumbing-sealed update container: `(container index, canonical wire)`.
-    /// Set at the commit seam (a publish that followed a `da_make_update` in the same run);
-    /// `take` semantics so the session stages each sealed container exactly once (§5.11).
+    /// Drain the outstanding-op requests awaiting service (the async-runtime bridge, architecture
+    /// §3.3: "all actual waiting lives in the host's async runtime"). Each request is handed out
+    /// exactly once; the embedder answers through [`PumpHandle::complete_op`] whenever it likes —
+    /// completion order is a nondeterministic input the journal captures (tag 14).
     #[must_use]
-    pub fn take_sealed_update(&self) -> Option<(usize, Vec<u8>)> {
-        self.shared
-            .state
-            .lock()
-            .expect("pump lock")
-            .latest_sealed_update
-            .take()
+    pub fn take_op_requests(&self) -> Vec<(u64, OpRequest)> {
+        std::mem::take(&mut self.shared.state.lock().expect("pump lock").op_requests)
+    }
+
+    /// Complete an outstanding op with the embedder's outcome. The pump — not the embedder — owns
+    /// the trust steps (architecture §3.4): a put's hash is computed here over the op's own sealed
+    /// bytes; a get's bytes are hash-verified against the requested hash BEFORE the completion is
+    /// delivered (a mismatch completes `HashMismatch`, and the guest never sees the bytes);
+    /// stream/buffer handles are minted here (never trusted from the embedder), and a stream
+    /// read's opaque bytes are journaled verbatim at arrival (the ABI kind-4 record) — they are
+    /// nondeterministic input that no content address can re-fetch. A completion for an op that
+    /// is no longer outstanding (it was cancelled) is the raced-cancel no-op: the guest was
+    /// already told `Cancelled`.
+    ///
+    /// Returns the handle the completion minted (`Some` for get/open/accept — the transport
+    /// needs it to route subsequent writes/reads), else `None`.
+    ///
+    /// # Errors
+    /// A journal-sink failure, or an outcome that contradicts the op's request shape (an embedder
+    /// bug, surfaced loudly).
+    pub fn complete_op(&self, op: u64, outcome: OpOutcome) -> Result<Option<u64>, SinkError> {
+        let mut st = self.shared.state.lock().expect("pump lock");
+        let Some(request) = st.ops.finish(op) else {
+            return Ok(None); // cancelled while in service — Cancelled was already delivered
+        };
+        let mut minted = None;
+        let result = match (request, outcome) {
+            (OpRequest::PayloadPut { bytes }, OpOutcome::PutDone) => {
+                CompletionResult::Ok(SuccessPayload::Hash(*blake3::hash(&bytes).as_bytes()))
+            }
+            (OpRequest::PayloadGet { hash }, OpOutcome::GetDone { bytes }) => {
+                if blake3::hash(&bytes).as_bytes() == &hash {
+                    match st.buffers.create_host(Arc::new(bytes)) {
+                        Some(handle) => {
+                            minted = Some(handle);
+                            CompletionResult::Ok(SuccessPayload::Handle(handle))
+                        }
+                        None => CompletionResult::Err(CompError {
+                            code: COMP_ERR_GRANT_EXHAUSTED,
+                            detail: Some("buffer quota exhausted (deny new buffers)".into()),
+                        }),
+                    }
+                } else {
+                    CompletionResult::Err(CompError {
+                        code: COMP_ERR_HASH_MISMATCH,
+                        detail: Some("fetched bytes do not hash to the requested content".into()),
+                    })
+                }
+            }
+            (
+                OpRequest::ArtifactFetch {
+                    hash,
+                    range_off,
+                    range_len,
+                },
+                OpOutcome::FetchDone { artifact },
+            ) => {
+                // §3.4 "verification unchanged": the pump — not the embedder — verifies the
+                // WHOLE artifact against the committed hash, then slices the range. A range is
+                // thereby verified as a slice of hash-verified content (the sub-resource rule).
+                if blake3::hash(&artifact).as_bytes() != &hash {
+                    CompletionResult::Err(CompError {
+                        code: COMP_ERR_HASH_MISMATCH,
+                        detail: Some(
+                            "fetched artifact does not hash to the committed value".into(),
+                        ),
+                    })
+                } else {
+                    let total = artifact.len() as u64;
+                    let end = if range_len == 0 {
+                        total
+                    } else {
+                        range_off.saturating_add(range_len)
+                    };
+                    if range_off > total || end > total {
+                        CompletionResult::Err(CompError {
+                            code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                            detail: Some(format!(
+                                "range [{range_off}, {end}) out of bounds (artifact is {total} \
+                                 bytes)"
+                            )),
+                        })
+                    } else {
+                        let slice = artifact[range_off as usize..end as usize].to_vec();
+                        match st.buffers.create_host(Arc::new(slice)) {
+                            Some(handle) => CompletionResult::Ok(SuccessPayload::Handle(handle)),
+                            None => CompletionResult::Err(CompError {
+                                code: COMP_ERR_GRANT_EXHAUSTED,
+                                detail: Some("buffer quota exhausted (deny new buffers)".into()),
+                            }),
+                        }
+                    }
+                }
+            }
+            (OpRequest::StreamOpen { .. }, OpOutcome::OpenDone { credit }) => {
+                let stream = st.streams.open(credit);
+                minted = Some(stream);
+                CompletionResult::Ok(SuccessPayload::Handle(stream))
+            }
+            (OpRequest::StreamAccept, OpOutcome::AcceptDone { credit }) => {
+                let stream = st.streams.open(credit);
+                minted = Some(stream);
+                CompletionResult::Ok(SuccessPayload::Handle(stream))
+            }
+            (OpRequest::StreamWrite { .. }, OpOutcome::WriteDone) => {
+                CompletionResult::Ok(SuccessPayload::Unit)
+            }
+            (OpRequest::StreamRead { .. }, OpOutcome::ReadDone { bytes }) => {
+                // Opaque stream bytes are a nondeterministic input with NO content address:
+                // journal them verbatim at arrival (the kind-4 record) so replay can
+                // materialize the completion's buffer (§8.1/§8.7).
+                st.sink.read_back(
+                    op,
+                    u64::from(daemon_vhc_abi::READBACK_KIND_STREAM_BYTES),
+                    daemon_vhc_abi::RET_STATUS_DELIVERED,
+                    &bytes,
+                )?;
+                match st.buffers.create_host(Arc::new(bytes)) {
+                    Some(handle) => {
+                        minted = Some(handle);
+                        CompletionResult::Ok(SuccessPayload::Handle(handle))
+                    }
+                    None => CompletionResult::Err(CompError {
+                        code: COMP_ERR_GRANT_EXHAUSTED,
+                        detail: Some("buffer quota exhausted (deny new buffers)".into()),
+                    }),
+                }
+            }
+            (_, OpOutcome::Failed { code, detail }) => CompletionResult::Err(CompError {
+                code,
+                detail: Some(detail),
+            }),
+            (req, outcome) => {
+                return Err(SinkError(format!(
+                    "op outcome shape mismatch: request {req:?} answered with {outcome:?}"
+                )))
+            }
+        };
+        st.enqueue_completion(op, &result)?;
+        drop(st);
+        self.shared.wake.notify_all();
+        Ok(minted)
+    }
+
+    /// Replenish a stream's writable credit (the receiver consumed bytes — transport-driven,
+    /// §3.3). Held writes whose sizes now fit are released FIFO: their transport requests are
+    /// emitted, and their completions will follow the embedder's service — the guest's credit
+    /// signal IS those completions.
+    pub fn grant_credit(&self, stream: u64, credit: u64) {
+        let mut st = self.shared.state.lock().expect("pump lock");
+        let released = st.streams.grant(stream, credit);
+        for (op, bytes) in released {
+            st.op_requests
+                .push((op, OpRequest::StreamWrite { stream, bytes }));
+        }
     }
 
     /// The bridge's final canonical state bytes (the digest input), exported by the guest thread
@@ -558,10 +1013,41 @@ struct SliceState {
     pending_next: Option<u64>,
     /// A pending mandatory `read_back` retry: `(src, kind, required)` (§6.4).
     pending_readback: Option<(u64, u32, u64)>,
+    /// A pending mandatory `device_profile` retry: the required capacity (same §4.1/§6.4
+    /// mandatory-retry discipline — the profile is delivered, and journaled, exactly once).
+    pending_device: Option<u64>,
     /// The already-computed value behind a pending `read_back` retry: bridge kinds (1/2) mutate
     /// the tabi state exactly once (register batch / stage container), so the retry re-delivers
     /// the SAME value instead of re-registering (§6.4 "the staged value remains available").
     pending_readback_value: Option<Vec<u8>>,
+}
+
+/// The bridge staged-update ingest phase (§2.5/§5.9) — the state machine behind the v1 ingest
+/// epilogue's placement (the B3-found catch-up defect):
+///
+/// v1 ran `snapshot_round_bases` (post-ingest master → next round's base) when
+/// `da_ingest_updates` RETURNED — i.e. at the **ingest→training boundary**, before any later
+/// math. The v2 bridge has no "ingest returns" moment, and deferring the epilogue to the
+/// Delivered slice close diverges on the straggle **catch-up path**, where `BarrierRound`
+/// ingests round r and trains round r+1 in ONE slice (round r+1 then trains against a
+/// pre-ingest base). The equivalent boundary, driver-visible:
+///
+/// - a kind-2 read while `Idle` opens a FRESH staged window (v1's per-ingest `staged.clear()`);
+/// - further kind-2 reads with no intervening non-window ops continue the SAME window (a
+///   record's N entries are read back-to-back by `Staged::mint`);
+/// - any other bridge op marks the window's ingest MATH as begun (aggregate + apply);
+/// - the epilogue fires at the first boundary AFTER the math: the next kind-1 batch read
+///   (training resumes — the catch-up path), a kind-2 read that OPENS THE NEXT window
+///   (multi-round catch-up), or the slice close (the normal path, timing unchanged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestPhase {
+    /// No staged-update window is being consumed.
+    Idle,
+    /// A window is open; `math_seen` = a non-window bridge op ran since its last kind-2 read.
+    Consuming {
+        /// Whether ingest math has begun on this window.
+        math_seen: bool,
+    },
 }
 
 /// The wasmtime `Store` data for a v2 run instance.
@@ -584,13 +1070,24 @@ struct V2Host {
     tabi: Option<crate::runtime::HostState>,
     // Whether a bridge slice pass is open (begin/end at Delivered boundaries, §2.5 rule 4).
     slice_pass_open: bool,
-    // Whether the open slice consumed a staged update (read_back kind 2) — its close is the v1
-    // ingest epilogue: the §5.9 barrier snapshot (post-ingest master → next round's base).
-    slice_ingested: bool,
+    // The bridge ingest phase (§5.9): tracks a staged-update window from its first kind-2
+    // consumption to the boundary where the v1 ingest epilogue (post-ingest master → next
+    // round's base) must run. See [`IngestPhase`].
+    ingest_phase: IngestPhase,
+    // Sealed-container watermark (B1 sealing-gap retirement): containers the bridge has built
+    // that were already sealed + announced to the guest at a slice boundary.
+    sealed_containers: usize,
     // signing (§12.1)
     signing: SigningKey,
     identity: RunIdentity,
     sender: [u8; 32],
+    // sys@2 ambient inputs: the admitted device-profile bytes (nondeterministic input — journaled
+    // tag 15 per delivery) and the identity-derived RNG seed (deterministic — never journaled).
+    device_bytes: Vec<u8>,
+    rng_seed: [u8; 32],
+    // data@2: the admitted artifact set ("which artifacts a module may touch is a grant") — the
+    // envelope's edge-pinned artifact map ∩ the role's grants. Fail closed when empty.
+    granted_artifacts: std::collections::BTreeSet<[u8; 32]>,
 }
 
 impl V2Host {
@@ -640,6 +1137,14 @@ impl V2Host {
                 import,
                 None,
                 "NeedCapacity from read_back requires an immediate retry (§6.4)",
+            ));
+        }
+        if self.slice.pending_device.is_some() && import != "device_profile" {
+            return Err(Trap::new(
+                TrapCode::BadEvent,
+                import,
+                None,
+                "NeedCapacity from device_profile requires an immediate retry (§6.4)",
             ));
         }
         self.charge_op(import)
@@ -729,6 +1234,50 @@ fn build_signed_frame(
         .map_err(|e| Trap::bare(TrapCode::BadModule, format!("frame encoding: {e}")))
 }
 
+// -- sys@2 seeded deterministic randomness (architecture §3.2 "seeded randomness") ------------------
+
+/// Derive the run-scoped RNG seed for one execution identity (`sys@2::rng_seed`): a **pure
+/// function of the frozen §8.1 identity**, domain-separated under
+/// [`daemon_vhc_abi::RNG_SEED_DOMAIN_V2`]. Deterministic per the §2.7 `dc` class — the import
+/// carries **no journal record**; replay re-derives the identical seed from the run header's
+/// identity (see [`super::replay`]). Two role-instances never share a seed; a trap-restart of the
+/// same incarnation reproduces it (the seed is an *identity* property, not an *instantiation*
+/// property — restarted policy must be able to re-derive its own randomness).
+#[must_use]
+pub fn derive_rng_seed(identity: &RunIdentity) -> [u8; 32] {
+    // Unambiguous concatenation: fixed-width fields + a length prefix on the one variable field.
+    let mut material = Vec::with_capacity(32 + 8 + 4 + identity.role.len() + 8 + 32);
+    material.extend_from_slice(&identity.run_id);
+    material.extend_from_slice(&identity.epoch.to_le_bytes());
+    material.extend_from_slice(&(identity.role.len() as u32).to_le_bytes());
+    material.extend_from_slice(identity.role.as_bytes());
+    material.extend_from_slice(&identity.instance.to_le_bytes());
+    material.extend_from_slice(&identity.module);
+    blake3::derive_key(daemon_vhc_abi::RNG_SEED_DOMAIN_V2, &material)
+}
+
+// -- sys@2 crypto accelerations (the det/crypto-lane fast path, §3.2/§3.7) --------------------------
+
+/// The host `sys@2::hash` acceleration body: blake3-256 over `data`, pinned by the dual-compiled
+/// [`daemon_vhc_proto::crypto`] contract. Because the in-guest fallback is that *same* contract
+/// compiled to wasm, host-op ≡ in-guest-op is bit-exact **by construction** (architecture §3.2, the
+/// det-lane pattern). Exposed (crate-public) so the tier-1 conformance gate exercises the exact
+/// body the live import runs. Deterministic → the import carries **no journal record** (§2.7 `dc`
+/// class); replay re-executes it (see [`super::replay`]).
+#[must_use]
+pub fn host_crypto_hash(data: &[u8]) -> [u8; daemon_vhc_proto::HASH_LEN] {
+    daemon_vhc_proto::crypto_hash(data)
+}
+
+/// The host `sys@2::verify_sig` acceleration body: the ABI status code of the tri-state
+/// [`daemon_vhc_proto::VerifyOutcome`] (0 = valid, 1 = invalid, 2 = malformed). Same
+/// dual-compiled-contract / by-construction-parity story as [`host_crypto_hash`]; deterministic,
+/// not journaled.
+#[must_use]
+pub fn host_crypto_verify(public_key: &[u8], signature: &[u8], message: &[u8]) -> u32 {
+    daemon_vhc_proto::verify_sig(public_key, signature, message).code()
+}
+
 // -- the v2 linker ----------------------------------------------------------------------------------
 
 /// How long a parked `next_event` waits between wake checks when no timer bounds the wait.
@@ -759,6 +1308,36 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         ));
                     }
                 }
+                // B1 (the sealing-gap retirement): a bridge container completed in the slice
+                // that just ended is sealed HERE — at the slice boundary — and ANNOUNCED to the
+                // guest as PayloadReady kind 0. Bridge-plane serialization stays a host service
+                // until Phase C's compute export, but the guest now owns the commitment path:
+                // read_back → create_from → payload_put → author the commitment over the
+                // completion hash. Watermarked, so a NeedCapacity retry never double-stages.
+                let sealed: Option<Vec<u8>> = {
+                    let d = c.data_mut();
+                    match d.tabi.as_ref() {
+                        Some(tabi) => {
+                            // GUEST-BUILT containers only: an inbound-staged container (read_back
+                            // kind 2) must never be re-announced as the guest's own.
+                            let n = tabi.guest_container_count();
+                            if n > d.sealed_containers {
+                                let bytes = tabi.seal_guest_container_of(n - 1);
+                                d.sealed_containers = n;
+                                bytes
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(bytes) = sealed {
+                    let sh = c.data().shared.clone();
+                    let mut st = sh.state.lock().expect("pump lock");
+                    stage_own_bytes(&mut st, bytes)
+                        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                }
                 let shared = c.data().shared.clone();
                 // Park until an event is deliverable, firing due timers ourselves (§6.3).
                 let (frame, at) = {
@@ -780,6 +1359,18 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                             // Deliver: sample once, journal BEFORE the guest observes (§8.4 r4).
                             let at = shared.now_ms();
                             let ev = st.queue.pop_front().expect("front checked");
+                            // Spool accounting (§4.7): a delivered authoritative frame frees its
+                            // spool slot + its sender's quota; draining below the bound closes
+                            // the exhaustion episode.
+                            if let Some((_, _, sender, _)) = ev.signed {
+                                st.auth_spooled = st.auth_spooled.saturating_sub(1);
+                                if let Some(n) = st.auth_per_sender.get_mut(&sender) {
+                                    *n = n.saturating_sub(1);
+                                }
+                                if st.auth_spooled < st.spool_frames {
+                                    st.spool_exhausted_reported = false;
+                                }
+                            }
                             st.sink
                                 .event(at, &ev.frame_bytes)
                                 .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
@@ -815,12 +1406,12 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                 // slice's pass (clear step arenas wholesale, free tensors — the v1 finish_entry
                 // teardown) and begin the new slice's differentiable pass.
                 if let Some(tabi) = d.tabi.as_mut() {
-                    // The v1 ingest epilogue at the slice that ingested (§5.9): the post-ingest
-                    // master is the next round's base. v1 runs it as `Instance::ingest` returns;
-                    // the bridge's equivalent boundary is the close of the ingesting slice.
-                    if d.slice_ingested {
+                    // The §5.9 epilogue's slice-close backstop (the normal path, where the
+                    // ingesting slice ends without further training — timing unchanged from
+                    // A2). The catch-up boundaries fire earlier, in read_back (IngestPhase).
+                    if d.ingest_phase != IngestPhase::Idle {
                         tabi.snapshot_round_bases();
-                        d.slice_ingested = false;
+                        d.ingest_phase = IngestPhase::Idle;
                     }
                     if d.slice_pass_open {
                         tabi.end_slice_pass_and_clear();
@@ -982,6 +1573,16 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                                 .collect(),
                             _ => return Err(Trap::bare(TrapCode::BadModule, "staged tokens")),
                         };
+                        // A batch read is the ingest→TRAINING boundary (the catch-up path,
+                        // §5.9 / IngestPhase docs): the epilogue fires BEFORE the batch
+                        // registers, so training sees the post-ingest round base.
+                        {
+                            let d = c.data_mut();
+                            if d.ingest_phase != IngestPhase::Idle {
+                                d.tabi().snapshot_round_bases();
+                                d.ingest_phase = IngestPhase::Idle;
+                            }
+                        }
                         let handle = c
                             .data_mut()
                             .tabi()
@@ -993,17 +1594,30 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         out
                     }
                     daemon_vhc_abi::READBACK_KIND_STAGED_UPDATE => {
-                        // The slice's first staged update opens a FRESH window (v1's per-ingest
-                        // `staged.clear()`), so `upd_*@1` indices are 0-based per round.
-                        let fresh_window = !c.data().slice_ingested;
+                        // Window boundaries (IngestPhase docs): the first kind-2 read of a
+                        // window — or one following the previous window's ingest MATH (the
+                        // multi-round catch-up boundary, which also fires the epilogue) —
+                        // opens a FRESH window (v1's per-ingest `staged.clear()`), so
+                        // `upd_*@1` indices are 0-based per round.
+                        let fresh_window = {
+                            let d = c.data_mut();
+                            match d.ingest_phase {
+                                IngestPhase::Idle => true,
+                                IngestPhase::Consuming { math_seen: false } => false,
+                                IngestPhase::Consuming { math_seen: true } => {
+                                    // The previous window's ingest finished: epilogue, then
+                                    // a fresh window for this round.
+                                    d.tabi().snapshot_round_bases();
+                                    true
+                                }
+                            }
+                        };
                         let idx = c
                             .data_mut()
                             .tabi()
                             .stage_bridge_update(&staged_bytes, fresh_window)
                             .map_err(|e| Trap::bare(TrapCode::BadModule, e))?;
-                        // This slice is an ingest slice: its close runs the §5.9 barrier
-                        // snapshot (v1's ingest epilogue).
-                        c.data_mut().slice_ingested = true;
+                        c.data_mut().ingest_phase = IngestPhase::Consuming { math_seen: false };
                         let mut out = Vec::new();
                         ciborium::into_writer(&ciborium::value::Value::from(idx), &mut out)
                             .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
@@ -1113,6 +1727,360 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
         },
     )?;
 
+    // ---- vhc@2 minor 1: the buffer layer (architecture §3.4; ABI §7.4) --------------------------
+    // create_from — the budgeted linear-memory path OUT: seal guest bytes into a kind-8 buffer.
+    linker.func_wrap(
+        NS_VHC_V2,
+        "create_from",
+        |mut c: Caller<'_, V2Host>, ptr: u32, len: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("create_from")?;
+                let bytes = read_guest(c, ptr, len)?;
+                // The hard-accountable claim meter covers guest-initiated allocations (ABI §9.1
+                // "tensors, buffers, handles the host meters exactly").
+                {
+                    let d = c.data_mut();
+                    d.accountable_staged_bytes += u64::from(len);
+                    if d.hard_accountable_host_bytes != 0
+                        && d.accountable_staged_bytes > d.hard_accountable_host_bytes
+                    {
+                        return Err(Trap::new(
+                            TrapCode::BudgetMemory,
+                            "create_from",
+                            None,
+                            "hard-accountable host cap breached (attributable, ABI §9.1)",
+                        ));
+                    }
+                }
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.buffers
+                    .create(Arc::new(bytes))
+                    .map_err(|code| Trap::new(code, "create_from", None, "buffer quota (§7.3)"))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // read_into — the budgeted linear-memory path IN: copy a window of a sealed buffer into guest
+    // memory. Charged against the per-slice readback-byte allowance (§5.5); recordless — buffer
+    // contents are deterministic at replay (create_from bytes) or content-addressed (payload_get).
+    linker.func_wrap(
+        NS_VHC_V2,
+        "read_into",
+        |mut c: Caller<'_, V2Host>,
+         buffer: u64,
+         offset: u64,
+         out_ptr: u32,
+         out_cap: u32|
+         -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("read_into")?;
+                let shared = c.data().shared.clone();
+                let data = {
+                    let st = shared.state.lock().expect("pump lock");
+                    st.buffers
+                        .resolve(buffer)
+                        .map_err(|code| Trap::new(code, "read_into", None, "buffer handle"))?
+                };
+                let start = usize::try_from(offset).unwrap_or(usize::MAX);
+                let window = data.len().saturating_sub(start.min(data.len()));
+                let n = window.min(out_cap as usize);
+                {
+                    let d = c.data_mut();
+                    d.slice.readback_bytes += n as u64;
+                    if d.slice.readback_bytes > d.max_readback_bytes {
+                        return Err(Trap::new(
+                            TrapCode::GrantViolation,
+                            "read_into",
+                            None,
+                            "per-slice readback-byte allowance exhausted (§5.5)",
+                        ));
+                    }
+                }
+                if n > 0 {
+                    let slice = data[start..start + n].to_vec();
+                    write_guest(c, out_ptr, &slice)?;
+                }
+                Ok(n as u64)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // buffer_len — deterministic bookkeeping (no journal record).
+    linker.func_wrap(
+        NS_VHC_V2,
+        "buffer_len",
+        |mut c: Caller<'_, V2Host>, buffer: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("buffer_len")?;
+                let shared = c.data().shared.clone();
+                let st = shared.state.lock().expect("pump lock");
+                st.buffers
+                    .resolve(buffer)
+                    .map(|d| d.len() as u64)
+                    .map_err(|code| Trap::new(code, "buffer_len", None, "buffer handle"))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // buffer_release — the guest's explicit release (§3.4 ownership); frees quota + claim meter.
+    linker.func_wrap(
+        NS_VHC_V2,
+        "buffer_release",
+        |mut c: Caller<'_, V2Host>, buffer: u64| -> Result<(), wasmtime::Error> {
+            let r: Result<(), Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("buffer_release")?;
+                let shared = c.data().shared.clone();
+                let freed = {
+                    let mut st = shared.state.lock().expect("pump lock");
+                    st.buffers
+                        .release(buffer)
+                        .map_err(|code| Trap::new(code, "buffer_release", None, "buffer handle"))?
+                };
+                let d = c.data_mut();
+                d.accountable_staged_bytes = d.accountable_staged_bytes.saturating_sub(freed);
+                Ok(())
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // cancel — the completion protocol's cancellation (§3.3/§7.5): an outstanding op is retired
+    // NOW and its completion (reporting Cancelled) is enqueued deterministically; a late service
+    // outcome is ignored. Recordless: the journaled completion result captures the race (§8.3).
+    linker.func_wrap(
+        NS_VHC_V2,
+        "cancel",
+        |mut c: Caller<'_, V2Host>, op: u64| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("cancel")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                if st.ops.finish(op).is_some() {
+                    // A credit-held stream write is un-held with its op (its bytes never left).
+                    st.streams.cancel_held(op);
+                    st.enqueue_completion(op, &CompletionResult::cancelled())
+                        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    Ok(0) // cancel accepted: the op's completion reports Cancelled
+                } else {
+                    Ok(1) // already completed/cancelled or never issued
+                }
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- net@2 minor 1: content-addressed payloads by handle (§3.4) — both complete async -------
+    linker.func_wrap(
+        NS_NET_V2,
+        "payload_put",
+        |mut c: Caller<'_, V2Host>, buffer: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("payload_put")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let bytes = st
+                    .buffers
+                    .resolve(buffer)
+                    .map_err(|code| Trap::new(code, "payload_put", None, "buffer handle"))?;
+                let request = OpRequest::PayloadPut { bytes };
+                let op = st.ops.begin(request.clone()).map_err(|code| {
+                    Trap::new(code, "payload_put", None, "max_outstanding grant (§2.3)")
+                })?;
+                st.op_requests.push((op, request));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_NET_V2,
+        "payload_get",
+        |mut c: Caller<'_, V2Host>, hash_ptr: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("payload_get")?;
+                let hash_bytes = read_guest(c, hash_ptr, 32)?;
+                let hash: [u8; 32] = hash_bytes.as_slice().try_into().expect("32-byte span");
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st
+                    .ops
+                    .begin(OpRequest::PayloadGet { hash })
+                    .map_err(|code| {
+                        Trap::new(code, "payload_get", None, "max_outstanding grant (§2.3)")
+                    })?;
+                st.op_requests.push((op, OpRequest::PayloadGet { hash }));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- data@2::fetch — artifact fetch by committed hash + range (track B2; §3.2) --------------
+    // The guest names CONTENT, never location: the only inputs are the committed blake3 (edge-
+    // pinned in the envelope's artifact map, §5.1) and a byte range — no URL, no locator, no
+    // credential crosses this boundary (the resolver + its credentials stay embedder-side).
+    // Which artifacts a module may touch is a GRANT: a hash outside the admitted set traps
+    // GrantViolation before any op is issued. Completes Ok(BufferHandle) via tag 6 after the
+    // pump whole-artifact-verifies + range-slices (see complete_op).
+    linker.func_wrap(
+        NS_DATA_V2,
+        "fetch",
+        |mut c: Caller<'_, V2Host>,
+         hash_ptr: u32,
+         range_off: u64,
+         range_len: u64|
+         -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("fetch")?;
+                let hash_bytes = read_guest(c, hash_ptr, 32)?;
+                let hash: [u8; 32] = hash_bytes.as_slice().try_into().expect("32-byte span");
+                if !c.data().granted_artifacts.contains(&hash) {
+                    return Err(Trap::new(
+                        TrapCode::GrantViolation,
+                        "fetch",
+                        None,
+                        format!(
+                            "artifact {} is not in the admitted artifact set (which artifacts a \
+                             module may touch is a grant, architecture §3.2)",
+                            hash[..4]
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        ),
+                    ));
+                }
+                let request = OpRequest::ArtifactFetch {
+                    hash,
+                    range_off,
+                    range_len,
+                };
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st.ops.begin(request.clone()).map_err(|code| {
+                    Trap::new(code, "fetch", None, "max_outstanding grant (§2.3)")
+                })?;
+                st.op_requests.push((op, request));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- net@2 minor 1: direct peer streams under credit flow control (§3.3/§3.4) ---------------
+    linker.func_wrap(
+        NS_NET_V2,
+        "stream_open",
+        |mut c: Caller<'_, V2Host>, peer_ptr: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("stream_open")?;
+                let peer_bytes = read_guest(c, peer_ptr, 32)?;
+                let peer: [u8; 32] = peer_bytes.as_slice().try_into().expect("32-byte span");
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st
+                    .ops
+                    .begin(OpRequest::StreamOpen { peer })
+                    .map_err(|code| {
+                        Trap::new(code, "stream_open", None, "max_outstanding grant (§2.3)")
+                    })?;
+                st.op_requests.push((op, OpRequest::StreamOpen { peer }));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_NET_V2,
+        "stream_accept",
+        |mut c: Caller<'_, V2Host>| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("stream_accept")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st.ops.begin(OpRequest::StreamAccept).map_err(|code| {
+                    Trap::new(code, "stream_accept", None, "max_outstanding grant (§2.3)")
+                })?;
+                st.op_requests.push((op, OpRequest::StreamAccept));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_NET_V2,
+        "stream_write",
+        |mut c: Caller<'_, V2Host>, stream: u64, buffer: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("stream_write")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let bytes = st
+                    .buffers
+                    .resolve(buffer)
+                    .map_err(|code| Trap::new(code, "stream_write", None, "buffer handle"))?;
+                let op = st
+                    .ops
+                    .begin(OpRequest::StreamWrite {
+                        stream,
+                        bytes: bytes.clone(),
+                    })
+                    .map_err(|code| {
+                        Trap::new(code, "stream_write", None, "max_outstanding grant (§2.3)")
+                    })?;
+                // Credit flow control (§3.3): the transport request is emitted only when the
+                // stream's writable credit covers the bytes; otherwise the op is HELD pump-side
+                // (still outstanding — the guest's OpId is live) until the receiver's reads
+                // replenish credit.
+                match st.streams.write(stream, op, bytes.clone()) {
+                    Some(true) => {
+                        st.op_requests
+                            .push((op, OpRequest::StreamWrite { stream, bytes }));
+                    }
+                    Some(false) => { /* held for credit */ }
+                    None => {
+                        st.ops.finish(op);
+                        return Err(Trap::new(
+                            TrapCode::StaleHandle,
+                            "stream_write",
+                            None,
+                            "unknown or stale stream handle",
+                        ));
+                    }
+                }
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_NET_V2,
+        "stream_read",
+        |mut c: Caller<'_, V2Host>, stream: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("stream_read")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                if !st.streams.is_live(stream) {
+                    return Err(Trap::new(
+                        TrapCode::StaleHandle,
+                        "stream_read",
+                        None,
+                        "unknown or stale stream handle",
+                    ));
+                }
+                let op = st
+                    .ops
+                    .begin(OpRequest::StreamRead { stream })
+                    .map_err(|code| {
+                        Trap::new(code, "stream_read", None, "max_outstanding grant (§2.3)")
+                    })?;
+                st.op_requests.push((op, OpRequest::StreamRead { stream }));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
     // ---- net@2::publish — the signed, sequenced, durable egress door (§6.2/§12) -----------------
     linker.func_wrap(
         NS_NET_V2,
@@ -1166,22 +2134,6 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                     .publish(u64::from(channel_id), seq, &payload, &frame)
                     .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
                 st.published.push((u64::from(channel_id), seq, frame));
-                // Phase-A plumbing-owned sealing: if this run's bridge built a new update
-                // container since the last publish, seal the newest to its canonical wire at
-                // the commit point — v1's host sealing relocated to the v2 commit seam, so the
-                // session can stage the committed set at the barrier. The guest-visible sealing
-                // path (Phase B `payload_put`) retires this.
-                {
-                    let d = c.data();
-                    if let Some(tabi) = d.tabi.as_ref() {
-                        let n = tabi.container_count();
-                        if n > st.sealed_containers {
-                            st.latest_sealed_update =
-                                tabi.seal_container_of(n - 1).map(|b| (n - 1, b));
-                            st.sealed_containers = n;
-                        }
-                    }
-                }
                 Ok(seq)
             })(&mut c);
             stash(&mut c, r)
@@ -1310,6 +2262,148 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
         },
     )?;
 
+    // ---- sys@2::hash — crypto acceleration: blake3-256 over guest bytes (§3.2/§3.7) -------------
+    // The det/crypto-lane fast path: the in-guest fallback (daemon_vhc_proto::crypto) is always
+    // available, this host import accelerates it, and the two are bit-identical by construction.
+    // `(in_ptr, in_len, out_ptr) -> status`; writes HASH_LEN bytes to `out_ptr`, returns 0 (Ok).
+    // Deterministic function of the input → no journal record (§2.7 dc class).
+    linker.func_wrap(
+        NS_SYS_V2,
+        "hash",
+        |mut c: Caller<'_, V2Host>,
+         in_ptr: u32,
+         in_len: u32,
+         out_ptr: u32|
+         -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("hash")?;
+                let data = read_guest(c, in_ptr, in_len)?;
+                let digest = host_crypto_hash(&data);
+                write_guest(c, out_ptr, &digest)?;
+                Ok(0)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- sys@2::verify_sig — crypto acceleration: ed25519 verify (§3.2/§3.7) --------------------
+    // `(pk_ptr, sig_ptr, msg_ptr, msg_len) -> VerifyOutcome code` (0 valid / 1 invalid / 2
+    // malformed). Fixed-length key/sig spans; a bad-length span is a MemOob trap (an out-of-bounds
+    // read), a structurally-bad-but-in-bounds key/sig is `Malformed` (2). Deterministic → not
+    // journaled; replay re-executes it.
+    linker.func_wrap(
+        NS_SYS_V2,
+        "verify_sig",
+        |mut c: Caller<'_, V2Host>,
+         pk_ptr: u32,
+         sig_ptr: u32,
+         msg_ptr: u32,
+         msg_len: u32|
+         -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("verify_sig")?;
+                let pk = read_guest(c, pk_ptr, daemon_vhc_proto::VERIFY_PUBLIC_KEY_LEN as u32)?;
+                let sig = read_guest(c, sig_ptr, daemon_vhc_proto::VERIFY_SIGNATURE_LEN as u32)?;
+                let msg = read_guest(c, msg_ptr, msg_len)?;
+                Ok(host_crypto_verify(&pk, &sig, &msg))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- sys@2::rng_seed — the run-scoped deterministic seed (architecture §3.2) ----------------
+    // `(out_ptr) -> status 0`; writes RNG_SEED_LEN bytes. A pure function of the execution
+    // identity (derive_rng_seed) — §2.7 dc class, no journal record; replay re-derives it.
+    linker.func_wrap(
+        NS_SYS_V2,
+        "rng_seed",
+        |mut c: Caller<'_, V2Host>, out_ptr: u32| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("rng_seed")?;
+                let seed = c.data().rng_seed;
+                write_guest(c, out_ptr, &seed)?;
+                Ok(0)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- sys@2::device_profile — the probe's device profile, guest-readable (§3.5) --------------
+    // `(out_ptr, out_cap) -> (status << 32) | len` with the §4.1/§6.4 NeedCapacity protocol. The
+    // profile is what makes module autotune possible ("micro-batch autotune moves inside the
+    // module", architecture §3.5). It is a NONDETERMINISTIC INPUT — the same probe measurement
+    // admission judged — so every `Ok` delivery is journaled as the §8.3 tag-15 record and replay
+    // feeds the recorded bytes, never a fresh probe.
+    linker.func_wrap(
+        NS_SYS_V2,
+        "device_profile",
+        |mut c: Caller<'_, V2Host>, out_ptr: u32, out_cap: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("device_profile")?;
+                // Mandatory-retry rule: after NeedCapacity the re-call must be big enough.
+                if let Some(required) = c.data().slice.pending_device {
+                    if u64::from(out_cap) < required {
+                        return Err(Trap::new(
+                            TrapCode::BadEvent,
+                            "device_profile",
+                            None,
+                            format!("retry with out_cap {out_cap} < required {required} (§6.4)"),
+                        ));
+                    }
+                }
+                let bytes = c.data().device_bytes.clone();
+                let len = bytes.len() as u64;
+                if len > u64::from(out_cap) {
+                    c.data_mut().slice.pending_device = Some(len);
+                    return Ok(pack_status_len(RET_STATUS_NEED_CAPACITY, len as u32));
+                }
+                write_guest(c, out_ptr, &bytes)?;
+                c.data_mut().slice.pending_device = None;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.sink
+                    .device_profile(&bytes)
+                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                Ok(pack_status_len(RET_STATUS_DELIVERED, len as u32))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Stage the guest's own sealed container bytes and announce them as `PayloadReady` kind 0 —
+/// the slice-boundary half of the B1 sealing-gap retirement (see the `next_event` body).
+fn stage_own_bytes(st: &mut PumpState, bytes: Vec<u8>) -> Result<(), SinkError> {
+    if st.stop_enqueued {
+        return Ok(()); // no deliveries after Stop (§4.4)
+    }
+    let hash = *blake3::hash(&bytes).as_bytes();
+    st.enforce_payload_depth()?;
+    let staging_id = st.next_host_staging_id;
+    st.next_host_staging_id += 1;
+    let size = bytes.len() as u64;
+    st.staged.insert(staging_id, (STAGED_KIND_BYTES, bytes));
+    let ev = EventV2::PayloadReady {
+        staging_id,
+        hash,
+        meta: PayloadMeta {
+            size,
+            kind: STAGED_KIND_BYTES,
+            channel: None,
+        },
+    };
+    let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
+    st.queue.push_back(QueuedEvent {
+        frame_bytes,
+        tag: daemon_vhc_abi::EV_TAG_PAYLOAD_READY,
+        signed: None,
+        payload_hash: Some(hash),
+        timer_id: None,
+        is_budget: false,
+        gossip_id: None,
+    });
     Ok(())
 }
 
@@ -1335,9 +2429,17 @@ fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
         let queued_timers = st.queue.iter().filter(|q| q.timer_id.is_some()).count();
         if queued_timers >= st.timer_depth {
             if let Some(pos) = st.queue.iter().position(|q| q.timer_id.is_some()) {
-                let dropped = st.queue.remove(pos).and_then(|q| q.timer_id);
+                let dropped = st
+                    .queue
+                    .remove(pos)
+                    .and_then(|q| q.timer_id)
+                    .expect("positioned on a queued Timer");
                 st.sink
-                    .drop_coalesced(1, 1, dropped, None)
+                    .drop_coalesced(
+                        1,
+                        daemon_vhc_abi::COALESCE_LATEST_WINS,
+                        crate::v2::journal::Dropped::timer(dropped),
+                    )
                     .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
             }
         }
@@ -1348,6 +2450,7 @@ fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
             payload_hash: None,
             timer_id: Some(t.id),
             is_budget: false,
+            gossip_id: None,
         });
     }
     Ok(())
@@ -1428,12 +2531,24 @@ pub fn start_run(
             next_guest_staging_id: 1,
             sink,
             timer_depth: run.advisory_depth,
+            payload_depth: run.payload_depth,
+            gossip_depth: run.gossip_depth,
+            spool_frames: run.spool_frames,
+            per_sender_quota: run.per_sender_quota,
+            auth_spooled: 0,
+            auth_per_sender: std::collections::HashMap::new(),
+            spool_exhausted_reported: false,
+            gossip_arrivals: std::collections::HashMap::new(),
             metrics: Vec::new(),
             logs: Vec::new(),
             published: Vec::new(),
             bridge_final_state: None,
-            sealed_containers: 0,
-            latest_sealed_update: None,
+            // Generation-seeded by the instantiation counter (0: this driver instantiates once
+            // per start_run; trap-restart re-seeding rides the tag-13 counter, ABI §7.1).
+            buffers: BufferTable::new(0, run.max_live_buffer_handles, run.max_live_buffer_bytes),
+            ops: OpTable::new(0, run.max_outstanding_ops),
+            streams: StreamTable::new(0),
+            op_requests: Vec::new(),
             stop_enqueued: false,
             draining: false,
         }),
@@ -1478,6 +2593,7 @@ pub fn start_run(
                     pending_next: None,
                     pending_readback: None,
                     pending_readback_value: None,
+                    pending_device: None,
                 },
                 fuel_per_slice: engine_cfg.fuel_per_call,
                 op_budget: engine_cfg.op_budget,
@@ -1488,8 +2604,12 @@ pub fn start_run(
                 accountable_staged_bytes: 0,
                 tabi: bridge.then(|| crate::runtime::HostState::new(&engine_cfg)),
                 slice_pass_open: false,
-                slice_ingested: false,
+                ingest_phase: IngestPhase::Idle,
+                sealed_containers: 0,
                 signing,
+                rng_seed: derive_rng_seed(&run.identity),
+                device_bytes: run.device_bytes.clone(),
+                granted_artifacts: run.granted_artifacts.clone(),
                 identity: run.identity.clone(),
                 sender,
             };
@@ -1587,6 +2707,12 @@ pub fn start_run(
                     .map(crate::runtime::HostState::canonical_state_bytes_of);
                 let mut st = shared.state.lock().expect("pump lock");
                 st.bridge_final_state = final_state;
+                // Force-reclaim the instance's buffers + outstanding ops + streams through the
+                // per-instance tables (architecture §3.4; ABI §7.3) — guest-thread-owned teardown.
+                st.buffers.clear();
+                st.ops.clear();
+                st.streams.clear();
+                st.op_requests.clear();
             }
             match run_result {
                 Ok(outcome) => {
@@ -1679,6 +2805,26 @@ impl crate::runtime::TabiHost for V2Host {
                 },
             ));
         }
+        // Ingest-phase tracking (§5.9 / IngestPhase docs): any bridge op that is not a pure
+        // window reader marks the open staged window's ingest MATH as begun — the next window
+        // (or batch read, or slice close) is then the epilogue boundary.
+        if let IngestPhase::Consuming { math_seen: false } = self.ingest_phase {
+            let window_reader = matches!(
+                import,
+                "upd_sections@1"
+                    | "upd_kind@1"
+                    | "upd_bytes_len@1"
+                    | "upd_read_bytes@1"
+                    | "upd_tensor@1"
+                    | "drop@1"
+                    | "metric@1"
+                    | "log@1"
+                    | "abi_minor@1"
+            );
+            if !window_reader {
+                self.ingest_phase = IngestPhase::Consuming { math_seen: true };
+            }
+        }
         self.charge_op(import)
     }
     fn stash_trap(&mut self, t: Trap) {
@@ -1715,7 +2861,7 @@ fn journal_terminal_trap(shared: &Arc<PumpShared>, trap: &Trap) -> Result<(), Si
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::journal::MemorySink;
+    use crate::v2::journal::{MemorySink, SinkEntry};
     use daemon_vhc_proto::sign::verify_bytes;
 
     fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
@@ -1728,15 +2874,149 @@ mod tests {
             next_guest_staging_id: 1,
             sink,
             timer_depth: 2,
+            payload_depth: 4,
+            gossip_depth: 2,
+            spool_frames: 4,
+            per_sender_quota: 2,
+            auth_spooled: 0,
+            auth_per_sender: std::collections::HashMap::new(),
+            spool_exhausted_reported: false,
+            gossip_arrivals: std::collections::HashMap::new(),
             metrics: Vec::new(),
             logs: Vec::new(),
             published: Vec::new(),
             bridge_final_state: None,
-            sealed_containers: 0,
-            latest_sealed_update: None,
+            buffers: BufferTable::new(0, 0, 0),
+            ops: OpTable::new(0, 0),
+            streams: StreamTable::new(0),
+            op_requests: Vec::new(),
             stop_enqueued: false,
             draining: false,
         }
+    }
+
+    fn test_pump(sink: Box<dyn JournalSink>) -> PumpHandle {
+        PumpHandle {
+            shared: Arc::new(PumpShared {
+                state: Mutex::new(test_state(sink)),
+                wake: Condvar::new(),
+                t0: Instant::now(),
+            }),
+        }
+    }
+
+    fn signed_stub() -> Vec<u8> {
+        b"signed-frame-stub".to_vec()
+    }
+
+    #[test]
+    fn authoritative_spool_backpressures_and_journals_the_typed_stall() {
+        // test_state: spool_frames = 4, per_sender_quota = 2 (§4.7: bounded, never drops).
+        let sink = Arc::new(Mutex::new(MemorySink::new()));
+        let pump = test_pump(Box::new(sink.clone()));
+        let s1 = [1u8; 32];
+        let s2 = [2u8; 32];
+        let s3 = [3u8; 32];
+        // Per-sender quota: sender 1's third undelivered frame back-pressures HIM only.
+        assert_eq!(
+            pump.deliver_frame(0, 0, s1, b"a".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::Accepted
+        );
+        assert_eq!(
+            pump.deliver_frame(0, 1, s1, b"b".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::Accepted
+        );
+        assert_eq!(
+            pump.deliver_frame(0, 2, s1, b"c".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::SenderQuota,
+            "per-sender quota bounds the DoS vector (§4.7)"
+        );
+        // Other senders proceed until the SPOOL bound (4).
+        assert_eq!(
+            pump.deliver_frame(0, 0, s2, b"d".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::Accepted
+        );
+        assert_eq!(
+            pump.deliver_frame(0, 1, s2, b"e".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::Accepted
+        );
+        assert_eq!(
+            pump.deliver_frame(0, 0, s3, b"f".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::SpoolFull,
+            "genuine spool exhaustion back-pressures (never a drop)"
+        );
+        // The typed stall was journaled ONCE for the episode (§6.7 tag 16), even on a re-hit.
+        assert_eq!(
+            pump.deliver_frame(0, 0, s3, b"f".to_vec(), signed_stub())
+                .unwrap(),
+            DeliverVerdict::SpoolFull
+        );
+        let entries = &sink.lock().unwrap().entries;
+        let stalls: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e, SinkEntry::Condition { code, .. } if code == "SpoolExhausted"))
+            .collect();
+        assert_eq!(stalls.len(), 1, "one condition per exhaustion episode");
+        // Nothing was dropped: the reliable class holds every accepted frame.
+        assert!(!entries.iter().any(|e| matches!(e, SinkEntry::Drop { .. })));
+    }
+
+    #[test]
+    fn gossip_class_drops_oldest_at_depth_and_journals_identity() {
+        // test_state: gossip_depth = 2 (§4.7 drop-oldest, journaled tag 7 class 2).
+        let sink = Arc::new(Mutex::new(MemorySink::new()));
+        let pump = test_pump(Box::new(sink.clone()));
+        let g = [9u8; 32];
+        pump.deliver_gossip(5, g, b"g0".to_vec()).unwrap();
+        pump.deliver_gossip(5, g, b"g1".to_vec()).unwrap();
+        pump.deliver_gossip(5, g, b"g2".to_vec()).unwrap();
+        let entries = &sink.lock().unwrap().entries;
+        let drops: Vec<&SinkEntry> = entries
+            .iter()
+            .filter(|e| matches!(e, SinkEntry::Drop { class: 2, .. }))
+            .collect();
+        assert_eq!(drops.len(), 1, "third arrival drops the OLDEST");
+        let SinkEntry::Drop { rule, dropped, .. } = drops[0] else {
+            unreachable!()
+        };
+        assert_eq!(*rule, daemon_vhc_abi::COALESCE_DROP_OLDEST);
+        assert_eq!(
+            (dropped.channel, dropped.sender, dropped.seq),
+            (Some(5), Some(g), Some(0)),
+            "the drop names the oldest arrival's full identity"
+        );
+    }
+
+    #[test]
+    fn payload_ready_dedups_by_hash_and_bounds_depth() {
+        // test_state: payload_depth = 4 (§4.7 class 0: dedup-by-hash + bounded queue).
+        let sink = Arc::new(Mutex::new(MemorySink::new()));
+        let pump = test_pump(Box::new(sink.clone()));
+        // Identical bytes coalesce: one announcement, one journaled dedup.
+        let id1 = pump.stage_payload(b"same".to_vec(), None).unwrap();
+        let id2 = pump.stage_payload(b"same".to_vec(), None).unwrap();
+        assert_eq!(id1, id2, "dedup returns the already-staged id");
+        // Distinct hashes beyond the depth drop the OLDEST announcement (and unstage it).
+        for i in 0u8..4 {
+            pump.stage_payload(vec![i], None).unwrap();
+        }
+        let entries = &sink.lock().unwrap().entries;
+        let dedups = entries
+            .iter()
+            .filter(
+                |e| matches!(e, SinkEntry::Drop { class: 0, rule, .. } if *rule == daemon_vhc_abi::COALESCE_DEDUP_HASH),
+            )
+            .count();
+        assert!(
+            dedups >= 2,
+            "the dedup + the depth drop are journaled: {entries:?}"
+        );
     }
 
     #[test]
@@ -1793,6 +3073,7 @@ mod tests {
                 pending_next: None,
                 pending_readback: None,
                 pending_readback_value: None,
+                pending_device: None,
             },
             fuel_per_slice: 0,
             op_budget: 0,
@@ -1803,8 +3084,12 @@ mod tests {
             accountable_staged_bytes: 0,
             tabi: None,
             slice_pass_open: false,
-            slice_ingested: false,
+            ingest_phase: IngestPhase::Idle,
+            sealed_containers: 0,
             signing,
+            rng_seed: [0u8; 32],
+            device_bytes: Vec::new(),
+            granted_artifacts: std::collections::BTreeSet::new(),
             identity: RunIdentity {
                 run_id: [1u8; 32],
                 epoch: 4,

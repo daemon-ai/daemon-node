@@ -175,6 +175,50 @@ fn v1_minor_above_host_is_minor_too_new() {
     assert_eq!(err.code, AbiRefusalCode::AbiMinorTooNew);
 }
 
+// -- the B1 minor-0→1 bump: both-side pins (ABI §1.3 step 5, §1.4) ----------------------------------
+
+#[test]
+fn minor1_import_with_minor1_declaration_is_admitted() {
+    // The bump's positive selection pin: a module importing the B1 surface and declaring 2.1.
+    let wasm = build_module(
+        &[("vhc@2", "next_event"), ("net@2", "payload_put")],
+        V2_EXPORTS,
+        pack(2, 1),
+    );
+    let sel = select_driver(&worker(), &wasm, None).expect("minor-1 module admitted");
+    assert_eq!((sel.major, sel.minor), (2, 1));
+}
+
+#[test]
+fn minor1_import_with_minor0_declaration_is_declaration_mismatch() {
+    // "A declared minor below what the imports require is AbiDeclarationMismatch" (§1.3 step 5):
+    // the module imports payload_put (introduced at minor 1) but declares 2.0.
+    let wasm = build_module(
+        &[("vhc@2", "next_event"), ("net@2", "payload_put")],
+        V2_EXPORTS,
+        pack(2, 0),
+    );
+    let err = select_driver(&worker(), &wasm, None).expect_err("lying declaration must refuse");
+    assert_eq!(err.code, AbiRefusalCode::AbiDeclarationMismatch);
+    assert!(err.detail.contains("require minor 1"), "{}", err.detail);
+}
+
+#[test]
+fn minor0_declaration_without_minor1_imports_stays_admitted() {
+    // Additive discipline: the Phase-A shape is untouched by the bump.
+    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 0));
+    let sel = select_driver(&worker(), &wasm, None).expect("minor-0 module still admitted");
+    assert_eq!((sel.major, sel.minor), (2, 0));
+}
+
+#[test]
+fn v2_minor_above_host_is_minor_too_new() {
+    // 2.2 > the host's 2.1: AbiMinorTooNew continues to protect the other direction.
+    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 2));
+    let err = select_driver(&worker(), &wasm, None).expect_err("minor 2 > host minor 1");
+    assert_eq!(err.code, AbiRefusalCode::AbiMinorTooNew);
+}
+
 // -- step 1: hash mismatch refuses BEFORE compile ---------------------------------------------------
 
 #[test]

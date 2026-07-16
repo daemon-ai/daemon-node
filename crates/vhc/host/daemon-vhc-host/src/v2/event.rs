@@ -13,18 +13,28 @@
 //! other consensus-critical byte in the tree.
 //!
 //! This host-side codec covers the Phase A closed subset (`{Frame, PayloadReady, Timer, Budget,
-//! Stop, Quiesce}`, ABI §4.2): [`EventV2`] has **no variants for the reserved `Fence`/`Completion`
-//! tags**, so a minor-0 host cannot deliver them by construction (§4.6). Decoding accepts and
-//! ignores trailing fields beyond those known (additive minors, §5.2) and fails closed on an
-//! unknown tag — the decoder here serves the journal/replay verifier and tests; the guest-side
-//! fail-closed trap (§5.2) is the SDK's obligation.
+//! Stop, Quiesce}`, ABI §4.2) **plus the Phase B `Completion` variant** (tag 6, ABI §4.6/§7.5 —
+//! track B1's async completion protocol): every non-immediate capability call returns an `OpId` and
+//! completes through `Event::Completion(op, result)`. The reserved `Fence` tag (5) is still **not a
+//! variant** of [`EventV2`], so a host without `compute@2` cannot deliver it by construction (§4.6);
+//! it arrives with Phase C. Decoding accepts and ignores trailing fields beyond those known
+//! (additive minors, §5.2) and fails closed on an unknown tag — the decoder here serves the
+//! journal/replay verifier and tests; the guest-side fail-closed trap (§5.2) is the SDK's
+//! obligation.
+//!
+//! Whether the host *delivers* a `Completion` is governed by minor negotiation (a minor-0 host with
+//! no completion sources never produces one); representability here is what lets the completion
+//! protocol, journal (§8.3 tag 14), and replay verifier all speak one shape.
 
 use ciborium::value::Value;
 
 use daemon_vhc_abi::{
-    EV_TAG_BUDGET, EV_TAG_FRAME, EV_TAG_PAYLOAD_READY, EV_TAG_QUIESCE, EV_TAG_STOP, EV_TAG_TIMER,
+    EV_TAG_BUDGET, EV_TAG_COMPLETION, EV_TAG_FRAME, EV_TAG_PAYLOAD_READY, EV_TAG_QUIESCE,
+    EV_TAG_STOP, EV_TAG_TIMER,
 };
 use daemon_vhc_proto::to_canonical_vec;
+
+use super::completion::CompletionResult;
 
 /// Metadata beside a staged payload announcement (ABI §4.2 `payload-meta`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,11 +69,13 @@ pub struct BudgetReport {
     pub throttle: ThrottleReport,
 }
 
-/// A Phase-A major-2 event, exactly the closed deliverable subset (ABI §4.2).
+/// A major-2 event: the Phase-A closed subset (ABI §4.2) plus the Phase-B `Completion` variant
+/// (tag 6, §4.6/§7.5 — track B1).
 ///
-/// The reserved `Fence` (tag 5) / `Completion` (tag 6) variants are deliberately absent: a
-/// minor-0 host MUST NOT deliver them (§4.6), and leaving them unrepresentable makes that a
-/// compile-time property of the pump rather than a runtime check.
+/// The reserved `Fence` (tag 5) variant is deliberately absent: a host without `compute@2` MUST NOT
+/// deliver it (§4.6), and leaving it unrepresentable makes that a compile-time property of the pump
+/// (it arrives with Phase C). `Completion` **is** representable now: track B1's completion protocol
+/// generalizes every non-immediate capability call to an `OpId` + `Event::Completion(op, result)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventV2 {
     /// Tag 0 — a verified signed control frame (§4.3). `payload` is opaque module-authored bytes.
@@ -97,6 +109,13 @@ pub enum EventV2 {
     Budget {
         /// The fully-defined report body.
         report: BudgetReport,
+    },
+    /// Tag 6 — the async result of a non-immediate capability call (§4.6/§7.5, track B1).
+    Completion {
+        /// The `OpId` the originating capability call returned (handle kind 10, §7.2).
+        op: u64,
+        /// The typed success/failure result (§7.5).
+        result: CompletionResult,
     },
     /// Tag 4 — terminal; after delivery every import traps `PhaseViolation` (§4.4).
     Stop {
@@ -189,6 +208,11 @@ pub fn encode_event_frame(event: &EventV2) -> Result<Vec<u8>, EventCodecError> {
                 ),
             ]),
         ]),
+        EventV2::Completion { op, result } => Value::Array(vec![
+            Value::from(EV_TAG_COMPLETION),
+            Value::from(*op),
+            result.to_value(),
+        ]),
         EventV2::Stop { reason } => {
             Value::Array(vec![Value::from(EV_TAG_STOP), Value::from(*reason)])
         }
@@ -239,6 +263,13 @@ pub fn decode_event_frame(bytes: &[u8]) -> Result<EventV2, EventCodecError> {
         }),
         t if t == EV_TAG_BUDGET => Ok(EventV2::Budget {
             report: decode_budget(items.get(1))?,
+        }),
+        t if t == EV_TAG_COMPLETION => Ok(EventV2::Completion {
+            op: as_u64(items.get(1), "op")?,
+            result: CompletionResult::from_value(items.get(2).ok_or_else(|| {
+                EventCodecError::Malformed("completion frame missing `result`".into())
+            })?)
+            .map_err(|e| EventCodecError::Malformed(e.to_string()))?,
         }),
         t if t == EV_TAG_STOP => Ok(EventV2::Stop {
             reason: as_u64(items.get(1), "reason")?,
@@ -346,8 +377,10 @@ fn map_u64_opt(entries: &[(Value, Value)], key: &str) -> Result<Option<u64>, Eve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v2::completion::{CompError, SuccessPayload};
     use daemon_vhc_abi::{
-        EV_TAG_COMPLETION, EV_TAG_FENCE, QUIESCE_REASON_UPGRADE, STOP_REASON_RUN_COMPLETE,
+        COMP_ERR_TIMEOUT, EV_TAG_COMPLETION, EV_TAG_FENCE, HANDLE_KIND_BUFFER,
+        QUIESCE_REASON_UPGRADE, STOP_REASON_RUN_COMPLETE,
     };
 
     fn samples() -> Vec<EventV2> {
@@ -391,6 +424,21 @@ mod tests {
                     },
                 },
             },
+            EventV2::Completion {
+                op: daemon_vhc_abi::pack_handle(daemon_vhc_abi::HANDLE_KIND_OP_ID, 1, 7),
+                result: CompletionResult::Ok(SuccessPayload::Handle(daemon_vhc_abi::pack_handle(
+                    HANDLE_KIND_BUFFER,
+                    1,
+                    3,
+                ))),
+            },
+            EventV2::Completion {
+                op: daemon_vhc_abi::pack_handle(daemon_vhc_abi::HANDLE_KIND_OP_ID, 1, 8),
+                result: CompletionResult::Err(CompError {
+                    code: COMP_ERR_TIMEOUT,
+                    detail: Some("fetch deadline".into()),
+                }),
+            },
             EventV2::Stop {
                 reason: STOP_REASON_RUN_COMPLETE,
             },
@@ -427,9 +475,10 @@ mod tests {
     }
 
     #[test]
-    fn reserved_and_future_tags_fail_closed() {
-        // ABI §4.6/§5.2: Fence/Completion are reserved; a future-minor tag is unknown.
-        for tag in [EV_TAG_FENCE, EV_TAG_COMPLETION, 63u64] {
+    fn fence_and_future_tags_fail_closed_but_completion_decodes() {
+        // ABI §4.6/§5.2: `Fence` (tag 5) is still reserved (Phase C) and a future-minor tag is
+        // unknown — both fail closed. `Completion` (tag 6) is now representable (track B1).
+        for tag in [EV_TAG_FENCE, 63u64] {
             let bytes =
                 to_canonical_vec(&Value::Array(vec![Value::from(tag), Value::from(1u64)])).unwrap();
             assert_eq!(
@@ -437,6 +486,41 @@ mod tests {
                 EventCodecError::UnknownTag(tag)
             );
         }
+        // A well-formed completion frame decodes to the `Completion` variant.
+        let completion = EventV2::Completion {
+            op: 5,
+            result: CompletionResult::cancelled(),
+        };
+        let bytes = encode_event_frame(&completion).unwrap();
+        assert_eq!(decode_event_frame(&bytes).unwrap(), completion);
+    }
+
+    #[test]
+    fn completion_frame_is_tag6_positional() {
+        // ABI §4.2 `completion-ev = [6, op, completion-result]`.
+        let bytes = encode_event_frame(&EventV2::Completion {
+            op: 1,
+            result: CompletionResult::Ok(SuccessPayload::Unit),
+        })
+        .unwrap();
+        assert_eq!(bytes[0] >> 5, 4, "definite-length array head");
+        assert_eq!(bytes[1], 0x06, "leading integer event tag 6 (Completion)");
+    }
+
+    #[test]
+    fn malformed_completion_result_is_a_malformed_frame() {
+        // A completion frame whose nested result is not a valid completion-result fails closed as a
+        // malformed frame (the completion codec error is surfaced through the event codec).
+        let bad = Value::Array(vec![
+            Value::from(EV_TAG_COMPLETION),
+            Value::from(1u64),
+            Value::Array(vec![Value::from(9u64), Value::Null]), // unknown result discriminant
+        ]);
+        let bytes = to_canonical_vec(&bad).unwrap();
+        assert!(matches!(
+            decode_event_frame(&bytes),
+            Err(EventCodecError::Malformed(_))
+        ));
     }
 
     #[test]

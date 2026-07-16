@@ -425,6 +425,26 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_replay"],
         ),
         (
+            // The sys@2 crypto-acceleration conformance gate (Phase B; architecture §3.2/§3.7,
+            // refactor §6): the host `hash`/`verify_sig` accel bodies ≡ the dual-compiled
+            // `daemon_vhc_proto::crypto` contract (the in-guest fallback is that same contract
+            // compiled to wasm — bit-exact by construction, the det-lane pattern) over a wide
+            // deterministic sweep + known-answer vectors + tri-state verify semantics. Named as
+            // its own lane (also covered by the host crate suite below).
+            "B2 sys@2 crypto accel conformance (host ≡ in-guest contract: hash/verify_sig)",
+            &["-p", "daemon-vhc-host", "--test", "v2_crypto"],
+        ),
+        (
+            // The B2 data@2 fetch conformance (architecture §3.2 the data world): the corpus
+            // window fetched by committed hash + policy-chosen range, completing Ok(BufferHandle)
+            // (tag 6) after whole-artifact verification; grant negative (GrantViolation),
+            // range negative (StoreRefused), tamper negative (HashMismatch — fetch-and-verify
+            // against the committed hash); tag-14 journaling + bit-exact replay with artifacts
+            // materialized from the content-addressed payload table.
+            "B2 data@2 fetch conformance (grants, pinning, range, journal + replay)",
+            &["-p", "daemon-vhc-host", "--test", "v2_data_fetch"],
+        ),
+        (
             "daemon-vhc-host (det lane + cross-backend digests + wasm-guest determinism)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),
@@ -564,6 +584,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "daemon-vhc-sdk-rounds",
             "Phase E — the A2 choreography bridging oracle (relocated round logic vs the v1 \
              engine) retires with the v1 engine at sunset [dev-dep]",
+        ),
+        (
+            "daemon-swarm-e2e",
+            "daemon-vhc-sdk-v2",
+            "Phase E — the B2 corpus-windowing equivalence oracle (SDK policy vs the v1 host \
+             pipeline `session::data`) retires with the v1 pipeline at sunset [dev-dep]",
         ),
         (
             "daemon-vhc-safetensors",

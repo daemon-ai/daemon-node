@@ -20,6 +20,11 @@ The crates merge only when the v1 SDK is next deliberately re-pinned (Phase E at
 ciborium = { workspace = true }
 daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }
 serde = { workspace = true, features = ["derive"] }
+# The corpus manifest is JSON (`manifest.json`, the same schema the v1 host pipeline reads) —
+# the corpus-windowing policy layer parses it in-module. Existing workspace pin.
+serde_json = { workspace = true }
+# Shard content addressing (fetch-time integrity re-check at the policy layer). Existing pin.
+blake3 = { workspace = true }
 
 [lints]
 workspace = true

@@ -227,7 +227,8 @@ fn staged_update_flows_through_read_back_kind_2() {
     }
     pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
         .expect("stop");
-    assert!(matches!(run.wait().expect("join"), RunEnd::Outcome(0)));
+    let end = run.wait().expect("join");
+    assert!(matches!(end, RunEnd::Outcome(0)), "run ended {end:?}");
 
     let frame: ciborium::value::Value =
         ciborium::de::from_reader(pump.published()[0].2.as_slice()).expect("frame");

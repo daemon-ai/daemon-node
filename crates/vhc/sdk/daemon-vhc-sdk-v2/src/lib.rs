@@ -20,11 +20,18 @@
 #[cfg(target_arch = "wasm32")]
 pub mod abi;
 #[cfg(target_arch = "wasm32")]
-pub use abi::{next_event, publish, read_back_bytes, read_back_uint, set_timer, Event};
+pub use abi::{
+    buffer_len, buffer_release, cancel, create_from, data_fetch, device_profile, emit_metric,
+    hash_accel, next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint,
+    read_buffer, rng_seed, set_timer, stream_accept, stream_open, stream_read, stream_write,
+    verify_sig_accel, Event,
+};
 
+pub mod corpus;
 pub mod migrate;
 pub mod module;
 
+pub use corpus::{BatchLocation, CorpusError, CorpusWindow, Manifest, ShardDesc, TokenWidth};
 pub use migrate::{
     build_manifest, MigrateState, MigrationDescriptor, MigrationSection, OwnedSection, SectionDecl,
     SectionReader, SimSections, StateManifest,
@@ -64,7 +71,10 @@ macro_rules! main {
 
             #[no_mangle]
             pub extern "C" fn da_abi() -> u32 {
-                2 << 16
+                // The declaration is cross-checked against the import shape at selection
+                // (ABI §1.3 step 5): the declared minor must cover every imported symbol's
+                // introducing minor.
+                (2 << 16) | <$module as $crate::module::V2Module>::decl().abi_minor
             }
 
             #[no_mangle]
