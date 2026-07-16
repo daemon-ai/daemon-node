@@ -517,6 +517,26 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-sdk-profiles"],
         ),
         (
+            // The C3 models-exodus acceptance (refactor §7 "models leave the SDK" + "re-authored
+            // tiny-llama matches reference parity within the existing tolerance class"): the
+            // re-authored `tiny-llama-c3` guest — a real Burn model over Autodiff<HostBackend> +
+            // the C3a profiles' in-guest det lane — through a 2-round barrier whole-run vs the
+            // frozen v1 digest oracle. C3b: guest training ≡ native Autodiff<NdArray> of the SAME
+            // dual-compiled model source, bit-exact. C3c: det-lane digests ≡ the v1 oracle
+            // bit-exact (equality class); trained θ within the OpClass::Optimizer band
+            // (tolerance class). The frozen pins (v2_parity) and the A0 fixture run beside this
+            // lane in the same gate.
+            "C3 re-authored tiny-llama parity (bit-exact lowering + det digests ≡ v1 + Optimizer band)",
+            &[
+                "-p",
+                "daemon-vhc-host",
+                "--test",
+                "c3_parity",
+                "--features",
+                "burn-ndarray",
+            ],
+        ),
+        (
             // A2 migrate/main! scaffolding (refactor §5 A2 item 4; ABI §10): state round-trips
             // in sim through the typed manifest protocol; the SDK-derived claim/manifest match
             // the §9.1/§6.2 wire schema the admission funnel decodes. The macro's exports are
@@ -654,6 +674,13 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "daemon-vhc-host",
             "daemon-vhc-sdk",
             "Phase C — model presets (TinyLlamaCfg/profiles) leave the SDK for guests/ [dev-dep]",
+        ),
+        (
+            "daemon-vhc-host",
+            "daemon-vhc-sdk-profiles",
+            "Phase E — the C3 parity harness runs the re-expressed profile natively as the \
+             lowering oracle beside the dual-compiled guest model; retires with the v1 oracle at \
+             sunset [dev-dep]",
         ),
         (
             "daemon-vhc-worker",

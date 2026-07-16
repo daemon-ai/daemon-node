@@ -1508,6 +1508,10 @@ name = "daemon-vhc-abi"
 version = "0.0.1"
 
 [[package]]
+name = "daemon-vhc-det"
+version = "0.0.1"
+
+[[package]]
 name = "daemon-vhc-proto"
 version = "0.0.1"
 dependencies = [
@@ -1540,6 +1544,16 @@ dependencies = [
  "ciborium",
  "daemon-vhc-sdk-v2",
  "getrandom 0.4.3",
+ "serde",
+]
+
+[[package]]
+name = "daemon-vhc-sdk-profiles"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "ciborium",
+ "daemon-vhc-det",
  "serde",
 ]
 
@@ -4628,6 +4642,20 @@ name = "tiny-llama"
 version = "0.0.1"
 dependencies = [
  "daemon-vhc-sdk",
+ "serde",
+]
+
+[[package]]
+name = "tiny-llama-c3"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "ciborium",
+ "daemon-vhc-proto",
+ "daemon-vhc-sdk-compute",
+ "daemon-vhc-sdk-profiles",
+ "daemon-vhc-sdk-rounds",
+ "daemon-vhc-sdk-v2",
  "serde",
 ]
 

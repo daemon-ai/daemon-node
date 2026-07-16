@@ -4915,6 +4915,7 @@ dependencies = [
  "daemon-vhc-proto",
  "daemon-vhc-safetensors",
  "daemon-vhc-sdk",
+ "daemon-vhc-sdk-profiles",
  "daemon-vhc-session",
  "serde",
  "serde_json",
