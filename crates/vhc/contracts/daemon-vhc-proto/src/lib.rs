@@ -25,6 +25,7 @@ pub mod digest;
 pub mod envelope;
 pub mod error;
 pub mod genesis;
+pub mod grants;
 pub mod hash;
 pub mod merkle;
 pub mod messages;
@@ -54,6 +55,7 @@ pub use genesis::{
     GenesisEnvelope, GrantBound, Identities, MigrationGrant, RoleEntry, RoleGrants, RunSectionV2,
     SnapshotArtifact, TransportSelection, WorldGrant, GENESIS_SCHEMA_MAJOR,
 };
+pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsError, LaneCeilings};
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
 pub use messages::{SignedMessage, SwarmMessage};
