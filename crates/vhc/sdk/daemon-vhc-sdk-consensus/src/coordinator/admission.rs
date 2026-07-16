@@ -17,9 +17,9 @@
 use daemon_vhc_proto::messages::Join;
 use daemon_vhc_proto::{CapabilitySet, Hash, PeerId, SwarmProtoVersion};
 
-use crate::config::RunConfig;
-use crate::io::AdmissionReject;
-use crate::state::{Member, Phase};
+use crate::coordinator::config::RunConfig;
+use crate::coordinator::io::AdmissionReject;
+use crate::coordinator::state::{Member, Phase};
 
 /// A candidate join to evaluate: the signing `peer`, its signed-frame `version`, the [`Join`]
 /// payload, and an optional asserted envelope hash (see the module note).

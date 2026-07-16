@@ -43,7 +43,11 @@ daemon-vhc-sdk-rounds = { workspace = true }
 # sides link legally (same rationale as the daemon-vhc-sdk entry above). Path dep like the sdk
 # entry (sdk-v2 is deliberately not in the frozen root [workspace.dependencies]).
 daemon-vhc-sdk-v2 = { path = "../../crates/vhc/sdk/daemon-vhc-sdk-v2" }
-daemon-vhc-coordinator = { workspace = true }
+# The pure coordinator `tick` loop (drills.rs / wasm_profiles.rs) + observe replay oracle.
+# Relocated at D2 from the dissolved daemon-vhc-coordinator into sdk/daemon-vhc-sdk-consensus's
+# `coordinator` module; this leaf e2e crate links it directly (same both-sides-link rationale as
+# the daemon-vhc-sdk entries above). Tracked in xtask vhc_dep_check.
+daemon-vhc-sdk-consensus = { workspace = true }
 daemon-vhc-observe = { workspace = true }
 ciborium = { workspace = true }
 blake3 = { workspace = true }

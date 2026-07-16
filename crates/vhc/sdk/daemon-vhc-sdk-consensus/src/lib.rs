@@ -11,15 +11,20 @@
 //! (`tests/assignment_golden.rs`) moved with it and still pin the LCG/shuffle output.
 //!
 //! Roadmap (architecture §7): D1 lands `Authority` (`SingleKey`, `ThresholdKeys`) and the
-//! `Committed<T>` mint here; D2 lands the coordinator drivers (`DeadlineQuorumCoordinator` …).
+//! `Committed<T>` mint here; **D2 lands the coordinator driver** ([`coordinator`]) — the pure
+//! `tick` state machine relocated from the dissolved host-side `daemon-vhc-coordinator` crate
+//! (refactor §8/D2), so one implementation serves the wasm `coordinator-quorum` guest, the native
+//! `vhc-sim` coordination, and the dual-compilation identity reference alike.
 //!
-//! wasm32-clean by construction: the only dependency is `daemon-vhc-proto` (wire types + blake3),
-//! so this crate compiles for guests and hosts alike — the "linked identically by worker drivers,
-//! coordinator drivers, simulator, and replay" property (architecture §8 authority table).
+//! wasm32-clean by construction: the dependencies are `daemon-vhc-proto` (wire types + blake3) and
+//! `serde` (derive, for the canonical-CBOR-serializable coordinator state), so this crate compiles
+//! for guests and hosts alike — the "linked identically by worker drivers, coordinator drivers,
+//! simulator, and replay" property (architecture §8 authority table).
 
 #![forbid(unsafe_code)]
 
 pub mod assignment;
+pub mod coordinator;
 
 pub use assignment::{
     advance_cursor, assign_batches, class_weight, deterministic_shuffle, elect_checkpointer,

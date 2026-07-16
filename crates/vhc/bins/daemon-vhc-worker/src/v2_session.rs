@@ -31,7 +31,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_coordinator::{tick, CoordinatorState, Input, Output};
 use daemon_vhc_host::v2::{
     replay_v2, start_run, MemorySink, ReplayEnd, ReplayScript, RunEnd, RunIdentity, SinkEntry,
     V2RunConfig,
@@ -42,6 +41,7 @@ use daemon_vhc_proto::{
     blake3_hash, digest_state, peer_id, to_canonical_vec, CapabilitySet, Envelope, IrohId, Seed,
     SignedMessage, SigningKey, SwarmMessage,
 };
+use daemon_vhc_sdk_consensus::coordinator::{tick, CoordinatorState, Input, Output};
 
 use crate::send;
 use daemon_provision::CutWriter;
@@ -246,7 +246,7 @@ pub(crate) async fn join_and_run_v2(
     let pump = run.pump.clone();
 
     // -- the native coordinator, in-process: the pure tick over the run's frozen envelope --------
-    let params = daemon_vhc_coordinator::CoordinatorParams {
+    let params = daemon_vhc_sdk_consensus::coordinator::CoordinatorParams {
         seq_len: u64::from(T2_SEQ_LEN),
         witness_target: 0,
         overlap_bps: 0,
@@ -254,8 +254,9 @@ pub(crate) async fn join_and_run_v2(
         verification_percent: 0,
         authorized: Vec::new(),
     };
-    let config_c = daemon_vhc_coordinator::RunConfig::from_envelope(envelope, params)
-        .map_err(|e| format!("coordinator config: {e}"))?;
+    let config_c =
+        daemon_vhc_sdk_consensus::coordinator::RunConfig::from_envelope(envelope, params)
+            .map_err(|e| format!("coordinator config: {e}"))?;
     let envelope_hash = config_c.envelope_hash;
     let mut state = CoordinatorState::new(config_c, Seed([0x33; 32]), 0);
     let mut now_s = 0u64;

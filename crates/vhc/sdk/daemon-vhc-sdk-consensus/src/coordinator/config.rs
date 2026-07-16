@@ -9,13 +9,13 @@
 //! [`crate::CoordinatorState`] and therefore canonical-CBOR-serializable (the replay foundation,
 //! PROTO-20).
 
+use crate::assignment::WITNESS_TARGET_DEFAULT;
 use daemon_vhc_proto::canonical::to_canonical_vec;
 use daemon_vhc_proto::envelope::{Envelope, GlobalBatch, StopCondition};
 use daemon_vhc_proto::{blake3_hash, CapabilitySet, Hash, PeerId, SwarmProtoVersion};
-use daemon_vhc_sdk_consensus::assignment::WITNESS_TARGET_DEFAULT;
 use serde::{Deserialize, Serialize};
 
-use crate::CoordinatorError;
+use crate::coordinator::CoordinatorError;
 
 /// Default K record-absences before a peer is dropped (§6.4 daemon Delta; TDD PROTO-7).
 pub const K_ABSENCES_DEFAULT: u32 = 3;

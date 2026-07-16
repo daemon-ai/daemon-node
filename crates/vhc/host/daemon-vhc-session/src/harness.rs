@@ -30,7 +30,6 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use daemon_vhc_coordinator::{CoordinatorParams, CoordinatorState, RunConfig};
 use daemon_vhc_net::{
     ControlPlane, FsPayloadStore, LoopbackGossip, PayloadStat, PayloadStore, SwarmNetError,
 };
@@ -44,6 +43,7 @@ use daemon_vhc_proto::{
     from_canonical_slice, peer_id, CapabilitySet, Hash, PeerId, Seed, SignedMessage, SigningKey,
     SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorParams, CoordinatorState, RunConfig};
 
 use crate::backend::{StateDigest, StubBackend, TrainerBackend};
 use crate::checkpoint::CheckpointManifest;

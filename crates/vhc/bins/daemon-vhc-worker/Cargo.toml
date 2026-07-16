@@ -26,9 +26,13 @@ daemon-vhc-abi = { workspace = true }
 daemon-vhc-host = { workspace = true }
 # The R↔E seam + the frozen node↔worker wire (`daemon_vhc_session::protocol`) this binary speaks.
 daemon-vhc-session = { workspace = true }
-# The pure native coordinator tick the v2 self-driven join drives in-process (the D3 cell-5/6
-# whole-run shape: v2 worker module × native coordinator × envelope v1).
-daemon-vhc-coordinator = { workspace = true }
+# The pure native coordinator `tick` the v2 self-driven join drives in-process (the D3 cell-5/6
+# whole-run shape: v2 worker module × native coordinator × envelope v1). Relocated at D2 from the
+# dissolved daemon-vhc-coordinator into sdk/daemon-vhc-sdk-consensus's `coordinator` module.
+# TRACKED dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/* — this is the
+# transitional cell-6 native-coordinator drive the D2 wasm coordinator (guests/coordinator-quorum)
+# retires; it goes when the worker bin's self-driven join re-seats onto the wasm coordinator.
+daemon-vhc-sdk-consensus = { workspace = true }
 # Envelope open/verify (`SignedEnvelope`) on the assess path.
 daemon-vhc-proto = { workspace = true }
 # The envelope artifact plane (`ArtifactResolver`, `file://` blake3-verified) the worker uses to

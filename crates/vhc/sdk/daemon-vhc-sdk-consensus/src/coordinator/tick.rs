@@ -9,6 +9,7 @@
 //! yields identical `(state', outputs)` — the replay-oracle foundation (I1, PROTO-20). The commit
 //! rule ([`crate::commit`]) consumes only signed evidence (I6).
 
+use crate::{global_batch_at, select_committee};
 use daemon_vhc_proto::envelope::StopCondition;
 use daemon_vhc_proto::messages::{
     Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RoundOpen, RoundRecord,
@@ -16,12 +17,11 @@ use daemon_vhc_proto::messages::{
 };
 use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{blake3_hash, commit_set, Hash, PeerId, Seed, SwarmProtoVersion};
-use daemon_vhc_sdk_consensus::{global_batch_at, select_committee};
 
-use crate::admission::{admit, JoinCandidate};
-use crate::commit::{all_committed, all_evidenced, committed_entries};
-use crate::io::{ControlAction, ControlRequest, Input, Notice, Output, Rejection};
-use crate::state::{ClientState, CoordinatorState, Member, Phase, RoundState};
+use crate::coordinator::admission::{admit, JoinCandidate};
+use crate::coordinator::commit::{all_committed, all_evidenced, committed_entries};
+use crate::coordinator::io::{ControlAction, ControlRequest, Input, Notice, Output, Rejection};
+use crate::coordinator::state::{ClientState, CoordinatorState, Member, Phase, RoundState};
 
 /// Advance the coordinator by one input. Pure: no I/O, no clock read, no signing.
 #[must_use]

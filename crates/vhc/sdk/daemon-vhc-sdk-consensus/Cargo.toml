@@ -24,6 +24,14 @@ path = "src/lib.rs"
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+# serde (derive) for the canonical-CBOR-serializable coordinator state — the replay-oracle and
+# dual-compilation foundation (relocated with the coordinator driver at D2). wasm32-clean.
+serde = { workspace = true }
+
+[dev-dependencies]
+# Integer-only property testing of `tick` determinism (relocated with the coordinator driver at
+# D2; TDD PROTO-16). Dev-only: does not affect the crate's wasm-clean normal-dependency surface.
+proptest = { workspace = true }
 
 [lints]
 workspace = true

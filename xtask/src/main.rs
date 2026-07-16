@@ -623,6 +623,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
              pipeline `session::data`) retires with the v1 pipeline at sunset [dev-dep]",
         ),
         (
+            "daemon-swarm-e2e",
+            "daemon-vhc-sdk-consensus",
+            "D2/E — the drills + wasm-profile oracle drive the coordinator `tick` (relocated here \
+             at D2) + observe oracle; retires with the v1 engine/harness at sunset [dev-dep]",
+        ),
+        (
             "daemon-vhc-safetensors",
             "daemon-vhc-sdk",
             "Phase E — safetensors is wired into the checkpoint path (state-dict layout) [dev-dep]",
@@ -638,28 +644,42 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "Phase C — TinyLlamaCfg in the moved worker-protocol test leaves the SDK for guests/ \
              [dev-dep] (split from daemon-vhc-host's identical exception at the A2 bin split)",
         ),
-        // --- D0: proto::assignment -> sdk/daemon-vhc-sdk-consensus (refactor §8/D0). The proto
-        // is algorithm-free from D0 (enforced below); its old host-side assignment consumers
-        // relink to the consensus SDK layer as explicit transitional edges, each retiring at D2.
-        (
-            "daemon-vhc-coordinator",
-            "daemon-vhc-sdk-consensus",
-            "D2 — the native coordinator dissolves at D2 into sdk-consensus + \
-             guests/coordinator-quorum; native coordination for tests moves to SDK-side vhc-sim \
-             (which links sdk-consensus legitimately) [normal]",
-        ),
+        // --- D0/D2: host/* -> sdk/daemon-vhc-sdk-consensus. The assignment math moved out of the
+        // proto at D0 (proto is algorithm-free, enforced below); the pure coordinator `tick`
+        // relocated here at D2 (the native daemon-vhc-coordinator crate DISSOLVED into
+        // sdk-consensus's `coordinator` module + guests/coordinator-quorum, refactor §8/D2). Each
+        // remaining host consumer of the SDK consensus layer is a tracked transitional edge with an
+        // honest retirement phase. (The old `daemon-vhc-coordinator -> sdk-consensus` self-edge is
+        // gone with the crate.)
         (
             "daemon-vhc-session",
             "daemon-vhc-sdk-consensus",
-            "D2 — the retained v1 RoundEngine's assignment consumption; reviewed/retired as D2 \
-             re-seats consumers (the engine itself retires with the v1 driver at the Phase-E \
-             sunset) [normal]",
+            "D2/E — the retained v1 RoundEngine's assignment consumption AND (relocated at D2) the \
+             coordinator `tick` the harness shell (local_coordinator) drives; both retire with the \
+             v1 driver at the Phase-E sunset [normal]",
         ),
         (
             "daemon-vhc-testkit",
             "daemon-vhc-sdk-consensus",
-            "D2 — the barrier harness re-derives worker windows natively; reviewed/retired as D2 \
-             re-seats consumers on the wasm coordinator [normal]",
+            "D2 — the barrier harness re-derives worker windows natively, drives the native \
+             coordinator in-process, AND runs the native `tick` as the dual-compilation identity \
+             reference the wasm coordinator-quorum guest is compared against; retires as the \
+             whole-run harness re-seats onto the wasm coordinator and the reference moves to \
+             SDK-side vhc-sim [normal]",
+        ),
+        (
+            "daemon-vhc-observe",
+            "daemon-vhc-sdk-consensus",
+            "D2 — the coordinator replay oracle re-runs the native `tick` (relocated here at D2); \
+             re-seats onto the wasm coordinator blob via the host runtime when the D2 \
+             consensus-replay verifier lands, retiring this edge [normal]",
+        ),
+        (
+            "daemon-vhc-worker",
+            "daemon-vhc-sdk-consensus",
+            "D2 — the transitional cell-6 native-coordinator self-driven join drives the native \
+             `tick` in-process (the shape the D2 wasm coordinator retires); goes when the worker \
+             bin re-seats onto the wasm coordinator [normal]",
         ),
     ];
 

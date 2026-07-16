@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // The flagship MVP scenario, compressed for CI: 3 in-process `WasmBackend` peers (real host training
-// over the tiny-llama `.wasm`) driven by the **real** `daemon_vhc_coordinator::tick` loop, one run
+// over the tiny-llama `.wasm`) driven by the **real** `daemon_vhc_sdk_consensus::coordinator::tick` loop, one run
 // per comm profile (sparse_loco / diloco / demo). Each round every peer trains H inner steps on its
 // own data slice, seals a payload, and ingests the record-ordered committed set; the coordinator
 // admits the roster, opens rounds, and finalizes each from the peers' signed commitments +
@@ -32,7 +32,6 @@ use std::sync::Once;
 use blake3::hash as blake3_hash_raw;
 use ciborium::into_writer;
 
-use daemon_vhc_coordinator::{tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig};
 use daemon_vhc_host::EngineConfig;
 use daemon_vhc_observe::{genesis_seed, replay};
 use daemon_vhc_proto::envelope::{
@@ -47,6 +46,9 @@ use daemon_vhc_proto::{
     SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
 use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_sdk_consensus::coordinator::{
+    tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
+};
 use daemon_vhc_session::backend::{
     BatchRef, StagedPayload, StateDigest as RunDigest, StepCtx, TrainerBackend,
 };

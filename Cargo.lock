@@ -4506,13 +4506,13 @@ dependencies = [
  "ciborium",
  "daemon-api",
  "daemon-egress",
- "daemon-vhc-coordinator",
  "daemon-vhc-host",
  "daemon-vhc-net",
  "daemon-vhc-node",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk",
+ "daemon-vhc-sdk-consensus",
  "daemon-vhc-sdk-rounds",
  "daemon-vhc-sdk-v2",
  "daemon-vhc-session",
@@ -4884,16 +4884,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daemon-vhc-coordinator"
-version = "0.0.1"
-dependencies = [
- "daemon-vhc-proto",
- "daemon-vhc-sdk-consensus",
- "proptest",
- "serde",
-]
-
-[[package]]
 name = "daemon-vhc-det"
 version = "0.0.1"
 
@@ -4979,8 +4969,8 @@ dependencies = [
  "ciborium",
  "crc32c",
  "daemon-vhc-abi",
- "daemon-vhc-coordinator",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
  "serde",
  "serde_bytes",
  "thiserror 2.0.18",
@@ -5039,6 +5029,8 @@ name = "daemon-vhc-sdk-consensus"
 version = "0.0.1"
 dependencies = [
  "daemon-vhc-proto",
+ "proptest",
+ "serde",
 ]
 
 [[package]]
@@ -5068,7 +5060,6 @@ dependencies = [
  "async-trait",
  "blake3",
  "ciborium",
- "daemon-vhc-coordinator",
  "daemon-vhc-host",
  "daemon-vhc-net",
  "daemon-vhc-observe",
@@ -5117,7 +5108,6 @@ dependencies = [
  "blake3",
  "ciborium",
  "daemon-vhc-abi",
- "daemon-vhc-coordinator",
  "daemon-vhc-host",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
@@ -5135,11 +5125,11 @@ dependencies = [
  "daemon-provision",
  "daemon-telemetry",
  "daemon-vhc-abi",
- "daemon-vhc-coordinator",
  "daemon-vhc-host",
  "daemon-vhc-net",
  "daemon-vhc-proto",
  "daemon-vhc-sdk",
+ "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
  "tokio",

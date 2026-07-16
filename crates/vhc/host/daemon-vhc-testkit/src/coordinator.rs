@@ -13,11 +13,13 @@
 
 use std::collections::VecDeque;
 
-use daemon_vhc_coordinator::{tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig};
 use daemon_vhc_proto::messages::{Join, ThroughputClass};
 use daemon_vhc_proto::{
     CapabilitySet, Envelope, Hash, IrohId, Seed, SignedMessage, SigningKey, SwarmMessage,
     SWARM_PROTO_VERSION,
+};
+use daemon_vhc_sdk_consensus::coordinator::{
+    tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
 };
 
 /// A native coordinator driven in-process from an envelope.

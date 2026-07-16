@@ -16,7 +16,7 @@ use daemon_vhc_proto::messages::{
 use daemon_vhc_proto::{IrohId, PeerId, Seed, StateDigest};
 use serde::{Deserialize, Serialize};
 
-use crate::config::RunConfig;
+use crate::coordinator::config::RunConfig;
 
 /// The fixed ring of stored rounds (Psyche `NUM_STORED_ROUNDS`, Appendix A.1) — absorbs out-of-order
 /// arrivals and the stall ladder (§6.2).

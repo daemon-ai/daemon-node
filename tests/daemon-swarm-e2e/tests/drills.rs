@@ -256,7 +256,7 @@ async fn desync_injection_detected_and_resynced() {
     // agreeing healthy peers pin the quorum digest and the corrupted peer is the sole outlier.
     // Via the coordinator's re-exported assignment seam (the math lives in
     // daemon-vhc-sdk-consensus from D0; the proto is algorithm-free).
-    let quorum = daemon_vhc_coordinator::witness_quorum(3);
+    let quorum = daemon_vhc_sdk_consensus::coordinator::witness_quorum(3);
     let verdict = run.desync_verdict(CORRUPT, quorum);
     assert!(
         verdict.is_desync(),

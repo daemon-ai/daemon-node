@@ -15,7 +15,7 @@ use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{PeerId, SwarmProtoVersion};
 use serde::{Deserialize, Serialize};
 
-use crate::state::Phase;
+use crate::coordinator::state::Phase;
 
 /// An operator control intent (pause/resume), signed by the requesting principal (§11.1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

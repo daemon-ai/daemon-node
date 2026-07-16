@@ -1,21 +1,27 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-vhc-coordinator` — the purified coordinator state machine (spec §6.2, §6.4, §11.2).
+//! The coordinator driver — the purified consensus state machine (architecture §4.1, §6/§7;
+//! refactor §8/D2).
 //!
-//! Wave 2 ships this as a **pure library**: the [`tick`] state machine plus its
-//! canonical-CBOR-serializable types. `tick(state, input) -> (state', outputs)` is I/O-free —
-//! time enters as [`Input::Clock`], signed evidence as [`Input::Message`], operator intents as
-//! [`Input::Control`] — so the same logic runs identically in a local server, a private node, and the
-//! cloud Durable Object (§11.2), is property-testable, and is the foundation of the offline replay
-//! oracle (I1, TDD PROTO-20). The deterministic per-round assignment it relies on lives in the
-//! wasm-clean [`daemon_vhc_sdk_consensus::assignment`] module (re-exported below; moved out of
-//! `daemon-vhc-proto` at D0 — refactor §8/D0).
+//! Relocated at **D2** from the dissolved host-side `daemon-vhc-coordinator` crate into the
+//! consensus SDK layer, its architectural home (architecture §7: `sdk/daemon-vhc-sdk-consensus`
+//! holds "the coordinator drivers"). The move is what lets **one** coordinator implementation be:
 //!
-//! The runnable local coordinator (axum/WS wiring, the tick loop over a real clock and transport)
-//! is Wave 3 — lane R owns `bins/`. This crate never performs I/O and never signs (see the ledger).
-
-#![forbid(unsafe_code)]
+//! - compiled to wasm32 in `guests/coordinator-quorum` (the launch coordinator module) — the guest
+//!   links this crate for both the assignment math (moved here at D0) and this `tick`;
+//! - run natively by `sdk/daemon-vhc-sim` for fast native-policy coordination in tests;
+//! - run natively as the **dual-compilation identity reference** the D2 wasm-coordinator gate
+//!   compares the guest against (refactor §8/D2 acceptance: "wasm `coordinator-quorum` vs native
+//!   `tick` on identical inputs").
+//!
+//! `tick(state, input) -> (state', outputs)` is a total, I/O-free function: time enters as
+//! [`Input::Clock`], signed evidence as [`Input::Message`], operator intents as [`Input::Control`].
+//! Identical `(state, input)` always yields identical `(state', outputs)` — the replay-oracle and
+//! dual-compilation foundation. It never signs and never touches the network: whose records count
+//! is an `Authority` question (D1, this crate) the harness/guest resolves above `tick`; today's
+//! implicit trust is the envelope-named coordinator identity (`SingleKey`), verified where a signed
+//! frame enters as [`Input::Message`].
 
 pub mod admission;
 pub mod commit;
@@ -38,13 +44,14 @@ pub use state::{
 pub use tick::tick;
 
 // Re-export the assignment seam so consumers get committee/batch math without a second import
-// (it is the consensus SDK layer's authority from D0; the coordinator does not fork it).
-pub use daemon_vhc_sdk_consensus::assignment::{
+// (it is this crate's own lower layer; the coordinator does not fork it). Preserves the ergonomics
+// of the dissolved `daemon-vhc-coordinator` crate's identical re-export.
+pub use crate::assignment::{
     assign_batches, deterministic_shuffle, elect_checkpointer, global_batch_at, seeded_lcg,
     select_committee, select_verifiers, witness_quorum, Committee, Lcg,
 };
 
-/// Errors surfaced by the coordinator library.
+/// Errors surfaced by the coordinator driver.
 ///
 /// Hand-rolled (no `thiserror`) to keep the crate lean + wasm-clean, matching the proto convention.
 #[derive(Debug, Clone, PartialEq, Eq)]

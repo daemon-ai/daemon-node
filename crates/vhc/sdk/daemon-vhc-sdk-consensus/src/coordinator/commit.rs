@@ -24,11 +24,11 @@
 
 use std::collections::BTreeMap;
 
+use crate::assignment::witness_quorum;
 use daemon_vhc_proto::messages::RecordEntry;
 use daemon_vhc_proto::{commit_set, Hash, PeerId, Root};
-use daemon_vhc_sdk_consensus::assignment::witness_quorum;
 
-use crate::state::{Member, RoundState};
+use crate::coordinator::state::{Member, RoundState};
 
 /// Whether availability evidence exists for `(peer, hash)` in this round (§6.4 I6).
 #[must_use]

@@ -27,8 +27,8 @@
 //! The initial [`CoordinatorState`] is journaled once as a **snapshot record** (tag 10, "verbatim
 //! accepted state-manifest bytes") — it is the state the replay restores from, exactly §10.2's role.
 
-use daemon_vhc_coordinator::{CoordinatorState, Input};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec};
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 
 use crate::capture::RunCapture;
 use crate::log::{MessageKind, MessageLog};
