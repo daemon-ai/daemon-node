@@ -51,12 +51,10 @@ blake3 = { workspace = true }
 # trees, so a segfault is a real failure mode). A runtime no-op unless the spawning node injected
 # a DSN + `DAEMON_CRASH_CONSENT=1`.
 daemon-telemetry = { workspace = true }
-# The SSRF-safe outbound HTTP client the `R2Store`/`HttpPresignClient` payload plane rides (A3
-# live attach). OPTIONAL — pulled in only by the `swarm-net` feature.
+# The SSRF-safe outbound HTTP client the module store-fetch path rides. OPTIONAL — pulled in only
+# by the `swarm-net` feature. (The `async-trait` optional dep that rode beside it for live.rs's
+# concrete `PayloadStore` impl retired with live.rs at the Phase-E sunset.)
 daemon-egress = { workspace = true, optional = true }
-# `#[async_trait]` for the worker's concrete `PayloadStore` impl (the R2/Fs store enum). OPTIONAL —
-# pulled in only by `swarm-net`.
-async-trait = { workspace = true, optional = true }
 
 # Per-backend lane selection: this bin crate FORWARDS its lanes into `daemon-vhc-host`, whose lib
 # code (`burn_backend.rs`/`runtime.rs`/`probe.rs`) is what the features actually gate — the
@@ -73,11 +71,15 @@ burn-ndarray = ["daemon-vhc-host/burn-ndarray"]
 wgpu = ["daemon-vhc-host/wgpu"]
 # burn with the CUDA backend (driver-API + NVRTC JIT at runtime) — the C2/P3 lane. Opt-in only.
 cuda = ["daemon-vhc-host/cuda"]
-# The A3 live coordinator attach: RoundEngine over DualPlane(WsControlPlane[, IrohGossip]) +
-# R2/Fs payload store. OFF the default gate so a default `cargo build`/`test`/`deny` never
-# compiles the WS/TLS/iroh/QUIC tree. (This feature lives wholly here post-split: the host lib
-# has no swarm-net-gated code — the attach is worker-binary plumbing.)
-swarm-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress", "dep:async-trait"]
+# The networked module-fetch lane: `resolve_run`'s payload-store fetch of network module URLs
+# (`r2://` / `https://` / `hf://`, presign via WS + egress). OFF the default gate so a default
+# `cargo build`/`test`/`deny` never compiles the WS/TLS/iroh/QUIC tree. (Originally the A3 live
+# coordinator attach — the RoundEngine-over-DualPlane consumer, live.rs, retired with the v1
+# driver at the Phase-E sunset; the store fetch path is what remains. Whether the
+# `daemon-vhc-net/iroh` edge is still warranted post-sunset is an open question — the surviving
+# fetch path is WS/presign-only, but the cross-built fat-worker packaging lane (flake.nix's
+# Windows worker) ships this feature set, so dropping the edge is a packaging decision.)
+swarm-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress"]
 
 [dev-dependencies]
 # tests/worker_protocol.rs (moved with the bin — `env!("CARGO_BIN_EXE_daemon-vhc-worker")` only
