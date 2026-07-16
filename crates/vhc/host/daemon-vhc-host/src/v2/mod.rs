@@ -26,8 +26,8 @@ pub mod replay;
 pub mod streams;
 
 pub use admission::{
-    admit_v2, AdmissionV2, DeviceProfile, FunnelRefusal, MemoryClaim, OwnerPolicy,
-    ParticipationLane, TierBytes,
+    admit_v2, AdmissionV2, DeviceProfile, EnvelopeRoleGrants, FunnelRefusal, MemoryClaim,
+    OwnerPolicy, ParticipationLane, TierBytes,
 };
 pub use buffer::BufferTable;
 pub use completion::{CompError, CompletionCodecError, CompletionResult, SuccessPayload};

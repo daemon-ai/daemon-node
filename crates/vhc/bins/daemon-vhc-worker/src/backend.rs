@@ -852,6 +852,10 @@ fn assess_v2(
         &device,
         &owner,
         device_min,
+        // No envelope-v2 role grants on this path yet: assess still arrives with the v1 signed
+        // envelope (the genesis-envelope join threads its RoleGrants here with the D0→D1
+        // native-coordinator adapter, mixed-fleet cell 6).
+        None,
     ) {
         Ok(admission) => Eligibility {
             eligible: true,
