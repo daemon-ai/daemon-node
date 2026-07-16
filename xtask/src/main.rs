@@ -683,11 +683,11 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         (
             "daemon-vhc-observe",
             "daemon-vhc-sdk-consensus",
-            "post-D1 — the coordinator oracle AND the D2 consensus-replay verifier re-run the \
-             native `tick` (legitimate for a third-party verifier: the dual-compilation gate \
-             proves native ≡ blob); the edge retires when the oracle machinery re-seats onto the \
-             blob via the host runtime, cleanest after D1's Authority swap lands in these same \
-             seams [normal]",
+            "reviewed at D2 sitting 3 and RETAINED — the coordinator oracle, the consensus-replay \
+             verifier, and the archive's Authority judgments (AuthorityConfig::authorize) all \
+             live here; re-running the native `tick` is legitimate third-party verification (no \
+             wasmtime needed; the dual-compilation gate proves native ≡ blob). Retires only if \
+             the oracle machinery ever re-seats onto the blob via the host runtime [normal]",
         ),
         (
             "daemon-vhc-worker",
