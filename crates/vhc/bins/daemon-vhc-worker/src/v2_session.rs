@@ -84,21 +84,62 @@ const T2_BATCH_SEQS: u32 = 1;
 /// Tokens per sequence — the corpus's `seq_len` and the guest model's (`TinyLlamaCfg.seq_len`).
 const T2_SEQ_LEN: u32 = 9;
 
-/// Build the t2 run's corpus: deterministic small-vocab shards assembled into the **same
-/// `Corpus` the live fetch path yields** (`live.rs::build_corpus` — manifest + shards fetched by
-/// hash, blake3-verified, windowed). The in-process t2 run has no store to fetch from, so it
-/// assembles the fetch path's product deterministically; `Corpus::from_parts` re-runs the same
-/// per-shard integrity verification a fetch would.
+/// Decode a 64-char lowercase-hex blake3 digest.
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The t2 run's **artifact store** — the one fetch path (B2 tier-d unification). Every corpus
+/// byte the session stages AND every guest `data@2::fetch` is answered from here, through
+/// [`T2Artifacts::fetch`]'s single fetch-and-verify discipline: content addressed by the
+/// committed blake3, verified on every read (exactly what `live.rs::fetch_cached` + the
+/// resolver do against a real store — this is the in-process seat of the same mechanism, not a
+/// second path).
+struct T2Artifacts {
+    by_hash: std::collections::HashMap<[u8; 32], Vec<u8>>,
+}
+
+impl T2Artifacts {
+    /// Fetch-and-verify one committed artifact (the whole-artifact rule the `data@2` pump also
+    /// enforces — a store lie is a typed error, never silent bytes).
+    fn fetch(&self, hash: &[u8; 32]) -> Result<Vec<u8>, String> {
+        let bytes = self
+            .by_hash
+            .get(hash)
+            .ok_or_else(|| "artifact not in the t2 store".to_string())?;
+        if blake3::hash(bytes).as_bytes() != hash {
+            return Err("t2 store content does not hash to the committed value".into());
+        }
+        Ok(bytes.clone())
+    }
+
+    /// The committed hash set — the run's artifact grants (`V2RunConfig::granted_artifacts`).
+    fn granted(&self) -> std::collections::BTreeSet<[u8; 32]> {
+        self.by_hash.keys().copied().collect()
+    }
+}
+
+/// Build the t2 run's corpus artifacts: deterministic small-vocab shards + their manifest, as
+/// content-addressed blobs — the in-process stand-in for the envelope's artifact map (the live
+/// path fetches the same shapes by hash through `live.rs::build_corpus`). Returns the store and
+/// the manifest's committed hash.
 ///
 /// Tokens are embedding indices, so the vocabulary is strictly below the guest model's
 /// (`TinyLlamaCfg::default().vocab` = 64).
-fn t2_corpus() -> Result<daemon_vhc_session::data::Corpus, String> {
+fn t2_corpus_artifacts() -> Result<(T2Artifacts, [u8; 32]), String> {
     use daemon_vhc_session::data::{Manifest, ShardDesc, TokenWidth};
     const SHARDS: u64 = 2;
     const TOKENS_PER_SHARD: u64 = 2 * T2_SEQ_LEN as u64; // two sequences per shard
     const VOCAB: u64 = 64;
     let mut shards = Vec::new();
-    let mut blobs = Vec::new();
+    let mut by_hash = std::collections::HashMap::new();
     for i in 0..SHARDS {
         let mut bytes = Vec::with_capacity(TOKENS_PER_SHARD as usize * 2);
         let mut s = 0xDAE0_7E57u64 ^ i;
@@ -114,7 +155,7 @@ fn t2_corpus() -> Result<daemon_vhc_session::data::Corpus, String> {
             tokens: TOKENS_PER_SHARD,
             blake3: blake3_hash(&bytes).to_hex(),
         });
-        blobs.push(bytes);
+        by_hash.insert(*blake3::hash(&bytes).as_bytes(), bytes);
     }
     let manifest = Manifest {
         token_width: TokenWidth::U16,
@@ -125,6 +166,34 @@ fn t2_corpus() -> Result<daemon_vhc_session::data::Corpus, String> {
         dataset: None,
         dataset_revision: None,
     };
+    let manifest_bytes = manifest
+        .to_json()
+        .map_err(|e| format!("manifest json: {e}"))?
+        .into_bytes();
+    let manifest_hash = *blake3::hash(&manifest_bytes).as_bytes();
+    by_hash.insert(manifest_hash, manifest_bytes);
+    Ok((T2Artifacts { by_hash }, manifest_hash))
+}
+
+/// Assemble the staging corpus **through the artifact store** (the one fetch path): fetch the
+/// manifest by its committed hash, parse it, fetch every shard by its committed hash, and let
+/// `Corpus::from_parts` re-run the per-shard integrity verification — byte-for-byte the
+/// `build_corpus` shape over the unified store.
+fn t2_corpus_via_store(
+    store: &T2Artifacts,
+    manifest_hash: &[u8; 32],
+) -> Result<daemon_vhc_session::data::Corpus, String> {
+    let manifest_bytes = store.fetch(manifest_hash)?;
+    let manifest = daemon_vhc_session::data::Manifest::from_json(
+        std::str::from_utf8(&manifest_bytes).map_err(|e| format!("manifest utf8: {e}"))?,
+    )
+    .map_err(|e| format!("parse manifest: {e}"))?;
+    let mut blobs = Vec::with_capacity(manifest.shards.len());
+    for desc in &manifest.shards {
+        let hash = hex32(&desc.blake3)
+            .ok_or_else(|| format!("shard hash `{}` is not 64 hex chars", desc.blake3))?;
+        blobs.push(store.fetch(&hash)?);
+    }
     daemon_vhc_session::data::Corpus::from_parts(manifest, blobs)
         .map_err(|e| format!("t2 corpus: {e}"))
 }
@@ -165,7 +234,12 @@ pub(crate) async fn join_and_run_v2(
         instance: 1,
         module: module_hash,
     };
-    let run_cfg = V2RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
+    // The t2 artifact store: ONE fetch path (B2) — the session's staging reads and any guest
+    // data@2::fetch are both answered through T2Artifacts::fetch; the run's artifact grants are
+    // exactly the store's committed hashes (which artifacts a module may touch is a grant).
+    let (artifacts, manifest_hash) = t2_corpus_artifacts()?;
+    let mut run_cfg = V2RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
+    run_cfg.granted_artifacts = artifacts.granted();
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, module, run_cfg, Box::new(sink.clone()))
         .map_err(|e| format!("v2 start_run: {e}"))?;
@@ -229,8 +303,8 @@ pub(crate) async fn join_and_run_v2(
     )
     .await;
 
-    // The corpus the staging path reads (the fetch-path product — see `t2_corpus`).
-    let corpus = t2_corpus()?;
+    // The corpus the staging path reads — assembled THROUGH the artifact store (one fetch path).
+    let corpus = t2_corpus_via_store(&artifacts, &manifest_hash)?;
     let mut rounds_done = 0u64;
     let mut last_round = 0u64;
     // Sealed bytes captured while servicing the guest's payload_put ops (the async-runtime seat).
@@ -287,8 +361,12 @@ pub(crate) async fn join_and_run_v2(
                 // Commitment over the completion hash: per round, one Commitment then one
                 // Digest — so after round r's open, publishes reach 2r + 1. This session is the
                 // async-runtime seat: it services the put, capturing the sealed bytes.
-                let published =
-                    wait_publishes_servicing(&pump, (rounds_done as usize) * 2 + 1, &mut puts)?;
+                let published = wait_publishes_servicing(
+                    &pump,
+                    (rounds_done as usize) * 2 + 1,
+                    &mut puts,
+                    &artifacts,
+                )?;
                 let sealed = puts
                     .last()
                     .cloned()
@@ -346,7 +424,12 @@ pub(crate) async fn join_and_run_v2(
             SwarmMessage::RoundRecord(_) => {
                 deliver_coordinator_msg(&pump, &coord_key, &msg)?;
                 // The guest ingests and voices its round digest: publishes reach 2(r + 1).
-                wait_publishes_servicing(&pump, (rounds_done as usize) * 2 + 2, &mut puts)?;
+                wait_publishes_servicing(
+                    &pump,
+                    (rounds_done as usize) * 2 + 2,
+                    &mut puts,
+                    &artifacts,
+                )?;
                 rounds_done += 1;
             }
             _ => { /* Digest/witness chatter — not part of the Phase-A closed drive */ }
@@ -459,13 +542,15 @@ fn next_coord_seq() -> u64 {
 }
 
 /// Wait (bounded) until the pump has published at least `target` frames in total, servicing the
-/// guest's `payload_put` ops meanwhile (the async-runtime seat): the pump computes the completion
-/// hash over the op's own sealed bytes; this session captures them into `puts` — the bytes the
-/// barrier will stage, and the bytes the guest's commitment evidence must hash.
+/// guest's ops meanwhile (the async-runtime seat): `payload_put`s' sealed bytes are captured
+/// into `puts` (the barrier's staging + commitment-evidence input), and `data.fetch`s are
+/// answered from the run's artifact store — the SAME `T2Artifacts::fetch` the session's own
+/// corpus staging reads through (one fetch path; the pump re-verifies + range-slices).
 fn wait_publishes_servicing(
     pump: &daemon_vhc_host::v2::PumpHandle,
     target: usize,
     puts: &mut Vec<Vec<u8>>,
+    artifacts: &T2Artifacts,
 ) -> Result<Vec<(u64, u64, Vec<u8>)>, String> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -475,6 +560,24 @@ fn wait_publishes_servicing(
                     puts.push(bytes.to_vec());
                     pump.complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
                         .map_err(|e| format!("put completion: {e}"))?;
+                }
+                daemon_vhc_host::v2::OpRequest::ArtifactFetch { hash, .. } => {
+                    // The unified fetch path: the same store + verification discipline the
+                    // staging corpus was assembled through (the range is the pump's job).
+                    match artifacts.fetch(&hash) {
+                        Ok(artifact) => pump
+                            .complete_op(op, daemon_vhc_host::v2::OpOutcome::FetchDone { artifact })
+                            .map_err(|e| format!("fetch completion: {e}"))?,
+                        Err(detail) => pump
+                            .complete_op(
+                                op,
+                                daemon_vhc_host::v2::OpOutcome::Failed {
+                                    code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                                    detail,
+                                },
+                            )
+                            .map_err(|e| format!("fetch failure completion: {e}"))?,
+                    }
                 }
                 other => return Err(format!("unexpected op request from the guest: {other:?}")),
             }
