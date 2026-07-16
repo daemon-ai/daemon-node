@@ -104,9 +104,14 @@ impl V2Module for Coordinator {
     fn init(config: &[u8], _grants: &[u8]) -> Result<Self, u32> {
         // A malformed config is a module-defined init refusal (§9.4 step 11, detail >= 16).
         let init: CoordinatorInit = from_canonical_slice(config).map_err(|_| 16u32)?;
+        // Resume the synthetic clock from the restored state's clock (0 for a fresh run): a
+        // standby coordinator reconstructed from the archive + journal (refactor §8/D2 failover)
+        // continues the SAME logical timeline, so its decisions (e.g. `RoundOpen.deadline_unix_s`,
+        // a function of `state.now_s`) are byte-identical to an uninterrupted run's.
+        let now_s = init.state.now_s;
         Ok(Coordinator {
             state: init.state,
-            now_s: 0,
+            now_s,
             tick_period_ms: init.tick_period_ms,
             control_channel: init.control_channel,
         })

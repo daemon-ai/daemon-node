@@ -38,6 +38,8 @@ daemon-vhc-proto = { workspace = true }
 daemon-vhc-sdk-consensus = { workspace = true }
 blake3 = { workspace = true }
 ciborium = { workspace = true }
+# Typed harness errors (the D2 wasm-coordinator configuration seat's matrix refusals).
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

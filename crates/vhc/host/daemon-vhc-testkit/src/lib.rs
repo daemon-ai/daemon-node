@@ -26,15 +26,22 @@
 //! blob (timers + publish, no coordinator) — deterministic, journaled, replay-verified.
 
 pub mod barrier;
+pub mod cell8;
 pub mod coordinator;
 pub mod run;
+pub mod wasm_coordinator;
 
 pub use barrier::{
     barrier_whole_run, BarrierRunReport, BarrierSpec, FaultAction, FaultPlan, FaultRule, FrameKind,
     WorkerReport,
 };
+pub use cell8::{cell8_genesis, cell8_whole_run, Cell8Report, Cell8Spec, Cell8WorkerReport};
 pub use coordinator::NativeCoordinator;
 pub use run::{whole_run, ReplayReport, RunSpec, WholeRunReport};
+pub use wasm_coordinator::{
+    configure_wasm_coordinator, refuse_unconfigurable_envelope, WasmCoordError, WasmCoordinator,
+    WasmCoordinatorSpec,
+};
 
 use daemon_vhc_host::{EngineConfig, Worker};
 

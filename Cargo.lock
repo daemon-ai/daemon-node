@@ -5111,6 +5111,7 @@ dependencies = [
  "daemon-vhc-host",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
