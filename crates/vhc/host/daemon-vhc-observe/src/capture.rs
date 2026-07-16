@@ -19,8 +19,8 @@
 
 use std::io::{Read, Write};
 
-use daemon_vhc_coordinator::{CoordinatorState, Input};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec};
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 
 use crate::ObserveError;
 

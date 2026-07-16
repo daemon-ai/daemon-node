@@ -36,7 +36,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon_vhc_coordinator::CoordinatorState;
 use daemon_vhc_net::{
     DownloadScheduler, FsPayloadStore, IrohGossip, IrohGossipConfig, IrohPeer, RebroadcastConfig,
     RetryConfig,
@@ -47,6 +46,7 @@ use daemon_vhc_proto::{
     from_canonical_slice, peer_id, PeerId, SignedMessage, SigningKey, SwarmMessage,
     SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
+use daemon_vhc_sdk_consensus::coordinator::CoordinatorState;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 

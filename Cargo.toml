@@ -464,7 +464,10 @@ daemon-vhc-sdk-profiles = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk
 daemon-vhc-sim = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sim" }
 daemon-vhc-net = { version = "0", path = "crates/vhc/host/daemon-vhc-net" }
 daemon-vhc-session = { version = "0", path = "crates/vhc/host/daemon-vhc-session" }
-daemon-vhc-coordinator = { version = "0", path = "crates/vhc/host/daemon-vhc-coordinator" }
+# daemon-vhc-coordinator DISSOLVED at D2 (refactor §8/D2): the pure `tick` state machine relocated
+# into sdk/daemon-vhc-sdk-consensus (its `coordinator` module — the architectural home, §7) so one
+# implementation serves the wasm coordinator-quorum guest, native vhc-sim coordination, and the
+# dual-compilation identity reference; the production coordinator is now the wasm guest.
 daemon-vhc-observe = { version = "0", path = "crates/vhc/host/daemon-vhc-observe" }
 # The node-side swarm-training service (resident `SwarmService` + worker supervisor), bound at boot
 # when `[swarm] enabled = true` (B3, spec §10.4). Promoted to the workspace table at Merge 3 (matches

@@ -10,7 +10,7 @@
 //! * [`MessageLog`] — an append-only, replayable log of [`SignedMessage`](daemon_vhc_proto::messages::SignedMessage)
 //!   in arrival order, canonical-CBOR framed, indexed by `(round, kind)`. Writer + reader.
 //! * [`replay`] — the replay oracle (PROTO-20 as a library): re-run
-//!   [`daemon_vhc_coordinator::tick`] from genesis over a recorded `Input` trace and verify the
+//!   [`daemon_vhc_sdk_consensus::coordinator::tick`] from genesis over a recorded `Input` trace and verify the
 //!   recorded [`RoundRecord`](daemon_vhc_proto::messages::RoundRecord)s match the pure function's —
 //!   the "anyone can re-derive the coordinator" property, with the first divergence pinpointed.
 //! * [`digest_tally`] / [`DesyncVerdict`] — fold `Digest` messages per round into a quorum digest +
@@ -36,7 +36,11 @@ pub use capture::RunCapture;
 pub use desync::{digest_tally, DesyncVerdict};
 pub use health::{RoundHealth, RunHealth};
 pub use journal::{
-    Body, ExecIdentity, Journal, JournalError, JournalPaths, Record, RotatePolicy, SidecarError,
+    detect_fork, extract_consensus_capture, recover_chain_from_archive,
+    replay_consensus_from_archive, ArchiveError, AttestedHead, Body, ChainHead, ConsensusCapture,
+    ConsensusReplayError, ConsensusReplayReport, ExecIdentity, ForkEvidence, Journal, JournalError,
+    JournalPaths, Record, RecordArchive, RecoveredChain, ReplicationPolicy, RetentionPolicy,
+    RotatePolicy, SidecarError,
 };
 pub use log::{MessageKind, MessageLog};
 pub use replay::{

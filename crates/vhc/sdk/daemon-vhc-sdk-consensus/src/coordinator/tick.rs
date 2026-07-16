@@ -9,6 +9,7 @@
 //! yields identical `(state', outputs)` — the replay-oracle foundation (I1, PROTO-20). The commit
 //! rule ([`crate::commit`]) consumes only signed evidence (I6).
 
+use crate::{global_batch_at, select_committee};
 use daemon_vhc_proto::envelope::StopCondition;
 use daemon_vhc_proto::messages::{
     Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RoundOpen, RoundRecord,
@@ -16,12 +17,12 @@ use daemon_vhc_proto::messages::{
 };
 use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{blake3_hash, commit_set, Hash, PeerId, Seed, SwarmProtoVersion};
-use daemon_vhc_sdk_consensus::{global_batch_at, select_committee};
 
-use crate::admission::{admit, JoinCandidate};
-use crate::commit::{all_committed, all_evidenced, committed_entries};
-use crate::io::{ControlAction, ControlRequest, Input, Notice, Output, Rejection};
-use crate::state::{ClientState, CoordinatorState, Member, Phase, RoundState};
+use crate::authority::Authorized;
+use crate::coordinator::admission::{admit, JoinCandidate};
+use crate::coordinator::commit::{all_committed, all_evidenced, committed_entries};
+use crate::coordinator::io::{ControlAction, ControlRequest, Input, Notice, Output, Rejection};
+use crate::coordinator::state::{ClientState, CoordinatorState, Member, Phase, RoundState};
 
 /// Advance the coordinator by one input. Pure: no I/O, no clock read, no signing.
 #[must_use]
@@ -31,6 +32,48 @@ pub fn tick(mut state: CoordinatorState, input: Input) -> (CoordinatorState, Vec
         Input::Clock(now) => on_clock(&mut state, &mut out, now),
         Input::Message(sm) => on_message(&mut state, &mut out, sm),
         Input::Control(req) => on_control(&mut state, &mut out, req),
+    }
+    (state, out)
+}
+
+/// Advance the coordinator by a message whose delivery authority is attested by D1's
+/// [`Authorized`] token — the reconciled D2 seam (formerly the pre-D1 `SingleKey` stub).
+///
+/// Rationale (architecture §4.2/§4.3): the wasm `coordinator-quorum` guest receives worker
+/// messages as **host-verified** `Frame` events — the host authenticated the §12 signed-frame
+/// envelope above the sandbox on a **declared authoritative channel** and delivers only the
+/// opaque payload + the (authenticated) sender, never a re-checkable ed25519 signature. That is
+/// exactly the provenance [`Authorized::from_authoritative_channel`] encodes (D1's host-delivery
+/// bridge path); the in-guest signature path obtains the same token from `Authority::authorize`.
+/// Either way, the caller cannot reach the dispatch below without having gone through D1's
+/// authority vocabulary — the trust decision lives in the token's mint, not here.
+///
+/// The decision logic is **identical** to [`tick`]'s message path after signature verification
+/// (both funnel through the private `dispatch_payload`), so a native reference fed validly-signed
+/// frames and this guest fed the same host-authenticated payloads produce byte-identical outputs —
+/// the dual-compilation identity property (refactor §8/D2 acceptance). The token itself carries no
+/// decision-relevant data (the channel is delivery provenance), so it cannot perturb identity.
+#[must_use]
+pub fn tick_authenticated(
+    mut state: CoordinatorState,
+    signer: PeerId,
+    version: SwarmProtoVersion,
+    payload: SwarmMessage,
+    authorized: Authorized,
+) -> (CoordinatorState, Vec<Output>) {
+    // The token is the proof-of-provenance; its channel is not a dispatch input (delivery routing
+    // is host mechanism, ABI §6.2). Consume it explicitly so the requirement is visible.
+    let _ = authorized.channel();
+    let mut out = Vec::new();
+    if version != state.config.proto_version {
+        out.push(Output::Reject(Rejection::VersionMismatch {
+            expected: state.config.proto_version,
+            got: version,
+        }));
+    } else if state.phase.is_halted() {
+        out.push(Output::Reject(Rejection::Halted(state.phase)));
+    } else {
+        dispatch_payload(&mut state, &mut out, signer, version, payload);
     }
     (state, out)
 }
@@ -108,9 +151,21 @@ fn on_message(state: &mut CoordinatorState, out: &mut Vec<Output>, sm: SignedMes
         out.push(Output::Reject(Rejection::Halted(state.phase)));
         return;
     }
-    let signer = sm.signer;
-    let version = sm.version;
-    match sm.payload {
+    dispatch_payload(state, out, sm.signer, sm.version, sm.payload);
+}
+
+/// Dispatch an authenticated, phase-legal message to its per-type handler (the shared tail of the
+/// [`tick`] `Input::Message` path and the [`tick_authenticated`] seam). Both callers have already
+/// established version match, signature/authenticity, and non-halted phase — this is the pure
+/// decision logic, so the two entry paths make byte-identical decisions on identical payloads.
+fn dispatch_payload(
+    state: &mut CoordinatorState,
+    out: &mut Vec<Output>,
+    signer: PeerId,
+    version: SwarmProtoVersion,
+    payload: SwarmMessage,
+) {
+    match payload {
         SwarmMessage::Join(j) => on_join(state, out, signer, version, j),
         SwarmMessage::Commitment(c) => on_commitment(state, out, signer, c),
         SwarmMessage::Attestation(a) => on_attestation(state, out, signer, a),

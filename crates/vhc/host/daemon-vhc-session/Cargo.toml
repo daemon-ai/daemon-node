@@ -30,7 +30,7 @@ required-features = ["harness"]
 # RoundOpen/RoundRecord outputs and feeds it signed peer messages + StorageReceipt evidence + scripted
 # Clock inputs) to external crates. Kept out of the default build; the `tests/daemon-swarm-e2e` crate
 # enables it. The crate's own unit tests reach the harness via `cfg(test)` (no feature needed).
-harness = ["dep:daemon-vhc-coordinator", "dep:daemon-vhc-observe"]
+harness = ["dep:daemon-vhc-observe"]
 # `iroh` adds the live-transport harness (`live_harness`): the round engine over a real per-node
 # `IrohGossip` mesh + a shared `FsPayloadStore`. It layers on `harness` (the coordinator shell) and
 # turns on `daemon-vhc-net`'s off-default `iroh` feature. Kept out of the default build; the
@@ -39,10 +39,12 @@ iroh = ["harness", "daemon-vhc-net/iroh"]
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
-# Assignment math moved from the proto to the consensus SDK layer at D0 (refactor §8/D0); the
-# retained v1 RoundEngine consumes it here. TRACKED dependency-direction exception (xtask
-# vhc_dep_check): host/* -> sdk/* is transitional and is reviewed/retired as D2 re-seats the
-# engine's consumers (the engine itself retires with the v1 driver at the Phase-E sunset).
+# The consensus SDK layer: assignment math (moved from the proto at D0, consumed by the retained v1
+# RoundEngine) AND — relocated at D2 from the dissolved daemon-vhc-coordinator — the pure coordinator
+# `tick` state machine (its `coordinator` module) the harness shell (`local_coordinator`) signs,
+# publishes, and feeds. TRACKED dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/*
+# is transitional and is reviewed/retired as D2 re-seats the engine's consumers (the engine itself,
+# and the harness shell, retire with the v1 driver at the Phase-E sunset).
 daemon-vhc-sdk-consensus = { workspace = true }
 daemon-vhc-net = { workspace = true }
 # The A2 dependency INVERSION (refactor §5 A2; architecture §7: SESS → HOSTC): the session links
@@ -50,10 +52,6 @@ daemon-vhc-net = { workspace = true }
 # xtask's vhc_dep_check enforces the direction). `wasm_backend.rs` (the TrainerBackend seam over
 # the wasm host) moved here with the inversion.
 daemon-vhc-host = { workspace = true }
-# The pure coordinator `tick` state machine — driven by the Merge-2 harness shell (feature-gated, so
-# it stays out of the default participant-runtime build). Not a root Cargo.toml change: the path dep
-# is already declared in the frozen `[workspace.dependencies]`.
-daemon-vhc-coordinator = { workspace = true, optional = true }
 # Observe drives the desync verdict (digest tally / `DesyncVerdict`, §9) the harness + checkpoint
 # resync trigger consume. Node-side std tool, `harness`-gated so it stays off the default
 # participant build. Path dep already in the frozen root `[workspace.dependencies]` (no root edit),
@@ -78,10 +76,6 @@ blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
 
 [dev-dependencies]
-# The crate's own `cfg(test)` harness tests exercise the real coordinator `tick` loop (the same code
-# external crates reach behind `feature = "harness"`), so the coordinator must be available for tests
-# even with the feature off.
-daemon-vhc-coordinator = { workspace = true }
 # Same as the coordinator: the `cfg(test)` harness build uses observe's `digest_tally` / `DesyncVerdict`
 # (the desync trigger) even with the `harness` feature off.
 daemon-vhc-observe = { workspace = true }

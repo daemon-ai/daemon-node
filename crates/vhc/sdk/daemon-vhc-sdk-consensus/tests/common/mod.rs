@@ -16,7 +16,7 @@ use daemon_vhc_proto::{
     SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
 
-use daemon_vhc_coordinator::{
+use daemon_vhc_sdk_consensus::coordinator::{
     ControlAction, ControlRequest, CoordinatorState, Input, Output, Phase, RunConfig,
 };
 
@@ -197,7 +197,7 @@ pub fn control(k: &SigningKey, action: ControlAction) -> Signed<ControlRequest> 
 pub fn drive(mut state: CoordinatorState, inputs: Vec<Input>) -> (CoordinatorState, Vec<Output>) {
     let mut last = Vec::new();
     for inp in inputs {
-        let (s, o) = daemon_vhc_coordinator::tick(state, inp);
+        let (s, o) = daemon_vhc_sdk_consensus::coordinator::tick(state, inp);
         state = s;
         last = o;
     }
@@ -208,14 +208,15 @@ pub fn drive(mut state: CoordinatorState, inputs: Vec<Input>) -> (CoordinatorSta
 pub fn to_first_round(config: RunConfig, keys: &[SigningKey]) -> CoordinatorState {
     let mut state = new_state(config);
     for k in keys {
-        let (s, _) = daemon_vhc_coordinator::tick(state, Input::Message(join_msg(k)));
+        let (s, _) =
+            daemon_vhc_sdk_consensus::coordinator::tick(state, Input::Message(join_msg(k)));
         state = s;
     }
     // enter Warmup
-    let (s, _) = daemon_vhc_coordinator::tick(state, Input::Clock(1));
+    let (s, _) = daemon_vhc_sdk_consensus::coordinator::tick(state, Input::Clock(1));
     state = s;
     // exit Warmup -> RoundTrain (warmup_s = 10)
-    let (s, _) = daemon_vhc_coordinator::tick(state, Input::Clock(20));
+    let (s, _) = daemon_vhc_sdk_consensus::coordinator::tick(state, Input::Clock(20));
     state = s;
     assert_eq!(state.phase, Phase::RoundTrain, "expected RoundTrain");
     state

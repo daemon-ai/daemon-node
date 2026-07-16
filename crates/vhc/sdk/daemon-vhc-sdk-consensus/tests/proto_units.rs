@@ -12,9 +12,11 @@
 mod common;
 
 use common::*;
-use daemon_vhc_coordinator::elect_checkpointer;
-use daemon_vhc_coordinator::{tick, ClientState, CoordinatorState, Input, Notice, Output, Phase};
 use daemon_vhc_proto::{peer_id, PeerId, Seed};
+use daemon_vhc_sdk_consensus::coordinator::elect_checkpointer;
+use daemon_vhc_sdk_consensus::coordinator::{
+    tick, ClientState, CoordinatorState, Input, Notice, Output, Phase,
+};
 
 /// Drive round `round` to finalize: `committers` commit + are storage-receipted. If the committed
 /// set is the full healthy roster the receipt fast-path finalizes immediately; otherwise (silent

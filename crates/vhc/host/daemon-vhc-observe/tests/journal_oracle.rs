@@ -27,7 +27,9 @@ use daemon_vhc_proto::{
     peer_id, CapabilitySet, Hash, IrohId, PeerId, SigningKey, SWARM_PROTO_VERSION,
 };
 
-use daemon_vhc_coordinator::{tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig};
+use daemon_vhc_sdk_consensus::coordinator::{
+    tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
+};
 
 use daemon_vhc_observe::journal::oracle::{record_capture, replay_over_journal};
 use daemon_vhc_observe::journal::record::ExecIdentity;

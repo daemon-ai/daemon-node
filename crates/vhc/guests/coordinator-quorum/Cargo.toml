@@ -1,0 +1,34 @@
+[package]
+name = "coordinator-quorum"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The launch COORDINATOR module (architecture §4.1, §7; refactor §8/D2): consensus is a wasm
+# module, not a native host service. A deterministic reactive state machine over signed control
+# frames + a logical clock — membership/admission, round pacing, the commit rule, and epoch
+# advance — authored against the same major-2 event loop as a worker and run by the same
+# `daemon-vhc-worker` binary. It is the wasm twin of the (now dissolved) native coordinator: its
+# body is `daemon_vhc_sdk_consensus::coordinator::tick`, the SAME code the native dual-compilation
+# reference runs, so wasm ≡ native decisions is a byte-for-byte identity gate (refactor §8/D2).
+#
+# It links `daemon-vhc-sdk-consensus` (the legitimate SDK-side seam: the assignment math moved
+# there at D0 + the relocated coordinator driver at D2) and needs NO `compute@` world — its grants
+# are frames, timers, and (Phase D) the record archive (architecture §4.1).
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The major-2 event loop: `main!` exports, the `V2Module` trait, and the raw `vhc@2`/`net@2`/`sys@2`
+# bindings (next_event / publish / set_timer — the Phase-A closed subset, ABI §6.1).
+daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
+# The coordinator driver (`tick` / `tick_authenticated`) + its serde-CBOR state, plus the shared
+# assignment math. wasm32-clean by construction (proto + serde only).
+daemon-vhc-sdk-consensus = { path = "../../sdk/daemon-vhc-sdk-consensus" }
+# The wire contract: SwarmMessage / SignedMessage payloads, PeerId, canonical CBOR codec.
+daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }
+# The shared ABI vocabulary: the event tags (EV_TAG_FRAME/TIMER/STOP/QUIESCE) the loop dispatches on.
+daemon-vhc-abi = { path = "../../contracts/daemon-vhc-abi" }
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }

@@ -48,6 +48,7 @@
 //!   choreography sitting); this driver journals the original signed frame it is handed (§8.6).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -471,6 +472,11 @@ struct PumpShared {
     wake: Condvar,
     /// Logical time zero = pump creation (≈ run join / journal open, §6.5).
     t0: Instant,
+    /// Rig-controlled delivery hold (D2 back-pressure prerequisite; module docs on
+    /// [`PumpHandle::hold`]). When set, the guest thread parks inside `next_event` and NO event is
+    /// delivered — so the embedder can fill the authoritative spool to `SpoolFull`/`SenderQuota`
+    /// deterministically, which a live guest (draining as fast as frames arrive) cannot force.
+    hold: AtomicBool,
 }
 
 impl PumpShared {
@@ -488,6 +494,21 @@ pub struct PumpHandle {
 }
 
 impl PumpHandle {
+    /// Freeze event delivery to the guest (the D2 rig back-pressure control). While held, the guest
+    /// thread parks inside `next_event` and no Frame/PayloadReady/Timer/… is delivered, so the
+    /// embedder can `deliver_frame` past the authoritative spool bound and observe the typed
+    /// [`DeliverVerdict::SpoolFull`] / [`DeliverVerdict::SenderQuota`] back-pressure deterministically
+    /// (a live guest drains too fast to force it). Idempotent; pair with [`PumpHandle::release`].
+    pub fn hold(&self) {
+        self.shared.hold.store(true, Ordering::Relaxed);
+    }
+
+    /// Release a [`PumpHandle::hold`] and wake the guest to resume draining. Idempotent.
+    pub fn release(&self) {
+        self.shared.hold.store(false, Ordering::Relaxed);
+        self.shared.wake.notify_all();
+    }
+
     /// Deliver a **pre-verified** authoritative control frame (see module docs): `payload` is the
     /// module-authored bytes; `original_signed_frame` is the complete signed wire frame journaled
     /// as tag-12 evidence (§8.6).
@@ -1395,6 +1416,16 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                 let (frame, at) = {
                     let mut st = shared.state.lock().expect("pump lock");
                     loop {
+                        // Rig delivery hold (D2 back-pressure prerequisite): freeze all delivery so
+                        // the embedder can fill the spool to SpoolFull/SenderQuota deterministically.
+                        if shared.hold.load(Ordering::Relaxed) {
+                            let (guard, _timeout) = shared
+                                .wake
+                                .wait_timeout(st, PARK_RECHECK)
+                                .expect("pump lock");
+                            st = guard;
+                            continue;
+                        }
                         let now = shared.now_ms();
                         // Fire due timers (frozen during a drain, §4.4; and never behind a queued
                         // Stop — the host delivers no further events after Stop, §4.4).
@@ -2812,6 +2843,7 @@ pub fn start_run(
         }),
         wake: Condvar::new(),
         t0: Instant::now(),
+        hold: AtomicBool::new(false),
     });
     let pump = PumpHandle {
         shared: shared.clone(),
@@ -3174,6 +3206,7 @@ mod tests {
                 state: Mutex::new(test_state(sink)),
                 wake: Condvar::new(),
                 t0: Instant::now(),
+                hold: AtomicBool::new(false),
             }),
         }
     }
@@ -3333,6 +3366,7 @@ mod tests {
                 state: Mutex::new(test_state(Box::new(MemorySink::new()))),
                 wake: Condvar::new(),
                 t0: Instant::now(),
+                hold: AtomicBool::new(false),
             }),
             limits: StoreLimitsBuilder::new().build(),
             trap: None,

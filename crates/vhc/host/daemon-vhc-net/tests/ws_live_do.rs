@@ -127,7 +127,7 @@ async fn live_ws_framing_relay_and_resubscribe_against_wrangler_dev() {
 /// RoundEngine-adjacent progression smoke: a run-bound `Join` + a readiness `Heartbeat` published
 /// over the WS plane drive the real wasm-tick DO through admission → warmup → a signed `RoundOpen`
 /// coordinator emission that reaches the joining peer. Proves the DO's decision core (the compiled
-/// `daemon_vhc_coordinator::tick`) advances the run in response to A1-client frames — the
+/// `daemon_vhc_sdk_consensus::coordinator::tick`) advances the run in response to A1-client frames — the
 /// coordinator half of the RoundEngine-over-WsControlPlane loop (the full stub-backend round loop is
 /// the Merge-2 node↔cloud↔worker item, gated by A3 worker attach).
 #[tokio::test(flavor = "multi_thread")]

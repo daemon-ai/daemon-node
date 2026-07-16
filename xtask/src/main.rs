@@ -613,11 +613,24 @@ fn swarm_ci_t2() -> anyhow::Result<()> {
             // providers, journaled end-to-end, re-driven through the §8.7 input-replay engine —
             // every decision reproduced bit-for-bit. Covers the toy_averager whole run, the
             // tiny_llama_v2 barrier whole runs under the in-process native coordinator (single-
-            // and 2-worker with cross-worker det-digest agreement; SDK-free raw-CBOR config), and
-            // the adversarial-rig pinned cases (duplicate record deduped; delayed payloads →
-            // straggle → catch-up).
-            "daemon-vhc-testkit (production-blob whole runs + barrier rounds + adversarial rig)",
+            // and 2-worker with cross-worker det-digest agreement; SDK-free raw-CBOR config), the
+            // adversarial-rig pinned cases (duplicate record deduped; delayed payloads →
+            // straggle → catch-up), and — from D2 — the wasm-coordinator lanes: the 20-round
+            // dual-compilation identity gate, the mixed-fleet matrix cells for
+            // {wasm coordinator × v1/v2 workers} (cell 8 positive + cells 3/4/7 typed negatives),
+            // the pump-hold back-pressure rig, and the failover drill.
+            "daemon-vhc-testkit (production-blob whole runs + D2 wasm-coordinator lanes)",
             &["-p", "daemon-vhc-testkit"],
+        ),
+        (
+            // D2's CONSENSUS REPLAY — the third replay tier (architecture §3.6; refactor §10 gate
+            // row "Consensus replay from archive alone", tier-2): a third party re-verifies every
+            // consensus decision and every digest from the record archive's signed, hash-chained,
+            // content-addressed sealed segments + the content-addressed payloads ALONE (no live
+            // journal, no coordinator). Positive + the typed incompleteness negatives (missing
+            // payload, withheld segment, forged/gappy heads).
+            "D2 consensus replay (third tier: digests re-verified from archive + payloads alone)",
+            &["-p", "daemon-vhc-observe", "--test", "consensus_replay"],
         ),
     ];
     for (label, args) in suites {
@@ -673,6 +686,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
              pipeline `session::data`) retires with the v1 pipeline at sunset [dev-dep]",
         ),
         (
+            "daemon-swarm-e2e",
+            "daemon-vhc-sdk-consensus",
+            "D2/E — the drills + wasm-profile oracle drive the coordinator `tick` (relocated here \
+             at D2) + observe oracle; retires with the v1 engine/harness at sunset [dev-dep]",
+        ),
+        (
             "daemon-vhc-safetensors",
             "daemon-vhc-sdk",
             "Phase E — safetensors is wired into the checkpoint path (state-dict layout) [dev-dep]",
@@ -695,28 +714,44 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "Phase C — TinyLlamaCfg in the moved worker-protocol test leaves the SDK for guests/ \
              [dev-dep] (split from daemon-vhc-host's identical exception at the A2 bin split)",
         ),
-        // --- D0: proto::assignment -> sdk/daemon-vhc-sdk-consensus (refactor §8/D0). The proto
-        // is algorithm-free from D0 (enforced below); its old host-side assignment consumers
-        // relink to the consensus SDK layer as explicit transitional edges, each retiring at D2.
-        (
-            "daemon-vhc-coordinator",
-            "daemon-vhc-sdk-consensus",
-            "D2 — the native coordinator dissolves at D2 into sdk-consensus + \
-             guests/coordinator-quorum; native coordination for tests moves to SDK-side vhc-sim \
-             (which links sdk-consensus legitimately) [normal]",
-        ),
+        // --- D0/D2: host/* -> sdk/daemon-vhc-sdk-consensus. The assignment math moved out of the
+        // proto at D0 (proto is algorithm-free, enforced below); the pure coordinator `tick`
+        // relocated here at D2 (the native daemon-vhc-coordinator crate DISSOLVED into
+        // sdk-consensus's `coordinator` module + guests/coordinator-quorum, refactor §8/D2). Each
+        // remaining host consumer of the SDK consensus layer is a tracked transitional edge with an
+        // honest retirement phase. (The old `daemon-vhc-coordinator -> sdk-consensus` self-edge is
+        // gone with the crate.)
         (
             "daemon-vhc-session",
             "daemon-vhc-sdk-consensus",
-            "D2 — the retained v1 RoundEngine's assignment consumption; reviewed/retired as D2 \
-             re-seats consumers (the engine itself retires with the v1 driver at the Phase-E \
-             sunset) [normal]",
+            "D2/E — the retained v1 RoundEngine's assignment consumption AND (relocated at D2) the \
+             coordinator `tick` the harness shell (local_coordinator) drives; both retire with the \
+             v1 driver at the Phase-E sunset [normal]",
         ),
         (
             "daemon-vhc-testkit",
             "daemon-vhc-sdk-consensus",
-            "D2 — the barrier harness re-derives worker windows natively; reviewed/retired as D2 \
-             re-seats consumers on the wasm coordinator [normal]",
+            "D2 — the barrier harness re-derives worker windows natively, drives the native \
+             coordinator in-process, AND runs the native `tick` as the dual-compilation identity \
+             reference the wasm coordinator-quorum guest is compared against; retires as the \
+             whole-run harness re-seats onto the wasm coordinator and the reference moves to \
+             SDK-side vhc-sim [normal]",
+        ),
+        (
+            "daemon-vhc-observe",
+            "daemon-vhc-sdk-consensus",
+            "reviewed at D2 sitting 3 and RETAINED — the coordinator oracle, the consensus-replay \
+             verifier, and the archive's Authority judgments (AuthorityConfig::authorize) all \
+             live here; re-running the native `tick` is legitimate third-party verification (no \
+             wasmtime needed; the dual-compilation gate proves native ≡ blob). Retires only if \
+             the oracle machinery ever re-seats onto the blob via the host runtime [normal]",
+        ),
+        (
+            "daemon-vhc-worker",
+            "daemon-vhc-sdk-consensus",
+            "Phase E — the cell-5 (v1-envelope) self-driven t2 join drives the native `tick` \
+             in-process; the cell-6 (genesis) arm was RETIRED at D2 with the adapter, so this \
+             edge now retires with the v1 path at the Phase-E sunset [normal]",
         ),
     ];
 

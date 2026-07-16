@@ -11,8 +11,8 @@ use daemon_vhc_proto::{
     peer_id, CapabilitySet, Hash, IrohId, SwarmProtoVersion, SWARM_PROTO_VERSION,
 };
 
-use daemon_vhc_coordinator::admission::{admit, JoinCandidate};
-use daemon_vhc_coordinator::{AdmissionReject, Phase, RunConfig};
+use daemon_vhc_sdk_consensus::coordinator::admission::{admit, JoinCandidate};
+use daemon_vhc_sdk_consensus::coordinator::{AdmissionReject, Phase, RunConfig};
 
 fn caps(tokens: &[&str]) -> CapabilitySet {
     CapabilitySet::from_tokens(tokens.iter().copied()).unwrap()
@@ -138,9 +138,9 @@ fn join_via_tick_without_hash_is_admitted() {
     let mut cfg = base_config();
     cfg.envelope_hash = Hash([0x77; 32]);
     let state = new_state(cfg);
-    let (state, _) = daemon_vhc_coordinator::tick(
+    let (state, _) = daemon_vhc_sdk_consensus::coordinator::tick(
         state,
-        daemon_vhc_coordinator::Input::Message(join_msg(&key(1))),
+        daemon_vhc_sdk_consensus::coordinator::Input::Message(join_msg(&key(1))),
     );
     assert!(state.is_healthy_member(&peer_id(&key(1))));
 }
@@ -155,22 +155,30 @@ fn join_via_tick_asserts_envelope_hash() {
     let state = new_state(cfg);
 
     // Wrong asserted hash → rejected, not admitted.
-    let (state, out) = daemon_vhc_coordinator::tick(
+    let (state, out) = daemon_vhc_sdk_consensus::coordinator::tick(
         state,
-        daemon_vhc_coordinator::Input::Message(join_msg_with_hash(&key(1), Hash([0xEE; 32]))),
+        daemon_vhc_sdk_consensus::coordinator::Input::Message(join_msg_with_hash(
+            &key(1),
+            Hash([0xEE; 32]),
+        )),
     );
     assert!(!state.is_healthy_member(&peer_id(&key(1))));
     assert!(out.iter().any(|o| matches!(
         o,
-        daemon_vhc_coordinator::Output::Reject(daemon_vhc_coordinator::Rejection::Admission(
-            AdmissionReject::EnvelopeHashMismatch
-        ))
+        daemon_vhc_sdk_consensus::coordinator::Output::Reject(
+            daemon_vhc_sdk_consensus::coordinator::Rejection::Admission(
+                AdmissionReject::EnvelopeHashMismatch
+            )
+        )
     )));
 
     // Correct asserted hash → admitted.
-    let (state, _) = daemon_vhc_coordinator::tick(
+    let (state, _) = daemon_vhc_sdk_consensus::coordinator::tick(
         state,
-        daemon_vhc_coordinator::Input::Message(join_msg_with_hash(&key(2), Hash([0x77; 32]))),
+        daemon_vhc_sdk_consensus::coordinator::Input::Message(join_msg_with_hash(
+            &key(2),
+            Hash([0x77; 32]),
+        )),
     );
     assert!(state.is_healthy_member(&peer_id(&key(2))));
 }
@@ -201,8 +209,12 @@ fn run_id_mismatch_rejected() {
 fn roster_full_rejected() {
     let mut cfg = base_config();
     cfg.max_peers = 1;
-    let existing =
-        daemon_vhc_coordinator::Member::joining(pid(1), IrohId([1; 32]), ThroughputClass::C2, 0);
+    let existing = daemon_vhc_sdk_consensus::coordinator::Member::joining(
+        pid(1),
+        IrohId([1; 32]),
+        ThroughputClass::C2,
+        0,
+    );
     let j = join_with(CapabilitySet::new());
     let cand = JoinCandidate {
         peer: pid(2),
@@ -220,8 +232,12 @@ fn roster_full_rejected() {
 fn duplicate_healthy_peer_rejected_but_dropped_may_rejoin() {
     let cfg = base_config();
     let j = join_with(CapabilitySet::new());
-    let healthy =
-        daemon_vhc_coordinator::Member::joining(pid(1), IrohId([1; 32]), ThroughputClass::C2, 0);
+    let healthy = daemon_vhc_sdk_consensus::coordinator::Member::joining(
+        pid(1),
+        IrohId([1; 32]),
+        ThroughputClass::C2,
+        0,
+    );
     let cand = JoinCandidate {
         peer: pid(1),
         version: SWARM_PROTO_VERSION,
@@ -241,7 +257,7 @@ fn duplicate_healthy_peer_rejected_but_dropped_may_rejoin() {
 
     // A dropped member of the same identity may rejoin.
     let mut dropped = healthy;
-    dropped.state = daemon_vhc_coordinator::ClientState::Dropped;
+    dropped.state = daemon_vhc_sdk_consensus::coordinator::ClientState::Dropped;
     assert!(admit(&cfg, Phase::WaitingForMembers, &[dropped], &[], &cand).is_ok());
 }
 
@@ -250,10 +266,12 @@ fn join_via_tick_adds_to_roster() {
     let cfg = base_config();
     let state = new_state(cfg);
     let k = key(1);
-    let (state, out) =
-        daemon_vhc_coordinator::tick(state, daemon_vhc_coordinator::Input::Message(join_msg(&k)));
+    let (state, out) = daemon_vhc_sdk_consensus::coordinator::tick(
+        state,
+        daemon_vhc_sdk_consensus::coordinator::Input::Message(join_msg(&k)),
+    );
     assert!(out
         .iter()
-        .any(|o| matches!(o, daemon_vhc_coordinator::Output::Note(_))));
+        .any(|o| matches!(o, daemon_vhc_sdk_consensus::coordinator::Output::Note(_))));
     assert!(state.is_healthy_member(&peer_id(&k)));
 }

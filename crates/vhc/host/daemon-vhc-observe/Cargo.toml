@@ -9,11 +9,14 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-# The wire contract (message types, canonical codec, envelope, hashes) + the pure coordinator `tick`
-# the replay oracle re-runs (PROTO-20). Both path deps are already in the frozen root
-# `[workspace.dependencies]`, so declaring them here is a lane-owned edit — no root Cargo.toml change.
+# The wire contract (message types, canonical codec, envelope, hashes).
 daemon-vhc-proto = { workspace = true }
-daemon-vhc-coordinator = { workspace = true }
+# The pure coordinator `tick` the replay oracle re-runs (PROTO-20). Relocated at D2 from the
+# dissolved daemon-vhc-coordinator into sdk/daemon-vhc-sdk-consensus's `coordinator` module.
+# TRACKED dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/* — the coordinator
+# oracle re-runs the native tick; it re-seats onto the wasm coordinator blob (via the host runtime)
+# when the D2 consensus-replay verifier lands, retiring this edge.
+daemon-vhc-sdk-consensus = { workspace = true }
 # The journal record grammar + framing constants (ABI companion §8.2/§8.3/§8.5). This crate encodes
 # journal records and validates them against `daemon_vhc_abi::JOURNAL_CDDL` (the authoritative CDDL);
 # the abi crate stays dep-free / dual-compiled, so the Rust record types + codec live here (host).
