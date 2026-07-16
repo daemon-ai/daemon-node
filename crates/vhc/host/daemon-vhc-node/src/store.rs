@@ -538,25 +538,13 @@ impl SwarmStore {
         Ok(out)
     }
 
-    /// The **D5 sunset audit** (decisions D5; refactor §9): the active-intent runs that still
-    /// need the retired v1 driver, judged from the D0 observability columns — never an
-    /// inference. Scoped to **local desired-run state** (`desired_state = 'joined'`): local
-    /// durable state cannot witness the whole world; the registry half of D5's criterion (a) and
-    /// criterion (b) (registries stop accepting v1 genesis) are registry-side facts.
-    ///
-    /// A run needs the v1 driver iff its **module** is v1: `selected_driver = 'v1'`, or
-    /// `module_abi_major = 1`, or — conservatively — a run whose module major was never recorded
-    /// under a schema-major-1 envelope (a pre-observability v1-era row). A schema-major-1
-    /// envelope with a **major-2 module** is mixed-fleet cell 5 — interim-supported, NOT flagged.
-    pub fn v1_sunset_audit(&self) -> Result<Vec<PersistedRun>, StoreError> {
-        self.query_runs(&format!(
-            "SELECT {RUN_COLUMNS} FROM swarm_runs WHERE desired_state = 'joined' AND (\
-                 selected_driver = 'v1' \
-                 OR module_abi_major = 1 \
-                 OR (module_abi_major IS NULL AND envelope_schema_major = 1)\
-             ) ORDER BY run_id"
-        ))
-    }
+    // The D5 sunset-audit query (`v1_sunset_audit` — active-intent runs still needing the
+    // retired v1 driver, judged from the D0 observability columns) was the E3 transition gate's
+    // "no live v1 runs" proof and was REMOVED post-sunset: with the typed v1 refusal in place no
+    // new v1 run can be admitted, so its only remaining function was detecting pre-sunset rows in
+    // an existing swarm.db — a back-compat accommodation the ratified posture drops. The D0
+    // observability COLUMNS (envelope_schema_major / module_abi_major / selected_driver /
+    // module_hash) stay: they are the per-run provenance/diagnostics record, not compat.
 
     /// Mint the next **role-instance incarnation id** — never-reused, node-durable, monotonic
     /// (ABI §8.1; decisions D1). The first minted id is `1` (`0` is the pre-multi-instance
@@ -762,69 +750,9 @@ mod tests {
         assert_eq!(store.run_priority("run-X").unwrap(), 7);
     }
 
-    /// THE sunset gate's observability assert (E3 brief; decisions D5): the D0 fields
-    /// (`envelope_schema_major` / `module_abi_major` / `selected_driver` / `module_hash`) are
-    /// present in `swarm.db` and the "no live v1 runs" audit is a QUERY over them — a v1-module
-    /// run and a pre-observability v1-era row are flagged; a cell-5 run (v1 envelope, major-2
-    /// module), a v2-genesis run, and a LEFT v1 run are not.
-    #[test]
-    fn v1_sunset_audit_is_a_query_over_the_d0_observability_fields() {
-        let store = SwarmStore::open_in_memory().unwrap();
-        let put = |id: &str| {
-            store
-                .put_join_intent(id, "c", &v1_policy(), None, &SwarmEligibility::default())
-                .unwrap();
-        };
-        // A v1-module run (the thing the sunset drains).
-        put("v1-module");
-        store
-            .set_observability("v1-module", 1, Some(1), Some("v1"), None)
-            .unwrap();
-        // A pre-observability v1-era row: schema-major-1, module major never recorded.
-        put("v1-era-unknown");
-        store
-            .set_observability("v1-era-unknown", 1, None, None, None)
-            .unwrap();
-        // Cell 5: a major-2 module under a v1 envelope — interim-supported, NOT flagged.
-        put("cell5");
-        store
-            .set_observability("cell5", 1, Some(2), Some("v2"), Some(&[0x55; 32]))
-            .unwrap();
-        // A v2-genesis run.
-        put("v2-genesis");
-        store
-            .set_observability("v2-genesis", 2, Some(2), Some("v2"), Some(&[0x66; 32]))
-            .unwrap();
-        // A v1 run that already LEFT (desired_state != joined): outside "live" scope.
-        put("v1-left");
-        store
-            .set_observability("v1-left", 1, Some(1), Some("v1"), None)
-            .unwrap();
-        store
-            .set_desired_state("v1-left", DesiredState::Left)
-            .unwrap();
-
-        let flagged: Vec<String> = store
-            .v1_sunset_audit()
-            .unwrap()
-            .into_iter()
-            .map(|r| r.run_id)
-            .collect();
-        assert_eq!(flagged, ["v1-era-unknown", "v1-module"]);
-
-        // Draining the flagged intents empties the audit — the D5 "no live v1 runs" half (a),
-        // scoped to local desired-run state.
-        store
-            .set_desired_state("v1-module", DesiredState::Left)
-            .unwrap();
-        store
-            .set_desired_state("v1-era-unknown", DesiredState::Left)
-            .unwrap();
-        assert!(store.v1_sunset_audit().unwrap().is_empty());
-    }
-
-    /// The v2 execution-identity + observability writers populate the D0 columns for the sunset
-    /// audit query (decisions D5).
+    /// The v2 execution-identity + observability writers populate the D0 columns (decisions D5;
+    /// the columns outlive the retired `v1_sunset_audit` transition query as the per-run
+    /// provenance/diagnostics record).
     #[test]
     fn v2_identity_and_observability_writers() {
         let store = SwarmStore::open_in_memory().unwrap();
