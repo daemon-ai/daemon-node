@@ -5034,6 +5034,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-sdk-profiles"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "ciborium",
+ "daemon-vhc-det",
+ "daemon-vhc-sdk",
+ "serde",
+]
+
+[[package]]
 name = "daemon-vhc-sdk-rounds"
 version = "0.0.1"
 dependencies = [

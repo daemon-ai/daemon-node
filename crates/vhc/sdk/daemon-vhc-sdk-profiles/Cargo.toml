@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-sdk-profiles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The comm/optimizer profiles as composable strategies over Burn tensors + det math
+# (architecture §6 "Profiles" row; refactor §7 "profiles re-express over Burn tensors + det math
+# in `sdk/daemon-vhc-sdk-profiles`" — the Phase-C models-exodus companion of `guests/tiny-llama`).
+#
+# The det-lane math delegates every kernel to the normative dual-compiled `daemon-vhc-det`
+# (architecture §3.2: any module runs it in-guest with zero host support), so a guest linking this
+# crate reproduces the v1 profiles' consensus math BIT-EXACTLY — pinned by this crate's golden
+# suite against the current SDK (`daemon-vhc-sdk::profiles`) implementation. The Burn doorway
+# (`burn_lane`) is the model↔profile composition surface for `HostBackend`/native authors.
+#
+# Dependency rules (architecture §7, CI-enforced): sdk/* links contracts/* and lower sdk layers
+# only — never host/*. Normal deps: `daemon-vhc-det` + serde/ciborium (the payload wire) + the
+# pinned `burn` core (tensor doorway; no backend). Dev-dep: `daemon-vhc-sdk` (sim) — the CURRENT
+# profile implementation the goldens are generated from; it retires with the v1 sunset.
+
+[dependencies]
+daemon-vhc-det = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+ciborium = { workspace = true }
+# The pinned Burn the compute@2 wire is defined against (decisions D8): tensor core only, no
+# backend — `burn_lane` is generic over `B: Backend` (guests bind `HostBackend`, tests NdArray).
+burn = { version = "=0.21.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The golden oracle: the CURRENT SDK profiles over the `sim` backend (ABI §10.4). The goldens
+# suite drives old + new implementations A/B on identical inputs and pins bit-equality.
+daemon-vhc-sdk = { workspace = true, features = ["sim"] }
+
+[lints]
+workspace = true

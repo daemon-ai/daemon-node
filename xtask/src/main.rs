@@ -508,6 +508,15 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-sdk", "--features", "sim"],
         ),
         (
+            // The C3a models-exodus profiles gate (refactor §7 "profiles re-express over Burn
+            // tensors + det math in sdk/daemon-vhc-sdk-profiles"): the re-expressed
+            // SparseLoco/DiLoCo/Demo reproduce the CURRENT SDK profile implementation bit-for-bit
+            // (live A/B over the sim oracle + the pinned sparse_loco_golden literals), and the
+            // Section payload wire is byte-identical to the v1 container encoding.
+            "C3a sdk-profiles ≡ current SDK profiles (bit-exact A/B + pinned goldens + wire)",
+            &["-p", "daemon-vhc-sdk-profiles"],
+        ),
+        (
             // A2 migrate/main! scaffolding (refactor §5 A2 item 4; ABI §10): state round-trips
             // in sim through the typed manifest protocol; the SDK-derived claim/manifest match
             // the §9.1/§6.2 wire schema the admission funnel decodes. The macro's exports are
