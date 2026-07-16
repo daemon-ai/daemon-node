@@ -37,6 +37,15 @@ extern "C" {
     fn abi_payload_put(buffer: u64) -> u64;
     #[link_name = "payload_get"]
     fn abi_payload_get(hash_ptr: u32) -> u64;
+    // -- minor 1: direct peer streams under credit flow control (§3.3/§3.4) ---------------------
+    #[link_name = "stream_open"]
+    fn abi_stream_open(peer_ptr: u32) -> u64;
+    #[link_name = "stream_accept"]
+    fn abi_stream_accept() -> u64;
+    #[link_name = "stream_write"]
+    fn abi_stream_write(stream: u64, buffer: u64) -> u64;
+    #[link_name = "stream_read"]
+    fn abi_stream_read(stream: u64) -> u64;
 }
 
 #[link(wasm_import_module = "data@2")]
@@ -326,4 +335,32 @@ pub fn payload_get(hash: &[u8; 32]) -> u64 {
 pub fn data_fetch(hash: &[u8; 32], range_off: u64, range_len: u64) -> u64 {
     // SAFETY: `hash` is a live 32-byte guest span for the call's duration.
     unsafe { abi_data_fetch(hash.as_ptr() as u32, range_off, range_len) }
+}
+
+/// Open a direct stream to `peer` (§3.3). Returns the `OpId`; completes with `Ok(StreamHandle)`.
+pub fn stream_open(peer: &[u8; 32]) -> u64 {
+    // SAFETY: `peer` is a live 32-byte guest span for the call's duration.
+    unsafe { abi_stream_open(peer.as_ptr() as u32) }
+}
+
+/// Stand an accept for an incoming stream (§3.3). Returns the `OpId`; completes with
+/// `Ok(StreamHandle)` when a peer opens.
+pub fn stream_accept() -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_stream_accept() }
+}
+
+/// Write a sealed buffer to a stream (§3.4): consumes writable credit; a write beyond the window
+/// is held host-side and completes when the receiver's reads replenish credit — the completion IS
+/// the credit signal. Returns the `OpId`; completes `Ok(())`.
+pub fn stream_write(stream: u64, buffer: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_stream_write(stream, buffer) }
+}
+
+/// Read the next chunk from a stream (§3.4). Returns the `OpId`; completes with
+/// `Ok(BufferHandle)` of the received opaque bytes.
+pub fn stream_read(stream: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_stream_read(stream) }
 }

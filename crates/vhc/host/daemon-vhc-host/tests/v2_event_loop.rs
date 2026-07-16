@@ -248,21 +248,32 @@ impl JournalSink for JournalAdapter {
         &mut self,
         class: u64,
         rule: u64,
-        timer_id: Option<u64>,
-        hash: Option<[u8; 32]>,
+        dropped: daemon_vhc_host::v2::Dropped,
     ) -> Result<(), SinkError> {
         self.journal
             .append(Body::Drop(DropRec {
                 class,
                 rule,
                 dropped: DropId {
-                    hash: hash.map(Hash),
-                    timer_id,
-                    channel: None,
-                    sender: None,
-                    seq: None,
+                    hash: dropped.hash.map(Hash),
+                    timer_id: dropped.timer_id,
+                    channel: dropped.channel,
+                    sender: dropped.sender.map(Hash),
+                    seq: dropped.seq,
                 },
             }))
+            .map(|_| ())
+            .map_err(|e| SinkError(e.to_string()))
+    }
+
+    fn condition(&mut self, code: &str, detail: &str) -> Result<(), SinkError> {
+        self.journal
+            .append(Body::Condition(
+                daemon_vhc_observe::journal::record::ConditionRec {
+                    code: code.to_string(),
+                    detail: detail.to_string(),
+                },
+            ))
             .map(|_| ())
             .map_err(|e| SinkError(e.to_string()))
     }

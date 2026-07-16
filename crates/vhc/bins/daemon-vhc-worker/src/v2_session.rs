@@ -529,8 +529,16 @@ fn deliver_coordinator_msg(
     let payload = to_canonical_vec(msg).map_err(|e| format!("payload encode: {e}"))?;
     let evidence = to_canonical_vec(&signed).map_err(|e| format!("evidence encode: {e}"))?;
     let seq = next_coord_seq();
-    pump.deliver_frame(0, seq, peer_id(coord_key).0, payload, evidence)
-        .map_err(|e| format!("deliver: {e}"))
+    match pump
+        .deliver_frame(0, seq, peer_id(coord_key).0, payload, evidence)
+        .map_err(|e| format!("deliver: {e}"))?
+    {
+        daemon_vhc_host::v2::DeliverVerdict::Accepted => Ok(()),
+        other => Err(format!(
+            "coordinator frame back-pressured/refused ({other:?}) — the t2 drive never fills \
+             the spool"
+        )),
+    }
 }
 
 /// Coordinator-plane delivery seq (per-process monotone; the §12.2 dense-seq discipline for the
@@ -564,7 +572,8 @@ fn wait_publishes_servicing(
                 daemon_vhc_host::v2::OpRequest::ArtifactFetch { hash, .. } => {
                     // The unified fetch path: the same store + verification discipline the
                     // staging corpus was assembled through (the range is the pump's job).
-                    match artifacts.fetch(&hash) {
+                    // (The minted handle is the transport's concern; fetch needs no routing.)
+                    let _ = match artifacts.fetch(&hash) {
                         Ok(artifact) => pump
                             .complete_op(op, daemon_vhc_host::v2::OpOutcome::FetchDone { artifact })
                             .map_err(|e| format!("fetch completion: {e}"))?,
@@ -577,7 +586,7 @@ fn wait_publishes_servicing(
                                 },
                             )
                             .map_err(|e| format!("fetch failure completion: {e}"))?,
-                    }
+                    };
                 }
                 other => return Err(format!("unexpected op request from the guest: {other:?}")),
             }

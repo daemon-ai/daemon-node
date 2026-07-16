@@ -178,9 +178,10 @@ fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
         // the async-runtime seat; the pump computes the commitment hash itself.
         for (op, request) in pump.take_op_requests() {
             match request {
-                daemon_vhc_host::v2::OpRequest::PayloadPut { .. } => pump
-                    .complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
-                    .expect("put completion"),
+                daemon_vhc_host::v2::OpRequest::PayloadPut { .. } => {
+                    pump.complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
+                        .expect("put completion");
+                }
                 other => panic!("unexpected op request from the parity guest: {other:?}"),
             }
         }
@@ -247,8 +248,11 @@ fn v2_run_n(
             deadline_unix_s: 0,
         });
         let payload = to_canonical_vec(&ro).expect("ro");
-        pump.deliver_frame(0, seq, sender, payload.clone(), payload)
-            .expect("deliver RoundOpen");
+        assert_eq!(
+            pump.deliver_frame(0, seq, sender, payload.clone(), payload)
+                .expect("deliver"),
+            daemon_vhc_host::v2::DeliverVerdict::Accepted
+        );
         seq += 1;
         wait_published(&pump, (round as usize) * 2 + 1); // + this round's Commitment
 
@@ -270,8 +274,11 @@ fn v2_run_n(
             inline: Some(vec![entry]),
         });
         let payload = to_canonical_vec(&rr).expect("rr");
-        pump.deliver_frame(0, seq, sender, payload.clone(), payload)
-            .expect("deliver RoundRecord");
+        assert_eq!(
+            pump.deliver_frame(0, seq, sender, payload.clone(), payload)
+                .expect("deliver"),
+            daemon_vhc_host::v2::DeliverVerdict::Accepted
+        );
         seq += 1;
         wait_published(&pump, (round as usize) * 2 + 2); // + this round's Digest
     }
@@ -287,6 +294,163 @@ fn v2_run_n(
         .expect("the digest-extraction hook exported the bridge state");
     let entries = sink.lock().expect("sink").entries.clone();
     (StateDigest(digest_of_state(&state, rounds - 1)), entries)
+}
+
+/// Drive the v2 guest through a STRAGGLE → CATCH-UP schedule (the B3-found §5.9 defect shape):
+/// round 0 trains + commits normally, but its record arrives while the committed payload is not
+/// yet fetchable (straggle); the payload lands; RoundOpen(1) then makes the guest ingest round 0
+/// AND train round 1 **in one event slice** — the catch-up path where the ingest epilogue
+/// (post-ingest master → round base) must run at the ingest→training boundary, not at slice
+/// close, or round 1 trains against a pre-ingest base and diverges from v1.
+fn v2_run_catchup(
+    engine: EngineConfig,
+    v1_updates: &[Vec<u8>],
+) -> (StateDigest, Vec<daemon_vhc_host::v2::SinkEntry>) {
+    let wasm = guest("tiny_llama_v2");
+    let worker = Worker::new(engine).expect("engine");
+    let identity = RunIdentity {
+        run_id: [0xAC; 32],
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance: 2,
+        module: *blake3::hash(&wasm).as_bytes(),
+    };
+    let run_cfg = V2RunConfig::new(identity, [0x82; 32], guest_cfg_bytes(), Vec::new());
+    let sink = Arc::new(Mutex::new(MemorySink::new()));
+    let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
+    let pump = run.pump.clone();
+    let peer = PeerId(PEER);
+    let mut seq = 0u64;
+    let sender = [9u8; 32];
+
+    let ro = |round: u64| {
+        SwarmMessage::RoundOpen(RoundOpen {
+            round,
+            seed: Seed([round as u8; 32]),
+            roster_digest: Hash([0; 32]),
+            batch: BatchWindow {
+                start: 0,
+                end: u64::from(STEPS_PER_ROUND * MICRO_BATCH),
+            },
+            deadline_unix_s: 0,
+        })
+    };
+    let rr = |round: u64, bytes: &[u8]| {
+        let entry = RecordEntry {
+            peer,
+            hash: blake3_hash(bytes),
+            size: bytes.len() as u64,
+        };
+        let set: Vec<(PeerId, Hash)> = vec![(peer, entry.hash)];
+        SwarmMessage::RoundRecord(RoundRecord {
+            round,
+            set: commit_set(&set).commitment(),
+            drops: Vec::new(),
+            next_seed: Seed([0; 32]),
+            set_locator: Locator::StoreKey(String::new()),
+            inline: Some(vec![entry]),
+        })
+    };
+    let deliver = |msg: &SwarmMessage, seq: &mut u64| {
+        let payload = to_canonical_vec(msg).expect("msg");
+        assert_eq!(
+            pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
+                .expect("deliver"),
+            daemon_vhc_host::v2::DeliverVerdict::Accepted
+        );
+        *seq += 1;
+    };
+
+    // Round 0: normal train + guest-authored commit.
+    for _h in 0..STEPS_PER_ROUND {
+        pump.stage_batch(&zero_tokens(), MICRO_BATCH, SEQ_LEN, None)
+            .expect("stage batch");
+    }
+    deliver(&ro(0), &mut seq);
+    wait_published(&pump, 1); // Commitment(0)
+
+    // The record arrives while the committed payload is NOT yet fetchable → straggle.
+    deliver(&rr(0, &v1_updates[0]), &mut seq);
+    wait_published(&pump, 2); // Straggle(0)
+
+    // The payload lands (the archive/store caught up).
+    pump.stage_update(v1_updates[0].clone(), None)
+        .expect("stage update 0");
+
+    // RoundOpen(1): ONE slice ingests round 0 (catch-up) and trains round 1.
+    for _h in 0..STEPS_PER_ROUND {
+        pump.stage_batch(&zero_tokens(), MICRO_BATCH, SEQ_LEN, None)
+            .expect("stage batch");
+    }
+    deliver(&ro(1), &mut seq);
+    wait_published(&pump, 3); // Digest(0) — the CaughtUp voice
+    wait_published(&pump, 4); // Commitment(1) — after the guest's put completes
+
+    // Barrier 1, normal path.
+    pump.stage_update(v1_updates[1].clone(), None)
+        .expect("stage update 1");
+    deliver(&rr(1, &v1_updates[1]), &mut seq);
+    wait_published(&pump, 5); // Digest(1)
+
+    pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
+        .expect("stop");
+    match run.wait().expect("guest thread clean") {
+        RunEnd::Outcome(0) => {}
+        other => panic!("expected Outcome(0), got {other:?}"),
+    }
+    let state = pump.bridge_final_state().expect("final state exported");
+    let entries = sink.lock().expect("sink").entries.clone();
+    (StateDigest(digest_of_state(&state, ROUNDS - 1)), entries)
+}
+
+/// The B1 catch-up parity pin (the driver-side twin of B3's adversarial `assert_ne!`): a
+/// straggle → catch-up run must end in EXACTLY the clean run's det state — the §5.9 ingest
+/// epilogue fires at the ingest→training boundary, so round 1 trains against the post-ingest-0
+/// base even when ingest(0) and train(1) share one slice — and the recorded run replays
+/// bit-for-bit (drops/straggles are advisory; the journal records what was delivered).
+#[test]
+fn catch_up_after_straggle_reproduces_v1_digests_cpu() {
+    let (updates, v1_digest) = v1_oracle(EngineConfig::default());
+    let (v2_digest, entries) = v2_run_catchup(EngineConfig::default(), &updates);
+    assert_eq!(
+        v1_digest, v2_digest,
+        "catch-up (ingest r + train r+1 in ONE slice) must reproduce v1 semantics — the §5.9 \
+         epilogue must run at the ingest→training boundary, not at slice close"
+    );
+
+    // Replay green on the catch-up journal too.
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    let script = daemon_vhc_host::v2::ReplayScript::from_entries(&entries);
+    let replayed = daemon_vhc_host::v2::replay_v2(
+        &worker,
+        &guest("tiny_llama_v2"),
+        &guest_cfg_bytes(),
+        &[],
+        script,
+    )
+    .expect("replay harness");
+    assert_eq!(replayed.end, daemon_vhc_host::v2::ReplayEnd::Outcome(0));
+    let recorded: Vec<(u64, u64, [u8; 32])> = entries
+        .iter()
+        .filter_map(|e| match e {
+            daemon_vhc_host::v2::SinkEntry::Publish {
+                channel,
+                seq,
+                payload_hash,
+                ..
+            } => Some((*channel, *seq, *payload_hash)),
+            _ => None,
+        })
+        .collect();
+    let replayed_decisions: Vec<(u64, u64, [u8; 32])> = replayed
+        .decisions
+        .iter()
+        .map(|d| (d.channel, d.seq, d.payload_hash))
+        .collect();
+    assert_eq!(
+        recorded, replayed_decisions,
+        "catch-up decisions replay bit-for-bit"
+    );
 }
 
 /// The named Phase-A acceptance lane, CPU tier: v1 driver ≡ v2 BarrierRound det digests — and

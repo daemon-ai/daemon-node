@@ -245,6 +245,13 @@ pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
     // Content-addressed payload plane by handle (§3.4): both complete via `Event::Completion`.
     (NS_NET_V2, "payload_put", 1),
     (NS_NET_V2, "payload_get", 1),
+    // Direct peer streams under credit-based flow control (§3.3/§3.4): open/accept complete with
+    // a kind-9 StreamHandle; writes consume writable credit (replenished by the receiver's reads,
+    // surfacing as the writes' completions); reads complete with a kind-8 BufferHandle.
+    (NS_NET_V2, "stream_open", 1),
+    (NS_NET_V2, "stream_accept", 1),
+    (NS_NET_V2, "stream_write", 1),
+    (NS_NET_V2, "stream_read", 1),
     // -- minor 1 (Phase B, track B2): sys@2 crypto accels + ambient inputs ----------------------
     // The det-lane-pattern crypto accelerations (deterministic, unjournaled — §2.7 dc class).
     (NS_SYS_V2, "hash", 1),
@@ -706,6 +713,14 @@ pub const READBACK_KIND_STAGED_UPDATE: u32 = 2;
 /// `read_back` kind 3: bytes of a named state-manifest section (migration restore, ABI §10.2;
 /// requires the restore grant; the one kind legal during `da_migrate`, ABI §6.6).
 pub const READBACK_KIND_STATE_SECTION: u32 = 3;
+/// Kind 4 — **journal-record kind only** (assigned by the B1 minor): the bytes behind a
+/// `stream_read` completion. Stream payloads are opaque and NOT content-addressed, so — unlike
+/// `payload_get` buffers, which replay re-fetches by hash (§8.7) — the received bytes are a
+/// nondeterministic input journaled verbatim (a §8.3 tag-2 record, `src` = the read's `OpId`)
+/// at completion arrival; replay materializes the completion's buffer from that record. Never a
+/// valid `read_back` CALL argument at this minor (the same never-callable discipline as the
+/// ≥ 128 bridge journal kinds).
+pub const READBACK_KIND_STREAM_BYTES: u32 = 4;
 /// `read_back` kinds ≥ this are the reserved bridge-op journal kinds (ABI §2.5/§2.7); never valid as
 /// call arguments (ABI §6.4).
 pub const READBACK_KIND_BRIDGE_JOURNAL_MIN: u32 = 128;
@@ -1298,6 +1313,10 @@ mod tests {
         assert!(call_kinds
             .iter()
             .all(|k| *k < READBACK_KIND_BRIDGE_JOURNAL_MIN));
+        // Kind 4 is a JOURNAL-record kind (stream-read completion bytes, B1) — distinct from
+        // every call kind and below the bridge journal floor, never callable at this minor.
+        assert_eq!(READBACK_KIND_STREAM_BYTES, 4);
+        assert!(!call_kinds.contains(&READBACK_KIND_STREAM_BYTES));
         assert_eq!(READBACK_KIND_BRIDGE_JOURNAL_MIN, 128);
     }
 
@@ -1504,7 +1523,14 @@ mod tests {
         ] {
             assert_eq!(v2_symbol_minor(NS_VHC_V2, sym), Some(1), "vhc@2::{sym}");
         }
-        for sym in ["payload_put", "payload_get"] {
+        for sym in [
+            "payload_put",
+            "payload_get",
+            "stream_open",
+            "stream_accept",
+            "stream_write",
+            "stream_read",
+        ] {
             assert_eq!(v2_symbol_minor(NS_NET_V2, sym), Some(1), "net@2::{sym}");
         }
         assert_eq!(v2_symbol_minor(NS_VHC_V2, "bogus"), None);

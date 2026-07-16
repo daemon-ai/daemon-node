@@ -23,6 +23,54 @@
 #[error("journal sink: {0}")]
 pub struct SinkError(pub String);
 
+/// The dropped/coalesced item's identity (ABI §8.3 `drop-id`): which fields are present depends
+/// on the drop class — a payload announcement carries its hash, a timer its id, an advisory
+/// frame its `(channel, sender, seq)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Dropped {
+    /// A payload hash (payload-ready drops).
+    pub hash: Option<[u8; 32]>,
+    /// A timer id (timer drops).
+    pub timer_id: Option<u64>,
+    /// A channel (gossip drops).
+    pub channel: Option<u64>,
+    /// A sender identity (gossip drops).
+    pub sender: Option<[u8; 32]>,
+    /// An arrival sequence (gossip drops).
+    pub seq: Option<u64>,
+}
+
+impl Dropped {
+    /// A payload-ready drop identity.
+    #[must_use]
+    pub fn payload(hash: [u8; 32]) -> Self {
+        Self {
+            hash: Some(hash),
+            ..Self::default()
+        }
+    }
+
+    /// A timer drop identity.
+    #[must_use]
+    pub fn timer(id: u64) -> Self {
+        Self {
+            timer_id: Some(id),
+            ..Self::default()
+        }
+    }
+
+    /// A gossip-frame drop identity.
+    #[must_use]
+    pub fn gossip(channel: u64, sender: [u8; 32], seq: u64) -> Self {
+        Self {
+            channel: Some(channel),
+            sender: Some(sender),
+            seq: Some(seq),
+            ..Self::default()
+        }
+    }
+}
+
 /// The §8.3 records the Phase-A driver produces, as a write-only seam (see module docs).
 ///
 /// All methods take `&mut self`; the driver serializes access behind its pump lock, so an adapter
@@ -110,13 +158,11 @@ pub trait JournalSink: Send {
 
     /// tag 7 — an advisory drop/coalesce (§4.7: every drop or coalesce MUST be journaled).
     /// `class`: 0 payload-ready, 1 timer, 2 gossip, 3 budget; `rule`: the fixed coalesce code.
-    fn drop_coalesced(
-        &mut self,
-        class: u64,
-        rule: u64,
-        timer_id: Option<u64>,
-        hash: Option<[u8; 32]>,
-    ) -> Result<(), SinkError>;
+    fn drop_coalesced(&mut self, class: u64, rule: u64, dropped: Dropped) -> Result<(), SinkError>;
+
+    /// tag 16 — a typed run condition (ABI §6.7): `SpoolExhausted` etc — journaled, node-visible,
+    /// neither a guest trap nor an admission refusal.
+    fn condition(&mut self, code: &str, detail: &str) -> Result<(), SinkError>;
 
     /// tag 14 — a completion arrival (ABI §7.5/§8.3, Phase B): the op plus its standalone
     /// canonical `completion-result` bytes. Written at ARRIVAL (enqueue), before the completion
@@ -221,16 +267,13 @@ impl<S: JournalSink> JournalSink for std::sync::Arc<std::sync::Mutex<S>> {
     fn device_profile(&mut self, profile: &[u8]) -> Result<(), SinkError> {
         self.lock().expect("sink lock").device_profile(profile)
     }
-    fn drop_coalesced(
-        &mut self,
-        class: u64,
-        rule: u64,
-        timer_id: Option<u64>,
-        hash: Option<[u8; 32]>,
-    ) -> Result<(), SinkError> {
+    fn drop_coalesced(&mut self, class: u64, rule: u64, dropped: Dropped) -> Result<(), SinkError> {
         self.lock()
             .expect("sink lock")
-            .drop_coalesced(class, rule, timer_id, hash)
+            .drop_coalesced(class, rule, dropped)
+    }
+    fn condition(&mut self, code: &str, detail: &str) -> Result<(), SinkError> {
+        self.lock().expect("sink lock").condition(code, detail)
     }
     fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError> {
         self.lock().expect("sink lock").completion(op, result)
@@ -303,8 +346,11 @@ pub enum SinkEntry {
     Drop {
         class: u64,
         rule: u64,
-        timer_id: Option<u64>,
-        hash: Option<[u8; 32]>,
+        dropped: Dropped,
+    },
+    Condition {
+        code: String,
+        detail: String,
     },
     Completion {
         op: u64,
@@ -335,6 +381,7 @@ impl SinkEntry {
             Self::Instantiation { .. } => 13,
             Self::Completion { .. } => 14,
             Self::DeviceProfile { .. } => 15,
+            Self::Condition { .. } => 16,
         }
     }
 }
@@ -482,18 +529,19 @@ impl JournalSink for MemorySink {
         Ok(())
     }
 
-    fn drop_coalesced(
-        &mut self,
-        class: u64,
-        rule: u64,
-        timer_id: Option<u64>,
-        hash: Option<[u8; 32]>,
-    ) -> Result<(), SinkError> {
+    fn drop_coalesced(&mut self, class: u64, rule: u64, dropped: Dropped) -> Result<(), SinkError> {
         self.entries.push(SinkEntry::Drop {
             class,
             rule,
-            timer_id,
-            hash,
+            dropped,
+        });
+        Ok(())
+    }
+
+    fn condition(&mut self, code: &str, detail: &str) -> Result<(), SinkError> {
+        self.entries.push(SinkEntry::Condition {
+            code: code.to_string(),
+            detail: detail.to_string(),
         });
         Ok(())
     }

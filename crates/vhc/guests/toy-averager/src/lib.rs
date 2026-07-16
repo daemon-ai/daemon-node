@@ -183,6 +183,10 @@ struct State {
     /// undeclared channel makes the host trap `GrantViolation` typed (§6.2) — proving the
     /// channel table, not the guest, owns routing.
     channel: u32,
+    /// How many timers to arm UP FRONT (config byte 2, default 1). A burst > the host's
+    /// declared advisory `Timer` depth makes the queue coalesce (drop-oldest, journaled §4.7)
+    /// deterministically — the replay-under-coalescing conformance knob.
+    burst: u32,
     /// Ticks folded so far.
     ticks: u32,
     /// Running mean of `fired_at`.
@@ -192,6 +196,7 @@ struct State {
 static mut STATE: State = State {
     n: 0,
     channel: 0,
+    burst: 1,
     ticks: 0,
     mean: 0.0,
 };
@@ -212,6 +217,7 @@ pub unsafe extern "C" fn da_init(cfg_ptr: u32, cfg_len: u32, _g: u32, _gl: u32) 
     STATE = State {
         n: u32::from(byte(0).unwrap_or(3)).max(1),
         channel: u32::from(byte(1).unwrap_or(0)),
+        burst: u32::from(byte(2).unwrap_or(1)).max(1),
         ticks: 0,
         mean: 0.0,
     };
@@ -340,9 +346,13 @@ pub extern "C" fn da_run() -> u32 {
         f64::from(u32::from_le_bytes([seed[0], seed[1], seed[2], seed[3]])),
     );
 
-    // Arm the first tick (legal before the first slice — §6.6 rule 2).
-    // SAFETY: plain-value import call.
-    unsafe { abi_set_timer(TIMER_STEP_MS) };
+    // Arm the opening tick(s) (legal before the first slice — §6.6 rule 2). A burst > 1 arms
+    // them all at the same deadline, so they fire in ONE pump batch — the deterministic
+    // queue-coalescing driver for the replay-under-coalescing conformance lane.
+    for _ in 0..st.burst {
+        // SAFETY: plain-value import call.
+        unsafe { abi_set_timer(TIMER_STEP_MS) };
+    }
 
     // Start deliberately undersized to exercise the NeedCapacity round-trip (§4.1).
     let mut buf: Vec<u8> = Vec::with_capacity(8);
