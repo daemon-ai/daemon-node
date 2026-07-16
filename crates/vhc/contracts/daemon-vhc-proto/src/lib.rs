@@ -24,6 +24,7 @@ pub mod crypto;
 pub mod digest;
 pub mod envelope;
 pub mod error;
+pub mod genesis;
 pub mod hash;
 pub mod merkle;
 pub mod messages;
@@ -48,6 +49,11 @@ pub use envelope::{
     DeviceMinimums, Envelope, FrozenEnvelope, SignedEnvelope, ENVELOPE_SCHEMA_MAJOR,
 };
 pub use error::SwarmProtoError;
+pub use genesis::{
+    peek_schema, BufferReq, ChannelDecl, ControlTransport, EventCap, EventCaps, FrozenGenesis,
+    GenesisEnvelope, GrantBound, Identities, MigrationGrant, RoleEntry, RoleGrants, RunSectionV2,
+    SnapshotArtifact, TransportSelection, WorldGrant, GENESIS_SCHEMA_MAJOR,
+};
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
 pub use messages::{SignedMessage, SwarmMessage};
