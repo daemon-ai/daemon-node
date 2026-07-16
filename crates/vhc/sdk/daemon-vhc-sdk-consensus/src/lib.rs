@@ -10,20 +10,25 @@
 //! drivers) relink here. The math is unchanged byte-for-byte: the golden vectors
 //! (`tests/assignment_golden.rs`) moved with it and still pin the LCG/shuffle output.
 //!
-//! Roadmap (architecture §7): D1 lands `Authority` (`SingleKey`, `ThresholdKeys`) and the
-//! `Committed<T>` mint here; **D2 lands the coordinator driver** ([`coordinator`]) — the pure
-//! `tick` state machine relocated from the dissolved host-side `daemon-vhc-coordinator` crate
-//! (refactor §8/D2), so one implementation serves the wasm `coordinator-quorum` guest, the native
-//! `vhc-sim` coordination, and the dual-compilation identity reference alike.
+//! The layer is complete as of D1+D2: **D1 landed `Authority` (`SingleKey`, `ThresholdKeys`) +
+//! the typed `AuthorityConfig`, and the `Committed<T>` mint** ([`authority`], [`committed`]);
+//! **D2 landed the coordinator driver** ([`coordinator`]) — the pure `tick` state machine
+//! relocated from the dissolved host-side `daemon-vhc-coordinator` crate (refactor §8/D2), so one
+//! implementation serves the wasm `coordinator-quorum` guest, the native `vhc-sim` coordination,
+//! and the dual-compilation identity reference alike. The coordinator's authenticated-dispatch
+//! seam consumes D1's `Authority` surface (the D2 sitting-3 reconciliation).
 //!
-//! wasm32-clean by construction: the dependencies are `daemon-vhc-proto` (wire types + blake3) and
-//! `serde` (derive, for the canonical-CBOR-serializable coordinator state), so this crate compiles
-//! for guests and hosts alike — the "linked identically by worker drivers, coordinator drivers,
-//! simulator, and replay" property (architecture §8 authority table).
+//! wasm32-clean by construction: the dependencies are `daemon-vhc-proto` (wire types + blake3 +
+//! the `verify_sig` crypto primitive) and `serde` (derive, for the canonical-CBOR-serializable
+//! coordinator state), so this crate compiles for guests and hosts alike — the "linked
+//! identically by worker drivers, coordinator drivers, simulator, and replay" property
+//! (architecture §8 authority table).
 
 #![forbid(unsafe_code)]
 
 pub mod assignment;
+pub mod authority;
+pub mod committed;
 pub mod coordinator;
 
 pub use assignment::{
@@ -31,4 +36,11 @@ pub use assignment::{
     elect_checkpointers, global_batch_at, seeded_lcg, select_committee, select_verifiers,
     witness_quorum, Committee, Lcg, ASSIGN_SALT, CHECKPOINTER_SALT, VERIFIER_SALT, WITNESS_SALT,
     WITNESS_TARGET_DEFAULT,
+};
+pub use authority::{
+    AuthError, Authority, AuthorityConfig, AuthorityContract, Authorized, FaultThreshold, Finality,
+    Reconfiguration, RecordSig, SingleKey, ThresholdKeys, Topology, DEFAULT_RECORDS_CHANNEL,
+};
+pub use committed::{
+    Committed, CommittedItem, HostStaged, MintError, PayloadCheck, PayloadRepr, PayloadSource,
 };

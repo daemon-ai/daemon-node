@@ -27,6 +27,10 @@ daemon-vhc-proto = { workspace = true }
 # serde (derive) for the canonical-CBOR-serializable coordinator state — the replay-oracle and
 # dual-compilation foundation (relocated with the coordinator driver at D2). wasm32-clean.
 serde = { workspace = true }
+# The envelope's opaque `authority` section is a `ciborium::value::Value` (D0); D1's typed
+# `AuthorityConfig` decodes from it. ciborium is the same wasm32-clean codec `daemon-vhc-proto`
+# already links, so this keeps the crate guest-buildable.
+ciborium = { workspace = true }
 
 [dev-dependencies]
 # Integer-only property testing of `tick` determinism (relocated with the coordinator driver at

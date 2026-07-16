@@ -256,22 +256,36 @@ impl AdmissionV2 {
     /// grants (the config's Phase-A defaults stand). `granted_artifacts` REPLACES the config's
     /// set (the envelope is the authority; empty grants = no artifacts, fail closed).
     pub fn apply_quotas(&self, cfg: &mut crate::v2::V2RunConfig) {
-        let Some(q) = &self.quotas else { return };
-        // `0` admitted = "unbounded by this grant" (ABI §2.3): the driver treats 0 the same way,
-        // so the values copy through verbatim.
-        cfg.max_frame_bytes = u32::try_from(q.max_frame_bytes).unwrap_or(u32::MAX);
-        cfg.advisory_depth = usize::try_from(q.advisory_depth).unwrap_or(usize::MAX);
-        cfg.payload_depth = usize::try_from(q.payload_depth).unwrap_or(usize::MAX);
-        cfg.gossip_depth = usize::try_from(q.gossip_depth).unwrap_or(usize::MAX);
-        cfg.spool_frames = usize::try_from(q.spool_frames).unwrap_or(usize::MAX);
-        cfg.per_sender_quota = usize::try_from(q.per_sender_quota).unwrap_or(usize::MAX);
-        cfg.max_readback_bytes_per_slice = q.max_readback_bytes;
-        cfg.max_live_buffer_handles = q.max_live_handles;
-        cfg.max_live_buffer_bytes = q.max_live_bytes;
-        cfg.max_outstanding_ops = q.max_outstanding_ops;
-        cfg.compute_queue_depth = q.compute_queue_depth;
-        cfg.granted_artifacts = q.granted_artifacts.iter().map(|h| h.0).collect();
+        if let Some(q) = &self.quotas {
+            apply_admitted_quotas(q, cfg);
+        }
     }
+}
+
+/// Copy one derived [`daemon_vhc_proto::AdmittedQuotas`] into a [`crate::v2::V2RunConfig`] — the
+/// single quota→config mapping shared by [`AdmissionV2::apply_quotas`] and the worker's
+/// envelope-v2 join path (D1 deliverable 4: the join derives the role's quotas from the genesis
+/// grants and applies them here, so assess and join agree on the mapping by construction).
+///
+/// `granted_artifacts` REPLACES the config's set (the envelope is the authority; empty grants =
+/// no artifacts, fail closed). `0` admitted = "unbounded by this grant" (ABI §2.3): the driver
+/// treats 0 the same way, so the values copy through verbatim.
+pub fn apply_admitted_quotas(
+    q: &daemon_vhc_proto::AdmittedQuotas,
+    cfg: &mut crate::v2::V2RunConfig,
+) {
+    cfg.max_frame_bytes = u32::try_from(q.max_frame_bytes).unwrap_or(u32::MAX);
+    cfg.advisory_depth = usize::try_from(q.advisory_depth).unwrap_or(usize::MAX);
+    cfg.payload_depth = usize::try_from(q.payload_depth).unwrap_or(usize::MAX);
+    cfg.gossip_depth = usize::try_from(q.gossip_depth).unwrap_or(usize::MAX);
+    cfg.spool_frames = usize::try_from(q.spool_frames).unwrap_or(usize::MAX);
+    cfg.per_sender_quota = usize::try_from(q.per_sender_quota).unwrap_or(usize::MAX);
+    cfg.max_readback_bytes_per_slice = q.max_readback_bytes;
+    cfg.max_live_buffer_handles = q.max_live_handles;
+    cfg.max_live_buffer_bytes = q.max_live_bytes;
+    cfg.max_outstanding_ops = q.max_outstanding_ops;
+    cfg.compute_queue_depth = q.compute_queue_depth;
+    cfg.granted_artifacts = q.granted_artifacts.iter().map(|h| h.0).collect();
 }
 
 /// A funnel refusal: which stage refused, the typed code where one is ratified (§9.5: stages 1–3
@@ -949,6 +963,107 @@ mod tests {
         assert_eq!(err.stage, 4);
         assert_eq!(err.code, Some(AbiRefusalCode::GrantsExceedLane));
         assert!(err.reason.contains("max_frame_bytes"));
+    }
+
+    /// D1 deliverable 4 (grants threading): `EnvelopeRoleGrants::from_genesis` derives a role's
+    /// grants straight from a genesis envelope and feeds the SAME admission seam the hand-built
+    /// grants do — the production path the worker join threads in place of the pre-D1 `None`. Here
+    /// the worker role's channel grant exceeds the trainer lane's frame ceiling, so the derived
+    /// grants produce the identical stage-4 `GrantsExceedLane` refusal (before any compile).
+    #[test]
+    fn from_genesis_role_grants_feed_the_admission_seam() {
+        use std::collections::BTreeMap;
+        let worker = Worker::new(crate::runtime::EngineConfig::default()).unwrap();
+        let owner = OwnerPolicy {
+            participation_enabled: true,
+            vram_cap_bytes: 0,
+            host_cap_bytes: 0,
+        };
+        let mut grants = daemon_vhc_proto::RoleGrants::default();
+        grants.channels.push(daemon_vhc_proto::ChannelDecl {
+            id: 0,
+            name: "control".into(),
+            class: 0,
+            direction: 2,
+            max_frame_bytes: 1 << 30, // wider than the trainer lane's 16 MiB ceiling
+            rate_per_min: 60,
+            spool_frames: Some(8),
+            replay_window: Some(64),
+            per_sender_quota: Some(4),
+        });
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            "worker".to_string(),
+            daemon_vhc_proto::RoleEntry {
+                lane: "trainer".into(),
+                module: "worker-mod".into(),
+                abi: "vhc@2".into(),
+                config: ciborium::value::Value::Map(vec![]),
+                grants,
+                device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            },
+        );
+        roles.insert(
+            "coordinator".to_string(),
+            daemon_vhc_proto::RoleEntry {
+                lane: "coordinator".into(),
+                module: "coord-mod".into(),
+                abi: "vhc@2".into(),
+                config: ciborium::value::Value::Map(vec![]),
+                grants: daemon_vhc_proto::RoleGrants::default(),
+                device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            },
+        );
+        let mut artifacts = BTreeMap::new();
+        artifacts.insert(
+            "worker-mod".to_string(),
+            daemon_vhc_proto::SnapshotArtifact {
+                url: "r2://mods/worker.wasm".into(),
+                blake3: daemon_vhc_proto::Hash([1u8; 32]),
+                size: Some(4096),
+            },
+        );
+        artifacts.insert(
+            "coord-mod".to_string(),
+            daemon_vhc_proto::SnapshotArtifact {
+                url: "r2://mods/coord.wasm".into(),
+                blake3: daemon_vhc_proto::Hash([2u8; 32]),
+                size: Some(2048),
+            },
+        );
+        let env = daemon_vhc_proto::GenesisEnvelope {
+            run: daemon_vhc_proto::RunSectionV2 {
+                schema: daemon_vhc_proto::GENESIS_SCHEMA_MAJOR,
+                run_label: "grants-run".into(),
+                min_peers: 1,
+                max_peers: 8,
+                access: daemon_vhc_proto::envelope::Access::Org,
+            },
+            roles,
+            artifacts,
+            authority: ciborium::value::Value::Map(vec![]),
+            transport: daemon_vhc_proto::TransportSelection::default(),
+            identities: daemon_vhc_proto::Identities::default(),
+        };
+        // The derivation the worker join threads (replacing the pre-D1 `None`).
+        let eg = EnvelopeRoleGrants::from_genesis(&env, "worker").expect("worker role present");
+        assert!(EnvelopeRoleGrants::from_genesis(&env, "no-such-role").is_none());
+
+        let err = admit_v2(
+            &worker,
+            b"not wasm",
+            None,
+            &[],
+            &[],
+            &lane(),
+            &DeviceProfile::default(),
+            &owner,
+            None,
+            Some(&eg),
+        )
+        .unwrap_err();
+        assert_eq!(err.stage, 4);
+        assert_eq!(err.code, Some(AbiRefusalCode::GrantsExceedLane));
     }
 
     /// D0 deliverable 2: the admitted quotas copy into `V2RunConfig` (the Phase-B seam) —

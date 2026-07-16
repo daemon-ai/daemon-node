@@ -18,9 +18,10 @@
 //!   [`RoundExperiment::train_step`], then one [`RoundExperiment::inner_update`]; after all
 //!   steps, one [`RoundExperiment::make_update`] → a `Commit` action.
 //! - **The barrier (I2/I3)** — a `RoundRecord` is ingestible only when every record-listed
-//!   payload is fetchable; ingest consumes a [`Staged`] set minted in **record-listed order with
-//!   per-item blake3 verification** ([`Staged::mint`] — the bridging oracle Phase D re-types as
-//!   `Committed<T>` byte-identically); records ingest in strictly ascending round order.
+//!   payload is fetchable; ingest consumes a [`Committed`] set minted in **record-listed order with
+//!   per-item blake3 verification** ([`Committed::mint`] — the D1 re-type of A2's bridged `Staged`,
+//!   byte-identical but now gated by an [`Authorized`] token); records ingest in strictly ascending
+//!   round order.
 //! - **The straggle ladder (RUN-8/§6.4)** — an unfetchable head enters the stall ladder
 //!   (`Straggle{Fetching}`), later `RoundOpen`s while stalled skip training and heartbeat
 //!   `Straggle{Stalled}` against the `stall_rounds_max` budget, catch-up ingests late
@@ -35,7 +36,18 @@
 use std::collections::BTreeMap;
 
 use daemon_vhc_proto::messages::{BatchWindow, Commitment, RecordEntry, RoundOpen, RoundRecord};
-use daemon_vhc_proto::{blake3_hash, Hash, PeerId};
+use daemon_vhc_proto::{blake3_hash, PeerId};
+
+// D1 re-typing (refactor §8/D1): the barrier ingests `Committed<T>` — the authority-gated re-type of
+// A2's bridged `Staged` — from `daemon-vhc-sdk-consensus`. The mint's ordering/verification is
+// byte-identical, so the barrier-round pins and the TinyLlama det-digest parity lanes reproduce the
+// same digests; the only change is that construction now flows through an `Authorized` token
+// (`crate::authority`). The former in-crate `Staged`/`PayloadRepr`/`PayloadSource`/`HostStaged`/
+// `MintError` types moved to sdk-consensus and are re-exported here for existing call sites.
+pub use daemon_vhc_sdk_consensus::{
+    Authorized, Committed, CommittedItem, HostStaged, MintError, PayloadCheck, PayloadRepr,
+    PayloadSource, DEFAULT_RECORDS_CHANNEL,
+};
 
 /// The round id vocabulary (matches the session seam).
 pub type RoundId = u64;
@@ -75,136 +87,9 @@ pub trait RoundExperiment<P = Vec<u8>> {
     fn inner_update(&mut self, inner_step: u32);
     /// Seal this round's outer update as opaque payload bytes.
     fn make_update(&mut self, round: RoundId) -> Vec<u8>;
-    /// The barrier ingest of the verified, record-ordered committed set → the det-lane digest.
-    fn ingest(&mut self, round: RoundId, staged: &Staged<P>) -> [u8; 16];
-}
-
-/// How a payload representation proves itself against the record-listed hash at mint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PayloadCheck {
-    /// The repr carries the bytes and they hash to the listed value.
-    Verified,
-    /// The repr carries the bytes and they DO NOT hash to the listed value (tamper — refuse).
-    Mismatch,
-    /// The repr is a host staging token: the host hash-verified the content before announcing it
-    /// (`PayloadReady` is delivered only after blake3 verification, ABI §4.3), so the in-guest
-    /// check is delegated — the oracle semantics (record-listed order, all-or-nothing) still hold.
-    HostVerified,
-}
-
-/// A committed payload's representation at the barrier: in-guest bytes (native tests, the
-/// session's verified cache) or a host staging token (the bridge's `read_back` kinds — guest
-/// payloads never enter linear memory wholesale, architecture §3.4).
-pub trait PayloadRepr: Clone + PartialEq {
-    /// Check this repr against the record-listed blake3.
-    fn check(&self, expected: &Hash) -> PayloadCheck;
-}
-
-impl PayloadRepr for Vec<u8> {
-    fn check(&self, expected: &Hash) -> PayloadCheck {
-        if blake3_hash(self) == *expected {
-            PayloadCheck::Verified
-        } else {
-            PayloadCheck::Mismatch
-        }
-    }
-}
-
-/// A host-staged payload token: the staging id / `upd_*` index `read_back` yielded. The host
-/// verified the content hash before announcing it (ABI §4.3), so the mint delegates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostStaged(pub u64);
-
-impl PayloadRepr for HostStaged {
-    fn check(&self, _expected: &Hash) -> PayloadCheck {
-        PayloadCheck::HostVerified
-    }
-}
-
-/// Where committed payloads come from at the barrier. Sans-io: `None` = not (yet) fetchable
-/// (→ the stall ladder), never an await. Guests answer with staged tokens; the session answers
-/// from its verified cache; tests answer from a map.
-pub trait PayloadSource<P = Vec<u8>> {
-    /// The payload committed by `peer` for `round`, if fetchable now.
-    fn payload(&mut self, round: RoundId, peer: &PeerId) -> Option<P>;
-}
-
-impl<P: Clone> PayloadSource<P> for BTreeMap<(RoundId, PeerId), P> {
-    fn payload(&mut self, round: RoundId, peer: &PeerId) -> Option<P> {
-        self.get(&(round, *peer)).cloned()
-    }
-}
-
-/// The verified, record-ordered committed set the barrier ingests — the **bridging oracle**
-/// (refactor §5 A2): its ordering/verification semantics are pinned by tests so Phase D can
-/// re-type it as `Committed<T>` with byte-identical behavior. Constructible only through
-/// [`Staged::mint`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Staged<P = Vec<u8>> {
-    items: Vec<StagedItem<P>>,
-}
-
-/// One verified committed payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedItem<P = Vec<u8>> {
-    /// The contributing peer.
-    pub peer: PeerId,
-    /// The record-listed blake3 (verified against `bytes` at mint).
-    pub hash: Hash,
-    /// The payload representation (bytes, or a host staging token).
-    pub bytes: P,
-}
-
-/// Why a [`Staged::mint`] refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MintError {
-    /// A record-listed payload is not fetchable yet (the caller stalls — never a panic).
-    Missing {
-        /// The peer whose payload is missing.
-        peer: PeerId,
-    },
-    /// Fetched bytes do not hash to the record-listed value (tamper — refuse, propagate).
-    HashMismatch {
-        /// The offending peer.
-        peer: PeerId,
-    },
-}
-
-impl<P: PayloadRepr> Staged<P> {
-    /// Mint the staged set from a record's listed entries: **record-listed order** (I3 — never
-    /// arrival or map order), every item's bytes **blake3-verified** against its listed hash. A
-    /// missing payload refuses with [`MintError::Missing`] (the stall ladder's input); a mismatch
-    /// refuses with [`MintError::HashMismatch`].
-    ///
-    /// # Errors
-    /// [`MintError`] as above; on any error NOTHING is minted (all-or-nothing, the I2 barrier).
-    pub fn mint(
-        round: RoundId,
-        entries: &[RecordEntry],
-        source: &mut impl PayloadSource<P>,
-    ) -> Result<Self, MintError> {
-        let mut items = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let Some(bytes) = source.payload(round, &entry.peer) else {
-                return Err(MintError::Missing { peer: entry.peer });
-            };
-            if bytes.check(&entry.hash) == PayloadCheck::Mismatch {
-                return Err(MintError::HashMismatch { peer: entry.peer });
-            }
-            items.push(StagedItem {
-                peer: entry.peer,
-                hash: entry.hash,
-                bytes,
-            });
-        }
-        Ok(Self { items })
-    }
-
-    /// The verified items, in record-listed order.
-    #[must_use]
-    pub fn items(&self) -> &[StagedItem<P>] {
-        &self.items
-    }
+    /// The barrier ingest of the authority-verified, record-ordered committed set → the det-lane
+    /// digest.
+    fn ingest(&mut self, round: RoundId, committed: &Committed<P>) -> [u8; 16];
 }
 
 /// Static per-epoch configuration (the engine's `EngineConfig` subset the round logic consumes).
@@ -385,18 +270,27 @@ impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
 
     /// Ingest queued records in strictly ascending round order, stopping at the first whose
     /// committed set cannot be minted (ported from the engine's `advance` + `try_ingest`, with
-    /// [`Staged::mint`] as the fetch+verify+order step).
+    /// [`Committed::mint`] as the fetch+verify+order step).
+    ///
+    /// The record reached this driver as an **authoritative frame on the declared records channel**
+    /// (ABI §6.2 / §12.1): in the bridge / mixed-fleet cell-6 topology the host signature-verifies
+    /// the coordinator's frame above the pump (`daemon-vhc-session::v2_attach`) before it is
+    /// delivered, so authorization is discharged by that host mechanism and expressed here as an
+    /// [`Authorized`] token from the authoritative channel. D2's in-guest wasm coordinator threads a
+    /// real [`daemon_vhc_sdk_consensus::Authority::authorize`] token instead (zero change to the
+    /// mint's ordering/verification, so digests are unaffected).
     fn advance(
         &mut self,
         trigger: Option<RoundId>,
         source: &mut impl PayloadSource<P>,
         out: &mut Vec<Outbound>,
     ) {
+        let authorized = Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
         while let Some(round) = self.pending.keys().next().copied() {
             let entries = self.pending[&round].clone();
-            match Staged::mint(round, &entries, source) {
-                Ok(staged) => {
-                    let digest = self.experiment.ingest(round, &staged);
+            match Committed::mint(&authorized, round, &entries, source) {
+                Ok(committed) => {
+                    let digest = self.experiment.ingest(round, &committed);
                     self.last_ingested = Some(round);
                     self.pending.remove(&round);
                     let on_time = !self.straggling && trigger == Some(round);

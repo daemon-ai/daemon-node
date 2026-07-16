@@ -20,7 +20,9 @@ use std::collections::HashMap;
 
 use ciborium::value::Value;
 use daemon_vhc_proto::sign::verify_bytes;
-use daemon_vhc_proto::{to_canonical_vec, PeerId, Signature};
+use daemon_vhc_proto::{
+    to_canonical_vec, verify_certified_sender, Hash, PeerId, RunKeyCertificate, Signature,
+};
 
 /// The verdict on one inbound §12.1 frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +67,17 @@ pub enum InboundVerdict {
         /// The seq the frame carries.
         got: u64,
     },
+    /// The frame's signature verified over its `sender`, but that per-run key is **not certified**
+    /// to the trusted base identity for this frame's `(run, role, instance, epoch)` scope (D1
+    /// certified per-run keys, architecture §4.3). Only surfaced when the attach was configured
+    /// with a certificate store ([`InboundFrames::with_certs`]); the certificate-less transition
+    /// path (the retained A2 verifier) never produces it. This is the signature-downgrade refusal.
+    UncertifiedSender {
+        /// The sending per-run key that lacks a valid certificate chain.
+        sender: [u8; 32],
+        /// The refusal reason (the underlying `CertError`).
+        reason: String,
+    },
     /// Verified and in-sequence, but the pump's bounded spool (or this sender's quota) is full
     /// (§4.7): the frame was NOT delivered and the cursor was rewound — hold + retry the same
     /// frame; the reliable class never drops.
@@ -78,24 +91,67 @@ pub enum InboundVerdict {
     },
 }
 
+/// The D1 certified-per-run-key check layered **around** the A2 frame verifier (architecture §4.3):
+/// which base identity a receiver trusts to certify per-run keys, and the certificates it holds
+/// (distributed beside frames / via join records). Configured only on the cert-aware path; absent on
+/// the retained transition path.
+pub struct CertCheck {
+    /// The base machine identity whose certificates this attach trusts (e.g. the coordinator's).
+    pub trusted_base: PeerId,
+    /// The certificates that authenticate per-run keys to `trusted_base`.
+    pub certs: Vec<RunKeyCertificate>,
+}
+
 /// Inbound §12.1 verification state for one run attach: the expected run scope + per
-/// `(sender, channel)` sequence cursors (the dedup/gap substrate, §12.2).
+/// `(sender, channel)` sequence cursors (the dedup/gap substrate, §12.2), plus the optional D1
+/// certified-key layer.
 pub struct InboundFrames {
     run_id: [u8; 32],
     epoch: u64,
     /// Next expected seq per `(sender, channel)` — everything below is a duplicate, everything
     /// above is a gap.
     cursors: HashMap<([u8; 32], u64), u64>,
+    /// The optional D1 certified-per-run-key layer (`None` = the retained A2 verifier, the
+    /// transition path — the frame signature over `sender` is checked, but `sender` is not required
+    /// to be certified).
+    cert_check: Option<CertCheck>,
 }
 
 impl InboundFrames {
-    /// A verifier for one run scope.
+    /// A verifier for one run scope — the **retained A2 verifier** (frame signature over `sender`,
+    /// scope, dedup/gap). No certified-key requirement: the transition path, behaviorally identical
+    /// to before D1.
     #[must_use]
     pub fn new(run_id: [u8; 32], epoch: u64) -> Self {
         Self {
             run_id,
             epoch,
             cursors: HashMap::new(),
+            cert_check: None,
+        }
+    }
+
+    /// A verifier that additionally requires every accepted frame's `sender` per-run key to be
+    /// **certified** to `trusted_base` for the frame's `(run, role, instance, epoch)` scope (D1
+    /// certified per-run keys, architecture §4.3). Everything the A2 verifier checks still runs
+    /// first; the certified-key check is an additional guard that turns an uncertified sender into
+    /// [`InboundVerdict::UncertifiedSender`] (the signature-downgrade refusal) rather than a
+    /// delivery.
+    #[must_use]
+    pub fn with_certs(
+        run_id: [u8; 32],
+        epoch: u64,
+        trusted_base: PeerId,
+        certs: Vec<RunKeyCertificate>,
+    ) -> Self {
+        Self {
+            run_id,
+            epoch,
+            cursors: HashMap::new(),
+            cert_check: Some(CertCheck {
+                trusted_base,
+                certs,
+            }),
         }
     }
 
@@ -138,6 +194,12 @@ impl InboundFrames {
                 .and_then(Value::as_integer)
                 .and_then(|n| u64::try_from(i128::from(n)).ok())
         };
+        let text = |name: &str| -> Option<String> {
+            match field(name) {
+                Some(Value::Text(t)) => Some(t.clone()),
+                _ => None,
+            }
+        };
         let (Some(run_id), Some(sender), Some(payload_hash)) = (
             bytes32("run_id"),
             bytes32("sender"),
@@ -175,6 +237,34 @@ impl InboundFrames {
                 hex_prefix(&self.run_id),
                 self.epoch,
             ));
+        }
+
+        // 3b. Certified per-run key (D1, architecture §4.3): when a cert store is configured, the
+        // per-run `sender` key (whose frame signature just verified — the retained A2 check above)
+        // MUST be certified to the trusted base identity for this frame's (run, role, instance,
+        // epoch) scope. An uncertified sender is the signature-downgrade refusal. The `role` and
+        // `instance` are read from the frozen §12.1 envelope fields (read-only — the envelope shape
+        // is untouched).
+        if let Some(check) = &self.cert_check {
+            let (Some(role), Some(instance)) = (text("role"), uint("instance")) else {
+                return InboundVerdict::Malformed(
+                    "missing role/instance for the certified-key check".into(),
+                );
+            };
+            if let Err(e) = verify_certified_sender(
+                &Hash(run_id),
+                &role,
+                instance,
+                epoch,
+                &PeerId(sender),
+                &check.trusted_base,
+                &check.certs,
+            ) {
+                return InboundVerdict::UncertifiedSender {
+                    sender,
+                    reason: e.to_string(),
+                };
+            }
         }
 
         // 4. Sequence position per (sender, channel): dense from 0 (§12.2).

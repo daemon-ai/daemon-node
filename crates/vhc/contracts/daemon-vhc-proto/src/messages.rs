@@ -304,6 +304,20 @@ impl SignedMessage {
         expected.check_join(self.version)?;
         self.verify()
     }
+
+    /// The exact signed preimage bytes: the canonical CBOR of `(version, payload)` this frame's
+    /// `sig` covers. Exposed so an SDK `Authority` (architecture §4.2 — D1) can authorize a
+    /// coordinator record against its trust topology (`SingleKey`/`ThresholdKeys` verify presented
+    /// signatures over exactly these bytes) without re-implementing the frame's preimage layout.
+    ///
+    /// # Errors
+    /// A canonical-CBOR encoding failure ([`SwarmProtoError::Codec`]).
+    pub fn preimage_bytes(&self) -> Result<Vec<u8>, SwarmProtoError> {
+        crate::canonical::to_canonical_vec(&Preimage {
+            version: self.version,
+            payload: &self.payload,
+        })
+    }
 }
 
 #[cfg(test)]

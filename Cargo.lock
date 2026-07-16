@@ -5028,6 +5028,7 @@ dependencies = [
 name = "daemon-vhc-sdk-consensus"
 version = "0.0.1"
 dependencies = [
+ "ciborium",
  "daemon-vhc-proto",
  "proptest",
  "serde",
