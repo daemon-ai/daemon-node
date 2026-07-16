@@ -22,7 +22,8 @@ pub mod abi;
 #[cfg(target_arch = "wasm32")]
 pub use abi::{
     buffer_len, buffer_release, cancel, create_from, next_event, payload_get, payload_put, publish,
-    read_back_bytes, read_back_uint, read_buffer, set_timer, Event,
+    read_back_bytes, read_back_uint, read_buffer, set_timer, stream_accept, stream_open,
+    stream_read, stream_write, Event,
 };
 
 pub mod migrate;

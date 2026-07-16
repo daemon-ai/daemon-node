@@ -23,6 +23,7 @@ pub mod event;
 pub mod journal;
 pub mod ops;
 pub mod replay;
+pub mod streams;
 
 pub use admission::{
     admit_v2, AdmissionV2, DeviceProfile, FunnelRefusal, MemoryClaim, OwnerPolicy,
@@ -38,3 +39,4 @@ pub use event::{decode_event_frame, encode_event_frame, EventCodecError, EventV2
 pub use journal::{Dropped, JournalSink, MemorySink, SinkEntry, SinkError};
 pub use ops::{OpRequest, OpTable};
 pub use replay::{replay_v2, ReplayEnd, ReplayScript, ReplayedDecision, ReplayedRun};
+pub use streams::StreamTable;

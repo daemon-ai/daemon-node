@@ -81,6 +81,10 @@ pub struct ReplayScript {
     /// bytes come from here; a missing entry is the typed `ReplayMissingPayload` divergence,
     /// never a silent pass.
     pub payloads: HashMap<[u8; 32], Vec<u8>>,
+    /// Stream-read completion bytes (the ABI kind-4 tag-2 records): `(op, bytes)` in arrival
+    /// order — opaque stream payloads have no content address, so the journal carries them
+    /// verbatim and replay materializes each read's buffer from here.
+    pub stream_bytes: VecDeque<(u64, Vec<u8>)>,
 }
 
 impl ReplayScript {
@@ -96,6 +100,10 @@ impl ReplayScript {
                 } => {
                     if *kind >= 128 {
                         s.nr.push_back((*kind, value.clone()));
+                    } else if *kind == u64::from(daemon_vhc_abi::READBACK_KIND_STREAM_BYTES) {
+                        // Journal-record-only kind (never a guest call): completion-carried
+                        // stream bytes, consumed at completion delivery — not by read_back.
+                        s.stream_bytes.push_back((*src, value.clone()));
                     } else {
                         s.readbacks.push_back((*src, *kind, value.clone()));
                     }
@@ -167,8 +175,10 @@ struct ReplayHost {
     ops: OpTable,
     /// `payload_get` op → requested hash (guest-authored, deterministic).
     op_hashes: HashMap<u64, [u8; 32]>,
+    /// `stream_read` ops awaiting their journaled kind-4 bytes at completion delivery.
+    stream_read_ops: std::collections::HashSet<u64>,
     /// Host-partition (completion-minted) buffers, keyed by the handle the journaled completion
-    /// frame carries, materialized from `script.payloads` at delivery.
+    /// frame carries, materialized from `script.payloads` / `script.stream_bytes` at delivery.
     host_buffers: HashMap<u64, Arc<Vec<u8>>>,
 }
 
@@ -274,7 +284,24 @@ fn dispatch(
                                 )));
                             };
                             host.host_buffers.insert(h, Arc::new(bytes.clone()));
+                        } else if host.stream_read_ops.remove(&op) {
+                            // Opaque stream bytes: materialize from the journaled kind-4 record
+                            // (arrival order == delivery order).
+                            let Some((src, bytes)) = host.script.stream_bytes.pop_front() else {
+                                return Err(diverged(format!(
+                                    "stream-read completion for op {op:#x} has no journaled \
+                                     kind-4 bytes record"
+                                )));
+                            };
+                            if src != op {
+                                return Err(diverged(format!(
+                                    "journaled stream bytes belong to op {src:#x}, not {op:#x}"
+                                )));
+                            }
+                            host.host_buffers.insert(h, Arc::new(bytes));
                         }
+                        // Stream handles (kind 9) from open/accept completions need no
+                        // materialization: replay validates stream ops via op bookkeeping.
                     }
                 }
             } else {
@@ -376,6 +403,52 @@ fn dispatch(
                 .begin(OpRequest::PayloadGet { hash })
                 .map_err(|c| diverged(format!("payload_get refused at replay: {c:?}")))?;
             host.op_hashes.insert(op, hash);
+            results[0] = Val::I64(op as i64);
+            Ok(())
+        }
+        ("net@2", "stream_open") => {
+            let peer_ptr = p_u32(params, 0);
+            let mem = mem_of(caller)?;
+            let mut peer = [0u8; 32];
+            mem.read(&mut *caller, peer_ptr as usize, &mut peer)
+                .map_err(|e| wasmtime::Error::msg(format!("stream_open read: {e}")))?;
+            let op = caller
+                .data_mut()
+                .ops
+                .begin(OpRequest::StreamOpen { peer })
+                .map_err(|c| diverged(format!("stream_open refused at replay: {c:?}")))?;
+            results[0] = Val::I64(op as i64);
+            Ok(())
+        }
+        ("net@2", "stream_accept") => {
+            let op = caller
+                .data_mut()
+                .ops
+                .begin(OpRequest::StreamAccept)
+                .map_err(|c| diverged(format!("stream_accept refused at replay: {c:?}")))?;
+            results[0] = Val::I64(op as i64);
+            Ok(())
+        }
+        ("net@2", "stream_write") => {
+            let (stream, buffer) = (p_u64(params, 0), p_u64(params, 1));
+            let bytes = resolve_replay_buffer(caller.data(), buffer)
+                .ok_or_else(|| diverged(format!("stream_write on unknown buffer {buffer:#x}")))?;
+            let op = caller
+                .data_mut()
+                .ops
+                .begin(OpRequest::StreamWrite { stream, bytes })
+                .map_err(|c| diverged(format!("stream_write refused at replay: {c:?}")))?;
+            results[0] = Val::I64(op as i64);
+            Ok(())
+        }
+        ("net@2", "stream_read") => {
+            let stream = p_u64(params, 0);
+            let host = caller.data_mut();
+            let op = host
+                .ops
+                .begin(OpRequest::StreamRead { stream })
+                .map_err(|c| diverged(format!("stream_read refused at replay: {c:?}")))?;
+            host.stream_read_ops.insert(op);
             results[0] = Val::I64(op as i64);
             Ok(())
         }
@@ -589,6 +662,7 @@ pub fn replay_v2(
         buffers: BufferTable::new(0, 0, 0),
         ops: OpTable::new(0, 0),
         op_hashes: HashMap::new(),
+        stream_read_ops: std::collections::HashSet::new(),
         host_buffers: HashMap::new(),
     };
     let mut store = Store::new(worker.engine(), host);

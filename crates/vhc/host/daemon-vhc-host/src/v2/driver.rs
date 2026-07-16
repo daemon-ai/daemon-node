@@ -70,6 +70,7 @@ use crate::v2::completion::{CompError, CompletionResult, SuccessPayload};
 use crate::v2::event::{encode_event_frame, EventV2, PayloadMeta};
 use crate::v2::journal::{JournalSink, SinkError};
 use crate::v2::ops::{OpRequest, OpTable};
+use crate::v2::streams::StreamTable;
 
 /// The frozen execution-identity five-tuple (ABI §8.1) as the driver consumes it.
 #[derive(Debug, Clone)]
@@ -223,6 +224,25 @@ pub enum OpOutcome {
         /// The fetched bytes (verified against the op's requested hash by the pump).
         bytes: Vec<u8>,
     },
+    /// A `stream_open` connected; the pump mints the kind-9 handle with this receiver-granted
+    /// initial writable credit (§3.3).
+    OpenDone {
+        /// Initial writable credit (bytes).
+        credit: u64,
+    },
+    /// A standing `stream_accept` matched an incoming stream; the pump mints the handle.
+    AcceptDone {
+        /// Initial writable credit (bytes) for THIS side's writes on the accepted stream.
+        credit: u64,
+    },
+    /// A `stream_write`'s bytes were accepted by the transport (unit completion, §3.4).
+    WriteDone,
+    /// A `stream_read` received these opaque bytes (journaled verbatim at completion — stream
+    /// payloads are not content-addressed; ABI kind-4 record).
+    ReadDone {
+        /// The received bytes.
+        bytes: Vec<u8>,
+    },
     /// The operation failed (`COMP_ERR_*`, e.g. `NetUnreachable` for a connection failure —
     /// connection establishment/failure are completions of the op that needed the connection,
     /// architecture §3.3).
@@ -314,6 +334,8 @@ struct PumpState {
     buffers: BufferTable,
     /// The outstanding-op table (kind 10, ABI §7.5).
     ops: OpTable,
+    /// The stream table (kind 9, §3.3 credit flow control).
+    streams: StreamTable,
     /// Requests awaiting the embedder (the async-runtime bridge): `(op, request)` in issue order.
     op_requests: Vec<(u64, OpRequest)>,
     /// A `Stop` has been enqueued — no further deliveries will be accepted after it.
@@ -769,18 +791,25 @@ impl PumpHandle {
     /// Complete an outstanding op with the embedder's outcome. The pump — not the embedder — owns
     /// the trust steps (architecture §3.4): a put's hash is computed here over the op's own sealed
     /// bytes; a get's bytes are hash-verified against the requested hash BEFORE the completion is
-    /// delivered (a mismatch completes `HashMismatch`, and the guest never sees the bytes). A
-    /// completion for an op that is no longer outstanding (it was cancelled) is the raced-cancel
-    /// no-op: the guest was already told `Cancelled`.
+    /// delivered (a mismatch completes `HashMismatch`, and the guest never sees the bytes);
+    /// stream/buffer handles are minted here (never trusted from the embedder), and a stream
+    /// read's opaque bytes are journaled verbatim at arrival (the ABI kind-4 record) — they are
+    /// nondeterministic input that no content address can re-fetch. A completion for an op that
+    /// is no longer outstanding (it was cancelled) is the raced-cancel no-op: the guest was
+    /// already told `Cancelled`.
+    ///
+    /// Returns the handle the completion minted (`Some` for get/open/accept — the transport
+    /// needs it to route subsequent writes/reads), else `None`.
     ///
     /// # Errors
     /// A journal-sink failure, or an outcome that contradicts the op's request shape (an embedder
     /// bug, surfaced loudly).
-    pub fn complete_op(&self, op: u64, outcome: OpOutcome) -> Result<(), SinkError> {
+    pub fn complete_op(&self, op: u64, outcome: OpOutcome) -> Result<Option<u64>, SinkError> {
         let mut st = self.shared.state.lock().expect("pump lock");
         let Some(request) = st.ops.finish(op) else {
-            return Ok(()); // cancelled while in service — Cancelled was already delivered
+            return Ok(None); // cancelled while in service — Cancelled was already delivered
         };
+        let mut minted = None;
         let result = match (request, outcome) {
             (OpRequest::PayloadPut { bytes }, OpOutcome::PutDone) => {
                 CompletionResult::Ok(SuccessPayload::Hash(*blake3::hash(&bytes).as_bytes()))
@@ -788,7 +817,10 @@ impl PumpHandle {
             (OpRequest::PayloadGet { hash }, OpOutcome::GetDone { bytes }) => {
                 if blake3::hash(&bytes).as_bytes() == &hash {
                     match st.buffers.create_host(Arc::new(bytes)) {
-                        Some(handle) => CompletionResult::Ok(SuccessPayload::Handle(handle)),
+                        Some(handle) => {
+                            minted = Some(handle);
+                            CompletionResult::Ok(SuccessPayload::Handle(handle))
+                        }
                         None => CompletionResult::Err(CompError {
                             code: COMP_ERR_GRANT_EXHAUSTED,
                             detail: Some("buffer quota exhausted (deny new buffers)".into()),
@@ -799,6 +831,40 @@ impl PumpHandle {
                         code: COMP_ERR_HASH_MISMATCH,
                         detail: Some("fetched bytes do not hash to the requested content".into()),
                     })
+                }
+            }
+            (OpRequest::StreamOpen { .. }, OpOutcome::OpenDone { credit }) => {
+                let stream = st.streams.open(credit);
+                minted = Some(stream);
+                CompletionResult::Ok(SuccessPayload::Handle(stream))
+            }
+            (OpRequest::StreamAccept, OpOutcome::AcceptDone { credit }) => {
+                let stream = st.streams.open(credit);
+                minted = Some(stream);
+                CompletionResult::Ok(SuccessPayload::Handle(stream))
+            }
+            (OpRequest::StreamWrite { .. }, OpOutcome::WriteDone) => {
+                CompletionResult::Ok(SuccessPayload::Unit)
+            }
+            (OpRequest::StreamRead { .. }, OpOutcome::ReadDone { bytes }) => {
+                // Opaque stream bytes are a nondeterministic input with NO content address:
+                // journal them verbatim at arrival (the kind-4 record) so replay can
+                // materialize the completion's buffer (§8.1/§8.7).
+                st.sink.read_back(
+                    op,
+                    u64::from(daemon_vhc_abi::READBACK_KIND_STREAM_BYTES),
+                    daemon_vhc_abi::RET_STATUS_DELIVERED,
+                    &bytes,
+                )?;
+                match st.buffers.create_host(Arc::new(bytes)) {
+                    Some(handle) => {
+                        minted = Some(handle);
+                        CompletionResult::Ok(SuccessPayload::Handle(handle))
+                    }
+                    None => CompletionResult::Err(CompError {
+                        code: COMP_ERR_GRANT_EXHAUSTED,
+                        detail: Some("buffer quota exhausted (deny new buffers)".into()),
+                    }),
                 }
             }
             (_, OpOutcome::Failed { code, detail }) => CompletionResult::Err(CompError {
@@ -814,7 +880,20 @@ impl PumpHandle {
         st.enqueue_completion(op, &result)?;
         drop(st);
         self.shared.wake.notify_all();
-        Ok(())
+        Ok(minted)
+    }
+
+    /// Replenish a stream's writable credit (the receiver consumed bytes — transport-driven,
+    /// §3.3). Held writes whose sizes now fit are released FIFO: their transport requests are
+    /// emitted, and their completions will follow the embedder's service — the guest's credit
+    /// signal IS those completions.
+    pub fn grant_credit(&self, stream: u64, credit: u64) {
+        let mut st = self.shared.state.lock().expect("pump lock");
+        let released = st.streams.grant(stream, credit);
+        for (op, bytes) in released {
+            st.op_requests
+                .push((op, OpRequest::StreamWrite { stream, bytes }));
+        }
     }
 
     /// The bridge's final canonical state bytes (the digest input), exported by the guest thread
@@ -1654,6 +1733,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
                 if st.ops.finish(op).is_some() {
+                    // A credit-held stream write is un-held with its op (its bytes never left).
+                    st.streams.cancel_held(op);
                     st.enqueue_completion(op, &CompletionResult::cancelled())
                         .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
                     Ok(0) // cancel accepted: the op's completion reports Cancelled
@@ -1705,6 +1786,121 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         Trap::new(code, "payload_get", None, "max_outstanding grant (§2.3)")
                     })?;
                 st.op_requests.push((op, OpRequest::PayloadGet { hash }));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- net@2 minor 1: direct peer streams under credit flow control (§3.3/§3.4) ---------------
+    linker.func_wrap(
+        NS_NET_V2,
+        "stream_open",
+        |mut c: Caller<'_, V2Host>, peer_ptr: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("stream_open")?;
+                let peer_bytes = read_guest(c, peer_ptr, 32)?;
+                let peer: [u8; 32] = peer_bytes.as_slice().try_into().expect("32-byte span");
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st
+                    .ops
+                    .begin(OpRequest::StreamOpen { peer })
+                    .map_err(|code| {
+                        Trap::new(code, "stream_open", None, "max_outstanding grant (§2.3)")
+                    })?;
+                st.op_requests.push((op, OpRequest::StreamOpen { peer }));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_NET_V2,
+        "stream_accept",
+        |mut c: Caller<'_, V2Host>| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("stream_accept")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let op = st.ops.begin(OpRequest::StreamAccept).map_err(|code| {
+                    Trap::new(code, "stream_accept", None, "max_outstanding grant (§2.3)")
+                })?;
+                st.op_requests.push((op, OpRequest::StreamAccept));
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_NET_V2,
+        "stream_write",
+        |mut c: Caller<'_, V2Host>, stream: u64, buffer: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("stream_write")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let bytes = st
+                    .buffers
+                    .resolve(buffer)
+                    .map_err(|code| Trap::new(code, "stream_write", None, "buffer handle"))?;
+                let op = st
+                    .ops
+                    .begin(OpRequest::StreamWrite {
+                        stream,
+                        bytes: bytes.clone(),
+                    })
+                    .map_err(|code| {
+                        Trap::new(code, "stream_write", None, "max_outstanding grant (§2.3)")
+                    })?;
+                // Credit flow control (§3.3): the transport request is emitted only when the
+                // stream's writable credit covers the bytes; otherwise the op is HELD pump-side
+                // (still outstanding — the guest's OpId is live) until the receiver's reads
+                // replenish credit.
+                match st.streams.write(stream, op, bytes.clone()) {
+                    Some(true) => {
+                        st.op_requests
+                            .push((op, OpRequest::StreamWrite { stream, bytes }));
+                    }
+                    Some(false) => { /* held for credit */ }
+                    None => {
+                        st.ops.finish(op);
+                        return Err(Trap::new(
+                            TrapCode::StaleHandle,
+                            "stream_write",
+                            None,
+                            "unknown or stale stream handle",
+                        ));
+                    }
+                }
+                Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_NET_V2,
+        "stream_read",
+        |mut c: Caller<'_, V2Host>, stream: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+                c.data_mut().enter("stream_read")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                if !st.streams.is_live(stream) {
+                    return Err(Trap::new(
+                        TrapCode::StaleHandle,
+                        "stream_read",
+                        None,
+                        "unknown or stale stream handle",
+                    ));
+                }
+                let op = st
+                    .ops
+                    .begin(OpRequest::StreamRead { stream })
+                    .map_err(|code| {
+                        Trap::new(code, "stream_read", None, "max_outstanding grant (§2.3)")
+                    })?;
+                st.op_requests.push((op, OpRequest::StreamRead { stream }));
                 Ok(op)
             })(&mut c);
             stash(&mut c, r)
@@ -2069,6 +2265,7 @@ pub fn start_run(
             // per start_run; trap-restart re-seeding rides the tag-13 counter, ABI §7.1).
             buffers: BufferTable::new(0, run.max_live_buffer_handles, run.max_live_buffer_bytes),
             ops: OpTable::new(0, run.max_outstanding_ops),
+            streams: StreamTable::new(0),
             op_requests: Vec::new(),
             stop_enqueued: false,
             draining: false,
@@ -2224,10 +2421,11 @@ pub fn start_run(
                     .map(crate::runtime::HostState::canonical_state_bytes_of);
                 let mut st = shared.state.lock().expect("pump lock");
                 st.bridge_final_state = final_state;
-                // Force-reclaim the instance's buffers + outstanding ops through the per-instance
-                // tables (architecture §3.4; ABI §7.3) — the guest-thread-owned teardown.
+                // Force-reclaim the instance's buffers + outstanding ops + streams through the
+                // per-instance tables (architecture §3.4; ABI §7.3) — guest-thread-owned teardown.
                 st.buffers.clear();
                 st.ops.clear();
+                st.streams.clear();
                 st.op_requests.clear();
             }
             match run_result {
@@ -2404,6 +2602,7 @@ mod tests {
             bridge_final_state: None,
             buffers: BufferTable::new(0, 0, 0),
             ops: OpTable::new(0, 0),
+            streams: StreamTable::new(0),
             op_requests: Vec::new(),
             stop_enqueued: false,
             draining: false,

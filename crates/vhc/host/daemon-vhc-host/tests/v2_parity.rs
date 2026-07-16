@@ -178,9 +178,10 @@ fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
         // the async-runtime seat; the pump computes the commitment hash itself.
         for (op, request) in pump.take_op_requests() {
             match request {
-                daemon_vhc_host::v2::OpRequest::PayloadPut { .. } => pump
-                    .complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
-                    .expect("put completion"),
+                daemon_vhc_host::v2::OpRequest::PayloadPut { .. } => {
+                    pump.complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
+                        .expect("put completion");
+                }
                 other => panic!("unexpected op request from the parity guest: {other:?}"),
             }
         }

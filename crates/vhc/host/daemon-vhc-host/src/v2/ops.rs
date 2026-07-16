@@ -50,6 +50,31 @@ pub enum OpRequest {
         /// The requested blake3.
         hash: [u8; 32],
     },
+    /// `net.stream_open(peer)` — open a direct stream to `peer`; completes with a kind-9
+    /// `StreamHandle` minted by the pump with the receiver-granted initial credit (§3.3).
+    StreamOpen {
+        /// The remote peer identity.
+        peer: [u8; 32],
+    },
+    /// `net.stream_accept()` — a standing accept; completes with a `StreamHandle` when a peer
+    /// opens a stream to this instance (§3.3 "incoming streams surface as completions of a
+    /// standing accept").
+    StreamAccept,
+    /// `net.stream_write(stream, buffer)` — send these sealed bytes. Emitted ONLY once the
+    /// stream's credit covered them (held writes stay pump-side, §3.3 flow control); completes
+    /// unit when the transport accepted them.
+    StreamWrite {
+        /// The stream.
+        stream: u64,
+        /// The sealed bytes (the op's refcount hold).
+        bytes: Arc<Vec<u8>>,
+    },
+    /// `net.stream_read(stream)` — receive the next chunk; completes with a kind-8 buffer of the
+    /// received bytes (opaque — journaled verbatim at completion, not content-addressed).
+    StreamRead {
+        /// The stream.
+        stream: u64,
+    },
 }
 
 /// The per-instance outstanding-operation table (see module docs).
@@ -187,6 +212,19 @@ mod tests {
             match (self, other) {
                 (Self::PayloadPut { bytes: a }, Self::PayloadPut { bytes: b }) => a == b,
                 (Self::PayloadGet { hash: a }, Self::PayloadGet { hash: b }) => a == b,
+                (Self::StreamOpen { peer: a }, Self::StreamOpen { peer: b }) => a == b,
+                (Self::StreamAccept, Self::StreamAccept) => true,
+                (
+                    Self::StreamWrite {
+                        stream: s1,
+                        bytes: b1,
+                    },
+                    Self::StreamWrite {
+                        stream: s2,
+                        bytes: b2,
+                    },
+                ) => s1 == s2 && b1 == b2,
+                (Self::StreamRead { stream: a }, Self::StreamRead { stream: b }) => a == b,
                 _ => false,
             }
         }

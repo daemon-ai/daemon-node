@@ -117,6 +117,7 @@ fn service_ops(pump: &PumpHandle, store: Arc<Mutex<std::collections::HashMap<[u8
                 pump.complete_op(op, OpOutcome::GetDone { bytes })
                     .expect("get done");
             }
+            other => panic!("test-net-v2 issues no stream ops: {other:?}"),
         }
     }
 }
