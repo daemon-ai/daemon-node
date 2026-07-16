@@ -172,6 +172,54 @@ pub const RNG_SEED_DOMAIN_V2: &str = "daemon-vhc/rng/2";
 /// The byte length of the `sys@2::rng_seed` output.
 pub const RNG_SEED_LEN: usize = 32;
 
+/// The `compute@2` symbol vocabulary (Phase C, track C1; architecture §3.2/§3.3/§3.4, ABI §15
+/// ratified direction). The Burn-shaped compute world lowers ordinary `Autodiff<HostBackend>`
+/// models to a stream of **CBOR-encoded [`burn_ir::OperationIr`] at the pinned Burn version**
+/// (`burn = 0.21.0`; a Burn bump is an ABI event — decisions D8). The four symbols are the wasm
+/// import shim over that stream:
+///
+/// - `submit_op(op_ptr, op_len)` — enqueue one CBOR `OperationIr` (command-queue semantics, ABI
+///   §3.3: enqueue is **infallible** and returns immediately; errors surface only at fence/export).
+///   Opaque `TensorId`s (guest-minted, guest reference-counted, released via `OperationIr::Drop`)
+///   are carried *inside* the op blob — they are a guest-owned id space like staging/timer IDs,
+///   **not** [§7.2](`pack_handle`) host-arena handles.
+/// - `fence(fence_id)` — insert a fence marker into the compute queue; the host delivers
+///   `Event::Fence(fence_id)` ([`EV_TAG_FENCE`]) when the device passes it (architecture §3.3).
+///   Device errors surface here as a typed completion/trap.
+/// - `export(ir_ptr, ir_len) -> OpId` — device tensor → staging: names a tensor by CBOR `TensorIr`
+///   and completes `Ok(BufferHandle)` (kind 8) carrying the CBOR `TensorData`. Bulk bytes ride the
+///   `BufferHandle`/`read_into` path (§3.4), never inline in the op-stream (§15 caveat).
+/// - `import(buffer, meta_ptr, meta_len) -> OpId` — staging → device: registers a sealed buffer's
+///   `TensorData` under the guest-minted `TensorId` named in `meta`, completing `Ok(())`.
+///
+/// **Reserved, refuse cleanly until specified (ABI §15):** quantization / `QFloat`
+/// (`OperationIr::Float(Quantize/Dequantize)` do not lower today) and `OperationIr::Custom`
+/// (custom/fused kernels stay in C2's host-side custom-op registry, architecture §3.2);
+/// `OperationIr::Distributed` is out of scope. The rank-erased-primitive property of Burn is a
+/// hard ABI floor.
+///
+/// **Minor-bump note (mirrors [`SYS_V2_CRYPTO_SYMBOLS`]):** these symbols register at
+/// [`COMPUTE_MINOR_V2`] (the shared Phase-C minor). Like the B1→B2→B3 Phase-B minor, the single
+/// [`DA_ABI_MINOR_V2`] bump to the collective Phase-C minor — flipping the host to *implement*
+/// compute (and thus admit compute-importing modules and deliver [`EV_TAG_FENCE`]) — is a change
+/// the parallel Phase-C tracks (C1 compute, C2 det/custom-ops) share; it lands **once, at the
+/// track merge**, so the v2 guest blobs are re-pinned once, not per track. Registered-but-not-yet-
+/// implemented means `validate_imports` cleanly refuses a compute import as
+/// [`AbiRefusalCode::WorldMinorUnsupported`] until the bump — the honest pre-merge state.
+pub const COMPUTE_V2_SYMBOLS: &[&str] = &["submit_op", "fence", "export", "import"];
+
+/// The shared Phase-C major-2 minor at which the `compute@2` surface ([`COMPUTE_V2_SYMBOLS`]) and
+/// the [`EV_TAG_FENCE`] event are introduced (ABI §15, decisions D8). The host advertises this
+/// minor — and thus admits compute-importing modules and delivers `Fence` — only once
+/// [`DA_ABI_MINOR_V2`] is bumped to it at the Phase-C track merge (see [`COMPUTE_V2_SYMBOLS`]).
+pub const COMPUTE_MINOR_V2: u32 = 2;
+
+/// The pinned Burn version the `compute@2` wire (`CBOR(burn_ir::OperationIr)`) is defined against
+/// (ABI §15, decisions D8). The IR's variant set / discriminants / fields are Burn-version-
+/// specific, so **a Burn version bump is an ABI event** (a variant insertion is a compute-major;
+/// a provably additive change is at most a compute-minor). One pinned version per ABI major.
+pub const COMPUTE_BURN_VERSION: &str = "0.21.0";
+
 /// The v1 five-phase lifecycle exports whose presence (with a `tabi@1`-only import shape) marks a
 /// **candidate major-1** module (ABI §1.3 step 2: "exports include the v1 lifecycle (`da_build` …)").
 pub const V1_LIFECYCLE_EXPORTS: &[&str] = &[
@@ -194,8 +242,9 @@ pub const V2_REQUIRED_EXPORTS: &[&str] = &[
     "da_run",
 ];
 
-/// The Phase-A symbol vocabulary the host provides for a v2 import namespace, or `None` if `ns` is
-/// not a known v2 namespace. `data@2`/`compute@2` are known but empty at Phase A.
+/// The symbol vocabulary the host provides for a v2 import namespace, or `None` if `ns` is
+/// not a known v2 namespace. `data@2` populated at Phase B; `compute@2` at Phase C (registered at
+/// [`COMPUTE_MINOR_V2`], see [`COMPUTE_V2_SYMBOLS`]).
 #[must_use]
 pub fn v2_namespace_symbols(ns: &str) -> Option<&'static [&'static str]> {
     match ns {
@@ -203,7 +252,7 @@ pub fn v2_namespace_symbols(ns: &str) -> Option<&'static [&'static str]> {
         NS_NET_V2 => Some(NET_V2_SYMBOLS),
         NS_SYS_V2 => Some(SYS_V2_SYMBOLS),
         NS_DATA_V2 => Some(DATA_V2_SYMBOLS),
-        NS_COMPUTE_V2 => Some(&[]),
+        NS_COMPUTE_V2 => Some(COMPUTE_V2_SYMBOLS),
         _ => None,
     }
 }
@@ -264,6 +313,18 @@ pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
     // Artifact fetch by committed hash + range, completing Ok(BufferHandle) (see
     // `DATA_V2_SYMBOLS` for the pinning/grant/range rules).
     (NS_DATA_V2, "fetch", 1),
+    // -- minor 2 (Phase C, track C1): the Burn-shaped compute world (ABI §15, decisions D8) ------
+    // The wasm import shim over the CBOR(burn_ir::OperationIr) op-stream: enqueue (infallible),
+    // fence (-> Event::Fence), and the two BufferHandle-mediated bulk crossings (export/import).
+    // These register at COMPUTE_MINOR_V2 but the host advertises minor 2 (admitting them + the
+    // Fence event) only after the shared Phase-C DA_ABI_MINOR_V2 bump at the track merge — the
+    // same "registered before host-implemented" convention the Phase-B sys crypto/ambient symbols
+    // used (see COMPUTE_V2_SYMBOLS). Until then validate_imports cleanly refuses a compute import
+    // as WorldMinorUnsupported naming the introducing minor.
+    (NS_COMPUTE_V2, "submit_op", COMPUTE_MINOR_V2),
+    (NS_COMPUTE_V2, "fence", COMPUTE_MINOR_V2),
+    (NS_COMPUTE_V2, "export", COMPUTE_MINOR_V2),
+    (NS_COMPUTE_V2, "import", COMPUTE_MINOR_V2),
 ];
 
 /// The minor at which `(namespace, symbol)` was introduced, or `None` if it is not a registered
@@ -669,7 +730,9 @@ pub const EV_TAG_TIMER: u64 = 2;
 pub const EV_TAG_BUDGET: u64 = 3;
 /// `Stop` — terminal; after delivery every import traps `PhaseViolation` (ABI §4.2/§4.4).
 pub const EV_TAG_STOP: u64 = 4;
-/// `Fence` — RESERVED (Phase C `compute@2`); host MUST NOT deliver at major-2 minor 0 (ABI §4.6).
+/// `Fence` — a compute-queue marker the guest inserted with `compute@2::fence(id)` has been passed
+/// by the device (architecture §3.3, ABI §4.6/§15). Deliverable only at minor ≥ [`COMPUTE_MINOR_V2`]
+/// (Phase C); a host below that minor MUST NOT deliver it (ABI §4.6).
 pub const EV_TAG_FENCE: u64 = 5;
 /// `Completion` — RESERVED (Phase B async protocol); not delivered at minor 0 (ABI §4.6, §7.5).
 pub const EV_TAG_COMPLETION: u64 = 6;
@@ -1365,6 +1428,62 @@ mod tests {
         for sym in ["hash", "verify_sig", "rng_seed", "device_profile"] {
             assert_eq!(v2_symbol_minor(NS_SYS_V2, sym), Some(1), "sys@2::{sym}");
         }
+    }
+
+    #[test]
+    fn compute_v2_vocab_registers_at_the_phase_c_minor() {
+        // ABI §15 / decisions D8: the compute@2 shim symbols register at COMPUTE_MINOR_V2 (the
+        // shared Phase-C minor), following the same "registered before host-implemented"
+        // convention as the Phase-B sys crypto/ambient symbols.
+        assert_eq!(COMPUTE_MINOR_V2, 2);
+        assert_eq!(COMPUTE_BURN_VERSION, "0.21.0");
+        assert_eq!(
+            v2_namespace_symbols(NS_COMPUTE_V2),
+            Some(COMPUTE_V2_SYMBOLS)
+        );
+        for sym in COMPUTE_V2_SYMBOLS {
+            assert_eq!(
+                v2_symbol_minor(NS_COMPUTE_V2, sym),
+                Some(COMPUTE_MINOR_V2),
+                "compute@2::{sym} registers at the Phase-C minor"
+            );
+        }
+        // The Fence event tag is the Phase-C-minor compute-queue marker (ABI §4.6/§15): reserved
+        // out of the Phase-A closed subset until the compute minor lands.
+        assert_eq!(EV_TAG_FENCE, 5);
+        assert!(!PHASE_A_EVENT_TAGS.contains(&EV_TAG_FENCE));
+        // required_v2_minor lifts a compute import to the Phase-C minor (ABI §1.3 step 5).
+        assert_eq!(
+            required_v2_minor(&[("vhc@2", "next_event"), ("compute@2", "submit_op")]),
+            COMPUTE_MINOR_V2
+        );
+    }
+
+    #[test]
+    fn compute_imports_refused_until_the_phase_c_minor_bump() {
+        // Registered-but-not-yet-host-implemented: a compute@2 import is a clean typed refusal
+        // (WorldMinorUnsupported naming the introducing minor) until DA_ABI_MINOR_V2 is bumped to
+        // COMPUTE_MINOR_V2 at the Phase-C track merge — never a BadModule, never a trap.
+        let r = validate_imports(&[("compute@2", "submit_op")]);
+        if host_minor_for(DA_ABI_MAJOR_V2).unwrap_or(0) >= COMPUTE_MINOR_V2 {
+            r.unwrap();
+        } else {
+            let err = r.unwrap_err();
+            assert_eq!(err.code, AbiRefusalCode::WorldMinorUnsupported);
+            assert!(
+                err.detail.contains("introduced at minor 2"),
+                "{}",
+                err.detail
+            );
+        }
+        // An unregistered compute symbol is the same refusal (never BadModule — the namespace is
+        // known), and a bogus compute symbol too.
+        assert_eq!(
+            validate_imports(&[("compute@2", "not_a_compute_symbol")])
+                .unwrap_err()
+                .code,
+            AbiRefusalCode::WorldMinorUnsupported
+        );
     }
 
     #[test]
