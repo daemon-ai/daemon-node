@@ -188,6 +188,9 @@ struct ScriptMsg {
 /// Build the deterministic 20-round script: join the two workers, exit warmup via ready
 /// heartbeats, then per round two commitments + one storage receipt (the all-committed →
 /// all-evidenced fast path that finalizes a record and opens the next round).
+// The `for i in 0..2` loops index the roster/key vectors through the `push` closure deliberately
+// (the closure captures both `peers` and `worker_keys`), so the index is the natural driver here.
+#[allow(clippy::needless_range_loop)]
 fn build_script(envelope_hash: Hash) -> Vec<ScriptMsg> {
     let worker_keys: Vec<SigningKey> = (0..2)
         .map(|i| {
