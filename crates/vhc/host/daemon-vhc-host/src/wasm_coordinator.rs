@@ -49,12 +49,18 @@ use daemon_vhc_proto::{
     from_canonical_slice, peek_schema, to_canonical_vec, FrozenGenesis, Hash, SignedMessage,
     SwarmMessage, GENESIS_SCHEMA_MAJOR,
 };
+use daemon_vhc_sdk_consensus::coordinator::CoordinatorState;
 use daemon_vhc_sdk_consensus::{AuthorityConfig, RecordSig};
 
 use crate::v2::{
-    start_run, DeliverVerdict, MemorySink, RunEnd, RunIdentity, SinkEntry, V2Run, V2RunConfig,
+    start_run_migrating, DeliverVerdict, MemorySink, MigrationInput, RunEnd, RunIdentity,
+    SinkEntry, SnapshotCapture, V2Run, V2RunConfig,
 };
 use crate::{select_driver, EngineConfig, Worker};
+
+/// The state-manifest section the `coordinator-quorum` module snapshots its whole
+/// `CoordinatorState` into on `Quiesce` (must match the guest's `STATE_SECTION`).
+const COORDINATOR_STATE_SECTION: &str = "consensus";
 
 /// Typed refusals from the wasm-coordinator configuration seat (decisions D3 cells 3/7 negatives
 /// + cell-8 well-formedness).
@@ -232,6 +238,49 @@ impl WasmCoordinator {
         instance: u64,
         key_seed: [u8; 32],
     ) -> Result<Self, String> {
+        Self::start_inner(wasm, spec, grants, instance, key_seed, None)
+    }
+
+    /// Re-instantiate the coordinator module from a state-export (the standby / restart path,
+    /// architecture §4.4; ABI §10.3 step 4). `capture` is the accepted snapshot a prior instance's
+    /// [`WasmCoordinator::quiesce_snapshot`] produced (its whole `CoordinatorState` as one
+    /// consensus-canonical section): `da_init` runs with the spec's genesis config, then
+    /// `da_migrate(descriptor)` restores that state through the sandbox — so the resumed module
+    /// continues the same logical timeline and publishes byte-identical decisions. This is the
+    /// re-seated substitute for reconstructing `CoordinatorState` by folding the pure native `tick`.
+    ///
+    /// # Errors
+    /// A `String` on selection/start/migrate failure (harness-level).
+    pub fn start_migrating(
+        wasm: &[u8],
+        spec: &WasmCoordinatorSpec,
+        grants: Vec<u8>,
+        instance: u64,
+        key_seed: [u8; 32],
+        capture: SnapshotCapture,
+    ) -> Result<Self, String> {
+        Self::start_inner(
+            wasm,
+            spec,
+            grants,
+            instance,
+            key_seed,
+            Some(MigrationInput {
+                capture,
+                restore: true,
+                migrate_fuel: None,
+            }),
+        )
+    }
+
+    fn start_inner(
+        wasm: &[u8],
+        spec: &WasmCoordinatorSpec,
+        grants: Vec<u8>,
+        instance: u64,
+        key_seed: [u8; 32],
+        migration: Option<MigrationInput>,
+    ) -> Result<Self, String> {
         let module_hash = *blake3::hash(wasm).as_bytes();
         if module_hash != spec.module_hash.0 {
             return Err(format!(
@@ -258,7 +307,7 @@ impl WasmCoordinator {
         };
         let sink = Arc::new(Mutex::new(MemorySink::new()));
         let run_cfg = V2RunConfig::new(identity, key_seed, spec.config_bytes.clone(), grants);
-        let run = start_run(&engine, wasm, run_cfg, Box::new(sink.clone()))
+        let run = start_run_migrating(&engine, wasm, run_cfg, Box::new(sink.clone()), migration)
             .map_err(|e| format!("coordinator start_run: {e}"))?;
         Ok(Self {
             pump: run.pump.clone(),
@@ -283,12 +332,25 @@ impl WasmCoordinator {
     ) -> Result<(), String> {
         let signed = SignedMessage::sign(key, daemon_vhc_proto::SWARM_PROTO_VERSION, msg.clone())
             .map_err(|e| format!("sign: {e}"))?;
+        self.deliver_signed(&signed)
+    }
+
+    /// Deliver a **pre-signed** frame verbatim, preserving its original `signer` (the §12.1 sender).
+    /// Unlike [`WasmCoordinator::deliver`] this does not re-sign — so a recorded `SignedMessage`
+    /// (e.g. a journal-captured `Input::Message`) replays into the module with its authentic sender,
+    /// which is exactly what reconstructing consensus state from recorded inputs requires (a
+    /// re-signed frame would change the sender and break per-peer round accounting).
+    ///
+    /// # Errors
+    /// A `String` on verify/encode/deliver failure or a persistent back-pressure timeout.
+    pub fn deliver_signed(&mut self, signed: &SignedMessage) -> Result<(), String> {
         signed
             .verify()
             .map_err(|e| format!("frame REFUSED above the pump: {e}"))?;
         let sender = signed.signer.0;
-        let payload = to_canonical_vec(msg).map_err(|e| format!("payload encode: {e}"))?;
-        let evidence = to_canonical_vec(&signed).map_err(|e| format!("evidence encode: {e}"))?;
+        let payload =
+            to_canonical_vec(&signed.payload).map_err(|e| format!("payload encode: {e}"))?;
+        let evidence = to_canonical_vec(signed).map_err(|e| format!("evidence encode: {e}"))?;
         let seq = self.seqs.entry(sender).or_insert(0);
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -395,6 +457,35 @@ impl WasmCoordinator {
             .map_err(|e| format!("coordinator guest thread: {e}"))
     }
 
+    /// Export the coordinator's consensus state through the sandbox (architecture §4.4; ABI §10.2):
+    /// open a `Quiesce` drain, wait for the module to snapshot its `CoordinatorState` as a typed
+    /// state-manifest and return `QuiesceReady`, then return the accepted [`SnapshotCapture`]. This
+    /// consumes the instance (its `da_run` has returned). Feed the capture to
+    /// [`WasmCoordinator::start_migrating`] to re-instantiate a standby / restart from it.
+    ///
+    /// # Errors
+    /// A `String` if the drain fails, the guest does not quiesce cleanly, or no snapshot was
+    /// accepted in the drain.
+    pub fn quiesce_snapshot(mut self, deadline_ms: u64) -> Result<SnapshotCapture, String> {
+        self.pump
+            .quiesce(daemon_vhc_abi::QUIESCE_REASON_UPGRADE, deadline_ms)
+            .map_err(|e| format!("coordinator quiesce: {e}"))?;
+        let end = self
+            .run
+            .take()
+            .expect("run present")
+            .wait()
+            .map_err(|e| format!("coordinator guest thread: {e}"))?;
+        match end {
+            RunEnd::Outcome(code)
+                if u64::from(code) == u64::from(daemon_vhc_abi::OUTCOME_QUIESCE_READY) => {}
+            other => return Err(format!("coordinator did not quiesce cleanly: {other:?}")),
+        }
+        self.pump
+            .snapshot_capture()
+            .ok_or_else(|| "coordinator produced no accepted snapshot in the drain".to_string())
+    }
+
     /// Kill the coordinator abruptly (the failover drill's "kill coordinator node"): stop the run
     /// with a fault reason and join the guest thread, returning however it ended. The pump and
     /// journal simply cease — no clean drain is negotiated.
@@ -430,4 +521,22 @@ pub fn frame_sender(frame: &Value) -> Result<[u8; 32], String> {
         })
         .ok_or("frame envelope missing sender")?;
     <[u8; 32]>::try_from(sender.as_slice()).map_err(|_| "sender is not 32 bytes".into())
+}
+
+/// Decode the exported [`CoordinatorState`] out of a [`SnapshotCapture`] the coordinator module
+/// produced (the single `consensus` section is its whole state, canonical CBOR). Lets a drill
+/// inspect the reconstructed state (e.g. its round height) without re-deriving it natively.
+///
+/// # Errors
+/// A `String` if the capture carries no `consensus` section or the bytes do not decode.
+pub fn coordinator_state_from_capture(
+    capture: &SnapshotCapture,
+) -> Result<CoordinatorState, String> {
+    let (_, bytes) = capture
+        .sections
+        .iter()
+        .find(|(name, _)| name == COORDINATOR_STATE_SECTION)
+        .ok_or_else(|| format!("capture carries no `{COORDINATOR_STATE_SECTION}` section"))?;
+    from_canonical_slice::<CoordinatorState>(bytes)
+        .map_err(|e| format!("coordinator state decode: {e}"))
 }
