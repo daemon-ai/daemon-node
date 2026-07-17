@@ -506,26 +506,66 @@ pub fn verify_observe_dir(dir: &std::path::Path) -> Result<ObserveVerify, SwarmR
     })
 }
 
+/// A collector task plus the handle that stops it **losslessly**: on [`CollectorStop::stop`] the
+/// task drains everything already queued on its subscription before exiting, so messages published
+/// before the stop are never dropped. (A bare `JoinHandle::abort` loses whatever the task had not
+/// yet been scheduled to pull off the channel — under parallel-suite CPU contention that was
+/// routinely the final round's `RoundRecord`, the `observe_record_and_replay_green` flake.)
+pub(crate) struct CollectorStop {
+    handle: JoinHandle<()>,
+    stop: tokio::sync::oneshot::Sender<()>,
+}
+
+impl CollectorStop {
+    /// Signal the collector to drain its queue and exit, then wait for it.
+    pub(crate) async fn stop(self) {
+        // A closed receiver (task already gone) is fine — awaiting the handle is the real barrier.
+        let _ = self.stop.send(());
+        let _ = self.handle.await;
+    }
+}
+
 /// Spawn the observe message-log collector: subscribe to `control` and append every verified
 /// `SignedMessage` to the shared [`MessageLog`] in arrival order (the `--observe` capture). Generic
 /// over the control plane so both the loopback and live (iroh) harnesses reuse it.
+///
+/// Stop it via [`CollectorStop::stop`] once every publisher has quiesced: because publishes enqueue
+/// synchronously, the drain-on-stop then deterministically captures the complete wire history.
 pub(crate) fn spawn_message_log<C: ControlPlane>(
     control: &Arc<C>,
     version: SwarmProtoVersion,
     log: Arc<std::sync::Mutex<MessageLog>>,
-) -> JoinHandle<()> {
+) -> CollectorStop {
     let mut sub = control.subscribe();
-    tokio::spawn(async move {
-        while let Some(bytes) = sub.recv().await {
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let append = move |bytes: Vec<u8>| {
             let Ok(msg) = from_canonical_slice::<SignedMessage>(&bytes) else {
-                continue;
+                return;
             };
             if msg.verify_for_run(version).is_err() {
-                continue;
+                return;
             }
             log.lock().expect("observe log lock").append(msg);
+        };
+        loop {
+            tokio::select! {
+                m = sub.recv() => match m {
+                    Some(bytes) => append(bytes),
+                    None => return, // plane closed: nothing more can arrive
+                },
+                _ = &mut stop_rx => break,
+            }
         }
-    })
+        // Stop requested: drain what was already enqueued so no published message is lost.
+        while let Some(bytes) = sub.try_recv() {
+            append(bytes);
+        }
+    });
+    CollectorStop {
+        handle,
+        stop: stop_tx,
+    }
 }
 
 /// A deterministic per-peer node identity key (index `i`).
@@ -806,8 +846,12 @@ where
     for h in fwd_handles {
         h.abort();
     }
-    rec_handle.abort();
-    obs_handle.abort();
+    // Every publisher has quiesced (coordinator awaited, peers done/aborted), so a lossless
+    // drain-on-stop leaves the collectors with the complete wire history — an `abort()` here
+    // raced the collectors' append loops and intermittently dropped the tail of the log (the
+    // final round's `RoundRecord`), the `observe_record_and_replay_green` parallel-load flake.
+    rec_handle.stop().await;
+    obs_handle.stop().await;
     while let Ok((peer, ev)) = col_rx.try_recv() {
         events.push((peer, ev));
     }
@@ -899,20 +943,22 @@ where
 }
 
 /// A background task that decodes the coordinator's published `RoundRecord`s off the gossip plane
-/// and records their committed sets (for the desync drill's offline resync).
+/// and records their committed sets (for the desync drill's offline resync). Stopped losslessly via
+/// [`CollectorStop::stop`] (same drain-on-stop rationale as [`spawn_message_log`]).
 fn spawn_record_collector(
     gossip: &Arc<LoopbackGossip>,
     version: SwarmProtoVersion,
     records: Arc<std::sync::Mutex<BTreeMap<RoundId, Vec<RecordEntry>>>>,
-) -> JoinHandle<()> {
+) -> CollectorStop {
     let mut sub = gossip.subscribe();
-    tokio::spawn(async move {
-        while let Some(bytes) = sub.recv().await {
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let record = move |bytes: Vec<u8>| {
             let Ok(msg) = from_canonical_slice::<SignedMessage>(&bytes) else {
-                continue;
+                return;
             };
             if msg.verify_for_run(version).is_err() {
-                continue;
+                return;
             }
             if let SwarmMessage::RoundRecord(RoundRecord {
                 round,
@@ -926,8 +972,24 @@ fn spawn_record_collector(
                     .entry(*round)
                     .or_insert_with(|| entries.clone());
             }
+        };
+        loop {
+            tokio::select! {
+                m = sub.recv() => match m {
+                    Some(bytes) => record(bytes),
+                    None => return,
+                },
+                _ = &mut stop_rx => break,
+            }
         }
-    })
+        while let Some(bytes) = sub.try_recv() {
+            record(bytes);
+        }
+    });
+    CollectorStop {
+        handle,
+        stop: stop_tx,
+    }
 }
 
 /// A tiny process-lifetime counter for unique temp-dir names (no external `tempfile` dep).
