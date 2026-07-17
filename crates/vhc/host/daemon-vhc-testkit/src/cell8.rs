@@ -49,7 +49,9 @@ use daemon_vhc_proto::{
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
-use crate::barrier::{phase_a_grants, tiny_llama_config, SEQ_LEN};
+use crate::barrier::{
+    phase_a_grants, tiny_llama_config, FaultAction, FaultPlan, FrameKind, SEQ_LEN,
+};
 use crate::run::Decision;
 use crate::wasm_coordinator::{
     authorize_coordinator_frame, configure_wasm_coordinator, WasmCoordinator,
@@ -67,6 +69,10 @@ pub struct Cell8Spec {
     pub steps_per_round: u32,
     /// Sequences per round across the roster.
     pub global_batch: u32,
+    /// The deterministic fault plan applied to coordinator→worker deliveries + committed-payload
+    /// staging (`Default` = fault-free). Shares [`crate::barrier`]'s rig so the wasm-coordinator
+    /// twins of the adversarial drills author the same `(worker, round, kind)` faults.
+    pub faults: FaultPlan,
     /// Hard wall per wait step.
     pub timeout: Duration,
 }
@@ -82,6 +88,7 @@ impl Cell8Spec {
             rounds,
             steps_per_round: 2,
             global_batch: 2 * workers as u32,
+            faults: FaultPlan::default(),
             timeout: Duration::from_secs(180),
         }
     }
@@ -93,6 +100,9 @@ pub struct Cell8WorkerReport {
     pub peer: PeerId,
     /// How its run ended.
     pub end: RunEnd,
+    /// Its recorded publishes as decoded control messages (in publish order) — the fault drills
+    /// assert straggle/digest counts against it.
+    pub messages: Vec<SwarmMessage>,
     /// Its final det-lane state digest.
     pub digest: [u8; 16],
     /// Its §8.7 replay verdict.
@@ -278,6 +288,9 @@ struct LiveWorker {
     puts: Vec<Vec<u8>>,
     /// Round → the round's sealed payload set (stashed at commit, staged at the record).
     stash: BTreeMap<u64, BTreeMap<PeerId, Vec<u8>>>,
+    /// Sealed containers whose ingest staging was delayed past their record (the straggle
+    /// trigger): round → record-ordered payloads, staged at the NEXT open (the catch-up input).
+    held_payloads: BTreeMap<u64, Vec<Vec<u8>>>,
 }
 
 impl LiveWorker {
@@ -290,9 +303,31 @@ impl LiveWorker {
         msg: &SwarmMessage,
         evidence: Vec<u8>,
     ) -> Result<(), String> {
-        let payload = to_canonical_vec(msg).map_err(|e| format!("payload encode: {e}"))?;
         let seq = self.coord_seq;
         self.coord_seq += 1;
+        self.deliver_from_coordinator_seq(sender, msg, evidence, seq)
+    }
+
+    /// Re-deliver the same coordinator frame with the SAME seq — a true duplicate (byte-identical
+    /// frame, same §12.2 seq): the round driver's ingest watermark is the dedup under test.
+    fn deliver_duplicate_from_coordinator(
+        &mut self,
+        sender: [u8; 32],
+        msg: &SwarmMessage,
+        evidence: Vec<u8>,
+    ) -> Result<(), String> {
+        let seq = self.coord_seq.saturating_sub(1);
+        self.deliver_from_coordinator_seq(sender, msg, evidence, seq)
+    }
+
+    fn deliver_from_coordinator_seq(
+        &mut self,
+        sender: [u8; 32],
+        msg: &SwarmMessage,
+        evidence: Vec<u8>,
+        seq: u64,
+    ) -> Result<(), String> {
+        let payload = to_canonical_vec(msg).map_err(|e| format!("payload encode: {e}"))?;
         match self
             .pump
             .deliver_frame(0, seq, sender, payload, evidence)
@@ -370,6 +405,11 @@ fn digests_for(msgs: &[SwarmMessage], round: u64) -> usize {
     msgs.iter()
         .filter(|m| matches!(m, SwarmMessage::Digest(d) if d.round == round))
         .count()
+}
+
+fn straggled_for(msgs: &[SwarmMessage], round: u64) -> bool {
+    msgs.iter()
+        .any(|m| matches!(m, SwarmMessage::Straggle(s) if s.round == round))
 }
 
 fn assigned_len(window: BatchWindow, seed: Seed, roster: &[PeerId], peer: &PeerId) -> u64 {
@@ -479,6 +519,7 @@ pub fn cell8_whole_run(
             coord_seq: 0,
             puts: Vec::new(),
             stash: BTreeMap::new(),
+            held_payloads: BTreeMap::new(),
         });
     }
 
@@ -522,8 +563,22 @@ pub fn cell8_whole_run(
         match &msg {
             SwarmMessage::RoundOpen(ro) => {
                 let round = ro.round;
-                // Stage each worker's assigned batches, then deliver the open.
+                // Stage each worker's assigned batches, then deliver the open — first flushing any
+                // payloads held from an earlier record (the straggle catch-up input, staged BEFORE
+                // this open so the driver ingests the stalled round then trains the new one).
                 for (i, worker) in workers.iter_mut().enumerate() {
+                    let held: Vec<Vec<Vec<u8>>> = worker.held_payloads.values().cloned().collect();
+                    for payloads in held {
+                        for p in payloads {
+                            worker
+                                .pump
+                                .stage_update(p, None)
+                                .map_err(|e| format!("worker {i} stage held update: {e}"))?;
+                        }
+                    }
+                    let caught_up: Vec<u64> = worker.held_payloads.keys().copied().collect();
+                    worker.held_payloads.clear();
+
                     let mine = assigned_len(ro.batch, ro.seed, &roster, &worker.peer);
                     if mine == 0 || !mine.is_multiple_of(u64::from(spec.steps_per_round)) {
                         return Err(format!(
@@ -536,7 +591,22 @@ pub fn cell8_whole_run(
                             .stage_batch(&vec![0u32; SEQ_LEN as usize], 1, SEQ_LEN, None)
                             .map_err(|e| format!("worker {i} stage batch: {e}"))?;
                     }
-                    worker.deliver_from_coordinator(sender, &msg, evidence.clone())?;
+                    deliver_open_under_faults(
+                        worker,
+                        &spec.faults,
+                        i,
+                        round,
+                        sender,
+                        &msg,
+                        &evidence,
+                    )?;
+                    // A caught-up round produces its (deferred) digest at this open; drain it so
+                    // the straggle detour is a recorded decision the §8.7 replay reproduces.
+                    for r in caught_up {
+                        worker.wait_for(spec.timeout, "catch-up digest", |m| {
+                            digests_for(m, r) >= 1
+                        })?;
+                    }
                 }
 
                 // Each worker trains, seals + puts its own container, voices its commitment; the
@@ -606,15 +676,35 @@ pub fn cell8_whole_run(
                                 .ok_or_else(|| "record entry for unknown peer".to_string())
                         })
                         .collect::<Result<_, String>>()?;
-                    for p in &ordered {
-                        worker
-                            .pump
-                            .stage_update(p.clone(), None)
-                            .map_err(|e| format!("worker {i} stage update: {e}"))?;
+                    if spec.faults.payloads_delayed(i, round) {
+                        // The straggle trigger: the record arrives, its payloads do not (staged at
+                        // the next open instead) — the driver stalls and voices Straggle{fetching}.
+                        worker.held_payloads.insert(round, ordered);
+                    } else {
+                        for p in &ordered {
+                            worker
+                                .pump
+                                .stage_update(p.clone(), None)
+                                .map_err(|e| format!("worker {i} stage update: {e}"))?;
+                        }
                     }
-                    worker.deliver_from_coordinator(sender, &msg, evidence.clone())?;
+                    deliver_record_under_faults(
+                        worker,
+                        &spec.faults,
+                        i,
+                        round,
+                        sender,
+                        &msg,
+                        &evidence,
+                    )?;
                 }
-                for w in workers.iter_mut() {
+                for (i, w) in workers.iter_mut().enumerate() {
+                    if spec.faults.payloads_delayed(i, round) {
+                        // The straggle path: the driver voices Straggle{fetching}, no digest yet
+                        // (it catches up when the held payloads stage at the next open).
+                        w.wait_for(spec.timeout, "straggle", |m| straggled_for(m, round))?;
+                        continue;
+                    }
                     let msgs =
                         w.wait_for(spec.timeout, "digest", |m| digests_for(m, round) >= 1)?;
                     // Relay the digest to the coordinator (roster liveness/desync accounting).
@@ -630,6 +720,44 @@ pub fn cell8_whole_run(
                 rounds_done += 1;
             }
             _ => { /* notes/chatter — not part of the closed drive */ }
+        }
+    }
+
+    // Payloads delayed in the FINAL driven round have no next open in the closed drive; pull one
+    // more coordinator open so the stragglers catch up (the coordinator keeps opening rounds).
+    if workers.iter().any(|w| !w.held_payloads.is_empty()) {
+        let mut opened = false;
+        while !opened {
+            let (sender, evidence, msg) = coord.next_decision(spec.timeout)?;
+            if let SwarmMessage::RoundOpen(ro) = &msg {
+                for (i, worker) in workers.iter_mut().enumerate() {
+                    let held: Vec<Vec<Vec<u8>>> = worker.held_payloads.values().cloned().collect();
+                    for payloads in held {
+                        for p in payloads {
+                            worker
+                                .pump
+                                .stage_update(p, None)
+                                .map_err(|e| format!("worker {i} stage held update: {e}"))?;
+                        }
+                    }
+                    let caught_up: Vec<u64> = worker.held_payloads.keys().copied().collect();
+                    worker.held_payloads.clear();
+                    let mine = assigned_len(ro.batch, ro.seed, &roster, &worker.peer);
+                    for _ in 0..mine {
+                        worker
+                            .pump
+                            .stage_batch(&vec![0u32; SEQ_LEN as usize], 1, SEQ_LEN, None)
+                            .map_err(|e| format!("worker {i} stage batch: {e}"))?;
+                    }
+                    worker.deliver_from_coordinator(sender, &msg, evidence.clone())?;
+                    for r in caught_up {
+                        worker.wait_for(spec.timeout, "catch-up digest", |m| {
+                            digests_for(m, r) >= 1
+                        })?;
+                    }
+                }
+                opened = true;
+            }
         }
     }
 
@@ -677,9 +805,11 @@ pub fn cell8_whole_run(
             .collect();
         let replay_matched = redriven == recorded && matches!(replayed.end, ReplayEnd::Outcome(_));
 
+        let messages = w.messages();
         reports.push(Cell8WorkerReport {
             peer: w.peer,
             end,
+            messages,
             digest,
             replay_matched,
             replay_decisions: redriven.len(),
@@ -695,6 +825,48 @@ pub fn cell8_whole_run(
         coordinator_end,
         run_id,
     })
+}
+
+/// Deliver a `RoundOpen` to one worker under the fault plan: drop it (the worker sits the round
+/// out), duplicate it byte-identically (same §12.2 seq — the ingest-watermark dedup), or deliver
+/// it once.
+fn deliver_open_under_faults(
+    worker: &mut LiveWorker,
+    faults: &FaultPlan,
+    i: usize,
+    round: u64,
+    sender: [u8; 32],
+    msg: &SwarmMessage,
+    evidence: &[u8],
+) -> Result<(), String> {
+    match faults.action(i, round, FrameKind::Open) {
+        Some(FaultAction::Drop) => Ok(()),
+        Some(FaultAction::Duplicate) => {
+            worker.deliver_from_coordinator(sender, msg, evidence.to_vec())?;
+            worker.deliver_duplicate_from_coordinator(sender, msg, evidence.to_vec())
+        }
+        None => worker.deliver_from_coordinator(sender, msg, evidence.to_vec()),
+    }
+}
+
+/// Deliver a `RoundRecord` to one worker under the fault plan (same actions as the open).
+fn deliver_record_under_faults(
+    worker: &mut LiveWorker,
+    faults: &FaultPlan,
+    i: usize,
+    round: u64,
+    sender: [u8; 32],
+    msg: &SwarmMessage,
+    evidence: &[u8],
+) -> Result<(), String> {
+    match faults.action(i, round, FrameKind::Record) {
+        Some(FaultAction::Drop) => Ok(()),
+        Some(FaultAction::Duplicate) => {
+            worker.deliver_from_coordinator(sender, msg, evidence.to_vec())?;
+            worker.deliver_duplicate_from_coordinator(sender, msg, evidence.to_vec())
+        }
+        None => worker.deliver_from_coordinator(sender, msg, evidence.to_vec()),
+    }
 }
 
 /// Stash a round's sealed payload set per worker (consumed at the record's staging).

@@ -65,10 +65,7 @@ use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SignedMessage,
     SigningKey, SwarmMessage, SWARM_PROTO_VERSION,
 };
-use daemon_vhc_sdk_consensus::coordinator::{
-    tick, tick_authenticated, CoordinatorState, Input, Output,
-};
-use daemon_vhc_sdk_consensus::{Authorized, DEFAULT_RECORDS_CHANNEL};
+use daemon_vhc_sdk_consensus::coordinator::{tick, CoordinatorState, Input};
 use daemon_vhc_testkit::barrier::phase_a_grants;
 use daemon_vhc_testkit::{
     cell8_genesis, configure_wasm_coordinator, WasmCoordinator, WasmCoordinatorSpec,
@@ -199,36 +196,39 @@ fn build_script(worker_keys: &[SigningKey; 2], rounds: std::ops::Range<u64>) -> 
     script
 }
 
-/// The uninterrupted native reference: fold `tick` over the whole script exactly as the guest
-/// does (authenticated dispatch + one synthetic clock tick per frame), collecting every publish.
-/// The synthetic clock CONTINUES from the initial state's clock — the same resume rule the guest
-/// applies (`da_init` resumes `now_s` from the restored state), so a reference over a
-/// reconstructed mid-run state stays on the primary's logical timeline.
-fn reference_publishes(initial: CoordinatorState, script: &[ScriptMsg]) -> Vec<SwarmMessage> {
-    let version = initial.config.proto_version;
-    let mut now_s = initial.now_s;
-    let mut state = initial;
-    let mut published = Vec::new();
+/// The uninterrupted reference is itself a wasm-coordinator run (consensus never runs outside the
+/// sandbox — the D2 dual-compilation gate proves the module ≡ the native tick, so no separate
+/// native oracle is authored here): drive a FRESH `coordinator_quorum.wasm` blob over `script`
+/// from the same genesis config, drain exactly `decisions` published decisions in order, and stop
+/// it clean. Every barrier round contributes a `RoundOpen` + `RoundRecord`; a round that opens but
+/// is never recorded (the trailing open past the last committed round) adds one more open — so
+/// `decisions = 2 * committed_rounds (+ 1 trailing open)`.
+fn wasm_reference(
+    wasm: &[u8],
+    spec: &WasmCoordinatorSpec,
+    key_seed: [u8; 32],
+    script: &[ScriptMsg],
+    decisions: usize,
+) -> Vec<SwarmMessage> {
+    let mut coord = WasmCoordinator::start(wasm, spec, phase_a_grants(), 0, key_seed).unwrap();
     for sm in script {
-        let token = Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
-        let (next, outputs) =
-            tick_authenticated(state, peer_id(&sm.key), version, sm.msg.clone(), token);
-        state = next;
-        for o in &outputs {
-            if let Output::Publish(m) = o {
-                published.push((**m).clone());
-            }
-        }
-        now_s += 1;
-        let (next, outputs) = tick(state, Input::Clock(now_s));
-        state = next;
-        for o in &outputs {
-            if let Output::Publish(m) = o {
-                published.push((**m).clone());
-            }
-        }
+        coord.deliver(&sm.key, &sm.msg).expect("reference deliver");
     }
+    let mut published = Vec::new();
+    while published.len() < decisions {
+        let (_, _, msg) = coord
+            .next_decision(Duration::from_secs(60))
+            .expect("reference decision");
+        published.push(msg);
+    }
+    coord.stop().expect("reference stops clean");
     published
+}
+
+/// Published decisions a `committed`-round barrier drive produces, plus the trailing open of the
+/// round that opened but never recorded (`with_trailing_open`): `2 * committed (+ 1)`.
+fn decision_count(committed: u64, with_trailing_open: bool) -> usize {
+    2 * committed as usize + usize::from(with_trailing_open)
 }
 
 /// The receivers' run-key certificate store — the signer-transfer seat (architecture §4.4 under
@@ -388,12 +388,13 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     journal.commit().expect("tail barrier (§8.4)");
     let tail_segment = cut_ord.expect("the cut happened");
 
-    // Drain the primary's decisions up to the kill point (records 0..4 + opens): each frame's
-    // sender authenticates through the D1 certified-sender check — the cert chain to the base
-    // identity, incarnation 0, epoch 0 (the reconciled signer seat).
+    // Drain the primary's decisions up to the kill point: the ROUNDS_BEFORE_KILL records + their
+    // opens, plus the trailing open of the next (never-recorded) round. Each frame's sender
+    // authenticates through the D1 certified-sender check — the cert chain to the base identity,
+    // incarnation 0, epoch 0 (the reconciled signer seat).
     let mut primary_decisions = Vec::new();
-    let expected_pre = reference_publishes(initial.clone(), &pre_kill);
-    while primary_decisions.len() < expected_pre.len() {
+    let expected_pre = decision_count(ROUNDS_BEFORE_KILL, true);
+    while primary_decisions.len() < expected_pre {
         let (sender, _, msg) = primary
             .next_decision(Duration::from_secs(60))
             .expect("primary decision");
@@ -524,41 +525,48 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
         standby.deliver(&sm.key, &sm.msg).expect("standby deliver");
     }
 
-    // The uninterrupted reference over the SAME post-kill inputs, continuing from the
-    // reconstructed state: the standby's decisions must be byte-identical (resumption).
-    let expected_post = reference_publishes(state, &post_kill);
-    assert!(
-        expected_post
-            .iter()
-            .filter(|m| matches!(m, SwarmMessage::RoundRecord(_)))
-            .count()
-            == ROUNDS_AFTER as usize,
-        "the reference records the post-kill rounds"
-    );
-    for (i, expected) in expected_post.iter().enumerate() {
+    // Drain the standby's decisions: the round the reconstructed state already stands in was
+    // opened during reconstruction, so the standby's stream starts at that round's RECORD — the
+    // post-kill rounds contribute 2 decisions each (record + the next round's open), no leading
+    // open. The standby's decisions must be byte-identical to what an uninterrupted run produces
+    // over the same tail (resumption, not approximation).
+    let mut standby_decisions = Vec::new();
+    let expected_post = decision_count(ROUNDS_AFTER, false);
+    for i in 0..expected_post {
         let (sender, _, msg) = standby
             .next_decision(Duration::from_secs(60))
             .unwrap_or_else(|e| panic!("standby decision {i}: {e}"));
-        assert_eq!(
-            to_canonical_vec(&msg).unwrap(),
-            to_canonical_vec(expected).unwrap(),
-            "standby decision {i} diverged from the uninterrupted reference"
-        );
-        // The sitting-2 gap, CLOSED: the standby's frames now authenticate through the certified
-        // path — its incarnation-1 run key chains to the base identity via the transfer cert.
+        // The sitting-2 gap, CLOSED: the standby's frames authenticate through the certified path
+        // — its incarnation-1 run key chains to the base identity via the transfer cert.
         certs
             .accept(1, 0, &PeerId(sender))
             .expect("standby frame authenticates via the transfer certificate");
         assert_eq!(sender, standby_sender.0, "standby signs under its own key");
+        standby_decisions.push(msg);
     }
+    assert_eq!(
+        standby_decisions
+            .iter()
+            .filter(|m| matches!(m, SwarmMessage::RoundRecord(_)))
+            .count(),
+        ROUNDS_AFTER as usize,
+        "the standby records the post-kill rounds"
+    );
 
-    // The resumed decisions continue the primary's timeline: together they equal one
-    // uninterrupted run over the full script.
+    // The uninterrupted reference is a fresh wasm-coordinator run over the full script (no native
+    // oracle): the resumed decisions — the killed primary's prefix followed by the standby's
+    // resumption — must equal it byte-for-byte.
     let total_rounds = ROUNDS_BEFORE_KILL + ROUNDS_AFTER;
     let full_script = build_script(&worker_keys, 0..total_rounds);
-    let uninterrupted = reference_publishes(initial, &full_script);
+    let uninterrupted = wasm_reference(
+        &wasm,
+        &spec,
+        primary_key_seed,
+        &full_script,
+        decision_count(total_rounds, true),
+    );
     let mut resumed = primary_decisions;
-    resumed.extend(expected_post);
+    resumed.extend(standby_decisions);
     assert_eq!(
         uninterrupted.len(),
         resumed.len(),

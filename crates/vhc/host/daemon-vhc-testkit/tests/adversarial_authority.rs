@@ -62,11 +62,9 @@ use daemon_vhc_proto::{
     blake3_hash, peer_id, sign_canonical, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId,
     Seed, SignedMessage, SigningKey, SwarmMessage, SWARM_PROTO_VERSION,
 };
-use daemon_vhc_sdk_consensus::coordinator::{
-    tick, tick_authenticated, CoordinatorState, Input, Output, RunConfig,
-};
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input, RunConfig};
 use daemon_vhc_sdk_consensus::{
-    AuthError, AuthorityConfig, Authorized, RecordSig, SingleKey, ThresholdKeys, Topology,
+    AuthError, AuthorityConfig, RecordSig, SingleKey, ThresholdKeys, Topology,
     DEFAULT_RECORDS_CHANNEL,
 };
 use daemon_vhc_session::replay_sandbox::WasmCoordinatorSandbox;
@@ -203,46 +201,20 @@ fn spec_for(
     }
 }
 
-/// Fold the native reference exactly as the guest does (authenticated dispatch + one synthetic
-/// clock tick per frame), collecting publishes — the dual-compilation twin every blob lane
-/// asserts identity against.
-fn reference_publishes(initial: CoordinatorState, script: &[ScriptMsg]) -> Vec<SwarmMessage> {
-    let version = initial.config.proto_version;
-    let mut now_s = initial.now_s;
-    let mut state = initial;
-    let mut published = Vec::new();
-    for sm in script {
-        let token = Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
-        let (next, outputs) =
-            tick_authenticated(state, peer_id(&sm.key), version, sm.msg.clone(), token);
-        state = next;
-        for o in &outputs {
-            if let Output::Publish(m) = o {
-                published.push((**m).clone());
-            }
-        }
-        now_s += 1;
-        let (next, outputs) = tick(state, Input::Clock(now_s));
-        state = next;
-        for o in &outputs {
-            if let Output::Publish(m) = o {
-                published.push((**m).clone());
-            }
-        }
-    }
-    published
-}
-
 /// Drive the production blob over `script`, journaling every input (msg + clock pair) AND every
 /// blob decision (tag-4, custody-signed) into an on-disk journal; seal + archive everything under
 /// heads attested by `custody`. Returns the archive, its heads, and the blob's decisions.
+///
+/// The drive drains until the blob has published `expected_records` `RoundRecord`s — the blob IS
+/// the oracle (consensus never runs outside the sandboxed module; the D2 dual-compilation gate is
+/// the identity proof, so no separate native fold is authored here).
 fn drive_and_archive(
     wasm: &[u8],
     spec: &WasmCoordinatorSpec,
     key_seed: [u8; 32],
     custody: &SigningKey,
     script: &[ScriptMsg],
-    expected_decisions: usize,
+    expected_records: usize,
 ) -> (RecordArchive, Vec<AttestedHead>, Vec<SwarmMessage>) {
     let ident = ExecIdentity {
         run_id: spec.run_id,
@@ -292,10 +264,14 @@ fn drive_and_archive(
         at += 1;
     }
     let mut decisions = Vec::new();
-    while decisions.len() < expected_decisions {
+    let mut records = 0usize;
+    while records < expected_records {
         let (_, _, msg) = coord
             .next_decision(Duration::from_secs(60))
             .expect("blob decision");
+        if matches!(msg, SwarmMessage::RoundRecord(_)) {
+            records += 1;
+        }
         // Journal the blob's decision as the custody-signed tag-4 publish (the oracle).
         let payload = to_canonical_vec(&msg).expect("payload");
         let signed = sign(custody, &msg);
@@ -439,12 +415,9 @@ fn equivocation_yields_portable_evidence_and_both_histories_look_valid() {
     let mut payloads_b = BTreeMap::new();
     let script_b = barrier_script("equiv", &worker_keys, 0..2, "B", &mut payloads_b);
 
-    let expected_a = reference_publishes(initial.clone(), &script_a).len();
-    let expected_b = reference_publishes(initial.clone(), &script_b).len();
-    let (archive_a, heads_a, _) =
-        drive_and_archive(&wasm, &spec, key_seed, &custody, &script_a, expected_a);
-    let (archive_b, heads_b, _) =
-        drive_and_archive(&wasm, &spec, key_seed, &custody, &script_b, expected_b);
+    // Each side drives 2 barrier rounds to a record; the blob is the oracle (drain by record).
+    let (archive_a, heads_a, _) = drive_and_archive(&wasm, &spec, key_seed, &custody, &script_a, 2);
+    let (archive_b, heads_b, _) = drive_and_archive(&wasm, &spec, key_seed, &custody, &script_b, 2);
 
     // "Conflicting valid-looking histories": EACH side is green in isolation — a third party
     // shown only one archive finds nothing wrong (consensus replay re-derives every record and
@@ -570,11 +543,11 @@ fn withheld_records_close_rounds_without_the_peer_and_drop_it_at_k() {
         }
     }
 
-    // The native reference IS the oracle (dual-compilation): fold it, assert the SUBSTANCE
-    // (records exclude the withheld peer; the drop lands at k), then require the blob to
-    // reproduce it byte-for-byte under the same withholding.
-    let expected = reference_publishes(initial.clone(), &script);
-    let records: Vec<&SwarmMessage> = expected
+    // The blob IS the oracle (consensus runs only in the sandboxed module): drive it under the
+    // withholding and assert the SUBSTANCE on its OWN published records — both rounds close by the
+    // deterministic event-count deadline WITHOUT the withheld peer, and it is dropped at k.
+    let (_, _, decisions) = drive_and_archive(&wasm, &spec, key_seed, &custody, &script, 2);
+    let records: Vec<&SwarmMessage> = decisions
         .iter()
         .filter(|m| matches!(m, SwarmMessage::RoundRecord(_)))
         .collect();
@@ -595,16 +568,6 @@ fn withheld_records_close_rounds_without_the_peer_and_drop_it_at_k() {
         vec![withheld_peer],
         "the withheld peer is dropped at k_absences = 2"
     );
-
-    let (_, _, decisions) =
-        drive_and_archive(&wasm, &spec, key_seed, &custody, &script, expected.len());
-    for (i, (d, e)) in decisions.iter().zip(expected.iter()).enumerate() {
-        assert_eq!(
-            to_canonical_vec(d).unwrap(),
-            to_canonical_vec(e).unwrap(),
-            "blob decision {i} under withholding ≡ native reference"
-        );
-    }
 }
 
 // -- lane 3: partition (eclipse) heal — the eclipsed peer converges from the archive alone ---------
@@ -626,9 +589,8 @@ fn eclipsed_peer_converges_from_archive_and_payloads_alone() {
 
     let mut payloads = BTreeMap::new();
     let script = barrier_script("eclipse", &worker_keys, 0..3, "E", &mut payloads);
-    let expected = reference_publishes(initial.clone(), &script);
     let (archive, heads, decisions) =
-        drive_and_archive(&wasm, &spec, key_seed, &custody, &script, expected.len());
+        drive_and_archive(&wasm, &spec, key_seed, &custody, &script, 3);
 
     // The partitioned peer saw NOTHING live. When the partition heals it holds only the archive
     // replica + payload store — and re-derives the ENTIRE history, digests included.
@@ -641,12 +603,12 @@ fn eclipsed_peer_converges_from_archive_and_payloads_alone() {
     // Convergence: the re-derived decision stream equals the live run's exact decision stream. The
     // resync anchor is a blake3 of the coordinator's published `RoundRecord`s (the observer sees
     // published objects, never the module's privileged internal state), so the reference is that
-    // same anchor over the native dual-compilation twin's published records.
+    // same anchor over the LIVE blob's own published records — no native oracle.
     let final_ref = {
-        let records: Vec<_> = reference_publishes(initial, &script)
-            .into_iter()
+        let records: Vec<_> = decisions
+            .iter()
             .filter_map(|m| match m {
-                SwarmMessage::RoundRecord(r) => Some(r),
+                SwarmMessage::RoundRecord(r) => Some(r.clone()),
                 _ => None,
             })
             .collect();
@@ -656,7 +618,13 @@ fn eclipsed_peer_converges_from_archive_and_payloads_alone() {
         report.replay.final_state_hash, final_ref,
         "the eclipsed peer converges to the live coordinator's exact decision stream"
     );
-    assert_eq!(decisions.len(), expected.len());
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|m| matches!(m, SwarmMessage::RoundRecord(_)))
+            .count(),
+        3
+    );
 }
 
 // -- lane 4: ThresholdKeys — quorum refusals end-to-end (the m-of-n lane) --------------------------
@@ -689,9 +657,8 @@ fn threshold_keys_quorum_refusals_end_to_end() {
     // SUB-QUORUM under the threshold topology (asserted below); the quorum re-attests them.
     let mut payloads = BTreeMap::new();
     let script = barrier_script("tk", &worker_keys, 0..2, "T", &mut payloads);
-    let expected = reference_publishes(initial.clone(), &script).len();
     let (source_archive, single_heads, _) =
-        drive_and_archive(&wasm, &spec, key_seed, &m1, &script, expected);
+        drive_and_archive(&wasm, &spec, key_seed, &m1, &script, 2);
 
     // A threshold archive replica: same segments, heads re-attested by the 2-of-3 quorum.
     let mut archive = RecordArchive::new(

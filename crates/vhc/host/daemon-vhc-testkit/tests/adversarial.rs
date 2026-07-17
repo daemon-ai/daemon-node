@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
-// Adversarial-suite seeds (B3 sitting 2; architecture §4.2's conformance surface, ahead of
-// D1/D2): trace-driven fault injection against the PRODUCTION `tiny_llama_v2.wasm` blob through
-// the testkit's deterministic `FaultPlan` — one pinned case per rig primitive proving the
-// harness shape. The full `Authority` adversarial suites (partitions, equivocation, withheld
-// records, conflicting histories) are D1/D2 deliverables; they grow on this rig.
+// Adversarial-suite seeds (architecture §4.2's conformance surface): trace-driven fault injection
+// against the PRODUCTION `tiny_llama_v2.wasm` worker blob **under the production
+// `coordinator_quorum.wasm` coordinator** (the cell-8 whole-run drive), through the shared
+// deterministic `FaultPlan` — one pinned case per rig primitive proving the harness shape. The
+// full `Authority` adversarial suites (partitions, equivocation, withheld records) live in
+// `adversarial_authority.rs`; they drive the same coordinator blob.
+//
+// Consensus runs only in the sandboxed, content-addressed module: both the coordinator and the
+// workers execute under the real major-2 event-loop driver, and the fault is injected purely at
+// the network seat (coordinator→worker frame delivery / committed-payload staging). No native
+// coordinator tick backs these drills.
 //
 // Pinned cases:
 // 1. duplicate RoundRecord → the round driver's ingest watermark dedups: ingested exactly once,
@@ -24,7 +30,7 @@ use std::sync::Once;
 
 use daemon_vhc_proto::messages::SwarmMessage;
 use daemon_vhc_testkit::{
-    barrier_whole_run, BarrierSpec, FaultAction, FaultPlan, FaultRule, FrameKind,
+    cell8_whole_run, Cell8Spec, FaultAction, FaultPlan, FaultRule, FrameKind,
 };
 
 fn guests_root() -> PathBuf {
@@ -49,7 +55,7 @@ fn guest_remap_rustflags() -> String {
 
 static BUILD: Once = Once::new();
 
-fn tiny_llama_v2_wasm() -> Vec<u8> {
+fn guest_wasm(name: &str) -> Vec<u8> {
     BUILD.call_once(|| {
         let status = Command::new("cargo")
             .current_dir(guests_root())
@@ -60,7 +66,7 @@ fn tiny_llama_v2_wasm() -> Vec<u8> {
             .expect("run cargo for guests (dev shell provides the wasm target)");
         assert!(status.success(), "building guest modules failed");
     });
-    let path = guests_root().join("target/wasm32-unknown-unknown/release/tiny_llama_v2.wasm");
+    let path = guests_root().join(format!("target/wasm32-unknown-unknown/release/{name}.wasm"));
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
@@ -78,21 +84,22 @@ fn straggles_for(msgs: &[SwarmMessage], round: u64) -> usize {
 
 /// Pinned case 1 — a byte-identical duplicate `RoundRecord` (same seq, same signed frame) is
 /// **ingested exactly once**: the round driver's watermark (`rr.round <= last_ingested`) is the
-/// dedup under test (the Phase-A pump has no §4.7 dedup machinery yet — that is B1's bounded
-/// delivery classes; the round-driver watermark is the layer that must already hold). The
-/// faulted run ends in the identical det-lane state as the clean run, and its journal §8.7
-/// replays bit-for-bit (replay re-feeds the delivered sequence, duplicate included).
+/// dedup under test. The faulted run — driven through the real wasm coordinator — ends in the
+/// identical det-lane state as the clean run, and its journal §8.7 replays bit-for-bit (replay
+/// re-feeds the delivered sequence, duplicate included).
 #[test]
 fn duplicate_round_record_is_ingested_once() {
-    let wasm = tiny_llama_v2_wasm();
-    let run_id = "testkit-adv-dup-record";
+    let coordinator = guest_wasm("coordinator_quorum");
+    let worker = guest_wasm("tiny_llama_v2");
+    let run_label = "cell8-adv-dup-record";
 
-    // Clean baseline (same run identity, so every derived seed/key matches).
-    let clean = barrier_whole_run(&wasm, &BarrierSpec::new(run_id, 1, 2)).expect("clean run");
+    // Clean baseline (same run label, so every derived seed/key matches).
+    let clean = cell8_whole_run(&coordinator, &worker, &Cell8Spec::new(run_label, 1, 2))
+        .expect("clean run");
     assert!(clean.is_green());
 
     // Faulted run: round 0's record delivered twice to worker 0.
-    let mut spec = BarrierSpec::new(run_id, 1, 2);
+    let mut spec = Cell8Spec::new(run_label, 1, 2);
     spec.faults = FaultPlan {
         rules: vec![FaultRule {
             worker: 0,
@@ -102,7 +109,7 @@ fn duplicate_round_record_is_ingested_once() {
         }],
         delay_payload_staging: Vec::new(),
     };
-    let faulted = barrier_whole_run(&wasm, &spec).expect("faulted run");
+    let faulted = cell8_whole_run(&coordinator, &worker, &spec).expect("faulted run");
 
     let w = &faulted.workers[0];
     assert!(w.replay_matched, "§8.7 replay green under the duplicate");
@@ -120,25 +127,27 @@ fn duplicate_round_record_is_ingested_once() {
 }
 
 /// Pinned case 2 — a record whose committed payloads are **delayed** past it: the guest cannot
-/// mint the committed set, voices `Straggle{fetching}` (the observable straggle-path decision),
-/// then catches up when the payloads stage at the next open — a `CaughtUp` digest for the
-/// stalled round, the identical det-lane end state as the clean run, and a §8.7-green journal
-/// (the straggle detour is part of the recorded decision stream and must replay bit-for-bit).
+/// mint the committed set, voices `Straggle{fetching}`, then catches up when the payloads stage at
+/// the next open — a `CaughtUp` digest for the stalled round, the identical det-lane end state as
+/// the clean run, and a §8.7-green journal (the straggle detour is part of the recorded decision
+/// stream and must replay bit-for-bit).
 #[test]
 fn delayed_committed_payloads_straggle_then_catch_up() {
-    let wasm = tiny_llama_v2_wasm();
-    let run_id = "testkit-adv-delayed-payloads";
+    let coordinator = guest_wasm("coordinator_quorum");
+    let worker = guest_wasm("tiny_llama_v2");
+    let run_label = "cell8-adv-delayed-payloads";
 
-    let clean = barrier_whole_run(&wasm, &BarrierSpec::new(run_id, 1, 2)).expect("clean run");
+    let clean = cell8_whole_run(&coordinator, &worker, &Cell8Spec::new(run_label, 1, 2))
+        .expect("clean run");
     assert!(clean.is_green());
 
     // Faulted run: round 0's committed payloads reach worker 0 only at round 1's open.
-    let mut spec = BarrierSpec::new(run_id, 1, 2);
+    let mut spec = Cell8Spec::new(run_label, 1, 2);
     spec.faults = FaultPlan {
         rules: Vec::new(),
         delay_payload_staging: vec![(0, 0)],
     };
-    let faulted = barrier_whole_run(&wasm, &spec).expect("faulted run");
+    let faulted = cell8_whole_run(&coordinator, &worker, &spec).expect("faulted run");
 
     let w = &faulted.workers[0];
     assert!(
@@ -160,20 +169,10 @@ fn delayed_committed_payloads_straggle_then_catch_up() {
     assert_eq!(w.replay_decisions, 5);
     assert!(faulted.is_green());
 
-    // Catch-up parity (the FLIPPED pin — defect found by this rig in B3 sitting 2, fixed by
-    // B1's §5.9 IngestPhase state machine, flip witnessed on the merge of `vhc-integration`
-    // @ 372cd0a: the previous `assert_ne!` divergence pin went red with byte-identical
-    // digests). v1 parity holds through the straggle detour: the ingest epilogue
-    // (`snapshot_round_bases`) now fires at the first boundary after the ingest math — so when
-    // `BarrierRound::on_round_open` ingests round r and trains round r+1 within one slice,
-    // round r+1 commits against the POST-ingest round base, exactly as v1's separate
-    // `Instance::ingest` export boundary guaranteed. The detour changes the path, never the
-    // state. (B1's own `catch_up_after_straggle_reproduces_v1_digests_cpu` pins the same
-    // property against the v1 engine oracle; this pin exercises it through the adversarial
-    // rig's payload-delay fault.)
+    // Catch-up parity: v1 parity holds through the straggle detour — the ingest epilogue fires at
+    // the ingest→training boundary, so the detour changes the path, never the state.
     assert_eq!(
         w.digest, clean.workers[0].digest,
-        "the straggle detour must change the path, not the state: identical det-lane end state \
-         (v1 catch-up parity, §5.9 ingest epilogue at the ingest→training boundary)"
+        "the straggle detour must change the path, not the state: identical det-lane end state"
     );
 }

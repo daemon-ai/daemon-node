@@ -5,8 +5,9 @@
 // colocated on one host, arbitrated, both green"; decisions D6), tier-2:
 //
 // Two real wasm role-instances run CONCURRENTLY in one host process — a trainer
-// (`tiny_llama_v2.wasm`, the barrier whole-run under the in-process native coordinator) and a
-// verifier-role instance (`toy_averager.wasm`, self-driven) — each admitted through the node's
+// (`tiny_llama_v2.wasm`, the cell-8 barrier whole-run under the PRODUCTION `coordinator_quorum.wasm`
+// coordinator) and a verifier-role instance (`toy_averager.wasm`, self-driven) — each admitted
+// through the node's
 // `OwnerArbiter` (per-device + host-wide typed ledgers, atomic check-and-reserve) BEFORE its
 // sandbox starts, exactly the D6 funnel order. Both runs end green (clean outcome + §8.7 replay
 // bit-for-bit); the ledgers account exactly while both are live; an over-budget third instance
@@ -29,7 +30,7 @@ use std::time::Duration;
 use daemon_vhc_host::v2::{RunEnd, RunIdentity};
 use daemon_vhc_node::{AdmitRefusal, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId};
 use daemon_vhc_testkit::run::{whole_run, RunSpec};
-use daemon_vhc_testkit::{barrier_whole_run, BarrierSpec};
+use daemon_vhc_testkit::{cell8_whole_run, Cell8Spec};
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -81,6 +82,7 @@ fn id(label: &str, role: &str, instance: u64) -> RoleInstanceId {
 
 #[test]
 fn trainer_and_verifier_colocated_on_one_host_arbitrated_both_green() {
+    let coordinator_wasm = guest("coordinator_quorum");
     let trainer_wasm = guest("tiny_llama_v2");
     let verifier_wasm = guest("toy_averager");
 
@@ -130,10 +132,11 @@ fn trainer_and_verifier_colocated_on_one_host_arbitrated_both_green() {
 
     // Run both role-instances CONCURRENTLY — two sandboxes, one host process.
     let trainer = std::thread::spawn({
+        let coordinator = coordinator_wasm;
         let wasm = trainer_wasm;
         move || {
-            let spec = BarrierSpec::new("colo-trainer", 1, 2);
-            barrier_whole_run(&wasm, &spec).expect("trainer whole run")
+            let spec = Cell8Spec::new("colo-trainer", 1, 2);
+            cell8_whole_run(&coordinator, &wasm, &spec).expect("trainer whole run")
         }
     });
     let verifier = std::thread::spawn({
