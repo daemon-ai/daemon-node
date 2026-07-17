@@ -230,6 +230,14 @@ pub struct SwarmConfig {
     /// typed sectioned manifest and emits `EngineEvent::TypedCheckpointed`. Default off — every
     /// pre-E harness run is behavior-identical.
     pub typed_checkpoints: bool,
+    /// Record the run through the production **wasm coordinator** module rather than the native
+    /// `tick` shell (architecture §4.1: consensus is a sandboxed, content-addressed module). The
+    /// module is event-driven (one tick per delivered frame), so the captured driving trace is
+    /// reproducible from frames alone — a recorded run and its `swarm-replay` re-derivation share
+    /// one coordinator substrate (this un-gates the observe record/replay path). The event-driven
+    /// drive expects every healthy peer to commit each round (no clock-timeout forcing); the
+    /// clock-forced fault drills stay on the native shell for now.
+    pub wasm_coordinator: bool,
 }
 
 impl Default for SwarmConfig {
@@ -251,6 +259,7 @@ impl Default for SwarmConfig {
             late_join: None,
             restart_after_round: None,
             typed_checkpoints: false,
+            wasm_coordinator: false,
         }
     }
 }
@@ -747,20 +756,53 @@ where
     let obs_log = Arc::new(std::sync::Mutex::new(MessageLog::new(run.as_str())));
     let obs_handle = spawn_message_log(&gossip, version, obs_log.clone());
 
-    // The real coordinator tick loop (subscribes at construction, before it opens round 0).
-    let coord_cfg = LocalCoordinatorConfig {
-        run: run.clone(),
-        key: coordinator_key(),
-        version,
-        state: CoordinatorState::new(build_run_config(&run, &cfg), Seed([0xAB; 32]), 0),
-        bootstrap_keys: boot_keys.clone(),
-        late_keys: late_key.iter().cloned().collect(),
-        quiescence: Duration::from_millis(1500),
-        restart_after_round: cfg.restart_after_round,
+    // The coordinator drive (subscribes at construction, before it opens round 0). Either the
+    // native `tick` shell or — when `wasm_coordinator` is set — the production coordinator-quorum
+    // module (event-driven), so the recorded run and its replay oracle share one substrate.
+    let mut coord_run_config = build_run_config(&run, &cfg);
+    if cfg.wasm_coordinator {
+        // The module owns a one-tick-per-frame synthetic clock, so wall-clock phase deadlines
+        // would fire on every delivered frame and close rounds prematurely. Push them effectively
+        // infinite: the run is driven entirely by the event-driven fast paths (readiness exits
+        // warmup, all-committed + all-evidenced finalizes each round), and the captured frame trace
+        // is reproducible with no clock inputs at all (the sandbox replay drops clocks).
+        coord_run_config.warmup_s = 1_000_000;
+        coord_run_config.round_train_max_s = 1_000_000;
+        coord_run_config.round_witness_s = 1_000_000;
+        coord_run_config.cooldown_s = 1_000_000;
+    }
+    let coord_state = CoordinatorState::new(coord_run_config, Seed([0xAB; 32]), 0);
+    let coord_handle: JoinHandle<Result<CoordinatorReplay, SwarmRunError>> = if cfg.wasm_coordinator
+    {
+        let shell_cfg = crate::wasm_coordinator_shell::WasmCoordinatorShellConfig {
+            run: run.clone(),
+            version,
+            state: coord_state,
+            bootstrap_keys: boot_keys.clone(),
+            num_rounds: cfg.num_rounds,
+            poll: Duration::from_millis(50),
+            deadline: Duration::from_secs(180),
+        };
+        let shell = crate::wasm_coordinator_shell::WasmCoordinatorShell::new(
+            gossip.clone(),
+            fs.clone(),
+            shell_cfg,
+        );
+        tokio::spawn(async move { shell.drive().await })
+    } else {
+        let coord_cfg = LocalCoordinatorConfig {
+            run: run.clone(),
+            key: coordinator_key(),
+            version,
+            state: coord_state,
+            bootstrap_keys: boot_keys.clone(),
+            late_keys: late_key.iter().cloned().collect(),
+            quiescence: Duration::from_millis(1500),
+            restart_after_round: cfg.restart_after_round,
+        };
+        let coordinator = LocalCoordinator::new(gossip.clone(), fs.clone(), coord_cfg);
+        tokio::spawn(async move { coordinator.drive().await })
     };
-    let coordinator = LocalCoordinator::new(gossip.clone(), fs.clone(), coord_cfg);
-    let coord_handle: JoinHandle<Result<CoordinatorReplay, SwarmRunError>> =
-        tokio::spawn(async move { coordinator.drive().await });
 
     // Collect events until every expected peer finishes (or leaves / is killed), with a safety
     // timeout so a silent/left peer cannot hang the harness.

@@ -63,6 +63,13 @@ pub mod harness;
 #[cfg(any(test, feature = "harness"))]
 pub mod replay_sandbox;
 
+/// The wasm-coordinator recording drive for the in-process whole-run harness: drives the
+/// production `coordinator-quorum` module (event-driven, one tick per frame) instead of a native
+/// tick, so a recorded run and its `swarm-replay` re-derivation share one coordinator substrate.
+/// Behind the `harness` feature (needs the host runtime), and this crate's own tests.
+#[cfg(any(test, feature = "harness"))]
+pub mod wasm_coordinator_shell;
+
 // `live_harness` (the iroh live-transport harness driving the v1 WasmBackend over the RoundEngine)
 // RETIRED with the v1 driver at the Phase-E sunset; the loopback `harness` (StubBackend) remains
 // the deterministic multi-peer substrate, and the live v2 lanes are the testkit's.
