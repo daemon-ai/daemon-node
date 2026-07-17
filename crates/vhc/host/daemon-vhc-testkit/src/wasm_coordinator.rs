@@ -11,6 +11,7 @@
 //! are unchanged.
 
 pub use daemon_vhc_host::wasm_coordinator::{
-    authorize_coordinator_frame, configure_wasm_coordinator, frame_sender,
-    refuse_unconfigurable_envelope, WasmCoordError, WasmCoordinator, WasmCoordinatorSpec,
+    authorize_coordinator_frame, configure_wasm_coordinator, coordinator_state_from_capture,
+    frame_sender, refuse_unconfigurable_envelope, WasmCoordError, WasmCoordinator,
+    WasmCoordinatorSpec,
 };

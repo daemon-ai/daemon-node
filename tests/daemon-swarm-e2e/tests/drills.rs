@@ -56,6 +56,7 @@ async fn late_join_mid_run_syncs_and_contributes() {
         checkpoint_every_rounds: 3, // checkpoints at round 2 (and 5)
         min_peers: Some(3),
         late_join: Some(LateJoin { resume_round: 2 }),
+        wasm_coordinator: true,
         ..SwarmConfig::small(6)
     };
     let run = run_swarm(cfg).await.expect("late-join run");
@@ -99,6 +100,7 @@ async fn hard_peer_death_dropped_after_absences() {
             peer_index: 2,
             after_round: 2,
         }),
+        wasm_coordinator: true,
         ..SwarmConfig::small(8)
     };
     let run = run_swarm(cfg).await.expect("silent-death run");
@@ -137,6 +139,7 @@ async fn payload_store_outage_absorbed_by_stall_ladder() {
             round: 4,
             first_n_gets: 3,
         }),
+        wasm_coordinator: true,
         ..SwarmConfig::small(10)
     };
     let run = run_swarm(cfg).await.expect("store-outage run");
@@ -224,6 +227,7 @@ async fn desync_injection_detected_and_resynced() {
         num_peers: 3,
         num_rounds: 8,
         checkpoint_every_rounds: 1, // a checkpoint every round → round-3 checkpoint available
+        wasm_coordinator: true,
         ..SwarmConfig::small(8)
     };
     // Peer 2 desyncs at round 4; peers 0 and 1 stay healthy.
@@ -333,12 +337,15 @@ async fn desync_injection_detected_and_resynced() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_restart_mid_run_completes() {
-    // The coordinator shell reloads its CoordinatorState from canonical CBOR after round 4 (a
-    // process restart, practical PROTO-20); the run completes and stays in agreement.
+    // The wasm coordinator module is re-instantiated from its EXPORTED state after round 4 (a
+    // process restart through the sandbox, architecture §4.4): quiesce→snapshot→`da_migrate` a
+    // fresh incarnation, which resumes the same logical timeline. The run completes and stays in
+    // agreement across the restart.
     let cfg = SwarmConfig {
         num_peers: 3,
         num_rounds: 10,
         restart_after_round: Some(4),
+        wasm_coordinator: true,
         ..SwarmConfig::small(10)
     };
     let run = run_swarm(cfg).await.expect("restart run");
@@ -355,15 +362,13 @@ async fn coordinator_restart_mid_run_completes() {
         assert_eq!(peers.len(), 3, "all 3 peers report round {round}");
     }
 
+    // The module was re-instantiated from its exported state exactly once mid-run. (The native
+    // per-round CBOR trajectory `verify()` does not apply to the wasm capture — the module owns its
+    // state; agreement across the restart above is the resumption proof.)
     let replay = run.replay.as_ref().expect("replay captured");
     assert_eq!(
         replay.reloads(),
         1,
-        "the coordinator reloaded its state once"
-    );
-    assert_eq!(replay.recorded_rounds(), 10);
-    assert!(
-        replay.verify(),
-        "the reloaded trajectory still replays byte-identically (PROTO-20)"
+        "the coordinator was re-instantiated from its exported state once"
     );
 }

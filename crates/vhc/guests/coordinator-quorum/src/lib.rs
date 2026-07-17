@@ -34,13 +34,30 @@
 //! sets `tick_period_ms > 0` to also arm real deadline timers.
 
 use daemon_vhc_abi::{EV_TAG_FRAME, EV_TAG_QUIESCE, EV_TAG_STOP, EV_TAG_TIMER};
-use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, PeerId, SwarmMessage};
+use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId, SwarmMessage};
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, tick_authenticated, CoordinatorState, Input, Output,
 };
 use daemon_vhc_sdk_consensus::{Authorized, DEFAULT_RECORDS_CHANNEL};
+use daemon_vhc_sdk_v2::migrate::{
+    build_manifest, MigrationDescriptor, OwnedSection, SectionReader,
+};
 use daemon_vhc_sdk_v2::module::{ModuleDecl, V2Module};
 use serde::Deserialize;
+
+/// The one state-manifest section a coordinator snapshot declares: its whole `CoordinatorState`,
+/// canonical-CBOR, consensus-canonical (`class` 0). Named so `da_migrate` can bind it on restore.
+const STATE_SECTION: &str = "consensus";
+
+/// The coordinator state-schema version (ABI §10.2 `state-section-decl.schema`).
+const STATE_SCHEMA: u64 = 1;
+
+/// `da_run` outcome for a completed `Quiesce` drain (ABI §4.5): the module snapshotted and is ready
+/// to be torn down / migrated from.
+const OUTCOME_QUIESCE_READY: u32 = 2;
+
+/// `da_migrate` status for a descriptor the coordinator cannot consume (ABI §10.2 `Incompatible`).
+const MIGRATE_INCOMPATIBLE: u32 = 1;
 
 /// The module's `da_init` config (canonical CBOR): the resolved initial coordinator state plus the
 /// two guest-runtime knobs. The native reference consumes only `state` — the knobs are wasm-loop
@@ -72,6 +89,42 @@ impl Coordinator {
         let (next, outputs) = tick(self.state.clone(), Input::Clock(self.now_s));
         self.state = next;
         self.emit(&outputs);
+    }
+
+    /// Snapshot the whole consensus state through the sandbox on a `Quiesce` drain (§10.2): the
+    /// same typed quiesce→`StateManifest` path the trainer guest uses. `CoordinatorState` is small
+    /// in-memory CBOR with no device residency, so the snapshot is synchronous — one
+    /// consensus-canonical section staged, then the manifest submitted. A standby/restart
+    /// re-instantiates from the accepted snapshot via [`Coordinator::migrate`] and continues the
+    /// same logical timeline bit-identically (its `now_s`/round ring are restored verbatim).
+    ///
+    /// Returns the `da_run` outcome: `OUTCOME_QUIESCE_READY` once the host accepts the manifest, or
+    /// a nonzero module-defined code if serialization or the submission is refused (fail loud).
+    fn snapshot_and_ready(&self) -> u32 {
+        let Ok(state_bytes) = to_canonical_vec(&self.state) else {
+            return MIGRATE_INCOMPATIBLE;
+        };
+        let section = OwnedSection {
+            name: STATE_SECTION.to_string(),
+            schema: STATE_SCHEMA,
+            class: 0, // consensus-canonical (the published-decision-bearing state)
+            bytes: state_bytes,
+        };
+        let _staging_id = daemon_vhc_sdk_v2::stage_state(&section.bytes);
+        // `module` is zeroed — a module cannot hash its own bytes; the host verifies the section
+        // by content hash before staging (the §10.2 discipline the trainer follows too).
+        let manifest = build_manifest(
+            Hash([0u8; 32]),
+            STATE_SCHEMA,
+            std::slice::from_ref(&section),
+        );
+        let Ok(manifest_bytes) = to_canonical_vec(&manifest) else {
+            return MIGRATE_INCOMPATIBLE;
+        };
+        if daemon_vhc_sdk_v2::snapshot_state(&manifest_bytes) != 0 {
+            return MIGRATE_INCOMPATIBLE;
+        }
+        OUTCOME_QUIESCE_READY
     }
 
     /// Publish every `RoundOpen`/`RoundRecord` the coordinator produced, in order (§6.2). Notes and
@@ -120,6 +173,32 @@ impl V2Module for Coordinator {
         })
     }
 
+    /// The §10.2 consuming protocol (the standby/restart re-instantiation): read back the single
+    /// `consensus` state-manifest section the old instance's `snapshot_and_ready` staged and
+    /// replace this fresh instance's state with it. `da_init` already ran (with the genesis config,
+    /// so `run` has a valid `proto_version` etc.); this overrides its state — and the resumed
+    /// `now_s` — with the exported one, so the module continues the same logical timeline and its
+    /// published decisions are byte-identical to an uninterrupted run's.
+    fn migrate(&mut self, descriptor: &MigrationDescriptor, reader: &mut dyn SectionReader) -> u32 {
+        let mut restored: Option<CoordinatorState> = None;
+        for binding in &descriptor.sections {
+            if binding.name != STATE_SECTION {
+                return MIGRATE_INCOMPATIBLE;
+            }
+            let bytes = reader.read(binding.staging_id);
+            match from_canonical_slice::<CoordinatorState>(&bytes) {
+                Ok(s) => restored = Some(s),
+                Err(_) => return MIGRATE_INCOMPATIBLE,
+            }
+        }
+        let Some(state) = restored else {
+            return MIGRATE_INCOMPATIBLE;
+        };
+        self.now_s = state.now_s;
+        self.state = state;
+        0
+    }
+
     fn run(&mut self) -> u32 {
         let proto_version = self.state.config.proto_version;
         let mut buf: Vec<u8> = Vec::with_capacity(512);
@@ -166,10 +245,11 @@ impl V2Module for Coordinator {
                         daemon_vhc_sdk_v2::abi::set_timer(self.tick_period_ms);
                     }
                 }
-                // Terminal / drain: a coordinator holds no un-snapshotted durable state beyond its
-                // journaled inputs, so it returns promptly (Ok / QuiesceReady).
+                // Terminal: a clean stop returns Ok promptly (no un-snapshotted durable state).
                 t if t == EV_TAG_STOP => return 0,
-                t if t == EV_TAG_QUIESCE => return 2,
+                // Drain: snapshot the consensus state through the sandbox (§10.2) so a standby /
+                // restart re-instantiates from the exported state, then return QuiesceReady.
+                t if t == EV_TAG_QUIESCE => return self.snapshot_and_ready(),
                 // Advisory / unknown-but-delivered events: ignore (only unknown TAGS fail closed,
                 // which the SDK `next_event` decoder already enforces, §5.2).
                 _ => {}

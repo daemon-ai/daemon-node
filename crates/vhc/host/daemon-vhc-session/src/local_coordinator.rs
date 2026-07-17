@@ -73,21 +73,23 @@ pub struct CoordinatorReplay {
 impl CoordinatorReplay {
     /// A replay capture recorded by the **wasm-coordinator** drive
     /// ([`crate::wasm_coordinator_shell`]): the module's genesis-derived initial state + the exact
-    /// driving-frame trace it consumed. There is no native per-round state trajectory to snapshot
-    /// (the module owns its state), so `states_by_round` is empty and [`CoordinatorReplay::verify`]
-    /// is not the verification path — the run is re-derived through the sandboxed module by
-    /// [`crate::harness::verify_observe_dir`] instead.
+    /// driving-frame trace it consumed, plus how many times the module was re-instantiated from its
+    /// exported state mid-run (`reloads` — the restart drill). There is no native per-round state
+    /// trajectory to snapshot (the module owns its state), so `states_by_round` is empty and
+    /// [`CoordinatorReplay::verify`] is not the verification path — the run is re-derived through
+    /// the sandboxed module by [`crate::harness::verify_observe_dir`] instead.
     #[must_use]
     pub(crate) fn from_wasm_capture(
         initial: CoordinatorState,
         inputs: Vec<Input>,
         dropped: BTreeSet<PeerId>,
+        reloads: u32,
     ) -> Self {
         Self {
             initial,
             inputs,
             states_by_round: BTreeMap::new(),
-            reloads: 0,
+            reloads,
             dropped,
         }
     }

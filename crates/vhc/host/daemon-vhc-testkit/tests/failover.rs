@@ -16,10 +16,13 @@
 // 3. The primary is **killed** mid-round-stream.
 // 4. A **standby** reconstructs the coordinator state deterministically from the **archive prefix
 //    + the journal tail alone** (chain-walked, content-re-hashed, tail chained against the last
-//    archived segment), re-folds the pure `tick` natively — legitimate because the D2
-//    dual-compilation gate proves native ≡ blob — and boots a FRESH incarnation of the production
-//    blob with the reconstructed state as its config. The guest resumes its synthetic clock from
-//    the restored state, so its decisions continue the same logical timeline.
+//    archived segment) — **through the sandbox, never a native `tick` fold**: it replays the
+//    recovered inputs into a fresh `coordinator_quorum.wasm` instance seeded from the archived
+//    initial state and EXPORTS the rebuilt `CoordinatorState` via the typed quiesce→snapshot path
+//    (§10.2). It then boots a FRESH incarnation of the production blob and re-instantiates it from
+//    that exported snapshot (`da_migrate`). The guest resumes its synthetic clock from the restored
+//    state, so its decisions continue the same logical timeline. Consensus never runs outside the
+//    content-addressed module, even to rebuild a standby (architecture §4.1/§4.4).
 // 5. The remaining rounds are delivered to the standby; its decisions must be **byte-identical**
 //    to what an uninterrupted reference run would have produced — resumption, not approximation.
 //
@@ -65,10 +68,11 @@ use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SignedMessage,
     SigningKey, SwarmMessage, SWARM_PROTO_VERSION,
 };
-use daemon_vhc_sdk_consensus::coordinator::{tick, CoordinatorState, Input};
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 use daemon_vhc_testkit::barrier::phase_a_grants;
 use daemon_vhc_testkit::{
-    cell8_genesis, configure_wasm_coordinator, WasmCoordinator, WasmCoordinatorSpec,
+    cell8_genesis, configure_wasm_coordinator, coordinator_state_from_capture, WasmCoordinator,
+    WasmCoordinatorSpec,
 };
 
 const ROUNDS_BEFORE_KILL: u64 = 4;
@@ -282,6 +286,15 @@ impl CoordinatorCertStore {
     }
 }
 
+/// Wrap a `CoordinatorState` in the module's opaque `{state: …}` `da_init` config shape.
+fn state_config(state: &CoordinatorState) -> Vec<u8> {
+    let v = Value::Map(vec![(
+        Value::Text("state".into()),
+        Value::serialized(state).expect("state value"),
+    )]);
+    to_canonical_vec(&v).expect("state config")
+}
+
 /// Decode the coordinator's initial state out of its opaque `{state: …}` config bytes.
 fn initial_state_of(spec: &WasmCoordinatorSpec) -> CoordinatorState {
     let v: Value = ciborium::de::from_reader(spec.config_bytes.as_slice()).expect("config cbor");
@@ -460,13 +473,46 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
         .initial
         .expect("the archived prefix carries the snapshot");
 
-    // Deterministic state reconstruction (architecture §4.4): fold the pure tick natively —
-    // native ≡ blob by the D2 dual-compilation gate.
-    let mut state = rec_initial;
-    for input in capture.inputs {
-        let (next, _) = tick(state, input);
-        state = next;
+    // Deterministic state reconstruction THROUGH THE SANDBOX (architecture §4.1/§4.4): consensus
+    // never runs outside the content-addressed module, even to rebuild a standby — so instead of
+    // folding the pure native `tick`, replay the recovered inputs into a fresh coordinator-quorum
+    // instance seeded from the archived initial state, then EXPORT its rebuilt state via the typed
+    // quiesce→snapshot path (§10.2). The module owns a one-tick-per-frame synthetic clock, so the
+    // recovered `Input::Message` frames alone reproduce the primary's state (the recovered
+    // `Input::Clock`s are redundant with the module's own per-frame ticks).
+    let rebuild_spec = WasmCoordinatorSpec {
+        module_hash: spec.module_hash,
+        config_bytes: state_config(&rec_initial),
+        authority: spec.authority.clone(),
+        run_id: spec.run_id,
+    };
+    let rebuild_key_seed = *blake3::hash(b"failover/rebuild-key").as_bytes();
+    let mut rebuild =
+        WasmCoordinator::start(&wasm, &rebuild_spec, phase_a_grants(), 2, rebuild_key_seed)
+            .unwrap();
+    for input in &capture.inputs {
+        if let Input::Message(signed) = input {
+            rebuild
+                .deliver_signed(signed)
+                .expect("replay a recovered frame into the reconstruction instance");
+        }
     }
+    // Drain the rebuilt decisions before exporting: a `Quiesce` freezes delivery (queued frames
+    // spool), so the module must have finished folding the replayed inputs first. The rebuild
+    // re-derives the same prefix the primary published — its trailing open marks the round the
+    // exported state stands in.
+    let expected_rebuild = decision_count(ROUNDS_BEFORE_KILL, true);
+    let mut drained = 0usize;
+    while drained < expected_rebuild {
+        rebuild
+            .next_decision(Duration::from_secs(60))
+            .expect("rebuild decision");
+        drained += 1;
+    }
+    let exported = rebuild
+        .quiesce_snapshot(60_000)
+        .expect("the reconstruction instance exports its state through the sandbox");
+    let state = coordinator_state_from_capture(&exported).expect("exported state decodes");
     assert_eq!(
         state.round, ROUNDS_BEFORE_KILL,
         "the reconstructed state stands at the next un-opened round"
@@ -499,23 +545,18 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
         "the fenced old signer is refused after the transfer (split-brain prevention)"
     );
 
-    // -- 6. boot the standby (fresh incarnation, reconstructed state as config) and resume -------
-    let standby_config = {
-        let v = Value::Map(vec![(
-            Value::Text("state".into()),
-            Value::serialized(&state).expect("state value"),
-        )]);
-        to_canonical_vec(&v).expect("standby config")
-    };
-    let standby_spec = WasmCoordinatorSpec {
-        module_hash: spec.module_hash,
-        config_bytes: standby_config,
-        authority: spec.authority.clone(),
-        run_id: spec.run_id,
-    };
-    let mut standby =
-        WasmCoordinator::start(&wasm, &standby_spec, phase_a_grants(), 1, standby_key_seed)
-            .unwrap();
+    // -- 6. boot the standby (fresh incarnation, RE-INSTANTIATED from the exported snapshot) -----
+    // `da_init` runs with the genesis config, then `da_migrate` restores the exported state through
+    // the sandbox (ABI §10.3 step 4) — the module continues the same logical timeline from there.
+    let mut standby = WasmCoordinator::start_migrating(
+        &wasm,
+        &spec,
+        phase_a_grants(),
+        1,
+        standby_key_seed,
+        exported,
+    )
+    .unwrap();
 
     let post_kill = build_script(
         &worker_keys,
@@ -581,4 +622,109 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     }
 
     standby.stop().expect("standby stops clean");
+}
+
+/// The coordinator module **state-export** proof (architecture §4.1/§4.4; ABI §10.2): a running
+/// `coordinator_quorum.wasm` is quiesced, snapshots its consensus state through the sandbox, is torn
+/// down, and is re-instantiated from that manifest (`da_migrate`) — and the resumed run's published
+/// decisions are byte-identical to an uninterrupted reference run's. This is the direct proof of
+/// the export → re-instantiate cycle (the failover drill exercises the same export on a rebuilt
+/// instance recovered from the archive); it is the prerequisite for standby reconstruction running
+/// entirely through the sandbox.
+#[test]
+fn coordinator_state_export_resumes_byte_identically() {
+    let wasm = coordinator_quorum_wasm();
+    let coord_hash = Hash(*blake3::hash(&wasm).as_bytes());
+
+    let base_key = SigningKey::from_bytes(blake3::hash(b"export/base-identity").as_bytes());
+    let base_id = peer_id(&base_key);
+    let primary_key_seed = *blake3::hash(b"export/primary-key").as_bytes();
+    let standby_key_seed = *blake3::hash(b"export/standby-key").as_bytes();
+    let worker_keys = [
+        SigningKey::from_bytes(blake3::hash(b"export/worker/0").as_bytes()),
+        SigningKey::from_bytes(blake3::hash(b"export/worker/1").as_bytes()),
+    ];
+
+    let genesis = cell8_genesis(RUN_LABEL, coord_hash, Hash([0x77; 32]), base_id, 2, 2, 4);
+    let author = SigningKey::from_bytes(blake3::hash(b"export/author").as_bytes());
+    let frozen = genesis.freeze(&author).expect("genesis freeze");
+    let spec = configure_wasm_coordinator(&frozen).expect("coordinator configurable");
+
+    // The primary drives the first rounds, then we drain its published decisions.
+    let mut primary =
+        WasmCoordinator::start(&wasm, &spec, phase_a_grants(), 0, primary_key_seed).unwrap();
+    let pre_kill = build_script(&worker_keys, 0..ROUNDS_BEFORE_KILL);
+    for sm in &pre_kill {
+        primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
+    }
+    let mut primary_decisions = Vec::new();
+    let expected_pre = decision_count(ROUNDS_BEFORE_KILL, true);
+    while primary_decisions.len() < expected_pre {
+        let (_, _, msg) = primary
+            .next_decision(Duration::from_secs(60))
+            .expect("primary decision");
+        primary_decisions.push(msg);
+    }
+
+    // Quiesce → snapshot → tear down: the module exports its consensus state through the sandbox.
+    let exported = primary
+        .quiesce_snapshot(60_000)
+        .expect("the primary exports its state through the sandbox");
+    let state = coordinator_state_from_capture(&exported).expect("exported state decodes");
+    assert_eq!(
+        state.round, ROUNDS_BEFORE_KILL,
+        "the exported state stands at the round the primary had opened but not recorded"
+    );
+
+    // Re-instantiate a FRESH incarnation from the exported manifest and resume the remaining rounds.
+    let mut standby = WasmCoordinator::start_migrating(
+        &wasm,
+        &spec,
+        phase_a_grants(),
+        1,
+        standby_key_seed,
+        exported,
+    )
+    .unwrap();
+    let post_kill = build_script(
+        &worker_keys,
+        ROUNDS_BEFORE_KILL..ROUNDS_BEFORE_KILL + ROUNDS_AFTER,
+    );
+    for sm in &post_kill {
+        standby.deliver(&sm.key, &sm.msg).expect("standby deliver");
+    }
+    let mut standby_decisions = Vec::new();
+    let expected_post = decision_count(ROUNDS_AFTER, false);
+    for i in 0..expected_post {
+        let (_, _, msg) = standby
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("standby decision {i}: {e}"));
+        standby_decisions.push(msg);
+    }
+    standby.stop().expect("standby stops clean");
+
+    // The uninterrupted reference: a single fresh instance over the full script.
+    let total_rounds = ROUNDS_BEFORE_KILL + ROUNDS_AFTER;
+    let full_script = build_script(&worker_keys, 0..total_rounds);
+    let uninterrupted = wasm_reference(
+        &wasm,
+        &spec,
+        primary_key_seed,
+        &full_script,
+        decision_count(total_rounds, true),
+    );
+    let mut resumed = primary_decisions;
+    resumed.extend(standby_decisions);
+    assert_eq!(
+        uninterrupted.len(),
+        resumed.len(),
+        "export+resume produced the same number of decisions as an uninterrupted run"
+    );
+    for (a, b) in uninterrupted.iter().zip(resumed.iter()) {
+        assert_eq!(
+            to_canonical_vec(a).unwrap(),
+            to_canonical_vec(b).unwrap(),
+            "export+resume ≡ uninterrupted, byte-for-byte"
+        );
+    }
 }

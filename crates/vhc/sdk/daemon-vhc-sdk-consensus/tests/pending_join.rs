@@ -3,17 +3,19 @@
 
 //! §6.2 pending-join sharp edge (Merge-2 adjudication (d); TDD PROTO-2/§6.2 gap register).
 //!
-//! Joins take effect only at epoch boundaries because the roster is frozen in `Warmup` (spec §6.2).
-//! A join that arrives while the run is still `WaitingForMembers` is applied **roster-direct**; a
-//! join that arrives **after** the `WaitingForMembers → Warmup` transition is staged `pending` and
+//! The epoch roster forms through the whole pre-round window (`WaitingForMembers` + `Warmup`): a
+//! join that arrives before the first round opens is applied **roster-direct**. A join that arrives
+//! once a **round is active** is staged `pending` (the roster is frozen for the epoch, §6.2) and
 //! materializes only at the next epoch boundary — so with `epoch_rounds = 0` (a single-epoch run) a
-//! late join **never** materializes mid-run. This is the operational note the ledger adds to §6.2:
-//! declared-run authors MUST set `min_peers` = the expected initial roster size, or workers racing
-//! the warmup transition are staged until an epoch boundary that (for `epoch_rounds = 0`) never
-//! comes. The `ws_live_workers` gate harness encodes exactly this (`min_peers == NUM_WORKERS`).
+//! join that races into an active round **never** materializes mid-run. This is the operational
+//! note the ledger adds to §6.2: declared-run authors SHOULD set `min_peers` = the expected initial
+//! roster size, but a bootstrap peer that lands during `Warmup` (after `min_peers` was reached)
+//! still joins the initial roster rather than being stranded. The `ws_live_workers` gate harness
+//! encodes `min_peers == NUM_WORKERS`.
 //!
-//! These pin the `tick` routing (`tick.rs::on_join`: `WaitingForMembers` → `upsert_member`, else
-//! `state.pending.push`) + the epoch-boundary drain, so the sharp edge cannot silently regress.
+//! These pin the `tick` routing (`tick.rs::on_join`: pre-round `WaitingForMembers`/`Warmup` →
+//! `upsert_member`, active-round → `state.pending.push`) + the epoch-boundary drain, so the sharp
+//! edge cannot silently regress.
 
 mod common;
 

@@ -16,6 +16,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use daemon_core::ContainedRoot;
@@ -30,6 +31,14 @@ use crate::SwarmNetError;
 pub struct FsPayloadStore {
     root: ContainedRoot,
     retention_rounds: u64,
+    /// In-process object-access lock. `put` is a plain truncate+write (`ContainedRoot` exposes no
+    /// rename, so there is no atomic write path), and local mode legitimately has **concurrent
+    /// same-key writers**: every peer persists the identical round-boundary checkpoint under the
+    /// shared `CHECKPOINT_PEER` key, so a reader can otherwise observe a torn (empty/partial)
+    /// object mid-rewrite and fail its content-hash check — a lane-load-dependent flake. All
+    /// local-mode users of one store share one process, so an in-process RwLock (writes exclusive,
+    /// reads shared) linearizes object access completely.
+    lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl FsPayloadStore {
@@ -41,6 +50,7 @@ impl FsPayloadStore {
         Ok(Self {
             root,
             retention_rounds,
+            lock: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -70,6 +80,7 @@ impl FsPayloadStore {
     /// round directories removed. A subsequent fetch of a pruned object is a typed
     /// [`SwarmNetError::PayloadMiss`] (feeds the stall ladder).
     pub async fn prune(&self, run: &RunId, current_round: RoundId) -> Result<u64, SwarmNetError> {
+        let _w = self.lock.write().await;
         let run_rel = Self::run_rel(run);
         let entries = match self.root.read_dir(&run_rel).await {
             Ok(entries) => entries,
@@ -116,6 +127,7 @@ impl FsPayloadStore {
 #[async_trait]
 impl PayloadStore for FsPayloadStore {
     async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, SwarmNetError> {
+        let _w = self.lock.write().await;
         let round_rel = Self::round_rel(&key.run, key.round);
         self.root
             .create_dir_all(&round_rel)
@@ -133,6 +145,7 @@ impl PayloadStore for FsPayloadStore {
         key: &PayloadKey,
         expected: &ContentHash,
     ) -> Result<Vec<u8>, SwarmNetError> {
+        let _r = self.lock.read().await;
         let bytes = self
             .root
             .read(&Self::object_rel(key))
@@ -151,6 +164,7 @@ impl PayloadStore for FsPayloadStore {
     async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, SwarmNetError> {
         // A local fs store re-reads to attest the content hash; a network HEAD would carry the size
         // from object metadata and the hash from the commitment (the trait allows either).
+        let _r = self.lock.read().await;
         let bytes = self
             .root
             .read(&Self::object_rel(key))
