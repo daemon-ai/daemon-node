@@ -766,11 +766,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         (
             "daemon-vhc-observe",
             "daemon-vhc-sdk-consensus",
-            "reviewed at D2 sitting 3 and RETAINED — the coordinator oracle, the consensus-replay \
-             verifier, and the archive's Authority judgments (AuthorityConfig::authorize) all \
-             live here; re-running the native `tick` is legitimate third-party verification (no \
-             wasmtime needed; the dual-compilation gate proves native ≡ blob). Retires only if \
-             the oracle machinery ever re-seats onto the blob via the host runtime [normal]",
+            "TYPES-ONLY post-re-seat — the coordinator oracle no longer re-runs a native `tick`: \
+             it re-derives a recorded run inside the sandboxed coordinator-quorum module through \
+             the `CoordinatorSandbox` seam (the concrete driver lives in the session crate, which \
+             links the host runtime). This edge now carries only the shared coordinator types the \
+             capture/oracle traffic in (`CoordinatorState`, `Input`) + the archive's Authority \
+             judgments; retires when those types relocate off sdk-consensus [normal]",
         ),
         (
             "daemon-vhc-worker",

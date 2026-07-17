@@ -638,29 +638,23 @@ fn eclipsed_peer_converges_from_archive_and_payloads_alone() {
     assert_eq!(report.replay.rounds_verified, 3);
     assert_eq!(report.set_commitments_verified, 3);
 
-    // Convergence: the re-derived final state equals the live run's exact final state (fold the
-    // same inputs natively — the dual-compilation twin of the blob's trajectory).
+    // Convergence: the re-derived decision stream equals the live run's exact decision stream. The
+    // resync anchor is a blake3 of the coordinator's published `RoundRecord`s (the observer sees
+    // published objects, never the module's privileged internal state), so the reference is that
+    // same anchor over the native dual-compilation twin's published records.
     let final_ref = {
-        let mut state = initial;
-        let mut now_s = 0;
-        for sm in &script {
-            let token = Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
-            let (next, _) = tick_authenticated(
-                state,
-                peer_id(&sm.key),
-                SWARM_PROTO_VERSION,
-                sm.msg.clone(),
-                token,
-            );
-            now_s += 1;
-            let (after_clock, _) = tick(next, Input::Clock(now_s));
-            state = after_clock;
-        }
-        blake3_hash(&to_canonical_vec(&state).unwrap())
+        let records: Vec<_> = reference_publishes(initial, &script)
+            .into_iter()
+            .filter_map(|m| match m {
+                SwarmMessage::RoundRecord(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        blake3_hash(&to_canonical_vec(&records).unwrap())
     };
     assert_eq!(
         report.replay.final_state_hash, final_ref,
-        "the eclipsed peer converges to the live coordinator's exact state"
+        "the eclipsed peer converges to the live coordinator's exact decision stream"
     );
     assert_eq!(decisions.len(), expected.len());
 }
