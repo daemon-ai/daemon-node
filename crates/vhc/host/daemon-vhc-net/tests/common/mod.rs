@@ -138,7 +138,7 @@ pub mod iroh_harness {
             secret_key: [seed; 32],
             relay_urls: vec![],
             roster: vec![],
-            topic_input: [0x42; 32],
+            genesis_hash: [0x42; 32],
             rebroadcast,
             bind_addr: Some(loopback()),
         };
@@ -155,7 +155,7 @@ pub mod iroh_harness {
             secret_key: [seed; 32],
             relay_urls: vec![relay_url.to_string()],
             roster: vec![],
-            topic_input: [0x42; 32],
+            genesis_hash: [0x42; 32],
             rebroadcast: no_rebroadcast(),
             bind_addr: Some(loopback()),
         };

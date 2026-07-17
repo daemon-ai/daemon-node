@@ -109,9 +109,11 @@ pub struct IrohGossipConfig {
     pub relay_urls: Vec<String>,
     /// The peer roster to bootstrap the gossip mesh from (admission/Join flow).
     pub roster: Vec<IrohPeer>,
-    /// The topic-derivation input: the frozen envelope hash (`FrozenEnvelope::hash`). The topic is
-    /// `blake3(envelope hash)` (delta from Psyche's `sha256("psyche gossip" ++ run_id)`).
-    pub topic_input: [u8; 32],
+    /// The topic-derivation input: the run's **genesis hash** (`FrozenGenesis::run_id` — the
+    /// cryptographic run identity). The topic is a domain-separated `blake3` of it (see
+    /// [`derive_topic`]). Run identity is anchored on the genesis envelope, so a run's gossip topic
+    /// is a pure function of its genesis; every node/worker on the same run derives the same topic.
+    pub genesis_hash: [u8; 32],
     /// Delivery-assurance rebroadcast knob.
     pub rebroadcast: RebroadcastConfig,
     /// Optional bind address (default `0.0.0.0:0`); tests bind `127.0.0.1:0` for direct loopback.
@@ -227,7 +229,7 @@ impl IrohGossip {
             .spawn();
 
         let self_id = endpoint.id();
-        let topic = derive_topic(&config.topic_input);
+        let topic = derive_topic(&config.genesis_hash);
 
         // Bootstrap ids = roster minus self (Psyche `lib.rs:337,500-503`).
         let bootstrap: Vec<EndpointId> = config
@@ -405,11 +407,21 @@ impl ControlPlane for IrohGossip {
     }
 }
 
-/// Derive the gossip topic: `blake3(frozen envelope hash)` -> [`TopicId`]. Delta from Psyche's
-/// `sha256("psyche gossip" ++ run_id)` (`util.rs:5-13`): blake3 not sha256 (spec §6.4 content
-/// addressing), and the frozen envelope hash not the run id (binds the topic to the exact frozen run).
-fn derive_topic(envelope_hash: &[u8; 32]) -> TopicId {
-    TopicId::from_bytes(*blake3_hash(envelope_hash).as_bytes())
+/// Domain tag for the gossip-topic derivation. Binds the topic to the genesis run-identity domain
+/// so it cannot collide with any other blake3 use of the same 32 bytes, and so the topic is a
+/// distinct value from a legacy (pre-genesis) topic that hashed a run's frozen envelope directly.
+const GOSSIP_TOPIC_DOMAIN: &[u8] = b"daemon-swarm/gossip-topic/genesis/v2";
+
+/// Derive the gossip topic from the run's **genesis hash**: `blake3(domain ++ genesis_hash)` ->
+/// [`TopicId`]. Delta from Psyche's `sha256("psyche gossip" ++ run_id)` (`util.rs:5-13`): blake3 not
+/// sha256 (spec §6.4 content addressing), and the genesis hash (the run's cryptographic identity)
+/// rather than a run id or a frozen v1 envelope hash — the topic is a pure function of the genesis
+/// so every node/worker on the same run derives the same topic.
+fn derive_topic(genesis_hash: &[u8; 32]) -> TopicId {
+    let mut buf = Vec::with_capacity(GOSSIP_TOPIC_DOMAIN.len() + genesis_hash.len());
+    buf.extend_from_slice(GOSSIP_TOPIC_DOMAIN);
+    buf.extend_from_slice(genesis_hash);
+    TopicId::from_bytes(*blake3_hash(&buf).as_bytes())
 }
 
 /// Build a [`RelayMap`] from the configured URLs (`None` when empty -> `RelayMode::Disabled`).
@@ -552,13 +564,18 @@ mod tests {
     }
 
     #[test]
-    fn topic_is_blake3_of_envelope_hash() {
-        let envelope_hash = [0x11u8; 32];
-        let topic = derive_topic(&envelope_hash);
-        // Deterministic, and equal to blake3 of the input (delta from Psyche's sha256).
-        assert_eq!(
+    fn topic_is_domain_separated_blake3_of_genesis_hash() {
+        let genesis_hash = [0x11u8; 32];
+        let topic = derive_topic(&genesis_hash);
+        // Deterministic, and equal to the domain-separated blake3 of the genesis hash (the
+        // run-identity derivation; delta from Psyche's sha256 and from a bare-hash topic).
+        let mut buf = GOSSIP_TOPIC_DOMAIN.to_vec();
+        buf.extend_from_slice(&genesis_hash);
+        assert_eq!(topic, TopicId::from_bytes(*blake3_hash(&buf).as_bytes()));
+        // The migration is a real wire change: the topic differs from the legacy bare-hash form.
+        assert_ne!(
             topic,
-            TopicId::from_bytes(*blake3_hash(&envelope_hash).as_bytes())
+            TopicId::from_bytes(*blake3_hash(&genesis_hash).as_bytes())
         );
     }
 
