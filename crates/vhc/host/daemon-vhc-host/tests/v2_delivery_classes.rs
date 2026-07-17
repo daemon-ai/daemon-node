@@ -90,7 +90,15 @@ fn replay_under_coalescing_reproduces_decisions_bit_exact() {
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
 
-    // The averager still reaches all TICKS folds (it re-arms per fold), coalescing or not.
+    // Stop intent registered at the run's OUTPUT cut (§4.4): the Stop enqueues atomically with
+    // the TICKS-th publish, so the guest's last re-armed timer (armed on fold TICKS-1, still
+    // pending after the final fold) can never fire into the recorded stream — an embedder-side
+    // poll + stop() races that timer and loses under load.
+    run.pump
+        .stop_at_publishes(usize::from(TICKS), daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
+        .expect("register stop cut");
+
+    // Watchdog only (the cut does the stopping): the averager reaches all TICKS folds.
     let deadline = Instant::now() + Duration::from_secs(30);
     while run.pump.published().len() < usize::from(TICKS) {
         assert!(
@@ -100,9 +108,6 @@ fn replay_under_coalescing_reproduces_decisions_bit_exact() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    run.pump
-        .stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
-        .expect("stop");
     assert!(matches!(run.wait().expect("thread"), RunEnd::Outcome(0)));
 
     let entries: Vec<SinkEntry> = sink.lock().expect("sink").entries.clone();
