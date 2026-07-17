@@ -1,2 +1,7 @@
 edition = "2021"
 max_width = 100
+# Vendored, locally-patched third-party crate copies under vendor/ (pulled in via
+# [patch.crates-io]) are NOT formatted by us: they are a standalone workspace (never a member here,
+# so `cargo fmt` never visits them) and each carries its own `disable_all_formatting` rustfmt.toml
+# (honored per-file, so the pre-commit hook's explicit-path rustfmt skips them too). A root `ignore`
+# is deliberately NOT used here: it is a nightly-only rustfmt option and would only warn on stable.

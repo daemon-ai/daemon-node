@@ -9,6 +9,9 @@
 extend-exclude = [
   # Vendored third-party clones and build/codegen output - not ours to spell-check.
   "research/**",
+  # Vendored, locally-patched crate copies pulled in via [patch.crates-io] (upstream source, only
+  # a targeted fix is ours) - honored on explicit staged paths via the hook's `--force-exclude`.
+  "vendor/**",
   "**/target/**",
   "**/build*/**",
   "**/result-*/**",
