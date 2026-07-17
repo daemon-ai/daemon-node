@@ -9,6 +9,11 @@
 //! author the state-manifest (one `"counter"` section, schema 1, consensus-canonical class),
 //! `snapshot_state`, assert `Accepted` — and returns `QuiesceReady`. On `Stop` it returns `Ok`.
 //!
+//! Config byte 1 (nonzero) flips the module into its misbehaving twin: it IGNORES `Quiesce` —
+//! no snapshot, no return — and keeps pulling. The drain-deadline drill drives this knob: the
+//! host's §4.4/§11.3 forced interruption (`QuiesceDeadlineExceeded`) is the only way such a
+//! module leaves the drain.
+//!
 //! Raw-ABI on purpose (no SDK link — the pin-stability rule the sibling `toy-averager` follows).
 
 use std::alloc::{alloc, dealloc, Layout};
@@ -126,18 +131,24 @@ pub extern "C" fn da_claim(_c: u32, _cl: u32, _g: u32, _gl: u32) -> u64 {
 // ---- module state -----------------------------------------------------------------------------------
 
 static mut COUNTER: u64 = 0;
+static mut IGNORE_QUIESCE: bool = false;
 
-/// Initialize: the counter seeds from config byte 0 (0 when absent). No imports here (§6.6).
+/// Initialize: the counter seeds from config byte 0 (0 when absent); config byte 1 (nonzero)
+/// arms the ignore-quiesce misbehavior knob. No imports here (§6.6).
 ///
 /// # Safety
 /// Called exactly once by the host before `da_run`; `cfg_ptr` is a host-written span.
 #[no_mangle]
 pub unsafe extern "C" fn da_init(cfg_ptr: u32, cfg_len: u32, _g: u32, _gl: u32) -> u32 {
-    COUNTER = if cfg_len > 0 {
-        u64::from(*(cfg_ptr as *const u8))
-    } else {
-        0
+    let byte = |i: u32| -> u8 {
+        if i < cfg_len {
+            *((cfg_ptr + i) as *const u8)
+        } else {
+            0
+        }
     };
+    COUNTER = u64::from(byte(0));
+    IGNORE_QUIESCE = byte(1) != 0;
     0
 }
 
@@ -210,11 +221,13 @@ fn snapshot_counter(counter: u64) -> u32 {
     unsafe { abi_snapshot_state(manifest_bytes.as_ptr() as u32, manifest_bytes.len() as u32) }
 }
 
-/// The module main loop: count frames, publish the counter; snapshot + `QuiesceReady` on drain.
+/// The module main loop: count frames, publish the counter; snapshot + `QuiesceReady` on drain
+/// (or, with the misbehavior knob armed, ignore the drain and keep pulling).
 #[no_mangle]
 pub extern "C" fn da_run() -> u32 {
     // SAFETY: wasm is single-threaded; the host calls da_run exactly once (ABI §3.1).
     let counter = unsafe { &mut *core::ptr::addr_of_mut!(COUNTER) };
+    let ignore_quiesce = unsafe { *core::ptr::addr_of!(IGNORE_QUIESCE) };
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     loop {
         let frame = pull_event(&mut buf);
@@ -226,6 +239,10 @@ pub extern "C" fn da_run() -> u32 {
                 unsafe { abi_publish(0, payload.as_ptr() as u32, payload.len() as u32) };
             }
             EV_STOP => return OUTCOME_OK,
+            EV_QUIESCE if ignore_quiesce => {
+                // The misbehaving twin: no snapshot, no return — the host's drain deadline is
+                // the only exit (§4.4/§11.3 forced interruption).
+            }
             EV_QUIESCE => {
                 // One successful submission before QuiesceReady (§10.2) — fail loud otherwise.
                 let status = snapshot_counter(*counter);

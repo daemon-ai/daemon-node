@@ -439,6 +439,11 @@ struct PumpState {
     stop_cut: Option<(usize, u64)>,
     /// A `Quiesce` drain is open: Frame/PayloadReady/Timer deliveries are frozen (§4.4).
     draining: bool,
+    /// The drain's wall-clock deadline (§4.4/§11.3), as logical pump time: `now_ms()` at the
+    /// `quiesce()` registration plus its `deadline_ms`. A guest still pulling past it is forcibly
+    /// interrupted with the typed `QuiesceDeadlineExceeded` trap. Live-pump enforcement only —
+    /// replay has no wall clock; the trap lands in the journal as the tag-9 terminal fact.
+    drain_deadline_at: Option<u64>,
     /// The snapshot `snapshot_state` accepted during this drain (§10.2): the upgrade transaction
     /// reads it through [`PumpHandle::snapshot_capture`]. At most one per drain (a second
     /// successful submission is `BadEvent`).
@@ -992,6 +997,14 @@ impl PumpHandle {
         out
     }
 
+    /// Open a `Quiesce{reason, deadline_ms}` drain (§4.4): new Frame/Timer deliveries freeze
+    /// (spool/coalesce); the guest is expected to snapshot and return `QuiesceReady`. The
+    /// `deadline_ms` is not advisory: the pump enforces it wall-clock, and a guest still pulling
+    /// past it is forcibly interrupted with the typed `QuiesceDeadlineExceeded` trap
+    /// (§4.4/§11.3) — the upgrade orchestrator treats that as a failed quiesce and leaves.
+    ///
+    /// # Errors
+    /// A journal-sink/encode failure.
     pub fn quiesce(&self, reason: u64, deadline_ms: u64) -> Result<(), SinkError> {
         let frame_bytes = encode_event_frame(&EventV2::Quiesce {
             reason,
@@ -1000,6 +1013,11 @@ impl PumpHandle {
         .map_err(|e| SinkError(e.to_string()))?;
         let mut st = self.shared.state.lock().expect("pump lock");
         st.draining = true;
+        // Host-side enforcement of the deadline the event advertises (§4.4/§11.3): a guest that
+        // has not returned from the drain by then is forcibly interrupted inside `next_event`
+        // with the typed `QuiesceDeadlineExceeded` trap. The clock lives here, on the live pump
+        // (`PumpShared::t0`-anchored logical ms) — never on the deterministic replay surface.
+        st.drain_deadline_at = Some(self.shared.now_ms().saturating_add(deadline_ms));
         st.queue.push_back(QueuedEvent {
             frame_bytes,
             tag: daemon_vhc_abi::EV_TAG_QUIESCE,
@@ -1601,6 +1619,26 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                             continue;
                         }
                         let now = shared.now_ms();
+                        // Forced interruption at the drain deadline (§4.4/§11.3): a guest that
+                        // has not returned `QuiesceReady` by the advertised deadline is trapped
+                        // typed — the host never waits on a drain indefinitely. Checked before
+                        // candidate selection, so a guest busy consuming still-deliverable events
+                        // cannot ride past the deadline either.
+                        if st.draining {
+                            if let Some(deadline) = st.drain_deadline_at {
+                                if now >= deadline {
+                                    return Err(Trap::new(
+                                        TrapCode::QuiesceDeadlineExceeded,
+                                        "next_event",
+                                        None,
+                                        format!(
+                                            "the Quiesce drain's deadline passed ({now}ms >= \
+                                             {deadline}ms) without QuiesceReady (§4.4/§11.3)"
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
                         // Fire due timers (frozen during a drain, §4.4; and never behind a queued
                         // Stop — the host delivers no further events after Stop, §4.4).
                         if !st.draining && !st.stop_enqueued {
@@ -1651,7 +1689,11 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         }
                         // Nothing deliverable: park until a wake or the earliest timer deadline.
                         let wait = if st.draining {
-                            PARK_RECHECK
+                            // Bounded by the drain deadline, so its expiry is noticed promptly.
+                            st.drain_deadline_at.map_or(PARK_RECHECK, |d| {
+                                Duration::from_millis(d.saturating_sub(now).max(1))
+                                    .min(PARK_RECHECK)
+                            })
                         } else {
                             st.timers
                                 .iter()
@@ -3165,6 +3207,7 @@ pub fn start_run_migrating(
             stop_enqueued: false,
             stop_cut: None,
             draining: false,
+            drain_deadline_at: None,
             accepted_snapshot: None,
         }),
         wake: Condvar::new(),
@@ -3701,6 +3744,7 @@ mod tests {
             stop_enqueued: false,
             stop_cut: None,
             draining: false,
+            drain_deadline_at: None,
             accepted_snapshot: None,
         }
     }

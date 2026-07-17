@@ -529,13 +529,15 @@ struct Drill<'w> {
 
 /// Assemble one live drill for `role`: start the OLD instance (epoch 0), feed it `frames` frames
 /// (counter advances), commit the epoch-1 upgrade record to a REAL transition chain, and return
-/// everything `run_local_upgrade` needs. `new_grants` is the epoch-1 role grant list (the
-/// expansion negative passes a loosened one).
+/// everything `run_local_upgrade` needs. `old_config` is the OLD instance's config span (byte 0
+/// seeds the counter; byte 1 arms its ignore-quiesce misbehavior — the deadline drill's knob);
+/// `new_grants` is the epoch-1 role grant list (the expansion negative passes a loosened one).
 #[allow(clippy::too_many_lines)]
 fn assemble<'w>(
     worker: &'w Worker,
     role: &str,
     frames: u64,
+    old_config: Vec<u8>,
     new_grants: &RoleGrants,
     migrate_fuel: Vec<Option<u64>>,
     late_frame: bool,
@@ -559,7 +561,7 @@ fn assemble<'w>(
         module: old_module.0,
     };
     let old_grants_bytes = to_canonical_vec(&genesis.roles[role].grants).expect("grants cbor");
-    let mut old_cfg = V2RunConfig::new(old_identity, old_seed, Vec::new(), old_grants_bytes);
+    let mut old_cfg = V2RunConfig::new(old_identity, old_seed, old_config, old_grants_bytes);
     old_cfg.migration_max_sections = 4;
     old_cfg.migration_max_section_bytes = 1 << 12;
     let old_run = start_run(worker, &old_wasm, old_cfg, Box::new(old_sink.clone()))
@@ -689,7 +691,15 @@ fn finish_activated(steps: &mut WasmSteps<'_>) -> Vec<SinkEntry> {
 #[test]
 fn worker_upgrade_live_epoch_fenced_without_restart() {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
-    let mut drill = assemble(&worker, "worker", 3, &role_grants(4096), vec![], true);
+    let mut drill = assemble(
+        &worker,
+        "worker",
+        3,
+        Vec::new(),
+        &role_grants(4096),
+        vec![],
+        true,
+    );
 
     let outcome = run_local_upgrade(
         &drill.target,
@@ -772,7 +782,15 @@ fn worker_upgrade_live_epoch_fenced_without_restart() {
 #[test]
 fn coordinator_self_upgrade_carries_signer_continuity() {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
-    let mut drill = assemble(&worker, "coordinator", 2, &role_grants(4096), vec![], false);
+    let mut drill = assemble(
+        &worker,
+        "coordinator",
+        2,
+        Vec::new(),
+        &role_grants(4096),
+        vec![],
+        false,
+    );
 
     // D2's signer-continuity machinery: the base machine identity certified the OLD epoch's
     // per-run key with a validity window that ENDS at the fence (epoch_to = 0).
@@ -879,6 +897,7 @@ fn mid_migration_crash_recovers_by_local_rollback_and_retry() {
         &worker,
         "worker",
         5,
+        Vec::new(),
         &role_grants(4096),
         vec![Some(1_000), None],
         false,
@@ -932,7 +951,15 @@ fn grant_expanding_upgrade_fails_closed_and_the_worker_exits() {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     // The epoch-1 grants LOOSEN the channel frame bound (4096 → 8192): still within the lane,
     // but wider than the previously-admitted set — the owner-law fail-closed case.
-    let mut drill = assemble(&worker, "worker", 2, &role_grants(8192), vec![], false);
+    let mut drill = assemble(
+        &worker,
+        "worker",
+        2,
+        Vec::new(),
+        &role_grants(8192),
+        vec![],
+        false,
+    );
 
     let outcome = run_local_upgrade(
         &drill.target,
@@ -973,4 +1000,77 @@ fn grant_expanding_upgrade_fails_closed_and_the_worker_exits() {
     ));
     // Unused fields hold the drill shape together even on the refused path.
     let _ = (&drill.old_pump, &drill.steps.role);
+}
+
+// -- drill 5: drain-deadline enforcement — a quiesce-ignoring module is forcibly interrupted ---------
+
+#[test]
+fn quiesce_ignoring_module_hits_the_deadline_and_the_worker_leaves() {
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    // Config byte 1 arms the old module's misbehaving twin: it IGNORES `Quiesce` — no snapshot,
+    // no `QuiesceReady` — so the host's §4.4/§11.3 wall-clock deadline is the only exit. Before
+    // the live pump enforced that deadline, this drill hung forever inside the quiesce step.
+    let mut drill = assemble(
+        &worker,
+        "worker",
+        2,
+        vec![0, 1],
+        &role_grants(4096),
+        vec![],
+        false,
+    );
+
+    let started = Instant::now();
+    let outcome = run_local_upgrade(
+        &drill.target,
+        "worker",
+        drill.grants_hash,
+        &drill.prev_quotas,
+        250, // the drain deadline (ms) — deliberately tight; the drill proves it binds
+        1,
+        &mut drill.steps,
+    );
+    let elapsed = started.elapsed();
+
+    // The typed forced interruption surfaced, and the orchestrator mapped it to the
+    // failed-quiesce leave (§10.3 step 7): the chain stays at the committed epoch; only this
+    // node left; the old epoch is never resumed.
+    match outcome {
+        LocalUpgradeOutcome::Left {
+            epoch,
+            reason: LeaveReason::QuiesceFailed(why),
+        } => {
+            assert_eq!(epoch, 1);
+            assert!(
+                why.contains("QuiesceDeadlineExceeded"),
+                "the leave names the typed interruption: {why}"
+            );
+        }
+        other => panic!("expected the failed-quiesce leave, got {other:?}"),
+    }
+    // Liveness: the host enforced the wall clock — bounded by the deadline plus the pump's
+    // recheck granularity, never an indefinite drain (and well under the epoch watchdog).
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "forced interruption was prompt, took {elapsed:?}"
+    );
+    assert!(drill.steps.left.is_some(), "the worker exited the run");
+    assert!(drill.steps.pending.is_none() && drill.steps.activated.is_none());
+    assert_eq!(drill.steps.attempt, 0, "migrate never ran");
+    // The old journal ends at the tag-9 terminal TRAP fact (kind 1) — the forced interruption
+    // is journaled like any wall-clock watchdog trap; replay never re-derives it.
+    let old_entries = drill.old_sink.lock().expect("sink").entries.clone();
+    assert!(
+        matches!(
+            old_entries.last(),
+            Some(SinkEntry::Terminal {
+                kind: 1,
+                outcome: None
+            })
+        ),
+        "trap terminal journaled, got {:?}",
+        old_entries.last()
+    );
+    // No snapshot was ever accepted: the drain produced nothing durable to roll back to.
+    assert!(drill.old_pump.snapshot_capture().is_none());
 }
