@@ -119,8 +119,17 @@ pub fn whole_run(worker: &Worker, wasm: &[u8], spec: RunSpec) -> Result<WholeRun
         .map_err(|e| format!("start_run: {e}"))?;
     let pump = run.pump.clone();
 
-    // Drain the self-driven module to its natural stop point (it arms its own timers; the driver's
-    // clock fires them), bounded by the timeout so a wedged guest cannot hang the gate.
+    // Stop intent at the run's output cut (§4.4): the Stop enqueues atomically with the final
+    // expected publish, so a still-armed guest timer can never fire into the recorded stream
+    // after the run's natural completion (a poll + stop() would race it).
+    pump.stop_at_publishes(
+        spec.expect_publishes,
+        daemon_vhc_abi::STOP_REASON_RUN_COMPLETE,
+    )
+    .map_err(|e| format!("register stop cut: {e}"))?;
+
+    // Watchdog: the self-driven module reaches its publishes (it arms its own timers; the
+    // driver's clock fires them), bounded so a wedged guest cannot hang the gate.
     let deadline = Instant::now() + spec.timeout;
     while pump.published().len() < spec.expect_publishes {
         if Instant::now() >= deadline {
@@ -135,8 +144,6 @@ pub fn whole_run(worker: &Worker, wasm: &[u8], spec: RunSpec) -> Result<WholeRun
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
-        .map_err(|e| format!("stop: {e}"))?;
     let end = run.wait().map_err(|e| format!("guest thread: {e}"))?;
 
     // The recorded journal → the decisions the run made.

@@ -433,6 +433,10 @@ struct PumpState {
     op_requests: Vec<(u64, OpRequest)>,
     /// A `Stop` has been enqueued — no further deliveries will be accepted after it.
     stop_enqueued: bool,
+    /// A registered stop cut (`PumpHandle::stop_at_publishes`): when the guest's total publish
+    /// count reaches `.0`, a `Stop{.1}` enqueues atomically with that publish's commit — stop
+    /// intent registered at a deterministic point in the guest's own output stream (§4.4).
+    stop_cut: Option<(usize, u64)>,
     /// A `Quiesce` drain is open: Frame/PayloadReady/Timer deliveries are frozen (§4.4).
     draining: bool,
     /// The snapshot `snapshot_state` accepted during this drain (§10.2): the upgrade transaction
@@ -520,6 +524,30 @@ impl PumpState {
         self.queue.push_back(QueuedEvent {
             frame_bytes,
             tag: daemon_vhc_abi::EV_TAG_FENCE,
+            signed: None,
+            payload_hash: None,
+            timer_id: None,
+            is_budget: false,
+            gossip_id: None,
+        });
+        Ok(())
+    }
+
+    /// Register stop intent: enqueue the terminal `Stop{reason}` behind already-pending events
+    /// and refuse all further deliveries (§4.4). Idempotent. Because timers fire only inside
+    /// `next_event` under this same lock, no timer fire can enter the delivered (recorded)
+    /// stream after this returns.
+    fn enqueue_stop(&mut self, reason: u64) -> Result<(), SinkError> {
+        if self.stop_enqueued {
+            return Ok(());
+        }
+        let frame_bytes =
+            encode_event_frame(&EventV2::Stop { reason }).map_err(|e| SinkError(e.to_string()))?;
+        self.stop_enqueued = true;
+        self.stop_cut = None;
+        self.queue.push_back(QueuedEvent {
+            frame_bytes,
+            tag: EV_TAG_STOP,
             signed: None,
             payload_hash: None,
             timer_id: None,
@@ -873,23 +901,43 @@ impl PumpHandle {
 
     /// Deliver the terminal `Stop{reason}` (§4.4). Queued behind already-pending events (the host
     /// never silently discards a consensus input); nothing may be enqueued after it.
+    ///
+    /// This registers stop intent at a **wall-clock** point: it races the guest's own event loop,
+    /// so a due timer may still fire and be delivered before the intent lands. An embedder whose
+    /// stop condition is "the guest published its Nth output" should register the intent at that
+    /// cut instead ([`PumpHandle::stop_at_publishes`]) — the recorded stream is then deterministic.
     pub fn stop(&self, reason: u64) -> Result<(), SinkError> {
-        let frame_bytes =
-            encode_event_frame(&EventV2::Stop { reason }).map_err(|e| SinkError(e.to_string()))?;
+        let mut st = self.shared.state.lock().expect("pump lock");
+        st.enqueue_stop(reason)?;
+        drop(st);
+        self.shared.wake.notify_all();
+        Ok(())
+    }
+
+    /// Register stop intent at a deterministic cut in the guest's own output stream (§4.4): when
+    /// the guest's total publish count reaches `publishes`, the terminal `Stop{reason}` enqueues
+    /// atomically with that publish's commit — under the pump lock, before the publish import
+    /// returns. Timers fire only inside `next_event` under the same lock, so no timer fire (nor
+    /// any other new delivery) can enter the recorded stream between the cut and the `Stop`.
+    ///
+    /// This is the race-free form of "stop when the run completes": run completion is a fact of
+    /// the guest's output, and observing it from the embedder thread ([`PumpHandle::published`] +
+    /// [`PumpHandle::stop`]) loses the lock race to the guest's next timer under load. If the cut
+    /// has already passed at registration time, the `Stop` enqueues immediately. Idempotent
+    /// against an already-registered stop.
+    ///
+    /// # Errors
+    /// A journal-sink/encode failure.
+    pub fn stop_at_publishes(&self, publishes: usize, reason: u64) -> Result<(), SinkError> {
         let mut st = self.shared.state.lock().expect("pump lock");
         if st.stop_enqueued {
             return Ok(());
         }
-        st.stop_enqueued = true;
-        st.queue.push_back(QueuedEvent {
-            frame_bytes,
-            tag: EV_TAG_STOP,
-            signed: None,
-            payload_hash: None,
-            timer_id: None,
-            is_budget: false,
-            gossip_id: None,
-        });
+        if st.published.len() >= publishes {
+            st.enqueue_stop(reason)?;
+        } else {
+            st.stop_cut = Some((publishes, reason));
+        }
         drop(st);
         self.shared.wake.notify_all();
         Ok(())
@@ -2457,6 +2505,14 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                     .publish(u64::from(channel_id), seq, &payload, &frame)
                     .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
                 st.published.push((u64::from(channel_id), seq, frame));
+                // A registered stop cut (§4.4): the run is complete AT this publish — enqueue the
+                // Stop in the same critical section, so nothing else can enter the stream first.
+                if let Some((n, reason)) = st.stop_cut {
+                    if st.published.len() >= n {
+                        st.enqueue_stop(reason)
+                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    }
+                }
                 Ok(seq)
             })(&mut c);
             stash(&mut c, r)
@@ -3107,6 +3163,7 @@ pub fn start_run_migrating(
             streams: StreamTable::new(0),
             op_requests: Vec::new(),
             stop_enqueued: false,
+            stop_cut: None,
             draining: false,
             accepted_snapshot: None,
         }),
@@ -3642,6 +3699,7 @@ mod tests {
             streams: StreamTable::new(0),
             op_requests: Vec::new(),
             stop_enqueued: false,
+            stop_cut: None,
             draining: false,
             accepted_snapshot: None,
         }
@@ -3800,6 +3858,51 @@ mod tests {
         fire_due_timers(&mut st, 10).unwrap();
         let queued: Vec<u64> = st.queue.iter().filter_map(|q| q.timer_id).collect();
         assert_eq!(queued, vec![2, 3]);
+    }
+
+    #[test]
+    fn stop_cut_already_passed_enqueues_stop_immediately_and_fences_timers() {
+        let pump = test_pump(Box::new(MemorySink::new()));
+        {
+            let mut st = pump.shared.state.lock().unwrap();
+            st.published.push((0, 0, b"frame".to_vec()));
+            // A due timer armed at registration time: it must never fire past the cut.
+            st.timers.push(ArmedTimer { id: 7, fire_at: 0 });
+        }
+        pump.stop_at_publishes(1, 0).unwrap();
+        let mut st = pump.shared.state.lock().unwrap();
+        assert!(st.stop_enqueued, "cut already passed: stop registers now");
+        assert_eq!(st.queue.len(), 1);
+        assert_eq!(st.queue[0].tag, EV_TAG_STOP);
+        // The delivery loop's gate: with stop enqueued, due timers never fire (§4.4).
+        fire_due_timers_gated(&mut st, 100).unwrap();
+        assert_eq!(st.queue.len(), 1, "no Timer enters the stream behind Stop");
+    }
+
+    /// The `next_event` loop's exact firing condition, extracted for the gate assertion above.
+    fn fire_due_timers_gated(st: &mut PumpState, now: u64) -> Result<(), Trap> {
+        if !st.draining && !st.stop_enqueued {
+            fire_due_timers(st, now)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stop_cut_pending_yields_to_explicit_stop_and_stays_idempotent() {
+        let pump = test_pump(Box::new(MemorySink::new()));
+        pump.stop_at_publishes(5, 0).unwrap();
+        {
+            let st = pump.shared.state.lock().unwrap();
+            assert!(!st.stop_enqueued, "cut not reached: no stop yet");
+            assert_eq!(st.stop_cut, Some((5, 0)));
+        }
+        pump.stop(1).unwrap();
+        pump.stop(1).unwrap(); // idempotent
+        pump.stop_at_publishes(0, 2).unwrap(); // registration after stop is a no-op
+        let st = pump.shared.state.lock().unwrap();
+        let stops = st.queue.iter().filter(|q| q.tag == EV_TAG_STOP).count();
+        assert_eq!(stops, 1, "exactly one terminal Stop");
+        assert_eq!(st.stop_cut, None, "an explicit stop clears the cut");
     }
 
     #[test]
