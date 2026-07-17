@@ -11,9 +11,11 @@
 // so this suite's positive arms drive the REAL major-2 module (`tiny_llama_v2.wasm` — the v2
 // whole-run itself is `tests/v2_join.rs`), and the suite carries the WIRE-LEVEL sunset
 // regressions over the real binary:
-//   * assessing the v1 `tiny_llama.wasm` returns an INELIGIBLE verdict with the typed
-//     `AbiUnsupportedMajor` refusal code — an `Assessed` outcome, never an `Event::Error`, never
-//     a crash (the protocol twin of the flipped A0 fixture);
+//   * assessing a SYNTHETIC ABI-major-1 module (a few-section wasm image hand-assembled in-test
+//     with `wasm-encoder`: empty imports + the v1 lifecycle exports + `da_abi` = major 1 — no
+//     vendored/recorded bytes) returns an INELIGIBLE verdict with the typed `AbiUnsupportedMajor`
+//     refusal code — an `Assessed` outcome, never an `Event::Error`, never a crash (the protocol
+//     twin of the host-side driver-selection refusal, `daemon-vhc-host/tests/driver_selection.rs`);
 //   * the D0 `UnsignedEnvelopeRetired` refusal is unchanged;
 //   * `Throttle` never respawns the worker (preemption-as-churn is node-side post-sunset: the
 //     arbiter pauses/stops and re-issues JoinRun on the durable intent).
@@ -133,6 +135,83 @@ fn module_path(name: &str) -> PathBuf {
 
 fn worker_bin() -> String {
     env!("CARGO_BIN_EXE_daemon-vhc-worker").to_string()
+}
+
+// -- synthetic ABI-major-1 module (the AbiUnsupportedMajor refusal input, constructed in-test) ----
+
+/// The v1 lifecycle export set — a candidate-major-1 import/export shape (∅ imports ⊆ {tabi@1}).
+const V1_LIFECYCLE_EXPORTS: &[&str] = &[
+    "da_alloc",
+    "da_free",
+    "da_manifest",
+    "da_build",
+    "da_step",
+    "da_inner_update",
+    "da_make_update",
+    "da_ingest_updates",
+];
+
+/// Assemble a minimal valid wasm module declaring ABI major 1: empty imports, the v1 lifecycle
+/// exports (all `() -> i32`), plus a `da_abi` export returning `pack(1, 0)`. This is the offending
+/// input the post-sunset host refuses with a typed `AbiUnsupportedMajor` — hand-built here (the
+/// same `wasm-encoder` shape `daemon-vhc-host/tests/driver_selection.rs` uses) so no vendored,
+/// recorded pre-refactor artifact is load-bearing for the refusal proof.
+fn synthetic_v1_module() -> Vec<u8> {
+    use wasm_encoder::{
+        CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection,
+        ValType,
+    };
+    let mut module = Module::new();
+
+    let mut types = TypeSection::new();
+    types.ty().function([], [ValType::I32]);
+    module.section(&types);
+
+    let n_funcs = V1_LIFECYCLE_EXPORTS.len() as u32 + 1; // + da_abi
+    let mut funcs = FunctionSection::new();
+    for _ in 0..n_funcs {
+        funcs.function(0);
+    }
+    module.section(&funcs);
+
+    let mut exports = ExportSection::new();
+    for (i, name) in V1_LIFECYCLE_EXPORTS.iter().enumerate() {
+        exports.export(name, ExportKind::Func, i as u32);
+    }
+    exports.export(
+        "da_abi",
+        ExportKind::Func,
+        V1_LIFECYCLE_EXPORTS.len() as u32,
+    );
+    module.section(&exports);
+
+    let mut code = CodeSection::new();
+    for _ in 0..V1_LIFECYCLE_EXPORTS.len() {
+        let mut f = Function::new([]);
+        f.instructions().i32_const(0).end();
+        code.function(&f);
+    }
+    let mut da_abi = Function::new([]);
+    da_abi.instructions().i32_const(1 << 16).end(); // pack(major=1, minor=0)
+    code.function(&da_abi);
+    module.section(&code);
+
+    module.finish()
+}
+
+/// Write bytes to a unique temp `.wasm` path (the worker resolves its module from a filesystem
+/// path via `DAEMON_TRAIN_MODULE`). Returns the path; the caller removes it after the assess.
+fn write_temp_module(bytes: &[u8], tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "daemon-vhc-{tag}-{}-{nanos}.wasm",
+        std::process::id()
+    ));
+    std::fs::write(&path, bytes).expect("write synthetic module to temp");
+    path
 }
 
 /// The tiny-llama-v2 guest config (`GuestCfg`) — the v2_join shape: single-peer roster, 2 inner
@@ -414,12 +493,13 @@ async fn configured_default_worker_path_names_a_binary_that_speaks_ready() {
 
 // -- THE SUNSET REGRESSION over the real binary (the flipped A0's protocol twin) ------------------
 
-/// Assessing the pinned **v1** module post-sunset yields an INELIGIBLE `Assessed` verdict whose
-/// refusal code is exactly `AbiUnsupportedMajor` — typed, attributable, never an `Event::Error`,
-/// never a worker crash; the worker stays healthy and serves subsequent commands.
+/// Assessing a SYNTHETIC ABI-major-1 module post-sunset yields an INELIGIBLE `Assessed` verdict
+/// whose refusal code is exactly `AbiUnsupportedMajor` — typed, attributable, never an
+/// `Event::Error`, never a worker crash; the worker stays healthy and serves subsequent commands.
+/// The offending module is hand-assembled in-test (no vendored/recorded pre-refactor bytes).
 #[tokio::test]
 async fn v1_module_assess_is_refused_abi_unsupported_major() {
-    let module = module_path("tiny_llama.wasm");
+    let module = write_temp_module(&synthetic_v1_module(), "synthetic-v1-assess");
     let sup = supervisor_for(&module);
 
     let cfg = TinyLlamaCfg {
@@ -429,22 +509,24 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
     };
     let elig = sup
         .assess(genesis_wire(
-            "sunset-v1",
+            "abi-major-1",
             Value::serialized(&cfg).expect("cfg value"),
         ))
         .await
         .expect("assess is an outcome, not a transport error");
-    assert!(!elig.eligible, "a v1 module is refused post-sunset");
+    assert!(!elig.eligible, "a major-1 module is refused post-sunset");
     assert_eq!(
         elig.refusal_code.as_deref(),
         Some("AbiUnsupportedMajor"),
         "the clean typed refusal (decisions D5), got: {:?}",
         elig.reasons
     );
-    // The worker is unharmed: it still answers on the same process.
+    // The worker is unharmed: it still answers on the same process (no partial admission, no
+    // guest code executed — the refusal is an admission outcome raised before any da_* dispatch).
     sup.ping().await.expect("worker healthy after the refusal");
     assert_eq!(sup.restarts().await, 0, "no respawn");
     sup.shutdown().await;
+    let _ = std::fs::remove_file(&module);
 }
 
 // -- the v2 positive over the signed-envelope seam ------------------------------------------------

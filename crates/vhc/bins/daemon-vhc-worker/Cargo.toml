@@ -92,6 +92,11 @@ daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
 daemon-vhc-sdk-consensus = { workspace = true }
 blake3 = { workspace = true }
 ciborium = { workspace = true }
+# Test-only: the `AbiUnsupportedMajor` refusal input is a synthetic ABI-major-1 wasm image
+# hand-assembled in `tests/worker_protocol.rs` (no vendored/recorded pre-refactor bytes) — the same
+# `wasm-encoder` shape `daemon-vhc-host/tests/driver_selection.rs` uses. Already resolved in
+# Cargo.lock (a wasmtime/cranelift transitive), so this dev-dep adds no new crate to the graph.
+wasm-encoder = { workspace = true }
 
 [lints]
 workspace = true

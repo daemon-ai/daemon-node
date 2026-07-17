@@ -81,6 +81,67 @@ fn frozen_v1_envelope_bytes() -> Vec<u8> {
     daemon_vhc_proto::to_canonical_vec(&envelope).expect("envelope cbor")
 }
 
+/// The v1 lifecycle export set — a candidate-major-1 import/export shape (∅ imports ⊆ {tabi@1}).
+const V1_LIFECYCLE_EXPORTS: &[&str] = &[
+    "da_alloc",
+    "da_free",
+    "da_manifest",
+    "da_build",
+    "da_step",
+    "da_inner_update",
+    "da_make_update",
+    "da_ingest_updates",
+];
+
+/// Assemble a minimal valid wasm module declaring ABI major 1: empty imports, the v1 lifecycle
+/// exports (all `() -> i32`), plus a `da_abi` export returning `pack(1, 0)`. This is the offending
+/// "v1 worker module" input the two v1-worker cells refuse typed at the §1.3 front door —
+/// hand-built here (the `wasm-encoder` shape of `daemon-vhc-host/tests/driver_selection.rs`) so no
+/// vendored/recorded pre-refactor bytes and no soon-to-retire v1 guest crate is load-bearing for
+/// the refusal proof.
+fn synthetic_v1_worker_module() -> Vec<u8> {
+    use wasm_encoder::{
+        CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection,
+        ValType,
+    };
+    let mut module = Module::new();
+
+    let mut types = TypeSection::new();
+    types.ty().function([], [ValType::I32]);
+    module.section(&types);
+
+    let n_funcs = V1_LIFECYCLE_EXPORTS.len() as u32 + 1; // + da_abi
+    let mut funcs = FunctionSection::new();
+    for _ in 0..n_funcs {
+        funcs.function(0);
+    }
+    module.section(&funcs);
+
+    let mut exports = ExportSection::new();
+    for (i, name) in V1_LIFECYCLE_EXPORTS.iter().enumerate() {
+        exports.export(name, ExportKind::Func, i as u32);
+    }
+    exports.export(
+        "da_abi",
+        ExportKind::Func,
+        V1_LIFECYCLE_EXPORTS.len() as u32,
+    );
+    module.section(&exports);
+
+    let mut code = CodeSection::new();
+    for _ in 0..V1_LIFECYCLE_EXPORTS.len() {
+        let mut f = Function::new([]);
+        f.instructions().i32_const(0).end();
+        code.function(&f);
+    }
+    let mut da_abi = Function::new([]);
+    da_abi.instructions().i32_const(1 << 16).end(); // pack(major=1, minor=0)
+    code.function(&da_abi);
+    module.section(&code);
+
+    module.finish()
+}
+
 // -- cell 8: the SUPPORTED target end-state (positive whole-run gate) ------------------------------
 
 /// Cell 8 single-worker: one production tiny-llama-v2 worker trains 2 barrier rounds under the
@@ -140,8 +201,9 @@ fn cell8_two_workers_agree_on_the_det_lane_digest() {
 /// envelope v1 cannot pin a coordinator module or name an Authority.
 #[test]
 fn cell3_v1_worker_wasm_coordinator_envelope_v1_refused_typed() {
-    // The worker-module axis: the v1 module is refused typed at driver selection (the sunset).
-    let v1_worker = guest_wasm("tiny_llama");
+    // The worker-module axis: a synthetic ABI-major-1 module is refused typed at driver selection
+    // (the sunset) — the offending input is hand-assembled in-test, not a vendored/recorded fixture.
+    let v1_worker = synthetic_v1_worker_module();
     let engine = Worker::new(EngineConfig::default()).expect("engine");
     let hash = *blake3::hash(&v1_worker).as_bytes();
     let refusal = select_driver(&engine, &v1_worker, Some(&hash))
@@ -183,8 +245,9 @@ fn cell7_v2_worker_wasm_coordinator_envelope_v1_refused_typed() {
 fn cell4_v1_worker_wasm_coordinator_envelope_v2_refused_typed() {
     // The worker-module axis: v1 — refused typed at driver selection since the Phase-E sunset
     // (pre-sunset this asserted `CandidateDriver::V1` selection; the cell stays refused, now
-    // doubly: unsupported worker major AND the v1 opener refusing genesis bytes below).
-    let v1_worker = guest_wasm("tiny_llama");
+    // doubly: unsupported worker major AND the v1 opener refusing genesis bytes below). The v1
+    // worker module is synthetic (hand-assembled in-test), not a vendored/recorded fixture.
+    let v1_worker = synthetic_v1_worker_module();
     let engine = Worker::new(EngineConfig::default()).expect("engine");
     let hash = *blake3::hash(&v1_worker).as_bytes();
     let refusal = select_driver(&engine, &v1_worker, Some(&hash))

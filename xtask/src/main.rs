@@ -371,16 +371,13 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-net"],
         ),
         (
-            // The A0 frozen v1 compatibility fixture — expectation FLIPPED at the Phase-E sunset
-            // (decisions D5; never deleted): the pinned pre-refactor tiny-llama bundle (every
-            // content-address still verified) now meets a clean typed AbiUnsupportedMajor
-            // admission refusal, the standing regression that v1 support is gone and gone
-            // gracefully. Named explicitly so the sunset regression is a visible tier-1 lane.
-            "A0 frozen v1 fixture (FLIPPED at sunset: typed AbiUnsupportedMajor refusal)",
-            &["-p", "daemon-vhc-host", "--test", "a0_frozen_fixture"],
-        ),
-        (
-            "daemon-vhc-host driver selection (ABI §1.3 typed refusals)",
+            // The v1 admission refusal is proven over SYNTHETIC inputs (retirement plan §3): the
+            // recorded pre-refactor bundle retired once refusal coverage went synthetic. A
+            // hand-assembled ABI-major-1 module (empty imports + the v1 lifecycle exports + a
+            // `da_abi` declaring major 1) meets a clean typed `AbiUnsupportedMajor` at the §1.3
+            // front door — the standing regression that v1 support is gone and gone gracefully.
+            // The protocol twin over the real worker binary is `worker_protocol` (below).
+            "daemon-vhc-host driver selection (ABI §1.3 typed refusals incl. synthetic major-1)",
             &["-p", "daemon-vhc-host", "--test", "driver_selection"],
         ),
         (
@@ -388,8 +385,8 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             // (timers + publish only) end-to-end under the real major-2 driver — selection
             // admits, da_init/da_run dispatch, §12.1 signed frames with durable seqs, journaled
             // through the real A1 substrate — plus the undeclared-channel GrantViolation
-            // negative. Named as its own lane (like the A0 fixture) so the standing
-            // expressiveness proof is visible; also covered by the host crate suite above.
+            // negative. Named as its own lane (like the driver-selection refusal lane) so the
+            // standing expressiveness proof is visible; also covered by the host crate suite above.
             "A2 v2 event loop (toy-averager expressiveness + typed channel trap)",
             &["-p", "daemon-vhc-host", "--test", "v2_event_loop"],
         ),
@@ -407,32 +404,18 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             // dispatch as the v1 driver, genericized over the store — registration only in
             // da_init (PhaseViolation otherwise), slice-class arenas cleared per Delivered
             // (StaleHandle across a boundary), nr-class readouts journaled under §2.7 kinds.
-            // The A0 fixture lane above is the byte-for-byte v1-untouched proof.
+            // The driver-selection lane above proves the frozen tabi@1 vocabulary is still
+            // recognized while a major-1 module is refused.
             "A2 tabi@1 bridge under the v2 driver (§2.5 legality + slice arenas + nr journal)",
             &["-p", "daemon-vhc-host", "--test", "v2_bridge"],
-        ),
-        (
-            // THE Phase-A acceptance (refactor §5 A2): TinyLlama on BarrierRound under the v2
-            // driver + bridge reproduces the v1 WasmBackend's det-lane state digests — cpu +
-            // burn-ndarray tiers here; wgpu/cuda tiers are hardware-gated in the same test file
-            // (the scheduled GPU lanes, like reference_parity_{wgpu,cuda}).
-            "A2 det-digest parity: TinyLlama-on-BarrierRound v2 ≡ v1 (cpu + burn-ndarray)",
-            &[
-                "-p",
-                "daemon-vhc-host",
-                "--test",
-                "v2_parity",
-                "--features",
-                "burn-ndarray",
-            ],
         ),
         (
             // The v2 input-replay step (refactor §5 A1→A2 acceptance; §12.6 journal soak for
             // v2): recorded runs (toy averager: timers/clock; bridge guest: nr readouts +
             // staged kinds 1/2) re-driven from the journal alone through the §8.7 verifier
             // (observe contract over the host replay engine) — every decision bit-for-bit;
-            // tampered/incomplete journals are typed divergences. The TinyLlama acceptance run
-            // replays inside the parity lane above.
+            // tampered/incomplete journals are typed divergences. The compute@2 trainer's
+            // journal-replay soak lives in the trainer-goldens lane below.
             "A2 v2 input-replay: journal-only re-drive ≡ recorded decisions (§8.7)",
             &["-p", "daemon-vhc-host", "--test", "v2_replay"],
         ),
@@ -525,35 +508,17 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-sdk-profiles"],
         ),
         (
-            // The C3 models-exodus acceptance (refactor §7 "models leave the SDK" + "re-authored
-            // tiny-llama matches reference parity within the existing tolerance class"): the
-            // re-authored `tiny-llama-c3` guest — a real Burn model over Autodiff<HostBackend> +
-            // the C3a profiles' in-guest det lane — through a 2-round barrier whole-run vs the
-            // frozen v1 digest oracle. C3b: guest training ≡ native Autodiff<NdArray> of the SAME
-            // dual-compiled model source, bit-exact. C3c: det-lane digests ≡ the v1 oracle
-            // bit-exact (equality class); trained θ within the OpClass::Optimizer band
-            // (tolerance class). The frozen pins (v2_parity) and the A0 fixture run beside this
-            // lane in the same gate.
-            "C3 re-authored tiny-llama parity (bit-exact lowering + det digests ≡ v1 + Optimizer band)",
-            &[
-                "-p",
-                "daemon-vhc-host",
-                "--test",
-                "c3_parity",
-                "--features",
-                "burn-ndarray",
-            ],
-        ),
-        (
             // The v2-native trainer goldens (retirement plan §3): the compute@2 trainer guest
-            // reproduces a recorded, content-addressed golden bundle (per-round det digests, the
-            // trainer's own committed payload bytes, the matched-init trained-theta trajectory)
-            // instead of the v1 parity oracle — the successor drift oracle that lets the v1
-            // recording + v2_parity retire. cpu + burn-ndarray tiers reproduce the digests
-            // bit-exactly (equality class) and theta within the Optimizer band (tolerance class),
-            // plus the straggle -> catch-up leg. wgpu/cuda device tiers are hardware-gated in the
-            // same file (op-journal replay of the compute@2 kernels). Runs beside the c3_parity +
-            // v2_parity pins in the same gate, never replacing them.
+            // (`tiny-llama-c3`) reproduces a recorded, content-addressed golden bundle (per-round
+            // det digests, the trainer's own committed payload bytes, the matched-init
+            // trained-theta trajectory). This is the SUCCESSOR drift oracle that superseded and
+            // retired the recorded v1 parity oracle (`v2_parity` / `c3_parity` lanes, D-3): the
+            // det lane is an equality class (digests reproduce bit-for-bit through the full
+            // wasm32 + CBOR + driver path) and the native lane a tolerance class (theta within
+            // the OpClass::Optimizer band), plus the straggle -> catch-up leg (ported from
+            // v2_parity) and a checkpoint/migration continuity pin. wgpu/cuda device tiers are
+            // hardware-gated in the same file (op-journal replay of the compute@2 kernels, with a
+            // bit-exact ndarray self-check of the recording).
             "trainer goldens: v2-native det digests + Optimizer band + straggle catch-up (cpu + burn-ndarray)",
             &[
                 "-p",
@@ -568,7 +533,7 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             // A2 migrate/main! scaffolding (refactor §5 A2 item 4; ABI §10): state round-trips
             // in sim through the typed manifest protocol; the SDK-derived claim/manifest match
             // the §9.1/§6.2 wire schema the admission funnel decodes. The macro's exports are
-            // exercised for real by the tiny-llama-v2 guest under the parity lane.
+            // exercised for real by the tiny-llama-v2 guest in the host driver + whole-run suites.
             "daemon-vhc-sdk-v2 (main!/migrate scaffolding: sim round-trips + derivations)",
             &["-p", "daemon-vhc-sdk-v2"],
         ),
@@ -723,14 +688,6 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "RETAINED post-E1 — the state-dict layout oracle in the converter's tests (the \
              checkpoint wiring itself landed at E1); retires if the oracle re-seats onto a \
              recorded layout fixture [dev-dep]",
-        ),
-        (
-            "daemon-vhc-host",
-            "daemon-vhc-sdk-profiles",
-            "post-E — the C3 parity harness runs the re-expressed profile natively as the \
-             lowering oracle beside the dual-compiled guest model (the v1 digest side is the \
-             RECORDED v1-parity-oracle fixture since the sunset); retires when the native A/B \
-             leg re-seats onto vhc-sim [dev-dep]",
         ),
         (
             "daemon-vhc-worker",

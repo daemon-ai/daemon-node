@@ -30,8 +30,10 @@
 //!
 //! The run is a genuine single-peer barrier: the trainer commits its own update and ingests that
 //! same committed set, so the recorded digests are the trainer's autonomous v2-native trajectory
-//! (no v1 inputs feed it). Only the matched init is inherited from the v1 oracle bundle, which is
-//! what keeps the provenance chain intact (see ../README.md).
+//! (no v1 inputs feed it). The matched init was originally inherited from the v1 oracle bundle;
+//! that oracle retired with the v1 parity lanes (retirement plan §3), so the init now lives IN this
+//! bundle (`init.f32le.bin`) and the capture is self-contained (see ../README.md for the historical
+//! provenance chain).
 //!
 //! ## Reproducibility
 //!
@@ -517,44 +519,41 @@ fn fixture_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The v1 oracle bundle — the matched-init source and the provenance anchor.
-fn v1_oracle_root() -> PathBuf {
-    fixture_root()
-        .parent()
-        .expect("fixtures dir")
-        .join("v1-parity-oracle")
-}
-
-fn read_v1_oracle() -> (
+/// The matched init + config literals — carried IN this bundle (`init.f32le.bin` + the
+/// `model_cfg`/`profile_cfg`/`param_*` fields of `expected.json`). They were originally inherited
+/// from the recorded v1 parity oracle; that oracle retired with the v1 parity lanes (retirement
+/// plan §3), so the bundle is now self-contained and a re-capture regenerates the v2-native
+/// trajectory from the bundle's OWN frozen init (idempotent — the init is written back byte-
+/// identically). See ../README.md for the (now historical) provenance chain.
+fn read_matched_init_and_config() -> (
     ModelCfgLit,
     SparseLocoCfg,
     Vec<usize>,
     Vec<String>,
     Vec<Vec<f32>>,
 ) {
-    let root = v1_oracle_root();
+    let root = fixture_root();
     let expected: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(root.join("expected.json")).expect("read"))
-            .expect("v1 oracle expected.json");
-    let c3 = &expected["c3_parity"];
+            .expect("trainer-goldens expected.json (the bundle carries its own matched init)");
     let model: ModelCfgLit =
-        serde_json::from_value(c3["model_cfg"].clone()).expect("model cfg literals");
+        serde_json::from_value(expected["model_cfg"].clone()).expect("model cfg literals");
     let profile: SparseLocoCfg =
-        serde_json::from_value(c3["profile_cfg"].clone()).expect("profile cfg literals");
-    let numels: Vec<usize> = c3["param_numels"]
+        serde_json::from_value(expected["profile_cfg"].clone()).expect("profile cfg literals");
+    let numels: Vec<usize> = expected["param_numels"]
         .as_array()
         .expect("numels")
         .iter()
         .map(|n| usize::try_from(n.as_u64().expect("numel")).expect("usize"))
         .collect();
-    let names: Vec<String> = c3["param_names"]
+    let names: Vec<String> = expected["param_names"]
         .as_array()
         .expect("names")
         .iter()
         .map(|n| n.as_str().expect("name").to_string())
         .collect();
-    let init_rel = c3["init"]["file"].as_str().expect("init file");
-    let init_bytes = std::fs::read(root.join(init_rel)).expect("read v1 init");
+    let init_rel = expected["init"]["file"].as_str().expect("init file");
+    let init_bytes = std::fs::read(root.join(init_rel)).expect("read matched init");
     let init_flat: Vec<f32> = init_bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -567,9 +566,10 @@ fn main() {
     let root = fixture_root();
     let commit = std::env::var("CAPTURE_COMMIT").unwrap_or_else(|_| "UNSET".into());
 
-    // Matched init + config literals come from the v1 oracle bundle (the provenance anchor); the
-    // trained trajectory, payloads, and digests are the compute@2 trainer's OWN v2-native output.
-    let (model, profile_cfg, numels, names, init) = read_v1_oracle();
+    // Matched init + config literals are carried in this bundle (originally inherited from the now-
+    // retired v1 oracle — see read_matched_init_and_config); the trained trajectory, payloads, and
+    // digests are the compute@2 trainer's OWN v2-native output.
+    let (model, profile_cfg, numels, names, init) = read_matched_init_and_config();
     assert_eq!(
         numels.iter().sum::<usize>(),
         init.iter().map(Vec::len).sum::<usize>(),
@@ -619,10 +619,11 @@ fn main() {
                              this commit; EngineConfig.backend does not select the compute@2 tier)",
             "capture": "tests/fixtures/trainer-goldens/capture (see ../README.md)",
         },
-        "provenance": "v1 parity oracle (matched init + config literals) -> c3_parity C3c \
-                       (c3_reauthored_tiny_llama_parity_vs_v1_oracle_cpu) green at captured_from.commit \
-                       -> these goldens. See ../README.md for the full chain and the exact \
-                       comparison surface.",
+        "provenance": "HISTORICAL (the v1 parity oracle retired with the v1 parity lanes, \
+                       retirement plan §3): v1 parity oracle (matched init + config literals) -> \
+                       c3_parity C3c green at the original capture commit -> these goldens. The \
+                       matched init now lives in this self-contained bundle (init.f32le.bin). See \
+                       ../README.md for the full historical chain and the exact comparison surface.",
         "module": {
             "name": "tiny_llama_c3.wasm",
             "blake3": hex(blake3_hash(&wasm).as_bytes()),

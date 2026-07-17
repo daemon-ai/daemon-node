@@ -4895,7 +4895,6 @@ dependencies = [
  "daemon-vhc-proto",
  "daemon-vhc-safetensors",
  "daemon-vhc-sdk-consensus",
- "daemon-vhc-sdk-profiles",
  "daemon-vhc-session",
  "serde",
  "serde_json",
@@ -5125,6 +5124,7 @@ dependencies = [
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "thiserror 2.0.18",
+ "wasm-encoder",
 ]
 
 [[package]]
@@ -5146,6 +5146,7 @@ dependencies = [
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
  "tokio",
+ "wasm-encoder",
 ]
 
 [[package]]

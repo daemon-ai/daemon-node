@@ -134,28 +134,24 @@ cuda = ["burn/cuda", "dep:cudarc"]
 # dependency direction stays observe → host (the replay verifiers drive modules through the host
 # runtime), which A2's verifier wiring adds — never the reverse as a normal dep.
 daemon-vhc-observe = { workspace = true }
-# Test-only since the A2 inversion: the v2 parity/data-fetch suites and the A0 refusal fixture
-# (`v2_parity.rs`, `v2_data_fetch.rs`, `a0_frozen_fixture.rs`) consume the session's data/protocol
+# Test-only since the A2 inversion: the v2 data-fetch suite consumes the session's data/protocol
 # types. A dev-dep beside the session→host normal edge is cargo-legal and carries no runtime
 # direction.
 daemon-vhc-session = { workspace = true }
-# Test-only: hand-built wasm fixtures (the driver-selection negative tests) are assembled with
-# `wasm-encoder` — precise control over import namespaces + the `da_abi` constant, with no
-# wasm32 toolchain or guest workspace in the tier-1 lane. Already resolved in Cargo.lock (a
-# wasmtime/cranelift transitive), so this dev-dep adds no new crate to the graph.
+# Test-only: hand-built wasm fixtures (the driver-selection negative tests + the synthetic
+# ABI-major-1 refusal input) are assembled with `wasm-encoder` — precise control over import
+# namespaces + the `da_abi` constant, with no wasm32 toolchain or guest workspace in the tier-1
+# lane. Already resolved in Cargo.lock (a wasmtime/cranelift transitive), so this dev-dep adds no
+# new crate to the graph.
 wasm-encoder = { workspace = true }
-# Test-only: the A0 frozen fixture's `expected.json` (pins + transcript) is JSON for human review;
-# the replay test parses it. Already a workspace pin.
+# Test-only: the trainer-goldens bundle's `expected.json` (pins + recorded digests/schedule) is
+# JSON; the reproduction tests parse it. Already a workspace pin.
 serde_json = { workspace = true }
-# Test-only: the guest-lifecycle / parity tests build the `TinyLlamaCfg` the wasm guest parses.
 # (Phase-E sunset) the host->SDK dev-dep for the v1 oracle/reference/determinism harnesses was
-# REMOVED with those harnesses (decisions D5); the parity tests consume the RECORDED
-# v1-parity-oracle fixture instead.
-# Test-only (C3 models-exodus parity harness): the re-expressed profiles crate is the NATIVE
-# oracle half of the C3b lowering gate (the same det-lane transition the guest runs in wasm32,
-# executed natively against the dual-compiled model source). A tracked dependency-direction
-# exception like `daemon-vhc-sdk` above; never a runtime edge.
-daemon-vhc-sdk-profiles = { workspace = true }
+# REMOVED with those harnesses (decisions D5). The `daemon-vhc-sdk-profiles` dev-dep (the NATIVE
+# lowering-oracle half of the retired C3 parity harness) was removed with the v1 parity oracle
+# retirement: the trainer-goldens lane reproduces the trainer over its own recorded bundle and
+# needs no native profile A/B.
 # (A2 worker-bin split): the daemon-vhc-supervisor + daemon-common dev-deps served only
 # tests/worker_protocol.rs, which moved to `crates/vhc/bins/daemon-vhc-worker` with the bin.
 # Test-only (M2 reference-parity harness): the state-dict ↔ safetensors converter (M1 seam 4) the

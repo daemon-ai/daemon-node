@@ -2,15 +2,18 @@
 
 This is the standing **drift oracle for the compute@2 trainer** (`tiny-llama-c3`): a recorded,
 content-addressed bundle the per-tier reproduction tests
-(`daemon-vhc-host/tests/trainer_goldens.rs`) check the trainer against, instead of the recorded v1
-parity oracle (`../v1-parity-oracle/`). It is the v2-native successor that lets the v1 recording +
-`v2_parity.rs` retire later (retirement plan §3) — nothing v1 is deleted by capturing it.
+(`daemon-vhc-host/tests/trainer_goldens.rs`) check the trainer against. It is the v2-native
+successor that **retired** the recorded v1 parity oracle and its parity lanes (`v2_parity.rs` +
+`c3_parity.rs`) once these goldens stood (retirement plan §3, D-3) — the v1 recording no longer
+exists in the tree; this bundle is the sole standing det-lane drift oracle for the trainer.
 
 The recorded lane is the compute@2 trainer guest driven through a **single-peer barrier
 whole-run**: it trains, commits its own outer update, and ingests that same committed set. Every
-recorded value is the trainer's own v2-native output — no v1 inputs feed the trajectory. Only the
-matched init and the config literals are inherited from the v1 oracle bundle, which is what anchors
-the provenance chain below.
+recorded value is the trainer's own v2-native output — no v1 inputs feed the trajectory. The
+matched init and the config literals were originally inherited from the v1 oracle bundle; that
+oracle has since retired, so they now live **in this bundle** (`init.f32le.bin` + the config
+literals in `expected.json`) and the bundle is fully self-contained. The provenance section below
+records the (now historical) derivation chain.
 
 ## Bundle contents
 
@@ -20,7 +23,7 @@ load (content-addressing).
 | Path | What |
 |---|---|
 | `expected.json` | Every pin + the recorded per-round digests + the schedule + the exact model/profile config literals + `captured_from` provenance |
-| `init.f32le.bin` | The matched init θ (flat f32-le; concatenated params in registration order), inherited from the v1 oracle so the goldens sit on the exact trajectory the C3c equality proof pins |
+| `init.f32le.bin` | The matched init θ (flat f32-le; concatenated params in registration order) — originally inherited from the (now-retired) v1 oracle so the goldens sit on the exact trajectory the C3c equality proof pinned; now carried in-bundle as the self-contained matched init |
 | `trained-round-{0,1}.f32le.bin` | Per-round trained θ (post-inner-steps, pre-ingest) — the guest's tag-2 publish; the native-lane (tolerance-class) comparison surface |
 | `payload-round-{0,1}.bin` | Per-round committed payload bytes — **the trainer's OWN** sealed `SparseLoco` update (the guest publishes only the commitment hash, so the capture reconstructs the bytes natively and cross-checks them against that hash) |
 | `capture/` | The documented, re-runnable capture crate (command below) |
@@ -29,11 +32,17 @@ The recorded per-round digests are the guest's tag-4 post-ingest det digests (th
 oracle). At the capture commit they coincide bit-for-bit with the v1 oracle's c3 digests
 (`abcf2612…`, `574cf418…`) — captured here from the autonomous v2-native self-ingest lane.
 
-## Provenance chain (v1 oracle → C3c green → these goldens)
+## Provenance chain (HISTORICAL: v1 oracle → C3c green → these goldens)
 
-1. **v1 parity oracle** (`../v1-parity-oracle/`, recorded pre-sunset from the live v1 five-phase
-   driver; decisions D5). Supplies this bundle's **matched init** (`init.f32le.bin`) and the exact
-   **model/profile config literals**, and is the source of the recorded v1 det digests.
+The v1 parity oracle bundle and its parity lanes have since been **deleted** (retirement plan §3,
+D-3 — the "pins never deleted" clause was amended: the v1 oracle retires once the v2 goldens
+stand, which they now do). The chain below is the historical derivation, retained for audit; the
+matched init and config literals it supplied now live in this self-contained bundle.
+
+1. **v1 parity oracle** (formerly `../v1-parity-oracle/`, recorded pre-sunset from the live v1
+   five-phase driver; decisions D5 — now deleted). Supplied this bundle's **matched init**
+   (`init.f32le.bin`) and the exact **model/profile config literals**, and was the source of the
+   recorded v1 det digests.
 2. **`c3_parity` C3c green at the capture commit.** The test
    `c3_reauthored_tiny_llama_parity_vs_v1_oracle_cpu` (`daemon-vhc-host/tests/c3_parity.rs`) proves
    the compute@2 trainer, **fed the v1 oracle's recorded committed payloads**, reproduces the v1
