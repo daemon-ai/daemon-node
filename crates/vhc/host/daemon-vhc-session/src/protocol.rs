@@ -14,6 +14,16 @@
 //! control protocol (`daemon-swarm.cddl`, lane P). It lives in `daemon-vhc-session` (not the client)
 //! so lane E's `daemon-vhc-host` worker implements the worker side against it in Wave 3 (§10.1:
 //! `daemon-vhc-host` depends on `daemon-vhc-session`).
+//!
+//! **v1 retirement (WS4).** The §10.2 [`Event`] stream dropped three producer-less variants —
+//! `MicroBatch`, `OomLadder`, `ResyncProgress` — that only the retired v1 live-attach path ever
+//! emitted. Their behaviors are superseded (micro-batch/OOM adaptation → the claim()-based
+//! admission funnel + a typed `BudgetMemory` trap plus node churn, no halving ladder;
+//! resync-progress → typed-checkpoint / late-join / record-replay). This is a vocabulary change,
+//! not a re-numbering: CBOR enum variants are name-keyed, so removing an unused variant leaves the
+//! remaining frames encoding-identical, and a stale worker emitting one now decodes as an
+//! unknown-variant error (logged, dropped) at the node pump — the same posture as any undecodable
+//! frame.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -61,7 +71,11 @@ pub enum LeaveMode {
 /// A classified worker failure (§10.2) — the swarm analogue of `daemon_infer`'s `ErrorClass`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorClass {
-    /// VRAM/host allocator OOM — worker replaced, micro-batch re-probed.
+    /// VRAM/host allocator OOM. Post-v1 semantics (decisions D-6): a memory breach is the module's
+    /// typed `BudgetMemory` trap, and the node's recovery is **churn** — preempt/replace the
+    /// role-instance (preemption-as-churn, [`Command::Throttle`]`{ paused }`) — never a dynamic
+    /// micro-batch halving/re-probe ladder. Micro-batching is guest/module policy fixed at admission
+    /// from the run schedule; it is not renegotiated at runtime.
     OutOfMemory,
     /// A transient network/transport fault — retry in place.
     Transient,
@@ -256,44 +270,6 @@ pub enum Event {
         class: String,
         /// A short human-readable detail.
         detail: String,
-    },
-    /// **Additive (A3, Merge 2).** The autotune micro-batch verdict the worker consumed in-process
-    /// for the joined run (the node's `Eligibility.headroom["micro_batch"]`, §10.5). Emitted once
-    /// per join by the live-attach path (the P1-deferred telemetry-as-protocol-event follow-on 2;
-    /// B3 logged it to stderr). Additive to the frozen §10.2 stream — a new variant only, so every
-    /// pre-A3 decoder still round-trips the existing frames.
-    MicroBatch {
-        /// The chosen micro-batch (sequences per inner step).
-        micro_batch: u32,
-    },
-    /// **Additive (A3, Merge 2).** One rung of the §10.5 OOM-halving ladder: a real `BudgetMemory`
-    /// trap forced the worker to churn the instance and retry at half the micro-batch. Emitted by
-    /// the live-attach path when the ladder fires (B3 logged it to stderr). Additive to the frozen
-    /// §10.2 stream.
-    OomLadder {
-        /// The round the ladder fired on.
-        round: RoundId,
-        /// The micro-batch before halving.
-        from_micro_batch: u32,
-        /// The micro-batch after halving.
-        to_micro_batch: u32,
-        /// Cumulative halvings on this round so far.
-        halvings: u32,
-    },
-    /// **Additive (R, P3).** Live checkpoint-resync progress on a worker rejoin (spec §9): the
-    /// rejoining worker reloaded the latest coordinator-published checkpoint and is replaying the
-    /// retained rounds forward to reach byte-identity with the survivors. Emitted per replayed round
-    /// by the live-attach resync path; additive to the frozen §10.2 stream (a new variant only).
-    ResyncProgress {
-        /// The round just re-ingested during replay (`from_checkpoint < round <= from_checkpoint +
-        /// total`).
-        round: RoundId,
-        /// The checkpoint round the replay resumed from.
-        from_checkpoint: RoundId,
-        /// How many retained rounds have been replayed so far (1-based within this resync).
-        replayed: u32,
-        /// The total number of retained rounds this resync replays.
-        total: u32,
     },
     /// A classified failure.
     Error {
@@ -612,21 +588,6 @@ mod tests {
         round_trip_event(Event::Warning {
             class: "straggle".into(),
             detail: "late fetch".into(),
-        });
-        // A3 additive telemetry variants.
-        round_trip_event(Event::MicroBatch { micro_batch: 4 });
-        round_trip_event(Event::OomLadder {
-            round: 7,
-            from_micro_batch: 4,
-            to_micro_batch: 2,
-            halvings: 1,
-        });
-        // R (P3) additive resync telemetry.
-        round_trip_event(Event::ResyncProgress {
-            round: 5,
-            from_checkpoint: 3,
-            replayed: 2,
-            total: 2,
         });
         for class in [
             ErrorClass::OutOfMemory,

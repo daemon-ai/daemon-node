@@ -550,8 +550,6 @@ impl SwarmService {
             | protocol::Event::Metric { .. }
             | protocol::Event::CheckpointPublished { .. }
             | protocol::Event::Warning { .. }
-            | protocol::Event::MicroBatch { .. }
-            | protocol::Event::OomLadder { .. }
             | protocol::Event::Error { .. } => self.current_run.lock().unwrap().clone(),
             _ => None,
         }
@@ -1016,25 +1014,6 @@ fn translate(ev: &protocol::Event, run_id: &str) -> Option<SwarmEvent> {
             run_id: run_id.to_string(),
             class: class.clone(),
             detail: detail.clone(),
-        }),
-        // A3 additive telemetry (§10.5): the micro-batch verdict + OOM-ladder rungs surface as
-        // `Warning`s (no new SwarmApi wire type — telemetry stays off the wire, program ledger).
-        protocol::Event::MicroBatch { micro_batch } => Some(SwarmEvent::Warning {
-            run_id: run_id.to_string(),
-            class: "micro_batch".to_string(),
-            detail: micro_batch.to_string(),
-        }),
-        protocol::Event::OomLadder {
-            round,
-            from_micro_batch,
-            to_micro_batch,
-            halvings,
-        } => Some(SwarmEvent::Warning {
-            run_id: run_id.to_string(),
-            class: "oom_ladder".to_string(),
-            detail: format!(
-                "round {round}: micro_batch {from_micro_batch}->{to_micro_batch} (halving {halvings})"
-            ),
         }),
         protocol::Event::Error { class, detail } => Some(SwarmEvent::Error {
             run_id: run_id.to_string(),

@@ -176,8 +176,10 @@ pub enum EngineEvent {
     },
     /// **Additive (R, P3).** This (rejoining) peer replayed one retained round forward from the
     /// latest checkpoint during a live resync (§9 I1). Emitted per replayed round by
-    /// [`RoundEngine::resync_from_checkpoint`]; the live-attach forwarder surfaces it as
-    /// `protocol::Event::ResyncProgress`.
+    /// [`RoundEngine::resync_from_checkpoint`]. (The retired v1 live-attach forwarder used to
+    /// surface this as a `protocol::Event::ResyncProgress` wire frame; that producer-less variant
+    /// was dropped in the v1 retirement — resync progress is now observed via typed-checkpoint /
+    /// record-replay, WS4.)
     Resynced {
         /// The round just re-ingested during replay.
         round: RoundId,

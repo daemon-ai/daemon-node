@@ -193,8 +193,8 @@ impl TrainSupervisor {
     ///
     /// Unlike [`join`](Self::join) (which resolves on the first `RunPhase` and drops the rest), this
     /// installs a pump sink so the worker's reader routes **every** subsequent [`Event`]
-    /// (`RunPhase`/`Metric`/`RoundOutcome`/`Warning` per round, plus the additive `MicroBatch` /
-    /// `OomLadder` telemetry) into the returned receiver. The node's `SwarmService` drains it into
+    /// (`RunPhase`/`Metric`/`RoundOutcome`/`Warning` per round) into the returned receiver. The
+    /// node's `SwarmService` drains it into
     /// `handle_worker_event`, so `swarm.db` reflects live round progression (§10.3/§10.4). The sink
     /// clears automatically when the receiver is dropped (back to request/reply routing).
     pub async fn join_streaming(
