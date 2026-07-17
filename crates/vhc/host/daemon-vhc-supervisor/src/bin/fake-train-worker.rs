@@ -67,18 +67,24 @@ async fn main() {
                 if misbehave {
                     std::process::exit(1);
                 }
+                // Headroom is claim-shaped (bytes), the one contract `derive_charge` consumes
+                // (decisions D-10): a claim-bearing verdict carries `claim_device_bytes` /
+                // `claim_host_bytes`, an ineligible one carries a shortfall on the device claim.
                 let assessed = if scenario == "ineligible" {
                     Eligibility {
                         eligible: false,
                         reasons: vec!["fake: vram below floor".into()],
-                        headroom: vec![("vram_mb".into(), -2048)],
+                        headroom: vec![("claim_device_bytes".into(), -(2048_i64 << 20))],
                         refusal_code: None,
                     }
                 } else {
                     Eligibility {
                         eligible: true,
                         reasons: vec!["fake: fits".into()],
-                        headroom: vec![("vram_mb".into(), 4096)],
+                        headroom: vec![
+                            ("claim_device_bytes".into(), 4096_i64 << 20),
+                            ("claim_host_bytes".into(), 8192_i64 << 20),
+                        ],
                         refusal_code: None,
                     }
                 };

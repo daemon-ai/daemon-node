@@ -31,7 +31,9 @@ use std::collections::BTreeMap;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::arbiter::{AdmitRefusal, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId};
+use crate::arbiter::{
+    AdmitRefusal, ClaimTiers, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId, TierBytes,
+};
 use crate::discovery::RunDiscovery;
 use crate::store::{DesiredState, PersistedRun, StoreError, SwarmStore, EVENT_WINDOW};
 
@@ -416,28 +418,57 @@ impl SwarmService {
         }
     }
 
-    /// Derive a role-instance's ledger charge (decisions D6 point 3, the v1-era mapping): the
-    /// device-memory estimate is the assess verdict's `vram_mb` headroom when present (the
-    /// autotune verdict), else the per-run policy's `vram_cap_mb` tightening cap; duty is the
-    /// policy's `duty_cycle_pct`. Net/disk charges arrive with the v2 claim mapping. The device
-    /// is placed by [`Self::admit_placed`] (first-fit) — a placeholder here.
+    /// Derive a role-instance's ledger charge (decisions D6 point 3) from the node-computed
+    /// eligibility. Both live eligibility sources reach this through **one** claim-shaped input
+    /// contract (decisions D-10):
+    ///
+    /// - **v2 assess** (`eligibility_from_assess`, the discovery path): the claim funnel's verdict,
+    ///   whose headroom carries `claim_device_bytes` / `claim_host_bytes` (bytes) — the disjoint
+    ///   tier sums the worker's `admit_v2` computed. Charged verbatim onto the device + host tiers,
+    ///   so an admitted instance's reservation equals the assess claim totals.
+    /// - **probe fallback** (`eligibility_from_hardware`, the no-registry default path): headroom
+    ///   carries `claim_device_bytes` from the probed dedicated VRAM (bytes) — a conservative
+    ///   device-tier charge. This read is load-bearing: dropping it would collapse the default-path
+    ///   device charge to the (zero) cap default and admit everything (the audit hazard), so the
+    ///   fallback NEVER falls through to a zero charge while a device is probed.
+    ///
+    /// `policy.vram_cap_mb` (the owner's standing VRAM cap, MiB) stands as the device estimate only
+    /// when no device claim is present (the tightening overlay, never an inflation); `duty_cycle_pct`
+    /// is the duty charge. Net/disk tiers are left to the assess claim (not separately reported
+    /// here yet). The device id is placed by [`Self::admit_placed`] (first-fit) — a placeholder here.
     fn derive_charge(
         &self,
         eligibility: &SwarmEligibility,
         policy: &SwarmPolicy,
     ) -> InstanceCharge {
         const MIB: u64 = 1 << 20;
-        let vram_mb = eligibility
-            .headroom
-            .get("vram_mb")
-            .copied()
-            .filter(|v| *v > 0)
-            .map_or(u64::from(policy.vram_cap_mb), |v| v as u64);
-        InstanceCharge::device_memory(
-            String::new(),
-            vram_mb.saturating_mul(MIB),
-            policy.duty_cycle_pct.min(100) as u8,
-        )
+        let claim = |key: &str| {
+            eligibility
+                .headroom
+                .get(key)
+                .copied()
+                .filter(|v| *v > 0)
+                .map(|v| v as u64)
+        };
+        let claim_host = claim("claim_host_bytes").unwrap_or(0);
+        // The device claim (bytes) when present, else the owner's standing VRAM cap as the
+        // estimate — NEVER a silent zero fall-through (D-10).
+        let cap_bytes = u64::from(policy.vram_cap_mb).saturating_mul(MIB);
+        let device_bytes = claim("claim_device_bytes").unwrap_or(cap_bytes);
+        InstanceCharge {
+            device: String::new(),
+            tiers: ClaimTiers {
+                hard_accountable: TierBytes {
+                    device: device_bytes,
+                    host: claim_host,
+                },
+                ..ClaimTiers::default()
+            },
+            disk_bytes: 0,
+            net_up_bps: 0,
+            net_down_bps: 0,
+            duty_pct: policy.duty_cycle_pct.min(100) as u8,
+        }
     }
 
     /// Node-side placement (decisions D6 point 2 — one accelerator per role-instance): try the
@@ -953,8 +984,16 @@ fn eligibility_from_assess(e: &Eligibility) -> SwarmEligibility {
 }
 
 /// A coarse node-computed eligibility from a hardware probe (the fallback when no discovery seam is
-/// configured): eligible if the worker reports a usable GPU or backend lane, with VRAM/RAM
-/// headroom. The app renders this; it never re-derives eligibility (ADR-003).
+/// configured): eligible if the worker reports a usable GPU or backend lane. The app renders this;
+/// it never re-derives eligibility (ADR-003).
+///
+/// D-10: the charge key is **claim-shaped** (`claim_device_bytes`, in BYTES), so this no-registry
+/// default path presents `derive_charge` the SAME contract the v2 assess verdict does — one input
+/// shape, no `derive_charge` branch. The conservative device-tier charge is the probed dedicated
+/// VRAM (`Hardware.vram_mb`, MiB → bytes); `derive_charge` reads it directly, so the default path
+/// charges probed VRAM and never falls through to a zero/default cap. Host RAM stays an
+/// informational readout (`ram_mb`, MiB) for the app panel — it is not charged on this path (the
+/// assess claim is the host-tier source).
 fn eligibility_from_hardware(hw: &Hardware) -> SwarmEligibility {
     let eligible = hw.gpus > 0 || !hw.backend_lanes.is_empty();
     let mut reasons = Vec::new();
@@ -962,7 +1001,10 @@ fn eligibility_from_hardware(hw: &Hardware) -> SwarmEligibility {
         reasons.push("no usable GPU or backend lane".to_string());
     }
     let mut headroom = BTreeMap::new();
-    headroom.insert("vram_mb".to_string(), hw.vram_mb as i64);
+    headroom.insert(
+        "claim_device_bytes".to_string(),
+        hw.vram_mb.saturating_mul(1 << 20) as i64,
+    );
     headroom.insert("ram_mb".to_string(), hw.ram_mb as i64);
     SwarmEligibility {
         eligible,

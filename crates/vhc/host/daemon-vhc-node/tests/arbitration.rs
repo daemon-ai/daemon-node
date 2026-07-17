@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use daemon_api::{SwarmApi, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode};
 use daemon_vhc_node::service::{SwarmError, WorkerControl};
-use daemon_vhc_node::{OwnerBudget, SwarmService, SwarmServiceParts, SwarmStore};
+use daemon_vhc_node::{
+    DiscoveredRun, OwnerBudget, RunDiscovery, SwarmService, SwarmServiceParts, SwarmStore,
+};
 use daemon_vhc_session::config::SwarmConfig;
 use daemon_vhc_session::protocol::{Eligibility, Hardware, JoinPolicy, LeaveMode};
 use std::collections::BTreeMap;
@@ -32,6 +34,9 @@ struct FakeChild {
     leaves: Mutex<Vec<String>>,
     shutdowns: Mutex<usize>,
     vram_mb: i64,
+    /// When set, `assess` returns a claim-bearing verdict carrying these `(device, host)` bytes as
+    /// the claim-shaped headroom (the discovery-path input to `derive_charge`, decisions D-10).
+    assess_claim: Option<(i64, i64)>,
 }
 
 #[async_trait]
@@ -46,7 +51,18 @@ impl WorkerControl for FakeChild {
         })
     }
     async fn assess(&self, _envelope: Vec<u8>) -> Result<Eligibility, SwarmError> {
-        unreachable!("no discovery seam in this test")
+        match self.assess_claim {
+            Some((device, host)) => Ok(Eligibility {
+                eligible: true,
+                reasons: vec!["fake: claim admitted".into()],
+                headroom: vec![
+                    ("claim_device_bytes".into(), device),
+                    ("claim_host_bytes".into(), host),
+                ],
+                refusal_code: None,
+            }),
+            None => unreachable!("no discovery seam in this test"),
+        }
     }
     async fn join(
         &self,
@@ -75,8 +91,11 @@ impl WorkerControl for FakeChild {
     }
 }
 
-/// The probe-eligibility headroom carries `vram_mb` — the v1-era autotune-verdict stand-in the
-/// service charges the device ledger with (decisions D6 point 3).
+/// The probe-eligibility headroom carries the probed dedicated VRAM, which
+/// `eligibility_from_hardware` renders as the claim-shaped `claim_device_bytes` charge key
+/// (decisions D-10): the no-registry default path charges probed VRAM, and — when the probe
+/// reports no dedicated VRAM (this rig's `vram_mb = 0`) — `derive_charge` falls back to the
+/// per-run `policy.vram_cap_mb` as the conservative estimate, never a zero charge (D6 point 3).
 fn probe_worker(vram_mb: i64) -> Arc<FakeChild> {
     Arc::new(FakeChild {
         vram_mb,
@@ -334,4 +353,94 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
     let small = r.svc.store().get_run("run-small").unwrap().unwrap();
     assert!(small.instance > 0);
     assert_ne!(small.instance, incarnation);
+}
+
+/// A stub discovery seam that always resolves a run and hands back opaque envelope bytes, so the
+/// service takes the **assess** path (`worker.assess` → `eligibility_from_assess`) instead of the
+/// probe fallback.
+struct StubDiscovery;
+
+#[async_trait]
+impl RunDiscovery for StubDiscovery {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, SwarmError> {
+        Ok(Vec::new())
+    }
+    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, SwarmError> {
+        Ok(Some(DiscoveredRun {
+            run_id: run_id.to_string(),
+            coordinator: "wss://coord.example/swarm".to_string(),
+            envelope_hash: "00".repeat(32),
+            proto_version: 1,
+        }))
+    }
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, SwarmError> {
+        Ok(vec![1, 2, 3, 4])
+    }
+}
+
+/// D-10 / D6 point 3: on the assess path a claim-bearing verdict carries `claim_device_bytes` /
+/// `claim_host_bytes`, and `derive_charge` charges them verbatim onto the device + host tiers —
+/// so an **admitted instance's arbiter reservation equals the assess claim totals exactly** (with
+/// an uncapped policy, the owner cap does not tighten the claim). This is the acceptance assertion
+/// the retirement plan requires for the both-inputs rewrite.
+#[tokio::test]
+async fn admitted_charge_equals_assess_claim_totals() {
+    const GIB: i64 = 1 << 30;
+    let claim_device = 5 * GIB;
+    let claim_host = 8 * GIB;
+
+    let children: Arc<Mutex<Vec<Arc<FakeChild>>>> = Arc::new(Mutex::new(Vec::new()));
+    let spawned = children.clone();
+    let factory: daemon_vhc_node::service::WorkerFactory = Arc::new(move || {
+        let child = Arc::new(FakeChild {
+            assess_claim: Some((claim_device, claim_host)),
+            ..FakeChild::default()
+        });
+        spawned.lock().unwrap().push(child.clone());
+        child as Arc<dyn WorkerControl>
+    });
+
+    // A budget generous enough for the claim on both the device and host ledgers.
+    let budget = OwnerBudget {
+        device_memory: BTreeMap::from([("gpu:0".to_string(), 16 * GIB as u64)]),
+        host_ram: 32 * GIB as u64,
+        disk: u64::MAX,
+        net_up_bps: u64::MAX,
+        net_down_bps: u64::MAX,
+        duty_pct: 100,
+        max_instances: 4,
+    };
+
+    let svc = Arc::new(SwarmService::new(SwarmServiceParts {
+        config: SwarmConfig {
+            enabled: true,
+            ..SwarmConfig::default()
+        },
+        store: SwarmStore::open_in_memory().unwrap(),
+        worker: probe_worker(0),
+        feed: None,
+        discovery: Some(Arc::new(StubDiscovery)),
+        budget: Some(budget),
+        worker_factory: Some(factory),
+    }));
+    svc.bind_self();
+
+    // Uncapped policy (`vram_cap_mb = 0`) so the assess claim stands verbatim.
+    svc.swarm_join("run-claim".into(), policy(0, 50), "op-1".into())
+        .await
+        .expect("claim-bearing join admitted");
+
+    // The reservation equals the assess claim totals exactly on both tiers.
+    let snap = svc.arbiter().remaining();
+    assert_eq!(
+        snap.device_memory["gpu:0"],
+        16 * GIB as u64 - claim_device as u64,
+        "device ledger charged the assess device-claim total"
+    );
+    assert_eq!(
+        snap.host_ram,
+        32 * GIB as u64 - claim_host as u64,
+        "host ledger charged the assess host-claim total"
+    );
+    assert_eq!(snap.instances, 1);
 }
