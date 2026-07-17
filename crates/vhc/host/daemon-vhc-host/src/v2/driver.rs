@@ -3610,7 +3610,7 @@ impl crate::runtime::TabiHost for V2Host {
 /// descriptor is a fresh encoding whose `manifest` field decodes to the identical value) plus the
 /// restore bindings in manifest order. Built at the CBOR-value level for the same dependency-wall
 /// reason as [`decode_manifest_sections`].
-fn build_migration_descriptor(
+pub(crate) fn build_migration_descriptor(
     manifest: &[u8],
     bindings: &[(String, u64)],
 ) -> Result<Vec<u8>, String> {

@@ -40,5 +40,8 @@ pub use driver::{
 pub use event::{decode_event_frame, encode_event_frame, EventCodecError, EventV2, PayloadMeta};
 pub use journal::{Dropped, JournalSink, MemorySink, SinkEntry, SinkError};
 pub use ops::{OpRequest, OpTable};
-pub use replay::{replay_v2, ReplayEnd, ReplayScript, ReplayedDecision, ReplayedRun};
+pub use replay::{
+    replay_v2, replay_v2_migrating, ReplayEnd, ReplayMigration, ReplayScript, ReplayedDecision,
+    ReplayedRun,
+};
 pub use streams::StreamTable;

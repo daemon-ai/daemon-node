@@ -357,6 +357,408 @@ pub fn run_local_upgrade(
     }
 }
 
+// ============================================================================================
+// The production step adapter over the live host primitives (ABI §10.3).
+// ============================================================================================
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use daemon_vhc_host::v2::{
+    admit_v2, start_run_migrating, DeviceProfile, EnvelopeRoleGrants, MemorySink, MigrationInput,
+    OwnerPolicy, ParticipationLane, PumpHandle, RunEnd, RunIdentity, SinkEntry, SnapshotCapture,
+    SpooledFrame, V2Run, V2RunConfig,
+};
+use daemon_vhc_host::Worker;
+use daemon_vhc_proto::blake3_hash;
+use daemon_vhc_sdk_consensus::checkpoint::SectionKind;
+
+/// The **live activated instance** an upgrade produced (ABI §10.3 step 6): the running new-epoch
+/// [`V2Run`], its [`PumpHandle`], and the **continued** journal (the old incarnation's records up
+/// to the fence, followed by this incarnation's — one gapless log, see [`MemorySink::continuing`]).
+pub struct ActivatedInstance {
+    /// The running new-epoch instance (join it to finish the run).
+    pub run: V2Run,
+    /// The pump driving the new instance (spooled frames have already drained into it).
+    pub pump: PumpHandle,
+    /// The continued run journal: `old prefix ++ this incarnation's records`.
+    pub journal: Arc<Mutex<MemorySink>>,
+}
+
+/// The inputs that start a live upgrade transaction: the live OLD instance plus the NEW module's
+/// admission bundle (ABI §10.3). Handed to [`LiveUpgradeSteps::new`]; the orchestrator
+/// ([`run_local_upgrade`]) then drives the five steps over these.
+pub struct LiveUpgradeInputs<'w> {
+    /// The host worker (engine) both instances run under.
+    pub worker: &'w Worker,
+    /// The role-instance's role label (§8.1).
+    pub role: String,
+    /// The live OLD instance (consumed by the quiesce drain).
+    pub old_run: V2Run,
+    /// The OLD instance's pump (quiesce / snapshot capture / spool drain).
+    pub old_pump: PumpHandle,
+    /// The OLD instance's journal (its length at the fence is the [`SnapshotSeam::journal_cursor`],
+    /// and its records seed the new incarnation's continuation).
+    pub old_sink: Arc<Mutex<MemorySink>>,
+    /// The OLD module hash (recorded in the snapshot manifest's `module` field).
+    pub old_module: Hash,
+    /// The NEW module bytes (hash-pinned target; re-admitted under owner law).
+    pub new_wasm: Vec<u8>,
+    /// The NEW instance's execution identity (epoch = the committed target epoch, §8.1).
+    pub new_identity: RunIdentity,
+    /// The NEW instance's per-run signing key seed (a fresh sender — §12.1/§12.2).
+    pub new_signing_seed: [u8; 32],
+    /// The NEW module's admitted grants document (must hash to the committed record's
+    /// `grants_hash`).
+    pub new_grants_bytes: Vec<u8>,
+    /// The participation lane the owner-law re-check evaluates against (§9.4).
+    pub lane: ParticipationLane,
+    /// The device profile for the re-admission funnel.
+    pub device: DeviceProfile,
+    /// The owner policy (participation + caps) the re-admission enforces (fail-closed at step 3).
+    pub owner: OwnerPolicy,
+    /// The envelope-derived role grants the re-admission derives quotas from.
+    pub envelope_grants: EnvelopeRoleGrants,
+    /// Per-attempt migrate fuel (§10.2 "explicit bounded budget"): entry `i` bounds attempt `i`
+    /// (`None` = the engine default). Production passes the migration-grant fuel; the crash-recovery
+    /// path (refactor §9) can starve an early attempt and grant a later one.
+    pub migrate_fuel: Vec<Option<u64>>,
+    /// A frame delivered **during** the drain window (§4.4): the network-reader seat keeps
+    /// servicing while the guest drains, so a frame arriving mid-drain spools and drains into the
+    /// new instance at activation (§10.3 step 6). Production leaves this `None` (real frames arrive
+    /// through [`PumpHandle::deliver_frame`]); a drill sets it to pin the drain-time spool.
+    pub drain_window_frame: Option<(u64, [u8; 32], Vec<u8>)>,
+}
+
+/// The production [`UpgradeSteps`] adapter: each step wired onto the real host primitive the spec
+/// names — [`PumpHandle::quiesce`] + [`PumpHandle::snapshot_capture`] (steps 1–2), [`admit_v2`]
+/// (step 3), [`start_run_migrating`] (steps 4–5), spooled-frame drain (step 6). It is the concrete
+/// side-effecting half of the transaction whose ordering/invariants [`run_local_upgrade`] fixes.
+///
+/// The new incarnation's journal is a **continuation** of the old one, seeded at the fence's
+/// journal cursor ([`MemorySink::continuing`]) rather than a fresh sink — so the run journal is one
+/// gapless log across the module switch, replayable end to end (no replay gap, no double-delivery).
+pub struct LiveUpgradeSteps<'w> {
+    worker: &'w Worker,
+    role: String,
+    old_run: Option<V2Run>,
+    old_pump: PumpHandle,
+    old_sink: Arc<Mutex<MemorySink>>,
+    old_module: Hash,
+    new_wasm: Vec<u8>,
+    new_identity: RunIdentity,
+    new_signing_seed: [u8; 32],
+    new_grants_bytes: Vec<u8>,
+    lane: ParticipationLane,
+    device: DeviceProfile,
+    owner: OwnerPolicy,
+    envelope_grants: EnvelopeRoleGrants,
+    migrate_fuel: Vec<Option<u64>>,
+    drain_window_frame: Option<(u64, [u8; 32], Vec<u8>)>,
+    attempt: usize,
+    // captured / derived state
+    journal_prefix: Vec<SinkEntry>,
+    capture: Option<SnapshotCapture>,
+    spooled: Vec<SpooledFrame>,
+    pending: Option<ActivatedInstance>,
+    activated: Option<ActivatedInstance>,
+    migrate_failures: Vec<String>,
+    left: Option<String>,
+}
+
+impl<'w> LiveUpgradeSteps<'w> {
+    /// Build the adapter from its inputs (all captured state starts empty).
+    #[must_use]
+    pub fn new(inputs: LiveUpgradeInputs<'w>) -> Self {
+        Self {
+            worker: inputs.worker,
+            role: inputs.role,
+            old_run: Some(inputs.old_run),
+            old_pump: inputs.old_pump,
+            old_sink: inputs.old_sink,
+            old_module: inputs.old_module,
+            new_wasm: inputs.new_wasm,
+            new_identity: inputs.new_identity,
+            new_signing_seed: inputs.new_signing_seed,
+            new_grants_bytes: inputs.new_grants_bytes,
+            lane: inputs.lane,
+            device: inputs.device,
+            owner: inputs.owner,
+            envelope_grants: inputs.envelope_grants,
+            migrate_fuel: inputs.migrate_fuel,
+            drain_window_frame: inputs.drain_window_frame,
+            attempt: 0,
+            journal_prefix: Vec::new(),
+            capture: None,
+            spooled: Vec::new(),
+            pending: None,
+            activated: None,
+            migrate_failures: Vec::new(),
+            left: None,
+        }
+    }
+
+    /// The role label this transaction upgrades.
+    #[must_use]
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// The live activated instance (ABI §10.3 step 6), once the transaction has activated one.
+    #[must_use]
+    pub fn activated(&self) -> Option<&ActivatedInstance> {
+        self.activated.as_ref()
+    }
+
+    /// Take the activated instance (to finish/stop it).
+    pub fn take_activated(&mut self) -> Option<ActivatedInstance> {
+        self.activated.take()
+    }
+
+    /// Whether an instance is currently pending activation (a migrated-but-not-activated instance).
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The leave reason, if the transaction failed closed / exhausted its retries.
+    #[must_use]
+    pub fn left(&self) -> Option<&str> {
+        self.left.as_deref()
+    }
+
+    /// How many migrate attempts ran (0 before any migrate; the crash-recovery drill increments).
+    #[must_use]
+    pub fn attempts(&self) -> usize {
+        self.attempt
+    }
+
+    /// The per-attempt migrate/validate failure details (for logging / crash-drill assertions).
+    #[must_use]
+    pub fn migrate_failures(&self) -> &[String] {
+        &self.migrate_failures
+    }
+
+    /// The continuation sink for a new incarnation: the old prefix (up to the fence) + this
+    /// incarnation's records, with the publish-seq high-water marks reset (a fresh sender, §12.2).
+    fn continuation_sink(&self) -> Arc<Mutex<MemorySink>> {
+        Arc::new(Mutex::new(MemorySink::continuing(
+            self.journal_prefix.clone(),
+        )))
+    }
+}
+
+/// Poll until `cond` holds or `timeout` elapses; returns whether it held.
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    cond()
+}
+
+impl UpgradeSteps for LiveUpgradeSteps<'_> {
+    fn quiesce(&mut self, deadline_ms: u64) -> Result<SnapshotSeam, StepFailure> {
+        self.old_pump
+            .quiesce(daemon_vhc_abi::QUIESCE_REASON_UPGRADE, deadline_ms)
+            .map_err(|e| StepFailure::new(format!("quiesce delivery: {e}")))?;
+        // A frame arriving DURING the drain freezes — it spools, never reaching the draining
+        // instance (§4.4), and drains into the new instance at activation (§10.3 step 6).
+        if let Some((seq, sender, payload)) = self.drain_window_frame.take() {
+            self.old_pump
+                .deliver_frame(
+                    daemon_vhc_abi::DEFAULT_CHANNEL_CONTROL_ID,
+                    seq,
+                    sender,
+                    payload,
+                    b"drain-window-signed-frame".to_vec(),
+                )
+                .map_err(|e| StepFailure::new(format!("drain-window frame: {e}")))?;
+        }
+        let run = self
+            .old_run
+            .take()
+            .ok_or_else(|| StepFailure::new("old instance already consumed"))?;
+        match run.wait() {
+            Ok(RunEnd::Outcome(code))
+                if u64::from(code) == u64::from(daemon_vhc_abi::OUTCOME_QUIESCE_READY) => {}
+            other => {
+                return Err(StepFailure::new(format!(
+                    "drain did not quiesce: {other:?}"
+                )))
+            }
+        }
+        let capture = self
+            .old_pump
+            .snapshot_capture()
+            .ok_or_else(|| StepFailure::new("no accepted snapshot in the drain"))?;
+        self.spooled = self.old_pump.take_spooled_frames();
+        // The journal cursor (§10.3 step 2): where the old incarnation's records end. The new
+        // incarnation continues the SAME journal from here — this prefix seeds the continuation.
+        let old_entries = self.old_sink.lock().expect("old sink").entries.clone();
+        let journal_cursor = old_entries.len() as u64;
+        self.journal_prefix = old_entries;
+        // The labelled seam, in the checkpoint typed-manifest format (E1): the captured
+        // module-state section(s), content-addressed, plus the journal cursor —
+        // "checkpointing and migration are one discipline".
+        let mut builder = CheckpointManifest::builder(
+            Hash(self.new_identity.run_id),
+            0, // the snapshot captures the OLD epoch's state, produced by the OLD module
+            0,
+            self.old_module,
+            daemon_vhc_proto::StateDigest([0u8; 16]),
+        );
+        for (name, bytes) in &capture.sections {
+            builder = builder.section(name.clone(), SectionKind::Module, 1, bytes);
+        }
+        let manifest = builder
+            .section(
+                "journal-position",
+                SectionKind::JournalPosition,
+                1,
+                &journal_cursor.to_le_bytes(),
+            )
+            .build()
+            .map_err(|e| StepFailure::new(format!("seam manifest: {e:?}")))?;
+        self.capture = Some(capture);
+        Ok(SnapshotSeam {
+            manifest,
+            journal_cursor,
+        })
+    }
+
+    fn readmit(
+        &mut self,
+        new_module: Hash,
+        new_grants_hash: Hash,
+    ) -> Result<AdmittedQuotas, StepFailure> {
+        // The committed record's grants anchor: the re-derived grants document must hash to it.
+        if blake3_hash(&self.new_grants_bytes) != new_grants_hash {
+            return Err(StepFailure::new(
+                "re-derived grants do not match the committed record's grants_hash",
+            ));
+        }
+        // Owner-law re-check (§10.3 step 3): the full admission funnel over the NEW module.
+        let admission = admit_v2(
+            self.worker,
+            &self.new_wasm,
+            Some(new_module.as_bytes()),
+            &[],
+            &self.new_grants_bytes,
+            &self.lane,
+            &self.device,
+            &self.owner,
+            None,
+            Some(&self.envelope_grants),
+        )
+        .map_err(|refusal| StepFailure::new(refusal.to_string()))?;
+        admission
+            .quotas
+            .ok_or_else(|| StepFailure::new("envelope-grants admission yields quotas"))
+    }
+
+    fn migrate(&mut self, seam: &SnapshotSeam) -> Result<(), StepFailure> {
+        let capture = self
+            .capture
+            .clone()
+            .ok_or_else(|| StepFailure::new("quiesce did not capture a snapshot"))?;
+        // The typed seam content-addresses exactly the captured module state (E1's format).
+        if let Some(module_section) = seam.manifest.section(SectionKind::Module) {
+            if let Some((_, first)) = capture.sections.first() {
+                if module_section.hash != blake3_hash(first) {
+                    return Err(StepFailure::new(
+                        "seam module section does not content-address the captured snapshot",
+                    ));
+                }
+            }
+        }
+        let fuel = self.migrate_fuel.get(self.attempt).copied().flatten();
+        self.attempt += 1;
+        // The new incarnation continues the SAME journal (seeded at the fence cursor), not a fresh
+        // sink — the run journal is one gapless log across the switch (§10.3 step 6).
+        let sink = self.continuation_sink();
+        let cfg = V2RunConfig::new(
+            self.new_identity.clone(),
+            self.new_signing_seed,
+            Vec::new(),
+            self.new_grants_bytes.clone(),
+        );
+        let run = start_run_migrating(
+            self.worker,
+            &self.new_wasm,
+            cfg,
+            Box::new(sink.clone()),
+            Some(MigrationInput {
+                capture,
+                restore: true,
+                migrate_fuel: fuel,
+            }),
+        )
+        .map_err(|e| StepFailure::new(format!("start_run_migrating: {e}")))?;
+        let pump = run.pump.clone();
+        // The migrated module announces the restored state as its first publish; a failed migrate
+        // tears the instance down before da_run (§10.3 step 5).
+        let ok = wait_until(Duration::from_secs(30), || {
+            !pump.published().is_empty() || run.is_finished()
+        });
+        if !ok {
+            return Err(StepFailure::new(
+                "migrating instance neither published nor tore down within the budget",
+            ));
+        }
+        if pump.published().is_empty() {
+            let end = run.wait().map_err(|e| StepFailure::new(e.to_string()))?;
+            let detail = format!("migrate step failed: {end:?}");
+            self.migrate_failures.push(detail.clone());
+            return Err(StepFailure::new(detail));
+        }
+        self.pending = Some(ActivatedInstance {
+            run,
+            pump,
+            journal: sink,
+        });
+        Ok(())
+    }
+
+    fn activate(&mut self) -> Result<(), StepFailure> {
+        let instance = self
+            .pending
+            .take()
+            .ok_or_else(|| StepFailure::new("activate without a migrated instance"))?;
+        // Spooled frames drain into the new instance (§10.3 step 6).
+        for f in self.spooled.drain(..) {
+            instance
+                .pump
+                .deliver_frame(
+                    f.channel,
+                    f.seq,
+                    f.sender,
+                    f.payload,
+                    f.original_signed_frame,
+                )
+                .map_err(|e| StepFailure::new(format!("spool drain: {e}")))?;
+        }
+        self.activated = Some(instance);
+        Ok(())
+    }
+
+    fn rollback(&mut self, _seam: &SnapshotSeam) {
+        // A failed migrate already tore the new instance down (guest-thread-owned teardown); the
+        // snapshot capture IS the recovery point — nothing else to restore locally.
+        if let Some(instance) = self.pending.take() {
+            let _ = instance.pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE);
+            let _ = instance.run.wait();
+        }
+    }
+
+    fn leave(&mut self, reason: &LeaveReason) {
+        self.left = Some(reason.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

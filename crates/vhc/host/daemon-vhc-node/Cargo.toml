@@ -39,6 +39,14 @@ blake3 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Node-level acceptance for the live module-upgrade command surface (`tests/switch_module.rs`):
+# it drives `WorkerControl::switch_module` over a REAL running worker instance (a real wasm
+# migratable guest under the host runtime) through the production upgrade transaction
+# (`daemon_vhc_session::upgrade`). Test-only edges — no runtime dependency-direction change.
+daemon-vhc-host = { workspace = true }
+daemon-vhc-proto = { workspace = true }
+daemon-vhc-abi = { workspace = true }
+ciborium = { workspace = true }
 
 [lints]
 workspace = true

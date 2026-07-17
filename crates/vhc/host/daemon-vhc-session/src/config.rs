@@ -158,6 +158,29 @@ pub struct OwnerBudgetConfig {
     pub max_instances: u32,
 }
 
+/// Live module-upgrade bounds (`[swarm.upgrade]`, ABI §4.4/§9.6/§10.3) — the node clamps every
+/// `SwitchModule` it issues to these before touching the worker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpgradeConfig {
+    /// Ceiling on the quiesce drain deadline the node passes with a `SwitchModule` (§4.4/§9.6): the
+    /// requested deadline is clamped to this before sending, so a guest can never be granted an
+    /// unbounded drain (the host wall-clock-enforces it → `QuiesceDeadlineExceeded`). Milliseconds.
+    pub quiesce_deadline_max_ms: u64,
+    /// Max rollback-and-retry cycles the LOCAL upgrade transaction runs before it leaves the run
+    /// (ABI §10.3 step 7; the mid-migration crash drill recovers within this budget).
+    pub max_retries: u32,
+}
+
+impl Default for UpgradeConfig {
+    fn default() -> Self {
+        Self {
+            quiesce_deadline_max_ms: 30_000,
+            max_retries: 1,
+        }
+    }
+}
+
 /// The `[swarm]` config section (spec §10.6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -182,6 +205,8 @@ pub struct SwarmConfig {
     /// conservatively + finitely from the hardware probe when `enabled` (never unbounded — see
     /// [`OwnerBudgetConfig`]).
     pub owner_budget: OwnerBudgetConfig,
+    /// Live module-upgrade (`SwitchModule`) bounds (ABI §10.3). Additive; sensible finite defaults.
+    pub upgrade: UpgradeConfig,
 }
 
 impl Default for SwarmConfig {
@@ -200,6 +225,7 @@ impl Default for SwarmConfig {
             registry: RegistryConfig::default(),
             iroh: IrohConfig::default(),
             owner_budget: OwnerBudgetConfig::default(),
+            upgrade: UpgradeConfig::default(),
         }
     }
 }

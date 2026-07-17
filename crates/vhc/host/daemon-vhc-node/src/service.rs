@@ -25,7 +25,7 @@ use daemon_vhc_session::config::SwarmConfig;
 use daemon_vhc_session::protocol::{
     self, Eligibility, Hardware, JoinPolicy, LeaveMode, PolicyMode,
 };
-use daemon_vhc_supervisor::TrainSupervisor;
+use daemon_vhc_supervisor::{SwitchOutcome, TrainSupervisor};
 use futures::StreamExt;
 use std::collections::BTreeMap;
 use tokio::sync::broadcast;
@@ -123,6 +123,26 @@ pub trait WorkerControl: Send + Sync {
         duty_cycle_pct: Option<u8>,
         paused: bool,
     ) -> Result<(), SwarmError>;
+    /// Initiate a live module upgrade for a running instance (ABI §10.3; architecture §5.4) — the
+    /// node command surface for `SwitchModule`. The run-level upgrade record has already committed
+    /// to the transition chain (deliverable 1); this drives the LOCAL half of the transaction on
+    /// the worker (quiesce → snapshot → owner-law re-admission → migrate → validate → activate).
+    /// Default: unsupported (fakes / non-upgrading workers); `TrainSupervisor` overrides it with
+    /// the real command path.
+    async fn switch_module(
+        &self,
+        run_id: String,
+        epoch: u64,
+        role: String,
+        new_module: [u8; 32],
+        grants_hash: [u8; 32],
+        deadline_ms: u64,
+    ) -> Result<SwitchOutcome, SwarmError> {
+        let _ = (run_id, epoch, role, new_module, grants_hash, deadline_ms);
+        Err(SwarmError::Worker(
+            "switch_module unsupported by this worker".into(),
+        ))
+    }
     /// Tear the worker down (a factory child that was refused admission or whose run left —
     /// Phase E multi-instance supervision). Default no-op for fakes/shared workers.
     async fn shutdown(&self) {}
@@ -176,6 +196,27 @@ impl WorkerControl for TrainSupervisor {
         TrainSupervisor::throttle(self, vram_cap_mb, duty_cycle_pct, paused)
             .await
             .map_err(SwarmError::worker)
+    }
+    async fn switch_module(
+        &self,
+        run_id: String,
+        epoch: u64,
+        role: String,
+        new_module: [u8; 32],
+        grants_hash: [u8; 32],
+        deadline_ms: u64,
+    ) -> Result<SwitchOutcome, SwarmError> {
+        TrainSupervisor::switch_module(
+            self,
+            run_id,
+            epoch,
+            role,
+            new_module,
+            grants_hash,
+            deadline_ms,
+        )
+        .await
+        .map_err(SwarmError::worker)
     }
     async fn shutdown(&self) {
         TrainSupervisor::shutdown(self).await;

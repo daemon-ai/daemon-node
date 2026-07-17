@@ -412,6 +412,23 @@ impl MemorySink {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Continue a journal across an incarnation boundary (ABI §10.3 step 6; §12.1/§12.2): the new
+    /// incarnation appends its records **after** `prefix` — the previous incarnation's records up
+    /// to the quiesce fence (the [`crate::v2::SnapshotCapture`] journal cursor) — so the combined
+    /// journal is one gapless, replayable log across the module switch (no replay gap; the
+    /// pre-fence records are never re-emitted).
+    ///
+    /// The per-channel publish-seq high-water marks are **reset**: the new incarnation signs under
+    /// a fresh per-run key, and the §12.2 dense sequence is per `(channel, sender)`, so the new
+    /// sender's sequence opens at 0 (no double-delivery via a stale sender's high-water mark).
+    #[must_use]
+    pub fn continuing(prefix: Vec<SinkEntry>) -> Self {
+        Self {
+            entries: prefix,
+            seq_high: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 impl JournalSink for MemorySink {
