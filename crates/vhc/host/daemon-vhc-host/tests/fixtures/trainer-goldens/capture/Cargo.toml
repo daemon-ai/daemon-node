@@ -1,0 +1,33 @@
+# The trainer-goldens CAPTURE crate — the documented, re-runnable recorder for the v2-native
+# det-lane golden bundle (the successor to the recorded v1 parity oracle).
+#
+# The per-tier reproduction tests (daemon-vhc-host/tests/trainer_goldens.rs) drive the compute@2
+# trainer guest (`tiny-llama-c3`) against the RECORDED goldens in `../` (per-round det digests,
+# committed payload bytes, matched-init trained-theta trajectory). This crate is how that bundle
+# is produced: it drives the SAME guest through a single-peer barrier whole-run, reconstructs the
+# guest's own committed payload bytes natively (the guest publishes only the commitment hash), and
+# content-addresses every recorded file. It runs the capture TWICE and asserts byte-identity
+# before writing — reproducibility is proven at capture time, not assumed.
+#
+# Standalone (the empty [workspace] table below): NOT a member of the daemon-node workspace, so it
+# never enters the default gate; its deps point BY PATH into the tree. Unlike the v1 oracle's
+# capture crate, this one builds on the CURRENT tree (it drives the live compute@2 path, not the
+# retired v1 driver) — regeneration stays meaningful. Capture command: see ../README.md.
+[package]
+name = "trainer-goldens-capture"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+daemon-vhc-host = { path = "../../../.." }
+daemon-vhc-proto = { path = "../../../../../../contracts/daemon-vhc-proto" }
+daemon-vhc-abi = { path = "../../../../../../contracts/daemon-vhc-abi" }
+daemon-vhc-sdk-profiles = { path = "../../../../../../sdk/daemon-vhc-sdk-profiles" }
+blake3 = "1"
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

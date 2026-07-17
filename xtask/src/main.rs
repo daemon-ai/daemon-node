@@ -545,6 +545,26 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             ],
         ),
         (
+            // The v2-native trainer goldens (retirement plan §3): the compute@2 trainer guest
+            // reproduces a recorded, content-addressed golden bundle (per-round det digests, the
+            // trainer's own committed payload bytes, the matched-init trained-theta trajectory)
+            // instead of the v1 parity oracle — the successor drift oracle that lets the v1
+            // recording + v2_parity retire. cpu + burn-ndarray tiers reproduce the digests
+            // bit-exactly (equality class) and theta within the Optimizer band (tolerance class),
+            // plus the straggle -> catch-up leg. wgpu/cuda device tiers are hardware-gated in the
+            // same file (op-journal replay of the compute@2 kernels). Runs beside the c3_parity +
+            // v2_parity pins in the same gate, never replacing them.
+            "trainer goldens: v2-native det digests + Optimizer band + straggle catch-up (cpu + burn-ndarray)",
+            &[
+                "-p",
+                "daemon-vhc-host",
+                "--test",
+                "trainer_goldens",
+                "--features",
+                "burn-ndarray",
+            ],
+        ),
+        (
             // A2 migrate/main! scaffolding (refactor §5 A2 item 4; ABI §10): state round-trips
             // in sim through the typed manifest protocol; the SDK-derived claim/manifest match
             // the §9.1/§6.2 wire schema the admission funnel decodes. The macro's exports are

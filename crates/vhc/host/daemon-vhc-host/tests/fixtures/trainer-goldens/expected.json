@@ -1,0 +1,110 @@
+{
+  "captured_from": {
+    "capture": "tests/fixtures/trainer-goldens/capture (see ../README.md)",
+    "commit": "e93217b9",
+    "compute_lane": "host ndarray ComputeRunner (the compute@2 host execution backend at this commit; EngineConfig.backend does not select the compute@2 tier)",
+    "trainer": "compute@2 tiny-llama-c3 (real Burn LLaMA over Autodiff<HostBackend>, SparseLoco det-lane ingest in-guest, BarrierRound, kind-0 staging)",
+    "tree": "vhc/trainer-goldens (the current tree — the live compute@2 trainer lane)"
+  },
+  "digests": [
+    "abcf2612d53960d1930e46772e02d718",
+    "574cf418f3b526b2066bd9134cfc4286"
+  ],
+  "init": {
+    "blake3": "d31eb76052d96d280742389def0bfb00501b65eaac24a4eac580c31e24a0d454",
+    "bytes": 180992,
+    "file": "init.f32le.bin"
+  },
+  "model_cfg": {
+    "adam_eps": 1e-8,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "d_model": 64,
+    "ffn_mult": 2,
+    "head_dim": 16,
+    "lr": 0.0004,
+    "n_heads": 4,
+    "n_layers": 1,
+    "rmsnorm_eps": 0.00001,
+    "rope_theta": 10000.0,
+    "seq_len": 9,
+    "vocab": 64,
+    "wd": 0.1
+  },
+  "module": {
+    "blake3": "f03e81957b3b3b1912988bf3d18913f772469062c79abd5f8b9c4105d1be41da",
+    "bytes": 1011398,
+    "name": "tiny_llama_c3.wasm",
+    "source": "guests/target build at capture (byte-identical across checkout paths via the guests workspace rustc remap; pinned in guests.blake3 at the commit)"
+  },
+  "param_names": [
+    "tok.weight",
+    "l0.attn_norm",
+    "l0.wq",
+    "l0.wk",
+    "l0.wv",
+    "l0.wo",
+    "l0.ffn_norm",
+    "l0.w_gate",
+    "l0.w_up",
+    "l0.w_down",
+    "norm.weight"
+  ],
+  "param_numels": [
+    4096,
+    64,
+    4096,
+    4096,
+    4096,
+    4096,
+    64,
+    8192,
+    8192,
+    8192,
+    64
+  ],
+  "payloads": [
+    {
+      "blake3": "3894a20d705d89c820a90f980b3e1429410b46c796ec19a6a9c968c437c06122",
+      "bytes": 26026,
+      "file": "payload-round-0.bin"
+    },
+    {
+      "blake3": "01153cd1d868f5b679c98a58ddeea0a634d4379b2024c21379e4fc10268195ca",
+      "bytes": 26026,
+      "file": "payload-round-1.bin"
+    }
+  ],
+  "profile_cfg": {
+    "bits": 2,
+    "chunk": 64,
+    "clip": false,
+    "ef_decay": 0.95,
+    "h": 3,
+    "outer_alpha": 1.0,
+    "topk": 8
+  },
+  "provenance": "v1 parity oracle (matched init + config literals) -> c3_parity C3c (c3_reauthored_tiny_llama_parity_vs_v1_oracle_cpu) green at captured_from.commit -> these goldens. See ../README.md for the full chain and the exact comparison surface.",
+  "schedule": {
+    "micro_batch": 2,
+    "peer": "[7; 32]",
+    "roster": "single-peer (self-ingest barrier)",
+    "rounds": 2,
+    "seq_len": 9,
+    "steps_per_round": 2,
+    "tokens": "token[i] of (round, step) = ((i + 1000*step + 100000*round + 1) * 2654435761) % 64",
+    "vocab": 64
+  },
+  "trained": [
+    {
+      "blake3": "8c78def25dda264ee5486843d5a3648e12a6debb2153ef54be8e06a6eb941f0b",
+      "bytes": 180992,
+      "file": "trained-round-0.f32le.bin"
+    },
+    {
+      "blake3": "3587b43d0d9dc7f085d4ee9e119ecc9ff3194ee469c999be0214161488823f93",
+      "bytes": 180992,
+      "file": "trained-round-1.f32le.bin"
+    }
+  ]
+}
