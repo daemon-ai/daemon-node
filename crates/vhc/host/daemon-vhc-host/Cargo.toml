@@ -8,10 +8,6 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
-[[bin]]
-name = "daemon-vhc"
-path = "src/bin/daemon-vhc.rs"
-
 # The Wave-3 training worker (`daemon-vhc-worker`) was a `[[bin]]` target here through Phase A0;
 # it split into its own `crates/vhc/bins/daemon-vhc-worker` crate at A2 per refactor §3/§11
 # ("splits into `bins/daemon-vhc-worker` when A0 gives it real work") — a strictly mechanical move.

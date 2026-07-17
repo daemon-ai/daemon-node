@@ -13,9 +13,11 @@
 //! **The v1 five-phase driver retired at the Phase-E sunset** (decisions D5): the `Instance`
 //! lifecycle dispatch, the phase-legality table, and the autotune admission were removed in one
 //! auditable step; a major-1 module now meets a typed `AbiUnsupportedMajor` admission refusal
-//! (the flipped A0 fixture is the standing regression). The `TENSOR_ABI_MAJOR`/`VERSION`
-//! constants and the frozen 66-import vocabulary (`daemon-vhc-abi`) remain as the historical
-//! record and the live §2.5 bridge surface.
+//! (the flipped A0 fixture is the standing regression). The frozen 66-import vocabulary
+//! (`daemon-vhc-abi`) and the [`TENSOR_ABI_MINOR`] constant (served by the §2.5 bridge's
+//! `abi_minor@1` import) remain as the live bridge surface; the retired-major packing constants
+//! (`TENSOR_ABI_MAJOR`/`TENSOR_ABI_VERSION`) were dropped with the Wave-0 `daemon-vhc` scaffold
+//! bin that was their only reader.
 
 // `deny` (not `forbid`) so the two cfg-gated platform-probe FFI modules in `probe` can carry a
 // scoped `#[allow(unsafe_code)]` (DXGI/D3D12 on Windows; the Objective-C runtime + `sysctlbyname` on
@@ -61,15 +63,10 @@ pub use runtime::{EngineConfig, Worker};
 pub use select::{select_driver, Selection};
 pub use trap::{Trap, TrapCode};
 
-/// The retired v1 tensor-ABI major (the FROZEN historical record — decisions D5: the sunset
-/// removed the DRIVER, not the vocabulary; `tabi@1` lives on as the §2.5 bridge under major 2).
-pub const TENSOR_ABI_MAJOR: u32 = 1;
-/// The retired v1 tensor-ABI minor (frozen historical record).
+/// The frozen `tabi@1` minor served by the §2.5 compute bridge's `abi_minor@1` import (decisions
+/// D5: the sunset removed the v1 DRIVER, not the vocabulary; `tabi@1` lives on as the bridge under
+/// major 2). A major-1 module is still refused `AbiUnsupportedMajor` at the §1.3 front door.
 pub const TENSOR_ABI_MINOR: u32 = 0;
-
-/// The v1 tensor-ABI version, packed as `(major << 16) | minor` (frozen historical record; a
-/// module declaring it is refused `AbiUnsupportedMajor` since the Phase-E sunset).
-pub const TENSOR_ABI_VERSION: u32 = (TENSOR_ABI_MAJOR << 16) | TENSOR_ABI_MINOR;
 
 /// Errors surfaced by the worker host runtime.
 #[derive(Debug, thiserror::Error)]
@@ -111,11 +108,6 @@ pub fn content_digest(bytes: &[u8]) -> ([u8; 32], u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn abi_version_packs_major_minor() {
-        assert_eq!(TENSOR_ABI_VERSION >> 16, 1);
-    }
 
     #[test]
     fn digest_is_deterministic() {

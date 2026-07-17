@@ -2262,7 +2262,7 @@ mod tests {
             assert_eq!(cfg.swarm.data_cache_gb, 200);
             assert_eq!(cfg.swarm.default_policy.duty_cycle_pct, 25);
             // Omitted keys keep the §10.6 defaults.
-            assert_eq!(cfg.swarm.worker_path, "daemon-vhc");
+            assert_eq!(cfg.swarm.worker_path, "daemon-vhc-worker");
             assert_eq!(cfg.swarm.iroh.relays, "default");
             Ok(())
         });
