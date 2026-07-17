@@ -241,9 +241,9 @@ fn driver_oom_from_summed_pool_acceptable_allocs_is_fence_and_readback_visible_a
 
     // (2) The driver OOM is fence-visible, typed (the fix). Fence first so the drained stream error
     // is unambiguously the reported fault.
-    let ferr = runner
-        .fence()
-        .expect_err("a genuine driver CUDA_ERROR_OUT_OF_MEMORY must be fence-visible with the patch");
+    let ferr = runner.fence().expect_err(
+        "a genuine driver CUDA_ERROR_OUT_OF_MEMORY must be fence-visible with the patch",
+    );
     let ComputeError::Device(reason) = &ferr else {
         panic!("expected the typed deferred Device fault at the fence, got {ferr:?}");
     };
@@ -264,8 +264,12 @@ fn driver_oom_from_summed_pool_acceptable_allocs_is_fence_and_readback_visible_a
     assert_eq!(rerr.trap_code().slug(), "ComputeFault");
 
     // (4) Survival — the driver OOM is non-sticky: the same runner serves fresh work...
-    runner.import_tensor(2, &ser(&data)).expect("fresh import after the fault");
-    runner.fence().expect("clean fence after the fault — same runner recovered");
+    runner
+        .import_tensor(2, &ser(&data))
+        .expect("fresh import after the fault");
+    runner
+        .fence()
+        .expect("clean fence after the fault — same runner recovered");
     let exported = runner
         .read_tensor(&read_ir(2, 4))
         .expect("readback after the fault — the CUDA context survived");
@@ -321,8 +325,12 @@ fn sticky_context_error_is_unreachable_through_the_pinned_op_set() {
     // The refusal is a programming-error trap, not a device fault: the runner is untouched and
     // continues to serve.
     let data = TensorData::new(vec![1.0f32, 2.0, 3.0, 4.0], [4usize]);
-    runner.import_tensor(1, &ser(&data)).expect("import after the refusal");
-    runner.fence().expect("the refusal never touched the device");
+    runner
+        .import_tensor(1, &ser(&data))
+        .expect("import after the refusal");
+    runner
+        .fence()
+        .expect("the refusal never touched the device");
     let exported = runner.read_tensor(&read_ir(1, 4)).expect("readback");
     let round: TensorData = ciborium::from_reader(exported.as_slice()).expect("decodes");
     assert_eq!(
