@@ -56,6 +56,13 @@ pub mod local_coordinator;
 #[cfg(any(test, feature = "harness"))]
 pub mod harness;
 
+/// The wasm-coordinator replay sandbox: the concrete [`daemon_vhc_observe::CoordinatorSandbox`] the
+/// replay oracle drives consensus through (consensus re-derives inside the sandboxed
+/// `coordinator-quorum` module, never a native tick). Needs the host runtime + observe, so it lives
+/// behind the `harness` feature (and this crate's own tests).
+#[cfg(any(test, feature = "harness"))]
+pub mod replay_sandbox;
+
 // `live_harness` (the iroh live-transport harness driving the v1 WasmBackend over the RoundEngine)
 // RETIRED with the v1 driver at the Phase-E sunset; the loopback `harness` (StubBackend) remains
 // the deterministic multi-peer substrate, and the live v2 lanes are the testkit's.

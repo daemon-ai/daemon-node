@@ -19,9 +19,10 @@
 //!    tag-10 snapshot is the initial coordinator state, tag-1/tag-3 records are the driving
 //!    inputs, and tag-4 publishes carry the coordinator's own signed `RoundOpen`/`RoundRecord`
 //!    decisions — the oracle.
-//! 3. **Re-derivation** — the pure `tick` re-runs over the recovered inputs
-//!    ([`crate::replay::replay_from_state`]); every archived `RoundRecord` must re-derive
-//!    byte-identically (the existing coordinator-oracle discipline, now sourced from the archive).
+//! 3. **Re-derivation** — the recovered inputs re-run inside the sandboxed coordinator module
+//!    ([`crate::replay::replay_from_state`] over a [`CoordinatorSandbox`]); every archived
+//!    `RoundRecord` must re-derive byte-identically (the coordinator-oracle discipline, now sourced
+//!    from the archive and driven through the sandbox — consensus never runs natively).
 //! 4. **Digest re-verification from payloads alone** — every committed `RecordEntry` of every
 //!    record is checked against the supplied content-addressed payload bytes (`blake3(payload) ==
 //!    entry.hash`, `len == entry.size`), and the record's set commitment is **recomputed** from
@@ -36,7 +37,7 @@ use daemon_vhc_proto::{blake3_hash, commit_set, from_canonical_slice, Hash, Peer
 
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 
-use crate::replay::{replay_from_state, ReplayError, ReplayReport};
+use crate::replay::{replay_from_state, CoordinatorSandbox, ReplayError, ReplayReport};
 
 use super::archive::{AttestedHead, RecordArchive};
 use super::record::{Body, Record};
@@ -275,6 +276,7 @@ pub fn recover_chain_from_archive(
 /// # Errors
 /// A typed [`ConsensusReplayError`]; an incomplete verification is never a pass.
 pub fn replay_consensus_from_archive(
+    sandbox: &dyn CoordinatorSandbox,
     archive: &RecordArchive,
     heads: &[AttestedHead],
     payloads: &BTreeMap<Hash, Vec<u8>>,
@@ -294,7 +296,11 @@ pub fn replay_consensus_from_archive(
         .cloned()
         .map(Input::Message)
         .collect();
-    let replay = replay_from_state(initial, capture.inputs.into_iter().chain(oracle_records))?;
+    let replay = replay_from_state(
+        sandbox,
+        initial,
+        capture.inputs.into_iter().chain(oracle_records),
+    )?;
 
     // -- 4. digests from payloads alone: every committed entry + every set commitment ------------
     let mut payload_entries_verified = 0u64;

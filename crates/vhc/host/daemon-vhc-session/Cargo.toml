@@ -31,6 +31,9 @@ harness = ["dep:daemon-vhc-observe"]
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+# Stop-reason + candidate-driver constants for the `harness`-gated replay sandbox (the concrete
+# `CoordinatorSandbox` that drives the wasm coordinator module under the host runtime).
+daemon-vhc-abi = { workspace = true }
 # The consensus SDK layer: assignment math (moved from the proto at D0, consumed by the retained v1
 # RoundEngine) AND — relocated at D2 from the dissolved daemon-vhc-coordinator — the pure coordinator
 # `tick` state machine (its `coordinator` module) the harness shell (`local_coordinator`) signs,
@@ -83,6 +86,7 @@ figment = { workspace = true, features = ["test"] }
 workspace = true
 
 [package.metadata.cargo-machete]
-# `async-trait` is used only by the harness `FaultyStore` PayloadStore impl, gated behind
-# `cfg(any(test, feature = "harness"))`, so it looks unused on the default (non-test) build path.
-ignored = ["async-trait"]
+# `async-trait` is used only by the harness `FaultyStore` PayloadStore impl, and `daemon-vhc-abi`
+# only by the `replay_sandbox` module — both gated behind `cfg(any(test, feature = "harness"))`, so
+# they look unused on the default (non-test) build path.
+ignored = ["async-trait", "daemon-vhc-abi"]

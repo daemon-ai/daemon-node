@@ -5,13 +5,14 @@
 //!
 //! A1 generalizes `daemon-vhc-observe`'s in-memory capture — the [`RunCapture`](crate::RunCapture)
 //! (`initial` [`CoordinatorState`] + the exact ordered `tick` [`Input`] trace, messages **and**
-//! clocks) — onto the crash-safe segmented [`Journal`]. The existing replay oracle
+//! clocks) — onto the crash-safe segmented [`Journal`]. The replay oracle
 //! ([`crate::replay`]) and its tests are **pinned**: this module is an *adapter* that writes a
 //! capture onto the journal and reads it back into the exact same driving-input sequence, so
 //! [`replay_over_journal`] returns a byte-identical [`ReplayReport`] to
-//! [`replay_capture`](crate::replay::replay_capture) over the in-memory path. The in-memory
-//! `RunCapture`/`MessageLog` types are retained (their on-disk framing is separately pinned); the
-//! journal is the durable substrate the same oracle now runs over.
+//! [`replay_capture`](crate::replay::replay_capture) over the in-memory path — both re-derive the
+//! run inside the same sandboxed coordinator module. The in-memory `RunCapture`/`MessageLog` types
+//! are retained (their on-disk framing is separately pinned); the journal is the durable substrate
+//! the same oracle now runs over.
 //!
 //! ### The mapping (documented — an ABI §8 record per coordinator input)
 //!
@@ -32,7 +33,7 @@ use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 
 use crate::capture::RunCapture;
 use crate::log::{MessageKind, MessageLog};
-use crate::replay::{replay_from_state, ReplayError, ReplayReport};
+use crate::replay::{replay_from_state, CoordinatorSandbox, ReplayError, ReplayReport};
 use crate::ObserveError;
 
 use super::record::{Body, ClockRec, EventRec, ExecIdentity, RunHeader, SnapshotRec};
@@ -175,12 +176,14 @@ pub fn recover_capture<K: KeyProvider + Clone>(
 ///
 /// Semantically identical to [`replay_capture`](crate::replay::replay_capture): reconstruct the
 /// captured initial state + driving inputs from the journal, append the wire log's `RoundRecord`s as
-/// the oracle, and re-run `tick`. Returns a byte-identical [`ReplayReport`], proving the pinned oracle
-/// behavior is preserved over the new substrate.
+/// the oracle, and re-derive the run inside the sandboxed coordinator module (`sandbox`). Returns a
+/// byte-identical [`ReplayReport`], proving the pinned oracle behavior is preserved over the new
+/// substrate.
 ///
 /// # Errors
-/// [`ReplayError`] on a divergence or setup failure.
+/// [`ReplayError`] on a divergence, a sandbox failure, or a setup failure.
 pub fn replay_over_journal<K: KeyProvider + Clone>(
+    sandbox: &dyn CoordinatorSandbox,
     journal: &Journal<K>,
     oracle: &MessageLog,
 ) -> Result<ReplayReport, ReplayError> {
@@ -190,5 +193,5 @@ pub fn replay_over_journal<K: KeyProvider + Clone>(
         .cloned()
         .map(Input::Message)
         .collect();
-    replay_from_state(initial, inputs.into_iter().chain(oracle_records))
+    replay_from_state(sandbox, initial, inputs.into_iter().chain(oracle_records))
 }

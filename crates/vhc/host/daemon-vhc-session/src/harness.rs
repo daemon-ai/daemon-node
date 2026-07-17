@@ -456,9 +456,10 @@ impl ObserveVerify {
 }
 
 /// Replay + verify the `daemon-vhc-observe` artifacts written by [`SwarmRun::write_observe`] into
-/// `dir` (the `swarm-replay` entry point): re-run the pure coordinator `tick` from the recorded
-/// [`RunCapture`] and assert its `RoundRecord`s re-derive byte-identically against the independent
-/// wire [`MessageLog`] (§6.4 I1 / PROTO-20). Also projects [`RunHealth`] from the log.
+/// `dir` (the `swarm-replay` entry point): re-derive the recorded [`RunCapture`] inside the
+/// sandboxed `coordinator-quorum` module (never a native tick) and assert its `RoundRecord`s
+/// re-derive byte-identically against the independent wire [`MessageLog`] (§6.4 I1 / PROTO-20). Also
+/// projects [`RunHealth`] from the log.
 ///
 /// # Errors
 ///
@@ -496,7 +497,10 @@ pub fn verify_observe_dir(dir: &std::path::Path) -> Result<ObserveVerify, SwarmR
 
     let logged_records = logged_round_records(&log);
     let health = RunHealth::from_log(&log);
-    let report = replay_capture(capture, &log)
+    // Re-derive inside the real coordinator module : consensus never runs natively, even here.
+    let sandbox = crate::replay_sandbox::WasmCoordinatorSandbox::from_built_guest()
+        .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator sandbox: {e}")))?;
+    let report = replay_capture(&sandbox, capture, &log)
         .map_err(|e| SwarmRunError::Lifecycle(format!("replay diverged: {e}")))?;
     Ok(ObserveVerify {
         run_id: log.run_id().to_string(),
