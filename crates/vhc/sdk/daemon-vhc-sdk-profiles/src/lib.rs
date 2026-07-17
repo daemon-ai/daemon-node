@@ -311,6 +311,43 @@ impl SparseLoco {
     pub fn replicated_state(&self) -> Vec<&[f32]> {
         Vec::new()
     }
+
+    /// The profile's **local** (replica-scoped, digest-invisible) state: the per-param
+    /// error-feedback residuals, in registration order. Checkpoint/migration continuity requires
+    /// it — the next round's `make_update` reads `ef`, so a restore that drops it forks the
+    /// committed-payload trajectory even though the det digest (a function of the canonical
+    /// masters only) would still match on the ingest side.
+    #[must_use]
+    pub fn ef_state(&self) -> &[Vec<f32>] {
+        &self.ef
+    }
+
+    /// Restore the error-feedback residuals from a checkpoint/migration snapshot (the counterpart
+    /// of [`SparseLoco::ef_state`]). Shapes must match the construction-time param layout.
+    ///
+    /// # Errors
+    /// A `String` naming the first param whose element count differs from the layout this profile
+    /// was built with — a shape drift fails loud, never a silent truncation.
+    pub fn restore_ef(&mut self, ef: Vec<Vec<f32>>) -> Result<(), String> {
+        if ef.len() != self.ef.len() {
+            return Err(format!(
+                "ef restore: {} params in the snapshot, {} in the layout",
+                ef.len(),
+                self.ef.len()
+            ));
+        }
+        for (i, (got, want)) in ef.iter().zip(self.ef.iter()).enumerate() {
+            if got.len() != want.len() {
+                return Err(format!(
+                    "ef restore: param {i} has {} elements, layout expects {}",
+                    got.len(),
+                    want.len()
+                ));
+            }
+        }
+        self.ef = ef;
+        Ok(())
+    }
 }
 
 // ================================================================================================

@@ -39,7 +39,9 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
-use daemon_vhc_host::v2::{start_run, MemorySink, RunEnd, RunIdentity, V2RunConfig};
+use daemon_vhc_host::v2::{
+    start_run, MemorySink, OpOutcome, OpRequest, RunEnd, RunIdentity, V2RunConfig,
+};
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::messages::{
@@ -417,9 +419,23 @@ fn c3_run(init: &[Vec<f32>], v1_payloads: &[Vec<u8>]) -> C3Run {
         );
         *seq += 1;
     };
+    // The async-runtime seat's minimal duty: the trainer `payload_put`s its sealed committed
+    // container each round (B1 discipline); this lane feeds the v1 oracle's payloads, so the put
+    // is acknowledged and its bytes dropped.
+    let service_puts = || {
+        for (op, request) in pump.take_op_requests() {
+            match request {
+                OpRequest::PayloadPut { .. } => {
+                    pump.complete_op(op, OpOutcome::PutDone).expect("put done");
+                }
+                other => panic!("unexpected op request from the c3 guest: {other:?}"),
+            }
+        }
+    };
     let wait_published = |n: usize| {
         let deadline = Instant::now() + Duration::from_secs(120);
         while pump.published().len() < n {
+            service_puts();
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for {n} publishes (have {}); logs: {:?}",
@@ -428,6 +444,7 @@ fn c3_run(init: &[Vec<f32>], v1_payloads: &[Vec<u8>]) -> C3Run {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        service_puts();
     };
 
     for round in 0..ROUNDS {

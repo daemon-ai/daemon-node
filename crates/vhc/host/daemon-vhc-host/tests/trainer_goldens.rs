@@ -48,7 +48,10 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
-use daemon_vhc_host::v2::{start_run, MemorySink, RunEnd, RunIdentity, V2RunConfig};
+use daemon_vhc_host::v2::{
+    start_run, start_run_migrating, MemorySink, MigrationInput, OpOutcome, OpRequest, RunEnd,
+    RunIdentity, V2RunConfig,
+};
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::messages::{
@@ -352,6 +355,7 @@ fn decode_publish(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
 fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
     let deadline = Instant::now() + Duration::from_secs(180);
     while pump.published().len() < n {
+        service_puts(pump);
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {n} publishes (have {}); logs: {:?}",
@@ -359,6 +363,21 @@ fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
             pump.logs()
         );
         std::thread::sleep(Duration::from_millis(5));
+    }
+    service_puts(pump);
+}
+
+/// The async-runtime seat's minimal duty here: the trainer `payload_put`s its sealed committed
+/// container each round (the B1 discipline); this harness compares against RECORDED payloads, so
+/// the put is acknowledged and its bytes dropped.
+fn service_puts(pump: &daemon_vhc_host::v2::PumpHandle) {
+    for (op, request) in pump.take_op_requests() {
+        match request {
+            OpRequest::PayloadPut { .. } => {
+                pump.complete_op(op, OpOutcome::PutDone).expect("put done");
+            }
+            other => panic!("unexpected op request from the trainer guest: {other:?}"),
+        }
     }
 }
 
@@ -720,6 +739,193 @@ fn trainer_goldens_catch_up_after_straggle_cpu() {
         }
     }
     eprintln!("trainer_goldens[straggle]: catch-up reproduced the clean final digest + theta band");
+}
+
+// -- the checkpoint/migration continuity pin (ABI §10.2 over the trainer at LLaMA scale) ----------
+
+/// The round's tag-3 commitment hash from the published frames, if voiced yet.
+fn commitment_hash(pump: &daemon_vhc_host::v2::PumpHandle, round: u64) -> Option<[u8; 32]> {
+    for (_, _, frame) in pump.published() {
+        if let Some((3, r, bytes)) = decode_publish(&frame) {
+            if r == round {
+                return Some(bytes.as_slice().try_into().expect("hash32"));
+            }
+        }
+    }
+    None
+}
+
+/// Typed checkpoint/restore at LLaMA scale, pinned against the frozen goldens: round 0 runs on
+/// instance 1, a `Quiesce{Upgrade}` drain snapshots the typed state-manifest (`master` + `ef` +
+/// `adamw_m`/`adamw_v` sections — the moments walk device→host through the async export seam),
+/// `da_migrate` restores it into a FRESH instance, and round 1 on the new instance must produce
+/// (a) the round-1 commitment hash of the recorded golden payload — which pins the replica-local
+/// restore (error feedback + moments), because the committed payload is a function of them and
+/// the digest alone would not see their loss — and (b) the recorded golden round-1 det digest
+/// bit-exactly.
+#[test]
+fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
+    let g = load_goldens();
+    let wasm = guest("tiny_llama_c3");
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    let module_hash = *blake3::hash(&wasm).as_bytes();
+
+    // -- instance 1: round 0 exactly as the reproduce lane drives it ------------------------------
+    let identity = RunIdentity {
+        run_id: [0x69; 32],
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance: 1,
+        module: module_hash,
+    };
+    let mut run_cfg = V2RunConfig::new(
+        identity.clone(),
+        [0x9f; 32],
+        g.cfg_bytes.clone(),
+        Vec::new(),
+    );
+    run_cfg.compute_queue_depth = 1 << 20;
+    let sink = Arc::new(Mutex::new(MemorySink::new()));
+    let run = start_run(&worker, &wasm, run_cfg, Box::new(sink)).expect("start");
+    let pump = run.pump.clone();
+    let mut seq = 0u64;
+    let sender = [9u8; 32];
+    let deliver = |pump: &daemon_vhc_host::v2::PumpHandle, msg: &SwarmMessage, seq: &mut u64| {
+        let payload = to_canonical_vec(msg).expect("msg");
+        assert_eq!(
+            pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
+                .expect("deliver"),
+            daemon_vhc_host::v2::DeliverVerdict::Accepted
+        );
+        *seq += 1;
+    };
+
+    for h in 0..STEPS_PER_ROUND {
+        pump.stage_payload(batch_wrapper(0, h, &tokens_for(0, h)), None)
+            .expect("stage batch");
+    }
+    deliver(&pump, &round_open(0), &mut seq);
+    wait_published(&pump, 2); // theta(0) + commitment(0)
+    pump.stage_payload(update_wrapper(0, &g.payloads[0]), None)
+        .expect("stage update 0");
+    deliver(&pump, &round_record(0, &g.payloads[0]), &mut seq);
+    wait_published(&pump, 3); // digest(0)
+
+    // -- quiesce: the §10.2 producing protocol snapshots the typed manifest -----------------------
+    pump.quiesce(daemon_vhc_abi::QUIESCE_REASON_UPGRADE, 60_000)
+        .expect("quiesce delivery");
+    match run.wait().expect("guest thread clean") {
+        RunEnd::Outcome(code) if code == daemon_vhc_abi::OUTCOME_QUIESCE_READY => {}
+        other => panic!("expected QuiesceReady, got {other:?}"),
+    }
+    let capture = pump
+        .snapshot_capture()
+        .expect("the drain accepted a snapshot");
+    assert_eq!(
+        capture
+            .sections
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["master", "ef", "adamw_m", "adamw_v"],
+        "the typed manifest declares the canonical masters + the replica-local continuity state \
+         (error feedback and AdamW moments)"
+    );
+    let total: usize = g.numels.iter().sum();
+    for (name, bytes) in &capture.sections {
+        assert_eq!(
+            bytes.len(),
+            total * 4,
+            "section `{name}` is the flat f32-le canonical layout"
+        );
+    }
+    let round0_digest: [u8; 16] = {
+        let published = pump.published();
+        published
+            .iter()
+            .find_map(|(_, _, frame)| match decode_publish(frame) {
+                Some((4, 0, bytes)) => Some(bytes.as_slice().try_into().expect("digest16")),
+                _ => None,
+            })
+            .expect("round-0 digest voiced before the drain")
+    };
+    assert_eq!(
+        round0_digest, g.digests[0],
+        "pre-snapshot round-0 digest matches the golden (the baseline for continuity)"
+    );
+
+    // -- instance 2: da_init -> da_migrate(restore) -> round 1 ------------------------------------
+    let identity2 = RunIdentity {
+        instance: 2, // never-reused (§8.1): the migrated incarnation
+        ..identity
+    };
+    let mut run_cfg2 = V2RunConfig::new(identity2, [0xa0; 32], g.cfg_bytes.clone(), Vec::new());
+    run_cfg2.compute_queue_depth = 1 << 20;
+    let sink2 = Arc::new(Mutex::new(MemorySink::new()));
+    let run2 = start_run_migrating(
+        &worker,
+        &wasm,
+        run_cfg2,
+        Box::new(sink2),
+        Some(MigrationInput {
+            capture,
+            restore: true,
+            migrate_fuel: None,
+        }),
+    )
+    .expect("start migrating");
+    let pump2 = run2.pump.clone();
+    let mut seq2 = 0u64;
+
+    for h in 0..STEPS_PER_ROUND {
+        pump2
+            .stage_payload(batch_wrapper(1, h, &tokens_for(1, h)), None)
+            .expect("stage batch");
+    }
+    deliver(&pump2, &round_open(1), &mut seq2);
+    wait_published(&pump2, 2); // theta(1) + commitment(1)
+
+    // The ef-restore pin: round 1's committed payload is a function of (theta, round_base, ef);
+    // master/round_base continuity alone would still digest-match after ingesting the RECORDED
+    // payload, so the commitment hash is the assertion that catches a dropped/zeroed ef.
+    assert_eq!(
+        commitment_hash(&pump2, 1).expect("round-1 commitment voiced"),
+        blake3_hash(&g.payloads[1]).0,
+        "the restored instance's round-1 committed payload must hash-match the recorded golden \
+         (error-feedback continuity across the migration)"
+    );
+
+    pump2
+        .stage_payload(update_wrapper(1, &g.payloads[1]), None)
+        .expect("stage update 1");
+    deliver(&pump2, &round_record(1, &g.payloads[1]), &mut seq2);
+    wait_published(&pump2, 3); // digest(1)
+
+    pump2
+        .stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
+        .expect("stop");
+    match run2.wait().expect("guest thread clean") {
+        RunEnd::Outcome(0) => {}
+        other => panic!("expected Outcome(0), got {other:?}"),
+    }
+
+    let final_digest: [u8; 16] = pump2
+        .published()
+        .iter()
+        .find_map(|(_, _, frame)| match decode_publish(frame) {
+            Some((4, 1, bytes)) => Some(bytes.as_slice().try_into().expect("digest16")),
+            _ => None,
+        })
+        .expect("round-1 digest voiced");
+    assert_eq!(
+        final_digest, g.digests[1],
+        "round 1 on the migrated instance must reproduce the recorded golden digest bit-exactly \
+         — checkpoint/restore continuity at LLaMA scale"
+    );
+    eprintln!(
+        "trainer_goldens[checkpoint]: quiesce -> typed manifest (master + ef + adamw moments) -> \
+         da_migrate -> round 1 reproduced the golden commitment hash + det digest"
+    );
 }
 
 // -- wgpu + cuda tiers (genuine compute@2 device coverage via op-journal replay) ------------------
