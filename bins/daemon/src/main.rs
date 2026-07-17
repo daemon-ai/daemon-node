@@ -3076,6 +3076,38 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         }
                     }
                 };
+                // The owner's aggregate resource ledgers (decisions D6). Default posture:
+                // conservative + FINITE, derived from the worker's hardware probe — never
+                // unbounded (an unbounded default lets the arbiter admit without limit). The
+                // explicit `[swarm.owner_budget] unbounded = true` opt-out routes back to the
+                // permissive posture. The probe is best-effort and bounded: on failure/timeout
+                // (e.g. no worker installed) the budget falls back to config + fixed finite floors,
+                // still finite (`OwnerBudget::from_config`).
+                let budget = if cfg.swarm.owner_budget.unbounded {
+                    daemon_vhc_node::OwnerBudget::unbounded()
+                } else {
+                    let probed = match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        worker.probe(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(hw)) => Some(hw),
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "swarm: hardware probe failed; deriving a conservative finite owner budget from config + floors");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!("swarm: hardware probe timed out; deriving a conservative finite owner budget from config + floors");
+                            None
+                        }
+                    };
+                    daemon_vhc_node::OwnerBudget::from_config(
+                        &cfg.swarm.owner_budget,
+                        probed.as_ref(),
+                        cfg.swarm.data_cache_gb,
+                    )
+                };
                 let svc = Arc::new(daemon_vhc_node::SwarmService::new(
                     daemon_vhc_node::SwarmServiceParts {
                         config: cfg.swarm.clone(),
@@ -3083,7 +3115,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         worker,
                         feed: Some(feed),
                         discovery,
-                        budget: None,
+                        budget: Some(budget),
                         worker_factory: Some(worker_factory),
                     },
                 ));

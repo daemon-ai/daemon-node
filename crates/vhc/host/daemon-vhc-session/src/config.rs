@@ -12,6 +12,8 @@
 //! exercises the figment layering as a dev-dependency, proving the `[swarm]` keys deserialize
 //! additively with the spec §10.6 defaults.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::PolicyMode;
@@ -110,6 +112,52 @@ impl Default for IrohConfig {
     }
 }
 
+/// The owner's aggregate resource grants for swarm participation (`[swarm.owner_budget]`,
+/// decisions D6) — the standing per-device + host-wide ledgers every admitted role-instance is
+/// charged against. Maps into the node's `daemon_vhc_node::OwnerBudget`.
+///
+/// **Default posture: conservative and FINITE, not unbounded.** When `[swarm]` is enabled and no
+/// explicit budget is configured, the node derives finite ledgers from the worker's hardware
+/// probe rather than granting everything (which would let the arbiter admit without limit). A
+/// field left at its zero/empty default is derived; a non-zero field overrides its ledger
+/// explicitly. The derivation the node applies (`OwnerBudget::from_config`):
+///
+/// - **device memory** — `device_memory_mb` if set; else a single `gpu:0` ledger sized to the
+///   probed dedicated VRAM (v2.0 fleets are single-accelerator-per-member); else, with no probe,
+///   a conservative 4 GiB floor.
+/// - **host RAM** — `host_ram_mb` if set; else the probed host RAM; else an 8 GiB floor.
+/// - **disk** — `disk_mb` if set; else the `[swarm].data_cache_gb` cache bound.
+/// - **uplink / downlink** — `net_{up,down}_kbps` if set; else the probed link rates; else a 1
+///   Gbit/s finite ceiling.
+/// - **duty** — `duty_pct` if set; else 100 (one full accelerator-duty).
+/// - **instances** — `max_instances` if set; else a conservative finite default
+///   (`OwnerBudget::DEFAULT_MAX_INSTANCES`).
+///
+/// `unbounded = true` is the explicit opt-out (grant everything — the pre-budget permissive
+/// posture), the only route back to unbounded ledgers; kept for single-tenant boxes and tests.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OwnerBudgetConfig {
+    /// Explicit opt-out: grant everything (the pre-budget permissive posture). Overrides all other
+    /// fields.
+    pub unbounded: bool,
+    /// Per-accelerator VRAM ledger in MiB, keyed by device id (e.g. `"gpu:0"`). Empty → derive
+    /// from the probed dedicated VRAM.
+    pub device_memory_mb: BTreeMap<String, u64>,
+    /// Host-RAM ledger in MiB. `0` → derive from the probed host RAM.
+    pub host_ram_mb: u64,
+    /// Disk/cache ledger in MiB. `0` → derive from `[swarm].data_cache_gb`.
+    pub disk_mb: u64,
+    /// Uplink ledger in kbit/s. `0` → derive from the probed uplink.
+    pub net_up_kbps: u64,
+    /// Downlink ledger in kbit/s. `0` → derive from the probed downlink.
+    pub net_down_kbps: u64,
+    /// Duty-cycle ledger in percent (100 = one full accelerator-duty). `0` → 100.
+    pub duty_pct: u32,
+    /// Max concurrently-admitted role-instances. `0` → a conservative finite default.
+    pub max_instances: u32,
+}
+
 /// The `[swarm]` config section (spec §10.6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -130,6 +178,10 @@ pub struct SwarmConfig {
     pub registry: RegistryConfig,
     /// iroh transport knobs.
     pub iroh: IrohConfig,
+    /// The owner's aggregate resource grants (decisions D6). Additive; the default is derived
+    /// conservatively + finitely from the hardware probe when `enabled` (never unbounded — see
+    /// [`OwnerBudgetConfig`]).
+    pub owner_budget: OwnerBudgetConfig,
 }
 
 impl Default for SwarmConfig {
@@ -144,6 +196,7 @@ impl Default for SwarmConfig {
             coordinator_allowlist: vec!["https://api.daemon.ai/api/v1/swarm".to_string()],
             registry: RegistryConfig::default(),
             iroh: IrohConfig::default(),
+            owner_budget: OwnerBudgetConfig::default(),
         }
     }
 }
@@ -200,6 +253,55 @@ mod tests {
         assert_eq!(cfg.data_cache_gb, 50);
         assert_eq!(cfg.default_policy.vram_cap_mb, 0);
         assert_eq!(cfg.iroh.relays, "default");
+    }
+
+    #[test]
+    fn owner_budget_section_extracts_additively_and_defaults_finite_derivable() {
+        // Default: no owner budget configured — every ledger is left for the node to derive
+        // conservatively + finitely from the probe (decisions D6); `unbounded` is off.
+        let cfg = SwarmConfig::default();
+        assert!(!cfg.owner_budget.unbounded);
+        assert!(cfg.owner_budget.device_memory_mb.is_empty());
+        assert_eq!(cfg.owner_budget.host_ram_mb, 0);
+        assert_eq!(cfg.owner_budget.duty_pct, 0);
+        assert_eq!(cfg.owner_budget.max_instances, 0);
+
+        // An explicit finite owner budget (incl. the per-device ledger map) extracts additively.
+        let toml = r#"
+            [swarm]
+            enabled = true
+
+            [swarm.owner_budget]
+            host_ram_mb = 16384
+            duty_pct = 50
+            max_instances = 2
+
+            [swarm.owner_budget.device_memory_mb]
+            "gpu:0" = 12000
+        "#;
+        let cfg: SwarmConfig = Figment::new()
+            .merge(Toml::string(toml))
+            .extract_inner("swarm")
+            .expect("extract [swarm]");
+        assert!(!cfg.owner_budget.unbounded);
+        assert_eq!(cfg.owner_budget.host_ram_mb, 16_384);
+        assert_eq!(cfg.owner_budget.duty_pct, 50);
+        assert_eq!(cfg.owner_budget.max_instances, 2);
+        assert_eq!(
+            cfg.owner_budget.device_memory_mb.get("gpu:0").copied(),
+            Some(12_000)
+        );
+
+        // The explicit opt-out extracts too.
+        let toml = r#"
+            [swarm.owner_budget]
+            unbounded = true
+        "#;
+        let cfg: SwarmConfig = Figment::new()
+            .merge(Toml::string(toml))
+            .extract_inner("swarm")
+            .expect("extract [swarm]");
+        assert!(cfg.owner_budget.unbounded);
     }
 
     #[test]

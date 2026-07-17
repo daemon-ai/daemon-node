@@ -2270,6 +2270,54 @@ mod tests {
 
     #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
     #[test]
+    fn swarm_owner_budget_section_round_trips() {
+        // Default: no owner budget configured (all zero/empty, `unbounded` off) — the node derives
+        // conservative FINITE ledgers from the hardware probe at boot (decisions D6).
+        let defaults =
+            NodeConfig::from_figment(Figment::from(Serialized::defaults(NodeConfig::default())))
+                .expect("defaults must extract");
+        assert!(!defaults.swarm.owner_budget.unbounded);
+        assert!(defaults.swarm.owner_budget.device_memory_mb.is_empty());
+        assert_eq!(defaults.swarm.owner_budget.host_ram_mb, 0);
+        assert_eq!(defaults.swarm.owner_budget.max_instances, 0);
+
+        figment::Jail::expect_with(|jail| {
+            // TOML layer: an explicit finite owner budget, incl. the per-device VRAM ledger map.
+            jail.create_file(
+                "cfg.toml",
+                "[swarm]\n\
+                 enabled = true\n\
+                 [swarm.owner_budget]\n\
+                 host_ram_mb = 32768\n\
+                 disk_mb = 102400\n\
+                 net_up_kbps = 50000\n\
+                 net_down_kbps = 200000\n\
+                 duty_pct = 80\n\
+                 max_instances = 3\n\
+                 [swarm.owner_budget.device_memory_mb]\n\
+                 \"gpu:0\" = 24000\n",
+            )?;
+            jail.set_env("DAEMON_CONFIG", "cfg.toml");
+            // Env wins over TOML for the same nested key (`__` split).
+            jail.set_env("DAEMON_SWARM__OWNER_BUDGET__MAX_INSTANCES", "5");
+            let cfg = NodeConfig::from_figment(NodeConfig::base_figment())
+                .unwrap_or_else(|e| panic!("[swarm.owner_budget] layering must extract: {e:#}"));
+            let ob = &cfg.swarm.owner_budget;
+            assert!(!ob.unbounded);
+            assert_eq!(ob.host_ram_mb, 32768);
+            assert_eq!(ob.disk_mb, 102_400);
+            assert_eq!(ob.net_up_kbps, 50_000);
+            assert_eq!(ob.net_down_kbps, 200_000);
+            assert_eq!(ob.duty_pct, 80);
+            // Env override wins over TOML.
+            assert_eq!(ob.max_instances, 5);
+            assert_eq!(ob.device_memory_mb.get("gpu:0").copied(), Some(24_000));
+            Ok(())
+        });
+    }
+
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
+    #[test]
     fn routing_rejects_transport_and_family_together() {
         figment::Jail::expect_with(|jail| {
             jail.create_file(

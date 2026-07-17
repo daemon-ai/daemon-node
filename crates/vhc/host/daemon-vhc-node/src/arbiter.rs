@@ -40,6 +40,9 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use daemon_vhc_session::config::OwnerBudgetConfig;
+use daemon_vhc_session::protocol::Hardware;
+
 /// A device-ledger key: the probe/owner-config accelerator identifier (e.g. `"gpu:0"`).
 pub type DeviceId = String;
 
@@ -179,8 +182,9 @@ pub struct OwnerBudget {
 }
 
 impl OwnerBudget {
-    /// A permissive budget (everything unbounded) — the compatibility default where no owner
-    /// grant is configured; the arbiter still enforces key uniqueness and teardown ordering.
+    /// A permissive budget (everything unbounded) — the explicit opt-out (`[swarm.owner_budget]
+    /// unbounded = true`) and the default in tests; the arbiter still enforces key uniqueness and
+    /// teardown ordering.
     #[must_use]
     pub fn unbounded() -> Self {
         Self {
@@ -191,6 +195,77 @@ impl OwnerBudget {
             net_down_bps: u64::MAX,
             duty_pct: u32::MAX,
             max_instances: u32::MAX,
+        }
+    }
+
+    /// The conservative finite ceiling on concurrently-admitted role-instances applied when the
+    /// owner does not configure `max_instances` (a finite bound — never `u32::MAX`).
+    pub const DEFAULT_MAX_INSTANCES: u32 = 4;
+
+    /// Map an `[swarm.owner_budget]` config + an optional hardware probe into the standing owner
+    /// ledgers (decisions D6). `cfg.unbounded` short-circuits to [`Self::unbounded`]; otherwise
+    /// every ledger left at its zero/empty default is derived **conservatively and finitely** —
+    /// from the probe where one is available, else a documented fixed floor — so an enabled node
+    /// with no configured budget still bounds admission rather than granting everything. The exact
+    /// per-field derivation is documented on [`OwnerBudgetConfig`]; `data_cache_gb` is the
+    /// `[swarm]` cache bound the disk ledger defaults to.
+    #[must_use]
+    pub fn from_config(cfg: &OwnerBudgetConfig, hw: Option<&Hardware>, data_cache_gb: u32) -> Self {
+        const MIB: u64 = 1 << 20;
+        // Conservative finite floors when neither config nor probe supplies a value.
+        const FLOOR_DEVICE_MB: u64 = 4096; // 4 GiB
+        const FLOOR_HOST_MB: u64 = 8192; // 8 GiB
+        const FLOOR_NET_KBPS: u64 = 1_000_000; // 1 Gbit/s finite ceiling
+
+        if cfg.unbounded {
+            return Self::unbounded();
+        }
+
+        // `cfg` wins when set (> 0); else the probed value when present (> 0); else the floor.
+        let pick = |configured: u64, probed: Option<u64>, floor: u64| -> u64 {
+            if configured > 0 {
+                configured
+            } else {
+                probed.filter(|v| *v > 0).unwrap_or(floor)
+            }
+        };
+
+        // Device ledgers: explicit config wins; else a single `gpu:0` ledger sized to the probed
+        // dedicated VRAM (v2.0 fleets are single-accelerator-per-member, spec §10 FT-4); else the
+        // conservative floor.
+        let device_memory: BTreeMap<DeviceId, u64> = if cfg.device_memory_mb.is_empty() {
+            let vram_mb = hw
+                .map(|h| h.vram_mb)
+                .filter(|v| *v > 0)
+                .unwrap_or(FLOOR_DEVICE_MB);
+            BTreeMap::from([(String::from("gpu:0"), vram_mb.saturating_mul(MIB))])
+        } else {
+            cfg.device_memory_mb
+                .iter()
+                .map(|(dev, mb)| (dev.clone(), mb.saturating_mul(MIB)))
+                .collect()
+        };
+
+        Self {
+            device_memory,
+            host_ram: pick(cfg.host_ram_mb, hw.map(|h| h.ram_mb), FLOOR_HOST_MB)
+                .saturating_mul(MIB),
+            disk: pick(
+                cfg.disk_mb,
+                Some(u64::from(data_cache_gb).saturating_mul(1024)),
+                0,
+            )
+            .saturating_mul(MIB),
+            net_up_bps: pick(cfg.net_up_kbps, hw.map(|h| h.up_kbps), FLOOR_NET_KBPS)
+                .saturating_mul(1000),
+            net_down_bps: pick(cfg.net_down_kbps, hw.map(|h| h.down_kbps), FLOOR_NET_KBPS)
+                .saturating_mul(1000),
+            duty_pct: if cfg.duty_pct > 0 { cfg.duty_pct } else { 100 },
+            max_instances: if cfg.max_instances > 0 {
+                cfg.max_instances
+            } else {
+                Self::DEFAULT_MAX_INSTANCES
+            },
         }
     }
 }
