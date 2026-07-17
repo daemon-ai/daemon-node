@@ -273,6 +273,44 @@ async fn supervisor_probe_reports_major2_and_the_frozen_vocabulary() {
     sup.shutdown().await;
 }
 
+/// WS6 regression (the crash-loop meltdown fix): the shipped `[swarm]` config default names the
+/// REAL worker binary, and a binary of that name speaks `Event::Ready` when the supervisor spawns
+/// it. Before the v1-retirement the default was `"daemon-vhc"` — the Wave-0 scaffold that printed a
+/// version line and exited, so a stock `[swarm] enabled` node crash-looped its supervisor on spawn
+/// (the negative half of this contract is the `supervisor_meltdown` unit test over a bogus path).
+/// `Worker::spawn` blocks on `Event::Ready`, so a successful `probe()` here proves the configured
+/// default resolves to a `Ready`-speaking worker, not a self-exiting stub.
+#[tokio::test]
+async fn configured_default_worker_path_names_a_binary_that_speaks_ready() {
+    // The product default the node feeds to `TrainClientConfig::new` (bins/daemon/src/main.rs).
+    let default_path = daemon_vhc_session::config::SwarmConfig::default().worker_path;
+    assert_eq!(
+        default_path, "daemon-vhc-worker",
+        "the shipped default must name the real worker binary, not the retired `daemon-vhc` scaffold"
+    );
+    // The binary cargo built for this `[[bin]]` target — its file name is exactly the default the
+    // node would look up on `PATH`, tying the config contract to a binary that actually exists.
+    let bin = worker_bin();
+    assert_eq!(
+        Path::new(&bin).file_name().and_then(|s| s.to_str()),
+        Some(default_path.as_str()),
+        "the built worker binary's name must equal the configured `worker_path` default"
+    );
+
+    // Spawn it exactly as the node would; the supervisor blocks until the worker reports `Ready`.
+    let module = module_path("tiny_llama_v2.wasm");
+    let sup = supervisor_for(&module);
+    sup.probe()
+        .await
+        .expect("the configured default worker reaches Ready and answers a probe");
+    assert_eq!(
+        sup.restarts().await,
+        0,
+        "a healthy default never triggers a respawn"
+    );
+    sup.shutdown().await;
+}
+
 // -- THE SUNSET REGRESSION over the real binary (the flipped A0's protocol twin) ------------------
 
 /// Assessing the pinned **v1** module post-sunset yields an INELIGIBLE `Assessed` verdict whose

@@ -164,7 +164,7 @@ pub struct OwnerBudgetConfig {
 pub struct SwarmConfig {
     /// Master switch (default off; the feature-gated worker must also be installed).
     pub enabled: bool,
-    /// Path to the `daemon-vhc-host` worker binary (resolved like the `daemon-infer` worker).
+    /// Path to the `daemon-vhc-worker` binary (resolved like the `daemon-infer` worker).
     pub worker_path: String,
     /// Data/artifact cache budget in GiB (the artifact LRU bound, §8, RUN-4).
     pub data_cache_gb: u32,
@@ -189,7 +189,10 @@ impl Default for SwarmConfig {
         // Mirrors the spec §10.6 TOML defaults verbatim.
         Self {
             enabled: false,
-            worker_path: "daemon-vhc".to_string(),
+            // The real training worker binary (`crates/vhc/bins/daemon-vhc-worker`). The pre-A2
+            // Wave-0 `daemon-vhc` scaffold that this defaulted to only printed a version line and
+            // exited, so a stock `[swarm] enabled` node crash-looped its supervisor on spawn.
+            worker_path: "daemon-vhc-worker".to_string(),
             data_cache_gb: 50,
             default_policy: SwarmPolicyConfig::default(),
             module_trust: ModuleTrust::Signed,
@@ -211,7 +214,7 @@ mod tests {
     fn defaults_match_spec() {
         let cfg = SwarmConfig::default();
         assert!(!cfg.enabled);
-        assert_eq!(cfg.worker_path, "daemon-vhc");
+        assert_eq!(cfg.worker_path, "daemon-vhc-worker");
         assert_eq!(cfg.data_cache_gb, 50);
         assert_eq!(cfg.default_policy.mode, PolicyMode::Idle);
         assert_eq!(cfg.default_policy.duty_cycle_pct, 100);
@@ -249,7 +252,7 @@ mod tests {
         assert_eq!(cfg.default_policy.duty_cycle_pct, 40);
         assert_eq!(cfg.default_policy.schedule.as_deref(), Some("0 2 * * *"));
         // Omitted keys keep their defaults.
-        assert_eq!(cfg.worker_path, "daemon-vhc");
+        assert_eq!(cfg.worker_path, "daemon-vhc-worker");
         assert_eq!(cfg.data_cache_gb, 50);
         assert_eq!(cfg.default_policy.vram_cap_mb, 0);
         assert_eq!(cfg.iroh.relays, "default");
