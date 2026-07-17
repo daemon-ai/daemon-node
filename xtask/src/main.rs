@@ -865,7 +865,7 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                     && from_role != Some("host")
                     && from_role != Some("contracts");
                 if sim_native_harness {
-                    // allowed: a native harness (e.g. bins/swarm-local, tests/*) linking the
+                    // allowed: a native harness (e.g. the vhc-sim examples, tests/*) linking the
                     // SDK-side sim — its whole purpose (refactor §6/§11).
                 } else if is_exception(&from, &to) {
                     seen.insert((from.clone(), to.clone()));

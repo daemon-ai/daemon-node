@@ -15179,24 +15179,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "swarm-local"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "ciborium",
- "clap",
- "daemon-vhc-proto",
- "daemon-vhc-session",
- "daemon-vhc-sim",
- "daemon-vhc-supervisor",
- "serde",
- "serde_json",
- "tokio",
- "toml 0.8.23",
-]
-
-[[package]]
 name = "symphonia"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
