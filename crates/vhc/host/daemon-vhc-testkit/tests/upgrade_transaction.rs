@@ -31,14 +31,11 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_abi::{
-    DEFAULT_CHANNEL_CONTROL_ID, OUTCOME_QUIESCE_READY, QUIESCE_REASON_UPGRADE,
-    STOP_REASON_RUN_COMPLETE,
-};
+use daemon_vhc_abi::{DEFAULT_CHANNEL_CONTROL_ID, OUTCOME_QUIESCE_READY, STOP_REASON_RUN_COMPLETE};
 use daemon_vhc_host::v2::{
-    admit_v2, start_run, start_run_migrating, DeviceProfile, EnvelopeRoleGrants, MemorySink,
-    MigrationInput, OwnerPolicy, ParticipationLane, PumpHandle, RunEnd, RunIdentity, SinkEntry,
-    SnapshotCapture, SpooledFrame, V2Run, V2RunConfig,
+    replay_v2, replay_v2_migrating, start_run, DeviceProfile, EnvelopeRoleGrants, MemorySink,
+    OwnerPolicy, ParticipationLane, PumpHandle, ReplayEnd, ReplayMigration, ReplayScript, RunEnd,
+    RunIdentity, SinkEntry, V2RunConfig,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::envelope::{Access, DeviceMinimums};
@@ -52,9 +49,9 @@ use daemon_vhc_proto::{
     AdmittedQuotas, BufferReq, CertError, EpochDescriptor, Hash, PeerId, RunKeyCertificate,
     SigningKey, TransitionChain, UpgradeAuthority, UpgradeRecord,
 };
-use daemon_vhc_sdk_consensus::checkpoint::{CheckpointManifest, SectionKind};
 use daemon_vhc_session::upgrade::{
-    run_local_upgrade, LeaveReason, LocalUpgradeOutcome, SnapshotSeam, StepFailure, UpgradeSteps,
+    run_local_upgrade, ActivatedInstance, LeaveReason, LiveUpgradeInputs, LiveUpgradeSteps,
+    LocalUpgradeOutcome,
 };
 
 // -- guest build harness (the established testkit pattern) ----------------------------------------
@@ -295,226 +292,14 @@ fn decode_signed_frame(frame: &[u8]) -> (u64, [u8; 32], [u8; 32], Vec<u8>) {
     (epoch, module, sender, payload)
 }
 
-// -- the UpgradeSteps adapter over the real host primitives -----------------------------------------
-
-/// The production-shaped step adapter: each `UpgradeSteps` method wires onto the real host
-/// primitive the spec names — `PumpHandle::quiesce` + `snapshot_capture` (steps 1–2), `admit_v2`
-/// (step 3), `start_run_migrating` (steps 4–5), spooled-frame drain (step 6).
-struct WasmSteps<'w> {
-    worker: &'w Worker,
-    role: String,
-    // the OLD live instance
-    old_run: Option<V2Run>,
-    old_pump: PumpHandle,
-    old_sink: Arc<Mutex<MemorySink>>,
-    old_module: Hash,
-    // a frame that arrives DURING the drain (must spool, §4.4)
-    late_frame: Option<(u64, [u8; 32], Vec<u8>)>,
-    // the NEW module + its admission inputs
-    new_wasm: Vec<u8>,
-    new_identity: RunIdentity,
-    new_signing_seed: [u8; 32],
-    new_grants_bytes: Vec<u8>,
-    lane: ParticipationLane,
-    device: DeviceProfile,
-    owner: OwnerPolicy,
-    envelope_grants: EnvelopeRoleGrants,
-    // per-attempt migrate fuel (the crash drill schedules a starvation then a real budget)
-    migrate_fuel: Vec<Option<u64>>,
-    attempt: usize,
-    // captured state
-    capture: Option<SnapshotCapture>,
-    spooled: Vec<SpooledFrame>,
-    pending: Option<(V2Run, PumpHandle, Arc<Mutex<MemorySink>>)>,
-    activated: Option<(V2Run, PumpHandle, Arc<Mutex<MemorySink>>)>,
-    migrate_failures: Vec<String>,
-    left: Option<String>,
-}
-
-impl WasmSteps<'_> {
-    fn new_instance_sinks(&self) -> Arc<Mutex<MemorySink>> {
-        Arc::new(Mutex::new(MemorySink::new()))
-    }
-}
-
-impl UpgradeSteps for WasmSteps<'_> {
-    fn quiesce(&mut self, deadline_ms: u64) -> Result<SnapshotSeam, StepFailure> {
-        self.old_pump
-            .quiesce(QUIESCE_REASON_UPGRADE, deadline_ms)
-            .map_err(|e| StepFailure::new(format!("quiesce delivery: {e}")))?;
-        // A frame arriving DURING the drain: frozen — it spools, never reaching the draining
-        // instance (§4.4), and drains into the new instance at activation (§10.3 step 6).
-        if let Some((seq, sender, payload)) = self.late_frame.take() {
-            self.old_pump
-                .deliver_frame(
-                    DEFAULT_CHANNEL_CONTROL_ID,
-                    seq,
-                    sender,
-                    payload,
-                    b"late-original-signed-frame".to_vec(),
-                )
-                .map_err(|e| StepFailure::new(format!("late frame: {e}")))?;
-        }
-        let run = self.old_run.take().expect("old instance is live");
-        match run.wait() {
-            Ok(RunEnd::Outcome(code)) if u64::from(code) == u64::from(OUTCOME_QUIESCE_READY) => {}
-            other => {
-                return Err(StepFailure::new(format!(
-                    "drain did not quiesce: {other:?}"
-                )))
-            }
-        }
-        let capture = self
-            .old_pump
-            .snapshot_capture()
-            .ok_or_else(|| StepFailure::new("no accepted snapshot in the drain"))?;
-        self.spooled = self.old_pump.take_spooled_frames();
-        // The labelled seam, in E1's typed-manifest format (swapped in at the E1 merge, as the
-        // cross-track design fixed): the captured module-state section, content-addressed, plus
-        // the journal cursor — "checkpointing and migration are one discipline".
-        let journal_cursor = self.old_sink.lock().expect("sink").entries.len() as u64;
-        let mut builder = CheckpointManifest::builder(
-            Hash(self.new_identity.run_id),
-            0, // the snapshot captures the OLD epoch's state, produced by the OLD module
-            0,
-            self.old_module,
-            daemon_vhc_proto::StateDigest([0u8; 16]),
-        );
-        for (name, bytes) in &capture.sections {
-            builder = builder.section(name.clone(), SectionKind::Module, 1, bytes);
-        }
-        let manifest = builder
-            .section(
-                "journal-position",
-                SectionKind::JournalPosition,
-                1,
-                &journal_cursor.to_le_bytes(),
-            )
-            .build()
-            .map_err(|e| StepFailure::new(format!("seam manifest: {e:?}")))?;
-        let seam = SnapshotSeam {
-            manifest,
-            journal_cursor,
-        };
-        self.capture = Some(capture);
-        Ok(seam)
-    }
-
-    fn readmit(
-        &mut self,
-        new_module: Hash,
-        new_grants_hash: Hash,
-    ) -> Result<AdmittedQuotas, StepFailure> {
-        // The committed record's grants anchor: the re-derived grants document must hash to it.
-        if blake3_hash(&self.new_grants_bytes) != new_grants_hash {
-            return Err(StepFailure::new(
-                "re-derived grants do not match the committed record's grants_hash",
-            ));
-        }
-        // Owner-law re-check (§10.3 step 3): the full funnel over the NEW module.
-        let admission = admit_v2(
-            self.worker,
-            &self.new_wasm,
-            Some(new_module.as_bytes()),
-            &[],
-            &self.new_grants_bytes,
-            &self.lane,
-            &self.device,
-            &self.owner,
-            None,
-            Some(&self.envelope_grants),
-        )
-        .map_err(|refusal| StepFailure::new(refusal.to_string()))?;
-        admission
-            .quotas
-            .ok_or_else(|| StepFailure::new("envelope-grants admission yields quotas"))
-    }
-
-    fn migrate(&mut self, seam: &SnapshotSeam) -> Result<(), StepFailure> {
-        let capture = self.capture.clone().expect("quiesce captured");
-        // The typed seam content-addresses exactly the captured module state (E1's format).
-        let module_section = seam
-            .manifest
-            .section(SectionKind::Module)
-            .expect("seam carries the module-state section");
-        assert_eq!(
-            module_section.hash,
-            blake3_hash(&capture.sections[0].1),
-            "the seam's module section content-addresses the captured snapshot"
-        );
-        let fuel = self.migrate_fuel.get(self.attempt).copied().flatten();
-        self.attempt += 1;
-        let sink = self.new_instance_sinks();
-        let cfg = V2RunConfig::new(
-            self.new_identity.clone(),
-            self.new_signing_seed,
-            Vec::new(),
-            self.new_grants_bytes.clone(),
-        );
-        let run = start_run_migrating(
-            self.worker,
-            &self.new_wasm,
-            cfg,
-            Box::new(sink.clone()),
-            Some(MigrationInput {
-                capture,
-                restore: true,
-                migrate_fuel: fuel,
-            }),
-        )
-        .map_err(|e| StepFailure::new(format!("start_run_migrating: {e}")))?;
-        let pump = run.pump.clone();
-        // The migrated module announces the restored state as its first publish; a failed
-        // migrate tears the instance down before da_run (§10.3 step 5).
-        let ok = wait_for(Duration::from_secs(30), || {
-            !pump.published().is_empty() || run.is_finished()
-        });
-        assert!(ok, "migrating instance neither published nor tore down");
-        if pump.published().is_empty() {
-            let end = run.wait().map_err(|e| StepFailure::new(e.to_string()))?;
-            let detail = format!("migrate step failed: {end:?}");
-            self.migrate_failures.push(detail.clone());
-            return Err(StepFailure::new(detail));
-        }
-        self.pending = Some((run, pump, sink));
-        Ok(())
-    }
-
-    fn activate(&mut self) -> Result<(), StepFailure> {
-        let (run, pump, sink) = self.pending.take().expect("migrate produced an instance");
-        // Spooled frames drain into the new instance (§10.3 step 6).
-        for f in self.spooled.drain(..) {
-            pump.deliver_frame(
-                f.channel,
-                f.seq,
-                f.sender,
-                f.payload,
-                f.original_signed_frame,
-            )
-            .map_err(|e| StepFailure::new(format!("spool drain: {e}")))?;
-        }
-        self.activated = Some((run, pump, sink));
-        Ok(())
-    }
-
-    fn rollback(&mut self, _seam: &SnapshotSeam) {
-        // A failed migrate already tore the new instance down (guest-thread-owned teardown); the
-        // snapshot capture IS the recovery point — nothing else to restore locally.
-        if let Some((run, pump, _)) = self.pending.take() {
-            let _ = pump.stop(STOP_REASON_RUN_COMPLETE);
-            let _ = run.wait();
-        }
-    }
-
-    fn leave(&mut self, reason: &LeaveReason) {
-        self.left = Some(reason.to_string());
-    }
-}
-
 // -- drill assembly ---------------------------------------------------------------------------------
+//
+// The step adapter under test is the PRODUCTION one — `daemon_vhc_session::upgrade::LiveUpgradeSteps`
+// (promoted out of this file): each `UpgradeSteps` method wires onto the real host primitive the
+// spec names. These drills drive it through `run_local_upgrade` over real migratable wasm guests.
 
 struct Drill<'w> {
-    steps: WasmSteps<'w>,
+    steps: LiveUpgradeSteps<'w>,
     target: EpochDescriptor,
     chain_epoch_before: u64,
     grants_hash: Hash,
@@ -523,6 +308,9 @@ struct Drill<'w> {
     old_sink: Arc<Mutex<MemorySink>>,
     run_id: Hash,
     new_module: Hash,
+    old_module: Hash,
+    old_config: Vec<u8>,
+    new_grants_bytes: Vec<u8>,
     old_seed: [u8; 32],
     new_seed: [u8; 32],
 }
@@ -561,6 +349,7 @@ fn assemble<'w>(
         module: old_module.0,
     };
     let old_grants_bytes = to_canonical_vec(&genesis.roles[role].grants).expect("grants cbor");
+    let old_config_kept = old_config.clone();
     let mut old_cfg = V2RunConfig::new(old_identity, old_seed, old_config, old_grants_bytes);
     old_cfg.migration_max_sections = 4;
     old_cfg.migration_max_section_bytes = 1 << 12;
@@ -617,14 +406,13 @@ fn assemble<'w>(
             .expect("epoch-0 quotas derive");
 
     let new_seed = [22u8; 32];
-    let steps = WasmSteps {
+    let steps = LiveUpgradeSteps::new(LiveUpgradeInputs {
         worker,
         role: role.to_string(),
-        old_run: Some(old_run),
+        old_run,
         old_pump: old_pump.clone(),
         old_sink: old_sink.clone(),
         old_module,
-        late_frame: late_frame.then(|| (frames, sender, b"late".to_vec())),
         new_wasm,
         new_identity: RunIdentity {
             run_id: run_id.0,
@@ -634,7 +422,7 @@ fn assemble<'w>(
             module: new_module.0,
         },
         new_signing_seed: new_seed,
-        new_grants_bytes,
+        new_grants_bytes: new_grants_bytes.clone(),
         lane,
         device: DeviceProfile::default(),
         owner: OwnerPolicy {
@@ -647,14 +435,8 @@ fn assemble<'w>(
             run_artifacts,
         },
         migrate_fuel,
-        attempt: 0,
-        capture: None,
-        spooled: Vec::new(),
-        pending: None,
-        activated: None,
-        migrate_failures: Vec::new(),
-        left: None,
-    };
+        drain_window_frame: late_frame.then(|| (frames, sender, b"late".to_vec())),
+    });
     Drill {
         steps,
         target,
@@ -665,6 +447,9 @@ fn assemble<'w>(
         old_sink,
         run_id,
         new_module,
+        old_module,
+        old_config: old_config_kept,
+        new_grants_bytes,
         old_seed,
         new_seed,
     }
@@ -674,16 +459,36 @@ fn counter_of(payload: &[u8]) -> u64 {
     u64::from_le_bytes(payload.try_into().expect("8-byte counter"))
 }
 
-/// Stop the activated instance cleanly and return its journal entries.
-fn finish_activated(steps: &mut WasmSteps<'_>) -> Vec<SinkEntry> {
-    let (run, pump, sink) = steps.activated.take().expect("activated instance");
+/// The `(channel, seq, payload_hash)` triples of every `Publish` (tag 4) in a journal segment, in
+/// order — what a replay's decisions are compared against for bit-exactness.
+fn publishes_of(entries: &[SinkEntry]) -> Vec<(u64, u64, [u8; 32])> {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            SinkEntry::Publish {
+                channel,
+                seq,
+                payload_hash,
+                ..
+            } => Some((*channel, *seq, *payload_hash)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Stop the activated instance cleanly and return **this incarnation's** journal records — the
+/// records the continued journal appended after the fence cursor (`cursor` = the old incarnation's
+/// journal length; the new incarnation's sink continues from there, `MemorySink::continuing`).
+fn finish_activated(steps: &mut LiveUpgradeSteps<'_>, cursor: usize) -> Vec<SinkEntry> {
+    let ActivatedInstance { run, pump, journal } =
+        steps.take_activated().expect("activated instance");
     pump.stop(STOP_REASON_RUN_COMPLETE).expect("stop");
     match run.wait() {
         Ok(RunEnd::Outcome(0)) => {}
         other => panic!("new instance did not stop cleanly: {other:?}"),
     }
-    let entries = sink.lock().expect("sink").entries.clone();
-    entries
+    let entries = journal.lock().expect("sink").entries.clone();
+    entries[cursor..].to_vec()
 }
 
 // -- drill 1: live epoch-fenced worker upgrade without restart ---------------------------------------
@@ -723,7 +528,7 @@ fn worker_upgrade_live_epoch_fenced_without_restart() {
 
     // Continuity across the fence, without restart: the new instance's FIRST publish is the
     // restored counter (3 pre-fence frames), and the spooled late frame drained into it (4).
-    let (_, pump, _) = drill.steps.activated.as_ref().expect("activated");
+    let pump = drill.steps.activated().expect("activated").pump.clone();
     assert!(
         wait_for(Duration::from_secs(30), || pump.published().len() >= 2),
         "restored announcement + drained late frame"
@@ -757,7 +562,10 @@ fn worker_upgrade_live_epoch_fenced_without_restart() {
     )));
 
     // The NEW journal opens with tag-13 reason 2 (upgrade-activation), before da_init (tag 11).
-    let new_entries = finish_activated(&mut drill.steps);
+    // The new incarnation CONTINUES the old journal (seeded at the fence cursor), so slice this
+    // incarnation's records from the cursor (= the old incarnation's journal length).
+    let cursor = old_entries.len();
+    let new_entries = finish_activated(&mut drill.steps, cursor);
     let inst_pos = new_entries
         .iter()
         .position(|e| matches!(e, SinkEntry::Instantiation { reason: 2, .. }))
@@ -774,7 +582,10 @@ fn worker_upgrade_live_epoch_fenced_without_restart() {
     assert!(new_entries
         .iter()
         .any(|e| matches!(e, SinkEntry::ReadBack { kind: 3, .. })));
-    assert!(drill.steps.left.is_none(), "the worker never left the run");
+    assert!(
+        drill.steps.left().is_none(),
+        "the worker never left the run"
+    );
 }
 
 // -- drill 2: coordinator self-upgrade with signer continuity ----------------------------------------
@@ -818,7 +629,7 @@ fn coordinator_self_upgrade_carries_signer_continuity() {
     );
 
     // The new instance signs as the NEW per-run key under epoch 1 — observed from its frames.
-    let (_, pump, _) = drill.steps.activated.as_ref().expect("activated");
+    let pump = drill.steps.activated().expect("activated").pump.clone();
     assert!(wait_for(Duration::from_secs(30), || !pump
         .published()
         .is_empty()));
@@ -883,7 +694,8 @@ fn coordinator_self_upgrade_carries_signer_continuity() {
         Err(CertError::NoCertifiedChain)
     );
 
-    finish_activated(&mut drill.steps);
+    let cursor = drill.old_sink.lock().expect("sink").entries.len();
+    finish_activated(&mut drill.steps, cursor);
 }
 
 // -- drill 3: mid-migration crash recovers by local rollback-and-retry -------------------------------
@@ -921,16 +733,16 @@ fn mid_migration_crash_recovers_by_local_rollback_and_retry() {
         "the second attempt activated after the local rollback"
     );
     // The crash was the typed migrate-budget interruption, mid-migration.
-    assert_eq!(drill.steps.migrate_failures.len(), 1);
+    assert_eq!(drill.steps.migrate_failures().len(), 1);
     assert!(
-        drill.steps.migrate_failures[0].contains("MigrateBudget"),
+        drill.steps.migrate_failures()[0].contains("MigrateBudget"),
         "attempt 0 fell to the migrate budget: {}",
-        drill.steps.migrate_failures[0]
+        drill.steps.migrate_failures()[0]
     );
     // The chain never rolled back; the retry activated the SAME already-committed epoch, and
     // the restored state is intact (5 pre-fence frames).
     assert_eq!(drill.chain_epoch_before, 1);
-    let (_, pump, _) = drill.steps.activated.as_ref().expect("activated");
+    let pump = drill.steps.activated().expect("activated").pump.clone();
     assert!(wait_for(Duration::from_secs(30), || !pump
         .published()
         .is_empty()));
@@ -941,7 +753,8 @@ fn mid_migration_crash_recovers_by_local_rollback_and_retry() {
         5,
         "state restored intact on the retry"
     );
-    finish_activated(&mut drill.steps);
+    let cursor = drill.old_sink.lock().expect("sink").entries.len();
+    finish_activated(&mut drill.steps, cursor);
 }
 
 // -- drill 4: the grant-expansion refusal (negative) --------------------------------------------------
@@ -988,9 +801,9 @@ fn grant_expanding_upgrade_fails_closed_and_the_worker_exits() {
     }
     // Fail closed means fail CLOSED: the worker exited; no new instance was ever started; the
     // old epoch was not resumed (the old instance stays quiesced).
-    assert!(drill.steps.left.is_some(), "the worker exited the run");
-    assert!(drill.steps.pending.is_none() && drill.steps.activated.is_none());
-    assert_eq!(drill.steps.attempt, 0, "migrate never ran");
+    assert!(drill.steps.left().is_some(), "the worker exited the run");
+    assert!(!drill.steps.has_pending() && drill.steps.activated().is_none());
+    assert_eq!(drill.steps.attempts(), 0, "migrate never ran");
     // The old instance's journal ends at the QuiesceReady terminal — never resumed.
     let old_entries = drill.old_sink.lock().expect("sink").entries.clone();
     assert!(matches!(
@@ -999,7 +812,7 @@ fn grant_expanding_upgrade_fails_closed_and_the_worker_exits() {
             if *o == u64::from(OUTCOME_QUIESCE_READY)
     ));
     // Unused fields hold the drill shape together even on the refused path.
-    let _ = (&drill.old_pump, &drill.steps.role);
+    let _ = (&drill.old_pump, drill.steps.role());
 }
 
 // -- drill 5: drain-deadline enforcement — a quiesce-ignoring module is forcibly interrupted ---------
@@ -1054,9 +867,9 @@ fn quiesce_ignoring_module_hits_the_deadline_and_the_worker_leaves() {
         elapsed < Duration::from_secs(5),
         "forced interruption was prompt, took {elapsed:?}"
     );
-    assert!(drill.steps.left.is_some(), "the worker exited the run");
-    assert!(drill.steps.pending.is_none() && drill.steps.activated.is_none());
-    assert_eq!(drill.steps.attempt, 0, "migrate never ran");
+    assert!(drill.steps.left().is_some(), "the worker exited the run");
+    assert!(!drill.steps.has_pending() && drill.steps.activated().is_none());
+    assert_eq!(drill.steps.attempts(), 0, "migrate never ran");
     // The old journal ends at the tag-9 terminal TRAP fact (kind 1) — the forced interruption
     // is journaled like any wall-clock watchdog trap; replay never re-derives it.
     let old_entries = drill.old_sink.lock().expect("sink").entries.clone();
@@ -1073,4 +886,197 @@ fn quiesce_ignoring_module_hits_the_deadline_and_the_worker_leaves() {
     );
     // No snapshot was ever accepted: the drain produced nothing durable to roll back to.
     assert!(drill.old_pump.snapshot_capture().is_none());
+}
+
+// -- journal-cursor continuation: the run journal is one gapless log across the upgrade fence, and
+//    it replays bit-exact end to end -----------------------------------------------------------
+
+#[test]
+fn upgrade_journal_continues_from_cursor_and_replays_across_the_boundary_bit_exact() {
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    // 3 pre-fence frames + a frame arriving DURING the drain (spools, drains into the new instance
+    // at activation, §10.3 step 6).
+    let mut drill = assemble(
+        &worker,
+        "worker",
+        3,
+        Vec::new(),
+        &role_grants(4096),
+        vec![],
+        true,
+    );
+
+    let outcome = run_local_upgrade(
+        &drill.target,
+        "worker",
+        drill.grants_hash,
+        &drill.prev_quotas,
+        5_000,
+        1,
+        &mut drill.steps,
+    );
+    assert_eq!(
+        outcome,
+        LocalUpgradeOutcome::Activated {
+            epoch: 1,
+            retries: 0
+        }
+    );
+
+    // The durable snapshot the old incarnation produced (available to a replay verifier, §10.2) —
+    // the replay of the new incarnation drives `da_migrate` from it.
+    let capture = drill
+        .old_pump
+        .snapshot_capture()
+        .expect("accepted snapshot");
+
+    // Drive two more frames into the NEW incarnation (post-fence continuity), then stop cleanly.
+    let sender = [42u8; 32];
+    let pump = drill.steps.activated().expect("activated").pump.clone();
+    assert!(
+        wait_for(Duration::from_secs(30), || pump.published().len() >= 2),
+        "restored announcement + drained drain-window frame"
+    );
+    for seq in 100..102 {
+        pump.deliver_frame(
+            DEFAULT_CHANNEL_CONTROL_ID,
+            seq,
+            sender,
+            b"tick".to_vec(),
+            b"post-fence-signed-frame".to_vec(),
+        )
+        .expect("post-fence frame accepted");
+    }
+    assert!(
+        wait_for(Duration::from_secs(30), || pump.published().len() >= 4),
+        "the new incarnation counts the post-fence frames"
+    );
+    // The restored announcement is the old counter (3); the new incarnation resumes counting.
+    let restored = counter_of(&decode_signed_frame(&pump.published()[0].2).3);
+    assert_eq!(
+        restored, 3,
+        "the new incarnation resumed from the migrated state"
+    );
+
+    // The CONTINUED run journal + the fence cursor (= the old incarnation's journal length).
+    let cursor = drill.old_sink.lock().expect("sink").entries.len();
+    let ActivatedInstance { run, pump, journal } = drill.steps.take_activated().expect("activated");
+    pump.stop(STOP_REASON_RUN_COMPLETE).expect("stop");
+    match run.wait() {
+        Ok(RunEnd::Outcome(0)) => {}
+        other => panic!("new incarnation did not stop cleanly: {other:?}"),
+    }
+    let full = journal.lock().expect("sink").entries.clone();
+
+    // (1) GAPLESS: the continuation begins exactly at the cursor — the prefix is byte-for-byte the
+    // old incarnation's own journal, and the suffix opens with the new run header then the tag-13
+    // reason-2 (upgrade-activation) instantiation, before `da_init`.
+    assert!(
+        cursor > 0 && cursor < full.len(),
+        "the new incarnation appended after the cursor"
+    );
+    let prefix = full[..cursor].to_vec();
+    let suffix = full[cursor..].to_vec();
+    assert_eq!(
+        prefix,
+        drill.old_sink.lock().expect("sink").entries.clone(),
+        "the prefix is the old incarnation journal verbatim (no gap at the seam)"
+    );
+    assert!(
+        matches!(suffix.first(), Some(SinkEntry::RunHeader { .. })),
+        "the new incarnation opens its own run header"
+    );
+    let inst = suffix
+        .iter()
+        .position(|e| matches!(e, SinkEntry::Instantiation { reason: 2, .. }))
+        .expect("tag-13 reason 2 opens the new incarnation");
+    let init = suffix
+        .iter()
+        .position(|e| matches!(e, SinkEntry::Init { .. }))
+        .expect("da_init");
+    assert!(inst < init, "instantiation before da_init at the seam");
+
+    // (2) NO DOUBLE-DELIVERY: the pre-fence delivered frames live ONLY in the prefix; the
+    // drain-window (spooled) frame + the post-fence frames live ONLY in the suffix. A replayed
+    // journal that re-delivered a pre-fence frame into the new incarnation would over-count.
+    let old_pubs = publishes_of(&prefix);
+    let new_pubs = publishes_of(&suffix);
+    // The old incarnation published one frame per pre-fence delivery (3), dense from seq 0.
+    assert_eq!(
+        old_pubs.iter().map(|p| p.1).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "the old incarnation's dense channel seq"
+    );
+    // The new incarnation is a fresh sender: its dense seq opens at 0 (§12.2), never reusing the
+    // old sender's — the restore announcement + the drain-window frame + the two post-fence frames.
+    assert_eq!(
+        new_pubs.iter().map(|p| p.1).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "the new sender's dense channel seq opens fresh"
+    );
+
+    // (3) REPLAYS BIT-EXACT ACROSS THE BOUNDARY: the old prefix under the OLD module; the new
+    // suffix under the NEW module, driving `da_migrate` from the durable capture.
+    let old_wasm = guest_wasm("test_migrate_old");
+    let old_replay = replay_v2(
+        &worker,
+        &old_wasm,
+        &drill.old_config,
+        &[],
+        ReplayScript::from_entries(&prefix),
+    )
+    .expect("old-incarnation replay harness");
+    assert_eq!(
+        old_replay.end,
+        ReplayEnd::Outcome(OUTCOME_QUIESCE_READY),
+        "the old incarnation replays to its QuiesceReady terminal"
+    );
+    let old_redriven: Vec<(u64, u64, [u8; 32])> = old_replay
+        .decisions
+        .iter()
+        .map(|d| (d.channel, d.seq, d.payload_hash))
+        .collect();
+    assert_eq!(
+        old_pubs, old_redriven,
+        "the pre-fence prefix replays bit-exact"
+    );
+
+    let new_wasm = guest_wasm("test_migrate_new");
+    let new_replay = replay_v2_migrating(
+        &worker,
+        &new_wasm,
+        &[],
+        &drill.new_grants_bytes,
+        ReplayScript::from_entries(&suffix),
+        Some(ReplayMigration {
+            capture,
+            migrate_fuel: None,
+        }),
+    )
+    .expect("new-incarnation replay harness");
+    assert_eq!(
+        new_replay.end,
+        ReplayEnd::Outcome(0),
+        "the new incarnation replays to its clean stop"
+    );
+    let new_redriven: Vec<(u64, u64, [u8; 32])> = new_replay
+        .decisions
+        .iter()
+        .map(|d| (d.channel, d.seq, d.payload_hash))
+        .collect();
+    assert_eq!(
+        new_pubs, new_redriven,
+        "the post-fence suffix replays bit-exact across the upgrade boundary (da_migrate restored \
+         the state, no replay gap, no double-delivery)"
+    );
+
+    // Belt and braces: the new module never used the old sender's `old_module` — the fields are
+    // held to keep the drill shape coherent on this path too.
+    let _ = (
+        drill.new_module,
+        drill.old_module,
+        drill.run_id,
+        drill.old_seed,
+        drill.new_seed,
+    );
 }

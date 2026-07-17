@@ -31,6 +31,11 @@ harness = ["dep:daemon-vhc-observe"]
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+# The frozen ABI constants (event/outcome/quiesce-reason/stop-reason codes, the default control
+# channel id) the production upgrade-transaction adapter (`upgrade::LiveUpgradeSteps`) drives the
+# live pump with. A contracts crate (links neither sdk/* nor host/*), so the session→abi edge is
+# direction-safe.
+daemon-vhc-abi = { workspace = true }
 # The consensus SDK layer: assignment math (moved from the proto at D0, consumed by the retained v1
 # RoundEngine) AND — relocated at D2 from the dissolved daemon-vhc-coordinator — the pure coordinator
 # `tick` state machine (its `coordinator` module) the harness shell (`local_coordinator`) signs,
