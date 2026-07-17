@@ -184,6 +184,10 @@ struct ReplayHost {
     pending_event: Option<(u64, Vec<u8>)>,
     /// Synthesized opaque handles for stubbed bridge compute imports.
     next_handle: u64,
+    /// The deterministic guest-created staging-id counter (§10.2): `stage_state` returns
+    /// `(1 << 63) | n` for a per-instance monotone `n` from 1, exactly as the live driver mints
+    /// them — no journal record (the bytes come from replay-reproduced guest memory).
+    next_guest_staging_id: u64,
     /// Per-channel dense seq counters (mirrors the recording driver's allocation).
     seqs: std::collections::HashMap<u64, u64>,
     /// Guest-partition buffers: the SAME deterministic arena as the recording (quotas were
@@ -371,6 +375,23 @@ fn dispatch(
             } else {
                 caller.data_mut().pending_event = Some(frame);
             }
+            Ok(())
+        }
+        ("vhc@2", "stage_state") => {
+            // The §10.2 producing import: a prompt, deterministic guest-created staging id
+            // (`(1 << 63) | n`, monotone from 1) — no journal record, re-minted identically at
+            // replay. The bytes are replay-reproduced guest memory; the id is counter-derived.
+            let host = caller.data_mut();
+            let id = (1u64 << 63) | host.next_guest_staging_id;
+            host.next_guest_staging_id += 1;
+            results[0] = Val::I64(id as i64);
+            Ok(())
+        }
+        ("vhc@2", "snapshot_state") => {
+            // The §10.2 submission: the host verified + accepted it at record time (the journal
+            // carries the accepted manifest, tag 10) — deterministic given the manifest, so replay
+            // re-derives `Accepted` (0). A rejected submission would have retried in the recording.
+            results[0] = Val::I32(0);
             Ok(())
         }
         ("vhc@2", "create_from") => {
@@ -791,6 +812,24 @@ fn dispatch(
     }
 }
 
+/// The migration half of a replayed incarnation (ABI §10.2/§10.3): replaying the journal segment
+/// **after** an upgrade boundary (the tag-13 reason-2 instantiation) drives `da_migrate` between
+/// `da_init` and `da_run`, exactly as the live [`super::driver::start_run_migrating`] did. The
+/// restore `read_back(staging_id, kind = 3)` the guest issues inside `da_migrate` is answered from
+/// the recorded kind-3 read-backs in the [`ReplayScript`] (they are `kind < 128`, so `from_entries`
+/// files them under `readbacks`), and the descriptor is rebuilt from the durable snapshot capture
+/// with the same host staging IDs the recording assigned (monotone from 1, in manifest order) — so
+/// the guest reads the identical `(staging_id, kind)` and the replay is bit-exact across the fence.
+#[derive(Debug, Clone)]
+pub struct ReplayMigration {
+    /// The accepted snapshot the old incarnation produced (durable per §10.2): the manifest + the
+    /// staged section bytes, in manifest order.
+    pub capture: super::driver::SnapshotCapture,
+    /// The migrate fuel the recording used (`None` = the engine default) — replay is not the
+    /// budget gate, so this only documents provenance.
+    pub migrate_fuel: Option<u64>,
+}
+
 /// Re-drive `wasm` from a recorded journal: `da_init(config, grants)` then `da_run`, every
 /// nondeterministic input answered from `script`, every publish collected as a decision.
 ///
@@ -807,6 +846,26 @@ pub fn replay_v2(
     config: &[u8],
     grants: &[u8],
     script: ReplayScript,
+) -> Result<ReplayedRun, V2Error> {
+    replay_v2_migrating(worker, wasm, config, grants, script, None)
+}
+
+/// [`replay_v2`] for an incarnation that entered through an upgrade migration (§10.3 step 4): when
+/// `migration` is `Some`, `da_migrate(descriptor)` runs between `da_init` and `da_run`, so the
+/// **full run journal across the upgrade boundary** replays bit-exact — the old incarnation's
+/// prefix under its module via [`replay_v2`], the new incarnation's suffix under its module here.
+///
+/// # Errors
+/// [`V2Error`] only for harness-level failures (compile/instantiate/missing exports); guest-level
+/// endings are [`ReplayedRun::end`] variants (a non-`Ready` `da_migrate` surfaces as
+/// [`ReplayEnd::Diverged`]).
+pub fn replay_v2_migrating(
+    worker: &Worker,
+    wasm: &[u8],
+    config: &[u8],
+    grants: &[u8],
+    script: ReplayScript,
+    migration: Option<ReplayMigration>,
 ) -> Result<ReplayedRun, V2Error> {
     let module = Module::new(worker.engine(), wasm)
         .map_err(|e| V2Error::Sandbox(format!("replay compile: {e}")))?;
@@ -841,6 +900,7 @@ pub fn replay_v2(
         events_delivered: 0,
         pending_event: None,
         next_handle: 0x5EED_0000_0000,
+        next_guest_staging_id: 1,
         seqs: std::collections::HashMap::new(),
         // Quotas 0 (unbounded): the recording already enforced them; replay re-derives handles.
         buffers: BufferTable::new(0, 0, 0),
@@ -917,6 +977,42 @@ pub fn replay_v2(
         Err(e) => {
             let end = classify(&e);
             return finish(store, end);
+        }
+    }
+
+    // The migrate step (§10.3 steps 4–5), on a migrating incarnation only: rebuild the descriptor
+    // from the durable capture with the same host staging IDs the recording assigned (monotone
+    // from 1, in manifest order), then drive `da_migrate` — the guest's restore `read_back(id, 3)`
+    // is answered from the recorded kind-3 read-backs (`script.readbacks`), so the reconstruction
+    // is byte-identical to the live one.
+    if let Some(mig) = &migration {
+        let bindings: Vec<(String, u64)> = mig
+            .capture
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| (name.clone(), i as u64 + 1))
+            .collect();
+        let descriptor =
+            super::driver::build_migration_descriptor(&mig.capture.manifest, &bindings)
+                .map_err(|e| V2Error::Sandbox(format!("replay migration descriptor: {e}")))?;
+        let desc_ptr = write_span(&mut store, &descriptor)?;
+        let da_migrate = instance
+            .get_typed_func::<(u32, u32), u32>(&mut store, "da_migrate")
+            .map_err(|_| V2Error::Sandbox("missing/mis-typed da_migrate".into()))?;
+        match da_migrate.call(&mut store, (desc_ptr, descriptor.len() as u32)) {
+            Ok(daemon_vhc_abi::DA_MIGRATE_READY) => {}
+            Ok(status) => {
+                let end = ReplayEnd::Diverged(format!(
+                    "da_migrate returned {status} at replay but the recording validated Ready \
+                     (§10.2)"
+                ));
+                return finish(store, end);
+            }
+            Err(e) => {
+                let end = classify(&e);
+                return finish(store, end);
+            }
         }
     }
 
