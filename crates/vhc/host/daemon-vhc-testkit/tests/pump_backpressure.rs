@@ -25,9 +25,9 @@ use daemon_vhc_host::v2::{
     start_run, DeliverVerdict, MemorySink, RunEnd, RunIdentity, V2RunConfig,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
-use daemon_vhc_proto::to_canonical_vec;
-use daemon_vhc_sdk_consensus::coordinator::{CoordinatorParams, CoordinatorState, RunConfig};
-use daemon_vhc_testkit::barrier::barrier_envelope;
+use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
+use daemon_vhc_proto::{to_canonical_vec, CapabilitySet, Hash, SWARM_PROTO_VERSION};
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 use std::sync::{Arc, Mutex};
 
 fn guests_root() -> PathBuf {
@@ -68,9 +68,41 @@ fn coordinator_quorum_wasm() -> Vec<u8> {
 }
 
 fn coordinator_config() -> Vec<u8> {
-    let envelope = barrier_envelope("pump-hold", 2, 4, 2, 4);
-    let config = RunConfig::from_envelope(&envelope, CoordinatorParams::default()).expect("cfg");
-    let state = CoordinatorState::new(config, daemon_vhc_proto::Seed([0x33; 32]), 0);
+    // The coordinator's opaque config is an authored `RunConfig` + genesis `CoordinatorState`,
+    // exactly the guest's `da_init` shape (`{state: …}`) — the same way a genesis envelope carries
+    // the coordinator role's config verbatim. Authored directly here (the coordinator module's
+    // opaque config under envelope v2; the v1 `[data]`/`[phases]` projection left the envelope at
+    // D0). Phase deadlines are effectively infinite: the coordinator-quorum guest runs on the
+    // event-driven fast path (`tick_period_ms = 0`) and parks in `next_event`, which is exactly the
+    // clean delivery-hold fixture this drill needs.
+    let run_config = RunConfig {
+        run_id: "pump-hold".to_string(),
+        proto_version: SWARM_PROTO_VERSION,
+        envelope_hash: Hash([0u8; 32]),
+        required_capabilities: CapabilitySet::new(),
+        min_peers: 2,
+        max_peers: 4,
+        warmup_s: 1_000_000,
+        round_train_max_s: 1_000_000,
+        round_witness_s: 1_000_000,
+        cooldown_s: 1_000_000,
+        epoch_rounds: 0,
+        stall_rounds_max: 2,
+        global_batch: GlobalBatch {
+            start: 4,
+            end: 4,
+            ramp_rounds: 1,
+        },
+        stop: StopCondition::Rounds(1_000_000),
+        steps_per_round: 2,
+        seq_len: 1,
+        witness_target: 0,
+        overlap_bps: 0,
+        k_absences: 8,
+        verification_percent: 0,
+        authorized: Vec::new(),
+    };
+    let state = CoordinatorState::new(run_config, daemon_vhc_proto::Seed([0x33; 32]), 0);
     let state_val = Value::serialized(&state).expect("state value");
     let init = Value::Map(vec![(Value::Text("state".into()), state_val)]);
     to_canonical_vec(&init).expect("init cbor")

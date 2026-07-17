@@ -212,6 +212,37 @@ impl<B: AutodiffBackend> C3Llama<B> {
         self.flat_params().into_iter().map(Tensor::inner).collect()
     }
 
+    /// The AdamW moment tensors (all of `m`, then all of `v`, canonical order) — replica-local
+    /// optimizer state the checkpoint walk exports (§10.2): the moments survive ingest, so a
+    /// restore without them forks the next round's training trajectory.
+    #[must_use]
+    pub fn moment_tensors(&self) -> Vec<Tensor<B::InnerBackend, 1>> {
+        self.m
+            .iter()
+            .cloned()
+            .chain(self.v.iter().cloned())
+            .collect()
+    }
+
+    /// Replace the AdamW moments from canonical per-param vectors (the restore counterpart of
+    /// [`C3Llama::moment_tensors`]).
+    ///
+    /// # Panics
+    /// If either moment set does not match [`ModelCfg::param_numels`].
+    pub fn set_moments_from_flat(&mut self, m: &[Vec<f32>], v: &[Vec<f32>]) {
+        let numels = self.cfg.param_numels();
+        assert_eq!(m.len(), numels.len(), "m param count");
+        assert_eq!(v.len(), numels.len(), "v param count");
+        let upload = |d: &Vec<f32>| {
+            Tensor::<B::InnerBackend, 1>::from_data(
+                TensorData::new(d.clone(), [d.len()]),
+                &self.device,
+            )
+        };
+        self.m = m.iter().map(upload).collect();
+        self.v = v.iter().map(upload).collect();
+    }
+
     /// Replace the params with a new canonical flat state (post-ingest master upload). The AdamW
     /// moments are kept — the v1 outer step never resets them.
     pub fn set_params_from_flat(&mut self, flat: &[Vec<f32>]) {

@@ -32,10 +32,10 @@
     "wd": 0.1
   },
   "module": {
-    "blake3": "f03e81957b3b3b1912988bf3d18913f772469062c79abd5f8b9c4105d1be41da",
-    "bytes": 1011398,
+    "blake3": "0e2c6fb4cc295f7d0411a325ed14b2629c2bd2387e66e0e291dc61327f3281e2",
+    "bytes": 1026114,
     "name": "tiny_llama_c3.wasm",
-    "source": "guests/target build at capture (byte-identical across checkout paths via the guests workspace rustc remap; pinned in guests.blake3 at the commit)"
+    "source": "guests/target build at capture (byte-identical across checkout paths via the guests workspace rustc remap; pinned in guests.blake3 at the commit). INFORMATIONAL field, mechanically re-synced when the trainer guest gained checkpoint/migration support + payload externalization (guests.blake3 re-pin) — the recorded golden bytes and digests below are unchanged and were NOT re-captured (the guest's training math is untouched; the reproduce lanes stay green against them)."
   },
   "param_names": [
     "tok.weight",

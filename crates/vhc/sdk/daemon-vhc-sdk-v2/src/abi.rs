@@ -15,6 +15,11 @@ extern "C" {
     fn abi_next_event(buf_ptr: u32, buf_cap: u32) -> u64;
     #[link_name = "read_back"]
     fn abi_read_back(src: u64, kind: u32, out_ptr: u32, out_cap: u32) -> u64;
+    // -- the §10.2 producing protocol (Quiesce drain: snapshot the state as typed sections) -----
+    #[link_name = "stage_state"]
+    fn abi_stage_state(ptr: u32, len: u32) -> u64;
+    #[link_name = "snapshot_state"]
+    fn abi_snapshot_state(manifest_ptr: u32, manifest_len: u32) -> u32;
     // -- minor 1 (Phase B, track B1): the buffer layer + cancellation (§3.4/§7.5) --------------
     #[link_name = "create_from"]
     fn abi_create_from(ptr: u32, len: u32) -> u64;
@@ -187,6 +192,24 @@ pub fn read_back_bytes(src: u64, kind: u32) -> Vec<u8> {
             _ => unreachable!("unknown read_back status (fail closed, §5.2)"),
         }
     }
+}
+
+/// Stage one state-section's bytes during a `Quiesce` drain (the §10.2 producing protocol);
+/// returns the guest-created staging ID (top bit set) the state-manifest's acceptance pairs
+/// with the section declaration.
+#[must_use]
+pub fn stage_state(section: &[u8]) -> u64 {
+    // SAFETY: `section` is a live guest span for the call's duration.
+    unsafe { abi_stage_state(section.as_ptr() as u32, section.len() as u32) }
+}
+
+/// Submit the state-manifest closing a `Quiesce` snapshot (§10.2). Returns the typed acceptance
+/// status (`SNAPSHOT_STATE_*` — 0 = accepted); the module returns `QuiesceReady` only after an
+/// accepted submission.
+#[must_use]
+pub fn snapshot_state(manifest: &[u8]) -> u32 {
+    // SAFETY: `manifest` is a live guest span for the call's duration.
+    unsafe { abi_snapshot_state(manifest.as_ptr() as u32, manifest.len() as u32) }
 }
 
 /// Publish opaque payload bytes on `channel` (§6.2); returns the durable channel-scoped seq.

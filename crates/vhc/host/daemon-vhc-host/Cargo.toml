@@ -52,6 +52,13 @@ thiserror = { workspace = true }
 daemon-vhc-det = { workspace = true }
 serde = { workspace = true }
 ciborium = { workspace = true }
+# The wasm-coordinator drive seat (`wasm_coordinator` module): configuring/authorizing the
+# production coordinator blob needs the run's typed `AuthorityConfig` (decode + authorize), which
+# lives in the consensus SDK layer. TRACKED dependency-direction exception (xtask vhc_dep_check):
+# host/* -> sdk/* — the ratified rule is that consensus never runs outside the sandboxed module,
+# so the *drive* is production host machinery while the *authority vocabulary* stays SDK-side;
+# the edge narrows to a contracts-crate move if AuthorityConfig ever relocates.
+daemon-vhc-sdk-consensus = { workspace = true }
 # (A2 dependency INVERSION, refactor §5 A2 item 3): the daemon-vhc-session dep is GONE — the host
 # no longer links run policy; the session links the host (architecture §7: SESS → HOSTC), and
 # `wasm_backend.rs` (the TrainerBackend seam impl) moved to the session with it. The session

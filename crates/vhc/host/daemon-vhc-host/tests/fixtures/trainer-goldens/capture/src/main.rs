@@ -18,13 +18,15 @@
 //!
 //! ## Why the payload is reconstructed, not read off the wire
 //!
-//! The guest publishes only the blake3 HASH of its committed payload (tag-3), never the bytes —
-//! the payload never crosses `compute@2`. To record the trainer's OWN committed payload bytes we
-//! recompute them natively with the identical det-lane profile math (`SparseLoco::make_update`
-//! over the guest's published theta and the running round base) and assert the reconstruction's
-//! blake3 equals the guest's tag-3 hash. `daemon-vhc-det` is bit-identical wasm-vs-native (the
-//! det-lane invariant), so the reconstruction is byte-exact — and the hash check makes any drift
-//! a hard capture failure rather than a silent divergence.
+//! The guest voices the blake3 HASH of its committed payload on the control channel (tag-3) and
+//! externalizes the sealed bytes through `payload_put` (this capture acknowledges the put and
+//! drops the bytes). To record the trainer's OWN committed payload bytes we recompute them
+//! natively with the identical det-lane profile math (`SparseLoco::make_update` over the guest's
+//! published theta and the running round base) and assert the reconstruction's blake3 equals the
+//! guest's tag-3 hash. `daemon-vhc-det` is bit-identical wasm-vs-native (the det-lane
+//! invariant), so the reconstruction is byte-exact — and the double derivation (native rebuild
+//! hash-checked against the guest's voice) makes any drift a hard capture failure rather than a
+//! silent divergence.
 //!
 //! The run is a genuine single-peer barrier: the trainer commits its own update and ingests that
 //! same committed set, so the recorded digests are the trainer's autonomous v2-native trajectory
@@ -273,6 +275,7 @@ impl PartialEq for Captured {
 fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
     let deadline = Instant::now() + Duration::from_secs(180);
     while pump.published().len() < n {
+        service_puts(pump);
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {n} publishes (have {}); logs: {:?}",
@@ -280,6 +283,22 @@ fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
             pump.logs()
         );
         std::thread::sleep(Duration::from_millis(5));
+    }
+    service_puts(pump);
+}
+
+/// The async-runtime seat's minimal duty: the trainer `payload_put`s its sealed committed
+/// container each round (B1 discipline); the capture reconstructs the payload natively and
+/// verifies via the tag-3 hash, so the put is acknowledged and its bytes dropped.
+fn service_puts(pump: &daemon_vhc_host::v2::PumpHandle) {
+    for (op, request) in pump.take_op_requests() {
+        match request {
+            daemon_vhc_host::v2::OpRequest::PayloadPut { .. } => {
+                pump.complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
+                    .expect("put done");
+            }
+            other => panic!("unexpected op request from the trainer guest: {other:?}"),
+        }
     }
 }
 

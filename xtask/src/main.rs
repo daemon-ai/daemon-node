@@ -764,6 +764,15 @@ fn vhc_dep_check() -> anyhow::Result<()> {
              SDK-side vhc-sim [normal]",
         ),
         (
+            "daemon-vhc-host",
+            "daemon-vhc-sdk-consensus",
+            "the production wasm-coordinator drive seat (host wasm_coordinator module, lifted \
+             from the testkit when the worker join re-seated onto the wasm coordinator): \
+             configuring/authorizing the coordinator blob needs the typed AuthorityConfig \
+             decode + authorize, which lives in the consensus SDK layer; narrows to a \
+             contracts-crate move if the authority vocabulary ever relocates [normal]",
+        ),
+        (
             "daemon-vhc-observe",
             "daemon-vhc-sdk-consensus",
             "TYPES-ONLY post-re-seat — the coordinator oracle no longer re-runs a native `tick`: \
@@ -776,10 +785,10 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         (
             "daemon-vhc-worker",
             "daemon-vhc-sdk-consensus",
-            "post-E — the cell-5 (v2 module × v1 envelope) self-driven t2 join drives the native \
-             `tick` in-process; cell 5 SURVIVED the sunset (D5 retired the v1 DRIVER, not the v1 \
-             envelope), so this edge retires when the in-process join re-seats onto the wasm \
-             coordinator (cell 8) [normal]",
+            "genesis-authoring vocabulary for the in-process join suite (authored \
+             CoordinatorState role config + AuthorityConfig topology); the runtime native-tick \
+             edge retired when the self-driven join re-seated onto the wasm coordinator — this \
+             remainder writes test fixtures only [dev-dep]",
         ),
     ];
 

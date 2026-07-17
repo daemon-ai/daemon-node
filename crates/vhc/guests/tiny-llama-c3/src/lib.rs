@@ -26,6 +26,24 @@
 //!   the C3b/C3c native-lane comparison surface); `[3, round, hash32]` the round commitment
 //!   voice; `[4, round, digest16]` the post-ingest det digest (the v1 digest formula, computed
 //!   in-guest).
+//! - **payload plane**: the round's sealed committed container is `payload_put` before the tag-3
+//!   voice (B1 discipline — the guest authors and externalizes its own payload; the embedder's
+//!   async-runtime seat services the put and verifies the tag-3 hash covers exactly those bytes).
+//!
+//! ## Checkpoint / migration (ABI §10.2)
+//!
+//! On `Quiesce` the guest snapshots its state as a typed manifest of four flat f32-le sections:
+//! `master` (the canonical det-lane masters — consensus-canonical, class 0; post-ingest this IS
+//! the round base), `ef` (the profile's error-feedback residuals), and `adamw_m`/`adamw_v` (the
+//! AdamW moments). The latter three are replica-local (class 1) and digest-invisible but
+//! REQUIRED for continuity: the next round's `make_update` reads `ef` and the next round's
+//! training reads the moments (v1 semantics — the outer step never resets them), so a restore
+//! without them forks the committed-payload trajectory even though the ingest-side digest would
+//! still match. The moments live device-side, so the quiesce is an async walk exactly like the
+//! round export (fence → `export` → completions → stage + `snapshot_state` → `QuiesceReady`).
+//! `da_migrate` restores all four and `run` rebuilds the model from them. A quiesce is a
+//! between-rounds fence: trained-but-uncommitted state is deliberately not snapshotted (the
+//! upgrade transaction drains at the round boundary).
 //!
 //! ## The export walk (why `make_update` is split)
 //!
@@ -44,14 +62,16 @@ use std::rc::Rc;
 
 use daemon_vhc_proto::messages::{RecordEntry, SwarmMessage};
 use daemon_vhc_proto::{
-    blake3_hash, digest_state, from_canonical_slice, to_canonical_vec, PeerId, Seed,
+    blake3_hash, digest_state, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed,
 };
 use daemon_vhc_sdk_compute::{export_tensor, fence, AutodiffHostBackend, HostBackend};
 use daemon_vhc_sdk_profiles::{encode_payload, IngestParam, ParamView, SparseLoco, SparseLocoCfg};
 use daemon_vhc_sdk_rounds::{
     BarrierRound, Committed, PayloadSource, RoundCfg, RoundExperiment, StepCtx as RoundStepCtx,
 };
-use daemon_vhc_sdk_v2::{ModuleDecl, V2Module};
+use daemon_vhc_sdk_v2::{
+    build_manifest, MigrationDescriptor, ModuleDecl, OwnedSection, SectionReader, V2Module,
+};
 use serde::Deserialize;
 
 use model::{C3Llama, ModelCfg};
@@ -61,6 +81,12 @@ const EV_PAYLOAD_READY: u64 = 1;
 const EV_STOP: u64 = 4;
 const EV_FENCE: u64 = 5;
 const EV_COMPLETION: u64 = 6;
+const EV_QUIESCE: u64 = 7;
+/// `da_run` outcome after a §10.2 snapshot-accepted drain.
+const OUTCOME_QUIESCE_READY: u32 = 2;
+/// `da_migrate` Incompatible detail: a section is missing/unknown or its length mismatches the
+/// model layout (§10.2 — module-defined detail codes are ≥ 16).
+const MIGRATE_INCOMPATIBLE_SECTIONS: u32 = 16;
 
 /// Per-step queue-depth-reset fences start here; round-final fences are `round + 1`.
 const STEP_FENCE_BASE: u64 = 1 << 32;
@@ -219,8 +245,17 @@ impl PayloadSource<Vec<u8>> for PayloadMap {
 
 // -- the V2Module under `main!` -------------------------------------------------------------------
 
+/// Flat state a `da_migrate` restore carries into `run` (split by the model layout there).
+struct Restored {
+    master: Vec<f32>,
+    ef: Vec<f32>,
+    adamw_m: Vec<f32>,
+    adamw_v: Vec<f32>,
+}
+
 struct TinyLlamaC3 {
     cfg_bytes: Vec<u8>,
+    restored: Option<Restored>,
 }
 
 impl V2Module for TinyLlamaC3 {
@@ -248,13 +283,55 @@ impl V2Module for TinyLlamaC3 {
         }
         Ok(Self {
             cfg_bytes: config.to_vec(),
+            restored: None,
         })
     }
 
     fn run(&mut self) -> u32 {
         let cfg: GuestCfg =
             from_canonical_slice(&self.cfg_bytes).expect("config validated at init");
-        run_module(cfg)
+        run_module(cfg, self.restored.take())
+    }
+
+    /// The §10.2 consuming protocol: read the `master`/`ef`/`adamw_m`/`adamw_v` flat f32-le
+    /// sections staged by the old instance's snapshot; `run` splits them by the model layout and
+    /// rebuilds from them.
+    fn migrate(&mut self, descriptor: &MigrationDescriptor, reader: &mut dyn SectionReader) -> u32 {
+        let cfg: GuestCfg =
+            from_canonical_slice(&self.cfg_bytes).expect("config validated at init");
+        let total: usize = cfg.model.param_numels().iter().sum();
+        let mut master: Option<Vec<f32>> = None;
+        let mut ef: Option<Vec<f32>> = None;
+        let mut adamw_m: Option<Vec<f32>> = None;
+        let mut adamw_v: Option<Vec<f32>> = None;
+        for binding in &descriptor.sections {
+            let bytes = reader.read(binding.staging_id);
+            let vals: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            if vals.len() != total {
+                return MIGRATE_INCOMPATIBLE_SECTIONS;
+            }
+            match binding.name.as_str() {
+                "master" => master = Some(vals),
+                "ef" => ef = Some(vals),
+                "adamw_m" => adamw_m = Some(vals),
+                "adamw_v" => adamw_v = Some(vals),
+                _ => return MIGRATE_INCOMPATIBLE_SECTIONS,
+            }
+        }
+        let (Some(master), Some(ef), Some(adamw_m), Some(adamw_v)) = (master, ef, adamw_m, adamw_v)
+        else {
+            return MIGRATE_INCOMPATIBLE_SECTIONS;
+        };
+        self.restored = Some(Restored {
+            master,
+            ef,
+            adamw_m,
+            adamw_v,
+        });
+        0
     }
 }
 
@@ -291,14 +368,75 @@ struct ExportState {
     ops: BTreeMap<u64, usize>,
 }
 
+/// The quiesce snapshot's export walk: op → moment index (all `m`, then all `v`).
+struct QuiesceWalk {
+    collected: Vec<Option<Vec<f32>>>,
+    ops: BTreeMap<u64, usize>,
+}
+
+/// Decode one export completion's payload: `[status, handle]` → the tensor's f32 vec (None on a
+/// nonzero status or an undecodable payload).
+fn completion_tensor(ev: &daemon_vhc_sdk_v2::Event) -> Option<Vec<f32>> {
+    let ciborium::value::Value::Array(result) = ev.items.get(2)? else {
+        return None;
+    };
+    let ok = result
+        .first()
+        .and_then(|v| v.as_integer())
+        .is_some_and(|n| i128::from(n) == 0);
+    if !ok {
+        return None;
+    }
+    let handle = result
+        .get(1)
+        .and_then(|v| v.as_integer())
+        .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))?;
+    let bytes = daemon_vhc_sdk_v2::read_buffer(handle);
+    daemon_vhc_sdk_v2::buffer_release(handle);
+    let data = daemon_vhc_sdk_compute::decode_tensor_data(&bytes);
+    data.to_vec::<f32>().ok()
+}
+
+/// Flatten per-param canonical vectors to f32-le bytes (the snapshot section encoding).
+fn flat_le(params: &[Vec<f32>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(params.iter().map(Vec::len).sum::<usize>() * 4);
+    for p in params {
+        for v in p {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_lines)]
-fn run_module(cfg: GuestCfg) -> u32 {
+fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
     let numels = cfg.model.param_numels();
-    let init = split_flat(&cfg.init, &numels);
+    // A restored instance rebuilds from the snapshot's masters + error feedback + AdamW moments
+    // (post-ingest state: master IS the round base); a fresh instance starts from the config's
+    // matched init with zeroed local state.
+    let (init, restored_local) = match restored {
+        Some(r) => (
+            split_flat(&r.master, &numels),
+            Some((
+                split_flat(&r.ef, &numels),
+                split_flat(&r.adamw_m, &numels),
+                split_flat(&r.adamw_v, &numels),
+            )),
+        ),
+        None => (split_flat(&cfg.init, &numels), None),
+    };
+    let mut profile = SparseLoco::new(cfg.profile.clone(), &numels);
     let device = daemon_vhc_sdk_compute::device();
+    let mut model = C3Llama::<AutodiffHostBackend>::from_flat(cfg.model.clone(), device, &init);
+    if let Some((ef, m, v)) = restored_local {
+        profile
+            .restore_ef(ef)
+            .expect("snapshot ef matches the model layout (validated at da_migrate)");
+        model.set_moments_from_flat(&m, &v);
+    }
     let core = Rc::new(RefCell::new(Core {
-        model: C3Llama::<AutodiffHostBackend>::from_flat(cfg.model.clone(), device, &init),
-        profile: SparseLoco::new(cfg.profile.clone(), &numels),
+        model,
+        profile,
         master: init.clone(),
         round_base: init,
         batches: VecDeque::new(),
@@ -319,6 +457,7 @@ fn run_module(cfg: GuestCfg) -> u32 {
         map: BTreeMap::new(),
     };
     let mut export: Option<ExportState> = None;
+    let mut quiesce: Option<QuiesceWalk> = None;
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
@@ -332,6 +471,22 @@ fn run_module(cfg: GuestCfg) -> u32 {
                 std::mem::forget(driver);
                 std::mem::forget(core);
                 return 0;
+            }
+            EV_QUIESCE => {
+                // The §10.2 producing protocol, phase 1: the AdamW moments live device-side, so
+                // the snapshot is an async export walk (same shape as the round's θ export —
+                // Fence/Completion events keep delivering during a drain, §4.4). The manifest is
+                // authored and submitted when the last completion lands (EV_COMPLETION below).
+                let tensors = core.borrow().model.moment_tensors();
+                let mut ops = BTreeMap::new();
+                let n = tensors.len();
+                for (i, t) in tensors.into_iter().enumerate() {
+                    ops.insert(export_tensor(t), i);
+                }
+                quiesce = Some(QuiesceWalk {
+                    collected: vec![None; n],
+                    ops,
+                });
             }
             EV_PAYLOAD_READY => {
                 // All harness staging is kind-0 bytes; the wrapper tag routes it.
@@ -435,6 +590,69 @@ fn run_module(cfg: GuestCfg) -> u32 {
             }
             EV_COMPLETION => {
                 let op = ev.uint(1);
+                // The quiesce walk's completions (§10.2 phase 2): collect the exported moments;
+                // when the last lands, author + submit the typed manifest and QuiesceReady.
+                if let Some(walk) = quiesce.as_mut() {
+                    if let Some(idx) = walk.ops.remove(&op) {
+                        walk.collected[idx] = Some(
+                            completion_tensor(&ev)
+                                .expect("moment export completes (quiesce fails loud)"),
+                        );
+                        if walk.ops.is_empty() && walk.collected.iter().all(Option::is_some) {
+                            let moments: Vec<Vec<f32>> = walk
+                                .collected
+                                .iter_mut()
+                                .map(|c| c.take().expect("collected"))
+                                .collect();
+                            let n = moments.len() / 2;
+                            let (master_le, ef_le) = {
+                                let c = core.borrow();
+                                (flat_le(&c.master), flat_le(c.profile.ef_state()))
+                            };
+                            // `module` is zeroed — a module cannot hash its own bytes; the host
+                            // verifies sections by content hash (the drill-pair convention).
+                            let sections = [
+                                OwnedSection {
+                                    name: "master".to_string(),
+                                    schema: 1,
+                                    class: 0, // consensus-canonical (the digest-covered masters)
+                                    bytes: master_le,
+                                },
+                                OwnedSection {
+                                    name: "ef".to_string(),
+                                    schema: 1,
+                                    class: 1, // replica-local; continuity-required
+                                    bytes: ef_le,
+                                },
+                                OwnedSection {
+                                    name: "adamw_m".to_string(),
+                                    schema: 1,
+                                    class: 1,
+                                    bytes: flat_le(&moments[..n]),
+                                },
+                                OwnedSection {
+                                    name: "adamw_v".to_string(),
+                                    schema: 1,
+                                    class: 1,
+                                    bytes: flat_le(&moments[n..]),
+                                },
+                            ];
+                            for s in &sections {
+                                let _staging_id = daemon_vhc_sdk_v2::stage_state(&s.bytes);
+                            }
+                            let manifest = build_manifest(Hash([0u8; 32]), 1, &sections);
+                            let manifest_bytes =
+                                to_canonical_vec(&manifest).expect("state-manifest cbor");
+                            let status = daemon_vhc_sdk_v2::snapshot_state(&manifest_bytes);
+                            assert_eq!(status, 0, "snapshot_state rejected the trainer manifest");
+                            // Same deliberate-leak shutdown discipline as Stop (§7.3).
+                            std::mem::forget(driver);
+                            std::mem::forget(core);
+                            return OUTCOME_QUIESCE_READY;
+                        }
+                        continue;
+                    }
+                }
                 let Some(st) = export.as_mut() else { continue };
                 let Some(param_idx) = st.ops.remove(&op) else {
                     continue; // an import ack or another op — ignored
@@ -494,6 +712,12 @@ fn run_module(cfg: GuestCfg) -> u32 {
                         .collect();
                     let sections = profile.make_update(&views);
                     let payload = encode_payload(&sections);
+                    // Externalize the sealed committed container (B1: the guest authors its own
+                    // payload) — put BEFORE the tag-3 voice so the embedder that observes the
+                    // commitment can pair it with the serviced bytes.
+                    let buf = daemon_vhc_sdk_v2::create_from(&payload);
+                    let _op = daemon_vhc_sdk_v2::payload_put(buf);
+                    daemon_vhc_sdk_v2::buffer_release(buf);
                     publish_tagged(3, round, &blake3_hash(&payload).0);
                 }
             }

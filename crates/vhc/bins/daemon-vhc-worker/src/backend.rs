@@ -18,33 +18,27 @@ use daemon_vhc_session::protocol::{Eligibility, Hardware, WorkerCapabilities};
 /// does not spuriously reject on an unprobed number (`u64::MAX / MiB`).
 const UNKNOWN_BUDGET_MB: u64 = u64::MAX / (1 << 20);
 
-/// The experiment inputs a run resolves to: the `[experiment.config]` CBOR + the module `.wasm`,
-/// plus the envelope's per-role blake3 pin when one exists (the ABI §1.3 step-1 verify-before-
-/// compile input; `None` under the explicit `DAEMON_TRAIN_MODULE` module-source override, which
-/// deliberately bypasses the artifact map and so carries no pin).
+/// The experiment inputs a run resolves to: the worker role's opaque config CBOR + the module
+/// `.wasm`, plus the envelope's per-role blake3 pin when one exists (the ABI §1.3 step-1
+/// verify-before-compile input; `None` under the explicit `DAEMON_TRAIN_MODULE` module-source
+/// override, which deliberately bypasses the artifact map and so carries no pin).
 pub(crate) struct ResolvedRun {
     pub(crate) config: Vec<u8>,
     pub(crate) module: Vec<u8>,
     pub(crate) module_blake3: Option<[u8; 32]>,
-    /// The envelope's additive `device_min` section (ABI §9.3 stage-3 pre-screen; D3 cell 5
-    /// interim-supported), parsed from the RAW frozen bytes — `None` when the envelope carries
-    /// no such section. On the genesis path this is the worker role's typed `device_min`.
+    /// The worker role's typed `device_min` (ABI §9.3 stage-3 pre-screen input).
     pub(crate) device_min: Option<daemon_vhc_proto::DeviceMinimums>,
-    /// The decoded typed v1 envelope (the coordinator-config source for the v2 self-driven join,
-    /// mixed-fleet cell 5). `None` on the genesis path.
-    pub(crate) envelope: Option<daemon_vhc_proto::Envelope>,
-    /// The resolved genesis run (envelope v2 — mixed-fleet cell 6, D1 deliverable 4). `None` on
-    /// the v1 path.
+    /// The resolved genesis run (envelope v2). `Some` on every resolvable run — the schema-1
+    /// envelope form refuses typed at [`ENVELOPE_SCHEMA_RETIRED`] before resolution.
     pub(crate) genesis: Option<GenesisRun>,
 }
 
-/// A resolved envelope-v2 (genesis) run: the decoded envelope and the joining worker role. A
-/// genesis run's COORDINATION is its wasm coordinator module (mixed-fleet cell 8) — the
-/// transitional cell-6 native-coordinator adapter was retired at D2, so no coordinator-role
-/// config is read host-side anymore, and the cryptographic `RunId` (the genesis hash) is
-/// re-derived from the frozen bytes wherever a join path needs it.
+/// A resolved envelope-v2 (genesis) run: the decoded envelope, the frozen wire form (the
+/// wasm-coordinator configuration source — `configure_wasm_coordinator` reads role config bytes
+/// + the cryptographic `RunId` from it), and the joining worker role.
 pub(crate) struct GenesisRun {
     pub(crate) env: daemon_vhc_proto::GenesisEnvelope,
+    pub(crate) frozen: daemon_vhc_proto::FrozenGenesis,
     /// The worker role this node assessed/joins (the first non-coordinator role — the
     /// single-worker interim of decisions D6; role *selection* is node policy from Phase E).
     pub(crate) worker_role: String,
@@ -65,20 +59,28 @@ impl ResolvedRun {
 /// tests and the node key on it, exactly like the ABI §1.5 refusal slugs.
 pub(crate) const UNSIGNED_ENVELOPE_RETIRED: &str = "UnsignedEnvelopeRetired";
 
+/// The typed refusal slug for the retired schema-major-1 (v1) envelope form: a genesis (schema-2)
+/// envelope is the only run description this worker resolves — the v1 form cannot configure a
+/// wasm coordinator (no coordinator role entry, no `Authority`/identities section), so it refuses
+/// HERE, at assess, before any module is fetched or inspected. Stable, like the slug above.
+pub(crate) const ENVELOPE_SCHEMA_RETIRED: &str = "EnvelopeSchemaRetired";
+
 /// Resolve the `AssessRun` envelope bytes into `(config, module)` (the §6.1/§6.5 seam).
 ///
-/// The bytes MUST be the canonical [`SignedEnvelope`] wire form: verify it, take
-/// `config_bytes()`, and resolve the module from the envelope's artifact map via
-/// [`ArtifactResolver`] (`file://`, blake3-verified). `DAEMON_TRAIN_MODULE` remains the explicit
-/// dev/node-controlled **module-source override inside the signed path** (it substitutes the
-/// artifact fetch, never the envelope).
+/// The bytes MUST be the canonical [`SignedEnvelope`] wire form carrying a **genesis (schema-2)**
+/// envelope: verify it, take the worker role's opaque config, and resolve the module by its
+/// pinned artifact hash. `DAEMON_TRAIN_MODULE` remains the explicit dev/node-controlled
+/// **module-source override inside the signed path** (it substitutes the artifact fetch, never
+/// the envelope).
 ///
 /// **D0: the unsigned legacy path is RETIRED.** Bytes that are not a signed-envelope wrapper
 /// (the pre-A0 raw `[experiment.config]` CBOR direct-drive) are refused with the typed
-/// [`UNSIGNED_ENVELOPE_RETIRED`] slug — never accepted, never guessed at. Dev/test drives that
-/// used raw config author a signed envelope instead (the worker-protocol suite's
-/// `signed_envelope_wire()` shape), optionally keeping `DAEMON_TRAIN_MODULE` as the module
-/// source.
+/// [`UNSIGNED_ENVELOPE_RETIRED`] slug — never accepted, never guessed at.
+///
+/// **The schema-major-1 (v1) envelope form is RETIRED**: it refuses with the typed
+/// [`ENVELOPE_SCHEMA_RETIRED`] slug at assess (a v1 envelope cannot configure a wasm
+/// coordinator — no coordinator role, no `Authority`/identities section). Authors present a
+/// genesis envelope v2 instead.
 pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, String> {
     let wire = from_canonical_slice::<SignedEnvelope>(envelope_bytes).map_err(|e| {
         format!(
@@ -87,26 +89,19 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
              DAEMON_TRAIN_MODULE still overrides the module source inside it): {e}"
         )
     })?;
-    // Route on the schema sniff (decisions D3: the dual-driver worker enforces the mixed-fleet
-    // matrix from the raw bytes — a v2 genesis run resolves through the genesis path, a v1 run
-    // through the frozen-envelope path, byte-for-byte as before).
-    if daemon_vhc_proto::peek_schema(&wire.bytes) == Some(daemon_vhc_proto::GENESIS_SCHEMA_MAJOR) {
-        return resolve_genesis_run(wire).await;
+    // Route on the schema sniff: schema 2 (genesis) resolves; anything else refuses typed.
+    match daemon_vhc_proto::peek_schema(&wire.bytes) {
+        Some(daemon_vhc_proto::GENESIS_SCHEMA_MAJOR) => resolve_genesis_run(wire).await,
+        Some(major) => Err(format!(
+            "{ENVELOPE_SCHEMA_RETIRED}: envelope schema major {major} is retired — it cannot \
+             configure a wasm coordinator (no coordinator role entry to pin a module hash, no \
+             Authority/identities section to name the signer); author a genesis envelope v2"
+        )),
+        None => Err(format!(
+            "{ENVELOPE_SCHEMA_RETIRED}: the signed bytes carry no recognizable `[run].schema` \
+             major; author a genesis envelope v2"
+        )),
     }
-    // Verify (re-derives hash + config over the received bytes, checks the signature).
-    let frozen = wire.open().map_err(|e| format!("verify envelope: {e}"))?;
-    let config = frozen.config_bytes().to_vec();
-    let device_min = frozen.device_min();
-    let envelope = frozen.decode().ok();
-    let (module, module_blake3) = resolve_module(&frozen).await?;
-    Ok(ResolvedRun {
-        config,
-        module,
-        module_blake3,
-        device_min,
-        envelope,
-        genesis: None,
-    })
 }
 
 /// Resolve an envelope-v2 **genesis** run (D1 deliverable 4; mixed-fleet cell 6): verify the
@@ -137,7 +132,7 @@ async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String
     let device_min = Some(role.device_min.clone());
 
     // Resolve the worker role's module by its pinned artifact hash — same override + fetch
-    // discipline as the v1 path (DAEMON_TRAIN_MODULE is the explicit dev/node-controlled
+    // discipline as before (DAEMON_TRAIN_MODULE is the explicit dev/node-controlled
     // module-source override inside the signed path).
     let (module, module_blake3) = if let Some(bytes) = module_from_env() {
         (bytes?, None)
@@ -149,94 +144,60 @@ async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String
             )
         })?;
         let pin = Some(artifact.blake3.0);
-        let art = ArtifactRef::new(artifact.url.clone(), artifact.blake3);
-        #[cfg(feature = "swarm-net")]
-        if !artifact.url.starts_with("file://") {
-            let bytes = fetch_artifact_from_store(&art).await.map_err(|e| {
-                format!(
-                    "fetch module `{}` ({}) from store: {e}",
-                    role.module, artifact.url
-                )
-            })?;
-            return finish_genesis_run(config, bytes, pin, device_min, env, worker_role);
-        }
-        let bytes = ArtifactResolver::new()
-            .fetch(&art)
-            .await
-            .map_err(|e| format!("resolve module `{}` ({}): {e}", role.module, artifact.url))?;
-        (bytes, pin)
+        let module_name = role.module.clone();
+        (fetch_genesis_artifact(artifact, &module_name).await?, pin)
     };
-    finish_genesis_run(config, module, module_blake3, device_min, env, worker_role)
-}
-
-/// Assemble the genesis [`ResolvedRun`] (split out so the feature-gated store-fetch arm can share
-/// the tail without duplicating it).
-fn finish_genesis_run(
-    config: Vec<u8>,
-    module: Vec<u8>,
-    module_blake3: Option<[u8; 32]>,
-    device_min: Option<daemon_vhc_proto::DeviceMinimums>,
-    env: daemon_vhc_proto::GenesisEnvelope,
-    worker_role: String,
-) -> Result<ResolvedRun, String> {
     Ok(ResolvedRun {
         config,
         module,
         module_blake3,
         device_min,
-        envelope: None,
-        genesis: Some(GenesisRun { env, worker_role }),
+        genesis: Some(GenesisRun {
+            env,
+            frozen,
+            worker_role,
+        }),
     })
 }
 
-/// Resolve the experiment module bytes for a verified envelope (P3 lane S — fetch-by-hash):
-///
-/// 1. `DAEMON_TRAIN_MODULE` set → read the local file (the **explicit** dev/test override — the only
-///    remaining local-path path; the P2 pre-staging is gone).
-/// 2. else, resolve the envelope's `experiment.module` artifact by its content hash. Under the
-///    `swarm-net` feature a network URL (`r2://` / `https://` / `hf://`) is fetched from the payload
-///    store via a presigned GET (context from the node-set env, [`store_fetch_context`]) and cached
-///    content-addressed on disk ([`ContentCache`]); a `file://` URL uses the file-only resolver.
-/// 3. default build: `file://` only (network schemes are `SchemeUnsupported`, as before).
-///
-/// Every path blake3-verifies the bytes against the artifact-map hash **before** `assess`/
-/// instantiation ([`ArtifactResolver::fetch`] / [`ContentCache`]), so a tampered module is rejected
-/// before the wasm engine loads it (§6.5, §12).
-async fn resolve_module(
-    frozen: &daemon_vhc_proto::FrozenEnvelope,
-) -> Result<(Vec<u8>, Option<[u8; 32]>), String> {
-    if let Some(bytes) = module_from_env() {
-        // The explicit dev/node-controlled override deliberately bypasses the artifact map, so it
-        // carries no envelope pin (the operator chose the bytes; there is nothing to verify them
-        // against — matching the pre-A0 behavior of this path).
-        return bytes.map(|b| (b, None));
-    }
-    let envelope = frozen
-        .decode()
-        .map_err(|e| format!("decode envelope: {e}"))?;
-    let name = &envelope.experiment.module;
-    let artifact = envelope
-        .artifacts
-        .get(name)
-        .ok_or_else(|| format!("experiment module `{name}` absent from [artifacts]"))?;
-    let pin = Some(artifact.blake3.0);
+/// Fetch one genesis artifact-map entry (blake3-verified): `file://` through the file resolver;
+/// network URLs through the payload-store path under the `swarm-net` feature.
+async fn fetch_genesis_artifact(
+    artifact: &daemon_vhc_proto::SnapshotArtifact,
+    name: &str,
+) -> Result<Vec<u8>, String> {
     let art = ArtifactRef::new(artifact.url.clone(), artifact.blake3);
-
-    // Content-addressed fetch from the payload store (fleet distribution) — feature-gated because
-    // egress/presign live behind `swarm-net`.
     #[cfg(feature = "swarm-net")]
     if !artifact.url.starts_with("file://") {
         return fetch_artifact_from_store(&art)
             .await
-            .map(|b| (b, pin))
-            .map_err(|e| format!("fetch module `{name}` ({}) from store: {e}", artifact.url));
+            .map_err(|e| format!("fetch `{name}` ({}) from store: {e}", artifact.url));
     }
-
     ArtifactResolver::new()
         .fetch(&art)
         .await
-        .map(|b| (b, pin))
-        .map_err(|e| format!("resolve module `{name}` ({}): {e}", artifact.url))
+        .map_err(|e| format!("resolve `{name}` ({}): {e}", artifact.url))
+}
+
+/// Resolve the genesis **coordinator role's** module by its pinned artifact hash (the in-process
+/// self-driven join runs the run's real wasm coordinator; consensus never runs outside the
+/// sandboxed, content-addressed module). The `DAEMON_TRAIN_MODULE` override deliberately does
+/// NOT apply here — it substitutes the WORKER module source only.
+pub(crate) async fn resolve_coordinator_module(
+    env: &daemon_vhc_proto::GenesisEnvelope,
+) -> Result<Vec<u8>, String> {
+    let (_, role) = env
+        .roles
+        .iter()
+        .find(|(_, r)| r.lane == "coordinator")
+        .ok_or("genesis envelope has no role with lane `coordinator`")?;
+    let artifact = env.artifacts.get(&role.module).ok_or_else(|| {
+        format!(
+            "coordinator role module `{}` absent from the genesis artifact map",
+            role.module
+        )
+    })?;
+    fetch_genesis_artifact(artifact, &role.module).await
 }
 
 /// The presign context the node sets when spawning the worker for a live run (small env strings, NOT
