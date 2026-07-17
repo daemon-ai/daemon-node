@@ -530,3 +530,16 @@ debug = "line-tables-only"
 
 [profile.dev]
 panic = "unwind"
+
+# --- vendored patch: cubecl-cuda alloc fence-visibility (compute@2 deferred-error contract) -------
+# `cubecl-cuda` 0.10.0 (pulled transitively by `burn/cuda`, the opt-in CUDA lane of
+# `daemon-vhc-host`) panicked on a fallible device/pool reservation in `initialize_memory` instead
+# of recording the error on the stream error queue the way its `launch`/`write` paths do. The caught
+# per-task panic was dropped, leaving no state for `RunnerClient::sync`/`fence` to drain, so CUDA
+# allocation faults were readback-visible only — violating the `compute@2` fence-visibility rule
+# (ABI-spec §15, decisions D8). The vendored copy under `vendor/cubecl-cuda` is byte-identical to
+# the crates.io 0.10.0 release except for that one fix (see `vendor/cubecl-cuda/PATCH.md`); it is a
+# single-crate patch, so every sibling `cubecl-*` crate stays at the crates.io 0.10.0 source.
+# Lock-affecting only for the `cuda` lane; the default gate never compiles it.
+[patch.crates-io]
+cubecl-cuda = { path = "vendor/cubecl-cuda" }

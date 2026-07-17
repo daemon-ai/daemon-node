@@ -1,0 +1,4 @@
+# Vendored upstream source: do not reformat. Only our targeted fix is ours (see PATCH.md).
+# rustfmt discovers the nearest config per input file, so this is honored even when the
+# pre-commit hook passes vendored paths explicitly (where root `ignore` is not applied).
+disable_all_formatting = true
