@@ -264,6 +264,43 @@
         daemon = buildWorkspacePackage "daemon";
         daemon-cli = buildWorkspacePackage "daemon-cli";
 
+        # ------------------------------------------------------------------------------------
+        # Linux training-worker lane (native). D-7: the node ships WITH its training worker, so a
+        # stock `[swarm] enabled` node finds the binary its `worker_path` default names
+        # (`"daemon-vhc-worker"` since the WS6 fix — the pre-A2 `daemon-vhc` scaffold default only
+        # printed a version line and exited, crash-looping the supervisor). The `daemon-vhc-worker`
+        # bin is its own crate (crates/vhc/bins/daemon-vhc-worker); `--features burn-ndarray` is the
+        # G1 tier-1 native backend (the same lane the `swarm-ci-det` worker suite runs, and a no-op-
+        # safe toggle over burn's always-on ndarray+autodiff graph — no new deps, so it reuses the
+        # shared default-feature `cargoArtifacts`). `wgpu`/`cuda` are deliberately NOT unioned in
+        # this first Linux lane (wgpu needs the Vulkan tree; the D6 nvrtc fetch-on-demand fetcher is
+        # not built yet — the Windows cross lane is the GPU rung this wave; fat-worker unioning per
+        # architecture §9.4 [EB-10] is a follow-on). The Windows cross lane (below) is the template.
+        daemon-vhc-worker = craneLib.buildPackage (
+          commonArgs
+          // {
+            pname = "daemon-vhc-worker";
+            version = baseVersion;
+            inherit cargoArtifacts;
+            cargoExtraArgs = "-p daemon-vhc-worker --bin daemon-vhc-worker --features burn-ndarray";
+            DAEMON_BUILD_ID = buildId;
+          }
+        );
+
+        # The node closure: the daemon host binary + its training worker as ONE deployable artifact
+        # pair. `daemon` (the node) spawns `daemon-vhc-worker` by `worker_path` at runtime, so a
+        # `symlinkJoin` lands `bin/daemon` and `bin/daemon-vhc-worker` under one prefix — the node's
+        # configured default resolves on the same PATH the closure installs. (`packages.default`
+        # stays the bare `daemon` for the superproject's existing bundling; this is the additive
+        # node+worker output for deployments that host training.)
+        daemon-node = pkgs.symlinkJoin {
+          name = "daemon-node-${baseVersion}";
+          paths = [
+            daemon
+            daemon-vhc-worker
+          ];
+        };
+
         # The browser-enabled daemon: the `daemon` binary compiled with the `browser` feature
         # (chromiumoxide CDP). Kept a SEPARATE output so the default `daemon` + the workspace gate /
         # `checks` never compile the heavy (~60K generated LOC) chromiumoxide bindings. No Chromium is
@@ -941,6 +978,8 @@
           inherit
             daemon
             daemon-cli
+            daemon-vhc-worker
+            daemon-node
             daemon-browser
             daemon-infer-llama
             daemon-infer-mistralrs
