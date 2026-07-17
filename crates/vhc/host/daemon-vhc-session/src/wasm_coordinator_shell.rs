@@ -9,10 +9,33 @@
 //! re-derives through), never a native `tick`. The module owns a deterministic logical clock (one
 //! tick per delivered frame), so the run is driven **event-driven**: members are admitted with
 //! synthesized joins, warmup exits on readiness heartbeats, and each round closes on the
-//! all-committed + all-evidenced fast path — no wall-clock phase deadlines, no clock-timeout
-//! forcing. The captured driving trace is therefore reproducible from the frames alone, so a
-//! recorded run and its `swarm-replay` re-derivation share one coordinator substrate and one clock
-//! discipline (this is what un-gates `observe_record_and_replay_green`).
+//! all-committed + all-evidenced fast path. The captured driving trace is therefore reproducible
+//! from the frames alone, so a recorded run and its `swarm-replay` re-derivation share one
+//! coordinator substrate and one clock discipline (this is what un-gates
+//! `observe_record_and_replay_green`).
+//!
+//! ## Event-count deadline forcing (the churn drills)
+//!
+//! A churn drill needs phases to *expire* (a silent peer's round, the epoch-boundary cooldown +
+//! warmup). Expiry is expressed in the module's own clock discipline: the shell delivers **filler
+//! frames** that each advance the one-tick-per-frame synthetic clock until the phase deadline
+//! passes. Crucially, the *decision to force* is a **state predicate over the shell's evidence
+//! accounting** (mirroring the native shell's accounted-set rule), never a wall-clock timer:
+//!
+//! - an open round may be forced only when every peer expected to act in it is **accounted** —
+//!   committed (receipted), evidenced-stalled (`Straggle(Stalled)` for that round), or
+//!   **fault-planned** absent (the drill deliberately killed it) — and at least one expected peer
+//!   has not committed (all-committed rounds close on the fast path, no forcing);
+//! - the epoch-boundary cooldown/warmup may be forced only when the last relayed record is
+//!   arithmetically an epoch boundary, and any late-joining peers' engines are already live (a
+//!   frame-ordered barrier: the new epoch's `RoundOpen` is published only after their control
+//!   subscriptions exist).
+//!
+//! A healthy peer that has neither committed nor stalled therefore *blocks* the force — correct
+//! under arbitrary scheduling delay, which is what makes the drive deterministic under parallel
+//! lane load. Wall clock survives only as the outer [`WasmCoordinatorShellConfig::deadline`]
+//! failsafe (a wedged run errors out) and as polling *mechanism* (recv timeouts / sleeps that feed
+//! no protocol decision).
 //!
 //! This shell plays the network + storage seats around the module exactly as the testkit's cell-8
 //! whole-run harness does: it signs + relays the module's published `RoundOpen`/`RoundRecord`s onto
@@ -20,6 +43,7 @@
 //! `StorageReceipt` availability evidence over the shared payload store.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -57,6 +81,32 @@ pub struct WasmCoordinatorShellConfig {
     pub poll: Duration,
     /// Hard wall on the whole drive (a wedged run cannot hang the harness).
     pub deadline: Duration,
+    /// Signing keys of peers admitted at the first epoch boundary (the late-join drill). Their
+    /// synthesized `Join` is staged into `pending` during epoch 0 and applied at the epoch boundary
+    /// (the frozen `RoundEngine` never joins — the coordinator drives admission, §6.5).
+    pub late_keys: Vec<SigningKey>,
+    /// The frame-ordered barrier for the epoch-boundary roster transition (the late-join drill):
+    /// the harness sets this once every late-joining peer's engine has been **constructed** — the
+    /// engine subscribes to the control plane in its constructor, so once the flag is observed, the
+    /// next epoch's `RoundOpen` is guaranteed to be queued to the late engine. The shell refuses to
+    /// force the epoch boundary until then: whether the late peer hears its first round is a
+    /// wait-on-observed-state, never a thread-interleaving race. Ignored when `late_keys` is empty.
+    pub late_engines_live: Arc<AtomicBool>,
+    /// If set, re-instantiate the coordinator module from its exported state right after the record
+    /// for this round is relayed (the mid-run restart drill): quiesce→snapshot→`da_migrate` a fresh
+    /// incarnation, which resumes the same logical timeline (ABI §10.2/§10.3).
+    pub restart_after_round: Option<u64>,
+    /// Drive clock-forced phases (round/cooldown/warmup timeouts) by delivering **filler frames**
+    /// that advance the module's one-tick-per-frame synthetic clock past the phase deadline (the
+    /// event-count clock discipline for the churn drills). `false` keeps the pure event-driven
+    /// fast-path drive (the fault-free whole-run / observe-replay lane — no deadline ever fires).
+    /// When to force is decided by the accounted-set state predicate (module docs), never a timer.
+    pub force_deadlines: bool,
+    /// The drill's fault plan, as the accounted-set predicate consumes it: `(peer, last round the
+    /// peer acts in)` — for later rounds the peer is deliberately dead/silent and counts as
+    /// accounted immediately (no waiting), so its round can be deadline-forced as soon as every
+    /// healthy peer is accounted. Empty when no peer is fault-planned.
+    pub planned_absent: Vec<(PeerId, u64)>,
 }
 
 /// The wasm-backed impure shell: it drives the production `coordinator-quorum` module over the
@@ -69,13 +119,31 @@ pub struct WasmCoordinatorShell<C> {
     version: SwarmProtoVersion,
     initial: CoordinatorState,
     bootstrap_keys: Vec<SigningKey>,
+    late_keys: Vec<SigningKey>,
+    late_engines_live: Arc<AtomicBool>,
     num_rounds: u64,
     poll: Duration,
     deadline: Duration,
+    restart_after_round: Option<u64>,
+    force_deadlines: bool,
+    planned_absent: BTreeMap<PeerId, u64>,
     /// The coordinator's §12.1 frame-signing identity (the envelope-named SingleKey authority).
     coord_key: SigningKey,
     /// Peers whose commitment for a round has been evidenced (drives one receipt per commitment).
     committed: BTreeMap<u64, BTreeSet<PeerId>>,
+    /// Peers that reported `Straggle(Stalled)` for a round (evidenced-stalled — accounted, §6.4).
+    stalled: BTreeMap<u64, BTreeSet<PeerId>>,
+    /// The peers the module currently counts as roster members the shell expects action from:
+    /// bootstrap at start, + the late joiners once the epoch boundary applies their staged join,
+    /// − every peer a published record dropped. The accounted-set predicate ranges over this.
+    expected: BTreeSet<PeerId>,
+    /// The round the module currently has open (`RoundOpen(r)` relayed, its record not yet) — the
+    /// shell's frame-ordered view of "a round is active".
+    open_round: Option<u64>,
+    /// The last round whose `RoundRecord` was relayed.
+    last_record: Option<u64>,
+    /// Whether the late joiners have been added to `expected` (the boundary force ran).
+    late_expected: bool,
     /// The captured driving-frame trace (worker messages the module consumed), for the replay
     /// oracle — never the module's own published decisions (those are the wire-log oracle).
     inputs: Vec<Input>,
@@ -92,6 +160,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         cfg: WasmCoordinatorShellConfig,
     ) -> Self {
         let coord_key = coordinator_key();
+        let expected: BTreeSet<PeerId> = cfg.bootstrap_keys.iter().map(peer_id).collect();
         Self {
             control,
             store,
@@ -99,11 +168,21 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
             version: cfg.version,
             initial: cfg.state,
             bootstrap_keys: cfg.bootstrap_keys,
+            late_keys: cfg.late_keys,
+            late_engines_live: cfg.late_engines_live,
             num_rounds: cfg.num_rounds,
             poll: cfg.poll,
             deadline: cfg.deadline,
+            restart_after_round: cfg.restart_after_round,
+            force_deadlines: cfg.force_deadlines,
+            planned_absent: cfg.planned_absent.into_iter().collect(),
             coord_key,
             committed: BTreeMap::new(),
+            stalled: BTreeMap::new(),
+            expected,
+            open_round: None,
+            last_record: None,
+            late_expected: false,
             inputs: Vec::new(),
             dropped: BTreeSet::new(),
         }
@@ -185,55 +264,180 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
     }
 
     /// Relay every module decision published since `consumed`: sign it under the coordinator key
-    /// and broadcast it on the control plane (the peers verify + consume it), accounting drops and
-    /// counting `RoundRecord`s. Returns the running record count.
+    /// and broadcast it on the control plane (the peers verify + consume it). Maintains the shell's
+    /// frame-ordered view of the module's round lifecycle (`open_round`/`last_record`), accounts
+    /// drops out of the expected set, and returns the number of **new** `RoundRecord`s relayed this
+    /// call (a delta — the caller keeps a running total, which survives a mid-run re-instantiation
+    /// where the fresh instance's `published` cursor restarts at 0).
     async fn relay_new(
         &mut self,
         coord: &WasmCoordinator,
         consumed: &mut usize,
     ) -> Result<u64, SwarmRunError> {
         let published = coord.published();
-        // Relay only the decisions published since last time (the peers consume them once).
-        for (_, _, _, msg) in published.iter().skip(*consumed) {
+        let start = (*consumed).min(published.len());
+        let mut new_records = 0u64;
+        for (_, _, _, msg) in published.iter().skip(start) {
             let signed = SignedMessage::sign(&self.coord_key, self.version, msg.clone())
                 .map_err(|e| SwarmRunError::Lifecycle(format!("relay sign: {e}")))?;
             let bytes = to_canonical_vec(&signed)
                 .map_err(|e| SwarmRunError::Lifecycle(format!("relay encode: {e}")))?;
             self.control.publish(&bytes).await?;
-        }
-        *consumed = published.len();
-        // Account drops (idempotent set-insert) + count the records the module has published.
-        let mut records = 0u64;
-        for (_, _, _, msg) in &published {
-            if let SwarmMessage::RoundRecord(rr) = msg {
-                records += 1;
-                for p in &rr.drops {
-                    self.dropped.insert(*p);
+            match msg {
+                SwarmMessage::RoundOpen(ro) => {
+                    self.open_round = Some(ro.round);
                 }
+                SwarmMessage::RoundRecord(rr) => {
+                    new_records += 1;
+                    self.last_record = Some(rr.round);
+                    if self.open_round == Some(rr.round) {
+                        self.open_round = None;
+                    }
+                    for p in &rr.drops {
+                        self.dropped.insert(*p);
+                        self.expected.remove(p);
+                    }
+                }
+                _ => {}
             }
         }
-        Ok(records)
+        *consumed = published.len();
+        Ok(new_records)
+    }
+
+    /// The accounted-set force predicate (the event-count analogue of the native shell's
+    /// `maybe_force_accounted`, a STATE predicate — never a timer). Returns whether the module is
+    /// sitting in a clock-gated phase that the shell should now expire with filler frames:
+    ///
+    /// - **An open round**: forceable iff every expected peer is accounted — committed (receipted),
+    ///   evidenced-stalled (`Straggle(Stalled)` for this round), or fault-planned absent — AND some
+    ///   expected peer has not committed (all-committed rounds close on the fast path untouched).
+    ///   A healthy peer that has neither committed nor stalled BLOCKS the force, which makes the
+    ///   decision correct under arbitrary scheduling delay.
+    /// - **Between rounds at an epoch boundary** (the record relayed, the next round's open
+    ///   requires cooldown + warmup expiry): forceable once the late-join barrier is satisfied —
+    ///   the staged joins were delivered frame-ordered long before, and the late engines' control
+    ///   subscriptions exist (`late_engines_live`), so the new epoch's `RoundOpen` cannot be
+    ///   published into the void. Adds the late joiners to the expected set at that point.
+    ///
+    /// Within-epoch record→open transitions are module-internal fast paths (`finalize_round` opens
+    /// the next round in the same tick) and are never forced — this also makes the shell immune to
+    /// the torn read where the record is relayed while its sibling open is still in flight.
+    fn should_force(&mut self) -> bool {
+        if let Some(r) = self.open_round {
+            let committed = self.committed.get(&r);
+            let stalled = self.stalled.get(&r);
+            let is_committed = |p: &PeerId| committed.is_some_and(|c| c.contains(p));
+            let accounted = |p: &PeerId| {
+                is_committed(p)
+                    || stalled.is_some_and(|s| s.contains(p))
+                    || self.planned_absent.get(p).is_some_and(|last| r > *last)
+            };
+            return !self.expected.is_empty()
+                && self.expected.iter().all(accounted)
+                && self.expected.iter().any(|p| !is_committed(p));
+        }
+        // No round open: force only across a genuine epoch boundary (cooldown + warmup expiry).
+        let Some(r) = self.last_record else {
+            return false;
+        };
+        let epoch_rounds = self.initial.config.epoch_rounds;
+        let boundary = epoch_rounds > 0 && (r + 1) % epoch_rounds == 0;
+        if !boundary || r + 1 >= self.num_rounds {
+            return false;
+        }
+        // The frame-ordered roster barrier: hold the boundary until every late engine is live.
+        if !self.late_keys.is_empty() {
+            if !self.late_engines_live.load(Ordering::Acquire) {
+                return false;
+            }
+            if !self.late_expected {
+                for k in &self.late_keys {
+                    self.expected.insert(peer_id(k));
+                }
+                self.late_expected = true;
+            }
+        }
+        true
+    }
+
+    /// Whether the module has published a `RoundOpen` yet (round 0 has opened) — the cue to stage
+    /// the late-join `Join` into `pending` so it lands in the roster at the first epoch boundary
+    /// (delivering it before an open would upsert it into epoch 0's roster instead).
+    fn round_opened(coord: &WasmCoordinator) -> bool {
+        coord
+            .published()
+            .iter()
+            .any(|(_, _, _, m)| matches!(m, SwarmMessage::RoundOpen(_)))
+    }
+
+    /// Force the module past a clock-gated phase deadline (round train/witness, cooldown, warmup)
+    /// by delivering **filler frames** — coordinator-signed no-op heartbeats — that each advance the
+    /// module's one-tick-per-frame synthetic clock (architecture §4.1). A filler is a non-member
+    /// frame: the tick ignores it (the coordinator is not a roster member) but still ticks the clock
+    /// once, so a bounded batch expires the deadline and the module publishes the next decision. The
+    /// event-count analogue of the native shell's `Input::Clock` jump — no wall-clock forcing (the
+    /// sleep below is a polling mechanism for the guest thread to drain, feeding no decision).
+    fn force_step(&mut self, coord: &mut WasmCoordinator) -> Result<(), SwarmRunError> {
+        const FORCE_CAP: usize = 512;
+        const BATCH: usize = 8;
+        // The filler loop blocks (deliver + poll sleeps): hand the worker's task queue off so the
+        // same runtime's engine/collector tasks keep running while the phase is expired.
+        tokio::task::block_in_place(|| {
+            let before = coord.published().len();
+            let coord_key = self.coord_key.clone();
+            let filler = SwarmMessage::Heartbeat(daemon_vhc_proto::messages::Heartbeat {
+                round: 0,
+                ready: None,
+            });
+            let mut delivered = 0usize;
+            while delivered < FORCE_CAP {
+                for _ in 0..BATCH {
+                    self.deliver(coord, &coord_key, &filler)?;
+                    delivered += 1;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                if coord.published().len() > before {
+                    break;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Drive the run to completion over the wasm coordinator, returning the reproducible driving
     /// trace ([`CoordinatorReplay`]) for the observe capture.
     ///
+    /// On the fault-free lane (`force_deadlines == false`) this is the pure event-driven drive:
+    /// joins + readiness heartbeats open round 0 and each round closes on the all-committed +
+    /// all-evidenced fast path. The churn drills set `force_deadlines`, which adds the event-count
+    /// clock discipline: a stalled/silent round (or the cooldown+warmup at an epoch boundary) is
+    /// force-closed with **filler frames** ([`WasmCoordinatorShell::force_step`]), the late joiner is
+    /// admitted at the epoch boundary, and the restart drill re-instantiates the module from its
+    /// exported state ([`WasmCoordinator::quiesce_snapshot`] → [`WasmCoordinator::start_migrating`]).
+    ///
     /// # Errors
     /// [`SwarmRunError::Lifecycle`] on a build/start/deliver failure or the run's hard deadline.
+    #[allow(clippy::too_many_lines)]
     pub async fn drive(mut self) -> Result<CoordinatorReplay, SwarmRunError> {
         let wasm = crate::replay_sandbox::coordinator_quorum_wasm()
             .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator blob: {e}")))?;
         let spec = self.spec(&wasm)?;
         let coord_seed =
             *blake3_hash(b"daemon-swarm/harness/wasm-coordinator/frame-key").as_bytes();
-        let mut coord = WasmCoordinator::start(&wasm, &spec, Vec::new(), 0, coord_seed)
-            .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator start: {e}")))?;
+        // The module start compiles the blob (CPU-seconds): hand this worker's task queue off
+        // first so the drive cannot starve the same runtime's engine/collector tasks.
+        let mut coord = tokio::task::block_in_place(|| {
+            WasmCoordinator::start(&wasm, &spec, Vec::new(), 0, coord_seed)
+        })
+        .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator start: {e}")))?;
 
         let mut sub = self.control.subscribe();
 
         // Admit the roster and exit warmup event-driven: joins bring the roster to `min_peers`,
         // then readiness heartbeats open round 0 (no warmup clock — the module ticks per frame).
         let boot = self.bootstrap_keys.clone();
+        let late = self.late_keys.clone();
         let envelope_hash = self.initial.config.envelope_hash;
         for key in &boot {
             let join = SwarmMessage::Join(Join {
@@ -253,21 +457,89 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
             self.deliver(&mut coord, key, &hb)?;
         }
 
-        let peer_keys: BTreeMap<PeerId, SigningKey> =
-            boot.iter().map(|k| (peer_id(k), k.clone())).collect();
+        // The full keyed roster (bootstrap + any late joiner) the inbound-frame router keys on.
+        let peer_keys: BTreeMap<PeerId, SigningKey> = boot
+            .iter()
+            .chain(late.iter())
+            .map(|k| (peer_id(k), k.clone()))
+            .collect();
 
         let mut consumed = 0usize;
+        let mut total_records = 0u64;
+        let mut late_joined = late.is_empty();
+        let mut reloads = 0u32;
+        // Wall clock appears ONLY as the outer failsafe below (a wedged run errors the harness
+        // out); every force decision is the accounted-set state predicate (`should_force`).
         let start = Instant::now();
         loop {
-            let records = self.relay_new(&coord, &mut consumed).await?;
-            if records >= self.num_rounds {
+            let delta = self.relay_new(&coord, &mut consumed).await?;
+            total_records += delta;
+
+            // Stage the late joiner once round 0 has opened: delivered now it lands in `pending`
+            // and is applied to the roster at the first epoch boundary (§6.2). Frame-ordered: this
+            // join precedes every boundary-forcing filler on the module's delivery stream, so
+            // "staged before the boundary drain" is a certainty, not a race.
+            if !late_joined && Self::round_opened(&coord) {
+                for key in &late {
+                    let join = SwarmMessage::Join(Join {
+                        run_id: self.run.as_str().to_string(),
+                        iroh_id: JOIN_IROH_ID,
+                        class: ThroughputClass::C1,
+                        capabilities: CapabilitySet::new(),
+                        envelope_hash: Some(envelope_hash),
+                    });
+                    self.deliver(&mut coord, key, &join)?;
+                }
+                late_joined = true;
+            }
+
+            // Mid-run restart: after the record for `restart_after_round` is relayed, re-instantiate
+            // the module from its exported state (the fresh incarnation resumes the same timeline).
+            if let Some(r) = self.restart_after_round {
+                if total_records > r {
+                    // Blocking span (guest-thread join + module recompile): hand the worker off.
+                    coord = tokio::task::block_in_place(|| {
+                        let capture = coord.quiesce_snapshot(60_000).map_err(|e| {
+                            SwarmRunError::Lifecycle(format!("coordinator restart quiesce: {e}"))
+                        })?;
+                        WasmCoordinator::start_migrating(
+                            &wasm,
+                            &spec,
+                            Vec::new(),
+                            1,
+                            coord_seed,
+                            capture,
+                        )
+                        .map_err(|e| {
+                            SwarmRunError::Lifecycle(format!(
+                                "coordinator restart re-instantiate: {e}"
+                            ))
+                        })
+                    })?;
+                    consumed = 0;
+                    reloads += 1;
+                    self.restart_after_round = None;
+                    continue;
+                }
+            }
+
+            if total_records >= self.num_rounds {
                 break;
             }
             if start.elapsed() >= self.deadline {
                 return Err(SwarmRunError::Lifecycle(format!(
-                    "wasm coordinator drive deadline: {records}/{} records",
+                    "wasm coordinator drive deadline: {total_records}/{} records",
                     self.num_rounds
                 )));
+            }
+            // Event-count deadline-close, gated on the accounted-set STATE predicate: expire the
+            // stuck phase (a round whose only missing actors are evidenced-stalled or
+            // fault-planned, or the epoch-boundary cooldown + warmup) with filler frames. A healthy
+            // peer that has neither committed nor stalled blocks this, so the decision is
+            // deterministic under arbitrary scheduling delay — no timer is consulted.
+            if self.force_deadlines && self.should_force() {
+                self.force_step(&mut coord)?;
+                continue;
             }
             match tokio::time::timeout(self.poll, sub.recv()).await {
                 Ok(Some(bytes)) => {
@@ -281,6 +553,11 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
                     match &msg.payload {
                         // Skip the coordinator's own relayed outputs echoed back over gossip.
                         SwarmMessage::RoundOpen(_) | SwarmMessage::RoundRecord(_) => continue,
+                        // Peer heartbeats are advisory post-warmup (readiness is synthesized at
+                        // admission), and every delivered frame ticks the module's synthetic
+                        // clock — relaying a steady heartbeat stream would burn a round's deadline
+                        // budget before its evidence lands. Not delivered; carries no accounting.
+                        SwarmMessage::Heartbeat(_) => continue,
                         SwarmMessage::Commitment(Commitment { round, .. }) => {
                             let round = *round;
                             if let Some(key) = peer_keys.get(&signer) {
@@ -288,6 +565,21 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
                                 self.deliver(&mut coord, &key, &msg.payload)?;
                             }
                             self.receipt_for(&mut coord, round, signer).await?;
+                        }
+                        SwarmMessage::Straggle(st) => {
+                            let (round, is_stalled) = (
+                                st.round,
+                                st.status == daemon_vhc_proto::messages::StraggleStatus::Stalled,
+                            );
+                            if let Some(key) = peer_keys.get(&signer) {
+                                let key = key.clone();
+                                self.deliver(&mut coord, &key, &msg.payload)?;
+                            }
+                            // Evidenced-stalled: the peer declared it skips this round — it is
+                            // accounted, so the round becomes deadline-forceable (§6.4).
+                            if is_stalled {
+                                self.stalled.entry(round).or_default().insert(signer);
+                            }
                         }
                         _ => {
                             if let Some(key) = peer_keys.get(&signer) {
@@ -298,7 +590,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
                     }
                 }
                 Ok(None) => break,
-                Err(_) => { /* poll timeout — re-drain the module's decisions at the loop top */ }
+                Err(_) => { /* poll timeout — re-drain + re-evaluate forcing at the loop top */ }
             }
         }
 
@@ -312,6 +604,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
             self.initial,
             self.inputs,
             self.dropped,
+            reloads,
         ))
     }
 }

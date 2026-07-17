@@ -759,17 +759,39 @@ where
     // The coordinator drive (subscribes at construction, before it opens round 0). Either the
     // native `tick` shell or — when `wasm_coordinator` is set — the production coordinator-quorum
     // module (event-driven), so the recorded run and its replay oracle share one substrate.
+    // The clock-forced churn drills (a silent peer to drop, a stalled round to time out, an
+    // epoch-boundary cooldown+warmup to expire) need finite phase deadlines the wasm shell can
+    // reach with filler frames (the event-count clock discipline). The fault-free lanes keep the
+    // deadlines effectively infinite so the module is driven purely by its event-driven fast paths.
+    let force_deadlines = cfg.wasm_coordinator
+        && (cfg.silent_death.is_some() || cfg.outage.is_some() || cfg.late_join.is_some());
+    // The drill's fault plan, in the shell's accounted-set vocabulary: the silent-death peer acts
+    // through `after_round` and is deliberately absent thereafter — accounted immediately, so its
+    // rounds are deadline-forceable as soon as every healthy peer is accounted.
+    let planned_absent: Vec<(PeerId, u64)> = cfg
+        .silent_death
+        .map(|d| (boot_ids[d.peer_index], d.after_round))
+        .into_iter()
+        .collect();
+    // The frame-ordered late-join barrier: set once the late engine is CONSTRUCTED (its control
+    // subscription exists), which is when forcing the epoch boundary becomes safe — the new
+    // epoch's RoundOpen is then guaranteed to be queued to it.
+    let late_engines_live = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // A phase-deadline value comfortably above the per-round frame count (commitments + authored
+    // receipts + straggles) so a healthy round always closes on the fast path first, yet small
+    // enough that a bounded filler-frame batch expires it.
+    const FORCED_PHASE_S: u64 = 40;
     let mut coord_run_config = build_run_config(&run, &cfg);
     if cfg.wasm_coordinator {
-        // The module owns a one-tick-per-frame synthetic clock, so wall-clock phase deadlines
-        // would fire on every delivered frame and close rounds prematurely. Push them effectively
-        // infinite: the run is driven entirely by the event-driven fast paths (readiness exits
-        // warmup, all-committed + all-evidenced finalizes each round), and the captured frame trace
-        // is reproducible with no clock inputs at all (the sandbox replay drops clocks).
-        coord_run_config.warmup_s = 1_000_000;
-        coord_run_config.round_train_max_s = 1_000_000;
-        coord_run_config.round_witness_s = 1_000_000;
-        coord_run_config.cooldown_s = 1_000_000;
+        let phase = if force_deadlines {
+            FORCED_PHASE_S
+        } else {
+            1_000_000
+        };
+        coord_run_config.warmup_s = phase;
+        coord_run_config.round_train_max_s = phase;
+        coord_run_config.round_witness_s = phase;
+        coord_run_config.cooldown_s = phase;
     }
     let coord_state = CoordinatorState::new(coord_run_config, Seed([0xAB; 32]), 0);
     let coord_handle: JoinHandle<Result<CoordinatorReplay, SwarmRunError>> = if cfg.wasm_coordinator
@@ -779,9 +801,14 @@ where
             version,
             state: coord_state,
             bootstrap_keys: boot_keys.clone(),
+            late_keys: late_key.iter().cloned().collect(),
             num_rounds: cfg.num_rounds,
             poll: Duration::from_millis(50),
             deadline: Duration::from_secs(180),
+            late_engines_live: late_engines_live.clone(),
+            restart_after_round: cfg.restart_after_round,
+            force_deadlines,
+            planned_absent,
         };
         let shell = crate::wasm_coordinator_shell::WasmCoordinatorShell::new(
             gossip.clone(),
@@ -804,8 +831,12 @@ where
         tokio::spawn(async move { coordinator.drive().await })
     };
 
-    // Collect events until every expected peer finishes (or leaves / is killed), with a safety
-    // timeout so a silent/left peer cannot hang the harness.
+    // Collect events until every expected peer finishes (or leaves / is killed). The timeout is a
+    // pure OUTER FAILSAFE (a wedged run cannot hang the harness forever) and feeds no protocol
+    // decision — every in-run decision (deadline forcing, late-join release, drops) is event- or
+    // state-driven. It is sized generously: under heavy parallel-suite CPU starvation a healthy
+    // run can legitimately go quiet for tens of seconds, and giving up early here would cancel the
+    // late-engine spawn (an event-driven step this collector performs).
     let last_round = cfg.num_rounds.saturating_sub(1);
     let mut events: Vec<(PeerId, EngineEvent)> = Vec::new();
     let mut done: BTreeSet<PeerId> = BTreeSet::new();
@@ -819,7 +850,7 @@ where
         if !awaiting_late && expected.iter().all(|p| done.contains(p)) {
             break;
         }
-        match tokio::time::timeout(Duration::from_secs(20), col_rx.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(90), col_rx.recv()).await {
             Ok(Some((peer, ev))) => {
                 // Late-join: when a bootstrap peer checkpoints the resume round, spawn the late peer.
                 if awaiting_late {
@@ -845,6 +876,11 @@ where
                                 fwd_handles.push(fwd_h);
                                 expected.insert(lpeer);
                                 awaiting_late = false;
+                                // The engine subscribed to the control plane in its constructor
+                                // (inside `launch_engine`), so the wasm shell's epoch-boundary
+                                // force is now safe to release: the new epoch's RoundOpen will be
+                                // queued to the late engine (the frame-ordered roster barrier).
+                                late_engines_live.store(true, std::sync::atomic::Ordering::Release);
                             }
                         }
                     }

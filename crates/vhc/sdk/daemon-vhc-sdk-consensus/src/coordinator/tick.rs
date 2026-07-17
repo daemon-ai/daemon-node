@@ -241,7 +241,15 @@ fn on_join(
         Err(reason) => out.push(Output::Reject(Rejection::Admission(reason))),
         Ok(()) => {
             let m = Member::joining(signer, j.iroh_id, j.class, state.epoch);
-            if state.phase == Phase::WaitingForMembers {
+            // The epoch roster forms through the whole pre-round window (`WaitingForMembers` +
+            // `Warmup`): a peer that joins before the first round opens is a live member. A join
+            // that arrives once a round is ACTIVE is staged `pending` (the roster is frozen for the
+            // epoch, §6.2) and materializes at the next epoch boundary. Admitting during `Warmup`
+            // lets an initial roster larger than `min_peers` form even when the coordinator's
+            // synthetic clock advances one tick per delivered join (so `min_peers` is reached before
+            // the last bootstrap join lands) — the driver need not pin `min_peers` to the exact
+            // bootstrap count.
+            if matches!(state.phase, Phase::WaitingForMembers | Phase::Warmup) {
                 upsert_member(state, m);
             } else {
                 state.pending.push(m);
