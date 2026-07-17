@@ -196,6 +196,28 @@ async fn main() {
                 // The v2 session run drives itself to completion within JoinRun; the durable
                 // intent lives at the node. Nothing held here to tear down.
             }
+            Command::SwitchModule { run_id, .. } => {
+                // The LOCAL upgrade transaction (ABI §10.3) runs against a LIVE, held role-instance
+                // — quiesce → snapshot → owner-law re-admission → migrate → validate → activate,
+                // via `daemon_vhc_session::upgrade::{run_local_upgrade, LiveUpgradeSteps}`. The
+                // in-process self-driven t2 join above owns its sandbox to completion (it holds no
+                // instance across commands), so — exactly like `Throttle`/`Leave` — there is no
+                // live instance to switch here. A running instance is driven through the node
+                // command surface (`WorkerControl::switch_module`), where the transaction has the
+                // live pump/admission/migrate path in hand; the long-lived in-process join that
+                // would hold an instance across `SwitchModule` arrives with the wasm-coordinator
+                // re-seat of the worker session.
+                send(
+                    &writer,
+                    &worker_error(&format!(
+                        "SwitchModule for run `{run_id}`: no live role-instance is held in this \
+                         worker (the self-driven join runs to completion); the live upgrade \
+                         transaction is driven at the node command surface \
+                         (WorkerControl::switch_module) over the held instance"
+                    )),
+                )
+                .await;
+            }
             Command::Ping => send(&writer, &Event::Pong).await,
             Command::Shutdown => {
                 break;

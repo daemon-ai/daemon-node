@@ -108,6 +108,28 @@ async fn main() {
             Command::Throttle { .. } | Command::Leave { .. } => {
                 // One-way commands: no reply.
             }
+            Command::SwitchModule {
+                run_id,
+                epoch,
+                new_module,
+                ..
+            } => {
+                if misbehave {
+                    std::process::exit(1);
+                }
+                // The fake acknowledges the switch as an activation of the target epoch/module
+                // (the real host-enforced transaction lives in the node/session upgrade path).
+                send(
+                    &writer,
+                    &Event::ModuleSwitched {
+                        run_id,
+                        epoch,
+                        module: new_module,
+                        retries: 0,
+                    },
+                )
+                .await;
+            }
             Command::Ping => send(&writer, &Event::Pong).await,
             Command::Shutdown => break,
         }

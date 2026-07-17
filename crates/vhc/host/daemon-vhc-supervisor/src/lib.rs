@@ -118,6 +118,28 @@ impl TrainClientError {
     }
 }
 
+/// The outcome of a [`TrainSupervisor::switch_module`] live upgrade (ABI §10.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchOutcome {
+    /// The new module activated locally under the target epoch (§10.3 step 6): the old module
+    /// quiesced, its state migrated, and the new module resumed — no process restart.
+    Activated {
+        /// The epoch now running locally (the already-committed target epoch).
+        epoch: u64,
+        /// The new module hash now bound to the role-instance.
+        module: [u8; 32],
+        /// Rollback-and-retry cycles used before activation (`0` on a clean first migration).
+        retries: u32,
+    },
+    /// The local transaction failed closed / exhausted its retries and **left the run** (§10.3
+    /// step 7): the chain is NOT rolled back and the old epoch is not resumed; the worker is
+    /// unharmed, and the node churns / re-admits. `reason` is the typed `LeaveReason` detail.
+    Left {
+        /// Why the worker left the run (the `LeaveReason` display).
+        reason: String,
+    },
+}
+
 /// A supervised client over a single `daemon-vhc-host` worker process.
 pub struct TrainSupervisor {
     inner: Arc<Inner>,
@@ -249,6 +271,60 @@ impl TrainSupervisor {
             mode,
         })
         .await
+    }
+
+    /// Initiate a live module upgrade for a running instance (ABI §10.3; architecture §5.4).
+    ///
+    /// Sends [`Command::SwitchModule`] (the run-level upgrade record has already committed to the
+    /// transition chain) and awaits the terminal fact: [`Event::ModuleSwitched`] →
+    /// [`SwitchOutcome::Activated`], or a fail-closed / exhausted transaction that leaves the run
+    /// (the worker answers `Event::Error{class: Module, ..}`, the worker unharmed) →
+    /// [`SwitchOutcome::Left`]. Any other worker fault propagates as a [`TrainClientError`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn switch_module(
+        &self,
+        run_id: impl Into<String>,
+        epoch: u64,
+        role: impl Into<String>,
+        new_module: [u8; 32],
+        grants_hash: [u8; 32],
+        deadline_ms: u64,
+    ) -> Result<SwitchOutcome, TrainClientError> {
+        let cmd = Command::SwitchModule {
+            run_id: run_id.into(),
+            epoch,
+            role: role.into(),
+            new_module,
+            grants_hash,
+            deadline_ms,
+        };
+        let res = self
+            .exchange(cmd, |ev| match ev {
+                Event::ModuleSwitched {
+                    epoch,
+                    module,
+                    retries,
+                    ..
+                } => Some(Ok(SwitchOutcome::Activated {
+                    epoch,
+                    module,
+                    retries,
+                })),
+                _ => None,
+            })
+            .await;
+        match res {
+            Ok(outcome) => Ok(outcome),
+            // A fail-closed / exhausted local transaction leaves the run: the worker answers
+            // `Error{class: Module}` (unharmed). That is a normal upgrade outcome, not a fault —
+            // the node churns / re-admits on it. `Module` is not a worker-replacing class, so the
+            // supervised worker survives (as the spec requires: the old epoch is simply left).
+            Err(TrainClientError::Worker {
+                class: ErrorClass::Module,
+                detail,
+            }) => Ok(SwitchOutcome::Left { reason: detail }),
+            Err(e) => Err(e),
+        }
     }
 
     /// Liveness check: spawn if needed, then `Ping`/`Pong`.

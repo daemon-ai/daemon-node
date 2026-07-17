@@ -191,6 +191,36 @@ pub enum Command {
         /// How to leave.
         mode: LeaveMode,
     },
+    /// Initiate a live module upgrade for a running instance (ABI §10.3; architecture §5.4).
+    ///
+    /// The run-level upgrade record has ALREADY committed to the transition chain (the global
+    /// event — deliverable 1; it advanced the epoch). This command tells the worker to run the
+    /// **local** half of the transaction against the already-committed target epoch: quiesce →
+    /// snapshot → owner-law re-admission (grant-expanding **fails closed**) → migrate → validate →
+    /// activate, or roll back and retry / leave. It is **hash-pinned and authority-bound**: the
+    /// worker admits the target under owner law only if its bytes match `new_module`, and re-derives
+    /// the grants document against `grants_hash` (the committed record's anchor). Success answers
+    /// with [`Event::ModuleSwitched`]; a fail-closed / exhausted transaction leaves the run and
+    /// answers [`Event::Error`]`{ class: Module, .. }` (the worker is unharmed; the node churns).
+    SwitchModule {
+        /// The run whose role-instance is upgrading.
+        run_id: String,
+        /// The committed transition-chain epoch this switch activates (§8.1). No host advances the
+        /// chain — it advanced when the upgrade record committed.
+        epoch: u64,
+        /// The role whose module is switching. The target module is a pure function of
+        /// `(run_id, epoch, role)` via the chain (ABI §8.1/§10.3).
+        role: String,
+        /// The hash-pinned target module for `role` at `epoch` — admission refuses any mismatch.
+        new_module: [u8; 32],
+        /// The committed upgrade record's grants anchor
+        /// (`daemon_vhc_proto::UpgradeRecordBody::grants_hash`) the owner-law re-check verifies the
+        /// re-derived grants document against.
+        grants_hash: [u8; 32],
+        /// The drain deadline in ms (§4.4). The node clamps it to the lane's
+        /// `quiesce_deadline_max_ms` ceiling before sending (§9.6).
+        deadline_ms: u64,
+    },
     /// Ask the worker to exit cleanly.
     Shutdown,
     /// Liveness probe (answered with [`Event::Pong`]).
@@ -277,6 +307,20 @@ pub enum Event {
         class: ErrorClass,
         /// A short human-readable detail.
         detail: String,
+    },
+    /// A live module upgrade activated (ABI §10.3 step 6; architecture §5.4): the old module
+    /// quiesced at the fence, its state migrated, and the new module resumed under the target epoch
+    /// — without a process restart, det digests continuous across the fence. The answer to a
+    /// successful [`Command::SwitchModule`].
+    ModuleSwitched {
+        /// The run that upgraded.
+        run_id: String,
+        /// The epoch now running locally (the already-committed target epoch).
+        epoch: u64,
+        /// The new module hash now bound to the role-instance.
+        module: [u8; 32],
+        /// Rollback-and-retry cycles used before activation (`0` on a clean first migration).
+        retries: u32,
     },
     /// Liveness reply to [`Command::Ping`].
     Pong,
@@ -514,6 +558,14 @@ mod tests {
             run_id: "run-42".into(),
             mode: LeaveMode::Graceful,
         });
+        round_trip_command(Command::SwitchModule {
+            run_id: "run-42".into(),
+            epoch: 1,
+            role: "worker".into(),
+            new_module: [0x5A; 32],
+            grants_hash: [0x6B; 32],
+            deadline_ms: 5_000,
+        });
         round_trip_command(Command::Shutdown);
         round_trip_command(Command::Ping);
     }
@@ -602,6 +654,12 @@ mod tests {
                 detail: "boom".into(),
             });
         }
+        round_trip_event(Event::ModuleSwitched {
+            run_id: "run-42".into(),
+            epoch: 3,
+            module: [0x5A; 32],
+            retries: 1,
+        });
         round_trip_event(Event::Pong);
     }
 
