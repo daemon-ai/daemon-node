@@ -11,11 +11,12 @@ path = "src/lib.rs"
 [dependencies]
 # The wire contract (message types, canonical codec, envelope, hashes).
 daemon-vhc-proto = { workspace = true }
-# The pure coordinator `tick` the replay oracle re-runs (PROTO-20). Relocated at D2 from the
-# dissolved daemon-vhc-coordinator into sdk/daemon-vhc-sdk-consensus's `coordinator` module.
-# TRACKED dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/* — the coordinator
-# oracle re-runs the native tick; it re-seats onto the wasm coordinator blob (via the host runtime)
-# when the D2 consensus-replay verifier lands, retiring this edge.
+# The shared coordinator types the replay oracle carries (PROTO-20): `CoordinatorState` (the
+# genesis-derived config the coordinator module is initialized with) + the `Input` trace. The
+# oracle no longer re-runs a native `tick`: consensus is re-derived inside the sandboxed
+# `coordinator-quorum` module through the `CoordinatorSandbox` seam (consensus never runs
+# outside the sandbox, even in verification), so this is now a types-only dependency.
+# TRACKED dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/*.
 daemon-vhc-sdk-consensus = { workspace = true }
 # The journal record grammar + framing constants (ABI companion §8.2/§8.3/§8.5). This crate encodes
 # journal records and validates them against `daemon_vhc_abi::JOURNAL_CDDL` (the authoritative CDDL);
@@ -43,6 +44,11 @@ chacha20poly1305 = "0.10"
 # Journal grammar conformance: encode each record and validate it against `daemon_vhc_abi::JOURNAL_CDDL`
 # under the same validator + exact pin the proto/daemon-api conformance suites use.
 cddl-cat = "=0.7.1"
+# The replay-oracle tests re-derive consensus inside the real `coordinator-quorum` module through
+# the session crate's `WasmCoordinatorSandbox` (consensus never runs natively, even in these
+# tests). A dev-only edge; session depends on observe normally, so this is a dev-dependency cycle
+# (permitted by cargo), never a normal-build edge.
+daemon-vhc-session = { workspace = true, features = ["harness"] }
 
 [lints]
 workspace = true

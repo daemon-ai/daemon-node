@@ -48,8 +48,9 @@ daemon-vhc-observe = { workspace = true }
 # The Phase-E upgrade-transaction drills (refactor §9): the session's `run_local_upgrade`
 # orchestrator + `UpgradeSteps` seam driven over the real host primitives (quiesce/snapshot,
 # admit_v2 re-admission, start_run_migrating). host/* -> host/* (architecture §7: TESTKIT → SESS),
-# test-only.
-daemon-vhc-session = { workspace = true }
+# test-only. `harness` exposes the `WasmCoordinatorSandbox` the consensus-replay lanes re-derive
+# through (consensus never runs natively, even in verification).
+daemon-vhc-session = { workspace = true, features = ["harness"] }
 # The Phase-E colocation-under-arbitration acceptance (refactor §9; decisions D6): the node's
 # OwnerArbiter admits the trainer + verifier role-instances the tier-2 lane colocates.
 # host/* -> host/* (allowed), test-only.

@@ -32,9 +32,11 @@ harness = ["dep:daemon-vhc-observe"]
 [dependencies]
 daemon-vhc-proto = { workspace = true }
 # The frozen ABI constants (event/outcome/quiesce-reason/stop-reason codes, the default control
-# channel id) the production upgrade-transaction adapter (`upgrade::LiveUpgradeSteps`) drives the
-# live pump with. A contracts crate (links neither sdk/* nor host/*), so the session→abi edge is
-# direction-safe.
+# channel id) two consumers share: the production upgrade-transaction adapter
+# (`upgrade::LiveUpgradeSteps`) drives the live pump with them (default build), and the
+# `harness`-gated replay sandbox (the concrete `CoordinatorSandbox` that drives the wasm coordinator
+# module under the host runtime) reads its stop-reason + candidate-driver constants. A contracts
+# crate (links neither sdk/* nor host/*), so the session→abi edge is direction-safe.
 daemon-vhc-abi = { workspace = true }
 # The consensus SDK layer: assignment math (moved from the proto at D0, consumed by the retained v1
 # RoundEngine) AND — relocated at D2 from the dissolved daemon-vhc-coordinator — the pure coordinator
@@ -90,4 +92,5 @@ workspace = true
 [package.metadata.cargo-machete]
 # `async-trait` is used only by the harness `FaultyStore` PayloadStore impl, gated behind
 # `cfg(any(test, feature = "harness"))`, so it looks unused on the default (non-test) build path.
+# (`daemon-vhc-abi` is NOT ignored: the `upgrade` adapter consumes it on the default build.)
 ignored = ["async-trait"]

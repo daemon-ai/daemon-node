@@ -18,7 +18,7 @@ relay URL by putting it in `IrohGossipConfig.relay_urls` (or the envelope's tran
 ```rust
 IrohGossipConfig {
     relay_urls: vec!["http://localhost:3340".to_string()],
-    // ... secret_key, roster, topic_input, rebroadcast, bind_addr
+    // ... secret_key, roster, genesis_hash, rebroadcast, bind_addr
 }
 ```
 

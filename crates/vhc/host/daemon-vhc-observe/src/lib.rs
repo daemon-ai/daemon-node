@@ -9,10 +9,11 @@
 //!
 //! * [`MessageLog`] — an append-only, replayable log of [`SignedMessage`](daemon_vhc_proto::messages::SignedMessage)
 //!   in arrival order, canonical-CBOR framed, indexed by `(round, kind)`. Writer + reader.
-//! * [`replay`] — the replay oracle (PROTO-20 as a library): re-run
-//!   [`daemon_vhc_sdk_consensus::coordinator::tick`] from genesis over a recorded `Input` trace and verify the
-//!   recorded [`RoundRecord`](daemon_vhc_proto::messages::RoundRecord)s match the pure function's —
-//!   the "anyone can re-derive the coordinator" property, with the first divergence pinpointed.
+//! * [`replay_from_state`] / [`replay_capture`] — the replay oracle (PROTO-20 as a library):
+//!   re-derive a run inside the sandboxed `coordinator-quorum` module (through the
+//!   [`CoordinatorSandbox`] seam, never a native tick) over a recorded driving trace and verify the
+//!   recorded [`RoundRecord`](daemon_vhc_proto::messages::RoundRecord)s match the module's — the
+//!   "anyone can re-derive the coordinator" property, with the first divergence pinpointed.
 //! * [`digest_tally`] / [`DesyncVerdict`] — fold `Digest` messages per round into a quorum digest +
 //!   outlier set (the observe-driven desync trigger the runtime lane consumes — this crate does not
 //!   wire it into `daemon-vhc-session`).
@@ -44,7 +45,7 @@ pub use journal::{
 };
 pub use log::{MessageKind, MessageLog};
 pub use replay::{
-    genesis_seed, logged_round_records, replay, replay_capture, replay_from_state,
+    genesis_seed, logged_round_records, replay_capture, replay_from_state, CoordinatorSandbox,
     ReplayDivergence, ReplayError, ReplayReport,
 };
 

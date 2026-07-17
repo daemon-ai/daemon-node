@@ -52,6 +52,8 @@ use daemon_vhc_observe::{
     detect_fork, replay_consensus_from_archive, ArchiveError, ForkEvidence, RecordArchive,
     ReplicationPolicy, RetentionPolicy,
 };
+// The consensus-replay oracle re-derives inside the real coordinator module : the tests hold
+// the same `coordinator_quorum.wasm` blob they drove, so they replay through it.
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_vhc_proto::messages::{
     Commitment, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
@@ -67,6 +69,7 @@ use daemon_vhc_sdk_consensus::{
     AuthError, AuthorityConfig, Authorized, RecordSig, SingleKey, ThresholdKeys, Topology,
     DEFAULT_RECORDS_CHANNEL,
 };
+use daemon_vhc_session::replay_sandbox::WasmCoordinatorSandbox;
 use daemon_vhc_testkit::barrier::phase_a_grants;
 use daemon_vhc_testkit::{WasmCoordinator, WasmCoordinatorSpec};
 
@@ -446,8 +449,11 @@ fn equivocation_yields_portable_evidence_and_both_histories_look_valid() {
     // "Conflicting valid-looking histories": EACH side is green in isolation — a third party
     // shown only one archive finds nothing wrong (consensus replay re-derives every record and
     // digest from archive + payloads alone).
-    let a = replay_consensus_from_archive(&archive_a, &heads_a, &payloads_a).expect("A valid");
-    let b = replay_consensus_from_archive(&archive_b, &heads_b, &payloads_b).expect("B valid");
+    let sandbox = WasmCoordinatorSandbox::new(wasm.clone());
+    let a = replay_consensus_from_archive(&sandbox, &archive_a, &heads_a, &payloads_a)
+        .expect("A valid");
+    let b = replay_consensus_from_archive(&sandbox, &archive_b, &heads_b, &payloads_b)
+        .expect("B valid");
     assert_eq!(a.replay.rounds_verified, 2);
     assert_eq!(b.replay.rounds_verified, 2);
     assert_ne!(
@@ -626,34 +632,29 @@ fn eclipsed_peer_converges_from_archive_and_payloads_alone() {
 
     // The partitioned peer saw NOTHING live. When the partition heals it holds only the archive
     // replica + payload store — and re-derives the ENTIRE history, digests included.
-    let report =
-        replay_consensus_from_archive(&archive, &heads, &payloads).expect("heal replay green");
+    let sandbox = WasmCoordinatorSandbox::new(wasm.clone());
+    let report = replay_consensus_from_archive(&sandbox, &archive, &heads, &payloads)
+        .expect("heal replay green");
     assert_eq!(report.replay.rounds_verified, 3);
     assert_eq!(report.set_commitments_verified, 3);
 
-    // Convergence: the re-derived final state equals the live run's exact final state (fold the
-    // same inputs natively — the dual-compilation twin of the blob's trajectory).
+    // Convergence: the re-derived decision stream equals the live run's exact decision stream. The
+    // resync anchor is a blake3 of the coordinator's published `RoundRecord`s (the observer sees
+    // published objects, never the module's privileged internal state), so the reference is that
+    // same anchor over the native dual-compilation twin's published records.
     let final_ref = {
-        let mut state = initial;
-        let mut now_s = 0;
-        for sm in &script {
-            let token = Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
-            let (next, _) = tick_authenticated(
-                state,
-                peer_id(&sm.key),
-                SWARM_PROTO_VERSION,
-                sm.msg.clone(),
-                token,
-            );
-            now_s += 1;
-            let (after_clock, _) = tick(next, Input::Clock(now_s));
-            state = after_clock;
-        }
-        blake3_hash(&to_canonical_vec(&state).unwrap())
+        let records: Vec<_> = reference_publishes(initial, &script)
+            .into_iter()
+            .filter_map(|m| match m {
+                SwarmMessage::RoundRecord(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        blake3_hash(&to_canonical_vec(&records).unwrap())
     };
     assert_eq!(
         report.replay.final_state_hash, final_ref,
-        "the eclipsed peer converges to the live coordinator's exact state"
+        "the eclipsed peer converges to the live coordinator's exact decision stream"
     );
     assert_eq!(decisions.len(), expected.len());
 }
@@ -713,7 +714,8 @@ fn threshold_keys_quorum_refusals_end_to_end() {
     }
 
     // END-TO-END positive: consensus replay green under the threshold topology.
-    let report = replay_consensus_from_archive(&archive, &quorum_heads, &payloads)
+    let sandbox = WasmCoordinatorSandbox::new(wasm.clone());
+    let report = replay_consensus_from_archive(&sandbox, &archive, &quorum_heads, &payloads)
         .expect("threshold replay green");
     assert_eq!(report.replay.rounds_verified, 2);
 

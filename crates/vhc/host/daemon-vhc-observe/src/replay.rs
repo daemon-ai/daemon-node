@@ -3,48 +3,91 @@
 
 //! The replay oracle — PROTO-20 as a library (spec §6.4 I1, §9, §11.2).
 //!
-//! Given the run envelope + the recorded `tick` input trace, re-run
-//! [`daemon_vhc_sdk_consensus::coordinator::tick`] from genesis and verify that every recorded
-//! [`RoundRecord`] matches what the pure coordinator function re-derives — the "anyone can re-derive
-//! the coordinator" property, and the substrate under resync (§9). The oracle consumes only signed
-//! messages + published records: the coordinator's own published `RoundRecord`s carried in the input
-//! trace are the **oracle** (compared, not fed back to `tick`); everything else drives `tick`.
+//! Given a run's genesis-derived initial [`CoordinatorState`] + the recorded driving trace, re-run
+//! the run through the **sandboxed coordinator module** and verify that every recorded
+//! [`RoundRecord`] matches what the module re-derives — the "anyone can re-derive the coordinator"
+//! property, and the substrate under resync (§9).
 //!
-//! On the event-driven happy path a round finalizes with **zero clocks** (the Merge-2 P0 finding), so
-//! the trace is pure messages; timeout/straggler rounds additionally carry the recorded
-//! `Input::Clock`s (the driver's sidecar — clocks are not signed messages, §14).
+//! ## Consensus runs only in the sandbox — even in verification
+//!
+//! Consensus is a wasm module, not a native host service (architecture §4.1). The replay oracle
+//! therefore never re-runs consensus natively: it drives the same content-addressed
+//! `coordinator-quorum` module the live run used, under the host runtime, through the
+//! [`CoordinatorSandbox`] seam. This crate stays host-free (it is a node-side log tool below the
+//! host runtime in the dependency graph), so it defines only the seam; the concrete driver — start
+//! the pinned module, deliver recorded frames, collect its published decisions — lives in a
+//! host-capable crate and is injected. The recorded driving trace carries only the coordinator's
+//! *inputs* (signed worker messages); the module owns its own deterministic logical clock (one tick
+//! per delivered frame), so recorded `Input::Clock`s are not re-fed — the sandbox re-derives them.
+//!
+//! The oracle consumes only signed messages + published records: the coordinator's own published
+//! [`RoundRecord`]s carried in the trace are the **oracle** (compared, never delivered to the
+//! module as an input); everything else is the driving trace fed to the module.
 
-use daemon_vhc_proto::envelope::Envelope;
-use daemon_vhc_proto::messages::{RoundRecord, SwarmMessage};
+use daemon_vhc_proto::messages::{RoundRecord, SignedMessage, SwarmMessage};
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, Seed};
 
-use daemon_vhc_sdk_consensus::coordinator::{
-    tick, CoordinatorParams, CoordinatorState, Input, Output, RunConfig,
-};
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 
 use crate::capture::RunCapture;
 use crate::log::{MessageKind, MessageLog};
 use crate::ObserveError;
 
-/// The deterministic genesis seed for a run, derived from its envelope (domain-separated blake3), so
-/// the oracle reconstructs the exact `CoordinatorState::new` a driver started from without any
-/// privileged input.
-pub fn genesis_seed(env: &Envelope) -> Result<Seed, ObserveError> {
-    let bytes = to_canonical_vec(env).map_err(|e| ObserveError::Codec(e.to_string()))?;
-    let mut buf = Vec::with_capacity(bytes.len() + 32);
-    buf.extend_from_slice(b"daemon-swarm/observe/genesis-seed/v1");
-    buf.extend_from_slice(&bytes);
-    Ok(Seed(*blake3_hash(&buf).as_bytes()))
+/// Domain tag for the coordinator genesis seed derivation (see [`genesis_seed`]).
+const GENESIS_SEED_DOMAIN: &[u8] = b"daemon-swarm/observe/genesis-seed/genesis/v2";
+
+/// The deterministic genesis seed for a run, derived from its **genesis hash** (the run's
+/// cryptographic identity, `FrozenGenesis::run_id`) by a domain-separated blake3.
+///
+/// Seed domains derive from the genesis hash, not from a frozen v1 envelope's canonical bytes: run
+/// identity is anchored on the genesis, so the oracle reconstructs the exact `CoordinatorState::new`
+/// a driver started from using only the public run identity, without any privileged input.
+#[must_use]
+pub fn genesis_seed(genesis_hash: &Hash) -> Seed {
+    let mut buf = Vec::with_capacity(GENESIS_SEED_DOMAIN.len() + 32);
+    buf.extend_from_slice(GENESIS_SEED_DOMAIN);
+    buf.extend_from_slice(genesis_hash.as_bytes());
+    Seed(*blake3_hash(&buf).as_bytes())
 }
 
-/// A successful replay: what the pure coordinator re-derived.
+/// The sandbox seam the replay oracle drives consensus through (consensus never runs outside
+/// the sandboxed, content-addressed coordinator module, even in verification).
+///
+/// A concrete implementation lives in a host-capable crate: it starts the run's pinned
+/// `coordinator-quorum` module under the host runtime — configured from the genesis-derived
+/// `initial` state (the opaque `da_init` config the module is initialized with) — delivers the
+/// recorded driving `messages` as host-verified authoritative frames, waits for the module to
+/// publish its decisions, and returns every published [`SwarmMessage`] in order. The module owns
+/// its logical clock, so no clocks are delivered.
+pub trait CoordinatorSandbox {
+    /// Re-derive a recorded run inside the sandbox: start the pinned coordinator module from
+    /// `initial`, deliver `messages` in order, and return every decision the module published, in
+    /// order. `expected_records` is how many [`RoundRecord`]s the recorded run published (the oracle
+    /// count), so the driver can wait deterministically for the module to finish before stopping it.
+    ///
+    /// # Errors
+    /// [`ReplayError::Sandbox`] if the module fails to start, a frame is refused, or the module does
+    /// not produce the expected decisions before its deadline.
+    fn replay_run(
+        &self,
+        initial: &CoordinatorState,
+        messages: &[SignedMessage],
+        expected_records: usize,
+    ) -> Result<Vec<SwarmMessage>, ReplayError>;
+}
+
+/// A successful replay: what the sandboxed coordinator module re-derived.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayReport {
     /// The re-derived round records, in production order.
     pub records: Vec<RoundRecord>,
     /// How many recorded `RoundRecord`s in the trace were checked (and matched) against re-derivation.
     pub rounds_verified: u64,
-    /// blake3 of the canonical CBOR of the final coordinator state (the resync anchor, I1).
+    /// blake3 of the canonical CBOR of the re-derived decision stream (the resync anchor, I1).
+    ///
+    /// The observer consumes only published objects, never the module's privileged internal state,
+    /// so the anchor is a pure function of the module's published `RoundRecord`s: two runs that
+    /// re-derive the same decision stream carry the same anchor.
     pub final_state_hash: Hash,
 }
 
@@ -55,118 +98,103 @@ pub struct ReplayDivergence {
     pub round: u64,
     /// The recorded (oracle) round record.
     pub recorded: RoundRecord,
-    /// What `tick` re-derived for that round (`None` if the coordinator produced no record).
+    /// What the module re-derived for that round (`None` if it produced no record).
     pub rederived: Option<RoundRecord>,
     /// A human-readable summary of the mismatch.
     pub detail: String,
 }
 
-/// Why a replay did not complete: a setup failure, or a pinpointed first divergence.
+/// Why a replay did not complete: a setup failure, a sandbox failure, or a pinpointed first divergence.
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayError {
-    /// The envelope config / genesis could not be resolved (not a divergence).
+    /// The genesis config could not be resolved (not a divergence).
     #[error("replay setup: {0}")]
     Setup(#[from] ObserveError),
+    /// The sandboxed coordinator module could not be driven (start / delivery / deadline).
+    #[error("coordinator sandbox: {0}")]
+    Sandbox(String),
     /// A recorded record diverged from the re-derivation (the PROTO-20 failure). Boxed to keep the
     /// error small (the divergence carries two full round records).
     #[error("replay diverged at round {}: {}", .0.round, .0.detail)]
     Diverged(Box<ReplayDivergence>),
 }
 
-/// Re-run `tick` from genesis over `inputs` and verify recorded records match (§6.4 I1, PROTO-20).
-///
-/// `inputs` is the recorded `tick` trace: driving inputs (peer messages, storage receipts, clocks,
-/// control) **plus** the coordinator's own signed `RoundRecord` publications, which serve as the
-/// oracle. `RoundOpen`/`RoundRecord` messages are never fed back to `tick` (they are outputs); a
-/// `RoundRecord` is compared against the record `tick` last produced for its round.
-pub fn replay(
-    env: &Envelope,
-    params: CoordinatorParams,
-    inputs: impl Iterator<Item = Input>,
-) -> Result<ReplayReport, ReplayError> {
-    let config =
-        RunConfig::from_envelope(env, params).map_err(|e| ObserveError::Replay(e.to_string()))?;
-    let seed = genesis_seed(env)?;
-    let state = CoordinatorState::new(config, seed, 0);
-    replay_from_state(state, inputs)
+/// Split a recorded `tick` trace into the driving messages (fed to the module) and the oracle
+/// [`RoundRecord`]s (compared, never fed). The module owns its clock, so `Input::Clock`s are
+/// dropped; `RoundOpen` is a module output and is dropped too.
+fn partition_trace(inputs: impl Iterator<Item = Input>) -> (Vec<SignedMessage>, Vec<RoundRecord>) {
+    let mut driving = Vec::new();
+    let mut oracle = Vec::new();
+    for input in inputs {
+        if let Input::Message(sm) = input {
+            match &sm.payload {
+                SwarmMessage::RoundRecord(r) => oracle.push(r.clone()),
+                SwarmMessage::RoundOpen(_) => {}
+                _ => driving.push(sm),
+            }
+        }
+        // Clocks and control are not driving frames here: the module owns its logical clock, and a
+        // signed control request rides its own channel (not exercised by the recorded traces).
+    }
+    (driving, oracle)
 }
 
-/// Re-run `tick` from a **given initial [`CoordinatorState`]** over `inputs` and verify recorded
-/// records match — the same oracle as [`replay`] without envelope resolution (§6.4 I1, PROTO-20).
+/// Re-derive a run inside the sandbox from a **given initial [`CoordinatorState`]** and verify the
+/// recorded records match (§6.4 I1, PROTO-20).
 ///
-/// This is the entry point for a recorded local/gate run: the coordinator's genesis is not derived
-/// from an envelope (the in-process harness / gate ceremony builds `RunConfig` directly), so the
-/// exact starting state is captured in a [`RunCapture`](crate::capture::RunCapture) and replayed
-/// here. `inputs` carries the driving trace (messages + clocks) followed by the wire-recorded
-/// `RoundRecord`s as the oracle (see [`replay_capture`]). Same rule as [`replay`]: a `RoundRecord`
-/// in the stream is **compared**, never fed back to `tick`; `RoundOpen` is skipped; all else drives.
+/// The initial state is the genesis-derived config the coordinator module is started with (the
+/// in-process harness / gate ceremony builds it directly and captures it in a
+/// [`RunCapture`](crate::capture::RunCapture)). `inputs` carries the driving trace (signed worker
+/// messages) followed by the wire-recorded `RoundRecord`s as the oracle. A `RoundRecord` in the
+/// stream is **compared** against what the module re-derived; `RoundOpen`/clocks are not delivered.
 ///
 /// # Errors
 ///
 /// [`ReplayError::Diverged`] on the first recorded record that disagrees with the re-derivation;
-/// [`ReplayError::Setup`] on a final-state hashing/codec failure.
+/// [`ReplayError::Sandbox`] on a module start/delivery/deadline failure.
 pub fn replay_from_state(
+    sandbox: &dyn CoordinatorSandbox,
     initial: CoordinatorState,
     inputs: impl Iterator<Item = Input>,
 ) -> Result<ReplayReport, ReplayError> {
-    let mut state = initial;
+    let (driving, oracle) = partition_trace(inputs);
+    let published = sandbox.replay_run(&initial, &driving, oracle.len())?;
 
-    // The last record `tick` produced for each round (records[idx_by_round]).
-    let mut produced_by_round: std::collections::BTreeMap<u64, RoundRecord> =
-        std::collections::BTreeMap::new();
-    let mut records: Vec<RoundRecord> = Vec::new();
+    // The module's published RoundRecords, in production order — the re-derivation.
+    let records: Vec<RoundRecord> = published
+        .into_iter()
+        .filter_map(|m| match m {
+            SwarmMessage::RoundRecord(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+
+    // Compare each oracle record against the re-derived record for the same round, in order.
     let mut rounds_verified = 0u64;
-
-    for input in inputs {
-        if let Input::Message(sm) = &input {
-            match &sm.payload {
-                // Oracle: compare, do not feed a coordinator output back into `tick`.
-                SwarmMessage::RoundRecord(recorded) => {
-                    let round = recorded.round;
-                    match produced_by_round.get(&round) {
-                        Some(rederived) if rederived == recorded => {
-                            rounds_verified += 1;
-                        }
-                        Some(rederived) => {
-                            return Err(ReplayError::Diverged(Box::new(ReplayDivergence {
-                                round,
-                                recorded: recorded.clone(),
-                                rederived: Some(rederived.clone()),
-                                detail: "recorded RoundRecord differs from the re-derived record"
-                                    .into(),
-                            })));
-                        }
-                        None => {
-                            return Err(ReplayError::Diverged(Box::new(ReplayDivergence {
-                                round,
-                                recorded: recorded.clone(),
-                                rederived: None,
-                                detail: "re-derivation produced no record for this round".into(),
-                            })));
-                        }
-                    }
-                    continue;
-                }
-                // The coordinator's other output is also not a `tick` input.
-                SwarmMessage::RoundOpen(_) => continue,
-                _ => {}
+    for recorded in &oracle {
+        let rederived = records.iter().find(|r| r.round == recorded.round);
+        match rederived {
+            Some(r) if r == recorded => rounds_verified += 1,
+            Some(r) => {
+                return Err(ReplayError::Diverged(Box::new(ReplayDivergence {
+                    round: recorded.round,
+                    recorded: recorded.clone(),
+                    rederived: Some(r.clone()),
+                    detail: "recorded RoundRecord differs from the re-derived record".into(),
+                })));
             }
-        }
-
-        let (next, outputs) = tick(state, input);
-        state = next;
-        for out in outputs {
-            if let Output::Publish(msg) = out {
-                if let SwarmMessage::RoundRecord(r) = *msg {
-                    produced_by_round.insert(r.round, r.clone());
-                    records.push(r);
-                }
+            None => {
+                return Err(ReplayError::Diverged(Box::new(ReplayDivergence {
+                    round: recorded.round,
+                    recorded: recorded.clone(),
+                    rederived: None,
+                    detail: "re-derivation produced no record for this round".into(),
+                })));
             }
         }
     }
 
-    let final_state_hash =
-        blake3_hash(&to_canonical_vec(&state).map_err(|e| ObserveError::Codec(e.to_string()))?);
+    let final_state_hash = decision_stream_anchor(&records)?;
     Ok(ReplayReport {
         records,
         rounds_verified,
@@ -174,21 +202,29 @@ pub fn replay_from_state(
     })
 }
 
-/// Verify a recorded run: re-run `tick` from the [`RunCapture`]'s initial state over its driving
-/// trace, using the **independent** wire [`MessageLog`]'s `RoundRecord`s as the oracle (§6.4 I1).
+/// The resync anchor (I1): blake3 of the canonical CBOR of the module's published decision stream.
+fn decision_stream_anchor(records: &[RoundRecord]) -> Result<Hash, ReplayError> {
+    let bytes = to_canonical_vec(records).map_err(|e| ObserveError::Codec(e.to_string()))?;
+    Ok(blake3_hash(&bytes))
+}
+
+/// Verify a recorded run: re-derive it inside the sandbox from the [`RunCapture`]'s initial state
+/// over its driving trace, using the **independent** wire [`MessageLog`]'s `RoundRecord`s as the
+/// oracle (§6.4 I1).
 ///
-/// The capture supplies the driving inputs (messages + clocks) the coordinator fed `tick`; the log
-/// supplies what the coordinator actually broadcast. Re-derivation reproduces a `RoundRecord` per
-/// round; each logged record is appended to the input stream as the oracle to compare against. A
-/// successful [`ReplayReport`] with `rounds_verified` equal to the logged record count proves the
-/// run's per-round consensus (committed set + drops = the round digest) is byte-reproducible — the
-/// `swarm-replay` gate-ceremony assertion.
+/// The capture supplies the driving inputs (signed worker messages) the coordinator consumed; the
+/// log supplies what the coordinator actually broadcast. The module re-derives a `RoundRecord` per
+/// round; each logged record is compared against it. A successful [`ReplayReport`] with
+/// `rounds_verified` equal to the logged record count proves the run's per-round consensus
+/// (committed set + drops = the round digest) is byte-reproducible — the `swarm-replay`
+/// gate-ceremony assertion.
 ///
 /// # Errors
 ///
-/// [`ReplayError::Diverged`] at the first logged record that does not re-derive; [`ReplayError::Setup`]
-/// on a codec failure.
+/// [`ReplayError::Diverged`] at the first logged record that does not re-derive;
+/// [`ReplayError::Sandbox`] on a module failure.
 pub fn replay_capture(
+    sandbox: &dyn CoordinatorSandbox,
     capture: RunCapture,
     oracle: &MessageLog,
 ) -> Result<ReplayReport, ReplayError> {
@@ -198,7 +234,7 @@ pub fn replay_capture(
         .map(Input::Message)
         .collect();
     let inputs = capture.inputs.into_iter().chain(oracle_records);
-    replay_from_state(capture.initial, inputs)
+    replay_from_state(sandbox, capture.initial, inputs)
 }
 
 /// How many `RoundRecord`s a [`MessageLog`] carries (the count `replay_capture` verifies against).
