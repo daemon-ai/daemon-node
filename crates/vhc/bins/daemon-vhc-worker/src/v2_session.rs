@@ -1,29 +1,37 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The worker's v2 join — the session run path for a major-2 module (refactor §5 A2, the last
-//! A2 remainder): node → worker `JoinRun` → re-admission (§9.4 step 10) → `start_run` (the
-//! event pump) → the NATIVE coordinator (`daemon-vhc-coordinator`'s pure `tick`, driven
-//! in-process exactly as the session's `LocalCoordinator` shells it) opening rounds over the
-//! run's frozen envelope → frames verified ABOVE the pump before delivery → the D3 cell-5/6
-//! whole-run shape: a v2 worker module under a v1 envelope + the native coordinator.
+//! The worker's in-process join — the session run path for a major-2 module under a **genesis
+//! envelope v2**: node → worker `JoinRun` → re-admission (§9.4 step 10) → `start_run` (the event
+//! pump) → the run's REAL wasm coordinator (`configure_wasm_coordinator` derives the spec from
+//! the frozen genesis; the pinned, content-addressed `coordinator_quorum` blob runs in-process
+//! under the same major-2 event-loop driver) → frames verified + authority-judged ABOVE the pump
+//! before delivery. Consensus never runs outside the sandboxed module — the native-tick drive
+//! shell this file used to carry is gone with the v1-envelope (cell 5) form, which now refuses
+//! typed at assess (`EnvelopeSchemaRetired`).
 //!
-//! Phase-A seams, stated where they live:
-//! - **Guest-authored payloads (the B1 sealing-gap retirement)**: the guest seals its own
-//!   container (`read_back` → `create_from`) and `payload_put`s it; this session is the
-//!   async-runtime seat servicing the put (capturing the bytes), and the commitment evidence fed
-//!   to the coordinator is decoded FROM THE GUEST'S OWN Commitment frame — verified here to hash
-//!   exactly the serviced bytes (commitment hash ≡ staged bytes) before it is relayed.
-//! - **Coordinator-plane verification**: the coordinator speaks v1 `SignedMessage`s; each is
-//!   signature-verified here, above the pump, and the pre-verified payload is delivered with
-//!   the original signed bytes as tag-12 evidence. (Worker-plane §12.1 v2 frames verify through
-//!   `daemon_vhc_session::v2_attach` — the same seam, different wire.)
-//! - **Batch staging (corpus-backed since B2)**: the plumbing stages REAL token windows cut
-//!   from a corpus — the same `Corpus` shape the retired v1 live fetch path (`live.rs`,
-//!   fetch-by-hash + blake3 verify + content cache) used to yield; the in-process t2 run assembles
-//!   it deterministically instead of fetching. Window arithmetic mirrors the module's own SDK math
-//!   (proto assignment + the same slicing — windowing is MODULE policy, the plumbing stages
-//!   content in the module's training order); the kind-1 staging encoding is unchanged.
+//! Seams, stated where they live:
+//! - **Coordinator configuration**: the genesis coordinator role's pinned module hash + its
+//!   verbatim opaque config (`{state: CoordinatorState}` — the host never interprets it) +
+//!   the run's declared `AuthorityConfig`, all derived by the production
+//!   `daemon_vhc_host::wasm_coordinator` seat. Every coordinator decision is
+//!   signature-verified AND authority-judged (`authorize_coordinator_frame`) above the pump;
+//!   the original signed frame rides as tag-12 evidence.
+//! - **In-process identity contract**: this self-driven join derives the coordinator's §12.1
+//!   frame key from the run id (`blake3("vhc-coordinator/<run_id>")`) — the genesis author must
+//!   name that key's peer id as the envelope `SingleKey` coordinator identity, or every
+//!   coordinator frame refuses at the authority judgment (fail closed, never a fallback).
+//!   The worker's own key derives as `blake3("vhc-worker/<run_id>")` likewise.
+//! - **Guest-authored payloads (B1)**: the guest seals its own committed container and
+//!   `payload_put`s it; this session is the async-runtime seat servicing the put, and the
+//!   commitment evidence is the guest's own tag-3 voice — verified here to hash exactly the
+//!   serviced bytes before it is relayed onto the coordinator plane.
+//! - **Batch staging (module-wire kind-0 bytes)**: the plumbing stages REAL token windows cut
+//!   from a corpus as the trainer's `[0, round, step, sequences, seq_len, tokens_le]` wrapper —
+//!   window arithmetic mirrors the module's own SDK math (proto assignment + the same slicing;
+//!   windowing is MODULE policy, the plumbing stages content in the module's training order).
+//! - **Round digests**: from the guest's published tag-4 digest frame (`[4, round, digest16]`) —
+//!   the guest's own det-lane voice, never a host-side re-derivation.
 //! - **Inline replay soak** (refactor §12.6): after the run, the recorded journal is re-driven
 //!   through the §8.7 replay engine and every decision must reproduce bit-for-bit — a
 //!   diverging run is a join FAILURE, not a warning.
@@ -35,34 +43,29 @@ use daemon_vhc_host::v2::{
     replay_v2, start_run, MemorySink, ReplayEnd, ReplayScript, RunEnd, RunIdentity, SinkEntry,
     V2RunConfig,
 };
-use daemon_vhc_host::{EngineConfig, Worker};
-use daemon_vhc_proto::messages::{Join, StorageReceipt, ThroughputClass};
-use daemon_vhc_proto::{
-    blake3_hash, digest_state, peer_id, to_canonical_vec, CapabilitySet, Envelope, IrohId, Seed,
-    SignedMessage, SigningKey, SwarmMessage,
+use daemon_vhc_host::wasm_coordinator::{
+    authorize_coordinator_frame, configure_wasm_coordinator, WasmCoordinator,
 };
-use daemon_vhc_sdk_consensus::coordinator::{tick, CoordinatorState, Input, Output};
+use daemon_vhc_host::{EngineConfig, Worker};
+use daemon_vhc_proto::messages::{
+    Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, SwarmMessage, ThroughputClass,
+};
+use daemon_vhc_proto::{
+    blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, SigningKey, StateDigest,
+};
 
 use crate::send;
 use daemon_provision::CutWriter;
 use daemon_vhc_session::protocol::Event;
 
-// The envelope-v2 (genesis) arm of this drive — the transitional cell-6 native-coordinator
-// adapter (`RunConfig::from_genesis`) — was RETIRED at D2 (decisions D3 cell 6): a genesis run's
-// coordination is its wasm coordinator module (mixed-fleet cell 8, pinned in the testkit's
-// cell-8 whole-run lanes). This self-driven t2 join keeps only the v1-envelope form (cell 5),
-// which SURVIVED the Phase-E sunset (D5 retired the v1 driver, not the v1 envelope) and retires
-// when the in-process join re-seats onto the wasm coordinator (cell 8).
-
-/// The Phase-A derived grants document (§2.6 stand-in until node-side lane config lands): the
-/// admitted channel table + the worlds the Phase-A driver links. Deterministic, so assess and
-/// join derive byte-identical copies (§9.4 steps 8/11 hash pinning).
+/// The ABI §2.6 derived grants document (§9.4 steps 8/11 hash pinning — assess and join derive
+/// byte-identical copies): the admitted channel table + the worlds the driver links.
 pub(crate) fn derive_grants() -> Vec<u8> {
     let channels: Vec<ciborium::value::Value> = daemon_vhc_abi::PHASE_A_DEFAULT_CHANNEL_TABLE
         .iter()
         .map(|c| ciborium::value::Value::from(u64::from(c.id)))
         .collect();
-    let worlds = ["vhc@2", "net@2", "sys@2", "tabi@1"]
+    let worlds = ["vhc@2", "net@2", "sys@2"]
         .iter()
         .map(|w| ciborium::value::Value::from(*w))
         .collect();
@@ -84,11 +87,15 @@ pub(crate) fn derive_grants() -> Vec<u8> {
 /// How many rounds the self-driven t2 run drives before a clean stop.
 const T2_ROUNDS: u64 = 2;
 
-/// Sequences per staged batch (one micro-window per inner step; the envelope's
-/// `global_batch`/`steps_per_round` schedule fixes the counts).
+/// Inner steps per round — part of the fixed t2 drive geometry: the authored genesis (the
+/// coordinator state's schedule AND the trainer role's config) must match it.
+const T2_STEPS_PER_ROUND: u32 = 2;
+
+/// Sequences per staged step batch (one micro-window per inner step; the genesis schedule's
+/// `global_batch`/`steps_per_round` fix the counts).
 const T2_BATCH_SEQS: u32 = 1;
 
-/// Tokens per sequence — the corpus's `seq_len` and the guest model's (`TinyLlamaCfg.seq_len`).
+/// Tokens per sequence — the corpus's `seq_len` and the guest model's.
 const T2_SEQ_LEN: u32 = 9;
 
 /// Decode a 64-char lowercase-hex blake3 digest.
@@ -133,11 +140,10 @@ impl T2Artifacts {
 }
 
 /// Build the t2 run's corpus artifacts: deterministic small-vocab shards + their manifest, as
-/// content-addressed blobs — the in-process stand-in for the envelope's artifact map. Returns the
-/// store and the manifest's committed hash.
+/// content-addressed blobs — the in-process stand-in for the genesis artifact map's corpus
+/// entries. Returns the store and the manifest's committed hash.
 ///
-/// Tokens are embedding indices, so the vocabulary is strictly below the guest model's
-/// (`TinyLlamaCfg::default().vocab` = 64).
+/// Tokens are embedding indices, so the vocabulary is strictly below the guest model's.
 fn t2_corpus_artifacts() -> Result<(T2Artifacts, [u8; 32]), String> {
     use daemon_vhc_session::data::{Manifest, ShardDesc, TokenWidth};
     const SHARDS: u64 = 2;
@@ -203,12 +209,68 @@ fn t2_corpus_via_store(
         .map_err(|e| format!("t2 corpus: {e}"))
 }
 
-/// Drive one self-driven v2 run: the whole-run t2 shape. Returns the final det-lane digest.
+/// The trainer's staged-batch wrapper: `[0, round, step, sequences, seq_len, tokens_le]`
+/// (module-wire kind-0 bytes — the promoted trainer's contract).
+fn batch_wrapper(round: u64, step: u32, sequences: u32, tokens: &[u32]) -> Result<Vec<u8>, String> {
+    let mut le = Vec::with_capacity(tokens.len() * 4);
+    for t in tokens {
+        le.extend_from_slice(&t.to_le_bytes());
+    }
+    let v = ciborium::value::Value::Array(vec![
+        ciborium::value::Value::from(0u8),
+        ciborium::value::Value::from(round),
+        ciborium::value::Value::from(step),
+        ciborium::value::Value::from(sequences),
+        ciborium::value::Value::from(T2_SEQ_LEN),
+        ciborium::value::Value::Bytes(le),
+    ]);
+    to_canonical_vec(&v).map_err(|e| format!("batch wrapper: {e}"))
+}
+
+/// The trainer's staged committed-payload wrapper: `[1, round, peer32, payload]`.
+fn update_wrapper(round: u64, peer: &[u8; 32], payload: &[u8]) -> Result<Vec<u8>, String> {
+    let v = ciborium::value::Value::Array(vec![
+        ciborium::value::Value::from(1u8),
+        ciborium::value::Value::from(round),
+        ciborium::value::Value::Bytes(peer.to_vec()),
+        ciborium::value::Value::Bytes(payload.to_vec()),
+    ]);
+    to_canonical_vec(&v).map_err(|e| format!("update wrapper: {e}"))
+}
+
+/// Decode one published frame's module-authored `[tag, round, bytes]` payload.
+fn decode_tagged(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
+    let v: ciborium::value::Value = ciborium::de::from_reader(frame).ok()?;
+    let ciborium::value::Value::Array(parts) = v else {
+        return None;
+    };
+    let ciborium::value::Value::Bytes(payload) = parts.get(1)? else {
+        return None;
+    };
+    let inner: ciborium::value::Value = ciborium::de::from_reader(payload.as_slice()).ok()?;
+    let ciborium::value::Value::Array(items) = inner else {
+        return None;
+    };
+    let uint = |i: usize| -> Option<u64> {
+        items
+            .get(i)
+            .and_then(ciborium::value::Value::as_integer)
+            .map(|n| u64::try_from(i128::from(n)).unwrap_or(u64::MAX))
+    };
+    let bytes = match items.get(2) {
+        Some(ciborium::value::Value::Bytes(b)) => b.clone(),
+        _ => Vec::new(),
+    };
+    Some((uint(0)?, uint(1)?, bytes))
+}
+
+/// Drive one self-driven v2 run over genesis: the whole-run t2 shape under the run's real wasm
+/// coordinator. Reports the guest's final tag-4 det digest.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn join_and_run_v2(
     module: &[u8],
     config: &[u8],
-    envelope: &Envelope,
+    genesis: &crate::backend::GenesisRun,
     run_id: &str,
     writer: &CutWriter,
 ) -> Result<(), String> {
@@ -224,21 +286,25 @@ pub(crate) async fn join_and_run_v2(
     }
     let grants = derive_grants();
 
-    // Identities: the worker peer signs its frames; the coordinator signs its records.
+    // The wasm-coordinator configuration, derived from the frozen genesis (the production seat:
+    // pinned module hash, verbatim opaque config, declared AuthorityConfig, cryptographic RunId).
+    let coord_spec = configure_wasm_coordinator(&genesis.frozen)
+        .map_err(|e| format!("coordinator config: {e}"))?;
+    let coordinator_wasm = crate::backend::resolve_coordinator_module(&genesis.env).await?;
+
+    // Identities (module docs "in-process identity contract"): run_id-derived keys; the genesis
+    // must name the derived coordinator identity or authority judgment refuses every frame.
     let worker_key_seed = *blake3::hash(format!("vhc-worker/{run_id}").as_bytes()).as_bytes();
-    let coord_key = SigningKey::from_bytes(
-        blake3::hash(format!("vhc-coordinator/{run_id}").as_bytes()).as_bytes(),
-    );
+    let coord_key_seed = *blake3::hash(format!("vhc-coordinator/{run_id}").as_bytes()).as_bytes();
     let worker_key = SigningKey::from_bytes(&worker_key_seed);
     let worker_peer = peer_id(&worker_key);
 
-    // The execution identity (ABI §8.1): the v1-envelope path keeps the A2 label-derived
-    // stand-in. (Genesis identities — run_id = genesis hash, envelope role labels — ride the
-    // cell-8 wasm-coordinator path in the testkit; the cell-6 self-drive is retired.)
+    // The execution identity (ABI §8.1): run_id = the genesis hash (the cryptographic RunId),
+    // role = the joining worker role from the genesis role set.
     let identity = RunIdentity {
-        run_id: *blake3::hash(run_id.as_bytes()).as_bytes(),
+        run_id: coord_spec.run_id.0,
         epoch: 0,
-        role: "trainer".to_string(),
+        role: genesis.worker_role.clone(),
         instance: 1,
         module: module_hash,
     };
@@ -247,68 +313,43 @@ pub(crate) async fn join_and_run_v2(
     // exactly the store's committed hashes (which artifacts a module may touch is a grant).
     let (artifacts, manifest_hash) = t2_corpus_artifacts()?;
     let mut run_cfg = V2RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
-    // The t2 corpus stands in for the run's artifact map on this in-process drive: the staged
-    // shards/manifest are generated here, so the fetch allow-list is the store's committed hashes
-    // (the envelope-derived set names the real artifact map the live path fetches instead).
     run_cfg.granted_artifacts = artifacts.granted();
+    // A real transformer's per-round op stream exceeds the tiny default queue depth (the guest
+    // also fences per inner step to reclaim depth).
+    run_cfg.compute_queue_depth = 1 << 20;
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, module, run_cfg, Box::new(sink.clone()))
         .map_err(|e| format!("v2 start_run: {e}"))?;
     let pump = run.pump.clone();
 
-    // -- the native coordinator, in-process: the pure tick over the run's envelope ----------------
-    let params = daemon_vhc_sdk_consensus::coordinator::CoordinatorParams {
-        seq_len: u64::from(T2_SEQ_LEN),
-        witness_target: 0,
-        overlap_bps: 0,
-        k_absences: 8,
-        verification_percent: 0,
-        authorized: Vec::new(),
-    };
-    // The coordinator's projected config: `from_envelope` — the v1 path (cell 5). The genesis
-    // form's `from_genesis` adapter was retired at D2 (module note above).
-    let config_c =
-        daemon_vhc_sdk_consensus::coordinator::RunConfig::from_envelope(envelope, params)
-            .map_err(|e| format!("coordinator config: {e}"))?;
-    let envelope_hash = config_c.envelope_hash;
-    // The drive's pacing knobs, read from the PROJECTED config (verbatim from `[data]`/`[phases]`).
-    let warmup_s = config_c.warmup_s;
-    let round_train_max_s = config_c.round_train_max_s;
-    let steps_per_round = config_c.steps_per_round;
-    let mut state = CoordinatorState::new(config_c, Seed([0x33; 32]), 0);
-    let mut now_s = 0u64;
-    let mut outbox: Vec<SwarmMessage> = Vec::new();
-    let feed = |state: &mut CoordinatorState,
-                input: Input,
-                outbox: &mut Vec<SwarmMessage>|
-     -> Result<(), String> {
-        let (next, outputs) = tick(state.clone(), input);
-        *state = next;
-        for o in outputs {
-            match o {
-                Output::Publish(msg) => outbox.push(*msg),
-                Output::Reject(r) => return Err(format!("coordinator rejected input: {r:?}")),
-                Output::Note(_) => {}
-            }
-        }
-        Ok(())
-    };
+    // -- the run's REAL wasm coordinator, in-process under the major-2 driver --------------------
+    let mut coord = WasmCoordinator::start(
+        &coordinator_wasm,
+        &coord_spec,
+        derive_grants(),
+        0,
+        coord_key_seed,
+    )?;
 
-    // Join the roster (the coordinator's real admission path: envelope hash + capabilities).
-    let join = SwarmMessage::Join(Join {
-        run_id: run_id.to_string(),
-        iroh_id: IrohId([0x44; 32]),
-        class: ThroughputClass::C1,
-        capabilities: CapabilitySet::new(),
-        envelope_hash: Some(envelope_hash),
-    });
-    let signed = SignedMessage::sign(&worker_key, daemon_vhc_proto::SWARM_PROTO_VERSION, join)
-        .map_err(|e| format!("join sign: {e}"))?;
-    feed(&mut state, Input::Message(signed), &mut outbox)?;
-
-    // Clock past warmup so round 0 opens.
-    now_s += warmup_s + 1;
-    feed(&mut state, Input::Clock(now_s), &mut outbox)?;
+    // Join the roster + the ready heartbeat (the event-driven fast path: the coordinator's
+    // synthetic clock advances per frame; no wall-clock manipulation exists on this drive).
+    coord.deliver(
+        &worker_key,
+        &SwarmMessage::Join(Join {
+            run_id: run_id.to_string(),
+            iroh_id: IrohId([0x44; 32]),
+            class: ThroughputClass::C1,
+            capabilities: CapabilitySet::new(),
+            envelope_hash: None,
+        }),
+    )?;
+    coord.deliver(
+        &worker_key,
+        &SwarmMessage::Heartbeat(Heartbeat {
+            round: 0,
+            ready: Some(true),
+        }),
+    )?;
 
     send(
         writer,
@@ -325,44 +366,41 @@ pub(crate) async fn join_and_run_v2(
     let corpus = t2_corpus_via_store(&artifacts, &manifest_hash)?;
     let mut rounds_done = 0u64;
     let mut last_round = 0u64;
+    let mut last_digest = [0u8; 16];
+    // Per-sender dense delivery seq into the worker pump (§12.2, channel 0).
+    let mut coord_seq = 0u64;
     // Sealed bytes captured while servicing the guest's payload_put ops (the async-runtime seat).
     let mut puts: Vec<Vec<u8>> = Vec::new();
+    let step_timeout = Duration::from_secs(120);
+
     while rounds_done < T2_ROUNDS {
-        // The coordinator's next authoritative message.
-        let Some(msg) = outbox.first().cloned() else {
-            // Nothing pending: advance the clock (timeout-driven transitions — warmup, the
-            // round cadence). Bounded so a wedged coordinator is a typed join failure.
-            let mut ticks = 0u32;
-            while outbox.is_empty() {
-                now_s += 1;
-                feed(&mut state, Input::Clock(now_s), &mut outbox)?;
-                ticks += 1;
-                if ticks > 10_000 {
-                    return Err("coordinator went quiet before the run finished".into());
-                }
-            }
-            continue;
-        };
-        outbox.remove(0);
+        // The coordinator's next authoritative decision, authority-judged above the pump.
+        let (sender, evidence, msg) = coord.next_decision(step_timeout)?;
+        let (auth_sender, _token) =
+            authorize_coordinator_frame(&coord_spec.authority, &evidence)
+                .map_err(|e| format!("coordinator frame not authoritative: {e}"))?;
+        if auth_sender != sender {
+            return Err("coordinator frame sender != authorized signer".into());
+        }
         match &msg {
             SwarmMessage::RoundOpen(ro) => {
                 last_round = ro.round;
-                // Corpus-backed staging (B2): slice the round's batch window exactly as the
-                // module's SDK math does (single-peer roster ⇒ assignment yields the whole
-                // window), then stage each micro-window's REAL tokens from the corpus, in
-                // training order — content is mechanism, the window arithmetic is the module's
-                // policy mirrored (the bridge-era contract; kind-1 encoding unchanged).
+                // Corpus-backed staging (module-wire kind-0 bytes): slice the round's batch
+                // window exactly as the module's SDK math does (single-peer roster ⇒ assignment
+                // yields the whole window), then stage each inner step's REAL tokens from the
+                // corpus, in training order.
                 let interval =
                     daemon_vhc_session::data::BatchInterval::new(ro.batch.start, ro.batch.end);
                 let steps = daemon_vhc_session::data::slice_interval(
                     interval,
-                    steps_per_round,
+                    T2_STEPS_PER_ROUND,
                     T2_BATCH_SEQS,
                 )
                 .map_err(|e| format!("t2 window slicing: {e}"))?;
-                for step in &steps {
+                for (h, step) in steps.iter().enumerate() {
+                    let mut tokens = Vec::new();
+                    let mut sequences = 0u32;
                     for mb in &step.micro_batches {
-                        let mut tokens = Vec::new();
                         for id in mb.start..mb.end {
                             tokens.extend(
                                 corpus
@@ -370,103 +408,126 @@ pub(crate) async fn join_and_run_v2(
                                     .map_err(|e| format!("corpus sequence {id}: {e}"))?,
                             );
                         }
-                        pump.stage_batch(&tokens, (mb.end - mb.start) as u32, T2_SEQ_LEN, None)
-                            .map_err(|e| format!("stage batch: {e}"))?;
+                        sequences += u32::try_from(mb.end - mb.start).unwrap_or(0);
                     }
+                    pump.stage_payload(
+                        batch_wrapper(ro.round, h as u32, sequences, &tokens)?,
+                        None,
+                    )
+                    .map_err(|e| format!("stage batch: {e}"))?;
                 }
-                deliver_coordinator_msg(&pump, &coord_key, &msg)?;
-                // The guest trains, seals its own container, payload_puts it, and voices its
-                // Commitment over the completion hash: per round, one Commitment then one
-                // Digest — so after round r's open, publishes reach 2r + 1. This session is the
-                // async-runtime seat: it services the put, capturing the sealed bytes.
+                deliver_to_worker(&pump, sender, &msg, evidence.clone(), &mut coord_seq)?;
+
+                // The guest trains, seals + puts its own container, and voices its tag-3
+                // commitment hash: per round, theta (tag 2) + commitment (tag 3) then, after
+                // the record, the digest (tag 4) — so publishes reach 3r + 2 here.
                 let published = wait_publishes_servicing(
                     &pump,
-                    (rounds_done as usize) * 2 + 1,
+                    (rounds_done as usize) * 3 + 2,
                     &mut puts,
                     &artifacts,
                 )?;
                 let sealed = puts
                     .last()
                     .cloned()
-                    .ok_or("no payload_put serviced after commit (bridge module expected)")?;
-                // The GUEST-authored commitment (the B1 sealing-gap retirement): decode the
-                // guest's own frame, and verify its evidence hashes exactly the serviced bytes.
-                let commitment_frame = &published[(rounds_done as usize) * 2].2;
-                let SwarmMessage::Commitment(commitment) = decode_v2_payload(commitment_frame)?
-                else {
-                    return Err("publish 2r is not the guest's Commitment".into());
-                };
-                if commitment.payload != blake3_hash(&sealed) {
+                    .ok_or("no payload_put serviced after the round's commit")?;
+                // The guest-authored commitment evidence: its tag-3 voice must hash exactly the
+                // serviced bytes.
+                let guest_hash: [u8; 32] = published
+                    .iter()
+                    .rev()
+                    .find_map(|(_, _, frame)| match decode_tagged(frame) {
+                        Some((3, r, bytes)) if r == ro.round => Some(bytes),
+                        _ => None,
+                    })
+                    .ok_or("no tag-3 commitment voice for the round")?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "tag-3 commitment voice is not 32 bytes".to_string())?;
+                if guest_hash != blake3_hash(&sealed).0 {
                     return Err(format!(
                         "guest commitment hash {} != staged bytes hash {} (evidence must be \
                          authored over the guest's own sealed bytes)",
-                        commitment.payload.to_hex(),
+                        Hash(guest_hash).to_hex(),
                         blake3_hash(&sealed).to_hex()
                     ));
                 }
-                if commitment.round != ro.round {
-                    return Err("guest commitment names the wrong round".into());
-                }
-                let hash = commitment.payload;
-                let size = commitment.size;
-                // Relay the guest's evidence onto the v1 coordinator plane (the proto-plane
-                // shim, exactly as deliver_coordinator_msg shims the other direction).
-                let signed = SignedMessage::sign(
+                let hash = blake3_hash(&sealed);
+                let size = sealed.len() as u64;
+                // Relay the guest's evidence onto the coordinator plane (worker-signed).
+                coord.deliver(
                     &worker_key,
-                    daemon_vhc_proto::SWARM_PROTO_VERSION,
-                    SwarmMessage::Commitment(commitment),
-                )
-                .map_err(|e| format!("commitment sign: {e}"))?;
-                feed(&mut state, Input::Message(signed), &mut outbox)?;
-                // Availability evidence (§6.4): the coordinator-as-storage-client receipt.
-                let receipt = SwarmMessage::StorageReceipt(StorageReceipt {
-                    round: ro.round,
-                    verified: vec![daemon_vhc_proto::messages::RecordEntry {
-                        peer: worker_peer,
-                        hash,
+                    &SwarmMessage::Commitment(Commitment {
+                        round: ro.round,
+                        payload: hash,
                         size,
-                    }],
-                });
-                let signed =
-                    SignedMessage::sign(&coord_key, daemon_vhc_proto::SWARM_PROTO_VERSION, receipt)
-                        .map_err(|e| format!("receipt sign: {e}"))?;
-                feed(&mut state, Input::Message(signed), &mut outbox)?;
-                // Clock forward so the round closes into a record.
-                now_s += round_train_max_s + 1;
-                feed(&mut state, Input::Clock(now_s), &mut outbox)?;
+                        locators: Vec::new(),
+                    }),
+                )?;
+                // Availability evidence (§6.4): the storage seat's receipt (any authenticated
+                // sender carries it — `on_receipt` consumes content, not signer).
+                coord.deliver(
+                    &worker_key,
+                    &SwarmMessage::StorageReceipt(StorageReceipt {
+                        round: ro.round,
+                        verified: vec![RecordEntry {
+                            peer: worker_peer,
+                            hash,
+                            size,
+                        }],
+                    }),
+                )?;
                 // Stage the committed set for the barrier BEFORE the record arrives (§5.11:
                 // record-listed order; single peer = the one guest-put payload).
-                pump.stage_update(sealed, None)
+                pump.stage_payload(update_wrapper(ro.round, &worker_peer.0, &sealed)?, None)
                     .map_err(|e| format!("stage update: {e}"))?;
             }
-            SwarmMessage::RoundRecord(_) => {
-                deliver_coordinator_msg(&pump, &coord_key, &msg)?;
-                // The guest ingests and voices its round digest: publishes reach 2(r + 1).
-                wait_publishes_servicing(
+            SwarmMessage::RoundRecord(rr) => {
+                deliver_to_worker(&pump, sender, &msg, evidence.clone(), &mut coord_seq)?;
+                // The guest ingests and voices its round digest (tag 4): publishes reach 3r + 3.
+                let published = wait_publishes_servicing(
                     &pump,
-                    (rounds_done as usize) * 2 + 2,
+                    (rounds_done as usize) * 3 + 3,
                     &mut puts,
                     &artifacts,
                 )?;
+                let digest_bytes = published
+                    .iter()
+                    .rev()
+                    .find_map(|(_, _, frame)| match decode_tagged(frame) {
+                        Some((4, r, bytes)) if r == rr.round => Some(bytes),
+                        _ => None,
+                    })
+                    .ok_or("no tag-4 digest voice for the round")?;
+                last_digest = digest_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "tag-4 digest is not 16 bytes".to_string())?;
+                // Relay the digest to the coordinator (roster liveness/desync accounting).
+                coord.deliver(
+                    &worker_key,
+                    &SwarmMessage::Digest(Digest {
+                        round: rr.round,
+                        digest: StateDigest(last_digest),
+                    }),
+                )?;
                 rounds_done += 1;
             }
-            _ => { /* Digest/witness chatter — not part of the Phase-A closed drive */ }
+            _ => { /* notes/chatter — not part of the closed t2 drive */ }
         }
     }
 
-    // Clean stop; the guest returns Outcome Ok and the final canonical state exports.
+    // Clean stop for both sandboxes; the guest returns Outcome Ok.
     pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
         .map_err(|e| format!("stop: {e}"))?;
     match run.wait().map_err(|e| format!("guest thread: {e}"))? {
         RunEnd::Outcome(0) => {}
         other => return Err(format!("v2 run ended {other:?}, expected Outcome(0)")),
     }
-    let final_state = pump
-        .bridge_final_state()
-        .ok_or("no final bridge state exported")?;
-    let mut seed = [0u8; 32];
-    seed[..8].copy_from_slice(&last_round.to_le_bytes());
-    let digest = digest_state(&Seed(seed), 64, u32::MAX, &final_state);
+    match coord.stop()? {
+        RunEnd::Outcome(0) => {}
+        other => return Err(format!("coordinator ended {other:?}, expected Outcome(0)")),
+    }
 
     // -- inline replay soak (refactor §12.6): the recorded run must re-drive bit-for-bit ---------
     let entries: Vec<SinkEntry> = sink.lock().expect("sink").entries.clone();
@@ -519,52 +580,37 @@ pub(crate) async fn join_and_run_v2(
             committed: 1,
             ingested: 1,
             stalled: false,
-            digest: *digest.as_bytes(),
+            digest: last_digest,
         },
     )
     .await;
     Ok(())
 }
 
-/// Verify a coordinator `SignedMessage` ABOVE the pump, then deliver the pre-verified payload
-/// with the original signed bytes as tag-12 evidence (the pump's delivery contract).
-fn deliver_coordinator_msg(
+/// Deliver one authority-judged coordinator decision into the worker pump: the decoded control
+/// message's canonical bytes as the payload, the coordinator's ORIGINAL §12.1 signed frame as
+/// tag-12 evidence, per-sender dense seq (§12.2 discipline, channel 0).
+fn deliver_to_worker(
     pump: &daemon_vhc_host::v2::PumpHandle,
-    coord_key: &SigningKey,
+    sender: [u8; 32],
     msg: &SwarmMessage,
+    evidence: Vec<u8>,
+    seq: &mut u64,
 ) -> Result<(), String> {
-    // tick emits UNSIGNED messages; the shell signs them (LocalCoordinator's contract). Sign,
-    // then verify exactly as a remote worker would before delivery — the seam under test.
-    let signed = SignedMessage::sign(
-        coord_key,
-        daemon_vhc_proto::SWARM_PROTO_VERSION,
-        msg.clone(),
-    )
-    .map_err(|e| format!("coordinator sign: {e}"))?;
-    signed
-        .verify()
-        .map_err(|e| format!("coordinator frame REFUSED above the pump: {e}"))?;
     let payload = to_canonical_vec(msg).map_err(|e| format!("payload encode: {e}"))?;
-    let evidence = to_canonical_vec(&signed).map_err(|e| format!("evidence encode: {e}"))?;
-    let seq = next_coord_seq();
-    match pump
-        .deliver_frame(0, seq, peer_id(coord_key).0, payload, evidence)
-        .map_err(|e| format!("deliver: {e}"))?
-    {
-        daemon_vhc_host::v2::DeliverVerdict::Accepted => Ok(()),
+    let verdict = pump
+        .deliver_frame(0, *seq, sender, payload, evidence)
+        .map_err(|e| format!("deliver: {e}"))?;
+    match verdict {
+        daemon_vhc_host::v2::DeliverVerdict::Accepted => {
+            *seq += 1;
+            Ok(())
+        }
         other => Err(format!(
             "coordinator frame back-pressured/refused ({other:?}) — the t2 drive never fills \
              the spool"
         )),
     }
-}
-
-/// Coordinator-plane delivery seq (per-process monotone; the §12.2 dense-seq discipline for the
-/// coordinator sender on channel 0).
-fn next_coord_seq() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Wait (bounded) until the pump has published at least `target` frames in total, servicing the
@@ -590,7 +636,6 @@ fn wait_publishes_servicing(
                 daemon_vhc_host::v2::OpRequest::ArtifactFetch { hash, .. } => {
                     // The unified fetch path: the same store + verification discipline the
                     // staging corpus was assembled through (the range is the pump's job).
-                    // (The minted handle is the transport's concern; fetch needs no routing.)
                     let _ = match artifacts.fetch(&hash) {
                         Ok(artifact) => pump
                             .complete_op(op, daemon_vhc_host::v2::OpOutcome::FetchDone { artifact })
@@ -621,18 +666,4 @@ fn wait_publishes_servicing(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-}
-
-/// Decode the module-authored payload of a §12.1 signed frame `[envelope, payload, sig]` as a
-/// `SwarmMessage` (the guest's voice on the control channel).
-fn decode_v2_payload(frame: &[u8]) -> Result<SwarmMessage, String> {
-    let v: ciborium::value::Value =
-        ciborium::de::from_reader(frame).map_err(|e| format!("frame cbor: {e}"))?;
-    let ciborium::value::Value::Array(parts) = v else {
-        return Err("frame is not [envelope, payload, sig]".into());
-    };
-    let Some(ciborium::value::Value::Bytes(payload)) = parts.get(1) else {
-        return Err("frame payload is not bytes".into());
-    };
-    daemon_vhc_proto::from_canonical_slice(payload).map_err(|e| format!("payload decode: {e}"))
 }

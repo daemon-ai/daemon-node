@@ -16,15 +16,16 @@
 //!
 //! - `Probe` → a real host capability report (the frozen 66-op vocabulary; GPU absent = CPU-only).
 //! - `AssessRun{envelope}` → the peer-side re-validation (spec §6.5): verify the canonical
-//!   [`daemon_vhc_proto::SignedEnvelope`], resolve the module from the artifact map
-//!   (blake3-verified; `DAEMON_TRAIN_MODULE` overrides the source inside the signed path), then
-//!   the ABI §1.3 driver selection + the A2 claim()-admission funnel → `Assessed`. **A raw
-//!   config-CBOR envelope is refused typed (`UnsignedEnvelopeRetired`, D0), and a major-1 module
-//!   is refused typed (`AbiUnsupportedMajor`)** — the Phase-E v1 sunset removed the five-phase
-//!   driver, its autotune admission, and the self-driven v1 round together (decisions D5); the
-//!   flipped A0 fixture pins the refusal.
+//!   [`daemon_vhc_proto::SignedEnvelope`] carrying a **genesis envelope v2**, resolve the worker
+//!   role's module by its pinned artifact hash (blake3-verified; `DAEMON_TRAIN_MODULE` overrides
+//!   the source inside the signed path), then the ABI §1.3 driver selection + the A2
+//!   claim()-admission funnel → `Assessed`. **A raw config-CBOR envelope is refused typed
+//!   (`UnsignedEnvelopeRetired`, D0), a schema-major-1 envelope is refused typed
+//!   (`EnvelopeSchemaRetired` — the v1 form cannot configure a wasm coordinator), and a major-1
+//!   module is refused typed (`AbiUnsupportedMajor`)** — the flipped A0 fixture pins the last.
 //! - `JoinRun` → the v2 session run (`v2_session::join_and_run_v2`): the event pump over the
-//!   in-process native coordinator (mixed-fleet cell 5 — a v2 module under a v1 envelope).
+//!   run's REAL wasm coordinator, configured from the genesis and run in-process under the same
+//!   major-2 driver (consensus never runs outside the sandboxed, content-addressed module).
 //! - `Leave`/`Shutdown`/`Ping` → as the protocol requires.
 //!
 //! A trapping module surfaces as `Event::Error{class: Module, …}` — the worker is never harmed.
@@ -142,33 +143,18 @@ async fn main() {
                     .await;
                     continue;
                 }
-                // The v2 session run. The genesis (envelope-v2) in-process drive — the
-                // transitional cell-6 native-coordinator adapter — was RETIRED at D2
-                // (decisions D3 cell 6): a genesis run is coordinated by its wasm coordinator
-                // module (mixed-fleet cell 8), refused typed here. A raw-config AssessRun has
-                // no envelope at all — refused loud.
-                if resolved.genesis.is_some() {
+                // The v2 session run: a genesis (envelope-v2) run coordinated by its REAL wasm
+                // coordinator module, run in-process. The v1-envelope (cell 5) form refused
+                // typed at assess (`EnvelopeSchemaRetired`), so an assessed run always carries
+                // a genesis — the guard fails loud if a caller somehow joins past a refusal.
+                let Some(genesis) = resolved.genesis.as_ref() else {
                     send(
                         &writer,
                         &worker_error(
-                            "cell 6 retired at D2: a genesis (envelope-v2) run is \
-                             coordinated by its wasm coordinator module (mixed-fleet \
-                             cell 8) — the transitional native-coordinator adapter no \
-                             longer exists; the in-process self-driven join serves the \
-                             v1 envelope form (cell 5) only",
-                        ),
-                    )
-                    .await;
-                    continue;
-                }
-                let Some(envelope) = resolved.envelope.as_ref() else {
-                    send(
-                        &writer,
-                        &worker_error(
-                            "JoinRun for a major-2 module without a signed run envelope: \
-                             the v2 session needs the envelope (the coordinator-config \
-                             source); author a SignedEnvelope AssessRun instead of raw \
-                             config bytes",
+                            "JoinRun without a resolved genesis run: the in-process \
+                             self-driven join serves the envelope-v2 (genesis) form only \
+                             (a schema-1 envelope refuses typed at assess — \
+                             EnvelopeSchemaRetired); author a genesis envelope v2",
                         ),
                     )
                     .await;
@@ -177,7 +163,7 @@ async fn main() {
                 match v2_session::join_and_run_v2(
                     &resolved.module,
                     &resolved.config,
-                    envelope,
+                    genesis,
                     &run_id,
                     &writer,
                 )

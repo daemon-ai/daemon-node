@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
-// **The D3 cell-5/6 live t2 whole-run** (decisions D3; ABI §9.3): a REAL v2 worker module
-// (tiny-llama-v2, the macro-emitted BarrierRound guest) under the modified **v1 envelope**
-// carrying `device_min`, driven by the **native coordinator** (the pure `tick`, in-process in
-// the worker binary), through the real worker protocol: probe → assess (claim funnel + stage-3
-// pre-screen over the envelope section) → join → two full rounds (train → commit → record →
-// barrier ingest) → digest — upgrading cell 5 from fixture-supported to whole-run-proven and
-// exercising cell 6's v2-worker × native-coordinator path (its envelope-v2 form is D0's).
+// **The genesis-native in-process whole-run** (the worker's supported self-driven join): the
+// compute@2 trainer (`tiny_llama_c3.wasm` — a real Burn LLaMA, det-lane ingest in-guest, kind-0
+// byte staging) under a **genesis envelope v2**, coordinated by the run's REAL wasm coordinator
+// (`coordinator_quorum.wasm`, pinned in the genesis role set, resolved by content hash from the
+// artifact map, and run in-process under the same major-2 driver), through the real worker
+// protocol: probe → assess (claim funnel + the worker role's device_min pre-screen + role
+// grants) → join → two full barrier rounds (train → guest-sealed commit → record → ingest) →
+// the guest's tag-4 det digest. Consensus never runs outside the sandboxed, content-addressed
+// module — the native-tick drive this file used to pin retired with the v1-envelope (cell 5)
+// form, which now refuses typed at assess (worker_protocol.rs pins the refusal).
 //
 // The run also proves the inline replay soak (refactor §12.6): the worker re-drives its own
 // recorded journal through the §8.7 engine before reporting the round outcome — a diverging
 // run is a join FAILURE (the `replay_decisions` metric is the green receipt).
+//
+// In-process identity contract (v2_session module docs): the worker derives the coordinator's
+// §12.1 frame key from the run id, so this author names that derived key's peer id as the
+// genesis `SingleKey` coordinator identity — a mismatch refuses every coordinator frame at the
+// authority judgment.
 
 // Dev/test harness: shells cargo for the guest build (same pattern as worker_protocol.rs); the
 // env/spawn bans target the shipped node, so they are allowed file-wide here.
@@ -24,16 +32,24 @@ use std::sync::Once;
 use std::time::Duration;
 
 use ciborium::value::Value;
-use daemon_vhc_proto::envelope::{
-    Access, Artifact, DataSection, ExperimentSection, GlobalBatch, Phases, Requirements, RoundMode,
-    RunSection, StopCondition,
+use daemon_vhc_proto::genesis::{
+    ChannelDecl, Identities, RoleEntry, RoleGrants, RunSectionV2, SnapshotArtifact,
+    TransportSelection, GENESIS_SCHEMA_MAJOR,
 };
-use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Envelope, Hash, SignedEnvelope, SigningKey};
-use daemon_vhc_sdk::models::TinyLlamaCfg;
+use daemon_vhc_proto::{
+    blake3_hash, peer_id, to_canonical_vec, GenesisEnvelope, Hash, PeerId, Seed, SignedEnvelope,
+    SigningKey, SWARM_PROTO_VERSION,
+};
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
+use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 use daemon_vhc_session::protocol::{Event, JoinPolicy, PolicyMode};
 use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
-const RUN_ID: &str = "cell56-t2";
+const RUN_ID: &str = "genesis-t2";
+/// The t2 drive geometry (must match the worker's in-process join constants).
+const STEPS_PER_ROUND: u32 = 2;
+const SEQ_LEN: u32 = 9;
+const GLOBAL_BATCH: u32 = 2;
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -57,7 +73,7 @@ fn guest_remap_rustflags() -> String {
 
 static BUILD: Once = Once::new();
 
-fn module_path() -> PathBuf {
+fn module_path(name: &str) -> PathBuf {
     BUILD.call_once(|| {
         let status = StdCommand::new("cargo")
             .current_dir(guests_root())
@@ -68,116 +84,241 @@ fn module_path() -> PathBuf {
             .expect("run cargo for guests");
         assert!(status.success(), "building guest modules failed");
     });
-    guests_root().join("target/wasm32-unknown-unknown/release/tiny_llama_v2.wasm")
+    guests_root().join(format!("target/wasm32-unknown-unknown/release/{name}.wasm"))
 }
 
-/// The guest config (`GuestCfg`): the tiny parity model on a 2-step round, one sequence per
-/// micro window (matching the worker's corpus-backed staging: real token windows cut from the
-/// t2 corpus in training order, one staged batch per train_step — B2).
-fn guest_config() -> Value {
-    let model = Value::serialized(&TinyLlamaCfg {
-        n_layers: 1,
-        seq_len: 9,
-        ..TinyLlamaCfg::default()
-    })
-    .expect("model value");
+/// The worker's in-process identity derivation (v2_session's contract): key seeds are
+/// `blake3("vhc-worker/<run_id>")` / `blake3("vhc-coordinator/<run_id>")`.
+fn derived_peer(prefix: &str) -> PeerId {
+    let seed = *blake3::hash(format!("{prefix}/{RUN_ID}").as_bytes()).as_bytes();
+    peer_id(&SigningKey::from_bytes(&seed))
+}
+
+/// The trainer's canonical parameter element counts for the tiny parity-shape model below
+/// (`ModelCfg::param_numels` — tok, per-block 9 params, final norm).
+fn param_numels() -> Vec<usize> {
+    let (d, qdim, hidden, vocab) = (64usize, 64usize, 128usize, 64usize);
+    let mut out = vec![vocab * d];
+    out.extend([
+        d,
+        d * qdim,
+        d * qdim,
+        d * qdim,
+        qdim * d,
+        d,
+        d * hidden,
+        d * hidden,
+        hidden * d,
+    ]);
+    out.push(d);
+    out
+}
+
+/// A deterministic small init (the guest asserts the flat length against its layout).
+fn deterministic_init(total: usize) -> Vec<f32> {
+    let mut s = 0x5EED_C0DEu64;
+    (0..total)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            #[allow(clippy::cast_precision_loss)]
+            let v = ((s >> 33) % 2001) as f32;
+            (v - 1000.0) / 20000.0 // [-0.05, 0.05]
+        })
+        .collect()
+}
+
+/// The trainer role's opaque config: the compute@2 trainer's `GuestCfg` map (tiny parity-shape
+/// model, sparse_loco profile, matched deterministic init). The `peer`/`roster` are the
+/// worker's DERIVED peer — the coordinator's record entries carry the joined peer identity, and
+/// the guest's payload map is keyed by it.
+fn trainer_role_config() -> Value {
+    let peer = derived_peer("vhc-worker");
+    let model = Value::Map(vec![
+        (Value::from("d_model"), Value::from(64u32)),
+        (Value::from("n_layers"), Value::from(1u32)),
+        (Value::from("n_heads"), Value::from(4u32)),
+        (Value::from("head_dim"), Value::from(16u32)),
+        (Value::from("vocab"), Value::from(64u32)),
+        (Value::from("seq_len"), Value::from(SEQ_LEN)),
+        (Value::from("ffn_mult"), Value::from(2u32)),
+        (Value::from("rope_theta"), Value::from(10_000.0f64)),
+        (Value::from("rmsnorm_eps"), Value::from(1e-5f64)),
+        (Value::from("lr"), Value::from(4e-4f64)),
+        (Value::from("beta1"), Value::from(0.9f64)),
+        (Value::from("beta2"), Value::from(0.95f64)),
+        (Value::from("adam_eps"), Value::from(1e-8f64)),
+        (Value::from("wd"), Value::from(0.1f64)),
+    ]);
+    let profile = Value::Map(vec![
+        (Value::from("h"), Value::from(3u32)),
+        (Value::from("ef_decay"), Value::from(0.95f64)),
+        (Value::from("chunk"), Value::from(64u32)),
+        (Value::from("topk"), Value::from(8u32)),
+        (Value::from("bits"), Value::from(2u32)),
+        (Value::from("outer_alpha"), Value::from(1.0f64)),
+        (Value::from("clip"), Value::Bool(false)),
+    ]);
+    let total: usize = param_numels().iter().sum();
+    let init = deterministic_init(total);
     Value::Map(vec![
         (Value::from("model"), model),
-        (Value::from("peer"), Value::Bytes(vec![7u8; 32])),
+        (Value::from("peer"), Value::Bytes(peer.0.to_vec())),
         (
             Value::from("roster"),
-            Value::Array(vec![Value::Bytes(vec![7u8; 32])]),
+            Value::Array(vec![Value::Bytes(peer.0.to_vec())]),
         ),
-        (Value::from("steps_per_round"), Value::from(2u32)),
+        (Value::from("steps_per_round"), Value::from(STEPS_PER_ROUND)),
         (Value::from("micro_batch"), Value::from(1u32)),
         (Value::from("stall_rounds_max"), Value::from(2u32)),
+        (Value::from("profile"), profile),
+        (
+            Value::from("init"),
+            Value::serialized(&init).expect("init value"),
+        ),
     ])
 }
 
-/// The v1 envelope for the run: schema 1, single peer, a 2-sequence window per round — plus the
-/// additive `device_min` section injected at the raw-CBOR level and re-signed (the cell-5 form).
-fn envelope_wire() -> Vec<u8> {
+/// The coordinator role's opaque config: an authored `RunConfig` + genesis `CoordinatorState`,
+/// exactly the coordinator-quorum guest's `da_init` shape (`{state: …}`; event-driven synthetic
+/// clock — phase deadlines effectively infinite, the ready-heartbeat fast path opens rounds).
+fn coordinator_role_config() -> Value {
+    let run_config = RunConfig {
+        run_id: RUN_ID.to_string(),
+        proto_version: SWARM_PROTO_VERSION,
+        envelope_hash: Hash([0u8; 32]),
+        required_capabilities: daemon_vhc_proto::CapabilitySet::new(),
+        min_peers: 1,
+        max_peers: 4,
+        warmup_s: 1_000_000,
+        round_train_max_s: 1_000_000,
+        round_witness_s: 1_000_000,
+        cooldown_s: 1_000_000,
+        epoch_rounds: 0,
+        stall_rounds_max: 2,
+        global_batch: daemon_vhc_proto::envelope::GlobalBatch {
+            start: GLOBAL_BATCH,
+            end: GLOBAL_BATCH,
+            ramp_rounds: 1,
+        },
+        stop: daemon_vhc_proto::envelope::StopCondition::Rounds(1_000_000),
+        steps_per_round: STEPS_PER_ROUND,
+        seq_len: u64::from(SEQ_LEN),
+        witness_target: 0,
+        overlap_bps: 0,
+        k_absences: 8,
+        verification_percent: 0,
+        authorized: Vec::new(),
+    };
+    let state = CoordinatorState::new(run_config, Seed([0x33; 32]), 0);
+    Value::Map(vec![(
+        Value::Text("state".into()),
+        Value::serialized(&state).expect("state to cbor value"),
+    )])
+}
+
+/// Author + freeze the genesis envelope v2: coordinator + trainer roles pinning the REAL built
+/// blobs by content hash (file:// URLs — the worker fetches BOTH through the artifact resolver),
+/// the derived `SingleKey` coordinator identity, and the declared authority topology.
+fn genesis_wire() -> Vec<u8> {
+    let coord_wasm = std::fs::read(module_path("coordinator_quorum")).expect("coordinator blob");
+    let worker_wasm = std::fs::read(module_path("tiny_llama_c3")).expect("trainer blob");
+    let coord_identity = derived_peer("vhc-coordinator");
+
     let mut artifacts = BTreeMap::new();
     artifacts.insert(
-        "experiment.wasm".to_string(),
-        Artifact {
-            url: "file:///dev/null".into(),
-            blake3: Hash([1; 32]),
+        "coordinator.wasm".to_string(),
+        SnapshotArtifact {
+            url: format!("file://{}", module_path("coordinator_quorum").display()),
+            blake3: blake3_hash(&coord_wasm),
+            size: None,
         },
     );
     artifacts.insert(
-        "data.manifest".to_string(),
-        Artifact {
-            url: "file:///dev/null".into(),
-            blake3: Hash([2; 32]),
+        "worker.wasm".to_string(),
+        SnapshotArtifact {
+            url: format!("file://{}", module_path("tiny_llama_c3").display()),
+            blake3: blake3_hash(&worker_wasm),
+            size: None,
         },
     );
-    let env = Envelope {
-        run: RunSection {
-            schema: 1,
-            run_id: RUN_ID.into(),
+
+    // The roles' channel table: the control channel both modules' manifests name (the
+    // manifest ⊆ admitted-channels check is §9.4 step 6 — omitting channel 0 is a typed
+    // GrantsExceedLane refusal). Numeric quotas stay unset, inheriting the lane ceiling.
+    let control_channel = |name: &str| RoleGrants {
+        channels: vec![ChannelDecl {
+            id: 0,
+            name: name.into(),
+            class: 0,     // authoritative
+            direction: 2, // bidirectional
+            max_frame_bytes: 1 << 20,
+            rate_per_min: 600,
+            spool_frames: Some(256),
+            replay_window: Some(1024),
+            per_sender_quota: Some(64),
+        }],
+        ..RoleGrants::default()
+    };
+    let mut roles = BTreeMap::new();
+    roles.insert(
+        "coordinator".to_string(),
+        RoleEntry {
+            lane: "coordinator".into(),
+            module: "coordinator.wasm".into(),
+            abi: "vhc@2".into(),
+            config: coordinator_role_config(),
+            grants: control_channel("control"),
+            device_min: daemon_vhc_proto::DeviceMinimums::default(),
+        },
+    );
+    roles.insert(
+        "trainer".to_string(),
+        RoleEntry {
+            lane: "trainer".into(),
+            module: "worker.wasm".into(),
+            abi: "vhc@2".into(),
+            config: trainer_role_config(),
+            grants: control_channel("control"),
+            device_min: daemon_vhc_proto::DeviceMinimums {
+                gpu: Some(1), // optional
+                ram_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+        },
+    );
+
+    let env = GenesisEnvelope {
+        run: RunSectionV2 {
+            schema: GENESIS_SCHEMA_MAJOR,
+            run_label: RUN_ID.to_string(),
             min_peers: 1,
             max_peers: 4,
-            access: Access::Org,
+            access: daemon_vhc_proto::envelope::Access::Org,
         },
-        experiment: ExperimentSection {
-            module: "experiment.wasm".into(),
-            abi: "tensor-abi@1".into(),
-            config: guest_config(),
-        },
+        roles,
         artifacts,
-        data: DataSection {
-            manifest: "data.manifest".into(),
-            steps_per_round: 2,
-            global_batch: GlobalBatch {
-                start: 2,
-                end: 2,
-                ramp_rounds: 1,
-            },
-            stop: StopCondition::Tokens(1_000_000),
-        },
-        requirements: Requirements {
-            vram_mb_min: 0,
-            ram_gb_min: 1,
-            uplink_mbps_min: 1,
-            downlink_mbps_min: 1,
-            disk_gb_min: 1,
-            throughput_floor: "c1".into(),
-            update_mb_max: 8,
-            capabilities: vec![],
-            payload_store: "r2".into(),
-        },
-        phases: Phases {
-            round_mode: RoundMode::Barrier,
-            warmup: 1,
-            round_train_max: 60,
-            round_witness: 1,
-            cooldown: 1,
-            epoch_rounds: 10,
-            checkpoint_every_epochs: 1,
-            stall_rounds_max: 2,
-            payload_retention_rounds: 4,
+        // The run's declared trust topology (D1's typed AuthorityConfig, encoded into the opaque
+        // section the host never interprets): SingleKey over the DERIVED coordinator identity.
+        authority: AuthorityConfig {
+            topology: Topology::SingleKey(SingleKey::new(coord_identity)),
+            records_channel: DEFAULT_RECORDS_CHANNEL,
+        }
+        .encode(),
+        transport: TransportSelection::default(),
+        identities: Identities {
+            coordinator: Some(coord_identity),
+            coordinator_set: Vec::new(),
+            upgrade_authority: Vec::new(),
         },
     };
-    let key = SigningKey::from_bytes(&[0x42; 32]);
-    let frozen = env.freeze(&key).expect("freeze");
-    // Inject `device_min` additively (the raw-CBOR author-side operation) and re-sign.
-    let v: Value = ciborium::de::from_reader(frozen.bytes()).expect("decode");
-    let Value::Map(mut entries) = v else { panic!() };
-    entries.push((
-        Value::from("device_min"),
-        Value::Map(vec![
-            (Value::from("gpu"), Value::from(1u64)),
-            (Value::from("ram_bytes"), Value::from(1u64 << 20)),
-        ]),
-    ));
-    let bytes = to_canonical_vec(&Value::Map(entries)).expect("re-encode");
-    let hash = blake3_hash(&bytes);
-    let signature = daemon_vhc_proto::sign::sign_canonical(&key, &hash).expect("sign");
+    let author = SigningKey::from_bytes(&[0x42; 32]);
+    let frozen = env.freeze(&author).expect("freeze genesis");
     let wire = SignedEnvelope {
-        bytes,
-        signature,
-        signer: daemon_vhc_proto::sign::peer_id(&key),
+        bytes: frozen.bytes().to_vec(),
+        signature: *frozen.signature(),
+        signer: *frozen.signer(),
     };
     to_canonical_vec(&wire).expect("wire")
 }
@@ -191,43 +332,39 @@ fn policy() -> JoinPolicy {
     }
 }
 
-/// probe → assess → join → two native-coordinator-driven rounds → replay-soaked digest.
+/// probe → assess → join → two wasm-coordinator-driven barrier rounds → replay-soaked digest.
 #[tokio::test]
-async fn v2_worker_joins_and_runs_rounds_under_the_native_coordinator() {
-    let module = module_path();
-    assert!(module.exists(), "tiny_llama_v2.wasm missing");
+async fn v2_worker_joins_and_runs_rounds_under_the_wasm_coordinator() {
+    let wire = genesis_wire(); // also builds the guests
     let mut cfg = TrainClientConfig::new(env!("CARGO_BIN_EXE_daemon-vhc-worker").to_string());
     cfg.env = vec![
-        (
-            "DAEMON_TRAIN_MODULE".to_string(),
-            module.to_string_lossy().into_owned(),
-        ),
         // The owner's node-side lane choice (§9.6 numbers-are-config): CPU-admitting t2 lane.
+        // NO module-source override: both blobs resolve by content hash from the artifact map.
         ("DAEMON_VHC_LANE_GPU_OPTIONAL".to_string(), "1".to_string()),
     ];
     cfg.spawn_timeout = Duration::from_secs(30);
-    cfg.op_timeout = Duration::from_secs(180);
+    cfg.op_timeout = Duration::from_secs(300);
     let sup = TrainSupervisor::new(cfg);
 
-    // Assess through the REAL funnel: the envelope's device_min feeds stage 3; the claim is the
-    // SDK-derived one the main! macro emits for tiny-llama-v2.
-    let elig = sup.assess(envelope_wire()).await.expect("assess");
+    // Assess through the REAL funnel: the genesis worker role's device_min feeds stage 3, its
+    // grant list stage 4.0; the claim is the trainer's SDK-derived declaration.
+    let elig = sup.assess(wire).await.expect("assess");
     assert!(
         elig.eligible,
-        "v2 module admits under the t2 lane: {:?}",
+        "the compute@2 trainer admits under the t2 lane: {:?}",
         elig.reasons
     );
 
-    // Join: the worker's v2 session — pump attach + the in-process native coordinator.
+    // Join: the worker's v2 session — pump attach + the run's REAL wasm coordinator in-process.
     let mut events = sup
-        .join_streaming(RUN_ID, "local://native-tick", vec![], policy())
+        .join_streaming(RUN_ID, "local://wasm-coordinator", vec![], policy())
         .await
         .expect("join");
 
     // The event stream: RunPhase(train) → Metric(replay_decisions) → RoundOutcome(final digest).
     let mut replay_decisions = None;
     let mut outcome = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     while outcome.is_none() {
         let ev = tokio::time::timeout_at(deadline, events.recv())
             .await
@@ -246,7 +383,10 @@ async fn v2_worker_joins_and_runs_rounds_under_the_native_coordinator() {
             } => {
                 assert_eq!(round, 1, "two rounds ran (0 and 1)");
                 assert_eq!((committed, ingested, stalled), (1, 1, false));
-                assert_ne!(digest, [0u8; 16], "a real det-lane digest");
+                assert_ne!(
+                    digest, [0u8; 16],
+                    "a real det-lane digest (the guest's tag-4)"
+                );
                 outcome = Some(digest);
             }
             Event::Error { detail, .. } => panic!("worker error: {detail}"),
@@ -254,10 +394,11 @@ async fn v2_worker_joins_and_runs_rounds_under_the_native_coordinator() {
         }
     }
 
-    // The inline §12.6 replay soak ran and reproduced every decision (2 rounds × 2 publishes).
+    // The inline §12.6 replay soak ran and reproduced every decision
+    // (2 rounds × 3 publishes: theta + commitment + digest).
     assert_eq!(
         replay_decisions,
-        Some(4.0),
+        Some(6.0),
         "the recorded journal re-drove bit-for-bit before the outcome was reported"
     );
 }

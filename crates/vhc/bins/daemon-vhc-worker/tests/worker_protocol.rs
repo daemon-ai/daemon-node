@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // The `daemon-vhc-worker` binary speaks the frozen `daemon_vhc_session::protocol` over the
+// (Run descriptions are genesis envelopes v2 since the worker's join re-seated onto the wasm
+// coordinator; the schema-major-1 envelope form refuses typed at assess — pinned below.)
 // length-framed stdio cut, through `daemon-vhc-supervisor::TrainSupervisor` (probe / assess /
 // join / throttle) against real guest modules.
 //
@@ -155,8 +157,107 @@ fn v2_guest_config() -> Value {
     ])
 }
 
-/// A real signed schema-major-1 run envelope for `module` (resolved via `DAEMON_TRAIN_MODULE`
-/// inside the signed path; the artifact entry is a placeholder the override substitutes).
+/// A real signed **genesis envelope v2** wire for the run (the worker's only resolvable form):
+/// a coordinator role + a trainer role carrying `config`, with placeholder artifact entries the
+/// `DAEMON_TRAIN_MODULE` override substitutes (the explicit dev/node-controlled module source
+/// inside the signed path — assess never fetches the coordinator module).
+fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
+    use daemon_vhc_proto::genesis::{
+        ChannelDecl, Identities, RoleEntry, RoleGrants, RunSectionV2, SnapshotArtifact,
+        TransportSelection, GENESIS_SCHEMA_MAJOR,
+    };
+    use daemon_vhc_proto::GenesisEnvelope;
+    let mut artifacts = BTreeMap::new();
+    artifacts.insert(
+        "worker-mod".to_string(),
+        SnapshotArtifact {
+            url: "file:///dev/null".into(),
+            blake3: Hash([1; 32]),
+            size: None,
+        },
+    );
+    artifacts.insert(
+        "coord-mod".to_string(),
+        SnapshotArtifact {
+            url: "file:///dev/null".into(),
+            blake3: Hash([2; 32]),
+            size: None,
+        },
+    );
+    let mut roles = BTreeMap::new();
+    roles.insert(
+        "trainer".to_string(),
+        RoleEntry {
+            lane: "trainer".into(),
+            module: "worker-mod".into(),
+            abi: "vhc@2".into(),
+            config,
+            // The control channel the module's manifest names (§9.4 step 6: an envelope that
+            // omitted channel 0 would be a typed GrantsExceedLane refusal); numeric quotas
+            // inherit the lane ceiling (tighten-only).
+            grants: RoleGrants {
+                channels: vec![ChannelDecl {
+                    id: 0,
+                    name: "control".into(),
+                    class: 0,     // authoritative
+                    direction: 2, // bidirectional
+                    max_frame_bytes: 1 << 20,
+                    rate_per_min: 600,
+                    spool_frames: Some(256),
+                    replay_window: Some(1024),
+                    per_sender_quota: Some(64),
+                }],
+                ..RoleGrants::default()
+            },
+            device_min: daemon_vhc_proto::DeviceMinimums {
+                gpu: Some(1), // optional
+                ram_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+        },
+    );
+    roles.insert(
+        "coordinator".to_string(),
+        RoleEntry {
+            lane: "coordinator".into(),
+            module: "coord-mod".into(),
+            abi: "vhc@2".into(),
+            config: Value::Map(vec![]),
+            grants: RoleGrants::default(),
+            device_min: daemon_vhc_proto::DeviceMinimums::default(),
+        },
+    );
+    let env = GenesisEnvelope {
+        run: RunSectionV2 {
+            schema: GENESIS_SCHEMA_MAJOR,
+            run_label: run_label.to_string(),
+            min_peers: 1,
+            max_peers: 4,
+            access: Access::Org,
+        },
+        roles,
+        artifacts,
+        // The opaque Authority section (D1 vocabulary; the host never interprets it) — nominal
+        // for assess-only drives.
+        authority: Value::Map(vec![
+            (Value::from("topology"), Value::from("single-key")),
+            (Value::from("coordinator"), Value::Bytes(vec![9u8; 32])),
+        ]),
+        transport: TransportSelection::default(),
+        identities: Identities::default(),
+    };
+    let author = SigningKey::from_bytes(&[0xA1u8; 32]);
+    let frozen = env.freeze(&author).expect("freeze genesis");
+    let wire = daemon_vhc_proto::SignedEnvelope {
+        bytes: frozen.bytes().to_vec(),
+        signature: *frozen.signature(),
+        signer: *frozen.signer(),
+    };
+    to_canonical_vec(&wire).expect("wire")
+}
+
+/// A real signed schema-major-1 run envelope for `module` — the RETIRED v1 form, authored here
+/// only as the typed-refusal pin's input (`EnvelopeSchemaRetired` at assess).
 fn signed_envelope_wire(run_id: &str, config: Value) -> Vec<u8> {
     let mut artifacts = BTreeMap::new();
     artifacts.insert(
@@ -327,7 +428,7 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
         ..TinyLlamaCfg::default()
     };
     let elig = sup
-        .assess(signed_envelope_wire(
+        .assess(genesis_wire(
             "sunset-v1",
             Value::serialized(&cfg).expect("cfg value"),
         ))
@@ -348,7 +449,7 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
 
 // -- the v2 positive over the signed-envelope seam ------------------------------------------------
 
-/// The Merge-3 envelope seam, post-sunset: the worker receives the real signed envelope, verifies
+/// The envelope seam over the genesis form: the worker receives the real signed genesis, verifies
 /// it, and the **major-2** module assesses eligible through the claim funnel (the full v2
 /// whole-run join is `tests/v2_join.rs`).
 #[tokio::test]
@@ -357,14 +458,36 @@ async fn v2_module_assesses_eligible_over_the_signed_envelope() {
     let sup = supervisor_for(&module);
 
     let elig = sup
-        .assess(signed_envelope_wire("worker-seam", v2_guest_config()))
+        .assess(genesis_wire("worker-seam", v2_guest_config()))
         .await
-        .expect("assess over the signed envelope");
+        .expect("assess over the signed genesis");
     assert!(
         elig.eligible,
         "the v2 module assesses eligible: {:?}",
         elig.reasons
     );
+    sup.shutdown().await;
+}
+
+/// The retired schema-major-1 envelope form refuses TYPED at assess (`EnvelopeSchemaRetired`):
+/// a v1 envelope cannot configure a wasm coordinator (no coordinator role entry, no
+/// Authority/identities section), so the worker refuses it before any module is fetched — and
+/// stays healthy on the same process.
+#[tokio::test]
+async fn v1_envelope_assess_is_refused_envelope_schema_retired() {
+    let module = module_path("tiny_llama_v2.wasm");
+    let sup = supervisor_for(&module);
+
+    let err = sup
+        .assess(signed_envelope_wire("retired-v1-form", v2_guest_config()))
+        .await
+        .expect_err("a schema-1 envelope must refuse at assess");
+    assert!(
+        err.to_string().contains("EnvelopeSchemaRetired"),
+        "the refusal carries the stable typed slug, got: {err}"
+    );
+    sup.ping().await.expect("worker healthy after the refusal");
+    assert_eq!(sup.restarts().await, 0, "no respawn");
     sup.shutdown().await;
 }
 
@@ -396,12 +519,12 @@ async fn throttle_is_harmless_and_never_respawns() {
     let module = module_path("tiny_llama_v2.wasm");
     let sup = supervisor_for(&module);
 
-    sup.assess(signed_envelope_wire("run-9", v2_guest_config()))
+    sup.assess(genesis_wire("run-9", v2_guest_config()))
         .await
         .expect("assess");
     sup.throttle(None, None, true).await.expect("pause");
     sup.throttle(None, None, false).await.expect("resume");
-    sup.assess(signed_envelope_wire("run-9", v2_guest_config()))
+    sup.assess(genesis_wire("run-9", v2_guest_config()))
         .await
         .expect("assess after the lever");
     assert_eq!(
