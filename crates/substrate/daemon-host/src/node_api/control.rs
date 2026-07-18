@@ -2161,7 +2161,7 @@ impl ControlApi for NodeApiImpl {
         }
     }
 
-    // -- Saved presences (W2-F; wire v37): every op delegates to the shared `PresenceManager`;
+    // -- Saved presences (wire v37): every op delegates to the shared `PresenceManager`;
     //    absent it, the trait defaults (empty list / `Unsupported`) apply.
     async fn presence_list(&self) -> Vec<daemon_api::SavedPresence> {
         match &self.presences {

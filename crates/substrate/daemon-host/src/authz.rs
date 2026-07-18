@@ -113,7 +113,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         // telemetry-consent toggle above.
         GatewayGet => C::ControlRead,
         GatewaySet { .. } => C::ControlWrite,
-        // Saved presences (W2-F) are node-wide shared config (like the gateway/telemetry-consent
+        // Saved presences are node-wide shared config (like the gateway/telemetry-consent
         // toggles): listing is a control-plane read (viewer-readable); mutating them is a node-wide
         // control-plane write (operator tier). Not per-owner session state.
         PresenceList => C::ControlRead,
