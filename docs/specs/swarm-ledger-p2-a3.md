@@ -1,5 +1,7 @@
 # Swarm P2 WAN — lane ledger **A3** (worker live attach — the Merge-2 headline)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **A3** of the "Swarm P2 WAN Program", Wave 2. Moves the in-process live recipe (B3's
 `live_harness` — a `RoundEngine` over `IrohGossip` + a real payload store) **into the
 `daemon-train-worker` subprocess**, wires a continuous worker→node event pump, boots run discovery

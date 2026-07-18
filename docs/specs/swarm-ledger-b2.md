@@ -1,5 +1,7 @@
 # Swarm P1 + Transport — lane ledger **B2** (iroh gossip control plane + self-hosted relay)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **B2** of the "Swarm P1 + Transport" program, Wave 2. Owns
 `crates/swarm/daemon-swarm-net/src/iroh_gossip.rs` + `lib.rs` re-exports + the crate `Cargo.toml`
 (iroh-relay features / dev-deps) + the relay dev runner and its docs under the lane-owned

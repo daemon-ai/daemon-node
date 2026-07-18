@@ -1,5 +1,7 @@
 # Swarm P3 — artifact distribution runbook (replaces the P2 pre-staging steps)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 P3 lane-S addendum to [`swarm-p2-gate-runbook.md`](swarm-p2-gate-runbook.md). It **replaces the
 runbook's §1c–§1e module pre-staging** (`scp tiny_llama.wasm <box>` + `DAEMON_TRAIN_MODULE=<path>`)
 and the synthetic corpus with **content-addressed fetch from the payload store**: every fleet peer

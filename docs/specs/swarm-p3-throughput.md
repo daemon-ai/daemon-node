@@ -1,5 +1,7 @@
 # Swarm P3 — throughput record (Lane G: the CUDA engine arm at 160M)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 The P3 Lane-G exit-criterion evidence: the **160M single-host run on the RunPod RTX 4090** through
 the new `BackendKind::Cuda` arm — reference parity inside the Optimizer tolerance class + the
 tokens/s record vs the P2 wgpu figures. Extends [`swarm-p2-throughput.md`](swarm-p2-throughput.md)

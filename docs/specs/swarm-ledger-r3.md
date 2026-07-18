@@ -1,5 +1,7 @@
 # Swarm-training MVP — lane R3 ledger (local runner / churn drills / worker-backed run)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-3 coordination record for lane **R3** (`swarm/r3`). Companion to the program ledger
 [`swarm-mvp-ledger.md`](swarm-mvp-ledger.md) ("Merge 1" + "Merge 2" frozen sections) and the
 Wave-2 runtime record [`swarm-ledger-r2.md`](swarm-ledger-r2.md). Read those first for the frozen

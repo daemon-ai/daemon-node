@@ -1,5 +1,7 @@
 # Swarm-training MVP — lane E3 ledger (engine / tensor-ABI / guests, Wave 3)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-3 (final wave) coordination record for lane **E** (`swarm/e3`). Companion to the program
 ledger (`swarm-mvp-ledger.md`) and the Wave-1/2 lane records (`swarm-ledger-e1.md`,
 `swarm-ledger-e2.md`). Read the program ledger's FROZEN-file + file-ownership rules and the

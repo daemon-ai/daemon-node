@@ -1,5 +1,7 @@
 # daemon swarm training — decentralized transformer pretraining on consumer GPUs
 
+> **Superseded specification.** Predates the `swarm`→`vhc` rename and the v1 retirement (envelope v1 and the `tabi@1` bridge are now typed refusals, the native coordinator substrate is deleted in favor of the WASM coordinator, and `Swarm*` types, `swarm.db`, the `[swarm]` config section, `DAEMON_SWARM__*` env, and the `daemon-swarm-*` crates/lanes are renamed to their `vhc` equivalents). Retained for history; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md) and the module-ABI spec.
+
 **Status:** architecture design (research synthesis + spec draft, not yet scheduled)
 **Provenance:** supersedes the C++/hivemind port designs in
 `~/experiments/decentralised-llm-training/` (`architecture-design.md`,

@@ -1,5 +1,7 @@
 # Swarm P2 — Lane C3 ledger (CI tiers + WAN-gate preparation)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **C3** of the Swarm P2 WAN Program, **Wave 3** — the final wave before the P2 WAN gate ceremony
 (Merge 3). Worktree `/home/j/experiments/daemon-worktree/p2-c3`, branch `swarm/c3`, base `fe27b9c`
 (trunk `integrations/swarm-p2` @ Merge 2). This file is the single source of truth for what C3

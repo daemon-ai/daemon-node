@@ -1,5 +1,7 @@
 # Swarm-training MVP — lane P2 ledger (consensus / coordinator)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-2 working record for lane **P2** (`swarm/p2`). Scope is the deterministic assignment math (in
 `crates/contracts/daemon-swarm-proto`, additively) and the purified coordinator `tick` state machine
 + admission logic (in `crates/swarm/daemon-swarm-coordinator`). Read the program ledger

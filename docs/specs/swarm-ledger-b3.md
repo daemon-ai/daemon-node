@@ -1,5 +1,7 @@
 # Swarm P1 + Transport — lane ledger **B3** (live worker transport + e2e on real planes)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **B3** of the "Swarm P1 + Transport" program, Wave 3 (the final lane wave) — the **transport
 exit-gate lane**. Read `swarm-p1-ledger.md` (program ledger; "Merge 2" + "Wave-3 must know") and the
 predecessor lane ledgers first: `swarm-ledger-b1.md` (R2Store / PresignClient / scheduler / fetch),

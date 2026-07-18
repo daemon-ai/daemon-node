@@ -1,5 +1,7 @@
 # Swarm P1 + Transport — program ledger
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-0 scaffold coordination record for the **Swarm P1 + Transport** program (Workstream A: node
 wire + burn-wgpu GPU training to the P1 "160M on 1 GPU" gate; Workstream B: real transport planes —
 R2 via the daemon-cloud `apps/swarm` worker, self-hosted iroh gossip, live worker transport). This

@@ -1,5 +1,7 @@
 # Swarm-training MVP — lane R1 ledger (runtime / transport / supervisor)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-1 coordination record for lane **R** (`swarm/r1`). Companion to the program ledger
 [`swarm-mvp-ledger.md`](swarm-mvp-ledger.md); read that first for the branch map, file-ownership
 table, and the frozen-file rule. This file records what lane R builds, the seams it exports (frozen

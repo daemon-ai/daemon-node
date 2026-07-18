@@ -1,5 +1,7 @@
 # Swarm P1 — lane M1 ledger (model/data lane, Wave 2)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **M1** of the *Swarm P1 + Transport* program (program ledger:
 [`swarm-p1-ledger.md`](swarm-p1-ledger.md)). M1 → M2 owns: the 160M preset in
 `daemon-train-sdk/src/models.rs`, the `guests/*` binding, the pre-tokenized data path

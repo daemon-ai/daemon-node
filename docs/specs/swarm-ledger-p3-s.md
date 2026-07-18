@@ -1,5 +1,7 @@
 # Swarm P3 Follow-ons — lane ledger **S** (160M fleet staging / artifact distribution)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **S** of the **Swarm P3 Follow-ons Program** (`swarm/s`, base `64e191a` + the wave-0 program
 ledger `245aef6`). Read the program ledger [`swarm-p3-ledger.md`](swarm-p3-ledger.md) first (charter,
 frozen seams, fleet inventory, live substrate). This ledger records only lane S's deltas and consumes

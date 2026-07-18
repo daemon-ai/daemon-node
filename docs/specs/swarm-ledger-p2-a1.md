@@ -1,5 +1,7 @@
 # Swarm P2 WAN — lane ledger **A1** (node↔cloud control plane)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **A1** of the "Swarm P2 WAN Program", Wave 1 (the first blocking link in the integration
 chain). Owns the node WS coordinator client, the dual-plane (WS + gossip) control surface, the
 run-discovery + AssessRun join flow, and the v42 wire delta. Read the program ledger

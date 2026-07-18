@@ -1,5 +1,7 @@
 # Swarm P2 — Lane B1 ledger (protocol/SDK completion)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **B1** of the **Swarm P2 WAN Program**, Wave 1. Branch `swarm/b1`, base `3cd43c1`
 (trunk `integrations/swarm-p2`), worktree `/home/j/experiments/daemon-worktree/p2-b1`.
 This lane closes the P2-assigned **TDD test debt** — the convergence-gating golden/conformance

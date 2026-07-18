@@ -1,5 +1,7 @@
 # Swarm P1 + Transport — lane ledger **B1** (R2 store + presign client + egress schemes)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **B1** of the "Swarm P1 + Transport" program, Wave 1. Owns
 `crates/swarm/daemon-swarm-net/src/{r2_store.rs,presign.rs,artifact.rs,fetch.rs}` + `lib.rs`
 re-exports + the crate `Cargo.toml` (dev-deps). Read `swarm-p1-ledger.md` (program ledger) and

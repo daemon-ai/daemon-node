@@ -1,5 +1,7 @@
 # Swarm P1 — lane W1 ledger (SwarmApi wire + node service)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **W1** (wire/node) of the *Swarm P1 + Transport* program, Wave 1. This is the lane-local
 coordination record: base sha, scope, exported seams, planned slices, and — critically — the exact
 edits **Merge 1** must make (the single coordinated `WireVersion` 39→40 bump is NOT done in this

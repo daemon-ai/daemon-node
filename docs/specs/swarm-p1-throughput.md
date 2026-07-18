@@ -1,5 +1,7 @@
 # Swarm P1 — reference-parity + throughput record (the P1 numeric exit-gate)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 The program-record evidence for the **P1 exit gate** (spec §17 / TDD §8 "P1"): *160M pretrains
 through the module (tabi) path with loss curves matching a straight-burn reference, and tokens/s is
 measured and reported*. Produced by lane **M2** (`swarm-ledger-m2.md`) on this machine — AMD Strix

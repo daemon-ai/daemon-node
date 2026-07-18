@@ -1,5 +1,7 @@
 # Swarm P2 — throughput record (B3 lazy device-resident `OpBackend`)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 The P2 perf follow-on evidence: the **before/after** tokens/s for the B3 lazy-residency change to
 `BurnBackend` (remove the per-op host-readback tax the P1 M2 gate measured, `swarm-p1-throughput.md
 §"Honest overhead accounting"`). Extends the P1 record's method. Produced on this machine — AMD Strix

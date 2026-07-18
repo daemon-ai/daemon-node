@@ -1,5 +1,7 @@
 # Swarm P1 — lane G1 ledger (BurnBackend seam, burn-ndarray first)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane record for **G1** of the "Swarm P1 + Transport" program, Wave 1 (program ledger:
 `swarm-p1-ledger.md`; program plan conventions are the contract). G1 builds the `BurnBackend`
 implementation of the frozen `OpBackend` trait on the **burn-ndarray** CPU backend + autodiff,

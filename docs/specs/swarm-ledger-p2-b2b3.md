@@ -1,5 +1,7 @@
 # Swarm P2 — Lane B2+B3 ledger (observability + performance)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **B2+B3** of the **Swarm P2 WAN Program**, Wave 2. Branch `swarm/b2b3`, base `4e821cd`
 (trunk `integrations/swarm-p2` Merge-1 HEAD), worktree `/home/j/experiments/daemon-worktree/p2-b2`.
 This lane lands two of the three Wave-2 B items:

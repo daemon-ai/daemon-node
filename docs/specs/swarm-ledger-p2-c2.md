@@ -1,5 +1,7 @@
 # Swarm P2 — Lane C2 ledger (platform probes + fleet lanes)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **C2** of the Swarm P2 WAN Program, Wave 2. Worktree
 `/home/j/experiments/daemon-worktree/p2-c2`, branch `swarm/c2`, base `4e821cd` (trunk
 `integrations/swarm-p2` @ Merge-1). This file is the single source of truth for what C2 landed, the

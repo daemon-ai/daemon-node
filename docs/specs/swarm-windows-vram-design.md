@@ -1,5 +1,7 @@
 # Windows VRAM/UMA probe — resolved design (autotune `DeviceLimits`)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 **Status:** design record — **committed at Merge 3** by the integration owner (folds together with
 `swarm-uma-platform-findings.md` §2b, which lane M2 committed this wave; that section is now marked
 RESOLVED with a pointer here). This is a **design/P2-prep record, not a landed implementation** —

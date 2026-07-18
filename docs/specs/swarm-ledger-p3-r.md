@@ -1,5 +1,7 @@
 # Swarm P3 Follow-ons — lane ledger **R** (live checkpoint-resync + DO checkpoint pointer)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **R** of the **Swarm P2 Follow-ons Program (P3)**. Converts B4's proven-in-process
 `resume_from_checkpoint` / `resync_by_replay` machinery into the **LIVE** worker rejoin path, so a
 peer that drops and respawns mid-run rejoins with state **byte-identical to the survivors** — and

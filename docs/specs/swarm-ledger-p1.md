@@ -1,5 +1,7 @@
 # Swarm-training MVP — lane P1 ledger (consensus / proto)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-1 working record for lane **P1** (`swarm/p1`). Scope is the consensus/proto contract in
 `crates/contracts/daemon-swarm-proto` plus its new CDDL file. Read the program ledger
 ([`swarm-mvp-ledger.md`](swarm-mvp-ledger.md)) first for the branch map and the frozen-file rule.

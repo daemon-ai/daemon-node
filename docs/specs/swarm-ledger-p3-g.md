@@ -1,5 +1,7 @@
 # Swarm P3 — Lane G ledger (CUDA engine arm)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane **G** of the **Swarm P3 Follow-ons Program** — the `BackendKind::Cuda` engine arm and its
 RTX-4090 parity/throughput validation. Worktree `/home/j/experiments/daemon-worktree/p3-g`, branch
 `swarm/g`, base `245aef6` (trunk `integrations/swarm-p3` @ Wave-0 — the P3 program ledger on

@@ -1,5 +1,7 @@
 # daemon swarm training — TDD plan (test port + gap register)
 
+> **Superseded specification.** Predates the `swarm`→`vhc` rename and the v1 retirement; the test suites, crate names, and lanes it references are renamed to their `vhc` equivalents and the v1 surfaces are now typed refusals. Retained for history; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md) and the module-ABI spec.
+
 **Status:** test-planning companion to
 [`swarm-training-spec.md`](swarm-training-spec.md) (architecture design) and
 [`swarm-tensor-abi-spec.md`](swarm-tensor-abi-spec.md) (interface contract; its §11 conformance

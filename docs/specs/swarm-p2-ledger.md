@@ -1,5 +1,7 @@
 # Swarm P2 WAN — program ledger
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-0 scaffold coordination record for the **Swarm P2 WAN Program** — taking the landed P1
 protocol stack from in-process shells to a real WAN swarm and passing the spec's P2 research gate
 ([swarm-training-spec.md §17](swarm-training-spec.md)): 160M–500M training across ≥4 heterogeneous

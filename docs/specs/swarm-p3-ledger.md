@@ -1,5 +1,7 @@
 # Swarm P3 Follow-ons — program ledger
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-0 scaffold coordination record for the **Swarm P3 Follow-ons Program** — the direct-measurement
 follow-on to the completed **Swarm P2 WAN Program** ([swarm-p2-ledger.md](swarm-p2-ledger.md)). P2
 passed the spec §17 WAN research gate with **two honest scale caveats** (ε-convergence and <15% round

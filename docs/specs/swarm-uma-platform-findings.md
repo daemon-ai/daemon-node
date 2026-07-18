@@ -1,5 +1,7 @@
 # UMA / GPU-memory-budget platform findings (autotune `DeviceLimits`) — platform matrix
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 **Status:** validation notes — untracked, for the `integrations/swarm-p1` Merge-2 owner to fold
 into the unified-memory GPU-budget fix. Do **not** treat as a committed spec change.
 **Author/date:** G2 follow-up investigation, 2026-07-13.

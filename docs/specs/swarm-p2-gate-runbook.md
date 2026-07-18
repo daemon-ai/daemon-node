@@ -1,5 +1,7 @@
 # Swarm P2 WAN-gate ceremony — operator runbook
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 The exact, archaeology-free procedure to execute **Merge 3 = the P2 WAN research gate**
 ([swarm-training-spec.md §17](swarm-training-spec.md); the ledger's older numbering calls it §16):
 a 160M–500M training run across **≥4 heterogeneous consumer GPUs** (mixed vendors incl. one

@@ -1,5 +1,7 @@
 # Swarm P1 — lane G2 ledger (burn-wgpu + VRAM autotune)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane record for **G2** of the "Swarm P1 + Transport" program, Wave 2 (program ledger:
 `swarm-p1-ledger.md`; program plan conventions are the contract; predecessor lane:
 `swarm-ledger-g1.md`). G2 slots **burn-wgpu** (Vulkan/RADV) into the frozen `BurnBackend<B:

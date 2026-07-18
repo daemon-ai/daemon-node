@@ -1,5 +1,7 @@
 # Swarm-training MVP — program ledger
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-0 scaffold coordination record for the daemon swarm-training MVP. This is the single source
 of truth for the branch map, lane file-ownership, and the frozen-file rule. Lane agents: read this
 before you touch anything.

@@ -1,5 +1,7 @@
 # daemon swarm training — tensor ABI & experiment SDK (interface specification)
 
+> **Superseded specification.** Predates the `swarm`→`vhc` rename and the v1 retirement: envelope v1 and the `tabi@1` bridge described here are now typed refusals (`EnvelopeSchemaRetired` / `BridgeRetired`), the native coordinator substrate is deleted in favor of the WASM coordinator, and the live import vocabulary is `da_abi`-major-2. Retained for history; the current contract lives in [`vhc-architecture-spec.md`](vhc-architecture-spec.md) and the module-ABI spec.
+
 **Status:** interface specification draft (companion to
 [`swarm-training-spec.md`](swarm-training-spec.md); that document owns the architecture, this one
 owns the contract)

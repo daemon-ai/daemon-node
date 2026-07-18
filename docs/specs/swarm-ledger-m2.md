@@ -1,5 +1,7 @@
 # Swarm P1 — lane M2 ledger (reference parity + throughput, Wave 3)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Lane record for **M2** of the "Swarm P1 + Transport" program, Wave 3 — the **P1 numeric exit-gate
 evidence lane** (program ledger: [`swarm-p1-ledger.md`](swarm-p1-ledger.md); the plan conventions
 are the contract; predecessor lanes: [`swarm-ledger-m1.md`](swarm-ledger-m1.md) for the 160M preset

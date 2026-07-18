@@ -1,5 +1,7 @@
 # Swarm-training MVP — lane P3 ledger (consensus / observability)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-3 (final wave) working record for lane **P3** (`swarm/p3`). Scope is the observer / replay-oracle
 crate (`daemon-swarm-observe`), plus additive extensions on the frozen consensus surfaces this
 program froze at Merge 1 and Merge 2: the content-addressed `record-set.cbor` object codec + the

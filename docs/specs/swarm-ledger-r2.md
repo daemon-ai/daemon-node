@@ -1,5 +1,7 @@
 # Swarm-training MVP — lane R2 ledger (peer-side round engine / checkpointing / gossip)
 
+> **Historical document.** Predates the `swarm`→`vhc` rename and the v1 retirement; current naming and behavior are in [`vhc-architecture-spec.md`](vhc-architecture-spec.md).
+
 Wave-2 coordination record for lane **R2** (`swarm/r2`). Companion to the program ledger
 [`swarm-mvp-ledger.md`](swarm-mvp-ledger.md) ("Merge 1 — frozen interfaces") and the Wave-1
 runtime record [`swarm-ledger-r1.md`](swarm-ledger-r1.md). Read those first for the frozen seams
