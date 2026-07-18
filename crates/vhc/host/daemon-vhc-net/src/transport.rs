@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The `SwarmTransport` seam: one control plane + one payload-plane trait (spec §7.1).
+//! The `VhcTransport` seam: one control plane + one payload-plane trait (spec §7.1).
 //!
 //! The control plane is not tiered — every peer publishes/subscribes **already-signed** opaque
 //! control-message bytes (the seven §6.4 round messages plus join/heartbeat). Signing and

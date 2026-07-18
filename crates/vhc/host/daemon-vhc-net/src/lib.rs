@@ -3,7 +3,7 @@
 
 //! `daemon-vhc-net` — the vhc transport.
 //!
-//! The [`SwarmTransport`](transport) seam (spec §7.1): one control plane
+//! The [`VhcTransport`](transport) seam (spec §7.1): one control plane
 //! ([`ControlPlane`] — publish/subscribe of already-signed message bytes, with the in-process
 //! [`LoopbackGossip`] implementation) and one payload plane ([`PayloadStore`] — opaque objects by
 //! `(run, round, peer)` key + content hash, with the filesystem [`FsPayloadStore`] implementation
