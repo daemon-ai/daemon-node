@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The `Tags` container ported from libpurple `PurpleTags` (`purpletags.c`, work package W2-E).
+//! The `Tags` container ported from libpurple `PurpleTags` (`purpletags.c`).
 //!
 //! An ordered collection of string tags, each either bare (`"name"`) or valued (`"name:value"`,
 //! split on the **first** `:`). This is a **non-wire** domain type (like the typed models in
 //! [`crate::details`]): a pure in-memory container with no serde/CDDL surface.
 //!
-//! It deliberately reuses [`ConversationType::tag_value`] (W1-B, [`crate::details`]) for the
+//! It deliberately reuses [`ConversationType::tag_value`] ([`crate::details`]) for the
 //! conversation-`"type"` tag rather than re-deriving that mapping.
 
 use crate::ConversationType;
@@ -150,7 +150,7 @@ impl Tags {
     }
 
     /// Set the conversation `"type"` tag from a [`ConversationType`], reusing
-    /// [`ConversationType::tag_value`] (W1-B, `details.rs`) rather than re-deriving the mapping.
+    /// [`ConversationType::tag_value`] (`details.rs`) rather than re-deriving the mapping.
     /// `Unset` removes any existing `"type"` tag; otherwise the previous `"type"` tag is replaced.
     pub fn set_conversation_type(&mut self, ty: ConversationType) {
         // Drop any existing `type` / `type:*` tag first.
@@ -470,7 +470,7 @@ mod tests {
         assert!(!tags.contains(&needle));
     }
 
-    // -- extra: conversation-type alignment (reuses W1-B tag_value) --------
+    // -- extra: conversation-type alignment (reuses `ConversationType::tag_value`) --------
 
     #[test]
     fn tags_set_conversation_type() {

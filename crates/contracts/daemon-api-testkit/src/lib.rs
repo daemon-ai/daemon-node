@@ -4,8 +4,8 @@
 //! `daemon-api-testkit` — reference [`MessagingProtocol`] implementations plus the
 //! ops-vs-behavior conformance invariant, ported from libpurple's protocol test fixtures.
 //!
-//! This dev-only crate is the executable spec for W1-A: the daemon analogue of libpurple's
-//! `Test*Empty` / `Test*` protocol fixtures.
+//! This dev-only crate is the executable spec for adapter ops-vs-behavior conformance: the daemon
+//! analogue of libpurple's `Test*Empty` / `Test*` protocol fixtures.
 //!
 //! - [`EmptyProtocol`] exposes **every** `Supports*` feature-trait handle but reports **no** verb
 //!   supported and leaves every verb at its trait default (→ [`ApiError::Unsupported`]). It mirrors

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! libpurple's **request-field model** ported node-internally (work package W2-I).
+//! libpurple's **request-field model** ported node-internally.
 //!
 //! This is the node-authoritative model behind an interactive request form: typed
 //! [`RequestField`]s grouped into [`RequestGroup`]s aggregated onto a [`RequestPage`], with the

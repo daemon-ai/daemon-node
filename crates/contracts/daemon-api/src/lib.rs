@@ -1364,7 +1364,7 @@ pub trait ControlApi: Send + Sync {
         Err(ApiError::Unsupported("cron_dismiss_suggestion".into()))
     }
 
-    // -- Saved presences (W2-F; wire v37): the node-authoritative list of named, reusable
+    // -- Saved presences (wire v37): the node-authoritative list of named, reusable
     //    presences the app renders + drives. Backed by the host `PresenceManager` over the durable
     //    store; a node built without it inherits the defaulted empty list / `Unsupported`. --
 

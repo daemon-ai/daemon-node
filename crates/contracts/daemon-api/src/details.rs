@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Conversation/account **DTO behavior logic** ported from libpurple (work package W1-B).
+//! Conversation/account **DTO behavior logic** ported from libpurple.
 //!
 //! This module adds methods/functions over the existing wire DTOs in [`crate`] — it introduces **no
 //! wire-contract changes**. Everything here is a pure, node-authoritative decision the thin clients

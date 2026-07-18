@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! File-transfer **DTO behavior logic** ported from libpurple (work package W2-H).
+//! File-transfer **DTO behavior logic** ported from libpurple.
 //!
 //! This module adds constructors, a state machine, and an in-memory manager over the wire
 //! [`FileTransfer`] DTO in [`crate`]:

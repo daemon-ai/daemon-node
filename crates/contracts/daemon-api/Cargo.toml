@@ -27,7 +27,7 @@ arbitrary = ["dep:arbitrary", "daemon-common/arbitrary", "daemon-protocol/arbitr
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
-# W1-A conformance harness. The daemon-api <-> daemon-api-testkit dev-dependency cycle is permitted
+# Adapter ops-vs-behavior conformance harness. The daemon-api <-> daemon-api-testkit dev-dependency cycle is permitted
 # by cargo (testkit depends on daemon-api as a normal dep; daemon-api depends on it only for tests).
 daemon-api-testkit = { workspace = true }
 # Conformance gate: validate real ciborium wire bytes against the authoritative daemon-api.cddl so

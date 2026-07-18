@@ -227,14 +227,14 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
                 ApiResponse::CrashConsent { enabled }
             })
         }
-        // -- saved presences (W2-F; wire v37) -------------------------------------------------
+        // -- saved presences (wire v37) -------------------------------------------------------
         ApiRequest::PresenceList => ApiResponse::SavedPresences(api.presence_list().await),
         ApiRequest::PresenceSave { presence } => unit_or_err(api.presence_save(presence).await),
         ApiRequest::PresenceDelete { id } => unit_or_err(api.presence_delete(id).await),
         ApiRequest::PresenceSetActive { id } => unit_or_err(api.presence_set_active(id).await),
-        // -- notifications (W2-G; wire v37) ---------------------------------------------------
+        // -- notifications (wire v37) ---------------------------------------------------------
         ApiRequest::NotificationList => ApiResponse::Notifications(api.notification_list().await),
-        // -- persons / metacontacts (W3-J; wire v37) ------------------------------------------
+        // -- persons / metacontacts (wire v37) ------------------------------------------------
         ApiRequest::PersonList { since_rev } => {
             ApiResponse::Persons(api.person_list(since_rev).await)
         }
