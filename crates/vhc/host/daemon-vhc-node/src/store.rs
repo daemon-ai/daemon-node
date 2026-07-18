@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use daemon_api::{SwarmContribution, SwarmEligibility, SwarmEvent, SwarmPolicy};
+use daemon_api::{VhcContribution, VhcEligibility, VhcEvent, VhcPolicy};
 use rusqlite::{params, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
 
@@ -59,13 +59,13 @@ pub struct PersistedRun {
     /// The coordinator endpoint discovery/join used.
     pub coordinator: String,
     /// The participation policy the node joined under.
-    pub policy: SwarmPolicy,
+    pub policy: VhcPolicy,
     /// The durable join-intent (drives restart re-convergence).
     pub desired_state: DesiredState,
     /// An opaque credential store reference (daemon-credentials), if any.
     pub credentials_ref: Option<String>,
     /// The node-computed eligibility (ADR-003 mirror; the app renders it, never re-derives it).
-    pub eligibility: SwarmEligibility,
+    pub eligibility: VhcEligibility,
     /// The last-known phase string.
     pub last_phase: String,
     /// The last-known round.
@@ -262,9 +262,9 @@ impl VhcStore {
         &self,
         run_id: &str,
         coordinator: &str,
-        policy: &SwarmPolicy,
+        policy: &VhcPolicy,
         credentials_ref: Option<&str>,
-        eligibility: &SwarmEligibility,
+        eligibility: &VhcEligibility,
     ) -> Result<(), StoreError> {
         let policy_json = serde_json::to_string(policy)?;
         let elig_json = serde_json::to_string(eligibility)?;
@@ -310,7 +310,7 @@ impl VhcStore {
     pub fn set_eligibility(
         &self,
         run_id: &str,
-        eligibility: &SwarmEligibility,
+        eligibility: &VhcEligibility,
     ) -> Result<(), StoreError> {
         let elig_json = serde_json::to_string(eligibility)?;
         self.lock().execute(
@@ -444,7 +444,7 @@ impl VhcStore {
     }
 
     /// A run's contribution counters (zeros if no row yet).
-    pub fn get_contribution(&self, run_id: &str) -> Result<SwarmContribution, StoreError> {
+    pub fn get_contribution(&self, run_id: &str) -> Result<VhcContribution, StoreError> {
         let conn = self.lock();
         let c = conn
             .query_row(
@@ -452,7 +452,7 @@ impl VhcStore {
                  FROM vhc_contrib WHERE run_id = ?1",
                 params![run_id],
                 |row| {
-                    Ok(SwarmContribution {
+                    Ok(VhcContribution {
                         rounds: row.get::<_, i64>(0)? as u64,
                         tokens: row.get::<_, i64>(1)? as u64,
                         bytes_up: row.get::<_, i64>(2)? as u64,
@@ -503,8 +503,8 @@ impl VhcStore {
     }
 
     /// Append an event to the windowed log for a run, then prune to the newest [`EVENT_WINDOW`]
-    /// (ADR-007). The event body is JSON (`SwarmEvent`), keyed by `kind` for cheap filtering.
-    pub fn append_event(&self, event: &SwarmEvent) -> Result<(), StoreError> {
+    /// (ADR-007). The event body is JSON (`VhcEvent`), keyed by `kind` for cheap filtering.
+    pub fn append_event(&self, event: &VhcEvent) -> Result<(), StoreError> {
         let body = serde_json::to_vec(event)?;
         let run_id = event.run_id().to_string();
         let conn = self.lock();
@@ -521,7 +521,7 @@ impl VhcStore {
     }
 
     /// The most recent events for a run in chronological order (oldest → newest), capped at `limit`.
-    pub fn recent_events(&self, run_id: &str, limit: usize) -> Result<Vec<SwarmEvent>, StoreError> {
+    pub fn recent_events(&self, run_id: &str, limit: usize) -> Result<Vec<VhcEvent>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare("SELECT body FROM vhc_events WHERE run_id = ?1 ORDER BY seq DESC LIMIT ?2")?;
@@ -531,7 +531,7 @@ impl VhcStore {
         let mut out = Vec::new();
         for r in rows {
             let bytes = r?;
-            out.push(serde_json::from_slice::<SwarmEvent>(&bytes)?);
+            out.push(serde_json::from_slice::<VhcEvent>(&bytes)?);
         }
         out.reverse();
         Ok(out)
@@ -640,11 +640,11 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daemon_api::SwarmPolicyMode;
+    use daemon_api::VhcPolicyMode;
 
-    fn v1_policy() -> SwarmPolicy {
-        SwarmPolicy {
-            mode: SwarmPolicyMode::Idle,
+    fn v1_policy() -> VhcPolicy {
+        VhcPolicy {
+            mode: VhcPolicyMode::Idle,
             vram_cap_mb: 8_000,
             duty_cycle_pct: 90,
             schedule: None,
@@ -662,7 +662,7 @@ mod tests {
             .to_latest(&mut conn)
             .unwrap();
         let policy_json = serde_json::to_string(&v1_policy()).unwrap();
-        let elig_json = serde_json::to_string(&SwarmEligibility::default()).unwrap();
+        let elig_json = serde_json::to_string(&VhcEligibility::default()).unwrap();
         conn.execute(
             "INSERT INTO vhc_runs (run_id, coordinator, policy_json, desired_state, \
              eligibility_json) VALUES ('legacy-run', 'ws://c', ?1, 'joined', ?2)",
@@ -707,7 +707,7 @@ mod tests {
                 "ws://c",
                 &v1_policy(),
                 None,
-                &SwarmEligibility::default(),
+                &VhcEligibility::default(),
             )
             .unwrap();
         assert_eq!(store.get_run("run-A").unwrap().unwrap().run_id_hash, None);
@@ -761,7 +761,7 @@ mod tests {
                 "iroh://c",
                 &v1_policy(),
                 None,
-                &SwarmEligibility::default(),
+                &VhcEligibility::default(),
             )
             .unwrap();
         store

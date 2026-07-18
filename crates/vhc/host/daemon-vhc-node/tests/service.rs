@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use daemon_api::{
-    NodeEvent, SwarmApi, SwarmEligibility, SwarmEvent, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode,
+    NodeEvent, VhcApi, VhcEligibility, VhcEvent, VhcLeaveMode, VhcPolicy, VhcPolicyMode,
 };
 use daemon_vhc_node::service::{NodeFeed, VhcError, WorkerControl};
 use daemon_vhc_node::{
@@ -114,9 +114,9 @@ fn enabled_config() -> VhcConfig {
     }
 }
 
-fn policy() -> SwarmPolicy {
-    SwarmPolicy {
-        mode: SwarmPolicyMode::Idle,
+fn policy() -> VhcPolicy {
+    VhcPolicy {
+        mode: VhcPolicyMode::Idle,
         vram_cap_mb: 8_000,
         duty_cycle_pct: 90,
         schedule: None,
@@ -144,11 +144,11 @@ async fn disabled_by_default_never_touches_worker() {
     assert_eq!(svc.start().await.unwrap(), 0);
     // Every worker-touching API op resolves to Unsupported (disabled), spawning nothing.
     assert!(matches!(
-        svc.swarm_join("r1".into(), policy(), "op".into()).await,
+        svc.vhc_join("r1".into(), policy(), "op".into()).await,
         Err(daemon_api::ApiError::Unsupported(_))
     ));
     assert!(matches!(
-        svc.swarm_hardware_report().await,
+        svc.vhc_hardware_report().await,
         Err(daemon_api::ApiError::Unsupported(_))
     ));
     let c = worker.calls();
@@ -174,13 +174,13 @@ async fn join_persists_and_reload_reconverges() {
             budget: None,
             worker_factory: None,
         });
-        svc.swarm_join("run-a".into(), policy(), "op-a".into())
+        svc.vhc_join("run-a".into(), policy(), "op-a".into())
             .await
             .unwrap();
-        svc.swarm_join("run-b".into(), policy(), "op-b".into())
+        svc.vhc_join("run-b".into(), policy(), "op-b".into())
             .await
             .unwrap();
-        svc.swarm_leave("run-b".into(), SwarmLeaveMode::Graceful, "op-c".into())
+        svc.vhc_leave("run-b".into(), VhcLeaveMode::Graceful, "op-c".into())
             .await
             .unwrap();
         assert_eq!(worker.calls().joins, vec!["run-a", "run-b"]);
@@ -204,7 +204,7 @@ async fn join_persists_and_reload_reconverges() {
         assert_eq!(rejoined, 1, "only the active intent re-converges");
         assert_eq!(worker.calls().joins, vec!["run-a"]);
         // The run list still shows both rows (run-b retained, marked not-joined).
-        let mut runs = svc.swarm_run_list().await.unwrap();
+        let mut runs = svc.vhc_run_list().await.unwrap();
         runs.sort_by(|a, b| a.run_id.cmp(&b.run_id));
         assert_eq!(runs.len(), 2);
         assert!(runs[0].joined && runs[0].run_id == "run-a");
@@ -223,14 +223,14 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
     let svc = service(enabled_config(), worker, Some(feed));
 
     // Events arrive for a joined run — join first (creates the run row), then reset the feed log so
-    // we count only the event-driven SwarmChanged pings below.
-    svc.swarm_join("run-1".into(), policy(), "op".into())
+    // we count only the event-driven VhcChanged pings below.
+    svc.vhc_join("run-1".into(), policy(), "op".into())
         .await
         .unwrap();
     feed_log.lock().unwrap().clear();
 
     // A live subscriber for run-1.
-    let mut sub = svc.swarm_subscribe(Some("run-1".into())).await.unwrap();
+    let mut sub = svc.vhc_subscribe(Some("run-1".into())).await.unwrap();
 
     // Feed a worker phase → progress → outcome → error sequence.
     let outs = svc
@@ -243,7 +243,7 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
         .unwrap();
     assert!(matches!(
         outs.as_slice(),
-        [SwarmEvent::Phase { round: 5, .. }]
+        [VhcEvent::Phase { round: 5, .. }]
     ));
 
     let outs = svc
@@ -258,7 +258,7 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
         .unwrap();
     assert!(matches!(
         outs.as_slice(),
-        [SwarmEvent::Progress {
+        [VhcEvent::Progress {
             loss_micros: 3_500_000,
             peers: 3,
             ..
@@ -284,23 +284,23 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
     let kinds: Vec<&str> = collect(&mut sub, 4)
         .await
         .iter()
-        .map(SwarmEvent::kind)
+        .map(VhcEvent::kind)
         .collect();
     assert_eq!(kinds, ["phase", "progress", "round_outcome", "error"]);
 
-    // Each handled worker event pinged the node feed with a SwarmChanged pointer. Scope the guard so
+    // Each handled worker event pinged the node feed with a VhcChanged pointer. Scope the guard so
     // it never crosses the await below.
     {
         let feed_events = feed_log.lock().unwrap();
         assert_eq!(feed_events.len(), 4);
         assert!(feed_events.iter().all(|e| matches!(
             e,
-            NodeEvent::SwarmChanged { run_id: Some(r), .. } if r == "run-1"
+            NodeEvent::VhcChanged { run_id: Some(r), .. } if r == "run-1"
         )));
     }
 
     // Contribution folded from the events (one non-stalled round, bytes from progress).
-    let detail = svc.swarm_run_detail("run-1".into()).await.unwrap().unwrap();
+    let detail = svc.vhc_run_detail("run-1".into()).await.unwrap().unwrap();
     assert_eq!(detail.contribution.rounds, 1);
     assert_eq!(detail.contribution.bytes_up, 100);
     assert_eq!(detail.contribution.bytes_down, 200);
@@ -312,18 +312,18 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
 async fn governor_throttle_lever_reaches_worker_with_combined_budget_clamp() {
     // §10.5 governor drill (B3): a synthetic inference-pressure signal arrives as a policy update
     // clamping the vhc's budget (on a unified box `vram_cap_mb` clamps the *combined* device+host
-    // budget — Merge-2 spec-amendment #1). `swarm_set_policy` must push that lever through to the
+    // budget — Merge-2 spec-amendment #1). `vhc_set_policy` must push that lever through to the
     // worker's `throttle` verbatim, so the co-resident inference tenant is protected.
     let worker = FakeWorker::new();
     let svc = service(enabled_config(), worker.clone(), None);
 
-    let pressure = SwarmPolicy {
-        mode: SwarmPolicyMode::Idle,
+    let pressure = VhcPolicy {
+        mode: VhcPolicyMode::Idle,
         vram_cap_mb: 4_096, // clamp the combined budget under inference pressure
         duty_cycle_pct: 25, // and throttle the duty cycle
         schedule: None,
     };
-    svc.swarm_set_policy(pressure).await.unwrap();
+    svc.vhc_set_policy(pressure).await.unwrap();
 
     let c = worker.calls();
     assert_eq!(
@@ -359,7 +359,7 @@ async fn checkpoint_published_yields_contribution_event_and_credit() {
     // CheckpointPublished emits a Contribution event carrying the fresh totals (1 credit).
     assert!(matches!(
         outs.as_slice(),
-        [SwarmEvent::Contribution { contribution, .. }] if contribution.checkpoint_credits == 1
+        [VhcEvent::Contribution { contribution, .. }] if contribution.checkpoint_credits == 1
     ));
 }
 
@@ -367,7 +367,7 @@ async fn checkpoint_published_yields_contribution_event_and_credit() {
 fn vhc_db_migration_is_idempotent_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vhc.db");
-    let elig = SwarmEligibility::default();
+    let elig = VhcEligibility::default();
     {
         let store = VhcStore::open(&path).unwrap();
         store
@@ -389,7 +389,7 @@ fn vhc_events_log_is_windowed() {
     let store = VhcStore::open_in_memory().unwrap();
     for i in 0..(EVENT_WINDOW + 50) {
         store
-            .append_event(&SwarmEvent::Phase {
+            .append_event(&VhcEvent::Phase {
                 run_id: "r1".into(),
                 phase: format!("p{i}"),
                 epoch: 0,
@@ -402,7 +402,7 @@ fn vhc_events_log_is_windowed() {
     let recent = store.recent_events("r1", EVENT_WINDOW).unwrap();
     assert_eq!(recent.len(), EVENT_WINDOW);
     // Chronological order (oldest → newest); the last is the highest round.
-    if let SwarmEvent::Phase { round, .. } = recent.last().unwrap() {
+    if let VhcEvent::Phase { round, .. } = recent.last().unwrap() {
         assert_eq!(*round, (EVENT_WINDOW + 49) as u64);
     } else {
         panic!("expected Phase");
@@ -439,14 +439,14 @@ impl FakeDiscovery {
     }
 }
 
-/// With a discovery seam, `swarm_join` discovers the run, fetches the frozen envelope, and derives
+/// With a discovery seam, `vhc_join` discovers the run, fetches the frozen envelope, and derives
 /// eligibility from the worker's real §6.5 `AssessRun` (not the probe), taking the coordinator from
 /// discovery — the A1 join flow.
 #[tokio::test]
 async fn join_discovers_fetches_envelope_and_assesses() {
     let worker = FakeWorker::new();
     let discovery = Arc::new(FakeDiscovery {
-        coordinator: "https://coord.example/api/v1/swarm".into(),
+        coordinator: "https://coord.example/api/v1/vhc".into(),
         envelope: b"frozen-envelope-bytes".to_vec(),
     });
     let svc = VhcService::new(VhcServiceParts {
@@ -459,7 +459,7 @@ async fn join_discovers_fetches_envelope_and_assesses() {
         worker_factory: None,
     });
 
-    svc.swarm_join("run-disc".into(), policy(), "op".into())
+    svc.vhc_join("run-disc".into(), policy(), "op".into())
         .await
         .unwrap();
 
@@ -479,11 +479,11 @@ async fn join_discovers_fetches_envelope_and_assesses() {
 
     // The persisted run carries the discovery coordinator + the assess-derived eligibility.
     let detail = svc
-        .swarm_run_detail("run-disc".into())
+        .vhc_run_detail("run-disc".into())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(detail.coordinator, "https://coord.example/api/v1/swarm");
+    assert_eq!(detail.coordinator, "https://coord.example/api/v1/vhc");
     assert!(detail.summary.eligibility.eligible);
     assert_eq!(
         detail
@@ -497,7 +497,7 @@ async fn join_discovers_fetches_envelope_and_assesses() {
 }
 
 /// Drain `n` items from a subscription stream (with a timeout so a bug can't hang the test).
-async fn collect(sub: &mut daemon_api::SwarmEventStream, n: usize) -> Vec<SwarmEvent> {
+async fn collect(sub: &mut daemon_api::VhcEventStream, n: usize) -> Vec<VhcEvent> {
     let mut out = Vec::new();
     for _ in 0..n {
         match tokio::time::timeout(std::time::Duration::from_secs(2), sub.next()).await {

@@ -263,38 +263,38 @@ pub enum ApiRequest {
         /// The installed model to introspect.
         id: ModelId,
     },
-    /// [`SwarmApi::swarm_run_list`].
-    SwarmRunList,
-    /// [`SwarmApi::swarm_run_detail`].
-    SwarmRunDetail {
+    /// [`VhcApi::vhc_run_list`].
+    VhcRunList,
+    /// [`VhcApi::vhc_run_detail`].
+    VhcRunDetail {
         /// The run to detail.
         run_id: String,
     },
-    /// [`SwarmApi::swarm_join`].
-    SwarmJoin {
+    /// [`VhcApi::vhc_join`].
+    VhcJoin {
         /// The run to join.
         run_id: String,
         /// The participation policy.
-        policy: SwarmPolicy,
+        policy: VhcPolicy,
         /// The client-minted idempotency key (ADR-006).
         op_id: String,
     },
-    /// [`SwarmApi::swarm_leave`].
-    SwarmLeave {
+    /// [`VhcApi::vhc_leave`].
+    VhcLeave {
         /// The run to leave.
         run_id: String,
         /// How to leave (graceful / immediate).
-        mode: SwarmLeaveMode,
+        mode: VhcLeaveMode,
         /// The client-minted idempotency key (ADR-006).
         op_id: String,
     },
-    /// [`SwarmApi::swarm_set_policy`].
-    SwarmSetPolicy {
+    /// [`VhcApi::vhc_set_policy`].
+    VhcSetPolicy {
         /// The new default participation policy.
-        policy: SwarmPolicy,
+        policy: VhcPolicy,
     },
-    /// [`SwarmApi::swarm_hardware_report`].
-    SwarmHardwareReport,
+    /// [`VhcApi::vhc_hardware_report`].
+    VhcHardwareReport,
     /// [`ProfileApi::profile_list`].
     ProfileList,
     /// [`ProfileApi::profile_get`].
@@ -1331,8 +1331,8 @@ impl ApiRequest {
             | ApiRequest::RosterRemove { op_id, .. }
             | ApiRequest::FtSend { op_id, .. }
             | ApiRequest::TransportConfigure { op_id, .. } => op_id,
-            // Swarm join/leave carry a required op_id (not `Option`) — return it directly.
-            ApiRequest::SwarmJoin { op_id, .. } | ApiRequest::SwarmLeave { op_id, .. } => {
+            // Vhc join/leave carry a required op_id (not `Option`) — return it directly.
+            ApiRequest::VhcJoin { op_id, .. } | ApiRequest::VhcLeave { op_id, .. } => {
                 return Some(op_id.as_str())
             }
             _ => return None,
@@ -1413,12 +1413,12 @@ pub enum ApiResponse {
     ModelQuantizes(Vec<QuantizeStatus>),
     /// A model's GGUF metadata.
     ModelInspect(GgufInfo),
-    /// A swarm run list (each row carries node-computed eligibility, §6.5).
-    SwarmRuns(Vec<SwarmRunSummary>),
-    /// One swarm run's full detail (`None` rendered as the absent variant).
-    SwarmRunDetail(Option<SwarmRunDetail>),
+    /// A vhc run list (each row carries node-computed eligibility, §6.5).
+    VhcRuns(Vec<VhcRunSummary>),
+    /// One vhc run's full detail (`None` rendered as the absent variant).
+    VhcRunDetail(Option<VhcRunDetail>),
     /// This node's training-capability report.
-    SwarmHardwareReport(SwarmHardwareReport),
+    VhcHardwareReport(VhcHardwareReport),
     /// A profile listing (the active default marked).
     Profiles(Vec<ProfileInfo>),
     /// One profile's full spec, or `None` if unknown / no active default (profile_get).
@@ -2413,8 +2413,8 @@ mod auth_contract_tests {
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
     /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v42 (the additive
-    /// `SwarmHardwareReport.shared_mb` UMA-spillover mirror, Swarm P2 A1 — on top of v41's
-    /// crash-consent surface, v40's `SwarmApi` surface, and v39's rungs 1+2+3, spec 09 §10.4).
+    /// `VhcHardwareReport.shared_mb` UMA-spillover mirror, Vhc P2 A1 — on top of v41's
+    /// crash-consent surface, v40's `VhcApi` surface, and v39's rungs 1+2+3, spec 09 §10.4).
     /// Distinct from the transport-envelope [`WIRE_VERSION`] above (= 2), which the mirror rungs did
     /// not touch. Bumping the contract version is a deliberate act — this assertion is the gate.
     #[test]

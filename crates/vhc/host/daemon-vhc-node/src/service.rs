@@ -4,22 +4,21 @@
 //! [`VhcService`] — the resident node-side vhc-training service (spec §10.3/§10.4).
 //!
 //! It owns a worker-control seam ([`WorkerControl`], implemented for `daemon-vhc-supervisor`'s
-//! `TrainSupervisor`), the durable [`VhcStore`] (`vhc.db`), and a broadcast of [`SwarmEvent`]s.
+//! `TrainSupervisor`), the durable [`VhcStore`] (`vhc.db`), and a broadcast of [`VhcEvent`]s.
 //! It:
 //!
-//! - Translates worker [`protocol::Event`]s into [`SwarmEvent`]s, persists them to the windowed log, folds contribution counters, broadcasts to `swarm_subscribe`, and emits a payload-free [`NodeEvent::SwarmChanged`] pointer onto the node feed (§10.4).
+//! - Translates worker [`protocol::Event`]s into [`VhcEvent`]s, persists them to the windowed log, folds contribution counters, broadcasts to `vhc_subscribe`, and emits a payload-free [`NodeEvent::VhcChanged`] pointer onto the node feed (§10.4).
 //! - Drives **durable-intent re-convergence** on [`start`](VhcService::start): re-issues `JoinRun` for every persisted active join-intent so a restart rejoins without app involvement (§10.3).
 //! - Is **OFF by default** (`[vhc] enabled = false`): a disabled service never touches the worker, so no training worker is ever spawned unless vhc is enabled.
-//! - Implements [`SwarmApi`], mapping requests → worker commands + store reads (eligibility is node-computed from the worker probe/assess and mirrored, ADR-003 — the app never re-derives it).
+//! - Implements [`VhcApi`], mapping requests → worker commands + store reads (eligibility is node-computed from the worker probe/assess and mirrored, ADR-003 — the app never re-derives it).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use daemon_api::{
-    ApiError, NodeEvent, SwarmApi, SwarmCapabilities, SwarmEligibility, SwarmEvent,
-    SwarmEventStream, SwarmHardwareReport, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode,
-    SwarmRunDetail, SwarmRunSummary,
+    ApiError, NodeEvent, VhcApi, VhcCapabilities, VhcEligibility, VhcEvent, VhcEventStream,
+    VhcHardwareReport, VhcLeaveMode, VhcPolicy, VhcPolicyMode, VhcRunDetail, VhcRunSummary,
 };
 use daemon_vhc_session::config::VhcConfig;
 use daemon_vhc_session::protocol::{
@@ -38,7 +37,7 @@ use crate::discovery::RunDiscovery;
 use crate::store::{DesiredState, PersistedRun, StoreError, VhcStore, EVENT_WINDOW};
 
 /// A node-feed sink: the node passes a closure over `NodeEventFeed::emit` so live vhc updates ride
-/// the existing `events_subscribe` channel as `SwarmChanged` pointers (no new transport).
+/// the existing `events_subscribe` channel as `VhcChanged` pointers (no new transport).
 pub type NodeFeed = Arc<dyn Fn(NodeEvent) + Send + Sync>;
 
 /// A per-role-instance worker factory (Phase E multi-instance supervision, decisions D1/D6):
@@ -230,9 +229,9 @@ pub struct VhcServiceParts {
     /// The default worker-control seam (a real `TrainSupervisor` in production) — the probe
     /// surface, and the shared child when no [`VhcServiceParts::worker_factory`] is set.
     pub worker: Arc<dyn WorkerControl>,
-    /// The node-feed sink for `SwarmChanged` pointers (`None` on a headless / test build).
+    /// The node-feed sink for `VhcChanged` pointers (`None` on a headless / test build).
     pub feed: Option<NodeFeed>,
-    /// The run-discovery seam (A1). When present, `swarm_join` discovers the run + fetches the frozen
+    /// The run-discovery seam (A1). When present, `vhc_join` discovers the run + fetches the frozen
     /// envelope + runs the worker's real §6.5 `AssessRun` before `JoinRun`. `None` keeps the W1
     /// probe-based eligibility path (no coordinator configured), so the service stays usable offline.
     pub discovery: Option<Arc<dyn RunDiscovery>>,
@@ -263,15 +262,15 @@ pub struct VhcService {
     /// Per-role-instance children (Phase E N-sandbox supervision), keyed by `RunLabel`.
     instances: Mutex<BTreeMap<String, InstanceEntry>>,
     worker_factory: Option<WorkerFactory>,
-    events_tx: broadcast::Sender<SwarmEvent>,
+    events_tx: broadcast::Sender<VhcEvent>,
     feed: Option<NodeFeed>,
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
     /// don't carry a run id (`RoundProgress`/`RoundOutcome`/…).
     current_run: Mutex<Option<String>>,
-    /// The coalescing vhc-feed revision stamped on each `SwarmChanged` pointer.
+    /// The coalescing vhc-feed revision stamped on each `VhcChanged` pointer.
     rev: AtomicU64,
     /// The service's own `Arc` handle (A3), bound post-construction via [`bind_self`](Self::bind_self)
-    /// so `swarm_join`/`start` can spawn a detached event-pump task that outlives the `&self` call.
+    /// so `vhc_join`/`start` can spawn a detached event-pump task that outlives the `&self` call.
     /// Unbound (test builds) → the non-streaming `join` path, drained-and-dropped.
     me: std::sync::OnceLock<std::sync::Weak<VhcService>>,
 }
@@ -302,10 +301,10 @@ impl VhcService {
         &self.arbiter
     }
 
-    /// Bind the service's own `Arc` handle (A3 event pump), mirroring the node's `set_swarm`
-    /// post-`Arc` binder. After this, `swarm_join` / `start` drive `join_streaming` + a detached pump
+    /// Bind the service's own `Arc` handle (A3 event pump), mirroring the node's `set_vhc`
+    /// post-`Arc` binder. After this, `vhc_join` / `start` drive `join_streaming` + a detached pump
     /// task feeding the worker's continuous event stream into [`handle_worker_event`](Self::handle_worker_event)
-    /// → `NodeEvent::SwarmChanged`, so `vhc.db` reflects live round progression (§10.3/§10.4).
+    /// → `NodeEvent::VhcChanged`, so `vhc.db` reflects live round progression (§10.3/§10.4).
     /// Idempotent; never bound → the non-streaming join path (unchanged, for tests).
     pub fn bind_self(self: &Arc<Self>) {
         let _ = self.me.set(Arc::downgrade(self));
@@ -339,7 +338,7 @@ impl VhcService {
                     while let Some(ev) = rx.recv().await {
                         // Best-effort fan-out: a persist error never stalls the pump (mirrors the
                         // existing "a broadcast send error only means no live subscribers" posture;
-                        // the durable log + a SwarmChanged pointer let a client re-baseline).
+                        // the durable log + a VhcChanged pointer let a client re-baseline).
                         let _ = me.handle_worker_event(&ev);
                     }
                 });
@@ -368,7 +367,7 @@ impl VhcService {
     /// the children died with the node (stdio cut), so the fresh ledger is re-charged exactly by
     /// re-admitting each persisted intent (decisions D6 point 7 — the ledger converges to the
     /// genuinely-running set). A persisted intent the (possibly shrunk) owner budget no longer
-    /// fits is surfaced LOUD as a persisted `SwarmEvent::Error` and skipped — one refused run
+    /// fits is surfaced LOUD as a persisted `VhcEvent::Error` and skipped — one refused run
     /// never blocks the rest of re-convergence. The persisted incarnation is retained (a process
     /// restart retains the logical instance id, decisions D1); only a genuinely new
     /// role-instance mints a new one.
@@ -404,7 +403,7 @@ impl VhcService {
                 }
                 let mut emitted = Vec::new();
                 let _ = self.emit(
-                    SwarmEvent::Error {
+                    VhcEvent::Error {
                         run_id: run.run_id.clone(),
                         class: "owner_arbitration".to_string(),
                         detail: format!("re-convergence refused: {refusal}"),
@@ -475,11 +474,7 @@ impl VhcService {
     /// when no device claim is present (the tightening overlay, never an inflation); `duty_cycle_pct`
     /// is the duty charge. Net/disk tiers are left to the assess claim (not separately reported
     /// here yet). The device id is placed by [`Self::admit_placed`] (first-fit) — a placeholder here.
-    fn derive_charge(
-        &self,
-        eligibility: &SwarmEligibility,
-        policy: &SwarmPolicy,
-    ) -> InstanceCharge {
+    fn derive_charge(&self, eligibility: &VhcEligibility, policy: &VhcPolicy) -> InstanceCharge {
         const MIB: u64 = 1 << 20;
         let claim = |key: &str| {
             eligibility
@@ -538,9 +533,9 @@ impl VhcService {
     }
 
     /// Translate + persist + fan out a worker event (spec §10.3 "all are persisted / fanned out by
-    /// the node"). Returns the [`SwarmEvent`]s emitted (0..2 per worker event). B3 wires the live
+    /// the node"). Returns the [`VhcEvent`]s emitted (0..2 per worker event). B3 wires the live
     /// worker event stream into this; W1 tests drive it directly.
-    pub fn handle_worker_event(&self, ev: &protocol::Event) -> Result<Vec<SwarmEvent>, VhcError> {
+    pub fn handle_worker_event(&self, ev: &protocol::Event) -> Result<Vec<VhcEvent>, VhcError> {
         // Track the current run + persist phase from a RunPhase.
         if let protocol::Event::RunPhase {
             run_id,
@@ -584,7 +579,7 @@ impl VhcService {
         if matches!(ev, protocol::Event::CheckpointPublished { .. }) {
             let contribution = self.store.get_contribution(&run_id)?;
             self.emit(
-                SwarmEvent::Contribution {
+                VhcEvent::Contribution {
                     run_id: run_id.clone(),
                     contribution,
                 },
@@ -597,7 +592,7 @@ impl VhcService {
         Ok(emitted)
     }
 
-    fn emit(&self, sev: SwarmEvent, out: &mut Vec<SwarmEvent>) -> Result<(), VhcError> {
+    fn emit(&self, sev: VhcEvent, out: &mut Vec<VhcEvent>) -> Result<(), VhcError> {
         self.store.append_event(&sev)?;
         // A send error only means "no live subscribers"; the durable log already has it.
         let _ = self.events_tx.send(sev.clone());
@@ -608,7 +603,7 @@ impl VhcService {
     fn emit_changed(&self, run_id: Option<String>) {
         if let Some(feed) = &self.feed {
             let rev = self.rev.fetch_add(1, Ordering::SeqCst) + 1;
-            feed(NodeEvent::SwarmChanged { run_id, rev });
+            feed(NodeEvent::VhcChanged { run_id, rev });
         }
     }
 
@@ -653,7 +648,7 @@ impl VhcService {
         &self,
         worker: &Arc<dyn WorkerControl>,
         run_id: &str,
-    ) -> Result<(String, SwarmEligibility), VhcError> {
+    ) -> Result<(String, VhcEligibility), VhcError> {
         if let Some(discovery) = &self.discovery {
             let run = discovery
                 .get_run(run_id)
@@ -666,7 +661,7 @@ impl VhcService {
             let coordinator = self.coordinator();
             let eligibility = match worker.probe().await {
                 Ok(hw) => eligibility_from_hardware(&hw),
-                Err(_) => SwarmEligibility {
+                Err(_) => VhcEligibility {
                     eligible: false,
                     reasons: vec!["worker probe failed".into()],
                     headroom: BTreeMap::new(),
@@ -678,8 +673,8 @@ impl VhcService {
 }
 
 #[async_trait]
-impl SwarmApi for VhcService {
-    async fn swarm_run_list(&self) -> Result<Vec<SwarmRunSummary>, ApiError> {
+impl VhcApi for VhcService {
+    async fn vhc_run_list(&self) -> Result<Vec<VhcRunSummary>, ApiError> {
         let runs = self
             .store
             .list_runs()
@@ -687,7 +682,7 @@ impl SwarmApi for VhcService {
         Ok(runs.into_iter().map(run_summary).collect())
     }
 
-    async fn swarm_run_detail(&self, run_id: String) -> Result<Option<SwarmRunDetail>, ApiError> {
+    async fn vhc_run_detail(&self, run_id: String) -> Result<Option<VhcRunDetail>, ApiError> {
         let map = |e: StoreError| VhcError::from(e).to_api();
         let Some(run) = self.store.get_run(&run_id).map_err(map)? else {
             return Ok(None);
@@ -697,7 +692,7 @@ impl SwarmApi for VhcService {
             .store
             .recent_events(&run_id, EVENT_WINDOW)
             .map_err(map)?;
-        Ok(Some(SwarmRunDetail {
+        Ok(Some(VhcRunDetail {
             coordinator: run.coordinator.clone(),
             summary: run_summary(run),
             contribution,
@@ -705,10 +700,10 @@ impl SwarmApi for VhcService {
         }))
     }
 
-    async fn swarm_join(
+    async fn vhc_join(
         &self,
         run_id: String,
-        policy: SwarmPolicy,
+        policy: VhcPolicy,
         _op_id: String,
     ) -> Result<(), ApiError> {
         // Idempotency is enforced upstream by the dispatch op-id dedup guard; the store's
@@ -846,10 +841,10 @@ impl SwarmApi for VhcService {
         Ok(())
     }
 
-    async fn swarm_leave(
+    async fn vhc_leave(
         &self,
         run_id: String,
-        mode: SwarmLeaveMode,
+        mode: VhcLeaveMode,
         _op_id: String,
     ) -> Result<(), ApiError> {
         self.require_enabled().map_err(|e| e.to_api())?;
@@ -875,7 +870,7 @@ impl SwarmApi for VhcService {
         Ok(())
     }
 
-    async fn swarm_set_policy(&self, policy: SwarmPolicy) -> Result<(), ApiError> {
+    async fn vhc_set_policy(&self, policy: VhcPolicy) -> Result<(), ApiError> {
         self.require_enabled().map_err(|e| e.to_api())?;
         // W1: push the governor levers to the worker (§10.5) — and, under multi-instance
         // supervision, to every live role-instance child (the owner lever is host-wide). The
@@ -903,20 +898,20 @@ impl SwarmApi for VhcService {
         Ok(())
     }
 
-    async fn swarm_hardware_report(&self) -> Result<SwarmHardwareReport, ApiError> {
+    async fn vhc_hardware_report(&self) -> Result<VhcHardwareReport, ApiError> {
         self.require_enabled().map_err(|e| e.to_api())?;
         let hw = self.worker.probe().await.map_err(|e| e.to_api())?;
         Ok(hardware_report(hw))
     }
 
-    async fn swarm_subscribe(&self, run_id: Option<String>) -> Result<SwarmEventStream, ApiError> {
+    async fn vhc_subscribe(&self, run_id: Option<String>) -> Result<VhcEventStream, ApiError> {
         let rx = self.events_tx.subscribe();
         let stream = BroadcastStream::new(rx).filter_map(move |res| {
             let want = run_id.clone();
             async move {
                 match res {
                     // Filter to one run when requested; drop `Lagged` gaps (the durable log + a
-                    // SwarmChanged pointer let a lagging client re-baseline via run_detail).
+                    // VhcChanged pointer let a lagging client re-baseline via run_detail).
                     Ok(ev) => match &want {
                         Some(r) if ev.run_id() != r => None,
                         _ => Some(ev),
@@ -933,7 +928,7 @@ impl SwarmApi for VhcService {
 // Wire<->worker mappings (the node is the single translation point)
 // ---------------------------------------------------------------------------
 
-fn run_summary(run: PersistedRun) -> SwarmRunSummary {
+fn run_summary(run: PersistedRun) -> VhcRunSummary {
     let joined = run.desired_state == DesiredState::Joined;
     let hex = |bytes: &[u8; 32]| {
         use std::fmt::Write as _;
@@ -946,7 +941,7 @@ fn run_summary(run: PersistedRun) -> SwarmRunSummary {
     // backfilled); a v1-only row keeps them absent — its identity is the RunLabel alone
     // (decisions D1 lazy backfill).
     let identified = run.run_id_hash.is_some();
-    SwarmRunSummary {
+    VhcRunSummary {
         run_id: run.run_id,
         phase: run.last_phase,
         joined,
@@ -964,16 +959,16 @@ fn run_summary(run: PersistedRun) -> SwarmRunSummary {
     }
 }
 
-fn to_policy_mode(mode: SwarmPolicyMode) -> PolicyMode {
+fn to_policy_mode(mode: VhcPolicyMode) -> PolicyMode {
     match mode {
-        SwarmPolicyMode::Always => PolicyMode::Always,
-        SwarmPolicyMode::Idle => PolicyMode::Idle,
-        SwarmPolicyMode::Scheduled => PolicyMode::Scheduled,
-        SwarmPolicyMode::Manual => PolicyMode::Manual,
+        VhcPolicyMode::Always => PolicyMode::Always,
+        VhcPolicyMode::Idle => PolicyMode::Idle,
+        VhcPolicyMode::Scheduled => PolicyMode::Scheduled,
+        VhcPolicyMode::Manual => PolicyMode::Manual,
     }
 }
 
-fn to_join_policy(p: &SwarmPolicy) -> JoinPolicy {
+fn to_join_policy(p: &VhcPolicy) -> JoinPolicy {
     JoinPolicy {
         mode: to_policy_mode(p.mode),
         vram_cap_mb: p.vram_cap_mb,
@@ -982,15 +977,15 @@ fn to_join_policy(p: &SwarmPolicy) -> JoinPolicy {
     }
 }
 
-fn to_leave_mode(mode: SwarmLeaveMode) -> LeaveMode {
+fn to_leave_mode(mode: VhcLeaveMode) -> LeaveMode {
     match mode {
-        SwarmLeaveMode::Graceful => LeaveMode::Graceful,
-        SwarmLeaveMode::Immediate => LeaveMode::Immediate,
+        VhcLeaveMode::Graceful => LeaveMode::Graceful,
+        VhcLeaveMode::Immediate => LeaveMode::Immediate,
     }
 }
 
-fn hardware_report(hw: Hardware) -> SwarmHardwareReport {
-    SwarmHardwareReport {
+fn hardware_report(hw: Hardware) -> VhcHardwareReport {
+    VhcHardwareReport {
         gpus: hw.gpus,
         vram_mb: hw.vram_mb,
         // A1 / wire v42: mirror the worker's unified-memory spillover (GTT) into the app-facing DTO
@@ -999,7 +994,7 @@ fn hardware_report(hw: Hardware) -> SwarmHardwareReport {
         shared_mb: hw.shared_mb,
         ram_mb: hw.ram_mb,
         backend_lanes: hw.backend_lanes,
-        capabilities: SwarmCapabilities {
+        capabilities: VhcCapabilities {
             abi_version: u32::from(hw.capabilities.abi_version),
             ops: hw.capabilities.ops,
             payload_stores: hw.capabilities.payload_stores,
@@ -1014,8 +1009,8 @@ fn hardware_report(hw: Hardware) -> SwarmHardwareReport {
 /// Map the worker's real §6.5 `AssessRun` verdict onto the app-facing eligibility DTO (A1). The
 /// worker's `headroom` is an ordered `Vec<(String, i64)>`; the wire DTO is a `BTreeMap`. The app
 /// renders this; it never re-derives eligibility (ADR-003).
-fn eligibility_from_assess(e: &Eligibility) -> SwarmEligibility {
-    SwarmEligibility {
+fn eligibility_from_assess(e: &Eligibility) -> VhcEligibility {
+    VhcEligibility {
         eligible: e.eligible,
         reasons: e.reasons.clone(),
         headroom: e.headroom.iter().cloned().collect(),
@@ -1033,7 +1028,7 @@ fn eligibility_from_assess(e: &Eligibility) -> SwarmEligibility {
 /// charges probed VRAM and never falls through to a zero/default cap. Host RAM stays an
 /// informational readout (`ram_mb`, MiB) for the app panel — it is not charged on this path (the
 /// assess claim is the host-tier source).
-fn eligibility_from_hardware(hw: &Hardware) -> SwarmEligibility {
+fn eligibility_from_hardware(hw: &Hardware) -> VhcEligibility {
     let eligible = hw.gpus > 0 || !hw.backend_lanes.is_empty();
     let mut reasons = Vec::new();
     if !eligible {
@@ -1045,21 +1040,21 @@ fn eligibility_from_hardware(hw: &Hardware) -> SwarmEligibility {
         hw.vram_mb.saturating_mul(1 << 20) as i64,
     );
     headroom.insert("ram_mb".to_string(), hw.ram_mb as i64);
-    SwarmEligibility {
+    VhcEligibility {
         eligible,
         reasons,
         headroom,
     }
 }
 
-fn translate(ev: &protocol::Event, run_id: &str) -> Option<SwarmEvent> {
+fn translate(ev: &protocol::Event, run_id: &str) -> Option<VhcEvent> {
     match ev {
         protocol::Event::RunPhase {
             phase,
             epoch,
             round,
             ..
-        } => Some(SwarmEvent::Phase {
+        } => Some(VhcEvent::Phase {
             run_id: run_id.to_string(),
             phase: phase.clone(),
             epoch: *epoch,
@@ -1071,7 +1066,7 @@ fn translate(ev: &protocol::Event, run_id: &str) -> Option<SwarmEvent> {
             tokens_per_s,
             peers,
             ..
-        } => Some(SwarmEvent::Progress {
+        } => Some(VhcEvent::Progress {
             run_id: run_id.to_string(),
             inner_step: *inner_step,
             loss_micros: fixed(*loss, 1_000_000.0),
@@ -1084,19 +1079,19 @@ fn translate(ev: &protocol::Event, run_id: &str) -> Option<SwarmEvent> {
             ingested,
             stalled,
             ..
-        } => Some(SwarmEvent::RoundOutcome {
+        } => Some(VhcEvent::RoundOutcome {
             run_id: run_id.to_string(),
             round: *round,
             committed: *committed,
             ingested: *ingested,
             stalled: *stalled,
         }),
-        protocol::Event::Warning { class, detail } => Some(SwarmEvent::Warning {
+        protocol::Event::Warning { class, detail } => Some(VhcEvent::Warning {
             run_id: run_id.to_string(),
             class: class.clone(),
             detail: detail.clone(),
         }),
-        protocol::Event::Error { class, detail } => Some(SwarmEvent::Error {
+        protocol::Event::Error { class, detail } => Some(VhcEvent::Error {
             run_id: run_id.to_string(),
             class: format!("{class:?}"),
             detail: detail.clone(),

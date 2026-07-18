@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use daemon_api::{SwarmApi, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode};
+use daemon_api::{VhcApi, VhcLeaveMode, VhcPolicy, VhcPolicyMode};
 use daemon_vhc_node::service::{VhcError, WorkerControl};
 use daemon_vhc_node::{
     DiscoveredRun, OwnerBudget, RunDiscovery, VhcService, VhcServiceParts, VhcStore,
@@ -103,9 +103,9 @@ fn probe_worker(vram_mb: i64) -> Arc<FakeChild> {
     })
 }
 
-fn policy(vram_cap_mb: u32, duty: u32) -> SwarmPolicy {
-    SwarmPolicy {
-        mode: SwarmPolicyMode::Idle,
+fn policy(vram_cap_mb: u32, duty: u32) -> VhcPolicy {
+    VhcPolicy {
+        mode: VhcPolicyMode::Idle,
         vram_cap_mb,
         duty_cycle_pct: duty,
         schedule: None,
@@ -171,11 +171,11 @@ async fn trainer_and_verifier_colocate_under_arbitration_both_green() {
     // The probe path charges policy.vram_cap_mb when the probe headroom is absent/zero — the
     // tightening overlay as the estimate (decisions D6: JoinPolicy narrows, never exceeds).
     r.svc
-        .swarm_join("run-trainer".into(), policy(6_000, 40), "op-1".into())
+        .vhc_join("run-trainer".into(), policy(6_000, 40), "op-1".into())
         .await
         .expect("trainer admitted");
     r.svc
-        .swarm_join("run-verifier".into(), policy(4_000, 40), "op-2".into())
+        .vhc_join("run-verifier".into(), policy(4_000, 40), "op-2".into())
         .await
         .expect("verifier colocated");
 
@@ -206,7 +206,7 @@ async fn trainer_and_verifier_colocate_under_arbitration_both_green() {
     // supreme stage) — the API error names the exhausted ledger, and no third child spawned.
     let err = r
         .svc
-        .swarm_join("run-third".into(), policy(1, 1), "op-3".into())
+        .vhc_join("run-third".into(), policy(1, 1), "op-3".into())
         .await
         .expect_err("no room");
     let msg = format!("{err:?}");
@@ -225,11 +225,7 @@ async fn trainer_and_verifier_colocate_under_arbitration_both_green() {
 
     // Leave the verifier: teardown observed → ledger released → the third now admits.
     r.svc
-        .swarm_leave(
-            "run-verifier".into(),
-            SwarmLeaveMode::Graceful,
-            "op-4".into(),
-        )
+        .vhc_leave("run-verifier".into(), VhcLeaveMode::Graceful, "op-4".into())
         .await
         .expect("leave");
     assert_eq!(
@@ -245,7 +241,7 @@ async fn trainer_and_verifier_colocate_under_arbitration_both_green() {
         4_000 * MIB
     );
     r.svc
-        .swarm_join("run-third".into(), policy(1_000, 10), "op-5".into())
+        .vhc_join("run-third".into(), policy(1_000, 10), "op-5".into())
         .await
         .expect("admits after the release");
     assert_eq!(r.svc.arbiter().instances(), 2);
@@ -258,12 +254,12 @@ async fn trainer_and_verifier_colocate_under_arbitration_both_green() {
 async fn repeated_join_never_double_charges() {
     let r = rig(colocation_budget());
     r.svc
-        .swarm_join("run-a".into(), policy(6_000, 40), "op-1".into())
+        .vhc_join("run-a".into(), policy(6_000, 40), "op-1".into())
         .await
         .unwrap();
     let before = r.svc.arbiter().remaining();
     r.svc
-        .swarm_join("run-a".into(), policy(6_000, 40), "op-2".into())
+        .vhc_join("run-a".into(), policy(6_000, 40), "op-2".into())
         .await
         .expect("re-join converges");
     assert_eq!(r.svc.arbiter().remaining(), before, "no double charge");
@@ -300,10 +296,10 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
             worker_factory: Some(factory),
         }));
         svc.bind_self();
-        svc.swarm_join("run-big".into(), policy(6_000, 40), "op-1".into())
+        svc.vhc_join("run-big".into(), policy(6_000, 40), "op-1".into())
             .await
             .unwrap();
-        svc.swarm_join("run-small".into(), policy(2_000, 10), "op-2".into())
+        svc.vhc_join("run-small".into(), policy(2_000, 10), "op-2".into())
             .await
             .unwrap();
         incarnation = svc.store().get_run("run-big").unwrap().unwrap().instance;
@@ -344,7 +340,7 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            daemon_api::SwarmEvent::Error { class, .. } if class == "owner_arbitration"
+            daemon_api::VhcEvent::Error { class, .. } if class == "owner_arbitration"
         )),
         "the refused intent is surfaced loud, got {events:?}"
     );
@@ -368,7 +364,7 @@ impl RunDiscovery for StubDiscovery {
     async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, VhcError> {
         Ok(Some(DiscoveredRun {
             run_id: run_id.to_string(),
-            coordinator: "wss://coord.example/swarm".to_string(),
+            coordinator: "wss://coord.example/vhc".to_string(),
             envelope_hash: "00".repeat(32),
             proto_version: 1,
         }))
@@ -426,7 +422,7 @@ async fn admitted_charge_equals_assess_claim_totals() {
     svc.bind_self();
 
     // Uncapped policy (`vram_cap_mb = 0`) so the assess claim stands verbatim.
-    svc.swarm_join("run-claim".into(), policy(0, 50), "op-1".into())
+    svc.vhc_join("run-claim".into(), policy(0, 50), "op-1".into())
         .await
         .expect("claim-bearing join admitted");
 

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::seam::RoundId;
 
 /// How a peer participates on hardware primarily wanted for inference (§10.5). Mirrors the wire
-/// `swarm-policy-mode` (§10.4).
+/// `vhc-policy-mode` (§10.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyMode {
@@ -113,8 +113,8 @@ pub struct Hardware {
     /// an integrated GPU can page tensors into beyond [`Self::vram_mb`]. `0` = none (a classic
     /// discrete GPU). **Additive (Merge 2):** `#[serde(default)]` keeps pre-Merge-2 `Hardware`
     /// payloads (which lack this field) decodable, and a `shared_mb == 0` value serializes
-    /// compatibly. This is the worker↔node protocol type; it does NOT cross the SwarmApi wire (the
-    /// app-facing DTO is `daemon_api::SwarmHardwareReport`, mapped in the node service), so no CDDL
+    /// compatibly. This is the worker↔node protocol type; it does NOT cross the VhcApi wire (the
+    /// app-facing DTO is `daemon_api::VhcHardwareReport`, mapped in the node service), so no CDDL
     /// / wire-version change is implied.
     #[serde(default)]
     pub shared_mb: u64,

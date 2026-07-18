@@ -80,7 +80,7 @@ pub enum RegistryAuthConfig {
 /// The coordinator-registry discovery surface (`[vhc.registry]`; A3 — the A1-noted boot follow-on).
 ///
 /// When `base` is non-empty, `bins/daemon` constructs a `RegistryClient`-backed `EgressRunDiscovery`
-/// at boot, so `swarm_join` discovers the run, fetches + blake3-verifies the frozen envelope, and
+/// at boot, so `vhc_join` discovers the run, fetches + blake3-verifies the frozen envelope, and
 /// runs the worker's real §6.5 `AssessRun` before `JoinRun`. Empty (the default) keeps
 /// `discovery: None` — the W1 probe-based fallback against the allowlist. **Deploy-swappable by
 /// config only**: the same node targets wrangler-dev (`http://127.0.0.1:8795/api/v1/swarm`) or the

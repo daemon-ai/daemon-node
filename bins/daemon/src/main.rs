@@ -3011,10 +3011,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // Drain any feedback records left queued by a previous run (best-effort, detached). No-op when
     // export is inert. Per-submit drains ride the `FeedbackSubmit` handler.
     node.spawn_feedback_drain();
-    // B3: bind the vhc-training service post-`Arc` when `[vhc] enabled` (the W1 `with_swarm`
-    // seam — inert by default). When on, the node hosts a `daemon-vhc-node::VhcService` over a
+    // Bind the vhc-training service post-`Arc` when `[vhc] enabled` (the `with_vhc` seam — inert
+    // by default). When on, the node hosts a `daemon-vhc-node::VhcService` over a
     // `daemon-vhc-supervisor::TrainSupervisor`, re-converges durable join intents (§10.3), and routes
-    // its `SwarmChanged` invalidation pointers onto the existing node feed. A `Weak` feed handle
+    // its `VhcChanged` invalidation pointers onto the existing node feed. A `Weak` feed handle
     // avoids a node↔service `Arc` cycle. Drags no burn/wasmtime/iroh onto the default build.
     if cfg.vhc.enabled {
         match daemon_vhc_node::VhcStore::open(cfg.data_dir.join("vhc.db")) {
@@ -3125,7 +3125,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 if let Err(e) = svc.start().await {
                     tracing::error!(error = %e, "vhc: VhcService::start failed");
                 }
-                node.set_swarm(svc as Arc<dyn daemon_api::SwarmApi>);
+                node.set_vhc(svc as Arc<dyn daemon_api::VhcApi>);
                 tracing::info!("vhc: VhcService bound ([vhc] enabled)");
             }
             Err(e) => {

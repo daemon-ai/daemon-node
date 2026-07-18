@@ -151,12 +151,12 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | CustomProviderSet { .. }
         | CustomProviderRemove { .. } => C::ModelsWrite,
 
-        // -- serve_swarm: swarm-training participation (spec §10.4) -----------------------------
-        // Swarm participation is node-wide operator control (like the gateway / presence / telemetry
+        // -- serve_vhc: vhc-training participation (spec §10.4) -----------------------------
+        // Vhc participation is node-wide operator control (like the gateway / presence / telemetry
         // toggles): discovery/detail/hardware are control-plane reads; join/leave/set-policy move the
         // node's durable participation intent and are node-wide control-plane writes (operator tier).
-        SwarmRunList | SwarmRunDetail { .. } | SwarmHardwareReport => C::ControlRead,
-        SwarmJoin { .. } | SwarmLeave { .. } | SwarmSetPolicy { .. } => C::ControlWrite,
+        VhcRunList | VhcRunDetail { .. } | VhcHardwareReport => C::ControlRead,
+        VhcJoin { .. } | VhcLeave { .. } | VhcSetPolicy { .. } => C::ControlWrite,
 
         // -- serve_profile: profiles + skills (versioned) + personas (wire v36) -----------------
         ProfileList

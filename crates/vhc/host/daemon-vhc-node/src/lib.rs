@@ -12,14 +12,14 @@
 //! - [`VhcService`] — supervises **N worker instances** (one sandbox = one role-instance,
 //!   decisions D1/D6; each a [`WorkerControl`], in production a `daemon-vhc-supervisor`
 //!   `TrainSupervisor` child) under the owner's aggregate grants, translates worker events into
-//!   [`SwarmEvent`](daemon_api::SwarmEvent)s (persisted + fanned out + `NodeEvent::SwarmChanged`
+//!   [`VhcEvent`](daemon_api::VhcEvent)s (persisted + fanned out + `NodeEvent::VhcChanged`
 //!   on the node feed), re-issues `JoinRun` for persisted intents on start, and implements
-//!   [`daemon_api::SwarmApi`]. **OFF by default** — a disabled service never spawns a worker.
+//!   [`daemon_api::VhcApi`]. **OFF by default** — a disabled service never spawns a worker.
 //! - [`OwnerArbiter`] — the D6 owner-scoped resource arbiter (Phase E): per-device + host-wide
 //!   typed ledgers, atomic check-and-reserve admission, release-before-replacement preemption
 //!   ordering, and crash reconciliation, across every role-instance on the host.
 //!
-//! The node binds an `Arc<VhcService>` as its `Arc<dyn SwarmApi>` (via `NodeApiImpl::with_swarm`)
+//! The node binds an `Arc<VhcService>` as its `Arc<dyn VhcApi>` (via `NodeApiImpl::with_vhc`)
 //! only when `[vhc] enabled = true`.
 
 #![forbid(unsafe_code)]

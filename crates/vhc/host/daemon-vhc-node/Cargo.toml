@@ -6,10 +6,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The node-side vhc-training service: durable vhc.db state, worker supervision, and the SwarmApi surface."
+description = "The node-side vhc-training service: durable vhc.db state, worker supervision, and the VhcApi surface."
 
 [dependencies]
-# The SwarmApi trait + wire DTOs + NodeEvent this service implements / emits (spec §10.4).
+# The VhcApi trait + wire DTOs + NodeEvent this service implements / emits (spec §10.4).
 daemon-api = { workspace = true }
 # The frozen worker protocol (Event/Command/Hardware/Eligibility) + the `[vhc]` config type.
 daemon-vhc-session = { workspace = true }

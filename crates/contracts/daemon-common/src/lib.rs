@@ -759,8 +759,8 @@ impl WireVersion {
     /// because the rung-1 arm-shape changes are breaking and `is_compatible` is strict-equal
     /// (mirrors the additive v15–v38 bumps); clients feature-detect via the `api/39` Hello feature.
     ///
-    /// (v40) additive `SwarmApi` surface — the `Swarm*` request/response variants + `swarm-*` CDDL
-    /// rules + the `NodeEvent::SwarmChanged` invalidation pointer (Swarm P1, Merge 1). Purely
+    /// (v40) additive `VhcApi` surface — the `Vhc*` request/response variants + `vhc-*` CDDL
+    /// rules + the `NodeEvent::VhcChanged` invalidation pointer (Vhc P1, Merge 1). Purely
     /// additive union arms; strict-equal `is_compatible` still holds, so the bump follows the same
     /// additive pattern as the earlier versions; clients feature-detect via the `api/40` Hello feature.
     ///
@@ -770,10 +770,10 @@ impl WireVersion {
     /// additive union arms, mirroring the telemetry-consent verbs; strict-equal `is_compatible`
     /// still holds; clients feature-detect via the `api/41` Hello feature.
     ///
-    /// (v42) additive `SwarmHardwareReport.shared_mb` (Swarm P2, A1) — the app-facing mirror of the
+    /// (v42) additive `VhcHardwareReport.shared_mb` (Vhc P2, A1) — the app-facing mirror of the
     /// worker's unified-memory (GTT) spillover the node already probes (`Hardware.shared_mb`), so the
     /// GUI shows the true effective device budget on integrated/UMA boxes. A single additive DTO
-    /// field (`#[serde(default)]`) + its `swarm-hardware-report` CDDL key; strict-equal
+    /// field (`#[serde(default)]`) + its `vhc-hardware-report` CDDL key; strict-equal
     /// `is_compatible` still holds; clients feature-detect via the `api/42` Hello feature.
     pub const CURRENT: Self = Self(42);
 

@@ -99,26 +99,26 @@ impl NodeApiImpl {
                 crate::notifications::NotificationManager::new(),
             )),
             persons: Arc::new(std::sync::Mutex::new(crate::person::PersonManager::new())),
-            swarm: std::sync::OnceLock::new(),
+            vhc: std::sync::OnceLock::new(),
         }
     }
 
-    /// Bind the swarm-training service backing the [`daemon_api::SwarmApi`] sub-surface (spec §10.4)
-    /// **at assembly** (builder form). Call ONLY when `[swarm] enabled = true` — the node never spawns
-    /// a training worker unless a service is present. Absent, every `SwarmApi` op resolves to
-    /// [`ApiError::Unsupported`] / an empty stream. See [`set_swarm`](Self::set_swarm) for the
+    /// Bind the vhc-training service backing the [`daemon_api::VhcApi`] sub-surface (spec §10.4)
+    /// **at assembly** (builder form). Call ONLY when `[vhc] enabled = true` — the node never spawns
+    /// a training worker unless a service is present. Absent, every `VhcApi` op resolves to
+    /// [`ApiError::Unsupported`] / an empty stream. See [`set_vhc`](Self::set_vhc) for the
     /// post-`Arc` binder B3 uses (the service is built after the node exists).
-    pub fn with_swarm(self, swarm: Arc<dyn daemon_api::SwarmApi>) -> Self {
-        let _ = self.swarm.set(swarm);
+    pub fn with_vhc(self, vhc: Arc<dyn daemon_api::VhcApi>) -> Self {
+        let _ = self.vhc.set(vhc);
         self
     }
 
-    /// Bind the swarm-training service **post-`Arc`** (B3): the `daemon-vhc-node` `VhcService`
+    /// Bind the vhc-training service **post-`Arc`** (B3): the `daemon-vhc-node` `VhcService`
     /// owns a `TrainSupervisor` that is constructed after the node exists (mirroring
     /// [`set_gateway`](Self::set_gateway) / [`register_managed`](Self::register_managed)). Idempotent
-    /// (write-once); a second bind is ignored. Call ONLY when `[swarm] enabled = true`.
-    pub fn set_swarm(&self, swarm: Arc<dyn daemon_api::SwarmApi>) {
-        let _ = self.swarm.set(swarm);
+    /// (write-once); a second bind is ignored. Call ONLY when `[vhc] enabled = true`.
+    pub fn set_vhc(&self, vhc: Arc<dyn daemon_api::VhcApi>) {
+        let _ = self.vhc.set(vhc);
     }
 
     /// Register a node-managed backend resource ([`ManagedResource`](crate::managed::ManagedResource))

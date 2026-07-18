@@ -4,7 +4,7 @@
 //! [`RunDiscovery`] — the run-discovery + envelope-fetch seam the join flow drives (spec §6.1/§6.5;
 //! A1).
 //!
-//! [`VhcService::swarm_join`](crate::VhcService) used to derive eligibility from a hardware
+//! [`VhcService::vhc_join`](crate::VhcService) used to derive eligibility from a hardware
 //! probe against a hardcoded allowlist coordinator (W1 placeholder). A1 replaces that with real
 //! discovery: resolve the run from the coordinator registry, fetch + blake3-verify the frozen
 //! envelope, and hand it to the worker's existing `AssessRun` for a real §6.5 verdict **before**
