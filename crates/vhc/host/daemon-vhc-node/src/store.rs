@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `swarm.db` — the node's durable swarm-participation state (spec §10.3).
+//! `vhc.db` — the node's durable vhc-participation state (spec §10.3).
 //!
 //! A separate SQLite file (kept out of the session store to stay lean), opened + migrated the same
 //! way as `daemon-auth`'s `auth.db`: bundled amalgamation, WAL, and `PRAGMA user_version` migrations
 //! via `rusqlite_migration` (append-only — never edit a released `M`). Three tables:
 //!
-//! - `swarm_runs` — the joined-run intents + status. `desired_state` is the **durable join-intent**
+//! - `vhc_runs` — the joined-run intents + status. `desired_state` is the **durable join-intent**
 //!   flag (ADR-006 idempotent intents); the node re-converges on restart by re-issuing `JoinRun` for
-//!   every row with `desired_state = 'joined'` ([`SwarmStore::active_intents`]). Each row carries the
+//!   every row with `desired_state = 'joined'` ([`VhcStore::active_intents`]). Each row carries the
 //!   node-computed `eligibility` (ADR-003 mirror) so the app never re-derives it.
-//! - `swarm_contrib` — per-run contribution counters (the "what did my GPU do" ledger).
-//! - `swarm_events` — the windowed (ADR-007) recent event log for the UI; pruned to a bounded ring
+//! - `vhc_contrib` — per-run contribution counters (the "what did my GPU do" ledger).
+//! - `vhc_events` — the windowed (ADR-007) recent event log for the UI; pruned to a bounded ring
 //!   per run on every append.
 
 use std::path::Path;
@@ -23,7 +23,7 @@ use daemon_api::{SwarmContribution, SwarmEligibility, SwarmEvent, SwarmPolicy};
 use rusqlite::{params, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
 
-/// How many recent events per run the windowed `swarm_events` log retains (ADR-007).
+/// How many recent events per run the windowed `vhc_events` log retains (ADR-007).
 pub const EVENT_WINDOW: usize = 256;
 
 /// The durable desired-state flag for a run (the join-intent that drives restart re-convergence).
@@ -50,10 +50,10 @@ impl DesiredState {
     }
 }
 
-/// A persisted run row (spec §10.3 `swarm_runs`), decoded into typed form.
+/// A persisted run row (spec §10.3 `vhc_runs`), decoded into typed form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedRun {
-    /// The run's **`RunLabel`** — the human/registry-facing handle and the `swarm_runs` primary
+    /// The run's **`RunLabel`** — the human/registry-facing handle and the `vhc_runs` primary
     /// key (decisions D1; the old string `run_id`, unchanged on the wire).
     pub run_id: String,
     /// The coordinator endpoint discovery/join used.
@@ -89,7 +89,7 @@ pub struct PersistedRun {
     pub module_hash: Option<[u8; 32]>,
 }
 
-/// A `swarm.db` error.
+/// A `vhc.db` error.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// An underlying SQLite error.
@@ -118,7 +118,7 @@ pub enum StoreError {
 /// M1: the full schema (spec §10.3). `IF NOT EXISTS` makes a fresh open idempotent; later schema
 /// changes append a new `M::up("ALTER …")` and NEVER edit this one.
 const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS swarm_runs (
+CREATE TABLE IF NOT EXISTS vhc_runs (
     run_id           TEXT PRIMARY KEY,
     coordinator      TEXT NOT NULL,
     policy_json      TEXT NOT NULL,
@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS swarm_runs (
     last_round       INTEGER NOT NULL DEFAULT 0,
     updated_ms       INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS swarm_contrib (
+CREATE TABLE IF NOT EXISTS vhc_contrib (
     run_id             TEXT PRIMARY KEY,
     rounds             INTEGER NOT NULL DEFAULT 0,
     tokens             INTEGER NOT NULL DEFAULT 0,
@@ -138,17 +138,17 @@ CREATE TABLE IF NOT EXISTS swarm_contrib (
     witness_count      INTEGER NOT NULL DEFAULT 0,
     checkpoint_credits INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS swarm_events (
+CREATE TABLE IF NOT EXISTS vhc_events (
     seq    INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
     ts_ms  INTEGER NOT NULL,
     kind   TEXT NOT NULL,
     body   BLOB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS swarm_events_run ON swarm_events (run_id, seq);
+CREATE INDEX IF NOT EXISTS vhc_events_run ON vhc_events (run_id, seq);
 ";
 
-/// M2 (D0): migrate `swarm.db` to the run/epoch/role-instance execution-identity model
+/// M2 (D0): migrate `vhc.db` to the run/epoch/role-instance execution-identity model
 /// (decisions D1) and add the D5 sunset-observability columns (decisions D5). **Append-only** —
 /// never edit `SCHEMA`/M1. All adds are nullable or defaulted, so an existing M1 db (v1 rows)
 /// migrates in place: the `run_id` TEXT primary key remains the **`RunLabel`**; the cryptographic
@@ -157,14 +157,14 @@ CREATE INDEX IF NOT EXISTS swarm_events_run ON swarm_events (run_id, seq);
 /// hash for its whole life — decisions D1 point 5). `envelope_schema_major` defaults to `1` so
 /// legacy rows read as v1 for the sunset audit without a data migration.
 const M2_IDENTITY_OBSERVABILITY: &str = "\
-ALTER TABLE swarm_runs ADD COLUMN run_id_hash BLOB;
-ALTER TABLE swarm_runs ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE swarm_runs ADD COLUMN role TEXT NOT NULL DEFAULT '';
-ALTER TABLE swarm_runs ADD COLUMN instance INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE swarm_runs ADD COLUMN envelope_schema_major INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE swarm_runs ADD COLUMN module_abi_major INTEGER;
-ALTER TABLE swarm_runs ADD COLUMN selected_driver TEXT;
-ALTER TABLE swarm_runs ADD COLUMN module_hash BLOB;
+ALTER TABLE vhc_runs ADD COLUMN run_id_hash BLOB;
+ALTER TABLE vhc_runs ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE vhc_runs ADD COLUMN role TEXT NOT NULL DEFAULT '';
+ALTER TABLE vhc_runs ADD COLUMN instance INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE vhc_runs ADD COLUMN envelope_schema_major INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE vhc_runs ADD COLUMN module_abi_major INTEGER;
+ALTER TABLE vhc_runs ADD COLUMN selected_driver TEXT;
+ALTER TABLE vhc_runs ADD COLUMN module_hash BLOB;
 ";
 
 /// M3 (Phase E, decisions D6/D1): the node-durable **incarnation counter** — the never-reused,
@@ -173,12 +173,12 @@ ALTER TABLE swarm_runs ADD COLUMN module_hash BLOB;
 /// sequence stream) — and the **owner-priority store** (D6 point 4: preemption priority is
 /// node-side owner state, never the envelope). Append-only.
 const M3_ARBITER: &str = "\
-CREATE TABLE IF NOT EXISTS swarm_counters (
+CREATE TABLE IF NOT EXISTS vhc_counters (
     name  TEXT PRIMARY KEY,
     value INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO swarm_counters (name, value) VALUES ('incarnation', 0);
-CREATE TABLE IF NOT EXISTS swarm_owner_priority (
+INSERT OR IGNORE INTO vhc_counters (name, value) VALUES ('incarnation', 0);
+CREATE TABLE IF NOT EXISTS vhc_owner_priority (
     run_id   TEXT PRIMARY KEY,
     priority INTEGER NOT NULL
 );
@@ -192,8 +192,8 @@ fn migrations() -> Migrations<'static> {
     ])
 }
 
-/// The column list every `swarm_runs` read shares — kept as one constant so the three readers
-/// ([`SwarmStore::get_run`], [`SwarmStore::list_runs`], [`SwarmStore::active_intents`]) and
+/// The column list every `vhc_runs` read shares — kept as one constant so the three readers
+/// ([`VhcStore::get_run`], [`VhcStore::list_runs`], [`VhcStore::active_intents`]) and
 /// [`row_to_run`] never drift apart.
 const RUN_COLUMNS: &str = "run_id, coordinator, policy_json, desired_state, credentials_ref, \
      eligibility_json, last_phase, last_round, run_id_hash, epoch, role, instance, \
@@ -215,13 +215,13 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The durable swarm-state store (`swarm.db`).
-pub struct SwarmStore {
+/// The durable vhc-state store (`vhc.db`).
+pub struct VhcStore {
     conn: Mutex<Connection>,
 }
 
-impl SwarmStore {
-    /// Open (creating if absent) and migrate `swarm.db` at `path`. The parent directory must already
+impl VhcStore {
+    /// Open (creating if absent) and migrate `vhc.db` at `path`. The parent directory must already
     /// exist (the node creates its `data_dir`). Idempotent: re-opening an existing db re-runs the
     /// migration ladder to the same `user_version` (a no-op).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -270,7 +270,7 @@ impl SwarmStore {
         let elig_json = serde_json::to_string(eligibility)?;
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO swarm_runs
+            "INSERT INTO vhc_runs
                 (run_id, coordinator, policy_json, desired_state, credentials_ref,
                  eligibility_json, last_phase, last_round, updated_ms)
              VALUES (?1, ?2, ?3, 'joined', ?4, ?5, '', 0, ?6)
@@ -291,7 +291,7 @@ impl SwarmStore {
             ],
         )?;
         conn.execute(
-            "INSERT OR IGNORE INTO swarm_contrib (run_id) VALUES (?1)",
+            "INSERT OR IGNORE INTO vhc_contrib (run_id) VALUES (?1)",
             params![run_id],
         )?;
         Ok(())
@@ -300,7 +300,7 @@ impl SwarmStore {
     /// Flip a run's durable desired-state (a leave keeps the row + contribution ledger). Idempotent.
     pub fn set_desired_state(&self, run_id: &str, state: DesiredState) -> Result<(), StoreError> {
         self.lock().execute(
-            "UPDATE swarm_runs SET desired_state = ?2, updated_ms = ?3 WHERE run_id = ?1",
+            "UPDATE vhc_runs SET desired_state = ?2, updated_ms = ?3 WHERE run_id = ?1",
             params![run_id, state.as_str(), now_ms()],
         )?;
         Ok(())
@@ -314,7 +314,7 @@ impl SwarmStore {
     ) -> Result<(), StoreError> {
         let elig_json = serde_json::to_string(eligibility)?;
         self.lock().execute(
-            "UPDATE swarm_runs SET eligibility_json = ?2, updated_ms = ?3 WHERE run_id = ?1",
+            "UPDATE vhc_runs SET eligibility_json = ?2, updated_ms = ?3 WHERE run_id = ?1",
             params![run_id, elig_json, now_ms()],
         )?;
         Ok(())
@@ -323,7 +323,7 @@ impl SwarmStore {
     /// Update a run's last-known phase + round (from a worker `RunPhase` event).
     pub fn set_phase(&self, run_id: &str, phase: &str, round: u64) -> Result<(), StoreError> {
         self.lock().execute(
-            "UPDATE swarm_runs SET last_phase = ?2, last_round = ?3, updated_ms = ?4
+            "UPDATE vhc_runs SET last_phase = ?2, last_round = ?3, updated_ms = ?4
              WHERE run_id = ?1",
             params![run_id, phase, round as i64, now_ms()],
         )?;
@@ -340,7 +340,7 @@ impl SwarmStore {
         instance: u64,
     ) -> Result<(), StoreError> {
         self.lock().execute(
-            "UPDATE swarm_runs SET epoch = ?2, role = ?3, instance = ?4, updated_ms = ?5 \
+            "UPDATE vhc_runs SET epoch = ?2, role = ?3, instance = ?4, updated_ms = ?5 \
              WHERE run_id = ?1",
             params![run_id, epoch as i64, role, instance as i64, now_ms()],
         )?;
@@ -359,7 +359,7 @@ impl SwarmStore {
         module_hash: Option<&[u8; 32]>,
     ) -> Result<(), StoreError> {
         self.lock().execute(
-            "UPDATE swarm_runs SET envelope_schema_major = ?2, module_abi_major = ?3, \
+            "UPDATE vhc_runs SET envelope_schema_major = ?2, module_abi_major = ?3, \
              selected_driver = ?4, module_hash = ?5, updated_ms = ?6 WHERE run_id = ?1",
             params![
                 run_id,
@@ -383,7 +383,7 @@ impl SwarmStore {
         let conn = self.lock();
         let existing: Option<Option<Vec<u8>>> = conn
             .query_row(
-                "SELECT run_id_hash FROM swarm_runs WHERE run_id = ?1",
+                "SELECT run_id_hash FROM vhc_runs WHERE run_id = ?1",
                 params![run_id],
                 |row| row.get(0),
             )
@@ -399,7 +399,7 @@ impl SwarmStore {
             return Ok(()); // already backfilled + agrees
         }
         conn.execute(
-            "UPDATE swarm_runs SET run_id_hash = ?2, updated_ms = ?3 WHERE run_id = ?1",
+            "UPDATE vhc_runs SET run_id_hash = ?2, updated_ms = ?3 WHERE run_id = ?1",
             params![run_id, run_id_hash.as_slice(), now_ms()],
         )?;
         Ok(())
@@ -409,7 +409,7 @@ impl SwarmStore {
     pub fn get_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError> {
         let conn = self.lock();
         conn.query_row(
-            &format!("SELECT {RUN_COLUMNS} FROM swarm_runs WHERE run_id = ?1"),
+            &format!("SELECT {RUN_COLUMNS} FROM vhc_runs WHERE run_id = ?1"),
             params![run_id],
             row_to_run,
         )
@@ -420,7 +420,7 @@ impl SwarmStore {
     /// All run rows in `run_id` order.
     pub fn list_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
         self.query_runs(&format!(
-            "SELECT {RUN_COLUMNS} FROM swarm_runs ORDER BY run_id"
+            "SELECT {RUN_COLUMNS} FROM vhc_runs ORDER BY run_id"
         ))
     }
 
@@ -428,7 +428,7 @@ impl SwarmStore {
     /// re-issues `JoinRun` for on restart (re-convergence).
     pub fn active_intents(&self) -> Result<Vec<PersistedRun>, StoreError> {
         self.query_runs(&format!(
-            "SELECT {RUN_COLUMNS} FROM swarm_runs WHERE desired_state = 'joined' ORDER BY run_id"
+            "SELECT {RUN_COLUMNS} FROM vhc_runs WHERE desired_state = 'joined' ORDER BY run_id"
         ))
     }
 
@@ -449,7 +449,7 @@ impl SwarmStore {
         let c = conn
             .query_row(
                 "SELECT rounds, tokens, bytes_up, bytes_down, witness_count, checkpoint_credits
-                 FROM swarm_contrib WHERE run_id = ?1",
+                 FROM vhc_contrib WHERE run_id = ?1",
                 params![run_id],
                 |row| {
                     Ok(SwarmContribution {
@@ -479,7 +479,7 @@ impl SwarmStore {
         checkpoint_credits: u64,
     ) -> Result<(), StoreError> {
         self.lock().execute(
-            "INSERT INTO swarm_contrib
+            "INSERT INTO vhc_contrib
                 (run_id, rounds, tokens, bytes_up, bytes_down, witness_count, checkpoint_credits)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(run_id) DO UPDATE SET
@@ -509,12 +509,12 @@ impl SwarmStore {
         let run_id = event.run_id().to_string();
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO swarm_events (run_id, ts_ms, kind, body) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO vhc_events (run_id, ts_ms, kind, body) VALUES (?1, ?2, ?3, ?4)",
             params![run_id, now_ms(), event.kind(), body],
         )?;
         conn.execute(
-            "DELETE FROM swarm_events WHERE run_id = ?1 AND seq NOT IN
-                (SELECT seq FROM swarm_events WHERE run_id = ?1 ORDER BY seq DESC LIMIT ?2)",
+            "DELETE FROM vhc_events WHERE run_id = ?1 AND seq NOT IN
+                (SELECT seq FROM vhc_events WHERE run_id = ?1 ORDER BY seq DESC LIMIT ?2)",
             params![run_id, EVENT_WINDOW as i64],
         )?;
         Ok(())
@@ -523,9 +523,8 @@ impl SwarmStore {
     /// The most recent events for a run in chronological order (oldest → newest), capped at `limit`.
     pub fn recent_events(&self, run_id: &str, limit: usize) -> Result<Vec<SwarmEvent>, StoreError> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT body FROM swarm_events WHERE run_id = ?1 ORDER BY seq DESC LIMIT ?2",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT body FROM vhc_events WHERE run_id = ?1 ORDER BY seq DESC LIMIT ?2")?;
         let rows = stmt.query_map(params![run_id, limit as i64], |row| {
             row.get::<_, Vec<u8>>(0)
         })?;
@@ -542,7 +541,7 @@ impl SwarmStore {
     // retired v1 driver, judged from the D0 observability columns) was the E3 transition gate's
     // "no live v1 runs" proof and was REMOVED post-sunset: with the typed v1 refusal in place no
     // new v1 run can be admitted, so its only remaining function was detecting pre-sunset rows in
-    // an existing swarm.db — a back-compat accommodation the ratified posture drops. The D0
+    // an existing vhc.db — a back-compat accommodation the ratified posture drops. The D0
     // observability COLUMNS (envelope_schema_major / module_abi_major / selected_driver /
     // module_hash) stay: they are the per-run provenance/diagnostics record, not compat.
 
@@ -552,7 +551,7 @@ impl SwarmStore {
     pub fn mint_incarnation(&self) -> Result<u64, StoreError> {
         let conn = self.lock();
         let value: i64 = conn.query_row(
-            "UPDATE swarm_counters SET value = value + 1 WHERE name = 'incarnation' \
+            "UPDATE vhc_counters SET value = value + 1 WHERE name = 'incarnation' \
              RETURNING value",
             [],
             |row| row.get(0),
@@ -564,7 +563,7 @@ impl SwarmStore {
     /// state — the envelope can never set or influence its own priority). Idempotent upsert.
     pub fn set_run_priority(&self, run_id: &str, priority: u8) -> Result<(), StoreError> {
         self.lock().execute(
-            "INSERT INTO swarm_owner_priority (run_id, priority) VALUES (?1, ?2)
+            "INSERT INTO vhc_owner_priority (run_id, priority) VALUES (?1, ?2)
              ON CONFLICT(run_id) DO UPDATE SET priority = excluded.priority",
             params![run_id, i64::from(priority)],
         )?;
@@ -576,7 +575,7 @@ impl SwarmStore {
         let conn = self.lock();
         let p: Option<i64> = conn
             .query_row(
-                "SELECT priority FROM swarm_owner_priority WHERE run_id = ?1",
+                "SELECT priority FROM vhc_owner_priority WHERE run_id = ?1",
                 params![run_id],
                 |row| row.get(0),
             )
@@ -588,7 +587,7 @@ impl SwarmStore {
     pub fn event_count(&self, run_id: &str) -> Result<usize, StoreError> {
         let conn = self.lock();
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM swarm_events WHERE run_id = ?1",
+            "SELECT COUNT(*) FROM vhc_events WHERE run_id = ?1",
             params![run_id],
             |row| row.get(0),
         )?;
@@ -596,7 +595,7 @@ impl SwarmStore {
     }
 }
 
-/// Decode a `swarm_runs` row into a [`PersistedRun`]. The JSON columns decode outside the rusqlite
+/// Decode a `vhc_runs` row into a [`PersistedRun`]. The JSON columns decode outside the rusqlite
 /// closure (its error type is `rusqlite::Error`), so the closure yields a `Result<PersistedRun,
 /// StoreError>` that the caller flattens.
 fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, StoreError>> {
@@ -665,7 +664,7 @@ mod tests {
         let policy_json = serde_json::to_string(&v1_policy()).unwrap();
         let elig_json = serde_json::to_string(&SwarmEligibility::default()).unwrap();
         conn.execute(
-            "INSERT INTO swarm_runs (run_id, coordinator, policy_json, desired_state, \
+            "INSERT INTO vhc_runs (run_id, coordinator, policy_json, desired_state, \
              eligibility_json) VALUES ('legacy-run', 'ws://c', ?1, 'joined', ?2)",
             params![policy_json, elig_json],
         )
@@ -674,7 +673,7 @@ mod tests {
         // Now run the FULL ladder (M1 + M2). rusqlite_migration applies only the missing M2.
         migrations().to_latest(&mut conn).unwrap();
 
-        let store = SwarmStore {
+        let store = VhcStore {
             conn: Mutex::new(conn),
         };
         let run = store
@@ -701,7 +700,7 @@ mod tests {
     /// (decisions D1 cross-check).
     #[test]
     fn run_id_backfill_is_lazy_idempotent_and_cross_checked() {
-        let store = SwarmStore::open_in_memory().unwrap();
+        let store = VhcStore::open_in_memory().unwrap();
         store
             .put_join_intent(
                 "run-A",
@@ -735,14 +734,14 @@ mod tests {
     #[test]
     fn m3_incarnation_counter_and_owner_priority() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("swarm.db");
+        let path = dir.path().join("vhc.db");
 
-        let store = SwarmStore::open(&path).unwrap();
+        let store = VhcStore::open(&path).unwrap();
         assert_eq!(store.mint_incarnation().unwrap(), 1);
         assert_eq!(store.mint_incarnation().unwrap(), 2);
         drop(store);
         // A re-open (node restart) continues the durable counter — never reuses an id.
-        let store = SwarmStore::open(&path).unwrap();
+        let store = VhcStore::open(&path).unwrap();
         assert_eq!(store.mint_incarnation().unwrap(), 3);
 
         assert_eq!(store.run_priority("run-X").unwrap(), 100, "default");
@@ -755,7 +754,7 @@ mod tests {
     /// provenance/diagnostics record).
     #[test]
     fn v2_identity_and_observability_writers() {
-        let store = SwarmStore::open_in_memory().unwrap();
+        let store = VhcStore::open_in_memory().unwrap();
         store
             .put_join_intent(
                 "run-B",

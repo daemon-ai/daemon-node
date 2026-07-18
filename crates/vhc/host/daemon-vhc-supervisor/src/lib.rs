@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 
 /// A live worker→node event pump sink. When set (by [`TrainSupervisor::join_streaming`]) the
 /// worker's reader task routes every decoded [`Event`] here (the continuous round stream the node's
-/// `SwarmService` consumes) instead of the request/reply inbox; cleared automatically when the
+/// `VhcService` consumes) instead of the request/reply inbox; cleared automatically when the
 /// receiver is dropped. Shared with each spawned `Worker`'s reader so a respawn keeps pumping.
 type PumpSink = Arc<StdMutex<Option<UnboundedSender<Event>>>>;
 
@@ -216,8 +216,8 @@ impl TrainSupervisor {
     /// Unlike [`join`](Self::join) (which resolves on the first `RunPhase` and drops the rest), this
     /// installs a pump sink so the worker's reader routes **every** subsequent [`Event`]
     /// (`RunPhase`/`Metric`/`RoundOutcome`/`Warning` per round) into the returned receiver. The
-    /// node's `SwarmService` drains it into
-    /// `handle_worker_event`, so `swarm.db` reflects live round progression (§10.3/§10.4). The sink
+    /// node's `VhcService` drains it into
+    /// `handle_worker_event`, so `vhc.db` reflects live round progression (§10.3/§10.4). The sink
     /// clears automatically when the receiver is dropped (back to request/reply routing).
     pub async fn join_streaming(
         &self,

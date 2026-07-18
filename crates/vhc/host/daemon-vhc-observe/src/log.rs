@@ -3,7 +3,7 @@
 
 //! The append-only, replayable message log (spec §14; TDD §3.9).
 //!
-//! Every swarm-visible transition is a signed control message (§6.4), so the per-run log is exactly a
+//! Every vhc-visible transition is a signed control message (§6.4), so the per-run log is exactly a
 //! sequence of [`SignedMessage`]s in **arrival order**, indexed by `(round, kind)`. It serializes as
 //! canonical-CBOR **length-framed** records (a magic header + run id, then `u32`-LE length + the
 //! canonical bytes of each message), so appends are O(1) and two writes of the same log are
@@ -12,7 +12,7 @@
 
 use std::io::{Read, Write};
 
-use daemon_vhc_proto::messages::{SignedMessage, SwarmMessage};
+use daemon_vhc_proto::messages::{SignedMessage, VhcMessage};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec};
 use daemon_vhc_sdk_consensus::coordinator::Input;
 
@@ -21,64 +21,64 @@ use crate::ObserveError;
 /// Magic + version prefix of a serialized [`MessageLog`].
 const MAGIC: &[u8; 8] = b"DSMLOG01";
 
-/// The kind of a swarm control message — the second half of the `(round, kind)` index.
+/// The kind of a vhc control message — the second half of the `(round, kind)` index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MessageKind {
-    /// [`SwarmMessage::RoundOpen`].
+    /// [`VhcMessage::RoundOpen`].
     RoundOpen,
-    /// [`SwarmMessage::Commitment`].
+    /// [`VhcMessage::Commitment`].
     Commitment,
-    /// [`SwarmMessage::Attestation`].
+    /// [`VhcMessage::Attestation`].
     Attestation,
-    /// [`SwarmMessage::StorageReceipt`].
+    /// [`VhcMessage::StorageReceipt`].
     StorageReceipt,
-    /// [`SwarmMessage::RoundRecord`].
+    /// [`VhcMessage::RoundRecord`].
     RoundRecord,
-    /// [`SwarmMessage::Digest`].
+    /// [`VhcMessage::Digest`].
     Digest,
-    /// [`SwarmMessage::Straggle`].
+    /// [`VhcMessage::Straggle`].
     Straggle,
-    /// [`SwarmMessage::Join`].
+    /// [`VhcMessage::Join`].
     Join,
-    /// [`SwarmMessage::Heartbeat`].
+    /// [`VhcMessage::Heartbeat`].
     Heartbeat,
-    /// [`SwarmMessage::CheckpointAttestation`] (Phase E cold join).
+    /// [`VhcMessage::CheckpointAttestation`] (Phase E cold join).
     CheckpointAttestation,
 }
 
 impl MessageKind {
     /// The kind of a payload.
     #[must_use]
-    pub fn of(m: &SwarmMessage) -> Self {
+    pub fn of(m: &VhcMessage) -> Self {
         match m {
-            SwarmMessage::RoundOpen(_) => Self::RoundOpen,
-            SwarmMessage::Commitment(_) => Self::Commitment,
-            SwarmMessage::Attestation(_) => Self::Attestation,
-            SwarmMessage::StorageReceipt(_) => Self::StorageReceipt,
-            SwarmMessage::RoundRecord(_) => Self::RoundRecord,
-            SwarmMessage::Digest(_) => Self::Digest,
-            SwarmMessage::Straggle(_) => Self::Straggle,
-            SwarmMessage::Join(_) => Self::Join,
-            SwarmMessage::Heartbeat(_) => Self::Heartbeat,
-            SwarmMessage::CheckpointAttestation(_) => Self::CheckpointAttestation,
+            VhcMessage::RoundOpen(_) => Self::RoundOpen,
+            VhcMessage::Commitment(_) => Self::Commitment,
+            VhcMessage::Attestation(_) => Self::Attestation,
+            VhcMessage::StorageReceipt(_) => Self::StorageReceipt,
+            VhcMessage::RoundRecord(_) => Self::RoundRecord,
+            VhcMessage::Digest(_) => Self::Digest,
+            VhcMessage::Straggle(_) => Self::Straggle,
+            VhcMessage::Join(_) => Self::Join,
+            VhcMessage::Heartbeat(_) => Self::Heartbeat,
+            VhcMessage::CheckpointAttestation(_) => Self::CheckpointAttestation,
         }
     }
 }
 
 /// The round a payload pertains to, if any. `Join` is roster-scoped (no round).
 #[must_use]
-pub fn round_of(m: &SwarmMessage) -> Option<u64> {
+pub fn round_of(m: &VhcMessage) -> Option<u64> {
     match m {
-        SwarmMessage::RoundOpen(x) => Some(x.round),
-        SwarmMessage::Commitment(x) => Some(x.round),
-        SwarmMessage::Attestation(x) => Some(x.round),
-        SwarmMessage::StorageReceipt(x) => Some(x.round),
-        SwarmMessage::RoundRecord(x) => Some(x.round),
-        SwarmMessage::Digest(x) => Some(x.round),
-        SwarmMessage::Straggle(x) => Some(x.round),
-        SwarmMessage::Heartbeat(x) => Some(x.round),
-        SwarmMessage::CheckpointAttestation(x) => Some(x.round),
-        SwarmMessage::Join(_) => None,
+        VhcMessage::RoundOpen(x) => Some(x.round),
+        VhcMessage::Commitment(x) => Some(x.round),
+        VhcMessage::Attestation(x) => Some(x.round),
+        VhcMessage::StorageReceipt(x) => Some(x.round),
+        VhcMessage::RoundRecord(x) => Some(x.round),
+        VhcMessage::Digest(x) => Some(x.round),
+        VhcMessage::Straggle(x) => Some(x.round),
+        VhcMessage::Heartbeat(x) => Some(x.round),
+        VhcMessage::CheckpointAttestation(x) => Some(x.round),
+        VhcMessage::Join(_) => None,
     }
 }
 

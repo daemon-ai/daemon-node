@@ -26,7 +26,7 @@ daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
 # The coordinator driver (`tick` / `tick_authenticated`) + its serde-CBOR state, plus the shared
 # assignment math. wasm32-clean by construction (proto + serde only).
 daemon-vhc-sdk-consensus = { path = "../../sdk/daemon-vhc-sdk-consensus" }
-# The wire contract: SwarmMessage / SignedMessage payloads, PeerId, canonical CBOR codec.
+# The wire contract: VhcMessage / SignedMessage payloads, PeerId, canonical CBOR codec.
 daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }
 # The shared ABI vocabulary: the event tags (EV_TAG_FRAME/TIMER/STOP/QUIESCE) the loop dispatches on.
 daemon-vhc-abi = { path = "../../contracts/daemon-vhc-abi" }

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-vhc-proto` — the swarm-training wire contract (**algorithm-free from D0**).
+//! `daemon-vhc-proto` — the vhc-training wire contract (**algorithm-free from D0**).
 //!
 //! Canonical CBOR codec, the genesis (schema-2) run envelope + freeze/verify (the retired v1
 //! envelope form survives only as the outer schema-major read that types its refusal),
 //! capability-set admission, merkle set commitments, the seven round messages + their CDDL, the
-//! round state-digest schedule, and the [`SwarmProtoVersion`]. This crate is the single authority
-//! for the swarm wire shapes shared by the host, the participant runtime, and the (wasm32)
+//! round state-digest schedule, and the [`VhcProtoVersion`]. This crate is the single authority
+//! for the vhc wire shapes shared by the host, the participant runtime, and the (wasm32)
 //! coordinator DO — see `docs/specs/swarm-training-spec.md` §6, §7.3, §10.1, §16.
 //!
 //! **Algorithm-free (D0 invariant, dep-check-enforced):** the deterministic assignment math that
@@ -52,7 +52,7 @@ pub use crypto::{
 };
 pub use digest::{derive_schedule, digest_state, DigestSchedule, StateLayout};
 pub use envelope::{DeviceMinimums, SignedEnvelope};
-pub use error::SwarmProtoError;
+pub use error::VhcProtoError;
 pub use genesis::{
     peek_schema, BufferReq, ChannelDecl, ControlTransport, EventCap, EventCaps, FrozenGenesis,
     GenesisEnvelope, GrantBound, Identities, MigrationGrant, RoleEntry, RoleGrants, RunSectionV2,
@@ -61,14 +61,14 @@ pub use genesis::{
 pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsError, LaneCeilings};
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
-pub use messages::{SignedMessage, SwarmMessage};
+pub use messages::{SignedMessage, VhcMessage};
 pub use record_set::RecordSet;
 pub use sign::{peer_id, sign_canonical, verify_canonical, Signed, SigningKey, VerifyingKey};
 pub use transition::{
     EpochDescriptor, TransitionChain, TransitionError, UpgradeAuthority, UpgradeRecord,
     UpgradeRecordBody, UpgradeSig, UPGRADE_RECORD_DOMAIN_V2,
 };
-pub use version::{SwarmProtoVersion, SWARM_PROTO_VERSION};
+pub use version::{VhcProtoVersion, VHC_PROTO_VERSION};
 
 #[cfg(test)]
 mod tests {
@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn error_renders() {
-        let err = SwarmProtoError::Validation("round out of range".into());
+        let err = VhcProtoError::Validation("round out of range".into());
         assert!(err.to_string().contains("validation failed"));
     }
 }

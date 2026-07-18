@@ -56,14 +56,14 @@ daemon-tool-web = { workspace = true }
 # The `[fs]` config table (`FsConfig`) embedded in NodeConfig; the tool itself is registered by
 # daemon-node's role/session registries.
 daemon-tool-fs = { workspace = true }
-# The `[swarm]` config table (`daemon_vhc_session::config::SwarmConfig`, spec §10.6) embedded in
+# The `[vhc]` config table (`daemon_vhc_session::config::VhcConfig`, spec §10.6) embedded in
 # NodeConfig. Serde/tokio-only on the default gate: it pulls `daemon-vhc-net`
 # (reqwest via daemon-egress) + `daemon-vhc-proto` (ed25519) — all already in-tree — and NO
 # burn/wasmtime (no `daemon-vhc-host` dep) and NO iroh (behind daemon-vhc-net's off-by-default `iroh`
 # feature). See swarm-ledger-w1.md for the cargo-tree evidence.
 daemon-vhc-session = { workspace = true }
-# B3: the node-side swarm-training service + worker supervisor, bound post-`Arc` at boot when
-# `[swarm] enabled = true` (spec §10.4; the W1 `with_swarm` integration remainder). Promoted to
+# B3: the node-side vhc-training service + worker supervisor, bound post-`Arc` at boot when
+# `[vhc] enabled = true` (spec §10.4; the W1 `with_swarm` integration remainder). Promoted to
 # `[workspace.dependencies]` at Merge 3 (integration owner), so this is now `{ workspace = true }`
 # like the other internal crates. Does not pull burn/wasmtime/iroh onto the default gate
 # (swarm-ledger-w1.md cargo-tree; re-verified by the Merge-3 default-gate dep check).

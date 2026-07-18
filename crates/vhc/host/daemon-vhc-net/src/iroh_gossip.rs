@@ -47,7 +47,7 @@ use daemon_vhc_proto::blake3_hash;
 
 use crate::dedupe::Deduper;
 use crate::transport::{ControlPlane, ControlSubscription};
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// Gossip max message size (Psyche `lib.rs:461`). Our frame prepends an 8-byte nonce, so a
 /// control-message payload must be at most `MAX_MESSAGE_SIZE - NONCE_LEN` (signed messages are
@@ -159,7 +159,7 @@ impl IrohGossip {
     /// config, QUIC transport tuning (120 s idle / 5 s keepalive, `lib.rs:344-348`). Discovery is
     /// **explicit** ([`MemoryLookup`] seeded from the roster) — no public DNS/pkarr service (delta:
     /// Psyche's `N0` discovery path; we prefer roster addrs per the program brief).
-    pub async fn connect(config: IrohGossipConfig) -> Result<Self, SwarmNetError> {
+    pub async fn connect(config: IrohGossipConfig) -> Result<Self, VhcNetError> {
         let secret = SecretKey::from_bytes(&config.secret_key);
         let node_id = *secret.public().as_bytes();
 
@@ -167,7 +167,7 @@ impl IrohGossip {
         let idle = Duration::from_secs(120);
         let transport = QuicTransportConfig::builder()
             .max_idle_timeout(Some(idle.try_into().map_err(|e| {
-                SwarmNetError::Transport(format!("invalid idle timeout: {e}"))
+                VhcNetError::Transport(format!("invalid idle timeout: {e}"))
             })?))
             .keep_alive_interval(Duration::from_secs(5))
             .build();
@@ -188,12 +188,12 @@ impl IrohGossip {
         if let Some(addr) = config.bind_addr {
             builder = builder
                 .bind_addr(addr)
-                .map_err(|e| SwarmNetError::Transport(format!("invalid bind addr: {e}")))?;
+                .map_err(|e| VhcNetError::Transport(format!("invalid bind addr: {e}")))?;
         }
         let endpoint = builder
             .bind()
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("endpoint bind failed: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("endpoint bind failed: {e}")))?;
 
         // Explicit static discovery seeded from the roster (delta: Psyche's `LocalTestDiscovery` /
         // `MemoryLookup`, `lib.rs:366-368`). Added post-bind, matching the iroh-gossip 1.0 harness.
@@ -242,7 +242,7 @@ impl IrohGossip {
         let topic_handle = gossip
             .subscribe(topic, bootstrap)
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("gossip subscribe failed: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("gossip subscribe failed: {e}")))?;
         let (sender, receiver) = topic_handle.split();
 
         let shared = Arc::new(Mutex::new(Shared {
@@ -307,7 +307,7 @@ impl IrohGossip {
     /// `client.rs:736-799`): add each roster addr to discovery, then `join_peers` up to the
     /// [`MAX_BOOTSTRAP_PEERS`] neighbor cap (only enough to reach the cap, to avoid force-evicting
     /// existing neighbors — Psyche `client.rs:773-782`).
-    pub async fn update_roster(&self, roster: Vec<IrohPeer>) -> Result<(), SwarmNetError> {
+    pub async fn update_roster(&self, roster: Vec<IrohPeer>) -> Result<(), VhcNetError> {
         let mut ids = Vec::with_capacity(roster.len());
         for peer in &roster {
             self.lookup.add_endpoint_info(peer_to_addr(peer)?);
@@ -333,7 +333,7 @@ impl IrohGossip {
             self.sender
                 .join_peers(to_add)
                 .await
-                .map_err(|e| SwarmNetError::Transport(format!("gossip join_peers failed: {e}")))?;
+                .map_err(|e| VhcNetError::Transport(format!("gossip join_peers failed: {e}")))?;
         }
         Ok(())
     }
@@ -362,9 +362,9 @@ impl Drop for IrohGossip {
 
 #[async_trait]
 impl ControlPlane for IrohGossip {
-    async fn publish(&self, message: &[u8]) -> Result<(), SwarmNetError> {
+    async fn publish(&self, message: &[u8]) -> Result<(), VhcNetError> {
         if message.len() + NONCE_LEN > MAX_MESSAGE_SIZE {
-            return Err(SwarmNetError::Transport(format!(
+            return Err(VhcNetError::Transport(format!(
                 "control message {} B exceeds gossip max {} B",
                 message.len(),
                 MAX_MESSAGE_SIZE - NONCE_LEN
@@ -392,7 +392,7 @@ impl ControlPlane for IrohGossip {
         self.sender
             .broadcast(frame.into())
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("gossip broadcast failed: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("gossip broadcast failed: {e}")))?;
         Ok(())
     }
 
@@ -410,7 +410,7 @@ impl ControlPlane for IrohGossip {
 /// Domain tag for the gossip-topic derivation. Binds the topic to the genesis run-identity domain
 /// so it cannot collide with any other blake3 use of the same 32 bytes, and so the topic is a
 /// distinct value from a legacy (pre-genesis) topic that hashed a run's frozen envelope directly.
-const GOSSIP_TOPIC_DOMAIN: &[u8] = b"daemon-swarm/gossip-topic/genesis/v2";
+const GOSSIP_TOPIC_DOMAIN: &[u8] = b"daemon-vhc/gossip-topic/genesis/v2";
 
 /// Derive the gossip topic from the run's **genesis hash**: `blake3(domain ++ genesis_hash)` ->
 /// [`TopicId`]. Delta from Psyche's `sha256("psyche gossip" ++ run_id)` (`util.rs:5-13`): blake3 not
@@ -425,7 +425,7 @@ fn derive_topic(genesis_hash: &[u8; 32]) -> TopicId {
 }
 
 /// Build a [`RelayMap`] from the configured URLs (`None` when empty -> `RelayMode::Disabled`).
-fn relay_map(urls: &[String]) -> Result<Option<RelayMap>, SwarmNetError> {
+fn relay_map(urls: &[String]) -> Result<Option<RelayMap>, VhcNetError> {
     if urls.is_empty() {
         return Ok(None);
     }
@@ -433,16 +433,16 @@ fn relay_map(urls: &[String]) -> Result<Option<RelayMap>, SwarmNetError> {
     for url in urls {
         let relay: RelayUrl = url
             .parse()
-            .map_err(|e| SwarmNetError::Transport(format!("bad relay url {url}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("bad relay url {url}: {e}")))?;
         parsed.push(relay);
     }
     Ok(Some(RelayMap::from_iter(parsed)))
 }
 
 /// Convert a roster [`IrohPeer`] to an iroh [`EndpointAddr`] (id + direct addrs + relay url).
-fn peer_to_addr(peer: &IrohPeer) -> Result<EndpointAddr, SwarmNetError> {
+fn peer_to_addr(peer: &IrohPeer) -> Result<EndpointAddr, VhcNetError> {
     let id = EndpointId::from_bytes(&peer.endpoint_id)
-        .map_err(|e| SwarmNetError::Transport(format!("bad iroh endpoint id: {e}")))?;
+        .map_err(|e| VhcNetError::Transport(format!("bad iroh endpoint id: {e}")))?;
     let mut addr = EndpointAddr::new(id);
     for socket in &peer.direct_addrs {
         addr = addr.with_ip_addr(*socket);
@@ -450,7 +450,7 @@ fn peer_to_addr(peer: &IrohPeer) -> Result<EndpointAddr, SwarmNetError> {
     if let Some(url) = &peer.relay_url {
         let relay: RelayUrl = url
             .parse()
-            .map_err(|e| SwarmNetError::Transport(format!("bad relay url {url}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("bad relay url {url}: {e}")))?;
         addr = addr.with_relay_url(relay);
     }
     Ok(addr)

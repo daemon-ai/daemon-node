@@ -8,7 +8,7 @@
 
 use daemon_egress::{EgressClient, EgressConfig};
 use daemon_vhc_net::RunId;
-use daemon_vhc_net::{RegistryClient, RunDescriptor, SwarmNetError};
+use daemon_vhc_net::{RegistryClient, RunDescriptor, VhcNetError};
 use daemon_vhc_proto::blake3_hash;
 use serde_json::json;
 use wiremock::matchers::{method, path};
@@ -72,7 +72,7 @@ async fn registry_with(envelope_hash: &str) -> (MockServer, RegistryClient) {
         .await;
 
     let egress = EgressClient::new(EgressConfig::default()).expect("egress");
-    let client = RegistryClient::new(egress, base).with_bearer("swarm-token");
+    let client = RegistryClient::new(egress, base).with_bearer("vhc-token");
     (server, client)
 }
 
@@ -133,7 +133,7 @@ async fn rejects_envelope_with_wrong_hash() {
         .await
         .expect_err("must reject a hash mismatch");
     assert!(
-        matches!(err, SwarmNetError::HashMismatch { .. }),
+        matches!(err, VhcNetError::HashMismatch { .. }),
         "expected HashMismatch, got {err:?}"
     );
 }

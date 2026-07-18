@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bytes::{Hash, PeerId, Signature};
 use crate::canonical::to_canonical_vec;
-use crate::error::SwarmProtoError;
+use crate::error::VhcProtoError;
 use crate::genesis::{GenesisEnvelope, Identities};
 use crate::hash::blake3_hash;
 use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
@@ -154,9 +154,9 @@ impl core::fmt::Display for TransitionError {
 
 impl std::error::Error for TransitionError {}
 
-impl From<TransitionError> for SwarmProtoError {
+impl From<TransitionError> for VhcProtoError {
     fn from(e: TransitionError) -> Self {
-        SwarmProtoError::Validation(e.to_string())
+        VhcProtoError::Validation(e.to_string())
     }
 }
 

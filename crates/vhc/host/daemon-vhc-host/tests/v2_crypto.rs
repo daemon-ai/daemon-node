@@ -15,7 +15,7 @@
 // This gate asserts that standingly: it locks the host accel bodies to the normative contract over
 // a wide, deterministic input sweep (guarding against a later host-side re-implementation drifting
 // from the contract the guest fallback pins), plus known-answer vectors and the tri-state
-// verify semantics. It is CPU-deterministic (no wasm host, no GPU, no network) — a `swarm-ci-det`
+// verify semantics. It is CPU-deterministic (no wasm host, no GPU, no network) — a `vhc-ci-det`
 // citizen.
 
 use daemon_vhc_host::v2::driver::{host_crypto_hash, host_crypto_verify};

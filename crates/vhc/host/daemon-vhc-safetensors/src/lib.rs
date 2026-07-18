@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-vhc-safetensors` — the swarm-checkpoint ↔ safetensors converter (spec §9).
+//! `daemon-vhc-safetensors` — the vhc-checkpoint ↔ safetensors converter (spec §9).
 //!
 //! A small, additive library that maps a canonical **state dict** — the module's parameter list in
 //! registration order (ABI §6.3), which is the checkpoint tensor order and digest coverage — to and
@@ -29,7 +29,7 @@
 //!
 //! ## Integrity
 //!
-//! safetensors carries no content hash of its own; the swarm addresses artifacts by blake3 (spec
+//! safetensors carries no content hash of its own; the vhc addresses artifacts by blake3 (spec
 //! §8/§9). [`blake3_hex`] hashes the serialized bytes — the value that goes in the run manifest /
 //! checkpoint record. A safetensors round-trip is bit-exact, so the blake3 of the re-serialized
 //! bytes equals the original's.
@@ -53,7 +53,7 @@ use safetensors::tensor::{Dtype, SafeTensors, TensorView};
 /// `serde_json` `HashMap`, whose multi-entry iteration order is non-deterministic — which would make
 /// the file bytes (and thus its blake3) unstable and break spec §9's "register only when both
 /// checkpointer uploads hash-match". A single key serializes deterministically. Provenance
-/// (tokenizer/dataset) lives in the swarm run manifest (`data.rs`), not here.
+/// (tokenizer/dataset) lives in the vhc run manifest (`data.rs`), not here.
 const ORDER_KEY: &str = "order";
 /// The order separator (parameter names are UTF-8 ≤128 bytes and never contain `\n`, ABI §6.3).
 const ORDER_SEP: char = '\n';

@@ -10,8 +10,8 @@
 //! body is CBOR; the `u32`-length prefix is handled by the channel, so this module owns only the
 //! body [`encode`]/[`decode`] — the exact conventions of [`daemon_infer::protocol`].
 //!
-//! This is the **worker** protocol (node ↔ `daemon-vhc-host` child) — distinct from the **swarm**
-//! control protocol (`daemon-swarm.cddl`, lane P). It lives in `daemon-vhc-session` (not the client)
+//! This is the **worker** protocol (node ↔ `daemon-vhc-host` child) — distinct from the **vhc**
+//! control protocol (`daemon-vhc.cddl`, lane P). It lives in `daemon-vhc-session` (not the client)
 //! so lane E's `daemon-vhc-host` worker implements the worker side against it in Wave 3 (§10.1:
 //! `daemon-vhc-host` depends on `daemon-vhc-session`).
 //!
@@ -68,7 +68,7 @@ pub enum LeaveMode {
     Immediate,
 }
 
-/// A classified worker failure (§10.2) — the swarm analogue of `daemon_infer`'s `ErrorClass`.
+/// A classified worker failure (§10.2) — the vhc analogue of `daemon_infer`'s `ErrorClass`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorClass {
     /// VRAM/host allocator OOM. Post-v1 semantics (decisions D-6): a memory breach is the module's
@@ -354,7 +354,7 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
 // ---------------------------------------------------------------------------
 //
 // `Command::JoinRun.credentials` stays an OPAQUE `Vec<u8>` on the frozen worker wire (§10.2). A3
-// defines the canonical-CBOR **schema** carried in it: the node's `SwarmService` / run-authoring
+// defines the canonical-CBOR **schema** carried in it: the node's `VhcService` / run-authoring
 // path AUTHORS a [`JoinCredentials`], `to_bytes()` it into `credentials`, and the worker's live
 // attach `from_bytes()` it to construct the live plane + engine. It is a NEW additive type — no
 // `Command`/`Event` shape change — so a worker built without the live-attach feature ignores the

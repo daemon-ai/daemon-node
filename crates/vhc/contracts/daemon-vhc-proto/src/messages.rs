@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The swarm control-plane messages (spec §6.4, §7.3; TDD PROTO-19).
+//! The vhc control-plane messages (spec §6.4, §7.3; TDD PROTO-19).
 //!
 //! The seven round messages — `RoundOpen`, `Commitment`, `Attestation`, `StorageReceipt`,
 //! `RoundRecord`, `Digest`, `Straggle` — plus the `Join`/`Heartbeat` envelope messages. Every one
-//! travels as **signed CBOR**: the [`SignedMessage`] frame carries the [`SwarmProtoVersion`], the
-//! externally-tagged [`SwarmMessage`] payload, the signer's [`PeerId`], and an ed25519
+//! travels as **signed CBOR**: the [`SignedMessage`] frame carries the [`VhcProtoVersion`], the
+//! externally-tagged [`VhcMessage`] payload, the signer's [`PeerId`], and an ed25519
 //! [`Signature`] over the canonical CBOR of `(version, payload)`.
 //!
 //! Attestations and records carry **commitments to sets** ([`SetCommitment`]), not the sets
@@ -18,13 +18,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::bytes::{Hash, IrohId, PeerId, Seed, Signature, StateDigest};
 use crate::capability::CapabilitySet;
-use crate::error::SwarmProtoError;
+use crate::error::VhcProtoError;
 use crate::merkle::SetCommitment;
 use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
-use crate::version::SwarmProtoVersion;
+use crate::version::VhcProtoVersion;
 
 /// A measured throughput class (§6.3). Boundaries are `daemon-vhc-proto` constants, versioned
-/// with [`SwarmProtoVersion`].
+/// with [`VhcProtoVersion`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThroughputClass {
@@ -254,7 +254,7 @@ pub struct Heartbeat {
 
 /// The externally-tagged union of every control-plane message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SwarmMessage {
+pub enum VhcMessage {
     /// Coordinator opens a round.
     RoundOpen(RoundOpen),
     /// Trainer commits an update.
@@ -281,17 +281,17 @@ pub enum SwarmMessage {
 /// The signed preimage: the exact bytes an ed25519 signature covers.
 #[derive(Serialize)]
 struct Preimage<'a> {
-    version: SwarmProtoVersion,
-    payload: &'a SwarmMessage,
+    version: VhcProtoVersion,
+    payload: &'a VhcMessage,
 }
 
 /// A signed control-plane message frame — everything on the wire is one of these (spec §7.3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedMessage {
-    /// The swarm proto version (exact-match join gate, §16).
-    pub version: SwarmProtoVersion,
+    /// The vhc proto version (exact-match join gate, §16).
+    pub version: VhcProtoVersion,
     /// The message payload.
-    pub payload: SwarmMessage,
+    pub payload: VhcMessage,
     /// The signing node's identity.
     pub signer: PeerId,
     /// ed25519 signature over the canonical CBOR of `(version, payload)`.
@@ -302,9 +302,9 @@ impl SignedMessage {
     /// Sign `payload` at `version` with `key`.
     pub fn sign(
         key: &SigningKey,
-        version: SwarmProtoVersion,
-        payload: SwarmMessage,
-    ) -> Result<Self, SwarmProtoError> {
+        version: VhcProtoVersion,
+        payload: VhcMessage,
+    ) -> Result<Self, VhcProtoError> {
         let sig = sign_canonical(
             key,
             &Preimage {
@@ -321,7 +321,7 @@ impl SignedMessage {
     }
 
     /// Verify the signature over `(version, payload)` against the embedded signer.
-    pub fn verify(&self) -> Result<(), SwarmProtoError> {
+    pub fn verify(&self) -> Result<(), VhcProtoError> {
         verify_canonical(
             &self.signer,
             &self.sig,
@@ -334,7 +334,7 @@ impl SignedMessage {
 
     /// Verify the signature **and** that the version exactly matches the run's pinned `expected`
     /// (§16 join gate — the message is rejected on either failure).
-    pub fn verify_for_run(&self, expected: SwarmProtoVersion) -> Result<(), SwarmProtoError> {
+    pub fn verify_for_run(&self, expected: VhcProtoVersion) -> Result<(), VhcProtoError> {
         expected.check_join(self.version)?;
         self.verify()
     }
@@ -345,8 +345,8 @@ impl SignedMessage {
     /// signatures over exactly these bytes) without re-implementing the frame's preimage layout.
     ///
     /// # Errors
-    /// A canonical-CBOR encoding failure ([`SwarmProtoError::Codec`]).
-    pub fn preimage_bytes(&self) -> Result<Vec<u8>, SwarmProtoError> {
+    /// A canonical-CBOR encoding failure ([`VhcProtoError::Codec`]).
+    pub fn preimage_bytes(&self) -> Result<Vec<u8>, VhcProtoError> {
         crate::canonical::to_canonical_vec(&Preimage {
             version: self.version,
             payload: &self.payload,

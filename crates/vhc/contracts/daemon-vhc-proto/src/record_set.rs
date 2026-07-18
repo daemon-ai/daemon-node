@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bytes::{Hash, PeerId};
 use crate::canonical::{from_canonical_slice, to_canonical_vec};
-use crate::error::SwarmProtoError;
+use crate::error::VhcProtoError;
 use crate::hash::blake3_hash;
 use crate::merkle::{commit_set, SetCommitment};
 use crate::messages::RecordEntry;
@@ -52,19 +52,19 @@ impl RecordSet {
     }
 
     /// The canonical CBOR encoding of the object (RFC 8949 §4.2, the content-address preimage).
-    pub fn to_canonical_vec(&self) -> Result<Vec<u8>, SwarmProtoError> {
+    pub fn to_canonical_vec(&self) -> Result<Vec<u8>, VhcProtoError> {
         to_canonical_vec(self)
     }
 
     /// Decode a record-set object from CBOR bytes. Order is not trusted from the wire — callers that
     /// need the object's content address must have produced it via [`RecordSet::new`]; the exact
     /// (order-independent) consensus check is [`RecordSet::verify_against`].
-    pub fn from_canonical_slice(bytes: &[u8]) -> Result<Self, SwarmProtoError> {
+    pub fn from_canonical_slice(bytes: &[u8]) -> Result<Self, VhcProtoError> {
         from_canonical_slice(bytes)
     }
 
     /// The object's content address: blake3 of its canonical CBOR (the locator hash, §11.3).
-    pub fn content_hash(&self) -> Result<Hash, SwarmProtoError> {
+    pub fn content_hash(&self) -> Result<Hash, VhcProtoError> {
         Ok(blake3_hash(&self.to_canonical_vec()?))
     }
 
@@ -79,11 +79,11 @@ impl RecordSet {
     /// Verify the object reconstructs `commitment` (the record's signed root + count). Order- and
     /// duplicate-independent: [`commit_set`] re-sorts + de-duplicates, so a witness that received the
     /// object in any order still gets an exact membership guarantee (§6.4 I3).
-    pub fn verify_against(&self, commitment: &SetCommitment) -> Result<(), SwarmProtoError> {
+    pub fn verify_against(&self, commitment: &SetCommitment) -> Result<(), VhcProtoError> {
         if self.commitment() == *commitment {
             Ok(())
         } else {
-            Err(SwarmProtoError::Merkle(
+            Err(VhcProtoError::Merkle(
                 "record-set object does not reconstruct the record's set commitment".into(),
             ))
         }

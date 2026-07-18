@@ -9,7 +9,7 @@
 //! every §8.3 tag has a representative CBOR sample that validates against the `journal-record` root,
 //! and the §8.2 / §8.5 header grammars validate too. The exhaustive serde↔grammar round-trip over
 //! the real Rust record types lives in `daemon-vhc-observe::journal` (the substrate that encodes
-//! them), mirroring how `daemon-vhc-proto` owns `daemon-swarm.cddl` and validates its own types.
+//! them), mirroring how `daemon-vhc-proto` owns `daemon-vhc.cddl` and validates its own types.
 
 use ciborium::value::Value;
 use daemon_vhc_abi::{JOURNAL_CDDL, JOURNAL_RECORD_TAGS};

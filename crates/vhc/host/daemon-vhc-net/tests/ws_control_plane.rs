@@ -18,7 +18,7 @@ use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
 use daemon_vhc_net::{ControlPlane, WsAuth};
 use daemon_vhc_proto::messages::{Commitment, Locator};
 use daemon_vhc_proto::{
-    from_canonical_slice, to_canonical_vec, Hash, SignedMessage, SwarmMessage, SWARM_PROTO_VERSION,
+    from_canonical_slice, to_canonical_vec, Hash, SignedMessage, VhcMessage, VHC_PROTO_VERSION,
 };
 
 const FRAME_FIXTURE: &str = concat!(
@@ -29,7 +29,7 @@ const FRAME_FIXTURE: &str = concat!(
 /// A deterministic signed `Commitment` frame — the golden the DO framing must reproduce byte-for-byte.
 fn golden_commitment_frame() -> Vec<u8> {
     let key = signing_key(7);
-    let payload = SwarmMessage::Commitment(Commitment {
+    let payload = VhcMessage::Commitment(Commitment {
         round: 3,
         payload: Hash::new([0xab; 32]),
         size: 4096,
@@ -37,7 +37,7 @@ fn golden_commitment_frame() -> Vec<u8> {
             "runs/run-golden/rounds/3/aabb.upd".to_string(),
         )],
     });
-    let signed = SignedMessage::sign(&key, SWARM_PROTO_VERSION, payload).expect("sign");
+    let signed = SignedMessage::sign(&key, VHC_PROTO_VERSION, payload).expect("sign");
     to_canonical_vec(&signed).expect("encode")
 }
 

@@ -18,8 +18,8 @@ use std::time::Duration;
 use daemon_vhc_net::{ControlPlane, ControlSubscription};
 use daemon_vhc_proto::messages::Heartbeat;
 use daemon_vhc_proto::{
-    from_canonical_slice, to_canonical_vec, SignedMessage, SigningKey, SwarmMessage,
-    SWARM_PROTO_VERSION,
+    from_canonical_slice, to_canonical_vec, SignedMessage, SigningKey, VhcMessage,
+    VHC_PROTO_VERSION,
 };
 
 /// How long to wait for a message to be delivered (iroh mesh formation + flood).
@@ -96,8 +96,8 @@ pub fn signing_key(seed: u8) -> SigningKey {
 
 /// Canonical-CBOR bytes of a signed `Heartbeat` — a valid opaque control-plane payload.
 pub fn signed_heartbeat_bytes(key: &SigningKey, round: u64) -> Vec<u8> {
-    let payload = SwarmMessage::Heartbeat(Heartbeat { round, ready: None });
-    let signed = SignedMessage::sign(key, SWARM_PROTO_VERSION, payload).expect("sign");
+    let payload = VhcMessage::Heartbeat(Heartbeat { round, ready: None });
+    let signed = SignedMessage::sign(key, VHC_PROTO_VERSION, payload).expect("sign");
     to_canonical_vec(&signed).expect("encode")
 }
 

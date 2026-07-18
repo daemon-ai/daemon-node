@@ -70,7 +70,7 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 ciborium = "0.2"
-# --- swarm training stack (swarm-training-spec.md §10.1) -------------------------------------------
+# --- vhc training stack (swarm-training-spec.md §10.1) -------------------------------------------
 # The wasm guest sandbox for experiment modules, isolated to the `daemon-vhc-host` worker (never the
 # node process). default-features = false trims the defaults we don't need (async, component-model,
 # wat, coredump, profiling/ittapi, parallel-compilation) down to the JIT runtime we do: the
@@ -107,14 +107,14 @@ burn-ndarray = { version = "0.21", default-features = false, features = ["std"] 
 # (needed only by the compute-conformance harness that impls the guest client). Already in the lock.
 burn-std = { version = "0.21", default-features = false, features = ["std"] }
 # Canonical content hashing for artifact / tensor / checkpoint identity (blake3), plus the cheap
-# xxh3-64 in-memory change probe. Isolated to the swarm stack.
+# xxh3-64 in-memory change probe. Isolated to the vhc stack.
 blake3 = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-# ed25519 signatures for swarm capability leases / witness attestations (§6, §7). v2 (dual
-# MIT/Apache-2.0 + BSD-3-Clause on the curve dep). Declared for the swarm lanes; wired in with the
+# ed25519 signatures for vhc capability leases / witness attestations (§6, §7). v2 (dual
+# MIT/Apache-2.0 + BSD-3-Clause on the curve dep). Declared for the vhc lanes; wired in with the
 # envelope-signing surface (lane P).
 ed25519-dalek = "2"
-# --- swarm transport plane (iroh gossip control plane + self-hosted relay, spec §7) --------------
+# --- vhc transport plane (iroh gossip control plane + self-hosted relay, spec §7) --------------
 # The iroh 1.0 stack: the QUIC/relay endpoint + the mandatory gossip control plane (§7.1 — every peer
 # speaks gossip in every mode) + the self-hosted `iroh-relay` binary/lib (§7.4 — relay URLs pinned in
 # the envelope, a delta from Psyche's hardcoded hostnames). Explicitly **NO iroh-blobs** — the
@@ -276,7 +276,7 @@ base64 = "0.22"
 # system memory probe for the hardware-aware quant recommender (RAM budget; VRAM is best-effort via
 # nvidia-smi, no GPU SDK link). default-features off keeps it to the system-info we use.
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
-# [swarm P2:C2] Windows DXGI/D3D12 VRAM+UMA probe for the swarm training WORKER only, per
+# [vhc P2:C2] Windows DXGI/D3D12 VRAM+UMA probe for the vhc training WORKER only, per
 # swarm-windows-vram-design.md §4. Windows-only: the worker wires it under
 # `[target.'cfg(windows)'.dependencies]` and selects the API-module features there (design §4:
 # Win32_Foundation, Win32_Graphics_{Dxgi,Dxgi_Common,Direct3D,Direct3D12},
@@ -448,7 +448,7 @@ daemon-node = { version = "0", path = "crates/node/daemon-node" }
 # (no-hyperon) build; the worker build opts into the engine via `--features hyperon` on the crate.
 daemon-metta = { version = "0", path = "crates/coprocessor/daemon-metta", default-features = false }
 daemon-metta-client = { version = "0", path = "crates/coprocessor/daemon-metta-client" }
-# --- swarm training stack (swarm-training-spec.md §10.1; DAG-ordered) -----------------------------
+# --- vhc training stack (swarm-training-spec.md §10.1; DAG-ordered) -----------------------------
 daemon-vhc-abi = { version = "0", path = "crates/vhc/contracts/daemon-vhc-abi" }
 daemon-vhc-proto = { version = "0", path = "crates/vhc/contracts/daemon-vhc-proto" }
 daemon-vhc-det = { version = "0", path = "crates/vhc/contracts/daemon-vhc-det" }
@@ -468,8 +468,8 @@ daemon-vhc-session = { version = "0", path = "crates/vhc/host/daemon-vhc-session
 # implementation serves the wasm coordinator-quorum guest, native vhc-sim coordination, and the
 # dual-compilation identity reference; the production coordinator is now the wasm guest.
 daemon-vhc-observe = { version = "0", path = "crates/vhc/host/daemon-vhc-observe" }
-# The node-side swarm-training service (resident `SwarmService` + worker supervisor), bound at boot
-# when `[swarm] enabled = true` (B3, spec §10.4). Promoted to the workspace table at Merge 3 (matches
+# The node-side vhc-training service (resident `VhcService` + worker supervisor), bound at boot
+# when `[vhc] enabled = true` (B3, spec §10.4). Promoted to the workspace table at Merge 3 (matches
 # the daemon-vhc-safetensors precedent from Merge 2) so `bins/daemon` consumes it via
 # `{ workspace = true }`. Default-gate-clean: no burn/wasmtime/iroh (verified by the Merge-3 dep check).
 daemon-vhc-node = { version = "0", path = "crates/vhc/host/daemon-vhc-node" }

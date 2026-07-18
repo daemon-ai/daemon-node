@@ -28,39 +28,38 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::error::SwarmProtoError;
+use crate::error::VhcProtoError;
 
 /// Serialize `value` to canonical (RFC 8949 §4.2 deterministic) CBOR bytes.
-pub fn to_canonical_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, SwarmProtoError> {
+pub fn to_canonical_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, VhcProtoError> {
     // ciborium gives us the value tree; our writer imposes the deterministic profile.
     let mut scratch = Vec::new();
     ciborium::ser::into_writer(value, &mut scratch)
-        .map_err(|e| SwarmProtoError::Codec(format!("serialize: {e}")))?;
+        .map_err(|e| VhcProtoError::Codec(format!("serialize: {e}")))?;
     let tree: ciborium::value::Value = ciborium::de::from_reader(scratch.as_slice())
-        .map_err(|e| SwarmProtoError::Codec(format!("re-read: {e}")))?;
+        .map_err(|e| VhcProtoError::Codec(format!("re-read: {e}")))?;
     let mut out = Vec::with_capacity(scratch.len());
     write_value(&tree, &mut out)?;
     Ok(out)
 }
 
 /// Decode canonical CBOR bytes produced by [`to_canonical_vec`] (or any well-formed CBOR).
-pub fn from_canonical_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SwarmProtoError> {
-    ciborium::de::from_reader(bytes)
-        .map_err(|e| SwarmProtoError::Codec(format!("deserialize: {e}")))
+pub fn from_canonical_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, VhcProtoError> {
+    ciborium::de::from_reader(bytes).map_err(|e| VhcProtoError::Codec(format!("deserialize: {e}")))
 }
 
-fn write_value(value: &ciborium::value::Value, out: &mut Vec<u8>) -> Result<(), SwarmProtoError> {
+fn write_value(value: &ciborium::value::Value, out: &mut Vec<u8>) -> Result<(), VhcProtoError> {
     use ciborium::value::Value;
     match value {
         Value::Integer(i) => {
             let n: i128 = (*i).into();
             if n >= 0 {
                 let arg = u64::try_from(n)
-                    .map_err(|_| SwarmProtoError::Codec("uint out of 64-bit range".into()))?;
+                    .map_err(|_| VhcProtoError::Codec("uint out of 64-bit range".into()))?;
                 write_head(0, arg, out);
             } else {
                 let arg = u64::try_from(-1 - n)
-                    .map_err(|_| SwarmProtoError::Codec("nint out of 64-bit range".into()))?;
+                    .map_err(|_| VhcProtoError::Codec("nint out of 64-bit range".into()))?;
                 write_head(1, arg, out);
             }
         }
@@ -105,7 +104,7 @@ fn write_value(value: &ciborium::value::Value, out: &mut Vec<u8>) -> Result<(), 
             write_value(inner, out)?;
         }
         other => {
-            return Err(SwarmProtoError::Codec(format!(
+            return Err(VhcProtoError::Codec(format!(
                 "unsupported CBOR value in canonical encoding: {other:?}"
             )));
         }

@@ -92,7 +92,7 @@ pub fn digest_tally_from_log(log: &MessageLog, round: u64, quorum: u32) -> Desyn
     let reports = log
         .by_round_kind(round, MessageKind::Digest)
         .filter_map(|m| match &m.payload {
-            daemon_vhc_proto::messages::SwarmMessage::Digest(d) => Some((m.signer, d.digest)),
+            daemon_vhc_proto::messages::VhcMessage::Digest(d) => Some((m.signer, d.digest)),
             _ => None,
         });
     digest_tally(round, reports, quorum)

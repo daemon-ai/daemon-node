@@ -113,9 +113,9 @@ cpu = []
 burn-ndarray = ["burn/ndarray"]
 # burn with the wgpu backend (cubecl + wgpu 29; targets Vulkan/RADV) — the G2 GPU lane. Opt-in only.
 wgpu = ["burn/wgpu"]
-# (A2 worker-bin split): the `swarm-net` feature (the A3 live coordinator attach) moved to
+# (A2 worker-bin split): the `vhc-net` feature (the A3 live coordinator attach) moved to
 # `crates/vhc/bins/daemon-vhc-worker` with the bin — it gated only worker-binary plumbing
-# (`live.rs`); the host lib has no swarm-net code.
+# (`live.rs`); the host lib has no vhc-net code.
 # burn with the CUDA backend (cubecl-cuda + cudarc; driver-API + NVRTC JIT at runtime) — the C2/P2
 # RunPod-4090 lane. Opt-in only, and a LANE-OWNED edit by the ledger rule: burn-cuda/cubecl-cuda/
 # cudarc are ALREADY resolved in the committed Cargo.lock (verified byte-unchanged when this feature

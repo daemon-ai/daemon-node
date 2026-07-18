@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use daemon_api::{SwarmApi, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode};
-use daemon_vhc_node::service::{SwarmError, WorkerControl};
+use daemon_vhc_node::service::{VhcError, WorkerControl};
 use daemon_vhc_node::{
-    DiscoveredRun, OwnerBudget, RunDiscovery, SwarmService, SwarmServiceParts, SwarmStore,
+    DiscoveredRun, OwnerBudget, RunDiscovery, VhcService, VhcServiceParts, VhcStore,
 };
-use daemon_vhc_session::config::SwarmConfig;
+use daemon_vhc_session::config::VhcConfig;
 use daemon_vhc_session::protocol::{Eligibility, Hardware, JoinPolicy, LeaveMode};
 use std::collections::BTreeMap;
 
@@ -41,7 +41,7 @@ struct FakeChild {
 
 #[async_trait]
 impl WorkerControl for FakeChild {
-    async fn probe(&self) -> Result<Hardware, SwarmError> {
+    async fn probe(&self) -> Result<Hardware, VhcError> {
         Ok(Hardware {
             gpus: 1,
             vram_mb: self.vram_mb as u64,
@@ -50,7 +50,7 @@ impl WorkerControl for FakeChild {
             ..Default::default()
         })
     }
-    async fn assess(&self, _envelope: Vec<u8>) -> Result<Eligibility, SwarmError> {
+    async fn assess(&self, _envelope: Vec<u8>) -> Result<Eligibility, VhcError> {
         match self.assess_claim {
             Some((device, host)) => Ok(Eligibility {
                 eligible: true,
@@ -70,11 +70,11 @@ impl WorkerControl for FakeChild {
         _coordinator: String,
         _credentials: Vec<u8>,
         _policy: JoinPolicy,
-    ) -> Result<(), SwarmError> {
+    ) -> Result<(), VhcError> {
         self.joins.lock().unwrap().push(run_id);
         Ok(())
     }
-    async fn leave(&self, run_id: String, _mode: LeaveMode) -> Result<(), SwarmError> {
+    async fn leave(&self, run_id: String, _mode: LeaveMode) -> Result<(), VhcError> {
         self.leaves.lock().unwrap().push(run_id);
         Ok(())
     }
@@ -83,7 +83,7 @@ impl WorkerControl for FakeChild {
         _vram_cap_mb: Option<u32>,
         _duty_cycle_pct: Option<u8>,
         _paused: bool,
-    ) -> Result<(), SwarmError> {
+    ) -> Result<(), VhcError> {
         Ok(())
     }
     async fn shutdown(&self) {
@@ -127,7 +127,7 @@ fn colocation_budget() -> OwnerBudget {
 }
 
 struct Rig {
-    svc: Arc<SwarmService>,
+    svc: Arc<VhcService>,
     children: Arc<Mutex<Vec<Arc<FakeChild>>>>,
 }
 
@@ -143,12 +143,12 @@ fn rig(budget: OwnerBudget) -> Rig {
         spawned.lock().unwrap().push(child.clone());
         child as Arc<dyn WorkerControl>
     });
-    let svc = Arc::new(SwarmService::new(SwarmServiceParts {
-        config: SwarmConfig {
+    let svc = Arc::new(VhcService::new(VhcServiceParts {
+        config: VhcConfig {
             enabled: true,
-            ..SwarmConfig::default()
+            ..VhcConfig::default()
         },
-        store: SwarmStore::open_in_memory().unwrap(),
+        store: VhcStore::open_in_memory().unwrap(),
         worker: probe_worker(0),
         feed: None,
         discovery: None,
@@ -277,7 +277,7 @@ async fn repeated_join_never_double_charges() {
 #[tokio::test]
 async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swarm.db");
+    let path = dir.path().join("vhc.db");
     let incarnation;
     {
         let children: Arc<Mutex<Vec<Arc<FakeChild>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -287,12 +287,12 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
             spawned.lock().unwrap().push(child.clone());
             child as Arc<dyn WorkerControl>
         });
-        let svc = Arc::new(SwarmService::new(SwarmServiceParts {
-            config: SwarmConfig {
+        let svc = Arc::new(VhcService::new(VhcServiceParts {
+            config: VhcConfig {
                 enabled: true,
-                ..SwarmConfig::default()
+                ..VhcConfig::default()
             },
-            store: SwarmStore::open(&path).unwrap(),
+            store: VhcStore::open(&path).unwrap(),
             worker: probe_worker(0),
             feed: None,
             discovery: None,
@@ -322,12 +322,12 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
             spawned.lock().unwrap().push(child.clone());
             child as Arc<dyn WorkerControl>
         });
-        let svc = Arc::new(SwarmService::new(SwarmServiceParts {
-            config: SwarmConfig {
+        let svc = Arc::new(VhcService::new(VhcServiceParts {
+            config: VhcConfig {
                 enabled: true,
-                ..SwarmConfig::default()
+                ..VhcConfig::default()
             },
-            store: SwarmStore::open(&path).unwrap(),
+            store: VhcStore::open(&path).unwrap(),
             worker: probe_worker(0),
             feed: None,
             discovery: None,
@@ -362,10 +362,10 @@ struct StubDiscovery;
 
 #[async_trait]
 impl RunDiscovery for StubDiscovery {
-    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, SwarmError> {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, VhcError> {
         Ok(Vec::new())
     }
-    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, SwarmError> {
+    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, VhcError> {
         Ok(Some(DiscoveredRun {
             run_id: run_id.to_string(),
             coordinator: "wss://coord.example/swarm".to_string(),
@@ -373,7 +373,7 @@ impl RunDiscovery for StubDiscovery {
             proto_version: 1,
         }))
     }
-    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, SwarmError> {
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
         Ok(vec![1, 2, 3, 4])
     }
 }
@@ -411,12 +411,12 @@ async fn admitted_charge_equals_assess_claim_totals() {
         max_instances: 4,
     };
 
-    let svc = Arc::new(SwarmService::new(SwarmServiceParts {
-        config: SwarmConfig {
+    let svc = Arc::new(VhcService::new(VhcServiceParts {
+        config: VhcConfig {
             enabled: true,
-            ..SwarmConfig::default()
+            ..VhcConfig::default()
         },
-        store: SwarmStore::open_in_memory().unwrap(),
+        store: VhcStore::open_in_memory().unwrap(),
         worker: probe_worker(0),
         feed: None,
         discovery: Some(Arc::new(StubDiscovery)),

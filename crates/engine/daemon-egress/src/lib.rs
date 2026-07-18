@@ -159,7 +159,7 @@ impl EgressRequest {
         }
     }
 
-    /// A raw-body `PUT` of `body` — the presigned R2/S3 upload shape (the swarm `r2` payload plane,
+    /// A raw-body `PUT` of `body` — the presigned R2/S3 upload shape (the vhc `r2` payload plane,
     /// spec §7.1/§11.3): the URL carries the SigV4 signature in its query, the object bytes are the
     /// request body. **No `Content-Type` is set here**: a presigned URL only signs the headers it was
     /// generated with, so forcing a `Content-Type` the presign did not sign would break the signature.

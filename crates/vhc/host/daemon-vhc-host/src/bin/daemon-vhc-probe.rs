@@ -16,7 +16,7 @@
 //! decision logic is the shared `probe` code, so the numbers are identical to a live `Probe`.
 
 fn main() {
-    println!("daemon-vhc-probe — device limits (swarm P2 C2)");
+    println!("daemon-vhc-probe — device limits (vhc P2 C2)");
     println!("target_os = {}", std::env::consts::OS);
 
     #[cfg(windows)]

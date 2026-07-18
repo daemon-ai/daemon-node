@@ -1,5 +1,5 @@
 [package]
-name = "daemon-swarm-e2e"
+name = "daemon-vhc-e2e"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

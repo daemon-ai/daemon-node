@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Shared swarm identity / hash vocabulary.
+//! Shared vhc identity / hash vocabulary.
 //!
 //! Merge 1 swapped the Wave-1 placeholders for the canonical [`daemon_vhc_proto`] types: the
 //! content hash is proto's blake3 [`Hash`](daemon_vhc_proto::Hash) (re-exported here as
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// A content-addressed identity over opaque bytes: proto's canonical blake3 [`Hash`].
 ///
-/// The whole swarm integrity model — artifacts, round payloads, checkpoints — is blake3-addressed
+/// The whole vhc integrity model — artifacts, round payloads, checkpoints — is blake3-addressed
 /// (spec §6.4, the delta from Psyche's sha256). Compute one with
 /// [`daemon_vhc_proto::blake3_hash`].
 ///
@@ -84,9 +84,9 @@ mod tests {
     #[test]
     fn content_hash_is_proto_blake3() {
         // ContentHash is proto's blake3 Hash; `blake3_hash` computes it, `to_hex` renders 64 chars.
-        let h = blake3_hash(b"daemon-swarm");
+        let h = blake3_hash(b"daemon-vhc");
         assert_eq!(h.to_hex().len(), 64);
-        assert_eq!(h, blake3_hash(b"daemon-swarm"));
+        assert_eq!(h, blake3_hash(b"daemon-vhc"));
     }
 
     #[test]

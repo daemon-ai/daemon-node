@@ -25,9 +25,7 @@ use daemon_vhc_observe::{
     replay_consensus_from_archive, AttestedHead, ConsensusReplayError, ReplicationPolicy,
     RetentionPolicy,
 };
-use daemon_vhc_proto::{
-    peer_id, to_canonical_vec, Hash, PeerId, SignedMessage, SWARM_PROTO_VERSION,
-};
+use daemon_vhc_proto::{peer_id, to_canonical_vec, Hash, PeerId, SignedMessage, VHC_PROTO_VERSION};
 use daemon_vhc_sdk_consensus::coordinator::Input;
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
@@ -102,7 +100,7 @@ fn build_archived(fx: Fixture) -> Archived {
     for msg in &fx.published {
         let payload = to_canonical_vec(msg).expect("payload cbor");
         let signed =
-            SignedMessage::sign(&coord, SWARM_PROTO_VERSION, msg.clone()).expect("sign publish");
+            SignedMessage::sign(&coord, VHC_PROTO_VERSION, msg.clone()).expect("sign publish");
         let frame = to_canonical_vec(&signed).expect("frame cbor");
         journal
             .publish(0, &payload, frame)

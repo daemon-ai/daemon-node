@@ -15,7 +15,7 @@
 //!
 //! [`HttpPresignClient`] caches responses keyed to their `expires_at`, so a burst of PUT/GET ops on
 //! the same object presigns once; a minted URL already past `expires_at` is rejected up-front as
-//! [`SwarmNetError::PresignExpired`] (NET-1 `store_presign_expired_rejected`).
+//! [`VhcNetError::PresignExpired`] (NET-1 `store_presign_expired_rejected`).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ use daemon_egress::{EgressClient, EgressRequest, Redirects};
 use serde::{Deserialize, Serialize};
 
 use crate::seam::RunId;
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// The class of object being presigned — selects the R2 key layout (spec §11.3).
 ///
@@ -135,7 +135,7 @@ pub struct PresignResponse {
     /// The presigned URL to `PUT`/`GET`.
     pub url: String,
     /// Expiry (unix seconds). The [`HttpPresignClient`] cache honours this; a URL already past it is
-    /// rejected as [`SwarmNetError::PresignExpired`].
+    /// rejected as [`VhcNetError::PresignExpired`].
     pub expires_at: u64,
     /// Signed headers the caller must replay verbatim on the object request (e.g. a
     /// signature-covered `content-type`). Empty when the presign signed only the URL query.
@@ -151,7 +151,7 @@ pub trait PresignClient: Send + Sync {
         &self,
         run: &RunId,
         req: &PresignRequest,
-    ) -> Result<PresignResponse, SwarmNetError>;
+    ) -> Result<PresignResponse, VhcNetError>;
 }
 
 /// The cache key: a run + the fully-qualified object request. `ObjectKind`/`PresignOp` are `Hash`.
@@ -188,7 +188,7 @@ fn now_unix() -> u64 {
 
 /// The HTTP [`PresignClient`]: `POST <coordinator_base>/runs/:id/presign` through [`EgressClient`].
 ///
-/// `coordinator_base` is a swarm-allowlisted coordinator endpoint (spec §11.1), e.g.
+/// `coordinator_base` is a vhc-allowlisted coordinator endpoint (spec §11.1), e.g.
 /// `https://api.daemon.ai/api/v1/swarm`. An optional bearer token carries the `swarm:*` API-key scope.
 pub struct HttpPresignClient {
     egress: EgressClient,
@@ -251,14 +251,14 @@ impl PresignClient for HttpPresignClient {
         &self,
         run: &RunId,
         req: &PresignRequest,
-    ) -> Result<PresignResponse, SwarmNetError> {
+    ) -> Result<PresignResponse, VhcNetError> {
         let cache_key = CacheKey::of(run, req);
         if let Some(hit) = self.cached(&cache_key) {
             return Ok(hit);
         }
 
         let mut ereq = EgressRequest::post_json(self.endpoint(run), req)
-            .map_err(|e| SwarmNetError::Transport(format!("encode presign request: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("encode presign request: {e}")))?;
         if let Some(token) = &self.bearer {
             ereq = ereq.bearer_auth(token);
         }
@@ -271,25 +271,25 @@ impl PresignClient for HttpPresignClient {
             .egress
             .execute(ereq, Redirects::DEFAULT)
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("presign request: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("presign request: {e}")))?;
         let status = resp.status();
         let body = resp
             .bytes()
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("read presign body: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("read presign body: {e}")))?;
         if !status.is_success() {
-            return Err(SwarmNetError::Transport(format!(
+            return Err(VhcNetError::Transport(format!(
                 "presign endpoint returned {status}: {}",
                 String::from_utf8_lossy(&body)
             )));
         }
         let presigned: PresignResponse = serde_json::from_slice(&body)
-            .map_err(|e| SwarmNetError::Transport(format!("decode presign response: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("decode presign response: {e}")))?;
 
         // A URL that is already expired is a fault (clock skew / a misconfigured coordinator): the
         // credential is unusable, so reject rather than hand back a dead URL. Not a `PayloadMiss`.
         if presigned.expires_at <= now_unix() {
-            return Err(SwarmNetError::PresignExpired(format!(
+            return Err(VhcNetError::PresignExpired(format!(
                 "{}/{:?} expires_at={} <= now",
                 run.as_str(),
                 req.kind,

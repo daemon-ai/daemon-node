@@ -56,21 +56,21 @@ enum Cmd {
     },
     /// Decode every CBOR fixture with the generated C codec (wire-compat gate).
     VerifyCodec,
-    /// Build the swarm guest experiment modules (`guests/`) for `wasm32-unknown-unknown`.
+    /// Build the vhc guest experiment modules (`guests/`) for `wasm32-unknown-unknown`.
     BuildGuests,
-    /// Run the swarm **CI tier-1** suite: the CPU-only, consensus-critical determinism / round-
+    /// Run the vhc **CI tier-1** suite: the CPU-only, consensus-critical determinism / round-
     /// protocol / codec / wasm-guest suites (TDD §8.1 tier 1). Builds the guests first, then runs the
     /// pinned suite list, failing on the first red. No GPU, no live substrate (env-gated live tests
-    /// skip). This is the single in-repo definition of the per-PR swarm gate — the superproject CI
-    /// job and a local operator both invoke `cargo run -p xtask -- swarm-ci-det`.
-    SwarmCiDet,
-    /// Run the swarm **CI tier-2** whole-run suites (decisions D4): the deterministic sim/testkit
+    /// skip). This is the single in-repo definition of the per-PR vhc gate — the superproject CI
+    /// job and a local operator both invoke `cargo run -p xtask -- vhc-ci-det`.
+    VhcCiDet,
+    /// Run the vhc **CI tier-2** whole-run suites (decisions D4): the deterministic sim/testkit
     /// whole runs as they land — SDK-side `daemon-vhc-sim` native whole runs (the SPARTA
     /// continuous-averaging toy over the virtual worlds) and host-side `daemon-vhc-testkit` whole
     /// runs over the PRODUCTION wasm blobs (wasmtime + simulated capability providers, journaled,
     /// §8.7 replay-verified). Heavier than tier-1 (wasmtime + guest builds), so it is a separate
-    /// gate invoked as `cargo run -p xtask -- swarm-ci-t2`, never part of `swarm-ci-det`.
-    SwarmCiT2,
+    /// gate invoked as `cargo run -p xtask -- vhc-ci-t2`, never part of `vhc-ci-det`.
+    VhcCiT2,
     /// Enforce the daemon-vhc dependency-direction rules (architecture §7): `host/*` never links
     /// `sdk/*`, `contracts/*` links neither, `sdk/*` never links `host/*`. The honest current
     /// exceptions are listed inline and each is tracked to the phase that removes it.
@@ -183,8 +183,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::GenZcbor { cddl, out } => gen_zcbor(cddl, out),
         Cmd::VerifyCodec => verify_codec(),
         Cmd::BuildGuests => build_guests(),
-        Cmd::SwarmCiDet => swarm_ci_det(),
-        Cmd::SwarmCiT2 => swarm_ci_t2(),
+        Cmd::VhcCiDet => vhc_ci_det(),
+        Cmd::VhcCiT2 => vhc_ci_t2(),
         Cmd::VhcDepCheck => vhc_dep_check(),
         Cmd::TokenizeCorpus {
             dataset,
@@ -243,7 +243,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Build the swarm guest experiment modules for `wasm32-unknown-unknown`.
+/// Build the vhc guest experiment modules for `wasm32-unknown-unknown`.
 ///
 /// `guests/` is its OWN cargo workspace (excluded from the root workspace), so the host's native
 /// `cargo build/clippy/test` never tries to build a `cdylib` for wasm. This target runs
@@ -295,7 +295,7 @@ fn build_guests() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the swarm CI tier-1 suite (TDD §8.1 tier 1: the per-PR, hosted-CI, no-GPU gate).
+/// Run the vhc CI tier-1 suite (TDD §8.1 tier 1: the per-PR, hosted-CI, no-GPU gate).
 ///
 /// Every bit-exact / cross-peer-consensus claim is a CPU property by contract (the det lane is CPU
 /// fp32, spec §5.6), so this tier runs on plain runners. It covers the shared det kernels; the round
@@ -312,12 +312,12 @@ fn build_guests() -> anyhow::Result<()> {
 /// per-lane tier 2 and the manual hardware-in-loop gate tier 3 (see swarm-p2-gate-runbook.md).
 ///
 /// The `daemon-conformance` detached-delegation trio (a known parallel-load flake, pass-in-isolation
-/// = green) is NOT a swarm crate and NOT in this list, so it never gates the swarm tier.
-fn swarm_ci_det() -> anyhow::Result<()> {
+/// = green) is NOT a vhc crate and NOT in this list, so it never gates the vhc tier.
+fn vhc_ci_det() -> anyhow::Result<()> {
     let root = workspace_root();
     // Dependency-direction invariant (architecture §7) first — cheap (metadata only) and fails fast
     // on a host/*->sdk/* regression before spending a compile.
-    println!("\n== swarm-ci-det: daemon-vhc dependency-direction check ==");
+    println!("\n== vhc-ci-det: daemon-vhc dependency-direction check ==");
     vhc_dep_check()?;
     build_guests()?;
     // (label, cargo test args). Each runs in its own process; the first red aborts.
@@ -520,8 +520,8 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-sdk-v2"],
         ),
         (
-            "daemon-swarm-e2e (drills + observe-replay, no iroh/live)",
-            &["-p", "daemon-swarm-e2e"],
+            "daemon-vhc-e2e (drills + observe-replay, no iroh/live)",
+            &["-p", "daemon-vhc-e2e"],
         ),
         (
             "daemon-api conformance (serde wire ↔ CDDL, pos+neg)",
@@ -540,31 +540,31 @@ fn swarm_ci_det() -> anyhow::Result<()> {
         ),
     ];
     for (label, args) in suites {
-        println!("\n== swarm-ci-det: {label} ==");
+        println!("\n== vhc-ci-det: {label} ==");
         let status = Command::new("cargo")
             .current_dir(&root)
             .arg("test")
             .args(*args)
             .status()
             .map_err(|e| anyhow::anyhow!("running cargo test {args:?}: {e}"))?;
-        anyhow::ensure!(status.success(), "swarm CI tier-1 suite failed: {label}");
+        anyhow::ensure!(status.success(), "vhc CI tier-1 suite failed: {label}");
     }
-    println!("\nswarm-ci-det: all tier-1 (CPU consensus-critical) swarm suites green");
+    println!("\nvhc-ci-det: all tier-1 (CPU consensus-critical) vhc suites green");
     Ok(())
 }
 
-/// Run the swarm **CI tier-2** whole-run suites (decisions D4; refactor §6, §10 gate table).
+/// Run the vhc **CI tier-2** whole-run suites (decisions D4; refactor §6, §10 gate table).
 ///
 /// The two-layer simulation split (architecture §6): SDK-side `daemon-vhc-sim` runs NATIVE policy
 /// code (the SPARTA continuous-averaging toy over the virtual worlds — deterministic whole run),
 /// and host-side `daemon-vhc-testkit` runs the PRODUCTION wasm blobs under wasmtime + simulated
 /// capability providers, journaled and §8.7 replay-verified. This is heavier than tier-1 (it builds
 /// the wasm guests + compiles wasmtime), so it is a separate gate — never folded into
-/// `swarm-ci-det`, which stays the CPU-only deterministic tier-1 bar.
-fn swarm_ci_t2() -> anyhow::Result<()> {
+/// `vhc-ci-det`, which stays the CPU-only deterministic tier-1 bar.
+fn vhc_ci_t2() -> anyhow::Result<()> {
     let root = workspace_root();
     // Same dependency-direction preflight as tier-1, then the guests the testkit runs.
-    println!("\n== swarm-ci-t2: daemon-vhc dependency-direction check ==");
+    println!("\n== vhc-ci-t2: daemon-vhc dependency-direction check ==");
     vhc_dep_check()?;
     build_guests()?;
     let suites: &[(&str, &[&str])] = &[
@@ -601,7 +601,7 @@ fn swarm_ci_t2() -> anyhow::Result<()> {
         ),
     ];
     for (label, args) in suites {
-        println!("\n== swarm-ci-t2: {label} ==");
+        println!("\n== vhc-ci-t2: {label} ==");
         let status = Command::new("cargo")
             .current_dir(&root)
             .arg("test")
@@ -610,10 +610,10 @@ fn swarm_ci_t2() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("running cargo test {args:?}: {e}"))?;
         anyhow::ensure!(
             status.success(),
-            "swarm CI tier-2 whole-run suite failed: {label}"
+            "vhc CI tier-2 whole-run suite failed: {label}"
         );
     }
-    println!("\nswarm-ci-t2: all tier-2 (sim/testkit) whole-run suites green");
+    println!("\nvhc-ci-t2: all tier-2 (sim/testkit) whole-run suites green");
     Ok(())
 }
 
@@ -636,7 +636,7 @@ fn vhc_dep_check() -> anyhow::Result<()> {
     // later phase removes. Format: (dependent crate, sdk crate, why it exists / when it goes).
     // Reviewed at the Phase-E v1 sunset (decisions D5): the exceptions whose consumers retired
     // WITH the v1 driver were removed here in the sunset commit (`daemon-vhc-host ->
-    // daemon-vhc-sdk`: the v1 oracle/reference/160M/determinism harnesses; `daemon-swarm-e2e ->
+    // daemon-vhc-sdk`: the v1 oracle/reference/160M/determinism harnesses; `daemon-vhc-e2e ->
     // daemon-vhc-sdk`: the wasm_profiles / typed_checkpoint_bridge WasmBackend suites). The rest
     // were re-reviewed and RETAINED with honest post-sunset notes — the RoundEngine survived the
     // sunset as the deterministic harness / cold-join substrate (D5 names the five-phase driver,
@@ -645,20 +645,20 @@ fn vhc_dep_check() -> anyhow::Result<()> {
     // the engine's own re-seat onto vhc-sim instead.
     const EXCEPTIONS: &[(&str, &str, &str)] = &[
         (
-            "daemon-swarm-e2e",
+            "daemon-vhc-e2e",
             "daemon-vhc-sdk-rounds",
             "post-E — the A2 choreography bridging oracle (relocated round logic vs the retained \
              RoundEngine harness substrate); retires when the engine re-seats onto vhc-sim \
              [dev-dep]",
         ),
         (
-            "daemon-swarm-e2e",
+            "daemon-vhc-e2e",
             "daemon-vhc-sdk-v2",
             "post-E — the B2 corpus-windowing equivalence oracle (SDK policy vs the retained \
              host pipeline `session::data`); retires with that pipeline [dev-dep]",
         ),
         (
-            "daemon-swarm-e2e",
+            "daemon-vhc-e2e",
             "daemon-vhc-sdk-consensus",
             "D2/post-E — the StubBackend drills drive the coordinator `tick` (relocated here at \
              D2) + observe oracle; retires when the drills re-seat onto vhc-sim/testkit [dev-dep]",

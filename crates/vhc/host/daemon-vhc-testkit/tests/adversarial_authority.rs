@@ -60,7 +60,7 @@ use daemon_vhc_proto::messages::{
 };
 use daemon_vhc_proto::{
     blake3_hash, peer_id, sign_canonical, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId,
-    Seed, SignedMessage, SigningKey, SwarmMessage, SWARM_PROTO_VERSION,
+    Seed, SignedMessage, SigningKey, VhcMessage, VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input, RunConfig};
 use daemon_vhc_sdk_consensus::{
@@ -127,11 +127,11 @@ fn tempdir() -> std::path::PathBuf {
 
 struct ScriptMsg {
     key: SigningKey,
-    msg: SwarmMessage,
+    msg: VhcMessage,
 }
 
-fn sign(k: &SigningKey, m: &SwarmMessage) -> SignedMessage {
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, m.clone()).expect("sign")
+fn sign(k: &SigningKey, m: &VhcMessage) -> SignedMessage {
+    SignedMessage::sign(k, VHC_PROTO_VERSION, m.clone()).expect("sign")
 }
 
 fn single_key(authority: PeerId) -> AuthorityConfig {
@@ -151,7 +151,7 @@ fn run_config(
 ) -> RunConfig {
     RunConfig {
         run_id: run_label.to_string(),
-        proto_version: SWARM_PROTO_VERSION,
+        proto_version: VHC_PROTO_VERSION,
         envelope_hash: Hash([0u8; 32]),
         required_capabilities: CapabilitySet::new(),
         min_peers,
@@ -215,7 +215,7 @@ fn drive_and_archive(
     custody: &SigningKey,
     script: &[ScriptMsg],
     expected_records: usize,
-) -> (RecordArchive, Vec<AttestedHead>, Vec<SwarmMessage>) {
+) -> (RecordArchive, Vec<AttestedHead>, Vec<VhcMessage>) {
     let ident = ExecIdentity {
         run_id: spec.run_id,
         epoch: 0,
@@ -269,7 +269,7 @@ fn drive_and_archive(
         let (_, _, msg) = coord
             .next_decision(Duration::from_secs(60))
             .expect("blob decision");
-        if matches!(msg, SwarmMessage::RoundRecord(_)) {
+        if matches!(msg, VhcMessage::RoundRecord(_)) {
             records += 1;
         }
         // Journal the blob's decision as the custody-signed tag-4 publish (the oracle).
@@ -340,7 +340,7 @@ fn barrier_script(
         for k in worker_keys {
             script.push(ScriptMsg {
                 key: k.clone(),
-                msg: SwarmMessage::Join(Join {
+                msg: VhcMessage::Join(Join {
                     run_id: run_label.into(),
                     iroh_id: IrohId([0x44; 32]),
                     class: ThroughputClass::C1,
@@ -352,7 +352,7 @@ fn barrier_script(
         for k in worker_keys {
             script.push(ScriptMsg {
                 key: k.clone(),
-                msg: SwarmMessage::Heartbeat(Heartbeat {
+                msg: VhcMessage::Heartbeat(Heartbeat {
                     round: 0,
                     ready: Some(true),
                 }),
@@ -367,7 +367,7 @@ fn barrier_script(
             payloads.insert(hash, bytes.clone());
             script.push(ScriptMsg {
                 key: k.clone(),
-                msg: SwarmMessage::Commitment(Commitment {
+                msg: VhcMessage::Commitment(Commitment {
                     round,
                     payload: hash,
                     size: bytes.len() as u64,
@@ -382,7 +382,7 @@ fn barrier_script(
         }
         script.push(ScriptMsg {
             key: worker_keys[0].clone(),
-            msg: SwarmMessage::StorageReceipt(StorageReceipt {
+            msg: VhcMessage::StorageReceipt(StorageReceipt {
                 round,
                 verified: entries,
             }),
@@ -492,7 +492,7 @@ fn withheld_records_close_rounds_without_the_peer_and_drop_it_at_k() {
     for k in [&w0, &w1] {
         script.push(ScriptMsg {
             key: (*k).clone(),
-            msg: SwarmMessage::Join(Join {
+            msg: VhcMessage::Join(Join {
                 run_id: "withhold".into(),
                 iroh_id: IrohId([0x44; 32]),
                 class: ThroughputClass::C1,
@@ -504,7 +504,7 @@ fn withheld_records_close_rounds_without_the_peer_and_drop_it_at_k() {
     for k in [&w0, &w1] {
         script.push(ScriptMsg {
             key: (*k).clone(),
-            msg: SwarmMessage::Heartbeat(Heartbeat {
+            msg: VhcMessage::Heartbeat(Heartbeat {
                 round: 0,
                 ready: Some(true),
             }),
@@ -516,7 +516,7 @@ fn withheld_records_close_rounds_without_the_peer_and_drop_it_at_k() {
         payloads.insert(hash, bytes.clone());
         script.push(ScriptMsg {
             key: w0.clone(),
-            msg: SwarmMessage::Commitment(Commitment {
+            msg: VhcMessage::Commitment(Commitment {
                 round,
                 payload: hash,
                 size: bytes.len() as u64,
@@ -525,7 +525,7 @@ fn withheld_records_close_rounds_without_the_peer_and_drop_it_at_k() {
         });
         script.push(ScriptMsg {
             key: w0.clone(),
-            msg: SwarmMessage::StorageReceipt(StorageReceipt {
+            msg: VhcMessage::StorageReceipt(StorageReceipt {
                 round,
                 verified: vec![RecordEntry {
                     peer: peer_id(&w0),
@@ -538,7 +538,7 @@ fn withheld_records_close_rounds_without_the_peer_and_drop_it_at_k() {
         for _ in 0..8 {
             script.push(ScriptMsg {
                 key: w0.clone(),
-                msg: SwarmMessage::Heartbeat(Heartbeat { round, ready: None }),
+                msg: VhcMessage::Heartbeat(Heartbeat { round, ready: None }),
             });
         }
     }
@@ -547,20 +547,20 @@ fn withheld_records_close_rounds_without_the_peer_and_drop_it_at_k() {
     // withholding and assert the SUBSTANCE on its OWN published records — both rounds close by the
     // deterministic event-count deadline WITHOUT the withheld peer, and it is dropped at k.
     let (_, _, decisions) = drive_and_archive(&wasm, &spec, key_seed, &custody, &script, 2);
-    let records: Vec<&SwarmMessage> = decisions
+    let records: Vec<&VhcMessage> = decisions
         .iter()
-        .filter(|m| matches!(m, SwarmMessage::RoundRecord(_)))
+        .filter(|m| matches!(m, VhcMessage::RoundRecord(_)))
         .collect();
     assert_eq!(records.len(), 2, "both withheld rounds still close");
     for r in &records {
-        let SwarmMessage::RoundRecord(rr) = r else {
+        let VhcMessage::RoundRecord(rr) = r else {
             unreachable!()
         };
         let entries = rr.inline.clone().unwrap_or_default();
         assert_eq!(entries.len(), 1, "the record excludes the withheld peer");
         assert_ne!(entries[0].peer, withheld_peer);
     }
-    let SwarmMessage::RoundRecord(last) = records[1] else {
+    let VhcMessage::RoundRecord(last) = records[1] else {
         unreachable!()
     };
     assert_eq!(
@@ -608,7 +608,7 @@ fn eclipsed_peer_converges_from_archive_and_payloads_alone() {
         let records: Vec<_> = decisions
             .iter()
             .filter_map(|m| match m {
-                SwarmMessage::RoundRecord(r) => Some(r.clone()),
+                VhcMessage::RoundRecord(r) => Some(r.clone()),
                 _ => None,
             })
             .collect();
@@ -621,7 +621,7 @@ fn eclipsed_peer_converges_from_archive_and_payloads_alone() {
     assert_eq!(
         decisions
             .iter()
-            .filter(|m| matches!(m, SwarmMessage::RoundRecord(_)))
+            .filter(|m| matches!(m, VhcMessage::RoundRecord(_)))
             .count(),
         3
     );

@@ -8,12 +8,12 @@
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_vhc_proto::messages::{
     AttestEntry, Attestation, Commitment, Digest, Heartbeat, Join, Locator, RecordEntry,
-    SignedMessage, StorageReceipt, Straggle, StraggleStatus, SwarmMessage, ThroughputClass,
+    SignedMessage, StorageReceipt, Straggle, StraggleStatus, ThroughputClass, VhcMessage,
 };
 use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{
     commit_set, peer_id, CapabilitySet, Hash, IrohId, PeerId, Seed, SigningKey, StateDigest,
-    SwarmProtoVersion, SWARM_PROTO_VERSION,
+    VhcProtoVersion, VHC_PROTO_VERSION,
 };
 
 use daemon_vhc_sdk_consensus::coordinator::{
@@ -33,7 +33,7 @@ pub fn pid(seed: u8) -> PeerId {
 pub fn base_config() -> RunConfig {
     RunConfig {
         run_id: RUN_ID.to_string(),
-        proto_version: SWARM_PROTO_VERSION,
+        proto_version: VHC_PROTO_VERSION,
         envelope_hash: Hash([0x11; 32]),
         required_capabilities: CapabilitySet::new(),
         min_peers: 2,
@@ -74,7 +74,7 @@ pub fn join_msg(k: &SigningKey) -> SignedMessage {
         capabilities: CapabilitySet::new(),
         envelope_hash: None,
     };
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Join(j)).unwrap()
+    SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Join(j)).unwrap()
 }
 
 pub fn join_msg_with_hash(k: &SigningKey, envelope_hash: Hash) -> SignedMessage {
@@ -85,10 +85,10 @@ pub fn join_msg_with_hash(k: &SigningKey, envelope_hash: Hash) -> SignedMessage 
         capabilities: CapabilitySet::new(),
         envelope_hash: Some(envelope_hash),
     };
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Join(j)).unwrap()
+    SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Join(j)).unwrap()
 }
 
-pub fn join_msg_version(k: &SigningKey, version: SwarmProtoVersion) -> SignedMessage {
+pub fn join_msg_version(k: &SigningKey, version: VhcProtoVersion) -> SignedMessage {
     let j = Join {
         run_id: RUN_ID.to_string(),
         iroh_id: IrohId([0x22; 32]),
@@ -96,7 +96,7 @@ pub fn join_msg_version(k: &SigningKey, version: SwarmProtoVersion) -> SignedMes
         capabilities: CapabilitySet::new(),
         envelope_hash: None,
     };
-    SignedMessage::sign(k, version, SwarmMessage::Join(j)).unwrap()
+    SignedMessage::sign(k, version, VhcMessage::Join(j)).unwrap()
 }
 
 pub fn payload_hash(seed: u8) -> Hash {
@@ -110,7 +110,7 @@ pub fn commitment_msg(k: &SigningKey, round: u64, payload_seed: u8) -> SignedMes
         size: 1_000,
         locators: vec![Locator::StoreKey("k".to_string())],
     };
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Commitment(c)).unwrap()
+    SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Commitment(c)).unwrap()
 }
 
 pub fn receipt_msg(coord: &SigningKey, round: u64, entries: &[(PeerId, u8)]) -> SignedMessage {
@@ -123,7 +123,7 @@ pub fn receipt_msg(coord: &SigningKey, round: u64, entries: &[(PeerId, u8)]) -> 
         })
         .collect();
     let sr = StorageReceipt { round, verified };
-    SignedMessage::sign(coord, SWARM_PROTO_VERSION, SwarmMessage::StorageReceipt(sr)).unwrap()
+    SignedMessage::sign(coord, VHC_PROTO_VERSION, VhcMessage::StorageReceipt(sr)).unwrap()
 }
 
 pub fn attestation_msg(
@@ -147,7 +147,7 @@ pub fn attestation_msg(
         set: commit_set(&pairs).commitment(),
         inline: Some(inline),
     };
-    SignedMessage::sign(witness, SWARM_PROTO_VERSION, SwarmMessage::Attestation(a)).unwrap()
+    SignedMessage::sign(witness, VHC_PROTO_VERSION, VhcMessage::Attestation(a)).unwrap()
 }
 
 pub fn digest_msg(k: &SigningKey, round: u64, digest_seed: u8) -> SignedMessage {
@@ -155,7 +155,7 @@ pub fn digest_msg(k: &SigningKey, round: u64, digest_seed: u8) -> SignedMessage 
         round,
         digest: StateDigest([digest_seed; 16]),
     };
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Digest(d)).unwrap()
+    SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Digest(d)).unwrap()
 }
 
 pub fn straggle_msg(k: &SigningKey, round: u64) -> SignedMessage {
@@ -163,12 +163,12 @@ pub fn straggle_msg(k: &SigningKey, round: u64) -> SignedMessage {
         round,
         status: StraggleStatus::Stalled,
     };
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Straggle(s)).unwrap()
+    SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Straggle(s)).unwrap()
 }
 
 pub fn heartbeat_msg(k: &SigningKey, round: u64) -> SignedMessage {
     let h = Heartbeat { round, ready: None };
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Heartbeat(h)).unwrap()
+    SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Heartbeat(h)).unwrap()
 }
 
 /// A heartbeat that also signals model-readiness during `Warmup` (Wave-3 additive `ready` flag).
@@ -177,7 +177,7 @@ pub fn ready_heartbeat_msg(k: &SigningKey, round: u64) -> SignedMessage {
         round,
         ready: Some(true),
     };
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Heartbeat(h)).unwrap()
+    SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Heartbeat(h)).unwrap()
 }
 
 pub fn control(k: &SigningKey, action: ControlAction) -> Signed<ControlRequest> {
@@ -223,7 +223,7 @@ pub fn to_first_round(config: RunConfig, keys: &[SigningKey]) -> CoordinatorStat
 }
 
 /// Count `Output::Publish` matching a predicate on the payload.
-pub fn publishes(outputs: &[Output]) -> Vec<&SwarmMessage> {
+pub fn publishes(outputs: &[Output]) -> Vec<&VhcMessage> {
     outputs
         .iter()
         .filter_map(|o| match o {

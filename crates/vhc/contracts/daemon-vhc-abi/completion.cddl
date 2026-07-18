@@ -9,7 +9,7 @@
 ; test asserts it is machine-valid and that a representative of each variant validates.
 ;
 ; The result-variant set is additive within major 2 (ABI §1.4); unknown `comp-error` codes fail
-; closed (§5.2). Note on byte lengths: matching journal.cddl / daemon-swarm.cddl, `cddl-cat` parses
+; closed (§5.2). Note on byte lengths: matching journal.cddl / daemon-vhc.cddl, `cddl-cat` parses
 ; but does not enforce `.size N`; the fixed-width `bstr .size 32` (a blake3 content hash) carries its
 ; size verbatim from the spec (the Rust codec enforces the actual length).
 

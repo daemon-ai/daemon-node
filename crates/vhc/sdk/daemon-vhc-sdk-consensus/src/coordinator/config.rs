@@ -12,7 +12,7 @@
 
 use crate::assignment::WITNESS_TARGET_DEFAULT;
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
-use daemon_vhc_proto::{CapabilitySet, Hash, PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::{CapabilitySet, Hash, PeerId, VhcProtoVersion};
 use serde::{Deserialize, Serialize};
 
 /// Default K record-absences before a peer is dropped (§6.4 daemon Delta; TDD PROTO-7).
@@ -57,8 +57,8 @@ impl Default for CoordinatorParams {
 pub struct RunConfig {
     /// Run identity (`[run].run_id`).
     pub run_id: String,
-    /// The swarm proto version this run is pinned to (exact-match join gate, §16).
-    pub proto_version: SwarmProtoVersion,
+    /// The vhc proto version this run is pinned to (exact-match join gate, §16).
+    pub proto_version: VhcProtoVersion,
     /// blake3 hash of the frozen envelope (§6.1) — the admission envelope-hash anchor.
     pub envelope_hash: Hash,
     /// The run's required capability set (`[requirements].capabilities`, §6.5).

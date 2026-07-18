@@ -38,7 +38,7 @@ use daemon_vhc_proto::genesis::{
 };
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, GenesisEnvelope, Hash, PeerId, Seed, SignedEnvelope,
-    SigningKey, SWARM_PROTO_VERSION,
+    SigningKey, VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
@@ -186,7 +186,7 @@ fn trainer_role_config() -> Value {
 fn coordinator_role_config() -> Value {
     let run_config = RunConfig {
         run_id: RUN_ID.to_string(),
-        proto_version: SWARM_PROTO_VERSION,
+        proto_version: VHC_PROTO_VERSION,
         envelope_hash: Hash([0u8; 32]),
         required_capabilities: daemon_vhc_proto::CapabilitySet::new(),
         min_peers: 1,

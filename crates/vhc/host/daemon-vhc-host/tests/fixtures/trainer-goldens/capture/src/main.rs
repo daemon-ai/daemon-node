@@ -55,7 +55,7 @@ use daemon_vhc_host::v2::{
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::messages::{
-    BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, SwarmMessage,
+    BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, VhcMessage,
 };
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId, Seed};
 use daemon_vhc_sdk_profiles::{
@@ -344,7 +344,7 @@ fn capture_once(
     let mut seq = 0u64;
     let sender = [9u8; 32];
 
-    let deliver = |msg: &SwarmMessage, seq: &mut u64| {
+    let deliver = |msg: &VhcMessage, seq: &mut u64| {
         let payload = to_canonical_vec(msg).expect("msg");
         assert_eq!(
             pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
@@ -372,7 +372,7 @@ fn capture_once(
         // RoundOpen → train; the guest walks fence -> export -> publishes theta (tag 2) and its
         // commitment voice (tag 3).
         deliver(
-            &SwarmMessage::RoundOpen(RoundOpen {
+            &VhcMessage::RoundOpen(RoundOpen {
                 round,
                 seed: Seed([round as u8; 32]),
                 roster_digest: Hash([0; 32]),
@@ -434,7 +434,7 @@ fn capture_once(
             .expect("stage update");
         let set: Vec<(PeerId, Hash)> = vec![(PeerId(PEER), entry.hash)];
         deliver(
-            &SwarmMessage::RoundRecord(RoundRecord {
+            &VhcMessage::RoundRecord(RoundRecord {
                 round,
                 set: commit_set(&set).commitment(),
                 drops: Vec::new(),

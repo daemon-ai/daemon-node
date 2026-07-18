@@ -10,7 +10,7 @@
 //!
 //! Retention (§7.4, NET-8): [`FsPayloadStore::prune`] deletes objects older than
 //! `payload_retention_rounds`; a subsequent `get`/`head` of a pruned object is a typed
-//! [`SwarmNetError::PayloadMiss`], which the §6.4 stall ladder consumes. The `head` (`stat`) result
+//! [`VhcNetError::PayloadMiss`], which the §6.4 stall ladder consumes. The `head` (`stat`) result
 //! is what the [`ReceiptProducer`](crate::receipt::ReceiptProducer) turns into a signed
 //! `StorageReceipt` (§6.4 I6).
 
@@ -24,7 +24,7 @@ use daemon_vhc_proto::blake3_hash;
 
 use crate::seam::{ContentHash, PayloadKey, RoundId, RunId};
 use crate::transport::{PayloadStat, PayloadStore};
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// A filesystem payload plane with a bounded retention window.
 #[derive(Clone)]
@@ -44,9 +44,9 @@ pub struct FsPayloadStore {
 impl FsPayloadStore {
     /// Open a store rooted at `root`, keeping objects for `retention_rounds` rounds. The root is
     /// created if missing.
-    pub fn open(root: &Path, retention_rounds: u64) -> Result<Self, SwarmNetError> {
+    pub fn open(root: &Path, retention_rounds: u64) -> Result<Self, VhcNetError> {
         let root = ContainedRoot::open(root)
-            .map_err(|e| SwarmNetError::Transport(format!("open payload store root: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("open payload store root: {e}")))?;
         Ok(Self {
             root,
             retention_rounds,
@@ -78,8 +78,8 @@ impl FsPayloadStore {
     /// Delete every object of `run` whose round has fallen outside the retention window relative to
     /// `current_round` (i.e. `round + retention_rounds < current_round`). Returns the number of
     /// round directories removed. A subsequent fetch of a pruned object is a typed
-    /// [`SwarmNetError::PayloadMiss`] (feeds the stall ladder).
-    pub async fn prune(&self, run: &RunId, current_round: RoundId) -> Result<u64, SwarmNetError> {
+    /// [`VhcNetError::PayloadMiss`] (feeds the stall ladder).
+    pub async fn prune(&self, run: &RunId, current_round: RoundId) -> Result<u64, VhcNetError> {
         let _w = self.lock.write().await;
         let run_rel = Self::run_rel(run);
         let entries = match self.root.read_dir(&run_rel).await {
@@ -105,7 +105,7 @@ impl FsPayloadStore {
     }
 
     /// Remove a round directory and all objects beneath it (contained; no symlink traversal).
-    async fn remove_round_dir(&self, round_rel: &Path) -> Result<(), SwarmNetError> {
+    async fn remove_round_dir(&self, round_rel: &Path) -> Result<(), VhcNetError> {
         let children = self
             .root
             .read_dir(round_rel)
@@ -126,7 +126,7 @@ impl FsPayloadStore {
 
 #[async_trait]
 impl PayloadStore for FsPayloadStore {
-    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, SwarmNetError> {
+    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, VhcNetError> {
         let _w = self.lock.write().await;
         let round_rel = Self::round_rel(&key.run, key.round);
         self.root
@@ -140,11 +140,7 @@ impl PayloadStore for FsPayloadStore {
         Ok(blake3_hash(bytes))
     }
 
-    async fn get(
-        &self,
-        key: &PayloadKey,
-        expected: &ContentHash,
-    ) -> Result<Vec<u8>, SwarmNetError> {
+    async fn get(&self, key: &PayloadKey, expected: &ContentHash) -> Result<Vec<u8>, VhcNetError> {
         let _r = self.lock.read().await;
         let bytes = self
             .root
@@ -153,7 +149,7 @@ impl PayloadStore for FsPayloadStore {
             .map_err(|e| miss_or_err("read object", &e, key))?;
         let actual = blake3_hash(&bytes);
         if &actual != expected {
-            return Err(SwarmNetError::HashMismatch {
+            return Err(VhcNetError::HashMismatch {
                 expected: expected.to_hex(),
                 actual: actual.to_hex(),
             });
@@ -161,7 +157,7 @@ impl PayloadStore for FsPayloadStore {
         Ok(bytes)
     }
 
-    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, SwarmNetError> {
+    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, VhcNetError> {
         // A local fs store re-reads to attest the content hash; a network HEAD would carry the size
         // from object metadata and the hash from the commitment (the trait allows either).
         let _r = self.lock.read().await;
@@ -194,16 +190,16 @@ fn parse_round(name: &str) -> Option<RoundId> {
 }
 
 /// Map a `ContainedRoot` io error onto a transport error.
-fn transport_err(op: &str, e: &io::Error) -> SwarmNetError {
-    SwarmNetError::Transport(format!("{op}: {e}"))
+fn transport_err(op: &str, e: &io::Error) -> VhcNetError {
+    VhcNetError::Transport(format!("{op}: {e}"))
 }
 
 /// Map a `ContainedRoot` io error onto a typed miss (NotFound) or a transport error (everything
-/// else). A pruned/never-present object surfaces as [`SwarmNetError::PayloadMiss`] for the stall
+/// else). A pruned/never-present object surfaces as [`VhcNetError::PayloadMiss`] for the stall
 /// ladder.
-fn miss_or_err(op: &str, e: &io::Error, key: &PayloadKey) -> SwarmNetError {
+fn miss_or_err(op: &str, e: &io::Error, key: &PayloadKey) -> VhcNetError {
     if e.kind() == io::ErrorKind::NotFound {
-        SwarmNetError::PayloadMiss(format!(
+        VhcNetError::PayloadMiss(format!(
             "{}@r{}/{}",
             key.run.as_str(),
             key.round,
@@ -251,7 +247,7 @@ mod tests {
         let wrong = blake3_hash(b"different");
         let err = store.get(&k, &wrong).await.unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::HashMismatch { .. }),
+            matches!(err, VhcNetError::HashMismatch { .. }),
             "got {err:?}"
         );
     }
@@ -262,7 +258,7 @@ mod tests {
         let store = FsPayloadStore::open(dir.path(), 8).unwrap();
         let k = key("run-a", 7, 0x33);
         let err = store.get(&k, &blake3_hash(b"x")).await.unwrap_err();
-        assert!(matches!(err, SwarmNetError::PayloadMiss(_)), "got {err:?}");
+        assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -289,6 +285,6 @@ mod tests {
         let removed = store.prune(&k.run, 5).await.unwrap();
         assert_eq!(removed, 1);
         let err = store.get(&k, &hash).await.unwrap_err();
-        assert!(matches!(err, SwarmNetError::PayloadMiss(_)), "got {err:?}");
+        assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
     }
 }

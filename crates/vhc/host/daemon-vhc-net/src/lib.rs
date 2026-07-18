@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-vhc-net` — the swarm transport.
+//! `daemon-vhc-net` — the vhc transport.
 //!
 //! The [`SwarmTransport`](transport) seam (spec §7.1): one control plane
 //! ([`ControlPlane`] — publish/subscribe of already-signed message bytes, with the in-process
@@ -76,12 +76,12 @@ pub use transport::{ControlPlane, ControlSubscription, PayloadStat, PayloadStore
 #[cfg(feature = "ws")]
 pub use ws_client::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
 
-/// Errors surfaced by the swarm transport.
+/// Errors surfaced by the vhc transport.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum SwarmNetError {
+pub enum VhcNetError {
     /// A control-plane or payload-plane transport step failed.
-    #[error("swarm transport error: {0}")]
+    #[error("vhc transport error: {0}")]
     Transport(String),
     /// An artifact fetch (`file`, and later `r2` / `hf` / `https`) failed.
     #[error("artifact fetch failed: {0}")]
@@ -100,7 +100,7 @@ pub enum SwarmNetError {
     #[error("payload miss: {0}")]
     PayloadMiss(String),
     /// A minted presigned URL was already past its `expires_at` (clock skew / a stale cache entry).
-    /// Distinct from [`SwarmNetError::PayloadMiss`]: the object may well exist — the *credential*
+    /// Distinct from [`VhcNetError::PayloadMiss`]: the object may well exist — the *credential*
     /// expired, so the caller must re-request a fresh presign rather than treat the object as gone
     /// (NET-1 `store_presign_expired_rejected`).
     #[error("presigned url expired: {0}")]
@@ -306,7 +306,7 @@ pub(crate) mod mock_r2 {
             Self { server, objects }
         }
 
-        /// The swarm coordinator base URL (`{uri}/api/v1/swarm`).
+        /// The vhc coordinator base URL (`{uri}/api/v1/swarm`).
         pub fn coordinator_base(&self) -> String {
             format!("{}/api/v1/swarm", self.server.uri())
         }

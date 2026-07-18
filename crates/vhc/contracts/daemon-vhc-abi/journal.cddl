@@ -12,7 +12,7 @@
 ; observe `journal_grammar` test encodes a sample of every tag and validates it against this file;
 ; the abi `journal_grammar` test validates the grammar itself parses (machine-valid).
 ;
-; Note on byte lengths: matching daemon-swarm.cddl / daemon-api.cddl, `cddl-cat` parses but does not
+; Note on byte lengths: matching daemon-vhc.cddl / daemon-api.cddl, `cddl-cat` parses but does not
 ; enforce `.size N`; fixed-width byte fields carry their `.size` here verbatim from the spec (the
 ; Rust newtypes enforce the actual length). `hash32` is a 32-byte blake3.
 

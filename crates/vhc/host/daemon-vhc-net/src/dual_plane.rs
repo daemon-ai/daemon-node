@@ -20,7 +20,7 @@ use async_trait::async_trait;
 
 use crate::dedupe::Deduper;
 use crate::transport::{ControlPlane, ControlSubscription};
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// A control plane composed of several inner planes with cross-plane content-hash dedupe.
 pub struct DualPlane {
@@ -69,16 +69,16 @@ impl DualPlane {
 /// receive-side pre-filter must drop. Undecodable / non-`Commitment` frames are never dropped here
 /// (the engine's own `verify_for_run` handles bad frames; only the size policy lives at the edge).
 fn commitment_over_cap(bytes: &[u8], cap: u64) -> bool {
-    use daemon_vhc_proto::messages::SwarmMessage;
+    use daemon_vhc_proto::messages::VhcMessage;
     match daemon_vhc_proto::from_canonical_slice::<daemon_vhc_proto::SignedMessage>(bytes) {
-        Ok(msg) => matches!(&msg.payload, SwarmMessage::Commitment(c) if c.size > cap),
+        Ok(msg) => matches!(&msg.payload, VhcMessage::Commitment(c) if c.size > cap),
         Err(_) => false,
     }
 }
 
 #[async_trait]
 impl ControlPlane for DualPlane {
-    async fn publish(&self, message: &[u8]) -> Result<(), SwarmNetError> {
+    async fn publish(&self, message: &[u8]) -> Result<(), VhcNetError> {
         // Fan out on every plane (a WS + gossip double-send is exactly the redundancy the dual plane
         // is for). Succeed if any plane accepted it; surface the last error only if all failed, so a
         // single degraded plane never fails the publish.
@@ -93,9 +93,8 @@ impl ControlPlane for DualPlane {
         if any_ok {
             Ok(())
         } else {
-            Err(last_err.unwrap_or_else(|| {
-                SwarmNetError::Transport("dual plane has no inner planes".into())
-            }))
+            Err(last_err
+                .unwrap_or_else(|| VhcNetError::Transport("dual plane has no inner planes".into())))
         }
     }
 
@@ -157,15 +156,15 @@ mod tests {
     /// delivery, while an under-cap `Commitment` (and any non-`Commitment` frame) passes.
     #[tokio::test]
     async fn receive_size_cap_drops_oversize_commitment() {
-        use daemon_vhc_proto::messages::{Commitment, SwarmMessage};
-        use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey, SWARM_PROTO_VERSION};
+        use daemon_vhc_proto::messages::{Commitment, VhcMessage};
+        use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey, VHC_PROTO_VERSION};
 
         fn commit_frame(size: u64) -> Vec<u8> {
             let key = SigningKey::from_bytes(&[9u8; 32]);
             let signed = daemon_vhc_proto::SignedMessage::sign(
                 &key,
-                SWARM_PROTO_VERSION,
-                SwarmMessage::Commitment(Commitment {
+                VHC_PROTO_VERSION,
+                VhcMessage::Commitment(Commitment {
                     round: 1,
                     payload: Hash::new([0xab; 32]),
                     size,

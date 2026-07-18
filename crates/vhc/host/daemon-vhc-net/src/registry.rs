@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::presign::{PresignOp, PresignRequest, PresignResponse};
 use crate::seam::RunId;
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// One artifact the run references (name → pinned blake3 + size). Mirrors the cloud `ArtifactRef`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +45,7 @@ pub struct RunDescriptor {
     pub run_id: String,
     /// Envelope schema major (spec §16).
     pub schema: u32,
-    /// The swarm proto version the run is pinned to (§16).
+    /// The vhc proto version the run is pinned to (§16).
     pub proto_version: u32,
     /// blake3 of the frozen envelope bytes (the signed hash), 64 lowercase hex chars.
     pub envelope_hash: String,
@@ -172,23 +172,23 @@ impl RegistryClient {
     }
 
     /// Discover all runs (`GET {base}/runs`).
-    pub async fn list_runs(&self) -> Result<Vec<RunDescriptor>, SwarmNetError> {
+    pub async fn list_runs(&self) -> Result<Vec<RunDescriptor>, VhcNetError> {
         let url = format!("{}/runs", self.base_url);
         let body = self.authed_get(&url).await?;
         let env: DataEnvelope<Vec<RunDescriptor>> = serde_json::from_slice(&body)
-            .map_err(|e| SwarmNetError::Transport(format!("decode run list: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("decode run list: {e}")))?;
         Ok(env.data)
     }
 
     /// Fetch one run descriptor (`GET {base}/runs/:id`); `Ok(None)` on a 404.
-    pub async fn get_run(&self, run_id: &str) -> Result<Option<RunDescriptor>, SwarmNetError> {
+    pub async fn get_run(&self, run_id: &str) -> Result<Option<RunDescriptor>, VhcNetError> {
         let url = format!("{}/runs/{run_id}", self.base_url);
         let req = self.authed_request(EgressRequest::get(&url));
         let resp = self
             .egress
             .execute(req, Redirects::None)
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("get run {run_id}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("get run {run_id}: {e}")))?;
         let status = resp.status();
         if status.as_u16() == 404 {
             return Ok(None);
@@ -196,29 +196,29 @@ impl RegistryClient {
         let body = resp
             .bytes()
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("read run {run_id}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("read run {run_id}: {e}")))?;
         if !status.is_success() {
-            return Err(SwarmNetError::Transport(format!(
+            return Err(VhcNetError::Transport(format!(
                 "get run {run_id} returned {status}: {}",
                 String::from_utf8_lossy(&body)
             )));
         }
         let env: DataEnvelope<RunDescriptor> = serde_json::from_slice(&body)
-            .map_err(|e| SwarmNetError::Transport(format!("decode run {run_id}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("decode run {run_id}: {e}")))?;
         Ok(Some(env.data))
     }
 
     /// Fetch the coordinator run-state projection (`GET {base}/runs/:id/state`), the queryable
     /// surface a rejoining peer reads for the current round + the latest checkpoint pointer (spec
     /// §9; lane R). `Ok(None)` on a 404 (run not initialized).
-    pub async fn fetch_state(&self, run_id: &str) -> Result<Option<RunState>, SwarmNetError> {
+    pub async fn fetch_state(&self, run_id: &str) -> Result<Option<RunState>, VhcNetError> {
         let url = format!("{}/runs/{run_id}/state", self.base_url);
         let req = self.authed_request(EgressRequest::get(&url));
         let resp = self
             .egress
             .execute(req, Redirects::None)
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("get state {run_id}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("get state {run_id}: {e}")))?;
         let status = resp.status();
         if status.as_u16() == 404 {
             return Ok(None);
@@ -226,14 +226,14 @@ impl RegistryClient {
         let body = resp
             .bytes()
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("read state {run_id}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("read state {run_id}: {e}")))?;
         if !status.is_success() {
-            return Err(SwarmNetError::Transport(format!(
+            return Err(VhcNetError::Transport(format!(
                 "get state {run_id} returned {status}"
             )));
         }
         let env: DataEnvelope<RunState> = serde_json::from_slice(&body)
-            .map_err(|e| SwarmNetError::Transport(format!("decode state {run_id}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("decode state {run_id}: {e}")))?;
         Ok(Some(env.data))
     }
 
@@ -247,18 +247,18 @@ impl RegistryClient {
         round: u64,
         hash: &str,
         size: u64,
-    ) -> Result<(), SwarmNetError> {
+    ) -> Result<(), VhcNetError> {
         let url = format!("{}/runs/{run_id}/checkpoint", self.base_url);
         let body = serde_json::json!({ "round": round, "hash": hash, "size": size });
         let ereq = EgressRequest::post_json(&url, &body)
-            .map_err(|e| SwarmNetError::Transport(format!("encode checkpoint pointer: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("encode checkpoint pointer: {e}")))?;
         let resp = self
             .egress
             .execute(self.authed_request(ereq), Redirects::None)
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("publish checkpoint {run_id}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("publish checkpoint {run_id}: {e}")))?;
         if !resp.status().is_success() {
-            return Err(SwarmNetError::Transport(format!(
+            return Err(VhcNetError::Transport(format!(
                 "publish checkpoint {run_id} returned {}",
                 resp.status()
             )));
@@ -269,13 +269,13 @@ impl RegistryClient {
     /// Fetch the frozen envelope for `run` and **blake3-verify** it against `descriptor.envelope_hash`.
     ///
     /// Presigns a `GET` of the run-relative `envelope.cbor` artifact (§11.3), downloads the bytes via
-    /// [`EgressClient`], and rejects a hash mismatch as [`SwarmNetError::HashMismatch`] (the tamper
+    /// [`EgressClient`], and rejects a hash mismatch as [`VhcNetError::HashMismatch`] (the tamper
     /// path, §12) — so a registry that served the wrong envelope can never reach `AssessRun`.
     pub async fn fetch_envelope(
         &self,
         run: &RunId,
         descriptor: &RunDescriptor,
-    ) -> Result<Vec<u8>, SwarmNetError> {
+    ) -> Result<Vec<u8>, VhcNetError> {
         let presigned = self
             .presign(
                 run,
@@ -288,20 +288,20 @@ impl RegistryClient {
             .egress
             .get(&presigned.url, Redirects::None)
             .await
-            .map_err(|e| SwarmNetError::Fetch(format!("fetch envelope: {e}")))?;
+            .map_err(|e| VhcNetError::Fetch(format!("fetch envelope: {e}")))?;
         let status = resp.status();
         let body = resp
             .bytes()
             .await
-            .map_err(|e| SwarmNetError::Fetch(format!("read envelope body: {e}")))?;
+            .map_err(|e| VhcNetError::Fetch(format!("read envelope body: {e}")))?;
         if !status.is_success() {
-            return Err(SwarmNetError::Fetch(format!(
+            return Err(VhcNetError::Fetch(format!(
                 "envelope fetch returned {status}"
             )));
         }
         let got = blake3_hash(&body[..]).to_hex();
         if got != descriptor.envelope_hash {
-            return Err(SwarmNetError::HashMismatch {
+            return Err(VhcNetError::HashMismatch {
                 expected: descriptor.envelope_hash.clone(),
                 actual: got,
             });
@@ -314,45 +314,45 @@ impl RegistryClient {
         &self,
         run: &RunId,
         req: &PresignRequest,
-    ) -> Result<PresignResponse, SwarmNetError> {
+    ) -> Result<PresignResponse, VhcNetError> {
         let url = format!("{}/runs/{}/presign", self.base_url, run.as_str());
         let ereq = EgressRequest::post_json(&url, req)
-            .map_err(|e| SwarmNetError::Transport(format!("encode presign request: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("encode presign request: {e}")))?;
         let resp = self
             .egress
             .execute(self.authed_request(ereq), Redirects::DEFAULT)
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("presign request: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("presign request: {e}")))?;
         let status = resp.status();
         let body = resp
             .bytes()
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("read presign body: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("read presign body: {e}")))?;
         if !status.is_success() {
-            return Err(SwarmNetError::Transport(format!(
+            return Err(VhcNetError::Transport(format!(
                 "presign endpoint returned {status}: {}",
                 String::from_utf8_lossy(&body)
             )));
         }
         serde_json::from_slice(&body)
-            .map_err(|e| SwarmNetError::Transport(format!("decode presign response: {e}")))
+            .map_err(|e| VhcNetError::Transport(format!("decode presign response: {e}")))
     }
 
     /// Issue an authed GET and return the body bytes (2xx only).
-    async fn authed_get(&self, url: &str) -> Result<Vec<u8>, SwarmNetError> {
+    async fn authed_get(&self, url: &str) -> Result<Vec<u8>, VhcNetError> {
         let req = self.authed_request(EgressRequest::get(url));
         let resp = self
             .egress
             .execute(req, Redirects::None)
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("registry GET {url}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("registry GET {url}: {e}")))?;
         let status = resp.status();
         let body = resp
             .bytes()
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("read {url}: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("read {url}: {e}")))?;
         if !status.is_success() {
-            return Err(SwarmNetError::Transport(format!(
+            return Err(VhcNetError::Transport(format!(
                 "registry GET {url} returned {status}"
             )));
         }

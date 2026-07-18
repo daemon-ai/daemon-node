@@ -8,7 +8,7 @@
 //! plane + a shared [`FsPayloadStore`], plus the [`crate::wasm_coordinator_shell`] recording drive
 //! around the `coordinator-quorum` module. It collects every peer's [`EngineEvent`] and the
 //! coordinator's driving trace, and drives the **churn/failure drills** over the same machinery via
-//! the extended [`SwarmConfig`]:
+//! the extended [`VhcConfig`]:
 //!
 //! - [`StallFault`] — a single peer misses one object for N gets (the §6.4 stall ladder);
 //! - [`StoreOutage`] — a peer's whole-round `get`s are denied for a window (store outage);
@@ -34,7 +34,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use daemon_vhc_net::{
-    ControlPlane, FsPayloadStore, LoopbackGossip, PayloadStat, PayloadStore, SwarmNetError,
+    ControlPlane, FsPayloadStore, LoopbackGossip, PayloadStat, PayloadStore, VhcNetError,
 };
 use daemon_vhc_observe::{
     digest_tally, logged_round_records, replay_capture, DesyncVerdict, MessageLog, ObserveError,
@@ -44,7 +44,7 @@ use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_vhc_proto::messages::{RecordEntry, RoundRecord};
 use daemon_vhc_proto::{
     from_canonical_slice, peer_id, CapabilitySet, Hash, PeerId, Seed, SignedMessage, SigningKey,
-    SwarmMessage, SwarmProtoVersion, SWARM_PROTO_VERSION,
+    VhcMessage, VhcProtoVersion, VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorParams, CoordinatorState, RunConfig};
 
@@ -52,7 +52,7 @@ use crate::backend::{StateDigest, StubBackend, TrainerBackend};
 use crate::checkpoint::CheckpointManifest;
 use crate::engine::{EngineConfig, EngineEvent, RoundEngine};
 use crate::seam::{PayloadKey, RoundId, RunId};
-use crate::SwarmRunError;
+use crate::VhcRunError;
 
 pub use crate::wasm_coordinator_shell::CoordinatorReplay;
 
@@ -67,7 +67,7 @@ enum Fault {
 /// A [`PayloadStore`] wrapper that injects deterministic, wall-clock-independent fetch faults to
 /// drive the §6.4 stall ladder / store-outage drills (TEST-ONLY).
 ///
-/// The faulted `get`s return a typed [`SwarmNetError::PayloadMiss`] for their first `n` calls (the
+/// The faulted `get`s return a typed [`VhcNetError::PayloadMiss`] for their first `n` calls (the
 /// stalling peer's prefetch + barrier attempts), then delegate — so a subsequent cross-round
 /// catch-up attempt succeeds. All other keys (and `put`/`head`) delegate unchanged.
 pub struct FaultyStore {
@@ -130,13 +130,13 @@ impl FaultyStore {
 
 #[async_trait]
 impl PayloadStore for FaultyStore {
-    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<Hash, SwarmNetError> {
+    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<Hash, VhcNetError> {
         self.inner.put(key, bytes).await
     }
 
-    async fn get(&self, key: &PayloadKey, expected: &Hash) -> Result<Vec<u8>, SwarmNetError> {
+    async fn get(&self, key: &PayloadKey, expected: &Hash) -> Result<Vec<u8>, VhcNetError> {
         if self.should_miss(key) {
-            return Err(SwarmNetError::PayloadMiss(format!(
+            return Err(VhcNetError::PayloadMiss(format!(
                 "injected miss for {}@r{}/{}",
                 key.run.as_str(),
                 key.round,
@@ -146,7 +146,7 @@ impl PayloadStore for FaultyStore {
         self.inner.get(key, expected).await
     }
 
-    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, SwarmNetError> {
+    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, VhcNetError> {
         self.inner.head(key).await
     }
 }
@@ -195,9 +195,9 @@ pub struct LateJoin {
     pub resume_round: RoundId,
 }
 
-/// Configuration for an in-process swarm run.
+/// Configuration for an in-process vhc run.
 #[derive(Clone, Debug)]
-pub struct SwarmConfig {
+pub struct VhcConfig {
     /// Number of peers admitted at run start.
     pub num_peers: usize,
     /// Total number of rounds the coordinator drives (`[data].stop = Rounds(num_rounds)`).
@@ -234,7 +234,7 @@ pub struct SwarmConfig {
     pub typed_checkpoints: bool,
 }
 
-impl Default for SwarmConfig {
+impl Default for VhcConfig {
     fn default() -> Self {
         Self {
             num_peers: 3,
@@ -257,7 +257,7 @@ impl Default for SwarmConfig {
     }
 }
 
-impl SwarmConfig {
+impl VhcConfig {
     /// A small, fault-free default (3 peers, `num_rounds` rounds).
     #[must_use]
     pub fn small(num_rounds: u64) -> Self {
@@ -280,10 +280,10 @@ impl SwarmConfig {
     }
 }
 
-/// The collected outcome of a swarm run: every `(peer, event)` the engines emitted, the coordinator
+/// The collected outcome of a vhc run: every `(peer, event)` the engines emitted, the coordinator
 /// replay, and (for the drills) the shared store + captured round records.
 #[derive(Clone)]
-pub struct SwarmRun {
+pub struct VhcRun {
     /// The sorted bootstrap roster (node identities).
     pub roster: Vec<PeerId>,
     /// Every emitted event, tagged with the peer that emitted it (collection order).
@@ -301,7 +301,7 @@ pub struct SwarmRun {
     pub message_log: MessageLog,
 }
 
-impl SwarmRun {
+impl VhcRun {
     /// The digest each peer reported for each round (from `RoundComplete` or `CaughtUp`).
     #[must_use]
     pub fn digests_by_round(&self) -> BTreeMap<RoundId, BTreeMap<PeerId, StateDigest>> {
@@ -319,7 +319,7 @@ impl SwarmRun {
     }
 
     /// The single agreed digest per round (the first digest seen for that round). Pair with
-    /// [`SwarmRun::all_agree`] to assert every peer matched it.
+    /// [`VhcRun::all_agree`] to assert every peer matched it.
     #[must_use]
     pub fn agreed_transcript(&self) -> BTreeMap<RoundId, StateDigest> {
         self.digests_by_round()
@@ -411,7 +411,7 @@ impl SwarmRun {
 
     /// Write the `daemon-vhc-observe` artifacts for this run into `dir` (the `--observe <dir>`
     /// gate-ceremony instrumentation): `<run_id>.dsmlog` (the node-visible [`MessageLog`]) and, if a
-    /// coordinator replay was captured, `<run_id>.dsmcap` (the [`RunCapture`] `swarm-replay` verifies).
+    /// coordinator replay was captured, `<run_id>.dsmcap` (the [`RunCapture`] the replay oracle verifies).
     ///
     /// # Errors
     ///
@@ -457,26 +457,26 @@ impl ObserveVerify {
     }
 }
 
-/// Replay + verify the `daemon-vhc-observe` artifacts written by [`SwarmRun::write_observe`] into
-/// `dir` (the `swarm-replay` entry point): re-derive the recorded [`RunCapture`] inside the
+/// Replay + verify the `daemon-vhc-observe` artifacts written by [`VhcRun::write_observe`] into
+/// `dir` (the replay entry point): re-derive the recorded [`RunCapture`] inside the
 /// sandboxed `coordinator-quorum` module (never a native tick) and assert its `RoundRecord`s
 /// re-derive byte-identically against the independent wire [`MessageLog`] (§6.4 I1 / PROTO-20). Also
 /// projects [`RunHealth`] from the log.
 ///
 /// # Errors
 ///
-/// [`SwarmRunError::Lifecycle`] if the artifacts are missing/corrupt, or if the replay diverges
+/// [`VhcRunError::Lifecycle`] if the artifacts are missing/corrupt, or if the replay diverges
 /// (the first divergent round is included in the message).
 // Reads back the artifacts `write_observe` wrote to an operator-supplied gate directory (same
 // dev/gate-only, not-attacker-influenced rationale as `write_observe`).
 #[allow(clippy::disallowed_methods)]
-pub fn verify_observe_dir(dir: &std::path::Path) -> Result<ObserveVerify, SwarmRunError> {
+pub fn verify_observe_dir(dir: &std::path::Path) -> Result<ObserveVerify, VhcRunError> {
     let mut cap_path = None;
     for entry in std::fs::read_dir(dir)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("observe dir {}: {e}", dir.display())))?
+        .map_err(|e| VhcRunError::Lifecycle(format!("observe dir {}: {e}", dir.display())))?
     {
         let path = entry
-            .map_err(|e| SwarmRunError::Lifecycle(format!("observe dir entry: {e}")))?
+            .map_err(|e| VhcRunError::Lifecycle(format!("observe dir entry: {e}")))?
             .path();
         if path.extension().is_some_and(|e| e == "dsmcap") {
             cap_path = Some(path);
@@ -484,26 +484,26 @@ pub fn verify_observe_dir(dir: &std::path::Path) -> Result<ObserveVerify, SwarmR
         }
     }
     let cap_path = cap_path.ok_or_else(|| {
-        SwarmRunError::Lifecycle(format!("no .dsmcap capture in {}", dir.display()))
+        VhcRunError::Lifecycle(format!("no .dsmcap capture in {}", dir.display()))
     })?;
     let log_path = cap_path.with_extension("dsmlog");
 
     let mut cap_file = std::fs::File::open(&cap_path)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("open {}: {e}", cap_path.display())))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("open {}: {e}", cap_path.display())))?;
     let capture = RunCapture::read_from(&mut cap_file)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("read capture: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("read capture: {e}")))?;
     let mut log_file = std::fs::File::open(&log_path)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("open {}: {e}", log_path.display())))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("open {}: {e}", log_path.display())))?;
     let log = MessageLog::read_from(&mut log_file)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("read log: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("read log: {e}")))?;
 
     let logged_records = logged_round_records(&log);
     let health = RunHealth::from_log(&log);
     // Re-derive inside the real coordinator module : consensus never runs natively, even here.
     let sandbox = crate::replay_sandbox::WasmCoordinatorSandbox::from_built_guest()
-        .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator sandbox: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("coordinator sandbox: {e}")))?;
     let report = replay_capture(&sandbox, capture, &log)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("replay diverged: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("replay diverged: {e}")))?;
     Ok(ObserveVerify {
         run_id: log.run_id().to_string(),
         rounds_verified: report.rounds_verified,
@@ -539,7 +539,7 @@ impl CollectorStop {
 /// synchronously, the drain-on-stop then deterministically captures the complete wire history.
 pub(crate) fn spawn_message_log<C: ControlPlane>(
     control: &Arc<C>,
-    version: SwarmProtoVersion,
+    version: VhcProtoVersion,
     log: Arc<std::sync::Mutex<MessageLog>>,
 ) -> CollectorStop {
     let mut sub = control.subscribe();
@@ -585,7 +585,7 @@ pub fn peer_key(i: usize) -> SigningKey {
 pub const EXPERIMENT_CONFIG: &[u8] = b"e2e-experiment-config";
 
 /// Build the coordinator's resolved [`RunConfig`] for an in-process run of `cfg`.
-pub(crate) fn build_run_config(run: &RunId, cfg: &SwarmConfig) -> RunConfig {
+pub(crate) fn build_run_config(run: &RunId, cfg: &VhcConfig) -> RunConfig {
     // Global batch = max-roster × steps × micro-batch, so the per-peer (class-equal) partition is
     // non-empty for every roster size the run will see (bootstrap and post-late-join).
     let g =
@@ -600,7 +600,7 @@ pub(crate) fn build_run_config(run: &RunId, cfg: &SwarmConfig) -> RunConfig {
     };
     RunConfig {
         run_id: run.as_str().to_string(),
-        proto_version: SWARM_PROTO_VERSION,
+        proto_version: VHC_PROTO_VERSION,
         envelope_hash: Hash([0u8; 32]),
         required_capabilities: CapabilitySet::new(),
         min_peers: cfg.min_peers(),
@@ -632,7 +632,7 @@ pub(crate) fn peer_store(
     fs: &Arc<FsPayloadStore>,
     run: &RunId,
     peer_ids: &[PeerId],
-    cfg: &SwarmConfig,
+    cfg: &VhcConfig,
     i: usize,
 ) -> Arc<FaultyStore> {
     if let Some(f) = cfg.fault {
@@ -654,10 +654,10 @@ pub(crate) fn peer_store(
     Arc::new(FaultyStore::transparent(fs.clone()))
 }
 
-/// Run an in-process swarm (N peers + the real coordinator `tick`) for `cfg.num_rounds` rounds over
+/// Run an in-process vhc (N peers + the real coordinator `tick`) for `cfg.num_rounds` rounds over
 /// the deterministic [`StubBackend`]. Deterministic: same `cfg` → byte-identical digest transcript.
-pub async fn run_swarm(cfg: SwarmConfig) -> Result<SwarmRun, SwarmRunError> {
-    run_swarm_with(cfg, |_i| {
+pub async fn run_vhc(cfg: VhcConfig) -> Result<VhcRun, VhcRunError> {
+    run_vhc_with(cfg, |_i| {
         let mut backend = StubBackend::new();
         backend
             .build(EXPERIMENT_CONFIG)
@@ -667,19 +667,16 @@ pub async fn run_swarm(cfg: SwarmConfig) -> Result<SwarmRun, SwarmRunError> {
     .await
 }
 
-/// Like [`run_swarm`], but each peer's [`TrainerBackend`] is produced by `make_backend(index)` — so
+/// Like [`run_vhc`], but each peer's [`TrainerBackend`] is produced by `make_backend(index)` — so
 /// tests can inject an instrumented backend (barrier assertion, desync injection). The factory MUST
 /// return an already-`build`-ed backend (base snapshot set from the shared config).
-pub async fn run_swarm_with<B, F>(
-    cfg: SwarmConfig,
-    make_backend: F,
-) -> Result<SwarmRun, SwarmRunError>
+pub async fn run_vhc_with<B, F>(cfg: VhcConfig, make_backend: F) -> Result<VhcRun, VhcRunError>
 where
     B: TrainerBackend + Send + Sync + 'static,
     F: Fn(usize) -> B,
 {
     let run = RunId::new("e2e-run");
-    let version = SWARM_PROTO_VERSION;
+    let version = VHC_PROTO_VERSION;
 
     // Bootstrap peer identities + the (larger) full roster including any late joiner.
     let boot_keys: Vec<SigningKey> = (0..cfg.num_peers).map(peer_key).collect();
@@ -698,7 +695,7 @@ where
     let gossip = Arc::new(LoopbackGossip::new());
 
     let root = std::env::temp_dir().join(format!(
-        "daemon-swarm-e2e-{}-{}",
+        "daemon-vhc-e2e-{}-{}",
         std::process::id(),
         fastcounter()
     ));
@@ -707,7 +704,7 @@ where
     let (col_tx, mut col_rx) = unbounded_channel::<(PeerId, EngineEvent)>();
     let mut peer_handles: BTreeMap<
         PeerId,
-        JoinHandle<Result<crate::engine::RunOutcome, SwarmRunError>>,
+        JoinHandle<Result<crate::engine::RunOutcome, VhcRunError>>,
     > = BTreeMap::new();
     let mut fwd_handles: Vec<JoinHandle<()>> = Vec::new();
 
@@ -738,7 +735,7 @@ where
     let rec_handle = spawn_record_collector(&gossip, version, records.clone());
 
     // The observe message-log collector: capture every verified signed message (arrival order) into
-    // a shared `MessageLog` — the `--observe` audit artifact + the `swarm-replay` oracle source.
+    // a shared `MessageLog` — the `--observe` audit artifact + the replay oracle source.
     let obs_log = Arc::new(std::sync::Mutex::new(MessageLog::new(run.as_str())));
     let obs_handle = spawn_message_log(&gossip, version, obs_log.clone());
 
@@ -782,7 +779,7 @@ where
     coord_run_config.round_witness_s = phase;
     coord_run_config.cooldown_s = phase;
     let coord_state = CoordinatorState::new(coord_run_config, Seed([0xAB; 32]), 0);
-    let coord_handle: JoinHandle<Result<CoordinatorReplay, SwarmRunError>> = {
+    let coord_handle: JoinHandle<Result<CoordinatorReplay, VhcRunError>> = {
         let shell_cfg = crate::wasm_coordinator_shell::WasmCoordinatorShellConfig {
             run: run.clone(),
             version,
@@ -915,7 +912,7 @@ where
     let records = records.lock().expect("records lock").clone();
     let message_log = obs_log.lock().expect("observe log lock").clone();
 
-    Ok(SwarmRun {
+    Ok(VhcRun {
         roster: boot_roster,
         events,
         replay,
@@ -936,14 +933,14 @@ fn launch_engine<B>(
     key: SigningKey,
     corpus: &Arc<crate::data::Corpus>,
     run: &RunId,
-    version: SwarmProtoVersion,
-    cfg: &SwarmConfig,
+    version: VhcProtoVersion,
+    cfg: &VhcConfig,
     roster: Vec<PeerId>,
     resume: Option<CheckpointManifest>,
     col_tx: &UnboundedSender<(PeerId, EngineEvent)>,
 ) -> (
     PeerId,
-    JoinHandle<Result<crate::engine::RunOutcome, SwarmRunError>>,
+    JoinHandle<Result<crate::engine::RunOutcome, VhcRunError>>,
     JoinHandle<()>,
 )
 where
@@ -1003,7 +1000,7 @@ where
 /// [`CollectorStop::stop`] (same drain-on-stop rationale as [`spawn_message_log`]).
 fn spawn_record_collector(
     gossip: &Arc<LoopbackGossip>,
-    version: SwarmProtoVersion,
+    version: VhcProtoVersion,
     records: Arc<std::sync::Mutex<BTreeMap<RoundId, Vec<RecordEntry>>>>,
 ) -> CollectorStop {
     let mut sub = gossip.subscribe();
@@ -1016,7 +1013,7 @@ fn spawn_record_collector(
             if msg.verify_for_run(version).is_err() {
                 return;
             }
-            if let SwarmMessage::RoundRecord(RoundRecord {
+            if let VhcMessage::RoundRecord(RoundRecord {
                 round,
                 inline: Some(entries),
                 ..

@@ -9,7 +9,7 @@
 // is the first registered fusion and the template for future entries. This gate pins the shared
 // ABI vocabulary (the `required ⊆ advertised` contract, coordinated with C1's compute@2 track by
 // vocabulary rather than shared code) and the registry's admission behaviour. CPU-deterministic
-// (no wasm host, no GPU, no network) — a `swarm-ci-det` citizen.
+// (no wasm host, no GPU, no network) — a `vhc-ci-det` citizen.
 
 use daemon_vhc_abi::{
     host_supports_custom_op, AbiRefusalCode, CUSTOM_OP_FLASH_ATTN_V1, HOST_CUSTOM_OPS,

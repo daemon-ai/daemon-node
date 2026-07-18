@@ -54,7 +54,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::dedupe::Deduper;
 use crate::transport::{ControlPlane, ControlSubscription};
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// The connected client WebSocket stream (TLS for `wss://`, plain for `ws://`).
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -105,7 +105,7 @@ impl Default for ReconnectConfig {
 /// Construction surface for [`WsControlPlane`] (frozen at Merge 1).
 #[derive(Clone, Debug)]
 pub struct WsConfig {
-    /// The swarm coordinator base URL (spec §11.1), e.g. `https://api.daemon.ai/api/v1/swarm` (the
+    /// The vhc coordinator base URL (spec §11.1), e.g. `https://api.daemon.ai/api/v1/swarm` (the
     /// gateway) or `http://127.0.0.1:8795/api/v1/swarm` (a bare `wrangler dev`). The `base_url` swap
     /// (gateway ↔ wrangler-dev ↔ mock) is trivial by design — only this field changes.
     pub base_url: String,
@@ -155,7 +155,7 @@ impl WsControlPlane {
     /// Dial the coordinator and spawn the background connection task. The **first** connection is
     /// established eagerly so a bad endpoint / rejected auth fails fast; subsequent drops are
     /// covered by the reconnect loop.
-    pub async fn connect(config: WsConfig) -> Result<Self, SwarmNetError> {
+    pub async fn connect(config: WsConfig) -> Result<Self, VhcNetError> {
         let endpoint = config.endpoint();
         let initial = dial(&endpoint, &config.auth).await?;
         // The initial connection is live before the task spawns; count it synchronously so
@@ -237,7 +237,7 @@ impl Drop for WsControlPlane {
 
 #[async_trait]
 impl ControlPlane for WsControlPlane {
-    async fn publish(&self, message: &[u8]) -> Result<(), SwarmNetError> {
+    async fn publish(&self, message: &[u8]) -> Result<(), VhcNetError> {
         // Dedupe + self-deliver under the lock: a frame already seen (e.g. arrived via gossip, or a
         // WS+gossip double-send) is a no-op; the DO never echoes our own frame back, so self-deliver
         // keeps the contract identical to Loopback/Iroh (publish reaches our own subscriber once).
@@ -251,7 +251,7 @@ impl ControlPlane for WsControlPlane {
         }
         self.outbound_tx
             .send(message.to_vec())
-            .map_err(|_| SwarmNetError::Transport("ws control plane closed".into()))?;
+            .map_err(|_| VhcNetError::Transport("ws control plane closed".into()))?;
         Ok(())
     }
 
@@ -397,15 +397,15 @@ fn ensure_crypto_provider() {
 }
 
 /// Dial the coordinator WS endpoint with the auth headers applied (TLS auto-selected for `wss://`).
-async fn dial(endpoint: &str, auth: &WsAuth) -> Result<WsStream, SwarmNetError> {
+async fn dial(endpoint: &str, auth: &WsAuth) -> Result<WsStream, VhcNetError> {
     ensure_crypto_provider();
     let mut request = endpoint
         .into_client_request()
-        .map_err(|e| SwarmNetError::Transport(format!("bad ws url {endpoint}: {e}")))?;
+        .map_err(|e| VhcNetError::Transport(format!("bad ws url {endpoint}: {e}")))?;
     apply_auth(request.headers_mut(), auth);
     let (stream, _resp) = connect_async(request)
         .await
-        .map_err(|e| SwarmNetError::Transport(format!("ws connect {endpoint}: {e}")))?;
+        .map_err(|e| VhcNetError::Transport(format!("ws connect {endpoint}: {e}")))?;
     Ok(stream)
 }
 

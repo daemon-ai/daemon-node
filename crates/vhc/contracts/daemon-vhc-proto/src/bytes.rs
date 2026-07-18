@@ -6,7 +6,7 @@
 //! Each serializes as a CBOR **byte string** (`bstr`) via `serialize_bytes`, so the CDDL declares
 //! them as `bstr` and the on-wire form is compact (a raw array of `uint` would be both larger and a
 //! worse CDDL). Length is enforced Rust-side on deserialize; `cddl-cat` does not check `.size`, so
-//! the newtype is the length authority (see `daemon-swarm.cddl`).
+//! the newtype is the length authority (see `daemon-vhc.cddl`).
 
 use core::fmt;
 

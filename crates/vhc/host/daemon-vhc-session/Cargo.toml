@@ -10,21 +10,21 @@ path = "src/lib.rs"
 
 # The recorded-run verification entry point stays a LIBRARY capability
 # (`harness::verify_observe_dir`, exercised by the observe gate): it re-derives a recorded run
-# through the sandboxed coordinator module. The standalone `swarm-replay` dev binary folded onto the
+# through the sandboxed coordinator module. The standalone `replay` dev binary folded onto the
 # v2 substrate as the `daemon-vhc-sim` `replay_check` example (D-5) — no stub/native runnable survives.
 
 [features]
 # `harness` exposes the in-process multi-peer test harness + the real `daemon-vhc-coordinator`
 # pure `tick` loop driver (the impure shell that signs/publishes the coordinator's unsigned
 # RoundOpen/RoundRecord outputs and feeds it signed peer messages + StorageReceipt evidence + scripted
-# Clock inputs) to external crates. Kept out of the default build; the `tests/daemon-swarm-e2e` crate
+# Clock inputs) to external crates. Kept out of the default build; the `tests/daemon-vhc-e2e` crate
 # enables it. The crate's own unit tests reach the harness via `cfg(test)` (no feature needed).
 harness = ["dep:daemon-vhc-observe"]
 # (Phase-E sunset cleanup) The `iroh` feature is GONE: it layered the live-transport harness
 # (`live_harness`) on `harness`, and that harness retired with the v1 driver at the sunset (it
 # drove the v1 WasmBackend over the engine). The passthrough kept "external `--features iroh`
 # invocations valid" — a back-compat accommodation the ratified no-backcompat posture removes;
-# its only in-repo invoker was `daemon-swarm-e2e`'s equally dead `iroh` feature.
+# its only in-repo invoker was `daemon-vhc-e2e`'s equally dead `iroh` feature.
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
@@ -79,7 +79,7 @@ xxhash-rust = { workspace = true }
 # Same as the coordinator: the `cfg(test)` harness build uses observe's `digest_tally` / `DesyncVerdict`
 # (the desync trigger) even with the `harness` feature off.
 daemon-vhc-observe = { workspace = true }
-# The `[swarm]` config-section extraction test (§10.6) layers a figment the way the node config does;
+# The `[vhc]` config-section extraction test (§10.6) layers a figment the way the node config does;
 # `test` adds `figment::Jail` for hermetic env fixtures. Test-only — the struct itself is serde-only.
 figment = { workspace = true, features = ["test"] }
 

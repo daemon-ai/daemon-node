@@ -34,7 +34,7 @@
 //!
 //! [`Section`] is CBOR-identical to the v1 update-container wire (the host's `SectionWire`:
 //! externally-tagged `Bytes`/`Tensor{data, shape}`), so a payload sealed by this crate decodes
-//! under a v1 ingest and vice versa — the profile owns both ends, and the swarm never parses
+//! under a v1 ingest and vice versa — the profile owns both ends, and the vhc never parses
 //! payloads (opaque by invariant).
 
 use serde::{Deserialize, Serialize};

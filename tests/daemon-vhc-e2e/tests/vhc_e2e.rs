@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Stub swarm end-to-end record/replay (spec §6.4).
+//! Stub vhc end-to-end record/replay (spec §6.4).
 //!
 //! N = 3 peers over `LoopbackGossip` + a shared `FsPayloadStore` + the deterministic
 //! `StubBackend`, coordinated by the production `coordinator-quorum` module (the harness's
@@ -10,11 +10,11 @@
 //! ladder). The recorded run is then re-derived offline through the SAME content-addressed
 //! module (`verify_observe_dir`) — the gate-ceremony record + replay path.
 
-use daemon_vhc_session::harness::{run_swarm, verify_observe_dir, StallFault, SwarmConfig};
+use daemon_vhc_session::harness::{run_vhc, verify_observe_dir, StallFault, VhcConfig};
 
 /// The 20-round, 3-peer scenario with a stall at round 7 and catch-up at round 8.
-fn scenario() -> SwarmConfig {
-    SwarmConfig {
+fn scenario() -> VhcConfig {
+    VhcConfig {
         num_rounds: 20,
         fault: Some(StallFault {
             // Peer 1 cannot fetch peer 0's round-7 payload for its first 2 gets (prefetch +
@@ -24,11 +24,11 @@ fn scenario() -> SwarmConfig {
             round: 7,
             first_n_gets: 2,
         }),
-        ..SwarmConfig::small(20)
+        ..VhcConfig::small(20)
     }
 }
 
-/// `--observe` records the run (message log + replay capture) and `swarm-replay` re-derives every
+/// `--observe` records the run (message log + replay capture) and `replay` re-derives every
 /// round record byte-identically (`verify_observe_dir`) — the gate-ceremony record + replay path.
 ///
 /// The run is recorded by driving the production `coordinator-quorum` module — the SAME
@@ -38,7 +38,7 @@ fn scenario() -> SwarmConfig {
 /// recording or verification).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observe_record_and_replay_green() {
-    let run = run_swarm(scenario()).await.expect("swarm run");
+    let run = run_vhc(scenario()).await.expect("vhc run");
     assert!(
         run.all_agree(),
         "peers agree so the digest tally is unanimous"
@@ -60,7 +60,7 @@ async fn observe_record_and_replay_green() {
         );
     }
 
-    // Write the artifacts, then replay + verify them offline (what `swarm-replay <dir>` does).
+    // Write the artifacts, then replay + verify them offline (what `replay <dir>` does).
     let dir = std::env::temp_dir().join(format!(
         "daemon-vhc-observe-e2e-{}-{}",
         std::process::id(),

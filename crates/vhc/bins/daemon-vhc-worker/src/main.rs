@@ -58,7 +58,7 @@ async fn main() {
     // fleet-staging entry point (replaces P2's scp pre-staging). Like DAEMON_TRAIN_PROBE, it runs on
     // a bare box with no CBOR framing.
     if std::env::var_os("DAEMON_TRAIN_PREFETCH").is_some() {
-        #[cfg(feature = "swarm-net")]
+        #[cfg(feature = "vhc-net")]
         {
             if let Err(e) = backend::prefetch_main().await {
                 eprintln!("daemon-vhc-worker: prefetch FAILED: {e}");
@@ -66,11 +66,11 @@ async fn main() {
             }
             return;
         }
-        #[cfg(not(feature = "swarm-net"))]
+        #[cfg(not(feature = "vhc-net"))]
         {
             eprintln!(
                 "daemon-vhc-worker: DAEMON_TRAIN_PREFETCH needs a worker built with \
-                 `--features swarm-net` (the store fetch path)"
+                 `--features vhc-net` (the store fetch path)"
             );
             std::process::exit(1);
         }

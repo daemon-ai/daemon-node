@@ -6,12 +6,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "The node-side swarm-training service: durable swarm.db state, worker supervision, and the SwarmApi surface."
+description = "The node-side vhc-training service: durable vhc.db state, worker supervision, and the SwarmApi surface."
 
 [dependencies]
 # The SwarmApi trait + wire DTOs + NodeEvent this service implements / emits (spec §10.4).
 daemon-api = { workspace = true }
-# The frozen worker protocol (Event/Command/Hardware/Eligibility) + the `[swarm]` config type.
+# The frozen worker protocol (Event/Command/Hardware/Eligibility) + the `[vhc]` config type.
 daemon-vhc-session = { workspace = true }
 # Run discovery + frozen-envelope fetch (A1): the `RegistryClient` (registry `GET /runs`,
 # envelope presign+GET+blake3-verify) the `EgressRunDiscovery` seam wraps, so the join flow runs the
@@ -26,10 +26,10 @@ tokio-stream = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
-# swarm.db stores policy/eligibility as JSON and the windowed event log as JSON blobs.
+# vhc.db stores policy/eligibility as JSON and the windowed event log as JSON blobs.
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-# swarm.db: a separate SQLite file (spec §10.3), mirroring the daemon-auth `auth.db` precedent —
+# vhc.db: a separate SQLite file (spec §10.3), mirroring the daemon-auth `auth.db` precedent —
 # bundled amalgamation + PRAGMA user_version migrations via rusqlite_migration.
 rusqlite = { version = "0.37", features = ["bundled"] }
 rusqlite_migration = { workspace = true }

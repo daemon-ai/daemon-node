@@ -59,7 +59,7 @@ pub mod replay_sandbox;
 
 /// The wasm-coordinator recording drive for the in-process whole-run harness: drives the
 /// production `coordinator-quorum` module (event-driven, one tick per frame) instead of a native
-/// tick, so a recorded run and its `swarm-replay` re-derivation share one coordinator substrate.
+/// tick, so a recorded run and its `replay` re-derivation share one coordinator substrate.
 /// Behind the `harness` feature (needs the host runtime), and this crate's own tests.
 #[cfg(any(test, feature = "harness"))]
 pub mod wasm_coordinator_shell;
@@ -82,15 +82,15 @@ pub use seam::BatchId;
 /// Errors surfaced by the participant runtime.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum SwarmRunError {
+pub enum VhcRunError {
     /// The transport (control or payload plane) failed.
     #[error(transparent)]
-    Net(#[from] daemon_vhc_net::SwarmNetError),
+    Net(#[from] daemon_vhc_net::VhcNetError),
     /// The data pipeline (manifest / batch mapping) failed.
     #[error(transparent)]
     Data(#[from] data::DataError),
     /// A round-lifecycle invariant was violated (warmup, digest, or checkpoint step).
-    #[error("swarm run lifecycle error: {0}")]
+    #[error("vhc run lifecycle error: {0}")]
     Lifecycle(String),
 }
 
@@ -100,13 +100,13 @@ mod tests {
 
     #[test]
     fn wraps_net_errors() {
-        let err: SwarmRunError = daemon_vhc_net::SwarmNetError::Transport("gossip".into()).into();
+        let err: VhcRunError = daemon_vhc_net::VhcNetError::Transport("gossip".into()).into();
         assert!(err.to_string().contains("gossip"));
     }
 
     #[test]
     fn wraps_data_errors() {
-        let err: SwarmRunError = data::DataError::EmptyManifest.into();
+        let err: VhcRunError = data::DataError::EmptyManifest.into();
         assert!(err.to_string().contains("no shards"));
     }
 }

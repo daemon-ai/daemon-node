@@ -1,15 +1,15 @@
 # Self-hosted iroh relay — dev ops (lane B2)
 
-The swarm control plane is **iroh gossip**, mandatory for every peer (spec §7.1). Gossip's
-sub-4 KB signed messages traverse NAT via **iroh relays**; for the public swarm the relay URLs are
+The vhc control plane is **iroh gossip**, mandatory for every peer (spec §7.1). Gossip's
+sub-4 KB signed messages traverse NAT via **iroh relays**; for the public vhc the relay URLs are
 **pinned in the run envelope** (spec §7.4 — Psyche only ever hardcoded hostnames; we do better).
 This directory ships a dev runner that stands one up locally for LAN/loopback testing.
 
 ## Run it
 
 ```
-nix develop --command crates/swarm/daemon-swarm-net/dev/run-relay.sh        # http://localhost:3340
-IROH_RELAY_PORT=4455 nix develop --command crates/swarm/daemon-swarm-net/dev/run-relay.sh
+nix develop --command crates/vhc/host/daemon-vhc-net/dev/run-relay.sh        # http://localhost:3340
+IROH_RELAY_PORT=4455 nix develop --command crates/vhc/host/daemon-vhc-net/dev/run-relay.sh
 ```
 
 The devShell ships the `iroh-relay` 1.0 binary (flake Wave-0 lane). Point clients at the printed

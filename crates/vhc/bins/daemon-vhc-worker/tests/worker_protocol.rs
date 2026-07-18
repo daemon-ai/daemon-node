@@ -46,7 +46,7 @@ fn guests_root() -> PathBuf {
 }
 
 fn guest_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SWARM_TEST_GUEST_DIR") {
+    if let Ok(dir) = std::env::var("VHC_TEST_GUEST_DIR") {
         return PathBuf::from(dir);
     }
     guests_root().join("target/wasm32-unknown-unknown/release")
@@ -104,7 +104,7 @@ static BUILD: Once = Once::new();
 
 fn ensure_built() {
     BUILD.call_once(|| {
-        if std::env::var("SWARM_TEST_GUEST_DIR").is_ok() {
+        if std::env::var("VHC_TEST_GUEST_DIR").is_ok() {
             verify_guest_manifest(&guest_dir());
             return;
         }
@@ -470,17 +470,17 @@ async fn supervisor_probe_reports_major2_worlds_and_custom_ops() {
     sup.shutdown().await;
 }
 
-/// WS6 regression (the crash-loop meltdown fix): the shipped `[swarm]` config default names the
+/// WS6 regression (the crash-loop meltdown fix): the shipped `[vhc]` config default names the
 /// REAL worker binary, and a binary of that name speaks `Event::Ready` when the supervisor spawns
 /// it. Before the v1-retirement the default was `"daemon-vhc"` — the Wave-0 scaffold that printed a
-/// version line and exited, so a stock `[swarm] enabled` node crash-looped its supervisor on spawn
+/// version line and exited, so a stock `[vhc] enabled` node crash-looped its supervisor on spawn
 /// (the negative half of this contract is the `supervisor_meltdown` unit test over a bogus path).
 /// `Worker::spawn` blocks on `Event::Ready`, so a successful `probe()` here proves the configured
 /// default resolves to a `Ready`-speaking worker, not a self-exiting stub.
 #[tokio::test]
 async fn configured_default_worker_path_names_a_binary_that_speaks_ready() {
     // The product default the node feeds to `TrainClientConfig::new` (bins/daemon/src/main.rs).
-    let default_path = daemon_vhc_session::config::SwarmConfig::default().worker_path;
+    let default_path = daemon_vhc_session::config::VhcConfig::default().worker_path;
     assert_eq!(
         default_path, "daemon-vhc-worker",
         "the shipped default must name the real worker binary, not the retired `daemon-vhc` scaffold"

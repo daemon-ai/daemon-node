@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! [`SwarmService`] — the resident node-side swarm-training service (spec §10.3/§10.4).
+//! [`VhcService`] — the resident node-side vhc-training service (spec §10.3/§10.4).
 //!
 //! It owns a worker-control seam ([`WorkerControl`], implemented for `daemon-vhc-supervisor`'s
-//! `TrainSupervisor`), the durable [`SwarmStore`] (`swarm.db`), and a broadcast of [`SwarmEvent`]s.
+//! `TrainSupervisor`), the durable [`VhcStore`] (`vhc.db`), and a broadcast of [`SwarmEvent`]s.
 //! It:
 //!
 //! - Translates worker [`protocol::Event`]s into [`SwarmEvent`]s, persists them to the windowed log, folds contribution counters, broadcasts to `swarm_subscribe`, and emits a payload-free [`NodeEvent::SwarmChanged`] pointer onto the node feed (§10.4).
-//! - Drives **durable-intent re-convergence** on [`start`](SwarmService::start): re-issues `JoinRun` for every persisted active join-intent so a restart rejoins without app involvement (§10.3).
-//! - Is **OFF by default** (`[swarm] enabled = false`): a disabled service never touches the worker, so no training worker is ever spawned unless swarm is enabled.
+//! - Drives **durable-intent re-convergence** on [`start`](VhcService::start): re-issues `JoinRun` for every persisted active join-intent so a restart rejoins without app involvement (§10.3).
+//! - Is **OFF by default** (`[vhc] enabled = false`): a disabled service never touches the worker, so no training worker is ever spawned unless vhc is enabled.
 //! - Implements [`SwarmApi`], mapping requests → worker commands + store reads (eligibility is node-computed from the worker probe/assess and mirrored, ADR-003 — the app never re-derives it).
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +21,7 @@ use daemon_api::{
     SwarmEventStream, SwarmHardwareReport, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode,
     SwarmRunDetail, SwarmRunSummary,
 };
-use daemon_vhc_session::config::SwarmConfig;
+use daemon_vhc_session::config::VhcConfig;
 use daemon_vhc_session::protocol::{
     self, Eligibility, Hardware, JoinPolicy, LeaveMode, PolicyMode,
 };
@@ -35,9 +35,9 @@ use crate::arbiter::{
     AdmitRefusal, ClaimTiers, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId, TierBytes,
 };
 use crate::discovery::RunDiscovery;
-use crate::store::{DesiredState, PersistedRun, StoreError, SwarmStore, EVENT_WINDOW};
+use crate::store::{DesiredState, PersistedRun, StoreError, VhcStore, EVENT_WINDOW};
 
-/// A node-feed sink: the node passes a closure over `NodeEventFeed::emit` so live swarm updates ride
+/// A node-feed sink: the node passes a closure over `NodeEventFeed::emit` so live vhc updates ride
 /// the existing `events_subscribe` channel as `SwarmChanged` pointers (no new transport).
 pub type NodeFeed = Arc<dyn Fn(NodeEvent) + Send + Sync>;
 
@@ -47,10 +47,10 @@ pub type NodeFeed = Arc<dyn Fn(NodeEvent) + Send + Sync>;
 /// fresh `TrainSupervisor`; tests hand out recording fakes.
 pub type WorkerFactory = Arc<dyn Fn() -> Arc<dyn WorkerControl> + Send + Sync>;
 
-/// A swarm-service error.
+/// A vhc-service error.
 #[derive(Debug, thiserror::Error)]
-pub enum SwarmError {
-    /// A `swarm.db` error.
+pub enum VhcError {
+    /// A `vhc.db` error.
     #[error("store: {0}")]
     Store(#[from] StoreError),
     /// A worker-control failure (mapped from the supervisor).
@@ -64,19 +64,19 @@ pub enum SwarmError {
     /// D6 — the admission funnel's last, supreme stage; the owner can always refuse).
     #[error("owner arbitration refused the join: {0}")]
     Resources(#[from] AdmitRefusal),
-    /// The swarm service is disabled (`[swarm] enabled = false`).
-    #[error("swarm is disabled")]
+    /// The vhc service is disabled (`[vhc] enabled = false`).
+    #[error("vhc is disabled")]
     Disabled,
 }
 
-impl SwarmError {
+impl VhcError {
     fn worker(e: impl std::fmt::Display) -> Self {
         Self::Worker(e.to_string())
     }
 
     fn to_api(&self) -> ApiError {
         match self {
-            SwarmError::Disabled => ApiError::Unsupported("swarm is disabled".into()),
+            VhcError::Disabled => ApiError::Unsupported("vhc is disabled".into()),
             other => ApiError::Other(other.to_string()),
         }
     }
@@ -88,9 +88,9 @@ impl SwarmError {
 #[async_trait]
 pub trait WorkerControl: Send + Sync {
     /// Probe hardware + capability vocabulary (§10.2).
-    async fn probe(&self) -> Result<Hardware, SwarmError>;
+    async fn probe(&self) -> Result<Hardware, VhcError>;
     /// Assess a run envelope against effective resources (§6.5) — the eligibility source.
-    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, SwarmError>;
+    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, VhcError>;
     /// Join a run.
     async fn join(
         &self,
@@ -98,7 +98,7 @@ pub trait WorkerControl: Send + Sync {
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
-    ) -> Result<(), SwarmError>;
+    ) -> Result<(), VhcError>;
     /// Join a run and return the **continuous** worker event stream (A3 event pump). The default
     /// delegates to [`join`](Self::join) and returns an already-closed receiver, so test fakes and
     /// non-streaming workers keep the pre-A3 behavior; `TrainSupervisor` overrides it with the real
@@ -109,20 +109,20 @@ pub trait WorkerControl: Send + Sync {
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
-    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, SwarmError> {
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, VhcError> {
         self.join(run_id, coordinator, credentials, policy).await?;
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(rx)
     }
     /// Leave a run.
-    async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), SwarmError>;
+    async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), VhcError>;
     /// Push a GPU-governor throttle lever (§10.5).
     async fn throttle(
         &self,
         vram_cap_mb: Option<u32>,
         duty_cycle_pct: Option<u8>,
         paused: bool,
-    ) -> Result<(), SwarmError>;
+    ) -> Result<(), VhcError>;
     /// Initiate a live module upgrade for a running instance (ABI §10.3; architecture §5.4) — the
     /// node command surface for `SwitchModule`. The run-level upgrade record has already committed
     /// to the transition chain (deliverable 1); this drives the LOCAL half of the transaction on
@@ -137,9 +137,9 @@ pub trait WorkerControl: Send + Sync {
         new_module: [u8; 32],
         grants_hash: [u8; 32],
         deadline_ms: u64,
-    ) -> Result<SwitchOutcome, SwarmError> {
+    ) -> Result<SwitchOutcome, VhcError> {
         let _ = (run_id, epoch, role, new_module, grants_hash, deadline_ms);
-        Err(SwarmError::Worker(
+        Err(VhcError::Worker(
             "switch_module unsupported by this worker".into(),
         ))
     }
@@ -150,15 +150,13 @@ pub trait WorkerControl: Send + Sync {
 
 #[async_trait]
 impl WorkerControl for TrainSupervisor {
-    async fn probe(&self) -> Result<Hardware, SwarmError> {
-        TrainSupervisor::probe(self)
-            .await
-            .map_err(SwarmError::worker)
+    async fn probe(&self) -> Result<Hardware, VhcError> {
+        TrainSupervisor::probe(self).await.map_err(VhcError::worker)
     }
-    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, SwarmError> {
+    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, VhcError> {
         TrainSupervisor::assess(self, envelope)
             .await
-            .map_err(SwarmError::worker)
+            .map_err(VhcError::worker)
     }
     async fn join(
         &self,
@@ -166,10 +164,10 @@ impl WorkerControl for TrainSupervisor {
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
-    ) -> Result<(), SwarmError> {
+    ) -> Result<(), VhcError> {
         TrainSupervisor::join(self, run_id, coordinator, credentials, policy)
             .await
-            .map_err(SwarmError::worker)
+            .map_err(VhcError::worker)
     }
     async fn join_streaming(
         &self,
@@ -177,25 +175,25 @@ impl WorkerControl for TrainSupervisor {
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
-    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, SwarmError> {
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, VhcError> {
         TrainSupervisor::join_streaming(self, run_id, coordinator, credentials, policy)
             .await
-            .map_err(SwarmError::worker)
+            .map_err(VhcError::worker)
     }
-    async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), SwarmError> {
+    async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), VhcError> {
         TrainSupervisor::leave(self, run_id, mode)
             .await
-            .map_err(SwarmError::worker)
+            .map_err(VhcError::worker)
     }
     async fn throttle(
         &self,
         vram_cap_mb: Option<u32>,
         duty_cycle_pct: Option<u8>,
         paused: bool,
-    ) -> Result<(), SwarmError> {
+    ) -> Result<(), VhcError> {
         TrainSupervisor::throttle(self, vram_cap_mb, duty_cycle_pct, paused)
             .await
-            .map_err(SwarmError::worker)
+            .map_err(VhcError::worker)
     }
     async fn switch_module(
         &self,
@@ -205,7 +203,7 @@ impl WorkerControl for TrainSupervisor {
         new_module: [u8; 32],
         grants_hash: [u8; 32],
         deadline_ms: u64,
-    ) -> Result<SwitchOutcome, SwarmError> {
+    ) -> Result<SwitchOutcome, VhcError> {
         TrainSupervisor::switch_module(
             self,
             run_id,
@@ -216,21 +214,21 @@ impl WorkerControl for TrainSupervisor {
             deadline_ms,
         )
         .await
-        .map_err(SwarmError::worker)
+        .map_err(VhcError::worker)
     }
     async fn shutdown(&self) {
         TrainSupervisor::shutdown(self).await;
     }
 }
 
-/// Construction parts for a [`SwarmService`].
-pub struct SwarmServiceParts {
-    /// The `[swarm]` config (spec §10.6); `enabled` gates all worker activity.
-    pub config: SwarmConfig,
-    /// The durable `swarm.db` store.
-    pub store: SwarmStore,
+/// Construction parts for a [`VhcService`].
+pub struct VhcServiceParts {
+    /// The `[vhc]` config (spec §10.6); `enabled` gates all worker activity.
+    pub config: VhcConfig,
+    /// The durable `vhc.db` store.
+    pub store: VhcStore,
     /// The default worker-control seam (a real `TrainSupervisor` in production) — the probe
-    /// surface, and the shared child when no [`SwarmServiceParts::worker_factory`] is set.
+    /// surface, and the shared child when no [`VhcServiceParts::worker_factory`] is set.
     pub worker: Arc<dyn WorkerControl>,
     /// The node-feed sink for `SwarmChanged` pointers (`None` on a headless / test build).
     pub feed: Option<NodeFeed>,
@@ -253,10 +251,10 @@ struct InstanceEntry {
     worker: Arc<dyn WorkerControl>,
 }
 
-/// The node-side swarm-training service.
-pub struct SwarmService {
-    config: SwarmConfig,
-    store: SwarmStore,
+/// The node-side vhc-training service.
+pub struct VhcService {
+    config: VhcConfig,
+    store: VhcStore,
     worker: Arc<dyn WorkerControl>,
     discovery: Option<Arc<dyn RunDiscovery>>,
     /// The D6 owner arbiter: every join is admitted against the aggregate typed ledgers before
@@ -270,18 +268,18 @@ pub struct SwarmService {
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
     /// don't carry a run id (`RoundProgress`/`RoundOutcome`/…).
     current_run: Mutex<Option<String>>,
-    /// The coalescing swarm-feed revision stamped on each `SwarmChanged` pointer.
+    /// The coalescing vhc-feed revision stamped on each `SwarmChanged` pointer.
     rev: AtomicU64,
     /// The service's own `Arc` handle (A3), bound post-construction via [`bind_self`](Self::bind_self)
     /// so `swarm_join`/`start` can spawn a detached event-pump task that outlives the `&self` call.
     /// Unbound (test builds) → the non-streaming `join` path, drained-and-dropped.
-    me: std::sync::OnceLock<std::sync::Weak<SwarmService>>,
+    me: std::sync::OnceLock<std::sync::Weak<VhcService>>,
 }
 
-impl SwarmService {
+impl VhcService {
     /// Build a service. The worker is never touched until [`start`](Self::start) / an API call, and
     /// only when `config.enabled`.
-    pub fn new(parts: SwarmServiceParts) -> Self {
+    pub fn new(parts: VhcServiceParts) -> Self {
         let (events_tx, _) = broadcast::channel(1024);
         Self {
             config: parts.config,
@@ -307,7 +305,7 @@ impl SwarmService {
     /// Bind the service's own `Arc` handle (A3 event pump), mirroring the node's `set_swarm`
     /// post-`Arc` binder. After this, `swarm_join` / `start` drive `join_streaming` + a detached pump
     /// task feeding the worker's continuous event stream into [`handle_worker_event`](Self::handle_worker_event)
-    /// → `NodeEvent::SwarmChanged`, so `swarm.db` reflects live round progression (§10.3/§10.4).
+    /// → `NodeEvent::SwarmChanged`, so `vhc.db` reflects live round progression (§10.3/§10.4).
     /// Idempotent; never bound → the non-streaming join path (unchanged, for tests).
     pub fn bind_self(self: &Arc<Self>) {
         let _ = self.me.set(Arc::downgrade(self));
@@ -322,7 +320,7 @@ impl SwarmService {
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
-    ) -> Result<(), SwarmError> {
+    ) -> Result<(), VhcError> {
         let rx = self
             .worker
             .join_streaming(run_id, coordinator, credentials, policy)
@@ -352,13 +350,13 @@ impl SwarmService {
         }
     }
 
-    /// Whether swarm training is enabled.
+    /// Whether vhc training is enabled.
     pub fn enabled(&self) -> bool {
         self.config.enabled
     }
 
     /// The durable store (test/observability access).
-    pub fn store(&self) -> &SwarmStore {
+    pub fn store(&self) -> &VhcStore {
         &self.store
     }
 
@@ -374,7 +372,7 @@ impl SwarmService {
     /// never blocks the rest of re-convergence. The persisted incarnation is retained (a process
     /// restart retains the logical instance id, decisions D1); only a genuinely new
     /// role-instance mints a new one.
-    pub async fn start(&self) -> Result<usize, SwarmError> {
+    pub async fn start(&self) -> Result<usize, VhcError> {
         if !self.config.enabled {
             return Ok(0);
         }
@@ -420,7 +418,7 @@ impl SwarmService {
                     .set_execution_identity(&run.run_id, id.epoch, &id.role, id.instance)?;
             }
             // A3: re-issue via the streaming path + pump so a re-converged run resumes reporting
-            // live round progression into swarm.db (durable-intent re-convergence, §10.3).
+            // live round progression into vhc.db (durable-intent re-convergence, §10.3).
             let rx = match worker
                 .join_streaming(
                     run.run_id.clone(),
@@ -542,7 +540,7 @@ impl SwarmService {
     /// Translate + persist + fan out a worker event (spec §10.3 "all are persisted / fanned out by
     /// the node"). Returns the [`SwarmEvent`]s emitted (0..2 per worker event). B3 wires the live
     /// worker event stream into this; W1 tests drive it directly.
-    pub fn handle_worker_event(&self, ev: &protocol::Event) -> Result<Vec<SwarmEvent>, SwarmError> {
+    pub fn handle_worker_event(&self, ev: &protocol::Event) -> Result<Vec<SwarmEvent>, VhcError> {
         // Track the current run + persist phase from a RunPhase.
         if let protocol::Event::RunPhase {
             run_id,
@@ -599,7 +597,7 @@ impl SwarmService {
         Ok(emitted)
     }
 
-    fn emit(&self, sev: SwarmEvent, out: &mut Vec<SwarmEvent>) -> Result<(), SwarmError> {
+    fn emit(&self, sev: SwarmEvent, out: &mut Vec<SwarmEvent>) -> Result<(), VhcError> {
         self.store.append_event(&sev)?;
         // A send error only means "no live subscribers"; the durable log already has it.
         let _ = self.events_tx.send(sev.clone());
@@ -627,11 +625,11 @@ impl SwarmService {
         }
     }
 
-    fn require_enabled(&self) -> Result<(), SwarmError> {
+    fn require_enabled(&self) -> Result<(), VhcError> {
         if self.config.enabled {
             Ok(())
         } else {
-            Err(SwarmError::Disabled)
+            Err(VhcError::Disabled)
         }
     }
 
@@ -655,12 +653,12 @@ impl SwarmService {
         &self,
         worker: &Arc<dyn WorkerControl>,
         run_id: &str,
-    ) -> Result<(String, SwarmEligibility), SwarmError> {
+    ) -> Result<(String, SwarmEligibility), VhcError> {
         if let Some(discovery) = &self.discovery {
             let run = discovery
                 .get_run(run_id)
                 .await?
-                .ok_or_else(|| SwarmError::Discovery(format!("run {run_id} not found")))?;
+                .ok_or_else(|| VhcError::Discovery(format!("run {run_id} not found")))?;
             let envelope = discovery.fetch_envelope(run_id).await?;
             let verdict = worker.assess(envelope).await?;
             Ok((run.coordinator, eligibility_from_assess(&verdict)))
@@ -680,17 +678,17 @@ impl SwarmService {
 }
 
 #[async_trait]
-impl SwarmApi for SwarmService {
+impl SwarmApi for VhcService {
     async fn swarm_run_list(&self) -> Result<Vec<SwarmRunSummary>, ApiError> {
         let runs = self
             .store
             .list_runs()
-            .map_err(|e| SwarmError::from(e).to_api())?;
+            .map_err(|e| VhcError::from(e).to_api())?;
         Ok(runs.into_iter().map(run_summary).collect())
     }
 
     async fn swarm_run_detail(&self, run_id: String) -> Result<Option<SwarmRunDetail>, ApiError> {
-        let map = |e: StoreError| SwarmError::from(e).to_api();
+        let map = |e: StoreError| VhcError::from(e).to_api();
         let Some(run) = self.store.get_run(&run_id).map_err(map)? else {
             return Ok(None);
         };
@@ -753,7 +751,7 @@ impl SwarmApi for SwarmService {
                 let persisted = self
                     .store
                     .get_run(&run_id)
-                    .map_err(|e| SwarmError::from(e).to_api())?;
+                    .map_err(|e| VhcError::from(e).to_api())?;
                 let (epoch, role, persisted_instance, run_hash) = persisted
                     .as_ref()
                     .filter(|r| r.desired_state == DesiredState::Joined)
@@ -777,19 +775,19 @@ impl SwarmApi for SwarmService {
                     } else {
                         self.store
                             .mint_incarnation()
-                            .map_err(|e| SwarmError::from(e).to_api())?
+                            .map_err(|e| VhcError::from(e).to_api())?
                     },
                 };
                 let charge = self.derive_charge(&eligibility, &policy);
                 let priority = self
                     .store
                     .run_priority(&run_id)
-                    .map_err(|e| SwarmError::from(e).to_api())?;
+                    .map_err(|e| VhcError::from(e).to_api())?;
                 if let Err(refusal) = self.admit_placed(&id, charge, priority) {
                     if fresh_child {
                         worker.shutdown().await;
                     }
-                    return Err(SwarmError::from(refusal).to_api());
+                    return Err(VhcError::from(refusal).to_api());
                 }
                 id
             }
@@ -805,14 +803,14 @@ impl SwarmApi for SwarmService {
                     worker.shutdown().await;
                 }
             }
-            return Err(SwarmError::from(e).to_api());
+            return Err(VhcError::from(e).to_api());
         }
         let _ = self
             .store
             .set_execution_identity(&run_id, id.epoch, &id.role, id.instance);
 
         // A3: join over the streaming path + pump the continuous worker event stream into
-        // `handle_worker_event` so swarm.db reflects live round progression (§10.3/§10.4). The
+        // `handle_worker_event` so vhc.db reflects live round progression (§10.3/§10.4). The
         // opaque `JoinRun.credentials` the worker's live attach parses (§2 of the A3 ledger) are
         // authored where the node identity + roster are known (the e2e / boot join_and_pump path);
         // an API-initiated join with no authored credentials keeps the worker's self-driven round
@@ -857,7 +855,7 @@ impl SwarmApi for SwarmService {
         self.require_enabled().map_err(|e| e.to_api())?;
         self.store
             .set_desired_state(&run_id, DesiredState::Left)
-            .map_err(|e| SwarmError::from(e).to_api())?;
+            .map_err(|e| VhcError::from(e).to_api())?;
         let entry = self.instances.lock().unwrap().remove(&run_id);
         let worker = entry
             .as_ref()
@@ -881,7 +879,7 @@ impl SwarmApi for SwarmService {
         self.require_enabled().map_err(|e| e.to_api())?;
         // W1: push the governor levers to the worker (§10.5) — and, under multi-instance
         // supervision, to every live role-instance child (the owner lever is host-wide). The
-        // persisted default-policy slot for future joins is the config `[swarm].default_policy`;
+        // persisted default-policy slot for future joins is the config `[vhc].default_policy`;
         // a durable override lands with the policy store in a later wave.
         let vram = Some(policy.vram_cap_mb);
         let duty = Some(policy.duty_cycle_pct.min(100) as u8);

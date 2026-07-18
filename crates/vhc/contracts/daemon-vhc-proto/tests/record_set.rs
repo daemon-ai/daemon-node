@@ -8,7 +8,7 @@ use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::messages::{Locator, RecordEntry, RoundRecord};
 use daemon_vhc_proto::{to_canonical_vec, Hash, PeerId, RecordSet, Root, Seed};
 
-const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-swarm.cddl"));
+const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-vhc.cddl"));
 
 fn peer(n: u8) -> PeerId {
     PeerId([n; 32])

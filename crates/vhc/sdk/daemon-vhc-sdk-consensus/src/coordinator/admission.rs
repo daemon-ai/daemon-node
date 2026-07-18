@@ -15,7 +15,7 @@
 //! passes `None` and skips the check (back-compat).
 
 use daemon_vhc_proto::messages::Join;
-use daemon_vhc_proto::{CapabilitySet, Hash, PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::{CapabilitySet, Hash, PeerId, VhcProtoVersion};
 
 use crate::coordinator::config::RunConfig;
 use crate::coordinator::io::AdmissionReject;
@@ -28,7 +28,7 @@ pub struct JoinCandidate<'a> {
     /// The join's signer (node identity).
     pub peer: PeerId,
     /// The signed frame's proto version.
-    pub version: SwarmProtoVersion,
+    pub version: VhcProtoVersion,
     /// The join payload.
     pub join: &'a Join,
     /// An asserted envelope hash to check against the run (`None` skips the check).

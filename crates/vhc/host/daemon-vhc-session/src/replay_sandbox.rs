@@ -40,7 +40,7 @@ use daemon_vhc_abi::{CandidateDriver, STOP_REASON_RUN_COMPLETE};
 use daemon_vhc_host::v2::{start_run, DeliverVerdict, MemorySink, RunIdentity, V2RunConfig};
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_observe::{CoordinatorSandbox, ReplayError};
-use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, SignedMessage, SwarmMessage};
+use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, SignedMessage, VhcMessage};
 use daemon_vhc_sdk_consensus::coordinator::CoordinatorState;
 
 /// Frame delivery / drain deadline: a re-derivation that has not drained by here is a sandbox fault.
@@ -49,7 +49,7 @@ const RUN_DEADLINE: Duration = Duration::from_secs(60);
 const DRAIN_QUIET: Duration = Duration::from_millis(300);
 /// Fixed key seed for the coordinator's frame signer: the replay oracle compares the module's
 /// published `RoundRecord` **payloads**, never their transport signatures, so any seed serves.
-const FRAME_KEY_SEED: &[u8] = b"daemon-swarm/observe/replay-sandbox/coordinator-frame-key";
+const FRAME_KEY_SEED: &[u8] = b"daemon-vhc/observe/replay-sandbox/coordinator-frame-key";
 
 /// A [`CoordinatorSandbox`] backed by the production `coordinator-quorum` wasm module running under
 /// the real major-2 host driver.
@@ -83,7 +83,7 @@ impl CoordinatorSandbox for WasmCoordinatorSandbox {
         initial: &CoordinatorState,
         messages: &[SignedMessage],
         expected_records: usize,
-    ) -> Result<Vec<SwarmMessage>, ReplayError> {
+    ) -> Result<Vec<VhcMessage>, ReplayError> {
         let sandbox = |detail: String| ReplayError::Sandbox(detail);
 
         let module_hash = *blake3::hash(&self.wasm).as_bytes();
@@ -197,26 +197,26 @@ fn count_records(published: &[(u64, u64, Vec<u8>)]) -> usize {
     published
         .iter()
         .filter_map(|(_, _, frame)| decode_frame(frame))
-        .filter(|m| matches!(m, SwarmMessage::RoundRecord(_)))
+        .filter(|m| matches!(m, VhcMessage::RoundRecord(_)))
         .count()
 }
 
 /// Decode a publish stream (`(channel, seq, signed-frame bytes)`) into ordered messages.
-fn decode_published(published: &[(u64, u64, Vec<u8>)]) -> Result<Vec<SwarmMessage>, String> {
+fn decode_published(published: &[(u64, u64, Vec<u8>)]) -> Result<Vec<VhcMessage>, String> {
     published
         .iter()
         .map(|(_, _, frame)| decode_frame(frame).ok_or_else(|| "undecodable publish frame".into()))
         .collect()
 }
 
-/// Decode one `[envelope, payload, sig]` signed frame's payload into a [`SwarmMessage`].
-fn decode_frame(frame: &[u8]) -> Option<SwarmMessage> {
+/// Decode one `[envelope, payload, sig]` signed frame's payload into a [`VhcMessage`].
+fn decode_frame(frame: &[u8]) -> Option<VhcMessage> {
     let v: Value = ciborium::de::from_reader(frame).ok()?;
     let Value::Array(parts) = v else { return None };
     let Value::Bytes(payload) = parts.get(1)? else {
         return None;
     };
-    from_canonical_slice::<SwarmMessage>(payload).ok()
+    from_canonical_slice::<VhcMessage>(payload).ok()
 }
 
 /// The guests workspace root (`crates/vhc/guests`).

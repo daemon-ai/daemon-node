@@ -145,7 +145,7 @@ impl SignedAttestation {
         }
     }
 
-    /// Project onto the control-plane wire form (`SwarmMessage::CheckpointAttestation`) — the E3
+    /// Project onto the control-plane wire form (`VhcMessage::CheckpointAttestation`) — the E3
     /// coordinator-flow carrier. Field-for-field; the inner signature rides verbatim.
     #[must_use]
     pub fn to_wire(&self) -> WireAttestation {

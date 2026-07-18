@@ -31,7 +31,7 @@ use crate::bytes::{PeerId, Signature};
 use crate::hash::blake3_hash;
 use crate::sign::verify_bytes;
 
-/// The digest length (bytes) of the `sys@2::hash` primitive — blake3-256, the swarm's universal
+/// The digest length (bytes) of the `sys@2::hash` primitive — blake3-256, the vhc's universal
 /// content-address width (`hash.rs`, architecture §3.4). Fixed here so host and guest agree on the
 /// output span without negotiating it.
 pub const HASH_LEN: usize = 32;
@@ -72,7 +72,7 @@ impl VerifyOutcome {
 /// `sys@2::hash` — the blake3-256 content hash of `data`.
 ///
 /// The one normative definition shared by the host accel and the in-guest fallback. Delegates to
-/// [`blake3_hash`] (the swarm's content-address function) so there is exactly one hash on both
+/// [`blake3_hash`] (the vhc's content-address function) so there is exactly one hash on both
 /// sides of the boundary.
 #[must_use]
 pub fn hash(data: &[u8]) -> [u8; HASH_LEN] {

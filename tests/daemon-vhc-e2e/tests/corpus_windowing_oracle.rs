@@ -12,7 +12,7 @@
 // asserted equal over the same inputs, including the wrap-around and windowed-residency edges.
 //
 // This leaf test crate is the one place host-side (session) and SDK-side code may link together
-// (tracked exception, e2e Cargo.toml). Tier-1: runs in `swarm-ci-det`'s e2e suite (no iroh/live).
+// (tracked exception, e2e Cargo.toml). Tier-1: runs in `vhc-ci-det`'s e2e suite (no iroh/live).
 
 use std::collections::BTreeMap;
 

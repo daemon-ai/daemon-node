@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `local_swarm` — the local-mode swarm developer runnable, on the v2 (vhc-sim) substrate.
+//! `local_run` — the local-mode vhc developer runnable, on the v2 (vhc-sim) substrate.
 //!
 //! Runs N native SPARTA-shaped averager peers (`daemon_vhc_sim::toys::SparseAverager`) over the
 //! virtual worlds — a whole run of timer-driven gossip that converges to the exact global mean —
-//! and prints the per-peer transcript. This is the successor to the retired `swarm-local --backend
+//! and prints the per-peer transcript. This is the successor to the retired local-mode dev runner (`--backend
 //! stub` dev runner: no native/stub consensus path survives as a standalone binary; the local-run
 //! developer experience lives here as a vhc-sim example on the v2 substrate (the SPARTA whole run
 //! whose wasm twin runs under the host testkit).
 //!
-//! Usage: `cargo run -p daemon-vhc-sim --example local_swarm -- [PEERS] [TICKS]`.
+//! Usage: `cargo run -p daemon-vhc-sim --example local_run -- [PEERS] [TICKS]`.
 
 use daemon_vhc_sim::toys::SparseAverager;
 use daemon_vhc_sim::{RunLimits, Simulator, Trace, VirtualNet};
@@ -33,7 +33,7 @@ fn main() {
     let sim = Simulator::new(VirtualNet::mesh(peers), Trace::reliable(10));
     let (final_peers, transcript) = sim.run(modules, RunLimits::default());
 
-    println!("local swarm — {peers} peers, {ticks} mixing ticks (SPARTA averager, v2 substrate)");
+    println!("local vhc — {peers} peers, {ticks} mixing ticks (SPARTA averager, v2 substrate)");
     println!("  opening values : {initials:?}");
     for (i, p) in final_peers.iter().enumerate() {
         println!("  peer {i:>2} converged : {:.6}", p.value()[0]);

@@ -27,9 +27,9 @@ use daemon_vhc_proto::hash::blake3_hash;
 use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
 
 /// Salt for the witness-committee shuffle (§6.3).
-pub const WITNESS_SALT: &[u8] = b"daemon-swarm/witness/v1";
+pub const WITNESS_SALT: &[u8] = b"daemon-vhc/witness/v1";
 /// Salt for the batch-assignment shuffle (§6.3).
-pub const ASSIGN_SALT: &[u8] = b"daemon-swarm/assign/v1";
+pub const ASSIGN_SALT: &[u8] = b"daemon-vhc/assign/v1";
 
 /// Default witness-committee size (§6.3 — "witness count default 4"). `0` means "all peers witness".
 pub const WITNESS_TARGET_DEFAULT: u32 = 4;
@@ -38,7 +38,7 @@ pub const WITNESS_TARGET_DEFAULT: u32 = 4;
 ///
 /// Not cryptographic — its only job is a reproducible permutation. Seed it via [`seeded_lcg`] so a
 /// round seed + salt produce an independent stream. `daemon-vhc-proto`'s golden vectors pin its
-/// output; the constants are frozen with [`daemon_vhc_proto::SwarmProtoVersion`].
+/// output; the constants are frozen with [`daemon_vhc_proto::VhcProtoVersion`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lcg {
     state: u64,
@@ -115,7 +115,7 @@ pub fn witness_quorum(n: u32) -> u32 {
 
 /// The integer assignment weight of a throughput class (§6.3). Ratios track the `~4×` class ladder
 /// (`c1<1k, c2 1–4k, c3 4–16k, c4 >16k` tok/s) so a `c4` peer is assigned ~64× a `c1` peer's data.
-/// Frozen with [`daemon_vhc_proto::SwarmProtoVersion`].
+/// Frozen with [`daemon_vhc_proto::VhcProtoVersion`].
 #[must_use]
 pub fn class_weight(class: ThroughputClass) -> u64 {
     match class {
@@ -137,9 +137,9 @@ pub struct Committee {
 }
 
 /// Salt for the verifier-committee shuffle (§12).
-pub const VERIFIER_SALT: &[u8] = b"daemon-swarm/verifier/v1";
+pub const VERIFIER_SALT: &[u8] = b"daemon-vhc/verifier/v1";
 /// Salt for the checkpointer (tie-breaker) election (§9).
-pub const CHECKPOINTER_SALT: &[u8] = b"daemon-swarm/checkpointer/v1";
+pub const CHECKPOINTER_SALT: &[u8] = b"daemon-vhc/checkpointer/v1";
 
 /// Select the verifier committee — a seed-shuffled `⌈n·percent/100⌉` subset (§12; TDD PROTO-15).
 ///

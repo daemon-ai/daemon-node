@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::SwarmProtoError;
+use crate::error::VhcProtoError;
 
 /// A single `name@version` capability (e.g. `tensor-abi@1`, `adamw_step@1`).
 ///
@@ -39,17 +39,17 @@ impl Capability {
     }
 
     /// Parse a `name@version` token.
-    pub fn parse(token: &str) -> Result<Self, SwarmProtoError> {
+    pub fn parse(token: &str) -> Result<Self, VhcProtoError> {
         let (name, version) = token.rsplit_once('@').ok_or_else(|| {
-            SwarmProtoError::Capability(format!("`{token}` is not a name@version token"))
+            VhcProtoError::Capability(format!("`{token}` is not a name@version token"))
         })?;
         if name.is_empty() {
-            return Err(SwarmProtoError::Capability(format!(
+            return Err(VhcProtoError::Capability(format!(
                 "`{token}` has an empty capability name"
             )));
         }
         let version = version.parse::<u32>().map_err(|_| {
-            SwarmProtoError::Capability(format!("`{token}` has a non-numeric version"))
+            VhcProtoError::Capability(format!("`{token}` has a non-numeric version"))
         })?;
         Ok(Self {
             name: name.to_string(),
@@ -101,7 +101,7 @@ impl CapabilitySet {
     }
 
     /// Build from `name@version` tokens (e.g. the envelope's `capabilities` list).
-    pub fn from_tokens<I, S>(tokens: I) -> Result<Self, SwarmProtoError>
+    pub fn from_tokens<I, S>(tokens: I) -> Result<Self, VhcProtoError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -131,13 +131,13 @@ impl CapabilitySet {
     }
 
     /// Admission check: `required ⊆ self` (self = advertised). Errors listing the missing ops if not.
-    pub fn admits(&self, required: &CapabilitySet) -> Result<(), SwarmProtoError> {
+    pub fn admits(&self, required: &CapabilitySet) -> Result<(), VhcProtoError> {
         let missing = self.missing(required);
         if missing.is_empty() {
             Ok(())
         } else {
             let tokens: Vec<String> = missing.iter().map(Capability::token).collect();
-            Err(SwarmProtoError::Capability(format!(
+            Err(VhcProtoError::Capability(format!(
                 "advertised set is missing required capabilities: {}",
                 tokens.join(", ")
             )))

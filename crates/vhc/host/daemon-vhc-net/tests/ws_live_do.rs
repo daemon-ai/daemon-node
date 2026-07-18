@@ -11,9 +11,9 @@
 //! Loopback/Iroh delivery contract holds against the DO (publisher self-delivers, the DO relays to
 //! the *other* peer, no echo/no duplicate), and that a registered resubscribe frame reaches the peer.
 //!
-//! It SKIPS cleanly (like C1's `r2-smoke`) unless `SWARM_LIVE_WS_URL` is set, so it never runs in the
+//! It SKIPS cleanly (like C1's `r2-smoke`) unless `VHC_LIVE_WS_URL` is set, so it never runs in the
 //! offline workspace gate. Drive it after seeding a run against wrangler-dev (port 8795):
-//!   SWARM_LIVE_WS_URL=http://127.0.0.1:8795/api/v1/swarm SWARM_LIVE_RUN_ID=run-live \
+//!   VHC_LIVE_WS_URL=http://127.0.0.1:8795/api/v1/swarm VHC_LIVE_RUN_ID=run-live \
 //!     cargo test -p daemon-vhc-net --features ws --test ws_live_do -- --nocapture
 
 mod common;
@@ -24,8 +24,8 @@ use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
 use daemon_vhc_net::{ControlPlane, ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
 use daemon_vhc_proto::messages::{Commitment, Heartbeat, Join, Locator, ThroughputClass};
 use daemon_vhc_proto::{
-    from_canonical_slice, to_canonical_vec, CapabilitySet, Hash, IrohId, SignedMessage,
-    SwarmMessage, SWARM_PROTO_VERSION,
+    from_canonical_slice, to_canonical_vec, CapabilitySet, Hash, IrohId, SignedMessage, VhcMessage,
+    VHC_PROTO_VERSION,
 };
 
 /// The committed A1 framing golden (matches `tests/fixtures/ws-frame-commitment.cbor`): a signed
@@ -33,7 +33,7 @@ use daemon_vhc_proto::{
 /// receive-side cap does not drop it before relay.
 fn golden_commitment_frame() -> Vec<u8> {
     let key = signing_key(7);
-    let payload = SwarmMessage::Commitment(Commitment {
+    let payload = VhcMessage::Commitment(Commitment {
         round: 3,
         payload: Hash::new([0xab; 32]),
         size: 4096,
@@ -41,14 +41,14 @@ fn golden_commitment_frame() -> Vec<u8> {
             "runs/run-golden/rounds/3/aabb.upd".to_string(),
         )],
     });
-    let signed = SignedMessage::sign(&key, SWARM_PROTO_VERSION, payload).expect("sign");
+    let signed = SignedMessage::sign(&key, VHC_PROTO_VERSION, payload).expect("sign");
     to_canonical_vec(&signed).expect("encode")
 }
 
 fn live_auth() -> WsAuth {
     WsAuth::Internal {
-        org_id: std::env::var("SWARM_LIVE_ORG").unwrap_or_else(|_| "org_live".into()),
-        actor: std::env::var("SWARM_LIVE_ACTOR").unwrap_or_else(|_| "key:live".into()),
+        org_id: std::env::var("VHC_LIVE_ORG").unwrap_or_else(|_| "org_live".into()),
+        actor: std::env::var("VHC_LIVE_ACTOR").unwrap_or_else(|_| "key:live".into()),
     }
 }
 
@@ -67,13 +67,11 @@ async fn connect_live(base_url: &str, run_id: &str) -> WsControlPlane {
 /// resubscribe-frame delivery.
 #[tokio::test(flavor = "multi_thread")]
 async fn live_ws_framing_relay_and_resubscribe_against_wrangler_dev() {
-    let Ok(base_url) = std::env::var("SWARM_LIVE_WS_URL") else {
-        eprintln!(
-            "SKIP live_ws_do: set SWARM_LIVE_WS_URL (e.g. http://127.0.0.1:8795/api/v1/swarm)"
-        );
+    let Ok(base_url) = std::env::var("VHC_LIVE_WS_URL") else {
+        eprintln!("SKIP live_ws_do: set VHC_LIVE_WS_URL (e.g. http://127.0.0.1:8795/api/v1/swarm)");
         return;
     };
-    let run_id = std::env::var("SWARM_LIVE_RUN_ID").unwrap_or_else(|_| "run-live".into());
+    let run_id = std::env::var("VHC_LIVE_RUN_ID").unwrap_or_else(|_| "run-live".into());
 
     let a = connect_live(&base_url, &run_id).await;
     let b = connect_live(&base_url, &run_id).await;
@@ -132,12 +130,12 @@ async fn live_ws_framing_relay_and_resubscribe_against_wrangler_dev() {
 /// the Merge-2 node↔cloud↔worker item, gated by A3 worker attach).
 #[tokio::test(flavor = "multi_thread")]
 async fn live_ws_join_ready_progresses_to_round_open() {
-    let Ok(base_url) = std::env::var("SWARM_LIVE_WS_URL") else {
-        eprintln!("SKIP live_ws_do progression: set SWARM_LIVE_WS_URL");
+    let Ok(base_url) = std::env::var("VHC_LIVE_WS_URL") else {
+        eprintln!("SKIP live_ws_do progression: set VHC_LIVE_WS_URL");
         return;
     };
     // A dedicated single-peer run (min_peers=1) seeded by scripts/seed_run.mjs.
-    let run_id = std::env::var("SWARM_LIVE_PROG_RUN").unwrap_or_else(|_| "run-prog".into());
+    let run_id = std::env::var("VHC_LIVE_PROG_RUN").unwrap_or_else(|_| "run-prog".into());
 
     let peer = connect_live(&base_url, &run_id).await;
     let mut sub = peer.subscribe();
@@ -145,8 +143,8 @@ async fn live_ws_join_ready_progresses_to_round_open() {
 
     let join = SignedMessage::sign(
         &key,
-        SWARM_PROTO_VERSION,
-        SwarmMessage::Join(Join {
+        VHC_PROTO_VERSION,
+        VhcMessage::Join(Join {
             run_id: run_id.clone(),
             iroh_id: IrohId([0x21; 32]),
             class: ThroughputClass::C2,
@@ -162,8 +160,8 @@ async fn live_ws_join_ready_progresses_to_round_open() {
     // Readiness heartbeat: lets the coordinator exit Warmup early (all admitted members ready, §6.2).
     let ready = SignedMessage::sign(
         &key,
-        SWARM_PROTO_VERSION,
-        SwarmMessage::Heartbeat(Heartbeat {
+        VHC_PROTO_VERSION,
+        VhcMessage::Heartbeat(Heartbeat {
             round: 0,
             ready: Some(true),
         }),
@@ -180,7 +178,7 @@ async fn live_ws_join_ready_progresses_to_round_open() {
         match recv_timeout(&mut sub, Duration::from_secs(5)).await {
             Some(frame) => {
                 if let Ok(sm) = from_canonical_slice::<SignedMessage>(&frame) {
-                    if matches!(sm.payload, SwarmMessage::RoundOpen(_)) {
+                    if matches!(sm.payload, VhcMessage::RoundOpen(_)) {
                         saw_round_open = true;
                         break;
                     }

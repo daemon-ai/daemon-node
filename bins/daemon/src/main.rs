@@ -3011,23 +3011,23 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // Drain any feedback records left queued by a previous run (best-effort, detached). No-op when
     // export is inert. Per-submit drains ride the `FeedbackSubmit` handler.
     node.spawn_feedback_drain();
-    // B3: bind the swarm-training service post-`Arc` when `[swarm] enabled` (the W1 `with_swarm`
-    // seam — inert by default). When on, the node hosts a `daemon-vhc-node::SwarmService` over a
+    // B3: bind the vhc-training service post-`Arc` when `[vhc] enabled` (the W1 `with_swarm`
+    // seam — inert by default). When on, the node hosts a `daemon-vhc-node::VhcService` over a
     // `daemon-vhc-supervisor::TrainSupervisor`, re-converges durable join intents (§10.3), and routes
     // its `SwarmChanged` invalidation pointers onto the existing node feed. A `Weak` feed handle
     // avoids a node↔service `Arc` cycle. Drags no burn/wasmtime/iroh onto the default build.
-    if cfg.swarm.enabled {
-        match daemon_vhc_node::SwarmStore::open(cfg.data_dir.join("swarm.db")) {
+    if cfg.vhc.enabled {
+        match daemon_vhc_node::VhcStore::open(cfg.data_dir.join("vhc.db")) {
             Ok(store) => {
                 let worker: Arc<dyn daemon_vhc_node::WorkerControl> =
                     Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(
-                        daemon_vhc_supervisor::TrainClientConfig::new(&cfg.swarm.worker_path),
+                        daemon_vhc_supervisor::TrainClientConfig::new(&cfg.vhc.worker_path),
                     ));
                 // Phase E multi-instance supervision (decisions D1/D6): every admitted join gets
                 // its OWN supervised worker subprocess (one sandbox = one role-instance) — the
                 // pre-E single-shared-child interim is lifted. Admission is arbitrated by the
                 // service's OwnerArbiter (permissive until an owner budget is configured).
-                let worker_path = cfg.swarm.worker_path.clone();
+                let worker_path = cfg.vhc.worker_path.clone();
                 let worker_factory: daemon_vhc_node::service::WorkerFactory = Arc::new(move || {
                     Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(
                         daemon_vhc_supervisor::TrainClientConfig::new(&worker_path),
@@ -3040,12 +3040,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                     }
                 });
                 // A3: construct the `RegistryClient`-backed `EgressRunDiscovery` from the additive
-                // `[swarm.registry]` config (registry base + `swarm:*` creds) — the A1-noted boot
+                // `[vhc.registry]` config (registry base + `swarm:*` creds) — the A1-noted boot
                 // follow-on. An empty base keeps `discovery: None` (the W1 probe fallback against
                 // the allowlist), so existing configs are unchanged. The base/auth are pure config:
                 // the same node targets wrangler-dev or a real workers.dev deployment by config only.
                 let discovery: Option<Arc<dyn daemon_vhc_node::RunDiscovery>> = if cfg
-                    .swarm
+                    .vhc
                     .registry
                     .base
                     .is_empty()
@@ -3057,9 +3057,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                             use daemon_vhc_session::config::RegistryAuthConfig;
                             let mut registry = daemon_vhc_node::RegistryClient::new(
                                 egress,
-                                cfg.swarm.registry.base.clone(),
+                                cfg.vhc.registry.base.clone(),
                             );
-                            registry = match &cfg.swarm.registry.auth {
+                            registry = match &cfg.vhc.registry.auth {
                                 RegistryAuthConfig::None => registry,
                                 RegistryAuthConfig::Bearer { token } => {
                                     registry.with_bearer(token.clone())
@@ -3071,7 +3071,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                             Some(Arc::new(daemon_vhc_node::EgressRunDiscovery::new(registry)))
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "swarm: registry egress client failed; discovery not wired");
+                            tracing::error!(error = %e, "vhc: registry egress client failed; discovery not wired");
                             None
                         }
                     }
@@ -3079,11 +3079,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 // The owner's aggregate resource ledgers (decisions D6). Default posture:
                 // conservative + FINITE, derived from the worker's hardware probe — never
                 // unbounded (an unbounded default lets the arbiter admit without limit). The
-                // explicit `[swarm.owner_budget] unbounded = true` opt-out routes back to the
+                // explicit `[vhc.owner_budget] unbounded = true` opt-out routes back to the
                 // permissive posture. The probe is best-effort and bounded: on failure/timeout
                 // (e.g. no worker installed) the budget falls back to config + fixed finite floors,
                 // still finite (`OwnerBudget::from_config`).
-                let budget = if cfg.swarm.owner_budget.unbounded {
+                let budget = if cfg.vhc.owner_budget.unbounded {
                     daemon_vhc_node::OwnerBudget::unbounded()
                 } else {
                     let probed = match tokio::time::timeout(
@@ -3094,23 +3094,23 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                     {
                         Ok(Ok(hw)) => Some(hw),
                         Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "swarm: hardware probe failed; deriving a conservative finite owner budget from config + floors");
+                            tracing::warn!(error = %e, "vhc: hardware probe failed; deriving a conservative finite owner budget from config + floors");
                             None
                         }
                         Err(_) => {
-                            tracing::warn!("swarm: hardware probe timed out; deriving a conservative finite owner budget from config + floors");
+                            tracing::warn!("vhc: hardware probe timed out; deriving a conservative finite owner budget from config + floors");
                             None
                         }
                     };
                     daemon_vhc_node::OwnerBudget::from_config(
-                        &cfg.swarm.owner_budget,
+                        &cfg.vhc.owner_budget,
                         probed.as_ref(),
-                        cfg.swarm.data_cache_gb,
+                        cfg.vhc.data_cache_gb,
                     )
                 };
-                let svc = Arc::new(daemon_vhc_node::SwarmService::new(
-                    daemon_vhc_node::SwarmServiceParts {
-                        config: cfg.swarm.clone(),
+                let svc = Arc::new(daemon_vhc_node::VhcService::new(
+                    daemon_vhc_node::VhcServiceParts {
+                        config: cfg.vhc.clone(),
                         store,
                         worker,
                         feed: Some(feed),
@@ -3120,16 +3120,16 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                     },
                 ));
                 // A3: bind the service's own Arc so joins pump the continuous worker event stream
-                // into swarm.db (§10.3/§10.4).
+                // into vhc.db (§10.3/§10.4).
                 svc.bind_self();
                 if let Err(e) = svc.start().await {
-                    tracing::error!(error = %e, "swarm: SwarmService::start failed");
+                    tracing::error!(error = %e, "vhc: VhcService::start failed");
                 }
                 node.set_swarm(svc as Arc<dyn daemon_api::SwarmApi>);
-                tracing::info!("swarm: SwarmService bound ([swarm] enabled)");
+                tracing::info!("vhc: VhcService bound ([vhc] enabled)");
             }
             Err(e) => {
-                tracing::error!(error = %e, "swarm: failed to open swarm.db; service not bound")
+                tracing::error!(error = %e, "vhc: failed to open vhc.db; service not bound")
             }
         }
     }

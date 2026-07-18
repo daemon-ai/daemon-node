@@ -7,8 +7,8 @@ mod common;
 
 use common::*;
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
-use daemon_vhc_proto::messages::SwarmMessage;
-use daemon_vhc_proto::{peer_id, to_canonical_vec, PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::messages::VhcMessage;
+use daemon_vhc_proto::{peer_id, to_canonical_vec, PeerId, VhcProtoVersion};
 
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, ClientState, ControlAction, CoordinatorState, Input, Notice, Output, Phase,
@@ -83,7 +83,7 @@ fn proto2_phase_timeouts_walk_the_ladder() {
     assert!(
         publishes(&out)
             .iter()
-            .any(|m| matches!(m, SwarmMessage::RoundOpen(_))),
+            .any(|m| matches!(m, VhcMessage::RoundOpen(_))),
         "opening a round publishes RoundOpen"
     );
 
@@ -99,7 +99,7 @@ fn proto2_phase_timeouts_walk_the_ladder() {
     assert_eq!(state.round, 1);
     assert!(publishes(&out)
         .iter()
-        .any(|m| matches!(m, SwarmMessage::RoundRecord(_))));
+        .any(|m| matches!(m, VhcMessage::RoundRecord(_))));
 }
 
 // ----- PROTO-3: stored-round ring + cursor threading -----
@@ -391,7 +391,7 @@ fn message_with_wrong_version_rejected() {
     let state = new_state(base_config());
     let (_, out) = tick(
         state,
-        Input::Message(join_msg_version(&ks[0], SwarmProtoVersion(999))),
+        Input::Message(join_msg_version(&ks[0], VhcProtoVersion(999))),
     );
     assert!(matches!(
         out.as_slice(),
@@ -437,7 +437,7 @@ fn warmup_early_exits_when_all_ready() {
     );
     assert!(publishes(&out)
         .iter()
-        .any(|m| matches!(m, SwarmMessage::RoundOpen(_))));
+        .any(|m| matches!(m, VhcMessage::RoundOpen(_))));
 }
 
 #[test]
@@ -460,7 +460,7 @@ fn warmup_falls_back_to_timeout_without_all_ready() {
     assert_eq!(state.phase, Phase::RoundTrain);
     assert!(publishes(&out)
         .iter()
-        .any(|m| matches!(m, SwarmMessage::RoundOpen(_))));
+        .any(|m| matches!(m, VhcMessage::RoundOpen(_))));
 }
 
 // ----- happy path: a fully-evidenced round records the committed set -----
@@ -475,7 +475,7 @@ fn happy_round_records_committed_set() {
     let records: Vec<_> = publishes(&out)
         .into_iter()
         .filter_map(|m| match m {
-            SwarmMessage::RoundRecord(r) => Some(r.clone()),
+            VhcMessage::RoundRecord(r) => Some(r.clone()),
             _ => None,
         })
         .collect();

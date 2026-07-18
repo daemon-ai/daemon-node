@@ -1517,13 +1517,13 @@ pub struct NodeConfig {
     /// prefixes, and the post-edit `[fs.lint]` command runner. Embedded from the tool crate so
     /// the config surface and the tool cannot drift.
     pub fs: daemon_tool_fs::FsConfig,
-    /// Swarm-training participation tuning (`[swarm]` / `DAEMON_SWARM__*`, spec §10.6): `enabled`
+    /// VHC training participation tuning (`[vhc]` / `DAEMON_VHC__*`, spec §10.6): `enabled`
     /// (off by default), worker path, data-cache budget, default participation policy, module-trust
     /// posture, coordinator allowlist, iroh relays. Embedded from `daemon-vhc-session` so the config
-    /// surface and the node swarm service cannot drift. Serde-only (no figment on the participant
+    /// surface and the node vhc service cannot drift. Serde-only (no figment on the participant
     /// build); the node layers it via the standard figment path below.
     #[serde(default)]
-    pub swarm: daemon_vhc_session::config::SwarmConfig,
+    pub vhc: daemon_vhc_session::config::VhcConfig,
     /// Session search/title tuning (`[sessions]`): boot-time FTS backfill + title generation.
     pub sessions: SessionsConfig,
     /// `semantic_search` workspace-index tuning (`[workspace_index]`): enabled by default but only
@@ -1631,7 +1631,7 @@ impl Default for NodeConfig {
             execute_code: ExecuteCodeConfig::default(),
             skills: SkillsConfig::default(),
             fs: daemon_tool_fs::FsConfig::default(),
-            swarm: daemon_vhc_session::config::SwarmConfig::default(),
+            vhc: daemon_vhc_session::config::VhcConfig::default(),
             sessions: SessionsConfig::default(),
             workspace_index: WorkspaceIndexConfig::default(),
             lcm: LcmOpts::default(),
@@ -2218,91 +2218,91 @@ mod tests {
         });
     }
 
-    // The `[swarm]` section (spec §10.6) is off by default and rides the standard figment layering:
-    // defaults <- TOML <- `DAEMON_SWARM__*` env. Both a `[swarm]` TOML table and a nested env override
-    // must extract into `NodeConfig.swarm` additively (W1 config embed; TDD config-figment gate).
+    // The `[vhc]` section (spec §10.6) is off by default and rides the standard figment layering:
+    // defaults <- TOML <- `DAEMON_VHC__*` env. Both a `[vhc]` TOML table and a nested env override
+    // must extract into `NodeConfig.vhc` additively (W1 config embed; TDD config-figment gate).
     #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
     #[test]
-    fn swarm_section_defaults_off_and_layers_toml_and_env() {
-        // Default: the swarm section is present and disabled (never spawns a worker by default).
+    fn vhc_section_defaults_off_and_layers_toml_and_env() {
+        // Default: the vhc section is present and disabled (never spawns a worker by default).
         let defaults =
             NodeConfig::from_figment(Figment::from(Serialized::defaults(NodeConfig::default())))
                 .expect("defaults must extract");
-        assert!(!defaults.swarm.enabled, "swarm is off by default (§10.6)");
-        assert_eq!(defaults.swarm.data_cache_gb, 50);
+        assert!(!defaults.vhc.enabled, "vhc is off by default (§10.6)");
+        assert_eq!(defaults.vhc.data_cache_gb, 50);
 
         figment::Jail::expect_with(|jail| {
             // TOML layer: enable + a partial nested policy table.
             jail.create_file(
                 "cfg.toml",
-                "[swarm]\n\
+                "[vhc]\n\
                  enabled = true\n\
                  data_cache_gb = 100\n\
-                 [swarm.default_policy]\n\
+                 [vhc.default_policy]\n\
                  mode = \"scheduled\"\n\
                  schedule = \"0 3 * * *\"\n",
             )?;
             jail.set_env("DAEMON_CONFIG", "cfg.toml");
             // Env layer wins over TOML for the same key (nested `__` split), and sets a new one.
-            jail.set_env("DAEMON_SWARM__DATA_CACHE_GB", "200");
-            jail.set_env("DAEMON_SWARM__DEFAULT_POLICY__DUTY_CYCLE_PCT", "25");
+            jail.set_env("DAEMON_VHC__DATA_CACHE_GB", "200");
+            jail.set_env("DAEMON_VHC__DEFAULT_POLICY__DUTY_CYCLE_PCT", "25");
             let cfg = NodeConfig::from_figment(NodeConfig::base_figment())
-                .unwrap_or_else(|e| panic!("[swarm] layering must extract: {e:#}"));
+                .unwrap_or_else(|e| panic!("[vhc] layering must extract: {e:#}"));
             // TOML applied.
-            assert!(cfg.swarm.enabled);
+            assert!(cfg.vhc.enabled);
             assert_eq!(
-                cfg.swarm.default_policy.mode,
+                cfg.vhc.default_policy.mode,
                 daemon_vhc_session::protocol::PolicyMode::Scheduled
             );
             assert_eq!(
-                cfg.swarm.default_policy.schedule.as_deref(),
+                cfg.vhc.default_policy.schedule.as_deref(),
                 Some("0 3 * * *")
             );
             // Env wins over TOML for data_cache_gb; nested env override applied.
-            assert_eq!(cfg.swarm.data_cache_gb, 200);
-            assert_eq!(cfg.swarm.default_policy.duty_cycle_pct, 25);
+            assert_eq!(cfg.vhc.data_cache_gb, 200);
+            assert_eq!(cfg.vhc.default_policy.duty_cycle_pct, 25);
             // Omitted keys keep the §10.6 defaults.
-            assert_eq!(cfg.swarm.worker_path, "daemon-vhc-worker");
-            assert_eq!(cfg.swarm.iroh.relays, "default");
+            assert_eq!(cfg.vhc.worker_path, "daemon-vhc-worker");
+            assert_eq!(cfg.vhc.iroh.relays, "default");
             Ok(())
         });
     }
 
     #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
     #[test]
-    fn swarm_owner_budget_section_round_trips() {
+    fn vhc_owner_budget_section_round_trips() {
         // Default: no owner budget configured (all zero/empty, `unbounded` off) — the node derives
         // conservative FINITE ledgers from the hardware probe at boot (decisions D6).
         let defaults =
             NodeConfig::from_figment(Figment::from(Serialized::defaults(NodeConfig::default())))
                 .expect("defaults must extract");
-        assert!(!defaults.swarm.owner_budget.unbounded);
-        assert!(defaults.swarm.owner_budget.device_memory_mb.is_empty());
-        assert_eq!(defaults.swarm.owner_budget.host_ram_mb, 0);
-        assert_eq!(defaults.swarm.owner_budget.max_instances, 0);
+        assert!(!defaults.vhc.owner_budget.unbounded);
+        assert!(defaults.vhc.owner_budget.device_memory_mb.is_empty());
+        assert_eq!(defaults.vhc.owner_budget.host_ram_mb, 0);
+        assert_eq!(defaults.vhc.owner_budget.max_instances, 0);
 
         figment::Jail::expect_with(|jail| {
             // TOML layer: an explicit finite owner budget, incl. the per-device VRAM ledger map.
             jail.create_file(
                 "cfg.toml",
-                "[swarm]\n\
+                "[vhc]\n\
                  enabled = true\n\
-                 [swarm.owner_budget]\n\
+                 [vhc.owner_budget]\n\
                  host_ram_mb = 32768\n\
                  disk_mb = 102400\n\
                  net_up_kbps = 50000\n\
                  net_down_kbps = 200000\n\
                  duty_pct = 80\n\
                  max_instances = 3\n\
-                 [swarm.owner_budget.device_memory_mb]\n\
+                 [vhc.owner_budget.device_memory_mb]\n\
                  \"gpu:0\" = 24000\n",
             )?;
             jail.set_env("DAEMON_CONFIG", "cfg.toml");
             // Env wins over TOML for the same nested key (`__` split).
-            jail.set_env("DAEMON_SWARM__OWNER_BUDGET__MAX_INSTANCES", "5");
+            jail.set_env("DAEMON_VHC__OWNER_BUDGET__MAX_INSTANCES", "5");
             let cfg = NodeConfig::from_figment(NodeConfig::base_figment())
-                .unwrap_or_else(|e| panic!("[swarm.owner_budget] layering must extract: {e:#}"));
-            let ob = &cfg.swarm.owner_budget;
+                .unwrap_or_else(|e| panic!("[vhc.owner_budget] layering must extract: {e:#}"));
+            let ob = &cfg.vhc.owner_budget;
             assert!(!ob.unbounded);
             assert_eq!(ob.host_ram_mb, 32768);
             assert_eq!(ob.disk_mb, 102_400);

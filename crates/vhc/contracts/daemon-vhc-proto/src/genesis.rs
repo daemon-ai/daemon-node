@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::bytes::{Hash, PeerId, Signature};
 use crate::canonical::{from_canonical_slice, to_canonical_vec};
 use crate::envelope::{Access, DeviceMinimums};
-use crate::error::SwarmProtoError;
+use crate::error::VhcProtoError;
 use crate::hash::blake3_hash;
 use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
 
@@ -302,24 +302,24 @@ impl GenesisEnvelope {
     /// Grants-exceed-lane and device-below-floor are **admission-time** judgments (they need the
     /// node's lane profiles and device probe, architecture §3.5), not envelope-internal — they are
     /// not checked here.
-    pub fn validate(&self) -> Result<(), SwarmProtoError> {
+    pub fn validate(&self) -> Result<(), VhcProtoError> {
         if self.run.schema != GENESIS_SCHEMA_MAJOR {
-            return Err(SwarmProtoError::Validation(format!(
+            return Err(VhcProtoError::Validation(format!(
                 "unknown genesis schema major {} (this build understands \
                  {GENESIS_SCHEMA_MAJOR})",
                 self.run.schema
             )));
         }
         if self.run.min_peers == 0 {
-            return Err(SwarmProtoError::Validation("min_peers must be >= 1".into()));
+            return Err(VhcProtoError::Validation("min_peers must be >= 1".into()));
         }
         if self.run.max_peers < self.run.min_peers {
-            return Err(SwarmProtoError::Validation(
+            return Err(VhcProtoError::Validation(
                 "max_peers must be >= min_peers".into(),
             ));
         }
         if self.roles.is_empty() {
-            return Err(SwarmProtoError::Validation(
+            return Err(VhcProtoError::Validation(
                 "a genesis envelope must declare at least one role".into(),
             ));
         }
@@ -329,7 +329,7 @@ impl GenesisEnvelope {
         let has_coordinator = self.roles.keys().any(|r| r.contains("coordinator"));
         let has_worker = self.roles.keys().any(|r| !r.contains("coordinator"));
         if !has_coordinator || !has_worker {
-            return Err(SwarmProtoError::Validation(
+            return Err(VhcProtoError::Validation(
                 "a genesis envelope must declare at least a coordinator role and one worker role \
                  (architecture §5.1)"
                     .into(),
@@ -338,12 +338,12 @@ impl GenesisEnvelope {
         let artifact_hashes: BTreeSet<Hash> = self.artifacts.values().map(|a| a.blake3).collect();
         for (name, role) in &self.roles {
             if role.lane.is_empty() {
-                return Err(SwarmProtoError::Validation(format!(
+                return Err(VhcProtoError::Validation(format!(
                     "role `{name}` has an empty lane selector"
                 )));
             }
             let Some(module) = self.artifacts.get(&role.module) else {
-                return Err(SwarmProtoError::Validation(format!(
+                return Err(VhcProtoError::Validation(format!(
                     "role `{name}` module `{}` is not present in [artifacts]",
                     role.module
                 )));
@@ -352,14 +352,14 @@ impl GenesisEnvelope {
             // blake3 is the pin and is always present (byte newtype). Guard the obvious authoring
             // slip of an all-zero hash on a role's module.
             if module.blake3 == Hash([0u8; 32]) {
-                return Err(SwarmProtoError::Validation(format!(
+                return Err(VhcProtoError::Validation(format!(
                     "role `{name}` module `{}` has an unpinned (all-zero) blake3",
                     role.module
                 )));
             }
             for granted in &role.grants.artifacts {
                 if !artifact_hashes.contains(granted) {
-                    return Err(SwarmProtoError::Validation(format!(
+                    return Err(VhcProtoError::Validation(format!(
                         "role `{name}` grants artifact {} absent from the artifact map",
                         granted.to_hex()
                     )));
@@ -373,7 +373,7 @@ impl GenesisEnvelope {
     /// the hash with the author's key. The hash **is** the run's cryptographic `RunId`
     /// (architecture §5.1). The returned [`FrozenGenesis`] is the only form peers and the
     /// coordinator ever see.
-    pub fn freeze(&self, key: &SigningKey) -> Result<FrozenGenesis, SwarmProtoError> {
+    pub fn freeze(&self, key: &SigningKey) -> Result<FrozenGenesis, VhcProtoError> {
         self.validate()?;
         let bytes = to_canonical_vec(self)?;
         let hash = blake3_hash(&bytes);
@@ -405,7 +405,7 @@ impl FrozenGenesis {
         bytes: Vec<u8>,
         signature: Signature,
         signer: PeerId,
-    ) -> Result<Self, SwarmProtoError> {
+    ) -> Result<Self, VhcProtoError> {
         let envelope: GenesisEnvelope = from_canonical_slice(&bytes)?;
         envelope.validate()?;
         let hash = blake3_hash(&bytes);
@@ -435,7 +435,7 @@ impl FrozenGenesis {
     /// The human/registry-facing `RunLabel` (decisions D1). When a node carries both a `RunLabel`
     /// and a `RunId`, they must agree — a `RunLabel` resolving to a different genesis hash is a
     /// typed refusal (that cross-check is a host/node concern; this accessor is the label side).
-    pub fn run_label(&self) -> Result<String, SwarmProtoError> {
+    pub fn run_label(&self) -> Result<String, VhcProtoError> {
         Ok(self.decode()?.run.run_label)
     }
 
@@ -452,14 +452,14 @@ impl FrozenGenesis {
     }
 
     /// Decode the resolved genesis envelope from the frozen bytes.
-    pub fn decode(&self) -> Result<GenesisEnvelope, SwarmProtoError> {
+    pub fn decode(&self) -> Result<GenesisEnvelope, VhcProtoError> {
         from_canonical_slice(&self.bytes)
     }
 
     /// The canonical CBOR of a role's opaque module config — byte-identically what that role's
     /// module receives as its `da_init`/`da_build` config input (the per-role analogue of v1's
     /// single `[experiment.config]`). `None` for an unknown role.
-    pub fn role_config_bytes(&self, role: &str) -> Result<Option<Vec<u8>>, SwarmProtoError> {
+    pub fn role_config_bytes(&self, role: &str) -> Result<Option<Vec<u8>>, VhcProtoError> {
         let env = self.decode()?;
         match env.roles.get(role) {
             Some(entry) => Ok(Some(to_canonical_vec(&entry.config)?)),
@@ -468,10 +468,10 @@ impl FrozenGenesis {
     }
 
     /// Verify integrity: the stored hash matches blake3 of the bytes, and the signature verifies.
-    pub fn verify(&self) -> Result<(), SwarmProtoError> {
+    pub fn verify(&self) -> Result<(), VhcProtoError> {
         let recomputed = blake3_hash(&self.bytes);
         if recomputed != self.hash {
-            return Err(SwarmProtoError::Validation(
+            return Err(VhcProtoError::Validation(
                 "genesis hash does not match its bytes".into(),
             ));
         }

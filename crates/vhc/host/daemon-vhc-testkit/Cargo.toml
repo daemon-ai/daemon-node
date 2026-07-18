@@ -25,7 +25,7 @@ two-layer split on opposite sides of the wasm boundary). vhc_dep_check enforces 
 daemon-vhc-host = { workspace = true }
 # The shared ABI vocabulary (event tags, channel table, stop reasons, outcome codes). contracts/*.
 daemon-vhc-abi = { workspace = true }
-# The signed control-plane wire (SignedMessage / SwarmMessage), envelope, blake3. contracts/*.
+# The signed control-plane wire (SignedMessage / VhcMessage), envelope, blake3. contracts/*.
 daemon-vhc-proto = { workspace = true }
 # The consensus SDK layer (assignment math + the shared coordinator types). The whole-run
 # harness re-derives worker windows with the same `assign_batches` the guests use, and authors

@@ -9,7 +9,7 @@
 //! (`docs/specs/swarm-tensor-abi-spec.md` §5.9; `swarm-training-spec.md` §5.6/§10.1).
 //!
 //! These implement the **det lane** semantics (ABI §5.9): CPU fp32, fixed evaluation order,
-//! bit-exact on every target and every vendor. That property is what makes the swarm's agree-path
+//! bit-exact on every target and every vendor. That property is what makes the vhc's agree-path
 //! (decode → clip → aggregate → outer step) cross-peer identical by construction — every reduction
 //! here fixes its order explicitly, never leaving it to the compiler or a SIMD reassociation.
 //!

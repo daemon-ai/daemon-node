@@ -10,7 +10,7 @@
 //! tick per delivered frame), so the run is driven **event-driven**: members are admitted with
 //! synthesized joins, warmup exits on readiness heartbeats, and each round closes on the
 //! all-committed + all-evidenced fast path. The captured driving trace is therefore reproducible
-//! from the frames alone, so a recorded run and its `swarm-replay` re-derivation share one
+//! from the frames alone, so a recorded run and its `replay` re-derivation share one
 //! coordinator substrate and one clock discipline (this is what un-gates
 //! `observe_record_and_replay_green`).
 //!
@@ -52,13 +52,13 @@ use daemon_vhc_net::{ControlPlane, FsPayloadStore, PayloadStore};
 use daemon_vhc_proto::messages::{Commitment, Join, RecordEntry, StorageReceipt, ThroughputClass};
 use daemon_vhc_proto::{
     blake3_hash, from_canonical_slice, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId,
-    PeerId, SignedMessage, SigningKey, SwarmMessage, SwarmProtoVersion,
+    PeerId, SignedMessage, SigningKey, VhcMessage, VhcProtoVersion,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
 use crate::seam::{PayloadKey, RunId};
-use crate::SwarmRunError;
+use crate::VhcRunError;
 
 /// The iroh id + class every synthesized `Join` carries (the in-process peers are class-equal).
 const JOIN_IROH_ID: IrohId = IrohId([0x22; 32]);
@@ -125,8 +125,8 @@ impl CoordinatorReplay {
 pub struct WasmCoordinatorShellConfig {
     /// The run this coordinator drives.
     pub run: RunId,
-    /// The pinned swarm proto version.
-    pub version: SwarmProtoVersion,
+    /// The pinned vhc proto version.
+    pub version: VhcProtoVersion,
     /// The genesis-derived initial coordinator state (the module's opaque `{state}` `da_init`).
     pub state: CoordinatorState,
     /// Signing keys of the peers admitted at run start (one synthesized `Join` + ready heartbeat).
@@ -172,7 +172,7 @@ pub struct WasmCoordinatorShell<C> {
     control: Arc<C>,
     store: Arc<FsPayloadStore>,
     run: RunId,
-    version: SwarmProtoVersion,
+    version: VhcProtoVersion,
     initial: CoordinatorState,
     bootstrap_keys: Vec<SigningKey>,
     late_keys: Vec<SigningKey>,
@@ -246,15 +246,14 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
 
     /// The genesis-derived coordinator spec: the module hash pinned to the built blob, the opaque
     /// `{state}` config bytes, the envelope-named `SingleKey` authority, and the run identity.
-    fn spec(&self, wasm: &[u8]) -> Result<WasmCoordinatorSpec, SwarmRunError> {
+    fn spec(&self, wasm: &[u8]) -> Result<WasmCoordinatorSpec, VhcRunError> {
         let config_bytes = {
             let v = ciborium::value::Value::Map(vec![(
                 ciborium::value::Value::Text("state".into()),
                 ciborium::value::Value::serialized(&self.initial)
-                    .map_err(|e| SwarmRunError::Lifecycle(format!("state value: {e}")))?,
+                    .map_err(|e| VhcRunError::Lifecycle(format!("state value: {e}")))?,
             )]);
-            to_canonical_vec(&v)
-                .map_err(|e| SwarmRunError::Lifecycle(format!("config cbor: {e}")))?
+            to_canonical_vec(&v).map_err(|e| VhcRunError::Lifecycle(format!("config cbor: {e}")))?
         };
         Ok(WasmCoordinatorSpec {
             module_hash: Hash(*blake3::hash(wasm).as_bytes()),
@@ -275,13 +274,13 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         &mut self,
         coord: &mut WasmCoordinator,
         key: &SigningKey,
-        msg: &SwarmMessage,
-    ) -> Result<(), SwarmRunError> {
+        msg: &VhcMessage,
+    ) -> Result<(), VhcRunError> {
         let signed = SignedMessage::sign(key, self.version, msg.clone())
-            .map_err(|e| SwarmRunError::Lifecycle(format!("frame sign: {e}")))?;
+            .map_err(|e| VhcRunError::Lifecycle(format!("frame sign: {e}")))?;
         coord
             .deliver(key, msg)
-            .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator deliver: {e}")))?;
+            .map_err(|e| VhcRunError::Lifecycle(format!("coordinator deliver: {e}")))?;
         self.inputs.push(Input::Message(signed));
         Ok(())
     }
@@ -293,7 +292,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         coord: &mut WasmCoordinator,
         round: u64,
         peer: PeerId,
-    ) -> Result<(), SwarmRunError> {
+    ) -> Result<(), VhcRunError> {
         if self
             .committed
             .get(&round)
@@ -305,7 +304,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         let Ok(stat) = self.store.head(&key).await else {
             return Ok(());
         };
-        let receipt = SwarmMessage::StorageReceipt(StorageReceipt {
+        let receipt = VhcMessage::StorageReceipt(StorageReceipt {
             round,
             verified: vec![RecordEntry {
                 peer,
@@ -329,21 +328,21 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         &mut self,
         coord: &WasmCoordinator,
         consumed: &mut usize,
-    ) -> Result<u64, SwarmRunError> {
+    ) -> Result<u64, VhcRunError> {
         let published = coord.published();
         let start = (*consumed).min(published.len());
         let mut new_records = 0u64;
         for (_, _, _, msg) in published.iter().skip(start) {
             let signed = SignedMessage::sign(&self.coord_key, self.version, msg.clone())
-                .map_err(|e| SwarmRunError::Lifecycle(format!("relay sign: {e}")))?;
+                .map_err(|e| VhcRunError::Lifecycle(format!("relay sign: {e}")))?;
             let bytes = to_canonical_vec(&signed)
-                .map_err(|e| SwarmRunError::Lifecycle(format!("relay encode: {e}")))?;
+                .map_err(|e| VhcRunError::Lifecycle(format!("relay encode: {e}")))?;
             self.control.publish(&bytes).await?;
             match msg {
-                SwarmMessage::RoundOpen(ro) => {
+                VhcMessage::RoundOpen(ro) => {
                     self.open_round = Some(ro.round);
                 }
-                SwarmMessage::RoundRecord(rr) => {
+                VhcMessage::RoundRecord(rr) => {
                     new_records += 1;
                     self.last_record = Some(rr.round);
                     if self.open_round == Some(rr.round) {
@@ -424,7 +423,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         coord
             .published()
             .iter()
-            .any(|(_, _, _, m)| matches!(m, SwarmMessage::RoundOpen(_)))
+            .any(|(_, _, _, m)| matches!(m, VhcMessage::RoundOpen(_)))
     }
 
     /// Force the module past a clock-gated phase deadline (round train/witness, cooldown, warmup)
@@ -434,7 +433,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
     /// once, so a bounded batch expires the deadline and the module publishes the next decision. The
     /// event-count analogue of the native shell's `Input::Clock` jump — no wall-clock forcing (the
     /// sleep below is a polling mechanism for the guest thread to drain, feeding no decision).
-    fn force_step(&mut self, coord: &mut WasmCoordinator) -> Result<(), SwarmRunError> {
+    fn force_step(&mut self, coord: &mut WasmCoordinator) -> Result<(), VhcRunError> {
         const FORCE_CAP: usize = 512;
         const BATCH: usize = 8;
         // The filler loop blocks (deliver + poll sleeps): hand the worker's task queue off so the
@@ -442,7 +441,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         tokio::task::block_in_place(|| {
             let before = coord.published().len();
             let coord_key = self.coord_key.clone();
-            let filler = SwarmMessage::Heartbeat(daemon_vhc_proto::messages::Heartbeat {
+            let filler = VhcMessage::Heartbeat(daemon_vhc_proto::messages::Heartbeat {
                 round: 0,
                 ready: None,
             });
@@ -473,20 +472,19 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
     /// exported state ([`WasmCoordinator::quiesce_snapshot`] → [`WasmCoordinator::start_migrating`]).
     ///
     /// # Errors
-    /// [`SwarmRunError::Lifecycle`] on a build/start/deliver failure or the run's hard deadline.
+    /// [`VhcRunError::Lifecycle`] on a build/start/deliver failure or the run's hard deadline.
     #[allow(clippy::too_many_lines)]
-    pub async fn drive(mut self) -> Result<CoordinatorReplay, SwarmRunError> {
+    pub async fn drive(mut self) -> Result<CoordinatorReplay, VhcRunError> {
         let wasm = crate::replay_sandbox::coordinator_quorum_wasm()
-            .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator blob: {e}")))?;
+            .map_err(|e| VhcRunError::Lifecycle(format!("coordinator blob: {e}")))?;
         let spec = self.spec(&wasm)?;
-        let coord_seed =
-            *blake3_hash(b"daemon-swarm/harness/wasm-coordinator/frame-key").as_bytes();
+        let coord_seed = *blake3_hash(b"daemon-vhc/harness/wasm-coordinator/frame-key").as_bytes();
         // The module start compiles the blob (CPU-seconds): hand this worker's task queue off
         // first so the drive cannot starve the same runtime's engine/collector tasks.
         let mut coord = tokio::task::block_in_place(|| {
             WasmCoordinator::start(&wasm, &spec, Vec::new(), 0, coord_seed)
         })
-        .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator start: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("coordinator start: {e}")))?;
 
         let mut sub = self.control.subscribe();
 
@@ -496,7 +494,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         let late = self.late_keys.clone();
         let envelope_hash = self.initial.config.envelope_hash;
         for key in &boot {
-            let join = SwarmMessage::Join(Join {
+            let join = VhcMessage::Join(Join {
                 run_id: self.run.as_str().to_string(),
                 iroh_id: JOIN_IROH_ID,
                 class: ThroughputClass::C1,
@@ -506,7 +504,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
             self.deliver(&mut coord, key, &join)?;
         }
         for key in &boot {
-            let hb = SwarmMessage::Heartbeat(daemon_vhc_proto::messages::Heartbeat {
+            let hb = VhcMessage::Heartbeat(daemon_vhc_proto::messages::Heartbeat {
                 round: 0,
                 ready: Some(true),
             });
@@ -537,7 +535,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
             // "staged before the boundary drain" is a certainty, not a race.
             if !late_joined && Self::round_opened(&coord) {
                 for key in &late {
-                    let join = SwarmMessage::Join(Join {
+                    let join = VhcMessage::Join(Join {
                         run_id: self.run.as_str().to_string(),
                         iroh_id: JOIN_IROH_ID,
                         class: ThroughputClass::C1,
@@ -556,7 +554,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
                     // Blocking span (guest-thread join + module recompile): hand the worker off.
                     coord = tokio::task::block_in_place(|| {
                         let capture = coord.quiesce_snapshot(60_000).map_err(|e| {
-                            SwarmRunError::Lifecycle(format!("coordinator restart quiesce: {e}"))
+                            VhcRunError::Lifecycle(format!("coordinator restart quiesce: {e}"))
                         })?;
                         WasmCoordinator::start_migrating(
                             &wasm,
@@ -567,7 +565,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
                             capture,
                         )
                         .map_err(|e| {
-                            SwarmRunError::Lifecycle(format!(
+                            VhcRunError::Lifecycle(format!(
                                 "coordinator restart re-instantiate: {e}"
                             ))
                         })
@@ -583,7 +581,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
                 break;
             }
             if start.elapsed() >= self.deadline {
-                return Err(SwarmRunError::Lifecycle(format!(
+                return Err(VhcRunError::Lifecycle(format!(
                     "wasm coordinator drive deadline: {total_records}/{} records",
                     self.num_rounds
                 )));
@@ -608,13 +606,13 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
                     let signer = msg.signer;
                     match &msg.payload {
                         // Skip the coordinator's own relayed outputs echoed back over gossip.
-                        SwarmMessage::RoundOpen(_) | SwarmMessage::RoundRecord(_) => continue,
+                        VhcMessage::RoundOpen(_) | VhcMessage::RoundRecord(_) => continue,
                         // Peer heartbeats are advisory post-warmup (readiness is synthesized at
                         // admission), and every delivered frame ticks the module's synthetic
                         // clock — relaying a steady heartbeat stream would burn a round's deadline
                         // budget before its evidence lands. Not delivered; carries no accounting.
-                        SwarmMessage::Heartbeat(_) => continue,
-                        SwarmMessage::Commitment(Commitment { round, .. }) => {
+                        VhcMessage::Heartbeat(_) => continue,
+                        VhcMessage::Commitment(Commitment { round, .. }) => {
                             let round = *round;
                             if let Some(key) = peer_keys.get(&signer) {
                                 let key = key.clone();
@@ -622,7 +620,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
                             }
                             self.receipt_for(&mut coord, round, signer).await?;
                         }
-                        SwarmMessage::Straggle(st) => {
+                        VhcMessage::Straggle(st) => {
                             let (round, is_stalled) = (
                                 st.round,
                                 st.status == daemon_vhc_proto::messages::StraggleStatus::Stalled,
@@ -654,7 +652,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         self.relay_new(&coord, &mut consumed).await?;
         coord
             .stop()
-            .map_err(|e| SwarmRunError::Lifecycle(format!("coordinator stop: {e}")))?;
+            .map_err(|e| VhcRunError::Lifecycle(format!("coordinator stop: {e}")))?;
 
         Ok(CoordinatorReplay::from_wasm_capture(
             self.initial,

@@ -32,7 +32,7 @@ use crate::backend::{StagedPayload, StateDigest, TrainerBackend};
 use crate::seam::{PayloadKey, RoundId, RunId};
 use daemon_vhc_net::PayloadStore;
 
-use crate::SwarmRunError;
+use crate::VhcRunError;
 
 /// The reserved payload-plane peer id under which a run's checkpoints are stored (never a real node
 /// identity — node pubkeys are ed25519 points, this sentinel is not).
@@ -116,14 +116,14 @@ pub async fn save_checkpoint<P, B>(
     backend: &B,
     round: RoundId,
     digest: StateDigest,
-) -> Result<CheckpointManifest, SwarmRunError>
+) -> Result<CheckpointManifest, VhcRunError>
 where
     P: PayloadStore,
     B: TrainerBackend,
 {
     let bytes = backend
         .checkpoint_save()
-        .map_err(|e| SwarmRunError::Lifecycle(format!("checkpoint_save: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("checkpoint_save: {e}")))?;
     let blake3 = blake3_hash(&bytes);
     let size = bytes.len() as u64;
     let key = PayloadKey::new(run.clone(), round, CHECKPOINT_PEER);
@@ -143,7 +143,7 @@ pub async fn load_checkpoint<P, B>(
     run: &RunId,
     backend: &mut B,
     manifest: &CheckpointManifest,
-) -> Result<(), SwarmRunError>
+) -> Result<(), VhcRunError>
 where
     P: PayloadStore,
     B: TrainerBackend,
@@ -152,7 +152,7 @@ where
     let bytes = store.get(&key, &manifest.blake3).await?;
     backend
         .checkpoint_load(&bytes)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("checkpoint_load: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("checkpoint_load: {e}")))?;
     Ok(())
 }
 
@@ -166,18 +166,18 @@ pub fn resync_by_replay<B: TrainerBackend>(
     backend: &mut B,
     checkpoint_bytes: &[u8],
     steps: &[ReplayStep],
-) -> Result<StateDigest, SwarmRunError> {
+) -> Result<StateDigest, VhcRunError> {
     backend
         .checkpoint_load(checkpoint_bytes)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("resync checkpoint_load: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("resync checkpoint_load: {e}")))?;
     let mut last = None;
     for step in steps {
         let digest = backend
             .ingest(step.round, &step.staged)
-            .map_err(|e| SwarmRunError::Lifecycle(format!("resync ingest r{}: {e}", step.round)))?;
+            .map_err(|e| VhcRunError::Lifecycle(format!("resync ingest r{}: {e}", step.round)))?;
         last = Some(digest);
     }
-    last.ok_or_else(|| SwarmRunError::Lifecycle("resync replay had no steps".into()))
+    last.ok_or_else(|| VhcRunError::Lifecycle("resync replay had no steps".into()))
 }
 
 // -- RUN-6: two-checkpointer both-match registration + degraded mode ----------------------------
@@ -322,7 +322,7 @@ pub async fn save_typed_checkpoint<P, B>(
     ident: &CheckpointIdent,
     backend: &B,
     capture: CheckpointCapture,
-) -> Result<TypedCheckpoint, SwarmRunError>
+) -> Result<TypedCheckpoint, VhcRunError>
 where
     P: PayloadStore,
     B: TrainerBackend,
@@ -335,10 +335,10 @@ where
     } = capture;
     let opaque = backend
         .checkpoint_save()
-        .map_err(|e| SwarmRunError::Lifecycle(format!("checkpoint_save: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("checkpoint_save: {e}")))?;
     let typed = backend
         .export_state_dict()
-        .map_err(|e| SwarmRunError::Lifecycle(format!("export_state_dict: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("export_state_dict: {e}")))?;
 
     let mut builder = TypedCheckpointManifest::builder(
         ident.run_id,
@@ -362,7 +362,7 @@ where
     if let Some(sd) = typed {
         let st = sd
             .to_safetensors()
-            .map_err(|e| SwarmRunError::Lifecycle(format!("safetensors serialize: {e}")))?;
+            .map_err(|e| VhcRunError::Lifecycle(format!("safetensors serialize: {e}")))?;
         builder = builder
             .section(
                 "module",
@@ -403,7 +403,7 @@ where
 
     let manifest = builder
         .build()
-        .map_err(|e| SwarmRunError::Lifecycle(format!("checkpoint manifest: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("checkpoint manifest: {e}")))?;
 
     // Store each section on the payload plane under its per-kind sentinel key; the put returns the
     // content hash, which MUST equal the hash the manifest declared.
@@ -417,7 +417,7 @@ where
     // Store the manifest itself, content-addressed.
     let wire = manifest
         .to_wire()
-        .map_err(|e| SwarmRunError::Lifecycle(format!("manifest wire: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("manifest wire: {e}")))?;
     let content_hash = blake3_hash(&wire);
     let mkey = PayloadKey::new(run.clone(), round, manifest_peer());
     store.put(&mkey, &wire).await?;
@@ -449,7 +449,7 @@ pub async fn load_typed_checkpoint<P, B>(
     run: &RunId,
     backend: &mut B,
     pointer: &CheckpointManifest,
-) -> Result<TypedCheckpointManifest, SwarmRunError>
+) -> Result<TypedCheckpointManifest, VhcRunError>
 where
     P: PayloadStore,
     B: TrainerBackend,
@@ -457,15 +457,15 @@ where
     let mkey = PayloadKey::new(run.clone(), pointer.round, manifest_peer());
     let wire = store.get(&mkey, &pointer.blake3).await?;
     let manifest = TypedCheckpointManifest::from_wire(&wire)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("manifest decode: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("manifest decode: {e}")))?;
     manifest
         .validate()
-        .map_err(|e| SwarmRunError::Lifecycle(format!("manifest validate: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("manifest validate: {e}")))?;
     let content_hash = manifest
         .content_hash()
-        .map_err(|e| SwarmRunError::Lifecycle(format!("manifest hash: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("manifest hash: {e}")))?;
     if content_hash != pointer.blake3 {
-        return Err(SwarmRunError::Lifecycle(
+        return Err(VhcRunError::Lifecycle(
             "typed checkpoint manifest content hash != pointer".into(),
         ));
     }
@@ -475,7 +475,7 @@ where
     let restore = manifest
         .section(SectionKind::WorkerLocal)
         .or_else(|| manifest.section(SectionKind::Module))
-        .ok_or_else(|| SwarmRunError::Lifecycle("checkpoint has no restore section".into()))?;
+        .ok_or_else(|| VhcRunError::Lifecycle("checkpoint has no restore section".into()))?;
     let restore_bytes = store
         .get(
             &PayloadKey::new(run.clone(), pointer.round, section_peer(restore.kind)),
@@ -484,7 +484,7 @@ where
         .await?;
     backend
         .checkpoint_load(&restore_bytes)
-        .map_err(|e| SwarmRunError::Lifecycle(format!("checkpoint_load: {e}")))?;
+        .map_err(|e| VhcRunError::Lifecycle(format!("checkpoint_load: {e}")))?;
 
     // Integrity-check the typed safetensors module section, if that is what the module section is.
     if let Some(module) = manifest.section(SectionKind::Module) {
@@ -500,7 +500,7 @@ where
                 )
                 .await?;
             daemon_vhc_safetensors::StateDict::from_safetensors(&st).map_err(|e| {
-                SwarmRunError::Lifecycle(format!("typed module section not valid safetensors: {e}"))
+                VhcRunError::Lifecycle(format!("typed module section not valid safetensors: {e}"))
             })?;
         }
     }
@@ -607,13 +607,13 @@ pub fn plan_late_join(
 /// content-addressed payload plane).
 ///
 /// # Errors
-/// A typed [`SwarmRunError::Lifecycle`] on a record without an inline set (the full set-object
+/// A typed [`VhcRunError::Lifecycle`] on a record without an inline set (the full set-object
 /// resolution is the live engine's path), a missing/mismatched payload, or a set commitment that
 /// does not recompute.
 pub fn steps_from_round_records<F>(
     records: &[daemon_vhc_proto::messages::RoundRecord],
     mut fetch: F,
-) -> Result<Vec<ReplayStep>, SwarmRunError>
+) -> Result<Vec<ReplayStep>, VhcRunError>
 where
     F: FnMut(&Hash) -> Option<Vec<u8>>,
 {
@@ -622,7 +622,7 @@ where
     let mut steps = Vec::with_capacity(records.len());
     for record in records {
         let entries = record.inline.as_ref().ok_or_else(|| {
-            SwarmRunError::Lifecycle(format!(
+            VhcRunError::Lifecycle(format!(
                 "round {} record has no inline set (resolve the set object via the live path)",
                 record.round
             ))
@@ -635,14 +635,14 @@ where
         let mut pairs = Vec::with_capacity(ordered.len());
         for entry in &ordered {
             let bytes = fetch(&entry.hash).ok_or_else(|| {
-                SwarmRunError::Lifecycle(format!(
+                VhcRunError::Lifecycle(format!(
                     "round {}: committed payload {} missing from the payload plane",
                     record.round,
                     entry.hash.to_hex()
                 ))
             })?;
             if blake3_hash(&bytes) != entry.hash || bytes.len() as u64 != entry.size {
-                return Err(SwarmRunError::Lifecycle(format!(
+                return Err(VhcRunError::Lifecycle(format!(
                     "round {}: payload does not re-verify against its committed entry",
                     record.round
                 )));
@@ -657,7 +657,7 @@ where
         // The record's committed set commitment must recompute from the verified pairs (the D2
         // consensus-replay discipline, applied at the catch-up boundary).
         if commit_set(&pairs).commitment() != record.set {
-            return Err(SwarmRunError::Lifecycle(format!(
+            return Err(VhcRunError::Lifecycle(format!(
                 "round {}: set commitment does not recompute from the payload set",
                 record.round
             )));
@@ -678,7 +678,7 @@ mod tests {
 
     fn temp_store() -> Arc<FsPayloadStore> {
         let root = std::env::temp_dir().join(format!(
-            "daemon-swarm-ckpt-{}-{}",
+            "daemon-vhc-ckpt-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -739,7 +739,7 @@ mod tests {
         let err = load_checkpoint(&store, &run, &mut fresh, &manifest)
             .await
             .unwrap_err();
-        assert!(matches!(err, SwarmRunError::Net(_)), "got {err:?}");
+        assert!(matches!(err, VhcRunError::Net(_)), "got {err:?}");
     }
 
     use daemon_vhc_proto::{peer_id, SigningKey};

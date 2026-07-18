@@ -12,7 +12,7 @@
 //! - **`https://`** → `EgressClient` GET with `Redirects::FollowValidated` (§8 "data host").
 //! - **`hf://<repo>@<rev>/<path>`** → mapped to the pinned HF resolve URL
 //!   `https://huggingface.co/<repo>/resolve/<rev>/<path>` and GET through egress. **Unpinned refs
-//!   are rejected** ([`SwarmNetError::UnpinnedRevision`]) — only a pinned revision is as immutable
+//!   are rejected** ([`VhcNetError::UnpinnedRevision`]) — only a pinned revision is as immutable
 //!   as a content-addressed object (§8). Mirrors the revision-pin shape of daemon-models
 //!   `crates/providers/daemon-models/src/acquire.rs:395` (`Repo::with_revision`), but over
 //!   `EgressClient` (hf-hub does its own HTTP, which would bypass the egress gate).
@@ -21,7 +21,7 @@
 //!
 //! Every scheme blake3-verifies the fetched bytes against the artifact map's hash before returning
 //! (tamper/corruption reject, §12). [`ArtifactCache`] is the RUN-4 LRU that bounds resolved-artifact
-//! bytes by `[swarm].data_cache_gb`.
+//! bytes by `[vhc].data_cache_gb`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -32,7 +32,7 @@ use daemon_vhc_proto::blake3_hash;
 
 use crate::presign::{PresignClient, PresignOp, PresignRequest};
 use crate::seam::{ContentHash, RunId};
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// The transport scheme of an artifact URL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,17 +49,17 @@ pub enum ArtifactScheme {
 
 impl ArtifactScheme {
     /// Split `url` into its scheme + the remainder after `scheme://`.
-    fn parse(url: &str) -> Result<(Self, &str), SwarmNetError> {
+    fn parse(url: &str) -> Result<(Self, &str), VhcNetError> {
         let (scheme, rest) = url
             .split_once("://")
-            .ok_or_else(|| SwarmNetError::BadUrl(format!("missing scheme separator: {url}")))?;
+            .ok_or_else(|| VhcNetError::BadUrl(format!("missing scheme separator: {url}")))?;
         let scheme = match scheme {
             "file" => Self::File,
             "r2" => Self::R2,
             "hf" => Self::Hf,
             "https" => Self::Https,
             other => {
-                return Err(SwarmNetError::BadUrl(format!("unknown scheme: {other}")));
+                return Err(VhcNetError::BadUrl(format!("unknown scheme: {other}")));
             }
         };
         Ok((scheme, rest))
@@ -120,7 +120,7 @@ impl std::fmt::Debug for ArtifactResolver {
 
 impl ArtifactResolver {
     /// A **file-only** resolver (`file://`, blake3-verified). Network schemes return
-    /// [`SwarmNetError::SchemeUnsupported`] until [`ArtifactResolver::with_egress`] is used.
+    /// [`VhcNetError::SchemeUnsupported`] until [`ArtifactResolver::with_egress`] is used.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -162,12 +162,12 @@ impl ArtifactResolver {
     }
 
     /// Fetch `artifact` and verify its blake3. A mismatch is a typed
-    /// [`SwarmNetError::HashMismatch`] (tamper/corruption reject, §12).
-    pub async fn fetch(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, SwarmNetError> {
+    /// [`VhcNetError::HashMismatch`] (tamper/corruption reject, §12).
+    pub async fn fetch(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, VhcNetError> {
         let bytes = self.fetch_raw(&artifact.url).await?;
         let actual = blake3_hash(&bytes);
         if actual != artifact.blake3 {
-            return Err(SwarmNetError::HashMismatch {
+            return Err(VhcNetError::HashMismatch {
                 expected: artifact.blake3.to_hex(),
                 actual: actual.to_hex(),
             });
@@ -176,7 +176,7 @@ impl ArtifactResolver {
     }
 
     /// Fetch the raw bytes for `url`, dispatching on scheme (no verification).
-    async fn fetch_raw(&self, url: &str) -> Result<Vec<u8>, SwarmNetError> {
+    async fn fetch_raw(&self, url: &str) -> Result<Vec<u8>, VhcNetError> {
         let (scheme, rest) = ArtifactScheme::parse(url)?;
         match scheme {
             ArtifactScheme::File => read_file_uri(rest).await,
@@ -187,37 +187,35 @@ impl ArtifactResolver {
     }
 
     /// The configured egress client, or a typed "scheme needs egress" error.
-    fn egress(&self, scheme: &str) -> Result<&EgressClient, SwarmNetError> {
+    fn egress(&self, scheme: &str) -> Result<&EgressClient, VhcNetError> {
         self.egress.as_ref().ok_or_else(|| {
-            SwarmNetError::SchemeUnsupported(format!(
+            VhcNetError::SchemeUnsupported(format!(
                 "{scheme} needs an egress client — build with ArtifactResolver::with_egress"
             ))
         })
     }
 
     /// `https://` → egress GET, browser-style validated redirects (data hosts 302 to a CDN).
-    async fn fetch_https(&self, url: &str) -> Result<Vec<u8>, SwarmNetError> {
+    async fn fetch_https(&self, url: &str) -> Result<Vec<u8>, VhcNetError> {
         egress_get_bytes(self.egress("https://")?, url).await
     }
 
     /// `hf://<repo>@<rev>/<path>` → the pinned HF resolve URL, via egress. Unpinned → reject (§8).
-    async fn fetch_hf(&self, rest: &str) -> Result<Vec<u8>, SwarmNetError> {
+    async fn fetch_hf(&self, rest: &str) -> Result<Vec<u8>, VhcNetError> {
         let url = hf_resolve_url(&self.hf_base, rest)?;
         egress_get_bytes(self.egress("hf://")?, &url).await
     }
 
     /// `r2://<path>` → presigned GET (artifact object key = run-relative `path`), via egress.
-    async fn fetch_r2(&self, rest: &str) -> Result<Vec<u8>, SwarmNetError> {
+    async fn fetch_r2(&self, rest: &str) -> Result<Vec<u8>, VhcNetError> {
         let egress = self.egress("r2://")?;
         let presign = self.presign.as_ref().ok_or_else(|| {
-            SwarmNetError::SchemeUnsupported(
+            VhcNetError::SchemeUnsupported(
                 "r2:// needs a presign client — chain ArtifactResolver::with_presign".into(),
             )
         })?;
         let run = self.run.as_ref().ok_or_else(|| {
-            SwarmNetError::SchemeUnsupported(
-                "r2:// needs a run — chain with_presign(.., run)".into(),
-            )
+            VhcNetError::SchemeUnsupported("r2:// needs a run — chain with_presign(.., run)".into())
         })?;
         let path = rest.trim_start_matches('/');
         let req = PresignRequest::artifact(PresignOp::Get, path);
@@ -228,20 +226,20 @@ impl ArtifactResolver {
 
 /// Resolve the local path of a `file://` URI's remainder (`<host>/<abs-path>`), accepting an empty
 /// or `localhost` host per RFC 8089.
-fn file_uri_path(rest: &str) -> Result<PathBuf, SwarmNetError> {
+fn file_uri_path(rest: &str) -> Result<PathBuf, VhcNetError> {
     // `file:///abs/path` -> rest = "/abs/path"; `file://localhost/abs` -> rest = "localhost/abs".
     let path = if let Some(stripped) = rest.strip_prefix('/') {
         // Empty host: rest began with the leading slash of the absolute path.
         format!("/{stripped}")
     } else if let Some((host, path)) = rest.split_once('/') {
         if !host.is_empty() && host != "localhost" {
-            return Err(SwarmNetError::BadUrl(format!(
+            return Err(VhcNetError::BadUrl(format!(
                 "file:// host must be empty or localhost, got {host:?}"
             )));
         }
         format!("/{path}")
     } else {
-        return Err(SwarmNetError::BadUrl(format!(
+        return Err(VhcNetError::BadUrl(format!(
             "file:// url has no path: file://{rest}"
         )));
     };
@@ -256,28 +254,28 @@ fn file_uri_path(rest: &str) -> Result<PathBuf, SwarmNetError> {
 /// does not apply to an absolute, operator-pinned path, so this is the one sanctioned raw-fs read in
 /// the crate. (Network schemes route through `daemon-egress`, never raw fs.)
 #[allow(clippy::disallowed_methods)]
-async fn read_file_uri(rest: &str) -> Result<Vec<u8>, SwarmNetError> {
+async fn read_file_uri(rest: &str) -> Result<Vec<u8>, VhcNetError> {
     let path = file_uri_path(rest)?;
     tokio::fs::read(&path)
         .await
-        .map_err(|e| SwarmNetError::Fetch(format!("read {}: {e}", path.display())))
+        .map_err(|e| VhcNetError::Fetch(format!("read {}: {e}", path.display())))
 }
 
 /// GET `url` through the egress client and return the body, mapping non-2xx + transport failures to
-/// [`SwarmNetError::Fetch`]. Validated redirects are followed (data hosts / HF `resolve` 302 to CDN).
-async fn egress_get_bytes(egress: &EgressClient, url: &str) -> Result<Vec<u8>, SwarmNetError> {
+/// [`VhcNetError::Fetch`]. Validated redirects are followed (data hosts / HF `resolve` 302 to CDN).
+async fn egress_get_bytes(egress: &EgressClient, url: &str) -> Result<Vec<u8>, VhcNetError> {
     let resp = egress
         .get(url, Redirects::DEFAULT)
         .await
-        .map_err(|e| SwarmNetError::Fetch(format!("egress GET {url}: {e}")))?;
+        .map_err(|e| VhcNetError::Fetch(format!("egress GET {url}: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(SwarmNetError::Fetch(format!("GET {url} returned {status}")));
+        return Err(VhcNetError::Fetch(format!("GET {url} returned {status}")));
     }
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| SwarmNetError::Fetch(format!("read body {url}: {e}")))?;
+        .map_err(|e| VhcNetError::Fetch(format!("read body {url}: {e}")))?;
     Ok(bytes.to_vec())
 }
 
@@ -288,15 +286,15 @@ async fn egress_get_bytes(egress: &EgressClient, url: &str) -> Result<Vec<u8>, S
 /// `@`. A remainder with no `@` (unpinned) is rejected — only a pinned revision is immutable (§8).
 /// Mirrors daemon-models `acquire.rs:395` (`Repo::with_revision(repo, Model, rev)`), which resolves
 /// into the same `/resolve/<rev>/` URL space.
-fn hf_resolve_url(base: &str, rest: &str) -> Result<String, SwarmNetError> {
+fn hf_resolve_url(base: &str, rest: &str) -> Result<String, VhcNetError> {
     let (repo, right) = rest
         .split_once('@')
-        .ok_or_else(|| SwarmNetError::UnpinnedRevision(format!("hf://{rest}")))?;
-    let (rev, path) = right.split_once('/').ok_or_else(|| {
-        SwarmNetError::BadUrl(format!("hf:// reference has no path: hf://{rest}"))
-    })?;
+        .ok_or_else(|| VhcNetError::UnpinnedRevision(format!("hf://{rest}")))?;
+    let (rev, path) = right
+        .split_once('/')
+        .ok_or_else(|| VhcNetError::BadUrl(format!("hf:// reference has no path: hf://{rest}")))?;
     if repo.is_empty() || rev.is_empty() || path.is_empty() {
-        return Err(SwarmNetError::BadUrl(format!(
+        return Err(VhcNetError::BadUrl(format!(
             "hf:// reference must be hf://<repo>@<rev>/<path>: hf://{rest}"
         )));
     }
@@ -306,7 +304,7 @@ fn hf_resolve_url(base: &str, rest: &str) -> Result<String, SwarmNetError> {
 /// A bounded LRU cache of resolved artifact bytes (spec §8, §10.6; TDD RUN-4).
 ///
 /// Artifacts (module `.wasm`, tokenizer, shards) download lazily ahead-of-need into a workspace
-/// cache bounded by `[swarm].data_cache_gb`. This is that bound: an LRU over the resolved bytes,
+/// cache bounded by `[vhc].data_cache_gb`. This is that bound: an LRU over the resolved bytes,
 /// keyed by the artifact URL, evicting least-recently-used entries until a new insert fits. Bytes
 /// are already blake3-verified by [`ArtifactResolver::fetch`] before they land here.
 ///
@@ -331,7 +329,7 @@ impl ArtifactCache {
         }
     }
 
-    /// A cache bounded by `[swarm].data_cache_gb` gibibytes (the §10.6 knob, RUN-4).
+    /// A cache bounded by `[vhc].data_cache_gb` gibibytes (the §10.6 knob, RUN-4).
     #[must_use]
     pub fn from_gb(data_cache_gb: u32) -> Self {
         Self::new(u64::from(data_cache_gb) * (1 << 30))
@@ -440,7 +438,7 @@ mod tests {
         );
         assert!(matches!(
             ArtifactScheme::parse("no-scheme"),
-            Err(SwarmNetError::BadUrl(_))
+            Err(VhcNetError::BadUrl(_))
         ));
     }
 
@@ -473,16 +471,16 @@ mod tests {
 
         let err = ArtifactResolver::new().fetch(&art).await.unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::HashMismatch { .. }),
+            matches!(err, VhcNetError::HashMismatch { .. }),
             "got {err:?}"
         );
     }
 
     #[tokio::test]
     async fn missing_file_is_fetch_error() {
-        let art = ArtifactRef::new("file:///no/such/daemon-swarm/artifact", blake3_hash(b""));
+        let art = ArtifactRef::new("file:///no/such/daemon-vhc/artifact", blake3_hash(b""));
         let err = ArtifactResolver::new().fetch(&art).await.unwrap_err();
-        assert!(matches!(err, SwarmNetError::Fetch(_)), "got {err:?}");
+        assert!(matches!(err, VhcNetError::Fetch(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -495,7 +493,7 @@ mod tests {
             let art = ArtifactRef::new(url, blake3_hash(b""));
             let err = ArtifactResolver::new().fetch(&art).await.unwrap_err();
             assert!(
-                matches!(err, SwarmNetError::SchemeUnsupported(_)),
+                matches!(err, VhcNetError::SchemeUnsupported(_)),
                 "{url}: got {err:?}"
             );
         }
@@ -519,7 +517,7 @@ mod tests {
         // No `@rev` at all — the reject the NET-3 `unpinned_hf_rejected` case asserts (unit level).
         let err = hf_resolve_url(HF_HUB_BASE, "org/repo/file.json").unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::UnpinnedRevision(_)),
+            matches!(err, VhcNetError::UnpinnedRevision(_)),
             "got {err:?}"
         );
     }
@@ -527,7 +525,7 @@ mod tests {
     #[test]
     fn hf_pinned_without_path_is_bad_url() {
         let err = hf_resolve_url(HF_HUB_BASE, "org/repo@rev").unwrap_err();
-        assert!(matches!(err, SwarmNetError::BadUrl(_)), "got {err:?}");
+        assert!(matches!(err, VhcNetError::BadUrl(_)), "got {err:?}");
     }
 
     #[test]
@@ -612,7 +610,7 @@ mod tests {
         let art = ArtifactRef::new("r2://experiment.wasm", blake3_hash(b"the-original"));
         let err = resolver.fetch(&art).await.unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::HashMismatch { .. }),
+            matches!(err, VhcNetError::HashMismatch { .. }),
             "got {err:?}"
         );
     }
@@ -640,7 +638,7 @@ mod tests {
         let art = ArtifactRef::new("hf://org/model/model.bin", blake3_hash(b""));
         let err = resolver.fetch(&art).await.unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::UnpinnedRevision(_)),
+            matches!(err, VhcNetError::UnpinnedRevision(_)),
             "got {err:?}"
         );
     }
@@ -667,7 +665,7 @@ mod tests {
         let art = ArtifactRef::new("https://127.0.0.1:1/artifact", blake3_hash(b""));
         let err = resolver.fetch(&art).await.unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::Fetch(_)),
+            matches!(err, VhcNetError::Fetch(_)),
             "https must route through egress (got {err:?})"
         );
     }

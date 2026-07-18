@@ -3,14 +3,14 @@
 
 //! Run-health summary — plain, serializable per-round facts (spec §6.4, §14; TDD §3.9).
 //!
-//! The base for `daemon-cli swarm observe` / the app's run view: each round's committed count,
+//! The base for `daemon-cli vhc observe` / the app's run view: each round's committed count,
 //! attested coverage, stragglers, drops, digest agreement, and activity span, derived **only** from
 //! the signed [`MessageLog`]. No privileged coordinator state — the app renders the node's answer
 //! (architecture invariant), and this is the node-side projection it renders.
 
 use std::collections::BTreeSet;
 
-use daemon_vhc_proto::messages::SwarmMessage;
+use daemon_vhc_proto::messages::VhcMessage;
 use daemon_vhc_proto::PeerId;
 use serde::{Deserialize, Serialize};
 
@@ -70,7 +70,7 @@ fn round_health(log: &MessageLog, round: u64) -> RoundHealth {
     let record = log
         .by_round_kind(round, MessageKind::RoundRecord)
         .filter_map(|m| match &m.payload {
-            SwarmMessage::RoundRecord(r) => Some(r.clone()),
+            VhcMessage::RoundRecord(r) => Some(r.clone()),
             _ => None,
         })
         .last();
@@ -98,7 +98,7 @@ fn round_health(log: &MessageLog, round: u64) -> RoundHealth {
     let mut reporters: BTreeSet<PeerId> = BTreeSet::new();
     let mut digests: BTreeSet<_> = BTreeSet::new();
     for m in log.by_round_kind(round, MessageKind::Digest) {
-        if let SwarmMessage::Digest(d) = &m.payload {
+        if let VhcMessage::Digest(d) = &m.payload {
             reporters.insert(m.signer);
             digests.insert(d.digest);
         }

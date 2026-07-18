@@ -10,10 +10,10 @@
 use std::error::Error;
 use std::fmt;
 
-/// Errors surfaced across the swarm proto contract.
+/// Errors surfaced across the vhc proto contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum SwarmProtoError {
+pub enum VhcProtoError {
     /// A schema value was out of range, missing, or inconsistent (e.g. unknown envelope major).
     Validation(String),
     /// A CBOR (de)serialization / canonicalization step failed.
@@ -24,21 +24,21 @@ pub enum SwarmProtoError {
     Merkle(String),
     /// A capability requirement was not satisfied (missing `name@version`).
     Capability(String),
-    /// A `SwarmProtoVersion` did not exactly match the run's pinned version.
+    /// A `VhcProtoVersion` did not exactly match the run's pinned version.
     Version(String),
 }
 
-impl fmt::Display for SwarmProtoError {
+impl fmt::Display for VhcProtoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Validation(d) => write!(f, "swarm envelope validation failed: {d}"),
-            Self::Codec(d) => write!(f, "swarm envelope codec error: {d}"),
-            Self::Signature(d) => write!(f, "swarm signature error: {d}"),
-            Self::Merkle(d) => write!(f, "swarm set-commitment error: {d}"),
-            Self::Capability(d) => write!(f, "swarm capability error: {d}"),
-            Self::Version(d) => write!(f, "swarm proto version error: {d}"),
+            Self::Validation(d) => write!(f, "vhc envelope validation failed: {d}"),
+            Self::Codec(d) => write!(f, "vhc envelope codec error: {d}"),
+            Self::Signature(d) => write!(f, "vhc signature error: {d}"),
+            Self::Merkle(d) => write!(f, "vhc set-commitment error: {d}"),
+            Self::Capability(d) => write!(f, "vhc capability error: {d}"),
+            Self::Version(d) => write!(f, "vhc proto version error: {d}"),
         }
     }
 }
 
-impl Error for SwarmProtoError {}
+impl Error for VhcProtoError {}

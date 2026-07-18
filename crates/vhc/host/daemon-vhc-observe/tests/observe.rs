@@ -12,10 +12,10 @@
 #![allow(clippy::disallowed_methods)]
 
 use daemon_vhc_proto::messages::{
-    Digest, RoundRecord, SignedMessage, Straggle, StraggleStatus, SwarmMessage,
+    Digest, RoundRecord, SignedMessage, Straggle, StraggleStatus, VhcMessage,
 };
 use daemon_vhc_proto::{
-    blake3_hash, peer_id, to_canonical_vec, PeerId, SigningKey, StateDigest, SWARM_PROTO_VERSION,
+    blake3_hash, peer_id, to_canonical_vec, PeerId, SigningKey, StateDigest, VHC_PROTO_VERSION,
 };
 
 use daemon_vhc_sdk_consensus::coordinator::Input;
@@ -40,12 +40,8 @@ fn signed_records(fx: &Fixture, coord: &SigningKey) -> Vec<SignedMessage> {
     fx.records
         .iter()
         .map(|r| {
-            SignedMessage::sign(
-                coord,
-                SWARM_PROTO_VERSION,
-                SwarmMessage::RoundRecord(r.clone()),
-            )
-            .expect("sign record")
+            SignedMessage::sign(coord, VHC_PROTO_VERSION, VhcMessage::RoundRecord(r.clone()))
+                .expect("sign record")
         })
         .collect()
 }
@@ -75,7 +71,7 @@ fn anchor(records: &[RoundRecord]) -> daemon_vhc_proto::Hash {
 
 fn digest_msg(k: &SigningKey, round: u64, d: StateDigest) -> SignedMessage {
     let x = Digest { round, digest: d };
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Digest(x)).unwrap()
+    SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Digest(x)).unwrap()
 }
 
 fn straggle_msg(k: &SigningKey, round: u64) -> SignedMessage {
@@ -83,7 +79,7 @@ fn straggle_msg(k: &SigningKey, round: u64) -> SignedMessage {
         round,
         status: StraggleStatus::Stalled,
     };
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, SwarmMessage::Straggle(s)).unwrap()
+    SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Straggle(s)).unwrap()
 }
 
 // ----- OBS: message-log roundtrip -----
@@ -116,7 +112,7 @@ fn log_roundtrip_canonical() {
     // Joins are roster-scoped (no round) — not returned by `by_round`.
     assert_eq!(
         log.by_round(0)
-            .filter(|m| matches!(m.payload, SwarmMessage::Join(_)))
+            .filter(|m| matches!(m.payload, VhcMessage::Join(_)))
             .count(),
         0
     );
@@ -139,7 +135,7 @@ fn replay_matches_recorded_run() {
     assert_eq!(report.final_state_hash, anchor(&fx.records));
 }
 
-// ----- OBS: RunCapture replays a recorded run (the --observe / swarm-replay path) -----
+// ----- OBS: RunCapture replays a recorded run (the --observe / replay path) -----
 
 #[test]
 fn run_capture_replays_recorded_run() {
@@ -196,8 +192,7 @@ fn replay_detects_tampered_record() {
             rec.drops.push(pid(9));
         }
         log.append(
-            SignedMessage::sign(&coord, SWARM_PROTO_VERSION, SwarmMessage::RoundRecord(rec))
-                .unwrap(),
+            SignedMessage::sign(&coord, VHC_PROTO_VERSION, VhcMessage::RoundRecord(rec)).unwrap(),
         );
     }
 

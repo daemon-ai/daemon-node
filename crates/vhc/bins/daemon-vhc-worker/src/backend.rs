@@ -160,13 +160,13 @@ async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String
 }
 
 /// Fetch one genesis artifact-map entry (blake3-verified): `file://` through the file resolver;
-/// network URLs through the payload-store path under the `swarm-net` feature.
+/// network URLs through the payload-store path under the `vhc-net` feature.
 async fn fetch_genesis_artifact(
     artifact: &daemon_vhc_proto::SnapshotArtifact,
     name: &str,
 ) -> Result<Vec<u8>, String> {
     let art = ArtifactRef::new(artifact.url.clone(), artifact.blake3);
-    #[cfg(feature = "swarm-net")]
+    #[cfg(feature = "vhc-net")]
     if !artifact.url.starts_with("file://") {
         return fetch_artifact_from_store(&art)
             .await
@@ -202,7 +202,7 @@ pub(crate) async fn resolve_coordinator_module(
 /// The presign context the node sets when spawning the worker for a live run (small env strings, NOT
 /// a pre-staged artifact): the coordinator base, run id, auth, and the on-disk cache dir/budget. This
 /// is the fetch-by-hash analogue of `DAEMON_TRAIN_MODULE` — a node-controlled input at assess time.
-#[cfg(feature = "swarm-net")]
+#[cfg(feature = "vhc-net")]
 pub(crate) struct StoreFetchContext {
     pub(crate) presign_base: Option<String>,
     pub(crate) run_id: String,
@@ -211,29 +211,29 @@ pub(crate) struct StoreFetchContext {
     pub(crate) cache_gb: u32,
 }
 
-#[cfg(feature = "swarm-net")]
+#[cfg(feature = "vhc-net")]
 pub(crate) fn store_fetch_context() -> StoreFetchContext {
     use daemon_vhc_session::protocol::WsAuthSpec;
-    let ws_auth = if let Ok(bearer) = std::env::var("DAEMON_SWARM_BEARER") {
+    let ws_auth = if let Ok(bearer) = std::env::var("DAEMON_VHC_BEARER") {
         WsAuthSpec::Bearer(bearer)
     } else if let (Ok(org_id), Ok(actor)) = (
-        std::env::var("DAEMON_SWARM_ORG"),
-        std::env::var("DAEMON_SWARM_ACTOR"),
+        std::env::var("DAEMON_VHC_ORG"),
+        std::env::var("DAEMON_VHC_ACTOR"),
     ) {
         WsAuthSpec::Internal { org_id, actor }
     } else {
         WsAuthSpec::None
     };
-    let cache_dir = std::env::var_os("DAEMON_SWARM_CACHE_DIR")
+    let cache_dir = std::env::var_os("DAEMON_VHC_CACHE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("daemon-swarm-cache"));
-    let cache_gb = std::env::var("DAEMON_SWARM_CACHE_GB")
+        .unwrap_or_else(|| std::env::temp_dir().join("daemon-vhc-cache"));
+    let cache_gb = std::env::var("DAEMON_VHC_CACHE_GB")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
     StoreFetchContext {
-        presign_base: std::env::var("DAEMON_SWARM_PRESIGN_BASE").ok(),
-        run_id: std::env::var("DAEMON_SWARM_RUN_ID").unwrap_or_else(|_| "run-unknown".to_string()),
+        presign_base: std::env::var("DAEMON_VHC_PRESIGN_BASE").ok(),
+        run_id: std::env::var("DAEMON_VHC_RUN_ID").unwrap_or_else(|_| "run-unknown".to_string()),
         ws_auth,
         cache_dir,
         cache_gb,
@@ -241,7 +241,7 @@ pub(crate) fn store_fetch_context() -> StoreFetchContext {
 }
 
 /// Build a content-addressed [`daemon_vhc_net::ContentCache`] from the node-set context.
-#[cfg(feature = "swarm-net")]
+#[cfg(feature = "vhc-net")]
 pub(crate) fn open_content_cache(
     ctx: &StoreFetchContext,
 ) -> Result<daemon_vhc_net::ContentCache, String> {
@@ -251,7 +251,7 @@ pub(crate) fn open_content_cache(
 
 /// Build an [`ArtifactResolver`] wired for the network schemes from the node-set presign context
 /// (egress for `https`/`hf`; egress + presign for `r2://`).
-#[cfg(feature = "swarm-net")]
+#[cfg(feature = "vhc-net")]
 pub(crate) fn store_resolver(ctx: &StoreFetchContext) -> Result<ArtifactResolver, String> {
     use daemon_vhc_net::{HttpPresignClient, PresignClient, RunId};
     let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
@@ -280,7 +280,7 @@ pub(crate) fn store_resolver(ctx: &StoreFetchContext) -> Result<ArtifactResolver
 
 /// Fetch `art` from the payload store (presigned GET), checking the on-disk content cache first and
 /// caching the verified bytes on a miss (P3 lane S — the fleet distribution path).
-#[cfg(feature = "swarm-net")]
+#[cfg(feature = "vhc-net")]
 pub(crate) async fn fetch_artifact_from_store(art: &ArtifactRef) -> Result<Vec<u8>, String> {
     let ctx = store_fetch_context();
     let cache = open_content_cache(&ctx)?;
@@ -297,7 +297,7 @@ pub(crate) async fn fetch_artifact_from_store(art: &ArtifactRef) -> Result<Vec<u
 }
 
 /// Decode a 64-char lowercase-hex blake3 into a content hash.
-#[cfg(feature = "swarm-net")]
+#[cfg(feature = "vhc-net")]
 pub(crate) fn hash_from_hex(s: &str) -> Option<daemon_vhc_net::ContentHash> {
     use daemon_vhc_net::ContentHash;
     let s = s.trim();
@@ -320,15 +320,15 @@ pub(crate) fn hash_from_hex(s: &str) -> Option<daemon_vhc_net::ContentHash> {
 /// finds every artifact cache-warm. Idempotent (re-running is all cache hits).
 ///
 /// Env (mirrors the assess-time fetch context; all plain strings so `set X=… && worker.exe` works):
-/// `DAEMON_SWARM_PRESIGN_BASE`, `DAEMON_SWARM_RUN_ID`, `DAEMON_SWARM_ORG`/`DAEMON_SWARM_ACTOR` (or
-/// `DAEMON_SWARM_BEARER`), `DAEMON_SWARM_CACHE_DIR`/`DAEMON_SWARM_CACHE_GB`, plus what to warm:
+/// `DAEMON_VHC_PRESIGN_BASE`, `DAEMON_VHC_RUN_ID`, `DAEMON_VHC_ORG`/`DAEMON_VHC_ACTOR` (or
+/// `DAEMON_VHC_BEARER`), `DAEMON_VHC_CACHE_DIR`/`DAEMON_VHC_CACHE_GB`, plus what to warm:
 /// `DAEMON_TRAIN_PREFETCH_MODULE=<blake3-hex>`, `DAEMON_TRAIN_PREFETCH_MANIFEST=<blake3-hex>`,
 /// `DAEMON_TRAIN_PREFETCH_WINDOW=<start>:<count>` (optional; absent/0 = every shard).
-#[cfg(feature = "swarm-net")]
+#[cfg(feature = "vhc-net")]
 pub(crate) async fn prefetch_main() -> Result<(), String> {
     let ctx = store_fetch_context();
     if ctx.presign_base.is_none() {
-        return Err("DAEMON_TRAIN_PREFETCH needs DAEMON_SWARM_PRESIGN_BASE".to_string());
+        return Err("DAEMON_TRAIN_PREFETCH needs DAEMON_VHC_PRESIGN_BASE".to_string());
     }
     let cache = open_content_cache(&ctx)?;
     let resolver = store_resolver(&ctx)?;

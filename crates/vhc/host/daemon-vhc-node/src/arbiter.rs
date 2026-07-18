@@ -35,7 +35,7 @@
 //!
 //! The keys are the frozen execution identity's demux tuple (ABI §8.1, decisions D1):
 //! [`RoleInstanceId`] `{ run_id, epoch, role, instance }`, where `instance` is the never-reused,
-//! node-durable, monotonic u64 incarnation id ([`crate::SwarmStore::mint_incarnation`]).
+//! node-durable, monotonic u64 incarnation id ([`crate::VhcStore::mint_incarnation`]).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -182,7 +182,7 @@ pub struct OwnerBudget {
 }
 
 impl OwnerBudget {
-    /// A permissive budget (everything unbounded) — the explicit opt-out (`[swarm.owner_budget]
+    /// A permissive budget (everything unbounded) — the explicit opt-out (`[vhc.owner_budget]
     /// unbounded = true`) and the default in tests; the arbiter still enforces key uniqueness and
     /// teardown ordering.
     #[must_use]
@@ -202,13 +202,13 @@ impl OwnerBudget {
     /// owner does not configure `max_instances` (a finite bound — never `u32::MAX`).
     pub const DEFAULT_MAX_INSTANCES: u32 = 4;
 
-    /// Map an `[swarm.owner_budget]` config + an optional hardware probe into the standing owner
+    /// Map an `[vhc.owner_budget]` config + an optional hardware probe into the standing owner
     /// ledgers (decisions D6). `cfg.unbounded` short-circuits to [`Self::unbounded`]; otherwise
     /// every ledger left at its zero/empty default is derived **conservatively and finitely** —
     /// from the probe where one is available, else a documented fixed floor — so an enabled node
     /// with no configured budget still bounds admission rather than granting everything. The exact
     /// per-field derivation is documented on [`OwnerBudgetConfig`]; `data_cache_gb` is the
-    /// `[swarm]` cache bound the disk ledger defaults to.
+    /// `[vhc]` cache bound the disk ledger defaults to.
     #[must_use]
     pub fn from_config(cfg: &OwnerBudgetConfig, hw: Option<&Hardware>, data_cache_gb: u32) -> Self {
         const MIB: u64 = 1 << 20;

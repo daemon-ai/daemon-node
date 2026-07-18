@@ -58,7 +58,7 @@ pub use crate::assignment::{
 #[non_exhaustive]
 pub enum CoordinatorError {
     /// A proto-contract step failed (canonicalization, capability parse, envelope validation).
-    Proto(daemon_vhc_proto::SwarmProtoError),
+    Proto(daemon_vhc_proto::VhcProtoError),
     /// The run configuration was inconsistent.
     Config(String),
 }
@@ -81,8 +81,8 @@ impl Error for CoordinatorError {
     }
 }
 
-impl From<daemon_vhc_proto::SwarmProtoError> for CoordinatorError {
-    fn from(e: daemon_vhc_proto::SwarmProtoError) -> Self {
+impl From<daemon_vhc_proto::VhcProtoError> for CoordinatorError {
+    fn from(e: daemon_vhc_proto::VhcProtoError) -> Self {
         Self::Proto(e)
     }
 }

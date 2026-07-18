@@ -18,11 +18,10 @@ use std::collections::BTreeMap;
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_vhc_proto::messages::{
     Commitment, Heartbeat, Join, RecordEntry, RoundRecord, SignedMessage, StorageReceipt,
-    SwarmMessage, ThroughputClass,
+    ThroughputClass, VhcMessage,
 };
 use daemon_vhc_proto::{
-    blake3_hash, peer_id, CapabilitySet, Hash, IrohId, PeerId, Seed, SigningKey,
-    SWARM_PROTO_VERSION,
+    blake3_hash, peer_id, CapabilitySet, Hash, IrohId, PeerId, Seed, SigningKey, VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 
@@ -50,7 +49,7 @@ pub fn run_config(run_id: &str) -> RunConfig {
     let envelope_hash = blake3_hash(run_id.as_bytes());
     RunConfig {
         run_id: run_id.into(),
-        proto_version: SWARM_PROTO_VERSION,
+        proto_version: VHC_PROTO_VERSION,
         envelope_hash,
         required_capabilities: CapabilitySet::new(),
         min_peers: 2,
@@ -102,13 +101,13 @@ pub struct Fixture {
     pub peers: Vec<PeerId>,
     pub driving: Vec<SignedMessage>,
     /// Every decision the module published, in order (`RoundOpen` + `RoundRecord`).
-    pub published: Vec<SwarmMessage>,
+    pub published: Vec<VhcMessage>,
     pub records: Vec<RoundRecord>,
     pub payloads: BTreeMap<Hash, Vec<u8>>,
 }
 
-fn sign(k: &SigningKey, m: SwarmMessage) -> SignedMessage {
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, m).expect("sign")
+fn sign(k: &SigningKey, m: VhcMessage) -> SignedMessage {
+    SignedMessage::sign(k, VHC_PROTO_VERSION, m).expect("sign")
 }
 
 /// Author the deterministic driving script and run it through the real coordinator module to
@@ -129,7 +128,7 @@ pub fn run_fixture(sandbox: &WasmCoordinatorSandbox, run_id: &str, rounds: u64) 
     for k in &worker_keys {
         driving.push(sign(
             k,
-            SwarmMessage::Join(Join {
+            VhcMessage::Join(Join {
                 run_id: run_id.into(),
                 iroh_id: IrohId([0x44; 32]),
                 class: ThroughputClass::C1,
@@ -141,7 +140,7 @@ pub fn run_fixture(sandbox: &WasmCoordinatorSandbox, run_id: &str, rounds: u64) 
     for k in &worker_keys {
         driving.push(sign(
             k,
-            SwarmMessage::Heartbeat(Heartbeat {
+            VhcMessage::Heartbeat(Heartbeat {
                 round: 0,
                 ready: Some(true),
             }),
@@ -154,7 +153,7 @@ pub fn run_fixture(sandbox: &WasmCoordinatorSandbox, run_id: &str, rounds: u64) 
             payloads.insert(hash, bytes.clone());
             driving.push(sign(
                 k,
-                SwarmMessage::Commitment(Commitment {
+                VhcMessage::Commitment(Commitment {
                     round,
                     payload: hash,
                     size: bytes.len() as u64,
@@ -169,7 +168,7 @@ pub fn run_fixture(sandbox: &WasmCoordinatorSandbox, run_id: &str, rounds: u64) 
         }
         driving.push(sign(
             &worker_keys[0],
-            SwarmMessage::StorageReceipt(StorageReceipt {
+            VhcMessage::StorageReceipt(StorageReceipt {
                 round,
                 verified: entries,
             }),
@@ -182,7 +181,7 @@ pub fn run_fixture(sandbox: &WasmCoordinatorSandbox, run_id: &str, rounds: u64) 
     let records: Vec<RoundRecord> = published
         .iter()
         .filter_map(|m| match m {
-            SwarmMessage::RoundRecord(r) => Some(r.clone()),
+            VhcMessage::RoundRecord(r) => Some(r.clone()),
             _ => None,
         })
         .collect();
@@ -210,7 +209,7 @@ pub fn replay_run(
     initial: &CoordinatorState,
     driving: &[SignedMessage],
     expected_records: usize,
-) -> Result<Vec<SwarmMessage>, daemon_vhc_observe::ReplayError> {
+) -> Result<Vec<VhcMessage>, daemon_vhc_observe::ReplayError> {
     use daemon_vhc_observe::CoordinatorSandbox as _;
     sandbox.replay_run(initial, driving, expected_records)
 }

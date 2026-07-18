@@ -102,7 +102,7 @@ pub struct AdmittedQuotas {
 
 /// A tighten-only violation — the host surfaces it as the ABI §1.5 `GrantsExceedLane` refusal.
 /// Hand-rolled (no `thiserror`) to keep the crate `wasm32`-clean, matching
-/// [`crate::error::SwarmProtoError`].
+/// [`crate::error::VhcProtoError`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GrantsError {

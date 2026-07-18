@@ -13,10 +13,10 @@ use crate::{global_batch_at, select_committee};
 use daemon_vhc_proto::envelope::StopCondition;
 use daemon_vhc_proto::messages::{
     Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RoundOpen, RoundRecord,
-    SignedMessage, StorageReceipt, Straggle, SwarmMessage,
+    SignedMessage, StorageReceipt, Straggle, VhcMessage,
 };
 use daemon_vhc_proto::sign::Signed;
-use daemon_vhc_proto::{blake3_hash, commit_set, Hash, PeerId, Seed, SwarmProtoVersion};
+use daemon_vhc_proto::{blake3_hash, commit_set, Hash, PeerId, Seed, VhcProtoVersion};
 
 use crate::authority::Authorized;
 use crate::coordinator::admission::{admit, JoinCandidate};
@@ -57,8 +57,8 @@ pub fn tick(mut state: CoordinatorState, input: Input) -> (CoordinatorState, Vec
 pub fn tick_authenticated(
     mut state: CoordinatorState,
     signer: PeerId,
-    version: SwarmProtoVersion,
-    payload: SwarmMessage,
+    version: VhcProtoVersion,
+    payload: VhcMessage,
     authorized: Authorized,
 ) -> (CoordinatorState, Vec<Output>) {
     // The token is the proof-of-provenance; its channel is not a dispatch input (delivery routing
@@ -162,19 +162,19 @@ fn dispatch_payload(
     state: &mut CoordinatorState,
     out: &mut Vec<Output>,
     signer: PeerId,
-    version: SwarmProtoVersion,
-    payload: SwarmMessage,
+    version: VhcProtoVersion,
+    payload: VhcMessage,
 ) {
     match payload {
-        SwarmMessage::Join(j) => on_join(state, out, signer, version, j),
-        SwarmMessage::Commitment(c) => on_commitment(state, out, signer, c),
-        SwarmMessage::Attestation(a) => on_attestation(state, out, signer, a),
-        SwarmMessage::StorageReceipt(sr) => on_receipt(state, out, sr),
-        SwarmMessage::Digest(d) => on_digest(state, out, signer, d),
-        SwarmMessage::Straggle(s) => on_straggle(state, signer, s),
-        SwarmMessage::Heartbeat(h) => on_heartbeat(state, out, signer, h),
-        SwarmMessage::CheckpointAttestation(ca) => on_checkpoint_attestation(state, out, &ca),
-        SwarmMessage::RoundOpen(_) | SwarmMessage::RoundRecord(_) => {
+        VhcMessage::Join(j) => on_join(state, out, signer, version, j),
+        VhcMessage::Commitment(c) => on_commitment(state, out, signer, c),
+        VhcMessage::Attestation(a) => on_attestation(state, out, signer, a),
+        VhcMessage::StorageReceipt(sr) => on_receipt(state, out, sr),
+        VhcMessage::Digest(d) => on_digest(state, out, signer, d),
+        VhcMessage::Straggle(s) => on_straggle(state, signer, s),
+        VhcMessage::Heartbeat(h) => on_heartbeat(state, out, signer, h),
+        VhcMessage::CheckpointAttestation(ca) => on_checkpoint_attestation(state, out, &ca),
+        VhcMessage::RoundOpen(_) | VhcMessage::RoundRecord(_) => {
             out.push(Output::Reject(Rejection::UnexpectedMessage));
         }
     }
@@ -219,7 +219,7 @@ fn on_join(
     state: &mut CoordinatorState,
     out: &mut Vec<Output>,
     signer: PeerId,
-    version: SwarmProtoVersion,
+    version: VhcProtoVersion,
     j: Join,
 ) {
     let cand = JoinCandidate {
@@ -533,7 +533,7 @@ fn open_round(state: &mut CoordinatorState, out: &mut Vec<Output>) {
         batch,
         deadline_unix_s: state.now_s + state.config.round_train_max_s,
     };
-    out.push(Output::publish(SwarmMessage::RoundOpen(ro)));
+    out.push(Output::publish(VhcMessage::RoundOpen(ro)));
 }
 
 /// Freeze the round record from signed evidence, account absences/drops, and decide the next phase.
@@ -586,7 +586,7 @@ fn finalize_round(state: &mut CoordinatorState, out: &mut Vec<Output>) {
     if let Some(s) = state.rounds.get_mut(round) {
         s.record = Some(record.clone());
     }
-    out.push(Output::publish(SwarmMessage::RoundRecord(record)));
+    out.push(Output::publish(VhcMessage::RoundRecord(record)));
 
     let gb = global_batch_at(state.config.global_batch, round);
     state.rounds_done += 1;

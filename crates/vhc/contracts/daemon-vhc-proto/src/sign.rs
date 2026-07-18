@@ -3,7 +3,7 @@
 
 //! ed25519 signing over canonical CBOR.
 //!
-//! Every swarm control message and the run envelope are signed by the node identity (spec §7.2,
+//! Every vhc control message and the run envelope are signed by the node identity (spec §7.2,
 //! §7.3). Signatures are always taken over the [`crate::canonical`] encoding of the value, so a
 //! signature is a commitment to a *value*, independent of any transport re-encoding. ed25519
 //! signing is deterministic (RFC 8032), which is what makes envelope freeze idempotent (PROTO-11)
@@ -15,7 +15,7 @@ use ed25519_dalek::Signer;
 
 use crate::bytes::{PeerId, Signature};
 use crate::canonical::to_canonical_vec;
-use crate::error::SwarmProtoError;
+use crate::error::VhcProtoError;
 
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 
@@ -29,7 +29,7 @@ pub fn peer_id(key: &SigningKey) -> PeerId {
 pub fn sign_canonical<T: Serialize + ?Sized>(
     key: &SigningKey,
     value: &T,
-) -> Result<Signature, SwarmProtoError> {
+) -> Result<Signature, VhcProtoError> {
     let bytes = to_canonical_vec(value)?;
     Ok(Signature(key.sign(&bytes).to_bytes()))
 }
@@ -39,19 +39,19 @@ pub fn verify_canonical<T: Serialize + ?Sized>(
     signer: &PeerId,
     sig: &Signature,
     value: &T,
-) -> Result<(), SwarmProtoError> {
+) -> Result<(), VhcProtoError> {
     let bytes = to_canonical_vec(value)?;
     verify_bytes(signer, sig, &bytes)
 }
 
 /// Verify `sig` over raw `bytes`, against `signer`. Uses `verify_strict` (rejects the small-order /
 /// malleability edge cases), matching the consensus intent that a signature be unambiguous.
-pub fn verify_bytes(signer: &PeerId, sig: &Signature, bytes: &[u8]) -> Result<(), SwarmProtoError> {
+pub fn verify_bytes(signer: &PeerId, sig: &Signature, bytes: &[u8]) -> Result<(), VhcProtoError> {
     let vk = VerifyingKey::from_bytes(&signer.0)
-        .map_err(|e| SwarmProtoError::Signature(format!("malformed public key: {e}")))?;
+        .map_err(|e| VhcProtoError::Signature(format!("malformed public key: {e}")))?;
     let dsig = ed25519_dalek::Signature::from_bytes(&sig.0);
     vk.verify_strict(bytes, &dsig)
-        .map_err(|_| SwarmProtoError::Signature("signature does not verify".into()))
+        .map_err(|_| VhcProtoError::Signature("signature does not verify".into()))
 }
 
 /// A value bundled with the node identity that signed its canonical CBOR encoding.
@@ -71,7 +71,7 @@ pub struct Signed<T> {
 
 impl<T: Serialize> Signed<T> {
     /// Seal `body` under `key`.
-    pub fn seal(key: &SigningKey, body: T) -> Result<Self, SwarmProtoError> {
+    pub fn seal(key: &SigningKey, body: T) -> Result<Self, VhcProtoError> {
         let sig = sign_canonical(key, &body)?;
         Ok(Self {
             body,
@@ -81,7 +81,7 @@ impl<T: Serialize> Signed<T> {
     }
 
     /// Verify the signature over the body.
-    pub fn verify(&self) -> Result<(), SwarmProtoError> {
+    pub fn verify(&self) -> Result<(), VhcProtoError> {
         verify_canonical(&self.signer, &self.sig, &self.body)
     }
 }

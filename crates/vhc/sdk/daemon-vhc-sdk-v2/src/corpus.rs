@@ -9,7 +9,7 @@
 //! worker module. This module is that policy's SDK home: the pure windowing math of the host's
 //! v1 pipeline (`daemon-vhc-session::data`) — manifest → `BatchId` location → shard-window
 //! coverage → token extraction — ported behind the wasm boundary, byte-for-byte in semantics
-//! (pinned by the cross-layer equivalence oracle in `tests/daemon-swarm-e2e`).
+//! (pinned by the cross-layer equivalence oracle in `tests/daemon-vhc-e2e`).
 //!
 //! **The layering, stated honestly for the bridge era:**
 //!

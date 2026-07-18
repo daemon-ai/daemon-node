@@ -3,7 +3,7 @@
 
 //! blake3 content hashing.
 //!
-//! blake3 is the content-address function for every artifact, payload, and checkpoint in the swarm
+//! blake3 is the content-address function for every artifact, payload, and checkpoint in the vhc
 //! (spec §5.6, §7.3 — replacing Psyche's sha256). The per-round *comparison* digest is xxh3-128
 //! (see [`crate::digest`]); everything content-addressed here is full blake3.
 

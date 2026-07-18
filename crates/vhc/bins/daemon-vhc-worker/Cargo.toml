@@ -45,7 +45,7 @@ blake3 = { workspace = true }
 # a DSN + `DAEMON_CRASH_CONSENT=1`.
 daemon-telemetry = { workspace = true }
 # The SSRF-safe outbound HTTP client the module store-fetch path rides. OPTIONAL — pulled in only
-# by the `swarm-net` feature. (The `async-trait` optional dep that rode beside it for live.rs's
+# by the `vhc-net` feature. (The `async-trait` optional dep that rode beside it for live.rs's
 # concrete `PayloadStore` impl retired with live.rs at the Phase-E sunset.)
 daemon-egress = { workspace = true, optional = true }
 
@@ -53,7 +53,7 @@ daemon-egress = { workspace = true, optional = true }
 # code (`burn_backend.rs`/`runtime.rs`/`probe.rs`) is what the features actually gate — the
 # `cfg(feature = …)` blocks in this binary's own `backend.rs`/`main.rs` select the matching
 # `BackendKind` at spawn. Feature names are unchanged from the pre-split `daemon-vhc-host` bin
-# lanes, so `--features swarm-net,wgpu` invocations only re-point `-p`.
+# lanes, so `--features vhc-net,wgpu` invocations only re-point `-p`.
 [features]
 default = ["cpu"]
 # The CPU (det-lane fp32) lane — no extra backend deps.
@@ -72,7 +72,7 @@ cuda = ["daemon-vhc-host/cuda"]
 # `daemon-vhc-net/iroh` edge is still warranted post-sunset is an open question — the surviving
 # fetch path is WS/presign-only, but the cross-built fat-worker packaging lane (flake.nix's
 # Windows worker) ships this feature set, so dropping the edge is a packaging decision.)
-swarm-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress"]
+vhc-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress"]
 
 [dev-dependencies]
 # tests/worker_protocol.rs (moved with the bin — `env!("CARGO_BIN_EXE_daemon-vhc-worker")` only

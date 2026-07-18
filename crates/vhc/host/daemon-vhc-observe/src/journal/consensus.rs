@@ -32,7 +32,7 @@
 
 use std::collections::BTreeMap;
 
-use daemon_vhc_proto::messages::{SignedMessage, SwarmMessage};
+use daemon_vhc_proto::messages::{SignedMessage, VhcMessage};
 use daemon_vhc_proto::{blake3_hash, commit_set, from_canonical_slice, Hash, PeerId};
 
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
@@ -292,7 +292,7 @@ pub fn replay_consensus_from_archive(
     let oracle_records: Vec<Input> = capture
         .published
         .iter()
-        .filter(|sm| matches!(sm.payload, SwarmMessage::RoundRecord(_)))
+        .filter(|sm| matches!(sm.payload, VhcMessage::RoundRecord(_)))
         .cloned()
         .map(Input::Message)
         .collect();

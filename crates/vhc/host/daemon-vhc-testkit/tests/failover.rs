@@ -66,7 +66,7 @@ use daemon_vhc_proto::messages::{
 };
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SignedMessage,
-    SigningKey, SwarmMessage, SWARM_PROTO_VERSION,
+    SigningKey, VhcMessage, VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 use daemon_vhc_testkit::cell8::phase_a_grants;
@@ -135,11 +135,11 @@ fn tempdir() -> std::path::PathBuf {
 
 struct ScriptMsg {
     key: SigningKey,
-    msg: SwarmMessage,
+    msg: VhcMessage,
 }
 
-fn sign(k: &SigningKey, m: &SwarmMessage) -> SignedMessage {
-    SignedMessage::sign(k, SWARM_PROTO_VERSION, m.clone()).expect("sign")
+fn sign(k: &SigningKey, m: &VhcMessage) -> SignedMessage {
+    SignedMessage::sign(k, VHC_PROTO_VERSION, m.clone()).expect("sign")
 }
 
 /// The join/warmup prologue + one commitment pair and covering receipt per round.
@@ -150,7 +150,7 @@ fn build_script(worker_keys: &[SigningKey; 2], rounds: std::ops::Range<u64>) -> 
         for k in worker_keys {
             script.push(ScriptMsg {
                 key: k.clone(),
-                msg: SwarmMessage::Join(Join {
+                msg: VhcMessage::Join(Join {
                     run_id: RUN_LABEL.into(),
                     iroh_id: IrohId([0x44; 32]),
                     class: ThroughputClass::C1,
@@ -162,7 +162,7 @@ fn build_script(worker_keys: &[SigningKey; 2], rounds: std::ops::Range<u64>) -> 
         for k in worker_keys {
             script.push(ScriptMsg {
                 key: k.clone(),
-                msg: SwarmMessage::Heartbeat(Heartbeat {
+                msg: VhcMessage::Heartbeat(Heartbeat {
                     round: 0,
                     ready: Some(true),
                 }),
@@ -176,7 +176,7 @@ fn build_script(worker_keys: &[SigningKey; 2], rounds: std::ops::Range<u64>) -> 
             let hash = blake3_hash(&bytes);
             script.push(ScriptMsg {
                 key: k.clone(),
-                msg: SwarmMessage::Commitment(Commitment {
+                msg: VhcMessage::Commitment(Commitment {
                     round,
                     payload: hash,
                     size: bytes.len() as u64,
@@ -191,7 +191,7 @@ fn build_script(worker_keys: &[SigningKey; 2], rounds: std::ops::Range<u64>) -> 
         }
         script.push(ScriptMsg {
             key: worker_keys[0].clone(),
-            msg: SwarmMessage::StorageReceipt(StorageReceipt {
+            msg: VhcMessage::StorageReceipt(StorageReceipt {
                 round,
                 verified: entries,
             }),
@@ -213,7 +213,7 @@ fn wasm_reference(
     key_seed: [u8; 32],
     script: &[ScriptMsg],
     decisions: usize,
-) -> Vec<SwarmMessage> {
+) -> Vec<VhcMessage> {
     let mut coord = WasmCoordinator::start(wasm, spec, phase_a_grants(), 0, key_seed).unwrap();
     for sm in script {
         coord.deliver(&sm.key, &sm.msg).expect("reference deliver");
@@ -588,7 +588,7 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     assert_eq!(
         standby_decisions
             .iter()
-            .filter(|m| matches!(m, SwarmMessage::RoundRecord(_)))
+            .filter(|m| matches!(m, VhcMessage::RoundRecord(_)))
             .count(),
         ROUNDS_AFTER as usize,
         "the standby records the post-kill rounds"

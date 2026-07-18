@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::bytes::{Hash, PeerId, Signature};
-use crate::error::SwarmProtoError;
+use crate::error::VhcProtoError;
 use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
 
 /// The domain-separation tag every run-key certificate body carries at ABI major 2. Distinct from
@@ -131,9 +131,9 @@ impl core::fmt::Display for CertError {
 
 impl std::error::Error for CertError {}
 
-impl From<CertError> for SwarmProtoError {
+impl From<CertError> for VhcProtoError {
     fn from(e: CertError) -> Self {
-        SwarmProtoError::Signature(e.to_string())
+        VhcProtoError::Signature(e.to_string())
     }
 }
 
@@ -143,7 +143,7 @@ impl RunKeyCertificate {
     /// base key is touched exactly here (once per run), never per frame (architecture §4.3).
     ///
     /// # Errors
-    /// A signing failure (canonical-CBOR encode / ed25519), surfaced as [`SwarmProtoError`].
+    /// A signing failure (canonical-CBOR encode / ed25519), surfaced as [`VhcProtoError`].
     #[allow(clippy::too_many_arguments)]
     pub fn issue(
         base_key: &SigningKey,
@@ -153,7 +153,7 @@ impl RunKeyCertificate {
         epoch_from: u64,
         epoch_to: u64,
         run_key: PeerId,
-    ) -> Result<Self, SwarmProtoError> {
+    ) -> Result<Self, VhcProtoError> {
         let body = RunKeyCertBody {
             domain: CERT_DOMAIN_V2.to_string(),
             run_id,

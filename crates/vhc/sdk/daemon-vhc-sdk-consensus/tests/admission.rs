@@ -7,9 +7,7 @@ mod common;
 
 use common::*;
 use daemon_vhc_proto::messages::{Join, ThroughputClass};
-use daemon_vhc_proto::{
-    peer_id, CapabilitySet, Hash, IrohId, SwarmProtoVersion, SWARM_PROTO_VERSION,
-};
+use daemon_vhc_proto::{peer_id, CapabilitySet, Hash, IrohId, VhcProtoVersion, VHC_PROTO_VERSION};
 
 use daemon_vhc_sdk_consensus::coordinator::admission::{admit, JoinCandidate};
 use daemon_vhc_sdk_consensus::coordinator::{AdmissionReject, Phase, RunConfig};
@@ -40,7 +38,7 @@ fn proto12_capability_subset_admits() {
     let j = join_with(caps(&["tensor-abi@1", "adamw_step@1", "flash_attn@1"]));
     let cand = JoinCandidate {
         peer: pid(1),
-        version: SWARM_PROTO_VERSION,
+        version: VHC_PROTO_VERSION,
         join: &j,
         asserted_hash: None,
     };
@@ -53,7 +51,7 @@ fn proto12_missing_capability_rejected() {
     let j = join_with(caps(&["tensor-abi@1"]));
     let cand = JoinCandidate {
         peer: pid(1),
-        version: SWARM_PROTO_VERSION,
+        version: VHC_PROTO_VERSION,
         join: &j,
         asserted_hash: None,
     };
@@ -72,7 +70,7 @@ fn proto13_version_mismatch_rejected() {
     let j = join_with(CapabilitySet::new());
     let cand = JoinCandidate {
         peer: pid(1),
-        version: SwarmProtoVersion(999),
+        version: VhcProtoVersion(999),
         join: &j,
         asserted_hash: None,
     };
@@ -89,7 +87,7 @@ fn envelope_hash_mismatch_rejected_when_asserted() {
     let wrong = Hash([0xEE; 32]);
     let cand = JoinCandidate {
         peer: pid(1),
-        version: SWARM_PROTO_VERSION,
+        version: VHC_PROTO_VERSION,
         join: &j,
         asserted_hash: Some(&wrong),
     };
@@ -123,7 +121,7 @@ fn envelope_hash_absent_is_tolerated() {
     let j = join_with(CapabilitySet::new());
     let cand = JoinCandidate {
         peer: pid(1),
-        version: SWARM_PROTO_VERSION,
+        version: VHC_PROTO_VERSION,
         join: &j,
         asserted_hash: None,
     };
@@ -195,7 +193,7 @@ fn run_id_mismatch_rejected() {
     };
     let cand = JoinCandidate {
         peer: pid(1),
-        version: SWARM_PROTO_VERSION,
+        version: VHC_PROTO_VERSION,
         join: &j,
         asserted_hash: None,
     };
@@ -218,7 +216,7 @@ fn roster_full_rejected() {
     let j = join_with(CapabilitySet::new());
     let cand = JoinCandidate {
         peer: pid(2),
-        version: SWARM_PROTO_VERSION,
+        version: VHC_PROTO_VERSION,
         join: &j,
         asserted_hash: None,
     };
@@ -240,7 +238,7 @@ fn duplicate_healthy_peer_rejected_but_dropped_may_rejoin() {
     );
     let cand = JoinCandidate {
         peer: pid(1),
-        version: SWARM_PROTO_VERSION,
+        version: VHC_PROTO_VERSION,
         join: &j,
         asserted_hash: None,
     };

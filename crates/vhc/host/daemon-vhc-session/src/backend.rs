@@ -50,7 +50,7 @@ pub trait TrainerBackend: Send {
     fn inner_update(&mut self, inner_step: u32) -> Result<(), Self::Error>;
 
     /// `da_make_update`: at round end, compress this peer's progress into opaque payload bytes (the
-    /// object the payload plane moves + hashes; the swarm never parses it, §7.3).
+    /// object the payload plane moves + hashes; the vhc never parses it, §7.3).
     fn make_update(&mut self, round: RoundId) -> Result<Vec<u8>, Self::Error>;
 
     /// `da_ingest_updates`: decode + aggregate + outer step over the committed set, staged **in

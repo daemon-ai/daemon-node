@@ -10,7 +10,7 @@
 //! - **`put`** → presigned `PUT`, returns `blake3(bytes)`.
 //! - **`get`** → presigned `GET` + blake3-verify against the commitment's hash (reuses the frozen
 //!   mismatch reject path); a 404/403 from the object store is the typed
-//!   [`SwarmNetError::PayloadMiss`] the §6.4 stall ladder consumes (matches the `FsPayloadStore`
+//!   [`VhcNetError::PayloadMiss`] the §6.4 stall ladder consumes (matches the `FsPayloadStore`
 //!   taxonomy, NET-8).
 //! - **`head`** → presigned `GET` + hash the body (see the type doc: an R2 `HEAD` cannot yield the
 //!   blake3 `PayloadStat` needs, and the trait's `head` takes no expected hash — so we re-fetch and
@@ -27,7 +27,7 @@ use daemon_vhc_proto::blake3_hash;
 use crate::presign::{ObjectKind, PresignClient, PresignOp, PresignRequest, PresignResponse};
 use crate::seam::{ContentHash, PayloadKey, RunId};
 use crate::transport::{PayloadStat, PayloadStore};
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// The R2 object key for one presign request, per the spec §11.3 layout. The coordinator (BC) mints
 /// its presigned URLs at exactly these keys, so this is the single source of truth both sides share.
@@ -36,7 +36,7 @@ use crate::SwarmNetError;
 /// - `record-set`  → `runs/<run>/rounds/<round>/record-set.cbor`
 /// - `checkpoint`  → `runs/<run>/checkpoints/round-<round>.safetensors`
 /// - `artifact`    → `runs/<run>/<path>`
-pub fn r2_object_key(run: &RunId, req: &PresignRequest) -> Result<String, SwarmNetError> {
+pub fn r2_object_key(run: &RunId, req: &PresignRequest) -> Result<String, VhcNetError> {
     let run = run.as_str();
     match req.kind {
         ObjectKind::Payload => {
@@ -65,8 +65,8 @@ pub fn r2_object_key(run: &RunId, req: &PresignRequest) -> Result<String, SwarmN
     }
 }
 
-fn missing(kind: &str, field: &str) -> SwarmNetError {
-    SwarmNetError::Transport(format!("presign {kind} object requires `{field}`"))
+fn missing(kind: &str, field: &str) -> VhcNetError {
+    VhcNetError::Transport(format!("presign {kind} object requires `{field}`"))
 }
 
 /// A [`PayloadStore`] over presigned R2/S3 URLs (spec §7.1). Generic over the [`PresignClient`] so
@@ -98,20 +98,20 @@ impl<P: PresignClient> R2Store<P> {
     /// (`runs/<run>/rounds/<round>/record-set.cbor`, spec §11.3). A rejoining peer uses this to
     /// learn which `(peer, hash, size)` payloads to stage when replaying a retained round forward
     /// from a checkpoint. Presigns a `record-set` GET (the frozen §11.1 contract), fetches, and
-    /// decodes; a 404/403 → a typed [`SwarmNetError::PayloadMiss`] (the stall-ladder signal — the
+    /// decodes; a 404/403 → a typed [`VhcNetError::PayloadMiss`] (the stall-ladder signal — the
     /// caller falls back to fresh-state per §9). The per-payload blake3 verify (RUN-2) happens when
     /// the caller fetches each entry's payload, so a decode here is sufficient.
     pub async fn fetch_record_set_object(
         &self,
         round: crate::seam::RoundId,
-    ) -> Result<daemon_vhc_proto::RecordSet, SwarmNetError> {
+    ) -> Result<daemon_vhc_proto::RecordSet, VhcNetError> {
         let req = PresignRequest::record_set(PresignOp::Get, round);
         let resp = self.presign.presign(&self.run, &req).await?;
         let bytes = self.get_object(&resp).await?.ok_or_else(|| {
-            SwarmNetError::PayloadMiss(format!("{}@r{round}/record-set.cbor", self.run.as_str()))
+            VhcNetError::PayloadMiss(format!("{}@r{round}/record-set.cbor", self.run.as_str()))
         })?;
         daemon_vhc_proto::RecordSet::from_canonical_slice(&bytes)
-            .map_err(|e| SwarmNetError::Fetch(format!("decode record-set r{round}: {e}")))
+            .map_err(|e| VhcNetError::Fetch(format!("decode record-set r{round}: {e}")))
     }
 
     /// Presign one payload op for `key`.
@@ -119,7 +119,7 @@ impl<P: PresignClient> R2Store<P> {
         &self,
         key: &PayloadKey,
         op: PresignOp,
-    ) -> Result<PresignResponse, SwarmNetError> {
+    ) -> Result<PresignResponse, VhcNetError> {
         debug_assert_eq!(
             &key.run, &self.run,
             "payload key run must match the store run"
@@ -130,7 +130,7 @@ impl<P: PresignClient> R2Store<P> {
 
     /// Issue a presigned `GET`, returning `Some(bytes)` on 2xx, `None` on a 404/403 miss, or a hard
     /// transport error otherwise. Signed headers (if any) are replayed verbatim.
-    async fn get_object(&self, resp: &PresignResponse) -> Result<Option<Vec<u8>>, SwarmNetError> {
+    async fn get_object(&self, resp: &PresignResponse) -> Result<Option<Vec<u8>>, VhcNetError> {
         let egress_resp = if resp.headers.is_empty() {
             self.egress
                 .get(&resp.url, Redirects::DEFAULT)
@@ -156,7 +156,7 @@ impl<P: PresignClient> R2Store<P> {
         if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
             return Ok(None);
         }
-        Err(SwarmNetError::Transport(format!(
+        Err(VhcNetError::Transport(format!(
             "presigned GET {} returned {status}",
             resp.url
         )))
@@ -165,7 +165,7 @@ impl<P: PresignClient> R2Store<P> {
 
 #[async_trait]
 impl<P: PresignClient> PayloadStore for R2Store<P> {
-    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, SwarmNetError> {
+    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, VhcNetError> {
         let resp = self.presign_payload(key, PresignOp::Put).await?;
         // No forced Content-Type: a presigned PUT only validates the headers it was minted with
         // (SigV4 parity — Wave-0 `EgressClient::put`). Replay any the presign *did* sign.
@@ -186,7 +186,7 @@ impl<P: PresignClient> PayloadStore for R2Store<P> {
         };
         let status = egress_resp.status();
         if !status.is_success() {
-            return Err(SwarmNetError::Transport(format!(
+            return Err(VhcNetError::Transport(format!(
                 "presigned PUT {} returned {status}",
                 resp.url
             )));
@@ -194,16 +194,12 @@ impl<P: PresignClient> PayloadStore for R2Store<P> {
         Ok(blake3_hash(bytes))
     }
 
-    async fn get(
-        &self,
-        key: &PayloadKey,
-        expected: &ContentHash,
-    ) -> Result<Vec<u8>, SwarmNetError> {
+    async fn get(&self, key: &PayloadKey, expected: &ContentHash) -> Result<Vec<u8>, VhcNetError> {
         let resp = self.presign_payload(key, PresignOp::Get).await?;
         let bytes = self.get_object(&resp).await?.ok_or_else(|| miss(key))?;
         let actual = blake3_hash(&bytes);
         if &actual != expected {
-            return Err(SwarmNetError::HashMismatch {
+            return Err(VhcNetError::HashMismatch {
                 expected: expected.to_hex(),
                 actual: actual.to_hex(),
             });
@@ -211,7 +207,7 @@ impl<P: PresignClient> PayloadStore for R2Store<P> {
         Ok(bytes)
     }
 
-    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, SwarmNetError> {
+    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, VhcNetError> {
         // A network HEAD cannot produce the blake3 `PayloadStat.hash` (R2 exposes only size + an
         // etag/md5), and the trait's `head` takes no expected hash — so we re-fetch and hash, exactly
         // like `FsPayloadStore::head` re-reads to attest the content hash (store.rs).
@@ -225,8 +221,8 @@ impl<P: PresignClient> PayloadStore for R2Store<P> {
 }
 
 /// A typed availability miss for `key` (the stall-ladder signal; mirrors `store.rs`'s taxonomy).
-fn miss(key: &PayloadKey) -> SwarmNetError {
-    SwarmNetError::PayloadMiss(format!(
+fn miss(key: &PayloadKey) -> VhcNetError {
+    VhcNetError::PayloadMiss(format!(
         "{}@r{}/{}",
         key.run.as_str(),
         key.round,
@@ -235,13 +231,13 @@ fn miss(key: &PayloadKey) -> SwarmNetError {
 }
 
 /// Map an [`EgressError`](daemon_egress::EgressError) onto a transport error.
-fn transport(e: daemon_egress::EgressError) -> SwarmNetError {
-    SwarmNetError::Transport(format!("egress: {e}"))
+fn transport(e: daemon_egress::EgressError) -> VhcNetError {
+    VhcNetError::Transport(format!("egress: {e}"))
 }
 
 /// Map a response-body read failure (`reqwest::Error`) onto a transport error.
-fn read_body(e: reqwest::Error) -> SwarmNetError {
-    SwarmNetError::Transport(format!("read object body: {e}"))
+fn read_body(e: reqwest::Error) -> VhcNetError {
+    VhcNetError::Transport(format!("read object body: {e}"))
 }
 
 #[cfg(test)]
@@ -296,7 +292,7 @@ mod tests {
         };
         assert!(matches!(
             r2_object_key(&r, &bad),
-            Err(SwarmNetError::Transport(_))
+            Err(VhcNetError::Transport(_))
         ));
     }
 
@@ -311,7 +307,7 @@ mod tests {
     use crate::receipt::ReceiptProducer;
     use crate::store::FsPayloadStore;
     use crate::test_support::temp_root;
-    use daemon_vhc_proto::{blake3_hash, SigningKey, SwarmMessage, SWARM_PROTO_VERSION};
+    use daemon_vhc_proto::{blake3_hash, SigningKey, VhcMessage, VHC_PROTO_VERSION};
 
     fn pkey(round: RoundId, peer: u8) -> PayloadKey {
         PayloadKey::new(RunId::new("run-x"), round, PeerId([peer; 32]))
@@ -342,10 +338,7 @@ mod tests {
         let store = store_over(&mock);
         let k = pkey(3, 0x12);
         let err = store.put(&k, b"x").await.unwrap_err();
-        assert!(
-            matches!(err, SwarmNetError::PresignExpired(_)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, VhcNetError::PresignExpired(_)), "got {err:?}");
     }
 
     /// NET-1: `ReceiptProducer<R2Store>` compiles + works **unchanged** — HEAD → signed
@@ -360,12 +353,12 @@ mod tests {
         let producer = ReceiptProducer::new(
             store,
             SigningKey::from_bytes(&[0x42; 32]),
-            SWARM_PROTO_VERSION,
+            VHC_PROTO_VERSION,
         );
         let signed = producer.produce(&k).await.unwrap();
         assert!(signed.verify().is_ok());
 
-        let SwarmMessage::StorageReceipt(receipt) = &signed.payload else {
+        let VhcMessage::StorageReceipt(receipt) = &signed.payload else {
             panic!("expected StorageReceipt, got {:?}", signed.payload);
         };
         assert_eq!(receipt.round, 2);
@@ -389,7 +382,7 @@ mod tests {
         assert_eq!(stat.size, 6);
     }
 
-    /// NET-8: a lifecycle-expired (evicted) object is a typed [`SwarmNetError::PayloadMiss`] — the
+    /// NET-8: a lifecycle-expired (evicted) object is a typed [`VhcNetError::PayloadMiss`] — the
     /// stall-ladder signal.
     #[tokio::test]
     async fn expired_object_typed_miss() {
@@ -401,7 +394,7 @@ mod tests {
         mock.evict(&format!("runs/run-x/rounds/0/{}.upd", k.peer.to_hex()));
 
         let err = store.get(&k, &hash).await.unwrap_err();
-        assert!(matches!(err, SwarmNetError::PayloadMiss(_)), "got {err:?}");
+        assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
     }
 
     /// NET-1: a GET whose bytes do not match the commitment hash is a tamper reject.
@@ -413,7 +406,7 @@ mod tests {
         store.put(&k, b"honest").await.unwrap();
         let err = store.get(&k, &blake3_hash(b"different")).await.unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::HashMismatch { .. }),
+            matches!(err, VhcNetError::HashMismatch { .. }),
             "got {err:?}"
         );
     }

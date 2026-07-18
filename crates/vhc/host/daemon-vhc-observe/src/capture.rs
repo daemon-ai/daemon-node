@@ -7,7 +7,7 @@
 //! sees on the wire, but the pure `tick` also consumes **clocks** (`Input::Clock`, the warmup /
 //! cooldown / force-progress edges) — a driver detail that never crosses the wire (§14: clocks are
 //! not signed messages). To make a recorded run *byte-reproducibly* replayable off disk (the
-//! gate-ceremony `swarm-replay` step), the coordinator emits a [`RunCapture`]: its **initial**
+//! gate-ceremony `replay` step), the coordinator emits a [`RunCapture`]: its **initial**
 //! [`CoordinatorState`] plus the exact ordered `Input` trace (messages **and** clocks) it fed
 //! `tick`.
 //!

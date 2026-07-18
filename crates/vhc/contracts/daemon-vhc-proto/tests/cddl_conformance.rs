@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Swarm control-plane CDDL conformance (TDD PROTO-19, spec §6.4/§7.3).
+//! Vhc control-plane CDDL conformance (TDD PROTO-19, spec §6.4/§7.3).
 //!
 //! Mirrors the `daemon-api` pattern: real canonical-CBOR bytes emitted by the Rust serde types are
-//! validated against the authoritative `daemon-swarm.cddl`, so serde↔CDDL drift becomes a failing
+//! validated against the authoritative `daemon-vhc.cddl`, so serde↔CDDL drift becomes a failing
 //! test. Fixtures are generated in-process (no committed blobs, no `xtask` edit — the whole crate
 //! surface is here). Plus signature-reject and roster-size-invariant checks.
 
@@ -13,13 +13,13 @@ use daemon_vhc_proto::capability::CapabilitySet;
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::messages::{
     Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RecordEntry, RoundOpen,
-    RoundRecord, SignedMessage, StorageReceipt, Straggle, StraggleStatus, SwarmMessage,
-    ThroughputClass,
+    RoundRecord, SignedMessage, StorageReceipt, Straggle, StraggleStatus, ThroughputClass,
+    VhcMessage,
 };
-use daemon_vhc_proto::version::SWARM_PROTO_VERSION;
+use daemon_vhc_proto::version::VHC_PROTO_VERSION;
 use daemon_vhc_proto::{to_canonical_vec, SigningKey};
 
-const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-swarm.cddl"));
+const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-vhc.cddl"));
 
 fn key() -> SigningKey {
     SigningKey::from_bytes(&[0x21; 32])
@@ -33,8 +33,8 @@ fn hash(n: u8) -> Hash {
     Hash([n; 32])
 }
 
-fn signed(payload: SwarmMessage) -> Vec<u8> {
-    let msg = SignedMessage::sign(&key(), SWARM_PROTO_VERSION, payload).unwrap();
+fn signed(payload: VhcMessage) -> Vec<u8> {
+    let msg = SignedMessage::sign(&key(), VHC_PROTO_VERSION, payload).unwrap();
     to_canonical_vec(&msg).unwrap()
 }
 
@@ -43,17 +43,17 @@ fn validate(root: &str, bytes: &[u8]) {
         .unwrap_or_else(|e| panic!("`{root}` failed to validate: {e:?}"));
 }
 
-fn all_sample_messages() -> Vec<SwarmMessage> {
+fn all_sample_messages() -> Vec<VhcMessage> {
     let set = commit_set(&[(peer(1), hash(9)), (peer(2), hash(8))]);
     vec![
-        SwarmMessage::RoundOpen(RoundOpen {
+        VhcMessage::RoundOpen(RoundOpen {
             round: 42,
             seed: Seed([7; 32]),
             roster_digest: hash(5),
             batch: BatchWindow { start: 0, end: 256 },
             deadline_unix_s: 1_800_000_000,
         }),
-        SwarmMessage::Commitment(Commitment {
+        VhcMessage::Commitment(Commitment {
             round: 42,
             payload: hash(3),
             size: 40 * 1024 * 1024,
@@ -62,12 +62,12 @@ fn all_sample_messages() -> Vec<SwarmMessage> {
                 Locator::BlobTicket("blobabc".into()),
             ],
         }),
-        SwarmMessage::Attestation(Attestation {
+        VhcMessage::Attestation(Attestation {
             round: 42,
             set: set.commitment(),
             inline: None,
         }),
-        SwarmMessage::StorageReceipt(StorageReceipt {
+        VhcMessage::StorageReceipt(StorageReceipt {
             round: 42,
             verified: vec![RecordEntry {
                 peer: peer(1),
@@ -75,7 +75,7 @@ fn all_sample_messages() -> Vec<SwarmMessage> {
                 size: 1234,
             }],
         }),
-        SwarmMessage::RoundRecord(RoundRecord {
+        VhcMessage::RoundRecord(RoundRecord {
             round: 42,
             set: set.commitment(),
             drops: vec![peer(7)],
@@ -87,15 +87,15 @@ fn all_sample_messages() -> Vec<SwarmMessage> {
                 size: 1234,
             }]),
         }),
-        SwarmMessage::Digest(Digest {
+        VhcMessage::Digest(Digest {
             round: 42,
             digest: StateDigest([0xab; 16]),
         }),
-        SwarmMessage::Straggle(Straggle {
+        VhcMessage::Straggle(Straggle {
             round: 42,
             status: StraggleStatus::Stalled,
         }),
-        SwarmMessage::Join(Join {
+        VhcMessage::Join(Join {
             run_id: "smollm-500m-01".into(),
             iroh_id: IrohId([4; 32]),
             class: ThroughputClass::C2,
@@ -104,7 +104,7 @@ fn all_sample_messages() -> Vec<SwarmMessage> {
             // CDDL rule (Wave 3).
             envelope_hash: Some(daemon_vhc_proto::blake3_hash(b"smollm-500m-01-envelope")),
         }),
-        SwarmMessage::Heartbeat(Heartbeat {
+        VhcMessage::Heartbeat(Heartbeat {
             round: 42,
             ready: None,
         }),
@@ -125,7 +125,7 @@ fn heartbeat_ready_flag_cddl_conforms_and_roundtrips() {
         ready: Some(true),
     };
     for hb in [legacy, ready] {
-        let bytes = signed(SwarmMessage::Heartbeat(hb));
+        let bytes = signed(VhcMessage::Heartbeat(hb));
         validate("signed-message", &bytes);
     }
     // The optional field is absent from the canonical bytes when `None` (back-compat), present when set.
@@ -188,7 +188,7 @@ fn invalid_payloads_are_rejected() {
         Value::Text("Heartbeat".into()),
         Value::Map(vec![(Value::Text("round".into()), Value::Text("x".into()))]),
     )]);
-    assert!(cddl_cat::validate_cbor_bytes("swarm-message", CDDL, &enc(&bad_field)).is_err());
+    assert!(cddl_cat::validate_cbor_bytes("vhc-message", CDDL, &enc(&bad_field)).is_err());
 }
 
 #[test]
@@ -196,8 +196,8 @@ fn record_bad_sig_rejected() {
     let set = commit_set(&[(peer(1), hash(9))]);
     let mut msg = SignedMessage::sign(
         &key(),
-        SWARM_PROTO_VERSION,
-        SwarmMessage::RoundRecord(RoundRecord {
+        VHC_PROTO_VERSION,
+        VhcMessage::RoundRecord(RoundRecord {
             round: 7,
             set: set.commitment(),
             drops: vec![],
@@ -217,11 +217,11 @@ fn record_bad_sig_rejected() {
 
 #[test]
 fn wrong_run_version_rejected() {
-    use daemon_vhc_proto::version::SwarmProtoVersion;
+    use daemon_vhc_proto::version::VhcProtoVersion;
     let msg = SignedMessage::sign(
         &key(),
-        SwarmProtoVersion(2),
-        SwarmMessage::Heartbeat(Heartbeat {
+        VhcProtoVersion(2),
+        VhcMessage::Heartbeat(Heartbeat {
             round: 1,
             ready: None,
         }),
@@ -229,7 +229,7 @@ fn wrong_run_version_rejected() {
     .unwrap();
     // Signature is valid, but the run is pinned to a different version → join gate rejects it.
     assert!(msg.verify().is_ok());
-    assert!(msg.verify_for_run(SWARM_PROTO_VERSION).is_err());
+    assert!(msg.verify_for_run(VHC_PROTO_VERSION).is_err());
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn message_size_roster_invariant() {
         } else {
             None
         };
-        let payload = SwarmMessage::Attestation(Attestation {
+        let payload = VhcMessage::Attestation(Attestation {
             round: 1,
             set: tree.commitment(),
             inline: inline_set,

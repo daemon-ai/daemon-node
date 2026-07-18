@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `SwarmService` + `swarm.db` unit tests (W1): event fanout, durable join-intent persistence +
-//! reload re-convergence, `swarm.db` migration idempotence, and disabled-by-default (no worker spawn
+//! `VhcService` + `vhc.db` unit tests (W1): event fanout, durable join-intent persistence +
+//! reload re-convergence, `vhc.db` migration idempotence, and disabled-by-default (no worker spawn
 //! when `enabled = false`). The worker is a trait-level `FakeWorker` (the `WorkerControl` seam) — no
 //! subprocess — recording every call so we can assert the service never touches the worker while
 //! disabled and re-issues exactly the persisted intents on restart.
@@ -13,11 +13,11 @@ use async_trait::async_trait;
 use daemon_api::{
     NodeEvent, SwarmApi, SwarmEligibility, SwarmEvent, SwarmLeaveMode, SwarmPolicy, SwarmPolicyMode,
 };
-use daemon_vhc_node::service::{NodeFeed, SwarmError, WorkerControl};
+use daemon_vhc_node::service::{NodeFeed, VhcError, WorkerControl};
 use daemon_vhc_node::{
-    DiscoveredRun, RunDiscovery, SwarmService, SwarmServiceParts, SwarmStore, EVENT_WINDOW,
+    DiscoveredRun, RunDiscovery, VhcService, VhcServiceParts, VhcStore, EVENT_WINDOW,
 };
-use daemon_vhc_session::config::SwarmConfig;
+use daemon_vhc_session::config::VhcConfig;
 use daemon_vhc_session::protocol::{
     self, Eligibility, ErrorClass, Hardware, JoinPolicy, LeaveMode,
 };
@@ -66,11 +66,11 @@ impl FakeWorker {
 
 #[async_trait]
 impl WorkerControl for FakeWorker {
-    async fn probe(&self) -> Result<Hardware, SwarmError> {
+    async fn probe(&self) -> Result<Hardware, VhcError> {
         self.calls().probes += 1;
         Ok(self.hardware.clone())
     }
-    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, SwarmError> {
+    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, VhcError> {
         self.calls().assessed_envelopes.push(envelope);
         // A distinctive verdict so a test can tell the §6.5 assess path from the probe fallback.
         Ok(Eligibility {
@@ -86,11 +86,11 @@ impl WorkerControl for FakeWorker {
         _coordinator: String,
         _credentials: Vec<u8>,
         _policy: JoinPolicy,
-    ) -> Result<(), SwarmError> {
+    ) -> Result<(), VhcError> {
         self.calls().joins.push(run_id);
         Ok(())
     }
-    async fn leave(&self, run_id: String, _mode: LeaveMode) -> Result<(), SwarmError> {
+    async fn leave(&self, run_id: String, _mode: LeaveMode) -> Result<(), VhcError> {
         self.calls().leaves.push(run_id);
         Ok(())
     }
@@ -99,7 +99,7 @@ impl WorkerControl for FakeWorker {
         vram_cap_mb: Option<u32>,
         duty_cycle_pct: Option<u8>,
         paused: bool,
-    ) -> Result<(), SwarmError> {
+    ) -> Result<(), VhcError> {
         let mut c = self.calls();
         c.throttles += 1;
         c.last_throttle = Some((vram_cap_mb, duty_cycle_pct, paused));
@@ -107,10 +107,10 @@ impl WorkerControl for FakeWorker {
     }
 }
 
-fn enabled_config() -> SwarmConfig {
-    SwarmConfig {
+fn enabled_config() -> VhcConfig {
+    VhcConfig {
         enabled: true,
-        ..SwarmConfig::default()
+        ..VhcConfig::default()
     }
 }
 
@@ -123,10 +123,10 @@ fn policy() -> SwarmPolicy {
     }
 }
 
-fn service(config: SwarmConfig, worker: Arc<FakeWorker>, feed: Option<NodeFeed>) -> SwarmService {
-    SwarmService::new(SwarmServiceParts {
+fn service(config: VhcConfig, worker: Arc<FakeWorker>, feed: Option<NodeFeed>) -> VhcService {
+    VhcService::new(VhcServiceParts {
         config,
-        store: SwarmStore::open_in_memory().unwrap(),
+        store: VhcStore::open_in_memory().unwrap(),
         worker,
         feed,
         discovery: None,
@@ -138,8 +138,8 @@ fn service(config: SwarmConfig, worker: Arc<FakeWorker>, feed: Option<NodeFeed>)
 #[tokio::test]
 async fn disabled_by_default_never_touches_worker() {
     let worker = FakeWorker::new();
-    let svc = service(SwarmConfig::default(), worker.clone(), None);
-    assert!(!svc.enabled(), "swarm is off by default (§10.6)");
+    let svc = service(VhcConfig::default(), worker.clone(), None);
+    assert!(!svc.enabled(), "vhc is off by default (§10.6)");
     // start() must be a no-op: no re-convergence, no probe, no join.
     assert_eq!(svc.start().await.unwrap(), 0);
     // Every worker-touching API op resolves to Unsupported (disabled), spawning nothing.
@@ -160,14 +160,14 @@ async fn disabled_by_default_never_touches_worker() {
 #[tokio::test]
 async fn join_persists_and_reload_reconverges() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swarm.db");
+    let path = dir.path().join("vhc.db");
 
     // First boot: enabled service joins two runs, then leaves one.
     {
         let worker = FakeWorker::new();
-        let svc = SwarmService::new(SwarmServiceParts {
+        let svc = VhcService::new(VhcServiceParts {
             config: enabled_config(),
-            store: SwarmStore::open(&path).unwrap(),
+            store: VhcStore::open(&path).unwrap(),
             worker: worker.clone(),
             feed: None,
             discovery: None,
@@ -187,13 +187,13 @@ async fn join_persists_and_reload_reconverges() {
         assert_eq!(worker.calls().leaves, vec!["run-b"]);
     }
 
-    // Second boot: a fresh worker + service over the SAME swarm.db. start() re-issues JoinRun for
+    // Second boot: a fresh worker + service over the SAME vhc.db. start() re-issues JoinRun for
     // the one still-active intent (run-a), not the left one (run-b) — durable re-convergence.
     {
         let worker = FakeWorker::new();
-        let svc = SwarmService::new(SwarmServiceParts {
+        let svc = VhcService::new(VhcServiceParts {
             config: enabled_config(),
-            store: SwarmStore::open(&path).unwrap(),
+            store: VhcStore::open(&path).unwrap(),
             worker: worker.clone(),
             feed: None,
             discovery: None,
@@ -311,7 +311,7 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
 #[tokio::test]
 async fn governor_throttle_lever_reaches_worker_with_combined_budget_clamp() {
     // §10.5 governor drill (B3): a synthetic inference-pressure signal arrives as a policy update
-    // clamping the swarm's budget (on a unified box `vram_cap_mb` clamps the *combined* device+host
+    // clamping the vhc's budget (on a unified box `vram_cap_mb` clamps the *combined* device+host
     // budget — Merge-2 spec-amendment #1). `swarm_set_policy` must push that lever through to the
     // worker's `throttle` verbatim, so the co-resident inference tenant is protected.
     let worker = FakeWorker::new();
@@ -364,29 +364,29 @@ async fn checkpoint_published_yields_contribution_event_and_credit() {
 }
 
 #[test]
-fn swarm_db_migration_is_idempotent_across_reopen() {
+fn vhc_db_migration_is_idempotent_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swarm.db");
+    let path = dir.path().join("vhc.db");
     let elig = SwarmEligibility::default();
     {
-        let store = SwarmStore::open(&path).unwrap();
+        let store = VhcStore::open(&path).unwrap();
         store
             .put_join_intent("r1", "coord", &policy(), None, &elig)
             .unwrap();
     }
     // Re-opening re-runs the migration ladder (a no-op at the same user_version) and the row is
     // still there — proving migrations are idempotent + durable.
-    let store = SwarmStore::open(&path).unwrap();
+    let store = VhcStore::open(&path).unwrap();
     assert_eq!(store.get_run("r1").unwrap().unwrap().run_id, "r1");
     // A third open is still fine (idempotence again).
     drop(store);
-    let store = SwarmStore::open(&path).unwrap();
+    let store = VhcStore::open(&path).unwrap();
     assert_eq!(store.list_runs().unwrap().len(), 1);
 }
 
 #[test]
-fn swarm_events_log_is_windowed() {
-    let store = SwarmStore::open_in_memory().unwrap();
+fn vhc_events_log_is_windowed() {
+    let store = VhcStore::open_in_memory().unwrap();
     for i in 0..(EVENT_WINDOW + 50) {
         store
             .append_event(&SwarmEvent::Phase {
@@ -417,13 +417,13 @@ struct FakeDiscovery {
 
 #[async_trait]
 impl RunDiscovery for FakeDiscovery {
-    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, SwarmError> {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, VhcError> {
         Ok(vec![self.run("run-disc")])
     }
-    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, SwarmError> {
+    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, VhcError> {
         Ok(Some(self.run(run_id)))
     }
-    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, SwarmError> {
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
         Ok(self.envelope.clone())
     }
 }
@@ -449,9 +449,9 @@ async fn join_discovers_fetches_envelope_and_assesses() {
         coordinator: "https://coord.example/api/v1/swarm".into(),
         envelope: b"frozen-envelope-bytes".to_vec(),
     });
-    let svc = SwarmService::new(SwarmServiceParts {
+    let svc = VhcService::new(VhcServiceParts {
         config: enabled_config(),
-        store: SwarmStore::open_in_memory().unwrap(),
+        store: VhcStore::open_in_memory().unwrap(),
         worker: worker.clone(),
         feed: None,
         discovery: Some(discovery),

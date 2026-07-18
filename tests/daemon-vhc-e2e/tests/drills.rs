@@ -5,7 +5,7 @@
 //! machinery ([`daemon_vhc_session::harness`] — the in-process peers under the production
 //! wasm-coordinator recording drive).
 //!
-//! Each drill injects one failure mode into the in-process N-peer swarm and asserts the run
+//! Each drill injects one failure mode into the in-process N-peer vhc and asserts the run
 //! **completes with all surviving peers' digests equal every round**:
 //!
 //! - [`late_join_mid_run_syncs_and_contributes`] — a peer joins at the epoch boundary via the real
@@ -29,13 +29,13 @@ use daemon_vhc_session::backend::{
 use daemon_vhc_session::checkpoint::{resync_by_replay, ReplayStep, CHECKPOINT_PEER};
 use daemon_vhc_session::engine::EngineEvent;
 use daemon_vhc_session::harness::{
-    peer_key, run_swarm, run_swarm_with, LateJoin, SilentDeath, StoreOutage, SwarmConfig,
+    peer_key, run_vhc, run_vhc_with, LateJoin, SilentDeath, StoreOutage, VhcConfig,
     EXPERIMENT_CONFIG,
 };
 use daemon_vhc_session::seam::{PayloadKey, RoundId};
 
 /// Assert every round in `run` has a single digest shared by all peers that reported it.
-fn assert_all_agree(run: &daemon_vhc_session::harness::SwarmRun) {
+fn assert_all_agree(run: &daemon_vhc_session::harness::VhcRun) {
     assert!(
         run.all_agree(),
         "surviving peers must agree on every round's digest"
@@ -48,7 +48,7 @@ fn assert_all_agree(run: &daemon_vhc_session::harness::SwarmRun) {
 async fn late_join_mid_run_syncs_and_contributes() {
     // Epoch 0 = rounds 0..2 (3 peers), epoch boundary at round 3; a 4th peer joins epoch 1 via the
     // real admission path, resyncs from the round-2 checkpoint, and contributes rounds 3..5.
-    let cfg = SwarmConfig {
+    let cfg = VhcConfig {
         num_peers: 3,
         num_rounds: 6,
         steps_per_round: 1,
@@ -57,9 +57,9 @@ async fn late_join_mid_run_syncs_and_contributes() {
         checkpoint_every_rounds: 3, // checkpoints at round 2 (and 5)
         min_peers: Some(3),
         late_join: Some(LateJoin { resume_round: 2 }),
-        ..SwarmConfig::small(6)
+        ..VhcConfig::small(6)
     };
-    let run = run_swarm(cfg).await.expect("late-join run");
+    let run = run_vhc(cfg).await.expect("late-join run");
 
     assert_all_agree(&run);
     assert!(run.left_peers().is_empty(), "no peer leaves");
@@ -91,7 +91,7 @@ async fn late_join_mid_run_syncs_and_contributes() {
 async fn hard_peer_death_dropped_after_absences() {
     // Peer 2 goes silent after round 2 (no Straggle). With k_absences = 2 the coordinator drops it;
     // min_peers = 1 keeps the run alive on peers 0 and 1 through the last round.
-    let cfg = SwarmConfig {
+    let cfg = VhcConfig {
         num_peers: 3,
         num_rounds: 8,
         min_peers: Some(1),
@@ -100,9 +100,9 @@ async fn hard_peer_death_dropped_after_absences() {
             peer_index: 2,
             after_round: 2,
         }),
-        ..SwarmConfig::small(8)
+        ..VhcConfig::small(8)
     };
-    let run = run_swarm(cfg).await.expect("silent-death run");
+    let run = run_vhc(cfg).await.expect("silent-death run");
 
     assert_all_agree(&run);
 
@@ -129,7 +129,7 @@ async fn hard_peer_death_dropped_after_absences() {
 async fn payload_store_outage_absorbed_by_stall_ladder() {
     // Peer 1's whole-round get()s for round 4 are denied for a window, then the store recovers; the
     // stall ladder absorbs it and peer 1 catches up within budget.
-    let cfg = SwarmConfig {
+    let cfg = VhcConfig {
         num_peers: 3,
         num_rounds: 10,
         stall_rounds_max: 3,
@@ -138,9 +138,9 @@ async fn payload_store_outage_absorbed_by_stall_ladder() {
             round: 4,
             first_n_gets: 3,
         }),
-        ..SwarmConfig::small(10)
+        ..VhcConfig::small(10)
     };
-    let run = run_swarm(cfg).await.expect("store-outage run");
+    let run = run_vhc(cfg).await.expect("store-outage run");
 
     assert_all_agree(&run);
     assert!(
@@ -221,14 +221,14 @@ impl TrainerBackend for DesyncBackend {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn desync_injection_detected_and_resynced() {
     const CORRUPT: RoundId = 4;
-    let cfg = SwarmConfig {
+    let cfg = VhcConfig {
         num_peers: 3,
         num_rounds: 8,
         checkpoint_every_rounds: 1, // a checkpoint every round → round-3 checkpoint available
-        ..SwarmConfig::small(8)
+        ..VhcConfig::small(8)
     };
     // Peer 2 desyncs at round 4; peers 0 and 1 stay healthy.
-    let run = run_swarm_with(cfg, |i| {
+    let run = run_vhc_with(cfg, |i| {
         let mut inner = StubBackend::new();
         inner.build(EXPERIMENT_CONFIG).expect("build");
         DesyncBackend {
@@ -338,13 +338,13 @@ async fn coordinator_restart_mid_run_completes() {
     // process restart through the sandbox, architecture §4.4): quiesce→snapshot→`da_migrate` a
     // fresh incarnation, which resumes the same logical timeline. The run completes and stays in
     // agreement across the restart.
-    let cfg = SwarmConfig {
+    let cfg = VhcConfig {
         num_peers: 3,
         num_rounds: 10,
         restart_after_round: Some(4),
-        ..SwarmConfig::small(10)
+        ..VhcConfig::small(10)
     };
-    let run = run_swarm(cfg).await.expect("restart run");
+    let run = run_vhc(cfg).await.expect("restart run");
 
     assert_all_agree(&run);
     assert!(

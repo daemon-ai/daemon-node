@@ -19,7 +19,7 @@
 //!   guest accepts frames **only on the declared authoritative records channel**, mints D1's
 //!   [`Authorized`] token for that host-verified delivery
 //!   (`Authorized::from_authoritative_channel` — the bridge path of the D1 contract), and feeds
-//!   the decoded [`SwarmMessage`] through [`tick_authenticated`] with it.
+//!   the decoded [`VhcMessage`] through [`tick_authenticated`] with it.
 //! - **`Timer`** — drives the logical clock for deadline-based transitions (warmup / round
 //!   timeouts) in a live run.
 //!
@@ -34,7 +34,7 @@
 //! sets `tick_period_ms > 0` to also arm real deadline timers.
 
 use daemon_vhc_abi::{EV_TAG_FRAME, EV_TAG_QUIESCE, EV_TAG_STOP, EV_TAG_TIMER};
-use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId, SwarmMessage};
+use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId, VhcMessage};
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, tick_authenticated, CoordinatorState, Input, Output,
 };
@@ -221,7 +221,7 @@ impl V2Module for Coordinator {
                         let authorized =
                             Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
                         if let Ok(arr) = <[u8; 32]>::try_from(sender.as_slice()) {
-                            if let Ok(msg) = from_canonical_slice::<SwarmMessage>(&payload) {
+                            if let Ok(msg) = from_canonical_slice::<VhcMessage>(&payload) {
                                 let (next, outputs) = tick_authenticated(
                                     self.state.clone(),
                                     PeerId(arr),

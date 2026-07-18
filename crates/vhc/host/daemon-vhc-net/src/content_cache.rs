@@ -10,7 +10,7 @@
 //!
 //! Unlike the in-memory [`ArtifactCache`](crate::ArtifactCache) (RUN-4, bounds resolved bytes within
 //! one process), this cache **persists to disk** — the fleet-staging property. It is the on-disk half
-//! of the same §10.6 `[swarm].data_cache_gb` budget.
+//! of the same §10.6 `[vhc].data_cache_gb` budget.
 //!
 //! ## Layout
 //!
@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use daemon_core::ContainedRoot;
 use daemon_vhc_proto::{blake3_hash, Hash};
 
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// The subdirectory under the cache root that holds the content-addressed object files.
 const OBJECTS_DIR: &str = "objects";
@@ -67,15 +67,15 @@ impl std::fmt::Debug for ContentCache {
 
 impl ContentCache {
     /// Open (creating if missing) a cache rooted at `dir`, bounded to `max_bytes` total object bytes.
-    pub fn open(dir: &Path, max_bytes: u64) -> Result<Self, SwarmNetError> {
+    pub fn open(dir: &Path, max_bytes: u64) -> Result<Self, VhcNetError> {
         let root = ContainedRoot::open(dir)
-            .map_err(|e| SwarmNetError::Transport(format!("open content cache root: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("open content cache root: {e}")))?;
         // The objects subdir is created lazily on the first insert; `open` only fixes the boundary.
         Ok(Self { root, max_bytes })
     }
 
-    /// A cache bounded by `data_cache_gb` gibibytes (the §10.6 `[swarm].data_cache_gb` knob).
-    pub fn open_gb(dir: &Path, data_cache_gb: u32) -> Result<Self, SwarmNetError> {
+    /// A cache bounded by `data_cache_gb` gibibytes (the §10.6 `[vhc].data_cache_gb` knob).
+    pub fn open_gb(dir: &Path, data_cache_gb: u32) -> Result<Self, VhcNetError> {
         Self::open(dir, u64::from(data_cache_gb) * (1 << 30))
     }
 
@@ -102,12 +102,12 @@ impl ContentCache {
     /// Read `hash`'s bytes from the cache, blake3-verifying them against the key. Returns `Ok(None)`
     /// on a miss; a **corrupt** cache file (bytes do not hash to `hash`) is evicted and reported as a
     /// miss (so a poisoned entry never satisfies a fetch).
-    pub async fn get(&self, hash: &Hash) -> Result<Option<Vec<u8>>, SwarmNetError> {
+    pub async fn get(&self, hash: &Hash) -> Result<Option<Vec<u8>>, VhcNetError> {
         let rel = Self::object_rel(hash);
         let bytes = match self.root.read(&rel).await {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(SwarmNetError::Transport(format!("read cache object: {e}"))),
+            Err(e) => return Err(VhcNetError::Transport(format!("read cache object: {e}"))),
         };
         if &blake3_hash(&bytes) != hash {
             // Poisoned entry: drop it and report a miss so the caller re-fetches from the store.
@@ -119,13 +119,13 @@ impl ContentCache {
 
     /// Insert `bytes` under `hash`, evicting least-recently-written objects until it fits.
     ///
-    /// Refuses bytes whose blake3 is not `hash` ([`SwarmNetError::HashMismatch`] — a programming/
+    /// Refuses bytes whose blake3 is not `hash` ([`VhcNetError::HashMismatch`] — a programming/
     /// integrity error, never stored). An object larger than the whole budget is a no-op (not cached).
     /// The write is atomic (tmp + rename), so a concurrent reader never sees a partial object.
-    pub async fn insert(&self, hash: &Hash, bytes: &[u8]) -> Result<(), SwarmNetError> {
+    pub async fn insert(&self, hash: &Hash, bytes: &[u8]) -> Result<(), VhcNetError> {
         let actual = blake3_hash(bytes);
         if &actual != hash {
-            return Err(SwarmNetError::HashMismatch {
+            return Err(VhcNetError::HashMismatch {
                 expected: hash.to_hex(),
                 actual: actual.to_hex(),
             });
@@ -137,7 +137,7 @@ impl ContentCache {
         self.root
             .create_dir_all(Path::new(OBJECTS_DIR))
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("create cache objects dir: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("create cache objects dir: {e}")))?;
         self.evict_to_fit(len).await?;
 
         // Atomic publish: write to a per-hash temp name, then rename over the final name.
@@ -147,20 +147,20 @@ impl ContentCache {
         self.root
             .write(&tmp, bytes)
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("write cache tmp: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("write cache tmp: {e}")))?;
         self.root
             .rename(&tmp, &final_rel)
             .await
-            .map_err(|e| SwarmNetError::Transport(format!("publish cache object: {e}")))?;
+            .map_err(|e| VhcNetError::Transport(format!("publish cache object: {e}")))?;
         Ok(())
     }
 
     /// The (size, mtime_ms) of every cached object file, plus the running total.
-    async fn scan(&self) -> Result<(u64, Vec<(String, u64, u64)>), SwarmNetError> {
+    async fn scan(&self) -> Result<(u64, Vec<(String, u64, u64)>), VhcNetError> {
         let entries = match self.root.read_dir(Path::new(OBJECTS_DIR)).await {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, Vec::new())),
-            Err(e) => return Err(SwarmNetError::Transport(format!("scan cache: {e}"))),
+            Err(e) => return Err(VhcNetError::Transport(format!("scan cache: {e}"))),
         };
         let mut used = 0u64;
         let mut objects = Vec::new();
@@ -176,7 +176,7 @@ impl ContentCache {
     }
 
     /// Evict oldest-`mtime` objects until `incoming` more bytes fit under the budget.
-    async fn evict_to_fit(&self, incoming: u64) -> Result<(), SwarmNetError> {
+    async fn evict_to_fit(&self, incoming: u64) -> Result<(), VhcNetError> {
         let (mut used, mut objects) = self.scan().await?;
         if used + incoming <= self.max_bytes {
             return Ok(());
@@ -195,7 +195,7 @@ impl ContentCache {
                 Ok(()) => used = used.saturating_sub(size),
                 // A racing reader/evictor already removed it — treat as freed.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => used = used.saturating_sub(size),
-                Err(e) => return Err(SwarmNetError::Transport(format!("evict cache object: {e}"))),
+                Err(e) => return Err(VhcNetError::Transport(format!("evict cache object: {e}"))),
             }
         }
         Ok(())
@@ -232,7 +232,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::HashMismatch { .. }),
+            matches!(err, VhcNetError::HashMismatch { .. }),
             "got {err:?}"
         );
     }

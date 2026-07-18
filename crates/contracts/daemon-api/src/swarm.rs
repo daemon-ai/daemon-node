@@ -12,7 +12,7 @@
 //! Like [`ModelApi`](crate::ModelApi), every method defaults to [`ApiError::Unsupported`] / empty so
 //! a transport that hosts no swarm service (the session-only FFI, test stubs) inherits the surface;
 //! the node's [`NodeApi`](crate::NodeApi) binds the real implementation (backed by the node
-//! `SwarmService` over a `daemon-vhc-host` worker).
+//! `VhcService` over a `daemon-vhc-host` worker).
 
 use std::collections::BTreeMap;
 
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::ApiError;
 
 /// A live, push-based stream of [`SwarmEvent`]s — the delivery shape [`SwarmApi::swarm_subscribe`]
-/// returns for the in-process transport and the node `SwarmService`'s own broadcast. Over the socket
+/// returns for the in-process transport and the node `VhcService`'s own broadcast. Over the socket
 /// mux, live swarm updates ride the **existing** node-event feed as payload-free
 /// [`NodeEvent::SwarmChanged`](crate::NodeEvent::SwarmChanged) pointers (the client refetches
 /// [`SwarmRunDetail`], whose `recent_events` carries the windowed events, §10.3) — no new transport.

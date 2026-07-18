@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-swarm-e2e` — the swarm-training end-to-end test target (spec §6.4, §19.5).
+//! `daemon-vhc-e2e` — the vhc-training end-to-end test target (spec §6.4, §19.5).
 //!
 //! This crate exists only to host the integration test under `tests/`: N in-process peers driven
 //! by the `daemon_vhc_session::harness` through the full round protocol against the **real**

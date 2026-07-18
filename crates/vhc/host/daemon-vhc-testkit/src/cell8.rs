@@ -50,8 +50,8 @@ use daemon_vhc_proto::messages::{
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, ControlTransport, GenesisEnvelope, Hash,
     Identities, IrohId, PeerId, RoleEntry, RoleGrants, RunSectionV2, Seed, SigningKey,
-    SnapshotArtifact, StateDigest, SwarmMessage, TransportSelection, GENESIS_SCHEMA_MAJOR,
-    SWARM_PROTO_VERSION,
+    SnapshotArtifact, StateDigest, TransportSelection, VhcMessage, GENESIS_SCHEMA_MAJOR,
+    VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
@@ -459,7 +459,7 @@ pub fn cell8_genesis(
     // the guest's `da_init` shape (`{state: …}`; event-driven synthetic clock defaults).
     let run_config = RunConfig {
         run_id: run_label.to_string(),
-        proto_version: SWARM_PROTO_VERSION,
+        proto_version: VHC_PROTO_VERSION,
         // The envelope anchor a worker Join asserts under v2 is the genesis hash; the harness
         // passes `envelope_hash: None` on joins (the v1-era anchor is superseded — the genesis
         // hash IS the run identity, carried in the execution identity / §12.1 scope).
@@ -596,7 +596,7 @@ impl LiveWorker {
     fn deliver_from_coordinator(
         &mut self,
         sender: [u8; 32],
-        msg: &SwarmMessage,
+        msg: &VhcMessage,
         evidence: Vec<u8>,
     ) -> Result<(), String> {
         let seq = self.coord_seq;
@@ -609,7 +609,7 @@ impl LiveWorker {
     fn deliver_duplicate_from_coordinator(
         &mut self,
         sender: [u8; 32],
-        msg: &SwarmMessage,
+        msg: &VhcMessage,
         evidence: Vec<u8>,
     ) -> Result<(), String> {
         let seq = self.coord_seq.saturating_sub(1);
@@ -619,7 +619,7 @@ impl LiveWorker {
     fn deliver_from_coordinator_seq(
         &mut self,
         sender: [u8; 32],
-        msg: &SwarmMessage,
+        msg: &VhcMessage,
         evidence: Vec<u8>,
         seq: u64,
     ) -> Result<(), String> {
@@ -833,7 +833,7 @@ pub fn cell8_whole_run(
     for w in &workers {
         coord.deliver(
             &w.key,
-            &SwarmMessage::Join(Join {
+            &VhcMessage::Join(Join {
                 run_id: spec.run_label.clone(),
                 iroh_id: IrohId([0x44; 32]),
                 class: ThroughputClass::C1,
@@ -845,7 +845,7 @@ pub fn cell8_whole_run(
     for w in &workers {
         coord.deliver(
             &w.key,
-            &SwarmMessage::Heartbeat(Heartbeat {
+            &VhcMessage::Heartbeat(Heartbeat {
                 round: 0,
                 ready: Some(true),
             }),
@@ -866,7 +866,7 @@ pub fn cell8_whole_run(
         debug_assert_eq!(auth_sender, sender);
 
         match &msg {
-            SwarmMessage::RoundOpen(ro) => {
+            VhcMessage::RoundOpen(ro) => {
                 let round = ro.round;
                 // Stage each worker's assigned batches, then deliver the open — first flushing any
                 // payload wrappers held from an earlier record (the straggle catch-up input,
@@ -935,7 +935,7 @@ pub fn cell8_whole_run(
                     let key = w.key.clone();
                     coord.deliver(
                         &key,
-                        &SwarmMessage::Commitment(Commitment {
+                        &VhcMessage::Commitment(Commitment {
                             round,
                             payload: Hash(guest_hash),
                             size: sealed.len() as u64,
@@ -947,7 +947,7 @@ pub fn cell8_whole_run(
 
                 // Availability evidence (§6.4): the harness (storage seat) authors the receipt;
                 // any authenticated sender carries it (`on_receipt` consumes content, not signer).
-                let receipt = SwarmMessage::StorageReceipt(StorageReceipt {
+                let receipt = VhcMessage::StorageReceipt(StorageReceipt {
                     round,
                     verified: sealed_by_peer
                         .iter()
@@ -964,7 +964,7 @@ pub fn cell8_whole_run(
                 // manipulation; the record arrives as the coordinator's next publish.
                 round_payloads_stash(&mut workers, round, sealed_by_peer);
             }
-            SwarmMessage::RoundRecord(rr) => {
+            VhcMessage::RoundRecord(rr) => {
                 coordinator_records += 1;
                 let round = rr.round;
                 let entries = rr.inline.clone().unwrap_or_default();
@@ -1028,7 +1028,7 @@ pub fn cell8_whole_run(
                         let key = w.key.clone();
                         coord.deliver(
                             &key,
-                            &SwarmMessage::Digest(Digest {
+                            &VhcMessage::Digest(Digest {
                                 round,
                                 digest: StateDigest(digest16),
                             }),
@@ -1049,7 +1049,7 @@ pub fn cell8_whole_run(
         let mut opened = false;
         while !opened {
             let (sender, evidence, msg) = coord.next_decision(spec.timeout)?;
-            if let SwarmMessage::RoundOpen(ro) = &msg {
+            if let VhcMessage::RoundOpen(ro) = &msg {
                 for (i, worker) in workers.iter_mut().enumerate() {
                     let held: Vec<Vec<Vec<u8>>> = worker.held_payloads.values().cloned().collect();
                     for wrappers in held {
@@ -1153,7 +1153,7 @@ fn deliver_open_under_faults(
     i: usize,
     round: u64,
     sender: [u8; 32],
-    msg: &SwarmMessage,
+    msg: &VhcMessage,
     evidence: &[u8],
 ) -> Result<(), String> {
     match faults.action(i, round, FrameKind::Open) {
@@ -1173,7 +1173,7 @@ fn deliver_record_under_faults(
     i: usize,
     round: u64,
     sender: [u8; 32],
-    msg: &SwarmMessage,
+    msg: &VhcMessage,
     evidence: &[u8],
 ) -> Result<(), String> {
     match faults.action(i, round, FrameKind::Record) {

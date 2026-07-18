@@ -1,4 +1,4 @@
-# Swarm training guests — experiment modules
+# Vhc training guests — experiment modules
 
 This directory is a **separate Cargo workspace** (excluded from the root `daemon-node` workspace) of
 `wasm32-unknown-unknown` experiment modules. Each is a `cdylib` the `daemon-vhc-host` runtime instantiates
@@ -23,7 +23,7 @@ nix develop --command cargo run -p xtask -- build-guests
 ```
 
 Artifacts land in `guests/target/wasm32-unknown-unknown/release/<name>.wasm` (gitignored). The
-`daemon-vhc-host` tests locate them via `SWARM_TEST_GUEST_DIR` if set, else this conventional path,
+`daemon-vhc-host` tests locate them via `VHC_TEST_GUEST_DIR` if set, else this conventional path,
 building on demand if absent. Release modules are size-tuned (`opt-level = "s"`, LTO, strip) and stay
 well under a few hundred KB.
 
@@ -100,4 +100,4 @@ nix develop --command cargo test -p daemon-vhc-sdk --features sim
 ```
 
 `daemon-vhc-host`'s integration suites then run the built guest modules through the real wasm
-sandbox (`cargo run -p xtask -- swarm-ci-det` builds the guests and runs those suites).
+sandbox (`cargo run -p xtask -- vhc-ci-det` builds the guests and runs those suites).

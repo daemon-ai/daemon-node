@@ -4496,21 +4496,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daemon-swarm-e2e"
-version = "0.0.1"
-dependencies = [
- "blake3",
- "daemon-vhc-net",
- "daemon-vhc-observe",
- "daemon-vhc-proto",
- "daemon-vhc-sdk-consensus",
- "daemon-vhc-sdk-rounds",
- "daemon-vhc-sdk-v2",
- "daemon-vhc-session",
- "tokio",
-]
-
-[[package]]
 name = "daemon-telegram"
 version = "0.0.1"
 dependencies = [
@@ -4875,6 +4860,21 @@ dependencies = [
 [[package]]
 name = "daemon-vhc-det"
 version = "0.0.1"
+
+[[package]]
+name = "daemon-vhc-e2e"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "daemon-vhc-net",
+ "daemon-vhc-observe",
+ "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
+ "daemon-vhc-sdk-rounds",
+ "daemon-vhc-sdk-v2",
+ "daemon-vhc-session",
+ "tokio",
+]
 
 [[package]]
 name = "daemon-vhc-host"

@@ -24,7 +24,7 @@
 //! [`RoundRecord`]s carried in the trace are the **oracle** (compared, never delivered to the
 //! module as an input); everything else is the driving trace fed to the module.
 
-use daemon_vhc_proto::messages::{RoundRecord, SignedMessage, SwarmMessage};
+use daemon_vhc_proto::messages::{RoundRecord, SignedMessage, VhcMessage};
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, Seed};
 
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
@@ -34,7 +34,7 @@ use crate::log::{MessageKind, MessageLog};
 use crate::ObserveError;
 
 /// Domain tag for the coordinator genesis seed derivation (see [`genesis_seed`]).
-const GENESIS_SEED_DOMAIN: &[u8] = b"daemon-swarm/observe/genesis-seed/genesis/v2";
+const GENESIS_SEED_DOMAIN: &[u8] = b"daemon-vhc/observe/genesis-seed/genesis/v2";
 
 /// The deterministic genesis seed for a run, derived from its **genesis hash** (the run's
 /// cryptographic identity, `FrozenGenesis::run_id`) by a domain-separated blake3.
@@ -57,7 +57,7 @@ pub fn genesis_seed(genesis_hash: &Hash) -> Seed {
 /// `coordinator-quorum` module under the host runtime — configured from the genesis-derived
 /// `initial` state (the opaque `da_init` config the module is initialized with) — delivers the
 /// recorded driving `messages` as host-verified authoritative frames, waits for the module to
-/// publish its decisions, and returns every published [`SwarmMessage`] in order. The module owns
+/// publish its decisions, and returns every published [`VhcMessage`] in order. The module owns
 /// its logical clock, so no clocks are delivered.
 pub trait CoordinatorSandbox {
     /// Re-derive a recorded run inside the sandbox: start the pinned coordinator module from
@@ -73,7 +73,7 @@ pub trait CoordinatorSandbox {
         initial: &CoordinatorState,
         messages: &[SignedMessage],
         expected_records: usize,
-    ) -> Result<Vec<SwarmMessage>, ReplayError>;
+    ) -> Result<Vec<VhcMessage>, ReplayError>;
 }
 
 /// A successful replay: what the sandboxed coordinator module re-derived.
@@ -128,8 +128,8 @@ fn partition_trace(inputs: impl Iterator<Item = Input>) -> (Vec<SignedMessage>, 
     for input in inputs {
         if let Input::Message(sm) = input {
             match &sm.payload {
-                SwarmMessage::RoundRecord(r) => oracle.push(r.clone()),
-                SwarmMessage::RoundOpen(_) => {}
+                VhcMessage::RoundRecord(r) => oracle.push(r.clone()),
+                VhcMessage::RoundOpen(_) => {}
                 _ => driving.push(sm),
             }
         }
@@ -164,7 +164,7 @@ pub fn replay_from_state(
     let records: Vec<RoundRecord> = published
         .into_iter()
         .filter_map(|m| match m {
-            SwarmMessage::RoundRecord(r) => Some(r),
+            VhcMessage::RoundRecord(r) => Some(r),
             _ => None,
         })
         .collect();
@@ -216,7 +216,7 @@ fn decision_stream_anchor(records: &[RoundRecord]) -> Result<Hash, ReplayError> 
 /// log supplies what the coordinator actually broadcast. The module re-derives a `RoundRecord` per
 /// round; each logged record is compared against it. A successful [`ReplayReport`] with
 /// `rounds_verified` equal to the logged record count proves the run's per-round consensus
-/// (committed set + drops = the round digest) is byte-reproducible — the `swarm-replay`
+/// (committed set + drops = the round digest) is byte-reproducible — the `replay`
 /// gate-ceremony assertion.
 ///
 /// # Errors

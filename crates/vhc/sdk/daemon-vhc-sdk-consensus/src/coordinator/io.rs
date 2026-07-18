@@ -10,9 +10,9 @@
 //! yields at least one output class (PROTO-1).
 
 use daemon_vhc_proto::capability::Capability;
-use daemon_vhc_proto::messages::{SignedMessage, SwarmMessage};
+use daemon_vhc_proto::messages::{SignedMessage, VhcMessage};
 use daemon_vhc_proto::sign::Signed;
-use daemon_vhc_proto::{Hash, PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::{Hash, PeerId, VhcProtoVersion};
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator::state::Phase;
@@ -40,7 +40,7 @@ pub enum ControlAction {
 pub enum Input {
     /// A clock advance (unix seconds) — the only way time enters `tick`.
     Clock(u64),
-    /// An inbound, already-signed swarm message.
+    /// An inbound, already-signed vhc message.
     Message(SignedMessage),
     /// A signed operator control request (pause/resume).
     Control(Signed<ControlRequest>),
@@ -93,9 +93,9 @@ pub enum Rejection {
     /// The message's proto version does not match the run (§16; PROTO-13).
     VersionMismatch {
         /// The run's pinned version.
-        expected: SwarmProtoVersion,
+        expected: VhcProtoVersion,
         /// The message's version.
-        got: SwarmProtoVersion,
+        got: VhcProtoVersion,
     },
     /// A pause/resume from a non-authorized principal (§11.1; PROTO-14).
     Unauthorized,
@@ -124,9 +124,9 @@ pub enum AdmissionReject {
     /// Proto-version mismatch (exact match required, §16).
     VersionMismatch {
         /// The run's pinned version.
-        expected: SwarmProtoVersion,
+        expected: VhcProtoVersion,
         /// The join's version.
-        got: SwarmProtoVersion,
+        got: VhcProtoVersion,
     },
     /// The asserted envelope hash does not match the run's frozen envelope (§6.1/§6.5).
     EnvelopeHashMismatch,
@@ -147,7 +147,7 @@ pub enum AdmissionReject {
 pub enum Output {
     /// A coordinator message to sign + broadcast (`RoundOpen` / `RoundRecord`). Boxed to keep the
     /// enum small.
-    Publish(Box<SwarmMessage>),
+    Publish(Box<VhcMessage>),
     /// A non-wire state-change signal.
     Note(Notice),
     /// The input was rejected.
@@ -157,7 +157,7 @@ pub enum Output {
 impl Output {
     /// Convenience constructor for a publish output.
     #[must_use]
-    pub fn publish(msg: SwarmMessage) -> Self {
+    pub fn publish(msg: VhcMessage) -> Self {
         Output::Publish(Box::new(msg))
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-vhc-observe` — the observer / replay-oracle for a swarm run.
+//! `daemon-vhc-observe` — the observer / replay-oracle for a vhc run.
 //!
 //! A node-side tool that consumes **only signed messages + published objects** (never privileged
 //! coordinator state) and turns them into audit + recovery primitives (swarm-training-spec.md §14,

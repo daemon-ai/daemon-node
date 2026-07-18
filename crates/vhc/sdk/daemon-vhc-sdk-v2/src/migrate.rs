@@ -62,7 +62,7 @@ impl MigrationDescriptor {
     ///
     /// # Errors
     /// Propagates the codec error (structurally unreachable for these types).
-    pub fn to_wire(&self) -> Result<Vec<u8>, daemon_vhc_proto::SwarmProtoError> {
+    pub fn to_wire(&self) -> Result<Vec<u8>, daemon_vhc_proto::VhcProtoError> {
         to_canonical_vec(self)
     }
 
@@ -70,7 +70,7 @@ impl MigrationDescriptor {
     ///
     /// # Errors
     /// Malformed/non-canonical descriptor bytes.
-    pub fn from_wire(bytes: &[u8]) -> Result<Self, daemon_vhc_proto::SwarmProtoError> {
+    pub fn from_wire(bytes: &[u8]) -> Result<Self, daemon_vhc_proto::VhcProtoError> {
         from_canonical_slice(bytes)
     }
 }

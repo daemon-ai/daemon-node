@@ -16,12 +16,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::bytes::{Hash, PeerId, Root};
-use crate::error::SwarmProtoError;
+use crate::error::VhcProtoError;
 use crate::hash::blake3_hash;
 
 const LEAF_DOMAIN: u8 = 0x00;
 const NODE_DOMAIN: u8 = 0x01;
-const EMPTY_ROOT_LABEL: &[u8] = b"daemon-swarm/merkle/empty/v1";
+const EMPTY_ROOT_LABEL: &[u8] = b"daemon-vhc/merkle/empty/v1";
 
 fn leaf_hash(peer: &PeerId, hash: &Hash) -> Hash {
     let mut buf = [0u8; 1 + PeerId::LEN + Hash::LEN];
@@ -161,12 +161,12 @@ impl SetCommitment {
         peer: &PeerId,
         hash: &Hash,
         proof: &MembershipProof,
-    ) -> Result<(), SwarmProtoError> {
+    ) -> Result<(), VhcProtoError> {
         if self.count == 0 {
-            return Err(SwarmProtoError::Merkle("set is empty".into()));
+            return Err(VhcProtoError::Merkle("set is empty".into()));
         }
         if proof.leaf_index >= self.count {
-            return Err(SwarmProtoError::Merkle("leaf index out of range".into()));
+            return Err(VhcProtoError::Merkle("leaf index out of range".into()));
         }
         let mut idx = proof.leaf_index as usize;
         let mut cur = leaf_hash(peer, hash);
@@ -181,7 +181,7 @@ impl SetCommitment {
         if Root(*cur.as_bytes()) == self.root {
             Ok(())
         } else {
-            Err(SwarmProtoError::Merkle(
+            Err(VhcProtoError::Merkle(
                 "membership proof does not reconstruct the committed root".into(),
             ))
         }

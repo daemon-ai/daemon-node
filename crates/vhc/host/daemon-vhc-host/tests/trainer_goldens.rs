@@ -55,7 +55,7 @@ use daemon_vhc_host::v2::{
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::messages::{
-    BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, SwarmMessage,
+    BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, VhcMessage,
 };
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId, Seed};
 
@@ -394,8 +394,8 @@ fn theta_from_le(bytes: &[u8], numels: &[usize]) -> Vec<Vec<f32>> {
     split_params(bytes, numels)
 }
 
-fn round_open(round: u64) -> SwarmMessage {
-    SwarmMessage::RoundOpen(RoundOpen {
+fn round_open(round: u64) -> VhcMessage {
+    VhcMessage::RoundOpen(RoundOpen {
         round,
         seed: Seed([round as u8; 32]),
         roster_digest: Hash([0; 32]),
@@ -407,14 +407,14 @@ fn round_open(round: u64) -> SwarmMessage {
     })
 }
 
-fn round_record(round: u64, payload: &[u8]) -> SwarmMessage {
+fn round_record(round: u64, payload: &[u8]) -> VhcMessage {
     let entry = RecordEntry {
         peer: PeerId(PEER),
         hash: blake3_hash(payload),
         size: payload.len() as u64,
     };
     let set: Vec<(PeerId, Hash)> = vec![(PeerId(PEER), entry.hash)];
-    SwarmMessage::RoundRecord(RoundRecord {
+    VhcMessage::RoundRecord(RoundRecord {
         round,
         set: commit_set(&set).commitment(),
         drops: Vec::new(),
@@ -452,7 +452,7 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
     let pump = run.pump.clone();
     let mut seq = 0u64;
     let sender = [9u8; 32];
-    let deliver = |msg: &SwarmMessage, seq: &mut u64| {
+    let deliver = |msg: &VhcMessage, seq: &mut u64| {
         let payload = to_canonical_vec(msg).expect("msg");
         assert_eq!(
             pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
@@ -633,7 +633,7 @@ fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
     let pump = run.pump.clone();
     let mut seq = 0u64;
     let sender = [9u8; 32];
-    let deliver = |msg: &SwarmMessage, seq: &mut u64| {
+    let deliver = |msg: &VhcMessage, seq: &mut u64| {
         let payload = to_canonical_vec(msg).expect("msg");
         assert_eq!(
             pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
@@ -790,7 +790,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
     let pump = run.pump.clone();
     let mut seq = 0u64;
     let sender = [9u8; 32];
-    let deliver = |pump: &daemon_vhc_host::v2::PumpHandle, msg: &SwarmMessage, seq: &mut u64| {
+    let deliver = |pump: &daemon_vhc_host::v2::PumpHandle, msg: &VhcMessage, seq: &mut u64| {
         let payload = to_canonical_vec(msg).expect("msg");
         assert_eq!(
             pump.deliver_frame(0, *seq, sender, payload.clone(), payload)

@@ -18,27 +18,27 @@
 //! never *defines* the message or signature type — it only assembles store evidence into proto's.
 
 use daemon_vhc_proto::messages::{RecordEntry, StorageReceipt};
-use daemon_vhc_proto::{SignedMessage, SigningKey, SwarmMessage, SwarmProtoVersion};
+use daemon_vhc_proto::{SignedMessage, SigningKey, VhcMessage, VhcProtoVersion};
 
 use crate::seam::{PayloadKey, RoundId};
 use crate::transport::PayloadStore;
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// Polls a [`PayloadStore`] and emits signed availability evidence for committed payloads as proto
 /// [`SignedMessage`] frames carrying a [`StorageReceipt`].
 ///
-/// The producer holds the node's ed25519 [`SigningKey`] and the run's pinned [`SwarmProtoVersion`]
+/// The producer holds the node's ed25519 [`SigningKey`] and the run's pinned [`VhcProtoVersion`]
 /// so every emitted receipt is a fully-signed control message the commit rule can consume directly.
 pub struct ReceiptProducer<S> {
     store: S,
     key: SigningKey,
-    version: SwarmProtoVersion,
+    version: VhcProtoVersion,
 }
 
 impl<S: PayloadStore> ReceiptProducer<S> {
     /// Build a producer over `store`, signing receipts with the node identity `key` at the run's
     /// pinned proto `version`.
-    pub fn new(store: S, key: SigningKey, version: SwarmProtoVersion) -> Self {
+    pub fn new(store: S, key: SigningKey, version: VhcProtoVersion) -> Self {
         Self {
             store,
             key,
@@ -48,9 +48,9 @@ impl<S: PayloadStore> ReceiptProducer<S> {
 
     /// Check `key` in the store and, if the object is available, produce a signed single-entry
     /// [`StorageReceipt`] message for its round. A missing/expired object surfaces as
-    /// [`SwarmNetError::PayloadMiss`] (no evidence is emitted — the §6.4 recovery-ladder rung 1 "no
+    /// [`VhcNetError::PayloadMiss`] (no evidence is emitted — the §6.4 recovery-ladder rung 1 "no
     /// availability yet" case).
-    pub async fn produce(&self, key: &PayloadKey) -> Result<SignedMessage, SwarmNetError> {
+    pub async fn produce(&self, key: &PayloadKey) -> Result<SignedMessage, VhcNetError> {
         let stat = self.store.head(key).await?;
         let receipt = StorageReceipt {
             round: key.round,
@@ -71,7 +71,7 @@ impl<S: PayloadStore> ReceiptProducer<S> {
         &self,
         round: RoundId,
         keys: &[PayloadKey],
-    ) -> Result<Option<SignedMessage>, SwarmNetError> {
+    ) -> Result<Option<SignedMessage>, VhcNetError> {
         let mut verified = Vec::new();
         for key in keys {
             if let Ok(stat) = self.store.head(key).await {
@@ -90,13 +90,9 @@ impl<S: PayloadStore> ReceiptProducer<S> {
 
     /// Sign a [`StorageReceipt`] into the proto [`SignedMessage`] control frame (ed25519 over
     /// canonical CBOR of `(version, payload)`).
-    fn sign(&self, receipt: StorageReceipt) -> Result<SignedMessage, SwarmNetError> {
-        SignedMessage::sign(
-            &self.key,
-            self.version,
-            SwarmMessage::StorageReceipt(receipt),
-        )
-        .map_err(|e| SwarmNetError::Transport(format!("sign storage receipt: {e}")))
+    fn sign(&self, receipt: StorageReceipt) -> Result<SignedMessage, VhcNetError> {
+        SignedMessage::sign(&self.key, self.version, VhcMessage::StorageReceipt(receipt))
+            .map_err(|e| VhcNetError::Transport(format!("sign storage receipt: {e}")))
     }
 }
 
@@ -106,7 +102,7 @@ mod tests {
     use crate::seam::{PeerId, RunId};
     use crate::store::FsPayloadStore;
     use crate::test_support::temp_root;
-    use daemon_vhc_proto::SWARM_PROTO_VERSION;
+    use daemon_vhc_proto::VHC_PROTO_VERSION;
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[0x42; 32])
@@ -120,7 +116,7 @@ mod tests {
     /// variant — a test helper).
     fn receipt_of(msg: &SignedMessage) -> &StorageReceipt {
         match &msg.payload {
-            SwarmMessage::StorageReceipt(r) => r,
+            VhcMessage::StorageReceipt(r) => r,
             other => panic!("expected StorageReceipt, got {other:?}"),
         }
     }
@@ -132,12 +128,12 @@ mod tests {
         let k = key(2, 0x01);
         let hash = store.put(&k, b"peer-update").await.unwrap();
 
-        let producer = ReceiptProducer::new(store, signing_key(), SWARM_PROTO_VERSION);
+        let producer = ReceiptProducer::new(store, signing_key(), VHC_PROTO_VERSION);
         let signed = producer.produce(&k).await.unwrap();
 
         // The frame is a real ed25519-signed control message at the pinned version.
         assert!(signed.verify().is_ok());
-        assert_eq!(signed.version, SWARM_PROTO_VERSION);
+        assert_eq!(signed.version, VHC_PROTO_VERSION);
 
         let receipt = receipt_of(&signed);
         assert_eq!(receipt.round, 2);
@@ -151,9 +147,9 @@ mod tests {
     async fn no_evidence_for_absent_object() {
         let dir = temp_root("receipt-absent");
         let store = FsPayloadStore::open(dir.path(), 8).unwrap();
-        let producer = ReceiptProducer::new(store, signing_key(), SWARM_PROTO_VERSION);
+        let producer = ReceiptProducer::new(store, signing_key(), VHC_PROTO_VERSION);
         let err = producer.produce(&key(9, 0x02)).await.unwrap_err();
-        assert!(matches!(err, SwarmNetError::PayloadMiss(_)), "got {err:?}");
+        assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -166,7 +162,7 @@ mod tests {
         store.put(&present_b, b"there").await.unwrap();
         let absent = key(1, 0x04);
 
-        let producer = ReceiptProducer::new(store, signing_key(), SWARM_PROTO_VERSION);
+        let producer = ReceiptProducer::new(store, signing_key(), VHC_PROTO_VERSION);
         let signed = producer
             .produce_round(1, &[present_a.clone(), absent, present_b.clone()])
             .await
@@ -187,7 +183,7 @@ mod tests {
     async fn produce_round_emits_nothing_when_all_absent() {
         let dir = temp_root("receipt-empty");
         let store = FsPayloadStore::open(dir.path(), 8).unwrap();
-        let producer = ReceiptProducer::new(store, signing_key(), SWARM_PROTO_VERSION);
+        let producer = ReceiptProducer::new(store, signing_key(), VHC_PROTO_VERSION);
         let out = producer.produce_round(3, &[key(3, 0x06)]).await.unwrap();
         assert!(out.is_none());
     }

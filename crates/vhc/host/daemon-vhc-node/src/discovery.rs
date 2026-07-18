@@ -4,7 +4,7 @@
 //! [`RunDiscovery`] — the run-discovery + envelope-fetch seam the join flow drives (spec §6.1/§6.5;
 //! A1).
 //!
-//! [`SwarmService::swarm_join`](crate::SwarmService) used to derive eligibility from a hardware
+//! [`VhcService::swarm_join`](crate::VhcService) used to derive eligibility from a hardware
 //! probe against a hardcoded allowlist coordinator (W1 placeholder). A1 replaces that with real
 //! discovery: resolve the run from the coordinator registry, fetch + blake3-verify the frozen
 //! envelope, and hand it to the worker's existing `AssessRun` for a real §6.5 verdict **before**
@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use daemon_vhc_net::{RegistryClient, RunId};
 
-use crate::service::SwarmError;
+use crate::service::VhcError;
 
 /// A discovered run: the coordination facts the node needs to assess + join (never experiment
 /// config or module bytes — the seam rule).
@@ -27,7 +27,7 @@ pub struct DiscoveredRun {
     pub coordinator: String,
     /// blake3 of the frozen envelope (hex) — the assert the peer joins under (§6.5).
     pub envelope_hash: String,
-    /// The swarm proto version the run is pinned to (§16).
+    /// The vhc proto version the run is pinned to (§16).
     pub proto_version: u32,
 }
 
@@ -36,15 +36,15 @@ pub struct DiscoveredRun {
 #[async_trait]
 pub trait RunDiscovery: Send + Sync {
     /// Discover all runs the coordinator advertises (registry `GET /runs`).
-    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, SwarmError>;
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, VhcError>;
     /// Resolve one run (`GET /runs/:id`); `None` if the coordinator does not know it.
-    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, SwarmError>;
+    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, VhcError>;
     /// Fetch the run's frozen envelope bytes (presigned GET + blake3-verify). Errors if the run is
     /// unknown or the bytes do not match the descriptor's hash.
-    async fn fetch_envelope(&self, run_id: &str) -> Result<Vec<u8>, SwarmError>;
+    async fn fetch_envelope(&self, run_id: &str) -> Result<Vec<u8>, VhcError>;
 }
 
-/// The production [`RunDiscovery`]: a [`RegistryClient`] against a swarm coordinator base.
+/// The production [`RunDiscovery`]: a [`RegistryClient`] against a vhc coordinator base.
 pub struct EgressRunDiscovery {
     registry: RegistryClient,
     coordinator: String,
@@ -64,12 +64,12 @@ impl EgressRunDiscovery {
 
 #[async_trait]
 impl RunDiscovery for EgressRunDiscovery {
-    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, SwarmError> {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, VhcError> {
         let runs = self
             .registry
             .list_runs()
             .await
-            .map_err(|e| SwarmError::Discovery(e.to_string()))?;
+            .map_err(|e| VhcError::Discovery(e.to_string()))?;
         Ok(runs
             .into_iter()
             .map(|d| DiscoveredRun {
@@ -81,12 +81,12 @@ impl RunDiscovery for EgressRunDiscovery {
             .collect())
     }
 
-    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, SwarmError> {
+    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, VhcError> {
         let run = self
             .registry
             .get_run(run_id)
             .await
-            .map_err(|e| SwarmError::Discovery(e.to_string()))?;
+            .map_err(|e| VhcError::Discovery(e.to_string()))?;
         Ok(run.map(|d| DiscoveredRun {
             run_id: d.run_id,
             coordinator: self.coordinator.clone(),
@@ -95,16 +95,16 @@ impl RunDiscovery for EgressRunDiscovery {
         }))
     }
 
-    async fn fetch_envelope(&self, run_id: &str) -> Result<Vec<u8>, SwarmError> {
+    async fn fetch_envelope(&self, run_id: &str) -> Result<Vec<u8>, VhcError> {
         let descriptor = self
             .registry
             .get_run(run_id)
             .await
-            .map_err(|e| SwarmError::Discovery(e.to_string()))?
-            .ok_or_else(|| SwarmError::Discovery(format!("run {run_id} not found in registry")))?;
+            .map_err(|e| VhcError::Discovery(e.to_string()))?
+            .ok_or_else(|| VhcError::Discovery(format!("run {run_id} not found in registry")))?;
         self.registry
             .fetch_envelope(&RunId::new(run_id), &descriptor)
             .await
-            .map_err(|e| SwarmError::Discovery(e.to_string()))
+            .map_err(|e| VhcError::Discovery(e.to_string()))
     }
 }

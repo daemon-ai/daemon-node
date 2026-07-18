@@ -14,8 +14,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use daemon_vhc_proto::messages::{SignedMessage, SwarmMessage};
-use daemon_vhc_proto::{Hash, SWARM_PROTO_VERSION};
+use daemon_vhc_proto::messages::{SignedMessage, VhcMessage};
+use daemon_vhc_proto::{Hash, VHC_PROTO_VERSION};
 
 use daemon_vhc_sdk_consensus::coordinator::Input;
 
@@ -68,8 +68,8 @@ fn oracle_parity_over_journal_substrate() {
     for r in &fx.records {
         let signed = SignedMessage::sign(
             &coord,
-            SWARM_PROTO_VERSION,
-            SwarmMessage::RoundRecord(r.clone()),
+            VHC_PROTO_VERSION,
+            VhcMessage::RoundRecord(r.clone()),
         )
         .expect("sign record");
         log.append(signed);

@@ -60,7 +60,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
-use daemon_vhc_proto::messages::{RecordEntry, SwarmMessage};
+use daemon_vhc_proto::messages::{RecordEntry, VhcMessage};
 use daemon_vhc_proto::{
     blake3_hash, digest_state, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed,
 };
@@ -542,11 +542,11 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
             }
             EV_FRAME => {
                 let payload = ev.bytes(4);
-                let Ok(msg) = from_canonical_slice::<SwarmMessage>(&payload) else {
+                let Ok(msg) = from_canonical_slice::<VhcMessage>(&payload) else {
                     continue;
                 };
                 match msg {
-                    SwarmMessage::RoundOpen(ro) => {
+                    VhcMessage::RoundOpen(ro) => {
                         let round = ro.round;
                         // Train + (dropped) commit; then the export walk for this round's θ.
                         let _out = driver.on_round_open(&ro, &mut payloads);
@@ -557,7 +557,7 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                         });
                         fence(round + 1); // the round-final fence the walk waits for
                     }
-                    SwarmMessage::RoundRecord(rr) => {
+                    VhcMessage::RoundRecord(rr) => {
                         let entries: Vec<RecordEntry> = rr.inline.clone().unwrap_or_default();
                         let out = driver.on_round_record(&rr, entries, &mut payloads);
                         for o in out {

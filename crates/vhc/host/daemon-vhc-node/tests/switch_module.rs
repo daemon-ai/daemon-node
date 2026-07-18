@@ -31,7 +31,7 @@ use daemon_vhc_host::v2::{
     PumpHandle, RunEnd, RunIdentity, V2RunConfig,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
-use daemon_vhc_node::{SwarmError, WorkerControl};
+use daemon_vhc_node::{VhcError, WorkerControl};
 use daemon_vhc_proto::envelope::{Access, DeviceMinimums};
 use daemon_vhc_proto::genesis::{
     ChannelDecl, EventCap, EventCaps, GenesisEnvelope, Identities, RoleEntry, RoleGrants,
@@ -408,10 +408,10 @@ impl InProcessUpgradeWorker {
 
 #[async_trait]
 impl WorkerControl for InProcessUpgradeWorker {
-    async fn probe(&self) -> Result<Hardware, SwarmError> {
+    async fn probe(&self) -> Result<Hardware, VhcError> {
         Ok(Hardware::default())
     }
-    async fn assess(&self, _envelope: Vec<u8>) -> Result<Eligibility, SwarmError> {
+    async fn assess(&self, _envelope: Vec<u8>) -> Result<Eligibility, VhcError> {
         Ok(Eligibility {
             eligible: true,
             ..Eligibility::default()
@@ -423,10 +423,10 @@ impl WorkerControl for InProcessUpgradeWorker {
         _coordinator: String,
         _credentials: Vec<u8>,
         _policy: JoinPolicy,
-    ) -> Result<(), SwarmError> {
+    ) -> Result<(), VhcError> {
         Ok(())
     }
-    async fn leave(&self, _run_id: String, _mode: LeaveMode) -> Result<(), SwarmError> {
+    async fn leave(&self, _run_id: String, _mode: LeaveMode) -> Result<(), VhcError> {
         Ok(())
     }
     async fn throttle(
@@ -434,7 +434,7 @@ impl WorkerControl for InProcessUpgradeWorker {
         _vram_cap_mb: Option<u32>,
         _duty_cycle_pct: Option<u8>,
         _paused: bool,
-    ) -> Result<(), SwarmError> {
+    ) -> Result<(), VhcError> {
         Ok(())
     }
 
@@ -446,20 +446,20 @@ impl WorkerControl for InProcessUpgradeWorker {
         new_module: [u8; 32],
         grants_hash: [u8; 32],
         deadline_ms: u64,
-    ) -> Result<SwitchOutcome, SwarmError> {
+    ) -> Result<SwitchOutcome, VhcError> {
         let scenario = self
             .scenario
             .lock()
             .expect("scenario")
             .take()
-            .ok_or_else(|| SwarmError::Worker("no live role-instance to switch".into()))?;
+            .ok_or_else(|| VhcError::Worker("no live role-instance to switch".into()))?;
         // Hash-pinned + authority-bound: the command's target must match the committed chain's.
         if scenario.target.epoch != epoch
             || scenario.role != role
             || scenario.target.module_for(&role) != Some(Hash(new_module))
             || scenario.grants_hash != Hash(grants_hash)
         {
-            return Err(SwarmError::Worker(
+            return Err(VhcError::Worker(
                 "SwitchModule target does not match the committed transition-chain descriptor"
                     .into(),
             ));
@@ -524,7 +524,7 @@ async fn node_switch_module_upgrades_a_running_instance_epoch_fenced() {
     let control = InProcessUpgradeWorker::new(worker, scenario);
 
     // Drive the NODE command surface: `WorkerControl::switch_module` (deadline clamped by the
-    // node's `[swarm.upgrade].quiesce_deadline_max_ms` in production; here 5s).
+    // node's `[vhc.upgrade].quiesce_deadline_max_ms` in production; here 5s).
     let outcome = WorkerControl::switch_module(
         &control,
         "switch-module-acceptance".to_string(),

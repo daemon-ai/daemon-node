@@ -48,7 +48,7 @@ use daemon_vhc_host::wasm_coordinator::{
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::messages::{
-    Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, SwarmMessage, ThroughputClass,
+    Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass, VhcMessage,
 };
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, SigningKey, StateDigest,
@@ -335,7 +335,7 @@ pub(crate) async fn join_and_run_v2(
     // synthetic clock advances per frame; no wall-clock manipulation exists on this drive).
     coord.deliver(
         &worker_key,
-        &SwarmMessage::Join(Join {
+        &VhcMessage::Join(Join {
             run_id: run_id.to_string(),
             iroh_id: IrohId([0x44; 32]),
             class: ThroughputClass::C1,
@@ -345,7 +345,7 @@ pub(crate) async fn join_and_run_v2(
     )?;
     coord.deliver(
         &worker_key,
-        &SwarmMessage::Heartbeat(Heartbeat {
+        &VhcMessage::Heartbeat(Heartbeat {
             round: 0,
             ready: Some(true),
         }),
@@ -383,7 +383,7 @@ pub(crate) async fn join_and_run_v2(
             return Err("coordinator frame sender != authorized signer".into());
         }
         match &msg {
-            SwarmMessage::RoundOpen(ro) => {
+            VhcMessage::RoundOpen(ro) => {
                 last_round = ro.round;
                 // Corpus-backed staging (module-wire kind-0 bytes): slice the round's batch
                 // window exactly as the module's SDK math does (single-peer roster ⇒ assignment
@@ -457,7 +457,7 @@ pub(crate) async fn join_and_run_v2(
                 // Relay the guest's evidence onto the coordinator plane (worker-signed).
                 coord.deliver(
                     &worker_key,
-                    &SwarmMessage::Commitment(Commitment {
+                    &VhcMessage::Commitment(Commitment {
                         round: ro.round,
                         payload: hash,
                         size,
@@ -468,7 +468,7 @@ pub(crate) async fn join_and_run_v2(
                 // sender carries it — `on_receipt` consumes content, not signer).
                 coord.deliver(
                     &worker_key,
-                    &SwarmMessage::StorageReceipt(StorageReceipt {
+                    &VhcMessage::StorageReceipt(StorageReceipt {
                         round: ro.round,
                         verified: vec![RecordEntry {
                             peer: worker_peer,
@@ -482,7 +482,7 @@ pub(crate) async fn join_and_run_v2(
                 pump.stage_payload(update_wrapper(ro.round, &worker_peer.0, &sealed)?, None)
                     .map_err(|e| format!("stage update: {e}"))?;
             }
-            SwarmMessage::RoundRecord(rr) => {
+            VhcMessage::RoundRecord(rr) => {
                 deliver_to_worker(&pump, sender, &msg, evidence.clone(), &mut coord_seq)?;
                 // The guest ingests and voices its round digest (tag 4): publishes reach 3r + 3.
                 let published = wait_publishes_servicing(
@@ -506,7 +506,7 @@ pub(crate) async fn join_and_run_v2(
                 // Relay the digest to the coordinator (roster liveness/desync accounting).
                 coord.deliver(
                     &worker_key,
-                    &SwarmMessage::Digest(Digest {
+                    &VhcMessage::Digest(Digest {
                         round: rr.round,
                         digest: StateDigest(last_digest),
                     }),
@@ -593,7 +593,7 @@ pub(crate) async fn join_and_run_v2(
 fn deliver_to_worker(
     pump: &daemon_vhc_host::v2::PumpHandle,
     sender: [u8; 32],
-    msg: &SwarmMessage,
+    msg: &VhcMessage,
     evidence: Vec<u8>,
     seq: &mut u64,
 ) -> Result<(), String> {

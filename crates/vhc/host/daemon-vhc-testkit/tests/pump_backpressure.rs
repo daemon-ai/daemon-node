@@ -26,7 +26,7 @@ use daemon_vhc_host::v2::{
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
-use daemon_vhc_proto::{to_canonical_vec, CapabilitySet, Hash, SWARM_PROTO_VERSION};
+use daemon_vhc_proto::{to_canonical_vec, CapabilitySet, Hash, VHC_PROTO_VERSION};
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 use std::sync::{Arc, Mutex};
 
@@ -77,7 +77,7 @@ fn coordinator_config() -> Vec<u8> {
     // clean delivery-hold fixture this drill needs.
     let run_config = RunConfig {
         run_id: "pump-hold".to_string(),
-        proto_version: SWARM_PROTO_VERSION,
+        proto_version: VHC_PROTO_VERSION,
         envelope_hash: Hash([0u8; 32]),
         required_capabilities: CapabilitySet::new(),
         min_peers: 2,

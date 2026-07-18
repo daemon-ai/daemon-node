@@ -180,7 +180,7 @@
 
         # devShell toolchain: the pinned stable toolchain PLUS the wasm32-unknown-unknown rust-std,
         # combined per fenix's cross recipe (same stable channel, so host and wasm rustc stay in
-        # lockstep). This lets the swarm guest experiment modules (`guests/`, `daemon-vhc-sdk`)
+        # lockstep). This lets the vhc guest experiment modules (`guests/`, `daemon-vhc-sdk`)
         # `cargo build --target wasm32-unknown-unknown` in-shell — the `xtask build-guests` target
         # (swarm-training-spec.md §10.1). Scoped to the dev shell (`craneLibDev` below) so the
         # package/build outputs keep using the lean host-only `rustToolchain`.
@@ -266,11 +266,11 @@
 
         # ------------------------------------------------------------------------------------
         # Linux training-worker lane (native). D-7: the node ships WITH its training worker, so a
-        # stock `[swarm] enabled` node finds the binary its `worker_path` default names
+        # stock `[vhc] enabled` node finds the binary its `worker_path` default names
         # (`"daemon-vhc-worker"` since the WS6 fix — the pre-A2 `daemon-vhc` scaffold default only
         # printed a version line and exited, crash-looping the supervisor). The `daemon-vhc-worker`
         # bin is its own crate (crates/vhc/bins/daemon-vhc-worker); `--features burn-ndarray` is the
-        # G1 tier-1 native backend (the same lane the `swarm-ci-det` worker suite runs, and a no-op-
+        # G1 tier-1 native backend (the same lane the `vhc-ci-det` worker suite runs, and a no-op-
         # safe toggle over burn's always-on ndarray+autodiff graph — no new deps, so it reuses the
         # shared default-feature `cargoArtifacts`). `wgpu`/`cuda` are deliberately NOT unioned in
         # this first Linux lane (wgpu needs the Vulkan tree; the D6 nvrtc fetch-on-demand fetcher is
@@ -902,7 +902,7 @@
 
         # ------------------------------------------------------------------------------------
         # Windows training-worker lane (x86_64-pc-windows-gnu). The FULL `daemon-vhc-worker`
-        # cross-built via the same MinGW toolchain as `daemon-windows`, WITH the `swarm-net` feature
+        # cross-built via the same MinGW toolchain as `daemon-windows`, WITH the `vhc-net` feature
         # (WS control plane + iroh gossip) so it live-attaches to the dev coordinator as a real
         # heterogeneity peer at the P2 WAN gate. Deployed to the RTX-5090 box (never build on-box).
         #
@@ -913,15 +913,15 @@
         # worker LINKS. Rust-panic crash capture via `sentry` is retained; only the native-minidump
         # monitor is absent on this one target (no behavior change on Linux/macOS/msvc-windows).
         #
-        # Feature set = `swarm-net` + `wgpu` (P3 Merge-2, the D5 fat-worker alignment). The P2-era
-        # shape was `swarm-net` ONLY ("the det lane needs no GPU backend to byte-match Linux") —
+        # Feature set = `vhc-net` + `wgpu` (P3 Merge-2, the D5 fat-worker alignment). The P2-era
+        # shape was `vhc-net` ONLY ("the det lane needs no GPU backend to byte-match Linux") —
         # correct for consensus at tiny-llama scale, but it contradicts the D5 packaging decision
         # (ndarray+wgpu+cuda unioned, runtime probe ladder) and collapses at 160M: a CPU-det Windows
         # peer cannot meet the barrier round wall (confirmed live at the Merge-2 ceremony — GPU peers
         # finished a 160M round in seconds, the CPU-det 5090 box needed >15 min). `wgpu` gives the
         # honest Windows GPU rung (DX12/Vulkan via windows-rs/ash — pure Rust, MinGW-crossable); NO
         # `cuda` on windows this wave (the D6 nvrtc fetch-on-demand fetcher is not built yet).
-        # aws-lc-sys (rustls' provider, pulled by `swarm-net`'s wss:// TLS) already cross-builds
+        # aws-lc-sys (rustls' provider, pulled by `vhc-net`'s wss:// TLS) already cross-builds
         # here via `windowsCommonArgs` (nasm + TARGET_CC), exactly like daemon-host's TLS stack.
         # Integration-owner flake edit (frozen-file rule), recorded in swarm-p3-ledger Merge-2.
         daemonTrainWorkerWindowsDeps = craneLibWindows.buildDepsOnly (
@@ -930,7 +930,7 @@
             pname = "daemon-vhc-worker-windows-deps";
             # A2 worker-bin split: the worker is its own crate (crates/vhc/bins/daemon-vhc-worker);
             # feature names are unchanged (they forward into daemon-vhc-host's lanes).
-            cargoExtraArgs = "-p daemon-vhc-worker --bin daemon-vhc-worker --features swarm-net,wgpu";
+            cargoExtraArgs = "-p daemon-vhc-worker --bin daemon-vhc-worker --features vhc-net,wgpu";
           }
         );
         daemon-vhc-worker-windows = craneLibWindows.buildPackage (
@@ -939,7 +939,7 @@
             pname = "daemon-vhc-worker-windows";
             version = baseVersion;
             cargoArtifacts = daemonTrainWorkerWindowsDeps;
-            cargoExtraArgs = "-p daemon-vhc-worker --bin daemon-vhc-worker --features swarm-net,wgpu";
+            cargoExtraArgs = "-p daemon-vhc-worker --bin daemon-vhc-worker --features vhc-net,wgpu";
             DAEMON_BUILD_ID = buildId;
           }
         );
@@ -1114,7 +1114,7 @@
               # shell simply omits it. Minimal honest fix (swarm-ledger-p2-c2 flake edit #1).
               ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.bubblewrap ]
               ++ engineNativeInputs
-              # Swarm transport lane (spec §7.4): the self-hosted `iroh-relay` binary B2 stands up
+              # Vhc transport lane (spec §7.4): the self-hosted `iroh-relay` binary B2 stands up
               # locally for the gossip control plane (relay URLs are pinned in the envelope). Added
               # from the pinned nixpkgs when it provides the package (flake-native), and skipped
               # gracefully otherwise so the devShell still evaluates — the documented fallback is
@@ -1247,7 +1247,7 @@
             # runtime. The Vulkan SDK pieces on `packages` also let a from-source `--features vulkan`
             # build work here (it just recompiles llama.cpp via the crate's cmake path).
             #
-            # This is ALSO the swarm burn-wgpu GPU training test lane (spec §10.1; G2, Wave 2): the
+            # This is ALSO the vhc burn-wgpu GPU training test lane (spec §10.1; G2, Wave 2): the
             # Vulkan loader above resolves the RADV ICD for `cargo test -p daemon-vhc-host --features
             # wgpu` (burn-wgpu -> cubecl -> wgpu 29 over Vulkan). It uses `craneLibDev` (not
             # `craneLib`) so the wasm32-unknown-unknown rust-std is on the toolchain — the daemon-vhc-host
@@ -1280,10 +1280,10 @@
                 ++ [ cudaPkgs.cudatoolkit ];
             };
 
-          # The swarm burn-cuda TRAINING lane (spec §10.1; the C2/P2 RunPod-4090 lane, Merge-2
+          # The vhc burn-cuda TRAINING lane (spec §10.1; the C2/P2 RunPod-4090 lane, Merge-2
           # adjudication (c)). Distinct from the infer `.#cuda` shell above (which builds llama.cpp
           # CUDA via cudatoolkit): this targets `cargo {build,test} -p daemon-vhc-host --features cuda`
-          # (burn-cuda -> cubecl-cuda -> cudarc; driver-API + NVRTC JIT at runtime) and the swarm
+          # (burn-cuda -> cubecl-cuda -> cudarc; driver-API + NVRTC JIT at runtime) and the vhc
           # det/parity suites, so it uses `craneLibDev` for the wasm32 guest toolchain (like
           # `.#vulkan`). C3 flake edit (ADDITIVE lane output; integration-owner-delegated flake rights).
           #

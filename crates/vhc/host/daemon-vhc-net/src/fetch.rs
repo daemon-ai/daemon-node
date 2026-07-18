@@ -8,7 +8,7 @@
 //! needs *some* verified copy; the retention floor (`payload_retention_rounds`, §7.4) guarantees
 //! the bytes outlive a bounded retry. [`fetch_with_fallback`] encodes that policy: try the primary
 //! store with bounded backoff, then fall through to alternate sources in cost order, returning the
-//! first blake3-verified copy or a typed [`SwarmNetError::PayloadMiss`] once every source is
+//! first blake3-verified copy or a typed [`VhcNetError::PayloadMiss`] once every source is
 //! exhausted (the miss the §6.4 stall ladder consumes).
 //!
 //! [`fetch_with_fallback_dyn`] is the same policy over heterogeneous stores behind a trait object
@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::seam::{ContentHash, PayloadKey};
 use crate::transport::PayloadStore;
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// Bounded retry/backoff policy for a single payload source (NET-4, §7.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,14 +79,14 @@ impl Default for RetryPolicy {
 ///
 /// Returns `Ok(Some(bytes))` on the first verified fetch, `Ok(None)` if the object was a typed
 /// miss on every attempt (so the caller can fall through to another source), or `Err` for a hard
-/// failure that must not be masked — a [`SwarmNetError::HashMismatch`] (tamper/corruption, §12) or
+/// failure that must not be masked — a [`VhcNetError::HashMismatch`] (tamper/corruption, §12) or
 /// a non-miss transport error.
 async fn try_source(
     store: &dyn PayloadStore,
     key: &PayloadKey,
     expected: &ContentHash,
     policy: RetryPolicy,
-) -> Result<Option<Vec<u8>>, SwarmNetError> {
+) -> Result<Option<Vec<u8>>, VhcNetError> {
     let attempts = policy.max_attempts.max(1);
     for attempt in 0..attempts {
         let backoff = policy.backoff_for(attempt);
@@ -97,9 +97,9 @@ async fn try_source(
             Ok(bytes) => return Ok(Some(bytes)),
             // A miss is retryable (the object may still be landing) and, once exhausted, falls
             // through to the next source.
-            Err(SwarmNetError::PayloadMiss(_)) => continue,
+            Err(VhcNetError::PayloadMiss(_)) => continue,
             // A hash mismatch is never masked by a retry — the source served the wrong bytes.
-            Err(e @ SwarmNetError::HashMismatch { .. }) => return Err(e),
+            Err(e @ VhcNetError::HashMismatch { .. }) => return Err(e),
             // Any other transport error is surfaced.
             Err(e) => return Err(e),
         }
@@ -110,8 +110,8 @@ async fn try_source(
 /// Fetch a committed payload, trying `primary` first (with `policy` backoff) then each of
 /// `fallbacks` in order, returning the first blake3-verified copy.
 ///
-/// A [`SwarmNetError::PayloadMiss`] is returned only when **every** source is exhausted — the typed
-/// miss the §6.4 stall ladder consumes. A tamper ([`SwarmNetError::HashMismatch`]) from any source
+/// A [`VhcNetError::PayloadMiss`] is returned only when **every** source is exhausted — the typed
+/// miss the §6.4 stall ladder consumes. A tamper ([`VhcNetError::HashMismatch`]) from any source
 /// aborts immediately (it is a correctness fault, not an availability one).
 pub async fn fetch_with_fallback<P: PayloadStore>(
     primary: &P,
@@ -119,7 +119,7 @@ pub async fn fetch_with_fallback<P: PayloadStore>(
     key: &PayloadKey,
     expected: &ContentHash,
     policy: RetryPolicy,
-) -> Result<Vec<u8>, SwarmNetError> {
+) -> Result<Vec<u8>, VhcNetError> {
     if let Some(bytes) = try_source(primary, key, expected, policy).await? {
         return Ok(bytes);
     }
@@ -137,14 +137,14 @@ pub async fn fetch_with_fallback<P: PayloadStore>(
 /// gap). The `PayloadStore` trait is `async_trait` and object-safe, so this needs no wrapper type.
 ///
 /// Sources are tried in the given (cost) order under `policy` backoff; returns the first
-/// blake3-verified copy, a tamper ([`SwarmNetError::HashMismatch`]) aborts immediately, and a typed
-/// [`SwarmNetError::PayloadMiss`] surfaces only once **every** source is exhausted.
+/// blake3-verified copy, a tamper ([`VhcNetError::HashMismatch`]) aborts immediately, and a typed
+/// [`VhcNetError::PayloadMiss`] surfaces only once **every** source is exhausted.
 pub async fn fetch_with_fallback_dyn(
     stores: &[&dyn PayloadStore],
     key: &PayloadKey,
     expected: &ContentHash,
     policy: RetryPolicy,
-) -> Result<Vec<u8>, SwarmNetError> {
+) -> Result<Vec<u8>, VhcNetError> {
     for store in stores {
         if let Some(bytes) = try_source(*store, key, expected, policy).await? {
             return Ok(bytes);
@@ -164,15 +164,15 @@ pub async fn fetch_record_set<P: PayloadStore>(
     store: &P,
     key: &PayloadKey,
     expected: &ContentHash,
-) -> Result<RecordSet, SwarmNetError> {
+) -> Result<RecordSet, VhcNetError> {
     let bytes = store.get(key, expected).await?;
     let set = RecordSet::from_canonical_slice(&bytes)
-        .map_err(|e| SwarmNetError::Fetch(format!("decode record-set: {e}")))?;
+        .map_err(|e| VhcNetError::Fetch(format!("decode record-set: {e}")))?;
     let actual = set
         .content_hash()
-        .map_err(|e| SwarmNetError::Fetch(format!("hash record-set: {e}")))?;
+        .map_err(|e| VhcNetError::Fetch(format!("hash record-set: {e}")))?;
     if &actual != expected {
-        return Err(SwarmNetError::HashMismatch {
+        return Err(VhcNetError::HashMismatch {
             expected: expected.to_hex(),
             actual: actual.to_hex(),
         });
@@ -181,8 +181,8 @@ pub async fn fetch_record_set<P: PayloadStore>(
 }
 
 /// The typed "exhausted every source" miss the §6.4 stall ladder consumes.
-fn exhausted(key: &PayloadKey, sources: usize) -> SwarmNetError {
-    SwarmNetError::PayloadMiss(format!(
+fn exhausted(key: &PayloadKey, sources: usize) -> VhcNetError {
+    VhcNetError::PayloadMiss(format!(
         "{}@r{}/{} unavailable from {sources} source(s)",
         key.run.as_str(),
         key.round,
@@ -303,13 +303,13 @@ impl DownloadScheduler {
 
     /// Acquire one capacity slot, awaiting until one frees (FIFO). Errors iff the actor shut down
     /// (scheduler.rs:122-132). The caller must [`release_capacity`](Self::release_capacity) when done.
-    pub async fn wait_for_capacity(&self) -> Result<(), SwarmNetError> {
+    pub async fn wait_for_capacity(&self) -> Result<(), VhcNetError> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(SchedulerMessage::WaitForCapacity { response: tx })
-            .map_err(|_| SwarmNetError::Transport("download scheduler actor shut down".into()))?;
+            .map_err(|_| VhcNetError::Transport("download scheduler actor shut down".into()))?;
         rx.await
-            .map_err(|_| SwarmNetError::Transport("download scheduler dropped before reply".into()))
+            .map_err(|_| VhcNetError::Transport("download scheduler dropped before reply".into()))
     }
 
     /// Release one capacity slot, handing it to the next FIFO waiter if any (scheduler.rs:134-136).
@@ -519,7 +519,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, SwarmNetError::PayloadMiss(_)), "got {err:?}");
+        assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -569,7 +569,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::HashMismatch { .. }),
+            matches!(err, VhcNetError::HashMismatch { .. }),
             "got {err:?}"
         );
     }
@@ -602,7 +602,7 @@ mod tests {
         let err = fetch_with_fallback_dyn(&stores, &k, &blake3_hash(b"nope"), RetryPolicy::none())
             .await
             .unwrap_err();
-        assert!(matches!(err, SwarmNetError::PayloadMiss(_)), "got {err:?}");
+        assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
     }
 
     // --- fetch_record_set (RUN-2 net half) -------------------------------------------------------
@@ -649,7 +649,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, SwarmNetError::HashMismatch { .. }),
+            matches!(err, VhcNetError::HashMismatch { .. }),
             "got {err:?}"
         );
     }

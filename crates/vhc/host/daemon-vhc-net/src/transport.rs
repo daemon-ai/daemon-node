@@ -17,7 +17,7 @@
 use async_trait::async_trait;
 
 use crate::seam::{ContentHash, PayloadKey};
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// The control plane: publish/subscribe of already-signed, opaque control-message bytes (§7.1).
 ///
@@ -28,7 +28,7 @@ use crate::SwarmNetError;
 pub trait ControlPlane: Send + Sync {
     /// Publish one already-signed control message to all peers. Re-publishing identical bytes is a
     /// no-op (content-hash dedupe), so a WS+gossip double-send fans out once.
-    async fn publish(&self, message: &[u8]) -> Result<(), SwarmNetError>;
+    async fn publish(&self, message: &[u8]) -> Result<(), VhcNetError>;
 
     /// Open a subscription to inbound control messages. Each distinct message is delivered at most
     /// once per subscriber.
@@ -80,15 +80,14 @@ pub struct PayloadStat {
 #[async_trait]
 pub trait PayloadStore: Send + Sync {
     /// PUT an opaque payload object, returning its content hash (blake3).
-    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, SwarmNetError>;
+    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, VhcNetError>;
 
     /// GET a payload object, verifying its content hash equals `expected`. A hash mismatch is a
-    /// typed [`SwarmNetError::HashMismatch`]; a missing/expired object is [`SwarmNetError::PayloadMiss`].
-    async fn get(&self, key: &PayloadKey, expected: &ContentHash)
-        -> Result<Vec<u8>, SwarmNetError>;
+    /// typed [`VhcNetError::HashMismatch`]; a missing/expired object is [`VhcNetError::PayloadMiss`].
+    async fn get(&self, key: &PayloadKey, expected: &ContentHash) -> Result<Vec<u8>, VhcNetError>;
 
     /// HEAD-equivalent availability check (`stat`): the object's size + content hash, without
     /// transferring the bytes to the caller. A missing/expired object is
-    /// [`SwarmNetError::PayloadMiss`].
-    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, SwarmNetError>;
+    /// [`VhcNetError::PayloadMiss`].
+    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, VhcNetError>;
 }

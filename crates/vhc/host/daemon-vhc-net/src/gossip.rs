@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use crate::dedupe::Deduper;
 use crate::seam::ContentHash;
 use crate::transport::{ControlPlane, ControlSubscription};
-use crate::SwarmNetError;
+use crate::VhcNetError;
 
 /// An in-process broadcast control plane (fanout + content-hash dedupe).
 #[derive(Default)]
@@ -46,7 +46,7 @@ impl LoopbackGossip {
 
 #[async_trait]
 impl ControlPlane for LoopbackGossip {
-    async fn publish(&self, message: &[u8]) -> Result<(), SwarmNetError> {
+    async fn publish(&self, message: &[u8]) -> Result<(), VhcNetError> {
         let mut inner = self.inner.lock().expect("gossip lock");
         // Dedupe: a message already disseminated (e.g. seen on WS then gossip) fans out once.
         if !inner.dedupe.observe(message) {

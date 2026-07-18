@@ -1,8 +1,8 @@
-; daemon-swarm.cddl — the swarm-training control-plane wire contract (spec §6.4, §7.3).
+; daemon-vhc.cddl — the vhc-training control-plane wire contract (spec §6.4, §7.3).
 ;
 ; Every peer↔coordinator and peer↔peer control message is deterministic CBOR (serde/ciborium via
 ; the crate's canonical RFC 8949 §4.2 encoder), signed by the node identity (§7.2), and versioned by
-; `SwarmProtoVersion` (u16) — independent of the app `WireVersion`. The Rust serde types in
+; `VhcProtoVersion` (u16) — independent of the app `WireVersion`. The Rust serde types in
 ; `daemon-vhc-proto` are the source of truth; this file is the authoritative schema the
 ; `cddl_conformance` test validates real ciborium bytes against.
 ;
@@ -12,7 +12,7 @@
 ; StateDigest = 16 B, IrohId = 32 B). Same convention as daemon-api.cddl's `content-hash`.
 
 ; ----- scalars / identifiers -----
-swarm-proto-version = uint            ; SwarmProtoVersion (u16)
+vhc-proto-version = uint            ; VhcProtoVersion (u16)
 round               = uint
 size                = uint
 peer-id             = bstr            ; ed25519 node identity (32 B)
@@ -103,7 +103,7 @@ heartbeat = {
 }
 
 ; ----- the externally-tagged message union -----
-swarm-message = { "RoundOpen": round-open }
+vhc-message = { "RoundOpen": round-open }
               / { "Commitment": commitment }
               / { "Attestation": attestation }
               / { "StorageReceipt": storage-receipt }
@@ -115,8 +115,8 @@ swarm-message = { "RoundOpen": round-open }
 
 ; ----- the signed wire frame (everything on the wire is one of these) -----
 signed-message = {
-  "version": swarm-proto-version,
-  "payload": swarm-message,
+  "version": vhc-proto-version,
+  "payload": vhc-message,
   "signer": peer-id,
   "sig": signature,
 }

@@ -22,7 +22,7 @@
 //!   skip training, keep fetching across rounds, late-ingest to catch up within `stall_rounds_max`,
 //!   else leave for the next epoch.
 //!
-//! Downloads overlap compute at the swarm level: while this peer trains round r, its peers commit
+//! Downloads overlap compute at the vhc level: while this peer trains round r, its peers commit
 //! and this peer prefetches their payloads reactively as the `Commitment`s arrive, so the barrier
 //! usually finds the set already local. (`// MERGE-2`: a dedicated in-peer concurrent fetch task
 //! becomes worthwhile once the real iroh/r2 payload plane replaces the fast `FsPayloadStore`.)
@@ -45,8 +45,8 @@ use daemon_vhc_proto::messages::{
     Straggle, StraggleStatus,
 };
 use daemon_vhc_proto::{
-    commit_set, from_canonical_slice, to_canonical_vec, Hash, PeerId, Root, SigningKey,
-    SwarmMessage, SwarmProtoVersion,
+    commit_set, from_canonical_slice, to_canonical_vec, Hash, PeerId, Root, SigningKey, VhcMessage,
+    VhcProtoVersion,
 };
 
 use crate::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
@@ -56,7 +56,7 @@ use crate::checkpoint::{
 };
 use crate::data::{slice_interval, BatchInterval, Corpus};
 use crate::seam::{PayloadKey, RoundId, RunId};
-use crate::SwarmRunError;
+use crate::VhcRunError;
 
 /// Per-round batch assignment: P2's throughput-weighted deterministic split (§6.3, PROTO-8).
 ///
@@ -112,8 +112,8 @@ pub struct EngineConfig {
     pub stall_rounds_max: u32,
     /// Save a round-boundary checkpoint every N ingested rounds (§9). `0` disables checkpointing.
     pub checkpoint_every_rounds: u32,
-    /// The run's pinned swarm proto version (exact-match join gate, §16).
-    pub version: SwarmProtoVersion,
+    /// The run's pinned vhc proto version (exact-match join gate, §16).
+    pub version: VhcProtoVersion,
 }
 
 /// An observable outcome of the peer's round loop (the engine's event stream).
@@ -340,7 +340,7 @@ where
     pub async fn resume_from_checkpoint(
         &mut self,
         manifest: &CheckpointManifest,
-    ) -> Result<(), SwarmRunError> {
+    ) -> Result<(), VhcRunError> {
         load_checkpoint(&self.store, &self.cfg.run, &mut self.backend, manifest).await?;
         self.last_ingested = Some(manifest.round);
         Ok(())
@@ -361,7 +361,7 @@ where
         &mut self,
         manifest: &CheckpointManifest,
         steps: &[ReplayStep],
-    ) -> Result<StateDigest, SwarmRunError> {
+    ) -> Result<StateDigest, VhcRunError> {
         load_checkpoint(&self.store, &self.cfg.run, &mut self.backend, manifest).await?;
         self.last_ingested = Some(manifest.round);
         let total = steps.len() as u32;
@@ -385,7 +385,7 @@ where
 
     /// Run the message-driven round loop until the control plane closes or the stall budget is
     /// exhausted (`LeftForEpoch`).
-    pub async fn run(&mut self) -> Result<RunOutcome, SwarmRunError> {
+    pub async fn run(&mut self) -> Result<RunOutcome, VhcRunError> {
         while let Some(bytes) = self.sub.recv().await {
             let Ok(msg) = from_canonical_slice::<daemon_vhc_proto::SignedMessage>(&bytes) else {
                 continue; // undecodable frame — gossip is best-effort dissemination
@@ -395,13 +395,13 @@ where
                 continue;
             }
             match msg.payload {
-                SwarmMessage::RoundOpen(ro) => {
+                VhcMessage::RoundOpen(ro) => {
                     if let Some(outcome) = self.on_round_open(&ro).await? {
                         return Ok(outcome);
                     }
                 }
-                SwarmMessage::Commitment(c) => self.on_commitment(msg.signer, c).await?,
-                SwarmMessage::RoundRecord(rr) => self.on_round_record(&rr).await?,
+                VhcMessage::Commitment(c) => self.on_commitment(msg.signer, c).await?,
+                VhcMessage::RoundRecord(rr) => self.on_round_record(&rr).await?,
                 // Attestations / receipts / other peers' digests / straggles are coordinator inputs
                 // (or observability); the peer side does not act on them in the MVP round loop.
                 _ => {}
@@ -414,14 +414,14 @@ where
 
     /// Handle `RoundOpen(r)`: first make progress on any stalled round (in-order catch-up), then
     /// either skip (still stalled) or train + commit this round.
-    async fn on_round_open(&mut self, ro: &RoundOpen) -> Result<Option<RunOutcome>, SwarmRunError> {
+    async fn on_round_open(&mut self, ro: &RoundOpen) -> Result<Option<RunOutcome>, VhcRunError> {
         self.advance(None).await?;
 
         if self.straggling {
             // Still stalled: skip training, keep heartbeating Straggle, and check the budget.
             self.stalled_rounds += 1;
             let round = self.pending.keys().next().copied().unwrap_or(ro.round);
-            self.publish(SwarmMessage::Straggle(Straggle {
+            self.publish(VhcMessage::Straggle(Straggle {
                 round: ro.round,
                 status: StraggleStatus::Stalled,
             }))
@@ -448,7 +448,7 @@ where
     }
 
     /// Derive this peer's interval, train it, seal + PUT the payload, and publish the `Commitment`.
-    async fn train_and_commit(&mut self, ro: &RoundOpen) -> Result<(), SwarmRunError> {
+    async fn train_and_commit(&mut self, ro: &RoundOpen) -> Result<(), VhcRunError> {
         let interval = assignment::interval_for(ro.batch, ro.seed, &self.roster, &self.peer);
         let steps = slice_interval(interval, self.cfg.steps_per_round, self.cfg.micro_batch)?;
         let seq_len = self.corpus.manifest().seq_len;
@@ -491,7 +491,7 @@ where
             size: payload.len() as u64,
             locators: vec![Locator::StoreKey(self.locator_key(ro.round, self.peer))],
         };
-        self.publish(SwarmMessage::Commitment(commitment)).await?;
+        self.publish(VhcMessage::Commitment(commitment)).await?;
         self.emit(EngineEvent::Committed {
             round: ro.round,
             hash,
@@ -505,7 +505,7 @@ where
         &mut self,
         signer: PeerId,
         commitment: Commitment,
-    ) -> Result<(), SwarmRunError> {
+    ) -> Result<(), VhcRunError> {
         let round = commitment.round;
         self.round_mut(round).commits.insert(signer, commitment);
         self.prefetch(round, signer).await?;
@@ -515,7 +515,7 @@ where
     /// Best-effort fetch + blake3-verify of `peer`'s committed payload for `round`, caching it and
     /// (if this node is a witness) re-publishing the cumulative attestation. A miss is tolerated
     /// (the barrier retries); a hash mismatch propagates (tamper, §12).
-    async fn prefetch(&mut self, round: RoundId, peer: PeerId) -> Result<(), SwarmRunError> {
+    async fn prefetch(&mut self, round: RoundId, peer: PeerId) -> Result<(), VhcRunError> {
         if self.round_mut(round).fetched.contains_key(&peer) {
             return Ok(());
         }
@@ -527,7 +527,7 @@ where
                 self.round_mut(round).fetched.insert(peer, bytes);
                 self.maybe_attest(round, peer, commitment.payload).await?;
             }
-            Err(SwarmRunError::Net(daemon_vhc_net::SwarmNetError::PayloadMiss(_))) => {}
+            Err(VhcRunError::Net(daemon_vhc_net::VhcNetError::PayloadMiss(_))) => {}
             Err(e) => return Err(e),
         }
         Ok(())
@@ -540,7 +540,7 @@ where
         round: RoundId,
         peer: PeerId,
         hash: Hash,
-    ) -> Result<(), SwarmRunError> {
+    ) -> Result<(), VhcRunError> {
         if !self.cfg.witnesses.contains(&self.peer) {
             return Ok(());
         }
@@ -559,7 +559,7 @@ where
             .map(|(p, h)| daemon_vhc_proto::messages::AttestEntry { peer: *p, hash: *h })
             .collect();
         let _ = (peer, hash);
-        self.publish(SwarmMessage::Attestation(Attestation {
+        self.publish(VhcMessage::Attestation(Attestation {
             round,
             set: commitment,
             inline: Some(inline),
@@ -576,7 +576,7 @@ where
     /// Handle `RoundRecord(r)` — the barrier. Verify the committed set against the record root,
     /// enqueue it, and try to ingest as far as the queue allows (in order). If `r` itself cannot be
     /// ingested yet (its set — or an earlier round's — is unfetchable), enter the stall ladder.
-    async fn on_round_record(&mut self, rr: &RoundRecord) -> Result<(), SwarmRunError> {
+    async fn on_round_record(&mut self, rr: &RoundRecord) -> Result<(), VhcRunError> {
         // Resync-composability guard (R, P3): a rejoining peer that replayed retained rounds from a
         // checkpoint (`resync_from_checkpoint`) has already ingested every round up to
         // `last_ingested`. A buffered / late `RoundRecord` at or below that watermark must NOT be
@@ -594,7 +594,7 @@ where
             // This round could not be ingested yet (a committed payload is missing, here or behind
             // an earlier stalled round) → stall ladder.
             self.straggling = true;
-            self.publish(SwarmMessage::Straggle(Straggle {
+            self.publish(VhcMessage::Straggle(Straggle {
                 round: rr.round,
                 status: StraggleStatus::Fetching,
             }))
@@ -614,10 +614,7 @@ where
     /// [`RECORD_SET_PEER`] key, then root-verify the decoded set against the record's **signed**
     /// commitment (`rr.set`). This wires the B1 net-side fetch into the engine's barrier (the
     /// `// MERGE-2` marker on `verify_record_set`).
-    async fn resolve_record_set(
-        &self,
-        rr: &RoundRecord,
-    ) -> Result<Vec<RecordEntry>, SwarmRunError> {
+    async fn resolve_record_set(&self, rr: &RoundRecord) -> Result<Vec<RecordEntry>, VhcRunError> {
         if rr.inline.is_some() {
             return verify_record_set(rr);
         }
@@ -628,7 +625,7 @@ where
         let stat = self.store.head(&key).await?;
         let set = fetch_record_set(&*self.store, &key, &stat.hash).await?;
         set.verify_against(&rr.set).map_err(|e| {
-            SwarmRunError::Lifecycle(format!(
+            VhcRunError::Lifecycle(format!(
                 "round {} record-set object does not reconstruct the signed root (I3): {e}",
                 rr.round
             ))
@@ -645,7 +642,7 @@ where
         &mut self,
         round: RoundId,
         entries: &[RecordEntry],
-    ) -> Result<(), SwarmRunError> {
+    ) -> Result<(), VhcRunError> {
         let Some(scheduler) = self.fetch_scheduler.clone() else {
             return Ok(());
         };
@@ -690,7 +687,7 @@ where
     /// committed set cannot yet be fetched (the barrier + stall ladder). `trigger` is the round
     /// whose record just arrived, if any — a round ingested "on time" (its own record, no prior
     /// stall) emits `RoundComplete`; a round ingested late (catch-up) emits `CaughtUp`.
-    async fn advance(&mut self, trigger: Option<RoundId>) -> Result<(), SwarmRunError> {
+    async fn advance(&mut self, trigger: Option<RoundId>) -> Result<(), VhcRunError> {
         while let Some(round) = self.pending.keys().next().copied() {
             let entries = self.pending[&round].clone();
             match self.try_ingest(round, &entries).await? {
@@ -721,7 +718,7 @@ where
         &mut self,
         round: RoundId,
         entries: &[RecordEntry],
-    ) -> Result<Option<StateDigest>, SwarmRunError> {
+    ) -> Result<Option<StateDigest>, VhcRunError> {
         // Pipeline the barrier: pull all still-uncached payloads concurrently (no-op unless a
         // download scheduler is bound). Ordering below (I3 staging) is unaffected.
         self.prefetch_missing(round, entries).await?;
@@ -734,7 +731,7 @@ where
                         self.round_mut(round).fetched.insert(entry.peer, b.clone());
                         b
                     }
-                    Err(SwarmRunError::Net(daemon_vhc_net::SwarmNetError::PayloadMiss(_))) => {
+                    Err(VhcRunError::Net(daemon_vhc_net::VhcNetError::PayloadMiss(_))) => {
                         return Ok(None);
                     }
                     Err(e) => return Err(e),
@@ -749,7 +746,7 @@ where
 
         let digest = self.backend.ingest(round, &staged).map_err(lifecycle)?;
         self.last_ingested = Some(round);
-        self.publish(SwarmMessage::Digest(DigestMsg {
+        self.publish(VhcMessage::Digest(DigestMsg {
             round,
             digest: daemon_vhc_proto::StateDigest::new(*digest.as_bytes()),
         }))
@@ -764,7 +761,7 @@ where
         &mut self,
         round: RoundId,
         digest: StateDigest,
-    ) -> Result<(), SwarmRunError> {
+    ) -> Result<(), VhcRunError> {
         let every = self.cfg.checkpoint_every_rounds;
         if every == 0 || !(round + 1).is_multiple_of(u64::from(every)) {
             return Ok(());
@@ -811,8 +808,8 @@ where
                 signer: self.peer,
             }
             .sign(&self.key)
-            .map_err(|e| SwarmRunError::Lifecycle(format!("sign checkpoint attestation: {e}")))?;
-            self.publish(SwarmMessage::CheckpointAttestation(att.to_wire()))
+            .map_err(|e| VhcRunError::Lifecycle(format!("sign checkpoint attestation: {e}")))?;
+            self.publish(VhcMessage::CheckpointAttestation(att.to_wire()))
                 .await?;
         }
         Ok(())
@@ -824,7 +821,7 @@ where
         round: RoundId,
         peer: PeerId,
         hash: &Hash,
-    ) -> Result<Vec<u8>, SwarmRunError> {
+    ) -> Result<Vec<u8>, VhcRunError> {
         let key = self.payload_key(round, peer);
         Ok(self.store.get(&key, hash).await?)
     }
@@ -843,11 +840,11 @@ where
 
     /// Sign `payload` with the node identity and publish the canonical-CBOR frame on the control
     /// plane (already-signed bytes, §7.1).
-    async fn publish(&self, payload: SwarmMessage) -> Result<(), SwarmRunError> {
+    async fn publish(&self, payload: VhcMessage) -> Result<(), VhcRunError> {
         let signed = daemon_vhc_proto::SignedMessage::sign(&self.key, self.cfg.version, payload)
-            .map_err(|e| SwarmRunError::Lifecycle(format!("sign control message: {e}")))?;
+            .map_err(|e| VhcRunError::Lifecycle(format!("sign control message: {e}")))?;
         let bytes = to_canonical_vec(&signed)
-            .map_err(|e| SwarmRunError::Lifecycle(format!("encode control message: {e}")))?;
+            .map_err(|e| VhcRunError::Lifecycle(format!("encode control message: {e}")))?;
         self.control.publish(&bytes).await?;
         Ok(())
     }
@@ -858,8 +855,8 @@ where
 }
 
 /// Map a backend error into the run-lifecycle error (the backend's error is boxed by `Display`).
-fn lifecycle<E: std::error::Error>(e: E) -> SwarmRunError {
-    SwarmRunError::Lifecycle(format!("trainer backend: {e}"))
+fn lifecycle<E: std::error::Error>(e: E) -> VhcRunError {
+    VhcRunError::Lifecycle(format!("trainer backend: {e}"))
 }
 
 /// Verify a round record's inline committed set against its signed root and return it totally
@@ -869,9 +866,9 @@ fn lifecycle<E: std::error::Error>(e: E) -> SwarmRunError {
 /// A pure function of the record (no I/O), so the commit-side check is auditable and unit-testable.
 /// `// MERGE-2`: at large rosters the set rides in `record-set.cbor` (fetched via `set_locator`)
 /// rather than inline — wire that object fetch + root-verify here.
-pub(crate) fn verify_record_set(rr: &RoundRecord) -> Result<Vec<RecordEntry>, SwarmRunError> {
+pub(crate) fn verify_record_set(rr: &RoundRecord) -> Result<Vec<RecordEntry>, VhcRunError> {
     let inline = rr.inline.as_ref().ok_or_else(|| {
-        SwarmRunError::Lifecycle(format!(
+        VhcRunError::Lifecycle(format!(
             "round {} record has no inline set (record-set.cbor fetch is a MERGE-2 seam)",
             rr.round
         ))
@@ -880,7 +877,7 @@ pub(crate) fn verify_record_set(rr: &RoundRecord) -> Result<Vec<RecordEntry>, Sw
     let tree = commit_set(&pairs);
     let recomputed = tree.commitment();
     if recomputed.root != rr.set.root || recomputed.count != rr.set.count {
-        return Err(SwarmRunError::Lifecycle(format!(
+        return Err(VhcRunError::Lifecycle(format!(
             "round {} record set does not match its committed root (I3)",
             rr.round
         )));
@@ -903,7 +900,7 @@ pub(crate) fn verify_record_set(rr: &RoundRecord) -> Result<Vec<RecordEntry>, Sw
 mod tests {
     use super::*;
     use crate::backend::{AssessMeta, Assessment, BatchRef, StepStats, StubBackend};
-    use crate::harness::{run_swarm, run_swarm_with, StallFault, SwarmConfig, EXPERIMENT_CONFIG};
+    use crate::harness::{run_vhc, run_vhc_with, StallFault, VhcConfig, EXPERIMENT_CONFIG};
     use daemon_vhc_proto::messages::RoundRecord;
     use daemon_vhc_proto::{blake3_hash, commit_set, Seed};
     use std::sync::{Arc, Mutex};
@@ -942,7 +939,7 @@ mod tests {
     ) {
         let run = RunId::new("resolve-run");
         let root = std::env::temp_dir().join(format!(
-            "daemon-swarm-resolve-{}-{}",
+            "daemon-vhc-resolve-{}-{}",
             std::process::id(),
             crate::harness::fastcounter()
         ));
@@ -960,7 +957,7 @@ mod tests {
             micro_batch: 1,
             stall_rounds_max: 2,
             checkpoint_every_rounds: 0,
-            version: daemon_vhc_proto::SWARM_PROTO_VERSION,
+            version: daemon_vhc_proto::VHC_PROTO_VERSION,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let engine = RoundEngine::new(control, store.clone(), backend, key, corpus, cfg, tx);
@@ -1024,7 +1021,7 @@ mod tests {
         };
         let err = engine.resolve_record_set(&rr).await.unwrap_err();
         assert!(
-            matches!(&err, SwarmRunError::Lifecycle(m) if m.contains("does not reconstruct")),
+            matches!(&err, VhcRunError::Lifecycle(m) if m.contains("does not reconstruct")),
             "expected a signed-root mismatch rejection, got {err:?}"
         );
     }
@@ -1049,7 +1046,7 @@ mod tests {
         rr.set.root = daemon_vhc_proto::Root([0xAB; 32]);
         let err = verify_record_set(&rr).unwrap_err();
         assert!(
-            matches!(err, SwarmRunError::Lifecycle(m) if m.contains("does not match")),
+            matches!(err, VhcRunError::Lifecycle(m) if m.contains("does not match")),
             "expected root-mismatch rejection"
         );
     }
@@ -1061,7 +1058,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_peers_agree_each_round() {
         // RUN-1: 3 peers over the round loop; equal post-ingest digest every round.
-        let run = run_swarm(SwarmConfig::small(6)).await.unwrap();
+        let run = run_vhc(VhcConfig::small(6)).await.unwrap();
         assert!(run.left_peers().is_empty(), "no peer should leave");
         let by_round = run.digests_by_round();
         assert_eq!(by_round.len(), 6, "one digest set per round");
@@ -1077,8 +1074,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn transcript_is_deterministic_across_runs() {
         // Same config → byte-identical agreed digest transcript.
-        let a = run_swarm(SwarmConfig::small(8)).await.unwrap();
-        let b = run_swarm(SwarmConfig::small(8)).await.unwrap();
+        let a = run_vhc(VhcConfig::small(8)).await.unwrap();
+        let b = run_vhc(VhcConfig::small(8)).await.unwrap();
         assert!(a.all_agree() && b.all_agree());
         assert_eq!(
             a.agreed_transcript(),
@@ -1091,11 +1088,11 @@ mod tests {
     async fn round_boundary_checkpoints_are_emitted() {
         // RUN-6: with a cadence, each peer emits a Checkpointed manifest whose digest matches the
         // round it captured, at the configured boundaries.
-        let cfg = SwarmConfig {
+        let cfg = VhcConfig {
             checkpoint_every_rounds: 2,
-            ..SwarmConfig::small(8)
+            ..VhcConfig::small(8)
         };
-        let run = run_swarm(cfg).await.unwrap();
+        let run = run_vhc(cfg).await.unwrap();
         let by_round = run.digests_by_round();
         let mut checkpoint_rounds: std::collections::BTreeSet<RoundId> =
             std::collections::BTreeSet::new();
@@ -1136,12 +1133,12 @@ mod tests {
         };
         use daemon_vhc_proto::messages::{Locator, RoundRecord as ProtoRoundRecord};
 
-        let cfg = SwarmConfig {
+        let cfg = VhcConfig {
             checkpoint_every_rounds: 2,
             typed_checkpoints: true,
-            ..SwarmConfig::small(6)
+            ..VhcConfig::small(6)
         };
-        let run = run_swarm(cfg).await.unwrap();
+        let run = run_vhc(cfg).await.unwrap();
         assert!(run.all_agree());
 
         // Both lanes emitted at every cadence boundary; the typed pointer's digest matches the
@@ -1238,7 +1235,7 @@ mod tests {
     /// THE Phase-E **cold-join acceptance** (refactor §9; the E1 `restore_attestation_round_trip`
     /// seed grown to the full flow against a LIVE run): admission → attested checkpoint →
     /// restore → record-replay catch-up, with the attestation frames flowing **through the
-    /// coordinator** (`SwarmMessage::CheckpointAttestation` → `tick` → the consensus ledger) —
+    /// coordinator** (`VhcMessage::CheckpointAttestation` → `tick` → the consensus ledger) —
     /// the K-digest gate and the restore-attestation preference evaluated over the ledger the
     /// coordinator actually accumulated on the wire, never a hand-built one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1254,13 +1251,13 @@ mod tests {
         };
         use daemon_vhc_sdk_consensus::coordinator::{tick, Input};
 
-        let cfg = SwarmConfig {
+        let cfg = VhcConfig {
             checkpoint_every_rounds: 2,
             typed_checkpoints: true,
-            ..SwarmConfig::small(6)
+            ..VhcConfig::small(6)
         };
         let num_peers = u32::try_from(cfg.num_peers).unwrap();
-        let run = run_swarm(cfg).await.unwrap();
+        let run = run_vhc(cfg).await.unwrap();
         assert!(run.all_agree());
 
         // -- the coordinator flow: fold the recorded driving frames through the pure tick -------
@@ -1346,8 +1343,8 @@ mod tests {
         .unwrap();
         let frame = daemon_vhc_proto::SignedMessage::sign(
             &restorer,
-            daemon_vhc_proto::SWARM_PROTO_VERSION,
-            SwarmMessage::CheckpointAttestation(restore_att.to_wire()),
+            daemon_vhc_proto::VHC_PROTO_VERSION,
+            VhcMessage::CheckpointAttestation(restore_att.to_wire()),
         )
         .unwrap();
         let (state, _) = tick(state, Input::Message(frame));
@@ -1393,8 +1390,8 @@ mod tests {
         .unwrap();
         let frame = daemon_vhc_proto::SignedMessage::sign(
             &joiner_key,
-            daemon_vhc_proto::SWARM_PROTO_VERSION,
-            SwarmMessage::CheckpointAttestation(joiner_att.to_wire()),
+            daemon_vhc_proto::VHC_PROTO_VERSION,
+            VhcMessage::CheckpointAttestation(joiner_att.to_wire()),
         )
         .unwrap();
         let (state, _) = tick(state, Input::Message(frame));
@@ -1412,8 +1409,8 @@ mod tests {
         forged.body.signer = daemon_vhc_proto::peer_id(&SigningKey::from_bytes(&[0x79; 32]));
         let forged_frame = daemon_vhc_proto::SignedMessage::sign(
             &joiner_key,
-            daemon_vhc_proto::SWARM_PROTO_VERSION,
-            SwarmMessage::CheckpointAttestation(
+            daemon_vhc_proto::VHC_PROTO_VERSION,
+            VhcMessage::CheckpointAttestation(
                 SignedAttestation {
                     body: forged.body,
                     sig: forged.sig,
@@ -1485,16 +1482,16 @@ mod tests {
     async fn stalled_peer_catches_up_within_budget() {
         // RUN-8: peer 1 misses peer 0's round-3 payload (first 2 gets), stalls, catches up next
         // round, and still agrees on every round's digest.
-        let cfg = SwarmConfig {
+        let cfg = VhcConfig {
             fault: Some(StallFault {
                 peer_index: 1,
                 missing_peer_index: 0,
                 round: 3,
                 first_n_gets: 2,
             }),
-            ..SwarmConfig::small(6)
+            ..VhcConfig::small(6)
         };
-        let run = run_swarm(cfg).await.unwrap();
+        let run = run_vhc(cfg).await.unwrap();
         assert!(run.left_peers().is_empty(), "peer recovers within budget");
         assert!(run.all_agree(), "digests agree despite the stall");
 
@@ -1525,7 +1522,7 @@ mod tests {
     async fn stall_budget_exhausted_leaves() {
         // RUN-8: the missing payload never arrives within budget → the peer leaves for the epoch;
         // the rest keep agreeing.
-        let cfg = SwarmConfig {
+        let cfg = VhcConfig {
             stall_rounds_max: 2,
             fault: Some(StallFault {
                 peer_index: 1,
@@ -1533,9 +1530,9 @@ mod tests {
                 round: 3,
                 first_n_gets: 1000,
             }),
-            ..SwarmConfig::small(8)
+            ..VhcConfig::small(8)
         };
-        let run = run_swarm(cfg).await.unwrap();
+        let run = run_vhc(cfg).await.unwrap();
         let stalled = daemon_vhc_proto::peer_id(&crate::harness::peer_key(1));
         assert!(
             run.left_peers().contains(&stalled),
@@ -1612,12 +1609,12 @@ mod tests {
         // RUN-5 / I2: with one peer over several rounds, the first train_step of round r+1 is
         // recorded strictly after ingest(r).
         let log: Arc<Mutex<Vec<Op>>> = Arc::new(Mutex::new(Vec::new()));
-        let cfg = SwarmConfig {
+        let cfg = VhcConfig {
             num_peers: 1,
-            ..SwarmConfig::small(4)
+            ..VhcConfig::small(4)
         };
         let log_for_factory = log.clone();
-        let _ = run_swarm_with(cfg, move |_i| {
+        let _ = run_vhc_with(cfg, move |_i| {
             let mut inner = StubBackend::new();
             inner.build(EXPERIMENT_CONFIG).unwrap();
             RecordingBackend {

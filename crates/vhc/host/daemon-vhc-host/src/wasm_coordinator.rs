@@ -47,7 +47,7 @@ use ciborium::value::Value;
 use daemon_vhc_abi::CandidateDriver;
 use daemon_vhc_proto::{
     from_canonical_slice, peek_schema, to_canonical_vec, FrozenGenesis, Hash, SignedMessage,
-    SwarmMessage, GENESIS_SCHEMA_MAJOR,
+    VhcMessage, GENESIS_SCHEMA_MAJOR,
 };
 use daemon_vhc_sdk_consensus::coordinator::CoordinatorState;
 use daemon_vhc_sdk_consensus::{AuthorityConfig, RecordSig};
@@ -328,9 +328,9 @@ impl WasmCoordinator {
     pub fn deliver(
         &mut self,
         key: &daemon_vhc_proto::SigningKey,
-        msg: &SwarmMessage,
+        msg: &VhcMessage,
     ) -> Result<(), String> {
-        let signed = SignedMessage::sign(key, daemon_vhc_proto::SWARM_PROTO_VERSION, msg.clone())
+        let signed = SignedMessage::sign(key, daemon_vhc_proto::VHC_PROTO_VERSION, msg.clone())
             .map_err(|e| format!("sign: {e}"))?;
         self.deliver_signed(&signed)
     }
@@ -375,7 +375,7 @@ impl WasmCoordinator {
 
     /// Every decision published so far, decoded: `(channel, seq, signed frame bytes, message)`.
     #[must_use]
-    pub fn published(&self) -> Vec<(u64, u64, Vec<u8>, SwarmMessage)> {
+    pub fn published(&self) -> Vec<(u64, u64, Vec<u8>, VhcMessage)> {
         self.pump
             .published()
             .into_iter()
@@ -385,7 +385,7 @@ impl WasmCoordinator {
                 let Value::Bytes(payload) = parts.get(1)? else {
                     return None;
                 };
-                let msg = from_canonical_slice::<SwarmMessage>(payload).ok()?;
+                let msg = from_canonical_slice::<VhcMessage>(payload).ok()?;
                 Some((ch, seq, frame, msg))
             })
             .collect()
@@ -395,7 +395,7 @@ impl WasmCoordinator {
     ///
     /// # Errors
     /// A `String` timeout naming what was published so far.
-    pub fn next_message(&mut self, timeout: Duration) -> Result<SwarmMessage, String> {
+    pub fn next_message(&mut self, timeout: Duration) -> Result<VhcMessage, String> {
         self.next_decision(timeout).map(|(_, _, msg)| msg)
     }
 
@@ -409,7 +409,7 @@ impl WasmCoordinator {
     pub fn next_decision(
         &mut self,
         timeout: Duration,
-    ) -> Result<([u8; 32], Vec<u8>, SwarmMessage), String> {
+    ) -> Result<([u8; 32], Vec<u8>, VhcMessage), String> {
         let deadline = Instant::now() + timeout;
         loop {
             let published = self.published();

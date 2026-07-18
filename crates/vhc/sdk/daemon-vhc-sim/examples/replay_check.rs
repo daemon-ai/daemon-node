@@ -6,7 +6,7 @@
 //!
 //! Runs the identical whole-run setup twice and confirms the two decision transcripts are
 //! byte-identical — the SDK-side analogue of the host's §8.7 input replay and the successor to the
-//! retired `swarm-replay` dev runner ("anyone can re-derive the run"). The host-side re-derivation
+//! retired `replay` dev runner ("anyone can re-derive the run"). The host-side re-derivation
 //! of a *recorded production run* through the sandboxed coordinator module stays a library
 //! capability (`daemon_vhc_session::harness::verify_observe_dir`, exercised by the observe gate);
 //! this example is the fast native equivalent for iterating on policy code.
