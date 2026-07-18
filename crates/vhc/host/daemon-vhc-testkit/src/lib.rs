@@ -9,7 +9,7 @@
 //! conflating them would smuggle a forbidden `sdk/* -> host/*` dependency (enforced by
 //! `xtask vhc-dep-check`).
 //!
-//! It generalizes the A2 t2 join-run test (`daemon-vhc-worker`'s `v2_session`) into reusable
+//! It generalizes the A2 t2 join-run test (`daemon-vhc-worker`'s `session`) into reusable
 //! infrastructure:
 //!
 //! - [`run`] — [`run::whole_run`]: start a major-2 module under the real host event-loop driver,

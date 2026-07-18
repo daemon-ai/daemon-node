@@ -1,4 +1,4 @@
-# The trainer-goldens CAPTURE crate — the documented, re-runnable recorder for the v2-native
+# The trainer-goldens CAPTURE crate — the documented, re-runnable recorder for the native
 # det-lane golden bundle (the successor to the recorded v1 parity oracle).
 #
 # The per-tier reproduction tests (daemon-vhc-host/tests/trainer_goldens.rs) drive the compute@2

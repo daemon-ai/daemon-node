@@ -21,7 +21,7 @@ two-layer split on opposite sides of the wasm boundary). vhc_dep_check enforces 
 
 [dependencies]
 # The wasmtime sandbox + the major-2 event-loop driver, admission, the in-memory JournalSink, and
-# the §8.7 replay engine (`replay_v2`). host/* -> host/* (allowed).
+# the §8.7 replay engine (`replay`). host/* -> host/* (allowed).
 daemon-vhc-host = { workspace = true }
 # The shared ABI vocabulary (event tags, channel table, stop reasons, outcome codes). contracts/*.
 daemon-vhc-abi = { workspace = true }
@@ -46,7 +46,7 @@ thiserror = { workspace = true }
 daemon-vhc-observe = { workspace = true }
 # The Phase-E upgrade-transaction drills (refactor §9): the session's `run_local_upgrade`
 # orchestrator + `UpgradeSteps` seam driven over the real host primitives (quiesce/snapshot,
-# admit_v2 re-admission, start_run_migrating). host/* -> host/* (architecture §7: TESTKIT → SESS),
+# admit re-admission, start_run_migrating). host/* -> host/* (architecture §7: TESTKIT → SESS),
 # test-only. `harness` exposes the `SandboxedCoordinator` the consensus-replay lanes re-derive
 # through (consensus never runs natively, even in verification).
 daemon-vhc-session = { workspace = true, features = ["harness"] }

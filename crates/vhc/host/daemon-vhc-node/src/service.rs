@@ -463,7 +463,7 @@ impl VhcService {
     ///
     /// - **v2 assess** (`eligibility_from_assess`, the discovery path): the claim funnel's verdict,
     ///   whose headroom carries `claim_device_bytes` / `claim_host_bytes` (bytes) — the disjoint
-    ///   tier sums the worker's `admit_v2` computed. Charged verbatim onto the device + host tiers,
+    ///   tier sums the worker's `admit` computed. Charged verbatim onto the device + host tiers,
     ///   so an admitted instance's reservation equals the assess claim totals.
     /// - **probe fallback** (`eligibility_from_hardware`, the no-registry default path): headroom
     ///   carries `claim_device_bytes` from the probed dedicated VRAM (bytes) — a conservative
@@ -945,7 +945,7 @@ fn run_summary(run: PersistedRun) -> SwarmRunSummary {
     // The D0 execution-identity trio travels only once the run is v2-identified (its RunId is
     // backfilled); a v1-only row keeps them absent — its identity is the RunLabel alone
     // (decisions D1 lazy backfill).
-    let v2_identified = run.run_id_hash.is_some();
+    let identified = run.run_id_hash.is_some();
     SwarmRunSummary {
         run_id: run.run_id,
         phase: run.last_phase,
@@ -954,9 +954,9 @@ fn run_summary(run: PersistedRun) -> SwarmRunSummary {
         policy: if joined { Some(run.policy) } else { None },
         last_round: run.last_round,
         run_id_hash: run.run_id_hash.as_ref().map(hex),
-        epoch: v2_identified.then_some(run.epoch),
-        role: v2_identified.then(|| run.role.clone()),
-        instance: v2_identified.then_some(run.instance),
+        epoch: identified.then_some(run.epoch),
+        role: identified.then(|| run.role.clone()),
+        instance: identified.then_some(run.instance),
         envelope_schema_major: Some(run.envelope_schema_major),
         module_abi_major: run.module_abi_major,
         selected_driver: run.selected_driver,

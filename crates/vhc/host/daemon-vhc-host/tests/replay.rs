@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
-// **The v2 input-replay tier-1 lane** (refactor §5 A1→A2 acceptance; ABI companion §8.7): record
+// **The input-replay tier-1 lane** (refactor §5 A1→A2 acceptance; ABI companion §8.7): record
 // a real v2 run, then re-drive the same module from the journal alone and assert every guest
 // decision reproduces bit-for-bit — the wiring of `daemon-vhc-observe::journal::verifier` (the
-// §8.7 typed contract) over `daemon-vhc-host::v2::replay` (the wasm execution). This activates
+// §8.7 typed contract) over `daemon-vhc-host::run::replay` (the wasm execution). This activates
 // the journal-soak invariant (refactor §12.6) for v2: a recorded run IS its decisions.
 //
 // Coverage: the toy averager (timers, clock reads, periodic publishes) — plus the negatives: a
 // tampered recorded publish is a typed `Diverged`, and a journal missing a recorded input makes
 // the guest's request itself the divergence. (The compute@2 trainer's journal-replay soak lives
-// in the trainer-goldens lane; data@2's in v2_data_fetch.)
+// in the trainer-goldens lane; data@2's in data_fetch.)
 
 #![allow(clippy::disallowed_methods)]
 
@@ -19,9 +19,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_host::v2::{
-    replay_v2, start_run, MemorySink, ReplayEnd, ReplayScript, RunEnd, RunIdentity, SinkEntry,
-    V2RunConfig,
+use daemon_vhc_host::run::{
+    replay, start_run, MemorySink, ReplayEnd, ReplayScript, RunConfig, RunEnd, RunIdentity,
+    SinkEntry,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_observe::journal::record::{
@@ -89,11 +89,11 @@ fn record(
     config: Vec<u8>,
     instance: u64,
     publishes: usize,
-    drive: impl FnOnce(&daemon_vhc_host::v2::PumpHandle),
+    drive: impl FnOnce(&daemon_vhc_host::run::PumpHandle),
 ) -> (Vec<SinkEntry>, RunEnd) {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let identity = identity_for(wasm, instance);
-    let run_cfg = V2RunConfig::new(identity, [0x61; 32], config, Vec::new());
+    let run_cfg = RunConfig::new(identity, [0x61; 32], config, Vec::new());
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, run_cfg, Box::new(sink.clone())).expect("start");
     let pump = run.pump.clone();
@@ -163,7 +163,7 @@ fn to_records(entries: &[SinkEntry]) -> Vec<Record> {
 }
 
 /// The §8.7 `GuestUnderReplay` seam over the host replay's slice-attributed decisions: the run
-/// already happened synchronously (`replay_v2` — a replay can never block, every input is in
+/// already happened synchronously (`replay` — a replay can never block, every input is in
 /// the journal), so delivery here walks the per-slice groups in recorded order. Ordinals are
 /// clerical (journal bookkeeping the replay cannot know); decisions carry the recorded ord so
 /// equality judges the substance: channel, seq, payload hash.
@@ -175,7 +175,7 @@ struct ReplayedDecisions {
 }
 
 impl ReplayedDecisions {
-    fn new(run: &daemon_vhc_host::v2::ReplayedRun, plan: &ReplayPlan) -> Self {
+    fn new(run: &daemon_vhc_host::run::ReplayedRun, plan: &ReplayPlan) -> Self {
         let mut per_event = vec![Vec::new(); run.events_delivered];
         for d in &run.decisions {
             per_event[d.event_index.min(run.events_delivered.saturating_sub(1))].push((
@@ -257,7 +257,7 @@ fn verify(
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let mut script = ReplayScript::from_entries(entries);
     script.identity = Some(identity_for(wasm, instance));
-    let replayed = replay_v2(&worker, wasm, config, &[], script).expect("replay harness");
+    let replayed = replay(&worker, wasm, config, &[], script).expect("replay harness");
     let plan = ReplayPlan::from_records(&to_records(entries));
     let mut guest = ReplayedDecisions::new(&replayed, &plan);
     let outcome = run_replay(&plan, &mut guest, &NoSidecars);
@@ -327,7 +327,7 @@ fn missing_recorded_input_is_a_replay_divergence() {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let mut script = ReplayScript::from_entries(&entries);
     script.identity = Some(identity_for(&wasm, 5));
-    let replayed = replay_v2(&worker, &wasm, &[3u8], &[], script).expect("replay harness");
+    let replayed = replay(&worker, &wasm, &[3u8], &[], script).expect("replay harness");
     match replayed.end {
         ReplayEnd::Diverged(msg) => assert!(msg.contains("none recorded"), "{msg}"),
         other => panic!("expected Diverged, got {other:?}"),

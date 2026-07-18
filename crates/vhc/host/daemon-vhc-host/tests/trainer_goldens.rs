@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
-// The v2-native **trainer goldens** reproduction lanes (retirement plan §3): the compute@2
+// The native **trainer goldens** reproduction lanes (retirement plan §3): the compute@2
 // trainer guest (`tiny-llama`) reproduces a RECORDED, content-addressed golden bundle rather
 // than the v1 parity oracle. This is the successor drift oracle that lets the v1 recording +
-// `v2_parity.rs` retire later.
+// `parity.rs` retire later.
 //
 // The bundle (`tests/fixtures/trainer-goldens/`) was captured from the trainer's OWN single-peer
 // barrier whole-run (the guest commits its update and ingests that same committed set): per-round
@@ -12,7 +12,7 @@
 // trajectory, exact config literals, and the schedule. Its provenance chain (v1 oracle -> the
 // trainer_parity det-equality equality proof at the capture commit -> these goldens) is written into the bundle
 // README; the recorded digests coincide bit-for-bit with the v1 oracle's, captured from the
-// autonomous v2-native lane.
+// autonomous native lane.
 //
 // Two comparison classes, exactly as the det-equality lane splits them:
 //   * the DET LANE is an EQUALITY class — the guest's post-ingest digests (tag 4) must equal the
@@ -23,7 +23,7 @@
 //     recorded golden theta within the `OpClass::Optimizer` band.
 //
 // Tiers: cpu + burn-ndarray run here; wgpu + cuda are hardware-gated feature variants (the
-// v2_parity skip-if-no-hardware convention). NOTE (this commit): the compute@2 host execution
+// parity skip-if-no-hardware convention). NOTE (this commit): the compute@2 host execution
 // backend is the ndarray `ComputeRunner` regardless of `EngineConfig.backend` (the driver wires
 // no GPU compute runner yet — that lands with the GPU/CUDA workstream). The det digest is
 // backend-independent, so the cpu and burn-ndarray tiers reproduce it identically; the wgpu/cuda
@@ -48,9 +48,9 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
-use daemon_vhc_host::v2::{
-    start_run, start_run_migrating, MemorySink, MigrationInput, OpOutcome, OpRequest, RunEnd,
-    RunIdentity, V2RunConfig,
+use daemon_vhc_host::run::{
+    start_run, start_run_migrating, MemorySink, MigrationInput, OpOutcome, OpRequest, RunConfig,
+    RunEnd, RunIdentity,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::merkle::commit_set;
@@ -352,7 +352,7 @@ fn decode_publish(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
     Some((uint(0)?, uint(1)?, bytes))
 }
 
-fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
+fn wait_published(pump: &daemon_vhc_host::run::PumpHandle, n: usize) {
     let deadline = Instant::now() + Duration::from_secs(180);
     while pump.published().len() < n {
         service_puts(pump);
@@ -370,7 +370,7 @@ fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
 /// The async-runtime seat's minimal duty here: the trainer `payload_put`s its sealed committed
 /// container each round (the B1 discipline); this harness compares against RECORDED payloads, so
 /// the put is acknowledged and its bytes dropped.
-fn service_puts(pump: &daemon_vhc_host::v2::PumpHandle) {
+fn service_puts(pump: &daemon_vhc_host::run::PumpHandle) {
     for (op, request) in pump.take_op_requests() {
         match request {
             OpRequest::PayloadPut { .. } => {
@@ -445,7 +445,7 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
         instance: 1,
         module: *blake3::hash(wasm).as_bytes(),
     };
-    let mut run_cfg = V2RunConfig::new(identity, [0x9d; 32], g.cfg_bytes.clone(), Vec::new());
+    let mut run_cfg = RunConfig::new(identity, [0x9d; 32], g.cfg_bytes.clone(), Vec::new());
     run_cfg.compute_queue_depth = 1 << 20;
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, run_cfg, Box::new(sink)).expect("start");
@@ -457,7 +457,7 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
         assert_eq!(
             pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
                 .expect("deliver"),
-            daemon_vhc_host::v2::DeliverVerdict::Accepted
+            daemon_vhc_host::run::DeliverVerdict::Accepted
         );
         *seq += 1;
     };
@@ -489,7 +489,7 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
     collect(&pump, &g.numels)
 }
 
-fn collect(pump: &daemon_vhc_host::v2::PumpHandle, numels: &[usize]) -> Reproduced {
+fn collect(pump: &daemon_vhc_host::run::PumpHandle, numels: &[usize]) -> Reproduced {
     let mut trained: Vec<Vec<Vec<f32>>> = Vec::new();
     let mut digests: Vec<[u8; 16]> = Vec::new();
     for (_, _, frame) in pump.published() {
@@ -605,7 +605,7 @@ fn trainer_goldens_reproduce_burn_ndarray() {
     assert_theta_within_band(&g, &r, "burn-ndarray");
 }
 
-// -- the straggle -> catch-up leg (ported from v2_parity's catch_up_after_straggle lane) ---------
+// -- the straggle -> catch-up leg (ported from parity's catch_up_after_straggle lane) ---------
 
 /// Drive a STRAGGLE -> CATCH-UP schedule against the goldens: round 0 trains + commits, but its
 /// record arrives while the committed payload is not yet fetchable (straggle); the payload lands;
@@ -616,7 +616,7 @@ fn trainer_goldens_reproduce_burn_ndarray() {
 /// The compute@2 trainer publishes the catch-up digest from the record handler, not the
 /// `RoundOpen` handler (the guest defers only the training/export from `RoundOpen`), so the
 /// caught-up round-0 digest is folded into the final state and the observable is the final
-/// (round 1) digest — exactly what v2_parity's lane asserts against the clean run.
+/// (round 1) digest — exactly what parity's lane asserts against the clean run.
 fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let identity = RunIdentity {
@@ -626,7 +626,7 @@ fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
         instance: 2,
         module: *blake3::hash(wasm).as_bytes(),
     };
-    let mut run_cfg = V2RunConfig::new(identity, [0x9e; 32], g.cfg_bytes.clone(), Vec::new());
+    let mut run_cfg = RunConfig::new(identity, [0x9e; 32], g.cfg_bytes.clone(), Vec::new());
     run_cfg.compute_queue_depth = 1 << 20;
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, run_cfg, Box::new(sink)).expect("start");
@@ -638,7 +638,7 @@ fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
         assert_eq!(
             pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
                 .expect("deliver"),
-            daemon_vhc_host::v2::DeliverVerdict::Accepted
+            daemon_vhc_host::run::DeliverVerdict::Accepted
         );
         *seq += 1;
     };
@@ -744,7 +744,7 @@ fn trainer_goldens_catch_up_after_straggle_cpu() {
 // -- the checkpoint/migration continuity pin (ABI §10.2 over the trainer at LLaMA scale) ----------
 
 /// The round's tag-3 commitment hash from the published frames, if voiced yet.
-fn commitment_hash(pump: &daemon_vhc_host::v2::PumpHandle, round: u64) -> Option<[u8; 32]> {
+fn commitment_hash(pump: &daemon_vhc_host::run::PumpHandle, round: u64) -> Option<[u8; 32]> {
     for (_, _, frame) in pump.published() {
         if let Some((3, r, bytes)) = decode_publish(&frame) {
             if r == round {
@@ -778,7 +778,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
         instance: 1,
         module: module_hash,
     };
-    let mut run_cfg = V2RunConfig::new(
+    let mut run_cfg = RunConfig::new(
         identity.clone(),
         [0x9f; 32],
         g.cfg_bytes.clone(),
@@ -790,12 +790,12 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
     let pump = run.pump.clone();
     let mut seq = 0u64;
     let sender = [9u8; 32];
-    let deliver = |pump: &daemon_vhc_host::v2::PumpHandle, msg: &VhcMessage, seq: &mut u64| {
+    let deliver = |pump: &daemon_vhc_host::run::PumpHandle, msg: &VhcMessage, seq: &mut u64| {
         let payload = to_canonical_vec(msg).expect("msg");
         assert_eq!(
             pump.deliver_frame(0, *seq, sender, payload.clone(), payload)
                 .expect("deliver"),
-            daemon_vhc_host::v2::DeliverVerdict::Accepted
+            daemon_vhc_host::run::DeliverVerdict::Accepted
         );
         *seq += 1;
     };
@@ -859,7 +859,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
         instance: 2, // never-reused (§8.1): the migrated incarnation
         ..identity
     };
-    let mut run_cfg2 = V2RunConfig::new(identity2, [0xa0; 32], g.cfg_bytes.clone(), Vec::new());
+    let mut run_cfg2 = RunConfig::new(identity2, [0xa0; 32], g.cfg_bytes.clone(), Vec::new());
     run_cfg2.compute_queue_depth = 1 << 20;
     let sink2 = Arc::new(Mutex::new(MemorySink::new()));
     let run2 = start_run_migrating(
@@ -942,7 +942,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
 // is the lane that retires the plan's "first GPU run may expose a compute@2 det-lane divergence"
 // risk — it runs the trainer's actual kernels on the device.
 //
-// Feature-gated + self-skipping without hardware (the v2_parity convention). wgpu is attempted on
+// Feature-gated + self-skipping without hardware (the parity convention). wgpu is attempted on
 // this host's Vulkan/RADV; cuda is gated for the remote CUDA lane (never attempted locally).
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 mod gpu {
@@ -1221,7 +1221,7 @@ mod gpu {
         assert_theta(&g.trained[0], &dev, &g.names, OpClass::Optimizer, tier);
     }
 
-    /// The wgpu tier — hardware-gated (the v2_parity skip convention; `.#vulkan` / a GPU runner
+    /// The wgpu tier — hardware-gated (the parity skip convention; `.#vulkan` / a GPU runner
     /// exercises it). The compute@2 kernels re-execute on wgpu and reproduce the recorded golden
     /// round-0 theta within the native tolerance class.
     #[cfg(feature = "wgpu")]

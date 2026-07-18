@@ -11,7 +11,7 @@
 //! the batch coalesces (drop-oldest, journaled) before the guest sees a single event — no timing
 //! races, byte-reproducible.
 //!
-//! Dev/test harness: shells `cargo build` for the guests (the `v2_event_loop.rs` pattern), so the
+//! Dev/test harness: shells `cargo build` for the guests (the `event_loop.rs` pattern), so the
 //! fs/process bans are allowed file-wide.
 #![allow(clippy::disallowed_methods)]
 
@@ -20,9 +20,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_host::v2::{
-    decode_event_frame, replay_v2, start_run, EventV2, MemorySink, ReplayEnd, ReplayScript, RunEnd,
-    RunIdentity, SinkEntry, V2RunConfig,
+use daemon_vhc_host::run::{
+    decode_event_frame, replay, start_run, MemorySink, ReplayEnd, ReplayScript, RunConfig, RunEnd,
+    RunEvent, RunIdentity, SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 
@@ -85,7 +85,7 @@ fn replay_under_coalescing_reproduces_decisions_bit_exact() {
     };
     // config: [n ticks, channel 0, burst]; the declared Timer depth is the coalescing bound.
     let config = vec![TICKS, 0u8, BURST];
-    let mut run_cfg = V2RunConfig::new(identity, [0x91; 32], config.clone(), Vec::new());
+    let mut run_cfg = RunConfig::new(identity, [0x91; 32], config.clone(), Vec::new());
     run_cfg.advisory_depth = TIMER_DEPTH;
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
@@ -133,7 +133,7 @@ fn replay_under_coalescing_reproduces_decisions_bit_exact() {
         .iter()
         .filter(|e| {
             matches!(e, SinkEntry::Event { frame, .. }
-                if matches!(decode_event_frame(frame), Ok(EventV2::Timer { .. })))
+                if matches!(decode_event_frame(frame), Ok(RunEvent::Timer { .. })))
         })
         .count();
     assert_eq!(
@@ -154,7 +154,7 @@ fn replay_under_coalescing_reproduces_decisions_bit_exact() {
         instance: 1,
         module: *blake3::hash(&wasm).as_bytes(),
     });
-    let replayed = replay_v2(&worker, &wasm, &config, &[], script).expect("replay harness");
+    let replayed = replay(&worker, &wasm, &config, &[], script).expect("replay harness");
     assert_eq!(replayed.end, ReplayEnd::Outcome(0));
     let recorded: Vec<(u64, u64, [u8; 32])> = entries
         .iter()

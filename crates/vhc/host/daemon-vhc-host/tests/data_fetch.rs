@@ -23,7 +23,7 @@
 //!   bit-for-bit with the artifact materialized from the content-addressed payload table
 //!   (extended for artifacts per §8.7).
 //!
-//! Dev/test harness: shells `cargo build` for the guests (the v2_event_loop.rs pattern), so the
+//! Dev/test harness: shells `cargo build` for the guests (the event_loop.rs pattern), so the
 //! fs/process bans are allowed file-wide.
 #![allow(clippy::disallowed_methods)]
 
@@ -33,9 +33,9 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
-use daemon_vhc_host::v2::{
-    replay_v2, start_run, MemorySink, OpOutcome, OpRequest, PumpHandle, ReplayEnd, ReplayScript,
-    RunEnd, RunIdentity, SinkEntry, V2RunConfig,
+use daemon_vhc_host::run::{
+    replay, start_run, MemorySink, OpOutcome, OpRequest, PumpHandle, ReplayEnd, ReplayScript,
+    RunConfig, RunEnd, RunIdentity, SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_session::data::{Corpus, SyntheticCorpus};
@@ -156,7 +156,7 @@ fn drive(
         instance,
         module: *blake3::hash(&wasm).as_bytes(),
     };
-    let mut run_cfg = V2RunConfig::new(identity, [0x77; 32], config, Vec::new());
+    let mut run_cfg = RunConfig::new(identity, [0x77; 32], config, Vec::new());
     run_cfg.granted_artifacts = granted.into_iter().collect();
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
@@ -237,7 +237,7 @@ fn corpus_window_fetch_end_to_end_and_replays() {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let mut script = ReplayScript::from_entries(&entries);
     script.payloads.insert(shard0, blobs[0].clone());
-    let replayed = replay_v2(&worker, &guest_wasm(), &config, &[], script).expect("harness");
+    let replayed = replay(&worker, &guest_wasm(), &config, &[], script).expect("harness");
     assert_eq!(replayed.end, ReplayEnd::Outcome(0));
     let recorded: Vec<(u64, u64, [u8; 32])> = entries
         .iter()
@@ -260,7 +260,7 @@ fn corpus_window_fetch_end_to_end_and_replays() {
 
     // And a replay WITHOUT the artifact table entry is the typed missing-payload divergence.
     let script_missing = ReplayScript::from_entries(&entries);
-    let replayed = replay_v2(&worker, &guest_wasm(), &config, &[], script_missing).expect("h");
+    let replayed = replay(&worker, &guest_wasm(), &config, &[], script_missing).expect("h");
     match replayed.end {
         ReplayEnd::Diverged(msg) => assert!(msg.contains("ReplayMissingPayload"), "{msg}"),
         other => panic!("expected ReplayMissingPayload, got {other:?}"),

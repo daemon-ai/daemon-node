@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The module layer under [`crate::main!`]: the [`V2Module`] trait, the author's declaration,
+//! The module layer under [`crate::main!`]: the [`GuestModule`] trait, the author's declaration,
 //! and the SDK-side **claim generation** (ABI §9.1, deferred from the admission sitting) —
 //! authors declare raw capacities, the SDK derives the tiered claim wire form. Hand-authored
 //! manifests/claims stay legal: the funnel judges bytes, not their author.
 //!
-//! Native-visible on purpose: sim tests drive [`V2Module`] methods and the derivations directly
+//! Native-visible on purpose: sim tests drive [`GuestModule`] methods and the derivations directly
 //! (the `main!` exports are wasm32-only, exactly like the v1 `experiment!` macro).
 
 use crate::migrate::{MigrationDescriptor, SectionReader};
@@ -36,7 +36,7 @@ pub struct ModuleDecl {
 }
 
 /// A major-2 module under [`crate::main!`]: the v2 analogue of the v1 SDK's `Experiment`.
-pub trait V2Module: Sized {
+pub trait GuestModule: Sized {
     /// The static declaration the manifest + claim derive from.
     fn decl() -> ModuleDecl;
 
@@ -125,13 +125,13 @@ pub fn derive_claim(decl: &ModuleDecl) -> Vec<u8> {
 
 /// Derive the manifest wire bytes (ABI §2.3/§6.2 Phase-A fields). `migratable` is always `true`
 /// under `main!` — the macro always exports `da_migrate` (§6.2: "true iff exported"); whether a
-/// descriptor is consumable is [`V2Module::migrate`]'s runtime answer.
+/// descriptor is consumable is [`GuestModule::migrate`]'s runtime answer.
 #[must_use]
 pub fn manifest_bytes(decl: &ModuleDecl) -> Vec<u8> {
     let m = ciborium::value::Value::Map(vec![
         (text("name"), text(decl.name)),
         (text("version"), text(decl.version)),
-        (text("sdk"), text("daemon-vhc-sdk-v2")),
+        (text("sdk"), text("daemon-vhc-sdk")),
         (text("abi"), uint(u64::from((2u32 << 16) | decl.abi_minor))),
         (
             text("channels"),

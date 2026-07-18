@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // **The corpus-windowing equivalence oracle** (B2, refactor §6 "corpus windowing, by layer"):
-// `daemon-vhc-sdk-v2::corpus` (the SDK/module-policy home the data@ world consumes) must window
+// `daemon-vhc-sdk::corpus` (the SDK/module-policy home the data@ world consumes) must window
 // the corpus **decision-for-decision identically** to `daemon-vhc-session::data` (the v1 host
 // pipeline, which stays untouched for the retained v1 driver until the Phase-E sunset).
 //
@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use daemon_vhc_sdk_v2::corpus::{CorpusWindow as SdkWindow, Manifest as SdkManifest};
+use daemon_vhc_sdk::corpus::{CorpusWindow as SdkWindow, Manifest as SdkManifest};
 use daemon_vhc_session::data::{Corpus as HostCorpus, Manifest as HostManifest, SyntheticCorpus};
 
 /// One corpus both layers read: the session's own synthetic generator (the v1 fetch path's CI

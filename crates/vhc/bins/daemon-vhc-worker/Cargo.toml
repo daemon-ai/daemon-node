@@ -9,7 +9,7 @@ license.workspace = true
 # §3/§11 ("splits into `bins/daemon-vhc-worker` when A0 gives it real work") and architecture §7's
 # tree (`crates/vhc/bins/daemon-vhc-worker`). A strictly mechanical move: the child side of the
 # frozen worker protocol (§10.2) over the length-framed stdio cut, driving the `daemon-vhc-host`
-# wasm runtime. Runs ANY role's module once the v2 driver lands; the node side stays a library
+# wasm runtime. Runs ANY role's module once the event-loop driver lands; the node side stays a library
 # (`daemon-vhc-node` + `daemon-vhc-supervisor`, embedded by the product's node binary — never here).
 # `daemon-vhc-probe` and the `daemon-vhc` CLI remain `[[bin]]` targets of `daemon-vhc-host` (the
 # probe is the MinGW-linkable fleet-validation artifact and links none of this worker's stdio/crash

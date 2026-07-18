@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
-// The A2 v2-event-loop end-to-end proof (refactor §5 A2 acceptance; ABI §13 conformance rows):
+// The A2 event-loop end-to-end proof (refactor §5 A2 acceptance; ABI §13 conformance rows):
 // the timer-driven `toy-averager` guest — a NON-ROUND topology using only the declared Phase-A
 // subset (timers + publish) — runs under the real major-2 driver with zero host changes:
 // selection admits it (majors flipped to [1,2] in this commit), `da_init`/`da_run` dispatch,
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
 use daemon_vhc_abi::{DEFAULT_CHANNEL_CONTROL_ID, FRAME_ENVELOPE_DOMAIN_V2};
-use daemon_vhc_host::v2::{start_run, JournalSink, RunEnd, RunIdentity, SinkError, V2RunConfig};
+use daemon_vhc_host::run::{start_run, JournalSink, RunConfig, RunEnd, RunIdentity, SinkError};
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_observe::journal::record::{
     ClockRec, DropId, DropRec, EventRec, InitRec, InstantiationRec, RunHeader, SignedFrameRec,
@@ -248,7 +248,7 @@ impl JournalSink for JournalAdapter {
         &mut self,
         class: u64,
         rule: u64,
-        dropped: daemon_vhc_host::v2::Dropped,
+        dropped: daemon_vhc_host::run::Dropped,
     ) -> Result<(), SinkError> {
         self.journal
             .append(Body::Drop(DropRec {
@@ -391,14 +391,14 @@ fn toy_averager_runs_end_to_end_under_the_v2_driver() {
 
     // Config: average over 3 timer ticks. The device profile (8 GiB VRAM) feeds the guest's
     // module autotune (architecture §3.5); the identity feeds the deterministic rng_seed.
-    let device = daemon_vhc_host::v2::DeviceProfile {
+    let device = daemon_vhc_host::run::DeviceProfile {
         gpu: true,
         vram_bytes: 8 << 30,
         ram_bytes: 16 << 30,
         disk_bytes: 100 << 30,
     };
-    let expected_seed = daemon_vhc_host::v2::driver::derive_rng_seed(&identity);
-    let mut run_cfg = V2RunConfig::new(identity, [0x51; 32], vec![3u8], b"grants-tbd".to_vec());
+    let expected_seed = daemon_vhc_host::run::driver::derive_rng_seed(&identity);
+    let mut run_cfg = RunConfig::new(identity, [0x51; 32], vec![3u8], b"grants-tbd".to_vec());
     run_cfg.device_bytes = device.to_wire();
     let run = start_run(&worker, &wasm, run_cfg, Box::new(adapter.clone())).expect("start run");
 
@@ -544,7 +544,8 @@ fn toy_averager_runs_end_to_end_under_the_v2_driver() {
         // Every journaled delivered-event frame decodes under the v2 codec (replay substrate).
         for r in &records {
             if let Body::Event(e) = &r.body {
-                daemon_vhc_host::v2::decode_event_frame(&e.frame).expect("journaled frame decodes");
+                daemon_vhc_host::run::decode_event_frame(&e.frame)
+                    .expect("journaled frame decodes");
             }
         }
         // The terminal is Outcome(0).
@@ -593,7 +594,7 @@ fn publish_on_undeclared_channel_traps_grant_violation() {
     }));
 
     // Config: 1 tick, publish on undeclared channel 9.
-    let run_cfg = V2RunConfig::new(identity, [0x52; 32], vec![1u8, 9u8], Vec::new());
+    let run_cfg = RunConfig::new(identity, [0x52; 32], vec![1u8, 9u8], Vec::new());
     let run = start_run(&worker, &wasm, run_cfg, Box::new(adapter.clone())).expect("start run");
 
     let end = run.wait().expect("guest thread clean");

@@ -27,21 +27,21 @@ pub mod replay;
 pub mod streams;
 
 pub use admission::{
-    admit_v2, apply_admitted_quotas, AdmissionV2, DeviceProfile, EnvelopeRoleGrants, FunnelRefusal,
+    admit, apply_admitted_quotas, Admission, DeviceProfile, EnvelopeRoleGrants, FunnelRefusal,
     MemoryClaim, OwnerPolicy, ParticipationLane, TierBytes,
 };
 pub use buffer::BufferTable;
 pub use completion::{CompError, CompletionCodecError, CompletionResult, SuccessPayload};
 pub use custom_op::CustomOpRegistry;
 pub use driver::{
-    start_run, start_run_migrating, DeliverVerdict, MigrationInput, OpOutcome, PumpHandle, RunEnd,
-    RunIdentity, SnapshotCapture, SpooledFrame, V2Error, V2Run, V2RunConfig,
+    start_run, start_run_migrating, DeliverVerdict, MigrationInput, OpOutcome, PumpHandle, Run,
+    RunConfig, RunEnd, RunError, RunIdentity, SnapshotCapture, SpooledFrame,
 };
-pub use event::{decode_event_frame, encode_event_frame, EventCodecError, EventV2, PayloadMeta};
+pub use event::{decode_event_frame, encode_event_frame, EventCodecError, PayloadMeta, RunEvent};
 pub use journal::{Dropped, JournalSink, MemorySink, SinkEntry, SinkError};
 pub use ops::{OpRequest, OpTable};
 pub use replay::{
-    replay_v2, replay_v2_migrating, ReplayEnd, ReplayMigration, ReplayScript, ReplayedDecision,
+    replay, replay_migrating, ReplayEnd, ReplayMigration, ReplayScript, ReplayedDecision,
     ReplayedRun,
 };
 pub use streams::StreamTable;

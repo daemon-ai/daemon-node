@@ -283,7 +283,7 @@ fn compute_replay_degenerate_ndarray_is_bit_exact() {
     }
 }
 
-/// The wgpu cross-backend tier — hardware-gated (the same convention as `v2_parity`'s wgpu tier:
+/// The wgpu cross-backend tier — hardware-gated (the same convention as `parity`'s wgpu tier:
 /// the `.#vulkan` shell / a GPU runner exercises it). The ndarray-recorded journal re-executed on
 /// wgpu reproduces the trajectory within the native lane's TOLERANCE CLASS — NOT bit-exact
 /// (heterogeneous-hardware arithmetic differs; architecture §3.6/§10).

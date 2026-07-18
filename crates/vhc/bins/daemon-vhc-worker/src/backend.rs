@@ -4,7 +4,7 @@
 //! The assess / probe side of the worker (§6.5, §10.2).
 //!
 //! Owns the `Probe` hardware report, the `AssessRun` envelope→`(config, module)` resolution, and the
-//! v2 claim()-funnel eligibility pass ([`assess_v2`]). (The v1 `WasmBackend` construction / autotune
+//! v2 claim()-funnel eligibility pass ([`assess`]). (The v1 `WasmBackend` construction / autotune
 //! assess this file also carried retired with the v1 driver at the Phase-E sunset.)
 
 use daemon_vhc_host::probe::DeviceLimits;
@@ -47,9 +47,9 @@ impl ResolvedRun {
     /// The envelope-v2 grants input for the admission funnel (D1 deliverable 4): the worker
     /// role's grant list + the run's artifact-map hashes, derived from the genesis envelope.
     /// `None` on the v1 path — the funnel's pre-D0 defaults stand there.
-    pub(crate) fn envelope_grants(&self) -> Option<daemon_vhc_host::v2::EnvelopeRoleGrants> {
+    pub(crate) fn envelope_grants(&self) -> Option<daemon_vhc_host::run::EnvelopeRoleGrants> {
         let g = self.genesis.as_ref()?;
-        daemon_vhc_host::v2::EnvelopeRoleGrants::from_genesis(&g.env, &g.worker_role)
+        daemon_vhc_host::run::EnvelopeRoleGrants::from_genesis(&g.env, &g.worker_role)
     }
 }
 
@@ -672,7 +672,7 @@ pub(crate) fn hardware() -> Hardware {
 }
 
 /// The device budget the admission math is computed against (Merge-2 UMA fix) — post-sunset it
-/// feeds the v2 claim funnel's [`daemon_vhc_host::v2::DeviceProfile`].
+/// feeds the v2 claim funnel's [`daemon_vhc_host::run::DeviceProfile`].
 ///
 /// With the `wgpu` feature + a usable adapter: `vram_mb` = sysfs dedicated VRAM (true lower bound),
 /// `shared_mb` = sysfs GTT (the unified spillover pool), `max_alloc_mb` = the wgpu `max_buffer_size`
@@ -751,7 +751,7 @@ pub(crate) fn device_limits() -> DeviceLimits {
 ///    never an `Event::Error` (ABI §1.5). **Since the Phase-E v1 sunset a v1 module lands here
 ///    with `AbiUnsupportedMajor`** — the retained-v1 assess (import scan → meta pass → autotune
 ///    verdict) retired with the driver in the same step (decisions D5).
-/// 2. A module selecting the **v2 driver** runs the A2 claim()-admission funnel ([`assess_v2`]):
+/// 2. A module selecting the **event-loop driver** runs the A2 claim()-admission funnel ([`assess`]):
 ///    lane floor, restricted-instance `da_manifest`/`da_claim`, lane claim bounds, owner
 ///    authorization — the ABI §9.3 owner-bracketed order.
 ///
@@ -763,7 +763,7 @@ pub(crate) fn assess(
     config: &[u8],
     module_blake3: Option<&[u8; 32]>,
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
-    envelope_grants: Option<&daemon_vhc_host::v2::EnvelopeRoleGrants>,
+    envelope_grants: Option<&daemon_vhc_host::run::EnvelopeRoleGrants>,
 ) -> Result<(Eligibility, bool), String> {
     // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (real-scale param layouts exceed
     // the tiny-model defaults). Assessment itself stays on the CPU-cheap path.
@@ -781,10 +781,10 @@ pub(crate) fn assess(
     match daemon_vhc_host::select_driver(&worker, module, module_blake3) {
         Ok(_sel) => {
             // The major-2 path: the claim()-based admission funnel (ABI §9.3, A2). Selection
-            // re-runs inside admit_v2 (§9.4 step 1–3 order is normative); the arms below map the
+            // re-runs inside admit (§9.4 step 1–3 order is normative); the arms below map the
             // funnel outcome onto the typed `Assessed` surface.
             Ok((
-                assess_v2(
+                assess_module(
                     &worker,
                     module,
                     config,
@@ -812,22 +812,22 @@ pub(crate) fn assess(
 /// CPU-admitting dev/t2 lane (GPU optional, no device floors, the same claim bounds) — the
 /// owner's explicit choice, exactly like `DAEMON_TRAIN_BACKEND=cpu` on the v1 path. Shared by
 /// assess and the v2 join so both stages evaluate the identical lane (§9.4 step-10 re-check).
-pub(crate) fn selected_lane() -> daemon_vhc_host::v2::ParticipationLane {
+pub(crate) fn selected_lane() -> daemon_vhc_host::run::ParticipationLane {
     if std::env::var_os("DAEMON_VHC_LANE_GPU_OPTIONAL").is_some_and(|v| v == "1") {
-        daemon_vhc_host::v2::ParticipationLane {
+        daemon_vhc_host::run::ParticipationLane {
             gpu: 1,
             vram_bytes: 0,
             ram_bytes: 0,
             disk_bytes: 0,
-            ..daemon_vhc_host::v2::ParticipationLane::trainer_launch_defaults()
+            ..daemon_vhc_host::run::ParticipationLane::trainer_launch_defaults()
         }
     } else {
-        daemon_vhc_host::v2::ParticipationLane::trainer_launch_defaults()
+        daemon_vhc_host::run::ParticipationLane::trainer_launch_defaults()
     }
 }
 
 /// The major-2 assess arm: the owner-bracketed claim()-admission funnel (ABI §9.3;
-/// `daemon_vhc_host::v2::admission::admit_v2`), mapped onto the typed `Assessed` surface.
+/// `daemon_vhc_host::run::admission::admit`), mapped onto the typed `Assessed` surface.
 ///
 /// Funnel inputs at the worker seam:
 /// - **Stage 1 (owner participation)** is `true` here by construction: the node client — the
@@ -842,32 +842,32 @@ pub(crate) fn selected_lane() -> daemon_vhc_host::v2::ParticipationLane {
 /// - **Stage 5 owner caps** are uncapped at assess time: the standing resource policy
 ///   (`JoinPolicy{vram_cap_mb, …}`) arrives with `JoinRun`, where the join-time re-check judges
 ///   it (§9.4 step 10 re-runs stage 5 against the recorded claim).
-fn assess_v2(
+fn assess_module(
     worker: &Worker,
     module: &[u8],
     config: &[u8],
     module_blake3: Option<&[u8; 32]>,
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
-    envelope_grants: Option<&daemon_vhc_host::v2::EnvelopeRoleGrants>,
+    envelope_grants: Option<&daemon_vhc_host::run::EnvelopeRoleGrants>,
 ) -> Eligibility {
     let lane = selected_lane();
     let hw = hardware();
     let dl = device_limits();
-    let device = daemon_vhc_host::v2::DeviceProfile {
+    let device = daemon_vhc_host::run::DeviceProfile {
         gpu: hw.gpus > 0,
         vram_bytes: dl.vram_mb << 20,
         ram_bytes: dl.ram_mb << 20,
         disk_bytes: hw.disk_free_mb << 20,
     };
-    let owner = daemon_vhc_host::v2::OwnerPolicy {
+    let owner = daemon_vhc_host::run::OwnerPolicy {
         participation_enabled: true,
         vram_cap_bytes: 0,
         host_cap_bytes: 0,
     };
     // The derived grants document (§2.6 stand-in): the SAME deterministic derivation the v2 join
     // uses, so assess and join evaluate byte-identical (config, grants) pairs (§9.4 pinning).
-    let grants = crate::v2_session::derive_grants();
-    match daemon_vhc_host::v2::admit_v2(
+    let grants = crate::session::derive_grants();
+    match daemon_vhc_host::run::admit(
         worker,
         module,
         module_blake3,

@@ -26,7 +26,7 @@ pub use migrate::{
     build_manifest, MigrateState, MigrationDescriptor, MigrationSection, OwnedSection, SectionDecl,
     SectionReader, SimSections, StateManifest,
 };
-pub use module::{derive_claim, manifest_bytes, ModuleDecl, V2Module};
+pub use module::{derive_claim, manifest_bytes, GuestModule, ModuleDecl};
 
 /// A [`crate::migrate::SectionReader`] over the live `read_back(kind = 3)` restore capability —
 /// what `main!`'s `da_migrate` hands the module (§6.6: kind 3 is legal exactly there).
@@ -40,11 +40,11 @@ impl migrate::SectionReader for AbiSections {
     }
 }
 
-/// Emit the required major-2 exports (ABI §2.1) for a [`module::V2Module`] type: `da_abi`,
+/// Emit the required major-2 exports (ABI §2.1) for a [`module::GuestModule`] type: `da_abi`,
 /// `da_alloc`/`da_free`, `da_manifest`, `da_claim` (both SDK-derived from the declaration),
 /// `da_init`, `da_run`, and `da_migrate` (ABI §10.1 — always exported; the manifest's
 /// `migratable: true` echo is therefore truthful, and a module that does not override
-/// [`module::V2Module::migrate`] answers `Incompatible` honestly at runtime).
+/// [`module::GuestModule::migrate`] answers `Incompatible` honestly at runtime).
 ///
 /// Expands to nothing on non-wasm targets, exactly like the v1 `experiment!` — sim tests call
 /// the trait methods directly.
@@ -64,7 +64,7 @@ macro_rules! main {
                 // The declaration is cross-checked against the import shape at selection
                 // (ABI §1.3 step 5): the declared minor must cover every imported symbol's
                 // introducing minor.
-                (2 << 16) | <$module as $crate::module::V2Module>::decl().abi_minor
+                (2 << 16) | <$module as $crate::module::GuestModule>::decl().abi_minor
             }
 
             #[no_mangle]
@@ -79,13 +79,13 @@ macro_rules! main {
 
             #[no_mangle]
             pub extern "C" fn da_manifest(_cfg: u32, _cfg_len: u32) -> u64 {
-                let decl = <$module as $crate::module::V2Module>::decl();
+                let decl = <$module as $crate::module::GuestModule>::decl();
                 $crate::module::rt::emit_cbor(&$crate::module::manifest_bytes(&decl))
             }
 
             #[no_mangle]
             pub extern "C" fn da_claim(_c: u32, _cl: u32, _g: u32, _gl: u32) -> u64 {
-                let decl = <$module as $crate::module::V2Module>::decl();
+                let decl = <$module as $crate::module::GuestModule>::decl();
                 $crate::module::rt::emit_cbor(&$crate::module::derive_claim(&decl))
             }
 
@@ -107,7 +107,7 @@ macro_rules! main {
                 };
                 let config = read(cfg_ptr, cfg_len);
                 let grants = read(grants_ptr, grants_len);
-                match <$module as $crate::module::V2Module>::init(&config, &grants) {
+                match <$module as $crate::module::GuestModule>::init(&config, &grants) {
                     Ok(m) => {
                         MODULE.with(|s| *s.borrow_mut() = Some(m));
                         0
@@ -121,7 +121,7 @@ macro_rules! main {
                 MODULE.with(|s| {
                     let mut m = s.borrow_mut();
                     let m = m.as_mut().expect("da_init ran (host contract, §9.4)");
-                    <$module as $crate::module::V2Module>::run(m)
+                    <$module as $crate::module::GuestModule>::run(m)
                 })
             }
 
@@ -143,7 +143,7 @@ macro_rules! main {
                         .as_mut()
                         .expect("da_init ran before da_migrate (§10.3 step 4)");
                     let mut reader = $crate::AbiSections;
-                    <$module as $crate::module::V2Module>::migrate(m, &descriptor, &mut reader)
+                    <$module as $crate::module::GuestModule>::migrate(m, &descriptor, &mut reader)
                 })
             }
         };

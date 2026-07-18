@@ -3,7 +3,7 @@
 //
 // The Phase-C **model-agnostic** acceptance (refactor §7: "a non-LLaMA toy authored with zero host
 // changes … proving the compute ABI is model-agnostic"): the `toy-mlp` guest — a two-layer MLP
-// trained by SGD, authored purely over `daemon-vhc-sdk-compute` + `daemon-vhc-sdk-v2` — runs as a
+// trained by SGD, authored purely over `daemon-vhc-sdk-compute` + `daemon-vhc-sdk` — runs as a
 // REAL wasm32 module against the SAME `compute@2` runner + event-loop driver + journal the LLaMA
 // reference uses. No host code was added for it: the host dispatches its `CBOR(OperationIr)` op
 // stream by tensor shape, never by model. The trained `W1` it exports is **bit-exact** vs a native
@@ -18,9 +18,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_host::v2::{
-    replay_v2, start_run, MemorySink, ReplayEnd, ReplayScript, RunEnd, RunIdentity, SinkEntry,
-    V2RunConfig,
+use daemon_vhc_host::run::{
+    replay, start_run, MemorySink, ReplayEnd, ReplayScript, RunConfig, RunEnd, RunIdentity,
+    SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 
@@ -143,7 +143,7 @@ struct Ran {
 fn run_toy(wasm: &[u8], steps: u8) -> Ran {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let module_hash = *blake3::hash(wasm).as_bytes();
-    let cfg = V2RunConfig::new(identity(module_hash), [0x77; 32], vec![steps], Vec::new());
+    let cfg = RunConfig::new(identity(module_hash), [0x77; 32], vec![steps], Vec::new());
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, cfg, Box::new(sink.clone())).expect("start");
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -217,7 +217,7 @@ fn toy_mlp_trains_bit_exact_and_replays_with_zero_host_changes() {
         "the export journaled its kind-5 TensorData record"
     );
     let worker = Worker::new(EngineConfig::default()).expect("engine");
-    let replayed = replay_v2(&worker, &wasm, &[steps], &[], script).expect("replay harness");
+    let replayed = replay(&worker, &wasm, &[steps], &[], script).expect("replay harness");
     assert_eq!(replayed.end, ReplayEnd::Outcome(0));
     let recorded: Vec<[u8; 32]> = ran
         .entries

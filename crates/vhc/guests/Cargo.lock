@@ -949,8 +949,8 @@ dependencies = [
  "ciborium",
  "daemon-vhc-abi",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk",
  "daemon-vhc-sdk-consensus",
- "daemon-vhc-sdk-v2",
  "serde",
 ]
 
@@ -1535,6 +1535,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-sdk"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "daemon-vhc-proto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "daemon-vhc-sdk-compute"
 version = "0.0.1"
 dependencies = [
@@ -1545,7 +1556,7 @@ dependencies = [
  "burn-router",
  "burn-std",
  "ciborium",
- "daemon-vhc-sdk-v2",
+ "daemon-vhc-sdk",
  "getrandom 0.4.3",
  "serde",
 ]
@@ -1576,17 +1587,6 @@ dependencies = [
  "blake3",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
-]
-
-[[package]]
-name = "daemon-vhc-sdk-v2"
-version = "0.0.1"
-dependencies = [
- "blake3",
- "ciborium",
- "daemon-vhc-proto",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -3535,8 +3535,8 @@ version = "0.0.1"
 dependencies = [
  "burn",
  "ciborium",
+ "daemon-vhc-sdk",
  "daemon-vhc-sdk-compute",
- "daemon-vhc-sdk-v2",
 ]
 
 [[package]]
@@ -4531,8 +4531,8 @@ dependencies = [
  "burn",
  "burn-ir",
  "ciborium",
+ "daemon-vhc-sdk",
  "daemon-vhc-sdk-compute",
- "daemon-vhc-sdk-v2",
 ]
 
 [[package]]
@@ -4540,7 +4540,7 @@ name = "test-data-v2"
 version = "0.0.1"
 dependencies = [
  "ciborium",
- "daemon-vhc-sdk-v2",
+ "daemon-vhc-sdk",
 ]
 
 [[package]]
@@ -4657,10 +4657,10 @@ dependencies = [
  "burn",
  "ciborium",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk",
  "daemon-vhc-sdk-compute",
  "daemon-vhc-sdk-profiles",
  "daemon-vhc-sdk-rounds",
- "daemon-vhc-sdk-v2",
  "serde",
 ]
 
@@ -4871,8 +4871,8 @@ version = "0.0.1"
 dependencies = [
  "burn",
  "ciborium",
+ "daemon-vhc-sdk",
  "daemon-vhc-sdk-compute",
- "daemon-vhc-sdk-v2",
 ]
 
 [[package]]

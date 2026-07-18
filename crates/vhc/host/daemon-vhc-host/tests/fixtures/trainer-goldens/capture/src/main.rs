@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Capture the **v2-native trainer goldens** as a content-addressed recorded fixture — the
+//! Capture the **native trainer goldens** as a content-addressed recorded fixture — the
 //! successor drift oracle that lets the recorded v1 parity oracle retire (retirement plan §3).
 //!
 //! The recorded lane is the compute@2 trainer guest (`tiny-llama`): a real Burn LLaMA over
@@ -29,7 +29,7 @@
 //! silent divergence.
 //!
 //! The run is a genuine single-peer barrier: the trainer commits its own update and ingests that
-//! same committed set, so the recorded digests are the trainer's autonomous v2-native trajectory
+//! same committed set, so the recorded digests are the trainer's autonomous native trajectory
 //! (no v1 inputs feed it). The matched init was originally inherited from the v1 oracle bundle;
 //! that oracle retired with the v1 parity lanes (retirement plan §3), so the init now lives IN this
 //! bundle (`init.f32le.bin`) and the capture is self-contained (see ../README.md for the historical
@@ -49,9 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
-use daemon_vhc_host::v2::{
-    start_run, DeliverVerdict, MemorySink, RunEnd, RunIdentity, V2RunConfig,
-};
+use daemon_vhc_host::run::{start_run, DeliverVerdict, MemorySink, RunConfig, RunEnd, RunIdentity};
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::messages::{
@@ -274,7 +272,7 @@ impl PartialEq for Captured {
     }
 }
 
-fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
+fn wait_published(pump: &daemon_vhc_host::run::PumpHandle, n: usize) {
     let deadline = Instant::now() + Duration::from_secs(180);
     while pump.published().len() < n {
         service_puts(pump);
@@ -292,11 +290,11 @@ fn wait_published(pump: &daemon_vhc_host::v2::PumpHandle, n: usize) {
 /// The async-runtime seat's minimal duty: the trainer `payload_put`s its sealed committed
 /// container each round (B1 discipline); the capture reconstructs the payload natively and
 /// verifies via the tag-3 hash, so the put is acknowledged and its bytes dropped.
-fn service_puts(pump: &daemon_vhc_host::v2::PumpHandle) {
+fn service_puts(pump: &daemon_vhc_host::run::PumpHandle) {
     for (op, request) in pump.take_op_requests() {
         match request {
-            daemon_vhc_host::v2::OpRequest::PayloadPut { .. } => {
-                pump.complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
+            daemon_vhc_host::run::OpRequest::PayloadPut { .. } => {
+                pump.complete_op(op, daemon_vhc_host::run::OpOutcome::PutDone)
                     .expect("put done");
             }
             other => panic!("unexpected op request from the trainer guest: {other:?}"),
@@ -329,7 +327,7 @@ fn capture_once(
         instance: 1,
         module: *blake3::hash(wasm).as_bytes(),
     };
-    let mut run_cfg = V2RunConfig::new(
+    let mut run_cfg = RunConfig::new(
         identity,
         [0x9d; 32],
         guest_cfg_bytes(model, profile_cfg, init),
@@ -522,7 +520,7 @@ fn fixture_root() -> PathBuf {
 /// The matched init + config literals — carried IN this bundle (`init.f32le.bin` + the
 /// `model_cfg`/`profile_cfg`/`param_*` fields of `expected.json`). They were originally inherited
 /// from the recorded v1 parity oracle; that oracle retired with the v1 parity lanes (retirement
-/// plan §3), so the bundle is now self-contained and a re-capture regenerates the v2-native
+/// plan §3), so the bundle is now self-contained and a re-capture regenerates the native
 /// trajectory from the bundle's OWN frozen init (idempotent — the init is written back byte-
 /// identically). See ../README.md for the (now historical) provenance chain.
 fn read_matched_init_and_config() -> (
@@ -568,7 +566,7 @@ fn main() {
 
     // Matched init + config literals are carried in this bundle (originally inherited from the now-
     // retired v1 oracle — see read_matched_init_and_config); the trained trajectory, payloads, and
-    // digests are the compute@2 trainer's OWN v2-native output.
+    // digests are the compute@2 trainer's OWN native output.
     let (model, profile_cfg, numels, names, init) = read_matched_init_and_config();
     assert_eq!(
         numels.iter().sum::<usize>(),
@@ -655,7 +653,7 @@ fn main() {
     std::fs::write(root.join("expected.json"), json + "\n").expect("write expected.json");
 
     println!(
-        "captured v2-native trainer goldens into {} (module {} … digests {})",
+        "captured native trainer goldens into {} (module {} … digests {})",
         root.display(),
         &hex(blake3_hash(&wasm).as_bytes())[..16],
         cap.digests

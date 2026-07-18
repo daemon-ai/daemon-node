@@ -9,9 +9,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_host::v2::{
-    replay_v2, start_run, MemorySink, ReplayEnd, ReplayScript, RunEnd, RunIdentity, SinkEntry,
-    V2RunConfig,
+use daemon_vhc_host::run::{
+    replay, start_run, MemorySink, ReplayEnd, ReplayScript, RunConfig, RunEnd, RunIdentity,
+    SinkEntry,
 };
 use daemon_vhc_host::{select_driver, Worker};
 
@@ -109,7 +109,7 @@ pub fn whole_run(worker: &Worker, wasm: &[u8], spec: RunSpec) -> Result<WholeRun
     }
 
     let sink = Arc::new(Mutex::new(MemorySink::new()));
-    let run_cfg = V2RunConfig::new(
+    let run_cfg = RunConfig::new(
         spec.identity.clone(),
         spec.key_seed,
         spec.config.clone(),
@@ -155,7 +155,7 @@ pub fn whole_run(worker: &Worker, wasm: &[u8], spec: RunSpec) -> Result<WholeRun
     // (the merged toy-averager is abi 2.1 and reads its identity-derived seed).
     let mut script = ReplayScript::from_entries(&entries);
     script.identity = Some(spec.identity.clone());
-    let replayed = replay_v2(worker, wasm, &spec.config, &spec.grants, script)
+    let replayed = replay(worker, wasm, &spec.config, &spec.grants, script)
         .map_err(|e| format!("replay harness: {e}"))?;
     let decisions: Vec<Decision> = replayed
         .decisions

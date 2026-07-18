@@ -7,7 +7,7 @@
 // funnel decodes (§9.1/§6.2).
 
 use daemon_vhc_proto::{blake3_hash, Hash};
-use daemon_vhc_sdk_v2::{
+use daemon_vhc_sdk::{
     build_manifest, derive_claim, manifest_bytes, migrate, MigrateState, MigrationDescriptor,
     ModuleDecl, OwnedSection, SectionReader,
 };
@@ -175,6 +175,6 @@ fn derived_manifest_echoes_abi_and_declares_migratable() {
     assert_eq!(get("migratable"), ciborium::value::Value::Bool(true));
     assert_eq!(
         get("sdk"),
-        ciborium::value::Value::Text("daemon-vhc-sdk-v2".into())
+        ciborium::value::Value::Text("daemon-vhc-sdk".into())
     );
 }

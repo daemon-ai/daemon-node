@@ -241,7 +241,7 @@ impl Authorized {
     }
 
     /// The host-delivery path: the frame arrived on a **declared authoritative channel** and was
-    /// signature-verified above the pump (ABI §12.1, `daemon-vhc-session::v2_attach`) before
+    /// signature-verified above the pump (ABI §12.1, `daemon-vhc-session::attach`) before
     /// delivery, so the in-guest re-verification is delegated to that host mechanism. This is the
     /// bridge / mixed-fleet retired-native-coordinator topology (native coordinator, frames verified host-side). D2's
     /// coordinator mints records in-guest and threads a real [`Authority::authorize`] token

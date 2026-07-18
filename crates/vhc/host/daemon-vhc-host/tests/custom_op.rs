@@ -14,7 +14,7 @@
 use daemon_vhc_abi::{
     host_supports_custom_op, AbiRefusalCode, CUSTOM_OP_FLASH_ATTN_V1, HOST_CUSTOM_OPS,
 };
-use daemon_vhc_host::v2::CustomOpRegistry;
+use daemon_vhc_host::run::CustomOpRegistry;
 
 #[test]
 fn abi_vocabulary_pins_flash_attn_v1_as_the_first_entry() {

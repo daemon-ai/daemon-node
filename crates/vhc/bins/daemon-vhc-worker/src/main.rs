@@ -4,7 +4,7 @@
 // The worker reads its module path from an env var and the module bytes from disk (developer /
 // node-controlled inputs, mirroring `fake-train-worker`); the fs/env hardening bans target the
 // shipped node process, not this isolated worker binary. Allowed file-wide (crate-level, so the
-// `backend`/`v2_session` submodules inherit it too).
+// `backend`/`session` submodules inherit it too).
 #![allow(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
@@ -23,7 +23,7 @@
 //!   (`UnsignedEnvelopeRetired`, D0), a schema-major-1 envelope is refused typed
 //!   (`EnvelopeSchemaRetired` — the v1 form cannot configure a coordinator), and a major-1
 //!   module is refused typed (`AbiUnsupportedMajor`)** — the flipped A0 fixture pins the last.
-//! - `JoinRun` → the v2 session run (`v2_session::join_and_run_v2`): the event pump over the
+//! - `JoinRun` → the v2 session run (`session::join_and_run`): the event pump over the
 //!   run's REAL coordinator, configured from the genesis and run in-process under the same
 //!   major-2 driver (consensus never runs outside the sandboxed, content-addressed module).
 //! - `Leave`/`Shutdown`/`Ping` → as the protocol requires.
@@ -31,7 +31,7 @@
 //! A trapping module surfaces as `Event::Error{class: Module, …}` — the worker is never harmed.
 
 mod backend;
-mod v2_session;
+mod session;
 
 use daemon_provision::{CutChannel, CutWriter};
 use daemon_vhc_session::protocol::{self, Command, ErrorClass, Event};
@@ -160,7 +160,7 @@ async fn main() {
                     .await;
                     continue;
                 };
-                match v2_session::join_and_run_v2(
+                match session::join_and_run(
                     &resolved.module,
                     &resolved.config,
                     genesis,
@@ -220,7 +220,7 @@ pub(crate) fn worker_error(detail: &str) -> Event {
     }
 }
 
-/// Encode and send an [`Event`] over the stdio cut (shared by `main` and `v2_session`).
+/// Encode and send an [`Event`] over the stdio cut (shared by `main` and `session`).
 pub(crate) async fn send(writer: &CutWriter, event: &Event) {
     match protocol::encode(event) {
         Ok(bytes) => {

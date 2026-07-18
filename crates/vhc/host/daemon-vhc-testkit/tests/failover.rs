@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use ciborium::value::Value;
 
-use daemon_vhc_host::v2::RunEnd;
+use daemon_vhc_host::run::RunEnd;
 use daemon_vhc_observe::journal::archive::{AttestedHead, ChainHead};
 use daemon_vhc_observe::journal::oracle::{record_initial_state, record_input, record_run_header};
 use daemon_vhc_observe::journal::record::ExecIdentity;

@@ -39,9 +39,9 @@ use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
 
-use daemon_vhc_host::v2::{
-    replay_v2, start_run, DeliverVerdict, MemorySink, OpOutcome, OpRequest, PumpHandle, ReplayEnd,
-    ReplayScript, RunEnd, RunIdentity, SinkEntry, V2RunConfig,
+use daemon_vhc_host::run::{
+    replay, start_run, DeliverVerdict, MemorySink, OpOutcome, OpRequest, PumpHandle, ReplayEnd,
+    ReplayScript, RunConfig, RunEnd, RunIdentity, SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::messages::{
@@ -49,11 +49,11 @@ use daemon_vhc_proto::messages::{
 };
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, ControlTransport, GenesisEnvelope, Hash,
-    Identities, IrohId, PeerId, RoleEntry, RoleGrants, RunSectionV2, Seed, SigningKey,
+    Identities, IrohId, PeerId, RoleEntry, RoleGrants, RunSection, Seed, SigningKey,
     SnapshotArtifact, StateDigest, TransportSelection, VhcMessage, GENESIS_SCHEMA_MAJOR,
     VHC_PROTO_VERSION,
 };
-use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig as CoordinatorRunConfig};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
 use crate::coordinator::{authorize_coordinator_frame, configure_coordinator, Coordinator};
@@ -455,7 +455,7 @@ pub fn genesis_envelope(
 ) -> GenesisEnvelope {
     // The coordinator's opaque config: an authored RunConfig + genesis CoordinatorState, exactly
     // the guest's `da_init` shape (`{state: …}`; event-driven synthetic clock defaults).
-    let run_config = RunConfig {
+    let run_config = CoordinatorRunConfig {
         run_id: run_label.to_string(),
         proto_version: VHC_PROTO_VERSION,
         // The envelope anchor a worker Join asserts under v2 is the genesis hash; the harness
@@ -536,7 +536,7 @@ pub fn genesis_envelope(
     );
 
     GenesisEnvelope {
-        run: RunSectionV2 {
+        run: RunSection {
             schema: GENESIS_SCHEMA_MAJOR,
             run_label: run_label.to_string(),
             min_peers: workers,
@@ -573,7 +573,7 @@ struct LiveWorker {
     config: Vec<u8>,
     pump: PumpHandle,
     sink: Arc<Mutex<MemorySink>>,
-    run: Option<daemon_vhc_host::v2::V2Run>,
+    run: Option<daemon_vhc_host::run::Run>,
     engine: Worker,
     /// Per-worker coordinator-plane delivery seq (§12.2 dense-seq discipline, channel 0).
     coord_seq: u64,
@@ -780,7 +780,7 @@ pub fn genesis_whole_run(
         coord_key_seed,
     )?;
 
-    // Start every worker under the real v2 event-loop driver, keyed by the cryptographic RunId.
+    // Start every worker under the real event-loop driver, keyed by the cryptographic RunId.
     let mut workers: Vec<LiveWorker> = Vec::with_capacity(spec.workers);
     for (i, key) in worker_keys.iter().enumerate() {
         let peer = roster[i];
@@ -806,7 +806,7 @@ pub fn genesis_whole_run(
                 .as_bytes();
         let sink = Arc::new(Mutex::new(MemorySink::new()));
         let mut run_cfg =
-            V2RunConfig::new(identity.clone(), key_seed, config.clone(), grants.clone());
+            RunConfig::new(identity.clone(), key_seed, config.clone(), grants.clone());
         // A real transformer's per-round op stream exceeds the tiny default queue depth (the
         // guest also fences per inner step to reclaim depth).
         run_cfg.compute_queue_depth = 1 << 20;
@@ -1114,7 +1114,7 @@ pub fn genesis_whole_run(
             .collect();
         let mut script = ReplayScript::from_entries(&entries);
         script.identity = Some(w.identity.clone());
-        let replayed = replay_v2(&w.engine, worker_wasm, &w.config, &phase_a_grants(), script)
+        let replayed = replay(&w.engine, worker_wasm, &w.config, &phase_a_grants(), script)
             .map_err(|e| format!("worker {i} replay harness: {e}"))?;
         let redriven: Vec<Decision> = replayed
             .decisions

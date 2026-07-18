@@ -55,7 +55,7 @@ pub use envelope::{DeviceMinimums, SignedEnvelope};
 pub use error::VhcProtoError;
 pub use genesis::{
     peek_schema, BufferReq, ChannelDecl, ControlTransport, EventCap, EventCaps, FrozenGenesis,
-    GenesisEnvelope, GrantBound, Identities, MigrationGrant, RoleEntry, RoleGrants, RunSectionV2,
+    GenesisEnvelope, GrantBound, Identities, MigrationGrant, RoleEntry, RoleGrants, RunSection,
     SnapshotArtifact, TransportSelection, WorldGrant, GENESIS_SCHEMA_MAJOR,
 };
 pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsError, LaneCeilings};

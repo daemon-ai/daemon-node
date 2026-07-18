@@ -21,13 +21,11 @@ use std::time::{Duration, Instant};
 use ciborium::value::Value;
 
 use daemon_vhc_abi::{CandidateDriver, STOP_REASON_RUN_COMPLETE};
-use daemon_vhc_host::v2::{
-    start_run, DeliverVerdict, MemorySink, RunEnd, RunIdentity, V2RunConfig,
-};
+use daemon_vhc_host::run::{start_run, DeliverVerdict, MemorySink, RunConfig, RunEnd, RunIdentity};
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
 use daemon_vhc_proto::{to_canonical_vec, CapabilitySet, Hash, VHC_PROTO_VERSION};
-use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
+use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig as CoordinatorRunConfig};
 use std::sync::{Arc, Mutex};
 
 fn guests_root() -> PathBuf {
@@ -75,7 +73,7 @@ fn coordinator_config() -> Vec<u8> {
     // D0). Phase deadlines are effectively infinite: the coordinator-quorum guest runs on the
     // event-driven fast path (`tick_period_ms = 0`) and parks in `next_event`, which is exactly the
     // clean delivery-hold fixture this drill needs.
-    let run_config = RunConfig {
+    let run_config = CoordinatorRunConfig {
         run_id: "pump-hold".to_string(),
         proto_version: VHC_PROTO_VERSION,
         envelope_hash: Hash([0u8; 32]),
@@ -128,7 +126,7 @@ fn hold_forces_deterministic_spoolfull_and_senderquota_then_releases_clean() {
         module: module_hash,
     };
     let sink = Arc::new(Mutex::new(MemorySink::new()));
-    let mut run_cfg = V2RunConfig::new(
+    let mut run_cfg = RunConfig::new(
         identity,
         *blake3::hash(b"pump-hold/key").as_bytes(),
         coordinator_config(),

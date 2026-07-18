@@ -22,18 +22,18 @@
 //! The guest names artifacts by content hash only — it has no URL, locator, or credential
 //! surface to even express (snapshot pinning at the edge, architecture §5.1).
 
-use daemon_vhc_sdk_v2::corpus::Manifest;
+use daemon_vhc_sdk::corpus::Manifest;
 
 // ---- required exports (ABI §2.1) — the sdk-v2 rt helpers back the allocator ---------------------
 
 #[no_mangle]
 pub extern "C" fn da_alloc(size: u32, align: u32) -> u32 {
-    daemon_vhc_sdk_v2::module::rt::da_alloc(size, align)
+    daemon_vhc_sdk::module::rt::da_alloc(size, align)
 }
 
 #[no_mangle]
 pub extern "C" fn da_free(ptr: u32, size: u32, align: u32) {
-    daemon_vhc_sdk_v2::module::rt::da_free(ptr, size, align);
+    daemon_vhc_sdk::module::rt::da_free(ptr, size, align);
 }
 
 /// `(major << 16) | minor` — major 2, **minor 1**: this module consumes completions + data@2.
@@ -55,7 +55,7 @@ pub extern "C" fn da_manifest(_cfg_ptr: u32, _cfg_len: u32) -> u64 {
     let v = ciborium::value::Value::Map(vec![
         (text("name"), text("test-data-v2")),
         (text("version"), text(env!("CARGO_PKG_VERSION"))),
-        (text("sdk"), text("daemon-vhc-sdk-v2")),
+        (text("sdk"), text("daemon-vhc-sdk")),
         (text("abi"), uint(u64::from(da_abi()))),
         (
             text("channels"),
@@ -64,7 +64,7 @@ pub extern "C" fn da_manifest(_cfg_ptr: u32, _cfg_len: u32) -> u64 {
     ]);
     let mut bytes = Vec::new();
     ciborium::into_writer(&v, &mut bytes).expect("manifest cbor");
-    daemon_vhc_sdk_v2::module::rt::emit_cbor(&bytes)
+    daemon_vhc_sdk::module::rt::emit_cbor(&bytes)
 }
 
 #[no_mangle]
@@ -86,7 +86,7 @@ pub extern "C" fn da_claim(_c: u32, _cl: u32, _g: u32, _gl: u32) -> u64 {
     ]);
     let mut bytes = Vec::new();
     ciborium::into_writer(&claim, &mut bytes).expect("claim cbor");
-    daemon_vhc_sdk_v2::module::rt::emit_cbor(&bytes)
+    daemon_vhc_sdk::module::rt::emit_cbor(&bytes)
 }
 
 // ---- module state -----------------------------------------------------------------------------------
@@ -155,7 +155,7 @@ const EV_STOP: u64 = 4;
 const EV_COMPLETION: u64 = 6;
 
 /// Decode a completion frame `[6, op, [variant, payload]]`.
-fn decode_completion(ev: &daemon_vhc_sdk_v2::Event) -> (u64, u64, Option<ciborium::value::Value>) {
+fn decode_completion(ev: &daemon_vhc_sdk::Event) -> (u64, u64, Option<ciborium::value::Value>) {
     let op = ev.uint(1);
     let Some(ciborium::value::Value::Array(result)) = ev.items.get(2) else {
         unreachable!("completion result is [variant, payload]");
@@ -191,11 +191,11 @@ pub extern "C" fn da_run() -> u32 {
     // The opening move per mode: issue exactly one fetch.
     let op = match st.mode {
         // Mode 1: an UNGRANTED hash — the host traps GrantViolation on this very call.
-        1 => daemon_vhc_sdk_v2::data_fetch(&[0xAB; 32], 0, 0),
+        1 => daemon_vhc_sdk::data_fetch(&[0xAB; 32], 0, 0),
         // Mode 2: a granted artifact, absurd range — completes Err(StoreRefused).
-        2 => daemon_vhc_sdk_v2::data_fetch(&st.shard, u64::MAX / 2, 1),
+        2 => daemon_vhc_sdk::data_fetch(&st.shard, u64::MAX / 2, 1),
         // Mode 3: a granted artifact the harness tampers — completes Err(HashMismatch).
-        3 => daemon_vhc_sdk_v2::data_fetch(&st.shard, 0, 0),
+        3 => daemon_vhc_sdk::data_fetch(&st.shard, 0, 0),
         // Mode 0: the corpus window ("adapts"): POLICY decides which bytes it needs — the SDK
         // corpus layer locates the sequence, and the module fetches exactly that byte range.
         _ => {
@@ -208,19 +208,19 @@ pub extern "C" fn da_run() -> u32 {
             let width = manifest.token_width.bytes();
             let range_off = loc.token_offset * width;
             let range_len = u64::from(manifest.seq_len) * width;
-            daemon_vhc_sdk_v2::data_fetch(&st.shard, range_off, range_len)
+            daemon_vhc_sdk::data_fetch(&st.shard, range_off, range_len)
         }
     };
 
     let mut buf: Vec<u8> = Vec::with_capacity(16); // deliberately small: exercises NeedCapacity
     loop {
-        let ev = daemon_vhc_sdk_v2::next_event(&mut buf);
+        let ev = daemon_vhc_sdk::next_event(&mut buf);
         match ev.tag {
             EV_STOP => return 0,
             EV_COMPLETION => {
                 let (cop, variant, payload) = decode_completion(&ev);
                 if cop != op {
-                    let _ = daemon_vhc_sdk_v2::publish(0, b"unexpected-completion");
+                    let _ = daemon_vhc_sdk::publish(0, b"unexpected-completion");
                     continue;
                 }
                 match (st.mode, variant) {
@@ -231,18 +231,17 @@ pub extern "C" fn da_run() -> u32 {
                             .and_then(ciborium::value::Value::as_integer)
                             .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))
                             .unwrap_or(0);
-                        let window = daemon_vhc_sdk_v2::read_buffer(handle);
-                        let _ = daemon_vhc_sdk_v2::publish(0, &window);
-                        daemon_vhc_sdk_v2::buffer_release(handle);
+                        let window = daemon_vhc_sdk::read_buffer(handle);
+                        let _ = daemon_vhc_sdk::publish(0, &window);
+                        daemon_vhc_sdk::buffer_release(handle);
                     }
                     // The negative modes publish the comp-error code byte for the harness.
                     (2 | 3, 1) => {
                         let code = err_code(&payload);
-                        let _ =
-                            daemon_vhc_sdk_v2::publish(0, &[u8::try_from(code).unwrap_or(0xFF)]);
+                        let _ = daemon_vhc_sdk::publish(0, &[u8::try_from(code).unwrap_or(0xFF)]);
                     }
                     _ => {
-                        let _ = daemon_vhc_sdk_v2::publish(0, b"wrong-variant");
+                        let _ = daemon_vhc_sdk::publish(0, b"wrong-variant");
                     }
                 }
             }

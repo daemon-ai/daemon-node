@@ -328,7 +328,7 @@ fn vhc_ci_det() -> anyhow::Result<()> {
         ),
         (
             // The det-lane kernels' tier-1 suite. This is the ONLY det implementation: the
-            // former host-op ≡ in-guest-crate conformance lane (v2_det_conformance) retired
+            // former host-op ≡ in-guest-crate conformance lane (det_conformance) retired
             // WITH the tabi@1 bridge — the host-side det_* acceleration dispatch it compared
             // was the bridge's, and no host-executed det-kernel surface exists any more (the
             // compute@2 runner executes burn_ir ops, the tolerance-class native lane; det math
@@ -394,8 +394,8 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // through the real A1 substrate — plus the undeclared-channel GrantViolation
             // negative. Named as its own lane (like the driver-selection refusal lane) so the
             // standing expressiveness proof is visible; also covered by the host crate suite above.
-            "A2 v2 event loop (toy-averager expressiveness + typed channel trap)",
-            &["-p", "daemon-vhc-host", "--test", "v2_event_loop"],
+            "A2 event loop (toy-averager expressiveness + typed channel trap)",
+            &["-p", "daemon-vhc-host", "--test", "event_loop"],
         ),
         (
             // The A2 claim + admission-funnel acceptance (refactor §5 A2; §10 gate row "Claim
@@ -404,17 +404,17 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // attributable under-claim cap trap at run time, and claim determinism — all through
             // the real restricted assessment instance (test-claim-v2 guest).
             "A2 claim + admission funnel (over/under-claim, lane bounds, typed refusals)",
-            &["-p", "daemon-vhc-host", "--test", "v2_claim_funnel"],
+            &["-p", "daemon-vhc-host", "--test", "claim_funnel"],
         ),
         (
-            // The v2 input-replay step (refactor §5 A1→A2 acceptance; §12.6 journal soak for
+            // The input-replay step (refactor §5 A1→A2 acceptance; §12.6 journal soak for
             // v2): recorded runs (toy averager: timers/clock; bridge guest: nr readouts +
             // staged kinds 1/2) re-driven from the journal alone through the §8.7 verifier
             // (observe contract over the host replay engine) — every decision bit-for-bit;
             // tampered/incomplete journals are typed divergences. The compute@2 trainer's
             // journal-replay soak lives in the trainer-goldens lane below.
-            "A2 v2 input-replay: journal-only re-drive ≡ recorded decisions (§8.7)",
-            &["-p", "daemon-vhc-host", "--test", "v2_replay"],
+            "A2 input-replay: journal-only re-drive ≡ recorded decisions (§8.7)",
+            &["-p", "daemon-vhc-host", "--test", "replay"],
         ),
         (
             // The sys@2 crypto-acceleration conformance gate (Phase B; architecture §3.2/§3.7,
@@ -424,7 +424,7 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // deterministic sweep + known-answer vectors + tri-state verify semantics. Named as
             // its own lane (also covered by the host crate suite below).
             "B2 sys@2 crypto accel conformance (host ≡ in-guest contract: hash/verify_sig)",
-            &["-p", "daemon-vhc-host", "--test", "v2_crypto"],
+            &["-p", "daemon-vhc-host", "--test", "crypto"],
         ),
         (
             // The Phase-C custom-op registry gate (architecture §3.2, refactor §7): versioned
@@ -433,13 +433,13 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // CustomOpUnsupported, never a trap). Pins the shared ABI vocabulary (the seam C1's
             // compute@2 OperationIr::Custom resolves through) + the registry admission behaviour.
             "C2 custom-op registry (flash_attn@1; typed refusal on absent required op)",
-            &["-p", "daemon-vhc-host", "--test", "v2_custom_op"],
+            &["-p", "daemon-vhc-host", "--test", "custom_op"],
         ),
         (
             // The Phase-C MODEL-AGNOSTIC acceptance (refactor §7: "a non-LLaMA toy authored with
             // zero host changes … proving the compute ABI is model-agnostic"): the `toy-mlp` guest
             // — a two-layer MLP trained by SGD, authored purely over daemon-vhc-sdk-compute +
-            // daemon-vhc-sdk-v2 — runs against the SAME compute@2 runner/driver/journal as the
+            // daemon-vhc-sdk — runs against the SAME compute@2 runner/driver/journal as the
             // LLaMA reference, exports a trained weight bit-exact vs a native Autodiff<NdArray> run
             // of the identical loop, and replays bit-for-bit (§8.7). No host code is model-specific.
             "model-agnostic compute@2 (toy-mlp: distinct model, zero host changes, bit-exact + replay)",
@@ -464,10 +464,10 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // against the committed hash); tag-14 journaling + bit-exact replay with artifacts
             // materialized from the content-addressed payload table.
             "B2 data@2 fetch conformance (grants, pinning, range, journal + replay)",
-            &["-p", "daemon-vhc-host", "--test", "v2_data_fetch"],
+            &["-p", "daemon-vhc-host", "--test", "data_fetch"],
         ),
         (
-            "daemon-vhc-host (det lane + cross-backend digests + the v2 driver suites)",
+            "daemon-vhc-host (det lane + cross-backend digests + the driver suites)",
             &["-p", "daemon-vhc-host", "--features", "burn-ndarray"],
         ),
         (
@@ -490,7 +490,7 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-sdk-profiles"],
         ),
         (
-            // The v2-native trainer goldens (retirement plan §3): the compute@2 trainer guest
+            // The native trainer goldens (retirement plan §3): the compute@2 trainer guest
             // (`tiny-llama`) reproduces a recorded, content-addressed golden bundle (per-round
             // det digests, the trainer's own committed payload bytes, the matched-init
             // trained-theta trajectory). This is the SUCCESSOR drift oracle that superseded and
@@ -498,10 +498,10 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // det lane is an equality class (digests reproduce bit-for-bit through the full
             // wasm32 + CBOR + driver path) and the native lane a tolerance class (theta within
             // the OpClass::Optimizer band), plus the straggle -> catch-up leg (ported from
-            // v2_parity) and a checkpoint/migration continuity pin. wgpu/cuda device tiers are
+            // parity) and a checkpoint/migration continuity pin. wgpu/cuda device tiers are
             // hardware-gated in the same file (op-journal replay of the compute@2 kernels, with a
             // bit-exact ndarray self-check of the recording).
-            "trainer goldens: v2-native det digests + Optimizer band + straggle catch-up (cpu + burn-ndarray)",
+            "trainer goldens: native det digests + Optimizer band + straggle catch-up (cpu + burn-ndarray)",
             &[
                 "-p",
                 "daemon-vhc-host",
@@ -516,8 +516,8 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // in sim through the typed manifest protocol; the SDK-derived claim/manifest match
             // the §9.1/§6.2 wire schema the admission funnel decodes. The macro's exports are
             // exercised for real by the compute@2 trainer guest in the whole-run suites.
-            "daemon-vhc-sdk-v2 (main!/migrate scaffolding: sim round-trips + derivations)",
-            &["-p", "daemon-vhc-sdk-v2"],
+            "daemon-vhc-sdk (main!/migrate scaffolding: sim round-trips + derivations)",
+            &["-p", "daemon-vhc-sdk"],
         ),
         (
             "daemon-vhc-e2e (drills + observe-replay, no iroh/live)",
@@ -653,7 +653,7 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         ),
         (
             "daemon-vhc-e2e",
-            "daemon-vhc-sdk-v2",
+            "daemon-vhc-sdk",
             "post-E — the B2 corpus-windowing equivalence oracle (SDK policy vs the retained \
              host pipeline `session::data`); retires with that pipeline [dev-dep]",
         ),

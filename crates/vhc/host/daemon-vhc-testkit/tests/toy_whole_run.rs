@@ -9,7 +9,7 @@
 // inline replay soak (refactor §12.6) into reusable testkit infrastructure.
 //
 // Dev/test harness: shells `cargo build` for the guests (the same pattern as the host crate's
-// v2_event_loop test) and reads the `.wasm`, so the fs/process bans are allowed file-wide.
+// event_loop test) and reads the `.wasm`, so the fs/process bans are allowed file-wide.
 #![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use daemon_vhc_abi::DEFAULT_CHANNEL_CONTROL_ID;
-use daemon_vhc_host::v2::{RunEnd, RunIdentity};
+use daemon_vhc_host::run::{RunEnd, RunIdentity};
 use daemon_vhc_testkit::run::{whole_run, RunSpec};
 
 fn guests_root() -> PathBuf {

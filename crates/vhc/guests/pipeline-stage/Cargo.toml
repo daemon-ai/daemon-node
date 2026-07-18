@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
+daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk" }
 # Phase-C graduation (refactor §7 "the pipeline toy graduates to tensor buffers here"): the
 # exchanged payloads are EXPORTED TENSORS — device tensors crossed to sealed buffers via
 # compute@2::export and re-imported on the consumer side.

@@ -30,7 +30,7 @@ daemon-vhc-det = { workspace = true }
 # The DiLoCo-shaped round driver (BarrierRound) and the major-2 module scaffolding — re-exported so
 # native policy code (round experiments, hand-written loops) is authored against one surface here.
 daemon-vhc-sdk-rounds = { workspace = true }
-daemon-vhc-sdk-v2 = { path = "../daemon-vhc-sdk-v2" }
+daemon-vhc-sdk = { path = "../daemon-vhc-sdk" }
 serde = { workspace = true, features = ["derive"] }
 ciborium = { workspace = true }
 # Content-addressing for the virtual net's payloads and the deterministic decision transcript

@@ -64,17 +64,17 @@ use daemon_vhc_proto::messages::{RecordEntry, VhcMessage};
 use daemon_vhc_proto::{
     blake3_hash, digest_state, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed,
 };
+use daemon_vhc_sdk::{
+    build_manifest, GuestModule, MigrationDescriptor, ModuleDecl, OwnedSection, SectionReader,
+};
 use daemon_vhc_sdk_compute::{export_tensor, fence, AutodiffHostBackend, HostBackend};
 use daemon_vhc_sdk_profiles::{encode_payload, IngestParam, ParamView, SparseLoco, SparseLocoCfg};
 use daemon_vhc_sdk_rounds::{
     BarrierRound, Committed, PayloadSource, RoundCfg, RoundExperiment, StepCtx as RoundStepCtx,
 };
-use daemon_vhc_sdk_v2::{
-    build_manifest, MigrationDescriptor, ModuleDecl, OwnedSection, SectionReader, V2Module,
-};
 use serde::Deserialize;
 
-use model::{TinyLlamaModel, ModelCfg};
+use model::{ModelCfg, TinyLlamaModel};
 
 const EV_FRAME: u64 = 0;
 const EV_PAYLOAD_READY: u64 = 1;
@@ -243,7 +243,7 @@ impl PayloadSource<Vec<u8>> for PayloadMap {
     }
 }
 
-// -- the V2Module under `main!` -------------------------------------------------------------------
+// -- the GuestModule under `main!` -------------------------------------------------------------------
 
 /// Flat state a `da_migrate` restore carries into `run` (split by the model layout there).
 struct Restored {
@@ -258,7 +258,7 @@ struct TinyLlama {
     restored: Option<Restored>,
 }
 
-impl V2Module for TinyLlama {
+impl GuestModule for TinyLlama {
     fn decl() -> ModuleDecl {
         ModuleDecl {
             name: "tiny-llama",
@@ -335,7 +335,7 @@ impl V2Module for TinyLlama {
     }
 }
 
-daemon_vhc_sdk_v2::main!(TinyLlama);
+daemon_vhc_sdk::main!(TinyLlama);
 
 /// Split the flat init into per-param canonical vectors.
 fn split_flat(flat: &[f32], numels: &[usize]) -> Vec<Vec<f32>> {
@@ -357,7 +357,7 @@ fn publish_tagged(tag: u64, round: u64, bytes: &[u8]) {
         ciborium::value::Value::Bytes(bytes.to_vec()),
     ]);
     if let Ok(payload) = to_canonical_vec(&v) {
-        let _ = daemon_vhc_sdk_v2::publish(0, &payload);
+        let _ = daemon_vhc_sdk::publish(0, &payload);
     }
 }
 
@@ -376,7 +376,7 @@ struct QuiesceWalk {
 
 /// Decode one export completion's payload: `[status, handle]` → the tensor's f32 vec (None on a
 /// nonzero status or an undecodable payload).
-fn completion_tensor(ev: &daemon_vhc_sdk_v2::Event) -> Option<Vec<f32>> {
+fn completion_tensor(ev: &daemon_vhc_sdk::Event) -> Option<Vec<f32>> {
     let ciborium::value::Value::Array(result) = ev.items.get(2)? else {
         return None;
     };
@@ -391,8 +391,8 @@ fn completion_tensor(ev: &daemon_vhc_sdk_v2::Event) -> Option<Vec<f32>> {
         .get(1)
         .and_then(|v| v.as_integer())
         .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))?;
-    let bytes = daemon_vhc_sdk_v2::read_buffer(handle);
-    daemon_vhc_sdk_v2::buffer_release(handle);
+    let bytes = daemon_vhc_sdk::read_buffer(handle);
+    daemon_vhc_sdk::buffer_release(handle);
     let data = daemon_vhc_sdk_compute::decode_tensor_data(&bytes);
     data.to_vec::<f32>().ok()
 }
@@ -427,7 +427,8 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
     };
     let mut profile = SparseLoco::new(cfg.profile.clone(), &numels);
     let device = daemon_vhc_sdk_compute::device();
-    let mut model = TinyLlamaModel::<AutodiffHostBackend>::from_flat(cfg.model.clone(), device, &init);
+    let mut model =
+        TinyLlamaModel::<AutodiffHostBackend>::from_flat(cfg.model.clone(), device, &init);
     if let Some((ef, m, v)) = restored_local {
         profile
             .restore_ef(ef)
@@ -461,7 +462,7 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
-        let ev = daemon_vhc_sdk_v2::next_event(&mut buf);
+        let ev = daemon_vhc_sdk::next_event(&mut buf);
         match ev.tag {
             EV_STOP => {
                 // Deliberate leak: any device tensor still held here would enqueue its
@@ -491,7 +492,7 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
             EV_PAYLOAD_READY => {
                 // All harness staging is kind-0 bytes; the wrapper tag routes it.
                 let staging_id = ev.uint(1);
-                let bytes = daemon_vhc_sdk_v2::read_back_bytes(staging_id, 0);
+                let bytes = daemon_vhc_sdk::read_back_bytes(staging_id, 0);
                 let Ok(ciborium::value::Value::Array(items)) =
                     ciborium::from_reader::<ciborium::value::Value, _>(bytes.as_slice())
                 else {
@@ -638,12 +639,12 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                                 },
                             ];
                             for s in &sections {
-                                let _staging_id = daemon_vhc_sdk_v2::stage_state(&s.bytes);
+                                let _staging_id = daemon_vhc_sdk::stage_state(&s.bytes);
                             }
                             let manifest = build_manifest(Hash([0u8; 32]), 1, &sections);
                             let manifest_bytes =
                                 to_canonical_vec(&manifest).expect("state-manifest cbor");
-                            let status = daemon_vhc_sdk_v2::snapshot_state(&manifest_bytes);
+                            let status = daemon_vhc_sdk::snapshot_state(&manifest_bytes);
                             assert_eq!(status, 0, "snapshot_state rejected the trainer manifest");
                             // Same deliberate-leak shutdown discipline as Stop (§7.3).
                             std::mem::forget(driver);
@@ -673,8 +674,8 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                     .and_then(|v| v.as_integer())
                     .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))
                     .unwrap_or(0);
-                let bytes = daemon_vhc_sdk_v2::read_buffer(handle);
-                daemon_vhc_sdk_v2::buffer_release(handle);
+                let bytes = daemon_vhc_sdk::read_buffer(handle);
+                daemon_vhc_sdk::buffer_release(handle);
                 let data = daemon_vhc_sdk_compute::decode_tensor_data(&bytes);
                 st.collected[param_idx] = data.to_vec::<f32>().ok();
 
@@ -715,9 +716,9 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                     // Externalize the sealed committed container (B1: the guest authors its own
                     // payload) — put BEFORE the tag-3 voice so the embedder that observes the
                     // commitment can pair it with the serviced bytes.
-                    let buf = daemon_vhc_sdk_v2::create_from(&payload);
-                    let _op = daemon_vhc_sdk_v2::payload_put(buf);
-                    daemon_vhc_sdk_v2::buffer_release(buf);
+                    let buf = daemon_vhc_sdk::create_from(&payload);
+                    let _op = daemon_vhc_sdk::payload_put(buf);
+                    daemon_vhc_sdk::buffer_release(buf);
                     publish_tagged(3, round, &blake3_hash(&payload).0);
                 }
             }

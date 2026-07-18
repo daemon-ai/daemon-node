@@ -3,7 +3,7 @@
 
 //! The driver-side journaling seam (ABI §8) — dependency-inverted over A1's substrate.
 //!
-//! The v2 event-loop driver is **born audited**: it emits every §8 observation (delivered events,
+//! The event-loop driver is **born audited**: it emits every §8 observation (delivered events,
 //! nondeterministic import results, publish outcomes, timer arms/cancels, clock readings, the
 //! terminal fact) from its first commit. The concrete crash-safe segmented store lives in
 //! `daemon-vhc-observe::journal` (A1), and the architecture's dependency direction is
@@ -415,7 +415,7 @@ impl MemorySink {
 
     /// Continue a journal across an incarnation boundary (ABI §10.3 step 6; §12.1/§12.2): the new
     /// incarnation appends its records **after** `prefix` — the previous incarnation's records up
-    /// to the quiesce fence (the [`crate::v2::SnapshotCapture`] journal cursor) — so the combined
+    /// to the quiesce fence (the [`crate::run::SnapshotCapture`] journal cursor) — so the combined
     /// journal is one gapless, replayable log across the module switch (no replay gap; the
     /// pre-fence records are never re-emitted).
     ///

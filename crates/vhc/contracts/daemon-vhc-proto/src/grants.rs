@@ -12,7 +12,7 @@
 //! ```
 //!
 //! This module is the **pure, wasm-clean core** of that intersection for the numeric quotas the
-//! Phase-B `V2RunConfig` seam consumes (`payload_depth`/`advisory_depth`/`gossip_depth`, the
+//! Phase-B `RunConfig` seam consumes (`payload_depth`/`advisory_depth`/`gossip_depth`, the
 //! authoritative spool bounds `spool_frames`/`per_sender_quota`, `max_frame_bytes`, buffer and
 //! completion ceilings, and the granted-artifact set). It takes the **lane ceilings as plain
 //! numbers** ([`LaneCeilings`]) so the host passes its `ParticipationLane` profile in without this
@@ -68,8 +68,8 @@ pub struct LaneCeilings {
     pub custom_ops: BTreeSet<String>,
 }
 
-/// The admitted numeric quotas — the tightened values the host copies into `V2RunConfig` (host
-/// `daemon-vhc-host::v2::V2RunConfig`). Every field is the tightest of (lane, envelope, manifest).
+/// The admitted numeric quotas — the tightened values the host copies into `RunConfig` (host
+/// `daemon-vhc-host::run::RunConfig`). Every field is the tightest of (lane, envelope, manifest).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdmittedQuotas {
     /// Admitted per-frame byte ceiling (`publish`).
@@ -92,7 +92,7 @@ pub struct AdmittedQuotas {
     pub max_readback_bytes: u64,
     /// Admitted concurrent-operation ceiling.
     pub max_outstanding_ops: u64,
-    /// Admitted compute@2 command-queue depth (C1's `V2RunConfig.compute_queue_depth`; tightened
+    /// Admitted compute@2 command-queue depth (C1's `RunConfig.compute_queue_depth`; tightened
     /// exactly like the other quotas — D0∩C1 union).
     pub compute_queue_depth: u64,
     /// The admitted artifact set (a subset of the run's artifact map, intersected with the role
@@ -199,7 +199,7 @@ impl RoleGrants {
 }
 
 /// Derive the admitted numeric quotas for one role by intersecting its envelope grant list with
-/// the lane ceilings (tighten-only) — the pure core of ABI §2.6's derivation for the `V2RunConfig`
+/// the lane ceilings (tighten-only) — the pure core of ABI §2.6's derivation for the `RunConfig`
 /// quotas. `run_artifacts` is the set of blake3 hashes in the run's artifact map (the role's
 /// granted artifacts must be a subset).
 ///

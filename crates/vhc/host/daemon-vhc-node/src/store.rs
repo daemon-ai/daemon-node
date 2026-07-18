@@ -753,7 +753,7 @@ mod tests {
     /// the columns outlive the retired `v1_sunset_audit` transition query as the per-run
     /// provenance/diagnostics record).
     #[test]
-    fn v2_identity_and_observability_writers() {
+    fn identity_and_observability_writers() {
         let store = VhcStore::open_in_memory().unwrap();
         store
             .put_join_intent(

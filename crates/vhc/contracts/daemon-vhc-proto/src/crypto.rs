@@ -14,7 +14,7 @@
 //!   available, so a module can verify signatures / hash bytes with zero host support (the
 //!   compatibility path, architecture §3.2);
 //! - the **host acceleration** (`sys@2::hash` / `sys@2::verify_sig`, wired in
-//!   `daemon-vhc-host::v2::driver`) is this module compiled natively — the fast path.
+//!   `daemon-vhc-host::run::driver`) is this module compiled natively — the fast path.
 //!
 //! Because both paths are the *same source*, host-op ≡ in-guest-op is bit-exact **by
 //! construction** (exactly as `daemon-vhc-det` makes the det lane bit-exact by sharing one

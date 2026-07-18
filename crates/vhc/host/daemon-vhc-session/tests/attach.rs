@@ -5,12 +5,12 @@
 // is refused and never delivered; a duplicate scope tuple is idempotently dropped; a sequence
 // gap is detected, surfaced typed, and the frame HELD (no silent skip). The positive path
 // (verified frames delivered to a real pump) is exercised end-to-end by the worker's v2 join
-// (daemon-vhc-worker/tests/v2_join.rs).
+// (daemon-vhc-worker/tests/join.rs).
 
 use ciborium::value::Value;
 use daemon_vhc_proto::sign::{peer_id, sign_canonical};
 use daemon_vhc_proto::{Hash, RunKeyCertificate, SigningKey};
-use daemon_vhc_session::v2_attach::{InboundFrames, InboundVerdict};
+use daemon_vhc_session::attach::{InboundFrames, InboundVerdict};
 
 const RUN: [u8; 32] = [0xA1; 32];
 

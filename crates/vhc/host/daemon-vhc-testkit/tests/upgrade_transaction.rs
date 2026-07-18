@@ -32,16 +32,16 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use daemon_vhc_abi::{DEFAULT_CHANNEL_CONTROL_ID, OUTCOME_QUIESCE_READY, STOP_REASON_RUN_COMPLETE};
-use daemon_vhc_host::v2::{
-    replay_v2, replay_v2_migrating, start_run, DeviceProfile, EnvelopeRoleGrants, MemorySink,
-    OwnerPolicy, ParticipationLane, PumpHandle, ReplayEnd, ReplayMigration, ReplayScript, RunEnd,
-    RunIdentity, SinkEntry, V2RunConfig,
+use daemon_vhc_host::run::{
+    replay, replay_migrating, start_run, DeviceProfile, EnvelopeRoleGrants, MemorySink,
+    OwnerPolicy, ParticipationLane, PumpHandle, ReplayEnd, ReplayMigration, ReplayScript,
+    RunConfig, RunEnd, RunIdentity, SinkEntry,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::envelope::{Access, DeviceMinimums};
 use daemon_vhc_proto::genesis::{
     ChannelDecl, EventCap, EventCaps, GenesisEnvelope, Identities, RoleEntry, RoleGrants,
-    RunSectionV2, SnapshotArtifact, TransportSelection, GENESIS_SCHEMA_MAJOR,
+    RunSection, SnapshotArtifact, TransportSelection, GENESIS_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::sign::verify_bytes;
 use daemon_vhc_proto::{
@@ -206,7 +206,7 @@ fn drill_genesis(
         );
     }
     let genesis = GenesisEnvelope {
-        run: RunSectionV2 {
+        run: RunSection {
             schema: GENESIS_SCHEMA_MAJOR,
             run_label: "upgrade-drill".into(),
             min_peers: 1,
@@ -350,7 +350,7 @@ fn assemble<'w>(
     };
     let old_grants_bytes = to_canonical_vec(&genesis.roles[role].grants).expect("grants cbor");
     let old_config_kept = old_config.clone();
-    let mut old_cfg = V2RunConfig::new(old_identity, old_seed, old_config, old_grants_bytes);
+    let mut old_cfg = RunConfig::new(old_identity, old_seed, old_config, old_grants_bytes);
     old_cfg.migration_max_sections = 4;
     old_cfg.migration_max_section_bytes = 1 << 12;
     let old_run = start_run(worker, &old_wasm, old_cfg, Box::new(old_sink.clone()))
@@ -1018,7 +1018,7 @@ fn upgrade_journal_continues_from_cursor_and_replays_across_the_boundary_bit_exa
     // (3) REPLAYS BIT-EXACT ACROSS THE BOUNDARY: the old prefix under the OLD module; the new
     // suffix under the NEW module, driving `da_migrate` from the durable capture.
     let old_wasm = guest_wasm("test_migrate_old");
-    let old_replay = replay_v2(
+    let old_replay = replay(
         &worker,
         &old_wasm,
         &drill.old_config,
@@ -1042,7 +1042,7 @@ fn upgrade_journal_continues_from_cursor_and_replays_across_the_boundary_bit_exa
     );
 
     let new_wasm = guest_wasm("test_migrate_new");
-    let new_replay = replay_v2_migrating(
+    let new_replay = replay_migrating(
         &worker,
         &new_wasm,
         &[],

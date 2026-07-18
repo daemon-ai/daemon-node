@@ -16,7 +16,7 @@
 // recorded journal through the §8.7 engine before reporting the round outcome — a diverging
 // run is a join FAILURE (the `replay_decisions` metric is the green receipt).
 //
-// In-process identity contract (v2_session module docs): the worker derives the coordinator's
+// In-process identity contract (session module docs): the worker derives the coordinator's
 // §12.1 frame key from the run id, so this author names that derived key's peer id as the
 // genesis `SingleKey` coordinator identity — a mismatch refuses every coordinator frame at the
 // authority judgment.
@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use ciborium::value::Value;
 use daemon_vhc_proto::genesis::{
-    ChannelDecl, Identities, RoleEntry, RoleGrants, RunSectionV2, SnapshotArtifact,
+    ChannelDecl, Identities, RoleEntry, RoleGrants, RunSection, SnapshotArtifact,
     TransportSelection, GENESIS_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{
@@ -87,7 +87,7 @@ fn module_path(name: &str) -> PathBuf {
     guests_root().join(format!("target/wasm32-unknown-unknown/release/{name}.wasm"))
 }
 
-/// The worker's in-process identity derivation (v2_session's contract): key seeds are
+/// The worker's in-process identity derivation (session's contract): key seeds are
 /// `blake3("vhc-worker/<run_id>")` / `blake3("vhc-coordinator/<run_id>")`.
 fn derived_peer(prefix: &str) -> PeerId {
     let seed = *blake3::hash(format!("{prefix}/{RUN_ID}").as_bytes()).as_bytes();
@@ -290,7 +290,7 @@ fn genesis_wire() -> Vec<u8> {
     );
 
     let env = GenesisEnvelope {
-        run: RunSectionV2 {
+        run: RunSection {
             schema: GENESIS_SCHEMA_MAJOR,
             run_label: RUN_ID.to_string(),
             min_peers: 1,
@@ -334,7 +334,7 @@ fn policy() -> JoinPolicy {
 
 /// probe → assess → join → two coordinator-driven barrier rounds → replay-soaked digest.
 #[tokio::test]
-async fn v2_worker_joins_and_runs_rounds_under_the_coordinator() {
+async fn worker_joins_and_runs_rounds_under_the_coordinator() {
     let wire = genesis_wire(); // also builds the guests
     let mut cfg = TrainClientConfig::new(env!("CARGO_BIN_EXE_daemon-vhc-worker").to_string());
     cfg.env = vec![

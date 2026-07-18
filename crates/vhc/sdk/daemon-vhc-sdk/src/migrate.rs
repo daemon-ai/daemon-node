@@ -97,7 +97,7 @@ pub trait SectionReader {
 }
 
 /// The producing/consuming pair a migratable module implements; `main!`'s `da_migrate` and the
-/// Phase-E quiesce path drive it. Kept separate from [`crate::module::V2Module`] so a
+/// Phase-E quiesce path drive it. Kept separate from [`crate::module::GuestModule`] so a
 /// non-migratable module implements nothing extra.
 pub trait MigrateState: Sized {
     /// Snapshot the module state as named sections (the `Quiesce{Upgrade}` drain, §10.2).

@@ -27,10 +27,10 @@ pub mod compute;
 // The PERMANENT device probe (decisions D5: "the device probe stays forever").
 pub mod coordinator;
 pub mod probe;
+pub mod run;
 pub mod runtime;
 pub mod select;
 pub mod trap;
-pub mod v2;
 
 pub use compute::{unservable_op, ComputeError, ComputeRunner, HostReal};
 #[cfg(feature = "cuda")]

@@ -21,10 +21,10 @@
 
 use burn::tensor::Tensor;
 use burn_ir::{TensorId, TensorIr, TensorStatus};
+use daemon_vhc_sdk::{GuestModule, ModuleDecl};
 use daemon_vhc_sdk_compute::{
     device, export_tensor, fence, tensor_from_floats, AutodiffHostBackend, HostBackend,
 };
-use daemon_vhc_sdk_v2::{ModuleDecl, V2Module};
 
 const EV_FENCE: u64 = 5;
 const EV_COMPLETION: u64 = 6;
@@ -43,7 +43,7 @@ fn inputs() -> (Vec<f32>, [usize; 2], Vec<f32>, [usize; 2]) {
     (a, [2, 3], w, [3, 2])
 }
 
-impl V2Module for ComputeGuest {
+impl GuestModule for ComputeGuest {
     fn decl() -> ModuleDecl {
         ModuleDecl {
             name: "test-compute-v2",
@@ -79,7 +79,7 @@ impl V2Module for ComputeGuest {
     }
 }
 
-daemon_vhc_sdk_v2::main!(ComputeGuest);
+daemon_vhc_sdk::main!(ComputeGuest);
 
 /// Scenario 0 — the acceptance path: an ordinary Burn forward+backward over `HostBackend`, the
 /// gradient extracted through fence → export → completion → read.
@@ -113,7 +113,7 @@ fn forward_backward_export() -> u32 {
     let mut export_op = 0u64;
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     loop {
-        let ev = daemon_vhc_sdk_v2::next_event(&mut buf);
+        let ev = daemon_vhc_sdk::next_event(&mut buf);
         match ev.tag {
             EV_FENCE if ev.uint(1) == 1 => {
                 export_op = export_tensor(ga.take().expect("fence delivers once"));
@@ -127,7 +127,7 @@ fn forward_backward_export() -> u32 {
                     .and_then(|v| v.as_integer())
                     .is_some_and(|n| i128::from(n) == 0);
                 if !ok {
-                    daemon_vhc_sdk_v2::publish(0, b"export-failed");
+                    daemon_vhc_sdk::publish(0, b"export-failed");
                     return 18;
                 }
                 let handle = result
@@ -136,9 +136,9 @@ fn forward_backward_export() -> u32 {
                     .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))
                     .unwrap_or(0);
                 // The exported CBOR(TensorData), crossed into linear memory (budgeted §3.4).
-                let bytes = daemon_vhc_sdk_v2::read_buffer(handle);
-                daemon_vhc_sdk_v2::buffer_release(handle);
-                daemon_vhc_sdk_v2::publish(0, &bytes);
+                let bytes = daemon_vhc_sdk::read_buffer(handle);
+                daemon_vhc_sdk::buffer_release(handle);
+                daemon_vhc_sdk::publish(0, &bytes);
             }
             EV_STOP => return 0,
             _ => {}
@@ -156,7 +156,7 @@ fn invalid_handle_export() -> u32 {
     };
     let mut bytes = Vec::new();
     ciborium::into_writer(&ir, &mut bytes).expect("ir encodes");
-    let _op = daemon_vhc_sdk_v2::compute_export(&bytes); // traps InvalidHandle
+    let _op = daemon_vhc_sdk::compute_export(&bytes); // traps InvalidHandle
     19 // unreachable when the host conforms
 }
 
@@ -189,7 +189,7 @@ fn fault_surfaces_at_export() -> u32 {
     let op = export_tensor(kept);
     let mut buf: Vec<u8> = Vec::with_capacity(128);
     loop {
-        let ev = daemon_vhc_sdk_v2::next_event(&mut buf);
+        let ev = daemon_vhc_sdk::next_event(&mut buf);
         match ev.tag {
             EV_COMPLETION if ev.uint(1) == op => {
                 let Some(ciborium::value::Value::Array(result)) = ev.items.get(2) else {
@@ -199,7 +199,7 @@ fn fault_surfaces_at_export() -> u32 {
                     .first()
                     .and_then(|v| v.as_integer())
                     .is_some_and(|n| i128::from(n) == 1);
-                daemon_vhc_sdk_v2::publish(
+                daemon_vhc_sdk::publish(
                     0,
                     if failed {
                         b"device-error"

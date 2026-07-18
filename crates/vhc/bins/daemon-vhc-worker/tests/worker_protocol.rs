@@ -9,7 +9,7 @@
 //
 // **Post-sunset shape (decisions D5)**: the v1 five-phase driver retired at the Phase-E sunset,
 // so this suite's positive arms drive the REAL major-2 module (`tiny_llama.wasm` — the v2
-// whole-run itself is `tests/v2_join.rs`), and the suite carries the WIRE-LEVEL sunset
+// whole-run itself is `tests/join.rs`), and the suite carries the WIRE-LEVEL sunset
 // regressions over the real binary:
 //   * assessing a SYNTHETIC ABI-major-1 module (a few-section wasm image hand-assembled in-test
 //     with `wasm-encoder`: empty imports + the v1 lifecycle exports + `da_abi` = major 1 — no
@@ -36,7 +36,7 @@ use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey};
 
 use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
-// -- guest module loading (mirrors tests/v2_join.rs) ---------------------------------------------
+// -- guest module loading (mirrors tests/join.rs) ---------------------------------------------
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -248,7 +248,7 @@ fn deterministic_init(total: usize) -> Vec<f32> {
 /// The compute@2 trainer's guest config (`GuestCfg`, authored SDK-free as raw canonical CBOR —
 /// the tiny t2 parity model + `sparse_loco` profile + matched init): single-peer roster, 2 inner
 /// steps, one sequence per micro window.
-fn v2_guest_config() -> Value {
+fn guest_config() -> Value {
     let model = Value::Map(vec![
         (Value::from("d_model"), Value::from(64u32)),
         (Value::from("n_layers"), Value::from(1u32)),
@@ -300,7 +300,7 @@ fn v2_guest_config() -> Value {
 /// inside the signed path — assess never fetches the coordinator module).
 fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
     use daemon_vhc_proto::genesis::{
-        ChannelDecl, Identities, RoleEntry, RoleGrants, RunSectionV2, SnapshotArtifact,
+        ChannelDecl, Identities, RoleEntry, RoleGrants, RunSection, SnapshotArtifact,
         TransportSelection, GENESIS_SCHEMA_MAJOR,
     };
     use daemon_vhc_proto::GenesisEnvelope;
@@ -365,7 +365,7 @@ fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
         },
     );
     let env = GenesisEnvelope {
-        run: RunSectionV2 {
+        run: RunSection {
             schema: GENESIS_SCHEMA_MAJOR,
             run_label: run_label.to_string(),
             min_peers: 1,
@@ -520,7 +520,7 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
     let sup = supervisor_for(&module);
 
     let elig = sup
-        .assess(genesis_wire("abi-major-1", v2_guest_config()))
+        .assess(genesis_wire("abi-major-1", guest_config()))
         .await
         .expect("assess is an outcome, not a transport error");
     assert!(!elig.eligible, "a major-1 module is refused post-sunset");
@@ -542,14 +542,14 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
 
 /// The envelope seam over the genesis form: the worker receives the real signed genesis, verifies
 /// it, and the **major-2** module assesses eligible through the claim funnel (the full v2
-/// whole-run join is `tests/v2_join.rs`).
+/// whole-run join is `tests/join.rs`).
 #[tokio::test]
-async fn v2_module_assesses_eligible_over_the_signed_envelope() {
+async fn module_assesses_eligible_over_the_signed_envelope() {
     let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
     let elig = sup
-        .assess(genesis_wire("worker-seam", v2_guest_config()))
+        .assess(genesis_wire("worker-seam", guest_config()))
         .await
         .expect("assess over the signed genesis");
     assert!(
@@ -590,7 +590,7 @@ async fn unsigned_raw_config_assess_is_refused_with_typed_slug() {
     let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
-    let raw = to_canonical_vec(&v2_guest_config()).expect("raw config cbor");
+    let raw = to_canonical_vec(&guest_config()).expect("raw config cbor");
     let err = sup
         .assess(raw)
         .await
@@ -610,12 +610,12 @@ async fn throttle_is_harmless_and_never_respawns() {
     let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
-    sup.assess(genesis_wire("run-9", v2_guest_config()))
+    sup.assess(genesis_wire("run-9", guest_config()))
         .await
         .expect("assess");
     sup.throttle(None, None, true).await.expect("pause");
     sup.throttle(None, None, false).await.expect("resume");
-    sup.assess(genesis_wire("run-9", v2_guest_config()))
+    sup.assess(genesis_wire("run-9", guest_config()))
         .await
         .expect("assess after the lever");
     assert_eq!(

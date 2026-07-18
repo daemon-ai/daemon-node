@@ -4,7 +4,7 @@
 // The Phase-C **model-agnostic** whole-run gate (refactor §7: "a non-LLaMA toy authored with zero
 // host changes … wire it through the testkit as a lane"; tier-2): the `toy_mlp.wasm` PRODUCTION
 // blob — a two-layer MLP trained by SGD, authored purely over `daemon-vhc-sdk-compute` +
-// `daemon-vhc-sdk-v2` — runs under the SAME testkit driver + simulated capability providers +
+// `daemon-vhc-sdk` — runs under the SAME testkit driver + simulated capability providers +
 // `compute@2` runner the LLaMA reference uses, is journaled end-to-end, and replays bit-for-bit
 // through the §8.7 engine. The lane exists to prove the compute ABI is model-agnostic at the
 // whole-run level: nothing in the testkit knows the model; the op stream is dispatched by shape.
@@ -18,7 +18,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use daemon_vhc_abi::DEFAULT_CHANNEL_CONTROL_ID;
-use daemon_vhc_host::v2::{RunEnd, RunIdentity};
+use daemon_vhc_host::run::{RunEnd, RunIdentity};
 use daemon_vhc_testkit::run::{whole_run, RunSpec};
 
 fn guests_root() -> PathBuf {

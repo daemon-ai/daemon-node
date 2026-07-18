@@ -1,15 +1,15 @@
-# The v2-native trainer goldens (successor to the recorded v1 parity oracle)
+# The native trainer goldens (successor to the recorded v1 parity oracle)
 
 This is the standing **drift oracle for the compute@2 trainer** (`tiny-llama`): a recorded,
 content-addressed bundle the per-tier reproduction tests
-(`daemon-vhc-host/tests/trainer_goldens.rs`) check the trainer against. It is the v2-native
-successor that **retired** the recorded v1 parity oracle and its parity lanes (`v2_parity.rs` +
+(`daemon-vhc-host/tests/trainer_goldens.rs`) check the trainer against. It is the native
+successor that **retired** the recorded v1 parity oracle and its parity lanes (`parity.rs` +
 `trainer_parity.rs`) once these goldens stood (retirement plan §3, D-3) — the v1 recording no longer
 exists in the tree; this bundle is the sole standing det-lane drift oracle for the trainer.
 
 The recorded lane is the compute@2 trainer guest driven through a **single-peer barrier
 whole-run**: it trains, commits its own outer update, and ingests that same committed set. Every
-recorded value is the trainer's own v2-native output — no v1 inputs feed the trajectory. The
+recorded value is the trainer's own native output — no v1 inputs feed the trajectory. The
 matched init and the config literals were originally inherited from the v1 oracle bundle; that
 oracle has since retired, so they now live **in this bundle** (`init.f32le.bin` + the config
 literals in `expected.json`) and the bundle is fully self-contained. The provenance section below
@@ -30,7 +30,7 @@ load (content-addressing).
 
 The recorded per-round digests are the guest's tag-4 post-ingest det digests (the equality-class
 oracle). At the capture commit they coincide bit-for-bit with the v1 oracle's trainer digests
-(`abcf2612…`, `574cf418…`) — captured here from the autonomous v2-native self-ingest lane.
+(`abcf2612…`, `574cf418…`) — captured here from the autonomous native self-ingest lane.
 
 ## Provenance chain (HISTORICAL: v1 oracle → det-equality green → these goldens)
 
@@ -71,7 +71,7 @@ matched init and config literals it supplied now live in this self-contained bun
   container encoding").
 - This bundle therefore records the trainer's **own** committed payload bytes
   (`payload-round-*.bin`) — captured from the self-ingest lane, hash-verified against the guest's
-  tag-3 commitment at capture. These are v2-native bytes (they differ from the v1 oracle's recorded
+  tag-3 commitment at capture. These are native bytes (they differ from the v1 oracle's recorded
   update bytes), while the post-ingest digests coincide with v1's.
 
 ## What the reproduction tiers assert
@@ -81,7 +81,7 @@ matched init and config literals it supplied now live in this self-contained bun
 - **cpu** and **burn-ndarray** tiers drive the trainer against the recorded golden payloads and
   assert the tag-4 digests reproduce the golden **bit-for-bit** (equality class) and the tag-2 θ
   within the **Optimizer** band (tolerance class).
-- **straggle → catch-up** leg (ported from `v2_parity.rs`'s
+- **straggle → catch-up** leg (ported from `parity.rs`'s
   `catch_up_after_straggle_reproduces_v1_digests_cpu` onto the compute@2 trainer): round 0's record
   arrives before its committed payload is fetchable (straggle), the payload lands, and `RoundOpen(1)`
   ingests round 0 (catch-up) and trains round 1 in one event slice — the run must end in exactly the

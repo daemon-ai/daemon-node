@@ -64,14 +64,14 @@ use daemon_vhc_abi::{
 };
 use daemon_vhc_proto::{peer_id, sign_canonical, to_canonical_vec, SigningKey};
 
+use crate::run::buffer::BufferTable;
+use crate::run::completion::{CompError, CompletionResult, SuccessPayload};
+use crate::run::event::{encode_event_frame, PayloadMeta, RunEvent};
+use crate::run::journal::{JournalSink, SinkError};
+use crate::run::ops::{OpRequest, OpTable};
+use crate::run::streams::StreamTable;
 use crate::runtime::{EngineConfig, Worker};
 use crate::trap::{Trap, TrapCode};
-use crate::v2::buffer::BufferTable;
-use crate::v2::completion::{CompError, CompletionResult, SuccessPayload};
-use crate::v2::event::{encode_event_frame, EventV2, PayloadMeta};
-use crate::v2::journal::{JournalSink, SinkError};
-use crate::v2::ops::{OpRequest, OpTable};
-use crate::v2::streams::StreamTable;
 
 /// The frozen execution-identity five-tuple (ABI §8.1) as the driver consumes it.
 #[derive(Debug, Clone)]
@@ -90,7 +90,7 @@ pub struct RunIdentity {
 
 /// Configuration for one v2 run instance.
 #[derive(Debug, Clone)]
-pub struct V2RunConfig {
+pub struct RunConfig {
     /// The execution identity (journal + signing scope, ABI §8.1/§12).
     pub identity: RunIdentity,
     /// The per-run software signing key seed (certified key chains arrive at D1; the §12.1
@@ -103,7 +103,7 @@ pub struct V2RunConfig {
     /// Run-header fields the admission path pinned (verbatim canonical bytes; §8.3 tag 0). Empty
     /// until the A2 admission funnel wires them — recorded as such.
     pub manifest_bytes: Vec<u8>,
-    /// Run-header claim bytes (see [`V2RunConfig::manifest_bytes`]).
+    /// Run-header claim bytes (see [`RunConfig::manifest_bytes`]).
     pub claim_bytes: Vec<u8>,
     /// Run-header channel-table bytes (the Phase-A default table until D0).
     pub channels_bytes: Vec<u8>,
@@ -177,7 +177,7 @@ pub struct V2RunConfig {
     pub compute_fault_after_ops: Option<u64>,
 }
 
-impl V2RunConfig {
+impl RunConfig {
     /// A config with Phase-A defaults for the bound fields.
     #[must_use]
     pub fn new(
@@ -218,7 +218,7 @@ impl V2RunConfig {
 /// Driver-level failures raised before/around guest execution (admission-shaped, not traps).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum V2Error {
+pub enum RunError {
     /// Engine/linker/instantiation plumbing failed.
     #[error("v2 sandbox error: {0}")]
     Sandbox(String),
@@ -470,15 +470,15 @@ impl PumpState {
         {
             let old = self.queue.remove(pos).expect("position exists");
             // The frame names what was dropped (staging id + hash); unstage the bytes too.
-            if let Ok(EventV2::PayloadReady {
+            if let Ok(RunEvent::PayloadReady {
                 staging_id, hash, ..
-            }) = crate::v2::event::decode_event_frame(&old.frame_bytes)
+            }) = crate::run::event::decode_event_frame(&old.frame_bytes)
             {
                 self.staged.remove(&staging_id);
                 self.sink.drop_coalesced(
                     0,
                     daemon_vhc_abi::COALESCE_DEDUP_HASH,
-                    crate::v2::journal::Dropped::payload(hash),
+                    crate::run::journal::Dropped::payload(hash),
                 )?;
             }
         }
@@ -495,7 +495,7 @@ impl PumpState {
         }
         let result_bytes = result.encode().map_err(|e| SinkError(e.to_string()))?;
         self.sink.completion(op, &result_bytes)?;
-        let frame_bytes = encode_event_frame(&EventV2::Completion {
+        let frame_bytes = encode_event_frame(&RunEvent::Completion {
             op,
             result: result.clone(),
         })
@@ -521,7 +521,7 @@ impl PumpState {
         if self.stop_enqueued {
             return Ok(()); // the host delivers no further events after Stop (§4.4)
         }
-        let frame_bytes = encode_event_frame(&EventV2::Fence { fence_id })
+        let frame_bytes = encode_event_frame(&RunEvent::Fence { fence_id })
             .map_err(|e| SinkError(e.to_string()))?;
         self.queue.push_back(QueuedEvent {
             frame_bytes,
@@ -544,7 +544,7 @@ impl PumpState {
             return Ok(());
         }
         let frame_bytes =
-            encode_event_frame(&EventV2::Stop { reason }).map_err(|e| SinkError(e.to_string()))?;
+            encode_event_frame(&RunEvent::Stop { reason }).map_err(|e| SinkError(e.to_string()))?;
         self.stop_enqueued = true;
         self.stop_cut = None;
         self.queue.push_back(QueuedEvent {
@@ -619,7 +619,7 @@ impl PumpHandle {
         payload: Vec<u8>,
         original_signed_frame: Vec<u8>,
     ) -> Result<DeliverVerdict, SinkError> {
-        let ev = EventV2::Frame {
+        let ev = RunEvent::Frame {
             channel,
             seq,
             sender,
@@ -683,7 +683,7 @@ impl PumpHandle {
             st.sink.drop_coalesced(
                 2,
                 daemon_vhc_abi::COALESCE_DROP_OLDEST,
-                crate::v2::journal::Dropped::gossip(u64::from(channel), sender, seq),
+                crate::run::journal::Dropped::gossip(u64::from(channel), sender, seq),
             )?;
             return Ok(());
         }
@@ -693,7 +693,7 @@ impl PumpHandle {
             *c += 1;
             s
         };
-        let ev = EventV2::Frame {
+        let ev = RunEvent::Frame {
             channel,
             seq,
             sender,
@@ -709,7 +709,7 @@ impl PumpHandle {
                 st.sink.drop_coalesced(
                     2,
                     daemon_vhc_abi::COALESCE_DROP_OLDEST,
-                    crate::v2::journal::Dropped::gossip(u64::from(och), osender, oseq),
+                    crate::run::journal::Dropped::gossip(u64::from(och), osender, oseq),
                 )?;
             }
         }
@@ -740,7 +740,7 @@ impl PumpHandle {
             st.sink.drop_coalesced(
                 0,
                 daemon_vhc_abi::COALESCE_DEDUP_HASH,
-                crate::v2::journal::Dropped::payload(hash),
+                crate::run::journal::Dropped::payload(hash),
             )?;
             // The staged bytes are already announced; find its id for the caller.
             if let Some((&id, _)) = st
@@ -756,7 +756,7 @@ impl PumpHandle {
         st.next_host_staging_id += 1;
         let size = bytes.len() as u64;
         st.staged.insert(staging_id, (STAGED_KIND_BYTES, bytes));
-        let ev = EventV2::PayloadReady {
+        let ev = RunEvent::PayloadReady {
             staging_id,
             hash,
             meta: PayloadMeta {
@@ -789,11 +789,11 @@ impl PumpHandle {
         duty_pct: u64,
         vram_cap_bytes: u64,
     ) -> Result<(), SinkError> {
-        let ev = EventV2::Budget {
-            report: crate::v2::event::BudgetReport {
+        let ev = RunEvent::Budget {
+            report: crate::run::event::BudgetReport {
                 fuel,
                 mem,
-                throttle: crate::v2::event::ThrottleReport {
+                throttle: crate::run::event::ThrottleReport {
                     paused,
                     duty_pct,
                     vram_cap_bytes,
@@ -811,7 +811,7 @@ impl PumpHandle {
             st.sink.drop_coalesced(
                 3,
                 daemon_vhc_abi::COALESCE_LATEST_WINS,
-                crate::v2::journal::Dropped::default(),
+                crate::run::journal::Dropped::default(),
             )?;
         }
         st.queue.push_back(QueuedEvent {
@@ -903,8 +903,8 @@ impl PumpHandle {
                 if let Some(n) = st.auth_per_sender.get_mut(&sender) {
                     *n = n.saturating_sub(1);
                 }
-                let payload = match crate::v2::event::decode_event_frame(&ev.frame_bytes) {
-                    Ok(EventV2::Frame { payload, .. }) => payload,
+                let payload = match crate::run::event::decode_event_frame(&ev.frame_bytes) {
+                    Ok(RunEvent::Frame { payload, .. }) => payload,
                     _ => Vec::new(),
                 };
                 out.push(SpooledFrame {
@@ -930,7 +930,7 @@ impl PumpHandle {
     /// # Errors
     /// A journal-sink/encode failure.
     pub fn quiesce(&self, reason: u64, deadline_ms: u64) -> Result<(), SinkError> {
-        let frame_bytes = encode_event_frame(&EventV2::Quiesce {
+        let frame_bytes = encode_event_frame(&RunEvent::Quiesce {
             reason,
             deadline_ms,
         })
@@ -1174,7 +1174,7 @@ struct SliceState {
 }
 
 /// The wasmtime `Store` data for a v2 run instance.
-struct V2Host {
+struct Host {
     shared: Arc<PumpShared>,
     limits: StoreLimits,
     trap: Option<Trap>,
@@ -1213,12 +1213,12 @@ struct V2Host {
     // The queue-depth grant + its ledger: ops enqueued since the last successful fence.
     compute_queue_depth: u64,
     compute_ops_since_fence: u64,
-    // The deferred-fault injection seam (see `V2RunConfig::compute_fault_after_ops`).
+    // The deferred-fault injection seam (see `RunConfig::compute_fault_after_ops`).
     compute_fault_after_ops: Option<u64>,
     compute_ops_total: u64,
 }
 
-impl V2Host {
+impl Host {
     fn charge_op(&mut self, import: &'static str) -> Result<(), Trap> {
         self.slice.op_calls += 1;
         if self.slice.op_calls > self.op_budget {
@@ -1287,16 +1287,16 @@ impl V2Host {
     }
 }
 
-// -- memory helpers (Caller<V2Host>) ---------------------------------------------------------------
+// -- memory helpers (Caller<Host>) ---------------------------------------------------------------
 
-fn mem_of(caller: &mut Caller<'_, V2Host>) -> Result<Memory, Trap> {
+fn mem_of(caller: &mut Caller<'_, Host>) -> Result<Memory, Trap> {
     caller
         .get_export("memory")
         .and_then(wasmtime::Extern::into_memory)
         .ok_or_else(|| Trap::bare(TrapCode::BadModule, "module has no exported memory"))
 }
 
-fn read_guest(caller: &mut Caller<'_, V2Host>, ptr: u32, len: u32) -> Result<Vec<u8>, Trap> {
+fn read_guest(caller: &mut Caller<'_, Host>, ptr: u32, len: u32) -> Result<Vec<u8>, Trap> {
     let mem = mem_of(caller)?;
     let (start, end) = (ptr as usize, ptr as usize + len as usize);
     mem.data(&caller)
@@ -1305,7 +1305,7 @@ fn read_guest(caller: &mut Caller<'_, V2Host>, ptr: u32, len: u32) -> Result<Vec
         .ok_or_else(|| Trap::bare(TrapCode::MemOob, "guest span out of bounds"))
 }
 
-fn write_guest(caller: &mut Caller<'_, V2Host>, ptr: u32, bytes: &[u8]) -> Result<(), Trap> {
+fn write_guest(caller: &mut Caller<'_, Host>, ptr: u32, bytes: &[u8]) -> Result<(), Trap> {
     let mem = mem_of(caller)?;
     let start = ptr as usize;
     let data = mem.data_mut(caller);
@@ -1316,7 +1316,7 @@ fn write_guest(caller: &mut Caller<'_, V2Host>, ptr: u32, bytes: &[u8]) -> Resul
     Ok(())
 }
 
-fn stash<T>(caller: &mut Caller<'_, V2Host>, r: Result<T, Trap>) -> Result<T, wasmtime::Error> {
+fn stash<T>(caller: &mut Caller<'_, Host>, r: Result<T, Trap>) -> Result<T, wasmtime::Error> {
     r.map_err(|t| {
         let msg = t.to_string();
         caller.data_mut().trap = Some(t);
@@ -1329,7 +1329,7 @@ fn stash<T>(caller: &mut Caller<'_, V2Host>, r: Result<T, Trap>) -> Result<T, wa
 /// Build + sign the §12.1 domain-separated frame: `[envelope, payload, sig]` canonical CBOR, the
 /// signature over the canonical envelope (which commits to the payload via `payload_hash`).
 fn build_signed_frame(
-    host: &V2Host,
+    host: &Host,
     channel: u64,
     seq: u64,
     payload: &[u8],
@@ -1420,18 +1420,18 @@ pub fn host_crypto_verify(public_key: &[u8], signature: &[u8], message: &[u8]) -
 const PARK_RECHECK: Duration = Duration::from_millis(50);
 
 /// The pump shared state behind a caller (borrow helper for the import bodies).
-fn shared_of(c: &Caller<'_, V2Host>) -> Arc<PumpShared> {
+fn shared_of(c: &Caller<'_, Host>) -> Arc<PumpShared> {
     c.data().shared.clone()
 }
 
 #[allow(clippy::too_many_lines)]
-fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
+fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
     // ---- vhc@2::next_event — THE blocking pull (§4.1) -------------------------------------------
     linker.func_wrap(
         NS_VHC_V2,
         "next_event",
-        |mut c: Caller<'_, V2Host>, buf_ptr: u32, buf_cap: u32| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, buf_ptr: u32, buf_cap: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("next_event")?;
                 // Mandatory-retry rule: after NeedCapacity the re-call must be big enough (§4.1).
                 if let Some(required) = c.data().slice.pending_next {
@@ -1581,13 +1581,13 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_VHC_V2,
         "read_back",
-        |mut c: Caller<'_, V2Host>,
+        |mut c: Caller<'_, Host>,
          src: u64,
          kind: u32,
          out_ptr: u32,
          out_cap: u32|
          -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("read_back")?;
                 if let Some((psrc, pkind, required)) = c.data().slice.pending_readback {
                     if psrc != src || pkind != kind {
@@ -1742,8 +1742,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_VHC_V2,
         "stage_state",
-        |mut c: Caller<'_, V2Host>, ptr: u32, len: u32| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, ptr: u32, len: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("stage_state")?;
                 let bytes = read_guest(c, ptr, len)?;
                 // The hard-accountable cap (ABI §9.1): staged bytes are the Phase-A metered
@@ -1783,8 +1783,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_VHC_V2,
         "snapshot_state",
-        |mut c: Caller<'_, V2Host>, ptr: u32, len: u32| -> Result<u32, wasmtime::Error> {
-            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, ptr: u32, len: u32| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("snapshot_state")?;
                 if !c.data().slice.draining {
                     return Err(Trap::new(
@@ -1876,8 +1876,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_VHC_V2,
         "create_from",
-        |mut c: Caller<'_, V2Host>, ptr: u32, len: u32| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, ptr: u32, len: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("create_from")?;
                 let bytes = read_guest(c, ptr, len)?;
                 // The hard-accountable claim meter covers guest-initiated allocations (ABI §9.1
@@ -1911,13 +1911,13 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_VHC_V2,
         "read_into",
-        |mut c: Caller<'_, V2Host>,
+        |mut c: Caller<'_, Host>,
          buffer: u64,
          offset: u64,
          out_ptr: u32,
          out_cap: u32|
          -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("read_into")?;
                 let shared = c.data().shared.clone();
                 let data = {
@@ -1954,8 +1954,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_VHC_V2,
         "buffer_len",
-        |mut c: Caller<'_, V2Host>, buffer: u64| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, buffer: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("buffer_len")?;
                 let shared = c.data().shared.clone();
                 let st = shared.state.lock().expect("pump lock");
@@ -1971,8 +1971,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_VHC_V2,
         "buffer_release",
-        |mut c: Caller<'_, V2Host>, buffer: u64| -> Result<(), wasmtime::Error> {
-            let r: Result<(), Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, buffer: u64| -> Result<(), wasmtime::Error> {
+            let r: Result<(), Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("buffer_release")?;
                 let shared = c.data().shared.clone();
                 let freed = {
@@ -1994,8 +1994,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_VHC_V2,
         "cancel",
-        |mut c: Caller<'_, V2Host>, op: u64| -> Result<u32, wasmtime::Error> {
-            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, op: u64| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("cancel")?;
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
@@ -2017,8 +2017,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_NET_V2,
         "payload_put",
-        |mut c: Caller<'_, V2Host>, buffer: u64| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, buffer: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("payload_put")?;
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
@@ -2039,8 +2039,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_NET_V2,
         "payload_get",
-        |mut c: Caller<'_, V2Host>, hash_ptr: u32| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, hash_ptr: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("payload_get")?;
                 let hash_bytes = read_guest(c, hash_ptr, 32)?;
                 let hash: [u8; 32] = hash_bytes.as_slice().try_into().expect("32-byte span");
@@ -2069,12 +2069,12 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_DATA_V2,
         "fetch",
-        |mut c: Caller<'_, V2Host>,
+        |mut c: Caller<'_, Host>,
          hash_ptr: u32,
          range_off: u64,
          range_len: u64|
          -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("fetch")?;
                 let hash_bytes = read_guest(c, hash_ptr, 32)?;
                 let hash: [u8; 32] = hash_bytes.as_slice().try_into().expect("32-byte span");
@@ -2114,8 +2114,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_NET_V2,
         "stream_open",
-        |mut c: Caller<'_, V2Host>, peer_ptr: u32| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, peer_ptr: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("stream_open")?;
                 let peer_bytes = read_guest(c, peer_ptr, 32)?;
                 let peer: [u8; 32] = peer_bytes.as_slice().try_into().expect("32-byte span");
@@ -2136,8 +2136,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_NET_V2,
         "stream_accept",
-        |mut c: Caller<'_, V2Host>| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("stream_accept")?;
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
@@ -2153,8 +2153,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_NET_V2,
         "stream_write",
-        |mut c: Caller<'_, V2Host>, stream: u64, buffer: u64| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, stream: u64, buffer: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("stream_write")?;
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
@@ -2199,8 +2199,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_NET_V2,
         "stream_read",
-        |mut c: Caller<'_, V2Host>, stream: u64| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, stream: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("stream_read")?;
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
@@ -2229,12 +2229,12 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_NET_V2,
         "publish",
-        |mut c: Caller<'_, V2Host>,
+        |mut c: Caller<'_, Host>,
          channel_id: u32,
          payload_ptr: u32,
          payload_len: u32|
          -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("publish")?;
                 // The channel table decides class/direction/bounds — never the guest (§6.2).
                 let decl = PHASE_A_DEFAULT_CHANNEL_TABLE
@@ -2296,8 +2296,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_SYS_V2,
         "set_timer",
-        |mut c: Caller<'_, V2Host>, delay_ms: u64| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, delay_ms: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("set_timer")?;
                 let armed_at = c.data().slice.now;
                 let shared = c.data().shared.clone();
@@ -2321,8 +2321,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_SYS_V2,
         "cancel_timer",
-        |mut c: Caller<'_, V2Host>, timer_id: u64| -> Result<u32, wasmtime::Error> {
-            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, timer_id: u64| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("cancel_timer")?;
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
@@ -2355,8 +2355,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_SYS_V2,
         "now",
-        |mut c: Caller<'_, V2Host>| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("now")?;
                 // Slice-constant (§6.5); every reading journaled (the coordinator-replay lesson).
                 let now = c.data().slice.now;
@@ -2373,12 +2373,12 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_SYS_V2,
         "emit_metric",
-        |mut c: Caller<'_, V2Host>,
+        |mut c: Caller<'_, Host>,
          name_ptr: u32,
          name_len: u32,
          value: f64|
          -> Result<(), wasmtime::Error> {
-            let r: Result<(), Trap> = (|c: &mut Caller<'_, V2Host>| {
+            let r: Result<(), Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("emit_metric")?;
                 // Egress only; non-finite / oversize-name → dropped host-side, never a trap (§6.5).
                 if !value.is_finite() || name_len > 128 {
@@ -2397,12 +2397,12 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_SYS_V2,
         "log",
-        |mut c: Caller<'_, V2Host>,
+        |mut c: Caller<'_, Host>,
          level: u32,
          msg_ptr: u32,
          msg_len: u32|
          -> Result<(), wasmtime::Error> {
-            let r: Result<(), Trap> = (|c: &mut Caller<'_, V2Host>| {
+            let r: Result<(), Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("log")?;
                 let msg = String::from_utf8_lossy(&read_guest(c, msg_ptr, msg_len)?).into_owned();
                 let shared = c.data().shared.clone();
@@ -2422,12 +2422,12 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_SYS_V2,
         "hash",
-        |mut c: Caller<'_, V2Host>,
+        |mut c: Caller<'_, Host>,
          in_ptr: u32,
          in_len: u32,
          out_ptr: u32|
          -> Result<u32, wasmtime::Error> {
-            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("hash")?;
                 let data = read_guest(c, in_ptr, in_len)?;
                 let digest = host_crypto_hash(&data);
@@ -2446,13 +2446,13 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_SYS_V2,
         "verify_sig",
-        |mut c: Caller<'_, V2Host>,
+        |mut c: Caller<'_, Host>,
          pk_ptr: u32,
          sig_ptr: u32,
          msg_ptr: u32,
          msg_len: u32|
          -> Result<u32, wasmtime::Error> {
-            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("verify_sig")?;
                 let pk = read_guest(c, pk_ptr, daemon_vhc_proto::VERIFY_PUBLIC_KEY_LEN as u32)?;
                 let sig = read_guest(c, sig_ptr, daemon_vhc_proto::VERIFY_SIGNATURE_LEN as u32)?;
@@ -2469,8 +2469,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_SYS_V2,
         "rng_seed",
-        |mut c: Caller<'_, V2Host>, out_ptr: u32| -> Result<u32, wasmtime::Error> {
-            let r: Result<u32, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, out_ptr: u32| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("rng_seed")?;
                 let seed = c.data().rng_seed;
                 write_guest(c, out_ptr, &seed)?;
@@ -2489,8 +2489,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_SYS_V2,
         "device_profile",
-        |mut c: Caller<'_, V2Host>, out_ptr: u32, out_cap: u32| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, out_ptr: u32, out_cap: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("device_profile")?;
                 // Mandatory-retry rule: after NeedCapacity the re-call must be big enough.
                 if let Some(required) = c.data().slice.pending_device {
@@ -2532,8 +2532,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_COMPUTE_V2,
         "submit_op",
-        |mut c: Caller<'_, V2Host>, op_ptr: u32, op_len: u32| -> Result<(), wasmtime::Error> {
-            let r: Result<(), Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, op_ptr: u32, op_len: u32| -> Result<(), wasmtime::Error> {
+            let r: Result<(), Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("submit_op")?;
                 let op_cbor = read_guest(c, op_ptr, op_len)?;
                 let d = c.data_mut();
@@ -2563,7 +2563,7 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                     .map_err(|e| Trap::new(e.trap_code(), "submit_op", None, e.to_string()))?;
                 d.compute_ops_since_fence += 1;
                 d.compute_ops_total += 1;
-                // The deferred-fault injection seam (V2RunConfig::compute_fault_after_ops).
+                // The deferred-fault injection seam (RunConfig::compute_fault_after_ops).
                 if d.compute_fault_after_ops == Some(d.compute_ops_total - 1) {
                     d.compute
                         .as_mut()
@@ -2580,8 +2580,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_COMPUTE_V2,
         "fence",
-        |mut c: Caller<'_, V2Host>, fence_id: u64| -> Result<(), wasmtime::Error> {
-            let r: Result<(), Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, fence_id: u64| -> Result<(), wasmtime::Error> {
+            let r: Result<(), Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("fence")?;
                 let d = c.data_mut();
                 let Some(compute) = d.compute.as_mut() else {
@@ -2617,8 +2617,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_COMPUTE_V2,
         "export",
-        |mut c: Caller<'_, V2Host>, ir_ptr: u32, ir_len: u32| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, ir_ptr: u32, ir_len: u32| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("export")?;
                 let ir_cbor = read_guest(c, ir_ptr, ir_len)?;
                 let d = c.data_mut();
@@ -2685,8 +2685,8 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     linker.func_wrap(
         NS_COMPUTE_V2,
         "import",
-        |mut c: Caller<'_, V2Host>, buffer: u64, tensor_id: u64| -> Result<u64, wasmtime::Error> {
-            let r: Result<u64, Trap> = (|c: &mut Caller<'_, V2Host>| {
+        |mut c: Caller<'_, Host>, buffer: u64, tensor_id: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("import")?;
                 let shared = c.data().shared.clone();
                 let bytes = {
@@ -2739,7 +2739,7 @@ fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
     // Deterministic firing order (§6.3).
     fired.sort_by_key(|t| (t.fire_at, t.id));
     for t in fired {
-        let ev = EventV2::Timer {
+        let ev = RunEvent::Timer {
             timer_id: t.id,
             fired_at: now,
         };
@@ -2759,7 +2759,7 @@ fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
                     .drop_coalesced(
                         1,
                         daemon_vhc_abi::COALESCE_LATEST_WINS,
-                        crate::v2::journal::Dropped::timer(dropped),
+                        crate::run::journal::Dropped::timer(dropped),
                     )
                     .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
             }
@@ -2780,22 +2780,22 @@ fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
 // -- the run ---------------------------------------------------------------------------------------
 
 /// A live v2 run: the embedder handle plus the guest thread's join handle.
-pub struct V2Run {
+pub struct Run {
     /// The embedder's event/staging/egress handle.
     pub pump: PumpHandle,
-    thread: JoinHandle<Result<RunEnd, V2Error>>,
+    thread: JoinHandle<Result<RunEnd, RunError>>,
 }
 
-impl V2Run {
+impl Run {
     /// Join the guest thread and return how the run ended. The guest thread has already dropped
     /// the `Store` (guest-thread-owned teardown, §11.3) and journaled the terminal fact.
     ///
     /// # Errors
-    /// [`V2Error`] for setup/journaling failures (a trap is a [`RunEnd::Trapped`], not an error).
-    pub fn wait(self) -> Result<RunEnd, V2Error> {
+    /// [`RunError`] for setup/journaling failures (a trap is a [`RunEnd::Trapped`], not an error).
+    pub fn wait(self) -> Result<RunEnd, RunError> {
         self.thread
             .join()
-            .map_err(|_| V2Error::Sandbox("guest thread panicked".into()))?
+            .map_err(|_| RunError::Sandbox("guest thread panicked".into()))?
     }
 
     /// Whether the guest thread has ended (non-blocking): the upgrade transaction's migrate step
@@ -2812,16 +2812,16 @@ impl V2Run {
 /// §9.4 steps 10–12), journaling throughout.
 ///
 /// The caller has already run ABI §1.3 selection (`select_driver` → `CandidateDriver::V2`).
-/// A module importing the retired `tabi@1` bridge is refused typed ([`V2Error::BridgeRetired`]).
+/// A module importing the retired `tabi@1` bridge is refused typed ([`RunError::BridgeRetired`]).
 ///
 /// # Errors
-/// [`V2Error`] on setup/journal failure. Guest traps and init refusals are [`RunEnd`]s.
+/// [`RunError`] on setup/journal failure. Guest traps and init refusals are [`RunEnd`]s.
 pub fn start_run(
     worker: &Worker,
     wasm: &[u8],
-    run: V2RunConfig,
+    run: RunConfig,
     sink: Box<dyn JournalSink>,
-) -> Result<V2Run, V2Error> {
+) -> Result<Run, RunError> {
     start_run_migrating(worker, wasm, run, sink, None)
 }
 
@@ -2833,21 +2833,22 @@ pub fn start_run(
 /// budget exhaustion inside `da_migrate` traps the typed `MigrateBudget`.
 ///
 /// # Errors
-/// [`V2Error`] on setup/journal failure. Guest traps, init refusals, and migrate refusals are
+/// [`RunError`] on setup/journal failure. Guest traps, init refusals, and migrate refusals are
 /// [`RunEnd`]s.
 pub fn start_run_migrating(
     worker: &Worker,
     wasm: &[u8],
-    run: V2RunConfig,
+    run: RunConfig,
     mut sink: Box<dyn JournalSink>,
     migration: Option<MigrationInput>,
-) -> Result<V2Run, V2Error> {
-    let module = Module::new(worker.engine(), wasm).map_err(|e| V2Error::Sandbox(e.to_string()))?;
+) -> Result<Run, RunError> {
+    let module =
+        Module::new(worker.engine(), wasm).map_err(|e| RunError::Sandbox(e.to_string()))?;
     // The retired compute bridge: any tabi@1 import is refused typed here as well as at the
     // §1.3 front door (`validate_imports`), so a caller that skips selection still never links
     // or runs a bridge module.
     if module.imports().any(|i| i.module() == NS_TABI_V1) {
-        return Err(V2Error::BridgeRetired(
+        return Err(RunError::BridgeRetired(
             "the module imports the retired tabi@1 compute bridge — compute crosses the \
              boundary through compute@2 only"
                 .to_string(),
@@ -2921,8 +2922,8 @@ pub fn start_run_migrating(
         shared: shared.clone(),
     };
 
-    let mut linker: Linker<V2Host> = Linker::new(worker.engine());
-    link_v2(&mut linker).map_err(|e| V2Error::Sandbox(e.to_string()))?;
+    let mut linker: Linker<Host> = Linker::new(worker.engine());
+    link_v2(&mut linker).map_err(|e| RunError::Sandbox(e.to_string()))?;
 
     let signing = SigningKey::from_bytes(&run.signing_seed);
     let sender = peer_id(&signing).0;
@@ -2934,8 +2935,8 @@ pub fn start_run_migrating(
             "vhc-guest-{}-{}",
             run.identity.role, run.identity.instance
         ))
-        .spawn(move || -> Result<RunEnd, V2Error> {
-            let host = V2Host {
+        .spawn(move || -> Result<RunEnd, RunError> {
+            let host = Host {
                 shared: shared.clone(),
                 limits: StoreLimitsBuilder::new()
                     .memory_size(engine_cfg.max_memory_bytes)
@@ -2990,12 +2991,12 @@ pub fn start_run_migrating(
             store.limiter(|s| &mut s.limits);
             store
                 .set_fuel(engine_cfg.fuel_per_call)
-                .map_err(|e| V2Error::Sandbox(e.to_string()))?;
+                .map_err(|e| RunError::Sandbox(e.to_string()))?;
             store.set_epoch_deadline(epoch_ticks);
 
             let instance = linker
                 .instantiate(&mut store, &module)
-                .map_err(|e| V2Error::Sandbox(format!("v2 instantiation: {e}")))?;
+                .map_err(|e| RunError::Sandbox(format!("v2 instantiation: {e}")))?;
 
             // tag 13 at instantiation, before any guest code (§8.3/§10.3): counter 0; reason 0
             // (initial) — or reason 2 (upgrade-activation) on a migrating instance, journaled at
@@ -3009,24 +3010,24 @@ pub fn start_run_migrating(
             store.data_mut().slice.now = inst_at;
 
             // Write the admitted config + grants via da_alloc (outside import context, §2.4).
-            let write_span = |store: &mut Store<V2Host>, bytes: &[u8]| -> Result<u32, V2Error> {
+            let write_span = |store: &mut Store<Host>, bytes: &[u8]| -> Result<u32, RunError> {
                 if bytes.is_empty() {
                     return Ok(0);
                 }
                 let alloc = instance
                     .get_typed_func::<(u32, u32), u32>(&mut *store, "da_alloc")
-                    .map_err(|_| V2Error::Sandbox("missing da_alloc".into()))?;
+                    .map_err(|_| RunError::Sandbox("missing da_alloc".into()))?;
                 let ptr = alloc
                     .call(&mut *store, (bytes.len() as u32, 1))
-                    .map_err(|e| V2Error::Sandbox(format!("da_alloc: {e}")))?;
+                    .map_err(|e| RunError::Sandbox(format!("da_alloc: {e}")))?;
                 if ptr == 0 {
-                    return Err(V2Error::Sandbox("da_alloc returned 0".into()));
+                    return Err(RunError::Sandbox("da_alloc returned 0".into()));
                 }
                 let mem = instance
                     .get_memory(&mut *store, "memory")
-                    .ok_or_else(|| V2Error::Sandbox("no exported memory".into()))?;
+                    .ok_or_else(|| RunError::Sandbox("no exported memory".into()))?;
                 mem.write(&mut *store, ptr as usize, bytes)
-                    .map_err(|e| V2Error::Sandbox(format!("config write: {e}")))?;
+                    .map_err(|e| RunError::Sandbox(format!("config write: {e}")))?;
                 Ok(ptr)
             };
             let cfg_ptr = write_span(&mut store, &run.config)?;
@@ -3036,7 +3037,7 @@ pub fn start_run_migrating(
             store.data_mut().slice.in_init = true;
             let da_init = instance
                 .get_typed_func::<(u32, u32, u32, u32), u32>(&mut store, "da_init")
-                .map_err(|_| V2Error::Sandbox("missing/mis-typed da_init".into()))?;
+                .map_err(|_| RunError::Sandbox("missing/mis-typed da_init".into()))?;
             let init_status = match da_init.call(
                 &mut store,
                 (
@@ -3089,17 +3090,17 @@ pub fn start_run_migrating(
                         .collect()
                 };
                 let descriptor = build_migration_descriptor(&mig.capture.manifest, &bindings)
-                    .map_err(|e| V2Error::Sandbox(format!("migration descriptor: {e}")))?;
+                    .map_err(|e| RunError::Sandbox(format!("migration descriptor: {e}")))?;
                 let desc_ptr = write_span(&mut store, &descriptor)?;
 
                 let da_migrate = instance
                     .get_typed_func::<(u32, u32), u32>(&mut store, "da_migrate")
-                    .map_err(|_| V2Error::Sandbox("missing/mis-typed da_migrate".into()))?;
+                    .map_err(|_| RunError::Sandbox("missing/mis-typed da_migrate".into()))?;
                 // The explicit bounded budget (§10.2): fuel + the epoch deadline; exceeding it is
                 // the typed `MigrateBudget` trap and the host rolls back.
                 store
                     .set_fuel(mig.migrate_fuel.unwrap_or(engine_cfg.fuel_per_call))
-                    .map_err(|e| V2Error::Sandbox(e.to_string()))?;
+                    .map_err(|e| RunError::Sandbox(e.to_string()))?;
                 store.set_epoch_deadline(epoch_ticks);
                 store.data_mut().slice.in_migrate = true;
                 let migrate_status =
@@ -3123,7 +3124,7 @@ pub fn start_run_migrating(
                 store.data_mut().slice.in_migrate = false;
                 store
                     .set_fuel(engine_cfg.fuel_per_call)
-                    .map_err(|e| V2Error::Sandbox(e.to_string()))?;
+                    .map_err(|e| RunError::Sandbox(e.to_string()))?;
                 if migrate_status != daemon_vhc_abi::DA_MIGRATE_READY {
                     // Validate failed (§10.3 step 5): journal the fact (a typed condition + the
                     // forced-interruption terminal — the instance never entered da_run) and tear
@@ -3150,7 +3151,7 @@ pub fn start_run_migrating(
             // da_run — exactly once; the module owns its loop from here (§3.1).
             let da_run = instance
                 .get_typed_func::<(), u32>(&mut store, "da_run")
-                .map_err(|_| V2Error::Sandbox("missing/mis-typed da_run".into()))?;
+                .map_err(|_| RunError::Sandbox("missing/mis-typed da_run".into()))?;
             let run_result = da_run.call(&mut store, ());
             {
                 let mut st = shared.state.lock().expect("pump lock");
@@ -3175,14 +3176,14 @@ pub fn start_run_migrating(
                   // thread — the only thread allowed to (§11.3).
             }
         })
-        .map_err(|e| V2Error::Sandbox(format!("guest thread spawn: {e}")))?;
+        .map_err(|e| RunError::Sandbox(format!("guest thread spawn: {e}")))?;
 
-    Ok(V2Run { pump, thread })
+    Ok(Run { pump, thread })
 }
 
 /// Map a wasmtime error into the typed taxonomy: prefer the stashed host trap, else classify the
 /// engine trap (fuel/epoch/unreachable/oob), mirroring the v1 driver's mapping (§7.6).
-fn take_trap(store: &mut Store<V2Host>, e: wasmtime::Error) -> Trap {
+fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
     if let Some(t) = store.data_mut().trap.take() {
         return t;
     }
@@ -3315,7 +3316,7 @@ fn journal_terminal_trap(shared: &Arc<PumpShared>, trap: &Trap) -> Result<(), Si
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::journal::{MemorySink, SinkEntry};
+    use crate::run::journal::{MemorySink, SinkEntry};
     use daemon_vhc_proto::sign::verify_bytes;
 
     fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
@@ -3621,7 +3622,7 @@ mod tests {
         // field host-built. Verify with the plain proto primitives a third party would use.
         let signing = SigningKey::from_bytes(&[9u8; 32]);
         let sender = peer_id(&signing).0;
-        let host = V2Host {
+        let host = Host {
             shared: Arc::new(PumpShared {
                 state: Mutex::new(test_state(Box::new(MemorySink::new()))),
                 wake: Condvar::new(),

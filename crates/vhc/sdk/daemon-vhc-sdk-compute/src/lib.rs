@@ -86,7 +86,7 @@ impl RunnerClient for ComputeClient {
     type Device = ComputeDevice;
 
     fn register_op(&self, op: OperationIr) {
-        daemon_vhc_sdk_v2::compute_submit_op(&ser(&op));
+        daemon_vhc_sdk::compute_submit_op(&ser(&op));
     }
 
     fn read_tensor_async(&self, _tensor: TensorIr) -> DynFut<Result<TensorData, ExecutionError>> {
@@ -119,9 +119,9 @@ impl RunnerClient for ComputeClient {
         let shape = data.shape.clone();
         let dtype = data.dtype;
         let bytes = ser(&data);
-        let buffer = daemon_vhc_sdk_v2::create_from(&bytes);
-        let _op = daemon_vhc_sdk_v2::compute_import(buffer, id);
-        daemon_vhc_sdk_v2::buffer_release(buffer);
+        let buffer = daemon_vhc_sdk::create_from(&bytes);
+        let _op = daemon_vhc_sdk::compute_import(buffer, id);
+        daemon_vhc_sdk::buffer_release(buffer);
         RouterTensor::new(TensorId::new(id), shape, dtype, self.clone())
     }
 
@@ -199,7 +199,7 @@ impl RunnerChannel for ComputeChannel {
 /// Insert a compute-queue fence marker (§3.3): `Event::Fence(fence_id)` delivers when the device
 /// passes it; a deferred device error surfaces at this call as a typed `ComputeFault` trap.
 pub fn fence(fence_id: u64) {
-    daemon_vhc_sdk_v2::compute_fence(fence_id);
+    daemon_vhc_sdk::compute_fence(fence_id);
 }
 
 /// Export a float tensor to a sealed buffer (device → staging, §3.4): returns the `OpId`; the
@@ -210,7 +210,7 @@ pub fn fence(fence_id: u64) {
 pub fn export_tensor<const D: usize>(tensor: burn::tensor::Tensor<HostBackend, D>) -> u64 {
     let primitive = tensor.into_primitive().tensor();
     let ir = primitive.into_ir();
-    daemon_vhc_sdk_v2::compute_export(&ser(&ir))
+    daemon_vhc_sdk::compute_export(&ser(&ir))
 }
 
 /// Decode an exported tensor's `CBOR(TensorData)` bytes (from `read_buffer` over the completion's
@@ -241,7 +241,7 @@ pub fn import_buffer_as_tensor<const D: usize>(
 ) -> burn::tensor::Tensor<HostBackend, D> {
     let client = burn_router::get_client::<ComputeChannel>(&device());
     let id = client.mint();
-    let _op = daemon_vhc_sdk_v2::compute_import(buffer, id);
+    let _op = daemon_vhc_sdk::compute_import(buffer, id);
     let router = RouterTensor::new(TensorId::new(id), data.shape.clone(), data.dtype, client);
     burn::tensor::Tensor::from_primitive(burn::tensor::TensorPrimitive::Float(router))
 }

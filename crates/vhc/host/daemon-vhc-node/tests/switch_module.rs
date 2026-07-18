@@ -26,16 +26,16 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use daemon_vhc_abi::{DEFAULT_CHANNEL_CONTROL_ID, STOP_REASON_RUN_COMPLETE};
-use daemon_vhc_host::v2::{
+use daemon_vhc_host::run::{
     start_run, DeviceProfile, EnvelopeRoleGrants, MemorySink, OwnerPolicy, ParticipationLane,
-    PumpHandle, RunEnd, RunIdentity, V2RunConfig,
+    PumpHandle, RunConfig, RunEnd, RunIdentity,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_node::{VhcError, WorkerControl};
 use daemon_vhc_proto::envelope::{Access, DeviceMinimums};
 use daemon_vhc_proto::genesis::{
     ChannelDecl, EventCap, EventCaps, GenesisEnvelope, Identities, RoleEntry, RoleGrants,
-    RunSectionV2, SnapshotArtifact, TransportSelection, GENESIS_SCHEMA_MAJOR,
+    RunSection, SnapshotArtifact, TransportSelection, GENESIS_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{
     blake3_hash, derive_admitted_quotas, peer_id, to_canonical_vec, AdmittedQuotas, BufferReq,
@@ -201,7 +201,7 @@ struct Scenario {
 /// The owned pieces of the live OLD instance + NEW module admission bundle (moved into
 /// `LiveUpgradeInputs` at switch time; a struct so the borrow of `&Worker` happens only there).
 struct LiveScenarioInputs {
-    old_run: daemon_vhc_host::v2::V2Run,
+    old_run: daemon_vhc_host::run::Run,
     old_pump: PumpHandle,
     old_sink: Arc<Mutex<MemorySink>>,
     old_module: Hash,
@@ -257,7 +257,7 @@ fn build_scenario(worker: &Worker, frames: u64) -> (Scenario, TransitionChain) {
         );
     }
     let genesis = GenesisEnvelope {
-        run: RunSectionV2 {
+        run: RunSection {
             schema: GENESIS_SCHEMA_MAJOR,
             run_label: "switch-module-acceptance".into(),
             min_peers: 1,
@@ -289,7 +289,7 @@ fn build_scenario(worker: &Worker, frames: u64) -> (Scenario, TransitionChain) {
         module: old_module.0,
     };
     let old_grants_bytes = to_canonical_vec(&genesis.roles[role].grants).expect("grants cbor");
-    let mut old_cfg = V2RunConfig::new(old_identity, old_seed, Vec::new(), old_grants_bytes);
+    let mut old_cfg = RunConfig::new(old_identity, old_seed, Vec::new(), old_grants_bytes);
     old_cfg.migration_max_sections = 4;
     old_cfg.migration_max_section_bytes = 1 << 12;
     let old_run =

@@ -7,7 +7,7 @@
 //! This is the HOST half of the verifier: `daemon-vhc-observe`'s `journal::verifier` owns the
 //! typed §8.7 contract (`ReplayPlan` / `run_replay` / `ReplayOutcome`) and stays wasm-free; this
 //! module owns the wasm execution it drives — the dependency direction is observe → host
-//! (dev-side today: the tier-1 lane adapts the two in `tests/v2_replay.rs`), and neither links
+//! (dev-side today: the tier-1 lane adapts the two in `tests/replay.rs`), and neither links
 //! the SDK.
 //!
 //! **Replay semantics (the fixed A1 contract):** re-feeding the recorded inputs reproduces every
@@ -42,11 +42,11 @@ use std::sync::Arc;
 use wasmtime::{Caller, Extern, ExternType, Linker, Memory, Module, Store, Val};
 
 use super::journal::SinkEntry;
+use crate::run::buffer::BufferTable;
+use crate::run::completion::{CompletionResult, SuccessPayload};
+use crate::run::ops::{OpRequest, OpTable};
+use crate::run::RunError;
 use crate::runtime::Worker;
-use crate::v2::buffer::BufferTable;
-use crate::v2::completion::{CompletionResult, SuccessPayload};
-use crate::v2::ops::{OpRequest, OpTable};
-use crate::v2::V2Error;
 
 /// The recorded inputs a replay re-feeds, split by answering mechanism.
 #[derive(Debug, Default, Clone)]
@@ -281,8 +281,8 @@ fn dispatch(
                 // A delivered Completion retires its op and, for a payload_get success,
                 // materializes the completion-minted buffer from the content-addressed payload
                 // table (§8.7 — bulk payloads are re-fetched, never copied into the journal).
-                if let Ok(crate::v2::event::EventV2::Completion { op, result }) =
-                    crate::v2::event::decode_event_frame(&frame.1)
+                if let Ok(crate::run::event::RunEvent::Completion { op, result }) =
+                    crate::run::event::decode_event_frame(&frame.1)
                 {
                     let host = caller.data_mut();
                     host.ops.finish(op);
@@ -436,8 +436,8 @@ fn dispatch(
             let accepted = host.ops.is_outstanding(op)
                 && host.script.events.iter().any(|(_, f)| {
                     matches!(
-                        crate::v2::event::decode_event_frame(f),
-                        Ok(crate::v2::event::EventV2::Completion { op: o, result })
+                        crate::run::event::decode_event_frame(f),
+                        Ok(crate::run::event::RunEvent::Completion { op: o, result })
                             if o == op && result == CompletionResult::cancelled()
                     )
                 });
@@ -765,42 +765,42 @@ pub struct ReplayMigration {
 /// divergence).
 ///
 /// # Errors
-/// [`V2Error`] only for harness-level failures (compile/instantiate/missing exports). Guest-level
+/// [`RunError`] only for harness-level failures (compile/instantiate/missing exports). Guest-level
 /// endings — outcome, init refusal, divergence, trap — are the [`ReplayedRun::end`] variants.
-pub fn replay_v2(
+pub fn replay(
     worker: &Worker,
     wasm: &[u8],
     config: &[u8],
     grants: &[u8],
     script: ReplayScript,
-) -> Result<ReplayedRun, V2Error> {
-    replay_v2_migrating(worker, wasm, config, grants, script, None)
+) -> Result<ReplayedRun, RunError> {
+    replay_migrating(worker, wasm, config, grants, script, None)
 }
 
-/// [`replay_v2`] for an incarnation that entered through an upgrade migration (§10.3 step 4): when
+/// [`replay`] for an incarnation that entered through an upgrade migration (§10.3 step 4): when
 /// `migration` is `Some`, `da_migrate(descriptor)` runs between `da_init` and `da_run`, so the
 /// **full run journal across the upgrade boundary** replays bit-exact — the old incarnation's
-/// prefix under its module via [`replay_v2`], the new incarnation's suffix under its module here.
+/// prefix under its module via [`replay`], the new incarnation's suffix under its module here.
 ///
 /// # Errors
-/// [`V2Error`] only for harness-level failures (compile/instantiate/missing exports); guest-level
+/// [`RunError`] only for harness-level failures (compile/instantiate/missing exports); guest-level
 /// endings are [`ReplayedRun::end`] variants (a non-`Ready` `da_migrate` surfaces as
 /// [`ReplayEnd::Diverged`]).
-pub fn replay_v2_migrating(
+pub fn replay_migrating(
     worker: &Worker,
     wasm: &[u8],
     config: &[u8],
     grants: &[u8],
     script: ReplayScript,
     migration: Option<ReplayMigration>,
-) -> Result<ReplayedRun, V2Error> {
+) -> Result<ReplayedRun, RunError> {
     let module = Module::new(worker.engine(), wasm)
-        .map_err(|e| V2Error::Sandbox(format!("replay compile: {e}")))?;
+        .map_err(|e| RunError::Sandbox(format!("replay compile: {e}")))?;
 
     let mut linker: Linker<ReplayHost> = Linker::new(worker.engine());
     for import in module.imports() {
         let ExternType::Func(func_ty) = import.ty() else {
-            return Err(V2Error::Sandbox(format!(
+            return Err(RunError::Sandbox(format!(
                 "non-function import `{}::{}`",
                 import.module(),
                 import.name()
@@ -818,7 +818,7 @@ pub fn replay_v2_migrating(
                     dispatch(&mut caller, &ns, &name, params, results, &result_types)
                 },
             )
-            .map_err(|e| V2Error::Sandbox(format!("replay link: {e}")))?;
+            .map_err(|e| RunError::Sandbox(format!("replay link: {e}")))?;
     }
 
     let host = ReplayHost {
@@ -842,29 +842,29 @@ pub fn replay_v2_migrating(
     // room to complete and rely on divergence detection for runaway guests.
     store
         .set_fuel(u64::MAX / 2)
-        .map_err(|e| V2Error::Sandbox(e.to_string()))?;
+        .map_err(|e| RunError::Sandbox(e.to_string()))?;
     store.set_epoch_deadline(u64::MAX / 2);
 
     let instance = linker
         .instantiate(&mut store, &module)
-        .map_err(|e| V2Error::Sandbox(format!("replay instantiation: {e}")))?;
+        .map_err(|e| RunError::Sandbox(format!("replay instantiation: {e}")))?;
 
     // Config + grants spans via da_alloc, exactly as the recording driver wrote them (§2.4).
-    let write_span = |store: &mut Store<ReplayHost>, bytes: &[u8]| -> Result<u32, V2Error> {
+    let write_span = |store: &mut Store<ReplayHost>, bytes: &[u8]| -> Result<u32, RunError> {
         if bytes.is_empty() {
             return Ok(0);
         }
         let alloc = instance
             .get_typed_func::<(u32, u32), u32>(&mut *store, "da_alloc")
-            .map_err(|_| V2Error::Sandbox("missing da_alloc".into()))?;
+            .map_err(|_| RunError::Sandbox("missing da_alloc".into()))?;
         let ptr = alloc
             .call(&mut *store, (bytes.len() as u32, 1))
-            .map_err(|e| V2Error::Sandbox(format!("da_alloc: {e}")))?;
+            .map_err(|e| RunError::Sandbox(format!("da_alloc: {e}")))?;
         let mem = instance
             .get_memory(&mut *store, "memory")
-            .ok_or_else(|| V2Error::Sandbox("no exported memory".into()))?;
+            .ok_or_else(|| RunError::Sandbox("no exported memory".into()))?;
         mem.write(&mut *store, ptr as usize, bytes)
-            .map_err(|e| V2Error::Sandbox(format!("span write: {e}")))?;
+            .map_err(|e| RunError::Sandbox(format!("span write: {e}")))?;
         Ok(ptr)
     };
     let cfg_ptr = write_span(&mut store, config)?;
@@ -888,7 +888,7 @@ pub fn replay_v2_migrating(
 
     let da_init = instance
         .get_typed_func::<(u32, u32, u32, u32), u32>(&mut store, "da_init")
-        .map_err(|_| V2Error::Sandbox("missing/mis-typed da_init".into()))?;
+        .map_err(|_| RunError::Sandbox("missing/mis-typed da_init".into()))?;
     match da_init.call(
         &mut store,
         (
@@ -921,11 +921,11 @@ pub fn replay_v2_migrating(
             .collect();
         let descriptor =
             super::driver::build_migration_descriptor(&mig.capture.manifest, &bindings)
-                .map_err(|e| V2Error::Sandbox(format!("replay migration descriptor: {e}")))?;
+                .map_err(|e| RunError::Sandbox(format!("replay migration descriptor: {e}")))?;
         let desc_ptr = write_span(&mut store, &descriptor)?;
         let da_migrate = instance
             .get_typed_func::<(u32, u32), u32>(&mut store, "da_migrate")
-            .map_err(|_| V2Error::Sandbox("missing/mis-typed da_migrate".into()))?;
+            .map_err(|_| RunError::Sandbox("missing/mis-typed da_migrate".into()))?;
         match da_migrate.call(&mut store, (desc_ptr, descriptor.len() as u32)) {
             Ok(daemon_vhc_abi::DA_MIGRATE_READY) => {}
             Ok(status) => {
@@ -944,7 +944,7 @@ pub fn replay_v2_migrating(
 
     let da_run = instance
         .get_typed_func::<(), u32>(&mut store, "da_run")
-        .map_err(|_| V2Error::Sandbox("missing/mis-typed da_run".into()))?;
+        .map_err(|_| RunError::Sandbox("missing/mis-typed da_run".into()))?;
     match da_run.call(&mut store, ()) {
         Ok(outcome) => finish(store, ReplayEnd::Outcome(outcome)),
         Err(e) => {

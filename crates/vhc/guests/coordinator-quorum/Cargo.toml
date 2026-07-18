@@ -20,9 +20,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-# The major-2 event loop: `main!` exports, the `V2Module` trait, and the raw `vhc@2`/`net@2`/`sys@2`
+# The major-2 event loop: `main!` exports, the `GuestModule` trait, and the raw `vhc@2`/`net@2`/`sys@2`
 # bindings (next_event / publish / set_timer — the Phase-A closed subset, ABI §6.1).
-daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
+daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk" }
 # The coordinator driver (`tick` / `tick_authenticated`) + its serde-CBOR state, plus the shared
 # assignment math. wasm32-clean by construction (proto + serde only).
 daemon-vhc-sdk-consensus = { path = "../../sdk/daemon-vhc-sdk-consensus" }

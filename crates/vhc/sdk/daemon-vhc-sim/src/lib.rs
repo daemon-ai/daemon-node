@@ -31,7 +31,7 @@
 //!
 //! The callback event-handler shape (rather than the wasm loop's blocking `next_event` pull) is the
 //! deterministic single-threaded native form; the same *algorithm* ships as a wasm blob (run under
-//! the testkit) authored against `daemon-vhc-sdk-v2`'s raw event loop.
+//! the testkit) authored against `daemon-vhc-sdk`'s raw event loop.
 
 pub mod backend;
 pub mod clock;
@@ -47,7 +47,7 @@ pub use sim::{PublishedFrame, RunLimits, RunTranscript, SimCtx, SimEvent, SimMod
 /// vhc-sim consumer links one crate. Re-exports (not just deps) so the dependency-direction gate
 /// sees these `sdk/* -> sdk/*` edges as used.
 pub mod drivers {
-    pub use daemon_vhc_sdk_rounds::*;
     #[doc(inline)]
-    pub use daemon_vhc_sdk_v2 as v2;
+    pub use daemon_vhc_sdk as sdk;
+    pub use daemon_vhc_sdk_rounds::*;
 }

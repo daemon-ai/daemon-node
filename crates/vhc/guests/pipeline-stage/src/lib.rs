@@ -24,10 +24,10 @@
 //!
 //! Config (raw bytes): `[role, n_chunks, chunk_len, peer_id[32]]` (`chunk_len` = f32 elements).
 
+use daemon_vhc_sdk::{GuestModule, ModuleDecl};
 use daemon_vhc_sdk_compute::{
     decode_tensor_data, export_tensor, import_buffer_as_tensor, tensor_from_floats,
 };
-use daemon_vhc_sdk_v2::{ModuleDecl, V2Module};
 
 const EV_STOP: u64 = 4;
 const EV_COMPLETION: u64 = 6;
@@ -46,7 +46,7 @@ fn chunk_floats(i: u8, len: u8) -> Vec<f32> {
         .collect()
 }
 
-impl V2Module for Pipeline {
+impl GuestModule for Pipeline {
     fn decl() -> ModuleDecl {
         ModuleDecl {
             name: "pipeline-stage",
@@ -83,10 +83,10 @@ impl V2Module for Pipeline {
     }
 }
 
-daemon_vhc_sdk_v2::main!(Pipeline);
+daemon_vhc_sdk::main!(Pipeline);
 
 /// Decode a completion frame's `(op, ok, uint-or-unit payload)`.
-fn completion_parts(ev: &daemon_vhc_sdk_v2::Event) -> (u64, bool, u64) {
+fn completion_parts(ev: &daemon_vhc_sdk::Event) -> (u64, bool, u64) {
     let op = ev.uint(1);
     let (mut ok, mut value) = (false, 0u64);
     if let Some(ciborium::value::Value::Array(result)) = ev.items.get(2) {
@@ -106,7 +106,7 @@ fn completion_parts(ev: &daemon_vhc_sdk_v2::Event) -> (u64, bool, u64) {
 /// Stage A: open → export every chunk tensor → write ALL exported buffers (over-credit on
 /// purpose) → publish "sent".
 fn produce(st: &Pipeline) -> u32 {
-    let open_op = daemon_vhc_sdk_v2::stream_open(&st.peer);
+    let open_op = daemon_vhc_sdk::stream_open(&st.peer);
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     let mut stream = 0u64;
     // export op → chunk index; exported buffers by chunk index (write order must be chunk order).
@@ -115,14 +115,14 @@ fn produce(st: &Pipeline) -> u32 {
     let mut writes_pending: Vec<u64> = Vec::new();
     let mut done = false;
     loop {
-        let ev = daemon_vhc_sdk_v2::next_event(&mut buf);
+        let ev = daemon_vhc_sdk::next_event(&mut buf);
         match ev.tag {
             EV_STOP => return 0,
             EV_COMPLETION => {
                 let (op, ok, value) = completion_parts(&ev);
                 if op == open_op {
                     if !ok {
-                        daemon_vhc_sdk_v2::publish(0, b"open-failed");
+                        daemon_vhc_sdk::publish(0, b"open-failed");
                         continue;
                     }
                     stream = value;
@@ -138,7 +138,7 @@ fn produce(st: &Pipeline) -> u32 {
                     }
                 } else if let Some(idx) = export_ops.iter().position(|e| *e == op) {
                     if !ok {
-                        daemon_vhc_sdk_v2::publish(0, b"export-failed");
+                        daemon_vhc_sdk::publish(0, b"export-failed");
                         continue;
                     }
                     exported[idx] = Some(value);
@@ -146,19 +146,19 @@ fn produce(st: &Pipeline) -> u32 {
                         // ALL writes back to back: the surplus beyond the credit window is held
                         // host-side and completes as the consumer reads (§3.3 — the pin).
                         for b in exported.iter().flatten() {
-                            writes_pending.push(daemon_vhc_sdk_v2::stream_write(stream, *b));
-                            daemon_vhc_sdk_v2::buffer_release(*b);
+                            writes_pending.push(daemon_vhc_sdk::stream_write(stream, *b));
+                            daemon_vhc_sdk::buffer_release(*b);
                         }
                     }
                 } else if let Some(pos) = writes_pending.iter().position(|w| *w == op) {
                     if !ok {
-                        daemon_vhc_sdk_v2::publish(0, b"write-failed");
+                        daemon_vhc_sdk::publish(0, b"write-failed");
                         continue;
                     }
                     writes_pending.remove(pos);
                     if writes_pending.is_empty() && !done {
                         done = true;
-                        daemon_vhc_sdk_v2::publish(0, b"sent");
+                        daemon_vhc_sdk::publish(0, b"sent");
                     }
                 }
             }
@@ -170,7 +170,7 @@ fn produce(st: &Pipeline) -> u32 {
 /// Stage B: accept → per chunk: read → re-import as a device tensor → double on-device →
 /// export → accumulate the doubled bytes → seal + payload_put → publish its hash.
 fn consume(st: &Pipeline) -> u32 {
-    let accept_op = daemon_vhc_sdk_v2::stream_accept();
+    let accept_op = daemon_vhc_sdk::stream_accept();
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     let mut stream = 0u64;
     let mut read_op = 0u64;
@@ -179,44 +179,44 @@ fn consume(st: &Pipeline) -> u32 {
     let mut received: Vec<u8> = Vec::new();
     let mut chunks_done = 0u8;
     loop {
-        let ev = daemon_vhc_sdk_v2::next_event(&mut buf);
+        let ev = daemon_vhc_sdk::next_event(&mut buf);
         match ev.tag {
             EV_STOP => return 0,
             EV_COMPLETION => {
                 let (op, ok, value) = completion_parts(&ev);
                 if op == accept_op {
                     if !ok {
-                        daemon_vhc_sdk_v2::publish(0, b"accept-failed");
+                        daemon_vhc_sdk::publish(0, b"accept-failed");
                         continue;
                     }
                     stream = value;
-                    read_op = daemon_vhc_sdk_v2::stream_read(stream);
+                    read_op = daemon_vhc_sdk::stream_read(stream);
                 } else if op == read_op {
                     if !ok {
-                        daemon_vhc_sdk_v2::publish(0, b"read-failed");
+                        daemon_vhc_sdk::publish(0, b"read-failed");
                         continue;
                     }
                     // The received buffer IS an exported tensor: re-import it as a device
                     // tensor, transform on-device, and export the result (§3.4).
-                    let data = decode_tensor_data(&daemon_vhc_sdk_v2::read_buffer(value));
+                    let data = decode_tensor_data(&daemon_vhc_sdk::read_buffer(value));
                     let t = import_buffer_as_tensor::<1>(value, &data);
-                    daemon_vhc_sdk_v2::buffer_release(value);
+                    daemon_vhc_sdk::buffer_release(value);
                     export_op = export_tensor(t.mul_scalar(2.0_f32));
                 } else if op == export_op {
                     if !ok {
-                        daemon_vhc_sdk_v2::publish(0, b"re-export-failed");
+                        daemon_vhc_sdk::publish(0, b"re-export-failed");
                         continue;
                     }
-                    received.extend(daemon_vhc_sdk_v2::read_buffer(value));
-                    daemon_vhc_sdk_v2::buffer_release(value);
+                    received.extend(daemon_vhc_sdk::read_buffer(value));
+                    daemon_vhc_sdk::buffer_release(value);
                     chunks_done += 1;
                     if chunks_done < st.n_chunks {
-                        read_op = daemon_vhc_sdk_v2::stream_read(stream);
+                        read_op = daemon_vhc_sdk::stream_read(stream);
                     } else {
                         // Commit the device-transformed content, content-addressed.
-                        let sealed = daemon_vhc_sdk_v2::create_from(&received);
-                        put_op = daemon_vhc_sdk_v2::payload_put(sealed);
-                        daemon_vhc_sdk_v2::buffer_release(sealed);
+                        let sealed = daemon_vhc_sdk::create_from(&received);
+                        put_op = daemon_vhc_sdk::payload_put(sealed);
+                        daemon_vhc_sdk::buffer_release(sealed);
                     }
                 } else if op == put_op {
                     // Publish the commitment hash of everything received-and-doubled.
@@ -227,7 +227,7 @@ fn consume(st: &Pipeline) -> u32 {
                         },
                         _ => Vec::new(),
                     };
-                    daemon_vhc_sdk_v2::publish(0, &hash);
+                    daemon_vhc_sdk::publish(0, &hash);
                 }
             }
             _ => {}

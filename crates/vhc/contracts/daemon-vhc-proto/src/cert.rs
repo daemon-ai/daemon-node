@@ -15,7 +15,7 @@
 //! change any frame-envelope field (the fields that give a Phase-A sequence its evidentiary meaning
 //! are frozen at A2). The **old verifier is retained**: a receiver still verifies the frame
 //! signature over `sender` exactly as A2 did ([`crate::sign::verify_bytes`] /
-//! `daemon-vhc-session::v2_attach`); the certificate check is an *additional* layer that
+//! `daemon-vhc-session::attach`); the certificate check is an *additional* layer that
 //! authenticates the `sender` per-run key to the base identity. A receiver that holds no cert store
 //! keeps the A2 behavior unchanged (the transition path).
 //!

@@ -37,12 +37,12 @@ pub mod seam;
 // migrate → validate → activate locally → rollback-and-retry-or-leave. Composes the committed
 // transition chain (`daemon_vhc_proto::TransitionChain`, deliverable 1); the wasm-guest step
 // adapters and drills live in the host testkit.
+pub mod attach;
 pub mod upgrade;
-pub mod v2_attach;
 // `wasm_backend` (the v1 five-phase driver's TrainerBackend binding, moved here at the A2
 // inversion) RETIRED at the Phase-E v1 sunset (decisions D5) together with the host's Instance
 // lifecycle: the trait seam + `StubBackend` remain (the harness/checkpoint/cold-join substrate);
-// no wasm TrainerBackend exists — major-2 modules run under the v2 event-loop driver.
+// no wasm TrainerBackend exists — major-2 modules run under the event-loop driver.
 
 /// In-process multi-peer harness + the churn/failure drill machinery, driven by the production
 /// coordinator through the [`coordinator_shell`] recording drive. Available to external

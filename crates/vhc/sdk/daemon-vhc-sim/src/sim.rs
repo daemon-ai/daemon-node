@@ -55,7 +55,7 @@ pub enum SimEvent {
 }
 
 /// A native module driven by the simulator — the SDK-side authoring shape (the wasm blob authors
-/// the same algorithm against `daemon-vhc-sdk-v2`'s raw event loop instead).
+/// the same algorithm against `daemon-vhc-sdk`'s raw event loop instead).
 pub trait SimModule {
     /// Called once at logical time 0 before any event (the `da_run` prologue, ABI §3.1): arm the
     /// first timer, subscribe, publish an opening frame.

@@ -7,7 +7,7 @@
 //! A small, deliberately **non-LLaMA** model — a two-layer MLP (`relu(x·W1)·W2`, sum-of-squares
 //! loss) trained by hand-rolled SGD — authored as an ordinary Burn model over
 //! `daemon-vhc-sdk-compute`'s `Autodiff<HostBackend>`. Its ENTIRE dependency surface is
-//! `daemon-vhc-sdk-compute` + `daemon-vhc-sdk-v2`: no LLaMA silhouette, no SDK model code, and —
+//! `daemon-vhc-sdk-compute` + `daemon-vhc-sdk`: no LLaMA silhouette, no SDK model code, and —
 //! the point of the lane — **no host edit**. It runs against the same `compute@2` runner, driver,
 //! and journal the `tiny-llama` reference does, proving the compute ABI is model-agnostic (the op
 //! stream is `CBOR(burn_ir::OperationIr)` blobs the host dispatches by shape, never by model).
@@ -30,8 +30,8 @@
 //! and the exported weight is consumed by `export`.
 
 use burn::tensor::{Tensor, TensorData};
+use daemon_vhc_sdk::{GuestModule, ModuleDecl};
 use daemon_vhc_sdk_compute::{device, export_tensor, fence, AutodiffHostBackend, HostBackend};
-use daemon_vhc_sdk_v2::{ModuleDecl, V2Module};
 
 const EV_FENCE: u64 = 5;
 const EV_COMPLETION: u64 = 6;
@@ -68,7 +68,7 @@ fn params() -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     (x, y, w1, w2)
 }
 
-impl V2Module for ToyMlp {
+impl GuestModule for ToyMlp {
     fn decl() -> ModuleDecl {
         ModuleDecl {
             name: "toy-mlp",
@@ -95,7 +95,7 @@ impl V2Module for ToyMlp {
     }
 }
 
-daemon_vhc_sdk_v2::main!(ToyMlp);
+daemon_vhc_sdk::main!(ToyMlp);
 
 /// Train the MLP for `steps` SGD steps and publish the trained `W1` through the fence → export →
 /// completion → read path.
@@ -140,7 +140,7 @@ fn train_and_publish(steps: u8) -> u32 {
     let mut export_op = 0u64;
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     loop {
-        let ev = daemon_vhc_sdk_v2::next_event(&mut buf);
+        let ev = daemon_vhc_sdk::next_event(&mut buf);
         match ev.tag {
             EV_FENCE if ev.uint(1) == 1 => {
                 export_op = export_tensor(export_me.take().expect("fence delivers once"));
@@ -154,7 +154,7 @@ fn train_and_publish(steps: u8) -> u32 {
                     .and_then(|v| v.as_integer())
                     .is_some_and(|n| i128::from(n) == 0);
                 if !ok {
-                    daemon_vhc_sdk_v2::publish(0, b"export-failed");
+                    daemon_vhc_sdk::publish(0, b"export-failed");
                     return 18;
                 }
                 let handle = result
@@ -162,9 +162,9 @@ fn train_and_publish(steps: u8) -> u32 {
                     .and_then(|v| v.as_integer())
                     .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))
                     .unwrap_or(0);
-                let bytes = daemon_vhc_sdk_v2::read_buffer(handle);
-                daemon_vhc_sdk_v2::buffer_release(handle);
-                daemon_vhc_sdk_v2::publish(0, &bytes);
+                let bytes = daemon_vhc_sdk::read_buffer(handle);
+                daemon_vhc_sdk::buffer_release(handle);
+                daemon_vhc_sdk::publish(0, &bytes);
             }
             EV_STOP => return 0,
             _ => {}

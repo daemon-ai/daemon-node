@@ -23,9 +23,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
 
 use daemon_vhc_abi::AbiRefusalCode;
-use daemon_vhc_host::v2::{
-    admit_v2, start_run, DeviceProfile, MemorySink, OwnerPolicy, ParticipationLane, RunEnd,
-    RunIdentity, V2RunConfig,
+use daemon_vhc_host::run::{
+    admit, start_run, DeviceProfile, MemorySink, OwnerPolicy, ParticipationLane, RunConfig, RunEnd,
+    RunIdentity,
 };
 use daemon_vhc_host::{EngineConfig, TrapCode, Worker};
 
@@ -122,7 +122,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
     let w = worker();
     let cfg = vec![0u8, 0u8]; // mode 0
 
-    let admission = admit_v2(
+    let admission = admit(
         &w,
         &wasm,
         Some(blake3::hash(&wasm).as_bytes()),
@@ -141,7 +141,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
     assert!(!admission.manifest_bytes.is_empty());
 
     // Determinism (§9.2): a whole second assessment yields byte-identical claim bytes.
-    let again = admit_v2(
+    let again = admit(
         &w,
         &wasm,
         None,
@@ -157,7 +157,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
     assert_eq!(admission.claim_bytes, again.claim_bytes);
 
     // The admitted claim wires into the run: header bytes + the enforced hard cap.
-    let mut run_cfg = V2RunConfig::new(identity(&wasm, 1), [0x61; 32], cfg, Vec::new());
+    let mut run_cfg = RunConfig::new(identity(&wasm, 1), [0x61; 32], cfg, Vec::new());
     run_cfg.claim_bytes = admission.claim_bytes.clone();
     run_cfg.manifest_bytes = admission.manifest_bytes.clone();
     run_cfg.hard_accountable_host_bytes = admission.claim.hard_accountable.host;
@@ -184,7 +184,7 @@ fn over_claim_rejected_against_owner_policy() {
         vram_cap_bytes: 1 << 30,
         host_cap_bytes: 0,
     };
-    let err = admit_v2(
+    let err = admit(
         &worker(),
         &wasm,
         None,
@@ -209,7 +209,7 @@ fn claim_outside_lane_bounds_refused() {
     let wasm = test_claim_wasm();
     // Mode 4 param 8: 8 GiB device claim > the lane's 4 GiB bound — refused at stage 4 (before
     // any owner judgment), also ClaimExceedsPolicy but naming the lane.
-    let err = admit_v2(
+    let err = admit(
         &worker(),
         &wasm,
         None,
@@ -232,7 +232,7 @@ fn claim_outside_lane_bounds_refused() {
 #[test]
 fn inconsistent_claim_refused() {
     let wasm = test_claim_wasm();
-    let err = admit_v2(
+    let err = admit(
         &worker(),
         &wasm,
         None,
@@ -254,7 +254,7 @@ fn inconsistent_claim_refused() {
 #[test]
 fn manifest_channel_beyond_table_refused_grants_exceed_lane() {
     let wasm = test_claim_wasm();
-    let err = admit_v2(
+    let err = admit(
         &worker(),
         &wasm,
         None,
@@ -279,7 +279,7 @@ fn under_claim_traps_attributably_at_the_hard_cap() {
     let wasm = test_claim_wasm();
     let w = worker();
     let cfg = vec![3u8, 0u8]; // mode 3: claims 512 B hard host, stages 4096 B
-    let admission = admit_v2(
+    let admission = admit(
         &w,
         &wasm,
         None,
@@ -294,7 +294,7 @@ fn under_claim_traps_attributably_at_the_hard_cap() {
     .expect("the under-claimer's CLAIM is well-formed and within bounds — it admits");
     assert_eq!(admission.claim.hard_accountable.host, 512);
 
-    let mut run_cfg = V2RunConfig::new(identity(&wasm, 2), [0x62; 32], cfg, Vec::new());
+    let mut run_cfg = RunConfig::new(identity(&wasm, 2), [0x62; 32], cfg, Vec::new());
     run_cfg.claim_bytes = admission.claim_bytes;
     run_cfg.hard_accountable_host_bytes = admission.claim.hard_accountable.host;
     let sink = Arc::new(Mutex::new(MemorySink::new()));
@@ -315,7 +315,7 @@ fn under_claim_traps_attributably_at_the_hard_cap() {
     let entries = &sink.lock().expect("sink").entries;
     assert!(entries
         .iter()
-        .any(|e| matches!(e, daemon_vhc_host::v2::SinkEntry::Terminal { kind: 1, .. })));
+        .any(|e| matches!(e, daemon_vhc_host::run::SinkEntry::Terminal { kind: 1, .. })));
 }
 
 // -- D3 device-min admission pre-screen, admission side: the additive `device_min` pre-screen (funnel stage 3) ------------
@@ -333,7 +333,7 @@ fn device_below_envelope_minimums_refuses_at_stage_3() {
         ..daemon_vhc_proto::DeviceMinimums::default()
     };
     // Garbage wasm proves stage order: stage 3 must refuse before stage 4 ever sees the bytes.
-    let err = admit_v2(
+    let err = admit(
         &worker(),
         b"not wasm",
         None,
@@ -357,7 +357,7 @@ fn gpu_required_by_envelope_refuses_on_gpu_less_device() {
         gpu: Some(2),
         ..daemon_vhc_proto::DeviceMinimums::default()
     };
-    let err = admit_v2(
+    let err = admit(
         &worker(),
         b"not wasm",
         None,
@@ -385,7 +385,7 @@ fn device_meeting_envelope_minimums_admits_the_module() {
         disk_bytes: Some(1 << 30),
         ..daemon_vhc_proto::DeviceMinimums::default()
     };
-    let admission = admit_v2(
+    let admission = admit(
         &worker(),
         &wasm,
         Some(blake3::hash(&wasm).as_bytes()),

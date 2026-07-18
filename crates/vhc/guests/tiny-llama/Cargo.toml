@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
+daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk" }
 # The guest-side Burn compute tier: Autodiff<HostBackend> over the compute@2 shim (C1).
 daemon-vhc-sdk-compute = { path = "../../sdk/daemon-vhc-sdk-compute" }
 # The re-expressed comm/optimizer profiles (C3a): det-lane ingest runs IN-GUEST with zero host

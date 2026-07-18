@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use ciborium::value::Value;
 
 use daemon_vhc_abi::{CandidateDriver, STOP_REASON_RUN_COMPLETE};
-use daemon_vhc_host::v2::{start_run, DeliverVerdict, MemorySink, RunIdentity, V2RunConfig};
+use daemon_vhc_host::run::{start_run, DeliverVerdict, MemorySink, RunConfig, RunIdentity};
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_observe::{CoordinatorSandbox, ReplayError};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, SignedMessage, VhcMessage};
@@ -108,7 +108,7 @@ impl CoordinatorSandbox for SandboxedCoordinator {
         let key_seed = *blake3::hash(FRAME_KEY_SEED).as_bytes();
         let config = guest_config(initial)?;
         let sink = std::sync::Arc::new(std::sync::Mutex::new(MemorySink::new()));
-        let run_cfg = V2RunConfig::new(identity, key_seed, config, Vec::new());
+        let run_cfg = RunConfig::new(identity, key_seed, config, Vec::new());
         let run = start_run(&engine, &self.wasm, run_cfg, Box::new(sink))
             .map_err(|e| sandbox(format!("coordinator start_run: {e}")))?;
         let pump = run.pump.clone();

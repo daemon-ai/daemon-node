@@ -319,15 +319,15 @@ fn hex_prefix(b: &[u8; 32]) -> String {
 /// The attach itself: verification above the pump, delivery below it. `deliver` returns the
 /// verdict either way — only `Deliver` reaches the pump, with the original signed frame as the
 /// tag-12 evidence the driver journals.
-pub struct V2Attach {
+pub struct Attach {
     frames: InboundFrames,
-    pump: daemon_vhc_host::v2::PumpHandle,
+    pump: daemon_vhc_host::run::PumpHandle,
 }
 
-impl V2Attach {
+impl Attach {
     /// Attach the verifier in front of a running v2 pump.
     #[must_use]
-    pub fn new(run_id: [u8; 32], epoch: u64, pump: daemon_vhc_host::v2::PumpHandle) -> Self {
+    pub fn new(run_id: [u8; 32], epoch: u64, pump: daemon_vhc_host::run::PumpHandle) -> Self {
         Self {
             frames: InboundFrames::new(run_id, epoch),
             pump,
@@ -337,7 +337,7 @@ impl V2Attach {
     /// Verify + (iff verified, first-sighted, in-sequence) deliver one inbound wire frame.
     ///
     /// The pump's reliable class is bounded and back-pressures rather than drops (§4.7): on a
-    /// [`daemon_vhc_host::v2::DeliverVerdict::SpoolFull`]/`SenderQuota` verdict this seam
+    /// [`daemon_vhc_host::run::DeliverVerdict::SpoolFull`]/`SenderQuota` verdict this seam
     /// **rewinds the sender's sequence cursor** and returns [`InboundVerdict::Backpressure`], so
     /// the caller's retry of the very same frame is in-sequence again — never a duplicate, never
     /// a silent skip.
@@ -347,7 +347,7 @@ impl V2Attach {
     pub fn deliver(
         &mut self,
         frame: &[u8],
-    ) -> Result<InboundVerdict, daemon_vhc_host::v2::SinkError> {
+    ) -> Result<InboundVerdict, daemon_vhc_host::run::SinkError> {
         let verdict = self.frames.accept(frame);
         if let InboundVerdict::Deliver {
             channel,
@@ -364,9 +364,9 @@ impl V2Attach {
                 frame.to_vec(),
             )?;
             match pump_verdict {
-                daemon_vhc_host::v2::DeliverVerdict::Accepted => {}
-                daemon_vhc_host::v2::DeliverVerdict::SpoolFull
-                | daemon_vhc_host::v2::DeliverVerdict::SenderQuota => {
+                daemon_vhc_host::run::DeliverVerdict::Accepted => {}
+                daemon_vhc_host::run::DeliverVerdict::SpoolFull
+                | daemon_vhc_host::run::DeliverVerdict::SenderQuota => {
                     // Held, not delivered: rewind so the retry is in-sequence (§4.7).
                     self.frames.rewind(*sender, *channel);
                     return Ok(InboundVerdict::Backpressure {
@@ -375,7 +375,7 @@ impl V2Attach {
                         seq: *seq,
                     });
                 }
-                daemon_vhc_host::v2::DeliverVerdict::FrameTooLarge => {
+                daemon_vhc_host::run::DeliverVerdict::FrameTooLarge => {
                     return Ok(InboundVerdict::Malformed(
                         "frame exceeds the channel's max_frame_bytes".into(),
                     ));

@@ -35,14 +35,12 @@
 
 use daemon_vhc_abi::{EV_TAG_FRAME, EV_TAG_QUIESCE, EV_TAG_STOP, EV_TAG_TIMER};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId, VhcMessage};
+use daemon_vhc_sdk::migrate::{build_manifest, MigrationDescriptor, OwnedSection, SectionReader};
+use daemon_vhc_sdk::module::{GuestModule, ModuleDecl};
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, tick_authenticated, CoordinatorState, Input, Output,
 };
 use daemon_vhc_sdk_consensus::{Authorized, DEFAULT_RECORDS_CHANNEL};
-use daemon_vhc_sdk_v2::migrate::{
-    build_manifest, MigrationDescriptor, OwnedSection, SectionReader,
-};
-use daemon_vhc_sdk_v2::module::{ModuleDecl, V2Module};
 use serde::Deserialize;
 
 /// The one state-manifest section a coordinator snapshot declares: its whole `CoordinatorState`,
@@ -110,7 +108,7 @@ impl Coordinator {
             class: 0, // consensus-canonical (the published-decision-bearing state)
             bytes: state_bytes,
         };
-        let _staging_id = daemon_vhc_sdk_v2::stage_state(&section.bytes);
+        let _staging_id = daemon_vhc_sdk::stage_state(&section.bytes);
         // `module` is zeroed — a module cannot hash its own bytes; the host verifies the section
         // by content hash before staging (the §10.2 discipline the trainer follows too).
         let manifest = build_manifest(
@@ -121,7 +119,7 @@ impl Coordinator {
         let Ok(manifest_bytes) = to_canonical_vec(&manifest) else {
             return MIGRATE_INCOMPATIBLE;
         };
-        if daemon_vhc_sdk_v2::snapshot_state(&manifest_bytes) != 0 {
+        if daemon_vhc_sdk::snapshot_state(&manifest_bytes) != 0 {
             return MIGRATE_INCOMPATIBLE;
         }
         OUTCOME_QUIESCE_READY
@@ -133,14 +131,14 @@ impl Coordinator {
         for o in outputs {
             if let Output::Publish(msg) = o {
                 if let Ok(bytes) = to_canonical_vec(&**msg) {
-                    daemon_vhc_sdk_v2::abi::publish(self.control_channel, &bytes);
+                    daemon_vhc_sdk::abi::publish(self.control_channel, &bytes);
                 }
             }
         }
     }
 }
 
-impl V2Module for Coordinator {
+impl GuestModule for Coordinator {
     fn decl() -> ModuleDecl {
         ModuleDecl {
             name: "coordinator-quorum",
@@ -203,10 +201,10 @@ impl V2Module for Coordinator {
         let proto_version = self.state.config.proto_version;
         let mut buf: Vec<u8> = Vec::with_capacity(512);
         if self.tick_period_ms > 0 {
-            daemon_vhc_sdk_v2::abi::set_timer(self.tick_period_ms);
+            daemon_vhc_sdk::abi::set_timer(self.tick_period_ms);
         }
         loop {
-            let ev = daemon_vhc_sdk_v2::abi::next_event(&mut buf);
+            let ev = daemon_vhc_sdk::abi::next_event(&mut buf);
             match ev.tag {
                 t if t == EV_TAG_FRAME => {
                     let channel = ev.uint(1);
@@ -242,7 +240,7 @@ impl V2Module for Coordinator {
                 t if t == EV_TAG_TIMER => {
                     self.advance_clock();
                     if self.tick_period_ms > 0 {
-                        daemon_vhc_sdk_v2::abi::set_timer(self.tick_period_ms);
+                        daemon_vhc_sdk::abi::set_timer(self.tick_period_ms);
                     }
                 }
                 // Terminal: a clean stop returns Ok promptly (no un-snapshotted durable state).
@@ -258,4 +256,4 @@ impl V2Module for Coordinator {
     }
 }
 
-daemon_vhc_sdk_v2::main!(Coordinator);
+daemon_vhc_sdk::main!(Coordinator);

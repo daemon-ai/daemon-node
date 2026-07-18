@@ -6,7 +6,7 @@
 //! Admission is a funnel **ordered by cost and bracketed by the owner at both ends**: cheap local
 //! policy gates first, the claim-dependent resource authorization last. No later stage runs before
 //! an earlier one passes; nothing before stage 4 fetches or executes guest code (refactor
-//! invariant 8). [`admit_v2`] implements the stages for the major-2 path — the only admission
+//! invariant 8). [`admit`] implements the stages for the major-2 path — the only admission
 //! path since the Phase-E sunset retired the v1 driver's autotune-based admission.
 //!
 //! ## The Phase-A pre-screen branch (recorded determination — decisions D3 device-min admission pre-screen / D7; ABI §9.3)
@@ -142,7 +142,7 @@ impl ParticipationLane {
                 max_live_bytes: 1 << 30,
                 max_readback_bytes: 64 << 20,
                 max_outstanding_ops: 256,
-                // The compute@2 queue-depth ceiling (C1; mirrors the `V2RunConfig` default).
+                // The compute@2 queue-depth ceiling (C1; mirrors the `RunConfig` default).
                 compute_queue_depth: 1024,
                 // The worlds a Trainer-lane role may be granted (§9.6: all four capability
                 // worlds; `vhc` loop mechanics always).
@@ -235,7 +235,7 @@ impl EnvelopeRoleGrants {
 /// run header journals (§8.3 tag 0 `claim` / `manifest`), and — when the run carried envelope-v2
 /// grants — the tighten-derived quotas the run config consumes.
 #[derive(Debug, Clone)]
-pub struct AdmissionV2 {
+pub struct Admission {
     /// The ABI §1.3 selection (driver, major, minor).
     pub selection: Selection,
     /// The decoded, bounds-checked claim.
@@ -245,25 +245,25 @@ pub struct AdmissionV2 {
     /// The manifest's verbatim CBOR bytes.
     pub manifest_bytes: Vec<u8>,
     /// The admitted numeric quotas derived from `lane ∩ envelope role grants` (D0, ABI §2.6 core;
-    /// tighten-only). `None` on the pre-D0 path (no envelope grants) — the `V2RunConfig` defaults
+    /// tighten-only). `None` on the pre-D0 path (no envelope grants) — the `RunConfig` defaults
     /// stand there.
     pub quotas: Option<daemon_vhc_proto::AdmittedQuotas>,
 }
 
-impl AdmissionV2 {
-    /// Copy the admitted quotas into a [`crate::v2::V2RunConfig`] — the D0 envelope→admission→
+impl Admission {
+    /// Copy the admitted quotas into a [`crate::run::RunConfig`] — the D0 envelope→admission→
     /// run-config derivation seam (deliverable 2). A no-op when the admission carried no envelope
     /// grants (the config's Phase-A defaults stand). `granted_artifacts` REPLACES the config's
     /// set (the envelope is the authority; empty grants = no artifacts, fail closed).
-    pub fn apply_quotas(&self, cfg: &mut crate::v2::V2RunConfig) {
+    pub fn apply_quotas(&self, cfg: &mut crate::run::RunConfig) {
         if let Some(q) = &self.quotas {
             apply_admitted_quotas(q, cfg);
         }
     }
 }
 
-/// Copy one derived [`daemon_vhc_proto::AdmittedQuotas`] into a [`crate::v2::V2RunConfig`] — the
-/// single quota→config mapping shared by [`AdmissionV2::apply_quotas`] and the worker's
+/// Copy one derived [`daemon_vhc_proto::AdmittedQuotas`] into a [`crate::run::RunConfig`] — the
+/// single quota→config mapping shared by [`Admission::apply_quotas`] and the worker's
 /// envelope-v2 join path (D1 deliverable 4: the join derives the role's quotas from the genesis
 /// grants and applies them here, so assess and join agree on the mapping by construction).
 ///
@@ -272,7 +272,7 @@ impl AdmissionV2 {
 /// treats 0 the same way, so the values copy through verbatim.
 pub fn apply_admitted_quotas(
     q: &daemon_vhc_proto::AdmittedQuotas,
-    cfg: &mut crate::v2::V2RunConfig,
+    cfg: &mut crate::run::RunConfig,
 ) {
     cfg.max_frame_bytes = u32::try_from(q.max_frame_bytes).unwrap_or(u32::MAX);
     cfg.advisory_depth = usize::try_from(q.advisory_depth).unwrap_or(usize::MAX);
@@ -336,7 +336,7 @@ impl std::fmt::Display for FunnelRefusal {
 // bytes, and the three policy sources bracketing it) — grouping them further would hide the
 // stage structure the spec fixes.
 #[allow(clippy::too_many_arguments)]
-pub fn admit_v2(
+pub fn admit(
     worker: &Worker,
     wasm: &[u8],
     expected_blake3: Option<&[u8; 32]>,
@@ -347,7 +347,7 @@ pub fn admit_v2(
     owner: &OwnerPolicy,
     envelope_min: Option<&daemon_vhc_proto::DeviceMinimums>,
     envelope_grants: Option<&EnvelopeRoleGrants>,
-) -> Result<AdmissionV2, FunnelRefusal> {
+) -> Result<Admission, FunnelRefusal> {
     // -- stage 1: owner participation policy — free, local, before ANY other work ----------------
     if !owner.participation_enabled {
         return Err(FunnelRefusal::local(
@@ -443,7 +443,7 @@ pub fn admit_v2(
     if selection.driver != CandidateDriver::V2 {
         return Err(FunnelRefusal::local(
             4,
-            "admit_v2 is the major-2 funnel; no other driver is admissible (the v1 driver \
+            "admit is the major-2 funnel; no other driver is admissible (the v1 driver \
              retired at the Phase-E sunset)",
         ));
     }
@@ -497,7 +497,7 @@ pub fn admit_v2(
     // MUST be advertised by the host custom-op registry, else a clean typed refusal — never a
     // trap. `flash_attn@1` is the first registered fusion; the RESERVED compute@2 OperationIr::Custom
     // wire (owned/refused by C1) resolves NAMED ops through this same registry (C2:custom-op).
-    crate::v2::custom_op::CustomOpRegistry::default()
+    crate::run::custom_op::CustomOpRegistry::default()
         .admit(&assessed.manifest_custom_ops)
         .map_err(|refusal| FunnelRefusal::typed(4, refusal))?;
 
@@ -550,7 +550,7 @@ pub fn admit_v2(
         ));
     }
 
-    Ok(AdmissionV2 {
+    Ok(Admission {
         selection,
         claim: assessed.claim,
         claim_bytes: assessed.claim_bytes,
@@ -876,7 +876,7 @@ mod tests {
             host_cap_bytes: 0,
         };
         // Deliberately garbage wasm: stage 1 must refuse BEFORE any byte is inspected.
-        let err = admit_v2(
+        let err = admit(
             &worker,
             b"not wasm",
             None,
@@ -903,7 +903,7 @@ mod tests {
         };
         let mut l = lane();
         l.gpu = 2; // required — the CPU-only device profile is below the floor
-        let err = admit_v2(
+        let err = admit(
             &worker,
             b"not wasm",
             None,
@@ -948,7 +948,7 @@ mod tests {
             grants,
             run_artifacts: std::collections::BTreeSet::new(),
         };
-        let err = admit_v2(
+        let err = admit(
             &worker,
             b"not wasm",
             None,
@@ -1033,7 +1033,7 @@ mod tests {
             },
         );
         let env = daemon_vhc_proto::GenesisEnvelope {
-            run: daemon_vhc_proto::RunSectionV2 {
+            run: daemon_vhc_proto::RunSection {
                 schema: daemon_vhc_proto::GENESIS_SCHEMA_MAJOR,
                 run_label: "grants-run".into(),
                 min_peers: 1,
@@ -1050,7 +1050,7 @@ mod tests {
         let eg = EnvelopeRoleGrants::from_genesis(&env, "worker").expect("worker role present");
         assert!(EnvelopeRoleGrants::from_genesis(&env, "no-such-role").is_none());
 
-        let err = admit_v2(
+        let err = admit(
             &worker,
             b"not wasm",
             None,
@@ -1067,7 +1067,7 @@ mod tests {
         assert_eq!(err.code, Some(AbiRefusalCode::GrantsExceedLane));
     }
 
-    /// D0 deliverable 2: the admitted quotas copy into `V2RunConfig` (the Phase-B seam) —
+    /// D0 deliverable 2: the admitted quotas copy into `RunConfig` (the Phase-B seam) —
     /// tightened values replace the defaults; the granted-artifact set replaces the config's.
     #[test]
     fn apply_quotas_copies_admitted_values_into_run_config() {
@@ -1085,7 +1085,7 @@ mod tests {
             compute_queue_depth: 48,
             granted_artifacts: [daemon_vhc_proto::Hash([7u8; 32])].into_iter().collect(),
         };
-        let admission = AdmissionV2 {
+        let admission = Admission {
             selection: Selection {
                 driver: CandidateDriver::V2,
                 major: 2,
@@ -1101,14 +1101,14 @@ mod tests {
             manifest_bytes: Vec::new(),
             quotas: Some(quotas),
         };
-        let identity = crate::v2::RunIdentity {
+        let identity = crate::run::RunIdentity {
             run_id: [0u8; 32],
             epoch: 0,
             role: "worker".into(),
             instance: 1,
             module: [0u8; 32],
         };
-        let mut cfg = crate::v2::V2RunConfig::new(identity, [0u8; 32], vec![], vec![]);
+        let mut cfg = crate::run::RunConfig::new(identity, [0u8; 32], vec![], vec![]);
         admission.apply_quotas(&mut cfg);
         assert_eq!(cfg.max_frame_bytes, 4096);
         assert_eq!(cfg.spool_frames, 32);
@@ -1151,7 +1151,7 @@ mod tests {
         assert!(channels.is_empty());
         assert_eq!(custom_ops, vec!["flash_attn@1", "fused_moe@1"]);
         // The registry that stage 4 runs refuses the unadvertised op, typed (not a trap).
-        let err = crate::v2::custom_op::CustomOpRegistry::default()
+        let err = crate::run::custom_op::CustomOpRegistry::default()
             .admit(&custom_ops)
             .unwrap_err();
         assert_eq!(err.code, AbiRefusalCode::CustomOpUnsupported);

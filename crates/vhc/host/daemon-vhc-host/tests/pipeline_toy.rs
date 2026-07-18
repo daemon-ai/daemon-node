@@ -24,9 +24,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_host::v2::{
-    replay_v2, start_run, MemorySink, OpOutcome, OpRequest, PumpHandle, ReplayEnd, ReplayScript,
-    RunEnd, RunIdentity, SinkEntry, V2RunConfig,
+use daemon_vhc_host::run::{
+    replay, start_run, MemorySink, OpOutcome, OpRequest, PumpHandle, ReplayEnd, ReplayScript,
+    RunConfig, RunEnd, RunIdentity, SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 
@@ -255,7 +255,7 @@ fn two_stage_pipeline_exchanges_exported_tensors_under_credit_flow_control() {
             instance,
             module: *blake3::hash(&wasm).as_bytes(),
         };
-        let cfg = V2RunConfig::new(identity, [seed; 32], config(role, peer), Vec::new());
+        let cfg = RunConfig::new(identity, [seed; 32], config(role, peer), Vec::new());
         let sink = Arc::new(Mutex::new(MemorySink::new()));
         let run = start_run(&worker, &wasm, cfg, Box::new(sink.clone())).expect("start");
         (run, sink)
@@ -331,7 +331,7 @@ fn two_stage_pipeline_exchanges_exported_tensors_under_credit_flow_control() {
         assert!(matches!(run.wait().expect("thread"), RunEnd::Outcome(0)));
         let entries: Vec<SinkEntry> = sink.lock().expect("sink").entries.clone();
         let script = ReplayScript::from_entries(&entries);
-        let replayed = replay_v2(&worker, &wasm, &config(cfg_role, cfg_peer), &[], script)
+        let replayed = replay(&worker, &wasm, &config(cfg_role, cfg_peer), &[], script)
             .expect("replay harness");
         assert_eq!(
             replayed.end,

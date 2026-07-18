@@ -128,7 +128,7 @@ wgpu = ["burn/wgpu"]
 cuda = ["burn/cuda", "dep:cudarc"]
 
 [dev-dependencies]
-# Test-only: the A2 v2-event-loop end-to-end test (`tests/v2_event_loop.rs`) journals through the
+# Test-only: the A2 event-loop end-to-end test (`tests/event_loop.rs`) journals through the
 # REAL A1 crash-safe segmented substrate by adapting `daemon_vhc_observe::journal::Journal` onto
 # the driver's `JournalSink` seam. A host→host dev edge (observe is host-side); the runtime
 # dependency direction stays observe → host (the replay verifiers drive modules through the host

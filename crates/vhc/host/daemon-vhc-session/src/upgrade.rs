@@ -49,7 +49,7 @@
 //! fail-closed / rollback / never-roll-back-the-chain rules the spec fixes. The five side-effecting
 //! steps are abstracted behind [`UpgradeSteps`] so the invariants are unit-tested deterministically;
 //! the production adapter wires each step onto the real host primitives (the `PumpHandle` quiesce,
-//! `daemon_vhc_host::v2::admit_v2`, and the migrate-instance `start_run` path). The wasm-level
+//! `daemon_vhc_host::run::admit`, and the migrate-instance `start_run` path). The wasm-level
 //! drills that drive a real migratable guest through these steps live in the host testkit.
 
 use daemon_vhc_proto::{AdmittedQuotas, EpochDescriptor, Hash};
@@ -84,7 +84,7 @@ pub enum LeaveReason {
     UnknownRole(String),
     /// The quiesce drain failed (deadline exceeded / forced interruption, ABI §4.4/§11.3).
     QuiesceFailed(String),
-    /// Owner-law re-check refused the new module (owner policy / lane / claim, `admit_v2`).
+    /// Owner-law re-check refused the new module (owner policy / lane / claim, `admit`).
     OwnerRefused(String),
     /// The upgrade would expand grants beyond the previously-admitted set — **fail closed**
     /// (architecture §5.4; refactor invariant 7). Carries the offending bound.
@@ -162,7 +162,7 @@ pub trait UpgradeSteps {
     fn quiesce(&mut self, deadline_ms: u64) -> Result<SnapshotSeam, StepFailure>;
 
     /// **Step 3.** Re-run owner-law admission for the new module (owner policy + lane + `claim()`,
-    /// `daemon_vhc_host::v2::admit_v2`) and return the newly-admitted grant quotas. An owner/lane
+    /// `daemon_vhc_host::run::admit`) and return the newly-admitted grant quotas. An owner/lane
     /// refusal is an `Err` (the worker leaves). Grant-expansion vs the previous grants is checked by
     /// the orchestrator against this result.
     ///
@@ -364,21 +364,21 @@ pub fn run_local_upgrade(
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_host::v2::{
-    admit_v2, start_run_migrating, DeviceProfile, EnvelopeRoleGrants, MemorySink, MigrationInput,
-    OwnerPolicy, ParticipationLane, PumpHandle, RunEnd, RunIdentity, SinkEntry, SnapshotCapture,
-    SpooledFrame, V2Run, V2RunConfig,
+use daemon_vhc_host::run::{
+    admit, start_run_migrating, DeviceProfile, EnvelopeRoleGrants, MemorySink, MigrationInput,
+    OwnerPolicy, ParticipationLane, PumpHandle, Run, RunConfig, RunEnd, RunIdentity, SinkEntry,
+    SnapshotCapture, SpooledFrame,
 };
 use daemon_vhc_host::Worker;
 use daemon_vhc_proto::blake3_hash;
 use daemon_vhc_sdk_consensus::checkpoint::SectionKind;
 
 /// The **live activated instance** an upgrade produced (ABI §10.3 step 6): the running new-epoch
-/// [`V2Run`], its [`PumpHandle`], and the **continued** journal (the old incarnation's records up
+/// [`Run`], its [`PumpHandle`], and the **continued** journal (the old incarnation's records up
 /// to the fence, followed by this incarnation's — one gapless log, see [`MemorySink::continuing`]).
 pub struct ActivatedInstance {
     /// The running new-epoch instance (join it to finish the run).
-    pub run: V2Run,
+    pub run: Run,
     /// The pump driving the new instance (spooled frames have already drained into it).
     pub pump: PumpHandle,
     /// The continued run journal: `old prefix ++ this incarnation's records`.
@@ -394,7 +394,7 @@ pub struct LiveUpgradeInputs<'w> {
     /// The role-instance's role label (§8.1).
     pub role: String,
     /// The live OLD instance (consumed by the quiesce drain).
-    pub old_run: V2Run,
+    pub old_run: Run,
     /// The OLD instance's pump (quiesce / snapshot capture / spool drain).
     pub old_pump: PumpHandle,
     /// The OLD instance's journal (its length at the fence is the [`SnapshotSeam::journal_cursor`],
@@ -431,7 +431,7 @@ pub struct LiveUpgradeInputs<'w> {
 }
 
 /// The production [`UpgradeSteps`] adapter: each step wired onto the real host primitive the spec
-/// names — [`PumpHandle::quiesce`] + [`PumpHandle::snapshot_capture`] (steps 1–2), [`admit_v2`]
+/// names — [`PumpHandle::quiesce`] + [`PumpHandle::snapshot_capture`] (steps 1–2), [`admit`]
 /// (step 3), [`start_run_migrating`] (steps 4–5), spooled-frame drain (step 6). It is the concrete
 /// side-effecting half of the transaction whose ordering/invariants [`run_local_upgrade`] fixes.
 ///
@@ -441,7 +441,7 @@ pub struct LiveUpgradeInputs<'w> {
 pub struct LiveUpgradeSteps<'w> {
     worker: &'w Worker,
     role: String,
-    old_run: Option<V2Run>,
+    old_run: Option<Run>,
     old_pump: PumpHandle,
     old_sink: Arc<Mutex<MemorySink>>,
     old_module: Hash,
@@ -642,7 +642,7 @@ impl UpgradeSteps for LiveUpgradeSteps<'_> {
             ));
         }
         // Owner-law re-check (§10.3 step 3): the full admission funnel over the NEW module.
-        let admission = admit_v2(
+        let admission = admit(
             self.worker,
             &self.new_wasm,
             Some(new_module.as_bytes()),
@@ -680,7 +680,7 @@ impl UpgradeSteps for LiveUpgradeSteps<'_> {
         // The new incarnation continues the SAME journal (seeded at the fence cursor), not a fresh
         // sink — the run journal is one gapless log across the switch (§10.3 step 6).
         let sink = self.continuation_sink();
-        let cfg = V2RunConfig::new(
+        let cfg = RunConfig::new(
             self.new_identity.clone(),
             self.new_signing_seed,
             Vec::new(),
@@ -795,7 +795,7 @@ mod tests {
     fn target_at_epoch_1(new_worker_module: Hash) -> (EpochDescriptor, TransitionChain) {
         use daemon_vhc_proto::envelope::{Access, DeviceMinimums};
         use daemon_vhc_proto::genesis::{
-            GenesisEnvelope, Identities, RoleEntry, RoleGrants, RunSectionV2, SnapshotArtifact,
+            GenesisEnvelope, Identities, RoleEntry, RoleGrants, RunSection, SnapshotArtifact,
             TransportSelection, GENESIS_SCHEMA_MAJOR,
         };
         use std::collections::BTreeMap;
@@ -837,7 +837,7 @@ mod tests {
             );
         }
         let genesis = GenesisEnvelope {
-            run: RunSectionV2 {
+            run: RunSection {
                 schema: GENESIS_SCHEMA_MAJOR,
                 run_label: "up".into(),
                 min_peers: 1,

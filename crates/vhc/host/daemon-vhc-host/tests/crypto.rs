@@ -6,7 +6,7 @@
 // The det-lane pattern applied to crypto: the `hash`/`verify_sig` semantics are pinned by ONE
 // dual-compiled contract (`daemon_vhc_proto::crypto`). The **in-guest fallback** is that contract
 // compiled to wasm32 (always available — a module can hash/verify with zero host support); the
-// **host acceleration** (`daemon_vhc_host::v2::driver::host_crypto_{hash,verify}`, the exact body
+// **host acceleration** (`daemon_vhc_host::run::driver::host_crypto_{hash,verify}`, the exact body
 // the `sys@2::hash`/`verify_sig` imports run) is that contract compiled natively. Because both are
 // the same source and blake3/ed25519 are integer arithmetic under wasm's deterministic core
 // semantics, host-op ≡ in-guest-op is bit-exact **by construction** — exactly how
@@ -18,7 +18,7 @@
 // verify semantics. It is CPU-deterministic (no wasm host, no GPU, no network) — a `vhc-ci-det`
 // citizen.
 
-use daemon_vhc_host::v2::driver::{host_crypto_hash, host_crypto_verify};
+use daemon_vhc_host::run::driver::{host_crypto_hash, host_crypto_verify};
 use daemon_vhc_proto::canonical::to_canonical_vec;
 use daemon_vhc_proto::crypto::{self, VerifyOutcome};
 use daemon_vhc_proto::sign::{peer_id, sign_canonical, SigningKey};

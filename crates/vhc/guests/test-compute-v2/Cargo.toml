@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
+daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk" }
 # The guest-side Burn compute tier: HostBackend + Autodiff<HostBackend> over the compute@2 shim.
 daemon-vhc-sdk-compute = { path = "../../sdk/daemon-vhc-sdk-compute" }
 # The pinned wire IR (scenario guests hand-build TensorIr for the negative paths).

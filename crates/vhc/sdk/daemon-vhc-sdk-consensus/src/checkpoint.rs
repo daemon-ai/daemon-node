@@ -14,7 +14,7 @@
 //! ## One discipline with migration (ABI §10.2)
 //!
 //! The section-declaration shape here is deliberately a **superset** of the ABI §10.2
-//! `state-section-decl` the migration path speaks (`daemon-vhc-sdk-v2::migrate`): a checkpoint's
+//! `state-section-decl` the migration path speaks (`daemon-vhc-sdk::migrate`): a checkpoint's
 //! sections carry the same `name`/`schema`/`hash`/`size`/`class` fields, plus a semantic
 //! [`SectionKind`] tag naming which of the five architecture-§5.3 sections it is. So the upgrade
 //! transaction's "snapshot state + journal cursor" (architecture §5.4; E2's upgrade transaction)

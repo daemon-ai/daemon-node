@@ -28,7 +28,7 @@ use std::process::Command;
 use std::sync::Once;
 
 use daemon_vhc_abi::{AbiRefusalCode, CandidateDriver};
-use daemon_vhc_host::v2::RunEnd;
+use daemon_vhc_host::run::RunEnd;
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::{peek_schema, peer_id, Hash, SigningKey, GENESIS_SCHEMA_MAJOR};
 use daemon_vhc_testkit::{

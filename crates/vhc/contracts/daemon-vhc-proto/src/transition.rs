@@ -557,7 +557,7 @@ mod tests {
     use super::*;
     use crate::envelope::{Access, DeviceMinimums};
     use crate::genesis::{
-        GenesisEnvelope, Identities, RoleEntry, RoleGrants, RunSectionV2, SnapshotArtifact,
+        GenesisEnvelope, Identities, RoleEntry, RoleGrants, RunSection, SnapshotArtifact,
         TransportSelection, GENESIS_SCHEMA_MAJOR,
     };
     use std::collections::BTreeMap;
@@ -616,7 +616,7 @@ mod tests {
         );
 
         GenesisEnvelope {
-            run: RunSectionV2 {
+            run: RunSection {
                 schema: GENESIS_SCHEMA_MAJOR,
                 run_label: "demo-run".into(),
                 min_peers: 1,

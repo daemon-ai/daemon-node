@@ -870,7 +870,7 @@ pub const CLAIM_PRESSURE_TRAP_CURRENT_SLICE: u64 = 1;
 //
 // The tiered memory envelope every major-2 module reports as a deterministic, cheap, compute-free
 // function of (config, grants). The canonical-CBOR map keys are fixed here so the guest-side
-// authors/SDK and the host-side evaluator (`daemon-vhc-host::v2::admission`) agree on one
+// authors/SDK and the host-side evaluator (`daemon-vhc-host::run::admission`) agree on one
 // vocabulary; the schema itself is ratified in the ABI companion (§9.1 `memory-claim`).
 
 /// `memory-claim` key: resources the host meters EXACTLY — the enforceable cap (breach is a typed
@@ -1030,7 +1030,7 @@ pub const fn handle_index(handle: u64) -> u32 {
 
 // ================================================================================================
 // The async completion-result wire vocabulary (ABI §7.5): the numeric assignments the completion
-// codec (`daemon-vhc-host::v2`), the guest SDK, and the journal/replay verifier must agree on.
+// codec (`daemon-vhc-host::run`), the guest SDK, and the journal/replay verifier must agree on.
 //
 // Any capability call that cannot complete immediately returns an `OpId` (kind 10) and completes
 // via `Event::Completion(op, result)` (event tag 6). None of it is linked at Phase A, but §7.5

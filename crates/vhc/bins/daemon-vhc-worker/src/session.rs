@@ -42,9 +42,9 @@ use std::time::{Duration, Instant};
 use daemon_vhc_host::coordinator::{
     authorize_coordinator_frame, configure_coordinator, Coordinator,
 };
-use daemon_vhc_host::v2::{
-    replay_v2, start_run, MemorySink, ReplayEnd, ReplayScript, RunEnd, RunIdentity, SinkEntry,
-    V2RunConfig,
+use daemon_vhc_host::run::{
+    replay, start_run, MemorySink, ReplayEnd, ReplayScript, RunConfig, RunEnd, RunIdentity,
+    SinkEntry,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::messages::{
@@ -133,7 +133,7 @@ impl T2Artifacts {
         Ok(bytes.clone())
     }
 
-    /// The committed hash set — the run's artifact grants (`V2RunConfig::granted_artifacts`).
+    /// The committed hash set — the run's artifact grants (`RunConfig::granted_artifacts`).
     fn granted(&self) -> std::collections::BTreeSet<[u8; 32]> {
         self.by_hash.keys().copied().collect()
     }
@@ -267,7 +267,7 @@ fn decode_tagged(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
 /// Drive one self-driven v2 run over genesis: the whole-run t2 shape under the run's real wasm
 /// coordinator. Reports the guest's final tag-4 det digest.
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn join_and_run_v2(
+pub(crate) async fn join_and_run(
     module: &[u8],
     config: &[u8],
     genesis: &crate::backend::GenesisRun,
@@ -282,7 +282,7 @@ pub(crate) async fn join_and_run_v2(
     let sel = daemon_vhc_host::select_driver(&worker, module, Some(&module_hash))
         .map_err(|e| format!("join re-selection: {e}"))?;
     if sel.driver != daemon_vhc_abi::CandidateDriver::V2 {
-        return Err("join_and_run_v2 on a non-major-2 module".into());
+        return Err("join_and_run on a non-major-2 module".into());
     }
     let grants = derive_grants();
 
@@ -312,7 +312,7 @@ pub(crate) async fn join_and_run_v2(
     // data@2::fetch are both answered through T2Artifacts::fetch; the run's artifact grants are
     // exactly the store's committed hashes (which artifacts a module may touch is a grant).
     let (artifacts, manifest_hash) = t2_corpus_artifacts()?;
-    let mut run_cfg = V2RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
+    let mut run_cfg = RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
     run_cfg.granted_artifacts = artifacts.granted();
     // A real transformer's per-round op stream exceeds the tiny default queue depth (the guest
     // also fences per inner step to reclaim depth).
@@ -535,7 +535,7 @@ pub(crate) async fn join_and_run_v2(
     // The identity behind the recorded run: what `sys@2::rng_seed` re-derives from at replay
     // (in a real journal this rides the tag-0 run header).
     script.identity = Some(identity);
-    let replayed = replay_v2(&worker, module, config, &derive_grants(), script)
+    let replayed = replay(&worker, module, config, &derive_grants(), script)
         .map_err(|e| format!("replay harness: {e}"))?;
     if replayed.end != ReplayEnd::Outcome(0) {
         return Err(format!("input replay diverged: {:?}", replayed.end));
@@ -591,7 +591,7 @@ pub(crate) async fn join_and_run_v2(
 /// message's canonical bytes as the payload, the coordinator's ORIGINAL §12.1 signed frame as
 /// tag-12 evidence, per-sender dense seq (§12.2 discipline, channel 0).
 fn deliver_to_worker(
-    pump: &daemon_vhc_host::v2::PumpHandle,
+    pump: &daemon_vhc_host::run::PumpHandle,
     sender: [u8; 32],
     msg: &VhcMessage,
     evidence: Vec<u8>,
@@ -602,7 +602,7 @@ fn deliver_to_worker(
         .deliver_frame(0, *seq, sender, payload, evidence)
         .map_err(|e| format!("deliver: {e}"))?;
     match verdict {
-        daemon_vhc_host::v2::DeliverVerdict::Accepted => {
+        daemon_vhc_host::run::DeliverVerdict::Accepted => {
             *seq += 1;
             Ok(())
         }
@@ -619,7 +619,7 @@ fn deliver_to_worker(
 /// answered from the run's artifact store — the SAME `T2Artifacts::fetch` the session's own
 /// corpus staging reads through (one fetch path; the pump re-verifies + range-slices).
 fn wait_publishes_servicing(
-    pump: &daemon_vhc_host::v2::PumpHandle,
+    pump: &daemon_vhc_host::run::PumpHandle,
     target: usize,
     puts: &mut Vec<Vec<u8>>,
     artifacts: &T2Artifacts,
@@ -628,22 +628,25 @@ fn wait_publishes_servicing(
     loop {
         for (op, request) in pump.take_op_requests() {
             match request {
-                daemon_vhc_host::v2::OpRequest::PayloadPut { bytes } => {
+                daemon_vhc_host::run::OpRequest::PayloadPut { bytes } => {
                     puts.push(bytes.to_vec());
-                    pump.complete_op(op, daemon_vhc_host::v2::OpOutcome::PutDone)
+                    pump.complete_op(op, daemon_vhc_host::run::OpOutcome::PutDone)
                         .map_err(|e| format!("put completion: {e}"))?;
                 }
-                daemon_vhc_host::v2::OpRequest::ArtifactFetch { hash, .. } => {
+                daemon_vhc_host::run::OpRequest::ArtifactFetch { hash, .. } => {
                     // The unified fetch path: the same store + verification discipline the
                     // staging corpus was assembled through (the range is the pump's job).
                     let _ = match artifacts.fetch(&hash) {
                         Ok(artifact) => pump
-                            .complete_op(op, daemon_vhc_host::v2::OpOutcome::FetchDone { artifact })
+                            .complete_op(
+                                op,
+                                daemon_vhc_host::run::OpOutcome::FetchDone { artifact },
+                            )
                             .map_err(|e| format!("fetch completion: {e}"))?,
                         Err(detail) => pump
                             .complete_op(
                                 op,
-                                daemon_vhc_host::v2::OpOutcome::Failed {
+                                daemon_vhc_host::run::OpOutcome::Failed {
                                     code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
                                     detail,
                                 },

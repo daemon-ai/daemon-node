@@ -7,7 +7,7 @@
 //! *worker* input-replay verifier — which re-drives a wasm guest through the **host runtime** from a
 //! recorded journal and asserts every outbound decision matches — needs the dual-dispatch worker and
 //! the `da_run`/`next_event` event loop, so its real wiring lands after A0 merges and **completes in
-//! A2** (there is no v2 event stream to replay end-to-end until then). This module is therefore the
+//! A2** (there is no event stream to replay end-to-end until then). This module is therefore the
 //! *shape*: the typed outcomes (§8.7), a [`ReplayPlan`] derived from a journal, and a [`GuestUnderReplay`]
 //! seam a sim/host driver implements — plus a sim-fed test harness proving the shape holds. It drives
 //! **nothing real yet** and links neither the worker binary nor the host dispatch code (A0's

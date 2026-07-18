@@ -78,7 +78,7 @@ pub struct BudgetReport {
 /// Delivery of the two post-Phase-A variants is minor-gated structurally (module docs): each can
 /// only arise from a capability call whose import forces the declaring minor at selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EventV2 {
+pub enum RunEvent {
     /// Tag 0 — a verified signed control frame (§4.3). `payload` is opaque module-authored bytes.
     Frame {
         /// The declared channel the frame arrived on (§6.2).
@@ -158,9 +158,9 @@ pub enum EventCodecError {
 ///
 /// [`EventCodecError::Malformed`] only on a canonical-encoder failure (which the fixed value
 /// shapes below cannot produce in practice).
-pub fn encode_event_frame(event: &EventV2) -> Result<Vec<u8>, EventCodecError> {
+pub fn encode_event_frame(event: &RunEvent) -> Result<Vec<u8>, EventCodecError> {
     let tree = match event {
-        EventV2::Frame {
+        RunEvent::Frame {
             channel,
             seq,
             sender,
@@ -172,7 +172,7 @@ pub fn encode_event_frame(event: &EventV2) -> Result<Vec<u8>, EventCodecError> {
             Value::Bytes(sender.to_vec()),
             Value::Bytes(payload.clone()),
         ]),
-        EventV2::PayloadReady {
+        RunEvent::PayloadReady {
             staging_id,
             hash,
             meta,
@@ -191,12 +191,12 @@ pub fn encode_event_frame(event: &EventV2) -> Result<Vec<u8>, EventCodecError> {
                 Value::Map(m),
             ])
         }
-        EventV2::Timer { timer_id, fired_at } => Value::Array(vec![
+        RunEvent::Timer { timer_id, fired_at } => Value::Array(vec![
             Value::from(EV_TAG_TIMER),
             Value::from(*timer_id),
             Value::from(*fired_at),
         ]),
-        EventV2::Budget { report } => Value::Array(vec![
+        RunEvent::Budget { report } => Value::Array(vec![
             Value::from(EV_TAG_BUDGET),
             Value::Map(vec![
                 (Value::from("fuel"), Value::from(report.fuel)),
@@ -217,18 +217,18 @@ pub fn encode_event_frame(event: &EventV2) -> Result<Vec<u8>, EventCodecError> {
                 ),
             ]),
         ]),
-        EventV2::Fence { fence_id } => {
+        RunEvent::Fence { fence_id } => {
             Value::Array(vec![Value::from(EV_TAG_FENCE), Value::from(*fence_id)])
         }
-        EventV2::Completion { op, result } => Value::Array(vec![
+        RunEvent::Completion { op, result } => Value::Array(vec![
             Value::from(EV_TAG_COMPLETION),
             Value::from(*op),
             result.to_value(),
         ]),
-        EventV2::Stop { reason } => {
+        RunEvent::Stop { reason } => {
             Value::Array(vec![Value::from(EV_TAG_STOP), Value::from(*reason)])
         }
-        EventV2::Quiesce {
+        RunEvent::Quiesce {
             reason,
             deadline_ms,
         } => Value::Array(vec![
@@ -248,7 +248,7 @@ pub fn encode_event_frame(event: &EventV2) -> Result<Vec<u8>, EventCodecError> {
 /// [`EventCodecError::UnknownTag`] for an unassigned tag (a future minor's variant — fail
 /// closed); [`EventCodecError::Malformed`] for anything that is not a well-formed frame of the
 /// tagged shape.
-pub fn decode_event_frame(bytes: &[u8]) -> Result<EventV2, EventCodecError> {
+pub fn decode_event_frame(bytes: &[u8]) -> Result<RunEvent, EventCodecError> {
     let tree: Value = ciborium::de::from_reader(bytes)
         .map_err(|e| EventCodecError::Malformed(format!("decode: {e}")))?;
     let Value::Array(items) = tree else {
@@ -258,38 +258,38 @@ pub fn decode_event_frame(bytes: &[u8]) -> Result<EventV2, EventCodecError> {
     };
     let tag = as_u64(items.first(), "tag")?;
     match tag {
-        t if t == EV_TAG_FRAME => Ok(EventV2::Frame {
+        t if t == EV_TAG_FRAME => Ok(RunEvent::Frame {
             channel: as_u32(items.get(1), "channel")?,
             seq: as_u64(items.get(2), "seq")?,
             sender: as_hash32(items.get(3), "sender")?,
             payload: as_bytes(items.get(4), "payload")?,
         }),
-        t if t == EV_TAG_PAYLOAD_READY => Ok(EventV2::PayloadReady {
+        t if t == EV_TAG_PAYLOAD_READY => Ok(RunEvent::PayloadReady {
             staging_id: as_u64(items.get(1), "staging_id")?,
             hash: as_hash32(items.get(2), "hash")?,
             meta: decode_meta(items.get(3))?,
         }),
-        t if t == EV_TAG_TIMER => Ok(EventV2::Timer {
+        t if t == EV_TAG_TIMER => Ok(RunEvent::Timer {
             timer_id: as_u64(items.get(1), "timer_id")?,
             fired_at: as_u64(items.get(2), "fired_at")?,
         }),
-        t if t == EV_TAG_BUDGET => Ok(EventV2::Budget {
+        t if t == EV_TAG_BUDGET => Ok(RunEvent::Budget {
             report: decode_budget(items.get(1))?,
         }),
-        t if t == EV_TAG_FENCE => Ok(EventV2::Fence {
+        t if t == EV_TAG_FENCE => Ok(RunEvent::Fence {
             fence_id: as_u64(items.get(1), "fence_id")?,
         }),
-        t if t == EV_TAG_COMPLETION => Ok(EventV2::Completion {
+        t if t == EV_TAG_COMPLETION => Ok(RunEvent::Completion {
             op: as_u64(items.get(1), "op")?,
             result: CompletionResult::from_value(items.get(2).ok_or_else(|| {
                 EventCodecError::Malformed("completion frame missing `result`".into())
             })?)
             .map_err(|e| EventCodecError::Malformed(e.to_string()))?,
         }),
-        t if t == EV_TAG_STOP => Ok(EventV2::Stop {
+        t if t == EV_TAG_STOP => Ok(RunEvent::Stop {
             reason: as_u64(items.get(1), "reason")?,
         }),
-        t if t == EV_TAG_QUIESCE => Ok(EventV2::Quiesce {
+        t if t == EV_TAG_QUIESCE => Ok(RunEvent::Quiesce {
             reason: as_u64(items.get(1), "reason")?,
             deadline_ms: as_u64(items.get(2), "deadline_ms")?,
         }),
@@ -392,21 +392,21 @@ fn map_u64_opt(entries: &[(Value, Value)], key: &str) -> Result<Option<u64>, Eve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::completion::{CompError, SuccessPayload};
+    use crate::run::completion::{CompError, SuccessPayload};
     use daemon_vhc_abi::{
         COMP_ERR_TIMEOUT, EV_TAG_COMPLETION, HANDLE_KIND_BUFFER, QUIESCE_REASON_UPGRADE,
         STOP_REASON_RUN_COMPLETE,
     };
 
-    fn samples() -> Vec<EventV2> {
+    fn samples() -> Vec<RunEvent> {
         vec![
-            EventV2::Frame {
+            RunEvent::Frame {
                 channel: 0,
                 seq: 42,
                 sender: [7u8; 32],
                 payload: b"opaque-module-bytes".to_vec(),
             },
-            EventV2::PayloadReady {
+            RunEvent::PayloadReady {
                 staging_id: 9,
                 hash: [3u8; 32],
                 meta: PayloadMeta {
@@ -415,7 +415,7 @@ mod tests {
                     channel: Some(0),
                 },
             },
-            EventV2::PayloadReady {
+            RunEvent::PayloadReady {
                 staging_id: 10,
                 hash: [4u8; 32],
                 meta: PayloadMeta {
@@ -424,11 +424,11 @@ mod tests {
                     channel: None,
                 },
             },
-            EventV2::Timer {
+            RunEvent::Timer {
                 timer_id: 1,
                 fired_at: 1500,
             },
-            EventV2::Budget {
+            RunEvent::Budget {
                 report: BudgetReport {
                     fuel: 1,
                     mem: 0,
@@ -439,7 +439,7 @@ mod tests {
                     },
                 },
             },
-            EventV2::Completion {
+            RunEvent::Completion {
                 op: daemon_vhc_abi::pack_handle(daemon_vhc_abi::HANDLE_KIND_OP_ID, 1, 7),
                 result: CompletionResult::Ok(SuccessPayload::Handle(daemon_vhc_abi::pack_handle(
                     HANDLE_KIND_BUFFER,
@@ -447,18 +447,18 @@ mod tests {
                     3,
                 ))),
             },
-            EventV2::Completion {
+            RunEvent::Completion {
                 op: daemon_vhc_abi::pack_handle(daemon_vhc_abi::HANDLE_KIND_OP_ID, 1, 8),
                 result: CompletionResult::Err(CompError {
                     code: COMP_ERR_TIMEOUT,
                     detail: Some("fetch deadline".into()),
                 }),
             },
-            EventV2::Fence { fence_id: 11 },
-            EventV2::Stop {
+            RunEvent::Fence { fence_id: 11 },
+            RunEvent::Stop {
                 reason: STOP_REASON_RUN_COMPLETE,
             },
-            EventV2::Quiesce {
+            RunEvent::Quiesce {
                 reason: QUIESCE_REASON_UPGRADE,
                 deadline_ms: 30_000,
             },
@@ -485,7 +485,7 @@ mod tests {
         }
         // Positional array with the tag as the first element (§5.1): a small frame's head is a
         // definite-length array head (major 4) and its first item is the integer tag.
-        let bytes = encode_event_frame(&EventV2::Stop { reason: 0 }).unwrap();
+        let bytes = encode_event_frame(&RunEvent::Stop { reason: 0 }).unwrap();
         assert_eq!(bytes[0] >> 5, 4, "definite-length array head");
         assert_eq!(bytes[1], 0x04, "leading integer event tag 4 (Stop)");
     }
@@ -501,13 +501,13 @@ mod tests {
             EventCodecError::UnknownTag(63)
         );
         // Well-formed completion + fence frames decode to their variants.
-        let completion = EventV2::Completion {
+        let completion = RunEvent::Completion {
             op: 5,
             result: CompletionResult::cancelled(),
         };
         let bytes = encode_event_frame(&completion).unwrap();
         assert_eq!(decode_event_frame(&bytes).unwrap(), completion);
-        let fence = EventV2::Fence { fence_id: 3 };
+        let fence = RunEvent::Fence { fence_id: 3 };
         let bytes = encode_event_frame(&fence).unwrap();
         assert_eq!(bytes[1], 0x05, "leading integer event tag 5 (Fence)");
         assert_eq!(decode_event_frame(&bytes).unwrap(), fence);
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn completion_frame_is_tag6_positional() {
         // ABI §4.2 `completion-ev = [6, op, completion-result]`.
-        let bytes = encode_event_frame(&EventV2::Completion {
+        let bytes = encode_event_frame(&RunEvent::Completion {
             op: 1,
             result: CompletionResult::Ok(SuccessPayload::Unit),
         })
@@ -554,7 +554,7 @@ mod tests {
         let bytes = to_canonical_vec(&future_timer).unwrap();
         assert_eq!(
             decode_event_frame(&bytes).unwrap(),
-            EventV2::Timer {
+            RunEvent::Timer {
                 timer_id: 5,
                 fired_at: 777
             }

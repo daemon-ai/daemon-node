@@ -38,7 +38,7 @@ fn main() -> ExitCode {
     let a = run(peers, ticks);
     let b = run(peers, ticks);
 
-    println!("replay check — {peers} peers, {ticks} ticks (v2 substrate)");
+    println!("replay check — {peers} peers, {ticks} ticks (vhc-sim substrate)");
     println!(
         "  run A: {} publishes, {} events; run B: {} publishes, {} events",
         a.publishes.len(),

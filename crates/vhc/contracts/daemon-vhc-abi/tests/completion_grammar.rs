@@ -10,7 +10,7 @@
 //! dependency-free contract crate owns the grammar and proves it machine-valid: each variant of
 //! `completion-result` has a representative CBOR sample that validates, and malformed shapes are
 //! rejected. The host-side encode/decode round-trip over the real Rust types lives in
-//! `daemon-vhc-host::v2` (the codec that produces these bytes), mirroring how `journal_grammar`
+//! `daemon-vhc-host::run` (the codec that produces these bytes), mirroring how `journal_grammar`
 //! proves the §8.3 grammar and `daemon-vhc-observe::journal` owns the record round-trip.
 
 use ciborium::value::Value;

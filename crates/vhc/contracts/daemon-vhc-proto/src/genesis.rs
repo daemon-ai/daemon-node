@@ -28,7 +28,7 @@
 //! - **identities** ([`Identities`]) — the coordinator identity/keyset and the upgrade-authority
 //!   keys (architecture §5.1). The cryptographic **`RunId`** is *not* stored: it **is** the
 //!   genesis hash ([`FrozenGenesis::run_id`]); the human/registry-facing **`RunLabel`** lives in
-//!   [`RunSectionV2::run_label`] (decisions D1 — the string→`RunLabel`, hash→`RunId` split).
+//!   [`RunSection::run_label`] (decisions D1 — the string→`RunLabel`, hash→`RunId` split).
 //!
 //! The host-visible `[data]` schedule and `[phases]` policy of the v1 envelope **do not exist**
 //! here — they became worker-module and coordinator-module opaque config respectively (each role's
@@ -196,7 +196,7 @@ pub struct MigrationGrant {
 /// intersects it with the selected lane's ceilings and the owner's standing policy to derive the
 /// admitted grants (tighten-only — a role whose grants exceed the lane's bounds is refused at
 /// admission, architecture §3.5). The fields mirror the ABI grant vocabulary and map onto the
-/// Phase-B `V2RunConfig` quotas (`payload_depth`/`advisory_depth`/`gossip_depth`, spool bounds,
+/// Phase-B `RunConfig` quotas (`payload_depth`/`advisory_depth`/`gossip_depth`, spool bounds,
 /// stream credit, `granted_artifacts`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleGrants {
@@ -262,7 +262,7 @@ pub struct Identities {
 /// RunSection`] in that identity is the cryptographic **`RunId`** (the genesis hash) — carried
 /// here only as the human/registry-facing **`RunLabel`** string (decisions D1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunSectionV2 {
+pub struct RunSection {
     /// Envelope schema major — MUST be [`GENESIS_SCHEMA_MAJOR`].
     pub schema: u32,
     /// The human/registry-facing run handle (the old string `run_id`, renamed — decisions D1). The
@@ -280,7 +280,7 @@ pub struct RunSectionV2 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GenesisEnvelope {
     /// `[run]`.
-    pub run: RunSectionV2,
+    pub run: RunSection,
     /// The role set — `role → (lane, module, opaque config, grants, device minimums)`.
     pub roles: BTreeMap<String, RoleEntry>,
     /// `[artifacts]` — name → pinned snapshot descriptor.
@@ -579,7 +579,7 @@ mod tests {
         );
 
         GenesisEnvelope {
-            run: RunSectionV2 {
+            run: RunSection {
                 schema: GENESIS_SCHEMA_MAJOR,
                 run_label: "demo-run".into(),
                 min_peers: 1,

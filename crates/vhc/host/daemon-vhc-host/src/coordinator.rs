@@ -28,7 +28,7 @@
 //!   8**'s configuration half.
 //!
 //! This derivation is harness-level infrastructure: the *production* admission seat for the
-//! genesis join flow (threading `RoleGrants` through `admit_v2`, certified keys) is D1's landed
+//! genesis join flow (threading `RoleGrants` through `admit`, certified keys) is D1's landed
 //! work — this module deliberately duplicates none of it.
 //!
 //! ## The `Authority` seam (reconciled onto D1's contract — sitting 3)
@@ -52,9 +52,9 @@ use daemon_vhc_proto::{
 use daemon_vhc_sdk_consensus::coordinator::CoordinatorState;
 use daemon_vhc_sdk_consensus::{AuthorityConfig, RecordSig};
 
-use crate::v2::{
-    start_run_migrating, DeliverVerdict, MemorySink, MigrationInput, RunEnd, RunIdentity,
-    SinkEntry, SnapshotCapture, V2Run, V2RunConfig,
+use crate::run::{
+    start_run_migrating, DeliverVerdict, MemorySink, MigrationInput, Run, RunConfig, RunEnd,
+    RunIdentity, SinkEntry, SnapshotCapture,
 };
 use crate::{select_driver, EngineConfig, Worker};
 
@@ -206,8 +206,8 @@ pub fn authorize_coordinator_frame(
 /// coordinator decisions out. The harness plays the network seat (sign → verify above the pump →
 /// deliver, per-sender dense seqs) exactly as the testkit barrier harness does for workers.
 pub struct Coordinator {
-    pump: crate::v2::PumpHandle,
-    run: Option<V2Run>,
+    pump: crate::run::PumpHandle,
+    run: Option<Run>,
     /// Keep the engine alive for the run's lifetime.
     _engine: Worker,
     sink: Arc<Mutex<MemorySink>>,
@@ -304,7 +304,7 @@ impl Coordinator {
             module: module_hash,
         };
         let sink = Arc::new(Mutex::new(MemorySink::new()));
-        let run_cfg = V2RunConfig::new(identity, key_seed, spec.config_bytes.clone(), grants);
+        let run_cfg = RunConfig::new(identity, key_seed, spec.config_bytes.clone(), grants);
         let run = start_run_migrating(&engine, wasm, run_cfg, Box::new(sink.clone()), migration)
             .map_err(|e| format!("coordinator start_run: {e}"))?;
         Ok(Self {
@@ -436,7 +436,7 @@ impl Coordinator {
 
     /// The embedder's pump handle (hold/release, stop — the rig controls).
     #[must_use]
-    pub fn pump(&self) -> crate::v2::PumpHandle {
+    pub fn pump(&self) -> crate::run::PumpHandle {
         self.pump.clone()
     }
 

@@ -14,4 +14,4 @@ crate-type = ["cdylib"]
 ciborium = "0.2"
 # The SDK bindings under test (data_fetch/read_buffer/…) + the corpus-windowing policy layer
 # (Manifest::locate decides the byte range the module fetches — windowing is MODULE policy).
-daemon-vhc-sdk-v2 = { path = "../../sdk/daemon-vhc-sdk-v2" }
+daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk" }

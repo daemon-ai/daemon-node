@@ -15,7 +15,7 @@
 //!   (the ABI §1.3 step-5 declaration-below-imports rule);
 //! - a declared minor above the host's (2.2) stays `AbiMinorTooNew`.
 //!
-//! Dev/test harness: shells `cargo build` for the guests (the same pattern as `v2_event_loop.rs`),
+//! Dev/test harness: shells `cargo build` for the guests (the same pattern as `event_loop.rs`),
 //! so the fs/process bans are allowed file-wide.
 #![allow(clippy::disallowed_methods)]
 
@@ -25,13 +25,13 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use daemon_vhc_abi::{AbiRefusalCode, HANDLE_KIND_OP_ID};
-use daemon_vhc_host::v2::{
-    decode_event_frame, replay_v2, start_run, CompletionResult, EventV2, MemorySink, OpOutcome,
-    OpRequest, PumpHandle, ReplayEnd, ReplayScript, RunEnd, RunIdentity, SinkEntry, V2RunConfig,
+use daemon_vhc_host::run::{
+    decode_event_frame, replay, start_run, CompletionResult, MemorySink, OpOutcome, OpRequest,
+    PumpHandle, ReplayEnd, ReplayScript, RunConfig, RunEnd, RunEvent, RunIdentity, SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 
-// -- guest build harness (mirrors v2_event_loop.rs) -------------------------------------------------
+// -- guest build harness (mirrors event_loop.rs) -------------------------------------------------
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -175,7 +175,7 @@ fn completion_protocol_runs_end_to_end_and_replays_bit_exact() {
         module: *blake3::hash(&wasm).as_bytes(),
     };
     let payload = b"the-guest-authored-container".to_vec();
-    let run_cfg = V2RunConfig::new(identity, [0x61; 32], payload.clone(), Vec::new());
+    let run_cfg = RunConfig::new(identity, [0x61; 32], payload.clone(), Vec::new());
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
     let store = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -228,11 +228,11 @@ fn completion_protocol_runs_end_to_end_and_replays_bit_exact() {
         .all(|(op, _)| daemon_vhc_abi::handle_kind(*op) == HANDLE_KIND_OP_ID));
     assert!(matches!(
         &completions[0].1,
-        CompletionResult::Ok(daemon_vhc_host::v2::SuccessPayload::Hash(h)) if *h == put_hash
+        CompletionResult::Ok(daemon_vhc_host::run::SuccessPayload::Hash(h)) if *h == put_hash
     ));
     assert!(matches!(
         &completions[1].1,
-        CompletionResult::Ok(daemon_vhc_host::v2::SuccessPayload::Handle(_))
+        CompletionResult::Ok(daemon_vhc_host::run::SuccessPayload::Handle(_))
     ));
     assert_eq!(completions[2].1, CompletionResult::cancelled());
     assert!(matches!(
@@ -246,7 +246,7 @@ fn completion_protocol_runs_end_to_end_and_replays_bit_exact() {
         .iter()
         .filter_map(|e| match e {
             SinkEntry::Event { frame, .. } => match decode_event_frame(frame) {
-                Ok(EventV2::Completion { op, .. }) => Some(op),
+                Ok(RunEvent::Completion { op, .. }) => Some(op),
                 _ => None,
             },
             _ => None,
@@ -261,7 +261,7 @@ fn completion_protocol_runs_end_to_end_and_replays_bit_exact() {
     // -- input replay (§8.7 + the B1 extension): completions re-fed in journaled order ------------
     let mut script = ReplayScript::from_entries(&entries);
     script.payloads.insert(put_hash, payload.clone());
-    let replayed = replay_v2(&worker, &wasm, &payload, &[], script).expect("replay harness");
+    let replayed = replay(&worker, &wasm, &payload, &[], script).expect("replay harness");
     assert_eq!(replayed.end, ReplayEnd::Outcome(0), "replay completes");
     let recorded: Vec<(u64, u64, [u8; 32])> = entries
         .iter()
@@ -285,7 +285,7 @@ fn completion_protocol_runs_end_to_end_and_replays_bit_exact() {
     // -- the §8.7 missing-payload conformance: replay WITHOUT the payload table entry names the
     // typed ReplayMissingPayload divergence, never a silent pass -----------------------------------
     let script_missing = ReplayScript::from_entries(&entries);
-    let replayed = replay_v2(&worker, &wasm, &payload, &[], script_missing).expect("harness");
+    let replayed = replay(&worker, &wasm, &payload, &[], script_missing).expect("harness");
     match replayed.end {
         ReplayEnd::Diverged(msg) => {
             assert!(msg.contains("ReplayMissingPayload"), "typed: {msg}");
@@ -315,14 +315,14 @@ fn minor0_module_never_sees_tag6_and_declaration_below_imports_is_refused() {
         module: *blake3::hash(&wasm).as_bytes(),
     };
     // The counter guest publishes once per delivered frame — deliver one to trigger a publish.
-    let run_cfg = V2RunConfig::new(identity, [0x62; 32], Vec::new(), Vec::new());
+    let run_cfg = RunConfig::new(identity, [0x62; 32], Vec::new(), Vec::new());
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
     assert_eq!(
         run.pump
             .deliver_frame(0, 0, [0x77; 32], vec![1], vec![1])
             .expect("deliver"),
-        daemon_vhc_host::v2::DeliverVerdict::Accepted
+        daemon_vhc_host::run::DeliverVerdict::Accepted
     );
     let deadline = Instant::now() + Duration::from_secs(30);
     while run.pump.published().is_empty() {
@@ -341,7 +341,7 @@ fn minor0_module_never_sees_tag6_and_declaration_below_imports_is_refused() {
         if let SinkEntry::Event { frame, .. } = e {
             let ev = decode_event_frame(frame).expect("journaled frame decodes");
             assert!(
-                !matches!(ev, EventV2::Completion { .. }),
+                !matches!(ev, RunEvent::Completion { .. }),
                 "a minor-0 run must never be delivered tag 6 (ABI §4.6)"
             );
         }

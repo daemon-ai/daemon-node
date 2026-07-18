@@ -25,9 +25,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_host::v2::{
-    replay_v2, start_run, MemorySink, ReplayEnd, ReplayScript, RunEnd, RunIdentity, SinkEntry,
-    V2RunConfig,
+use daemon_vhc_host::run::{
+    replay, start_run, MemorySink, ReplayEnd, ReplayScript, RunConfig, RunEnd, RunIdentity,
+    SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, TrapCode, Worker};
 
@@ -112,12 +112,12 @@ struct Ran {
 fn run_scenario(
     wasm: &[u8],
     config: Vec<u8>,
-    tune: impl FnOnce(&mut V2RunConfig),
+    tune: impl FnOnce(&mut RunConfig),
     expect_publishes: usize,
 ) -> Ran {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let module_hash = *blake3::hash(wasm).as_bytes();
-    let mut cfg = V2RunConfig::new(identity(1, module_hash), [0x5C; 32], config, Vec::new());
+    let mut cfg = RunConfig::new(identity(1, module_hash), [0x5C; 32], config, Vec::new());
     tune(&mut cfg);
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, cfg, Box::new(sink.clone())).expect("start");
@@ -199,7 +199,7 @@ fn wasm_guest_backward_is_bit_exact_and_replays() {
         "the export journaled its kind-5 TensorData record"
     );
     let worker = Worker::new(EngineConfig::default()).expect("engine");
-    let replayed = replay_v2(&worker, &wasm, &[0, 0], &[], script).expect("replay harness");
+    let replayed = replay(&worker, &wasm, &[0, 0], &[], script).expect("replay harness");
     assert_eq!(replayed.end, ReplayEnd::Outcome(0));
     let recorded: Vec<[u8; 32]> = ran
         .entries

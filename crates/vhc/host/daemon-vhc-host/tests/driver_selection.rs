@@ -114,7 +114,7 @@ fn v1_shaped_module_is_refused_abi_unsupported_major_post_sunset() {
 // module end-to-end — refactor §5 A2) --------------------------------------------------------------
 
 #[test]
-fn v2_module_selects_the_event_loop_driver() {
+fn module_selects_the_event_loop_driver() {
     let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 0));
     let sel = select_driver(&worker(), &wasm, Some(blake3::hash(&wasm).as_bytes()))
         .expect("major 2 selects the A2 event-loop driver");
@@ -127,7 +127,7 @@ fn v2_module_selects_the_event_loop_driver() {
 /// bridge imports never make a module major-1), never a `BadModule`, never a trap. The offending
 /// input is hand-assembled in-test; no recorded bridge artifact exists.
 #[test]
-fn v2_module_importing_the_retired_bridge_is_refused_bridge_retired() {
+fn module_importing_the_retired_bridge_is_refused_bridge_retired() {
     let wasm = build_module(
         &[("vhc@2", "next_event"), ("tabi@1", "batch_size@1")],
         V2_EXPORTS,

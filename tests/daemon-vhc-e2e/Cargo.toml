@@ -35,11 +35,11 @@ tokio = { workspace = true }
 # vhc_dep_check), removed when the engine re-seats onto vhc-sim.
 daemon-vhc-sdk-rounds = { workspace = true }
 # The B2 corpus-windowing equivalence oracle (tests/corpus_windowing_oracle.rs): the SDK-side
-# windowing policy (`daemon-vhc-sdk-v2::corpus`) must match the retained host pipeline
+# windowing policy (`daemon-vhc-sdk::corpus`) must match the retained host pipeline
 # (`daemon-vhc-session::data`) decision-for-decision. This leaf test crate is the one place both
 # sides link legally (same rationale as the daemon-vhc-sdk-rounds entry above). Path dep
 # (sdk-v2 is deliberately not in the frozen root [workspace.dependencies]).
-daemon-vhc-sdk-v2 = { path = "../../crates/vhc/sdk/daemon-vhc-sdk-v2" }
+daemon-vhc-sdk = { path = "../../crates/vhc/sdk/daemon-vhc-sdk" }
 # The pure coordinator `tick` loop (drills.rs) + observe replay oracle.
 # Relocated at D2 from the dissolved daemon-vhc-coordinator into sdk/daemon-vhc-sdk-consensus's
 # `coordinator` module; this leaf e2e crate links it directly (same both-sides-link rationale as

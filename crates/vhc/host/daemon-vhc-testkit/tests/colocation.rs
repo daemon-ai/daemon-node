@@ -27,7 +27,7 @@ use std::process::Command;
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use daemon_vhc_host::v2::{RunEnd, RunIdentity};
+use daemon_vhc_host::run::{RunEnd, RunIdentity};
 use daemon_vhc_node::{AdmitRefusal, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId};
 use daemon_vhc_testkit::run::{whole_run, RunSpec};
 use daemon_vhc_testkit::{genesis_whole_run, GenesisRunSpec};

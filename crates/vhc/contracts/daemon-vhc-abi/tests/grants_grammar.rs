@@ -78,7 +78,7 @@ fn manifest_root_validates() {
     let manifest = map(vec![
         ("name", t("tiny-llama")),
         ("version", t("1.0.0")),
-        ("sdk", t("daemon-vhc-sdk-v2")),
+        ("sdk", t("daemon-vhc-sdk")),
         ("abi", u(2 << 16)),
         ("worlds", Value::Array(vec![world])),
         ("custom_ops", Value::Array(vec![])),
