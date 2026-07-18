@@ -132,6 +132,26 @@ impl ContentStore for MemoryContentStore {
     }
 }
 
+/// A payload plane: opaque payload objects keyed by `(run, round, peer)` + content hash (§7.1).
+///
+/// PUT your sealed update object; GET a committed object (verified against the hash the commitment
+/// carried); HEAD (`stat`) to attest availability without transferring bytes. A payload is opaque —
+/// the transport moves, hashes, and (on GET) verifies it, but never parses it (§7.3).
+#[async_trait]
+pub trait PayloadStore: Send + Sync {
+    /// PUT an opaque payload object, returning its content hash (blake3).
+    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, VhcNetError>;
+
+    /// GET a payload object, verifying its content hash equals `expected`. A hash mismatch is a
+    /// typed [`VhcNetError::HashMismatch`]; a missing/expired object is [`VhcNetError::PayloadMiss`].
+    async fn get(&self, key: &PayloadKey, expected: &ContentHash) -> Result<Vec<u8>, VhcNetError>;
+
+    /// HEAD-equivalent availability check (`stat`): the object's size + content hash, without
+    /// transferring the bytes to the caller. A missing/expired object is
+    /// [`VhcNetError::PayloadMiss`].
+    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, VhcNetError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,24 +171,4 @@ mod tests {
             Err(VhcNetError::PayloadMiss(_))
         ));
     }
-}
-
-/// A payload plane: opaque payload objects keyed by `(run, round, peer)` + content hash (§7.1).
-///
-/// PUT your sealed update object; GET a committed object (verified against the hash the commitment
-/// carried); HEAD (`stat`) to attest availability without transferring bytes. A payload is opaque —
-/// the transport moves, hashes, and (on GET) verifies it, but never parses it (§7.3).
-#[async_trait]
-pub trait PayloadStore: Send + Sync {
-    /// PUT an opaque payload object, returning its content hash (blake3).
-    async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, VhcNetError>;
-
-    /// GET a payload object, verifying its content hash equals `expected`. A hash mismatch is a
-    /// typed [`VhcNetError::HashMismatch`]; a missing/expired object is [`VhcNetError::PayloadMiss`].
-    async fn get(&self, key: &PayloadKey, expected: &ContentHash) -> Result<Vec<u8>, VhcNetError>;
-
-    /// HEAD-equivalent availability check (`stat`): the object's size + content hash, without
-    /// transferring the bytes to the caller. A missing/expired object is
-    /// [`VhcNetError::PayloadMiss`].
-    async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, VhcNetError>;
 }

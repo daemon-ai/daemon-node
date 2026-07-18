@@ -77,9 +77,9 @@ pub struct RoleSessionSpec {
     pub module: Vec<u8>,
     /// The engine configuration (sandbox budgets, backend lane).
     pub engine: EngineConfig,
-    /// The driver-facing run binding: execution identity, per-run signing seed, admitted config
-    /// + grants bytes, admitted quotas/artifact grants. The signing seed is the certified
-    /// per-run key's — the pump signs every published frame with it.
+    /// The driver-facing run binding: execution identity, per-run signing seed, admitted
+    /// config/grants bytes, admitted quotas/artifact grants. The signing seed is the certified
+    /// per-run key's; the pump signs every published frame with it.
     pub run: RunConfig,
     /// The session's own run-key certificate (issued by the node's base identity; distributed to
     /// peers out of band / on join).
