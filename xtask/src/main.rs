@@ -696,7 +696,8 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "daemon-vhc-worker",
             "daemon-vhc-sdk-consensus",
             "the in-process self-driven join (round-decoding harness seat); \
-             `harness`-feature-gated, off default — the shipped worker refuses JoinRun typed",
+             `harness`-feature-gated, off default — the shipped worker joins through the \
+             role session (opaque frames only; no transport binding = a typed refusal)",
         ),
     ];
 
