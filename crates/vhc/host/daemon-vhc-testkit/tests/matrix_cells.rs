@@ -75,9 +75,19 @@ fn guest_wasm(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// A frozen schema-major-1 envelope's raw bytes (the barrier harness's v1 shape, signed).
-fn frozen_v1_envelope_bytes() -> Vec<u8> {
-    let envelope = daemon_vhc_testkit::barrier::barrier_envelope("matrix-v1", 2, 4, 2, 4);
+/// Synthetic schema-major-1 envelope bytes: a canonical-CBOR map carrying `[run].schema = 1` —
+/// the retired v1 form's outer shape. The refusal is decided by the outer schema-major read
+/// alone (`peek_schema`), so the pin's input needs no retired v1 payload machinery.
+fn synthetic_v1_envelope_bytes() -> Vec<u8> {
+    use ciborium::value::Value;
+    let run = Value::Map(vec![
+        (Value::Text("schema".into()), Value::from(1u32)),
+        (
+            Value::Text("run_id".into()),
+            Value::Text("matrix-v1".into()),
+        ),
+    ]);
+    let envelope = Value::Map(vec![(Value::Text("run".into()), run)]);
     daemon_vhc_proto::to_canonical_vec(&envelope).expect("envelope cbor")
 }
 
@@ -211,7 +221,7 @@ fn cell3_v1_worker_wasm_coordinator_envelope_v1_refused_typed() {
     assert_eq!(refusal.code, AbiRefusalCode::AbiUnsupportedMajor);
 
     // The coordinator axis: envelope v1 cannot configure a wasm coordinator — typed refusal.
-    let bytes = frozen_v1_envelope_bytes();
+    let bytes = synthetic_v1_envelope_bytes();
     assert_eq!(peek_schema(&bytes), Some(1));
     let err = refuse_unconfigurable_envelope(&bytes).unwrap_err();
     assert_eq!(err, WasmCoordError::EnvelopeCannotConfigure(1));
@@ -230,7 +240,7 @@ fn cell7_v2_worker_wasm_coordinator_envelope_v1_refused_typed() {
     let sel = select_driver(&engine, &v2_worker, Some(&hash)).expect("v2 selection");
     assert_eq!(sel.driver, CandidateDriver::V2, "the worker axis is v2");
 
-    let bytes = frozen_v1_envelope_bytes();
+    let bytes = synthetic_v1_envelope_bytes();
     let err = refuse_unconfigurable_envelope(&bytes).unwrap_err();
     assert_eq!(err, WasmCoordError::EnvelopeCannotConfigure(1));
 }

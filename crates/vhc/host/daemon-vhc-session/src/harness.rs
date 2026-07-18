@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! In-process multi-peer harness driven by the real [`LocalCoordinator`] shell (spec §6.2/§6.4).
+//! In-process multi-peer harness driven by the production **wasm coordinator** (spec §6.2/§6.4;
+//! architecture §4.1: consensus is a sandboxed, content-addressed module).
 //!
 //! The harness spins up N in-process [`RoundEngine`] peers over a shared [`LoopbackGossip`] control
-//! plane + a shared [`FsPayloadStore`], plus the [`LocalCoordinator`] (Wave-3's promoted shell around
-//! lane P2's pure `tick`). It collects every peer's [`EngineEvent`] and the coordinator's replay
-//! trajectory, and drives the Wave-3 **churn/failure drills** over the same machinery via the
-//! extended [`SwarmConfig`]:
+//! plane + a shared [`FsPayloadStore`], plus the [`crate::wasm_coordinator_shell`] recording drive
+//! around the `coordinator-quorum` module. It collects every peer's [`EngineEvent`] and the
+//! coordinator's driving trace, and drives the **churn/failure drills** over the same machinery via
+//! the extended [`SwarmConfig`]:
 //!
 //! - [`StallFault`] — a single peer misses one object for N gets (the §6.4 stall ladder);
 //! - [`StoreOutage`] — a peer's whole-round `get`s are denied for a window (store outage);
 //! - [`SilentDeath`] — a peer goes silent mid-run (no `Straggle`) → dropped after K absences;
 //! - [`LateJoin`] — a peer joins at the next epoch boundary, resyncs from a checkpoint, contributes;
-//! - `restart_after_round` — the coordinator shell reloads its state from canonical CBOR mid-run.
+//! - `restart_after_round` — the coordinator module is re-instantiated from its EXPORTED state
+//!   mid-run (quiesce → snapshot → `da_migrate`, ABI §10.2).
 //!
-//! The coordinator-as-storage-client `StorageReceipt` evidence path and the deterministic
-//! finalization live in [`crate::local_coordinator`]; see that module for the "why a receipt path"
-//! and determinism/replay notes.
+//! The coordinator-as-storage-client `StorageReceipt` evidence path, the event-count clock
+//! discipline (one tick per delivered frame; filler-frame deadline forcing gated on the
+//! accounted-set state predicate), and the recording drive live in
+//! [`crate::wasm_coordinator_shell`].
 
 #![allow(clippy::too_many_lines)]
 
@@ -48,11 +51,10 @@ use daemon_vhc_sdk_consensus::coordinator::{CoordinatorParams, CoordinatorState,
 use crate::backend::{StateDigest, StubBackend, TrainerBackend};
 use crate::checkpoint::CheckpointManifest;
 use crate::engine::{EngineConfig, EngineEvent, RoundEngine};
-use crate::local_coordinator::{LocalCoordinator, LocalCoordinatorConfig};
 use crate::seam::{PayloadKey, RoundId, RunId};
 use crate::SwarmRunError;
 
-pub use crate::local_coordinator::CoordinatorReplay;
+pub use crate::wasm_coordinator_shell::CoordinatorReplay;
 
 /// The injected-fault mode a [`FaultyStore`] plays (TEST-ONLY).
 enum Fault {
@@ -230,14 +232,6 @@ pub struct SwarmConfig {
     /// typed sectioned manifest and emits `EngineEvent::TypedCheckpointed`. Default off — every
     /// pre-E harness run is behavior-identical.
     pub typed_checkpoints: bool,
-    /// Record the run through the production **wasm coordinator** module rather than the native
-    /// `tick` shell (architecture §4.1: consensus is a sandboxed, content-addressed module). The
-    /// module is event-driven (one tick per delivered frame), so the captured driving trace is
-    /// reproducible from frames alone — a recorded run and its `swarm-replay` re-derivation share
-    /// one coordinator substrate (this un-gates the observe record/replay path). The event-driven
-    /// drive expects every healthy peer to commit each round (no clock-timeout forcing); the
-    /// clock-forced fault drills stay on the native shell for now.
-    pub wasm_coordinator: bool,
 }
 
 impl Default for SwarmConfig {
@@ -259,7 +253,6 @@ impl Default for SwarmConfig {
             late_join: None,
             restart_after_round: None,
             typed_checkpoints: false,
-            wasm_coordinator: false,
         }
     }
 }
@@ -587,13 +580,6 @@ pub fn peer_key(i: usize) -> SigningKey {
     SigningKey::from_bytes(&[0x11 + i as u8; 32])
 }
 
-/// The coordinator's node identity key (signs the emitted RoundOpen/RoundRecord + the shell's
-/// StorageReceipt evidence).
-#[must_use]
-pub fn coordinator_key() -> SigningKey {
-    SigningKey::from_bytes(&[0xC0; 32])
-}
-
 /// The experiment config bytes every peer builds its backend from (identical across peers, so the
 /// consensus round base coincides — the reconvergence precondition, §5.6).
 pub const EXPERIMENT_CONFIG: &[u8] = b"e2e-experiment-config";
@@ -756,15 +742,19 @@ where
     let obs_log = Arc::new(std::sync::Mutex::new(MessageLog::new(run.as_str())));
     let obs_handle = spawn_message_log(&gossip, version, obs_log.clone());
 
-    // The coordinator drive (subscribes at construction, before it opens round 0). Either the
-    // native `tick` shell or — when `wasm_coordinator` is set — the production coordinator-quorum
-    // module (event-driven), so the recorded run and its replay oracle share one substrate.
-    // The clock-forced churn drills (a silent peer to drop, a stalled round to time out, an
-    // epoch-boundary cooldown+warmup to expire) need finite phase deadlines the wasm shell can
-    // reach with filler frames (the event-count clock discipline). The fault-free lanes keep the
-    // deadlines effectively infinite so the module is driven purely by its event-driven fast paths.
-    let force_deadlines = cfg.wasm_coordinator
-        && (cfg.silent_death.is_some() || cfg.outage.is_some() || cfg.late_join.is_some());
+    // The coordinator drive (subscribes at construction, before it opens round 0): the production
+    // coordinator-quorum module (event-driven, one tick per delivered frame), so the recorded run
+    // and its replay oracle share one substrate. Any run that can leave a round without a full
+    // commitment set (a silent peer to drop, a store outage, a late-join epoch boundary, or a
+    // payload fault whose victim skips training while stalled) needs finite phase deadlines the
+    // shell can reach with filler frames (the event-count clock discipline); the forcing itself
+    // stays gated on the accounted-set state predicate, so an all-committed round always closes
+    // on the fast path untouched. Fault-free runs keep the deadlines effectively infinite so the
+    // module is driven purely by its event-driven fast paths.
+    let force_deadlines = cfg.silent_death.is_some()
+        || cfg.outage.is_some()
+        || cfg.late_join.is_some()
+        || cfg.fault.is_some();
     // The drill's fault plan, in the shell's accounted-set vocabulary: the silent-death peer acts
     // through `after_round` and is deliberately absent thereafter — accounted immediately, so its
     // rounds are deadline-forceable as soon as every healthy peer is accounted.
@@ -782,20 +772,17 @@ where
     // enough that a bounded filler-frame batch expires it.
     const FORCED_PHASE_S: u64 = 40;
     let mut coord_run_config = build_run_config(&run, &cfg);
-    if cfg.wasm_coordinator {
-        let phase = if force_deadlines {
-            FORCED_PHASE_S
-        } else {
-            1_000_000
-        };
-        coord_run_config.warmup_s = phase;
-        coord_run_config.round_train_max_s = phase;
-        coord_run_config.round_witness_s = phase;
-        coord_run_config.cooldown_s = phase;
-    }
+    let phase = if force_deadlines {
+        FORCED_PHASE_S
+    } else {
+        1_000_000
+    };
+    coord_run_config.warmup_s = phase;
+    coord_run_config.round_train_max_s = phase;
+    coord_run_config.round_witness_s = phase;
+    coord_run_config.cooldown_s = phase;
     let coord_state = CoordinatorState::new(coord_run_config, Seed([0xAB; 32]), 0);
-    let coord_handle: JoinHandle<Result<CoordinatorReplay, SwarmRunError>> = if cfg.wasm_coordinator
-    {
+    let coord_handle: JoinHandle<Result<CoordinatorReplay, SwarmRunError>> = {
         let shell_cfg = crate::wasm_coordinator_shell::WasmCoordinatorShellConfig {
             run: run.clone(),
             version,
@@ -816,19 +803,6 @@ where
             shell_cfg,
         );
         tokio::spawn(async move { shell.drive().await })
-    } else {
-        let coord_cfg = LocalCoordinatorConfig {
-            run: run.clone(),
-            key: coordinator_key(),
-            version,
-            state: coord_state,
-            bootstrap_keys: boot_keys.clone(),
-            late_keys: late_key.iter().cloned().collect(),
-            quiescence: Duration::from_millis(1500),
-            restart_after_round: cfg.restart_after_round,
-        };
-        let coordinator = LocalCoordinator::new(gossip.clone(), fs.clone(), coord_cfg);
-        tokio::spawn(async move { coordinator.drive().await })
     };
 
     // Collect events until every expected peer finishes (or leaves / is killed). The timeout is a

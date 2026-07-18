@@ -673,19 +673,20 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         (
             "daemon-vhc-session",
             "daemon-vhc-sdk-consensus",
-            "D2/post-E — the retained RoundEngine's assignment consumption, the coordinator \
-             `tick` the harness shell (local_coordinator) drives, and the E1/E3 checkpoint \
-             attestation vocabulary (ledger + signed attestations on the engine's typed lane); \
-             retires when the engine/harness re-seat onto vhc-sim [normal]",
+            "D2/post-E — the retained RoundEngine's assignment consumption, the shared \
+             coordinator types (CoordinatorState/Input) the wasm-coordinator recording shell \
+             authors + captures, and the E1/E3 checkpoint attestation vocabulary (ledger + \
+             signed attestations on the engine's typed lane); retires when the engine/harness \
+             re-seat onto vhc-sim [normal]",
         ),
         (
             "daemon-vhc-testkit",
             "daemon-vhc-sdk-consensus",
-            "D2 — the barrier harness re-derives worker windows natively, drives the native \
-             coordinator in-process, AND runs the native `tick` as the dual-compilation identity \
-             reference the wasm coordinator-quorum guest is compared against; retires as the \
-             whole-run harness re-seats onto the wasm coordinator and the reference moves to \
-             SDK-side vhc-sim [normal]",
+            "the whole-run harness re-derives worker windows with the guests' own \
+             `assign_batches` and authors the genesis coordinator config \
+             (`{state: CoordinatorState}`) + AuthorityConfig topology — authoring vocabulary \
+             only, no native consensus drive; narrows to a contracts-crate move if the shared \
+             types relocate [normal]",
         ),
         (
             "daemon-vhc-host",

@@ -44,15 +44,9 @@ pub mod v2_attach;
 // lifecycle: the trait seam + `StubBackend` remain (the harness/checkpoint/cold-join substrate);
 // no wasm TrainerBackend exists — major-2 modules run under the v2 event-loop driver.
 
-/// The runnable local-mode coordinator shell (the impure driver around the pure
-/// `daemon-vhc-coordinator` `tick`). Behind the `harness` feature (its coordinator dep is
-/// `harness`-optional), and available to this crate's own tests via `cfg(test)`.
-#[cfg(any(test, feature = "harness"))]
-pub mod local_coordinator;
-
-/// In-process multi-peer harness + the churn/failure drill machinery, driven by the real
-/// [`local_coordinator`] shell. Available to external crates behind the `harness` feature, and to
-/// this crate's own tests via `cfg(test)`.
+/// In-process multi-peer harness + the churn/failure drill machinery, driven by the production
+/// wasm coordinator through the [`wasm_coordinator_shell`] recording drive. Available to external
+/// crates behind the `harness` feature, and to this crate's own tests via `cfg(test)`.
 #[cfg(any(test, feature = "harness"))]
 pub mod harness;
 

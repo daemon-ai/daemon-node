@@ -57,12 +57,69 @@ use daemon_vhc_proto::{
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
-use crate::local_coordinator::CoordinatorReplay;
 use crate::seam::{PayloadKey, RunId};
 use crate::SwarmRunError;
 
 /// The iroh id + class every synthesized `Join` carries (the in-process peers are class-equal).
 const JOIN_IROH_ID: IrohId = IrohId([0x22; 32]);
+
+/// A recorded coordinator run trajectory: the module's genesis-derived initial state + the exact
+/// driving-frame trace it consumed (the reproducible driver trace `daemon-vhc-observe`'s
+/// `RunCapture` records for offline replay), plus how many times the module was re-instantiated
+/// from its exported state mid-run (the restart drill) and the peers it dropped. The module owns
+/// its state, so there is no host-side per-round state trajectory to snapshot — a recorded run is
+/// re-derived through the sandboxed module by [`crate::harness::verify_observe_dir`].
+#[derive(Clone, Debug)]
+pub struct CoordinatorReplay {
+    initial: CoordinatorState,
+    inputs: Vec<Input>,
+    reloads: u32,
+    dropped: std::collections::BTreeSet<PeerId>,
+}
+
+impl CoordinatorReplay {
+    /// Assemble the capture from the recording drive's collected trace.
+    #[must_use]
+    pub(crate) fn from_wasm_capture(
+        initial: CoordinatorState,
+        inputs: Vec<Input>,
+        dropped: std::collections::BTreeSet<PeerId>,
+        reloads: u32,
+    ) -> Self {
+        Self {
+            initial,
+            inputs,
+            reloads,
+            dropped,
+        }
+    }
+
+    /// How many times the module was re-instantiated from its exported state mid-run (the
+    /// restart drill).
+    #[must_use]
+    pub fn reloads(&self) -> u32 {
+        self.reloads
+    }
+
+    /// The peers the coordinator dropped after K record-absences (the silent-death drill, §6.4).
+    #[must_use]
+    pub fn dropped(&self) -> &std::collections::BTreeSet<PeerId> {
+        &self.dropped
+    }
+
+    /// The `CoordinatorState` the run started from (the replay genesis for the observe capture).
+    #[must_use]
+    pub fn initial_state(&self) -> &CoordinatorState {
+        &self.initial
+    }
+
+    /// The exact ordered driving inputs the module consumed — the reproducible driver trace
+    /// `daemon-vhc-observe`'s `RunCapture` records for offline replay.
+    #[must_use]
+    pub fn inputs(&self) -> &[Input] {
+        &self.inputs
+    }
+}
 
 /// Construction inputs for a [`WasmCoordinatorShell`] (mirrors `LocalCoordinatorConfig`, minus the
 /// clock knobs the module owns).

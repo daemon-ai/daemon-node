@@ -27,14 +27,13 @@ daemon-vhc-host = { workspace = true }
 daemon-vhc-abi = { workspace = true }
 # The signed control-plane wire (SignedMessage / SwarmMessage), envelope, blake3. contracts/*.
 daemon-vhc-proto = { workspace = true }
-# The consensus SDK layer (assignment math + — relocated at D2 from the dissolved
-# daemon-vhc-coordinator — the pure `tick` state machine, `coordinator` module). The barrier
-# harness re-derives worker windows with the same `assign_batches` the guests use, drives the
-# native coordinator in-process ("native coordinator + wasm workers", refactor §6), AND runs the
-# native `tick` as the D2 dual-compilation identity reference the wasm coordinator-quorum guest is
-# compared against. TRACKED dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/*
-# is transitional — it retires as the whole-run harness re-seats onto the wasm coordinator and the
-# native reference/assignment re-derivation moves to SDK-side vhc-sim.
+# The consensus SDK layer (assignment math + the shared coordinator types). The whole-run
+# harness re-derives worker windows with the same `assign_batches` the guests use, and authors
+# the genesis coordinator role's opaque config (`{state: CoordinatorState}`) + the typed
+# `AuthorityConfig` topology — authoring vocabulary only; no native consensus drive exists (the
+# coordinator runs exclusively as the sandboxed coordinator-quorum module). TRACKED
+# dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/* narrows to a
+# contracts-crate move if the shared coordinator/authority types ever relocate.
 daemon-vhc-sdk-consensus = { workspace = true }
 blake3 = { workspace = true }
 ciborium = { workspace = true }

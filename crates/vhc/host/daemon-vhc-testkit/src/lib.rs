@@ -17,26 +17,23 @@
 //!   re-drive the recorded journal through the §8.7 input-replay engine and assert every decision
 //!   (publish channel + seq + payload hash) and the terminal outcome reproduce bit-for-bit. A
 //!   diverging replay is a gate FAILURE, never a warning (refactor §12.6).
-//! - [`coordinator`] — [`coordinator::NativeCoordinator`]: the reusable "native coordinator" half —
-//!   the pure `daemon-vhc-coordinator` `tick` state machine wrapped with envelope config, clock
-//!   advancement, and signing, so a whole run can be driven by a real coordinator in-process (the
-//!   "native coordinator + wasm workers" shape ahead of the D2 wasm coordinator).
+//! - [`cell8`] — [`cell8::cell8_whole_run`]: the barrier whole-run harness — N production
+//!   compute@2 trainers under the production `coordinator_quorum.wasm` coordinator, both sides
+//!   under the real major-2 event-loop driver (consensus never runs outside the sandboxed,
+//!   content-addressed module), plus the deterministic fault-injection rig the adversarial
+//!   drills compose.
 //!
 //! The first whole-run gate wired into tier-2 CI is the SPARTA-shaped `toy_averager.wasm` production
 //! blob (timers + publish, no coordinator) — deterministic, journaled, replay-verified.
 
-pub mod barrier;
 pub mod cell8;
-pub mod coordinator;
 pub mod run;
 pub mod wasm_coordinator;
 
-pub use barrier::{barrier_whole_run, BarrierRunReport, BarrierSpec, WorkerReport};
 pub use cell8::{
     cell8_genesis, cell8_whole_run, Cell8Report, Cell8Spec, Cell8WorkerReport, FaultAction,
     FaultPlan, FaultRule, FrameKind,
 };
-pub use coordinator::NativeCoordinator;
 pub use run::{whole_run, ReplayReport, RunSpec, WholeRunReport};
 pub use wasm_coordinator::{
     configure_wasm_coordinator, coordinator_state_from_capture, refuse_unconfigurable_envelope,
