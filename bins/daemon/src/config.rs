@@ -2220,7 +2220,7 @@ mod tests {
 
     // The `[vhc]` section (spec §10.6) is off by default and rides the standard figment layering:
     // defaults <- TOML <- `DAEMON_VHC__*` env. Both a `[vhc]` TOML table and a nested env override
-    // must extract into `NodeConfig.vhc` additively (W1 config embed; TDD config-figment gate).
+    // must extract into `NodeConfig.vhc` additively (the config-embed figment layering gate).
     #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
     #[test]
     fn vhc_section_defaults_off_and_layers_toml_and_env() {

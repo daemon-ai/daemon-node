@@ -5,7 +5,7 @@
 //! A1).
 //!
 //! [`VhcService::vhc_join`](crate::VhcService) used to derive eligibility from a hardware
-//! probe against a hardcoded allowlist coordinator (W1 placeholder). A1 replaces that with real
+//! probe against a hardcoded allowlist coordinator (a placeholder). A1 replaces that with real
 //! discovery: resolve the run from the coordinator registry, fetch + blake3-verify the frozen
 //! envelope, and hand it to the worker's existing `AssessRun` for a real §6.5 verdict **before**
 //! `JoinRun`. This trait is the seam (a [`EgressRunDiscovery`] over
