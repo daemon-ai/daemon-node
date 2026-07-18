@@ -40,7 +40,7 @@ pub use probe::wgpu_adapter_available;
 pub use probe::DeviceLimits;
 pub use runtime::BackendKind;
 pub use runtime::{EngineConfig, Worker};
-pub use select::{select_driver, Selection};
+pub use select::{linked_worlds, select_driver, Selection};
 pub use trap::{Trap, TrapCode};
 
 /// Errors surfaced by the worker host runtime.

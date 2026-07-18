@@ -69,30 +69,24 @@ use daemon_vhc_session::protocol::Event;
 /// seat runs one incarnation per join.
 const RUN_INSTANCE: u64 = 1;
 
-/// The ABI §2.6 derived grants document (§9.4 steps 8/11 hash pinning — assess and join derive
-/// byte-identical copies): the admitted channel table + the worlds the driver links.
-pub(crate) fn derive_grants() -> Vec<u8> {
-    let channels: Vec<ciborium::value::Value> = daemon_vhc_abi::PHASE_A_DEFAULT_CHANNEL_TABLE
-        .iter()
-        .map(|c| ciborium::value::Value::from(u64::from(c.id)))
-        .collect();
-    let worlds = ["vhc@2", "net@2", "sys@2"]
-        .iter()
-        .map(|w| ciborium::value::Value::from(*w))
-        .collect();
-    let doc = ciborium::value::Value::Map(vec![
-        (
-            ciborium::value::Value::from("channels"),
-            ciborium::value::Value::Array(channels),
-        ),
-        (
-            ciborium::value::Value::from("worlds"),
-            ciborium::value::Value::Array(worlds),
-        ),
-    ]);
-    let mut b = Vec::new();
-    ciborium::into_writer(&doc, &mut b).expect("grants cbor");
-    b
+/// Author the complete ABI §2.6 grants document for the run's worker role (§9.4 steps 8/11 hash
+/// pinning — assess and join derive byte-identical copies). Admission authors the truth: the
+/// document enumerates the complete capability surface the module actually links + the genesis
+/// role grant list — the worlds the module imports (incl. `compute@2`/`data@2`), the role's
+/// channel table, custom ops, artifacts, buffer limits, and rate/quota bounds. This replaces the
+/// former hand-rolled `vhc@2`/`net@2`/`sys@2` subset (audit finding: grants inconsistent with
+/// what the trainer uses).
+///
+/// Both assess ([`crate::backend`]) and join call this with the SAME `(worker, module, genesis
+/// role)` inputs, so the canonical bytes — and the grants hash — match by construction.
+pub(crate) fn derive_grants(
+    worker: &Worker,
+    module: &[u8],
+    role_grants: &daemon_vhc_proto::genesis::RoleGrants,
+) -> Result<Vec<u8>, String> {
+    let linked = daemon_vhc_host::linked_worlds(worker, module)
+        .map_err(|e| format!("linked worlds for grants authoring: {e}"))?;
+    Ok(daemon_vhc_proto::GrantsDoc::author(&linked, role_grants).to_canonical_bytes())
 }
 
 /// How many rounds the self-driven t2 run drives before a clean stop.
@@ -295,7 +289,8 @@ pub(crate) async fn join_and_run(
     if sel.driver != daemon_vhc_abi::CandidateDriver::V2 {
         return Err("join_and_run on a non-major-2 module".into());
     }
-    let grants = derive_grants();
+    let worker_role_grants = &genesis.env.roles[&genesis.worker_role].grants;
+    let grants = derive_grants(&worker, module, worker_role_grants)?;
 
     // The coordinator configuration, derived from the frozen genesis (the production seat:
     // pinned module hash, verbatim opaque config, declared AuthorityConfig, cryptographic RunId).
@@ -359,7 +354,12 @@ pub(crate) async fn join_and_run(
     // data@2::fetch are both answered through T2Artifacts::fetch; the run's artifact grants are
     // exactly the store's committed hashes (which artifacts a module may touch is a grant).
     let (artifacts, manifest_hash) = t2_corpus_artifacts()?;
-    let mut run_cfg = RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
+    let mut run_cfg = RunConfig::new(
+        identity.clone(),
+        worker_key_seed,
+        config.to_vec(),
+        grants.clone(),
+    );
     run_cfg.granted_artifacts = artifacts.granted();
     // A real transformer's per-round op stream exceeds the tiny default queue depth (the guest
     // also fences per inner step to reclaim depth).
@@ -370,10 +370,12 @@ pub(crate) async fn join_and_run(
     let pump = run.pump.clone();
 
     // -- the run's REAL coordinator, in-process under the major-2 driver --------------------
+    let coord_role_grants = &genesis.env.roles[&coordinator_role].grants;
+    let coord_grants = derive_grants(&worker, &coordinator_wasm, coord_role_grants)?;
     let mut coord = Coordinator::start(
         &coordinator_wasm,
         &coord_spec,
-        derive_grants(),
+        coord_grants,
         0,
         coord_key_seed,
     )?;
@@ -593,7 +595,7 @@ pub(crate) async fn join_and_run(
     // The identity behind the recorded run: what `sys@2::rng_seed` re-derives from at replay
     // (in a real journal this rides the tag-0 run header).
     script.identity = Some(identity);
-    let replayed = replay(&worker, module, config, &derive_grants(), script)
+    let replayed = replay(&worker, module, config, &grants, script)
         .map_err(|e| format!("replay harness: {e}"))?;
     if replayed.end != ReplayEnd::Outcome(0) {
         return Err(format!("input replay diverged: {:?}", replayed.end));

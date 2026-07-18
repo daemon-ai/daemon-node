@@ -864,9 +864,23 @@ fn assess_module(
         vram_cap_bytes: 0,
         host_cap_bytes: 0,
     };
-    // The derived grants document (§2.6 stand-in): the SAME deterministic derivation the v2 join
-    // uses, so assess and join evaluate byte-identical (config, grants) pairs (§9.4 pinning).
-    let grants = crate::session::derive_grants();
+    // The complete §2.6 grants document: the SAME deterministic derivation the v2 join uses
+    // (worlds the module links ∪ the genesis role grant list), so assess and join evaluate
+    // byte-identical (config, grants) pairs (§9.4 pinning). The no-envelope path authors from an
+    // empty role grant (worlds still covered from the module's imports).
+    let default_role = daemon_vhc_proto::genesis::RoleGrants::default();
+    let role_grants = envelope_grants.map_or(&default_role, |eg| &eg.grants);
+    let grants = match crate::session::derive_grants(worker, module, role_grants) {
+        Ok(g) => g,
+        Err(detail) => {
+            return Eligibility {
+                eligible: false,
+                reasons: vec![detail],
+                headroom: Vec::new(),
+                refusal_code: None,
+            }
+        }
+    };
     match daemon_vhc_host::run::admit(
         worker,
         module,

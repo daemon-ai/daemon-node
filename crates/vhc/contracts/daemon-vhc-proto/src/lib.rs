@@ -61,7 +61,7 @@ pub use genesis::{
     GenesisEnvelope, GrantBound, Identities, MigrationGrant, RoleEntry, RoleGrants, RunSection,
     SnapshotArtifact, TransportSelection, WorldGrant, GENESIS_SCHEMA_MAJOR,
 };
-pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsError, LaneCeilings};
+pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsDoc, GrantsError, LaneCeilings};
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
 pub use messages::{SignedMessage, VhcMessage};
