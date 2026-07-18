@@ -368,9 +368,9 @@ pub enum WsAuthSpec {
     /// No auth (bare `ws://` dev target).
     #[default]
     None,
-    /// `Authorization: Bearer <token>` (the gateway `swarm:join` path).
+    /// `Authorization: Bearer <token>` (the gateway `vhc:join` path).
     Bearer(String),
-    /// The internal identity headers `x-daemon-org-id` / `x-daemon-actor` (direct-to-`apps/swarm`).
+    /// The internal identity headers `x-daemon-org-id` / `x-daemon-actor` (direct-to-`apps/vhc`).
     Internal {
         /// The org id header value.
         org_id: String,
@@ -496,7 +496,7 @@ pub struct JoinCredentials {
     #[serde(default)]
     pub iroh: Option<IrohCredentials>,
     /// Optional presign base for the `R2Store` payload plane (e.g.
-    /// `http://127.0.0.1:8795/api/v1/swarm`). Absent ⇒ `FsPayloadStore` fallback (tests / LAN).
+    /// `http://127.0.0.1:8795/api/v1/vhc`). Absent ⇒ `FsPayloadStore` fallback (tests / LAN).
     #[serde(default)]
     pub presign_base: Option<String>,
     /// The engine + corpus knobs.
@@ -540,7 +540,7 @@ mod tests {
         });
         round_trip_command(Command::JoinRun {
             run_id: "run-42".into(),
-            coordinator: "wss://coord.example/swarm".into(),
+            coordinator: "wss://coord.example/vhc".into(),
             credentials: vec![0xde, 0xad, 0xbe, 0xef],
             policy: JoinPolicy {
                 mode: PolicyMode::Idle,
@@ -685,7 +685,7 @@ mod tests {
                     relay_url: Some("http://127.0.0.1:3340".into()),
                 }],
             }),
-            presign_base: Some("http://127.0.0.1:8795/api/v1/swarm".into()),
+            presign_base: Some("http://127.0.0.1:8795/api/v1/vhc".into()),
             engine: EngineParams {
                 steps_per_round: 2,
                 micro_batch: 2,

@@ -27,13 +27,13 @@ use daemon_vhc_session::data::Manifest;
 
 /// The presign coordinator target + auth (mirrors the worker's `JoinCredentials` auth choices).
 pub struct Target {
-    /// The coordinator presign base, e.g. `https://daemon-swarm-dev.me-dc6.workers.dev/api/v1/swarm`.
+    /// The coordinator presign base, e.g. `https://daemon-vhc-dev.me-dc6.workers.dev/api/v1/vhc`.
     pub presign_base: String,
     /// The run id whose prefix the objects live under (`runs/<run>/…`).
     pub run: String,
-    /// `swarm:*`-scoped bearer token (gateway path), if any.
+    /// `vhc:*`-scoped bearer token (gateway path), if any.
     pub bearer: Option<String>,
-    /// Internal identity headers (direct-to-`apps/swarm` dev path): `(org_id, actor)`.
+    /// Internal identity headers (direct-to-`apps/vhc` dev path): `(org_id, actor)`.
     pub internal: Option<(String, String)>,
 }
 

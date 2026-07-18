@@ -4,7 +4,7 @@
 //! [`WsControlPlane`] — the node WS coordinator client (spec §11.2; A1).
 //!
 //! The node dials **out** to the cloud `RunCoordinatorDO`'s WebSocket surface —
-//! `GET {base}/runs/:id/ws` (daemon-cloud `apps/swarm`, `coordinator/do.ts`) — over `wss://`,
+//! `GET {base}/runs/:id/ws` (daemon-cloud `apps/vhc`, `coordinator/do.ts`) — over `wss://`,
 //! speaking canonical-CBOR [`SignedMessage`](daemon_vhc_proto::SignedMessage) frames **both
 //! ways**. It presents as a [`ControlPlane`]: `publish` sends a frame up the socket, `subscribe`
 //! delivers inbound frames, so the frozen `RoundEngine` runs over it unchanged.
@@ -33,9 +33,9 @@
 //! ## Auth
 //!
 //! Credentials come from the run's `JoinRun.credentials` / node config — **never hardcoded**. The
-//! gateway path carries a `swarm:join`-scoped API key as `Authorization: Bearer <token>`
-//! (`apps/gateway/src/routes/swarm.ts`); the direct-to-worker dev path carries the internal
-//! identity headers `x-daemon-org-id` / `x-daemon-actor` (`apps/swarm/src/middleware/internalAuth`).
+//! gateway path carries a `vhc:join`-scoped API key as `Authorization: Bearer <token>`
+//! (`apps/gateway/src/routes/vhc.ts`); the direct-to-worker dev path carries the internal
+//! identity headers `x-daemon-org-id` / `x-daemon-actor` (`apps/vhc/src/middleware/internalAuth`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -66,10 +66,10 @@ pub enum WsAuth {
     /// No auth headers (a bare mock server / a listener that trusts the network position).
     #[default]
     None,
-    /// `Authorization: Bearer <token>` — the gateway path (`swarm:join`-scoped API key).
+    /// `Authorization: Bearer <token>` — the gateway path (`vhc:join`-scoped API key).
     Bearer(String),
     /// The internal identity headers `x-daemon-org-id` / `x-daemon-actor` — the direct-to-worker
-    /// dev path (`apps/swarm` trusts the gateway-forwarded headers).
+    /// dev path (`apps/vhc` trusts the gateway-forwarded headers).
     Internal {
         /// `x-daemon-org-id`.
         org_id: String,
@@ -105,8 +105,8 @@ impl Default for ReconnectConfig {
 /// Construction surface for [`WsControlPlane`] (frozen at Merge 1).
 #[derive(Clone, Debug)]
 pub struct WsConfig {
-    /// The vhc coordinator base URL (spec §11.1), e.g. `https://api.daemon.ai/api/v1/swarm` (the
-    /// gateway) or `http://127.0.0.1:8795/api/v1/swarm` (a bare `wrangler dev`). The `base_url` swap
+    /// The vhc coordinator base URL (spec §11.1), e.g. `https://api.daemon.ai/api/v1/vhc` (the
+    /// gateway) or `http://127.0.0.1:8795/api/v1/vhc` (a bare `wrangler dev`). The `base_url` swap
     /// (gateway ↔ wrangler-dev ↔ mock) is trivial by design — only this field changes.
     pub base_url: String,
     /// The run whose coordinator DO to attach to (`{base}/runs/:id/ws`).
@@ -457,17 +457,17 @@ mod tests {
     #[test]
     fn endpoint_swaps_scheme_and_appends_ws_path() {
         assert_eq!(
-            ws_endpoint("https://api.daemon.ai/api/v1/swarm", "run-1"),
-            "wss://api.daemon.ai/api/v1/swarm/runs/run-1/ws"
+            ws_endpoint("https://api.daemon.ai/api/v1/vhc", "run-1"),
+            "wss://api.daemon.ai/api/v1/vhc/runs/run-1/ws"
         );
         assert_eq!(
-            ws_endpoint("http://127.0.0.1:8795/api/v1/swarm/", "r"),
-            "ws://127.0.0.1:8795/api/v1/swarm/runs/r/ws"
+            ws_endpoint("http://127.0.0.1:8795/api/v1/vhc/", "r"),
+            "ws://127.0.0.1:8795/api/v1/vhc/runs/r/ws"
         );
         // An already-ws base is preserved (only the path is appended).
         assert_eq!(
-            ws_endpoint("wss://coord.example/swarm", "x"),
-            "wss://coord.example/swarm/runs/x/ws"
+            ws_endpoint("wss://coord.example/vhc", "x"),
+            "wss://coord.example/vhc/runs/x/ws"
         );
     }
 

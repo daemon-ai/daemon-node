@@ -13,7 +13,7 @@
 //!
 //! It SKIPS cleanly (like C1's `r2-smoke`) unless `VHC_LIVE_WS_URL` is set, so it never runs in the
 //! offline workspace gate. Drive it after seeding a run against wrangler-dev (port 8795):
-//!   VHC_LIVE_WS_URL=http://127.0.0.1:8795/api/v1/swarm VHC_LIVE_RUN_ID=run-live \
+//!   VHC_LIVE_WS_URL=http://127.0.0.1:8795/api/v1/vhc VHC_LIVE_RUN_ID=run-live \
 //!     cargo test -p daemon-vhc-net --features ws --test ws_live_do -- --nocapture
 
 mod common;
@@ -68,7 +68,7 @@ async fn connect_live(base_url: &str, run_id: &str) -> WsControlPlane {
 #[tokio::test(flavor = "multi_thread")]
 async fn live_ws_framing_relay_and_resubscribe_against_wrangler_dev() {
     let Ok(base_url) = std::env::var("VHC_LIVE_WS_URL") else {
-        eprintln!("SKIP live_ws_do: set VHC_LIVE_WS_URL (e.g. http://127.0.0.1:8795/api/v1/swarm)");
+        eprintln!("SKIP live_ws_do: set VHC_LIVE_WS_URL (e.g. http://127.0.0.1:8795/api/v1/vhc)");
         return;
     };
     let run_id = std::env::var("VHC_LIVE_RUN_ID").unwrap_or_else(|_| "run-live".into());

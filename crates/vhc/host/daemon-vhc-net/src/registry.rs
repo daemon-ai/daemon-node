@@ -4,9 +4,9 @@
 //! [`RegistryClient`] — run discovery + envelope fetch against the coordinator registry (spec
 //! §6.1/§11.1; A1).
 //!
-//! The cloud `apps/swarm` worker exposes a validation-only run registry:
+//! The cloud `apps/vhc` worker exposes a validation-only run registry:
 //! `GET {base}/runs` (snapshot) and `GET {base}/runs/:id` (one descriptor), each wrapped in
-//! `{ "data": … }` (`apps/swarm/src/registry.ts`, `index.ts`). The descriptors carry the frozen
+//! `{ "data": … }` (`apps/vhc/src/registry.ts`, `index.ts`). The descriptors carry the frozen
 //! envelope's blake3 (`envelope_hash`) + artifact manifest, never the module bytes — the cloud
 //! never fetches/executes a module (spec §11.1/§12), and every peer re-derives eligibility at
 //! assess (§6.5).
@@ -15,7 +15,7 @@
 //! envelope object (presigned `GET` of `runs/<run>/envelope.cbor`, §11.3) and **blake3-verifies** it
 //! against the descriptor's `envelope_hash` before handing the bytes to the worker's `AssessRun`.
 //! All outbound HTTP rides the SSRF-safe [`EgressClient`] (raw `reqwest::Client` is clippy-banned);
-//! auth is the same `swarm:*` credential the WS client uses (Bearer for the gateway, or the internal
+//! auth is the same `vhc:*` credential the WS client uses (Bearer for the gateway, or the internal
 //! identity headers for a direct-to-worker dev target) — never hardcoded.
 
 use daemon_egress::{EgressClient, EgressRequest, Redirects};
@@ -37,7 +37,7 @@ pub struct RunArtifact {
     pub size: u64,
 }
 
-/// A run descriptor from the registry (`apps/swarm` `RunDescriptor`). Experiment-opaque: it carries
+/// A run descriptor from the registry (`apps/vhc` `RunDescriptor`). Experiment-opaque: it carries
 /// the frozen envelope's hash + artifact manifest, never module bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDescriptor {
@@ -71,7 +71,7 @@ pub struct RunDescriptor {
     pub envelope_key: String,
 }
 
-/// The `{ "data": T }` envelope every `apps/swarm` route wraps its success body in.
+/// The `{ "data": T }` envelope every `apps/vhc` route wraps its success body in.
 #[derive(Deserialize)]
 struct DataEnvelope<T> {
     data: T,
@@ -80,7 +80,7 @@ struct DataEnvelope<T> {
 /// The coordinator's latest published-checkpoint pointer (spec §9; lane R), read from
 /// `GET {base}/runs/:id/state`.`data.checkpoint`. `None` there ⇒ no checkpoint published yet (a
 /// rejoining peer falls back to fresh-state, §9 first-epoch). Mirrors the cloud `CheckpointPointer`
-/// (`apps/swarm/src/coordinator/checkpoint.ts`).
+/// (`apps/vhc/src/coordinator/checkpoint.ts`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointPointer {
     /// The round the checkpoint captures (post-ingest state).
@@ -117,7 +117,7 @@ pub struct RunState {
     pub checkpoint: Option<CheckpointPointer>,
 }
 
-/// The `swarm:*` credential the registry + presign requests carry (never hardcoded — sourced from
+/// The `vhc:*` credential the registry + presign requests carry (never hardcoded — sourced from
 /// `JoinRun.credentials` / node config, mirroring [`crate::ws_client::WsAuth`]).
 #[derive(Clone, Debug, Default)]
 enum Auth {
@@ -131,7 +131,7 @@ enum Auth {
 }
 
 /// Discovery + envelope-fetch client against a coordinator registry base
-/// (e.g. `https://api.daemon.ai/api/v1/swarm`).
+/// (e.g. `https://api.daemon.ai/api/v1/vhc`).
 pub struct RegistryClient {
     egress: EgressClient,
     base_url: String,
@@ -148,14 +148,14 @@ impl RegistryClient {
         }
     }
 
-    /// Attach the `swarm:*`-scoped API-key bearer token (the gateway path).
+    /// Attach the `vhc:*`-scoped API-key bearer token (the gateway path).
     #[must_use]
     pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
         self.auth = Auth::Bearer(token.into());
         self
     }
 
-    /// Attach the internal identity headers (the direct-to-`apps/swarm` dev path).
+    /// Attach the internal identity headers (the direct-to-`apps/vhc` dev path).
     #[must_use]
     pub fn with_internal(mut self, org_id: impl Into<String>, actor: impl Into<String>) -> Self {
         self.auth = Auth::Internal {
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn run_descriptor_decodes_registry_shape() {
-        // The `{ "data": … }`-wrapped shape `apps/swarm` returns, with optional fields present.
+        // The `{ "data": … }`-wrapped shape `apps/vhc` returns, with optional fields present.
         let json = r#"{
             "run_id": "run-1", "schema": 1, "proto_version": 3,
             "envelope_hash": "aa", "author_pubkey": "bb",
