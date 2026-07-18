@@ -1,0 +1,443 @@
+{
+  "description": "Normative seat-slot CAS vectors: every conforming seat registry (the Rust SeatSlot::fold, the cloud implementation) must reproduce these decisions and slot transitions bit-for-bit. The fold is structural only — signatures and authority are peer-side and deliberately absent here. Byte fields are fill-byte tags: `run`/`claimant`/`module` N means the 32-byte array [N; 32]. `expect.kind` matches the decision variant only (structural reasons are diagnostics, not contract). `expect_slot` is the observable projection after the step: `leased_token`/`leased_claimant` are null when unclaimed; `last_fencing_token` is the tombstone floor.",
+  "lease_defaults": {
+    "domain": "daemon-vhc/seat-lease/1.0.0",
+    "run": 1,
+    "role": "coordinator",
+    "epoch": 0,
+    "module": 204,
+    "endpoint_ws": "wss://registry.example/runs/demo/ws",
+    "issued_at_ms": 1000,
+    "expires_at_ms": 31000,
+    "heartbeat_interval_ms": 10000
+  },
+  "vectors": [
+    {
+      "name": "first_claim_on_a_virgin_slot_is_accepted_at_its_presented_token",
+      "skew_ms": 5000,
+      "initial": { "lease": null, "last_fencing_token": null },
+      "steps": [
+        {
+          "now_ms": 1000,
+          "request": { "claim": { "incarnation": 0, "fencing_token": 0, "claimant": 10 } },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 0, "leased_claimant": 10, "last_fencing_token": 0 }
+        }
+      ]
+    },
+    {
+      "name": "a_virgin_slot_accepts_a_nonzero_first_token_as_presented",
+      "skew_ms": 5000,
+      "initial": { "lease": null, "last_fencing_token": null },
+      "steps": [
+        {
+          "now_ms": 1000,
+          "request": { "claim": { "incarnation": 3, "fencing_token": 3, "claimant": 10 } },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 3, "leased_claimant": 10, "last_fencing_token": 3 }
+        }
+      ]
+    },
+    {
+      "name": "a_live_lease_refuses_a_different_claimant_held_not_a_token_race",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 0, "fencing_token": 0, "claimant": 10 },
+        "last_fencing_token": 0
+      },
+      "steps": [
+        {
+          "now_ms": 2000,
+          "request": { "claim": { "incarnation": 1, "fencing_token": 1, "claimant": 20 } },
+          "expect": { "kind": "rejected_held" },
+          "expect_slot": { "leased_token": 0, "leased_claimant": 10, "last_fencing_token": 0 }
+        }
+      ]
+    },
+    {
+      "name": "expiry_boundary_is_expiry_plus_skew_exclusive",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 0, "fencing_token": 0, "claimant": 10 },
+        "last_fencing_token": 0
+      },
+      "steps": [
+        {
+          "now_ms": 36000,
+          "request": { "claim": { "incarnation": 1, "fencing_token": 1, "claimant": 20 } },
+          "expect": { "kind": "rejected_held" },
+          "expect_slot": { "leased_token": 0, "leased_claimant": 10, "last_fencing_token": 0 }
+        },
+        {
+          "now_ms": 36001,
+          "request": {
+            "claim": {
+              "incarnation": 1,
+              "fencing_token": 1,
+              "claimant": 20,
+              "issued_at_ms": 36001,
+              "expires_at_ms": 66001
+            }
+          },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 1, "leased_claimant": 20, "last_fencing_token": 1 }
+        }
+      ]
+    },
+    {
+      "name": "an_expired_takeover_must_present_exactly_floor_plus_one",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 2, "fencing_token": 2, "claimant": 10 },
+        "last_fencing_token": 2
+      },
+      "steps": [
+        {
+          "now_ms": 40000,
+          "request": { "claim": { "incarnation": 4, "fencing_token": 4, "claimant": 20 } },
+          "expect": { "kind": "rejected_fencing_conflict", "expected": 3, "got": 4 },
+          "expect_slot": { "leased_token": 2, "leased_claimant": 10, "last_fencing_token": 2 }
+        },
+        {
+          "now_ms": 40000,
+          "request": { "claim": { "incarnation": 2, "fencing_token": 2, "claimant": 20 } },
+          "expect": { "kind": "rejected_fencing_conflict", "expected": 3, "got": 2 },
+          "expect_slot": { "leased_token": 2, "leased_claimant": 10, "last_fencing_token": 2 }
+        },
+        {
+          "now_ms": 40000,
+          "request": {
+            "claim": {
+              "incarnation": 3,
+              "fencing_token": 3,
+              "claimant": 20,
+              "issued_at_ms": 40000,
+              "expires_at_ms": 70000
+            }
+          },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 3, "leased_claimant": 20, "last_fencing_token": 3 }
+        }
+      ]
+    },
+    {
+      "name": "the_same_claimant_may_refresh_at_the_held_token_or_self_supersede_at_plus_one",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 1, "fencing_token": 1, "claimant": 10 },
+        "last_fencing_token": 1
+      },
+      "steps": [
+        {
+          "now_ms": 5000,
+          "request": {
+            "claim": {
+              "incarnation": 1,
+              "fencing_token": 1,
+              "claimant": 10,
+              "issued_at_ms": 5000,
+              "expires_at_ms": 35000
+            }
+          },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 1, "leased_claimant": 10, "last_fencing_token": 1 }
+        },
+        {
+          "now_ms": 6000,
+          "request": {
+            "claim": {
+              "incarnation": 2,
+              "fencing_token": 2,
+              "claimant": 10,
+              "issued_at_ms": 6000,
+              "expires_at_ms": 36000
+            }
+          },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 2, "leased_claimant": 10, "last_fencing_token": 2 }
+        },
+        {
+          "now_ms": 7000,
+          "request": { "claim": { "incarnation": 4, "fencing_token": 4, "claimant": 10 } },
+          "expect": { "kind": "rejected_fencing_conflict", "expected": 3, "got": 4 },
+          "expect_slot": { "leased_token": 2, "leased_claimant": 10, "last_fencing_token": 2 }
+        }
+      ]
+    },
+    {
+      "name": "renew_requires_the_exact_held_identity_and_token",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 1, "fencing_token": 1, "claimant": 10 },
+        "last_fencing_token": 1
+      },
+      "steps": [
+        {
+          "now_ms": 10000,
+          "request": {
+            "renew": {
+              "incarnation": 1,
+              "fencing_token": 1,
+              "claimant": 10,
+              "issued_at_ms": 10000,
+              "expires_at_ms": 40000
+            }
+          },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 1, "leased_claimant": 10, "last_fencing_token": 1 }
+        },
+        {
+          "now_ms": 11000,
+          "request": { "renew": { "incarnation": 2, "fencing_token": 2, "claimant": 10 } },
+          "expect": { "kind": "rejected_fencing_conflict", "expected": 1, "got": 2 },
+          "expect_slot": { "leased_token": 1, "leased_claimant": 10, "last_fencing_token": 1 }
+        },
+        {
+          "now_ms": 11000,
+          "request": { "renew": { "incarnation": 1, "fencing_token": 1, "claimant": 20 } },
+          "expect": { "kind": "rejected_fencing_conflict", "expected": 1, "got": 1 },
+          "expect_slot": { "leased_token": 1, "leased_claimant": 10, "last_fencing_token": 1 }
+        }
+      ]
+    },
+    {
+      "name": "a_stale_claimant_renewing_after_a_takeover_is_fenced",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 2, "fencing_token": 2, "claimant": 20 },
+        "last_fencing_token": 2
+      },
+      "steps": [
+        {
+          "now_ms": 12000,
+          "request": { "renew": { "incarnation": 1, "fencing_token": 1, "claimant": 10 } },
+          "expect": { "kind": "rejected_fencing_conflict", "expected": 2, "got": 1 },
+          "expect_slot": { "leased_token": 2, "leased_claimant": 20, "last_fencing_token": 2 }
+        }
+      ]
+    },
+    {
+      "name": "renew_on_an_unclaimed_slot_is_not_held",
+      "skew_ms": 5000,
+      "initial": { "lease": null, "last_fencing_token": 4 },
+      "steps": [
+        {
+          "now_ms": 1000,
+          "request": { "renew": { "incarnation": 4, "fencing_token": 4, "claimant": 10 } },
+          "expect": { "kind": "rejected_not_held" },
+          "expect_slot": { "leased_token": null, "leased_claimant": null, "last_fencing_token": 4 }
+        }
+      ]
+    },
+    {
+      "name": "an_epoch_rebind_renews_under_the_same_token",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 3, "fencing_token": 3, "claimant": 10 },
+        "last_fencing_token": 3
+      },
+      "steps": [
+        {
+          "now_ms": 20000,
+          "request": {
+            "renew": {
+              "incarnation": 3,
+              "fencing_token": 3,
+              "claimant": 10,
+              "epoch": 1,
+              "module": 238,
+              "issued_at_ms": 20000,
+              "expires_at_ms": 50000
+            }
+          },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 3, "leased_claimant": 10, "last_fencing_token": 3 }
+        }
+      ]
+    },
+    {
+      "name": "an_expired_but_untaken_lease_may_still_renew",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 1, "fencing_token": 1, "claimant": 10 },
+        "last_fencing_token": 1
+      },
+      "steps": [
+        {
+          "now_ms": 50000,
+          "request": {
+            "renew": {
+              "incarnation": 1,
+              "fencing_token": 1,
+              "claimant": 10,
+              "issued_at_ms": 50000,
+              "expires_at_ms": 80000
+            }
+          },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 1, "leased_claimant": 10, "last_fencing_token": 1 }
+        }
+      ]
+    },
+    {
+      "name": "release_tombstones_the_floor_and_the_next_claim_bids_floor_plus_one",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 4, "fencing_token": 4, "claimant": 10 },
+        "last_fencing_token": 4
+      },
+      "steps": [
+        {
+          "now_ms": 2000,
+          "request": { "release": { "incarnation": 4, "fencing_token": 4, "claimant": 10 } },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": null, "leased_claimant": null, "last_fencing_token": 4 }
+        },
+        {
+          "now_ms": 3000,
+          "request": { "claim": { "incarnation": 4, "fencing_token": 4, "claimant": 20 } },
+          "expect": { "kind": "rejected_fencing_conflict", "expected": 5, "got": 4 },
+          "expect_slot": { "leased_token": null, "leased_claimant": null, "last_fencing_token": 4 }
+        },
+        {
+          "now_ms": 3000,
+          "request": {
+            "claim": {
+              "incarnation": 5,
+              "fencing_token": 5,
+              "claimant": 20,
+              "issued_at_ms": 3000,
+              "expires_at_ms": 33000
+            }
+          },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "leased_token": 5, "leased_claimant": 20, "last_fencing_token": 5 }
+        }
+      ]
+    },
+    {
+      "name": "release_requires_the_held_token_and_claimant",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 2, "fencing_token": 2, "claimant": 10 },
+        "last_fencing_token": 2
+      },
+      "steps": [
+        {
+          "now_ms": 2000,
+          "request": { "release": { "incarnation": 1, "fencing_token": 1, "claimant": 10 } },
+          "expect": { "kind": "rejected_fencing_conflict", "expected": 2, "got": 1 },
+          "expect_slot": { "leased_token": 2, "leased_claimant": 10, "last_fencing_token": 2 }
+        },
+        {
+          "now_ms": 2000,
+          "request": { "release": { "incarnation": 2, "fencing_token": 2, "claimant": 20 } },
+          "expect": { "kind": "rejected_fencing_conflict", "expected": 2, "got": 2 },
+          "expect_slot": { "leased_token": 2, "leased_claimant": 10, "last_fencing_token": 2 }
+        }
+      ]
+    },
+    {
+      "name": "release_on_an_unclaimed_slot_is_not_held",
+      "skew_ms": 5000,
+      "initial": { "lease": null, "last_fencing_token": null },
+      "steps": [
+        {
+          "now_ms": 1000,
+          "request": { "release": { "incarnation": 0, "fencing_token": 0, "claimant": 10 } },
+          "expect": { "kind": "rejected_not_held" },
+          "expect_slot": {
+            "leased_token": null,
+            "leased_claimant": null,
+            "last_fencing_token": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "structural_refusals_never_mutate_the_slot",
+      "skew_ms": 5000,
+      "initial": { "lease": null, "last_fencing_token": null },
+      "steps": [
+        {
+          "now_ms": 1000,
+          "request": { "claim": { "incarnation": 0, "fencing_token": 1, "claimant": 10 } },
+          "expect": { "kind": "rejected_structural" },
+          "expect_slot": {
+            "leased_token": null,
+            "leased_claimant": null,
+            "last_fencing_token": null
+          }
+        },
+        {
+          "now_ms": 1000,
+          "request": {
+            "claim": {
+              "incarnation": 0,
+              "fencing_token": 0,
+              "claimant": 10,
+              "domain": "daemon-vhc/cert/2"
+            }
+          },
+          "expect": { "kind": "rejected_structural" },
+          "expect_slot": {
+            "leased_token": null,
+            "leased_claimant": null,
+            "last_fencing_token": null
+          }
+        },
+        {
+          "now_ms": 1000,
+          "request": {
+            "claim": {
+              "incarnation": 0,
+              "fencing_token": 0,
+              "claimant": 10,
+              "endpoint_ws": null
+            }
+          },
+          "expect": { "kind": "rejected_structural" },
+          "expect_slot": {
+            "leased_token": null,
+            "leased_claimant": null,
+            "last_fencing_token": null
+          }
+        },
+        {
+          "now_ms": 1000,
+          "request": {
+            "claim": {
+              "incarnation": 0,
+              "fencing_token": 0,
+              "claimant": 10,
+              "issued_at_ms": 5000,
+              "expires_at_ms": 5000
+            }
+          },
+          "expect": { "kind": "rejected_structural" },
+          "expect_slot": {
+            "leased_token": null,
+            "leased_claimant": null,
+            "last_fencing_token": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "a_claim_addressing_a_different_run_than_the_slot_is_structural",
+      "skew_ms": 5000,
+      "initial": {
+        "lease": { "incarnation": 0, "fencing_token": 0, "claimant": 10 },
+        "last_fencing_token": 0
+      },
+      "steps": [
+        {
+          "now_ms": 2000,
+          "request": { "claim": { "run": 2, "incarnation": 1, "fencing_token": 1, "claimant": 20 } },
+          "expect": { "kind": "rejected_structural" },
+          "expect_slot": { "leased_token": 0, "leased_claimant": 10, "last_fencing_token": 0 }
+        }
+      ]
+    }
+  ]
+}

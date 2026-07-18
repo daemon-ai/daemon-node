@@ -38,6 +38,7 @@ pub mod merkle;
 pub mod messages;
 pub mod record_set;
 pub mod revocation;
+pub mod seat;
 pub mod sign;
 pub mod transition;
 pub mod version;
@@ -68,6 +69,11 @@ pub use messages::{SignedMessage, VhcMessage};
 pub use record_set::RecordSet;
 pub use revocation::{
     RevocationError, RevocationLedger, RunKeyRevocation, RunKeyRevocationBody, REVOCATION_DOMAIN_V2,
+};
+pub use seat::{
+    ControlEndpoint, SeatDecision, SeatLease, SeatLeaseBody, SeatLeaseError, SeatMutationResponse,
+    SeatRelease, SeatReleaseBody, SeatRequest, SeatSlot, SeatState, DEFAULT_SEAT_HEARTBEAT_MS,
+    DEFAULT_SEAT_SKEW_MS, DEFAULT_SEAT_TTL_MS, MAX_SEAT_SKEW_MS,
 };
 pub use sign::{peer_id, sign_canonical, verify_canonical, Signed, SigningKey, VerifyingKey};
 pub use transition::{

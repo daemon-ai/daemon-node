@@ -4979,6 +4979,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "proptest",
  "serde",
+ "serde_json",
  "xxhash-rust",
 ]
 

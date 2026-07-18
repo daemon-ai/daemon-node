@@ -19,7 +19,10 @@
 //! identity headers for a direct-to-worker dev target) — never hardcoded.
 
 use daemon_egress::{EgressClient, EgressRequest, Redirects};
-use daemon_vhc_proto::blake3_hash;
+use daemon_vhc_proto::{
+    blake3_hash, from_canonical_slice, to_canonical_vec, SeatDecision, SeatLease,
+    SeatMutationResponse, SeatRelease, SeatState,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::presign::{PresignOp, PresignRequest, PresignResponse};
@@ -115,6 +118,29 @@ pub struct RunState {
     /// The latest published-checkpoint pointer, or `None` if none published yet.
     #[serde(default)]
     pub checkpoint: Option<CheckpointPointer>,
+}
+
+/// The outcome of a seat claim/renew against the registry's fencing-token compare-and-swap.
+///
+/// `Won` is a **storage** outcome, not an authority grant (the registry is untrusted): the
+/// claimant may start/continue coordinating, but every peer independently verifies the stored
+/// lease's signature, certificate chain, and supersession floor. `Lost` carries the registry's
+/// structural refusal plus the slot's current state — the re-read a losing claimant needs to
+/// decide between standing by and retrying at the floor + 1 after expiry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+// A transient return value consumed at the call site, never stored in bulk — the size skew
+// between the variants is not worth indirection on the client surface.
+#[allow(clippy::large_enum_variant)]
+pub enum SeatClaimOutcome {
+    /// The CAS accepted; the slot now stores this lease.
+    Won(SeatLease),
+    /// The CAS refused; the slot is unchanged.
+    Lost {
+        /// The registry's structural refusal.
+        decision: SeatDecision,
+        /// The slot's current state (the incumbent lease, or unclaimed + tombstone floor).
+        state: SeatState,
+    },
 }
 
 /// The `vhc:*` credential the registry + presign requests carry (never hardcoded — sourced from
@@ -307,6 +333,162 @@ impl RegistryClient {
             });
         }
         Ok(body.to_vec())
+    }
+
+    /// Read a run's seat slot for `role` (`GET {base}/runs/:id/seat/:role`): the stored
+    /// [`SeatState`] — a signed lease, or unclaimed with the fencing-token tombstone floor a
+    /// prospective claimant bids `floor + 1` against. `Ok(None)` on a 404 (unknown run).
+    ///
+    /// The registry stores and CASes the signed object but creates no authority: the caller MUST
+    /// verify a returned lease itself (`SeatLease::authorize` against the genesis-trusted bases,
+    /// plus the revocation/supersession judgment) before dialing its endpoint or accepting its
+    /// claimant's records.
+    pub async fn read_seat(
+        &self,
+        run: &RunId,
+        role: &str,
+    ) -> Result<Option<SeatState>, VhcNetError> {
+        let url = format!("{}/runs/{}/seat/{role}", self.base_url, run.as_str());
+        let req = self.authed_request(EgressRequest::get(&url));
+        let resp = self
+            .egress
+            .execute(req, Redirects::None)
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("read seat {role}: {e}")))?;
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("read seat body {role}: {e}")))?;
+        if !status.is_success() {
+            return Err(VhcNetError::Transport(format!(
+                "read seat {role} returned {status}"
+            )));
+        }
+        let state: SeatState = from_canonical_slice(&body)
+            .map_err(|e| VhcNetError::Transport(format!("decode seat state {role}: {e}")))?;
+        Ok(Some(state))
+    }
+
+    /// Claim (or take over) a run's seat (`PUT {base}/runs/:id/seat/:role` with the canonical-CBOR
+    /// signed lease). The registry CASes on the fencing token — classic compare-and-set with
+    /// increment: an unclaimed/expired slot accepts exactly `floor + 1`. A lost CAS returns
+    /// [`SeatClaimOutcome::Lost`] carrying the slot's current state (re-read included); the loser
+    /// either accepts the incumbent or, once it expires, retries at the floor + 1.
+    pub async fn claim_seat(
+        &self,
+        run: &RunId,
+        lease: &SeatLease,
+    ) -> Result<SeatClaimOutcome, VhcNetError> {
+        let url = format!(
+            "{}/runs/{}/seat/{}",
+            self.base_url,
+            run.as_str(),
+            lease.body.role
+        );
+        let bytes = to_canonical_vec(lease)
+            .map_err(|e| VhcNetError::Transport(format!("encode seat lease: {e}")))?;
+        let req = EgressRequest::put(&url, bytes).header("content-type", "application/cbor");
+        self.seat_mutation(req, lease, "claim seat").await
+    }
+
+    /// Renew (heartbeat) a held lease (`POST {base}/runs/:id/seat/:role/heartbeat` with the
+    /// re-signed canonical-CBOR lease): same claimant, same incarnation, same fencing token; the
+    /// fresh body extends `expires_at_ms` and may rebind the epoch (the epoch-rebind rule — a
+    /// renew, never a takeover). A refusal means the seat moved: the claimant is fenced and must
+    /// stop acting as coordinator.
+    pub async fn renew_seat(
+        &self,
+        run: &RunId,
+        lease: &SeatLease,
+    ) -> Result<SeatClaimOutcome, VhcNetError> {
+        let url = format!(
+            "{}/runs/{}/seat/{}/heartbeat",
+            self.base_url,
+            run.as_str(),
+            lease.body.role
+        );
+        let bytes = to_canonical_vec(lease)
+            .map_err(|e| VhcNetError::Transport(format!("encode seat renew: {e}")))?;
+        let req = EgressRequest::post(&url, bytes).header("content-type", "application/cbor");
+        self.seat_mutation(req, lease, "renew seat").await
+    }
+
+    /// Release a held seat (`DELETE {base}/runs/:id/seat/:role` with the canonical-CBOR signed
+    /// release). The slot transitions to unclaimed but retains the fencing-token floor (tokens
+    /// never reset). `Ok` only on an accepted release; a refusal (the seat already moved — a
+    /// benign race with a takeover) surfaces as a typed transport error the caller may ignore.
+    pub async fn release_seat(
+        &self,
+        run: &RunId,
+        role: &str,
+        release: &SeatRelease,
+    ) -> Result<(), VhcNetError> {
+        let url = format!("{}/runs/{}/seat/{role}", self.base_url, run.as_str());
+        let bytes = to_canonical_vec(release)
+            .map_err(|e| VhcNetError::Transport(format!("encode seat release: {e}")))?;
+        let req = self.authed_request(
+            EgressRequest::delete(&url, bytes).header("content-type", "application/cbor"),
+        );
+        let resp = self
+            .egress
+            .execute(req, Redirects::None)
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("release seat {role}: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("read release body {role}: {e}")))?;
+        if status.is_success() {
+            return Ok(());
+        }
+        let rendered = from_canonical_slice::<SeatMutationResponse>(&body)
+            .map(|r| format!("{:?}", r.decision))
+            .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned());
+        Err(VhcNetError::Transport(format!(
+            "release seat {role} returned {status}: {rendered}"
+        )))
+    }
+
+    /// Issue one seat mutation (claim/renew) and map the frozen status contract: 2xx + `Accepted`
+    /// ⇒ [`SeatClaimOutcome::Won`]; 409 + a decoded [`SeatMutationResponse`] ⇒
+    /// [`SeatClaimOutcome::Lost`] with the refusal and the slot's current state; anything else is
+    /// a transport error.
+    async fn seat_mutation(
+        &self,
+        req: EgressRequest,
+        lease: &SeatLease,
+        what: &str,
+    ) -> Result<SeatClaimOutcome, VhcNetError> {
+        let resp = self
+            .egress
+            .execute(self.authed_request(req), Redirects::None)
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("{what}: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("read {what} body: {e}")))?;
+        if status.is_success() {
+            return Ok(SeatClaimOutcome::Won(lease.clone()));
+        }
+        if status.as_u16() == 409 {
+            let refusal: SeatMutationResponse = from_canonical_slice(&body)
+                .map_err(|e| VhcNetError::Transport(format!("decode {what} refusal (409): {e}")))?;
+            return Ok(SeatClaimOutcome::Lost {
+                decision: refusal.decision,
+                state: refusal.state,
+            });
+        }
+        Err(VhcNetError::Transport(format!(
+            "{what} returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        )))
     }
 
     /// Presign one object for `run` (`POST {base}/runs/:id/presign`) with the registry auth applied.

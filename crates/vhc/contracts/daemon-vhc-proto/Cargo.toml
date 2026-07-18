@@ -26,6 +26,9 @@ ed25519-dalek = { workspace = true }
 # ownership, so it is declared here directly at daemon-api's exact version.
 cddl-cat = "=0.7.1"
 proptest = { workspace = true }
+# The shared seat-slot CAS vectors (`tests/fixtures/seat-cas-vectors.json`) are JSON so every
+# conforming seat-registry implementation (this fold, the cloud port) executes one fixture.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

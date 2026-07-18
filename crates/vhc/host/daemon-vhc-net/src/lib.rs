@@ -46,6 +46,7 @@ pub mod receipt;
 /// Run discovery + envelope fetch against the coordinator registry (spec §6.1/§11.1; A1).
 pub mod registry;
 pub mod seam;
+pub mod seat_registry;
 pub mod store;
 pub mod transport;
 /// The node WS coordinator client as a [`ControlPlane`] (spec §11.2; A1). Behind the off-default
@@ -69,8 +70,11 @@ pub use presign::{
 };
 pub use r2_store::{r2_object_key, R2Store};
 pub use receipt::ReceiptProducer;
-pub use registry::{CheckpointPointer, RegistryClient, RunArtifact, RunDescriptor, RunState};
+pub use registry::{
+    CheckpointPointer, RegistryClient, RunArtifact, RunDescriptor, RunState, SeatClaimOutcome,
+};
 pub use seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};
+pub use seat_registry::FakeSeatRegistry;
 pub use store::FsPayloadStore;
 pub use transport::{ControlPlane, ControlSubscription, PayloadStat, PayloadStore};
 #[cfg(feature = "ws")]
