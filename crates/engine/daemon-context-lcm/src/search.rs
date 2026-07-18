@@ -1473,7 +1473,7 @@ mod tests {
         assert_eq!(hits[0].rank, -1.0);
     }
 
-    // ---- Wave 2 theme 1: search ranking at scale (role bias, batch caps, limit stability) -----
+    // ---- search ranking at scale (role bias, batch caps, limit stability) ---------------------
 
     /// Append one message with an explicit timestamp; returns its store_id.
     fn append_one(store: &Store, session: &str, role: &str, content: &str, ts: f64) -> i64 {

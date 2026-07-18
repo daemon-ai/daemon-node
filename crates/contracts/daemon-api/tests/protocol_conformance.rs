@@ -497,7 +497,7 @@ mod file_transfer {
         }
     }
 
-    // ---- Empty (Wave 1) ----
+    // ---- Empty (baseline capability shape) ----
     #[tokio::test]
     async fn ft_empty_implements_and_send_unsupported() {
         let ft = empty();

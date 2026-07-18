@@ -4003,7 +4003,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- Wave 2 theme 5: WAL crash-safety (durability PRAGMAs + graceful close checkpoint) -----
+    // ---- WAL crash-safety (durability PRAGMAs + graceful close checkpoint) ---------------------
 
     // PARITY: hermes-lcm tests/test_crash_safe_wal.py::TestConfigureConnectionPragmas
     #[test]
@@ -4075,7 +4075,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- Wave 2 theme 9: concurrent append serialization -------------------------------------
+    // ---- concurrent append serialization -----------------------------------------------------
 
     // PARITY: hermes-lcm tests/test_lcm_core.py::test_write_lock_serializes_concurrent_appends
     // The Rust `Store` serializes every write behind `conn: Mutex<Connection>` (the analog of

@@ -213,7 +213,7 @@ async fn grep_clamps_oversized_limits_and_reports_the_original() {
     assert_eq!(out["limit_clamped_from"], 500);
 }
 
-// ---- Wave 2 theme 8: grep/expand tool edges ------------------------------------------------------
+// ---- grep/expand tool edges ----------------------------------------------------------------------
 
 // PARITY: hermes-lcm tests/test_lcm_engine.py::test_limit_zero_returns_error
 #[tokio::test]

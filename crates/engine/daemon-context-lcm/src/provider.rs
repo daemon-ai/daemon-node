@@ -5366,7 +5366,7 @@ mod tests {
         assert!(text.contains("no backup was created"), "{text}");
     }
 
-    // ---- Wave 2 theme 3: rotate edge cases (empty segments, boundaries, repeated rotation) -----
+    // ---- rotate edge cases (empty segments, boundaries, repeated rotation) ---------------------
 
     // PARITY: hermes-lcm tests/test_lcm_rotate.py::test_rotate_preview_reports_noop_when_total_messages_within_tail
     #[tokio::test]

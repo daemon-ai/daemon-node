@@ -1418,7 +1418,7 @@ mod tests {
         );
     }
 
-    // ---- Wave 2 theme 2: ingest-protection replay + quarantine interplay ----------------------
+    // ---- ingest-protection replay + quarantine interplay --------------------------------------
 
     use daemon_core::{AssistantMsg, ToolCall, ToolResult, ToolTurn, Turn, UserMsg};
 

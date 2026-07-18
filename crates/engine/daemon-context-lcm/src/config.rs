@@ -373,7 +373,7 @@ impl LcmConfig {
 mod tests {
     use super::*;
 
-    // ---- Wave 2 theme 6: config defaults ------------------------------------------------------
+    // ---- config defaults ----------------------------------------------------------------------
 
     // PARITY: hermes-lcm tests/test_lcm_core.py::TestConfig::test_defaults
     // The Rust crate reads no environment (the node injects config), so the `from_env` family is

@@ -435,7 +435,7 @@ async fn messaging_adapter_rooms_manage_over_socket() {
 /// in-memory contact list. It grounds the wire-v34 roster surface (`RosterList`/`RosterAdd`/
 /// `RosterUpdate`/`RosterRemove` + the `ContactsChanged` event) end to end through real
 /// dispatch/CBOR without a real protocol server — the reference `daemon-rooms`/`daemon-telegram`
-/// `SupportsRoster` impls land in Wave 3 (see the plan). Mirrors how the messaging test above uses
+/// `SupportsRoster` impls land in a later protocol-adapter change. Mirrors how the messaging test above uses
 /// the Rooms adapter to ground the conv/member surface.
 struct RosterMockAdapter {
     contacts: std::sync::Mutex<Vec<daemon_api::ContactInfo>>,

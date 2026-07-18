@@ -131,7 +131,7 @@ ed25519-dalek = "2"
 #
 # Default features carry iroh-gossip's `net` (the networked gossip); the `iroh` feature-gated consumer
 # (`daemon-vhc-net`) enables `iroh-relay/server` + `test-utils` locally for the self-hosted relay +
-# the in-process 3-node test harness (B2, Wave 2). Heavy trees: single-sourced here for the pin, but
+# the in-process 3-node test harness. Heavy trees: single-sourced here for the pin, but
 # OPT-IN only — `daemon-vhc-net` gates all three behind its `iroh` cargo feature (optional deps), so
 # the default workspace build/gate never compiles iroh (spec §10.1). Relay reachability is part of the
 # §6.5 eligibility probe.
