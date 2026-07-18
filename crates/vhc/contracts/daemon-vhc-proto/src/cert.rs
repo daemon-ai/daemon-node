@@ -113,6 +113,9 @@ pub enum CertError {
     SenderNotCertified,
     /// No certificate in the store authenticates the frame's `sender` for its scope+epoch.
     NoCertifiedChain,
+    /// The per-run key is dead: explicitly revoked by a signed record, or its incarnation is
+    /// superseded by a higher one for the same role slot ([`crate::revocation`]).
+    Revoked,
 }
 
 impl core::fmt::Display for CertError {
@@ -143,6 +146,12 @@ impl core::fmt::Display for CertError {
                 write!(
                     f,
                     "no certificate authenticates the frame sender for its scope/epoch"
+                )
+            }
+            Self::Revoked => {
+                write!(
+                    f,
+                    "the per-run key is revoked or its incarnation is superseded"
                 )
             }
         }
