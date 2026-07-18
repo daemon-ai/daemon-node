@@ -11,13 +11,13 @@
 use daemon_vhc_proto::bytes::{Hash, IrohId, PeerId, Seed, StateDigest};
 use daemon_vhc_proto::capability::CapabilitySet;
 use daemon_vhc_proto::merkle::commit_set;
-use daemon_vhc_proto::messages::{
+use daemon_vhc_proto::version::VHC_PROTO_VERSION;
+use daemon_vhc_proto::{to_canonical_vec, SigningKey};
+use daemon_vhc_sdk_consensus::messages::{
     Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RecordEntry, RoundOpen,
     RoundRecord, SignedMessage, StorageReceipt, Straggle, StraggleStatus, ThroughputClass,
     VhcMessage,
 };
-use daemon_vhc_proto::version::VHC_PROTO_VERSION;
-use daemon_vhc_proto::{to_canonical_vec, SigningKey};
 
 const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-vhc.cddl"));
 
@@ -253,7 +253,10 @@ fn message_size_roster_invariant() {
             Some(
                 tree.entries()
                     .iter()
-                    .map(|(p, h)| daemon_vhc_proto::messages::AttestEntry { peer: *p, hash: *h })
+                    .map(|(p, h)| daemon_vhc_sdk_consensus::messages::AttestEntry {
+                        peer: *p,
+                        hash: *h,
+                    })
                     .collect(),
             )
         } else {

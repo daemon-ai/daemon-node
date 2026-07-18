@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! [`ReceiptProducer`] — turns payload-store availability into a signed proto `StorageReceipt`.
+//! [`ReceiptProducer`] — turns payload-store availability into a signed `StorageReceipt`.
 //!
 //! The commit rule (§6.4 I6) consumes only **signed messages**: a payload enters the round record
 //! iff its `Commitment` arrived *and* signed availability evidence exists — either a
@@ -9,20 +9,22 @@
 //! a signed message*) or a witness-quorum `Attestation`. This keeps the coordinator's `tick` a pure
 //! function of its inputs (no inline I/O in the rule).
 //!
-//! Lane R models the *receipt-producer* half: a small component that polls/checks a
+//! The *receipt-producer* half: a small component that polls/checks a
 //! [`PayloadStore`] via `head` (`stat`) and, when the object is available, produces a signed
-//! [`StorageReceipt`](daemon_vhc_proto::messages::StorageReceipt). Merge 1 re-expressed this over
-//! proto: the message shape is proto's CDDL `StorageReceipt` (a round + its verified
-//! `(peer, hash, size)` [`RecordEntry`] set), and the signature is the real ed25519 node-identity
-//! [`SignedMessage`] frame produced by [`SignedMessage::sign`] over canonical CBOR (§7.3). Net
-//! never *defines* the message or signature type — it only assembles store evidence into proto's.
+//! [`StorageReceipt`](daemon_vhc_sdk_consensus::messages::StorageReceipt) — the message shape is
+//! the SDK schema layer's `StorageReceipt` (a round + its verified `(peer, hash, size)`
+//! [`RecordEntry`] set), and the signature is the real ed25519 node-identity [`SignedMessage`]
+//! frame produced by [`SignedMessage::sign`] over canonical CBOR (§7.3).
+//!
+//! This is a coordinator-seat function (the cloud wasm-tick shell performs the identical HEAD →
+//! signed-receipt injection), so it lives with the coordinator harness drive — moved out of
+//! `daemon-vhc-net`, which carries opaque frames and defines no consensus message.
 
-use daemon_vhc_proto::messages::{RecordEntry, StorageReceipt};
-use daemon_vhc_proto::{SignedMessage, SigningKey, VhcMessage, VhcProtoVersion};
-
-use crate::seam::{PayloadKey, RoundId};
-use crate::transport::PayloadStore;
-use crate::VhcNetError;
+use daemon_vhc_net::seam::{PayloadKey, RoundId};
+use daemon_vhc_net::{PayloadStore, VhcNetError};
+use daemon_vhc_proto::{SigningKey, VhcProtoVersion};
+use daemon_vhc_sdk_consensus::messages::{RecordEntry, StorageReceipt};
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 
 /// Polls a [`PayloadStore`] and emits signed availability evidence for committed payloads as proto
 /// [`SignedMessage`] frames carrying a [`StorageReceipt`].
@@ -99,10 +101,18 @@ impl<S: PayloadStore> ReceiptProducer<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::seam::{PeerId, RunId};
-    use crate::store::FsPayloadStore;
-    use crate::test_support::temp_root;
+    use daemon_vhc_net::seam::{PeerId, RunId};
+    use daemon_vhc_net::FsPayloadStore;
     use daemon_vhc_proto::VHC_PROTO_VERSION;
+    use tempfile::TempDir;
+
+    /// A throwaway store root (the net-crate test helper is crate-private).
+    fn temp_root(tag: &str) -> TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("vhc-receipt-{tag}-"))
+            .tempdir()
+            .expect("tempdir")
+    }
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[0x42; 32])

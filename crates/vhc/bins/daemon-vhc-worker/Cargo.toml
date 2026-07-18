@@ -48,6 +48,11 @@ daemon-telemetry = { workspace = true }
 # by the `vhc-net` feature. (The `async-trait` optional dep that rode beside it for live.rs's
 # concrete `PayloadStore` impl retired with live.rs at the Phase-E sunset.)
 daemon-egress = { workspace = true, optional = true }
+# The SDK schema layer (round messages) the HARNESS-ONLY in-process self-driven join decodes.
+# OPTIONAL, enabled only by the `harness` feature: the production worker build carries no round
+# vocabulary (the opaque-host boundary, dep-check-enforced — `vhc-dep-check` asserts the schema
+# crates are absent from this binary's default normal graph).
+daemon-vhc-sdk-consensus = { workspace = true, optional = true }
 
 # Per-backend lane selection: this bin crate FORWARDS its lanes into `daemon-vhc-host`, whose lib
 # code (`burn_backend.rs`/`runtime.rs`/`probe.rs`) is what the features actually gate — the
@@ -73,6 +78,14 @@ cuda = ["daemon-vhc-host/cuda"]
 # fetch path is WS/presign-only, but the cross-built fat-worker packaging lane (flake.nix's
 # Windows worker) ships this feature set, so dropping the edge is a packaging decision.)
 vhc-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress"]
+# The in-process self-driven join (`src/session.rs`): drives the run's coordinator module
+# in-process and decodes SDK round schemas — harness/test machinery, never a production build.
+# Off the default gate so the shipped worker carries no round vocabulary.
+harness = [
+    "dep:daemon-vhc-sdk-consensus",
+    "daemon-vhc-host/harness",
+    "daemon-vhc-session/harness",
+]
 
 [dev-dependencies]
 # tests/worker_protocol.rs (moved with the bin — `env!("CARGO_BIN_EXE_daemon-vhc-worker")` only

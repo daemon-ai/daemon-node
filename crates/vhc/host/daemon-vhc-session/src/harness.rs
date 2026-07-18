@@ -41,12 +41,13 @@ use daemon_vhc_observe::{
     RunCapture, RunHealth,
 };
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
-use daemon_vhc_proto::messages::{RecordEntry, RoundRecord};
 use daemon_vhc_proto::{
-    from_canonical_slice, peer_id, CapabilitySet, Hash, PeerId, Seed, SignedMessage, SigningKey,
-    VhcMessage, VhcProtoVersion, VHC_PROTO_VERSION,
+    from_canonical_slice, peer_id, CapabilitySet, Hash, PeerId, Seed, SigningKey, VhcProtoVersion,
+    VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorParams, CoordinatorState, RunConfig};
+use daemon_vhc_sdk_consensus::messages::{RecordEntry, RoundRecord};
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 
 use crate::backend::{StateDigest, StubBackend, TrainerBackend};
 use crate::checkpoint::CheckpointManifest;

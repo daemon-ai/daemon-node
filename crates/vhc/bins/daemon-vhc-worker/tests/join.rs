@@ -25,6 +25,10 @@
 // Dev/test harness: shells cargo for the guest build (same pattern as worker_protocol.rs); the
 // env/spawn bans target the shipped node, so they are allowed file-wide here.
 #![allow(clippy::disallowed_methods)]
+// The in-process self-driven join is harness machinery (`--features harness` builds the worker
+// with it); a default worker build refuses JoinRun typed, so this suite only runs on the
+// harness-featured lane.
+#![cfg(feature = "harness")]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

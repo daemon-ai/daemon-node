@@ -60,14 +60,13 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
-use daemon_vhc_proto::messages::{RecordEntry, VhcMessage};
-use daemon_vhc_proto::{
-    blake3_hash, digest_state, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed,
-};
+use daemon_vhc_proto::{blake3_hash, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed};
 use daemon_vhc_sdk::{
     build_manifest, GuestModule, MigrationDescriptor, ModuleDecl, OwnedSection, SectionReader,
 };
 use daemon_vhc_sdk_compute::{export_tensor, fence, AutodiffHostBackend, HostBackend};
+use daemon_vhc_sdk_consensus::digest_state;
+use daemon_vhc_sdk_consensus::messages::{RecordEntry, VhcMessage};
 use daemon_vhc_sdk_profiles::{encode_payload, IngestParam, ParamView, SparseLoco, SparseLocoCfg};
 use daemon_vhc_sdk_rounds::{
     BarrierRound, Committed, PayloadSource, RoundCfg, RoundExperiment, StepCtx as RoundStepCtx,

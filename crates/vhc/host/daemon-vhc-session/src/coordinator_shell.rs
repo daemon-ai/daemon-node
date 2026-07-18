@@ -49,13 +49,16 @@ use std::time::{Duration, Instant};
 
 use daemon_vhc_host::coordinator::{Coordinator, CoordinatorSpec};
 use daemon_vhc_net::{ControlPlane, FsPayloadStore, PayloadStore};
-use daemon_vhc_proto::messages::{Commitment, Join, RecordEntry, StorageReceipt, ThroughputClass};
 use daemon_vhc_proto::{
     blake3_hash, from_canonical_slice, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId,
-    PeerId, SignedMessage, SigningKey, VhcMessage, VhcProtoVersion,
+    PeerId, SigningKey, VhcProtoVersion,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
+use daemon_vhc_sdk_consensus::messages::{
+    Commitment, Join, RecordEntry, StorageReceipt, ThroughputClass,
+};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 
 use crate::seam::{PayloadKey, RunId};
 use crate::VhcRunError;
@@ -437,7 +440,7 @@ impl<C: ControlPlane> CoordinatorShell<C> {
         tokio::task::block_in_place(|| {
             let before = coord.published().len();
             let coord_key = self.coord_key.clone();
-            let filler = VhcMessage::Heartbeat(daemon_vhc_proto::messages::Heartbeat {
+            let filler = VhcMessage::Heartbeat(daemon_vhc_sdk_consensus::messages::Heartbeat {
                 round: 0,
                 ready: None,
             });
@@ -500,7 +503,7 @@ impl<C: ControlPlane> CoordinatorShell<C> {
             self.deliver(&mut coord, key, &join)?;
         }
         for key in &boot {
-            let hb = VhcMessage::Heartbeat(daemon_vhc_proto::messages::Heartbeat {
+            let hb = VhcMessage::Heartbeat(daemon_vhc_sdk_consensus::messages::Heartbeat {
                 round: 0,
                 ready: Some(true),
             });
@@ -619,7 +622,8 @@ impl<C: ControlPlane> CoordinatorShell<C> {
                         VhcMessage::Straggle(st) => {
                             let (round, is_stalled) = (
                                 st.round,
-                                st.status == daemon_vhc_proto::messages::StraggleStatus::Stalled,
+                                st.status
+                                    == daemon_vhc_sdk_consensus::messages::StraggleStatus::Stalled,
                             );
                             if let Some(key) = peer_keys.get(&signer) {
                                 let key = key.clone();

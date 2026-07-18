@@ -10,7 +10,7 @@
 //! shape cites its Psyche `file:line` anchor and records the 0.97 -> 1.0 delta inline.
 //!
 //! The plane carries **already-signed opaque bytes** — signing/verification is proto's surface
-//! (`daemon_vhc_proto::SignedMessage`, canonical CBOR + ed25519), not the transport's (§7.1:
+//! (the SDK schema layer's `SignedMessage`: canonical CBOR + ed25519), not the transport's (§7.1:
 //! gossip is dissemination, never arbitration). Delivery matches [`LoopbackGossip`]
 //! (crate::gossip::LoopbackGossip), the conformance twin: publish -> every subscriber, once.
 //!

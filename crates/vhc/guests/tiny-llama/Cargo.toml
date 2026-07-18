@@ -17,8 +17,11 @@ daemon-vhc-sdk-compute = { path = "../../sdk/daemon-vhc-sdk-compute" }
 # The re-expressed comm/optimizer profiles (C3a): det-lane ingest runs IN-GUEST with zero host
 # support (the daemon-vhc-det compatibility path, architecture §3.2).
 daemon-vhc-sdk-profiles = { path = "../../sdk/daemon-vhc-sdk-profiles" }
-# Round choreography as library code (BarrierRound) + the wire vocabulary/digest (wasm-clean).
+# Round choreography as library code (BarrierRound) — wasm-clean.
 daemon-vhc-sdk-rounds = { path = "../../sdk/daemon-vhc-sdk-rounds" }
+# The round message schemas + state-digest schedule (moved out of the proto with the round-vocabulary move:
+# round vocabulary is SDK/guest territory, the proto is mechanism-only).
+daemon-vhc-sdk-consensus = { path = "../../sdk/daemon-vhc-sdk-consensus" }
 daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }
 burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
 ciborium = "0.2"

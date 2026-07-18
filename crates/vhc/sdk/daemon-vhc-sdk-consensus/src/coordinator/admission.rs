@@ -14,7 +14,7 @@
 //! different envelope is rejected with `EnvelopeHashMismatch`; a legacy join that omits the hash
 //! passes `None` and skips the check (back-compat).
 
-use daemon_vhc_proto::messages::Join;
+use crate::messages::Join;
 use daemon_vhc_proto::{CapabilitySet, Hash, PeerId, VhcProtoVersion};
 
 use crate::coordinator::config::RunConfig;

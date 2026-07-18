@@ -6,8 +6,8 @@
 mod common;
 
 use common::*;
-use daemon_vhc_proto::messages::{Join, ThroughputClass};
 use daemon_vhc_proto::{peer_id, CapabilitySet, Hash, IrohId, VhcProtoVersion, VHC_PROTO_VERSION};
+use daemon_vhc_sdk_consensus::messages::{Join, ThroughputClass};
 
 use daemon_vhc_sdk_consensus::coordinator::admission::{admit, JoinCandidate};
 use daemon_vhc_sdk_consensus::coordinator::{AdmissionReject, Phase, RunConfig};

@@ -55,18 +55,19 @@ use daemon_vhc_observe::{
 // The consensus-replay oracle re-derives inside the real coordinator module : the tests hold
 // the same `coordinator_quorum.wasm` blob they drove, so they replay through it.
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
-use daemon_vhc_proto::messages::{
-    Commitment, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
-};
 use daemon_vhc_proto::{
     blake3_hash, peer_id, sign_canonical, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId,
-    Seed, SignedMessage, SigningKey, VhcMessage, VHC_PROTO_VERSION,
+    Seed, SigningKey, VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input, RunConfig};
+use daemon_vhc_sdk_consensus::messages::{
+    Commitment, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
+};
 use daemon_vhc_sdk_consensus::{
     AuthError, AuthorityConfig, RecordSig, SingleKey, ThresholdKeys, Topology,
     DEFAULT_RECORDS_CHANNEL,
 };
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 use daemon_vhc_session::replay_sandbox::SandboxedCoordinator;
 use daemon_vhc_testkit::genesis_run::phase_a_grants;
 use daemon_vhc_testkit::{Coordinator, CoordinatorSpec};

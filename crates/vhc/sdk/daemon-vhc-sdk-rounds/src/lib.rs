@@ -35,8 +35,10 @@
 
 use std::collections::BTreeMap;
 
-use daemon_vhc_proto::messages::{BatchWindow, Commitment, RecordEntry, RoundOpen, RoundRecord};
 use daemon_vhc_proto::{blake3_hash, PeerId};
+use daemon_vhc_sdk_consensus::messages::{
+    BatchWindow, Commitment, RecordEntry, RoundOpen, RoundRecord,
+};
 
 // D1 re-typing (refactor §8/D1): the barrier ingests `Committed<T>` — the authority-gated re-type of
 // A2's bridged `Staged` — from `daemon-vhc-sdk-consensus`. The mint's ordering/verification is
@@ -338,8 +340,8 @@ pub fn interval_for(
     roster: &[PeerId],
     peer: &PeerId,
 ) -> MicroWindow {
-    use daemon_vhc_proto::messages::ThroughputClass;
     use daemon_vhc_sdk_consensus::assign_batches;
+    use daemon_vhc_sdk_consensus::messages::ThroughputClass;
     let weighted: Vec<(PeerId, ThroughputClass)> =
         roster.iter().map(|p| (*p, ThroughputClass::C1)).collect();
     assign_batches(&weighted, &seed, window, 0)

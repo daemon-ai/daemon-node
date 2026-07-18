@@ -14,12 +14,19 @@ path = "src/lib.rs"
 # vhc-sim substrate as the `daemon-vhc-sim` `replay_check` example (D-5) — no stub/native runnable survives.
 
 [features]
-# `harness` exposes the in-process multi-peer test harness + the real `daemon-vhc-coordinator`
-# pure `tick` loop driver (the impure shell that signs/publishes the coordinator's unsigned
-# RoundOpen/RoundRecord outputs and feeds it signed peer messages + StorageReceipt evidence + scripted
-# Clock inputs) to external crates. Kept out of the default build; the `tests/daemon-vhc-e2e` crate
-# enables it. The crate's own unit tests reach the harness via `cfg(test)` (no feature needed).
-harness = ["dep:daemon-vhc-observe"]
+# `harness` exposes the in-process multi-peer test harness, the coordinator recording drive (the
+# impure shell that signs/publishes the coordinator's unsigned round outputs and feeds it signed
+# peer messages + storage-receipt evidence + scripted Clock inputs), the retained `RoundEngine`,
+# and the typed checkpoint / upgrade machinery — everything that decodes SDK round schemas. Kept
+# out of the default build: the production session surface (assess / attach / identity / keystore
+# / protocol / data / config) routes opaque signed frames only and links no SDK schema crate
+# (dep-check-enforced). The crate's own unit tests reach the harness via `cfg(test)`; external
+# harness crates (testkit, e2e, observe's dev graph) enable the feature.
+harness = [
+    "dep:daemon-vhc-observe",
+    "dep:daemon-vhc-sdk-consensus",
+    "daemon-vhc-host/harness",
+]
 # (Phase-E sunset cleanup) The `iroh` feature is GONE: it layered the live-transport harness
 # (`live_harness`) on `harness`, and that harness retired with the v1 driver at the sunset (it
 # drove the v1 WasmBackend over the engine). The passthrough kept "external `--features iroh`
@@ -35,13 +42,12 @@ daemon-vhc-proto = { workspace = true }
 # module under the host runtime) reads its stop-reason + candidate-driver constants. A contracts
 # crate (links neither sdk/* nor host/*), so the session→abi edge is direction-safe.
 daemon-vhc-abi = { workspace = true }
-# The consensus SDK layer: assignment math (moved from the proto at D0, consumed by the retained v1
-# RoundEngine) AND — relocated at D2 from the dissolved daemon-vhc-coordinator — the pure coordinator
-# `tick` state machine (its `coordinator` module) the harness shell (`local_coordinator`) signs,
-# publishes, and feeds. TRACKED dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/*
-# is transitional and is reviewed/retired as D2 re-seats the engine's consumers (the engine itself,
-# and the harness shell, retire with the v1 driver at the Phase-E sunset).
-daemon-vhc-sdk-consensus = { workspace = true }
+# The consensus SDK layer (round message schemas, assignment math, the pure coordinator `tick`,
+# the typed checkpoint manifest + attestation vocabulary). OPTIONAL, enabled only by the
+# `harness` feature: every consumer (`engine`, `checkpoint`, `upgrade`, `coordinator_shell`,
+# `harness`, `replay_sandbox`, `receipt`) is harness machinery gated behind that feature, so the
+# default production session graph carries no SDK schema crate (dep-check-enforced).
+daemon-vhc-sdk-consensus = { workspace = true, optional = true }
 daemon-vhc-net = { workspace = true }
 # The A2 dependency INVERSION (refactor §5 A2; architecture §7: SESS → HOSTC): the session links
 # the host runtime — never the reverse (the old daemon-vhc-host → daemon-vhc-session edge is gone;
@@ -83,6 +89,11 @@ xxhash-rust = { workspace = true }
 # Same as the coordinator: the `cfg(test)` harness build uses observe's `digest_tally` / `DesyncVerdict`
 # (the desync trigger) even with the `harness` feature off.
 daemon-vhc-observe = { workspace = true }
+# The `cfg(test)` builds of the harness-gated modules (engine/checkpoint/upgrade/harness/…) need
+# the optional deps present without the feature: the SDK schema layer and the host's own
+# harness-gated coordinator drive.
+daemon-vhc-sdk-consensus = { workspace = true }
+daemon-vhc-host = { workspace = true, features = ["harness"] }
 # Keystore lifecycle tests need throwaway on-disk stores (same direct-version pattern as the
 # node crate's dev-dep).
 tempfile = "3"

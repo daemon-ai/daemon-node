@@ -1,22 +1,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `daemon-vhc-proto` — the vhc-training wire contract (**algorithm-free from D0**).
+//! `daemon-vhc-proto` — the vhc-training wire **mechanism** (algorithm-free, round-vocabulary-free).
 //!
 //! Canonical CBOR codec, the genesis (schema-2) run envelope + freeze/verify (the retired v1
 //! envelope form survives only as the outer schema-major read that types its refusal),
-//! capability-set admission, merkle set commitments, the seven round messages + their CDDL, the
-//! round state-digest schedule, and the [`VhcProtoVersion`]. This crate is the single authority
-//! for the vhc wire shapes shared by the host, the participant runtime, and the (wasm32)
-//! coordinator DO — see `docs/specs/swarm-training-spec.md` §6, §7.3, §10.1, §16.
+//! capability-set admission, merkle set commitments, grants, certificates + revocations, and the
+//! [`VhcProtoVersion`]. This crate is the shared mechanism ground for the host, the participant
+//! runtime, and the (wasm32) coordinator DO — see `docs/specs/vhc-architecture-spec.md` §7.
 //!
-//! **Algorithm-free (D0 invariant, dep-check-enforced):** the deterministic assignment math that
-//! lived here as `proto::assignment` moved to `sdk/daemon-vhc-sdk-consensus` at D0 (refactor
-//! §8/D0; architecture §7 rule 1 — "daemon-vhc-proto stays algorithm-free: no assignment math, no
-//! round vocabulary"). This crate carries wire *mechanism* only.
+//! **Algorithm-free AND round-vocabulary-free (dep-check-enforced):** the deterministic assignment
+//! math moved to `sdk/daemon-vhc-sdk-consensus` first (architecture §7 rule 1 — "daemon-vhc-proto
+//! stays algorithm-free: no assignment math, no round vocabulary"); the round message schemas
+//! (`RoundOpen`/`Commitment`/…/`VhcMessage`/`SignedMessage`), the round state-digest schedule, and
+//! the `record-set.cbor` object followed when the round vocabulary moved out — they live in
+//! `daemon_vhc_sdk_consensus::{messages, digest, record_set}` now. Hosts route the resulting
+//! frames as opaque signed bytes; only modules and SDK layers decode them.
 //!
 //! **wasm32-clean by construction:** the only dependencies are `serde`, `ciborium`, `blake3`,
-//! `xxhash-rust`, and `ed25519-dalek` — no `tokio`, Burn, or wasmtime — so it builds for the
+//! and `ed25519-dalek` — no `tokio`, Burn, or wasmtime — so it builds for the
 //! `wasm32-unknown-unknown` coordinator target (§11.2). Signing uses only deterministic
 //! ed25519 operations (no RNG on the crate's non-test paths).
 
@@ -27,7 +29,6 @@ pub mod canonical;
 pub mod capability;
 pub mod cert;
 pub mod crypto;
-pub mod digest;
 pub mod domains;
 pub mod envelope;
 pub mod error;
@@ -35,8 +36,6 @@ pub mod genesis;
 pub mod grants;
 pub mod hash;
 pub mod merkle;
-pub mod messages;
-pub mod record_set;
 pub mod revocation;
 pub mod sign;
 pub mod transition;
@@ -53,7 +52,6 @@ pub use crypto::{
     hash as crypto_hash, verify_sig, VerifyOutcome, HASH_LEN, VERIFY_PUBLIC_KEY_LEN,
     VERIFY_SIGNATURE_LEN,
 };
-pub use digest::{derive_schedule, digest_state, DigestSchedule, StateLayout};
 pub use envelope::{DeviceMinimums, SignedEnvelope};
 pub use error::VhcProtoError;
 pub use genesis::{
@@ -64,8 +62,6 @@ pub use genesis::{
 pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsDoc, GrantsError, LaneCeilings};
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
-pub use messages::{SignedMessage, VhcMessage};
-pub use record_set::RecordSet;
 pub use revocation::{
     RevocationError, RevocationLedger, RunKeyRevocation, RunKeyRevocationBody, REVOCATION_DOMAIN_V2,
 };

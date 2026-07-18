@@ -62,7 +62,7 @@ impl ControlSubscription {
 
 /// Availability metadata for one payload object — the HEAD/`stat()` result (§7.1).
 ///
-/// This is what a [`ReceiptProducer`](crate::receipt::ReceiptProducer) folds into a signed
+/// This is what a coordinator-seat receipt producer folds into a signed
 /// `StorageReceipt`: the object's content hash + size, verified against the store (§6.4 I6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PayloadStat {

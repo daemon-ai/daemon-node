@@ -11,12 +11,15 @@ path = "src/lib.rs"
 [dependencies]
 # The wire contract (message types, canonical codec, envelope, hashes).
 daemon-vhc-proto = { workspace = true }
-# The shared coordinator types the replay oracle carries (PROTO-20): `CoordinatorState` (the
-# genesis-derived config the coordinator module is initialized with) + the `Input` trace. The
+# The shared coordinator types + round message schemas the replay oracle carries (PROTO-20):
+# `CoordinatorState` (the genesis-derived config the coordinator module is initialized with), the
+# `Input` trace, and the decoded round messages the journal/desync/health oracles inspect. The
 # oracle no longer re-runs a native `tick`: consensus is re-derived inside the sandboxed
 # `coordinator-quorum` module through the `CoordinatorSandbox` seam (consensus never runs
-# outside the sandbox, even in verification), so this is now a types-only dependency.
-# TRACKED dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/*.
+# outside the sandbox, even in verification).
+# EXPLICIT dependency-direction EXEMPTION (xtask vhc_dep_check): observe is harness/oracle
+# TOOLING, not a production host crate — it replays and audits recorded runs, which requires
+# decoding the SDK round schemas. It is never linked by the production node/worker/session graph.
 daemon-vhc-sdk-consensus = { workspace = true }
 # The journal record grammar + framing constants (ABI companion §8.2/§8.3/§8.5). This crate encodes
 # journal records and validates them against `daemon_vhc_abi::JOURNAL_CDDL` (the authoritative CDDL);

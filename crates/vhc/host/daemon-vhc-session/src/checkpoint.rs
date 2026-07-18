@@ -611,7 +611,7 @@ pub fn plan_late_join(
 /// resolution is the live engine's path), a missing/mismatched payload, or a set commitment that
 /// does not recompute.
 pub fn steps_from_round_records<F>(
-    records: &[daemon_vhc_proto::messages::RoundRecord],
+    records: &[daemon_vhc_sdk_consensus::messages::RoundRecord],
     mut fetch: F,
 ) -> Result<Vec<ReplayStep>, VhcRunError>
 where
@@ -927,8 +927,8 @@ mod tests {
         // record archive recovers them (D2's seam): typed checkpoint at round 0 → records for
         // rounds 1..=2 with committed inline sets → steps_from_round_records verifies payloads +
         // recomputes set commitments → resync_by_replay reaches the in-sync digest.
-        use daemon_vhc_proto::messages::{Locator, RecordEntry, RoundRecord};
         use daemon_vhc_proto::{commit_set, Seed};
+        use daemon_vhc_sdk_consensus::messages::{Locator, RecordEntry, RoundRecord};
         use std::collections::BTreeMap;
 
         let store = temp_store();

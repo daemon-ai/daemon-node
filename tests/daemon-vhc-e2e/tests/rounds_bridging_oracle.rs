@@ -14,8 +14,8 @@
 
 use std::collections::BTreeMap;
 
-use daemon_vhc_proto::messages::{BatchWindow, RecordEntry};
 use daemon_vhc_proto::{blake3_hash, PeerId, Seed};
+use daemon_vhc_sdk_consensus::messages::{BatchWindow, RecordEntry};
 use daemon_vhc_sdk_rounds::{
     interval_for as sdk_interval_for, slice_interval as sdk_slice, Authorized, Committed,
     MicroWindow,

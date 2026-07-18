@@ -3,8 +3,8 @@
 
 //! Merkle set commitments (spec §6.4; TDD PROTO-5 root/proof half).
 //!
-//! The signed, consensus-critical field of an [`Attestation`](crate::messages::Attestation) and a
-//! [`RoundRecord`](crate::messages::RoundRecord) is a **set commitment**: a blake3 merkle root over
+//! The signed, consensus-critical field of the SDK layer's `Attestation` and `RoundRecord`
+//! consensus messages is a **set commitment**: a blake3 merkle root over
 //! the set's `(peer, payload-hash)` pairs, **sorted by node public-key bytes** (invariant I3), plus
 //! the element count. The root is constant-size at any roster (≈32 B at n = 4 and at n = 4000), so
 //! the consensus messages are scale-invariant while membership stays exactly provable via O(log n)

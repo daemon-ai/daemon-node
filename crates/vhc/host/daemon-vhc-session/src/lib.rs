@@ -14,8 +14,10 @@
 //!   in-memory [`Corpus`] the engine reads batches from (§8, §6.3).
 //! - [`backend`] — the [`TrainerBackend`] trait (**the R↔E seam**) and the deterministic
 //!   [`StubBackend`] (§5.1, §10.2, ABI §2.3).
-//! - [`engine`] — the [`RoundEngine`]: the peer-side round state machine over the frozen seams
-//!   (round protocol, barrier I2, record-order staging I3, stall ladder — §6.4).
+//! - `engine` (harness-gated) — the retained `RoundEngine`: the peer-side round state machine
+//!   over the frozen seams (round protocol, barrier I2, record-order staging I3, stall ladder —
+//!   §6.4). It decodes SDK round schemas, so it lives behind the `harness` feature with the
+//!   checkpoint/upgrade machinery; the production session surface routes opaque signed frames.
 //! - [`protocol`] — the worker `Command`/`Event` wire types + CBOR codec (§10.2), which lane E's
 //!   `daemon-vhc-host` worker implements later.
 //!
@@ -25,22 +27,42 @@
 #![forbid(unsafe_code)]
 
 pub mod assess;
+pub mod attach;
 pub mod backend;
-pub mod checkpoint;
 pub mod config;
 pub mod data;
-pub mod engine;
-pub mod protocol;
-pub mod seam;
-// The host-enforced upgrade transaction (Phase E; architecture §5.4, ABI §10.3): the LOCAL half of
-// the two-key model — quiesce → snapshot → owner-law re-check (grant-expanding fails closed) →
-// migrate → validate → activate locally → rollback-and-retry-or-leave. Composes the committed
-// transition chain (`daemon_vhc_proto::TransitionChain`, deliverable 1); the wasm-guest step
-// adapters and drills live in the host testkit.
-pub mod attach;
 pub mod identity;
 pub mod keystore;
+pub mod protocol;
+pub mod seam;
+
+/// The typed checkpoint manager (save/load/attest/resync) — it decodes SDK round schemas
+/// (`RoundRecord` record-replay catch-up) and the SDK checkpoint manifest, so it rides the
+/// `harness` seat until its production consumer (the generic role session) lands.
+#[cfg(any(test, feature = "harness"))]
+pub mod checkpoint;
+
+/// The retained `RoundEngine` — the peer-side round state machine (round protocol, barrier I2,
+/// record-order staging I3, stall ladder). Round-schema-decoding harness substrate: the
+/// production session routes opaque signed frames only.
+#[cfg(any(test, feature = "harness"))]
+pub mod engine;
+
+// The host-enforced upgrade transaction (architecture §5.4, ABI §10.3): the LOCAL half of
+// the two-key model — quiesce → snapshot → owner-law re-check (grant-expanding fails closed) →
+// migrate → validate → activate locally → rollback-and-retry-or-leave. Composes the committed
+// transition chain (`daemon_vhc_proto::TransitionChain`). Consumes the SDK checkpoint manifest,
+// so it rides the `harness` seat with the checkpoint manager until its production command-surface
+// consumer lands; the wasm-guest step adapters and drills live in the host testkit.
+#[cfg(any(test, feature = "harness"))]
 pub mod upgrade;
+
+/// Turns payload-store availability into signed storage-receipt availability evidence — the
+/// coordinator-as-storage-client seat (moved here from the transport crate: authoring a consensus
+/// message is a coordinator-harness function, never generic transport). Behind the `harness`
+/// feature with the rest of the coordinator drive.
+#[cfg(any(test, feature = "harness"))]
+pub mod receipt;
 // `wasm_backend` (the v1 five-phase driver's TrainerBackend binding, moved here at the A2
 // inversion) RETIRED at the Phase-E v1 sunset (decisions D5) together with the host's Instance
 // lifecycle: the trait seam + `StubBackend` remain (the harness/checkpoint/cold-join substrate);
@@ -73,11 +95,13 @@ pub mod coordinator_shell;
 pub use backend::{
     AssessMeta, Assessment, BatchRef, StateDigest, StepCtx, StepStats, StubBackend, TrainerBackend,
 };
+#[cfg(any(test, feature = "harness"))]
 pub use checkpoint::{CheckpointManifest, ReplayStep};
 pub use data::{
     BatchInterval, BatchLocation, Corpus, DataError, InnerStep, Manifest, MicroBatch, ShardDesc,
     SyntheticCorpus, TokenWidth,
 };
+#[cfg(any(test, feature = "harness"))]
 pub use engine::{EngineConfig, EngineEvent, RoundEngine, RunOutcome};
 pub use seam::BatchId;
 

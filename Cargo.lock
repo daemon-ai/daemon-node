@@ -4912,6 +4912,7 @@ dependencies = [
  "daemon-core",
  "daemon-egress",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
  "futures",
  "iroh",
  "iroh-gossip",
@@ -4974,12 +4975,10 @@ name = "daemon-vhc-proto"
 version = "0.0.1"
 dependencies = [
  "blake3",
- "cddl-cat",
  "ciborium",
  "ed25519-dalek 2.2.0",
  "proptest",
  "serde",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -5021,10 +5020,12 @@ dependencies = [
 name = "daemon-vhc-sdk-consensus"
 version = "0.0.1"
 dependencies = [
+ "cddl-cat",
  "ciborium",
  "daemon-vhc-proto",
  "proptest",
  "serde",
+ "xxhash-rust",
 ]
 
 [[package]]

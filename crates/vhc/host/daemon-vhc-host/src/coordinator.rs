@@ -46,11 +46,11 @@ use ciborium::value::Value;
 
 use daemon_vhc_abi::CandidateDriver;
 use daemon_vhc_proto::{
-    from_canonical_slice, peek_schema, to_canonical_vec, FrozenGenesis, Hash, SignedMessage,
-    VhcMessage, GENESIS_SCHEMA_MAJOR,
+    from_canonical_slice, peek_schema, to_canonical_vec, FrozenGenesis, Hash, GENESIS_SCHEMA_MAJOR,
 };
 use daemon_vhc_sdk_consensus::coordinator::CoordinatorState;
 use daemon_vhc_sdk_consensus::{AuthorityConfig, RecordSig};
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 
 use crate::run::{
     start_run_migrating, DeliverVerdict, MemorySink, MigrationInput, Run, RunConfig, RunEnd,

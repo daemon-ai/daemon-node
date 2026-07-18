@@ -4,7 +4,7 @@
 //! Round state digest schedule conformance (TDD PROTO-18, spec §5.6).
 
 use daemon_vhc_proto::bytes::Seed;
-use daemon_vhc_proto::digest::{derive_schedule, digest_state, StateLayout};
+use daemon_vhc_sdk_consensus::digest::{derive_schedule, digest_state, StateLayout};
 
 const BLOCK: u32 = 64;
 const SAMPLES: u32 = 8;

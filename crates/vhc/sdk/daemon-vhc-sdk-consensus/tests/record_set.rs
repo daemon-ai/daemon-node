@@ -5,8 +5,9 @@
 //! membership-proof spot-checks (spec §6.4/§11.3; TDD PROTO-5 / RUN-2).
 
 use daemon_vhc_proto::merkle::commit_set;
-use daemon_vhc_proto::messages::{Locator, RecordEntry, RoundRecord};
-use daemon_vhc_proto::{to_canonical_vec, Hash, PeerId, RecordSet, Root, Seed};
+use daemon_vhc_proto::{to_canonical_vec, Hash, PeerId, Root, Seed};
+use daemon_vhc_sdk_consensus::messages::{Locator, RecordEntry, RoundRecord};
+use daemon_vhc_sdk_consensus::RecordSet;
 
 const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-vhc.cddl"));
 

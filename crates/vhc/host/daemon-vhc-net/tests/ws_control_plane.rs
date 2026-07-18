@@ -16,10 +16,9 @@ use std::time::Duration;
 use common::ws_harness::{fast_reconnect, no_reconnect, MockWsCoordinator};
 use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
 use daemon_vhc_net::{ControlPlane, WsAuth};
-use daemon_vhc_proto::messages::{Commitment, Locator};
-use daemon_vhc_proto::{
-    from_canonical_slice, to_canonical_vec, Hash, SignedMessage, VhcMessage, VHC_PROTO_VERSION,
-};
+use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, VHC_PROTO_VERSION};
+use daemon_vhc_sdk_consensus::messages::{Commitment, Locator};
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 
 const FRAME_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

@@ -32,8 +32,8 @@
 
 use std::collections::BTreeMap;
 
-use daemon_vhc_proto::messages::{SignedMessage, VhcMessage};
 use daemon_vhc_proto::{blake3_hash, commit_set, from_canonical_slice, Hash, PeerId};
+use daemon_vhc_sdk_consensus::messages::{SignedMessage, VhcMessage};
 
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 

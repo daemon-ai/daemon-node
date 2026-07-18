@@ -31,6 +31,11 @@
 //! A trapping module surfaces as `Event::Error{class: Module, …}` — the worker is never harmed.
 
 mod backend;
+// The in-process self-driven join: it decodes the SDK round schemas and drives the run's
+// coordinator module in-process, so it is HARNESS machinery — the production worker routes
+// opaque signed frames only and carries no round vocabulary (dep-check-enforced; the
+// decentralized role-session join lands at the node command surface).
+#[cfg(feature = "harness")]
 mod session;
 
 use daemon_provision::{CutChannel, CutWriter};
@@ -117,7 +122,7 @@ async fn main() {
                         resolved.genesis.as_ref().map(|g| backend::TupleIdentity {
                             genesis_hash: g.frozen.run_id().0,
                             role: &g.worker_role,
-                            incarnation: session::RUN_INSTANCE,
+                            incarnation: backend::RUN_INSTANCE,
                         });
                     match backend::assess(
                         &resolved.module,
@@ -192,7 +197,7 @@ async fn main() {
                     let tuple_identity = backend::TupleIdentity {
                         genesis_hash: genesis.frozen.run_id().0,
                         role: &genesis.worker_role,
-                        incarnation: session::RUN_INSTANCE,
+                        incarnation: backend::RUN_INSTANCE,
                     };
                     match backend::assess(
                         &resolved.module,
@@ -223,17 +228,38 @@ async fn main() {
                         }
                     }
                 }
-                match session::join_and_run(
-                    &resolved.module,
-                    &resolved.config,
-                    genesis,
-                    &run_id,
-                    &writer,
-                )
-                .await
+                #[cfg(feature = "harness")]
                 {
-                    Ok(()) => {}
-                    Err(detail) => send(&writer, &worker_error(&detail)).await,
+                    match session::join_and_run(
+                        &resolved.module,
+                        &resolved.config,
+                        genesis,
+                        &run_id,
+                        &writer,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(detail) => send(&writer, &worker_error(&detail)).await,
+                    }
+                }
+                #[cfg(not(feature = "harness"))]
+                {
+                    // The production worker carries no in-process join: the self-driven session
+                    // decodes SDK round schemas and hosts the run's coordinator in-process, which
+                    // the opaque-host boundary forbids (the host routes signed opaque frames and
+                    // services capabilities; it never understands rounds). The decentralized
+                    // role-session join over real transports is the successor; until it lands,
+                    // an unadorned worker refuses typed instead of running harness machinery.
+                    send(
+                        &writer,
+                        &worker_error(&format!(
+                            "JoinRun for run `{run_id}`: this worker build carries no \
+                             in-process self-driven join (harness builds only); the \
+                             decentralized role-session join supersedes it"
+                        )),
+                    )
+                    .await;
                 }
             }
             Command::Throttle { .. } => {

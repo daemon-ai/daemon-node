@@ -9,8 +9,8 @@
 // Oracle provenance (swarm-ledger-p2-b1.md): hand-derived pinned literals for the class-weight
 // ladder + from-definition cover-counting for the partition property; daemon seed 0xDAE0_7E57.
 
-use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
 use daemon_vhc_proto::{PeerId, Seed};
+use daemon_vhc_sdk_consensus::messages::{BatchWindow, ThroughputClass};
 use daemon_vhc_sdk_consensus::{assign_batches, class_weight};
 
 const GOLDEN_SEED_RAW: u64 = 0xDAE0_7E57;

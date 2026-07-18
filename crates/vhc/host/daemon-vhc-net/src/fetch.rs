@@ -13,8 +13,9 @@
 //!
 //! [`fetch_with_fallback_dyn`] is the same policy over heterogeneous stores behind a trait object
 //! (`&[&dyn PayloadStore]`) — an [`R2Store`](crate::R2Store) primary with an
-//! [`FsPayloadStore`](crate::store::FsPayloadStore) mirror fallback (NET-4). [`fetch_record_set`]
-//! fetches + decodes + content-verifies a `record-set.cbor` object (RUN-2 net half). The
+//! [`FsPayloadStore`](crate::store::FsPayloadStore) mirror fallback (NET-4). (The record-set
+//! fetch+decode helper moved to the engine with the SDK schema layer: net returns verified
+//! BYTES; what those bytes decode to is module/SDK vocabulary.) The
 //! [`DownloadScheduler`] is the concurrency + retry layer ported from Psyche's download scheduler
 //! (capacity gate, FIFO waiters, per-class expo-backoff retry) — see the port note below.
 //!
@@ -24,7 +25,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use daemon_vhc_proto::RecordSet;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::seam::{ContentHash, PayloadKey};
@@ -151,33 +151,6 @@ pub async fn fetch_with_fallback_dyn(
         }
     }
     Err(exhausted(key, stores.len()))
-}
-
-/// Fetch and decode a `record-set.cbor` object (spec §6.4, §11.3; TDD RUN-2 net half).
-///
-/// Fetches the object via [`PayloadStore::get`] (which blake3-verifies the raw bytes equal
-/// `expected` — the locator hash), decodes [`RecordSet`], and re-verifies the decoded set's content
-/// address equals `expected` (so a non-canonical re-encoding is also rejected). Root verification
-/// against the `RoundRecord`'s signed commitment stays **engine-side** (B3 wires this into
-/// `engine.rs::verify_record_set` later); this is the net-side fetch+decode+content-verify half.
-pub async fn fetch_record_set<P: PayloadStore>(
-    store: &P,
-    key: &PayloadKey,
-    expected: &ContentHash,
-) -> Result<RecordSet, VhcNetError> {
-    let bytes = store.get(key, expected).await?;
-    let set = RecordSet::from_canonical_slice(&bytes)
-        .map_err(|e| VhcNetError::Fetch(format!("decode record-set: {e}")))?;
-    let actual = set
-        .content_hash()
-        .map_err(|e| VhcNetError::Fetch(format!("hash record-set: {e}")))?;
-    if &actual != expected {
-        return Err(VhcNetError::HashMismatch {
-            expected: expected.to_hex(),
-            actual: actual.to_hex(),
-        });
-    }
-    Ok(set)
 }
 
 /// The typed "exhausted every source" miss the §6.4 stall ladder consumes.
@@ -603,55 +576,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
-    }
-
-    // --- fetch_record_set (RUN-2 net half) -------------------------------------------------------
-
-    #[tokio::test]
-    async fn record_set_round_trips_and_content_verifies() {
-        use daemon_vhc_proto::messages::RecordEntry;
-
-        let dir = temp_root("recordset-ok");
-        let store = FsPayloadStore::open(dir.path(), 8).unwrap();
-        let set = RecordSet::new([
-            RecordEntry {
-                peer: PeerId([2; 32]),
-                hash: blake3_hash(b"p2"),
-                size: 2,
-            },
-            RecordEntry {
-                peer: PeerId([1; 32]),
-                hash: blake3_hash(b"p1"),
-                size: 1,
-            },
-        ]);
-        let bytes = set.to_canonical_vec().unwrap();
-        let expected = set.content_hash().unwrap();
-        let k = key(0x30);
-        store.put(&k, &bytes).await.unwrap();
-
-        let fetched = fetch_record_set(&store, &k, &expected).await.unwrap();
-        assert_eq!(fetched, set);
-        assert_eq!(fetched.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn tampered_set_object_rejected() {
-        // The store holds bytes that do not hash to the locator hash → the get-side blake3 verify
-        // rejects before we ever decode (RUN-2's tamper reject, net side).
-        let dir = temp_root("recordset-tamper");
-        let store = FsPayloadStore::open(dir.path(), 8).unwrap();
-        let k = key(0x31);
-        store.put(&k, b"not-a-record-set").await.unwrap();
-
-        let locator_hash = blake3_hash(b"the-honest-record-set-bytes");
-        let err = fetch_record_set(&store, &k, &locator_hash)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, VhcNetError::HashMismatch { .. }),
-            "got {err:?}"
-        );
     }
 
     // --- DownloadScheduler: DIRECT ports of Psyche scheduler.rs:411-675 ---------------------------

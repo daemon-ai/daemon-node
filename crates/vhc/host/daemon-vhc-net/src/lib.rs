@@ -7,17 +7,21 @@
 //! ([`ControlPlane`] — publish/subscribe of already-signed message bytes, with the in-process
 //! [`LoopbackGossip`] implementation) and one payload plane ([`PayloadStore`] — opaque objects by
 //! `(run, round, peer)` key + content hash, with the filesystem [`FsPayloadStore`] implementation
-//! and its retention window). The [`ReceiptProducer`] turns store availability into signed
-//! `StorageReceipt` evidence (§6.4 I6). Artifact fetch ([`ArtifactResolver`]) resolves `file://`
+//! and its retention window). Artifact fetch ([`ArtifactResolver`]) resolves `file://`
 //! (blake3-verified); `r2`/`hf`/`https` are reserved for the egress plane.
+//!
+//! **Opaque by construction:** this crate carries already-signed frame BYTES and content-addressed
+//! payload objects; it defines no consensus message and decodes none (the round message schemas
+//! are SDK vocabulary — `daemon_vhc_sdk_consensus::messages` — that hosts never link;
+//! dep-check-enforced). Receipt production (store availability → signed evidence) is a
+//! coordinator-seat function and lives with the coordinator harness drive in the session crate.
 //!
 //! Engine-agnostic; consumed by `daemon-vhc-session` (§10.1). Outbound HTTP must route through
 //! `daemon_egress::EgressClient` (raw `reqwest::Client` is banned workspace-wide by clippy); no HTTP
 //! client is constructed this wave.
 //!
-//! Merge-1 note: the shared identity/hash vocabulary in [`seam`] is now the canonical
-//! `daemon-vhc-proto` types (blake3 `Hash`, `PeerId`); the [`ReceiptProducer`] emits proto's
-//! signed `StorageReceipt` control message (ed25519 over canonical CBOR).
+//! Merge-1 note: the shared identity/hash vocabulary in [`seam`] is the canonical
+//! `daemon-vhc-proto` types (blake3 `Hash`, `PeerId`).
 //!
 //! Additions: [`Deduper`] — the reusable content-hash dedupe [`LoopbackGossip`]
 //! composes (NET-6); and [`fetch_with_fallback`] — payload fetch with bounded [`RetryPolicy`]
@@ -42,7 +46,6 @@ pub mod gossip;
 pub mod iroh_gossip;
 pub mod presign;
 pub mod r2_store;
-pub mod receipt;
 /// Run discovery + envelope fetch against the coordinator registry (spec §6.1/§11.1; A1).
 pub mod registry;
 pub mod seam;
@@ -58,8 +61,8 @@ pub use content_cache::ContentCache;
 pub use dedupe::Deduper;
 pub use dual_plane::DualPlane;
 pub use fetch::{
-    fetch_record_set, fetch_with_fallback, fetch_with_fallback_dyn, DownloadScheduler, ReadyRetry,
-    RetryConfig, RetryPolicy, RetryQueueResult,
+    fetch_with_fallback, fetch_with_fallback_dyn, DownloadScheduler, ReadyRetry, RetryConfig,
+    RetryPolicy, RetryQueueResult,
 };
 pub use gossip::LoopbackGossip;
 #[cfg(feature = "iroh")]
@@ -68,7 +71,6 @@ pub use presign::{
     HttpPresignClient, ObjectKind, PresignClient, PresignOp, PresignRequest, PresignResponse,
 };
 pub use r2_store::{r2_object_key, R2Store};
-pub use receipt::ReceiptProducer;
 pub use registry::{CheckpointPointer, RegistryClient, RunArtifact, RunDescriptor, RunState};
 pub use seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};
 pub use store::FsPayloadStore;
