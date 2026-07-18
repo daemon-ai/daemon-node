@@ -21,7 +21,7 @@ use crate::hash::blake3_hash;
 
 const LEAF_DOMAIN: u8 = 0x00;
 const NODE_DOMAIN: u8 = 0x01;
-const EMPTY_ROOT_LABEL: &[u8] = b"daemon-vhc/merkle/empty/v1";
+use crate::domains::MERKLE_EMPTY_ROOT_LABEL as EMPTY_ROOT_LABEL;
 
 fn leaf_hash(peer: &PeerId, hash: &Hash) -> Hash {
     let mut buf = [0u8; 1 + PeerId::LEN + Hash::LEN];

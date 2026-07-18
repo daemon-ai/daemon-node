@@ -62,8 +62,8 @@ fn golden_shuffle_of_sixteen() {
     let mut sorted = v.clone();
     sorted.sort_unstable();
     assert_eq!(sorted, (0..16).collect::<Vec<_>>());
-    // …pinned exactly.
-    let want: [u32; 16] = [10, 15, 14, 5, 12, 7, 6, 11, 3, 13, 9, 0, 1, 2, 4, 8];
+    // …pinned exactly (under the registry witness salt, `daemon-vhc/witness/1.0.0`).
+    let want: [u32; 16] = [14, 12, 2, 4, 13, 10, 6, 8, 9, 15, 1, 11, 5, 3, 0, 7];
     assert_eq!(v, want.to_vec(), "shuffle drifted from the pinned golden");
 }
 

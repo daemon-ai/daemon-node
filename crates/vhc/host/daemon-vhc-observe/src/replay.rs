@@ -33,8 +33,9 @@ use crate::capture::RunCapture;
 use crate::log::{MessageKind, MessageLog};
 use crate::ObserveError;
 
-/// Domain tag for the coordinator genesis seed derivation (see [`genesis_seed`]).
-const GENESIS_SEED_DOMAIN: &[u8] = b"daemon-vhc/observe/genesis-seed/genesis/v2";
+/// Domain tag for the coordinator genesis seed derivation (see [`genesis_seed`]) — the
+/// registry constant.
+use daemon_vhc_proto::domains::GENESIS_SEED_DOMAIN;
 
 /// The deterministic genesis seed for a run, derived from its **genesis hash** (the run's
 /// cryptographic identity, `FrozenGenesis::run_id`) by a domain-separated blake3.

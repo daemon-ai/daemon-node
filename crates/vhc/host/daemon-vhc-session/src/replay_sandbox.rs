@@ -49,7 +49,8 @@ const RUN_DEADLINE: Duration = Duration::from_secs(60);
 const DRAIN_QUIET: Duration = Duration::from_millis(300);
 /// Fixed key seed for the coordinator's frame signer: the replay oracle compares the module's
 /// published `RoundRecord` **payloads**, never their transport signatures, so any seed serves.
-const FRAME_KEY_SEED: &[u8] = b"daemon-vhc/observe/replay-sandbox/coordinator-frame-key";
+/// The registry constant.
+use daemon_vhc_proto::domains::REPLAY_SANDBOX_FRAME_KEY_SEED as FRAME_KEY_SEED;
 
 /// A [`CoordinatorSandbox`] backed by the production `coordinator-quorum` wasm module running under
 /// the real major-2 host driver.

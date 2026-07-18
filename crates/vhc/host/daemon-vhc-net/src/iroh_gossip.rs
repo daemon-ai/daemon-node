@@ -410,7 +410,8 @@ impl ControlPlane for IrohGossip {
 /// Domain tag for the gossip-topic derivation. Binds the topic to the genesis run-identity domain
 /// so it cannot collide with any other blake3 use of the same 32 bytes, and so the topic is a
 /// distinct value from a legacy (pre-genesis) topic that hashed a run's frozen envelope directly.
-const GOSSIP_TOPIC_DOMAIN: &[u8] = b"daemon-vhc/gossip-topic/genesis/v2";
+/// The registry constant.
+use daemon_vhc_proto::domains::GOSSIP_TOPIC_DOMAIN;
 
 /// Derive the gossip topic from the run's **genesis hash**: `blake3(domain ++ genesis_hash)` ->
 /// [`TopicId`]. Delta from Psyche's `sha256("psyche gossip" ++ run_id)` (`util.rs:5-13`): blake3 not

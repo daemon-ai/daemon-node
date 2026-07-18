@@ -32,10 +32,10 @@
     "wd": 0.1
   },
   "module": {
-    "blake3": "0e2c6fb4cc295f7d0411a325ed14b2629c2bd2387e66e0e291dc61327f3281e2",
-    "bytes": 1026114,
+    "blake3": "1e7d25ac792cf81827b43a298bbbdee6999692170390ac7ecb5b26c9934bed8b",
+    "bytes": 1024466,
     "name": "tiny_llama.wasm",
-    "source": "guests/target build at capture (byte-identical across checkout paths via the guests workspace rustc remap; pinned in guests.blake3 at the commit). INFORMATIONAL field, mechanically re-synced when the trainer guest gained checkpoint/migration support + payload externalization (guests.blake3 re-pin) — the recorded golden bytes and digests below are unchanged and were NOT re-captured (the guest's training math is untouched; the reproduce lanes stay green against them)."
+    "source": "guests/target build at capture (byte-identical across checkout paths via the guests workspace rustc remap; pinned in guests.blake3 at the commit). INFORMATIONAL field, mechanically re-synced when the trainer guest gained checkpoint/migration support + payload externalization, and again at the durable-rename pass (guest crate promoted to the clean tiny-llama name; SDK crate renamed; domain-salt registry) — the recorded golden bytes and digests below are unchanged on every re-sync and were NOT re-captured (the guest's training math is untouched; the reproduce lanes stay green against them)."
   },
   "param_names": [
     "tok.weight",

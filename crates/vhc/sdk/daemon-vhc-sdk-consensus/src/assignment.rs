@@ -26,10 +26,10 @@ use daemon_vhc_proto::envelope::GlobalBatch;
 use daemon_vhc_proto::hash::blake3_hash;
 use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
 
-/// Salt for the witness-committee shuffle (§6.3).
-pub const WITNESS_SALT: &[u8] = b"daemon-vhc/witness/v1";
-/// Salt for the batch-assignment shuffle (§6.3).
-pub const ASSIGN_SALT: &[u8] = b"daemon-vhc/assign/v1";
+/// Salt for the batch-assignment shuffle (§6.3) — the registry constant, re-exported.
+pub use daemon_vhc_proto::domains::ASSIGN_SALT;
+/// Salt for the witness-committee shuffle (§6.3) — the registry constant, re-exported.
+pub use daemon_vhc_proto::domains::WITNESS_SALT;
 
 /// Default witness-committee size (§6.3 — "witness count default 4"). `0` means "all peers witness".
 pub const WITNESS_TARGET_DEFAULT: u32 = 4;
@@ -136,10 +136,10 @@ pub struct Committee {
     pub witnesses: Vec<PeerId>,
 }
 
-/// Salt for the verifier-committee shuffle (§12).
-pub const VERIFIER_SALT: &[u8] = b"daemon-vhc/verifier/v1";
-/// Salt for the checkpointer (tie-breaker) election (§9).
-pub const CHECKPOINTER_SALT: &[u8] = b"daemon-vhc/checkpointer/v1";
+/// Salt for the checkpointer (tie-breaker) election (§9) — the registry constant, re-exported.
+pub use daemon_vhc_proto::domains::CHECKPOINTER_SALT;
+/// Salt for the verifier-committee shuffle (§12) — the registry constant, re-exported.
+pub use daemon_vhc_proto::domains::VERIFIER_SALT;
 
 /// Select the verifier committee — a seed-shuffled `⌈n·percent/100⌉` subset (§12; TDD PROTO-15).
 ///

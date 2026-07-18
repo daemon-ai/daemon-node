@@ -474,7 +474,7 @@ impl<C: ControlPlane> CoordinatorShell<C> {
         let wasm = crate::replay_sandbox::coordinator_quorum_wasm()
             .map_err(|e| VhcRunError::Lifecycle(format!("coordinator blob: {e}")))?;
         let spec = self.spec(&wasm)?;
-        let coord_seed = *blake3_hash(b"daemon-vhc/harness/coordinator/frame-key").as_bytes();
+        let coord_seed = *blake3_hash(daemon_vhc_proto::domains::HARNESS_FRAME_KEY_SEED).as_bytes();
         // The module start compiles the blob (CPU-seconds): hand this worker's task queue off
         // first so the drive cannot starve the same runtime's engine/collector tasks.
         let mut coord = tokio::task::block_in_place(|| {

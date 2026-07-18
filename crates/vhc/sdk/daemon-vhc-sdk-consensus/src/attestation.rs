@@ -30,8 +30,9 @@ use daemon_vhc_proto::{
 use serde::{Deserialize, Serialize};
 
 /// Domain-separation tag bound into every attestation preimage (so a signature is scoped to
-/// checkpoint attestation and cannot be replayed as any other signed frame).
-pub const ATTEST_DOMAIN: &str = "daemon-vhc/checkpoint-attestation/v1";
+/// checkpoint attestation and cannot be replayed as any other signed frame) — the registry
+/// constant, re-exported.
+pub use daemon_vhc_proto::domains::CHECKPOINT_ATTESTATION_DOMAIN as ATTEST_DOMAIN;
 
 /// Which claim an attestation makes about a checkpoint (architecture §5.3). Numeric values are
 /// permanent wire tags.

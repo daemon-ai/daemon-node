@@ -28,6 +28,7 @@ pub mod capability;
 pub mod cert;
 pub mod crypto;
 pub mod digest;
+pub mod domains;
 pub mod envelope;
 pub mod error;
 pub mod genesis;

@@ -211,7 +211,7 @@ pub struct Join {
 /// `CheckpointAttestation` — a peer's signed two-tier checkpoint attestation (architecture §5.3;
 /// Phase E cold join). The wire mirror of the E1 attestation vocabulary
 /// (`daemon-vhc-sdk-consensus::attestation::SignedAttestation`): `sig` is the **inner**,
-/// domain-separated (`daemon-vhc/checkpoint-attestation/v1`) ed25519 signature by `signer` over
+/// domain-separated (`daemon-vhc/checkpoint-attestation/1.0.0`) ed25519 signature by `signer` over
 /// the attestation body — self-authenticating independent of the outer [`SignedMessage`] wrapper
 /// (which authenticates the *relayer*; a coordinator may re-broadcast another peer's
 /// attestation verbatim). The coordinator records verified attestations into its consensus-state
