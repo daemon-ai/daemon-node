@@ -10,7 +10,7 @@
 //! PTY stdin trio `write` / `submit` / `close`. Every action is scoped to the calling session's
 //! own processes (ownership = the spawning `SessionId`).
 //!
-//! §12 per-call classification (W5 seams): the read-only actions (`list|poll|log|wait`) run
+//! §12 per-call classification: the read-only actions (`list|poll|log|wait`) run
 //! [`Parallel`](ToolConcurrency::Parallel) and don't checkpoint; the mutating ones
 //! (`kill|write|submit|close`) are [`Exclusive`](ToolConcurrency::Exclusive) and do. `wait` opts
 //! out of the engine's per-tool timeout (it self-limits, clamped to the shell default like
