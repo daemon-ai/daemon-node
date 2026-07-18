@@ -764,6 +764,7 @@ pub(crate) fn assess(
     module_blake3: Option<&[u8; 32]>,
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
     envelope_grants: Option<&daemon_vhc_host::run::EnvelopeRoleGrants>,
+    tuple_identity: Option<TupleIdentity<'_>>,
 ) -> Result<(Eligibility, bool), String> {
     // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (real-scale param layouts exceed
     // the tiny-model defaults). Assessment itself stays on the CPU-cheap path.
@@ -791,6 +792,7 @@ pub(crate) fn assess(
                     module_blake3,
                     device_min,
                     envelope_grants,
+                    tuple_identity,
                 ),
                 true,
             ))
@@ -801,10 +803,23 @@ pub(crate) fn assess(
                 reasons: vec![refusal.to_string()],
                 headroom: Vec::new(),
                 refusal_code: Some(refusal.code.slug().to_string()),
+                admitted_tuple: None,
             },
             false,
         )),
     }
+}
+
+/// The non-artifact identity fields the admitted tuple needs beyond what the module/config/grants
+/// bytes provide: the run's genesis hash, the admitted role, and the role-instance incarnation.
+#[derive(Clone, Copy)]
+pub(crate) struct TupleIdentity<'a> {
+    /// The run identity — the genesis-envelope hash.
+    pub(crate) genesis_hash: [u8; 32],
+    /// The envelope-level role admitted.
+    pub(crate) role: &'a str,
+    /// The role-instance incarnation.
+    pub(crate) incarnation: u64,
 }
 
 /// The owner's node-side lane configuration seam (§9.6: "numbers are deployment config").
@@ -849,6 +864,7 @@ fn assess_module(
     module_blake3: Option<&[u8; 32]>,
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
     envelope_grants: Option<&daemon_vhc_host::run::EnvelopeRoleGrants>,
+    tuple_identity: Option<TupleIdentity<'_>>,
 ) -> Eligibility {
     let lane = selected_lane();
     let hw = hardware();
@@ -864,9 +880,24 @@ fn assess_module(
         vram_cap_bytes: 0,
         host_cap_bytes: 0,
     };
-    // The derived grants document (§2.6 stand-in): the SAME deterministic derivation the v2 join
-    // uses, so assess and join evaluate byte-identical (config, grants) pairs (§9.4 pinning).
-    let grants = crate::session::derive_grants();
+    // The complete §2.6 grants document: the SAME deterministic derivation the v2 join uses
+    // (worlds the module links ∪ the genesis role grant list), so assess and join evaluate
+    // byte-identical (config, grants) pairs (§9.4 pinning). The no-envelope path authors from an
+    // empty role grant (worlds still covered from the module's imports).
+    let default_role = daemon_vhc_proto::genesis::RoleGrants::default();
+    let role_grants = envelope_grants.map_or(&default_role, |eg| &eg.grants);
+    let grants = match crate::session::derive_grants(worker, module, role_grants) {
+        Ok(g) => g,
+        Err(detail) => {
+            return Eligibility {
+                eligible: false,
+                reasons: vec![detail],
+                headroom: Vec::new(),
+                refusal_code: None,
+                admitted_tuple: None,
+            }
+        }
+    };
     match daemon_vhc_host::run::admit(
         worker,
         module,
@@ -883,32 +914,53 @@ fn assess_module(
         // funnel's pre-D0 defaults stand.
         envelope_grants,
     ) {
-        Ok(admission) => Eligibility {
-            eligible: true,
-            reasons: vec![format!(
-                "major-2 claim admitted: device {} B / host {} B (disjoint tier sums), \
-                 pressure order {:?}",
-                admission.claim.device_total(),
-                admission.claim.host_total(),
-                admission.claim.under_pressure,
-            )],
-            headroom: vec![
-                (
-                    "claim_device_bytes".to_string(),
-                    admission.claim.device_total() as i64,
-                ),
-                (
-                    "claim_host_bytes".to_string(),
-                    admission.claim.host_total() as i64,
-                ),
-            ],
-            refusal_code: None,
-        },
+        Ok(admission) => {
+            // The immutable admitted tuple this assessment produced (architecture §6.3): the exact
+            // assessed identity join rederives and compares. The artifact-addressed fields are hashes
+            // of the very bytes admitted; the node stamps its device-profile / owner-policy revisions.
+            let admitted_tuple =
+                tuple_identity.map(|id| daemon_vhc_session::protocol::AdmittedTuple {
+                    module_hash: module_blake3
+                        .copied()
+                        .unwrap_or_else(|| *blake3::hash(module).as_bytes()),
+                    config_hash: *blake3::hash(config).as_bytes(),
+                    grants_hash: *blake3::hash(&grants).as_bytes(),
+                    claim_hash: *blake3::hash(&admission.claim_bytes).as_bytes(),
+                    genesis_hash: id.genesis_hash,
+                    role: id.role.to_string(),
+                    incarnation: id.incarnation,
+                    device_profile_rev: 0,
+                    owner_policy_rev: 0,
+                });
+            Eligibility {
+                eligible: true,
+                reasons: vec![format!(
+                    "major-2 claim admitted: device {} B / host {} B (disjoint tier sums), \
+                     pressure order {:?}",
+                    admission.claim.device_total(),
+                    admission.claim.host_total(),
+                    admission.claim.under_pressure,
+                )],
+                headroom: vec![
+                    (
+                        "claim_device_bytes".to_string(),
+                        admission.claim.device_total() as i64,
+                    ),
+                    (
+                        "claim_host_bytes".to_string(),
+                        admission.claim.host_total() as i64,
+                    ),
+                ],
+                refusal_code: None,
+                admitted_tuple,
+            }
+        }
         Err(refusal) => Eligibility {
             eligible: false,
             reasons: vec![refusal.to_string()],
             headroom: Vec::new(),
             refusal_code: refusal.code.map(|c| c.slug().to_string()),
+            admitted_tuple: None,
         },
     }
 }

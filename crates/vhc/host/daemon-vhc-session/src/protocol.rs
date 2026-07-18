@@ -134,6 +134,62 @@ pub struct Hardware {
     pub throughput_class: String,
 }
 
+/// The immutable **admitted tuple** an assessment produces (architecture §6.3): the exact
+/// assessed identity of what will run, carried to `JoinRun` and re-verified there. Join rederives
+/// every artifact-addressed field from the artifacts it is about to run and compares field by
+/// field; any mismatch aborts the join and reruns assessment (a stale or swapped artifact can
+/// never be silently joined). The two revisions are node-owned monotonic counters (the device
+/// profile revision and the owner policy revision) stamped at assess and compared by the node.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmittedTuple {
+    /// Content address of the module actually admitted.
+    pub module_hash: [u8; 32],
+    /// Canonical-CBOR hash of the run config.
+    pub config_hash: [u8; 32],
+    /// Canonical-CBOR hash of the FULL grants document (ABI §2.6).
+    pub grants_hash: [u8; 32],
+    /// The module's `claim()` output as admitted (hash of the claim bytes).
+    pub claim_hash: [u8; 32],
+    /// The run identity — the genesis-envelope hash.
+    pub genesis_hash: [u8; 32],
+    /// The envelope-level role label admitted.
+    pub role: String,
+    /// The role-instance incarnation admitted.
+    pub incarnation: u64,
+    /// The hardware-probe revision consulted for eligibility (node-owned counter).
+    #[serde(default)]
+    pub device_profile_rev: u64,
+    /// The owner-policy revision consulted at admission (node-owned counter).
+    #[serde(default)]
+    pub owner_policy_rev: u64,
+}
+
+impl AdmittedTuple {
+    /// The first artifact-addressed field that differs from `rederived` (the fields join
+    /// recomputes from the artifacts it is about to run), or `None` when they match. The
+    /// node-owned revisions are compared separately by the node, not here.
+    #[must_use]
+    pub fn first_artifact_mismatch(&self, rederived: &Self) -> Option<&'static str> {
+        if self.module_hash != rederived.module_hash {
+            Some("module_hash")
+        } else if self.config_hash != rederived.config_hash {
+            Some("config_hash")
+        } else if self.grants_hash != rederived.grants_hash {
+            Some("grants_hash")
+        } else if self.claim_hash != rederived.claim_hash {
+            Some("claim_hash")
+        } else if self.genesis_hash != rederived.genesis_hash {
+            Some("genesis_hash")
+        } else if self.role != rederived.role {
+            Some("role")
+        } else if self.incarnation != rederived.incarnation {
+            Some("incarnation")
+        } else {
+            None
+        }
+    }
+}
+
 /// A self-assessment result for a run (§6.5, §10.2).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Eligibility {
@@ -143,6 +199,11 @@ pub struct Eligibility {
     pub reasons: Vec<String>,
     /// Per-dimension headroom (e.g. `"vram_mb" => 4096`).
     pub headroom: Vec<(String, i64)>,
+    /// The immutable admitted tuple this assessment produced (architecture §6.3), carried to the
+    /// node and on into `JoinRun`. `None` on an ineligible verdict (nothing was admitted).
+    /// Additive `#[serde(default)]` — pre-tuple frames decode to `None`.
+    #[serde(default)]
+    pub admitted_tuple: Option<AdmittedTuple>,
     /// The split typed admission-refusal code slug (ABI Draft 3 §1.5 — e.g.
     /// `"AbiUnsupportedMajor"`, `"AbiDeclarationMismatch"`, `"ModuleHashMismatch"`), set when
     /// ineligibility is a driver-selection/ABI admission refusal rather than a resource verdict.
@@ -173,6 +234,12 @@ pub enum Command {
         credentials: Vec<u8>,
         /// The participation policy.
         policy: JoinPolicy,
+        /// The immutable admitted tuple assessment produced (architecture §6.3), carried back so
+        /// join can rederive-and-compare before running. Additive `#[serde(default)]` — a join
+        /// without a tuple (the self-driven interim / a pre-tuple caller) authors and checks its
+        /// own.
+        #[serde(default)]
+        admitted_tuple: Option<AdmittedTuple>,
     },
     /// GPU-governor lever (§10.5). `paused` promises memory, not just time: the worker aborts any
     /// in-flight guest call, drops the wasm instance + GPU allocations, and keeps only CPU masters.
@@ -321,6 +388,15 @@ pub enum Event {
         module: [u8; 32],
         /// Rollback-and-retry cycles used before activation (`0` on a clean first migration).
         retries: u32,
+    },
+    /// Join aborted: the admitted tuple carried from assessment does not match the tuple
+    /// rederived from the artifacts at join (architecture §6.3) — a stale or swapped artifact.
+    /// The node's recovery is to reassess, never to run on stale admission.
+    AdmittedTupleMismatch {
+        /// The run whose join aborted.
+        run_id: String,
+        /// The first tuple field that differed (e.g. `"module_hash"`).
+        field: String,
     },
     /// Liveness reply to [`Command::Ping`].
     Pong,
@@ -526,6 +602,34 @@ mod tests {
         assert_eq!(cmd, back);
     }
 
+    #[test]
+    fn admitted_tuple_first_artifact_mismatch_reports_the_differing_field() {
+        let base = AdmittedTuple {
+            module_hash: [1; 32],
+            config_hash: [2; 32],
+            grants_hash: [3; 32],
+            claim_hash: [4; 32],
+            genesis_hash: [5; 32],
+            role: "trainer".into(),
+            incarnation: 1,
+            device_profile_rev: 9,
+            owner_policy_rev: 9,
+        };
+        // Identical artifact fields: no mismatch (node-owned revs are compared separately).
+        let mut other = base.clone();
+        other.device_profile_rev = 0;
+        other.owner_policy_rev = 0;
+        assert_eq!(base.first_artifact_mismatch(&other), None);
+        // A swapped module is caught first.
+        let mut swapped = base.clone();
+        swapped.module_hash = [0xFF; 32];
+        assert_eq!(base.first_artifact_mismatch(&swapped), Some("module_hash"));
+        // A changed grants document is caught.
+        let mut regrant = base.clone();
+        regrant.grants_hash = [0xAB; 32];
+        assert_eq!(base.first_artifact_mismatch(&regrant), Some("grants_hash"));
+    }
+
     fn round_trip_event(ev: Event) {
         let bytes = encode(&ev).expect("encode event");
         let back: Event = decode(&bytes).expect("decode event");
@@ -548,6 +652,17 @@ mod tests {
                 duty_cycle_pct: 80,
                 schedule: Some("0 2 * * *".into()),
             },
+            admitted_tuple: Some(AdmittedTuple {
+                module_hash: [0x11; 32],
+                config_hash: [0x22; 32],
+                grants_hash: [0x33; 32],
+                claim_hash: [0x44; 32],
+                genesis_hash: [0x55; 32],
+                role: "trainer".into(),
+                incarnation: 3,
+                device_profile_rev: 7,
+                owner_policy_rev: 2,
+            }),
         });
         round_trip_command(Command::Throttle {
             vram_cap_mb: Some(8_000),
@@ -600,13 +715,36 @@ mod tests {
             reasons: vec!["vram below floor".into()],
             headroom: vec![("vram_mb".into(), -2048), ("ram_mb".into(), 16_000)],
             refusal_code: None,
+            admitted_tuple: None,
         }));
         round_trip_event(Event::Assessed(Eligibility {
             eligible: false,
             reasons: vec!["AbiUnsupportedMajor: module declares abi major 2".into()],
             headroom: Vec::new(),
             refusal_code: Some("AbiUnsupportedMajor".into()),
+            admitted_tuple: None,
         }));
+        round_trip_event(Event::Assessed(Eligibility {
+            eligible: true,
+            reasons: vec!["admitted".into()],
+            headroom: Vec::new(),
+            refusal_code: None,
+            admitted_tuple: Some(AdmittedTuple {
+                module_hash: [0x11; 32],
+                config_hash: [0x22; 32],
+                grants_hash: [0x33; 32],
+                claim_hash: [0x44; 32],
+                genesis_hash: [0x55; 32],
+                role: "trainer".into(),
+                incarnation: 1,
+                device_profile_rev: 4,
+                owner_policy_rev: 1,
+            }),
+        }));
+        round_trip_event(Event::AdmittedTupleMismatch {
+            run_id: "run-42".into(),
+            field: "module_hash".into(),
+        });
         round_trip_event(Event::RunPhase {
             run_id: "run-42".into(),
             phase: "train".into(),

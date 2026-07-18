@@ -78,6 +78,7 @@ impl WorkerControl for FakeWorker {
             reasons: vec!["assessed against envelope".into()],
             headroom: vec![("assessed_micro_batch".into(), 64)],
             refusal_code: None,
+            admitted_tuple: None,
         })
     }
     async fn join(

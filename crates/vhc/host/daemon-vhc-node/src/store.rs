@@ -87,6 +87,9 @@ pub struct PersistedRun {
     pub selected_driver: Option<String>,
     /// Sunset observability: the current pinned module blake3, if known.
     pub module_hash: Option<[u8; 32]>,
+    /// The immutable admitted tuple this join intent was assessed under (architecture §6.3),
+    /// canonical-CBOR. `None` for a row assessed before the tuple existed.
+    pub admitted_tuple: Option<Vec<u8>>,
 }
 
 /// A `vhc.db` error.
@@ -184,11 +187,23 @@ CREATE TABLE IF NOT EXISTS vhc_owner_priority (
 );
 ";
 
+/// M4: the immutable **admitted tuple** (architecture §6.3) stored alongside the durable join
+/// intent, plus the two node-owned monotonic revision counters the tuple stamps — the
+/// device-profile revision (bumped when the assessed device profile's canonical encoding changes)
+/// and the owner-policy revision (bumped on any owner policy mutation). Append-only; the tuple
+/// column is nullable (a pre-tuple row carries NULL), and the counters seed at 0.
+const M4_ADMITTED_TUPLE: &str = "\
+ALTER TABLE vhc_runs ADD COLUMN admitted_tuple BLOB;
+INSERT OR IGNORE INTO vhc_counters (name, value) VALUES ('device_profile_rev', 0);
+INSERT OR IGNORE INTO vhc_counters (name, value) VALUES ('owner_policy_rev', 0);
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(SCHEMA),
         M::up(M2_IDENTITY_OBSERVABILITY),
         M::up(M3_ARBITER),
+        M::up(M4_ADMITTED_TUPLE),
     ])
 }
 
@@ -197,7 +212,7 @@ fn migrations() -> Migrations<'static> {
 /// [`row_to_run`] never drift apart.
 const RUN_COLUMNS: &str = "run_id, coordinator, policy_json, desired_state, credentials_ref, \
      eligibility_json, last_phase, last_round, run_id_hash, epoch, role, instance, \
-     envelope_schema_major, module_abi_major, selected_driver, module_hash";
+     envelope_schema_major, module_abi_major, selected_driver, module_hash, admitted_tuple";
 
 fn hex_of(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -403,6 +418,48 @@ impl VhcStore {
             params![run_id, run_id_hash.as_slice(), now_ms()],
         )?;
         Ok(())
+    }
+
+    /// Persist the immutable admitted tuple (architecture §6.3) for a run's join intent
+    /// (canonical-CBOR bytes). Idempotent per `run_id`.
+    pub fn set_admitted_tuple(&self, run_id: &str, tuple: &[u8]) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE vhc_runs SET admitted_tuple = ?2, updated_ms = ?3 WHERE run_id = ?1",
+            params![run_id, tuple, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The current value of a node-owned monotonic counter (`device_profile_rev` /
+    /// `owner_policy_rev`); `0` when unseeded.
+    pub fn counter(&self, name: &str) -> Result<u64, StoreError> {
+        let conn = self.lock();
+        let v: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM vhc_counters WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0) as u64)
+    }
+
+    /// Bump a node-owned monotonic counter by one and return the new value (atomic). Used for the
+    /// device-profile revision (assessed device profile changed) and the owner-policy revision
+    /// (owner policy mutated) the admitted tuple stamps (architecture §6.3).
+    pub fn bump_counter(&self, name: &str) -> Result<u64, StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO vhc_counters (name, value) VALUES (?1, 1)
+             ON CONFLICT(name) DO UPDATE SET value = value + 1",
+            params![name],
+        )?;
+        let value: i64 = conn.query_row(
+            "SELECT value FROM vhc_counters WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        Ok(value as u64)
     }
 
     /// Fetch one run row, decoded (`None` if unknown).
@@ -615,6 +672,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, 
     let module_abi_major: Option<i64> = row.get(13)?;
     let selected_driver: Option<String> = row.get(14)?;
     let module_hash: Option<Vec<u8>> = row.get(15)?;
+    let admitted_tuple: Option<Vec<u8>> = row.get(16)?;
     Ok((|| {
         Ok(PersistedRun {
             run_id,
@@ -633,6 +691,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, 
             module_abi_major: module_abi_major.map(|v| v as u32),
             selected_driver,
             module_hash: module_hash.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()),
+            admitted_tuple,
         })
     })())
 }
@@ -747,6 +806,41 @@ mod tests {
         assert_eq!(store.run_priority("run-X").unwrap(), 100, "default");
         store.set_run_priority("run-X", 7).unwrap();
         assert_eq!(store.run_priority("run-X").unwrap(), 7);
+    }
+
+    /// M4: the admitted-tuple column persists beside the join intent, and the two node-owned
+    /// revision counters are durable + monotonic (architecture §6.3).
+    #[test]
+    fn m4_admitted_tuple_and_revision_counters() {
+        let store = VhcStore::open_in_memory().unwrap();
+        store
+            .put_join_intent(
+                "run-T",
+                "ws://c",
+                &v1_policy(),
+                None,
+                &VhcEligibility::default(),
+            )
+            .unwrap();
+        // Absent until stamped.
+        assert_eq!(
+            store.get_run("run-T").unwrap().unwrap().admitted_tuple,
+            None
+        );
+        let tuple = vec![0xA1, 0xB2, 0xC3];
+        store.set_admitted_tuple("run-T", &tuple).unwrap();
+        assert_eq!(
+            store.get_run("run-T").unwrap().unwrap().admitted_tuple,
+            Some(tuple)
+        );
+
+        // The node-owned counters seed at 0 and bump monotonically.
+        assert_eq!(store.counter("device_profile_rev").unwrap(), 0);
+        assert_eq!(store.counter("owner_policy_rev").unwrap(), 0);
+        assert_eq!(store.bump_counter("device_profile_rev").unwrap(), 1);
+        assert_eq!(store.bump_counter("device_profile_rev").unwrap(), 2);
+        assert_eq!(store.counter("device_profile_rev").unwrap(), 2);
+        assert_eq!(store.counter("owner_policy_rev").unwrap(), 0);
     }
 
     /// The v2 execution-identity + observability writers populate the D0 columns (decisions D5;

@@ -60,7 +60,7 @@ use daemon_vhc_observe::{
     extract_consensus_capture, recover_chain_from_archive, RecordArchive, ReplicationPolicy,
     RetentionPolicy,
 };
-use daemon_vhc_proto::cert::{verify_certified_sender, CertError, RunKeyCertificate};
+use daemon_vhc_proto::cert::{verify_certified_sender, CertError, CertScope, RunKeyCertificate};
 use daemon_vhc_proto::messages::{
     Commitment, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
 };
@@ -243,6 +243,7 @@ fn decision_count(committed: u64, with_trailing_open: bool) -> usize {
 /// are never reused (§8.1), so the ordering is total and rollback-free.
 struct CoordinatorCertStore {
     run_id: Hash,
+    module: Hash,
     trusted_base: PeerId,
     certs: Vec<RunKeyCertificate>,
     /// The lowest live coordinator incarnation; anything below is fenced.
@@ -250,9 +251,10 @@ struct CoordinatorCertStore {
 }
 
 impl CoordinatorCertStore {
-    fn new(run_id: Hash, trusted_base: PeerId) -> Self {
+    fn new(run_id: Hash, module: Hash, trusted_base: PeerId) -> Self {
         Self {
             run_id,
+            module,
             trusted_base,
             certs: Vec::new(),
             live_floor: 0,
@@ -263,22 +265,25 @@ impl CoordinatorCertStore {
     /// signer-transfer statement: the live floor advances and every lower incarnation is fenced.
     fn ingest(&mut self, cert: RunKeyCertificate) {
         assert!(cert.verify_chain().is_ok(), "only chain-valid certs ingest");
-        self.live_floor = self.live_floor.max(cert.body.instance);
+        self.live_floor = self.live_floor.max(cert.body.scope.instance);
         self.certs.push(cert);
     }
 
     /// Authenticate a coordinator frame's `sender` for `instance` at `epoch`: refused if the
-    /// incarnation is fenced, else the D1 certified-sender check against the trusted base.
+    /// incarnation is fenced, else the certified-sender check against the trusted base.
     fn accept(&self, instance: u64, epoch: u64, sender: &PeerId) -> Result<(), CertError> {
         if instance < self.live_floor {
             // The fence: a base-signed transfer to a newer incarnation supersedes this signer.
             return Err(CertError::NoCertifiedChain);
         }
         verify_certified_sender(
-            &self.run_id,
-            "coordinator",
-            instance,
-            epoch,
+            &CertScope {
+                run_id: self.run_id,
+                epoch,
+                role: "coordinator".into(),
+                instance,
+                module_hash: self.module,
+            },
             sender,
             &self.trusted_base,
             &self.certs,
@@ -340,15 +345,17 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     let initial = initial_state_of(&spec);
 
     // The receivers' cert store: the base certifies the primary's incarnation-0 run key.
-    let mut certs = CoordinatorCertStore::new(spec.run_id, base_id);
+    let mut certs = CoordinatorCertStore::new(spec.run_id, coord_hash, base_id);
     certs.ingest(
         RunKeyCertificate::issue(
             &base_key,
-            spec.run_id,
-            "coordinator",
-            0,
-            0,
-            0,
+            CertScope {
+                run_id: spec.run_id,
+                epoch: 0,
+                role: "coordinator".into(),
+                instance: 0,
+                module_hash: coord_hash,
+            },
             primary_sender,
         )
         .expect("issue primary cert"),
@@ -529,11 +536,13 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     certs.ingest(
         RunKeyCertificate::issue(
             &base_key,
-            spec.run_id,
-            "coordinator",
-            1,
-            0,
-            0,
+            CertScope {
+                run_id: spec.run_id,
+                epoch: 0,
+                role: "coordinator".into(),
+                instance: 1,
+                module_hash: coord_hash,
+            },
             standby_sender,
         )
         .expect("issue standby cert"),

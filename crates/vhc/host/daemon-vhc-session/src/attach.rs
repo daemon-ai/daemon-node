@@ -15,13 +15,19 @@
 //!
 //! Duplicates (an already-accepted scope tuple) are idempotently dropped — re-delivery of a
 //! signed frame is normal gossip behavior, not an error.
+//!
+//! **Certified senders are mandatory** (architecture §4.3): every production attach carries a
+//! [`CertCheck`] — the frame's `sender` per-run key must chain to a trusted base identity for the
+//! frame's full execution-identity scope and must not be revoked/superseded. The only
+//! certificate-less constructor is the `harness`-gated [`InboundFrames::without_certs`].
 
 use std::collections::HashMap;
 
 use ciborium::value::Value;
 use daemon_vhc_proto::sign::verify_bytes;
 use daemon_vhc_proto::{
-    to_canonical_vec, verify_certified_sender, Hash, PeerId, RunKeyCertificate, Signature,
+    to_canonical_vec, verify_certified_sender, CertError, CertScope, Hash, PeerId, RevocationError,
+    RevocationLedger, RunKeyCertificate, RunKeyRevocation, Signature,
 };
 
 /// The verdict on one inbound §12.1 frame.
@@ -68,15 +74,20 @@ pub enum InboundVerdict {
         got: u64,
     },
     /// The frame's signature verified over its `sender`, but that per-run key is **not certified**
-    /// to the trusted base identity for this frame's `(run, role, instance, epoch)` scope (D1
-    /// certified per-run keys, architecture §4.3). Only surfaced when the attach was configured
-    /// with a certificate store ([`InboundFrames::with_certs`]); the certificate-less transition
-    /// path (the retained A2 verifier) never produces it. This is the signature-downgrade refusal.
+    /// to a trusted base identity for this frame's full execution-identity scope (certified
+    /// per-run keys, architecture §4.3). This is the signature-downgrade refusal — mandatory on
+    /// every production attach.
     UncertifiedSender {
         /// The sending per-run key that lacks a valid certificate chain.
         sender: [u8; 32],
         /// The refusal reason (the underlying `CertError`).
         reason: String,
+    },
+    /// The sender's per-run key IS certified but is dead: explicitly revoked by a signed record,
+    /// or its incarnation is superseded by a higher one for the same role slot.
+    CertRevoked {
+        /// The revoked per-run key.
+        sender: [u8; 32],
     },
     /// Verified and in-sequence, but the pump's bounded spool (or this sender's quota) is full
     /// (§4.7): the frame was NOT delivered and the cursor was rewound — hold + retry the same
@@ -91,19 +102,83 @@ pub enum InboundVerdict {
     },
 }
 
-/// The D1 certified-per-run-key check layered **around** the A2 frame verifier (architecture §4.3):
-/// which base identity a receiver trusts to certify per-run keys, and the certificates it holds
-/// (distributed beside frames / via join records). Configured only on the cert-aware path; absent on
-/// the retained transition path.
+/// The certified-per-run-key layer every production attach carries (architecture §4.3): which
+/// base identities the receiver trusts to certify per-run keys (from the run's genesis/Authority
+/// configuration — never ambient config), the certificates it holds (distributed beside frames /
+/// via join records), and the revocation state (explicit signed records + the incarnation
+/// supersession floor).
 pub struct CertCheck {
-    /// The base machine identity whose certificates this attach trusts (e.g. the coordinator's).
-    pub trusted_base: PeerId,
-    /// The certificates that authenticate per-run keys to `trusted_base`.
-    pub certs: Vec<RunKeyCertificate>,
+    /// The base machine identities whose certificates this attach trusts.
+    trusted_bases: Vec<PeerId>,
+    /// The certificates that authenticate per-run keys to a trusted base.
+    certs: Vec<RunKeyCertificate>,
+    /// Revocation state: explicit signed records + the supersession floor derived from the
+    /// certificates observed above.
+    revocations: RevocationLedger,
+}
+
+impl CertCheck {
+    /// A certificate check trusting `trusted_bases` with the given starting certificate store.
+    /// Every certificate's incarnation is observed into the supersession floor (a higher
+    /// incarnation for a role slot implicitly revokes lower ones).
+    #[must_use]
+    pub fn new(trusted_bases: Vec<PeerId>, certs: Vec<RunKeyCertificate>) -> Self {
+        let mut revocations = RevocationLedger::new();
+        revocations.observe_certificates(&certs);
+        Self {
+            trusted_bases,
+            certs,
+            revocations,
+        }
+    }
+
+    /// Ingest a later-arriving certificate (control-plane distribution): stored for sender
+    /// authentication and observed into the supersession floor.
+    pub fn ingest_certificate(&mut self, cert: RunKeyCertificate) {
+        self.revocations
+            .observe_certificates(std::slice::from_ref(&cert));
+        self.certs.push(cert);
+    }
+
+    /// Ingest a signed revocation record: accepted only from a trusted base and only with a
+    /// strictly-monotonic per-slot sequence (replay protection).
+    ///
+    /// # Errors
+    /// The applicable [`RevocationError`]; a refused record changes no state.
+    pub fn ingest_revocation(&mut self, record: &RunKeyRevocation) -> Result<(), RevocationError> {
+        let mut last_err = RevocationError::UntrustedBase;
+        for base in &self.trusted_bases {
+            match self.revocations.ingest(record, base) {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Judge one verified frame's sender: certified to a trusted base for the full scope, and not
+    /// revoked/superseded.
+    fn judge(&self, scope: &CertScope, sender: &PeerId) -> Result<(), CertError> {
+        let mut last = CertError::NoCertifiedChain;
+        let mut certified = false;
+        for base in &self.trusted_bases {
+            match verify_certified_sender(scope, sender, base, &self.certs) {
+                Ok(()) => {
+                    certified = true;
+                    break;
+                }
+                Err(e) => last = e,
+            }
+        }
+        if !certified {
+            return Err(last);
+        }
+        self.revocations.judge(scope, sender)
+    }
 }
 
 /// Inbound §12.1 verification state for one run attach: the expected run scope + per
-/// `(sender, channel)` sequence cursors (the dedup/gap substrate, §12.2), plus the optional D1
+/// `(sender, channel)` sequence cursors (the dedup/gap substrate, §12.2), plus the mandatory
 /// certified-key layer.
 pub struct InboundFrames {
     run_id: [u8; 32],
@@ -111,18 +186,32 @@ pub struct InboundFrames {
     /// Next expected seq per `(sender, channel)` — everything below is a duplicate, everything
     /// above is a gap.
     cursors: HashMap<([u8; 32], u64), u64>,
-    /// The optional D1 certified-per-run-key layer (`None` = the retained A2 verifier, the
-    /// transition path — the frame signature over `sender` is checked, but `sender` is not required
-    /// to be certified).
+    /// The certified-per-run-key layer. `Some` on every production construction path; `None`
+    /// exists only behind the harness gate ([`InboundFrames::without_certs`]).
     cert_check: Option<CertCheck>,
 }
 
 impl InboundFrames {
-    /// A verifier for one run scope — the **retained A2 verifier** (frame signature over `sender`,
-    /// scope, dedup/gap). No certified-key requirement: the transition path, behaviorally identical
-    /// to before D1.
+    /// A verifier for one run scope. The certificate check is **mandatory**: every accepted
+    /// frame's `sender` per-run key must be certified to a trusted base identity for the frame's
+    /// full execution-identity scope, and must not be revoked or superseded. There is no
+    /// production constructor that accepts an uncertified key.
     #[must_use]
-    pub fn new(run_id: [u8; 32], epoch: u64) -> Self {
+    pub fn new(run_id: [u8; 32], epoch: u64, cert_check: CertCheck) -> Self {
+        Self {
+            run_id,
+            epoch,
+            cursors: HashMap::new(),
+            cert_check: Some(cert_check),
+        }
+    }
+
+    /// The certificate-less verifier — frame signature over `sender`, scope, dedup/gap, but NO
+    /// certified-key requirement. Harness/test seat only: production paths must construct via
+    /// [`InboundFrames::new`].
+    #[cfg(any(test, feature = "harness"))]
+    #[must_use]
+    pub fn without_certs(run_id: [u8; 32], epoch: u64) -> Self {
         Self {
             run_id,
             epoch,
@@ -131,28 +220,10 @@ impl InboundFrames {
         }
     }
 
-    /// A verifier that additionally requires every accepted frame's `sender` per-run key to be
-    /// **certified** to `trusted_base` for the frame's `(run, role, instance, epoch)` scope (D1
-    /// certified per-run keys, architecture §4.3). Everything the A2 verifier checks still runs
-    /// first; the certified-key check is an additional guard that turns an uncertified sender into
-    /// [`InboundVerdict::UncertifiedSender`] (the signature-downgrade refusal) rather than a
-    /// delivery.
-    #[must_use]
-    pub fn with_certs(
-        run_id: [u8; 32],
-        epoch: u64,
-        trusted_base: PeerId,
-        certs: Vec<RunKeyCertificate>,
-    ) -> Self {
-        Self {
-            run_id,
-            epoch,
-            cursors: HashMap::new(),
-            cert_check: Some(CertCheck {
-                trusted_base,
-                certs,
-            }),
-        }
+    /// The mutable certificate layer (ingesting later-arriving certificates / revocations from
+    /// the control plane). `None` only on the harness path.
+    pub fn certs_mut(&mut self) -> Option<&mut CertCheck> {
+        self.cert_check.as_mut()
     }
 
     /// Verify one wire frame (`[envelope, payload, sig]`, §12.1) and judge its sequence position.
@@ -239,31 +310,39 @@ impl InboundFrames {
             ));
         }
 
-        // 3b. Certified per-run key (D1, architecture §4.3): when a cert store is configured, the
-        // per-run `sender` key (whose frame signature just verified — the retained A2 check above)
-        // MUST be certified to the trusted base identity for this frame's (run, role, instance,
-        // epoch) scope. An uncertified sender is the signature-downgrade refusal. The `role` and
-        // `instance` are read from the frozen §12.1 envelope fields (read-only — the envelope shape
-        // is untouched).
+        // 3b. Certified per-run key (architecture §4.3) — mandatory on every production attach:
+        // the per-run `sender` key (whose frame signature just verified — the retained check
+        // above) MUST be certified to a trusted base identity for this frame's full
+        // execution-identity scope (run, epoch, role, instance, module) AND must not be revoked
+        // or superseded. An uncertified sender is the signature-downgrade refusal; a dead key is
+        // the CertRevoked refusal. The scope fields are read from the frozen §12.1 envelope
+        // (read-only — the envelope shape is untouched).
         if let Some(check) = &self.cert_check {
-            let (Some(role), Some(instance)) = (text("role"), uint("instance")) else {
+            let (Some(role), Some(instance), Some(module)) =
+                (text("role"), uint("instance"), bytes32("module"))
+            else {
                 return InboundVerdict::Malformed(
-                    "missing role/instance for the certified-key check".into(),
+                    "missing role/instance/module for the certified-key check".into(),
                 );
             };
-            if let Err(e) = verify_certified_sender(
-                &Hash(run_id),
-                &role,
-                instance,
+            let scope = CertScope {
+                run_id: Hash(run_id),
                 epoch,
-                &PeerId(sender),
-                &check.trusted_base,
-                &check.certs,
-            ) {
-                return InboundVerdict::UncertifiedSender {
-                    sender,
-                    reason: e.to_string(),
-                };
+                role,
+                instance,
+                module_hash: Hash(module),
+            };
+            match check.judge(&scope, &PeerId(sender)) {
+                Ok(()) => {}
+                Err(CertError::Revoked) => {
+                    return InboundVerdict::CertRevoked { sender };
+                }
+                Err(e) => {
+                    return InboundVerdict::UncertifiedSender {
+                        sender,
+                        reason: e.to_string(),
+                    };
+                }
             }
         }
 
@@ -325,11 +404,17 @@ pub struct Attach {
 }
 
 impl Attach {
-    /// Attach the verifier in front of a running v2 pump.
+    /// Attach the verifier in front of a running v2 pump. The certificate check is mandatory —
+    /// there is no production attach without one.
     #[must_use]
-    pub fn new(run_id: [u8; 32], epoch: u64, pump: daemon_vhc_host::run::PumpHandle) -> Self {
+    pub fn new(
+        run_id: [u8; 32],
+        epoch: u64,
+        cert_check: CertCheck,
+        pump: daemon_vhc_host::run::PumpHandle,
+    ) -> Self {
         Self {
-            frames: InboundFrames::new(run_id, epoch),
+            frames: InboundFrames::new(run_id, epoch, cert_check),
             pump,
         }
     }
@@ -383,5 +468,54 @@ impl Attach {
             }
         }
         Ok(verdict)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_vhc_proto::sign::{peer_id, sign_canonical};
+    use daemon_vhc_proto::SigningKey;
+
+    fn frame(key: &SigningKey, run: [u8; 32]) -> Vec<u8> {
+        let sender = peer_id(key).0;
+        let payload = b"hello".to_vec();
+        let envelope = Value::Map(vec![
+            (Value::from("domain"), Value::from("daemon-vhc/frame/2")),
+            (Value::from("run_id"), Value::Bytes(run.to_vec())),
+            (Value::from("epoch"), Value::from(0u64)),
+            (Value::from("role"), Value::from("trainer")),
+            (Value::from("instance"), Value::from(1u64)),
+            (Value::from("module"), Value::Bytes(vec![0; 32])),
+            (Value::from("sender"), Value::Bytes(sender.to_vec())),
+            (Value::from("channel"), Value::from(0u64)),
+            (Value::from("seq"), Value::from(0u64)),
+            (
+                Value::from("payload_hash"),
+                Value::Bytes(blake3::hash(&payload).as_bytes().to_vec()),
+            ),
+        ]);
+        let sig = sign_canonical(key, &envelope).expect("sign");
+        let wire = Value::Array(vec![
+            envelope,
+            Value::Bytes(payload),
+            Value::Bytes(sig.0.to_vec()),
+        ]);
+        let mut out = Vec::new();
+        ciborium::into_writer(&wire, &mut out).expect("frame cbor");
+        out
+    }
+
+    /// The certificate-less constructor is the HARNESS seat only (cfg-gated off production
+    /// builds): it retains the frame-signature verifier but requires no certification.
+    #[test]
+    fn the_harness_path_without_certs_delivers_an_uncertified_sender() {
+        let uncertified = SigningKey::from_bytes(&[42; 32]);
+        let run = [0xA1; 32];
+        let mut v = InboundFrames::without_certs(run, 0);
+        assert!(matches!(
+            v.accept(&frame(&uncertified, run)),
+            InboundVerdict::Deliver { .. }
+        ));
     }
 }

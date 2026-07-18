@@ -41,6 +41,30 @@ use daemon_vhc_abi::{
 
 use crate::runtime::Worker;
 
+/// The capability worlds a module statically links — its import namespaces filtered to the known
+/// v2 worlds (`vhc@2`/`net@2`/`sys@2`/`compute@2`/`data@2`). This is exactly the set the run
+/// driver links at start (the run-header `worlds` are derived the same way), so admission can
+/// author a grants document that covers every world the module can reach and nothing it cannot.
+///
+/// # Errors
+/// [`AbiRefusalCode::BadModule`] if the blob fails wasm validation/compilation.
+pub fn linked_worlds(
+    worker: &Worker,
+    wasm: &[u8],
+) -> Result<std::collections::BTreeSet<String>, AbiRefusal> {
+    let module = Module::new(worker.engine(), wasm).map_err(|e| {
+        AbiRefusal::new(
+            AbiRefusalCode::BadModule,
+            format!("module failed wasm validation/compilation: {e}"),
+        )
+    })?;
+    Ok(module
+        .imports()
+        .map(|i| i.module().to_string())
+        .filter(|ns| daemon_vhc_abi::v2_namespace_symbols(ns).is_some())
+        .collect())
+}
+
 /// A successful ABI §1.3 selection: the driver the module gets, plus its cross-checked declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {

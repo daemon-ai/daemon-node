@@ -37,6 +37,7 @@ pub mod hash;
 pub mod merkle;
 pub mod messages;
 pub mod record_set;
+pub mod revocation;
 pub mod sign;
 pub mod transition;
 pub mod version;
@@ -45,7 +46,8 @@ pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use capability::{Capability, CapabilitySet};
 pub use cert::{
-    verify_certified_sender, CertError, RunKeyCertBody, RunKeyCertificate, CERT_DOMAIN_V2,
+    verify_certified_sender, CertError, CertScope, RunKeyCertBody, RunKeyCertificate,
+    CERT_DOMAIN_V2,
 };
 pub use crypto::{
     hash as crypto_hash, verify_sig, VerifyOutcome, HASH_LEN, VERIFY_PUBLIC_KEY_LEN,
@@ -59,11 +61,14 @@ pub use genesis::{
     GenesisEnvelope, GrantBound, Identities, MigrationGrant, RoleEntry, RoleGrants, RunSection,
     SnapshotArtifact, TransportSelection, WorldGrant, GENESIS_SCHEMA_MAJOR,
 };
-pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsError, LaneCeilings};
+pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsDoc, GrantsError, LaneCeilings};
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
 pub use messages::{SignedMessage, VhcMessage};
 pub use record_set::RecordSet;
+pub use revocation::{
+    RevocationError, RevocationLedger, RunKeyRevocation, RunKeyRevocationBody, REVOCATION_DOMAIN_V2,
+};
 pub use sign::{peer_id, sign_canonical, verify_canonical, Signed, SigningKey, VerifyingKey};
 pub use transition::{
     EpochDescriptor, TransitionChain, TransitionError, UpgradeAuthority, UpgradeRecord,

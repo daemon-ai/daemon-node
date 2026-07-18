@@ -25,10 +25,85 @@
 //! bound inherits the lane ceiling; a `0` lane ceiling means "the lane imposes no ceiling on this
 //! bound" (the envelope/manifest value stands).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
 
 use crate::bytes::Hash;
-use crate::genesis::RoleGrants;
+use crate::genesis::{BufferReq, ChannelDecl, EventCaps, MigrationGrant, RoleGrants, WorldGrant};
+
+/// The complete ABI §2.6 **grants document** — the single canonical value naming everything a
+/// role-instance may reach, authored at admission and hashed for the assess→join pin + the
+/// `da_claim`/`da_init` tag-11 cross-check.
+///
+/// This is the object admission authors as the truth; it supersedes the worker's former
+/// hand-rolled three-world subset. It enumerates the complete capability surface: the **worlds**
+/// the module links (`vhc@2`/`net@2`/`sys@2`/`compute@2`/`data@2` as imported — with their
+/// per-world bounds), the **channel table**, the **artifacts** the role may fetch, the **custom
+/// ops**, the **buffer limits**, and the **rate/quota bounds** (carried in the channel decls +
+/// the outstanding-op/queue ceilings). Canonical CBOR (the deterministic writer sorts map keys),
+/// so [`GrantsDoc::to_canonical_bytes`] is reproducible across assess and join.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantsDoc {
+    /// Grants-schema version (1 in this document).
+    pub version: u64,
+    /// The worlds the module links, each with its negotiated minor + per-grant bounds
+    /// (`net@2`/`data@2` rate/quota bounds live here). Keyed by world name (`"compute@2"`, …).
+    pub worlds: BTreeMap<String, WorldGrant>,
+    /// The versioned host custom-op names the role may invoke.
+    pub custom_ops: Vec<String>,
+    /// The admitted channel table (per-channel `max_frame_bytes` + `rate_per_min` + authoritative
+    /// spool/quota bounds are the channel rate/quota surface).
+    pub channels: Vec<ChannelDecl>,
+    /// Admitted advisory-class depths + coalescing.
+    pub events: EventCaps,
+    /// Admitted live-resource quotas (buffer limits).
+    pub buffers: BufferReq,
+    /// The artifacts the role may `data@2::fetch` (a subset of the run's artifact map).
+    pub artifacts: BTreeSet<Hash>,
+    /// Async-completion concurrent-operation ceiling.
+    pub max_outstanding_ops: u64,
+    /// compute@2 command-queue depth grant.
+    pub compute_queue_depth: u64,
+    /// The migration grant, when the role participates in live upgrades.
+    pub migration: Option<MigrationGrant>,
+}
+
+impl GrantsDoc {
+    /// Author the complete §2.6 grants document for one role from the worlds the module actually
+    /// links (`linked_worlds`, e.g. from `module.imports()`) and the genesis role's grant list.
+    /// A linked world inherits its minor + bounds from the role grant when the role declares it,
+    /// else it is granted at minor 0 with no extra bounds — the world is present because the
+    /// module links it (the runtime never provides a capability absent from this document).
+    #[must_use]
+    pub fn author(linked_worlds: &BTreeSet<String>, role: &RoleGrants) -> Self {
+        let worlds = linked_worlds
+            .iter()
+            .map(|w| {
+                let grant = role.worlds.get(w).cloned().unwrap_or_default();
+                (w.clone(), grant)
+            })
+            .collect();
+        Self {
+            version: 1,
+            worlds,
+            custom_ops: role.custom_ops.clone(),
+            channels: role.channels.clone(),
+            events: role.events.clone(),
+            buffers: role.buffers,
+            artifacts: role.artifacts.clone(),
+            max_outstanding_ops: role.max_outstanding_ops,
+            compute_queue_depth: role.compute_queue_depth,
+            migration: role.migration,
+        }
+    }
+
+    /// The canonical-CBOR bytes — the grants-hash preimage (deterministic across assess/join).
+    #[must_use]
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        crate::canonical::to_canonical_vec(self).expect("grants doc is canonical-CBOR serializable")
+    }
+}
 
 /// A lane profile's ceilings as pure numbers (the host's `ParticipationLane` §9.6 fields, passed
 /// in so this crate needs no host dependency). A `0` ceiling means **"no lane ceiling on this
@@ -436,5 +511,51 @@ mod tests {
             derive_admitted_quotas(&role, &lane(), &BTreeSet::new()),
             Err(GrantsError::ArtifactNotInMap(_))
         ));
+    }
+
+    #[test]
+    fn authored_grants_doc_covers_every_linked_world_and_the_role_surface() {
+        use crate::genesis::WorldGrant;
+        let mut role = RoleGrants {
+            channels: vec![auth_channel(4096, 32, 8)],
+            custom_ops: vec!["flash_attn@1".to_string()],
+            compute_queue_depth: 256,
+            max_outstanding_ops: 16,
+            ..Default::default()
+        };
+        role.artifacts.insert(hash(7));
+        role.worlds.insert(
+            "data@2".to_string(),
+            WorldGrant {
+                minor: 3,
+                bounds: BTreeMap::new(),
+            },
+        );
+
+        let linked: BTreeSet<String> = ["vhc@2", "net@2", "sys@2", "compute@2", "data@2"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let doc = GrantsDoc::author(&linked, &role);
+
+        // Every world the module links is present — not just the old vhc/net/sys subset.
+        assert_eq!(doc.worlds.len(), 5);
+        assert!(doc.worlds.contains_key("compute@2"));
+        assert!(doc.worlds.contains_key("data@2"));
+        // A role-declared world keeps its minor + bounds; an undeclared linked world defaults.
+        assert_eq!(doc.worlds["data@2"].minor, 3);
+        assert_eq!(doc.worlds["compute@2"].minor, 0);
+        // The channel table, custom ops, artifacts, buffers, and rate/quota bounds all carry.
+        assert_eq!(doc.channels.len(), 1);
+        assert_eq!(doc.custom_ops, vec!["flash_attn@1".to_string()]);
+        assert!(doc.artifacts.contains(&hash(7)));
+        assert_eq!(doc.compute_queue_depth, 256);
+        assert_eq!(doc.max_outstanding_ops, 16);
+
+        // Canonical bytes are reproducible (the assess→join pin).
+        assert_eq!(doc.to_canonical_bytes(), doc.to_canonical_bytes());
+        let back: GrantsDoc =
+            crate::canonical::from_canonical_slice(&doc.to_canonical_bytes()).unwrap();
+        assert_eq!(back, doc);
     }
 }

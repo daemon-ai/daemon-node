@@ -17,11 +17,14 @@
 //!   `daemon_vhc_host::coordinator` seat. Every coordinator decision is
 //!   signature-verified AND authority-judged (`authorize_coordinator_frame`) above the pump;
 //!   the original signed frame rides as tag-12 evidence.
-//! - **In-process identity contract**: this self-driven join derives the coordinator's §12.1
-//!   frame key from the run id (`blake3("vhc-coordinator/<run_id>")`) — the genesis author must
-//!   name that key's peer id as the envelope `SingleKey` coordinator identity, or every
-//!   coordinator frame refuses at the authority judgment (fail closed, never a fallback).
-//!   The worker's own key derives as `blake3("vhc-worker/<run_id>")` likewise.
+//! - **In-process identity contract**: every signing key resolves against the node-provided
+//!   identity keystore (`daemon_vhc_session::keystore`, referenced by `DAEMON_VHC_IDENTITY_DIR`)
+//!   — CSPRNG per-run keys, never a function of any public run value. The genesis author must
+//!   name the keystore's coordinator run key as the envelope `SingleKey` coordinator identity
+//!   (an authoring fixture reads the peer id out of the same store it hands the worker), or
+//!   every coordinator frame refuses at the authority judgment (fail closed, never a fallback).
+//!   The worker's per-run key is additionally CERTIFIED by the store's base identity to the
+//!   full execution identity, and the certificate is persisted beside the key.
 //! - **Guest-authored payloads (B1)**: the guest seals its own committed container and
 //!   `payload_put`s it; this session is the async-runtime seat servicing the put, and the
 //!   commitment evidence is the guest's own tag-3 voice — verified here to hash exactly the
@@ -51,37 +54,39 @@ use daemon_vhc_proto::messages::{
     Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass, VhcMessage,
 };
 use daemon_vhc_proto::{
-    blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, SigningKey, StateDigest,
+    blake3_hash, peer_id, to_canonical_vec, CapabilitySet, CertScope, Hash, IrohId, SigningKey,
+    StateDigest,
 };
 
 use crate::send;
 use daemon_provision::CutWriter;
+use daemon_vhc_session::identity::certify_existing_key;
+use daemon_vhc_session::keystore::VhcKeystore;
 use daemon_vhc_session::protocol::Event;
 
-/// The ABI §2.6 derived grants document (§9.4 steps 8/11 hash pinning — assess and join derive
-/// byte-identical copies): the admitted channel table + the worlds the driver links.
-pub(crate) fn derive_grants() -> Vec<u8> {
-    let channels: Vec<ciborium::value::Value> = daemon_vhc_abi::PHASE_A_DEFAULT_CHANNEL_TABLE
-        .iter()
-        .map(|c| ciborium::value::Value::from(u64::from(c.id)))
-        .collect();
-    let worlds = ["vhc@2", "net@2", "sys@2"]
-        .iter()
-        .map(|w| ciborium::value::Value::from(*w))
-        .collect();
-    let doc = ciborium::value::Value::Map(vec![
-        (
-            ciborium::value::Value::from("channels"),
-            ciborium::value::Value::Array(channels),
-        ),
-        (
-            ciborium::value::Value::from("worlds"),
-            ciborium::value::Value::Array(worlds),
-        ),
-    ]);
-    let mut b = Vec::new();
-    ciborium::into_writer(&doc, &mut b).expect("grants cbor");
-    b
+/// The self-driven join's role-instance incarnation. The node-durable incarnation counter takes
+/// over when the node carries the admitted identity into `JoinRun`; until then this in-process
+/// seat runs one incarnation per join.
+pub(crate) const RUN_INSTANCE: u64 = 1;
+
+/// Author the complete ABI §2.6 grants document for the run's worker role (§9.4 steps 8/11 hash
+/// pinning — assess and join derive byte-identical copies). Admission authors the truth: the
+/// document enumerates the complete capability surface the module actually links + the genesis
+/// role grant list — the worlds the module imports (incl. `compute@2`/`data@2`), the role's
+/// channel table, custom ops, artifacts, buffer limits, and rate/quota bounds. This replaces the
+/// former hand-rolled `vhc@2`/`net@2`/`sys@2` subset (audit finding: grants inconsistent with
+/// what the trainer uses).
+///
+/// Both assess ([`crate::backend`]) and join call this with the SAME `(worker, module, genesis
+/// role)` inputs, so the canonical bytes — and the grants hash — match by construction.
+pub(crate) fn derive_grants(
+    worker: &Worker,
+    module: &[u8],
+    role_grants: &daemon_vhc_proto::genesis::RoleGrants,
+) -> Result<Vec<u8>, String> {
+    let linked = daemon_vhc_host::linked_worlds(worker, module)
+        .map_err(|e| format!("linked worlds for grants authoring: {e}"))?;
+    Ok(daemon_vhc_proto::GrantsDoc::author(&linked, role_grants).to_canonical_bytes())
 }
 
 /// How many rounds the self-driven t2 run drives before a clean stop.
@@ -284,7 +289,8 @@ pub(crate) async fn join_and_run(
     if sel.driver != daemon_vhc_abi::CandidateDriver::V2 {
         return Err("join_and_run on a non-major-2 module".into());
     }
-    let grants = derive_grants();
+    let worker_role_grants = &genesis.env.roles[&genesis.worker_role].grants;
+    let grants = derive_grants(&worker, module, worker_role_grants)?;
 
     // The coordinator configuration, derived from the frozen genesis (the production seat:
     // pinned module hash, verbatim opaque config, declared AuthorityConfig, cryptographic RunId).
@@ -292,12 +298,48 @@ pub(crate) async fn join_and_run(
         configure_coordinator(&genesis.frozen).map_err(|e| format!("coordinator config: {e}"))?;
     let coordinator_wasm = crate::backend::resolve_coordinator_module(&genesis.env).await?;
 
-    // Identities (module docs "in-process identity contract"): run_id-derived keys; the genesis
-    // must name the derived coordinator identity or authority judgment refuses every frame.
-    let worker_key_seed = *blake3::hash(format!("vhc-worker/{run_id}").as_bytes()).as_bytes();
-    let coord_key_seed = *blake3::hash(format!("vhc-coordinator/{run_id}").as_bytes()).as_bytes();
-    let worker_key = SigningKey::from_bytes(&worker_key_seed);
+    // Identities (module docs "in-process identity contract"): every key resolves against the
+    // node-provided keystore — CSPRNG per-run material, never derived from the public run id.
+    // The genesis must name the keystore's coordinator run key or authority judgment refuses
+    // every frame.
+    let keystore = VhcKeystore::from_env().map_err(|e| format!("identity store: {e}"))?;
+    let worker_key = keystore
+        .run_signing_key(run_id, &genesis.worker_role, RUN_INSTANCE)
+        .map_err(|e| format!("worker run key: {e}"))?;
+    let worker_key_seed = worker_key.to_bytes();
     let worker_peer = peer_id(&worker_key);
+    let coordinator_role = genesis
+        .env
+        .roles
+        .iter()
+        .find(|(_, r)| r.lane == "coordinator")
+        .map(|(name, _)| name.clone())
+        .ok_or("genesis envelope has no role with lane `coordinator`")?;
+    let coord_key_seed = keystore
+        .run_signing_key(run_id, &coordinator_role, RUN_INSTANCE)
+        .map_err(|e| format!("coordinator run key: {e}"))?
+        .to_bytes();
+
+    // Certify the worker's per-run key to the store's base identity over the full execution
+    // identity, and persist the certificate beside the key (crash recovery re-reads both).
+    let base = keystore
+        .base_identity()
+        .map_err(|e| format!("base identity: {e}"))?;
+    let certified = certify_existing_key(
+        &base,
+        CertScope {
+            run_id: coord_spec.run_id,
+            epoch: 0,
+            role: genesis.worker_role.clone(),
+            instance: RUN_INSTANCE,
+            module_hash: Hash(module_hash),
+        },
+        SigningKey::from_bytes(&worker_key_seed),
+    )
+    .map_err(|e| format!("certify run key: {e}"))?;
+    keystore
+        .store_run_certificate(run_id, &genesis.worker_role, RUN_INSTANCE, &certified.cert)
+        .map_err(|e| format!("persist run certificate: {e}"))?;
 
     // The execution identity (ABI §8.1): run_id = the genesis hash (the cryptographic RunId),
     // role = the joining worker role from the genesis role set.
@@ -305,14 +347,19 @@ pub(crate) async fn join_and_run(
         run_id: coord_spec.run_id.0,
         epoch: 0,
         role: genesis.worker_role.clone(),
-        instance: 1,
+        instance: RUN_INSTANCE,
         module: module_hash,
     };
     // The t2 artifact store: ONE fetch path (B2) — the session's staging reads and any guest
     // data@2::fetch are both answered through T2Artifacts::fetch; the run's artifact grants are
     // exactly the store's committed hashes (which artifacts a module may touch is a grant).
     let (artifacts, manifest_hash) = t2_corpus_artifacts()?;
-    let mut run_cfg = RunConfig::new(identity.clone(), worker_key_seed, config.to_vec(), grants);
+    let mut run_cfg = RunConfig::new(
+        identity.clone(),
+        worker_key_seed,
+        config.to_vec(),
+        grants.clone(),
+    );
     run_cfg.granted_artifacts = artifacts.granted();
     // A real transformer's per-round op stream exceeds the tiny default queue depth (the guest
     // also fences per inner step to reclaim depth).
@@ -323,21 +370,34 @@ pub(crate) async fn join_and_run(
     let pump = run.pump.clone();
 
     // -- the run's REAL coordinator, in-process under the major-2 driver --------------------
+    let coord_role_grants = &genesis.env.roles[&coordinator_role].grants;
+    let coord_grants = derive_grants(&worker, &coordinator_wasm, coord_role_grants)?;
     let mut coord = Coordinator::start(
         &coordinator_wasm,
         &coord_spec,
-        derive_grants(),
+        coord_grants,
         0,
         coord_key_seed,
     )?;
 
     // Join the roster + the ready heartbeat (the event-driven fast path: the coordinator's
     // synthetic clock advances per frame; no wall-clock manipulation exists on this drive).
+    // The transport identity: the keystore's iroh secret — its own key, never the base identity
+    // and never a run key (the fixed placeholder id this frame used to carry is gone).
+    let iroh_id = IrohId(
+        peer_id(
+            &keystore
+                .iroh_secret()
+                .map_err(|e| format!("iroh identity: {e}"))?
+                .signing_key(),
+        )
+        .0,
+    );
     coord.deliver(
         &worker_key,
         &VhcMessage::Join(Join {
             run_id: run_id.to_string(),
-            iroh_id: IrohId([0x44; 32]),
+            iroh_id,
             class: ThroughputClass::C1,
             capabilities: CapabilitySet::new(),
             envelope_hash: None,
@@ -535,7 +595,7 @@ pub(crate) async fn join_and_run(
     // The identity behind the recorded run: what `sys@2::rng_seed` re-derives from at replay
     // (in a real journal this rides the tag-0 run header).
     script.identity = Some(identity);
-    let replayed = replay(&worker, module, config, &derive_grants(), script)
+    let replayed = replay(&worker, module, config, &grants, script)
         .map_err(|e| format!("replay harness: {e}"))?;
     if replayed.end != ReplayEnd::Outcome(0) {
         return Err(format!("input replay diverged: {:?}", replayed.end));

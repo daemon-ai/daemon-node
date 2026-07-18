@@ -189,6 +189,9 @@ pub struct VhcConfig {
     pub enabled: bool,
     /// Path to the `daemon-vhc-worker` binary (resolved like the `daemon-infer` worker).
     pub worker_path: String,
+    /// The vhc identity keystore directory (base identity, iroh transport secret, per-run keys —
+    /// `crate::keystore`). Empty (the default) derives `<data_dir>/vhc/identity` at boot.
+    pub identity_dir: String,
     /// Data/artifact cache budget in GiB (the artifact LRU bound, §8, RUN-4).
     pub data_cache_gb: u32,
     /// Default participation policy for joined runs.
@@ -218,6 +221,7 @@ impl Default for VhcConfig {
             // initial `daemon-vhc` scaffold that this defaulted to only printed a version line and
             // exited, so a stock `[vhc] enabled` node crash-looped its supervisor on spawn.
             worker_path: "daemon-vhc-worker".to_string(),
+            identity_dir: String::new(),
             data_cache_gb: 50,
             default_policy: VhcPolicyConfig::default(),
             module_trust: ModuleTrust::Signed,

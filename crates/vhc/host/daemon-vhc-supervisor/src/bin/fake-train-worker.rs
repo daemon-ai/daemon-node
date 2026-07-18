@@ -76,6 +76,7 @@ async fn main() {
                         reasons: vec!["fake: vram below floor".into()],
                         headroom: vec![("claim_device_bytes".into(), -(2048_i64 << 20))],
                         refusal_code: None,
+                        admitted_tuple: None,
                     }
                 } else {
                     Eligibility {
@@ -86,6 +87,7 @@ async fn main() {
                             ("claim_host_bytes".into(), 8192_i64 << 20),
                         ],
                         refusal_code: None,
+                        admitted_tuple: None,
                     }
                 };
                 send(&writer, &Event::Assessed(assessed)).await;

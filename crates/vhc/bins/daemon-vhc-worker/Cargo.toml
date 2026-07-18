@@ -88,6 +88,9 @@ daemon-common = { workspace = true }
 daemon-vhc-sdk-consensus = { workspace = true }
 blake3 = { workspace = true }
 ciborium = { workspace = true }
+# Test-only: the join suite authors its genesis from a throwaway identity keystore (the same
+# store it hands the spawned worker by directory reference).
+tempfile = "3"
 # Test-only: the `AbiUnsupportedMajor` refusal input is a synthetic ABI-major-1 wasm image
 # hand-assembled in `tests/worker_protocol.rs` (no vendored/recorded pre-refactor bytes) — the same
 # `wasm-encoder` shape `daemon-vhc-host/tests/driver_selection.rs` uses. Already resolved in

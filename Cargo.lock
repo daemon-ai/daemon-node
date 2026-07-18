@@ -5062,11 +5062,14 @@ dependencies = [
  "daemon-vhc-sdk-consensus",
  "figment",
  "futures",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "xxhash-rust",
+ "zeroize",
 ]
 
 [[package]]
@@ -5129,6 +5132,7 @@ dependencies = [
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
+ "tempfile",
  "tokio",
  "wasm-encoder",
 ]

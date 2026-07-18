@@ -60,6 +60,7 @@ impl WorkerControl for FakeChild {
                     ("claim_host_bytes".into(), host),
                 ],
                 refusal_code: None,
+                admitted_tuple: None,
             }),
             None => unreachable!("no discovery seam in this test"),
         }

@@ -92,6 +92,10 @@ async fn main() {
     // an ineligible/refused assess fails loud instead of guessing.
     let mut run: Option<backend::ResolvedRun> = None;
     let mut run_is_v2 = false;
+    // The immutable admitted tuple the last assessment produced (architecture §6.3). Join
+    // rederives from the artifacts it is about to run and compares against this; a mismatch
+    // aborts with a typed event so the node reassesses.
+    let mut assessed_tuple: Option<daemon_vhc_session::protocol::AdmittedTuple> = None;
 
     while let Some(bytes) = reader.recv().await {
         let cmd: Command = match protocol::decode(&bytes) {
@@ -104,23 +108,41 @@ async fn main() {
         match cmd {
             Command::Probe => send(&writer, &Event::Probed(backend::hardware())).await,
             Command::AssessRun { envelope } => match backend::resolve_run(&envelope).await {
-                Ok(resolved) => match backend::assess(
-                    &resolved.module,
-                    &resolved.config,
-                    resolved.module_blake3.as_ref(),
-                    resolved.device_min.as_ref(),
-                    resolved.envelope_grants().as_ref(),
-                ) {
-                    Ok((elig, is_v2)) => {
-                        run_is_v2 = is_v2;
-                        run = Some(resolved);
-                        send(&writer, &Event::Assessed(elig)).await;
+                Ok(resolved) => {
+                    // The admitted tuple's non-artifact identity: the run's genesis hash + the
+                    // worker role this node joins as. The self-driven seat runs one incarnation
+                    // per join (the node-durable incarnation counter takes over with the
+                    // node-side identity delivery).
+                    let tuple_identity =
+                        resolved.genesis.as_ref().map(|g| backend::TupleIdentity {
+                            genesis_hash: g.frozen.run_id().0,
+                            role: &g.worker_role,
+                            incarnation: session::RUN_INSTANCE,
+                        });
+                    match backend::assess(
+                        &resolved.module,
+                        &resolved.config,
+                        resolved.module_blake3.as_ref(),
+                        resolved.device_min.as_ref(),
+                        resolved.envelope_grants().as_ref(),
+                        tuple_identity,
+                    ) {
+                        Ok((elig, is_v2)) => {
+                            run_is_v2 = is_v2;
+                            assessed_tuple = elig.admitted_tuple.clone();
+                            run = Some(resolved);
+                            send(&writer, &Event::Assessed(elig)).await;
+                        }
+                        Err(detail) => send(&writer, &worker_error(&detail)).await,
                     }
-                    Err(detail) => send(&writer, &worker_error(&detail)).await,
-                },
+                }
                 Err(detail) => send(&writer, &worker_error(&detail)).await,
             },
-            Command::JoinRun { run_id, .. } => {
+            Command::JoinRun {
+                run_id,
+                admitted_tuple,
+                ..
+            } => {
                 let Some(resolved) = run.as_ref() else {
                     send(
                         &writer,
@@ -160,6 +182,47 @@ async fn main() {
                     .await;
                     continue;
                 };
+                // Admitted-tuple integrity (architecture §6.3): rederive the tuple from the
+                // artifacts this join is about to run and compare field-by-field against the
+                // tuple assessment produced (the node-delivered one when present, else the
+                // worker's own cached assessment). Any artifact mismatch aborts the join with a
+                // typed event — the node reassesses; a stale/swapped artifact is never run.
+                let expected = admitted_tuple.or_else(|| assessed_tuple.clone());
+                if let Some(expected) = &expected {
+                    let tuple_identity = backend::TupleIdentity {
+                        genesis_hash: genesis.frozen.run_id().0,
+                        role: &genesis.worker_role,
+                        incarnation: session::RUN_INSTANCE,
+                    };
+                    match backend::assess(
+                        &resolved.module,
+                        &resolved.config,
+                        resolved.module_blake3.as_ref(),
+                        resolved.device_min.as_ref(),
+                        resolved.envelope_grants().as_ref(),
+                        Some(tuple_identity),
+                    ) {
+                        Ok((rederived_elig, _)) => {
+                            if let Some(rederived) = &rederived_elig.admitted_tuple {
+                                if let Some(field) = expected.first_artifact_mismatch(rederived) {
+                                    send(
+                                        &writer,
+                                        &Event::AdmittedTupleMismatch {
+                                            run_id: run_id.clone(),
+                                            field: field.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(detail) => {
+                            send(&writer, &worker_error(&detail)).await;
+                            continue;
+                        }
+                    }
+                }
                 match session::join_and_run(
                     &resolved.module,
                     &resolved.config,

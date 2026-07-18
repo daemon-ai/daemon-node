@@ -46,8 +46,8 @@ use daemon_vhc_proto::genesis::{
 use daemon_vhc_proto::sign::verify_bytes;
 use daemon_vhc_proto::{
     blake3_hash, derive_admitted_quotas, peer_id, to_canonical_vec, verify_certified_sender,
-    AdmittedQuotas, BufferReq, CertError, EpochDescriptor, Hash, PeerId, RunKeyCertificate,
-    SigningKey, TransitionChain, UpgradeAuthority, UpgradeRecord,
+    AdmittedQuotas, BufferReq, CertError, CertScope, EpochDescriptor, Hash, PeerId,
+    RunKeyCertificate, SigningKey, TransitionChain, UpgradeAuthority, UpgradeRecord,
 };
 use daemon_vhc_session::upgrade::{
     run_local_upgrade, ActivatedInstance, LeaveReason, LiveUpgradeInputs, LiveUpgradeSteps,
@@ -603,13 +603,18 @@ fn coordinator_self_upgrade_carries_signer_continuity() {
         false,
     );
 
-    // D2's signer-continuity machinery: the base machine identity certified the OLD epoch's
-    // per-run key with a validity window that ENDS at the fence (epoch_to = 0).
+    // The signer-continuity machinery: the base machine identity certified the OLD epoch's
+    // per-run key bound to exactly (epoch 0, old module) — the binding dies at the fence.
     let base = key(9);
     let old_run_key = peer_id(&SigningKey::from_bytes(&drill.old_seed));
-    let cert_old =
-        RunKeyCertificate::issue(&base, drill.run_id, "coordinator", 7, 0, 0, old_run_key)
-            .expect("old cert");
+    let old_scope = CertScope {
+        run_id: drill.run_id,
+        epoch: 0,
+        role: "coordinator".into(),
+        instance: 7,
+        module_hash: drill.old_module,
+    };
+    let cert_old = RunKeyCertificate::issue(&base, old_scope, old_run_key).expect("old cert");
 
     let outcome = run_local_upgrade(
         &drill.target,
@@ -638,59 +643,45 @@ fn coordinator_self_upgrade_carries_signer_continuity() {
     assert_eq!(epoch, 1);
     let new_sender = PeerId(sender);
 
-    // Signer continuity (architecture §4.4/§5.4; the D2 failover building block): the base
-    // identity issues the NEW epoch's certificate at the fence...
+    // Signer continuity (architecture §4.4/§5.4; the failover building block): the base
+    // identity issues the NEW epoch's certificate at the fence — same key rebinding is the
+    // policy, but this drill's fresh instance signs under a new key, so the new cert carries it.
+    let new_scope = CertScope {
+        run_id: drill.run_id,
+        epoch: 1,
+        role: "coordinator".into(),
+        instance: 7,
+        module_hash: drill.new_module,
+    };
     let cert_new =
-        RunKeyCertificate::issue(&base, drill.run_id, "coordinator", 7, 1, 10, new_sender)
-            .expect("new cert");
+        RunKeyCertificate::issue(&base, new_scope.clone(), new_sender).expect("new cert");
     let base_id = peer_id(&base);
     let store = [cert_old.clone(), cert_new];
 
     // ...the new signer is ACCEPTED for epoch-1 frames through the chain to the base identity...
-    verify_certified_sender(
-        &drill.run_id,
-        "coordinator",
-        7,
-        1,
-        &new_sender,
-        &base_id,
-        &store,
-    )
-    .expect("epoch-1 signer certified");
-    // ...the OLD signer is FENCED at the epoch boundary: its certificate expired at epoch 0
-    // (Expired on direct check; no certified chain covers it at epoch 1)...
+    verify_certified_sender(&new_scope, &new_sender, &base_id, &store)
+        .expect("epoch-1 signer certified");
+    // ...the OLD signer is FENCED at the epoch boundary: its certificate binds epoch 0 only
+    // (EpochMismatch on direct check; no certified chain covers it at epoch 1)...
     assert_eq!(
-        cert_old.authorizes_sender(&drill.run_id, "coordinator", 7, 1, &old_run_key),
-        Err(CertError::Expired {
-            epoch: 1,
-            from: 0,
-            to: 0
-        })
+        cert_old.authorizes_sender(
+            &CertScope {
+                epoch: 1,
+                module_hash: drill.old_module,
+                ..new_scope.clone()
+            },
+            &old_run_key
+        ),
+        Err(CertError::EpochMismatch { epoch: 1, bound: 0 })
     );
     assert_eq!(
-        verify_certified_sender(
-            &drill.run_id,
-            "coordinator",
-            7,
-            1,
-            &old_run_key,
-            &base_id,
-            &store
-        ),
+        verify_certified_sender(&new_scope, &old_run_key, &base_id, &store),
         Err(CertError::NoCertifiedChain)
     );
     // ...and WITHOUT the new certificate the new signer is not yet accepted (the continuity
     // step is explicit, never implicit).
     assert_eq!(
-        verify_certified_sender(
-            &drill.run_id,
-            "coordinator",
-            7,
-            1,
-            &new_sender,
-            &base_id,
-            &[cert_old]
-        ),
+        verify_certified_sender(&new_scope, &new_sender, &base_id, &[cert_old]),
         Err(CertError::NoCertifiedChain)
     );
 

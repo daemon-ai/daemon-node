@@ -203,6 +203,9 @@ impl TrainSupervisor {
             coordinator: coordinator.into(),
             credentials,
             policy,
+            // Node-authored tuple delivery into JoinRun arrives with the node-side credential
+            // authorship; the self-driven join authors and re-verifies its own tuple.
+            admitted_tuple: None,
         };
         self.exchange(cmd, |ev| match ev {
             Event::RunPhase { .. } => Some(Ok(())),
@@ -233,6 +236,9 @@ impl TrainSupervisor {
             coordinator: coordinator.into(),
             credentials,
             policy,
+            // Node-authored tuple delivery into JoinRun arrives with the node-side credential
+            // authorship; the self-driven join authors and re-verifies its own tuple.
+            admitted_tuple: None,
         };
         // One-way: the worker streams events (incl. the first RunPhase) over the pump, so we do not
         // block on a reply here. A spawn/transport fault clears the pump + surfaces the error.
