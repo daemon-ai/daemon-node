@@ -445,9 +445,23 @@ struct PumpState {
     /// reads it through [`PumpHandle::snapshot_capture`]. At most one per drain (a second
     /// successful submission is `BadEvent`).
     accepted_snapshot: Option<SnapshotCapture>,
+    /// The registered embedder egress wake ([`PumpHandle::set_egress_hook`]): fired whenever
+    /// guest egress lands (a publish, an op request awaiting service, a metric, a log line) so
+    /// an async embedder can wait for a wake instead of interval-polling `published()` /
+    /// `take_op_requests()`. Host-internal — never a wire surface. The hook runs under the pump
+    /// lock, so it MUST be wait-free and MUST NOT call back into the pump (a channel/notify
+    /// signal, nothing more).
+    egress_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl PumpState {
+    /// Fire the registered egress wake, if any (see [`PumpHandle::set_egress_hook`]).
+    fn note_egress(&self) {
+        if let Some(hook) = &self.egress_hook {
+            hook();
+        }
+    }
+
     /// Bound the advisory `PayloadReady` queue at its declared depth (§4.7 class 0): dedup by
     /// hash happens at staging; a distinct-hash announcement beyond the depth drops the OLDEST
     /// queued announcement — its staged bytes are unstaged with it — journaled (tag 7).
@@ -965,6 +979,21 @@ impl PumpHandle {
         std::mem::take(&mut self.shared.state.lock().expect("pump lock").op_requests)
     }
 
+    /// Register the embedder's **egress wake**: `hook` fires whenever guest egress lands — a
+    /// publish, an op request awaiting service, a metric, or a log line — so an event-driven
+    /// embedder (the role session) can await a wake instead of interval-polling
+    /// [`PumpHandle::published`] / [`PumpHandle::take_op_requests`]. Host-internal plumbing,
+    /// never a wire surface.
+    ///
+    /// The hook runs under the pump lock: it MUST be wait-free and MUST NOT call back into the
+    /// pump (signal a channel/notify and return). It fires once at registration so egress that
+    /// landed before the hook was set is never silently unannounced.
+    pub fn set_egress_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        let mut st = self.shared.state.lock().expect("pump lock");
+        st.egress_hook = Some(hook);
+        st.note_egress();
+    }
+
     /// Complete an outstanding op with the embedder's outcome. The pump — not the embedder — owns
     /// the trust steps (architecture §3.4): a put's hash is computed here over the op's own sealed
     /// bytes; a get's bytes are hash-verified against the requested hash BEFORE the completion is
@@ -1112,9 +1141,13 @@ impl PumpHandle {
     pub fn grant_credit(&self, stream: u64, credit: u64) {
         let mut st = self.shared.state.lock().expect("pump lock");
         let released = st.streams.grant(stream, credit);
+        let any = !released.is_empty();
         for (op, bytes) in released {
             st.op_requests
                 .push((op, OpRequest::StreamWrite { stream, bytes }));
+        }
+        if any {
+            st.note_egress();
         }
     }
 
@@ -2031,6 +2064,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                     Trap::new(code, "payload_put", None, "max_outstanding grant (§2.3)")
                 })?;
                 st.op_requests.push((op, request));
+                st.note_egress();
                 Ok(op)
             })(&mut c);
             stash(&mut c, r)
@@ -2053,6 +2087,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         Trap::new(code, "payload_get", None, "max_outstanding grant (§2.3)")
                     })?;
                 st.op_requests.push((op, OpRequest::PayloadGet { hash }));
+                st.note_egress();
                 Ok(op)
             })(&mut c);
             stash(&mut c, r)
@@ -2104,6 +2139,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                     Trap::new(code, "fetch", None, "max_outstanding grant (§2.3)")
                 })?;
                 st.op_requests.push((op, request));
+                st.note_egress();
                 Ok(op)
             })(&mut c);
             stash(&mut c, r)
@@ -2128,6 +2164,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         Trap::new(code, "stream_open", None, "max_outstanding grant (§2.3)")
                     })?;
                 st.op_requests.push((op, OpRequest::StreamOpen { peer }));
+                st.note_egress();
                 Ok(op)
             })(&mut c);
             stash(&mut c, r)
@@ -2145,6 +2182,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                     Trap::new(code, "stream_accept", None, "max_outstanding grant (§2.3)")
                 })?;
                 st.op_requests.push((op, OpRequest::StreamAccept));
+                st.note_egress();
                 Ok(op)
             })(&mut c);
             stash(&mut c, r)
@@ -2179,6 +2217,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                     Some(true) => {
                         st.op_requests
                             .push((op, OpRequest::StreamWrite { stream, bytes }));
+                        st.note_egress();
                     }
                     Some(false) => { /* held for credit */ }
                     None => {
@@ -2219,6 +2258,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         Trap::new(code, "stream_read", None, "max_outstanding grant (§2.3)")
                     })?;
                 st.op_requests.push((op, OpRequest::StreamRead { stream }));
+                st.note_egress();
                 Ok(op)
             })(&mut c);
             stash(&mut c, r)
@@ -2278,6 +2318,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                     .publish(u64::from(channel_id), seq, &payload, &frame)
                     .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
                 st.published.push((u64::from(channel_id), seq, frame));
+                st.note_egress();
                 // A registered stop cut (§4.4): the run is complete AT this publish — enqueue the
                 // Stop in the same critical section, so nothing else can enter the stream first.
                 if let Some((n, reason)) = st.stop_cut {
@@ -2389,6 +2430,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
                 st.metrics.push((name, value));
+                st.note_egress();
                 Ok(())
             })(&mut c);
             stash(&mut c, r)
@@ -2408,6 +2450,7 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
                 st.logs.push((level.min(5), msg));
+                st.note_egress();
                 Ok(())
             })(&mut c);
             stash(&mut c, r)
@@ -2913,6 +2956,7 @@ pub fn start_run_migrating(
             draining: false,
             drain_deadline_at: None,
             accepted_snapshot: None,
+            egress_hook: None,
         }),
         wake: Condvar::new(),
         t0: Instant::now(),
@@ -3349,6 +3393,7 @@ mod tests {
             draining: false,
             drain_deadline_at: None,
             accepted_snapshot: None,
+            egress_hook: None,
         }
     }
 
@@ -3423,6 +3468,38 @@ mod tests {
         assert_eq!(stalls.len(), 1, "one condition per exhaustion episode");
         // Nothing was dropped: the reliable class holds every accepted frame.
         assert!(!entries.iter().any(|e| matches!(e, SinkEntry::Drop { .. })));
+    }
+
+    #[test]
+    fn the_egress_hook_fires_on_registration_and_on_guest_egress() {
+        // The embedder egress wake: registering fires once (nothing already landed is silently
+        // unannounced), and every subsequent guest-egress landing fires it again. The hook is a
+        // pure signal — the embedder still drains through `published`/`take_op_requests`.
+        let sink = Arc::new(Mutex::new(MemorySink::new()));
+        let pump = test_pump(Box::new(sink));
+        let fires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = fires.clone();
+        pump.set_egress_hook(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            1,
+            "fires once at registration"
+        );
+        // Simulate guest egress landing under the pump lock (the import-body path).
+        {
+            let mut st = pump.shared.state.lock().unwrap();
+            st.published.push((0, 0, b"frame".to_vec()));
+            st.note_egress();
+            st.metrics.push(("loss".into(), 1.0));
+            st.note_egress();
+        }
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            3,
+            "each landing wakes the embedder"
+        );
     }
 
     #[test]
