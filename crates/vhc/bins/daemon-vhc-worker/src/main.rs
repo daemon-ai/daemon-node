@@ -23,12 +23,17 @@
 //!   (`UnsignedEnvelopeRetired`, D0), a schema-major-1 envelope is refused typed
 //!   (`EnvelopeSchemaRetired` — the v1 form cannot configure a coordinator), and a major-1
 //!   module is refused typed (`AbiUnsupportedMajor`)** — the flipped A0 fixture pins the last.
-//! - `JoinRun` → the v2 session run (`session::join_and_run`): the event pump over the
-//!   run's REAL coordinator, configured from the genesis and run in-process under the same
-//!   major-2 driver (consensus never runs outside the sandboxed, content-addressed module).
-//! - `Leave`/`Shutdown`/`Ping` → as the protocol requires.
+//! - `JoinRun` → spawns a **role session** (`daemon_vhc_session::role_session`) as a background
+//!   task and returns to the loop immediately: the command loop NEVER blocks on run execution.
+//!   The worker keeps only the `{role instance → role handle}` task map; the session owns the
+//!   run (opaque frame routing, capability servicing, lifecycle, terminal classification).
+//! - `Throttle` → forwarded into every live session (`paused` is a hard pump-level gate; duty
+//!   percentage is a cooperative budget advisory).
+//! - `Leave` → graceful (quiesce + drain-snapshot checkpoint) or immediate; either way the
+//!   session emits the classified terminal `RunTerminated`.
+//! - `Shutdown` → cancels every live session under a bounded drain deadline, then exits.
 //!
-//! A trapping module surfaces as `Event::Error{class: Module, …}` — the worker is never harmed.
+//! A trapping module surfaces as a classified terminal outcome — the worker is never harmed.
 
 mod backend;
 // The in-process self-driven join: it decodes the SDK round schemas and drives the run's
@@ -38,8 +43,36 @@ mod backend;
 #[cfg(feature = "harness")]
 mod session;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
 use daemon_provision::{CutChannel, CutWriter};
-use daemon_vhc_session::protocol::{self, Command, ErrorClass, Event};
+use daemon_vhc_session::protocol::{self, Command, ErrorClass, Event, LeaveMode};
+use daemon_vhc_session::role_session::{
+    spawn_role, RoleHandle, RoleProviders, RoleSessionSpec, ThrottleLevel,
+};
+
+/// The graceful-leave / shutdown drain ceiling. Becomes lane configuration when the node-side
+/// quiesce ceilings land; a constant keeps the drain bounded meanwhile.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Whether the node/test selected the **in-process plane** for this worker's role sessions: an
+/// in-process control plane + in-memory content stores — the single-host smoke seat. The live
+/// transport attach (credential-selected planes and stores) supersedes this; without either, a
+/// join refuses typed (fail closed, never a silent local run).
+fn in_process_plane_selected() -> bool {
+    std::env::var_os("DAEMON_VHC_INPROC_PLANE").is_some_and(|v| v == "1")
+}
+
+/// Providers for the in-process plane seat.
+fn in_process_providers() -> RoleProviders {
+    RoleProviders {
+        control: Arc::new(daemon_vhc_net::LoopbackGossip::new()),
+        payloads: Arc::new(daemon_vhc_net::MemoryContentStore::new()),
+        artifacts: Arc::new(daemon_vhc_net::MemoryContentStore::new()),
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -97,6 +130,22 @@ async fn main() {
     // an ineligible/refused assess fails loud instead of guessing.
     let mut run: Option<backend::ResolvedRun> = None;
     let mut run_is_v2 = false;
+    // The role-instance task map — the ONLY per-run state this binary owns (the session library
+    // owns everything else). Keyed by the wire's run label; each handle carries the generation
+    // that disambiguates incarnations.
+    let mut roles: HashMap<String, RoleHandle> = HashMap::new();
+    // One forwarder moves every session event (phases, metrics, warnings, the terminal
+    // RunTerminated) onto the stdio cut, concurrently with the command loop. Shutdown drops the
+    // sender and awaits the forwarder so no terminal event is lost to process exit.
+    let (role_events, mut role_events_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let forwarder = {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = role_events_rx.recv().await {
+                send(&writer, &ev).await;
+            }
+        })
+    };
     // The immutable admitted tuple the last assessment produced (architecture §6.3). Join
     // rederives from the artifacts it is about to run and compares against this; a mismatch
     // aborts with a typed event so the node reassesses.
@@ -215,6 +264,7 @@ async fn main() {
                                         &Event::AdmittedTupleMismatch {
                                             run_id: run_id.clone(),
                                             field: field.to_string(),
+                                            generation: backend::RUN_INSTANCE,
                                         },
                                     )
                                     .await;
@@ -227,6 +277,49 @@ async fn main() {
                             continue;
                         }
                     }
+                }
+                // The production join: spawn a role session as a background task and return to
+                // the loop at once. A finished predecessor for the same run is reaped; a LIVE
+                // one refuses typed (the node leaves first — a silent replacement could strand
+                // a running instance).
+                if let Some(existing) = roles.get(&run_id) {
+                    if existing.is_finished() {
+                        roles.remove(&run_id);
+                    } else {
+                        send(
+                            &writer,
+                            &worker_error(&format!(
+                                "JoinRun for run `{run_id}`: a role instance is already live \
+                                 for this run (generation {}); leave it before re-joining",
+                                existing.generation()
+                            )),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                if in_process_plane_selected() {
+                    match backend::role_binding(resolved, genesis, &run_id) {
+                        Ok(binding) => {
+                            let spec = RoleSessionSpec {
+                                module: resolved.module.clone(),
+                                engine: backend::engine_config_from_env(),
+                                run: binding.run,
+                                own_cert: binding.own_cert.clone(),
+                                trusted_bases: binding.trusted_bases,
+                                peer_certs: vec![binding.own_cert],
+                                providers: in_process_providers(),
+                                // The journal home is node-delivered once run state dirs land;
+                                // the in-process seat records in memory meanwhile.
+                                journal: Box::new(daemon_vhc_host::run::MemorySink::new()),
+                                drain_deadline: DRAIN_DEADLINE,
+                            };
+                            let handle = spawn_role(run_id.clone(), spec, role_events.clone());
+                            roles.insert(run_id, handle);
+                        }
+                        Err(detail) => send(&writer, &worker_error(&detail)).await,
+                    }
+                    continue;
                 }
                 #[cfg(feature = "harness")]
                 {
@@ -245,31 +338,44 @@ async fn main() {
                 }
                 #[cfg(not(feature = "harness"))]
                 {
-                    // The production worker carries no in-process join: the self-driven session
-                    // decodes SDK round schemas and hosts the run's coordinator in-process, which
-                    // the opaque-host boundary forbids (the host routes signed opaque frames and
-                    // services capabilities; it never understands rounds). The decentralized
-                    // role-session join over real transports is the successor; until it lands,
-                    // an unadorned worker refuses typed instead of running harness machinery.
+                    // No transport is bound: refuse typed (fail closed). The live transport
+                    // attach (credential-selected planes and stores) replaces this refusal;
+                    // the in-process plane above is the single-host smoke seat meanwhile.
                     send(
                         &writer,
                         &worker_error(&format!(
-                            "JoinRun for run `{run_id}`: this worker build carries no \
-                             in-process self-driven join (harness builds only); the \
-                             decentralized role-session join supersedes it"
+                            "JoinRun for run `{run_id}`: no control-plane binding for a role \
+                             session in this build (the live transport attach supersedes; the \
+                             in-process plane serves single-host smoke)"
                         )),
                     )
                     .await;
                 }
             }
-            Command::Throttle { .. } => {
-                // The v2 session owns its sandbox exclusively; a live pause is
-                // preemption-as-churn at the node (stop + re-issue JoinRun on the durable
-                // intent, §10.3/§10.5). Nothing to do in-process here.
+            Command::Throttle {
+                vram_cap_mb,
+                duty_cycle_pct,
+                paused,
+            } => {
+                // The owner's governor lever, forwarded into every live session: `paused` is a
+                // HARD pump-level gate (a paused worker actually stops); the duty percentage
+                // and VRAM cap ride the cooperative budget advisory.
+                let level = ThrottleLevel {
+                    paused,
+                    duty_cycle_pct,
+                    vram_cap_mb,
+                };
+                for handle in roles.values() {
+                    handle.throttle(level);
+                }
             }
-            Command::Leave { .. } => {
-                // The v2 session run drives itself to completion within JoinRun; the durable
-                // intent lives at the node. Nothing held here to tear down.
+            Command::Leave { run_id, mode } => {
+                // Real leave semantics: graceful = quiesce + drain-snapshot checkpoint;
+                // immediate = stop now. The session emits the terminal RunTerminated either
+                // way; the handle leaves the map at once (a re-join mints a new generation).
+                if let Some(handle) = roles.remove(&run_id) {
+                    handle.leave(mode);
+                }
             }
             Command::SwitchModule { run_id, .. } => {
                 // The LOCAL upgrade transaction (ABI §10.3) runs against a LIVE, held role-instance
@@ -295,6 +401,15 @@ async fn main() {
             }
             Command::Ping => send(&writer, &Event::Pong).await,
             Command::Shutdown => {
+                // Cancel every live session under a bounded drain, then exit. Each session
+                // still emits its terminal RunTerminated through the forwarder; dropping the
+                // sender and awaiting the forwarder flushes them before the process ends.
+                for (_, handle) in roles.drain() {
+                    handle.leave(LeaveMode::Immediate);
+                    let _ = tokio::time::timeout(DRAIN_DEADLINE, handle.join()).await;
+                }
+                drop(role_events);
+                let _ = forwarder.await;
                 break;
             }
         }

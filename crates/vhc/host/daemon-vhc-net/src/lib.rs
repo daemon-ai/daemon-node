@@ -78,7 +78,9 @@ pub use registry::{
 pub use seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};
 pub use seat_registry::FakeSeatRegistry;
 pub use store::FsPayloadStore;
-pub use transport::{ControlPlane, ControlSubscription, PayloadStat, PayloadStore};
+pub use transport::{
+    ContentStore, ControlPlane, ControlSubscription, MemoryContentStore, PayloadStat, PayloadStore,
+};
 #[cfg(feature = "ws")]
 pub use ws_client::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
 

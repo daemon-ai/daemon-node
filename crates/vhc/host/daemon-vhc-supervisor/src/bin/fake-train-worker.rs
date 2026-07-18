@@ -103,6 +103,7 @@ async fn main() {
                         phase: "warmup".into(),
                         epoch: 0,
                         round: 0,
+                        generation: 1,
                     },
                 )
                 .await;
@@ -128,6 +129,7 @@ async fn main() {
                         epoch,
                         module: new_module,
                         retries: 0,
+                        generation: 1,
                     },
                 )
                 .await;

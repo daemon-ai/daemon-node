@@ -849,6 +849,125 @@ pub(crate) struct TupleIdentity<'a> {
     pub(crate) incarnation: u64,
 }
 
+/// Everything a production role-session join binds beyond the providers: the driver-facing run
+/// binding (identity, certified per-run signing seed, admitted config + grants + quotas) and the
+/// inbound trust configuration (own certificate, genesis-named trusted bases).
+pub(crate) struct RoleBinding {
+    pub(crate) run: daemon_vhc_host::run::RunConfig,
+    pub(crate) own_cert: daemon_vhc_proto::RunKeyCertificate,
+    pub(crate) trusted_bases: Vec<daemon_vhc_proto::PeerId>,
+}
+
+/// Author the role-session binding for a resolved genesis run: re-run the admission funnel over
+/// the exact artifacts (the §9.4 join-time re-check — same lane, same grants derivation as
+/// assess), resolve the certified per-run identity against the node-provided keystore (CSPRNG
+/// material, certified by the base identity, persisted beside the key), and assemble the run
+/// config with the admitted quotas applied.
+pub(crate) fn role_binding(
+    resolved: &ResolvedRun,
+    genesis: &GenesisRun,
+    run_id: &str,
+) -> Result<RoleBinding, String> {
+    use daemon_vhc_session::identity::certify_existing_key;
+    use daemon_vhc_session::keystore::VhcKeystore;
+
+    // Admission re-check on the CPU-cheap path (assessment parity: same engine shape).
+    let engine = EngineConfig {
+        backend: daemon_vhc_host::BackendKind::Cpu,
+        ..engine_config_from_env()
+    };
+    let worker = Worker::new(engine).map_err(|e| format!("admission engine: {e}"))?;
+    let module_hash = resolved
+        .module_blake3
+        .unwrap_or_else(|| *blake3::hash(&resolved.module).as_bytes());
+    let envelope_grants = resolved.envelope_grants();
+    let default_role = daemon_vhc_proto::genesis::RoleGrants::default();
+    let role_grants = envelope_grants
+        .as_ref()
+        .map_or(&default_role, |eg| &eg.grants);
+    let grants = derive_grants(&worker, &resolved.module, role_grants)?;
+    let hw = hardware();
+    let dl = device_limits();
+    let device = daemon_vhc_host::run::DeviceProfile {
+        gpu: hw.gpus > 0,
+        vram_bytes: dl.vram_mb << 20,
+        ram_bytes: dl.ram_mb << 20,
+        disk_bytes: hw.disk_free_mb << 20,
+    };
+    let owner = daemon_vhc_host::run::OwnerPolicy {
+        participation_enabled: true,
+        vram_cap_bytes: 0,
+        host_cap_bytes: 0,
+    };
+    let admission = daemon_vhc_host::run::admit(
+        &worker,
+        &resolved.module,
+        Some(&module_hash),
+        &resolved.config,
+        &grants,
+        &selected_lane(),
+        &device,
+        &owner,
+        resolved.device_min.as_ref(),
+        envelope_grants.as_ref(),
+    )
+    .map_err(|refusal| format!("join re-admission: {refusal}"))?;
+
+    // Certified per-run identity from the node-provided keystore (a path reference — key
+    // material never rides the command wire). CSPRNG per-run key, certified by the base
+    // identity to the full execution identity, certificate persisted beside the key.
+    let keystore = VhcKeystore::from_env().map_err(|e| format!("identity store: {e}"))?;
+    let run_key = keystore
+        .run_signing_key(run_id, &genesis.worker_role, RUN_INSTANCE)
+        .map_err(|e| format!("run key: {e}"))?;
+    let base = keystore
+        .base_identity()
+        .map_err(|e| format!("base identity: {e}"))?;
+    let genesis_hash = *genesis.frozen.run_id();
+    let certified = certify_existing_key(
+        &base,
+        daemon_vhc_proto::CertScope {
+            run_id: genesis_hash,
+            epoch: 0,
+            role: genesis.worker_role.clone(),
+            instance: RUN_INSTANCE,
+            module_hash: daemon_vhc_proto::Hash(module_hash),
+        },
+        daemon_vhc_proto::SigningKey::from_bytes(&run_key.to_bytes()),
+    )
+    .map_err(|e| format!("certify run key: {e}"))?;
+    keystore
+        .store_run_certificate(run_id, &genesis.worker_role, RUN_INSTANCE, &certified.cert)
+        .map_err(|e| format!("persist run certificate: {e}"))?;
+
+    let identity = daemon_vhc_host::run::RunIdentity {
+        run_id: genesis_hash.0,
+        epoch: 0,
+        role: genesis.worker_role.clone(),
+        instance: RUN_INSTANCE,
+        module: module_hash,
+    };
+    let mut run = daemon_vhc_host::run::RunConfig::new(
+        identity,
+        run_key.to_bytes(),
+        resolved.config.clone(),
+        grants,
+    );
+    run.claim_bytes = admission.claim_bytes.clone();
+    run.manifest_bytes = admission.manifest_bytes.clone();
+    admission.apply_quotas(&mut run);
+
+    // Inbound trust: the base identities the genesis names — never ambient config.
+    let trusted_bases = daemon_vhc_session::identity::TrustedBases::from_genesis(&genesis.env)
+        .bases()
+        .to_vec();
+    Ok(RoleBinding {
+        run,
+        own_cert: certified.cert,
+        trusted_bases,
+    })
+}
+
 /// The owner's node-side lane configuration seam (§9.6: "numbers are deployment config").
 /// Until the node client carries lane config, `DAEMON_VHC_LANE_GPU_OPTIONAL=1` selects a
 /// CPU-admitting dev/t2 lane (GPU optional, no device floors, the same claim bounds) — the

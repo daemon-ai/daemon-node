@@ -190,6 +190,39 @@ impl AdmittedTuple {
     }
 }
 
+/// The classified terminal outcome of one role-instance run — the typed exit the role session
+/// produces and the worker reports verbatim ([`Event::RunTerminated`]). The node's run-instance
+/// state machine consumes the class; the reason strings are operator-facing detail, never
+/// branched on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalOutcome {
+    /// The module signaled run end (`da_run` returned an outcome code; `0` is the clean end).
+    Completed {
+        /// The module's outcome code (ABI §4.5). `0` on a clean run end.
+        outcome: u32,
+    },
+    /// Owner intent ended the run (a leave command — graceful or immediate).
+    Left {
+        /// The content hash (blake3 hex) of the drain snapshot persisted to the payload plane
+        /// on a graceful leave; `None` when the leave was immediate or the module had nothing
+        /// to snapshot.
+        checkpoint: Option<String>,
+    },
+    /// A recoverable environment fault: transport loss, provider fault, resource-budget breach,
+    /// an unrecoverable inbound sequence gap with no backfill. The node may re-converge (rejoin
+    /// as a new incarnation) under its retry budget.
+    FailedRetryable {
+        /// Operator-facing detail (never branched on).
+        reason: String,
+    },
+    /// A non-recoverable failure: a module trap, an admission identity mismatch, a certificate
+    /// refusal, an init/migrate refusal. The node must not rejoin without owner action.
+    FailedTerminal {
+        /// Operator-facing detail (never branched on).
+        reason: String,
+    },
+}
+
 /// A self-assessment result for a run (§6.5, §10.2).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Eligibility {
@@ -316,6 +349,12 @@ pub enum Event {
         epoch: u64,
         /// The current round.
         round: RoundId,
+        /// The emitting role-instance's generation counter (the never-reused incarnation id).
+        /// The node discards events stamped with a stale generation — a reaped instance's late
+        /// events can never mutate its replacement. Additive `#[serde(default)]`: pre-counter
+        /// frames decode to `0` (un-stamped).
+        #[serde(default)]
+        generation: u64,
     },
     /// Progress within a round.
     RoundProgress {
@@ -331,6 +370,9 @@ pub enum Event {
         down_bytes: u64,
         /// Peers this round involves.
         peers: u32,
+        /// The emitting role-instance's generation counter (see [`Event::RunPhase`]).
+        #[serde(default)]
+        generation: u64,
     },
     /// The §6.4 protocol as seen from this peer, at round end.
     RoundOutcome {
@@ -344,6 +386,9 @@ pub enum Event {
         stalled: bool,
         /// The post-ingest state digest (§5.6).
         digest: [u8; 16],
+        /// The emitting role-instance's generation counter (see [`Event::RunPhase`]).
+        #[serde(default)]
+        generation: u64,
     },
     /// A named scalar metric readout.
     Metric {
@@ -360,6 +405,9 @@ pub enum Event {
         hash: String,
         /// A locator (store key / blob ticket).
         location: String,
+        /// The emitting role-instance's generation counter (see [`Event::RunPhase`]).
+        #[serde(default)]
+        generation: u64,
     },
     /// A non-fatal warning (desync-warning, straggling, quota).
     Warning {
@@ -388,6 +436,9 @@ pub enum Event {
         module: [u8; 32],
         /// Rollback-and-retry cycles used before activation (`0` on a clean first migration).
         retries: u32,
+        /// The emitting role-instance's generation counter (see [`Event::RunPhase`]).
+        #[serde(default)]
+        generation: u64,
     },
     /// Join aborted: the admitted tuple carried from assessment does not match the tuple
     /// rederived from the artifacts at join (architecture §6.3) — a stale or swapped artifact.
@@ -397,6 +448,21 @@ pub enum Event {
         run_id: String,
         /// The first tuple field that differed (e.g. `"module_hash"`).
         field: String,
+        /// The emitting role-instance's generation counter (see [`Event::RunPhase`]).
+        #[serde(default)]
+        generation: u64,
+    },
+    /// The role-instance run reached its terminal state: exactly one per spawned role task, the
+    /// last run-scoped event a generation emits. The worker reports the session's classified
+    /// exit verbatim; the node's run-instance state machine transitions on the class
+    /// (idempotently — duplicate delivery must not double-release resources).
+    RunTerminated {
+        /// The run that terminated.
+        run_id: String,
+        /// The terminated role-instance's generation counter (see [`Event::RunPhase`]).
+        generation: u64,
+        /// The classified terminal outcome.
+        outcome: TerminalOutcome,
     },
     /// Liveness reply to [`Command::Ping`].
     Pong,
@@ -744,12 +810,14 @@ mod tests {
         round_trip_event(Event::AdmittedTupleMismatch {
             run_id: "run-42".into(),
             field: "module_hash".into(),
+            generation: 3,
         });
         round_trip_event(Event::RunPhase {
             run_id: "run-42".into(),
             phase: "train".into(),
             epoch: 3,
             round: 128,
+            generation: 3,
         });
         round_trip_event(Event::RoundProgress {
             inner_step: 12,
@@ -758,6 +826,7 @@ mod tests {
             up_bytes: 1024,
             down_bytes: 8192,
             peers: 7,
+            generation: 3,
         });
         round_trip_event(Event::RoundOutcome {
             round: 128,
@@ -765,6 +834,7 @@ mod tests {
             ingested: 6,
             stalled: false,
             digest: [0xAB; 16],
+            generation: 3,
         });
         round_trip_event(Event::Metric {
             name: "grad_norm".into(),
@@ -774,6 +844,7 @@ mod tests {
             round: 200,
             hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
             location: "r2://run-42/ckpt-200.safetensors".into(),
+            generation: 3,
         });
         round_trip_event(Event::Warning {
             class: "straggle".into(),
@@ -797,8 +868,86 @@ mod tests {
             epoch: 3,
             module: [0x5A; 32],
             retries: 1,
+            generation: 3,
         });
+        for outcome in [
+            TerminalOutcome::Completed { outcome: 0 },
+            TerminalOutcome::Left { checkpoint: None },
+            TerminalOutcome::Left {
+                checkpoint: Some(
+                    "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
+                ),
+            },
+            TerminalOutcome::FailedRetryable {
+                reason: "control plane lost".into(),
+            },
+            TerminalOutcome::FailedTerminal {
+                reason: "module trapped: GrantViolation".into(),
+            },
+        ] {
+            round_trip_event(Event::RunTerminated {
+                run_id: "run-42".into(),
+                generation: 3,
+                outcome,
+            });
+        }
         round_trip_event(Event::Pong);
+    }
+
+    /// The generation counter is additive on every run-scoped event: a frame authored before the
+    /// counter existed (a CBOR map WITHOUT the field) still decodes, with `generation`
+    /// defaulting to `0` (un-stamped) — the node treats `0` as pre-counter, never as a stale
+    /// generation.
+    #[test]
+    fn generation_counter_is_additive_back_compatible() {
+        #[derive(serde::Serialize)]
+        enum LegacyEvent {
+            RunPhase {
+                run_id: String,
+                phase: String,
+                epoch: u64,
+                round: RoundId,
+            },
+            RoundOutcome {
+                round: RoundId,
+                committed: u32,
+                ingested: u32,
+                stalled: bool,
+                digest: [u8; 16],
+            },
+        }
+        let legacy_phase = LegacyEvent::RunPhase {
+            run_id: "run-42".into(),
+            phase: "train".into(),
+            epoch: 3,
+            round: 128,
+        };
+        let decoded: Event = decode(&encode(&legacy_phase).expect("encode legacy")).expect(
+            "a pre-counter RunPhase still decodes (the counter is additive, never re-keying)",
+        );
+        assert_eq!(
+            decoded,
+            Event::RunPhase {
+                run_id: "run-42".into(),
+                phase: "train".into(),
+                epoch: 3,
+                round: 128,
+                generation: 0,
+            }
+        );
+        let legacy_outcome = LegacyEvent::RoundOutcome {
+            round: 128,
+            committed: 6,
+            ingested: 6,
+            stalled: false,
+            digest: [0xAB; 16],
+        };
+        let decoded: Event =
+            decode(&encode(&legacy_outcome).expect("encode legacy")).expect("decodes");
+        assert!(
+            matches!(decoded, Event::RoundOutcome { generation: 0, .. }),
+            "missing counter defaults to 0"
+        );
     }
 
     /// `join_credentials_round_trip`: the A3 `JoinCredentials` schema carried in

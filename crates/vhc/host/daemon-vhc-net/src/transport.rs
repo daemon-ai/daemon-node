@@ -72,6 +72,66 @@ pub struct PayloadStat {
     pub size: u64,
 }
 
+/// A **content-addressed** payload plane: opaque objects keyed by their blake3 alone
+/// (`payload/<blake3>`), no run/round/peer coordinates anywhere in the key.
+///
+/// This is the plane the role session services module `payload_put`/`payload_get` and
+/// `data.fetch` operations against: the module names CONTENT, the store moves bytes, and the run
+/// pump re-verifies every fetched object against the requested hash before delivery — so the
+/// store is untrusted by construction. The coordinate-keyed [`PayloadStore`] below predates this
+/// seam and remains for the engine-era consumers; new production bindings are content-addressed.
+#[async_trait]
+pub trait ContentStore: Send + Sync {
+    /// PUT an opaque object, returning its content hash (blake3). Idempotent: re-putting
+    /// identical bytes stores/returns the same address.
+    async fn put_content(&self, bytes: &[u8]) -> Result<ContentHash, VhcNetError>;
+
+    /// GET an object by content hash. A missing object is [`VhcNetError::PayloadMiss`]; a store
+    /// returning bytes that do not hash to `hash` is [`VhcNetError::HashMismatch`] (the caller's
+    /// pump re-verifies regardless — defense in depth, not trust).
+    async fn get_content(&self, hash: &ContentHash) -> Result<Vec<u8>, VhcNetError>;
+}
+
+/// An in-memory [`ContentStore`]: the in-process seat for single-host smoke runs and tests.
+#[derive(Default)]
+pub struct MemoryContentStore {
+    objects: std::sync::Mutex<std::collections::HashMap<ContentHash, Vec<u8>>>,
+}
+
+impl MemoryContentStore {
+    /// A fresh, empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed an object directly (test/genesis staging helper). Returns its content hash.
+    pub fn seed(&self, bytes: &[u8]) -> ContentHash {
+        let hash = daemon_vhc_proto::blake3_hash(bytes);
+        self.objects
+            .lock()
+            .expect("content store lock")
+            .insert(hash, bytes.to_vec());
+        hash
+    }
+}
+
+#[async_trait]
+impl ContentStore for MemoryContentStore {
+    async fn put_content(&self, bytes: &[u8]) -> Result<ContentHash, VhcNetError> {
+        Ok(self.seed(bytes))
+    }
+
+    async fn get_content(&self, hash: &ContentHash) -> Result<Vec<u8>, VhcNetError> {
+        self.objects
+            .lock()
+            .expect("content store lock")
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| VhcNetError::PayloadMiss(hash.to_hex()))
+    }
+}
+
 /// A payload plane: opaque payload objects keyed by `(run, round, peer)` + content hash (§7.1).
 ///
 /// PUT your sealed update object; GET a committed object (verified against the hash the commitment
@@ -90,4 +150,25 @@ pub trait PayloadStore: Send + Sync {
     /// transferring the bytes to the caller. A missing/expired object is
     /// [`VhcNetError::PayloadMiss`].
     async fn head(&self, key: &PayloadKey) -> Result<PayloadStat, VhcNetError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn content_store_round_trips_by_hash_and_misses_typed() {
+        let store = MemoryContentStore::new();
+        let hash = store.put_content(b"sealed-object").await.unwrap();
+        assert_eq!(hash, daemon_vhc_proto::blake3_hash(b"sealed-object"));
+        assert_eq!(store.get_content(&hash).await.unwrap(), b"sealed-object");
+        // Idempotent re-put returns the same address.
+        assert_eq!(store.put_content(b"sealed-object").await.unwrap(), hash);
+        // A miss is typed, never empty bytes.
+        let absent = ContentHash([0xEE; 32]);
+        assert!(matches!(
+            store.get_content(&absent).await,
+            Err(VhcNetError::PayloadMiss(_))
+        ));
+    }
 }
