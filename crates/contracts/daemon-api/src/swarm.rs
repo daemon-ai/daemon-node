@@ -169,7 +169,7 @@ pub struct SwarmRunSummary {
     /// The last-known round the node observed for the run.
     pub last_round: u64,
     // -- D0 additive run-identity + sunset-observability fields (envelope v2; decisions D1/D5).
-    // The node decides, the app renders (never re-derives): these mirror the swarm.db M2
+    // The node decides, the app renders (never re-derives): these mirror the vhc.db M2
     // columns. All optional — absent on pre-D0 nodes and for fields a v1 run never acquires.
     /// The cryptographic `RunId` — lowercase hex of the 32-byte genesis-envelope hash — once
     /// known (v2 runs; absent for a v1-only run, whose identity is the `run_id` label alone).
