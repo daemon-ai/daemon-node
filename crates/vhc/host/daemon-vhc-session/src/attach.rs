@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use ciborium::value::Value;
 use daemon_vhc_proto::sign::verify_bytes;
 use daemon_vhc_proto::{
-    to_canonical_vec, verify_certified_sender, Hash, PeerId, RunKeyCertificate, Signature,
+    to_canonical_vec, verify_certified_sender, CertScope, Hash, PeerId, RunKeyCertificate,
+    Signature,
 };
 
 /// The verdict on one inbound §12.1 frame.
@@ -239,27 +240,30 @@ impl InboundFrames {
             ));
         }
 
-        // 3b. Certified per-run key (D1, architecture §4.3): when a cert store is configured, the
-        // per-run `sender` key (whose frame signature just verified — the retained A2 check above)
-        // MUST be certified to the trusted base identity for this frame's (run, role, instance,
-        // epoch) scope. An uncertified sender is the signature-downgrade refusal. The `role` and
-        // `instance` are read from the frozen §12.1 envelope fields (read-only — the envelope shape
-        // is untouched).
+        // 3b. Certified per-run key (architecture §4.3): when a cert store is configured, the
+        // per-run `sender` key (whose frame signature just verified — the retained check above)
+        // MUST be certified to the trusted base identity for this frame's full execution-identity
+        // scope (run, epoch, role, instance, module). An uncertified sender is the
+        // signature-downgrade refusal. The scope fields are read from the frozen §12.1 envelope
+        // (read-only — the envelope shape is untouched).
         if let Some(check) = &self.cert_check {
-            let (Some(role), Some(instance)) = (text("role"), uint("instance")) else {
+            let (Some(role), Some(instance), Some(module)) =
+                (text("role"), uint("instance"), bytes32("module"))
+            else {
                 return InboundVerdict::Malformed(
-                    "missing role/instance for the certified-key check".into(),
+                    "missing role/instance/module for the certified-key check".into(),
                 );
             };
-            if let Err(e) = verify_certified_sender(
-                &Hash(run_id),
-                &role,
-                instance,
+            let scope = CertScope {
+                run_id: Hash(run_id),
                 epoch,
-                &PeerId(sender),
-                &check.trusted_base,
-                &check.certs,
-            ) {
+                role,
+                instance,
+                module_hash: Hash(module),
+            };
+            if let Err(e) =
+                verify_certified_sender(&scope, &PeerId(sender), &check.trusted_base, &check.certs)
+            {
                 return InboundVerdict::UncertifiedSender {
                     sender,
                     reason: e.to_string(),

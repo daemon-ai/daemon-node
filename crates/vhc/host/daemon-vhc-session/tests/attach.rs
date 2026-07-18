@@ -9,7 +9,7 @@
 
 use ciborium::value::Value;
 use daemon_vhc_proto::sign::{peer_id, sign_canonical};
-use daemon_vhc_proto::{Hash, RunKeyCertificate, SigningKey};
+use daemon_vhc_proto::{CertScope, Hash, RunKeyCertificate, SigningKey};
 use daemon_vhc_session::attach::{InboundFrames, InboundVerdict};
 
 const RUN: [u8; 32] = [0xA1; 32];
@@ -139,12 +139,22 @@ fn a_frame_from_another_run_scope_is_refused() {
 
 #[test]
 fn certified_sender_delivers_and_an_uncertified_one_is_downgrade_refused() {
-    // The frame builder signs with `key` under scope (RUN, epoch 0, role "trainer", instance 1).
+    // The frame builder signs with `key` under scope (RUN, epoch 0, role "trainer", instance 1,
+    // module all-zero) — the base certifies `key`'s per-run key for exactly that binding.
     let key = SigningKey::from_bytes(&[9; 32]);
     let base = SigningKey::from_bytes(&[7; 32]); // the trusted base machine identity
-                                                 // The base certifies `key`'s per-run key for exactly this scope, epochs 0..=3.
-    let cert = RunKeyCertificate::issue(&base, Hash(RUN), "trainer", 1, 0, 3, peer_id(&key))
-        .expect("issue cert");
+    let cert = RunKeyCertificate::issue(
+        &base,
+        CertScope {
+            run_id: Hash(RUN),
+            epoch: 0,
+            role: "trainer".into(),
+            instance: 1,
+            module_hash: Hash([0; 32]),
+        },
+        peer_id(&key),
+    )
+    .expect("issue cert");
     let mut v = InboundFrames::with_certs(RUN, 0, peer_id(&base), vec![cert]);
 
     // A v2 signer (certified per-run key) is accepted — the cell that should accept it does.

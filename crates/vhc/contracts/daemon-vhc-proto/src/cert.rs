@@ -1,29 +1,34 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Certified per-run keys — the D1 signing-oracle evolution **around** the A2-frozen frame
-//! envelope (architecture §4.3; refactor §8/D1; ABI §12.1).
+//! Certified per-run keys — the signing-oracle evolution **around** the frozen frame
+//! envelope (architecture §4.3; ABI §12.1).
 //!
-//! At admission the host generates a fresh software keypair for the role-instance and signs a
-//! **certificate** with the base machine identity, binding `(genesis hash, role-instance, epoch
-//! validity, per-run public key)`. All run traffic is then signed with the per-run key — that key
-//! is exactly the `sender` field of the A2-frozen §12.1 frame envelope — and peers authenticate it
-//! by verifying this certificate chain back to the base identity.
+//! At admission the host generates a fresh CSPRNG software keypair for the role-instance and
+//! signs a **certificate** with the base machine identity, binding the per-run public key to the
+//! full execution identity `(run_id, epoch, role, incarnation, module_hash)` (ABI §8.1). All run
+//! traffic is then signed with the per-run key — that key is exactly the `sender` field of the
+//! frozen §12.1 frame envelope — and peers authenticate it by verifying this certificate chain
+//! back to a base identity the run's genesis/Authority configuration names.
 //!
 //! **This is additive and lands strictly around the frozen envelope (ABI §12.1):** the certificate
-//! is a *separate distribution record*, never a `frame-envelope` field. D1 MUST NOT add, remove, or
-//! change any frame-envelope field (the fields that give a Phase-A sequence its evidentiary meaning
-//! are frozen at A2). The **old verifier is retained**: a receiver still verifies the frame
-//! signature over `sender` exactly as A2 did ([`crate::sign::verify_bytes`] /
-//! `daemon-vhc-session::attach`); the certificate check is an *additional* layer that
-//! authenticates the `sender` per-run key to the base identity. A receiver that holds no cert store
-//! keeps the A2 behavior unchanged (the transition path).
+//! is a *separate distribution record*, never a `frame-envelope` field. The certificate layer MUST
+//! NOT add, remove, or change any frame-envelope field. The frame verifier is retained: a receiver
+//! still verifies the frame signature over `sender` exactly as before
+//! ([`crate::sign::verify_bytes`] / `daemon-vhc-session::attach`); the certificate check is an
+//! *additional* layer that authenticates the `sender` per-run key to the base identity.
+//!
+//! **Epoch binding and rotation.** A certificate binds ONE epoch. An epoch change (a committed
+//! module upgrade) REBINDS the same per-run key by issuing a new certificate for the new epoch —
+//! journal identity stays stable across the fence. Full key rotation happens only on incarnation
+//! change: a new incarnation generates a fresh key and receives a fresh certificate, and
+//! incarnation monotonicity supersedes every prior incarnation for the role slot.
 //!
 //! Why this shape (architecture §4.3): it scopes every signature to one run — meaningless in any
-//! other run, role, daemon service, or protocol version (the domain tag + `run_id` bind it);
-//! it works with hardware-backed, non-exportable base identity keys (the base key is touched
-//! **once per run** to issue the cert, not per frame); and it yields rotation and expiry for free
-//! via the certificate's epoch validity window.
+//! other run, role, epoch, incarnation, module, daemon service, or protocol version (the domain
+//! tag + the scope fields bind it); it works with hardware-backed, non-exportable base identity
+//! keys (the base key is touched **once per binding** to issue the cert, not per frame); and
+//! expiry is structural — a certificate dies with its epoch/incarnation, never by wall clock.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,22 +41,31 @@ use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
 /// be replayed as a frame signature or vice versa.
 pub const CERT_DOMAIN_V2: &str = "daemon-vhc/cert/2";
 
+/// The scope a run-key certificate binds a per-run key to: the full ABI §8.1 execution identity.
+/// Every field is part of the signed preimage; verification compares all of them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertScope {
+    /// The run's cryptographic identity: the genesis-envelope hash (ABI §8.1 `run_id`).
+    pub run_id: Hash,
+    /// The transition-chain epoch this binding is valid for. An epoch change reissues the
+    /// certificate (same key, new binding); a certificate never spans epochs.
+    pub epoch: u64,
+    /// The envelope-level role label this per-run key acts as.
+    pub role: String,
+    /// The never-reused monotonic role-instance incarnation id (ABI §8.1 `instance`).
+    pub instance: u64,
+    /// The pinned module blob the role-instance runs at this epoch (ABI §8.1 `module_hash`).
+    pub module_hash: Hash,
+}
+
 /// The signed body of a run-key certificate: the binding the base identity attests to. Every field
 /// is part of the signed preimage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunKeyCertBody {
     /// Domain-separation tag — MUST be [`CERT_DOMAIN_V2`].
     pub domain: String,
-    /// The run's cryptographic identity: the genesis-envelope hash (ABI §8.1 `run_id`).
-    pub run_id: Hash,
-    /// The envelope-level role label this per-run key acts as.
-    pub role: String,
-    /// The never-reused monotonic role-instance incarnation id (ABI §8.1 `instance`).
-    pub instance: u64,
-    /// First epoch (inclusive) the certificate is valid for.
-    pub epoch_from: u64,
-    /// Last epoch (inclusive) the certificate is valid for — expiry for free (architecture §4.3).
-    pub epoch_to: u64,
+    /// The full execution-identity scope this certificate binds.
+    pub scope: CertScope,
     /// The certified **per-run public key** — this is exactly the §12.1 frame envelope `sender`.
     pub run_key: PeerId,
 }
@@ -70,7 +84,7 @@ pub struct RunKeyCertificate {
 
 /// Why a certificate (or a certified-sender check) was rejected. Distinguished so the
 /// signature-downgrade matrix can assert *which* guard fired (a certified-sender acceptance vs a
-/// scope/expiry/chain refusal).
+/// scope/epoch/module/chain refusal).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CertError {
@@ -83,15 +97,17 @@ pub enum CertError {
     BadChain,
     /// The certificate's `run_id`/`role`/`instance` scope does not match the frame's scope.
     ScopeMismatch,
-    /// The frame's epoch is outside the certificate's `[epoch_from, epoch_to]` validity window.
-    Expired {
+    /// The frame's epoch is not the single epoch the certificate binds. An epoch change reissues
+    /// the certificate; a stale-epoch certificate never authenticates the new epoch's frames.
+    EpochMismatch {
         /// The frame epoch checked.
         epoch: u64,
-        /// The certificate's inclusive lower bound.
-        from: u64,
-        /// The certificate's inclusive upper bound.
-        to: u64,
+        /// The one epoch the certificate binds.
+        bound: u64,
     },
+    /// The frame's `module` is not the module hash the certificate binds — a per-run key certified
+    /// for one module blob never authenticates traffic attributed to another.
+    ModuleMismatch,
     /// The certified `run_key` is not the frame's `sender` — a per-run key with no matching cert
     /// (the downgrade case: an uncertified signer presenting under a cert that is not its own).
     SenderNotCertified,
@@ -110,11 +126,15 @@ impl core::fmt::Display for CertError {
                 "certificate signature does not verify to the base identity"
             ),
             Self::ScopeMismatch => write!(f, "certificate scope does not match the frame scope"),
-            Self::Expired { epoch, from, to } => {
+            Self::EpochMismatch { epoch, bound } => {
                 write!(
                     f,
-                    "frame epoch {epoch} outside certificate validity [{from}, {to}]"
+                    "frame epoch {epoch} is not the certificate's bound epoch {bound} \
+                     (an epoch change reissues the certificate)"
                 )
+            }
+            Self::ModuleMismatch => {
+                write!(f, "certificate module hash does not match the frame module")
             }
             Self::SenderNotCertified => {
                 write!(f, "frame sender is not the certificate's certified run key")
@@ -139,28 +159,20 @@ impl From<CertError> for VhcProtoError {
 
 impl RunKeyCertificate {
     /// Issue a certificate: the base machine identity `base_key` attests that `run_key` is the
-    /// per-run key for `(run_id, role, instance)` valid over epochs `[epoch_from, epoch_to]`. The
-    /// base key is touched exactly here (once per run), never per frame (architecture §4.3).
+    /// per-run key for the execution-identity `scope`. The base key is touched exactly here (once
+    /// per binding; an epoch change re-issues with the same `run_key`), never per frame
+    /// (architecture §4.3).
     ///
     /// # Errors
     /// A signing failure (canonical-CBOR encode / ed25519), surfaced as [`VhcProtoError`].
-    #[allow(clippy::too_many_arguments)]
     pub fn issue(
         base_key: &SigningKey,
-        run_id: Hash,
-        role: impl Into<String>,
-        instance: u64,
-        epoch_from: u64,
-        epoch_to: u64,
+        scope: CertScope,
         run_key: PeerId,
     ) -> Result<Self, VhcProtoError> {
         let body = RunKeyCertBody {
             domain: CERT_DOMAIN_V2.to_string(),
-            run_id,
-            role: role.into(),
-            instance,
-            epoch_from,
-            epoch_to,
+            scope,
             run_key,
         };
         let sig = sign_canonical(base_key, &body)?;
@@ -172,8 +184,8 @@ impl RunKeyCertificate {
     }
 
     /// Verify the certificate **chain only**: the domain tag is [`CERT_DOMAIN_V2`] and the base
-    /// identity's signature over the body verifies (`verify_strict`). This does not check scope or
-    /// expiry — see [`RunKeyCertificate::authorizes_sender`].
+    /// identity's signature over the body verifies (`verify_strict`). This does not check scope —
+    /// see [`RunKeyCertificate::authorizes_sender`].
     ///
     /// # Errors
     /// [`CertError::WrongDomain`] or [`CertError::BadChain`].
@@ -187,43 +199,38 @@ impl RunKeyCertificate {
             .map_err(|_| CertError::BadChain)
     }
 
-    /// Whether this certificate's scope matches `(run_id, role, instance)` and its validity window
-    /// includes `epoch`. Chain-independent (call [`RunKeyCertificate::verify_chain`] too).
+    /// Whether this certificate's binding matches `scope` exactly (all five execution-identity
+    /// fields). Chain-independent (call [`RunKeyCertificate::verify_chain`] too).
     #[must_use]
-    pub fn covers(&self, run_id: &Hash, role: &str, instance: u64, epoch: u64) -> bool {
-        self.body.run_id == *run_id
-            && self.body.role == role
-            && self.body.instance == instance
-            && epoch >= self.body.epoch_from
-            && epoch <= self.body.epoch_to
+    pub fn covers(&self, scope: &CertScope) -> bool {
+        self.body.scope == *scope
     }
 
-    /// The full certified-sender check for one frame: the chain verifies, the scope matches, the
-    /// epoch is in-window, and the certified `run_key` **is** the frame's `sender`. This is what
-    /// authenticates a "v2 signer" (a certified per-run key) — and what refuses a downgraded /
-    /// uncertified sender.
+    /// The full certified-sender check for one frame: the chain verifies, the scope matches field
+    /// by field (run, role, incarnation, then the bound epoch, then the bound module), and the
+    /// certified `run_key` **is** the frame's `sender`. This is what authenticates a certified
+    /// per-run key — and what refuses a downgraded / uncertified sender.
     ///
     /// # Errors
-    /// The applicable [`CertError`] (wrong domain, bad chain, scope mismatch, expired, or
-    /// sender-not-certified).
-    pub fn authorizes_sender(
-        &self,
-        run_id: &Hash,
-        role: &str,
-        instance: u64,
-        epoch: u64,
-        sender: &PeerId,
-    ) -> Result<(), CertError> {
+    /// The applicable [`CertError`] (wrong domain, bad chain, scope mismatch, epoch mismatch,
+    /// module mismatch, or sender-not-certified).
+    pub fn authorizes_sender(&self, scope: &CertScope, sender: &PeerId) -> Result<(), CertError> {
         self.verify_chain()?;
-        if self.body.run_id != *run_id || self.body.role != role || self.body.instance != instance {
+        let bound = &self.body.scope;
+        if bound.run_id != scope.run_id
+            || bound.role != scope.role
+            || bound.instance != scope.instance
+        {
             return Err(CertError::ScopeMismatch);
         }
-        if epoch < self.body.epoch_from || epoch > self.body.epoch_to {
-            return Err(CertError::Expired {
-                epoch,
-                from: self.body.epoch_from,
-                to: self.body.epoch_to,
+        if bound.epoch != scope.epoch {
+            return Err(CertError::EpochMismatch {
+                epoch: scope.epoch,
+                bound: bound.epoch,
             });
+        }
+        if bound.module_hash != scope.module_hash {
+            return Err(CertError::ModuleMismatch);
         }
         if self.body.run_key != *sender {
             return Err(CertError::SenderNotCertified);
@@ -234,21 +241,17 @@ impl RunKeyCertificate {
 
 /// Authenticate a frame's `sender` per-run key against a set of certificates, trusting only
 /// certificates chained to `trusted_base` (the base machine identity a peer is willing to accept a
-/// per-run key from — e.g. the coordinator's or a rostered worker's base identity, distributed via
-/// the genesis / a join record). Returns `Ok` on the first certificate that
-/// [`RunKeyCertificate::authorizes_sender`] accepts.
+/// per-run key from — named by the run's genesis/Authority configuration, never ambient config).
+/// Returns `Ok` on the first certificate that [`RunKeyCertificate::authorizes_sender`] accepts.
 ///
-/// This is the D1 cert-aware acceptance that layers **around** the A2 frame-signature check (the
-/// old verifier): the caller must have already verified the frame signature over `sender`; this
-/// establishes that `sender` is a legitimately certified per-run key for the frame's scope/epoch.
+/// This is the cert-aware acceptance that layers **around** the frame-signature check (the
+/// retained verifier): the caller must have already verified the frame signature over `sender`;
+/// this establishes that `sender` is a legitimately certified per-run key for the frame's scope.
 ///
 /// # Errors
 /// [`CertError::NoCertifiedChain`] if no trusted certificate authenticates the sender.
 pub fn verify_certified_sender(
-    run_id: &Hash,
-    role: &str,
-    instance: u64,
-    epoch: u64,
+    scope: &CertScope,
     sender: &PeerId,
     trusted_base: &PeerId,
     certs: &[RunKeyCertificate],
@@ -257,10 +260,7 @@ pub fn verify_certified_sender(
         if cert.base_identity != *trusted_base {
             continue;
         }
-        if cert
-            .authorizes_sender(run_id, role, instance, epoch, sender)
-            .is_ok()
-        {
+        if cert.authorizes_sender(scope, sender).is_ok() {
             return Ok(());
         }
     }
@@ -280,36 +280,45 @@ mod tests {
         Hash([n; 32])
     }
 
-    fn issue(
-        base: &SigningKey,
-        run: Hash,
-        role: &str,
-        inst: u64,
-        from: u64,
-        to: u64,
-        run_key: PeerId,
-    ) -> RunKeyCertificate {
-        RunKeyCertificate::issue(base, run, role, inst, from, to, run_key).unwrap()
+    fn module(n: u8) -> Hash {
+        Hash([n; 32])
+    }
+
+    fn scope(run: Hash, role: &str, inst: u64, epoch: u64, module_hash: Hash) -> CertScope {
+        CertScope {
+            run_id: run,
+            epoch,
+            role: role.to_string(),
+            instance: inst,
+            module_hash,
+        }
+    }
+
+    fn issue(base: &SigningKey, s: CertScope, run_key: PeerId) -> RunKeyCertificate {
+        RunKeyCertificate::issue(base, s, run_key).unwrap()
     }
 
     #[test]
     fn a_certified_per_run_key_authenticates_to_its_base_identity() {
         let base = key(1);
         let run_key = peer_id(&key(2));
-        let cert = issue(&base, run_id(9), "trainer", 7, 0, 5, run_key);
+        let s = scope(run_id(9), "trainer", 7, 3, module(0xAA));
+        let cert = issue(&base, s.clone(), run_key);
         assert!(cert.verify_chain().is_ok());
-        // The certified sender at an in-window epoch is authenticated.
-        assert!(cert
-            .authorizes_sender(&run_id(9), "trainer", 7, 3, &run_key)
-            .is_ok());
+        // The certified sender at the bound scope is authenticated.
+        assert!(cert.authorizes_sender(&s, &run_key).is_ok());
     }
 
     #[test]
     fn a_tampered_certificate_breaks_the_chain() {
         let base = key(1);
         let run_key = peer_id(&key(2));
-        let mut cert = issue(&base, run_id(9), "trainer", 7, 0, 5, run_key);
-        cert.body.instance = 8; // re-scope without re-signing
+        let mut cert = issue(
+            &base,
+            scope(run_id(9), "trainer", 7, 0, module(0xAA)),
+            run_key,
+        );
+        cert.body.scope.instance = 8; // re-scope without re-signing
         assert_eq!(cert.verify_chain(), Err(CertError::BadChain));
     }
 
@@ -317,7 +326,11 @@ mod tests {
     fn wrong_domain_is_rejected() {
         let base = key(1);
         let run_key = peer_id(&key(2));
-        let mut cert = issue(&base, run_id(9), "trainer", 7, 0, 5, run_key);
+        let mut cert = issue(
+            &base,
+            scope(run_id(9), "trainer", 7, 0, module(0xAA)),
+            run_key,
+        );
         cert.body.domain = "daemon-vhc/frame/2".into(); // a frame tag, not a cert tag
         assert!(matches!(
             cert.verify_chain(),
@@ -327,85 +340,91 @@ mod tests {
 
     // -- the signature-downgrade matrix (tier-1) ---------------------------------------------------
     //
-    // "a v2 signer is refused by no cell that should accept it, and vice versa": a certified per-run
-    // key is accepted for exactly its (run, role, instance, epoch-window) and refused everywhere
-    // else; an uncertified / downgraded sender is refused.
+    // "a certified signer is refused by no cell that should accept it, and vice versa": a certified
+    // per-run key is accepted for exactly its (run, epoch, role, incarnation, module) binding and
+    // refused everywhere else; an uncertified / downgraded sender is refused.
 
     #[test]
     fn downgrade_uncertified_sender_is_refused_certified_sender_is_accepted() {
         let coord_base = key(10);
         let coord_run_key = peer_id(&key(11));
-        let cert = issue(
-            &coord_base,
-            run_id(1),
-            "coordinator",
-            1,
-            0,
-            10,
-            coord_run_key,
-        );
+        let s = scope(run_id(1), "coordinator", 1, 4, module(0xCC));
+        let cert = issue(&coord_base, s.clone(), coord_run_key);
         let store = [cert];
         let base_id = peer_id(&coord_base);
 
-        // ACCEPT: the certified per-run key, in-scope and in-window.
-        assert!(verify_certified_sender(
-            &run_id(1),
-            "coordinator",
-            1,
-            4,
-            &coord_run_key,
-            &base_id,
-            &store
-        )
-        .is_ok());
+        // ACCEPT: the certified per-run key, at exactly its bound scope.
+        assert!(verify_certified_sender(&s, &coord_run_key, &base_id, &store).is_ok());
 
         // REFUSE (downgrade): a different, uncertified key presenting on the same scope.
         let impostor = peer_id(&key(99));
         assert_eq!(
-            verify_certified_sender(&run_id(1), "coordinator", 1, 4, &impostor, &base_id, &store),
+            verify_certified_sender(&s, &impostor, &base_id, &store),
             Err(CertError::NoCertifiedChain)
         );
     }
 
     #[test]
-    fn certified_sender_is_refused_out_of_scope_and_out_of_window() {
+    fn certified_sender_is_refused_out_of_scope_epoch_and_module() {
         let base = key(10);
         let run_key = peer_id(&key(11));
-        let cert = issue(&base, run_id(1), "coordinator", 1, 2, 6, run_key);
+        let bound = scope(run_id(1), "coordinator", 1, 4, module(0xCC));
+        let cert = issue(&base, bound.clone(), run_key);
         let base_id = peer_id(&base);
         let store = [cert.clone()];
 
         // Wrong run.
         assert_eq!(
-            verify_certified_sender(&run_id(2), "coordinator", 1, 4, &run_key, &base_id, &store),
+            verify_certified_sender(
+                &scope(run_id(2), "coordinator", 1, 4, module(0xCC)),
+                &run_key,
+                &base_id,
+                &store
+            ),
             Err(CertError::NoCertifiedChain)
         );
         // Wrong role.
         assert_eq!(
-            verify_certified_sender(&run_id(1), "trainer", 1, 4, &run_key, &base_id, &store),
+            verify_certified_sender(
+                &scope(run_id(1), "trainer", 1, 4, module(0xCC)),
+                &run_key,
+                &base_id,
+                &store
+            ),
             Err(CertError::NoCertifiedChain)
         );
         // Wrong incarnation.
         assert_eq!(
-            verify_certified_sender(&run_id(1), "coordinator", 2, 4, &run_key, &base_id, &store),
+            verify_certified_sender(
+                &scope(run_id(1), "coordinator", 2, 4, module(0xCC)),
+                &run_key,
+                &base_id,
+                &store
+            ),
             Err(CertError::NoCertifiedChain)
         );
-        // Below and above the validity window.
+        // A stale (or future) epoch: the binding is per-epoch; a change reissues the cert.
         assert_eq!(
-            cert.authorizes_sender(&run_id(1), "coordinator", 1, 1, &run_key),
-            Err(CertError::Expired {
-                epoch: 1,
-                from: 2,
-                to: 6
-            })
+            cert.authorizes_sender(
+                &scope(run_id(1), "coordinator", 1, 5, module(0xCC)),
+                &run_key
+            ),
+            Err(CertError::EpochMismatch { epoch: 5, bound: 4 })
         );
         assert_eq!(
-            cert.authorizes_sender(&run_id(1), "coordinator", 1, 7, &run_key),
-            Err(CertError::Expired {
-                epoch: 7,
-                from: 2,
-                to: 6
-            })
+            cert.authorizes_sender(
+                &scope(run_id(1), "coordinator", 1, 3, module(0xCC)),
+                &run_key
+            ),
+            Err(CertError::EpochMismatch { epoch: 3, bound: 4 })
+        );
+        // A different module blob: the key is certified for one pinned module only.
+        assert_eq!(
+            cert.authorizes_sender(
+                &scope(run_id(1), "coordinator", 1, 4, module(0xDD)),
+                &run_key
+            ),
+            Err(CertError::ModuleMismatch)
         );
     }
 
@@ -416,36 +435,41 @@ mod tests {
         // *expected* base identity, not merely at *some* base identity.
         let attacker_base = key(50);
         let attacker_run_key = peer_id(&key(51));
-        let cert = issue(
-            &attacker_base,
-            run_id(1),
-            "coordinator",
-            1,
-            0,
-            10,
-            attacker_run_key,
-        );
+        let s = scope(run_id(1), "coordinator", 1, 4, module(0xCC));
+        let cert = issue(&attacker_base, s.clone(), attacker_run_key);
         let store = [cert];
         let trusted_base = peer_id(&key(10)); // the honest coordinator base, NOT the attacker's
         assert_eq!(
-            verify_certified_sender(
-                &run_id(1),
-                "coordinator",
-                1,
-                4,
-                &attacker_run_key,
-                &trusted_base,
-                &store
-            ),
+            verify_certified_sender(&s, &attacker_run_key, &trusted_base, &store),
             Err(CertError::NoCertifiedChain)
         );
+    }
+
+    #[test]
+    fn an_epoch_change_rebinds_the_same_key_with_a_new_certificate() {
+        // Rotation policy: an epoch change REBINDS the same per-run key (journal identity stays
+        // stable); only an incarnation change rotates the key itself.
+        let base = key(1);
+        let run_key = peer_id(&key(2));
+        let epoch0 = scope(run_id(9), "trainer", 7, 0, module(0xAA));
+        let epoch1 = scope(run_id(9), "trainer", 7, 1, module(0xBB));
+        let cert0 = issue(&base, epoch0.clone(), run_key);
+        let cert1 = issue(&base, epoch1.clone(), run_key);
+        let base_id = peer_id(&base);
+        let store = [cert0, cert1];
+        assert!(verify_certified_sender(&epoch0, &run_key, &base_id, &store).is_ok());
+        assert!(verify_certified_sender(&epoch1, &run_key, &base_id, &store).is_ok());
     }
 
     #[test]
     fn certificate_round_trips_through_canonical_cbor() {
         let base = key(1);
         let run_key = peer_id(&key(2));
-        let cert = issue(&base, run_id(9), "trainer", 7, 0, 5, run_key);
+        let cert = issue(
+            &base,
+            scope(run_id(9), "trainer", 7, 5, module(0xAB)),
+            run_key,
+        );
         let bytes = crate::canonical::to_canonical_vec(&cert).unwrap();
         let back: RunKeyCertificate = crate::canonical::from_canonical_slice(&bytes).unwrap();
         assert_eq!(cert, back);

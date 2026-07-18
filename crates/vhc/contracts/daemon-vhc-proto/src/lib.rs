@@ -45,7 +45,8 @@ pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use capability::{Capability, CapabilitySet};
 pub use cert::{
-    verify_certified_sender, CertError, RunKeyCertBody, RunKeyCertificate, CERT_DOMAIN_V2,
+    verify_certified_sender, CertError, CertScope, RunKeyCertBody, RunKeyCertificate,
+    CERT_DOMAIN_V2,
 };
 pub use crypto::{
     hash as crypto_hash, verify_sig, VerifyOutcome, HASH_LEN, VERIFY_PUBLIC_KEY_LEN,
