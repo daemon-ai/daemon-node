@@ -760,8 +760,8 @@ mod tests {
         handle.shutdown().await;
     }
 
-    /// Observe while **idle** folds context into the conversation but drives NO turn (W3 spike,
-    /// event-io §5.9): the notification seam for host-originated input must therefore use
+    /// Observe while **idle** folds context into the conversation but drives NO turn
+    /// (event-io §5.9): the notification seam for host-originated input must therefore use
     /// `StartTurn` — an `Observe`d process-exit note would sit unseen until the user next speaks.
     #[tokio::test]
     async fn observe_when_idle_folds_context_but_opens_no_turn() {
