@@ -416,6 +416,14 @@ Enumerated commit points — a consensus round either commits or rolls back resi
 
 - **[SV-6]** Implementations MUST keep a backup residual committed only when the full round (all phases of the collective) succeeds, reloaded otherwise — the production-validated pattern [10]. The churn drill (§13.4, E4) injects failures at each numbered point and verifies exactly-once behavior.
 
+### 9.5 Domain-separation strings
+
+Every blake3/signature domain-separation input in the subsystem is a named constant in the registry module `daemon_vhc_proto::domains`, of the form `daemon-vhc/<domain>/<semver>` with a full SemVer 2.0 version; fresh domains start at `1.0.0`.
+
+- **[SV-7]** A domain string is an *identity*, not an API: every byte is derivation-affecting, and any change to the derivation scheme behind a tag (input layout, hash construction, output meaning) is a MAJOR bump — the old string keeps naming the old scheme forever, and the new scheme gets a new string. This is the concrete form P-5 takes for hash/signature separation: mismatched domains produce unrelated outputs by construction, never subtly wrong ones.
+- **[SV-8]** Inline domain literals at call sites are forbidden; every derivation references a registry constant. Registry tests pin the format and the pairwise distinctness of all entries.
+- **[SV-9]** The ABI-major-anchored wire domains (`daemon-vhc/frame/2`, `daemon-vhc/cert/2`, `daemon-vhc/upgrade/2`, `daemon-vhc/rng/2`) are deliberately outside the registry: their trailing number is the `da_abi` major — a wire-contract identifier specified in the module-ABI spec — not a registry SemVer, and they live beside their contracts.
+
 ---
 
 ## 10. Assurance plane
