@@ -467,7 +467,7 @@ transcript-block = transcript-block-message
 
 journal-record-payload-management = { "Management": { "detail": tstr } }
 journal-record-payload-block = { "Block": { "block": transcript-block } }
-; wire v37: the richer ChatMessage representation on the conversation-history surface (W2-E).
+; wire v37: the richer ChatMessage representation on the conversation-history surface.
 message-attachment = {
   "id": tstr,
   ? "content_type": (tstr / null),
@@ -1265,7 +1265,7 @@ presence-primitive-t = "Offline"
                      / "Streaming"
                      / "OutOfOffice"
 presence = { "primitive": presence-primitive-t, ? "message": (tstr / null), ? "emoji": (tstr / null), ? "mobile": bool, ? "idle_since": (uint64 / null) }
-; saved-presence (W2-F; wire v37): a named, reusable presence. `id`+`primitive` are required; the
+; saved-presence (wire v37): a named, reusable presence. `id`+`primitive` are required; the
 ; rest mirror serde `#[serde(default)]` (present-null / present / absent all accepted).
 saved-presence = { "id": tstr, ? "name": (tstr / null), "primitive": presence-primitive-t, ? "message": (tstr / null), ? "emoji": (tstr / null), ? "last_used": (uint64 / null), ? "use_count": uint64 }
 contact-permission = "Unset"
@@ -1608,14 +1608,14 @@ request-notification-list = "NotificationList"
 ; the deferred bump). null/absent = the full list.
 request-person-list = { "PersonList": { ? "since_rev": (uint64 / null) } }
 
-; ----- saved presences (W2-F; wire v37) -----
+; ----- saved presences (wire v37) -----
 request-presence-list = "PresenceList"
 request-presence-save = { "PresenceSave": { "presence": saved-presence } }
 request-presence-delete = { "PresenceDelete": { "id": tstr } }
 request-presence-set-active = { "PresenceSetActive": { "id": tstr } }
 
-; ----- file transfer (W2-H; wire v37) -----
-; FileTransfer (<- PurpleFileTransfer). "name"+"blob" are the Wave-1 shape; the rest are additive
+; ----- file transfer (wire v37) -----
+; FileTransfer (<- PurpleFileTransfer). "name"+"blob" are the original required shape; the rest are additive
 ; #[serde(default)] fields (present-and-typed by serde; optional here). direction/state are
 ; serde-external unit-variant strings.
 ; `-t` suffixes avoid the zcbor coder-name clash with the map members `direction`/`state`.
@@ -1990,7 +1990,7 @@ response-feedback-ack = { "FeedbackAck": feedback-ack }
 response-telemetry-consent = { "TelemetryConsent": { "enabled": bool } }
 ; wire v41: the crash-reporting consent reply (echoes the current/new state).
 response-crash-consent = { "CrashConsent": { "enabled": bool } }
-; ----- saved presences (W2-F; wire v37) -----
+; ----- saved presences (wire v37) -----
 response-saved-presences = { "SavedPresences": [* saved-presence] }
 
 ; wire v37: the node's live notification list, newest first.
