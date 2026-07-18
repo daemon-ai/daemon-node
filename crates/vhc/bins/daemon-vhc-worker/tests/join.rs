@@ -432,6 +432,7 @@ async fn worker_joins_and_runs_rounds_under_the_coordinator() {
                 ingested,
                 stalled,
                 digest,
+                ..
             } => {
                 assert_eq!(round, 1, "two rounds ran (0 and 1)");
                 assert_eq!((committed, ingested, stalled), (1, 1, false));

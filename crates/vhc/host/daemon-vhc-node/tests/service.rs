@@ -240,6 +240,7 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
             phase: "RoundTrain".into(),
             epoch: 1,
             round: 5,
+            generation: 1,
         })
         .unwrap();
     assert!(matches!(
@@ -255,6 +256,7 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
             up_bytes: 100,
             down_bytes: 200,
             peers: 3,
+            generation: 1,
         })
         .unwrap();
     assert!(matches!(
@@ -272,6 +274,7 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
         ingested: 3,
         stalled: false,
         digest: [0u8; 16],
+        generation: 1,
     })
     .unwrap();
 
@@ -348,6 +351,7 @@ async fn checkpoint_published_yields_contribution_event_and_credit() {
         phase: "witness".into(),
         epoch: 0,
         round: 1,
+        generation: 1,
     })
     .unwrap();
     let outs = svc
@@ -355,6 +359,7 @@ async fn checkpoint_published_yields_contribution_event_and_credit() {
             round: 1,
             hash: "abc".into(),
             location: "r2://x".into(),
+            generation: 1,
         })
         .unwrap();
     // CheckpointPublished emits a Contribution event carrying the fresh totals (1 credit).

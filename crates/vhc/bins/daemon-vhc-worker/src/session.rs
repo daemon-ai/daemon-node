@@ -397,6 +397,7 @@ pub(crate) async fn join_and_run(
             phase: "train".to_string(),
             epoch: 0,
             round: 0,
+            generation: RUN_INSTANCE,
         },
     )
     .await;
@@ -620,6 +621,7 @@ pub(crate) async fn join_and_run(
             ingested: 1,
             stalled: false,
             digest: last_digest,
+            generation: RUN_INSTANCE,
         },
     )
     .await;
