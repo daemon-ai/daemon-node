@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! W1-A conformance: the [`assert_ops_match_behavior`] invariant against the real `RoomsAdapter`.
+//! Adapter ops<->behavior conformance: the [`assert_ops_match_behavior`] invariant against the real `RoomsAdapter`.
 //!
 //! The internal loopback transport is store-backed (no network), so it is constructed fully
 //! hermetically over an in-memory `SqliteStore` with no node lifecycle sink (chat journaling is a

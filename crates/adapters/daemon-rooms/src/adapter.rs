@@ -367,7 +367,7 @@ pub struct RoomsAdapter {
     /// the roster is purely local process state (unlike rooms/membership, which persist to the store);
     /// the host paginates + emits `ContactsChanged` centrally.
     roster: Mutex<HashMap<TransportId, HashMap<String, ContactInfo>>>,
-    /// The node content store, for the loopback [`SupportsFileTransfer`] (W2-H). When present, file
+    /// The node content store, for the loopback [`SupportsFileTransfer`]. When present, file
     /// transfer round-trips bytes through the content-addressed blob store (send verifies the blob
     /// resolves; receive fetches it — a same-node loopback). `None` ⟹ the feature is absent
     /// (`file_transfer()` returns `None`), keeping `assert_ops_match_behavior` honest.
@@ -388,7 +388,7 @@ impl RoomsAdapter {
     }
 
     /// Like [`new`](Self::new), but wires the node content store so the loopback
-    /// [`SupportsFileTransfer`] (W2-H) is advertised + operable.
+    /// [`SupportsFileTransfer`] is advertised + operable.
     pub fn with_blobs(
         store: Arc<dyn SessionStore>,
         cfg: RoomsConfig,
@@ -623,7 +623,7 @@ impl MessagingProtocol for RoomsAdapter {
     }
 
     fn file_transfer(self: Arc<Self>) -> Option<Arc<dyn SupportsFileTransfer>> {
-        // The feature exists only when the node content store is wired (W2-H). Absent ⟹ `None`, so
+        // The feature exists only when the node content store is wired. Absent ⟹ `None`, so
         // the ops-vs-behavior invariant sees no advertised (yet unimplemented) file-transfer verbs.
         if self.blobs.is_some() {
             Some(self)
