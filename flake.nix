@@ -906,7 +906,7 @@
         # (WS control plane + iroh gossip) so it live-attaches to the dev coordinator as a real
         # heterogeneity peer at the P2 WAN gate. Deployed to the RTX-5090 box (never build on-box).
         #
-        # UNBLOCKED by the Wave-3 daemon-telemetry fix (swarm-p2-ledger adjudication (f)): the
+        # UNBLOCKED by the daemon-telemetry cross-build fix (swarm-p2-ledger adjudication (f)): the
         # always-on `sentry-rust-minidump` → `crash-handler` native-minidump path (UCRT
         # `_invoke_watson`, unresolved by mingw-w64's msvcrt import lib) is now cfg-compiled OUT for
         # `x86_64-pc-windows-gnu` (target-gated dep + `#[cfg]` in `daemon-telemetry/crash.rs`), so the
@@ -1247,7 +1247,7 @@
             # runtime. The Vulkan SDK pieces on `packages` also let a from-source `--features vulkan`
             # build work here (it just recompiles llama.cpp via the crate's cmake path).
             #
-            # This is ALSO the vhc burn-wgpu GPU training test lane (spec §10.1; G2, Wave 2): the
+            # This is ALSO the vhc burn-wgpu GPU training test lane (spec §10.1): the
             # Vulkan loader above resolves the RADV ICD for `cargo test -p daemon-vhc-host --features
             # wgpu` (burn-wgpu -> cubecl -> wgpu 29 over Vulkan). It uses `craneLibDev` (not
             # `craneLib`) so the wasm32-unknown-unknown rust-std is on the toolchain — the daemon-vhc-host

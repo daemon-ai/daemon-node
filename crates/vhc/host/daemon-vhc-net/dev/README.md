@@ -12,7 +12,7 @@ nix develop --command crates/vhc/host/daemon-vhc-net/dev/run-relay.sh        # h
 IROH_RELAY_PORT=4455 nix develop --command crates/vhc/host/daemon-vhc-net/dev/run-relay.sh
 ```
 
-The devShell ships the `iroh-relay` 1.0 binary (flake Wave-0 lane). Point clients at the printed
+The devShell ships the `iroh-relay` 1.0 binary (flake devShell lane). Point clients at the printed
 relay URL by putting it in `IrohGossipConfig.relay_urls` (or the envelope's transport section):
 
 ```rust
