@@ -50,6 +50,16 @@ pub const GENESIS_SEED_DOMAIN: &[u8] = b"daemon-vhc/genesis-seed/1.0.0";
 /// Domain tag for the gossip-topic derivation: `blake3(domain ++ genesis_hash)` → topic id.
 pub const GOSSIP_TOPIC_DOMAIN: &[u8] = b"daemon-vhc/gossip-topic/1.0.0";
 
+/// Domain-separation tag bound into every coordinator seat-lease preimage (spec §6.3; the
+/// Authority-signed fenced lease). Distinct from the certificate domain so a lease signature can
+/// never be replayed as a certificate or a frame signature, and vice versa.
+pub const SEAT_LEASE_DOMAIN: &str = "daemon-vhc/seat-lease/1.0.0";
+
+/// Domain-separation tag bound into every seat-release preimage (the claimant's signed statement
+/// that it gives the seat up). Distinct from [`SEAT_LEASE_DOMAIN`] so a release signature can
+/// never be replayed as a live lease.
+pub const SEAT_RELEASE_DOMAIN: &str = "daemon-vhc/seat-release/1.0.0";
+
 /// Fixed key seed for the observe replay sandbox's coordinator frame signer (the replay oracle
 /// compares published payloads, never transport signatures, so any fixed seed serves).
 pub const REPLAY_SANDBOX_FRAME_KEY_SEED: &[u8] = b"daemon-vhc/replay-sandbox-frame-key/1.0.0";
@@ -71,6 +81,8 @@ mod tests {
             super::CHECKPOINTER_SALT,
             super::MERKLE_EMPTY_ROOT_LABEL,
             super::CHECKPOINT_ATTESTATION_DOMAIN.as_bytes(),
+            super::SEAT_LEASE_DOMAIN.as_bytes(),
+            super::SEAT_RELEASE_DOMAIN.as_bytes(),
             super::GENESIS_SEED_DOMAIN,
             super::GOSSIP_TOPIC_DOMAIN,
             super::REPLAY_SANDBOX_FRAME_KEY_SEED,
@@ -109,6 +121,8 @@ mod tests {
             super::CHECKPOINTER_SALT,
             super::MERKLE_EMPTY_ROOT_LABEL,
             super::CHECKPOINT_ATTESTATION_DOMAIN.as_bytes(),
+            super::SEAT_LEASE_DOMAIN.as_bytes(),
+            super::SEAT_RELEASE_DOMAIN.as_bytes(),
             super::GENESIS_SEED_DOMAIN,
             super::GOSSIP_TOPIC_DOMAIN,
             super::REPLAY_SANDBOX_FRAME_KEY_SEED,

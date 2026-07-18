@@ -177,6 +177,31 @@ impl EgressRequest {
         }
     }
 
+    /// A raw-body `POST` of `body` — for non-JSON payloads (e.g. canonical CBOR). **No
+    /// `Content-Type` is set here**; set it with [`EgressRequest::header`] when the endpoint
+    /// expects one. The body is retained for method-preserving `307`/`308` redirects, like
+    /// [`EgressRequest::put`].
+    pub fn post(url: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            method: Method::POST,
+            url: url.into(),
+            headers: HeaderMap::new(),
+            body: Some(body),
+        }
+    }
+
+    /// A `DELETE` carrying `body` — for endpoints whose delete semantics require a signed
+    /// statement (e.g. a canonical-CBOR release record). Header rules match
+    /// [`EgressRequest::put`]: nothing is set implicitly.
+    pub fn delete(url: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            method: Method::DELETE,
+            url: url.into(),
+            headers: HeaderMap::new(),
+            body: Some(body),
+        }
+    }
+
     /// Set a header (best-effort: an invalid name/value is ignored). Chainable.
     #[must_use]
     pub fn header(mut self, name: &str, value: &str) -> Self {
