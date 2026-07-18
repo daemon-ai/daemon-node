@@ -273,10 +273,10 @@ impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
     /// [`Committed::mint`] as the fetch+verify+order step).
     ///
     /// The record reached this driver as an **authoritative frame on the declared records channel**
-    /// (ABI §6.2 / §12.1): in the bridge / mixed-fleet cell-6 topology the host signature-verifies
+    /// (ABI §6.2 / §12.1): in the bridge / mixed-fleet retired-native-coordinator topology the host signature-verifies
     /// the coordinator's frame above the pump (`daemon-vhc-session::v2_attach`) before it is
     /// delivered, so authorization is discharged by that host mechanism and expressed here as an
-    /// [`Authorized`] token from the authoritative channel. D2's in-guest wasm coordinator threads a
+    /// [`Authorized`] token from the authoritative channel. D2's in-guest coordinator threads a
     /// real [`daemon_vhc_sdk_consensus::Authority::authorize`] token instead (zero change to the
     /// mint's ordering/verification, so digests are unaffected).
     fn advance(

@@ -442,7 +442,7 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // daemon-vhc-sdk-v2 — runs against the SAME compute@2 runner/driver/journal as the
             // LLaMA reference, exports a trained weight bit-exact vs a native Autodiff<NdArray> run
             // of the identical loop, and replays bit-for-bit (§8.7). No host code is model-specific.
-            "C3 model-agnostic compute@2 (toy-mlp: distinct model, zero host changes, bit-exact + replay)",
+            "model-agnostic compute@2 (toy-mlp: distinct model, zero host changes, bit-exact + replay)",
             &["-p", "daemon-vhc-host", "--test", "toy_mlp"],
         ),
         (
@@ -453,7 +453,7 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // pins the ndarray↔ndarray DEGENERATE case (tolerance 0 — bit-exact — so the harness
             // itself is always exercised); the wgpu cross-backend tier is hardware-gated in the
             // same file.
-            "C3 compute replay (ndarray↔ndarray degenerate: same op-journal, bit-exact re-execution)",
+            "compute replay (ndarray↔ndarray degenerate: same op-journal, bit-exact re-execution)",
             &["-p", "daemon-vhc-host", "--test", "compute_replay"],
         ),
         (
@@ -491,10 +491,10 @@ fn vhc_ci_det() -> anyhow::Result<()> {
         ),
         (
             // The v2-native trainer goldens (retirement plan §3): the compute@2 trainer guest
-            // (`tiny-llama-c3`) reproduces a recorded, content-addressed golden bundle (per-round
+            // (`tiny-llama`) reproduces a recorded, content-addressed golden bundle (per-round
             // det digests, the trainer's own committed payload bytes, the matched-init
             // trained-theta trajectory). This is the SUCCESSOR drift oracle that superseded and
-            // retired the recorded v1 parity oracle (`v2_parity` / `c3_parity` lanes, D-3): the
+            // retired the recorded v1 parity oracle (the retired trainer-parity lanes, D-3): the
             // det lane is an equality class (digests reproduce bit-for-bit through the full
             // wasm32 + CBOR + driver path) and the native lane a tolerance class (theta within
             // the OpClass::Optimizer band), plus the straggle -> catch-up leg (ported from
@@ -580,13 +580,13 @@ fn vhc_ci_t2() -> anyhow::Result<()> {
             // Host-side whole runs over the PRODUCTION blobs: wasmtime + simulated capability
             // providers, journaled end-to-end, re-driven through the §8.7 input-replay engine —
             // every decision reproduced bit-for-bit. Covers the toy_averager whole run, the
-            // compute@2 trainer barrier whole runs under the production wasm coordinator
+            // compute@2 trainer barrier whole runs under the production coordinator
             // (single- and 2-worker with cross-worker agreement over the guest-voiced det
             // digests; SDK-free raw-CBOR config), the adversarial-rig pinned cases (duplicate
             // record deduped; delayed payloads → stall → catch-up), the mixed-fleet matrix
             // cells (the whole-run positive + the envelope-v1 typed negatives), the pump-hold
             // back-pressure rig, and the failover drill.
-            "daemon-vhc-testkit (production-blob whole runs + D2 wasm-coordinator lanes)",
+            "daemon-vhc-testkit (production-blob whole runs + D2 coordinator lanes)",
             &["-p", "daemon-vhc-testkit"],
         ),
         (
@@ -674,7 +674,7 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "daemon-vhc-session",
             "daemon-vhc-sdk-consensus",
             "D2/post-E — the retained RoundEngine's assignment consumption, the shared \
-             coordinator types (CoordinatorState/Input) the wasm-coordinator recording shell \
+             coordinator types (CoordinatorState/Input) the coordinator recording shell \
              authors + captures, and the E1/E3 checkpoint attestation vocabulary (ledger + \
              signed attestations on the engine's typed lane); retires when the engine/harness \
              re-seat onto vhc-sim [normal]",
@@ -691,8 +691,8 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         (
             "daemon-vhc-host",
             "daemon-vhc-sdk-consensus",
-            "the production wasm-coordinator drive seat (host wasm_coordinator module, lifted \
-             from the testkit when the worker join re-seated onto the wasm coordinator): \
+            "the production coordinator drive seat (host coordinator module, lifted \
+             from the testkit when the worker join re-seated onto the coordinator): \
              configuring/authorizing the coordinator blob needs the typed AuthorityConfig \
              decode + authorize, which lives in the consensus SDK layer; narrows to a \
              contracts-crate move if the authority vocabulary ever relocates [normal]",
@@ -712,7 +712,7 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "daemon-vhc-sdk-consensus",
             "genesis-authoring vocabulary for the in-process join suite (authored \
              CoordinatorState role config + AuthorityConfig topology); the runtime native-tick \
-             edge retired when the self-driven join re-seated onto the wasm coordinator — this \
+             edge retired when the self-driven join re-seated onto the coordinator — this \
              remainder writes test fixtures only [dev-dep]",
         ),
     ];

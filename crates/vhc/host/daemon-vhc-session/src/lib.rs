@@ -14,10 +14,10 @@
 //!   in-memory [`Corpus`] the engine reads batches from (§8, §6.3).
 //! - [`backend`] — the [`TrainerBackend`] trait (**the R↔E seam**) and the deterministic
 //!   [`StubBackend`] (§5.1, §10.2, ABI §2.3).
-//! - [`engine`] — Wave-2's [`RoundEngine`]: the peer-side round state machine over the frozen seams
+//! - [`engine`] — the [`RoundEngine`]: the peer-side round state machine over the frozen seams
 //!   (round protocol, barrier I2, record-order staging I3, stall ladder — §6.4).
 //! - [`protocol`] — the worker `Command`/`Event` wire types + CBOR codec (§10.2), which lane E's
-//!   `daemon-vhc-host` worker implements against in Wave 3.
+//!   `daemon-vhc-host` worker implements later.
 //!
 //! Identity/hash types are re-exported from `daemon-vhc-net`'s [`seam`], which (as of Merge 1)
 //! resolves them to the canonical `daemon-vhc-proto` types (blake3 `Hash`, `PeerId`).
@@ -45,24 +45,24 @@ pub mod v2_attach;
 // no wasm TrainerBackend exists — major-2 modules run under the v2 event-loop driver.
 
 /// In-process multi-peer harness + the churn/failure drill machinery, driven by the production
-/// wasm coordinator through the [`wasm_coordinator_shell`] recording drive. Available to external
+/// coordinator through the [`coordinator_shell`] recording drive. Available to external
 /// crates behind the `harness` feature, and to this crate's own tests via `cfg(test)`.
 #[cfg(any(test, feature = "harness"))]
 pub mod harness;
 
-/// The wasm-coordinator replay sandbox: the concrete [`daemon_vhc_observe::CoordinatorSandbox`] the
+/// The coordinator replay sandbox: the concrete [`daemon_vhc_observe::CoordinatorSandbox`] the
 /// replay oracle drives consensus through (consensus re-derives inside the sandboxed
 /// `coordinator-quorum` module, never a native tick). Needs the host runtime + observe, so it lives
 /// behind the `harness` feature (and this crate's own tests).
 #[cfg(any(test, feature = "harness"))]
 pub mod replay_sandbox;
 
-/// The wasm-coordinator recording drive for the in-process whole-run harness: drives the
+/// The coordinator recording drive for the in-process whole-run harness: drives the
 /// production `coordinator-quorum` module (event-driven, one tick per frame) instead of a native
 /// tick, so a recorded run and its `replay` re-derivation share one coordinator substrate.
 /// Behind the `harness` feature (needs the host runtime), and this crate's own tests.
 #[cfg(any(test, feature = "harness"))]
-pub mod wasm_coordinator_shell;
+pub mod coordinator_shell;
 
 // `live_harness` (the iroh live-transport harness driving the v1 WasmBackend over the RoundEngine)
 // RETIRED with the v1 driver at the Phase-E sunset; the loopback `harness` (StubBackend) remains

@@ -5,7 +5,7 @@
 //!
 //! `tick(state, input) -> (state', outputs)` is I/O-free: **time enters as [`Input::Clock`]**, signed
 //! messages as [`Input::Message`], and operator intents as [`Input::Control`]. The coordinator emits
-//! its own messages **unsigned** ([`Output::Publish`]) — the Wave-3 harness signs + broadcasts them,
+//! its own messages **unsigned** ([`Output::Publish`]) — the harness signs + broadcasts them,
 //! keeping `tick` key-free while the round stays provable from signed evidence (I6). Every input class
 //! yields at least one output class (PROTO-1).
 

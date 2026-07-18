@@ -14,7 +14,7 @@
 //!
 //! * **Inline-quorum** (small rosters) — a witness-quorum whose *inline* sets each cover
 //!   `(peer, hash)`. This was the Merge-2 path.
-//! * **Root-only** (Wave 3, scale-invariant) — witnesses may attest a **bare root** (inline
+//! * **Root-only** (scale-invariant) — witnesses may attest a **bare root** (inline
 //!   omitted). When a quorum agree on the same root `R`, membership of `(peer, hash)` in `R` is
 //!   pinned by a `StorageReceipt` **or** a single inline opening that reconstructs `R`
 //!   (a full opening whose recomputed root equals `R` *is* the committed set, so membership stays

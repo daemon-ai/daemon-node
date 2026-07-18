@@ -45,7 +45,7 @@ chacha20poly1305 = "0.10"
 # under the same validator + exact pin the proto/daemon-api conformance suites use.
 cddl-cat = "=0.7.1"
 # The replay-oracle tests re-derive consensus inside the real `coordinator-quorum` module through
-# the session crate's `WasmCoordinatorSandbox` (consensus never runs natively, even in these
+# the session crate's `SandboxedCoordinator` (consensus never runs natively, even in these
 # tests). A dev-only edge; session depends on observe normally, so this is a dev-dependency cycle
 # (permitted by cargo), never a normal-build edge.
 daemon-vhc-session = { workspace = true, features = ["harness"] }

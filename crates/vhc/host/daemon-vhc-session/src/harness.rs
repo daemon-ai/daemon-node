@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! In-process multi-peer harness driven by the production **wasm coordinator** (spec §6.2/§6.4;
+//! In-process multi-peer harness driven by the production **coordinator** (spec §6.2/§6.4;
 //! architecture §4.1: consensus is a sandboxed, content-addressed module).
 //!
 //! The harness spins up N in-process [`RoundEngine`] peers over a shared [`LoopbackGossip`] control
-//! plane + a shared [`FsPayloadStore`], plus the [`crate::wasm_coordinator_shell`] recording drive
+//! plane + a shared [`FsPayloadStore`], plus the [`crate::coordinator_shell`] recording drive
 //! around the `coordinator-quorum` module. It collects every peer's [`EngineEvent`] and the
 //! coordinator's driving trace, and drives the **churn/failure drills** over the same machinery via
 //! the extended [`VhcConfig`]:
@@ -20,7 +20,7 @@
 //! The coordinator-as-storage-client `StorageReceipt` evidence path, the event-count clock
 //! discipline (one tick per delivered frame; filler-frame deadline forcing gated on the
 //! accounted-set state predicate), and the recording drive live in
-//! [`crate::wasm_coordinator_shell`].
+//! [`crate::coordinator_shell`].
 
 #![allow(clippy::too_many_lines)]
 
@@ -54,7 +54,7 @@ use crate::engine::{EngineConfig, EngineEvent, RoundEngine};
 use crate::seam::{PayloadKey, RoundId, RunId};
 use crate::VhcRunError;
 
-pub use crate::wasm_coordinator_shell::CoordinatorReplay;
+pub use crate::coordinator_shell::CoordinatorReplay;
 
 /// The injected-fault mode a [`FaultyStore`] plays (TEST-ONLY).
 enum Fault {
@@ -343,7 +343,7 @@ impl VhcRun {
     /// number of agreeing peers a digest needs to count as the quorum digest (e.g.
     /// [`daemon_vhc_sdk_consensus::witness_quorum`] of the roster).
     ///
-    /// This replaces R3's Wave-3 local quorum-digest fold stand-in with observe's shared verdict, so
+    /// This replaces R3's earlier local quorum-digest fold stand-in with observe's shared verdict, so
     /// the harness, the drills, and the (future) live coordinator path all consume one detector.
     #[must_use]
     pub fn desync_verdict(&self, round: RoundId, quorum: u32) -> DesyncVerdict {
@@ -500,7 +500,7 @@ pub fn verify_observe_dir(dir: &std::path::Path) -> Result<ObserveVerify, VhcRun
     let logged_records = logged_round_records(&log);
     let health = RunHealth::from_log(&log);
     // Re-derive inside the real coordinator module : consensus never runs natively, even here.
-    let sandbox = crate::replay_sandbox::WasmCoordinatorSandbox::from_built_guest()
+    let sandbox = crate::replay_sandbox::SandboxedCoordinator::from_built_guest()
         .map_err(|e| VhcRunError::Lifecycle(format!("coordinator sandbox: {e}")))?;
     let report = replay_capture(&sandbox, capture, &log)
         .map_err(|e| VhcRunError::Lifecycle(format!("replay diverged: {e}")))?;
@@ -780,7 +780,7 @@ where
     coord_run_config.cooldown_s = phase;
     let coord_state = CoordinatorState::new(coord_run_config, Seed([0xAB; 32]), 0);
     let coord_handle: JoinHandle<Result<CoordinatorReplay, VhcRunError>> = {
-        let shell_cfg = crate::wasm_coordinator_shell::WasmCoordinatorShellConfig {
+        let shell_cfg = crate::coordinator_shell::CoordinatorShellConfig {
             run: run.clone(),
             version,
             state: coord_state,
@@ -794,11 +794,8 @@ where
             force_deadlines,
             planned_absent,
         };
-        let shell = crate::wasm_coordinator_shell::WasmCoordinatorShell::new(
-            gossip.clone(),
-            fs.clone(),
-            shell_cfg,
-        );
+        let shell =
+            crate::coordinator_shell::CoordinatorShell::new(gossip.clone(), fs.clone(), shell_cfg);
         tokio::spawn(async move { shell.drive().await })
     };
 

@@ -83,7 +83,7 @@ daemon-common = { workspace = true }
 # Test-only: the genesis-authoring vocabulary for the in-process join suite — the coordinator
 # role's opaque config is an authored `{state: CoordinatorState}` and the run's trust topology a
 # typed `AuthorityConfig` (both consensus-SDK types). The RUNTIME native-tick edge this crate
-# used to carry is GONE (the join drives the wasm coordinator through daemon-vhc-host's
+# used to carry is GONE (the join drives the coordinator through daemon-vhc-host's
 # production seat); this dev-dep only writes test fixtures. Tracked in vhc_dep_check [dev-dep].
 daemon-vhc-sdk-consensus = { workspace = true }
 blake3 = { workspace = true }

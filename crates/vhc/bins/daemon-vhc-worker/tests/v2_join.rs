@@ -2,14 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // **The genesis-native in-process whole-run** (the worker's supported self-driven join): the
-// compute@2 trainer (`tiny_llama_c3.wasm` — a real Burn LLaMA, det-lane ingest in-guest, kind-0
-// byte staging) under a **genesis envelope v2**, coordinated by the run's REAL wasm coordinator
+// compute@2 trainer (`tiny_llama.wasm` — a real Burn LLaMA, det-lane ingest in-guest, kind-0
+// byte staging) under a **genesis envelope v2**, coordinated by the run's REAL coordinator
 // (`coordinator_quorum.wasm`, pinned in the genesis role set, resolved by content hash from the
 // artifact map, and run in-process under the same major-2 driver), through the real worker
 // protocol: probe → assess (claim funnel + the worker role's device_min pre-screen + role
 // grants) → join → two full barrier rounds (train → guest-sealed commit → record → ingest) →
 // the guest's tag-4 det digest. Consensus never runs outside the sandboxed, content-addressed
-// module — the native-tick drive this file used to pin retired with the v1-envelope (cell 5)
+// module — the native-tick drive this file used to pin retired with the v1-envelope (device-min admission pre-screen)
 // form, which now refuses typed at assess (worker_protocol.rs pins the refusal).
 //
 // The run also proves the inline replay soak (refactor §12.6): the worker re-drives its own
@@ -223,7 +223,7 @@ fn coordinator_role_config() -> Value {
 /// the derived `SingleKey` coordinator identity, and the declared authority topology.
 fn genesis_wire() -> Vec<u8> {
     let coord_wasm = std::fs::read(module_path("coordinator_quorum")).expect("coordinator blob");
-    let worker_wasm = std::fs::read(module_path("tiny_llama_c3")).expect("trainer blob");
+    let worker_wasm = std::fs::read(module_path("tiny_llama")).expect("trainer blob");
     let coord_identity = derived_peer("vhc-coordinator");
 
     let mut artifacts = BTreeMap::new();
@@ -238,7 +238,7 @@ fn genesis_wire() -> Vec<u8> {
     artifacts.insert(
         "worker.wasm".to_string(),
         SnapshotArtifact {
-            url: format!("file://{}", module_path("tiny_llama_c3").display()),
+            url: format!("file://{}", module_path("tiny_llama").display()),
             blake3: blake3_hash(&worker_wasm),
             size: None,
         },
@@ -332,9 +332,9 @@ fn policy() -> JoinPolicy {
     }
 }
 
-/// probe → assess → join → two wasm-coordinator-driven barrier rounds → replay-soaked digest.
+/// probe → assess → join → two coordinator-driven barrier rounds → replay-soaked digest.
 #[tokio::test]
-async fn v2_worker_joins_and_runs_rounds_under_the_wasm_coordinator() {
+async fn v2_worker_joins_and_runs_rounds_under_the_coordinator() {
     let wire = genesis_wire(); // also builds the guests
     let mut cfg = TrainClientConfig::new(env!("CARGO_BIN_EXE_daemon-vhc-worker").to_string());
     cfg.env = vec![
@@ -355,9 +355,9 @@ async fn v2_worker_joins_and_runs_rounds_under_the_wasm_coordinator() {
         elig.reasons
     );
 
-    // Join: the worker's v2 session — pump attach + the run's REAL wasm coordinator in-process.
+    // Join: the worker's v2 session — pump attach + the run's REAL coordinator in-process.
     let mut events = sup
-        .join_streaming(RUN_ID, "local://wasm-coordinator", vec![], policy())
+        .join_streaming(RUN_ID, "local://coordinator", vec![], policy())
         .await
         .expect("join");
 

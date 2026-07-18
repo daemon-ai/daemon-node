@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `tiny-llama-c3` — the **re-authored** reference worker module (Phase C, track C3; refactor §7
+//! `tiny-llama` — the **re-authored** reference worker module (Phase C, track C3; refactor §7
 //! "models leave the SDK": `models::TinyLlama` becomes a real Burn model in the guest).
 //!
-//! The model ([`model::C3Llama`]) is ordinary Burn over `Autodiff<HostBackend>`: every tensor op
+//! The model ([`model::TinyLlamaModel`]) is ordinary Burn over `Autodiff<HostBackend>`: every tensor op
 //! crosses `compute@2` as `CBOR(burn_ir::OperationIr)`; the autodiff tape walks guest-side with
 //! zero intermediate readbacks. The comm profile is `daemon-vhc-sdk-profiles::SparseLoco` — its
 //! det-lane ingest runs **in-guest with zero host support** (the `daemon-vhc-det` compatibility
@@ -74,7 +74,7 @@ use daemon_vhc_sdk_v2::{
 };
 use serde::Deserialize;
 
-use model::{C3Llama, ModelCfg};
+use model::{TinyLlamaModel, ModelCfg};
 
 const EV_FRAME: u64 = 0;
 const EV_PAYLOAD_READY: u64 = 1;
@@ -110,7 +110,7 @@ type BatchItem = (u32, u32, Vec<u32>);
 /// The shared model/profile/det-lane state both the driver-called experiment and the event loop
 /// mutate (wasm is single-threaded; `Rc<RefCell>` is the natural share).
 struct Core {
-    model: C3Llama<AutodiffHostBackend>,
+    model: TinyLlamaModel<AutodiffHostBackend>,
     profile: SparseLoco,
     /// Canonical det-lane masters (guest-side, registration order).
     master: Vec<Vec<f32>>,
@@ -253,15 +253,15 @@ struct Restored {
     adamw_v: Vec<f32>,
 }
 
-struct TinyLlamaC3 {
+struct TinyLlama {
     cfg_bytes: Vec<u8>,
     restored: Option<Restored>,
 }
 
-impl V2Module for TinyLlamaC3 {
+impl V2Module for TinyLlama {
     fn decl() -> ModuleDecl {
         ModuleDecl {
-            name: "tiny-llama-c3",
+            name: "tiny-llama",
             version: env!("CARGO_PKG_VERSION"),
             // compute@2 imports force the Phase-C minor (ABI §1.3 step 5).
             abi_minor: 2,
@@ -335,7 +335,7 @@ impl V2Module for TinyLlamaC3 {
     }
 }
 
-daemon_vhc_sdk_v2::main!(TinyLlamaC3);
+daemon_vhc_sdk_v2::main!(TinyLlama);
 
 /// Split the flat init into per-param canonical vectors.
 fn split_flat(flat: &[f32], numels: &[usize]) -> Vec<Vec<f32>> {
@@ -427,7 +427,7 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
     };
     let mut profile = SparseLoco::new(cfg.profile.clone(), &numels);
     let device = daemon_vhc_sdk_compute::device();
-    let mut model = C3Llama::<AutodiffHostBackend>::from_flat(cfg.model.clone(), device, &init);
+    let mut model = TinyLlamaModel::<AutodiffHostBackend>::from_flat(cfg.model.clone(), device, &init);
     if let Some((ef, m, v)) = restored_local {
         profile
             .restore_ef(ef)

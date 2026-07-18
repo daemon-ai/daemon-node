@@ -3,7 +3,7 @@
 
 //! Shared vhc identity / hash vocabulary.
 //!
-//! Merge 1 swapped the Wave-1 placeholders for the canonical [`daemon_vhc_proto`] types: the
+//! Merge 1 swapped the the initial placeholders for the canonical [`daemon_vhc_proto`] types: the
 //! content hash is proto's blake3 [`Hash`](daemon_vhc_proto::Hash) (re-exported here as
 //! [`ContentHash`]) and the peer identity is proto's [`PeerId`](daemon_vhc_proto::PeerId). The
 //! run-scoped locator types proto does not model — run ids stay opaque strings (proto carries

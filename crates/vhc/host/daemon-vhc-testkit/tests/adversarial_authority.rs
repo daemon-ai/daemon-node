@@ -67,9 +67,9 @@ use daemon_vhc_sdk_consensus::{
     AuthError, AuthorityConfig, RecordSig, SingleKey, ThresholdKeys, Topology,
     DEFAULT_RECORDS_CHANNEL,
 };
-use daemon_vhc_session::replay_sandbox::WasmCoordinatorSandbox;
-use daemon_vhc_testkit::cell8::phase_a_grants;
-use daemon_vhc_testkit::{WasmCoordinator, WasmCoordinatorSpec};
+use daemon_vhc_session::replay_sandbox::SandboxedCoordinator;
+use daemon_vhc_testkit::genesis_run::phase_a_grants;
+use daemon_vhc_testkit::{Coordinator, CoordinatorSpec};
 
 // -- guest build (the established testkit pattern) -------------------------------------------------
 
@@ -179,13 +179,13 @@ fn run_config(
 }
 
 /// The blob spec for a directly-authored coordinator state (the spec seat is public; the
-/// genesis-configured path is pinned by the cell-8/matrix lanes).
+/// genesis-configured path is pinned by the end-state/matrix lanes).
 fn spec_for(
     wasm: &[u8],
     state: &CoordinatorState,
     authority: AuthorityConfig,
     run_id: Hash,
-) -> WasmCoordinatorSpec {
+) -> CoordinatorSpec {
     let config_bytes = {
         let v = Value::Map(vec![(
             Value::Text("state".into()),
@@ -193,7 +193,7 @@ fn spec_for(
         )]);
         to_canonical_vec(&v).expect("config cbor")
     };
-    WasmCoordinatorSpec {
+    CoordinatorSpec {
         module_hash: Hash(*blake3::hash(wasm).as_bytes()),
         config_bytes,
         authority,
@@ -210,7 +210,7 @@ fn spec_for(
 /// the identity proof, so no separate native fold is authored here).
 fn drive_and_archive(
     wasm: &[u8],
-    spec: &WasmCoordinatorSpec,
+    spec: &CoordinatorSpec,
     key_seed: [u8; 32],
     custody: &SigningKey,
     script: &[ScriptMsg],
@@ -252,7 +252,7 @@ fn drive_and_archive(
     };
     record_initial_state(&mut journal, &initial).expect("snapshot");
 
-    let mut coord = WasmCoordinator::start(wasm, spec, phase_a_grants(), 0, key_seed).unwrap();
+    let mut coord = Coordinator::start(wasm, spec, phase_a_grants(), 0, key_seed).unwrap();
     let mut at = 0u64;
     let mut now_s = initial.now_s;
     for sm in script {
@@ -422,7 +422,7 @@ fn equivocation_yields_portable_evidence_and_both_histories_look_valid() {
     // "Conflicting valid-looking histories": EACH side is green in isolation — a third party
     // shown only one archive finds nothing wrong (consensus replay re-derives every record and
     // digest from archive + payloads alone).
-    let sandbox = WasmCoordinatorSandbox::new(wasm.clone());
+    let sandbox = SandboxedCoordinator::new(wasm.clone());
     let a = replay_consensus_from_archive(&sandbox, &archive_a, &heads_a, &payloads_a)
         .expect("A valid");
     let b = replay_consensus_from_archive(&sandbox, &archive_b, &heads_b, &payloads_b)
@@ -594,7 +594,7 @@ fn eclipsed_peer_converges_from_archive_and_payloads_alone() {
 
     // The partitioned peer saw NOTHING live. When the partition heals it holds only the archive
     // replica + payload store — and re-derives the ENTIRE history, digests included.
-    let sandbox = WasmCoordinatorSandbox::new(wasm.clone());
+    let sandbox = SandboxedCoordinator::new(wasm.clone());
     let report = replay_consensus_from_archive(&sandbox, &archive, &heads, &payloads)
         .expect("heal replay green");
     assert_eq!(report.replay.rounds_verified, 3);
@@ -681,7 +681,7 @@ fn threshold_keys_quorum_refusals_end_to_end() {
     }
 
     // END-TO-END positive: consensus replay green under the threshold topology.
-    let sandbox = WasmCoordinatorSandbox::new(wasm.clone());
+    let sandbox = SandboxedCoordinator::new(wasm.clone());
     let report = replay_consensus_from_archive(&sandbox, &archive, &quorum_heads, &payloads)
         .expect("threshold replay green");
     assert_eq!(report.replay.rounds_verified, 2);

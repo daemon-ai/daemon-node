@@ -3,7 +3,7 @@
 
 //! Shared fixture helpers for the replay-oracle tests: author a deterministic multi-round driving
 //! script and run it through the **real `coordinator-quorum` module** (via the
-//! [`WasmCoordinatorSandbox`]) to capture the coordinator's published decisions — the same sandbox
+//! [`SandboxedCoordinator`]) to capture the coordinator's published decisions — the same sandbox
 //! the oracle re-derives through. Consensus never runs natively here : both fixture generation
 //! and verification drive the sandboxed module.
 
@@ -26,7 +26,7 @@ use daemon_vhc_proto::{
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 
 use daemon_vhc_observe::genesis_seed;
-pub use daemon_vhc_session::replay_sandbox::WasmCoordinatorSandbox;
+pub use daemon_vhc_session::replay_sandbox::SandboxedCoordinator;
 
 /// A signing key from a one-byte seed (test identities).
 #[must_use]
@@ -116,7 +116,7 @@ fn sign(k: &SigningKey, m: VhcMessage) -> SignedMessage {
 /// Script (the all-committed → all-evidenced fast path, per round): join the two workers, ready
 /// heartbeats to open round 0, then per round two commitments (with real payload bytes) + one
 /// covering storage receipt that finalizes the record and opens the next round.
-pub fn run_fixture(sandbox: &WasmCoordinatorSandbox, run_id: &str, rounds: u64) -> Fixture {
+pub fn run_fixture(sandbox: &SandboxedCoordinator, run_id: &str, rounds: u64) -> Fixture {
     let initial = initial_state(run_id);
     let envelope_hash = initial.config.envelope_hash;
     let worker_keys = vec![key(2), key(3)];
@@ -205,7 +205,7 @@ pub fn run_fixture(sandbox: &WasmCoordinatorSandbox, run_id: &str, rounds: u64) 
 
 /// Run the sandbox once (fixture generation) — a thin wrapper over the [`CoordinatorSandbox`] seam.
 pub fn replay_run(
-    sandbox: &WasmCoordinatorSandbox,
+    sandbox: &SandboxedCoordinator,
     initial: &CoordinatorState,
     driving: &[SignedMessage],
     expected_records: usize,
@@ -216,6 +216,6 @@ pub fn replay_run(
 
 /// A fresh sandbox over the `coordinator-quorum` guest (built once per process).
 #[must_use]
-pub fn coordinator_sandbox() -> WasmCoordinatorSandbox {
-    WasmCoordinatorSandbox::from_built_guest().expect("build coordinator-quorum guest")
+pub fn coordinator_sandbox() -> SandboxedCoordinator {
+    SandboxedCoordinator::from_built_guest().expect("build coordinator-quorum guest")
 }

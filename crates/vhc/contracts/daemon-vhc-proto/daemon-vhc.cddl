@@ -94,12 +94,12 @@ join = {
   "iroh_id": iroh-id,
   "class": throughput-class,
   "capabilities": capabilities,
-  ? "envelope_hash": hash,   ; asserted frozen-envelope hash (§6.1/§6.5; additive Wave 3)
+  ? "envelope_hash": hash,   ; asserted frozen-envelope hash (§6.1/§6.5; additive)
 }
 
 heartbeat = {
   "round": round,
-  ? "ready": bool,          ; optional model-readiness signal during Warmup (§6.2; additive Wave 3)
+  ? "ready": bool,          ; optional model-readiness signal during Warmup (§6.2; additive)
 }
 
 ; ----- the externally-tagged message union -----

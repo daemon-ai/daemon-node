@@ -5,7 +5,7 @@
 # §10.1). Members link the guest SDK crates by path (../sdk/daemon-vhc-sdk-*).
 [workspace]
 resolver = "2"
-members = ["tiny-llama-c3", "toy-averager", "test-claim-v2", "test-net-v2", "test-data-v2", "pipeline-stage", "test-compute-v2", "toy-mlp", "coordinator-quorum", "test-migrate-old", "test-migrate-new"]
+members = ["tiny-llama", "toy-averager", "test-claim-v2", "test-net-v2", "test-data-v2", "pipeline-stage", "test-compute-v2", "toy-mlp", "coordinator-quorum", "test-migrate-old", "test-migrate-new"]
 
 # wasm size-tuned: the built modules ship as artifacts, so trade a little compile time for size.
 [profile.release]

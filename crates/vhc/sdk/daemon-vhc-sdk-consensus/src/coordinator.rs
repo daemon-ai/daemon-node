@@ -11,7 +11,7 @@
 //! - compiled to wasm32 in `guests/coordinator-quorum` (the launch coordinator module) — the guest
 //!   links this crate for both the assignment math (moved here at D0) and this `tick`;
 //! - run natively by `sdk/daemon-vhc-sim` for fast native-policy coordination in tests;
-//! - run natively as the **dual-compilation identity reference** the D2 wasm-coordinator gate
+//! - run natively as the **dual-compilation identity reference** the D2 coordinator gate
 //!   compares the guest against (refactor §8/D2 acceptance: "wasm `coordinator-quorum` vs native
 //!   `tick` on identical inputs").
 //!

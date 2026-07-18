@@ -215,7 +215,7 @@ impl Default for VhcConfig {
         Self {
             enabled: false,
             // The real training worker binary (`crates/vhc/bins/daemon-vhc-worker`). The pre-A2
-            // Wave-0 `daemon-vhc` scaffold that this defaulted to only printed a version line and
+            // initial `daemon-vhc` scaffold that this defaulted to only printed a version line and
             // exited, so a stock `[vhc] enabled` node crash-looped its supervisor on spawn.
             worker_path: "daemon-vhc-worker".to_string(),
             data_cache_gb: 50,

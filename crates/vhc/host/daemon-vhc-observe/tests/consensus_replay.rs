@@ -159,7 +159,7 @@ fn build_archived(fx: Fixture) -> Archived {
     }
 }
 
-fn build_fixture(sandbox: &common::WasmCoordinatorSandbox) -> Archived {
+fn build_fixture(sandbox: &common::SandboxedCoordinator) -> Archived {
     let fx = run_fixture(sandbox, RUN_LABEL, ROUNDS);
     build_archived(fx)
 }

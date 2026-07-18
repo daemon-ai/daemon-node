@@ -401,7 +401,7 @@ fn message_with_wrong_version_rejected() {
     ));
 }
 
-// ----- Warmup early-exit on peer readiness (Wave-3 additive) -----
+// ----- Warmup early-exit on peer readiness (additive) -----
 
 #[test]
 fn warmup_early_exits_when_all_ready() {

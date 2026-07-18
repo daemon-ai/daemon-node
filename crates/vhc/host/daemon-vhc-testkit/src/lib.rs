@@ -17,7 +17,7 @@
 //!   re-drive the recorded journal through the §8.7 input-replay engine and assert every decision
 //!   (publish channel + seq + payload hash) and the terminal outcome reproduce bit-for-bit. A
 //!   diverging replay is a gate FAILURE, never a warning (refactor §12.6).
-//! - [`cell8`] — [`cell8::cell8_whole_run`]: the barrier whole-run harness — N production
+//! - [`genesis_run`] — [`genesis_run::genesis_whole_run`]: the barrier whole-run harness — N production
 //!   compute@2 trainers under the production `coordinator_quorum.wasm` coordinator, both sides
 //!   under the real major-2 event-loop driver (consensus never runs outside the sandboxed,
 //!   content-addressed module), plus the deterministic fault-injection rig the adversarial
@@ -26,19 +26,19 @@
 //! The first whole-run gate wired into tier-2 CI is the SPARTA-shaped `toy_averager.wasm` production
 //! blob (timers + publish, no coordinator) — deterministic, journaled, replay-verified.
 
-pub mod cell8;
+pub mod coordinator;
+pub mod genesis_run;
 pub mod run;
-pub mod wasm_coordinator;
 
-pub use cell8::{
-    cell8_genesis, cell8_whole_run, Cell8Report, Cell8Spec, Cell8WorkerReport, FaultAction,
-    FaultPlan, FaultRule, FrameKind,
+pub use coordinator::{
+    configure_coordinator, coordinator_state_from_capture, refuse_unconfigurable_envelope,
+    CoordError, Coordinator, CoordinatorSpec,
+};
+pub use genesis_run::{
+    genesis_envelope, genesis_whole_run, FaultAction, FaultPlan, FaultRule, FrameKind,
+    GenesisRunReport, GenesisRunSpec, GenesisWorkerReport,
 };
 pub use run::{whole_run, ReplayReport, RunSpec, WholeRunReport};
-pub use wasm_coordinator::{
-    configure_wasm_coordinator, coordinator_state_from_capture, refuse_unconfigurable_envelope,
-    WasmCoordError, WasmCoordinator, WasmCoordinatorSpec,
-};
 
 use daemon_vhc_host::{EngineConfig, Worker};
 

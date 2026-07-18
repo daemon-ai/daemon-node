@@ -2,7 +2,7 @@
 # det-lane golden bundle (the successor to the recorded v1 parity oracle).
 #
 # The per-tier reproduction tests (daemon-vhc-host/tests/trainer_goldens.rs) drive the compute@2
-# trainer guest (`tiny-llama-c3`) against the RECORDED goldens in `../` (per-round det digests,
+# trainer guest (`tiny-llama`) against the RECORDED goldens in `../` (per-round det digests,
 # committed payload bytes, matched-init trained-theta trajectory). This crate is how that bundle
 # is produced: it drives the SAME guest through a single-peer barrier whole-run, reconstructs the
 # guest's own committed payload bytes natively (the guest publishes only the commitment hash), and

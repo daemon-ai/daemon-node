@@ -219,7 +219,7 @@ impl std::error::Error for AuthError {}
 /// input [`crate::committed::Committed::mint`] accepts (architecture §4.2). Minted by
 /// [`Authority::authorize`] on the signature path, or by [`Authorized::from_authoritative_channel`]
 /// on the host-delivery path (the frame was signature-verified above the pump on a declared
-/// authoritative channel — the bridge / mixed-fleet cell-6 topology, where the host verifies the
+/// authoritative channel — the bridge / mixed-fleet retired-native-coordinator topology, where the host verifies the
 /// coordinator's frame before the guest ever sees it).
 ///
 /// A cooperative module can only obtain this token by going through an authority check; the type is
@@ -243,8 +243,8 @@ impl Authorized {
     /// The host-delivery path: the frame arrived on a **declared authoritative channel** and was
     /// signature-verified above the pump (ABI §12.1, `daemon-vhc-session::v2_attach`) before
     /// delivery, so the in-guest re-verification is delegated to that host mechanism. This is the
-    /// bridge / mixed-fleet cell-6 topology (native coordinator, frames verified host-side). D2's
-    /// wasm coordinator mints records in-guest and threads a real [`Authority::authorize`] token
+    /// bridge / mixed-fleet retired-native-coordinator topology (native coordinator, frames verified host-side). D2's
+    /// coordinator mints records in-guest and threads a real [`Authority::authorize`] token
     /// instead.
     #[must_use]
     pub fn from_authoritative_channel(channel: u32) -> Self {

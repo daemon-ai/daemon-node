@@ -18,7 +18,7 @@ pub struct VhcProtoVersion(pub u16);
 
 /// The version this build speaks.
 ///
-/// Wave-1 ships version 1 (the scaffold placeholder was `0`); see `docs/specs/swarm-ledger-p1.md`.
+/// Version 1 ships (the scaffold placeholder was `0`); see `docs/specs/swarm-ledger-p1.md`.
 pub const VHC_PROTO_VERSION: VhcProtoVersion = VhcProtoVersion(1);
 
 impl VhcProtoVersion {

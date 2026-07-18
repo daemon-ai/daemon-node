@@ -3,7 +3,7 @@
 
 //! Churn / failure drills (spec §6.4, §13; TDD §3.8 E2E, RUN-7/8) over the local runner
 //! machinery ([`daemon_vhc_session::harness`] — the in-process peers under the production
-//! wasm-coordinator recording drive).
+//! coordinator recording drive).
 //!
 //! Each drill injects one failure mode into the in-process N-peer vhc and asserts the run
 //! **completes with all surviving peers' digests equal every round**:
@@ -334,7 +334,7 @@ async fn desync_injection_detected_and_resynced() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_restart_mid_run_completes() {
-    // The wasm coordinator module is re-instantiated from its EXPORTED state after round 4 (a
+    // The coordinator module is re-instantiated from its EXPORTED state after round 4 (a
     // process restart through the sandbox, architecture §4.4): quiesce→snapshot→`da_migrate` a
     // fresh incarnation, which resumes the same logical timeline. The run completes and stays in
     // agreement across the restart.

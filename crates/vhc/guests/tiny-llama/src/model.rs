@@ -117,7 +117,7 @@ struct Block<B: AutodiffBackend> {
 }
 
 /// The decoder: flat AD leaves + `InnerBackend` AdamW moments, all device-resident.
-pub struct C3Llama<B: AutodiffBackend> {
+pub struct TinyLlamaModel<B: AutodiffBackend> {
     cfg: ModelCfg,
     device: B::Device,
     tok: Tensor<B, 1>,
@@ -138,7 +138,7 @@ fn zeros_inner<B: AutodiffBackend>(device: &B::Device, n: usize) -> Tensor<B::In
     Tensor::from_data(TensorData::new(vec![0.0f32; n], [n]), device)
 }
 
-impl<B: AutodiffBackend> C3Llama<B> {
+impl<B: AutodiffBackend> TinyLlamaModel<B> {
     /// Build from the canonical flat state (registration order — matched init).
     ///
     /// # Panics
@@ -225,7 +225,7 @@ impl<B: AutodiffBackend> C3Llama<B> {
     }
 
     /// Replace the AdamW moments from canonical per-param vectors (the restore counterpart of
-    /// [`C3Llama::moment_tensors`]).
+    /// [`TinyLlamaModel::moment_tensors`]).
     ///
     /// # Panics
     /// If either moment set does not match [`ModelCfg::param_numels`].

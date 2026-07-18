@@ -6,7 +6,7 @@
 //! The participant runtime (lane R) drives the round structure; the engine (lane E's `daemon-vhc-host`
 //! worker) fills in the math. This trait is that boundary, deliberately **engine-agnostic**: every
 //! signature is opaque bytes + plain structs — no `burn`, no `wasmtime`, no tensor types leak
-//! across it, so the same round loop (Wave 2) hosts the [`StubBackend`] here and the real Burn/wasm
+//! across it, so the same round loop hosts the [`StubBackend`] here and the real Burn/wasm
 //! host later.
 //!
 //! The lifecycle mirrors the ABI guest exports (§5.1):
@@ -15,14 +15,14 @@
 //! (da_make_update) at round end, then `ingest` (da_ingest_updates) over the staged committed set →
 //! a post-ingest [`StateDigest`]; plus checkpoint save/load (§9).
 //!
-//! [`StubBackend`] is a deterministic fake (xxh3 of inputs) so Wave 2 can build + test the round
+//! [`StubBackend`] is a deterministic fake (xxh3 of inputs) so this layer can build + test the round
 //! loop over a real seam before the engine exists. It models the DiLoCo-family agree-path (§5.6):
 //! a `base` snapshot is the consensus round base (the outer-step anchor, ABI §5.9); local
 //! training moves `params` away from `base` between barriers; `ingest` performs the outer step
 //! `params = base ⊕ orderedFold(committed set)` and re-snapshots `base`. Because `base` is equal
 //! across peers post-ingest and the committed set (record order) is equal, every peer's post-ingest
 //! digest is **equal** — while `make_update` still emits a peer-distinct contribution derived from
-//! its diverged `params`. This is the property the Wave-2 round loop asserts round after round.
+//! its diverged `params`. This is the property the round loop asserts round after round.
 
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
@@ -180,7 +180,7 @@ impl core::fmt::Debug for StateDigest {
 /// A deterministic stub [`TrainerBackend`] whose "updates" are xxh3 of its inputs.
 ///
 /// It holds a tiny in-memory state dict (`Vec<u64>`) seeded from the config bytes and folds batches
-/// / staged payloads into it with fixed, order-sensitive mixing — enough for the Wave-2 round loop
+/// / staged payloads into it with fixed, order-sensitive mixing — enough for the round loop
 /// to exercise the full lifecycle and for tests to assert determinism + record-order sensitivity,
 /// with no engine, GPU, or wasm.
 pub struct StubBackend {

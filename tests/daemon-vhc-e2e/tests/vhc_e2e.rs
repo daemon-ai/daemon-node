@@ -5,7 +5,7 @@
 //!
 //! N = 3 peers over `LoopbackGossip` + a shared `FsPayloadStore` + the deterministic
 //! `StubBackend`, coordinated by the production `coordinator-quorum` module (the harness's
-//! wasm-coordinator recording drive — consensus never runs natively, in recording or
+//! coordinator recording drive — consensus never runs natively, in recording or
 //! verification) for 20 rounds with a stall at round 7 and catch-up at round 8 (§6.4 stall
 //! ladder). The recorded run is then re-derived offline through the SAME content-addressed
 //! module (`verify_observe_dir`) — the gate-ceremony record + replay path.

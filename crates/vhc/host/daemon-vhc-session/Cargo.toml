@@ -31,7 +31,7 @@ daemon-vhc-proto = { workspace = true }
 # The frozen ABI constants (event/outcome/quiesce-reason/stop-reason codes, the default control
 # channel id) two consumers share: the production upgrade-transaction adapter
 # (`upgrade::LiveUpgradeSteps`) drives the live pump with them (default build), and the
-# `harness`-gated replay sandbox (the concrete `CoordinatorSandbox` that drives the wasm coordinator
+# `harness`-gated replay sandbox (the concrete `CoordinatorSandbox` that drives the coordinator
 # module under the host runtime) reads its stop-reason + candidate-driver constants. A contracts
 # crate (links neither sdk/* nor host/*), so the session→abi edge is direction-safe.
 daemon-vhc-abi = { workspace = true }

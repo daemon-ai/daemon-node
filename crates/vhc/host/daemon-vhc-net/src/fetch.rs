@@ -19,7 +19,7 @@
 //! (capacity gate, FIFO waiters, per-class expo-backoff retry) — see the port note below.
 //!
 //! The alternate-locator hook (`BlobTicket` → iroh-blobs) slots behind the same shape once the
-//! network plane lands (P4 / Wave 3).
+//! network plane lands (P4).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -159,7 +159,7 @@ pub async fn fetch_with_fallback_dyn(
 /// `expected` — the locator hash), decodes [`RecordSet`], and re-verifies the decoded set's content
 /// address equals `expected` (so a non-canonical re-encoding is also rejected). Root verification
 /// against the `RoundRecord`'s signed commitment stays **engine-side** (B3 wires this into
-/// `engine.rs::verify_record_set` in Wave 3); this is the net-side fetch+decode+content-verify half.
+/// `engine.rs::verify_record_set` later); this is the net-side fetch+decode+content-verify half.
 pub async fn fetch_record_set<P: PayloadStore>(
     store: &P,
     key: &PayloadKey,

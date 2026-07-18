@@ -70,7 +70,7 @@ fn missing(kind: &str, field: &str) -> VhcNetError {
 }
 
 /// A [`PayloadStore`] over presigned R2/S3 URLs (spec §7.1). Generic over the [`PresignClient`] so
-/// the mock presign server (tests) and BC's real endpoint (Wave 3) are drop-in.
+/// the mock presign server (tests) and BC's real endpoint are drop-in.
 pub struct R2Store<P: PresignClient> {
     presign: P,
     egress: EgressClient,
@@ -168,7 +168,7 @@ impl<P: PresignClient> PayloadStore for R2Store<P> {
     async fn put(&self, key: &PayloadKey, bytes: &[u8]) -> Result<ContentHash, VhcNetError> {
         let resp = self.presign_payload(key, PresignOp::Put).await?;
         // No forced Content-Type: a presigned PUT only validates the headers it was minted with
-        // (SigV4 parity — Wave-0 `EgressClient::put`). Replay any the presign *did* sign.
+        // (SigV4 parity — initial `EgressClient::put`). Replay any the presign *did* sign.
         let egress_resp = if resp.headers.is_empty() {
             self.egress
                 .put(&resp.url, bytes.to_vec(), Redirects::None)

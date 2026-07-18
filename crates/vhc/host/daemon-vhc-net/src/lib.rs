@@ -19,7 +19,7 @@
 //! `daemon-vhc-proto` types (blake3 `Hash`, `PeerId`); the [`ReceiptProducer`] emits proto's
 //! signed `StorageReceipt` control message (ed25519 over canonical CBOR).
 //!
-//! Wave-2 (R2) additions: [`Deduper`] — the reusable content-hash dedupe [`LoopbackGossip`]
+//! Additions: [`Deduper`] — the reusable content-hash dedupe [`LoopbackGossip`]
 //! composes (NET-6); and [`fetch_with_fallback`] — payload fetch with bounded [`RetryPolicy`]
 //! backoff + fallback sources (NET-4), the miss-or-verified-bytes path the §6.4 stall ladder
 //! drives.
@@ -111,7 +111,7 @@ pub enum VhcNetError {
     #[error("hf:// reference must pin a revision (hf://<repo>@<rev>/<path>): {0}")]
     UnpinnedRevision(String),
     /// An artifact URL used a scheme not wired this wave (`r2` / `hf` / `https` await the egress
-    /// plane; only `file://` is resolved in Wave 1).
+    /// plane; only `file://` is resolved).
     #[error("artifact scheme unsupported this wave: {0}")]
     SchemeUnsupported(String),
     /// An artifact URL could not be parsed.

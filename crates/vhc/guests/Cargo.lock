@@ -4651,7 +4651,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiny-llama-c3"
+name = "tiny-llama"
 version = "0.0.1"
 dependencies = [
  "burn",

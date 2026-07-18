@@ -3,7 +3,7 @@
 
 //! [`RoundEngine`] — the peer-side round state machine (spec §6.4; TDD RUN-1..5, RUN-8).
 //!
-//! One async state machine drives a single peer through rounds over the frozen Wave-1 seams —
+//! One async state machine drives a single peer through rounds over the frozen seams —
 //! [`ControlPlane`] + [`PayloadStore`] (net) and [`TrainerBackend`] (run) + the node ed25519
 //! [`SigningKey`] (proto). It consumes the seven signed round messages and emits an
 //! [`EngineEvent`] stream, per the §6.4 peer-side flow:
@@ -1262,7 +1262,7 @@ mod tests {
 
         // -- the coordinator flow: fold the recorded driving frames through the pure tick -------
         // The engines voiced one digest attestation per peer per cadence boundary as
-        // CheckpointAttestation frames; the wasm-coordinator recording drive delivered every
+        // CheckpointAttestation frames; the coordinator recording drive delivered every
         // inbound frame to the module and captured the exact driving trace. Attestation
         // recording is phase-independent in `tick` (the ledger accumulates on any verified
         // attestation frame), so folding the captured frames through the pure tick library

@@ -69,10 +69,10 @@ use daemon_vhc_proto::{
     SigningKey, VhcMessage, VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
-use daemon_vhc_testkit::cell8::phase_a_grants;
+use daemon_vhc_testkit::genesis_run::phase_a_grants;
 use daemon_vhc_testkit::{
-    cell8_genesis, configure_wasm_coordinator, coordinator_state_from_capture, WasmCoordinator,
-    WasmCoordinatorSpec,
+    configure_coordinator, coordinator_state_from_capture, genesis_envelope, Coordinator,
+    CoordinatorSpec,
 };
 
 const ROUNDS_BEFORE_KILL: u64 = 4;
@@ -200,7 +200,7 @@ fn build_script(worker_keys: &[SigningKey; 2], rounds: std::ops::Range<u64>) -> 
     script
 }
 
-/// The uninterrupted reference is itself a wasm-coordinator run (consensus never runs outside the
+/// The uninterrupted reference is itself a coordinator run (consensus never runs outside the
 /// sandbox — the D2 dual-compilation gate proves the module ≡ the native tick, so no separate
 /// native oracle is authored here): drive a FRESH `coordinator_quorum.wasm` blob over `script`
 /// from the same genesis config, drain exactly `decisions` published decisions in order, and stop
@@ -209,12 +209,12 @@ fn build_script(worker_keys: &[SigningKey; 2], rounds: std::ops::Range<u64>) -> 
 /// `decisions = 2 * committed_rounds (+ 1 trailing open)`.
 fn wasm_reference(
     wasm: &[u8],
-    spec: &WasmCoordinatorSpec,
+    spec: &CoordinatorSpec,
     key_seed: [u8; 32],
     script: &[ScriptMsg],
     decisions: usize,
 ) -> Vec<VhcMessage> {
-    let mut coord = WasmCoordinator::start(wasm, spec, phase_a_grants(), 0, key_seed).unwrap();
+    let mut coord = Coordinator::start(wasm, spec, phase_a_grants(), 0, key_seed).unwrap();
     for sm in script {
         coord.deliver(&sm.key, &sm.msg).expect("reference deliver");
     }
@@ -296,7 +296,7 @@ fn state_config(state: &CoordinatorState) -> Vec<u8> {
 }
 
 /// Decode the coordinator's initial state out of its opaque `{state: …}` config bytes.
-fn initial_state_of(spec: &WasmCoordinatorSpec) -> CoordinatorState {
+fn initial_state_of(spec: &CoordinatorSpec) -> CoordinatorState {
     let v: Value = ciborium::de::from_reader(spec.config_bytes.as_slice()).expect("config cbor");
     let Value::Map(entries) = v else {
         panic!("coordinator config is a map")
@@ -332,11 +332,11 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
         SigningKey::from_bytes(blake3::hash(b"failover/worker/1").as_bytes()),
     ];
 
-    // The genesis envelope v2 + the coordinator spec derived from it (the cell-8 seat).
-    let genesis = cell8_genesis(RUN_LABEL, coord_hash, Hash([0x77; 32]), base_id, 2, 2, 4);
+    // The genesis envelope v2 + the coordinator spec derived from it (the end-state seat).
+    let genesis = genesis_envelope(RUN_LABEL, coord_hash, Hash([0x77; 32]), base_id, 2, 2, 4);
     let author = SigningKey::from_bytes(blake3::hash(b"failover/author").as_bytes());
     let frozen = genesis.freeze(&author).expect("genesis freeze");
-    let spec = configure_wasm_coordinator(&frozen).expect("coordinator configurable");
+    let spec = configure_coordinator(&frozen).expect("coordinator configurable");
     let initial = initial_state_of(&spec);
 
     // The receivers' cert store: the base certifies the primary's incarnation-0 run key.
@@ -377,7 +377,7 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
 
     // -- 1. the primary drives rounds 0..4, every input journaled (message + clock pair) ---------
     let mut primary =
-        WasmCoordinator::start(&wasm, &spec, phase_a_grants(), 0, primary_key_seed).unwrap();
+        Coordinator::start(&wasm, &spec, phase_a_grants(), 0, primary_key_seed).unwrap();
     let pre_kill = build_script(&worker_keys, 0..ROUNDS_BEFORE_KILL);
     let mut at = 0u64;
     let mut now_s = 0u64;
@@ -480,7 +480,7 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     // quiesce→snapshot path (§10.2). The module owns a one-tick-per-frame synthetic clock, so the
     // recovered `Input::Message` frames alone reproduce the primary's state (the recovered
     // `Input::Clock`s are redundant with the module's own per-frame ticks).
-    let rebuild_spec = WasmCoordinatorSpec {
+    let rebuild_spec = CoordinatorSpec {
         module_hash: spec.module_hash,
         config_bytes: state_config(&rec_initial),
         authority: spec.authority.clone(),
@@ -488,8 +488,7 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     };
     let rebuild_key_seed = *blake3::hash(b"failover/rebuild-key").as_bytes();
     let mut rebuild =
-        WasmCoordinator::start(&wasm, &rebuild_spec, phase_a_grants(), 2, rebuild_key_seed)
-            .unwrap();
+        Coordinator::start(&wasm, &rebuild_spec, phase_a_grants(), 2, rebuild_key_seed).unwrap();
     for input in &capture.inputs {
         if let Input::Message(signed) = input {
             rebuild
@@ -548,7 +547,7 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     // -- 6. boot the standby (fresh incarnation, RE-INSTANTIATED from the exported snapshot) -----
     // `da_init` runs with the genesis config, then `da_migrate` restores the exported state through
     // the sandbox (ABI §10.3 step 4) — the module continues the same logical timeline from there.
-    let mut standby = WasmCoordinator::start_migrating(
+    let mut standby = Coordinator::start_migrating(
         &wasm,
         &spec,
         phase_a_grants(),
@@ -594,7 +593,7 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
         "the standby records the post-kill rounds"
     );
 
-    // The uninterrupted reference is a fresh wasm-coordinator run over the full script (no native
+    // The uninterrupted reference is a fresh coordinator run over the full script (no native
     // oracle): the resumed decisions — the killed primary's prefix followed by the standby's
     // resumption — must equal it byte-for-byte.
     let total_rounds = ROUNDS_BEFORE_KILL + ROUNDS_AFTER;
@@ -645,14 +644,14 @@ fn coordinator_state_export_resumes_byte_identically() {
         SigningKey::from_bytes(blake3::hash(b"export/worker/1").as_bytes()),
     ];
 
-    let genesis = cell8_genesis(RUN_LABEL, coord_hash, Hash([0x77; 32]), base_id, 2, 2, 4);
+    let genesis = genesis_envelope(RUN_LABEL, coord_hash, Hash([0x77; 32]), base_id, 2, 2, 4);
     let author = SigningKey::from_bytes(blake3::hash(b"export/author").as_bytes());
     let frozen = genesis.freeze(&author).expect("genesis freeze");
-    let spec = configure_wasm_coordinator(&frozen).expect("coordinator configurable");
+    let spec = configure_coordinator(&frozen).expect("coordinator configurable");
 
     // The primary drives the first rounds, then we drain its published decisions.
     let mut primary =
-        WasmCoordinator::start(&wasm, &spec, phase_a_grants(), 0, primary_key_seed).unwrap();
+        Coordinator::start(&wasm, &spec, phase_a_grants(), 0, primary_key_seed).unwrap();
     let pre_kill = build_script(&worker_keys, 0..ROUNDS_BEFORE_KILL);
     for sm in &pre_kill {
         primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
@@ -677,7 +676,7 @@ fn coordinator_state_export_resumes_byte_identically() {
     );
 
     // Re-instantiate a FRESH incarnation from the exported manifest and resume the remaining rounds.
-    let mut standby = WasmCoordinator::start_migrating(
+    let mut standby = Coordinator::start_migrating(
         &wasm,
         &spec,
         phase_a_grants(),

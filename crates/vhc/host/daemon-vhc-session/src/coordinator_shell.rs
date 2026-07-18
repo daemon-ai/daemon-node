@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The wasm-coordinator recording drive for the in-process whole-run harness (architecture §4.1,
+//! The coordinator recording drive for the in-process whole-run harness (architecture §4.1,
 //! §6.2; spec §6.4 I1).
 //!
 //! Consensus is a wasm module, not a native host service — so the harness records a run by driving
@@ -33,11 +33,11 @@
 //!
 //! A healthy peer that has neither committed nor stalled therefore *blocks* the force — correct
 //! under arbitrary scheduling delay, which is what makes the drive deterministic under parallel
-//! lane load. Wall clock survives only as the outer [`WasmCoordinatorShellConfig::deadline`]
+//! lane load. Wall clock survives only as the outer [`CoordinatorShellConfig::deadline`]
 //! failsafe (a wedged run errors out) and as polling *mechanism* (recv timeouts / sleeps that feed
 //! no protocol decision).
 //!
-//! This shell plays the network + storage seats around the module exactly as the testkit's cell-8
+//! This shell plays the network + storage seats around the module exactly as the testkit's end-state
 //! whole-run harness does: it signs + relays the module's published `RoundOpen`/`RoundRecord`s onto
 //! the control plane so the `RoundEngine` peers hear them, and authors the coordinator-as-storage
 //! `StorageReceipt` availability evidence over the shared payload store.
@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use daemon_vhc_host::wasm_coordinator::{WasmCoordinator, WasmCoordinatorSpec};
+use daemon_vhc_host::coordinator::{Coordinator, CoordinatorSpec};
 use daemon_vhc_net::{ControlPlane, FsPayloadStore, PayloadStore};
 use daemon_vhc_proto::messages::{Commitment, Join, RecordEntry, StorageReceipt, ThroughputClass};
 use daemon_vhc_proto::{
@@ -121,8 +121,8 @@ impl CoordinatorReplay {
     }
 }
 
-/// Construction inputs for a [`WasmCoordinatorShell`].
-pub struct WasmCoordinatorShellConfig {
+/// Construction inputs for a [`CoordinatorShell`].
+pub struct CoordinatorShellConfig {
     /// The run this coordinator drives.
     pub run: RunId,
     /// The pinned vhc proto version.
@@ -168,7 +168,7 @@ pub struct WasmCoordinatorShellConfig {
 /// The wasm-backed impure shell: it drives the production `coordinator-quorum` module over the
 /// control plane, authoring joins + readiness + availability receipts, and captures the exact
 /// driving-frame trace for the replay oracle.
-pub struct WasmCoordinatorShell<C> {
+pub struct CoordinatorShell<C> {
     control: Arc<C>,
     store: Arc<FsPayloadStore>,
     run: RunId,
@@ -207,14 +207,10 @@ pub struct WasmCoordinatorShell<C> {
     dropped: BTreeSet<PeerId>,
 }
 
-impl<C: ControlPlane> WasmCoordinatorShell<C> {
+impl<C: ControlPlane> CoordinatorShell<C> {
     /// Build a shell over `control` + the shared `store`.
     #[must_use]
-    pub fn new(
-        control: Arc<C>,
-        store: Arc<FsPayloadStore>,
-        cfg: WasmCoordinatorShellConfig,
-    ) -> Self {
+    pub fn new(control: Arc<C>, store: Arc<FsPayloadStore>, cfg: CoordinatorShellConfig) -> Self {
         let coord_key = coordinator_key();
         let expected: BTreeSet<PeerId> = cfg.bootstrap_keys.iter().map(peer_id).collect();
         Self {
@@ -246,7 +242,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
 
     /// The genesis-derived coordinator spec: the module hash pinned to the built blob, the opaque
     /// `{state}` config bytes, the envelope-named `SingleKey` authority, and the run identity.
-    fn spec(&self, wasm: &[u8]) -> Result<WasmCoordinatorSpec, VhcRunError> {
+    fn spec(&self, wasm: &[u8]) -> Result<CoordinatorSpec, VhcRunError> {
         let config_bytes = {
             let v = ciborium::value::Value::Map(vec![(
                 ciborium::value::Value::Text("state".into()),
@@ -255,7 +251,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
             )]);
             to_canonical_vec(&v).map_err(|e| VhcRunError::Lifecycle(format!("config cbor: {e}")))?
         };
-        Ok(WasmCoordinatorSpec {
+        Ok(CoordinatorSpec {
             module_hash: Hash(*blake3::hash(wasm).as_bytes()),
             config_bytes,
             authority: AuthorityConfig {
@@ -272,7 +268,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
     /// oracle re-derives from the exact same trace.
     fn deliver(
         &mut self,
-        coord: &mut WasmCoordinator,
+        coord: &mut Coordinator,
         key: &SigningKey,
         msg: &VhcMessage,
     ) -> Result<(), VhcRunError> {
@@ -289,7 +285,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
     /// object is in the shared store (the §6.4 I6 availability-evidence path).
     async fn receipt_for(
         &mut self,
-        coord: &mut WasmCoordinator,
+        coord: &mut Coordinator,
         round: u64,
         peer: PeerId,
     ) -> Result<(), VhcRunError> {
@@ -326,7 +322,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
     /// where the fresh instance's `published` cursor restarts at 0).
     async fn relay_new(
         &mut self,
-        coord: &WasmCoordinator,
+        coord: &Coordinator,
         consumed: &mut usize,
     ) -> Result<u64, VhcRunError> {
         let published = coord.published();
@@ -419,7 +415,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
     /// Whether the module has published a `RoundOpen` yet (round 0 has opened) — the cue to stage
     /// the late-join `Join` into `pending` so it lands in the roster at the first epoch boundary
     /// (delivering it before an open would upsert it into epoch 0's roster instead).
-    fn round_opened(coord: &WasmCoordinator) -> bool {
+    fn round_opened(coord: &Coordinator) -> bool {
         coord
             .published()
             .iter()
@@ -433,7 +429,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
     /// once, so a bounded batch expires the deadline and the module publishes the next decision. The
     /// event-count analogue of the native shell's `Input::Clock` jump — no wall-clock forcing (the
     /// sleep below is a polling mechanism for the guest thread to drain, feeding no decision).
-    fn force_step(&mut self, coord: &mut WasmCoordinator) -> Result<(), VhcRunError> {
+    fn force_step(&mut self, coord: &mut Coordinator) -> Result<(), VhcRunError> {
         const FORCE_CAP: usize = 512;
         const BATCH: usize = 8;
         // The filler loop blocks (deliver + poll sleeps): hand the worker's task queue off so the
@@ -460,16 +456,16 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         })
     }
 
-    /// Drive the run to completion over the wasm coordinator, returning the reproducible driving
+    /// Drive the run to completion over the coordinator, returning the reproducible driving
     /// trace ([`CoordinatorReplay`]) for the observe capture.
     ///
     /// On the fault-free lane (`force_deadlines == false`) this is the pure event-driven drive:
     /// joins + readiness heartbeats open round 0 and each round closes on the all-committed +
     /// all-evidenced fast path. The churn drills set `force_deadlines`, which adds the event-count
     /// clock discipline: a stalled/silent round (or the cooldown+warmup at an epoch boundary) is
-    /// force-closed with **filler frames** ([`WasmCoordinatorShell::force_step`]), the late joiner is
+    /// force-closed with **filler frames** ([`CoordinatorShell::force_step`]), the late joiner is
     /// admitted at the epoch boundary, and the restart drill re-instantiates the module from its
-    /// exported state ([`WasmCoordinator::quiesce_snapshot`] → [`WasmCoordinator::start_migrating`]).
+    /// exported state ([`Coordinator::quiesce_snapshot`] → [`Coordinator::start_migrating`]).
     ///
     /// # Errors
     /// [`VhcRunError::Lifecycle`] on a build/start/deliver failure or the run's hard deadline.
@@ -478,11 +474,11 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
         let wasm = crate::replay_sandbox::coordinator_quorum_wasm()
             .map_err(|e| VhcRunError::Lifecycle(format!("coordinator blob: {e}")))?;
         let spec = self.spec(&wasm)?;
-        let coord_seed = *blake3_hash(b"daemon-vhc/harness/wasm-coordinator/frame-key").as_bytes();
+        let coord_seed = *blake3_hash(b"daemon-vhc/harness/coordinator/frame-key").as_bytes();
         // The module start compiles the blob (CPU-seconds): hand this worker's task queue off
         // first so the drive cannot starve the same runtime's engine/collector tasks.
         let mut coord = tokio::task::block_in_place(|| {
-            WasmCoordinator::start(&wasm, &spec, Vec::new(), 0, coord_seed)
+            Coordinator::start(&wasm, &spec, Vec::new(), 0, coord_seed)
         })
         .map_err(|e| VhcRunError::Lifecycle(format!("coordinator start: {e}")))?;
 
@@ -556,7 +552,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
                         let capture = coord.quiesce_snapshot(60_000).map_err(|e| {
                             VhcRunError::Lifecycle(format!("coordinator restart quiesce: {e}"))
                         })?;
-                        WasmCoordinator::start_migrating(
+                        Coordinator::start_migrating(
                             &wasm,
                             &spec,
                             Vec::new(),
@@ -582,7 +578,7 @@ impl<C: ControlPlane> WasmCoordinatorShell<C> {
             }
             if start.elapsed() >= self.deadline {
                 return Err(VhcRunError::Lifecycle(format!(
-                    "wasm coordinator drive deadline: {total_records}/{} records",
+                    "coordinator drive deadline: {total_records}/{} records",
                     self.num_rounds
                 )));
             }

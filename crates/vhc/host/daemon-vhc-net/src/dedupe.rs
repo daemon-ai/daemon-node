@@ -5,8 +5,8 @@
 //!
 //! Gossip is *dissemination, never arbitration* (§7.1): the same signed message may arrive over
 //! more than one path (WS push and gossip fanout), so every control plane de-duplicates by the
-//! blake3 of the raw message bytes before delivering it. Wave 1 baked that set into
-//! [`LoopbackGossip`](crate::gossip::LoopbackGossip); Wave 2 factors it into this small type so any
+//! blake3 of the raw message bytes before delivering it. The initial version baked that set into
+//! [`LoopbackGossip`](crate::gossip::LoopbackGossip); a later version factors it into this small type so any
 //! future carrier (a real iroh gossip mesh, a WS bridge) reuses the identical rule instead of
 //! re-implementing it — the NET-6 property "the same message via WS and gossip dedupes" is one
 //! implementation, shared.

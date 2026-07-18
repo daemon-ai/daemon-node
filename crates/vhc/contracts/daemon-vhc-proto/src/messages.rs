@@ -201,7 +201,7 @@ pub struct Join {
     pub capabilities: CapabilitySet,
     /// The frozen-envelope hash the peer asserts it is joining under (§6.1/§6.5; TDD PROTO-12).
     /// `Some(h)` lets the coordinator reject a peer that assessed a *different* envelope
-    /// (`AdmissionReject::EnvelopeHashMismatch`); `None` skips the check. Additive (Wave 3): omitted
+    /// (`AdmissionReject::EnvelopeHashMismatch`); `None` skips the check. Additive: omitted
     /// on the wire for legacy joins (`#[serde(default)]`), so the pre-carrier back-compat path is
     /// unchanged for senders that never set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,7 +246,7 @@ pub struct Heartbeat {
     pub round: u64,
     /// Optional model-readiness signal during `Warmup` (§6.2/§6.5): `Some(true)` means the peer has
     /// built + is ready to train, letting the coordinator exit `Warmup` early once every admitted
-    /// member is ready. Additive (Wave 3): omitted on the wire for legacy heartbeats, so the
+    /// member is ready. Additive: omitted on the wire for legacy heartbeats, so the
     /// timeout-only warmup path is unchanged for senders that never set it (back-compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,

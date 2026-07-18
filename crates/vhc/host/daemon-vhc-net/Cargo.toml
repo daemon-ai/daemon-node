@@ -28,7 +28,7 @@ serde = { workspace = true }
 # The presign HTTP DTOs (§11.1) are JSON; the frozen contract fixtures are `tests/fixtures/presign-*.json`.
 serde_json = { workspace = true }
 ciborium = { workspace = true }
-# The iroh transport plane (§7): the gossip control plane (`IrohGossip: ControlPlane`, B2 Wave 2) +
+# The iroh transport plane (§7): the gossip control plane (`IrohGossip: ControlPlane`, B2) +
 # the self-hosted relay. OPTIONAL — gated behind the `iroh` feature so the default workspace build
 # never compiles the heavy iroh/QUIC/relay tree (spec §10.1). NO iroh-blobs (P4). B2 may add feature
 # tuning (e.g. `iroh-relay/server`, `test-utils`) here — a lane-owned member edit, not a root change.
@@ -43,7 +43,7 @@ futures = { workspace = true, optional = true }
 # RunCoordinatorDO's `GET {base}/runs/:id/ws` surface, speaking canonical-CBOR `SignedMessage`
 # frames both ways. OPTIONAL — gated behind the `ws` feature so the default workspace build never
 # compiles the WS/TLS tree (mirrors `iroh`). Reuses the tree's `tokio-tungstenite 0.29` workspace
-# dep (Wave-0 decision; `daemon-host::ws` is the in-tree usage pattern) and enables the rustls TLS
+# dep (an early decision; `daemon-host::ws` is the in-tree usage pattern) and enables the rustls TLS
 # feature HERE (a lane-owned feature edit): the client dials OUT over `wss://`, matching the tree's
 # rustls/aws-lc posture (no native-tls anywhere). NO second WS library.
 tokio-tungstenite = { workspace = true, optional = true, features = [
@@ -62,7 +62,7 @@ rustls = { workspace = true, optional = true }
 wiremock = { workspace = true }
 
 [features]
-# Off by default: the default workspace gate builds no iroh. B2 (Wave 2) implements `iroh_gossip.rs`
+# Off by default: the default workspace gate builds no iroh. B2 implements `iroh_gossip.rs`
 # behind this feature; `iroh`/`iroh-gossip`/`futures` are referenced there. The self-hosted relay is
 # an external runtime binary (`iroh-relay --dev`, devShell), so the `iroh-relay` crate itself stays
 # unreferenced (kept declared for a future in-process-relay path; machete-ignored below).

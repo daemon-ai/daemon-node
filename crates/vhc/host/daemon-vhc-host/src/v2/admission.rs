@@ -9,11 +9,11 @@
 //! invariant 8). [`admit_v2`] implements the stages for the major-2 path — the only admission
 //! path since the Phase-E sunset retired the v1 driver's autotune-based admission.
 //!
-//! ## The Phase-A pre-screen branch (recorded determination — decisions D3 cell 5 / D7; ABI §9.3)
+//! ## The Phase-A pre-screen branch (recorded determination — decisions D3 device-min admission pre-screen / D7; ABI §9.3)
 //!
 //! **Branch B: interim v2 runs gate on the lane floor alone.** A2's optional additive
 //! `device_min` envelope section is deliberately **not relied upon** here: the ratified decision
-//! makes cell 5 conditional on a standing three-proviso whole-run fixture (old-reader open;
+//! makes device-min admission pre-screen conditional on a standing three-proviso whole-run fixture (old-reader open;
 //! bytes/hash preserved end-to-end; no decode→re-freeze path). Static inspection of the frozen
 //! decoder is favorable (no `deny_unknown_fields`; the hash is over received bytes; no
 //! decode→re-freeze chain in-tree), but that is the decision's "preliminary evidence, not proof" —
@@ -383,9 +383,9 @@ pub fn admit_v2(
     }
 
     // -- stage 3: run pre-screen — `max(lane floor, envelope minimums)` ---------------------------
-    // Branch shipped (D3 cell 5, recorded per the ratified conditional): the three-proviso
-    // envelope fixture is GREEN (`daemon-vhc-proto/tests/cell5_envelope.rs` — old-reader open,
-    // bytes/hash end-to-end, decode→re-freeze strip canary), so cell 5 is **interim-supported**
+    // Branch shipped (D3 device-min admission pre-screen, recorded per the ratified conditional): the three-proviso
+    // envelope fixture is GREEN (the device-min envelope fixture — old-reader open,
+    // bytes/hash end-to-end, decode→re-freeze strip canary), so device-min admission pre-screen is **interim-supported**
     // and the additive `device_min` section is consumed here. The section is parsed from the RAW
     // frozen bytes at the CBOR-value level, never via a typed envelope decode (which would
     // silently drop unknown keys — the proviso-3 trap). An envelope may only

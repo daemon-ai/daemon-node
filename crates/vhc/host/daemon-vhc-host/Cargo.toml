@@ -8,7 +8,7 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
-# The Wave-3 training worker (`daemon-vhc-worker`) was a `[[bin]]` target here through Phase A0;
+# The training worker (`daemon-vhc-worker`) was a `[[bin]]` target here through Phase A0;
 # it split into its own `crates/vhc/bins/daemon-vhc-worker` crate at A2 per refactor §3/§11
 # ("splits into `bins/daemon-vhc-worker` when A0 gives it real work") — a strictly mechanical move.
 # Its tests/worker_protocol.rs integration test moved with it (CARGO_BIN_EXE resolution).
@@ -52,7 +52,7 @@ thiserror = { workspace = true }
 # remains — det math runs exclusively in-guest via that crate compiled to wasm.)
 serde = { workspace = true }
 ciborium = { workspace = true }
-# The wasm-coordinator drive seat (`wasm_coordinator` module): configuring/authorizing the
+# The coordinator drive seat (`coordinator` module): configuring/authorizing the
 # production coordinator blob needs the run's typed `AuthorityConfig` (decode + authorize), which
 # lives in the consensus SDK layer. TRACKED dependency-direction exception (xtask vhc_dep_check):
 # host/* -> sdk/* — the ratified rule is that consensus never runs outside the sandboxed module,
@@ -82,7 +82,7 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
 
 # Windows GPU-memory probe (swarm-windows-vram-design.md §2): DXGI `GetDesc3`/`QueryVideoMemoryInfo`
 # + D3D12 `CheckFeatureSupport(ARCHITECTURE1)` + `GlobalMemoryStatusEx`. Target-gated so it never
-# enters the Linux/macOS build; consumes the Wave-0 reserved root `windows = "0.62"` workspace entry
+# enters the Linux/macOS build; consumes the reserved root `windows = "0.62"` workspace entry
 # (a lane-owned target/feature edit — no root Cargo.toml change). Feature modules per design §4
 # (Threading omitted — the §3 budget-change event is not wired at probe time). Compiles for
 # `x86_64-pc-windows-gnu` (MinGW) as well as msvc.
@@ -97,7 +97,7 @@ windows = { workspace = true, features = [
 ] }
 
 # Per-backend lane selection (spec §10.1). These features only toggle burn's *dependency* backend
-# features — no code path changes this wave (Wave-0 scaffold): the `OpBackend` seam is still the
+# features — no code path changes this wave (initial scaffold): the `OpBackend` seam is still the
 # `CpuBackend` fp32 fake; G1/G2 wire `BurnBackend` behind these lanes in Waves 1–2. burn's `std` +
 # `ndarray` + `autodiff` are always on (the root workspace dep), so `cpu` (default) and `burn-ndarray`
 # both compile the current CPU/ndarray+autodiff graph; `wgpu` additionally pulls burn-wgpu (cubecl +
@@ -149,7 +149,7 @@ wasm-encoder = { workspace = true }
 serde_json = { workspace = true }
 # (Phase-E sunset) the host->SDK dev-dep for the v1 oracle/reference/determinism harnesses was
 # REMOVED with those harnesses (decisions D5). The `daemon-vhc-sdk-profiles` dev-dep (the NATIVE
-# lowering-oracle half of the retired C3 parity harness) was removed with the v1 parity oracle
+# lowering-oracle half of the retired trainer parity harness) was removed with the v1 parity oracle
 # retirement: the trainer-goldens lane reproduces the trainer over its own recorded bundle and
 # needs no native profile A/B.
 # (A2 worker-bin split): the daemon-vhc-supervisor + daemon-common dev-deps served only
@@ -164,7 +164,7 @@ burn-std = { workspace = true }
 workspace = true
 
 [package.metadata.cargo-machete]
-# `wasmtime` (host runtime) is used; `burn` is the Wave-2 `OpBackend` engine (declared now, wired
+# `wasmtime` (host runtime) is used; `burn` is the `OpBackend` engine (declared now, wired
 # then — the CPU fake needs no burn). NOTE (Merge 1): burn should move to a feature-gated / lane-split
 # build off the default gate (program ledger); deferred this wave to avoid a full wasmtime recompile.
 ignored = ["wasmtime", "burn"]

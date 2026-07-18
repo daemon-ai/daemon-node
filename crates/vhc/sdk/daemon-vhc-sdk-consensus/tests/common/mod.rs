@@ -171,7 +171,7 @@ pub fn heartbeat_msg(k: &SigningKey, round: u64) -> SignedMessage {
     SignedMessage::sign(k, VHC_PROTO_VERSION, VhcMessage::Heartbeat(h)).unwrap()
 }
 
-/// A heartbeat that also signals model-readiness during `Warmup` (Wave-3 additive `ready` flag).
+/// A heartbeat that also signals model-readiness during `Warmup` (additive `ready` flag).
 pub fn ready_heartbeat_msg(k: &SigningKey, round: u64) -> SignedMessage {
     let h = Heartbeat {
         round,

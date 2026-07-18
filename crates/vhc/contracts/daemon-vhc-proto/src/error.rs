@@ -5,7 +5,7 @@
 //!
 //! Deliberately dependency-free (no `thiserror`) so the crate keeps a `serde` + `ciborium` +
 //! `blake3` + `xxhash-rust` + `ed25519-dalek` surface and stays trivially
-//! `wasm32-unknown-unknown`-clean (Wave-0 lean-contract note; swarm-training-spec.md §10.1).
+//! `wasm32-unknown-unknown`-clean (lean-contract note; swarm-training-spec.md §10.1).
 
 use std::error::Error;
 use std::fmt;

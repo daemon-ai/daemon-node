@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The wasm-coordinator replay sandbox — the concrete [`CoordinatorSandbox`] the replay oracle
+//! The coordinator replay sandbox — the concrete [`CoordinatorSandbox`] the replay oracle
 //! drives consensus through (spec §6.4 I1; architecture §4.1).
 //!
 //! Consensus is a wasm module, not a native host service, so the replay oracle re-derives a recorded
@@ -53,11 +53,11 @@ const FRAME_KEY_SEED: &[u8] = b"daemon-vhc/observe/replay-sandbox/coordinator-fr
 
 /// A [`CoordinatorSandbox`] backed by the production `coordinator-quorum` wasm module running under
 /// the real major-2 host driver.
-pub struct WasmCoordinatorSandbox {
+pub struct SandboxedCoordinator {
     wasm: Vec<u8>,
 }
 
-impl WasmCoordinatorSandbox {
+impl SandboxedCoordinator {
     /// A sandbox over an explicit coordinator wasm blob (the run's genesis-pinned coordinator
     /// module bytes).
     #[must_use]
@@ -77,7 +77,7 @@ impl WasmCoordinatorSandbox {
     }
 }
 
-impl CoordinatorSandbox for WasmCoordinatorSandbox {
+impl CoordinatorSandbox for SandboxedCoordinator {
     fn replay_run(
         &self,
         initial: &CoordinatorState,
@@ -244,7 +244,7 @@ static BUILD: Once = Once::new();
 
 /// Build (once) and read the production `coordinator-quorum.wasm` from the guests workspace — the
 /// established testkit dev pattern (the dev shell provides the wasm32 target). Shared with the
-/// in-process whole-run harness's wasm-coordinator recording drive (`harness`), so a recorded run
+/// in-process whole-run harness's coordinator recording drive (`harness`), so a recorded run
 /// and its replay oracle drive the byte-identical content-addressed module.
 #[allow(clippy::disallowed_methods)] // dev/gate-only guest build (shells cargo), not node code.
 pub(crate) fn coordinator_quorum_wasm() -> Result<Vec<u8>, ReplayError> {

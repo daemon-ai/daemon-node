@@ -5,7 +5,7 @@
 // colocated on one host, arbitrated, both green"; decisions D6), tier-2:
 //
 // Two real wasm role-instances run CONCURRENTLY in one host process — a trainer
-// (`tiny_llama_c3.wasm`, the cell-8 barrier whole-run under the PRODUCTION `coordinator_quorum.wasm`
+// (`tiny_llama.wasm`, the end-state barrier whole-run under the PRODUCTION `coordinator_quorum.wasm`
 // coordinator) and a verifier-role instance (`toy_averager.wasm`, self-driven) — each admitted
 // through the node's
 // `OwnerArbiter` (per-device + host-wide typed ledgers, atomic check-and-reserve) BEFORE its
@@ -30,7 +30,7 @@ use std::time::Duration;
 use daemon_vhc_host::v2::{RunEnd, RunIdentity};
 use daemon_vhc_node::{AdmitRefusal, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId};
 use daemon_vhc_testkit::run::{whole_run, RunSpec};
-use daemon_vhc_testkit::{cell8_whole_run, Cell8Spec};
+use daemon_vhc_testkit::{genesis_whole_run, GenesisRunSpec};
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -83,7 +83,7 @@ fn id(label: &str, role: &str, instance: u64) -> RoleInstanceId {
 #[test]
 fn trainer_and_verifier_colocated_on_one_host_arbitrated_both_green() {
     let coordinator_wasm = guest("coordinator_quorum");
-    let trainer_wasm = guest("tiny_llama_c3");
+    let trainer_wasm = guest("tiny_llama");
     let verifier_wasm = guest("toy_averager");
 
     // The owner's aggregate grants: one 8 GiB accelerator, 100% duty, at most 2 instances.
@@ -135,8 +135,8 @@ fn trainer_and_verifier_colocated_on_one_host_arbitrated_both_green() {
         let coordinator = coordinator_wasm;
         let wasm = trainer_wasm;
         move || {
-            let spec = Cell8Spec::new("colo-trainer", 1, 2);
-            cell8_whole_run(&coordinator, &wasm, &spec).expect("trainer whole run")
+            let spec = GenesisRunSpec::new("colo-trainer", 1, 2);
+            genesis_whole_run(&coordinator, &wasm, &spec).expect("trainer whole run")
         }
     });
     let verifier = std::thread::spawn({

@@ -9,7 +9,7 @@
 //! hash, capability **subset** (`required ⊆ advertised`, via the frozen [`CapabilitySet::admits`]),
 //! roster capacity, duplicate.
 //!
-//! The `Join` carries an optional `envelope_hash` (Wave-3 additive carrier), threaded here as
+//! The `Join` carries an optional `envelope_hash` (additive carrier), threaded here as
 //! `asserted_hash`: `tick` forwards `join.envelope_hash.as_ref()`, so a peer that assessed a
 //! different envelope is rejected with `EnvelopeHashMismatch`; a legacy join that omits the hash
 //! passes `None` and skips the check (back-compat).

@@ -105,7 +105,7 @@ fn drive_time(state: &mut CoordinatorState, out: &mut Vec<Output>) {
             if state.healthy_count() < cfg.min_peers {
                 change_phase(state, out, Phase::WaitingForMembers);
             } else if all_warmup_ready(state) || now >= state.phase_start_s + cfg.warmup_s {
-                // Exit warmup early once every admitted member signals readiness (Wave-3 additive),
+                // Exit warmup early once every admitted member signals readiness (additive),
                 // else on the warmup timeout (the always-available path, back-compat).
                 open_epoch_first_round(state, out);
             }
@@ -226,7 +226,7 @@ fn on_join(
         peer: signer,
         version,
         join: &j,
-        // Wave-3: the frozen `Join` now carries an additive `envelope_hash`; forward it so the
+        // The frozen `Join` now carries an additive `envelope_hash`; forward it so the
         // `EnvelopeHashMismatch` admission check is reachable from the wire (a peer that assessed a
         // different envelope is rejected). Legacy joins omit it (`None`) → check skipped (back-compat).
         asserted_hash: j.envelope_hash.as_ref(),
@@ -484,7 +484,7 @@ fn all_warmup_ready(state: &CoordinatorState) -> bool {
 }
 
 /// Exit `Warmup` early (no timeout) once every admitted member is ready — the event-driven path a
-/// readiness heartbeat triggers (§6.2/§6.5, Wave-3 additive).
+/// readiness heartbeat triggers (§6.2/§6.5, additive).
 fn maybe_exit_warmup(state: &mut CoordinatorState, out: &mut Vec<Output>) {
     if state.phase == Phase::Warmup
         && state.healthy_count() >= state.config.min_peers

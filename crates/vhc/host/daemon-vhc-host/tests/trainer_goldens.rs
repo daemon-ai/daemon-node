@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // The v2-native **trainer goldens** reproduction lanes (retirement plan §3): the compute@2
-// trainer guest (`tiny-llama-c3`) reproduces a RECORDED, content-addressed golden bundle rather
+// trainer guest (`tiny-llama`) reproduces a RECORDED, content-addressed golden bundle rather
 // than the v1 parity oracle. This is the successor drift oracle that lets the v1 recording +
 // `v2_parity.rs` retire later.
 //
@@ -10,11 +10,11 @@
 // barrier whole-run (the guest commits its update and ingests that same committed set): per-round
 // det digests, the trainer's own committed payload bytes, the matched-init trained-theta
 // trajectory, exact config literals, and the schedule. Its provenance chain (v1 oracle -> the
-// c3_parity C3c equality proof at the capture commit -> these goldens) is written into the bundle
+// trainer_parity det-equality equality proof at the capture commit -> these goldens) is written into the bundle
 // README; the recorded digests coincide bit-for-bit with the v1 oracle's, captured from the
 // autonomous v2-native lane.
 //
-// Two comparison classes, exactly as the C3c lane splits them:
+// Two comparison classes, exactly as the det-equality lane splits them:
 //   * the DET LANE is an EQUALITY class — the guest's post-ingest digests (tag 4) must equal the
 //     recorded golden digests bit-for-bit. The digest is a pure function of (init, ingested
 //     committed payloads) via `daemon-vhc-det`, so it is backend-independent by construction; a
@@ -35,12 +35,12 @@
 
 mod tolerance;
 
-// The c3 model source, dual-compiled here (the C3b `#[path]`-include pattern) so the wgpu/cuda
+// The trainer model source, dual-compiled here (the dual-compile `#[path]`-include pattern) so the wgpu/cuda
 // tiers record the SAME kernels the guest submits over compute@2. Only the device tiers use it.
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
-#[path = "../../../guests/tiny-llama-c3/src/model.rs"]
+#[path = "../../../guests/tiny-llama/src/model.rs"]
 #[allow(dead_code)]
-mod c3_model;
+mod tiny_llama_model;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -68,7 +68,7 @@ const SEQ_LEN: u32 = 9;
 const VOCAB: u32 = 64;
 const PEER: [u8; 32] = [7u8; 32];
 
-// -- guest build (the shared c3_parity pattern) --------------------------------------------------
+// -- guest build (the shared trainer_parity pattern) --------------------------------------------------
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -237,7 +237,7 @@ fn load_goldens() -> Goldens {
 }
 
 /// Rebuild the exact guest config (canonical CBOR) from the recorded literals + matched init — the
-/// c3 `GuestCfg` map. The model/profile sub-maps are handed through verbatim from `expected.json`.
+/// trainer `GuestCfg` map. The model/profile sub-maps are handed through verbatim from `expected.json`.
 fn guest_cfg_bytes(j: &serde_json::Value, init: &[Vec<f32>]) -> Vec<u8> {
     let flat: Vec<f32> = init.iter().flatten().copied().collect();
     let map = Value::Map(vec![
@@ -290,7 +290,7 @@ fn json_to_cbor(v: &serde_json::Value) -> Value {
     }
 }
 
-// -- schedule + wire shapes (the c3 module contract) ---------------------------------------------
+// -- schedule + wire shapes (the trainer module contract) ---------------------------------------------
 
 /// Deterministic varied tokens for `(round, step)` — the recorded schedule.
 fn tokens_for(round: u64, step: u32) -> Vec<u32> {
@@ -425,7 +425,7 @@ fn round_record(round: u64, payload: &[u8]) -> VhcMessage {
 }
 
 /// Drive the trainer through the recorded schedule, feeding the recorded golden payloads at the
-/// barrier (the successor of the c3_parity C3c drive). Returns the per-round trained theta + the
+/// barrier (the successor of the trainer_parity det-equality drive). Returns the per-round trained theta + the
 /// per-round post-ingest digests.
 fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced {
     let worker = Worker::new(engine).expect("engine");
@@ -581,7 +581,7 @@ fn assert_theta_within_band(g: &Goldens, r: &Reproduced, tier: &str) {
 #[test]
 fn trainer_goldens_reproduce_cpu() {
     let g = load_goldens();
-    let wasm = guest("tiny_llama_c3");
+    let wasm = guest("tiny_llama");
     let r = drive_reproduce(EngineConfig::default(), &g, &wasm);
     assert_digests_bit_exact(&g, &r, "cpu");
     assert_theta_within_band(&g, &r, "cpu");
@@ -595,7 +595,7 @@ fn trainer_goldens_reproduce_cpu() {
 #[test]
 fn trainer_goldens_reproduce_burn_ndarray() {
     let g = load_goldens();
-    let wasm = guest("tiny_llama_c3");
+    let wasm = guest("tiny_llama");
     let engine = EngineConfig {
         backend: daemon_vhc_host::BackendKind::BurnNdarray,
         ..EngineConfig::default()
@@ -651,7 +651,7 @@ fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
     deliver(&round_open(0), &mut seq);
     wait_published(&pump, 2); // theta(0) + commitment(0)
 
-    // The record arrives while the committed payload is NOT yet fetchable → straggle (the c3
+    // The record arrives while the committed payload is NOT yet fetchable → straggle (the trainer
     // guest publishes nothing on a straggle heartbeat, so there is no publish to await here).
     deliver(&round_record(0, &g.payloads[0]), &mut seq);
 
@@ -688,7 +688,7 @@ fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
 #[test]
 fn trainer_goldens_catch_up_after_straggle_cpu() {
     let g = load_goldens();
-    let wasm = guest("tiny_llama_c3");
+    let wasm = guest("tiny_llama");
     let r = drive_straggle(&g, &wasm);
 
     let final_round = (ROUNDS - 1) as usize;
@@ -766,7 +766,7 @@ fn commitment_hash(pump: &daemon_vhc_host::v2::PumpHandle, round: u64) -> Option
 #[test]
 fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
     let g = load_goldens();
-    let wasm = guest("tiny_llama_c3");
+    let wasm = guest("tiny_llama");
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let module_hash = *blake3::hash(&wasm).as_bytes();
 
@@ -935,7 +935,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
 // execute on ndarray, so it would NOT exercise the device. The det digest is backend-independent
 // (it is a pure function of the ingested committed payloads via `daemon-vhc-det`), so the ONLY
 // backend-sensitive output is the trained theta. These tiers exercise the compute@2 KERNELS on the
-// real device through the op-journal replay seam (the `compute_replay.rs` mechanism): the c3
+// real device through the op-journal replay seam (the `compute_replay.rs` mechanism): the trainer
 // model's round-0 forward+backward+AdamW op stream is recorded over a `burn-router` recording
 // client, then re-executed against the production `ComputeRunner<Device>` on the GPU, and the
 // exported theta is checked against the recorded golden within the native (tolerance) class. This
@@ -960,7 +960,7 @@ mod gpu {
     use burn_std::future::DynFut;
     use daemon_vhc_host::{ComputeRunner, HostReal};
 
-    use super::c3_model::{C3Llama, ModelCfg};
+    use super::tiny_llama_model::{ModelCfg, TinyLlamaModel};
     use super::{
         goldens_expected, load_goldens, tokens_for, tolerance, Goldens, MICRO_BATCH, SEQ_LEN,
         STEPS_PER_ROUND,
@@ -1095,13 +1095,14 @@ mod gpu {
         serde_json::from_value(goldens_expected()["model_cfg"].clone()).expect("model cfg")
     }
 
-    /// Record the c3 model's round-0 forward+backward+AdamW op stream from the matched init, and
+    /// Record the trainer model's round-0 forward+backward+AdamW op stream from the matched init, and
     /// the exported per-param `TensorIr` handles — the exact `compute@2` op stream the guest
-    /// submits (C3b: the guest lowers this source bit-exactly).
+    /// submits (dual-compile: the guest lowers this source bit-exactly).
     fn record_round0(cfg: &ModelCfg, init: &[Vec<f32>]) -> (Vec<ComputeStep>, Vec<Vec<u8>>) {
         rec_reset();
         let device = NdArrayDevice::Cpu;
-        let mut model = C3Llama::<Autodiff<RecBackend>>::from_flat(cfg.clone(), device, init);
+        let mut model =
+            TinyLlamaModel::<Autodiff<RecBackend>>::from_flat(cfg.clone(), device, init);
         for h in 0..STEPS_PER_ROUND {
             let grads = model.forward_backward(
                 &tokens_for(0, h),

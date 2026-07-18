@@ -20,7 +20,7 @@ pub const K_ABSENCES_DEFAULT: u32 = 3;
 
 /// Coordinator-only run parameters that the frozen envelope does not carry (ledger-P2 note).
 ///
-/// Supplied at run creation (Wave-3 authoring), never read from `[experiment.config]` at runtime, so
+/// Supplied at run creation (run authoring), never read from `[experiment.config]` at runtime, so
 /// the seam rule (§4.3) is preserved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoordinatorParams {

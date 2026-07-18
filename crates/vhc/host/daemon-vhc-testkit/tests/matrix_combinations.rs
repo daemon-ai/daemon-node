@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
-// The D2 mixed-fleet matrix cells for {wasm coordinator × v1/v2 workers} (decisions D3;
+// The D2 mixed-fleet matrix combinations for {coordinator × v1/v2 workers} (decisions D3;
 // refactor §8/D2 acceptance):
 //
-// - **cell 8** (v2 worker × wasm coordinator × envelope v2) — the SUPPORTED target end-state,
+// - **end-state** (v2 worker × coordinator × envelope v2) — the SUPPORTED target end-state,
 //   pinned POSITIVE: a real whole run (production coordinator_quorum.wasm + production
-//   tiny_llama_c3.wasm compute@2 trainers, both under the real major-2 driver), journaled, §8.7
+//   tiny_llama.wasm compute@2 trainers, both under the real major-2 driver), journaled, §8.7
 //   replay-verified, cross-worker det-digest agreement.
-// - **cell 3** (v1 worker × wasm coordinator × envelope v1) — REFUSED, typed: envelope v1 has no
+// - **v1-worker/envelope-v1 refusal** (v1 worker × coordinator × envelope v1) — REFUSED, typed: envelope v1 has no
 //   coordinator role entry (no module-hash pin) and no Authority/identities section — a wasm
 //   coordinator is unconfigurable from it.
-// - **cell 7** (v2 worker × wasm coordinator × envelope v1) — REFUSED, typed: same
+// - **v2-worker/envelope-v1 refusal** (v2 worker × coordinator × envelope v1) — REFUSED, typed: same
 //   coordinator-side refusal; the worker's ABI axis cannot rescue an unconfigurable coordinator.
-// - **cell 4** (v1 worker × wasm coordinator × envelope v2) — REFUSED, typed: the v1 five-phase
+// - **v1-worker/envelope-v2 refusal** (v1 worker × coordinator × envelope v2) — REFUSED, typed: the v1 five-phase
 //   driver's config source is the v1 envelope's [data]/[phases], which envelope v2 does not carry;
 //   the v1 opener refuses genesis bytes and the schema sniff routes v2 away from the v1 path.
 //
-// The cell-6 native-coordinator adapter (v2 × native × v2) WAS retired at D2 (decisions D3
-// cell 6): a genesis run's coordination is its wasm coordinator module (cell 8).
+// The retired-native-coordinator native-coordinator adapter (v2 × native × v2) WAS retired at D2 (decisions D3
+// retired-native-coordinator): a genesis run's coordination is its coordinator module (end-state).
 //
 // Dev/test harness: shells `cargo build` for the guests (the established pattern).
 #![allow(clippy::disallowed_methods)]
@@ -32,8 +32,8 @@ use daemon_vhc_host::v2::RunEnd;
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::{peek_schema, peer_id, Hash, SigningKey, GENESIS_SCHEMA_MAJOR};
 use daemon_vhc_testkit::{
-    cell8_genesis, cell8_whole_run, configure_wasm_coordinator, refuse_unconfigurable_envelope,
-    Cell8Spec, WasmCoordError,
+    configure_coordinator, genesis_envelope, genesis_whole_run, refuse_unconfigurable_envelope,
+    CoordError, GenesisRunSpec,
 };
 
 // -- guest build (the established testkit pattern) -------------------------------------------------
@@ -152,16 +152,16 @@ fn synthetic_v1_worker_module() -> Vec<u8> {
     module.finish()
 }
 
-// -- cell 8: the SUPPORTED target end-state (positive whole-run gate) ------------------------------
+// -- end-state: the SUPPORTED target end-state (positive whole-run gate) ------------------------------
 
-/// Cell 8 single-worker: one production compute@2 trainer trains 2 barrier rounds under the
-/// production wasm coordinator, configured from a genesis envelope v2 — journaled, replay-verified.
+/// End-state single-worker: one production compute@2 trainer trains 2 barrier rounds under the
+/// production coordinator, configured from a genesis envelope v2 — journaled, replay-verified.
 #[test]
-fn cell8_single_worker_whole_run_is_green() {
+fn genesis_single_worker_whole_run_is_green() {
     let coordinator = guest_wasm("coordinator_quorum");
-    let worker = guest_wasm("tiny_llama_c3");
-    let spec = Cell8Spec::new("cell8-1w", 1, 2);
-    let report = cell8_whole_run(&coordinator, &worker, &spec).expect("whole run completes");
+    let worker = guest_wasm("tiny_llama");
+    let spec = GenesisRunSpec::new("genesis_run-1w", 1, 2);
+    let report = genesis_whole_run(&coordinator, &worker, &spec).expect("whole run completes");
 
     assert_eq!(report.rounds_done, 2);
     assert_eq!(report.coordinator_records, 2, "one record per round");
@@ -176,14 +176,14 @@ fn cell8_single_worker_whole_run_is_green() {
     assert!(report.is_green());
 }
 
-/// Cell 8 multi-worker: 2 wasm workers under the wasm coordinator — the full inversion (no native
+/// End-state multi-worker: 2 wasm workers under the coordinator — the full inversion (no native
 /// consensus anywhere in the run) — with cross-worker det-lane digest agreement as the oracle.
 #[test]
-fn cell8_two_workers_agree_on_the_det_lane_digest() {
+fn genesis_two_workers_agree_on_the_det_lane_digest() {
     let coordinator = guest_wasm("coordinator_quorum");
-    let worker = guest_wasm("tiny_llama_c3");
-    let spec = Cell8Spec::new("cell8-2w", 2, 2);
-    let report = cell8_whole_run(&coordinator, &worker, &spec).expect("whole run completes");
+    let worker = guest_wasm("tiny_llama");
+    let spec = GenesisRunSpec::new("genesis_run-2w", 2, 2);
+    let report = genesis_whole_run(&coordinator, &worker, &spec).expect("whole run completes");
 
     assert_eq!(report.rounds_done, 2);
     assert_eq!(report.workers.len(), 2);
@@ -197,20 +197,20 @@ fn cell8_two_workers_agree_on_the_det_lane_digest() {
     }
     assert_eq!(
         report.workers[0].digest, report.workers[1].digest,
-        "cross-worker det-lane digest agreement under the wasm coordinator"
+        "cross-worker det-lane digest agreement under the coordinator"
     );
     assert!(report.is_green());
 }
 
-// -- cells 3/7: wasm coordinator × envelope v1 — REFUSED, typed ------------------------------------
+// -- the envelope-v1 refusal combinations: coordinator × envelope v1 — REFUSED, typed ------------------------------------
 
-/// Cell 3: a v1 worker module under a wasm coordinator and envelope v1. **Post-sunset the cell
+/// v1-worker/envelope-v1 refusal: a v1 worker module under a coordinator and envelope v1. **Post-sunset the cell
 /// is doubly refused** (decisions D5): the worker axis itself now meets the typed
 /// `AbiUnsupportedMajor` at the §1.3 front door (the v1 driver retired — pre-sunset this
 /// asserted `CandidateDriver::V1` selection), and the coordinator-side refusal fires regardless:
 /// envelope v1 cannot pin a coordinator module or name an Authority.
 #[test]
-fn cell3_v1_worker_wasm_coordinator_envelope_v1_refused_typed() {
+fn v1_worker_envelope_v1_refused_typed() {
     // The worker-module axis: a synthetic ABI-major-1 module is refused typed at driver selection
     // (the sunset) — the offending input is hand-assembled in-test, not a vendored/recorded fixture.
     let v1_worker = synthetic_v1_worker_module();
@@ -220,21 +220,21 @@ fn cell3_v1_worker_wasm_coordinator_envelope_v1_refused_typed() {
         .expect_err("the v1 worker axis is refused post-sunset");
     assert_eq!(refusal.code, AbiRefusalCode::AbiUnsupportedMajor);
 
-    // The coordinator axis: envelope v1 cannot configure a wasm coordinator — typed refusal.
+    // The coordinator axis: envelope v1 cannot configure a coordinator — typed refusal.
     let bytes = synthetic_v1_envelope_bytes();
     assert_eq!(peek_schema(&bytes), Some(1));
     let err = refuse_unconfigurable_envelope(&bytes).unwrap_err();
-    assert_eq!(err, WasmCoordError::EnvelopeCannotConfigure(1));
+    assert_eq!(err, CoordError::EnvelopeCannotConfigure(1));
     // The refusal is a typed admission outcome that names the fix (a genesis envelope), never a
     // trap or a silent misparse.
     assert!(err.to_string().contains("genesis envelope v2"));
 }
 
-/// Cell 7: a v2 worker module under a wasm coordinator and envelope v1 — the same typed
+/// v2-worker/envelope-v1 refusal: a v2 worker module under a coordinator and envelope v1 — the same typed
 /// coordinator-side refusal; a major-2 worker cannot rescue an unconfigurable coordinator.
 #[test]
-fn cell7_v2_worker_wasm_coordinator_envelope_v1_refused_typed() {
-    let v2_worker = guest_wasm("tiny_llama_c3");
+fn v2_worker_envelope_v1_refused_typed() {
+    let v2_worker = guest_wasm("tiny_llama");
     let engine = Worker::new(EngineConfig::default()).expect("engine");
     let hash = *blake3::hash(&v2_worker).as_bytes();
     let sel = select_driver(&engine, &v2_worker, Some(&hash)).expect("v2 selection");
@@ -242,19 +242,19 @@ fn cell7_v2_worker_wasm_coordinator_envelope_v1_refused_typed() {
 
     let bytes = synthetic_v1_envelope_bytes();
     let err = refuse_unconfigurable_envelope(&bytes).unwrap_err();
-    assert_eq!(err, WasmCoordError::EnvelopeCannotConfigure(1));
+    assert_eq!(err, CoordError::EnvelopeCannotConfigure(1));
 }
 
-// -- cell 4: v1 worker × wasm coordinator × envelope v2 — REFUSED, typed ---------------------------
+// -- v1-worker/envelope-v2 refusal: v1 worker × coordinator × envelope v2 — REFUSED, typed ---------------------------
 
-/// The remaining v1-worker cell: a v1 worker module under a wasm coordinator and envelope v2.
+/// The remaining v1-worker cell: a v1 worker module under a coordinator and envelope v2.
 /// The worker axis is refused typed at driver selection (`AbiUnsupportedMajor` — no v1 driver
-/// exists), while the same genesis envelope configures the wasm coordinator fine: the refusal is
+/// exists), while the same genesis envelope configures the coordinator fine: the refusal is
 /// strictly the worker's. (The retired v1 envelope OPENER this cell also used to exercise is
 /// gone with the v1 envelope machinery — schema routing is the outer schema-major read, pinned
 /// by the envelope-v1 cells above.)
 #[test]
-fn cell4_v1_worker_wasm_coordinator_envelope_v2_refused_typed() {
+fn v1_worker_envelope_v2_refused_typed() {
     // The worker-module axis: a synthetic ABI-major-1 module (hand-assembled in-test, never a
     // vendored/recorded fixture) is refused typed at driver selection.
     let v1_worker = synthetic_v1_worker_module();
@@ -268,8 +268,8 @@ fn cell4_v1_worker_wasm_coordinator_envelope_v2_refused_typed() {
     let coordinator = guest_wasm("coordinator_quorum");
     let coord_hash = Hash(*blake3::hash(&coordinator).as_bytes());
     let author = SigningKey::from_bytes(&[0x11u8; 32]);
-    let genesis = cell8_genesis(
-        "cell4-run",
+    let genesis = genesis_envelope(
+        "envelope-v2-refusal-run",
         coord_hash,
         Hash(hash),
         peer_id(&author),
@@ -281,8 +281,8 @@ fn cell4_v1_worker_wasm_coordinator_envelope_v2_refused_typed() {
 
     // The schema read recognizes the genesis form...
     assert_eq!(peek_schema(frozen.bytes()), Some(GENESIS_SCHEMA_MAJOR));
-    // ...and the wasm coordinator configures fine from the same envelope — the refusal is
+    // ...and the coordinator configures fine from the same envelope — the refusal is
     // strictly the v1 worker's, which is what makes this the v1-worker cell and not an
     // envelope-v1 cell.
-    configure_wasm_coordinator(&frozen).expect("coordinator side is configurable under v2");
+    configure_coordinator(&frozen).expect("coordinator side is configurable under v2");
 }

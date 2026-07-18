@@ -25,12 +25,12 @@
 // `burn` dep pins `ndarray`+`autodiff`); wgpu/cuda ride the same generic seam behind their features.
 pub mod compute;
 // The PERMANENT device probe (decisions D5: "the device probe stays forever").
+pub mod coordinator;
 pub mod probe;
 pub mod runtime;
 pub mod select;
 pub mod trap;
 pub mod v2;
-pub mod wasm_coordinator;
 
 pub use compute::{unservable_op, ComputeError, ComputeRunner, HostReal};
 #[cfg(feature = "cuda")]

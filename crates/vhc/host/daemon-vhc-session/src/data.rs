@@ -10,7 +10,7 @@
 //! ([`slice_interval`]) — no per-batch RPC.
 //!
 //! [`SyntheticCorpus`] generates a deterministic seeded corpus (u16 tokens) for tests, so the round
-//! loop (Wave 2) and the worker (Wave 3) have a data source with no external download.
+//! loop and the worker have a data source with no external download.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,8 +64,8 @@ pub struct ShardDesc {
 /// The pre-tokenized corpus manifest (`manifest.json`, §8).
 ///
 /// The provenance fields (`tokenizer`/`tokenizer_revision`/`dataset`/`dataset_revision`) are an
-/// **additive** Wave-2 extension (M1): `#[serde(default)]` + `skip_serializing_if` keeps every
-/// pre-Wave-2 manifest (which carries only `token_width`/`seq_len`/`shards`) valid, and a manifest
+/// **additive** extension (M1): `#[serde(default)]` + `skip_serializing_if` keeps every
+/// earlier manifest (which carries only `token_width`/`seq_len`/`shards`) valid, and a manifest
 /// written without provenance is byte-identical to the old shape. They record how the shards were
 /// produced (`xtask tokenize-corpus`) so a run is reproducible and auditable (spec §8/§9).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,7 +391,7 @@ impl SyntheticCorpus {
 
 /// An in-memory pre-tokenized corpus: a validated [`Manifest`] plus the shard bytes it describes.
 ///
-/// The round engine (Wave 2) reads a peer's assigned micro-batches out of this without any external
+/// The round engine reads a peer's assigned micro-batches out of this without any external
 /// download. [`Corpus::sequence`] maps a [`BatchId`] to its `seq_len` token ids (wrapping the id
 /// into range, so a monotonically-advancing round cursor never runs off the end of a fixed test
 /// corpus).
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn manifest_provenance_is_additive_and_back_compatible() {
-        // A pre-Wave-2 manifest (no provenance keys at all) still parses (RUN-3 back-compat).
+        // A earlier manifest (no provenance keys at all) still parses (RUN-3 back-compat).
         let old = r#"{
             "token_width": "u16",
             "seq_len": 4,

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
 //! `daemon-vhc-sdk-profiles` — the comm/optimizer profiles over Burn tensors + det math
-//! (Phase C, track C3; architecture §6 "Profiles" row, refactor §7 "models leave the SDK").
+//! (architecture §6 "Profiles" row, refactor §7 "models leave the SDK").
 //!
 //! The Phase-C re-expression of the v1 SDK profiles (`daemon-vhc-sdk::profiles`), shed of every
 //! tabi handle: [`SparseLoco`] (the consumer-uplink flagship), [`DiLoCo`] (dense/int8 outer

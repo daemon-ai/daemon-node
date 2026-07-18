@@ -101,7 +101,7 @@ fn all_sample_messages() -> Vec<VhcMessage> {
             class: ThroughputClass::C2,
             capabilities: CapabilitySet::from_tokens(["tensor-abi@1", "det_sum@1"]).unwrap(),
             // Exercise the additive optional envelope-hash carrier against the `? "envelope_hash"`
-            // CDDL rule (Wave 3).
+            // CDDL rule.
             envelope_hash: Some(daemon_vhc_proto::blake3_hash(b"smollm-500m-01-envelope")),
         }),
         VhcMessage::Heartbeat(Heartbeat {
@@ -115,7 +115,7 @@ fn all_sample_messages() -> Vec<VhcMessage> {
 fn heartbeat_ready_flag_cddl_conforms_and_roundtrips() {
     use daemon_vhc_proto::from_canonical_slice;
 
-    // A legacy heartbeat omits `ready` on the wire; a Wave-3 ready heartbeat carries the bool.
+    // A legacy heartbeat omits `ready` on the wire; a ready heartbeat carries the bool.
     let legacy = Heartbeat {
         round: 3,
         ready: None,

@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // Adversarial-suite seeds (architecture §4.2's conformance surface): trace-driven fault injection
-// against the PRODUCTION `tiny_llama_c3.wasm` compute@2 trainer **under the production
-// `coordinator_quorum.wasm` coordinator** (the cell-8 whole-run drive), through the shared
+// against the PRODUCTION `tiny_llama.wasm` compute@2 trainer **under the production
+// `coordinator_quorum.wasm` coordinator** (the end-state whole-run drive), through the shared
 // deterministic `FaultPlan` — one pinned case per rig primitive proving the harness shape. The
 // full `Authority` adversarial suites (partitions, equivocation, withheld records) live in
 // `adversarial_authority.rs`; they drive the same coordinator blob.
@@ -32,7 +32,7 @@ use std::process::Command;
 use std::sync::Once;
 
 use daemon_vhc_testkit::{
-    cell8_whole_run, Cell8Spec, FaultAction, FaultPlan, FaultRule, FrameKind,
+    genesis_whole_run, FaultAction, FaultPlan, FaultRule, FrameKind, GenesisRunSpec,
 };
 
 fn guests_root() -> PathBuf {
@@ -74,22 +74,22 @@ fn guest_wasm(name: &str) -> Vec<u8> {
 
 /// Pinned case 1 — a byte-identical duplicate `RoundRecord` (same seq, same signed frame) is
 /// **ingested exactly once**: the round driver's watermark (`rr.round <= last_ingested`) is the
-/// dedup under test. The faulted run — driven through the real wasm coordinator — ends in the
+/// dedup under test. The faulted run — driven through the real coordinator — ends in the
 /// identical guest-voiced det-lane state as the clean run, and its journal §8.7 replays
 /// bit-for-bit (replay re-feeds the delivered sequence, duplicate included).
 #[test]
 fn duplicate_round_record_is_ingested_once() {
     let coordinator = guest_wasm("coordinator_quorum");
-    let worker = guest_wasm("tiny_llama_c3");
-    let run_label = "cell8-adv-dup-record";
+    let worker = guest_wasm("tiny_llama");
+    let run_label = "genesis_run-adv-dup-record";
 
     // Clean baseline (same run label, so every derived seed/key matches).
-    let clean = cell8_whole_run(&coordinator, &worker, &Cell8Spec::new(run_label, 1, 2))
+    let clean = genesis_whole_run(&coordinator, &worker, &GenesisRunSpec::new(run_label, 1, 2))
         .expect("clean run");
     assert!(clean.is_green());
 
     // Faulted run: round 0's record delivered twice to worker 0.
-    let mut spec = Cell8Spec::new(run_label, 1, 2);
+    let mut spec = GenesisRunSpec::new(run_label, 1, 2);
     spec.faults = FaultPlan {
         rules: vec![FaultRule {
             worker: 0,
@@ -99,7 +99,7 @@ fn duplicate_round_record_is_ingested_once() {
         }],
         delay_payload_staging: Vec::new(),
     };
-    let faulted = cell8_whole_run(&coordinator, &worker, &spec).expect("faulted run");
+    let faulted = genesis_whole_run(&coordinator, &worker, &spec).expect("faulted run");
 
     let w = &faulted.workers[0];
     assert!(w.replay_matched, "§8.7 replay green under the duplicate");
@@ -126,20 +126,20 @@ fn duplicate_round_record_is_ingested_once() {
 #[test]
 fn delayed_committed_payloads_stall_then_catch_up() {
     let coordinator = guest_wasm("coordinator_quorum");
-    let worker = guest_wasm("tiny_llama_c3");
-    let run_label = "cell8-adv-delayed-payloads";
+    let worker = guest_wasm("tiny_llama");
+    let run_label = "genesis_run-adv-delayed-payloads";
 
-    let clean = cell8_whole_run(&coordinator, &worker, &Cell8Spec::new(run_label, 1, 2))
+    let clean = genesis_whole_run(&coordinator, &worker, &GenesisRunSpec::new(run_label, 1, 2))
         .expect("clean run");
     assert!(clean.is_green());
 
     // Faulted run: round 0's committed payloads reach worker 0 only at round 1's open.
-    let mut spec = Cell8Spec::new(run_label, 1, 2);
+    let mut spec = GenesisRunSpec::new(run_label, 1, 2);
     spec.faults = FaultPlan {
         rules: Vec::new(),
         delay_payload_staging: vec![(0, 0)],
     };
-    let faulted = cell8_whole_run(&coordinator, &worker, &spec).expect("faulted run");
+    let faulted = genesis_whole_run(&coordinator, &worker, &spec).expect("faulted run");
 
     let w = &faulted.workers[0];
     assert!(
@@ -155,7 +155,7 @@ fn delayed_committed_payloads_stall_then_catch_up() {
     //    round 1 only after its round-1 open successfully ingested the held round 0 (a
     //    still-stalled driver skips training and voices nothing);
     //  - the single (4,1) is the caught-up fold's terminal digest.
-    let shape = |w: &daemon_vhc_testkit::Cell8WorkerReport| -> Vec<(u64, u64)> {
+    let shape = |w: &daemon_vhc_testkit::GenesisWorkerReport| -> Vec<(u64, u64)> {
         w.voices.iter().map(|(t, r, _)| (*t, *r)).collect()
     };
     assert_eq!(

@@ -1,10 +1,10 @@
 # The v2-native trainer goldens (successor to the recorded v1 parity oracle)
 
-This is the standing **drift oracle for the compute@2 trainer** (`tiny-llama-c3`): a recorded,
+This is the standing **drift oracle for the compute@2 trainer** (`tiny-llama`): a recorded,
 content-addressed bundle the per-tier reproduction tests
 (`daemon-vhc-host/tests/trainer_goldens.rs`) check the trainer against. It is the v2-native
 successor that **retired** the recorded v1 parity oracle and its parity lanes (`v2_parity.rs` +
-`c3_parity.rs`) once these goldens stood (retirement plan §3, D-3) — the v1 recording no longer
+`trainer_parity.rs`) once these goldens stood (retirement plan §3, D-3) — the v1 recording no longer
 exists in the tree; this bundle is the sole standing det-lane drift oracle for the trainer.
 
 The recorded lane is the compute@2 trainer guest driven through a **single-peer barrier
@@ -23,16 +23,16 @@ load (content-addressing).
 | Path | What |
 |---|---|
 | `expected.json` | Every pin + the recorded per-round digests + the schedule + the exact model/profile config literals + `captured_from` provenance |
-| `init.f32le.bin` | The matched init θ (flat f32-le; concatenated params in registration order) — originally inherited from the (now-retired) v1 oracle so the goldens sit on the exact trajectory the C3c equality proof pinned; now carried in-bundle as the self-contained matched init |
+| `init.f32le.bin` | The matched init θ (flat f32-le; concatenated params in registration order) — originally inherited from the (now-retired) v1 oracle so the goldens sit on the exact trajectory the det-equality equality proof pinned; now carried in-bundle as the self-contained matched init |
 | `trained-round-{0,1}.f32le.bin` | Per-round trained θ (post-inner-steps, pre-ingest) — the guest's tag-2 publish; the native-lane (tolerance-class) comparison surface |
 | `payload-round-{0,1}.bin` | Per-round committed payload bytes — **the trainer's OWN** sealed `SparseLoco` update (the guest publishes only the commitment hash, so the capture reconstructs the bytes natively and cross-checks them against that hash) |
 | `capture/` | The documented, re-runnable capture crate (command below) |
 
 The recorded per-round digests are the guest's tag-4 post-ingest det digests (the equality-class
-oracle). At the capture commit they coincide bit-for-bit with the v1 oracle's c3 digests
+oracle). At the capture commit they coincide bit-for-bit with the v1 oracle's trainer digests
 (`abcf2612…`, `574cf418…`) — captured here from the autonomous v2-native self-ingest lane.
 
-## Provenance chain (HISTORICAL: v1 oracle → C3c green → these goldens)
+## Provenance chain (HISTORICAL: v1 oracle → det-equality green → these goldens)
 
 The v1 parity oracle bundle and its parity lanes have since been **deleted** (retirement plan §3,
 D-3 — the "pins never deleted" clause was amended: the v1 oracle retires once the v2 goldens
@@ -43,17 +43,17 @@ matched init and config literals it supplied now live in this self-contained bun
    five-phase driver; decisions D5 — now deleted). Supplied this bundle's **matched init**
    (`init.f32le.bin`) and the exact **model/profile config literals**, and was the source of the
    recorded v1 det digests.
-2. **`c3_parity` C3c green at the capture commit.** The test
-   `c3_reauthored_tiny_llama_parity_vs_v1_oracle_cpu` (`daemon-vhc-host/tests/c3_parity.rs`) proves
+2. **`trainer_parity` det-equality green at the capture commit.** The test
+   `reauthored_tiny_llama_parity_vs_v1_oracle_cpu` (`daemon-vhc-host/tests/trainer_parity.rs`) proves
    the compute@2 trainer, **fed the v1 oracle's recorded committed payloads**, reproduces the v1
    det digests **bit-for-bit** (the det lane is an equality class) and the trained θ **within the
    `OpClass::Optimizer` band** (the native lane is a tolerance class), on the pinned 2-round ×
    2-step, single-peer, 1-layer, seq-9 parity shape. Verified green at the capture commit:
 
-   - commit `e93217b9` (`vhc-integration`; `tiny_llama_c3.wasm` pinned in `guests.blake3` at this
+   - commit `e93217b9` (`vhc-integration`; `tiny_llama.wasm` pinned in `guests.blake3` at this
      commit)
-   - run: `cargo test -p daemon-vhc-host --test c3_parity --features burn-ndarray \
-     c3_reauthored_tiny_llama_parity_vs_v1_oracle_cpu` →
+   - run: `cargo test -p daemon-vhc-host --test trainer_parity --features burn-ndarray \
+     reauthored_tiny_llama_parity_vs_v1_oracle_cpu` →
      `det-lane digests bit-exact across 2 rounds (v1 oracle reproduced)`; trained-θ max |Δ|
      6.557e-7 / 1.574e-7 (Optimizer band rtol 2e-4 / atol 2e-5).
 
@@ -64,8 +64,8 @@ matched init and config literals it supplied now live in this self-contained bun
 
 ### Exact comparison surface (stated per the retirement-plan audit)
 
-- C3c's digest equality holds over a **v1-payload-driven** trajectory (the c3 guest ingests the v1
-  oracle's recorded committed payloads); the c3 guest's *own* committed payload bytes are not
+- det-equality's digest equality holds over a **v1-payload-driven** trajectory (the trainer guest ingests the v1
+  oracle's recorded committed payloads); the trainer guest's *own* committed payload bytes are not
   compared in that test. Payload-wire byte-identity is pinned separately at the profile-library
   level (`daemon-vhc-sdk-profiles` goldens: "the Section payload wire is byte-identical to the v1
   container encoding").
@@ -114,7 +114,7 @@ Unlike the v1 oracle's capture crate (which builds only on a pre-sunset tree), t
 live compute@2 path and regenerates on the current tree:
 
 ```
-# from the checkout root, build the guests first (the capture reads tiny_llama_c3.wasm):
+# from the checkout root, build the guests first (the capture reads tiny_llama.wasm):
 nix develop --command bash -c 'cd crates/vhc/guests && \
   env -u CARGO_TARGET_DIR cargo build --release --target wasm32-unknown-unknown'
 # then run the capture (it drives the guest, reconstructs + hash-verifies the payloads, and

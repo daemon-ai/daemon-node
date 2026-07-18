@@ -33,7 +33,7 @@ pub(crate) struct ResolvedRun {
 }
 
 /// A resolved envelope-v2 (genesis) run: the decoded envelope, the frozen wire form (the
-/// wasm-coordinator configuration source — `configure_wasm_coordinator` reads role config bytes
+/// coordinator configuration source — `configure_coordinator` reads role config bytes
 /// + the cryptographic `RunId` from it), and the joining worker role.
 pub(crate) struct GenesisRun {
     pub(crate) env: daemon_vhc_proto::GenesisEnvelope,
@@ -60,7 +60,7 @@ pub(crate) const UNSIGNED_ENVELOPE_RETIRED: &str = "UnsignedEnvelopeRetired";
 
 /// The typed refusal slug for the retired schema-major-1 (v1) envelope form: a genesis (schema-2)
 /// envelope is the only run description this worker resolves — the v1 form cannot configure a
-/// wasm coordinator (no coordinator role entry, no `Authority`/identities section), so it refuses
+/// coordinator (no coordinator role entry, no `Authority`/identities section), so it refuses
 /// HERE, at assess, before any module is fetched or inspected. Stable, like the slug above.
 pub(crate) const ENVELOPE_SCHEMA_RETIRED: &str = "EnvelopeSchemaRetired";
 
@@ -93,7 +93,7 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
         Some(daemon_vhc_proto::GENESIS_SCHEMA_MAJOR) => resolve_genesis_run(wire).await,
         Some(major) => Err(format!(
             "{ENVELOPE_SCHEMA_RETIRED}: envelope schema major {major} is retired — it cannot \
-             configure a wasm coordinator (no coordinator role entry to pin a module hash, no \
+             configure a coordinator (no coordinator role entry to pin a module hash, no \
              Authority/identities section to name the signer); author a genesis envelope v2"
         )),
         None => Err(format!(
@@ -103,7 +103,7 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
     }
 }
 
-/// Resolve an envelope-v2 **genesis** run (D1 deliverable 4; mixed-fleet cell 6): verify the
+/// Resolve an envelope-v2 **genesis** run (D1 deliverable 4; mixed-fleet retired-native-coordinator): verify the
 /// signed genesis (hash re-derived over the received bytes, author signature checked), select the
 /// worker + coordinator roles from the role set, decode the worker role's opaque config, and
 /// resolve the worker role's module by its pinned artifact hash.
@@ -179,7 +179,7 @@ async fn fetch_genesis_artifact(
 }
 
 /// Resolve the genesis **coordinator role's** module by its pinned artifact hash (the in-process
-/// self-driven join runs the run's real wasm coordinator; consensus never runs outside the
+/// self-driven join runs the run's real coordinator; consensus never runs outside the
 /// sandboxed, content-addressed module). The `DAEMON_TRAIN_MODULE` override deliberately does
 /// NOT apply here — it substitutes the WORKER module source only.
 pub(crate) async fn resolve_coordinator_module(
@@ -879,7 +879,7 @@ fn assess_v2(
         device_min,
         // The envelope-v2 role grants (D1 deliverable 4): present on the genesis path — the
         // worker role's grant list from the genesis role set, intersected tighten-only against
-        // the lane at stage 4.0 (mixed-fleet cell 6). `None` on the v1-envelope path, where the
+        // the lane at stage 4.0 (mixed-fleet retired-native-coordinator). `None` on the v1-envelope path, where the
         // funnel's pre-D0 defaults stand.
         envelope_grants,
     ) {

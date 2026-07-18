@@ -145,7 +145,7 @@ fn join_via_tick_without_hash_is_admitted() {
 
 #[test]
 fn join_via_tick_asserts_envelope_hash() {
-    // Wave-3 (Merge 3): the additive `Join.envelope_hash` carrier is now threaded through `tick`, so
+    // the additive `Join.envelope_hash` carrier is now threaded through `tick`, so
     // a join asserting the WRONG envelope hash is rejected from the wire, and the correct hash is
     // admitted. This closes the P2/P3 "structural but not wired" gap end-to-end.
     let mut cfg = base_config();

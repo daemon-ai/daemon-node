@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The wasm-coordinator half of a whole run (refactor §8/D2; decisions D3 cells 3/7/8): configure
+//! The coordinator half of a whole run (refactor §8/D2; decisions D3 the refusal and end-state combinations): configure
 //! the production `coordinator_quorum.wasm` blob **from a frozen envelope**, run it under the real
 //! major-2 event-loop driver, and route frames to/from it.
 //!
@@ -12,16 +12,16 @@
 //!
 //! ## The configuration seat and the matrix refusals (decisions D3)
 //!
-//! A wasm coordinator can only run under an envelope that **configures** it: its module hash must
+//! A coordinator can only run under an envelope that **configures** it: its module hash must
 //! be pinned in the role set and its `Authority` (launch: the `SingleKey` coordinator identity)
-//! named in `[identities]` — both envelope-v2 (genesis) features. [`configure_wasm_coordinator`]
+//! named in `[identities]` — both envelope-v2 (genesis) features. [`configure_coordinator`]
 //! is that seat: it sniffs the frozen envelope bytes' schema major and
 //!
-//! - **schema 1 (envelope v1)** → the typed refusal [`WasmCoordError::EnvelopeCannotConfigure`]
+//! - **schema 1 (envelope v1)** → the typed refusal [`CoordError::EnvelopeCannotConfigure`]
 //!   — there is no coordinator role entry to pin a module hash, and no `Authority`/identities
-//!   section to name the signer. This is the **cell 3 and cell 7** negative (v1 or v2 workers make
+//!   section to name the signer. This is the **v1-worker/envelope-v1 refusal and v2-worker/envelope-v1 refusal** negative (v1 or v2 workers make
 //!   no difference: the coordinator is unconfigurable before any worker is considered).
-//! - **schema 2 (genesis)** → derive the [`WasmCoordinatorSpec`]: the coordinator role's pinned
+//! - **schema 2 (genesis)** → derive the [`CoordinatorSpec`]: the coordinator role's pinned
 //!   module hash, its **verbatim opaque config bytes** (the host never interprets them — they are
 //!   byte-identically the guest's `da_init` input, architecture §5.1 seam rule), and the run's
 //!   declared [`AuthorityConfig`] decoded from the opaque `authority` section. This is **cell
@@ -33,7 +33,7 @@
 //!
 //! ## The `Authority` seam (reconciled onto D1's contract — sitting 3)
 //!
-//! [`WasmCoordinatorSpec::authority`] is D1's typed `AuthorityConfig`; every judgment goes through
+//! [`CoordinatorSpec::authority`] is D1's typed `AuthorityConfig`; every judgment goes through
 //! `AuthorityConfig::authorize` — the network seat's frame check
 //! ([`authorize_coordinator_frame`]), the archive's head check, and the guest-side
 //! `tick_authenticated` token. The pre-D1 identity-comparison stubs are gone.
@@ -62,31 +62,31 @@ use crate::{select_driver, EngineConfig, Worker};
 /// `CoordinatorState` into on `Quiesce` (must match the guest's `STATE_SECTION`).
 const COORDINATOR_STATE_SECTION: &str = "consensus";
 
-/// Typed refusals from the wasm-coordinator configuration seat (decisions D3 cells 3/7 negatives
-/// + cell-8 well-formedness).
+/// Typed refusals from the coordinator configuration seat (decisions D3 the envelope-v1 refusal combinations negatives
+/// + end-state well-formedness).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum WasmCoordError {
-    /// **Cells 3/7 (decisions D3):** the envelope cannot configure a wasm coordinator — a
+pub enum CoordError {
+    /// **Cells 3/7 (decisions D3):** the envelope cannot configure a coordinator — a
     /// schema-major-1 envelope has no coordinator role entry (no module-hash pin) and no
     /// `Authority`/identities section. The typed refusal that pushes an author to a v2 envelope.
     #[error(
-        "envelope schema major {0} cannot configure a wasm coordinator: no coordinator role \
+        "envelope schema major {0} cannot configure a coordinator: no coordinator role \
          entry to pin a module hash, no Authority/identities section to name the signer \
-         (decisions D3 cells 3/7 — author a genesis envelope v2)"
+         (decisions D3 the envelope-v1 refusal combinations — author a genesis envelope v2)"
     )]
     EnvelopeCannotConfigure(u32),
     /// The frozen bytes carry no recognizable `[run].schema` major.
     #[error("frozen envelope bytes carry no recognizable schema major")]
     UnknownSchema,
     /// A genesis envelope without a coordinator-lane role (validation admits label-only checks;
-    /// the wasm-coordinator seat needs the lane selector).
+    /// the coordinator seat needs the lane selector).
     #[error("genesis envelope has no role with lane `coordinator`")]
     NoCoordinatorRole,
     /// The coordinator role's module key is missing from the artifact map (envelope authoring).
     #[error("coordinator role module `{0}` absent from the genesis artifact map")]
     ModuleUnpinned(String),
     /// The genesis envelope's opaque `authority` section does not decode as D1's typed
-    /// `AuthorityConfig` — the run declares no usable trust topology, so a wasm coordinator's
+    /// `AuthorityConfig` — the run declares no usable trust topology, so a coordinator's
     /// records could never be judged (architecture §4.2/§5.1).
     #[error("genesis authority section does not decode: {0}")]
     NoAuthority(String),
@@ -95,9 +95,9 @@ pub enum WasmCoordError {
     Genesis(String),
 }
 
-/// What a genesis envelope configures a wasm coordinator with (the cell-8 configuration half).
+/// What a genesis envelope configures a coordinator with (the end-state configuration half).
 #[derive(Debug, Clone)]
-pub struct WasmCoordinatorSpec {
+pub struct CoordinatorSpec {
     /// The coordinator role's pinned module blake3 (the artifact-map pin the blob must match).
     pub module_hash: Hash,
     /// The role's **verbatim** opaque config bytes — byte-identically the guest's `da_init`
@@ -111,33 +111,31 @@ pub struct WasmCoordinatorSpec {
     pub run_id: Hash,
 }
 
-/// Configure a wasm coordinator from frozen envelope bytes (see module docs). Schema-major
+/// Configure a coordinator from frozen envelope bytes (see module docs). Schema-major
 /// routing per `peek_schema`: v1 → the typed cells-3/7 refusal; v2 → the derived spec.
 ///
 /// # Errors
-/// A typed [`WasmCoordError`]; the v1 case is the ratified matrix negative.
-pub fn configure_wasm_coordinator(
-    frozen: &FrozenGenesis,
-) -> Result<WasmCoordinatorSpec, WasmCoordError> {
+/// A typed [`CoordError`]; the v1 case is the ratified matrix negative.
+pub fn configure_coordinator(frozen: &FrozenGenesis) -> Result<CoordinatorSpec, CoordError> {
     let env = frozen
         .decode()
-        .map_err(|e| WasmCoordError::Genesis(e.to_string()))?;
+        .map_err(|e| CoordError::Genesis(e.to_string()))?;
     let (role_name, role) = env
         .roles
         .iter()
         .find(|(_, r)| r.lane == "coordinator")
-        .ok_or(WasmCoordError::NoCoordinatorRole)?;
+        .ok_or(CoordError::NoCoordinatorRole)?;
     let module = env
         .artifacts
         .get(&role.module)
-        .ok_or_else(|| WasmCoordError::ModuleUnpinned(role.module.clone()))?;
+        .ok_or_else(|| CoordError::ModuleUnpinned(role.module.clone()))?;
     let authority = AuthorityConfig::decode(&env.authority)
-        .map_err(|e| WasmCoordError::NoAuthority(e.to_string()))?;
+        .map_err(|e| CoordError::NoAuthority(e.to_string()))?;
     let config_bytes = frozen
         .role_config_bytes(role_name)
-        .map_err(|e| WasmCoordError::Genesis(e.to_string()))?
+        .map_err(|e| CoordError::Genesis(e.to_string()))?
         .expect("role name came from the decoded role set");
-    Ok(WasmCoordinatorSpec {
+    Ok(CoordinatorSpec {
         module_hash: module.blake3,
         config_bytes,
         authority,
@@ -145,18 +143,18 @@ pub fn configure_wasm_coordinator(
     })
 }
 
-/// The schema-major gate in front of [`configure_wasm_coordinator`]: raw frozen-envelope bytes of
+/// The schema-major gate in front of [`configure_coordinator`]: raw frozen-envelope bytes of
 /// EITHER schema. A schema-major-1 envelope is the typed cells-3/7 refusal — refused **before**
 /// any worker-ABI consideration (the coordinator is unconfigurable regardless of the worker axis).
 ///
 /// # Errors
-/// [`WasmCoordError::EnvelopeCannotConfigure`] for schema 1; [`WasmCoordError::UnknownSchema`]
+/// [`CoordError::EnvelopeCannotConfigure`] for schema 1; [`CoordError::UnknownSchema`]
 /// for unrecognizable bytes.
-pub fn refuse_unconfigurable_envelope(bytes: &[u8]) -> Result<(), WasmCoordError> {
+pub fn refuse_unconfigurable_envelope(bytes: &[u8]) -> Result<(), CoordError> {
     match peek_schema(bytes) {
         Some(GENESIS_SCHEMA_MAJOR) => Ok(()),
-        Some(major) => Err(WasmCoordError::EnvelopeCannotConfigure(major)),
-        None => Err(WasmCoordError::UnknownSchema),
+        Some(major) => Err(CoordError::EnvelopeCannotConfigure(major)),
+        None => Err(CoordError::UnknownSchema),
     }
 }
 
@@ -207,7 +205,7 @@ pub fn authorize_coordinator_frame(
 /// frame routing a whole run needs: deliver authenticated worker messages in, poll decoded
 /// coordinator decisions out. The harness plays the network seat (sign → verify above the pump →
 /// deliver, per-sender dense seqs) exactly as the testkit barrier harness does for workers.
-pub struct WasmCoordinator {
+pub struct Coordinator {
     pump: crate::v2::PumpHandle,
     run: Option<V2Run>,
     /// Keep the engine alive for the run's lifetime.
@@ -215,17 +213,17 @@ pub struct WasmCoordinator {
     sink: Arc<Mutex<MemorySink>>,
     /// Per-sender dense delivery seq (§12.2 discipline, channel 0).
     seqs: BTreeMap<[u8; 32], u64>,
-    /// How many published frames have been consumed by [`WasmCoordinator::next_message`].
+    /// How many published frames have been consumed by [`Coordinator::next_message`].
     consumed: usize,
 }
 
-impl WasmCoordinator {
+impl Coordinator {
     /// Start the coordinator blob under the event-loop driver: verify the blob against the spec's
     /// pin, select (must be major-2), and `start_run` with the spec's verbatim config bytes.
     ///
     /// `instance` is the role-instance incarnation (0 for a primary; a standby mints a fresh one,
     /// §8.1 never-reused). `key_seed` seeds the §12.1 frame signer — for the primary this is the
-    /// key behind the envelope-named `SingleKey` identity ([`WasmCoordinatorSpec::authority`]);
+    /// key behind the envelope-named `SingleKey` identity ([`CoordinatorSpec::authority`]);
     /// a standby signing under a *different* key is exactly the signer-transfer gap the
     /// `Authority` contract owns (architecture §4.4 — D1/sitting 3).
     ///
@@ -233,7 +231,7 @@ impl WasmCoordinator {
     /// A `String` on selection/start failure (harness-level).
     pub fn start(
         wasm: &[u8],
-        spec: &WasmCoordinatorSpec,
+        spec: &CoordinatorSpec,
         grants: Vec<u8>,
         instance: u64,
         key_seed: [u8; 32],
@@ -243,7 +241,7 @@ impl WasmCoordinator {
 
     /// Re-instantiate the coordinator module from a state-export (the standby / restart path,
     /// architecture §4.4; ABI §10.3 step 4). `capture` is the accepted snapshot a prior instance's
-    /// [`WasmCoordinator::quiesce_snapshot`] produced (its whole `CoordinatorState` as one
+    /// [`Coordinator::quiesce_snapshot`] produced (its whole `CoordinatorState` as one
     /// consensus-canonical section): `da_init` runs with the spec's genesis config, then
     /// `da_migrate(descriptor)` restores that state through the sandbox — so the resumed module
     /// continues the same logical timeline and publishes byte-identical decisions. This is the
@@ -253,7 +251,7 @@ impl WasmCoordinator {
     /// A `String` on selection/start/migrate failure (harness-level).
     pub fn start_migrating(
         wasm: &[u8],
-        spec: &WasmCoordinatorSpec,
+        spec: &CoordinatorSpec,
         grants: Vec<u8>,
         instance: u64,
         key_seed: [u8; 32],
@@ -275,7 +273,7 @@ impl WasmCoordinator {
 
     fn start_inner(
         wasm: &[u8],
-        spec: &WasmCoordinatorSpec,
+        spec: &CoordinatorSpec,
         grants: Vec<u8>,
         instance: u64,
         key_seed: [u8; 32],
@@ -336,7 +334,7 @@ impl WasmCoordinator {
     }
 
     /// Deliver a **pre-signed** frame verbatim, preserving its original `signer` (the §12.1 sender).
-    /// Unlike [`WasmCoordinator::deliver`] this does not re-sign — so a recorded `SignedMessage`
+    /// Unlike [`Coordinator::deliver`] this does not re-sign — so a recorded `SignedMessage`
     /// (e.g. a journal-captured `Input::Message`) replays into the module with its authentic sender,
     /// which is exactly what reconstructing consensus state from recorded inputs requires (a
     /// re-signed frame would change the sender and break per-peer round accounting).
@@ -461,7 +459,7 @@ impl WasmCoordinator {
     /// open a `Quiesce` drain, wait for the module to snapshot its `CoordinatorState` as a typed
     /// state-manifest and return `QuiesceReady`, then return the accepted [`SnapshotCapture`]. This
     /// consumes the instance (its `da_run` has returned). Feed the capture to
-    /// [`WasmCoordinator::start_migrating`] to re-instantiate a standby / restart from it.
+    /// [`Coordinator::start_migrating`] to re-instantiate a standby / restart from it.
     ///
     /// # Errors
     /// A `String` if the drain fails, the guest does not quiesce cleanly, or no snapshot was

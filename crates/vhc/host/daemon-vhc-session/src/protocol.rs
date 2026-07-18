@@ -12,7 +12,7 @@
 //!
 //! This is the **worker** protocol (node ↔ `daemon-vhc-host` child) — distinct from the **vhc**
 //! control protocol (`daemon-vhc.cddl`, lane P). It lives in `daemon-vhc-session` (not the client)
-//! so lane E's `daemon-vhc-host` worker implements the worker side against it in Wave 3 (§10.1:
+//! so lane E's `daemon-vhc-host` worker implements the worker side against it later (§10.1:
 //! `daemon-vhc-host` depends on `daemon-vhc-session`).
 //!
 //! **v1 retirement (WS4).** The §10.2 [`Event`] stream dropped three producer-less variants —

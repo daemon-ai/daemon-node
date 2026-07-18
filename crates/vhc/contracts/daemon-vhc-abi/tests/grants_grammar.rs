@@ -76,7 +76,7 @@ fn manifest_root_validates() {
         ("grants", map(vec![("publish", grant_bound_full())])),
     ]);
     let manifest = map(vec![
-        ("name", t("tiny-llama-c3")),
+        ("name", t("tiny-llama")),
         ("version", t("1.0.0")),
         ("sdk", t("daemon-vhc-sdk-v2")),
         ("abi", u(2 << 16)),

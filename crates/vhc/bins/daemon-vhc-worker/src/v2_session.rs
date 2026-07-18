@@ -3,18 +3,18 @@
 
 //! The worker's in-process join — the session run path for a major-2 module under a **genesis
 //! envelope v2**: node → worker `JoinRun` → re-admission (§9.4 step 10) → `start_run` (the event
-//! pump) → the run's REAL wasm coordinator (`configure_wasm_coordinator` derives the spec from
+//! pump) → the run's REAL coordinator (`configure_coordinator` derives the spec from
 //! the frozen genesis; the pinned, content-addressed `coordinator_quorum` blob runs in-process
 //! under the same major-2 event-loop driver) → frames verified + authority-judged ABOVE the pump
 //! before delivery. Consensus never runs outside the sandboxed module — the native-tick drive
-//! shell this file used to carry is gone with the v1-envelope (cell 5) form, which now refuses
+//! shell this file used to carry is gone with the v1-envelope (device-min admission pre-screen) form, which now refuses
 //! typed at assess (`EnvelopeSchemaRetired`).
 //!
 //! Seams, stated where they live:
 //! - **Coordinator configuration**: the genesis coordinator role's pinned module hash + its
 //!   verbatim opaque config (`{state: CoordinatorState}` — the host never interprets it) +
 //!   the run's declared `AuthorityConfig`, all derived by the production
-//!   `daemon_vhc_host::wasm_coordinator` seat. Every coordinator decision is
+//!   `daemon_vhc_host::coordinator` seat. Every coordinator decision is
 //!   signature-verified AND authority-judged (`authorize_coordinator_frame`) above the pump;
 //!   the original signed frame rides as tag-12 evidence.
 //! - **In-process identity contract**: this self-driven join derives the coordinator's §12.1
@@ -39,12 +39,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use daemon_vhc_host::coordinator::{
+    authorize_coordinator_frame, configure_coordinator, Coordinator,
+};
 use daemon_vhc_host::v2::{
     replay_v2, start_run, MemorySink, ReplayEnd, ReplayScript, RunEnd, RunIdentity, SinkEntry,
     V2RunConfig,
-};
-use daemon_vhc_host::wasm_coordinator::{
-    authorize_coordinator_frame, configure_wasm_coordinator, WasmCoordinator,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::messages::{
@@ -286,10 +286,10 @@ pub(crate) async fn join_and_run_v2(
     }
     let grants = derive_grants();
 
-    // The wasm-coordinator configuration, derived from the frozen genesis (the production seat:
+    // The coordinator configuration, derived from the frozen genesis (the production seat:
     // pinned module hash, verbatim opaque config, declared AuthorityConfig, cryptographic RunId).
-    let coord_spec = configure_wasm_coordinator(&genesis.frozen)
-        .map_err(|e| format!("coordinator config: {e}"))?;
+    let coord_spec =
+        configure_coordinator(&genesis.frozen).map_err(|e| format!("coordinator config: {e}"))?;
     let coordinator_wasm = crate::backend::resolve_coordinator_module(&genesis.env).await?;
 
     // Identities (module docs "in-process identity contract"): run_id-derived keys; the genesis
@@ -322,8 +322,8 @@ pub(crate) async fn join_and_run_v2(
         .map_err(|e| format!("v2 start_run: {e}"))?;
     let pump = run.pump.clone();
 
-    // -- the run's REAL wasm coordinator, in-process under the major-2 driver --------------------
-    let mut coord = WasmCoordinator::start(
+    // -- the run's REAL coordinator, in-process under the major-2 driver --------------------
+    let mut coord = Coordinator::start(
         &coordinator_wasm,
         &coord_spec,
         derive_grants(),

@@ -4,7 +4,7 @@
 //! Capture the **v2-native trainer goldens** as a content-addressed recorded fixture — the
 //! successor drift oracle that lets the recorded v1 parity oracle retire (retirement plan §3).
 //!
-//! The recorded lane is the compute@2 trainer guest (`tiny-llama-c3`): a real Burn LLaMA over
+//! The recorded lane is the compute@2 trainer guest (`tiny-llama`): a real Burn LLaMA over
 //! `Autodiff<HostBackend>`, det-lane ingest in-guest (`daemon-vhc-sdk-profiles::SparseLoco`),
 //! `BarrierRound` choreography, kind-0 byte staging. The capture drives it through a single-peer
 //! barrier whole-run and records, per round:
@@ -63,9 +63,9 @@ use daemon_vhc_sdk_profiles::{
 };
 use serde::{Deserialize, Serialize};
 
-// The pinned parity shape (the c3_parity harness shape): 1 layer, seq 9, 2 rounds x 2 inner steps,
+// The pinned parity shape (the trainer_parity harness shape): 1 layer, seq 9, 2 rounds x 2 inner steps,
 // micro-batch 2, vocab 64, single-peer roster. Small, deterministic, fast — the frozen-pin shape
-// the v1 oracle and the C3c equality proof both use.
+// the v1 oracle and the det-equality equality proof both use.
 const ROUNDS: u64 = 2;
 const STEPS_PER_ROUND: u32 = 2;
 const MICRO_BATCH: u32 = 2;
@@ -94,7 +94,7 @@ struct ModelCfgLit {
     wd: f64,
 }
 
-// -- guest build (the shared c3_parity pattern) --------------------------------------------------
+// -- guest build (the shared trainer_parity pattern) --------------------------------------------------
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -129,10 +129,10 @@ fn build_and_read_guest(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-// -- schedule + wire shapes (the c3 module contract) ---------------------------------------------
+// -- schedule + wire shapes (the trainer module contract) ---------------------------------------------
 
-/// Deterministic varied tokens for `(round, step)` — identical on every path (the c3_parity
-/// schedule, so the goldens sit on the same trajectory the C3c equality proof pins).
+/// Deterministic varied tokens for `(round, step)` — identical on every path (the trainer_parity
+/// schedule, so the goldens sit on the same trajectory the det-equality equality proof pins).
 fn tokens_for(round: u64, step: u32) -> Vec<u32> {
     let n = u64::from(MICRO_BATCH * SEQ_LEN);
     (0..n)
@@ -224,7 +224,7 @@ fn theta_from_le(bytes: &[u8], numels: &[usize]) -> Vec<Vec<f32>> {
     split_params(&flat, numels)
 }
 
-/// The guest config map (canonical CBOR — the c3 `GuestCfg`).
+/// The guest config map (canonical CBOR — the trainer `GuestCfg`).
 fn guest_cfg_bytes(model: &ModelCfgLit, profile: &SparseLocoCfg, init: &[Vec<f32>]) -> Vec<u8> {
     let flat: Vec<f32> = init.iter().flatten().copied().collect();
     let map = Value::Map(vec![
@@ -304,7 +304,7 @@ fn service_puts(pump: &daemon_vhc_host::v2::PumpHandle) {
     }
 }
 
-/// Drive the c3 guest through the single-peer barrier whole-run once, recording the goldens.
+/// Drive the trainer guest through the single-peer barrier whole-run once, recording the goldens.
 fn capture_once(
     wasm: &[u8],
     model: &ModelCfgLit,
@@ -314,7 +314,7 @@ fn capture_once(
 ) -> Captured {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let sel = daemon_vhc_host::select_driver(&worker, wasm, Some(blake3::hash(wasm).as_bytes()))
-        .expect("c3 guest admitted");
+        .expect("trainer guest admitted");
     assert_eq!(sel.driver, daemon_vhc_abi::CandidateDriver::V2);
     assert_eq!(
         (sel.major, sel.minor),
@@ -336,7 +336,7 @@ fn capture_once(
         Vec::new(),
     );
     // A real transformer's per-round op stream exceeds the tiny default queue depth (the guest
-    // also fences per inner step to reclaim depth) — the c3_parity setting.
+    // also fences per inner step to reclaim depth) — the trainer_parity setting.
     run_cfg.compute_queue_depth = 1 << 20;
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, run_cfg, Box::new(sink)).expect("start");
@@ -576,7 +576,7 @@ fn main() {
         "recorded numels match the init length"
     );
 
-    let wasm = build_and_read_guest("tiny_llama_c3");
+    let wasm = build_and_read_guest("tiny_llama");
 
     // Capture twice and prove byte-identity before writing anything.
     let first = capture_once(&wasm, &model, &profile_cfg, &numels, &init);
@@ -613,7 +613,7 @@ fn main() {
         "captured_from": {
             "commit": commit,
             "tree": "vhc/trainer-goldens (the current tree — the live compute@2 trainer lane)",
-            "trainer": "compute@2 tiny-llama-c3 (real Burn LLaMA over Autodiff<HostBackend>, \
+            "trainer": "compute@2 tiny-llama (real Burn LLaMA over Autodiff<HostBackend>, \
                         SparseLoco det-lane ingest in-guest, BarrierRound, kind-0 staging)",
             "compute_lane": "host ndarray ComputeRunner (the compute@2 host execution backend at \
                              this commit; EngineConfig.backend does not select the compute@2 tier)",
@@ -621,11 +621,11 @@ fn main() {
         },
         "provenance": "HISTORICAL (the v1 parity oracle retired with the v1 parity lanes, \
                        retirement plan §3): v1 parity oracle (matched init + config literals) -> \
-                       c3_parity C3c green at the original capture commit -> these goldens. The \
+                       trainer_parity det-equality green at the original capture commit -> these goldens. The \
                        matched init now lives in this self-contained bundle (init.f32le.bin). See \
                        ../README.md for the full historical chain and the exact comparison surface.",
         "module": {
-            "name": "tiny_llama_c3.wasm",
+            "name": "tiny_llama.wasm",
             "blake3": hex(blake3_hash(&wasm).as_bytes()),
             "bytes": wasm.len(),
             "source": "guests/target build at capture (byte-identical across checkout paths via \

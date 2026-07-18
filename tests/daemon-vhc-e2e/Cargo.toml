@@ -16,7 +16,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 # The peer-side round engine + the local-coordinator harness + churn/failure drill machinery
 # (feature-gated). Merge 2 swapped the scripted coordinator for the real `daemon-vhc-coordinator`
-# tick loop; Wave 3 (R3) adds the drills over the same harness.
+# tick loop; the drills (R3) run over the same harness.
 daemon-vhc-session = { workspace = true, features = ["harness"] }
 daemon-vhc-proto = { workspace = true }
 # The payload store + `PayloadStore` trait: the desync drill fetches checkpoint + payload bytes for

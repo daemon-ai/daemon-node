@@ -21,10 +21,10 @@
 //!   the source inside the signed path), then the ABI §1.3 driver selection + the A2
 //!   claim()-admission funnel → `Assessed`. **A raw config-CBOR envelope is refused typed
 //!   (`UnsignedEnvelopeRetired`, D0), a schema-major-1 envelope is refused typed
-//!   (`EnvelopeSchemaRetired` — the v1 form cannot configure a wasm coordinator), and a major-1
+//!   (`EnvelopeSchemaRetired` — the v1 form cannot configure a coordinator), and a major-1
 //!   module is refused typed (`AbiUnsupportedMajor`)** — the flipped A0 fixture pins the last.
 //! - `JoinRun` → the v2 session run (`v2_session::join_and_run_v2`): the event pump over the
-//!   run's REAL wasm coordinator, configured from the genesis and run in-process under the same
+//!   run's REAL coordinator, configured from the genesis and run in-process under the same
 //!   major-2 driver (consensus never runs outside the sandboxed, content-addressed module).
 //! - `Leave`/`Shutdown`/`Ping` → as the protocol requires.
 //!
@@ -144,7 +144,7 @@ async fn main() {
                     continue;
                 }
                 // The v2 session run: a genesis (envelope-v2) run coordinated by its REAL wasm
-                // coordinator module, run in-process. The v1-envelope (cell 5) form refused
+                // coordinator module, run in-process. The v1-envelope (device-min admission pre-screen) form refused
                 // typed at assess (`EnvelopeSchemaRetired`), so an assessed run always carries
                 // a genesis — the guard fails loud if a caller somehow joins past a refusal.
                 let Some(genesis) = resolved.genesis.as_ref() else {
@@ -191,7 +191,7 @@ async fn main() {
                 // live instance to switch here. A running instance is driven through the node
                 // command surface (`WorkerControl::switch_module`), where the transaction has the
                 // live pump/admission/migrate path in hand; the long-lived in-process join that
-                // would hold an instance across `SwitchModule` arrives with the wasm-coordinator
+                // would hold an instance across `SwitchModule` arrives with the coordinator
                 // re-seat of the worker session.
                 send(
                     &writer,

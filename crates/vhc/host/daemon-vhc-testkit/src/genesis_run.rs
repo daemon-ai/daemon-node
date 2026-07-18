@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! **Cell 8** — the mixed-fleet matrix's target end-state (decisions D3): wasm coordinator ×
+//! **End-state** — the mixed-fleet matrix's target end-state (decisions D3): coordinator ×
 //! v2 workers × envelope v2, as a whole-run harness (refactor §8/D2 acceptance: "the matrix
-//! cells for {wasm coordinator × v1/v2 workers} pass").
+//! cells for {coordinator × v1/v2 workers} pass").
 //!
-//! N production `tiny_llama_c3.wasm` trainers (the compute@2 reference worker: a real Burn
+//! N production `tiny_llama.wasm` trainers (the compute@2 reference worker: a real Burn
 //! LLaMA, det-lane ingest in-guest, kind-0 byte staging) train real barrier rounds under the
 //! production `coordinator_quorum.wasm` blob — **both** sides running under the real major-2
 //! event-loop driver, journaled, §8.7 replay-verified. The harness plays the network +
@@ -28,7 +28,7 @@
 //! the post-ingest canonical state) — never a host-side re-derivation. Cross-worker digest
 //! agreement is asserted over those voices.
 //!
-//! The run is configured **from a genesis envelope v2** ([`crate::configure_wasm_coordinator`]) —
+//! The run is configured **from a genesis envelope v2** ([`crate::configure_coordinator`]) —
 //! the coordinator module hash pinned in the role set, its opaque config carried verbatim, the
 //! `SingleKey` identity in `[identities]` — which is exactly what makes the envelope-v1 matrix
 //! cells typed refusals.
@@ -56,10 +56,8 @@ use daemon_vhc_proto::{
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
+use crate::coordinator::{authorize_coordinator_frame, configure_coordinator, Coordinator};
 use crate::run::Decision;
-use crate::wasm_coordinator::{
-    authorize_coordinator_frame, configure_wasm_coordinator, WasmCoordinator,
-};
 
 /// Tokens per sequence for the staged batches (the t2 geometry; real corpora are `data@2`).
 pub const SEQ_LEN: u32 = 9;
@@ -164,7 +162,7 @@ impl FaultPlan {
 //
 // The testkit links `host/*` + `contracts/*` only — never `sdk/*` — so the compute@2 trainer's
 // config is authored as **raw canonical CBOR** against the guest's documented schema
-// (`guests/tiny-llama-c3`: `{"model": ModelCfg, "peer": bstr32, "roster": [bstr32…],
+// (`guests/tiny-llama`: `{"model": ModelCfg, "peer": bstr32, "roster": [bstr32…],
 // "steps_per_round": uint, "micro_batch": uint, "stall_rounds_max": uint,
 // "profile": SparseLocoCfg, "init": [f32…]}`). The literals are the t2 parity shape (the
 // worker-binary genesis join authors the same tiny model). If the guest schema ever moves, this
@@ -343,8 +341,8 @@ fn voices_for(voices: &[(u64, u64, Vec<u8>)], tag: u64, round: u64) -> usize {
 
 // -- the whole-run harness --------------------------------------------------------------------------
 
-/// How a cell-8 whole run is set up.
-pub struct Cell8Spec {
+/// How a end-state whole run is set up.
+pub struct GenesisRunSpec {
     /// A stable run label (the genesis `run_label`; the `RunId` is the genesis hash).
     pub run_label: String,
     /// Wasm workers to run (2+ is the multi-worker shape). Worker `i` gets instance `i + 1`.
@@ -362,7 +360,7 @@ pub struct Cell8Spec {
     pub timeout: Duration,
 }
 
-impl Cell8Spec {
+impl GenesisRunSpec {
     /// A spec with the t2 per-worker geometry (`steps_per_round = 2`, one sequence per inner step
     /// per worker).
     #[must_use]
@@ -380,7 +378,7 @@ impl Cell8Spec {
 }
 
 /// One worker's observable product.
-pub struct Cell8WorkerReport {
+pub struct GenesisWorkerReport {
     /// The worker's peer identity.
     pub peer: PeerId,
     /// How its run ended.
@@ -397,7 +395,7 @@ pub struct Cell8WorkerReport {
     pub replay_decisions: usize,
 }
 
-impl Cell8WorkerReport {
+impl GenesisWorkerReport {
     /// Count this worker's tag-4 digest voices for `round`.
     #[must_use]
     pub fn digests_for(&self, round: u64) -> usize {
@@ -406,12 +404,12 @@ impl Cell8WorkerReport {
 }
 
 /// The whole run's observable product.
-pub struct Cell8Report {
+pub struct GenesisRunReport {
     /// Per-worker reports, worker-index order.
-    pub workers: Vec<Cell8WorkerReport>,
+    pub workers: Vec<GenesisWorkerReport>,
     /// Rounds driven to a record.
     pub rounds_done: u64,
-    /// `RoundRecord`s the wasm coordinator published, in order.
+    /// `RoundRecord`s the coordinator published, in order.
     pub coordinator_records: u64,
     /// How the coordinator's run ended.
     pub coordinator_end: RunEnd,
@@ -419,7 +417,7 @@ pub struct Cell8Report {
     pub run_id: Hash,
 }
 
-impl Cell8Report {
+impl GenesisRunReport {
     /// True iff every worker ended cleanly with a matching §8.7 replay, all workers agree on the
     /// guest-voiced det-lane digest, the coordinator recorded every driven round, and it ended
     /// cleanly.
@@ -437,7 +435,7 @@ impl Cell8Report {
     }
 }
 
-/// Author the cell-8 **genesis envelope v2** for a barrier run: the coordinator role pinning the
+/// Author the end-state **genesis envelope v2** for a barrier run: the coordinator role pinning the
 /// `coordinator_quorum.wasm` blob with its opaque `{state: CoordinatorState}` config, one trainer
 /// role pinning the worker blob, and the envelope-named `SingleKey` coordinator identity.
 ///
@@ -446,7 +444,7 @@ impl Cell8Report {
 /// envelope at D0). Phase deadlines are effectively infinite: the run is driven entirely by
 /// event-driven fast paths so the guest's synthetic clock (one tick per event) suffices.
 #[must_use]
-pub fn cell8_genesis(
+pub fn genesis_envelope(
     run_label: &str,
     coordinator_wasm_blake3: Hash,
     worker_wasm_blake3: Hash,
@@ -505,7 +503,7 @@ pub fn cell8_genesis(
     artifacts.insert(
         "worker.wasm".to_string(),
         SnapshotArtifact {
-            url: "r2://mods/tiny_llama_c3.wasm".into(),
+            url: "r2://mods/tiny_llama.wasm".into(),
             blake3: worker_wasm_blake3,
             size: None,
         },
@@ -723,17 +721,17 @@ fn assigned_len(window: BatchWindow, seed: Seed, roster: &[PeerId], peer: &PeerI
 }
 
 /// Drive the whole run: N production compute@2 trainers through `spec.rounds` barrier rounds
-/// under the production wasm coordinator, configured from a genesis envelope v2; then stop
+/// under the production coordinator, configured from a genesis envelope v2; then stop
 /// everything cleanly and §8.7 replay-verify each worker.
 ///
 /// # Errors
 /// A `String` on any harness-level failure.
 #[allow(clippy::too_many_lines)]
-pub fn cell8_whole_run(
+pub fn genesis_whole_run(
     coordinator_wasm: &[u8],
     worker_wasm: &[u8],
-    spec: &Cell8Spec,
-) -> Result<Cell8Report, String> {
+    spec: &GenesisRunSpec,
+) -> Result<GenesisRunReport, String> {
     let coord_hash = Hash(*blake3::hash(coordinator_wasm).as_bytes());
     let worker_hash = *blake3::hash(worker_wasm).as_bytes();
     let grants = phase_a_grants();
@@ -741,20 +739,21 @@ pub fn cell8_whole_run(
     // Identities: the coordinator's §12.1 frame key IS the envelope-named SingleKey identity
     // (launch topology, architecture §4.4); worker node keys are index-derived.
     let coord_key_seed =
-        *blake3::hash(format!("cell8-coordinator/{}", spec.run_label).as_bytes()).as_bytes();
+        *blake3::hash(format!("genesis_run-coordinator/{}", spec.run_label).as_bytes()).as_bytes();
     let coord_identity = peer_id(&SigningKey::from_bytes(&coord_key_seed));
     let worker_keys: Vec<SigningKey> = (0..spec.workers)
         .map(|i| {
             SigningKey::from_bytes(
-                blake3::hash(format!("cell8-worker/{}/{i}", spec.run_label).as_bytes()).as_bytes(),
+                blake3::hash(format!("genesis_run-worker/{}/{i}", spec.run_label).as_bytes())
+                    .as_bytes(),
             )
         })
         .collect();
     let roster: Vec<PeerId> = worker_keys.iter().map(peer_id).collect();
 
-    // The genesis envelope v2 + the wasm-coordinator configuration derived from it (the
+    // The genesis envelope v2 + the coordinator configuration derived from it (the
     // configuration half — the exact seat that REFUSES under envelope v1).
-    let genesis = cell8_genesis(
+    let genesis = genesis_envelope(
         &spec.run_label,
         coord_hash,
         Hash(worker_hash),
@@ -764,16 +763,16 @@ pub fn cell8_whole_run(
         spec.global_batch,
     );
     let author = SigningKey::from_bytes(
-        blake3::hash(format!("cell8-author/{}", spec.run_label).as_bytes()).as_bytes(),
+        blake3::hash(format!("genesis_run-author/{}", spec.run_label).as_bytes()).as_bytes(),
     );
     let frozen = genesis
         .freeze(&author)
         .map_err(|e| format!("genesis freeze: {e}"))?;
     let coord_spec =
-        configure_wasm_coordinator(&frozen).map_err(|e| format!("coordinator config: {e}"))?;
+        configure_coordinator(&frozen).map_err(|e| format!("coordinator config: {e}"))?;
     let run_id = coord_spec.run_id;
 
-    let mut coord = WasmCoordinator::start(
+    let mut coord = Coordinator::start(
         coordinator_wasm,
         &coord_spec,
         grants.clone(),
@@ -803,7 +802,8 @@ pub fn cell8_whole_run(
             module: worker_hash,
         };
         let key_seed =
-            *blake3::hash(format!("cell8-frame-key/{}/{i}", spec.run_label).as_bytes()).as_bytes();
+            *blake3::hash(format!("genesis_run-frame-key/{}/{i}", spec.run_label).as_bytes())
+                .as_bytes();
         let sink = Arc::new(Mutex::new(MemorySink::new()));
         let mut run_cfg =
             V2RunConfig::new(identity.clone(), key_seed, config.clone(), grants.clone());
@@ -1123,7 +1123,7 @@ pub fn cell8_whole_run(
             .collect();
         let replay_matched = redriven == recorded && matches!(replayed.end, ReplayEnd::Outcome(_));
 
-        reports.push(Cell8WorkerReport {
+        reports.push(GenesisWorkerReport {
             peer: w.peer,
             end,
             voices,
@@ -1135,7 +1135,7 @@ pub fn cell8_whole_run(
 
     let coordinator_end = coord.stop()?;
 
-    Ok(Cell8Report {
+    Ok(GenesisRunReport {
         workers: reports,
         rounds_done,
         coordinator_records,

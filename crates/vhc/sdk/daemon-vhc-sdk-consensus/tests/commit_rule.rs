@@ -132,7 +132,7 @@ fn proto6_witness_quorum_gate() {
     assert!(has_evidence(&rs, &pid(1), &payload_hash(30)));
 }
 
-// ----- §6.4 root-only attestation coverage (Wave 3) -----
+// ----- §6.4 root-only attestation coverage -----
 
 fn bare_root_attest(pairs: &[(PeerId, Hash)]) -> Attestation {
     Attestation {

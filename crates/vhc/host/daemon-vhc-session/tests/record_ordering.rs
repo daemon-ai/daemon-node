@@ -3,7 +3,7 @@
 
 //! Cross-crate consensus invariant (§6.4 I3): record staging order == proto set-commitment order.
 //!
-//! `TrainerBackend::ingest` folds staged payloads in caller-supplied order, and the Wave-2 round
+//! `TrainerBackend::ingest` folds staged payloads in caller-supplied order, and the round
 //! loop MUST stage in `RoundRecord` order — the committed set sorted by node public-key bytes. The
 //! proto crate is the single authority for that order: `commit_set` sorts the `(peer, hash)` set by
 //! `PeerId` byte order (then hash) before committing. This test pins the two to the *same* key so a

@@ -8,7 +8,7 @@
 // join / throttle) against real guest modules.
 //
 // **Post-sunset shape (decisions D5)**: the v1 five-phase driver retired at the Phase-E sunset,
-// so this suite's positive arms drive the REAL major-2 module (`tiny_llama_c3.wasm` — the v2
+// so this suite's positive arms drive the REAL major-2 module (`tiny_llama.wasm` — the v2
 // whole-run itself is `tests/v2_join.rs`), and the suite carries the WIRE-LEVEL sunset
 // regressions over the real binary:
 //   * assessing a SYNTHETIC ABI-major-1 module (a few-section wasm image hand-assembled in-test
@@ -435,7 +435,7 @@ fn supervisor_for(module: &Path) -> TrainSupervisor {
 /// exists — the retired bridge is a typed refusal, not a capability.
 #[tokio::test]
 async fn supervisor_probe_reports_major2_worlds_and_custom_ops() {
-    let module = module_path("tiny_llama_c3.wasm");
+    let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
     let hw = sup.probe().await.expect("probe");
@@ -472,7 +472,7 @@ async fn supervisor_probe_reports_major2_worlds_and_custom_ops() {
 
 /// WS6 regression (the crash-loop meltdown fix): the shipped `[vhc]` config default names the
 /// REAL worker binary, and a binary of that name speaks `Event::Ready` when the supervisor spawns
-/// it. Before the v1-retirement the default was `"daemon-vhc"` — the Wave-0 scaffold that printed a
+/// it. Before the v1-retirement the default was `"daemon-vhc"` — the initial scaffold that printed a
 /// version line and exited, so a stock `[vhc] enabled` node crash-looped its supervisor on spawn
 /// (the negative half of this contract is the `supervisor_meltdown` unit test over a bogus path).
 /// `Worker::spawn` blocks on `Event::Ready`, so a successful `probe()` here proves the configured
@@ -495,7 +495,7 @@ async fn configured_default_worker_path_names_a_binary_that_speaks_ready() {
     );
 
     // Spawn it exactly as the node would; the supervisor blocks until the worker reports `Ready`.
-    let module = module_path("tiny_llama_c3.wasm");
+    let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
     sup.probe()
         .await
@@ -545,7 +545,7 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
 /// whole-run join is `tests/v2_join.rs`).
 #[tokio::test]
 async fn v2_module_assesses_eligible_over_the_signed_envelope() {
-    let module = module_path("tiny_llama_c3.wasm");
+    let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
     let elig = sup
@@ -561,12 +561,12 @@ async fn v2_module_assesses_eligible_over_the_signed_envelope() {
 }
 
 /// The retired schema-major-1 envelope form refuses TYPED at assess (`EnvelopeSchemaRetired`):
-/// a v1 envelope cannot configure a wasm coordinator (no coordinator role entry, no
+/// a v1 envelope cannot configure a coordinator (no coordinator role entry, no
 /// Authority/identities section), so the worker refuses it before any module is fetched — and
 /// stays healthy on the same process.
 #[tokio::test]
 async fn v1_envelope_assess_is_refused_envelope_schema_retired() {
-    let module = module_path("tiny_llama_c3.wasm");
+    let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
     let err = sup
@@ -587,7 +587,7 @@ async fn v1_envelope_assess_is_refused_envelope_schema_retired() {
 /// stable `UnsignedEnvelopeRetired` slug even when `DAEMON_TRAIN_MODULE` is set.
 #[tokio::test]
 async fn unsigned_raw_config_assess_is_refused_with_typed_slug() {
-    let module = module_path("tiny_llama_c3.wasm");
+    let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
     let raw = to_canonical_vec(&v2_guest_config()).expect("raw config cbor");
@@ -607,7 +607,7 @@ async fn unsigned_raw_config_assess_is_refused_with_typed_slug() {
 /// the worker survives the lever and serves a fresh assess on the same process.
 #[tokio::test]
 async fn throttle_is_harmless_and_never_respawns() {
-    let module = module_path("tiny_llama_c3.wasm");
+    let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
     sup.assess(genesis_wire("run-9", v2_guest_config()))
