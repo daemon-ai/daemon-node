@@ -3019,19 +3019,40 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     if cfg.vhc.enabled {
         match daemon_vhc_node::VhcStore::open(cfg.data_dir.join("vhc.db")) {
             Ok(store) => {
-                let worker: Arc<dyn daemon_vhc_node::WorkerControl> =
-                    Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(
-                        daemon_vhc_supervisor::TrainClientConfig::new(&cfg.vhc.worker_path),
+                // The vhc identity keystore home (base identity, iroh transport secret, per-run
+                // keys). Workers receive it as a path REFERENCE via the environment and resolve
+                // key material against the store themselves — secrets never ride command
+                // payloads or journals.
+                let identity_dir = if cfg.vhc.identity_dir.is_empty() {
+                    cfg.data_dir.join("vhc").join("identity")
+                } else {
+                    std::path::PathBuf::from(&cfg.vhc.identity_dir)
+                };
+                let worker_cfg = |path: &str| {
+                    let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(path);
+                    wc.env.push((
+                        daemon_vhc_session::keystore::IDENTITY_DIR_ENV.to_string(),
+                        identity_dir.display().to_string(),
                     ));
+                    wc
+                };
+                let worker: Arc<dyn daemon_vhc_node::WorkerControl> = Arc::new(
+                    daemon_vhc_supervisor::TrainSupervisor::new(worker_cfg(&cfg.vhc.worker_path)),
+                );
                 // Phase E multi-instance supervision (decisions D1/D6): every admitted join gets
                 // its OWN supervised worker subprocess (one sandbox = one role-instance) — the
                 // pre-E single-shared-child interim is lifted. Admission is arbitrated by the
                 // service's OwnerArbiter (permissive until an owner budget is configured).
                 let worker_path = cfg.vhc.worker_path.clone();
+                let factory_identity_dir = identity_dir.clone();
                 let worker_factory: daemon_vhc_node::service::WorkerFactory = Arc::new(move || {
-                    Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(
-                        daemon_vhc_supervisor::TrainClientConfig::new(&worker_path),
-                    )) as Arc<dyn daemon_vhc_node::WorkerControl>
+                    let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(&worker_path);
+                    wc.env.push((
+                        daemon_vhc_session::keystore::IDENTITY_DIR_ENV.to_string(),
+                        factory_identity_dir.display().to_string(),
+                    ));
+                    Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(wc))
+                        as Arc<dyn daemon_vhc_node::WorkerControl>
                 });
                 let weak = Arc::downgrade(&node);
                 let feed: daemon_vhc_node::NodeFeed = Arc::new(move |ev| {

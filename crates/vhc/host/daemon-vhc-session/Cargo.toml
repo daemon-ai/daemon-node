@@ -83,6 +83,9 @@ xxhash-rust = { workspace = true }
 # Same as the coordinator: the `cfg(test)` harness build uses observe's `digest_tally` / `DesyncVerdict`
 # (the desync trigger) even with the `harness` feature off.
 daemon-vhc-observe = { workspace = true }
+# Keystore lifecycle tests need throwaway on-disk stores (same direct-version pattern as the
+# node crate's dev-dep).
+tempfile = "3"
 # The `[vhc]` config-section extraction test (§10.6) layers a figment the way the node config does;
 # `test` adds `figment::Jail` for hermetic env fixtures. Test-only — the struct itself is serde-only.
 figment = { workspace = true, features = ["test"] }
