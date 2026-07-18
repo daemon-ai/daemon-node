@@ -400,16 +400,6 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-host", "--test", "v2_claim_funnel"],
         ),
         (
-            // The §2.5 tabi@1 bridge under major-2 (the choreography sitting): the SAME frozen
-            // dispatch as the v1 driver, genericized over the store — registration only in
-            // da_init (PhaseViolation otherwise), slice-class arenas cleared per Delivered
-            // (StaleHandle across a boundary), nr-class readouts journaled under §2.7 kinds.
-            // The driver-selection lane above proves the frozen tabi@1 vocabulary is still
-            // recognized while a major-1 module is refused.
-            "A2 tabi@1 bridge under the v2 driver (§2.5 legality + slice arenas + nr journal)",
-            &["-p", "daemon-vhc-host", "--test", "v2_bridge"],
-        ),
-        (
             // The v2 input-replay step (refactor §5 A1→A2 acceptance; §12.6 journal soak for
             // v2): recorded runs (toy averager: timers/clock; bridge guest: nr readouts +
             // staged kinds 1/2) re-driven from the journal alone through the §8.7 verifier
@@ -428,17 +418,6 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             // its own lane (also covered by the host crate suite below).
             "B2 sys@2 crypto accel conformance (host ≡ in-guest contract: hash/verify_sig)",
             &["-p", "daemon-vhc-host", "--test", "v2_crypto"],
-        ),
-        (
-            // The Phase-C det-reclassification conformance gate (architecture §3.2/§3.6, refactor
-            // §7; §10 gate row "Det host-op ≡ in-guest-crate"): the host `det_*` accel bodies the
-            // worker runs (OpBackend, via the reference CpuBackend) ≡ the normative dual-compiled
-            // `daemon_vhc_det` crate the in-guest fallback also compiles — bit-identical (equality
-            // class) for EVERY det accel op over a wide deterministic sweep, plus the DET_ACCEL_OPS
-            // coverage guard. The det twin of the crypto lane above; also covered by the host crate
-            // suite below.
-            "C2 det reclassification conformance (host det_* ≡ in-guest daemon-vhc-det)",
-            &["-p", "daemon-vhc-host", "--test", "v2_det_conformance"],
         ),
         (
             // The Phase-C custom-op registry gate (architecture §3.2, refactor §7): versioned
@@ -495,10 +474,6 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-worker", "--features", "burn-ndarray"],
         ),
         (
-            "daemon-vhc-sdk (SDK profile goldens: sparse_loco/diloco)",
-            &["-p", "daemon-vhc-sdk", "--features", "sim"],
-        ),
-        (
             // The C3a models-exodus profiles gate (refactor §7 "profiles re-express over Burn
             // tensors + det math in sdk/daemon-vhc-sdk-profiles"): the re-expressed
             // SparseLoco/DiLoCo/Demo reproduce the CURRENT SDK profile implementation bit-for-bit
@@ -533,7 +508,7 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             // A2 migrate/main! scaffolding (refactor §5 A2 item 4; ABI §10): state round-trips
             // in sim through the typed manifest protocol; the SDK-derived claim/manifest match
             // the §9.1/§6.2 wire schema the admission funnel decodes. The macro's exports are
-            // exercised for real by the tiny-llama-v2 guest in the host driver + whole-run suites.
+            // exercised for real by the compute@2 trainer guest in the whole-run suites.
             "daemon-vhc-sdk-v2 (main!/migrate scaffolding: sim round-trips + derivations)",
             &["-p", "daemon-vhc-sdk-v2"],
         ),
@@ -598,13 +573,12 @@ fn swarm_ci_t2() -> anyhow::Result<()> {
             // Host-side whole runs over the PRODUCTION blobs: wasmtime + simulated capability
             // providers, journaled end-to-end, re-driven through the §8.7 input-replay engine —
             // every decision reproduced bit-for-bit. Covers the toy_averager whole run, the
-            // tiny_llama_v2 barrier whole runs under the in-process native coordinator (single-
-            // and 2-worker with cross-worker det-digest agreement; SDK-free raw-CBOR config), the
-            // adversarial-rig pinned cases (duplicate record deduped; delayed payloads →
-            // straggle → catch-up), and — from D2 — the wasm-coordinator lanes: the 20-round
-            // dual-compilation identity gate, the mixed-fleet matrix cells for
-            // {wasm coordinator × v1/v2 workers} (cell 8 positive + cells 3/4/7 typed negatives),
-            // the pump-hold back-pressure rig, and the failover drill.
+            // compute@2 trainer barrier whole runs under the production wasm coordinator
+            // (single- and 2-worker with cross-worker agreement over the guest-voiced det
+            // digests; SDK-free raw-CBOR config), the adversarial-rig pinned cases (duplicate
+            // record deduped; delayed payloads → stall → catch-up), the mixed-fleet matrix
+            // cells (the whole-run positive + the envelope-v1 typed negatives), the pump-hold
+            // back-pressure rig, and the failover drill.
             "daemon-vhc-testkit (production-blob whole runs + D2 wasm-coordinator lanes)",
             &["-p", "daemon-vhc-testkit"],
         ),
@@ -688,13 +662,6 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "RETAINED post-E1 — the state-dict layout oracle in the converter's tests (the \
              checkpoint wiring itself landed at E1); retires if the oracle re-seats onto a \
              recorded layout fixture [dev-dep]",
-        ),
-        (
-            "daemon-vhc-worker",
-            "daemon-vhc-sdk",
-            "post-E — TinyLlamaCfg authors the tiny-llama-v2 guest config in the worker protocol \
-             + v2-join suites (the guest itself links the SDK preset — the frozen parity pins' \
-             module); retires if the suites inline recorded config bytes [dev-dep]",
         ),
         // --- D0/D2: host/* -> sdk/daemon-vhc-sdk-consensus. The assignment math moved out of the
         // proto at D0 (proto is algorithm-free, enforced below); the pure coordinator `tick`

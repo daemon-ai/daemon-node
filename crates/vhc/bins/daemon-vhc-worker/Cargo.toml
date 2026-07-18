@@ -80,10 +80,6 @@ swarm-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress"]
 # node-side supervisor and directly over the provision cut, against a real tiny-llama `.wasm`.
 daemon-vhc-supervisor = { workspace = true }
 daemon-common = { workspace = true }
-# Test-only: `TinyLlamaCfg` for the guest config the worker assesses. NOTE: a tracked
-# dependency-direction exception (model presets leave the SDK for `guests/` in Phase C) —
-# registered in xtask's `vhc_dep_check` EXCEPTIONS.
-daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk", features = ["sim"] }
 # Test-only: the genesis-authoring vocabulary for the in-process join suite — the coordinator
 # role's opaque config is an authored `{state: CoordinatorState}` and the run's trust topology a
 # typed `AuthorityConfig` (both consensus-SDK types). The RUNTIME native-tick edge this crate

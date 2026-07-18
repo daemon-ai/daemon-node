@@ -68,7 +68,7 @@ use daemon_vhc_sdk_consensus::{
     DEFAULT_RECORDS_CHANNEL,
 };
 use daemon_vhc_session::replay_sandbox::WasmCoordinatorSandbox;
-use daemon_vhc_testkit::barrier::phase_a_grants;
+use daemon_vhc_testkit::cell8::phase_a_grants;
 use daemon_vhc_testkit::{WasmCoordinator, WasmCoordinatorSpec};
 
 // -- guest build (the established testkit pattern) -------------------------------------------------

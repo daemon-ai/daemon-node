@@ -132,7 +132,7 @@ fn hold_forces_deterministic_spoolfull_and_senderquota_then_releases_clean() {
         identity,
         *blake3::hash(b"pump-hold/key").as_bytes(),
         coordinator_config(),
-        daemon_vhc_testkit::barrier::phase_a_grants(),
+        daemon_vhc_testkit::cell8::phase_a_grants(),
     );
     // Tiny bounds so the back-pressure verdicts hit deterministically.
     run_cfg.spool_frames = 3;

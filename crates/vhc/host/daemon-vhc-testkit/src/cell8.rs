@@ -5,26 +5,33 @@
 //! v2 workers × envelope v2, as a whole-run harness (refactor §8/D2 acceptance: "the matrix
 //! cells for {wasm coordinator × v1/v2 workers} pass").
 //!
-//! The wasm twin of [`crate::barrier`]: N production `tiny_llama_v2.wasm` workers train real
-//! barrier rounds under the production `coordinator_quorum.wasm` blob — **both** sides running
-//! under the real major-2 event-loop driver, journaled, §8.7 replay-verified. The harness plays
-//! the network + async-runtime seats only:
+//! N production `tiny_llama_c3.wasm` trainers (the compute@2 reference worker: a real Burn
+//! LLaMA, det-lane ingest in-guest, kind-0 byte staging) train real barrier rounds under the
+//! production `coordinator_quorum.wasm` blob — **both** sides running under the real major-2
+//! event-loop driver, journaled, §8.7 replay-verified. The harness plays the network +
+//! async-runtime seats only:
 //!
 //! - **coordinator → workers**: the coordinator's §12.1-signed publishes are decoded, checked
 //!   against the envelope-named `SingleKey` identity (the D2 thin `Authority` seam at the network
 //!   seat — D1's `Authority::accept` replaces the judgment), and relayed to each worker pump with
 //!   the original signed frame as tag-12 evidence;
-//! - **workers → coordinator**: each worker's control publishes (`Commitment`/`Digest`) are
-//!   re-signed as wire `SignedMessage`s under the worker's node key and delivered to the
-//!   coordinator pump as host-verified frames;
-//! - **payload plane**: the harness services `payload_put`, verifies the guest's commitment hash
+//! - **workers → coordinator**: each worker's module-tagged control voices — the tag-3 commitment
+//!   hash and the tag-4 post-ingest det digest — are re-signed as wire `SignedMessage`s under the
+//!   worker's node key and delivered to the coordinator pump as host-verified frames (the same
+//!   relay shape as the worker binary's self-driven join);
+//! - **payload plane**: the harness services `payload_put`, verifies the guest's tag-3 voice
 //!   covers exactly the serviced bytes, authors the availability `StorageReceipt`, and stages the
-//!   record-listed payload set to every worker (record order, §5.11).
+//!   record-listed payload set to every worker (record order, §5.11) as the trainer's
+//!   `[1, round, peer32, payload]` kind-0 wrapper.
+//!
+//! **Round digests are the guest's own det-lane voice** (the tag-4 frame, computed in-guest over
+//! the post-ingest canonical state) — never a host-side re-derivation. Cross-worker digest
+//! agreement is asserted over those voices.
 //!
 //! The run is configured **from a genesis envelope v2** ([`crate::configure_wasm_coordinator`]) —
 //! the coordinator module hash pinned in the role set, its opaque config carried verbatim, the
-//! `SingleKey` identity in `[identities]` — which is exactly what makes cells 3/7 (envelope v1)
-//! typed refusals.
+//! `SingleKey` identity in `[identities]` — which is exactly what makes the envelope-v1 matrix
+//! cells typed refusals.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -38,24 +45,303 @@ use daemon_vhc_host::v2::{
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::messages::{
-    BatchWindow, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
+    BatchWindow, Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
 };
 use daemon_vhc_proto::{
-    blake3_hash, digest_state, from_canonical_slice, peer_id, to_canonical_vec, CapabilitySet,
-    ControlTransport, GenesisEnvelope, Hash, Identities, IrohId, PeerId, RoleEntry, RoleGrants,
-    RunSectionV2, Seed, SigningKey, SnapshotArtifact, SwarmMessage, TransportSelection,
-    GENESIS_SCHEMA_MAJOR, SWARM_PROTO_VERSION,
+    blake3_hash, peer_id, to_canonical_vec, CapabilitySet, ControlTransport, GenesisEnvelope, Hash,
+    Identities, IrohId, PeerId, RoleEntry, RoleGrants, RunSectionV2, Seed, SigningKey,
+    SnapshotArtifact, StateDigest, SwarmMessage, TransportSelection, GENESIS_SCHEMA_MAJOR,
+    SWARM_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
-use crate::barrier::{
-    phase_a_grants, tiny_llama_config, FaultAction, FaultPlan, FrameKind, SEQ_LEN,
-};
 use crate::run::Decision;
 use crate::wasm_coordinator::{
     authorize_coordinator_frame, configure_wasm_coordinator, WasmCoordinator,
 };
+
+/// Tokens per sequence for the staged batches (the t2 geometry; real corpora are `data@2`).
+pub const SEQ_LEN: u32 = 9;
+
+/// The trainer model's vocabulary (tokens are embedding indices strictly below it).
+const VOCAB: u32 = 64;
+
+/// The Phase-A derived grants document (§2.6 stand-in, byte-identical to the worker's
+/// `derive_grants`): the admitted channel table + the worlds the major-2 driver links.
+#[must_use]
+pub fn phase_a_grants() -> Vec<u8> {
+    let channels: Vec<Value> = daemon_vhc_abi::PHASE_A_DEFAULT_CHANNEL_TABLE
+        .iter()
+        .map(|c| uint(u64::from(c.id)))
+        .collect();
+    let worlds = ["vhc@2", "net@2", "sys@2"]
+        .iter()
+        .map(|w| text(w))
+        .collect();
+    let doc = Value::Map(vec![
+        (text("channels"), Value::Array(channels)),
+        (text("worlds"), Value::Array(worlds)),
+    ]);
+    to_canonical_vec(&doc).expect("grants cbor")
+}
+
+fn text(s: &str) -> Value {
+    Value::Text(s.into())
+}
+
+fn uint(v: u64) -> Value {
+    Value::Integer(v.into())
+}
+
+// -- the fault-injection rig (adversarial-suite seeds, architecture §4.2) -------------------------
+//
+// Coordinator→worker deliveries pass through a deterministic [`FaultPlan`]: authoritative frames
+// can be **dropped** or **duplicated** per `(worker, round, kind)` rule, and a round's
+// committed-payload staging can be **delayed** past its record (the straggle trigger at the
+// round-driver layer: a record whose payloads cannot be minted stalls; the guest catches up when
+// the payloads arrive at the next open).
+
+/// Which coordinator→worker authoritative frame a [`FaultRule`] targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    /// A `RoundOpen` frame.
+    Open,
+    /// A `RoundRecord` frame.
+    Record,
+}
+
+/// What the rig does to a matched delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultAction {
+    /// The frame is not delivered at all (loss / withholding).
+    Drop,
+    /// The frame is delivered twice, byte-identical, same seq — a true duplicate.
+    Duplicate,
+}
+
+/// One deterministic fault rule: `(worker, round, kind) → action`.
+#[derive(Debug, Clone, Copy)]
+pub struct FaultRule {
+    /// The worker index the fault applies to.
+    pub worker: usize,
+    /// The round whose frame is targeted.
+    pub round: u64,
+    /// Which frame of that round.
+    pub kind: FrameKind,
+    /// What happens to it.
+    pub action: FaultAction,
+}
+
+/// A deterministic fault plan over a barrier run (module docs). `Default` is fault-free.
+#[derive(Debug, Clone, Default)]
+pub struct FaultPlan {
+    /// Frame-plane faults (drop / duplicate).
+    pub rules: Vec<FaultRule>,
+    /// Payload-plane faults: `(worker, round)` pairs whose committed payloads are staged only at
+    /// the NEXT round's open instead of before the record — the straggle trigger (module docs).
+    pub delay_payload_staging: Vec<(usize, u64)>,
+}
+
+impl FaultPlan {
+    /// The action (if any) for `(worker, round, kind)`.
+    #[must_use]
+    pub fn action(&self, worker: usize, round: u64, kind: FrameKind) -> Option<FaultAction> {
+        self.rules
+            .iter()
+            .find(|r| r.worker == worker && r.round == round && r.kind == kind)
+            .map(|r| r.action)
+    }
+
+    /// Whether `(worker, round)`'s committed payloads are delayed past the record.
+    #[must_use]
+    pub fn payloads_delayed(&self, worker: usize, round: u64) -> bool {
+        self.delay_payload_staging.contains(&(worker, round))
+    }
+}
+
+// -- SDK-free trainer-config authoring -------------------------------------------------------------
+//
+// The testkit links `host/*` + `contracts/*` only — never `sdk/*` — so the compute@2 trainer's
+// config is authored as **raw canonical CBOR** against the guest's documented schema
+// (`guests/tiny-llama-c3`: `{"model": ModelCfg, "peer": bstr32, "roster": [bstr32…],
+// "steps_per_round": uint, "micro_batch": uint, "stall_rounds_max": uint,
+// "profile": SparseLocoCfg, "init": [f32…]}`). The literals are the t2 parity shape (the
+// worker-binary genesis join authors the same tiny model). If the guest schema ever moves, this
+// fixture fails loud at `da_init` (guest status 16), not silently.
+
+/// The trainer model's canonical parameter element counts for the tiny t2 parity shape
+/// (`ModelCfg::param_numels` — tok, per-block 9 params, final norm; d_model 64, 1 layer,
+/// 4 heads × head_dim 16, vocab 64, ffn_mult 2).
+#[must_use]
+fn param_numels() -> Vec<usize> {
+    let (d, qdim, hidden, vocab) = (64usize, 64usize, 128usize, 64usize);
+    let mut out = vec![vocab * d];
+    out.extend([
+        d,
+        d * qdim,
+        d * qdim,
+        d * qdim,
+        qdim * d,
+        d,
+        d * hidden,
+        d * hidden,
+        hidden * d,
+    ]);
+    out.push(d);
+    out
+}
+
+/// A deterministic matched init (identical across the roster — the cross-peer digest-agreement
+/// precondition; the guest asserts the flat length against its layout).
+#[must_use]
+fn matched_init(total: usize) -> Vec<f32> {
+    let mut s = 0x5EED_C0DEu64;
+    (0..total)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            #[allow(clippy::cast_precision_loss)]
+            let v = ((s >> 33) % 2001) as f32;
+            (v - 1000.0) / 20000.0 // [-0.05, 0.05]
+        })
+        .collect()
+}
+
+/// The compute@2 trainer's guest config, authored SDK-free as raw canonical CBOR (module docs):
+/// the tiny t2 parity model + the `sparse_loco` profile + the deterministic matched init.
+#[must_use]
+pub fn trainer_config(
+    peer: &PeerId,
+    roster: &[PeerId],
+    steps_per_round: u32,
+    micro_batch: u32,
+    stall_rounds_max: u32,
+) -> Vec<u8> {
+    let model = Value::Map(vec![
+        (text("d_model"), uint(64)),
+        (text("n_layers"), uint(1)),
+        (text("n_heads"), uint(4)),
+        (text("head_dim"), uint(16)),
+        (text("vocab"), uint(u64::from(VOCAB))),
+        (text("seq_len"), uint(u64::from(SEQ_LEN))),
+        (text("ffn_mult"), uint(2)),
+        (text("rope_theta"), Value::Float(10_000.0)),
+        (text("rmsnorm_eps"), Value::Float(1.0e-5)),
+        (text("lr"), Value::Float(4.0e-4)),
+        (text("beta1"), Value::Float(0.9)),
+        (text("beta2"), Value::Float(0.95)),
+        (text("adam_eps"), Value::Float(1.0e-8)),
+        (text("wd"), Value::Float(0.1)),
+    ]);
+    let profile = Value::Map(vec![
+        (text("h"), uint(3)),
+        (text("ef_decay"), Value::Float(0.95)),
+        (text("chunk"), uint(64)),
+        (text("topk"), uint(8)),
+        (text("bits"), uint(2)),
+        (text("outer_alpha"), Value::Float(1.0)),
+        (text("clip"), Value::Bool(false)),
+    ]);
+    let total: usize = param_numels().iter().sum();
+    let init = matched_init(total);
+    let cfg = Value::Map(vec![
+        (text("model"), model),
+        (text("peer"), Value::Bytes(peer.0.to_vec())),
+        (
+            text("roster"),
+            Value::Array(roster.iter().map(|p| Value::Bytes(p.0.to_vec())).collect()),
+        ),
+        (text("steps_per_round"), uint(u64::from(steps_per_round))),
+        (text("micro_batch"), uint(u64::from(micro_batch))),
+        (text("stall_rounds_max"), uint(u64::from(stall_rounds_max))),
+        (text("profile"), profile),
+        (text("init"), Value::serialized(&init).expect("init value")),
+    ]);
+    to_canonical_vec(&cfg).expect("guest config cbor")
+}
+
+// -- the trainer's module wire (kind-0 staged wrappers + tagged publishes) --------------------------
+
+/// Deterministic varied tokens for one staged batch: a pure mixer over `(worker, round, step)` so
+/// no two wrappers are byte-identical (the pump's advisory dedup-by-hash never coalesces them).
+fn tokens_for(worker: usize, round: u64, step: u32, sequences: u32) -> Vec<u32> {
+    let n = u64::from(sequences) * u64::from(SEQ_LEN);
+    (0..n)
+        .map(|i| {
+            let x = i
+                + 1
+                + 1_000 * u64::from(step)
+                + 100_000 * round
+                + 10_000_000 * (worker as u64 + 1);
+            (x.wrapping_mul(2_654_435_761) % u64::from(VOCAB)) as u32
+        })
+        .collect()
+}
+
+/// The trainer's staged-batch wrapper: `[0, round, step, sequences, seq_len, tokens_le]`
+/// (module-wire kind-0 bytes — the compute@2 trainer's contract).
+fn batch_wrapper(round: u64, step: u32, sequences: u32, tokens: &[u32]) -> Vec<u8> {
+    let mut le = Vec::with_capacity(tokens.len() * 4);
+    for t in tokens {
+        le.extend_from_slice(&t.to_le_bytes());
+    }
+    let v = Value::Array(vec![
+        uint(0),
+        uint(round),
+        uint(u64::from(step)),
+        uint(u64::from(sequences)),
+        uint(u64::from(SEQ_LEN)),
+        Value::Bytes(le),
+    ]);
+    to_canonical_vec(&v).expect("batch wrapper")
+}
+
+/// The trainer's staged committed-payload wrapper: `[1, round, peer32, payload]`.
+fn update_wrapper(round: u64, peer: &PeerId, payload: &[u8]) -> Vec<u8> {
+    let v = Value::Array(vec![
+        uint(1),
+        uint(round),
+        Value::Bytes(peer.0.to_vec()),
+        Value::Bytes(payload.to_vec()),
+    ]);
+    to_canonical_vec(&v).expect("update wrapper")
+}
+
+/// Decode one published frame's module-authored `[tag, round, bytes]` payload.
+fn decode_tagged(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
+    let v: Value = ciborium::de::from_reader(frame).ok()?;
+    let Value::Array(parts) = v else { return None };
+    let Value::Bytes(payload) = parts.get(1)? else {
+        return None;
+    };
+    let inner: Value = ciborium::de::from_reader(payload.as_slice()).ok()?;
+    let Value::Array(items) = inner else {
+        return None;
+    };
+    let get_uint = |i: usize| -> Option<u64> {
+        items
+            .get(i)
+            .and_then(Value::as_integer)
+            .map(|n| u64::try_from(i128::from(n)).unwrap_or(u64::MAX))
+    };
+    let bytes = match items.get(2) {
+        Some(Value::Bytes(b)) => b.clone(),
+        _ => Vec::new(),
+    };
+    Some((get_uint(0)?, get_uint(1)?, bytes))
+}
+
+/// Count a worker's tag-`tag` voices for `round`.
+fn voices_for(voices: &[(u64, u64, Vec<u8>)], tag: u64, round: u64) -> usize {
+    voices
+        .iter()
+        .filter(|(t, r, _)| *t == tag && *r == round)
+        .count()
+}
+
+// -- the whole-run harness --------------------------------------------------------------------------
 
 /// How a cell-8 whole run is set up.
 pub struct Cell8Spec {
@@ -70,8 +356,7 @@ pub struct Cell8Spec {
     /// Sequences per round across the roster.
     pub global_batch: u32,
     /// The deterministic fault plan applied to coordinator→worker deliveries + committed-payload
-    /// staging (`Default` = fault-free). Shares [`crate::barrier`]'s rig so the wasm-coordinator
-    /// twins of the adversarial drills author the same `(worker, round, kind)` faults.
+    /// staging (`Default` = fault-free).
     pub faults: FaultPlan,
     /// Hard wall per wait step.
     pub timeout: Duration,
@@ -94,21 +379,30 @@ impl Cell8Spec {
     }
 }
 
-/// One worker's observable product (mirrors [`crate::WorkerReport`]).
+/// One worker's observable product.
 pub struct Cell8WorkerReport {
     /// The worker's peer identity.
     pub peer: PeerId,
     /// How its run ended.
     pub end: RunEnd,
-    /// Its recorded publishes as decoded control messages (in publish order) — the fault drills
-    /// assert straggle/digest counts against it.
-    pub messages: Vec<SwarmMessage>,
-    /// Its final det-lane state digest.
+    /// Its module-tagged voices decoded from its publishes, in publish order:
+    /// `(tag, round, bytes)` — tag 2 = trained θ, tag 3 = commitment hash, tag 4 = det digest.
+    pub voices: Vec<(u64, u64, Vec<u8>)>,
+    /// The guest's FINAL tag-4 det-lane digest (its own in-guest det voice — the round-agreement
+    /// digest; never a host-side re-derivation).
     pub digest: [u8; 16],
     /// Its §8.7 replay verdict.
     pub replay_matched: bool,
     /// How many decisions the replay re-derived.
     pub replay_decisions: usize,
+}
+
+impl Cell8WorkerReport {
+    /// Count this worker's tag-4 digest voices for `round`.
+    #[must_use]
+    pub fn digests_for(&self, round: u64) -> usize {
+        voices_for(&self.voices, 4, round)
+    }
 }
 
 /// The whole run's observable product.
@@ -127,7 +421,8 @@ pub struct Cell8Report {
 
 impl Cell8Report {
     /// True iff every worker ended cleanly with a matching §8.7 replay, all workers agree on the
-    /// det-lane digest, the coordinator recorded every driven round, and it ended cleanly.
+    /// guest-voiced det-lane digest, the coordinator recorded every driven round, and it ended
+    /// cleanly.
     #[must_use]
     pub fn is_green(&self) -> bool {
         let ends_clean = self
@@ -210,7 +505,7 @@ pub fn cell8_genesis(
     artifacts.insert(
         "worker.wasm".to_string(),
         SnapshotArtifact {
-            url: "r2://mods/tiny_llama_v2.wasm".into(),
+            url: "r2://mods/tiny_llama_c3.wasm".into(),
             blake3: worker_wasm_blake3,
             size: None,
         },
@@ -272,7 +567,7 @@ pub fn cell8_genesis(
     }
 }
 
-/// One live worker under the harness (the [`crate::barrier`] `LiveWorker` shape).
+/// One live worker under the harness.
 struct LiveWorker {
     key: SigningKey,
     peer: PeerId,
@@ -288,8 +583,9 @@ struct LiveWorker {
     puts: Vec<Vec<u8>>,
     /// Round → the round's sealed payload set (stashed at commit, staged at the record).
     stash: BTreeMap<u64, BTreeMap<PeerId, Vec<u8>>>,
-    /// Sealed containers whose ingest staging was delayed past their record (the straggle
-    /// trigger): round → record-ordered payloads, staged at the NEXT open (the catch-up input).
+    /// Pre-wrapped committed-payload staging bytes whose ingest was delayed past their record
+    /// (the straggle trigger): round → record-ordered wrappers, staged at the NEXT open (the
+    /// catch-up input).
     held_payloads: BTreeMap<u64, Vec<Vec<u8>>>,
 }
 
@@ -335,23 +631,17 @@ impl LiveWorker {
         {
             DeliverVerdict::Accepted => Ok(()),
             other => Err(format!(
-                "coordinator frame back-pressured/refused ({other:?}) in the cell-8 drive"
+                "coordinator frame back-pressured/refused ({other:?}) in the whole-run drive"
             )),
         }
     }
 
-    fn messages(&self) -> Vec<SwarmMessage> {
+    /// The worker's module-tagged voices, decoded from its publishes in publish order.
+    fn voices(&self) -> Vec<(u64, u64, Vec<u8>)> {
         self.pump
             .published()
             .into_iter()
-            .filter_map(|(_, _, frame)| {
-                let v: Value = ciborium::de::from_reader(frame.as_slice()).ok()?;
-                let Value::Array(parts) = v else { return None };
-                let Value::Bytes(payload) = parts.get(1)? else {
-                    return None;
-                };
-                from_canonical_slice::<SwarmMessage>(payload).ok()
-            })
+            .filter_map(|(_, _, frame)| decode_tagged(&frame))
             .collect()
     }
 
@@ -366,7 +656,7 @@ impl LiveWorker {
                 }
                 other => {
                     return Err(format!(
-                        "unexpected op request from the cell-8 worker: {other:?}"
+                        "unexpected op request from the trainer guest: {other:?}"
                     ))
                 }
             }
@@ -378,14 +668,14 @@ impl LiveWorker {
         &mut self,
         timeout: Duration,
         what: &str,
-        pred: impl Fn(&[SwarmMessage]) -> bool,
-    ) -> Result<Vec<SwarmMessage>, String> {
+        pred: impl Fn(&[(u64, u64, Vec<u8>)]) -> bool,
+    ) -> Result<Vec<(u64, u64, Vec<u8>)>, String> {
         let deadline = Instant::now() + timeout;
         loop {
             self.service_ops()?;
-            let msgs = self.messages();
-            if pred(&msgs) {
-                return Ok(msgs);
+            let voices = self.voices();
+            if pred(&voices) {
+                return Ok(voices);
             }
             if Instant::now() >= deadline {
                 return Err(format!("timed out waiting for {what}"));
@@ -393,23 +683,34 @@ impl LiveWorker {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-}
 
-fn commitments_for(msgs: &[SwarmMessage], round: u64) -> usize {
-    msgs.iter()
-        .filter(|m| matches!(m, SwarmMessage::Commitment(c) if c.round == round))
-        .count()
-}
-
-fn digests_for(msgs: &[SwarmMessage], round: u64) -> usize {
-    msgs.iter()
-        .filter(|m| matches!(m, SwarmMessage::Digest(d) if d.round == round))
-        .count()
-}
-
-fn straggled_for(msgs: &[SwarmMessage], round: u64) -> bool {
-    msgs.iter()
-        .any(|m| matches!(m, SwarmMessage::Straggle(s) if s.round == round))
+    /// Stage one round's assigned batches in training order: the module's own slicing math
+    /// (assignment interval → `steps_per_round` inner steps → `micro_batch`-sized micro-windows),
+    /// one kind-0 wrapper per micro-window.
+    fn stage_batches(
+        &mut self,
+        index: usize,
+        round: u64,
+        mine: u64,
+        steps_per_round: u32,
+        micro_batch: u32,
+    ) -> Result<(), String> {
+        let per_step = mine / u64::from(steps_per_round);
+        for h in 0..steps_per_round {
+            let mut cursor = 0u64;
+            while cursor < per_step {
+                let seqs = (per_step - cursor).min(u64::from(micro_batch)) as u32;
+                self.pump
+                    .stage_payload(
+                        batch_wrapper(round, h, seqs, &tokens_for(index, round, h, seqs)),
+                        None,
+                    )
+                    .map_err(|e| format!("worker {index} stage batch: {e}"))?;
+                cursor += u64::from(seqs);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn assigned_len(window: BatchWindow, seed: Seed, roster: &[PeerId], peer: &PeerId) -> u64 {
@@ -421,8 +722,8 @@ fn assigned_len(window: BatchWindow, seed: Seed, roster: &[PeerId], peer: &PeerI
         .map_or(0, |(_, w)| w.end.saturating_sub(w.start))
 }
 
-/// Drive the cell-8 whole run: N production tiny-llama-v2 workers through `spec.rounds` barrier
-/// rounds under the production wasm coordinator, configured from a genesis envelope v2; then stop
+/// Drive the whole run: N production compute@2 trainers through `spec.rounds` barrier rounds
+/// under the production wasm coordinator, configured from a genesis envelope v2; then stop
 /// everything cleanly and §8.7 replay-verify each worker.
 ///
 /// # Errors
@@ -451,8 +752,8 @@ pub fn cell8_whole_run(
         .collect();
     let roster: Vec<PeerId> = worker_keys.iter().map(peer_id).collect();
 
-    // The genesis envelope v2 + the wasm-coordinator configuration derived from it (cell 8's
-    // configuration half — the exact seat that REFUSES under envelope v1, cells 3/7).
+    // The genesis envelope v2 + the wasm-coordinator configuration derived from it (the
+    // configuration half — the exact seat that REFUSES under envelope v1).
     let genesis = cell8_genesis(
         &spec.run_label,
         coord_hash,
@@ -484,7 +785,7 @@ pub fn cell8_whole_run(
     let mut workers: Vec<LiveWorker> = Vec::with_capacity(spec.workers);
     for (i, key) in worker_keys.iter().enumerate() {
         let peer = roster[i];
-        let config = tiny_llama_config(&peer, &roster, spec.steps_per_round, 1, 2);
+        let config = trainer_config(&peer, &roster, spec.steps_per_round, 1, 2);
         let engine = Worker::new(EngineConfig::default()).map_err(|e| format!("engine: {e}"))?;
         let sel = select_driver(&engine, worker_wasm, Some(&worker_hash))
             .map_err(|e| format!("worker {i} selection: {e}"))?;
@@ -504,7 +805,11 @@ pub fn cell8_whole_run(
         let key_seed =
             *blake3::hash(format!("cell8-frame-key/{}/{i}", spec.run_label).as_bytes()).as_bytes();
         let sink = Arc::new(Mutex::new(MemorySink::new()));
-        let run_cfg = V2RunConfig::new(identity.clone(), key_seed, config.clone(), grants.clone());
+        let mut run_cfg =
+            V2RunConfig::new(identity.clone(), key_seed, config.clone(), grants.clone());
+        // A real transformer's per-round op stream exceeds the tiny default queue depth (the
+        // guest also fences per inner step to reclaim depth).
+        run_cfg.compute_queue_depth = 1 << 20;
         let run = start_run(&engine, worker_wasm, run_cfg, Box::new(sink.clone()))
             .map_err(|e| format!("worker {i} start_run: {e}"))?;
         workers.push(LiveWorker {
@@ -564,19 +869,20 @@ pub fn cell8_whole_run(
             SwarmMessage::RoundOpen(ro) => {
                 let round = ro.round;
                 // Stage each worker's assigned batches, then deliver the open — first flushing any
-                // payloads held from an earlier record (the straggle catch-up input, staged BEFORE
-                // this open so the driver ingests the stalled round then trains the new one).
+                // payload wrappers held from an earlier record (the straggle catch-up input,
+                // staged BEFORE this open so the driver ingests the stalled round then trains the
+                // new one; the guest folds the caught-up round's digest into its state — the
+                // compute@2 trainer voices tag-4 only from the record handler).
                 for (i, worker) in workers.iter_mut().enumerate() {
                     let held: Vec<Vec<Vec<u8>>> = worker.held_payloads.values().cloned().collect();
-                    for payloads in held {
-                        for p in payloads {
+                    for wrappers in held {
+                        for wb in wrappers {
                             worker
                                 .pump
-                                .stage_update(p, None)
+                                .stage_payload(wb, None)
                                 .map_err(|e| format!("worker {i} stage held update: {e}"))?;
                         }
                     }
-                    let caught_up: Vec<u64> = worker.held_payloads.keys().copied().collect();
                     worker.held_payloads.clear();
 
                     let mine = assigned_len(ro.batch, ro.seed, &roster, &worker.peer);
@@ -585,12 +891,7 @@ pub fn cell8_whole_run(
                             "worker {i} assigned {mine} seqs — not divisible by steps_per_round"
                         ));
                     }
-                    for _ in 0..mine {
-                        worker
-                            .pump
-                            .stage_batch(&vec![0u32; SEQ_LEN as usize], 1, SEQ_LEN, None)
-                            .map_err(|e| format!("worker {i} stage batch: {e}"))?;
-                    }
+                    worker.stage_batches(i, round, mine, spec.steps_per_round, 1)?;
                     deliver_open_under_faults(
                         worker,
                         &spec.faults,
@@ -600,41 +901,47 @@ pub fn cell8_whole_run(
                         &msg,
                         &evidence,
                     )?;
-                    // A caught-up round produces its (deferred) digest at this open; drain it so
-                    // the straggle detour is a recorded decision the §8.7 replay reproduces.
-                    for r in caught_up {
-                        worker.wait_for(spec.timeout, "catch-up digest", |m| {
-                            digests_for(m, r) >= 1
-                        })?;
-                    }
                 }
 
-                // Each worker trains, seals + puts its own container, voices its commitment; the
-                // harness relays the commitment (worker-signed) to the coordinator.
+                // Each worker trains, exports θ, seals + puts its own container, and voices its
+                // tag-3 commitment hash; the harness verifies the voice covers exactly the
+                // serviced put bytes and relays a worker-signed Commitment to the coordinator.
                 let mut sealed_by_peer: BTreeMap<PeerId, Vec<u8>> = BTreeMap::new();
                 for (i, w) in workers.iter_mut().enumerate() {
-                    let msgs = w.wait_for(spec.timeout, "commitment", |m| {
-                        commitments_for(m, round) >= 1
-                    })?;
+                    if spec.faults.action(i, round, FrameKind::Open) == Some(FaultAction::Drop) {
+                        continue; // the open never arrived; this worker sits the round out
+                    }
+                    let voices =
+                        w.wait_for(spec.timeout, "commitment", |v| voices_for(v, 3, round) >= 1)?;
                     let sealed = w
                         .puts
                         .last()
                         .cloned()
                         .ok_or_else(|| format!("worker {i}: no payload_put after commit"))?;
-                    let Some(SwarmMessage::Commitment(commitment)) = msgs
+                    let guest_hash: [u8; 32] = voices
                         .iter()
-                        .find(|m| matches!(m, SwarmMessage::Commitment(c) if c.round == round))
-                        .cloned()
-                    else {
-                        return Err(format!("worker {i}: commitment frame missing"));
-                    };
-                    if commitment.payload != blake3_hash(&sealed) {
+                        .rev()
+                        .find_map(|(t, r, bytes)| (*t == 3 && *r == round).then(|| bytes.clone()))
+                        .ok_or_else(|| format!("worker {i}: tag-3 commitment voice missing"))?
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| format!("worker {i}: tag-3 voice is not 32 bytes"))?;
+                    if guest_hash != blake3_hash(&sealed).0 {
                         return Err(format!(
-                            "worker {i}: guest commitment hash != serviced put bytes"
+                            "worker {i}: guest commitment hash != serviced put bytes (evidence \
+                             must be authored over the guest's own sealed bytes)"
                         ));
                     }
                     let key = w.key.clone();
-                    coord.deliver(&key, &SwarmMessage::Commitment(commitment))?;
+                    coord.deliver(
+                        &key,
+                        &SwarmMessage::Commitment(Commitment {
+                            round,
+                            payload: Hash(guest_hash),
+                            size: sealed.len() as u64,
+                            locators: Vec::new(),
+                        }),
+                    )?;
                     sealed_by_peer.insert(w.peer, sealed);
                 }
 
@@ -665,26 +972,30 @@ pub fn cell8_whole_run(
                     return Err(format!("round {round} record carries no inline entries"));
                 }
                 for (i, worker) in workers.iter_mut().enumerate() {
-                    // Record-listed staging order (§5.11).
+                    // Record-listed staging order (§5.11): resolve each entry to its sealed
+                    // bytes and pre-wrap it as the trainer's `[1, round, peer, payload]` kind-0
+                    // staging wrapper.
                     let sealed = worker.stash.remove(&round).unwrap_or_default();
                     let ordered: Vec<Vec<u8>> = entries
                         .iter()
                         .map(|e| {
                             sealed
                                 .get(&e.peer)
-                                .cloned()
+                                .map(|p| update_wrapper(round, &e.peer, p))
                                 .ok_or_else(|| "record entry for unknown peer".to_string())
                         })
                         .collect::<Result<_, String>>()?;
                     if spec.faults.payloads_delayed(i, round) {
                         // The straggle trigger: the record arrives, its payloads do not (staged at
-                        // the next open instead) — the driver stalls and voices Straggle{fetching}.
+                        // the next open instead) — the driver stalls; the compute@2 trainer voices
+                        // nothing for the stalled round (the straggle detour is observable as the
+                        // absent tag-4 + the preserved final-state agreement).
                         worker.held_payloads.insert(round, ordered);
                     } else {
-                        for p in &ordered {
+                        for wb in &ordered {
                             worker
                                 .pump
-                                .stage_update(p.clone(), None)
+                                .stage_payload(wb.clone(), None)
                                 .map_err(|e| format!("worker {i} stage update: {e}"))?;
                         }
                     }
@@ -699,22 +1010,29 @@ pub fn cell8_whole_run(
                     )?;
                 }
                 for (i, w) in workers.iter_mut().enumerate() {
-                    if spec.faults.payloads_delayed(i, round) {
-                        // The straggle path: the driver voices Straggle{fetching}, no digest yet
-                        // (it catches up when the held payloads stage at the next open).
-                        w.wait_for(spec.timeout, "straggle", |m| straggled_for(m, round))?;
+                    if spec.faults.payloads_delayed(i, round)
+                        || spec.faults.action(i, round, FrameKind::Record)
+                            == Some(FaultAction::Drop)
+                    {
+                        // Straggling (or record-less) workers voice no digest for this round.
                         continue;
                     }
-                    let msgs =
-                        w.wait_for(spec.timeout, "digest", |m| digests_for(m, round) >= 1)?;
+                    let voices =
+                        w.wait_for(spec.timeout, "digest", |v| voices_for(v, 4, round) >= 1)?;
                     // Relay the digest to the coordinator (roster liveness/desync accounting).
-                    if let Some(SwarmMessage::Digest(d)) = msgs
-                        .iter()
-                        .find(|m| matches!(m, SwarmMessage::Digest(d) if d.round == round))
-                        .cloned()
-                    {
+                    if let Some(digest16) = voices.iter().rev().find_map(|(t, r, bytes)| {
+                        (*t == 4 && *r == round)
+                            .then(|| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+                            .flatten()
+                    }) {
                         let key = w.key.clone();
-                        coord.deliver(&key, &SwarmMessage::Digest(d))?;
+                        coord.deliver(
+                            &key,
+                            &SwarmMessage::Digest(Digest {
+                                round,
+                                digest: StateDigest(digest16),
+                            }),
+                        )?;
                     }
                 }
                 rounds_done += 1;
@@ -725,6 +1043,8 @@ pub fn cell8_whole_run(
 
     // Payloads delayed in the FINAL driven round have no next open in the closed drive; pull one
     // more coordinator open so the stragglers catch up (the coordinator keeps opening rounds).
+    // The catch-up ingest happens inside the open's event slice; the new round's tag-3 commitment
+    // voice is the completion barrier (the caught-up digest folds into state, unvoiced).
     if workers.iter().any(|w| !w.held_payloads.is_empty()) {
         let mut opened = false;
         while !opened {
@@ -732,29 +1052,22 @@ pub fn cell8_whole_run(
             if let SwarmMessage::RoundOpen(ro) = &msg {
                 for (i, worker) in workers.iter_mut().enumerate() {
                     let held: Vec<Vec<Vec<u8>>> = worker.held_payloads.values().cloned().collect();
-                    for payloads in held {
-                        for p in payloads {
+                    for wrappers in held {
+                        for wb in wrappers {
                             worker
                                 .pump
-                                .stage_update(p, None)
+                                .stage_payload(wb, None)
                                 .map_err(|e| format!("worker {i} stage held update: {e}"))?;
                         }
                     }
-                    let caught_up: Vec<u64> = worker.held_payloads.keys().copied().collect();
                     worker.held_payloads.clear();
                     let mine = assigned_len(ro.batch, ro.seed, &roster, &worker.peer);
-                    for _ in 0..mine {
-                        worker
-                            .pump
-                            .stage_batch(&vec![0u32; SEQ_LEN as usize], 1, SEQ_LEN, None)
-                            .map_err(|e| format!("worker {i} stage batch: {e}"))?;
-                    }
+                    worker.stage_batches(i, ro.round, mine, spec.steps_per_round, 1)?;
                     worker.deliver_from_coordinator(sender, &msg, evidence.clone())?;
-                    for r in caught_up {
-                        worker.wait_for(spec.timeout, "catch-up digest", |m| {
-                            digests_for(m, r) >= 1
-                        })?;
-                    }
+                    let round = ro.round;
+                    worker.wait_for(spec.timeout, "catch-up commitment", |v| {
+                        voices_for(v, 3, round) >= 1
+                    })?;
                 }
                 opened = true;
             }
@@ -773,13 +1086,18 @@ pub fn cell8_whole_run(
             .expect("run present")
             .wait()
             .map_err(|e| format!("worker {i} guest thread: {e}"))?;
-        let final_state = w
-            .pump
-            .bridge_final_state()
-            .ok_or_else(|| format!("worker {i}: no final bridge state"))?;
-        let mut dseed = [0u8; 32];
-        dseed[..8].copy_from_slice(&rounds_done.to_le_bytes());
-        let digest = *digest_state(&Seed(dseed), 64, u32::MAX, &final_state).as_bytes();
+        let voices = w.voices();
+        // The guest's FINAL tag-4 det digest — its own det-lane voice (the round-agreement
+        // digest); the harness never re-derives state host-side.
+        let digest: [u8; 16] = voices
+            .iter()
+            .rev()
+            .find_map(|(t, _, bytes)| {
+                (*t == 4)
+                    .then(|| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+                    .flatten()
+            })
+            .ok_or_else(|| format!("worker {i}: no tag-4 digest voice in the run"))?;
 
         let entries: Vec<SinkEntry> = w.sink.lock().expect("sink").entries.clone();
         let recorded: Vec<Decision> = entries
@@ -805,11 +1123,10 @@ pub fn cell8_whole_run(
             .collect();
         let replay_matched = redriven == recorded && matches!(replayed.end, ReplayEnd::Outcome(_));
 
-        let messages = w.messages();
         reports.push(Cell8WorkerReport {
             peer: w.peer,
             end,
-            messages,
+            voices,
             digest,
             replay_matched,
             replay_decisions: redriven.len(),

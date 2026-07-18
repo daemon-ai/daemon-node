@@ -6,7 +6,7 @@
 //
 // - **cell 8** (v2 worker × wasm coordinator × envelope v2) — the SUPPORTED target end-state,
 //   pinned POSITIVE: a real whole run (production coordinator_quorum.wasm + production
-//   tiny_llama_v2.wasm workers, both under the real major-2 driver), journaled, §8.7
+//   tiny_llama_c3.wasm compute@2 trainers, both under the real major-2 driver), journaled, §8.7
 //   replay-verified, cross-worker det-digest agreement.
 // - **cell 3** (v1 worker × wasm coordinator × envelope v1) — REFUSED, typed: envelope v1 has no
 //   coordinator role entry (no module-hash pin) and no Authority/identities section — a wasm
@@ -144,12 +144,12 @@ fn synthetic_v1_worker_module() -> Vec<u8> {
 
 // -- cell 8: the SUPPORTED target end-state (positive whole-run gate) ------------------------------
 
-/// Cell 8 single-worker: one production tiny-llama-v2 worker trains 2 barrier rounds under the
+/// Cell 8 single-worker: one production compute@2 trainer trains 2 barrier rounds under the
 /// production wasm coordinator, configured from a genesis envelope v2 — journaled, replay-verified.
 #[test]
 fn cell8_single_worker_whole_run_is_green() {
     let coordinator = guest_wasm("coordinator_quorum");
-    let worker = guest_wasm("tiny_llama_v2");
+    let worker = guest_wasm("tiny_llama_c3");
     let spec = Cell8Spec::new("cell8-1w", 1, 2);
     let report = cell8_whole_run(&coordinator, &worker, &spec).expect("whole run completes");
 
@@ -171,7 +171,7 @@ fn cell8_single_worker_whole_run_is_green() {
 #[test]
 fn cell8_two_workers_agree_on_the_det_lane_digest() {
     let coordinator = guest_wasm("coordinator_quorum");
-    let worker = guest_wasm("tiny_llama_v2");
+    let worker = guest_wasm("tiny_llama_c3");
     let spec = Cell8Spec::new("cell8-2w", 2, 2);
     let report = cell8_whole_run(&coordinator, &worker, &spec).expect("whole run completes");
 
@@ -224,7 +224,7 @@ fn cell3_v1_worker_wasm_coordinator_envelope_v1_refused_typed() {
 /// coordinator-side refusal; a major-2 worker cannot rescue an unconfigurable coordinator.
 #[test]
 fn cell7_v2_worker_wasm_coordinator_envelope_v1_refused_typed() {
-    let v2_worker = guest_wasm("tiny_llama_v2");
+    let v2_worker = guest_wasm("tiny_llama_c3");
     let engine = Worker::new(EngineConfig::default()).expect("engine");
     let hash = *blake3::hash(&v2_worker).as_bytes();
     let sel = select_driver(&engine, &v2_worker, Some(&hash)).expect("v2 selection");

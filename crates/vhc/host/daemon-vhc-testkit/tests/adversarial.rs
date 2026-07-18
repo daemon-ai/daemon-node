@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // Adversarial-suite seeds (architecture §4.2's conformance surface): trace-driven fault injection
-// against the PRODUCTION `tiny_llama_v2.wasm` worker blob **under the production
+// against the PRODUCTION `tiny_llama_c3.wasm` compute@2 trainer **under the production
 // `coordinator_quorum.wasm` coordinator** (the cell-8 whole-run drive), through the shared
 // deterministic `FaultPlan` — one pinned case per rig primitive proving the harness shape. The
 // full `Authority` adversarial suites (partitions, equivocation, withheld records) live in
@@ -15,10 +15,13 @@
 //
 // Pinned cases:
 // 1. duplicate RoundRecord → the round driver's ingest watermark dedups: ingested exactly once,
-//    identical end state to the clean run, §8.7 replay green under the fault.
-// 2. delayed committed payloads → the record arrives unmintable → the guest voices
-//    Straggle{fetching} → the payloads arrive at the next open → CaughtUp digest — the straggle
-//    ladder exercised end-to-end, replay green.
+//    identical guest-voiced det-lane end state to the clean run, §8.7 replay green under the
+//    fault.
+// 2. delayed committed payloads → the record arrives unmintable → the round driver stalls (the
+//    compute@2 trainer voices no digest for the stalled round) → the payloads arrive at the next
+//    open → the guest ingests the stalled round and folds its digest into state — observable as
+//    the ABSENT per-round tag-4 voice plus the preserved final-state agreement with the clean
+//    run; replay green through the detour.
 //
 // Dev/test harness: shells `cargo build` for the guests (the established pattern), so the
 // fs/process bans are allowed file-wide.
@@ -28,7 +31,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Once;
 
-use daemon_vhc_proto::messages::SwarmMessage;
 use daemon_vhc_testkit::{
     cell8_whole_run, Cell8Spec, FaultAction, FaultPlan, FaultRule, FrameKind,
 };
@@ -70,27 +72,15 @@ fn guest_wasm(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-fn digests_for(msgs: &[SwarmMessage], round: u64) -> usize {
-    msgs.iter()
-        .filter(|m| matches!(m, SwarmMessage::Digest(d) if d.round == round))
-        .count()
-}
-
-fn straggles_for(msgs: &[SwarmMessage], round: u64) -> usize {
-    msgs.iter()
-        .filter(|m| matches!(m, SwarmMessage::Straggle(s) if s.round == round))
-        .count()
-}
-
 /// Pinned case 1 — a byte-identical duplicate `RoundRecord` (same seq, same signed frame) is
 /// **ingested exactly once**: the round driver's watermark (`rr.round <= last_ingested`) is the
 /// dedup under test. The faulted run — driven through the real wasm coordinator — ends in the
-/// identical det-lane state as the clean run, and its journal §8.7 replays bit-for-bit (replay
-/// re-feeds the delivered sequence, duplicate included).
+/// identical guest-voiced det-lane state as the clean run, and its journal §8.7 replays
+/// bit-for-bit (replay re-feeds the delivered sequence, duplicate included).
 #[test]
 fn duplicate_round_record_is_ingested_once() {
     let coordinator = guest_wasm("coordinator_quorum");
-    let worker = guest_wasm("tiny_llama_v2");
+    let worker = guest_wasm("tiny_llama_c3");
     let run_label = "cell8-adv-dup-record";
 
     // Clean baseline (same run label, so every derived seed/key matches).
@@ -114,27 +104,29 @@ fn duplicate_round_record_is_ingested_once() {
     let w = &faulted.workers[0];
     assert!(w.replay_matched, "§8.7 replay green under the duplicate");
     assert_eq!(
-        digests_for(&w.messages, 0),
+        w.digests_for(0),
         1,
-        "round 0 ingested exactly once despite the duplicate record"
+        "round 0 ingested exactly once despite the duplicate record (one tag-4 voice)"
     );
-    assert_eq!(digests_for(&w.messages, 1), 1);
+    assert_eq!(w.digests_for(1), 1);
     assert_eq!(
         w.digest, clean.workers[0].digest,
-        "the duplicate changed nothing: identical det-lane end state"
+        "the duplicate changed nothing: identical guest-voiced det-lane end state"
     );
     assert!(faulted.is_green());
 }
 
-/// Pinned case 2 — a record whose committed payloads are **delayed** past it: the guest cannot
-/// mint the committed set, voices `Straggle{fetching}`, then catches up when the payloads stage at
-/// the next open — a `CaughtUp` digest for the stalled round, the identical det-lane end state as
-/// the clean run, and a §8.7-green journal (the straggle detour is part of the recorded decision
-/// stream and must replay bit-for-bit).
+/// Pinned case 2 — a record whose committed payloads are **delayed** past it: the round driver
+/// cannot mint the committed set and stalls (the compute@2 trainer voices NO digest for the
+/// stalled round — the straggle detour is observable as the absent tag-4), then catches up when
+/// the payloads stage at the next open: the stalled round's ingest folds into the guest state
+/// (the §5.9 ingest epilogue fires at the ingest→training boundary), so the FINAL digest equals
+/// the clean run's — the detour changes the path, never the state — and the journal §8.7 replays
+/// bit-for-bit through it.
 #[test]
-fn delayed_committed_payloads_straggle_then_catch_up() {
+fn delayed_committed_payloads_stall_then_catch_up() {
     let coordinator = guest_wasm("coordinator_quorum");
-    let worker = guest_wasm("tiny_llama_v2");
+    let worker = guest_wasm("tiny_llama_c3");
     let run_label = "cell8-adv-delayed-payloads";
 
     let clean = cell8_whole_run(&coordinator, &worker, &Cell8Spec::new(run_label, 1, 2))
@@ -155,22 +147,17 @@ fn delayed_committed_payloads_straggle_then_catch_up() {
         "§8.7 replay green through the straggle detour"
     );
     assert_eq!(
-        straggles_for(&w.messages, 0),
-        1,
-        "the guest voiced the straggle for the unmintable round"
+        w.digests_for(0),
+        0,
+        "the stalled round's digest is folded at catch-up, never voiced per-round"
     );
-    assert_eq!(
-        digests_for(&w.messages, 0),
-        1,
-        "round 0 caught up exactly once"
-    );
-    assert_eq!(digests_for(&w.messages, 1), 1, "round 1 unaffected");
-    // The straggle is an extra recorded decision: 2×(commitment+digest) + 1 straggle.
+    assert_eq!(w.digests_for(1), 1, "round 1 voices its digest normally");
+    // The detour's recorded decisions: theta+commitment per round + the single (final) digest.
     assert_eq!(w.replay_decisions, 5);
     assert!(faulted.is_green());
 
-    // Catch-up parity: v1 parity holds through the straggle detour — the ingest epilogue fires at
-    // the ingest→training boundary, so the detour changes the path, never the state.
+    // Catch-up parity: the detour changes the path, never the state — the final guest-voiced
+    // det digest equals the clean run's (which ingested round 0 on time).
     assert_eq!(
         w.digest, clean.workers[0].digest,
         "the straggle detour must change the path, not the state: identical det-lane end state"

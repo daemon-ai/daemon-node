@@ -31,11 +31,11 @@ pub mod coordinator;
 pub mod run;
 pub mod wasm_coordinator;
 
-pub use barrier::{
-    barrier_whole_run, BarrierRunReport, BarrierSpec, FaultAction, FaultPlan, FaultRule, FrameKind,
-    WorkerReport,
+pub use barrier::{barrier_whole_run, BarrierRunReport, BarrierSpec, WorkerReport};
+pub use cell8::{
+    cell8_genesis, cell8_whole_run, Cell8Report, Cell8Spec, Cell8WorkerReport, FaultAction,
+    FaultPlan, FaultRule, FrameKind,
 };
-pub use cell8::{cell8_genesis, cell8_whole_run, Cell8Report, Cell8Spec, Cell8WorkerReport};
 pub use coordinator::NativeCoordinator;
 pub use run::{whole_run, ReplayReport, RunSpec, WholeRunReport};
 pub use wasm_coordinator::{

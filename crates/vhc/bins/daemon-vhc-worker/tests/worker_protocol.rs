@@ -8,7 +8,7 @@
 // join / throttle) against real guest modules.
 //
 // **Post-sunset shape (decisions D5)**: the v1 five-phase driver retired at the Phase-E sunset,
-// so this suite's positive arms drive the REAL major-2 module (`tiny_llama_v2.wasm` — the v2
+// so this suite's positive arms drive the REAL major-2 module (`tiny_llama_c3.wasm` — the v2
 // whole-run itself is `tests/v2_join.rs`), and the suite carries the WIRE-LEVEL sunset
 // regressions over the real binary:
 //   * assessing a SYNTHETIC ABI-major-1 module (a few-section wasm image hand-assembled in-test
@@ -36,7 +36,6 @@ use daemon_vhc_proto::envelope::{
     RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey};
-use daemon_vhc_sdk::models::TinyLlamaCfg;
 
 use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
@@ -214,15 +213,72 @@ fn write_temp_module(bytes: &[u8], tag: &str) -> PathBuf {
     path
 }
 
-/// The tiny-llama-v2 guest config (`GuestCfg`) — the v2_join shape: single-peer roster, 2 inner
+/// The compute@2 trainer's canonical parameter element counts for the tiny t2 parity shape
+/// (`ModelCfg::param_numels` — tok, per-block 9 params, final norm).
+fn param_numels() -> Vec<usize> {
+    let (d, qdim, hidden, vocab) = (64usize, 64usize, 128usize, 64usize);
+    let mut out = vec![vocab * d];
+    out.extend([
+        d,
+        d * qdim,
+        d * qdim,
+        d * qdim,
+        qdim * d,
+        d,
+        d * hidden,
+        d * hidden,
+        hidden * d,
+    ]);
+    out.push(d);
+    out
+}
+
+/// A deterministic small init (the guest asserts the flat length against its layout).
+fn deterministic_init(total: usize) -> Vec<f32> {
+    let mut s = 0x5EED_C0DEu64;
+    (0..total)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            #[allow(clippy::cast_precision_loss)]
+            let v = ((s >> 33) % 2001) as f32;
+            (v - 1000.0) / 20000.0 // [-0.05, 0.05]
+        })
+        .collect()
+}
+
+/// The compute@2 trainer's guest config (`GuestCfg`, authored SDK-free as raw canonical CBOR —
+/// the tiny t2 parity model + `sparse_loco` profile + matched init): single-peer roster, 2 inner
 /// steps, one sequence per micro window.
 fn v2_guest_config() -> Value {
-    let model = Value::serialized(&TinyLlamaCfg {
-        n_layers: 1,
-        seq_len: 9,
-        ..TinyLlamaCfg::default()
-    })
-    .expect("model value");
+    let model = Value::Map(vec![
+        (Value::from("d_model"), Value::from(64u32)),
+        (Value::from("n_layers"), Value::from(1u32)),
+        (Value::from("n_heads"), Value::from(4u32)),
+        (Value::from("head_dim"), Value::from(16u32)),
+        (Value::from("vocab"), Value::from(64u32)),
+        (Value::from("seq_len"), Value::from(9u32)),
+        (Value::from("ffn_mult"), Value::from(2u32)),
+        (Value::from("rope_theta"), Value::from(10_000.0f64)),
+        (Value::from("rmsnorm_eps"), Value::from(1e-5f64)),
+        (Value::from("lr"), Value::from(4e-4f64)),
+        (Value::from("beta1"), Value::from(0.9f64)),
+        (Value::from("beta2"), Value::from(0.95f64)),
+        (Value::from("adam_eps"), Value::from(1e-8f64)),
+        (Value::from("wd"), Value::from(0.1f64)),
+    ]);
+    let profile = Value::Map(vec![
+        (Value::from("h"), Value::from(3u32)),
+        (Value::from("ef_decay"), Value::from(0.95f64)),
+        (Value::from("chunk"), Value::from(64u32)),
+        (Value::from("topk"), Value::from(8u32)),
+        (Value::from("bits"), Value::from(2u32)),
+        (Value::from("outer_alpha"), Value::from(1.0f64)),
+        (Value::from("clip"), Value::Bool(false)),
+    ]);
+    let total: usize = param_numels().iter().sum();
+    let init = deterministic_init(total);
     Value::Map(vec![
         (Value::from("model"), model),
         (Value::from("peer"), Value::Bytes(vec![7u8; 32])),
@@ -233,6 +289,11 @@ fn v2_guest_config() -> Value {
         (Value::from("steps_per_round"), Value::from(2u32)),
         (Value::from("micro_batch"), Value::from(1u32)),
         (Value::from("stall_rounds_max"), Value::from(2u32)),
+        (Value::from("profile"), profile),
+        (
+            Value::from("init"),
+            Value::serialized(&init).expect("init value"),
+        ),
     ])
 }
 
@@ -427,7 +488,7 @@ fn supervisor_for(module: &Path) -> TrainSupervisor {
 /// live §2.5 bridge surface — the sunset removed the DRIVER, not the vocabulary).
 #[tokio::test]
 async fn supervisor_probe_reports_major2_and_the_frozen_vocabulary() {
-    let module = module_path("tiny_llama_v2.wasm");
+    let module = module_path("tiny_llama_c3.wasm");
     let sup = supervisor_for(&module);
 
     let hw = sup.probe().await.expect("probe");
@@ -478,7 +539,7 @@ async fn configured_default_worker_path_names_a_binary_that_speaks_ready() {
     );
 
     // Spawn it exactly as the node would; the supervisor blocks until the worker reports `Ready`.
-    let module = module_path("tiny_llama_v2.wasm");
+    let module = module_path("tiny_llama_c3.wasm");
     let sup = supervisor_for(&module);
     sup.probe()
         .await
@@ -502,16 +563,8 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
     let module = write_temp_module(&synthetic_v1_module(), "synthetic-v1-assess");
     let sup = supervisor_for(&module);
 
-    let cfg = TinyLlamaCfg {
-        n_layers: 1,
-        seq_len: 9,
-        ..TinyLlamaCfg::default()
-    };
     let elig = sup
-        .assess(genesis_wire(
-            "abi-major-1",
-            Value::serialized(&cfg).expect("cfg value"),
-        ))
+        .assess(genesis_wire("abi-major-1", v2_guest_config()))
         .await
         .expect("assess is an outcome, not a transport error");
     assert!(!elig.eligible, "a major-1 module is refused post-sunset");
@@ -536,7 +589,7 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
 /// whole-run join is `tests/v2_join.rs`).
 #[tokio::test]
 async fn v2_module_assesses_eligible_over_the_signed_envelope() {
-    let module = module_path("tiny_llama_v2.wasm");
+    let module = module_path("tiny_llama_c3.wasm");
     let sup = supervisor_for(&module);
 
     let elig = sup
@@ -557,7 +610,7 @@ async fn v2_module_assesses_eligible_over_the_signed_envelope() {
 /// stays healthy on the same process.
 #[tokio::test]
 async fn v1_envelope_assess_is_refused_envelope_schema_retired() {
-    let module = module_path("tiny_llama_v2.wasm");
+    let module = module_path("tiny_llama_c3.wasm");
     let sup = supervisor_for(&module);
 
     let err = sup
@@ -578,7 +631,7 @@ async fn v1_envelope_assess_is_refused_envelope_schema_retired() {
 /// stable `UnsignedEnvelopeRetired` slug even when `DAEMON_TRAIN_MODULE` is set.
 #[tokio::test]
 async fn unsigned_raw_config_assess_is_refused_with_typed_slug() {
-    let module = module_path("tiny_llama_v2.wasm");
+    let module = module_path("tiny_llama_c3.wasm");
     let sup = supervisor_for(&module);
 
     let raw = to_canonical_vec(&v2_guest_config()).expect("raw config cbor");
@@ -598,7 +651,7 @@ async fn unsigned_raw_config_assess_is_refused_with_typed_slug() {
 /// the worker survives the lever and serves a fresh assess on the same process.
 #[tokio::test]
 async fn throttle_is_harmless_and_never_respawns() {
-    let module = module_path("tiny_llama_v2.wasm");
+    let module = module_path("tiny_llama_c3.wasm");
     let sup = supervisor_for(&module);
 
     sup.assess(genesis_wire("run-9", v2_guest_config()))

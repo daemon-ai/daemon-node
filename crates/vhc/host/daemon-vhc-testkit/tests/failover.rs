@@ -69,7 +69,7 @@ use daemon_vhc_proto::{
     SigningKey, SwarmMessage, SWARM_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
-use daemon_vhc_testkit::barrier::phase_a_grants;
+use daemon_vhc_testkit::cell8::phase_a_grants;
 use daemon_vhc_testkit::{
     cell8_genesis, configure_wasm_coordinator, coordinator_state_from_capture, WasmCoordinator,
     WasmCoordinatorSpec,

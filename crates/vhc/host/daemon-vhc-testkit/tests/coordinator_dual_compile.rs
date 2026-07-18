@@ -350,7 +350,7 @@ fn run_wasm(
     };
     let key_seed = *blake3::hash(b"d2-dual/coordinator-frame-key").as_bytes();
     let config = guest_config(state);
-    let grants = daemon_vhc_testkit::barrier::phase_a_grants();
+    let grants = daemon_vhc_testkit::cell8::phase_a_grants();
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run_cfg = V2RunConfig::new(identity, key_seed, config, grants);
     let run = start_run(&engine, wasm, run_cfg, Box::new(sink.clone())).expect("start_run");

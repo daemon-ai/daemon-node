@@ -5,7 +5,7 @@
 // colocated on one host, arbitrated, both green"; decisions D6), tier-2:
 //
 // Two real wasm role-instances run CONCURRENTLY in one host process — a trainer
-// (`tiny_llama_v2.wasm`, the cell-8 barrier whole-run under the PRODUCTION `coordinator_quorum.wasm`
+// (`tiny_llama_c3.wasm`, the cell-8 barrier whole-run under the PRODUCTION `coordinator_quorum.wasm`
 // coordinator) and a verifier-role instance (`toy_averager.wasm`, self-driven) — each admitted
 // through the node's
 // `OwnerArbiter` (per-device + host-wide typed ledgers, atomic check-and-reserve) BEFORE its
@@ -83,7 +83,7 @@ fn id(label: &str, role: &str, instance: u64) -> RoleInstanceId {
 #[test]
 fn trainer_and_verifier_colocated_on_one_host_arbitrated_both_green() {
     let coordinator_wasm = guest("coordinator_quorum");
-    let trainer_wasm = guest("tiny_llama_v2");
+    let trainer_wasm = guest("tiny_llama_c3");
     let verifier_wasm = guest("toy_averager");
 
     // The owner's aggregate grants: one 8 GiB accelerator, 100% duty, at most 2 instances.

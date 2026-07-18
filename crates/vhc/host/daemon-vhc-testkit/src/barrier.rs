@@ -25,8 +25,8 @@
 //! round-driver layer: a record whose payloads cannot be minted stalls, voices
 //! `Straggle{fetching}`, and catches up when the payloads arrive — delaying the *record frame*
 //! alone produces no straggle signal, because the driver only stalls on an unmintable pending
-//! record). D1/D2's `Authority` adversarial suites (partitions, equivocation, withheld records)
-//! grow on this rig; Phase B pins the rig shape with one case per primitive.
+//! record). The rig itself lives in [`crate::cell8`] (the wasm-coordinator whole-run harness —
+//! the adversarial drills' home); this native drive shares it.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -50,8 +50,11 @@ use daemon_vhc_proto::{
     PeerId, Seed, SignedMessage, SigningKey,
 };
 
+use crate::cell8::{phase_a_grants, FaultAction, FrameKind, SEQ_LEN};
 use crate::coordinator::NativeCoordinator;
 use crate::run::Decision;
+
+pub use crate::cell8::{FaultPlan, FaultRule};
 
 // -- SDK-free fixture authoring ---------------------------------------------------------------------
 
@@ -120,29 +123,6 @@ pub fn tiny_llama_config(
     ]);
     to_canonical_vec(&cfg).expect("guest config cbor")
 }
-
-/// The Phase-A derived grants document (§2.6 stand-in, byte-identical to the worker's
-/// `derive_grants`): the admitted channel table + the worlds the Phase-A driver links.
-#[must_use]
-pub fn phase_a_grants() -> Vec<u8> {
-    let channels: Vec<Value> = daemon_vhc_abi::PHASE_A_DEFAULT_CHANNEL_TABLE
-        .iter()
-        .map(|c| uint(u64::from(c.id)))
-        .collect();
-    let worlds = ["vhc@2", "net@2", "sys@2", "tabi@1"]
-        .iter()
-        .map(|w| text(w))
-        .collect();
-    let doc = Value::Map(vec![
-        (text("channels"), Value::Array(channels)),
-        (text("worlds"), Value::Array(worlds)),
-    ]);
-    to_canonical_vec(&doc).expect("grants cbor")
-}
-
-/// Tokens per sequence for the zero-token staged batches (the A2 t2 geometry; real corpora are
-/// `data@2`, Phase B track B2).
-pub const SEQ_LEN: u32 = 9;
 
 /// A schema-major-1 envelope for a barrier run: `global_batch` sequences per round over
 /// `steps_per_round` inner steps (the v1 envelope shape the native coordinator consumes).
@@ -215,66 +195,6 @@ pub fn barrier_envelope(
             stall_rounds_max: 2,
             payload_retention_rounds: 4,
         },
-    }
-}
-
-// -- the fault-injection rig --------------------------------------------------------------------------
-
-/// Which coordinator→worker authoritative frame a [`FaultRule`] targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameKind {
-    /// A `RoundOpen` frame.
-    Open,
-    /// A `RoundRecord` frame.
-    Record,
-}
-
-/// What the rig does to a matched delivery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FaultAction {
-    /// The frame is not delivered at all (loss / withholding).
-    Drop,
-    /// The frame is delivered twice, byte-identical, same seq — a true duplicate.
-    Duplicate,
-}
-
-/// One deterministic fault rule: `(worker, round, kind) → action`.
-#[derive(Debug, Clone, Copy)]
-pub struct FaultRule {
-    /// The worker index the fault applies to.
-    pub worker: usize,
-    /// The round whose frame is targeted.
-    pub round: u64,
-    /// Which frame of that round.
-    pub kind: FrameKind,
-    /// What happens to it.
-    pub action: FaultAction,
-}
-
-/// A deterministic fault plan over a barrier run (module docs). `Default` is fault-free.
-#[derive(Debug, Clone, Default)]
-pub struct FaultPlan {
-    /// Frame-plane faults (drop / duplicate).
-    pub rules: Vec<FaultRule>,
-    /// Payload-plane faults: `(worker, round)` pairs whose committed payloads are staged only at
-    /// the NEXT round's open instead of before the record — the straggle trigger (module docs).
-    pub delay_payload_staging: Vec<(usize, u64)>,
-}
-
-impl FaultPlan {
-    /// The action (if any) for `(worker, round, kind)`.
-    #[must_use]
-    pub fn action(&self, worker: usize, round: u64, kind: FrameKind) -> Option<FaultAction> {
-        self.rules
-            .iter()
-            .find(|r| r.worker == worker && r.round == round && r.kind == kind)
-            .map(|r| r.action)
-    }
-
-    /// Whether `(worker, round)`'s committed payloads are delayed past the record.
-    #[must_use]
-    pub fn payloads_delayed(&self, worker: usize, round: u64) -> bool {
-        self.delay_payload_staging.contains(&(worker, round))
     }
 }
 
