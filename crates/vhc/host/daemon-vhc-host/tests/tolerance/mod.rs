@@ -16,7 +16,8 @@
 /// The tolerance class of an op (the HOST-3 machinery). Pinned in [`tol_for`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpClass {
-    /// Bit-exact: det lane + compression natives (both delegate to `daemon_vhc_det` host-side).
+    /// Bit-exact: the det lane (a pure function of its inputs via the in-guest `daemon-vhc-det`
+    /// kernels — backend-independent by construction).
     Exact,
     /// Pure data moves (reshape/transpose/slice) — bit-exact permutations.
     Shape,

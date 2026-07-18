@@ -146,12 +146,29 @@ fn delayed_committed_payloads_stall_then_catch_up() {
         w.replay_matched,
         "§8.7 replay green through the straggle detour"
     );
+    // The AFFIRMATIVE stall + recovery evidence, pinned as the exact ordered decision shapes
+    // (tag, round) of the guest's voices — not just a count:
+    //  - the clean run voices the full per-round ladder, digest included;
+    //  - the faulted run's round-0 record was consumed yet produced NO (4,0) digest voice before
+    //    round 1's training — the OBSERVED stall (the driver could not mint the committed set);
+    //  - (2,1)/(3,1) exist at all — the OBSERVED recovery: the round driver trains + commits
+    //    round 1 only after its round-1 open successfully ingested the held round 0 (a
+    //    still-stalled driver skips training and voices nothing);
+    //  - the single (4,1) is the caught-up fold's terminal digest.
+    let shape = |w: &daemon_vhc_testkit::Cell8WorkerReport| -> Vec<(u64, u64)> {
+        w.voices.iter().map(|(t, r, _)| (*t, *r)).collect()
+    };
     assert_eq!(
-        w.digests_for(0),
-        0,
-        "the stalled round's digest is folded at catch-up, never voiced per-round"
+        shape(&clean.workers[0]),
+        vec![(2, 0), (3, 0), (4, 0), (2, 1), (3, 1), (4, 1)],
+        "clean run: theta+commitment+digest per round"
     );
-    assert_eq!(w.digests_for(1), 1, "round 1 voices its digest normally");
+    assert_eq!(
+        shape(w),
+        vec![(2, 0), (3, 0), (2, 1), (3, 1), (4, 1)],
+        "faulted run: round 0 stalls at its record (no (4,0)), round 1 trains + commits after \
+         the catch-up ingest, and the terminal digest is the caught-up fold"
+    );
     // The detour's recorded decisions: theta+commitment per round + the single (final) digest.
     assert_eq!(w.replay_decisions, 5);
     assert!(faulted.is_green());

@@ -327,7 +327,14 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-abi"],
         ),
         (
-            "daemon-vhc-det (shared det kernels: sim ≡ host)",
+            // The det-lane kernels' tier-1 suite. This is the ONLY det implementation: the
+            // former host-op ≡ in-guest-crate conformance lane (v2_det_conformance) retired
+            // WITH the tabi@1 bridge — the host-side det_* acceleration dispatch it compared
+            // was the bridge's, and no host-executed det-kernel surface exists any more (the
+            // compute@2 runner executes burn_ir ops, the tolerance-class native lane; det math
+            // runs exclusively in-guest via this crate compiled to wasm). End-to-end det
+            // coverage through the production trainer is the trainer-goldens digest equality.
+            "daemon-vhc-det (the det-lane kernels — the single implementation)",
             &["-p", "daemon-vhc-det"],
         ),
         (

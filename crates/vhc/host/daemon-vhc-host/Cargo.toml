@@ -47,9 +47,9 @@ burn-ndarray = { workspace = true }
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
 thiserror = { workspace = true }
-# The shared fixed-order fp32 det-lane kernels (bit-exact sim ≡ host, ABI §5.9) + the CBOR codec for
-# the manifest/config contract (ABI §6.1/§6.2). daemon-vhc-det is zero-dep; serde/ciborium are already pins.
-daemon-vhc-det = { workspace = true }
+# The CBOR codec for the manifest/config contract (ABI §6.1/§6.2). (The daemon-vhc-det dep
+# retired with the bridge's det_* acceleration dispatch: no host-executed det-kernel surface
+# remains — det math runs exclusively in-guest via that crate compiled to wasm.)
 serde = { workspace = true }
 ciborium = { workspace = true }
 # The wasm-coordinator drive seat (`wasm_coordinator` module): configuring/authorizing the
