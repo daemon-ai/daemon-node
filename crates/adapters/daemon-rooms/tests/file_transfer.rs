@@ -3,7 +3,7 @@
 // Integration test: raw fs (temp dirs) is expected in tests.
 #![allow(clippy::disallowed_methods)]
 
-//! W2-H: the Rooms adapter's loopback [`SupportsFileTransfer`] over the node content store.
+//! File transfer: the Rooms adapter's loopback [`SupportsFileTransfer`] over the node content store.
 //!
 //! A Room transfer is a same-node loopback: the file is content-addressed in the node blob store, so
 //! `send` verifies the blob resolves and `receive` fetches it. Without a wired blob store the

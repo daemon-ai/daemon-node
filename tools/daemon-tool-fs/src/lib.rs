@@ -19,7 +19,7 @@
 //! edit-approval gate and the credential/system deny list before touching anything; post-edit
 //! `[fs.lint]` diagnostics (delta-filtered) are appended to `write`/`edit` results.
 //!
-//! W5 executor seams: `concurrency_for` classifies `read`/`list`/`grep`/`glob` as
+//! Executor seams: `concurrency_for` classifies `read`/`list`/`grep`/`glob` as
 //! [`ToolConcurrency::Parallel`] (mutating ops stay exclusive), `mutates_for` scopes the §12
 //! checkpoint to the mutating ops, and `parallel_scope_paths` declares each call's target path
 //! for the batch path-overlap gate.

@@ -22,7 +22,7 @@ use std::cmp::Ordering;
 /// `Br` matches `biRb`). Casefolding is Unicode lowercase (approximates `g_utf8_casefold`).
 ///
 /// `pub(crate)` so the sibling saved-presence port ([`crate::saved_presence`]) reuses the exact
-/// birb matcher rather than duplicating it (W2-F).
+/// birb matcher rather than duplicating it.
 pub(crate) fn str_matches(pattern: &str, haystack: &str) -> bool {
     let mut pat = pattern.chars().flat_map(char::to_lowercase).peekable();
     // An empty pattern is a subsequence of anything.
@@ -69,7 +69,7 @@ impl ContactInfo {
     /// `alias → person-alias → display_name → id`; the daemon `ContactInfo` has neither an alias
     /// nor a person field (those live on [`ConversationMember`] / [`Person`]), so the chain reduces
     /// to `display_name → id`. The person-aware layer is
-    /// [`name_for_display_with_person`](ContactInfo::name_for_display_with_person) (W3-J).
+    /// [`name_for_display_with_person`](ContactInfo::name_for_display_with_person).
     pub fn name_for_display(&self) -> &str {
         if let Some(display_name) = self.display_name.as_deref() {
             if !display_name.is_empty() {
@@ -106,7 +106,7 @@ impl ContactInfo {
 }
 
 impl ContactInfo {
-    /// The person-aware name-for-display (W3-J): the full libpurple chain
+    /// The person-aware name-for-display: the full libpurple chain
     /// `contact-alias → person-alias → display_name → id`. The daemon `ContactInfo` has no
     /// contact-alias field, so the effective chain is `person-alias → display_name → id` — the
     /// person's alias (when the contact is associated with a [`Person`]) is inserted ahead of the
@@ -121,7 +121,7 @@ impl ContactInfo {
     }
 }
 
-/// Person-aware port of `purple_contact_info_compare` (W3-J): the NULL rules, then the
+/// Person-aware port of `purple_contact_info_compare`: the NULL rules, then the
 /// person tier (a contact WITH an associated [`Person`] sorts before one without —
 /// `purplecontactinfo.c` `person_a != NULL && person_b == NULL → -1`), then person-aware
 /// name-for-display caseless. Each side is `(contact, its optional person)`.
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(c.name_for_display(), "id");
     }
 
-    // -- ContactInfo::name_for_display (person-aware, W3-J re-activation) ---
+    // -- ContactInfo::name_for_display (person-aware) ---
 
     #[test]
     fn contact_info_name_for_display_person_alias() {
@@ -428,7 +428,7 @@ mod tests {
         );
     }
 
-    // -- ContactInfo::compare (person-aware, W3-J re-activation) -----------
+    // -- ContactInfo::compare (person-aware) -----------
 
     #[test]
     fn contact_info_compare_person_no_person() {

@@ -3041,7 +3041,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 });
                 // A3: construct the `RegistryClient`-backed `EgressRunDiscovery` from the additive
                 // `[vhc.registry]` config (registry base + `swarm:*` creds) — the A1-noted boot
-                // follow-on. An empty base keeps `discovery: None` (the W1 probe fallback against
+                // follow-on. An empty base keeps `discovery: None` (the probe fallback against
                 // the allowlist), so existing configs are unchanged. The base/auth are pure config:
                 // the same node targets wrangler-dev or a real workers.dev deployment by config only.
                 let discovery: Option<Arc<dyn daemon_vhc_node::RunDiscovery>> = if cfg

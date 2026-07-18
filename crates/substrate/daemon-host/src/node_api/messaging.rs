@@ -98,7 +98,7 @@ impl NodeApiImpl {
             })
     }
 
-    /// Resolve the file-transfer feature for `transport` (W2-H).
+    /// Resolve the file-transfer feature for `transport`.
     pub(crate) fn file_transfer_for(
         &self,
         transport: &TransportId,

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Authorization requests, add-contact requests, and typed notifications ported from libpurple
-//! (work package W2-G). Unlike the Wave-1 DTO-logic module, this package **touches the wire**: the
-//! types here are reachable from [`ApiResponse::Notifications`](crate::ApiResponse) and
+//! Authorization requests, add-contact requests, and typed notifications ported from libpurple.
+//! Unlike the pure DTO-logic modules ([`crate::details`], [`crate::tags`]), this one **touches the
+//! wire**: the types here are reachable from [`ApiResponse::Notifications`](crate::ApiResponse) and
 //! [`NodeEvent::NotificationsChanged`](crate::NodeEvent), so they are serde types mirrored in
 //! `daemon-api.cddl` and derive feature-gated [`arbitrary::Arbitrary`].
 //!

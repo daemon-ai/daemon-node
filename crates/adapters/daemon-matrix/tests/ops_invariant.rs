@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! W1-A conformance: the [`assert_ops_match_behavior`] invariant against the real `MatrixAdapter`,
+//! Adapter ops<->behavior conformance: the [`assert_ops_match_behavior`] invariant against the real `MatrixAdapter`,
 //! constructed hermetically (no-op provisioning + default config + no lifecycle sink, no live
 //! client). Advertised verbs short-circuit to `Unsupported("matrix account … is not connected")`
 //! (≠ the capability sentinel), so the biconditional holds without any homeserver I/O.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The `Person`/MetaContact model ported from libpurple (work package W3-J) — the one concept the
+//! The `Person`/MetaContact model ported from libpurple — the one concept the
 //! transport-adapter spec explicitly deferred, now un-deferred.
 //!
 //! A [`Person`] is "the same human across transports": an auto-identified association carrying an

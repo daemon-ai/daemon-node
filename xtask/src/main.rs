@@ -2258,8 +2258,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             origin_ops: std::collections::BTreeMap::new(),
         }),
     )?;
-    // W6: the pure-local session recap op (request + a populated response), so verify-codec proves
-    // the generated C decoder takes the new shapes end-to-end.
+    // Session recap: the pure-local session recap op (request + a populated response), so
+    // verify-codec proves the generated C decoder takes the new shapes end-to-end.
     write_cbor(
         &out,
         "request-session-recap.cbor",
@@ -2291,7 +2291,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             epoch: 0,
         }),
     )?;
-    // wire v37 (W2-E): the richer ChatMessage on the conversation-history surface, so conformance
+    // wire v37: the richer ChatMessage on the conversation-history surface, so conformance
     // + verify-codec prove the CDDL↔Rust agreement on the new `JournalRecordPayload::Chat` arm and
     // the `chat-message` / `message-attachment` shapes on a real ciborium payload.
     write_cbor(
@@ -2886,7 +2886,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-crash-consent.cbor",
         &ApiResponse::CrashConsent { enabled: true },
     )?;
-    // Saved presences (W2-F; wire v37): the list/save/delete/set-active ops + the listing reply.
+    // Saved presences (wire v37): the list/save/delete/set-active ops + the listing reply.
     {
         use daemon_api::{PresencePrimitive, SavedPresence};
         write_cbor(
@@ -2931,7 +2931,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         )?;
     }
 
-    // -- file transfer (W2-H; wire v37) --------------------------------------------------------
+    // -- file transfer (wire v37) --------------------------------------------------------------
     {
         use daemon_api::{FileTransfer, FileTransferDirection, FileTransferState};
         use daemon_common::{BlobRef, ContentHash};

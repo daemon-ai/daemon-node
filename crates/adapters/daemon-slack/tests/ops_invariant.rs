@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! W1-A conformance: the [`assert_ops_match_behavior`] invariant against the real `SlackAdapter`,
+//! Adapter ops<->behavior conformance: the [`assert_ops_match_behavior`] invariant against the real `SlackAdapter`,
 //! constructed hermetically (no-op provisioning + default config, no live connection).
 
 use std::sync::Arc;

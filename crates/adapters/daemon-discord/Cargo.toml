@@ -31,7 +31,7 @@ anyhow = { workspace = true }
 serenity_self = { version = "0.13", default-features = false, features = ["client", "gateway", "cache", "model", "http", "builder", "utils", "rustls_backend"] }
 
 [dev-dependencies]
-# W1-A conformance: run the ops<->behavior invariant against the real adapter.
+# Adapter ops<->behavior conformance: run the ops<->behavior invariant against the real adapter.
 daemon-api-testkit = { workspace = true }
 
 [lints]

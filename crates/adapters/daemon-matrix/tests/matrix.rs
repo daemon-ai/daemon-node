@@ -379,7 +379,7 @@ async fn sso_begin_mints_url_then_complete_persists_session() {
     let _ = std::fs::remove_dir_all(&store_root);
 }
 
-/// W2-H: `SupportsFileTransfer::send` reads the blob's bytes from the node store and uploads them to
+/// File transfer: `SupportsFileTransfer::send` reads the blob's bytes from the node store and uploads them to
 /// the Matrix content repository (`POST /_matrix/media/v3/upload`, mocked).
 #[tokio::test]
 async fn file_transfer_send_uploads_media() {
@@ -424,7 +424,7 @@ async fn file_transfer_send_uploads_media() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// W2-H: `SupportsFileTransfer::receive` downloads the `source` `mxc://` content
+/// File transfer: `SupportsFileTransfer::receive` downloads the `source` `mxc://` content
 /// (`GET /_matrix/client/v1/media/download/...`, mocked) and stores it back into the node store.
 #[tokio::test]
 async fn file_transfer_receive_downloads_media() {

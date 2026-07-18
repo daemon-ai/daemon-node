@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `VhcService` + `vhc.db` unit tests (W1): event fanout, durable join-intent persistence +
+//! `VhcService` + `vhc.db` unit tests: event fanout, durable join-intent persistence +
 //! reload re-convergence, `vhc.db` migration idempotence, and disabled-by-default (no worker spawn
 //! when `enabled = false`). The worker is a trait-level `FakeWorker` (the `WorkerControl` seam) — no
 //! subprocess — recording every call so we can assert the service never touches the worker while

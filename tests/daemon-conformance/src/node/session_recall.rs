@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! W6 session-recall conformance: turn-boundary FTS indexing (the live pump's snapshot round-trip
+//! Session-recall conformance: turn-boundary FTS indexing (the live pump's snapshot round-trip
 //! AND the durable incarnation's post-seal index), background title generation replacing the
 //! truncation seed, and the pure-local `session_recap` op (durable-snapshot + live-view sources,
 //! Auth-4 scoped).

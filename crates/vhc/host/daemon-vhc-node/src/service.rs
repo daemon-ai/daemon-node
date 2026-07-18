@@ -232,7 +232,7 @@ pub struct VhcServiceParts {
     /// The node-feed sink for `VhcChanged` pointers (`None` on a headless / test build).
     pub feed: Option<NodeFeed>,
     /// The run-discovery seam (A1). When present, `vhc_join` discovers the run + fetches the frozen
-    /// envelope + runs the worker's real §6.5 `AssessRun` before `JoinRun`. `None` keeps the W1
+    /// envelope + runs the worker's real §6.5 `AssessRun` before `JoinRun`. `None` keeps the
     /// probe-based eligibility path (no coordinator configured), so the service stays usable offline.
     pub discovery: Option<Arc<dyn RunDiscovery>>,
     /// The owner's aggregate resource grants (decisions D6). `None` = permissive
@@ -534,7 +534,7 @@ impl VhcService {
 
     /// Translate + persist + fan out a worker event (spec §10.3 "all are persisted / fanned out by
     /// the node"). Returns the [`VhcEvent`]s emitted (0..2 per worker event). B3 wires the live
-    /// worker event stream into this; W1 tests drive it directly.
+    /// worker event stream into this; unit tests drive it directly.
     pub fn handle_worker_event(&self, ev: &protocol::Event) -> Result<Vec<VhcEvent>, VhcError> {
         // Track the current run + persist phase from a RunPhase.
         if let protocol::Event::RunPhase {
@@ -643,7 +643,7 @@ impl VhcService {
     ///
     /// With a discovery seam: `GET /runs/:id` → fetch + blake3-verify the frozen envelope →
     /// `worker.assess(envelope)` (real §6.5), taking the coordinator from the registry. Without one:
-    /// the W1 probe against the allowlisted coordinator. Eligibility is always node-computed.
+    /// the probe against the allowlisted coordinator. Eligibility is always node-computed.
     async fn resolve_join(
         &self,
         worker: &Arc<dyn WorkerControl>,
@@ -729,7 +729,7 @@ impl VhcApi for VhcService {
         // Node-computed eligibility (ADR-003). A1: when a discovery seam is configured, resolve the
         // run + fetch the frozen envelope + run the worker's real §6.5 `AssessRun` before `JoinRun`,
         // and take the coordinator endpoint from discovery. With no discovery configured, fall back
-        // to the W1 probe-based eligibility against the allowlisted coordinator (offline / no-registry
+        // to the probe-based eligibility against the allowlisted coordinator (offline / no-registry
         // path). Either way the persisted eligibility is node-computed — the app never re-derives it.
         let (coordinator, eligibility) = self
             .resolve_join(&worker, &run_id)
@@ -872,7 +872,7 @@ impl VhcApi for VhcService {
 
     async fn vhc_set_policy(&self, policy: VhcPolicy) -> Result<(), ApiError> {
         self.require_enabled().map_err(|e| e.to_api())?;
-        // W1: push the governor levers to the worker (§10.5) — and, under multi-instance
+        // Push the governor levers to the worker (§10.5) — and, under multi-instance
         // supervision, to every live role-instance child (the owner lever is host-wide). The
         // persisted default-policy slot for future joins is the config `[vhc].default_policy`;
         // a durable override lands with the policy store in a later wave.

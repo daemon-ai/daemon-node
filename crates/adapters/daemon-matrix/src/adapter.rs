@@ -55,7 +55,7 @@ pub struct MatrixAdapter {
     /// The node-owned lifecycle sink (wire v30): the adapter reports conversation/membership changes
     /// and disconnect causes through it. `None` in unit tests that never wire the node.
     sink: Option<Arc<dyn daemon_api::LifecycleSink>>,
-    /// The node content store, for [`SupportsFileTransfer`] (W2-H): `send` reads a blob's bytes to
+    /// The node content store, for [`SupportsFileTransfer`]: `send` reads a blob's bytes to
     /// upload to the Matrix content repo, `receive` stores downloaded bytes back. `None` ⟹ the
     /// feature is absent (`file_transfer()` returns `None`).
     blobs: Option<Arc<dyn BlobStore>>,
@@ -80,7 +80,7 @@ impl MatrixAdapter {
         })
     }
 
-    /// Like [`new`](Self::new), but wires the node content store so [`SupportsFileTransfer`] (W2-H)
+    /// Like [`new`](Self::new), but wires the node content store so [`SupportsFileTransfer`]
     /// is advertised + operable (media upload for send, download for receive).
     pub fn with_blobs(
         provisioning: Arc<dyn AccountProvisioning>,
@@ -255,7 +255,7 @@ impl MessagingProtocol for MatrixAdapter {
     }
 
     fn file_transfer(self: Arc<Self>) -> Option<Arc<dyn SupportsFileTransfer>> {
-        // Present only when the node content store is wired (W2-H); absent ⟹ `None`, so the
+        // Present only when the node content store is wired; absent ⟹ `None`, so the
         // ops-vs-behavior invariant sees no advertised (yet unimplemented) file-transfer verbs.
         if self.blobs.is_some() {
             Some(self)

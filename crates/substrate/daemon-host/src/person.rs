@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `PersonManager` — the node-side person/metacontact registry (work package W3-J), ported from
+//! `PersonManager` — the node-side person/metacontact registry, ported from
 //! the person half of libpurple's `purplecontactmanager.c` (`manager->people`).
 //!
 //! It owns the live collection of [`Person`]s behind the person surface

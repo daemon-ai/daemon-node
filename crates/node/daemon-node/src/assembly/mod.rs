@@ -338,11 +338,11 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         .registry
         .set_notifier(Arc::new(NodeProcessNotifier { node: node.clone() }));
 
-    // The detached-delegation notice worker (W9): drains the durable completion-notice outbox for
+    // The detached-delegation notice worker: drains the durable completion-notice outbox for
     // `spawn wait:false` children and injects each terminal outcome into its parent through the same
     // one lifecycle-aware `inject_session_input` seam the process notifier uses. Detached like the
-    // reaper/fleet-change bridge; ticks at the wake/job dispatch cadence (no new config field — W10
-    // executes in parallel and must not conflict on `NodeAssembly`).
+    // reaper/fleet-change bridge; ticks at the wake/job dispatch cadence (adds no new config field,
+    // so it composes cleanly onto `NodeAssembly`).
     crate::fleet::NoticeWorker::new(a.store.clone(), node.clone())
         .spawn(a.host_config.dispatch_interval);
 
@@ -857,7 +857,7 @@ fn bind_node_api_surfaces(
 ) -> NodeApiImpl {
     spawn_fleet_change_bridge(shared);
     let node_api = bind_storage_surfaces(node_api, cron_ops, shared);
-    // Saved presences (W2-F; wire v37): the host `PresenceManager` over the SAME durable store the
+    // Saved presences (wire v37): the host `PresenceManager` over the SAME durable store the
     // rest of the node uses. Its default Offline/Available presences seed lazily on the first
     // `presence_list` (seed-on-read, like the cron catalog), so no async startup load is needed here.
     let node_api = node_api

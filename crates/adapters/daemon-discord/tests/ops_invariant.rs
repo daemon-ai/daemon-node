@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! W1-A conformance: the [`assert_ops_match_behavior`] invariant against the real `DiscordAdapter`.
+//! Adapter ops<->behavior conformance: the [`assert_ops_match_behavior`] invariant against the real `DiscordAdapter`.
 //!
 //! Constructed hermetically (a no-op provisioning seam + default config, no live client), so every
 //! verb the adapter reports unsupported returns the capability sentinel, and advertised verbs

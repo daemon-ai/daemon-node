@@ -82,7 +82,7 @@ pub enum RegistryAuthConfig {
 /// When `base` is non-empty, `bins/daemon` constructs a `RegistryClient`-backed `EgressRunDiscovery`
 /// at boot, so `vhc_join` discovers the run, fetches + blake3-verifies the frozen envelope, and
 /// runs the worker's real §6.5 `AssessRun` before `JoinRun`. Empty (the default) keeps
-/// `discovery: None` — the W1 probe-based fallback against the allowlist. **Deploy-swappable by
+/// `discovery: None` — the probe-based fallback against the allowlist. **Deploy-swappable by
 /// config only**: the same node targets wrangler-dev (`http://127.0.0.1:8795/api/v1/swarm`) or the
 /// real workers.dev deployment (e.g. `https://daemon-swarm-dev.<acct>.workers.dev/api/v1/swarm`)
 /// without a code change.

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
 //! Message state ([`ChatMessage`], [`MessageAttachment`]) ported from libpurple `PurpleMessage`
-//! (`purplemessage.c`) + `PurpleAttachment` (`purpleattachment.c`), work package W2-E.
+//! (`purplemessage.c`) + `PurpleAttachment` (`purpleattachment.c`).
 //!
 //! A **wire type**: it becomes reachable from [`crate::ApiResponse::Journal`] through the additive
 //! [`crate::JournalRecordPayload::Chat`] arm, so it enriches the conversation-history surface without

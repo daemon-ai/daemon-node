@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! W10 `semantic_search` conformance: the node assembled exactly as `bins/daemon` does injects the
+//! `semantic_search` conformance: the node assembled exactly as `bins/daemon` does injects the
 //! tool via `extra_tools` over a MockEmbedder-backed [`WorkspaceIndex`], and a driven turn's tool
 //! call returns ranked hits that reference the seeded file — scoped to the calling session's own
 //! workspace subtree (cross-session files never leak). The negative case (no tool wired, mirroring
@@ -161,7 +161,7 @@ async fn drive_tool_results(
     results
 }
 
-/// THE W10 GATE: a session's `semantic_search` call returns ranked hits referencing the seeded file
+/// THE SEMANTIC-SEARCH GATE: a session's `semantic_search` call returns ranked hits referencing the seeded file
 /// under ITS OWN workspace subtree — and never a file from a sibling session's subtree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn semantic_search_returns_ranked_hits_scoped_to_the_session() {

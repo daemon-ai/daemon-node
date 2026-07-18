@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! THE W9 DETACHED-DELEGATION GATE: the orchestrate `spawn wait:false` mode — a non-suspending
+//! THE DETACHED-DELEGATION GATE: the orchestrate `spawn wait:false` mode — a non-suspending
 //! delegation whose child runs in the background and, on its terminal state, delivers a completion
 //! *notice* to its parent as a fresh reactive turn (Cursor's `run_in_background: true` analogue).
 //!

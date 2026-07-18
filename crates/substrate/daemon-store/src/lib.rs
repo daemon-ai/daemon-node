@@ -393,7 +393,7 @@ pub struct StoredCronSuggestion {
     pub created_unix: u64,
 }
 
-/// A durable saved-presence row (W2-F). The store stays protocol-free: `payload` is the opaque
+/// A durable saved-presence row. The store stays protocol-free: `payload` is the opaque
 /// host-encoded CBOR of the wire `SavedPresence` (mirroring `cron_jobs.spec`), while `id` is the
 /// typed primary key for upsert/lookup/delete. Rows are insertion-ordered by the backend so the
 /// host-side `PresenceManager` list (and its active index) is stable across reloads.
@@ -1434,9 +1434,9 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
-    // -- saved presences (W2-F): the durable backing for the host `PresenceManager` -------------
+    // -- saved presences: the durable backing for the host `PresenceManager` --------------------
 
-    /// List every durable saved presence in insertion order (W2-F). The host `PresenceManager`
+    /// List every durable saved presence in insertion order. The host `PresenceManager`
     /// loads these at startup (and seeds its default offline/available presences if absent).
     /// Default: none (a store without the saved-presence table — presences are then in-memory only).
     async fn saved_presence_list(&self) -> Vec<StoredSavedPresence> {
@@ -1454,7 +1454,7 @@ pub trait SessionStore: Send + Sync {
         Ok(())
     }
 
-    /// The id of the active saved presence, if one has been set (W2-F). Default: `None`.
+    /// The id of the active saved presence, if one has been set. Default: `None`.
     async fn saved_presence_active_get(&self) -> Option<String> {
         None
     }
@@ -1687,11 +1687,11 @@ struct Inner {
     cron_runs: HashMap<String, Vec<StoredCronRun>>,
     /// Durable cron suggestions, keyed by id (I15; analogue of `cron_suggestions`).
     cron_suggestions: HashMap<String, StoredCronSuggestion>,
-    /// Durable saved presences in insertion order (W2-F; analogue of the SQLite `saved_presences`
+    /// Durable saved presences in insertion order (analogue of the SQLite `saved_presences`
     /// table). A `Vec` (not a `HashMap`) so the list order — which the `PresenceManager` active
     /// index depends on — is stable across reloads.
     saved_presences: Vec<StoredSavedPresence>,
-    /// The active saved-presence id, if set (W2-F; analogue of `saved_presence_active`).
+    /// The active saved-presence id, if set (analogue of `saved_presence_active`).
     saved_presence_active: Option<String>,
     fault: Option<FaultPoint>,
     /// Append-only journal entries per stream, in append (cursor) order across all segments.
@@ -3591,7 +3591,7 @@ mod pending_input_tests {
 
 #[cfg(test)]
 mod detached_delegation_tests {
-    //! The detached-delegation (W9 `spawn wait:false`) store seam, proven against both backends:
+    //! The detached-delegation (`spawn wait:false`) store seam, proven against both backends:
     //! `enqueue_detached_job` mints unique `{parent}/dN` children and stamps them onto the bare job;
     //! `bind_completion_notice` makes the child tree-visible without a delegation edge; and a detached
     //! child's terminal `mark_completed` pushes exactly one `CompletionNotice` (idempotent), stamps

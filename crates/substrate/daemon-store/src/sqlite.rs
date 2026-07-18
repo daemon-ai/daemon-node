@@ -297,7 +297,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         // `mark_completed` in the same transaction as the status flip — the ephemeral-subagent
         // reaper's grace timer. NULL on legacy/non-terminal rows (never reaped).
         M::up("ALTER TABLE session_meta ADD COLUMN terminal_ms INTEGER;"),
-        // M5 (detached delegation — W9 `spawn wait:false`): the completion-notice seam. A detached
+        // M5 (detached delegation — `spawn wait:false`): the completion-notice seam. A detached
         // child carries a `completion_notices` edge (not a `delegations` edge) so its terminal
         // `mark_completed` pushes a `CompletionNotice` onto `completion_notice_outbox` (delivered to
         // the parent as a fresh reactive turn) instead of fulfilling a parent job. The `notified` flag
@@ -397,7 +397,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
                  label   TEXT NOT NULL\n\
              );",
         ),
-        // M13 (W2-F — saved presences): the durable backing for the host `PresenceManager`.
+        // M13 (saved presences): the durable backing for the host `PresenceManager`.
         // `saved_presences.payload` is the opaque CBOR of the whole wire `SavedPresence`
         // (protocol-free, mirroring `cron_jobs.spec`); the `rowseq` AUTOINCREMENT primary key gives
         // stable insertion ordering (the manager's active index depends on list order), with `id`
@@ -2976,7 +2976,7 @@ mod tests {
         assert_eq!(total.cost_micros, 2468);
     }
 
-    /// Saved presences (W2-F): list/set/remove round-trip, upsert preserves insertion order, and
+    /// Saved presences: list/set/remove round-trip, upsert preserves insertion order, and
     /// the single-row active id persists (the durable backing for the host `PresenceManager`).
     #[tokio::test]
     async fn saved_presence_store_round_trips() {

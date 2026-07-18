@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `PresenceManager` — the host-side saved-presence surface (work package W2-F).
+//! `PresenceManager` — the host-side saved-presence surface.
 //!
 //! Ported from libpurple's `PurplePresenceManager` (`purplepresencemanager.c`): an ordered
 //! collection of [`SavedPresence`]s that always guarantees a default **Offline** and **Available**

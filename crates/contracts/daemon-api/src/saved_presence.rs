@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `SavedPresence` — the named, reusable presence a user can pick (work package W2-F).
+//! `SavedPresence` — the named, reusable presence a user can pick.
 //!
 //! Ported from libpurple's `PurpleSavedPresence` (`purplesavedpresence.c`): an auto-identified,
 //! named presence carrying a [`PresencePrimitive`], an optional status message + emoji, a

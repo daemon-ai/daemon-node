@@ -474,7 +474,7 @@ mod directory {
 }
 
 // ===========================================================================
-// test_protocol_file_transfer.c (EMPTY side only; normal/error skipped → W2-H)
+// test_protocol_file_transfer.c (EMPTY side only; normal/error covered by the file-transfer port)
 // ===========================================================================
 mod file_transfer {
     use super::*;
@@ -517,7 +517,7 @@ mod file_transfer {
         );
     }
 
-    // ---- Normal / error (← /protocol-file-transfer/normal/*; W2-H) ----
+    // ---- Normal / error (← /protocol-file-transfer/normal/*; file-transfer port) ----
     #[tokio::test]
     async fn ft_fake_implements_and_send_ok() {
         // ⟵ /protocol-file-transfer/normal/send-normal: implements_send + a successful finish.
