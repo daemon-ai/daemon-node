@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn an_epoch_rebind_renews_under_the_same_token_with_a_reissued_certificate() {
-        // Ruling: a renew across an epoch boundary rebinds the certificate (same key, new epoch,
+        // Contract: a renew across an epoch boundary rebinds the certificate (same key, new epoch,
         // possibly a new module), same incarnation, same fencing token — a renew, not a takeover.
         let base = key(1);
         let run_key = key(2);
