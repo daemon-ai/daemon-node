@@ -72,6 +72,10 @@ ciborium = { workspace = true }
 serde_json = { workspace = true }
 # Per-shard content addressing in the manifest (blake3, §8).
 blake3 = { workspace = true }
+# The certified per-run identity subsystem (architecture §4.3): CSPRNG seeds for base / per-run /
+# transport keys, and zero-on-drop carriers for secret seed material (redaction by construction).
+getrandom = { workspace = true }
+zeroize = { workspace = true }
 # Deterministic synthetic corpus + StubBackend fake "updates" and the xxh3-128 state digest (§5.6).
 xxhash-rust = { workspace = true }
 

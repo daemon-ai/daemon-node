@@ -38,6 +38,7 @@ pub mod seam;
 // transition chain (`daemon_vhc_proto::TransitionChain`, deliverable 1); the wasm-guest step
 // adapters and drills live in the host testkit.
 pub mod attach;
+pub mod identity;
 pub mod upgrade;
 // `wasm_backend` (the v1 five-phase driver's TrainerBackend binding, moved here at the A2
 // inversion) RETIRED at the Phase-E v1 sunset (decisions D5) together with the host's Instance
