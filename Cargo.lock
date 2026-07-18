@@ -5132,6 +5132,7 @@ dependencies = [
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
+ "tempfile",
  "tokio",
  "wasm-encoder",
 ]

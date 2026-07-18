@@ -16,10 +16,11 @@
 // recorded journal through the §8.7 engine before reporting the round outcome — a diverging
 // run is a join FAILURE (the `replay_decisions` metric is the green receipt).
 //
-// In-process identity contract (session module docs): the worker derives the coordinator's
-// §12.1 frame key from the run id, so this author names that derived key's peer id as the
-// genesis `SingleKey` coordinator identity — a mismatch refuses every coordinator frame at the
-// authority judgment.
+// In-process identity contract (session module docs): the worker resolves every signing key
+// against the identity keystore this fixture hands it (DAEMON_VHC_IDENTITY_DIR) — CSPRNG per-run
+// keys, never derived from the run id. The author therefore reads the coordinator run key's peer
+// id OUT of that same store and names it as the genesis `SingleKey` coordinator identity — a
+// mismatch refuses every coordinator frame at the authority judgment.
 
 // Dev/test harness: shells cargo for the guest build (same pattern as worker_protocol.rs); the
 // env/spawn bans target the shipped node, so they are allowed file-wide here.
@@ -42,10 +43,43 @@ use daemon_vhc_proto::{
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
+use daemon_vhc_session::keystore::{VhcKeystore, IDENTITY_DIR_ENV};
 use daemon_vhc_session::protocol::{Event, JoinPolicy, PolicyMode};
 use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
 const RUN_ID: &str = "genesis-t2";
+
+/// The identity keystore this test authors the genesis FROM and hands the worker (by the
+/// directory reference the node would pass): the trainer/coordinator per-run keys are CSPRNG
+/// material minted here, and the genesis pins their public halves.
+struct IdentityFixture {
+    dir: tempfile::TempDir,
+    worker_peer: PeerId,
+    coordinator_peer: PeerId,
+}
+
+fn identity_fixture() -> &'static IdentityFixture {
+    static FIXTURE: std::sync::OnceLock<IdentityFixture> = std::sync::OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("identity tempdir");
+        let store = VhcKeystore::open(dir.path()).expect("open keystore");
+        let worker_peer = peer_id(
+            &store
+                .run_signing_key(RUN_ID, "trainer", 1)
+                .expect("mint trainer run key"),
+        );
+        let coordinator_peer = peer_id(
+            &store
+                .run_signing_key(RUN_ID, "coordinator", 1)
+                .expect("mint coordinator run key"),
+        );
+        IdentityFixture {
+            dir,
+            worker_peer,
+            coordinator_peer,
+        }
+    })
+}
 /// The t2 drive geometry (must match the worker's in-process join constants).
 const STEPS_PER_ROUND: u32 = 2;
 const SEQ_LEN: u32 = 9;
@@ -85,13 +119,6 @@ fn module_path(name: &str) -> PathBuf {
         assert!(status.success(), "building guest modules failed");
     });
     guests_root().join(format!("target/wasm32-unknown-unknown/release/{name}.wasm"))
-}
-
-/// The worker's in-process identity derivation (session's contract): key seeds are
-/// `blake3("vhc-worker/<run_id>")` / `blake3("vhc-coordinator/<run_id>")`.
-fn derived_peer(prefix: &str) -> PeerId {
-    let seed = *blake3::hash(format!("{prefix}/{RUN_ID}").as_bytes()).as_bytes();
-    peer_id(&SigningKey::from_bytes(&seed))
 }
 
 /// The trainer's canonical parameter element counts for the tiny parity-shape model below
@@ -134,7 +161,7 @@ fn deterministic_init(total: usize) -> Vec<f32> {
 /// worker's DERIVED peer — the coordinator's record entries carry the joined peer identity, and
 /// the guest's payload map is keyed by it.
 fn trainer_role_config() -> Value {
-    let peer = derived_peer("vhc-worker");
+    let peer = identity_fixture().worker_peer;
     let model = Value::Map(vec![
         (Value::from("d_model"), Value::from(64u32)),
         (Value::from("n_layers"), Value::from(1u32)),
@@ -224,7 +251,7 @@ fn coordinator_role_config() -> Value {
 fn genesis_wire() -> Vec<u8> {
     let coord_wasm = std::fs::read(module_path("coordinator_quorum")).expect("coordinator blob");
     let worker_wasm = std::fs::read(module_path("tiny_llama")).expect("trainer blob");
-    let coord_identity = derived_peer("vhc-coordinator");
+    let coord_identity = identity_fixture().coordinator_peer;
 
     let mut artifacts = BTreeMap::new();
     artifacts.insert(
@@ -323,6 +350,21 @@ fn genesis_wire() -> Vec<u8> {
     to_canonical_vec(&wire).expect("wire")
 }
 
+/// Public run data must not derive any signing key: reconstruct the retired derivation shape
+/// (a blake3 of the public run label) and assert it matches NEITHER identity the keystore minted
+/// — the coordinator identity the genesis names, nor the worker peer the trainer config pins.
+/// (The attach/authority refusal of such a key is pinned in the session attach suite; here the
+/// worker's own fixture proves the identities are not reconstructible from the label.)
+#[test]
+fn run_label_derived_keys_match_no_minted_identity() {
+    for prefix in ["vhc-worker", "vhc-coordinator"] {
+        let derived_seed = *blake3::hash(format!("{prefix}/{RUN_ID}").as_bytes()).as_bytes();
+        let derived = peer_id(&SigningKey::from_bytes(&derived_seed));
+        assert_ne!(derived, identity_fixture().worker_peer);
+        assert_ne!(derived, identity_fixture().coordinator_peer);
+    }
+}
+
 fn policy() -> JoinPolicy {
     JoinPolicy {
         mode: PolicyMode::Always,
@@ -341,6 +383,12 @@ async fn worker_joins_and_runs_rounds_under_the_coordinator() {
         // The owner's node-side lane choice (§9.6 numbers-are-config): CPU-admitting t2 lane.
         // NO module-source override: both blobs resolve by content hash from the artifact map.
         ("DAEMON_VHC_LANE_GPU_OPTIONAL".to_string(), "1".to_string()),
+        // The identity-store reference the node would pass: the worker resolves its per-run and
+        // coordinator keys against the SAME store this test authored the genesis from.
+        (
+            IDENTITY_DIR_ENV.to_string(),
+            identity_fixture().dir.path().display().to_string(),
+        ),
     ];
     cfg.spawn_timeout = Duration::from_secs(30);
     cfg.op_timeout = Duration::from_secs(300);
