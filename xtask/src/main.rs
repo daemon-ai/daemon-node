@@ -349,8 +349,11 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-sdk-consensus"],
         ),
         (
+            // `--features harness` compiles the harness-gated round machinery (engine /
+            // checkpoint / upgrade / coordinator shell) into the integration-test lib build;
+            // the default (production) session build carries none of it (dep-check-enforced).
             "daemon-vhc-session (harness + assess + replay, loopback)",
-            &["-p", "daemon-vhc-session"],
+            &["-p", "daemon-vhc-session", "--features", "harness"],
         ),
         (
             "daemon-vhc-observe (MessageLog + replay oracle + desync tally)",
@@ -477,8 +480,16 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             // CARGO_BIN_EXE-spawning test) to `crates/vhc/bins/daemon-vhc-worker`; same features
             // as before the split (burn-ndarray forwards into the host lib), so coverage is
             // unchanged.
+            // `harness` builds the binary WITH the in-process self-driven join so the join suite
+            // exercises it; the shipped default worker refuses JoinRun typed and links no SDK
+            // schema crate (the dep-check's negative architecture test pins that).
             "daemon-vhc-worker (frozen worker protocol over the real binary)",
-            &["-p", "daemon-vhc-worker", "--features", "burn-ndarray"],
+            &[
+                "-p",
+                "daemon-vhc-worker",
+                "--features",
+                "burn-ndarray,harness",
+            ],
         ),
         (
             // The profiles gate (refactor §7 "profiles re-express over Burn tensors + det
@@ -620,101 +631,84 @@ fn vhc_ci_t2() -> anyhow::Result<()> {
 /// Enforce the daemon-vhc dependency-direction rules (architecture §7): the wasm boundary is
 /// visible as `sdk/` vs `host/`, and `contracts/` is the only shared ground.
 ///
-/// - `host/*` never links `sdk/*` (the host runs production wasm blobs; native policy testing is
-///   `vhc-sim`'s job SDK-side, integration testing is the testkit's job host-side).
+/// - `host/*` (incl. `bins/*`) never links `sdk/*` in its PRODUCTION graph: the SDK layer owns
+///   the round message schemas (`daemon-vhc-sdk-consensus`, `daemon-vhc-sdk-rounds`), and a
+///   production host routes opaque signed frames — it never decodes a round message. Dev edges
+///   (test authoring) and feature-gated OPTIONAL edges behind a harness feature are exempt when
+///   listed below; harness/oracle tooling crates are exempt wholesale, also listed below.
 /// - `contracts/*` links neither `sdk/*` nor `host/*`.
 /// - `sdk/*` never links `host/*`.
+/// - `daemon-vhc-proto` is algorithm-free AND round-vocabulary-free (source-level check below).
+/// - NEGATIVE ARCHITECTURE TEST: the resolved default-feature normal graph of every production
+///   host crate (worker binary above all) contains no SDK schema crate — `cargo tree -e normal`
+///   per crate, so a feature-unification accident can't smuggle a schema decode into a shipped
+///   binary.
 ///
-/// Enforced over `cargo metadata` (normal + dev + build edges). The real `sdk/*` consumers are the
-/// `guests/` modules, which are a separate cargo workspace outside this gate — so *every* edge into
-/// `sdk/*` from this workspace is a transitional wart, listed as an honest exception and tracked to
-/// the phase that removes it. A new, un-listed `*/ -> sdk/*` edge fails the gate.
+/// Enforced over `cargo metadata` (normal + dev + build edges) + `cargo tree` (resolved default
+/// graphs). The real `sdk/*` consumers are the `guests/` modules, which are a separate cargo
+/// workspace outside this gate.
 fn vhc_dep_check() -> anyhow::Result<()> {
     use std::collections::{BTreeMap, BTreeSet};
 
-    // The honest current exceptions (Phase 0): each is a transitional edge into `sdk/*` that a
-    // later phase removes. Format: (dependent crate, sdk crate, why it exists / when it goes).
-    // Reviewed at the Phase-E v1 sunset (decisions D5): the exceptions whose consumers retired
-    // WITH the v1 driver were removed here in the sunset commit (`daemon-vhc-host ->
-    // daemon-vhc-sdk`: the v1 oracle/reference/160M/determinism harnesses; `daemon-vhc-e2e ->
-    // daemon-vhc-sdk`: the wasm_profiles / typed_checkpoint_bridge WasmBackend suites). The rest
-    // were re-reviewed and RETAINED with honest post-sunset notes — the RoundEngine survived the
-    // sunset as the deterministic harness / cold-join substrate (D5 names the five-phase driver,
-    // batch_tokens@1's driver surface, autotune admission, and the phase table; not the session
-    // choreography), so notes that anticipated "retires with the v1 engine at sunset" now track
-    // the engine's own re-seat onto vhc-sim instead.
-    const EXCEPTIONS: &[(&str, &str, &str)] = &[
-        (
-            "daemon-vhc-e2e",
-            "daemon-vhc-sdk-rounds",
-            "post-E — the A2 choreography bridging oracle (relocated round logic vs the retained \
-             RoundEngine harness substrate); retires when the engine re-seats onto vhc-sim \
-             [dev-dep]",
-        ),
-        (
-            "daemon-vhc-e2e",
-            "daemon-vhc-sdk",
-            "post-E — the B2 corpus-windowing equivalence oracle (SDK policy vs the retained \
-             host pipeline `session::data`); retires with that pipeline [dev-dep]",
-        ),
-        (
-            "daemon-vhc-e2e",
-            "daemon-vhc-sdk-consensus",
-            "D2/post-E — the StubBackend drills drive the coordinator `tick` (relocated here at \
-             D2) + observe oracle; retires when the drills re-seat onto vhc-sim/testkit [dev-dep]",
-        ),
-        // --- D0/D2: host/* -> sdk/daemon-vhc-sdk-consensus. The assignment math moved out of the
-        // proto at D0 (proto is algorithm-free, enforced below); the pure coordinator `tick`
-        // relocated here at D2 (the native daemon-vhc-coordinator crate DISSOLVED into
-        // sdk-consensus's `coordinator` module + guests/coordinator-quorum, refactor §8/D2). Each
-        // remaining host consumer of the SDK consensus layer is a tracked transitional edge with an
-        // honest retirement phase. (The old `daemon-vhc-coordinator -> sdk-consensus` self-edge is
-        // gone with the crate.)
-        (
-            "daemon-vhc-session",
-            "daemon-vhc-sdk-consensus",
-            "D2/post-E — the retained RoundEngine's assignment consumption, the shared \
-             coordinator types (CoordinatorState/Input) the coordinator recording shell \
-             authors + captures, and the E1/E3 checkpoint attestation vocabulary (ledger + \
-             signed attestations on the engine's typed lane); retires when the engine/harness \
-             re-seat onto vhc-sim [normal]",
-        ),
+    // The SDK crates that own message SCHEMAS (round vocabulary): a production host crate must
+    // never link these in its normal, non-optional graph.
+    const SCHEMA_CRATES: &[&str] = &["daemon-vhc-sdk-consensus", "daemon-vhc-sdk-rounds"];
+
+    // Harness/oracle tooling crates, exempt WHOLESALE from the host->sdk prohibition (each with
+    // its documented rationale). They are never linked by the production node/worker graph —
+    // the negative architecture test below proves that stays true.
+    const EXEMPT_HARNESS_CRATES: &[(&str, &str)] = &[
         (
             "daemon-vhc-testkit",
-            "daemon-vhc-sdk-consensus",
-            "the whole-run harness re-derives worker windows with the guests' own \
-             `assign_batches` and authors the genesis coordinator config \
-             (`{state: CoordinatorState}`) + AuthorityConfig topology — authoring vocabulary \
-             only, no native consensus drive; narrows to a contracts-crate move if the shared \
-             types relocate [normal]",
-        ),
-        (
-            "daemon-vhc-host",
-            "daemon-vhc-sdk-consensus",
-            "the production coordinator drive seat (host coordinator module, lifted \
-             from the testkit when the worker join re-seated onto the coordinator): \
-             configuring/authorizing the coordinator blob needs the typed AuthorityConfig \
-             decode + authorize, which lives in the consensus SDK layer; narrows to a \
-             contracts-crate move if the authority vocabulary ever relocates [normal]",
+            "whole-run harness: authors genesis coordinator configs + re-derives worker windows \
+             with the guests' own assignment math; test tooling by charter, linked only by test \
+             targets",
         ),
         (
             "daemon-vhc-observe",
+            "replay/audit oracle tooling: re-derives + inspects recorded runs, which requires \
+             decoding the SDK round schemas; never on the production node/worker path",
+        ),
+        (
+            "daemon-vhc-e2e",
+            "leaf end-to-end test crate (tests/): the one place SDK policy and host pipeline \
+             legally meet for equivalence oracles",
+        ),
+    ];
+
+    // host/* crates whose OPTIONAL sdk edges are permitted because they are gated behind a
+    // harness feature that is off by default (the production build never activates them). A new
+    // optional edge from a crate not listed here still fails the gate.
+    const OPTIONAL_HARNESS_EDGES: &[(&str, &str, &str)] = &[
+        (
+            "daemon-vhc-host",
             "daemon-vhc-sdk-consensus",
-            "TYPES-ONLY post-re-seat — the coordinator oracle no longer re-runs a native `tick`: \
-             it re-derives a recorded run inside the sandboxed coordinator-quorum module through \
-             the `CoordinatorSandbox` seam (the concrete driver lives in the session crate, which \
-             links the host runtime). This edge now carries only the shared coordinator types the \
-             capture/oracle traffic in (`CoordinatorState`, `Input`) + the archive's Authority \
-             judgments; retires when those types relocate off sdk-consensus [normal]",
+            "the whole-run coordinator drive seat (`coordinator` module): decodes coordinator \
+             round decisions + the typed AuthorityConfig; `harness`-feature-gated, off default",
+        ),
+        (
+            "daemon-vhc-session",
+            "daemon-vhc-sdk-consensus",
+            "the retained RoundEngine + coordinator recording shell + typed checkpoint/upgrade \
+             machinery; `harness`-feature-gated, off default",
         ),
         (
             "daemon-vhc-worker",
             "daemon-vhc-sdk-consensus",
-            "genesis-authoring vocabulary for the in-process join suite (authored \
-             CoordinatorState role config + AuthorityConfig topology); the runtime native-tick \
-             edge retired when the self-driven join re-seated onto the coordinator — this \
-             remainder writes test fixtures only [dev-dep]",
+            "the in-process self-driven join (round-decoding harness seat); \
+             `harness`-feature-gated, off default — the shipped worker refuses JoinRun typed",
         ),
+    ];
+
+    // The production host crates whose resolved default-feature normal graph must be free of the
+    // schema crates (the negative architecture test).
+    const PRODUCTION_HOST_CRATES: &[&str] = &[
+        "daemon-vhc-host",
+        "daemon-vhc-net",
+        "daemon-vhc-session",
+        "daemon-vhc-node",
+        "daemon-vhc-supervisor",
+        "daemon-vhc-worker",
     ];
 
     let root = workspace_root();
@@ -760,8 +754,12 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         }
     }
 
-    let is_exception =
-        |from: &str, to: &str| EXCEPTIONS.iter().any(|(f, t, _)| *f == from && *t == to);
+    let is_exempt_crate = |from: &str| EXEMPT_HARNESS_CRATES.iter().any(|(name, _)| *name == from);
+    let is_optional_harness_edge = |from: &str, to: &str| {
+        OPTIONAL_HARNESS_EDGES
+            .iter()
+            .any(|(f, t, _)| *f == from && *t == to)
+    };
 
     let mut violations: Vec<String> = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
@@ -777,14 +775,16 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                 continue;
             };
             let kind = d["kind"].as_str().unwrap_or("normal"); // null == normal
+            let optional = d["optional"].as_bool().unwrap_or(false);
 
             // Edges into sdk/*. The SDK-side native sim (`daemon-vhc-sim`) is the DESIGNED entry
             // for native harnesses (architecture §6: "policy code compiled natively runs against
             // it"): any crate that is NOT host/* or contracts/* may link it without an exception.
-            // The wasm-boundary wall still holds — host/* and contracts/* linking sdk/* (including
-            // vhc-sim) remains a violation (enforced by the same branch + the hard rules below), so
-            // host/daemon-vhc-testkit can never reach across into the SDK sim. Every OTHER sdk/*
-            // edge from a non-sdk crate must be a tracked exception.
+            // The wasm-boundary wall still holds for production graphs — a host/* crate reaches
+            // sdk/* only through a dev edge (test authoring, can't ship), a LISTED harness-gated
+            // optional edge (off default), or by being a LISTED harness/oracle tooling crate.
+            // Anything else is a violation: production hosts route opaque signed frames and never
+            // link the SDK schema layer.
             if to_role == "sdk" && from_role != Some("sdk") {
                 let sim_native_harness = to == "daemon-vhc-sim"
                     && from_role != Some("host")
@@ -792,12 +792,22 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                 if sim_native_harness {
                     // allowed: a native harness (e.g. the vhc-sim examples, tests/*) linking the
                     // SDK-side sim — its whole purpose (refactor §6/§11).
-                } else if is_exception(&from, &to) {
+                } else if kind == "dev" {
+                    // allowed: dev edges compile into test targets only — they cannot ship.
+                    seen.insert((from.clone(), to.clone()));
+                } else if optional && is_optional_harness_edge(&from, &to) {
+                    // allowed: a harness-feature-gated optional edge, off the default build.
+                    seen.insert((from.clone(), to.clone()));
+                } else if is_exempt_crate(&from) {
+                    // allowed: a documented harness/oracle tooling crate.
                     seen.insert((from.clone(), to.clone()));
                 } else {
                     violations.push(format!(
-                        "{from} -> {to} [{kind}]: only the guests workspace and native harnesses \
-                         (via daemon-vhc-sim) may link sdk/* (no tracked exception)"
+                        "{from} -> {to} [{kind}{}]: a production crate must not link the SDK \
+                         layer (round schemas are module vocabulary; hosts route opaque signed \
+                         frames) — dev edges, listed harness-gated optional edges, and listed \
+                         harness tooling crates are the only exemptions",
+                        if optional { ", optional" } else { "" }
                     ));
                 }
             }
@@ -825,40 +835,87 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         }
     }
 
-    // --- D0 tightening: daemon-vhc-proto is ALGORITHM-FREE from D0 on (refactor §8/D0;
-    // architecture §7 rule 1 — "no assignment math, no round vocabulary"). The assignment module
-    // moved to sdk/daemon-vhc-sdk-consensus; a re-grown `assignment` module (or file) in the
-    // proto fails this gate from now on.
+    // --- daemon-vhc-proto is ALGORITHM-FREE and ROUND-VOCABULARY-FREE (architecture §7 rule 1 —
+    // "no assignment math, no round vocabulary"). The assignment module moved to
+    // sdk/daemon-vhc-sdk-consensus first; the round message schemas, the round state-digest
+    // schedule, and the record-set object followed with the round-vocabulary move. A re-grown module
+    // (or file) in the proto fails this gate from now on.
     {
         let proto_src = root.join("crates/vhc/contracts/daemon-vhc-proto/src");
-        if proto_src.join("assignment.rs").exists() {
-            violations.push(
-                "daemon-vhc-proto: src/assignment.rs exists — the proto is algorithm-free from \
-                 D0; assignment math lives in sdk/daemon-vhc-sdk-consensus"
-                    .to_string(),
-            );
+        for module in ["assignment", "messages", "digest", "record_set"] {
+            if proto_src.join(format!("{module}.rs")).exists() {
+                violations.push(format!(
+                    "daemon-vhc-proto: src/{module}.rs exists — the proto is algorithm-free and \
+                     round-vocabulary-free; that vocabulary lives in sdk/daemon-vhc-sdk-consensus"
+                ));
+            }
         }
         let lib = std::fs::read_to_string(proto_src.join("lib.rs")).unwrap_or_default();
-        if lib.contains("mod assignment") {
-            violations.push(
-                "daemon-vhc-proto: lib.rs declares an `assignment` module — the proto is \
-                 algorithm-free from D0 (refactor §8/D0)"
-                    .to_string(),
-            );
+        for module in ["assignment", "messages", "digest", "record_set"] {
+            if lib.contains(&format!("mod {module}")) {
+                violations.push(format!(
+                    "daemon-vhc-proto: lib.rs declares a `{module}` module — the proto is \
+                     algorithm-free and round-vocabulary-free (architecture §7 rule 1)"
+                ));
+            }
+        }
+    }
+
+    // --- NEGATIVE ARCHITECTURE TEST: no production host crate can decode an SDK round message.
+    // The structural form: the resolved DEFAULT-FEATURE normal dependency graph of each
+    // production host crate (the worker binary above all) must not contain a schema crate. This
+    // is what the metadata edge rules above cannot see — feature unification. `cargo tree -p X
+    // -e normal` resolves X like `cargo build -p X` (workspace-member features do NOT unify in),
+    // so this is exactly the shipped graph.
+    for krate in PRODUCTION_HOST_CRATES {
+        let out = Command::new("cargo")
+            .current_dir(&root)
+            .args([
+                "tree", "-p", krate, "-e", "normal", "--prefix", "none", "--quiet",
+            ])
+            .output()
+            .map_err(|e| anyhow::anyhow!("running cargo tree -p {krate}: {e}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "cargo tree -p {krate} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tree = String::from_utf8_lossy(&out.stdout);
+        for schema in SCHEMA_CRATES {
+            if tree.lines().any(|l| l.trim().starts_with(schema)) {
+                violations.push(format!(
+                    "{krate}: the SDK schema crate `{schema}` is reachable in the resolved \
+                     default-feature normal graph — a production host must not be able to \
+                     decode an SDK round message (round schemas are module vocabulary)"
+                ));
+            }
         }
     }
 
     println!("daemon-vhc dependency-direction check (architecture §7)");
     println!(
-        "  rule: host/* never links sdk/* · contracts/* links neither · sdk/* never links host/*"
+        "  rule: host/* never links sdk/* in production graphs · contracts/* links neither · \
+         sdk/* never links host/*"
     );
-    println!("  rule (D0): daemon-vhc-proto is algorithm-free (assignment lives in sdk-consensus)");
-    println!("\ntracked exceptions (honest; each removed by the noted phase):");
-    for (f, t, note) in EXCEPTIONS {
+    println!(
+        "  rule: daemon-vhc-proto is algorithm-free and round-vocabulary-free (schemas live in \
+         sdk-consensus)"
+    );
+    println!(
+        "  rule: no production host crate resolves a schema crate ({}) in its default normal \
+         graph",
+        SCHEMA_CRATES.join(", ")
+    );
+    println!("\nexempt harness/oracle tooling crates:");
+    for (name, note) in EXEMPT_HARNESS_CRATES {
+        println!("  {name}: {note}");
+    }
+    println!("\nlisted harness-gated optional edges:");
+    for (f, t, note) in OPTIONAL_HARNESS_EDGES {
         let mark = if seen.contains(&((*f).to_string(), (*t).to_string())) {
             "present"
         } else {
-            "STALE — listed but not in the graph; drop it from EXCEPTIONS"
+            "STALE — listed but not in the graph; drop it from OPTIONAL_HARNESS_EDGES"
         };
         println!("  [{mark}] {f} -> {t}: {note}");
     }
