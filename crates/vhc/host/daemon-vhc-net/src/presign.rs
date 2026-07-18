@@ -4,7 +4,7 @@
 //! [`PresignClient`] — the coordinator presign seam (spec §11.1) + its HTTP implementation.
 //!
 //! The `r2` payload plane keeps the node **S3-SDK-free**: SigV4 lives in the coordinator app (BC's
-//! `apps/swarm` worker), which mints short-lived presigned URLs on demand. A peer calls
+//! `apps/vhc` worker), which mints short-lived presigned URLs on demand. A peer calls
 //! `POST <coordinator_base>/runs/:id/presign` with `{kind, op, round?, peer?, path?}` and gets back
 //! `{url, expires_at, headers?}`; it then PUTs/GETs the object bytes at `url` through the SSRF-safe
 //! [`EgressClient`] (raw `reqwest::Client` is clippy-banned outside `daemon-egress`).
@@ -56,7 +56,7 @@ pub enum PresignOp {
     Get,
 }
 
-/// The presign **request** body (JSON) — `POST /api/v1/swarm/runs/:id/presign`.
+/// The presign **request** body (JSON) — `POST /api/v1/vhc/runs/:id/presign`.
 ///
 /// One endpoint serves both round objects (§11.1) and `r2://` envelope artifacts (§8): `round`/`peer`
 /// are set for round objects and `path` for artifacts; each is omitted from the JSON when unset
@@ -189,13 +189,13 @@ fn now_unix() -> u64 {
 /// The HTTP [`PresignClient`]: `POST <coordinator_base>/runs/:id/presign` through [`EgressClient`].
 ///
 /// `coordinator_base` is a vhc-allowlisted coordinator endpoint (spec §11.1), e.g.
-/// `https://api.daemon.ai/api/v1/swarm`. An optional bearer token carries the `swarm:*` API-key scope.
+/// `https://api.daemon.ai/api/v1/vhc`. An optional bearer token carries the `vhc:*` API-key scope.
 pub struct HttpPresignClient {
     egress: EgressClient,
     coordinator_base: String,
     bearer: Option<String>,
     /// The internal identity headers (`x-daemon-org-id` / `x-daemon-actor`) for the
-    /// direct-to-`apps/swarm` dev path (A3, additive — mirrors `RegistryClient::with_internal`).
+    /// direct-to-`apps/vhc` dev path (A3, additive — mirrors `RegistryClient::with_internal`).
     internal: Option<(String, String)>,
     /// Clock-skew safety margin (seconds): a cached URL is reused only while `expires_at > now + margin`.
     skew_margin_s: u64,
@@ -215,14 +215,14 @@ impl HttpPresignClient {
         }
     }
 
-    /// Attach the `swarm:*`-scoped API-key bearer token (sent on every presign request).
+    /// Attach the `vhc:*`-scoped API-key bearer token (sent on every presign request).
     #[must_use]
     pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
         self.bearer = Some(token.into());
         self
     }
 
-    /// Attach the internal identity headers (the direct-to-`apps/swarm` dev path; A3, additive —
+    /// Attach the internal identity headers (the direct-to-`apps/vhc` dev path; A3, additive —
     /// mirrors [`crate::RegistryClient::with_internal`]). Never hardcoded: sourced from
     /// `JoinRun.credentials` / node config.
     #[must_use]
@@ -423,7 +423,7 @@ mod tests {
             .await;
 
         let egress = EgressClient::new(EgressConfig::default()).unwrap();
-        let client = HttpPresignClient::new(egress, format!("{}/api/v1/swarm", server.uri()));
+        let client = HttpPresignClient::new(egress, format!("{}/api/v1/vhc", server.uri()));
         let run = RunId::new("run-c");
         let req = PresignRequest::payload(PresignOp::Get, 1, "aabb");
         let a = client.presign(&run, &req).await.unwrap();

@@ -55,7 +55,7 @@ impl Default for VhcPolicyConfig {
     }
 }
 
-/// The `swarm:*` credential a registry request carries (`[vhc.registry].auth`, §11.1). Mirrors
+/// The `vhc:*` credential a registry request carries (`[vhc.registry].auth`, §11.1). Mirrors
 /// `daemon_vhc_net::ws_client::WsAuth` / `RegistryClient`'s auth modes — never hardcoded.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,12 +63,12 @@ pub enum RegistryAuthConfig {
     /// No auth headers (a bare dev target).
     #[default]
     None,
-    /// `Authorization: Bearer <token>` (the gateway `swarm:*` API-key path).
+    /// `Authorization: Bearer <token>` (the gateway `vhc:*` API-key path).
     Bearer {
         /// The bearer token.
         token: String,
     },
-    /// The internal identity headers (the direct-to-`apps/swarm` dev path).
+    /// The internal identity headers (the direct-to-`apps/vhc` dev path).
     Internal {
         /// `x-daemon-org-id`.
         org_id: String,
@@ -83,15 +83,15 @@ pub enum RegistryAuthConfig {
 /// at boot, so `vhc_join` discovers the run, fetches + blake3-verifies the frozen envelope, and
 /// runs the worker's real §6.5 `AssessRun` before `JoinRun`. Empty (the default) keeps
 /// `discovery: None` — the probe-based fallback against the allowlist. **Deploy-swappable by
-/// config only**: the same node targets wrangler-dev (`http://127.0.0.1:8795/api/v1/swarm`) or the
-/// real workers.dev deployment (e.g. `https://daemon-swarm-dev.<acct>.workers.dev/api/v1/swarm`)
+/// config only**: the same node targets wrangler-dev (`http://127.0.0.1:8795/api/v1/vhc`) or the
+/// real workers.dev deployment (e.g. `https://daemon-vhc-dev.<acct>.workers.dev/api/v1/vhc`)
 /// without a code change.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RegistryConfig {
     /// The registry base URL (`""` = no registry → no discovery seam).
     pub base: String,
-    /// The `swarm:*` credential for registry + presign requests.
+    /// The `vhc:*` credential for registry + presign requests.
     pub auth: RegistryAuthConfig,
 }
 
@@ -221,7 +221,7 @@ impl Default for VhcConfig {
             data_cache_gb: 50,
             default_policy: VhcPolicyConfig::default(),
             module_trust: ModuleTrust::Signed,
-            coordinator_allowlist: vec!["https://api.daemon.ai/api/v1/swarm".to_string()],
+            coordinator_allowlist: vec!["https://api.daemon.ai/api/v1/vhc".to_string()],
             registry: RegistryConfig::default(),
             iroh: IrohConfig::default(),
             owner_budget: OwnerBudgetConfig::default(),
@@ -259,7 +259,7 @@ mod tests {
             [vhc]
             enabled = true
             module_trust = "first_party"
-            coordinator_allowlist = ["https://coord.local/swarm"]
+            coordinator_allowlist = ["https://coord.local/vhc"]
 
             [vhc.default_policy]
             mode = "scheduled"
@@ -273,7 +273,7 @@ mod tests {
 
         assert!(cfg.enabled);
         assert_eq!(cfg.module_trust, ModuleTrust::FirstParty);
-        assert_eq!(cfg.coordinator_allowlist, vec!["https://coord.local/swarm"]);
+        assert_eq!(cfg.coordinator_allowlist, vec!["https://coord.local/vhc"]);
         assert_eq!(cfg.default_policy.mode, PolicyMode::Scheduled);
         assert_eq!(cfg.default_policy.duty_cycle_pct, 40);
         assert_eq!(cfg.default_policy.schedule.as_deref(), Some("0 2 * * *"));
@@ -342,7 +342,7 @@ mod tests {
             enabled = true
 
             [vhc.registry]
-            base = "http://127.0.0.1:8795/api/v1/swarm"
+            base = "http://127.0.0.1:8795/api/v1/vhc"
 
             [vhc.registry.auth.internal]
             org_id = "org_live"
@@ -352,7 +352,7 @@ mod tests {
             .merge(Toml::string(toml))
             .extract_inner("vhc")
             .expect("extract [vhc]");
-        assert_eq!(cfg.registry.base, "http://127.0.0.1:8795/api/v1/swarm");
+        assert_eq!(cfg.registry.base, "http://127.0.0.1:8795/api/v1/vhc");
         assert_eq!(
             cfg.registry.auth,
             RegistryAuthConfig::Internal {
@@ -368,7 +368,7 @@ mod tests {
 
         // Bearer mode also extracts.
         let toml = r#"
-            base = "https://daemon-swarm-dev.example.workers.dev/api/v1/swarm"
+            base = "https://daemon-vhc-dev.example.workers.dev/api/v1/vhc"
             [auth.bearer]
             token = "sk-test"
         "#;

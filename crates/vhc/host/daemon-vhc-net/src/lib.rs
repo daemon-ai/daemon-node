@@ -172,8 +172,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 pub(crate) mod mock_r2 {
     //! An in-process mock of the coordinator presign endpoint + the R2 object store (NET-1/3/8),
-    //! built on `wiremock` (a dev-dep; no live network). Mirrors what BC's `apps/swarm` worker does:
-    //! `POST /api/v1/swarm/runs/:id/presign` returns a URL into a stateful `/obj/*` PUT/GET store at
+    //! built on `wiremock` (a dev-dep; no live network). Mirrors what BC's `apps/vhc` worker does:
+    //! `POST /api/v1/vhc/runs/:id/presign` returns a URL into a stateful `/obj/*` PUT/GET store at
     //! the spec §11.3 object key. It can mint expired presigns (`with_expiry`) and drop objects
     //! (`evict`) for the negative cases.
 
@@ -211,7 +211,7 @@ pub(crate) mod mock_r2 {
                 .url
                 .path()
                 .trim_start_matches('/')
-                .strip_prefix("api/v1/swarm/runs/")
+                .strip_prefix("api/v1/vhc/runs/")
                 .and_then(|s| s.split('/').next())
                 .unwrap_or_default()
                 .to_string();
@@ -282,7 +282,7 @@ pub(crate) mod mock_r2 {
             let base = server.uri();
             let objects: Objects = Arc::new(Mutex::new(HashMap::new()));
             Mock::given(method("POST"))
-                .and(path_regex(r"^/api/v1/swarm/runs/[^/]+/presign$"))
+                .and(path_regex(r"^/api/v1/vhc/runs/[^/]+/presign$"))
                 .respond_with(Presigner {
                     base: base.clone(),
                     expiry_offset_s,
@@ -306,9 +306,9 @@ pub(crate) mod mock_r2 {
             Self { server, objects }
         }
 
-        /// The vhc coordinator base URL (`{uri}/api/v1/swarm`).
+        /// The vhc coordinator base URL (`{uri}/api/v1/vhc`).
         pub fn coordinator_base(&self) -> String {
-            format!("{}/api/v1/swarm", self.server.uri())
+            format!("{}/api/v1/vhc", self.server.uri())
         }
 
         /// A fresh SSRF-safe egress client (the initial hop to the loopback mock is not re-checked).

@@ -7,7 +7,7 @@
 //! WS coordinator client suite (A1): the canonical-CBOR framing golden, dissemination relay over the
 //! mock `RunCoordinatorDO`, coordinator broadcast delivery, reconnect + resubscribe, and auth-header
 //! plumbing. The framing golden pins the byte-exact `SignedMessage` frame the DO consumes
-//! (`apps/swarm` `codec.ts` decodes the same bytes) so a canonicalization regression fails loud.
+//! (`apps/vhc` `codec.ts` decodes the same bytes) so a canonicalization regression fails loud.
 
 mod common;
 

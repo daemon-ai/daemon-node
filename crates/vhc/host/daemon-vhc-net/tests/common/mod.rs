@@ -217,7 +217,7 @@ pub mod iroh_harness {
 /// An in-process mock of the cloud `RunCoordinatorDO` WS surface (feature-gated): it accepts peer
 /// WebSocket upgrades on loopback and **disseminates** every inbound binary frame to the *other*
 /// connected peers (never echoes the sender) — the `webSocketMessage` `broadcast([bytes], ws)`
-/// contract from `apps/swarm/src/coordinator/do.ts`. It can also `broadcast` a coordinator emission
+/// contract from `apps/vhc/src/coordinator/do.ts`. It can also `broadcast` a coordinator emission
 /// to ALL peers, `sever` every live socket (force reconnect), capture the upgrade headers (auth
 /// assertion), and count received frames. Enough of the DO framing for the parametric `ControlPlane`
 /// conformance suite + the reconnect/resubscribe + dual-plane dedupe drills — NOT a full coordinator
@@ -292,9 +292,9 @@ pub mod ws_harness {
             }
         }
 
-        /// The coordinator base URL a [`WsControlPlane`] dials (`{addr}/api/v1/swarm`).
+        /// The coordinator base URL a [`WsControlPlane`] dials (`{addr}/api/v1/vhc`).
         pub fn base_url(&self) -> String {
-            format!("http://{}/api/v1/swarm", self.addr)
+            format!("http://{}/api/v1/vhc", self.addr)
         }
 
         /// Connect a [`WsControlPlane`] client to this coordinator for `run_id`.

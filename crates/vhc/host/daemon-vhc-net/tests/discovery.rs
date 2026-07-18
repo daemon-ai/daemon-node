@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Run discovery + envelope fetch (A1): [`RegistryClient`] against a mock `apps/swarm` registry —
+//! Run discovery + envelope fetch (A1): [`RegistryClient`] against a mock `apps/vhc` registry —
 //! `GET /runs` (list), `GET /runs/:id` (detail + 404), and the presign→object→blake3-verify envelope
 //! fetch. A registry that serves the wrong envelope bytes is rejected before `AssessRun` ever sees
 //! them (the §12 tamper path).
@@ -35,21 +35,21 @@ fn descriptor(run_id: &str, envelope_hash: &str) -> serde_json::Value {
 
 async fn registry_with(envelope_hash: &str) -> (MockServer, RegistryClient) {
     let server = MockServer::start().await;
-    let base = format!("{}/api/v1/swarm", server.uri());
+    let base = format!("{}/api/v1/vhc", server.uri());
     let d = descriptor("run-1", envelope_hash);
 
     Mock::given(method("GET"))
-        .and(path("/api/v1/swarm/runs"))
+        .and(path("/api/v1/vhc/runs"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [d.clone()] })))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/api/v1/swarm/runs/run-1"))
+        .and(path("/api/v1/vhc/runs/run-1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": d })))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/api/v1/swarm/runs/missing"))
+        .and(path("/api/v1/vhc/runs/missing"))
         .respond_with(
             ResponseTemplate::new(404)
                 .set_body_json(json!({ "error": { "message": "run not found" } })),
@@ -57,7 +57,7 @@ async fn registry_with(envelope_hash: &str) -> (MockServer, RegistryClient) {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/api/v1/swarm/runs/run-1/presign"))
+        .and(path("/api/v1/vhc/runs/run-1/presign"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "url": format!("{}/obj/envelope", server.uri()),
             "expires_at": now_plus_900(),
