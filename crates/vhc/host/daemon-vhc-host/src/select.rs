@@ -13,18 +13,18 @@
 //!    [`AbiRefusalCode::BadModule`].
 //! 3. **Derive + validate the compatibility tuple** — every imported symbol must be one the host
 //!    provides ([`daemon_vhc_abi::validate_imports`]): unknown symbol in a known namespace ⇒
-//!    [`AbiRefusalCode::WorldMinorUnsupported`]; unknown namespace ⇒ `BadModule`.
+//!    [`AbiRefusalCode::WorldMinorUnsupported`]; any `tabi@1` import (the retired compute
+//!    bridge) ⇒ [`AbiRefusalCode::BridgeRetired`]; unknown namespace ⇒ `BadModule`.
 //! 4. **Instantiate with the assessment linker** — a **deny-on-call** linker (every static import
 //!    resolves; calling any of them traps — ABI §9.2), under minimal fuel + a tight epoch
-//!    deadline. (Through the dual-driver transition the v1 candidate instantiated under the
-//!    retained v1 `tabi@1` linker; since the Phase-E sunset removed that driver, both candidates
-//!    read their declaration through the assessment stubs — `da_abi` is import-free, §1.1.)
+//!    deadline. Both candidates read their declaration through the assessment stubs — `da_abi`
+//!    is import-free (§1.1).
 //! 5. **Cross-check the declaration** — call `da_abi()`; `major` ≠ candidate ⇒
 //!    [`AbiRefusalCode::AbiDeclarationMismatch`]; `major` not implemented by this host ⇒
-//!    [`AbiRefusalCode::AbiUnsupportedMajor`] — **since the Phase-E v1 sunset (decisions D5) this
-//!    is where every well-formed v1 module is refused**: candidate major 1 cross-checks clean and
-//!    then meets the typed refusal, never a crash, never a silent hang (the flipped A0 fixture
-//!    pins exactly this). `minor` above the host's ⇒ [`AbiRefusalCode::AbiMinorTooNew`].
+//!    [`AbiRefusalCode::AbiUnsupportedMajor`] — **this is where every well-formed major-1 module
+//!    is refused**: candidate major 1 cross-checks clean and then meets the typed refusal, never
+//!    a crash, never a silent hang (the synthetic major-1 module pins exactly this). `minor`
+//!    above the host's ⇒ [`AbiRefusalCode::AbiMinorTooNew`].
 //! 6. **Check required exports** for the selected major ⇒ `BadModule` when missing/mis-typed.
 //!
 //! Every failure is a **typed admission refusal** ([`AbiRefusal`]) — an `AssessRun`/instantiate
@@ -190,21 +190,17 @@ pub fn select_driver(
 }
 
 /// Steps 4–5's mechanics: instantiate `module` under the deny-on-call assessment linker
-/// (ABI §9.2 — every static import, `tabi@1` bridge symbols included, resolves at link time to a
-/// deterministic stub that traps if invoked) with minimal budgets, call `da_abi()`, discard the
-/// instance, and return the packed declaration. `da_abi` is import-free (§1.1), so reading the
-/// declaration never touches a stub. Since the Phase-E sunset both candidates use this path (the
-/// v1 candidate's real linker retired with the v1 driver; its declaration is still read cleanly
-/// so the step-5 refusal is typed, never an instantiation crash).
+/// (ABI §9.2 — every static import resolves at link time to a deterministic stub that traps if
+/// invoked) with minimal budgets, call `da_abi()`, discard the instance, and return the packed
+/// declaration. `da_abi` is import-free (§1.1), so reading the declaration never touches a stub.
+/// Both candidates use this path, so every step-5 refusal is typed — never an instantiation
+/// crash.
 fn read_declaration(
     worker: &Worker,
     module: &Module,
     _candidate: CandidateDriver,
 ) -> Result<u32, AbiRefusal> {
-    let mut store: Store<crate::runtime::HostState> = Store::new(
-        worker.engine(),
-        crate::runtime::HostState::new(worker.config()),
-    );
+    let mut store: Store<()> = Store::new(worker.engine(), ());
     store.set_fuel(ASSESS_FUEL).map_err(|e| {
         AbiRefusal::new(
             AbiRefusalCode::BadModule,
@@ -214,7 +210,7 @@ fn read_declaration(
     store.set_epoch_deadline(worker.epoch_ticks_pub());
 
     let instance = {
-        let mut linker: Linker<crate::runtime::HostState> = Linker::new(worker.engine());
+        let mut linker: Linker<()> = Linker::new(worker.engine());
         for import in module.imports() {
             let ExternType::Func(func_ty) = import.ty() else {
                 return Err(AbiRefusal::new(

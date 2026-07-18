@@ -10,10 +10,10 @@ path = "src/lib.rs"
 
 [dependencies]
 # Intentionally zero third-party dependencies: this crate is the ABI surface both sides of the
-# wasm boundary must agree on (the `tabi@1` import vocabulary + the ABI version constants). It is
+# wasm boundary must agree on (the major-2 constants, namespaces, and wire vocabularies). It is
 # dual-compiled for native *and* wasm32 and links neither `sdk/*` nor `host/*` (the shared
 # contracts ground). Keeping it dep-free lets both the guest SDK and the host runtime pin the same
-# frozen surface without either side pulling the other (deletes the host->SDK dev-dep wart).
+# frozen surface without either side pulling the other.
 
 [dev-dependencies]
 # Grammar-validity gate ONLY (dev-only; never on the runtime/wasm32 surface, so the zero-dep rule

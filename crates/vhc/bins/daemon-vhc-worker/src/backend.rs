@@ -7,7 +7,6 @@
 //! v2 claim()-funnel eligibility pass ([`assess_v2`]). (The v1 `WasmBackend` construction / autotune
 //! assess this file also carried retired with the v1 driver at the Phase-E sunset.)
 
-use daemon_vhc_abi::TABI_IMPORTS;
 use daemon_vhc_host::probe::DeviceLimits;
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_net::{ArtifactRef, ArtifactResolver};
@@ -477,18 +476,34 @@ pub(crate) fn engine_config_from_env() -> daemon_vhc_host::EngineConfig {
     }
 }
 
-/// The host `tabi@1` vocabulary — the frozen 66-import list from the dual-compiled contract
-/// crate (post-sunset the phase table is gone; the vocabulary itself is the historical record +
-/// the live §2.5 bridge surface).
+/// The host capability vocabulary the probe advertises: the major-2 worlds with the implemented
+/// minor (`<world>@<major>:<minor>` — the compatibility surface a run author matches modules
+/// against), plus the versioned custom ops the host's registry advertises (`flash_attn@1`, …).
+/// The retired `tabi@1` vocabulary is gone — the bridge is a typed `BridgeRetired` refusal.
 fn host_ops() -> Vec<String> {
-    TABI_IMPORTS.iter().map(|n| (*n).to_string()).collect()
+    let minor = daemon_vhc_abi::host_minor_for(daemon_vhc_abi::DA_ABI_MAJOR_V2).unwrap_or(0);
+    let mut ops: Vec<String> = [
+        daemon_vhc_abi::NS_VHC_V2,
+        daemon_vhc_abi::NS_NET_V2,
+        daemon_vhc_abi::NS_SYS_V2,
+        daemon_vhc_abi::NS_DATA_V2,
+        daemon_vhc_abi::NS_COMPUTE_V2,
+    ]
+    .iter()
+    .map(|ns| format!("{ns}:{minor}"))
+    .collect();
+    ops.extend(
+        daemon_vhc_abi::HOST_CUSTOM_OPS
+            .iter()
+            .map(|op| (*op).to_string()),
+    );
+    ops
 }
 
 pub(crate) fn host_capabilities() -> WorkerCapabilities {
     WorkerCapabilities {
-        // The implemented ABI major (ABI §1.6): 2 since the Phase-E sunset removed the v1
-        // driver. The advertised `ops` stay the frozen 66-import tabi@1 vocabulary — the live
-        // §2.5 bridge surface under major 2.
+        // The implemented ABI major (ABI §1.6): 2 — the only implemented major. The advertised
+        // `ops` are the major-2 worlds at their implemented minor plus the custom-op registry.
         abi_version: daemon_vhc_abi::DA_ABI_MAJOR_V2 as u16,
         ops: host_ops(),
         payload_stores: Vec::new(),

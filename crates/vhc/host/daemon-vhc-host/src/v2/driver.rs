@@ -36,10 +36,9 @@
 //!
 //! ## Deliberate Phase-A bounds (recorded)
 //!
-//! - The `tabi@1` compute bridge IS wired (the choreography sitting): the frozen dispatch is
-//!   genericized over the store (`runtime::TabiHost`) and linked for any major-2 module that
-//!   imports it, under the §2.5 legality rules (registration only in `da_init`; slice-class
-//!   arenas cleared at each Delivered boundary; nr-class results journaled under §2.7 kinds).
+//! - The `tabi@1` compute bridge is RETIRED: a module importing the namespace is refused typed
+//!   (`BridgeRetired`) at the §1.3 front door and again here at start; compute crosses the
+//!   boundary through the `compute@2` world only.
 //! - `snapshot_state` returns `SectionMissing` during a drain (no state-manifest verification yet
 //!   — the §10.2 protocol lands with the migrate scaffolding); outside a drain it traps
 //!   `PhaseViolation` per §6.6. `stage_state` is fully functional.
@@ -65,7 +64,7 @@ use daemon_vhc_abi::{
 };
 use daemon_vhc_proto::{peer_id, sign_canonical, to_canonical_vec, SigningKey};
 
-use crate::runtime::{EngineConfig, TabiHost, Worker};
+use crate::runtime::{EngineConfig, Worker};
 use crate::trap::{Trap, TrapCode};
 use crate::v2::buffer::BufferTable;
 use crate::v2::completion::{CompError, CompletionResult, SuccessPayload};
@@ -134,7 +133,7 @@ pub struct V2RunConfig {
     /// The claim's **hard-accountable host-tier cap** in raw bytes (`0` = uncapped): the
     /// enforceable tier the host meters EXACTLY (ABI §9.1). At Phase A the metered
     /// guest-attributable allocations are the staged bytes (`stage_state`); tensors/buffers join
-    /// the meter with the bridge/Phase-B buffer layer. Breach is the typed attributable
+    /// the meter with the Phase-B buffer layer. Breach is the typed attributable
     /// `BudgetMemory` trap — the under-claim acceptance (refactor §5 A2). The admission funnel
     /// (`v2::admission`) supplies this from the evaluated claim.
     pub hard_accountable_host_bytes: u64,
@@ -223,10 +222,11 @@ pub enum V2Error {
     /// Engine/linker/instantiation plumbing failed.
     #[error("v2 sandbox error: {0}")]
     Sandbox(String),
-    /// RETIRED at the choreography move (kept for wire/type stability this phase): the bridge is
-    /// linked for every major-2 module that imports `tabi@1`; no path constructs this any more.
-    #[error("tabi@1 bridge not wired into the v2 driver yet: {0}")]
-    BridgeUnwired(String),
+    /// The module imports the retired `tabi@1` compute bridge — the typed `BridgeRetired`
+    /// admission refusal, re-raised here so a caller that skipped the §1.3 front door still
+    /// meets it before any guest code runs.
+    #[error("BridgeRetired: {0}")]
+    BridgeRetired(String),
     /// A journal-sink write failed (journaling is load-bearing, §8.4).
     #[error(transparent)]
     Sink(#[from] SinkError),
@@ -419,9 +419,6 @@ struct PumpState {
     logs: Vec<(u32, String)>,
     /// Published frames, for embedder-side assertions: `(channel, seq, signed frame bytes)`.
     published: Vec<(u64, u64, Vec<u8>)>,
-    /// The final bridge canonical state, exported by the guest thread before it drops the
-    /// store (the parity-oracle hook: the digest input, §3.6 tier-3 comparisons).
-    bridge_final_state: Option<Vec<u8>>,
     /// The per-instance buffer table (kind 8, architecture §3.4) — shared between the guest
     /// thread's imports and completion-arrival minting, behind this pump lock.
     buffers: BufferTable,
@@ -783,79 +780,6 @@ impl PumpHandle {
         Ok(staging_id)
     }
 
-    /// Stage a batch for the bridge (`read_back` kind 1, §2.5 rule 2): the tokens/shape encode as
-    /// canonical CBOR `[sequences, seq_len, tokens-le-bytes]`, announced with `meta.kind = 1`.
-    /// Identical batches may repeat, so no dedup applies (unlike kind-0 bytes).
-    pub fn stage_batch(
-        &self,
-        tokens: &[u32],
-        sequences: u32,
-        seq_len: u32,
-        channel: Option<u32>,
-    ) -> Result<u64, SinkError> {
-        let mut le = Vec::with_capacity(tokens.len() * 4);
-        for t in tokens {
-            le.extend_from_slice(&t.to_le_bytes());
-        }
-        let v = Value::Array(vec![
-            Value::from(sequences),
-            Value::from(seq_len),
-            Value::Bytes(le),
-        ]);
-        let bytes = to_canonical_vec(&v).map_err(|e| SinkError(format!("batch encode: {e}")))?;
-        self.stage_kinded(bytes, daemon_vhc_abi::STAGED_KIND_BATCH, channel)
-    }
-
-    /// Stage an update-container payload for the bridge (`read_back` kind 2, §2.5 rule 2): the
-    /// opaque committed payload wire bytes, announced with `meta.kind = 2`.
-    pub fn stage_update(&self, payload: Vec<u8>, channel: Option<u32>) -> Result<u64, SinkError> {
-        self.stage_kinded(
-            payload,
-            daemon_vhc_abi::STAGED_KIND_UPDATE_CONTAINER,
-            channel,
-        )
-    }
-
-    fn stage_kinded(
-        &self,
-        bytes: Vec<u8>,
-        staged_kind: u64,
-        channel: Option<u32>,
-    ) -> Result<u64, SinkError> {
-        let hash = *blake3::hash(&bytes).as_bytes();
-        let mut st = self.shared.state.lock().expect("pump lock");
-        if st.stop_enqueued {
-            return Err(SinkError("run is stopping; no further deliveries".into()));
-        }
-        st.enforce_payload_depth()?;
-        let staging_id = st.next_host_staging_id;
-        st.next_host_staging_id += 1;
-        let size = bytes.len() as u64;
-        st.staged.insert(staging_id, (staged_kind, bytes));
-        let ev = EventV2::PayloadReady {
-            staging_id,
-            hash,
-            meta: PayloadMeta {
-                size,
-                kind: staged_kind,
-                channel,
-            },
-        };
-        let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
-        st.queue.push_back(QueuedEvent {
-            frame_bytes,
-            tag: daemon_vhc_abi::EV_TAG_PAYLOAD_READY,
-            signed: None,
-            payload_hash: None,
-            timer_id: None,
-            is_budget: false,
-            gossip_id: None,
-        });
-        drop(st);
-        self.shared.wake.notify_all();
-        Ok(staging_id)
-    }
-
     /// Deliver a `Budget` notification (host-fixed depth 1, latest-wins — §4.3/§4.7).
     pub fn budget(
         &self,
@@ -1194,18 +1118,6 @@ impl PumpHandle {
         }
     }
 
-    /// The bridge's final canonical state bytes (the digest input), exported by the guest thread
-    /// before it dropped the store. `None` until the run ends, or when no bridge was linked.
-    #[must_use]
-    pub fn bridge_final_state(&self) -> Option<Vec<u8>> {
-        self.shared
-            .state
-            .lock()
-            .expect("pump lock")
-            .bridge_final_state
-            .clone()
-    }
-
     /// Signed frames the guest has published so far: `(channel, seq, signed frame bytes)`.
     #[must_use]
     pub fn published(&self) -> Vec<(u64, u64, Vec<u8>)> {
@@ -1256,38 +1168,9 @@ struct SliceState {
     /// A pending mandatory `device_profile` retry: the required capacity (same §4.1/§6.4
     /// mandatory-retry discipline — the profile is delivered, and journaled, exactly once).
     pending_device: Option<u64>,
-    /// The already-computed value behind a pending `read_back` retry: bridge kinds (1/2) mutate
-    /// the tabi state exactly once (register batch / stage container), so the retry re-delivers
-    /// the SAME value instead of re-registering (§6.4 "the staged value remains available").
+    /// The already-computed value behind a pending `read_back` retry (§6.4 "the staged value
+    /// remains available"): the retry re-delivers the SAME value.
     pending_readback_value: Option<Vec<u8>>,
-}
-
-/// The bridge staged-update ingest phase (§2.5/§5.9) — the state machine behind the v1 ingest
-/// epilogue's placement (the B3-found catch-up defect):
-///
-/// v1 ran `snapshot_round_bases` (post-ingest master → next round's base) when
-/// `da_ingest_updates` RETURNED — i.e. at the **ingest→training boundary**, before any later
-/// math. The v2 bridge has no "ingest returns" moment, and deferring the epilogue to the
-/// Delivered slice close diverges on the straggle **catch-up path**, where `BarrierRound`
-/// ingests round r and trains round r+1 in ONE slice (round r+1 then trains against a
-/// pre-ingest base). The equivalent boundary, driver-visible:
-///
-/// - a kind-2 read while `Idle` opens a FRESH staged window (v1's per-ingest `staged.clear()`);
-/// - further kind-2 reads with no intervening non-window ops continue the SAME window (a
-///   record's N entries are read back-to-back by `Committed::mint`);
-/// - any other bridge op marks the window's ingest MATH as begun (aggregate + apply);
-/// - the epilogue fires at the first boundary AFTER the math: the next kind-1 batch read
-///   (training resumes — the catch-up path), a kind-2 read that OPENS THE NEXT window
-///   (multi-round catch-up), or the slice close (the normal path, timing unchanged).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IngestPhase {
-    /// No staged-update window is being consumed.
-    Idle,
-    /// A window is open; `math_seen` = a non-window bridge op ran since its last kind-2 read.
-    Consuming {
-        /// Whether ingest math has begun on this window.
-        math_seen: bool,
-    },
 }
 
 /// The wasmtime `Store` data for a v2 run instance.
@@ -1310,18 +1193,6 @@ struct V2Host {
     migration_max_sections: u64,
     migration_max_section_bytes: u64,
     migration_restore: bool,
-    // The §2.5 compute bridge: the SAME frozen tabi@1 dispatch state the v1 driver uses,
-    // embedded (params/persistents/arenas/backend). None when the module imports no tabi@1.
-    tabi: Option<crate::runtime::HostState>,
-    // Whether a bridge slice pass is open (begin/end at Delivered boundaries, §2.5 rule 4).
-    slice_pass_open: bool,
-    // The bridge ingest phase (§5.9): tracks a staged-update window from its first kind-2
-    // consumption to the boundary where the v1 ingest epilogue (post-ingest master → next
-    // round's base) must run. See [`IngestPhase`].
-    ingest_phase: IngestPhase,
-    // Sealed-container watermark (B1 sealing-gap retirement): containers the bridge has built
-    // that were already sealed + announced to the guest at a slice boundary.
-    sealed_containers: usize,
     // signing (§12.1)
     signing: SigningKey,
     identity: RunIdentity,
@@ -1334,7 +1205,7 @@ struct V2Host {
     // envelope's edge-pinned artifact map ∩ the role's grants. Fail closed when empty.
     granted_artifacts: std::collections::BTreeSet<[u8; 32]>,
     // compute@2 (track C1, ABI §15): the per-instance command-queue runner over the tier-1 real
-    // backend, guest-thread-local like the bridge (device work belongs to the guest thread,
+    // backend, guest-thread-local (device work belongs to the guest thread,
     // §11.1/§11.3 — the runner drops with the Store). `None` when the module imports no
     // compute@2 symbol. wgpu/cuda ride the same generic `ComputeRunner<B>` seam behind the host
     // feature lanes; driver-side backend selection is deferred with them.
@@ -1573,36 +1444,6 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         ));
                     }
                 }
-                // B1 (the sealing-gap retirement): a bridge container completed in the slice
-                // that just ended is sealed HERE — at the slice boundary — and ANNOUNCED to the
-                // guest as PayloadReady kind 0. Bridge-plane serialization stays a host service
-                // until Phase C's compute export, but the guest now owns the commitment path:
-                // read_back → create_from → payload_put → author the commitment over the
-                // completion hash. Watermarked, so a NeedCapacity retry never double-stages.
-                let sealed: Option<Vec<u8>> = {
-                    let d = c.data_mut();
-                    match d.tabi.as_ref() {
-                        Some(tabi) => {
-                            // GUEST-BUILT containers only: an inbound-staged container (read_back
-                            // kind 2) must never be re-announced as the guest's own.
-                            let n = tabi.guest_container_count();
-                            if n > d.sealed_containers {
-                                let bytes = tabi.seal_guest_container_of(n - 1);
-                                d.sealed_containers = n;
-                                bytes
-                            } else {
-                                None
-                            }
-                        }
-                        None => None,
-                    }
-                };
-                if let Some(bytes) = sealed {
-                    let sh = c.data().shared.clone();
-                    let mut st = sh.state.lock().expect("pump lock");
-                    stage_own_bytes(&mut st, bytes)
-                        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
-                }
                 let shared = c.data().shared.clone();
                 // Park until an event is deliverable, firing due timers ourselves (§6.3).
                 let (frame, at) = {
@@ -1712,23 +1553,6 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                 // epoch re-arms on Delivered only.
                 write_guest(c, buf_ptr, &frame.frame_bytes)?;
                 let d = c.data_mut();
-                // Bridge slice lifecycle (§2.5 rule 4 / §7.1 slice class): end the previous
-                // slice's pass (clear step arenas wholesale, free tensors — the v1 finish_entry
-                // teardown) and begin the new slice's differentiable pass.
-                if let Some(tabi) = d.tabi.as_mut() {
-                    // The §5.9 epilogue's slice-close backstop (the normal path, where the
-                    // ingesting slice ends without further training — timing unchanged from
-                    // A2). The catch-up boundaries fire earlier, in read_back (IngestPhase).
-                    if d.ingest_phase != IngestPhase::Idle {
-                        tabi.snapshot_round_bases();
-                        d.ingest_phase = IngestPhase::Idle;
-                    }
-                    if d.slice_pass_open {
-                        tabi.end_slice_pass_and_clear();
-                    }
-                    tabi.begin_slice_pass();
-                    d.slice_pass_open = true;
-                }
                 d.slice.pending_next = None;
                 d.slice.now = at;
                 d.slice.op_calls = 0;
@@ -1783,14 +1607,11 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         ));
                     }
                 }
-                // kind → the staged-kind it consumes (ABI §6.4 table): 0 bytes, 1 batch (bridge),
-                // 2 update container (bridge), 3 state-section (migrate restore, §10.2).
+                // kind → the staged-kind it consumes (ABI §6.4 table): 0 bytes, 3 state-section
+                // (migrate restore, §10.2). Kinds 1/2 retired with the compute bridge; their
+                // assignments are permanent and never again valid call arguments.
                 let want_staged_kind = match kind {
                     READBACK_KIND_STAGED_BYTES => daemon_vhc_abi::STAGED_KIND_BYTES,
-                    daemon_vhc_abi::READBACK_KIND_STAGED_BATCH => daemon_vhc_abi::STAGED_KIND_BATCH,
-                    daemon_vhc_abi::READBACK_KIND_STAGED_UPDATE => {
-                        daemon_vhc_abi::STAGED_KIND_UPDATE_CONTAINER
-                    }
                     daemon_vhc_abi::READBACK_KIND_STATE_SECTION => {
                         // Legal EXACTLY during `da_migrate` (§6.6's one exception), and only
                         // under the migration grant's restore bit (§10.2 — fail closed).
@@ -1862,18 +1683,6 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                     d.slice.pending_readback_value = None;
                     return Ok(pack_status_len(RET_STATUS_DELIVERED, len as u32));
                 }
-                if !matches!(
-                    want_staged_kind,
-                    daemon_vhc_abi::STAGED_KIND_BYTES | daemon_vhc_abi::STAGED_KIND_STATE_SECTION
-                ) && c.data().tabi.is_none()
-                {
-                    return Err(Trap::new(
-                        TrapCode::ReadBackUnavailable,
-                        "read_back",
-                        None,
-                        "bridge staging kinds need the tabi@1 bridge linked (§2.5)",
-                    ));
-                }
                 let shared = c.data().shared.clone();
                 let staged_bytes = {
                     let st = shared.state.lock().expect("pump lock");
@@ -1889,87 +1698,9 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
                         }
                     }
                 };
-                // Bridge kinds resolve to a tiny CBOR uint (§6.4): kind 1 registers the batch and
-                // yields its kind-7 handle; kind 2 stages the container and yields the upd index.
-                // The staged entry is CONSUMED (a re-read would double-register — deterministic
-                // refusal instead). Kind 0 delivers the bytes verbatim, re-readable.
-                let value = match kind {
-                    daemon_vhc_abi::READBACK_KIND_STAGED_BATCH => {
-                        let v: ciborium::value::Value =
-                            ciborium::de::from_reader(staged_bytes.as_slice()).map_err(|e| {
-                                Trap::bare(TrapCode::BadModule, format!("staged batch: {e}"))
-                            })?;
-                        let ciborium::value::Value::Array(items) = v else {
-                            return Err(Trap::bare(TrapCode::BadModule, "staged batch shape"));
-                        };
-                        let uint = |i: usize| -> u32 {
-                            items
-                                .get(i)
-                                .and_then(ciborium::value::Value::as_integer)
-                                .map(|n| u32::try_from(i128::from(n)).unwrap_or(0))
-                                .unwrap_or(0)
-                        };
-                        let (sequences, seq_len) = (uint(0), uint(1));
-                        let tokens: Vec<u32> = match items.get(2) {
-                            Some(ciborium::value::Value::Bytes(b)) => b
-                                .chunks_exact(4)
-                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                .collect(),
-                            _ => return Err(Trap::bare(TrapCode::BadModule, "staged tokens")),
-                        };
-                        // A batch read is the ingest→TRAINING boundary (the catch-up path,
-                        // §5.9 / IngestPhase docs): the epilogue fires BEFORE the batch
-                        // registers, so training sees the post-ingest round base.
-                        {
-                            let d = c.data_mut();
-                            if d.ingest_phase != IngestPhase::Idle {
-                                d.tabi().snapshot_round_bases();
-                                d.ingest_phase = IngestPhase::Idle;
-                            }
-                        }
-                        let handle = c
-                            .data_mut()
-                            .tabi()
-                            .stage_bridge_batch(tokens, sequences, seq_len);
-                        let mut out = Vec::new();
-                        ciborium::into_writer(&ciborium::value::Value::from(handle), &mut out)
-                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
-                        shared.state.lock().expect("pump lock").staged.remove(&src);
-                        out
-                    }
-                    daemon_vhc_abi::READBACK_KIND_STAGED_UPDATE => {
-                        // Window boundaries (IngestPhase docs): the first kind-2 read of a
-                        // window — or one following the previous window's ingest MATH (the
-                        // multi-round catch-up boundary, which also fires the epilogue) —
-                        // opens a FRESH window (v1's per-ingest `staged.clear()`), so
-                        // `upd_*@1` indices are 0-based per round.
-                        let fresh_window = {
-                            let d = c.data_mut();
-                            match d.ingest_phase {
-                                IngestPhase::Idle => true,
-                                IngestPhase::Consuming { math_seen: false } => false,
-                                IngestPhase::Consuming { math_seen: true } => {
-                                    // The previous window's ingest finished: epilogue, then
-                                    // a fresh window for this round.
-                                    d.tabi().snapshot_round_bases();
-                                    true
-                                }
-                            }
-                        };
-                        let idx = c
-                            .data_mut()
-                            .tabi()
-                            .stage_bridge_update(&staged_bytes, fresh_window)
-                            .map_err(|e| Trap::bare(TrapCode::BadModule, e))?;
-                        c.data_mut().ingest_phase = IngestPhase::Consuming { math_seen: false };
-                        let mut out = Vec::new();
-                        ciborium::into_writer(&ciborium::value::Value::from(idx), &mut out)
-                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
-                        shared.state.lock().expect("pump lock").staged.remove(&src);
-                        out
-                    }
-                    _ => staged_bytes,
-                };
+                // Kind 0 delivers the bytes verbatim, re-readable; kind 3 delivers the staged
+                // state section (§10.2).
+                let value = staged_bytes;
                 let len = value.len() as u64;
                 if len > u64::from(out_cap) {
                     let d = c.data_mut();
@@ -2997,40 +2728,6 @@ fn link_v2(linker: &mut Linker<V2Host>) -> Result<(), wasmtime::Error> {
     Ok(())
 }
 
-/// Stage the guest's own sealed container bytes and announce them as `PayloadReady` kind 0 —
-/// the slice-boundary half of the B1 sealing-gap retirement (see the `next_event` body).
-fn stage_own_bytes(st: &mut PumpState, bytes: Vec<u8>) -> Result<(), SinkError> {
-    if st.stop_enqueued {
-        return Ok(()); // no deliveries after Stop (§4.4)
-    }
-    let hash = *blake3::hash(&bytes).as_bytes();
-    st.enforce_payload_depth()?;
-    let staging_id = st.next_host_staging_id;
-    st.next_host_staging_id += 1;
-    let size = bytes.len() as u64;
-    st.staged.insert(staging_id, (STAGED_KIND_BYTES, bytes));
-    let ev = EventV2::PayloadReady {
-        staging_id,
-        hash,
-        meta: PayloadMeta {
-            size,
-            kind: STAGED_KIND_BYTES,
-            channel: None,
-        },
-    };
-    let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
-    st.queue.push_back(QueuedEvent {
-        frame_bytes,
-        tag: daemon_vhc_abi::EV_TAG_PAYLOAD_READY,
-        signed: None,
-        payload_hash: Some(hash),
-        timer_id: None,
-        is_budget: false,
-        gossip_id: None,
-    });
-    Ok(())
-}
-
 /// Move due timers into the queue as `Timer` events, in `(fire_at, timer_id)` order (§6.3).
 fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
     if !st.timers.iter().any(|t| t.fire_at <= now) {
@@ -3115,8 +2812,7 @@ impl V2Run {
 /// §9.4 steps 10–12), journaling throughout.
 ///
 /// The caller has already run ABI §1.3 selection (`select_driver` → `CandidateDriver::V2`).
-/// A module importing the `tabi@1` bridge gets the frozen dispatch linked beside the v2
-/// namespaces (§2.5).
+/// A module importing the retired `tabi@1` bridge is refused typed ([`V2Error::BridgeRetired`]).
 ///
 /// # Errors
 /// [`V2Error`] on setup/journal failure. Guest traps and init refusals are [`RunEnd`]s.
@@ -3147,10 +2843,16 @@ pub fn start_run_migrating(
     migration: Option<MigrationInput>,
 ) -> Result<V2Run, V2Error> {
     let module = Module::new(worker.engine(), wasm).map_err(|e| V2Error::Sandbox(e.to_string()))?;
-    // The §2.5 compute bridge: a major-2 module MAY link the frozen tabi@1 vocabulary; the host
-    // links the SAME dispatch the v1 driver uses (genericized over the store — never forked)
-    // while the bridge is advertised. This retires the sitting-3 `BridgeUnwired` bound.
-    let bridge = module.imports().any(|i| i.module() == NS_TABI_V1);
+    // The retired compute bridge: any tabi@1 import is refused typed here as well as at the
+    // §1.3 front door (`validate_imports`), so a caller that skips selection still never links
+    // or runs a bridge module.
+    if module.imports().any(|i| i.module() == NS_TABI_V1) {
+        return Err(V2Error::BridgeRetired(
+            "the module imports the retired tabi@1 compute bridge — compute crosses the \
+             boundary through compute@2 only"
+                .to_string(),
+        ));
+    }
     // The compute@2 command queue (track C1, ABI §15): a per-instance ComputeRunner over the
     // tier-1 real backend, constructed only for modules that import the world.
     let compute = module.imports().any(|i| i.module() == NS_COMPUTE_V2);
@@ -3163,11 +2865,13 @@ pub fn start_run_migrating(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    // tag 0 first — the run header precedes everything (§8.3).
+    // tag 0 first — the run header precedes everything (§8.3). The header's `bridge` field is
+    // keep-reserved (always `false`: no bridge exists; the field stays so the record grammar is
+    // unchanged and pre-existing journals stay parseable).
     sink.run_header(
         abi_packed,
         &worlds,
-        bridge,
+        false,
         &run.manifest_bytes,
         &run.config,
         &run.grants,
@@ -3197,7 +2901,6 @@ pub fn start_run_migrating(
             metrics: Vec::new(),
             logs: Vec::new(),
             published: Vec::new(),
-            bridge_final_state: None,
             // Generation-seeded by the instantiation counter (0: this driver instantiates once
             // per start_run; trap-restart re-seeding rides the tag-13 counter, ABI §7.1).
             buffers: BufferTable::new(0, run.max_live_buffer_handles, run.max_live_buffer_bytes),
@@ -3220,10 +2923,6 @@ pub fn start_run_migrating(
 
     let mut linker: Linker<V2Host> = Linker::new(worker.engine());
     link_v2(&mut linker).map_err(|e| V2Error::Sandbox(e.to_string()))?;
-    if bridge {
-        // The identical frozen dispatch the v1 linker carries, monomorphized over V2Host (§2.5).
-        crate::runtime::link_tabi(&mut linker).map_err(|e| V2Error::Sandbox(e.to_string()))?;
-    }
 
     let signing = SigningKey::from_bytes(&run.signing_seed);
     let sender = peer_id(&signing).0;
@@ -3265,10 +2964,6 @@ pub fn start_run_migrating(
                 migration_max_sections: run.migration_max_sections,
                 migration_max_section_bytes: run.migration_max_section_bytes,
                 migration_restore: migration.as_ref().is_some_and(|m| m.restore),
-                tabi: bridge.then(|| crate::runtime::HostState::new(&engine_cfg)),
-                slice_pass_open: false,
-                ingest_phase: IngestPhase::Idle,
-                sealed_containers: 0,
                 compute: compute.then(|| {
                     let runner = crate::compute::ComputeRunner::ndarray_cpu();
                     // Host-side RNG (Float/Random ops) seeded deterministically from the
@@ -3457,17 +3152,8 @@ pub fn start_run_migrating(
                 .get_typed_func::<(), u32>(&mut store, "da_run")
                 .map_err(|_| V2Error::Sandbox("missing/mis-typed da_run".into()))?;
             let run_result = da_run.call(&mut store, ());
-            // The parity-oracle hook: export the bridge's final canonical state through the pump
-            // BEFORE this thread drops the store (guest-thread-owned teardown, §11.3) — the
-            // digest input the det-lane comparisons consume (§3.6).
             {
-                let final_state = store
-                    .data()
-                    .tabi
-                    .as_ref()
-                    .map(crate::runtime::HostState::canonical_state_bytes_of);
                 let mut st = shared.state.lock().expect("pump lock");
-                st.bridge_final_state = final_state;
                 // Force-reclaim the instance's buffers + outstanding ops + streams through the
                 // per-instance tables (architecture §3.4; ABI §7.3) — guest-thread-owned teardown.
                 st.buffers.clear();
@@ -3520,89 +3206,6 @@ fn take_trap(store: &mut Store<V2Host>, e: wasmtime::Error) -> Trap {
         TrapCode::BadModule
     };
     Trap::bare(code, msg)
-}
-
-impl crate::runtime::TabiHost for V2Host {
-    fn tabi(&mut self) -> &mut crate::runtime::HostState {
-        self.tabi
-            .as_mut()
-            .expect("bridge linked only when tabi imports exist")
-    }
-    fn tabi_ref(&self) -> &crate::runtime::HostState {
-        self.tabi
-            .as_ref()
-            .expect("bridge linked only when tabi imports exist")
-    }
-    /// The §2.5 temporal-legality rules (the v1 phase table does NOT apply): registration imports
-    /// are legal ONLY during `da_init`; every other bridge import is legal in any `da_run` slice;
-    /// every call charges the v2 per-slice op budget (§5.5) and honors the mandatory-retry rules.
-    fn enter_tabi(&mut self, import: &'static str) -> Result<(), Trap> {
-        if self.slice.stopped {
-            return Err(Trap::new(
-                TrapCode::PhaseViolation,
-                import,
-                None,
-                "bridge import after Stop was consumed (§4.4)",
-            ));
-        }
-        if self.slice.pending_next.is_some() || self.slice.pending_readback.is_some() {
-            return Err(Trap::new(
-                TrapCode::BadEvent,
-                import,
-                None,
-                "NeedCapacity requires an immediate retry before any other import (§4.1/§6.4)",
-            ));
-        }
-        let registration = matches!(import, "param@1" | "persistent@1" | "det_persistent@1");
-        if registration != self.slice.in_init {
-            return Err(Trap::new(
-                TrapCode::PhaseViolation,
-                import,
-                None,
-                if registration {
-                    "bridge registration imports are legal only during da_init (§2.5)"
-                } else {
-                    "non-registration bridge imports are illegal during da_init (§2.5)"
-                },
-            ));
-        }
-        // Ingest-phase tracking (§5.9 / IngestPhase docs): any bridge op that is not a pure
-        // window reader marks the open staged window's ingest MATH as begun — the next window
-        // (or batch read, or slice close) is then the epilogue boundary.
-        if let IngestPhase::Consuming { math_seen: false } = self.ingest_phase {
-            let window_reader = matches!(
-                import,
-                "upd_sections@1"
-                    | "upd_kind@1"
-                    | "upd_bytes_len@1"
-                    | "upd_read_bytes@1"
-                    | "upd_tensor@1"
-                    | "drop@1"
-                    | "metric@1"
-                    | "log@1"
-                    | "abi_minor@1"
-            );
-            if !window_reader {
-                self.ingest_phase = IngestPhase::Consuming { math_seen: true };
-            }
-        }
-        self.charge_op(import)
-    }
-    fn stash_trap(&mut self, t: Trap) {
-        self.trap = Some(t);
-    }
-    /// Bridge nr-class results are journaled verbatim under the §2.7 reserved kinds (≥ 128) so
-    /// input replay can feed them back without re-running native kernels.
-    fn journal_bridge_nr(&mut self, kind: u32, value: &[u8]) {
-        let shared = self.shared.clone();
-        let mut st = shared.state.lock().expect("pump lock");
-        // A sink failure here is a host fault; surface it as a stashed trap on the next boundary
-        // rather than swallowing (journaling is load-bearing, §8.4).
-        if let Err(e) = st.sink.read_back(0, u64::from(kind), 0, value) {
-            drop(st);
-            self.trap = Some(Trap::bare(TrapCode::BadModule, e.to_string()));
-        }
-    }
 }
 
 /// Build the §10.2 migration-descriptor bytes: the old module's accepted manifest **verbatim**
@@ -3736,7 +3339,6 @@ mod tests {
             metrics: Vec::new(),
             logs: Vec::new(),
             published: Vec::new(),
-            bridge_final_state: None,
             buffers: BufferTable::new(0, 0, 0),
             ops: OpTable::new(0, 0),
             streams: StreamTable::new(0),
@@ -4051,10 +3653,6 @@ mod tests {
             migration_max_sections: 0,
             migration_max_section_bytes: 0,
             migration_restore: false,
-            tabi: None,
-            slice_pass_open: false,
-            ingest_phase: IngestPhase::Idle,
-            sealed_containers: 0,
             compute: None,
             compute_queue_depth: 0,
             compute_ops_since_fence: 0,

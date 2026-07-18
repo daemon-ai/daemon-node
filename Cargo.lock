@@ -4893,7 +4893,6 @@ dependencies = [
  "daemon-vhc-det",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
- "daemon-vhc-safetensors",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "serde",
@@ -4989,18 +4988,7 @@ name = "daemon-vhc-safetensors"
 version = "0.0.1"
 dependencies = [
  "blake3",
- "daemon-vhc-sdk",
  "safetensors 0.4.5",
-]
-
-[[package]]
-name = "daemon-vhc-sdk"
-version = "0.0.1"
-dependencies = [
- "ciborium",
- "daemon-vhc-abi",
- "daemon-vhc-det",
- "serde",
 ]
 
 [[package]]
@@ -5036,7 +5024,6 @@ dependencies = [
  "burn",
  "ciborium",
  "daemon-vhc-det",
- "daemon-vhc-sdk",
  "serde",
 ]
 
@@ -5091,7 +5078,6 @@ dependencies = [
  "ciborium",
  "daemon-vhc-abi",
  "daemon-vhc-det",
- "daemon-vhc-sdk",
  "daemon-vhc-sdk-rounds",
  "daemon-vhc-sdk-v2",
  "serde",

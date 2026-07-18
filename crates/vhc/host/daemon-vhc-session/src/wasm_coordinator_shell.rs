@@ -121,8 +121,7 @@ impl CoordinatorReplay {
     }
 }
 
-/// Construction inputs for a [`WasmCoordinatorShell`] (mirrors `LocalCoordinatorConfig`, minus the
-/// clock knobs the module owns).
+/// Construction inputs for a [`WasmCoordinatorShell`].
 pub struct WasmCoordinatorShellConfig {
     /// The run this coordinator drives.
     pub run: RunId,

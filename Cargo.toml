@@ -26,7 +26,7 @@ members = [
     "xtask",
 ]
 # `crates/vhc/guests/` is its OWN cargo workspace (the wasm32 experiment modules): it builds for
-# `wasm32-unknown-unknown` via `xtask build-guests`, links `daemon-vhc-sdk` by path, and must not
+# `wasm32-unknown-unknown` via `xtask build-guests`, links the guest SDK crates by path, and must not
 # be pulled into the host workspace's default (native) gate. Kept out with an explicit exclude.
 exclude = ["crates/vhc/guests"]
 
@@ -452,7 +452,6 @@ daemon-metta-client = { version = "0", path = "crates/coprocessor/daemon-metta-c
 daemon-vhc-abi = { version = "0", path = "crates/vhc/contracts/daemon-vhc-abi" }
 daemon-vhc-proto = { version = "0", path = "crates/vhc/contracts/daemon-vhc-proto" }
 daemon-vhc-det = { version = "0", path = "crates/vhc/contracts/daemon-vhc-det" }
-daemon-vhc-sdk = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk" }
 daemon-vhc-sdk-rounds = { version = "0", path = "crates/vhc/sdk/daemon-vhc-sdk-rounds" }
 # The consensus SDK layer (created at D0): assignment math moved out of daemon-vhc-proto (the
 # proto is algorithm-free from D0, dep-check-enforced); D1 adds Authority/Committed<T>, D2 the

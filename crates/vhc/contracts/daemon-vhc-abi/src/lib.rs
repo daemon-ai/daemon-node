@@ -3,41 +3,31 @@
 
 //! `daemon-vhc-abi` — the ABI surface both sides of the wasm boundary must agree on.
 //!
-//! The frozen `tabi@1` import vocabulary ([`TABI_IMPORTS`]) plus the ABI version constants
-//! ([`DA_ABI_MAJOR`] / [`DA_ABI_MINOR`] / [`DA_ABI_VERSION`]). This is a `contracts/` crate: it is
-//! dual-compiled for native *and* `wasm32-unknown-unknown`, links neither `sdk/*` nor `host/*`, and
-//! carries no third-party dependencies.
+//! The major-2 (event-loop driver) version constants, the import-namespace vocabulary the host
+//! consults to select a candidate driver (ABI §1.3 step 2), the typed admission-refusal taxonomy
+//! (ABI §1.5), and the wire vocabularies the driver / SDK / journal share. This is a `contracts/`
+//! crate: it is dual-compiled for native *and* `wasm32-unknown-unknown`, links neither `sdk/*`
+//! nor `host/*`, and carries no third-party dependencies.
 //!
-//! Extracted verbatim from the guest SDK (`daemon-vhc-sdk`) so the host runtime can assert its
-//! `Linker` / phase-legality table against the frozen surface *without dev-depending on the SDK*
-//! (the host->SDK dev-dep wart). The SDK re-exports these items, so guest-side and existing
-//! consumers see an unchanged path. Growth is additive only (ABI §9) — append to [`TABI_IMPORTS`],
-//! never reorder or remove.
+//! **The retired v1 surface** survives only as its refusal-typing vocabulary: [`DA_ABI_MAJOR`]
+//! (the major a synthetic v1-shaped module declares, refused `AbiUnsupportedMajor`),
+//! [`V1_LIFECYCLE_EXPORTS`] (the export shape that makes a module a candidate major 1), and
+//! [`NS_TABI_V1`] (the retired compute-bridge namespace — any import of it is a typed
+//! [`AbiRefusalCode::BridgeRetired`]). The 66-import `tabi@1` vocabulary itself is deleted; its
+//! registry lives in the frozen spec history.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
 use std::fmt;
 
-/// The tensor-ABI major version this contract is pinned to.
+/// The RETIRED tensor-ABI major (the v1 five-phase surface). No driver for it exists — a module
+/// declaring it meets a typed [`AbiRefusalCode::AbiUnsupportedMajor`]; the constant survives to
+/// type that refusal and its synthetic test inputs.
 pub const DA_ABI_MAJOR: u32 = 1;
-/// The tensor-ABI minor version this contract is pinned to.
-pub const DA_ABI_MINOR: u32 = 0;
-
-/// The tensor-ABI version, packed as `(major << 16) | minor`.
-///
-/// The guest advertises it via the `da_abi` export so the host can reject an incompatible module
-/// before instantiation (swarm-tensor-abi-spec.md §4).
-pub const DA_ABI_VERSION: u32 = (DA_ABI_MAJOR << 16) | DA_ABI_MINOR;
 
 // ---------------------------------------------------------------------------------------------
 // v2 (major 2) — the event-loop driver surface (ABI Draft 3 §1–§2)
-//
-// A0 lands the *contract*: the major-2 version constants, the import-namespace vocabulary the host
-// consults to select a candidate driver (ABI §1.3 step 2), and the typed admission-refusal
-// taxonomy (ABI §1.5). The major-2 *driver itself* (the `da_run`/`next_event` event loop) is Phase
-// A2 — so a well-formed major-2 module is a clean [`AbiRefusalCode::AbiUnsupportedMajor`] here,
-// naming the missing v2 driver, never a trap (ABI §1.2/§1.5, refactor §5 A0, decisions D2).
 // ---------------------------------------------------------------------------------------------
 
 /// The major-2 (event-loop driver) ABI major (ABI §0.4, §1.2).
@@ -64,16 +54,10 @@ pub const DA_ABI_MINOR_V2: u32 = 2;
 
 /// The set of ABI **majors this host generation implements** (i.e. carries a driver for).
 ///
-/// A0 shipped the retained v1 five-phase driver only; A2 flipped this to `[1, 2]` in the same
-/// commit the major-2 event-loop driver (`daemon-vhc-host::v2::driver`) first ran a module end to
-/// end (refusal → driver, refactor §5 A2). **The Phase-E v1 sunset (decisions D5) removed major
-/// 1**: the v1 five-phase driver, its autotune admission, and the phase-legality table retired
-/// together, so this is `[2]` — a module whose declared major is `1` now meets a clean
-/// [`AbiRefusalCode::AbiUnsupportedMajor`] *after* its declaration is cross-checked against its
-/// import shape (ABI §1.3 step 5; the flipped A0 fixture pins this forever). [`DA_ABI_MAJOR`],
-/// [`DA_ABI_VERSION`], and the 66-import [`TABI_IMPORTS`] vocabulary remain as the frozen
-/// historical record — the sunset removed the DRIVER, not the vocabulary (refactor §9; `tabi@1`
-/// lives on as the §2.5 bridge under major 2).
+/// Exactly `[2]`: the major-2 event-loop driver is the only driver. A module whose declared
+/// major is `1` meets a clean [`AbiRefusalCode::AbiUnsupportedMajor`] *after* its declaration is
+/// cross-checked against its import shape (ABI §1.3 step 5; pinned by a synthetic in-test
+/// major-1 module — no recorded v1 artifact exists).
 pub const HOST_IMPLEMENTED_MAJORS: &[u32] = &[DA_ABI_MAJOR_V2];
 
 /// The host's supported *minor* for an implemented `major` (`None` if the major is not implemented).
@@ -91,11 +75,11 @@ pub fn host_minor_for(major: u32) -> Option<u32> {
 
 // -- import namespaces (the wasm `import_module` names, ABI §2.2) -------------------------------
 
-/// The frozen v1 tensor-ABI import namespace (`#[link(wasm_import_module = "tabi@1")]`).
-///
-/// Under major 2 this same namespace is the transitional **compute bridge** (ABI §2.5); its
-/// *presence alone never makes a module major-1* — the candidate is major 2 whenever any `vhc@2`
-/// symbol is imported (ABI §1.2/§1.3).
+/// The RETIRED v1 tensor-ABI import namespace (`#[link(wasm_import_module = "tabi@1")]`) — the
+/// transitional compute bridge's name. The bridge is gone: **any** import of this namespace is a
+/// typed [`AbiRefusalCode::BridgeRetired`] at import validation. The constant survives only to
+/// recognize the namespace and type that refusal; its presence never makes a module major-1
+/// (the candidate is major 2 whenever any `vhc@2` symbol is imported, ABI §1.2/§1.3).
 pub const NS_TABI_V1: &str = "tabi@1";
 /// Loop mechanics: `next_event`, `read_back`, `stage_state`, `snapshot_state` (ABI §2.2, §2.6).
 pub const NS_VHC_V2: &str = "vhc@2";
@@ -363,7 +347,8 @@ pub fn required_v2_minor(imports: &[(&str, &str)]) -> u32 {
 /// instantiated module); `da_abi` is then the declaration cross-checked against this (ABI §1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateDriver {
-    /// The retained v1 five-phase driver (`tabi@1`-only imports + v1 lifecycle exports).
+    /// The RETIRED v1 five-phase shape (`tabi@1`-only imports + v1 lifecycle exports) — selected
+    /// only so its refusal is typed (`AbiUnsupportedMajor` at the declaration cross-check).
     V1,
     /// The major-2 event-loop driver (a `vhc@2` symbol is imported).
     V2,
@@ -398,7 +383,8 @@ pub enum AbiRefusalCode {
     /// An imported symbol needs a namespace minor this host lacks (subsumes "missing import" for a
     /// known namespace; ABI §1.3 step 3).
     WorldMinorUnsupported,
-    /// A major-2 module imports `tabi@1` on a bridge-retired host (Phase C; ABI §1.3 step 3, §2.5).
+    /// The module imports the retired `tabi@1` compute bridge (ABI §1.3 step 3): the bridge no
+    /// longer exists on any host — compute crosses the boundary through `compute@2` only.
     BridgeRetired,
     /// The declared `major` is not implemented by this host (ABI §1.3 step 5). Through A0 this is
     /// how a well-formed major-2 module was cleanly refused; since A2 landed the event-loop
@@ -522,34 +508,34 @@ pub fn select_candidate(
 /// Validate the compatibility tuple derived from a module's static imports (ABI §1.3 step 3): every
 /// imported `(namespace, symbol)` MUST be one the host provides at a version ≥ required.
 ///
-/// - `tabi@1` symbols MUST be in the frozen [`TABI_IMPORTS`] vocabulary, else
-///   [`AbiRefusalCode::WorldMinorUnsupported`] (a `tabi@1` symbol the host lacks);
+/// - **any** `tabi@1` symbol ⇒ [`AbiRefusalCode::BridgeRetired`] — the transitional compute
+///   bridge is retired on every host; compute crosses the boundary through `compute@2` only;
 /// - `vhc@2`/`net@2`/`sys@2`/`data@2`/`compute@2` symbols MUST be in the
 ///   [`V2_SYMBOL_REGISTRY`] **at an introducing minor ≤ the host's implemented major-2 minor**,
 ///   else [`AbiRefusalCode::WorldMinorUnsupported`] (an unregistered symbol and a
 ///   registered-but-too-new symbol are the same refusal: this host cannot serve the import);
 /// - any wholly unknown namespace ⇒ [`AbiRefusalCode::BadModule`].
 ///
-/// This subsumes "missing import for a known namespace" (ABI §1.3 step 3). The `tabi@1`-under-major-2
-/// bridge is accepted here (the bridge is advertised through Phase C, ABI §2.5); a bridge-retired
-/// host is a Phase-C concern ([`AbiRefusalCode::BridgeRetired`]). The complementary declaration-side
-/// rule — a declared minor below [`required_v2_minor`] — is the selector's step-5 cross-check
-/// (`AbiDeclarationMismatch`), not this function's.
+/// This subsumes "missing import for a known namespace" (ABI §1.3 step 3). The complementary
+/// declaration-side rule — a declared minor below [`required_v2_minor`] — is the selector's
+/// step-5 cross-check (`AbiDeclarationMismatch`), not this function's.
 ///
 /// # Errors
 ///
+/// [`AbiRefusalCode::BridgeRetired`] for any `tabi@1` import;
 /// [`AbiRefusalCode::WorldMinorUnsupported`] for an unknown/too-new symbol in a known namespace;
 /// [`AbiRefusalCode::BadModule`] for an unknown namespace.
 pub fn validate_imports(imports: &[(&str, &str)]) -> Result<(), AbiRefusal> {
     let host_v2_minor = host_minor_for(DA_ABI_MAJOR_V2).unwrap_or(0);
     for (namespace, symbol) in imports {
         if *namespace == NS_TABI_V1 {
-            if !TABI_IMPORTS.contains(symbol) {
-                return Err(AbiRefusal::new(
-                    AbiRefusalCode::WorldMinorUnsupported,
-                    format!("tabi@1 symbol `{symbol}` is not in the frozen host vocabulary"),
-                ));
-            }
+            return Err(AbiRefusal::new(
+                AbiRefusalCode::BridgeRetired,
+                format!(
+                    "`tabi@1::{symbol}`: the transitional compute bridge is retired — compute \
+                     crosses the boundary through `compute@2` only"
+                ),
+            ));
         } else if v2_namespace_symbols(namespace).is_some() {
             match v2_symbol_minor(namespace, symbol) {
                 Some(introduced) if introduced <= host_v2_minor => {}
@@ -639,125 +625,6 @@ pub const JOURNAL_RECORD_TAGS: &[u8] = &[
     15, // device-profile (reserved, Phase B)
     16, // condition
     17, // seal
-];
-
-/// The complete `tabi@1` import vocabulary the guest SDK binds (the extern block in the SDK's
-/// `abi.rs`), in registration order: the Merge-1 frozen 50-import subset followed by the Wave-2
-/// additions.
-///
-/// This is the **frozen surface**: the host `Linker` (`daemon-vhc-host`) and the phase-legality
-/// table must agree with it name-for-name (asserted by `daemon-vhc-host/tests/abi_surface.rs`).
-/// Growth is additive only (ABI §9) — append here, never reorder or remove.
-pub const TABI_IMPORTS: &[&str] = &[
-    // --- Merge-1 frozen subset (50) ---
-    "param@1",
-    "persistent@1",
-    "det_persistent@1",
-    "drop@1",
-    "param_round_base@1",
-    "backward@1",
-    "grad@1",
-    "zero_grads@1",
-    "assign@1",
-    "zeros@1",
-    "ones@1",
-    "full@1",
-    "add@1",
-    "sub@1",
-    "mul@1",
-    "mul_s@1",
-    "matmul@1",
-    "relu@1",
-    "cross_entropy@1",
-    "scalar@1",
-    "metric@1",
-    "log@1",
-    "abi_minor@1",
-    "adamw_step@1",
-    "batch_tokens@1",
-    "batch_size@1",
-    "batch_seq_len@1",
-    "upd_new@1",
-    "upd_push_bytes@1",
-    "upd_push_tensor@1",
-    "upd_sections@1",
-    "upd_kind@1",
-    "upd_bytes_len@1",
-    "upd_read_bytes@1",
-    "upd_tensor@1",
-    "det_zeros@1",
-    "det_sum@1",
-    "det_scale@1",
-    "det_l2norm@1",
-    "det_sign@1",
-    "det_add@1",
-    "det_sub@1",
-    "det_mul@1",
-    "det_absmax_unpack@1",
-    "det_chunk_scatter_add@1",
-    "det_chunk_scatter@1",
-    "det_assign@1",
-    "det_param@1",
-    "det_reset_param_to_base@1",
-    "det_axpy_param@1",
-    // --- Wave-2 additions (16) ---
-    "embedding@1",
-    "rmsnorm@1",
-    "softmax@1",
-    "silu@1",
-    "rope@1",
-    "flash_attn@1",
-    "reshape@1",
-    "transpose@1",
-    "slice@1",
-    "topk_chunk@1",
-    "chunk_scatter@1",
-    "absmax_pack@1",
-    "absmax_unpack@1",
-    "dct2@1",
-    "idct2@1",
-    "det_idct2@1",
-];
-
-// ================================================================================================
-// Det reclassification (Phase C; architecture §3.2/§3.6, refactor §7).                    [C2:det]
-//
-// `daemon-vhc-det` is the NORMATIVE definition of the consensus math; the host `det_*` (and the
-// det-lane pack/transform) imports are an ACCELERATION of that one crate, and the always-available
-// compatibility path is the same crate compiled in-guest (the SDK `sim` wasm build) — bit-identical
-// by construction under wasm's deterministic core semantics. This vocabulary names the det
-// acceleration ops the tier-1 host-op ≡ in-guest-crate conformance gate covers
-// (`daemon-vhc-host/tests/v2_det_conformance.rs`), the det twin of the `sys@2` crypto gate.
-//
-// Kept in its own delimited section so the serial Phase-C merge with the C1 `compute@2` sections is
-// mechanical: this block is det-only; C1 appends the `OperationIr`-wire vocabulary separately.
-// ================================================================================================
-
-/// The det acceleration ops asserted host ≡ in-guest-crate by the tier-1 det conformance gate
-/// (architecture §3.2 "the conformance suite asserts host-op ≡ in-guest-crate bitwise").
-///
-/// Each entry has (a) a `daemon-vhc-det` normative kernel, (b) a host `OpBackend` `det_*` method
-/// that delegates to it (the acceleration), and (c) the in-guest fallback (the same crate compiled
-/// to wasm). These are a subset of [`TABI_IMPORTS`] (the frozen bridge surface) singled out as the
-/// **equality-class** det lane — as opposed to the native (tolerance-class) lane. The conformance
-/// gate's coverage guard asserts this list and its exercised set stay in lockstep, so a new det
-/// import forces a matching conformance arm.
-pub const DET_ACCEL_OPS: &[&str] = &[
-    "det_sum@1",
-    "det_scale@1",
-    "det_l2norm@1",
-    "det_sign@1",
-    "det_add@1",
-    "det_sub@1",
-    "det_mul@1",
-    "det_axpy@1",
-    "det_chunk_scatter@1",
-    "det_chunk_scatter_add@1",
-    "det_absmax_unpack@1",
-    "absmax_pack@1",
-    "topk_chunk@1",
-    "dct2@1",
-    "idct2@1",
 ];
 
 // ================================================================================================
@@ -856,9 +723,11 @@ pub const fn pack_status_len(status: u64, length: u32) -> u64 {
 
 /// `read_back` kind 0: the staged payload bytes (raw); any `PayloadReady` with `meta.kind = 0`.
 pub const READBACK_KIND_STAGED_BYTES: u32 = 0;
-/// `read_back` kind 1: a `tabi@1` batch handle (bridge only, ABI §2.5; `meta.kind = 1`).
+/// Kind 1 — RETIRED with the compute bridge (was its staged-batch handle). The assignment is
+/// permanent and never reused; the kind is no longer a valid `read_back` call argument.
 pub const READBACK_KIND_STAGED_BATCH: u32 = 1;
-/// `read_back` kind 2: the staging index for `upd_*@1` (bridge only, ABI §2.5; `meta.kind = 2`).
+/// Kind 2 — RETIRED with the compute bridge (was its staged-update-container index). Permanent,
+/// never reused, no longer a valid call argument.
 pub const READBACK_KIND_STAGED_UPDATE: u32 = 2;
 /// `read_back` kind 3: bytes of a named state-manifest section (migration restore, ABI §10.2;
 /// requires the restore grant; the one kind legal during `da_migrate`, ABI §6.6).
@@ -879,7 +748,8 @@ pub const READBACK_KIND_STREAM_BYTES: u32 = 4;
 /// buffer from that record and re-executes no kernel (§8.7). Never a valid `read_back` CALL
 /// argument (the same never-callable discipline as kind 4 and the ≥ 128 bridge journal kinds).
 pub const READBACK_KIND_TENSOR_EXPORT: u32 = 5;
-/// `read_back` kinds ≥ this are the reserved bridge-op journal kinds (ABI §2.5/§2.7); never valid as
+/// `read_back` kinds ≥ this were the retired bridge's reserved journal kinds (permanent, never
+/// reused); never valid as
 /// call arguments (ABI §6.4).
 pub const READBACK_KIND_BRIDGE_JOURNAL_MIN: u32 = 128;
 
@@ -915,9 +785,9 @@ pub const QUIESCE_REASON_THROTTLE: u64 = 1;
 
 /// Staged-kind 0: plain bytes (`read_back` kind 0).
 pub const STAGED_KIND_BYTES: u64 = 0;
-/// Staged-kind 1: a bridge batch (`read_back` kind 1, ABI §2.5).
+/// Staged-kind 1 — RETIRED with the compute bridge (permanent assignment, never reused).
 pub const STAGED_KIND_BATCH: u64 = 1;
-/// Staged-kind 2: a bridge update container (`read_back` kind 2, ABI §2.5).
+/// Staged-kind 2 — RETIRED with the compute bridge (permanent assignment, never reused).
 pub const STAGED_KIND_UPDATE_CONTAINER: u64 = 2;
 /// Staged-kind 3: a migration state section (`read_back` kind 3, legal only during `da_migrate` —
 /// ABI §6.4/§6.6/§10.2). Host-staged on the NEW run instance from the accepted snapshot; the
@@ -1052,7 +922,8 @@ pub const GUEST_STAGING_ID_TOP_BIT: u64 = 1 << 63;
 // A handle is an opaque nonzero `u64` naming a host-side resource; `0` is never a live handle. The
 // v1 bit layout (`daemon-vhc-host::handle`) is retained verbatim and lifted here so every side of
 // the boundary — the host arena, the guest SDK, the journal/replay verifier — packs and inspects
-// handles against one source of truth. Kinds 1–7 are the frozen `tabi@1` bridge resources; kinds
+// handles against one source of truth. Kinds 1–7 were the retired bridge's resources (their
+// numbering is permanent and never reused); kinds
 // 8/9/10 (BufferHandle / StreamHandle / OpId) are Phase B (this track) — reserved-numbered here so
 // the buffer + completion layers land without renumbering. Growth is additive (kinds 11–255
 // reserved); a kind's class is permanent.
@@ -1071,19 +942,19 @@ pub const HANDLE_MAX_GENERATION: u32 = 0x00FF_FFFF;
 /// The 32-bit mask applied to a handle's `index` field (1-based, ABI §7.2).
 pub const HANDLE_INDEX_MASK: u64 = 0xFFFF_FFFF;
 
-/// Handle kind 1: a native step tensor — bridge, slice-class (ABI §7.2).
+/// Handle kind 1: a native step tensor — retired bridge, slice-class (permanent, ABI §7.2).
 pub const HANDLE_KIND_STEP_TENSOR_NATIVE: u8 = 1;
-/// Handle kind 2: a det step tensor — bridge, slice-class (ABI §7.2).
+/// Handle kind 2: a det step tensor — retired bridge, slice-class (permanent, ABI §7.2).
 pub const HANDLE_KIND_STEP_TENSOR_DET: u8 = 2;
-/// Handle kind 3: a param — bridge, registered-class (ABI §7.2).
+/// Handle kind 3: a param — retired bridge, registered-class (permanent, ABI §7.2).
 pub const HANDLE_KIND_PARAM: u8 = 3;
-/// Handle kind 4: a persistent — bridge, registered-class (ABI §7.2).
+/// Handle kind 4: a persistent — retired bridge, registered-class (permanent, ABI §7.2).
 pub const HANDLE_KIND_PERSISTENT: u8 = 4;
-/// Handle kind 5: a det persistent — bridge, registered-class (ABI §7.2).
+/// Handle kind 5: a det persistent — retired bridge, registered-class (permanent, ABI §7.2).
 pub const HANDLE_KIND_DET_PERSISTENT: u8 = 5;
-/// Handle kind 6: an update container — bridge, instance-class (ABI §7.2).
+/// Handle kind 6: an update container — retired bridge, instance-class (permanent, ABI §7.2).
 pub const HANDLE_KIND_UPDATE_CONTAINER: u8 = 6;
-/// Handle kind 7: a batch — bridge, instance-class (ABI §7.2).
+/// Handle kind 7: a batch — retired bridge, instance-class (permanent, ABI §7.2).
 pub const HANDLE_KIND_BATCH: u8 = 7;
 /// Handle kind 8: a [`BufferHandle`](https://example.invalid) — the sealed, host-owned byte region
 /// every world speaks (ABI §7.4); instance-class. **Phase B (this track).**
@@ -1112,7 +983,7 @@ pub enum ResourceClass {
 /// The [`ResourceClass`] of a handle `kind`, or `None` if `kind` is unassigned (ABI §7.1/§7.2).
 ///
 /// The kind→class mapping is permanent: kinds 1–2 are slice-class, 3–5 registered-class, 6–10
-/// instance-class (buffers/streams/`OpId`s join the bridge's batches/containers as instance-class).
+/// instance-class (buffers/streams/`OpId`s share the instance class with the retired bridge kinds).
 #[must_use]
 pub fn handle_class(kind: u8) -> Option<ResourceClass> {
     match kind {
@@ -1267,7 +1138,7 @@ pub const GRANT_BOUND_KEY_VALUES: &str = "values";
 
 // -- `world-req` / `world-grant` keys (ABI §2.3 / §2.6) ------------------------------------------
 
-/// `world-req` key: the world/namespace name (`"vhc"`/`"net"`/`"sys"`/`"data"`/`"compute"`/`"tabi"`).
+/// `world-req` key: the world/namespace name (`"vhc"`/`"net"`/`"sys"`/`"data"`/`"compute"`).
 pub const WORLD_KEY_WORLD: &str = "world";
 /// `world-req`/`world-grant` key: the requested/admitted namespace minor (§2.3/§2.6).
 pub const WORLD_KEY_MINOR: &str = "minor";
@@ -1302,23 +1173,15 @@ pub const EVENT_CLASS_GOSSIP: &str = "gossip";
 mod tests {
     use super::*;
 
-    #[test]
-    fn abi_version_packs_major_minor() {
-        assert_eq!(DA_ABI_VERSION >> 16, 1);
-        assert_eq!(DA_ABI_VERSION & 0xffff, 0);
-    }
-
     fn ns_set(ns: &[&'static str]) -> BTreeSet<&'static str> {
         ns.iter().copied().collect()
     }
 
     #[test]
-    fn v2_constants_pack_and_only_major_2_is_implemented_post_sunset() {
+    fn only_major_2_is_implemented() {
         assert_eq!(DA_ABI_MAJOR_V2, 2);
-        // The Phase-E sunset (decisions D5) removed the v1 driver: major 1 is no longer
-        // implemented (AbiUnsupportedMajor), while the constants + the 66-import vocabulary
-        // remain the frozen historical record. An unimplemented major (e.g. a future 3) stays a
-        // clean AbiUnsupportedMajor too.
+        // Major 1 carries no driver (AbiUnsupportedMajor); an unimplemented major (e.g. a
+        // future 3) stays a clean AbiUnsupportedMajor too.
         assert_eq!(HOST_IMPLEMENTED_MAJORS, &[2]);
         assert_eq!(host_minor_for(DA_ABI_MAJOR), None);
         // B1 bumped the major-2 minor to 1 with Completion delivery; C1 bumped it to 2 with
@@ -1347,8 +1210,10 @@ mod tests {
     }
 
     #[test]
-    fn any_vhc_v2_import_selects_v2_even_with_tabi_bridge() {
-        // A major-2 module MAY also link the tabi@1 bridge (ABI §2.5); the candidate is still V2.
+    fn a_tabi_importing_module_still_selects_v2_then_refuses_bridge_retired() {
+        // Candidate selection is a pure shape read: a `vhc@2` import makes the candidate V2 even
+        // when the retired bridge namespace is also imported — the REFUSAL is import
+        // validation's, typed BridgeRetired (never a mis-selection, never BadModule).
         let ns = ns_set(&[NS_VHC_V2, NS_SYS_V2, NS_TABI_V1]);
         let exports = ns_set(V2_REQUIRED_EXPORTS);
         assert_eq!(
@@ -1356,6 +1221,9 @@ mod tests {
             CandidateDriver::V2
         );
         assert_eq!(CandidateDriver::V2.major(), 2);
+        let err = validate_imports(&[("vhc@2", "next_event"), ("tabi@1", "add@1")]).unwrap_err();
+        assert_eq!(err.code, AbiRefusalCode::BridgeRetired);
+        assert_eq!(err.code.slug(), "BridgeRetired");
     }
 
     #[test]
@@ -1379,9 +1247,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_imports_flags_unknown_tabi_symbol() {
-        let err = validate_imports(&[("tabi@1", "add@1"), ("tabi@1", "bogus@1")]).unwrap_err();
-        assert_eq!(err.code, AbiRefusalCode::WorldMinorUnsupported);
+    fn validate_imports_refuses_any_tabi_import_bridge_retired() {
+        // The retired-bridge pin at the vocabulary layer: ANY tabi@1 symbol — a formerly-real op
+        // or a made-up one alike — is the typed BridgeRetired refusal.
+        for sym in ["add@1", "matmul@1", "bogus@1"] {
+            let err = validate_imports(&[("tabi@1", sym)]).unwrap_err();
+            assert_eq!(err.code, AbiRefusalCode::BridgeRetired, "tabi@1::{sym}");
+        }
     }
 
     #[test]
@@ -1396,13 +1268,8 @@ mod tests {
             validate_imports(&[("bogus@9", "foo")]).unwrap_err().code,
             AbiRefusalCode::BadModule
         );
-        // Phase-A well-formed imports validate cleanly.
-        validate_imports(&[
-            ("tabi@1", "matmul@1"),
-            ("vhc@2", "next_event"),
-            ("sys@2", "now"),
-        ])
-        .unwrap();
+        // Well-formed v2 imports validate cleanly.
+        validate_imports(&[("vhc@2", "next_event"), ("sys@2", "now")]).unwrap();
     }
 
     #[test]
@@ -1742,9 +1609,9 @@ mod tests {
             "a minor-1 import raises the required minor"
         );
         assert_eq!(
-            required_v2_minor(&[("tabi@1", "add@1")]),
+            required_v2_minor(&[("bogus@9", "foo")]),
             0,
-            "bridge imports are not v2"
+            "unregistered namespaces contribute no required minor"
         );
         // The B1 minor-1 surface is registered.
         for sym in [
@@ -1821,18 +1688,5 @@ mod tests {
         assert_eq!(COALESCE_DEDUP_HASH, 0);
         assert_eq!(COALESCE_LATEST_WINS, 1);
         assert_eq!(COALESCE_DROP_OLDEST, 2);
-    }
-
-    #[test]
-    fn tabi_imports_are_unique_and_complete() {
-        // 50 Merge-1 frozen imports + 16 Wave-2 additions = the frozen v1 vocabulary.
-        assert_eq!(TABI_IMPORTS.len(), 66);
-        let mut names: Vec<&str> = TABI_IMPORTS.to_vec();
-        let count = names.len();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), count, "tabi import names must be unique");
-        // Every name carries an explicit @version (additive growth is by version, ABI §9).
-        assert!(TABI_IMPORTS.iter().all(|n| n.contains('@')));
     }
 }

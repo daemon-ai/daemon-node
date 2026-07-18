@@ -1,24 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The **tolerance-class harness** (G1 — defines TDD HOST-3's machinery).
+//! The **tolerance-class harness** (defines TDD HOST-3's machinery).
 //!
-//! A per-op tolerance table (`OpClass` → rtol/atol) plus a comparison runner that drives the same op
-//! sequence on a **backend-under-test** and a **reference** [`OpBackend`], asserting forward outputs
-//! and backward grads agree within the op's class. The native lane is not bit-identical across
-//! backends (burn autodiff vs the CpuBackend tape, later wgpu) so equality is *by class*, never
-//! exact — except the det lane / compression natives, which delegate to `daemon_vhc_det` host-side and
-//! MUST be byte-identical (`OpClass::Exact`).
+//! A per-op tolerance table (`OpClass` → rtol/atol) plus the comparison helpers the native-lane
+//! (tolerance-class) suites share: the compute@2 conformance/replay lanes and the trainer-goldens
+//! tiers. The native lane is not bit-identical across backends, so equality is *by class*, never
+//! exact — except the det lane, which is byte-identical by construction (`OpClass::Exact`).
 //!
 //! This module is a shared test harness (a subdirectory module, so cargo does not build it as its
-//! own test binary). The **burn-ndarray** parity test (`burn_backend_parity.rs`) passes a
-//! `CpuBackend` reference and a `BurnNdarrayBackend` under test; **G2** reuses this module verbatim
-//! and passes a `BurnBackend<Autodiff<Wgpu>>` under test — the backend pair is fully parametric
-//! (`&mut dyn OpBackend`), which is exactly the seam G2 parametrizes.
+//! own test binary).
 
 #![allow(dead_code)]
-
-use daemon_vhc_host::OpBackend;
 
 /// The tolerance class of an op (the HOST-3 machinery). Pinned in [`tol_for`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,22 +138,5 @@ impl Fixture {
     /// `n` values in `[-scale, scale)`.
     pub fn vec_scaled(&mut self, n: usize, scale: f32) -> Vec<f32> {
         (0..n).map(|_| self.signed() * scale).collect()
-    }
-}
-
-/// Run `run` on `under_test` and `reference`, asserting every returned buffer agrees within `class`.
-/// The backends are `&mut dyn OpBackend`, so the same runner serves any backend pair (G2 reuse).
-pub fn assert_parity(
-    under_test: &mut dyn OpBackend,
-    reference: &mut dyn OpBackend,
-    class: OpClass,
-    ctx: &str,
-    run: impl Fn(&mut dyn OpBackend) -> Vec<Vec<f32>>,
-) {
-    let got = run(under_test);
-    let want = run(reference);
-    assert_eq!(got.len(), want.len(), "{ctx}: output-buffer count mismatch");
-    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-        assert_close(g, w, class, &format!("{ctx}#{i}"));
     }
 }

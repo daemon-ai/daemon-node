@@ -14,14 +14,14 @@ license.workspace = true
 #
 # The det-lane math delegates every kernel to the normative dual-compiled `daemon-vhc-det`
 # (architecture §3.2: any module runs it in-guest with zero host support), so a guest linking this
-# crate reproduces the v1 profiles' consensus math BIT-EXACTLY — pinned by this crate's golden
-# suite against the current SDK (`daemon-vhc-sdk::profiles`) implementation. The Burn doorway
-# (`burn_lane`) is the model↔profile composition surface for `HostBackend`/native authors.
+# crate reproduces the profiles' consensus math BIT-EXACTLY — pinned by this crate's golden suite
+# (pinned trajectory inputs → pinned post-ingest outputs, both standing literals; the equivalence
+# proof against the retired reference implementation was carried into them at capture). The Burn
+# doorway (`burn_lane`) is the model↔profile composition surface for `HostBackend`/native authors.
 #
 # Dependency rules (architecture §7, CI-enforced): sdk/* links contracts/* and lower sdk layers
 # only — never host/*. Normal deps: `daemon-vhc-det` + serde/ciborium (the payload wire) + the
-# pinned `burn` core (tensor doorway; no backend). Dev-dep: `daemon-vhc-sdk` (sim) — the CURRENT
-# profile implementation the goldens are generated from; it retires with the v1 sunset.
+# pinned `burn` core (tensor doorway; no backend).
 
 [dependencies]
 daemon-vhc-det = { workspace = true }
@@ -32,9 +32,6 @@ ciborium = { workspace = true }
 burn = { version = "=0.21.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-# The golden oracle: the CURRENT SDK profiles over the `sim` backend (ABI §10.4). The goldens
-# suite drives old + new implementations A/B on identical inputs and pins bit-equality.
-daemon-vhc-sdk = { workspace = true, features = ["sim"] }
 
 [lints]
 workspace = true

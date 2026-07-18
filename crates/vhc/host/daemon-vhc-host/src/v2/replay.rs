@@ -48,19 +48,6 @@ use crate::v2::completion::{CompletionResult, SuccessPayload};
 use crate::v2::ops::{OpRequest, OpTable};
 use crate::v2::V2Error;
 
-/// The §2.7 nr-class bridge imports and their journal kinds (runtime.rs `journal_bridge_nr`).
-const NR_IMPORTS: &[(&str, u64)] = &[
-    ("scalar@1", 128),
-    ("abi_minor@1", 129),
-    ("batch_size@1", 130),
-    ("batch_seq_len@1", 131),
-    ("upd_sections@1", 132),
-    ("upd_kind@1", 133),
-    ("upd_bytes_len@1", 134),
-    ("upd_read_bytes@1", 135),
-    ("det_l2norm@1", 136),
-];
-
 /// The recorded inputs a replay re-feeds, split by answering mechanism.
 #[derive(Debug, Default, Clone)]
 pub struct ReplayScript {
@@ -68,8 +55,6 @@ pub struct ReplayScript {
     pub events: VecDeque<(u64, Vec<u8>)>,
     /// Guest-requested staged read-backs (tag 2, kind < 128): `(src, kind, value)`.
     pub readbacks: VecDeque<(u64, u64, Vec<u8>)>,
-    /// Bridge nr-class readouts (tag 2, kind ≥ 128): `(kind, value)`.
-    pub nr: VecDeque<(u64, Vec<u8>)>,
     /// Clock readings (tag 3).
     pub clocks: VecDeque<u64>,
     /// Timer arms (tag 5): `(id, delay_ms)`.
@@ -111,7 +96,8 @@ impl ReplayScript {
                     src, kind, value, ..
                 } => {
                     if *kind >= 128 {
-                        s.nr.push_back((*kind, value.clone()));
+                        // The retired bridge's reserved journal kinds: never re-fed (a
+                        // bridge-importing module cannot exist to request them).
                     } else if *kind == u64::from(daemon_vhc_abi::READBACK_KIND_STREAM_BYTES) {
                         // Journal-record-only kind (never a guest call): completion-carried
                         // stream bytes, consumed at completion delivery — not by read_back.
@@ -182,8 +168,6 @@ struct ReplayHost {
     events_delivered: usize,
     /// NeedCapacity retry state for `next_event` (the frame must not be consumed twice).
     pending_event: Option<(u64, Vec<u8>)>,
-    /// Synthesized opaque handles for stubbed bridge compute imports.
-    next_handle: u64,
     /// The deterministic guest-created staging-id counter (§10.2): `stage_state` returns
     /// `(1 << 63) | n` for a per-instance monotone `n` from 1, exactly as the live driver mints
     /// them — no journal record (the bytes come from replay-reproduced guest memory).
@@ -280,7 +264,7 @@ fn dispatch(
     name: &str,
     params: &[Val],
     results: &mut [Val],
-    result_types: &[wasmtime::ValType],
+    _result_types: &[wasmtime::ValType],
 ) -> Result<(), wasmtime::Error> {
     match (ns, name) {
         ("vhc@2", "next_event") => {
@@ -749,63 +733,6 @@ fn dispatch(
             results[0] = Val::I32(super::driver::host_crypto_verify(&pk, &sig, &msg) as i32);
             Ok(())
         }
-        ("tabi@1", _) => {
-            if let Some((_, want_kind)) = NR_IMPORTS.iter().find(|(n, _)| *n == name) {
-                let (kind, value) = caller.data_mut().script.nr.pop_front().ok_or_else(|| {
-                    diverged(format!("guest called nr import {name} with none recorded"))
-                })?;
-                if kind != *want_kind {
-                    return Err(diverged(format!(
-                        "nr import {name} (kind {want_kind}) but the journal recorded kind {kind}"
-                    )));
-                }
-                match name {
-                    "scalar@1" | "det_l2norm@1" => {
-                        let v = f64::from_le_bytes(value.as_slice().try_into().map_err(|_| {
-                            diverged(format!("nr kind {kind}: malformed f64 value"))
-                        })?);
-                        results[0] = Val::F64(v.to_bits());
-                    }
-                    "upd_read_bytes@1" => {
-                        // (i, s, ptr, cap) -> written; the recorded value IS what was written.
-                        let ptr = p_u32(params, 2);
-                        let mem = mem_of(caller)?;
-                        mem.write(&mut *caller, ptr as usize, &value)
-                            .map_err(|e| wasmtime::Error::msg(format!("nr write: {e}")))?;
-                        results[0] = Val::I32(value.len() as i32);
-                    }
-                    _ => {
-                        let v = u32::from_le_bytes(value.as_slice().try_into().map_err(|_| {
-                            diverged(format!("nr kind {kind}: malformed u32 value"))
-                        })?);
-                        results[0] = Val::I32(v as i32);
-                    }
-                }
-                Ok(())
-            } else {
-                // A bridge COMPUTE import: pure state transformer — synthesize opaque results,
-                // re-execute nothing (§8.7). Handles are counter-derived; scalars are unused by
-                // conforming guests outside the nr set.
-                for (i, t) in result_types.iter().enumerate() {
-                    results[i] = match t {
-                        wasmtime::ValType::I64 => {
-                            let h = caller.data_mut().next_handle;
-                            caller.data_mut().next_handle += 1;
-                            Val::I64(h as i64)
-                        }
-                        wasmtime::ValType::I32 => Val::I32(0),
-                        wasmtime::ValType::F64 => Val::F64(0f64.to_bits()),
-                        wasmtime::ValType::F32 => Val::F32(0f32.to_bits()),
-                        other => {
-                            return Err(wasmtime::Error::msg(format!(
-                                "unsupported tabi result type {other} in replay"
-                            )))
-                        }
-                    };
-                }
-                Ok(())
-            }
-        }
         _ => Err(diverged(format!(
             "guest called `{ns}::{name}`, which the Phase-A replay does not model"
         ))),
@@ -899,7 +826,6 @@ pub fn replay_v2_migrating(
         decisions: Vec::new(),
         events_delivered: 0,
         pending_event: None,
-        next_handle: 0x5EED_0000_0000,
         next_guest_staging_id: 1,
         seqs: std::collections::HashMap::new(),
         // Quotas 0 (unbounded): the recording already enforced them; replay re-derives handles.

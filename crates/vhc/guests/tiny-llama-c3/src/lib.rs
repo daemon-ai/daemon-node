@@ -52,7 +52,7 @@
 //! event loop (architecture §3.2/§3.4 — no synchronous readback exists). So the driver's
 //! `make_update` returns empty (its `Commit` outbound is dropped), and the real profile
 //! `make_update` + publishes run when the round's export completions finish — the same
-//! deferred-voice shape as tiny-llama-v2's held commit.
+//! deferred-voice shape as the retired bridge trainer's held commit.
 
 mod model;
 

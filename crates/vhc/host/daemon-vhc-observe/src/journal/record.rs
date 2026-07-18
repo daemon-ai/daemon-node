@@ -118,7 +118,8 @@ pub struct RunHeader {
     pub abi: u64,
     /// Negotiated per-world minors.
     pub worlds: std::collections::BTreeMap<String, u64>,
-    /// Whether the `tabi@1` bridge is linked.
+    /// Keep-reserved (always `false`): the retired `tabi@1` bridge flag — the field stays so
+    /// the record grammar is unchanged and pre-existing journals stay parseable.
     pub bridge: bool,
     /// Admitted manifest bytes.
     #[serde(with = "serde_bytes")]

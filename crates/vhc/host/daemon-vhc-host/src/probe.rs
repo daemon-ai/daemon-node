@@ -707,6 +707,28 @@ pub fn probe_macos_device_limits() -> Option<DeviceLimits> {
     }
 }
 
+/// Whether a usable wgpu adapter can be brought up (the **GPU-skip test convention**, TDD §8.1
+/// tier-2): device-needing tests skip loudly when this is `false`, so the default CI gate stays
+/// green on GPU-less runners while the `.#vulkan` devShell runs the full suite. Delegates to the
+/// memoized [`probe_wgpu`] (a `catch_unwind` around cubecl's default-device setup — cubecl panics
+/// when no adapter matches). The probe registers the default device's compute client exactly
+/// once; subsequent tensor work reuses it.
+#[cfg(feature = "wgpu")]
+#[must_use]
+pub fn wgpu_adapter_available() -> bool {
+    probe_wgpu().is_some()
+}
+
+/// Whether a usable CUDA device can be brought up — the CUDA analogue of
+/// [`wgpu_adapter_available`]. Returns `false` — never panics — when no device / driver is
+/// present, so CUDA-needing tests skip cleanly on GPU-less runners. Delegates to the memoized
+/// [`probe_cuda`], which wraps the `cuInit`/device query in `catch_unwind`.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn cuda_adapter_available() -> bool {
+    probe_cuda().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

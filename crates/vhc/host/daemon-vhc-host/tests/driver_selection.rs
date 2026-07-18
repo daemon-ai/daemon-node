@@ -122,17 +122,22 @@ fn v2_module_selects_the_event_loop_driver() {
     assert_eq!((sel.major, sel.minor), (2, 0));
 }
 
-/// A major-2 module additionally linking the frozen `tabi@1` bridge is still a major-2 candidate
-/// (ABI §1.2: bridge imports never make a module major-1) — admitted as major 2 since A2.
+/// THE RETIRED-BRIDGE PIN: a synthetic major-2 module importing `tabi@1` meets the typed
+/// `BridgeRetired` refusal at the §1.3 front door — never a mis-selection to major 1 (ABI §1.2:
+/// bridge imports never make a module major-1), never a `BadModule`, never a trap. The offending
+/// input is hand-assembled in-test; no recorded bridge artifact exists.
 #[test]
-fn v2_module_with_tabi_bridge_still_selects_major2() {
+fn v2_module_importing_the_retired_bridge_is_refused_bridge_retired() {
     let wasm = build_module(
         &[("vhc@2", "next_event"), ("tabi@1", "batch_size@1")],
         V2_EXPORTS,
         pack(2, 0),
     );
-    let sel = select_driver(&worker(), &wasm, None).expect("bridge module is major-2");
-    assert_eq!(sel.driver, CandidateDriver::V2);
+    let err = select_driver(&worker(), &wasm, None)
+        .expect_err("a bridge-importing module is refused typed");
+    assert_eq!(err.code, AbiRefusalCode::BridgeRetired);
+    assert_eq!(err.code.slug(), "BridgeRetired");
+    assert!(err.detail.contains("compute@2"), "{}", err.detail);
 }
 
 /// The AbiUnsupportedMajor guard survives the flip, one major further out: a future major 3 is
@@ -267,10 +272,12 @@ fn unknown_symbol_in_known_namespace_is_world_minor_unsupported() {
 }
 
 #[test]
-fn unknown_tabi_symbol_is_world_minor_unsupported() {
+fn any_tabi_import_is_bridge_retired() {
+    // ANY tabi@1 symbol — formerly-real or made-up — is the typed BridgeRetired refusal at
+    // import validation, on a v1-shaped candidate too.
     let wasm = build_module(&[("tabi@1", "bogus_op@1")], V1_EXPORTS, pack(1, 0));
-    let err = select_driver(&worker(), &wasm, None).expect_err("unknown tabi op must refuse");
-    assert_eq!(err.code, AbiRefusalCode::WorldMinorUnsupported);
+    let err = select_driver(&worker(), &wasm, None).expect_err("tabi import must refuse");
+    assert_eq!(err.code, AbiRefusalCode::BridgeRetired);
 }
 
 #[test]

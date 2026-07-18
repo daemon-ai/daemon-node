@@ -80,8 +80,8 @@ manifest = {
 }
 
 world-req = {
-  "world":  tstr,                     ; "vhc" / "net" / "sys" / "data" / "compute" / "tabi"
-  "minor":  uint,                     ; namespace minor required (for "tabi": always 1)
+  "world":  tstr,                     ; "vhc" / "net" / "sys" / "data" / "compute"
+  "minor":  uint,                     ; namespace minor required
   "grants": { * tstr => grant-bound },   ; requested per-grant bounds
 }
 

@@ -13,7 +13,7 @@
 //! ## The worlds (native)
 //!
 //! - [`backend`] — the reference CPU backend: the shared [`daemon_vhc_det`] fixed-order fp32
-//!   kernels (bit-identical to the host's det lane) plus the v1 SDK's native `sim` reference tape.
+//!   kernels (bit-identical to the host's det lane).
 //! - [`net`] — a virtual network: channel pub/sub with **trace-driven** latency, churn, and
 //!   session-length models (deterministic, seeded).
 //! - [`corpus`] — a virtual corpus: deterministic token windows by `(peer, cursor)`.

@@ -320,13 +320,27 @@ mod tests {
         assert!(StateDict::from_safetensors(b"not safetensors").is_err());
     }
 
-    /// The **real 160M canonical param layout** (names/shapes/order) survives a round-trip. Uses the
-    /// tiny default config (small tensors) but the identical layout machinery the 160M preset uses.
+    /// The canonical LLaMA param layout (names/shapes/order — `tok.weight`, per-block
+    /// `attn_norm/wq/wk/wv/wo/ffn_norm/w_gate/w_up/w_down`, `norm.weight`) survives a
+    /// round-trip. The layout literal below is the tiny reference shape (d_model 64, 2 layers,
+    /// qdim 64, hidden 128, vocab 64) — the recorded fixture the retired SDK preset used to
+    /// derive, inlined when that preset retired.
     #[test]
     fn canonical_llama_layout_round_trips() {
-        use daemon_vhc_sdk::models::TinyLlamaCfg;
-        let cfg = TinyLlamaCfg::default();
-        let layout = cfg.canonical_param_layout();
+        let (d, qdim, hidden, vocab) = (64u32, 64u32, 128u32, 64u32);
+        let mut layout: Vec<(String, Vec<u32>)> = vec![("tok.weight".to_string(), vec![vocab, d])];
+        for l in 0..2u32 {
+            layout.push((format!("l{l}.attn_norm"), vec![d]));
+            layout.push((format!("l{l}.wq"), vec![d, qdim]));
+            layout.push((format!("l{l}.wk"), vec![d, qdim]));
+            layout.push((format!("l{l}.wv"), vec![d, qdim]));
+            layout.push((format!("l{l}.wo"), vec![qdim, d]));
+            layout.push((format!("l{l}.ffn_norm"), vec![d]));
+            layout.push((format!("l{l}.w_gate"), vec![d, hidden]));
+            layout.push((format!("l{l}.w_up"), vec![d, hidden]));
+            layout.push((format!("l{l}.w_down"), vec![hidden, d]));
+        }
+        layout.push(("norm.weight".to_string(), vec![d]));
         let mut sd = StateDict::new();
         for (i, (name, shape)) in layout.iter().enumerate() {
             let numel: usize = shape.iter().map(|&d| d as usize).product();

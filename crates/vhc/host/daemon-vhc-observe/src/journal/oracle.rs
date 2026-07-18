@@ -68,7 +68,7 @@ pub fn record_run_header<K: KeyProvider + Clone>(
         role: id.role.clone(),
         instance: id.instance,
         module: id.module,
-        abi: u64::from(daemon_vhc_abi::DA_ABI_VERSION),
+        abi: u64::from(daemon_vhc_abi::DA_ABI_MAJOR_V2) << 16,
         worlds: std::collections::BTreeMap::new(),
         bridge: false,
         manifest: Vec::new(),

@@ -23,7 +23,7 @@ path = "src/bin/daemon-vhc-probe.rs"
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
-# The shared ABI contract (frozen `tabi@1` vocabulary + the v2 constants, import-namespace
+# The shared ABI contract (the major-2 constants, import-namespace
 # vocabulary, candidate-selection helpers, and the split admission-refusal taxonomy). A0 uses it
 # for driver selection (ABI §1.3) — promoted from a dev-dep (the `abi_surface` sync check) to a
 # normal dep now that the runtime consumes the selection API. contracts/ crate: links neither
@@ -154,11 +154,6 @@ serde_json = { workspace = true }
 # needs no native profile A/B.
 # (A2 worker-bin split): the daemon-vhc-supervisor + daemon-common dev-deps served only
 # tests/worker_protocol.rs, which moved to `crates/vhc/bins/daemon-vhc-worker` with the bin.
-# Test-only (M2 reference-parity harness): the state-dict ↔ safetensors converter (M1 seam 4) the
-# parity tests use to compare the tabi path's and the burn reference's weights. Already a
-# `[workspace.dependencies]` entry (added at Merge 2) — a dev-dep on an existing workspace dep, no
-# root/deny/flake change.
-daemon-vhc-safetensors = { workspace = true }
 # Test-only: the `compute@2` conformance harness (`tests/compute_conformance.rs`) impls the
 # guest-side `burn_router::RunnerChannel`/`RunnerClient` routing every op through the production
 # `ComputeRunner`, and `read_tensor_async` returns `burn_std::future::DynFut`. Already in the lock

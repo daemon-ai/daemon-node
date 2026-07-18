@@ -1535,15 +1535,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daemon-vhc-sdk"
-version = "0.0.1"
-dependencies = [
- "ciborium",
- "daemon-vhc-abi",
- "serde",
-]
-
-[[package]]
 name = "daemon-vhc-sdk-compute"
 version = "0.0.1"
 dependencies = [
@@ -4527,13 +4518,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "test-bridge-v2"
-version = "0.0.1"
-dependencies = [
- "ciborium",
-]
-
-[[package]]
 name = "test-claim-v2"
 version = "0.0.1"
 dependencies = [
@@ -4667,14 +4651,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiny-llama"
-version = "0.0.1"
-dependencies = [
- "daemon-vhc-sdk",
- "serde",
-]
-
-[[package]]
 name = "tiny-llama-c3"
 version = "0.0.1"
 dependencies = [
@@ -4683,18 +4659,6 @@ dependencies = [
  "daemon-vhc-proto",
  "daemon-vhc-sdk-compute",
  "daemon-vhc-sdk-profiles",
- "daemon-vhc-sdk-rounds",
- "daemon-vhc-sdk-v2",
- "serde",
-]
-
-[[package]]
-name = "tiny-llama-v2"
-version = "0.0.1"
-dependencies = [
- "ciborium",
- "daemon-vhc-proto",
- "daemon-vhc-sdk",
  "daemon-vhc-sdk-rounds",
  "daemon-vhc-sdk-v2",
  "serde",

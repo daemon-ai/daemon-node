@@ -7,10 +7,10 @@
 // §8.7 typed contract) over `daemon-vhc-host::v2::replay` (the wasm execution). This activates
 // the journal-soak invariant (refactor §12.6) for v2: a recorded run IS its decisions.
 //
-// Coverage: the toy averager (timers, clock reads, periodic publishes) and the bridge guest
-// (tabi compute stubs, §2.7 nr readouts, staged read-back kinds 1/2) — plus the negatives: a
+// Coverage: the toy averager (timers, clock reads, periodic publishes) — plus the negatives: a
 // tampered recorded publish is a typed `Diverged`, and a journal missing a recorded input makes
-// the guest's request itself the divergence.
+// the guest's request itself the divergence. (The compute@2 trainer's journal-replay soak lives
+// in the trainer-goldens lane; data@2's in v2_data_fetch.)
 
 #![allow(clippy::disallowed_methods)]
 
@@ -280,50 +280,6 @@ fn toy_averager_replay_reproduces_every_decision_bit_for_bit() {
     }
 }
 
-/// The bridge guest, staged-batch mode (read_back kind 1 + nr readouts 129/130): the richest
-/// Phase-A record mix — compute stubs, journal-answered nr values, staged read-backs.
-#[test]
-fn bridge_staged_batch_run_replays_bit_for_bit() {
-    let wasm = guest("test_bridge_v2");
-    let (entries, end) = record(&wasm, vec![3u8], 2, 1, |pump| {
-        pump.stage_batch(&[1, 2, 3, 4, 5, 6], 2, 3, None)
-            .expect("stage");
-    });
-    assert!(matches!(end, RunEnd::Outcome(0)), "recorded end: {end:?}");
-
-    let (outcome, replay_end) = verify(&wasm, &[3u8], &entries, 2);
-    assert_eq!(replay_end, ReplayEnd::Outcome(0));
-    match outcome {
-        ReplayOutcome::Pass { decisions } => assert_eq!(decisions, 1),
-        other => panic!("expected Pass, got {other:?}"),
-    }
-}
-
-/// The bridge guest, staged-update mode (read_back kind 2 + nr readout 132).
-#[test]
-fn bridge_staged_update_run_replays_bit_for_bit() {
-    let wasm = guest("test_bridge_v2");
-    let payload = {
-        // A one-section container in the v1 SectionWire form (externally-tagged serde enum) —
-        // the wire stage_update verifies before staging (§6.4 kind 2).
-        let v = ciborium::value::Value::Array(vec![ciborium::value::Value::Map(vec![(
-            ciborium::value::Value::Text("Bytes".into()),
-            ciborium::value::Value::Bytes(vec![9, 9, 9]),
-        )])]);
-        let mut b = Vec::new();
-        ciborium::into_writer(&v, &mut b).expect("cbor");
-        b
-    };
-    let (entries, end) = record(&wasm, vec![4u8], 3, 1, |pump| {
-        pump.stage_update(payload, None).expect("stage");
-    });
-    assert!(matches!(end, RunEnd::Outcome(0)), "recorded end: {end:?}");
-
-    let (outcome, replay_end) = verify(&wasm, &[4u8], &entries, 3);
-    assert_eq!(replay_end, ReplayEnd::Outcome(0));
-    assert!(matches!(outcome, ReplayOutcome::Pass { decisions: 1 }));
-}
-
 /// A tampered journal (one flipped bit in a recorded publish hash) is a typed `Diverged`
 /// naming the recorded and replayed decisions — never a pass, never a panic.
 #[test]
@@ -358,18 +314,20 @@ fn tampered_recorded_publish_is_a_typed_divergence() {
 }
 
 /// A journal missing a recorded input makes the guest's own request the divergence: the replay
-/// ends `Diverged` (the guest asked for an nr readout none was recorded for).
+/// ends `Diverged` (the guest armed its periodic timer, but the recorded tag-5 arms were
+/// stripped).
 #[test]
 fn missing_recorded_input_is_a_replay_divergence() {
-    let wasm = guest("test_bridge_v2");
-    let (mut entries, _) = record(&wasm, vec![0u8], 5, 1, |_| {});
+    let wasm = guest("toy_averager");
+    let (mut entries, _) = record(&wasm, vec![3u8], 5, 3, |_| {});
     let before = entries.len();
-    entries.retain(|e| !matches!(e, SinkEntry::ReadBack { kind, .. } if *kind >= 128));
-    assert!(entries.len() < before, "nr readouts were recorded");
+    entries.retain(|e| !matches!(e, SinkEntry::TimerArm { .. }));
+    assert!(entries.len() < before, "timer arms were recorded");
 
     let worker = Worker::new(EngineConfig::default()).expect("engine");
-    let script = ReplayScript::from_entries(&entries);
-    let replayed = replay_v2(&worker, &wasm, &[0u8], &[], script).expect("replay harness");
+    let mut script = ReplayScript::from_entries(&entries);
+    script.identity = Some(identity_for(&wasm, 5));
+    let replayed = replay_v2(&worker, &wasm, &[3u8], &[], script).expect("replay harness");
     match replayed.end {
         ReplayEnd::Diverged(msg) => assert!(msg.contains("none recorded"), "{msg}"),
         other => panic!("expected Diverged, got {other:?}"),

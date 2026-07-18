@@ -3,19 +3,8 @@
 
 //! The major-2 guest SDK tier: raw `vhc@2`/`net@2`/`sys@2` bindings ([`abi`]), the module layer
 //! with SDK-side claim generation ([`module`]), migration scaffolding ([`migrate`], ABI §10.2),
-//! and the [`main!`] macro emitting the v2 exports (ABI §2.1/§10.1) — the v2 analogue of the
-//! v1 SDK's `experiment!`.
-//!
-//! ## Why this is a SIBLING of `daemon-vhc-sdk`, permanently — not a module inside it
-//!
-//! The v1 SDK's source feeds the frozen v1 guest bytes (`guests.blake3` / the A0 fixture pins).
-//! Measured twice in this tree (sittings 8–9): ANY edit to `daemon-vhc-sdk` — even an unused,
-//! cfg-gated module — perturbs cargo's crate metadata and reorders `tiny_llama.wasm`'s emitted
-//! sections (pin `57ae15…` → different bytes), while growing THIS crate leaves the v1 pin
-//! byte-identical. The plan to "fold into the SDK when the macro layer lands" is therefore
-//! **rescinded**: the fold would trade the A0 byte-identity invariant (refactor invariant 2)
-//! for cosmetics. The two crates merge only when the v1 SDK itself is next deliberately
-//! re-pinned (a v1-sunsetting change, Phase E at the earliest).
+//! and the [`main!`] macro emitting the v2 exports (ABI §2.1/§10.1). This is the base guest SDK
+//! tier — the retired v1 SDK it once grew beside is deleted.
 
 #[cfg(target_arch = "wasm32")]
 pub mod abi;

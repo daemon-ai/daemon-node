@@ -299,10 +299,10 @@ fn completion_protocol_runs_end_to_end_and_replays_bit_exact() {
 #[test]
 fn minor0_module_never_sees_tag6_and_declaration_below_imports_is_refused() {
     // (a) A whole minor-0 run delivers NO tag-6 event — asserted over its complete journal.
-    // The witness is `test-bridge-v2` (declares 2.0, imports no minor-1 symbol): since B2 the
-    // toy-averager consumes the minor-1 sys@2 ambient surface and honestly declares 2.1, so it
-    // is no longer a minor-0 module (the B2↔B1 merge resolution).
-    let wasm = guest_wasm("test_bridge_v2");
+    // The witness is `test-migrate-old` (declares 2.0, raw Phase-A ABI, no minor-1 symbol):
+    // since B2 the toy-averager consumes the minor-1 sys@2 ambient surface and honestly
+    // declares 2.1, so it is no longer a minor-0 module (the B2↔B1 merge resolution).
+    let wasm = guest_wasm("test_migrate_old");
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let sel = select_driver(&worker, &wasm, None).expect("minor-0 module stays admitted");
     assert_eq!((sel.major, sel.minor), (2, 0));
@@ -314,13 +314,22 @@ fn minor0_module_never_sees_tag6_and_declaration_below_imports_is_refused() {
         instance: 1,
         module: *blake3::hash(&wasm).as_bytes(),
     };
-    // Bridge-guest config 0: publish-only mode (no staged batches needed), one publish.
-    let run_cfg = V2RunConfig::new(identity, [0x62; 32], vec![0u8], Vec::new());
+    // The counter guest publishes once per delivered frame — deliver one to trigger a publish.
+    let run_cfg = V2RunConfig::new(identity, [0x62; 32], Vec::new(), Vec::new());
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
+    assert_eq!(
+        run.pump
+            .deliver_frame(0, 0, [0x77; 32], vec![1], vec![1])
+            .expect("deliver"),
+        daemon_vhc_host::v2::DeliverVerdict::Accepted
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     while run.pump.published().is_empty() {
-        assert!(Instant::now() < deadline, "bridge guest publishes");
+        assert!(
+            Instant::now() < deadline,
+            "counter guest publishes per frame"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     run.pump

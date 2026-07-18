@@ -430,10 +430,11 @@ fn supervisor_for(module: &Path) -> TrainSupervisor {
 // -- probe: the frozen capability report ----------------------------------------------------------
 
 /// CLI-1 / RUN-9 worker side: the supervisor spawns the real worker; the probe reports the
-/// implemented ABI major (2 since the sunset) and the full frozen 66-op `tabi@1` vocabulary (the
-/// live §2.5 bridge surface — the sunset removed the DRIVER, not the vocabulary).
+/// implemented ABI major (2 — the only major) and the major-2 capability vocabulary: the five
+/// worlds at their implemented minor plus the versioned custom-op registry. No `tabi@1` entry
+/// exists — the retired bridge is a typed refusal, not a capability.
 #[tokio::test]
-async fn supervisor_probe_reports_major2_and_the_frozen_vocabulary() {
+async fn supervisor_probe_reports_major2_worlds_and_custom_ops() {
     let module = module_path("tiny_llama_c3.wasm");
     let sup = supervisor_for(&module);
 
@@ -447,16 +448,25 @@ async fn supervisor_probe_reports_major2_and_the_frozen_vocabulary() {
     } else {
         assert_eq!(hw.gpus, 0, "this build has no GPU lane");
     }
-    assert_eq!(
-        hw.capabilities.abi_version, 2,
-        "the implemented major is 2 post-sunset"
+    assert_eq!(hw.capabilities.abi_version, 2, "the implemented major is 2");
+    for world in ["vhc@2", "net@2", "sys@2", "data@2", "compute@2"] {
+        assert!(
+            hw.capabilities
+                .ops
+                .iter()
+                .any(|o| o.starts_with(&format!("{world}:"))),
+            "the probe advertises {world} with its implemented minor: {:?}",
+            hw.capabilities.ops
+        );
+    }
+    assert!(
+        hw.capabilities.ops.iter().any(|o| o == "flash_attn@1"),
+        "the custom-op registry is advertised"
     );
-    assert_eq!(
-        hw.capabilities.ops.len(),
-        66,
-        "the host reports the full frozen tabi@1 vocabulary"
+    assert!(
+        !hw.capabilities.ops.iter().any(|o| o.contains("tabi")),
+        "no retired-bridge vocabulary is advertised"
     );
-    assert!(hw.capabilities.ops.iter().any(|o| o == "flash_attn@1"));
     sup.shutdown().await;
 }
 

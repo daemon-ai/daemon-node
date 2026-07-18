@@ -474,12 +474,12 @@ fn swarm_ci_det() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-worker", "--features", "burn-ndarray"],
         ),
         (
-            // The C3a models-exodus profiles gate (refactor §7 "profiles re-express over Burn
-            // tensors + det math in sdk/daemon-vhc-sdk-profiles"): the re-expressed
-            // SparseLoco/DiLoCo/Demo reproduce the CURRENT SDK profile implementation bit-for-bit
-            // (live A/B over the sim oracle + the pinned sparse_loco_golden literals), and the
-            // Section payload wire is byte-identical to the v1 container encoding.
-            "C3a sdk-profiles ≡ current SDK profiles (bit-exact A/B + pinned goldens + wire)",
+            // The profiles gate (refactor §7 "profiles re-express over Burn tensors + det
+            // math"): SparseLoco/DiLoCo/Demo reproduce their pinned goldens bit-for-bit (pinned
+            // trajectory inputs → pinned post-ingest outputs — the standing literals that carry
+            // the retired reference implementation's equivalence proof), and the Section payload
+            // wire is byte-identical to the container encoding the committed payloads ride.
+            "sdk-profiles pinned goldens (bit-exact) + payload wire",
             &["-p", "daemon-vhc-sdk-profiles"],
         ),
         (
@@ -655,13 +655,6 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             "daemon-vhc-sdk-consensus",
             "D2/post-E — the StubBackend drills drive the coordinator `tick` (relocated here at \
              D2) + observe oracle; retires when the drills re-seat onto vhc-sim/testkit [dev-dep]",
-        ),
-        (
-            "daemon-vhc-safetensors",
-            "daemon-vhc-sdk",
-            "RETAINED post-E1 — the state-dict layout oracle in the converter's tests (the \
-             checkpoint wiring itself landed at E1); retires if the oracle re-seats onto a \
-             recorded layout fixture [dev-dep]",
         ),
         // --- D0/D2: host/* -> sdk/daemon-vhc-sdk-consensus. The assignment math moved out of the
         // proto at D0 (proto is algorithm-free, enforced below); the pure coordinator `tick`
@@ -875,7 +868,7 @@ fn vhc_dep_check() -> anyhow::Result<()> {
 }
 
 /// RUSTFLAGS that remap the absolute source prefixes rustc embeds in panic locations: the
-/// `<checkout>` root (workspace + path deps like `daemon-vhc-sdk`) and the cargo registry
+/// `<checkout>` root (workspace + path deps like the guest SDK crates) and the cargo registry
 /// (`$CARGO_HOME`, else `$HOME/.cargo`). With the guests' committed `Cargo.lock` this makes the
 /// `.wasm` bytes byte-reproducible across clean rebuilds within one checkout path. The
 /// cross-worktree `-C metadata` reordering that this remap does NOT rewrite is handled separately

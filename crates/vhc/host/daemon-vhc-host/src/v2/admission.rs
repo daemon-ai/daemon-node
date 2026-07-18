@@ -37,7 +37,7 @@ use daemon_vhc_abi::{
     CLAIM_TIER_KEY_DEVICE, CLAIM_TIER_KEY_HOST, PHASE_A_DEFAULT_CHANNEL_TABLE,
 };
 
-use crate::runtime::{HostState, Worker};
+use crate::runtime::Worker;
 use crate::select::{select_driver, Selection};
 
 /// One tier of the §9.1 memory claim: `{device, host}` in raw bytes.
@@ -145,8 +145,8 @@ impl ParticipationLane {
                 // The compute@2 queue-depth ceiling (C1; mirrors the `V2RunConfig` default).
                 compute_queue_depth: 1024,
                 // The worlds a Trainer-lane role may be granted (§9.6: all four capability
-                // worlds; `vhc` loop mechanics always; `tabi` while the bridge is advertised).
-                worlds: ["vhc", "net", "sys", "data", "compute", "tabi"]
+                // worlds; `vhc` loop mechanics always).
+                worlds: ["vhc", "net", "sys", "data", "compute"]
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
@@ -582,13 +582,13 @@ fn assess_instance(
     config: &[u8],
     grants: &[u8],
 ) -> Result<Assessed, AbiRefusal> {
-    let mut store: Store<HostState> = Store::new(worker.engine(), HostState::new(worker.config()));
+    let mut store: Store<()> = Store::new(worker.engine(), ());
     store
         .set_fuel(ASSESS_FUEL)
         .map_err(|e| AbiRefusal::new(AbiRefusalCode::BadModule, format!("fuel seeding: {e}")))?;
     store.set_epoch_deadline(worker.epoch_ticks_pub());
 
-    let mut linker: Linker<HostState> = Linker::new(worker.engine());
+    let mut linker: Linker<()> = Linker::new(worker.engine());
     for import in module.imports() {
         let ExternType::Func(func_ty) = import.ty() else {
             return Err(AbiRefusal::new(
@@ -626,7 +626,7 @@ fn assess_instance(
     let alloc = instance
         .get_typed_func::<(u32, u32), u32>(&mut store, "da_alloc")
         .map_err(|_| AbiRefusal::new(AbiRefusalCode::BadModule, "missing da_alloc"))?;
-    let write_span = |store: &mut Store<HostState>, bytes: &[u8]| -> Result<u32, AbiRefusal> {
+    let write_span = |store: &mut Store<()>, bytes: &[u8]| -> Result<u32, AbiRefusal> {
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -694,7 +694,7 @@ fn assess_instance(
 /// verbatim in the detail (the §1.5 exposed-code table routes assessment-instance faults under
 /// the step-5/7 refusals; `ClaimCapabilityDenied` itself is the *trap* vocabulary, §7.6).
 /// Fuel/epoch exhaustion under the minimal assessment budget refuses the same way (§9.2).
-fn deny_or_bad(e: wasmtime::Error, _store: &mut Store<HostState>) -> AbiRefusal {
+fn deny_or_bad(e: wasmtime::Error, _store: &mut Store<()>) -> AbiRefusal {
     let msg = e
         .chain()
         .map(std::string::ToString::to_string)
@@ -706,7 +706,7 @@ fn deny_or_bad(e: wasmtime::Error, _store: &mut Store<HostState>) -> AbiRefusal 
 /// Call a `(args…) -> (ptr<<32)|len` CBOR-returning export and copy the span out (§2.1).
 fn call_cbor_export(
     instance: &wasmtime::Instance,
-    store: &mut Store<HostState>,
+    store: &mut Store<()>,
     name: &str,
     args: &[u32],
 ) -> Result<Vec<u8>, AbiRefusal> {
