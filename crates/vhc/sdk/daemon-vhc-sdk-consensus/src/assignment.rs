@@ -21,10 +21,10 @@
 //! the assignment is bit-reproducible on any target (including the `wasm32`/zkVM coordinator
 //! substrate, §11.2).
 
+use crate::messages::{BatchWindow, ThroughputClass};
 use daemon_vhc_proto::bytes::{PeerId, Seed};
 use daemon_vhc_proto::envelope::GlobalBatch;
 use daemon_vhc_proto::hash::blake3_hash;
-use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
 
 /// Salt for the batch-assignment shuffle (§6.3) — the registry constant, re-exported.
 pub use daemon_vhc_proto::domains::ASSIGN_SALT;

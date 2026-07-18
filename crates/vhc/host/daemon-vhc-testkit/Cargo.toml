@@ -22,7 +22,9 @@ two-layer split on opposite sides of the wasm boundary). vhc_dep_check enforces 
 [dependencies]
 # The wasmtime sandbox + the major-2 event-loop driver, admission, the in-memory JournalSink, and
 # the §8.7 replay engine (`replay`). host/* -> host/* (allowed).
-daemon-vhc-host = { workspace = true }
+# `harness` exposes the host's whole-run coordinator drive (the testkit's coordinator seat is a
+# re-export of it) — the testkit is wholesale harness tooling, so the feature is always on here.
+daemon-vhc-host = { workspace = true, features = ["harness"] }
 # The shared ABI vocabulary (event tags, channel table, stop reasons, outcome codes). contracts/*.
 daemon-vhc-abi = { workspace = true }
 # The signed control-plane wire (SignedMessage / VhcMessage), envelope, blake3. contracts/*.

@@ -13,7 +13,8 @@ mod common;
 use std::time::Duration;
 
 use daemon_vhc_net::{ControlPlane, IrohPeer, RebroadcastConfig};
-use daemon_vhc_proto::{from_canonical_slice, SignedMessage};
+use daemon_vhc_proto::from_canonical_slice;
+use daemon_vhc_sdk_consensus::SignedMessage;
 
 use common::iroh_harness::{
     build_mesh, connect_node, connect_relay_node, no_rebroadcast, wait_for_mesh, wire_roster,

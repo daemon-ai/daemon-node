@@ -1531,7 +1531,6 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "serde",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -1568,6 +1567,7 @@ dependencies = [
  "ciborium",
  "daemon-vhc-proto",
  "serde",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4659,6 +4659,7 @@ dependencies = [
  "daemon-vhc-proto",
  "daemon-vhc-sdk",
  "daemon-vhc-sdk-compute",
+ "daemon-vhc-sdk-consensus",
  "daemon-vhc-sdk-profiles",
  "daemon-vhc-sdk-rounds",
  "serde",

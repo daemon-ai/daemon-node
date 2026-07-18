@@ -15,8 +15,8 @@
 use std::collections::BTreeMap;
 
 use daemon_vhc_proto::merkle::commit_set;
-use daemon_vhc_proto::messages::{BatchWindow, RecordEntry, RoundOpen, RoundRecord};
 use daemon_vhc_proto::{blake3_hash, Hash, PeerId, Seed};
+use daemon_vhc_sdk_consensus::messages::{BatchWindow, RecordEntry, RoundOpen, RoundRecord};
 use daemon_vhc_sdk_rounds::{
     Authorized, BarrierRound, Committed, MintError, Outbound, RoundCfg, RoundExperiment, StepCtx,
 };
@@ -94,7 +94,7 @@ fn round_record(round: u64, entries: &[RecordEntry]) -> RoundRecord {
         set: commit_set(&set).commitment(),
         drops: Vec::new(),
         next_seed: Seed([0; 32]),
-        set_locator: daemon_vhc_proto::messages::Locator::StoreKey(String::new()),
+        set_locator: daemon_vhc_sdk_consensus::messages::Locator::StoreKey(String::new()),
         inline: None,
     }
 }

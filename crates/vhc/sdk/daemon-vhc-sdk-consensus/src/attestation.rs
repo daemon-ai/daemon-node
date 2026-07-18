@@ -22,7 +22,7 @@
 //! signature is meaningless in any other protocol/run and forgery is an ed25519 problem. Signing
 //! reuses the same primitives as [`crate::authority`] (`sign_canonical` / `verify_sig`).
 
-use daemon_vhc_proto::messages::CheckpointAttestation as WireAttestation;
+use crate::messages::CheckpointAttestation as WireAttestation;
 use daemon_vhc_proto::{
     peer_id, sign_canonical, to_canonical_vec, verify_sig, Hash, PeerId, Signature, SigningKey,
     StateDigest, VerifyOutcome,

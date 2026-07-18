@@ -9,8 +9,8 @@
 //! keeping `tick` key-free while the round stays provable from signed evidence (I6). Every input class
 //! yields at least one output class (PROTO-1).
 
+use crate::messages::{SignedMessage, VhcMessage};
 use daemon_vhc_proto::capability::Capability;
-use daemon_vhc_proto::messages::{SignedMessage, VhcMessage};
 use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{Hash, PeerId, VhcProtoVersion};
 use serde::{Deserialize, Serialize};

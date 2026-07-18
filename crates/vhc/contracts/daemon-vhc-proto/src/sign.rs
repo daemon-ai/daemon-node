@@ -57,7 +57,7 @@ pub fn verify_bytes(signer: &PeerId, sig: &Signature, bytes: &[u8]) -> Result<()
 /// A value bundled with the node identity that signed its canonical CBOR encoding.
 ///
 /// The generic wrapper used for envelope/message signing; concrete wire frames (e.g.
-/// [`crate::messages::SignedMessage`]) build on the same [`sign_canonical`]/[`verify_canonical`]
+/// the SDK layer's `SignedMessage`) build on the same [`sign_canonical`]/[`verify_canonical`]
 /// pair.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signed<T> {

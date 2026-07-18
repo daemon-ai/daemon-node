@@ -9,12 +9,12 @@
 //! yields identical `(state', outputs)` — the replay-oracle foundation (I1, PROTO-20). The commit
 //! rule ([`crate::commit`]) consumes only signed evidence (I6).
 
-use crate::{global_batch_at, select_committee};
-use daemon_vhc_proto::envelope::StopCondition;
-use daemon_vhc_proto::messages::{
+use crate::messages::{
     Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RoundOpen, RoundRecord,
     SignedMessage, StorageReceipt, Straggle, VhcMessage,
 };
+use crate::{global_batch_at, select_committee};
+use daemon_vhc_proto::envelope::StopCondition;
 use daemon_vhc_proto::sign::Signed;
 use daemon_vhc_proto::{blake3_hash, commit_set, Hash, PeerId, Seed, VhcProtoVersion};
 
@@ -191,7 +191,7 @@ fn dispatch_payload(
 fn on_checkpoint_attestation(
     state: &mut CoordinatorState,
     out: &mut Vec<Output>,
-    ca: &daemon_vhc_proto::messages::CheckpointAttestation,
+    ca: &crate::messages::CheckpointAttestation,
 ) {
     let Ok(att) = crate::attestation::SignedAttestation::from_wire(ca) else {
         out.push(Output::Reject(Rejection::UnexpectedMessage)); // unknown tier tag

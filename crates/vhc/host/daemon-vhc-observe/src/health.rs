@@ -10,8 +10,8 @@
 
 use std::collections::BTreeSet;
 
-use daemon_vhc_proto::messages::VhcMessage;
 use daemon_vhc_proto::PeerId;
+use daemon_vhc_sdk_consensus::messages::VhcMessage;
 use serde::{Deserialize, Serialize};
 
 use crate::log::{round_of, MessageKind, MessageLog};

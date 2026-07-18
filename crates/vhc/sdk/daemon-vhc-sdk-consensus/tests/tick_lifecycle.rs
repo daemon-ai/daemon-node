@@ -7,8 +7,8 @@ mod common;
 
 use common::*;
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
-use daemon_vhc_proto::messages::VhcMessage;
 use daemon_vhc_proto::{peer_id, to_canonical_vec, PeerId, VhcProtoVersion};
+use daemon_vhc_sdk_consensus::messages::VhcMessage;
 
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, ClientState, ControlAction, CoordinatorState, Input, Notice, Output, Phase,

@@ -5,7 +5,7 @@
 //!
 //! The coordinator WS plane ([`WsControlPlane`](crate::ws_client::WsControlPlane)) and the iroh
 //! gossip mesh ([`IrohGossip`](crate::iroh_gossip::IrohGossip)) carry the **same** signed
-//! `SignedMessage` frames, so the run survives one plane degrading (spec: "coordinator WS carries
+//! signed control frames, so the run survives one plane degrading (spec: "coordinator WS carries
 //! the same messages if gossip degrades"). [`DualPlane`] fans a `publish` out on **every** inner
 //! plane and merges their subscriptions behind one [`Deduper`] per subscription, so a frame that
 //! arrives on both WS and gossip is delivered to each subscriber exactly **once** (NET-6).
@@ -25,9 +25,11 @@ use crate::VhcNetError;
 /// A control plane composed of several inner planes with cross-plane content-hash dedupe.
 pub struct DualPlane {
     planes: Vec<Arc<dyn ControlPlane>>,
-    /// §7.3 receive-side per-peer payload cap (bytes). When set, an inbound `Commitment` whose
-    /// declared `size` exceeds the cap is dropped **before** delivery — the node-side mirror of the
-    /// DO shell's pre-filter (Merge-1 Decision 2). `None` = uncapped (the default; back-compatible).
+    /// §7.3 receive-side frame cap (bytes). When set, an inbound frame whose encoded length
+    /// exceeds the cap is dropped **before** delivery — the node-side mirror of the cloud
+    /// coordinator shell's pre-filter. A pure byte-length policy: the transport never decodes the
+    /// frame (control frames are opaque signed bytes here; per-object size discipline is enforced
+    /// where payloads are fetched and verified). `None` = uncapped (the default).
     receive_size_cap: Option<u64>,
 }
 
@@ -47,11 +49,12 @@ impl DualPlane {
         Self::new(vec![a, b])
     }
 
-    /// Enable the §7.3 receive-side size cap (Merge-1 Decision 2): drop an inbound `Commitment`
-    /// whose declared `size` exceeds `cap` bytes before it reaches a subscriber, mirroring the cloud
-    /// DO shell's pre-filter so the node's own receive path enforces the same per-run bound. `0`
-    /// leaves it uncapped. Additive to the frozen Merge-1 `DualPlane` surface (call before
-    /// `subscribe`).
+    /// Enable the §7.3 receive-side frame cap: drop an inbound frame whose encoded byte length
+    /// exceeds `cap` before it reaches a subscriber, mirroring the cloud coordinator shell's
+    /// pre-filter so the node's own receive path enforces the same transport bound. The check is
+    /// length-only — the plane never decodes a frame (opaque signed bytes; declared *object*
+    /// sizes are verified engine-side at fetch/stage). `0` leaves it uncapped. Call before
+    /// `subscribe`.
     #[must_use]
     pub fn with_receive_size_cap(mut self, cap: u64) -> Self {
         self.receive_size_cap = (cap > 0).then_some(cap);
@@ -65,15 +68,10 @@ impl DualPlane {
     }
 }
 
-/// Whether an inbound frame is an oversize `Commitment` (declared `size` > `cap`) that the §7.3
-/// receive-side pre-filter must drop. Undecodable / non-`Commitment` frames are never dropped here
-/// (the engine's own `verify_for_run` handles bad frames; only the size policy lives at the edge).
-fn commitment_over_cap(bytes: &[u8], cap: u64) -> bool {
-    use daemon_vhc_proto::messages::VhcMessage;
-    match daemon_vhc_proto::from_canonical_slice::<daemon_vhc_proto::SignedMessage>(bytes) {
-        Ok(msg) => matches!(&msg.payload, VhcMessage::Commitment(c) if c.size > cap),
-        Err(_) => false,
-    }
+/// Whether an inbound frame's encoded byte length exceeds the §7.3 receive-side cap. A pure
+/// length check — the plane never decodes the frame (opaque signed bytes by construction).
+fn frame_over_cap(bytes: &[u8], cap: u64) -> bool {
+    bytes.len() as u64 > cap
 }
 
 #[async_trait]
@@ -110,9 +108,9 @@ impl ControlPlane for DualPlane {
             let dedupe = dedupe.clone();
             tokio::spawn(async move {
                 while let Some(msg) = sub.recv().await {
-                    // §7.3 receive-side pre-filter: drop an oversize Commitment before dedupe/deliver.
+                    // §7.3 receive-side pre-filter: drop an oversize frame before dedupe/deliver.
                     if let Some(cap) = cap {
-                        if commitment_over_cap(&msg, cap) {
+                        if frame_over_cap(&msg, cap) {
                             continue;
                         }
                     }
@@ -152,50 +150,31 @@ mod tests {
         );
     }
 
-    /// §7.3 receive-side cap (Merge-1 Decision 2): an oversize `Commitment` is dropped before
-    /// delivery, while an under-cap `Commitment` (and any non-`Commitment` frame) passes.
+    /// §7.3 receive-side frame cap: an oversize frame is dropped before delivery, while an
+    /// under-cap frame passes — a pure byte-length policy, no decode.
     #[tokio::test]
-    async fn receive_size_cap_drops_oversize_commitment() {
-        use daemon_vhc_proto::messages::{Commitment, VhcMessage};
-        use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey, VHC_PROTO_VERSION};
-
-        fn commit_frame(size: u64) -> Vec<u8> {
-            let key = SigningKey::from_bytes(&[9u8; 32]);
-            let signed = daemon_vhc_proto::SignedMessage::sign(
-                &key,
-                VHC_PROTO_VERSION,
-                VhcMessage::Commitment(Commitment {
-                    round: 1,
-                    payload: Hash::new([0xab; 32]),
-                    size,
-                    locators: Vec::new(),
-                }),
-            )
-            .expect("sign");
-            to_canonical_vec(&signed).expect("encode")
-        }
-
+    async fn receive_size_cap_drops_oversize_frame() {
         let bus = Arc::new(LoopbackGossip::new());
         let dual =
-            DualPlane::new(vec![bus.clone() as Arc<dyn ControlPlane>]).with_receive_size_cap(4096);
+            DualPlane::new(vec![bus.clone() as Arc<dyn ControlPlane>]).with_receive_size_cap(64);
         let mut sub = dual.subscribe();
         tokio::task::yield_now().await;
 
-        let under = commit_frame(4096);
-        let over = commit_frame(4097);
+        let under = vec![0xAAu8; 64];
+        let over = vec![0xBBu8; 65];
         bus.publish(&over).await.unwrap(); // dropped by the cap
         bus.publish(&under).await.unwrap(); // delivered
 
         assert_eq!(
             sub.recv().await.as_deref(),
             Some(under.as_slice()),
-            "the under-cap commitment is delivered (the oversize one was pre-filtered)"
+            "the under-cap frame is delivered (the oversize one was pre-filtered)"
         );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv())
                 .await
                 .is_err(),
-            "the oversize commitment must not be delivered"
+            "the oversize frame must not be delivered"
         );
     }
 

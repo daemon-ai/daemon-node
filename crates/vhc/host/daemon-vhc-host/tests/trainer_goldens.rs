@@ -54,10 +54,10 @@ use daemon_vhc_host::run::{
 };
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_proto::merkle::commit_set;
-use daemon_vhc_proto::messages::{
+use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId, Seed};
+use daemon_vhc_sdk_consensus::messages::{
     BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, VhcMessage,
 };
-use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId, Seed};
 
 use tolerance::{tol_for, OpClass};
 

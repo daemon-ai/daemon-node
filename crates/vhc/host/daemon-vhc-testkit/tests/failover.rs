@@ -61,14 +61,15 @@ use daemon_vhc_observe::{
     RetentionPolicy,
 };
 use daemon_vhc_proto::cert::{verify_certified_sender, CertError, CertScope, RunKeyCertificate};
-use daemon_vhc_proto::messages::{
-    Commitment, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
-};
 use daemon_vhc_proto::{
-    blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SignedMessage,
-    SigningKey, VhcMessage, VHC_PROTO_VERSION,
+    blake3_hash, peer_id, to_canonical_vec, CapabilitySet, Hash, IrohId, PeerId, SigningKey,
+    VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
+use daemon_vhc_sdk_consensus::messages::{
+    Commitment, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
+};
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 use daemon_vhc_testkit::genesis_run::phase_a_grants;
 use daemon_vhc_testkit::{
     configure_coordinator, coordinator_state_from_capture, genesis_envelope, Coordinator,

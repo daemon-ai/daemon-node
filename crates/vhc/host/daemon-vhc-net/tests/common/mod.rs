@@ -7,7 +7,7 @@
 //! [`Mesh`] — a set of N connected control planes each with one subscriber — so the *same* behavior
 //! tests exercise both [`LoopbackGossip`](daemon_vhc_net::LoopbackGossip) (a shared in-process bus)
 //! and [`IrohGossip`](daemon_vhc_net::IrohGossip) (N real iroh endpoints on loopback). The signed-
-//! message helpers build canonical-CBOR `daemon_vhc_proto::SignedMessage` bytes — the opaque
+//! message helpers build canonical-CBOR `daemon_vhc_sdk_consensus::SignedMessage` bytes — the opaque
 //! already-signed payloads the plane carries (NET-6).
 
 #![allow(dead_code)]
@@ -16,11 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daemon_vhc_net::{ControlPlane, ControlSubscription};
-use daemon_vhc_proto::messages::Heartbeat;
-use daemon_vhc_proto::{
-    from_canonical_slice, to_canonical_vec, SignedMessage, SigningKey, VhcMessage,
-    VHC_PROTO_VERSION,
-};
+use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, SigningKey, VHC_PROTO_VERSION};
+use daemon_vhc_sdk_consensus::messages::Heartbeat;
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 
 /// How long to wait for a message to be delivered (iroh mesh formation + flood).
 pub const DELIVER: Duration = Duration::from_secs(10);

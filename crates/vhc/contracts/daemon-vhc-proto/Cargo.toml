@@ -9,22 +9,18 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-# wasm32-clean by construction (swarm-training-spec.md §10.1): serde for the schema types, ciborium
-# for the CBOR value tree the canonical encoder walks, blake3 for content hashing, xxhash-rust for
-# the round state digest (xxh3-128), ed25519-dalek for deterministic message/envelope signing. No
-# tokio, no Burn, no wasmtime — this crate compiles for the coordinator DO (wasm32) and the host
-# alike. All pinned in the root `[workspace.dependencies]`; referenced with `workspace = true`.
+# wasm32-clean by construction (swarm-training-spec.md §10.1): serde for the mechanism types,
+# ciborium for the CBOR value tree the canonical encoder walks, blake3 for content hashing,
+# ed25519-dalek for deterministic message/envelope signing. (xxhash-rust moved to the SDK schema
+# layer with the round state digest when the round vocabulary moved to the SDK schema layer.) No tokio, no Burn, no wasmtime —
+# this crate compiles for the coordinator DO (wasm32) and the host alike. All pinned in the root
+# `[workspace.dependencies]`; referenced with `workspace = true`.
 serde = { workspace = true }
 ciborium = { workspace = true }
 blake3 = { workspace = true }
-xxhash-rust = { workspace = true }
 ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
-# CDDL conformance gate (in-process, no external toolchain), same validator + pin as daemon-api.
-# `cddl-cat` is not in the root `[workspace.dependencies]`; a crate's own dev-deps are within lane
-# ownership, so it is declared here directly at daemon-api's exact version.
-cddl-cat = "=0.7.1"
 proptest = { workspace = true }
 # The shared seat-slot CAS vectors (`tests/fixtures/seat-cas-vectors.json`) are JSON so every
 # conforming seat-registry implementation (this fold, the cloud port) executes one fixture.

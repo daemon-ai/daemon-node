@@ -34,12 +34,13 @@
 //! sets `tick_period_ms > 0` to also arm real deadline timers.
 
 use daemon_vhc_abi::{EV_TAG_FRAME, EV_TAG_QUIESCE, EV_TAG_STOP, EV_TAG_TIMER};
-use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId, VhcMessage};
+use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId};
 use daemon_vhc_sdk::migrate::{build_manifest, MigrationDescriptor, OwnedSection, SectionReader};
 use daemon_vhc_sdk::module::{GuestModule, ModuleDecl};
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, tick_authenticated, CoordinatorState, Input, Output,
 };
+use daemon_vhc_sdk_consensus::VhcMessage;
 use daemon_vhc_sdk_consensus::{Authorized, DEFAULT_RECORDS_CHANNEL};
 use serde::Deserialize;
 

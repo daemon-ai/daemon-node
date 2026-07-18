@@ -12,9 +12,9 @@
 
 use std::io::{Read, Write};
 
-use daemon_vhc_proto::messages::{SignedMessage, VhcMessage};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec};
 use daemon_vhc_sdk_consensus::coordinator::Input;
+use daemon_vhc_sdk_consensus::messages::{SignedMessage, VhcMessage};
 
 use crate::ObserveError;
 

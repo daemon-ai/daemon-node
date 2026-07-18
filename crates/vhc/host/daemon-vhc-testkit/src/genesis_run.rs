@@ -44,16 +44,16 @@ use daemon_vhc_host::run::{
     ReplayScript, RunConfig, RunEnd, RunIdentity, SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
-use daemon_vhc_proto::messages::{
-    BatchWindow, Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
-};
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, ControlTransport, GenesisEnvelope, Hash,
     Identities, IrohId, PeerId, RoleEntry, RoleGrants, RunSection, Seed, SigningKey,
-    SnapshotArtifact, StateDigest, TransportSelection, VhcMessage, GENESIS_SCHEMA_MAJOR,
-    VHC_PROTO_VERSION,
+    SnapshotArtifact, StateDigest, TransportSelection, GENESIS_SCHEMA_MAJOR, VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig as CoordinatorRunConfig};
+use daemon_vhc_sdk_consensus::messages::{
+    BatchWindow, Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
+};
+use daemon_vhc_sdk_consensus::VhcMessage;
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
 use crate::coordinator::{authorize_coordinator_frame, configure_coordinator, Coordinator};

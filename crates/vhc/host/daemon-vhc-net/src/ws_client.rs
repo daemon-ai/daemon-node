@@ -5,7 +5,7 @@
 //!
 //! The node dials **out** to the cloud `RunCoordinatorDO`'s WebSocket surface —
 //! `GET {base}/runs/:id/ws` (daemon-cloud `apps/vhc`, `coordinator/do.ts`) — over `wss://`,
-//! speaking canonical-CBOR [`SignedMessage`](daemon_vhc_proto::SignedMessage) frames **both
+//! speaking canonical-CBOR signed control frames (the SDK schema layer's `SignedMessage`) **both
 //! ways**. It presents as a [`ControlPlane`]: `publish` sends a frame up the socket, `subscribe`
 //! delivers inbound frames, so the frozen `RoundEngine` runs over it unchanged.
 //!

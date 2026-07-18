@@ -14,8 +14,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use daemon_vhc_proto::messages::{SignedMessage, VhcMessage};
 use daemon_vhc_proto::{Hash, VHC_PROTO_VERSION};
+use daemon_vhc_sdk_consensus::messages::{SignedMessage, VhcMessage};
 
 use daemon_vhc_sdk_consensus::coordinator::Input;
 

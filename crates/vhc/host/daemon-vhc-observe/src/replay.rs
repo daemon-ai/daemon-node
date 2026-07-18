@@ -24,8 +24,8 @@
 //! [`RoundRecord`]s carried in the trace are the **oracle** (compared, never delivered to the
 //! module as an input); everything else is the driving trace fed to the module.
 
-use daemon_vhc_proto::messages::{RoundRecord, SignedMessage, VhcMessage};
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, Seed};
+use daemon_vhc_sdk_consensus::messages::{RoundRecord, SignedMessage, VhcMessage};
 
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 

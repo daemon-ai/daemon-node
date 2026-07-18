@@ -16,14 +16,14 @@
 use std::collections::BTreeMap;
 
 use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
-use daemon_vhc_proto::messages::{
-    Commitment, Heartbeat, Join, RecordEntry, RoundRecord, SignedMessage, StorageReceipt,
-    ThroughputClass, VhcMessage,
-};
 use daemon_vhc_proto::{
     blake3_hash, peer_id, CapabilitySet, Hash, IrohId, PeerId, Seed, SigningKey, VHC_PROTO_VERSION,
 };
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig};
+use daemon_vhc_sdk_consensus::messages::{
+    Commitment, Heartbeat, Join, RecordEntry, RoundRecord, SignedMessage, StorageReceipt,
+    ThroughputClass, VhcMessage,
+};
 
 use daemon_vhc_observe::genesis_seed;
 pub use daemon_vhc_session::replay_sandbox::SandboxedCoordinator;

@@ -11,11 +11,11 @@
 // The sandbox shells `cargo build` for the guests workspace (the established testkit pattern).
 #![allow(clippy::disallowed_methods)]
 
-use daemon_vhc_proto::messages::{
-    Digest, RoundRecord, SignedMessage, Straggle, StraggleStatus, VhcMessage,
-};
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, PeerId, SigningKey, StateDigest, VHC_PROTO_VERSION,
+};
+use daemon_vhc_sdk_consensus::messages::{
+    Digest, RoundRecord, SignedMessage, Straggle, StraggleStatus, VhcMessage,
 };
 
 use daemon_vhc_sdk_consensus::coordinator::Input;

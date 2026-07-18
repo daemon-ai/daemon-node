@@ -14,7 +14,7 @@
 //!   taxonomy, NET-8).
 //! - **`head`** → presigned `GET` + hash the body (see the type doc: an R2 `HEAD` cannot yield the
 //!   blake3 `PayloadStat` needs, and the trait's `head` takes no expected hash — so we re-fetch and
-//!   hash, exactly like `FsPayloadStore::head`). Feeds [`ReceiptProducer`](crate::ReceiptProducer),
+//!   hash, exactly like `FsPayloadStore::head`). Feeds the coordinator-seat receipt producer,
 //!   which works unchanged over `R2Store` (NET-1 `head_emits_signed_receipt`).
 //!
 //! Object keys are the authoritative §11.3 layout, produced by [`r2_object_key`] (the coordinator
@@ -93,25 +93,24 @@ impl<P: PresignClient> R2Store<P> {
         &self.run
     }
 
-    /// **Live checkpoint-resync (§9; lane R).** Fetch + decode the committed-set object
+    /// **Live checkpoint-resync (§9; lane R).** Fetch the committed-set object bytes
     /// (`record-set.cbor`) the coordinator wrote for `round`
     /// (`runs/<run>/rounds/<round>/record-set.cbor`, spec §11.3). A rejoining peer uses this to
     /// learn which `(peer, hash, size)` payloads to stage when replaying a retained round forward
-    /// from a checkpoint. Presigns a `record-set` GET (the frozen §11.1 contract), fetches, and
-    /// decodes; a 404/403 → a typed [`VhcNetError::PayloadMiss`] (the stall-ladder signal — the
-    /// caller falls back to fresh-state per §9). The per-payload blake3 verify (RUN-2) happens when
-    /// the caller fetches each entry's payload, so a decode here is sufficient.
-    pub async fn fetch_record_set_object(
+    /// from a checkpoint. Presigns a `record-set` GET (the frozen §11.1 contract) and fetches;
+    /// a 404/403 → a typed [`VhcNetError::PayloadMiss`] (the stall-ladder signal — the caller
+    /// falls back to fresh-state per §9). The bytes are returned OPAQUE: the record-set schema is
+    /// SDK vocabulary, so decoding (and the per-payload blake3 verify, RUN-2) is the engine-side
+    /// caller's job — net never interprets a consensus object.
+    pub async fn fetch_record_set_bytes(
         &self,
         round: crate::seam::RoundId,
-    ) -> Result<daemon_vhc_proto::RecordSet, VhcNetError> {
+    ) -> Result<Vec<u8>, VhcNetError> {
         let req = PresignRequest::record_set(PresignOp::Get, round);
         let resp = self.presign.presign(&self.run, &req).await?;
-        let bytes = self.get_object(&resp).await?.ok_or_else(|| {
+        self.get_object(&resp).await?.ok_or_else(|| {
             VhcNetError::PayloadMiss(format!("{}@r{round}/record-set.cbor", self.run.as_str()))
-        })?;
-        daemon_vhc_proto::RecordSet::from_canonical_slice(&bytes)
-            .map_err(|e| VhcNetError::Fetch(format!("decode record-set r{round}: {e}")))
+        })
     }
 
     /// Presign one payload op for `key`.
@@ -304,10 +303,9 @@ mod tests {
 
     use crate::fetch::{fetch_with_fallback_dyn, RetryPolicy};
     use crate::mock_r2::MockR2;
-    use crate::receipt::ReceiptProducer;
     use crate::store::FsPayloadStore;
     use crate::test_support::temp_root;
-    use daemon_vhc_proto::{blake3_hash, SigningKey, VhcMessage, VHC_PROTO_VERSION};
+    use daemon_vhc_proto::blake3_hash;
 
     fn pkey(round: RoundId, peer: u8) -> PayloadKey {
         PayloadKey::new(RunId::new("run-x"), round, PeerId([peer; 32]))
@@ -341,31 +339,19 @@ mod tests {
         assert!(matches!(err, VhcNetError::PresignExpired(_)), "got {err:?}");
     }
 
-    /// NET-1: `ReceiptProducer<R2Store>` compiles + works **unchanged** — HEAD → signed
-    /// `StorageReceipt`.
+    /// NET-1: HEAD over the presign plane attests the stored object's `(hash, size)` — the stat
+    /// the coordinator-seat receipt producer folds into signed availability evidence (that
+    /// producer lives with the coordinator harness drive; here we pin the R2 stat half).
     #[tokio::test]
-    async fn head_emits_signed_receipt() {
+    async fn head_attests_hash_and_size() {
         let mock = MockR2::start().await;
         let store = store_over(&mock);
         let k = pkey(2, 0x01);
         let hash = store.put(&k, b"peer-update").await.unwrap();
 
-        let producer = ReceiptProducer::new(
-            store,
-            SigningKey::from_bytes(&[0x42; 32]),
-            VHC_PROTO_VERSION,
-        );
-        let signed = producer.produce(&k).await.unwrap();
-        assert!(signed.verify().is_ok());
-
-        let VhcMessage::StorageReceipt(receipt) = &signed.payload else {
-            panic!("expected StorageReceipt, got {:?}", signed.payload);
-        };
-        assert_eq!(receipt.round, 2);
-        assert_eq!(receipt.verified.len(), 1);
-        assert_eq!(receipt.verified[0].peer, k.peer);
-        assert_eq!(receipt.verified[0].hash, hash);
-        assert_eq!(receipt.verified[0].size, b"peer-update".len() as u64);
+        let stat = store.head(&k).await.unwrap();
+        assert_eq!(stat.hash, hash);
+        assert_eq!(stat.size, b"peer-update".len() as u64);
     }
 
     /// NET-8: an object within the retention window is fetchable.

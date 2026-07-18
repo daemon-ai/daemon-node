@@ -6,11 +6,11 @@
 mod common;
 
 use common::*;
-use daemon_vhc_proto::messages::{
-    AttestEntry, Attestation, BatchWindow, Commitment, Locator, RecordEntry, ThroughputClass,
-};
 use daemon_vhc_proto::{commit_set, Hash, IrohId, PeerId, Seed};
 use daemon_vhc_sdk_consensus::coordinator::{elect_checkpointer, select_verifiers};
+use daemon_vhc_sdk_consensus::messages::{
+    AttestEntry, Attestation, BatchWindow, Commitment, Locator, RecordEntry, ThroughputClass,
+};
 
 use daemon_vhc_sdk_consensus::coordinator::commit::{
     all_evidenced, committed_entries, has_evidence, quorum_root,

@@ -13,7 +13,7 @@
 // digest is the shared `digest_state` pure function; two peers computing it must agree.
 
 use daemon_vhc_proto::bytes::Seed;
-use daemon_vhc_proto::digest::{derive_schedule, digest_state, StateLayout};
+use daemon_vhc_sdk_consensus::digest::{derive_schedule, digest_state, StateLayout};
 
 const BLOCK: u32 = 64;
 

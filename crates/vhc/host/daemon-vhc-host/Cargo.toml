@@ -52,13 +52,12 @@ thiserror = { workspace = true }
 # remains — det math runs exclusively in-guest via that crate compiled to wasm.)
 serde = { workspace = true }
 ciborium = { workspace = true }
-# The coordinator drive seat (`coordinator` module): configuring/authorizing the
-# production coordinator blob needs the run's typed `AuthorityConfig` (decode + authorize), which
-# lives in the consensus SDK layer. TRACKED dependency-direction exception (xtask vhc_dep_check):
-# host/* -> sdk/* — the ratified rule is that consensus never runs outside the sandboxed module,
-# so the *drive* is production host machinery while the *authority vocabulary* stays SDK-side;
-# the edge narrows to a contracts-crate move if AuthorityConfig ever relocates.
-daemon-vhc-sdk-consensus = { workspace = true }
+# The coordinator drive seat (`coordinator` module) decodes the run's typed `AuthorityConfig`
+# AND the SDK round messages (`published()`/`next_message()` decode coordinator decisions), so
+# both the module and this dep are HARNESS machinery: OPTIONAL, enabled only by the `harness`
+# feature. The default host build carries no SDK schema crate (dep-check-enforced) — the
+# production pump path routes opaque frames and never inspects a decision.
+daemon-vhc-sdk-consensus = { workspace = true, optional = true }
 # (A2 dependency INVERSION, refactor §5 A2 item 3): the daemon-vhc-session dep is GONE — the host
 # no longer links run policy; the session links the host (architecture §7: SESS → HOSTC), and
 # `wasm_backend.rs` (the TrainerBackend seam impl) moved to the session with it. The session
@@ -126,8 +125,16 @@ wgpu = ["burn/wgpu"]
 # `BackendKind::Cuda` engine arm is wired behind this feature (swarm-ledger-p3-g): `dep:cudarc` adds
 # the driver-API VRAM probe (lock-neutral — see the cudarc dep note above). Opt-in only.
 cuda = ["burn/cuda", "dep:cudarc"]
+# The whole-run coordinator drive seat (`coordinator` module): starts the coordinator blob under
+# the real driver and signs/verifies/decodes its round decisions — harness machinery for the
+# in-process whole-run suites (testkit, session harness, worker self-driven join). Off the default
+# build so the production host carries no round vocabulary.
+harness = ["dep:daemon-vhc-sdk-consensus"]
 
 [dev-dependencies]
+# The `cfg(test)` builds of the harness-gated coordinator module need the optional SDK schema dep
+# present without the feature (same pattern as the session crate's dev-deps).
+daemon-vhc-sdk-consensus = { workspace = true }
 # Test-only: the A2 event-loop end-to-end test (`tests/event_loop.rs`) journals through the
 # REAL A1 crash-safe segmented substrate by adapting `daemon_vhc_observe::journal::Journal` onto
 # the driver's `JournalSink` seam. A host→host dev edge (observe is host-side); the runtime

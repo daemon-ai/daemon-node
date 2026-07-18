@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use daemon_vhc_proto::messages::{
+use crate::messages::{
     Attestation, BatchWindow, Commitment, RecordEntry, RoundRecord, ThroughputClass,
 };
 use daemon_vhc_proto::{IrohId, PeerId, Seed, StateDigest};

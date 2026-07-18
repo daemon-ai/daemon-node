@@ -22,11 +22,11 @@ use std::time::{Duration, Instant};
 
 use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
 use daemon_vhc_net::{ControlPlane, ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
-use daemon_vhc_proto::messages::{Commitment, Heartbeat, Join, Locator, ThroughputClass};
 use daemon_vhc_proto::{
-    from_canonical_slice, to_canonical_vec, CapabilitySet, Hash, IrohId, SignedMessage, VhcMessage,
-    VHC_PROTO_VERSION,
+    from_canonical_slice, to_canonical_vec, CapabilitySet, Hash, IrohId, VHC_PROTO_VERSION,
 };
+use daemon_vhc_sdk_consensus::messages::{Commitment, Heartbeat, Join, Locator, ThroughputClass};
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 
 /// The committed A1 framing golden (matches `tests/fixtures/ws-frame-commitment.cbor`): a signed
 /// `Commitment` frame. `size: 4096` stays under the run's `update_max_bytes`, so the DO's §7.3

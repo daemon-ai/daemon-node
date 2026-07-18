@@ -37,17 +37,16 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use daemon_vhc_net::{
-    fetch_record_set, ControlPlane, ControlSubscription, DownloadScheduler, PayloadStore,
+use daemon_vhc_net::{ControlPlane, ControlSubscription, DownloadScheduler, PayloadStore};
+use daemon_vhc_proto::{
+    commit_set, from_canonical_slice, to_canonical_vec, Hash, PeerId, Root, SigningKey,
+    VhcProtoVersion,
 };
-use daemon_vhc_proto::messages::{
+use daemon_vhc_sdk_consensus::messages::{
     Attestation, Commitment, Digest as DigestMsg, Locator, RecordEntry, RoundOpen, RoundRecord,
     Straggle, StraggleStatus,
 };
-use daemon_vhc_proto::{
-    commit_set, from_canonical_slice, to_canonical_vec, Hash, PeerId, Root, SigningKey, VhcMessage,
-    VhcProtoVersion,
-};
+use daemon_vhc_sdk_consensus::{RecordSet, VhcMessage};
 
 use crate::backend::{BatchRef, StagedPayload, StateDigest, StepCtx, TrainerBackend};
 use crate::checkpoint::{
@@ -57,6 +56,35 @@ use crate::checkpoint::{
 use crate::data::{slice_interval, BatchInterval, Corpus};
 use crate::seam::{PayloadKey, RoundId, RunId};
 use crate::VhcRunError;
+
+/// Fetch and decode a `record-set.cbor` object (spec §6.4, §11.3).
+///
+/// Fetches the object via [`PayloadStore::get`] (which blake3-verifies the raw bytes equal
+/// `expected` — the locator hash), decodes [`RecordSet`], and re-verifies the decoded set's
+/// content address equals `expected` (so a non-canonical re-encoding is also rejected). Root
+/// verification against the `RoundRecord`'s signed commitment stays in `verify_record_set`.
+/// Lives engine-side (moved out of the transport crate with the SDK schema layer): net returns
+/// verified bytes; what those bytes decode to is round vocabulary the host never carries.
+pub async fn fetch_record_set<P: PayloadStore + ?Sized>(
+    store: &P,
+    key: &PayloadKey,
+    expected: &Hash,
+) -> Result<RecordSet, daemon_vhc_net::VhcNetError> {
+    use daemon_vhc_net::VhcNetError;
+    let bytes = store.get(key, expected).await?;
+    let set = RecordSet::from_canonical_slice(&bytes)
+        .map_err(|e| VhcNetError::Fetch(format!("decode record-set: {e}")))?;
+    let actual = set
+        .content_hash()
+        .map_err(|e| VhcNetError::Fetch(format!("hash record-set: {e}")))?;
+    if &actual != expected {
+        return Err(VhcNetError::HashMismatch {
+            expected: expected.to_hex(),
+            actual: actual.to_hex(),
+        });
+    }
+    Ok(set)
+}
 
 /// Per-round batch assignment: P2's throughput-weighted deterministic split (§6.3, PROTO-8).
 ///
@@ -69,9 +97,9 @@ use crate::VhcRunError;
 /// cross-peer agreement is unaffected since every peer folds the same committed set).
 pub mod assignment {
     use super::{BatchInterval, PeerId};
-    use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
     use daemon_vhc_proto::Seed;
     use daemon_vhc_sdk_consensus::assign_batches;
+    use daemon_vhc_sdk_consensus::messages::{BatchWindow, ThroughputClass};
 
     /// The `[start, end)` sub-interval `assign_batches` assigns to `peer` for the round seeded by
     /// `seed` over `window`. Class-equal roster (StubBackend), zero overlap (exact partition). Falls
@@ -387,7 +415,8 @@ where
     /// exhausted (`LeftForEpoch`).
     pub async fn run(&mut self) -> Result<RunOutcome, VhcRunError> {
         while let Some(bytes) = self.sub.recv().await {
-            let Ok(msg) = from_canonical_slice::<daemon_vhc_proto::SignedMessage>(&bytes) else {
+            let Ok(msg) = from_canonical_slice::<daemon_vhc_sdk_consensus::SignedMessage>(&bytes)
+            else {
                 continue; // undecodable frame — gossip is best-effort dissemination
             };
             // Verification lives here, not in the transport (§7.1): drop bad-sig / wrong-version.
@@ -556,7 +585,7 @@ where
         let commitment = tree.commitment();
         let inline = entries
             .iter()
-            .map(|(p, h)| daemon_vhc_proto::messages::AttestEntry { peer: *p, hash: *h })
+            .map(|(p, h)| daemon_vhc_sdk_consensus::messages::AttestEntry { peer: *p, hash: *h })
             .collect();
         let _ = (peer, hash);
         self.publish(VhcMessage::Attestation(Attestation {
@@ -841,8 +870,9 @@ where
     /// Sign `payload` with the node identity and publish the canonical-CBOR frame on the control
     /// plane (already-signed bytes, §7.1).
     async fn publish(&self, payload: VhcMessage) -> Result<(), VhcRunError> {
-        let signed = daemon_vhc_proto::SignedMessage::sign(&self.key, self.cfg.version, payload)
-            .map_err(|e| VhcRunError::Lifecycle(format!("sign control message: {e}")))?;
+        let signed =
+            daemon_vhc_sdk_consensus::SignedMessage::sign(&self.key, self.cfg.version, payload)
+                .map_err(|e| VhcRunError::Lifecycle(format!("sign control message: {e}")))?;
         let bytes = to_canonical_vec(&signed)
             .map_err(|e| VhcRunError::Lifecycle(format!("encode control message: {e}")))?;
         self.control.publish(&bytes).await?;
@@ -901,8 +931,8 @@ mod tests {
     use super::*;
     use crate::backend::{AssessMeta, Assessment, BatchRef, StepStats, StubBackend};
     use crate::harness::{run_vhc, run_vhc_with, StallFault, VhcConfig, EXPERIMENT_CONFIG};
-    use daemon_vhc_proto::messages::RoundRecord;
     use daemon_vhc_proto::{blake3_hash, commit_set, Seed};
+    use daemon_vhc_sdk_consensus::messages::RoundRecord;
     use std::sync::{Arc, Mutex};
 
     fn peer(b: u8) -> PeerId {
@@ -925,7 +955,7 @@ mod tests {
             set: tree.commitment(),
             drops: Vec::new(),
             next_seed: Seed([0; 32]),
-            set_locator: daemon_vhc_proto::messages::Locator::StoreKey("s".into()),
+            set_locator: daemon_vhc_sdk_consensus::messages::Locator::StoreKey("s".into()),
             inline: Some(entries),
         }
     }
@@ -971,7 +1001,7 @@ mod tests {
         // commitment — the `fetch_record_set` wiring (the `// MERGE-2` marker on verify_record_set).
         let (engine, store, run) = resolve_engine();
         let round = 3;
-        let set = daemon_vhc_proto::RecordSet::new([
+        let set = daemon_vhc_sdk_consensus::RecordSet::new([
             entry(0x99, b"c"),
             entry(0x11, b"a"),
             entry(0x55, b"b"),
@@ -985,7 +1015,7 @@ mod tests {
             set: set.commitment(),
             drops: Vec::new(),
             next_seed: Seed([0; 32]),
-            set_locator: daemon_vhc_proto::messages::Locator::StoreKey(
+            set_locator: daemon_vhc_sdk_consensus::messages::Locator::StoreKey(
                 "runs/resolve-run/rounds/3/record-set.cbor".into(),
             ),
             inline: None,
@@ -1002,7 +1032,8 @@ mod tests {
         // rejected (I3 exactness), even though its bytes hash-verify on GET.
         let (engine, store, run) = resolve_engine();
         let round = 3;
-        let stored = daemon_vhc_proto::RecordSet::new([entry(0x11, b"a"), entry(0x55, b"b")]);
+        let stored =
+            daemon_vhc_sdk_consensus::RecordSet::new([entry(0x11, b"a"), entry(0x55, b"b")]);
         let key = PayloadKey::new(run, round, RECORD_SET_PEER);
         store
             .put(&key, &stored.to_canonical_vec().unwrap())
@@ -1010,13 +1041,14 @@ mod tests {
             .unwrap();
 
         // The record signs a DIFFERENT set's root.
-        let signed = daemon_vhc_proto::RecordSet::new([entry(0x11, b"a"), entry(0x99, b"z")]);
+        let signed =
+            daemon_vhc_sdk_consensus::RecordSet::new([entry(0x11, b"a"), entry(0x99, b"z")]);
         let rr = RoundRecord {
             round,
             set: signed.commitment(),
             drops: Vec::new(),
             next_seed: Seed([0; 32]),
-            set_locator: daemon_vhc_proto::messages::Locator::StoreKey("k".into()),
+            set_locator: daemon_vhc_sdk_consensus::messages::Locator::StoreKey("k".into()),
             inline: None,
         };
         let err = engine.resolve_record_set(&rr).await.unwrap_err();
@@ -1131,7 +1163,7 @@ mod tests {
             load_typed_checkpoint, resync_by_replay, steps_from_round_records,
             MODULE_SCHEMA_SAFETENSORS,
         };
-        use daemon_vhc_proto::messages::{Locator, RoundRecord as ProtoRoundRecord};
+        use daemon_vhc_sdk_consensus::messages::{Locator, RoundRecord as ProtoRoundRecord};
 
         let cfg = VhcConfig {
             checkpoint_every_rounds: 2,
@@ -1244,12 +1276,12 @@ mod tests {
             load_typed_checkpoint, plan_late_join, resync_by_replay, steps_from_round_records,
             CheckpointCandidate, LateJoinPlan, ResyncPlan,
         };
-        use daemon_vhc_proto::messages::{Locator, RoundRecord as ProtoRoundRecord};
         use daemon_vhc_sdk_consensus::attestation::{
             AttestationBody, AttestationLedger, AttestationPolicy, AttestationTier,
             SignedAttestation,
         };
         use daemon_vhc_sdk_consensus::coordinator::{tick, Input};
+        use daemon_vhc_sdk_consensus::messages::{Locator, RoundRecord as ProtoRoundRecord};
 
         let cfg = VhcConfig {
             checkpoint_every_rounds: 2,
@@ -1341,7 +1373,7 @@ mod tests {
         }
         .sign(&restorer)
         .unwrap();
-        let frame = daemon_vhc_proto::SignedMessage::sign(
+        let frame = daemon_vhc_sdk_consensus::SignedMessage::sign(
             &restorer,
             daemon_vhc_proto::VHC_PROTO_VERSION,
             VhcMessage::CheckpointAttestation(restore_att.to_wire()),
@@ -1388,7 +1420,7 @@ mod tests {
         }
         .sign(&joiner_key)
         .unwrap();
-        let frame = daemon_vhc_proto::SignedMessage::sign(
+        let frame = daemon_vhc_sdk_consensus::SignedMessage::sign(
             &joiner_key,
             daemon_vhc_proto::VHC_PROTO_VERSION,
             VhcMessage::CheckpointAttestation(joiner_att.to_wire()),
@@ -1407,7 +1439,7 @@ mod tests {
         // the coordinator flow and never inflates the ledger.
         let mut forged = joiner_att.clone();
         forged.body.signer = daemon_vhc_proto::peer_id(&SigningKey::from_bytes(&[0x79; 32]));
-        let forged_frame = daemon_vhc_proto::SignedMessage::sign(
+        let forged_frame = daemon_vhc_sdk_consensus::SignedMessage::sign(
             &joiner_key,
             daemon_vhc_proto::VHC_PROTO_VERSION,
             VhcMessage::CheckpointAttestation(

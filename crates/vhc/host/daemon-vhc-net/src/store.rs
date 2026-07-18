@@ -11,7 +11,7 @@
 //! Retention (§7.4, NET-8): [`FsPayloadStore::prune`] deletes objects older than
 //! `payload_retention_rounds`; a subsequent `get`/`head` of a pruned object is a typed
 //! [`VhcNetError::PayloadMiss`], which the §6.4 stall ladder consumes. The `head` (`stat`) result
-//! is what the [`ReceiptProducer`](crate::receipt::ReceiptProducer) turns into a signed
+//! is what the coordinator-seat receipt producer turns into a signed
 //! `StorageReceipt` (§6.4 I6).
 
 use std::io;

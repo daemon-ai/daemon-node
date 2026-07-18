@@ -7,8 +7,8 @@
 //! blocks of the canonical state (params + `replicated` persistents). The sampling schedule is
 //! derived from the round seed, so every peer hashes the identical blocks and a mismatch means true
 //! divergence (the [`Digest`](crate::messages::Digest) message, §6.4) rather than sampling noise.
-//! Content addressing of artifacts/checkpoints is full blake3 ([`crate::hash`]); xxh3 here is *only*
-//! the cheap per-round comparison digest.
+//! Content addressing of artifacts/checkpoints is full blake3 ([`daemon_vhc_proto::hash`]); xxh3
+//! here is *only* the cheap per-round comparison digest.
 //!
 //! The state is opaque byte ranges at this layer — the host supplies the real tensor bytes later.
 //! Both the schedule and the digest are **pure functions** of `(seed, layout)` (+ the bytes), so the
@@ -16,7 +16,7 @@
 
 use xxhash_rust::xxh3::{xxh3_64_with_seed, Xxh3};
 
-use crate::bytes::{Seed, StateDigest};
+use daemon_vhc_proto::bytes::{Seed, StateDigest};
 
 // Domain-separating salts so the schedule PRNG and the digest hasher are seeded independently.
 const SCHEDULE_SALT: u64 = 0x5761_726d_5363_6864; // "WarmSchd"

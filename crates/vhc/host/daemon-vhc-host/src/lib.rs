@@ -25,6 +25,11 @@
 // `burn` dep pins `ndarray`+`autodiff`); wgpu/cuda ride the same generic seam behind their features.
 pub mod compute;
 // The PERMANENT device probe (decisions D5: "the device probe stays forever").
+/// The whole-run coordinator drive: configure + run `coordinator_quorum.wasm` under the real
+/// driver and route frames to/from it, decoding its round decisions. Harness machinery (the
+/// in-process whole-run suites' seat) — it decodes SDK round schemas, so it rides the `harness`
+/// feature; the production host routes opaque frames only (dep-check-enforced).
+#[cfg(any(test, feature = "harness"))]
 pub mod coordinator;
 pub mod probe;
 pub mod run;

@@ -25,8 +25,9 @@ use daemon_vhc_observe::{
     replay_consensus_from_archive, AttestedHead, ConsensusReplayError, ReplicationPolicy,
     RetentionPolicy,
 };
-use daemon_vhc_proto::{peer_id, to_canonical_vec, Hash, PeerId, SignedMessage, VHC_PROTO_VERSION};
+use daemon_vhc_proto::{peer_id, to_canonical_vec, Hash, PeerId, VHC_PROTO_VERSION};
 use daemon_vhc_sdk_consensus::coordinator::Input;
+use daemon_vhc_sdk_consensus::SignedMessage;
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
 mod common;

@@ -16,12 +16,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::bytes::{Hash, IrohId, PeerId, Seed, Signature, StateDigest};
-use crate::capability::CapabilitySet;
-use crate::error::VhcProtoError;
-use crate::merkle::SetCommitment;
-use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
-use crate::version::VhcProtoVersion;
+use daemon_vhc_proto::bytes::{Hash, IrohId, PeerId, Seed, Signature, StateDigest};
+use daemon_vhc_proto::capability::CapabilitySet;
+use daemon_vhc_proto::error::VhcProtoError;
+use daemon_vhc_proto::merkle::SetCommitment;
+use daemon_vhc_proto::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
+use daemon_vhc_proto::version::VhcProtoVersion;
 
 /// A measured throughput class (§6.3). Boundaries are `daemon-vhc-proto` constants, versioned
 /// with [`VhcProtoVersion`].
@@ -347,7 +347,7 @@ impl SignedMessage {
     /// # Errors
     /// A canonical-CBOR encoding failure ([`VhcProtoError::Codec`]).
     pub fn preimage_bytes(&self) -> Result<Vec<u8>, VhcProtoError> {
-        crate::canonical::to_canonical_vec(&Preimage {
+        daemon_vhc_proto::canonical::to_canonical_vec(&Preimage {
             version: self.version,
             payload: &self.payload,
         })

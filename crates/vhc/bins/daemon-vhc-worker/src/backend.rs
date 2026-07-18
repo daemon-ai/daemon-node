@@ -17,6 +17,31 @@ use daemon_vhc_session::protocol::{Eligibility, Hardware, WorkerCapabilities};
 /// does not spuriously reject on an unprobed number (`u64::MAX / MiB`).
 const UNKNOWN_BUDGET_MB: u64 = u64::MAX / (1 << 20);
 
+/// The role-instance incarnation this worker assesses/joins as. The node-durable incarnation
+/// counter takes over when the node carries the admitted identity into `JoinRun`; until then a
+/// single in-process incarnation per join.
+pub(crate) const RUN_INSTANCE: u64 = 1;
+
+/// Author the complete ABI §2.6 grants document for the run's worker role (§9.4 steps 8/11 hash
+/// pinning — assess and join derive byte-identical copies). Admission authors the truth: the
+/// document enumerates the complete capability surface the module actually links + the genesis
+/// role grant list — the worlds the module imports (incl. `compute@2`/`data@2`), the role's
+/// channel table, custom ops, artifacts, buffer limits, and rate/quota bounds. This replaces the
+/// former hand-rolled `vhc@2`/`net@2`/`sys@2` subset (audit finding: grants inconsistent with
+/// what the trainer uses).
+///
+/// Both assess and join call this with the SAME `(worker, module, genesis role)` inputs, so the
+/// canonical bytes — and the grants hash — match by construction.
+pub(crate) fn derive_grants(
+    worker: &Worker,
+    module: &[u8],
+    role_grants: &daemon_vhc_proto::genesis::RoleGrants,
+) -> Result<Vec<u8>, String> {
+    let linked = daemon_vhc_host::linked_worlds(worker, module)
+        .map_err(|e| format!("linked worlds for grants authoring: {e}"))?;
+    Ok(daemon_vhc_proto::GrantsDoc::author(&linked, role_grants).to_canonical_bytes())
+}
+
 /// The experiment inputs a run resolves to: the worker role's opaque config CBOR + the module
 /// `.wasm`, plus the envelope's per-role blake3 pin when one exists (the ABI §1.3 step-1
 /// verify-before-compile input; `None` under the explicit `DAEMON_TRAIN_MODULE` module-source
@@ -181,7 +206,9 @@ async fn fetch_genesis_artifact(
 /// Resolve the genesis **coordinator role's** module by its pinned artifact hash (the in-process
 /// self-driven join runs the run's real coordinator; consensus never runs outside the
 /// sandboxed, content-addressed module). The `DAEMON_TRAIN_MODULE` override deliberately does
-/// NOT apply here — it substitutes the WORKER module source only.
+/// NOT apply here — it substitutes the WORKER module source only. Only the harness-featured
+/// self-driven join resolves a coordinator module.
+#[cfg(feature = "harness")]
 pub(crate) async fn resolve_coordinator_module(
     env: &daemon_vhc_proto::GenesisEnvelope,
 ) -> Result<Vec<u8>, String> {
@@ -886,7 +913,7 @@ fn assess_module(
     // empty role grant (worlds still covered from the module's imports).
     let default_role = daemon_vhc_proto::genesis::RoleGrants::default();
     let role_grants = envelope_grants.map_or(&default_role, |eg| &eg.grants);
-    let grants = match crate::session::derive_grants(worker, module, role_grants) {
+    let grants = match derive_grants(worker, module, role_grants) {
         Ok(g) => g,
         Err(detail) => {
             return Eligibility {

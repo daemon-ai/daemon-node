@@ -21,7 +21,7 @@
 //! protocol's job and is out of the mint's scope (the mint only decides "authoritative under this
 //! topology, content matches the listed hashes, in listed order").
 
-use daemon_vhc_proto::messages::RecordEntry;
+use crate::messages::RecordEntry;
 use daemon_vhc_proto::{blake3_hash, Hash, PeerId};
 
 use crate::authority::Authorized;

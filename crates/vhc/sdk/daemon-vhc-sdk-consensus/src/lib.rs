@@ -18,11 +18,22 @@
 //! and the dual-compilation identity reference alike. The coordinator's authenticated-dispatch
 //! seam consumes D1's `Authority` surface (the D2 sitting-3 reconciliation).
 //!
-//! wasm32-clean by construction: the dependencies are `daemon-vhc-proto` (wire types + blake3 +
-//! the `verify_sig` crypto primitive) and `serde` (derive, for the canonical-CBOR-serializable
-//! coordinator state), so this crate compiles for guests and hosts alike — the "linked
-//! identically by worker drivers, coordinator drivers, simulator, and replay" property
-//! (architecture §8 authority table).
+//! **The round message schemas live HERE, not in the proto (architecture §7 rule 1).** The
+//! round-vocabulary move relocated the seven round messages + the membership messages ([`messages`]), the
+//! round state-digest schedule ([`digest`]), and the committed-set object ([`record_set`]) out of
+//! `daemon-vhc-proto` into this crate: `daemon-vhc-proto` retains wire *mechanism* only (canonical
+//! CBOR, signing, hashes, merkle commitments, genesis envelope, grants, certificates/revocations),
+//! while the algorithm vocabulary — what a round *is* — belongs to the SDK layer the modules link.
+//! Production host crates must not link this crate (dep-check-enforced): hosts route opaque signed
+//! bytes; only modules (guests), the SDK, and explicitly-exempted harness/oracle tooling decode
+//! these schemas. The CBOR encodings are byte-identical to the pre-move proto encodings (the
+//! `daemon-vhc.cddl` conformance suite moved with the types and still pins them).
+//!
+//! wasm32-clean by construction: the dependencies are `daemon-vhc-proto` (wire mechanism + blake3 +
+//! the `verify_sig` crypto primitive), `serde` (derive, for the canonical-CBOR-serializable
+//! coordinator state), and `xxhash-rust` (the round state digest), so this crate compiles for
+//! guests and hosts alike — the "linked identically by worker drivers, coordinator drivers,
+//! simulator, and replay" property (architecture §8 authority table).
 
 #![forbid(unsafe_code)]
 
@@ -32,6 +43,9 @@ pub mod authority;
 pub mod checkpoint;
 pub mod committed;
 pub mod coordinator;
+pub mod digest;
+pub mod messages;
+pub mod record_set;
 
 pub use assignment::{
     advance_cursor, assign_batches, class_weight, deterministic_shuffle, elect_checkpointer,
@@ -54,3 +68,8 @@ pub use checkpoint::{
 pub use committed::{
     Committed, CommittedItem, HostStaged, MintError, PayloadCheck, PayloadRepr, PayloadSource,
 };
+pub use digest::{
+    derive_schedule, digest_state, digest_with_schedule, DigestSchedule, StateLayout,
+};
+pub use messages::{SignedMessage, VhcMessage};
+pub use record_set::RecordSet;

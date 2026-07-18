@@ -40,8 +40,9 @@ use daemon_vhc_abi::{CandidateDriver, STOP_REASON_RUN_COMPLETE};
 use daemon_vhc_host::run::{start_run, DeliverVerdict, MemorySink, RunConfig, RunIdentity};
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_observe::{CoordinatorSandbox, ReplayError};
-use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, SignedMessage, VhcMessage};
+use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec};
 use daemon_vhc_sdk_consensus::coordinator::CoordinatorState;
+use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 
 /// Frame delivery / drain deadline: a re-derivation that has not drained by here is a sandbox fault.
 const RUN_DEADLINE: Duration = Duration::from_secs(60);

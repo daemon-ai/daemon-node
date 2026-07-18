@@ -50,12 +50,12 @@ use daemon_vhc_host::run::{
     SinkEntry,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
-use daemon_vhc_proto::messages::{
-    Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass, VhcMessage,
-};
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, CertScope, Hash, IrohId, SigningKey,
     StateDigest,
+};
+use daemon_vhc_sdk_consensus::messages::{
+    Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass, VhcMessage,
 };
 
 use crate::send;
@@ -64,30 +64,9 @@ use daemon_vhc_session::identity::certify_existing_key;
 use daemon_vhc_session::keystore::VhcKeystore;
 use daemon_vhc_session::protocol::Event;
 
-/// The self-driven join's role-instance incarnation. The node-durable incarnation counter takes
-/// over when the node carries the admitted identity into `JoinRun`; until then this in-process
-/// seat runs one incarnation per join.
-pub(crate) const RUN_INSTANCE: u64 = 1;
+pub(crate) use crate::backend::RUN_INSTANCE;
 
-/// Author the complete ABI §2.6 grants document for the run's worker role (§9.4 steps 8/11 hash
-/// pinning — assess and join derive byte-identical copies). Admission authors the truth: the
-/// document enumerates the complete capability surface the module actually links + the genesis
-/// role grant list — the worlds the module imports (incl. `compute@2`/`data@2`), the role's
-/// channel table, custom ops, artifacts, buffer limits, and rate/quota bounds. This replaces the
-/// former hand-rolled `vhc@2`/`net@2`/`sys@2` subset (audit finding: grants inconsistent with
-/// what the trainer uses).
-///
-/// Both assess ([`crate::backend`]) and join call this with the SAME `(worker, module, genesis
-/// role)` inputs, so the canonical bytes — and the grants hash — match by construction.
-pub(crate) fn derive_grants(
-    worker: &Worker,
-    module: &[u8],
-    role_grants: &daemon_vhc_proto::genesis::RoleGrants,
-) -> Result<Vec<u8>, String> {
-    let linked = daemon_vhc_host::linked_worlds(worker, module)
-        .map_err(|e| format!("linked worlds for grants authoring: {e}"))?;
-    Ok(daemon_vhc_proto::GrantsDoc::author(&linked, role_grants).to_canonical_bytes())
-}
+pub(crate) use crate::backend::derive_grants;
 
 /// How many rounds the self-driven t2 run drives before a clean stop.
 const T2_ROUNDS: u64 = 2;

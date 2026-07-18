@@ -60,6 +60,10 @@ rustls = { workspace = true, optional = true }
 # `[workspace.dependencies]` entry (daemon-matrix / daemon-egress / daemon-models use it) — adds no
 # new third-party dep and needs no frozen-file change.
 wiremock = { workspace = true }
+# Test-only: the WS/gossip/live suites author + inspect real round messages (the SDK schema layer)
+# to exercise the opaque byte planes. The net LIBRARY never links the schema crates — it carries
+# opaque signed frames (dep-check-enforced); this dev edge is harness authoring only.
+daemon-vhc-sdk-consensus = { workspace = true }
 
 [features]
 # Off by default: the default workspace gate builds no iroh. B2 implements `iroh_gossip.rs`

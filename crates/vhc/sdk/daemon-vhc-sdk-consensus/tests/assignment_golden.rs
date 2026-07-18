@@ -8,8 +8,8 @@
 //! LCG/shuffle output so any future change to the assignment math is a visible, deliberate break.
 
 use daemon_vhc_proto::envelope::GlobalBatch;
-use daemon_vhc_proto::messages::{BatchWindow, ThroughputClass};
 use daemon_vhc_proto::{PeerId, Seed};
+use daemon_vhc_sdk_consensus::messages::{BatchWindow, ThroughputClass};
 use daemon_vhc_sdk_consensus::{
     advance_cursor, assign_batches, deterministic_shuffle, global_batch_at, seeded_lcg,
     select_committee, witness_quorum, Lcg, ASSIGN_SALT, WITNESS_SALT,

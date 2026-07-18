@@ -11,17 +11,18 @@
 //!
 //! This type is that object. It is **canonical CBOR of the sorted entries**; its blake3 content hash
 //! is the locator hash, and [`RecordSet::commitment`] reproduces exactly the
-//! [`SetCommitment`](crate::merkle::SetCommitment) the `RoundRecord` signs, so
+//! [`SetCommitment`](daemon_vhc_proto::merkle::SetCommitment) the `RoundRecord` signs, so
 //! [`RecordSet::verify_against`] is an exact (non-probabilistic) membership guarantee. Entries are
 //! ordered by node public-key bytes then payload hash (invariant I3), matching `commit_set`.
 
 use serde::{Deserialize, Serialize};
 
-use crate::bytes::{Hash, PeerId};
-use crate::canonical::{from_canonical_slice, to_canonical_vec};
-use crate::error::VhcProtoError;
-use crate::hash::blake3_hash;
-use crate::merkle::{commit_set, SetCommitment};
+use daemon_vhc_proto::bytes::{Hash, PeerId};
+use daemon_vhc_proto::canonical::{from_canonical_slice, to_canonical_vec};
+use daemon_vhc_proto::error::VhcProtoError;
+use daemon_vhc_proto::hash::blake3_hash;
+use daemon_vhc_proto::merkle::{commit_set, SetCommitment};
+
 use crate::messages::RecordEntry;
 
 /// The committed-set object a `RoundRecord`'s root signs (`record-set.cbor`, §11.3).
