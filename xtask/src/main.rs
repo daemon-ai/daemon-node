@@ -119,13 +119,13 @@ enum Cmd {
         /// The run id whose prefix the object lives under (`runs/<run>/modules/…`).
         #[arg(long)]
         run: String,
-        /// The coordinator presign base (e.g. `https://…/api/v1/swarm`).
+        /// The coordinator presign base (e.g. `https://…/api/v1/vhc`).
         #[arg(long)]
         presign_base: String,
-        /// `swarm:*`-scoped bearer token (gateway path).
+        /// `vhc:*`-scoped bearer token (gateway path).
         #[arg(long)]
         bearer: Option<String>,
-        /// Internal identity org id (direct-to-`apps/swarm` dev path; pair with `--actor`).
+        /// Internal identity org id (direct-to-`apps/vhc` dev path; pair with `--actor`).
         #[arg(long)]
         org: Option<String>,
         /// Internal identity actor (pair with `--org`).
@@ -143,7 +143,7 @@ enum Cmd {
         /// The coordinator presign base.
         #[arg(long)]
         presign_base: String,
-        /// `swarm:*`-scoped bearer token (gateway path).
+        /// `vhc:*`-scoped bearer token (gateway path).
         #[arg(long)]
         bearer: Option<String>,
         /// Internal identity org id (pair with `--actor`).

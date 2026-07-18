@@ -212,7 +212,7 @@ fn vhc_requests_validate() {
 fn vhc_responses_validate() {
     let detail = VhcRunDetail {
         summary: summary(true, Some(policy(VhcPolicyMode::Idle, None))),
-        coordinator: "https://api.daemon.ai/api/v1/swarm".into(),
+        coordinator: "https://api.daemon.ai/api/v1/vhc".into(),
         contribution: contribution(),
         recent_events: all_events(),
     };
