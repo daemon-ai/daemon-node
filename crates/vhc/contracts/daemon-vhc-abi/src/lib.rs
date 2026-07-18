@@ -780,6 +780,10 @@ pub const STOP_REASON_OWNER_POLICY: u64 = 3;
 pub const QUIESCE_REASON_UPGRADE: u64 = 0;
 /// `quiesce-reason` 1: a throttle drain (ABI §4.4, §11.3).
 pub const QUIESCE_REASON_THROTTLE: u64 = 1;
+/// `quiesce-reason` 2: a graceful-leave drain (ABI §4.4): owner intent ends the role instance;
+/// the module snapshots at the fence and the session persists the capture as the leave
+/// checkpoint before the instance ends.
+pub const QUIESCE_REASON_LEAVE: u64 = 2;
 
 // -- `payload-meta.kind` staged-kinds (ABI §4.2) --------------------------------------------------
 

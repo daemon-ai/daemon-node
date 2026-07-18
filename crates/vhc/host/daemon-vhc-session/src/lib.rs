@@ -34,6 +34,7 @@ pub mod data;
 pub mod identity;
 pub mod keystore;
 pub mod protocol;
+pub mod role_session;
 pub mod seam;
 
 /// The typed checkpoint manager (save/load/attest/resync) — it decodes SDK round schemas
@@ -103,6 +104,7 @@ pub use data::{
 };
 #[cfg(any(test, feature = "harness"))]
 pub use engine::{EngineConfig, EngineEvent, RoundEngine, RunOutcome};
+pub use role_session::{spawn_role, RoleHandle, RoleProviders, RoleSessionSpec, ThrottleLevel};
 pub use seam::BatchId;
 
 /// Errors surfaced by the participant runtime.
