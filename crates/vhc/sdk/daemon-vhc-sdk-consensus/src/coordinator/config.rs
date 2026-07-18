@@ -3,19 +3,17 @@
 
 //! The coordinator's resolved run configuration (spec §6.1/§6.2).
 //!
-//! [`RunConfig`] is the coordination-consumed projection of the frozen run envelope (§4.3 seam rule:
-//! `[run]`/`[data]`/`[phases]`/`[requirements].capabilities` only — never `[experiment.config]`),
-//! plus the coordinator-only knobs the envelope does not carry ([`CoordinatorParams`]). It is part of
+//! [`RunConfig`] is the coordination-consumed run schedule/membership shape, authored directly by
+//! the run author as the coordinator module's opaque config (a genesis envelope v2 carries it
+//! verbatim inside the coordinator role's `{state: CoordinatorState}` — the host never interprets
+//! it, §4.3 seam rule), plus the coordinator-only knobs ([`CoordinatorParams`]). It is part of
 //! [`crate::CoordinatorState`] and therefore canonical-CBOR-serializable (the replay foundation,
 //! PROTO-20).
 
 use crate::assignment::WITNESS_TARGET_DEFAULT;
-use daemon_vhc_proto::canonical::to_canonical_vec;
-use daemon_vhc_proto::envelope::{Envelope, GlobalBatch, StopCondition};
-use daemon_vhc_proto::{blake3_hash, CapabilitySet, Hash, PeerId, SwarmProtoVersion};
+use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
+use daemon_vhc_proto::{CapabilitySet, Hash, PeerId, SwarmProtoVersion};
 use serde::{Deserialize, Serialize};
-
-use crate::coordinator::CoordinatorError;
 
 /// Default K record-absences before a peer is dropped (§6.4 daemon Delta; TDD PROTO-7).
 pub const K_ABSENCES_DEFAULT: u32 = 3;
@@ -99,45 +97,4 @@ pub struct RunConfig {
     pub verification_percent: u32,
     /// Principals authorized to pause/resume (coordinator-only).
     pub authorized: Vec<PeerId>,
-}
-
-impl RunConfig {
-    /// Project a resolved [`Envelope`] + coordinator params into a [`RunConfig`].
-    ///
-    /// The `envelope_hash` is recomputed from the envelope's canonical CBOR (blake3), byte-identical
-    /// to [`daemon_vhc_proto::FrozenEnvelope::hash`]. Fails if the envelope is invalid (§6.1) or a
-    /// capability token is malformed.
-    pub fn from_envelope(
-        env: &Envelope,
-        params: CoordinatorParams,
-    ) -> Result<Self, CoordinatorError> {
-        env.validate()?;
-        let bytes = to_canonical_vec(env)?;
-        let envelope_hash = blake3_hash(&bytes);
-        let required_capabilities =
-            CapabilitySet::from_tokens(env.requirements.capabilities.iter())?;
-        Ok(Self {
-            run_id: env.run.run_id.clone(),
-            proto_version: daemon_vhc_proto::SWARM_PROTO_VERSION,
-            envelope_hash,
-            required_capabilities,
-            min_peers: env.run.min_peers,
-            max_peers: env.run.max_peers,
-            warmup_s: u64::from(env.phases.warmup),
-            round_train_max_s: u64::from(env.phases.round_train_max),
-            round_witness_s: u64::from(env.phases.round_witness),
-            cooldown_s: u64::from(env.phases.cooldown),
-            epoch_rounds: u64::from(env.phases.epoch_rounds),
-            stall_rounds_max: env.phases.stall_rounds_max,
-            global_batch: env.data.global_batch,
-            stop: env.data.stop,
-            steps_per_round: env.data.steps_per_round,
-            seq_len: params.seq_len,
-            witness_target: params.witness_target,
-            overlap_bps: params.overlap_bps,
-            k_absences: params.k_absences,
-            verification_percent: params.verification_percent,
-            authorized: params.authorized,
-        })
-    }
 }

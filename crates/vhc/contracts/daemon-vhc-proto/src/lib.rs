@@ -3,7 +3,8 @@
 
 //! `daemon-vhc-proto` — the swarm-training wire contract (**algorithm-free from D0**).
 //!
-//! Canonical CBOR codec, run-envelope schemas (v1 + the D0 genesis v2) + freeze/verify,
+//! Canonical CBOR codec, the genesis (schema-2) run envelope + freeze/verify (the retired v1
+//! envelope form survives only as the outer schema-major read that types its refusal),
 //! capability-set admission, merkle set commitments, the seven round messages + their CDDL, the
 //! round state-digest schedule, and the [`SwarmProtoVersion`]. This crate is the single authority
 //! for the swarm wire shapes shared by the host, the participant runtime, and the (wasm32)
@@ -50,9 +51,7 @@ pub use crypto::{
     VERIFY_SIGNATURE_LEN,
 };
 pub use digest::{derive_schedule, digest_state, DigestSchedule, StateLayout};
-pub use envelope::{
-    DeviceMinimums, Envelope, FrozenEnvelope, SignedEnvelope, ENVELOPE_SCHEMA_MAJOR,
-};
+pub use envelope::{DeviceMinimums, SignedEnvelope};
 pub use error::SwarmProtoError;
 pub use genesis::{
     peek_schema, BufferReq, ChannelDecl, ControlTransport, EventCap, EventCaps, FrozenGenesis,

@@ -31,10 +31,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use ciborium::value::Value;
-use daemon_vhc_proto::envelope::{
-    Access, Artifact, DataSection, Envelope, ExperimentSection, GlobalBatch, Phases, Requirements,
-    RoundMode, RunSection, StopCondition, ENVELOPE_SCHEMA_MAJOR,
-};
+use daemon_vhc_proto::envelope::Access;
 use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey};
 
 use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
@@ -396,74 +393,23 @@ fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
     to_canonical_vec(&wire).expect("wire")
 }
 
-/// A real signed schema-major-1 run envelope for `module` — the RETIRED v1 form, authored here
-/// only as the typed-refusal pin's input (`EnvelopeSchemaRetired` at assess).
-fn signed_envelope_wire(run_id: &str, config: Value) -> Vec<u8> {
-    let mut artifacts = BTreeMap::new();
-    artifacts.insert(
-        "experiment.wasm".to_string(),
-        Artifact {
-            url: "file:///dev/null".into(),
-            blake3: Hash([1; 32]),
-        },
-    );
-    artifacts.insert(
-        "data.manifest".to_string(),
-        Artifact {
-            url: "file:///dev/null".into(),
-            blake3: Hash([2; 32]),
-        },
-    );
-    let env = Envelope {
-        run: RunSection {
-            schema: ENVELOPE_SCHEMA_MAJOR,
-            run_id: run_id.to_string(),
-            min_peers: 1,
-            max_peers: 4,
-            access: Access::Org,
-        },
-        experiment: ExperimentSection {
-            module: "experiment.wasm".to_string(),
-            abi: "tensor-abi@1".to_string(),
-            config,
-        },
-        artifacts,
-        data: DataSection {
-            manifest: "data.manifest".to_string(),
-            steps_per_round: 2,
-            global_batch: GlobalBatch {
-                start: 2,
-                end: 2,
-                ramp_rounds: 1,
-            },
-            stop: StopCondition::Rounds(4),
-        },
-        requirements: Requirements {
-            vram_mb_min: 0,
-            ram_gb_min: 0,
-            uplink_mbps_min: 0,
-            downlink_mbps_min: 0,
-            disk_gb_min: 0,
-            throughput_floor: "c1".to_string(),
-            update_mb_max: 64,
-            capabilities: Vec::new(),
-            payload_store: "r2".to_string(),
-        },
-        phases: Phases {
-            round_mode: RoundMode::Barrier,
-            warmup: 1,
-            round_train_max: 60,
-            round_witness: 1,
-            cooldown: 1,
-            epoch_rounds: 0,
-            checkpoint_every_epochs: 0,
-            stall_rounds_max: 2,
-            payload_retention_rounds: 8,
-        },
+/// A signed wire whose payload is a SYNTHETIC schema-major-1 envelope — the RETIRED v1 form,
+/// authored here only as the typed-refusal pin's input (`EnvelopeSchemaRetired` at assess). The
+/// refusal is decided by the outer `[run].schema` read alone, before any signature or payload
+/// consideration, so the pin needs no retired v1 payload machinery: a canonical-CBOR map carrying
+/// `[run].schema = 1` inside the `SignedEnvelope` transport wrapper is the complete input.
+fn signed_envelope_wire(run_id: &str) -> Vec<u8> {
+    let run = Value::Map(vec![
+        (Value::from("schema"), Value::from(1u32)),
+        (Value::from("run_id"), Value::from(run_id)),
+    ]);
+    let envelope = Value::Map(vec![(Value::from("run"), run)]);
+    let wire = daemon_vhc_proto::SignedEnvelope {
+        bytes: to_canonical_vec(&envelope).expect("envelope cbor"),
+        signature: daemon_vhc_proto::Signature([0u8; 64]),
+        signer: daemon_vhc_proto::peer_id(&SigningKey::from_bytes(&[0xA1u8; 32])),
     };
-    let author = SigningKey::from_bytes(&[0xA1u8; 32]);
-    let frozen = env.freeze(&author).expect("freeze envelope");
-    to_canonical_vec(&frozen.to_wire()).expect("encode signed envelope")
+    to_canonical_vec(&wire).expect("encode signed envelope")
 }
 
 fn supervisor_for(module: &Path) -> TrainSupervisor {
@@ -614,7 +560,7 @@ async fn v1_envelope_assess_is_refused_envelope_schema_retired() {
     let sup = supervisor_for(&module);
 
     let err = sup
-        .assess(signed_envelope_wire("retired-v1-form", v2_guest_config()))
+        .assess(signed_envelope_wire("retired-v1-form"))
         .await
         .expect_err("a schema-1 envelope must refuse at assess");
     assert!(

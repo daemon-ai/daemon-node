@@ -3,9 +3,10 @@
 
 //! The **genesis envelope v2** — the D0 schema migration (architecture §5.1; refactor §8/D0).
 //!
-//! This is an **additive** schema that lives beside the frozen v1 [`crate::envelope::Envelope`]
-//! (schema major 1), which is untouched. A genesis envelope is `[run].schema == 2` and carries
-//! **mechanism only** (architecture §5.1):
+//! The genesis envelope (`[run].schema == 2`) is the ONLY resolvable run description — the
+//! schema-major-1 (v1) envelope form is retired and meets a typed refusal decided by the outer
+//! schema-major read alone ([`peek_schema`]). A genesis envelope carries **mechanism only**
+//! (architecture §5.1):
 //!
 //! - **role set** — `{role → (lane selector, module blake3, opaque config, grant list)}`
 //!   ([`RoleEntry`]). Roles are envelope-level labels the host never interprets beyond the lane
@@ -45,8 +46,8 @@ use crate::hash::blake3_hash;
 use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
 
 /// The genesis-envelope schema major this build understands (architecture §5.1; the v2 cell of the
-/// ratified mixed-fleet matrix — decisions D3). Distinct from the v1
-/// [`crate::envelope::ENVELOPE_SCHEMA_MAJOR`] (`1`).
+/// ratified mixed-fleet matrix — decisions D3). Distinct from the retired v1 schema major (`1`),
+/// whose only surviving trace is the typed refusal keyed off the outer schema read.
 pub const GENESIS_SCHEMA_MAJOR: u32 = 2;
 
 /// A control-plane transport a run may bring up (architecture §2 — "the envelope declares which
@@ -398,8 +399,8 @@ pub struct FrozenGenesis {
 
 impl FrozenGenesis {
     /// Reconstruct from bytes received over the wire, verifying the signature. The canonical form
-    /// is re-derived so a peer never trusts a supplied hash (`FrozenEnvelope::open` discipline —
-    /// the hash is always over the received bytes).
+    /// is re-derived so a peer never trusts a supplied hash (the hash is always recomputed over
+    /// the received bytes).
     pub fn open(
         bytes: Vec<u8>,
         signature: Signature,
@@ -479,10 +480,10 @@ impl FrozenGenesis {
 }
 
 /// Peek at the `[run].schema` major of a frozen envelope's raw bytes **without** committing to a
-/// typed decode — the schema sniff the dual-driver worker and the node use to route a run to the
-/// v1 vs v2 path and to enforce the ratified mixed-fleet matrix refusals (decisions D3: a v1
-/// driver under envelope v2 is a typed refusal, and vice versa). Returns `None` if the bytes are
-/// not a CBOR map or carry no integer `schema` key.
+/// typed decode — the outer schema-major read every configuration seat routes on: schema 2
+/// resolves as a genesis envelope; any other major (notably the retired schema-1 form) meets a
+/// typed refusal with no payload decode. Returns `None` if the bytes are not a CBOR map or carry
+/// no integer `schema` key.
 #[must_use]
 pub fn peek_schema(bytes: &[u8]) -> Option<u32> {
     let v: ciborium::value::Value = ciborium::de::from_reader(bytes).ok()?;
@@ -605,9 +606,21 @@ mod tests {
     }
 
     #[test]
-    fn schema_sniff_distinguishes_v1_and_v2() {
+    fn schema_sniff_distinguishes_retired_v1_from_genesis() {
         let frozen = sample().freeze(&key()).unwrap();
         assert_eq!(peek_schema(frozen.bytes()), Some(GENESIS_SCHEMA_MAJOR));
+        // The retired v1 form is detected by the outer schema-major read alone: a synthetic
+        // canonical-CBOR map carrying `[run].schema = 1` sniffs as major 1 — the input every
+        // typed schema-retired refusal keys on, with no v1 payload machinery involved.
+        let run = ciborium::value::Value::Map(vec![(
+            ciborium::value::Value::Text("schema".into()),
+            ciborium::value::Value::from(1u32),
+        )]);
+        let v1 =
+            ciborium::value::Value::Map(vec![(ciborium::value::Value::Text("run".into()), run)]);
+        let bytes = crate::to_canonical_vec(&v1).unwrap();
+        assert_eq!(peek_schema(&bytes), Some(1));
+        assert_eq!(peek_schema(b"not cbor"), None);
     }
 
     #[test]

@@ -247,24 +247,24 @@ fn cell7_v2_worker_wasm_coordinator_envelope_v1_refused_typed() {
 
 // -- cell 4: v1 worker × wasm coordinator × envelope v2 — REFUSED, typed ---------------------------
 
-/// Cell 4: the v1 five-phase driver's config source is the v1 envelope's `[data]`/`[phases]`,
-/// which the genesis schema does not carry (they became opaque module config at D0). The v1
-/// opener refuses genesis bytes with a typed error, and the schema sniff routes v2 away from the
-/// v1 path — never a silent misparse.
+/// The remaining v1-worker cell: a v1 worker module under a wasm coordinator and envelope v2.
+/// The worker axis is refused typed at driver selection (`AbiUnsupportedMajor` — no v1 driver
+/// exists), while the same genesis envelope configures the wasm coordinator fine: the refusal is
+/// strictly the worker's. (The retired v1 envelope OPENER this cell also used to exercise is
+/// gone with the v1 envelope machinery — schema routing is the outer schema-major read, pinned
+/// by the envelope-v1 cells above.)
 #[test]
 fn cell4_v1_worker_wasm_coordinator_envelope_v2_refused_typed() {
-    // The worker-module axis: v1 — refused typed at driver selection since the Phase-E sunset
-    // (pre-sunset this asserted `CandidateDriver::V1` selection; the cell stays refused, now
-    // doubly: unsupported worker major AND the v1 opener refusing genesis bytes below). The v1
-    // worker module is synthetic (hand-assembled in-test), not a vendored/recorded fixture.
+    // The worker-module axis: a synthetic ABI-major-1 module (hand-assembled in-test, never a
+    // vendored/recorded fixture) is refused typed at driver selection.
     let v1_worker = synthetic_v1_worker_module();
     let engine = Worker::new(EngineConfig::default()).expect("engine");
     let hash = *blake3::hash(&v1_worker).as_bytes();
-    let refusal = select_driver(&engine, &v1_worker, Some(&hash))
-        .expect_err("the v1 worker axis is refused post-sunset");
+    let refusal =
+        select_driver(&engine, &v1_worker, Some(&hash)).expect_err("the v1 worker axis is refused");
     assert_eq!(refusal.code, AbiRefusalCode::AbiUnsupportedMajor);
 
-    // A well-formed genesis envelope v2 (the same authoring the cell-8 positive uses).
+    // A well-formed genesis envelope v2 (the same authoring the whole-run positive uses).
     let coordinator = guest_wasm("coordinator_quorum");
     let coord_hash = Hash(*blake3::hash(&coordinator).as_bytes());
     let author = SigningKey::from_bytes(&[0x11u8; 32]);
@@ -279,19 +279,10 @@ fn cell4_v1_worker_wasm_coordinator_envelope_v2_refused_typed() {
     );
     let frozen = genesis.freeze(&author).expect("genesis freeze");
 
-    // The schema sniff routes the run AWAY from the v1 path (the dual-driver worker's gate).
+    // The schema read recognizes the genesis form...
     assert_eq!(peek_schema(frozen.bytes()), Some(GENESIS_SCHEMA_MAJOR));
-
-    // And the v1 envelope opener REFUSES the genesis bytes typed — the v1 driver's config source
-    // cannot exist under envelope v2 (cells 2/4, decisions D3).
-    let sig = *frozen.signature();
-    let signer = *frozen.signer();
-    let err = daemon_vhc_proto::FrozenEnvelope::open(frozen.bytes().to_vec(), sig, signer)
-        .expect_err("the v1 opener must refuse a genesis envelope");
-    let msg = err.to_string();
-    assert!(!msg.is_empty(), "typed SwarmProtoError refusal, got: {msg}");
-
-    // The wasm coordinator, by contrast, configures fine from the same envelope — the refusal is
-    // strictly the v1 worker's, which is what makes this cell 4 and not cell 3/7.
+    // ...and the wasm coordinator configures fine from the same envelope — the refusal is
+    // strictly the v1 worker's, which is what makes this the v1-worker cell and not an
+    // envelope-v1 cell.
     configure_wasm_coordinator(&frozen).expect("coordinator side is configurable under v2");
 }

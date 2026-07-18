@@ -387,8 +387,8 @@ pub fn admit_v2(
     // envelope fixture is GREEN (`daemon-vhc-proto/tests/cell5_envelope.rs` — old-reader open,
     // bytes/hash end-to-end, decode→re-freeze strip canary), so cell 5 is **interim-supported**
     // and the additive `device_min` section is consumed here. The section is parsed from the RAW
-    // frozen bytes at the CBOR-value level (`FrozenEnvelope::device_min`), never via the typed
-    // `Envelope` (which silently drops unknown keys — the proviso-3 trap). An envelope may only
+    // frozen bytes at the CBOR-value level, never via a typed envelope decode (which would
+    // silently drop unknown keys — the proviso-3 trap). An envelope may only
     // TIGHTEN the lane floor (§9.5): each present field refuses below its minimum; absent fields
     // constrain nothing. Mandatory per-role minimums arrive with the D0 genesis schema.
     if let Some(min) = envelope_min {
