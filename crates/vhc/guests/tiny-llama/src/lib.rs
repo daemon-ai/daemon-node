@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `tiny-llama` — the **re-authored** reference worker module (Phase C, track C3; refactor §7
-//! "models leave the SDK": `models::TinyLlama` becomes a real Burn model in the guest).
+//! `tiny-llama` — the reference worker training module: `models::TinyLlama`, formerly an
+//! SDK-hosted stand-in, re-authored here as a real Burn model that runs inside the guest.
 //!
 //! The model ([`model::TinyLlamaModel`]) is ordinary Burn over `Autodiff<HostBackend>`: every tensor op
 //! crosses `compute@2` as `CBOR(burn_ir::OperationIr)`; the autodiff tape walks guest-side with
