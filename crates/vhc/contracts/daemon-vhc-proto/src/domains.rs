@@ -20,7 +20,7 @@
 //!   scheme forever; the new scheme gets a new string.
 //! - **MINOR**/**PATCH** exist for completeness of the SemVer format; a change that would
 //!   only warrant a minor/patch bump of an API is still a *different derivation* here, so in
-//!   practice bumps are MAJOR. They stay `0.0` until a ruling says otherwise.
+//!   practice bumps are MAJOR. They stay `0.0` unless the spec defines a compatible revision.
 //!
 //! Consumers MUST reference these constants — never inline a domain string at a call site.
 //! (The ABI-major-anchored wire domains — `daemon-vhc/frame/2`, `daemon-vhc/cert/2`,
