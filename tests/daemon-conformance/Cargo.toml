@@ -65,7 +65,7 @@ tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 rcgen = "0.13"
 tempfile = "3"
-# W10 semantic_search conformance: the workspace embedding index + the tool, driven MockEmbedder-
+# semantic_search conformance: the workspace embedding index + the tool, driven MockEmbedder-
 # backed over a seeded temp workspace. Test-only.
 daemon-workspace-index = { workspace = true }
 daemon-tool-semantic-search = { workspace = true }

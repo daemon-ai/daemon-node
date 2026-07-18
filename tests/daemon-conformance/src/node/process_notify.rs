@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! THE W3 NOTIFY GATE: `NodeApiImpl::inject_session_input` — the seam background-process exit /
+//! THE PROCESS-NOTIFY GATE: `NodeApiImpl::inject_session_input` — the seam background-process exit /
 //! watch notifications ride into their owning session — works across **both** session lifecycles:
 //!
 //! - a **live** (actor-resident) session takes a real `StartTurn` and runs a reactive turn
@@ -9,7 +9,7 @@
 //!   so the notification must StartTurn);
 //! - a **durable** (activation-lifecycle) session — which `SessionApi::submit` rejects under the
 //!   one-lifecycle-owner guard-rail — receives a durable pending input + wake; the incarnation
-//!   drains it into the conversation at hydrate (the seam W7's child messaging reuses);
+//!   drains it into the conversation at hydrate (the seam child messaging reuses);
 //! - a **settled** durable session drops the input (its owner is gone) instead of erroring or
 //!   resurrecting the session.
 

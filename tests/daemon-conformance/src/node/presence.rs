@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! W2-F saved-presence wire surface, end-to-end through the real `daemon_node::assemble` composition
+//! Saved-presence wire surface, end-to-end through the real `daemon_node::assemble` composition
 //! root: `PresenceList` / `PresenceSave` / `PresenceSetActive` / `PresenceDelete` over both the
 //! in-process trait and the Unix-socket round-trip (transport parity), proving the host
 //! `PresenceManager` is wired and the CBOR shapes ride the wire.
