@@ -67,7 +67,7 @@ use daemon_vhc_session::protocol::Event;
 /// The self-driven join's role-instance incarnation. The node-durable incarnation counter takes
 /// over when the node carries the admitted identity into `JoinRun`; until then this in-process
 /// seat runs one incarnation per join.
-const RUN_INSTANCE: u64 = 1;
+pub(crate) const RUN_INSTANCE: u64 = 1;
 
 /// Author the complete ABI §2.6 grants document for the run's worker role (§9.4 steps 8/11 hash
 /// pinning — assess and join derive byte-identical copies). Admission authors the truth: the

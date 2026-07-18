@@ -66,6 +66,9 @@ pub enum VhcError {
     /// The vhc service is disabled (`[vhc] enabled = false`).
     #[error("vhc is disabled")]
     Disabled,
+    /// An internal invariant failure (e.g. canonical-CBOR encode of the admitted tuple).
+    #[error("internal: {0}")]
+    Internal(String),
 }
 
 impl VhcError {
@@ -609,7 +612,8 @@ impl VhcService {
 
     fn event_run_id(&self, ev: &protocol::Event) -> Option<String> {
         match ev {
-            protocol::Event::RunPhase { run_id, .. } => Some(run_id.clone()),
+            protocol::Event::RunPhase { run_id, .. }
+            | protocol::Event::AdmittedTupleMismatch { run_id, .. } => Some(run_id.clone()),
             protocol::Event::RoundProgress { .. }
             | protocol::Event::RoundOutcome { .. }
             | protocol::Event::Metric { .. }
@@ -648,7 +652,7 @@ impl VhcService {
         &self,
         worker: &Arc<dyn WorkerControl>,
         run_id: &str,
-    ) -> Result<(String, VhcEligibility), VhcError> {
+    ) -> Result<(String, VhcEligibility, Option<Vec<u8>>), VhcError> {
         if let Some(discovery) = &self.discovery {
             let run = discovery
                 .get_run(run_id)
@@ -656,7 +660,10 @@ impl VhcService {
                 .ok_or_else(|| VhcError::Discovery(format!("run {run_id} not found")))?;
             let envelope = discovery.fetch_envelope(run_id).await?;
             let verdict = worker.assess(envelope).await?;
-            Ok((run.coordinator, eligibility_from_assess(&verdict)))
+            // Stamp the node-owned revisions into the immutable admitted tuple (architecture
+            // §6.3) and carry its canonical-CBOR bytes for durable persistence beside the intent.
+            let tuple = self.stamp_admitted_tuple(verdict.admitted_tuple.clone())?;
+            Ok((run.coordinator, eligibility_from_assess(&verdict), tuple))
         } else {
             let coordinator = self.coordinator();
             let eligibility = match worker.probe().await {
@@ -667,8 +674,25 @@ impl VhcService {
                     headroom: BTreeMap::new(),
                 },
             };
-            Ok((coordinator, eligibility))
+            Ok((coordinator, eligibility, None))
         }
+    }
+
+    /// Stamp the node-owned device-profile / owner-policy revisions into an assessed admitted
+    /// tuple and return its canonical-CBOR bytes for durable persistence (architecture §6.3).
+    /// `None` in ⇒ `None` out (an ineligible assessment admitted nothing).
+    fn stamp_admitted_tuple(
+        &self,
+        tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
+    ) -> Result<Option<Vec<u8>>, VhcError> {
+        let Some(mut tuple) = tuple else {
+            return Ok(None);
+        };
+        tuple.device_profile_rev = self.store.counter("device_profile_rev")?;
+        tuple.owner_policy_rev = self.store.counter("owner_policy_rev")?;
+        Ok(Some(protocol::encode(&tuple).map_err(|e| {
+            VhcError::Internal(format!("admitted tuple encode: {e}"))
+        })?))
     }
 }
 
@@ -731,7 +755,7 @@ impl VhcApi for VhcService {
         // and take the coordinator endpoint from discovery. With no discovery configured, fall back
         // to the probe-based eligibility against the allowlisted coordinator (offline / no-registry
         // path). Either way the persisted eligibility is node-computed — the app never re-derives it.
-        let (coordinator, eligibility) = self
+        let (coordinator, eligibility, admitted_tuple) = self
             .resolve_join(&worker, &run_id)
             .await
             .map_err(|e| e.to_api())?;
@@ -803,6 +827,11 @@ impl VhcApi for VhcService {
         let _ = self
             .store
             .set_execution_identity(&run_id, id.epoch, &id.role, id.instance);
+        // Persist the immutable admitted tuple beside the durable join intent (architecture §6.3),
+        // so a restart re-converges against the exact assessed identity.
+        if let Some(tuple) = &admitted_tuple {
+            let _ = self.store.set_admitted_tuple(&run_id, tuple);
+        }
 
         // A3: join over the streaming path + pump the continuous worker event stream into
         // `handle_worker_event` so vhc.db reflects live round progression (§10.3/§10.4). The
@@ -1095,6 +1124,11 @@ fn translate(ev: &protocol::Event, run_id: &str) -> Option<VhcEvent> {
             run_id: run_id.to_string(),
             class: format!("{class:?}"),
             detail: detail.clone(),
+        }),
+        protocol::Event::AdmittedTupleMismatch { field, .. } => Some(VhcEvent::Warning {
+            run_id: run_id.to_string(),
+            class: "admitted_tuple_mismatch".to_string(),
+            detail: format!("join aborted: admitted tuple field `{field}` changed; reassessing"),
         }),
         _ => None,
     }
