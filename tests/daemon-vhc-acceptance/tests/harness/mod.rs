@@ -42,6 +42,15 @@ const CONTROL_CHANNEL: u64 = 0;
 /// builds `daemon` + `daemon-vhc-worker` before the suite runs). Walks up from the test
 /// executable to the profile dir (the parent of `deps/`) and expects `<profile>/<name>`.
 pub fn locate_bin(name: &str) -> PathBuf {
+    // An explicit override (the xtask acceptance lane builds the node + worker in RELEASE — debug
+    // wasmtime compilation of the ~1 MB trainer module can exceed the supervisor's assess
+    // watchdog — and points the suite at them).
+    if let Some(dir) = std::env::var_os("VHC_ACCEPTANCE_BIN_DIR") {
+        let p = PathBuf::from(dir).join(name);
+        if p.is_file() {
+            return p;
+        }
+    }
     let exe = std::env::current_exe().expect("test executable path");
     // .../target/<profile>/deps/<test>-<hash>  →  .../target/<profile>
     let profile_dir = exe
@@ -331,20 +340,22 @@ pub async fn recent_events(node: &Node, run_id: &str) -> Vec<VhcEvent> {
 /// wait loudly (never a silent drop).
 pub async fn wait_rounds(node: &Node, run_id: &str, rounds: u64, timeout: Duration) -> u64 {
     let deadline = Instant::now() + timeout;
-    let mut best = 0u64;
     loop {
         for ev in recent_events(node, run_id).await {
-            match ev {
-                VhcEvent::RoundOutcome { round, .. } => best = best.max(round + 1),
-                VhcEvent::Error { class, detail, .. } => {
-                    panic!(
-                        "node `{}` run `{run_id}` errored: {class}: {detail}",
-                        node.name
-                    )
-                }
-                _ => {}
+            if let VhcEvent::Error { class, detail, .. } = ev {
+                panic!(
+                    "node `{}` run `{run_id}` errored: {class}: {detail}",
+                    node.name
+                )
             }
         }
+        // Progress is read from the durable journal (the product-path oracle): the highest
+        // round this node voiced a tag-4 det digest for. The node's `RoundOutcome` app event is
+        // not emitted on the opaque live path, so the journal is the truth.
+        let best = journal_digests(node, run_id)
+            .keys()
+            .last()
+            .map_or(0, |r| r + 1);
         if best >= rounds {
             return best;
         }
@@ -354,7 +365,7 @@ pub async fn wait_rounds(node: &Node, run_id: &str, rounds: u64, timeout: Durati
                 node.name
             );
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
