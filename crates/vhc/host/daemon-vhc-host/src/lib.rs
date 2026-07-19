@@ -37,7 +37,10 @@ pub mod runtime;
 pub mod select;
 pub mod trap;
 
-pub use compute::{unservable_op, ComputeError, ComputeRunner, HostReal};
+pub use compute::{
+    backend_available, unservable_op, ComputeError, ComputeRunner, DeviceComputeGuard, HostCompute,
+    HostReal,
+};
 #[cfg(feature = "cuda")]
 pub use probe::cuda_adapter_available;
 #[cfg(feature = "wgpu")]
