@@ -23,12 +23,14 @@
 //     recorded golden theta within the `OpClass::Optimizer` band.
 //
 // Tiers: cpu + burn-ndarray run here; wgpu + cuda are hardware-gated feature variants (the
-// parity skip-if-no-hardware convention). NOTE (this commit): the compute@2 host execution
-// backend is the ndarray `ComputeRunner` regardless of `EngineConfig.backend` (the driver wires
-// no GPU compute runner yet — that lands with the GPU/CUDA workstream). The det digest is
-// backend-independent, so the cpu and burn-ndarray tiers reproduce it identically; the wgpu/cuda
-// tiers exercise the compute@2 kernels on the device through the op-journal replay seam (the same
-// mechanism as `compute_replay.rs`) and check the trained theta within the tolerance class.
+// parity skip-if-no-hardware convention). The driver constructs the compute@2 runner from
+// `EngineConfig.backend`, so the device tiers come in TWO shapes: (a) the END-TO-END tier —
+// the full wasm32 trainer driven with a device `BackendKind`, det digests bit-exact [equality
+// class] + trained theta within the Optimizer band [tolerance class]; and (b) the op-journal
+// replay tier (the `compute_replay.rs` mechanism) — the recorded kernel stream re-executed on
+// the device as the finer-grained per-op cross-check. The det digest is backend-independent
+// (in-guest fp32 via `daemon-vhc-det`), so the cpu and burn-ndarray tiers reproduce it
+// identically and any device det drift is a stop-and-escalate.
 //
 // Dev/test harness: shells `cargo build` for the guests, so fs/process bans are allowed file-wide.
 #![allow(clippy::disallowed_methods)]
@@ -587,10 +589,9 @@ fn trainer_goldens_reproduce_cpu() {
     assert_theta_within_band(&g, &r, "cpu");
 }
 
-/// The burn-ndarray tier (runs under the host suite's `--features burn-ndarray` lane). The
-/// compute@2 host execution backend is the ndarray `ComputeRunner` regardless of the selected
-/// `BackendKind` at this commit, so this reproduces the same trajectory as the cpu tier — the
-/// named tier documents the lane and stays wired for when a GPU compute runner lands.
+/// The burn-ndarray tier (runs under the host suite's `--features burn-ndarray` lane): the
+/// driver constructs the ndarray arm from the selected `BackendKind`, reproducing the cpu
+/// tier's trajectory over the explicit lane (one real CPU implementation).
 #[cfg(feature = "burn-ndarray")]
 #[test]
 fn trainer_goldens_reproduce_burn_ndarray() {
@@ -603,6 +604,63 @@ fn trainer_goldens_reproduce_burn_ndarray() {
     let r = drive_reproduce(engine, &g, &wasm);
     assert_digests_bit_exact(&g, &r, "burn-ndarray");
     assert_theta_within_band(&g, &r, "burn-ndarray");
+}
+
+/// The END-TO-END wgpu tier — hardware-gated (self-skips without an adapter): the full wasm32
+/// trainer drives the REAL device runner the driver constructed from `BackendKind::Wgpu`. The
+/// det-lane digests must reproduce bit-exactly (backend-independent by construction — the
+/// standing cpu-vs-GPU tripwire) and the trained theta must sit within the Optimizer band.
+/// This is the parity gate the fleet peers run with recorded evidence (the max-delta lines).
+#[cfg(feature = "wgpu")]
+#[test]
+fn trainer_goldens_reproduce_wgpu_end_to_end() {
+    if !daemon_vhc_host::wgpu_adapter_available() {
+        eprintln!("SKIP trainer_goldens(wgpu end-to-end): no usable wgpu adapter on this runner");
+        return;
+    }
+    let g = load_goldens();
+    let wasm = guest("tiny_llama");
+    let engine = EngineConfig {
+        backend: daemon_vhc_host::BackendKind::Wgpu,
+        // Real device kernels under wasm32 driving need the roomy wall-clock budgets (JIT
+        // compilation + queue drains overrun the tiny-model epoch watchdog).
+        fuel_per_call: 1 << 34,
+        epoch_deadline: std::time::Duration::from_secs(600),
+        op_budget: 1 << 30,
+        max_step_handles: 1 << 24,
+        ..EngineConfig::default()
+    };
+    let r = drive_reproduce(engine, &g, &wasm);
+    assert_digests_bit_exact(&g, &r, "wgpu-end-to-end");
+    assert_theta_within_band(&g, &r, "wgpu-end-to-end");
+}
+
+/// The END-TO-END cuda tier — hardware-gated like the wgpu tier (the remote CUDA lane runs it;
+/// requires a device + staged NVRTC, so it self-skips everywhere else).
+#[cfg(feature = "cuda")]
+#[test]
+fn trainer_goldens_reproduce_cuda_end_to_end() {
+    if !daemon_vhc_host::cuda_adapter_available() {
+        eprintln!("SKIP trainer_goldens(cuda end-to-end): no usable CUDA device on this runner");
+        return;
+    }
+    if !daemon_vhc_host::probe::cuda_nvrtc_ready() {
+        eprintln!("SKIP trainer_goldens(cuda end-to-end): NVRTC runtime not staged");
+        return;
+    }
+    let g = load_goldens();
+    let wasm = guest("tiny_llama");
+    let engine = EngineConfig {
+        backend: daemon_vhc_host::BackendKind::Cuda,
+        fuel_per_call: 1 << 34,
+        epoch_deadline: std::time::Duration::from_secs(600),
+        op_budget: 1 << 30,
+        max_step_handles: 1 << 24,
+        ..EngineConfig::default()
+    };
+    let r = drive_reproduce(engine, &g, &wasm);
+    assert_digests_bit_exact(&g, &r, "cuda-end-to-end");
+    assert_theta_within_band(&g, &r, "cuda-end-to-end");
 }
 
 // -- the straggle -> catch-up leg (ported from parity's catch_up_after_straggle lane) ---------
@@ -928,19 +986,15 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
     );
 }
 
-// -- wgpu + cuda tiers (genuine compute@2 device coverage via op-journal replay) ------------------
+// -- wgpu + cuda op-journal replay tiers (the finer-grained per-op device cross-check) ------------
 //
-// The compute@2 host execution backend is the ndarray `ComputeRunner` regardless of
-// `EngineConfig.backend` at this commit — driving the guest under a GPU `BackendKind` would still
-// execute on ndarray, so it would NOT exercise the device. The det digest is backend-independent
-// (it is a pure function of the ingested committed payloads via `daemon-vhc-det`), so the ONLY
-// backend-sensitive output is the trained theta. These tiers exercise the compute@2 KERNELS on the
-// real device through the op-journal replay seam (the `compute_replay.rs` mechanism): the trainer
-// model's round-0 forward+backward+AdamW op stream is recorded over a `burn-router` recording
-// client, then re-executed against the production `ComputeRunner<Device>` on the GPU, and the
-// exported theta is checked against the recorded golden within the native (tolerance) class. This
-// is the lane that retires the plan's "first GPU run may expose a compute@2 det-lane divergence"
-// risk — it runs the trainer's actual kernels on the device.
+// The end-to-end device tiers above drive the full wasm32 trainer on the real runner; these
+// tiers isolate the compute@2 KERNELS through the op-journal replay seam (the
+// `compute_replay.rs` mechanism): the trainer model's round-0 forward+backward+AdamW op stream
+// is recorded over a `burn-router` recording client, then re-executed against the production
+// `ComputeRunner<Device>` on the GPU, and the exported theta is checked against the recorded
+// golden within the native (tolerance) class — a per-op diagnosis surface when the end-to-end
+// tier breaches its band.
 //
 // Feature-gated + self-skipping without hardware (the parity convention). wgpu is attempted on
 // this host's Vulkan/RADV; cuda is gated for the remote CUDA lane (never attempted locally).
