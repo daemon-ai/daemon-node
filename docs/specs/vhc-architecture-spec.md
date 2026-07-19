@@ -819,6 +819,56 @@ artifact, configuration, or grant and then join under another.
   assessment admitted, because any additional world, channel, op, or raised limit changes the hash
   and trips [AT-2].
 
+### 6.4 The run-instance lifecycle at the node
+
+The node is the single authority for a run instance's lifecycle, held as a durable **two-axis**
+state machine: the owner-intent axis (`joined | paused | left`) records what the owner wants; the
+observed axis (`running | completed | failed_retryable | failed_terminal | left`) records what the
+last incarnation actually did. Clients render the six-state projection (`running | completed |
+paused | failed_retryable | failed_terminal | left`; terminal observations win, a paused intent
+masks recoverable states) and never re-derive it. Transitions on the observed axis are driven by
+the worker's classified terminal events and by observed process/stream loss — never by inference
+from silence.
+
+- **[RL-1]** **Terminal handling is idempotent and generation-gated.** Every run-scoped worker
+  event carries its instance's generation (the never-reused incarnation id); an event stamped with
+  a generation other than the run's current one is discarded whole — a reaped instance's late
+  events can never fold telemetry, transition state, release resources, or touch key custody for
+  its replacement. Duplicate terminal delivery transitions nothing and cannot double-release.
+- **[RL-2]** **Teardown is observed before the ledger releases.** A terminal transition follows a
+  fixed, crash-repairable order: a durable release marker commits first (teardown observed — the
+  terminal event arrived, or the worker's event stream closed / its process was reaped — with the
+  terminal target recorded); only then does the instance leave supervision and its resource
+  reservation release (a replacement is never admitted while the predecessor may hold devices);
+  only then does the terminal state commit. A node crash inside that window is finished by the
+  startup reconciliation pass — on a fresh start every child died with the node, so process
+  absence makes teardown definitional and the recorded target simply commits.
+- **[RL-3]** **A completed run never restarts.** The reconvergence set is standing `joined`
+  intents whose observed state is non-terminal: a module-signaled run end and a terminal failure
+  drop out permanently (the latter until explicit owner action). An owner rejoin of a settled run
+  mints a fresh incarnation; identity retention across a node restart is legitimate exactly
+  because no live predecessor can exist there.
+- **[RL-4]** **Recoverable failures reconverge under a bounded budget.** A recoverable fault
+  consumes one attempt of a config-bounded retry budget with exponential backoff; exhaustion
+  escalates to the terminal failure with a typed reason. The budget resets only when an
+  incarnation stays running past a configured minimum uptime — the coarse stability signal (the
+  node never inspects rounds) — so a crash loop cannot launder its budget by restarting. Mid-run
+  reconvergence always mints a new incarnation with freshly-authored credentials and certificate
+  ([CI-1]/[CI-6]); the generation strictly advances, so the predecessor's stale events stay gated.
+- **[RL-5]** **Pause is durable owner intent with release-on-pause.** Pause persists before it
+  acts: a paused run survives node restart and is never reconverged until resumed. The pause
+  lever is hard (memory, not just time), the run's resource reservation releases, and a held
+  coordinator seat lease is released fenced (the floor persists). Resume re-admits against the
+  owner's *current* ledgers before lifting the pause — a refusal is typed and loud, and the run
+  stays paused with nothing half-claimed.
+- **[RL-6]** **Coordinator-seat duty is resident, and fenced-out claimants never fight.** When
+  the owner enables coordinator duty, a resident keeper covers each joined run whose admitted
+  role is the seat role: it claims when a bid derives (standing by against a live incumbent),
+  heartbeat-renews under the same fencing token, drops the lease when a renew is refused (the
+  seat moved; supersession is the safety floor, [CI-5]-class), and releases signed on owner
+  pause/leave and node shutdown so a successor takes over at floor + 1 without waiting out the
+  lease TTL.
+
 ---
 
 ## 7. The consensus and aggregation seam
