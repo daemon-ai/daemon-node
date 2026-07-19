@@ -452,6 +452,7 @@ impl WorkerControl for InProcessUpgradeWorker {
         new_module: [u8; 32],
         grants_hash: [u8; 32],
         deadline_ms: u64,
+        _admitted_tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
     ) -> Result<SwitchOutcome, VhcError> {
         let scenario = self
             .scenario
@@ -539,6 +540,7 @@ async fn node_switch_module_upgrades_a_running_instance_epoch_fenced() {
         new_module.0,
         grants_hash.0,
         5_000,
+        None,
     )
     .await
     .expect("switch_module");
