@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-acceptance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# The multi-process acceptance suite (architecture §6; the production merge gate's proof tier):
+# three REAL `daemon` node processes — a seat-claiming coordinator-role node and two trainer
+# nodes — driven exclusively over their Unix-socket product API, against local in-process
+# fixtures (registry + seat CAS, relay-grade WS coordinator, shared filesystem payload plane).
+# No testkit relay, no pump handles: everything this crate touches at run time is a spawned
+# binary, a socket, a fixture server, or an on-disk artifact (journals — the offline oracle).
+#
+# Dependency posture (deliberate; the architecture assertion test pins it): NO host production
+# crates, NO sdk schema crates. Genesis/config authoring goes through the testkit (the
+# harness-exempt authoring seat); oracles go through daemon-vhc-observe (harness tooling).
+
+[dev-dependencies]
+# The suite spawns two REAL product binaries — the `daemon` node and the `daemon-vhc-worker`
+# training worker (built by the xtask acceptance lane with `vhc-net` + `burn-ndarray`, located
+# in the target dir at run time). They are NOT dependencies here: the suite drives them as
+# black-box processes over the socket, which is what makes it the product-path proof.
+daemon-api = { workspace = true }
+daemon-host = { workspace = true }
+# The node keystore reader (base-identity pubkey → the genesis trust set) — a host crate, but not
+# an sdk round-schema crate, so the negative architecture assertion (host↛sdk-rounds) is intact.
+daemon-vhc-session = { workspace = true }
+daemon-vhc-testkit = { workspace = true }
+daemon-vhc-journal = { workspace = true }
+daemon-vhc-proto = { workspace = true }
+daemon-vhc-net = { workspace = true, features = ["harness"] }
+tokio = { workspace = true }
+ciborium = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+tempfile = "3"
+wiremock = { workspace = true }
+nix = { workspace = true }
+# The fixture's WS relay (the coordinator control plane the seat holder + trainers connect to,
+# `ws://…/runs/:id/ws`) — the same tungstenite carrier the promoted `ws_relay` fixture uses.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+futures = { workspace = true }
+
+[lints]
+workspace = true

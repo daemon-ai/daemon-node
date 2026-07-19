@@ -1445,6 +1445,7 @@ impl VhcService {
             coordinator,
             &self.config.registry,
             restore,
+            !self.config.payload_dir.is_empty(),
         )?;
         Ok((Some(tuple), authored.wire, authored.credentials_ref))
     }

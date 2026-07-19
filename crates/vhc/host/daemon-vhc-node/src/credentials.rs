@@ -65,6 +65,7 @@ pub fn author_join(
     coordinator: &str,
     registry: &RegistryConfig,
     restore: Option<CheckpointRestore>,
+    local_payload_plane: bool,
 ) -> Result<AuthoredJoin, VhcError> {
     let cred = |e: KeystoreError| VhcError::Internal(format!("credential authorship: {e}"));
 
@@ -102,7 +103,13 @@ pub fn author_join(
         }
     };
 
-    let presign_base = (!registry.base.is_empty()).then(|| registry.base.clone());
+    // Plane selection: a configured shared FILESYSTEM payload root (`[vhc] payload_dir`, the
+    // multi-node single-host topology) uses the fs content store — the worker roots it at the
+    // node-delivered shared dir, so `presign_base` stays absent even when a registry base is
+    // configured for discovery + the seat CAS. Otherwise the presigned R2 plane is selected
+    // from the registry base.
+    let presign_base =
+        (!local_payload_plane && !registry.base.is_empty()).then(|| registry.base.clone());
     let credentials = SessionCredentials {
         genesis_hash: identity.genesis_hash,
         ws_base: (!coordinator.is_empty()).then(|| coordinator.to_string()),
