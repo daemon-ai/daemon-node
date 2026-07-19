@@ -281,6 +281,226 @@ async fn keeper_claims_renews_and_releases_on_pause() {
     }
 }
 
+/// A discovery fake naming a fixed coordinator endpoint (the allowlisted relay URL).
+struct FixedDiscovery;
+
+#[async_trait]
+impl daemon_vhc_node::RunDiscovery for FixedDiscovery {
+    async fn list_runs(&self) -> Result<Vec<daemon_vhc_node::DiscoveredRun>, VhcError> {
+        Ok(vec![])
+    }
+    async fn get_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<daemon_vhc_node::DiscoveredRun>, VhcError> {
+        Ok(Some(daemon_vhc_node::DiscoveredRun {
+            run_id: run_id.to_string(),
+            coordinator: "wss://coord.example".to_string(),
+            envelope_hash: "00".repeat(32),
+            proto_version: 3,
+        }))
+    }
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+        Ok(vec![0xA0]) // opaque bytes; the role-directed worker fake below never decodes them
+    }
+}
+
+/// A worker whose assess honors the role directive: the directed role lands in the admitted
+/// tuple (the coordinator-role assessment the seat-claim path issues), and joins are recorded.
+#[derive(Default)]
+struct RoleDirectedWorker {
+    joins: Mutex<Vec<(String, Option<AdmittedTuple>)>>,
+}
+
+#[async_trait]
+impl WorkerControl for RoleDirectedWorker {
+    async fn probe(&self) -> Result<Hardware, VhcError> {
+        Ok(Hardware::default())
+    }
+    async fn assess(&self, _e: Vec<u8>, role: Option<String>) -> Result<Eligibility, VhcError> {
+        let role = role.unwrap_or_else(|| "trainer".to_string());
+        Ok(Eligibility {
+            eligible: true,
+            admitted_tuple: Some(AdmittedTuple {
+                module_hash: MODULE,
+                genesis_hash: GENESIS,
+                role,
+                incarnation: 0,
+                ..AdmittedTuple::default()
+            }),
+            ..Eligibility::default()
+        })
+    }
+    async fn join(
+        &self,
+        run_id: String,
+        _coordinator: String,
+        _credentials: Vec<u8>,
+        _policy: JoinPolicy,
+        admitted_tuple: Option<AdmittedTuple>,
+    ) -> Result<(), VhcError> {
+        self.joins.lock().unwrap().push((run_id, admitted_tuple));
+        Ok(())
+    }
+    async fn leave(
+        &self,
+        _run_id: String,
+        _mode: daemon_vhc_session::protocol::LeaveMode,
+    ) -> Result<(), VhcError> {
+        Ok(())
+    }
+    async fn throttle(
+        &self,
+        _vram: Option<u32>,
+        _duty: Option<u8>,
+        _paused: bool,
+    ) -> Result<(), VhcError> {
+        Ok(())
+    }
+}
+
+/// The JOIN-side seat coupling ([SEAT-1] end-to-end): with coordinator duty enabled, `vhc_join`
+/// assesses the seat role, wins the virgin slot's CAS, and runs the join AT THE LEASE'S
+/// INCARNATION — the fencing token IS the execution identity's incarnation (never the minted
+/// counter), and the keeper holds the lease for the resident renew loop.
+#[tokio::test]
+async fn join_runs_the_coordinator_role_at_the_seat_bid_incarnation() {
+    let identity = tempfile::tempdir().unwrap();
+    VhcKeystore::open(identity.path()).unwrap();
+    let directory = FakeDirectory::new();
+    let worker = Arc::new(RoleDirectedWorker::default());
+    let svc = Arc::new(VhcService::new(VhcServiceParts {
+        config: VhcConfig {
+            enabled: true,
+            seat_claim: true,
+            coordinator_allowlist: vec!["wss://coord.example".to_string()],
+            ..VhcConfig::default()
+        },
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(Arc::new(FixedDiscovery)),
+        budget: None,
+        worker_factory: None,
+        identity_dir: Some(identity.path().to_path_buf()),
+        seat_directory: Some(directory.clone()),
+    }));
+    svc.bind_self();
+
+    let policy = VhcPolicy {
+        mode: VhcPolicyMode::Always,
+        vram_cap_mb: 0,
+        duty_cycle_pct: 100,
+        schedule: None,
+    };
+    svc.vhc_join(RUN.to_string(), policy.clone(), "op-1".into())
+        .await
+        .unwrap();
+
+    // The registry holds OUR lease at the virgin bid, token == incarnation == 0.
+    let lease = match directory.registry.read(RUN, ROLE) {
+        SeatState::Leased(l) => *l,
+        other => panic!("expected the won lease, got {other:?}"),
+    };
+    assert_eq!(lease.body.fencing_token, 0);
+    assert_eq!(lease.body.incarnation, 0);
+
+    // The join was delivered AT the lease incarnation, under the seat role.
+    let joins = worker.joins.lock().unwrap().clone();
+    let (run, tuple) = joins.first().expect("one join delivered");
+    assert_eq!(run, RUN);
+    let tuple = tuple.as_ref().expect("the join carries the admitted tuple");
+    assert_eq!(tuple.role, ROLE, "the seat role is the joined role");
+    assert_eq!(
+        tuple.incarnation, lease.body.incarnation,
+        "fencing_token == incarnation, end-to-end"
+    );
+
+    // The keeper HOLDS the won lease: the next resident pass renews (never re-claims).
+    let notes = svc.seat_tick().await.unwrap();
+    assert!(
+        matches!(notes.as_slice(), [SeatNote::Renewed { run_label }] if run_label == RUN),
+        "got {notes:?}"
+    );
+}
+
+/// A live foreign incumbent stands the seat attempt down: the join proceeds as the TRAINER
+/// default with a minted incarnation (coordinator duty is opportunistic, never a join failure).
+#[tokio::test]
+async fn join_stands_down_to_trainer_when_a_live_incumbent_holds() {
+    let identity = tempfile::tempdir().unwrap();
+    VhcKeystore::open(identity.path()).unwrap();
+    let directory = FakeDirectory::new();
+
+    // A foreign incumbent holds the slot, live.
+    let other_identity = tempfile::tempdir().unwrap();
+    let other_keystore = VhcKeystore::open(other_identity.path()).unwrap();
+    let incumbent = daemon_vhc_node::seat::author_claim(
+        &other_keystore,
+        &daemon_vhc_node::seat::CoordinatorSeat {
+            run_label: RUN,
+            genesis_hash: GENESIS,
+            role: ROLE,
+            epoch: 0,
+            module_hash: MODULE,
+            endpoint: candidate().endpoint,
+        },
+        0,
+        directory.now(),
+    )
+    .unwrap();
+    assert_eq!(
+        directory
+            .registry
+            .claim(RUN, &incumbent, directory.now())
+            .decision,
+        SeatDecision::Accepted
+    );
+
+    let worker = Arc::new(RoleDirectedWorker::default());
+    let svc = Arc::new(VhcService::new(VhcServiceParts {
+        config: VhcConfig {
+            enabled: true,
+            seat_claim: true,
+            coordinator_allowlist: vec!["wss://coord.example".to_string()],
+            ..VhcConfig::default()
+        },
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(Arc::new(FixedDiscovery)),
+        budget: None,
+        worker_factory: None,
+        identity_dir: Some(identity.path().to_path_buf()),
+        seat_directory: Some(directory.clone()),
+    }));
+    svc.bind_self();
+
+    let policy = VhcPolicy {
+        mode: VhcPolicyMode::Always,
+        vram_cap_mb: 0,
+        duty_cycle_pct: 100,
+        schedule: None,
+    };
+    svc.vhc_join(RUN.to_string(), policy, "op-1".into())
+        .await
+        .unwrap();
+
+    let joins = worker.joins.lock().unwrap().clone();
+    let (_, tuple) = joins.first().expect("one join delivered");
+    let tuple = tuple.as_ref().expect("the join carries the admitted tuple");
+    assert_eq!(tuple.role, "trainer", "stood down to the trainer default");
+    assert!(
+        tuple.incarnation > 0,
+        "the trainer identity is the minted counter, never the foreign lease's token"
+    );
+    // The incumbent's lease is untouched.
+    match directory.registry.read(RUN, ROLE) {
+        SeatState::Leased(l) => assert_eq!(l.body.claimant, incumbent.body.claimant),
+        other => panic!("the incumbent must still hold, got {other:?}"),
+    }
+}
+
 /// Fencing at the keeper: a held lease whose seat moved (expiry + takeover) is DROPPED on the
 /// refused renew — the fenced claimant never fights, and a later pass bids fresh at floor + 1.
 #[tokio::test]

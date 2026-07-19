@@ -123,12 +123,19 @@ pub async fn build_role_providers(inputs: LiveAttachInputs<'_>) -> Result<RolePr
             Arc::new(R2Store::new(presign, egress, RunId::new(inputs.run_label)))
         }
         _ => {
-            let root = journal_home::run_dir_from_env().ok_or_else(|| {
-                "no presign base and no run-state root reference (the fs content store needs \
-                 the node-delivered run dir)"
-                    .to_string()
-            })?;
-            let dir = journal_home::payload_dir(&root, inputs.run_label);
+            // The node-delivered payload-plane override wins (a shared single-host root, so
+            // multi-process peers serve each other's content); else the run's own state dir.
+            let dir = match journal_home::payload_dir_from_env() {
+                Some(shared) => journal_home::payload_dir(&shared, inputs.run_label),
+                None => {
+                    let root = journal_home::run_dir_from_env().ok_or_else(|| {
+                        "no presign base and no run-state root reference (the fs content store \
+                         needs the node-delivered run dir)"
+                            .to_string()
+                    })?;
+                    journal_home::payload_dir(&root, inputs.run_label)
+                }
+            };
             Arc::new(
                 FsContentStore::open(&dir)
                     .map_err(|e| format!("fs content store {}: {e}", dir.display()))?,

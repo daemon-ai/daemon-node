@@ -176,6 +176,63 @@ impl SeatKeeper {
             .map(|l| l.body.incarnation)
     }
 
+    /// Claim (or re-adopt) the seat for `candidate` NOW and return the incarnation the winning
+    /// lease carries — the JOIN-side coupling ([SEAT-1] end-to-end): the coordinator-role join
+    /// runs at exactly this incarnation, so `fencing_token == incarnation` holds from the CAS
+    /// through the certified execution identity.
+    ///
+    /// - a LIVE lease whose claimant is this node's own provisioned key at that incarnation is
+    ///   re-adopted (held + renewed by the resident loop) — the node-restart resume;
+    /// - an unheld / expired / tombstoned slot is bid per [`derive_bid`] and CASed;
+    /// - a live foreign incumbent (or a lost CAS race) returns `Ok(None)` — the caller stands
+    ///   down (never a takeover fight).
+    ///
+    /// # Errors
+    /// Directory transport or lease-authorship failure.
+    pub async fn claim_now(
+        &self,
+        candidate: &SeatCandidate,
+        now_ms: u64,
+    ) -> Result<Option<u64>, VhcError> {
+        // Already held (the resident loop claimed it) — the held incarnation IS the answer.
+        if let Some(inc) = self.held_incarnation(&candidate.run_label) {
+            return Ok(Some(inc));
+        }
+        let state = self
+            .directory
+            .read_seat(&candidate.run_label, &candidate.role)
+            .await?;
+        // Re-adopt our own live lease (a node restart with the previous lease un-expired): the
+        // claimant key must be OUR provisioned per-run key at the lease's incarnation.
+        if let SeatState::Leased(lease) = &state {
+            if !lease.is_expired(now_ms, DEFAULT_SEAT_SKEW_MS) {
+                let ours = self
+                    .keystore()?
+                    .existing_run_signing_key(
+                        &candidate.run_label,
+                        &candidate.role,
+                        lease.body.incarnation,
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some_and(|key| daemon_vhc_proto::peer_id(&key) == lease.body.claimant);
+                if ours {
+                    let incarnation = lease.body.incarnation;
+                    self.held
+                        .lock()
+                        .expect("seat keeper lock")
+                        .insert(candidate.run_label.clone(), (**lease).clone());
+                    return Ok(Some(incarnation));
+                }
+                return Ok(None); // a live foreign incumbent — stand down
+            }
+        }
+        match self.claim(candidate, now_ms).await? {
+            Some(SeatNote::Claimed { incarnation, .. }) => Ok(Some(incarnation)),
+            _ => Ok(None),
+        }
+    }
+
     /// One keeper pass over `candidates`: renew every held lease, claim every unheld slot whose
     /// bid derives (a live incumbent means stand by). Every outcome is a note; one run's failure
     /// never blocks the rest.

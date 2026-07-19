@@ -40,10 +40,23 @@ use daemon_vhc_proto::Hash;
 /// (a path reference — never secret material), mirroring the identity-store delivery.
 pub const RUN_DIR_ENV: &str = "DAEMON_VHC_RUN_DIR";
 
+/// The environment variable through which the node hands a worker subprocess an OVERRIDE root
+/// for the filesystem payload plane (`[vhc] payload_dir`; a path reference like [`RUN_DIR_ENV`]).
+/// Absent ⇒ the plane roots under the run's own state dir. A multi-node single-host deployment
+/// shares one root so peers can serve each other's content-addressed objects — the filesystem
+/// plane is the local stand-in for a shared object store (journals stay per-node).
+pub const PAYLOAD_DIR_ENV: &str = "DAEMON_VHC_PAYLOAD_DIR";
+
 /// The run-state root a worker was handed by reference, if any.
 #[must_use]
 pub fn run_dir_from_env() -> Option<PathBuf> {
     std::env::var_os(RUN_DIR_ENV).map(PathBuf::from)
+}
+
+/// The payload-plane override root a worker was handed by reference, if any.
+#[must_use]
+pub fn payload_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os(PAYLOAD_DIR_ENV).map(PathBuf::from)
 }
 
 /// One run's state home under the run-state root: `<root>/<blake3(run label)>/`. The label is

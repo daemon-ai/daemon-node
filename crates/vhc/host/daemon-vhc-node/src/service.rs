@@ -1335,6 +1335,62 @@ impl VhcService {
         }
     }
 
+    /// The coordinator-duty join attempt ([SEAT-1] end-to-end): assess the configured seat role,
+    /// then claim (or re-adopt) the registry seat slot through the resident keeper — the join
+    /// runs at the WON LEASE'S incarnation, so the fencing token IS the certified execution
+    /// identity's incarnation. Any refusal (keeper unwired, ineligible seat-role assessment, a
+    /// live foreign incumbent, a lost CAS race, a directory fault) returns `None`: the caller
+    /// stands down to the trainer default — coordinator duty is opportunistic, never a join
+    /// failure.
+    async fn try_seat_join(
+        &self,
+        worker: &Arc<dyn WorkerControl>,
+        run_id: &str,
+    ) -> Option<(
+        String,
+        VhcEligibility,
+        Option<protocol::AdmittedTuple>,
+        Option<u64>,
+    )> {
+        let keeper = self.seat.as_ref()?;
+        let seat_role = self.config.seat_role.clone();
+        let (coordinator, eligibility, tuple) = self
+            .resolve_join(worker, run_id, Some(seat_role.clone()))
+            .await
+            .ok()?;
+        if !eligibility.eligible {
+            return None;
+        }
+        let tuple_ref = tuple.as_ref()?;
+        let candidate = crate::seat_keeper::SeatCandidate {
+            run_label: run_id.to_string(),
+            genesis_hash: tuple_ref.genesis_hash,
+            role: seat_role,
+            epoch: 0,
+            module_hash: tuple_ref.module_hash,
+            endpoint: daemon_vhc_proto::ControlEndpoint {
+                ws: (!coordinator.is_empty()).then(|| coordinator.clone()),
+                iroh_ticket: None,
+            },
+        };
+        match keeper.claim_now(&candidate, now_ms() as u64).await {
+            Ok(Some(incarnation)) => Some((coordinator, eligibility, tuple, Some(incarnation))),
+            Ok(None) => None, // a live incumbent / lost race — stand down to the trainer default
+            Err(e) => {
+                let mut emitted = Vec::new();
+                let _ = self.emit(
+                    VhcEvent::Warning {
+                        run_id: run_id.to_string(),
+                        class: "seat_claim".to_string(),
+                        detail: format!("seat claim failed (joining as trainer): {e}"),
+                    },
+                    &mut emitted,
+                );
+                None
+            }
+        }
+    }
+
     /// Stamp the node-owned device-profile / owner-policy revisions into an assessed admitted
     /// tuple (architecture §6.3). `None` in ⇒ `None` out (an ineligible assessment admitted
     /// nothing). The incarnation field stays as assessed (0 = unassigned); the join mints it.
@@ -1480,10 +1536,27 @@ impl VhcApi for VhcService {
         // and take the coordinator endpoint from discovery. With no discovery configured, fall back
         // to the probe-based eligibility against the allowlisted coordinator (offline / no-registry
         // path). Either way the persisted eligibility is node-computed — the app never re-derives it.
-        let (coordinator, eligibility, assessed_tuple) = self
-            .resolve_join(&worker, &run_id, None)
-            .await
-            .map_err(|e| e.to_api())?;
+        //
+        // COORDINATOR DUTY FIRST (architecture §6.3; [SEAT-1]): when the owner enabled seat
+        // claiming and this is a fresh instance, try the seat — assess the configured seat role,
+        // claim (or re-adopt) the registry slot, and run the join AT THE WON LEASE'S INCARNATION
+        // (fencing_token == incarnation end-to-end). A live foreign incumbent, a lost CAS race,
+        // or an ineligible seat-role assessment stands down to the trainer default.
+        let seat_join = if existing.is_none() {
+            self.try_seat_join(&worker, &run_id).await
+        } else {
+            None
+        };
+        let (coordinator, eligibility, assessed_tuple, seat_incarnation) = match seat_join {
+            Some(won) => won,
+            None => {
+                let (coordinator, eligibility, assessed_tuple) = self
+                    .resolve_join(&worker, &run_id, None)
+                    .await
+                    .map_err(|e| e.to_api())?;
+                (coordinator, eligibility, assessed_tuple, None)
+            }
+        };
 
         // The admission funnel's LAST stage (decisions D6 point 5; architecture §3.5): the
         // aggregate owner arbitration — an atomic check-and-reserve against the remaining
@@ -1512,14 +1585,22 @@ impl VhcApi for VhcService {
                     // ledger entry by blake3(RunLabel) until then (decisions D1 lazy backfill).
                     run_id: run_hash.unwrap_or_else(|| *blake3::hash(run_id.as_bytes()).as_bytes()),
                     epoch,
-                    role: if role.is_empty() {
+                    // The seat-won join runs the configured seat role; else the persisted role
+                    // (the trainer default for a fresh row).
+                    role: if seat_incarnation.is_some() {
+                        self.config.seat_role.clone()
+                    } else if role.is_empty() {
                         "trainer".to_string()
                     } else {
                         role
                     },
-                    // A restart-re-join retains the logical incarnation; a genuinely new
-                    // role-instance mints a never-reused one (decisions D1).
-                    instance: if persisted_instance > 0 {
+                    // The seat-won join runs at the LEASE incarnation ([SEAT-1]: the fencing
+                    // token IS the incarnation — the CAS mints identity, never the counter).
+                    // Otherwise: a restart-re-join retains the logical incarnation; a genuinely
+                    // new role-instance mints a never-reused one (decisions D1).
+                    instance: if let Some(inc) = seat_incarnation {
+                        inc
+                    } else if persisted_instance > 0 {
                         persisted_instance
                     } else {
                         self.store
