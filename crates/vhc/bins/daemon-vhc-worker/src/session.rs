@@ -69,72 +69,78 @@ pub(crate) use crate::backend::RUN_INSTANCE;
 pub(crate) use crate::backend::derive_grants;
 
 /// How many rounds the self-driven t2 run drives before a clean stop.
-const T2_ROUNDS: u64 = 2;
+const DRIVE_ROUNDS: u64 = 2;
 
-/// Inner steps per round — part of the fixed t2 drive geometry: the authored genesis (the
+/// Inner steps per round — part of the fixed drive geometry: the authored genesis (the
 /// coordinator state's schedule AND the trainer role's config) must match it.
-const T2_STEPS_PER_ROUND: u32 = 2;
+const STEPS_PER_ROUND: u32 = 2;
 
 /// Sequences per staged step batch (one micro-window per inner step; the genesis schedule's
 /// `global_batch`/`steps_per_round` fix the counts).
-const T2_BATCH_SEQS: u32 = 1;
+const BATCH_SEQS: u32 = 1;
 
 /// Tokens per sequence — the corpus's `seq_len` and the guest model's.
-const T2_SEQ_LEN: u32 = 9;
+const SEQ_LEN: u32 = 9;
 
-/// Decode a 64-char lowercase-hex blake3 digest.
-fn hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
+/// The harness corpus's chunk size in bytes (a multiple of the u16 token width; small enough
+/// that every 36-byte shard spans several chunks — the chunk math is exercised, not vacuous).
+const CHUNK_SIZE: u64 = 16;
+
+/// The run's **artifact store** — the one fetch path (B2 tier-d unification), speaking BOTH
+/// artifact classes of the corpus contract:
+///
+/// - **plain** objects (the corpus manifest), keyed + verified by the blake3 of their bytes;
+/// - **chunk-addressed** shards, keyed by their chunk FOLD (`daemon_vhc_proto::shard_fold`) —
+///   there is no whole-object hash to verify, so reads are verified per covering chunk against
+///   the manifest's chunk hashes (exactly what the run pump enforces on `data@2` ranges).
+struct HarnessArtifacts {
+    plain: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    shards: std::collections::HashMap<[u8; 32], Vec<u8>>,
 }
 
-/// The t2 run's **artifact store** — the one fetch path (B2 tier-d unification). Every corpus
-/// byte the session stages AND every guest `data@2::fetch` is answered from here, through
-/// [`T2Artifacts::fetch`]'s single fetch-and-verify discipline: content addressed by the
-/// committed blake3, verified on every read (exactly what the artifact resolver does against a
-/// real store — this is the in-process seat of the same mechanism, not a second path).
-struct T2Artifacts {
-    by_hash: std::collections::HashMap<[u8; 32], Vec<u8>>,
-}
-
-impl T2Artifacts {
-    /// Fetch-and-verify one committed artifact (the whole-artifact rule the `data@2` pump also
-    /// enforces — a store lie is a typed error, never silent bytes).
+impl HarnessArtifacts {
+    /// Fetch one committed artifact's bytes: plain objects whole-verified; fold-keyed shards
+    /// verbatim (chunk verification happens at the read seam — the staging assembly below and
+    /// the pump's own covering-chunk check both re-verify).
     fn fetch(&self, hash: &[u8; 32]) -> Result<Vec<u8>, String> {
-        let bytes = self
-            .by_hash
-            .get(hash)
-            .ok_or_else(|| "artifact not in the t2 store".to_string())?;
-        if blake3::hash(bytes).as_bytes() != hash {
-            return Err("t2 store content does not hash to the committed value".into());
+        if let Some(bytes) = self.plain.get(hash) {
+            if blake3::hash(bytes).as_bytes() != hash {
+                return Err("store content does not hash to the committed value".into());
+            }
+            return Ok(bytes.clone());
         }
-        Ok(bytes.clone())
+        self.shards
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| "artifact not in the harness store".to_string())
     }
 
     /// The committed hash set — the run's artifact grants (`RunConfig::granted_artifacts`).
     fn granted(&self) -> std::collections::BTreeSet<[u8; 32]> {
-        self.by_hash.keys().copied().collect()
+        self.plain
+            .keys()
+            .chain(self.shards.keys())
+            .copied()
+            .collect()
     }
 }
 
-/// Build the t2 run's corpus artifacts: deterministic small-vocab shards + their manifest, as
-/// content-addressed blobs — the in-process stand-in for the genesis artifact map's corpus
-/// entries. Returns the store and the manifest's committed hash.
+/// Build the run's corpus artifacts under the CHUNK-ADDRESSED corpus contract: deterministic
+/// small-vocab shards, each identified by its chunk fold, plus the canonical-CBOR
+/// [`daemon_vhc_proto::CorpusManifest`] — the in-process stand-in for a published corpus whose
+/// manifest hash a genesis pins. Returns the store and the manifest's committed hash.
 ///
 /// Tokens are embedding indices, so the vocabulary is strictly below the guest model's.
-fn t2_corpus_artifacts() -> Result<(T2Artifacts, [u8; 32]), String> {
-    use daemon_vhc_session::data::{Manifest, ShardDesc, TokenWidth};
+fn harness_corpus_artifacts() -> Result<(HarnessArtifacts, [u8; 32]), String> {
+    use daemon_vhc_proto::corpus::{
+        CorpusManifest, Endianness, SequenceBoundary, ShardEntry, TokenWidth, TokenizerId,
+        CORPUS_MANIFEST_FORMAT,
+    };
     const SHARDS: u64 = 2;
-    const TOKENS_PER_SHARD: u64 = 2 * T2_SEQ_LEN as u64; // two sequences per shard
+    const TOKENS_PER_SHARD: u64 = 2 * SEQ_LEN as u64; // two sequences per shard
     const VOCAB: u64 = 64;
-    let mut shards = Vec::new();
-    let mut by_hash = std::collections::HashMap::new();
+    let mut entries: Vec<ShardEntry> = Vec::new();
+    let mut shards = std::collections::HashMap::new();
     for i in 0..SHARDS {
         let mut bytes = Vec::with_capacity(TOKENS_PER_SHARD as usize * 2);
         let mut s = 0xDAE0_7E57u64 ^ i;
@@ -144,53 +150,96 @@ fn t2_corpus_artifacts() -> Result<(T2Artifacts, [u8; 32]), String> {
                 .wrapping_add(1442695040888963407);
             bytes.extend_from_slice(&(((s >> 33) % VOCAB) as u16).to_le_bytes());
         }
-        shards.push(ShardDesc {
-            name: format!("shard-{i:04}.bin"),
-            bytes: bytes.len() as u64,
-            tokens: TOKENS_PER_SHARD,
-            blake3: blake3_hash(&bytes).to_hex(),
-        });
-        by_hash.insert(*blake3::hash(&bytes).as_bytes(), bytes);
+        let entry = CorpusManifest::author_shard(&bytes, TOKENS_PER_SHARD, CHUNK_SIZE)
+            .map_err(|e| format!("author shard {i}: {e}"))?;
+        shards.insert(entry.shard_hash.0, bytes);
+        entries.push(entry);
     }
-    let manifest = Manifest {
+    // The tokenizer identity is content-addressed like any artifact; the harness corpus is
+    // synthetic-token fixture data, so its "tokenizer" is a named fixture object.
+    let tokenizer_bytes = b"harness-identity-tokenizer".to_vec();
+    let manifest = CorpusManifest {
+        format_version: CORPUS_MANIFEST_FORMAT,
         token_width: TokenWidth::U16,
-        seq_len: T2_SEQ_LEN,
-        shards,
-        tokenizer: None,
-        tokenizer_revision: None,
-        dataset: None,
-        dataset_revision: None,
+        endianness: Endianness::Little,
+        seq_len: SEQ_LEN,
+        sequence_boundary: SequenceBoundary::WholeSequencesPerShard,
+        eos_id: None,
+        pad_id: None,
+        chunk_size: CHUNK_SIZE,
+        tokenizer: TokenizerId {
+            hash: blake3_hash(&tokenizer_bytes),
+            name: "harness-identity".into(),
+            revision: "fixture".into(),
+        },
+        total_tokens: SHARDS * TOKENS_PER_SHARD,
+        shards: entries,
     };
     let manifest_bytes = manifest
-        .to_json()
-        .map_err(|e| format!("manifest json: {e}"))?
-        .into_bytes();
+        .to_canonical_bytes()
+        .map_err(|e| format!("manifest cbor: {e}"))?;
     let manifest_hash = *blake3::hash(&manifest_bytes).as_bytes();
-    by_hash.insert(manifest_hash, manifest_bytes);
-    Ok((T2Artifacts { by_hash }, manifest_hash))
+    let mut plain = std::collections::HashMap::new();
+    plain.insert(manifest_hash, manifest_bytes);
+    plain.insert(blake3_hash(&tokenizer_bytes).0, tokenizer_bytes);
+    Ok((HarnessArtifacts { plain, shards }, manifest_hash))
 }
 
-/// Assemble the staging corpus **through the artifact store** (the one fetch path): fetch the
-/// manifest by its committed hash, parse it, fetch every shard by its committed hash, and let
-/// `Corpus::from_parts` re-run the per-shard integrity verification — byte-for-byte the
-/// `build_corpus` shape over the unified store.
-fn t2_corpus_via_store(
-    store: &T2Artifacts,
-    manifest_hash: &[u8; 32],
-) -> Result<daemon_vhc_session::data::Corpus, String> {
-    let manifest_bytes = store.fetch(manifest_hash)?;
-    let manifest = daemon_vhc_session::data::Manifest::from_json(
-        std::str::from_utf8(&manifest_bytes).map_err(|e| format!("manifest utf8: {e}"))?,
-    )
-    .map_err(|e| format!("parse manifest: {e}"))?;
-    let mut blobs = Vec::with_capacity(manifest.shards.len());
-    for desc in &manifest.shards {
-        let hash = hex32(&desc.blake3)
-            .ok_or_else(|| format!("shard hash `{}` is not 64 hex chars", desc.blake3))?;
-        blobs.push(store.fetch(&hash)?);
+/// The staging corpus, assembled **through the artifact store** (the one fetch path): fetch the
+/// canonical-CBOR manifest by its committed hash, fetch every shard by its FOLD identity, and
+/// re-verify every chunk against the manifest's chunk hashes (the same covering-chunk integrity
+/// rule the pump enforces on `data@2` ranges — never trust a staging layer you didn't have to).
+struct StagingCorpus {
+    manifest: daemon_vhc_proto::CorpusManifest,
+    blobs: Vec<Vec<u8>>,
+}
+
+impl StagingCorpus {
+    fn via_store(store: &HarnessArtifacts, manifest_hash: &[u8; 32]) -> Result<Self, String> {
+        let manifest_bytes = store.fetch(manifest_hash)?;
+        let manifest = daemon_vhc_proto::CorpusManifest::from_canonical_bytes(&manifest_bytes)
+            .map_err(|e| format!("parse manifest: {e}"))?;
+        let mut blobs = Vec::with_capacity(manifest.shards.len());
+        for (i, entry) in manifest.shards.iter().enumerate() {
+            let bytes = store.fetch(&entry.shard_hash.0)?;
+            if bytes.len() as u64 != entry.byte_len {
+                return Err(format!("shard {i} byte length lies"));
+            }
+            for (c, chunk) in bytes
+                .chunks(usize::try_from(manifest.chunk_size).unwrap_or(usize::MAX))
+                .enumerate()
+            {
+                if entry.chunk_hashes.get(c).map(|h| h.0) != Some(*blake3::hash(chunk).as_bytes()) {
+                    return Err(format!("shard {i} chunk {c} does not verify"));
+                }
+            }
+            blobs.push(bytes);
+        }
+        Ok(Self { manifest, blobs })
     }
-    daemon_vhc_session::data::Corpus::from_parts(manifest, blobs)
-        .map_err(|e| format!("t2 corpus: {e}"))
+
+    /// The token ids of sequence `id` (LE u16 extraction over the pinned geometry — the same
+    /// windowing arithmetic the module-side SDK owns; the plumbing stages content only).
+    fn sequence(&self, id: u64) -> Result<Vec<u32>, String> {
+        let seq_len = u64::from(self.manifest.seq_len);
+        let total = self.manifest.total_sequences();
+        if total == 0 {
+            return Err("empty corpus".into());
+        }
+        let mut seq = id % total;
+        for (entry, blob) in self.manifest.shards.iter().zip(&self.blobs) {
+            let seqs = entry.token_count / seq_len;
+            if seq < seqs {
+                let start = (seq * seq_len * 2) as usize;
+                return Ok(blob[start..start + (seq_len as usize) * 2]
+                    .chunks_exact(2)
+                    .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
+                    .collect());
+            }
+            seq -= seqs;
+        }
+        Err(format!("sequence {id} out of range"))
+    }
 }
 
 /// The trainer's staged-batch wrapper: `[0, round, step, sequences, seq_len, tokens_le]`
@@ -205,7 +254,7 @@ fn batch_wrapper(round: u64, step: u32, sequences: u32, tokens: &[u32]) -> Resul
         ciborium::value::Value::from(round),
         ciborium::value::Value::from(step),
         ciborium::value::Value::from(sequences),
-        ciborium::value::Value::from(T2_SEQ_LEN),
+        ciborium::value::Value::from(SEQ_LEN),
         ciborium::value::Value::Bytes(le),
     ]);
     to_canonical_vec(&v).map_err(|e| format!("batch wrapper: {e}"))
@@ -330,9 +379,9 @@ pub(crate) async fn join_and_run(
         module: module_hash,
     };
     // The t2 artifact store: ONE fetch path (B2) — the session's staging reads and any guest
-    // data@2::fetch are both answered through T2Artifacts::fetch; the run's artifact grants are
+    // data@2::fetch are both answered through HarnessArtifacts::fetch; the run's artifact grants are
     // exactly the store's committed hashes (which artifacts a module may touch is a grant).
-    let (artifacts, manifest_hash) = t2_corpus_artifacts()?;
+    let (artifacts, manifest_hash) = harness_corpus_artifacts()?;
     let mut run_cfg = RunConfig::new(
         identity.clone(),
         worker_key_seed,
@@ -403,7 +452,7 @@ pub(crate) async fn join_and_run(
     .await;
 
     // The corpus the staging path reads — assembled THROUGH the artifact store (one fetch path).
-    let corpus = t2_corpus_via_store(&artifacts, &manifest_hash)?;
+    let corpus = StagingCorpus::via_store(&artifacts, &manifest_hash)?;
     let mut rounds_done = 0u64;
     let mut last_round = 0u64;
     let mut last_digest = [0u8; 16];
@@ -413,7 +462,7 @@ pub(crate) async fn join_and_run(
     let mut puts: Vec<Vec<u8>> = Vec::new();
     let step_timeout = Duration::from_secs(120);
 
-    while rounds_done < T2_ROUNDS {
+    while rounds_done < DRIVE_ROUNDS {
         // The coordinator's next authoritative decision, authority-judged above the pump.
         let (sender, evidence, msg) = coord.next_decision(step_timeout)?;
         let (auth_sender, _token) =
@@ -431,12 +480,9 @@ pub(crate) async fn join_and_run(
                 // corpus, in training order.
                 let interval =
                     daemon_vhc_session::data::BatchInterval::new(ro.batch.start, ro.batch.end);
-                let steps = daemon_vhc_session::data::slice_interval(
-                    interval,
-                    T2_STEPS_PER_ROUND,
-                    T2_BATCH_SEQS,
-                )
-                .map_err(|e| format!("t2 window slicing: {e}"))?;
+                let steps =
+                    daemon_vhc_session::data::slice_interval(interval, STEPS_PER_ROUND, BATCH_SEQS)
+                        .map_err(|e| format!("t2 window slicing: {e}"))?;
                 for (h, step) in steps.iter().enumerate() {
                     let mut tokens = Vec::new();
                     let mut sequences = 0u32;
@@ -657,13 +703,13 @@ fn deliver_to_worker(
 /// Wait (bounded) until the pump has published at least `target` frames in total, servicing the
 /// guest's ops meanwhile (the async-runtime seat): `payload_put`s' sealed bytes are captured
 /// into `puts` (the barrier's staging + commitment-evidence input), and `data.fetch`s are
-/// answered from the run's artifact store — the SAME `T2Artifacts::fetch` the session's own
+/// answered from the run's artifact store — the SAME `HarnessArtifacts::fetch` the session's own
 /// corpus staging reads through (one fetch path; the pump re-verifies + range-slices).
 fn wait_publishes_servicing(
     pump: &daemon_vhc_host::run::PumpHandle,
     target: usize,
     puts: &mut Vec<Vec<u8>>,
-    artifacts: &T2Artifacts,
+    artifacts: &HarnessArtifacts,
 ) -> Result<Vec<(u64, u64, Vec<u8>)>, String> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -674,9 +720,12 @@ fn wait_publishes_servicing(
                     pump.complete_op(op, daemon_vhc_host::run::OpOutcome::PutDone)
                         .map_err(|e| format!("put completion: {e}"))?;
                 }
-                daemon_vhc_host::run::OpRequest::ArtifactFetch { hash, .. } => {
+                daemon_vhc_host::run::OpRequest::ArtifactFetch { hash, .. }
+                | daemon_vhc_host::run::OpRequest::ArtifactRange { hash, .. } => {
                     // The unified fetch path: the same store + verification discipline the
-                    // staging corpus was assembled through (the range is the pump's job).
+                    // staging corpus was assembled through. Whole-object answers serve both
+                    // classes — the pump verifies (whole hash, or the registered covering
+                    // chunks) and slices; the store is untrusted either way.
                     let _ = match artifacts.fetch(&hash) {
                         Ok(artifact) => pump
                             .complete_op(

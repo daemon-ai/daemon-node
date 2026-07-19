@@ -551,31 +551,6 @@ pub struct IrohCredentials {
     pub roster: Vec<IrohRosterPeer>,
 }
 
-/// A content-addressed reference to a pre-tokenized corpus manifest (P3 lane S, spec §8). Present in
-/// [`EngineParams::corpus`] ⇒ the worker fetches the manifest + its assigned shards **by content
-/// hash** from the payload store (presign GET on `corpus/<blake3>.{json,bin}`), verifies blake3, and
-/// builds a windowed `Corpus`; absent ⇒ the synthetic fallback (the `corpus_*` fields). Deterministic
-/// across peers so the digest transcript agrees.
-///
-/// Additive to the frozen A3 `EngineParams` (a new **type**, referenced only from a new
-/// `#[serde(default)] Option` field) — every pre-P3 `EngineParams` round-trips unchanged.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CorpusRef {
-    /// blake3 of the canonical `manifest.json` object (the fetch key `corpus/<hex>.json`).
-    pub manifest_blake3: [u8; 32],
-    /// The manifest object's byte size (advisory; the fetch verifies the hash regardless).
-    #[serde(default)]
-    pub manifest_size: u64,
-    /// The first sequence index of the run's active data window (§6.3). `0` for a run that starts at
-    /// the corpus head.
-    #[serde(default)]
-    pub window_start: u64,
-    /// The number of sequences in the active window (`rounds × global_batch`); `0` ⇒ the whole
-    /// corpus. The worker stages only the shards this window touches ([`crate::data::Manifest::shards_covering`]).
-    #[serde(default)]
-    pub window_sequences: u64,
-}
-
 /// The engine + corpus knobs the worker's `RoundEngine` needs (from the run's declared config /
 /// frozen envelope). Deterministic across peers so the digest transcript agrees.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,11 +588,6 @@ pub struct EngineParams {
     /// live-e2e shim recipe, applied identically by every peer so digests agree).
     #[serde(default)]
     pub corpus_vocab_clamp: u32,
-    /// Optional content-addressed pre-tokenized corpus (P3 lane S). `Some` ⇒ the worker fetches the
-    /// manifest + its assigned shards by content hash and builds a windowed `Corpus`; `None` ⇒ the
-    /// synthetic corpus above (the CI/test fallback). Additive (`#[serde(default)]`, back-compat).
-    #[serde(default)]
-    pub corpus: Option<CorpusRef>,
 }
 
 /// The canonical-CBOR body of [`Command::JoinRun`]'s `credentials` (A3, frozen at Merge 2). Authored
@@ -985,7 +955,6 @@ mod tests {
                 corpus_seq_len: 8,
                 corpus_vocab_clamp: 64,
                 payload_retention_rounds: 16,
-                corpus: None,
             },
         };
         let bytes = creds.to_bytes().expect("encode credentials");
@@ -1092,14 +1061,15 @@ mod tests {
         assert_eq!(back.shared_mb, 120_000);
     }
 
-    /// `engine_params_corpus_is_additive_back_compatible` (P3 lane S): a pre-P3 `EngineParams` CBOR
-    /// (a map WITHOUT the `corpus` field) still decodes, defaulting `corpus` to `None`; and a
-    /// `CorpusRef` round-trips through the credentials codec.
+    /// `engine_params_without_corpus_ref_still_decode` (corpus contract): an `EngineParams` CBOR
+    /// carrying the RETIRED `corpus` reference field (a map with an extra key) still decodes —
+    /// the production data path is the genesis-pinned chunk-addressed corpus manifest, and the
+    /// engine-era credentials schema simply no longer carries a corpus reference.
     #[test]
-    fn engine_params_corpus_is_additive_back_compatible() {
-        // A pre-P3 EngineParams had no `corpus` field. `#[serde(default)]` fills `None`.
+    fn engine_params_without_corpus_ref_still_decode() {
+        // A retired-era EngineParams carried an extra `corpus` key; decode ignores it.
         #[derive(serde::Serialize)]
-        struct LegacyEngineParams {
+        struct RetiredEngineParams {
             steps_per_round: u32,
             micro_batch: u32,
             stall_rounds_max: u32,
@@ -1108,8 +1078,9 @@ mod tests {
             corpus_shards: u32,
             corpus_tokens_per_shard: u64,
             corpus_seq_len: u32,
+            corpus: Option<u32>,
         }
-        let legacy = LegacyEngineParams {
+        let retired = RetiredEngineParams {
             steps_per_round: 2,
             micro_batch: 2,
             stall_rounds_max: 3,
@@ -1118,26 +1089,10 @@ mod tests {
             corpus_shards: 4,
             corpus_tokens_per_shard: 256,
             corpus_seq_len: 8,
+            corpus: None,
         };
         let decoded: EngineParams =
-            decode(&encode(&legacy).expect("encode legacy")).expect("legacy EngineParams decodes");
-        assert_eq!(
-            decoded.corpus, None,
-            "missing corpus field defaults to None"
-        );
+            decode(&encode(&retired).expect("encode")).expect("EngineParams decodes");
         assert_eq!(decoded.corpus_shards, 4);
-
-        // A CorpusRef round-trips.
-        let with_corpus = EngineParams {
-            corpus: Some(CorpusRef {
-                manifest_blake3: [0x9A; 32],
-                manifest_size: 4096,
-                window_start: 0,
-                window_sequences: 1024,
-            }),
-            ..decoded
-        };
-        let back: EngineParams = decode(&encode(&with_corpus).expect("encode")).expect("decode");
-        assert_eq!(back.corpus, with_corpus.corpus);
     }
 }

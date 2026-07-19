@@ -10,9 +10,12 @@
 //! - `publish-module` uploads a module to `modules/<blake3>.wasm` (a presigned PUT direct to R2 on
 //!   the SigV4 plane) and prints its `blake3` + `size` + the `r2://modules/<blake3>.wasm` URL to drop
 //!   into the envelope's `[artifacts]` (the worker's `resolve_module` fetches it by hash).
-//! - `publish-corpus` uploads each `tokenize-corpus` shard to `corpus/<shard_blake3>.bin` and the
-//!   `manifest.json` to `corpus/<manifest_blake3>.json`, then prints the `manifest_blake3` + total
-//!   sequences for the `CorpusRef` (`EngineParams.corpus`) the run author declares.
+//! - `publish-corpus` uploads the chunk-addressed corpus a `tokenize-corpus` run authored: each
+//!   shard to `corpus/<shard_hash>.bin` (the shard's **fold** identity — the chunk-addressed
+//!   artifact id, never a plain content hash), the tokenizer artifact to
+//!   `corpus/<tokenizer_blake3>.json`, and the canonical-CBOR manifest LAST to
+//!   `corpus/<manifest_blake3>.cbor`. Prints the genesis `corpus_manifest` pin + the complete
+//!   artifact list a trainer role's grants must carry.
 //!
 //! xtask is maintainer dev tooling (not the shipped node); its egress rides the SSRF-safe
 //! [`daemon_egress::EgressClient`] and the fs reads are covered by main.rs's crate-level
@@ -23,7 +26,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
 use daemon_vhc_net::{HttpPresignClient, PresignClient, PresignOp, PresignRequest, RunId};
-use daemon_vhc_session::data::Manifest;
+use daemon_vhc_proto::corpus::CorpusManifest;
 
 /// The presign coordinator target + auth (mirrors the worker's `JoinCredentials` auth choices).
 pub struct Target {
@@ -105,8 +108,9 @@ pub fn publish_module(module: PathBuf, target: Target) -> Result<()> {
     Ok(())
 }
 
-/// `publish-corpus`: upload every shard listed in `<dir>/manifest.json` to `corpus/<shard_blake3>.bin`
-/// and the manifest itself to `corpus/<manifest_blake3>.json`. Prints the `CorpusRef` fields.
+/// `publish-corpus`: upload the chunk-addressed corpus beside `<dir>/corpus-manifest.cbor` —
+/// every shard under its fold identity, the tokenizer artifact, and the manifest LAST (so a
+/// partial corpus never has a resolvable manifest). Prints the genesis pin + the artifact list.
 pub fn publish_corpus(manifest_path: PathBuf, target: Target) -> Result<()> {
     let dir = manifest_path
         .parent()
@@ -114,9 +118,19 @@ pub fn publish_corpus(manifest_path: PathBuf, target: Target) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
     let manifest_bytes = std::fs::read(&manifest_path)
         .with_context(|| format!("read {}", manifest_path.display()))?;
-    let manifest = Manifest::from_json(std::str::from_utf8(&manifest_bytes)?)
-        .with_context(|| format!("parse {}", manifest_path.display()))?;
-    let manifest_hash = blake3::hash(&manifest_bytes).to_hex().to_string();
+    let manifest = CorpusManifest::from_canonical_bytes(&manifest_bytes)
+        .map_err(|e| anyhow::anyhow!("parse {}: {e}", manifest_path.display()))?;
+    let manifest_hash = daemon_vhc_proto::blake3_hash(&manifest_bytes).to_hex();
+
+    let tokenizer_bytes = std::fs::read(dir.join("tokenizer.json"))
+        .context("read tokenizer.json beside the manifest")?;
+    let tokenizer_hash = daemon_vhc_proto::blake3_hash(&tokenizer_bytes);
+    anyhow::ensure!(
+        tokenizer_hash == manifest.tokenizer.hash,
+        "tokenizer.json blake3 {} does not match the manifest's tokenizer identity {}",
+        tokenizer_hash.to_hex(),
+        manifest.tokenizer.hash.to_hex()
+    );
 
     let rt = tokio::runtime::Runtime::new().context("tokio runtime")?;
     rt.block_on(async {
@@ -124,39 +138,50 @@ pub fn publish_corpus(manifest_path: PathBuf, target: Target) -> Result<()> {
         let egress = EgressClient::new(EgressConfig::default()).context("egress client")?;
         let run = RunId::new(&target.run);
 
-        for shard in &manifest.shards {
-            let bytes = std::fs::read(dir.join(&shard.name))
-                .with_context(|| format!("read shard {}", shard.name))?;
-            let actual = blake3::hash(&bytes).to_hex().to_string();
+        for (i, shard) in manifest.shards.iter().enumerate() {
+            let name = format!("{}.bin", shard.shard_hash.to_hex());
+            let bytes = std::fs::read(dir.join(&name))
+                .with_context(|| format!("read shard {i} ({name})"))?;
+            // Integrity before upload: the file's chunk fold must BE the manifest identity.
+            let entry =
+                CorpusManifest::author_shard(&bytes, shard.token_count, manifest.chunk_size)
+                    .map_err(|e| anyhow::anyhow!("shard {i}: {e}"))?;
             anyhow::ensure!(
-                actual == shard.blake3,
-                "shard {} content blake3 {actual} does not match manifest {}",
-                shard.name,
-                shard.blake3
+                entry.shard_hash == shard.shard_hash,
+                "shard {i} bytes do not fold to the manifest identity {}",
+                shard.shard_hash.to_hex()
             );
-            let path = format!("corpus/{}.bin", shard.blake3);
+            let path = format!("corpus/{}.bin", shard.shard_hash.to_hex());
             put_artifact(&presign, &egress, &run, &path, &bytes).await?;
-            println!(
-                "  shard {} -> r2://{path} ({} bytes)",
-                shard.name,
-                bytes.len()
-            );
+            println!("  shard {i} -> r2://{path} ({} bytes)", bytes.len());
         }
+        let tokenizer_key = format!("corpus/{}.json", manifest.tokenizer.hash.to_hex());
+        put_artifact(&presign, &egress, &run, &tokenizer_key, &tokenizer_bytes).await?;
+        println!(
+            "  tokenizer -> r2://{tokenizer_key} ({} bytes)",
+            tokenizer_bytes.len()
+        );
         // Upload the manifest LAST (so a partial corpus never has a resolvable manifest).
-        let manifest_key = format!("corpus/{manifest_hash}.json");
+        let manifest_key = format!("corpus/{manifest_hash}.cbor");
         put_artifact(&presign, &egress, &run, &manifest_key, &manifest_bytes).await?;
         anyhow::Ok(())
     })?;
 
-    println!("published corpus manifest to r2://corpus/{manifest_hash}.json");
-    println!("  CorpusRef.manifest_blake3 (hex) = {manifest_hash}");
+    println!("published corpus manifest to r2://corpus/{manifest_hash}.cbor");
+    println!("  genesis `corpus_manifest` pin        = {manifest_hash}");
     println!(
-        "  CorpusRef.manifest_size         = {}",
-        manifest_bytes.len()
+        "  tokenizer artifact blake3            = {}",
+        manifest.tokenizer.hash.to_hex()
     );
     println!(
-        "  total sequences = {} (set window_sequences = min(rounds*global_batch, total), or 0 = whole corpus)",
+        "  total sequences                      = {}",
         manifest.total_sequences()
     );
+    println!("  trainer-role artifact grants (manifest + tokenizer + every shard):");
+    println!("    {manifest_hash}");
+    println!("    {}", manifest.tokenizer.hash.to_hex());
+    for shard in &manifest.shards {
+        println!("    {}", shard.shard_hash.to_hex());
+    }
     Ok(())
 }
