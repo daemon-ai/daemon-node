@@ -65,6 +65,9 @@ pub struct GrantsDoc {
     pub max_outstanding_ops: u64,
     /// compute@2 command-queue depth grant.
     pub compute_queue_depth: u64,
+    /// Cumulative `data@2` read budget in bytes (`0` = unbounded by this grant).
+    #[serde(default)]
+    pub data_read_budget_bytes: u64,
     /// The migration grant, when the role participates in live upgrades.
     pub migration: Option<MigrationGrant>,
 }
@@ -94,6 +97,7 @@ impl GrantsDoc {
             artifacts: role.artifacts.clone(),
             max_outstanding_ops: role.max_outstanding_ops,
             compute_queue_depth: role.compute_queue_depth,
+            data_read_budget_bytes: role.data_read_budget_bytes,
             migration: role.migration,
         }
     }
@@ -134,6 +138,8 @@ pub struct LaneCeilings {
     pub max_readback_bytes: u64,
     /// Ceiling on the async-completion `max_outstanding` grant.
     pub max_outstanding_ops: u64,
+    /// Ceiling on the cumulative `data@2` read budget (bytes; `0` = no lane ceiling).
+    pub data_read_budget_bytes: u64,
     /// Ceiling on the compute@2 command-queue depth grant (C1, ABI §15 — "a queue-depth grant
     /// bounds outstanding device work"; D0∩C1 union: the ninth tightened quota).
     pub compute_queue_depth: u64,
@@ -167,6 +173,8 @@ pub struct AdmittedQuotas {
     pub max_readback_bytes: u64,
     /// Admitted concurrent-operation ceiling.
     pub max_outstanding_ops: u64,
+    /// Admitted cumulative `data@2` read budget (bytes; `0` = unbounded by this grant).
+    pub data_read_budget_bytes: u64,
     /// Admitted compute@2 command-queue depth (C1's `RunConfig.compute_queue_depth`; tightened
     /// exactly like the other quotas — D0∩C1 union).
     pub compute_queue_depth: u64,
@@ -362,6 +370,11 @@ pub fn derive_admitted_quotas(
         non_zero(role.compute_queue_depth),
         lane.compute_queue_depth,
     )?;
+    let data_read_budget_bytes = tighten(
+        "data_read_budget_bytes",
+        non_zero(role.data_read_budget_bytes),
+        lane.data_read_budget_bytes,
+    )?;
 
     Ok(AdmittedQuotas {
         max_frame_bytes,
@@ -375,6 +388,7 @@ pub fn derive_admitted_quotas(
         max_readback_bytes,
         max_outstanding_ops,
         compute_queue_depth,
+        data_read_budget_bytes,
         granted_artifacts: role.artifacts.clone(),
     })
 }
@@ -409,6 +423,7 @@ mod tests {
             max_readback_bytes: 1 << 20,
             max_outstanding_ops: 64,
             compute_queue_depth: 512,
+            data_read_budget_bytes: 1 << 30,
             worlds: ["vhc", "net", "sys", "data"]
                 .iter()
                 .map(|s| (*s).to_string())

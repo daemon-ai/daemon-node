@@ -149,13 +149,31 @@ pub const SYS_V2_SYMBOLS: &[&str] = &[
 /// Which artifacts a module may touch is a **grant** — a fetch outside the admitted artifact
 /// set traps `GrantViolation` (typed, attributable).
 ///
-/// **Sub-resource (range) verification rule:** there are no per-range hashes in the artifact
-/// map, so a range is verified as a slice OF hash-verified content — the host fetches and
-/// verifies the whole artifact against its committed blake3 (LRU content cache makes repeated
-/// ranged reads cheap), then slices `[range_off, range_off + range_len)` (`range_len == 0` =
-/// to the end) into the completion buffer. An out-of-bounds range completes
-/// `Err(StoreRefused)` — a completion error, not a trap (bounds are unknowable at call time).
-pub const DATA_V2_SYMBOLS: &[&str] = &["fetch"];
+/// **Sub-resource (range) verification rule — two artifact classes:**
+///
+/// - **Plain artifacts** (module blobs, tokenizers, the corpus manifest): no per-range hashes
+///   exist, so a range is verified as a slice OF hash-verified content — the host fetches and
+///   verifies the whole artifact against its committed blake3 (LRU content cache makes
+///   repeated ranged reads cheap), then slices `[range_off, range_off + range_len)`
+///   (`range_len == 0` = to the end) into the completion buffer. An out-of-bounds range
+///   completes `Err(StoreRefused)` — a completion error, not a trap (bounds are unknowable at
+///   call time).
+/// - **Chunk-addressed artifacts** (corpus shards): the artifact's committed identity is the
+///   domain-separated fold of its ordered per-chunk blake3 hashes + geometry
+///   (`daemon_vhc_proto::corpus::shard_fold`), and the module MUST first register the chunk
+///   list via `register_chunks(desc_ptr, desc_len) -> status` — canonical-CBOR
+///   `[chunk_size, token_count, byte_len, [c_0, …]]`; the host re-derives the fold and admits
+///   the map only when the fold IS a granted artifact hash (else `GrantViolation`), returning
+///   0 (idempotent re-registration included). A subsequent `fetch` of that hash is served as
+///   the chunk-aligned **covering span** of the requested range: the embedder moves only the
+///   span bytes, the host verifies each covering chunk against the registered hashes, then
+///   slices the exact range — whole-shard verify-on-first-touch is rejected by design (it
+///   defeats streaming). Bounds are knowable at registration, so an out-of-bounds range on a
+///   registered artifact completes `Err(StoreRefused)` immediately, and the cumulative
+///   `data-read-budget` grant is charged per fetch at the call (breach completes
+///   `Err(GrantExhausted)`, never silent truncation). Registration is deterministic guest
+///   output (§2.7 dc class — no journal record; replay re-executes it).
+pub const DATA_V2_SYMBOLS: &[&str] = &["fetch", "register_chunks"];
 
 /// The domain-separation context for the run-scoped RNG seed (`sys@2::rng_seed`): the seed is
 /// `blake3::derive_key(RNG_SEED_DOMAIN_V2, material)` where `material` is the unambiguous
@@ -318,6 +336,12 @@ pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
     (NS_COMPUTE_V2, "fence", COMPUTE_MINOR_V2),
     (NS_COMPUTE_V2, "export", COMPUTE_MINOR_V2),
     (NS_COMPUTE_V2, "import", COMPUTE_MINOR_V2),
+    // -- minor 2 (the chunk-addressed corpus contract): chunk-map registration ------------------
+    // The fold-identity registration that turns `fetch` into a covering-span, chunk-verified
+    // range read for corpus shards (see `DATA_V2_SYMBOLS` for the full rules). Registers at the
+    // host-implemented minor, landing in the same change that wires the chunked fetch path into
+    // the event-loop driver (the B1/C1 coupled-bump discipline).
+    (NS_DATA_V2, "register_chunks", 2),
 ];
 
 /// The minor at which `(namespace, symbol)` was introduced, or `None` if it is not a registered

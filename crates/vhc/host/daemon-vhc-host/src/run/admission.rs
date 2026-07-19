@@ -144,6 +144,9 @@ impl ParticipationLane {
                 max_outstanding_ops: 256,
                 // The compute@2 queue-depth ceiling (C1; mirrors the `RunConfig` default).
                 compute_queue_depth: 1024,
+                // No lane ceiling on the cumulative data@2 read budget: the envelope grant
+                // stands (0 = unbounded by this grant, ABI §2.3).
+                data_read_budget_bytes: 0,
                 // The worlds a Trainer-lane role may be granted (§9.6: all four capability
                 // worlds; `vhc` loop mechanics always).
                 worlds: ["vhc", "net", "sys", "data", "compute"]
@@ -285,6 +288,7 @@ pub fn apply_admitted_quotas(
     cfg.max_live_buffer_bytes = q.max_live_bytes;
     cfg.max_outstanding_ops = q.max_outstanding_ops;
     cfg.compute_queue_depth = q.compute_queue_depth;
+    cfg.data_read_budget_bytes = q.data_read_budget_bytes;
     cfg.granted_artifacts = q.granted_artifacts.iter().map(|h| h.0).collect();
 }
 
@@ -1042,6 +1046,7 @@ mod tests {
             },
             roles,
             artifacts,
+            corpus_manifest: None,
             authority: ciborium::value::Value::Map(vec![]),
             transport: daemon_vhc_proto::TransportSelection::default(),
             identities: daemon_vhc_proto::Identities::default(),
@@ -1083,6 +1088,7 @@ mod tests {
             max_readback_bytes: 1 << 14,
             max_outstanding_ops: 6,
             compute_queue_depth: 48,
+            data_read_budget_bytes: 1 << 20,
             granted_artifacts: [daemon_vhc_proto::Hash([7u8; 32])].into_iter().collect(),
         };
         let admission = Admission {
