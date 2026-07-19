@@ -327,6 +327,8 @@ fn classify(req: &ApiRequest) -> Coverage {
         | VhcRunDetail { .. }
         | VhcJoin { .. }
         | VhcLeave { .. }
+        | VhcPause { .. }
+        | VhcResume { .. }
         | VhcSetPolicy { .. }
         | VhcHardwareReport => NotSessionTouching,
         ProfileList
