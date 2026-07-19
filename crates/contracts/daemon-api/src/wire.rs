@@ -288,6 +288,20 @@ pub enum ApiRequest {
         /// The client-minted idempotency key (ADR-006).
         op_id: String,
     },
+    /// [`VhcApi::vhc_pause`].
+    VhcPause {
+        /// The run to pause.
+        run_id: String,
+        /// The client-minted idempotency key (ADR-006).
+        op_id: String,
+    },
+    /// [`VhcApi::vhc_resume`].
+    VhcResume {
+        /// The run to resume.
+        run_id: String,
+        /// The client-minted idempotency key (ADR-006).
+        op_id: String,
+    },
     /// [`VhcApi::vhc_set_policy`].
     VhcSetPolicy {
         /// The new default participation policy.
@@ -1331,10 +1345,11 @@ impl ApiRequest {
             | ApiRequest::RosterRemove { op_id, .. }
             | ApiRequest::FtSend { op_id, .. }
             | ApiRequest::TransportConfigure { op_id, .. } => op_id,
-            // Vhc join/leave carry a required op_id (not `Option`) — return it directly.
-            ApiRequest::VhcJoin { op_id, .. } | ApiRequest::VhcLeave { op_id, .. } => {
-                return Some(op_id.as_str())
-            }
+            // Vhc lifecycle intents carry a required op_id (not `Option`) — return it directly.
+            ApiRequest::VhcJoin { op_id, .. }
+            | ApiRequest::VhcLeave { op_id, .. }
+            | ApiRequest::VhcPause { op_id, .. }
+            | ApiRequest::VhcResume { op_id, .. } => return Some(op_id.as_str()),
             _ => return None,
         };
         op.as_deref()

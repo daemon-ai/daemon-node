@@ -34,7 +34,9 @@ use crate::arbiter::{
     AdmitRefusal, ClaimTiers, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId, TierBytes,
 };
 use crate::discovery::RunDiscovery;
-use crate::store::{DesiredState, PersistedRun, RunState, StoreError, VhcStore, EVENT_WINDOW};
+use crate::store::{
+    effective_state, DesiredState, PersistedRun, RunState, StoreError, VhcStore, EVENT_WINDOW,
+};
 
 /// A node-feed sink: the node passes a closure over `NodeEventFeed::emit` so live vhc updates ride
 /// the existing `events_subscribe` channel as `VhcChanged` pointers (no new transport).
@@ -1511,6 +1513,95 @@ impl VhcApi for VhcService {
         Ok(())
     }
 
+    async fn vhc_pause(&self, run_id: String, _op_id: String) -> Result<(), ApiError> {
+        self.require_enabled().map_err(|e| e.to_api())?;
+        let map = |e: StoreError| VhcError::from(e).to_api();
+        let Some(_) = self.store.get_run(&run_id).map_err(map)? else {
+            return Err(ApiError::Other(format!("unknown run `{run_id}`")));
+        };
+        // Durable owner intent FIRST: pause survives a crash/restart from this point on (a
+        // paused run is never reconverged until resumed), and the owner taking manual control
+        // clears any pending reconvergence.
+        self.store
+            .set_desired_state(&run_id, DesiredState::Paused)
+            .map_err(map)?;
+        self.store.clear_retry(&run_id).map_err(map)?;
+        // The HARD pause reaches the run's worker (its own factory child under multi-instance
+        // supervision; the shared default worker otherwise — whose pause is host-wide by
+        // construction). `paused` promises memory, not just time: the worker drops the wasm
+        // instance + device allocations and keeps only CPU masters.
+        let entry_worker = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .get(&run_id)
+                .map(|e| (e.id.clone(), e.worker.clone()))
+        };
+        if let Some((id, worker)) = entry_worker {
+            worker
+                .throttle(None, None, true)
+                .await
+                .map_err(|e| e.to_api())?;
+            // Release-on-pause: the pause was accepted by the child's serial command loop (the
+            // memory is surrendered), so the ledger reservation releases — accurate accounting
+            // over a held-but-idle reservation; resume re-admits against the CURRENT ledgers.
+            self.arbiter.release(&id);
+        }
+        self.emit_changed(Some(run_id));
+        Ok(())
+    }
+
+    async fn vhc_resume(&self, run_id: String, _op_id: String) -> Result<(), ApiError> {
+        self.require_enabled().map_err(|e| e.to_api())?;
+        let map = |e: StoreError| VhcError::from(e).to_api();
+        let Some(run) = self.store.get_run(&run_id).map_err(map)? else {
+            return Err(ApiError::Other(format!("unknown run `{run_id}`")));
+        };
+        if run.desired_state != DesiredState::Paused {
+            // Idempotent for an already-joined run; anything else is a typed refusal.
+            return if run.desired_state == DesiredState::Joined {
+                Ok(())
+            } else {
+                Err(ApiError::Other(format!(
+                    "run `{run_id}` is not paused (it was left); join it instead"
+                )))
+            };
+        }
+        // A live paused instance resumes in place: re-admit against the CURRENT ledgers (the
+        // pause released the reservation), then lift the hard pause. A refusal is typed and
+        // LOUD — the run stays paused, nothing is half-resumed.
+        let entry_worker = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .get(&run_id)
+                .map(|e| (e.id.clone(), e.worker.clone()))
+        };
+        if let Some((id, worker)) = entry_worker {
+            let charge = self.derive_charge(&run.eligibility, &run.policy);
+            let priority = self.store.run_priority(&run_id).map_err(map)?;
+            if let Err(refusal) = self.admit_placed(&id, charge, priority) {
+                return Err(VhcError::from(refusal).to_api());
+            }
+            if let Err(e) = worker.throttle(None, None, false).await {
+                // The lever never landed: surrender the fresh reservation, stay paused.
+                self.arbiter.release(&id);
+                return Err(e.to_api());
+            }
+            self.store
+                .set_desired_state(&run_id, DesiredState::Joined)
+                .map_err(map)?;
+            self.store.mark_running(&run_id).map_err(map)?;
+        } else {
+            // No live instance (paused across a restart / the instance died while paused):
+            // reconverge fresh under the reinstated intent. Failure keeps the run paused.
+            self.reconverge(&run).await.map_err(|e| e.to_api())?;
+            self.store
+                .set_desired_state(&run_id, DesiredState::Joined)
+                .map_err(map)?;
+        }
+        self.emit_changed(Some(run_id));
+        Ok(())
+    }
+
     async fn vhc_set_policy(&self, policy: VhcPolicy) -> Result<(), ApiError> {
         self.require_enabled().map_err(|e| e.to_api())?;
         // Push the governor levers to the worker (§10.5) — and, under multi-instance
@@ -1628,6 +1719,9 @@ fn run_summary(run: PersistedRun) -> VhcRunSummary {
         module_abi_major: run.module_abi_major,
         selected_driver: run.selected_driver,
         module_hash: run.module_hash.as_ref().map(hex),
+        run_state: Some(effective_state(run.desired_state, run.run_state).to_string()),
+        retry_count: Some(u64::from(run.retry_count)),
+        terminal_reason: run.terminal_reason,
     }
 }
 

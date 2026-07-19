@@ -153,10 +153,15 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
 
         // -- serve_vhc: vhc-training participation (spec §10.4) -----------------------------
         // Vhc participation is node-wide operator control (like the gateway / presence / telemetry
-        // toggles): discovery/detail/hardware are control-plane reads; join/leave/set-policy move the
-        // node's durable participation intent and are node-wide control-plane writes (operator tier).
+        // toggles): discovery/detail/hardware are control-plane reads; join/leave/pause/resume/
+        // set-policy move the node's durable participation intent and are node-wide control-plane
+        // writes (operator tier).
         VhcRunList | VhcRunDetail { .. } | VhcHardwareReport => C::ControlRead,
-        VhcJoin { .. } | VhcLeave { .. } | VhcSetPolicy { .. } => C::ControlWrite,
+        VhcJoin { .. }
+        | VhcLeave { .. }
+        | VhcPause { .. }
+        | VhcResume { .. }
+        | VhcSetPolicy { .. } => C::ControlWrite,
 
         // -- serve_profile: profiles + skills (versioned) + personas (wire v36) -----------------
         ProfileList

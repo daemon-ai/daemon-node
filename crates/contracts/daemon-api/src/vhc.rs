@@ -168,6 +168,19 @@ pub struct VhcRunSummary {
     pub policy: Option<VhcPolicy>,
     /// The last-known round the node observed for the run.
     pub last_round: u64,
+    /// The run instance's effective lifecycle state (`running | completed | paused |
+    /// failed_retryable | failed_terminal | left`) — the node's two-axis state machine (owner
+    /// intent × observed instance lifecycle) projected for display. Additive: absent from a
+    /// pre-lifecycle node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_state: Option<String>,
+    /// Reconvergence attempts consumed since the last stable interval (the bounded retry
+    /// budget). Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u64>,
+    /// The typed reason recorded with a terminal transition (operator-facing detail). Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
     // -- D0 additive run-identity + sunset-observability fields (envelope v2; decisions D1/D5).
     // The node decides, the app renders (never re-derives): these mirror the vhc.db M2
     // columns. All optional — absent on pre-D0 nodes and for fields a v1 run never acquires.
@@ -357,6 +370,20 @@ pub trait VhcApi: Send + Sync {
         _op_id: String,
     ) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("vhc_leave".into()))
+    }
+
+    /// Pause a run (durable owner intent; idempotent via `op_id`): training hard-stops, the
+    /// run's resource reservations release, and the node never reconverges the run — across
+    /// restarts — until the owner resumes it.
+    async fn vhc_pause(&self, _run_id: String, _op_id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("vhc_pause".into()))
+    }
+
+    /// Resume a paused run (durable owner intent; idempotent via `op_id`): resources are
+    /// re-admitted against the owner's current ledgers — a refusal is typed and LOUD, leaving
+    /// the run paused — and participation reconverges.
+    async fn vhc_resume(&self, _run_id: String, _op_id: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("vhc_resume".into()))
     }
 
     /// Set the default participation policy for newly-joined runs (§10.5).

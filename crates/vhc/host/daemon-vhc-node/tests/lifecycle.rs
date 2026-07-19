@@ -451,6 +451,110 @@ async fn stream_closure_classifies_recoverable_and_reconverges() {
     assert_eq!(worker.joins().len(), 2);
 }
 
+/// Pause is durable owner intent with release-on-pause: the hard pause reaches the worker, the
+/// ledger reservation releases, the run survives a restart WITHOUT reconverging, and resume
+/// re-admits + reconverges.
+#[tokio::test]
+async fn pause_survives_restart_and_resume_reconverges() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vhc.db");
+    {
+        let worker = StreamingWorker::new();
+        let svc = service_over(VhcStore::open(&path).unwrap(), worker.clone(), 5);
+        svc.vhc_join("run-p".into(), policy(), "op".into())
+            .await
+            .unwrap();
+        assert_eq!(svc.arbiter().instances(), 1);
+
+        svc.vhc_pause("run-p".into(), "op-p".into()).await.unwrap();
+        // The hard pause reached the worker and the reservation released (release-on-pause).
+        assert_eq!(
+            worker.throttles.lock().unwrap().as_slice(),
+            &[(None, None, true)]
+        );
+        assert_eq!(svc.arbiter().instances(), 0);
+        let summary = &svc.vhc_run_list().await.unwrap()[0];
+        assert_eq!(summary.run_state.as_deref(), Some("paused"));
+        // A paused run is inert to the reconciliation tick.
+        assert_eq!(svc.reconcile_tick().await.unwrap(), 0);
+    }
+    // Restart: the paused intent is durable — start() reconverges NOTHING for it.
+    let worker = StreamingWorker::new();
+    let svc = service_over(VhcStore::open(&path).unwrap(), worker.clone(), 5);
+    assert_eq!(svc.start().await.unwrap(), 0, "paused is not reconverged");
+    assert!(worker.joins().is_empty());
+
+    // Resume (no live instance after the restart): reconverges fresh under the intent.
+    svc.vhc_resume("run-p".into(), "op-r".into()).await.unwrap();
+    assert_eq!(worker.joins(), vec!["run-p"]);
+    assert_eq!(svc.arbiter().instances(), 1);
+    let row = svc.store().get_run("run-p").unwrap().unwrap();
+    assert_eq!(row.run_state, RunState::Running);
+    let summary = &svc.vhc_run_list().await.unwrap()[0];
+    assert_eq!(summary.run_state.as_deref(), Some("running"));
+}
+
+/// Resume of a live paused instance re-admits against the CURRENT ledgers; a refusal is typed
+/// and loud, and the run STAYS paused (nothing half-resumes).
+#[tokio::test]
+async fn resume_refusal_leaves_the_run_paused() {
+    let worker = StreamingWorker::new();
+    let svc = Arc::new(VhcService::new(VhcServiceParts {
+        config: config(5),
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: None,
+        // A budget with room for exactly ONE instance's probed device charge (24 GiB): the
+        // first admission fits, a concurrent second cannot.
+        budget: Some(daemon_vhc_node::OwnerBudget {
+            device_memory: std::collections::BTreeMap::from([(
+                "gpu:0".to_string(),
+                30_000u64 << 20,
+            )]),
+            host_ram: u64::MAX,
+            disk: u64::MAX,
+            net_up_bps: u64::MAX,
+            net_down_bps: u64::MAX,
+            duty_pct: u32::MAX,
+            max_instances: u32::MAX,
+        }),
+        worker_factory: None,
+        identity_dir: None,
+    }));
+    svc.bind_self();
+    svc.vhc_join("run-a".into(), policy(), "op".into())
+        .await
+        .unwrap();
+    svc.vhc_pause("run-a".into(), "op-p".into()).await.unwrap();
+    // A second run consumes the freed ledger while run-a is paused.
+    svc.vhc_join("run-b".into(), policy(), "op2".into())
+        .await
+        .unwrap();
+    assert_eq!(svc.arbiter().instances(), 1);
+
+    let err = svc
+        .vhc_resume("run-a".into(), "op-r".into())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("exhausted"),
+        "typed ledger refusal, got: {err}"
+    );
+    // Loud and unharmed: run-a stays paused, no half-claimed reservation, no unpause lever.
+    let row = svc.store().get_run("run-a").unwrap().unwrap();
+    assert_eq!(
+        daemon_vhc_node::effective_state(row.desired_state, row.run_state),
+        "paused"
+    );
+    assert_eq!(svc.arbiter().instances(), 1);
+    assert_eq!(
+        worker.throttles.lock().unwrap().as_slice(),
+        &[(None, None, true)],
+        "no resume lever reached the worker"
+    );
+}
+
 /// A leave that ends the stream is NOT transport loss: the instance left the map before the
 /// stream closed, so no recoverable failure is synthesized and nothing reconverges.
 #[tokio::test]
