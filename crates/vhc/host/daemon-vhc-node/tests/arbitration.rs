@@ -50,7 +50,11 @@ impl WorkerControl for FakeChild {
             ..Default::default()
         })
     }
-    async fn assess(&self, _envelope: Vec<u8>) -> Result<Eligibility, VhcError> {
+    async fn assess(
+        &self,
+        _envelope: Vec<u8>,
+        _role: Option<String>,
+    ) -> Result<Eligibility, VhcError> {
         match self.assess_claim {
             Some((device, host)) => Ok(Eligibility {
                 eligible: true,
@@ -71,6 +75,7 @@ impl WorkerControl for FakeChild {
         _coordinator: String,
         _credentials: Vec<u8>,
         _policy: JoinPolicy,
+        _admitted_tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
     ) -> Result<(), VhcError> {
         self.joins.lock().unwrap().push(run_id);
         Ok(())
@@ -155,6 +160,7 @@ fn rig(budget: OwnerBudget) -> Rig {
         discovery: None,
         budget: Some(budget),
         worker_factory: Some(factory),
+        identity_dir: None,
     }));
     svc.bind_self();
     Rig { svc, children }
@@ -295,6 +301,7 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
             discovery: None,
             budget: Some(colocation_budget()),
             worker_factory: Some(factory),
+            identity_dir: None,
         }));
         svc.bind_self();
         svc.vhc_join("run-big".into(), policy(6_000, 40), "op-1".into())
@@ -330,6 +337,7 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
             discovery: None,
             budget: Some(shrunk),
             worker_factory: Some(factory),
+            identity_dir: None,
         }));
         svc.bind_self();
         Rig { svc, children }
@@ -422,6 +430,7 @@ async fn admitted_charge_equals_assess_claim_totals() {
         discovery: Some(Arc::new(StubDiscovery)),
         budget: Some(budget),
         worker_factory: Some(factory),
+        identity_dir: None,
     }));
     svc.bind_self();
 

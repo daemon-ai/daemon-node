@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 pub mod arbiter;
+pub mod credentials;
 pub mod discovery;
 pub mod service;
 pub mod store;

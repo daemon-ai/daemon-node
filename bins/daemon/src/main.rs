@@ -3151,6 +3151,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         discovery,
                         budget: Some(budget),
                         worker_factory: Some(worker_factory),
+                        // The node authors per-run identity + credentials against this store
+                        // (D-P8): it mints keys, issues certificates under the base identity, and
+                        // writes credential records the worker resolves by reference.
+                        identity_dir: Some(identity_dir.clone()),
                     },
                 ));
                 // A3: bind the service's own Arc so joins pump the continuous worker event stream

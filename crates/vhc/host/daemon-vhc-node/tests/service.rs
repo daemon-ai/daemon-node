@@ -70,7 +70,11 @@ impl WorkerControl for FakeWorker {
         self.calls().probes += 1;
         Ok(self.hardware.clone())
     }
-    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, VhcError> {
+    async fn assess(
+        &self,
+        envelope: Vec<u8>,
+        _role: Option<String>,
+    ) -> Result<Eligibility, VhcError> {
         self.calls().assessed_envelopes.push(envelope);
         // A distinctive verdict so a test can tell the §6.5 assess path from the probe fallback.
         Ok(Eligibility {
@@ -87,6 +91,7 @@ impl WorkerControl for FakeWorker {
         _coordinator: String,
         _credentials: Vec<u8>,
         _policy: JoinPolicy,
+        _admitted_tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
     ) -> Result<(), VhcError> {
         self.calls().joins.push(run_id);
         Ok(())
@@ -133,6 +138,7 @@ fn service(config: VhcConfig, worker: Arc<FakeWorker>, feed: Option<NodeFeed>) -
         discovery: None,
         budget: None,
         worker_factory: None,
+        identity_dir: None,
     })
 }
 
@@ -174,6 +180,7 @@ async fn join_persists_and_reload_reconverges() {
             discovery: None,
             budget: None,
             worker_factory: None,
+            identity_dir: None,
         });
         svc.vhc_join("run-a".into(), policy(), "op-a".into())
             .await
@@ -200,6 +207,7 @@ async fn join_persists_and_reload_reconverges() {
             discovery: None,
             budget: None,
             worker_factory: None,
+            identity_dir: None,
         });
         let rejoined = svc.start().await.unwrap();
         assert_eq!(rejoined, 1, "only the active intent re-converges");
@@ -468,6 +476,7 @@ async fn join_discovers_fetches_envelope_and_assesses() {
         discovery: Some(discovery),
         budget: None,
         worker_factory: None,
+        identity_dir: None,
     });
 
     svc.vhc_join("run-disc".into(), policy(), "op".into())
@@ -525,6 +534,7 @@ async fn join_refuses_a_coordinator_outside_the_allowlist() {
         discovery: Some(discovery),
         budget: None,
         worker_factory: None,
+        identity_dir: None,
     });
 
     let err = svc
