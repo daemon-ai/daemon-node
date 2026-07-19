@@ -9,7 +9,8 @@
 // kernel layer). All assertions are bit-exact because the det lane is CPU fp32 with fixed evaluation
 // order — the cross-peer identity property the vhc's agree-path leans on.
 //
-// Oracle provenance (swarm-ledger-p2-b1.md): from-definition (an independent Rust expression of the
+// Oracle provenance (archived in the engineering ledgers under docs/specs/): from-definition (an
+// independent Rust expression of the
 // spec math) and hand-derived pinned literals; the daemon fixture seed is 0xDAE0_7E57.
 
 use daemon_vhc_det::{

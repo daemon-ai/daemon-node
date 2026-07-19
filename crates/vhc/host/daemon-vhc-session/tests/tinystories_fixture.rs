@@ -4,7 +4,7 @@
 //! RUN-3 (TDD §3.3) re-run against the **real vendored TinyStories fixture** — a genuine
 //! pre-tokenized corpus (GPT-2 BPE, u16 shards) produced offline by `xtask tokenize-corpus`, so CI
 //! never needs egress (spec §8). Provenance (dataset/tokenizer + pinned HF commits) is recorded in
-//! the fixture's `manifest.json` and `swarm-ledger-m1.md`.
+//! the fixture's `manifest.json` (and the archived corpus ledger under docs/specs/).
 //!
 //! Generation command (documented, reproducible):
 //! ```text

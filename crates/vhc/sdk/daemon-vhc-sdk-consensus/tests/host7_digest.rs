@@ -8,7 +8,8 @@
 // that share the round seed, and flips on a one-bit change anywhere the schedule samples (params or
 // replicated region alike). It is CPU xxh3-128 over sampled blocks: deterministic by construction.
 //
-// Oracle provenance (swarm-ledger-p2-b1.md): from-definition — the state image is assembled exactly
+// Oracle provenance (archived in the engineering ledgers under docs/specs/): from-definition —
+// the state image is assembled exactly
 // as the host does (params, then replicated persistents, in registration order, ABI §6.3), and the
 // digest is the shared `digest_state` pure function; two peers computing it must agree.
 

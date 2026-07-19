@@ -109,7 +109,7 @@ fn envelope_hash_mismatch_rejected_when_asserted() {
 fn envelope_hash_absent_is_tolerated() {
     // Back-compat: a join that asserts no envelope hash is admitted even though the run has a
     // specific frozen envelope hash. This is the wire reality until the `Join.envelope_hash` carrier
-    // lands (a Merge-3-coordinated additive field — see swarm-ledger-p3.md); the enforcement above is
+    // lands (a coordinated additive field — an archived cross-repo decision); the enforcement above is
     // ready to consume it, but `tick` passes `None` today so existing peers are never spuriously
     // rejected.
     let cfg = base_config();
@@ -147,7 +147,7 @@ fn join_via_tick_without_hash_is_admitted() {
 fn join_via_tick_asserts_envelope_hash() {
     // the additive `Join.envelope_hash` carrier is now threaded through `tick`, so
     // a join asserting the WRONG envelope hash is rejected from the wire, and the correct hash is
-    // admitted. This closes the P2/P3 "structural but not wired" gap end-to-end.
+    // admitted. This closes the earlier "structural but not wired" gap end-to-end.
     let mut cfg = base_config();
     cfg.envelope_hash = Hash([0x77; 32]);
     let state = new_state(cfg);

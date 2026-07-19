@@ -169,7 +169,7 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
 }
 
 // =====================================================================================
-// CUDA device-memory probe (P3 Lane G — swarm-ledger-p3-g D3). Unlike wgpu, the CUDA driver exposes
+// CUDA device-memory probe (the CUDA backend lane). Unlike wgpu, the CUDA driver exposes
 // total device memory (`cuDeviceTotalMem`), so `vram_mb` is the real dedicated VRAM (24564 MiB on the
 // RunPod 4090) — a discrete-device honest number (no UMA on this card). The pure mapper is
 // unconditional (fixture-tested); the driver query is `#[cfg(feature = "cuda")]` (dlopen'd libcuda).
@@ -221,7 +221,8 @@ pub struct CudaProbe {
 ///
 /// **Memoized process-wide.** The query is `cuInit` + `cuDeviceGet` + `cuDeviceTotalMem` +
 /// `cuDeviceGetName` via `cudarc` (which dlopens libcuda under nix glibc — proven on the 4090
-/// container, swarm-ledger-p2-c2). Wrapped in `catch_unwind` so a missing-libcuda dlopen panic (e.g.
+/// container during the archived hardware validation). Wrapped in `catch_unwind` so a
+/// missing-libcuda dlopen panic (e.g.
 /// on a CUDA-less host running the feature build) reports "no device" instead of aborting the process.
 #[cfg(feature = "cuda")]
 #[must_use]
@@ -241,14 +242,16 @@ fn probe_cuda_uncached() -> Option<CudaProbe> {
 }
 
 /// Whether the NVRTC runtime library is loadable (feature `cuda`) — the **fetch-on-demand readiness
-/// gate** (swarm-ledger-p3-g D6). A CUDA *device* being present ([`probe_cuda`]) is necessary but not
+/// gate** (an archived CUDA-lane decision). A CUDA *device* being present ([`probe_cuda`]) is necessary but not
 /// sufficient for the CUDA engine arm: burn-cuda JIT-compiles kernels through NVRTC, which most
 /// containers do not ship and which must be **driver-matched** (an nvrtc newer than the driver's CUDA
-/// level emits PTX the driver rejects — `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`, the P2 C2 finding). The
+/// level emits PTX the driver rejects — `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`, an archived
+/// container-validation finding). The
 /// operator (or the future fetch-on-demand stager) provides it via `DAEMON_CUDA_RUNTIME_DIR` on
 /// `LD_LIBRARY_PATH`; cudarc dlopens `libnvrtc.so.12` by soname on first use.
 ///
-/// This check has **two legs**, both required (live-attach smoke finding, swarm-ledger-p3-g D6):
+/// This check has **two legs**, both required (a live-attach smoke finding from the CUDA-lane
+/// validation):
 ///
 /// 1. **`libnvrtc` loadability** — compile-and-free a trivial NVRTC program inside `catch_unwind`:
 ///    in cudarc's dlopen mode a missing `libnvrtc` surfaces as a panic on first symbol resolution,
@@ -305,8 +308,8 @@ fn cuda_jit_headers_present() -> bool {
 
 // The one cudarc-touching module. `cuDeviceTotalMem` / `destroy_program` are `cudarc` `unsafe fn`s,
 // so this module carries the scoped `#[allow(unsafe_code)]` under the crate's `#![deny(unsafe_code)]`
-// — the identical pattern the Windows/macOS FFI probes use (swarm-ledger-p2-c2 D1). cudarc is a
-// cuda-gated, lock-neutral dep (already resolved via cubecl-cuda; swarm-ledger-p3-g D3).
+// — the identical pattern the Windows/macOS FFI probes use. cudarc is a
+// cuda-gated, lock-neutral dep (already resolved via cubecl-cuda).
 #[cfg(feature = "cuda")]
 #[allow(unsafe_code)]
 mod cuda_ffi {
@@ -819,7 +822,7 @@ mod tests {
     }
 
     /// The RunPod-4090 numbers map to a discrete budget — `vram_mb` = dedicated VRAM
-    /// (`cuDeviceTotalMem`), `shared_mb = 0`, `unified = false` (P3 Lane G).
+    /// (`cuDeviceTotalMem`), `shared_mb = 0`, `unified = false` (the CUDA backend lane).
     #[test]
     fn cuda_discrete_maps_dedicated_vram_no_uma() {
         // 4090: 24564 MiB dedicated VRAM, 124 GiB host RAM (RunPod container).

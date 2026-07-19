@@ -10,7 +10,7 @@
 //!
 //! Bulk **payloads** move on whichever plane the envelope's `payload_store` names. Both the `r2`
 //! store and `iroh-blobs` implement one [`PayloadStore`]: PUT your update object, GET committed
-//! objects (hash-verified), HEAD for availability. This wave ships the filesystem implementation
+//! objects (hash-verified), HEAD for availability. The filesystem implementation ships here
 //! ([`FsPayloadStore`](crate::store::FsPayloadStore)); the network planes slot in behind the same
 //! trait later.
 

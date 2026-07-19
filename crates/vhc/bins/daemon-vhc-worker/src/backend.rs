@@ -320,7 +320,7 @@ pub(crate) fn store_resolver(ctx: &StoreFetchContext) -> Result<ArtifactResolver
 }
 
 /// Fetch `art` from the payload store (presigned GET), checking the on-disk content cache first and
-/// caching the verified bytes on a miss (P3 lane S — the fleet distribution path).
+/// caching the verified bytes on a miss (the fleet artifact-distribution path).
 #[cfg(feature = "vhc-net")]
 pub(crate) async fn fetch_artifact_from_store(art: &ArtifactRef) -> Result<Vec<u8>, String> {
     let ctx = store_fetch_context();
@@ -391,7 +391,7 @@ fn shards_covering_window(
     out
 }
 
-/// The `DAEMON_TRAIN_PREFETCH` cache-warming mode (P3 lane S — the fleet staging entry point).
+/// The `DAEMON_TRAIN_PREFETCH` cache-warming mode (the fleet staging entry point).
 ///
 /// Runs on a bare fleet box (Windows cmd.exe, macOS, a RunPod container) with no CBOR framing:
 /// fetch the run's module and/or corpus (manifest + windowed shards) **by content hash** from the
@@ -992,8 +992,8 @@ pub(crate) fn hardware() -> Hardware {
             };
         }
     }
-    // CUDA (P3 Lane G): the driver exposes total dedicated VRAM directly (`cuDeviceTotalMem`), so a
-    // discrete NVIDIA box reports real VRAM + `["cuda","cpu"]` lanes, no UMA (swarm-ledger-p3-g).
+    // CUDA lane: the driver exposes total dedicated VRAM directly (`cuDeviceTotalMem`), so a
+    // discrete NVIDIA box reports real VRAM + `["cuda","cpu"]` lanes, no UMA.
     // Checked before wgpu so a box built `--features cuda` (RunPod 4090) reports the CUDA lane.
     #[cfg(feature = "cuda")]
     {
@@ -1085,8 +1085,8 @@ pub(crate) fn device_limits() -> DeviceLimits {
             return dl;
         }
     }
-    // CUDA (P3 Lane G): discrete-device budget from the driver's total-VRAM query (24 GB on the
-    // 4090), `shared_mb = 0`, `unified = false` — the discrete verdict path (swarm-ledger-p3-g D3).
+    // CUDA lane: discrete-device budget from the driver's total-VRAM query (24 GB on the
+    // 4090), `shared_mb = 0`, `unified = false` — the discrete verdict path.
     #[cfg(feature = "cuda")]
     {
         if let Some(p) = daemon_vhc_host::probe::probe_cuda() {

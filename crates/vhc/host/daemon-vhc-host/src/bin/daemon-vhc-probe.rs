@@ -11,12 +11,12 @@
 //! computes (Windows DXGI/D3D12, macOS Metal, or the CPU fallback) — deployable as a single
 //! cross-built binary to a bare fleet box (Windows cmd.exe, macOS, RunPod) to record the
 //! three-platform probe matrix end-to-end. It links **none** of the worker's stdio/crash-reporting
-//! stack (the always-on `sentry-rust-minidump` native-minidump path does not link under MinGW — see
-//! swarm-ledger-p2-c2), so this is the linkable Windows validation artifact. The actual VRAM/UMA
+//! stack (the always-on `sentry-rust-minidump` native-minidump path does not link under MinGW —
+//! the archived cross-build finding), so this is the linkable Windows validation artifact. The actual VRAM/UMA
 //! decision logic is the shared `probe` code, so the numbers are identical to a live `Probe`.
 
 fn main() {
-    println!("daemon-vhc-probe — device limits (vhc P2 C2)");
+    println!("daemon-vhc-probe — device limits (fleet hardware validation)");
     println!("target_os = {}", std::env::consts::OS);
 
     #[cfg(windows)]

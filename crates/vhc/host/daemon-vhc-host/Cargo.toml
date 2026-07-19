@@ -13,9 +13,10 @@ path = "src/lib.rs"
 # ("splits into `bins/daemon-vhc-worker` when A0 gives it real work") — a strictly mechanical move.
 # Its tests/worker_protocol.rs integration test moved with it (CARGO_BIN_EXE resolution).
 
-# A minimal, telemetry-free device-limits readout (C2 fleet validation). Cross-builds + LINKS under
-# MinGW (unlike the full worker, whose always-on `sentry-rust-minidump` path pulls an unresolved
-# UCRT symbol on windows-gnu — see swarm-ledger-p2-c2). Runs the same `daemon_vhc_host::probe` code
+# A minimal, telemetry-free device-limits readout (fleet hardware validation). Cross-builds + LINKS
+# under MinGW (unlike the full worker, whose always-on `sentry-rust-minidump` path pulls an
+# unresolved UCRT symbol on windows-gnu — the archived cross-build validation finding). Runs the
+# same `daemon_vhc_host::probe` code
 # the worker's `Probe` path uses, so the reported DeviceLimits are identical to a live `Probe`.
 [[bin]]
 name = "daemon-vhc-probe"
@@ -67,16 +68,16 @@ daemon-vhc-sdk-consensus = { workspace = true, optional = true }
 # (A2 worker-bin split): daemon-vhc-net, daemon-provision, tokio, daemon-telemetry, and the
 # optional daemon-egress/async-trait pair were worker-bin-only deps — they moved to
 # `crates/vhc/bins/daemon-vhc-worker` with the bin. The lib keeps none of them.
-# The CUDA driver API for the P3 Lane-G `BackendKind::Cuda` device probe: total dedicated-VRAM query
-# via `cuDeviceTotalMem` (swarm-ledger-p3-g D3). OPTIONAL — pulled ONLY by the `cuda` feature, so a
+# The CUDA driver API for the `BackendKind::Cuda` device probe: total dedicated-VRAM query via
+# `cuDeviceTotalMem`. OPTIONAL — pulled ONLY by the `cuda` feature, so a
 # default `cargo build`/`test`/`deny` never sees it. cudarc `0.19.8` is ALREADY resolved in the
 # committed `Cargo.lock` (cubecl-cuda 0.10 pulls it under `burn/cuda`); this edge adds only the
 # `driver` marker feature (`= []`, no dep edge), so NO new crate/version/source enters the graph — the
 # only lock change is the one `"cudarc 0.19.8"` edge line on this package node, and `cargo deny` is a
-# no-op. A lane-owned, off-default-gate dep (the C2 dep rule; STOP-and-report only on a NEW dep).
-# `default-features = false` avoids requesting cudarc's cublas/curand/nvrtc extras; cubecl already
-# enables the dlopen path via feature unification (host libcuda loaded at runtime, no toolkit at
-# build — swarm-ledger-p2-c2).
+# no-op. A lane-owned, off-default-gate dep (the standing dep rule; STOP-and-report only on a NEW
+# dep). `default-features = false` avoids requesting cudarc's cublas/curand/nvrtc extras; cubecl
+# already enables the dlopen path via feature unification (host libcuda loaded at runtime, no
+# toolkit at build — the archived CUDA container validation finding).
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = ["driver"] }
 
 # Windows GPU-memory probe (swarm-windows-vram-design.md §2): DXGI `GetDesc3`/`QueryVideoMemoryInfo`
@@ -96,8 +97,7 @@ windows = { workspace = true, features = [
 ] }
 
 # Per-backend lane selection (spec §10.1). These features only toggle burn's *dependency* backend
-# features — no code path changes this wave (initial scaffold): the `OpBackend` seam is still the
-# `CpuBackend` fp32 fake; G1/G2 wire `BurnBackend` behind these lanes in Waves 1–2. burn's `std` +
+# features — the compute@2 runner selects the admitted backend at run time. burn's `std` +
 # `ndarray` + `autodiff` are always on (the root workspace dep), so `cpu` (default) and `burn-ndarray`
 # both compile the current CPU/ndarray+autodiff graph; `wgpu` additionally pulls burn-wgpu (cubecl +
 # wgpu 29, Vulkan/RADV at runtime via the flake). Kept out of the default gate: `wgpu` is opt-in, so a
@@ -115,15 +115,16 @@ wgpu = ["burn/wgpu"]
 # (A2 worker-bin split): the `vhc-net` feature (the A3 live coordinator attach) moved to
 # `crates/vhc/bins/daemon-vhc-worker` with the bin — it gated only worker-binary plumbing
 # (`live.rs`); the host lib has no vhc-net code.
-# burn with the CUDA backend (cubecl-cuda + cudarc; driver-API + NVRTC JIT at runtime) — the C2/P2
-# RunPod-4090 lane. Opt-in only, and a LANE-OWNED edit by the ledger rule: burn-cuda/cubecl-cuda/
-# cudarc are ALREADY resolved in the committed Cargo.lock (verified byte-unchanged when this feature
-# was first enabled on the RunPod box), so no new third-party dep enters the tree — the feature only
-# compiles crates the lock already pins. Runtime needs the host NVIDIA driver (libcuda, loads clean
-# under nix glibc — cuInit verified on the 4090 container) + libnvrtc (absent from the RunPod
-# container; provided by the `.#cuda-train` devshell — see swarm-ledger-p2-c2/c3). The P3 Lane-G
-# `BackendKind::Cuda` engine arm is wired behind this feature (swarm-ledger-p3-g): `dep:cudarc` adds
-# the driver-API VRAM probe (lock-neutral — see the cudarc dep note above). Opt-in only.
+# burn with the CUDA backend (cubecl-cuda + cudarc; driver-API + NVRTC JIT at runtime) — the
+# discrete-NVIDIA (RunPod-4090-validated) lane. Opt-in only, and a LANE-OWNED edit by the standing
+# dep rule: burn-cuda/cubecl-cuda/cudarc are ALREADY resolved in the committed Cargo.lock (verified
+# byte-unchanged when this feature was first enabled on the RunPod box), so no new third-party dep
+# enters the tree — the feature only compiles crates the lock already pins. Runtime needs the host
+# NVIDIA driver (libcuda, loads clean under nix glibc — cuInit verified on the 4090 container) +
+# libnvrtc (absent from the RunPod container; provided by the `.#cuda-train` devshell — the
+# archived CUDA container validation findings). The `BackendKind::Cuda` engine arm is wired behind
+# this feature: `dep:cudarc` adds the driver-API VRAM probe (lock-neutral — see the cudarc dep
+# note above). Opt-in only.
 cuda = ["burn/cuda", "dep:cudarc"]
 # The whole-run coordinator drive seat (`coordinator` module): starts the coordinator blob under
 # the real driver and signs/verifies/decodes its round decisions — harness machinery for the
@@ -173,7 +174,7 @@ burn-std = { workspace = true }
 workspace = true
 
 [package.metadata.cargo-machete]
-# `wasmtime` (host runtime) is used; `burn` is the `OpBackend` engine (declared now, wired
-# then — the CPU fake needs no burn). NOTE (Merge 1): burn should move to a feature-gated / lane-split
-# build off the default gate (program ledger); deferred this wave to avoid a full wasmtime recompile.
+# `wasmtime` (host runtime) is used; `burn` is the compute engine. Standing note: burn's default
+# (ndarray+autodiff) tree could move to a feature-gated / lane-split build off the default gate;
+# deferred so far to avoid a full wasmtime recompile.
 ignored = ["wasmtime", "burn"]

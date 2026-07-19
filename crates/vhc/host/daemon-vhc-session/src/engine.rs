@@ -207,7 +207,7 @@ pub enum EngineEvent {
         /// The coordinator-facing pointer to the typed manifest (`blake3` = its content address).
         pointer: CheckpointManifest,
     },
-    /// **Additive (R, P3).** This (rejoining) peer replayed one retained round forward from the
+    /// **Additive (resync work).** This (rejoining) peer replayed one retained round forward from the
     /// latest checkpoint during a live resync (§9 I1). Emitted per replayed round by
     /// [`RoundEngine::resync_from_checkpoint`]. (The retired v1 live-attach forwarder used to
     /// surface this as a `protocol::Event::ResyncProgress` wire frame; that producer-less variant
@@ -379,7 +379,7 @@ where
         Ok(())
     }
 
-    /// **Live checkpoint-resync (§9 I1; R, P3).** Reload the latest checkpoint into the backend, then
+    /// **Live checkpoint-resync (§9 I1; resync work).** Reload the latest checkpoint into the backend, then
     /// replay `steps` (the retained rounds' committed sets, in record order) forward — recovering the
     /// exact post-`target` consensus state a survivor holds. Marks each replayed round ingested
     /// (`last_ingested`), so the subsequent [`RoundEngine::run`] loop **skips** any buffered
@@ -611,7 +611,7 @@ where
     /// enqueue it, and try to ingest as far as the queue allows (in order). If `r` itself cannot be
     /// ingested yet (its set — or an earlier round's — is unfetchable), enter the stall ladder.
     async fn on_round_record(&mut self, rr: &RoundRecord) -> Result<(), VhcRunError> {
-        // Resync-composability guard (R, P3): a rejoining peer that replayed retained rounds from a
+        // Resync-composability guard: a rejoining peer that replayed retained rounds from a
         // checkpoint (`resync_from_checkpoint`) has already ingested every round up to
         // `last_ingested`. A buffered / late `RoundRecord` at or below that watermark must NOT be
         // re-ingested (a double outer-step would diverge the digest). On the normal monotonic path

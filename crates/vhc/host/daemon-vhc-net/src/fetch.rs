@@ -166,10 +166,11 @@ fn exhausted(key: &PayloadKey, sources: usize) -> VhcNetError {
 // ---------------------------------------------------------------------------------------------
 // Download scheduler — a DIRECT port of Psyche's `download_scheduler_actor`
 // (`psyche/shared/network/src/download/scheduler.rs:189-375`; its DIRECT tests at
-// `scheduler.rs:411-675`). Deltas from upstream (recorded in `swarm-ledger-b1.md`):
+// `scheduler.rs:411-675`). Deltas from upstream (recorded in the archived engineering ledgers
+// under docs/specs/):
 //
 //   * Upstream keys retry entries by an `iroh_blobs::Hash` (a blob ticket). We key by the blake3
-//     `ContentHash` and carry the `PayloadKey` — no iroh-blobs this program (P4).
+//     `ContentHash` and carry the `PayloadKey` — iroh-blobs is out of scope for this transport.
 //   * Upstream has three retry classes (DistroResult + ModelSharing Parameter/Config). We keep
 //     **one** class — the payload fetch (= upstream's `DistroResult`: expo backoff
 //     `backoff_base * 2^prev_retries`, capped `max_payload_retries`, time-gated `due_retries`).

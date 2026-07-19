@@ -22,7 +22,7 @@
 //!
 //! Engine-agnostic; consumed by `daemon-vhc-session` (§10.1). Outbound HTTP must route through
 //! `daemon_egress::EgressClient` (raw `reqwest::Client` is banned workspace-wide by clippy); no HTTP
-//! client is constructed this wave.
+//! client is constructed here yet.
 //!
 //! Merge-1 note: the shared identity/hash vocabulary in [`seam`] is the canonical
 //! `daemon-vhc-proto` types (blake3 `Hash`, `PeerId`).
@@ -131,9 +131,9 @@ pub enum VhcNetError {
     /// NET-3 `unpinned_hf_rejected`).
     #[error("hf:// reference must pin a revision (hf://<repo>@<rev>/<path>): {0}")]
     UnpinnedRevision(String),
-    /// An artifact URL used a scheme not wired this wave (`r2` / `hf` / `https` await the egress
-    /// plane; only `file://` is resolved).
-    #[error("artifact scheme unsupported this wave: {0}")]
+    /// An artifact URL used a scheme the resolver does not serve yet (`r2` / `hf` / `https` await
+    /// the egress plane; only `file://` is resolved).
+    #[error("artifact scheme not yet supported: {0}")]
     SchemeUnsupported(String),
     /// An artifact URL could not be parsed.
     #[error("malformed artifact url: {0}")]

@@ -60,7 +60,8 @@ daemon-tool-fs = { workspace = true }
 # NodeConfig. Serde/tokio-only on the default gate: it pulls `daemon-vhc-net`
 # (reqwest via daemon-egress) + `daemon-vhc-proto` (ed25519) — all already in-tree — and NO
 # burn/wasmtime (no `daemon-vhc-host` dep) and NO iroh (behind daemon-vhc-net's off-by-default `iroh`
-# feature). See swarm-ledger-w1.md for the cargo-tree evidence.
+# feature). Verified via `cargo tree` when this edge first landed (archived in the engineering
+# ledgers under docs/specs/).
 daemon-vhc-session = { workspace = true }
 # The node-side vhc-training service + worker supervisor, bound onto the assembled node post-`Arc`
 # at boot (via `NodeApiImpl::with_vhc`) only when `[vhc] enabled = true` (spec §10.4). Taken as a

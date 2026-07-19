@@ -67,7 +67,8 @@ cpu = ["daemon-vhc-host/cpu"]
 burn-ndarray = ["daemon-vhc-host/burn-ndarray"]
 # burn with the wgpu backend (Vulkan/RADV at runtime) — the G2 GPU lane. Opt-in only.
 wgpu = ["daemon-vhc-host/wgpu"]
-# burn with the CUDA backend (driver-API + NVRTC JIT at runtime) — the C2/P3 lane. Opt-in only.
+# burn with the CUDA backend (driver-API + NVRTC JIT at runtime) — the discrete-NVIDIA lane.
+# Opt-in only.
 cuda = ["daemon-vhc-host/cuda"]
 # The networked module-fetch lane: `resolve_run`'s payload-store fetch of network module URLs
 # (`r2://` / `https://` / `hf://`, presign via WS + egress). OFF the default gate so a default

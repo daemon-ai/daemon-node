@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The `data@2` world (track B2, architecture §3.2): `fetch` — artifact fetch by committed hash
-//! + range, under the admitted-artifact grant and the cumulative read budget — and
+//! The `data@2` world (track B2, architecture §3.2): `fetch` — artifact fetch by committed
+//! hash and range, under the admitted-artifact grant and the cumulative read budget — and
 //! `register_chunks`, the chunk-addressed corpus registration whose fold must itself be a
 //! granted artifact identity.
 

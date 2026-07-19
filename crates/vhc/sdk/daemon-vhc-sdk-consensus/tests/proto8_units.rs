@@ -6,7 +6,8 @@
 // `assignment_golden.rs` (`assignment_weighted_by_class`, `overlap_10pct_covers_churn`):
 // `overlap_zero_is_partition` and `class_ladder_boundaries`.
 //
-// Oracle provenance (swarm-ledger-p2-b1.md): hand-derived pinned literals for the class-weight
+// Oracle provenance (archived in the engineering ledgers under docs/specs/): hand-derived pinned
+// literals for the class-weight
 // ladder + from-definition cover-counting for the partition property; daemon seed 0xDAE0_7E57.
 
 use daemon_vhc_proto::{PeerId, Seed};

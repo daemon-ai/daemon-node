@@ -127,7 +127,7 @@ enum Cmd {
         #[arg(long)]
         max_tokens: Option<u64>,
     },
-    /// Publish an experiment module to the payload store at `modules/<blake3>.wasm` (P3 lane S).
+    /// Publish an experiment module to the payload store at `modules/<blake3>.wasm` (the fleet artifact-distribution path).
     PublishModule {
         /// The `.wasm` module to upload.
         #[arg(long)]
@@ -148,7 +148,7 @@ enum Cmd {
         #[arg(long)]
         actor: Option<String>,
     },
-    /// Publish a pre-tokenized corpus (shards + manifest) to the payload store by content hash (P3 S).
+    /// Publish a pre-tokenized corpus (shards + manifest) to the payload store by content hash (the fleet artifact-distribution path).
     PublishCorpus {
         /// The `corpus-manifest.cbor` produced by `tokenize-corpus` (shards + tokenizer.json beside it).
         #[arg(long)]
