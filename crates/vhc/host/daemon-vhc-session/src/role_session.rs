@@ -381,6 +381,14 @@ async fn run_role(
     if let Ok(bytes) = own_cert_record.to_bytes() {
         let _ = providers.control.publish(&bytes).await;
     }
+    tracing::debug!(
+        run = run_label,
+        role = %identity.role,
+        incarnation = identity.instance,
+        restoring,
+        sender = %hex16(&own_sender.0),
+        "role session running: control plane attached, certificate announced"
+    );
 
     let _ = events.send(Event::RunPhase {
         run_id: run_label.to_string(),
@@ -1054,11 +1062,17 @@ fn accept_inbound(
     // per-record advisory, never a session fault; our own echoed announcement ingests as an
     // idempotent no-op.
     if let Ok(record) = crate::distribution::DistributionRecord::from_bytes(frame) {
-        if let Err(refusal) = attach.ingest_distribution(record) {
-            let _ = events.send(Event::Warning {
-                class: "distribution_refused".into(),
-                detail: format!("{refusal} (generation {generation})"),
-            });
+        match attach.ingest_distribution(record) {
+            Ok(()) => {
+                tracing::debug!("inbound: distribution record ingested (peer cert/revocation)")
+            }
+            Err(refusal) => {
+                tracing::debug!(%refusal, "inbound: distribution record refused");
+                let _ = events.send(Event::Warning {
+                    class: "distribution_refused".into(),
+                    detail: format!("{refusal} (generation {generation})"),
+                });
+            }
         }
         return true;
     }
@@ -1068,8 +1082,15 @@ fn accept_inbound(
         return true;
     }
     match attach.deliver(frame) {
-        Ok(InboundVerdict::Deliver { .. } | InboundVerdict::Duplicate { .. }) => true,
+        Ok(InboundVerdict::Deliver { .. } | InboundVerdict::Duplicate { .. }) => {
+            tracing::trace!(
+                sender = envelope_sender(frame).map(|s| hex16(&s)),
+                "inbound: frame delivered to the module"
+            );
+            true
+        }
         Ok(InboundVerdict::Gap { .. } | InboundVerdict::Backpressure { .. }) => {
+            tracing::debug!("inbound: frame held (gap/backpressure)");
             hold_frame(held, frame);
             true
         }
@@ -1082,6 +1103,7 @@ fn accept_inbound(
             | InboundVerdict::CertRevoked { .. }),
         ) => {
             // A typed refusal of one frame, never a session fault: surface and continue.
+            tracing::debug!(?verdict, "inbound: frame refused (typed)");
             let _ = events.send(Event::Warning {
                 class: "frame_refused".into(),
                 detail: format!("{verdict:?} (generation {generation})"),
@@ -1089,6 +1111,49 @@ fn accept_inbound(
             true
         }
         Err(_) => false,
+    }
+}
+
+/// A short hex prefix of an identity, for diagnostics (never a security surface).
+fn hex16(bytes: &[u8; 32]) -> String {
+    bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A short label for a published §12.1 frame's inner module payload — diagnostics only (the
+/// session never branches on message schema; this is a best-effort peek at the opaque bytes).
+fn frame_kind(frame: &[u8]) -> String {
+    let Ok(ciborium::value::Value::Array(parts)) = ciborium::de::from_reader(frame) else {
+        return "frame?".into();
+    };
+    let Some(ciborium::value::Value::Bytes(payload)) = parts.get(1) else {
+        return "frame?".into();
+    };
+    let Ok(ciborium::value::Value::Array(items)) = ciborium::de::from_reader(payload.as_slice())
+    else {
+        return "opaque".into();
+    };
+    // A module tag frame is `[uint tag, uint round, bytes]`; a wire VhcMessage is a tagged enum
+    // (a 1-element map or a variant array) — distinguish by the first element's shape.
+    match items.first() {
+        Some(ciborium::value::Value::Integer(n)) => format!("tag{}", i128::from(*n)),
+        Some(ciborium::value::Value::Text(t)) => format!("wire:{t}"),
+        _ => format!("wire/arr[{}]", items.len()),
+    }
+}
+
+/// A short label for an op request kind — diagnostics only.
+fn op_kind(req: &OpRequest) -> &'static str {
+    match req {
+        OpRequest::PayloadPut { .. } => "PayloadPut",
+        OpRequest::PayloadGet { .. } => "PayloadGet",
+        OpRequest::ArtifactFetch { .. } => "ArtifactFetch",
+        OpRequest::ArtifactRange { .. } => "ArtifactRange",
+        OpRequest::StreamOpen { .. } => "StreamOpen",
+        OpRequest::StreamAccept => "StreamAccept",
+        OpRequest::StreamWrite { .. } => "StreamWrite",
+        OpRequest::StreamRead { .. } => "StreamRead",
+        OpRequest::TensorExport => "TensorExport",
+        OpRequest::TensorImport { .. } => "TensorImport",
     }
 }
 
@@ -1162,7 +1227,8 @@ async fn relay_egress(
     generation: u64,
 ) -> Result<(), String> {
     let published = pump.published();
-    for (_channel, _seq, frame) in published.iter().skip(*published_cursor) {
+    for (channel, seq, frame) in published.iter().skip(*published_cursor) {
+        tracing::trace!(channel, seq, kind = %frame_kind(frame), "egress: publishing module frame");
         providers
             .control
             .publish(frame)
@@ -1172,6 +1238,7 @@ async fn relay_egress(
     *published_cursor = published.len();
 
     for (op, request) in pump.take_op_requests() {
+        tracing::trace!(op, request = %op_kind(&request), "egress: servicing capability op");
         service_op(pump, providers, op, request).await?;
     }
 
@@ -1284,6 +1351,14 @@ async fn service_op(
         // embedder's request queue.
         OpRequest::TensorExport | OpRequest::TensorImport { .. } => return Ok(()),
     };
+    match &outcome {
+        OpOutcome::Failed { code, detail } => {
+            tracing::debug!(op, code, detail, "capability op FAILED")
+        }
+        other => {
+            tracing::trace!(op, outcome = ?std::mem::discriminant(other), "capability op serviced")
+        }
+    }
     pump.complete_op(op, outcome)
         .map_err(|e| format!("op completion: {e}"))?;
     Ok(())
@@ -1321,11 +1396,23 @@ async fn finish(
 ) -> TerminalOutcome {
     // A leave that arrives while the guest is paused must still drain: release the gate.
     pump.release();
+    tracing::debug!(
+        run = run_label,
+        ?leave_requested,
+        transport_fault = transport_fault.as_deref(),
+        finished = run.is_finished(),
+        "role session finishing"
+    );
 
     if run.is_finished() {
         // The guest ended on its own: classify its end (a leave racing a natural end still
         // reports the natural end — the module's exit is the truth).
         let end = wait_run(run).await;
+        tracing::debug!(
+            run = run_label,
+            ?end,
+            "role session: guest ended on its own"
+        );
         return classify_natural_end(end, transport_fault);
     }
 

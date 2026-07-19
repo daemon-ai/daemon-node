@@ -269,13 +269,12 @@ impl<P: PresignClient> crate::transport::ContentStore for R2Store<P> {
             .get_object(&resp)
             .await?
             .ok_or_else(|| VhcNetError::PayloadMiss(hash.to_hex()))?;
-        let actual = blake3_hash(&bytes);
-        if &actual != hash {
-            return Err(VhcNetError::HashMismatch {
-                expected: hash.to_hex(),
-                actual: actual.to_hex(),
-            });
-        }
+        // The requested address is not always the object's plain blake3: a chunk-addressed corpus
+        // shard is keyed by its domain-separated CHUNK FOLD, which never equals `blake3(bytes)`.
+        // The PUMP verifies every fetched object (plain hash for payloads/checkpoints/whole
+        // artifacts, covering-chunk hashes for chunk-addressed shards), so this seat serves the
+        // keyed bytes verbatim — a plain-hash gate here would wrongly reject every chunk-addressed
+        // range fetch (the store is untrusted by construction; the pump is the arbiter).
         Ok(bytes)
     }
 }

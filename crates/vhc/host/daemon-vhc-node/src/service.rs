@@ -336,6 +336,12 @@ pub struct VhcService {
     /// The resident coordinator seat keeper (present only when the owner enabled coordinator
     /// duty AND a seat directory + identity store are wired).
     seat: Option<crate::seat_keeper::SeatKeeper>,
+    /// The registry seat READ seam, retained for EVERY node with a registry (not only claimers):
+    /// a trainer reads the coordinator seat at join to bootstrap the incumbent's certificate into
+    /// its session credentials (the seat lease is the out-of-band trust the on-plane §12.3
+    /// distribution cannot supply to a late subscriber — the coordinator's one-shot announcement
+    /// predates the trainer's connection).
+    seat_read: Option<Arc<dyn crate::seat_keeper::SeatDirectory>>,
     events_tx: broadcast::Sender<VhcEvent>,
     feed: Option<NodeFeed>,
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
@@ -366,6 +372,7 @@ impl VhcService {
             ),
             _ => None,
         };
+        let seat_read = parts.seat_directory.clone();
         Self {
             config: parts.config,
             store: parts.store,
@@ -376,6 +383,7 @@ impl VhcService {
             worker_factory: parts.worker_factory,
             identity_dir: parts.identity_dir,
             seat,
+            seat_read,
             events_tx,
             feed: parts.feed,
             current_run: Mutex::new(None),
@@ -553,12 +561,14 @@ impl VhcService {
                 .as_deref()
                 .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
             let restore = self.resolve_restore(&run.run_id).await;
+            let seat = self.resolve_seat_bootstrap(&run.run_id).await;
             let (delivery_tuple, credentials, credentials_ref) = match self.author_join(
                 &run.run_id,
                 &run.coordinator,
                 &id,
                 persisted_tuple,
                 restore,
+                seat,
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -840,17 +850,24 @@ impl VhcService {
             .as_deref()
             .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
         let restore = self.resolve_restore(&run.run_id).await;
-        let (delivery_tuple, credentials, _credentials_ref) =
-            match self.author_join(&run.run_id, &run.coordinator, &id, persisted_tuple, restore) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.arbiter.release(&id);
-                    if self.worker_factory.is_some() {
-                        worker.shutdown().await;
-                    }
-                    return Err(e);
+        let seat = self.resolve_seat_bootstrap(&run.run_id).await;
+        let (delivery_tuple, credentials, _credentials_ref) = match self.author_join(
+            &run.run_id,
+            &run.coordinator,
+            &id,
+            persisted_tuple,
+            restore,
+            seat,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.arbiter.release(&id);
+                if self.worker_factory.is_some() {
+                    worker.shutdown().await;
                 }
-            };
+                return Err(e);
+            }
+        };
         if let Some(tuple) = &delivery_tuple {
             if let Ok(bytes) = protocol::encode(tuple) {
                 let _ = self.store.set_admitted_tuple(&run.run_id, &bytes);
@@ -1417,6 +1434,7 @@ impl VhcService {
         id: &RoleInstanceId,
         tuple: Option<protocol::AdmittedTuple>,
         restore: Option<protocol::CheckpointRestore>,
+        seat: crate::credentials::SeatBootstrap,
     ) -> Result<AuthoredDelivery, VhcError> {
         let tuple = tuple.map(|mut t| {
             t.incarnation = id.instance;
@@ -1446,8 +1464,28 @@ impl VhcService {
             &self.config.registry,
             restore,
             !self.config.payload_dir.is_empty(),
+            seat,
         )?;
         Ok((Some(tuple), authored.wire, authored.credentials_ref))
+    }
+
+    /// Resolve the coordinator-seat bootstrap for a run: read the configured seat role's slot and,
+    /// when it holds a lease, hand the incumbent's certificate + published endpoint to credential
+    /// authorship. This is the out-of-band trust a trainer needs — the coordinator's on-plane
+    /// §12.3 certificate announcement is a one-shot a later subscriber never sees, so the seat
+    /// lease (untrusted storage, but carrying the cert) is how a joining trainer authenticates the
+    /// incumbent's frames from the first round. `CertCheck` still gates trust by the genesis base.
+    async fn resolve_seat_bootstrap(&self, run_label: &str) -> crate::credentials::SeatBootstrap {
+        let Some(dir) = &self.seat_read else {
+            return crate::credentials::SeatBootstrap::default();
+        };
+        match dir.read_seat(run_label, &self.config.seat_role).await {
+            Ok(daemon_vhc_proto::SeatState::Leased(lease)) => crate::credentials::SeatBootstrap {
+                peer_certs: vec![lease.certificate.clone()],
+                ws_base: lease.body.endpoint.ws.clone(),
+            },
+            _ => crate::credentials::SeatBootstrap::default(),
+        }
     }
 
     /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's latest
@@ -1629,8 +1667,9 @@ impl VhcApi for VhcService {
         // author the secrets-free plane-selection credentials (the token, if any, lands only in
         // the keystore record `credentials_ref` points at — never on the wire).
         let restore = self.resolve_restore(&run_id).await;
+        let seat = self.resolve_seat_bootstrap(&run_id).await;
         let (delivery_tuple, credentials, credentials_ref) =
-            match self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore) {
+            match self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore, seat) {
                 Ok(v) => v,
                 Err(e) => {
                     if existing.is_none() {

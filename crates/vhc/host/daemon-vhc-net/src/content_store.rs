@@ -82,15 +82,14 @@ impl ContentStore for FsContentStore {
             }
             Err(e) => return Err(VhcNetError::Transport(format!("read content object: {e}"))),
         };
-        // Defense in depth: the caller's pump re-verifies regardless, but a store that returns
-        // bytes not matching their own address is broken and says so typed.
-        let actual = blake3_hash(&bytes);
-        if &actual != hash {
-            return Err(VhcNetError::HashMismatch {
-                expected: hash.to_hex(),
-                actual: actual.to_hex(),
-            });
-        }
+        // The store is UNTRUSTED and the requested address is not always the object's plain
+        // blake3: a chunk-addressed corpus shard is keyed by its domain-separated CHUNK FOLD
+        // (`daemon_vhc_proto::shard_fold`), which never equals `blake3(bytes)`. Verification is
+        // the PUMP's job — it re-checks every fetched object against the requested plain hash
+        // (payloads/checkpoints/whole artifacts) or the registered covering-chunk hashes
+        // (chunk-addressed shards). So this seat serves the keyed bytes verbatim, exactly like
+        // the in-process [`MemoryContentStore`]; a plain-hash gate here would wrongly reject every
+        // chunk-addressed range fetch.
         Ok(bytes)
     }
 }

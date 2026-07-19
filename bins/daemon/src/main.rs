@@ -3160,13 +3160,17 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         cfg.vhc.data_cache_gb,
                     )
                 };
-                // The registry seat-slot directory (architecture §6.3; D-P9): wired only when the
-                // owner enabled coordinator duty AND a registry is configured — the resident seat
-                // keeper claims/heartbeats/releases through it.
-                let seat_directory: Option<Arc<dyn daemon_vhc_node::SeatDirectory>> = if cfg
+                // The registry seat-slot directory (architecture §6.3; D-P9): wired whenever a
+                // registry is configured. A coordinator-duty node drives claim/heartbeat/release
+                // through it (the resident keeper); EVERY node also READS it at join to bootstrap
+                // the incumbent coordinator's certificate into a trainer's session credentials
+                // (the seat lease is the out-of-band trust a late subscriber cannot get from the
+                // coordinator's one-shot on-plane announcement).
+                let seat_directory: Option<Arc<dyn daemon_vhc_node::SeatDirectory>> = if !cfg
                     .vhc
-                    .seat_claim
-                    && !cfg.vhc.registry.base.is_empty()
+                    .registry
+                    .base
+                    .is_empty()
                 {
                     match daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()) {
                         Ok(egress) => {

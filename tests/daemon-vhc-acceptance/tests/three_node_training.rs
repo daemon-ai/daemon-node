@@ -19,14 +19,6 @@ use harness::{
 
 const RUN: &str = "acceptance-baseline";
 
-// NOT YET GREEN — under diagnosis, deliberately not asserted green (never retry-to-green).
-// The three real node processes boot and serve; discovery + the seat CAS round-trip; but the
-// coordinator-role worker does not answer its `AssessRun` exchange within the supervisor
-// watchdog (30s) in the full cluster, so the run never opens rounds. The WS-relay fixture is
-// independently proven (see `fixture_ws_smoke`), so the block is in the coordinator worker's
-// assess/attach path under the live genesis, not the transport. Tracked for the coordinator;
-// `#[ignore]` keeps the harness reviewable and compiling without falsely claiming a pass.
-#[ignore = "coordinator-role worker assess hangs in the full cluster; under diagnosis (not retry-to-green)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_training_converges_with_agreeing_digests() {
     // A shared filesystem payload root every node serves content-addressed objects over (the

@@ -193,6 +193,9 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
 
     // Grants: the control channel both modules declare; the trainer additionally holds the
     // corpus artifact grants (the manifest + every shard fold) its data@2 fetches admit under.
+    // Numeric quotas stay unset (0 = inherit the lane ceiling, tighten-only): a real multi-layer
+    // TinyLlama step's compute-queue depth rides the Trainer lane ceiling
+    // (`ParticipationLane::trainer_launch_defaults`), which the production path sizes for training.
     let control_channel = |artifact_grants: BTreeSet<Hash>| RoleGrants {
         channels: vec![ChannelDecl {
             id: 0,
