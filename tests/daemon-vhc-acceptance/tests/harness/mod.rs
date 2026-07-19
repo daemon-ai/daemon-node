@@ -222,15 +222,34 @@ pub fn spawn_node(spec: &NodeSpec<'_>) -> Node {
             cmd.env(var, v);
         }
     }
+    let log_dir = std::path::PathBuf::from(
+        std::env::var("VHC_ACCEPTANCE_LOG_DIR")
+            .unwrap_or_else(|_| "/tmp/vhc-acceptance-logs".into()),
+    );
+    std::fs::create_dir_all(&log_dir).ok();
+    let log = std::fs::File::create(log_dir.join(format!("{}.log", spec.name))).expect("node log");
+    let log2 = log.try_clone().expect("clone node log");
     cmd.env("DAEMON_STORE", "memory")
         .env("DAEMON_DATA_DIR", data_dir.path())
         .env("DAEMON_SOCKET_PATH", &socket)
         .env("DAEMON_CONFIG", &config_path)
         // The training worker's compute lane needs no GPU; keep it CPU/ndarray.
         .env("DAEMON_VHC_LANE_GPU_OPTIONAL", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .env(
+            "RUST_LOG",
+            std::env::var("VHC_ACCEPTANCE_RUST_LOG").unwrap_or_else(|_| {
+                "daemon_vhc_node=debug,daemon_vhc_session=debug,daemon_vhc_supervisor=debug,\
+                 daemon_vhc_host=info,daemon_vhc_worker=debug,info"
+                    .to_string()
+            }),
+        )
+        .stdin(Stdio::null());
+    if std::env::var_os("VHC_ACCEPTANCE_INHERIT_STDIO").is_some() {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        drop((log, log2));
+    } else {
+        cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log2));
+    }
     let child = cmd.spawn().expect("spawn daemon node");
 
     let node = Node {

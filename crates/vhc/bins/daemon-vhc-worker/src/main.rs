@@ -193,6 +193,9 @@ async fn main() {
     // runs the monitor server (then exits) in that copy before it touches the stdio cut. A no-op
     // unless the spawning node injected a DSN + `DAEMON_CRASH_CONSENT=1`.
     let _crash = daemon_telemetry::init_crash_reporting("train-worker");
+    // Diagnostics to stderr (stdin/stdout are the framed cut): a worker that emits nothing is
+    // undebuggable in a live/multi-process run. Honors `RUST_LOG` (default off/warn).
+    daemon_telemetry::init_subscriber();
 
     // Fleet-validation readout (C2): print the same `hardware()` + `device_limits()` the live
     // `Probe`/assess path computes, then exit — so a cross-built worker on a bare fleet box (Windows

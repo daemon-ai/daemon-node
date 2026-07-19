@@ -164,14 +164,25 @@ pub async fn serve(
 async fn handle_conn(mut stream: TcpStream, reg: Arc<FixtureRegistry>) -> Result<(), Infallible> {
     // Peek the request head WITHOUT consuming it: a WebSocket upgrade is handed to the relay
     // (tungstenite performs its own handshake read); everything else is the REST path below.
-    let mut peek = [0u8; 2048];
-    let n = match stream.peek(&mut peek).await {
-        Ok(0) => return Ok(()),
-        Ok(n) => n,
-        Err(_) => return Ok(()),
-    };
-    let head_peek = String::from_utf8_lossy(&peek[..n]).to_ascii_lowercase();
-    if head_peek.contains("upgrade: websocket") {
+    // Peek can return before the whole header has arrived, so retry until the header terminator
+    // is visible (or a bounded number of attempts elapses).
+    let mut peek = [0u8; 4096];
+    let mut is_ws = false;
+    for _ in 0..200 {
+        let n = match stream.peek(&mut peek).await {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(_) => return Ok(()),
+        };
+        if find_subslice(&peek[..n], b"\r\n\r\n").is_some() || n == peek.len() {
+            is_ws = String::from_utf8_lossy(&peek[..n])
+                .to_ascii_lowercase()
+                .contains("upgrade: websocket");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    if is_ws {
         ws_relay(stream, reg).await;
         return Ok(());
     }
