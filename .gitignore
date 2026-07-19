@@ -6,4 +6,6 @@ Cargo.lock.bak
 # Local research/scratch notes, path-anchored so they do NOT match the bundled skill
 # `crates/skills/daemon-skills/bundled/research` (which must stay tracked so worktrees seed it).
 /research/
-/docs/research/
+/docs/research/*
+# Except archived research findings that the specs cite.
+!/docs/research/burn-backend-findings.md
