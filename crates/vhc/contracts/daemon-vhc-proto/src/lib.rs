@@ -28,6 +28,7 @@ pub mod bytes;
 pub mod canonical;
 pub mod capability;
 pub mod cert;
+pub mod corpus;
 pub mod crypto;
 pub mod domains;
 pub mod envelope;
@@ -48,6 +49,11 @@ pub use capability::{Capability, CapabilitySet};
 pub use cert::{
     verify_certified_sender, CertError, CertScope, RunKeyCertBody, RunKeyCertificate,
     CERT_DOMAIN_V2,
+};
+pub use corpus::{
+    chunk_count, chunk_hashes, covering_span, shard_fold, ChunkMap, CorpusManifest, Endianness,
+    SequenceBoundary, ShardEntry, TokenWidth, TokenizerId, CORPUS_DEFAULT_CHUNK_SIZE,
+    CORPUS_MANIFEST_FORMAT,
 };
 pub use crypto::{
     hash as crypto_hash, verify_sig, VerifyOutcome, HASH_LEN, VERIFY_PUBLIC_KEY_LEN,

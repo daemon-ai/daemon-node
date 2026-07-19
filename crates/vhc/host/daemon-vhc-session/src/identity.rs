@@ -292,6 +292,7 @@ mod tests {
             },
             roles: std::collections::BTreeMap::new(),
             artifacts: std::collections::BTreeMap::new(),
+            corpus_manifest: None,
             authority: ciborium::value::Value::Null,
             transport: daemon_vhc_proto::genesis::TransportSelection::default(),
             identities: daemon_vhc_proto::genesis::Identities::default(),

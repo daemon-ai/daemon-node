@@ -154,6 +154,7 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
         },
         roles,
         artifacts,
+        corpus_manifest: None,
         authority: Value::Null,
         transport: TransportSelection::default(),
         identities: Identities::default(),

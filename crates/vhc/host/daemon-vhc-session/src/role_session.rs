@@ -548,6 +548,46 @@ async fn service_op(
                 },
             }
         }
+        OpRequest::ArtifactRange {
+            hash,
+            span_off,
+            span_len,
+            ..
+        } => {
+            // A chunk-addressed shard (fold identity): the content store holds the whole
+            // object under the fold key; this in-process seat slices the requested covering
+            // span itself — the pump verifies every covering chunk against the registered
+            // chunk map either way (the provider is untrusted by construction). A store that
+            // cannot serve the span is a typed refusal, never silent bytes.
+            match providers
+                .artifacts
+                .get_content(&daemon_vhc_proto::Hash(hash))
+                .await
+            {
+                Ok(artifact) => {
+                    let lo = usize::try_from(span_off).unwrap_or(usize::MAX);
+                    let hi = lo.saturating_add(usize::try_from(span_len).unwrap_or(usize::MAX));
+                    if hi <= artifact.len() {
+                        OpOutcome::RangeDone {
+                            bytes: artifact[lo..hi].to_vec(),
+                        }
+                    } else {
+                        OpOutcome::Failed {
+                            code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                            detail: format!(
+                                "artifact range: stored object is {} bytes, span \
+                                 [{span_off}, +{span_len}) does not fit",
+                                artifact.len()
+                            ),
+                        }
+                    }
+                }
+                Err(e) => OpOutcome::Failed {
+                    code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                    detail: format!("artifact range fetch: {e}"),
+                },
+            }
+        }
         // Direct peer streams await their live transport binding: refuse typed, never hang the
         // guest's op.
         OpRequest::StreamOpen { .. }

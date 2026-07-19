@@ -60,6 +60,15 @@ pub const SEAT_LEASE_DOMAIN: &str = "daemon-vhc/seat-lease/1.0.0";
 /// never be replayed as a live lease.
 pub const SEAT_RELEASE_DOMAIN: &str = "daemon-vhc/seat-release/1.0.0";
 
+/// Domain-separation tag folded into every corpus **shard identity** (the chunk-addressed data
+/// contract): `shard_hash = blake3(domain ++ u64le(chunk_size) ++ u64le(token_count) ++
+/// u64le(byte_len) ++ c_0 ++ … ++ c_{n-1})` where `c_i = blake3(chunk_i bytes)`. The fold — not
+/// a plain content hash of the shard bytes — IS the shard's artifact identity, which is what
+/// makes a byte range verifiable from the covering chunks alone (whole-shard verify-on-first-
+/// touch is rejected for streaming). The domain prefix keeps the fold from colliding with any
+/// other blake3 derivation in the subsystem.
+pub const CORPUS_SHARD_DOMAIN: &[u8] = b"daemon-vhc/corpus-shard/1.0.0";
+
 /// Fixed key seed for the observe replay sandbox's coordinator frame signer (the replay oracle
 /// compares published payloads, never transport signatures, so any fixed seed serves).
 pub const REPLAY_SANDBOX_FRAME_KEY_SEED: &[u8] = b"daemon-vhc/replay-sandbox-frame-key/1.0.0";
@@ -85,6 +94,7 @@ mod tests {
             super::SEAT_RELEASE_DOMAIN.as_bytes(),
             super::GENESIS_SEED_DOMAIN,
             super::GOSSIP_TOPIC_DOMAIN,
+            super::CORPUS_SHARD_DOMAIN,
             super::REPLAY_SANDBOX_FRAME_KEY_SEED,
             super::HARNESS_FRAME_KEY_SEED,
         ];
@@ -125,6 +135,7 @@ mod tests {
             super::SEAT_RELEASE_DOMAIN.as_bytes(),
             super::GENESIS_SEED_DOMAIN,
             super::GOSSIP_TOPIC_DOMAIN,
+            super::CORPUS_SHARD_DOMAIN,
             super::REPLAY_SANDBOX_FRAME_KEY_SEED,
             super::HARNESS_FRAME_KEY_SEED,
         ];

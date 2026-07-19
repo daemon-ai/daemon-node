@@ -787,6 +787,7 @@ mod tests {
             max_readback_bytes: 1 << 20,
             max_outstanding_ops: 16,
             compute_queue_depth: 1024,
+            data_read_budget_bytes: 0,
             granted_artifacts: BTreeSet::new(),
         }
     }
@@ -846,6 +847,7 @@ mod tests {
             },
             roles,
             artifacts,
+            corpus_manifest: None,
             authority: ciborium::value::Value::Map(vec![]),
             transport: TransportSelection::default(),
             identities: Identities {

@@ -64,6 +64,25 @@ pub enum OpRequest {
         /// Range length in bytes (`0` = to the end of the artifact).
         range_len: u64,
     },
+    /// `data.fetch(artifact, range)` on a **chunk-addressed** artifact (a corpus shard whose
+    /// chunk map the module registered via `data@2::register_chunks`): the embedder services
+    /// ONLY the chunk-aligned covering span `[span_off, span_off + span_len)` — never the whole
+    /// shard (whole-shard verify-on-first-touch is rejected for streaming). The pump verifies
+    /// every covering chunk against the registered chunk hashes, then slices the original
+    /// `[range_off, …)` request before the completion is delivered. Like `ArtifactFetch`, the
+    /// request carries ONLY content coordinates — no URL, locator, or credential.
+    ArtifactRange {
+        /// The committed artifact identity (the registered chunk map's fold).
+        hash: [u8; 32],
+        /// The guest's requested range start (bytes into the artifact).
+        range_off: u64,
+        /// The guest's requested range length (`0` = to the end of the artifact).
+        range_len: u64,
+        /// The chunk-aligned covering-span start the embedder must serve.
+        span_off: u64,
+        /// The covering-span length (exact; never 0).
+        span_len: u64,
+    },
     /// `net.stream_open(peer)` — open a direct stream to `peer`; completes with a kind-9
     /// `StreamHandle` minted by the pump with the receiver-granted initial credit (§3.3).
     StreamOpen {
@@ -255,6 +274,22 @@ mod tests {
                         range_len: bl,
                     },
                 ) => a == b && ao == bo && al == bl,
+                (
+                    Self::ArtifactRange {
+                        hash: a,
+                        range_off: ao,
+                        range_len: al,
+                        span_off: sa,
+                        span_len: la,
+                    },
+                    Self::ArtifactRange {
+                        hash: b,
+                        range_off: bo,
+                        range_len: bl,
+                        span_off: sb,
+                        span_len: lb,
+                    },
+                ) => a == b && ao == bo && al == bl && sa == sb && la == lb,
                 (Self::StreamOpen { peer: a }, Self::StreamOpen { peer: b }) => a == b,
                 (Self::StreamAccept, Self::StreamAccept) => true,
                 (

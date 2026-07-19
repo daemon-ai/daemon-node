@@ -27,7 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use daemon_egress::{EgressClient, Redirects};
+use daemon_egress::{EgressClient, EgressRequest, Redirects};
 use daemon_vhc_proto::blake3_hash;
 
 use crate::presign::{PresignClient, PresignOp, PresignRequest};
@@ -175,6 +175,64 @@ impl ArtifactResolver {
         Ok(bytes)
     }
 
+    /// Fetch the byte range `[off, off + len)` of `url` (`len == 0` = to the end), dispatching
+    /// on scheme. **Unverified by design**: a range has no whole-object hash to check — the
+    /// chunk-addressed corpus contract verifies ranges from the manifest's covering CHUNK
+    /// hashes (the run pump's job, `daemon-vhc-host`), and the cache-warming path verifies each
+    /// chunk before inserting it. Never use this for plain (whole-hash) artifacts — those go
+    /// through [`ArtifactResolver::fetch`].
+    ///
+    /// Network schemes send an HTTP `Range` header; a server that ignores it (200 with the full
+    /// body) is handled by slicing locally, so the caller always receives exactly the range (a
+    /// short object is a typed [`VhcNetError::Fetch`]).
+    pub async fn fetch_range(&self, url: &str, off: u64, len: u64) -> Result<Vec<u8>, VhcNetError> {
+        let (scheme, rest) = ArtifactScheme::parse(url)?;
+        let body = match scheme {
+            ArtifactScheme::File => {
+                let bytes = read_file_uri(rest).await?;
+                return slice_range(url, bytes, off, len, true);
+            }
+            ArtifactScheme::Https => {
+                egress_get_range(self.egress("https://")?, url, off, len).await?
+            }
+            ArtifactScheme::Hf => {
+                let resolved = hf_resolve_url(&self.hf_base, rest)?;
+                egress_get_range(self.egress("hf://")?, &resolved, off, len).await?
+            }
+            ArtifactScheme::R2 => {
+                let egress = self.egress("r2://")?;
+                let presign = self.presign.as_ref().ok_or_else(|| {
+                    VhcNetError::SchemeUnsupported(
+                        "r2:// needs a presign client — chain ArtifactResolver::with_presign"
+                            .into(),
+                    )
+                })?;
+                let run = self.run.as_ref().ok_or_else(|| {
+                    VhcNetError::SchemeUnsupported(
+                        "r2:// needs a run — chain with_presign(.., run)".into(),
+                    )
+                })?;
+                let path = rest.trim_start_matches('/');
+                let req = PresignRequest::artifact(PresignOp::Get, path);
+                let resp = presign.presign(run, &req).await?;
+                egress_get_range(egress, &resp.url, off, len).await?
+            }
+        };
+        match body {
+            RangeBody::Partial(bytes) => {
+                // A 206 answer IS the requested span; a short one is a store lie.
+                if len != 0 && bytes.len() as u64 != len {
+                    return Err(VhcNetError::Fetch(format!(
+                        "range GET {url} returned {} bytes, requested {len}",
+                        bytes.len()
+                    )));
+                }
+                Ok(bytes)
+            }
+            RangeBody::Whole(bytes) => slice_range(url, bytes, off, len, false),
+        }
+    }
+
     /// Fetch the raw bytes for `url`, dispatching on scheme (no verification).
     async fn fetch_raw(&self, url: &str) -> Result<Vec<u8>, VhcNetError> {
         let (scheme, rest) = ArtifactScheme::parse(url)?;
@@ -259,6 +317,73 @@ async fn read_file_uri(rest: &str) -> Result<Vec<u8>, VhcNetError> {
     tokio::fs::read(&path)
         .await
         .map_err(|e| VhcNetError::Fetch(format!("read {}: {e}", path.display())))
+}
+
+/// A ranged GET's body: `Partial` when the server honored the `Range` header (206), `Whole`
+/// when it ignored it (200 — the caller slices locally).
+enum RangeBody {
+    Partial(Vec<u8>),
+    Whole(Vec<u8>),
+}
+
+/// GET `[off, off + len)` of `url` via an HTTP `Range` header (`len == 0` = `off-` open-ended).
+async fn egress_get_range(
+    egress: &EgressClient,
+    url: &str,
+    off: u64,
+    len: u64,
+) -> Result<RangeBody, VhcNetError> {
+    let range = if len == 0 {
+        format!("bytes={off}-")
+    } else {
+        format!("bytes={off}-{}", off + len - 1)
+    };
+    let req = EgressRequest::get(url).header("Range", &range);
+    let resp = egress
+        .execute(req, Redirects::DEFAULT)
+        .await
+        .map_err(|e| VhcNetError::Fetch(format!("egress range GET {url}: {e}")))?;
+    let status = resp.status();
+    let partial = status.as_u16() == 206;
+    if !status.is_success() {
+        return Err(VhcNetError::Fetch(format!(
+            "range GET {url} returned {status}"
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| VhcNetError::Fetch(format!("read body {url}: {e}")))?
+        .to_vec();
+    Ok(if partial {
+        RangeBody::Partial(bytes)
+    } else {
+        RangeBody::Whole(bytes)
+    })
+}
+
+/// Slice `[off, off + len)` out of a whole object (`len == 0` = to the end); out-of-bounds is a
+/// typed fetch error. `local` only flavors the error message (file read vs range-less server).
+fn slice_range(
+    url: &str,
+    bytes: Vec<u8>,
+    off: u64,
+    len: u64,
+    local: bool,
+) -> Result<Vec<u8>, VhcNetError> {
+    let total = bytes.len() as u64;
+    let end = if len == 0 {
+        total
+    } else {
+        off.saturating_add(len)
+    };
+    if off > total || end > total {
+        return Err(VhcNetError::Fetch(format!(
+            "range [{off}, {end}) out of bounds for {url} ({total} bytes{})",
+            if local { "" } else { ", server ignored Range" }
+        )));
+    }
+    Ok(bytes[off as usize..end as usize].to_vec())
 }
 
 /// GET `url` through the egress client and return the body, mapping non-2xx + transport failures to
@@ -654,6 +779,74 @@ mod tests {
             .with_presign(Arc::new(mock.presign_client()), RunId::new("run-x"));
         let art = ArtifactRef::new("r2://experiment.wasm", blake3_hash(&body));
         assert_eq!(resolver.fetch(&art).await.unwrap(), body);
+    }
+
+    /// `fetch_range` on `file://`: exact slice, open-ended tail, and a typed out-of-bounds.
+    #[tokio::test]
+    async fn fetch_range_file_slices_and_bounds() {
+        let dir = temp_root("artifact-range-file");
+        let body: Vec<u8> = (0u8..64).collect();
+        let (_abs, url) = write_artifact(dir.path(), "shard.bin", &body).await;
+        let r = ArtifactResolver::new();
+        assert_eq!(r.fetch_range(&url, 8, 16).await.unwrap(), body[8..24]);
+        assert_eq!(r.fetch_range(&url, 48, 0).await.unwrap(), body[48..]);
+        assert!(matches!(
+            r.fetch_range(&url, 60, 32).await.unwrap_err(),
+            VhcNetError::Fetch(_)
+        ));
+    }
+
+    /// `fetch_range` over HTTP: a 206 span is taken verbatim; a Range-ignoring 200 (the whole
+    /// object) is sliced locally — the caller always receives exactly the range.
+    #[tokio::test]
+    async fn fetch_range_http_handles_206_and_200() {
+        let body: Vec<u8> = (0u8..100).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/partial.bin"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(body[10..30].to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/whole.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        // wiremock speaks plaintext http, so drive the shared range primitives directly (the
+        // https:// scheme dispatch is the same egress_get_range + slice_range pair).
+        let partial = egress_get_range(&egress(), &format!("{}/partial.bin", server.uri()), 10, 20)
+            .await
+            .unwrap();
+        assert!(matches!(&partial, RangeBody::Partial(b) if b == &body[10..30].to_vec()));
+        let whole = egress_get_range(&egress(), &format!("{}/whole.bin", server.uri()), 10, 20)
+            .await
+            .unwrap();
+        let RangeBody::Whole(bytes) = whole else {
+            panic!("200 answer classifies Whole");
+        };
+        assert_eq!(
+            slice_range("mock", bytes, 10, 20, false).unwrap(),
+            body[10..30].to_vec()
+        );
+    }
+
+    /// `fetch_range` over `r2://` (presigned GET): a Range-ignoring store still yields the
+    /// exact slice.
+    #[tokio::test]
+    async fn fetch_range_r2_via_presign() {
+        let mock = MockR2::start().await;
+        let body: Vec<u8> = (0u8..80).collect();
+        mock.seed("runs/run-x/corpus/shard.bin", body.clone());
+        let resolver = ArtifactResolver::with_egress(mock.egress())
+            .with_presign(Arc::new(mock.presign_client()), RunId::new("run-x"));
+        assert_eq!(
+            resolver
+                .fetch_range("r2://corpus/shard.bin", 32, 16)
+                .await
+                .unwrap(),
+            body[32..48].to_vec()
+        );
     }
 
     /// The `https://` scheme is *wired* to egress (a fetch is attempted, not `SchemeUnsupported`):

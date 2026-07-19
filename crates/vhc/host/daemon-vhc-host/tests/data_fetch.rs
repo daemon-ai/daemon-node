@@ -102,34 +102,107 @@ fn guest_config(mode: u64, manifest_json: &str, shard: [u8; 32], seq: u64) -> Ve
     b
 }
 
+/// Guest config for the chunked modes: `{"mode", "shard" (the fold), "desc", "off", "len"}`.
+fn chunked_config(mode: u64, shard: [u8; 32], desc: &[u8], off: u64, len: u64) -> Vec<u8> {
+    let v = Value::Map(vec![
+        (Value::from("mode"), Value::from(mode)),
+        (Value::from("shard"), Value::Bytes(shard.to_vec())),
+        (Value::from("desc"), Value::Bytes(desc.to_vec())),
+        (Value::from("off"), Value::from(off)),
+        (Value::from("len"), Value::from(len)),
+    ]);
+    let mut b = Vec::new();
+    ciborium::into_writer(&v, &mut b).expect("config cbor");
+    b
+}
+
+/// A chunk-addressed shard fixture: 80 deterministic bytes at chunk_size 32 (two full chunks +
+/// one short), its fold identity, and the guest-facing register_chunks descriptor.
+fn chunked_fixture() -> (daemon_vhc_proto::ChunkMap, Vec<u8>, [u8; 32], Vec<u8>) {
+    let bytes: Vec<u8> = (0u8..80).map(|b| b.wrapping_mul(37)).collect();
+    let map = daemon_vhc_proto::ChunkMap {
+        chunk_size: 32,
+        token_count: 40,
+        byte_len: 80,
+        chunk_hashes: daemon_vhc_proto::chunk_hashes(&bytes, 32),
+    };
+    let fold = map.fold().0;
+    let hashes: Vec<Value> = map
+        .chunk_hashes
+        .iter()
+        .map(|h| Value::Bytes(h.0.to_vec()))
+        .collect();
+    let doc = Value::Array(vec![
+        Value::from(map.chunk_size),
+        Value::from(map.token_count),
+        Value::from(map.byte_len),
+        Value::Array(hashes),
+    ]);
+    let desc = daemon_vhc_proto::to_canonical_vec(&doc).expect("descriptor cbor");
+    (map, bytes, fold, desc)
+}
+
 /// The embedder servicer — the resolver/content-cache seat. `tamper`: hashes to answer with
-/// corrupted bytes (the pinning negative). Asserts the request carries ONLY (hash, range): no
-/// URL, locator, or credential can reach — or leave — the sandbox through this surface.
+/// corrupted bytes (the pinning negative). Asserts the request carries ONLY content
+/// coordinates (hash + range/span): no URL, locator, or credential can reach — or leave — the
+/// sandbox through this surface. Chunk-addressed requests (`ArtifactRange`) are served with
+/// ONLY the covering span (recorded into `spans_served` so tests can assert the whole shard
+/// never crossed).
 fn service_fetches(
     pump: &PumpHandle,
     artifacts: &std::collections::HashMap<[u8; 32], Vec<u8>>,
     tamper: &[[u8; 32]],
 ) {
+    service_fetches_spans(pump, artifacts, tamper, &mut Vec::new());
+}
+
+/// [`service_fetches`], recording every served covering span as `(span_off, span_len)`.
+fn service_fetches_spans(
+    pump: &PumpHandle,
+    artifacts: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+    tamper: &[[u8; 32]],
+    spans_served: &mut Vec<(u64, u64)>,
+) {
     for (op, request) in pump.take_op_requests() {
-        let OpRequest::ArtifactFetch {
-            hash,
-            range_off: _,
-            range_len: _,
-        } = request
-        else {
-            panic!("the data guest issues only ArtifactFetch requests, got {request:?}");
-        };
-        let artifact = artifacts
-            .get(&hash)
-            .unwrap_or_else(|| panic!("servicer asked for an unknown artifact"))
-            .clone();
-        let artifact = if tamper.contains(&hash) {
-            vec![0xFF; artifact.len()] // the wire lied — the pump must catch it
-        } else {
-            artifact
-        };
-        pump.complete_op(op, OpOutcome::FetchDone { artifact })
-            .expect("fetch completion");
+        match request {
+            OpRequest::ArtifactFetch {
+                hash,
+                range_off: _,
+                range_len: _,
+            } => {
+                let artifact = artifacts
+                    .get(&hash)
+                    .unwrap_or_else(|| panic!("servicer asked for an unknown artifact"))
+                    .clone();
+                let artifact = if tamper.contains(&hash) {
+                    vec![0xFF; artifact.len()] // the wire lied — the pump must catch it
+                } else {
+                    artifact
+                };
+                pump.complete_op(op, OpOutcome::FetchDone { artifact })
+                    .expect("fetch completion");
+            }
+            OpRequest::ArtifactRange {
+                hash,
+                span_off,
+                span_len,
+                ..
+            } => {
+                let artifact = artifacts
+                    .get(&hash)
+                    .unwrap_or_else(|| panic!("servicer asked for an unknown shard"));
+                let lo = span_off as usize;
+                let hi = lo + span_len as usize;
+                let mut bytes = artifact[lo..hi].to_vec();
+                if tamper.contains(&hash) {
+                    bytes[0] ^= 0xFF; // one lying byte in one covering chunk
+                }
+                spans_served.push((span_off, span_len));
+                pump.complete_op(op, OpOutcome::RangeDone { bytes })
+                    .expect("range completion");
+            }
+            other => panic!("the data guest issues only artifact requests, got {other:?}"),
+        }
     }
 }
 
@@ -146,8 +219,8 @@ fn drive(
     let wasm = guest_wasm();
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let sel = select_driver(&worker, &wasm, Some(blake3::hash(&wasm).as_bytes()))
-        .expect("minor-1 data module admitted");
-    assert_eq!((sel.major, sel.minor), (2, 1));
+        .expect("minor-2 data module admitted");
+    assert_eq!((sel.major, sel.minor), (2, 2));
 
     let identity = RunIdentity {
         run_id: [0xDA; 32],
@@ -179,6 +252,57 @@ fn drive(
     let end = run.wait().expect("guest thread clean");
     let entries = sink.lock().expect("sink").entries.clone();
     (published, entries, end)
+}
+
+/// [`drive`] with a data-read budget, recording the served covering spans.
+#[allow(clippy::type_complexity)]
+fn drive_chunked(
+    config: Vec<u8>,
+    granted: Vec<[u8; 32]>,
+    artifacts: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    tamper: &[[u8; 32]],
+    publishes: usize,
+    instance: u64,
+    budget: u64,
+) -> (
+    Vec<(u64, u64, Vec<u8>)>,
+    Vec<SinkEntry>,
+    RunEnd,
+    Vec<(u64, u64)>,
+) {
+    let wasm = guest_wasm();
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    let identity = RunIdentity {
+        run_id: [0xDB; 32],
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance,
+        module: *blake3::hash(&wasm).as_bytes(),
+    };
+    let mut run_cfg = RunConfig::new(identity, [0x77; 32], config, Vec::new());
+    run_cfg.granted_artifacts = granted.into_iter().collect();
+    run_cfg.data_read_budget_bytes = budget;
+    let sink = Arc::new(Mutex::new(MemorySink::new()));
+    let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
+    let pump = run.pump.clone();
+
+    let mut spans = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while pump.published().len() < publishes {
+        service_fetches_spans(&pump, &artifacts, tamper, &mut spans);
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let published = pump.published();
+    if published.len() >= publishes {
+        pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
+            .expect("stop");
+    }
+    let end = run.wait().expect("guest thread clean");
+    let entries = sink.lock().expect("sink").entries.clone();
+    (published, entries, end, spans)
 }
 
 /// The payload bytes of published frame `i` (the §12.1 `[envelope, payload, sig]` wire form).
@@ -341,5 +465,179 @@ fn range_bounds_and_tamper_complete_typed_errors() {
         published_payload(&published, 0),
         vec![u8::try_from(daemon_vhc_abi::COMP_ERR_HASH_MISMATCH).unwrap()],
         "tampered artifact completes HashMismatch"
+    );
+}
+
+// ---- the chunk-addressed corpus contract (register_chunks + covering-span range fetch) ----------
+
+/// Mode 4: register → range-fetch → the embedder moves ONLY the covering span, the pump
+/// verifies the covering chunks and slices the exact range — and the run replays bit-for-bit
+/// from CHUNK-keyed payload-table entries (no whole-shard object exists anywhere).
+#[test]
+fn chunked_range_fetch_end_to_end_and_replays() {
+    let (map, bytes, fold, desc) = chunked_fixture();
+    // The guest asks for [40, 60): chunk 1 ([32, 64)) covers it entirely.
+    let config = chunked_config(4, fold, &desc, 40, 20);
+    let artifacts: std::collections::HashMap<[u8; 32], Vec<u8>> =
+        [(fold, bytes.clone())].into_iter().collect();
+    let (published, entries, end, spans) =
+        drive_chunked(config.clone(), vec![fold], artifacts, &[], 1, 1, 0);
+    assert!(matches!(end, RunEnd::Outcome(0)), "end: {end:?}");
+    assert_eq!(
+        published_payload(&published, 0),
+        bytes[40..60].to_vec(),
+        "the module fed exactly the window its policy located"
+    );
+    assert_eq!(
+        spans,
+        vec![(32, 32)],
+        "the embedder served ONLY the covering chunk, never the whole shard"
+    );
+
+    // Replay: the artifact table is CHUNK-addressed — each chunk under its own blake3.
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    let mut script = ReplayScript::from_entries(&entries);
+    for (i, chunk) in bytes.chunks(32).enumerate() {
+        script
+            .payloads
+            .insert(map.chunk_hashes[i].0, chunk.to_vec());
+    }
+    let replayed = replay(&worker, &guest_wasm(), &config, &[], script).expect("harness");
+    assert_eq!(replayed.end, ReplayEnd::Outcome(0));
+    let recorded: Vec<(u64, u64, [u8; 32])> = entries
+        .iter()
+        .filter_map(|e| match e {
+            SinkEntry::Publish {
+                channel,
+                seq,
+                payload_hash,
+                ..
+            } => Some((*channel, *seq, *payload_hash)),
+            _ => None,
+        })
+        .collect();
+    let redriven: Vec<(u64, u64, [u8; 32])> = replayed
+        .decisions
+        .iter()
+        .map(|d| (d.channel, d.seq, d.payload_hash))
+        .collect();
+    assert_eq!(recorded, redriven, "decisions reproduce bit-for-bit");
+
+    // A replay whose payload table lacks the covering chunk is the typed missing-payload
+    // divergence — never a silent pass.
+    let script_missing = ReplayScript::from_entries(&entries);
+    let replayed = replay(&worker, &guest_wasm(), &config, &[], script_missing).expect("h");
+    match replayed.end {
+        ReplayEnd::Diverged(msg) => assert!(msg.contains("ReplayMissingPayload"), "{msg}"),
+        other => panic!("expected ReplayMissingPayload, got {other:?}"),
+    }
+}
+
+/// Mode 5: one lying byte in a covering chunk → the pump completes `Err(HashMismatch)`; the
+/// guest never sees the corrupted window.
+#[test]
+fn chunked_tampered_span_completes_hash_mismatch() {
+    let (_map, bytes, fold, desc) = chunked_fixture();
+    let artifacts: std::collections::HashMap<[u8; 32], Vec<u8>> =
+        [(fold, bytes)].into_iter().collect();
+    let (published, _, end, _) = drive_chunked(
+        chunked_config(5, fold, &desc, 0, 16),
+        vec![fold],
+        artifacts,
+        &[fold],
+        1,
+        2,
+        0,
+    );
+    assert!(matches!(end, RunEnd::Outcome(0)));
+    assert_eq!(
+        published_payload(&published, 0),
+        vec![u8::try_from(daemon_vhc_abi::COMP_ERR_HASH_MISMATCH).unwrap()],
+        "a lying covering chunk completes HashMismatch"
+    );
+}
+
+/// Mode 6: the cumulative data-read budget covers exactly one window — the first fetch feeds
+/// the batch, the identical second fetch completes `Err(GrantExhausted)` (typed, at the call).
+#[test]
+fn chunked_read_budget_exhaustion_is_typed() {
+    let (_map, bytes, fold, desc) = chunked_fixture();
+    let artifacts: std::collections::HashMap<[u8; 32], Vec<u8>> =
+        [(fold, bytes.clone())].into_iter().collect();
+    let (published, _, end, _) = drive_chunked(
+        chunked_config(6, fold, &desc, 8, 24),
+        vec![fold],
+        artifacts,
+        &[],
+        2,
+        3,
+        24, // exactly one 24-byte window
+    );
+    assert!(matches!(end, RunEnd::Outcome(0)));
+    assert_eq!(
+        published_payload(&published, 0),
+        bytes[8..32].to_vec(),
+        "the budgeted first window feeds"
+    );
+    assert_eq!(
+        published_payload(&published, 1),
+        vec![u8::try_from(daemon_vhc_abi::COMP_ERR_GRANT_EXHAUSTED).unwrap()],
+        "the second identical fetch breaches the cumulative budget"
+    );
+}
+
+/// Mode 7: bounds are knowable at the call on a REGISTERED shard — an absurd offset completes
+/// `Err(StoreRefused)` immediately (no embedder round-trip happens at all).
+#[test]
+fn chunked_out_of_bounds_range_refuses_at_the_call() {
+    let (_map, bytes, fold, desc) = chunked_fixture();
+    let artifacts: std::collections::HashMap<[u8; 32], Vec<u8>> =
+        [(fold, bytes)].into_iter().collect();
+    let (published, _, end, spans) = drive_chunked(
+        chunked_config(7, fold, &desc, 0, 0),
+        vec![fold],
+        artifacts,
+        &[],
+        1,
+        4,
+        0,
+    );
+    assert!(matches!(end, RunEnd::Outcome(0)));
+    assert_eq!(
+        published_payload(&published, 0),
+        vec![u8::try_from(daemon_vhc_abi::COMP_ERR_STORE_REFUSED).unwrap()],
+        "registered bounds refuse at the call"
+    );
+    assert!(spans.is_empty(), "no store round-trip for a refused range");
+}
+
+/// Mode 8: registering a chunk map whose fold is NOT a granted artifact traps `GrantViolation`
+/// at the call — a module cannot smuggle chunk identities for content it was not granted.
+#[test]
+fn ungranted_chunk_registration_traps_grant_violation() {
+    let (_map, _bytes, fold, desc) = chunked_fixture();
+    // Grant something else entirely; the descriptor's fold is not in the set.
+    let other = [0x55u8; 32];
+    let (_, entries, end, _) = drive_chunked(
+        chunked_config(8, fold, &desc, 0, 0),
+        vec![other],
+        std::collections::HashMap::new(),
+        &[],
+        1,
+        5,
+        0,
+    );
+    match end {
+        RunEnd::Trapped(trap) => {
+            assert_eq!(trap.code, daemon_vhc_host::TrapCode::GrantViolation);
+            assert!(trap.detail.contains("fold"), "{}", trap.detail);
+        }
+        other => panic!("expected GrantViolation, got {other:?}"),
+    }
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(e, SinkEntry::Completion { .. })),
+        "no op was issued, no completion journaled"
     );
 }

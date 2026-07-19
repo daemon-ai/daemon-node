@@ -18769,6 +18769,7 @@ dependencies = [
  "daemon-egress",
  "daemon-protocol",
  "daemon-vhc-net",
+ "daemon-vhc-proto",
  "daemon-vhc-session",
  "hf-hub 0.5.0",
  "serde",

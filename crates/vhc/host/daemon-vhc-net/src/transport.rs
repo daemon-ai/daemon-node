@@ -108,11 +108,20 @@ impl MemoryContentStore {
     /// Seed an object directly (test/genesis staging helper). Returns its content hash.
     pub fn seed(&self, bytes: &[u8]) -> ContentHash {
         let hash = daemon_vhc_proto::blake3_hash(bytes);
+        self.seed_under(hash, bytes);
+        hash
+    }
+
+    /// Seed an object under an EXPLICIT key — the chunk-addressed corpus seat: a shard's
+    /// artifact identity is its chunk FOLD (`daemon_vhc_proto::shard_fold`), not the plain
+    /// blake3 of its bytes, so staging one requires naming the key. The consumer pump verifies
+    /// the covering chunks on every fetch regardless (the store stays untrusted); `get_content`
+    /// serves whatever was seeded here verbatim.
+    pub fn seed_under(&self, hash: ContentHash, bytes: &[u8]) {
         self.objects
             .lock()
             .expect("content store lock")
             .insert(hash, bytes.to_vec());
-        hash
     }
 }
 

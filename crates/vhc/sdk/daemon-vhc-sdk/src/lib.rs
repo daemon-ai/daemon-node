@@ -11,17 +11,23 @@ pub mod abi;
 #[cfg(target_arch = "wasm32")]
 pub use abi::{
     buffer_len, buffer_release, cancel, compute_export, compute_fence, compute_import,
-    compute_submit_op, create_from, data_fetch, device_profile, emit_metric, hash_accel,
-    next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint, read_buffer,
-    rng_seed, set_timer, snapshot_state, stage_state, stream_accept, stream_open, stream_read,
-    stream_write, verify_sig_accel, Event,
+    compute_submit_op, create_from, data_fetch, data_register_chunks, device_profile, emit_metric,
+    hash_accel, next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint,
+    read_buffer, rng_seed, set_timer, snapshot_state, stage_state, stream_accept, stream_open,
+    stream_read, stream_write, verify_sig_accel, Event,
 };
 
 pub mod corpus;
 pub mod migrate;
 pub mod module;
 
-pub use corpus::{BatchLocation, CorpusError, CorpusWindow, Manifest, ShardDesc, TokenWidth};
+#[cfg(target_arch = "wasm32")]
+pub use corpus::register_shard_chunks;
+pub use corpus::{
+    chunk_descriptor, decode_sequence_tokens, derive_assignment, plan_window, sequence_byte_range,
+    Assignment, AssignmentParams, BatchLocation, CorpusError, CorpusManifest, CorpusWindow,
+    Manifest, RangeFetch, ShardDesc, TokenWidth,
+};
 pub use migrate::{
     build_manifest, MigrateState, MigrationDescriptor, MigrationSection, OwnedSection, SectionDecl,
     SectionReader, SimSections, StateManifest,

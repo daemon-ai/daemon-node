@@ -338,6 +338,45 @@ pub(crate) fn hash_from_hex(s: &str) -> Option<daemon_vhc_net::ContentHash> {
     Some(ContentHash::new(out))
 }
 
+/// The shard indices covering the sequence window `[start, start + count)` (wrapping;
+/// `count == 0` or `>= total` = every shard) — mechanical staging arithmetic over the manifest
+/// geometry (WHICH window to warm remains the operator's/module's choice).
+#[cfg(feature = "vhc-net")]
+fn shards_covering_window(
+    manifest: &daemon_vhc_proto::CorpusManifest,
+    start: u64,
+    count: u64,
+) -> Vec<usize> {
+    let total = manifest.total_sequences();
+    if total == 0 {
+        return Vec::new();
+    }
+    if count == 0 || count >= total {
+        return (0..manifest.shards.len()).collect();
+    }
+    let seq_len = u64::from(manifest.seq_len);
+    let start = start % total;
+    let ranges: [(u64, u64); 2] = if start + count <= total {
+        [(start, start + count), (0, 0)]
+    } else {
+        [(start, total), (0, (start + count) - total)]
+    };
+    let mut out = Vec::new();
+    let mut cum = 0u64;
+    for (i, shard) in manifest.shards.iter().enumerate() {
+        let seqs = shard.token_count / seq_len;
+        let (bs, be) = (cum, cum + seqs);
+        cum = be;
+        for (rs, re) in ranges {
+            if rs < re && bs < re && rs < be {
+                out.push(i);
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// The `DAEMON_TRAIN_PREFETCH` cache-warming mode (P3 lane S — the fleet staging entry point).
 ///
 /// Runs on a bare fleet box (Windows cmd.exe, macOS, a RunPod container) with no CBOR framing:
@@ -408,12 +447,16 @@ pub(crate) async fn prefetch_main() -> Result<(), String> {
     if let Ok(hex) = std::env::var("DAEMON_TRAIN_PREFETCH_MANIFEST") {
         let hash = hash_from_hex(&hex)
             .ok_or_else(|| format!("bad DAEMON_TRAIN_PREFETCH_MANIFEST {hex}"))?;
-        let art = ArtifactRef::new(format!("r2://corpus/{}.json", hash.to_hex()), hash);
+        let art = ArtifactRef::new(format!("r2://corpus/{}.cbor", hash.to_hex()), hash);
         let manifest_bytes = warm(&cache, &resolver, "manifest", &art).await?;
-        let manifest = daemon_vhc_session::data::Manifest::from_json(
-            std::str::from_utf8(&manifest_bytes).map_err(|e| format!("manifest utf8: {e}"))?,
-        )
-        .map_err(|e| format!("parse corpus manifest: {e}"))?;
+        let manifest = daemon_vhc_proto::CorpusManifest::from_canonical_bytes(&manifest_bytes)
+            .map_err(|e| format!("parse corpus manifest: {e}"))?;
+
+        // The tokenizer artifact is part of the corpus contract — warm it too.
+        let tok = &manifest.tokenizer.hash;
+        let tok_art = ArtifactRef::new(format!("r2://corpus/{}.json", tok.to_hex()), *tok);
+        warm(&cache, &resolver, "tokenizer", &tok_art).await?;
+        warmed += 1;
 
         let (start, count) = std::env::var("DAEMON_TRAIN_PREFETCH_WINDOW")
             .ok()
@@ -422,24 +465,57 @@ pub(crate) async fn prefetch_main() -> Result<(), String> {
                 Some((s.parse().ok()?, c.parse().ok()?))
             })
             .unwrap_or((0u64, 0u64));
-        let indices = manifest.shards_covering(start, count);
+        let indices = shards_covering_window(&manifest, start, count);
         println!(
             "prefetch: corpus window start={start} count={count} -> {}/{} shards",
             indices.len(),
             manifest.shards.len()
         );
+        // Shards are chunk-addressed (identity = the chunk fold, not a whole-object hash):
+        // fetch each selected shard's bytes as ONE open range, verify every chunk against the
+        // manifest's chunk hashes, and warm the cache CHUNK-keyed (chunks are plain blake3
+        // content — the cache's native unit; the live fetch path re-verifies regardless).
         for idx in indices {
-            let desc = &manifest.shards[idx];
-            let hash = hash_from_hex(&desc.blake3)
-                .ok_or_else(|| format!("shard {idx} malformed blake3"))?;
-            let art = ArtifactRef::new(format!("r2://corpus/{}.bin", desc.blake3), hash);
-            warm(
-                &cache,
-                &resolver,
-                &format!("shard[{idx}] {}", desc.name),
-                &art,
-            )
-            .await?;
+            let entry = &manifest.shards[idx];
+            let url = format!("r2://corpus/{}.bin", entry.shard_hash.to_hex());
+            let t0 = std::time::Instant::now();
+            let bytes = resolver
+                .fetch_range(&url, 0, 0)
+                .await
+                .map_err(|e| format!("shard[{idx}] ({url}): {e}"))?;
+            if bytes.len() as u64 != entry.byte_len {
+                return Err(format!(
+                    "shard[{idx}] is {} bytes, the manifest pins {}",
+                    bytes.len(),
+                    entry.byte_len
+                ));
+            }
+            let mut cached_chunks = 0usize;
+            for (i, chunk) in bytes
+                .chunks(usize::try_from(manifest.chunk_size).unwrap_or(usize::MAX))
+                .enumerate()
+            {
+                let expected = entry
+                    .chunk_hashes
+                    .get(i)
+                    .ok_or_else(|| format!("shard[{idx}] chunk {i} past the manifest list"))?;
+                let actual = daemon_vhc_proto::blake3_hash(chunk);
+                if actual != *expected {
+                    return Err(format!(
+                        "shard[{idx}] chunk {i} does not hash to the manifest chunk hash"
+                    ));
+                }
+                if let Err(e) = cache.insert(expected, chunk).await {
+                    eprintln!("prefetch: cache insert failed for shard[{idx}] chunk {i}: {e}");
+                }
+                cached_chunks += 1;
+            }
+            println!(
+                "prefetch: shard[{idx}] bytes={} fold={} chunks={cached_chunks} ms={}",
+                bytes.len(),
+                entry.shard_hash.to_hex(),
+                t0.elapsed().as_millis()
+            );
             warmed += 1;
         }
         warmed += 1;

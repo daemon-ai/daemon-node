@@ -330,6 +330,7 @@ fn genesis_wire() -> Vec<u8> {
         },
         roles,
         artifacts,
+        corpus_manifest: None,
         // The run's declared trust topology (D1's typed AuthorityConfig, encoded into the opaque
         // section the host never interprets): SingleKey over the DERIVED coordinator identity.
         authority: AuthorityConfig {

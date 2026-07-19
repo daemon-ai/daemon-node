@@ -25,7 +25,7 @@ mod publish;
 mod tokenize;
 
 use clap::{Parser, Subcommand};
-use daemon_vhc_session::data::TokenWidth;
+use daemon_vhc_proto::corpus::TokenWidth;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -107,6 +107,15 @@ enum Cmd {
         /// Token element width: `u16` (vocab ≤ 65 536) or `u32`.
         #[arg(long, default_value = "u16")]
         token_width: String,
+        /// Chunk size in bytes (pinned in the manifest; must be a multiple of the token width).
+        #[arg(long, default_value_t = daemon_vhc_proto::CORPUS_DEFAULT_CHUNK_SIZE)]
+        chunk_size: u64,
+        /// The tokenizer's end-of-sequence token id, where known (recorded in the manifest).
+        #[arg(long)]
+        eos_id: Option<u32>,
+        /// The padding token id, where the pipeline pads (recorded in the manifest).
+        #[arg(long)]
+        pad_id: Option<u32>,
         /// Optional cap on total tokens emitted (keeps a vendored fixture small).
         #[arg(long)]
         max_tokens: Option<u64>,
@@ -134,7 +143,7 @@ enum Cmd {
     },
     /// Publish a pre-tokenized corpus (shards + manifest) to the payload store by content hash (P3 S).
     PublishCorpus {
-        /// The `manifest.json` produced by `tokenize-corpus` (its shards sit beside it).
+        /// The `corpus-manifest.cbor` produced by `tokenize-corpus` (shards + tokenizer.json beside it).
         #[arg(long)]
         manifest: PathBuf,
         /// The run id whose prefix the objects live under (`runs/<run>/corpus/…`).
@@ -197,6 +206,9 @@ fn main() -> anyhow::Result<()> {
             shard_tokens,
             seq_len,
             token_width,
+            chunk_size,
+            eos_id,
+            pad_id,
             max_tokens,
         } => {
             let token_width = match token_width.as_str() {
@@ -215,6 +227,9 @@ fn main() -> anyhow::Result<()> {
                 shard_tokens,
                 seq_len,
                 token_width,
+                chunk_size,
+                eos_id,
+                pad_id,
                 max_tokens,
             })
         }

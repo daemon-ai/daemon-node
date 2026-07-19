@@ -1,21 +1,29 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `xtask tokenize-corpus` — offline corpus → fixed-width shards + `manifest.json` (spec §8).
+//! `xtask tokenize-corpus` — offline corpus → chunk-addressed shards + the canonical-CBOR
+//! corpus manifest (the corpus contract the genesis pins by hash).
 //!
 //! Mirrors `build-guests`: a maintainer-run dev tool (never the shipped node), so its egress goes
 //! through the revision-pinned `hf-hub` client (no raw `reqwest::Client` — the clippy
 //! `disallowed_types` egress ban is respected; the fs writes are covered by main.rs's crate-level
 //! `#![allow(clippy::disallowed_methods)]`). It pulls a dataset text + a tokenizer (both by pinned
-//! revision, or from local paths for hermetic/offline runs), tokenizes with the `tokenizers` crate,
-//! and writes fixed-width `u16`/`u32` LE shards + a `manifest.json` carrying the additive tokenizer/
-//! dataset provenance (`daemon_vhc_session::data::Manifest`). The shards are the exact format the
-//! participant runtime reads (`data.rs`), so a vendored fixture needs no egress in CI (RUN-3).
+//! revision, or from local paths for hermetic/offline runs), tokenizes with the `tokenizers`
+//! crate, and writes:
+//!
+//! - fixed-width little-endian token shards, one file per shard named by its **fold identity**
+//!   (`<shard_hash hex>.bin` — the chunk-addressed artifact id, `daemon_vhc_proto::shard_fold`);
+//! - the tokenizer artifact itself (`tokenizer.json`, content-addressed into the manifest);
+//! - `corpus-manifest.cbor` — the canonical-CBOR [`CorpusManifest`] whose blake3 is the identity
+//!   a genesis pins (`corpus_manifest`) and `publish-corpus` uploads under.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use daemon_vhc_session::data::{Manifest, ShardDesc, TokenWidth};
+use daemon_vhc_proto::corpus::{
+    CorpusManifest, Endianness, SequenceBoundary, ShardEntry, TokenWidth, TokenizerId,
+    CORPUS_MANIFEST_FORMAT,
+};
 
 /// Arguments for `tokenize-corpus` (the frozen CLI seam — see `swarm-ledger-m1.md`).
 pub struct Args {
@@ -23,7 +31,7 @@ pub struct Args {
     pub dataset: Option<String>,
     /// The file within the dataset repo to pull (e.g. `TinyStories-valid.txt`).
     pub dataset_file: Option<String>,
-    /// The pinned dataset revision (commit SHA / tag). Recorded in the manifest.
+    /// The pinned dataset revision (commit SHA / tag).
     pub revision: String,
     /// A local corpus text file — bypasses the HF dataset pull entirely (offline / synthetic).
     pub text: Option<PathBuf>,
@@ -31,7 +39,7 @@ pub struct Args {
     pub tokenizer: String,
     /// The pinned tokenizer revision (defaults to `main` when pulling from HF).
     pub tokenizer_revision: Option<String>,
-    /// The output directory for shards + `manifest.json`.
+    /// The output directory for shards + tokenizer + `corpus-manifest.cbor`.
     pub out_dir: PathBuf,
     /// Tokens per shard (rounded down to a whole multiple of `seq_len`).
     pub shard_tokens: u64,
@@ -39,6 +47,12 @@ pub struct Args {
     pub seq_len: u32,
     /// Token element width: `u16` (vocab ≤ 65 536) or `u32`.
     pub token_width: TokenWidth,
+    /// Chunk size in bytes (a whole multiple of the token width; the manifest pins it).
+    pub chunk_size: u64,
+    /// The tokenizer's end-of-sequence token id, where known (recorded in the manifest).
+    pub eos_id: Option<u32>,
+    /// The padding token id, where the pipeline pads (recorded in the manifest).
+    pub pad_id: Option<u32>,
     /// Optional cap on the total tokens emitted (keeps a vendored fixture small).
     pub max_tokens: Option<u64>,
 }
@@ -47,10 +61,18 @@ pub struct Args {
 pub fn run(args: Args) -> anyhow::Result<()> {
     anyhow::ensure!(args.seq_len > 0, "--seq-len must be > 0");
     anyhow::ensure!(args.shard_tokens > 0, "--shard-tokens must be > 0");
+    let width = args.token_width.bytes();
+    anyhow::ensure!(
+        args.chunk_size > 0 && args.chunk_size.is_multiple_of(width),
+        "--chunk-size must be a non-zero multiple of the token width ({width})"
+    );
     let seq_len = u64::from(args.seq_len);
 
-    // 1. Resolve the tokenizer (local file or pinned HF model download).
+    // 1. Resolve the tokenizer (local file or pinned HF model download) — the artifact itself is
+    //    content-addressed into the manifest and shipped beside it.
     let tokenizer_path = resolve_tokenizer(&args.tokenizer, args.tokenizer_revision.as_deref())?;
+    let tokenizer_bytes = std::fs::read(&tokenizer_path)
+        .with_context(|| format!("read tokenizer {}", tokenizer_path.display()))?;
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tokenizer_path.display()))?;
 
@@ -94,51 +116,69 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
-    // 6. Write shards + manifest.
+    // 6. Write shards (fold-named), the tokenizer artifact, and the canonical-CBOR manifest.
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("create {}", args.out_dir.display()))?;
-    let mut shards: Vec<ShardDesc> = Vec::new();
+    let mut shards: Vec<ShardEntry> = Vec::new();
     let mut cursor = 0u64;
-    let mut shard_idx = 0u32;
     while cursor < usable {
         let end = (cursor + per_shard).min(usable);
         let chunk = &ids[cursor as usize..end as usize];
         let bytes = encode_shard(chunk, args.token_width);
-        let name = format!("shard-{shard_idx:04}.bin");
+        let entry = CorpusManifest::author_shard(&bytes, chunk.len() as u64, args.chunk_size)
+            .map_err(|e| anyhow::anyhow!("author shard: {e}"))?;
+        let name = format!("{}.bin", entry.shard_hash.to_hex());
         std::fs::write(args.out_dir.join(&name), &bytes)
             .with_context(|| format!("write {name}"))?;
-        shards.push(ShardDesc {
-            name,
-            bytes: bytes.len() as u64,
-            tokens: chunk.len() as u64,
-            blake3: blake3::hash(&bytes).to_hex().to_string(),
-        });
+        shards.push(entry);
         cursor = end;
-        shard_idx += 1;
     }
 
-    let manifest = Manifest {
+    let tokenizer_hash = daemon_vhc_proto::blake3_hash(&tokenizer_bytes);
+    std::fs::write(args.out_dir.join("tokenizer.json"), &tokenizer_bytes)
+        .context("write tokenizer.json")?;
+
+    let manifest = CorpusManifest {
+        format_version: CORPUS_MANIFEST_FORMAT,
         token_width: args.token_width,
+        endianness: Endianness::Little,
         seq_len: args.seq_len,
+        sequence_boundary: SequenceBoundary::WholeSequencesPerShard,
+        eos_id: args.eos_id,
+        pad_id: args.pad_id,
+        chunk_size: args.chunk_size,
+        tokenizer: TokenizerId {
+            hash: tokenizer_hash,
+            name: args.tokenizer.clone(),
+            revision: args
+                .tokenizer_revision
+                .clone()
+                .unwrap_or_else(|| "main".to_string()),
+        },
+        total_tokens: usable,
         shards,
-        tokenizer: Some(args.tokenizer.clone()),
-        tokenizer_revision: args.tokenizer_revision.clone(),
-        dataset: args.dataset.clone(),
-        dataset_revision: args.dataset.as_ref().map(|_| args.revision.clone()),
     };
-    manifest
-        .validate()
-        .context("generated manifest failed validation")?;
-    let json = manifest.to_json().context("serialize manifest.json")?;
-    std::fs::write(args.out_dir.join("manifest.json"), json).context("write manifest.json")?;
+    let manifest_bytes = manifest
+        .to_canonical_bytes()
+        .map_err(|e| anyhow::anyhow!("generated manifest failed validation: {e}"))?;
+    let manifest_hash = daemon_vhc_proto::blake3_hash(&manifest_bytes);
+    std::fs::write(args.out_dir.join("corpus-manifest.cbor"), &manifest_bytes)
+        .context("write corpus-manifest.cbor")?;
 
     println!(
-        "wrote {} shards ({} tokens, seq_len {}) + manifest.json to {}",
+        "wrote {} chunk-addressed shards ({} tokens, seq_len {}, chunk_size {}) + \
+         tokenizer.json + corpus-manifest.cbor to {}",
         manifest.shards.len(),
-        manifest.total_tokens(),
+        manifest.total_tokens,
         args.seq_len,
+        args.chunk_size,
         args.out_dir.display()
     );
+    println!(
+        "  corpus manifest blake3 (the genesis `corpus_manifest` pin) = {}",
+        manifest_hash.to_hex()
+    );
+    println!("  tokenizer artifact blake3 = {}", tokenizer_hash.to_hex());
     Ok(())
 }
 

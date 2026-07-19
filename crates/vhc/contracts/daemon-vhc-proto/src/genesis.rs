@@ -215,6 +215,11 @@ pub struct RoleGrants {
     pub artifacts: BTreeSet<Hash>,
     /// Async-completion concurrent-operation ceiling (`grant-bound.max_outstanding`).
     pub max_outstanding_ops: u64,
+    /// Cumulative `data@2` **read budget** in bytes for the whole role instance (`0` =
+    /// unbounded by this grant): the total artifact bytes the module may fetch across the run —
+    /// the admitted-grant bound the ratified corpus contract draws cache/read ceilings from.
+    #[serde(default)]
+    pub data_read_budget_bytes: u64,
     /// compute@2 command-queue depth grant (C1, ABI §15; D0∩C1 union). `0` = unspecified —
     /// inherits the lane ceiling at derivation (tighten-only, like the other quotas).
     #[serde(default)]
@@ -285,6 +290,13 @@ pub struct GenesisEnvelope {
     pub roles: BTreeMap<String, RoleEntry>,
     /// `[artifacts]` — name → pinned snapshot descriptor.
     pub artifacts: BTreeMap<String, SnapshotArtifact>,
+    /// The pinned **corpus-manifest hash** (the chunk-addressed data root,
+    /// [`crate::corpus::CorpusManifest::manifest_hash`]) for a run that trains on a published
+    /// corpus. When present it MUST also be an `[artifacts]` entry (the manifest is fetched like
+    /// any other pinned artifact); the pin here is what commits the run's data identity into the
+    /// genesis hash. `None` for runs without a corpus (pure-consensus roles, conformance runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpus_manifest: Option<Hash>,
     /// Opaque `Authority` configuration — interpreted by modules (D1), never by the host.
     pub authority: ciborium::value::Value,
     /// Control-plane transport selection + payload store.
@@ -364,6 +376,15 @@ impl GenesisEnvelope {
                         granted.to_hex()
                     )));
                 }
+            }
+        }
+        if let Some(manifest) = &self.corpus_manifest {
+            if !artifact_hashes.contains(manifest) {
+                return Err(VhcProtoError::Validation(format!(
+                    "corpus_manifest pin {} is absent from the artifact map (the manifest must \
+                     be a fetchable pinned artifact)",
+                    manifest.to_hex()
+                )));
             }
         }
         Ok(())
@@ -588,6 +609,7 @@ mod tests {
             },
             roles,
             artifacts,
+            corpus_manifest: None,
             authority: ciborium::value::Value::Map(vec![]),
             transport: TransportSelection::default(),
             identities: Identities::default(),
@@ -655,5 +677,25 @@ mod tests {
         let mut env = sample();
         env.roles.get_mut("worker").unwrap().module = "nope".into();
         assert!(env.validate().is_err());
+    }
+
+    /// The corpus-manifest pin must name a fetchable `[artifacts]` entry; a mapped pin commits
+    /// into the genesis hash (a different pin is a different `RunId`).
+    #[test]
+    fn corpus_manifest_pin_must_be_a_mapped_artifact_and_commits_into_the_hash() {
+        let mut env = sample();
+        env.corpus_manifest = Some(hash(99));
+        assert!(env.validate().is_err(), "unmapped pin refused");
+
+        // Pin the mapped corpus artifact: valid, and the genesis hash moves with the pin.
+        let unpinned_id = *sample().freeze(&key()).unwrap().run_id();
+        env.corpus_manifest = Some(hash(3));
+        let frozen = env.freeze(&key()).unwrap();
+        assert_ne!(*frozen.run_id(), unpinned_id, "the pin is hash-committed");
+        assert_eq!(
+            frozen.decode().unwrap().corpus_manifest,
+            Some(hash(3)),
+            "the pin round-trips through the frozen form"
+        );
     }
 }
