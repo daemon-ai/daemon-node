@@ -625,9 +625,10 @@ impl VhcService {
         // identity (Completed / Left / FailedTerminal), delete its per-run key material,
         // certificates, and credentials record — no run identity outlives the run it was minted
         // for. FailedRetryable is NOT terminal for the identity (the reconvergence/rejoin path
-        // reuses or supersedes it under the lifecycle wave's retry budget), so its material
-        // survives. Instance-map removal + arbiter release beyond this stay with the lifecycle
-        // wave; this hook is scoped to secret custody. Idempotent (remove_run tolerates absence).
+        // reuses or supersedes it under the retry budget), so its material survives.
+        // Instance-map removal + arbiter release beyond this are run-lifecycle management
+        // concerns; this hook is scoped to secret custody. Idempotent (remove_run tolerates
+        // absence).
         if let protocol::Event::RunTerminated {
             run_id, outcome, ..
         } = ev
