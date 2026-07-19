@@ -160,6 +160,7 @@ fn hardware() -> Hardware {
         down_kbps: 200_000,
         disk_free_mb: 500_000,
         throughput_class: "c3".into(),
+        ..Default::default()
     }
 }
 
