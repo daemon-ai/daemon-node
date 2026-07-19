@@ -3,10 +3,11 @@
 
 //! The live module switch over the REAL worker binary (ABI §10.3): the certificate re-issuance
 //! handshake end to end — a switch whose post-switch identity was never provisioned refuses
-//! typed with the old module untouched; after the node-side provisioning (new incarnation's key
-//! + re-issued certificate in the keystore) the same switch activates, the generation advances,
-//! the command loop keeps answering, and the DURABLE journal continues as one file series across
-//! the seam (sealed retired span, new identity header, publish sequences restarting at 0).
+//! typed with the old module untouched; after the node-side provisioning (the new incarnation's
+//! key and re-issued certificate in the keystore) the same switch activates, the generation
+//! advances, the command loop keeps answering, and the DURABLE journal continues as one file
+//! series across the seam (sealed retired span, new identity header, publish sequences
+//! restarting at 0).
 //!
 //! The joined module is the migrate drill pair's FROM side (it snapshots its counter at the
 //! drain fence); the target is the TO side (it restores the counter through `da_migrate`). The
