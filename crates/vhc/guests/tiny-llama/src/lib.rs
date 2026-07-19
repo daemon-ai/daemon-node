@@ -60,16 +60,22 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
+use daemon_vhc_proto::capability::CapabilitySet;
+use daemon_vhc_proto::corpus::{CorpusManifest, Endianness, TokenWidth};
 use daemon_vhc_proto::{blake3_hash, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed};
+use daemon_vhc_proto::{IrohId, StateDigest};
 use daemon_vhc_sdk::{
     build_manifest, GuestModule, MigrationDescriptor, ModuleDecl, OwnedSection, SectionReader,
 };
 use daemon_vhc_sdk_compute::{export_tensor, fence, AutodiffHostBackend, HostBackend};
 use daemon_vhc_sdk_consensus::digest_state;
-use daemon_vhc_sdk_consensus::messages::{RecordEntry, VhcMessage};
+use daemon_vhc_sdk_consensus::messages::{
+    Commitment, Digest, Heartbeat, Join, RecordEntry, RoundOpen, ThroughputClass, VhcMessage,
+};
 use daemon_vhc_sdk_profiles::{encode_payload, IngestParam, ParamView, SparseLoco, SparseLocoCfg};
 use daemon_vhc_sdk_rounds::{
-    BarrierRound, Committed, PayloadSource, RoundCfg, RoundExperiment, StepCtx as RoundStepCtx,
+    interval_for, slice_interval, BarrierRound, Committed, PayloadSource, RoundCfg,
+    RoundExperiment, StepCtx as RoundStepCtx,
 };
 use serde::Deserialize;
 
@@ -77,6 +83,7 @@ use model::{ModelCfg, TinyLlamaModel};
 
 const EV_FRAME: u64 = 0;
 const EV_PAYLOAD_READY: u64 = 1;
+const EV_TIMER: u64 = 2;
 const EV_STOP: u64 = 4;
 const EV_FENCE: u64 = 5;
 const EV_COMPLETION: u64 = 6;
@@ -101,6 +108,22 @@ struct GuestCfg {
     profile: SparseLocoCfg,
     /// The canonical flat init (concatenated params, registration order) — matched init.
     init: Vec<f32>,
+    /// The MODULE-DRIVEN live mode (absent = the harness contract above): the module announces
+    /// itself on the control plane (Join/ready-Heartbeat), fetches its own training data from
+    /// the genesis-pinned chunk-addressed corpus via `data@2`, fetches committed peer payloads
+    /// from the content-addressed payload plane, and publishes the wire control messages
+    /// (Commitment/Digest) the run's coordinator consumes — no host staging anywhere.
+    #[serde(default)]
+    live: Option<LiveCfg>,
+}
+
+/// The live-mode config half (module-driven data + wire announcements).
+#[derive(Deserialize)]
+struct LiveCfg {
+    /// The run label the coordinator admits joins under (`RunConfig.run_id`).
+    run_label: String,
+    /// The genesis-pinned chunk-addressed corpus manifest's content hash (a granted artifact).
+    manifest: Hash,
 }
 
 /// One staged batch: `(sequences, seq_len, tokens)` in training order.
@@ -250,6 +273,9 @@ struct Restored {
     ef: Vec<f32>,
     adamw_m: Vec<f32>,
     adamw_v: Vec<f32>,
+    /// The snapshot's resync watermark (the last round its state folds), when the snapshot
+    /// recorded one — the restored driver never re-ingests at or below it (§9 restore).
+    round: Option<u64>,
 }
 
 struct TinyLlama {
@@ -303,8 +329,19 @@ impl GuestModule for TinyLlama {
         let mut ef: Option<Vec<f32>> = None;
         let mut adamw_m: Option<Vec<f32>> = None;
         let mut adamw_v: Option<Vec<f32>> = None;
+        let mut round: Option<u64> = None;
         for binding in &descriptor.sections {
             let bytes = reader.read(binding.staging_id);
+            if binding.name == "round" {
+                // The resync watermark: 8 bytes LE; `u64::MAX` = the snapshot predates any
+                // ingest (no watermark).
+                let Ok(raw) = <[u8; 8]>::try_from(bytes.as_slice()) else {
+                    return MIGRATE_INCOMPATIBLE_SECTIONS;
+                };
+                let val = u64::from_le_bytes(raw);
+                round = (val != u64::MAX).then_some(val);
+                continue;
+            }
             let vals: Vec<f32> = bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -329,6 +366,7 @@ impl GuestModule for TinyLlama {
             ef,
             adamw_m,
             adamw_v,
+            round,
         });
         0
     }
@@ -358,6 +396,112 @@ fn publish_tagged(tag: u64, round: u64, bytes: &[u8]) {
     if let Ok(payload) = to_canonical_vec(&v) {
         let _ = daemon_vhc_sdk::publish(0, &payload);
     }
+}
+
+/// Publish a canonical-CBOR wire control message on the records channel (live mode): the
+/// session signs the §12.1 transport envelope; the coordinator's tick consumes the payload.
+fn publish_wire(msg: &VhcMessage) {
+    if let Ok(payload) = to_canonical_vec(msg) {
+        let _ = daemon_vhc_sdk::publish(0, &payload);
+    }
+}
+
+/// One pending batch slot of an in-flight round open (live mode): the slot's sequence count and
+/// its fetched shard segments, in corpus order.
+struct PendingBatch {
+    sequences: u32,
+    segs: Vec<Option<Vec<u8>>>,
+}
+
+/// A round open awaiting its `data@2` corpus fetches (live mode).
+struct PendingOpen {
+    ro: RoundOpen,
+    /// fetch op → (slot index, segment index).
+    ops: BTreeMap<u64, (usize, usize)>,
+    /// Batch slots in training order (step-major, then micro-window).
+    slots: Vec<PendingBatch>,
+}
+
+/// A round record awaiting its committed-payload fetches (live mode).
+struct PendingRecord {
+    rr: daemon_vhc_sdk_consensus::messages::RoundRecord,
+    entries: Vec<RecordEntry>,
+    /// fetch op → the entry's peer (the payload lands under `(round, peer)`).
+    ops: BTreeMap<u64, PeerId>,
+}
+
+/// The corpus geometry the live mode fetches against, derived from the verified manifest.
+struct LiveCorpus {
+    manifest: CorpusManifest,
+    total_sequences: u64,
+}
+
+/// The live-mode session state (module-driven data + wire announcements).
+struct LiveState {
+    cfg: LiveCfg,
+    corpus: Option<LiveCorpus>,
+    manifest_op: Option<u64>,
+    /// Whether a round has been observed (stops the periodic Join/Heartbeat re-announce).
+    admitted: bool,
+    pending_open: Option<PendingOpen>,
+    pending_records: BTreeMap<u64, PendingRecord>,
+    /// payload_put op → the commitment to publish once the store write is durable.
+    pending_puts: BTreeMap<u64, Commitment>,
+}
+
+impl LiveState {
+    fn new(cfg: LiveCfg) -> Self {
+        Self {
+            cfg,
+            corpus: None,
+            manifest_op: None,
+            admitted: false,
+            pending_open: None,
+            pending_records: BTreeMap::new(),
+            pending_puts: BTreeMap::new(),
+        }
+    }
+
+    /// Announce this peer to the coordinator: a Join plus the ready-Heartbeat that drives the
+    /// warmup fast path. Re-published on a timer until the first round opens — control frames
+    /// are fire-and-forget on the plane, and a frame published before the receivers ingested
+    /// this session's certificate announcement is refused and lost (never replayed), so the
+    /// module re-announces until it observes admission (a duplicate Join is a typed advisory
+    /// reject coordinator-side, never an error).
+    fn announce(&self) {
+        publish_wire(&VhcMessage::Join(Join {
+            run_id: self.cfg.run_label.clone(),
+            iroh_id: IrohId([0u8; 32]),
+            class: ThroughputClass::C1,
+            capabilities: CapabilitySet::new(),
+            envelope_hash: None,
+        }));
+        publish_wire(&VhcMessage::Heartbeat(Heartbeat {
+            round: 0,
+            ready: Some(true),
+        }));
+    }
+}
+
+/// Read one completion's `Ok(BufferHandle)` payload as raw bytes (`None` on a failed op).
+fn completion_bytes(ev: &daemon_vhc_sdk::Event) -> Option<Vec<u8>> {
+    let ciborium::value::Value::Array(result) = ev.items.get(2)? else {
+        return None;
+    };
+    let ok = result
+        .first()
+        .and_then(|v| v.as_integer())
+        .is_some_and(|n| i128::from(n) == 0);
+    if !ok {
+        return None;
+    }
+    let handle = result
+        .get(1)
+        .and_then(|v| v.as_integer())
+        .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))?;
+    let bytes = daemon_vhc_sdk::read_buffer(handle);
+    daemon_vhc_sdk::buffer_release(handle);
+    Some(bytes)
 }
 
 /// The per-round export walk state: op → param index, collected values, the round in flight.
@@ -407,9 +551,126 @@ fn flat_le(params: &[Vec<f32>]) -> Vec<u8> {
     out
 }
 
+/// Plan one round's batch slots + `data@2` fetches from the assigned interval (live mode):
+/// slots in training order (step-major, then micro-window), each slot's sequences coalesced
+/// into per-shard contiguous byte segments.
+fn plan_open_fetches(corpus: &LiveCorpus, ro: &RoundOpen, round_cfg: &RoundCfg) -> PendingOpen {
+    let interval = interval_for(ro.batch, ro.seed, &round_cfg.roster, &round_cfg.peer);
+    let steps = slice_interval(interval, round_cfg.steps_per_round, round_cfg.micro_batch);
+    let mut slots = Vec::new();
+    let mut ops = BTreeMap::new();
+    for step in &steps {
+        for mb in &step.micro {
+            // Global sequence ids wrap modulo the corpus (the established window rule); the SDK
+            // planner coalesces them into maximal per-shard contiguous ranges.
+            let seqs: Vec<u64> = (mb.start..mb.end)
+                .map(|s| s % corpus.total_sequences)
+                .collect();
+            let fetches = daemon_vhc_sdk::plan_window(&corpus.manifest, &seqs)
+                .expect("the assigned window plans over the verified manifest");
+            let slot_idx = slots.len();
+            let mut segs = Vec::with_capacity(fetches.len());
+            for (seg_idx, f) in fetches.iter().enumerate() {
+                let op = daemon_vhc_sdk::data_fetch(&f.shard_hash, f.range_off, f.range_len);
+                ops.insert(op, (slot_idx, seg_idx));
+                segs.push(None);
+            }
+            slots.push(PendingBatch {
+                sequences: u32::try_from(mb.end - mb.start).unwrap_or(0),
+                segs,
+            });
+        }
+    }
+    PendingOpen {
+        ro: ro.clone(),
+        ops,
+        slots,
+    }
+}
+
+/// Decode a pending open's fetched segments into staged batches (training order), clamped into
+/// the model's vocabulary (`token % vocab` — the deterministic tokenizer-to-model shim applied
+/// identically by every peer).
+fn stage_fetched_batches(
+    core: &Rc<RefCell<Core>>,
+    corpus: &LiveCorpus,
+    open: &mut PendingOpen,
+    vocab: u32,
+) {
+    let seq_len = corpus.manifest.seq_len;
+    let width = corpus.manifest.token_width;
+    let little = corpus.manifest.endianness == Endianness::Little;
+    for slot in &mut open.slots {
+        let mut raw = Vec::new();
+        for seg in &mut slot.segs {
+            raw.extend_from_slice(&seg.take().expect("all segments fetched"));
+        }
+        let tokens: Vec<u32> = match width {
+            TokenWidth::U16 => raw
+                .chunks_exact(2)
+                .map(|c| {
+                    let t = if little {
+                        u16::from_le_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_be_bytes([c[0], c[1]])
+                    };
+                    u32::from(t) % vocab
+                })
+                .collect(),
+            TokenWidth::U32 => raw
+                .chunks_exact(4)
+                .map(|c| {
+                    let t = if little {
+                        u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                    } else {
+                        u32::from_be_bytes([c[0], c[1], c[2], c[3]])
+                    };
+                    t % vocab
+                })
+                .collect(),
+        };
+        core.borrow_mut()
+            .batches
+            .push_back((slot.sequences, seq_len, tokens));
+    }
+}
+
+/// Voice the barrier outbounds: the tag-4 det digest (the journal-oracle voice) always; the
+/// wire `Digest` control message additionally in live mode (the coordinator's liveness/desync
+/// accounting input).
+fn emit_round_outbounds(wire: bool, out: &[daemon_vhc_sdk_rounds::Outbound]) {
+    for o in out {
+        if let daemon_vhc_sdk_rounds::Outbound::RoundComplete { round, digest }
+        | daemon_vhc_sdk_rounds::Outbound::CaughtUp { round, digest } = o
+        {
+            publish_tagged(4, *round, digest);
+            if wire {
+                publish_wire(&VhcMessage::Digest(Digest {
+                    round: *round,
+                    digest: StateDigest(*digest),
+                }));
+            }
+        }
+    }
+}
+
+/// Run the barrier on a fully-staged record and voice the outbounds.
+fn dispatch_record(
+    driver: &mut BarrierRound<C3Round>,
+    payloads: &mut PayloadMap,
+    wire: bool,
+    pending: PendingRecord,
+) {
+    let out = driver.on_round_record(&pending.rr, pending.entries, payloads);
+    emit_round_outbounds(wire, &out);
+}
+
 #[allow(clippy::too_many_lines)]
-fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
+fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
     let numels = cfg.model.param_numels();
+    let vocab = cfg.model.vocab;
+    let mut live = cfg.live.take().map(LiveState::new);
+    let restored_round = restored.as_ref().and_then(|r| r.round);
     // A restored instance rebuilds from the snapshot's masters + error feedback + AdamW moments
     // (post-ingest state: master IS the round base); a fresh instance starts from the config's
     // matched init with zeroed local state.
@@ -443,21 +704,30 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
         pending_grads: None,
         next_step_fence: 0,
     }));
-    let mut driver = BarrierRound::new(
-        C3Round { core: core.clone() },
-        RoundCfg {
-            peer: cfg.peer,
-            roster: cfg.roster.clone(),
-            steps_per_round: cfg.steps_per_round,
-            micro_batch: cfg.micro_batch,
-            stall_rounds_max: cfg.stall_rounds_max,
-        },
-    );
+    let round_cfg = RoundCfg {
+        peer: cfg.peer,
+        roster: cfg.roster.clone(),
+        steps_per_round: cfg.steps_per_round,
+        micro_batch: cfg.micro_batch,
+        stall_rounds_max: cfg.stall_rounds_max,
+    };
+    let mut driver = BarrierRound::new(C3Round { core: core.clone() }, round_cfg.clone());
+    // A restored instance never re-ingests at or below the snapshot's watermark (§9 restore).
+    if restored_round.is_some() {
+        driver.resume_from(restored_round);
+    }
     let mut payloads = PayloadMap {
         map: BTreeMap::new(),
     };
     let mut export: Option<ExportState> = None;
     let mut quiesce: Option<QuiesceWalk> = None;
+
+    // Live mode boots by fetching the genesis-pinned corpus manifest (everything else waits on
+    // it: chunk registration precedes any shard range fetch, and the Join announcement waits so
+    // the first opened round finds this peer trainable).
+    if let Some(l) = live.as_mut() {
+        l.manifest_op = Some(daemon_vhc_sdk::data_fetch(&l.cfg.manifest.0, 0, 0));
+    }
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
@@ -540,6 +810,17 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                     _ => {}
                 }
             }
+            EV_TIMER => {
+                // Live mode: re-announce Join + ready-Heartbeat until the first round opens
+                // (fire-and-forget frames published before the peers ingested this session's
+                // certificate are refused and lost — the module re-announces, module policy).
+                if let Some(l) = live.as_ref() {
+                    if !l.admitted && l.corpus.is_some() {
+                        l.announce();
+                        daemon_vhc_sdk::set_timer(500);
+                    }
+                }
+            }
             EV_FRAME => {
                 let payload = ev.bytes(4);
                 let Ok(msg) = from_canonical_slice::<VhcMessage>(&payload) else {
@@ -548,7 +829,25 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                 match msg {
                     VhcMessage::RoundOpen(ro) => {
                         let round = ro.round;
-                        // Train + (dropped) commit; then the export walk for this round's θ.
+                        if let Some(l) = live.as_mut() {
+                            // Module-driven data: plan + fetch this round's assigned corpus
+                            // ranges; the driver's open runs when the last segment lands
+                            // (EV_COMPLETION below). One open in flight at a time — the
+                            // coordinator opens rounds strictly after records, so a second
+                            // in-flight open means this peer is already stalled and sits the
+                            // round out (the ladder catches it up at the next record).
+                            l.admitted = true;
+                            let Some(corpus) = l.corpus.as_ref() else {
+                                continue; // manifest not ready — sit the round out
+                            };
+                            if l.pending_open.is_some() {
+                                continue;
+                            }
+                            l.pending_open = Some(plan_open_fetches(corpus, &ro, &round_cfg));
+                            continue;
+                        }
+                        // Harness mode: batches were host-staged; train + (dropped) commit,
+                        // then the export walk for this round's θ.
                         let _out = driver.on_round_open(&ro, &mut payloads);
                         export = Some(ExportState {
                             round,
@@ -559,17 +858,32 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                     }
                     VhcMessage::RoundRecord(rr) => {
                         let entries: Vec<RecordEntry> = rr.inline.clone().unwrap_or_default();
-                        let out = driver.on_round_record(&rr, entries, &mut payloads);
-                        for o in out {
-                            if let daemon_vhc_sdk_rounds::Outbound::RoundComplete {
-                                round,
-                                digest,
+                        if live.is_some() {
+                            // Module-driven payload staging: fetch every record-listed
+                            // committed payload from the content-addressed plane (self
+                            // included — idempotent and uniform), then run the barrier.
+                            if let Some(last) = driver.last_ingested() {
+                                if rr.round <= last {
+                                    continue; // at/below the watermark — never re-fetched
+                                }
                             }
-                            | daemon_vhc_sdk_rounds::Outbound::CaughtUp { round, digest } = o
-                            {
-                                publish_tagged(4, round, &digest);
+                            let mut ops = BTreeMap::new();
+                            for e in &entries {
+                                if !payloads.map.contains_key(&(rr.round, e.peer)) {
+                                    let op = daemon_vhc_sdk::payload_get(&e.hash.0);
+                                    ops.insert(op, e.peer);
+                                }
                             }
+                            let pending = PendingRecord { rr, entries, ops };
+                            if pending.ops.is_empty() {
+                                dispatch_record(&mut driver, &mut payloads, true, pending);
+                            } else if let Some(l) = live.as_mut() {
+                                l.pending_records.insert(pending.rr.round, pending);
+                            }
+                            continue;
                         }
+                        let out = driver.on_round_record(&rr, entries, &mut payloads);
+                        emit_round_outbounds(false, &out);
                     }
                     _ => {}
                 }
@@ -590,6 +904,88 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
             }
             EV_COMPLETION => {
                 let op = ev.uint(1);
+                // Live-mode completion routing first: the manifest fetch, a pending open's
+                // corpus segments, a pending record's committed payloads, a durable payload put.
+                if let Some(l) = live.as_mut() {
+                    if l.manifest_op == Some(op) {
+                        l.manifest_op = None;
+                        let bytes = completion_bytes(&ev)
+                            .expect("the genesis-pinned corpus manifest fetches (fail loud)");
+                        let manifest = CorpusManifest::from_canonical_bytes(&bytes)
+                            .expect("the fetched corpus manifest parses");
+                        // Register every shard's chunk map: after registration a shard's fold
+                        // identity is range-fetchable with covering-chunk verification.
+                        for i in 0..manifest.shards.len() {
+                            let desc = daemon_vhc_sdk::chunk_descriptor(&manifest, i)
+                                .expect("manifest shard yields a chunk descriptor");
+                            let status = daemon_vhc_sdk::data_register_chunks(&desc);
+                            assert_eq!(status, 0, "chunk registration is granted (fail loud)");
+                        }
+                        let total_sequences = manifest.total_sequences();
+                        assert!(total_sequences > 0, "the pinned corpus is non-empty");
+                        l.corpus = Some(LiveCorpus {
+                            manifest,
+                            total_sequences,
+                        });
+                        // Announce (and keep re-announcing until the first round opens).
+                        l.announce();
+                        daemon_vhc_sdk::set_timer(500);
+                        continue;
+                    }
+                    if let Some(commitment) = l.pending_puts.remove(&op) {
+                        // The sealed container is durable on the plane: NOW the wire commitment
+                        // is publishable (the coordinator's availability check will find it).
+                        publish_wire(&VhcMessage::Commitment(commitment));
+                        continue;
+                    }
+                    let open_hit = l.pending_open.as_mut().and_then(|open| {
+                        open.ops.remove(&op).map(|(slot, seg)| {
+                            open.slots[slot].segs[seg] = Some(
+                                completion_bytes(&ev)
+                                    .expect("a granted corpus range fetch completes (fail loud)"),
+                            );
+                            open.ops.is_empty()
+                        })
+                    });
+                    if let Some(done) = open_hit {
+                        if done {
+                            let mut open = l.pending_open.take().expect("the in-flight open");
+                            let corpus = l.corpus.as_ref().expect("corpus ready");
+                            stage_fetched_batches(&core, corpus, &mut open, vocab);
+                            let ro = open.ro;
+                            let round = ro.round;
+                            let _out = driver.on_round_open(&ro, &mut payloads);
+                            export = Some(ExportState {
+                                round,
+                                collected: vec![None; numels.len()],
+                                ops: BTreeMap::new(),
+                            });
+                            fence(round + 1);
+                        }
+                        continue;
+                    }
+                    let record_round = l
+                        .pending_records
+                        .iter_mut()
+                        .find_map(|(round, p)| p.ops.remove(&op).map(|peer| (*round, peer)));
+                    if let Some((round, peer)) = record_round {
+                        let bytes = completion_bytes(&ev)
+                            .expect("a record-listed committed payload fetches (fail loud)");
+                        payloads.map.insert((round, peer), bytes);
+                        let done = l
+                            .pending_records
+                            .get(&round)
+                            .is_some_and(|p| p.ops.is_empty());
+                        if done {
+                            let pending = l
+                                .pending_records
+                                .remove(&round)
+                                .expect("the completed record");
+                            dispatch_record(&mut driver, &mut payloads, true, pending);
+                        }
+                        continue;
+                    }
+                }
                 // The quiesce walk's completions (§10.2 phase 2): collect the exported moments;
                 // when the last lands, author + submit the typed manifest and QuiesceReady.
                 if let Some(walk) = quiesce.as_mut() {
@@ -635,6 +1031,19 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                                     schema: 1,
                                     class: 1,
                                     bytes: flat_le(&moments[n..]),
+                                },
+                                OwnedSection {
+                                    // The resync watermark (§9): the last round this snapshot's
+                                    // state folds; a restore never re-ingests at/below it.
+                                    // `u64::MAX` = no ingest yet.
+                                    name: "round".to_string(),
+                                    schema: 1,
+                                    class: 1,
+                                    bytes: driver
+                                        .last_ingested()
+                                        .unwrap_or(u64::MAX)
+                                        .to_le_bytes()
+                                        .to_vec(),
                                 },
                             ];
                             for s in &sections {
@@ -688,13 +1097,17 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                         .collect();
                     export = None;
 
-                    let mut theta_le = Vec::new();
-                    for t in &theta {
-                        for v in t {
-                            theta_le.extend_from_slice(&v.to_le_bytes());
+                    // The trained-θ voice is the harness-tier native comparison surface; the
+                    // live plane skips it (a large frame per round with no live consumer).
+                    if live.is_none() {
+                        let mut theta_le = Vec::new();
+                        for t in &theta {
+                            for v in t {
+                                theta_le.extend_from_slice(&v.to_le_bytes());
+                            }
                         }
+                        publish_tagged(2, round, &theta_le);
                     }
-                    publish_tagged(2, round, &theta_le);
 
                     let mut core_mut = core.borrow_mut();
                     let Core {
@@ -716,9 +1129,23 @@ fn run_module(cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                     // payload) — put BEFORE the tag-3 voice so the embedder that observes the
                     // commitment can pair it with the serviced bytes.
                     let buf = daemon_vhc_sdk::create_from(&payload);
-                    let _op = daemon_vhc_sdk::payload_put(buf);
+                    let put_op = daemon_vhc_sdk::payload_put(buf);
                     daemon_vhc_sdk::buffer_release(buf);
-                    publish_tagged(3, round, &blake3_hash(&payload).0);
+                    let hash = blake3_hash(&payload);
+                    publish_tagged(3, round, &hash.0);
+                    if let Some(l) = live.as_mut() {
+                        // The wire Commitment publishes only once the put completes — the
+                        // coordinator's availability check must find the durable object.
+                        l.pending_puts.insert(
+                            put_op,
+                            Commitment {
+                                round,
+                                payload: hash,
+                                size: payload.len() as u64,
+                                locators: Vec::new(),
+                            },
+                        );
+                    }
                 }
             }
             _ => {}

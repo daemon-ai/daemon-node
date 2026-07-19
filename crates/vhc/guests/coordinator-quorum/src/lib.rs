@@ -33,13 +33,16 @@
 //! pure function of the event count, never wall-clock, so wasm ≡ native holds. A live deployment
 //! sets `tick_period_ms > 0` to also arm real deadline timers.
 
-use daemon_vhc_abi::{EV_TAG_FRAME, EV_TAG_QUIESCE, EV_TAG_STOP, EV_TAG_TIMER};
+use std::collections::BTreeMap;
+
+use daemon_vhc_abi::{EV_TAG_COMPLETION, EV_TAG_FRAME, EV_TAG_QUIESCE, EV_TAG_STOP, EV_TAG_TIMER};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId};
 use daemon_vhc_sdk::migrate::{build_manifest, MigrationDescriptor, OwnedSection, SectionReader};
 use daemon_vhc_sdk::module::{GuestModule, ModuleDecl};
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, tick_authenticated, CoordinatorState, Input, Output,
 };
+use daemon_vhc_sdk_consensus::messages::{RecordEntry, StorageReceipt};
 use daemon_vhc_sdk_consensus::VhcMessage;
 use daemon_vhc_sdk_consensus::{Authorized, DEFAULT_RECORDS_CHANNEL};
 use serde::Deserialize;
@@ -79,6 +82,12 @@ struct Coordinator {
     now_s: u64,
     tick_period_ms: u64,
     control_channel: u32,
+    /// Coordinator-as-storage-client availability checks in flight (§6.4 I6): a commitment's
+    /// payload is `payload_get`-verified against the run's content-addressed plane; a completed
+    /// fetch IS the storage receipt (the host re-verified the bytes against the committed hash
+    /// before delivery, so a successful get is exactly the "HEAD-verified" evidence
+    /// `has_evidence`'s receipt path consumes). op → the receipt entry it evidences.
+    pending_availability: BTreeMap<u64, (u64, RecordEntry)>,
 }
 
 impl Coordinator {
@@ -144,8 +153,9 @@ impl GuestModule for Coordinator {
         ModuleDecl {
             name: "coordinator-quorum",
             version: env!("CARGO_PKG_VERSION"),
-            // Phase-A closed subset only: next_event + publish + set_timer (no compute@, no data@).
-            abi_minor: 0,
+            // Phase-A subset + the §3.4 payload plane (minor 1): `payload_get` backs the
+            // coordinator-as-storage-client availability verification (§6.4 I6).
+            abi_minor: 1,
             // The control channel it publishes RoundOpen/RoundRecord on (§6.2).
             channels: vec![0],
             // Small host-accountable state (the round ring + roster); no device residency.
@@ -169,6 +179,7 @@ impl GuestModule for Coordinator {
             now_s,
             tick_period_ms: init.tick_period_ms,
             control_channel: init.control_channel,
+            pending_availability: BTreeMap::new(),
         })
     }
 
@@ -221,6 +232,24 @@ impl GuestModule for Coordinator {
                             Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
                         if let Ok(arr) = <[u8; 32]>::try_from(sender.as_slice()) {
                             if let Ok(msg) = from_canonical_slice::<VhcMessage>(&payload) {
+                                // Coordinator-as-storage-client (§6.4 I6): a commitment's
+                                // payload is availability-checked against the run's
+                                // content-addressed plane; the completed, host-verified fetch
+                                // becomes this coordinator's own storage receipt (below).
+                                if let VhcMessage::Commitment(c) = &msg {
+                                    let op = daemon_vhc_sdk::abi::payload_get(&c.payload.0);
+                                    self.pending_availability.insert(
+                                        op,
+                                        (
+                                            c.round,
+                                            RecordEntry {
+                                                peer: PeerId(arr),
+                                                hash: c.payload,
+                                                size: c.size,
+                                            },
+                                        ),
+                                    );
+                                }
                                 let (next, outputs) = tick_authenticated(
                                     self.state.clone(),
                                     PeerId(arr),
@@ -243,6 +272,61 @@ impl GuestModule for Coordinator {
                     if self.tick_period_ms > 0 {
                         daemon_vhc_sdk::abi::set_timer(self.tick_period_ms);
                     }
+                }
+                t if t == EV_TAG_COMPLETION => {
+                    // An availability check completed: a successful, host-verified fetch is the
+                    // storage receipt for exactly that (peer, hash) entry — feed it through the
+                    // tick as this coordinator's own receipt (`on_receipt` consumes content, not
+                    // signer). A failed fetch is no evidence: the entry stays unevidenced and
+                    // the round finalizes only through another evidence path.
+                    let op = ev.uint(1);
+                    let Some((round, entry)) = self.pending_availability.remove(&op) else {
+                        self.advance_clock();
+                        continue;
+                    };
+                    let ok = ev
+                        .items
+                        .get(2)
+                        .and_then(|v| {
+                            if let ciborium::value::Value::Array(result) = v {
+                                result.first().and_then(ciborium::value::Value::as_integer)
+                            } else {
+                                None
+                            }
+                        })
+                        .is_some_and(|n| i128::from(n) == 0);
+                    if ok {
+                        // Release the fetched buffer (the bytes themselves are not needed —
+                        // the host verified them against the committed hash before completing).
+                        if let Some(handle) = ev.items.get(2).and_then(|v| {
+                            if let ciborium::value::Value::Array(result) = v {
+                                result
+                                    .get(1)
+                                    .and_then(ciborium::value::Value::as_integer)
+                                    .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))
+                            } else {
+                                None
+                            }
+                        }) {
+                            daemon_vhc_sdk::abi::buffer_release(handle);
+                        }
+                        let receipt = VhcMessage::StorageReceipt(StorageReceipt {
+                            round,
+                            verified: vec![entry.clone()],
+                        });
+                        let authorized =
+                            Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
+                        let (next, outputs) = tick_authenticated(
+                            self.state.clone(),
+                            entry.peer,
+                            proto_version,
+                            receipt,
+                            authorized,
+                        );
+                        self.state = next;
+                        self.emit(&outputs);
+                    }
+                    self.advance_clock();
                 }
                 // Terminal: a clean stop returns Ok promptly (no un-snapshotted durable state).
                 t if t == EV_TAG_STOP => return 0,
