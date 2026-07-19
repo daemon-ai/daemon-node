@@ -410,6 +410,7 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         peer_certs: Vec::new(),
         secret_ref: None,
         expires_at_ms: 0,
+        restore: None,
     };
     join_role(&mut coord, coord_tuple, COORD_ROLE, bid, &coord_creds, step).await;
 
@@ -464,6 +465,7 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         peer_certs: vec![authorized.certificate.clone()],
         secret_ref: None,
         expires_at_ms: 0,
+        restore: None,
     };
     join_role(
         &mut trainer,
