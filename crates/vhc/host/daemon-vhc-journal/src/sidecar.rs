@@ -127,6 +127,13 @@ impl<K: KeyProvider> SidecarStore<K> {
         Ok(Self { dir, id, key })
     }
 
+    /// Re-key the owning execution identity at the live-upgrade seam (§8.1): sidecars written
+    /// after the seam bind the incoming incarnation's identity; already-written sidecars keep the
+    /// identity of the span whose record references them (ownership stays span-exact).
+    pub fn set_identity(&mut self, id: ExecIdentity) {
+        self.id = id;
+    }
+
     fn path_for(&self, hash: &Hash) -> PathBuf {
         self.dir.join(format!("{}.dvhcsc", hash.to_hex()))
     }

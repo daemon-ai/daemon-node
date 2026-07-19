@@ -480,6 +480,10 @@ struct PumpState {
     /// lock, so it MUST be wait-free and MUST NOT call back into the pump (a channel/notify
     /// signal, nothing more).
     egress_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Set once `da_migrate` returned `Ready` on a migrating instance (§10.3 step 5): the
+    /// embedder-visible VALIDATE marker the upgrade transaction gates activation on, independent
+    /// of what (or whether) the migrated module publishes. Never set on a non-migrating start.
+    migrate_validated: bool,
 }
 
 impl PumpState {
@@ -1005,6 +1009,18 @@ impl PumpHandle {
     #[must_use]
     pub fn take_op_requests(&self) -> Vec<(u64, OpRequest)> {
         std::mem::take(&mut self.shared.state.lock().expect("pump lock").op_requests)
+    }
+
+    /// Whether a migrating instance's `da_migrate` returned `Ready` (§10.3 step 5) — the
+    /// embedder-visible VALIDATE marker the upgrade transaction gates activation on. `false`
+    /// until validation, and forever on a non-migrating instance.
+    #[must_use]
+    pub fn migrate_validated(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .migrate_validated
     }
 
     /// Register the embedder's **egress wake**: `hook` fires whenever guest egress lands — a
@@ -3358,6 +3374,7 @@ pub fn start_run_migrating(
             drain_deadline_at: None,
             accepted_snapshot: None,
             egress_hook: None,
+            migrate_validated: false,
         }),
         wake: Condvar::new(),
         t0: Instant::now(),
@@ -3591,6 +3608,14 @@ pub fn start_run_migrating(
                     )?;
                     return Ok(RunEnd::MigrateRefused(migrate_status));
                 }
+                // Validate passed (§10.3 step 5): mark it embedder-visible — the upgrade
+                // transaction gates activation on this, not on module-specific egress — and
+                // wake any egress waiter.
+                {
+                    let mut st = shared.state.lock().expect("pump lock");
+                    st.migrate_validated = true;
+                    st.note_egress();
+                }
             }
 
             // da_run — exactly once; the module owns its loop from here (§3.1).
@@ -3798,6 +3823,7 @@ mod tests {
             drain_deadline_at: None,
             accepted_snapshot: None,
             egress_hook: None,
+            migrate_validated: false,
         }
     }
 

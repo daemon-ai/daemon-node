@@ -108,6 +108,40 @@ impl DurableSink {
         Ok(Self { journal, id })
     }
 
+    /// Open the journal at the **live-upgrade seam** (§8.1/§10.3): the retired incarnation's
+    /// records remain as the prefix of one continued file series; the seam seals + rolls a
+    /// segment so appends land under the incoming incarnation's identity header; the record
+    /// ordinal stays globally monotone; the per-channel publish counters reset (the new signed
+    /// stream opens at seq 0, §12.2). The incoming instance's own tag-0 run-header is written by
+    /// the driver as the new span's first record.
+    ///
+    /// The retired incarnation's sink MUST have been dropped first (one writer per file series);
+    /// the role session sequences that drop before invoking this.
+    ///
+    /// # Errors
+    /// [`JournalError`] on a broken chain, an empty directory (nothing to continue), or
+    /// filesystem failure.
+    pub fn open_continuation(
+        dir: &Path,
+        identity: &RunIdentity,
+        sidecar_key: [u8; 32],
+    ) -> Result<Self, JournalError> {
+        let id = ExecIdentity {
+            run_id: Hash(identity.run_id),
+            epoch: identity.epoch,
+            role: identity.role.clone(),
+            instance: identity.instance,
+            module: Hash(identity.module),
+        };
+        let journal = Journal::open_continuation(
+            dir,
+            id.clone(),
+            StaticKey::new(sidecar_key),
+            RotatePolicy::default(),
+        )?;
+        Ok(Self { journal, id })
+    }
+
     /// The journal root (observability / tests).
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -427,6 +461,94 @@ mod tests {
         assert!(
             tags.len() >= 4,
             "header + event + publish + post-recovery event, got {tags:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_rolls_a_segment_and_opens_a_fresh_stream_under_the_new_identity() {
+        // The live-upgrade seam (§8.1/§10.3): one continued file series — the retired
+        // incarnation's records stay as the prefix, the seam forces a segment roll, the new
+        // segment header carries the incoming identity, the record ordinal stays monotone
+        // across the seam, and the per-channel publish seq restarts at 0 (a fresh §12.2 stream).
+        let dir = tempfile::tempdir().unwrap();
+        let jdir = journal_dir(dir.path(), "run-z", "trainer", 3);
+        let key = [0x7E; 32];
+        let old = identity();
+
+        {
+            let mut sink = DurableSink::open(&jdir, &old, key).expect("fresh journal");
+            sink.run_header(
+                2 << 16,
+                &[("vhc".into(), 2)],
+                false,
+                b"m",
+                b"c",
+                b"g",
+                b"cl",
+                b"ch",
+                b"d",
+            )
+            .unwrap();
+            sink.publish(0, 0, b"p0", b"f0").unwrap();
+            sink.publish(0, 1, b"p1", b"f1").unwrap();
+            sink.snapshot(b"drain-manifest").unwrap();
+            sink.terminal(0, Some(2), None).unwrap();
+        } // the retired incarnation's sink drops before the seam opens (one writer)
+
+        let new = RunIdentity {
+            epoch: 1,
+            instance: 4,
+            module: [0x3B; 32],
+            ..identity()
+        };
+        let mut sink =
+            DurableSink::open_continuation(&jdir, &new, key).expect("continuation at the seam");
+        // The new signed stream opens at seq 0 — never inheriting the retired counter.
+        assert_eq!(sink.next_seq(0), 0, "publish seq restarts at the seam");
+        sink.run_header(
+            2 << 16,
+            &[("vhc".into(), 2)],
+            false,
+            b"m2",
+            b"c2",
+            b"g2",
+            b"cl2",
+            b"ch2",
+            b"d2",
+        )
+        .unwrap();
+        sink.publish(0, 0, b"q0", b"g0").unwrap();
+
+        // On disk: the seam sealed the old segment and the new head segment carries the NEW
+        // identity; ordinals stay monotone across the whole series.
+        let scans: Vec<_> = (0..=1)
+            .map(|n| scan_file(jdir.join(format!("segment-{n:08}.dvhcjrn"))).expect("scan"))
+            .collect();
+        assert!(scans[0].sealed, "the seam seals the retired span's segment");
+        assert_eq!(scans[0].header.id.instance, 3);
+        assert_eq!(scans[1].header.id.instance, 4);
+        assert_eq!(scans[1].header.id.epoch, 1);
+        let mut ords = Vec::new();
+        for scan in &scans {
+            for r in &scan.records {
+                if !matches!(r.body, daemon_vhc_journal::Body::Seal(_)) {
+                    ords.push(r.ord);
+                }
+            }
+        }
+        let mut sorted = ords.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(ords, sorted, "record ordinal monotone across the seam");
+
+        // Crash recovery AFTER the seam re-keys at the last run-header: channel 0's next seq is
+        // 1 (the new span's publish), not 2 (the retired span's high-water mark).
+        drop(sink);
+        let mut sink = DurableSink::open(&jdir, &new, key).expect("recovered continuation");
+        assert_eq!(
+            sink.next_seq(0),
+            1,
+            "recovery re-keys at the seam run-header"
         );
     }
 
