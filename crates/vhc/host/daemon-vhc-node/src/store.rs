@@ -26,11 +26,16 @@ use rusqlite_migration::{Migrations, M};
 /// How many recent events per run the windowed `vhc_events` log retains (ADR-007).
 pub const EVENT_WINDOW: usize = 256;
 
-/// The durable desired-state flag for a run (the join-intent that drives restart re-convergence).
+/// The durable desired-state flag for a run — the OWNER-INTENT axis of the two-axis run-instance
+/// lifecycle (spec §6.1 of the production-wiring contract). Intent alone decides whether the node
+/// still wants in; the OBSERVED [`RunState`] axis decides whether the last instance may resume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DesiredState {
     /// The node intends to participate (rejoined on restart).
     Joined,
+    /// The owner paused the run: durable intent surviving restart — a paused run is never
+    /// reconverged (and holds no ledger reservation) until the owner resumes it.
+    Paused,
     /// The node has left (retained for the contribution ledger; not rejoined).
     Left,
 }
@@ -39,14 +44,82 @@ impl DesiredState {
     fn as_str(self) -> &'static str {
         match self {
             DesiredState::Joined => "joined",
+            DesiredState::Paused => "paused",
             DesiredState::Left => "left",
         }
     }
     fn from_str(s: &str) -> Self {
         match s {
             "joined" => DesiredState::Joined,
+            "paused" => DesiredState::Paused,
             _ => DesiredState::Left,
         }
+    }
+}
+
+/// The OBSERVED per-incarnation lifecycle — the second axis of the run-instance state machine.
+/// Driven by worker terminal events (`RunTerminated`) and pump-stream observation, never by owner
+/// intent. A `Completed` instance is NEVER rejoined; `FailedTerminal` requires owner action;
+/// `FailedRetryable` reconverges under the retry budget; an observed `Left` with a standing
+/// `joined` intent (e.g. a shutdown drain) reconverges on restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunState {
+    /// A live (or presumed-live) role instance.
+    Running,
+    /// The module signaled run end. Terminal: never restarted.
+    Completed,
+    /// A recoverable environment fault; the reconciliation loop reconverges under the retry
+    /// budget while the owner intent stands.
+    FailedRetryable,
+    /// A non-recoverable failure (trap, admission/cert refusal, retry-budget exhaustion).
+    /// Terminal: owner action required.
+    FailedTerminal,
+    /// The instance ended by a leave command (owner leave or shutdown drain).
+    Left,
+}
+
+impl RunState {
+    /// The stable column token (also the app-facing lifecycle string).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunState::Running => "running",
+            RunState::Completed => "completed",
+            RunState::FailedRetryable => "failed_retryable",
+            RunState::FailedTerminal => "failed_terminal",
+            RunState::Left => "left",
+        }
+    }
+    fn from_str(s: &str) -> Self {
+        match s {
+            "completed" => RunState::Completed,
+            "failed_retryable" => RunState::FailedRetryable,
+            "failed_terminal" => RunState::FailedTerminal,
+            "left" => RunState::Left,
+            _ => RunState::Running,
+        }
+    }
+
+    /// Whether a fresh join for this run may RETAIN the persisted incarnation (a live or
+    /// recoverable instance) — terminal states always mint a new one.
+    #[must_use]
+    pub fn resumable(self) -> bool {
+        matches!(self, RunState::Running | RunState::FailedRetryable)
+    }
+}
+
+/// The app-facing effective lifecycle state: the owner-intent axis projected over the observed
+/// axis (spec §6.1 — the six-state view `running | completed | paused | failed_retryable |
+/// failed_terminal | left`). `Paused` intent masks a non-terminal observed state; terminal
+/// observations win (a completed run reads completed even while "paused").
+#[must_use]
+pub fn effective_state(desired: DesiredState, run_state: RunState) -> &'static str {
+    match (desired, run_state) {
+        (_, RunState::Completed) => "completed",
+        (_, RunState::FailedTerminal) => "failed_terminal",
+        (DesiredState::Paused, _) => "paused",
+        (DesiredState::Left, _) => "left",
+        (DesiredState::Joined, s) => s.as_str(),
     }
 }
 
@@ -90,6 +163,20 @@ pub struct PersistedRun {
     /// The immutable admitted tuple this join intent was assessed under (architecture §6.3),
     /// canonical-CBOR. `None` for a row assessed before the tuple existed.
     pub admitted_tuple: Option<Vec<u8>>,
+    /// The OBSERVED per-incarnation lifecycle state (the second axis; see [`RunState`]).
+    pub run_state: RunState,
+    /// The crash-window release marker: `Some(target)` means worker teardown was OBSERVED and the
+    /// ledger release + terminal commit were in flight when the row was last written. Startup
+    /// reconciliation finishes the transition (`run_state = target`, marker cleared).
+    pub pending_run_state: Option<RunState>,
+    /// Consecutive reconvergence attempts since the last stable interval (the retry budget).
+    pub retry_count: u32,
+    /// When the next reconvergence attempt is due (unix ms); `None` = none scheduled.
+    pub next_retry_ms: Option<i64>,
+    /// When the current incarnation (re)entered `Running` (unix ms); the uptime-reset input.
+    pub running_since_ms: Option<i64>,
+    /// The typed reason recorded with a terminal transition (operator-facing detail).
+    pub terminal_reason: Option<String>,
 }
 
 /// A `vhc.db` error.
@@ -198,12 +285,30 @@ INSERT OR IGNORE INTO vhc_counters (name, value) VALUES ('device_profile_rev', 0
 INSERT OR IGNORE INTO vhc_counters (name, value) VALUES ('owner_policy_rev', 0);
 ";
 
+/// M5: the durable **run-instance state machine** columns (the two-axis lifecycle; spec §6.1 of
+/// the production-wiring contract). `run_state` is the observed per-incarnation lifecycle
+/// (`running | completed | failed_retryable | failed_terminal | left`); `pending_run_state` is the
+/// crash-window release marker (teardown observed, terminal commit in flight — startup
+/// reconciliation finishes it); the retry columns carry the bounded reconvergence budget; and
+/// `running_since_ms` feeds the uptime-based retry reset. Append-only; every add is defaulted or
+/// nullable, so pre-M5 rows read as live (`running`) intents and are re-judged by the startup
+/// reconciliation pass.
+const M5_RUN_LIFECYCLE: &str = "\
+ALTER TABLE vhc_runs ADD COLUMN run_state TEXT NOT NULL DEFAULT 'running';
+ALTER TABLE vhc_runs ADD COLUMN pending_run_state TEXT;
+ALTER TABLE vhc_runs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE vhc_runs ADD COLUMN next_retry_ms INTEGER;
+ALTER TABLE vhc_runs ADD COLUMN running_since_ms INTEGER;
+ALTER TABLE vhc_runs ADD COLUMN terminal_reason TEXT;
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(SCHEMA),
         M::up(M2_IDENTITY_OBSERVABILITY),
         M::up(M3_ARBITER),
         M::up(M4_ADMITTED_TUPLE),
+        M::up(M5_RUN_LIFECYCLE),
     ])
 }
 
@@ -212,7 +317,8 @@ fn migrations() -> Migrations<'static> {
 /// [`row_to_run`] never drift apart.
 const RUN_COLUMNS: &str = "run_id, coordinator, policy_json, desired_state, credentials_ref, \
      eligibility_json, last_phase, last_round, run_id_hash, epoch, role, instance, \
-     envelope_schema_major, module_abi_major, selected_driver, module_hash, admitted_tuple";
+     envelope_schema_major, module_abi_major, selected_driver, module_hash, admitted_tuple, \
+     run_state, pending_run_state, retry_count, next_retry_ms, running_since_ms, terminal_reason";
 
 fn hex_of(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -284,18 +390,28 @@ impl VhcStore {
         let policy_json = serde_json::to_string(policy)?;
         let elig_json = serde_json::to_string(eligibility)?;
         let conn = self.lock();
+        // An owner join (re)arms the lifecycle: intent joined, the observed state live, and the
+        // retry/terminal bookkeeping of any previous incarnation cleared (an explicit join is the
+        // owner action that reopens a terminal row — with a freshly-minted incarnation).
         conn.execute(
             "INSERT INTO vhc_runs
                 (run_id, coordinator, policy_json, desired_state, credentials_ref,
-                 eligibility_json, last_phase, last_round, updated_ms)
-             VALUES (?1, ?2, ?3, 'joined', ?4, ?5, '', 0, ?6)
+                 eligibility_json, last_phase, last_round, updated_ms, run_state,
+                 running_since_ms)
+             VALUES (?1, ?2, ?3, 'joined', ?4, ?5, '', 0, ?6, 'running', ?6)
              ON CONFLICT(run_id) DO UPDATE SET
-                coordinator      = excluded.coordinator,
-                policy_json      = excluded.policy_json,
-                desired_state    = 'joined',
-                credentials_ref  = excluded.credentials_ref,
-                eligibility_json = excluded.eligibility_json,
-                updated_ms       = excluded.updated_ms",
+                coordinator       = excluded.coordinator,
+                policy_json       = excluded.policy_json,
+                desired_state     = 'joined',
+                credentials_ref   = excluded.credentials_ref,
+                eligibility_json  = excluded.eligibility_json,
+                updated_ms        = excluded.updated_ms,
+                run_state         = 'running',
+                pending_run_state = NULL,
+                retry_count       = 0,
+                next_retry_ms     = NULL,
+                running_since_ms  = excluded.updated_ms,
+                terminal_reason   = NULL",
             params![
                 run_id,
                 coordinator,
@@ -430,6 +546,119 @@ impl VhcStore {
         Ok(())
     }
 
+    // -- run-instance lifecycle (the observed axis + the crash-window release protocol) ---------
+
+    /// Begin a terminal release: persist the marker that worker teardown was OBSERVED for this
+    /// instance and that `target` is the terminal state to commit once the ledger releases. The
+    /// marker is what makes the release crash-repairable: a node crash between observing teardown
+    /// and committing the terminal is finished by [`Self::repair_pending_releases`] on startup.
+    pub fn begin_release(
+        &self,
+        run_id: &str,
+        target: RunState,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE vhc_runs SET pending_run_state = ?2, terminal_reason = ?3, updated_ms = ?4 \
+             WHERE run_id = ?1",
+            params![run_id, target.as_str(), reason, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Commit a begun release: the ledger reservation is surrendered, so the terminal state the
+    /// marker recorded becomes the observed state and the marker clears. Idempotent (a row with
+    /// no marker is untouched).
+    pub fn commit_release(&self, run_id: &str) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE vhc_runs SET run_state = pending_run_state, pending_run_state = NULL, \
+             updated_ms = ?2 WHERE run_id = ?1 AND pending_run_state IS NOT NULL",
+            params![run_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The startup crash-window repair: finish every release whose marker was persisted but whose
+    /// terminal commit never landed (the node crashed between observing worker teardown and the
+    /// final write). Process absence makes teardown definitional on a fresh start, so the
+    /// recorded target simply commits. Returns the number of repaired rows.
+    pub fn repair_pending_releases(&self) -> Result<usize, StoreError> {
+        let n = self.lock().execute(
+            "UPDATE vhc_runs SET run_state = pending_run_state, pending_run_state = NULL, \
+             updated_ms = ?1 WHERE pending_run_state IS NOT NULL",
+            params![now_ms()],
+        )?;
+        Ok(n)
+    }
+
+    /// Mark a run's instance live: observed state `running`, `running_since` stamped, any release
+    /// marker cleared. The retry budget is NOT cleared here — that is the uptime reset's job
+    /// ([`Self::reset_recovered_retries`]), so a crash-looping instance cannot launder its budget
+    /// by merely restarting.
+    pub fn mark_running(&self, run_id: &str) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE vhc_runs SET run_state = 'running', pending_run_state = NULL, \
+             next_retry_ms = NULL, running_since_ms = ?2, updated_ms = ?2 WHERE run_id = ?1",
+            params![run_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Record one consumed reconvergence attempt and when the next is due.
+    pub fn bump_retry(&self, run_id: &str, next_retry_ms: i64) -> Result<u32, StoreError> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "UPDATE vhc_runs SET retry_count = retry_count + 1, next_retry_ms = ?2, \
+             updated_ms = ?3 WHERE run_id = ?1 RETURNING retry_count",
+            params![run_id, next_retry_ms, now_ms()],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    /// Clear the retry bookkeeping (owner pause/leave took manual control, or the uptime reset).
+    pub fn clear_retry(&self, run_id: &str) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE vhc_runs SET retry_count = 0, next_retry_ms = NULL, updated_ms = ?2 \
+             WHERE run_id = ?1",
+            params![run_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The recoverable intents whose backoff has elapsed — the reconciliation tick's work list.
+    pub fn runs_awaiting_retry(&self, now_ms: i64) -> Result<Vec<PersistedRun>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM vhc_runs WHERE desired_state = 'joined' \
+             AND run_state = 'failed_retryable' AND next_retry_ms IS NOT NULL \
+             AND next_retry_ms <= ?1 ORDER BY run_id"
+        ))?;
+        let rows = stmt.query_map(params![now_ms], row_to_run)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// The uptime-based retry reset: an instance that stayed `running` beyond `min_uptime_ms`
+    /// has genuinely recovered, so its consumed retry budget resets to zero. Returns the number
+    /// of reset rows. (The coarse stability signal — the node never inspects rounds.)
+    pub fn reset_recovered_retries(
+        &self,
+        now_ms: i64,
+        min_uptime_ms: i64,
+    ) -> Result<usize, StoreError> {
+        let n = self.lock().execute(
+            "UPDATE vhc_runs SET retry_count = 0, next_retry_ms = NULL, updated_ms = ?1 \
+             WHERE run_state = 'running' AND retry_count > 0 AND running_since_ms IS NOT NULL \
+             AND running_since_ms + ?2 <= ?1",
+            params![now_ms, min_uptime_ms],
+        )?;
+        Ok(n)
+    }
+
     /// The current value of a node-owned monotonic counter (`device_profile_rev` /
     /// `owner_policy_rev`); `0` when unseeded.
     pub fn counter(&self, name: &str) -> Result<u64, StoreError> {
@@ -481,11 +710,15 @@ impl VhcStore {
         ))
     }
 
-    /// The runs with an active join-intent (`desired_state = 'joined'`) — the set the service
-    /// re-issues `JoinRun` for on restart (re-convergence).
+    /// The runs the restart reconciliation pass re-issues `JoinRun` for: a standing `joined`
+    /// intent whose observed lifecycle is not TERMINAL. A `completed` instance is never rejoined
+    /// (the module ended the run); `failed_terminal` requires owner action; a `paused` intent is
+    /// not reconverged until the owner resumes. An observed `left`/`failed_retryable` with a
+    /// standing joined intent (shutdown drain / recoverable fault) reconverges.
     pub fn active_intents(&self) -> Result<Vec<PersistedRun>, StoreError> {
         self.query_runs(&format!(
-            "SELECT {RUN_COLUMNS} FROM vhc_runs WHERE desired_state = 'joined' ORDER BY run_id"
+            "SELECT {RUN_COLUMNS} FROM vhc_runs WHERE desired_state = 'joined' \
+             AND run_state NOT IN ('completed', 'failed_terminal') ORDER BY run_id"
         ))
     }
 
@@ -673,6 +906,12 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, 
     let selected_driver: Option<String> = row.get(14)?;
     let module_hash: Option<Vec<u8>> = row.get(15)?;
     let admitted_tuple: Option<Vec<u8>> = row.get(16)?;
+    let run_state: String = row.get(17)?;
+    let pending_run_state: Option<String> = row.get(18)?;
+    let retry_count: i64 = row.get(19)?;
+    let next_retry_ms: Option<i64> = row.get(20)?;
+    let running_since_ms: Option<i64> = row.get(21)?;
+    let terminal_reason: Option<String> = row.get(22)?;
     Ok((|| {
         Ok(PersistedRun {
             run_id,
@@ -692,6 +931,12 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, 
             selected_driver,
             module_hash: module_hash.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()),
             admitted_tuple,
+            run_state: RunState::from_str(&run_state),
+            pending_run_state: pending_run_state.as_deref().map(RunState::from_str),
+            retry_count: retry_count as u32,
+            next_retry_ms,
+            running_since_ms,
+            terminal_reason,
         })
     })())
 }
@@ -841,6 +1086,176 @@ mod tests {
         assert_eq!(store.bump_counter("device_profile_rev").unwrap(), 2);
         assert_eq!(store.counter("device_profile_rev").unwrap(), 2);
         assert_eq!(store.counter("owner_policy_rev").unwrap(), 0);
+    }
+
+    /// M5: the two-axis lifecycle columns default a fresh join to a live `running` observation,
+    /// the release protocol (begin → commit) transitions the observed axis exactly once, and the
+    /// startup repair finishes a marker whose commit never landed (the crash window).
+    #[test]
+    fn m5_release_protocol_begin_commit_and_crash_repair() {
+        let store = VhcStore::open_in_memory().unwrap();
+        store
+            .put_join_intent(
+                "run-L",
+                "ws://c",
+                &v1_policy(),
+                None,
+                &VhcEligibility::default(),
+            )
+            .unwrap();
+        let run = store.get_run("run-L").unwrap().unwrap();
+        assert_eq!(run.run_state, RunState::Running);
+        assert_eq!(run.pending_run_state, None);
+        assert!(run.running_since_ms.is_some());
+
+        // begin → the marker + reason are durable while the observed state is still `running`.
+        store
+            .begin_release("run-L", RunState::Completed, Some("outcome 0"))
+            .unwrap();
+        let run = store.get_run("run-L").unwrap().unwrap();
+        assert_eq!(run.run_state, RunState::Running);
+        assert_eq!(run.pending_run_state, Some(RunState::Completed));
+        assert_eq!(run.terminal_reason.as_deref(), Some("outcome 0"));
+
+        // commit → the marker's target becomes the observed state; the marker clears.
+        store.commit_release("run-L").unwrap();
+        let run = store.get_run("run-L").unwrap().unwrap();
+        assert_eq!(run.run_state, RunState::Completed);
+        assert_eq!(run.pending_run_state, None);
+        // A second commit with no marker is a no-op (idempotent).
+        store.commit_release("run-L").unwrap();
+        assert_eq!(
+            store.get_run("run-L").unwrap().unwrap().run_state,
+            RunState::Completed
+        );
+
+        // Crash window: a begun-but-uncommitted release is finished by the startup repair.
+        store
+            .put_join_intent(
+                "run-M",
+                "ws://c",
+                &v1_policy(),
+                None,
+                &VhcEligibility::default(),
+            )
+            .unwrap();
+        store
+            .begin_release("run-M", RunState::FailedRetryable, Some("stream closed"))
+            .unwrap();
+        assert_eq!(store.repair_pending_releases().unwrap(), 1);
+        let run = store.get_run("run-M").unwrap().unwrap();
+        assert_eq!(run.run_state, RunState::FailedRetryable);
+        assert_eq!(run.pending_run_state, None);
+    }
+
+    /// M5: a `completed` / `failed_terminal` observation drops out of the reconvergence set even
+    /// under a standing joined intent (a module run end NEVER restarts); `failed_retryable` and
+    /// an observed `left` stay in; a `paused` intent leaves the set entirely.
+    #[test]
+    fn m5_active_intents_respect_the_observed_axis() {
+        let store = VhcStore::open_in_memory().unwrap();
+        for run in ["r-run", "r-done", "r-fatal", "r-retry", "r-left", "r-pause"] {
+            store
+                .put_join_intent(
+                    run,
+                    "ws://c",
+                    &v1_policy(),
+                    None,
+                    &VhcEligibility::default(),
+                )
+                .unwrap();
+        }
+        let terminal = |run: &str, state: RunState| {
+            store.begin_release(run, state, None).unwrap();
+            store.commit_release(run).unwrap();
+        };
+        terminal("r-done", RunState::Completed);
+        terminal("r-fatal", RunState::FailedTerminal);
+        terminal("r-retry", RunState::FailedRetryable);
+        terminal("r-left", RunState::Left);
+        store
+            .set_desired_state("r-pause", DesiredState::Paused)
+            .unwrap();
+
+        let intents: Vec<String> = store
+            .active_intents()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(intents, ["r-left", "r-retry", "r-run"]);
+    }
+
+    /// M5: the retry bookkeeping — bump returns the consumed count, the due query honors the
+    /// schedule, and the uptime reset clears only a stably-running row's budget.
+    #[test]
+    fn m5_retry_budget_bookkeeping_and_uptime_reset() {
+        let store = VhcStore::open_in_memory().unwrap();
+        store
+            .put_join_intent(
+                "run-R",
+                "ws://c",
+                &v1_policy(),
+                None,
+                &VhcEligibility::default(),
+            )
+            .unwrap();
+        store
+            .begin_release("run-R", RunState::FailedRetryable, Some("transport"))
+            .unwrap();
+        store.commit_release("run-R").unwrap();
+
+        let due_at = now_ms() + 50;
+        assert_eq!(store.bump_retry("run-R", due_at).unwrap(), 1);
+        assert_eq!(store.bump_retry("run-R", due_at).unwrap(), 2);
+        // Not due yet at a time before the schedule; due at/after it.
+        assert!(store.runs_awaiting_retry(due_at - 10).unwrap().is_empty());
+        let due = store.runs_awaiting_retry(due_at).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].retry_count, 2);
+
+        // Reconverged: running again, but the budget survives the mere restart...
+        store.mark_running("run-R").unwrap();
+        assert_eq!(store.get_run("run-R").unwrap().unwrap().retry_count, 2);
+        // ...until the instance has been stably up past the minimum uptime.
+        assert_eq!(store.reset_recovered_retries(now_ms(), 60_000).unwrap(), 0);
+        assert_eq!(
+            store
+                .reset_recovered_retries(now_ms() + 60_001, 60_000)
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.get_run("run-R").unwrap().unwrap().retry_count, 0);
+    }
+
+    /// The effective app-facing projection of the two axes (spec §6.1 six-state view): terminal
+    /// observations win; a paused intent masks recoverable states; intent `left` reads left.
+    #[test]
+    fn effective_state_projects_intent_over_observation() {
+        use super::effective_state as eff;
+        assert_eq!(eff(DesiredState::Joined, RunState::Running), "running");
+        assert_eq!(eff(DesiredState::Joined, RunState::Completed), "completed");
+        assert_eq!(
+            eff(DesiredState::Joined, RunState::FailedRetryable),
+            "failed_retryable"
+        );
+        assert_eq!(
+            eff(DesiredState::Joined, RunState::FailedTerminal),
+            "failed_terminal"
+        );
+        assert_eq!(eff(DesiredState::Paused, RunState::Running), "paused");
+        assert_eq!(
+            eff(DesiredState::Paused, RunState::FailedRetryable),
+            "paused"
+        );
+        // Terminal observations are never masked by pause/leave intent.
+        assert_eq!(eff(DesiredState::Paused, RunState::Completed), "completed");
+        assert_eq!(
+            eff(DesiredState::Left, RunState::FailedTerminal),
+            "failed_terminal"
+        );
+        assert_eq!(eff(DesiredState::Left, RunState::Running), "left");
+        assert_eq!(eff(DesiredState::Left, RunState::Left), "left");
     }
 
     /// The v2 execution-identity + observability writers populate the D0 columns (decisions D5;

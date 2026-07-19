@@ -40,4 +40,6 @@ pub use discovery::{CheckpointPointer, DiscoveredRun, EgressRunDiscovery, RunDis
 // `daemon-vhc-net` dep edge (A3 boot wiring; additive).
 pub use daemon_vhc_net::RegistryClient;
 pub use service::{NodeFeed, VhcError, VhcService, VhcServiceParts, WorkerControl};
-pub use store::{DesiredState, PersistedRun, StoreError, VhcStore, EVENT_WINDOW};
+pub use store::{
+    effective_state, DesiredState, PersistedRun, RunState, StoreError, VhcStore, EVENT_WINDOW,
+};
