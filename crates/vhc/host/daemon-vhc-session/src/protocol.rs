@@ -338,9 +338,9 @@ pub enum Command {
         /// The immutable admitted tuple assessment produced (architecture §6.3), carried back so
         /// join can rederive-and-compare before running. Additive `#[serde(default)]` — a join
         /// without a tuple (the self-driven interim / a pre-tuple caller) authors and checks its
-        /// own.
+        /// own. Boxed for variant-size parity (serde encodes through the box — no wire change).
         #[serde(default)]
-        admitted_tuple: Option<AdmittedTuple>,
+        admitted_tuple: Option<Box<AdmittedTuple>>,
     },
     /// GPU-governor lever (§10.5). `paused` promises memory, not just time: the worker aborts any
     /// in-flight guest call, drops the wasm instance + GPU allocations, and keeps only CPU masters.
@@ -883,7 +883,7 @@ mod tests {
                 duty_cycle_pct: 80,
                 schedule: Some("0 2 * * *".into()),
             },
-            admitted_tuple: Some(AdmittedTuple {
+            admitted_tuple: Some(Box::new(AdmittedTuple {
                 module_hash: [0x11; 32],
                 config_hash: [0x22; 32],
                 grants_hash: [0x33; 32],
@@ -895,7 +895,7 @@ mod tests {
                 owner_policy_rev: 2,
                 backend: "cuda".into(),
                 gpu_index: 0,
-            }),
+            })),
         });
         round_trip_command(Command::Throttle {
             vram_cap_mb: Some(8_000),

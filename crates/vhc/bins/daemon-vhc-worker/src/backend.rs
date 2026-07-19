@@ -580,7 +580,22 @@ pub(crate) struct BackendSelection {
 /// compiled lane whose runtime probe found a device, plus the always-present CPU record) —
 /// the probe report's `Hardware::backends` and the measured ladder's input.
 pub(crate) fn backend_inventory() -> Vec<BackendCapability> {
-    let mut out = Vec::new();
+    // The CPU record first (unconditional — the final ladder rung exists on every build);
+    // device records append per compiled lane + probe. Record order is not selection order
+    // (the ladder searches by slug). Without a compiled device lane no push follows, hence
+    // the gated allow.
+    #[cfg_attr(not(any(feature = "wgpu", feature = "cuda")), allow(unused_mut))]
+    let mut out = vec![BackendCapability {
+        backend: "cpu".to_string(),
+        class: "cpu".to_string(),
+        adapter: "host".to_string(),
+        device_index: 0,
+        vram_mb: 0,
+        max_alloc_mb: 0,
+        shared_mb: 0,
+        unified: false,
+        ready: true,
+    }];
     #[cfg(feature = "cuda")]
     if let Some(p) = daemon_vhc_host::probe::probe_cuda() {
         out.push(BackendCapability {
@@ -618,17 +633,6 @@ pub(crate) fn backend_inventory() -> Vec<BackendCapability> {
             ready: true,
         });
     }
-    out.push(BackendCapability {
-        backend: "cpu".to_string(),
-        class: "cpu".to_string(),
-        adapter: "host".to_string(),
-        device_index: 0,
-        vram_mb: 0,
-        max_alloc_mb: 0,
-        shared_mb: 0,
-        unified: false,
-        ready: true,
-    });
     out
 }
 

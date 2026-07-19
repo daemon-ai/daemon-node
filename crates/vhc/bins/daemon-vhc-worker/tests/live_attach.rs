@@ -319,7 +319,7 @@ async fn join_live(seat: &mut Seat, wire: &[u8], creds: &SessionCredentials, ste
             coordinator: String::new(), // the credentials carry the ws_base
             credentials: creds.to_bytes().expect("encode credentials"),
             policy: policy(),
-            admitted_tuple: Some(tuple),
+            admitted_tuple: Some(Box::new(tuple)),
         })
         .await;
     seat.cut

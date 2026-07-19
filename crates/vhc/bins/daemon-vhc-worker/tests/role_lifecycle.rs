@@ -322,7 +322,7 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
         coordinator: String::new(),
         credentials: Vec::new(),
         policy: policy(),
-        admitted_tuple: Some(tuple_a),
+        admitted_tuple: Some(Box::new(tuple_a)),
     })
     .await;
     cut.until(step, |ev| match ev {
@@ -368,7 +368,7 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
         coordinator: String::new(),
         credentials: Vec::new(),
         policy: policy(),
-        admitted_tuple: Some(tuple_b),
+        admitted_tuple: Some(Box::new(tuple_b)),
     })
     .await;
     cut.until(step, |ev| match ev {
@@ -479,7 +479,7 @@ async fn join_refuses_when_no_identity_was_provisioned() {
         coordinator: String::new(),
         credentials: Vec::new(),
         policy: policy(),
-        admitted_tuple: Some(tuple),
+        admitted_tuple: Some(Box::new(tuple)),
     })
     .await;
     // Read raw (the `until` helper treats a worker Error as a failure; here the Error IS the

@@ -361,7 +361,10 @@ async fn main() {
                 // Rederive from the artifacts this join is about to run and compare
                 // field-by-field; any artifact mismatch aborts the join with a typed event —
                 // the node reassesses; a stale/swapped artifact is never run.
-                let Some(expected) = admitted_tuple.or_else(|| assessed_tuple.clone()) else {
+                let Some(expected) = admitted_tuple
+                    .map(|boxed| *boxed)
+                    .or_else(|| assessed_tuple.clone())
+                else {
                     send(
                         &writer,
                         &worker_error(&format!(
