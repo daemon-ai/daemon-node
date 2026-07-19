@@ -473,6 +473,10 @@ daemon-vhc-session = { version = "0", path = "crates/vhc/host/daemon-vhc-session
 # implementation serves the wasm coordinator-quorum guest, native vhc-sim coordination, and the
 # dual-compilation identity reference; the production coordinator is now the wasm guest.
 daemon-vhc-observe = { version = "0", path = "crates/vhc/host/daemon-vhc-observe" }
+# The crash-safe segmented journal substrate (ABI §8), extracted from daemon-vhc-observe so the
+# production role-session/worker durable sink can link the on-disk store without observe's
+# oracle tooling (observe decodes SDK round schemas — forbidden in production host graphs).
+daemon-vhc-journal = { version = "0", path = "crates/vhc/host/daemon-vhc-journal" }
 # The node-side vhc-training service (resident `VhcService` + worker supervisor), bound at boot
 # when `[vhc] enabled = true` (B3, spec §10.4). Promoted to the workspace table at Merge 3 (matches
 # the daemon-vhc-safetensors precedent from Merge 2) so `bins/daemon` consumes it via

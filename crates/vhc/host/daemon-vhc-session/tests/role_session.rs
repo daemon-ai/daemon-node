@@ -172,7 +172,21 @@ async fn published_frames_relay_opaquely_and_immediate_leave_classifies_left() {
     let handle = spawn_role("run-relay".into(), r.spec, tx);
     assert_eq!(handle.generation(), 1);
 
-    // Both publishes arrive at an outside subscriber as §12.1-signed frames, relayed verbatim.
+    // The session's FIRST publication is its §12.3 certificate announcement (the distribution
+    // record — a top-level single-entry map, structurally disjoint from the frame triple), then
+    // both module publishes arrive as §12.1-signed frames, relayed verbatim.
+    let announcement = tokio::time::timeout(Duration::from_secs(30), outside.recv())
+        .await
+        .expect("certificate announcement within the deadline")
+        .expect("plane open");
+    match daemon_vhc_session::distribution::DistributionRecord::from_bytes(&announcement)
+        .expect("the first publication is the distribution record")
+    {
+        daemon_vhc_session::distribution::DistributionRecord::Cert(cert) => {
+            cert.verify_chain().expect("the announced record verifies");
+        }
+        other => panic!("expected the session's certificate announcement, got {other:?}"),
+    }
     for _ in 0..2 {
         let frame = tokio::time::timeout(Duration::from_secs(30), outside.recv())
             .await

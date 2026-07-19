@@ -455,8 +455,13 @@ async fn join_discovers_fetches_envelope_and_assesses() {
         coordinator: "https://coord.example/api/v1/vhc".into(),
         envelope: b"frozen-envelope-bytes".to_vec(),
     });
+    // The owner allowlists the discovered coordinator's base (spec §11.1) — the join proceeds.
+    let config = daemon_vhc_session::config::VhcConfig {
+        coordinator_allowlist: vec!["https://coord.example/api/v1/vhc".into()],
+        ..enabled_config()
+    };
     let svc = VhcService::new(VhcServiceParts {
-        config: enabled_config(),
+        config,
         store: VhcStore::open_in_memory().unwrap(),
         worker: worker.clone(),
         feed: None,
@@ -500,6 +505,50 @@ async fn join_discovers_fetches_envelope_and_assesses() {
         Some(&64),
         "eligibility came from AssessRun, not the hardware probe"
     );
+}
+
+/// A discovered coordinator OUTSIDE the owner's allowlist is a typed refusal BEFORE anything
+/// reaches the worker (spec §11.1): no envelope fetch, no assess, no join, nothing persisted.
+#[tokio::test]
+async fn join_refuses_a_coordinator_outside_the_allowlist() {
+    let worker = FakeWorker::new();
+    let discovery = Arc::new(FakeDiscovery {
+        coordinator: "https://rogue.example/api/v1/vhc".into(),
+        envelope: b"frozen-envelope-bytes".to_vec(),
+    });
+    // The default allowlist names only the product coordinator — rogue.example is not on it.
+    let svc = VhcService::new(VhcServiceParts {
+        config: enabled_config(),
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(discovery),
+        budget: None,
+        worker_factory: None,
+    });
+
+    let err = svc
+        .vhc_join("run-disc".into(), policy(), "op".into())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("allowlist"),
+        "typed allowlist refusal, got: {err}"
+    );
+    // Fail closed: the worker was never consulted and no intent was persisted.
+    {
+        let c = worker.calls();
+        assert!(
+            c.assessed_envelopes.is_empty(),
+            "no envelope reached assess"
+        );
+        assert!(c.joins.is_empty(), "no join was issued");
+    }
+    assert!(svc
+        .vhc_run_detail("run-disc".into())
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// Drain `n` items from a subscription stream (with a timeout so a bug can't hang the test).

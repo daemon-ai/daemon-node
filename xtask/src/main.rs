@@ -725,6 +725,10 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         "daemon-vhc-node",
         "daemon-vhc-supervisor",
         "daemon-vhc-worker",
+        // The extracted journal substrate: linked by the production durable sink, so it must be
+        // schema-free like every other production host crate (the oracle tooling that decodes
+        // schemas stays in daemon-vhc-observe, which re-exports this crate).
+        "daemon-vhc-journal",
     ];
 
     let root = workspace_root();

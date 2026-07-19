@@ -4904,6 +4904,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-journal"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "chacha20poly1305",
+ "ciborium",
+ "crc32c",
+ "daemon-vhc-abi",
+ "daemon-vhc-proto",
+ "serde",
+ "serde_bytes",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "daemon-vhc-net"
 version = "0.0.1"
 dependencies = [
@@ -4956,17 +4971,14 @@ dependencies = [
 name = "daemon-vhc-observe"
 version = "0.0.1"
 dependencies = [
- "blake3",
  "cddl-cat",
- "chacha20poly1305",
  "ciborium",
- "crc32c",
  "daemon-vhc-abi",
+ "daemon-vhc-journal",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "serde",
- "serde_bytes",
  "thiserror 2.0.18",
 ]
 
@@ -5055,8 +5067,10 @@ dependencies = [
  "async-trait",
  "blake3",
  "ciborium",
+ "daemon-egress",
  "daemon-vhc-abi",
  "daemon-vhc-host",
+ "daemon-vhc-journal",
  "daemon-vhc-net",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
@@ -5129,6 +5143,7 @@ dependencies = [
  "daemon-telemetry",
  "daemon-vhc-abi",
  "daemon-vhc-host",
+ "daemon-vhc-journal",
  "daemon-vhc-net",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",

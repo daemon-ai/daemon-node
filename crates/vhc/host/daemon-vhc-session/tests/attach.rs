@@ -266,3 +266,84 @@ fn a_superseding_incarnations_certificate_fences_the_old_one() {
         }
     );
 }
+
+/// §12.3 on-plane distribution: a certificate record from a genesis-trusted base ingests and its
+/// sender then authenticates; a record chained to an UNTRUSTED base is refused and advances no
+/// trust state (its sender stays uncertified — a forged record can never fence anyone).
+#[test]
+fn distribution_certs_ingest_only_from_trusted_bases() {
+    let base = SigningKey::from_bytes(&[7; 32]);
+    let rogue_base = SigningKey::from_bytes(&[8; 32]);
+    let key = SigningKey::from_bytes(&[9; 32]);
+    // Trusts `base`, holds NO certificates yet.
+    let mut v = InboundFrames::new(RUN, 0, CertCheck::new(vec![peer_id(&base)], vec![]));
+
+    // Before any distribution: the sender is uncertified.
+    assert!(matches!(
+        v.accept(&frame(&key, 0, 0, b"early")),
+        InboundVerdict::UncertifiedSender { .. }
+    ));
+
+    // A record chained to a rogue base refuses typed and changes nothing.
+    let rogue_cert =
+        RunKeyCertificate::issue(&rogue_base, frame_scope(), peer_id(&key)).expect("issue");
+    let err = v
+        .ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Cert(
+            rogue_cert,
+        ))
+        .unwrap_err();
+    assert!(err.contains("not genesis-trusted"), "got: {err}");
+    assert!(matches!(
+        v.accept(&frame(&key, 0, 0, b"still-early")),
+        InboundVerdict::UncertifiedSender { .. }
+    ));
+
+    // A record with a TAMPERED chain (bad signature) refuses even when it names a trusted base.
+    let mut forged = RunKeyCertificate::issue(&base, frame_scope(), peer_id(&key)).expect("issue");
+    forged.body.scope.instance = 99; // body no longer matches the signature
+    let err = v
+        .ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Cert(
+            forged,
+        ))
+        .unwrap_err();
+    assert!(err.contains("certificate chain"), "got: {err}");
+
+    // The honest record ingests; the sender now delivers. Re-delivery is an idempotent no-op.
+    let cert = RunKeyCertificate::issue(&base, frame_scope(), peer_id(&key)).expect("issue");
+    v.ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Cert(
+        cert.clone(),
+    ))
+    .expect("trusted record ingests");
+    v.ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Cert(
+        cert,
+    ))
+    .expect("re-delivery is idempotent");
+    assert!(matches!(
+        v.accept(&frame(&key, 0, 0, b"hello")),
+        InboundVerdict::Deliver { .. }
+    ));
+}
+
+/// §12.3 on-plane distribution: a revocation record rides the same surface — after it, the
+/// revoked sender is the typed CertRevoked refusal.
+#[test]
+fn distribution_revocations_ride_the_same_surface() {
+    let base = SigningKey::from_bytes(&[7; 32]);
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let mut v = InboundFrames::new(RUN, 0, check_for(&base, &[&key]));
+    assert!(matches!(
+        v.accept(&frame(&key, 0, 0, b"pre-revocation")),
+        InboundVerdict::Deliver { .. }
+    ));
+
+    let record = RunKeyRevocation::issue(&base, Hash(RUN), "trainer", 1, peer_id(&key), 1)
+        .expect("issue revocation");
+    v.ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Revocation(record))
+        .expect("trusted revocation ingests");
+    assert_eq!(
+        v.accept(&frame(&key, 0, 1, b"post-revocation")),
+        InboundVerdict::CertRevoked {
+            sender: peer_id(&key).0
+        }
+    );
+}

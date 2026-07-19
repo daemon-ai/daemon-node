@@ -411,6 +411,9 @@ async fn admitted_charge_equals_assess_claim_totals() {
     let svc = Arc::new(VhcService::new(VhcServiceParts {
         config: VhcConfig {
             enabled: true,
+            // The owner allowlists the stub coordinator's base (spec §11.1) — this suite is
+            // about arbitration, not the allowlist gate (tests/service.rs owns that).
+            coordinator_allowlist: vec!["wss://coord.example/vhc".into()],
             ..VhcConfig::default()
         },
         store: VhcStore::open_in_memory().unwrap(),

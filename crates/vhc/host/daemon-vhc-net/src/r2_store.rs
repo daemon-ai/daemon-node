@@ -219,6 +219,67 @@ impl<P: PresignClient> PayloadStore for R2Store<P> {
     }
 }
 
+/// The run-relative artifact path of one content-addressed payload object (ABI §12.6 [RS-4]):
+/// `payload/<blake3-hex>`, presigned through the frozen **artifact** presign form
+/// (`runs/<run>/payload/<hex>` at the bucket — the `runs/<run>/` prefix is the store's own
+/// namespace/auth scoping from the per-run presign endpoint, never a module-visible coordinate).
+fn content_rel(hash: &ContentHash) -> String {
+    format!("payload/{}", hash.to_hex())
+}
+
+/// The content-addressed seam over the SAME presigned remote store: the module names content,
+/// this impl moves bytes. This is the production payload plane a role session binds
+/// ([`crate::transport::ContentStore`]); the coordinate-keyed [`PayloadStore`] impl above
+/// predates it and survives for the harness-era consumers.
+#[async_trait]
+impl<P: PresignClient> crate::transport::ContentStore for R2Store<P> {
+    async fn put_content(&self, bytes: &[u8]) -> Result<ContentHash, VhcNetError> {
+        let hash = blake3_hash(bytes);
+        let req = PresignRequest::artifact(PresignOp::Put, content_rel(&hash));
+        let resp = self.presign.presign(&self.run, &req).await?;
+        let egress_resp = if resp.headers.is_empty() {
+            self.egress
+                .put(&resp.url, bytes.to_vec(), Redirects::None)
+                .await
+                .map_err(transport)?
+        } else {
+            let mut ereq = EgressRequest::put(&resp.url, bytes.to_vec());
+            for (name, value) in &resp.headers {
+                ereq = ereq.header(name, value);
+            }
+            self.egress
+                .execute(ereq, Redirects::None)
+                .await
+                .map_err(transport)?
+        };
+        let status = egress_resp.status();
+        if !status.is_success() {
+            return Err(VhcNetError::Transport(format!(
+                "presigned content PUT {} returned {status}",
+                resp.url
+            )));
+        }
+        Ok(hash)
+    }
+
+    async fn get_content(&self, hash: &ContentHash) -> Result<Vec<u8>, VhcNetError> {
+        let req = PresignRequest::artifact(PresignOp::Get, content_rel(hash));
+        let resp = self.presign.presign(&self.run, &req).await?;
+        let bytes = self
+            .get_object(&resp)
+            .await?
+            .ok_or_else(|| VhcNetError::PayloadMiss(hash.to_hex()))?;
+        let actual = blake3_hash(&bytes);
+        if &actual != hash {
+            return Err(VhcNetError::HashMismatch {
+                expected: hash.to_hex(),
+                actual: actual.to_hex(),
+            });
+        }
+        Ok(bytes)
+    }
+}
+
 /// A typed availability miss for `key` (the stall-ladder signal; mirrors `store.rs`'s taxonomy).
 fn miss(key: &PayloadKey) -> VhcNetError {
     VhcNetError::PayloadMiss(format!(
@@ -391,6 +452,54 @@ mod tests {
         let k = pkey(1, 0x66);
         store.put(&k, b"honest").await.unwrap();
         let err = store.get(&k, &blake3_hash(b"different")).await.unwrap_err();
+        assert!(
+            matches!(err, VhcNetError::HashMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // --- the content-addressed seam (ABI §12.6 [RS-4]) over the same presigned store ------------
+
+    use crate::transport::ContentStore as _;
+
+    /// Content put/get round-trips by blake3 address over the presigned artifact form
+    /// (`runs/<run>/payload/<hex>` at the bucket); a re-put of identical bytes is idempotent.
+    #[tokio::test]
+    async fn content_presign_roundtrip_is_idempotent() {
+        let mock = MockR2::start().await;
+        let store = store_over(&mock);
+
+        let hash = store.put_content(b"sealed-object").await.unwrap();
+        assert_eq!(hash, blake3_hash(b"sealed-object"));
+        assert_eq!(store.get_content(&hash).await.unwrap(), b"sealed-object");
+        assert_eq!(store.put_content(b"sealed-object").await.unwrap(), hash);
+    }
+
+    /// A never-stored / evicted content object is a typed miss keyed by its hex address.
+    #[tokio::test]
+    async fn content_miss_is_typed() {
+        let mock = MockR2::start().await;
+        let store = store_over(&mock);
+        let hash = store.put_content(b"short-lived").await.unwrap();
+        mock.evict(&format!("runs/run-x/payload/{}", hash.to_hex()));
+
+        let err = store.get_content(&hash).await.unwrap_err();
+        assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
+    }
+
+    /// A store returning bytes that do not hash to their own address is a typed tamper reject
+    /// (defense in depth — the pump re-verifies regardless).
+    #[tokio::test]
+    async fn content_tamper_is_typed_hash_mismatch() {
+        let mock = MockR2::start().await;
+        let store = store_over(&mock);
+        let hash = store.put_content(b"honest").await.unwrap();
+        mock.corrupt(
+            &format!("runs/run-x/payload/{}", hash.to_hex()),
+            b"tampered",
+        );
+
+        let err = store.get_content(&hash).await.unwrap_err();
         assert!(
             matches!(err, VhcNetError::HashMismatch { .. }),
             "got {err:?}"

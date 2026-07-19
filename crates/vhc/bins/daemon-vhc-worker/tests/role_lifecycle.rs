@@ -221,7 +221,7 @@ impl Cut {
     }
 }
 
-async fn spawn_worker(identity_dir: &std::path::Path) -> Cut {
+async fn spawn_worker(identity_dir: &std::path::Path, run_dir: &std::path::Path) -> Cut {
     let session = SessionId::new("role-lifecycle-worker");
     let spec = PlacementSpec {
         program: env!("CARGO_BIN_EXE_daemon-vhc-worker").into(),
@@ -231,6 +231,12 @@ async fn spawn_worker(identity_dir: &std::path::Path) -> Cut {
             (
                 IDENTITY_DIR_ENV.to_string(),
                 identity_dir.display().to_string(),
+            ),
+            // The node-delivered run-state root: every role instance journals durably under it
+            // (`<root>/<blake3(label)>/<role>-<incarnation>/journal`).
+            (
+                daemon_vhc_session::journal_home::RUN_DIR_ENV.to_string(),
+                run_dir.display().to_string(),
             ),
             // The in-process plane seat: the production role-session path with no network.
             ("DAEMON_VHC_INPROC_PLANE".to_string(), "1".to_string()),
@@ -259,7 +265,8 @@ async fn spawn_worker(identity_dir: &std::path::Path) -> Cut {
 async fn command_loop_stays_responsive_across_join_leave_shutdown() {
     let identity = tempfile::tempdir().expect("identity tempdir");
     VhcKeystore::open(identity.path()).expect("init keystore");
-    let mut cut = spawn_worker(identity.path()).await;
+    let run_dir = tempfile::tempdir().expect("run-state tempdir");
+    let mut cut = spawn_worker(identity.path(), run_dir.path()).await;
     let step = Duration::from_secs(120);
 
     // Role A: assess + join. The join reply is immediate (phase `joining`), and the role then
@@ -368,6 +375,15 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
         .await;
     assert_eq!(gen_a, 1);
     assert_eq!(outcome_a, TerminalOutcome::Left { checkpoint: None });
+    // The role journaled DURABLY into its node-delivered per-incarnation home: the terminated
+    // instance's first segment exists on disk and is non-empty (ABI §8 — the in-memory sink is
+    // gone from the referenced path; journals outlive the run as the oracle's product input).
+    let journal_a =
+        daemon_vhc_session::journal_home::journal_dir(run_dir.path(), "role-a", "publisher", 1);
+    let segment0 = journal_a.join("segment-00000000.dvhcjrn");
+    let seg_meta = std::fs::metadata(&segment0)
+        .unwrap_or_else(|e| panic!("durable segment at {}: {e}", segment0.display()));
+    assert!(seg_meta.len() > 0, "segment 0 carries records");
     cut.send(&Command::Ping).await;
     cut.until(Duration::from_secs(10), |ev| {
         matches!(ev, Event::Pong).then_some(())

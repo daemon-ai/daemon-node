@@ -66,6 +66,11 @@ pub enum VhcError {
     /// The vhc service is disabled (`[vhc] enabled = false`).
     #[error("vhc is disabled")]
     Disabled,
+    /// The discovered coordinator endpoint is outside `[vhc].coordinator_allowlist` (spec §11.1):
+    /// a typed refusal — the node never dials, assesses against, or authors credentials for an
+    /// endpoint the owner has not allowlisted.
+    #[error("coordinator endpoint refused by the allowlist: {0}")]
+    AllowlistRefused(String),
     /// An internal invariant failure (e.g. canonical-CBOR encode of the admitted tuple).
     #[error("internal: {0}")]
     Internal(String),
@@ -658,6 +663,12 @@ impl VhcService {
                 .get_run(run_id)
                 .await?
                 .ok_or_else(|| VhcError::Discovery(format!("run {run_id} not found")))?;
+            // The allowlist gate (spec §11.1): a discovered coordinator outside the owner's
+            // allowlist is a typed refusal BEFORE any envelope fetch reaches the worker — the
+            // registry names an endpoint, the owner authorizes it.
+            if !allowlisted(&self.config.coordinator_allowlist, &run.coordinator) {
+                return Err(VhcError::AllowlistRefused(run.coordinator.clone()));
+            }
             let envelope = discovery.fetch_envelope(run_id).await?;
             let verdict = worker.assess(envelope).await?;
             // Stamp the node-owned revisions into the immutable admitted tuple (architecture
@@ -1134,6 +1145,18 @@ fn translate(ev: &protocol::Event, run_id: &str) -> Option<VhcEvent> {
     }
 }
 
+/// Whether `endpoint` sits under one of the owner's allowlisted coordinator bases (spec §11.1):
+/// a normalized (trailing-`/`-trimmed) PREFIX match, so one allowlisted base authorizes its
+/// route tree (`{base}/runs/:id/ws`, presign, …) and nothing else. An empty allowlist authorizes
+/// nothing — the discovery path refuses loud until the owner names a coordinator.
+fn allowlisted(allowlist: &[String], endpoint: &str) -> bool {
+    let endpoint = endpoint.trim_end_matches('/');
+    allowlist.iter().any(|base| {
+        let base = base.trim_end_matches('/');
+        !base.is_empty() && (endpoint == base || endpoint.starts_with(&format!("{base}/")))
+    })
+}
+
 /// Convert an `f32` telemetry value to a non-negative fixed-point integer (saturating).
 fn fixed(v: f32, scale: f32) -> u64 {
     let scaled = (v.max(0.0) * scale).round();
@@ -1141,5 +1164,34 @@ fn fixed(v: f32, scale: f32) -> u64 {
         scaled as u64
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allowlisted;
+
+    #[test]
+    fn allowlist_matches_on_path_boundaries_only() {
+        let allow = vec!["https://coord.example/api/v1/vhc".to_string()];
+        // The base itself and its route tree pass (trailing slashes normalized).
+        assert!(allowlisted(&allow, "https://coord.example/api/v1/vhc"));
+        assert!(allowlisted(&allow, "https://coord.example/api/v1/vhc/"));
+        assert!(allowlisted(
+            &allow,
+            "https://coord.example/api/v1/vhc/runs/r1/ws"
+        ));
+        // A hostname EXTENDING the base is not a prefix match (the classic bypass).
+        assert!(!allowlisted(
+            &["https://coord.example".to_string()],
+            "https://coord.example.evil.tld/api/v1/vhc"
+        ));
+        // A sibling path is refused; an empty allowlist authorizes nothing.
+        assert!(!allowlisted(&allow, "https://coord.example/api/v1/other"));
+        assert!(!allowlisted(&[], "https://coord.example/api/v1/vhc"));
+        assert!(!allowlisted(
+            &[String::new()],
+            "https://coord.example/api/v1/vhc"
+        ));
     }
 }

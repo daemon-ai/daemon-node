@@ -21,32 +21,24 @@ daemon-vhc-proto = { workspace = true }
 # TOOLING, not a production host crate — it replays and audits recorded runs, which requires
 # decoding the SDK round schemas. It is never linked by the production node/worker/session graph.
 daemon-vhc-sdk-consensus = { workspace = true }
-# The journal record grammar + framing constants (ABI companion §8.2/§8.3/§8.5). This crate encodes
-# journal records and validates them against `daemon_vhc_abi::JOURNAL_CDDL` (the authoritative CDDL);
-# the abi crate stays dep-free / dual-compiled, so the Rust record types + codec live here (host).
+# The crash-safe segmented journal SUBSTRATE (ABI §8: records, segments, sidecars, the
+# commit-barrier store), extracted to its own schema-free crate so production crates can link the
+# store without this crate's oracle tooling. Re-exported here under the original `journal::` paths;
+# the archive/consensus/oracle/verifier tooling above it stays here.
+daemon-vhc-journal = { workspace = true }
+# The journal framing constants + `JOURNAL_CDDL` the grammar-conformance suite validates against.
 daemon-vhc-abi = { workspace = true }
 serde = { workspace = true }
 # Node-side tool: observe uses std freely (std::io message-log framing) and follows its scaffold's
 # `thiserror` errors. It is NOT on the wasm32 substrate path (proto + coordinator stay wasm-clean).
 thiserror = { workspace = true }
-# The segmented journal (ABI §8) is a host-side on-disk substrate: the CBOR value tree the canonical
-# encoder walks (ciborium), byte-string journal fields (serde_bytes), the BLAKE3 segment hash chain
-# + sidecar content addressing (blake3). All in the frozen root workspace deps.
-ciborium = { workspace = true }
-serde_bytes = { workspace = true }
-blake3 = { workspace = true }
-# CRC32C (Castagnoli) per-record checksum (ABI §8.2). Lane-owned dev/runtime dep at a concrete pin
-# (not in the root workspace table, like daemon-vhc-proto's cddl-cat): pure-Rust, permissive-licensed.
-crc32c = "0.6"
-# XChaCha20-Poly1305 sidecar encryption profile (ABI §8.5). Already resolved in the frozen tree
-# (transitively) at 0.10; pinned here for the sidecar store. default-features carry `alloc` (the
-# header-as-AAD `Payload` path). The node-local key is a construction input via a key-provider trait.
-chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 # Journal grammar conformance: encode each record and validate it against `daemon_vhc_abi::JOURNAL_CDDL`
 # under the same validator + exact pin the proto/daemon-api conformance suites use.
 cddl-cat = "=0.7.1"
+# The grammar suite hand-builds CBOR value trees to probe encode/decode edges.
+ciborium = { workspace = true }
 # The replay-oracle tests re-derive consensus inside the real `coordinator-quorum` module through
 # the session crate's `SandboxedCoordinator` (consensus never runs natively, even in these
 # tests). A dev-only edge; session depends on observe normally, so this is a dev-dependency cycle

@@ -628,6 +628,80 @@ impl JoinCredentials {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The role-session plane selection (the live-transport credentials body)
+// ---------------------------------------------------------------------------
+
+/// The optional iroh half of a [`SessionCredentials`]: PUBLIC reachability only — relay URLs and
+/// the bootstrap roster. The iroh transport SECRET never rides the wire; the worker resolves it
+/// from the identity keystore by reference (architecture §7.2; [CI-9]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrohPlane {
+    /// Envelope-pinned relay URLs (empty ⇒ direct-only / loopback).
+    #[serde(default)]
+    pub relay_urls: Vec<String>,
+    /// The bootstrap roster (may be empty; later roster updates ride the control plane).
+    #[serde(default)]
+    pub roster: Vec<IrohRosterPeer>,
+}
+
+/// The canonical-CBOR body of `Command::JoinRun.credentials` for the ROLE-SESSION live attach:
+/// the node-authored **plane selection** the worker builds its transport providers from.
+/// Everything here is NON-SECRET by construction — signing identity, the iroh transport secret,
+/// and (with the credential-authorship rework) token material are keystore references, never
+/// command-payload bytes ([CI-9]; D-P8 redaction by construction).
+///
+/// Replaces the engine-era [`JoinCredentials`] on the role-session path (that shape carried a
+/// raw signing seed, the iroh secret, and round vocabulary — all three retired from this
+/// surface; [`JoinCredentials`] survives only until its remaining harness consumers retire).
+/// A buffer that decodes as neither is "no live attach" (the in-process seat / typed refusal).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCredentials {
+    /// The run's cryptographic identity (the genesis hash): the iroh topic-derivation input and
+    /// the sanity anchor against the resolved run.
+    pub genesis_hash: [u8; 32],
+    /// WS control-plane base URL. `None` ⇒ the worker uses `JoinRun.coordinator` (the
+    /// node-resolved, allowlist-checked endpoint).
+    #[serde(default)]
+    pub ws_base: Option<String>,
+    /// WS coordinator auth. `None` for unauthenticated targets (local relay lanes); the
+    /// secret-bearing modes move behind a keystore reference with the credential-authorship
+    /// rework (this field then carries only non-secret forms).
+    #[serde(default)]
+    pub ws_auth: WsAuthSpec,
+    /// Optional iroh half. Present ⇒ the worker composes a dual plane (WS + iroh gossip);
+    /// absent ⇒ WS-only.
+    #[serde(default)]
+    pub iroh: Option<IrohPlane>,
+    /// Optional presign base for the content-addressed R2 payload plane. Absent ⇒ the
+    /// filesystem content store under the run's node-delivered state dir.
+    #[serde(default)]
+    pub presign_base: Option<String>,
+    /// Bootstrap peer certificates known at join (PUBLIC §12.3 records — e.g. the seat holder's);
+    /// later arrivals ride the control plane as distribution records.
+    #[serde(default)]
+    pub peer_certs: Vec<daemon_vhc_proto::RunKeyCertificate>,
+}
+
+impl SessionCredentials {
+    /// Encode to the canonical-CBOR bytes carried in `JoinRun.credentials`.
+    ///
+    /// # Errors
+    /// CBOR encode failure.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CodecError> {
+        encode(self)
+    }
+
+    /// Decode from `JoinRun.credentials` bytes. A buffer that is not a `SessionCredentials`
+    /// (empty, or an engine-era body) is the worker's "no live attach" signal.
+    ///
+    /// # Errors
+    /// The bytes are not a `SessionCredentials`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
+        decode(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,6 +1046,86 @@ mod tests {
         let back2 = JoinCredentials::from_bytes(&ws_only.to_bytes().unwrap()).unwrap();
         assert_eq!(ws_only, back2);
         assert!(JoinCredentials::from_bytes(&[]).is_err());
+    }
+
+    /// The role-session plane selection round-trips (WS-only baseline, and the full dual-plane +
+    /// presign + bootstrap-cert form), and an engine-era `JoinCredentials` body is NOT a
+    /// `SessionCredentials` — the structural "no live attach" signal (no secret seed can ever be
+    /// mistaken for a plane selection).
+    #[test]
+    fn session_credentials_round_trip_and_reject_the_engine_era_body() {
+        let ws_only = SessionCredentials {
+            genesis_hash: [0xE1; 32],
+            ws_base: None,
+            ws_auth: WsAuthSpec::None,
+            iroh: None,
+            presign_base: None,
+            peer_certs: Vec::new(),
+        };
+        let back = SessionCredentials::from_bytes(&ws_only.to_bytes().unwrap()).unwrap();
+        assert_eq!(back, ws_only);
+
+        let base = daemon_vhc_proto::SigningKey::from_bytes(&[7; 32]);
+        let run_key =
+            daemon_vhc_proto::peer_id(&daemon_vhc_proto::SigningKey::from_bytes(&[9; 32]));
+        let cert = daemon_vhc_proto::RunKeyCertificate::issue(
+            &base,
+            daemon_vhc_proto::CertScope {
+                run_id: daemon_vhc_proto::Hash([0xE1; 32]),
+                epoch: 0,
+                role: "coordinator".into(),
+                instance: 1,
+                module_hash: daemon_vhc_proto::Hash([2; 32]),
+            },
+            run_key,
+        )
+        .unwrap();
+        let full = SessionCredentials {
+            genesis_hash: [0xE1; 32],
+            ws_base: Some("http://127.0.0.1:8795/api/v1/vhc".into()),
+            ws_auth: WsAuthSpec::Internal {
+                org_id: "org_live".into(),
+                actor: "key:live".into(),
+            },
+            iroh: Some(IrohPlane {
+                relay_urls: vec!["http://127.0.0.1:3340".into()],
+                roster: vec![IrohRosterPeer {
+                    endpoint_id: [0x55; 32],
+                    direct_addrs: vec!["127.0.0.1:4550".into()],
+                    relay_url: None,
+                }],
+            }),
+            presign_base: Some("http://127.0.0.1:8795/api/v1/vhc".into()),
+            peer_certs: vec![cert],
+        };
+        let back = SessionCredentials::from_bytes(&full.to_bytes().unwrap()).unwrap();
+        assert_eq!(back, full);
+
+        // The engine-era body (raw seed + roster + engine knobs) is structurally NOT a plane
+        // selection; and an empty buffer never is.
+        let legacy = JoinCredentials {
+            node_secret: [0x11; 32],
+            ws_auth: WsAuthSpec::None,
+            roster: vec![[0x22; 32]],
+            envelope_hash: [0xEE; 32],
+            iroh: None,
+            presign_base: None,
+            engine: EngineParams {
+                steps_per_round: 2,
+                micro_batch: 2,
+                stall_rounds_max: 3,
+                checkpoint_every_rounds: 0,
+                update_max_bytes: 0,
+                corpus_seed: 7,
+                corpus_shards: 4,
+                corpus_tokens_per_shard: 256,
+                corpus_seq_len: 8,
+                corpus_vocab_clamp: 64,
+                payload_retention_rounds: 0,
+            },
+        };
+        assert!(SessionCredentials::from_bytes(&legacy.to_bytes().unwrap()).is_err());
+        assert!(SessionCredentials::from_bytes(&[]).is_err());
     }
 
     /// `engine_params_payload_retention_is_additive_back_compatible`: the P3 (R) field

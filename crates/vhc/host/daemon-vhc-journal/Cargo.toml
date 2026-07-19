@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-journal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The crash-safe segmented journal SUBSTRATE (ABI companion §8), extracted from
+# `daemon-vhc-observe` so PRODUCTION crates (the role session / worker durable sink) can link the
+# on-disk store without dragging the observe crate's harness/oracle tooling — observe links the
+# SDK round-schema crate for its replay oracles, which the opaque-host boundary forbids in any
+# production host graph (ABI §12.5 [OWN-3]; xtask `vhc-dep-check`). This crate is deliberately
+# schema-free: records, segments, sidecars, and the commit-barrier store — bytes and hashes only,
+# no round vocabulary. `daemon-vhc-observe` re-exports it under its original `journal::` paths, so
+# the oracle/archive tooling and their suites are unchanged.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Canonical CBOR + blake3 hashes (the §8.2 chain, §8.5 content addresses).
+daemon-vhc-proto = { workspace = true }
+# The journal record grammar + framing constants (§8.2/§8.3/§8.5): JOURNAL_CDDL is authoritative;
+# the abi crate stays dep-free / dual-compiled, so the Rust record types + codec live here (host).
+daemon-vhc-abi = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+# The CBOR value tree the canonical encoder walks; byte-string journal fields.
+ciborium = { workspace = true }
+serde_bytes = { workspace = true }
+# The BLAKE3 segment hash chain + sidecar content addressing.
+blake3 = { workspace = true }
+# CRC32C (Castagnoli) per-record checksum (ABI §8.2). Pure-Rust, permissive-licensed; same pin the
+# substrate carried in observe.
+crc32c = "0.6"
+# XChaCha20-Poly1305 sidecar encryption profile (ABI §8.5). The node-local key is a construction
+# input via the `KeyProvider` trait — never invented here.
+chacha20poly1305 = "0.10"
+
+# The substrate's suites (grammar conformance, crash recovery, oracle parity) stay with
+# `daemon-vhc-observe`, which re-exports this crate — no dev-dependencies here.
+
+[lints]
+workspace = true
