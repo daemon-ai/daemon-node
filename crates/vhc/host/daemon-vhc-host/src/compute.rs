@@ -698,10 +698,18 @@ fn block_on<F: core::future::Future>(fut: F) -> F::Output {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that OBSERVE or HOLD the process-global device-compute slot: the
+    /// parallel test harness otherwise races `is_held()` in one test against a live guard in
+    /// another (a real, occasional det-lane failure — the slot is process state, not test state).
+    static DEVICE_SLOT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The CPU arm builds unconditionally, dispatches on the constructing thread, and holds no
     /// device slot (many CPU instances may coexist — the whole tier-1 test matrix relies on it).
     #[test]
     fn cpu_host_compute_builds_and_serves_without_a_device_slot() {
+        let _slot_tests = DEVICE_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cfg = crate::runtime::EngineConfig::default();
         let mut a = HostCompute::build(&cfg).expect("cpu arm always available");
         let mut b = HostCompute::build(&cfg).expect("a second CPU instance is unbounded");
@@ -741,6 +749,9 @@ mod tests {
     /// so splitting these assertions across tests would race the parallel harness.)
     #[test]
     fn device_compute_slot_is_single_holder_and_releases_on_drop() {
+        let _slot_tests = DEVICE_SLOT_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let first = DeviceComputeGuard::acquire().expect("free slot acquires");
         assert!(DeviceComputeGuard::is_held());
         let second = DeviceComputeGuard::acquire();
