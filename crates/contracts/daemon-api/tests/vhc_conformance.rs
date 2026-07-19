@@ -138,7 +138,8 @@ fn summary(joined: bool, policy: Option<VhcPolicy>) -> VhcRunSummary {
 }
 
 /// A v2-identified run row carrying every D0 additive field (envelope v2: the hex RunId,
-/// execution-identity trio, and the D5 sunset-observability fields).
+/// execution-identity trio, and the D5 sunset-observability fields) plus the additive
+/// run-instance lifecycle fields (effective state, retry budget, terminal reason).
 fn summary_v2() -> VhcRunSummary {
     VhcRunSummary {
         run_id_hash: Some("ab".repeat(32)),
@@ -149,6 +150,9 @@ fn summary_v2() -> VhcRunSummary {
         module_abi_major: Some(2),
         selected_driver: Some("v2".into()),
         module_hash: Some("22".repeat(32)),
+        run_state: Some("failed_retryable".into()),
+        retry_count: Some(2),
+        terminal_reason: Some("transport loss".into()),
         ..summary(true, Some(policy(VhcPolicyMode::Idle, None)))
     }
 }
@@ -193,6 +197,20 @@ fn vhc_requests_validate() {
                 run_id: "run-1".into(),
                 mode: VhcLeaveMode::Immediate,
                 op_id: "op-4".into(),
+            },
+        ),
+        (
+            "VhcPause",
+            ApiRequest::VhcPause {
+                run_id: "run-1".into(),
+                op_id: "op-5".into(),
+            },
+        ),
+        (
+            "VhcResume",
+            ApiRequest::VhcResume {
+                run_id: "run-1".into(),
+                op_id: "op-6".into(),
             },
         ),
         (

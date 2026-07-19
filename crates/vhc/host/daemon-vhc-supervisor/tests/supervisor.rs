@@ -192,6 +192,58 @@ async fn throttle_frees_vram_keeps_masters() {
     let _ = std::fs::remove_file(&state);
 }
 
+/// The event-stream observability contract the node's run-instance reconciliation relies on: a
+/// worker child that DIES mid-stream closes the `join_streaming` receiver (the reader clears the
+/// pump sink at end-of-stream), so the node OBSERVES the transport loss instead of holding a
+/// live-looking receiver behind a dead child — over the real subprocess.
+#[tokio::test]
+async fn child_death_closes_the_streaming_receiver() {
+    let state = state_path("stream-death");
+    // `crash-once` exits the child on its first `JoinRun` (spawn index 0) — the mid-stream death.
+    let sup = TrainSupervisor::new(cfg("crash-once", &state));
+
+    let mut rx = sup
+        .join_streaming("run-x", "wss://coord", vec![], policy(), None)
+        .await
+        .expect("the streaming join dispatches (one-way)");
+    // The child died on the join: the stream must CLOSE (recv -> None), never hang.
+    let observed = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the stream closure is observed, not a hang");
+    assert!(
+        observed.is_none(),
+        "a dead child's stream closes; got {observed:?}"
+    );
+
+    sup.shutdown().await;
+    let _ = std::fs::remove_file(&state);
+}
+
+/// The supervisor-initiated teardown is as observable as a crash: shutting the worker down while
+/// a streaming join is live closes the held receiver too (the sink clears on teardown).
+#[tokio::test]
+async fn supervisor_teardown_closes_the_streaming_receiver() {
+    let state = state_path("stream-teardown");
+    let sup = TrainSupervisor::new(cfg("ready", &state));
+
+    let mut rx = sup
+        .join_streaming("run-y", "wss://coord", vec![], policy(), None)
+        .await
+        .expect("streaming join");
+    // The healthy fake answers the join with its first RunPhase over the pump.
+    let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("first event within the deadline");
+    assert!(first.is_some(), "the live stream delivers");
+
+    sup.shutdown().await;
+    let observed = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the teardown closure is observed, not a hang");
+    assert!(observed.is_none(), "teardown closes the stream");
+    let _ = std::fs::remove_file(&state);
+}
+
 /// RUN-10 (§6.5): assess staging. `AssessRun` against an envelope stages an eligibility verdict over
 /// the worker protocol — both the eligible and the pre-screen-rejected paths.
 #[tokio::test]

@@ -1067,7 +1067,8 @@ vhc-contribution = { "rounds": uint64, "tokens": uint64, "bytes_up": uint64, "by
 ; current module blake3 hex). Absent on pre-D0 nodes — pure additive rev.
 vhc-run-summary = { "run_id": tstr, "phase": tstr, "joined": bool, "eligibility": vhc-eligibility, ? "policy": vhc-policy, "last_round": uint64,
                       ? "run_id_hash": tstr, ? "epoch": uint64, ? "role": tstr, ? "instance": uint64,
-                      ? "envelope_schema_major": uint, ? "module_abi_major": uint, ? "selected_driver": tstr, ? "module_hash": tstr }
+                      ? "envelope_schema_major": uint, ? "module_abi_major": uint, ? "selected_driver": tstr, ? "module_hash": tstr,
+                      ? "run_state": tstr, ? "retry_count": uint64, ? "terminal_reason": tstr }
 vhc-run-detail = { "summary": vhc-run-summary, "coordinator": tstr, "contribution": vhc-contribution, "recent_events": [* vhc-event] }
 vhc-leave-mode = "graceful" / "immediate"
 vhc-event-phase = { "Phase": { "run_id": tstr, "phase": tstr, "epoch": uint64, "round": uint64 } }
@@ -1438,6 +1439,8 @@ request-vhc-run-list = "VhcRunList"
 request-vhc-run-detail = { "VhcRunDetail": { "run_id": tstr } }
 request-vhc-join = { "VhcJoin": { "run_id": tstr, "policy": vhc-policy, "op_id": tstr } }
 request-vhc-leave = { "VhcLeave": { "run_id": tstr, "mode": vhc-leave-mode, "op_id": tstr } }
+request-vhc-pause = { "VhcPause": { "run_id": tstr, "op_id": tstr } }
+request-vhc-resume = { "VhcResume": { "run_id": tstr, "op_id": tstr } }
 request-vhc-set-policy = { "VhcSetPolicy": { "policy": vhc-policy } }
 request-vhc-hardware-report = "VhcHardwareReport"
 request-models = { "Models": { ? "after": (tstr / null) } }
@@ -1731,6 +1734,8 @@ api-request = request-submit
             / request-vhc-run-detail
             / request-vhc-join
             / request-vhc-leave
+            / request-vhc-pause
+            / request-vhc-resume
             / request-vhc-set-policy
             / request-vhc-hardware-report
             / request-models

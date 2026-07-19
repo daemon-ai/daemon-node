@@ -52,6 +52,20 @@ impl VhcApi for NodeApiImpl {
         }
     }
 
+    async fn vhc_pause(&self, run_id: String, op_id: String) -> Result<(), ApiError> {
+        match self.vhc.get() {
+            Some(s) => s.vhc_pause(run_id, op_id).await,
+            None => Err(ApiError::Unsupported("vhc_pause".into())),
+        }
+    }
+
+    async fn vhc_resume(&self, run_id: String, op_id: String) -> Result<(), ApiError> {
+        match self.vhc.get() {
+            Some(s) => s.vhc_resume(run_id, op_id).await,
+            None => Err(ApiError::Unsupported("vhc_resume".into())),
+        }
+    }
+
     async fn vhc_set_policy(&self, policy: VhcPolicy) -> Result<(), ApiError> {
         match self.vhc.get() {
             Some(s) => s.vhc_set_policy(policy).await,

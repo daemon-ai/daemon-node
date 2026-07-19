@@ -71,6 +71,13 @@ enum Cmd {
     /// §8.7 replay-verified). Heavier than tier-1 (wasmtime + guest builds), so it is a separate
     /// gate invoked as `cargo run -p xtask -- vhc-ci-t2`, never part of `vhc-ci-det`.
     VhcCiT2,
+    /// Run the vhc **node + supervisor lifecycle** suites: the run-instance state machine
+    /// (terminal transitions, generation gating, retry budget, crash-window repair, pause/resume),
+    /// the resident reconciliation + seat-keeper passes, owner arbitration, and the supervisor's
+    /// spawn/respawn/meltdown + event-stream observability over the REAL worker subprocess. This
+    /// lane is FOLDED INTO the mandatory `vhc-ci-det` aggregate (never a side gate); the
+    /// standalone command serves focused iteration.
+    VhcCiNode,
     /// Enforce the daemon-vhc dependency-direction rules (architecture §7): `host/*` never links
     /// `sdk/*`, `contracts/*` links neither, `sdk/*` never links `host/*`. The honest current
     /// exceptions are listed inline and each is tracked to the phase that removes it.
@@ -194,6 +201,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::BuildGuests => build_guests(),
         Cmd::VhcCiDet => vhc_ci_det(),
         Cmd::VhcCiT2 => vhc_ci_t2(),
+        Cmd::VhcCiNode => vhc_ci_node(),
         Cmd::VhcDepCheck => vhc_dep_check(),
         Cmd::TokenizeCorpus {
             dataset,
@@ -565,7 +573,10 @@ fn vhc_ci_det() -> anyhow::Result<()> {
             ],
         ),
     ];
-    for (label, args) in suites {
+    // The node + supervisor lifecycle suites are part of the SAME mandatory aggregate (the
+    // run-instance state machine and supervision are consensus-adjacent product paths, not a
+    // side lane); `vhc-ci-node` also runs them standalone for focused iteration.
+    for (label, args) in suites.iter().chain(VHC_NODE_SUITES) {
         println!("\n== vhc-ci-det: {label} ==");
         let status = Command::new("cargo")
             .current_dir(&root)
@@ -576,6 +587,45 @@ fn vhc_ci_det() -> anyhow::Result<()> {
         anyhow::ensure!(status.success(), "vhc CI tier-1 suite failed: {label}");
     }
     println!("\nvhc-ci-det: all tier-1 (CPU consensus-critical) vhc suites green");
+    Ok(())
+}
+
+/// The node + supervisor lifecycle suites (one list, two entry points): the `daemon-vhc-node`
+/// suites cover the durable run-instance state machine (terminal transitions with observed
+/// teardown ordering, generation gating, the bounded retry budget, crash-window repair,
+/// pause/resume, restart reconvergence), the resident reconciliation + seat-keeper passes, and
+/// owner arbitration; the `daemon-vhc-supervisor` suites cover spawn → handshake → respawn →
+/// crash-loop meltdown and the event-pump observability contract over the REAL scripted worker
+/// subprocess (`fake-train-worker`).
+const VHC_NODE_SUITES: &[(&str, &[&str])] = &[
+    (
+        "daemon-vhc-node (run-instance state machine + reconciliation + seat keeper + arbitration)",
+        &["-p", "daemon-vhc-node"],
+    ),
+    (
+        "daemon-vhc-supervisor (spawn/respawn/meltdown + stream observability, real subprocess)",
+        &["-p", "daemon-vhc-supervisor"],
+    ),
+];
+
+/// Run the node + supervisor lifecycle suites standalone (the same list `vhc-ci-det` folds in —
+/// D-P5: the node lane is mandatory in the det aggregate, this entry point is for iteration).
+fn vhc_ci_node() -> anyhow::Result<()> {
+    let root = workspace_root();
+    for (label, args) in VHC_NODE_SUITES {
+        println!("\n== vhc-ci-node: {label} ==");
+        let status = Command::new("cargo")
+            .current_dir(&root)
+            .arg("test")
+            .args(*args)
+            .status()
+            .map_err(|e| anyhow::anyhow!("running cargo test {args:?}: {e}"))?;
+        anyhow::ensure!(
+            status.success(),
+            "vhc node/supervisor suite failed: {label}"
+        );
+    }
+    println!("\nvhc-ci-node: node + supervisor lifecycle suites green");
     Ok(())
 }
 

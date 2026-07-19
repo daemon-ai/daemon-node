@@ -3142,6 +3142,40 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         cfg.vhc.data_cache_gb,
                     )
                 };
+                // The registry seat-slot directory (architecture §6.3; D-P9): wired only when the
+                // owner enabled coordinator duty AND a registry is configured — the resident seat
+                // keeper claims/heartbeats/releases through it.
+                let seat_directory: Option<Arc<dyn daemon_vhc_node::SeatDirectory>> = if cfg
+                    .vhc
+                    .seat_claim
+                    && !cfg.vhc.registry.base.is_empty()
+                {
+                    match daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()) {
+                        Ok(egress) => {
+                            use daemon_vhc_session::config::RegistryAuthConfig;
+                            let mut registry = daemon_vhc_node::RegistryClient::new(
+                                egress,
+                                cfg.vhc.registry.base.clone(),
+                            );
+                            registry = match &cfg.vhc.registry.auth {
+                                RegistryAuthConfig::None => registry,
+                                RegistryAuthConfig::Bearer { token } => {
+                                    registry.with_bearer(token.clone())
+                                }
+                                RegistryAuthConfig::Internal { org_id, actor } => {
+                                    registry.with_internal(org_id.clone(), actor.clone())
+                                }
+                            };
+                            Some(Arc::new(registry))
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "vhc: seat-directory egress client failed; coordinator duty not wired");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let svc = Arc::new(daemon_vhc_node::VhcService::new(
                     daemon_vhc_node::VhcServiceParts {
                         config: cfg.vhc.clone(),
@@ -3155,6 +3189,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         // (D-P8): it mints keys, issues certificates under the base identity, and
                         // writes credential records the worker resolves by reference.
                         identity_dir: Some(identity_dir.clone()),
+                        seat_directory,
                     },
                 ));
                 // A3: bind the service's own Arc so joins pump the continuous worker event stream
@@ -3162,6 +3197,14 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 svc.bind_self();
                 if let Err(e) = svc.start().await {
                     tracing::error!(error = %e, "vhc: VhcService::start failed");
+                }
+                // The resident run-instance reconciliation tick: crash-window repair, uptime-based
+                // retry reset, and backoff-scheduled reconvergence of recoverable failures.
+                let _reconciler = svc.spawn_reconciler();
+                // The resident coordinator seat keeper (a no-op None unless the owner enabled
+                // coordinator duty with a registry + identity store).
+                if svc.spawn_seat_keeper().is_some() {
+                    tracing::info!("vhc: coordinator seat keeper resident ([vhc] seat_claim)");
                 }
                 node.set_vhc(svc as Arc<dyn daemon_api::VhcApi>);
                 tracing::info!("vhc: VhcService bound ([vhc] enabled)");
