@@ -313,7 +313,7 @@ async fn join_role(
             coordinator: String::new(),
             credentials: creds.to_bytes().expect("encode credentials"),
             policy: policy(),
-            admitted_tuple: Some(tuple),
+            admitted_tuple: Some(Box::new(tuple)),
         })
         .await;
     seat.cut

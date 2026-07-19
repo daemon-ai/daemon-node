@@ -100,6 +100,43 @@ pub struct WorkerCapabilities {
     pub payload_stores: Vec<String>,
 }
 
+/// One execution backend this worker build can actually run, as probed on this host — the
+/// per-backend half of the capability advertisement (architecture §9: the measured half of
+/// fleet heterogeneity). The worker advertises one record per COMPILED lane whose runtime
+/// probe found a device (plus the always-present CPU record); the measured selection ladder
+/// consumes exactly these records, so advertisement and selection cannot diverge.
+///
+/// Wire discipline: a new additive record type carried by [`Hardware::backends`]
+/// (`#[serde(default)]` — pre-extension frames decode to an empty list). All-fields-default
+/// construction is meaningful (an unknown/legacy record).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCapability {
+    /// The engine lane slug (`"cpu"` / `"wgpu"` / `"cuda"` — `BackendKind` vocabulary).
+    pub backend: String,
+    /// The device backend CLASS the run pre-screen matches (`device_min.backend_class`
+    /// vocabulary): `"cuda"`, `"vulkan"`, `"metal"`, `"dx12"`, or `"cpu"`.
+    pub class: String,
+    /// The adapter/device name as probed (operator-facing; never branched on).
+    pub adapter: String,
+    /// The device index this record describes (device placement vocabulary; single-device
+    /// probes report `0`).
+    pub device_index: u32,
+    /// Dedicated device memory in MiB (the platform-correct budget source; `0` = none/unknown).
+    pub vram_mb: u64,
+    /// The largest single device allocation in MiB (the per-buffer ceiling — the number the
+    /// fleet preflight checks the pinned model's largest tensor against; `0` = unbounded or
+    /// unknown).
+    pub max_alloc_mb: u64,
+    /// Shared/spillover memory in MiB (GTT / unified pool; `0` = none).
+    pub shared_mb: u64,
+    /// Whether the device shares host DRAM (unified-memory budget math applies).
+    pub unified: bool,
+    /// Whether the lane can serve RIGHT NOW (device probed AND its runtime staged — for CUDA
+    /// the two-leg NVRTC gate). A present-but-not-ready record advertises the hardware while
+    /// keeping the lane unselectable.
+    pub ready: bool,
+}
+
 /// A hardware + capability probe result (§10.2 — extends the daemon-models `HardwareProbe`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hardware {
@@ -122,6 +159,12 @@ pub struct Hardware {
     pub ram_mb: u64,
     /// The backend lanes the worker was built with (`cpu`, `cuda`, `rocm`, `vulkan`).
     pub backend_lanes: Vec<String>,
+    /// The structured per-backend capability records (one per compiled lane with a probed
+    /// device, plus the CPU record) — what the measured backend-selection ladder consumes and
+    /// what the fleet preflight sizes models against. **Additive:** `#[serde(default)]` keeps
+    /// pre-extension `Hardware` frames decodable (empty list = no structured advertisement).
+    #[serde(default)]
+    pub backends: Vec<BackendCapability>,
     /// The capability vocabulary (ABI version, ops, payload stores).
     pub capabilities: WorkerCapabilities,
     /// Measured uplink in kbit/s.
@@ -162,12 +205,27 @@ pub struct AdmittedTuple {
     /// The owner-policy revision consulted at admission (node-owned counter).
     #[serde(default)]
     pub owner_policy_rev: u64,
+    /// The execution backend the assessment SELECTED on the measured ladder (`BackendKind`
+    /// slug: `"cpu"` / `"burn-ndarray"` / `"wgpu"` / `"cuda"`). Join reruns the same measured
+    /// selection and compares — a device that disappeared or shrank between assess and join
+    /// rederives differently and refuses typed (the claim-revalidation flow; the node
+    /// reassesses). **Additive:** `#[serde(default)]` — a pre-extension tuple carries `""`,
+    /// which compares equal only to another pre-extension rederivation.
+    #[serde(default)]
+    pub backend: String,
+    /// The device placement the assessment selected (`EngineConfig.gpu_index` vocabulary;
+    /// single-device hosts place on `0`). Compared at join like [`Self::backend`]. Additive.
+    #[serde(default)]
+    pub gpu_index: u32,
 }
 
 impl AdmittedTuple {
-    /// The first artifact-addressed field that differs from `rederived` (the fields join
-    /// recomputes from the artifacts it is about to run), or `None` when they match. The
-    /// node-owned revisions are compared separately by the node, not here.
+    /// The first field that differs from `rederived` — the fields join recomputes: the
+    /// artifact-addressed hashes/identity AND the measured backend placement (`backend` /
+    /// `gpu_index`, whose join-time rederivation IS the device-claim revalidation: a device
+    /// that vanished between assess and join rederives a different selection and refuses here,
+    /// never OOMs later). `None` when they match. The node-owned revisions are compared
+    /// separately by the node, not here.
     #[must_use]
     pub fn first_artifact_mismatch(&self, rederived: &Self) -> Option<&'static str> {
         if self.module_hash != rederived.module_hash {
@@ -184,6 +242,10 @@ impl AdmittedTuple {
             Some("role")
         } else if self.incarnation != rederived.incarnation {
             Some("incarnation")
+        } else if self.backend != rederived.backend {
+            Some("backend")
+        } else if self.gpu_index != rederived.gpu_index {
+            Some("gpu_index")
         } else {
             None
         }
@@ -276,9 +338,9 @@ pub enum Command {
         /// The immutable admitted tuple assessment produced (architecture §6.3), carried back so
         /// join can rederive-and-compare before running. Additive `#[serde(default)]` — a join
         /// without a tuple (the self-driven interim / a pre-tuple caller) authors and checks its
-        /// own.
+        /// own. Boxed for variant-size parity (serde encodes through the box — no wire change).
         #[serde(default)]
-        admitted_tuple: Option<AdmittedTuple>,
+        admitted_tuple: Option<Box<AdmittedTuple>>,
     },
     /// GPU-governor lever (§10.5). `paused` promises memory, not just time: the worker aborts any
     /// in-flight guest call, drops the wasm instance + GPU allocations, and keeps only CPU masters.
@@ -335,9 +397,10 @@ pub enum Command {
         /// sending this command; the worker resolves both read-only by reference and refuses
         /// typed when either is absent or mis-scoped (the certificate re-issuance handshake).
         /// Additive `#[serde(default)]`; a switch without a tuple is a typed refusal on the
-        /// production path.
+        /// production path. Boxed for variant-size parity (serde encodes through the box — no
+        /// wire change).
         #[serde(default)]
-        admitted_tuple: Option<AdmittedTuple>,
+        admitted_tuple: Option<Box<AdmittedTuple>>,
     },
     /// Ask the worker to exit cleanly.
     Shutdown,
@@ -796,6 +859,8 @@ mod tests {
             incarnation: 1,
             device_profile_rev: 9,
             owner_policy_rev: 9,
+            backend: "wgpu".into(),
+            gpu_index: 0,
         };
         // Identical artifact fields: no mismatch (node-owned revs are compared separately).
         let mut other = base.clone();
@@ -810,6 +875,15 @@ mod tests {
         let mut regrant = base.clone();
         regrant.grants_hash = [0xAB; 32];
         assert_eq!(base.first_artifact_mismatch(&regrant), Some("grants_hash"));
+        // The measured backend placement is rederived at join like the artifact hashes: a
+        // device that disappeared (the rederivation lands on a different rung) or a moved
+        // placement refuses typed — the claim-revalidation flow.
+        let mut lost_device = base.clone();
+        lost_device.backend = "cpu".into();
+        assert_eq!(base.first_artifact_mismatch(&lost_device), Some("backend"));
+        let mut moved = base.clone();
+        moved.gpu_index = 1;
+        assert_eq!(base.first_artifact_mismatch(&moved), Some("gpu_index"));
     }
 
     fn round_trip_event(ev: Event) {
@@ -835,7 +909,7 @@ mod tests {
                 duty_cycle_pct: 80,
                 schedule: Some("0 2 * * *".into()),
             },
-            admitted_tuple: Some(AdmittedTuple {
+            admitted_tuple: Some(Box::new(AdmittedTuple {
                 module_hash: [0x11; 32],
                 config_hash: [0x22; 32],
                 grants_hash: [0x33; 32],
@@ -845,7 +919,9 @@ mod tests {
                 incarnation: 3,
                 device_profile_rev: 7,
                 owner_policy_rev: 2,
-            }),
+                backend: "cuda".into(),
+                gpu_index: 0,
+            })),
         });
         round_trip_command(Command::Throttle {
             vram_cap_mb: Some(8_000),
@@ -863,7 +939,7 @@ mod tests {
             new_module: [0x5A; 32],
             grants_hash: [0x6B; 32],
             deadline_ms: 5_000,
-            admitted_tuple: Some(AdmittedTuple {
+            admitted_tuple: Some(Box::new(AdmittedTuple {
                 module_hash: [0x5A; 32],
                 config_hash: [0x00; 32],
                 grants_hash: [0x6B; 32],
@@ -873,7 +949,9 @@ mod tests {
                 incarnation: 4,
                 device_profile_rev: 1,
                 owner_policy_rev: 1,
-            }),
+                backend: "cpu".into(),
+                gpu_index: 0,
+            })),
         });
         round_trip_command(Command::Shutdown);
         round_trip_command(Command::Ping);
@@ -931,6 +1009,30 @@ mod tests {
             shared_mb: 120_000,
             ram_mb: 64_000,
             backend_lanes: vec!["cuda".into()],
+            backends: vec![
+                BackendCapability {
+                    backend: "cuda".into(),
+                    class: "cuda".into(),
+                    adapter: "discrete 24 GiB".into(),
+                    device_index: 0,
+                    vram_mb: 24_000,
+                    max_alloc_mb: 24_000,
+                    shared_mb: 0,
+                    unified: false,
+                    ready: true,
+                },
+                BackendCapability {
+                    backend: "cpu".into(),
+                    class: "cpu".into(),
+                    adapter: "host".into(),
+                    device_index: 0,
+                    vram_mb: 0,
+                    max_alloc_mb: 0,
+                    shared_mb: 0,
+                    unified: false,
+                    ready: true,
+                },
+            ],
             capabilities: WorkerCapabilities {
                 abi_version: 1,
                 ops: vec!["adamw_step@1".into()],
@@ -970,6 +1072,8 @@ mod tests {
                 incarnation: 1,
                 device_profile_rev: 4,
                 owner_policy_rev: 1,
+                backend: "cpu".into(),
+                gpu_index: 0,
             }),
         }));
         round_trip_event(Event::AdmittedTupleMismatch {
@@ -1117,6 +1221,71 @@ mod tests {
         assert!(
             matches!(decoded, Event::RoundOutcome { generation: 0, .. }),
             "missing counter defaults to 0"
+        );
+    }
+
+    /// The backend-placement fields are additive on the admitted tuple, and the structured
+    /// backend records are additive on `Hardware`: frames authored before the extension (CBOR
+    /// maps WITHOUT the fields) still decode, with the backend slug defaulting to `""`, the
+    /// placement to `0`, and the record list to empty.
+    #[test]
+    fn backend_placement_and_capability_fields_are_additive_back_compatible() {
+        #[derive(serde::Serialize)]
+        struct PreExtensionTuple {
+            module_hash: [u8; 32],
+            config_hash: [u8; 32],
+            grants_hash: [u8; 32],
+            claim_hash: [u8; 32],
+            genesis_hash: [u8; 32],
+            role: String,
+            incarnation: u64,
+        }
+        let legacy = PreExtensionTuple {
+            module_hash: [1; 32],
+            config_hash: [2; 32],
+            grants_hash: [3; 32],
+            claim_hash: [4; 32],
+            genesis_hash: [5; 32],
+            role: "trainer".into(),
+            incarnation: 2,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&legacy, &mut bytes).expect("encode pre-extension tuple");
+        let decoded: AdmittedTuple =
+            ciborium::from_reader(bytes.as_slice()).expect("pre-extension tuple decodes");
+        assert_eq!(decoded.backend, "", "missing backend defaults empty");
+        assert_eq!(decoded.gpu_index, 0, "missing placement defaults to 0");
+
+        #[derive(serde::Serialize)]
+        struct PreExtensionHardware {
+            gpus: u32,
+            vram_mb: u64,
+            ram_mb: u64,
+            backend_lanes: Vec<String>,
+            capabilities: WorkerCapabilities,
+            up_kbps: u64,
+            down_kbps: u64,
+            disk_free_mb: u64,
+            throughput_class: String,
+        }
+        let legacy_hw = PreExtensionHardware {
+            gpus: 1,
+            vram_mb: 4096,
+            ram_mb: 128_000,
+            backend_lanes: vec!["vulkan".into(), "cpu".into()],
+            capabilities: WorkerCapabilities::default(),
+            up_kbps: 0,
+            down_kbps: 0,
+            disk_free_mb: 0,
+            throughput_class: "c1".into(),
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&legacy_hw, &mut bytes).expect("encode pre-extension hardware");
+        let decoded: Hardware =
+            ciborium::from_reader(bytes.as_slice()).expect("pre-extension hardware decodes");
+        assert!(
+            decoded.backends.is_empty(),
+            "missing records default to an empty advertisement"
         );
     }
 

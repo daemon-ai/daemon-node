@@ -276,6 +276,8 @@ fn switch_binding_for(
         incarnation,
         device_profile_rev: 0,
         owner_policy_rev: 0,
+        backend: "cpu".to_string(),
+        gpu_index: 0,
     };
     let certified = issue_run_key(
         base,

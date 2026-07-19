@@ -240,6 +240,8 @@ fn switch_tuple(
         incarnation,
         device_profile_rev: 0,
         owner_policy_rev: 0,
+        backend: "cpu".to_string(),
+        gpu_index: 0,
     };
     (tuple, new_module, grants_hash)
 }
@@ -370,7 +372,7 @@ async fn switch_reissues_identity_and_continues_the_durable_journal() {
         coordinator: String::new(),
         credentials: Vec::new(),
         policy: policy(),
-        admitted_tuple: Some(tuple.clone()),
+        admitted_tuple: Some(Box::new(tuple.clone())),
     })
     .await;
     cut.until(step, |ev| match ev {
@@ -393,7 +395,7 @@ async fn switch_reissues_identity_and_continues_the_durable_journal() {
         new_module,
         grants_hash,
         deadline_ms: 10_000,
-        admitted_tuple: Some(switch_tuple.clone()),
+        admitted_tuple: Some(Box::new(switch_tuple.clone())),
     })
     .await;
     let reason = cut
@@ -437,7 +439,7 @@ async fn switch_reissues_identity_and_continues_the_durable_journal() {
         new_module,
         grants_hash,
         deadline_ms: 10_000,
-        admitted_tuple: Some(switch_tuple),
+        admitted_tuple: Some(Box::new(switch_tuple)),
     })
     .await;
     let (epoch, module, generation) = cut

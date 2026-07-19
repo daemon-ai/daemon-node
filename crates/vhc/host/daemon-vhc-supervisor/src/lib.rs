@@ -219,7 +219,7 @@ impl TrainSupervisor {
             policy,
             // The node-minted admitted tuple (carrying the incarnation this instance runs as);
             // the worker rederives + re-verifies it before running.
-            admitted_tuple,
+            admitted_tuple: admitted_tuple.map(Box::new),
         };
         self.exchange(cmd, |ev| match ev {
             Event::RunPhase { .. } => Some(Ok(())),
@@ -252,7 +252,7 @@ impl TrainSupervisor {
             credentials,
             policy,
             // The node-minted admitted tuple (carrying the incarnation this instance runs as).
-            admitted_tuple,
+            admitted_tuple: admitted_tuple.map(Box::new),
         };
         // One-way: the worker streams events (incl. the first RunPhase) over the pump, so we do not
         // block on a reply here. A spawn/transport fault clears the pump + surfaces the error.
@@ -318,7 +318,7 @@ impl TrainSupervisor {
             new_module,
             grants_hash,
             deadline_ms,
-            admitted_tuple,
+            admitted_tuple: admitted_tuple.map(Box::new),
         };
         let res = self
             .exchange(cmd, |ev| match ev {

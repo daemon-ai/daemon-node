@@ -25,10 +25,13 @@ use crate::TrainError;
 /// The engine's device-backend selection seam.
 ///
 /// The default is [`BackendKind::Cpu`]. The GPU arms name the device lanes the worker binary's
-/// feature flags compile (`wgpu` / `cuda`); they select nothing in the driver yet — the
-/// `compute@2` host runner is ndarray-only until the GPU compute-runner wiring lands, at which
-/// point this seam re-points the per-instance [`crate::compute::ComputeRunner`] at the device.
-/// Selection is data only; nothing burn-specific leaks across the worker protocol.
+/// feature flags compile (`wgpu` / `cuda`); the driver constructs the matching per-instance
+/// [`crate::compute::HostCompute`] runner from this seam ([`EngineConfig::backend`] +
+/// [`EngineConfig::gpu_index`]). **A selected backend that is unavailable at run start is a
+/// typed [`crate::run::RunError::BackendUnavailable`] refusal — never a silent CPU run** (the
+/// det lane stays host fp32 on every rung, so backend choice affects only the native
+/// tolerance-class lane; the refusal protects capacity, not determinism). Selection is data
+/// only; nothing burn-specific leaks across the worker protocol.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BackendKind {
     /// The CPU lane (the det lane is bit-exact everywhere by construction).
@@ -43,6 +46,39 @@ pub enum BackendKind {
     /// The burn-cuda lane (NVIDIA CUDA / NVRTC JIT). Device chosen by [`EngineConfig::gpu_index`].
     #[cfg(feature = "cuda")]
     Cuda,
+}
+
+impl BackendKind {
+    /// The stable wire slug for this lane (`"cpu"` / `"burn-ndarray"` / `"wgpu"` / `"cuda"`) —
+    /// what the admitted tuple records and the worker's capability advertisement names. Slugs
+    /// are stable identifiers; renaming one is a wire change.
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            #[cfg(feature = "burn-ndarray")]
+            Self::BurnNdarray => "burn-ndarray",
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu => "wgpu",
+            #[cfg(feature = "cuda")]
+            Self::Cuda => "cuda",
+        }
+    }
+
+    /// Whether this lane executes on a GPU device (the lanes bound by the per-process compute
+    /// slot and the runtime availability probe; the CPU/ndarray lanes are always available).
+    #[must_use]
+    pub fn is_device(self) -> bool {
+        #[cfg(feature = "wgpu")]
+        if matches!(self, Self::Wgpu) {
+            return true;
+        }
+        #[cfg(feature = "cuda")]
+        if matches!(self, Self::Cuda) {
+            return true;
+        }
+        false
+    }
 }
 
 /// Fixed host-side settings that affect observable semantics (ABI §2.2/§8).

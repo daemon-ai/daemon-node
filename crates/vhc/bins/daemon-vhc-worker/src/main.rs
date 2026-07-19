@@ -146,7 +146,9 @@ async fn join_live(
     };
     Ok(RoleSessionSpec {
         module: resolved.module.clone(),
-        engine: backend::engine_config_from_env(),
+        // The measured backend selection materialized (no fallback: an unavailable admitted
+        // backend refuses the join typed here).
+        engine: backend::engine_for_join(resolved.device_min.as_ref())?,
         run: binding.run,
         own_cert: binding.own_cert,
         trusted_bases: binding.trusted_bases,
@@ -360,7 +362,10 @@ async fn main() {
                 // Rederive from the artifacts this join is about to run and compare
                 // field-by-field; any artifact mismatch aborts the join with a typed event —
                 // the node reassesses; a stale/swapped artifact is never run.
-                let Some(expected) = admitted_tuple.or_else(|| assessed_tuple.clone()) else {
+                let Some(expected) = admitted_tuple
+                    .map(|boxed| *boxed)
+                    .or_else(|| assessed_tuple.clone())
+                else {
                     send(
                         &writer,
                         &worker_error(&format!(
@@ -480,9 +485,19 @@ async fn main() {
                                     continue;
                                 }
                             };
+                            // The measured backend selection materialized (no fallback: an
+                            // unavailable admitted backend refuses the join typed).
+                            let engine =
+                                match backend::engine_for_join(resolved.device_min.as_ref()) {
+                                    Ok(engine) => engine,
+                                    Err(detail) => {
+                                        send(&writer, &worker_error(&detail)).await;
+                                        continue;
+                                    }
+                                };
                             let spec = RoleSessionSpec {
                                 module: resolved.module.clone(),
-                                engine: backend::engine_config_from_env(),
+                                engine,
                                 run: binding.run,
                                 own_cert: binding.own_cert.clone(),
                                 trusted_bases: binding.trusted_bases,
@@ -650,7 +665,7 @@ async fn main() {
                     new_module,
                     grants_hash,
                     deadline_ms,
-                    tuple,
+                    *tuple,
                     handle.generation(),
                 ) {
                     Ok(binding) => handle.switch(binding),

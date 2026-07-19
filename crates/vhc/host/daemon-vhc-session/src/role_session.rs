@@ -348,6 +348,15 @@ async fn run_role(
         &worker, &module, run_cfg, journal, restore,
     ) {
         Ok(r) => r,
+        // The admitted execution backend cannot serve right now (the device disappeared or
+        // shrank since assess, its runtime is unstaged, or the process device-compute slot is
+        // occupied): a RECOVERABLE environment fault — the node reassesses against the live
+        // device inventory and reconverges — never a quiet CPU run, never terminal.
+        Err(daemon_vhc_host::run::RunError::BackendUnavailable(reason)) => {
+            return TerminalOutcome::FailedRetryable {
+                reason: format!("execution backend unavailable at run start: {reason}"),
+            }
+        }
         Err(e) => {
             return TerminalOutcome::FailedTerminal {
                 reason: format!(
@@ -1425,7 +1434,12 @@ fn classify_natural_end(
 }
 
 /// Trap classification: resource-budget breaches are the node's churn/preemption loop
-/// (retryable); everything else is a module/admission fault (terminal).
+/// (retryable); a deferred device fault (`ComputeFault` — driver OOM, a host-side allocation
+/// rejection, a device that died at bring-up) is a CAPACITY fault, likewise retryable — the
+/// node reassesses against the live device inventory (the admitted claim's headroom is the
+/// primary defense; the hardware findings record that a faithful driver-OOM diagnostic is not
+/// distinguishable from a host-side pool rejection, so the class is judged conservatively
+/// recoverable). Everything else is a module/admission fault (terminal).
 fn classify_trap(trap: &daemon_vhc_host::trap::Trap) -> TerminalOutcome {
     match trap.code {
         TrapCode::BudgetMemory
@@ -1434,6 +1448,9 @@ fn classify_trap(trap: &daemon_vhc_host::trap::Trap) -> TerminalOutcome {
         | TrapCode::BudgetOps
         | TrapCode::BudgetHandles => TerminalOutcome::FailedRetryable {
             reason: format!("resource budget breached: {trap}"),
+        },
+        TrapCode::ComputeFault => TerminalOutcome::FailedRetryable {
+            reason: format!("device compute fault (capacity class): {trap}"),
         },
         _ => TerminalOutcome::FailedTerminal {
             reason: format!("module trapped: {trap}"),
@@ -1525,13 +1542,16 @@ mod tests {
 
     #[test]
     fn resource_budget_traps_classify_retryable_module_traps_terminal() {
-        // Budget breaches are the node's churn/preemption loop; module faults are terminal.
+        // Budget breaches are the node's churn/preemption loop; device compute faults are the
+        // CAPACITY class (driver OOM / allocation rejection / bring-up loss — recoverable by a
+        // reassess against the live device inventory); module faults are terminal.
         for code in [
             TrapCode::BudgetMemory,
             TrapCode::BudgetFuel,
             TrapCode::BudgetEpoch,
             TrapCode::BudgetOps,
             TrapCode::BudgetHandles,
+            TrapCode::ComputeFault,
         ] {
             assert!(matches!(
                 classify_trap(&trap(code)),

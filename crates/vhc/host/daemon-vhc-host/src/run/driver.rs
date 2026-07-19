@@ -234,6 +234,12 @@ pub enum RunError {
     /// meets it before any guest code runs.
     #[error("BridgeRetired: {0}")]
     BridgeRetired(String),
+    /// The admitted execution backend (`EngineConfig.backend`) cannot serve on this host right
+    /// now (device absent/ineligible at run start, NVRTC not staged, or the process
+    /// device-compute slot is occupied). A typed refusal — NEVER a silent ndarray fallback: the
+    /// caller classifies it recoverable (the node reassesses; the device inventory changed).
+    #[error("BackendUnavailable: {0}")]
+    BackendUnavailable(String),
     /// A journal-sink write failed (journaling is load-bearing, §8.4).
     #[error(transparent)]
     Sink(#[from] SinkError),
@@ -1363,12 +1369,12 @@ struct Host {
     // data@2: the admitted artifact set ("which artifacts a module may touch is a grant") — the
     // envelope's edge-pinned artifact map ∩ the role's grants. Fail closed when empty.
     granted_artifacts: std::collections::BTreeSet<[u8; 32]>,
-    // compute@2 (track C1, ABI §15): the per-instance command-queue runner over the tier-1 real
-    // backend, guest-thread-local (device work belongs to the guest thread,
-    // §11.1/§11.3 — the runner drops with the Store). `None` when the module imports no
-    // compute@2 symbol. wgpu/cuda ride the same generic `ComputeRunner<B>` seam behind the host
-    // feature lanes; driver-side backend selection is deferred with them.
-    compute: Option<crate::compute::ComputeRunner<crate::compute::HostReal>>,
+    // compute@2 (track C1, ABI §15): the per-instance command-queue runner over the ADMITTED
+    // backend (`EngineConfig.backend` → ndarray/wgpu/cuda), guest-thread-local (device work
+    // belongs to the guest thread, §11.1/§11.3 — the runner drops with the Store; GPU backends
+    // additionally REQUIRE single-thread driving, which this placement provides by
+    // construction). `None` when the module imports no compute@2 symbol.
+    compute: Option<crate::compute::HostCompute>,
     // The queue-depth grant + its ledger: ops enqueued since the last successful fence.
     compute_queue_depth: u64,
     compute_ops_since_fence: u64,
@@ -3311,11 +3317,28 @@ pub fn start_run_migrating(
                 .to_string(),
         ));
     }
-    // The compute@2 command queue (track C1, ABI §15): a per-instance ComputeRunner over the
-    // tier-1 real backend, constructed only for modules that import the world.
+    // The compute@2 command queue (track C1, ABI §15): a per-instance runner over the ADMITTED
+    // backend, constructed only for modules that import the world.
     let compute = module.imports().any(|i| i.module() == NS_COMPUTE_V2);
 
     let engine_cfg: EngineConfig = worker.config().clone();
+    // Backend claim revalidation at run start (fail fast, BEFORE the run header is journaled):
+    // the admitted backend must still be servable — feature compiled AND the runtime probe
+    // passing AND (device lanes) the process device-compute slot free. Unavailability is the
+    // typed refusal, never a silent ndarray run. The guest-thread construction below stays the
+    // authoritative backstop for the race window (a device dying between this check and
+    // bring-up surfaces as a typed compute fault, classified recoverable).
+    if compute {
+        crate::compute::backend_available(engine_cfg.backend)
+            .map_err(RunError::BackendUnavailable)?;
+        if engine_cfg.backend.is_device() && crate::compute::DeviceComputeGuard::is_held() {
+            return Err(RunError::BackendUnavailable(
+                "a device-backed compute instance is already live in this process (one \
+                 device-compute instance per process)"
+                    .to_string(),
+            ));
+        }
+    }
     let abi_packed = u64::from(daemon_vhc_abi::DA_ABI_MAJOR_V2) << 16;
     let worlds: Vec<(String, u64)> = module
         .imports()
@@ -3398,6 +3421,40 @@ pub fn start_run_migrating(
             run.identity.role, run.identity.instance
         ))
         .spawn(move || -> Result<RunEnd, RunError> {
+            // Construct the compute runner ON THIS THREAD (the pinned device thread): GPU
+            // backends derive their stream + memory-pool registry from the constructing thread
+            // and are driven single-threaded — every compute@2 import is a synchronous host
+            // call on this same thread, so affinity holds for the instance's lifetime. A
+            // bring-up failure here (the race the pre-spawn check cannot close: the device died
+            // in between) is a typed compute fault, journaled terminal — classified recoverable
+            // by the session, never a silent CPU run and never a host abort.
+            let compute_runner = if compute {
+                match crate::compute::HostCompute::build(&engine_cfg) {
+                    Ok(runner) => {
+                        // Host-side RNG (Float/Random ops) seeded deterministically from the
+                        // identity-derived seed: two runs of one incarnation reproduce it, and
+                        // replay never re-runs kernels anyway (kind-5 records feed readbacks).
+                        let seed_bytes = derive_rng_seed(&run.identity);
+                        runner.seed(u64::from_le_bytes(
+                            seed_bytes[..8].try_into().expect("8-byte slice"),
+                        ));
+                        Some(runner)
+                    }
+                    Err(reason) => {
+                        let trap = Trap::bare(
+                            TrapCode::ComputeFault,
+                            format!(
+                                "backend unavailable at device bring-up ({}): {reason}",
+                                engine_cfg.backend.slug()
+                            ),
+                        );
+                        journal_terminal_trap(&shared, &trap)?;
+                        return Ok(RunEnd::Trapped(trap));
+                    }
+                }
+            } else {
+                None
+            };
             let host = Host {
                 shared: shared.clone(),
                 limits: StoreLimitsBuilder::new()
@@ -3427,17 +3484,7 @@ pub fn start_run_migrating(
                 migration_max_sections: run.migration_max_sections,
                 migration_max_section_bytes: run.migration_max_section_bytes,
                 migration_restore: migration.as_ref().is_some_and(|m| m.restore),
-                compute: compute.then(|| {
-                    let runner = crate::compute::ComputeRunner::ndarray_cpu();
-                    // Host-side RNG (Float/Random ops) seeded deterministically from the
-                    // identity-derived seed: two runs of one incarnation reproduce it, and
-                    // replay never re-runs kernels anyway (kind-5 records feed readbacks).
-                    let seed_bytes = derive_rng_seed(&run.identity);
-                    runner.seed(u64::from_le_bytes(
-                        seed_bytes[..8].try_into().expect("8-byte slice"),
-                    ));
-                    runner
-                }),
+                compute: compute_runner,
                 compute_queue_depth: run.compute_queue_depth,
                 compute_ops_since_fence: 0,
                 compute_fault_after_ops: run.compute_fault_after_ops,

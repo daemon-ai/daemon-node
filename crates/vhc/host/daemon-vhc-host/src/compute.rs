@@ -375,6 +375,307 @@ impl<B: BackendIr> ComputeRunner<B> {
     }
 }
 
+// ==== the execution-backend selection layer =====================================================
+//
+// The driver constructs ONE of these per run instance from `EngineConfig.backend` — the seam
+// that replaces the former unconditional ndarray construction. Three invariants live here:
+//
+// 1. **No silent fallback.** A selected backend whose feature is compiled but whose device is
+//    unavailable at construction is a typed error the caller surfaces
+//    (`RunError::BackendUnavailable` pre-spawn; a `ComputeFault` trap on the guest thread) —
+//    never a quiet CPU run.
+// 2. **Thread affinity.** cubecl-cuda derives its stream + memory-pool registry from the
+//    CALLING thread (`StreamId::current()` is a thread-local) and backends are `Send` but not
+//    `Sync`; driving one from multiple OS threads silently splits pool bookkeeping and dies
+//    under memory pressure. The driver constructs this runner ON the per-instance guest thread
+//    and every `compute@2` import is a synchronous host call on that same thread, so affinity
+//    holds by construction; the recorded [`std::thread::ThreadId`] turns any future violation
+//    into a loud debug assertion instead of a latent pool split.
+// 3. **One device-compute instance per process.** cubecl memory pools never shrink — the peak
+//    working set is permanent for the process — so a second concurrent device-backed instance
+//    would compete for a pool sized by the first. The process-wide slot refuses a second LIVE
+//    device instance typed; sequential instances are permitted (the slot releases on drop) with
+//    the caveat that reclamation is only real after a process restart, which the node's
+//    worker-respawn discipline owns.
+
+/// Whether the selected backend can run on this host right now: the runtime-probe half of the
+/// selection ladder (feature-compiled is necessary but not sufficient). CPU/ndarray lanes are
+/// always available; the device lanes require a usable adapter/device (and staged NVRTC for
+/// CUDA — the two-leg readiness gate). The probes are memoized process-wide, so this is cheap
+/// on every call.
+///
+/// # Errors
+///
+/// A human-readable reason the backend cannot serve (the `BackendUnavailable` detail).
+pub fn backend_available(kind: crate::runtime::BackendKind) -> Result<(), String> {
+    match kind {
+        crate::runtime::BackendKind::Cpu => Ok(()),
+        #[cfg(feature = "burn-ndarray")]
+        crate::runtime::BackendKind::BurnNdarray => Ok(()),
+        #[cfg(feature = "wgpu")]
+        crate::runtime::BackendKind::Wgpu => {
+            if crate::probe::probe_wgpu().is_some() {
+                Ok(())
+            } else {
+                Err("no usable wgpu adapter on this host".to_string())
+            }
+        }
+        #[cfg(feature = "cuda")]
+        crate::runtime::BackendKind::Cuda => {
+            if crate::probe::probe_cuda().is_none() {
+                return Err("no usable CUDA device on this host".to_string());
+            }
+            if !crate::probe::cuda_nvrtc_ready() {
+                return Err(
+                    "CUDA device present but the NVRTC runtime is not staged (two-leg gate: \
+                     loadable libnvrtc AND the cudart JIT include tree)"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The process-wide device-compute slot: at most ONE live device-backed (wgpu/cuda) compute
+/// instance per process. CPU/ndarray instances are unbounded (tests run many concurrently).
+static DEVICE_COMPUTE_SLOT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Holding this guard IS the device-compute slot; dropping it releases the slot.
+#[derive(Debug)]
+pub struct DeviceComputeGuard(());
+
+impl DeviceComputeGuard {
+    /// Acquire the process's single device-compute slot, or report it occupied.
+    ///
+    /// # Errors
+    ///
+    /// The slot is held by a live device-backed compute instance in this process.
+    pub fn acquire() -> Result<Self, String> {
+        use std::sync::atomic::Ordering;
+        if DEVICE_COMPUTE_SLOT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Ok(Self(()))
+        } else {
+            Err(
+                "a device-backed compute instance is already live in this process (one \
+                 device-compute instance per process; device memory pools never shrink)"
+                    .to_string(),
+            )
+        }
+    }
+
+    /// Whether the slot is currently held (the cheap pre-spawn peek; the acquire on the guest
+    /// thread stays authoritative).
+    #[must_use]
+    pub fn is_held() -> bool {
+        DEVICE_COMPUTE_SLOT.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for DeviceComputeGuard {
+    fn drop(&mut self) {
+        DEVICE_COMPUTE_SLOT.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The per-backend runner arm behind [`HostCompute`]. Feature-gated exactly like
+/// [`crate::runtime::BackendKind`]; dispatch is a plain match, monomorphic per arm.
+enum SelectedRunner {
+    /// The ndarray CPU arm — serves both `BackendKind::Cpu` and `BackendKind::BurnNdarray`
+    /// (one real implementation: the burn-ndarray backend).
+    Ndarray(ComputeRunner<HostReal>),
+    #[cfg(feature = "wgpu")]
+    Wgpu(ComputeRunner<burn::backend::Wgpu>),
+    #[cfg(feature = "cuda")]
+    Cuda(ComputeRunner<burn::backend::Cuda>),
+}
+
+/// The driver-facing `compute@2` runner for one run instance: the [`ComputeRunner`] surface
+/// over the backend `EngineConfig.backend` selected, plus the thread-affinity record and (for
+/// device arms) the per-process device-compute slot.
+pub struct HostCompute {
+    /// The guest thread that constructed (and exclusively drives) this runner — the pinned
+    /// device thread. See the module invariants above.
+    thread: std::thread::ThreadId,
+    runner: SelectedRunner,
+    /// Held for the device arms; releases with the instance.
+    _device_slot: Option<DeviceComputeGuard>,
+}
+
+impl HostCompute {
+    /// Construct the selected backend's runner ON THE CALLING THREAD (the driver calls this on
+    /// the per-instance guest thread — the pinned device thread). Device arms acquire the
+    /// process device-compute slot and bring the device up inside `catch_unwind` (cubecl panics
+    /// on a missing adapter; that panic must surface typed, never abort the host).
+    ///
+    /// # Errors
+    ///
+    /// A human-readable reason (unavailable device, occupied device slot, bring-up panic) —
+    /// the caller maps it to the typed refusal surface.
+    pub fn build(cfg: &crate::runtime::EngineConfig) -> Result<Self, String> {
+        backend_available(cfg.backend)?;
+        let (runner, slot) = match cfg.backend {
+            crate::runtime::BackendKind::Cpu => {
+                (SelectedRunner::Ndarray(ComputeRunner::ndarray_cpu()), None)
+            }
+            #[cfg(feature = "burn-ndarray")]
+            crate::runtime::BackendKind::BurnNdarray => {
+                (SelectedRunner::Ndarray(ComputeRunner::ndarray_cpu()), None)
+            }
+            #[cfg(feature = "wgpu")]
+            crate::runtime::BackendKind::Wgpu => {
+                let slot = DeviceComputeGuard::acquire()?;
+                let device = match cfg.gpu_index {
+                    Some(i) => burn::backend::wgpu::WgpuDevice::DiscreteGpu(i as usize),
+                    None => burn::backend::wgpu::WgpuDevice::DefaultDevice,
+                };
+                let runner = catch_bringup(|| ComputeRunner::<burn::backend::Wgpu>::new(device))
+                    .map_err(|e| format!("wgpu device bring-up: {e}"))?;
+                (SelectedRunner::Wgpu(runner), Some(slot))
+            }
+            #[cfg(feature = "cuda")]
+            crate::runtime::BackendKind::Cuda => {
+                let slot = DeviceComputeGuard::acquire()?;
+                let device =
+                    burn::backend::cuda::CudaDevice::new(cfg.gpu_index.unwrap_or(0) as usize);
+                let runner = catch_bringup(|| ComputeRunner::<burn::backend::Cuda>::new(device))
+                    .map_err(|e| format!("CUDA device bring-up: {e}"))?;
+                (SelectedRunner::Cuda(runner), Some(slot))
+            }
+        };
+        Ok(Self {
+            thread: std::thread::current().id(),
+            runner,
+            _device_slot: slot,
+        })
+    }
+
+    /// The pinned-thread check (invariant 2 above): every call must arrive on the constructing
+    /// guest thread. A violation is a host programming error — loud in debug builds, where the
+    /// whole test matrix runs; never a user-facing failure mode.
+    #[inline]
+    fn check_thread(&self) {
+        debug_assert_eq!(
+            std::thread::current().id(),
+            self.thread,
+            "HostCompute driven off its pinned guest thread (backend thread-affinity violation)"
+        );
+    }
+
+    /// See [`ComputeRunner::submit_op`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ComputeRunner::submit_op`].
+    pub fn submit_op(&mut self, op_cbor: &[u8]) -> Result<(), ComputeError> {
+        self.check_thread();
+        match &mut self.runner {
+            SelectedRunner::Ndarray(r) => r.submit_op(op_cbor),
+            #[cfg(feature = "wgpu")]
+            SelectedRunner::Wgpu(r) => r.submit_op(op_cbor),
+            #[cfg(feature = "cuda")]
+            SelectedRunner::Cuda(r) => r.submit_op(op_cbor),
+        }
+    }
+
+    /// See [`ComputeRunner::fence`]. Backend-specific deferred-error caveat (ABI §15 hardware
+    /// findings): a successful fence does NOT prove device health — validated on real CUDA
+    /// hardware, faults may surface only at readback — so callers treat readback as the
+    /// authoritative fault surface and this fence as a best-effort early drain.
+    ///
+    /// # Errors
+    ///
+    /// As [`ComputeRunner::fence`].
+    pub fn fence(&mut self) -> Result<(), ComputeError> {
+        self.check_thread();
+        match &mut self.runner {
+            SelectedRunner::Ndarray(r) => r.fence(),
+            #[cfg(feature = "wgpu")]
+            SelectedRunner::Wgpu(r) => r.fence(),
+            #[cfg(feature = "cuda")]
+            SelectedRunner::Cuda(r) => r.fence(),
+        }
+    }
+
+    /// See [`ComputeRunner::read_tensor`] — the authoritative deferred-fault surface.
+    ///
+    /// # Errors
+    ///
+    /// As [`ComputeRunner::read_tensor`].
+    pub fn read_tensor(&mut self, ir_cbor: &[u8]) -> Result<Vec<u8>, ComputeError> {
+        self.check_thread();
+        match &mut self.runner {
+            SelectedRunner::Ndarray(r) => r.read_tensor(ir_cbor),
+            #[cfg(feature = "wgpu")]
+            SelectedRunner::Wgpu(r) => r.read_tensor(ir_cbor),
+            #[cfg(feature = "cuda")]
+            SelectedRunner::Cuda(r) => r.read_tensor(ir_cbor),
+        }
+    }
+
+    /// See [`ComputeRunner::import_tensor`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ComputeRunner::import_tensor`].
+    pub fn import_tensor(&mut self, id: u64, data_cbor: &[u8]) -> Result<(), ComputeError> {
+        self.check_thread();
+        match &mut self.runner {
+            SelectedRunner::Ndarray(r) => r.import_tensor(id, data_cbor),
+            #[cfg(feature = "wgpu")]
+            SelectedRunner::Wgpu(r) => r.import_tensor(id, data_cbor),
+            #[cfg(feature = "cuda")]
+            SelectedRunner::Cuda(r) => r.import_tensor(id, data_cbor),
+        }
+    }
+
+    /// See [`ComputeRunner::seed`].
+    pub fn seed(&self, seed: u64) {
+        self.check_thread();
+        match &self.runner {
+            SelectedRunner::Ndarray(r) => r.seed(seed),
+            #[cfg(feature = "wgpu")]
+            SelectedRunner::Wgpu(r) => r.seed(seed),
+            #[cfg(feature = "cuda")]
+            SelectedRunner::Cuda(r) => r.seed(seed),
+        }
+    }
+
+    /// See [`ComputeRunner::inject_device_fault`] (the deferred-error test seam).
+    pub fn inject_device_fault(&mut self, reason: impl Into<String>) {
+        self.check_thread();
+        match &mut self.runner {
+            SelectedRunner::Ndarray(r) => r.inject_device_fault(reason),
+            #[cfg(feature = "wgpu")]
+            SelectedRunner::Wgpu(r) => r.inject_device_fault(reason),
+            #[cfg(feature = "cuda")]
+            SelectedRunner::Cuda(r) => r.inject_device_fault(reason),
+        }
+    }
+}
+
+/// Run a device bring-up closure under `catch_unwind` with the panic hook silenced (the probe
+/// idiom this crate already uses): cubecl panics on a missing/failed adapter, and that panic
+/// must surface as a typed error on the guest thread — never a host abort.
+#[cfg(any(feature = "wgpu", feature = "cuda"))]
+fn catch_bringup<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Result<T, String> {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let res = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev);
+    res.map_err(|payload| {
+        payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "device bring-up panicked".to_string())
+    })
+}
+
 /// Minimal blocking executor for the runner's readback future. A synchronous backend's
 /// `read_tensor_async` future is always immediately `Ready`, so this never spins in practice;
 /// device backends complete when the queue drains.
@@ -390,5 +691,72 @@ fn block_on<F: core::future::Future>(fut: F) -> F::Output {
             Poll::Ready(v) => return v,
             Poll::Pending => core::hint::spin_loop(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CPU arm builds unconditionally, dispatches on the constructing thread, and holds no
+    /// device slot (many CPU instances may coexist — the whole tier-1 test matrix relies on it).
+    #[test]
+    fn cpu_host_compute_builds_and_serves_without_a_device_slot() {
+        let cfg = crate::runtime::EngineConfig::default();
+        let mut a = HostCompute::build(&cfg).expect("cpu arm always available");
+        let mut b = HostCompute::build(&cfg).expect("a second CPU instance is unbounded");
+        assert!(
+            !DeviceComputeGuard::is_held(),
+            "CPU arms take no device slot"
+        );
+
+        // The runner surface round-trips through the selection layer (import → fence → read).
+        let data = TensorData::new(vec![1.0f32, 2.0, 3.0], [3usize]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&data, &mut cbor).expect("tensor data encodes");
+        a.import_tensor(1, &cbor).expect("import");
+        a.fence().expect("clean fence");
+        let ir = TensorIr {
+            id: TensorId::new(1),
+            shape: burn_backend::Shape::from(vec![3usize]),
+            status: TensorStatus::ReadOnly,
+            dtype: burn_backend::DType::F32,
+        };
+        let mut ir_cbor = Vec::new();
+        ciborium::into_writer(&ir, &mut ir_cbor).expect("ir encodes");
+        let out = a.read_tensor(&ir_cbor).expect("readback");
+        let round: TensorData = ciborium::from_reader(out.as_slice()).expect("decodes");
+        assert_eq!(round.to_vec::<f32>().expect("f32"), vec![1.0f32, 2.0, 3.0]);
+
+        // The deferred-error latch rides the selection layer: injected fault surfaces at the
+        // next fence, typed, exactly once.
+        b.inject_device_fault("selection-layer injected fault");
+        let err = b.fence().expect_err("latched fault surfaces at the fence");
+        assert!(matches!(err, ComputeError::Device(_)));
+        b.fence().expect("the fault surfaced exactly once");
+    }
+
+    /// The process device-compute slot: one live holder; a second acquire refuses typed; the
+    /// slot releases on drop. (One test owns the whole lifecycle — the slot is process-global,
+    /// so splitting these assertions across tests would race the parallel harness.)
+    #[test]
+    fn device_compute_slot_is_single_holder_and_releases_on_drop() {
+        let first = DeviceComputeGuard::acquire().expect("free slot acquires");
+        assert!(DeviceComputeGuard::is_held());
+        let second = DeviceComputeGuard::acquire();
+        assert!(second.is_err(), "a second live device instance must refuse");
+        drop(first);
+        assert!(!DeviceComputeGuard::is_held());
+        let again = DeviceComputeGuard::acquire().expect("released slot re-acquires");
+        drop(again);
+    }
+
+    /// The CPU/ndarray rungs are always available (the availability probe is the runtime half
+    /// of the selection ladder; the device rungs are exercised on hardware lanes).
+    #[test]
+    fn cpu_rungs_are_always_available() {
+        assert!(backend_available(crate::runtime::BackendKind::Cpu).is_ok());
+        #[cfg(feature = "burn-ndarray")]
+        assert!(backend_available(crate::runtime::BackendKind::BurnNdarray).is_ok());
     }
 }
