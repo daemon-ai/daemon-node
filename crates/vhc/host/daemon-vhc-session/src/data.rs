@@ -3,6 +3,12 @@
 
 //! The pre-tokenized shard data pipeline (spec §8) + `BatchId` mapping (§6.3).
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): this legacy JSON-manifest corpus
+//! pipeline feeds the retained `RoundEngine` and the harness suites only. The production corpus
+//! contract is chunk-addressed — shards are named by their committed chunk-map fold identity,
+//! fetched through `data@2`, and chunk-verified by the run pump — and no production path reads
+//! `manifest.json`.
+//!
 //! Corpora are pre-tokenized offline into fixed-width shards (u16/u32 token streams); a
 //! [`Manifest`] (`manifest.json`) lists the shards, their sizes, token counts, and a blake3 per
 //! shard. Peers map [`BatchId`] intervals to `(shard, offset)` **purely locally** ([`Manifest::locate`])
@@ -184,7 +190,7 @@ impl Manifest {
 
     /// The set of shard indices covering the sequence window `[start_seq, start_seq + seq_count)`,
     /// wrapping modulo [`Manifest::total_sequences`] (a peer stages **only** these shards — the §8
-    /// RAM-bounded windowing, P3 lane S). `seq_count == 0` (or `>= total`) means the whole corpus.
+    /// RAM-bounded windowing, the fleet artifact-distribution path). `seq_count == 0` (or `>= total`) means the whole corpus.
     ///
     /// `start_seq` is taken modulo the total, matching [`Corpus::sequence`]'s wrap. A window that
     /// runs off the end wraps to the front (two contiguous ranges), so a run whose data cursor wraps
@@ -399,7 +405,7 @@ impl SyntheticCorpus {
 pub struct Corpus {
     manifest: Manifest,
     /// One slot per manifest shard. `Some` = resident bytes; `None` = not staged (a **windowed**
-    /// corpus stages only the shards its assignment touches — P3 lane S). A fully-resident corpus
+    /// corpus stages only the shards its assignment touches — the fleet artifact-distribution path). A fully-resident corpus
     /// (`from_parts`/`synthetic`) has every slot `Some`.
     shards: Vec<Option<Vec<u8>>>,
 }
@@ -428,7 +434,7 @@ impl Corpus {
     }
 
     /// Build a **windowed** corpus: a validated manifest plus only the shards a peer has staged
-    /// (`resident`: shard-index → bytes) — the P3 lane-S fetch-only-assigned-shards path (spec §8).
+    /// (`resident`: shard-index → bytes) — the fetch-only-assigned-shards distribution path (spec §8).
     /// Each resident shard is blake3-verified against its [`ShardDesc`]; a non-resident shard is left
     /// `None` and addressing it via [`Corpus::sequence`] is a typed [`DataError::ShardNotResident`]
     /// (never a silent NaN). Use [`Manifest::shards_covering`] to compute which indices to stage.

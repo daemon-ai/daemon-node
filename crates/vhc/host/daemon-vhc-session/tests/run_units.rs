@@ -2,13 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // TDD §3.3 RUN-6/7 — checkpoint registration + desync→resync (spec §9, §6.4). Completes the named
-// IDs on top of the P1 checkpoint save/load + replay fold: two-checkpointer both-match registration
+// IDs on top of the earlier checkpoint save/load + replay fold: two-checkpointer both-match registration
 // and single-uploader degraded mode (RUN-6), fp32-exact checkpoint roundtrip (RUN-6), the
 // digest-mismatch → replay-resync recovery (RUN-7), and the retention-floor decision that sends a
 // too-old desync to an epoch rejoin instead of a replay (RUN-7). RUN-10's staged-assess prescreen +
 // manifest-cadence checks are unit-tested in `daemon_vhc_session::assess`.
 //
-// Oracle provenance (swarm-ledger-p2-b1.md): from-definition — the StubBackend outer step is
+// Oracle provenance (archived in the engineering ledgers under docs/specs/): from-definition —
+// the StubBackend outer step is
 // deterministic + record-ordered, so resync replay recovering the in-sync digest is a bit-exact
 // property; registration/retention are pure decision functions asserted directly.
 
@@ -190,7 +191,7 @@ fn worker_rejoin_via_checkpoint_reaches_consensus_fresh_state_does_not() {
     //     `RoundEngine::resume_from_checkpoint`) reloads the latest checkpoint and replays the missed
     //     committed sets in record order, recovering the EXACT consensus digest (§9 I1).
     //
-    // Wiring real resync into the live worker rejoin (design note, swarm-ledger-p2-b4.md) is what
+    // Wiring real resync into the live worker rejoin (an archived design note under docs/specs/) is what
     // makes the gate's churn drill assert byte-identity across a rejoin, not merely "the run finishes".
     let sets = [
         [staged(1, b"r0-a"), staged(2, b"r0-b")],

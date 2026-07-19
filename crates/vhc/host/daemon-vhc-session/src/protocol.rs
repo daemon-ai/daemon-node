@@ -659,8 +659,8 @@ pub struct EngineParams {
     pub checkpoint_every_rounds: u32,
     /// §9 resync-replay window: the payload-retention floor (rounds) a rejoining peer may replay
     /// forward from the latest checkpoint. A desync/rejoin gap wider than this waits for the next
-    /// epoch checkpoint instead (`plan_resync`). Additive (R, P3): `#[serde(default)]` keeps
-    /// pre-P3 credential buffers decodable; `0` ⇒ unbounded (replay whatever is retained).
+    /// epoch checkpoint instead (`plan_resync`). Additive field: `#[serde(default)]` keeps
+    /// credential buffers minted before it existed decodable; `0` ⇒ unbounded (replay whatever is retained).
     #[serde(default)]
     pub payload_retention_rounds: u64,
     /// §7.3 receive-side per-peer payload cap in bytes (`0` = uncapped) — the worker mirrors the DO
@@ -702,7 +702,8 @@ pub struct JoinCredentials {
     #[serde(default)]
     pub iroh: Option<IrohCredentials>,
     /// Optional presign base for the `R2Store` payload plane (e.g.
-    /// `http://127.0.0.1:8795/api/v1/vhc`). Absent ⇒ `FsPayloadStore` fallback (tests / LAN).
+    /// `http://127.0.0.1:8795/api/v1/vhc`). Absent ⇒ the content-addressed `FsContentStore`
+    /// fallback under the node-delivered run dir (tests / LAN).
     #[serde(default)]
     pub presign_base: Option<String>,
     /// The engine + corpus knobs.
@@ -1443,8 +1444,8 @@ mod tests {
         assert!(SessionCredentials::from_bytes(&[]).is_err());
     }
 
-    /// `engine_params_payload_retention_is_additive_back_compatible`: the P3 (R) field
-    /// `payload_retention_rounds` is additive. A pre-P3 `EngineParams` (a CBOR map WITHOUT the
+    /// `engine_params_payload_retention_is_additive_back_compatible`: the resync-work field
+    /// `payload_retention_rounds` is additive. An older `EngineParams` (a CBOR map WITHOUT the
     /// field) still decodes, defaulting to `0` (unbounded) — keeping A3's back-compat contract
     /// (a non-decoding-in-full buffer never regresses existing joiners).
     #[test]

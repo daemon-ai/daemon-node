@@ -3,6 +3,12 @@
 
 //! [`FsPayloadStore`] — a filesystem [`PayloadStore`] rooted at a directory.
 //!
+//! **HARNESS-ERA — coordinate-keyed.** This store implements the engine-era `(run, round, peer)`
+//! plane the retained `RoundEngine` orbit consumes (all `harness`-gated in the session crate);
+//! the production filesystem plane is the content-addressed
+//! [`FsContentStore`](crate::content_store::FsContentStore) (objects keyed by blake3 alone),
+//! which is what the role session's providers bind.
+//!
 //! The local-mode stand-in for the `r2` / `iroh-blobs` payload planes (§7.1): objects live under a
 //! `<run>/<round>/<peer>.bin` layout beneath a [`ContainedRoot`], so peer-supplied key components
 //! (run id, peer pubkey) can never escape the store root (openat2 RESOLVE_BENEATH|NO_SYMLINKS —

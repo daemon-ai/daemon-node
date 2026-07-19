@@ -1,0 +1,528 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+//! The run lifecycle: journal the run header, spawn the dedicated guest thread (one OS thread
+//! per role-instance, §11.1), instantiate against the per-world linker, drive
+//! `da_init` → (`da_migrate` under the §10.2 budget on a migrating instance) → `da_run`, and
+//! journal the terminal fact — plus the wasmtime-error → typed-trap mapping (§7.6).
+
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Instant;
+
+use wasmtime::{Linker, Module, Store, StoreLimitsBuilder};
+
+use daemon_vhc_abi::{NS_COMPUTE_V2, NS_TABI_V1};
+use daemon_vhc_proto::{peer_id, SigningKey};
+
+use crate::run::buffer::BufferTable;
+use crate::run::driver::config::{MigrationInput, RunConfig, RunEnd, RunError};
+use crate::run::driver::host::{derive_rng_seed, Host, SliceState};
+use crate::run::driver::linker::link_v2;
+use crate::run::driver::migration::build_migration_descriptor;
+use crate::run::driver::pump::{PumpHandle, PumpShared, PumpState};
+use crate::run::journal::{JournalSink, SinkError};
+use crate::run::ops::OpTable;
+use crate::run::streams::StreamTable;
+use crate::runtime::{EngineConfig, Worker};
+use crate::trap::{Trap, TrapCode};
+
+/// A live v2 run: the embedder handle plus the guest thread's join handle.
+pub struct Run {
+    /// The embedder's event/staging/egress handle.
+    pub pump: PumpHandle,
+    thread: JoinHandle<Result<RunEnd, RunError>>,
+}
+
+impl Run {
+    /// Join the guest thread and return how the run ended. The guest thread has already dropped
+    /// the `Store` (guest-thread-owned teardown, §11.3) and journaled the terminal fact.
+    ///
+    /// # Errors
+    /// [`RunError`] for setup/journaling failures (a trap is a [`RunEnd::Trapped`], not an error).
+    pub fn wait(self) -> Result<RunEnd, RunError> {
+        self.thread
+            .join()
+            .map_err(|_| RunError::Sandbox("guest thread panicked".into()))?
+    }
+
+    /// Whether the guest thread has ended (non-blocking): the upgrade transaction's migrate step
+    /// polls this to distinguish "migrated and running" from "tore down before `da_run`"
+    /// (`InitRefused`/`MigrateRefused`/trapped) without consuming the run.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+}
+
+/// Start a major-2 run instance: journal the run header, spawn the dedicated guest thread,
+/// instantiate with the real Phase-A capability providers, run `da_init` then `da_run` (§3.1,
+/// §9.4 steps 10–12), journaling throughout.
+///
+/// The caller has already run ABI §1.3 selection (`select_driver` → `CandidateDriver::V2`).
+/// A module importing the retired `tabi@1` bridge is refused typed ([`RunError::BridgeRetired`]).
+///
+/// # Errors
+/// [`RunError`] on setup/journal failure. Guest traps and init refusals are [`RunEnd`]s.
+pub fn start_run(
+    worker: &Worker,
+    wasm: &[u8],
+    run: RunConfig,
+    sink: Box<dyn JournalSink>,
+) -> Result<Run, RunError> {
+    start_run_migrating(worker, wasm, run, sink, None)
+}
+
+/// [`start_run`] with an optional **migration input** (ABI §10.3 step 4): when `migration` is
+/// `Some`, the instantiation record is journaled as tag-13 **reason 2** (upgrade-activation),
+/// the snapshot's sections are staged host-side after `da_init`, and `da_migrate(descriptor)`
+/// runs under its explicit budget before `da_run`. A non-`Ready` return tears the instance down
+/// as [`RunEnd::MigrateRefused`] (the transaction's validate failure — roll back, §10.3 step 7);
+/// budget exhaustion inside `da_migrate` traps the typed `MigrateBudget`.
+///
+/// # Errors
+/// [`RunError`] on setup/journal failure. Guest traps, init refusals, and migrate refusals are
+/// [`RunEnd`]s.
+pub fn start_run_migrating(
+    worker: &Worker,
+    wasm: &[u8],
+    run: RunConfig,
+    mut sink: Box<dyn JournalSink>,
+    migration: Option<MigrationInput>,
+) -> Result<Run, RunError> {
+    let module =
+        Module::new(worker.engine(), wasm).map_err(|e| RunError::Sandbox(e.to_string()))?;
+    // The retired compute bridge: any tabi@1 import is refused typed here as well as at the
+    // §1.3 front door (`validate_imports`), so a caller that skips selection still never links
+    // or runs a bridge module.
+    if module.imports().any(|i| i.module() == NS_TABI_V1) {
+        return Err(RunError::BridgeRetired(
+            "the module imports the retired tabi@1 compute bridge — compute crosses the \
+             boundary through compute@2 only"
+                .to_string(),
+        ));
+    }
+    // The compute@2 command queue (track C1, ABI §15): a per-instance runner over the ADMITTED
+    // backend, constructed only for modules that import the world.
+    let compute = module.imports().any(|i| i.module() == NS_COMPUTE_V2);
+
+    let engine_cfg: EngineConfig = worker.config().clone();
+    // Backend claim revalidation at run start (fail fast, BEFORE the run header is journaled):
+    // the admitted backend must still be servable — feature compiled AND the runtime probe
+    // passing AND (device lanes) the process device-compute slot free. Unavailability is the
+    // typed refusal, never a silent ndarray run. The guest-thread construction below stays the
+    // authoritative backstop for the race window (a device dying between this check and
+    // bring-up surfaces as a typed compute fault, classified recoverable).
+    if compute {
+        crate::compute::backend_available(engine_cfg.backend)
+            .map_err(RunError::BackendUnavailable)?;
+        if engine_cfg.backend.is_device() && crate::compute::DeviceComputeGuard::is_held() {
+            return Err(RunError::BackendUnavailable(
+                "a device-backed compute instance is already live in this process (one \
+                 device-compute instance per process)"
+                    .to_string(),
+            ));
+        }
+    }
+    let abi_packed = u64::from(daemon_vhc_abi::DA_ABI_MAJOR_V2) << 16;
+    let worlds: Vec<(String, u64)> = module
+        .imports()
+        .map(|i| (i.module().to_string(), 0u64))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    // tag 0 first — the run header precedes everything (§8.3). The header's `bridge` field is
+    // keep-reserved (always `false`: no bridge exists; the field stays so the record grammar is
+    // unchanged and pre-existing journals stay parseable).
+    sink.run_header(
+        abi_packed,
+        &worlds,
+        false,
+        &run.manifest_bytes,
+        &run.config,
+        &run.grants,
+        &run.claim_bytes,
+        &run.channels_bytes,
+        &run.device_bytes,
+    )?;
+
+    let shared = Arc::new(PumpShared {
+        state: Mutex::new(PumpState {
+            queue: VecDeque::new(),
+            timers: Vec::new(),
+            next_timer_id: 1,
+            staged: std::collections::BTreeMap::new(),
+            next_host_staging_id: 1,
+            next_guest_staging_id: 1,
+            sink,
+            timer_depth: run.advisory_depth,
+            payload_depth: run.payload_depth,
+            gossip_depth: run.gossip_depth,
+            spool_frames: run.spool_frames,
+            per_sender_quota: run.per_sender_quota,
+            auth_spooled: 0,
+            auth_per_sender: std::collections::HashMap::new(),
+            spool_exhausted_reported: false,
+            gossip_arrivals: std::collections::HashMap::new(),
+            metrics: Vec::new(),
+            logs: Vec::new(),
+            published: Vec::new(),
+            // Generation-seeded by the instantiation counter (0: this driver instantiates once
+            // per start_run; trap-restart re-seeding rides the tag-13 counter, ABI §7.1).
+            buffers: BufferTable::new(0, run.max_live_buffer_handles, run.max_live_buffer_bytes),
+            ops: OpTable::new(0, run.max_outstanding_ops),
+            chunk_maps: std::collections::HashMap::new(),
+            data_read_budget: run.data_read_budget_bytes,
+            data_read_used: 0,
+            streams: StreamTable::new(0),
+            op_requests: Vec::new(),
+            stop_enqueued: false,
+            stop_cut: None,
+            draining: false,
+            drain_deadline_at: None,
+            accepted_snapshot: None,
+            egress_hook: None,
+            migrate_validated: false,
+        }),
+        wake: Condvar::new(),
+        t0: Instant::now(),
+        hold: AtomicBool::new(false),
+    });
+    let pump = PumpHandle {
+        shared: shared.clone(),
+    };
+
+    let mut linker: Linker<Host> = Linker::new(worker.engine());
+    link_v2(&mut linker).map_err(|e| RunError::Sandbox(e.to_string()))?;
+
+    let signing = SigningKey::from_bytes(&run.signing_seed);
+    let sender = peer_id(&signing).0;
+    let epoch_ticks = worker.epoch_ticks_pub();
+    let engine = worker.engine().clone();
+
+    let thread = std::thread::Builder::new()
+        .name(format!(
+            "vhc-guest-{}-{}",
+            run.identity.role, run.identity.instance
+        ))
+        .spawn(move || -> Result<RunEnd, RunError> {
+            // Construct the compute runner ON THIS THREAD (the pinned device thread): GPU
+            // backends derive their stream + memory-pool registry from the constructing thread
+            // and are driven single-threaded — every compute@2 import is a synchronous host
+            // call on this same thread, so affinity holds for the instance's lifetime. A
+            // bring-up failure here (the race the pre-spawn check cannot close: the device died
+            // in between) is a typed compute fault, journaled terminal — classified recoverable
+            // by the session, never a silent CPU run and never a host abort.
+            let compute_runner = if compute {
+                match crate::compute::HostCompute::build(&engine_cfg) {
+                    Ok(runner) => {
+                        // Host-side RNG (Float/Random ops) seeded deterministically from the
+                        // identity-derived seed: two runs of one incarnation reproduce it, and
+                        // replay never re-runs kernels anyway (kind-5 records feed readbacks).
+                        let seed_bytes = derive_rng_seed(&run.identity);
+                        runner.seed(u64::from_le_bytes(
+                            seed_bytes[..8].try_into().expect("8-byte slice"),
+                        ));
+                        Some(runner)
+                    }
+                    Err(reason) => {
+                        let trap = Trap::bare(
+                            TrapCode::ComputeFault,
+                            format!(
+                                "backend unavailable at device bring-up ({}): {reason}",
+                                engine_cfg.backend.slug()
+                            ),
+                        );
+                        journal_terminal_trap(&shared, &trap)?;
+                        return Ok(RunEnd::Trapped(trap));
+                    }
+                }
+            } else {
+                None
+            };
+            let host = Host {
+                shared: shared.clone(),
+                limits: StoreLimitsBuilder::new()
+                    .memory_size(engine_cfg.max_memory_bytes)
+                    .build(),
+                trap: None,
+                slice: SliceState {
+                    in_init: false,
+                    in_migrate: false,
+                    stopped: false,
+                    draining: false,
+                    now: shared.now_ms(),
+                    op_calls: 0,
+                    readback_bytes: 0,
+                    pending_next: None,
+                    pending_readback: None,
+                    pending_readback_value: None,
+                    pending_device: None,
+                },
+                fuel_per_slice: engine_cfg.fuel_per_call,
+                op_budget: engine_cfg.op_budget,
+                epoch_ticks,
+                max_readback_bytes: run.max_readback_bytes_per_slice,
+                max_frame_bytes: run.max_frame_bytes,
+                hard_accountable_host_bytes: run.hard_accountable_host_bytes,
+                accountable_staged_bytes: 0,
+                migration_max_sections: run.migration_max_sections,
+                migration_max_section_bytes: run.migration_max_section_bytes,
+                migration_restore: migration.as_ref().is_some_and(|m| m.restore),
+                compute: compute_runner,
+                compute_queue_depth: run.compute_queue_depth,
+                compute_ops_since_fence: 0,
+                compute_fault_after_ops: run.compute_fault_after_ops,
+                compute_ops_total: 0,
+                signing,
+                rng_seed: derive_rng_seed(&run.identity),
+                device_bytes: run.device_bytes.clone(),
+                granted_artifacts: run.granted_artifacts.clone(),
+                identity: run.identity.clone(),
+                sender,
+            };
+            let mut store = Store::new(&engine, host);
+            store.limiter(|s| &mut s.limits);
+            store
+                .set_fuel(engine_cfg.fuel_per_call)
+                .map_err(|e| RunError::Sandbox(e.to_string()))?;
+            store.set_epoch_deadline(epoch_ticks);
+
+            let instance = linker
+                .instantiate(&mut store, &module)
+                .map_err(|e| RunError::Sandbox(format!("v2 instantiation: {e}")))?;
+
+            // tag 13 at instantiation, before any guest code (§8.3/§10.3): counter 0; reason 0
+            // (initial) — or reason 2 (upgrade-activation) on a migrating instance, journaled at
+            // instantiation, BEFORE `da_init`/`da_migrate` (§10.3 step 4, never deferred).
+            let inst_at = shared.now_ms();
+            {
+                let mut st = shared.state.lock().expect("pump lock");
+                let reason = if migration.is_some() { 2 } else { 0 };
+                st.sink.instantiation(0, reason, inst_at)?;
+            }
+            store.data_mut().slice.now = inst_at;
+
+            // Write the admitted config + grants via da_alloc (outside import context, §2.4).
+            let write_span = |store: &mut Store<Host>, bytes: &[u8]| -> Result<u32, RunError> {
+                if bytes.is_empty() {
+                    return Ok(0);
+                }
+                let alloc = instance
+                    .get_typed_func::<(u32, u32), u32>(&mut *store, "da_alloc")
+                    .map_err(|_| RunError::Sandbox("missing da_alloc".into()))?;
+                let ptr = alloc
+                    .call(&mut *store, (bytes.len() as u32, 1))
+                    .map_err(|e| RunError::Sandbox(format!("da_alloc: {e}")))?;
+                if ptr == 0 {
+                    return Err(RunError::Sandbox("da_alloc returned 0".into()));
+                }
+                let mem = instance
+                    .get_memory(&mut *store, "memory")
+                    .ok_or_else(|| RunError::Sandbox("no exported memory".into()))?;
+                mem.write(&mut *store, ptr as usize, bytes)
+                    .map_err(|e| RunError::Sandbox(format!("config write: {e}")))?;
+                Ok(ptr)
+            };
+            let cfg_ptr = write_span(&mut store, &run.config)?;
+            let grants_ptr = write_span(&mut store, &run.grants)?;
+
+            // da_init — once, on the run instance, imports illegal inside it (§3.1/§6.6).
+            store.data_mut().slice.in_init = true;
+            let da_init = instance
+                .get_typed_func::<(u32, u32, u32, u32), u32>(&mut store, "da_init")
+                .map_err(|_| RunError::Sandbox("missing/mis-typed da_init".into()))?;
+            let init_status = match da_init.call(
+                &mut store,
+                (
+                    cfg_ptr,
+                    run.config.len() as u32,
+                    grants_ptr,
+                    run.grants.len() as u32,
+                ),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let trap = take_trap(&mut store, e);
+                    journal_terminal_trap(&shared, &trap)?;
+                    return Ok(RunEnd::Trapped(trap));
+                }
+            };
+            store.data_mut().slice.in_init = false;
+            {
+                let mut st = shared.state.lock().expect("pump lock");
+                st.sink.init(
+                    *blake3::hash(&run.config).as_bytes(),
+                    *blake3::hash(&run.grants).as_bytes(),
+                    u64::from(init_status),
+                )?;
+            }
+            if init_status != 0 {
+                // Journal, tear down, refuse the join (§9.4 step 11). Store drops on this thread.
+                return Ok(RunEnd::InitRefused(init_status));
+            }
+
+            // -- the migrate step (§10.3 steps 4–5), on a migrating instance only ----------------
+            if let Some(mig) = &migration {
+                // Stage the snapshot's sections host-side under kind-3 staging IDs; the restore
+                // IDs travel IN the descriptor (§10.2 — the module is not in `da_run` and sees
+                // no PayloadReady).
+                let bindings: Vec<(String, u64)> = {
+                    let mut st = shared.state.lock().expect("pump lock");
+                    mig.capture
+                        .sections
+                        .iter()
+                        .map(|(name, bytes)| {
+                            let id = st.next_host_staging_id;
+                            st.next_host_staging_id += 1;
+                            st.staged.insert(
+                                id,
+                                (daemon_vhc_abi::STAGED_KIND_STATE_SECTION, bytes.clone()),
+                            );
+                            (name.clone(), id)
+                        })
+                        .collect()
+                };
+                let descriptor = build_migration_descriptor(&mig.capture.manifest, &bindings)
+                    .map_err(|e| RunError::Sandbox(format!("migration descriptor: {e}")))?;
+                let desc_ptr = write_span(&mut store, &descriptor)?;
+
+                let da_migrate = instance
+                    .get_typed_func::<(u32, u32), u32>(&mut store, "da_migrate")
+                    .map_err(|_| RunError::Sandbox("missing/mis-typed da_migrate".into()))?;
+                // The explicit bounded budget (§10.2): fuel + the epoch deadline; exceeding it is
+                // the typed `MigrateBudget` trap and the host rolls back.
+                store
+                    .set_fuel(mig.migrate_fuel.unwrap_or(engine_cfg.fuel_per_call))
+                    .map_err(|e| RunError::Sandbox(e.to_string()))?;
+                store.set_epoch_deadline(epoch_ticks);
+                store.data_mut().slice.in_migrate = true;
+                let migrate_status =
+                    match da_migrate.call(&mut store, (desc_ptr, descriptor.len() as u32)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let mut trap = take_trap(&mut store, e);
+                            // Budget exhaustion inside da_migrate is the typed MigrateBudget (§10.2).
+                            if matches!(trap.code, TrapCode::BudgetFuel | TrapCode::BudgetEpoch) {
+                                trap = Trap::new(
+                                    TrapCode::MigrateBudget,
+                                    "da_migrate",
+                                    None,
+                                    format!("migrate budget exhausted: {}", trap.detail),
+                                );
+                            }
+                            journal_terminal_trap(&shared, &trap)?;
+                            return Ok(RunEnd::Trapped(trap));
+                        }
+                    };
+                store.data_mut().slice.in_migrate = false;
+                store
+                    .set_fuel(engine_cfg.fuel_per_call)
+                    .map_err(|e| RunError::Sandbox(e.to_string()))?;
+                if migrate_status != daemon_vhc_abi::DA_MIGRATE_READY {
+                    // Validate failed (§10.3 step 5): journal the fact (a typed condition + the
+                    // forced-interruption terminal — the instance never entered da_run) and tear
+                    // down; the upgrade transaction rolls back and retries or leaves (step 7).
+                    let mut st = shared.state.lock().expect("pump lock");
+                    st.sink.condition(
+                        "MigrateIncompatible",
+                        &format!("da_migrate returned {migrate_status} (§10.2)"),
+                    )?;
+                    st.sink.terminal(
+                        2,
+                        None,
+                        Some((
+                            "MigrateIncompatible".to_string(),
+                            "da_migrate".to_string(),
+                            "da_migrate".to_string(),
+                            format!("da_migrate returned {migrate_status}"),
+                        )),
+                    )?;
+                    return Ok(RunEnd::MigrateRefused(migrate_status));
+                }
+                // Validate passed (§10.3 step 5): mark it embedder-visible — the upgrade
+                // transaction gates activation on this, not on module-specific egress — and
+                // wake any egress waiter.
+                {
+                    let mut st = shared.state.lock().expect("pump lock");
+                    st.migrate_validated = true;
+                    st.note_egress();
+                }
+            }
+
+            // da_run — exactly once; the module owns its loop from here (§3.1).
+            let da_run = instance
+                .get_typed_func::<(), u32>(&mut store, "da_run")
+                .map_err(|_| RunError::Sandbox("missing/mis-typed da_run".into()))?;
+            let run_result = da_run.call(&mut store, ());
+            {
+                let mut st = shared.state.lock().expect("pump lock");
+                // Force-reclaim the instance's buffers + outstanding ops + streams through the
+                // per-instance tables (architecture §3.4; ABI §7.3) — guest-thread-owned teardown.
+                st.buffers.clear();
+                st.ops.clear();
+                st.streams.clear();
+                st.op_requests.clear();
+            }
+            match run_result {
+                Ok(outcome) => {
+                    let mut st = shared.state.lock().expect("pump lock");
+                    st.sink.terminal(0, Some(u64::from(outcome)), None)?;
+                    Ok(RunEnd::Outcome(outcome))
+                }
+                Err(e) => {
+                    let trap = take_trap(&mut store, e);
+                    journal_terminal_trap(&shared, &trap)?;
+                    Ok(RunEnd::Trapped(trap))
+                } // `store` (instance, handle table, device allocations) drops HERE, on the guest
+                  // thread — the only thread allowed to (§11.3).
+            }
+        })
+        .map_err(|e| RunError::Sandbox(format!("guest thread spawn: {e}")))?;
+
+    Ok(Run { pump, thread })
+}
+
+/// Map a wasmtime error into the typed taxonomy: prefer the stashed host trap, else classify the
+/// engine trap (fuel/epoch/unreachable/oob), mirroring the v1 driver's mapping (§7.6).
+fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
+    if let Some(t) = store.data_mut().trap.take() {
+        return t;
+    }
+    let msg = e
+        .chain()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+    let low = msg.to_lowercase();
+    let code = if low.contains("fuel") {
+        TrapCode::BudgetFuel
+    } else if low.contains("epoch") {
+        TrapCode::BudgetEpoch
+    } else if low.contains("unreachable") {
+        TrapCode::GuestPanic
+    } else if low.contains("out of bounds") {
+        TrapCode::MemOob
+    } else if low.contains("memory") {
+        TrapCode::BudgetMemory
+    } else {
+        TrapCode::BadModule
+    };
+    Trap::bare(code, msg)
+}
+
+fn journal_terminal_trap(shared: &Arc<PumpShared>, trap: &Trap) -> Result<(), SinkError> {
+    let mut st = shared.state.lock().expect("pump lock");
+    st.sink.terminal(
+        1,
+        None,
+        Some((
+            trap.code.slug().to_string(),
+            trap.import.to_string(),
+            "da_run".to_string(),
+            trap.detail.clone(),
+        )),
+    )
+}

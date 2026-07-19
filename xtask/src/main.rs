@@ -127,7 +127,7 @@ enum Cmd {
         #[arg(long)]
         max_tokens: Option<u64>,
     },
-    /// Publish an experiment module to the payload store at `modules/<blake3>.wasm` (P3 lane S).
+    /// Publish an experiment module to the payload store at `modules/<blake3>.wasm` (the fleet artifact-distribution path).
     PublishModule {
         /// The `.wasm` module to upload.
         #[arg(long)]
@@ -148,7 +148,7 @@ enum Cmd {
         #[arg(long)]
         actor: Option<String>,
     },
-    /// Publish a pre-tokenized corpus (shards + manifest) to the payload store by content hash (P3 S).
+    /// Publish a pre-tokenized corpus (shards + manifest) to the payload store by content hash (the fleet artifact-distribution path).
     PublishCorpus {
         /// The `corpus-manifest.cbor` produced by `tokenize-corpus` (shards + tokenizer.json beside it).
         #[arg(long)]
@@ -306,7 +306,8 @@ fn build_guests() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to run cargo for the guests workspace: {e}"))?;
     anyhow::ensure!(status.success(), "building guests failed with {status}");
 
-    // Stale-guest guard (swarm-p1-ledger Merge-1 follow-on): write the committed blake3 manifest of
+    // Stale-guest guard (an archived engineering-ledger Merge-1 follow-on): write the committed
+    // blake3 manifest of
     // the built modules. The wasm-backed test harness asserts the module it loads matches this file,
     // so a stale/mismatched guest fails loud instead of surfacing downstream as a NaN loss.
     let manifest = write_guest_manifest(&guests)?;
@@ -931,6 +932,69 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         }
     }
 
+    // --- HARNESS QUARANTINE (source-level): the engine-era surfaces stay unmistakably
+    // harness-only. The RoundEngine orbit in the session crate (engine, checkpoint, upgrade,
+    // receipt, harness, replay_sandbox, coordinator_shell) plus the legacy JSON corpus pipeline
+    // (`data` — the production corpus contract is chunk-addressed), the host's coordinator drive
+    // seat, and the worker's in-process self-driven join must each sit directly behind their
+    // harness cfg gate. A module that loses its gate (or moves without updating this check)
+    // fails the gate from now on.
+    {
+        let session_gate = r#"#[cfg(any(test, feature = "harness"))]"#;
+        let worker_gate = r#"#[cfg(feature = "harness")]"#;
+        let checks: &[(&str, &str, &str, &[&str])] = &[
+            (
+                "daemon-vhc-session",
+                "crates/vhc/host/daemon-vhc-session/src/lib.rs",
+                session_gate,
+                &[
+                    "pub mod data;",
+                    "pub mod checkpoint;",
+                    "pub mod engine;",
+                    "pub mod upgrade;",
+                    "pub mod receipt;",
+                    "pub mod harness;",
+                    "pub mod replay_sandbox;",
+                    "pub mod coordinator_shell;",
+                ],
+            ),
+            (
+                "daemon-vhc-host",
+                "crates/vhc/host/daemon-vhc-host/src/lib.rs",
+                session_gate,
+                &["pub mod coordinator;"],
+            ),
+            (
+                "daemon-vhc-worker",
+                "crates/vhc/bins/daemon-vhc-worker/src/main.rs",
+                worker_gate,
+                &["mod session;"],
+            ),
+        ];
+        for (krate, path, gate, decls) in checks {
+            let src = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+            let lines: Vec<&str> = src.lines().map(str::trim).collect();
+            for decl in *decls {
+                match lines.iter().position(|l| l == decl) {
+                    None => violations.push(format!(
+                        "{krate}: `{decl}` not found in {path} — if the harness-era module \
+                         moved, move its quarantine check with it"
+                    )),
+                    Some(i) => {
+                        if i == 0 || lines[i - 1] != *gate {
+                            violations.push(format!(
+                                "{krate}: `{decl}` in {path} is not immediately preceded by \
+                                 `{gate}` — the engine-era surface must stay harness-gated \
+                                 (production builds route opaque frames and read chunk-addressed \
+                                 corpora only)"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // --- NEGATIVE ARCHITECTURE TEST: no production host crate can decode an SDK round message.
     // The structural form: the resolved DEFAULT-FEATURE normal dependency graph of each
     // production host crate (the worker binary above all) must not contain a schema crate. This
@@ -975,6 +1039,10 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         "  rule: no production host crate resolves a schema crate ({}) in its default normal \
          graph",
         SCHEMA_CRATES.join(", ")
+    );
+    println!(
+        "  rule: the engine-era surfaces (RoundEngine orbit, the legacy JSON corpus pipeline, \
+         the coordinator drive seats) stay harness-gated at their declaration sites"
     );
     println!("\nexempt harness/oracle tooling crates:");
     for (name, note) in EXEMPT_HARNESS_CRATES {

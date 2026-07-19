@@ -6,7 +6,8 @@
 //! This ports Psyche's verified gossip stack (reference pack, workspace
 //! `/home/j/experiments/decentralised-llm-training/psyche`) to the **iroh 1.0.2 / iroh-gossip
 //! 0.101.0** API the tree resolved (the plan pinned 0.97; iroh 0.97/0.98 are unresolvable against
-//! our frozen `sha2 0.11` tree — see `swarm-ledger-b2.md` for the full delta table). Every ported
+//! our frozen `sha2 0.11` tree — the full delta table is archived in the engineering ledgers
+//! under docs/specs/). Every ported
 //! shape cites its Psyche `file:line` anchor and records the 0.97 -> 1.0 delta inline.
 //!
 //! The plane carries **already-signed opaque bytes** — signing/verification is proto's surface
@@ -222,7 +223,8 @@ impl IrohGossip {
             })
             .spawn(endpoint.clone());
 
-        // Router accepts only the gossip ALPN — no blobs (P4), no model-sharing. Psyche
+        // Router accepts only the gossip ALPN — no blobs (a future network-plane concern), no
+        // model-sharing. Psyche
         // `router.rs:32-46` accepts three; we accept one.
         let router = Router::builder(endpoint.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())

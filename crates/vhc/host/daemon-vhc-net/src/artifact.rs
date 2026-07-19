@@ -37,7 +37,7 @@ use crate::VhcNetError;
 /// The transport scheme of an artifact URL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtifactScheme {
-    /// `file://` — a local absolute path (wired this wave).
+    /// `file://` — a local absolute path (the one scheme the resolver serves).
     File,
     /// `r2://` — a presigned R2/S3 object (reserved; awaits the egress plane).
     R2,
@@ -69,7 +69,7 @@ impl ArtifactScheme {
 /// One entry of the envelope artifact map: a URL plus the blake3 it must hash to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactRef {
-    /// The source URL (`file://…` this wave).
+    /// The source URL (`file://…` until the egress plane lands).
     pub url: String,
     /// The blake3 the fetched bytes must match (content addressing, §8/§12).
     pub blake3: ContentHash,

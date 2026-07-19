@@ -3,6 +3,11 @@
 
 //! [`RoundEngine`] — the peer-side round state machine (spec §6.4; TDD RUN-1..5, RUN-8).
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): the engine decodes SDK round
+//! schemas, so it lives behind the `harness` feature with its orbit (checkpoint, upgrade,
+//! coordinator shell, replay sandbox, harness). The production session surface routes opaque
+//! signed frames only — no default build links a round schema (dep-check-enforced).
+//!
 //! One async state machine drives a single peer through rounds over the frozen seams —
 //! [`ControlPlane`] + [`PayloadStore`] (net) and [`TrainerBackend`] (run) + the node ed25519
 //! [`SigningKey`] (proto). It consumes the seven signed round messages and emits an
@@ -86,9 +91,9 @@ pub async fn fetch_record_set<P: PayloadStore + ?Sized>(
     Ok(set)
 }
 
-/// Per-round batch assignment: P2's throughput-weighted deterministic split (§6.3, PROTO-8).
+/// Per-round batch assignment: the throughput-weighted deterministic split (§6.3, PROTO-8).
 ///
-/// Merge 2 resolved the R2 `// MERGE-2` marker here by swapping the equal-split placeholder for
+/// Merge 2 resolved the `// MERGE-2` marker here by swapping the equal-split placeholder for
 /// `assign_batches` — the single pure authority the coordinator and
 /// every peer re-derive byte-identically from `(round_seed, roster, window)` (in
 /// `daemon-vhc-sdk-consensus` from D0; the proto is algorithm-free). The MVP StubBackend
@@ -202,7 +207,7 @@ pub enum EngineEvent {
         /// The coordinator-facing pointer to the typed manifest (`blake3` = its content address).
         pointer: CheckpointManifest,
     },
-    /// **Additive (R, P3).** This (rejoining) peer replayed one retained round forward from the
+    /// **Additive (resync work).** This (rejoining) peer replayed one retained round forward from the
     /// latest checkpoint during a live resync (§9 I1). Emitted per replayed round by
     /// [`RoundEngine::resync_from_checkpoint`]. (The retired v1 live-attach forwarder used to
     /// surface this as a `protocol::Event::ResyncProgress` wire frame; that producer-less variant
@@ -374,7 +379,7 @@ where
         Ok(())
     }
 
-    /// **Live checkpoint-resync (§9 I1; R, P3).** Reload the latest checkpoint into the backend, then
+    /// **Live checkpoint-resync (§9 I1; resync work).** Reload the latest checkpoint into the backend, then
     /// replay `steps` (the retained rounds' committed sets, in record order) forward — recovering the
     /// exact post-`target` consensus state a survivor holds. Marks each replayed round ingested
     /// (`last_ingested`), so the subsequent [`RoundEngine::run`] loop **skips** any buffered
@@ -606,7 +611,7 @@ where
     /// enqueue it, and try to ingest as far as the queue allows (in order). If `r` itself cannot be
     /// ingested yet (its set — or an earlier round's — is unfetchable), enter the stall ladder.
     async fn on_round_record(&mut self, rr: &RoundRecord) -> Result<(), VhcRunError> {
-        // Resync-composability guard (R, P3): a rejoining peer that replayed retained rounds from a
+        // Resync-composability guard: a rejoining peer that replayed retained rounds from a
         // checkpoint (`resync_from_checkpoint`) has already ingested every round up to
         // `last_ingested`. A buffered / late `RoundRecord` at or below that watermark must NOT be
         // re-ingested (a double outer-step would diverge the digest). On the normal monotonic path

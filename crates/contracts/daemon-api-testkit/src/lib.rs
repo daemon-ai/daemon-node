@@ -245,7 +245,7 @@ impl FailSwitches {
 
 /// An in-memory reference [`MessagingProtocol`] implementing **every** optional feature trait, with
 /// per-verb [`FailSwitches`]. The daemon analogue of libpurple's non-empty `Test*` fixtures: it
-/// advertises all verbs supported and each verb succeeds unless its switch is flipped. Wave-2
+/// advertises all verbs supported and each verb succeeds unless its switch is flipped. Later
 /// packages build feature tests on top of this.
 #[derive(Debug, Default)]
 pub struct FakeProtocol {

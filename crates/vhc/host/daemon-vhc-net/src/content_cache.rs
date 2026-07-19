@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! [`ContentCache`] — a blake3-keyed, on-disk, size-bounded content cache (P3 lane S, spec §8/§10.6).
+//! [`ContentCache`] — a blake3-keyed, on-disk, size-bounded content cache for the fleet
+//! artifact-distribution path (spec §8/§10.6).
 //!
-//! The P2 gate **pre-staged** the experiment `.wasm` (and used a synthetic corpus) onto every fleet
-//! box. Lane S removes that: the worker fetches the module + its assigned corpus shards **by content
+//! The hardware-validation gate **pre-staged** the experiment `.wasm` (and used a synthetic corpus)
+//! onto every fleet box. The fleet artifact-distribution path removes that: the worker fetches the
+//! module + its assigned corpus shards **by content
 //! hash** from the payload store and caches them here, so a box warmed once never re-downloads (a GB
 //! artifact is fetched exactly once per content hash, across runs and process restarts).
 //!
@@ -303,7 +305,7 @@ mod tests {
         );
     }
 
-    /// The end-to-end fetch-by-hash distribution path (P3 lane S): a module published at the
+    /// The end-to-end fetch-by-hash fleet distribution path: a module published at the
     /// content-addressed key `modules/<blake3>.wasm` is fetched via a presigned GET + blake3-verified
     /// by [`ArtifactResolver`], cached here, and served from cache on the second fetch — even after
     /// the object is evicted server-side (the fleet-warm property).

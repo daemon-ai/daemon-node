@@ -4,6 +4,10 @@
 //! The coordinator recording drive for the in-process whole-run harness (architecture §4.1,
 //! §6.2; spec §6.4 I1).
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): decodes coordinator round
+//! decisions (SDK schemas) to record a run, so it rides the `harness` seat; a production node
+//! routes the same frames opaquely.
+//!
 //! Consensus is a wasm module, not a native host service — so the harness records a run by driving
 //! the production `coordinator-quorum` module (the same content-addressed blob the replay oracle
 //! re-derives through), never a native `tick`. The module owns a deterministic logical clock (one

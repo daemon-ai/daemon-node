@@ -6,7 +6,8 @@
 // staleness + the K-record-absence drop counter + the straggle stall-window exemption; PROTO-9:
 // the epoch boundary at `epoch_rounds`; PROTO-10: deterministic single-checkpointer election.
 //
-// Oracle provenance (swarm-ledger-p2-b1.md): from-definition — the `tick` state machine is the
+// Oracle provenance (archived in the engineering ledgers under docs/specs/): from-definition —
+// the `tick` state machine is the
 // spec's pure function; these assert its exact per-input effects.
 
 mod common;

@@ -2,14 +2,16 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // TDD §3.5 HOST-1/2/5/6 full det-lane kernel suites (spec §5.6, ABI §5.8/§5.9). These extend the
-// daemon-vhc-det `#[cfg(test)]` unit tests into the "full suite" the P2 gate requires: DCT orthonormality
+// daemon-vhc-det `#[cfg(test)]` unit tests into the "full suite" the hardware-validation gate
+// requires: DCT orthonormality
 // across tile sizes 8..128 (HOST-1), `topk_chunk@1` semantics incl. ties + empty/all-zero chunks +
 // k boundaries (HOST-2), `det_sum` streaming≡batch equivalence in record order (HOST-5), and the
 // det outer-step composition `det_reset_param_to_base`+`det_axpy_param` (HOST-6, modelled at the
 // kernel layer). All assertions are bit-exact because the det lane is CPU fp32 with fixed evaluation
 // order — the cross-peer identity property the vhc's agree-path leans on.
 //
-// Oracle provenance (swarm-ledger-p2-b1.md): from-definition (an independent Rust expression of the
+// Oracle provenance (archived in the engineering ledgers under docs/specs/): from-definition (an
+// independent Rust expression of the
 // spec math) and hand-derived pinned literals; the daemon fixture seed is 0xDAE0_7E57.
 
 use daemon_vhc_det::{

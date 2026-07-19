@@ -25,9 +25,9 @@ daemon-vhc-session = { workspace = true }
 # The chunk-addressed corpus contract (`tokenize-corpus` / `publish-corpus`): the canonical-CBOR
 # CorpusManifest + shard fold identities live in the proto contracts crate.
 daemon-vhc-proto = { workspace = true }
-# `publish-module` / `publish-corpus` (P3 lane S): upload artifacts to the payload store by content
-# hash (presigned PUT direct-to-R2). Both are existing workspace deps already in the lock via
-# daemon-vhc-net, so no new third-party crate / deny change.
+# `publish-module` / `publish-corpus` (the fleet artifact-distribution path): upload artifacts to
+# the payload store by content hash (presigned PUT direct-to-R2). Both are existing workspace deps
+# already in the lock via daemon-vhc-net, so no new third-party crate / deny change.
 daemon-vhc-net = { workspace = true }
 daemon-egress = { workspace = true }
 tokio = { workspace = true }

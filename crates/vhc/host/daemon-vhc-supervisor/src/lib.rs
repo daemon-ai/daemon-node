@@ -203,7 +203,7 @@ impl TrainSupervisor {
     }
 
     /// Join a run; resolves once the worker acknowledges with its first `RunPhase` (§10.2). The
-    /// full event stream is consumed by the round loop in a later wave.
+    /// full event stream is consumed by the round loop once its consumer lands.
     pub async fn join(
         &self,
         run_id: impl Into<String>,

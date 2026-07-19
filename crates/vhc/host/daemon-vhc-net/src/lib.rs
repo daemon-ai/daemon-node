@@ -5,10 +5,14 @@
 //!
 //! The [`VhcTransport`](transport) seam (spec §7.1): one control plane
 //! ([`ControlPlane`] — publish/subscribe of already-signed message bytes, with the in-process
-//! [`LoopbackGossip`] implementation) and one payload plane ([`PayloadStore`] — opaque objects by
-//! `(run, round, peer)` key + content hash, with the filesystem [`FsPayloadStore`] implementation
-//! and its retention window). Artifact fetch ([`ArtifactResolver`]) resolves `file://`
-//! (blake3-verified); `r2`/`hf`/`https` are reserved for the egress plane.
+//! [`LoopbackGossip`] implementation) and one payload plane. The payload plane is split by era:
+//! the **production** plane is content-addressed ([`ContentStore`] — opaque objects keyed by
+//! blake3 alone, with the [`FsContentStore`](content_store::FsContentStore) filesystem seat and
+//! the `R2Store` presigned seat); the coordinate-keyed [`PayloadStore`] (objects by
+//! `(run, round, peer)` key, [`FsPayloadStore`] + retention window) is HARNESS-ERA — it predates
+//! that seam and remains for the retained `RoundEngine` orbit only. Artifact fetch
+//! ([`ArtifactResolver`]) resolves `file://` (blake3-verified); `r2`/`hf`/`https` are reserved
+//! for the egress plane.
 //!
 //! **Opaque by construction:** this crate carries already-signed frame BYTES and content-addressed
 //! payload objects; it defines no consensus message and decodes none (the round message schemas
@@ -18,7 +22,7 @@
 //!
 //! Engine-agnostic; consumed by `daemon-vhc-session` (§10.1). Outbound HTTP must route through
 //! `daemon_egress::EgressClient` (raw `reqwest::Client` is banned workspace-wide by clippy); no HTTP
-//! client is constructed this wave.
+//! client is constructed here yet.
 //!
 //! Merge-1 note: the shared identity/hash vocabulary in [`seam`] is the canonical
 //! `daemon-vhc-proto` types (blake3 `Hash`, `PeerId`).
@@ -31,7 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub mod artifact;
-/// A blake3-keyed, on-disk, size-bounded content cache (spec §8/§10.6; P3 lane S) — the persistent
+/// A blake3-keyed, on-disk, size-bounded content cache (spec §8/§10.6) — the persistent
 /// half of the artifact/shard cache the fleet warms once and never re-downloads.
 pub mod content_cache;
 pub mod content_store;
@@ -127,9 +131,9 @@ pub enum VhcNetError {
     /// NET-3 `unpinned_hf_rejected`).
     #[error("hf:// reference must pin a revision (hf://<repo>@<rev>/<path>): {0}")]
     UnpinnedRevision(String),
-    /// An artifact URL used a scheme not wired this wave (`r2` / `hf` / `https` await the egress
-    /// plane; only `file://` is resolved).
-    #[error("artifact scheme unsupported this wave: {0}")]
+    /// An artifact URL used a scheme the resolver does not serve yet (`r2` / `hf` / `https` await
+    /// the egress plane; only `file://` is resolved).
+    #[error("artifact scheme not yet supported: {0}")]
     SchemeUnsupported(String),
     /// An artifact URL could not be parsed.
     #[error("malformed artifact url: {0}")]

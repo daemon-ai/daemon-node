@@ -4,6 +4,10 @@
 //! In-process multi-peer harness driven by the production **coordinator** (spec §6.2/§6.4;
 //! architecture §4.1: consensus is a sandboxed, content-addressed module).
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): test/drill machinery by charter —
+//! it drives the retained `RoundEngine` peers and decodes SDK schemas, so it is never reachable
+//! from a default (production) session build.
+//!
 //! The harness spins up N in-process [`RoundEngine`] peers over a shared [`LoopbackGossip`] control
 //! plane + a shared [`FsPayloadStore`], plus the [`crate::coordinator_shell`] recording drive
 //! around the `coordinator-quorum` module. It collects every peer's [`EngineEvent`] and the

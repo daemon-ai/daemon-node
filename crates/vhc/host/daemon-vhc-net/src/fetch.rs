@@ -20,7 +20,7 @@
 //! (capacity gate, FIFO waiters, per-class expo-backoff retry) — see the port note below.
 //!
 //! The alternate-locator hook (`BlobTicket` → iroh-blobs) slots behind the same shape once the
-//! network plane lands (P4).
+//! full network plane lands.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -166,14 +166,15 @@ fn exhausted(key: &PayloadKey, sources: usize) -> VhcNetError {
 // ---------------------------------------------------------------------------------------------
 // Download scheduler — a DIRECT port of Psyche's `download_scheduler_actor`
 // (`psyche/shared/network/src/download/scheduler.rs:189-375`; its DIRECT tests at
-// `scheduler.rs:411-675`). Deltas from upstream (recorded in `swarm-ledger-b1.md`):
+// `scheduler.rs:411-675`). Deltas from upstream (recorded in the archived engineering ledgers
+// under docs/specs/):
 //
 //   * Upstream keys retry entries by an `iroh_blobs::Hash` (a blob ticket). We key by the blake3
-//     `ContentHash` and carry the `PayloadKey` — no iroh-blobs this program (P4).
+//     `ContentHash` and carry the `PayloadKey` — iroh-blobs is out of scope for this transport.
 //   * Upstream has three retry classes (DistroResult + ModelSharing Parameter/Config). We keep
 //     **one** class — the payload fetch (= upstream's `DistroResult`: expo backoff
 //     `backoff_base * 2^prev_retries`, capped `max_payload_retries`, time-gated `due_retries`).
-//     The ModelSharing classes are P2P model sharing (P4), dropped.
+//     The ModelSharing classes are P2P model sharing (a future network-plane concern), dropped.
 //   * The capacity gate + FIFO waiters + release-transfers-a-slot are ported 1:1.
 // ---------------------------------------------------------------------------------------------
 

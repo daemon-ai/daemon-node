@@ -2,13 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // TDD §3.5 HOST-7 — the round state digest as the cross-peer agreement tripwire (spec §5.6). This
-// is the "full suite beyond the P1 tripwire" (which lives in daemon-vhc-host), asserted here at the
+// is the "full suite beyond the original tripwire" (which lives in daemon-vhc-host), asserted here at the
 // pure-function digest layer it shares with PROTO-18: the digest covers the *canonical* state image
 // (params ++ `replicated` persistents — never `local` persistents), is bit-identical across peers
 // that share the round seed, and flips on a one-bit change anywhere the schedule samples (params or
 // replicated region alike). It is CPU xxh3-128 over sampled blocks: deterministic by construction.
 //
-// Oracle provenance (swarm-ledger-p2-b1.md): from-definition — the state image is assembled exactly
+// Oracle provenance (archived in the engineering ledgers under docs/specs/): from-definition —
+// the state image is assembled exactly
 // as the host does (params, then replicated persistents, in registration order, ABI §6.3), and the
 // digest is the shared `digest_state` pure function; two peers computing it must agree.
 

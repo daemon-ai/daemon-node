@@ -4,7 +4,7 @@
 //! RUN-3 (TDD §3.3) re-run against the **real vendored TinyStories fixture** — a genuine
 //! pre-tokenized corpus (GPT-2 BPE, u16 shards) produced offline by `xtask tokenize-corpus`, so CI
 //! never needs egress (spec §8). Provenance (dataset/tokenizer + pinned HF commits) is recorded in
-//! the fixture's `manifest.json` and `swarm-ledger-m1.md`.
+//! the fixture's `manifest.json` (and the archived corpus ledger under docs/specs/).
 //!
 //! Generation command (documented, reproducible):
 //! ```text
@@ -15,6 +15,11 @@
 //!   --out-dir crates/vhc/host/daemon-vhc-session/tests/fixtures/tinystories \
 //!   --shard-tokens 262144 --seq-len 1024 --token-width u16 --max-tokens 1048576
 //! ```
+
+// The legacy JSON corpus pipeline this fixture exercises rides the harness-gated engine-era
+// machinery (the production corpus contract is chunk-addressed), so this suite runs on the
+// harness-featured lane only — same pattern as `run_units.rs`.
+#![cfg(feature = "harness")]
 
 use daemon_vhc_session::data::{slice_interval, BatchInterval, BatchLocation, Corpus, Manifest};
 

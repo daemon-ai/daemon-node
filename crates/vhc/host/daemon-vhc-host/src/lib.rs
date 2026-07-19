@@ -17,7 +17,8 @@
 // `deny` (not `forbid`) so the two cfg-gated platform-probe FFI modules in `probe` can carry a
 // scoped `#[allow(unsafe_code)]` (DXGI/D3D12 on Windows; the Objective-C runtime + `sysctlbyname` on
 // macOS). Every other line of the crate still errors on stray `unsafe`; the worker bin keeps its
-// own `#![forbid(unsafe_code)]` and only calls the safe probe wrappers. See swarm-ledger-p2-c2 D1.
+// own `#![forbid(unsafe_code)]` and only calls the safe probe wrappers (a decision from the
+// archived cross-platform probe validation).
 #![deny(unsafe_code)]
 
 // The `compute@2` host runner: `CBOR(burn_ir::OperationIr)` wire + burn-router dispatch

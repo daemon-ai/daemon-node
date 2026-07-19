@@ -25,7 +25,8 @@ use daemon_vhc_proto::corpus::{
     CORPUS_MANIFEST_FORMAT,
 };
 
-/// Arguments for `tokenize-corpus` (the frozen CLI seam — see `swarm-ledger-m1.md`).
+/// Arguments for `tokenize-corpus` (the frozen CLI seam the vendored corpus fixtures were
+/// generated with — regeneration must stay byte-reproducible).
 pub struct Args {
     /// HF **dataset** repo id (e.g. `roneneldan/TinyStories`); ignored when `text` is set.
     pub dataset: Option<String>,

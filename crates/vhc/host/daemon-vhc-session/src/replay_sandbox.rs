@@ -4,6 +4,10 @@
 //! The coordinator replay sandbox — the concrete [`CoordinatorSandbox`] the replay oracle
 //! drives consensus through (spec §6.4 I1; architecture §4.1).
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): needs the host runtime + observe
+//! (oracle tooling), so it rides the `harness` seat; production sessions never re-derive
+//! consensus locally.
+//!
 //! Consensus is a wasm module, not a native host service, so the replay oracle re-derives a recorded
 //! run inside the **same content-addressed `coordinator-quorum` module** the live run used, under the
 //! real major-2 event-loop driver — never a native `tick` (consensus never runs outside the

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! `xtask publish-module` / `publish-corpus` — the P3 lane-S authoring/upload path (spec §8).
+//! `xtask publish-module` / `publish-corpus` — the fleet artifact authoring/upload path (spec §8).
 //!
-//! The P2 gate **pre-staged** the experiment `.wasm` on every fleet box and used a synthetic corpus.
-//! Lane S publishes both to the payload store at **content-addressed** keys, so the fleet fetches
+//! Earlier gate stages **pre-staged** the experiment `.wasm` on every fleet box and used a synthetic corpus.
+//! This path publishes both to the payload store at **content-addressed** keys, so the fleet fetches
 //! them by hash (presigned GET, blake3-verified) — no pre-staging:
 //!
 //! - `publish-module` uploads a module to `modules/<blake3>.wasm` (a presigned PUT direct to R2 on

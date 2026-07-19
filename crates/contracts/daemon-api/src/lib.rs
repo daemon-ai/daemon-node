@@ -4339,7 +4339,7 @@ pub enum FileTransferState {
 }
 
 /// A file transfer (← `PurpleFileTransfer`, `purplefiletransfer.c`). The `name` + content-addressed
-/// `blob` are the original (Wave-1) wire shape; every field below is appended additively with a
+/// `blob` are the original wire shape; every field below is appended additively with a
 /// serde default (wire v37), so pre-existing payloads decode unchanged. The behavior logic
 /// (constructors, state machine, predicates) lives in [`crate::file_transfer`].
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]

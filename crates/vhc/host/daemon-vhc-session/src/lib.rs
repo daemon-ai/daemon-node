@@ -9,9 +9,11 @@
 //! the real Burn/wasmtime worker.
 //!
 //! Seams:
-//! - [`data`] — the pre-tokenized shard [`Manifest`], `BatchId → (shard, offset)` mapping, interval
-//!   slicing into `steps_per_round` × micro-batches, a deterministic [`SyntheticCorpus`], and the
-//!   in-memory [`Corpus`] the engine reads batches from (§8, §6.3).
+//! - `data` (harness-gated) — the engine-era pre-tokenized shard manifest (`manifest.json`),
+//!   `BatchId → (shard, offset)` mapping, interval slicing, and the in-memory corpus the retained
+//!   `RoundEngine` reads batches from (§8, §6.3). The production corpus contract is
+//!   chunk-addressed (`data@2` fetch by committed fold identity); this legacy JSON pipeline rides
+//!   the `harness` seat with the engine that consumes it.
 //! - [`backend`] — the [`TrainerBackend`] trait (**the R↔E seam**) and the deterministic
 //!   [`StubBackend`] (§5.1, §10.2, ABI §2.3).
 //! - `engine` (harness-gated) — the retained `RoundEngine`: the peer-side round state machine
@@ -31,7 +33,6 @@ pub mod assess;
 pub mod attach;
 pub mod backend;
 pub mod config;
-pub mod data;
 pub mod distribution;
 pub mod identity;
 pub mod journal_home;
@@ -43,9 +44,18 @@ pub mod provisioning;
 pub mod role_session;
 pub mod seam;
 
-/// The typed checkpoint manager (save/load/attest/resync) — it decodes SDK round schemas
-/// (`RoundRecord` record-replay catch-up) and the SDK checkpoint manifest, so it rides the
-/// `harness` seat until its production consumer (the generic role session) lands.
+/// HARNESS-ERA: the legacy JSON corpus pipeline — the pre-tokenized shard `Manifest`
+/// (`manifest.json`), `BatchId` location math, interval slicing, and the in-memory `Corpus` the
+/// retained `RoundEngine` reads batches from. The production corpus contract is chunk-addressed
+/// (shards named by their committed chunk-map fold, fetched through `data@2` and chunk-verified
+/// by the run pump); no production path reads this manifest, so it rides the `harness` seat with
+/// the engine that consumes it.
+#[cfg(any(test, feature = "harness"))]
+pub mod data;
+
+/// HARNESS-ERA: the typed checkpoint manager (save/load/attest/resync) — it decodes SDK round
+/// schemas (`RoundRecord` record-replay catch-up) and the SDK checkpoint manifest, so it rides
+/// the `harness` seat until its production consumer (the generic role session) lands.
 #[cfg(any(test, feature = "harness"))]
 pub mod checkpoint;
 
@@ -104,6 +114,7 @@ pub use backend::{
 };
 #[cfg(any(test, feature = "harness"))]
 pub use checkpoint::{CheckpointManifest, ReplayStep};
+#[cfg(any(test, feature = "harness"))]
 pub use data::{
     BatchInterval, BatchLocation, Corpus, DataError, InnerStep, Manifest, MicroBatch, ShardDesc,
     SyntheticCorpus, TokenWidth,
@@ -120,7 +131,9 @@ pub enum VhcRunError {
     /// The transport (control or payload plane) failed.
     #[error(transparent)]
     Net(#[from] daemon_vhc_net::VhcNetError),
-    /// The data pipeline (manifest / batch mapping) failed.
+    /// The harness-era data pipeline (JSON manifest / batch mapping) failed. Rides the `harness`
+    /// seat with the [`data`] module that raises it.
+    #[cfg(any(test, feature = "harness"))]
     #[error(transparent)]
     Data(#[from] data::DataError),
     /// A round-lifecycle invariant was violated (warmup, digest, or checkpoint step).
