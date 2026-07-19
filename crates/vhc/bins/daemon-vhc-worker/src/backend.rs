@@ -946,6 +946,9 @@ pub(crate) struct RoleBinding {
     pub(crate) run: daemon_vhc_host::run::RunConfig,
     pub(crate) own_cert: daemon_vhc_proto::RunKeyCertificate,
     pub(crate) trusted_bases: Vec<daemon_vhc_proto::PeerId>,
+    /// The quotas the admission funnel derived — the grant-containment baseline a later live
+    /// module switch compares its re-admitted quotas against (fail closed, ABI §10.3 step 3).
+    pub(crate) quotas: Option<daemon_vhc_proto::AdmittedQuotas>,
 }
 
 /// Author the role-session binding for a resolved genesis run: re-run the admission funnel over
@@ -1081,6 +1084,183 @@ pub(crate) fn role_binding(
         run,
         own_cert: cert,
         trusted_bases,
+        quotas: admission.quotas.clone(),
+    })
+}
+
+/// The dev / node-controlled module-source override for a live module switch (the upgrade-time
+/// peer of `DAEMON_TRAIN_MODULE`): a filesystem path whose bytes MUST hash to the committed
+/// target module (verified at pre-flight — the override substitutes the artifact fetch, never
+/// the hash pin). Absent ⇒ the session resolves the target by content address from its bound
+/// stores (or the store-fetch path resolves it here under the networked build).
+pub(crate) const SWITCH_MODULE_ENV: &str = "DAEMON_VHC_SWITCH_MODULE";
+
+/// Author the live-switch binding (the worker's pre-flight half of ABI §10.3): resolve the
+/// node-provisioned POST-SWITCH identity read-only from the keystore (the node minted the new
+/// incarnation's key and re-issued its certificate before sending the command — the worker never
+/// mints), resolve the target module bytes where a worker-side source exists, and assemble the
+/// admission inputs the session re-runs owner law with ahead of the fence. Every failure is a
+/// typed refusal with the running instance untouched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn switch_binding(
+    genesis: &GenesisRun,
+    run_id: &str,
+    epoch: u64,
+    new_module: [u8; 32],
+    grants_hash: [u8; 32],
+    deadline_ms: u64,
+    tuple: daemon_vhc_session::protocol::AdmittedTuple,
+    old_incarnation: u64,
+) -> Result<daemon_vhc_session::role_session::SwitchBinding, String> {
+    use daemon_vhc_session::keystore::VhcKeystore;
+
+    let genesis_hash = *genesis.frozen.run_id();
+    if tuple.genesis_hash != genesis_hash.0 {
+        return Err("the post-switch tuple's genesis hash is not this run's".into());
+    }
+    if tuple.role != genesis.worker_role {
+        return Err(format!(
+            "the post-switch tuple's role `{}` is not the held role `{}`",
+            tuple.role, genesis.worker_role
+        ));
+    }
+    if tuple.incarnation <= old_incarnation {
+        return Err(format!(
+            "the post-switch incarnation {} does not supersede the running incarnation \
+             {old_incarnation} (incarnations are never reused)",
+            tuple.incarnation
+        ));
+    }
+
+    // The re-issued identity, READ-ONLY from the node-provisioned keystore ([LT-8]: the node
+    // mints keys and issues certificates; absence is a typed refusal).
+    let keystore = VhcKeystore::from_env().map_err(|e| format!("identity store: {e}"))?;
+    let run_key = keystore
+        .existing_run_signing_key(run_id, &genesis.worker_role, tuple.incarnation)
+        .map_err(|e| format!("post-switch run key: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "no per-run identity was provisioned for `{run_id}` role `{}` incarnation {} \
+                 (the node mints the post-switch key and re-issues its certificate before the \
+                 switch; the worker never mints)",
+                genesis.worker_role, tuple.incarnation
+            )
+        })?;
+    let cert = keystore
+        .run_certificate(run_id, &genesis.worker_role, tuple.incarnation)
+        .map_err(|e| format!("post-switch certificate: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "no certificate was re-issued for `{run_id}` role `{}` incarnation {}",
+                genesis.worker_role, tuple.incarnation
+            )
+        })?;
+    let expected_scope = daemon_vhc_proto::CertScope {
+        run_id: genesis_hash,
+        epoch,
+        role: genesis.worker_role.clone(),
+        instance: tuple.incarnation,
+        module_hash: daemon_vhc_proto::Hash(new_module),
+    };
+    if cert.body.scope != expected_scope {
+        return Err(format!(
+            "the re-issued certificate binds a different execution identity than this switch \
+             (certificate scope {:?}; switching to {:?}) — the node re-provisions",
+            cert.body.scope, expected_scope
+        ));
+    }
+    if cert.body.run_key != daemon_vhc_proto::peer_id(&run_key) {
+        return Err(
+            "the re-issued certificate does not certify the provisioned per-run key".into(),
+        );
+    }
+    cert.verify_chain()
+        .map_err(|e| format!("re-issued certificate chain: {e}"))?;
+
+    // Target module bytes, when a worker-side source exists. The explicit override substitutes
+    // the artifact fetch, never the hash pin (verified right here); with no worker-side source
+    // the session resolves the target by content address from its bound stores.
+    let module_bytes = match std::env::var(SWITCH_MODULE_ENV) {
+        Ok(path) => {
+            let bytes =
+                std::fs::read(&path).map_err(|e| format!("reading switch module {path}: {e}"))?;
+            if *blake3::hash(&bytes).as_bytes() != new_module {
+                return Err(format!(
+                    "the switch module override at {path} does not hash to the committed target"
+                ));
+            }
+            Some(bytes)
+        }
+        Err(_) => None,
+    };
+
+    // Admission inputs: the same lane/device/owner surface the join evaluated, plus the genesis
+    // role grants the new grants document derives from.
+    let hw = hardware();
+    let dl = device_limits();
+    let device = daemon_vhc_host::run::DeviceProfile {
+        gpu: hw.gpus > 0,
+        vram_bytes: dl.vram_mb << 20,
+        ram_bytes: dl.ram_mb << 20,
+        disk_bytes: hw.disk_free_mb << 20,
+    };
+    let owner = daemon_vhc_host::run::OwnerPolicy {
+        participation_enabled: true,
+        vram_cap_bytes: 0,
+        host_cap_bytes: 0,
+    };
+
+    // The seam journal (§8.1): with a durable run-state home, the switch CONTINUES the retiring
+    // incarnation's file series (segment roll under the new identity); the referenceless
+    // in-process seat records in memory.
+    let journal: daemon_vhc_session::role_session::SeamJournal =
+        match daemon_vhc_session::journal_home::run_dir_from_env() {
+            Some(root) => {
+                let dir = daemon_vhc_session::journal_home::journal_dir(
+                    &root,
+                    run_id,
+                    &genesis.worker_role,
+                    old_incarnation,
+                );
+                let key = *keystore
+                    .journal_sidecar_key()
+                    .map_err(|e| format!("seam journal: sidecar key: {e}"))?
+                    .bytes();
+                Box::new(move |identity: &daemon_vhc_host::run::RunIdentity| {
+                    daemon_vhc_session::journal_home::DurableSink::open_continuation(
+                        &dir, identity, key,
+                    )
+                    .map(|s| Box::new(s) as Box<dyn daemon_vhc_host::run::JournalSink>)
+                    .map_err(|e| format!("seam journal open {}: {e}", dir.display()))
+                })
+            }
+            None => Box::new(|_: &daemon_vhc_host::run::RunIdentity| {
+                Ok(Box::new(daemon_vhc_host::run::MemorySink::new())
+                    as Box<dyn daemon_vhc_host::run::JournalSink>)
+            }),
+        };
+
+    Ok(daemon_vhc_session::role_session::SwitchBinding {
+        epoch,
+        new_module,
+        grants_hash,
+        tuple,
+        module_bytes,
+        // Upgrade records pin module + grants; config carriage arrives when they carry one.
+        config: Vec::new(),
+        signing_seed: run_key.to_bytes(),
+        own_cert: cert,
+        role_grants: genesis.env.roles[&genesis.worker_role].grants.clone(),
+        envelope_grants: daemon_vhc_host::run::EnvelopeRoleGrants::from_genesis(
+            &genesis.env,
+            &genesis.worker_role,
+        ),
+        lane: selected_lane(),
+        device,
+        owner,
+        journal,
+        deadline_ms,
+        migrate_fuel: None,
     })
 }
 

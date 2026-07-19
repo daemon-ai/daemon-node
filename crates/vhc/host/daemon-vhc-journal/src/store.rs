@@ -180,6 +180,13 @@ impl<K: KeyProvider + Clone> Journal<K> {
             }
             for record in &scan.records {
                 next_ord = next_ord.max(record.ord + 1);
+                // Re-key at every run-header (§8.1): a run-header opens a new execution-identity
+                // span (a live upgrade's seam), and the §12.2 signed stream is scoped to that
+                // identity — the durable per-channel counters recover from the CURRENT span's
+                // publishes only, never a retired incarnation's.
+                if matches!(record.body, Body::RunHeader(_)) {
+                    seq_high.clear();
+                }
                 if let Body::Publish(p) = &record.body {
                     let e = seq_high.entry(p.channel).or_insert(0);
                     *e = (*e).max(p.seq);
@@ -365,6 +372,53 @@ impl<K: KeyProvider + Clone> Journal<K> {
         self.writer = SegmentWriter::create(self.paths.segment(next), &header)?;
         self.current_segment = next;
         Ok(())
+    }
+
+    /// The live-upgrade seam (§8.1/§10.3): CONTINUE this journal — one file series — under a new
+    /// execution identity. Seals the current segment and opens the next one with the incoming
+    /// incarnation's identity in its header (the seam forces a segment roll, so every segment
+    /// header still matches the identity of the records it contains); the per-journal record
+    /// ordinal stays globally monotone across the seam; the per-channel publish counters reset
+    /// (the new `(run, epoch, role, instance, channel)` stream opens at seq 0 — the never-reused
+    /// stream scope of §12.2, disjoint from the retired incarnation's by construction).
+    ///
+    /// The caller writes the incoming incarnation's own tag-0 run-header as the new span's first
+    /// record (the driver does this at instantiation).
+    ///
+    /// # Errors
+    /// [`JournalError`] on seal/create failure.
+    pub fn roll_to_identity(&mut self, id: ExecIdentity) -> Result<(), JournalError> {
+        self.id = id.clone();
+        self.sidecars.set_identity(id);
+        self.roll()?;
+        self.seq_high.clear();
+        Ok(())
+    }
+
+    /// Open a journal at the live-upgrade seam (§8.1): crash-recover the retired incarnation's
+    /// records (they remain as the prefix), then [`Journal::roll_to_identity`] so appends land in
+    /// a fresh segment carrying the incoming identity. Refuses on an empty directory — a seam
+    /// continues an existing log; a fresh incarnation uses [`Journal::open`].
+    ///
+    /// # Errors
+    /// [`JournalError`] on a broken chain, an empty directory, or filesystem failure.
+    pub fn open_continuation(
+        root: impl AsRef<std::path::Path>,
+        id: ExecIdentity,
+        key: K,
+        rotate: RotatePolicy,
+    ) -> Result<Self, JournalError> {
+        let paths = JournalPaths::open(&root)?;
+        if paths.existing_segments()?.is_empty() {
+            return Err(JournalError::BadHeader(
+                "continuation open on an empty journal directory (a seam continues an existing \
+                 log; use open for a fresh incarnation)"
+                    .into(),
+            ));
+        }
+        let mut journal = Self::open(root, id.clone(), key, rotate)?;
+        journal.roll_to_identity(id)?;
+        Ok(journal)
     }
 
     fn maybe_rotate(&mut self) -> Result<(), JournalError> {

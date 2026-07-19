@@ -147,6 +147,7 @@ pub trait WorkerControl: Send + Sync {
     /// the worker (quiesce → snapshot → owner-law re-admission → migrate → validate → activate).
     /// Default: unsupported (fakes / non-upgrading workers); `TrainSupervisor` overrides it with
     /// the real command path.
+    #[allow(clippy::too_many_arguments)]
     async fn switch_module(
         &self,
         run_id: String,
@@ -155,8 +156,17 @@ pub trait WorkerControl: Send + Sync {
         new_module: [u8; 32],
         grants_hash: [u8; 32],
         deadline_ms: u64,
+        admitted_tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
     ) -> Result<SwitchOutcome, VhcError> {
-        let _ = (run_id, epoch, role, new_module, grants_hash, deadline_ms);
+        let _ = (
+            run_id,
+            epoch,
+            role,
+            new_module,
+            grants_hash,
+            deadline_ms,
+            admitted_tuple,
+        );
         Err(VhcError::Worker(
             "switch_module unsupported by this worker".into(),
         ))
@@ -233,6 +243,7 @@ impl WorkerControl for TrainSupervisor {
             .await
             .map_err(VhcError::worker)
     }
+    #[allow(clippy::too_many_arguments)]
     async fn switch_module(
         &self,
         run_id: String,
@@ -241,6 +252,7 @@ impl WorkerControl for TrainSupervisor {
         new_module: [u8; 32],
         grants_hash: [u8; 32],
         deadline_ms: u64,
+        admitted_tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
     ) -> Result<SwitchOutcome, VhcError> {
         TrainSupervisor::switch_module(
             self,
@@ -250,6 +262,7 @@ impl WorkerControl for TrainSupervisor {
             new_module,
             grants_hash,
             deadline_ms,
+            admitted_tuple,
         )
         .await
         .map_err(VhcError::worker)

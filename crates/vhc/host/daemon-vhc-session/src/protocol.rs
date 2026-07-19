@@ -326,6 +326,18 @@ pub enum Command {
         /// The drain deadline in ms (§4.4). The node clamps it to the lane's
         /// `quiesce_deadline_max_ms` ceiling before sending (§9.6).
         deadline_ms: u64,
+        /// The node-assessed admitted tuple for the POST-SWITCH identity (architecture §6.3):
+        /// `module_hash = new_module`, `grants_hash` = the committed record's anchor, and —
+        /// load-bearing — the node-minted, never-reused incarnation the migrated instance runs
+        /// as (a live upgrade mints a new incarnation, ABI §8.1/§10.3). The node provisions the
+        /// new incarnation's per-run key and its certificate — bound to
+        /// `(run, epoch, role, new incarnation, new_module)` — in the identity keystore BEFORE
+        /// sending this command; the worker resolves both read-only by reference and refuses
+        /// typed when either is absent or mis-scoped (the certificate re-issuance handshake).
+        /// Additive `#[serde(default)]`; a switch without a tuple is a typed refusal on the
+        /// production path.
+        #[serde(default)]
+        admitted_tuple: Option<AdmittedTuple>,
     },
     /// Ask the worker to exit cleanly.
     Shutdown,
@@ -445,6 +457,19 @@ pub enum Event {
         /// The emitting role-instance's generation counter (see [`Event::RunPhase`]).
         #[serde(default)]
         generation: u64,
+    },
+    /// A module switch was REFUSED before the upgrade transaction touched the running instance
+    /// (ABI §10.3 pre-transaction refusals: no live instance, an unresolvable/mismatched target
+    /// artifact, missing or mis-scoped re-issued identity, an admission refusal evaluated ahead
+    /// of the fence). The old module keeps running untouched — distinct from a POST-quiesce
+    /// failure, which leaves the run with a terminal [`Event::RunTerminated`].
+    SwitchRefused {
+        /// The run whose switch was refused.
+        run_id: String,
+        /// The (still-running) role-instance's generation counter.
+        generation: u64,
+        /// Why the switch was refused (operator-facing detail, never branched on).
+        reason: String,
     },
     /// Join aborted: the admitted tuple carried from assessment does not match the tuple
     /// rederived from the artifacts at join (architecture §6.3) — a stale or swapped artifact.
@@ -838,9 +863,57 @@ mod tests {
             new_module: [0x5A; 32],
             grants_hash: [0x6B; 32],
             deadline_ms: 5_000,
+            admitted_tuple: Some(AdmittedTuple {
+                module_hash: [0x5A; 32],
+                config_hash: [0x00; 32],
+                grants_hash: [0x6B; 32],
+                claim_hash: [0x7C; 32],
+                genesis_hash: [0x8D; 32],
+                role: "worker".into(),
+                incarnation: 4,
+                device_profile_rev: 1,
+                owner_policy_rev: 1,
+            }),
         });
         round_trip_command(Command::Shutdown);
         round_trip_command(Command::Ping);
+    }
+
+    /// The post-switch admitted tuple is additive on the switch command: a frame authored before
+    /// the field existed (a CBOR map WITHOUT it) still decodes, with the tuple defaulting to
+    /// `None` — and the production path then refuses the switch typed rather than guessing an
+    /// identity.
+    #[test]
+    fn switch_tuple_is_additive_back_compatible() {
+        #[derive(serde::Serialize)]
+        enum LegacyCommand {
+            SwitchModule {
+                run_id: String,
+                epoch: u64,
+                role: String,
+                new_module: [u8; 32],
+                grants_hash: [u8; 32],
+                deadline_ms: u64,
+            },
+        }
+        let legacy = LegacyCommand::SwitchModule {
+            run_id: "run-42".into(),
+            epoch: 1,
+            role: "worker".into(),
+            new_module: [0x5A; 32],
+            grants_hash: [0x6B; 32],
+            deadline_ms: 5_000,
+        };
+        let decoded: Command = decode(&encode(&legacy).expect("encode legacy")).expect(
+            "a pre-tuple switch command still decodes (the field is additive, never re-keying)",
+        );
+        assert!(matches!(
+            decoded,
+            Command::SwitchModule {
+                admitted_tuple: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -961,6 +1034,11 @@ mod tests {
             module: [0x5A; 32],
             retries: 1,
             generation: 3,
+        });
+        round_trip_event(Event::SwitchRefused {
+            run_id: "run-42".into(),
+            generation: 3,
+            reason: "target artifact does not hash to the committed module".into(),
         });
         for outcome in [
             TerminalOutcome::Completed { outcome: 0 },

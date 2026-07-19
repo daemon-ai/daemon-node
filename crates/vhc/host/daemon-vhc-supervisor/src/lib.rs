@@ -138,6 +138,14 @@ pub enum SwitchOutcome {
         /// Why the worker left the run (the `LeaveReason` display).
         reason: String,
     },
+    /// The switch was refused BEFORE the transaction touched the running instance (§10.3
+    /// pre-transaction refusals: no live instance, unresolvable/mismatched target artifact,
+    /// missing or mis-scoped re-issued identity, an admission refusal evaluated ahead of the
+    /// fence). The old module keeps running untouched; the node reassesses/reprovisions.
+    Refused {
+        /// Why the switch was refused.
+        reason: String,
+    },
 }
 
 /// A supervised client over a single `daemon-vhc-host` worker process.
@@ -301,6 +309,7 @@ impl TrainSupervisor {
         new_module: [u8; 32],
         grants_hash: [u8; 32],
         deadline_ms: u64,
+        admitted_tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
     ) -> Result<SwitchOutcome, TrainClientError> {
         let cmd = Command::SwitchModule {
             run_id: run_id.into(),
@@ -309,6 +318,7 @@ impl TrainSupervisor {
             new_module,
             grants_hash,
             deadline_ms,
+            admitted_tuple,
         };
         let res = self
             .exchange(cmd, |ev| match ev {
@@ -322,6 +332,7 @@ impl TrainSupervisor {
                     module,
                     retries,
                 })),
+                Event::SwitchRefused { reason, .. } => Some(Ok(SwitchOutcome::Refused { reason })),
                 _ => None,
             })
             .await;
