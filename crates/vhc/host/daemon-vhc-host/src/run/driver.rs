@@ -1532,8 +1532,19 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         if let Some(pos) = candidate {
                             let len = st.queue[pos].frame_bytes.len() as u64;
                             if len > u64::from(buf_cap) {
-                                // Not consumed; no journal record; budgets do not reset (§4.1).
-                                c.data_mut().slice.pending_next = Some(len);
+                                // Not consumed; no journal record; fuel/op budgets do not reset
+                                // (§4.1/§5.5 — they reset on Delivered only). The epoch WATCHDOG
+                                // does re-arm: the deadline armed at the previous Delivered may
+                                // have lapsed during a long park (live planes idle for seconds),
+                                // and the mandatory realloc+retry executes guest code — killing
+                                // it here would epoch-kill a guest FOR WAITING, exactly what
+                                // §5.6 rules out. Unloopable: a retry below the required length
+                                // is the typed BadEvent trap above.
+                                drop(st);
+                                let d = c.data_mut();
+                                d.slice.pending_next = Some(len);
+                                let ticks = d.epoch_ticks;
+                                wasmtime::AsContextMut::as_context_mut(c).set_epoch_deadline(ticks);
                                 return Ok(pack_status_len(RET_STATUS_NEED_CAPACITY, len as u32));
                             }
                             // Deliver: sample once, journal BEFORE the guest observes (§8.4 r4).
