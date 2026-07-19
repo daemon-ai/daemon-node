@@ -140,6 +140,16 @@ impl Node {
     pub fn run_dir(&self) -> PathBuf {
         self.data_dir.path().join("vhc").join("runs")
     }
+
+    /// The node process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether the node process is still alive (a typed refusal must never crash it).
+    pub fn is_alive(&self) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.child.id() as i32), None).is_ok()
+    }
 }
 
 impl Drop for Node {
@@ -531,4 +541,58 @@ pub fn key_from(seed: &str) -> SigningKey {
 /// The base peer id of a node.
 pub fn base_peer(node: &Node) -> daemon_vhc_proto::PeerId {
     peer_id(&node.base_key)
+}
+
+/// Count a node's live `daemon-vhc-worker` children (via `/proc`) — the process-isolation +
+/// churn checks read this without reaching any product internal.
+pub fn worker_children(node: &Node) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if !comm.contains("daemon-vhc-work") {
+            continue;
+        }
+        // PPid: <node pid> — a child of this node.
+        if status
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("PPid:")
+                    .map(|v| v.trim().parse::<u32>().ok())
+            })
+            .flatten()
+            == Some(node.pid())
+        {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// A malformed control-plane distribution record: a `RunKeyCertificate` issued by an UNTRUSTED
+/// base (a random key absent from the genesis identities), wrapped as a §12.3 distribution record.
+/// A conforming node refuses it typed (the base is not genesis-trusted) — never a panic.
+pub fn untrusted_cert_record(genesis_hash: [u8; 32]) -> Vec<u8> {
+    use daemon_vhc_proto::{CertScope, Hash, RunKeyCertificate};
+    let rogue_base = key_from("acceptance/rogue-base");
+    let rogue_run_key = peer_id(&key_from("acceptance/rogue-run-key"));
+    let scope = CertScope {
+        run_id: Hash(genesis_hash),
+        epoch: 0,
+        role: "coordinator".to_string(),
+        instance: 0,
+        module_hash: Hash([0u8; 32]),
+    };
+    let cert = RunKeyCertificate::issue(&rogue_base, scope, rogue_run_key)
+        .expect("issue a (chain-valid but untrusted-base) certificate");
+    daemon_vhc_session::distribution::DistributionRecord::Cert(cert)
+        .to_bytes()
+        .expect("encode distribution record")
 }

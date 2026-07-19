@@ -80,6 +80,26 @@ impl FixtureRegistry {
     pub fn get_object(&self, key: &str) -> Option<Vec<u8>> {
         self.objects.lock().unwrap().get(key).cloned()
     }
+
+    /// Inject a raw binary frame to EVERY connected control-plane peer — the adversarial-injection
+    /// seat for the malformed-frame / bad-certificate gate. The relay is byte-opaque, so whatever
+    /// is injected reaches each node's §12.1 attach exactly as a peer frame would; a well-behaved
+    /// node refuses it TYPED (never a panic, never a silent drop) and keeps running.
+    pub fn inject_raw(&self, bytes: Vec<u8>) -> usize {
+        let peers = self.ws_peers.lock().unwrap();
+        let mut n = 0;
+        for tx in peers.values() {
+            if tx.send(Message::binary(bytes.clone())).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// The number of connected control-plane peers (the injection reaches all of them).
+    pub fn ws_peer_count(&self) -> usize {
+        self.ws_peers.lock().unwrap().len()
+    }
 }
 
 fn now_ms() -> u64 {
@@ -424,7 +444,7 @@ async fn ws_relay(stream: TcpStream, reg: Arc<FixtureRegistry>) {
                     let peers = reg.ws_peers.lock().unwrap();
                     for (pid, ptx) in peers.iter() {
                         if *pid != id {
-                            let _ = ptx.send(Message::Binary(bytes.clone()));
+                            let _ = ptx.send(Message::binary(bytes.clone()));
                         }
                     }
                 }
