@@ -1032,10 +1032,15 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                                     class: 1,
                                     bytes: flat_le(&moments[n..]),
                                 },
-                                OwnedSection {
-                                    // The resync watermark (§9): the last round this snapshot's
-                                    // state folds; a restore never re-ingests at/below it.
-                                    // `u64::MAX` = no ingest yet.
+                            ];
+                            let mut sections = sections.to_vec();
+                            // The resync watermark (§9): the last round this snapshot's state
+                            // folds; a restore never re-ingests at/below it (`u64::MAX` = no
+                            // ingest yet). LIVE-MODE ONLY — the deterministic harness rings pin
+                            // the four-section manifest shape, and only the live module-driven
+                            // path restores through the watermark.
+                            if live.is_some() {
+                                sections.push(OwnedSection {
                                     name: "round".to_string(),
                                     schema: 1,
                                     class: 1,
@@ -1044,8 +1049,8 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                                         .unwrap_or(u64::MAX)
                                         .to_le_bytes()
                                         .to_vec(),
-                                },
-                            ];
+                                });
+                            }
                             for s in &sections {
                                 let _staging_id = daemon_vhc_sdk::stage_state(&s.bytes);
                             }
