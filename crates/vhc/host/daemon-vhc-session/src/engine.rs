@@ -91,9 +91,9 @@ pub async fn fetch_record_set<P: PayloadStore + ?Sized>(
     Ok(set)
 }
 
-/// Per-round batch assignment: P2's throughput-weighted deterministic split (§6.3, PROTO-8).
+/// Per-round batch assignment: the throughput-weighted deterministic split (§6.3, PROTO-8).
 ///
-/// Merge 2 resolved the R2 `// MERGE-2` marker here by swapping the equal-split placeholder for
+/// Merge 2 resolved the `// MERGE-2` marker here by swapping the equal-split placeholder for
 /// `assign_batches` — the single pure authority the coordinator and
 /// every peer re-derive byte-identically from `(round_seed, roster, window)` (in
 /// `daemon-vhc-sdk-consensus` from D0; the proto is algorithm-free). The MVP StubBackend

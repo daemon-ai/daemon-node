@@ -35,7 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub mod artifact;
-/// A blake3-keyed, on-disk, size-bounded content cache (spec §8/§10.6; P3 lane S) — the persistent
+/// A blake3-keyed, on-disk, size-bounded content cache (spec §8/§10.6) — the persistent
 /// half of the artifact/shard cache the fleet warms once and never re-downloads.
 pub mod content_cache;
 pub mod content_store;

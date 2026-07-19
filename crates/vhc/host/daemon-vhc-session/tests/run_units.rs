@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 //
 // TDD §3.3 RUN-6/7 — checkpoint registration + desync→resync (spec §9, §6.4). Completes the named
-// IDs on top of the P1 checkpoint save/load + replay fold: two-checkpointer both-match registration
+// IDs on top of the earlier checkpoint save/load + replay fold: two-checkpointer both-match registration
 // and single-uploader degraded mode (RUN-6), fp32-exact checkpoint roundtrip (RUN-6), the
 // digest-mismatch → replay-resync recovery (RUN-7), and the retention-floor decision that sends a
 // too-old desync to an epoch rejoin instead of a replay (RUN-7). RUN-10's staged-assess prescreen +

@@ -181,8 +181,8 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
 /// ([`probe_cuda`]) is feature-gated.
 ///
 /// `shared_mb = 0` / `unified = false` put the budget math on the discrete path (dedicated
-/// VRAM is the whole GPU budget; the joint-pool UMA math never applies), matching the P2 probe matrix
-/// for the 4090 (24 GB discrete).
+/// VRAM is the whole GPU budget; the joint-pool UMA math never applies), matching the archived
+/// hardware-validation probe matrix for the 4090 (24 GB discrete).
 #[must_use]
 pub fn cuda_device_limits(vram_mb: u64, max_alloc_mb: u64, ram_mb: u64) -> DeviceLimits {
     DeviceLimits {

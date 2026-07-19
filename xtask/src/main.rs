@@ -306,7 +306,8 @@ fn build_guests() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to run cargo for the guests workspace: {e}"))?;
     anyhow::ensure!(status.success(), "building guests failed with {status}");
 
-    // Stale-guest guard (swarm-p1-ledger Merge-1 follow-on): write the committed blake3 manifest of
+    // Stale-guest guard (an archived engineering-ledger Merge-1 follow-on): write the committed
+    // blake3 manifest of
     // the built modules. The wasm-backed test harness asserts the module it loads matches this file,
     // so a stale/mismatched guest fails loud instead of surfacing downstream as a NaN loss.
     let manifest = write_guest_manifest(&guests)?;

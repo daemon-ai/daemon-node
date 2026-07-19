@@ -223,7 +223,8 @@ impl IrohGossip {
             })
             .spawn(endpoint.clone());
 
-        // Router accepts only the gossip ALPN — no blobs (P4), no model-sharing. Psyche
+        // Router accepts only the gossip ALPN — no blobs (a future network-plane concern), no
+        // model-sharing. Psyche
         // `router.rs:32-46` accepts three; we accept one.
         let router = Router::builder(endpoint.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())

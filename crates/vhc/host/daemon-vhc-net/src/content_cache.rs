@@ -4,8 +4,9 @@
 //! [`ContentCache`] — a blake3-keyed, on-disk, size-bounded content cache for the fleet
 //! artifact-distribution path (spec §8/§10.6).
 //!
-//! The P2 gate **pre-staged** the experiment `.wasm` (and used a synthetic corpus) onto every fleet
-//! box. Lane S removes that: the worker fetches the module + its assigned corpus shards **by content
+//! The hardware-validation gate **pre-staged** the experiment `.wasm` (and used a synthetic corpus)
+//! onto every fleet box. The fleet artifact-distribution path removes that: the worker fetches the
+//! module + its assigned corpus shards **by content
 //! hash** from the payload store and caches them here, so a box warmed once never re-downloads (a GB
 //! artifact is fetched exactly once per content hash, across runs and process restarts).
 //!
