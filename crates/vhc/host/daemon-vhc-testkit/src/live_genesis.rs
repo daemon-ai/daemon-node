@@ -189,10 +189,16 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         authorized: Vec::new(),
     };
     let state = CoordinatorState::new(run_config, Seed([0x33; 32]), 0);
-    let coord_config = Value::Map(vec![(
-        Value::Text("state".into()),
-        Value::serialized(&state).expect("state to cbor value"),
-    )]);
+    let coord_config = Value::Map(vec![
+        (
+            Value::Text("state".into()),
+            Value::serialized(&state).expect("state to cbor value"),
+        ),
+        // The live deployment shape: commitments are availability-verified against the run's
+        // content-addressed plane (coordinator-as-storage-client, §6.4 I6). The deterministic
+        // harness rings leave this off (the guest default).
+        (Value::Text("verify_availability".into()), Value::Bool(true)),
+    ]);
 
     // Grants: the control channel both modules declare; the trainer additionally holds the
     // corpus artifact grants (the manifest + every shard fold) its data@2 fetches admit under.

@@ -74,6 +74,13 @@ struct CoordinatorInit {
     /// The control channel `RoundOpen`/`RoundRecord` are published on (§6.2). Default `0`.
     #[serde(default)]
     control_channel: u32,
+    /// Coordinator-as-storage-client availability verification (§6.4 I6): when set, every
+    /// commitment's payload is `payload_get`-verified against the run's content-addressed plane
+    /// and the completed fetch is this coordinator's own storage receipt. Default OFF — the
+    /// deterministic harness rings (RoundEngine et al.) pin the receipt-free pipeline; a live
+    /// deployment's genesis enables it explicitly.
+    #[serde(default)]
+    verify_availability: bool,
 }
 
 /// The coordinator module: the pure `tick` state machine plus the wasm event-loop plumbing.
@@ -82,6 +89,8 @@ struct Coordinator {
     now_s: u64,
     tick_period_ms: u64,
     control_channel: u32,
+    /// Whether commitments are availability-verified via `payload_get` (config-gated, §6.4 I6).
+    verify_availability: bool,
     /// Coordinator-as-storage-client availability checks in flight (§6.4 I6): a commitment's
     /// payload is `payload_get`-verified against the run's content-addressed plane; a completed
     /// fetch IS the storage receipt (the host re-verified the bytes against the committed hash
@@ -179,6 +188,7 @@ impl GuestModule for Coordinator {
             now_s,
             tick_period_ms: init.tick_period_ms,
             control_channel: init.control_channel,
+            verify_availability: init.verify_availability,
             pending_availability: BTreeMap::new(),
         })
     }
@@ -232,11 +242,13 @@ impl GuestModule for Coordinator {
                             Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
                         if let Ok(arr) = <[u8; 32]>::try_from(sender.as_slice()) {
                             if let Ok(msg) = from_canonical_slice::<VhcMessage>(&payload) {
-                                // Coordinator-as-storage-client (§6.4 I6): a commitment's
-                                // payload is availability-checked against the run's
+                                // Coordinator-as-storage-client (§6.4 I6, config-gated): a
+                                // commitment's payload is availability-checked against the run's
                                 // content-addressed plane; the completed, host-verified fetch
                                 // becomes this coordinator's own storage receipt (below).
-                                if let VhcMessage::Commitment(c) = &msg {
+                                if let (true, VhcMessage::Commitment(c)) =
+                                    (self.verify_availability, &msg)
+                                {
                                     let op = daemon_vhc_sdk::abi::payload_get(&c.payload.0);
                                     self.pending_availability.insert(
                                         op,
