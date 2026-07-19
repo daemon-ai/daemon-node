@@ -49,6 +49,10 @@ daemon-vhc-abi = { workspace = true }
 # default production session graph carries no SDK schema crate (dep-check-enforced).
 daemon-vhc-sdk-consensus = { workspace = true, optional = true }
 daemon-vhc-net = { workspace = true }
+# The crash-safe segmented journal SUBSTRATE (ABI §8), schema-free by construction: the durable
+# per-incarnation sink (`journal_home::DurableSink`) adapts its `Journal` onto the driver's
+# dependency-inverted `JournalSink` seam — the production replacement for the in-memory sink.
+daemon-vhc-journal = { workspace = true }
 # The A2 dependency INVERSION (refactor §5 A2; architecture §7: SESS → HOSTC): the session links
 # the host runtime — never the reverse (the old daemon-vhc-host → daemon-vhc-session edge is gone;
 # xtask's vhc_dep_check enforces the direction). `wasm_backend.rs` (the TrainerBackend seam over

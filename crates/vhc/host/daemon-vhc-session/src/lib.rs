@@ -32,6 +32,7 @@ pub mod backend;
 pub mod config;
 pub mod data;
 pub mod identity;
+pub mod journal_home;
 pub mod keystore;
 pub mod protocol;
 pub mod role_session;

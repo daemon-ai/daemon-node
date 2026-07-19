@@ -74,6 +74,33 @@ fn in_process_providers() -> RoleProviders {
     }
 }
 
+/// The role session's journal sink: the node-delivered DURABLE per-incarnation home
+/// (`DAEMON_VHC_RUN_DIR`, ABI §8) when the run-state root reference is present — a journal that
+/// cannot open refuses the join typed (a run that cannot journal must not run, §8.4) — else the
+/// in-memory sink (the referenceless in-process smoke seat / unit tests).
+fn journal_sink(
+    run_label: &str,
+    identity: &daemon_vhc_host::run::RunIdentity,
+) -> Result<Box<dyn daemon_vhc_host::run::JournalSink>, String> {
+    use daemon_vhc_session::journal_home::{self, DurableSink};
+    use daemon_vhc_session::keystore::VhcKeystore;
+
+    let Some(root) = journal_home::run_dir_from_env() else {
+        return Ok(Box::new(daemon_vhc_host::run::MemorySink::new()));
+    };
+    // The sidecar encryption key comes from the node-provided identity store (a path reference —
+    // key material never rides the command wire).
+    let keystore = VhcKeystore::from_env()
+        .map_err(|e| format!("journal home: identity store for the sidecar key: {e}"))?;
+    let key = keystore
+        .journal_sidecar_key()
+        .map_err(|e| format!("journal home: sidecar key: {e}"))?;
+    let dir = journal_home::journal_dir(&root, run_label, &identity.role, identity.instance);
+    let sink = DurableSink::open(&dir, identity, *key.bytes())
+        .map_err(|e| format!("journal home: open {}: {e}", dir.display()))?;
+    Ok(Box::new(sink))
+}
+
 #[tokio::main]
 async fn main() {
     // Consent-gated crash reporting (component = train-worker). Armed as the first action: the
@@ -301,6 +328,13 @@ async fn main() {
                 if in_process_plane_selected() {
                     match backend::role_binding(resolved, genesis, &run_id) {
                         Ok(binding) => {
+                            let journal = match journal_sink(&run_id, &binding.run.identity) {
+                                Ok(sink) => sink,
+                                Err(detail) => {
+                                    send(&writer, &worker_error(&detail)).await;
+                                    continue;
+                                }
+                            };
                             let spec = RoleSessionSpec {
                                 module: resolved.module.clone(),
                                 engine: backend::engine_config_from_env(),
@@ -309,9 +343,7 @@ async fn main() {
                                 trusted_bases: binding.trusted_bases,
                                 peer_certs: vec![binding.own_cert],
                                 providers: in_process_providers(),
-                                // The journal home is node-delivered once run state dirs land;
-                                // the in-process seat records in memory meanwhile.
-                                journal: Box::new(daemon_vhc_host::run::MemorySink::new()),
+                                journal,
                                 drain_deadline: DRAIN_DEADLINE,
                             };
                             let handle = spawn_role(run_id.clone(), spec, role_events.clone());

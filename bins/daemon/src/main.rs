@@ -3028,11 +3028,19 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 } else {
                     std::path::PathBuf::from(&cfg.vhc.identity_dir)
                 };
+                // The run-state root: per-incarnation durable journal homes + the filesystem
+                // payload plane live under it (`<data_dir>/vhc/runs/<blake3(label)>/…`). Handed
+                // to workers as a path REFERENCE, exactly like the identity dir.
+                let run_dir = cfg.data_dir.join("vhc").join("runs");
                 let worker_cfg = |path: &str| {
                     let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(path);
                     wc.env.push((
                         daemon_vhc_session::keystore::IDENTITY_DIR_ENV.to_string(),
                         identity_dir.display().to_string(),
+                    ));
+                    wc.env.push((
+                        daemon_vhc_session::journal_home::RUN_DIR_ENV.to_string(),
+                        run_dir.display().to_string(),
                     ));
                     wc
                 };
@@ -3045,11 +3053,16 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 // service's OwnerArbiter (permissive until an owner budget is configured).
                 let worker_path = cfg.vhc.worker_path.clone();
                 let factory_identity_dir = identity_dir.clone();
+                let factory_run_dir = run_dir.clone();
                 let worker_factory: daemon_vhc_node::service::WorkerFactory = Arc::new(move || {
                     let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(&worker_path);
                     wc.env.push((
                         daemon_vhc_session::keystore::IDENTITY_DIR_ENV.to_string(),
                         factory_identity_dir.display().to_string(),
+                    ));
+                    wc.env.push((
+                        daemon_vhc_session::journal_home::RUN_DIR_ENV.to_string(),
+                        factory_run_dir.display().to_string(),
                     ));
                     Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(wc))
                         as Arc<dyn daemon_vhc_node::WorkerControl>

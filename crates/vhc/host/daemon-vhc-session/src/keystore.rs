@@ -160,6 +160,16 @@ impl VhcKeystore {
         self.load_or_create(&self.root.join("iroh.key"), "vhc-iroh")
     }
 
+    /// The node-local journal sidecar encryption key (ABI §8.5): its own CSPRNG secret with its
+    /// own store entry — a construction input for the durable journal's encrypted sidecars,
+    /// distinct from every signing/transport identity (it encrypts, it never signs).
+    ///
+    /// # Errors
+    /// Filesystem, entropy, or record-decode failure.
+    pub fn journal_sidecar_key(&self) -> Result<SecretSeed, KeystoreError> {
+        self.load_or_create(&self.root.join("journal.key"), "vhc-journal-sidecar")
+    }
+
     /// The per-run signing key for `(run label, role, incarnation)`: recovered if persisted (a
     /// crashed worker resumes its incarnation with the SAME key), freshly CSPRNG-generated and
     /// persisted otherwise. Persisted only for the life of the run ([`VhcKeystore::remove_run`]).
