@@ -3,6 +3,12 @@
 
 //! The pre-tokenized shard data pipeline (spec §8) + `BatchId` mapping (§6.3).
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): this legacy JSON-manifest corpus
+//! pipeline feeds the retained `RoundEngine` and the harness suites only. The production corpus
+//! contract is chunk-addressed — shards are named by their committed chunk-map fold identity,
+//! fetched through `data@2`, and chunk-verified by the run pump — and no production path reads
+//! `manifest.json`.
+//!
 //! Corpora are pre-tokenized offline into fixed-width shards (u16/u32 token streams); a
 //! [`Manifest`] (`manifest.json`) lists the shards, their sizes, token counts, and a blake3 per
 //! shard. Peers map [`BatchId`] intervals to `(shard, offset)` **purely locally** ([`Manifest::locate`])

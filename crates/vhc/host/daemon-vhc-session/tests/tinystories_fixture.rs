@@ -16,6 +16,11 @@
 //!   --shard-tokens 262144 --seq-len 1024 --token-width u16 --max-tokens 1048576
 //! ```
 
+// The legacy JSON corpus pipeline this fixture exercises rides the harness-gated engine-era
+// machinery (the production corpus contract is chunk-addressed), so this suite runs on the
+// harness-featured lane only — same pattern as `run_units.rs`.
+#![cfg(feature = "harness")]
+
 use daemon_vhc_session::data::{slice_interval, BatchInterval, BatchLocation, Corpus, Manifest};
 
 const MANIFEST: &str = include_str!("fixtures/tinystories/manifest.json");

@@ -143,8 +143,10 @@ daemon-vhc-sdk-consensus = { workspace = true }
 daemon-vhc-observe = { workspace = true }
 # Test-only since the A2 inversion: the v2 data-fetch suite consumes the session's data/protocol
 # types. A dev-dep beside the session→host normal edge is cargo-legal and carries no runtime
-# direction.
-daemon-vhc-session = { workspace = true }
+# direction. `harness` because the legacy JSON corpus pipeline (`daemon_vhc_session::data`) the
+# fetch suite builds its fixtures from is quarantined behind that feature — the production corpus
+# contract is chunk-addressed, and no default session build exposes the JSON manifest.
+daemon-vhc-session = { workspace = true, features = ["harness"] }
 # Test-only: hand-built wasm fixtures (the driver-selection negative tests + the synthetic
 # ABI-major-1 refusal input) are assembled with `wasm-encoder` — precise control over import
 # namespaces + the `da_abi` constant, with no wasm32 toolchain or guest workspace in the tier-1
