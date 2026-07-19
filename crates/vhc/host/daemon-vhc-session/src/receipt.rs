@@ -3,6 +3,10 @@
 
 //! [`ReceiptProducer`] — turns payload-store availability into a signed `StorageReceipt`.
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): authoring a consensus message is
+//! a coordinator-harness function (never generic transport), so this seat rides the `harness`
+//! feature with the rest of the coordinator drive.
+//!
 //! The commit rule (§6.4 I6) consumes only **signed messages**: a payload enters the round record
 //! iff its `Commitment` arrived *and* signed availability evidence exists — either a
 //! `StorageReceipt` (the coordinator-as-storage-client `HEAD`s the object and *emits the result as

@@ -5,10 +5,14 @@
 //! the production `coordinator_quorum.wasm` blob **from a frozen envelope**, run it under the real
 //! major-2 event-loop driver, and route frames to/from it.
 //!
-//! This is PRODUCTION machinery (consensus never runs outside the sandboxed, content-addressed
-//! module — even in verification): the worker's in-process self-driven join drives its run's
-//! coordinator through this seat, and the testkit's whole-run harness re-exports it (one copy,
-//! no fork). It supersedes the native-coordinator drive shells for every whole-run lane.
+//! This is PRODUCTION-SHAPED machinery (consensus never runs outside the sandboxed,
+//! content-addressed module — even in verification): the worker's in-process self-driven join
+//! drives its run's coordinator through this seat, and the testkit's whole-run harness
+//! re-exports it (one copy, no fork). It supersedes the native-coordinator drive shells for
+//! every whole-run lane. It is nonetheless **HARNESS-GATED**
+//! (`#[cfg(any(test, feature = "harness"))]`): it decodes SDK round decisions, and no default
+//! (production) host build may link a round schema (dep-check-enforced) — the shipped worker
+//! reaches consensus through the role session's opaque-frame path instead.
 //!
 //! ## The configuration seat and the matrix refusals (decisions D3)
 //!

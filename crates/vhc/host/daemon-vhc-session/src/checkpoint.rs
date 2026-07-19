@@ -3,6 +3,10 @@
 
 //! Round-boundary checkpointing + desync-recovery replay (spec §9; TDD RUN-6/7 subset).
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): decodes SDK round schemas
+//! (`RoundRecord` catch-up) + the SDK checkpoint manifest, so it rides the `harness` seat with
+//! the `RoundEngine` orbit until its production consumer (the generic role session) lands.
+//!
 //! A checkpoint is `TrainerBackend::checkpoint_save` bytes plus a [`CheckpointManifest`] — the
 //! round, the blake3 of the bytes (content address, §9), and the post-round state digest (§5.6).
 //! Checkpoints are stored on the payload plane under a reserved key ([`CHECKPOINT_PEER`]), so

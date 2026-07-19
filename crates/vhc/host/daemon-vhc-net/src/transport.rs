@@ -143,6 +143,14 @@ impl ContentStore for MemoryContentStore {
 
 /// A payload plane: opaque payload objects keyed by `(run, round, peer)` + content hash (§7.1).
 ///
+/// **HARNESS-ERA — the coordinate-keyed plane.** This trait predates the content-addressed seam
+/// and remains for the engine-era consumers only: the retained `RoundEngine` orbit
+/// (checkpoint/receipt/harness/coordinator shell, all `harness`-gated in the session crate) and
+/// this crate's own fetch-fallback helpers. Every production binding — the role session
+/// servicing module `payload_put`/`payload_get`/`data.fetch` — is content-addressed
+/// ([`ContentStore`]): the module names CONTENT, never a `(run, round, peer)` coordinate. New
+/// consumers must bind [`ContentStore`].
+///
 /// PUT your sealed update object; GET a committed object (verified against the hash the commitment
 /// carried); HEAD (`stat`) to attest availability without transferring bytes. A payload is opaque —
 /// the transport moves, hashes, and (on GET) verifies it, but never parses it (§7.3).

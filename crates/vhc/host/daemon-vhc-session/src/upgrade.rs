@@ -4,6 +4,10 @@
 //! The host-enforced upgrade transaction (architecture §5.4; ABI §10.3; refactor §9) — the
 //! **local** half of the two-key model.
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): consumes the SDK checkpoint
+//! manifest, so it rides the `harness` seat with the checkpoint manager until its production
+//! command-surface consumer lands.
+//!
 //! Live-run module replacement separates two authorities that must never be conflated
 //! (architecture §5.4):
 //!

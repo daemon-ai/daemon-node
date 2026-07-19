@@ -5,10 +5,14 @@
 //!
 //! The [`VhcTransport`](transport) seam (spec §7.1): one control plane
 //! ([`ControlPlane`] — publish/subscribe of already-signed message bytes, with the in-process
-//! [`LoopbackGossip`] implementation) and one payload plane ([`PayloadStore`] — opaque objects by
-//! `(run, round, peer)` key + content hash, with the filesystem [`FsPayloadStore`] implementation
-//! and its retention window). Artifact fetch ([`ArtifactResolver`]) resolves `file://`
-//! (blake3-verified); `r2`/`hf`/`https` are reserved for the egress plane.
+//! [`LoopbackGossip`] implementation) and one payload plane. The payload plane is split by era:
+//! the **production** plane is content-addressed ([`ContentStore`] — opaque objects keyed by
+//! blake3 alone, with the [`FsContentStore`](content_store::FsContentStore) filesystem seat and
+//! the `R2Store` presigned seat); the coordinate-keyed [`PayloadStore`] (objects by
+//! `(run, round, peer)` key, [`FsPayloadStore`] + retention window) is HARNESS-ERA — it predates
+//! that seam and remains for the retained `RoundEngine` orbit only. Artifact fetch
+//! ([`ArtifactResolver`]) resolves `file://` (blake3-verified); `r2`/`hf`/`https` are reserved
+//! for the egress plane.
 //!
 //! **Opaque by construction:** this crate carries already-signed frame BYTES and content-addressed
 //! payload objects; it defines no consensus message and decodes none (the round message schemas

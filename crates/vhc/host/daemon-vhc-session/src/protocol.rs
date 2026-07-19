@@ -702,7 +702,8 @@ pub struct JoinCredentials {
     #[serde(default)]
     pub iroh: Option<IrohCredentials>,
     /// Optional presign base for the `R2Store` payload plane (e.g.
-    /// `http://127.0.0.1:8795/api/v1/vhc`). Absent ⇒ `FsPayloadStore` fallback (tests / LAN).
+    /// `http://127.0.0.1:8795/api/v1/vhc`). Absent ⇒ the content-addressed `FsContentStore`
+    /// fallback under the node-delivered run dir (tests / LAN).
     #[serde(default)]
     pub presign_base: Option<String>,
     /// The engine + corpus knobs.

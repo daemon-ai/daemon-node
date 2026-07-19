@@ -3,6 +3,11 @@
 
 //! [`RoundEngine`] — the peer-side round state machine (spec §6.4; TDD RUN-1..5, RUN-8).
 //!
+//! **HARNESS-ERA** (`#[cfg(any(test, feature = "harness"))]`): the engine decodes SDK round
+//! schemas, so it lives behind the `harness` feature with its orbit (checkpoint, upgrade,
+//! coordinator shell, replay sandbox, harness). The production session surface routes opaque
+//! signed frames only — no default build links a round schema (dep-check-enforced).
+//!
 //! One async state machine drives a single peer through rounds over the frozen seams —
 //! [`ControlPlane`] + [`PayloadStore`] (net) and [`TrainerBackend`] (run) + the node ed25519
 //! [`SigningKey`] (proto). It consumes the seven signed round messages and emits an
