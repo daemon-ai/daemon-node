@@ -57,6 +57,9 @@ extern "C" {
 extern "C" {
     #[link_name = "fetch"]
     fn abi_data_fetch(hash_ptr: u32, range_off: u64, range_len: u64) -> u64;
+    // -- minor 2: chunk-map registration (the chunk-addressed corpus contract) ------------------
+    #[link_name = "register_chunks"]
+    fn abi_data_register_chunks(desc_ptr: u32, desc_len: u32) -> u32;
 }
 
 #[link(wasm_import_module = "compute@2")]
@@ -374,6 +377,19 @@ pub fn payload_get(hash: &[u8; 32]) -> u64 {
 pub fn data_fetch(hash: &[u8; 32], range_off: u64, range_len: u64) -> u64 {
     // SAFETY: `hash` is a live 32-byte guest span for the call's duration.
     unsafe { abi_data_fetch(hash.as_ptr() as u32, range_off, range_len) }
+}
+
+/// Register one chunk-addressed shard's chunk map (`data@2::register_chunks`, minor 2): `desc`
+/// is canonical CBOR `[chunk_size, token_count, byte_len, [c_0, …]]` (each `c_i` a 32-byte
+/// chunk blake3 — build it with [`crate::corpus::chunk_descriptor`]). The host re-derives the
+/// domain-separated shard fold and admits the map ONLY when the fold is a granted artifact
+/// hash (else it traps `GrantViolation`); returns 0 on (idempotent) registration. After
+/// registration, [`data_fetch`] of that identity is a verified covering-chunk range read —
+/// register BEFORE ranging a shard; a chunk-addressed identity has no whole-object hash to
+/// verify against.
+pub fn data_register_chunks(desc: &[u8]) -> u32 {
+    // SAFETY: `desc` is a live guest span for the call's duration.
+    unsafe { abi_data_register_chunks(desc.as_ptr() as u32, desc.len() as u32) }
 }
 
 // -- minor 2 (Phase C, track C1): the compute@2 command queue (ABI §15) ---------------------------

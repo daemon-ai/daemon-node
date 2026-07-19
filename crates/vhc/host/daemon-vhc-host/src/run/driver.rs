@@ -144,6 +144,12 @@ pub struct RunConfig {
     /// snapshot descriptors (§5.1), an unpinned source is unreachable by construction. Empty =
     /// no artifacts granted (fail closed).
     pub granted_artifacts: std::collections::BTreeSet<[u8; 32]>,
+    /// The cumulative `data@2` **read budget** in raw bytes (`0` = unbounded by this grant):
+    /// the total artifact bytes the module may `data.fetch` across the run instance, charged
+    /// per call from the requested range (deterministic — a pure function of guest call order,
+    /// like every grant refusal). Breach completes `Err(GrantExhausted)`, never a trap and
+    /// never silent truncation. Derived from the admitted grants (`AdmittedQuotas`).
+    pub data_read_budget_bytes: u64,
     /// `buffer-req.max_live_handles` (ABI §2.3): the standing live-buffer handle ceiling
     /// (`0` = unbounded by this grant). Breach traps `BudgetHandles` (§7.3).
     pub max_live_buffer_handles: u64,
@@ -204,6 +210,7 @@ impl RunConfig {
             per_sender_quota: 64,
             hard_accountable_host_bytes: 0,
             granted_artifacts: std::collections::BTreeSet::new(),
+            data_read_budget_bytes: 0,
             max_live_buffer_handles: 64,
             max_live_buffer_bytes: 1 << 26,
             max_outstanding_ops: 16,
@@ -263,9 +270,21 @@ pub enum OpOutcome {
     /// A `data.fetch` serviced the WHOLE artifact (resolver + content cache); the pump verifies
     /// it against the op's committed hash, then slices the op's range before delivery (the
     /// sub-resource verification rule: a range is a slice OF hash-verified content).
+    ///
+    /// Also accepted for an [`OpRequest::ArtifactRange`] from an embedder that can only serve
+    /// whole objects (an in-process content store): the pump extracts the covering span itself
+    /// and chunk-verifies it — correctness is identical, only the transferred volume differs.
     FetchDone {
         /// The complete artifact bytes (verified + sliced by the pump, never the embedder).
         artifact: Vec<u8>,
+    },
+    /// An [`OpRequest::ArtifactRange`] serviced exactly the requested covering span. The pump
+    /// verifies every covering chunk against the REGISTERED chunk hashes (the fold-committed
+    /// map), then slices the guest's original range — the store stays untrusted; a lying span
+    /// completes `Err(HashMismatch)` and the guest never sees the bytes.
+    RangeDone {
+        /// The covering-span bytes (`span_len` of them).
+        bytes: Vec<u8>,
     },
     /// A `stream_open` connected; the pump mints the kind-9 handle with this receiver-granted
     /// initial writable credit (§3.3).
@@ -424,6 +443,15 @@ struct PumpState {
     buffers: BufferTable,
     /// The outstanding-op table (kind 10, ABI §7.5).
     ops: OpTable,
+    /// The registered chunk maps (the chunk-addressed corpus contract): fold identity → the
+    /// module-registered, host-verified chunk map. Registration is deterministic guest output
+    /// (`data@2::register_chunks` re-derives the fold and admits only granted identities), so
+    /// this table is replay-reconstructible and carries no journal record.
+    chunk_maps: std::collections::HashMap<[u8; 32], daemon_vhc_proto::ChunkMap>,
+    /// The cumulative `data@2` read budget (raw bytes; `0` = unbounded) + its ledger. Charged
+    /// at the fetch CALL from the requested range — guest-call-order deterministic.
+    data_read_budget: u64,
+    data_read_used: u64,
     /// The stream table (kind 9, §3.3 credit flow control).
     streams: StreamTable,
     /// Requests awaiting the embedder (the async-runtime bridge): `(op, request)` in issue order.
@@ -1080,6 +1108,88 @@ impl PumpHandle {
                                 code: COMP_ERR_GRANT_EXHAUSTED,
                                 detail: Some("buffer quota exhausted (deny new buffers)".into()),
                             }),
+                        }
+                    }
+                }
+            }
+            (
+                OpRequest::ArtifactRange {
+                    hash,
+                    range_off,
+                    range_len,
+                    span_off,
+                    span_len,
+                },
+                outcome @ (OpOutcome::RangeDone { .. } | OpOutcome::FetchDone { .. }),
+            ) => {
+                // The chunk-addressed verification rule: the pump — never the embedder —
+                // verifies every covering chunk against the REGISTERED (fold-committed) chunk
+                // map, then slices the guest's original range. A whole-object answer
+                // (`FetchDone`, the in-process content-store seat) has its span extracted
+                // first; a span answer (`RangeDone`) must be exactly the requested span.
+                let map = st.chunk_maps.get(&hash).cloned();
+                match map {
+                    None => CompletionResult::Err(CompError {
+                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                        detail: Some(
+                            "chunk map unregistered at completion (pump invariant)".into(),
+                        ),
+                    }),
+                    Some(map) => {
+                        let span = match outcome {
+                            OpOutcome::RangeDone { bytes } => {
+                                if bytes.len() as u64 == span_len {
+                                    Ok(bytes)
+                                } else {
+                                    Err(format!(
+                                        "span answer is {} bytes, the covering span is \
+                                         {span_len}",
+                                        bytes.len()
+                                    ))
+                                }
+                            }
+                            OpOutcome::FetchDone { artifact } => {
+                                if artifact.len() as u64 == map.byte_len {
+                                    let s = span_off as usize;
+                                    Ok(artifact[s..s + span_len as usize].to_vec())
+                                } else {
+                                    Err(format!(
+                                        "whole-object answer is {} bytes, the registered \
+                                         shard is {}",
+                                        artifact.len(),
+                                        map.byte_len
+                                    ))
+                                }
+                            }
+                            _ => unreachable!("outer match arm admits only Range/FetchDone"),
+                        };
+                        match span.and_then(|bytes| verify_covering_span(&map, span_off, bytes)) {
+                            Err(detail) => CompletionResult::Err(CompError {
+                                code: COMP_ERR_HASH_MISMATCH,
+                                detail: Some(detail),
+                            }),
+                            Ok(span_bytes) => {
+                                let end = if range_len == 0 {
+                                    map.byte_len
+                                } else {
+                                    range_off + range_len
+                                };
+                                let lo = (range_off - span_off) as usize;
+                                let hi = lo + (end - range_off) as usize;
+                                let slice = span_bytes[lo..hi].to_vec();
+                                match st.buffers.create_host(Arc::new(slice)) {
+                                    Some(handle) => {
+                                        minted = Some(handle);
+                                        CompletionResult::Ok(SuccessPayload::Handle(handle))
+                                    }
+                                    None => CompletionResult::Err(CompError {
+                                        code: COMP_ERR_GRANT_EXHAUSTED,
+                                        detail: Some(
+                                            "buffer quota exhausted (deny new buffers)".into(),
+                                        ),
+                                    }),
+                                }
+                            }
                         }
                     }
                 }
@@ -2128,19 +2238,182 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         ),
                     ));
                 }
-                let request = OpRequest::ArtifactFetch {
-                    hash,
-                    range_off,
-                    range_len,
-                };
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
-                let op = st.ops.begin(request.clone()).map_err(|code| {
-                    Trap::new(code, "fetch", None, "max_outstanding grant (§2.3)")
-                })?;
-                st.op_requests.push((op, request));
+                let chunked = st.chunk_maps.get(&hash).map(|m| (m.byte_len, m.chunk_size));
+                let (used, budget) = (st.data_read_used, st.data_read_budget);
+                let op = match chunked {
+                    // Chunk-addressed (a registered corpus shard): bounds are knowable NOW
+                    // (registration pinned the geometry), the read budget is charged at the
+                    // call (guest-call-order deterministic), and the embedder is asked for the
+                    // chunk-aligned COVERING SPAN only — never the whole shard.
+                    Some((byte_len, chunk_size)) => {
+                        let end = if range_len == 0 {
+                            byte_len
+                        } else {
+                            range_off.saturating_add(range_len)
+                        };
+                        if range_off > byte_len || end > byte_len {
+                            immediate_fetch_refusal(
+                                &mut st,
+                                hash,
+                                range_off,
+                                range_len,
+                                daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                                format!(
+                                    "range [{range_off}, {end}) out of bounds (registered \
+                                     shard is {byte_len} bytes)"
+                                ),
+                            )?
+                        } else {
+                            let charge = end - range_off;
+                            if budget != 0 && used.saturating_add(charge) > budget {
+                                immediate_fetch_refusal(
+                                    &mut st,
+                                    hash,
+                                    range_off,
+                                    range_len,
+                                    COMP_ERR_GRANT_EXHAUSTED,
+                                    format!(
+                                        "data-read budget exhausted ({used} of {budget} bytes \
+                                         used; {charge} more requested)"
+                                    ),
+                                )?
+                            } else {
+                                st.data_read_used += charge;
+                                let (span_off, span_len) = daemon_vhc_proto::covering_span(
+                                    byte_len, chunk_size, range_off, end,
+                                );
+                                if span_len == 0 {
+                                    // An empty range needs no store round-trip: complete an
+                                    // empty buffer at the call (deterministic, journaled).
+                                    let request = OpRequest::ArtifactRange {
+                                        hash,
+                                        range_off,
+                                        range_len,
+                                        span_off,
+                                        span_len,
+                                    };
+                                    let op = st.ops.begin(request).map_err(|code| {
+                                        Trap::new(
+                                            code,
+                                            "fetch",
+                                            None,
+                                            "max_outstanding grant (§2.3)",
+                                        )
+                                    })?;
+                                    st.ops.finish(op);
+                                    let result = match st.buffers.create_host(Arc::new(vec![])) {
+                                        Some(handle) => {
+                                            CompletionResult::Ok(SuccessPayload::Handle(handle))
+                                        }
+                                        None => CompletionResult::Err(CompError {
+                                            code: COMP_ERR_GRANT_EXHAUSTED,
+                                            detail: Some(
+                                                "buffer quota exhausted (deny new buffers)".into(),
+                                            ),
+                                        }),
+                                    };
+                                    st.enqueue_completion(op, &result).map_err(|e| {
+                                        Trap::bare(TrapCode::BadModule, e.to_string())
+                                    })?;
+                                    op
+                                } else {
+                                    let request = OpRequest::ArtifactRange {
+                                        hash,
+                                        range_off,
+                                        range_len,
+                                        span_off,
+                                        span_len,
+                                    };
+                                    let op = st.ops.begin(request.clone()).map_err(|code| {
+                                        Trap::new(
+                                            code,
+                                            "fetch",
+                                            None,
+                                            "max_outstanding grant (§2.3)",
+                                        )
+                                    })?;
+                                    st.op_requests.push((op, request));
+                                    op
+                                }
+                            }
+                        }
+                    }
+                    // Plain artifact (manifest/tokenizer/module blob): the whole-artifact
+                    // verify-then-slice path, with a definite-length request charged against
+                    // the read budget at the call (a `range_len == 0` whole fetch charges at
+                    // the artifact's true size only once known — plain artifacts are the small
+                    // class; the shard volume is always chunk-registered and fully charged).
+                    None => {
+                        if budget != 0 && used.saturating_add(range_len) > budget {
+                            immediate_fetch_refusal(
+                                &mut st,
+                                hash,
+                                range_off,
+                                range_len,
+                                COMP_ERR_GRANT_EXHAUSTED,
+                                format!(
+                                    "data-read budget exhausted ({used} of {budget} bytes \
+                                     used; {range_len} more requested)"
+                                ),
+                            )?
+                        } else {
+                            st.data_read_used += range_len;
+                            let request = OpRequest::ArtifactFetch {
+                                hash,
+                                range_off,
+                                range_len,
+                            };
+                            let op = st.ops.begin(request.clone()).map_err(|code| {
+                                Trap::new(code, "fetch", None, "max_outstanding grant (§2.3)")
+                            })?;
+                            st.op_requests.push((op, request));
+                            op
+                        }
+                    }
+                };
                 st.note_egress();
                 Ok(op)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
+    // ---- data@2::register_chunks — the chunk-addressed corpus registration (minor 2) ------------
+    // The module presents one shard's chunk map as canonical CBOR
+    // `[chunk_size, token_count, byte_len, [c_0, …]]`; the host re-derives the domain-separated
+    // fold and admits the map ONLY when the fold IS a granted artifact hash — a module cannot
+    // register chunks for content it was not granted, and a lying chunk list can never derive a
+    // granted identity. Deterministic guest output (§2.7 dc class): no journal record; replay
+    // re-executes the registration over reproduced guest memory. Idempotent per identity.
+    linker.func_wrap(
+        NS_DATA_V2,
+        "register_chunks",
+        |mut c: Caller<'_, Host>, desc_ptr: u32, desc_len: u32| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, Host>| {
+                c.data_mut().enter("register_chunks")?;
+                let desc = read_guest(c, desc_ptr, desc_len)?;
+                let map = decode_chunk_descriptor(&desc).map_err(|detail| {
+                    Trap::new(TrapCode::BadEnum, "register_chunks", None, detail)
+                })?;
+                let fold = map.fold();
+                if !c.data().granted_artifacts.contains(&fold.0) {
+                    return Err(Trap::new(
+                        TrapCode::GrantViolation,
+                        "register_chunks",
+                        None,
+                        format!(
+                            "chunk-map fold {} is not in the admitted artifact set (which \
+                             artifacts a module may touch is a grant, architecture §3.2)",
+                            fold.to_hex()
+                        ),
+                    ));
+                }
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.chunk_maps.insert(fold.0, map);
+                Ok(0)
             })(&mut c);
             stash(&mut c, r)
         },
@@ -2771,6 +3044,120 @@ fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
     Ok(())
 }
 
+/// Mint + immediately refuse one `data.fetch` op with a typed completion error (bounds/budget
+/// refusals whose facts are knowable at the call): the OpId mint stays uniform (§7.1 — every
+/// OpId derives from the one `begin()` sequence), the op retires at once, and the journaled
+/// tag-14 completion carries the refusal for replay.
+fn immediate_fetch_refusal(
+    st: &mut PumpState,
+    hash: [u8; 32],
+    range_off: u64,
+    range_len: u64,
+    code: u64,
+    detail: String,
+) -> Result<u64, Trap> {
+    let op = st
+        .ops
+        .begin(OpRequest::ArtifactFetch {
+            hash,
+            range_off,
+            range_len,
+        })
+        .map_err(|code| Trap::new(code, "fetch", None, "max_outstanding grant (§2.3)"))?;
+    st.ops.finish(op);
+    let result = CompletionResult::Err(CompError {
+        code,
+        detail: Some(detail),
+    });
+    st.enqueue_completion(op, &result)
+        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+    Ok(op)
+}
+
+/// Decode the `register_chunks` descriptor — canonical CBOR
+/// `[chunk_size, token_count, byte_len, [c_0, …]]` (each `c_i` a 32-byte chunk blake3) — into a
+/// well-formed [`daemon_vhc_proto::ChunkMap`]. Malformed shape/geometry is described (the
+/// import traps it typed — a bad descriptor is a module authoring fault, not a store fault).
+pub(crate) fn decode_chunk_descriptor(desc: &[u8]) -> Result<daemon_vhc_proto::ChunkMap, String> {
+    let v: ciborium::value::Value =
+        ciborium::de::from_reader(desc).map_err(|e| format!("descriptor is not CBOR: {e}"))?;
+    let ciborium::value::Value::Array(parts) = v else {
+        return Err("descriptor is not a CBOR array".into());
+    };
+    let uint = |i: usize, name: &str| -> Result<u64, String> {
+        parts
+            .get(i)
+            .and_then(ciborium::value::Value::as_integer)
+            .and_then(|n| u64::try_from(i128::from(n)).ok())
+            .ok_or_else(|| format!("descriptor `{name}` is not a uint"))
+    };
+    let chunk_size = uint(0, "chunk_size")?;
+    let token_count = uint(1, "token_count")?;
+    let byte_len = uint(2, "byte_len")?;
+    let Some(ciborium::value::Value::Array(hashes)) = parts.get(3) else {
+        return Err("descriptor chunk-hash list is not an array".into());
+    };
+    let mut chunk_hashes = Vec::with_capacity(hashes.len());
+    for (i, h) in hashes.iter().enumerate() {
+        let ciborium::value::Value::Bytes(b) = h else {
+            return Err(format!("chunk hash {i} is not a byte string"));
+        };
+        let arr: [u8; 32] = b
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("chunk hash {i} is not 32 bytes"))?;
+        chunk_hashes.push(daemon_vhc_proto::Hash(arr));
+    }
+    let map = daemon_vhc_proto::ChunkMap {
+        chunk_size,
+        token_count,
+        byte_len,
+        chunk_hashes,
+    };
+    if !map.is_well_formed() {
+        return Err(format!(
+            "degenerate chunk geometry (chunk_size {chunk_size}, byte_len {byte_len}, {} \
+             chunk hashes)",
+            map.chunk_hashes.len()
+        ));
+    }
+    Ok(map)
+}
+
+/// Verify a chunk-aligned covering span against the registered chunk map: split `bytes` at
+/// `chunk_size`, and every chunk's blake3 must equal the registered hash at its absolute index
+/// (`span_off / chunk_size + i`). Returns the verified bytes, or the first mismatch described.
+fn verify_covering_span(
+    map: &daemon_vhc_proto::ChunkMap,
+    span_off: u64,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let base = span_off / map.chunk_size;
+    let mut cursor = 0usize;
+    let mut index = base;
+    while cursor < bytes.len() {
+        let expected_len = map.chunk_len(index) as usize;
+        let Some(expected) = map.chunk_hashes.get(index as usize) else {
+            return Err(format!("span reaches past the chunk list (chunk {index})"));
+        };
+        let end = cursor + expected_len;
+        if end > bytes.len() {
+            return Err(format!(
+                "span truncates chunk {index} ({} of {expected_len} bytes)",
+                bytes.len() - cursor
+            ));
+        }
+        if blake3::hash(&bytes[cursor..end]).as_bytes() != &expected.0 {
+            return Err(format!(
+                "chunk {index} does not hash to the registered chunk hash"
+            ));
+        }
+        cursor = end;
+        index += 1;
+    }
+    Ok(bytes)
+}
+
 /// Move due timers into the queue as `Timer` events, in `(fire_at, timer_id)` order (§6.3).
 fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
     if !st.timers.iter().any(|t| t.fire_at <= now) {
@@ -2949,6 +3336,9 @@ pub fn start_run_migrating(
             // per start_run; trap-restart re-seeding rides the tag-13 counter, ABI §7.1).
             buffers: BufferTable::new(0, run.max_live_buffer_handles, run.max_live_buffer_bytes),
             ops: OpTable::new(0, run.max_outstanding_ops),
+            chunk_maps: std::collections::HashMap::new(),
+            data_read_budget: run.data_read_budget_bytes,
+            data_read_used: 0,
             streams: StreamTable::new(0),
             op_requests: Vec::new(),
             stop_enqueued: false,
@@ -3386,6 +3776,9 @@ mod tests {
             published: Vec::new(),
             buffers: BufferTable::new(0, 0, 0),
             ops: OpTable::new(0, 0),
+            chunk_maps: std::collections::HashMap::new(),
+            data_read_budget: 0,
+            data_read_used: 0,
             streams: StreamTable::new(0),
             op_requests: Vec::new(),
             stop_enqueued: false,
@@ -3410,6 +3803,195 @@ mod tests {
 
     fn signed_stub() -> Vec<u8> {
         b"signed-frame-stub".to_vec()
+    }
+
+    /// A chunked fixture: 80 bytes at chunk_size 32 (two full chunks + one short).
+    fn chunk_fixture() -> (daemon_vhc_proto::ChunkMap, Vec<u8>) {
+        let bytes: Vec<u8> = (0u8..80).collect();
+        let map = daemon_vhc_proto::ChunkMap {
+            chunk_size: 32,
+            token_count: 40,
+            byte_len: 80,
+            chunk_hashes: daemon_vhc_proto::chunk_hashes(&bytes, 32),
+        };
+        (map, bytes)
+    }
+
+    #[test]
+    fn covering_span_verification_accepts_true_chunks_and_refuses_lies() {
+        let (map, bytes) = chunk_fixture();
+        // The full span verifies; a mid-span range's covering chunks verify.
+        assert_eq!(verify_covering_span(&map, 0, bytes.clone()).unwrap(), bytes);
+        assert!(verify_covering_span(&map, 32, bytes[32..].to_vec()).is_ok());
+        // One flipped byte in any covering chunk is a described refusal.
+        let mut tampered = bytes.clone();
+        tampered[40] ^= 0xFF;
+        let err = verify_covering_span(&map, 0, tampered).unwrap_err();
+        assert!(err.contains("chunk 1"), "{err}");
+        // A truncated span is refused, never partially accepted.
+        assert!(verify_covering_span(&map, 0, bytes[..40].to_vec())
+            .unwrap_err()
+            .contains("truncates chunk 1"));
+        // A span past the chunk list is refused.
+        let mut overlong = bytes.clone();
+        overlong.extend_from_slice(&[0u8; 32]);
+        assert!(verify_covering_span(&map, 0, overlong)
+            .unwrap_err()
+            .contains("past the chunk list"));
+    }
+
+    #[test]
+    fn chunk_descriptor_decode_round_trips_and_rejects_malformed() {
+        let (map, _) = chunk_fixture();
+        let hashes: Vec<ciborium::value::Value> = map
+            .chunk_hashes
+            .iter()
+            .map(|h| ciborium::value::Value::Bytes(h.0.to_vec()))
+            .collect();
+        let doc = ciborium::value::Value::Array(vec![
+            ciborium::value::Value::from(map.chunk_size),
+            ciborium::value::Value::from(map.token_count),
+            ciborium::value::Value::from(map.byte_len),
+            ciborium::value::Value::Array(hashes),
+        ]);
+        let desc = daemon_vhc_proto::to_canonical_vec(&doc).unwrap();
+        let decoded = decode_chunk_descriptor(&desc).unwrap();
+        assert_eq!(decoded, map);
+        assert_eq!(decoded.fold(), map.fold());
+
+        assert!(decode_chunk_descriptor(b"junk").is_err(), "not CBOR");
+        // Degenerate geometry (chunk list shorter than the byte length needs) is refused.
+        let bad = ciborium::value::Value::Array(vec![
+            ciborium::value::Value::from(32u64),
+            ciborium::value::Value::from(40u64),
+            ciborium::value::Value::from(80u64),
+            ciborium::value::Value::Array(vec![ciborium::value::Value::Bytes(vec![0u8; 32])]),
+        ]);
+        let bad_desc = daemon_vhc_proto::to_canonical_vec(&bad).unwrap();
+        assert!(decode_chunk_descriptor(&bad_desc)
+            .unwrap_err()
+            .contains("degenerate"));
+    }
+
+    #[test]
+    fn chunked_completion_verifies_covering_chunks_then_slices_the_range() {
+        let (map, bytes) = chunk_fixture();
+        let fold = map.fold();
+        let sink = Arc::new(Mutex::new(MemorySink::new()));
+        let pump = test_pump(Box::new(sink.clone()));
+        {
+            let mut st = pump.shared.state.lock().unwrap();
+            st.chunk_maps.insert(fold.0, map.clone());
+        }
+        // The guest asked for [40, 60); chunk 1 ([32, 64)) covers it entirely.
+        let (span_off, span_len) =
+            daemon_vhc_proto::covering_span(map.byte_len, map.chunk_size, 40, 60);
+        assert_eq!((span_off, span_len), (32, 32));
+        let request = OpRequest::ArtifactRange {
+            hash: fold.0,
+            range_off: 40,
+            range_len: 20,
+            span_off,
+            span_len,
+        };
+        let op = {
+            let mut st = pump.shared.state.lock().unwrap();
+            let op = st.ops.begin(request.clone()).unwrap();
+            st.op_requests.push((op, request));
+            op
+        };
+        // A span answer with true chunks completes Ok(handle) carrying exactly the range.
+        let handle = pump
+            .complete_op(
+                op,
+                OpOutcome::RangeDone {
+                    bytes: bytes[32..64].to_vec(),
+                },
+            )
+            .unwrap()
+            .expect("range completion mints a buffer");
+        let st = pump.shared.state.lock().unwrap();
+        let buf = st.buffers.resolve(handle).unwrap();
+        assert_eq!(buf.as_slice(), &bytes[40..60]);
+    }
+
+    #[test]
+    fn chunked_completion_refuses_tampered_spans_typed() {
+        let (map, bytes) = chunk_fixture();
+        let fold = map.fold();
+        let sink = Arc::new(Mutex::new(MemorySink::new()));
+        let pump = test_pump(Box::new(sink.clone()));
+        {
+            let mut st = pump.shared.state.lock().unwrap();
+            st.chunk_maps.insert(fold.0, map.clone());
+        }
+        let request = OpRequest::ArtifactRange {
+            hash: fold.0,
+            range_off: 0,
+            range_len: 16,
+            span_off: 0,
+            span_len: 32,
+        };
+        let op = {
+            let mut st = pump.shared.state.lock().unwrap();
+            st.ops.begin(request).unwrap()
+        };
+        let mut lied = bytes[..32].to_vec();
+        lied[3] ^= 0x01;
+        let minted = pump
+            .complete_op(op, OpOutcome::RangeDone { bytes: lied })
+            .unwrap();
+        assert!(minted.is_none(), "no buffer for a refused span");
+        // The journaled completion is the typed HashMismatch — the guest never saw the bytes.
+        let entries = sink.lock().unwrap().entries.clone();
+        let completion = entries
+            .iter()
+            .find_map(|e| match e {
+                SinkEntry::Completion { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("completion journaled");
+        let decoded = CompletionResult::decode(&completion).unwrap();
+        assert!(matches!(
+            decoded,
+            CompletionResult::Err(CompError { code, .. })
+                if code == COMP_ERR_HASH_MISMATCH
+        ));
+    }
+
+    /// A whole-object answer for a chunked request (the in-process content-store seat) is
+    /// span-extracted + chunk-verified by the pump — same trust path, different transfer shape.
+    #[test]
+    fn chunked_completion_accepts_whole_object_answers() {
+        let (map, bytes) = chunk_fixture();
+        let fold = map.fold();
+        let pump = test_pump(Box::new(MemorySink::new()));
+        {
+            let mut st = pump.shared.state.lock().unwrap();
+            st.chunk_maps.insert(fold.0, map.clone());
+        }
+        let request = OpRequest::ArtifactRange {
+            hash: fold.0,
+            range_off: 70,
+            range_len: 0, // to the end
+            span_off: 64,
+            span_len: 16,
+        };
+        let op = {
+            let mut st = pump.shared.state.lock().unwrap();
+            st.ops.begin(request).unwrap()
+        };
+        let handle = pump
+            .complete_op(
+                op,
+                OpOutcome::FetchDone {
+                    artifact: bytes.clone(),
+                },
+            )
+            .unwrap()
+            .expect("whole-object answer verifies");
+        let st = pump.shared.state.lock().unwrap();
+        assert_eq!(st.buffers.resolve(handle).unwrap().as_slice(), &bytes[70..]);
     }
 
     #[test]

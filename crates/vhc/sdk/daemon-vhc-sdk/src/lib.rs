@@ -21,7 +21,13 @@ pub mod corpus;
 pub mod migrate;
 pub mod module;
 
-pub use corpus::{BatchLocation, CorpusError, CorpusWindow, Manifest, ShardDesc, TokenWidth};
+#[cfg(target_arch = "wasm32")]
+pub use corpus::register_shard_chunks;
+pub use corpus::{
+    chunk_descriptor, decode_sequence_tokens, derive_assignment, plan_window, sequence_byte_range,
+    Assignment, AssignmentParams, BatchLocation, CorpusError, CorpusManifest, CorpusWindow,
+    Manifest, RangeFetch, ShardDesc, TokenWidth,
+};
 pub use migrate::{
     build_manifest, MigrateState, MigrationDescriptor, MigrationSection, OwnedSection, SectionDecl,
     SectionReader, SimSections, StateManifest,

@@ -185,6 +185,12 @@ struct ReplayHost {
     /// deterministic): the completion buffer materializes as the RANGE SLICE of the
     /// content-addressed artifact bytes — the same payload table, extended for artifacts.
     op_fetches: HashMap<u64, ([u8; 32], u64, u64)>,
+    /// Chunk maps re-registered by the replayed guest (`data@2::register_chunks` is
+    /// deterministic guest output — re-executed, never journaled): fold identity → map. A
+    /// fetch of a registered identity materializes its buffer from CHUNK-keyed payload-table
+    /// entries (the chunk hashes are the content addresses; the shard fold has no whole-object
+    /// bytes anywhere).
+    chunk_maps: HashMap<[u8; 32], daemon_vhc_proto::ChunkMap>,
     /// `stream_read` ops awaiting their journaled kind-4 bytes at completion delivery.
     stream_read_ops: std::collections::HashSet<u64>,
     /// `compute.export` ops awaiting their journaled kind-5 tensor bytes at completion delivery.
@@ -297,29 +303,86 @@ fn dispatch(
                             };
                             host.host_buffers.insert(h, Arc::new(bytes.clone()));
                         } else if let Some((hash, off, len)) = host.op_fetches.remove(&op) {
-                            // A data.fetch success: materialize the RANGE SLICE of the
-                            // content-addressed artifact (the recording's complete_op sliced
-                            // exactly this window from the verified artifact).
-                            let Some(artifact) = host.script.payloads.get(&hash) else {
-                                return Err(diverged(format!(
-                                    "ReplayMissingPayload: fetch completion for op {op:#x} \
-                                     names artifact {} but the replay payload table lacks it",
-                                    hex8(&hash)
-                                )));
-                            };
-                            let total = artifact.len() as u64;
-                            let end = if len == 0 {
-                                total
+                            // A data.fetch success materializes the RANGE SLICE the recording
+                            // delivered. Chunk-addressed artifact (a re-registered fold
+                            // identity): reassemble the covering span from CHUNK-keyed payload
+                            // table entries and slice — the shard has no whole-object content
+                            // address. Plain artifact: slice the whole-object table entry.
+                            let slice = if let Some(map) = host.chunk_maps.get(&hash) {
+                                let end = if len == 0 {
+                                    map.byte_len
+                                } else {
+                                    off.saturating_add(len)
+                                };
+                                if off > map.byte_len || end > map.byte_len {
+                                    return Err(diverged(format!(
+                                        "fetch completion for op {op:#x} succeeded but the \
+                                         range [{off}, {end}) exceeds the registered shard \
+                                         ({} bytes)",
+                                        map.byte_len
+                                    )));
+                                }
+                                let (span_off, span_len) = daemon_vhc_proto::covering_span(
+                                    map.byte_len,
+                                    map.chunk_size,
+                                    off,
+                                    end,
+                                );
+                                let mut span = Vec::with_capacity(span_len as usize);
+                                let base = span_off / map.chunk_size;
+                                let mut i = base;
+                                while (span.len() as u64) < span_len {
+                                    let Some(chunk_hash) = map.chunk_hashes.get(i as usize) else {
+                                        return Err(diverged(format!(
+                                            "fetch completion for op {op:#x}: covering span \
+                                             reaches past the registered chunk list"
+                                        )));
+                                    };
+                                    let Some(bytes) = host.script.payloads.get(&chunk_hash.0)
+                                    else {
+                                        return Err(diverged(format!(
+                                            "ReplayMissingPayload: fetch completion for op \
+                                             {op:#x} needs chunk {} but the replay payload \
+                                             table lacks it",
+                                            hex8(&chunk_hash.0)
+                                        )));
+                                    };
+                                    span.extend_from_slice(bytes);
+                                    i += 1;
+                                }
+                                let lo = (off - span_off) as usize;
+                                let hi = lo + (end - off) as usize;
+                                if hi > span.len() {
+                                    return Err(diverged(format!(
+                                        "fetch completion for op {op:#x}: reassembled span \
+                                         is shorter than the recorded range"
+                                    )));
+                                }
+                                span[lo..hi].to_vec()
                             } else {
-                                off.saturating_add(len)
+                                let Some(artifact) = host.script.payloads.get(&hash) else {
+                                    return Err(diverged(format!(
+                                        "ReplayMissingPayload: completion for op {op:#x} \
+                                         names artifact {} but the replay payload table \
+                                         lacks it",
+                                        hex8(&hash)
+                                    )));
+                                };
+                                let total = artifact.len() as u64;
+                                let end = if len == 0 {
+                                    total
+                                } else {
+                                    off.saturating_add(len)
+                                };
+                                if off > total || end > total {
+                                    return Err(diverged(format!(
+                                        "fetch completion for op {op:#x} succeeded but the \
+                                         range [{off}, {end}) exceeds the artifact ({total} \
+                                         bytes)"
+                                    )));
+                                }
+                                artifact[off as usize..end as usize].to_vec()
                             };
-                            if off > total || end > total {
-                                return Err(diverged(format!(
-                                    "fetch completion for op {op:#x} succeeded but the range \
-                                     [{off}, {end}) exceeds the artifact ({total} bytes)"
-                                )));
-                            }
-                            let slice = artifact[off as usize..end as usize].to_vec();
                             host.host_buffers.insert(h, Arc::new(slice));
                         } else if host.stream_read_ops.remove(&op) {
                             // Opaque stream bytes: materialize from the journaled kind-4 record
@@ -474,6 +537,21 @@ fn dispatch(
                 .map_err(|c| diverged(format!("payload_get refused at replay: {c:?}")))?;
             host.op_hashes.insert(op, hash);
             results[0] = Val::I64(op as i64);
+            Ok(())
+        }
+        ("data@2", "register_chunks") => {
+            // Deterministic guest output (§2.7 dc class): re-execute the registration over the
+            // reproduced guest memory — the grant/fold check passed at recording (a violation
+            // would have trapped there), so replay only rebuilds the map for materialization.
+            let (ptr, len) = (p_u32(params, 0), p_u32(params, 1));
+            let mem = mem_of(caller)?;
+            let mut desc = vec![0u8; len as usize];
+            mem.read(&mut *caller, ptr as usize, &mut desc)
+                .map_err(|e| wasmtime::Error::msg(format!("register_chunks read: {e}")))?;
+            let map = super::driver::decode_chunk_descriptor(&desc)
+                .map_err(|e| diverged(format!("register_chunks undecodable at replay: {e}")))?;
+            caller.data_mut().chunk_maps.insert(map.fold().0, map);
+            results[0] = Val::I32(0);
             Ok(())
         }
         ("data@2", "fetch") => {
@@ -833,6 +911,7 @@ pub fn replay_migrating(
         ops: OpTable::new(0, 0),
         op_hashes: HashMap::new(),
         op_fetches: HashMap::new(),
+        chunk_maps: HashMap::new(),
         stream_read_ops: std::collections::HashSet::new(),
         tensor_export_ops: std::collections::HashSet::new(),
         host_buffers: HashMap::new(),
