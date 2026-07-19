@@ -21,6 +21,7 @@ const RUN: &str = "acceptance-r2";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_training_over_presigned_r2_payload_plane() {
+    let _serial = harness::serial_guard();
     let base_port = harness::free_port();
     let base_url = format!("http://127.0.0.1:{base_port}/api/v1/vhc");
 

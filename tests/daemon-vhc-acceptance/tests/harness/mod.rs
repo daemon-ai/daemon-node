@@ -66,6 +66,55 @@ pub fn locate_bin(name: &str) -> PathBuf {
     profile_dir.join(name)
 }
 
+/// A cross-process serialization guard: each heavy multi-process gate spawns three real node
+/// processes doing burn compute, so running several gates concurrently (cargo runs test binaries
+/// in parallel) oversubscribes the host and makes round timing flaky. Every gate takes this guard
+/// first; it blocks (advisory lockfile) until any other gate finishes, so gates run one at a time
+/// regardless of how the suite is invoked — deterministic timing, never a retry-to-green.
+pub struct SerialGuard {
+    path: PathBuf,
+}
+
+impl Drop for SerialGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Acquire the acceptance-suite serial guard (blocks until free; stale locks older than 30 min
+/// are reclaimed so a killed gate never wedges the suite).
+pub fn serial_guard() -> SerialGuard {
+    let path = std::env::temp_dir().join("vhc-acceptance-serial.lock");
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                let _ = writeln!(f, "{}", std::process::id());
+                return SerialGuard { path };
+            }
+            Err(_) => {
+                // Reclaim a stale lock (a gate that was killed before its guard dropped).
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| m.elapsed().ok())
+                        .is_some_and(|e| e > Duration::from_secs(1800))
+                    {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
 /// A free loopback TCP port (bind :0, read the assignment, drop the listener).
 pub fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")

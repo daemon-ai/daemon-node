@@ -21,6 +21,7 @@ const RUN: &str = "acceptance-baseline";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_training_converges_with_agreeing_digests() {
+    let _serial = harness::serial_guard();
     // A shared filesystem payload root every node serves content-addressed objects over (the
     // local stand-in for a shared object store).
     let payload_root = tempfile::tempdir().expect("shared payload root");

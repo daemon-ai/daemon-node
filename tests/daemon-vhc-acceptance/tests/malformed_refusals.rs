@@ -21,6 +21,7 @@ const RUN: &str = "acceptance-malformed";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_frame_and_untrusted_cert_are_typed_refusals() {
+    let _serial = harness::serial_guard();
     let payload_root = tempfile::tempdir().expect("shared payload root");
     let base_port = harness::free_port();
     let base_url = format!("http://127.0.0.1:{base_port}/api/v1/vhc");
