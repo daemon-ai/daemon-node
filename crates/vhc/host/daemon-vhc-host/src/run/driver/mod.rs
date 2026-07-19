@@ -52,16 +52,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ciborium::value::Value;
-use wasmtime::{Caller, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Caller, Linker, Module, Store, StoreLimitsBuilder};
 
 use daemon_vhc_abi::{
     pack_status_len, CHANNEL_DIR_RX_ONLY, COMP_ERR_GRANT_EXHAUSTED, EV_TAG_FRAME, EV_TAG_STOP,
-    FRAME_ENVELOPE_DOMAIN_V2, NS_COMPUTE_V2, NS_DATA_V2, NS_NET_V2, NS_SYS_V2, NS_TABI_V1,
-    NS_VHC_V2, PHASE_A_DEFAULT_CHANNEL_TABLE, READBACK_KIND_STAGED_BYTES, RET_STATUS_DELIVERED,
+    NS_COMPUTE_V2, NS_DATA_V2, NS_NET_V2, NS_SYS_V2, NS_TABI_V1, NS_VHC_V2,
+    PHASE_A_DEFAULT_CHANNEL_TABLE, READBACK_KIND_STAGED_BYTES, RET_STATUS_DELIVERED,
     RET_STATUS_NEED_CAPACITY, SNAPSHOT_STATE_SECTION_MISSING, STAGED_KIND_BYTES,
 };
-use daemon_vhc_proto::{peer_id, sign_canonical, to_canonical_vec, SigningKey};
+use daemon_vhc_proto::{peer_id, SigningKey};
 
 use crate::run::buffer::BufferTable;
 use crate::run::completion::{CompError, CompletionResult, SuccessPayload};
@@ -73,6 +72,7 @@ use crate::trap::{Trap, TrapCode};
 
 mod chunks;
 mod config;
+mod host;
 mod migration;
 mod pump;
 
@@ -81,291 +81,15 @@ pub use config::{
     DeliverVerdict, MigrationInput, OpOutcome, RunConfig, RunEnd, RunError, RunIdentity,
     SnapshotCapture, SpooledFrame,
 };
+pub(crate) use host::{
+    build_signed_frame, read_guest, shared_of, stash, write_guest, Host, SliceState, PARK_RECHECK,
+};
+pub use host::{derive_rng_seed, host_crypto_hash, host_crypto_verify};
 pub(crate) use migration::{build_migration_descriptor, decode_manifest_sections};
 pub use pump::PumpHandle;
 pub(crate) use pump::{fire_due_timers, ArmedTimer, PumpShared, PumpState};
 
-// -- the guest-side store data --------------------------------------------------------------------
-
-/// Per-slice budget/legality state (guest-thread-local — never behind the pump lock).
-struct SliceState {
-    /// Inside `da_init` (imports illegal, §6.6 rule 1).
-    in_init: bool,
-    /// Inside `da_migrate` (every import illegal EXCEPT `read_back(kind = 3)` — the one §6.6
-    /// exception, §10.2).
-    in_migrate: bool,
-    /// `Stop` has been consumed (every import traps `PhaseViolation`, §4.4).
-    stopped: bool,
-    /// A `Quiesce` drain is open (freezes some behaviors, §4.4).
-    draining: bool,
-    /// The slice-constant logical `now()` (§6.5): the current slice's delivery timestamp.
-    now: u64,
-    /// Op-budget consumed this slice.
-    op_calls: u64,
-    /// Readback bytes consumed this slice.
-    readback_bytes: u64,
-    /// A pending mandatory `next_event` retry: the required capacity (§4.1).
-    pending_next: Option<u64>,
-    /// A pending mandatory `read_back` retry: `(src, kind, required)` (§6.4).
-    pending_readback: Option<(u64, u32, u64)>,
-    /// A pending mandatory `device_profile` retry: the required capacity (same §4.1/§6.4
-    /// mandatory-retry discipline — the profile is delivered, and journaled, exactly once).
-    pending_device: Option<u64>,
-    /// The already-computed value behind a pending `read_back` retry (§6.4 "the staged value
-    /// remains available"): the retry re-delivers the SAME value.
-    pending_readback_value: Option<Vec<u8>>,
-}
-
-/// The wasmtime `Store` data for a v2 run instance.
-struct Host {
-    shared: Arc<PumpShared>,
-    limits: StoreLimits,
-    trap: Option<Trap>,
-    slice: SliceState,
-    // budgets (per-slice allowances)
-    fuel_per_slice: u64,
-    op_budget: u64,
-    epoch_ticks: u64,
-    max_readback_bytes: u64,
-    max_frame_bytes: u32,
-    // the claim's hard-accountable host-tier cap (standing, not per-slice — ABI §9.1/§5.5)
-    hard_accountable_host_bytes: u64,
-    accountable_staged_bytes: u64,
-    // the migration grant (ABI §2.6): snapshot bounds on the producing side; the restore bit on
-    // the consuming (migrating) side (`read_back(kind = 3)` legality, §10.2)
-    migration_max_sections: u64,
-    migration_max_section_bytes: u64,
-    migration_restore: bool,
-    // signing (§12.1)
-    signing: SigningKey,
-    identity: RunIdentity,
-    sender: [u8; 32],
-    // sys@2 ambient inputs: the admitted device-profile bytes (nondeterministic input — journaled
-    // tag 15 per delivery) and the identity-derived RNG seed (deterministic — never journaled).
-    device_bytes: Vec<u8>,
-    rng_seed: [u8; 32],
-    // data@2: the admitted artifact set ("which artifacts a module may touch is a grant") — the
-    // envelope's edge-pinned artifact map ∩ the role's grants. Fail closed when empty.
-    granted_artifacts: std::collections::BTreeSet<[u8; 32]>,
-    // compute@2 (track C1, ABI §15): the per-instance command-queue runner over the ADMITTED
-    // backend (`EngineConfig.backend` → ndarray/wgpu/cuda), guest-thread-local (device work
-    // belongs to the guest thread, §11.1/§11.3 — the runner drops with the Store; GPU backends
-    // additionally REQUIRE single-thread driving, which this placement provides by
-    // construction). `None` when the module imports no compute@2 symbol.
-    compute: Option<crate::compute::HostCompute>,
-    // The queue-depth grant + its ledger: ops enqueued since the last successful fence.
-    compute_queue_depth: u64,
-    compute_ops_since_fence: u64,
-    // The deferred-fault injection seam (see `RunConfig::compute_fault_after_ops`).
-    compute_fault_after_ops: Option<u64>,
-    compute_ops_total: u64,
-}
-
-impl Host {
-    fn charge_op(&mut self, import: &'static str) -> Result<(), Trap> {
-        self.slice.op_calls += 1;
-        if self.slice.op_calls > self.op_budget {
-            return Err(Trap::new(
-                TrapCode::BudgetOps,
-                import,
-                None,
-                "per-slice op budget exhausted",
-            ));
-        }
-        Ok(())
-    }
-
-    /// The §6.6 temporal-legality gate + §4.1/§6.4 mandatory-retry enforcement, shared by every
-    /// import. `is_next_event`/`is_read_back` let the two blocking imports pass their own retry.
-    fn enter(&mut self, import: &'static str) -> Result<(), Trap> {
-        if self.slice.stopped {
-            return Err(Trap::new(
-                TrapCode::PhaseViolation,
-                import,
-                None,
-                "import after Stop was consumed (§4.4)",
-            ));
-        }
-        if self.slice.in_init {
-            return Err(Trap::new(
-                TrapCode::PhaseViolation,
-                import,
-                None,
-                "capability import during da_init (§6.6)",
-            ));
-        }
-        if self.slice.in_migrate && import != "read_back" {
-            return Err(Trap::new(
-                TrapCode::PhaseViolation,
-                import,
-                None,
-                "only read_back(kind = state-section) is legal during da_migrate (§6.6/§10.2)",
-            ));
-        }
-        if self.slice.pending_next.is_some() && import != "next_event" {
-            return Err(Trap::new(
-                TrapCode::BadEvent,
-                import,
-                None,
-                "NeedCapacity from next_event requires an immediate retry (§4.1)",
-            ));
-        }
-        if self.slice.pending_readback.is_some() && import != "read_back" {
-            return Err(Trap::new(
-                TrapCode::BadEvent,
-                import,
-                None,
-                "NeedCapacity from read_back requires an immediate retry (§6.4)",
-            ));
-        }
-        if self.slice.pending_device.is_some() && import != "device_profile" {
-            return Err(Trap::new(
-                TrapCode::BadEvent,
-                import,
-                None,
-                "NeedCapacity from device_profile requires an immediate retry (§6.4)",
-            ));
-        }
-        self.charge_op(import)
-    }
-}
-
-// -- memory helpers (Caller<Host>) ---------------------------------------------------------------
-
-fn mem_of(caller: &mut Caller<'_, Host>) -> Result<Memory, Trap> {
-    caller
-        .get_export("memory")
-        .and_then(wasmtime::Extern::into_memory)
-        .ok_or_else(|| Trap::bare(TrapCode::BadModule, "module has no exported memory"))
-}
-
-fn read_guest(caller: &mut Caller<'_, Host>, ptr: u32, len: u32) -> Result<Vec<u8>, Trap> {
-    let mem = mem_of(caller)?;
-    let (start, end) = (ptr as usize, ptr as usize + len as usize);
-    mem.data(&caller)
-        .get(start..end)
-        .map(<[u8]>::to_vec)
-        .ok_or_else(|| Trap::bare(TrapCode::MemOob, "guest span out of bounds"))
-}
-
-fn write_guest(caller: &mut Caller<'_, Host>, ptr: u32, bytes: &[u8]) -> Result<(), Trap> {
-    let mem = mem_of(caller)?;
-    let start = ptr as usize;
-    let data = mem.data_mut(caller);
-    let end = start + bytes.len();
-    data.get_mut(start..end)
-        .ok_or_else(|| Trap::bare(TrapCode::MemOob, "guest span out of bounds"))?
-        .copy_from_slice(bytes);
-    Ok(())
-}
-
-fn stash<T>(caller: &mut Caller<'_, Host>, r: Result<T, Trap>) -> Result<T, wasmtime::Error> {
-    r.map_err(|t| {
-        let msg = t.to_string();
-        caller.data_mut().trap = Some(t);
-        wasmtime::Error::msg(msg)
-    })
-}
-
-// -- the signed-frame envelope (§12.1) --------------------------------------------------------------
-
-/// Build + sign the §12.1 domain-separated frame: `[envelope, payload, sig]` canonical CBOR, the
-/// signature over the canonical envelope (which commits to the payload via `payload_hash`).
-fn build_signed_frame(
-    host: &Host,
-    channel: u64,
-    seq: u64,
-    payload: &[u8],
-) -> Result<Vec<u8>, Trap> {
-    let payload_hash = blake3::hash(payload);
-    let envelope = Value::Map(vec![
-        (Value::from("domain"), Value::from(FRAME_ENVELOPE_DOMAIN_V2)),
-        (
-            Value::from("run_id"),
-            Value::Bytes(host.identity.run_id.to_vec()),
-        ),
-        (Value::from("epoch"), Value::from(host.identity.epoch)),
-        (
-            Value::from("role"),
-            Value::from(host.identity.role.as_str()),
-        ),
-        (Value::from("instance"), Value::from(host.identity.instance)),
-        (
-            Value::from("module"),
-            Value::Bytes(host.identity.module.to_vec()),
-        ),
-        (Value::from("sender"), Value::Bytes(host.sender.to_vec())),
-        (Value::from("channel"), Value::from(channel)),
-        (Value::from("seq"), Value::from(seq)),
-        (
-            Value::from("payload_hash"),
-            Value::Bytes(payload_hash.as_bytes().to_vec()),
-        ),
-    ]);
-    let sig = sign_canonical(&host.signing, &envelope)
-        .map_err(|e| Trap::bare(TrapCode::BadModule, format!("frame signing: {e}")))?;
-    let frame = Value::Array(vec![
-        envelope,
-        Value::Bytes(payload.to_vec()),
-        Value::Bytes(sig.0.to_vec()),
-    ]);
-    to_canonical_vec(&frame)
-        .map_err(|e| Trap::bare(TrapCode::BadModule, format!("frame encoding: {e}")))
-}
-
-// -- sys@2 seeded deterministic randomness (architecture §3.2 "seeded randomness") ------------------
-
-/// Derive the run-scoped RNG seed for one execution identity (`sys@2::rng_seed`): a **pure
-/// function of the frozen §8.1 identity**, domain-separated under
-/// [`daemon_vhc_abi::RNG_SEED_DOMAIN_V2`]. Deterministic per the §2.7 `dc` class — the import
-/// carries **no journal record**; replay re-derives the identical seed from the run header's
-/// identity (see [`super::replay`]). Two role-instances never share a seed; a trap-restart of the
-/// same incarnation reproduces it (the seed is an *identity* property, not an *instantiation*
-/// property — restarted policy must be able to re-derive its own randomness).
-#[must_use]
-pub fn derive_rng_seed(identity: &RunIdentity) -> [u8; 32] {
-    // Unambiguous concatenation: fixed-width fields + a length prefix on the one variable field.
-    let mut material = Vec::with_capacity(32 + 8 + 4 + identity.role.len() + 8 + 32);
-    material.extend_from_slice(&identity.run_id);
-    material.extend_from_slice(&identity.epoch.to_le_bytes());
-    material.extend_from_slice(&(identity.role.len() as u32).to_le_bytes());
-    material.extend_from_slice(identity.role.as_bytes());
-    material.extend_from_slice(&identity.instance.to_le_bytes());
-    material.extend_from_slice(&identity.module);
-    blake3::derive_key(daemon_vhc_abi::RNG_SEED_DOMAIN_V2, &material)
-}
-
-// -- sys@2 crypto accelerations (the det/crypto-lane fast path, §3.2/§3.7) --------------------------
-
-/// The host `sys@2::hash` acceleration body: blake3-256 over `data`, pinned by the dual-compiled
-/// [`daemon_vhc_proto::crypto`] contract. Because the in-guest fallback is that *same* contract
-/// compiled to wasm, host-op ≡ in-guest-op is bit-exact **by construction** (architecture §3.2, the
-/// det-lane pattern). Exposed (crate-public) so the tier-1 conformance gate exercises the exact
-/// body the live import runs. Deterministic → the import carries **no journal record** (§2.7 `dc`
-/// class); replay re-executes it (see [`super::replay`]).
-#[must_use]
-pub fn host_crypto_hash(data: &[u8]) -> [u8; daemon_vhc_proto::HASH_LEN] {
-    daemon_vhc_proto::crypto_hash(data)
-}
-
-/// The host `sys@2::verify_sig` acceleration body: the ABI status code of the tri-state
-/// [`daemon_vhc_proto::VerifyOutcome`] (0 = valid, 1 = invalid, 2 = malformed). Same
-/// dual-compiled-contract / by-construction-parity story as [`host_crypto_hash`]; deterministic,
-/// not journaled.
-#[must_use]
-pub fn host_crypto_verify(public_key: &[u8], signature: &[u8], message: &[u8]) -> u32 {
-    daemon_vhc_proto::verify_sig(public_key, signature, message).code()
-}
-
 // -- the v2 linker ----------------------------------------------------------------------------------
-
-/// How long a parked `next_event` waits between wake checks when no timer bounds the wait.
-const PARK_RECHECK: Duration = Duration::from_millis(50);
-
-/// The pump shared state behind a caller (borrow helper for the import bodies).
-fn shared_of(c: &Caller<'_, Host>) -> Arc<PumpShared> {
-    c.data().shared.clone()
-}
 
 #[allow(clippy::too_many_lines)]
 fn link_v2(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
@@ -2390,8 +2114,10 @@ mod tests {
     use super::chunks::verify_covering_span;
     use super::*;
     use crate::run::journal::{MemorySink, SinkEntry};
-    use daemon_vhc_abi::COMP_ERR_HASH_MISMATCH;
+    use ciborium::value::Value;
+    use daemon_vhc_abi::{COMP_ERR_HASH_MISMATCH, FRAME_ENVELOPE_DOMAIN_V2};
     use daemon_vhc_proto::sign::verify_bytes;
+    use daemon_vhc_proto::to_canonical_vec;
 
     fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
         PumpState {
