@@ -27,6 +27,14 @@ harness = [
     "dep:daemon-vhc-sdk-consensus",
     "daemon-vhc-host/harness",
 ]
+# `live` exposes the role session's live transport-provider construction (`providers`): the WS
+# control plane + the presigned R2 / filesystem content stores selected by the node-authored
+# `SessionCredentials`. Off the default gate so a default build never compiles the WS/TLS tree;
+# the worker binary's networked feature set enables it.
+live = ["daemon-vhc-net/ws", "dep:daemon-egress"]
+# `live-iroh` adds the dual-plane composition (WS + iroh gossip) to the live attach; the iroh
+# transport secret stays a keystore reference.
+live-iroh = ["live", "daemon-vhc-net/iroh"]
 # (Phase-E sunset cleanup) The `iroh` feature is GONE: it layered the live-transport harness
 # (`live_harness`) on `harness`, and that harness retired with the v1 driver at the sunset (it
 # drove the v1 WasmBackend over the engine). The passthrough kept "external `--features iroh`
@@ -49,6 +57,9 @@ daemon-vhc-abi = { workspace = true }
 # default production session graph carries no SDK schema crate (dep-check-enforced).
 daemon-vhc-sdk-consensus = { workspace = true, optional = true }
 daemon-vhc-net = { workspace = true }
+# The SSRF-safe outbound HTTP client the live attach's presign plane rides. OPTIONAL — pulled in
+# only by the `live` feature (the default session build stays network-free).
+daemon-egress = { workspace = true, optional = true }
 # The crash-safe segmented journal SUBSTRATE (ABI §8), schema-free by construction: the durable
 # per-incarnation sink (`journal_home::DurableSink`) adapts its `Journal` onto the driver's
 # dependency-inverted `JournalSink` seam — the production replacement for the in-memory sink.

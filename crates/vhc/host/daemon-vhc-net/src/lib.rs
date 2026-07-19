@@ -34,6 +34,7 @@ pub mod artifact;
 /// A blake3-keyed, on-disk, size-bounded content cache (spec §8/§10.6; P3 lane S) — the persistent
 /// half of the artifact/shard cache the fleet warms once and never re-downloads.
 pub mod content_cache;
+pub mod content_store;
 pub mod dedupe;
 /// Multiplex several [`ControlPlane`]s (WS + iroh gossip) with cross-plane content-hash dedupe
 /// (spec §7.1; A1) — the run survives one plane degrading.
@@ -56,9 +57,17 @@ pub mod transport;
 /// `ws` feature so the default workspace build never compiles the WS/TLS tree.
 #[cfg(feature = "ws")]
 pub mod ws_client;
+// The reusable harness fixtures (never production): the mock R2 presign/object server serves the
+// crate's own suites too (`cfg(test)`); the loopback WS relay needs the `ws` server stack, which
+// only the `harness` feature pulls.
+#[cfg(any(test, feature = "harness"))]
+pub mod mock_r2;
+#[cfg(feature = "harness")]
+pub mod ws_relay;
 
 pub use artifact::{ArtifactCache, ArtifactRef, ArtifactResolver, ArtifactScheme};
 pub use content_cache::ContentCache;
+pub use content_store::FsContentStore;
 pub use dedupe::Deduper;
 pub use dual_plane::DualPlane;
 pub use fetch::{
@@ -174,175 +183,5 @@ pub(crate) mod test_support {
             pid = std::process::id()
         ));
         TempRoot { path }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod mock_r2 {
-    //! An in-process mock of the coordinator presign endpoint + the R2 object store (NET-1/3/8),
-    //! built on `wiremock` (a dev-dep; no live network). Mirrors what BC's `apps/vhc` worker does:
-    //! `POST /api/v1/vhc/runs/:id/presign` returns a URL into a stateful `/obj/*` PUT/GET store at
-    //! the spec §11.3 object key. It can mint expired presigns (`with_expiry`) and drop objects
-    //! (`evict`) for the negative cases.
-
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use daemon_egress::{EgressClient, EgressConfig};
-    use wiremock::matchers::{method, path_regex};
-    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
-
-    use crate::presign::{HttpPresignClient, PresignRequest, PresignResponse};
-    use crate::r2_store::r2_object_key;
-    use crate::seam::RunId;
-
-    type Objects = Arc<Mutex<HashMap<String, Vec<u8>>>>;
-
-    fn now_s() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    }
-
-    /// The presign responder: parses the request body, computes the §11.3 object key, and returns a
-    /// URL into this server's `/obj/*` store with the configured expiry.
-    struct Presigner {
-        base: String,
-        expiry_offset_s: i64,
-    }
-
-    impl Respond for Presigner {
-        fn respond(&self, req: &Request) -> ResponseTemplate {
-            let run = req
-                .url
-                .path()
-                .trim_start_matches('/')
-                .strip_prefix("api/v1/vhc/runs/")
-                .and_then(|s| s.split('/').next())
-                .unwrap_or_default()
-                .to_string();
-            let preq: PresignRequest = match serde_json::from_slice(&req.body) {
-                Ok(p) => p,
-                Err(e) => return ResponseTemplate::new(400).set_body_string(e.to_string()),
-            };
-            let key = match r2_object_key(&RunId::new(run), &preq) {
-                Ok(k) => k,
-                Err(e) => return ResponseTemplate::new(400).set_body_string(e.to_string()),
-            };
-            let expires_at = (now_s() + self.expiry_offset_s).max(0) as u64;
-            let resp = PresignResponse {
-                url: format!("{}/obj/{key}?sig=mock", self.base),
-                expires_at,
-                headers: BTreeMap::new(),
-            };
-            ResponseTemplate::new(200).set_body_json(serde_json::to_value(&resp).expect("json"))
-        }
-    }
-
-    struct PutObj {
-        objects: Objects,
-    }
-    impl Respond for PutObj {
-        fn respond(&self, req: &Request) -> ResponseTemplate {
-            self.objects
-                .lock()
-                .expect("objects mutex")
-                .insert(req.url.path().to_string(), req.body.clone());
-            ResponseTemplate::new(200)
-        }
-    }
-
-    struct GetObj {
-        objects: Objects,
-    }
-    impl Respond for GetObj {
-        fn respond(&self, req: &Request) -> ResponseTemplate {
-            match self
-                .objects
-                .lock()
-                .expect("objects mutex")
-                .get(req.url.path())
-            {
-                Some(bytes) => ResponseTemplate::new(200).set_body_bytes(bytes.clone()),
-                None => ResponseTemplate::new(404),
-            }
-        }
-    }
-
-    /// A running mock coordinator + object store.
-    pub(crate) struct MockR2 {
-        server: MockServer,
-        objects: Objects,
-    }
-
-    impl MockR2 {
-        /// Start with a healthy 15-minute presign expiry.
-        pub async fn start() -> Self {
-            Self::with_expiry(900).await
-        }
-
-        /// Start with presigns that expire `expiry_offset_s` seconds from now (negative = already
-        /// expired — the `store_presign_expired_rejected` case).
-        pub async fn with_expiry(expiry_offset_s: i64) -> Self {
-            let server = MockServer::start().await;
-            let base = server.uri();
-            let objects: Objects = Arc::new(Mutex::new(HashMap::new()));
-            Mock::given(method("POST"))
-                .and(path_regex(r"^/api/v1/vhc/runs/[^/]+/presign$"))
-                .respond_with(Presigner {
-                    base: base.clone(),
-                    expiry_offset_s,
-                })
-                .mount(&server)
-                .await;
-            Mock::given(method("PUT"))
-                .and(path_regex(r"^/obj/"))
-                .respond_with(PutObj {
-                    objects: objects.clone(),
-                })
-                .mount(&server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path_regex(r"^/obj/"))
-                .respond_with(GetObj {
-                    objects: objects.clone(),
-                })
-                .mount(&server)
-                .await;
-            Self { server, objects }
-        }
-
-        /// The vhc coordinator base URL (`{uri}/api/v1/vhc`).
-        pub fn coordinator_base(&self) -> String {
-            format!("{}/api/v1/vhc", self.server.uri())
-        }
-
-        /// A fresh SSRF-safe egress client (the initial hop to the loopback mock is not re-checked).
-        pub fn egress(&self) -> EgressClient {
-            EgressClient::new(EgressConfig::default()).expect("egress client")
-        }
-
-        /// An [`HttpPresignClient`] pointed at this mock.
-        pub fn presign_client(&self) -> HttpPresignClient {
-            HttpPresignClient::new(self.egress(), self.coordinator_base())
-        }
-
-        /// Seed an object directly at its §11.3 key (bypassing PUT) — GET-only / artifact cases.
-        pub fn seed(&self, object_key: &str, bytes: Vec<u8>) {
-            self.objects
-                .lock()
-                .expect("objects mutex")
-                .insert(format!("/obj/{object_key}"), bytes);
-        }
-
-        /// Drop a stored object (simulate lifecycle/retention expiry).
-        pub fn evict(&self, object_key: &str) {
-            self.objects
-                .lock()
-                .expect("objects mutex")
-                .remove(&format!("/obj/{object_key}"));
-        }
     }
 }
