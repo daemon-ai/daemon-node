@@ -11,10 +11,10 @@ pub mod abi;
 #[cfg(target_arch = "wasm32")]
 pub use abi::{
     buffer_len, buffer_release, cancel, compute_export, compute_fence, compute_import,
-    compute_submit_op, create_from, data_fetch, device_profile, emit_metric, hash_accel,
-    next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint, read_buffer,
-    rng_seed, set_timer, snapshot_state, stage_state, stream_accept, stream_open, stream_read,
-    stream_write, verify_sig_accel, Event,
+    compute_submit_op, create_from, data_fetch, data_register_chunks, device_profile, emit_metric,
+    hash_accel, next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint,
+    read_buffer, rng_seed, set_timer, snapshot_state, stage_state, stream_accept, stream_open,
+    stream_read, stream_write, verify_sig_accel, Event,
 };
 
 pub mod corpus;
