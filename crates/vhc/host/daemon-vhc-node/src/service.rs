@@ -34,9 +34,7 @@ use crate::arbiter::{
     AdmitRefusal, ClaimTiers, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId, TierBytes,
 };
 use crate::discovery::RunDiscovery;
-use crate::store::{
-    effective_state, DesiredState, PersistedRun, RunState, StoreError, VhcStore, EVENT_WINDOW,
-};
+use crate::store::{DesiredState, PersistedRun, RunState, StoreError, VhcStore, EVENT_WINDOW};
 
 /// A node-feed sink: the node passes a closure over `NodeEventFeed::emit` so live vhc updates ride
 /// the existing `events_subscribe` channel as `VhcChanged` pointers (no new transport).
@@ -573,6 +571,163 @@ impl VhcService {
             self.emit_changed(None);
         }
         Ok(rejoined)
+    }
+
+    /// Spawn the resident reconciliation tick (requires [`bind_self`](Self::bind_self)): the
+    /// periodic pass that repairs crash windows, applies the uptime-based retry reset, and fires
+    /// due reconvergences. The task ends when the service drops (the `Weak` no longer upgrades).
+    pub fn spawn_reconciler(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(self);
+        let tick = std::time::Duration::from_millis(self.config.retry.reconcile_tick_ms.max(100));
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(me) = weak.upgrade() else { return };
+                let _ = me.reconcile_tick().await;
+            }
+        })
+    }
+
+    /// One reconciliation pass (the resident tick's body; callable directly for deterministic
+    /// tests): finish any half-committed release, reset the retry budget of instances that have
+    /// been stably running past the minimum uptime, and reconverge every recoverable intent whose
+    /// backoff has elapsed. Returns the number of reconverged runs.
+    pub async fn reconcile_tick(&self) -> Result<usize, VhcError> {
+        if !self.config.enabled {
+            return Ok(0);
+        }
+        let retry = &self.config.retry;
+        // Crash-window safety net: a release begun by a path that died mid-transition commits.
+        self.store.repair_pending_releases()?;
+        // The uptime reset: a stably-running instance has genuinely recovered.
+        self.store
+            .reset_recovered_retries(now_ms(), retry.min_uptime_ms as i64)?;
+        let due = self.store.runs_awaiting_retry(now_ms())?;
+        let mut reconverged = 0;
+        for run in due {
+            // A live instance for this run means a competing path already reconverged it.
+            if self.instances.lock().unwrap().contains_key(&run.run_id) {
+                continue;
+            }
+            match self.reconverge(&run).await {
+                Ok(()) => reconverged += 1,
+                Err(e) => {
+                    // A failed reconvergence attempt consumes budget like any recoverable
+                    // failure: escalate on exhaustion, else reschedule with backoff. Loud
+                    // either way — one refused run never blocks the rest of the pass.
+                    let consumed = run.retry_count;
+                    if consumed >= retry.max_retries {
+                        self.store.begin_release(
+                            &run.run_id,
+                            RunState::FailedTerminal,
+                            Some(&format!(
+                                "retry budget exhausted ({consumed} of {} attempts \
+                                 consumed): reconvergence failed: {e}",
+                                retry.max_retries
+                            )),
+                        )?;
+                        self.store.commit_release(&run.run_id)?;
+                    } else {
+                        let due_at = now_ms() + retry_backoff_ms(retry, consumed) as i64;
+                        let _ = self.store.bump_retry(&run.run_id, due_at);
+                    }
+                    let mut emitted = Vec::new();
+                    let _ = self.emit(
+                        VhcEvent::Error {
+                            run_id: run.run_id.clone(),
+                            class: "reconvergence".to_string(),
+                            detail: format!("reconvergence attempt failed: {e}"),
+                        },
+                        &mut emitted,
+                    );
+                    self.emit_changed(Some(run.run_id.clone()));
+                }
+            }
+        }
+        Ok(reconverged)
+    }
+
+    /// Reconverge one recoverable intent as a NEW incarnation. Mid-run reconvergence never
+    /// retains the failed incarnation: the predecessor may still be surrendering devices, and a
+    /// fresh never-reused incarnation guarantees the generation strictly advances (its stale
+    /// events stay gated) and its ledger key cannot collide. Credentials and the per-run
+    /// certificate are re-authored fresh for the new incarnation (D-P8 — never replayed).
+    async fn reconverge(&self, run: &PersistedRun) -> Result<(), VhcError> {
+        let worker = self.instance_worker();
+        let id = RoleInstanceId {
+            run_id: run
+                .run_id_hash
+                .unwrap_or_else(|| *blake3::hash(run.run_id.as_bytes()).as_bytes()),
+            epoch: run.epoch,
+            role: if run.role.is_empty() {
+                "trainer".to_string()
+            } else {
+                run.role.clone()
+            },
+            instance: self.store.mint_incarnation()?,
+        };
+        let charge = self.derive_charge(&run.eligibility, &run.policy);
+        let priority = self.store.run_priority(&run.run_id)?;
+        if let Err(refusal) = self.admit_placed(&id, charge, priority) {
+            if self.worker_factory.is_some() {
+                worker.shutdown().await;
+            }
+            return Err(VhcError::Resources(refusal));
+        }
+        self.store
+            .set_execution_identity(&run.run_id, id.epoch, &id.role, id.instance)?;
+        let persisted_tuple = run
+            .admitted_tuple
+            .as_deref()
+            .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
+        let restore = self.resolve_restore(&run.run_id).await;
+        let (delivery_tuple, credentials, _credentials_ref) =
+            match self.author_join(&run.run_id, &run.coordinator, &id, persisted_tuple, restore) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.arbiter.release(&id);
+                    if self.worker_factory.is_some() {
+                        worker.shutdown().await;
+                    }
+                    return Err(e);
+                }
+            };
+        if let Some(tuple) = &delivery_tuple {
+            if let Ok(bytes) = protocol::encode(tuple) {
+                let _ = self.store.set_admitted_tuple(&run.run_id, &bytes);
+            }
+        }
+        let rx = match worker
+            .join_streaming(
+                run.run_id.clone(),
+                run.coordinator.clone(),
+                credentials,
+                to_join_policy(&run.policy),
+                delivery_tuple,
+            )
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                // No child came up — surrender the fresh reservation.
+                self.arbiter.release(&id);
+                if self.worker_factory.is_some() {
+                    worker.shutdown().await;
+                }
+                return Err(e);
+            }
+        };
+        let generation = id.instance;
+        self.instances
+            .lock()
+            .unwrap()
+            .insert(run.run_id.clone(), InstanceEntry { id, worker });
+        self.spawn_pump(Some((run.run_id.clone(), generation)), rx);
+        self.store.mark_running(&run.run_id)?;
+        self.emit_changed(Some(run.run_id.clone()));
+        Ok(())
     }
 
     /// The worker child for a new role-instance: a fresh factory child when configured (one
