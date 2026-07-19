@@ -20,6 +20,9 @@ use daemon_vhc_session::protocol::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+/// One recorded throttle lever: `(vram_cap_mb, duty_cycle_pct, paused)`.
+type ThrottleLever = (Option<u32>, Option<u8>, bool);
+
 /// A scripted streaming worker: every `join_streaming` hands back a LIVE receiver whose sender
 /// the test holds, so the pump stream stays open until the test terminates or severs it.
 #[derive(Default)]
@@ -27,7 +30,7 @@ struct StreamingWorker {
     joins: Mutex<Vec<String>>,
     leaves: Mutex<Vec<String>>,
     streams: Mutex<Vec<UnboundedSender<protocol::Event>>>,
-    throttles: Mutex<Vec<(Option<u32>, Option<u8>, bool)>>,
+    throttles: Mutex<Vec<ThrottleLever>>,
 }
 
 impl StreamingWorker {
