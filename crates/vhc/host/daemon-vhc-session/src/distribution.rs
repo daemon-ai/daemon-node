@@ -5,9 +5,12 @@
 //! travelling over the control plane beside (never inside) the §12.1 signed frames.
 //!
 //! The ABI companion fixes the record shapes and their domain tags (`daemon-vhc/cert/2`,
-//! `daemon-vhc/revocation/2`) and says they "propagate on the control plane best-effort"; this
-//! module fixes HOW a receiver tells a distribution record from a frame on one shared byte
-//! plane, without decoding either speculatively:
+//! `daemon-vhc/revocation/2` — proto mechanism, [OWN-1]) and says they "propagate on the control
+//! plane best-effort"; this module fixes HOW a receiver tells a distribution record from a frame
+//! on one shared byte plane, without decoding either speculatively. The carriage wrapper lives
+//! HERE, beside the attach machinery that consumes it: the guests' wasm workspace path-links the
+//! proto crate, so a proto change would force a deliberate guest re-pin — and this wrapper is
+//! host-plane carriage the guests never see.
 //!
 //! - a §12.1 **frame** is a top-level canonical-CBOR **array** `[envelope, payload, sig]`;
 //! - a **distribution record** is a top-level single-entry **map** whose key names the record
@@ -24,12 +27,10 @@
 //! the replay-protected ledger — an unverified record must never advance any trust state
 //! (certificate floors included).
 
+use daemon_vhc_proto::{
+    from_canonical_slice, to_canonical_vec, RunKeyCertificate, RunKeyRevocation, VhcProtoError,
+};
 use serde::{Deserialize, Serialize};
-
-use crate::canonical::{from_canonical_slice, to_canonical_vec};
-use crate::cert::RunKeyCertificate;
-use crate::error::VhcProtoError;
-use crate::revocation::RunKeyRevocation;
 
 /// One §12.3 record on the control plane: a certificate or a revocation, externally tagged by
 /// kind. Additive: a future record kind is a new map key, refused typed by old receivers.
@@ -66,9 +67,7 @@ impl DistributionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytes::Hash;
-    use crate::cert::CertScope;
-    use crate::sign::{peer_id, SigningKey};
+    use daemon_vhc_proto::{peer_id, CertScope, Hash, SigningKey};
 
     fn cert() -> RunKeyCertificate {
         let base = SigningKey::from_bytes(&[7; 32]);

@@ -29,7 +29,6 @@ pub mod canonical;
 pub mod capability;
 pub mod cert;
 pub mod crypto;
-pub mod distribution;
 pub mod domains;
 pub mod envelope;
 pub mod error;
@@ -54,7 +53,6 @@ pub use crypto::{
     hash as crypto_hash, verify_sig, VerifyOutcome, HASH_LEN, VERIFY_PUBLIC_KEY_LEN,
     VERIFY_SIGNATURE_LEN,
 };
-pub use distribution::DistributionRecord;
 pub use envelope::{DeviceMinimums, SignedEnvelope};
 pub use error::VhcProtoError;
 pub use genesis::{

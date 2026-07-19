@@ -252,13 +252,13 @@ impl InboundFrames {
     /// A human-readable refusal — a refused record changes no state.
     pub fn ingest_distribution(
         &mut self,
-        record: daemon_vhc_proto::DistributionRecord,
+        record: crate::distribution::DistributionRecord,
     ) -> Result<(), String> {
         let Some(certs) = self.cert_check.as_mut() else {
             return Err("no certificate layer on this attach".into());
         };
         match record {
-            daemon_vhc_proto::DistributionRecord::Cert(cert) => {
+            crate::distribution::DistributionRecord::Cert(cert) => {
                 cert.verify_chain()
                     .map_err(|e| format!("certificate chain: {e}"))?;
                 if !certs.trusts_base(&cert.base_identity) {
@@ -267,7 +267,7 @@ impl InboundFrames {
                 certs.ingest_certificate(cert);
                 Ok(())
             }
-            daemon_vhc_proto::DistributionRecord::Revocation(record) => certs
+            crate::distribution::DistributionRecord::Revocation(record) => certs
                 .ingest_revocation(&record)
                 .map_err(|e| format!("revocation record: {e}")),
         }
@@ -474,7 +474,7 @@ impl Attach {
     /// per-record event, never a session fault.
     pub fn ingest_distribution(
         &mut self,
-        record: daemon_vhc_proto::DistributionRecord,
+        record: crate::distribution::DistributionRecord,
     ) -> Result<(), String> {
         self.frames.ingest_distribution(record)
     }

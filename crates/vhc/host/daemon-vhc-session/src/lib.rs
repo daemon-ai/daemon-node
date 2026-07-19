@@ -31,6 +31,7 @@ pub mod attach;
 pub mod backend;
 pub mod config;
 pub mod data;
+pub mod distribution;
 pub mod identity;
 pub mod journal_home;
 pub mod keystore;

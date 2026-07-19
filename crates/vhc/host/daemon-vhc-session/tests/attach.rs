@@ -288,7 +288,9 @@ fn distribution_certs_ingest_only_from_trusted_bases() {
     let rogue_cert =
         RunKeyCertificate::issue(&rogue_base, frame_scope(), peer_id(&key)).expect("issue");
     let err = v
-        .ingest_distribution(daemon_vhc_proto::DistributionRecord::Cert(rogue_cert))
+        .ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Cert(
+            rogue_cert,
+        ))
         .unwrap_err();
     assert!(err.contains("not genesis-trusted"), "got: {err}");
     assert!(matches!(
@@ -300,16 +302,22 @@ fn distribution_certs_ingest_only_from_trusted_bases() {
     let mut forged = RunKeyCertificate::issue(&base, frame_scope(), peer_id(&key)).expect("issue");
     forged.body.scope.instance = 99; // body no longer matches the signature
     let err = v
-        .ingest_distribution(daemon_vhc_proto::DistributionRecord::Cert(forged))
+        .ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Cert(
+            forged,
+        ))
         .unwrap_err();
     assert!(err.contains("certificate chain"), "got: {err}");
 
     // The honest record ingests; the sender now delivers. Re-delivery is an idempotent no-op.
     let cert = RunKeyCertificate::issue(&base, frame_scope(), peer_id(&key)).expect("issue");
-    v.ingest_distribution(daemon_vhc_proto::DistributionRecord::Cert(cert.clone()))
-        .expect("trusted record ingests");
-    v.ingest_distribution(daemon_vhc_proto::DistributionRecord::Cert(cert))
-        .expect("re-delivery is idempotent");
+    v.ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Cert(
+        cert.clone(),
+    ))
+    .expect("trusted record ingests");
+    v.ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Cert(
+        cert,
+    ))
+    .expect("re-delivery is idempotent");
     assert!(matches!(
         v.accept(&frame(&key, 0, 0, b"hello")),
         InboundVerdict::Deliver { .. }
@@ -330,7 +338,7 @@ fn distribution_revocations_ride_the_same_surface() {
 
     let record = RunKeyRevocation::issue(&base, Hash(RUN), "trainer", 1, peer_id(&key), 1)
         .expect("issue revocation");
-    v.ingest_distribution(daemon_vhc_proto::DistributionRecord::Revocation(record))
+    v.ingest_distribution(daemon_vhc_session::distribution::DistributionRecord::Revocation(record))
         .expect("trusted revocation ingests");
     assert_eq!(
         v.accept(&frame(&key, 0, 1, b"post-revocation")),

@@ -223,7 +223,7 @@ async fn run_role(
 
     let identity = run_cfg.identity.clone();
     let own_sender = own_cert.body.run_key;
-    let own_cert_record = daemon_vhc_proto::DistributionRecord::Cert(own_cert.clone());
+    let own_cert_record = crate::distribution::DistributionRecord::Cert(own_cert.clone());
     if !peer_certs.contains(&own_cert) {
         peer_certs.push(own_cert);
     }
@@ -393,7 +393,7 @@ fn accept_inbound(
     // attempt is cheap and never speculative on frame bytes. A refused record is a typed
     // per-record advisory, never a session fault; our own echoed announcement ingests as an
     // idempotent no-op.
-    if let Ok(record) = daemon_vhc_proto::DistributionRecord::from_bytes(frame) {
+    if let Ok(record) = crate::distribution::DistributionRecord::from_bytes(frame) {
         if let Err(refusal) = attach.ingest_distribution(record) {
             let _ = events.send(Event::Warning {
                 class: "distribution_refused".into(),

@@ -101,9 +101,10 @@ async fn join_live(
     let journal = journal_sink(run_id, &binding.run.identity)?;
     let keystore = daemon_vhc_session::keystore::VhcKeystore::from_env()
         .map_err(|e| format!("identity store: {e}"))?;
-    let announcement = daemon_vhc_proto::DistributionRecord::Cert(binding.own_cert.clone())
-        .to_bytes()
-        .map_err(|e| format!("certificate announcement: {e}"))?;
+    let announcement =
+        daemon_vhc_session::distribution::DistributionRecord::Cert(binding.own_cert.clone())
+            .to_bytes()
+            .map_err(|e| format!("certificate announcement: {e}"))?;
     let providers = build_role_providers(LiveAttachInputs {
         credentials: creds,
         coordinator,

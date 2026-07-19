@@ -179,10 +179,10 @@ async fn published_frames_relay_opaquely_and_immediate_leave_classifies_left() {
         .await
         .expect("certificate announcement within the deadline")
         .expect("plane open");
-    match daemon_vhc_proto::DistributionRecord::from_bytes(&announcement)
+    match daemon_vhc_session::distribution::DistributionRecord::from_bytes(&announcement)
         .expect("the first publication is the distribution record")
     {
-        daemon_vhc_proto::DistributionRecord::Cert(cert) => {
+        daemon_vhc_session::distribution::DistributionRecord::Cert(cert) => {
             cert.verify_chain().expect("the announced record verifies");
         }
         other => panic!("expected the session's certificate announcement, got {other:?}"),
