@@ -437,6 +437,10 @@ struct Worker {
     events: tokio::sync::mpsc::UnboundedReceiver<Event>,
     child: ChildGuard,
     reader: JoinHandle<()>,
+    /// The shared pump sink, cleared on teardown so the node's stream receiver closes even when
+    /// the reader task is aborted (a supervisor-initiated replacement must be as observable as a
+    /// child crash).
+    pump: PumpSink,
 }
 
 impl Worker {
@@ -462,6 +466,7 @@ impl Worker {
 
         let (writer, mut framed_reader) = channel.split();
         let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let reader_pump = pump.clone();
         let reader = tokio::spawn(async move {
             // The first event (`Ready`) always goes to the request/reply inbox so the spawn
             // handshake completes even during a streaming respawn; subsequent events route to the
@@ -471,14 +476,14 @@ impl Worker {
                 match protocol::decode::<Event>(&bytes) {
                     Ok(event) => {
                         if !first {
-                            let sink = pump.lock().expect("pump lock").clone();
+                            let sink = reader_pump.lock().expect("pump lock").clone();
                             if let Some(tx) = sink {
                                 if tx.send(event.clone()).is_ok() {
                                     continue;
                                 }
                                 // The node dropped the stream (run left): clear the sink and fall
                                 // through so THIS event still reaches the request/reply inbox.
-                                *pump.lock().expect("pump lock") = None;
+                                *reader_pump.lock().expect("pump lock") = None;
                             }
                         }
                         first = false;
@@ -491,6 +496,11 @@ impl Worker {
                     }
                 }
             }
+            // The child's stream ended (process exit / stdio cut severed): dropping the sink
+            // closes the node-held stream receiver, so the node OBSERVES the transport loss and
+            // its run-instance reconciliation classifies the recoverable failure — never a
+            // silently-dead pump behind a live-looking receiver.
+            *reader_pump.lock().expect("pump lock") = None;
         });
 
         let mut worker = Worker {
@@ -498,6 +508,7 @@ impl Worker {
             events: ev_rx,
             child,
             reader,
+            pump,
         };
 
         match tokio::time::timeout(cfg.spawn_timeout, worker.events.recv()).await {
@@ -569,10 +580,13 @@ impl Worker {
     }
 
     /// Best-effort graceful stop: ask the worker to exit, kill + reap the child, stop the reader.
+    /// The pump sink clears so any node-held stream receiver observes the teardown (the reader's
+    /// own end-of-stream clear does not run when the task is aborted).
     async fn shutdown(&mut self) {
         let _ = self.send(&Command::Shutdown).await;
         self.child.shutdown().await;
         self.reader.abort();
+        *self.pump.lock().expect("pump lock") = None;
     }
 }
 

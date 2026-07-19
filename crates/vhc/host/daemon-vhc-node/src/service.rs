@@ -34,7 +34,9 @@ use crate::arbiter::{
     AdmitRefusal, ClaimTiers, InstanceCharge, OwnerArbiter, OwnerBudget, RoleInstanceId, TierBytes,
 };
 use crate::discovery::RunDiscovery;
-use crate::store::{DesiredState, PersistedRun, StoreError, VhcStore, EVENT_WINDOW};
+use crate::store::{
+    effective_state, DesiredState, PersistedRun, RunState, StoreError, VhcStore, EVENT_WINDOW,
+};
 
 /// A node-feed sink: the node passes a closure over `NodeEventFeed::emit` so live vhc updates ride
 /// the existing `events_subscribe` channel as `VhcChanged` pointers (no new transport).
@@ -373,26 +375,60 @@ impl VhcService {
         policy: JoinPolicy,
         admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<(), VhcError> {
+        let generation = admitted_tuple.as_ref().map_or(0, |t| t.incarnation);
         let rx = self
             .worker
-            .join_streaming(run_id, coordinator, credentials, policy, admitted_tuple)
+            .join_streaming(
+                run_id.clone(),
+                coordinator,
+                credentials,
+                policy,
+                admitted_tuple,
+            )
             .await?;
-        self.spawn_pump(rx);
+        self.spawn_pump(Some((run_id, generation)), rx);
         Ok(())
     }
 
     /// Spawn the detached event-pump task that drains a worker event stream into
     /// [`handle_worker_event`](Self::handle_worker_event). When the service is unbound (tests) it
     /// drains-and-drops so a streaming worker never backs up.
-    fn spawn_pump(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<protocol::Event>) {
+    ///
+    /// `instance` names the `(run, generation)` this stream belongs to. When it is known and the
+    /// stream ends WITHOUT that instance's terminal event, the closure itself is the observation
+    /// of teardown (worker crash / transport loss — the supervisor closes the pump sink when the
+    /// child's stream ends), and the instance transitions `failed_retryable` so the durable join
+    /// intent reconverges under the retry budget.
+    fn spawn_pump(
+        &self,
+        instance: Option<(String, u64)>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<protocol::Event>,
+    ) {
         match self.me.get().and_then(std::sync::Weak::upgrade) {
             Some(me) => {
                 tokio::spawn(async move {
+                    let mut terminated = false;
                     while let Some(ev) = rx.recv().await {
+                        if let (
+                            Some((run, generation)),
+                            protocol::Event::RunTerminated {
+                                run_id,
+                                generation: gen,
+                                ..
+                            },
+                        ) = (&instance, &ev)
+                        {
+                            if run_id == run && gen == generation {
+                                terminated = true;
+                            }
+                        }
                         // Best-effort fan-out: a persist error never stalls the pump (mirrors the
                         // existing "a broadcast send error only means no live subscribers" posture;
                         // the durable log + a VhcChanged pointer let a client re-baseline).
                         let _ = me.handle_worker_event(&ev);
+                    }
+                    if let (Some((run, generation)), false) = (instance, terminated) {
+                        let _ = me.handle_stream_closed(&run, generation);
                     }
                 });
             }
@@ -428,6 +464,11 @@ impl VhcService {
         if !self.config.enabled {
             return Ok(0);
         }
+        // Crash-window repair FIRST (the startup reconciliation pass): any release whose marker
+        // was persisted but whose terminal commit never landed is finished now — every child died
+        // with the node, so worker teardown is definitionally observed. Only then is the
+        // reconvergence set read (a repaired `completed` never rejoins).
+        self.store.repair_pending_releases()?;
         let intents = self.store.active_intents()?;
         let mut rejoined = 0;
         for run in &intents {
@@ -519,11 +560,13 @@ impl VhcService {
                     return Err(e);
                 }
             };
+            let generation = id.instance;
             self.instances
                 .lock()
                 .unwrap()
                 .insert(run.run_id.clone(), InstanceEntry { id, worker });
-            self.spawn_pump(rx);
+            self.spawn_pump(Some((run.run_id.clone(), generation)), rx);
+            self.store.mark_running(&run.run_id)?;
             rejoined += 1;
         }
         if rejoined > 0 {
@@ -621,41 +664,31 @@ impl VhcService {
     /// the node"). Returns the [`VhcEvent`]s emitted (0..2 per worker event). B3 wires the live
     /// worker event stream into this; unit tests drive it directly.
     pub fn handle_worker_event(&self, ev: &protocol::Event) -> Result<Vec<VhcEvent>, VhcError> {
-        // [CI-7] terminal cleanup: when a run instance reaches a terminal state that ends the run
-        // identity (Completed / Left / FailedTerminal), delete its per-run key material,
-        // certificates, and credentials record — no run identity outlives the run it was minted
-        // for. FailedRetryable is NOT terminal for the identity (the reconvergence/rejoin path
-        // reuses or supersedes it under the retry budget), so its material survives.
-        // Instance-map removal + arbiter release beyond this are run-lifecycle management
-        // concerns; this hook is scoped to secret custody. Idempotent (remove_run tolerates
-        // absence).
-        if let protocol::Event::RunTerminated {
-            run_id, outcome, ..
-        } = ev
-        {
-            let terminal = matches!(
-                outcome,
-                protocol::TerminalOutcome::Completed { .. }
-                    | protocol::TerminalOutcome::Left { .. }
-                    | protocol::TerminalOutcome::FailedTerminal { .. }
-            );
-            if terminal {
-                if let Some(dir) = &self.identity_dir {
-                    if let Ok(keystore) = daemon_vhc_session::keystore::VhcKeystore::open(dir) {
-                        if let Err(e) = keystore.remove_run(run_id) {
-                            let mut emitted = Vec::new();
-                            let _ = self.emit(
-                                VhcEvent::Warning {
-                                    run_id: run_id.clone(),
-                                    class: "identity_cleanup".to_string(),
-                                    detail: format!("per-run key/credential cleanup failed: {e}"),
-                                },
-                                &mut emitted,
-                            );
+        // Stale-generation discard (the idempotency/generation invariant): every run-scoped
+        // pump/session event carries the emitting instance's generation (== incarnation); an
+        // event stamped with a generation other than the run's CURRENT one is from a reaped
+        // predecessor and is dropped whole — it can never fold contribution, transition state,
+        // release a ledger, or touch key custody for the replacement. Generation 0 = un-stamped
+        // (pre-counter frames / request-reply events) passes through.
+        if let Some(generation) = event_generation(ev) {
+            if generation != 0 {
+                if let Some(run_id) = self.event_run_id(ev) {
+                    if let Some(expected) = self.expected_generation(&run_id)? {
+                        if generation != expected {
+                            return Ok(Vec::new());
                         }
                     }
                 }
             }
+        }
+        // The terminal transition (the run-instance state machine's worker-driven edges).
+        if let protocol::Event::RunTerminated {
+            run_id,
+            generation,
+            outcome,
+        } = ev
+        {
+            return self.handle_run_terminated(run_id, *generation, outcome);
         }
         // Track the current run + persist phase from a RunPhase.
         if let protocol::Event::RunPhase {
@@ -727,6 +760,178 @@ impl VhcService {
         Ok(emitted)
     }
 
+    /// Drive one worker-observed terminal edge of the run-instance state machine, in the
+    /// crash-repairable order (teardown-observed-before-ledger-release):
+    ///
+    /// 1. the durable RELEASE MARKER commits first — teardown is observed, the terminal target
+    ///    recorded (`begin_release`); a node crash after this point is finished by the startup
+    ///    reconciliation pass, never leaked;
+    /// 2. the live instance leaves the map and its ledger reservation releases — a replacement
+    ///    can only be admitted after this, never while the predecessor may hold devices;
+    /// 3. the terminal state commits (`commit_release`);
+    /// 4. retry bookkeeping: a recoverable failure consumes one attempt of the bounded budget
+    ///    (backoff-scheduled); exhaustion escalates to `failed_terminal` with a typed reason;
+    /// 5. per-run identity custody ([CI-7]): a terminal that ends the run identity deletes its
+    ///    key material / certificates / credentials record;
+    /// 6. the phase mirror + app event surface the transition.
+    ///
+    /// IDEMPOTENT: a duplicate terminal for an already-transitioned instance is a no-op — it can
+    /// never double-release the ledger or re-transition the row.
+    fn handle_run_terminated(
+        &self,
+        run_id: &str,
+        generation: u64,
+        outcome: &protocol::TerminalOutcome,
+    ) -> Result<Vec<VhcEvent>, VhcError> {
+        let row = self.store.get_run(run_id)?;
+        let entry_live = self.instances.lock().unwrap().contains_key(run_id);
+        if !entry_live {
+            match &row {
+                // Duplicate delivery: the instance already transitioned (no live entry, the
+                // observed state is settled) — nothing left to release or record.
+                Some(r) if r.run_state != RunState::Running && r.pending_run_state.is_none() => {
+                    return Ok(Vec::new());
+                }
+                Some(_) => {}
+                // A terminal for a run this node never recorded: nothing to transition.
+                None => return Ok(Vec::new()),
+            }
+        }
+        let (target, reason) = match outcome {
+            protocol::TerminalOutcome::Completed { outcome } => (
+                RunState::Completed,
+                format!("module signaled run end (outcome {outcome})"),
+            ),
+            protocol::TerminalOutcome::Left { checkpoint } => (
+                RunState::Left,
+                match checkpoint {
+                    Some(hash) => format!("left (drain snapshot {hash})"),
+                    None => "left".to_string(),
+                },
+            ),
+            protocol::TerminalOutcome::FailedRetryable { reason } => {
+                (RunState::FailedRetryable, reason.clone())
+            }
+            protocol::TerminalOutcome::FailedTerminal { reason } => {
+                (RunState::FailedTerminal, reason.clone())
+            }
+        };
+        // The bounded retry budget: a recoverable failure past the budget escalates to terminal
+        // with a typed reason; within it, the next reconvergence is backoff-scheduled.
+        let retry = &self.config.retry;
+        let consumed = row.as_ref().map_or(0, |r| r.retry_count);
+        let (target, reason, next_retry) = if target == RunState::FailedRetryable {
+            if consumed >= retry.max_retries {
+                (
+                    RunState::FailedTerminal,
+                    format!(
+                        "retry budget exhausted ({consumed} of {} attempts consumed): {reason}",
+                        retry.max_retries
+                    ),
+                    None,
+                )
+            } else {
+                let due = now_ms() + retry_backoff_ms(retry, consumed) as i64;
+                (RunState::FailedRetryable, reason, Some(due))
+            }
+        } else {
+            (target, reason, None)
+        };
+
+        // 1) The durable marker: teardown observed, terminal in flight (the crash window closes).
+        self.store.begin_release(run_id, target, Some(&reason))?;
+        // 2) Instance-map removal + ledger release — only AFTER the observation is durable.
+        let entry = self.instances.lock().unwrap().remove(run_id);
+        if let Some(e) = &entry {
+            self.arbiter.release(&e.id);
+        }
+        // 3) The terminal commits.
+        self.store.commit_release(run_id)?;
+        // 4) Retry bookkeeping.
+        if let Some(due) = next_retry {
+            let _ = self.store.bump_retry(run_id, due);
+        }
+        // 5) [CI-7] identity custody: a terminal that ends the run identity (completed / left /
+        // failed_terminal) deletes its per-run key material, certificates, and credentials
+        // record — no run identity outlives the run it was minted for. `failed_retryable` is NOT
+        // terminal for the identity (reconvergence supersedes it under the retry budget), so its
+        // material survives. Idempotent (remove_run tolerates absence).
+        let mut emitted = Vec::new();
+        if target != RunState::FailedRetryable {
+            if let Some(dir) = &self.identity_dir {
+                if let Ok(keystore) = daemon_vhc_session::keystore::VhcKeystore::open(dir) {
+                    if let Err(e) = keystore.remove_run(run_id) {
+                        let _ = self.emit(
+                            VhcEvent::Warning {
+                                run_id: run_id.to_string(),
+                                class: "identity_cleanup".to_string(),
+                                detail: format!("per-run key/credential cleanup failed: {e}"),
+                            },
+                            &mut emitted,
+                        );
+                    }
+                }
+            }
+        }
+        // 6) Surface the transition: the phase mirror + one app-facing event.
+        let (epoch, round) = row.as_ref().map_or((0, 0), |r| (r.epoch, r.last_round));
+        self.store.set_phase(run_id, target.as_str(), round)?;
+        self.emit(
+            VhcEvent::Phase {
+                run_id: run_id.to_string(),
+                phase: target.as_str().to_string(),
+                epoch,
+                round,
+            },
+            &mut emitted,
+        )?;
+        let _ = generation; // gated by the caller; carried for symmetry with the wire event
+        self.emit_changed(Some(run_id.to_string()));
+        Ok(emitted)
+    }
+
+    /// The pump-stream-closure observation: the worker's event stream for `(run, generation)`
+    /// ended without that instance's terminal event — the child crashed or the transport was
+    /// lost. If that instance is still the run's CURRENT one, it transitions `failed_retryable`
+    /// (process absence is the teardown observation); a reaped/replaced instance is left alone.
+    pub fn handle_stream_closed(&self, run_id: &str, generation: u64) -> Result<(), VhcError> {
+        let current = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .get(run_id)
+                .is_some_and(|e| e.id.instance == generation)
+        };
+        if !current {
+            return Ok(());
+        }
+        self.handle_run_terminated(
+            run_id,
+            generation,
+            &protocol::TerminalOutcome::FailedRetryable {
+                reason: "worker event stream closed without a terminal event".to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The generation the node currently expects for `run_id`'s events: the live instance's
+    /// incarnation when one is supervised, else the persisted incarnation (`None` for an unknown
+    /// run or a pre-incarnation row — such events pass ungated).
+    fn expected_generation(&self, run_id: &str) -> Result<Option<u64>, VhcError> {
+        let live = {
+            let instances = self.instances.lock().unwrap();
+            instances.get(run_id).map(|e| e.id.instance)
+        };
+        if live.is_some() {
+            return Ok(live);
+        }
+        Ok(self
+            .store
+            .get_run(run_id)?
+            .map(|r| r.instance)
+            .filter(|i| *i > 0))
+    }
+
     fn emit(&self, sev: VhcEvent, out: &mut Vec<VhcEvent>) -> Result<(), VhcError> {
         self.store.append_event(&sev)?;
         // A send error only means "no live subscribers"; the durable log already has it.
@@ -745,7 +950,8 @@ impl VhcService {
     fn event_run_id(&self, ev: &protocol::Event) -> Option<String> {
         match ev {
             protocol::Event::RunPhase { run_id, .. }
-            | protocol::Event::AdmittedTupleMismatch { run_id, .. } => Some(run_id.clone()),
+            | protocol::Event::AdmittedTupleMismatch { run_id, .. }
+            | protocol::Event::RunTerminated { run_id, .. } => Some(run_id.clone()),
             protocol::Event::RoundProgress { .. }
             | protocol::Event::RoundOutcome { .. }
             | protocol::Event::Metric { .. }
@@ -978,9 +1184,14 @@ impl VhcApi for VhcService {
                     .store
                     .get_run(&run_id)
                     .map_err(|e| VhcError::from(e).to_api())?;
+                // Identity retention is gated on BOTH axes: a standing joined intent whose
+                // observed instance is resumable (running / failed_retryable) retains its
+                // incarnation; a terminal or left instance never does — an explicit owner
+                // rejoin of a completed/failed/left run mints a fresh incarnation (its
+                // predecessor's identity, keys, and journal stream are settled).
                 let (epoch, role, persisted_instance, run_hash) = persisted
                     .as_ref()
-                    .filter(|r| r.desired_state == DesiredState::Joined)
+                    .filter(|r| r.desired_state == DesiredState::Joined && r.run_state.resumable())
                     .map_or((0, String::new(), 0, None), |r| {
                         (r.epoch, r.role.clone(), r.instance, r.run_id_hash)
                     });
@@ -1094,11 +1305,12 @@ impl VhcApi for VhcService {
                 return Err(e.to_api());
             }
         };
+        let generation = id.instance;
         self.instances
             .lock()
             .unwrap()
             .insert(run_id.clone(), InstanceEntry { id, worker });
-        self.spawn_pump(rx);
+        self.spawn_pump(Some((run_id.clone(), generation)), rx);
         self.emit_changed(Some(run_id));
         Ok(())
     }
@@ -1110,13 +1322,18 @@ impl VhcApi for VhcService {
         _op_id: String,
     ) -> Result<(), ApiError> {
         self.require_enabled().map_err(|e| e.to_api())?;
+        let map = |e: StoreError| VhcError::from(e).to_api();
         self.store
             .set_desired_state(&run_id, DesiredState::Left)
-            .map_err(|e| VhcError::from(e).to_api())?;
-        let entry = self.instances.lock().unwrap().remove(&run_id);
-        let worker = entry
-            .as_ref()
-            .map_or_else(|| self.worker.clone(), |e| e.worker.clone());
+            .map_err(map)?;
+        // The owner took manual control: no reconvergence is pending or owed.
+        self.store.clear_retry(&run_id).map_err(map)?;
+        let worker = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .get(&run_id)
+                .map_or_else(|| self.worker.clone(), |e| e.worker.clone())
+        };
         worker
             .leave(run_id.clone(), to_leave_mode(mode))
             .await
@@ -1124,10 +1341,17 @@ impl VhcApi for VhcService {
         // Observed teardown → release (decisions D6 point 6): the leave has been accepted by the
         // child's serial command loop (which drops the run's wasm instance + device allocations
         // before servicing anything else), so the ledger entry is surrendered only NOW — never
-        // optimistically before the victim gave the memory back.
+        // optimistically before the victim gave the memory back. The release rides the durable
+        // marker protocol so a crash between the observation and the terminal commit is repaired
+        // by the startup reconciliation pass.
+        self.store
+            .begin_release(&run_id, RunState::Left, None)
+            .map_err(map)?;
+        let entry = self.instances.lock().unwrap().remove(&run_id);
         if let Some(e) = &entry {
             self.arbiter.release(&e.id);
         }
+        self.store.commit_release(&run_id).map_err(map)?;
         self.emit_changed(Some(run_id));
         Ok(())
     }
@@ -1184,6 +1408,37 @@ impl VhcApi for VhcService {
         });
         Ok(stream.boxed())
     }
+}
+
+/// The generation stamp a run-scoped worker event carries (`None` for unstamped request/reply
+/// events — `Ready`/`Probed`/`Assessed`/`Metric`/`Warning`/`Error`/`Pong`).
+fn event_generation(ev: &protocol::Event) -> Option<u64> {
+    match ev {
+        protocol::Event::RunPhase { generation, .. }
+        | protocol::Event::RoundProgress { generation, .. }
+        | protocol::Event::RoundOutcome { generation, .. }
+        | protocol::Event::CheckpointPublished { generation, .. }
+        | protocol::Event::ModuleSwitched { generation, .. }
+        | protocol::Event::AdmittedTupleMismatch { generation, .. }
+        | protocol::Event::RunTerminated { generation, .. } => Some(*generation),
+        _ => None,
+    }
+}
+
+/// Exponential reconvergence backoff for the `attempt`-th consecutive recoverable failure
+/// (0-based), capped at the configured ceiling.
+fn retry_backoff_ms(cfg: &daemon_vhc_session::config::RetryConfig, attempt: u32) -> u64 {
+    cfg.initial_backoff_ms
+        .saturating_mul(2u64.saturating_pow(attempt.min(16)))
+        .min(cfg.max_backoff_ms.max(cfg.initial_backoff_ms))
+}
+
+/// Wall-clock unix ms (the retry schedule is a coarse wall-clock quantity, like the store's).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

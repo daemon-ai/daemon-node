@@ -158,6 +158,40 @@ pub struct OwnerBudgetConfig {
     pub max_instances: u32,
 }
 
+/// The bounded reconvergence budget for recoverable run-instance failures (`[vhc.retry]`; the
+/// run-instance state machine, architecture §6.4/ABI §12.10). A `failed_retryable` instance is
+/// reconverged with exponential backoff until either it stays up past `min_uptime_ms` (the budget
+/// resets — the coarse stability signal; the node never inspects rounds) or the budget exhausts
+/// (the failure escalates to `failed_terminal`, owner action required).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetryConfig {
+    /// Reconvergence attempts allowed since the last stable interval; exhaustion escalates the
+    /// failure to terminal.
+    pub max_retries: u32,
+    /// The first backoff delay in ms; doubles per consecutive attempt.
+    pub initial_backoff_ms: u64,
+    /// The backoff ceiling in ms.
+    pub max_backoff_ms: u64,
+    /// How long an instance must stay running before its consumed budget resets (ms).
+    pub min_uptime_ms: u64,
+    /// The reconciliation-tick interval in ms (the loop that repairs crash windows, fires due
+    /// reconvergences, and applies the uptime reset).
+    pub reconcile_tick_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 5,
+            initial_backoff_ms: 1_000,
+            max_backoff_ms: 60_000,
+            min_uptime_ms: 30_000,
+            reconcile_tick_ms: 5_000,
+        }
+    }
+}
+
 /// Live module-upgrade bounds (`[vhc.upgrade]`, ABI §4.4/§9.6/§10.3) — the node clamps every
 /// `SwitchModule` it issues to these before touching the worker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +240,15 @@ pub struct VhcConfig {
     /// trainer that verifies the seat holder's lease, never a claimant, unless the owner opts in.
     #[serde(default)]
     pub seat_claim: bool,
+    /// The envelope role LABEL whose registry seat this node claims when coordinator duty is
+    /// enabled — a joined run whose admitted role matches is covered by the resident
+    /// claim/heartbeat loop. Genesis envelopes name their coordinator role; this default matches
+    /// the conventional label.
+    #[serde(default = "default_seat_role")]
+    pub seat_role: String,
+    /// The reconvergence retry budget + reconciliation-tick cadence (`[vhc.retry]`).
+    #[serde(default)]
+    pub retry: RetryConfig,
     /// The coordinator-registry discovery surface (A3; additive — defaults to "no registry").
     pub registry: RegistryConfig,
     /// iroh transport knobs.
@@ -216,6 +259,10 @@ pub struct VhcConfig {
     pub owner_budget: OwnerBudgetConfig,
     /// Live module-upgrade (`SwitchModule`) bounds (ABI §10.3). Additive; sensible finite defaults.
     pub upgrade: UpgradeConfig,
+}
+
+fn default_seat_role() -> String {
+    "coordinator".to_string()
 }
 
 impl Default for VhcConfig {
@@ -233,6 +280,8 @@ impl Default for VhcConfig {
             module_trust: ModuleTrust::Signed,
             coordinator_allowlist: vec!["https://api.daemon.ai/api/v1/vhc".to_string()],
             seat_claim: false,
+            seat_role: default_seat_role(),
+            retry: RetryConfig::default(),
             registry: RegistryConfig::default(),
             iroh: IrohConfig::default(),
             owner_budget: OwnerBudgetConfig::default(),
