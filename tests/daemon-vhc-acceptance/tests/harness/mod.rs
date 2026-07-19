@@ -289,6 +289,19 @@ pub fn spawn_node(spec: &NodeSpec<'_>) -> Node {
     node
 }
 
+/// Seed the run's chunk-addressed corpus objects into the fixture's presigned OBJECT store (the
+/// R2-compatible payload tier): each object under the `runs/<run>/payload/<hex>` key the
+/// production `R2Store` content seam presigns for it. The live trainer fetches them by content
+/// hash via `data@2`; the pump verifies covering chunks (the store is untrusted).
+pub fn seed_corpus_r2(cluster: &Cluster, run_label: &str, genesis: &LiveGenesis) {
+    for (hash, bytes) in &genesis.corpus_objects {
+        let hex = daemon_vhc_proto::Hash(*hash).to_hex();
+        cluster
+            .registry
+            .put_object(&format!("runs/{run_label}/payload/{hex}"), bytes.clone());
+    }
+}
+
 /// A default participation policy (always-on, uncapped — the arbiter is unbounded in-suite).
 pub fn always_policy() -> VhcPolicy {
     VhcPolicy {
