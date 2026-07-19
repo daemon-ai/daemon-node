@@ -288,6 +288,11 @@ pub struct VhcServiceParts {
     /// credentials, no node-minted identity) — the worker's mandatory-tuple check then refuses a
     /// live join, which is exactly right off the production boot path.
     pub identity_dir: Option<std::path::PathBuf>,
+    /// The registry seat-slot directory (architecture §6.3; D-P9). `Some` + `[vhc] seat_claim` +
+    /// an identity store ⇒ the resident seat keeper covers every joined run whose admitted role
+    /// is the configured seat role (claim on boot, heartbeat at the lease cadence, fenced release
+    /// on pause/leave/shutdown). `None` = this node never claims (the trainer default).
+    pub seat_directory: Option<Arc<dyn crate::seat_keeper::SeatDirectory>>,
 }
 
 /// The authored-join delivery: the tuple (incarnation stamped), the wire credentials bytes, and
@@ -315,6 +320,9 @@ pub struct VhcService {
     /// The identity keystore directory (D-P8 credential + per-run cert authorship); `None`
     /// disables node-side authorship (tests / headless).
     identity_dir: Option<std::path::PathBuf>,
+    /// The resident coordinator seat keeper (present only when the owner enabled coordinator
+    /// duty AND a seat directory + identity store are wired).
+    seat: Option<crate::seat_keeper::SeatKeeper>,
     events_tx: broadcast::Sender<VhcEvent>,
     feed: Option<NodeFeed>,
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
@@ -333,6 +341,18 @@ impl VhcService {
     /// only when `config.enabled`.
     pub fn new(parts: VhcServiceParts) -> Self {
         let (events_tx, _) = broadcast::channel(1024);
+        // Coordinator duty is opt-in AND fully wired or absent: the keeper exists only when the
+        // owner enabled it and both the seat directory + the identity store are present.
+        let seat = match (
+            parts.config.seat_claim,
+            &parts.seat_directory,
+            &parts.identity_dir,
+        ) {
+            (true, Some(directory), Some(identity_dir)) => Some(
+                crate::seat_keeper::SeatKeeper::new(directory.clone(), identity_dir.clone()),
+            ),
+            _ => None,
+        };
         Self {
             config: parts.config,
             store: parts.store,
@@ -342,6 +362,7 @@ impl VhcService {
             instances: Mutex::new(BTreeMap::new()),
             worker_factory: parts.worker_factory,
             identity_dir: parts.identity_dir,
+            seat,
             events_tx,
             feed: parts.feed,
             current_run: Mutex::new(None),
@@ -573,6 +594,127 @@ impl VhcService {
             self.emit_changed(None);
         }
         Ok(rejoined)
+    }
+
+    /// Spawn the resident coordinator seat keeper loop (requires [`bind_self`](Self::bind_self)):
+    /// one keeper pass per lease heartbeat interval — claim-on-boot for uncovered slots, renew for
+    /// held leases, fenced-out drops surfaced as events. Returns `None` when coordinator duty is
+    /// not fully wired (`[vhc] seat_claim` off, or no seat directory / identity store).
+    pub fn spawn_seat_keeper(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        self.seat.as_ref()?;
+        let weak = Arc::downgrade(self);
+        let tick =
+            std::time::Duration::from_millis(daemon_vhc_proto::DEFAULT_SEAT_HEARTBEAT_MS.max(100));
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(me) = weak.upgrade() else { return };
+                let _ = me.seat_tick().await;
+            }
+        }))
+    }
+
+    /// One seat-keeper pass (the resident loop's body; callable directly for deterministic
+    /// tests): cover every joined run whose admitted role is the configured seat role. Fenced
+    /// drops and step failures surface as persisted warnings. Returns the notes observed.
+    pub async fn seat_tick(&self) -> Result<Vec<crate::seat_keeper::SeatNote>, VhcError> {
+        let Some(keeper) = &self.seat else {
+            return Ok(Vec::new());
+        };
+        let candidates = self.seat_candidates()?;
+        let notes = keeper.tick(&candidates, now_ms() as u64).await;
+        for note in &notes {
+            use crate::seat_keeper::SeatNote;
+            let (run_id, class, detail) = match note {
+                SeatNote::Claimed {
+                    run_label,
+                    incarnation,
+                } => {
+                    // A won seat is a state change the app should see (not a warning).
+                    self.emit_changed(Some(run_label.clone()));
+                    let _ = (run_label, incarnation);
+                    continue;
+                }
+                SeatNote::Renewed { .. } => continue,
+                SeatNote::Fenced { run_label, detail } => (
+                    run_label.clone(),
+                    "seat_fenced",
+                    format!("coordinator seat moved (this claimant is fenced): {detail}"),
+                ),
+                SeatNote::Error { run_label, detail } => {
+                    (run_label.clone(), "seat_keeper", detail.clone())
+                }
+            };
+            let mut emitted = Vec::new();
+            let _ = self.emit(
+                VhcEvent::Warning {
+                    run_id,
+                    class: class.to_string(),
+                    detail,
+                },
+                &mut emitted,
+            );
+        }
+        Ok(notes)
+    }
+
+    /// The seat keeper's coverage: every non-terminal joined intent whose admitted role matches
+    /// the configured seat role, resolved to its lease scope (identity from the persisted
+    /// admitted tuple; the endpoint peers dial is the run's coordinator endpoint).
+    fn seat_candidates(&self) -> Result<Vec<crate::seat_keeper::SeatCandidate>, VhcError> {
+        let seat_role = &self.config.seat_role;
+        let mut out = Vec::new();
+        for run in self.store.active_intents()? {
+            if &run.role != seat_role {
+                continue;
+            }
+            let Some(tuple) = run
+                .admitted_tuple
+                .as_deref()
+                .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok())
+            else {
+                continue; // no assessed identity to scope a lease under
+            };
+            out.push(crate::seat_keeper::SeatCandidate {
+                run_label: run.run_id.clone(),
+                genesis_hash: tuple.genesis_hash,
+                role: run.role.clone(),
+                epoch: run.epoch,
+                module_hash: tuple.module_hash,
+                endpoint: daemon_vhc_proto::ControlEndpoint {
+                    ws: (!run.coordinator.is_empty()).then(|| run.coordinator.clone()),
+                    iroh_ticket: None,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// Release the held coordinator seat for `run_id` (owner pause/leave): the fenced release, so
+    /// a successor takes over at floor + 1 without waiting out the TTL. Best-effort — a failed
+    /// release surfaces as a warning (the lease TTL remains the safety net).
+    async fn release_seat_for(&self, run_id: &str) {
+        let Some(keeper) = &self.seat else { return };
+        if let Err(e) = keeper.release_run(run_id).await {
+            let mut emitted = Vec::new();
+            let _ = self.emit(
+                VhcEvent::Warning {
+                    run_id: run_id.to_string(),
+                    class: "seat_release".to_string(),
+                    detail: format!("seat release failed (the lease TTL will expire it): {e}"),
+                },
+                &mut emitted,
+            );
+        }
+    }
+
+    /// Release every held coordinator seat (node shutdown) — the fenced release path.
+    pub async fn release_seats(&self) {
+        if let Some(keeper) = &self.seat {
+            let _ = keeper.release_all().await;
+        }
     }
 
     /// Spawn the resident reconciliation tick (requires [`bind_self`](Self::bind_self)): the
@@ -1509,6 +1651,8 @@ impl VhcApi for VhcService {
             self.arbiter.release(&e.id);
         }
         self.store.commit_release(&run_id).map_err(map)?;
+        // A leaving coordinator surrenders its seat (fenced release; the floor persists).
+        self.release_seat_for(&run_id).await;
         self.emit_changed(Some(run_id));
         Ok(())
     }
@@ -1546,6 +1690,9 @@ impl VhcApi for VhcService {
             // over a held-but-idle reservation; resume re-admits against the CURRENT ledgers.
             self.arbiter.release(&id);
         }
+        // Release-on-pause covers the coordinator seat too: a paused coordinator surrenders its
+        // lease (fenced release) so a standby can take the seat at floor + 1.
+        self.release_seat_for(&run_id).await;
         self.emit_changed(Some(run_id));
         Ok(())
     }

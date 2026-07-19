@@ -143,6 +143,7 @@ fn service_over(
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        seat_directory: None,
     }));
     svc.bind_self();
     svc
@@ -521,6 +522,7 @@ async fn resume_refusal_leaves_the_run_paused() {
         }),
         worker_factory: None,
         identity_dir: None,
+        seat_directory: None,
     }));
     svc.bind_self();
     svc.vhc_join("run-a".into(), policy(), "op".into())

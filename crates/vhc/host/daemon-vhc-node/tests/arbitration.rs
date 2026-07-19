@@ -161,6 +161,7 @@ fn rig(budget: OwnerBudget) -> Rig {
         budget: Some(budget),
         worker_factory: Some(factory),
         identity_dir: None,
+        seat_directory: None,
     }));
     svc.bind_self();
     Rig { svc, children }
@@ -302,6 +303,7 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
             budget: Some(colocation_budget()),
             worker_factory: Some(factory),
             identity_dir: None,
+            seat_directory: None,
         }));
         svc.bind_self();
         svc.vhc_join("run-big".into(), policy(6_000, 40), "op-1".into())
@@ -338,6 +340,7 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
             budget: Some(shrunk),
             worker_factory: Some(factory),
             identity_dir: None,
+            seat_directory: None,
         }));
         svc.bind_self();
         Rig { svc, children }
@@ -431,6 +434,7 @@ async fn admitted_charge_equals_assess_claim_totals() {
         budget: Some(budget),
         worker_factory: Some(factory),
         identity_dir: None,
+        seat_directory: None,
     }));
     svc.bind_self();
 

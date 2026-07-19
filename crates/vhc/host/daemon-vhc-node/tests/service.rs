@@ -139,6 +139,7 @@ fn service(config: VhcConfig, worker: Arc<FakeWorker>, feed: Option<NodeFeed>) -
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        seat_directory: None,
     })
 }
 
@@ -181,6 +182,7 @@ async fn join_persists_and_reload_reconverges() {
             budget: None,
             worker_factory: None,
             identity_dir: None,
+            seat_directory: None,
         });
         svc.vhc_join("run-a".into(), policy(), "op-a".into())
             .await
@@ -208,6 +210,7 @@ async fn join_persists_and_reload_reconverges() {
             budget: None,
             worker_factory: None,
             identity_dir: None,
+            seat_directory: None,
         });
         let rejoined = svc.start().await.unwrap();
         assert_eq!(rejoined, 1, "only the active intent re-converges");
@@ -477,6 +480,7 @@ async fn join_discovers_fetches_envelope_and_assesses() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        seat_directory: None,
     });
 
     svc.vhc_join("run-disc".into(), policy(), "op".into())
@@ -535,6 +539,7 @@ async fn join_refuses_a_coordinator_outside_the_allowlist() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        seat_directory: None,
     });
 
     let err = svc

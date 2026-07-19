@@ -28,6 +28,7 @@ pub mod arbiter;
 pub mod credentials;
 pub mod discovery;
 pub mod seat;
+pub mod seat_keeper;
 pub mod service;
 pub mod store;
 
@@ -39,6 +40,7 @@ pub use discovery::{CheckpointPointer, DiscoveredRun, EgressRunDiscovery, RunDis
 // Re-exported so the boot site constructs the registry-backed discovery seam without a direct
 // `daemon-vhc-net` dep edge (A3 boot wiring; additive).
 pub use daemon_vhc_net::RegistryClient;
+pub use seat_keeper::{SeatCandidate, SeatDirectory, SeatKeeper, SeatNote};
 pub use service::{NodeFeed, VhcError, VhcService, VhcServiceParts, WorkerControl};
 pub use store::{
     effective_state, DesiredState, PersistedRun, RunState, StoreError, VhcStore, EVENT_WINDOW,
