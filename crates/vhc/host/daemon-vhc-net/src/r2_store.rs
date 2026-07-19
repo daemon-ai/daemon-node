@@ -486,22 +486,25 @@ mod tests {
         assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
     }
 
-    /// A store returning bytes that do not hash to their own address is a typed tamper reject
-    /// (defense in depth — the pump re-verifies regardless).
+    /// The content seam serves keyed bytes VERBATIM: its key is not always the object's plain
+    /// blake3 (a chunk-addressed corpus shard is keyed by its CHUNK FOLD), so verification is the
+    /// pump's job (plain hash for payloads/whole artifacts, covering-chunk hashes for shards). A
+    /// plain-hash gate here would reject every chunk-addressed range fetch — the store is untrusted
+    /// by construction and the pump is the sole arbiter (matching `MemoryContentStore`).
     #[tokio::test]
-    async fn content_tamper_is_typed_hash_mismatch() {
+    async fn get_content_serves_keyed_bytes_verbatim() {
         let mock = MockR2::start().await;
         let store = store_over(&mock);
         let hash = store.put_content(b"honest").await.unwrap();
         mock.corrupt(
             &format!("runs/run-x/payload/{}", hash.to_hex()),
-            b"tampered",
+            b"fold-keyed-bytes",
         );
 
-        let err = store.get_content(&hash).await.unwrap_err();
-        assert!(
-            matches!(err, VhcNetError::HashMismatch { .. }),
-            "got {err:?}"
+        assert_eq!(
+            store.get_content(&hash).await.unwrap(),
+            b"fold-keyed-bytes",
+            "the untrusted store serves the keyed bytes; the pump verifies"
         );
     }
 

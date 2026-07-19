@@ -97,6 +97,9 @@ pub struct LiveGenesisSpec<'a> {
 ///
 /// # Panics
 /// On unreadable fixture files or CBOR authoring failures — fixture authorship fails loud.
+// Reads the vendored corpus fixture from disk: this is harness authoring tooling (never a shipped
+// node path), so the workspace's raw-fs ban does not apply here.
+#[allow(clippy::disallowed_methods)]
 #[must_use]
 pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
     let manifest_bytes = std::fs::read(spec.corpus_dir.join("corpus-manifest.cbor"))
