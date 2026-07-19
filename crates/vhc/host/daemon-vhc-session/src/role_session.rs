@@ -32,18 +32,25 @@
 //! execution.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon_vhc_host::run::{JournalSink, OpOutcome, OpRequest, PumpHandle, RunConfig, RunEnd};
+use daemon_vhc_host::run::{
+    DeviceProfile, EnvelopeRoleGrants, JournalSink, MigrationInput, OpOutcome, OpRequest,
+    OwnerPolicy, ParticipationLane, PumpHandle, RunConfig, RunEnd, RunIdentity,
+};
 use daemon_vhc_host::trap::TrapCode;
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_net::{ContentStore, ControlPlane};
-use daemon_vhc_proto::{to_canonical_vec, PeerId, RunKeyCertificate};
+use daemon_vhc_proto::{
+    blake3_hash, peer_id, to_canonical_vec, AdmittedQuotas, CertScope, Hash, PeerId,
+    RunKeyCertificate, SigningKey,
+};
 use tokio::sync::{mpsc, Notify};
 
 use crate::attach::{Attach, CertCheck, InboundVerdict};
-use crate::protocol::{Event, LeaveMode, TerminalOutcome};
+use crate::protocol::{AdmittedTuple, Event, LeaveMode, TerminalOutcome};
 
 /// How long an unresolved inbound sequence gap may stand before the session classifies it
 /// unrecoverable (no backfill plane exists yet; reordered frames usually resolve in milliseconds).
@@ -98,6 +105,11 @@ pub struct RoleSessionSpec {
     /// resolved, its bytes fetched + hash-verified from the payload plane). `None` = a fresh
     /// start from genesis.
     pub restore: Option<daemon_vhc_host::run::MigrationInput>,
+    /// The quotas this instance was admitted under — the grant-expansion baseline a live module
+    /// switch compares the re-admitted quotas against (fail closed, ABI §10.3 step 3). `None`
+    /// only on harness/test seats that bypass the admission funnel; the production join always
+    /// records them.
+    pub admitted_quotas: Option<AdmittedQuotas>,
 }
 
 /// A throttle level (the owner's GPU-governor lever, forwarded verbatim by the worker loop).
@@ -113,10 +125,68 @@ pub struct ThrottleLevel {
     pub vram_cap_mb: Option<u32>,
 }
 
+/// How many rollback-and-retry cycles a switch's migrate/validate/activate steps get before the
+/// session leaves the run (ABI §10.3 step 7). Each retry re-migrates from the same durable drain
+/// snapshot with a fresh instance.
+const SWITCH_MIGRATE_RETRIES: u32 = 1;
+
+/// A per-seam journal opener: invoked with the incoming incarnation's execution identity, AFTER
+/// the retired instance's sink has been dropped (one writer per file series — the §8.1 seam
+/// continues the same log). Called once per migrate attempt (a failed attempt's sink is dropped
+/// with its instance before the retry re-opens).
+pub type SeamJournal = Box<dyn FnMut(&RunIdentity) -> Result<Box<dyn JournalSink>, String> + Send>;
+
+/// Everything a live module switch binds — the worker's pre-flight output, handed into the
+/// running session (ABI §10.3). The target artifacts are hash-pinned; the identity material is
+/// the node-provisioned NEW incarnation's (a live upgrade advances the epoch and mints a new
+/// never-reused incarnation, §8.1); the admission inputs let the session re-run owner law over
+/// the new module before the fence.
+pub struct SwitchBinding {
+    /// The committed transition-chain epoch this switch activates (§8.1).
+    pub epoch: u64,
+    /// The hash-pinned target module.
+    pub new_module: [u8; 32],
+    /// The committed upgrade record's grants anchor — the re-derived grants document must hash
+    /// to it.
+    pub grants_hash: [u8; 32],
+    /// The node-assessed admitted tuple for the post-switch identity (carries the node-minted
+    /// new incarnation).
+    pub tuple: AdmittedTuple,
+    /// The target module bytes when the worker resolved them (hash-verified here either way);
+    /// `None` ⇒ the session fetches by content address from its own providers.
+    pub module_bytes: Option<Vec<u8>>,
+    /// The new instance's admitted config bytes (the upgrade record pins module + grants; config
+    /// carriage is empty until upgrade records carry one).
+    pub config: Vec<u8>,
+    /// The NEW incarnation's per-run signing seed (node-minted, resolved by keystore reference).
+    pub signing_seed: [u8; 32],
+    /// The NEW incarnation's certificate — bound to
+    /// `(run, epoch, role, new incarnation, new module)` (the re-issuance handshake, §12.3
+    /// [CERT-3]: an incarnation change rotates the key).
+    pub own_cert: RunKeyCertificate,
+    /// The genesis role grant list (channel table etc.) the new grants document derives from.
+    pub role_grants: daemon_vhc_proto::genesis::RoleGrants,
+    /// The envelope-derived role grants for the admission funnel's quota derivation.
+    pub envelope_grants: Option<EnvelopeRoleGrants>,
+    /// The participation lane owner law evaluates against (§9.4).
+    pub lane: ParticipationLane,
+    /// The device profile for the re-admission funnel.
+    pub device: DeviceProfile,
+    /// The owner policy the re-admission enforces (fail-closed).
+    pub owner: OwnerPolicy,
+    /// The seam journal opener (per migrate attempt).
+    pub journal: SeamJournal,
+    /// The quiesce drain deadline in ms (§4.4), also the per-attempt validate window.
+    pub deadline_ms: u64,
+    /// The explicit migrate fuel budget (`None` = the engine default).
+    pub migrate_fuel: Option<u64>,
+}
+
 /// A command from the worker loop into the running role task.
 enum RoleCommand {
     Throttle(ThrottleLevel),
     Leave(LeaveMode),
+    Switch(Box<SwitchBinding>),
 }
 
 /// The handle the worker keeps per spawned role — the ONLY per-run state above the session
@@ -125,7 +195,9 @@ enum RoleCommand {
 pub struct RoleHandle {
     commands: mpsc::UnboundedSender<RoleCommand>,
     task: tokio::task::JoinHandle<()>,
-    generation: u64,
+    /// The LIVE generation: a successful module switch advances it to the new incarnation
+    /// (shared with the session task, which stamps events with the current value).
+    generation: Arc<AtomicU64>,
     run_label: String,
 }
 
@@ -141,11 +213,19 @@ impl RoleHandle {
         let _ = self.commands.send(RoleCommand::Leave(mode));
     }
 
+    /// Run the live module switch (the ABI §10.3 upgrade transaction) against this session's
+    /// held instance. Answers on the event stream: `ModuleSwitched` on activation,
+    /// `SwitchRefused` when the pre-fence checks refuse (the old module keeps running), or the
+    /// terminal `RunTerminated` when a post-fence failure leaves the run.
+    pub fn switch(&self, binding: SwitchBinding) {
+        let _ = self.commands.send(RoleCommand::Switch(Box::new(binding)));
+    }
+
     /// The role-instance generation (the never-reused incarnation id) stamped on every event
-    /// this session emits.
+    /// this session emits. A successful module switch advances it.
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.generation
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// The run label this handle serves (the worker map's key coordinates).
@@ -177,24 +257,27 @@ pub fn spawn_role(
     events: mpsc::UnboundedSender<Event>,
 ) -> RoleHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let generation = spec.run.identity.instance;
+    let generation = Arc::new(AtomicU64::new(spec.run.identity.instance));
     let label = run_label.clone();
-    let task = tokio::spawn(async move {
-        let epoch = spec.run.identity.epoch;
-        let _ = events.send(Event::RunPhase {
-            run_id: label.clone(),
-            phase: "joining".into(),
-            epoch,
-            round: 0,
-            generation,
-        });
-        let outcome = run_role(&label, spec, &events, cmd_rx, generation).await;
-        let _ = events.send(Event::RunTerminated {
-            run_id: label,
-            generation,
-            outcome,
-        });
-    });
+    let task = {
+        let generation = generation.clone();
+        tokio::spawn(async move {
+            let epoch = spec.run.identity.epoch;
+            let _ = events.send(Event::RunPhase {
+                run_id: label.clone(),
+                phase: "joining".into(),
+                epoch,
+                round: 0,
+                generation: generation.load(Ordering::SeqCst),
+            });
+            let outcome = run_role(&label, spec, &events, cmd_rx, &generation).await;
+            let _ = events.send(Event::RunTerminated {
+                run_id: label,
+                generation: generation.load(Ordering::SeqCst),
+                outcome,
+            });
+        })
+    };
     RoleHandle {
         commands: cmd_tx,
         task,
@@ -203,14 +286,28 @@ pub fn spawn_role(
     }
 }
 
-/// The session body: bind, run, service, classify. Returns the terminal outcome (the task
-/// wrapper emits it).
+/// One live module instance under the session: the running guest, its pump, the epoch-scoped
+/// inbound attach, and the relay cursors. A live module switch retires one and binds the next;
+/// everything else in the session (providers, command stream, event stream) carries across.
+struct LiveInstance {
+    run: daemon_vhc_host::run::Run,
+    pump: PumpHandle,
+    attach: Attach,
+    identity: RunIdentity,
+    own_sender: PeerId,
+    published_cursor: usize,
+    metrics_cursor: usize,
+}
+
+/// The session body: bind, run, service, switch, classify. Returns the terminal outcome (the
+/// task wrapper emits it).
+#[allow(clippy::too_many_lines)]
 async fn run_role(
     run_label: &str,
     spec: RoleSessionSpec,
     events: &mpsc::UnboundedSender<Event>,
     mut commands: mpsc::UnboundedReceiver<RoleCommand>,
-    generation: u64,
+    generation: &Arc<AtomicU64>,
 ) -> TerminalOutcome {
     let RoleSessionSpec {
         module,
@@ -223,10 +320,11 @@ async fn run_role(
         journal,
         drain_deadline,
         restore,
+        mut admitted_quotas,
     } = spec;
 
-    let identity = run_cfg.identity.clone();
-    let own_sender = own_cert.body.run_key;
+    let mut identity = run_cfg.identity.clone();
+    let mut own_sender = own_cert.body.run_key;
     let own_cert_record = crate::distribution::DistributionRecord::Cert(own_cert.clone());
     if !peer_certs.contains(&own_cert) {
         peer_certs.push(own_cert);
@@ -234,7 +332,7 @@ async fn run_role(
 
     // Bind the runtime. Setup failures are terminal: the artifacts were already admitted, so a
     // module that cannot even instantiate is not a transient environment fault.
-    let worker = match Worker::new(engine) {
+    let worker = match Worker::new(engine.clone()) {
         Ok(w) => w,
         Err(e) => {
             return TerminalOutcome::FailedTerminal {
@@ -263,6 +361,7 @@ async fn run_role(
 
     // The egress wake: the pump signals whenever guest egress lands, so this loop is
     // event-driven over published frames / op requests / metrics instead of interval-polled.
+    // One notify serves every instance the session binds (the hook re-registers per pump).
     let egress = Arc::new(Notify::new());
     {
         let egress = egress.clone();
@@ -271,8 +370,8 @@ async fn run_role(
 
     // Inbound: §12.1 attach — signature, scope, MANDATORY certificate chain, dedup/gap — then
     // opaque delivery below the pump.
-    let cert_check = CertCheck::new(trusted_bases, peer_certs);
-    let mut attach = Attach::new(identity.run_id, identity.epoch, cert_check, pump.clone());
+    let cert_check = CertCheck::new(trusted_bases.clone(), peer_certs.clone());
+    let attach = Attach::new(identity.run_id, identity.epoch, cert_check, pump.clone());
     let mut inbound = providers.control.subscribe();
 
     // §12.3 distribution: announce this incarnation's certificate on the control plane so peers
@@ -288,12 +387,20 @@ async fn run_role(
         phase: "running".into(),
         epoch: identity.epoch,
         round: 0,
-        generation,
+        generation: generation.load(Ordering::SeqCst),
     });
 
-    // Loop state: relay cursors, held frames (gap/back-pressure), throttle level.
-    let mut published_cursor = 0usize;
-    let mut metrics_cursor = 0usize;
+    let mut current = LiveInstance {
+        run,
+        pump,
+        attach,
+        identity: identity.clone(),
+        own_sender,
+        published_cursor: 0,
+        metrics_cursor: 0,
+    };
+
+    // Loop state: held frames (gap/back-pressure), throttle level, exit causes.
     let mut held: VecDeque<(std::time::Instant, Vec<u8>)> = VecDeque::new();
     let mut paused = false;
     let mut ticker = tokio::time::interval(TICK);
@@ -302,12 +409,13 @@ async fn run_role(
     let mut transport_fault: Option<String> = None;
 
     'session: loop {
+        let gen_now = generation.load(Ordering::SeqCst);
         tokio::select! {
             frame = inbound.recv() => {
                 match frame {
                     Some(frame) => {
                         if !accept_inbound(
-                            &mut attach, &frame, own_sender, &mut held, events, generation,
+                            &mut current.attach, &frame, own_sender, &mut held, events, gen_now,
                         ) {
                             transport_fault = Some("inbound frame delivery failed".into());
                             break 'session;
@@ -323,8 +431,8 @@ async fn run_role(
             }
             _ = egress.notified() => {
                 if let Err(reason) = relay_egress(
-                    &pump, &providers, &mut published_cursor, &mut metrics_cursor,
-                    events, generation,
+                    &current.pump, &providers, &mut current.published_cursor,
+                    &mut current.metrics_cursor, events, gen_now,
                 ).await {
                     transport_fault = Some(reason);
                     break 'session;
@@ -333,11 +441,66 @@ async fn run_role(
             cmd = commands.recv() => {
                 match cmd {
                     Some(RoleCommand::Throttle(level)) => {
-                        apply_throttle(&pump, level, &mut paused);
+                        apply_throttle(&current.pump, level, &mut paused);
                     }
                     Some(RoleCommand::Leave(mode)) => {
                         leave_requested = Some(mode);
                         break 'session;
+                    }
+                    Some(RoleCommand::Switch(binding)) => {
+                        // The live module switch (ABI §10.3). A paused instance must drain:
+                        // release the hard gate first.
+                        current.pump.release();
+                        paused = false;
+                        match perform_switch(
+                            &worker,
+                            &engine,
+                            &providers,
+                            &trusted_bases,
+                            &peer_certs,
+                            &egress,
+                            current,
+                            *binding,
+                            admitted_quotas.as_ref(),
+                            run_label,
+                            events,
+                        )
+                        .await
+                        {
+                            SwitchStep::Refused { instance, reason } => {
+                                // Pre-fence refusal: the old module keeps running untouched.
+                                current = instance;
+                                let _ = events.send(Event::SwitchRefused {
+                                    run_id: run_label.to_string(),
+                                    generation: gen_now,
+                                    reason,
+                                });
+                            }
+                            SwitchStep::Activated {
+                                instance,
+                                retries,
+                                quotas,
+                            } => {
+                                current = instance;
+                                identity = current.identity.clone();
+                                own_sender = current.own_sender;
+                                admitted_quotas = quotas.or(admitted_quotas);
+                                generation.store(identity.instance, Ordering::SeqCst);
+                                held.clear(); // held frames belong to the retired epoch's scope
+                                let _ = events.send(Event::ModuleSwitched {
+                                    run_id: run_label.to_string(),
+                                    epoch: identity.epoch,
+                                    module: identity.module,
+                                    retries,
+                                    generation: identity.instance,
+                                });
+                            }
+                            SwitchStep::Left { outcome } => {
+                                // A post-fence failure left the run (§10.3 step 7): the chain is
+                                // not rolled back and the old epoch is never resumed.
+                                return outcome;
+                            }
+                        }
                     }
                     None => {
                         // The handle dropped without a leave: treat as an immediate leave (the
@@ -350,44 +513,528 @@ async fn run_role(
             _ = ticker.tick() => {
                 // Re-present held frames (a gap filled by a late frame, or back-pressure that
                 // drained); age out an unrecoverable gap.
-                if let Some(stale) = retry_held(&mut attach, &mut held, own_sender) {
+                if let Some(stale) = retry_held(&mut current.attach, &mut held, own_sender) {
                     transport_fault = Some(stale);
                     break 'session;
                 }
-                if run.is_finished() {
+                if current.run.is_finished() {
                     break 'session;
                 }
             }
         }
-        if run.is_finished() {
+        if current.run.is_finished() {
             break 'session;
         }
     }
 
     // Drain any egress the guest produced before the loop ended (final publishes/metrics race
     // the terminal decision).
+    let gen_now = generation.load(Ordering::SeqCst);
     let _ = relay_egress(
-        &pump,
+        &current.pump,
         &providers,
-        &mut published_cursor,
-        &mut metrics_cursor,
+        &mut current.published_cursor,
+        &mut current.metrics_cursor,
         events,
-        generation,
+        gen_now,
     )
     .await;
 
     finish(
-        run,
-        pump,
+        current.run,
+        current.pump,
         &providers,
         leave_requested,
         transport_fault,
         drain_deadline,
         events,
-        generation,
+        gen_now,
         run_label,
     )
     .await
+}
+
+/// How one switch attempt left the session.
+enum SwitchStep {
+    /// Refused BEFORE the fence: the old module keeps running untouched.
+    Refused {
+        instance: LiveInstance,
+        reason: String,
+    },
+    /// The new instance activated (§10.3 step 6).
+    Activated {
+        instance: LiveInstance,
+        retries: u32,
+        quotas: Option<AdmittedQuotas>,
+    },
+    /// A post-fence failure left the run (§10.3 step 7): terminal, old epoch never resumed.
+    Left { outcome: TerminalOutcome },
+}
+
+/// The ABI §10.3 upgrade transaction under the session.
+///
+/// Pre-fence, everything effect-free runs first — target-artifact resolution + hash pin, the
+/// re-issued certificate's scope, the admitted-tuple cross-check, owner-law re-admission, the
+/// fail-closed grant-containment comparison — and ANY refusal leaves the old module running
+/// untouched. Only then the fence: quiesce → durable snapshot → spool capture → retire the old
+/// instance → migrate the new one from the snapshot (bounded rollback-and-retry) → validate
+/// (`da_migrate` returned `Ready`, the pump's embedder-visible marker) → activate (spooled
+/// frames drain into the new instance; the attach re-scopes to the new epoch; the new
+/// certificate announces on the plane). Past the fence there is no way back: a migrate/validate
+/// failure that exhausts its retries LEAVES the run (the chain is never rolled back and the old
+/// epoch is never resumed).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn perform_switch(
+    worker: &Worker,
+    engine: &EngineConfig,
+    providers: &RoleProviders,
+    trusted_bases: &[PeerId],
+    bootstrap_certs: &[RunKeyCertificate],
+    egress: &Arc<Notify>,
+    current: LiveInstance,
+    mut binding: SwitchBinding,
+    admitted_quotas: Option<&AdmittedQuotas>,
+    run_label: &str,
+    events: &mpsc::UnboundedSender<Event>,
+) -> SwitchStep {
+    let old_identity = current.identity.clone();
+
+    // ---- pre-fence checks: any refusal returns the UNTOUCHED running instance ----------------
+    let refused = |instance: LiveInstance, reason: String| SwitchStep::Refused { instance, reason };
+
+    // Target artifact: worker-resolved bytes or a content-addressed fetch from this session's
+    // own providers; the hash pin is checked HERE either way (the store is untrusted).
+    let module_bytes = match binding.module_bytes.take() {
+        Some(bytes) => bytes,
+        None => {
+            let hash = Hash(binding.new_module);
+            match providers.artifacts.get_content(&hash).await {
+                Ok(bytes) => bytes,
+                Err(_) => match providers.payloads.get_content(&hash).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return refused(
+                            current,
+                            format!(
+                                "target module {} is not resolvable from the bound content \
+                                 stores: {e}",
+                                hash.to_hex()
+                            ),
+                        )
+                    }
+                },
+            }
+        }
+    };
+    if *blake3::hash(&module_bytes).as_bytes() != binding.new_module {
+        return refused(
+            current,
+            "resolved target artifact does not hash to the committed module".into(),
+        );
+    }
+
+    // The post-switch identity: the node-minted NEW incarnation (a live upgrade advances the
+    // epoch and mints a new never-reused incarnation, §8.1) — strictly above the retiring one.
+    let tuple = &binding.tuple;
+    if tuple.genesis_hash != old_identity.run_id
+        || tuple.role != old_identity.role
+        || tuple.module_hash != binding.new_module
+        || tuple.grants_hash != binding.grants_hash
+    {
+        return refused(
+            current,
+            "the post-switch admitted tuple does not bind this run/role/target".into(),
+        );
+    }
+    if tuple.incarnation <= old_identity.instance {
+        return refused(
+            current,
+            format!(
+                "the post-switch incarnation {} does not supersede the running incarnation {} \
+                 (incarnations are never reused)",
+                tuple.incarnation, old_identity.instance
+            ),
+        );
+    }
+    // The re-issued certificate (the node-authored identity handshake): it must bind EXACTLY
+    // the post-switch execution identity and certify the delivered per-run key.
+    let expected_scope = CertScope {
+        run_id: Hash(old_identity.run_id),
+        epoch: binding.epoch,
+        role: old_identity.role.clone(),
+        instance: tuple.incarnation,
+        module_hash: Hash(binding.new_module),
+    };
+    if binding.own_cert.body.scope != expected_scope {
+        return refused(
+            current,
+            "the re-issued certificate binds a different execution identity than this switch"
+                .into(),
+        );
+    }
+    if binding.own_cert.body.run_key != peer_id(&SigningKey::from_bytes(&binding.signing_seed)) {
+        return refused(
+            current,
+            "the re-issued certificate does not certify the provisioned per-run key".into(),
+        );
+    }
+    if let Err(e) = binding.own_cert.verify_chain() {
+        return refused(current, format!("re-issued certificate chain: {e}"));
+    }
+
+    // Owner-law re-admission over the new module (§10.3 step 3, evaluated ahead of the fence —
+    // it is effect-free, and refusing BEFORE quiescing leaves the old module unharmed).
+    let admission_engine = EngineConfig {
+        backend: daemon_vhc_host::BackendKind::Cpu,
+        ..engine.clone()
+    };
+    let admission_worker = match Worker::new(admission_engine) {
+        Ok(w) => w,
+        Err(e) => return refused(current, format!("re-admission engine: {e}")),
+    };
+    let linked = match daemon_vhc_host::linked_worlds(&admission_worker, &module_bytes) {
+        Ok(l) => l,
+        Err(e) => return refused(current, format!("target module linked worlds: {e}")),
+    };
+    let grants =
+        daemon_vhc_proto::GrantsDoc::author(&linked, &binding.role_grants).to_canonical_bytes();
+    if blake3_hash(&grants) != Hash(binding.grants_hash) {
+        return refused(
+            current,
+            "re-derived grants do not match the committed record's grants anchor".into(),
+        );
+    }
+    let admission = match daemon_vhc_host::run::admit(
+        &admission_worker,
+        &module_bytes,
+        Some(&binding.new_module),
+        &binding.config,
+        &grants,
+        &binding.lane,
+        &binding.device,
+        &binding.owner,
+        None,
+        binding.envelope_grants.as_ref(),
+    ) {
+        Ok(a) => a,
+        Err(refusal) => return refused(current, format!("switch re-admission: {refusal}")),
+    };
+    // The remaining artifact-addressed tuple fields, rederived from what would actually run.
+    if tuple.config_hash != *blake3::hash(&binding.config).as_bytes() {
+        return refused(
+            current,
+            "the post-switch admitted tuple's config hash does not match the delivered config"
+                .into(),
+        );
+    }
+    if tuple.claim_hash != *blake3::hash(&admission.claim_bytes).as_bytes() {
+        return refused(
+            current,
+            "the post-switch admitted tuple's claim hash does not match the re-evaluated claim"
+                .into(),
+        );
+    }
+    // Grant-expanding upgrades FAIL CLOSED (§10.3 step 3): the re-admitted quotas must be
+    // tighten-or-equal against the quotas this instance runs under.
+    match (admitted_quotas, admission.quotas.as_ref()) {
+        (Some(old), Some(new)) => {
+            if let Some(why) = grant_expansion(old, new) {
+                return refused(
+                    current,
+                    format!("grant-expanding upgrade refused (fail closed): {why}"),
+                );
+            }
+        }
+        (Some(_), None) => {
+            return refused(
+                current,
+                "the re-admission produced no quotas to verify grant containment against \
+                 (fail closed)"
+                    .into(),
+            );
+        }
+        // No recorded baseline (harness/test seats that bypass the funnel): nothing to compare.
+        (None, _) => {}
+    }
+
+    // ---- the fence (§10.3 steps 1–2): from here the old instance is consumed ------------------
+    let LiveInstance {
+        run: old_run,
+        pump: old_pump,
+        attach: old_attach,
+        ..
+    } = current;
+    if old_pump
+        .quiesce(daemon_vhc_abi::QUIESCE_REASON_UPGRADE, binding.deadline_ms)
+        .is_err()
+    {
+        return SwitchStep::Left {
+            outcome: TerminalOutcome::FailedTerminal {
+                reason: "switch quiesce could not be delivered".into(),
+            },
+        };
+    }
+    let end = wait_run(old_run).await;
+    let quiesced = matches!(
+        end,
+        Ok(RunEnd::Outcome(code)) if code == daemon_vhc_abi::OUTCOME_QUIESCE_READY
+    );
+    if !quiesced {
+        // A failed quiesce past the committed epoch leaves the run (§10.3 step 1/7): the old
+        // instance is already gone and the chain is never rolled back.
+        return SwitchStep::Left {
+            outcome: TerminalOutcome::FailedTerminal {
+                reason: format!("switch drain did not quiesce: {end:?}"),
+            },
+        };
+    }
+    let Some(capture) = old_pump.snapshot_capture() else {
+        return SwitchStep::Left {
+            outcome: TerminalOutcome::FailedTerminal {
+                reason: "switch drain accepted no snapshot (the module has no durable state to \
+                         carry across the fence)"
+                    .into(),
+            },
+        };
+    };
+    let spooled = old_pump.take_spooled_frames();
+    // Retire the old instance's handles BEFORE the seam journal opens: the journal seam
+    // continues one file series, and the retired sink (inside the old pump state) must drop
+    // first — one writer per series.
+    drop(old_attach);
+    drop(old_pump);
+
+    // ---- migrate + validate with bounded rollback-and-retry (§10.3 steps 4–5, 7) --------------
+    let new_identity = RunIdentity {
+        run_id: old_identity.run_id,
+        epoch: binding.epoch,
+        role: old_identity.role.clone(),
+        instance: tuple.incarnation,
+        module: binding.new_module,
+    };
+    let mut attempt: u32 = 0;
+    let (new_run, new_pump) = loop {
+        let journal = match (binding.journal)(&new_identity) {
+            Ok(sink) => sink,
+            Err(e) => {
+                return SwitchStep::Left {
+                    outcome: TerminalOutcome::FailedTerminal {
+                        reason: format!("seam journal open: {e}"),
+                    },
+                }
+            }
+        };
+        let mut cfg = RunConfig::new(
+            new_identity.clone(),
+            binding.signing_seed,
+            binding.config.clone(),
+            grants.clone(),
+        );
+        cfg.claim_bytes = admission.claim_bytes.clone();
+        cfg.manifest_bytes = admission.manifest_bytes.clone();
+        admission.apply_quotas(&mut cfg);
+        let started = daemon_vhc_host::run::start_run_migrating(
+            worker,
+            &module_bytes,
+            cfg,
+            journal,
+            Some(MigrationInput {
+                capture: capture.clone(),
+                restore: true,
+                migrate_fuel: binding.migrate_fuel,
+            }),
+        );
+        let failure = match started {
+            Ok(run) => {
+                let pump = run.pump.clone();
+                // Validate (§10.3 step 5): the pump's embedder-visible marker — set once
+                // `da_migrate` returned `Ready` — gates activation; a refusing/trapping
+                // migrate ends the guest thread instead.
+                let deadline =
+                    std::time::Instant::now() + Duration::from_millis(binding.deadline_ms.max(1));
+                loop {
+                    if pump.migrate_validated() {
+                        break;
+                    }
+                    if run.is_finished() || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(TICK).await;
+                }
+                if pump.migrate_validated() {
+                    break (run, pump);
+                }
+                if run.is_finished() {
+                    format!("migrate step failed: {:?}", wait_run(run).await)
+                } else {
+                    // Neither validated nor torn down within the window: the engine's own
+                    // migrate budget will reap the guest; retrying against a possibly-live
+                    // writer is unsafe, so the transaction leaves now.
+                    return SwitchStep::Left {
+                        outcome: TerminalOutcome::FailedTerminal {
+                            reason: "migrate neither validated nor tore down within the switch \
+                                     deadline"
+                                .into(),
+                        },
+                    };
+                }
+            }
+            Err(e) => format!("migrating instance start: {e}"),
+        };
+        // Roll back (§10.3 step 7): the failed instance already tore down guest-side; the
+        // durable snapshot is the recovery point. Retry under the budget or leave.
+        if attempt >= SWITCH_MIGRATE_RETRIES {
+            return SwitchStep::Left {
+                outcome: TerminalOutcome::FailedTerminal {
+                    reason: format!(
+                        "switch migration exhausted its retry budget (attempt {}): {failure}",
+                        attempt + 1
+                    ),
+                },
+            };
+        }
+        attempt += 1;
+        let _ = events.send(Event::Warning {
+            class: "switch_retry".into(),
+            detail: format!("rolling back and retrying the migrate step: {failure}"),
+        });
+    };
+
+    // ---- activate (§10.3 step 6) ---------------------------------------------------------------
+    // Spooled frames drain into the new instance verbatim (they were verified above the old
+    // pump before the fence).
+    for f in spooled {
+        if new_pump
+            .deliver_frame(
+                f.channel,
+                f.seq,
+                f.sender,
+                f.payload,
+                f.original_signed_frame,
+            )
+            .is_err()
+        {
+            return SwitchStep::Left {
+                outcome: TerminalOutcome::FailedTerminal {
+                    reason: "spool drain into the activated instance failed".into(),
+                },
+            };
+        }
+    }
+    {
+        let egress = egress.clone();
+        new_pump.set_egress_hook(Arc::new(move || egress.notify_one()));
+    }
+    // The inbound attach re-scopes to the new epoch, seeded with the bootstrap trust plus the
+    // NEW certificate; peers' post-switch certificates re-arrive as distribution records.
+    let mut certs = bootstrap_certs.to_vec();
+    if !certs.contains(&binding.own_cert) {
+        certs.push(binding.own_cert.clone());
+    }
+    let attach = Attach::new(
+        new_identity.run_id,
+        new_identity.epoch,
+        CertCheck::new(trusted_bases.to_vec(), certs),
+        new_pump.clone(),
+    );
+    // Announce the re-issued certificate (§12.3 distribution) — best-effort, like the join's.
+    if let Ok(bytes) =
+        crate::distribution::DistributionRecord::Cert(binding.own_cert.clone()).to_bytes()
+    {
+        let _ = providers.control.publish(&bytes).await;
+    }
+    let _ = events.send(Event::RunPhase {
+        run_id: run_label.to_string(),
+        phase: "running".into(),
+        epoch: new_identity.epoch,
+        round: 0,
+        generation: new_identity.instance,
+    });
+    let own_sender = binding.own_cert.body.run_key;
+    SwitchStep::Activated {
+        instance: LiveInstance {
+            run: new_run,
+            pump: new_pump,
+            attach,
+            identity: new_identity,
+            own_sender,
+            published_cursor: 0,
+            metrics_cursor: 0,
+        },
+        retries: attempt,
+        quotas: admission.quotas.clone(),
+    }
+}
+
+/// Whether `new` expands any grant beyond `old` (the fail-closed rule, architecture §5.4).
+/// Returns `Some(reason)` naming the first expanded bound, or `None` if `new` is
+/// tighten-or-equal everywhere.
+///
+/// Numeric bounds follow the ABI §2.3 convention where **`0` means "unbounded by this grant"** —
+/// the loosest value. So tightening from unbounded (`0`) to any finite bound is fine; loosening
+/// a finite bound to a larger one, or to unbounded (`0`), is expansion. The granted-artifact set
+/// must be a subset of the old set.
+#[must_use]
+pub fn grant_expansion(old: &AdmittedQuotas, new: &AdmittedQuotas) -> Option<String> {
+    // `0` = unbounded (loosest). `expands(old, new)`: new is looser than old.
+    fn expands(old: u64, new: u64) -> bool {
+        match (old, new) {
+            (o, n) if o == n => false,
+            (0, _) => false, // old already unbounded — nothing is looser
+            (_, 0) => true,  // new unbounded, old finite — expansion
+            (o, n) => n > o, // both finite — larger is looser
+        }
+    }
+    let checks: [(&str, u64, u64); 11] = [
+        ("max_frame_bytes", old.max_frame_bytes, new.max_frame_bytes),
+        ("spool_frames", old.spool_frames, new.spool_frames),
+        (
+            "per_sender_quota",
+            old.per_sender_quota,
+            new.per_sender_quota,
+        ),
+        ("advisory_depth", old.advisory_depth, new.advisory_depth),
+        ("payload_depth", old.payload_depth, new.payload_depth),
+        ("gossip_depth", old.gossip_depth, new.gossip_depth),
+        (
+            "max_live_handles",
+            old.max_live_handles,
+            new.max_live_handles,
+        ),
+        ("max_live_bytes", old.max_live_bytes, new.max_live_bytes),
+        (
+            "max_readback_bytes",
+            old.max_readback_bytes,
+            new.max_readback_bytes,
+        ),
+        (
+            "max_outstanding_ops",
+            old.max_outstanding_ops,
+            new.max_outstanding_ops,
+        ),
+        (
+            "compute_queue_depth",
+            old.compute_queue_depth,
+            new.compute_queue_depth,
+        ),
+    ];
+    for (name, o, n) in checks {
+        if expands(o, n) {
+            return Some(format!(
+                "grant `{name}` expands from {o} to {n} (0 = unbounded)"
+            ));
+        }
+    }
+    // Artifacts: the new allow-list must be a subset of the old (no newly-reachable artifact).
+    for h in &new.granted_artifacts {
+        if !old.granted_artifacts.contains(h) {
+            return Some(format!(
+                "granted artifact {} is not in the previously-admitted set",
+                h.to_hex()
+            ));
+        }
+    }
+    None
 }
 
 /// Verify + deliver one inbound wire frame. Own-voice echoes (a plane that self-delivers) are

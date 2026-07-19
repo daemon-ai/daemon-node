@@ -201,76 +201,10 @@ pub trait UpgradeSteps {
     fn leave(&mut self, reason: &LeaveReason);
 }
 
-/// Whether `new` expands any grant beyond `old` (the fail-closed rule, architecture §5.4). Returns
-/// `Some(reason)` naming the first expanded bound, or `None` if `new` is tighten-or-equal
-/// everywhere.
-///
-/// Numeric bounds follow the ABI §2.3 convention where **`0` means "unbounded by this grant"** —
-/// the loosest value. So tightening from unbounded (`0`) to any finite bound is fine; loosening a
-/// finite bound to a larger one, or to unbounded (`0`), is expansion. The granted-artifact set must
-/// be a subset of the old set.
-#[must_use]
-pub fn grant_expansion(old: &AdmittedQuotas, new: &AdmittedQuotas) -> Option<String> {
-    // `0` = unbounded (loosest). `expands(old, new)`: new is looser than old.
-    fn expands(old: u64, new: u64) -> bool {
-        match (old, new) {
-            (o, n) if o == n => false,
-            (0, _) => false, // old already unbounded — nothing is looser
-            (_, 0) => true,  // new unbounded, old finite — expansion
-            (o, n) => n > o, // both finite — larger is looser
-        }
-    }
-    let checks: [(&str, u64, u64); 11] = [
-        ("max_frame_bytes", old.max_frame_bytes, new.max_frame_bytes),
-        ("spool_frames", old.spool_frames, new.spool_frames),
-        (
-            "per_sender_quota",
-            old.per_sender_quota,
-            new.per_sender_quota,
-        ),
-        ("advisory_depth", old.advisory_depth, new.advisory_depth),
-        ("payload_depth", old.payload_depth, new.payload_depth),
-        ("gossip_depth", old.gossip_depth, new.gossip_depth),
-        (
-            "max_live_handles",
-            old.max_live_handles,
-            new.max_live_handles,
-        ),
-        ("max_live_bytes", old.max_live_bytes, new.max_live_bytes),
-        (
-            "max_readback_bytes",
-            old.max_readback_bytes,
-            new.max_readback_bytes,
-        ),
-        (
-            "max_outstanding_ops",
-            old.max_outstanding_ops,
-            new.max_outstanding_ops,
-        ),
-        (
-            "compute_queue_depth",
-            old.compute_queue_depth,
-            new.compute_queue_depth,
-        ),
-    ];
-    for (name, o, n) in checks {
-        if expands(o, n) {
-            return Some(format!(
-                "grant `{name}` expands from {o} to {n} (0 = unbounded)"
-            ));
-        }
-    }
-    // Artifacts: the new allow-list must be a subset of the old (no newly-reachable artifact).
-    for h in &new.granted_artifacts {
-        if !old.granted_artifacts.contains(h) {
-            return Some(format!(
-                "granted artifact {} is not in the previously-admitted set",
-                h.to_hex()
-            ));
-        }
-    }
-    None
-}
+/// The fail-closed grant-containment comparison — shared with the production role session's
+/// switch path, which owns the implementation (the rule is admission mechanism, not harness
+/// machinery).
+pub use crate::role_session::grant_expansion;
 
 /// Run the **local** upgrade transaction against an already-committed target epoch (ABI §10.3).
 ///

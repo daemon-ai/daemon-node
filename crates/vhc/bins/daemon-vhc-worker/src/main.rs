@@ -155,6 +155,7 @@ async fn join_live(
         journal,
         drain_deadline: DRAIN_DEADLINE,
         restore,
+        admitted_quotas: binding.quotas,
     })
 }
 
@@ -490,6 +491,7 @@ async fn main() {
                                 journal,
                                 drain_deadline: DRAIN_DEADLINE,
                                 restore: None,
+                                admitted_quotas: binding.quotas,
                             };
                             let handle = spawn_role(run_id.clone(), spec, role_events.clone());
                             roles.insert(run_id, handle);
@@ -555,27 +557,105 @@ async fn main() {
                     handle.leave(mode);
                 }
             }
-            Command::SwitchModule { run_id, .. } => {
-                // The LOCAL upgrade transaction (ABI §10.3) runs against a LIVE, held role-instance
-                // — quiesce → snapshot → owner-law re-admission → migrate → validate → activate,
-                // via `daemon_vhc_session::upgrade::{run_local_upgrade, LiveUpgradeSteps}`. The
-                // in-process self-driven t2 join above owns its sandbox to completion (it holds no
-                // instance across commands), so — exactly like `Throttle`/`Leave` — there is no
-                // live instance to switch here. A running instance is driven through the node
-                // command surface (`WorkerControl::switch_module`), where the transaction has the
-                // live pump/admission/migrate path in hand; the long-lived in-process join that
-                // would hold an instance across `SwitchModule` arrives with the coordinator
-                // re-seat of the worker session.
-                send(
-                    &writer,
-                    &worker_error(&format!(
-                        "SwitchModule for run `{run_id}`: no live role-instance is held in this \
-                         worker (the self-driven join runs to completion); the live upgrade \
-                         transaction is driven at the node command surface \
-                         (WorkerControl::switch_module) over the held instance"
-                    )),
-                )
-                .await;
+            Command::SwitchModule {
+                run_id,
+                epoch,
+                role,
+                new_module,
+                grants_hash,
+                deadline_ms,
+                admitted_tuple,
+            } => {
+                // The LOCAL upgrade transaction (ABI §10.3) against the held role-instance. The
+                // worker's half is pre-flight only — resolve the node-provisioned post-switch
+                // identity, the target bytes (where a worker-side source exists), and the
+                // admission inputs — every refusal typed with the running instance untouched;
+                // the SESSION runs the fence (quiesce → snapshot → migrate → validate →
+                // activate) and answers ModuleSwitched / SwitchRefused / a terminal
+                // RunTerminated on the event stream.
+                let Some(handle) = roles.get(&run_id) else {
+                    // §10.3: a worker without a long-lived instance answers typed
+                    // command-unsupported and attempts no migration.
+                    send(
+                        &writer,
+                        &Event::SwitchRefused {
+                            run_id: run_id.clone(),
+                            generation: 0,
+                            reason: "no live role-instance is held for this run".into(),
+                        },
+                    )
+                    .await;
+                    continue;
+                };
+                if handle.is_finished() {
+                    send(
+                        &writer,
+                        &Event::SwitchRefused {
+                            run_id: run_id.clone(),
+                            generation: handle.generation(),
+                            reason: "the role instance already reached its terminal state".into(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                let refusal = |reason: String| Event::SwitchRefused {
+                    run_id: run_id.clone(),
+                    generation: handle.generation(),
+                    reason,
+                };
+                let Some(resolved) = run.as_ref() else {
+                    send(
+                        &writer,
+                        &refusal("no resolved run is cached (assess first)".into()),
+                    )
+                    .await;
+                    continue;
+                };
+                let Some(genesis) = resolved.genesis.as_ref() else {
+                    send(
+                        &writer,
+                        &refusal("the cached run carries no genesis".into()),
+                    )
+                    .await;
+                    continue;
+                };
+                if role != genesis.worker_role {
+                    send(
+                        &writer,
+                        &refusal(format!(
+                            "the switch targets role `{role}` but this instance holds `{}`",
+                            genesis.worker_role
+                        )),
+                    )
+                    .await;
+                    continue;
+                }
+                let Some(tuple) = admitted_tuple else {
+                    send(
+                        &writer,
+                        &refusal(
+                            "no post-switch admitted tuple (the node assesses the target and \
+                             delivers the tuple with the switch)"
+                                .into(),
+                        ),
+                    )
+                    .await;
+                    continue;
+                };
+                match backend::switch_binding(
+                    genesis,
+                    &run_id,
+                    epoch,
+                    new_module,
+                    grants_hash,
+                    deadline_ms,
+                    tuple,
+                    handle.generation(),
+                ) {
+                    Ok(binding) => handle.switch(binding),
+                    Err(reason) => send(&writer, &refusal(reason)).await,
+                }
             }
             Command::Ping => send(&writer, &Event::Pong).await,
             Command::Shutdown => {

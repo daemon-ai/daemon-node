@@ -145,6 +145,7 @@ pub trait WorkerControl: Send + Sync {
     /// the worker (quiesce → snapshot → owner-law re-admission → migrate → validate → activate).
     /// Default: unsupported (fakes / non-upgrading workers); `TrainSupervisor` overrides it with
     /// the real command path.
+    #[allow(clippy::too_many_arguments)]
     async fn switch_module(
         &self,
         run_id: String,
@@ -240,6 +241,7 @@ impl WorkerControl for TrainSupervisor {
             .await
             .map_err(VhcError::worker)
     }
+    #[allow(clippy::too_many_arguments)]
     async fn switch_module(
         &self,
         run_id: String,
