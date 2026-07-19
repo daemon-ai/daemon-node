@@ -36,6 +36,11 @@ rusqlite_migration = { workspace = true }
 # The arbiter's ledger keys carry the 32-byte run identity; a v1-era run (no genesis hash yet)
 # uses blake3(RunLabel) as its node-local stand-in (decisions D6 wiring).
 blake3 = { workspace = true }
+# Credential authorship (D-P8): the node mints the per-run key, issues its RunKeyCertificate
+# under the base identity, and re-encodes the admitted tuple — proto is the mechanism home for
+# CertScope / RunKeyCertificate / SigningKey (a contracts crate; the node→proto edge is
+# direction-safe, dep-check-clean).
+daemon-vhc-proto = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

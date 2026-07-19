@@ -70,7 +70,11 @@ impl WorkerControl for FakeWorker {
         self.calls().probes += 1;
         Ok(self.hardware.clone())
     }
-    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, VhcError> {
+    async fn assess(
+        &self,
+        envelope: Vec<u8>,
+        _role: Option<String>,
+    ) -> Result<Eligibility, VhcError> {
         self.calls().assessed_envelopes.push(envelope);
         // A distinctive verdict so a test can tell the §6.5 assess path from the probe fallback.
         Ok(Eligibility {
@@ -87,6 +91,7 @@ impl WorkerControl for FakeWorker {
         _coordinator: String,
         _credentials: Vec<u8>,
         _policy: JoinPolicy,
+        _admitted_tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
     ) -> Result<(), VhcError> {
         self.calls().joins.push(run_id);
         Ok(())
@@ -133,6 +138,7 @@ fn service(config: VhcConfig, worker: Arc<FakeWorker>, feed: Option<NodeFeed>) -
         discovery: None,
         budget: None,
         worker_factory: None,
+        identity_dir: None,
     })
 }
 
@@ -174,6 +180,7 @@ async fn join_persists_and_reload_reconverges() {
             discovery: None,
             budget: None,
             worker_factory: None,
+            identity_dir: None,
         });
         svc.vhc_join("run-a".into(), policy(), "op-a".into())
             .await
@@ -200,6 +207,7 @@ async fn join_persists_and_reload_reconverges() {
             discovery: None,
             budget: None,
             worker_factory: None,
+            identity_dir: None,
         });
         let rejoined = svc.start().await.unwrap();
         assert_eq!(rejoined, 1, "only the active intent re-converges");
@@ -468,6 +476,7 @@ async fn join_discovers_fetches_envelope_and_assesses() {
         discovery: Some(discovery),
         budget: None,
         worker_factory: None,
+        identity_dir: None,
     });
 
     svc.vhc_join("run-disc".into(), policy(), "op".into())
@@ -525,6 +534,7 @@ async fn join_refuses_a_coordinator_outside_the_allowlist() {
         discovery: Some(discovery),
         budget: None,
         worker_factory: None,
+        identity_dir: None,
     });
 
     let err = svc
@@ -561,4 +571,75 @@ async fn collect(sub: &mut daemon_api::VhcEventStream, n: usize) -> Vec<VhcEvent
         }
     }
     out
+}
+
+/// The late-join checkpoint seam (spec §9; lane R): a run discovery that records published
+/// pointers and hands back the latest one — the round-trip the node's publish hook + join-time
+/// restore resolution drive. The default trait methods are overridden here exactly as the
+/// production `EgressRunDiscovery` overrides them over the registry.
+#[derive(Default)]
+struct CheckpointDiscovery {
+    published: Mutex<Vec<(String, u64, String)>>,
+    latest: Mutex<Option<daemon_vhc_node::CheckpointPointer>>,
+}
+
+#[async_trait]
+impl RunDiscovery for CheckpointDiscovery {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, VhcError> {
+        Ok(Vec::new())
+    }
+    async fn get_run(&self, _run_id: &str) -> Result<Option<DiscoveredRun>, VhcError> {
+        Ok(None)
+    }
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+        Ok(Vec::new())
+    }
+    async fn publish_checkpoint(
+        &self,
+        run_id: &str,
+        round: u64,
+        hash: &str,
+        _size: u64,
+    ) -> Result<(), VhcError> {
+        self.published
+            .lock()
+            .unwrap()
+            .push((run_id.to_string(), round, hash.to_string()));
+        // A publish becomes the latest pointer a subsequent joiner restores from.
+        *self.latest.lock().unwrap() = Some(daemon_vhc_node::CheckpointPointer {
+            round,
+            hash: hash.to_string(),
+            size: 0,
+        });
+        Ok(())
+    }
+    async fn fetch_checkpoint(
+        &self,
+        _run_id: &str,
+    ) -> Result<Option<daemon_vhc_node::CheckpointPointer>, VhcError> {
+        Ok(self.latest.lock().unwrap().clone())
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_pointer_publishes_and_is_fetched_for_restore() {
+    let d = CheckpointDiscovery::default();
+    let hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+
+    // A published checkpoint is recorded (the node's CheckpointPublished hook target)...
+    RunDiscovery::publish_checkpoint(&d, "run-ckpt", 7, hash, 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        &*d.published.lock().unwrap(),
+        &[("run-ckpt".to_string(), 7, hash.to_string())]
+    );
+
+    // ...and a later joiner reads it back as the restore pointer (the join-time resolve target).
+    let pointer = RunDiscovery::fetch_checkpoint(&d, "run-ckpt")
+        .await
+        .unwrap()
+        .expect("a pointer is published");
+    assert_eq!(pointer.round, 7);
+    assert_eq!(pointer.hash, hash);
 }

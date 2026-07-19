@@ -521,7 +521,7 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
     let sup = supervisor_for(&module);
 
     let elig = sup
-        .assess(genesis_wire("abi-major-1", guest_config()))
+        .assess(genesis_wire("abi-major-1", guest_config()), None)
         .await
         .expect("assess is an outcome, not a transport error");
     assert!(!elig.eligible, "a major-1 module is refused post-sunset");
@@ -550,7 +550,7 @@ async fn module_assesses_eligible_over_the_signed_envelope() {
     let sup = supervisor_for(&module);
 
     let elig = sup
-        .assess(genesis_wire("worker-seam", guest_config()))
+        .assess(genesis_wire("worker-seam", guest_config()), None)
         .await
         .expect("assess over the signed genesis");
     assert!(
@@ -571,7 +571,7 @@ async fn v1_envelope_assess_is_refused_envelope_schema_retired() {
     let sup = supervisor_for(&module);
 
     let err = sup
-        .assess(signed_envelope_wire("retired-v1-form"))
+        .assess(signed_envelope_wire("retired-v1-form"), None)
         .await
         .expect_err("a schema-1 envelope must refuse at assess");
     assert!(
@@ -593,7 +593,7 @@ async fn unsigned_raw_config_assess_is_refused_with_typed_slug() {
 
     let raw = to_canonical_vec(&guest_config()).expect("raw config cbor");
     let err = sup
-        .assess(raw)
+        .assess(raw, None)
         .await
         .expect_err("raw-config assess must refuse (retired at D0)");
     assert!(
@@ -611,12 +611,12 @@ async fn throttle_is_harmless_and_never_respawns() {
     let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
-    sup.assess(genesis_wire("run-9", guest_config()))
+    sup.assess(genesis_wire("run-9", guest_config()), None)
         .await
         .expect("assess");
     sup.throttle(None, None, true).await.expect("pause");
     sup.throttle(None, None, false).await.expect("resume");
-    sup.assess(genesis_wire("run-9", guest_config()))
+    sup.assess(genesis_wire("run-9", guest_config()), None)
         .await
         .expect("assess after the lever");
     assert_eq!(

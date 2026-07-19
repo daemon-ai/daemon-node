@@ -17,6 +17,18 @@ use daemon_vhc_net::{RegistryClient, RunId};
 
 use crate::service::VhcError;
 
+/// A published-checkpoint pointer resolved from the registry (spec §9; lane R): the round a
+/// checkpoint covers and its content address, the late-join restore input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointPointer {
+    /// The round the checkpoint captures.
+    pub round: u64,
+    /// blake3 of the checkpoint document (hex).
+    pub hash: String,
+    /// The checkpoint byte length (advisory).
+    pub size: u64,
+}
+
 /// A discovered run: the coordination facts the node needs to assess + join (never experiment
 /// config or module bytes — the seam rule).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +54,28 @@ pub trait RunDiscovery: Send + Sync {
     /// Fetch the run's frozen envelope bytes (presigned GET + blake3-verify). Errors if the run is
     /// unknown or the bytes do not match the descriptor's hash.
     async fn fetch_envelope(&self, run_id: &str) -> Result<Vec<u8>, VhcError>;
+
+    /// Publish this run's latest checkpoint pointer to the registry (spec §9; lane R). The
+    /// checkpoint DOCUMENT already lives on the payload plane (the session put it there); this
+    /// records the round → content-address pointer a late joiner reads. Best-effort: the default
+    /// is a no-op so fakes/offline nodes need not implement it.
+    async fn publish_checkpoint(
+        &self,
+        run_id: &str,
+        round: u64,
+        hash: &str,
+        size: u64,
+    ) -> Result<(), VhcError> {
+        let _ = (run_id, round, hash, size);
+        Ok(())
+    }
+
+    /// Read this run's latest published-checkpoint pointer (spec §9; the late-join restore input);
+    /// `None` when none is published yet (a fresh start). Default `None` (no registry state).
+    async fn fetch_checkpoint(&self, run_id: &str) -> Result<Option<CheckpointPointer>, VhcError> {
+        let _ = run_id;
+        Ok(None)
+    }
 }
 
 /// The production [`RunDiscovery`]: a [`RegistryClient`] against a vhc coordinator base.
@@ -106,5 +140,31 @@ impl RunDiscovery for EgressRunDiscovery {
             .fetch_envelope(&RunId::new(run_id), &descriptor)
             .await
             .map_err(|e| VhcError::Discovery(e.to_string()))
+    }
+
+    async fn publish_checkpoint(
+        &self,
+        run_id: &str,
+        round: u64,
+        hash: &str,
+        size: u64,
+    ) -> Result<(), VhcError> {
+        self.registry
+            .publish_checkpoint(run_id, round, hash, size)
+            .await
+            .map_err(|e| VhcError::Discovery(e.to_string()))
+    }
+
+    async fn fetch_checkpoint(&self, run_id: &str) -> Result<Option<CheckpointPointer>, VhcError> {
+        let state = self
+            .registry
+            .fetch_state(run_id)
+            .await
+            .map_err(|e| VhcError::Discovery(e.to_string()))?;
+        Ok(state.and_then(|s| s.checkpoint).map(|c| CheckpointPointer {
+            round: c.round,
+            hash: c.hash,
+            size: c.size,
+        }))
     }
 }

@@ -5145,6 +5145,7 @@ dependencies = [
  "daemon-vhc-host",
  "daemon-vhc-journal",
  "daemon-vhc-net",
+ "daemon-vhc-node",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",

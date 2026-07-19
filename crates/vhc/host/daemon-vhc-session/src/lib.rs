@@ -26,6 +26,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod assess;
 pub mod attach;
 pub mod backend;
@@ -38,6 +39,7 @@ pub mod keystore;
 pub mod protocol;
 #[cfg(feature = "live")]
 pub mod providers;
+pub mod provisioning;
 pub mod role_session;
 pub mod seam;
 

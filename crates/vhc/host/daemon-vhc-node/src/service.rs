@@ -97,7 +97,13 @@ pub trait WorkerControl: Send + Sync {
     /// Probe hardware + capability vocabulary (§10.2).
     async fn probe(&self) -> Result<Hardware, VhcError>;
     /// Assess a run envelope against effective resources (§6.5) — the eligibility source.
-    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, VhcError>;
+    /// `role` names the envelope role to assess for (node-directed selection — the seat-claim
+    /// path directs the coordinator role); `None` = the single-trainer default.
+    async fn assess(
+        &self,
+        envelope: Vec<u8>,
+        role: Option<String>,
+    ) -> Result<Eligibility, VhcError>;
     /// Join a run.
     async fn join(
         &self,
@@ -105,19 +111,22 @@ pub trait WorkerControl: Send + Sync {
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
+        admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<(), VhcError>;
     /// Join a run and return the **continuous** worker event stream (A3 event pump). The default
     /// delegates to [`join`](Self::join) and returns an already-closed receiver, so test fakes and
     /// non-streaming workers keep the pre-A3 behavior; `TrainSupervisor` overrides it with the real
-    /// per-round stream.
+    /// per-round stream. `admitted_tuple` carries the node-minted incarnation the worker runs as.
     async fn join_streaming(
         &self,
         run_id: String,
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
+        admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, VhcError> {
-        self.join(run_id, coordinator, credentials, policy).await?;
+        self.join(run_id, coordinator, credentials, policy, admitted_tuple)
+            .await?;
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(rx)
     }
@@ -160,8 +169,12 @@ impl WorkerControl for TrainSupervisor {
     async fn probe(&self) -> Result<Hardware, VhcError> {
         TrainSupervisor::probe(self).await.map_err(VhcError::worker)
     }
-    async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, VhcError> {
-        TrainSupervisor::assess(self, envelope)
+    async fn assess(
+        &self,
+        envelope: Vec<u8>,
+        role: Option<String>,
+    ) -> Result<Eligibility, VhcError> {
+        TrainSupervisor::assess(self, envelope, role)
             .await
             .map_err(VhcError::worker)
     }
@@ -171,10 +184,18 @@ impl WorkerControl for TrainSupervisor {
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
+        admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<(), VhcError> {
-        TrainSupervisor::join(self, run_id, coordinator, credentials, policy)
-            .await
-            .map_err(VhcError::worker)
+        TrainSupervisor::join(
+            self,
+            run_id,
+            coordinator,
+            credentials,
+            policy,
+            admitted_tuple,
+        )
+        .await
+        .map_err(VhcError::worker)
     }
     async fn join_streaming(
         &self,
@@ -182,10 +203,18 @@ impl WorkerControl for TrainSupervisor {
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
+        admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, VhcError> {
-        TrainSupervisor::join_streaming(self, run_id, coordinator, credentials, policy)
-            .await
-            .map_err(VhcError::worker)
+        TrainSupervisor::join_streaming(
+            self,
+            run_id,
+            coordinator,
+            credentials,
+            policy,
+            admitted_tuple,
+        )
+        .await
+        .map_err(VhcError::worker)
     }
     async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), VhcError> {
         TrainSupervisor::leave(self, run_id, mode)
@@ -250,7 +279,18 @@ pub struct VhcServiceParts {
     /// The per-role-instance worker factory (Phase E N-sandbox supervision). `None` = every run
     /// shares the single default worker (the pre-E single-child behavior).
     pub worker_factory: Option<WorkerFactory>,
+    /// The vhc identity keystore directory (the node's base identity + per-run key/cert/credential
+    /// records). `Some` ⇒ the node AUTHORS per-run identity + credentials at join (D-P8: it mints
+    /// the key, issues the certificate under the base identity, and delivers the minted incarnation
+    /// in the admitted tuple). `None` (tests / headless) keeps the pre-authorship path (no
+    /// credentials, no node-minted identity) — the worker's mandatory-tuple check then refuses a
+    /// live join, which is exactly right off the production boot path.
+    pub identity_dir: Option<std::path::PathBuf>,
 }
+
+/// The authored-join delivery: the tuple (incarnation stamped), the wire credentials bytes, and
+/// the `credentials_ref` to persist.
+type AuthoredDelivery = (Option<protocol::AdmittedTuple>, Vec<u8>, Option<String>);
 
 /// One live supervised role-instance: its ledger identity and its worker child.
 struct InstanceEntry {
@@ -270,6 +310,9 @@ pub struct VhcService {
     /// Per-role-instance children (Phase E N-sandbox supervision), keyed by `RunLabel`.
     instances: Mutex<BTreeMap<String, InstanceEntry>>,
     worker_factory: Option<WorkerFactory>,
+    /// The identity keystore directory (D-P8 credential + per-run cert authorship); `None`
+    /// disables node-side authorship (tests / headless).
+    identity_dir: Option<std::path::PathBuf>,
     events_tx: broadcast::Sender<VhcEvent>,
     feed: Option<NodeFeed>,
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
@@ -296,6 +339,7 @@ impl VhcService {
             arbiter: OwnerArbiter::new(parts.budget.unwrap_or_else(OwnerBudget::unbounded)),
             instances: Mutex::new(BTreeMap::new()),
             worker_factory: parts.worker_factory,
+            identity_dir: parts.identity_dir,
             events_tx,
             feed: parts.feed,
             current_run: Mutex::new(None),
@@ -327,10 +371,11 @@ impl VhcService {
         coordinator: String,
         credentials: Vec<u8>,
         policy: JoinPolicy,
+        admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<(), VhcError> {
         let rx = self
             .worker
-            .join_streaming(run_id, coordinator, credentials, policy)
+            .join_streaming(run_id, coordinator, credentials, policy, admitted_tuple)
             .await?;
         self.spawn_pump(rx);
         Ok(())
@@ -424,14 +469,46 @@ impl VhcService {
                 self.store
                     .set_execution_identity(&run.run_id, id.epoch, &id.role, id.instance)?;
             }
+            // Re-author identity + credentials for the retained incarnation (D-P8): the node
+            // re-resolves + REFRESHES the per-run cert + credentials on every reconvergence (the
+            // keystore recovers the same key within the incarnation; the certificate + credential
+            // record are re-issued). The persisted admitted tuple carries the incarnation to run.
+            let persisted_tuple = run
+                .admitted_tuple
+                .as_deref()
+                .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
+            let restore = self.resolve_restore(&run.run_id).await;
+            let (delivery_tuple, credentials, credentials_ref) = match self.author_join(
+                &run.run_id,
+                &run.coordinator,
+                &id,
+                persisted_tuple,
+                restore,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.arbiter.release(&id);
+                    return Err(e);
+                }
+            };
+            // The credentials-record reference is deterministic per `(role, incarnation)`, so a
+            // refresh reuses the persisted ref; only the tuple bytes (incarnation stamped) are
+            // re-persisted here.
+            let _ = &credentials_ref;
+            if let Some(tuple) = &delivery_tuple {
+                if let Ok(bytes) = protocol::encode(tuple) {
+                    let _ = self.store.set_admitted_tuple(&run.run_id, &bytes);
+                }
+            }
             // A3: re-issue via the streaming path + pump so a re-converged run resumes reporting
             // live round progression into vhc.db (durable-intent re-convergence, §10.3).
             let rx = match worker
                 .join_streaming(
                     run.run_id.clone(),
                     run.coordinator.clone(),
-                    Vec::new(),
+                    credentials,
                     to_join_policy(&run.policy),
+                    delivery_tuple,
                 )
                 .await
             {
@@ -544,6 +621,42 @@ impl VhcService {
     /// the node"). Returns the [`VhcEvent`]s emitted (0..2 per worker event). B3 wires the live
     /// worker event stream into this; unit tests drive it directly.
     pub fn handle_worker_event(&self, ev: &protocol::Event) -> Result<Vec<VhcEvent>, VhcError> {
+        // [CI-7] terminal cleanup: when a run instance reaches a terminal state that ends the run
+        // identity (Completed / Left / FailedTerminal), delete its per-run key material,
+        // certificates, and credentials record — no run identity outlives the run it was minted
+        // for. FailedRetryable is NOT terminal for the identity (the reconvergence/rejoin path
+        // reuses or supersedes it under the retry budget), so its material survives.
+        // Instance-map removal + arbiter release beyond this are run-lifecycle management
+        // concerns; this hook is scoped to secret custody. Idempotent (remove_run tolerates
+        // absence).
+        if let protocol::Event::RunTerminated {
+            run_id, outcome, ..
+        } = ev
+        {
+            let terminal = matches!(
+                outcome,
+                protocol::TerminalOutcome::Completed { .. }
+                    | protocol::TerminalOutcome::Left { .. }
+                    | protocol::TerminalOutcome::FailedTerminal { .. }
+            );
+            if terminal {
+                if let Some(dir) = &self.identity_dir {
+                    if let Ok(keystore) = daemon_vhc_session::keystore::VhcKeystore::open(dir) {
+                        if let Err(e) = keystore.remove_run(run_id) {
+                            let mut emitted = Vec::new();
+                            let _ = self.emit(
+                                VhcEvent::Warning {
+                                    run_id: run_id.clone(),
+                                    class: "identity_cleanup".to_string(),
+                                    detail: format!("per-run key/credential cleanup failed: {e}"),
+                                },
+                                &mut emitted,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // Track the current run + persist phase from a RunPhase.
         if let protocol::Event::RunPhase {
             run_id,
@@ -577,6 +690,20 @@ impl VhcService {
                 self.store.bump_contribution(&run_id, 0, 0, 0, 0, 0, 1)?
             }
             _ => {}
+        }
+
+        // Checkpoint-pointer publication (spec §9; lane R): the checkpoint DOCUMENT is already on
+        // the payload plane (the session put it there); record the round → content-address
+        // pointer at the registry so a late joiner can restore. Best-effort + detached (a pointer
+        // is advisory; the joiner hash-verifies regardless, so an unknown size is 0).
+        if let protocol::Event::CheckpointPublished { round, hash, .. } = ev {
+            if let Some(discovery) = &self.discovery {
+                let discovery = discovery.clone();
+                let (run, round, hash) = (run_id.clone(), *round, hash.clone());
+                tokio::spawn(async move {
+                    let _ = discovery.publish_checkpoint(&run, round, &hash, 0).await;
+                });
+            }
         }
 
         let mut emitted = Vec::new();
@@ -657,7 +784,8 @@ impl VhcService {
         &self,
         worker: &Arc<dyn WorkerControl>,
         run_id: &str,
-    ) -> Result<(String, VhcEligibility, Option<Vec<u8>>), VhcError> {
+        role: Option<String>,
+    ) -> Result<(String, VhcEligibility, Option<protocol::AdmittedTuple>), VhcError> {
         if let Some(discovery) = &self.discovery {
             let run = discovery
                 .get_run(run_id)
@@ -670,9 +798,9 @@ impl VhcService {
                 return Err(VhcError::AllowlistRefused(run.coordinator.clone()));
             }
             let envelope = discovery.fetch_envelope(run_id).await?;
-            let verdict = worker.assess(envelope).await?;
+            let verdict = worker.assess(envelope, role).await?;
             // Stamp the node-owned revisions into the immutable admitted tuple (architecture
-            // §6.3) and carry its canonical-CBOR bytes for durable persistence beside the intent.
+            // §6.3); the incarnation stays 0 (unassigned) until the node mints it at join.
             let tuple = self.stamp_admitted_tuple(verdict.admitted_tuple.clone())?;
             Ok((run.coordinator, eligibility_from_assess(&verdict), tuple))
         } else {
@@ -690,21 +818,89 @@ impl VhcService {
     }
 
     /// Stamp the node-owned device-profile / owner-policy revisions into an assessed admitted
-    /// tuple and return its canonical-CBOR bytes for durable persistence (architecture §6.3).
-    /// `None` in ⇒ `None` out (an ineligible assessment admitted nothing).
+    /// tuple (architecture §6.3). `None` in ⇒ `None` out (an ineligible assessment admitted
+    /// nothing). The incarnation field stays as assessed (0 = unassigned); the join mints it.
     fn stamp_admitted_tuple(
         &self,
         tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
-    ) -> Result<Option<Vec<u8>>, VhcError> {
+    ) -> Result<Option<protocol::AdmittedTuple>, VhcError> {
         let Some(mut tuple) = tuple else {
             return Ok(None);
         };
         tuple.device_profile_rev = self.store.counter("device_profile_rev")?;
         tuple.owner_policy_rev = self.store.counter("owner_policy_rev")?;
-        Ok(Some(protocol::encode(&tuple).map_err(|e| {
-            VhcError::Internal(format!("admitted tuple encode: {e}"))
-        })?))
+        Ok(Some(tuple))
     }
+
+    /// Finalize the admitted tuple for delivery: stamp the node-minted incarnation, and — when the
+    /// node authors identity ([`VhcServiceParts::identity_dir`]) — mint the per-run key, issue its
+    /// certificate under the base identity, and author the plane-selection credentials. Returns
+    /// the delivery tuple, the wire credentials bytes, and the `credentials_ref` to persist.
+    fn author_join(
+        &self,
+        run_label: &str,
+        coordinator: &str,
+        id: &RoleInstanceId,
+        tuple: Option<protocol::AdmittedTuple>,
+        restore: Option<protocol::CheckpointRestore>,
+    ) -> Result<AuthoredDelivery, VhcError> {
+        let tuple = tuple.map(|mut t| {
+            t.incarnation = id.instance;
+            t
+        });
+        let Some(dir) = &self.identity_dir else {
+            // No node-side authorship (tests / headless): no credentials, tuple as stamped.
+            return Ok((tuple, Vec::new(), None));
+        };
+        // Authorship needs the assessed tuple (its genesis + module hashes scope the certificate).
+        let Some(tuple) = tuple else {
+            return Ok((None, Vec::new(), None));
+        };
+        let keystore = daemon_vhc_session::keystore::VhcKeystore::open(dir)
+            .map_err(|e| VhcError::Internal(format!("open identity keystore: {e}")))?;
+        let authored = crate::credentials::author_join(
+            &keystore,
+            &crate::credentials::RunInstanceIdentity {
+                run_label,
+                genesis_hash: tuple.genesis_hash,
+                epoch: id.epoch,
+                role: &id.role,
+                incarnation: id.instance,
+                module_hash: tuple.module_hash,
+            },
+            coordinator,
+            &self.config.registry,
+            restore,
+        )?;
+        Ok((Some(tuple), authored.wire, authored.credentials_ref))
+    }
+
+    /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's latest
+    /// checkpoint pointer, decoded to the wire restore form (`None` = fresh start / no discovery
+    /// / no checkpoint published). A malformed pointer hash is dropped (fresh start), never a
+    /// hard join failure.
+    async fn resolve_restore(&self, run_id: &str) -> Option<protocol::CheckpointRestore> {
+        let discovery = self.discovery.as_ref()?;
+        let pointer = discovery.fetch_checkpoint(run_id).await.ok()??;
+        let hash = hex32(&pointer.hash)?;
+        Some(protocol::CheckpointRestore {
+            round: pointer.round,
+            hash,
+        })
+    }
+}
+
+/// Decode a 64-char lowercase-hex blake3 into a 32-byte array (`None` on any malformation).
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 #[async_trait]
@@ -766,8 +962,8 @@ impl VhcApi for VhcService {
         // and take the coordinator endpoint from discovery. With no discovery configured, fall back
         // to the probe-based eligibility against the allowlisted coordinator (offline / no-registry
         // path). Either way the persisted eligibility is node-computed — the app never re-derives it.
-        let (coordinator, eligibility, admitted_tuple) = self
-            .resolve_join(&worker, &run_id)
+        let (coordinator, eligibility, assessed_tuple) = self
+            .resolve_join(&worker, &run_id, None)
             .await
             .map_err(|e| e.to_api())?;
 
@@ -823,10 +1019,32 @@ impl VhcApi for VhcService {
             }
         };
 
-        if let Err(e) =
-            self.store
-                .put_join_intent(&run_id, &coordinator, &policy, None, &eligibility)
-        {
+        // Author identity + credentials for THIS incarnation (D-P8): mint the per-run key + its
+        // certificate under the base identity, stamp the minted incarnation into the tuple, and
+        // author the secrets-free plane-selection credentials (the token, if any, lands only in
+        // the keystore record `credentials_ref` points at — never on the wire).
+        let restore = self.resolve_restore(&run_id).await;
+        let (delivery_tuple, credentials, credentials_ref) =
+            match self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore) {
+                Ok(v) => v,
+                Err(e) => {
+                    if existing.is_none() {
+                        self.arbiter.release(&id);
+                        if fresh_child {
+                            worker.shutdown().await;
+                        }
+                    }
+                    return Err(e.to_api());
+                }
+            };
+
+        if let Err(e) = self.store.put_join_intent(
+            &run_id,
+            &coordinator,
+            &policy,
+            credentials_ref.as_deref(),
+            &eligibility,
+        ) {
             if existing.is_none() {
                 self.arbiter.release(&id);
                 if fresh_child {
@@ -838,10 +1056,13 @@ impl VhcApi for VhcService {
         let _ = self
             .store
             .set_execution_identity(&run_id, id.epoch, &id.role, id.instance);
-        // Persist the immutable admitted tuple beside the durable join intent (architecture §6.3),
-        // so a restart re-converges against the exact assessed identity.
-        if let Some(tuple) = &admitted_tuple {
-            let _ = self.store.set_admitted_tuple(&run_id, tuple);
+        // Persist the immutable admitted tuple (now carrying the minted incarnation) beside the
+        // durable join intent (architecture §6.3), so a restart re-converges against the exact
+        // assessed identity + incarnation.
+        if let Some(tuple) = &delivery_tuple {
+            if let Ok(bytes) = protocol::encode(tuple) {
+                let _ = self.store.set_admitted_tuple(&run_id, &bytes);
+            }
         }
 
         // A3: join over the streaming path + pump the continuous worker event stream into
@@ -854,8 +1075,9 @@ impl VhcApi for VhcService {
             .join_streaming(
                 run_id.clone(),
                 coordinator,
-                Vec::new(),
+                credentials,
                 to_join_policy(&policy),
+                delivery_tuple,
             )
             .await
         {

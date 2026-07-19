@@ -64,7 +64,10 @@ use daemon_vhc_session::identity::certify_existing_key;
 use daemon_vhc_session::keystore::VhcKeystore;
 use daemon_vhc_session::protocol::Event;
 
-pub(crate) use crate::backend::RUN_INSTANCE;
+/// The harness self-driven join runs one in-process incarnation per join — a fixed instance id
+/// (the PRODUCTION path's incarnation is node-minted and tuple-delivered; this seat is
+/// `harness`-feature test machinery and never joins a decentralized run).
+const RUN_INSTANCE: u64 = 1;
 
 pub(crate) use crate::backend::derive_grants;
 

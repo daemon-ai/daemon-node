@@ -180,9 +180,14 @@ impl TrainSupervisor {
         .await
     }
 
-    /// Assess a run envelope against this peer's effective resources (§6.5, read-only).
-    pub async fn assess(&self, envelope: Vec<u8>) -> Result<Eligibility, TrainClientError> {
-        self.exchange(Command::AssessRun { envelope }, |ev| match ev {
+    /// Assess a run envelope against this peer's effective resources (§6.5, read-only). `role`
+    /// names the envelope role to assess for (node-directed selection); `None` = the default.
+    pub async fn assess(
+        &self,
+        envelope: Vec<u8>,
+        role: Option<String>,
+    ) -> Result<Eligibility, TrainClientError> {
+        self.exchange(Command::AssessRun { envelope, role }, |ev| match ev {
             Event::Assessed(elig) => Some(Ok(elig)),
             _ => None,
         })
@@ -197,15 +202,16 @@ impl TrainSupervisor {
         coordinator: impl Into<String>,
         credentials: Vec<u8>,
         policy: JoinPolicy,
+        admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<(), TrainClientError> {
         let cmd = Command::JoinRun {
             run_id: run_id.into(),
             coordinator: coordinator.into(),
             credentials,
             policy,
-            // Node-authored tuple delivery into JoinRun arrives with the node-side credential
-            // authorship; the self-driven join authors and re-verifies its own tuple.
-            admitted_tuple: None,
+            // The node-minted admitted tuple (carrying the incarnation this instance runs as);
+            // the worker rederives + re-verifies it before running.
+            admitted_tuple,
         };
         self.exchange(cmd, |ev| match ev {
             Event::RunPhase { .. } => Some(Ok(())),
@@ -228,6 +234,7 @@ impl TrainSupervisor {
         coordinator: impl Into<String>,
         credentials: Vec<u8>,
         policy: JoinPolicy,
+        admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<UnboundedReceiver<Event>, TrainClientError> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *self.inner.pump.lock().expect("pump lock") = Some(tx);
@@ -236,9 +243,8 @@ impl TrainSupervisor {
             coordinator: coordinator.into(),
             credentials,
             policy,
-            // Node-authored tuple delivery into JoinRun arrives with the node-side credential
-            // authorship; the self-driven join authors and re-verifies its own tuple.
-            admitted_tuple: None,
+            // The node-minted admitted tuple (carrying the incarnation this instance runs as).
+            admitted_tuple,
         };
         // One-way: the worker streams events (incl. the first RunPhase) over the pump, so we do not
         // block on a reply here. A spawn/transport fault clears the pump + surfaces the error.

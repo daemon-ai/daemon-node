@@ -412,7 +412,11 @@ impl WorkerControl for InProcessUpgradeWorker {
     async fn probe(&self) -> Result<Hardware, VhcError> {
         Ok(Hardware::default())
     }
-    async fn assess(&self, _envelope: Vec<u8>) -> Result<Eligibility, VhcError> {
+    async fn assess(
+        &self,
+        _envelope: Vec<u8>,
+        _role: Option<String>,
+    ) -> Result<Eligibility, VhcError> {
         Ok(Eligibility {
             eligible: true,
             ..Eligibility::default()
@@ -424,6 +428,7 @@ impl WorkerControl for InProcessUpgradeWorker {
         _coordinator: String,
         _credentials: Vec<u8>,
         _policy: JoinPolicy,
+        _admitted_tuple: Option<daemon_vhc_session::protocol::AdmittedTuple>,
     ) -> Result<(), VhcError> {
         Ok(())
     }

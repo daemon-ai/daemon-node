@@ -67,7 +67,7 @@ async fn supervisor_probe_assess_ping() {
     assert_eq!(hw.gpus, 1);
     assert_eq!(hw.throughput_class, "c3");
 
-    let elig = sup.assess(vec![1, 2, 3]).await.expect("assess");
+    let elig = sup.assess(vec![1, 2, 3], None).await.expect("assess");
     assert!(elig.eligible);
 
     sup.ping().await.expect("ping");
@@ -83,13 +83,15 @@ async fn supervisor_respawn() {
     let state = state_path("respawn");
     let sup = TrainSupervisor::new(cfg("crash-once", &state));
 
-    let first = sup.join("run-1", "wss://coord", vec![], policy()).await;
+    let first = sup
+        .join("run-1", "wss://coord", vec![], policy(), None)
+        .await;
     assert!(
         matches!(first, Err(TrainClientError::Transient(_))),
         "first join should see the worker crash: {first:?}"
     );
 
-    sup.join("run-1", "wss://coord", vec![], policy())
+    sup.join("run-1", "wss://coord", vec![], policy(), None)
         .await
         .expect("respawn join should succeed");
     assert!(sup.restarts().await >= 1, "the worker was respawned");
@@ -109,7 +111,7 @@ async fn preemption_as_churn_pauses_and_rejoins_without_respawn() {
     let state = state_path("preempt");
     let sup = TrainSupervisor::new(cfg("ready", &state));
 
-    sup.join("run-9", "wss://coord", vec![], policy())
+    sup.join("run-9", "wss://coord", vec![], policy(), None)
         .await
         .expect("initial join");
 
@@ -117,7 +119,7 @@ async fn preemption_as_churn_pauses_and_rejoins_without_respawn() {
     sup.throttle(None, None, true).await.expect("pause");
     // Resume per policy, then rejoin at the next boundary.
     sup.throttle(None, None, false).await.expect("resume");
-    sup.join("run-9", "wss://coord", vec![], policy())
+    sup.join("run-9", "wss://coord", vec![], policy(), None)
         .await
         .expect("rejoin after resume");
 
@@ -141,7 +143,7 @@ async fn throttle_aborts_in_flight_call() {
     let state = state_path("throttle-abort");
     let sup = TrainSupervisor::new(cfg("ready", &state));
 
-    sup.join("run-4", "wss://coord", vec![], policy())
+    sup.join("run-4", "wss://coord", vec![], policy(), None)
         .await
         .expect("join");
     // Pause aborts the in-flight round on the worker side; the supervisor's oneway must succeed and
@@ -167,7 +169,7 @@ async fn throttle_frees_vram_keeps_masters() {
     let state = state_path("throttle-masters");
     let sup = TrainSupervisor::new(cfg("ready", &state));
 
-    sup.join("run-4b", "wss://coord", vec![], policy())
+    sup.join("run-4b", "wss://coord", vec![], policy(), None)
         .await
         .expect("join");
     sup.throttle(None, None, true)
@@ -177,7 +179,7 @@ async fn throttle_frees_vram_keeps_masters() {
         .await
         .expect("resume (rebuild)");
     // Resume + rejoin reuse the same worker process → the CPU masters were never discarded.
-    sup.join("run-4b", "wss://coord", vec![], policy())
+    sup.join("run-4b", "wss://coord", vec![], policy(), None)
         .await
         .expect("rejoin at boundary");
     assert_eq!(
@@ -197,7 +199,7 @@ async fn assess_staging_returns_eligibility() {
     let ok_state = state_path("assess-ok");
     let sup = TrainSupervisor::new(cfg("ready", &ok_state));
     let elig = sup
-        .assess(b"frozen-envelope-bytes".to_vec())
+        .assess(b"frozen-envelope-bytes".to_vec(), None)
         .await
         .expect("assess (eligible)");
     assert!(elig.eligible, "the fits-fake reports eligible");
@@ -208,7 +210,7 @@ async fn assess_staging_returns_eligibility() {
     let no_state = state_path("assess-no");
     let sup = TrainSupervisor::new(cfg("ineligible", &no_state));
     let elig = sup
-        .assess(b"frozen-envelope-bytes".to_vec())
+        .assess(b"frozen-envelope-bytes".to_vec(), None)
         .await
         .expect("assess (ineligible)");
     assert!(!elig.eligible, "the ineligible fake declines the run");

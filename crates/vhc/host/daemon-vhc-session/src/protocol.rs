@@ -256,6 +256,12 @@ pub enum Command {
     AssessRun {
         /// The run envelope bytes (opaque here; lane P owns the schema — MERGE-1).
         envelope: Vec<u8>,
+        /// The envelope role LABEL to assess for (node-directed role selection — the seat-claim
+        /// path assesses the coordinator role). `None` = the single-trainer default (the first
+        /// non-coordinator role). Additive `#[serde(default)]`; a label absent from the genesis
+        /// role set is a typed refusal.
+        #[serde(default)]
+        role: Option<String>,
     },
     /// Join a run, then stream [`Event`]s.
     JoinRun {
@@ -681,6 +687,47 @@ pub struct SessionCredentials {
     /// later arrivals ride the control plane as distribution records.
     #[serde(default)]
     pub peer_certs: Vec<daemon_vhc_proto::RunKeyCertificate>,
+    /// The keystore reference of the node-authored per-run CREDENTIALS RECORD (WS/presign auth
+    /// material) — resolved by the worker against the identity store it already holds by path
+    /// reference; token material never rides this body ([CI-9] custody; D-P8 redaction by
+    /// construction). `None` ⇒ the body's `ws_auth` stands alone (unauthenticated local lanes).
+    #[serde(default)]
+    pub secret_ref: Option<String>,
+    /// Advisory expiry (unix ms) of the referenced credentials record: past it the worker's
+    /// planes re-resolve the record before dialing (the node refreshes by atomically rewriting
+    /// the record — never by restarting the session). `0` = no expiry.
+    #[serde(default)]
+    pub expires_at_ms: u64,
+    /// An optional LATE-JOIN checkpoint restore (§9/§10.2): the node-resolved registry checkpoint
+    /// pointer this instance restores from before it runs. `None` = a fresh start from genesis.
+    #[serde(default)]
+    pub restore: Option<CheckpointRestore>,
+}
+
+/// A late-join checkpoint restore reference (the node-resolved registry pointer): the round the
+/// checkpoint covers and the content address (blake3) of the checkpoint document on the payload
+/// plane. The worker fetches the bytes, hash-verifies, and migrates the fresh instance from them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRestore {
+    /// The round the checkpoint captures (post-ingest state).
+    pub round: u64,
+    /// blake3 of the checkpoint document (the payload-plane content key).
+    pub hash: [u8; 32],
+}
+
+/// The node-authored per-run CREDENTIALS RECORD the [`SessionCredentials::secret_ref`] points at
+/// (persisted in the identity keystore, 0600, atomically rewritten on refresh — NEVER on the
+/// command wire): the WS/presign auth material and its advisory expiry. Lives here so the
+/// dependency-light protocol crate owns the schema beside the plane selection that references it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialsRecord {
+    /// The WS coordinator + presign auth (the secret-bearing modes live HERE, by reference).
+    #[serde(default)]
+    pub ws_auth: WsAuthSpec,
+    /// Advisory expiry (unix ms; `0` = none) — mirrored onto the wire body so planes know when
+    /// to re-resolve.
+    #[serde(default)]
+    pub expires_at_ms: u64,
 }
 
 impl SessionCredentials {
@@ -751,6 +798,7 @@ mod tests {
         round_trip_command(Command::Probe);
         round_trip_command(Command::AssessRun {
             envelope: vec![1, 2, 3, 4],
+            role: Some("coordinator".into()),
         });
         round_trip_command(Command::JoinRun {
             run_id: "run-42".into(),
@@ -1061,9 +1109,23 @@ mod tests {
             iroh: None,
             presign_base: None,
             peer_certs: Vec::new(),
+            secret_ref: None,
+            expires_at_ms: 0,
+            restore: None,
         };
         let back = SessionCredentials::from_bytes(&ws_only.to_bytes().unwrap()).unwrap();
         assert_eq!(back, ws_only);
+
+        // The additive secret_ref/expiry round-trip too, and a pre-secret_ref body still decodes.
+        let referenced = SessionCredentials {
+            secret_ref: Some("coordinator-3.creds".into()),
+            expires_at_ms: 1_900_000_000_000,
+            ..ws_only.clone()
+        };
+        assert_eq!(
+            SessionCredentials::from_bytes(&referenced.to_bytes().unwrap()).unwrap(),
+            referenced
+        );
 
         let base = daemon_vhc_proto::SigningKey::from_bytes(&[7; 32]);
         let run_key =
@@ -1097,6 +1159,12 @@ mod tests {
             }),
             presign_base: Some("http://127.0.0.1:8795/api/v1/vhc".into()),
             peer_certs: vec![cert],
+            secret_ref: Some("coordinator-1.creds".into()),
+            expires_at_ms: 1_800_000_000_000,
+            restore: Some(CheckpointRestore {
+                round: 42,
+                hash: [0x7C; 32],
+            }),
         };
         let back = SessionCredentials::from_bytes(&full.to_bytes().unwrap()).unwrap();
         assert_eq!(back, full);

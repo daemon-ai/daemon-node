@@ -195,3 +195,55 @@ async fn live_ws_join_ready_progresses_to_round_open() {
     );
     peer.shutdown().await;
 }
+
+/// The CERTIFIED-IDENTITY attach extension (§12.1/§12.3 over the live DO relay): the byte-opaque
+/// WS plane relays a §12.3 certificate DISTRIBUTION RECORD and a §12.1 frame byte-for-byte to the
+/// other peer, exactly as it relays the round-vocabulary control frames — proving the
+/// certified-identity carriage the role session rides works against the deployed relay.
+///
+/// SKIPS cleanly unless `VHC_LIVE_WS_URL` is set (the `ws_live_do` convention).
+#[tokio::test(flavor = "multi_thread")]
+async fn live_certified_distribution_and_frame_relay() {
+    let Ok(base_url) = std::env::var("VHC_LIVE_WS_URL") else {
+        eprintln!("SKIP live certified attach: set VHC_LIVE_WS_URL");
+        return;
+    };
+    let run_id = std::env::var("VHC_LIVE_RUN_ID").unwrap_or_else(|_| "run-live".into());
+
+    let a = connect_live(&base_url, &run_id).await;
+    let b = connect_live(&base_url, &run_id).await;
+    let mut sub_b = b.subscribe();
+
+    // A §12.3 certificate distribution record (proto mechanism — a top-level single-entry map,
+    // structurally disjoint from a §12.1 frame array), authored by a certified per-run key.
+    let base = signing_key(90);
+    let run_key = signing_key(91);
+    let scope = daemon_vhc_proto::CertScope {
+        run_id: daemon_vhc_proto::Hash([0x5E; 32]),
+        epoch: 0,
+        role: "trainer".into(),
+        instance: 1,
+        module_hash: daemon_vhc_proto::Hash([0x2A; 32]),
+    };
+    // The §12.3 certificate record is proto mechanism (canonical CBOR `{body, base_identity,
+    // sig}`); the on-plane distribution wrapper is a session concern, but the certified-identity
+    // carriage the wrapper rides is exactly this record's byte-exact relay over the plane.
+    let cert = daemon_vhc_proto::RunKeyCertificate::issue(
+        &base,
+        scope,
+        daemon_vhc_proto::peer_id(&run_key),
+    )
+    .expect("issue cert");
+    let record = to_canonical_vec(&cert).expect("encode certificate record");
+    a.publish(&record)
+        .await
+        .expect("publish certificate record");
+    assert_eq!(
+        recv_timeout(&mut sub_b, DELIVER).await.as_deref(),
+        Some(record.as_slice()),
+        "the DO relays the §12.3 certificate record BYTE-FOR-BYTE"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
