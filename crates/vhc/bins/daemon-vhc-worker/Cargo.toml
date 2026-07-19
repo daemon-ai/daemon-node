@@ -108,6 +108,10 @@ daemon-vhc-net = { workspace = true, features = ["harness"] }
 # tests/live_attach.rs: scans a peer's durable journal segments to prove inbound certified
 # frames DELIVERED (tag-12 evidence records) — the schema-free substrate crate.
 daemon-vhc-journal = { workspace = true }
+# tests/seat_smoke.rs: the node-side coordinator seat manager (claim/authorize/derive_bid) the
+# test drives as the node for both seats. A test-only edge (the shipped worker never links the
+# node service); no runtime dependency-direction change.
+daemon-vhc-node = { workspace = true }
 # Test-only: the genesis-authoring vocabulary for the in-process join suite — the coordinator
 # role's opaque config is an authored `{state: CoordinatorState}` and the run's trust topology a
 # typed `AuthorityConfig` (both consensus-SDK types). The RUNTIME native-tick edge this crate

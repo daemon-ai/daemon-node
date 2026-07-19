@@ -200,6 +200,12 @@ pub struct VhcConfig {
     pub module_trust: ModuleTrust,
     /// Allowlisted coordinator endpoints (discovery + join, §11.1).
     pub coordinator_allowlist: Vec<String>,
+    /// Whether this node's owner enables COORDINATOR DUTY (architecture §6.3; ABI §12.4): when
+    /// `true`, the node may claim a run's coordinator seat (Authority-signed fenced lease) and
+    /// launch the coordinator role through the role session. Default `false` — a node is a
+    /// trainer that verifies the seat holder's lease, never a claimant, unless the owner opts in.
+    #[serde(default)]
+    pub seat_claim: bool,
     /// The coordinator-registry discovery surface (A3; additive — defaults to "no registry").
     pub registry: RegistryConfig,
     /// iroh transport knobs.
@@ -226,6 +232,7 @@ impl Default for VhcConfig {
             default_policy: VhcPolicyConfig::default(),
             module_trust: ModuleTrust::Signed,
             coordinator_allowlist: vec!["https://api.daemon.ai/api/v1/vhc".to_string()],
+            seat_claim: false,
             registry: RegistryConfig::default(),
             iroh: IrohConfig::default(),
             owner_budget: OwnerBudgetConfig::default(),
