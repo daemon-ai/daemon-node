@@ -339,8 +339,8 @@ pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
     // -- minor 2 (the chunk-addressed corpus contract): chunk-map registration ------------------
     // The fold-identity registration that turns `fetch` into a covering-span, chunk-verified
     // range read for corpus shards (see `DATA_V2_SYMBOLS` for the full rules). Registers at the
-    // host-implemented minor, landing in the same change that wires the chunked fetch path into
-    // the event-loop driver (the B1/C1 coupled-bump discipline).
+    // host-implemented minor: the symbol enters the registry in the same change that wires the
+    // chunked fetch path into the event-loop driver (declaration + implementation bump together).
     (NS_DATA_V2, "register_chunks", 2),
 ];
 

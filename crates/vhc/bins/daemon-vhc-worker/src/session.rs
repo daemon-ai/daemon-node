@@ -86,7 +86,7 @@ const SEQ_LEN: u32 = 9;
 /// that every 36-byte shard spans several chunks — the chunk math is exercised, not vacuous).
 const CHUNK_SIZE: u64 = 16;
 
-/// The run's **artifact store** — the one fetch path (B2 tier-d unification), speaking BOTH
+/// The run's **artifact store** — the one unified fetch path, speaking BOTH
 /// artifact classes of the corpus contract:
 ///
 /// - **plain** objects (the corpus manifest), keyed + verified by the blake3 of their bytes;
