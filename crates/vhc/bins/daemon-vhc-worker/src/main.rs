@@ -120,6 +120,30 @@ async fn join_live(
     if !peer_certs.contains(&binding.own_cert) {
         peer_certs.push(binding.own_cert.clone());
     }
+    // Late-join restore (§9/§10.2): fetch the node-resolved checkpoint document by content
+    // address, hash-verify it (the ContentStore verifies; belt-and-suspenders here), decode the
+    // snapshot, and hand it to the session as a migration input — the fresh instance migrates
+    // from it before running. A restore that cannot be resolved is a typed refusal (a run asked
+    // to restore must not silently start fresh).
+    let restore = match &creds.restore {
+        None => None,
+        Some(r) => {
+            let hash = daemon_vhc_proto::Hash(r.hash);
+            let bytes = providers.payloads.get_content(&hash).await.map_err(|e| {
+                format!(
+                    "fetch checkpoint {} (round {}): {e}",
+                    hash.to_hex(),
+                    r.round
+                )
+            })?;
+            let capture = daemon_vhc_session::role_session::decode_snapshot_doc(&bytes)?;
+            Some(daemon_vhc_host::run::MigrationInput {
+                capture,
+                restore: true,
+                migrate_fuel: None,
+            })
+        }
+    };
     Ok(RoleSessionSpec {
         module: resolved.module.clone(),
         engine: backend::engine_config_from_env(),
@@ -130,6 +154,7 @@ async fn join_live(
         providers,
         journal,
         drain_deadline: DRAIN_DEADLINE,
+        restore,
     })
 }
 
@@ -464,6 +489,7 @@ async fn main() {
                                 providers: in_process_providers(),
                                 journal,
                                 drain_deadline: DRAIN_DEADLINE,
+                                restore: None,
                             };
                             let handle = spawn_role(run_id.clone(), spec, role_events.clone());
                             roles.insert(run_id, handle);

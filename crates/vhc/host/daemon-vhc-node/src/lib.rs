@@ -35,7 +35,7 @@ pub use arbiter::{
     AdmitRefusal, BudgetSnapshot, ClaimTiers, InstanceCharge, OwnerArbiter, OwnerBudget,
     RoleInstanceId, TierBytes,
 };
-pub use discovery::{DiscoveredRun, EgressRunDiscovery, RunDiscovery};
+pub use discovery::{CheckpointPointer, DiscoveredRun, EgressRunDiscovery, RunDiscovery};
 // Re-exported so the boot site constructs the registry-backed discovery seam without a direct
 // `daemon-vhc-net` dep edge (A3 boot wiring; additive).
 pub use daemon_vhc_net::RegistryClient;

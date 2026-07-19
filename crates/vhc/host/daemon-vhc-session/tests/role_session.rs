@@ -129,6 +129,7 @@ fn rig(wasm: &[u8], role: &str, config: Vec<u8>) -> Rig {
         },
         journal: Box::new(sink.clone()),
         drain_deadline: Duration::from_secs(10),
+        restore: None,
     };
     let own_sender = certified.sender().0;
     Rig {

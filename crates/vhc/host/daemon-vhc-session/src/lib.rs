@@ -26,6 +26,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod assess;
 pub mod attach;
 pub mod backend;

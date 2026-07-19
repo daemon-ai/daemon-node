@@ -477,14 +477,20 @@ impl VhcService {
                 .admitted_tuple
                 .as_deref()
                 .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
-            let (delivery_tuple, credentials, credentials_ref) =
-                match self.author_join(&run.run_id, &run.coordinator, &id, persisted_tuple) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.arbiter.release(&id);
-                        return Err(e);
-                    }
-                };
+            let restore = self.resolve_restore(&run.run_id).await;
+            let (delivery_tuple, credentials, credentials_ref) = match self.author_join(
+                &run.run_id,
+                &run.coordinator,
+                &id,
+                persisted_tuple,
+                restore,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.arbiter.release(&id);
+                    return Err(e);
+                }
+            };
             // The credentials-record reference is deterministic per `(role, incarnation)`, so a
             // refresh reuses the persisted ref; only the tuple bytes (incarnation stamped) are
             // re-persisted here.
@@ -685,6 +691,20 @@ impl VhcService {
             _ => {}
         }
 
+        // Checkpoint-pointer publication (spec §9; lane R): the checkpoint DOCUMENT is already on
+        // the payload plane (the session put it there); record the round → content-address
+        // pointer at the registry so a late joiner can restore. Best-effort + detached (a pointer
+        // is advisory; the joiner hash-verifies regardless, so an unknown size is 0).
+        if let protocol::Event::CheckpointPublished { round, hash, .. } = ev {
+            if let Some(discovery) = &self.discovery {
+                let discovery = discovery.clone();
+                let (run, round, hash) = (run_id.clone(), *round, hash.clone());
+                tokio::spawn(async move {
+                    let _ = discovery.publish_checkpoint(&run, round, &hash, 0).await;
+                });
+            }
+        }
+
         let mut emitted = Vec::new();
         if let Some(sev) = translate(ev, &run_id) {
             self.emit(sev, &mut emitted)?;
@@ -821,6 +841,7 @@ impl VhcService {
         coordinator: &str,
         id: &RoleInstanceId,
         tuple: Option<protocol::AdmittedTuple>,
+        restore: Option<protocol::CheckpointRestore>,
     ) -> Result<AuthoredDelivery, VhcError> {
         let tuple = tuple.map(|mut t| {
             t.incarnation = id.instance;
@@ -848,9 +869,37 @@ impl VhcService {
             },
             coordinator,
             &self.config.registry,
+            restore,
         )?;
         Ok((Some(tuple), authored.wire, authored.credentials_ref))
     }
+
+    /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's latest
+    /// checkpoint pointer, decoded to the wire restore form (`None` = fresh start / no discovery
+    /// / no checkpoint published). A malformed pointer hash is dropped (fresh start), never a
+    /// hard join failure.
+    async fn resolve_restore(&self, run_id: &str) -> Option<protocol::CheckpointRestore> {
+        let discovery = self.discovery.as_ref()?;
+        let pointer = discovery.fetch_checkpoint(run_id).await.ok()??;
+        let hash = hex32(&pointer.hash)?;
+        Some(protocol::CheckpointRestore {
+            round: pointer.round,
+            hash,
+        })
+    }
+}
+
+/// Decode a 64-char lowercase-hex blake3 into a 32-byte array (`None` on any malformation).
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 #[async_trait]
@@ -973,8 +1022,9 @@ impl VhcApi for VhcService {
         // certificate under the base identity, stamp the minted incarnation into the tuple, and
         // author the secrets-free plane-selection credentials (the token, if any, lands only in
         // the keystore record `credentials_ref` points at — never on the wire).
+        let restore = self.resolve_restore(&run_id).await;
         let (delivery_tuple, credentials, credentials_ref) =
-            match self.author_join(&run_id, &coordinator, &id, assessed_tuple) {
+            match self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore) {
                 Ok(v) => v,
                 Err(e) => {
                     if existing.is_none() {

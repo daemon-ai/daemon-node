@@ -35,9 +35,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon_vhc_host::run::{
-    start_run, JournalSink, OpOutcome, OpRequest, PumpHandle, RunConfig, RunEnd,
-};
+use daemon_vhc_host::run::{JournalSink, OpOutcome, OpRequest, PumpHandle, RunConfig, RunEnd};
 use daemon_vhc_host::trap::TrapCode;
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_net::{ContentStore, ControlPlane};
@@ -95,6 +93,11 @@ pub struct RoleSessionSpec {
     pub journal: Box<dyn JournalSink>,
     /// The graceful-leave drain ceiling (the quiesce deadline).
     pub drain_deadline: Duration,
+    /// An optional LATE-JOIN restore (§10.2/§10.3): a checkpoint snapshot to migrate the fresh
+    /// module instance from before it runs (built from a registry checkpoint pointer the node
+    /// resolved, its bytes fetched + hash-verified from the payload plane). `None` = a fresh
+    /// start from genesis.
+    pub restore: Option<daemon_vhc_host::run::MigrationInput>,
 }
 
 /// A throttle level (the owner's GPU-governor lever, forwarded verbatim by the worker loop).
@@ -219,6 +222,7 @@ async fn run_role(
         providers,
         journal,
         drain_deadline,
+        restore,
     } = spec;
 
     let identity = run_cfg.identity.clone();
@@ -238,11 +242,20 @@ async fn run_role(
             }
         }
     };
-    let run = match start_run(&worker, &module, run_cfg, journal) {
+    // A late-join restore migrates the fresh instance from the checkpoint snapshot before it
+    // runs (§10.3 step 4: `da_migrate` under budget between `da_init` and `da_run`); a
+    // migrate-refusal is a terminal admission fault, never a silent fresh start.
+    let restoring = restore.is_some();
+    let run = match daemon_vhc_host::run::start_run_migrating(
+        &worker, &module, run_cfg, journal, restore,
+    ) {
         Ok(r) => r,
         Err(e) => {
             return TerminalOutcome::FailedTerminal {
-                reason: format!("run start: {e}"),
+                reason: format!(
+                    "run start{}: {e}",
+                    if restoring { " (restore)" } else { "" }
+                ),
             }
         }
     };
@@ -787,6 +800,21 @@ async fn persist_drain_snapshot(
     providers: &RoleProviders,
     capture: &daemon_vhc_host::run::SnapshotCapture,
 ) -> Option<String> {
+    let bytes = encode_snapshot_doc(capture).ok()?;
+    providers
+        .payloads
+        .put_content(&bytes)
+        .await
+        .ok()
+        .map(|hash| hash.to_hex())
+}
+
+/// The content-addressed checkpoint document: `[manifest, [[name, section-bytes], …]]` in the
+/// manifest's declared order (the object a checkpoint pointer addresses). Encoder + decoder are
+/// paired so a late joiner rebuilds the exact [`SnapshotCapture`] the leaving peer wrote.
+pub fn encode_snapshot_doc(
+    capture: &daemon_vhc_host::run::SnapshotCapture,
+) -> Result<Vec<u8>, String> {
     let doc = ciborium::value::Value::Array(vec![
         ciborium::value::Value::Bytes(capture.manifest.clone()),
         ciborium::value::Value::Array(
@@ -802,13 +830,41 @@ async fn persist_drain_snapshot(
                 .collect(),
         ),
     ]);
-    let bytes = to_canonical_vec(&doc).ok()?;
-    providers
-        .payloads
-        .put_content(&bytes)
-        .await
-        .ok()
-        .map(|hash| hash.to_hex())
+    to_canonical_vec(&doc).map_err(|e| format!("encode snapshot doc: {e}"))
+}
+
+/// Decode a checkpoint document back into a [`SnapshotCapture`] (the late-join restore input).
+/// Fails typed on any structural surprise — a malformed checkpoint never yields a partial state.
+pub fn decode_snapshot_doc(bytes: &[u8]) -> Result<daemon_vhc_host::run::SnapshotCapture, String> {
+    let v: ciborium::value::Value =
+        ciborium::de::from_reader(bytes).map_err(|e| format!("snapshot doc cbor: {e}"))?;
+    let ciborium::value::Value::Array(parts) = v else {
+        return Err("snapshot doc is not an array".into());
+    };
+    let [manifest_v, sections_v] = <[ciborium::value::Value; 2]>::try_from(parts)
+        .map_err(|_| "snapshot doc arity != 2".to_string())?;
+    let ciborium::value::Value::Bytes(manifest) = manifest_v else {
+        return Err("snapshot manifest is not bytes".into());
+    };
+    let ciborium::value::Value::Array(section_vs) = sections_v else {
+        return Err("snapshot sections is not an array".into());
+    };
+    let mut sections = Vec::with_capacity(section_vs.len());
+    for entry in section_vs {
+        let ciborium::value::Value::Array(kv) = entry else {
+            return Err("snapshot section is not a [name, bytes] pair".into());
+        };
+        let [name_v, bytes_v] = <[ciborium::value::Value; 2]>::try_from(kv)
+            .map_err(|_| "snapshot section arity != 2".to_string())?;
+        let ciborium::value::Value::Text(name) = name_v else {
+            return Err("snapshot section name is not text".into());
+        };
+        let ciborium::value::Value::Bytes(section) = bytes_v else {
+            return Err("snapshot section value is not bytes".into());
+        };
+        sections.push((name, section));
+    }
+    Ok(daemon_vhc_host::run::SnapshotCapture { manifest, sections })
 }
 
 #[cfg(test)]
@@ -872,6 +928,24 @@ mod tests {
             classify_natural_end(Ok(RunEnd::Outcome(0)), Some("plane lost".into())),
             TerminalOutcome::FailedRetryable { .. }
         ));
+    }
+
+    #[test]
+    fn snapshot_doc_round_trips_and_refuses_malformed() {
+        // The late-join restore codec: a capture encodes + decodes to the identical sections in
+        // declared order; junk refuses typed (a malformed checkpoint never yields partial state).
+        let capture = daemon_vhc_host::run::SnapshotCapture {
+            manifest: b"manifest-bytes".to_vec(),
+            sections: vec![
+                ("params".into(), vec![1, 2, 3]),
+                ("residual".into(), vec![4, 5]),
+            ],
+        };
+        let bytes = encode_snapshot_doc(&capture).expect("encode");
+        let back = decode_snapshot_doc(&bytes).expect("decode");
+        assert_eq!(back.manifest, capture.manifest);
+        assert_eq!(back.sections, capture.sections);
+        assert!(decode_snapshot_doc(b"not-a-snapshot-doc").is_err());
     }
 
     #[test]

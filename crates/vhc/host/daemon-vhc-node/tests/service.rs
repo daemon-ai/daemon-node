@@ -572,3 +572,74 @@ async fn collect(sub: &mut daemon_api::VhcEventStream, n: usize) -> Vec<VhcEvent
     }
     out
 }
+
+/// The late-join checkpoint seam (spec §9; lane R): a run discovery that records published
+/// pointers and hands back the latest one — the round-trip the node's publish hook + join-time
+/// restore resolution drive. The default trait methods are overridden here exactly as the
+/// production `EgressRunDiscovery` overrides them over the registry.
+#[derive(Default)]
+struct CheckpointDiscovery {
+    published: Mutex<Vec<(String, u64, String)>>,
+    latest: Mutex<Option<daemon_vhc_node::CheckpointPointer>>,
+}
+
+#[async_trait]
+impl RunDiscovery for CheckpointDiscovery {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, VhcError> {
+        Ok(Vec::new())
+    }
+    async fn get_run(&self, _run_id: &str) -> Result<Option<DiscoveredRun>, VhcError> {
+        Ok(None)
+    }
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+        Ok(Vec::new())
+    }
+    async fn publish_checkpoint(
+        &self,
+        run_id: &str,
+        round: u64,
+        hash: &str,
+        _size: u64,
+    ) -> Result<(), VhcError> {
+        self.published
+            .lock()
+            .unwrap()
+            .push((run_id.to_string(), round, hash.to_string()));
+        // A publish becomes the latest pointer a subsequent joiner restores from.
+        *self.latest.lock().unwrap() = Some(daemon_vhc_node::CheckpointPointer {
+            round,
+            hash: hash.to_string(),
+            size: 0,
+        });
+        Ok(())
+    }
+    async fn fetch_checkpoint(
+        &self,
+        _run_id: &str,
+    ) -> Result<Option<daemon_vhc_node::CheckpointPointer>, VhcError> {
+        Ok(self.latest.lock().unwrap().clone())
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_pointer_publishes_and_is_fetched_for_restore() {
+    let d = CheckpointDiscovery::default();
+    let hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+
+    // A published checkpoint is recorded (the node's CheckpointPublished hook target)...
+    RunDiscovery::publish_checkpoint(&d, "run-ckpt", 7, hash, 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        &*d.published.lock().unwrap(),
+        &[("run-ckpt".to_string(), 7, hash.to_string())]
+    );
+
+    // ...and a later joiner reads it back as the restore pointer (the join-time resolve target).
+    let pointer = RunDiscovery::fetch_checkpoint(&d, "run-ckpt")
+        .await
+        .unwrap()
+        .expect("a pointer is published");
+    assert_eq!(pointer.round, 7);
+    assert_eq!(pointer.hash, hash);
+}

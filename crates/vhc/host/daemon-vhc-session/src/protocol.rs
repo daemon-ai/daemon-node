@@ -698,6 +698,21 @@ pub struct SessionCredentials {
     /// the record — never by restarting the session). `0` = no expiry.
     #[serde(default)]
     pub expires_at_ms: u64,
+    /// An optional LATE-JOIN checkpoint restore (§9/§10.2): the node-resolved registry checkpoint
+    /// pointer this instance restores from before it runs. `None` = a fresh start from genesis.
+    #[serde(default)]
+    pub restore: Option<CheckpointRestore>,
+}
+
+/// A late-join checkpoint restore reference (the node-resolved registry pointer): the round the
+/// checkpoint covers and the content address (blake3) of the checkpoint document on the payload
+/// plane. The worker fetches the bytes, hash-verifies, and migrates the fresh instance from them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRestore {
+    /// The round the checkpoint captures (post-ingest state).
+    pub round: u64,
+    /// blake3 of the checkpoint document (the payload-plane content key).
+    pub hash: [u8; 32],
 }
 
 /// The node-authored per-run CREDENTIALS RECORD the [`SessionCredentials::secret_ref`] points at
@@ -1096,6 +1111,7 @@ mod tests {
             peer_certs: Vec::new(),
             secret_ref: None,
             expires_at_ms: 0,
+            restore: None,
         };
         let back = SessionCredentials::from_bytes(&ws_only.to_bytes().unwrap()).unwrap();
         assert_eq!(back, ws_only);
@@ -1145,6 +1161,10 @@ mod tests {
             peer_certs: vec![cert],
             secret_ref: Some("coordinator-1.creds".into()),
             expires_at_ms: 1_800_000_000_000,
+            restore: Some(CheckpointRestore {
+                round: 42,
+                hash: [0x7C; 32],
+            }),
         };
         let back = SessionCredentials::from_bytes(&full.to_bytes().unwrap()).unwrap();
         assert_eq!(back, full);

@@ -85,6 +85,7 @@ fn no_secret_crosses_the_command_wire_or_lands_in_a_journal() {
         peer_certs: Vec::new(),
         secret_ref: Some(secret_ref),
         expires_at_ms: 0,
+        restore: None,
     };
 
     // (a) the command wire: encode the exact `JoinRun` the node sends.

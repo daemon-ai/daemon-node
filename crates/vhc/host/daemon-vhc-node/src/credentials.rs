@@ -20,7 +20,9 @@
 
 use daemon_vhc_session::config::{RegistryAuthConfig, RegistryConfig};
 use daemon_vhc_session::keystore::{KeystoreError, VhcKeystore};
-use daemon_vhc_session::protocol::{CredentialsRecord, SessionCredentials, WsAuthSpec};
+use daemon_vhc_session::protocol::{
+    CheckpointRestore, CredentialsRecord, SessionCredentials, WsAuthSpec,
+};
 use daemon_vhc_session::provisioning::{provision_run_identity, ProvisionScope};
 
 use crate::service::VhcError;
@@ -62,6 +64,7 @@ pub fn author_join(
     identity: &RunInstanceIdentity<'_>,
     coordinator: &str,
     registry: &RegistryConfig,
+    restore: Option<CheckpointRestore>,
 ) -> Result<AuthoredJoin, VhcError> {
     let cred = |e: KeystoreError| VhcError::Internal(format!("credential authorship: {e}"));
 
@@ -111,6 +114,7 @@ pub fn author_join(
         peer_certs: Vec::new(),
         secret_ref,
         expires_at_ms,
+        restore,
     };
     let wire = credentials
         .to_bytes()
