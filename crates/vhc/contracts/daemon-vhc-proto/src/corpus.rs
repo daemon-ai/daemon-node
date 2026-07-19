@@ -283,7 +283,7 @@ impl CorpusManifest {
             return Err(VhcProtoError::Validation("seq_len must be > 0".into()));
         }
         let width = self.token_width.bytes();
-        if self.chunk_size == 0 || self.chunk_size % width != 0 {
+        if self.chunk_size == 0 || !self.chunk_size.is_multiple_of(width) {
             return Err(VhcProtoError::Validation(format!(
                 "chunk_size {} must be a non-zero multiple of the token width {width} (no \
                  token may span a chunk boundary)",
@@ -303,7 +303,7 @@ impl CorpusManifest {
                     shard.byte_len, shard.token_count
                 )));
             }
-            if shard.token_count % u64::from(self.seq_len) != 0 {
+            if !shard.token_count.is_multiple_of(u64::from(self.seq_len)) {
                 return Err(VhcProtoError::Validation(format!(
                     "shard {i} token_count {} is not a multiple of seq_len {} (sequences must \
                      not span shard boundaries)",
@@ -578,7 +578,7 @@ mod tests {
                 prop_assert!(span_end <= byte_len);
                 // …chunk-aligned at the start, aligned-or-terminal at the end…
                 prop_assert_eq!(span_off % chunk_size, 0);
-                prop_assert!(span_end % chunk_size == 0 || span_end == byte_len);
+                prop_assert!(span_end.is_multiple_of(chunk_size) || span_end == byte_len);
                 // …and minimal: one chunk narrower on either side loses coverage.
                 prop_assert!(span_off + chunk_size > off);
                 prop_assert!(span_end < end + chunk_size);

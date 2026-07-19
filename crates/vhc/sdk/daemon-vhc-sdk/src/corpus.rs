@@ -589,11 +589,13 @@ pub fn derive_assignment(
     // (i + offset) % total — one range, or two when it wraps the corpus end.
     let start = (start_rot + offset) % total;
     let end = start + size;
-    let sequences = if end <= total {
-        vec![start..end]
+    let mut sequences = Vec::with_capacity(2);
+    if end <= total {
+        sequences.push(start..end);
     } else {
-        vec![start..total, 0..(end - total)]
-    };
+        sequences.push(start..total);
+        sequences.push(0..(end - total));
+    }
     Ok(Assignment { sequences })
 }
 
@@ -916,7 +918,7 @@ mod tests {
         let m = chunked_manifest();
         assert_eq!(m.total_sequences(), 16);
         for epoch in [0u64, 1, 7] {
-            let mut seen = vec![0u32; 16];
+            let mut seen = [0u32; 16];
             let mut first: Option<Assignment> = None;
             for peer in 0..3u32 {
                 let p = AssignmentParams {

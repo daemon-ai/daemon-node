@@ -63,7 +63,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     anyhow::ensure!(args.shard_tokens > 0, "--shard-tokens must be > 0");
     let width = args.token_width.bytes();
     anyhow::ensure!(
-        args.chunk_size > 0 && args.chunk_size % width == 0,
+        args.chunk_size > 0 && args.chunk_size.is_multiple_of(width),
         "--chunk-size must be a non-zero multiple of the token width ({width})"
     );
     let seq_len = u64::from(args.seq_len);
