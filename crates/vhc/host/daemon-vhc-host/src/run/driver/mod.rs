@@ -73,12 +73,16 @@ use crate::run::streams::StreamTable;
 use crate::runtime::{EngineConfig, Worker};
 use crate::trap::{Trap, TrapCode};
 
+mod chunks;
 mod config;
+mod migration;
 
+pub(crate) use chunks::{decode_chunk_descriptor, verify_covering_span};
 pub use config::{
     DeliverVerdict, MigrationInput, OpOutcome, RunConfig, RunEnd, RunError, RunIdentity,
     SnapshotCapture, SpooledFrame,
 };
+pub(crate) use migration::{build_migration_descriptor, decode_manifest_sections};
 
 // -- the pump (shared between the guest thread and the embedder) ----------------------------------
 
@@ -2804,90 +2808,6 @@ fn immediate_fetch_refusal(
     Ok(op)
 }
 
-/// Decode the `register_chunks` descriptor — canonical CBOR
-/// `[chunk_size, token_count, byte_len, [c_0, …]]` (each `c_i` a 32-byte chunk blake3) — into a
-/// well-formed [`daemon_vhc_proto::ChunkMap`]. Malformed shape/geometry is described (the
-/// import traps it typed — a bad descriptor is a module authoring fault, not a store fault).
-pub(crate) fn decode_chunk_descriptor(desc: &[u8]) -> Result<daemon_vhc_proto::ChunkMap, String> {
-    let v: ciborium::value::Value =
-        ciborium::de::from_reader(desc).map_err(|e| format!("descriptor is not CBOR: {e}"))?;
-    let ciborium::value::Value::Array(parts) = v else {
-        return Err("descriptor is not a CBOR array".into());
-    };
-    let uint = |i: usize, name: &str| -> Result<u64, String> {
-        parts
-            .get(i)
-            .and_then(ciborium::value::Value::as_integer)
-            .and_then(|n| u64::try_from(i128::from(n)).ok())
-            .ok_or_else(|| format!("descriptor `{name}` is not a uint"))
-    };
-    let chunk_size = uint(0, "chunk_size")?;
-    let token_count = uint(1, "token_count")?;
-    let byte_len = uint(2, "byte_len")?;
-    let Some(ciborium::value::Value::Array(hashes)) = parts.get(3) else {
-        return Err("descriptor chunk-hash list is not an array".into());
-    };
-    let mut chunk_hashes = Vec::with_capacity(hashes.len());
-    for (i, h) in hashes.iter().enumerate() {
-        let ciborium::value::Value::Bytes(b) = h else {
-            return Err(format!("chunk hash {i} is not a byte string"));
-        };
-        let arr: [u8; 32] = b
-            .as_slice()
-            .try_into()
-            .map_err(|_| format!("chunk hash {i} is not 32 bytes"))?;
-        chunk_hashes.push(daemon_vhc_proto::Hash(arr));
-    }
-    let map = daemon_vhc_proto::ChunkMap {
-        chunk_size,
-        token_count,
-        byte_len,
-        chunk_hashes,
-    };
-    if !map.is_well_formed() {
-        return Err(format!(
-            "degenerate chunk geometry (chunk_size {chunk_size}, byte_len {byte_len}, {} \
-             chunk hashes)",
-            map.chunk_hashes.len()
-        ));
-    }
-    Ok(map)
-}
-
-/// Verify a chunk-aligned covering span against the registered chunk map: split `bytes` at
-/// `chunk_size`, and every chunk's blake3 must equal the registered hash at its absolute index
-/// (`span_off / chunk_size + i`). Returns the verified bytes, or the first mismatch described.
-fn verify_covering_span(
-    map: &daemon_vhc_proto::ChunkMap,
-    span_off: u64,
-    bytes: Vec<u8>,
-) -> Result<Vec<u8>, String> {
-    let base = span_off / map.chunk_size;
-    let mut cursor = 0usize;
-    let mut index = base;
-    while cursor < bytes.len() {
-        let expected_len = map.chunk_len(index) as usize;
-        let Some(expected) = map.chunk_hashes.get(index as usize) else {
-            return Err(format!("span reaches past the chunk list (chunk {index})"));
-        };
-        let end = cursor + expected_len;
-        if end > bytes.len() {
-            return Err(format!(
-                "span truncates chunk {index} ({} of {expected_len} bytes)",
-                bytes.len() - cursor
-            ));
-        }
-        if blake3::hash(&bytes[cursor..end]).as_bytes() != &expected.0 {
-            return Err(format!(
-                "chunk {index} does not hash to the registered chunk hash"
-            ));
-        }
-        cursor = end;
-        index += 1;
-    }
-    Ok(bytes)
-}
-
 /// Move due timers into the queue as `Timer` events, in `(fire_at, timer_id)` order (§6.3).
 fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> {
     if !st.timers.iter().any(|t| t.fire_at <= now) {
@@ -3421,96 +3341,6 @@ fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
         TrapCode::BadModule
     };
     Trap::bare(code, msg)
-}
-
-/// Build the §10.2 migration-descriptor bytes: the old module's accepted manifest **verbatim**
-/// (decoded and re-embedded as a CBOR value — the bytes were journaled verbatim as tag 10; the
-/// descriptor is a fresh encoding whose `manifest` field decodes to the identical value) plus the
-/// restore bindings in manifest order. Built at the CBOR-value level for the same dependency-wall
-/// reason as [`decode_manifest_sections`].
-pub(crate) fn build_migration_descriptor(
-    manifest: &[u8],
-    bindings: &[(String, u64)],
-) -> Result<Vec<u8>, String> {
-    use ciborium::value::Value;
-    let manifest_value: Value = ciborium::de::from_reader(manifest).map_err(|e| e.to_string())?;
-    let sections = bindings
-        .iter()
-        .map(|(name, id)| {
-            Value::Map(vec![
-                (Value::Text("name".into()), Value::Text(name.clone())),
-                (
-                    Value::Text("staging_id".into()),
-                    Value::Integer((*id).into()),
-                ),
-            ])
-        })
-        .collect::<Vec<_>>();
-    let descriptor = Value::Map(vec![
-        (Value::Text("manifest".into()), manifest_value),
-        (Value::Text("sections".into()), Value::Array(sections)),
-    ]);
-    let mut out = Vec::new();
-    ciborium::into_writer(&descriptor, &mut out).map_err(|e| e.to_string())?;
-    Ok(out)
-}
-
-/// One decoded `state-section-decl` (ABI §10.2) — the fields the HOST verifies (name for the
-/// descriptor binding, hash + size for the staged-consistency check). Decoded at the CBOR-value
-/// level: the host never links the SDK's typed manifest, and the bytes stay verbatim.
-struct SectionDeclWire {
-    name: String,
-    hash: [u8; 32],
-    size: u64,
-}
-
-/// Decode the §10.2 `state-manifest`'s `sections` array from its verbatim CBOR bytes.
-fn decode_manifest_sections(manifest: &[u8]) -> Result<Vec<SectionDeclWire>, String> {
-    use ciborium::value::Value;
-    let v: Value = ciborium::de::from_reader(manifest).map_err(|e| e.to_string())?;
-    let Value::Map(entries) = v else {
-        return Err("state-manifest is not a map".into());
-    };
-    let sections = entries
-        .iter()
-        .find_map(|(k, val)| match k {
-            Value::Text(t) if t == "sections" => Some(val),
-            _ => None,
-        })
-        .ok_or("state-manifest has no `sections`")?;
-    let Value::Array(items) = sections else {
-        return Err("`sections` is not an array".into());
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        let Value::Map(fields) = item else {
-            return Err("a section decl is not a map".into());
-        };
-        let field = |name: &str| {
-            fields.iter().find_map(|(k, val)| match k {
-                Value::Text(t) if t == name => Some(val),
-                _ => None,
-            })
-        };
-        let name = match field("name") {
-            Some(Value::Text(t)) => t.clone(),
-            _ => return Err("section decl missing `name`".into()),
-        };
-        let hash: [u8; 32] = match field("hash") {
-            Some(Value::Bytes(b)) => b
-                .as_slice()
-                .try_into()
-                .map_err(|_| "section `hash` is not 32 bytes".to_string())?,
-            _ => return Err("section decl missing `hash`".into()),
-        };
-        let size = match field("size") {
-            Some(Value::Integer(i)) => u64::try_from(i128::from(*i))
-                .map_err(|_| "section `size` out of range".to_string())?,
-            _ => return Err("section decl missing `size`".into()),
-        };
-        out.push(SectionDeclWire { name, hash, size });
-    }
-    Ok(out)
 }
 
 fn journal_terminal_trap(shared: &Arc<PumpShared>, trap: &Trap) -> Result<(), SinkError> {
