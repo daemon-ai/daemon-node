@@ -27,7 +27,7 @@ use rusqlite_migration::{Migrations, M};
 pub const EVENT_WINDOW: usize = 256;
 
 /// The durable desired-state flag for a run — the OWNER-INTENT axis of the two-axis run-instance
-/// lifecycle (spec §6.1 of the production-wiring contract). Intent alone decides whether the node
+/// lifecycle (architecture §6.4). Intent alone decides whether the node
 /// still wants in; the OBSERVED [`RunState`] axis decides whether the last instance may resume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DesiredState {
@@ -285,8 +285,8 @@ INSERT OR IGNORE INTO vhc_counters (name, value) VALUES ('device_profile_rev', 0
 INSERT OR IGNORE INTO vhc_counters (name, value) VALUES ('owner_policy_rev', 0);
 ";
 
-/// M5: the durable **run-instance state machine** columns (the two-axis lifecycle; spec §6.1 of
-/// the production-wiring contract). `run_state` is the observed per-incarnation lifecycle
+/// M5: the durable **run-instance state machine** columns (the two-axis lifecycle; architecture
+/// §6.4; ABI §12.10). `run_state` is the observed per-incarnation lifecycle
 /// (`running | completed | failed_retryable | failed_terminal | left`); `pending_run_state` is the
 /// crash-window release marker (teardown observed, terminal commit in flight — startup
 /// reconciliation finishes it); the retry columns carry the bounded reconvergence budget; and
