@@ -54,6 +54,20 @@ pub struct LiveAttachInputs<'a> {
 pub async fn build_role_providers(inputs: LiveAttachInputs<'_>) -> Result<RoleProviders, String> {
     let creds = inputs.credentials;
 
+    // Resolve the auth: the wire body carries no secret ([CI-9]); when a `secret_ref` names a
+    // keystore credentials record, its `ws_auth` is the live token material (re-read here so an
+    // expiry-driven node refresh reaches a fresh dial). Absent record ⇒ the body's own (public)
+    // auth stands.
+    let auth = match &creds.secret_ref {
+        Some(reference) => inputs
+            .keystore
+            .run_credentials_by_ref(inputs.run_label, reference)
+            .map_err(|e| format!("resolve credentials record `{reference}`: {e}"))?
+            .map(|record| record.ws_auth)
+            .unwrap_or_else(|| creds.ws_auth.clone()),
+        None => creds.ws_auth.clone(),
+    };
+
     // -- control plane: WS (mandatory), composed with iroh gossip when selected ---------------
     let ws_base = match &creds.ws_base {
         Some(base) if !base.is_empty() => base.clone(),
@@ -69,7 +83,7 @@ pub async fn build_role_providers(inputs: LiveAttachInputs<'_>) -> Result<RolePr
     let ws = WsControlPlane::connect(WsConfig {
         base_url: ws_base.clone(),
         run_id: inputs.run_label.to_string(),
-        auth: ws_auth(&creds.ws_auth),
+        auth: ws_auth(&auth),
         reconnect: ReconnectConfig::default(),
     })
     .await
@@ -105,7 +119,7 @@ pub async fn build_role_providers(inputs: LiveAttachInputs<'_>) -> Result<RolePr
             let presign_egress =
                 daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
                     .map_err(|e| format!("presign egress client: {e}"))?;
-            let presign = presign_client(presign_egress, base, &creds.ws_auth);
+            let presign = presign_client(presign_egress, base, &auth);
             Arc::new(R2Store::new(presign, egress, RunId::new(inputs.run_label)))
         }
         _ => {

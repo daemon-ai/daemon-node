@@ -174,6 +174,9 @@ impl VhcKeystore {
     /// crashed worker resumes its incarnation with the SAME key), freshly CSPRNG-generated and
     /// persisted otherwise. Persisted only for the life of the run ([`VhcKeystore::remove_run`]).
     ///
+    /// The CREATING accessor — the node's provisioning path. Worker joins resolve strictly via
+    /// [`VhcKeystore::existing_run_signing_key`]: a worker never mints identity.
+    ///
     /// # Errors
     /// Filesystem, entropy, or record-decode failure.
     pub fn run_signing_key(
@@ -187,6 +190,132 @@ impl VhcKeystore {
         let path = dir.join(format!("{role}-{incarnation}.key"));
         let seed = self.load_or_create(&path, "vhc-run-ed25519")?;
         Ok(seed.signing_key())
+    }
+
+    /// The per-run signing key for `(run label, role, incarnation)` — READ-ONLY: `Ok(None)` when
+    /// the node has not provisioned it (the worker's typed "no identity was provisioned" signal;
+    /// the worker never mints).
+    ///
+    /// # Errors
+    /// Filesystem or record-decode failure (absence is `Ok(None)`).
+    pub fn existing_run_signing_key(
+        &self,
+        run_label: &str,
+        role: &str,
+        incarnation: u64,
+    ) -> Result<Option<SigningKey>, KeystoreError> {
+        let path = self
+            .run_dir(run_label)
+            .join(format!("{role}-{incarnation}.key"));
+        match read_file(&path) {
+            Ok(bytes) => {
+                let record: SecretRecord =
+                    from_canonical_slice(&bytes).map_err(|e| KeystoreError::BadRecord {
+                        path: path.clone(),
+                        detail: format!("record decode: {e}"),
+                    })?;
+                if record.v != RECORD_VERSION || record.kind != "vhc-run-ed25519" {
+                    return Err(KeystoreError::BadRecord {
+                        path,
+                        detail: format!(
+                            "record v{} kind `{}` (expected v{RECORD_VERSION} `vhc-run-ed25519`)",
+                            record.v, record.kind
+                        ),
+                    });
+                }
+                Ok(Some(SecretSeed::from_bytes(record.seed).signing_key()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(KeystoreError::Io { path, source: e }),
+        }
+    }
+
+    /// Persist the node-authored per-run CREDENTIALS RECORD (WS/presign auth material) beside
+    /// the run's keys — same atomic-0600 discipline, same terminal cleanup
+    /// ([`VhcKeystore::remove_run`]). A refresh atomically REWRITES the record (rename), so a
+    /// worker re-resolving mid-run reads either the old or the new material, never a torn one.
+    /// Returns the record's keystore REFERENCE (the run-relative path a `secret_ref` carries).
+    ///
+    /// # Errors
+    /// Filesystem or encode failure.
+    pub fn store_run_credentials(
+        &self,
+        run_label: &str,
+        role: &str,
+        incarnation: u64,
+        record: &crate::protocol::CredentialsRecord,
+    ) -> Result<String, KeystoreError> {
+        let dir = self.run_dir(run_label);
+        create_owner_only_dir(&dir)?;
+        let name = format!("{role}-{incarnation}.creds");
+        let bytes = to_canonical_vec(record).map_err(|e| KeystoreError::Codec(e.to_string()))?;
+        atomic_write(&dir.join(&name), &bytes)?;
+        Ok(name)
+    }
+
+    /// The node-authored credentials record for `(run label, role, incarnation)`, if provisioned.
+    ///
+    /// # Errors
+    /// Filesystem or decode failure (an absent record is `Ok(None)`).
+    pub fn run_credentials(
+        &self,
+        run_label: &str,
+        role: &str,
+        incarnation: u64,
+    ) -> Result<Option<crate::protocol::CredentialsRecord>, KeystoreError> {
+        self.credentials_at(
+            &self
+                .run_dir(run_label)
+                .join(format!("{role}-{incarnation}.creds")),
+        )
+    }
+
+    /// The credentials record named by a `SessionCredentials.secret_ref` (the run-relative
+    /// record name the worker holds): resolved against the run this worker was handed. The worker
+    /// composes the path from its own `(run label, secret_ref)` — the reference is a name inside
+    /// the run's own key directory, never an arbitrary path.
+    ///
+    /// # Errors
+    /// Filesystem or decode failure (an absent record is `Ok(None)`).
+    pub fn run_credentials_by_ref(
+        &self,
+        run_label: &str,
+        secret_ref: &str,
+    ) -> Result<Option<crate::protocol::CredentialsRecord>, KeystoreError> {
+        // The reference is a bare file name (`<role>-<incarnation>.creds`) — reject any path
+        // component so it can only ever name a record inside this run's own directory.
+        if secret_ref.contains('/') || secret_ref.contains("..") {
+            return Err(KeystoreError::BadRecord {
+                path: PathBuf::from(secret_ref),
+                detail: "credentials reference must be a bare record name".into(),
+            });
+        }
+        self.credentials_at(&self.run_dir(run_label).join(secret_ref))
+    }
+
+    /// Decode a credentials record at `path` (`Ok(None)` on absence).
+    fn credentials_at(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::protocol::CredentialsRecord>, KeystoreError> {
+        let bytes = match read_file(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(KeystoreError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })
+            }
+        };
+        let record =
+            from_canonical_slice::<crate::protocol::CredentialsRecord>(&bytes).map_err(|e| {
+                KeystoreError::BadRecord {
+                    path: path.to_path_buf(),
+                    detail: format!("credentials decode: {e}"),
+                }
+            })?;
+        Ok(Some(record))
     }
 
     /// Persist a run key's certificate beside its key (public material, cached for distribution
