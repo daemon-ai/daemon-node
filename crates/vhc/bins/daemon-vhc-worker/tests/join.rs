@@ -401,7 +401,7 @@ async fn worker_joins_and_runs_rounds_under_the_coordinator() {
 
     // Assess through the REAL funnel: the genesis worker role's device_min feeds stage 3, its
     // grant list stage 4.0; the claim is the trainer's SDK-derived declaration.
-    let elig = sup.assess(wire).await.expect("assess");
+    let elig = sup.assess(wire, None).await.expect("assess");
     assert!(
         elig.eligible,
         "the compute@2 trainer admits under the t2 lane: {:?}",
@@ -410,7 +410,7 @@ async fn worker_joins_and_runs_rounds_under_the_coordinator() {
 
     // Join: the worker's v2 session — pump attach + the run's REAL coordinator in-process.
     let mut events = sup
-        .join_streaming(RUN_ID, "local://coordinator", vec![], policy())
+        .join_streaming(RUN_ID, "local://coordinator", vec![], policy(), None)
         .await
         .expect("join");
 

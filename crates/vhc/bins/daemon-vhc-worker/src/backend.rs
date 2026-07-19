@@ -17,11 +17,6 @@ use daemon_vhc_session::protocol::{Eligibility, Hardware, WorkerCapabilities};
 /// does not spuriously reject on an unprobed number (`u64::MAX / MiB`).
 const UNKNOWN_BUDGET_MB: u64 = u64::MAX / (1 << 20);
 
-/// The role-instance incarnation this worker assesses/joins as. The node-durable incarnation
-/// counter takes over when the node carries the admitted identity into `JoinRun`; until then a
-/// single in-process incarnation per join.
-pub(crate) const RUN_INSTANCE: u64 = 1;
-
 /// Author the complete ABI §2.6 grants document for the run's worker role (§9.4 steps 8/11 hash
 /// pinning — assess and join derive byte-identical copies). Admission authors the truth: the
 /// document enumerates the complete capability surface the module actually links + the genesis
@@ -105,7 +100,10 @@ pub(crate) const ENVELOPE_SCHEMA_RETIRED: &str = "EnvelopeSchemaRetired";
 /// [`ENVELOPE_SCHEMA_RETIRED`] slug at assess (a v1 envelope cannot configure a wasm
 /// coordinator — no coordinator role, no `Authority`/identities section). Authors present a
 /// genesis envelope v2 instead.
-pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, String> {
+pub(crate) async fn resolve_run(
+    envelope_bytes: &[u8],
+    role: Option<&str>,
+) -> Result<ResolvedRun, String> {
     let wire = from_canonical_slice::<SignedEnvelope>(envelope_bytes).map_err(|e| {
         format!(
             "{UNSIGNED_ENVELOPE_RETIRED}: AssessRun bytes are not a SignedEnvelope wire form \
@@ -115,7 +113,7 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
     })?;
     // Route on the schema sniff: schema 2 (genesis) resolves; anything else refuses typed.
     match daemon_vhc_proto::peek_schema(&wire.bytes) {
-        Some(daemon_vhc_proto::GENESIS_SCHEMA_MAJOR) => resolve_genesis_run(wire).await,
+        Some(daemon_vhc_proto::GENESIS_SCHEMA_MAJOR) => resolve_genesis_run(wire, role).await,
         Some(major) => Err(format!(
             "{ENVELOPE_SCHEMA_RETIRED}: envelope schema major {major} is retired — it cannot \
              configure a coordinator (no coordinator role entry to pin a module hash, no \
@@ -133,21 +131,37 @@ pub(crate) async fn resolve_run(envelope_bytes: &[u8]) -> Result<ResolvedRun, St
 /// worker + coordinator roles from the role set, decode the worker role's opaque config, and
 /// resolve the worker role's module by its pinned artifact hash.
 ///
-/// Role selection is the single-worker interim (decisions D6): the first non-coordinator role is
-/// the joining worker role, exactly the well-formedness split `GenesisEnvelope::validate`
-/// guarantees exists; per-node role *selection* policy arrives with Phase-E multi-instance.
-async fn resolve_genesis_run(wire: SignedEnvelope) -> Result<ResolvedRun, String> {
+/// Role selection is NODE-DIRECTED: `directed_role` names the envelope role label to run (the
+/// seat-claim path directs the coordinator role); a label absent from the genesis role set is a
+/// typed refusal. Undirected (`None`), the default is the first role whose LANE is not
+/// `coordinator` (the single-trainer interim — selection by declared lane, never by label
+/// heuristics).
+async fn resolve_genesis_run(
+    wire: SignedEnvelope,
+    directed_role: Option<&str>,
+) -> Result<ResolvedRun, String> {
     let frozen = daemon_vhc_proto::FrozenGenesis::open(wire.bytes, wire.signature, wire.signer)
         .map_err(|e| format!("verify genesis envelope: {e}"))?;
     let env = frozen
         .decode()
         .map_err(|e| format!("decode genesis: {e}"))?;
-    let worker_role = env
-        .roles
-        .keys()
-        .find(|r| !r.contains("coordinator"))
-        .cloned()
-        .ok_or("genesis envelope has no worker role (validate should have refused)")?;
+    let worker_role = match directed_role {
+        Some(label) => {
+            if !env.roles.contains_key(label) {
+                return Err(format!(
+                    "directed role `{label}` is absent from the genesis role set (roles: {:?})",
+                    env.roles.keys().collect::<Vec<_>>()
+                ));
+            }
+            label.to_string()
+        }
+        None => env
+            .roles
+            .iter()
+            .find(|(_, r)| r.lane != "coordinator")
+            .map(|(name, _)| name.clone())
+            .ok_or("genesis envelope has no non-coordinator role (validate should have refused)")?,
+    };
     let role = &env.roles[&worker_role];
     let config = frozen
         .role_config_bytes(&worker_role)
@@ -936,15 +950,19 @@ pub(crate) struct RoleBinding {
 
 /// Author the role-session binding for a resolved genesis run: re-run the admission funnel over
 /// the exact artifacts (the §9.4 join-time re-check — same lane, same grants derivation as
-/// assess), resolve the certified per-run identity against the node-provided keystore (CSPRNG
-/// material, certified by the base identity, persisted beside the key), and assemble the run
-/// config with the admitted quotas applied.
+/// assess), resolve the certified per-run identity READ-ONLY against the node-provisioned
+/// keystore, and assemble the run config with the admitted quotas applied.
+///
+/// Identity custody: the NODE mints the per-run key and issues its certificate at join
+/// authorship (the base identity never leaves the node process); this worker resolves both by
+/// reference and refuses typed when either is absent or the certificate does not bind the exact
+/// execution identity about to run. The worker NEVER mints and NEVER touches `base.key`.
 pub(crate) fn role_binding(
     resolved: &ResolvedRun,
     genesis: &GenesisRun,
     run_id: &str,
+    incarnation: u64,
 ) -> Result<RoleBinding, String> {
-    use daemon_vhc_session::identity::certify_existing_key;
     use daemon_vhc_session::keystore::VhcKeystore;
 
     // Admission re-check on the CPU-cheap path (assessment parity: same engine shape).
@@ -989,38 +1007,60 @@ pub(crate) fn role_binding(
     )
     .map_err(|refusal| format!("join re-admission: {refusal}"))?;
 
-    // Certified per-run identity from the node-provided keystore (a path reference — key
-    // material never rides the command wire). CSPRNG per-run key, certified by the base
-    // identity to the full execution identity, certificate persisted beside the key.
+    // Certified per-run identity, READ-ONLY from the node-provisioned keystore (a path
+    // reference — key material never rides the command wire; the node minted the key and
+    // issued the certificate at join authorship). Absence is a typed refusal: a worker never
+    // mints identity, and base.key custody stays with the node.
     let keystore = VhcKeystore::from_env().map_err(|e| format!("identity store: {e}"))?;
-    let run_key = keystore
-        .run_signing_key(run_id, &genesis.worker_role, RUN_INSTANCE)
-        .map_err(|e| format!("run key: {e}"))?;
-    let base = keystore
-        .base_identity()
-        .map_err(|e| format!("base identity: {e}"))?;
     let genesis_hash = *genesis.frozen.run_id();
-    let certified = certify_existing_key(
-        &base,
-        daemon_vhc_proto::CertScope {
-            run_id: genesis_hash,
-            epoch: 0,
-            role: genesis.worker_role.clone(),
-            instance: RUN_INSTANCE,
-            module_hash: daemon_vhc_proto::Hash(module_hash),
-        },
-        daemon_vhc_proto::SigningKey::from_bytes(&run_key.to_bytes()),
-    )
-    .map_err(|e| format!("certify run key: {e}"))?;
-    keystore
-        .store_run_certificate(run_id, &genesis.worker_role, RUN_INSTANCE, &certified.cert)
-        .map_err(|e| format!("persist run certificate: {e}"))?;
+    let run_key = keystore
+        .existing_run_signing_key(run_id, &genesis.worker_role, incarnation)
+        .map_err(|e| format!("run key: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "no per-run identity was provisioned for `{run_id}` role `{}` incarnation \
+                 {incarnation} (the node mints keys and issues certificates at join authorship; \
+                 the worker never mints)",
+                genesis.worker_role
+            )
+        })?;
+    let cert = keystore
+        .run_certificate(run_id, &genesis.worker_role, incarnation)
+        .map_err(|e| format!("run certificate: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "no certificate was provisioned for `{run_id}` role `{}` incarnation {incarnation}",
+                genesis.worker_role
+            )
+        })?;
+    // The provisioned certificate must bind EXACTLY the execution identity about to run.
+    let expected_scope = daemon_vhc_proto::CertScope {
+        run_id: genesis_hash,
+        epoch: 0,
+        role: genesis.worker_role.clone(),
+        instance: incarnation,
+        module_hash: daemon_vhc_proto::Hash(module_hash),
+    };
+    if cert.body.scope != expected_scope {
+        return Err(format!(
+            "the provisioned certificate binds a different execution identity than this join \
+             (certificate scope {:?}; joining {:?}) — the node reassesses/reprovisions",
+            cert.body.scope, expected_scope
+        ));
+    }
+    if cert.body.run_key != daemon_vhc_proto::peer_id(&run_key) {
+        return Err(
+            "the provisioned certificate does not certify the provisioned per-run key".into(),
+        );
+    }
+    cert.verify_chain()
+        .map_err(|e| format!("provisioned certificate chain: {e}"))?;
 
     let identity = daemon_vhc_host::run::RunIdentity {
         run_id: genesis_hash.0,
         epoch: 0,
         role: genesis.worker_role.clone(),
-        instance: RUN_INSTANCE,
+        instance: incarnation,
         module: module_hash,
     };
     let mut run = daemon_vhc_host::run::RunConfig::new(
@@ -1039,7 +1079,7 @@ pub(crate) fn role_binding(
         .to_vec();
     Ok(RoleBinding {
         run,
-        own_cert: certified.cert,
+        own_cert: cert,
         trusted_bases,
     })
 }

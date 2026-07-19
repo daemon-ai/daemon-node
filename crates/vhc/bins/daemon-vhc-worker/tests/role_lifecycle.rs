@@ -33,9 +33,11 @@ use daemon_vhc_proto::{
     blake3_hash, to_canonical_vec, GenesisEnvelope, SignedEnvelope, SigningKey,
 };
 use daemon_vhc_session::keystore::{VhcKeystore, IDENTITY_DIR_ENV};
+use daemon_vhc_session::protocol::AdmittedTuple;
 use daemon_vhc_session::protocol::{
     self, Command, Event, JoinPolicy, LeaveMode, PolicyMode, TerminalOutcome,
 };
+use daemon_vhc_session::provisioning::{provision_run_identity, ProvisionScope};
 
 fn guests_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -169,6 +171,32 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
     to_canonical_vec(&wire).expect("wire")
 }
 
+/// Play the node's authorship role for a direct-drive test: stamp the minted incarnation into
+/// the assessed tuple and PROVISION the per-run identity (mint key + issue certificate under the
+/// base identity) in the keystore the worker resolves read-only. Returns the delivery tuple.
+fn provision_and_stamp(
+    identity_dir: &std::path::Path,
+    run_label: &str,
+    mut tuple: AdmittedTuple,
+    incarnation: u64,
+) -> AdmittedTuple {
+    tuple.incarnation = incarnation;
+    let keystore = VhcKeystore::open(identity_dir).expect("open keystore");
+    provision_run_identity(
+        &keystore,
+        &ProvisionScope {
+            run_label,
+            genesis_hash: tuple.genesis_hash,
+            epoch: 0,
+            role: &tuple.role,
+            incarnation,
+            module_hash: tuple.module_hash,
+        },
+    )
+    .expect("provision run identity");
+    tuple
+}
+
 fn policy() -> JoinPolicy {
     JoinPolicy {
         mode: PolicyMode::Always,
@@ -273,6 +301,7 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
     // reports `running` — the command loop never blocks on the run.
     cut.send(&Command::AssessRun {
         envelope: genesis_wire("role-a"),
+        role: None,
     })
     .await;
     let elig = cut
@@ -282,12 +311,18 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
         })
         .await;
     assert!(elig.eligible, "publisher admits: {:?}", elig.reasons);
+    let tuple_a = provision_and_stamp(
+        identity.path(),
+        "role-a",
+        elig.admitted_tuple.clone().expect("assessed tuple"),
+        1,
+    );
     cut.send(&Command::JoinRun {
         run_id: "role-a".into(),
         coordinator: String::new(),
         credentials: Vec::new(),
         policy: policy(),
-        admitted_tuple: elig.admitted_tuple.clone(),
+        admitted_tuple: Some(tuple_a),
     })
     .await;
     cut.until(step, |ev| match ev {
@@ -312,6 +347,7 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
     // both live handles).
     cut.send(&Command::AssessRun {
         envelope: genesis_wire("role-b"),
+        role: None,
     })
     .await;
     let elig_b = cut
@@ -321,12 +357,18 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
         })
         .await;
     assert!(elig_b.eligible, "second role admits: {:?}", elig_b.reasons);
+    let tuple_b = provision_and_stamp(
+        identity.path(),
+        "role-b",
+        elig_b.admitted_tuple.clone().expect("assessed tuple"),
+        1,
+    );
     cut.send(&Command::JoinRun {
         run_id: "role-b".into(),
         coordinator: String::new(),
         credentials: Vec::new(),
         policy: policy(),
-        admitted_tuple: elig_b.admitted_tuple.clone(),
+        admitted_tuple: Some(tuple_b),
     })
     .await;
     cut.until(step, |ev| match ev {
@@ -401,4 +443,62 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
         })
         .await;
     assert_eq!(outcome_b, TerminalOutcome::Left { checkpoint: None });
+}
+
+/// A production join REFUSES typed when no per-run identity was provisioned for the delivered
+/// incarnation — the worker never mints (base-key custody stays with the node). The negative
+/// incarnation test is real now: the delivered tuple names an incarnation the keystore has no
+/// key for.
+#[tokio::test]
+async fn join_refuses_when_no_identity_was_provisioned() {
+    let identity = tempfile::tempdir().expect("identity tempdir");
+    VhcKeystore::open(identity.path()).expect("init keystore");
+    let run_dir = tempfile::tempdir().expect("run-state tempdir");
+    let mut cut = spawn_worker(identity.path(), run_dir.path()).await;
+    let step = Duration::from_secs(120);
+
+    cut.send(&Command::AssessRun {
+        envelope: genesis_wire("role-unprovisioned"),
+        role: None,
+    })
+    .await;
+    let elig = cut
+        .until(step, |ev| match ev {
+            Event::Assessed(e) => Some(e.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(elig.eligible);
+
+    // Deliver a tuple stamped with an incarnation the keystore has NO provisioned key for —
+    // NOTHING was provisioned. The join must refuse typed, never mint, never run.
+    let mut tuple = elig.admitted_tuple.clone().expect("assessed tuple");
+    tuple.incarnation = 99;
+    cut.send(&Command::JoinRun {
+        run_id: "role-unprovisioned".into(),
+        coordinator: String::new(),
+        credentials: Vec::new(),
+        policy: policy(),
+        admitted_tuple: Some(tuple),
+    })
+    .await;
+    // Read raw (the `until` helper treats a worker Error as a failure; here the Error IS the
+    // expected outcome).
+    let detail = loop {
+        match cut.next(step).await {
+            Event::Error { detail, .. } => break detail,
+            Event::RunPhase { run_id, phase, .. }
+                if run_id == "role-unprovisioned" && phase == "running" =>
+            {
+                panic!("an unprovisioned join must never run")
+            }
+            _ => {}
+        }
+    };
+    assert!(
+        detail.contains("no per-run identity was provisioned"),
+        "typed no-identity refusal, got: {detail}"
+    );
+
+    cut.send(&Command::Shutdown).await;
 }

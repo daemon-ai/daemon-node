@@ -283,6 +283,7 @@ async fn join_live(seat: &mut Seat, wire: &[u8], creds: &SessionCredentials, ste
     seat.cut
         .send(&Command::AssessRun {
             envelope: wire.to_vec(),
+            role: None,
         })
         .await;
     let elig = seat
@@ -293,13 +294,32 @@ async fn join_live(seat: &mut Seat, wire: &[u8], creds: &SessionCredentials, ste
         })
         .await;
     assert!(elig.eligible, "publisher admits: {:?}", elig.reasons);
+    // Play the node: mint incarnation 1's identity in this seat's keystore and stamp it into the
+    // delivered tuple (the worker resolves the key + certificate read-only).
+    let mut tuple = elig.admitted_tuple.clone().expect("assessed tuple");
+    tuple.incarnation = 1;
+    {
+        let keystore = VhcKeystore::open(seat.identity.path()).expect("open keystore");
+        daemon_vhc_session::provisioning::provision_run_identity(
+            &keystore,
+            &daemon_vhc_session::provisioning::ProvisionScope {
+                run_label: RUN_LABEL,
+                genesis_hash: tuple.genesis_hash,
+                epoch: 0,
+                role: &tuple.role,
+                incarnation: 1,
+                module_hash: tuple.module_hash,
+            },
+        )
+        .expect("provision run identity");
+    }
     seat.cut
         .send(&Command::JoinRun {
             run_id: RUN_LABEL.into(),
             coordinator: String::new(), // the credentials carry the ws_base
             credentials: creds.to_bytes().expect("encode credentials"),
             policy: policy(),
-            admitted_tuple: elig.admitted_tuple.clone(),
+            admitted_tuple: Some(tuple),
         })
         .await;
     seat.cut
@@ -380,6 +400,8 @@ async fn two_workers_exchange_certified_frames_over_the_live_ws_plane() {
         iroh: None,
         presign_base: None, // the filesystem content store under the run-state root
         peer_certs: Vec::new(), // trust arrives ON the plane, as distribution records
+        secret_ref: None,   // unauthenticated local relay lane
+        expires_at_ms: 0,
     };
 
     // B first (subscribed before A attaches), then A: A's certificate announcement + frames

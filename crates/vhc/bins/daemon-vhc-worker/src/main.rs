@@ -86,6 +86,7 @@ async fn join_live(
     run_id: &str,
     coordinator: &str,
     creds: &daemon_vhc_session::protocol::SessionCredentials,
+    incarnation: u64,
 ) -> Result<RoleSessionSpec, String> {
     use daemon_vhc_session::providers::{build_role_providers, LiveAttachInputs};
 
@@ -97,7 +98,7 @@ async fn join_live(
              resolved run (credentials authored for a different run)"
         ));
     }
-    let binding = backend::role_binding(resolved, genesis, run_id)?;
+    let binding = backend::role_binding(resolved, genesis, run_id, incarnation)?;
     let journal = journal_sink(run_id, &binding.run.identity)?;
     let keystore = daemon_vhc_session::keystore::VhcKeystore::from_env()
         .map_err(|e| format!("identity store: {e}"))?;
@@ -246,37 +247,40 @@ async fn main() {
         };
         match cmd {
             Command::Probe => send(&writer, &Event::Probed(backend::hardware())).await,
-            Command::AssessRun { envelope } => match backend::resolve_run(&envelope).await {
-                Ok(resolved) => {
-                    // The admitted tuple's non-artifact identity: the run's genesis hash + the
-                    // worker role this node joins as. The self-driven seat runs one incarnation
-                    // per join (the node-durable incarnation counter takes over with the
-                    // node-side identity delivery).
-                    let tuple_identity =
-                        resolved.genesis.as_ref().map(|g| backend::TupleIdentity {
-                            genesis_hash: g.frozen.run_id().0,
-                            role: &g.worker_role,
-                            incarnation: backend::RUN_INSTANCE,
-                        });
-                    match backend::assess(
-                        &resolved.module,
-                        &resolved.config,
-                        resolved.module_blake3.as_ref(),
-                        resolved.device_min.as_ref(),
-                        resolved.envelope_grants().as_ref(),
-                        tuple_identity,
-                    ) {
-                        Ok((elig, is_v2)) => {
-                            run_is_v2 = is_v2;
-                            assessed_tuple = elig.admitted_tuple.clone();
-                            run = Some(resolved);
-                            send(&writer, &Event::Assessed(elig)).await;
+            Command::AssessRun { envelope, role } => {
+                match backend::resolve_run(&envelope, role.as_deref()).await {
+                    Ok(resolved) => {
+                        // The admitted tuple's non-artifact identity: the run's genesis hash + the
+                        // resolved (possibly node-directed) role. The incarnation is stamped 0 =
+                        // UNASSIGNED at assess: the node mints the durable incarnation and stamps
+                        // it into the tuple it delivers back with JoinRun — a join whose tuple
+                        // still carries 0 refuses typed (no incarnation was ever assigned).
+                        let tuple_identity =
+                            resolved.genesis.as_ref().map(|g| backend::TupleIdentity {
+                                genesis_hash: g.frozen.run_id().0,
+                                role: &g.worker_role,
+                                incarnation: 0,
+                            });
+                        match backend::assess(
+                            &resolved.module,
+                            &resolved.config,
+                            resolved.module_blake3.as_ref(),
+                            resolved.device_min.as_ref(),
+                            resolved.envelope_grants().as_ref(),
+                            tuple_identity,
+                        ) {
+                            Ok((elig, is_v2)) => {
+                                run_is_v2 = is_v2;
+                                assessed_tuple = elig.admitted_tuple.clone();
+                                run = Some(resolved);
+                                send(&writer, &Event::Assessed(elig)).await;
+                            }
+                            Err(detail) => send(&writer, &worker_error(&detail)).await,
                         }
-                        Err(detail) => send(&writer, &worker_error(&detail)).await,
                     }
+                    Err(detail) => send(&writer, &worker_error(&detail)).await,
                 }
-                Err(detail) => send(&writer, &worker_error(&detail)).await,
-            },
+            }
             Command::JoinRun {
                 run_id,
                 coordinator,
@@ -323,17 +327,42 @@ async fn main() {
                     .await;
                     continue;
                 };
-                // Admitted-tuple integrity (architecture §6.3): rederive the tuple from the
-                // artifacts this join is about to run and compare field-by-field against the
-                // tuple assessment produced (the node-delivered one when present, else the
-                // worker's own cached assessment). Any artifact mismatch aborts the join with a
-                // typed event — the node reassesses; a stale/swapped artifact is never run.
-                let expected = admitted_tuple.or_else(|| assessed_tuple.clone());
-                if let Some(expected) = &expected {
+                // Admitted-tuple integrity (architecture §6.3): the node-delivered tuple is
+                // MANDATORY on the join path — it carries the node-minted, never-reused
+                // incarnation this instance runs as (a tuple still stamped 0 means no
+                // incarnation was ever assigned: typed refusal, never a guessed identity).
+                // Rederive from the artifacts this join is about to run and compare
+                // field-by-field; any artifact mismatch aborts the join with a typed event —
+                // the node reassesses; a stale/swapped artifact is never run.
+                let Some(expected) = admitted_tuple.or_else(|| assessed_tuple.clone()) else {
+                    send(
+                        &writer,
+                        &worker_error(&format!(
+                            "JoinRun for run `{run_id}`: no admitted tuple (assess first; the \
+                             node delivers the assessed tuple with the join)"
+                        )),
+                    )
+                    .await;
+                    continue;
+                };
+                if expected.role != genesis.worker_role {
+                    send(
+                        &writer,
+                        &worker_error(&format!(
+                            "JoinRun for run `{run_id}`: the admitted tuple's role \
+                             `{}` is not the resolved role `{}` (re-assess with the intended \
+                             role directive)",
+                            expected.role, genesis.worker_role
+                        )),
+                    )
+                    .await;
+                    continue;
+                }
+                {
                     let tuple_identity = backend::TupleIdentity {
                         genesis_hash: genesis.frozen.run_id().0,
-                        role: &genesis.worker_role,
-                        incarnation: backend::RUN_INSTANCE,
+                        role: &expected.role,
+                        incarnation: expected.incarnation,
                     };
                     match backend::assess(
                         &resolved.module,
@@ -351,7 +380,7 @@ async fn main() {
                                         &Event::AdmittedTupleMismatch {
                                             run_id: run_id.clone(),
                                             field: field.to_string(),
-                                            generation: backend::RUN_INSTANCE,
+                                            generation: expected.incarnation,
                                         },
                                     )
                                     .await;
@@ -395,7 +424,16 @@ async fn main() {
                 if let Ok(creds) =
                     daemon_vhc_session::protocol::SessionCredentials::from_bytes(&credentials)
                 {
-                    match join_live(resolved, genesis, &run_id, &coordinator, &creds).await {
+                    match join_live(
+                        resolved,
+                        genesis,
+                        &run_id,
+                        &coordinator,
+                        &creds,
+                        expected.incarnation,
+                    )
+                    .await
+                    {
                         Ok(spec) => {
                             let handle = spawn_role(run_id.clone(), spec, role_events.clone());
                             roles.insert(run_id, handle);
@@ -407,7 +445,7 @@ async fn main() {
                 #[cfg(not(feature = "vhc-net"))]
                 let _ = (&coordinator, &credentials);
                 if in_process_plane_selected() {
-                    match backend::role_binding(resolved, genesis, &run_id) {
+                    match backend::role_binding(resolved, genesis, &run_id, expected.incarnation) {
                         Ok(binding) => {
                             let journal = match journal_sink(&run_id, &binding.run.identity) {
                                 Ok(sink) => sink,
