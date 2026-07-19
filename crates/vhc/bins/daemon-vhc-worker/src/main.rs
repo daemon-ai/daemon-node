@@ -74,6 +74,63 @@ fn in_process_providers() -> RoleProviders {
     }
 }
 
+/// Author the live role-session spec for a join whose credentials selected the production
+/// planes: re-run the admission binding, open the durable journal home, and construct the
+/// transport providers from the plane selection (WS connect fails FAST on an unreachable
+/// endpoint — one dial, typed error; reconnect policy applies only to an established plane, so
+/// the command loop never hangs here).
+#[cfg(feature = "vhc-net")]
+async fn join_live(
+    resolved: &backend::ResolvedRun,
+    genesis: &backend::GenesisRun,
+    run_id: &str,
+    coordinator: &str,
+    creds: &daemon_vhc_session::protocol::SessionCredentials,
+) -> Result<RoleSessionSpec, String> {
+    use daemon_vhc_session::providers::{build_role_providers, LiveAttachInputs};
+
+    // Credentials bind to ONE run identity: a body authored for a different genesis refuses.
+    let genesis_hash = genesis.frozen.run_id().0;
+    if creds.genesis_hash != genesis_hash {
+        return Err(format!(
+            "JoinRun for run `{run_id}`: the credentials' genesis hash does not match the \
+             resolved run (credentials authored for a different run)"
+        ));
+    }
+    let binding = backend::role_binding(resolved, genesis, run_id)?;
+    let journal = journal_sink(run_id, &binding.run.identity)?;
+    let keystore = daemon_vhc_session::keystore::VhcKeystore::from_env()
+        .map_err(|e| format!("identity store: {e}"))?;
+    let announcement = daemon_vhc_proto::DistributionRecord::Cert(binding.own_cert.clone())
+        .to_bytes()
+        .map_err(|e| format!("certificate announcement: {e}"))?;
+    let providers = build_role_providers(LiveAttachInputs {
+        credentials: creds,
+        coordinator,
+        run_label: run_id,
+        own_cert_announcement: announcement,
+        keystore: &keystore,
+    })
+    .await?;
+    // Bootstrap trust: the node-authored peer certificates (e.g. the verified seat holder's)
+    // plus our own; later arrivals ride the control plane as §12.3 distribution records.
+    let mut peer_certs = creds.peer_certs.clone();
+    if !peer_certs.contains(&binding.own_cert) {
+        peer_certs.push(binding.own_cert.clone());
+    }
+    Ok(RoleSessionSpec {
+        module: resolved.module.clone(),
+        engine: backend::engine_config_from_env(),
+        run: binding.run,
+        own_cert: binding.own_cert,
+        trusted_bases: binding.trusted_bases,
+        peer_certs,
+        providers,
+        journal,
+        drain_deadline: DRAIN_DEADLINE,
+    })
+}
+
 /// The role session's journal sink: the node-delivered DURABLE per-incarnation home
 /// (`DAEMON_VHC_RUN_DIR`, ABI §8) when the run-state root reference is present — a journal that
 /// cannot open refuses the join typed (a run that cannot journal must not run, §8.4) — else the
@@ -221,6 +278,8 @@ async fn main() {
             },
             Command::JoinRun {
                 run_id,
+                coordinator,
+                credentials,
                 admitted_tuple,
                 ..
             } => {
@@ -325,6 +384,27 @@ async fn main() {
                         continue;
                     }
                 }
+                // The LIVE transport attach: node-authored plane-selection credentials
+                // (`SessionCredentials`) select the production planes — WS control (optionally
+                // dual-plane with iroh), presigned-R2 or filesystem content stores. Any
+                // construction failure refuses the join typed (fail closed, never a silent
+                // local run). Bytes that are not a `SessionCredentials` mean "no live attach"
+                // and fall through to the in-process seat / typed refusal below.
+                #[cfg(feature = "vhc-net")]
+                if let Ok(creds) =
+                    daemon_vhc_session::protocol::SessionCredentials::from_bytes(&credentials)
+                {
+                    match join_live(resolved, genesis, &run_id, &coordinator, &creds).await {
+                        Ok(spec) => {
+                            let handle = spawn_role(run_id.clone(), spec, role_events.clone());
+                            roles.insert(run_id, handle);
+                        }
+                        Err(detail) => send(&writer, &worker_error(&detail)).await,
+                    }
+                    continue;
+                }
+                #[cfg(not(feature = "vhc-net"))]
+                let _ = (&coordinator, &credentials);
                 if in_process_plane_selected() {
                     match backend::role_binding(resolved, genesis, &run_id) {
                         Ok(binding) => {
@@ -370,15 +450,16 @@ async fn main() {
                 }
                 #[cfg(not(feature = "harness"))]
                 {
-                    // No transport is bound: refuse typed (fail closed). The live transport
-                    // attach (credential-selected planes and stores) replaces this refusal;
-                    // the in-process plane above is the single-host smoke seat meanwhile.
+                    // No transport is bound: refuse typed (fail closed, never a silent local
+                    // run). The live attach requires node-authored `SessionCredentials` (and a
+                    // networked worker build); the in-process plane above serves single-host
+                    // smoke.
                     send(
                         &writer,
                         &worker_error(&format!(
                             "JoinRun for run `{run_id}`: no control-plane binding for a role \
-                             session in this build (the live transport attach supersedes; the \
-                             in-process plane serves single-host smoke)"
+                             session (no live plane-selection credentials were delivered, and \
+                             the in-process smoke seat is not selected)"
                         )),
                     )
                     .await;

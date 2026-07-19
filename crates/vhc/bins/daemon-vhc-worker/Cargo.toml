@@ -77,7 +77,16 @@ cuda = ["daemon-vhc-host/cuda"]
 # `daemon-vhc-net/iroh` edge is still warranted post-sunset is an open question — the surviving
 # fetch path is WS/presign-only, but the cross-built fat-worker packaging lane (flake.nix's
 # Windows worker) ships this feature set, so dropping the edge is a packaging decision.)
-vhc-net = ["daemon-vhc-net/ws", "daemon-vhc-net/iroh", "dep:daemon-egress"]
+vhc-net = [
+    "daemon-vhc-net/ws",
+    "daemon-vhc-net/iroh",
+    "dep:daemon-egress",
+    # The role session's LIVE transport attach: provider construction from the node-authored
+    # `SessionCredentials` (WS control plane, optional dual-plane iroh half, presigned-R2 /
+    # filesystem content stores). Without this feature a join with live credentials refuses
+    # typed (fail closed) and only the in-process smoke seat serves.
+    "daemon-vhc-session/live-iroh",
+]
 # The in-process self-driven join (`src/session.rs`): drives the run's coordinator module
 # in-process and decodes SDK round schemas — harness/test machinery, never a production build.
 # Off the default gate so the shipped worker carries no round vocabulary.
@@ -93,6 +102,12 @@ harness = [
 # node-side supervisor and directly over the provision cut, against a real tiny-llama `.wasm`.
 daemon-vhc-supervisor = { workspace = true }
 daemon-common = { workspace = true }
+# tests/live_attach.rs: the promoted loopback relay-grade WS coordinator fixture two real worker
+# processes attach through (the `harness` feature is fixture-only, never a production edge).
+daemon-vhc-net = { workspace = true, features = ["harness"] }
+# tests/live_attach.rs: scans a peer's durable journal segments to prove inbound certified
+# frames DELIVERED (tag-12 evidence records) — the schema-free substrate crate.
+daemon-vhc-journal = { workspace = true }
 # Test-only: the genesis-authoring vocabulary for the in-process join suite — the coordinator
 # role's opaque config is an authored `{state: CoordinatorState}` and the run's trust topology a
 # typed `AuthorityConfig` (both consensus-SDK types). The RUNTIME native-tick edge this crate

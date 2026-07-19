@@ -223,6 +223,7 @@ async fn run_role(
 
     let identity = run_cfg.identity.clone();
     let own_sender = own_cert.body.run_key;
+    let own_cert_record = daemon_vhc_proto::DistributionRecord::Cert(own_cert.clone());
     if !peer_certs.contains(&own_cert) {
         peer_certs.push(own_cert);
     }
@@ -260,6 +261,14 @@ async fn run_role(
     let cert_check = CertCheck::new(trusted_bases, peer_certs);
     let mut attach = Attach::new(identity.run_id, identity.epoch, cert_check, pump.clone());
     let mut inbound = providers.control.subscribe();
+
+    // §12.3 distribution: announce this incarnation's certificate on the control plane so peers
+    // can verify our frames without an out-of-band exchange. Best-effort by design (supersession
+    // is the safety floor); a WS plane additionally re-announces on every reconnect via the
+    // resubscribe registration made at provider construction.
+    if let Ok(bytes) = own_cert_record.to_bytes() {
+        let _ = providers.control.publish(&bytes).await;
+    }
 
     let _ = events.send(Event::RunPhase {
         run_id: run_label.to_string(),
@@ -379,6 +388,20 @@ fn accept_inbound(
     events: &mpsc::UnboundedSender<Event>,
     generation: u64,
 ) -> bool {
+    // §12.3 distribution records travel on the same plane beside frames; the classification is
+    // structural (a record is a top-level map, a §12.1 frame a top-level array), so this decode
+    // attempt is cheap and never speculative on frame bytes. A refused record is a typed
+    // per-record advisory, never a session fault; our own echoed announcement ingests as an
+    // idempotent no-op.
+    if let Ok(record) = daemon_vhc_proto::DistributionRecord::from_bytes(frame) {
+        if let Err(refusal) = attach.ingest_distribution(record) {
+            let _ = events.send(Event::Warning {
+                class: "distribution_refused".into(),
+                detail: format!("{refusal} (generation {generation})"),
+            });
+        }
+        return true;
+    }
     // Echo filter: the §12.1 frame envelope's `sender` field (mechanism, not message schema).
     // The module's own voice is already its state; a self-delivering plane must not feed it back.
     if envelope_sender(frame) == Some(own_sender.0) {

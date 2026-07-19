@@ -133,11 +133,27 @@ impl CertCheck {
     }
 
     /// Ingest a later-arriving certificate (control-plane distribution): stored for sender
-    /// authentication and observed into the supersession floor.
+    /// authentication and observed into the supersession floor. Idempotent — a re-delivered
+    /// record (plane redundancy, resubscribe replay) changes nothing.
+    ///
+    /// TRUST GATE (caller-enforced by construction): the distribution handler verifies the
+    /// record's chain AND that its base identity is genesis-trusted BEFORE calling this — an
+    /// unverified record must never advance the supersession floor (a forged high incarnation
+    /// would fence out the legitimate holder).
     pub fn ingest_certificate(&mut self, cert: RunKeyCertificate) {
+        if self.certs.contains(&cert) {
+            return;
+        }
         self.revocations
             .observe_certificates(std::slice::from_ref(&cert));
         self.certs.push(cert);
+    }
+
+    /// Whether `base` is one of this attach's genesis-trusted certificate issuers (the
+    /// distribution handler's trust gate input).
+    #[must_use]
+    pub fn trusts_base(&self, base: &PeerId) -> bool {
+        self.trusted_bases.contains(base)
     }
 
     /// Ingest a signed revocation record: accepted only from a trusted base and only with a
@@ -224,6 +240,37 @@ impl InboundFrames {
     /// the control plane). `None` only on the harness path.
     pub fn certs_mut(&mut self) -> Option<&mut CertCheck> {
         self.cert_check.as_mut()
+    }
+
+    /// Route one inbound §12.3 distribution record into the certificate layer (the records
+    /// travel on the control plane beside frames). A certificate ingests only after its chain
+    /// verifies AND its base identity is genesis-trusted — an unverified record must never
+    /// advance the supersession floor (a forged high incarnation would fence out the legitimate
+    /// holder). A revocation goes through the replay-protected ledger.
+    ///
+    /// # Errors
+    /// A human-readable refusal — a refused record changes no state.
+    pub fn ingest_distribution(
+        &mut self,
+        record: daemon_vhc_proto::DistributionRecord,
+    ) -> Result<(), String> {
+        let Some(certs) = self.cert_check.as_mut() else {
+            return Err("no certificate layer on this attach".into());
+        };
+        match record {
+            daemon_vhc_proto::DistributionRecord::Cert(cert) => {
+                cert.verify_chain()
+                    .map_err(|e| format!("certificate chain: {e}"))?;
+                if !certs.trusts_base(&cert.base_identity) {
+                    return Err("certificate base identity is not genesis-trusted".into());
+                }
+                certs.ingest_certificate(cert);
+                Ok(())
+            }
+            daemon_vhc_proto::DistributionRecord::Revocation(record) => certs
+                .ingest_revocation(&record)
+                .map_err(|e| format!("revocation record: {e}")),
+        }
     }
 
     /// Verify one wire frame (`[envelope, payload, sig]`, §12.1) and judge its sequence position.
@@ -417,6 +464,19 @@ impl Attach {
             frames: InboundFrames::new(run_id, epoch, cert_check),
             pump,
         }
+    }
+
+    /// Route one inbound §12.3 distribution record into the certificate layer (see
+    /// [`InboundFrames::ingest_distribution`]).
+    ///
+    /// # Errors
+    /// A human-readable refusal for the caller's advisory surface — a refused record is a typed
+    /// per-record event, never a session fault.
+    pub fn ingest_distribution(
+        &mut self,
+        record: daemon_vhc_proto::DistributionRecord,
+    ) -> Result<(), String> {
+        self.frames.ingest_distribution(record)
     }
 
     /// Verify + (iff verified, first-sighted, in-sequence) deliver one inbound wire frame.

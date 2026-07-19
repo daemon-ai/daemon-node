@@ -35,6 +35,8 @@ pub mod identity;
 pub mod journal_home;
 pub mod keystore;
 pub mod protocol;
+#[cfg(feature = "live")]
+pub mod providers;
 pub mod role_session;
 pub mod seam;
 
