@@ -11,7 +11,7 @@ use daemon_vhc_host::probe::DeviceLimits;
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_net::{ArtifactRef, ArtifactResolver};
 use daemon_vhc_proto::{from_canonical_slice, SignedEnvelope};
-use daemon_vhc_session::protocol::{Eligibility, Hardware, WorkerCapabilities};
+use daemon_vhc_session::protocol::{BackendCapability, Eligibility, Hardware, WorkerCapabilities};
 
 /// A large sentinel (in MiB) used when a resource dimension is unknown, so the admission budget math
 /// does not spuriously reject on an unprobed number (`u64::MAX / MiB`).
@@ -552,44 +552,301 @@ fn module_from_env() -> Option<Result<Vec<u8>, String>> {
     Some(std::fs::read(&path).map_err(|e| format!("reading module {path}: {e}")))
 }
 
-/// The engine config for this worker's wasm host, honoring `DAEMON_TRAIN_BACKEND` (P3 lane S — the
-/// 160M staging rehearsal's Vulkan lane): `cpu` (default), `burn-ndarray`, or `wgpu` (feature-gated;
-/// an unavailable selection falls back to the CPU det lane with a loud stderr note, never silently
-/// changing semantics — the det digests are byte-identical across backends by the B3 contract, so
-/// backend choice affects wall-clock only). When the var is set the roomy 160M-scale sandbox budgets
-/// are applied (the defaults are tuned for the tiny reference model; a 768-wide model's real fp32
-/// steps trip the 5 s epoch watchdog — mirrors `preset_160m.rs::roomy_engine`).
-pub(crate) fn engine_config_from_env() -> daemon_vhc_host::EngineConfig {
-    use std::time::Duration;
-    let Ok(kind) = std::env::var("DAEMON_TRAIN_BACKEND") else {
-        return daemon_vhc_host::EngineConfig::default();
+// ==== measured backend selection (the execution half of fleet heterogeneity) ====================
+//
+// The worker advertises what it can RUN (the structured `BackendCapability` records on the
+// probe report) and selects what a join RUNS ON by the measured ladder over exactly those
+// records — advertisement and selection cannot diverge. The ladder order is fixed
+// cuda → wgpu → cpu; each device rung requires its feature compiled AND a passing runtime
+// probe. **There is no silent fallback anywhere**: an explicit `DAEMON_TRAIN_BACKEND` naming a
+// lane this build/host cannot serve is a typed refusal (the former quiet stderr-note downgrade
+// to the CPU lane is deleted); `DAEMON_TRAIN_BACKEND=cpu` remains the operator's EXPLICIT
+// escape hatch (an explicit CPU selection, not a fallback). The selection is recorded in the
+// admitted tuple (`backend` + `gpu_index`) at assess, and the join's tuple rederivation reruns
+// the identical ladder — a device that disappeared between assess and join rederives a
+// different rung and refuses typed (the claim-revalidation flow; the node reassesses).
+
+/// The measured selection one assessment/join runs under: the `BackendKind` wire slug, the
+/// device backend CLASS it serves (`device_min.backend_class` vocabulary), and the device
+/// placement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BackendSelection {
+    pub(crate) slug: String,
+    pub(crate) class: String,
+    pub(crate) gpu_index: u32,
+}
+
+/// The structured per-backend capability records this worker build advertises (one per
+/// compiled lane whose runtime probe found a device, plus the always-present CPU record) —
+/// the probe report's `Hardware::backends` and the measured ladder's input.
+pub(crate) fn backend_inventory() -> Vec<BackendCapability> {
+    let mut out = Vec::new();
+    #[cfg(feature = "cuda")]
+    if let Some(p) = daemon_vhc_host::probe::probe_cuda() {
+        out.push(BackendCapability {
+            backend: "cuda".to_string(),
+            class: "cuda".to_string(),
+            adapter: p.adapter.clone(),
+            device_index: 0,
+            vram_mb: p.vram_mb,
+            max_alloc_mb: p.max_alloc_mb,
+            shared_mb: 0,
+            unified: false,
+            // The two-leg NVRTC readiness gate: a CUDA device without its staged, driver-
+            // matched runtime advertises the hardware but stays unselectable.
+            ready: daemon_vhc_host::probe::cuda_nvrtc_ready(),
+        });
+    }
+    #[cfg(feature = "wgpu")]
+    if let Some(p) = daemon_vhc_host::probe::probe_wgpu() {
+        let vram_sysfs = amdgpu_sysfs_mem_mb("mem_info_vram_total");
+        out.push(BackendCapability {
+            backend: "wgpu".to_string(),
+            // The graphics API the adapter came up on IS the device backend class the run
+            // pre-screen matches ("vulkan" / "metal" / "dx12").
+            class: p.backend.to_lowercase(),
+            adapter: p.adapter.clone(),
+            device_index: 0,
+            vram_mb: if vram_sysfs > 0 {
+                vram_sysfs
+            } else {
+                p.max_alloc_mb
+            },
+            max_alloc_mb: p.max_alloc_mb,
+            shared_mb: amdgpu_sysfs_mem_mb("mem_info_gtt_total"),
+            unified: p.unified,
+            ready: true,
+        });
+    }
+    out.push(BackendCapability {
+        backend: "cpu".to_string(),
+        class: "cpu".to_string(),
+        adapter: "host".to_string(),
+        device_index: 0,
+        vram_mb: 0,
+        max_alloc_mb: 0,
+        shared_mb: 0,
+        unified: false,
+        ready: true,
+    });
+    out
+}
+
+/// The measured selection ladder (pure — unit-tested over synthetic inventories; the callers
+/// feed it [`backend_inventory`]). Fixed rung order cuda → wgpu → cpu; a rung serves only when
+/// its record is `ready` and its class passes the run's `backend_class` constraint. `directed`
+/// is the operator's explicit lane choice (`DAEMON_TRAIN_BACKEND`): it must name a servable,
+/// class-allowed lane or the selection refuses typed — never a fallback. `gpu_index` is the
+/// node-directed device placement: naming a device the inventory does not hold refuses typed.
+///
+/// # Errors
+///
+/// A human-readable reason carrying the `BackendUnavailable` vocabulary — the caller surfaces
+/// it as the typed assess refusal / join error.
+pub(crate) fn select_backend(
+    inventory: &[BackendCapability],
+    directed: Option<&str>,
+    allowed_classes: &[String],
+    gpu_index: Option<u32>,
+) -> Result<BackendSelection, String> {
+    let class_allowed =
+        |class: &str| allowed_classes.is_empty() || allowed_classes.iter().any(|c| c == class);
+    let place = |entry: &BackendCapability| -> Result<BackendSelection, String> {
+        let index = match gpu_index {
+            None => entry.device_index,
+            Some(i) if i == entry.device_index => i,
+            Some(i) => {
+                return Err(format!(
+                    "BackendUnavailable: device placement names device {i}, but backend `{}` \
+                     probed device {} only (the placement must name a probed device)",
+                    entry.backend, entry.device_index
+                ))
+            }
+        };
+        Ok(BackendSelection {
+            slug: entry.backend.clone(),
+            class: entry.class.clone(),
+            gpu_index: index,
+        })
     };
-    let backend = match kind.as_str() {
-        "cpu" | "" => daemon_vhc_host::BackendKind::Cpu,
-        #[cfg(feature = "burn-ndarray")]
-        "burn-ndarray" => daemon_vhc_host::BackendKind::BurnNdarray,
-        #[cfg(feature = "wgpu")]
-        "wgpu" => daemon_vhc_host::BackendKind::Wgpu,
-        // P3 Merge-2: the CUDA lane (RunPod 4090) sets `DAEMON_TRAIN_BACKEND=cuda` for the roomy
-        // 160M budgets. (The v1 live-attach probe ladder that composed over this —
-        // `select_backend()` — retired with `live.rs` at the Phase-E sunset.)
-        #[cfg(feature = "cuda")]
-        "cuda" => daemon_vhc_host::BackendKind::Cuda,
-        other => {
-            eprintln!(
-                "[daemon-vhc-worker] DAEMON_TRAIN_BACKEND={other} not available in this build \
-                 (feature not compiled?) — falling back to the CPU det lane"
-            );
-            daemon_vhc_host::BackendKind::Cpu
+    let cpu_selection = |slug: &str| -> Result<BackendSelection, String> {
+        if class_allowed("cpu") {
+            Ok(BackendSelection {
+                slug: slug.to_string(),
+                class: "cpu".to_string(),
+                gpu_index: 0,
+            })
+        } else {
+            Err(format!(
+                "BackendUnavailable: the run constrains backend classes to {allowed_classes:?}, \
+                 which excludes the CPU lane"
+            ))
         }
     };
-    daemon_vhc_host::EngineConfig {
-        fuel_per_call: 1 << 34,
-        epoch_deadline: Duration::from_secs(600),
-        op_budget: 1 << 30,
-        max_step_handles: 1 << 24,
-        backend,
-        ..daemon_vhc_host::EngineConfig::default()
+
+    if let Some(slug) = directed {
+        // The operator's explicit selection: exactly that lane or a typed refusal.
+        return match slug {
+            "" | "cpu" => cpu_selection("cpu"),
+            // The explicit burn-ndarray lane is CPU-class (one real implementation).
+            "burn-ndarray" => cpu_selection("burn-ndarray"),
+            other => {
+                let entry = inventory
+                    .iter()
+                    .find(|e| e.backend == other)
+                    .ok_or_else(|| {
+                        format!(
+                            "BackendUnavailable: DAEMON_TRAIN_BACKEND={other} is not servable on \
+                         this host (feature not compiled, or no device probed) — there is no \
+                         fallback; select `cpu` explicitly for the CPU lane"
+                        )
+                    })?;
+                if !entry.ready {
+                    return Err(format!(
+                        "BackendUnavailable: backend `{other}` probed a device but is not \
+                         ready to serve (runtime not staged)"
+                    ));
+                }
+                if !class_allowed(&entry.class) {
+                    return Err(format!(
+                        "BackendUnavailable: backend `{other}` serves class `{}`, outside the \
+                         run's allowed backend classes {allowed_classes:?}",
+                        entry.class
+                    ));
+                }
+                place(entry)
+            }
+        };
+    }
+
+    // The measured ladder: cuda → wgpu → cpu (architecture: fixed order; each rung requires
+    // its feature compiled AND a passing runtime probe — encoded here as inventory presence).
+    for slug in ["cuda", "wgpu"] {
+        if let Some(entry) = inventory.iter().find(|e| e.backend == slug) {
+            if entry.ready && class_allowed(&entry.class) {
+                return place(entry);
+            }
+        }
+    }
+    cpu_selection("cpu").map_err(|_| {
+        format!(
+            "BackendUnavailable: no compiled backend rung satisfies the run's backend classes \
+             {allowed_classes:?} on this host"
+        )
+    })
+}
+
+/// Resolve a selected slug to the engine's `BackendKind` — the feature-compiled half of the
+/// rung (the inventory only lists compiled device lanes, so a `None` here is a caller error on
+/// the device slugs; `burn-ndarray` additionally requires its feature).
+fn kind_for_slug(slug: &str) -> Option<daemon_vhc_host::BackendKind> {
+    match slug {
+        "cpu" => Some(daemon_vhc_host::BackendKind::Cpu),
+        #[cfg(feature = "burn-ndarray")]
+        "burn-ndarray" => Some(daemon_vhc_host::BackendKind::BurnNdarray),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => Some(daemon_vhc_host::BackendKind::Wgpu),
+        #[cfg(feature = "cuda")]
+        "cuda" => Some(daemon_vhc_host::BackendKind::Cuda),
+        _ => None,
+    }
+}
+
+/// The operator's explicit lane choice (`DAEMON_TRAIN_BACKEND`), if any.
+fn directed_backend() -> Option<String> {
+    std::env::var("DAEMON_TRAIN_BACKEND").ok()
+}
+
+/// The node-directed device placement (`DAEMON_VHC_GPU_INDEX`), if any. A malformed value is a
+/// typed error — placement is an owner input, never guessed.
+fn directed_gpu_index() -> Result<Option<u32>, String> {
+    match std::env::var("DAEMON_VHC_GPU_INDEX") {
+        Err(_) => Ok(None),
+        Ok(s) => {
+            s.trim().parse::<u32>().map(Some).map_err(|e| {
+                format!("BackendUnavailable: malformed DAEMON_VHC_GPU_INDEX `{s}`: {e}")
+            })
+        }
+    }
+}
+
+/// Run the measured selection for this host + this run's constraints (the assess/join shared
+/// path — both stages call this with the same inputs, so the tuple's `backend`/`gpu_index`
+/// rederive exactly).
+///
+/// # Errors
+///
+/// The typed `BackendUnavailable` reason (no fallback).
+pub(crate) fn measured_backend(
+    device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
+) -> Result<BackendSelection, String> {
+    let allowed = device_min
+        .map(|m| m.backend_class.clone())
+        .unwrap_or_default();
+    select_backend(
+        &backend_inventory(),
+        directed_backend().as_deref(),
+        &allowed,
+        directed_gpu_index()?,
+    )
+}
+
+/// The engine config a JOIN runs under: the measured backend selection materialized
+/// (`EngineConfig.backend` + `gpu_index`), with the roomy 160M-scale sandbox budgets on the
+/// device lanes and under an explicit operator selection (the defaults are tuned for the tiny
+/// reference model; a 768-wide model's real fp32 steps trip the 5 s epoch watchdog — mirrors
+/// `preset_160m.rs::roomy_engine`).
+///
+/// # Errors
+///
+/// The typed `BackendUnavailable` reason — the join refuses; there is no fallback.
+pub(crate) fn engine_for_join(
+    device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
+) -> Result<EngineConfig, String> {
+    let sel = measured_backend(device_min)?;
+    let backend = kind_for_slug(&sel.slug).ok_or_else(|| {
+        format!(
+            "BackendUnavailable: selected backend `{}` has no compiled engine lane in this \
+             build",
+            sel.slug
+        )
+    })?;
+    let gpu_index = backend.is_device().then_some(sel.gpu_index);
+    if backend.is_device() || directed_backend().is_some() {
+        Ok(EngineConfig {
+            fuel_per_call: 1 << 34,
+            epoch_deadline: std::time::Duration::from_secs(600),
+            op_budget: 1 << 30,
+            max_step_handles: 1 << 24,
+            backend,
+            gpu_index,
+            ..EngineConfig::default()
+        })
+    } else {
+        Ok(EngineConfig {
+            backend,
+            gpu_index,
+            ..EngineConfig::default()
+        })
+    }
+}
+
+/// The engine config for the ASSESSMENT instance (the CPU-cheap admission path: manifest/claim
+/// evaluation never runs compute, so assessment stays on the CPU engine regardless of the
+/// measured selection) — roomy budgets under an explicit operator selection, exactly like the
+/// join engine.
+pub(crate) fn assess_engine_config() -> EngineConfig {
+    if std::env::var_os("DAEMON_TRAIN_BACKEND").is_some() {
+        EngineConfig {
+            fuel_per_call: 1 << 34,
+            epoch_deadline: std::time::Duration::from_secs(600),
+            op_budget: 1 << 30,
+            max_step_handles: 1 << 24,
+            backend: daemon_vhc_host::BackendKind::Cpu,
+            ..EngineConfig::default()
+        }
+    } else {
+        EngineConfig::default()
     }
 }
 
@@ -702,6 +959,7 @@ pub(crate) fn hardware() -> Hardware {
                 shared_mb: dl.shared_mb,
                 ram_mb: if dl.ram_mb > 0 { dl.ram_mb } else { ram_mb },
                 backend_lanes: vec!["dx12".to_string(), "vulkan".to_string(), "cpu".to_string()],
+                backends: backend_inventory(),
                 capabilities: host_capabilities(),
                 up_kbps: 0,
                 down_kbps: 0,
@@ -721,6 +979,7 @@ pub(crate) fn hardware() -> Hardware {
                 shared_mb: dl.shared_mb,
                 ram_mb: if dl.ram_mb > 0 { dl.ram_mb } else { ram_mb },
                 backend_lanes: vec!["metal".to_string(), "cpu".to_string()],
+                backends: backend_inventory(),
                 capabilities: host_capabilities(),
                 up_kbps: 0,
                 down_kbps: 0,
@@ -741,6 +1000,7 @@ pub(crate) fn hardware() -> Hardware {
                 shared_mb: 0,
                 ram_mb,
                 backend_lanes: vec!["cuda".to_string(), "cpu".to_string()],
+                backends: backend_inventory(),
                 capabilities: host_capabilities(),
                 up_kbps: 0,
                 down_kbps: 0,
@@ -766,6 +1026,7 @@ pub(crate) fn hardware() -> Hardware {
                 shared_mb,
                 ram_mb,
                 backend_lanes: vec!["vulkan".to_string(), "cpu".to_string()],
+                backends: backend_inventory(),
                 capabilities: host_capabilities(),
                 up_kbps: 0,
                 down_kbps: 0,
@@ -780,6 +1041,7 @@ pub(crate) fn hardware() -> Hardware {
         shared_mb: 0,
         ram_mb,
         backend_lanes: vec!["cpu".to_string()],
+        backends: backend_inventory(),
         capabilities: host_capabilities(),
         up_kbps: 0,
         down_kbps: 0,
@@ -885,15 +1147,7 @@ pub(crate) fn assess(
 ) -> Result<(Eligibility, bool), String> {
     // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (real-scale param layouts exceed
     // the tiny-model defaults). Assessment itself stays on the CPU-cheap path.
-    let engine = if std::env::var_os("DAEMON_TRAIN_BACKEND").is_some() {
-        EngineConfig {
-            backend: daemon_vhc_host::BackendKind::Cpu,
-            ..engine_config_from_env()
-        }
-    } else {
-        EngineConfig::default()
-    };
-    let worker = Worker::new(engine).map_err(|e| format!("engine: {e}"))?;
+    let worker = Worker::new(assess_engine_config()).map_err(|e| format!("engine: {e}"))?;
 
     // ABI §1.3 steps 1–6: hash-verify → compile+inspect → candidate → instantiate → cross-check.
     match daemon_vhc_host::select_driver(&worker, module, module_blake3) {
@@ -966,11 +1220,8 @@ pub(crate) fn role_binding(
     use daemon_vhc_session::keystore::VhcKeystore;
 
     // Admission re-check on the CPU-cheap path (assessment parity: same engine shape).
-    let engine = EngineConfig {
-        backend: daemon_vhc_host::BackendKind::Cpu,
-        ..engine_config_from_env()
-    };
-    let worker = Worker::new(engine).map_err(|e| format!("admission engine: {e}"))?;
+    let worker =
+        Worker::new(assess_engine_config()).map_err(|e| format!("admission engine: {e}"))?;
     let module_hash = resolved
         .module_blake3
         .unwrap_or_else(|| *blake3::hash(&resolved.module).as_bytes());
@@ -1131,6 +1382,23 @@ fn assess_module(
     let lane = selected_lane();
     let hw = hardware();
     let dl = device_limits();
+    // The measured backend selection (the execution half of eligibility): the ladder over the
+    // advertised inventory, constrained by the run's `backend_class` and the operator's
+    // explicit lane choice. No servable rung is a typed refusal — never a silent CPU
+    // admission. The selection is stamped into the admitted tuple; the join reruns this exact
+    // call and compares (device-claim revalidation).
+    let selection = match measured_backend(device_min) {
+        Ok(sel) => sel,
+        Err(detail) => {
+            return Eligibility {
+                eligible: false,
+                reasons: vec![detail],
+                headroom: Vec::new(),
+                refusal_code: Some("BackendUnavailable".to_string()),
+                admitted_tuple: None,
+            }
+        }
+    };
     let device = daemon_vhc_host::run::DeviceProfile {
         gpu: hw.gpus > 0,
         vram_bytes: dl.vram_mb << 20,
@@ -1179,7 +1447,9 @@ fn assess_module(
         Ok(admission) => {
             // The immutable admitted tuple this assessment produced (architecture §6.3): the exact
             // assessed identity join rederives and compares. The artifact-addressed fields are hashes
-            // of the very bytes admitted; the node stamps its device-profile / owner-policy revisions.
+            // of the very bytes admitted; the measured backend placement is the selection above
+            // (rederiving differently at join = the device inventory changed = typed refusal);
+            // the node stamps its device-profile / owner-policy revisions.
             let admitted_tuple =
                 tuple_identity.map(|id| daemon_vhc_session::protocol::AdmittedTuple {
                     module_hash: module_blake3
@@ -1193,6 +1463,8 @@ fn assess_module(
                     incarnation: id.incarnation,
                     device_profile_rev: 0,
                     owner_policy_rev: 0,
+                    backend: selection.slug.clone(),
+                    gpu_index: selection.gpu_index,
                 });
             Eligibility {
                 eligible: true,
@@ -1224,5 +1496,146 @@ fn assess_module(
             refusal_code: refusal.code.map(|c| c.slug().to_string()),
             admitted_tuple: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cap(backend: &str, class: &str, ready: bool) -> BackendCapability {
+        BackendCapability {
+            backend: backend.to_string(),
+            class: class.to_string(),
+            adapter: format!("test {backend}"),
+            device_index: 0,
+            vram_mb: 24_000,
+            max_alloc_mb: 24_000,
+            shared_mb: 0,
+            unified: false,
+            ready,
+        }
+    }
+
+    fn cpu_cap() -> BackendCapability {
+        BackendCapability {
+            vram_mb: 0,
+            max_alloc_mb: 0,
+            ..cap("cpu", "cpu", true)
+        }
+    }
+
+    /// The measured ladder: cuda outranks wgpu outranks cpu; a missing/unready upper rung
+    /// falls through to the next MEASURED rung (falling through the ladder is selection, not
+    /// fallback — the selected rung is recorded and revalidated).
+    #[test]
+    fn ladder_prefers_cuda_then_wgpu_then_cpu() {
+        let full = [
+            cap("cuda", "cuda", true),
+            cap("wgpu", "vulkan", true),
+            cpu_cap(),
+        ];
+        assert_eq!(
+            select_backend(&full, None, &[], None)
+                .expect("selects")
+                .slug,
+            "cuda"
+        );
+        let no_cuda = [cap("wgpu", "vulkan", true), cpu_cap()];
+        assert_eq!(
+            select_backend(&no_cuda, None, &[], None)
+                .expect("selects")
+                .slug,
+            "wgpu"
+        );
+        let cpu_only = [cpu_cap()];
+        assert_eq!(
+            select_backend(&cpu_only, None, &[], None)
+                .expect("selects")
+                .slug,
+            "cpu"
+        );
+        // A CUDA device without its staged runtime advertises but never selects.
+        let unready = [cap("cuda", "cuda", false), cpu_cap()];
+        assert_eq!(
+            select_backend(&unready, None, &[], None)
+                .expect("selects")
+                .slug,
+            "cpu"
+        );
+    }
+
+    /// The run's `backend_class` constraint filters rungs; no matching rung is the typed
+    /// refusal (a cuda-required run on a vulkan-only box must refuse, never train on CPU).
+    #[test]
+    fn backend_class_constraint_filters_rungs_and_refuses_typed() {
+        let vulkan_box = [cap("wgpu", "vulkan", true), cpu_cap()];
+        let cuda_only = vec!["cuda".to_string()];
+        let err = select_backend(&vulkan_box, None, &cuda_only, None)
+            .expect_err("no rung serves class cuda");
+        assert!(err.contains("BackendUnavailable"), "typed refusal: {err}");
+        // The same box serves a vulkan-constrained run on the wgpu rung.
+        let vulkan_only = vec!["vulkan".to_string()];
+        let sel = select_backend(&vulkan_box, None, &vulkan_only, None).expect("selects");
+        assert_eq!((sel.slug.as_str(), sel.class.as_str()), ("wgpu", "vulkan"));
+        // A class constraint excluding cpu refuses the cpu-only box typed.
+        let err =
+            select_backend(&[cpu_cap()], None, &vulkan_only, None).expect_err("cpu lane excluded");
+        assert!(err.contains("BackendUnavailable"), "typed refusal: {err}");
+    }
+
+    /// The operator's explicit selection: exactly that lane or a typed refusal — the former
+    /// quiet downgrade to the CPU lane is gone. `cpu` stays the explicit escape hatch.
+    #[test]
+    fn explicit_selection_never_falls_back() {
+        let cpu_only = [cpu_cap()];
+        let err = select_backend(&cpu_only, Some("cuda"), &[], None)
+            .expect_err("cuda unavailable must refuse, not fall back");
+        assert!(err.contains("BackendUnavailable"), "typed refusal: {err}");
+        assert!(err.contains("no fallback"), "names the rule: {err}");
+        let err = select_backend(
+            &[cap("cuda", "cuda", false), cpu_cap()],
+            Some("cuda"),
+            &[],
+            None,
+        )
+        .expect_err("unready cuda must refuse");
+        assert!(err.contains("not ready to serve"), "{err}");
+        // The explicit escape hatch selects the CPU lane on any box.
+        let sel = select_backend(&cpu_only, Some("cpu"), &[], None).expect("explicit cpu");
+        assert_eq!(sel.slug, "cpu");
+        // An explicit selection still honors the run's class constraint (an owner refusing to
+        // supply the demanded class is a refusal, not a silent retrain on another class).
+        let err = select_backend(
+            &[cap("cuda", "cuda", true), cpu_cap()],
+            Some("cpu"),
+            &["cuda".to_string()],
+            None,
+        )
+        .expect_err("explicit cpu against a cuda-constrained run refuses");
+        assert!(err.contains("BackendUnavailable"), "typed refusal: {err}");
+    }
+
+    /// Device placement: `gpu_index` must name a probed device; anything else refuses typed.
+    #[test]
+    fn device_placement_must_name_a_probed_device() {
+        let inv = [cap("cuda", "cuda", true), cpu_cap()];
+        let sel = select_backend(&inv, None, &[], Some(0)).expect("placement on device 0");
+        assert_eq!((sel.slug.as_str(), sel.gpu_index), ("cuda", 0));
+        let err = select_backend(&inv, None, &[], Some(1)).expect_err("device 1 was never probed");
+        assert!(err.contains("BackendUnavailable"), "typed refusal: {err}");
+    }
+
+    /// The advertised inventory always carries the CPU record (the final rung exists on every
+    /// build), and — on this CPU-only default build — nothing else.
+    #[test]
+    fn inventory_always_advertises_the_cpu_lane() {
+        let inv = backend_inventory();
+        let cpu = inv
+            .iter()
+            .find(|e| e.backend == "cpu")
+            .expect("cpu record always advertised");
+        assert!(cpu.ready);
+        assert_eq!(cpu.class, "cpu");
     }
 }

@@ -146,7 +146,9 @@ async fn join_live(
     };
     Ok(RoleSessionSpec {
         module: resolved.module.clone(),
-        engine: backend::engine_config_from_env(),
+        // The measured backend selection materialized (no fallback: an unavailable admitted
+        // backend refuses the join typed here).
+        engine: backend::engine_for_join(resolved.device_min.as_ref())?,
         run: binding.run,
         own_cert: binding.own_cert,
         trusted_bases: binding.trusted_bases,
@@ -479,9 +481,19 @@ async fn main() {
                                     continue;
                                 }
                             };
+                            // The measured backend selection materialized (no fallback: an
+                            // unavailable admitted backend refuses the join typed).
+                            let engine =
+                                match backend::engine_for_join(resolved.device_min.as_ref()) {
+                                    Ok(engine) => engine,
+                                    Err(detail) => {
+                                        send(&writer, &worker_error(&detail)).await;
+                                        continue;
+                                    }
+                                };
                             let spec = RoleSessionSpec {
                                 module: resolved.module.clone(),
-                                engine: backend::engine_config_from_env(),
+                                engine,
                                 run: binding.run,
                                 own_cert: binding.own_cert.clone(),
                                 trusted_bases: binding.trusted_bases,
