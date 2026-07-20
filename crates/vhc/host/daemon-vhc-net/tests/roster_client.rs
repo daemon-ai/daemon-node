@@ -253,7 +253,7 @@ async fn empty_roster_and_shape_errors() {
     // A garbage body → 400 from the shape gate → a typed client error (never a decode panic).
     let egress = EgressClient::new(EgressConfig::default()).expect("egress");
     let raw = daemon_egress::EgressRequest::put(
-        &format!("{}/api/v1/vhc/runs/{RUN_LABEL}/roster", server.uri()),
+        format!("{}/api/v1/vhc/runs/{RUN_LABEL}/roster", server.uri()),
         b"not-cbor".to_vec(),
     );
     let resp = egress

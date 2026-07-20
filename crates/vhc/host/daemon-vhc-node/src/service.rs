@@ -1580,10 +1580,12 @@ impl VhcService {
             &identity,
             coordinator,
             &self.config.registry,
-            restore,
             !self.config.payload_dir.is_empty(),
-            seat,
-            iroh,
+            crate::credentials::JoinBootstrap {
+                restore,
+                seat,
+                iroh,
+            },
         )?;
         Ok((Some(tuple), authored.wire, authored.credentials_ref))
     }

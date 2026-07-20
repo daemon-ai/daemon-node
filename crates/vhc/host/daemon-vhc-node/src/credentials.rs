@@ -40,6 +40,20 @@ pub struct SeatBootstrap {
     pub ws_base: Option<String>,
 }
 
+/// The resolved plane-bootstrap material one authorship pass consumes: the late-join checkpoint
+/// restore, the coordinator-seat bootstrap, and the (opt-in) iroh half from the verified
+/// registry roster — grouped because they are resolved together ahead of authoring and consumed
+/// together by it.
+#[derive(Default)]
+pub struct JoinBootstrap {
+    /// The late-join checkpoint restore (`None` = fresh start).
+    pub restore: Option<CheckpointRestore>,
+    /// The coordinator-seat bootstrap (incumbent certificate + published endpoint).
+    pub seat: SeatBootstrap,
+    /// The node-resolved iroh plane (`None` = WS-only; opt-in via `[vhc].iroh.enabled`).
+    pub iroh: Option<IrohPlane>,
+}
+
 /// The output of one authorship pass: the wire credentials bytes for `JoinRun.credentials` and
 /// the keystore reference `vhc.db` persists (`None` when no secret record was needed).
 pub struct AuthoredJoin {
@@ -77,11 +91,14 @@ pub fn author_join(
     identity: &RunInstanceIdentity<'_>,
     coordinator: &str,
     registry: &RegistryConfig,
-    restore: Option<CheckpointRestore>,
     local_payload_plane: bool,
-    seat: SeatBootstrap,
-    iroh: Option<IrohPlane>,
+    bootstrap: JoinBootstrap,
 ) -> Result<AuthoredJoin, VhcError> {
+    let JoinBootstrap {
+        restore,
+        seat,
+        iroh,
+    } = bootstrap;
     let cred = |e: KeystoreError| VhcError::Internal(format!("credential authorship: {e}"));
 
     // -- per-run identity: mint the key + issue its certificate under the base identity ---------
