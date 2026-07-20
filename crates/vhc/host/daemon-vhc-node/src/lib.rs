@@ -27,6 +27,7 @@
 pub mod arbiter;
 pub mod credentials;
 pub mod discovery;
+pub mod roster;
 pub mod seat;
 pub mod seat_keeper;
 pub mod service;

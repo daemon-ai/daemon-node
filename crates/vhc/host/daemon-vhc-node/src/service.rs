@@ -382,6 +382,9 @@ pub struct VhcService {
     current_run: Mutex<Option<String>>,
     /// The coalescing vhc-feed revision stamped on each `VhcChanged` pointer.
     rev: AtomicU64,
+    /// The pinned iroh bind port per run label (chosen once per node lifetime, so the published
+    /// roster addresses and every re-authored credentials body agree on the socket).
+    iroh_ports: Mutex<BTreeMap<String, u16>>,
     /// The service's own `Arc` handle (the event-pump wiring), bound post-construction via [`bind_self`](Self::bind_self)
     /// so `vhc_join`/`start` can spawn a detached event-pump task that outlives the `&self` call.
     /// Unbound (test builds) → the non-streaming `join` path, drained-and-dropped.
@@ -421,6 +424,7 @@ impl VhcService {
             feed: parts.feed,
             current_run: Mutex::new(None),
             rev: AtomicU64::new(0),
+            iroh_ports: Mutex::new(BTreeMap::new()),
             me: std::sync::OnceLock::new(),
         }
     }
@@ -595,14 +599,17 @@ impl VhcService {
                 .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
             let restore = self.resolve_restore(&run.run_id, &run.role).await;
             let seat = self.resolve_seat_bootstrap(&run.run_id).await;
-            let (delivery_tuple, credentials, credentials_ref) = match self.author_join(
-                &run.run_id,
-                &run.coordinator,
-                &id,
-                persisted_tuple,
-                restore,
-                seat,
-            ) {
+            let (delivery_tuple, credentials, credentials_ref) = match self
+                .author_join(
+                    &run.run_id,
+                    &run.coordinator,
+                    &id,
+                    persisted_tuple,
+                    restore,
+                    seat,
+                )
+                .await
+            {
                 Ok(v) => v,
                 Err(e) => {
                     self.arbiter.release(&id);
@@ -914,14 +921,17 @@ impl VhcService {
             .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
         let restore = self.resolve_restore(&run.run_id, &run.role).await;
         let seat = self.resolve_seat_bootstrap(&run.run_id).await;
-        let (delivery_tuple, credentials, _credentials_ref) = match self.author_join(
-            &run.run_id,
-            &run.coordinator,
-            &id,
-            persisted_tuple,
-            restore,
-            seat,
-        ) {
+        let (delivery_tuple, credentials, _credentials_ref) = match self
+            .author_join(
+                &run.run_id,
+                &run.coordinator,
+                &id,
+                persisted_tuple,
+                restore,
+                seat,
+            )
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 self.arbiter.release(&id);
@@ -1529,7 +1539,7 @@ impl VhcService {
     /// node authors identity ([`VhcServiceParts::identity_dir`]) — mint the per-run key, issue its
     /// certificate under the base identity, and author the plane-selection credentials. Returns
     /// the delivery tuple, the wire credentials bytes, and the `credentials_ref` to persist.
-    fn author_join(
+    async fn author_join(
         &self,
         run_label: &str,
         coordinator: &str,
@@ -1552,23 +1562,157 @@ impl VhcService {
         };
         let keystore = daemon_vhc_session::keystore::VhcKeystore::open(dir)
             .map_err(|e| VhcError::Internal(format!("open identity keystore: {e}")))?;
+        let identity = crate::credentials::RunInstanceIdentity {
+            run_label,
+            genesis_hash: tuple.genesis_hash,
+            epoch: id.epoch,
+            role: &id.role,
+            incarnation: id.instance,
+            module_hash: tuple.module_hash,
+        };
+        // The iroh plane (opt-in): publish this node's signed roster record, fetch + verify the
+        // run's roster, and select the dual plane. Fail-closed when enabled — a roster that
+        // cannot be published/verified refuses the join typed (retryable via reconciliation),
+        // never a silently-degraded WS-only run.
+        let iroh = self.resolve_iroh_plane(&keystore, &identity).await?;
         let authored = crate::credentials::author_join(
             &keystore,
-            &crate::credentials::RunInstanceIdentity {
-                run_label,
-                genesis_hash: tuple.genesis_hash,
-                epoch: id.epoch,
-                role: &id.role,
-                incarnation: id.instance,
-                module_hash: tuple.module_hash,
-            },
+            &identity,
             coordinator,
             &self.config.registry,
             restore,
             !self.config.payload_dir.is_empty(),
             seat,
+            iroh,
         )?;
         Ok((Some(tuple), authored.wire, authored.credentials_ref))
+    }
+
+    /// Resolve the iroh half of the plane selection (`None` when `[vhc].iroh.enabled` is off —
+    /// the WS-only default, byte-identical to pre-roster behavior):
+    ///
+    /// 1. pin this run's iroh bind port (once per node lifetime; config `bind_port` or a free
+    ///    UDP port) and derive the advertised `ip:port` addresses;
+    /// 2. author + publish this node's signed roster record (per-run key + certificate — the
+    ///    registry stores it under the structural monotonic upsert);
+    /// 3. fetch the run's roster and verify every entry node-side (signature, certificate chain
+    ///    to a genesis-trusted base, freshness precedence) — the registry is never trusted;
+    /// 4. hand the verified peers + pinned relays + bind address to the credentials body.
+    async fn resolve_iroh_plane(
+        &self,
+        keystore: &daemon_vhc_session::keystore::VhcKeystore,
+        identity: &crate::credentials::RunInstanceIdentity<'_>,
+    ) -> Result<Option<daemon_vhc_session::protocol::IrohPlane>, VhcError> {
+        if !self.config.iroh.enabled {
+            return Ok(None);
+        }
+        let Some(discovery) = &self.discovery else {
+            return Err(VhcError::Discovery(
+                "iroh plane enabled but no registry discovery seam is wired".into(),
+            ));
+        };
+        let run_label = identity.run_label;
+
+        // 1. The pinned bind socket + the advertised addresses (agree by construction).
+        let port = self.iroh_bind_port(run_label)?;
+        let direct_addrs: Vec<String> = self
+            .config
+            .iroh
+            .advertise_ips
+            .iter()
+            .map(|ip| format!("{ip}:{port}"))
+            .collect();
+        let relay_urls = self.config.iroh.relay_urls();
+        // Loopback-only advertisement binds loopback (the single-host topology); anything else
+        // binds the wildcard so every advertised interface is served.
+        let all_loopback = self
+            .config
+            .iroh
+            .advertise_ips
+            .iter()
+            .all(|ip| ip == "127.0.0.1" || ip == "::1");
+        let bind_addr = if all_loopback {
+            format!("127.0.0.1:{port}")
+        } else {
+            format!("0.0.0.0:{port}")
+        };
+
+        // 2. Author + publish our record (provisioning is idempotent within the incarnation).
+        let record = crate::roster::author_roster_record(
+            keystore,
+            identity,
+            direct_addrs,
+            relay_urls.first().cloned(),
+            u64::try_from(now_ms()).unwrap_or(1).max(1),
+        )
+        .map_err(|e| VhcError::Internal(format!("author roster record: {e}")))?;
+        discovery.publish_roster(run_label, &record).await?;
+
+        // 3. Fetch + verify: trust is the genesis-named base set, never the registry.
+        let trusted = self.genesis_trusted_bases(run_label).await?;
+        let own = crate::roster::local_endpoint_id(keystore)
+            .map_err(|e| VhcError::Internal(format!("local endpoint id: {e}")))?;
+        let records = discovery.fetch_roster(run_label).await?;
+        let roster = crate::roster::verified_iroh_roster(records, trusted.bases(), own);
+        tracing::info!(
+            run = run_label,
+            peers = roster.len(),
+            relays = relay_urls.len(),
+            bind = %bind_addr,
+            "iroh plane resolved from the verified registry roster"
+        );
+
+        Ok(Some(daemon_vhc_session::protocol::IrohPlane {
+            relay_urls,
+            roster,
+            bind_addr: Some(bind_addr),
+        }))
+    }
+
+    /// The run's genesis-trusted certificate issuers: fetch the frozen envelope (blake3-verified
+    /// by the discovery seam), reopen + verify the signed genesis, and read its `[identities]`
+    /// section — never ambient config.
+    async fn genesis_trusted_bases(
+        &self,
+        run_label: &str,
+    ) -> Result<daemon_vhc_session::identity::TrustedBases, VhcError> {
+        let Some(discovery) = &self.discovery else {
+            return Err(VhcError::Discovery(
+                "no discovery seam to resolve the genesis trust set".into(),
+            ));
+        };
+        let bytes = discovery.fetch_envelope(run_label).await?;
+        let wire: daemon_vhc_proto::SignedEnvelope = daemon_vhc_proto::from_canonical_slice(&bytes)
+            .map_err(|e| VhcError::Discovery(format!("decode signed envelope: {e}")))?;
+        let frozen = daemon_vhc_proto::FrozenGenesis::open(wire.bytes, wire.signature, wire.signer)
+            .map_err(|e| VhcError::Discovery(format!("verify genesis envelope: {e}")))?;
+        let env = frozen
+            .decode()
+            .map_err(|e| VhcError::Discovery(format!("decode genesis: {e}")))?;
+        Ok(daemon_vhc_session::identity::TrustedBases::from_genesis(
+            &env,
+        ))
+    }
+
+    /// The pinned iroh bind port for `run_label`: the configured `[vhc].iroh.bind_port`, or a
+    /// free UDP port chosen once per node lifetime (cached so republishes and re-authored
+    /// credentials always agree on the socket).
+    fn iroh_bind_port(&self, run_label: &str) -> Result<u16, VhcError> {
+        if self.config.iroh.bind_port != 0 {
+            return Ok(self.config.iroh.bind_port);
+        }
+        let mut ports = self.iroh_ports.lock().expect("iroh ports lock");
+        if let Some(port) = ports.get(run_label) {
+            return Ok(*port);
+        }
+        let socket = std::net::UdpSocket::bind(("127.0.0.1", 0))
+            .map_err(|e| VhcError::Internal(format!("pick iroh bind port: {e}")))?;
+        let port = socket
+            .local_addr()
+            .map_err(|e| VhcError::Internal(format!("read iroh bind port: {e}")))?
+            .port();
+        ports.insert(run_label.to_string(), port);
+        Ok(port)
     }
 
     /// Resolve the coordinator-seat bootstrap for a run: read the configured seat role's slot and,
@@ -2025,19 +2169,21 @@ impl VhcApi for VhcService {
         // the keystore record `credentials_ref` points at — never on the wire).
         let restore = self.resolve_restore(&run_id, &id.role).await;
         let seat = self.resolve_seat_bootstrap(&run_id).await;
-        let (delivery_tuple, credentials, credentials_ref) =
-            match self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore, seat) {
-                Ok(v) => v,
-                Err(e) => {
-                    if existing.is_none() {
-                        self.arbiter.release(&id);
-                        if fresh_child {
-                            worker.shutdown().await;
-                        }
+        let (delivery_tuple, credentials, credentials_ref) = match self
+            .author_join(&run_id, &coordinator, &id, assessed_tuple, restore, seat)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if existing.is_none() {
+                    self.arbiter.release(&id);
+                    if fresh_child {
+                        worker.shutdown().await;
                     }
-                    return Err(e.to_api());
                 }
-            };
+                return Err(e.to_api());
+            }
+        };
 
         if let Err(e) = self.store.put_join_intent(
             &run_id,

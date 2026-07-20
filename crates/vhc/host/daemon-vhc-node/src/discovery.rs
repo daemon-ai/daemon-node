@@ -92,6 +92,30 @@ pub trait RunDiscovery: Send + Sync {
         let _ = (run_id, role);
         Ok(None)
     }
+
+    /// Publish this node's signed iroh roster record (`PUT {base}/runs/:id/roster`). The
+    /// registry applies its structural monotonic upsert; a stale refusal is surfaced as a
+    /// [`VhcError::Discovery`] (the join proceeds — a fresher record of OURS already stands).
+    /// Default no-op so fakes/offline nodes need not implement it (the iroh plane is opt-in).
+    async fn publish_roster(
+        &self,
+        run_id: &str,
+        record: &daemon_vhc_proto::RosterRecord,
+    ) -> Result<(), VhcError> {
+        let _ = (run_id, record);
+        Ok(())
+    }
+
+    /// Fetch the run's stored roster records (`GET {base}/runs/:id/roster`) — UNVERIFIED
+    /// registry state: the caller judges every entry (`crate::roster::verified_iroh_roster`).
+    /// Default empty (no registry state).
+    async fn fetch_roster(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<daemon_vhc_proto::RosterRecord>, VhcError> {
+        let _ = run_id;
+        Ok(Vec::new())
+    }
 }
 
 /// The role-scoped restore preference (spec §9): the freshest `live` pointer, else the freshest
@@ -213,5 +237,33 @@ impl RunDiscovery for EgressRunDiscovery {
             })
             .collect();
         Ok(best_restore_pointer(&pointers, role))
+    }
+
+    async fn publish_roster(
+        &self,
+        run_id: &str,
+        record: &daemon_vhc_proto::RosterRecord,
+    ) -> Result<(), VhcError> {
+        match self
+            .registry
+            .publish_roster(&RunId::new(run_id), record)
+            .await
+            .map_err(|e| VhcError::Discovery(e.to_string()))?
+        {
+            daemon_vhc_net::RosterPublishOutcome::Accepted => Ok(()),
+            daemon_vhc_net::RosterPublishOutcome::Refused { decision, .. } => Err(
+                VhcError::Discovery(format!("roster publish refused: {decision:?}")),
+            ),
+        }
+    }
+
+    async fn fetch_roster(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<daemon_vhc_proto::RosterRecord>, VhcError> {
+        self.registry
+            .fetch_roster(&RunId::new(run_id))
+            .await
+            .map_err(|e| VhcError::Discovery(e.to_string()))
     }
 }
