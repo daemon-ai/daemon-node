@@ -1079,12 +1079,30 @@
             # host thrashed into swap, plus ~68 GB of dead artifacts in /tmp). A repo-local target/
             # keeps builds warm across shells, sessions, and worktrees. A deliberate NON-tmp
             # override still wins (kept for e.g. shared-cache setups).
+            #
+            # LAYERED UNDER the repo-local target dir: sccache as RUSTC_WRAPPER, so object-level
+            # compilation results are shared ACROSS checkouts/worktrees (a fresh worktree's cold
+            # build replays the dependency graph from the cache instead of recompiling it). The
+            # target-dir repin stays authoritative — sccache only shortcuts the rustc invocations
+            # that feed it. Workspace-member crates compile incrementally in the dev profile and
+            # pass through uncached (sccache cannot cache incremental compiles); the win is the
+            # large registry/vendored dependency graph, which is non-incremental and caches fully.
+            # The cache lives on the big /home mount, capped. A pre-set RUSTC_WRAPPER wins (and
+            # RUSTC_WRAPPER="" opts out): the guests workspace is NOT affected either way — its
+            # reproducibility shim is wired via `crates/vhc/guests/.cargo/config.toml`, and every
+            # guest-build spawn site strips RUSTC_WRAPPER from the env so that config wrapper
+            # (which an env RUSTC_WRAPPER would override) always applies.
             shellHook = ''
               case "''${CARGO_TARGET_DIR:-}" in
                 ""|/tmp/*|"''${TMPDIR:-/nonexistent}"/*)
                   export CARGO_TARGET_DIR="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")/target"
                   ;;
               esac
+              if [ -z "''${RUSTC_WRAPPER+x}" ] && command -v sccache >/dev/null 2>&1; then
+                export RUSTC_WRAPPER=sccache
+                export SCCACHE_DIR="''${SCCACHE_DIR:-$HOME/.cache/sccache}"
+                export SCCACHE_CACHE_SIZE="''${SCCACHE_CACHE_SIZE:-50G}"
+              fi
             '';
             packages =
               [
@@ -1095,6 +1113,7 @@
                 # --- code-quality tooling (see justfile `lint` / `audit-cleanup` / `coverage`) ---
                 pkgs.cargo-deny # advisories + license/ban/source policy (supersedes cargo-audit)
                 pkgs.cargo-nextest # faster, more reliable test runner
+                pkgs.sccache # shared compilation cache across checkouts/worktrees (see shellHook)
                 pkgs.cargo-machete # fast unused-dependency detection
                 pkgs.cargo-hack # feature-powerset checks across the many feature gates
                 pkgs.cargo-mutants # mutation testing (validates test strength)

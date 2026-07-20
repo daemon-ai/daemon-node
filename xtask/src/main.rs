@@ -303,6 +303,11 @@ fn build_guests() -> anyhow::Result<()> {
         // redirects the guests' wasm out of `guests/target/` (where the test harness reads them). The
         // guests are their own workspace, so clear it and let cargo default to `guests/target/`.
         .env_remove("CARGO_TARGET_DIR")
+        // The devShell also exports `RUSTC_WRAPPER=sccache` (shared compilation cache). An env
+        // wrapper OVERRIDES the guests workspace's config-wired `rustc-wrapper` reproducibility
+        // shim (`guest-rustc-shim.sh` — the `-C metadata` pin + the wasm32 getrandom backend cfg),
+        // so strip it here (and in every `ensure_built()` copy) to keep the shim authoritative.
+        .env_remove("RUSTC_WRAPPER")
         // Remap the absolute checkout + cargo-registry prefixes rustc bakes into panic locations.
         // Together with the guests workspace's COMMITTED Cargo.lock (B3 sitting 2 — without it,
         // floating registry patch versions re-hashed every SDK-linking guest between builds), this
