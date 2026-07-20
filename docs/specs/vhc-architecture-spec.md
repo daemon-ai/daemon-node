@@ -867,7 +867,30 @@ from silence.
   heartbeat-renews under the same fencing token, drops the lease when a renew is refused (the
   seat moved; supersession is the safety floor, [CI-5]-class), and releases signed on owner
   pause/leave and node shutdown so a successor takes over at floor + 1 without waiting out the
-  lease TTL.
+  lease TTL. The shutdown release is a bounded best-effort hook on the node's graceful-shutdown
+  path (a hung registry must not stall shutdown; the TTL remains the safety net).
+- **[RL-7]** **Module-upgrade records are consumed operator-driven and validated fail-closed.**
+  A committed run-level module-upgrade record reaches the node through its product API (an
+  operator submits the canonical record; idempotent via the operation id) — the node never acts
+  on a record it did not validate at an operator's request. Validation is total: the frozen
+  genesis is re-fetched and re-verified, the transition chain is rebuilt from genesis plus the
+  node's durable mirror of previously-consumed records, and the presented record must append
+  cleanly (authority threshold, hash link, strictly-monotone epoch, current-module binding); any
+  failure is a typed refusal with every durable fact untouched. A validated record drives the
+  live switch through the worker-control surface — target assessed where the module bytes live,
+  a post-switch incarnation minted strictly above the running one, identity provisioned before
+  the command — and the record mirror plus the advanced execution identity persist only on
+  activation. A post-fence exit that leaves the run persists no advance: the run-level record
+  stays committed; only this node's instance left.
+- **[RL-8]** **Restore pointers are role- and kind-scoped, with a periodic live cadence.**
+  Published checkpoint pointers are keyed per `(role, kind)`: a joining instance restores only
+  from its own role's slots — a coordinator drain snapshot can never shadow a trainer restore
+  source — preferring the freshest `live` pointer and falling back to the freshest `drain`
+  snapshot. Because a drain snapshot exists only when an instance drains (a hard-crashed peer
+  never drains), the trainer exports its full restorable state on a configured ingested-round
+  cadence as a live checkpoint; within a replicated trainer group any peer's fresher live
+  checkpoint is a valid restore source for a rejoiner, so a hard-crashed peer resumes from state
+  that already folds the rounds it missed and its digests stay continuous with the survivors.
 
 ---
 
