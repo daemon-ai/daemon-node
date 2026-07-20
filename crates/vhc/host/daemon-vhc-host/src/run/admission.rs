@@ -1054,6 +1054,7 @@ mod tests {
             roles,
             artifacts,
             corpus_manifest: None,
+            state_contract: None,
             authority: ciborium::value::Value::Map(vec![]),
             transport: daemon_vhc_proto::TransportSelection::default(),
             identities: daemon_vhc_proto::Identities::default(),

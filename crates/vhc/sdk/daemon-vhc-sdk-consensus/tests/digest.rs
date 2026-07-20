@@ -4,7 +4,8 @@
 //! Round state digest schedule conformance (TDD PROTO-18, spec §5.6).
 
 use daemon_vhc_proto::bytes::Seed;
-use daemon_vhc_sdk_consensus::digest::{derive_schedule, digest_state, StateLayout};
+use daemon_vhc_sdk_consensus::digest::{derive_schedule, digest_state, DigestCarry, StateLayout};
+use proptest::prelude::*;
 
 const BLOCK: u32 = 64;
 const SAMPLES: u32 = 8;
@@ -78,4 +79,34 @@ fn digest_is_cross_peer_stable() {
         digest_state(&seed, BLOCK, SAMPLES, &data),
         digest_state(&seed, BLOCK, SAMPLES, &data),
     );
+}
+
+proptest! {
+    /// The streaming carry reproduces the full-coverage digest bit-for-bit for ARBITRARY
+    /// (unaligned) update splits: any state length (incl. partial final blocks), any split
+    /// points. The equivalence the pinned digest-carry vectors extend with fixed golden values.
+    #[test]
+    fn carry_equals_full_coverage_digest_for_arbitrary_splits(
+        seed_fill in 0u8..=255,
+        len in 0usize..3000,
+        splits in proptest::collection::vec(1usize..257, 0..40),
+    ) {
+        let seed = Seed([seed_fill; 32]);
+        let data = state(len);
+        let want = digest_state(&seed, BLOCK, u32::MAX, &data);
+
+        let mut carry = DigestCarry::new(&seed, BLOCK);
+        let mut off = 0usize;
+        for s in splits {
+            if off >= data.len() {
+                break;
+            }
+            let end = (off + s).min(data.len());
+            carry.update(&data[off..end]);
+            off = end;
+        }
+        carry.update(&data[off..]);
+        prop_assert_eq!(carry.finalize(), want);
+        prop_assert_eq!(carry.bytes_folded(), data.len() as u64);
+    }
 }

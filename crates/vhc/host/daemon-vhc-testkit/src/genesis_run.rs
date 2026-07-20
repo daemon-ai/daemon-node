@@ -546,6 +546,7 @@ pub fn genesis_envelope(
         roles,
         artifacts,
         corpus_manifest: None,
+        state_contract: None,
         // The run's declared trust topology (D1's typed AuthorityConfig, encoded into the opaque
         // section the host never interprets): launch SingleKey over the coordinator identity,
         // records on the default authoritative channel.

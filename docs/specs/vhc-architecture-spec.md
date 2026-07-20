@@ -833,7 +833,11 @@ artifact, configuration, or grant and then join under another.
   every custom op, and the buffer limits and rates the module is authorized to use. Completeness is
   what makes the grants hash load-bearing — a join cannot widen the module's authority beyond what
   assessment admitted, because any additional world, channel, op, or raised limit changes the hash
-  and trips [AT-2].
+  and trips [AT-2]. The same completeness argument covers a run's **genesis state contract**
+  (the chunk-addressed canonical-state geometry + init pin): the seed-form init rides inside the
+  genesis — hence inside the tuple's genesis hash — and the artifact-form init manifest and its
+  family folds enter the granted artifact set exactly like corpus shards, so bulk initial state
+  never needs to travel in the (hashed) role config to be admission-pinned.
 
 ### 6.4 The run-instance lifecycle at the node
 
@@ -907,6 +911,16 @@ from silence.
   cadence as a live checkpoint; within a replicated trainer group any peer's fresher live
   checkpoint is a valid restore source for a rejoiner, so a hard-crashed peer resumes from state
   that already folds the rounds it missed and its digests stay continuous with the survivors.
+  The cadence separates **sealing from publishing**: sealing a checkpoint locally is cheap
+  (state the host already holds) and may happen every cadence round, while **remote upload**
+  obeys a byte budget — one deterministically designated publisher per cadence slot (derivable
+  from roster + round, so every peer agrees without a message; R identical uploads per slot are
+  waste), with a slot whose publisher died simply going unpublished and the next slot's rotation
+  covering it. The remote cadence is bounded by payload retention (genesis-validated): a
+  rejoiner replays forward from the freshest reachable checkpoint only across *retained*
+  payloads, so the remote cadence plus one slot of publisher-churn slack must fit inside the
+  payload-retention floor — a configuration that could strand a rejoiner past retention is
+  refused at authoring, never discovered at rejoin.
 
 ---
 
@@ -984,6 +998,18 @@ them by `(group_id, group_round)`, extends entries with n ([GR-4]), and writes r
 `commit` schedule events — the plan decides *when*, the host decides *what a record is*. Digest
 coverage follows state classes: params + `replicated` + `residual` (committed copies) are
 digested; `local` never is (v1 spec §5.6 machinery, per group).
+
+Because full coverage is a sequential fold over the state image, the digest is computable as a
+**streaming carry** (seeded streaming hasher + absolute byte offset, block-index frames injected
+at each block boundary independent of update splits): the carry reproduces the identical value
+bit-for-bit for any chunking of the state, so canonical state need never be materialized to be
+digested. Coverage and formula are unchanged — existing pinned digests remain valid and are the
+parity evidence for any streaming refactor. Alongside the comparison digest, chunk-addressed
+canonical state defines a **per-round det-state manifest** (per-family blake3 chunk folds under
+a dedicated derivation domain, canonical CBOR) whose hash is the **round state root**: a
+collision-resistant, audit-grade agreement object every peer derives identically from its own
+sealed chunks — a derivable object, not a wire message; it rides checkpoint documents, and
+promotion to an explicit consensus voice is a separately-ratified later change.
 
 ---
 

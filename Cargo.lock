@@ -5068,6 +5068,7 @@ dependencies = [
  "daemon-vhc-proto",
  "proptest",
  "serde",
+ "serde_json",
  "xxhash-rust",
 ]
 

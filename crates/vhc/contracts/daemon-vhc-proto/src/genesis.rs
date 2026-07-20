@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::bytes::{Hash, PeerId, Signature};
+use crate::bytes::{Hash, PeerId, Seed, Signature};
 use crate::canonical::{from_canonical_slice, to_canonical_vec};
 use crate::envelope::{Access, DeviceMinimums};
 use crate::error::VhcProtoError;
@@ -97,6 +97,54 @@ pub struct SnapshotArtifact {
     pub blake3: Hash,
     /// The pinned byte size where the author recorded it (`None` = not pinned).
     pub size: Option<u64>,
+}
+
+/// The **init pin** of a genesis state contract ([`StateContract::init`]): how a fresh joiner
+/// obtains the run's matched initial canonical state. Two shapes, both content-cross-checked:
+///
+/// - **Seed-derived**: the guest expands a pinned `(seed, dist)` deterministically, chunk-wise,
+///   in registration order, and the sealed family fold MUST equal `expected_root` — a mismatch
+///   is a typed init failure, never a silent divergence. Zero storage, zero transfer.
+/// - **Content-addressed artifact**: a det-state manifest hash
+///   ([`crate::det_state::DetStateManifest::state_root`]) whose family artifacts publish like
+///   corpus shards; MUST also name a fetchable `[artifacts]` entry. The only shape that can
+///   express a warm start, and the golden-fixture continuity carrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StateInit {
+    /// `{seed, dist, expected_root}` — deterministic seed expansion under a versioned
+    /// distribution id, cross-checked against the pinned root.
+    Seed {
+        /// The 32-byte expansion seed.
+        seed: Seed,
+        /// The versioned distribution id the guest expands under (a derivation identity: any
+        /// change to the expansion scheme is a new id).
+        dist: u64,
+        /// The family fold the sealed expansion MUST reproduce.
+        expected_root: Hash,
+    },
+    /// `{manifest}` — the det-state manifest hash of a published init artifact.
+    Manifest {
+        /// blake3 of the init det-state manifest (canonical CBOR).
+        manifest: Hash,
+    },
+}
+
+/// The genesis **state contract** (additive key, the corpus-pin precedent): the chunk-addressed
+/// canonical-state geometry + the init pin. Envelope-internal validation covers what the host
+/// can judge from the envelope alone (non-degenerate geometry, a mapped artifact-form pin, a
+/// pinned root); the layout-aware rules — the profile chunk dividing every parameter numel
+/// ([`crate::det_state::validate_profile_chunk`]), `chunk_size` being an integer multiple of
+/// the profile chunk's byte width ([`crate::det_state::validate_state_chunk_size`]), and the
+/// checkpoint cadence↔retention bound ([`crate::det_state::validate_checkpoint_cadence`]) —
+/// run at the authoring/admission seat that can see the (host-opaque) module config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateContract {
+    /// The state chunk size in bytes ([`crate::det_state::derive_state_chunk_size`] is the
+    /// authoring derivation).
+    pub chunk_size: u64,
+    /// The init pin.
+    pub init: StateInit,
 }
 
 /// A per-grant numeric/enumerated bound (ABI §2.3 `grant-bound`). Every field is optional; an
@@ -297,6 +345,13 @@ pub struct GenesisEnvelope {
     /// genesis hash. `None` for runs without a corpus (pure-consensus roles, conformance runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corpus_manifest: Option<Hash>,
+    /// The chunk-addressed canonical-state contract (geometry + init pin) for a run whose
+    /// modules stream det-lane state through the host store. Additive, like the corpus pin;
+    /// `None` for runs without host-side canonical state. The artifact-form init manifest MUST
+    /// also be an `[artifacts]` entry; the pin here is what commits the run's initial-state
+    /// identity into the genesis hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_contract: Option<StateContract>,
     /// Opaque `Authority` configuration — interpreted by modules (D1), never by the host.
     pub authority: ciborium::value::Value,
     /// Control-plane transport selection + payload store.
@@ -385,6 +440,34 @@ impl GenesisEnvelope {
                      be a fetchable pinned artifact)",
                     manifest.to_hex()
                 )));
+            }
+        }
+        if let Some(contract) = &self.state_contract {
+            if contract.chunk_size == 0 {
+                return Err(VhcProtoError::Validation(
+                    "state contract chunk_size must be > 0".into(),
+                ));
+            }
+            match &contract.init {
+                StateInit::Seed { expected_root, .. } => {
+                    // Guard the authoring slip of an unpinned (all-zero) root — the seed form
+                    // is only cross-checkable through this pin.
+                    if *expected_root == Hash([0u8; 32]) {
+                        return Err(VhcProtoError::Validation(
+                            "state contract seed init has an unpinned (all-zero) expected_root"
+                                .into(),
+                        ));
+                    }
+                }
+                StateInit::Manifest { manifest } => {
+                    if !artifact_hashes.contains(manifest) {
+                        return Err(VhcProtoError::Validation(format!(
+                            "state contract init manifest {} is absent from the artifact map \
+                             (the init manifest must be a fetchable pinned artifact)",
+                            manifest.to_hex()
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -610,6 +693,7 @@ mod tests {
             roles,
             artifacts,
             corpus_manifest: None,
+            state_contract: None,
             authority: ciborium::value::Value::Map(vec![]),
             transport: TransportSelection::default(),
             identities: Identities::default(),
@@ -677,6 +761,69 @@ mod tests {
         let mut env = sample();
         env.roles.get_mut("worker").unwrap().module = "nope".into();
         assert!(env.validate().is_err());
+    }
+
+    /// The state contract is additive: absent it changes nothing; present it commits into the
+    /// genesis hash, round-trips through the frozen form in both init shapes, and its
+    /// envelope-internal rules refuse degenerate geometry, an unpinned seed root, and an
+    /// unmapped artifact-form init manifest.
+    #[test]
+    fn state_contract_commits_into_the_hash_and_validates_envelope_internal_rules() {
+        let baseline_id = *sample().freeze(&key()).unwrap().run_id();
+
+        // Seed form: valid, hash-committed, round-trips.
+        let mut env = sample();
+        env.state_contract = Some(StateContract {
+            chunk_size: 4 << 20,
+            init: StateInit::Seed {
+                seed: Seed([5u8; 32]),
+                dist: 1,
+                expected_root: hash(9),
+            },
+        });
+        let frozen = env.freeze(&key()).unwrap();
+        assert_ne!(
+            *frozen.run_id(),
+            baseline_id,
+            "the contract is hash-committed"
+        );
+        assert_eq!(
+            frozen.decode().unwrap().state_contract,
+            env.state_contract,
+            "seed form round-trips through the frozen form"
+        );
+
+        // Artifact form: must name a mapped artifact; mapped it round-trips.
+        let mut env = sample();
+        env.state_contract = Some(StateContract {
+            chunk_size: 4 << 20,
+            init: StateInit::Manifest { manifest: hash(99) },
+        });
+        assert!(env.validate().is_err(), "unmapped init manifest refused");
+        env.state_contract = Some(StateContract {
+            chunk_size: 4 << 20,
+            init: StateInit::Manifest { manifest: hash(3) },
+        });
+        let frozen = env.freeze(&key()).unwrap();
+        assert_eq!(frozen.decode().unwrap().state_contract, env.state_contract);
+
+        // Degenerate geometry and an unpinned seed root are authoring errors.
+        let mut env = sample();
+        env.state_contract = Some(StateContract {
+            chunk_size: 0,
+            init: StateInit::Manifest { manifest: hash(3) },
+        });
+        assert!(env.validate().is_err(), "zero chunk_size refused");
+        let mut env = sample();
+        env.state_contract = Some(StateContract {
+            chunk_size: 4 << 20,
+            init: StateInit::Seed {
+                seed: Seed([5u8; 32]),
+                dist: 1,
+                expected_root: Hash([0u8; 32]),
+            },
+        });
+        assert!(env.validate().is_err(), "all-zero expected_root refused");
     }
 
     /// The corpus-manifest pin must name a fetchable `[artifacts]` entry; a mapped pin commits

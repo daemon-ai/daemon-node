@@ -524,6 +524,10 @@
           nativeBuildInputs = [
             pkgs.nasm
             pkgs.cmake
+            # The messaging adapters pull vendored openssl-sys (cargo feature unification across
+            # the daemon closure), which compiles OpenSSL from source and needs `perl` — absent
+            # in the crane sandbox. Same fix as daemon-browser's commonArgs.
+            pkgs.perl
           ];
           depsBuildBuild = [ mingwCc ];
         };

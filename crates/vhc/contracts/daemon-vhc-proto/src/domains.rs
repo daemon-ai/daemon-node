@@ -74,6 +74,15 @@ pub const ROSTER_RECORD_DOMAIN: &str = "daemon-vhc/roster-record/1.0.0";
 /// other blake3 derivation in the subsystem.
 pub const CORPUS_SHARD_DOMAIN: &[u8] = b"daemon-vhc/corpus-shard/1.0.0";
 
+/// Domain-separation tag folded into every det-state **family identity** (the chunk-addressed
+/// canonical-state contract — the corpus custody chain instantiated for training state):
+/// `family_fold = blake3(domain ++ u64le(chunk_size) ++ u64le(byte_len) ++ c_0 ++ … ++ c_{n-1})`
+/// where `c_i = blake3(chunk_i bytes)`. As with [`CORPUS_SHARD_DOMAIN`], the fold — not a plain
+/// content hash of the family bytes — IS the artifact identity, so byte ranges verify from the
+/// covering chunks alone. The fold deliberately omits the corpus fold's `token_count`
+/// (corpus-specific); det-state geometry is `(chunk_size, byte_len)`.
+pub const DET_STATE_DOMAIN: &[u8] = b"daemon-vhc/det-state/1.0.0";
+
 /// Fixed key seed for the observe replay sandbox's coordinator frame signer (the replay oracle
 /// compares published payloads, never transport signatures, so any fixed seed serves).
 pub const REPLAY_SANDBOX_FRAME_KEY_SEED: &[u8] = b"daemon-vhc/replay-sandbox-frame-key/1.0.0";
@@ -101,6 +110,7 @@ mod tests {
             super::GENESIS_SEED_DOMAIN,
             super::GOSSIP_TOPIC_DOMAIN,
             super::CORPUS_SHARD_DOMAIN,
+            super::DET_STATE_DOMAIN,
             super::REPLAY_SANDBOX_FRAME_KEY_SEED,
             super::HARNESS_FRAME_KEY_SEED,
         ];
@@ -143,6 +153,7 @@ mod tests {
             super::GENESIS_SEED_DOMAIN,
             super::GOSSIP_TOPIC_DOMAIN,
             super::CORPUS_SHARD_DOMAIN,
+            super::DET_STATE_DOMAIN,
             super::REPLAY_SANDBOX_FRAME_KEY_SEED,
             super::HARNESS_FRAME_KEY_SEED,
         ];

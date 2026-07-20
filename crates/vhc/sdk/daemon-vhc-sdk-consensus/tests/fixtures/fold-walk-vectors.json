@@ -1,0 +1,101 @@
+{
+  "comment": "Shared slice-decomposition schedule vectors for the streamed det-lane fold walks (ingest and make_update share the schedule; they differ only in per-window math). Each case pins: the window enumeration of a parameter layout at window_size bytes (per-parameter chunking — a parameter never spans a window, tails short, ordinal = family chunk ordinal), and the completion-driven walk contract under an explicit arrival permutation: folds execute ascending and contiguous regardless of arrival order, at most in_flight reads are outstanding, issues are ascending, and the seal fires exactly once — in the slice that folds the last window (slice 0 is the opening issue slice; completion i is slice i+1). Window tuples are [ordinal, param, param_off, len]; slice entries are [fold ordinals, issue ordinals, seal].",
+  "cases": [
+    {
+      "name": "degenerate single-window walk (the 64-dim tier shape): issue, fold, seal in one completion slice",
+      "numels": [64],
+      "window_size": 4096,
+      "in_flight": 4,
+      "windows": [[0, 0, 0, 256]],
+      "arrivals": [0],
+      "slices": [
+        { "fold": [], "issue": [0], "seal": false },
+        { "fold": [0], "issue": [], "seal": true }
+      ]
+    },
+    {
+      "name": "parameter tails: 16/4/8 f32 at window 24 give 3+1+2 windows with two short tails",
+      "numels": [16, 4, 8],
+      "window_size": 24,
+      "in_flight": 2,
+      "windows": [
+        [0, 0, 0, 24],
+        [1, 0, 24, 24],
+        [2, 0, 48, 16],
+        [3, 1, 0, 16],
+        [4, 2, 0, 24],
+        [5, 2, 24, 8]
+      ],
+      "arrivals": [0, 1, 2, 3, 4, 5],
+      "slices": [
+        { "fold": [], "issue": [0, 1], "seal": false },
+        { "fold": [0], "issue": [2], "seal": false },
+        { "fold": [1], "issue": [3], "seal": false },
+        { "fold": [2], "issue": [4], "seal": false },
+        { "fold": [3], "issue": [5], "seal": false },
+        { "fold": [4], "issue": [], "seal": false },
+        { "fold": [5], "issue": [], "seal": true }
+      ]
+    },
+    {
+      "name": "out-of-order completions: folds stay ascending and contiguous, blocked windows buffer",
+      "numels": [16, 4, 8],
+      "window_size": 24,
+      "in_flight": 3,
+      "windows": [
+        [0, 0, 0, 24],
+        [1, 0, 24, 24],
+        [2, 0, 48, 16],
+        [3, 1, 0, 16],
+        [4, 2, 0, 24],
+        [5, 2, 24, 8]
+      ],
+      "arrivals": [2, 1, 0, 4, 3, 5],
+      "slices": [
+        { "fold": [], "issue": [0, 1, 2], "seal": false },
+        { "fold": [], "issue": [3], "seal": false },
+        { "fold": [], "issue": [4], "seal": false },
+        { "fold": [0, 1, 2], "issue": [5], "seal": false },
+        { "fold": [], "issue": [], "seal": false },
+        { "fold": [3, 4], "issue": [], "seal": false },
+        { "fold": [5], "issue": [], "seal": true }
+      ]
+    },
+    {
+      "name": "reads run ahead bounded: in_flight 1 serializes the walk",
+      "numels": [8, 8],
+      "window_size": 32,
+      "in_flight": 1,
+      "windows": [
+        [0, 0, 0, 32],
+        [1, 1, 0, 32]
+      ],
+      "arrivals": [0, 1],
+      "slices": [
+        { "fold": [], "issue": [0], "seal": false },
+        { "fold": [0], "issue": [1], "seal": false },
+        { "fold": [1], "issue": [], "seal": true }
+      ]
+    },
+    {
+      "name": "multi-chunk parameter with a whole-window tail parameter",
+      "numels": [96, 32],
+      "window_size": 128,
+      "in_flight": 8,
+      "windows": [
+        [0, 0, 0, 128],
+        [1, 0, 128, 128],
+        [2, 0, 256, 128],
+        [3, 1, 0, 128]
+      ],
+      "arrivals": [3, 2, 1, 0],
+      "slices": [
+        { "fold": [], "issue": [0, 1, 2, 3], "seal": false },
+        { "fold": [], "issue": [], "seal": false },
+        { "fold": [], "issue": [], "seal": false },
+        { "fold": [], "issue": [], "seal": false },
+        { "fold": [0, 1, 2, 3], "issue": [], "seal": true }
+      ]
+    }
+  ]
+}

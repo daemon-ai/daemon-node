@@ -343,6 +343,7 @@ fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
         roles,
         artifacts,
         corpus_manifest: None,
+        state_contract: None,
         // The opaque Authority section (D1 vocabulary; the host never interprets it) — nominal
         // for assess-only drives.
         authority: Value::Map(vec![
