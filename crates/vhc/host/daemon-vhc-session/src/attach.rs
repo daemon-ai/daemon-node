@@ -451,7 +451,14 @@ impl InboundFrames {
         seq: u64,
         payload: &[u8],
     ) -> InboundVerdict {
-        let cursor = self.cursors.entry((sender, channel)).or_insert(0);
+        // MID-STREAM ADOPTION: the first observed frame from an unseen `(sender, channel)` seats
+        // the cursor at ITS seq. A late joiner (fresh incarnation restoring mid-run) cannot — and
+        // need not — see a peer's stream from seq 0: its state comes from the checkpoint, the
+        // relay replays no history, and insisting on density-from-zero turned every late attach
+        // into an unrecoverable-gap terminal (a rejoin loop). Density (dedup/gap/hold, §12.2)
+        // applies from the adopted point on; a replayed pre-adoption frame is at worst an
+        // authentic duplicate the module's own round machinery already treats idempotently.
+        let cursor = self.cursors.entry((sender, channel)).or_insert(seq);
         match seq.cmp(cursor) {
             std::cmp::Ordering::Less => InboundVerdict::Duplicate {
                 sender,

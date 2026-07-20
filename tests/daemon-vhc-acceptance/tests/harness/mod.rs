@@ -303,6 +303,11 @@ pub fn spawn_node(spec: &NodeSpec<'_>) -> Node {
         .env("DAEMON_CONFIG", &config_path)
         // The training worker's compute lane needs no GPU; keep it CPU/ndarray.
         .env("DAEMON_VHC_LANE_GPU_OPTIONAL", "1")
+        // The worker inherits the node's env (provisioner policy): selecting the CPU backend
+        // EXPLICITLY also selects the roomy real-training engine budgets (fuel 1<<34 per slice,
+        // 600s epoch) — the tiny-model defaults trap `BudgetFuel` on a real trainer's quiesce
+        // slice (the drain snapshot's manifest/flatten work), losing the leave checkpoint.
+        .env("DAEMON_TRAIN_BACKEND", "cpu")
         .env(
             "RUST_LOG",
             std::env::var("VHC_ACCEPTANCE_RUST_LOG").unwrap_or_else(|_| {
@@ -549,6 +554,29 @@ pub async fn start_cluster_on(
     epoch_rounds: u32,
     global_batch: u32,
 ) -> Cluster {
+    start_cluster_with(
+        port,
+        run_label,
+        trusted_bases,
+        epoch_rounds,
+        global_batch,
+        6,
+        daemon_vhc_testkit::live_genesis::LiveTiming::default(),
+    )
+    .await
+}
+
+/// [`start_cluster_on`] with churn knobs: the absence budget (`k_absences`) and the coordinator's
+/// liveness timing (a churn tier arms the real timer so a vanished member is survivable).
+pub async fn start_cluster_with(
+    port: u16,
+    run_label: &str,
+    trusted_bases: &[daemon_vhc_proto::PeerId],
+    epoch_rounds: u32,
+    global_batch: u32,
+    k_absences: u32,
+    timing: daemon_vhc_testkit::live_genesis::LiveTiming,
+) -> Cluster {
     let coordinator_wasm = guest_wasm("coordinator_quorum");
     let trainer_wasm = guest_wasm("tiny_llama");
     let corpus = corpus_dir();
@@ -565,7 +593,8 @@ pub async fn start_cluster_on(
         epoch_rounds,
         global_batch,
         steps_per_round: 2,
-        k_absences: 6,
+        k_absences,
+        timing,
     });
 
     let (registry, base_url, task) = registry::serve(&genesis, run_label, port).await;

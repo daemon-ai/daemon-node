@@ -58,6 +58,56 @@ pub struct LiveGenesis {
     pub corpus_objects: Vec<([u8; 32], Vec<u8>)>,
 }
 
+/// The coordinator's liveness timing. The baseline tiers run EVENT-DRIVEN (no timer, effectively
+/// infinite deadlines: every phase exits on the all-submitted fast path, so a wall-clock stall can
+/// never mis-finalize a healthy round). The churn tiers arm the real timer so a SILENT member is
+/// survivable: a round whose member vanished finalizes at `round_train_max_s` synthetic ticks with
+/// an absence mark, `k_absences` drops the member, the `min_peers` floor breach forces the
+/// cooldown, and the cooldown exit materializes staged rejoins into the next epoch's roster.
+#[derive(Clone, Copy)]
+pub struct LiveTiming {
+    /// Real coordinator timer period in ms (`0` = event-driven synthetic clock, no timer).
+    pub tick_period_ms: u64,
+    /// Warmup timeout in synthetic ticks (early-exits when every member is ready).
+    pub warmup_s: u64,
+    /// Round training deadline in synthetic ticks (early-exits when all committed).
+    pub round_train_max_s: u64,
+    /// Witness/evidence deadline in synthetic ticks (early-exits when all evidenced).
+    pub round_witness_s: u64,
+    /// Cooldown dwell in synthetic ticks (the pending-join materialization point).
+    pub cooldown_s: u64,
+}
+
+impl Default for LiveTiming {
+    fn default() -> Self {
+        Self {
+            tick_period_ms: 0,
+            warmup_s: 1_000_000,
+            round_train_max_s: 1_000_000,
+            round_witness_s: 1_000_000,
+            cooldown_s: 1_000_000,
+        }
+    }
+}
+
+impl LiveTiming {
+    /// The churn tier: a 500ms real tick (~2 synthetic ticks/s, plus one per delivered event).
+    /// Deadlines are sized so a HEALTHY round (~1-2s wall, ~10-15 tick-equivalents) never grazes
+    /// them, while a vanished member costs ~20s of wall time before its round finalizes with an
+    /// absence mark; warmup exits by timeout when a ghost (dead incarnation still in the roster)
+    /// can never signal readiness; cooldown resolves promptly so staged rejoins materialize.
+    #[must_use]
+    pub fn churn() -> Self {
+        Self {
+            tick_period_ms: 500,
+            warmup_s: 30,
+            round_train_max_s: 40,
+            round_witness_s: 20,
+            cooldown_s: 2,
+        }
+    }
+}
+
 /// The authored-genesis knobs the acceptance topology varies.
 pub struct LiveGenesisSpec<'a> {
     /// The run label (registry key + coordinator admission id).
@@ -88,6 +138,8 @@ pub struct LiveGenesisSpec<'a> {
     pub steps_per_round: u32,
     /// Record absences before a silent member drops.
     pub k_absences: u32,
+    /// The coordinator's liveness timing (see [`LiveTiming`]).
+    pub timing: LiveTiming,
 }
 
 /// Author the acceptance genesis: the coordinator role carrying its opaque
@@ -168,10 +220,10 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         required_capabilities: CapabilitySet::new(),
         min_peers: spec.min_peers,
         max_peers: spec.max_peers,
-        warmup_s: 1_000_000,
-        round_train_max_s: 1_000_000,
-        round_witness_s: 1_000_000,
-        cooldown_s: 1_000_000,
+        warmup_s: spec.timing.warmup_s,
+        round_train_max_s: spec.timing.round_train_max_s,
+        round_witness_s: spec.timing.round_witness_s,
+        cooldown_s: spec.timing.cooldown_s,
         epoch_rounds: u64::from(spec.epoch_rounds),
         stall_rounds_max: 4,
         global_batch: GlobalBatch {
@@ -193,6 +245,12 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         (
             Value::Text("state".into()),
             Value::serialized(&state).expect("state to cbor value"),
+        ),
+        // A churn tier arms the coordinator's real timer so deadlines actually pass; the
+        // event-driven default (0) never arms one.
+        (
+            Value::Text("tick_period_ms".into()),
+            Value::Integer(spec.timing.tick_period_ms.into()),
         ),
         // The live deployment shape: commitments are availability-verified against the run's
         // content-addressed plane (coordinator-as-storage-client, §6.4 I6). The deterministic

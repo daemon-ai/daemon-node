@@ -1421,10 +1421,8 @@ async fn finish(
             // Quiesce: drain + module snapshot at the fence, snapshot persisted to the payload
             // plane as the leave checkpoint.
             let deadline_ms = u64::try_from(drain_deadline.as_millis()).unwrap_or(u64::MAX);
-            if pump
-                .quiesce(daemon_vhc_abi::QUIESCE_REASON_LEAVE, deadline_ms)
-                .is_err()
-            {
+            if let Err(e) = pump.quiesce(daemon_vhc_abi::QUIESCE_REASON_LEAVE, deadline_ms) {
+                tracing::debug!(run = run_label, error = %e, "graceful leave: quiesce refused; stopping without a checkpoint");
                 let _ = pump.stop(daemon_vhc_abi::STOP_REASON_LEAVE_REQUESTED);
                 let _ = wait_run(run).await;
                 return TerminalOutcome::Left { checkpoint: None };
@@ -1435,19 +1433,46 @@ async fn finish(
                 Ok(RunEnd::Outcome(code)) if code == daemon_vhc_abi::OUTCOME_QUIESCE_READY
             );
             if !quiesced {
+                tracing::debug!(
+                    run = run_label,
+                    ?end,
+                    "graceful leave: drain did not quiesce cleanly"
+                );
                 let _ = events.send(Event::Warning {
                     class: "leave_drain".into(),
                     detail: format!("drain did not quiesce cleanly: {end:?}"),
                 });
                 return TerminalOutcome::Left { checkpoint: None };
             }
-            let checkpoint = match pump.snapshot_capture() {
+            let capture = pump.snapshot_capture();
+            // The snapshot's resync watermark, when the module declared one (the live trainer's
+            // `round` section: the last round this state folds — a restore never re-ingests at or
+            // below it). The pointer carries it so a rejoiner knows which state it is adopting.
+            let round = capture
+                .as_ref()
+                .and_then(|c| {
+                    c.sections.iter().find_map(|(name, bytes)| {
+                        (name == "round")
+                            .then(|| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+                            .flatten()
+                    })
+                })
+                .map(u64::from_le_bytes)
+                .filter(|w| *w != u64::MAX)
+                .unwrap_or(0);
+            let checkpoint = match capture {
                 Some(capture) => persist_drain_snapshot(providers, &capture).await,
-                None => None,
+                None => {
+                    tracing::debug!(
+                        run = run_label,
+                        "graceful leave: guest quiesced but staged no snapshot capture"
+                    );
+                    None
+                }
             };
             if let Some(hash) = &checkpoint {
                 let _ = events.send(Event::CheckpointPublished {
-                    round: 0,
+                    round,
                     hash: hash.clone(),
                     location: format!("payload/{hash}"),
                     generation,
@@ -1534,13 +1559,20 @@ async fn persist_drain_snapshot(
     providers: &RoleProviders,
     capture: &daemon_vhc_host::run::SnapshotCapture,
 ) -> Option<String> {
-    let bytes = encode_snapshot_doc(capture).ok()?;
-    providers
-        .payloads
-        .put_content(&bytes)
-        .await
-        .ok()
-        .map(|hash| hash.to_hex())
+    let bytes = match encode_snapshot_doc(capture) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "drain snapshot: checkpoint document encode failed");
+            return None;
+        }
+    };
+    match providers.payloads.put_content(&bytes).await {
+        Ok(hash) => Some(hash.to_hex()),
+        Err(e) => {
+            tracing::warn!(error = %e, "drain snapshot: checkpoint document put failed");
+            None
+        }
+    }
 }
 
 /// The content-addressed checkpoint document: `[manifest, [[name, section-bytes], …]]` in the

@@ -9,6 +9,9 @@ license.workspace = true
 description = "The node-side vhc-training service: durable vhc.db state, worker supervision, and the VhcApi surface."
 
 [dependencies]
+# Structured diagnostics for the service's lifecycle seams (leave/drain dispatch, checkpoint
+# pointer publication). Events only — the node binary owns the subscriber.
+tracing = { workspace = true }
 # The VhcApi trait + wire DTOs + NodeEvent this service implements / emits (spec §10.4).
 daemon-api = { workspace = true }
 # The frozen worker protocol (Event/Command/Hardware/Eligibility) + the `[vhc]` config type.

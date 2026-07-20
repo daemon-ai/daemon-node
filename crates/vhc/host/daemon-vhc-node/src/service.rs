@@ -845,6 +845,32 @@ impl VhcService {
         }
         self.store
             .set_execution_identity(&run.run_id, id.epoch, &id.role, id.instance)?;
+        // The fresh child holds NO resolved run: a JoinRun without a prior AssessRun is a typed
+        // worker refusal ("JoinRun before AssessRun"). Re-run the assess on THIS child with the
+        // run's envelope and the persisted directed role — exactly what the original join did —
+        // so the child resolves the genesis/module before the join lands. The admitted tuple
+        // still comes from the store (identity continuity), never from this re-assess.
+        if let Some(discovery) = &self.discovery {
+            let assess = async {
+                let envelope = discovery.fetch_envelope(&run.run_id).await?;
+                let elig = worker.assess(envelope, Some(id.role.clone())).await?;
+                if !elig.eligible {
+                    return Err(VhcError::Internal(format!(
+                        "reconverge re-assess ineligible: {}",
+                        elig.reasons.join("; ")
+                    )));
+                }
+                Ok(())
+            };
+            if let Err(e) = assess.await {
+                tracing::warn!(run_id = run.run_id, error = %e, "reconverge: re-assess on the fresh child failed");
+                self.arbiter.release(&id);
+                if self.worker_factory.is_some() {
+                    worker.shutdown().await;
+                }
+                return Err(e);
+            }
+        }
         let persisted_tuple = run
             .admitted_tuple
             .as_deref()
@@ -1063,8 +1089,18 @@ impl VhcService {
                 let discovery = discovery.clone();
                 let (run, round, hash) = (run_id.clone(), *round, hash.clone());
                 tokio::spawn(async move {
-                    let _ = discovery.publish_checkpoint(&run, round, &hash, 0).await;
+                    match discovery.publish_checkpoint(&run, round, &hash, 0).await {
+                        Ok(()) => tracing::debug!(run, round, hash, "checkpoint pointer published"),
+                        Err(e) => {
+                            tracing::warn!(run, round, error = %e, "checkpoint pointer publication failed")
+                        }
+                    }
                 });
+            } else {
+                tracing::debug!(
+                    run_id,
+                    "checkpoint published but no discovery is wired (pointer not recorded)"
+                );
             }
         }
 
@@ -1761,12 +1797,18 @@ impl VhcApi for VhcService {
             .map_err(map)?;
         // The owner took manual control: no reconvergence is pending or owed.
         self.store.clear_retry(&run_id).map_err(map)?;
-        let worker = {
+        let (worker, held) = {
             let instances = self.instances.lock().unwrap();
-            instances
-                .get(&run_id)
-                .map_or_else(|| self.worker.clone(), |e| e.worker.clone())
+            match instances.get(&run_id) {
+                Some(e) => (e.worker.clone(), true),
+                None => (self.worker.clone(), false),
+            }
         };
+        tracing::debug!(
+            run_id,
+            instance_held = held,
+            "vhc leave: dispatching to the run's worker"
+        );
         worker
             .leave(run_id.clone(), to_leave_mode(mode))
             .await

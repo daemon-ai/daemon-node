@@ -39,6 +39,9 @@ use tokio::task::JoinHandle;
 /// receiver is dropped. Shared with each spawned `Worker`'s reader so a respawn keeps pumping.
 type PumpSink = Arc<StdMutex<Option<UnboundedSender<Event>>>>;
 
+/// The graceful-leave terminal waiter: `(run label, fire-once sender)` — see [`Inner::terminal`].
+type TerminalSlot = Arc<StdMutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>>;
+
 /// Construction + tuning for a [`TrainSupervisor`]'s worker (mirrors `WorkerConfig` / `MettaConfig`).
 #[derive(Clone, Debug)]
 pub struct TrainClientConfig {
@@ -162,6 +165,11 @@ struct Inner {
     /// The live event-pump sink (A3). Shared into every spawned worker's reader so the continuous
     /// stream survives a respawn; `None` outside a streaming join (request/reply routing).
     pump: PumpSink,
+    /// A one-shot terminal waiter: `leave()` installs `(run_id, tx)` and the reader fires it on
+    /// that run's `RunTerminated`, so a GRACEFUL leave returns only after the drain (quiesce +
+    /// snapshot + checkpoint publication) actually finished — the caller's teardown must never
+    /// race the drain, and the drain's events must flow through the still-armed pump.
+    terminal: TerminalSlot,
 }
 
 impl TrainSupervisor {
@@ -175,6 +183,7 @@ impl TrainSupervisor {
                 restarts: Mutex::new(Vec::new()),
                 spawns: Mutex::new(0),
                 pump: Arc::new(StdMutex::new(None)),
+                terminal: Arc::new(StdMutex::new(None)),
             }),
         }
     }
@@ -278,19 +287,47 @@ impl TrainSupervisor {
         .await
     }
 
-    /// Leave a run (§10.2). Fire-and-forget. Ends any streaming join: the pump sink is cleared so
-    /// subsequent request/reply commands (ping/probe) route to the inbox again.
+    /// Leave a run (§10.2), returning only after the run's terminal `RunTerminated` (bounded).
+    ///
+    /// The pump sink stays ARMED while the drain runs, so a graceful leave's drain events —
+    /// above all `CheckpointPublished`, which the node turns into the registry checkpoint
+    /// pointer — flow to the node's stream instead of vanishing into the request/reply inbox.
+    /// Only after the terminal (or the drain-deadline-scaled timeout, fail-loud) is the sink
+    /// cleared so subsequent request/reply commands (ping/probe) route to the inbox again.
     pub async fn leave(
         &self,
         run_id: impl Into<String>,
         mode: LeaveMode,
     ) -> Result<(), TrainClientError> {
+        let run_id = run_id.into();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.inner.terminal.lock().expect("terminal lock") = Some((run_id.clone(), tx));
+        let sent = self
+            .send_oneway(Command::Leave {
+                run_id: run_id.clone(),
+                mode,
+            })
+            .await;
+        if sent.is_err() {
+            *self.inner.terminal.lock().expect("terminal lock") = None;
+            *self.inner.pump.lock().expect("pump lock") = None;
+            return sent;
+        }
+        // The worker's drain deadline is 10s (quiesce + snapshot + checkpoint put); triple it so
+        // a slow content plane never truncates a healthy drain. A timeout is loud but not fatal:
+        // the caller's teardown proceeds and the terminal (if it still lands) is idempotent.
+        if tokio::time::timeout(Duration::from_secs(30), rx)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                run_id,
+                "leave: no RunTerminated within the drain window; tearing down anyway"
+            );
+            *self.inner.terminal.lock().expect("terminal lock") = None;
+        }
         *self.inner.pump.lock().expect("pump lock") = None;
-        self.send_oneway(Command::Leave {
-            run_id: run_id.into(),
-            mode,
-        })
-        .await
+        Ok(())
     }
 
     /// Initiate a live module upgrade for a running instance (ABI §10.3; architecture §5.4).
@@ -438,7 +475,7 @@ impl Inner {
             }
             *spawns += 1;
         }
-        Worker::spawn(&self.cfg, self.pump.clone()).await
+        Worker::spawn(&self.cfg, self.pump.clone(), self.terminal.clone()).await
     }
 }
 
@@ -456,7 +493,11 @@ struct Worker {
 
 impl Worker {
     /// Spawn the worker and block until it reports `Ready` (or fails / times out).
-    async fn spawn(cfg: &TrainClientConfig, pump: PumpSink) -> Result<Worker, TrainClientError> {
+    async fn spawn(
+        cfg: &TrainClientConfig,
+        pump: PumpSink,
+        terminal: TerminalSlot,
+    ) -> Result<Worker, TrainClientError> {
         let session = SessionId::new("daemon-vhc-worker");
         // Crash-reporting correlation: forward the node's DSN + current consent and tag the child
         // with this placement's session id + our pid, so a train-worker crash correlates with the
@@ -486,20 +527,51 @@ impl Worker {
             while let Some(bytes) = framed_reader.recv().await {
                 match protocol::decode::<Event>(&bytes) {
                     Ok(event) => {
+                        if matches!(
+                            event,
+                            Event::RunTerminated { .. } | Event::CheckpointPublished { .. }
+                        ) {
+                            tracing::debug!(?event, "worker event received (lifecycle)");
+                        }
+                        // Fire the graceful-leave terminal waiter (regardless of routing): the
+                        // leave caller blocks on this run's RunTerminated. Fired AFTER the event
+                        // has been routed below, so every preceding drain event (above all
+                        // CheckpointPublished) is already in the node's stream when the leave
+                        // returns and teardown proceeds.
+                        let fire_terminal = if let Event::RunTerminated { run_id, .. } = &event {
+                            let mut slot = terminal.lock().expect("terminal lock");
+                            if slot.as_ref().is_some_and(|(r, _)| r == run_id) {
+                                slot.take().map(|(_, tx)| tx)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let mut routed_to_pump = false;
                         if !first {
                             let sink = reader_pump.lock().expect("pump lock").clone();
                             if let Some(tx) = sink {
                                 if tx.send(event.clone()).is_ok() {
-                                    continue;
+                                    routed_to_pump = true;
+                                } else {
+                                    // The node dropped the stream (run left): clear the sink and
+                                    // fall through so THIS event still reaches the inbox.
+                                    *reader_pump.lock().expect("pump lock") = None;
                                 }
-                                // The node dropped the stream (run left): clear the sink and fall
-                                // through so THIS event still reaches the request/reply inbox.
-                                *reader_pump.lock().expect("pump lock") = None;
                             }
                         }
-                        first = false;
-                        if ev_tx.send(event).is_err() {
-                            break;
+                        if !routed_to_pump {
+                            first = false;
+                            if ev_tx.send(event).is_err() {
+                                if let Some(tx) = fire_terminal {
+                                    let _ = tx.send(());
+                                }
+                                break;
+                            }
+                        }
+                        if let Some(tx) = fire_terminal {
+                            let _ = tx.send(());
                         }
                     }
                     Err(e) => {

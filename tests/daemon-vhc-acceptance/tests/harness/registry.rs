@@ -81,6 +81,11 @@ impl FixtureRegistry {
         self.objects.lock().unwrap().get(key).cloned()
     }
 
+    /// The latest published checkpoint pointer (the churn/restore gates wait on it).
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        self.checkpoint.lock().unwrap().clone()
+    }
+
     /// Inject a raw binary frame to EVERY connected control-plane peer — the adversarial-injection
     /// seat for the malformed-frame / bad-certificate gate. The relay is byte-opaque, so whatever
     /// is injected reaches each node's §12.1 attach exactly as a peer frame would; a well-behaved
