@@ -324,7 +324,7 @@ impl GuestModule for Coordinator {
                         }
                         let receipt = VhcMessage::StorageReceipt(StorageReceipt {
                             round,
-                            verified: vec![entry.clone()],
+                            verified: vec![entry],
                         });
                         let authorized =
                             Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
