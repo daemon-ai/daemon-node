@@ -99,6 +99,10 @@ enum Cmd {
     /// The single merge gate (D-P10): `vhc-ci-det` + `vhc-ci-t2` + `vhc-ci-node` + the
     /// multi-process acceptance suite. Nothing merges on the deterministic subset alone; every
     /// integration branch passes `vhc-production-gate` before it merges.
+    ///
+    /// `VHC_GATE_PARALLEL=1` (opt-in; default stays fully serial) overlaps the det and t2 lanes
+    /// after a single shared preflight, with per-lane thread caps summing to <=16 on a 32-thread
+    /// host; the acceptance lane always runs strictly after both.
     VhcProductionGate,
     /// Tokenize a corpus into fixed-width shards + `manifest.json` (spec §8; M1 seam).
     TokenizeCorpus {
@@ -939,11 +943,68 @@ fn vhc_acceptance() -> anyhow::Result<()> {
 /// suites, and the multi-process acceptance suite. Every integration branch passes this
 /// aggregate before it merges; nothing merges on the deterministic subset alone.
 fn vhc_production_gate() -> anyhow::Result<()> {
-    println!("== vhc-production-gate: vhc-ci-det + vhc-ci-t2 + vhc-acceptance ==");
-    vhc_ci_det()?;
-    vhc_ci_t2()?;
+    let gate_started = std::time::Instant::now();
+    let parallel = std::env::var("VHC_GATE_PARALLEL").is_ok_and(|v| v == "1");
+    println!(
+        "== vhc-production-gate: vhc-ci-det + vhc-ci-t2 + vhc-acceptance{} ==",
+        if parallel { " (det ∥ t2)" } else { "" }
+    );
+    if parallel {
+        // Opt-in bounded lane overlap (`VHC_GATE_PARALLEL=1`): the det and t2 lanes are both
+        // dominated by serially-executed test binaries, so overlapping them recovers idle cores
+        // while the per-lane libtest caps keep the TOTAL at det (3 groups x 4 threads = 12) +
+        // t2 (1 x 4) = 16 threads. The shared dep-check + guest-build preflight runs ONCE up
+        // front (both lanes start with the identical preflight; running it twice concurrently
+        // would race the guest-manifest write). The heavyweight acceptance lane (release build +
+        // three real node processes per gate) stays strictly after both. Default (env unset)
+        // remains the fully serial historical order.
+        println!("\n== vhc-production-gate: shared preflight (dep-check + guests) ==");
+        vhc_dep_check()?;
+        build_guests()?;
+        let det_schedule = det_schedule_from_env();
+        let t2_schedule = LaneSchedule {
+            groups: 1,
+            test_threads: Some(4),
+        };
+        let (det_result, t2_result) = std::thread::scope(|scope| {
+            let det = scope.spawn(move || {
+                let started = std::time::Instant::now();
+                let result = vhc_ci_det_suites(det_schedule);
+                (result, started.elapsed())
+            });
+            let t2_started = std::time::Instant::now();
+            let t2 = (vhc_ci_t2_suites(t2_schedule), t2_started.elapsed());
+            (det.join().expect("det lane thread panicked"), t2)
+        });
+        println!(
+            "\nvhc-production-gate: det lane {:.0?}, t2 lane {:.0?}",
+            det_result.1, t2_result.1
+        );
+        // Report BOTH lanes before failing so a double-red run shows both reds.
+        match (det_result.0, t2_result.0) {
+            (Ok(()), Ok(())) => {}
+            (det, t2) => {
+                if let Err(e) = &det {
+                    eprintln!("vhc-production-gate: det lane RED: {e:#}");
+                }
+                if let Err(e) = &t2 {
+                    eprintln!("vhc-production-gate: t2 lane RED: {e:#}");
+                }
+                det?;
+                t2?;
+            }
+        }
+    } else {
+        vhc_ci_det()?;
+        vhc_ci_t2()?;
+    }
+    let acceptance_started = std::time::Instant::now();
     vhc_acceptance()?;
-    println!("\nvhc-production-gate: GREEN (det + t2 + node + acceptance)");
+    println!(
+        "\nvhc-production-gate: GREEN (det + t2 + node + acceptance; acceptance {:.0?}, total {:.0?})",
+        acceptance_started.elapsed(),
+        gate_started.elapsed()
+    );
     Ok(())
 }
 
