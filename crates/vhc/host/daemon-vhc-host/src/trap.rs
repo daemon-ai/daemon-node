@@ -78,6 +78,14 @@ pub enum TrapCode {
     /// / runner faults, ABI §7.6/§15). A stale/unknown tensor handle is [`Self::StaleHandle`] /
     /// [`Self::InvalidHandle`] instead — this code is the *device* failure, never the handle one.
     ComputeFault,
+    /// A misframed `state_emit` (ABI §12.14 [SF-4]): an empty chunk, a chunk larger than the
+    /// run-pinned `state_chunk_size`, or an emit past the stream's declared `byte_len`. Framing
+    /// is deliberately coarse — per-parameter tail alignment is a fold-identity concern, not a
+    /// host trap. A grant breach is [`Self::GrantViolation`] instead.
+    StateMisframedEmit,
+    /// A `state_seal` on a stream whose emitted bytes ≠ its declared `byte_len` (ABI §12.14
+    /// [SF-4]): the stream stays open (complete and retry); nothing was made durable.
+    StateIncompleteSeal,
 }
 
 impl TrapCode {
@@ -113,6 +121,8 @@ impl TrapCode {
             Self::MigrateBudget => "MigrateBudget",
             Self::QuiesceDeadlineExceeded => "QuiesceDeadlineExceeded",
             Self::ComputeFault => "ComputeFault",
+            Self::StateMisframedEmit => "StateMisframedEmit",
+            Self::StateIncompleteSeal => "StateIncompleteSeal",
         }
     }
 }
@@ -216,6 +226,8 @@ mod tests {
             TrapCode::MigrateBudget,
             TrapCode::QuiesceDeadlineExceeded,
             TrapCode::ComputeFault,
+            TrapCode::StateMisframedEmit,
+            TrapCode::StateIncompleteSeal,
         ];
         let mut slugs: Vec<&str> = codes.iter().map(|c| c.slug()).collect();
         slugs.sort_unstable();

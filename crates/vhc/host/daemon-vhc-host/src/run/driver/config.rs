@@ -102,6 +102,30 @@ pub struct RunConfig {
     /// fence (`0` = unbounded by this grant). Breach traps `GrantViolation` — the guest must
     /// fence (and handle `Event::Fence`) to reclaim depth.
     pub compute_queue_depth: u64,
+    // ---- the det-state plane (ABI §12.14 [SF-4]/[SF-7]) ---------------------------------------
+    /// The run-pinned `state_chunk_size` from the genesis state contract (ABI §12.14 [SF-5]).
+    /// `0` = no state contract ⇒ the state plane is not provisioned and `state_open` traps
+    /// typed. Set by the session/worker from `GenesisEnvelope.run.state_contract`.
+    pub state_chunk_size: u64,
+    /// `state-streams-max` (ABI §12.14 [SF-7]): concurrent open state write streams
+    /// (`0` = unbounded by this grant). Breach traps `GrantViolation`.
+    pub state_streams_max: u64,
+    /// `state-write-budget.max_bytes` ([SF-7]): the per-emit byte ceiling (`0` = unbounded).
+    /// Breach traps `GrantViolation` (writes are guest-driven, so attributable).
+    pub state_emit_max_bytes: u64,
+    /// `state-write-budget.rate_per_min` ([SF-7]): the write token-bucket rate in raw bytes per
+    /// minute (`0` = unbounded). Live-pump enforcement only (logical pump time) — replay is not
+    /// the budget gate, the epoch-watchdog posture.
+    pub state_write_rate_per_min: u64,
+    /// `state-store-bytes` ([SF-7]): the live retained-byte ceiling across sealed families
+    /// (`0` = unbounded). Enforced at `state_seal` after retention eviction; a seal that would
+    /// still exceed it is refused typed and rolled back.
+    pub state_store_bytes: u64,
+    /// `state_retain_roots` ([SF-7], design §8.2): sealed roots retained per family beyond the
+    /// pinned set (`0` = unbounded retention). Default
+    /// [`daemon_vhc_proto::STATE_RETAIN_ROOTS_DEFAULT`] — the current round base and the
+    /// freshly sealed round.
+    pub state_retain_roots: u64,
     // ---- migration grant (Phase E, ABI §2.6 `migration-grant` / §10.2) ------------------------
     /// `migration-grant.max_sections`: the max sections one `snapshot_state` manifest may declare
     /// (`0` = unbounded by this grant). Exceeding it returns `SNAPSHOT_STATE_GRANT_EXCEEDED`.
@@ -150,6 +174,12 @@ impl RunConfig {
             max_live_buffer_bytes: 1 << 26,
             max_outstanding_ops: 16,
             compute_queue_depth: 1024,
+            state_chunk_size: 0,
+            state_streams_max: 0,
+            state_emit_max_bytes: 0,
+            state_write_rate_per_min: 0,
+            state_store_bytes: 0,
+            state_retain_roots: daemon_vhc_proto::STATE_RETAIN_ROOTS_DEFAULT,
             migration_max_sections: 0,
             migration_max_section_bytes: 0,
             compute_fault_after_ops: None,

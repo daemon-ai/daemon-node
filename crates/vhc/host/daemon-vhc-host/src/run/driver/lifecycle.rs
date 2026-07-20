@@ -177,6 +177,16 @@ pub fn start_run_migrating(
             data_read_budget: run.data_read_budget_bytes,
             data_read_used: 0,
             streams: StreamTable::new(0),
+            state: crate::run::state_store::StateStore::new(
+                crate::run::state_store::StateStoreConfig {
+                    chunk_size: run.state_chunk_size,
+                    streams_max: run.state_streams_max,
+                    emit_max_bytes: run.state_emit_max_bytes,
+                    write_rate_per_min: run.state_write_rate_per_min,
+                    store_bytes_max: run.state_store_bytes,
+                    retain_roots: run.state_retain_roots,
+                },
+            ),
             op_requests: Vec::new(),
             stop_enqueued: false,
             stop_cut: None,
@@ -465,6 +475,10 @@ pub fn start_run_migrating(
                 st.ops.clear();
                 st.streams.clear();
                 st.op_requests.clear();
+                // Torn-fold GC (ABI §12.14 [SF-4]): opened-but-unsealed state streams are never
+                // durable — their staged chunks drop here; only sealed folds outlive the slice
+                // (and the store itself is instance-scoped).
+                st.state.clear_open();
             }
             match run_result {
                 Ok(outcome) => {

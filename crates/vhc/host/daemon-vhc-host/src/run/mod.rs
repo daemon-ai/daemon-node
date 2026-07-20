@@ -24,11 +24,13 @@ pub mod event;
 pub mod journal;
 pub mod ops;
 pub mod replay;
+pub mod state_store;
 pub mod streams;
 
 pub use admission::{
-    admit, apply_admitted_quotas, Admission, DeviceProfile, EnvelopeRoleGrants, FunnelRefusal,
-    MemoryClaim, OwnerPolicy, ParticipationLane, TierBytes,
+    admit, apply_admitted_quotas, apply_state_grant_bounds, Admission, DeviceProfile,
+    EnvelopeRoleGrants, FunnelRefusal, MemoryClaim, OwnerPolicy, ParticipationLane, TierBytes,
+    STATE_RETAIN_ROOTS_GRANT,
 };
 pub use buffer::BufferTable;
 pub use completion::{CompError, CompletionCodecError, CompletionResult, SuccessPayload};
@@ -43,5 +45,9 @@ pub use ops::{OpRequest, OpTable};
 pub use replay::{
     replay, replay_migrating, ReplayEnd, ReplayMigration, ReplayScript, ReplayedDecision,
     ReplayedRun,
+};
+pub use state_store::{
+    SealedFold, StateStore, StateStoreConfig, StateStoreError, StateStoreStats,
+    STATE_STREAM_ID_TOP_BIT,
 };
 pub use streams::StreamTable;

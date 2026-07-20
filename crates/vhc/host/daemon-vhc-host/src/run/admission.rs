@@ -299,6 +299,59 @@ pub fn apply_admitted_quotas(
     cfg.granted_artifacts = q.granted_artifacts.iter().map(|h| h.0).collect();
 }
 
+/// The grant-bound key retention rides under (`state_retain_roots`, ABI §12.14 [SF-7]) — a
+/// count-shaped bound (`max_outstanding`), beside the three byte/stream bounds whose names the
+/// det-state contract pinned in `daemon_vhc_proto::det_state`.
+pub const STATE_RETAIN_ROOTS_GRANT: &str = "state_retain_roots";
+
+/// Copy the det-state grant bounds (ABI §12.14 [SF-7]) from a role's `vhc@2` world grant into
+/// the run config — the host-side sourcing of the state-plane vocabulary from the generic
+/// `WorldGrant.bounds` map (grant names from `daemon_vhc_proto::det_state`; the lane profile
+/// declares no state ceilings yet, so the envelope value stands — tighten-only with no ceiling,
+/// the `tighten(_, 0)` case). An absent bound leaves the config default (unbounded budgets;
+/// `state_retain_roots` defaults to [`daemon_vhc_proto::STATE_RETAIN_ROOTS_DEFAULT`]).
+///
+/// Bound shapes: `state-write-budget` uses `max_bytes` (per-emit ceiling) + `rate_per_min`
+/// (token bucket); `state-store-bytes` uses `max_bytes`; `state-streams-max` and
+/// `state_retain_roots` are count-shaped (`max_outstanding`).
+pub fn apply_state_grant_bounds(
+    role: &daemon_vhc_proto::RoleGrants,
+    cfg: &mut crate::run::RunConfig,
+) {
+    // The role's world table is keyed by the import-namespace name (`"vhc@2"`); tolerate the
+    // short form some fixtures use.
+    let Some(world) = role
+        .worlds
+        .get(daemon_vhc_abi::NS_VHC_V2)
+        .or_else(|| role.worlds.get("vhc"))
+    else {
+        return;
+    };
+    if let Some(b) = world.bounds.get(daemon_vhc_proto::STATE_WRITE_BUDGET_GRANT) {
+        if let Some(max) = b.max_bytes {
+            cfg.state_emit_max_bytes = max;
+        }
+        if let Some(rate) = b.rate_per_min {
+            cfg.state_write_rate_per_min = rate;
+        }
+    }
+    if let Some(b) = world.bounds.get(daemon_vhc_proto::STATE_STORE_BYTES_GRANT) {
+        if let Some(max) = b.max_bytes {
+            cfg.state_store_bytes = max;
+        }
+    }
+    if let Some(b) = world.bounds.get(daemon_vhc_proto::STATE_STREAMS_MAX_GRANT) {
+        if let Some(max) = b.max_outstanding {
+            cfg.state_streams_max = max;
+        }
+    }
+    if let Some(b) = world.bounds.get(STATE_RETAIN_ROOTS_GRANT) {
+        if let Some(n) = b.max_outstanding {
+            cfg.state_retain_roots = n;
+        }
+    }
+}
+
 /// A funnel refusal: which stage refused, the typed code where one is ratified (§9.5: stages 1–3
 /// are local eligibility outcomes with no ABI code; stages 4–5 carry the split codes).
 #[derive(Debug, Clone)]

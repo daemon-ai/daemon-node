@@ -23,7 +23,26 @@ use crate::run::driver::config::SnapshotCapture;
 use crate::run::driver::host::{read_guest, shared_of, stash, write_guest, Host, PARK_RECHECK};
 use crate::run::driver::migration::decode_manifest_sections;
 use crate::run::driver::pump::fire_due_timers;
+use crate::run::state_store::StateStoreError;
 use crate::trap::{Trap, TrapCode};
+
+/// Map a typed state-store refusal onto its trap (ABI §12.14 [SF-4]/[SF-7]): framing faults get
+/// the two dedicated codes; grant breaches are `GrantViolation` (guest-driven, attributable);
+/// unknown streams are handle faults; an unprovisioned state plane (no genesis state contract)
+/// is a grant fault too — the capability was never provisioned for this run.
+fn state_trap(e: StateStoreError, import: &'static str) -> Trap {
+    let code = match &e {
+        StateStoreError::MisframedEmit { .. } => TrapCode::StateMisframedEmit,
+        StateStoreError::IncompleteSeal { .. } => TrapCode::StateIncompleteSeal,
+        StateStoreError::UnknownStream => TrapCode::InvalidHandle,
+        StateStoreError::EmptyFamily => TrapCode::BadEnum,
+        StateStoreError::NotProvisioned
+        | StateStoreError::StreamsExhausted { .. }
+        | StateStoreError::WriteBudget { .. }
+        | StateStoreError::StoreBytes { .. } => TrapCode::GrantViolation,
+    };
+    Trap::new(code, import, None, e.to_string())
+}
 
 /// Link the `vhc@2` imports.
 #[allow(clippy::too_many_lines)]
@@ -601,6 +620,103 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
             stash(&mut c, r)
         },
     )?;
+    // ---- vhc@2 minor 3: the det-state write surface (ABI §12.14 [SF-4]) -------------------------
+    // state_open — open a family write stream: `tag` names the family (e.g. "master"), `byte_len`
+    // declares its total length. Stream ids are counter-deterministic (top-bit namespace, §2.7 dc
+    // class — no journal record; replay re-derives them from call order).
+    linker.func_wrap(
+        NS_VHC_V2,
+        "state_open",
+        |mut c: Caller<'_, Host>,
+         tag_ptr: u32,
+         tag_len: u32,
+         byte_len: u64|
+         -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
+                c.data_mut().enter("state_open")?;
+                let tag_bytes = read_guest(c, tag_ptr, tag_len)?;
+                let tag = String::from_utf8(tag_bytes).map_err(|_| {
+                    Trap::new(
+                        TrapCode::BadEnum,
+                        "state_open",
+                        None,
+                        "the family tag is not UTF-8",
+                    )
+                })?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.state
+                    .open(&tag, byte_len)
+                    .map_err(|e| state_trap(e, "state_open"))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // state_emit — append exactly one chunk: the host copies the span out of linear memory,
+    // blake3-hashes it, and stores it content-addressed ([SF-4]). Coarse framing (`0 < len ≤
+    // chunk_size`, never past the declared byte_len) traps typed; the write budget ([SF-7]
+    // `state-write-budget`) traps `GrantViolation` (guest-driven, attributable). dc class over
+    // replay-reproduced guest memory: no journal record; replay re-executes the emit into a
+    // replay-side state chunk store.
+    linker.func_wrap(
+        NS_VHC_V2,
+        "state_emit",
+        |mut c: Caller<'_, Host>,
+         stream: u64,
+         ptr: u32,
+         len: u32|
+         -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
+                c.data_mut().enter("state_emit")?;
+                let bytes = read_guest(c, ptr, len)?;
+                let shared = c.data().shared.clone();
+                let now = shared.now_ms();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.state
+                    .emit(stream, &bytes, now)
+                    .map_err(|e| state_trap(e, "state_emit"))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // state_seal — close the stream: the host computes the domain-separated family fold over the
+    // accumulated chunk hashes, registers it retained + fetchable ([SF-R1]), enforces retention +
+    // `state-store-bytes` ([SF-7]), and writes the 32-byte fold into guest memory. nr class: the
+    // fold is journaled verbatim (the journal-record-only READBACK_KIND_STATE_SEAL) BEFORE the
+    // guest observes it — replay re-derives the fold over the re-emitted chunks and compares,
+    // the O(1) fold-divergence cross-check. An incomplete seal traps typed and the stream stays
+    // open (complete and retry); a store-bytes refusal rolls the seal back (nothing durable).
+    linker.func_wrap(
+        NS_VHC_V2,
+        "state_seal",
+        |mut c: Caller<'_, Host>, stream: u64, out_ptr: u32| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, Host>| {
+                c.data_mut().enter("state_seal")?;
+                let shared = c.data().shared.clone();
+                let fold = {
+                    let mut st = shared.state.lock().expect("pump lock");
+                    let fold = st
+                        .state
+                        .seal(stream)
+                        .map_err(|e| state_trap(e, "state_seal"))?;
+                    // The nr record (§8.4 rule 4 discipline: journal before the guest observes).
+                    st.sink
+                        .read_back(
+                            stream,
+                            u64::from(daemon_vhc_abi::READBACK_KIND_STATE_SEAL),
+                            RET_STATUS_DELIVERED,
+                            &fold,
+                        )
+                        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    fold
+                };
+                write_guest(c, out_ptr, &fold)?;
+                Ok(0)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
     // cancel — the completion protocol's cancellation (§3.3/§7.5): an outstanding op is retired
     // NOW and its completion (reporting Cancelled) is enqueued deterministically; a late service
     // outcome is ignored. Recordless: the journaled completion result captures the race (§8.3).

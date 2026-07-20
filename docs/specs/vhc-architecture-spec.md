@@ -1011,6 +1011,20 @@ collision-resistant, audit-grade agreement object every peer derives identically
 sealed chunks — a derivable object, not a wire message; it rides checkpoint documents, and
 promotion to an explicit consensus voice is a separately-ratified later change.
 
+Canonical chunk custody is **host-side**: the per-instance state store holds content-addressed
+chunks the guest writes through the ABI's three-state-import stream (open a family stream, emit
+verified chunks — the host hashes at the write, so bytes never leave host custody between emit
+and fetch — seal to the family fold), and a self-sealed fold is fetchable by construction over
+the ordinary content-addressed read path. Only the seal mints a durable artifact: an
+opened-but-unsealed stream's chunks are garbage-collected at instance teardown and the store is
+instance-scoped, so a crash mid-fold leaves nothing observable (the torn-fold rule). Retention
+is grant-declared (`state_retain_roots` per family, plus checkpoint-pinned folds and the init
+artifact), evicted oldest-first with chunks refcounted — content addressing dedups identical
+chunks across rounds structurally. Sealing journals a normal-size cross-check record (the
+journal stays O(records)); tier-1 replay re-executes emits over replay-reproduced guest memory
+into a replay-side chunk store and cross-checks each seal's recorded fold — fold divergence is
+detected at the seal in O(1), and no bulk state is ever archived.
+
 ---
 
 ## 8. The version plane and the message DAG

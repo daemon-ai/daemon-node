@@ -82,6 +82,17 @@ pub struct ReplayScript {
     /// (native-lane arithmetic), journaled verbatim exactly like stream bytes; replay
     /// materializes each export's buffer from here and re-executes no kernel (§8.7).
     pub tensor_exports: VecDeque<(u64, Vec<u8>)>,
+    /// `state_seal` folds (the ABI kind-6 tag-2 records — the state plane's one nr-class
+    /// import, ABI §12.14 [SF-4]): `(stream id, 32-byte fold)` in seal order. Replay
+    /// re-executes the emits over reproduced guest memory (dc class), re-derives each fold,
+    /// and cross-checks it against this record — a mismatch is the typed O(1) fold-divergence
+    /// detection at the seal.
+    pub state_seals: VecDeque<(u64, Vec<u8>)>,
+    /// The run-pinned `state_chunk_size` (genesis state contract, [SF-5]) — a script input the
+    /// harness supplies beside `identity` (it is admission state, not a journal record). `0`
+    /// when the run had no state contract; a replayed guest calling `state_open` then traps
+    /// exactly as the recording did.
+    pub state_chunk_size: u64,
 }
 
 impl ReplayScript {
@@ -105,6 +116,10 @@ impl ReplayScript {
                     } else if *kind == u64::from(daemon_vhc_abi::READBACK_KIND_TENSOR_EXPORT) {
                         // Journal-record-only kind (C1): completion-carried tensor-export bytes.
                         s.tensor_exports.push_back((*src, value.clone()));
+                    } else if *kind == u64::from(daemon_vhc_abi::READBACK_KIND_STATE_SEAL) {
+                        // Journal-record-only kind (the det-state minor): the recorded
+                        // state_seal fold, consumed as the seal's replay cross-check.
+                        s.state_seals.push_back((*src, value.clone()));
                     } else {
                         s.readbacks.push_back((*src, *kind, value.clone()));
                     }
@@ -198,6 +213,14 @@ struct ReplayHost {
     /// Host-partition (completion-minted) buffers, keyed by the handle the journaled completion
     /// frame carries, materialized from `script.payloads` / `script.stream_bytes` at delivery.
     host_buffers: HashMap<u64, Arc<Vec<u8>>>,
+    /// The **replay-side state chunk store** (ABI §12.14 [SF-4]): `state_open`/`state_emit` are
+    /// dc class — re-executed over reproduced guest memory into this store, exactly the way
+    /// `register_chunks` re-executes to rebuild chunk maps — and a later fetch of a self-sealed
+    /// root materializes its range from here, never from the script's payload table (the
+    /// journal stays O(records); `ReplayMissingPayload` cannot fire for a self-sealed root).
+    /// Budgets zero (replay is not the gate) and retention unbounded (a fold the recording
+    /// evicted was already un-fetchable there — nothing completes against it).
+    state: crate::run::state_store::StateStore,
 }
 
 fn diverged(msg: impl std::fmt::Display) -> wasmtime::Error {
@@ -304,11 +327,31 @@ fn dispatch(
                             host.host_buffers.insert(h, Arc::new(bytes.clone()));
                         } else if let Some((hash, off, len)) = host.op_fetches.remove(&op) {
                             // A data.fetch success materializes the RANGE SLICE the recording
-                            // delivered. Chunk-addressed artifact (a re-registered fold
-                            // identity): reassemble the covering span from CHUNK-keyed payload
-                            // table entries and slice — the shard has no whole-object content
+                            // delivered. Self-sealed state fold ([SF-R1]): materialize from the
+                            // replay-side state chunk store — never the payload table
+                            // (`ReplayMissingPayload` cannot fire for a self-sealed root).
+                            // Chunk-addressed artifact (a re-registered fold identity):
+                            // reassemble the covering span from CHUNK-keyed payload table
+                            // entries and slice — the shard has no whole-object content
                             // address. Plain artifact: slice the whole-object table entry.
-                            let slice = if let Some(map) = host.chunk_maps.get(&hash) {
+                            let slice = if let Some(sealed) = host.state.sealed(&hash) {
+                                let end = if len == 0 {
+                                    sealed.byte_len
+                                } else {
+                                    off.saturating_add(len)
+                                };
+                                match host.state.read_range(&hash, off, end) {
+                                    Some(Ok(bytes)) => bytes,
+                                    Some(Err(detail)) => {
+                                        return Err(diverged(format!(
+                                            "fetch completion for op {op:#x} succeeded at the \
+                                             recording but the replay-side state store refuses \
+                                             the range: {detail}"
+                                        )));
+                                    }
+                                    None => unreachable!("sealed() checked above"),
+                                }
+                            } else if let Some(map) = host.chunk_maps.get(&hash) {
                                 let end = if len == 0 {
                                     map.byte_len
                                 } else {
@@ -432,6 +475,77 @@ fn dispatch(
             let id = (1u64 << 63) | host.next_guest_staging_id;
             host.next_guest_staging_id += 1;
             results[0] = Val::I64(id as i64);
+            Ok(())
+        }
+        // ---- vhc@2 state writes (ABI §12.14 [SF-4]) --------------------------------------------
+        // open/emit are dc class: re-executed over the reproduced guest memory into the
+        // replay-side state chunk store (ids counter-deterministic; ordinals bookkeeping-derived
+        // — no journal record). The production store body runs here, so framing faults trap at
+        // replay exactly as they did live.
+        ("vhc@2", "state_open") => {
+            let (tag_ptr, tag_len) = (p_u32(params, 0), p_u32(params, 1));
+            let byte_len = p_u64(params, 2);
+            let mem = mem_of(caller)?;
+            let mut tag = vec![0u8; tag_len as usize];
+            mem.read(&mut *caller, tag_ptr as usize, &mut tag)
+                .map_err(|e| wasmtime::Error::msg(format!("state_open tag read: {e}")))?;
+            let tag = String::from_utf8(tag)
+                .map_err(|_| wasmtime::Error::msg("state_open tag is not UTF-8"))?;
+            let id =
+                caller.data_mut().state.open(&tag, byte_len).map_err(|e| {
+                    wasmtime::Error::msg(format!("state_open refused at replay: {e}"))
+                })?;
+            results[0] = Val::I64(id as i64);
+            Ok(())
+        }
+        ("vhc@2", "state_emit") => {
+            let stream = p_u64(params, 0);
+            let (ptr, len) = (p_u32(params, 1), p_u32(params, 2));
+            let mem = mem_of(caller)?;
+            let mut bytes = vec![0u8; len as usize];
+            mem.read(&mut *caller, ptr as usize, &mut bytes)
+                .map_err(|e| wasmtime::Error::msg(format!("state_emit read: {e}")))?;
+            let ordinal = caller
+                .data_mut()
+                .state
+                .emit(stream, &bytes, 0)
+                .map_err(|e| wasmtime::Error::msg(format!("state_emit refused at replay: {e}")))?;
+            results[0] = Val::I64(ordinal as i64);
+            Ok(())
+        }
+        // seal is the state plane's nr import: re-derive the fold over the re-emitted chunk
+        // hashes and CROSS-CHECK it against the journaled kind-6 record — a mismatch is the
+        // typed fold divergence, O(1) to detect at the seal ([SF-4]).
+        ("vhc@2", "state_seal") => {
+            let (stream, out_ptr) = (p_u64(params, 0), p_u32(params, 1));
+            let host = caller.data_mut();
+            let fold = host
+                .state
+                .seal(stream)
+                .map_err(|e| wasmtime::Error::msg(format!("state_seal refused at replay: {e}")))?;
+            let Some((r_stream, r_fold)) = host.script.state_seals.pop_front() else {
+                return Err(diverged(
+                    "guest sealed a state stream with no journaled seal record (kind 6)",
+                ));
+            };
+            if r_stream != stream {
+                return Err(diverged(format!(
+                    "state_seal on stream {stream:#x} but the journal recorded stream \
+                     {r_stream:#x}"
+                )));
+            }
+            if r_fold != fold {
+                return Err(diverged(format!(
+                    "state_seal fold mismatch: replay re-derived {} but the journal recorded \
+                     {} — the re-executed emits diverge from the recording",
+                    hex8(&fold),
+                    hex8(&r_fold.as_slice().try_into().unwrap_or([0u8; 32]))
+                )));
+            }
+            let mem = mem_of(caller)?;
+            mem.write(&mut *caller, out_ptr as usize, &fold)
+                .map_err(|e| wasmtime::Error::msg(format!("state_seal write: {e}")))?;
+            results[0] = Val::I32(0);
             Ok(())
         }
         ("vhc@2", "snapshot_state") => {
@@ -899,6 +1013,17 @@ pub fn replay_migrating(
             .map_err(|e| RunError::Sandbox(format!("replay link: {e}")))?;
     }
 
+    // The replay-side state store ([SF-4]): the run-pinned chunk size from the script; budgets
+    // zero + retention unbounded (replay is not the budget gate — the recording enforced them).
+    let state =
+        crate::run::state_store::StateStore::new(crate::run::state_store::StateStoreConfig {
+            chunk_size: script.state_chunk_size,
+            streams_max: 0,
+            emit_max_bytes: 0,
+            write_rate_per_min: 0,
+            store_bytes_max: 0,
+            retain_roots: 0,
+        });
     let host = ReplayHost {
         script,
         decisions: Vec::new(),
@@ -915,6 +1040,7 @@ pub fn replay_migrating(
         stream_read_ops: std::collections::HashSet::new(),
         tensor_export_ops: std::collections::HashSet::new(),
         host_buffers: HashMap::new(),
+        state,
     };
     let mut store = Store::new(worker.engine(), host);
     // Replay is not the sandbox gate — the recording already enforced budgets; give the replay

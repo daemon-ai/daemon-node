@@ -56,6 +56,9 @@ fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
         data_read_budget: 0,
         data_read_used: 0,
         streams: StreamTable::new(0),
+        state: crate::run::state_store::StateStore::new(
+            crate::run::state_store::StateStoreConfig::default(),
+        ),
         op_requests: Vec::new(),
         stop_enqueued: false,
         stop_cut: None,
