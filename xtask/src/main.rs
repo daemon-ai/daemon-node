@@ -102,14 +102,41 @@ enum Cmd {
     /// disables; any other value overrides the cache dir (default
     /// `$HOME/.cache/vhc-acceptance-bins`).
     VhcAcceptance,
-    /// The single merge gate (D-P10): `vhc-ci-det` + `vhc-ci-t2` + `vhc-ci-node` + the
-    /// multi-process acceptance suite. Nothing merges on the deterministic subset alone; every
-    /// integration branch passes `vhc-production-gate` before it merges.
+    /// The merge gate (D-P10): the tier-1 det aggregate (which folds `vhc-ci-node`), the tier-2
+    /// whole-run suites, and the multi-process acceptance suite.
     ///
-    /// `VHC_GATE_PARALLEL=1` (opt-in; default stays fully serial) overlaps the det and t2 lanes
-    /// after a single shared preflight, with per-lane thread caps summing to <=16 on a 32-thread
-    /// host; the acceptance lane always runs strictly after both.
-    VhcProductionGate,
+    /// DIFF-SCOPED by default, exactly like `just lint`: history at the base has already been
+    /// gated, so re-testing the whole tree on every iteration is waste. Changed files vs the
+    /// merge-base with the base ref (default `vhc-integration`; override via GATE_BASE or
+    /// `--base` — the LINT_BASE convention), unioned with staged/unstaged/untracked, map to
+    /// workspace crates and expand through the cargo dependency graph to reverse-dependents;
+    /// only that cone of the pinned battery runs, with identical per-suite semantics. Non-crate
+    /// inputs map conservatively: `crates/vhc/guests/` selects every guest-linked suite; xtask,
+    /// Cargo.lock, the root Cargo.toml, the flake, `.cargo/`, `vendor/`, and any UNMAPPED path
+    /// fail CLOSED into the full battery — selection can only over-include, never under. The
+    /// acceptance lane runs whenever the cone reaches the product binaries.
+    ///
+    /// Lanes memoize green runs by workspace fingerprint (`target/vhc-green-ledger/`;
+    /// VHC_GATE_MEMO=0 disables), so re-gating a byte-identical tree — e.g. right after a no-ff
+    /// merge of an already-gated tip — re-verifies nothing and reports "green (memoized)".
+    ///
+    /// The full-tree battery remains `--all` (manual pre-release / post-rebase only —
+    /// deliberately wired into NO workflow). `VHC_GATE_PARALLEL=1` (opt-in) overlaps the det and
+    /// t2 lanes in `--all` runs, per-lane thread caps summing to <=16 on a 32-thread host.
+    VhcProductionGate {
+        /// Run the FULL pinned battery regardless of the diff (the `lint-all` analogue: a manual
+        /// pre-release / post-rebase pass, deliberately wired into no workflow).
+        #[arg(long)]
+        all: bool,
+        /// Base ref for the diff scope (default: env GATE_BASE, else `vhc-integration`). The
+        /// changed set is the merge-base diff vs HEAD unioned with staged/unstaged/untracked.
+        #[arg(long)]
+        base: Option<String>,
+        /// Print the selection (changed set -> crate cone -> suites) and exit WITHOUT running
+        /// anything or touching the green ledger. For inspecting what a diff would gate.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Tokenize a corpus into fixed-width shards + `manifest.json` (spec §8; M1 seam).
     TokenizeCorpus {
         /// HF dataset repo id (e.g. `roneneldan/TinyStories`); omit when using `--text`.
@@ -232,7 +259,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::VhcCiNode => vhc_ci_node(),
         Cmd::VhcDepCheck => vhc_dep_check(),
         Cmd::VhcAcceptance => vhc_acceptance(),
-        Cmd::VhcProductionGate => vhc_production_gate(),
+        Cmd::VhcProductionGate { all, base, dry_run } => vhc_production_gate(all, base, dry_run),
         Cmd::TokenizeCorpus {
             dataset,
             dataset_file,
@@ -548,20 +575,36 @@ fn run_lane_suites(
 /// The `daemon-conformance` detached-delegation trio (a known parallel-load flake, pass-in-isolation
 /// = green) is NOT a vhc crate and NOT in this list, so it never gates the vhc tier.
 fn vhc_ci_det() -> anyhow::Result<()> {
-    // Dependency-direction invariant (architecture §7) first — cheap (metadata only) and fails fast
-    // on a host/*->sdk/* regression before spending a compile.
-    println!("\n== vhc-ci-det: daemon-vhc dependency-direction check ==");
-    vhc_dep_check()?;
-    build_guests()?;
-    vhc_ci_det_suites(det_schedule_from_env())
+    run_lane_memoized(&workspace_root(), "vhc-ci-det", &[], || {
+        // Dependency-direction invariant (architecture §7) first — cheap (metadata only) and
+        // fails fast on a host/*->sdk/* regression before spending a compile.
+        println!("\n== vhc-ci-det: daemon-vhc dependency-direction check ==");
+        vhc_dep_check()?;
+        build_guests()?;
+        vhc_ci_det_suites(det_schedule_from_env())
+    })
 }
 
 /// The det-lane suite list + scheduler, WITHOUT the dep-check/guest preflight (so the production
 /// gate can run the preflight once and overlap this lane with tier-2). The suite list and each
 /// suite's pass/fail semantics are identical in every schedule — only ordering/overlap changes.
 fn vhc_ci_det_suites(schedule: LaneSchedule) -> anyhow::Result<()> {
-    // (label, cargo test args). Each runs in its own process; the first red aborts.
-    let suites: &[(&str, &[&str])] = &[
+    // The node + supervisor lifecycle suites are part of the SAME mandatory aggregate (the
+    // run-instance state machine and supervision are consensus-adjacent product paths, not a
+    // side lane); `vhc-ci-node` also runs them standalone for focused iteration.
+    let all: Vec<SuiteEntry<'_>> = VHC_DET_SUITES
+        .iter()
+        .chain(VHC_NODE_SUITES)
+        .copied()
+        .collect();
+    run_lane_suites("vhc-ci-det", &all, schedule)?;
+    println!("\nvhc-ci-det: all tier-1 (CPU consensus-critical) vhc suites green");
+    Ok(())
+}
+
+/// The pinned det-lane suite list (label, cargo test args). Each suite runs in its own process;
+/// the first red aborts the lane.
+const VHC_DET_SUITES: &[SuiteEntry<'static>] = &[
         (
             "daemon-vhc-abi (journal §8.3 CDDL grammar validity + per-tag samples)",
             &["-p", "daemon-vhc-abi"],
@@ -789,15 +832,7 @@ fn vhc_ci_det_suites(schedule: LaneSchedule) -> anyhow::Result<()> {
                 "conformance_proptest",
             ],
         ),
-    ];
-    // The node + supervisor lifecycle suites are part of the SAME mandatory aggregate (the
-    // run-instance state machine and supervision are consensus-adjacent product paths, not a
-    // side lane); `vhc-ci-node` also runs them standalone for focused iteration.
-    let all: Vec<(&str, &[&str])> = suites.iter().chain(VHC_NODE_SUITES).copied().collect();
-    run_lane_suites("vhc-ci-det", &all, schedule)?;
-    println!("\nvhc-ci-det: all tier-1 (CPU consensus-critical) vhc suites green");
-    Ok(())
-}
+];
 
 /// The node + supervisor lifecycle suites (one list, two entry points): the `daemon-vhc-node`
 /// suites cover the durable run-instance state machine (terminal transitions with observed
@@ -847,53 +882,57 @@ fn vhc_ci_node() -> anyhow::Result<()> {
 /// the wasm guests + compiles wasmtime), so it is a separate gate — never folded into
 /// `vhc-ci-det`, which stays the CPU-only deterministic tier-1 bar.
 fn vhc_ci_t2() -> anyhow::Result<()> {
-    // Same dependency-direction preflight as tier-1, then the guests the testkit runs.
-    println!("\n== vhc-ci-t2: daemon-vhc dependency-direction check ==");
-    vhc_dep_check()?;
-    build_guests()?;
-    vhc_ci_t2_suites(LaneSchedule::serial())
+    run_lane_memoized(&workspace_root(), "vhc-ci-t2", &[], || {
+        // Same dependency-direction preflight as tier-1, then the guests the testkit runs.
+        println!("\n== vhc-ci-t2: daemon-vhc dependency-direction check ==");
+        vhc_dep_check()?;
+        build_guests()?;
+        vhc_ci_t2_suites(LaneSchedule::serial())
+    })
 }
 
 /// The tier-2 suite list, WITHOUT the dep-check/guest preflight (see `vhc_ci_det_suites` — same
 /// split, same "scheduling only, never coverage" contract).
 fn vhc_ci_t2_suites(schedule: LaneSchedule) -> anyhow::Result<()> {
-    let suites: &[(&str, &[&str])] = &[
-        (
-            // SDK-side native whole run (architecture §6): the SPARTA-shaped continuous-averaging
-            // toy (timers + gossip, no rounds, no coordinator) converges over the virtual worlds;
-            // the run is bit-for-bit deterministic (the SDK-side analogue of §8.7 input replay) and
-            // stays bounded under a lossy/churn trace.
-            "daemon-vhc-sim (SDK-side native whole run: SPARTA averager over the virtual worlds)",
-            &["-p", "daemon-vhc-sim"],
-        ),
-        (
-            // Host-side whole runs over the PRODUCTION blobs: wasmtime + simulated capability
-            // providers, journaled end-to-end, re-driven through the §8.7 input-replay engine —
-            // every decision reproduced bit-for-bit. Covers the toy_averager whole run, the
-            // compute@2 trainer barrier whole runs under the production coordinator
-            // (single- and 2-worker with cross-worker agreement over the guest-voiced det
-            // digests; SDK-free raw-CBOR config), the adversarial-rig pinned cases (duplicate
-            // record deduped; delayed payloads → stall → catch-up), the mixed-fleet matrix
-            // cells (the whole-run positive + the envelope-v1 typed negatives), the pump-hold
-            // back-pressure rig, and the failover drill.
-            "daemon-vhc-testkit (production-blob whole runs + D2 coordinator lanes)",
-            &["-p", "daemon-vhc-testkit"],
-        ),
-        (
-            // D2's CONSENSUS REPLAY — the third replay tier (architecture §3.6; refactor §10 gate
-            // row "Consensus replay from archive alone", tier-2): a third party re-verifies every
-            // consensus decision and every digest from the record archive's signed, hash-chained,
-            // content-addressed sealed segments + the content-addressed payloads ALONE (no live
-            // journal, no coordinator). Positive + the typed incompleteness negatives (missing
-            // payload, withheld segment, forged/gappy heads).
-            "D2 consensus replay (third tier: digests re-verified from archive + payloads alone)",
-            &["-p", "daemon-vhc-observe", "--test", "consensus_replay"],
-        ),
-    ];
-    run_lane_suites("vhc-ci-t2", suites, schedule)?;
+    run_lane_suites("vhc-ci-t2", VHC_T2_SUITES, schedule)?;
     println!("\nvhc-ci-t2: all tier-2 (sim/testkit) whole-run suites green");
     Ok(())
 }
+
+/// The pinned tier-2 suite list (label, cargo test args).
+const VHC_T2_SUITES: &[SuiteEntry<'static>] = &[
+    (
+        // SDK-side native whole run (architecture §6): the SPARTA-shaped continuous-averaging
+        // toy (timers + gossip, no rounds, no coordinator) converges over the virtual worlds;
+        // the run is bit-for-bit deterministic (the SDK-side analogue of §8.7 input replay) and
+        // stays bounded under a lossy/churn trace.
+        "daemon-vhc-sim (SDK-side native whole run: SPARTA averager over the virtual worlds)",
+        &["-p", "daemon-vhc-sim"],
+    ),
+    (
+        // Host-side whole runs over the PRODUCTION blobs: wasmtime + simulated capability
+        // providers, journaled end-to-end, re-driven through the §8.7 input-replay engine —
+        // every decision reproduced bit-for-bit. Covers the toy_averager whole run, the
+        // compute@2 trainer barrier whole runs under the production coordinator
+        // (single- and 2-worker with cross-worker agreement over the guest-voiced det
+        // digests; SDK-free raw-CBOR config), the adversarial-rig pinned cases (duplicate
+        // record deduped; delayed payloads → stall → catch-up), the mixed-fleet matrix
+        // cells (the whole-run positive + the envelope-v1 typed negatives), the pump-hold
+        // back-pressure rig, and the failover drill.
+        "daemon-vhc-testkit (production-blob whole runs + D2 coordinator lanes)",
+        &["-p", "daemon-vhc-testkit"],
+    ),
+    (
+        // D2's CONSENSUS REPLAY — the third replay tier (architecture §3.6; refactor §10 gate
+        // row "Consensus replay from archive alone", tier-2): a third party re-verifies every
+        // consensus decision and every digest from the record archive's signed, hash-chained,
+        // content-addressed sealed segments + the content-addressed payloads ALONE (no live
+        // journal, no coordinator). Positive + the typed incompleteness negatives (missing
+        // payload, withheld segment, forged/gappy heads).
+        "D2 consensus replay (third tier: digests re-verified from archive + payloads alone)",
+        &["-p", "daemon-vhc-observe", "--test", "consensus_replay"],
+    ),
+];
 
 /// Run the multi-process acceptance suite (spec §7): three REAL `daemon` node processes on the
 /// full product path. Builds the node + worker binaries in RELEASE first — a debug-compiled
@@ -903,25 +942,27 @@ fn vhc_ci_t2_suites(schedule: LaneSchedule) -> anyhow::Result<()> {
 /// debug test binary; only the spawned product binaries are release.
 fn vhc_acceptance() -> anyhow::Result<()> {
     let root = workspace_root();
-    build_guests()?;
+    run_lane_memoized(&root, "vhc-acceptance", &[], || {
+        build_guests()?;
 
-    let bin_dir = acceptance_release_bins(&root)?;
-    println!(
-        "\n== vhc-acceptance: multi-process gates (bin dir {}) ==",
-        bin_dir.display()
-    );
-    let status = Command::new("cargo")
-        .current_dir(&root)
-        .env("VHC_ACCEPTANCE_BIN_DIR", &bin_dir)
-        .args(["test", "-p", "daemon-vhc-acceptance"])
-        .status()
-        .map_err(|e| anyhow::anyhow!("running the acceptance suite: {e}"))?;
-    anyhow::ensure!(
-        status.success(),
-        "vhc-acceptance: a multi-process gate failed"
-    );
-    println!("\nvhc-acceptance: all multi-process gates green");
-    Ok(())
+        let bin_dir = acceptance_release_bins(&root)?;
+        println!(
+            "\n== vhc-acceptance: multi-process gates (bin dir {}) ==",
+            bin_dir.display()
+        );
+        let status = Command::new("cargo")
+            .current_dir(&root)
+            .env("VHC_ACCEPTANCE_BIN_DIR", &bin_dir)
+            .args(["test", "-p", "daemon-vhc-acceptance"])
+            .status()
+            .map_err(|e| anyhow::anyhow!("running the acceptance suite: {e}"))?;
+        anyhow::ensure!(
+            status.success(),
+            "vhc-acceptance: a multi-process gate failed"
+        );
+        println!("\nvhc-acceptance: all multi-process gates green");
+        Ok(())
+    })
 }
 
 /// The exact release build the acceptance lane spawns (see `vhc_acceptance` — debug wasmtime
@@ -1045,6 +1086,18 @@ fn acceptance_cache_root() -> Option<PathBuf> {
 /// `acceptance_release_bins` for the soundness argument). Fails (rather than guessing) when the
 /// workspace state cannot be proven — the caller then builds unconditionally.
 fn acceptance_source_key(root: &Path) -> anyhow::Result<String> {
+    let mut hasher = workspace_fingerprint_hasher(root)?;
+    hasher.update(b"args=");
+    hasher.update(ACCEPTANCE_BUILD_ARGS.join(" ").as_bytes());
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// A blake3 hasher primed with the COMPLETE workspace state that can feed a build or test
+/// outcome: the HEAD commit + `git describe` (pins the embedded build metadata), the
+/// working-tree content of every tracked-but-modified and untracked non-ignored file (deletions
+/// included), the toolchain (`rustc -vV`), and the codegen env knobs. Fails (rather than
+/// guessing) when that state cannot be proven — callers then fall back to doing the work.
+fn workspace_fingerprint_hasher(root: &Path) -> anyhow::Result<blake3::Hasher> {
     let git = |args: &[&str]| -> anyhow::Result<String> {
         let out = Command::new("git")
             .current_dir(root)
@@ -1098,8 +1151,6 @@ fn acceptance_source_key(root: &Path) -> anyhow::Result<String> {
     anyhow::ensure!(rustc.status.success(), "rustc -vV failed");
     hasher.update(b"rustc=");
     hasher.update(&rustc.stdout);
-    hasher.update(b"args=");
-    hasher.update(ACCEPTANCE_BUILD_ARGS.join(" ").as_bytes());
     for var in [
         "RUSTFLAGS",
         "CARGO_ENCODED_RUSTFLAGS",
@@ -1112,7 +1163,65 @@ fn acceptance_source_key(root: &Path) -> anyhow::Result<String> {
         hasher.update(b";");
     }
 
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(hasher)
+}
+
+/// The green-run ledger: one file per lane under the (gitignored, repo-local) `target/`, holding
+/// the workspace fingerprint of that lane's last green run. Committed history has already been
+/// gated; a lane requested again for a byte-identical workspace re-verifies nothing, so it is
+/// skipped and reported as memoized. `VHC_GATE_MEMO=0` disables both reading and recording.
+fn lane_ledger_path(root: &Path, lane: &str) -> PathBuf {
+    root.join("target").join("vhc-green-ledger").join(lane)
+}
+
+/// The memo key for a lane: the workspace fingerprint plus any lane-specific identity (e.g. the
+/// diff-scoped gate folds its selected suite set in). `None` = memoization unavailable (disabled
+/// via env, or the workspace state cannot be proven) — the lane then just runs.
+fn lane_memo_key(root: &Path, extra: &[u8]) -> Option<String> {
+    if std::env::var("VHC_GATE_MEMO").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let mut hasher = workspace_fingerprint_hasher(root).ok()?;
+    hasher.update(b"lane-extra=");
+    hasher.update(extra);
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// Does the ledger record a green run of `lane` for exactly this memo key?
+fn lane_memo_green(root: &Path, lane: &str, key: &Option<String>) -> bool {
+    let Some(key) = key else { return false };
+    std::fs::read_to_string(lane_ledger_path(root, lane)).is_ok_and(|s| s.trim() == key)
+}
+
+/// Record a green run of `lane` (best-effort — a write failure only costs a future re-run).
+fn lane_record_green(root: &Path, lane: &str, key: &Option<String>) {
+    let Some(key) = key else { return };
+    let path = lane_ledger_path(root, lane);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("{key}\n"));
+}
+
+/// Run `lane` through the green ledger: skip (and say so) when the workspace fingerprint matches
+/// the lane's last green run, record the fingerprint after a fresh green.
+fn run_lane_memoized(
+    root: &Path,
+    lane: &str,
+    extra: &[u8],
+    run: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let key = lane_memo_key(root, extra);
+    if lane_memo_green(root, lane, &key) {
+        println!(
+            "\n== {lane}: green (memoized — workspace identical to the last green run; \
+             VHC_GATE_MEMO=0 forces a re-run) =="
+        );
+        return Ok(());
+    }
+    run()?;
+    lane_record_green(root, lane, &key);
+    Ok(())
 }
 
 /// Keep the newest `keep` cache entries (by directory mtime — bumped on every hit), delete the
@@ -1140,11 +1249,29 @@ fn prune_acceptance_cache(cache_root: &Path, keep: usize) {
 /// `vhc-ci-node` + the dependency-direction / negative-architecture check), the tier-2 whole-run
 /// suites, and the multi-process acceptance suite. Every integration branch passes this
 /// aggregate before it merges; nothing merges on the deterministic subset alone.
-fn vhc_production_gate() -> anyhow::Result<()> {
+fn vhc_production_gate(all: bool, base: Option<String>, dry_run: bool) -> anyhow::Result<()> {
+    if all {
+        if dry_run {
+            println!(
+                "vhc-production-gate (--all, dry run): would run the FULL battery — {} suite(s) + acceptance",
+                VHC_DET_SUITES.len() + VHC_NODE_SUITES.len() + VHC_T2_SUITES.len()
+            );
+            return Ok(());
+        }
+        vhc_production_gate_all()
+    } else {
+        vhc_gate_diff(base, dry_run)
+    }
+}
+
+/// The FULL pinned battery — the `just lint-all` analogue: a manual pre-release / post-rebase
+/// pass, deliberately wired into no workflow (the default gate entry point is diff-scoped, and
+/// the fail-closed mappings escalate here on their own when a global input changes).
+fn vhc_production_gate_all() -> anyhow::Result<()> {
     let gate_started = std::time::Instant::now();
     let parallel = std::env::var("VHC_GATE_PARALLEL").is_ok_and(|v| v == "1");
     println!(
-        "== vhc-production-gate: vhc-ci-det + vhc-ci-t2 + vhc-acceptance{} ==",
+        "== vhc-production-gate (--all): vhc-ci-det + vhc-ci-t2 + vhc-acceptance{} ==",
         if parallel { " (det ∥ t2)" } else { "" }
     );
     if parallel {
@@ -1156,40 +1283,72 @@ fn vhc_production_gate() -> anyhow::Result<()> {
         // would race the guest-manifest write). The heavyweight acceptance lane (release build +
         // three real node processes per gate) stays strictly after both. Default (env unset)
         // remains the fully serial historical order.
-        println!("\n== vhc-production-gate: shared preflight (dep-check + guests) ==");
-        vhc_dep_check()?;
-        build_guests()?;
+        let root = workspace_root();
+        let memo_key = lane_memo_key(&root, &[]);
+        let det_green = lane_memo_green(&root, "vhc-ci-det", &memo_key);
+        let t2_green = lane_memo_green(&root, "vhc-ci-t2", &memo_key);
+        for (lane, green) in [("vhc-ci-det", det_green), ("vhc-ci-t2", t2_green)] {
+            if green {
+                println!(
+                    "\n== {lane}: green (memoized — workspace identical to the last green run) =="
+                );
+            }
+        }
+        if !det_green || !t2_green {
+            println!("\n== vhc-production-gate: shared preflight (dep-check + guests) ==");
+            vhc_dep_check()?;
+            build_guests()?;
+        }
         let det_schedule = det_schedule_from_env();
         let t2_schedule = LaneSchedule {
             groups: 1,
             test_threads: Some(4),
         };
-        let (det_result, t2_result) = std::thread::scope(|scope| {
-            let det = scope.spawn(move || {
-                let started = std::time::Instant::now();
-                let result = vhc_ci_det_suites(det_schedule);
-                (result, started.elapsed())
-            });
-            let t2_started = std::time::Instant::now();
-            let t2 = (vhc_ci_t2_suites(t2_schedule), t2_started.elapsed());
-            (det.join().expect("det lane thread panicked"), t2)
-        });
-        println!(
-            "\nvhc-production-gate: det lane {:.0?}, t2 lane {:.0?}",
-            det_result.1, t2_result.1
-        );
-        // Report BOTH lanes before failing so a double-red run shows both reds.
-        match (det_result.0, t2_result.0) {
-            (Ok(()), Ok(())) => {}
-            (det, t2) => {
-                if let Err(e) = &det {
-                    eprintln!("vhc-production-gate: det lane RED: {e:#}");
+        match (det_green, t2_green) {
+            (true, true) => {}
+            (false, true) => {
+                vhc_ci_det_suites(det_schedule)?;
+                lane_record_green(&root, "vhc-ci-det", &memo_key);
+            }
+            (true, false) => {
+                vhc_ci_t2_suites(t2_schedule)?;
+                lane_record_green(&root, "vhc-ci-t2", &memo_key);
+            }
+            (false, false) => {
+                let (det_result, t2_result) = std::thread::scope(|scope| {
+                    let det = scope.spawn(move || {
+                        let started = std::time::Instant::now();
+                        let result = vhc_ci_det_suites(det_schedule);
+                        (result, started.elapsed())
+                    });
+                    let t2_started = std::time::Instant::now();
+                    let t2 = (vhc_ci_t2_suites(t2_schedule), t2_started.elapsed());
+                    (det.join().expect("det lane thread panicked"), t2)
+                });
+                println!(
+                    "\nvhc-production-gate: det lane {:.0?}, t2 lane {:.0?}",
+                    det_result.1, t2_result.1
+                );
+                if det_result.0.is_ok() {
+                    lane_record_green(&root, "vhc-ci-det", &memo_key);
                 }
-                if let Err(e) = &t2 {
-                    eprintln!("vhc-production-gate: t2 lane RED: {e:#}");
+                if t2_result.0.is_ok() {
+                    lane_record_green(&root, "vhc-ci-t2", &memo_key);
                 }
-                det?;
-                t2?;
+                // Report BOTH lanes before failing so a double-red run shows both reds.
+                match (det_result.0, t2_result.0) {
+                    (Ok(()), Ok(())) => {}
+                    (det, t2) => {
+                        if let Err(e) = &det {
+                            eprintln!("vhc-production-gate: det lane RED: {e:#}");
+                        }
+                        if let Err(e) = &t2 {
+                            eprintln!("vhc-production-gate: t2 lane RED: {e:#}");
+                        }
+                        det?;
+                        t2?;
+                    }
+                }
             }
         }
     } else {
@@ -1202,6 +1361,339 @@ fn vhc_production_gate() -> anyhow::Result<()> {
         "\nvhc-production-gate: GREEN (det + t2 + node + acceptance; acceptance {:.0?}, total {:.0?})",
         acceptance_started.elapsed(),
         gate_started.elapsed()
+    );
+    Ok(())
+}
+
+/// The packages whose test suites LOAD the built guest `.wasm` bytes at run time (the
+/// `ensure_built()` harness copies + the replay sandbox + the acceptance product path). A change
+/// under `crates/vhc/guests/` compiles into no host crate — it changes these suites' runtime
+/// inputs — so the diff-scoped gate maps guests changes to exactly this set.
+const GUEST_LINKED_PACKAGES: &[&str] = &[
+    "daemon-vhc-host",
+    "daemon-vhc-testkit",
+    "daemon-vhc-session",
+    "daemon-vhc-worker",
+    "daemon-vhc-acceptance",
+];
+
+/// Path prefixes that escalate the diff-scoped gate to the FULL battery: they alter the gate
+/// itself, the dependency resolution, the toolchain, or vendored sources — inputs whose blast
+/// radius no crate cone bounds.
+const FULL_GATE_PREFIXES: &[&str] = &["xtask/", ".cargo/", "vendor/"];
+
+/// Root files with the same "no crate cone bounds this" property (the root `Cargo.toml` carries
+/// the workspace dependency + lint tables; the flake pins the devShell toolchain).
+const FULL_GATE_FILES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "flake.nix",
+    "flake.lock",
+    "rust-toolchain.toml",
+];
+
+/// Paths that cannot alter any test outcome: documentation, licensing metadata, and the
+/// lint-layer configs (they gate `just lint` / cargo-deny, which have their own diff-scoped
+/// runners — never `cargo test`).
+const GATE_IGNORED_PREFIXES: &[&str] = &["docs/", ".plans/", "LICENSES/"];
+const GATE_IGNORED_FILES: &[&str] = &[
+    "README.md",
+    "AGENTS.md",
+    "NOTICE",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "REUSE.toml",
+    ".gitignore",
+    ".gitleaks.toml",
+    "typos.toml",
+    "deny.toml",
+    "clippy.toml",
+    "rustfmt.toml",
+];
+
+/// How one changed path maps into the gate.
+enum GateInput {
+    /// Cannot alter a test outcome — selects nothing.
+    Ignored,
+    /// A guests-workspace change — selects every guest-linked suite.
+    Guests,
+    /// Maps to a workspace crate — seeds the reverse-dependency cone.
+    Crate(String),
+    /// A global input (or an unmapped path — fail CLOSED) — escalates to the full battery.
+    FullGate(String),
+}
+
+/// Classify one repo-relative changed path (see the constants above for each bucket's rationale;
+/// order matters: guests and the full-gate globals are carved out before crate mapping, and the
+/// terminal arm fails CLOSED so an unmapped path can only over-select).
+fn classify_gate_input(path: &str, crate_dirs: &[(String, String)]) -> GateInput {
+    if path.starts_with("crates/vhc/guests/") {
+        return GateInput::Guests;
+    }
+    if FULL_GATE_PREFIXES.iter().any(|p| path.starts_with(p)) || FULL_GATE_FILES.contains(&path) {
+        return GateInput::FullGate(format!("global input changed: {path}"));
+    }
+    // Longest-prefix crate match, so a nested fixture project maps to the crate that owns it.
+    if let Some((_, name)) = crate_dirs
+        .iter()
+        .filter(|(dir, _)| path.starts_with(dir.as_str()))
+        .max_by_key(|(dir, _)| dir.len())
+    {
+        return GateInput::Crate(name.clone());
+    }
+    if GATE_IGNORED_PREFIXES.iter().any(|p| path.starts_with(p))
+        || GATE_IGNORED_FILES.contains(&path)
+    {
+        return GateInput::Ignored;
+    }
+    GateInput::FullGate(format!("unmapped path (failing closed): {path}"))
+}
+
+/// The changed-file set the diff-scoped gate selects over — the `_lint-changed` convention:
+/// committed changes vs the merge-base with the base ref, unioned with staged/unstaged/untracked.
+fn gate_changed_files(root: &Path, base: &str) -> anyhow::Result<Vec<String>> {
+    let git = |args: &[&str]| -> anyhow::Result<String> {
+        let out = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("git {args:?}: {e}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let merge_base = git(&["merge-base", "HEAD", base])?.trim().to_string();
+    let mut files: std::collections::BTreeSet<String> =
+        git(&["diff", "--name-only", "--no-renames", &merge_base, "HEAD"])?
+            .lines()
+            .map(str::to_string)
+            .collect();
+    for line in git(&["status", "--porcelain=v1", "-uall", "--no-renames"])?.lines() {
+        let Some(path) = line.get(3..) else { continue };
+        // git quotes paths with special characters; refuse to guess at un-escaping (the caller
+        // fails closed into the full battery).
+        anyhow::ensure!(
+            !path.starts_with('"'),
+            "dirty path needs git unquoting: {path}"
+        );
+        files.insert(path.to_string());
+    }
+    Ok(files.into_iter().collect())
+}
+
+/// The workspace members from `cargo metadata --no-deps`: (name, repo-relative crate dir,
+/// declared dependency names — every kind, optional included, so feature edges over-select
+/// rather than under).
+#[allow(clippy::type_complexity)]
+fn workspace_members(root: &Path) -> anyhow::Result<Vec<(String, String, Vec<String>)>> {
+    let out = Command::new("cargo")
+        .current_dir(root)
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("cargo metadata: {e}"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| anyhow::anyhow!("parse cargo metadata: {e}"))?;
+    let packages = meta["packages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("cargo metadata: no packages array"))?;
+    let mut members = Vec::new();
+    for pkg in packages {
+        let name = pkg["name"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("package without a name"))?
+            .to_string();
+        let manifest = Path::new(
+            pkg["manifest_path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("package {name} without manifest_path"))?,
+        );
+        let dir = manifest
+            .parent()
+            .and_then(|d| d.strip_prefix(root).ok())
+            .map(|d| format!("{}/", d.display()))
+            .ok_or_else(|| anyhow::anyhow!("crate dir outside the workspace for {name}"))?;
+        let deps = pkg["dependencies"]
+            .as_array()
+            .map(|deps| {
+                deps.iter()
+                    .filter_map(|d| d["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        members.push((name, dir, deps));
+    }
+    Ok(members)
+}
+
+/// Expand seed crates through the REVERSE dependency graph (workspace members only, every
+/// dependency kind): everything whose build or tests can observe a seed changes with it.
+fn reverse_dependents(
+    members: &[(String, String, Vec<String>)],
+    seeds: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let mut affected = seeds.clone();
+    loop {
+        let mut grew = false;
+        for (name, _, deps) in members {
+            if !affected.contains(name) && deps.iter().any(|d| affected.contains(d)) {
+                affected.insert(name.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            return affected;
+        }
+    }
+}
+
+/// The DIFF-SCOPED gate — the default behavior of `vhc-production-gate`, applying the repo's
+/// lint doctrine to tests: history at the base has already been gated, so only the delta's cone
+/// needs re-checking. Changed files (merge-base with the base ref + staged/unstaged/untracked)
+/// map to workspace crates and expand through the reverse dependency graph; only the pinned
+/// battery suites of affected packages run (identical per-suite semantics), plus the acceptance
+/// lane whenever the affected cone reaches the product binaries. Every non-crate input maps
+/// conservatively (see `classify_gate_input`) and unknowns fail CLOSED into the full battery, so
+/// selection can only over-include, never under.
+fn vhc_gate_diff(base: Option<String>, dry_run: bool) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let root = workspace_root();
+    let base = base
+        .or_else(|| std::env::var("GATE_BASE").ok().filter(|b| !b.is_empty()))
+        .unwrap_or_else(|| "vhc-integration".to_string());
+    println!("== vhc-production-gate (diff-scoped vs `{base}`; --all for the full battery) ==");
+
+    let changed = match gate_changed_files(&root, &base) {
+        Ok(changed) => changed,
+        Err(e) => {
+            println!("vhc-production-gate: cannot compute the changed set ({e:#}) — failing closed into the full battery");
+            if dry_run {
+                println!("(dry run) would run the full battery");
+                return Ok(());
+            }
+            return vhc_production_gate_all();
+        }
+    };
+    let members = workspace_members(&root)?;
+    let crate_dirs: Vec<(String, String)> = members
+        .iter()
+        .map(|(name, dir, _)| (dir.clone(), name.clone()))
+        .collect();
+
+    let mut seeds: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut guests_changed = false;
+    let mut ignored = 0usize;
+    for path in &changed {
+        match classify_gate_input(path, &crate_dirs) {
+            GateInput::Ignored => ignored += 1,
+            GateInput::Guests => guests_changed = true,
+            GateInput::Crate(name) => {
+                seeds.insert(name);
+            }
+            GateInput::FullGate(reason) => {
+                println!("vhc-production-gate: {reason}");
+                if dry_run {
+                    println!("(dry run) would run the full battery");
+                    return Ok(());
+                }
+                return vhc_production_gate_all();
+            }
+        }
+    }
+
+    let mut affected = reverse_dependents(&members, &seeds);
+    if guests_changed {
+        // Guest bytes are runtime inputs to the guest-linked suites, not compile inputs to any
+        // host crate — select those suites directly (no reverse expansion needed or sound).
+        affected.extend(GUEST_LINKED_PACKAGES.iter().map(|p| p.to_string()));
+    }
+
+    let battery: Vec<SuiteEntry<'_>> = VHC_DET_SUITES
+        .iter()
+        .chain(VHC_NODE_SUITES)
+        .chain(VHC_T2_SUITES)
+        .copied()
+        .collect();
+    let selected: Vec<SuiteEntry<'_>> = battery
+        .into_iter()
+        .filter(|(_, args)| affected.contains(suite_package(args)))
+        .collect();
+    // The acceptance lane gates the PRODUCT binaries: it is affected exactly when the cone
+    // reaches them (or the suite itself changed).
+    let acceptance = ["daemon", "daemon-vhc-worker", "daemon-vhc-acceptance"]
+        .iter()
+        .any(|p| affected.contains(*p));
+
+    println!(
+        "vhc-production-gate: {} changed file(s) ({} test-neutral) -> {} seed crate(s){} -> {} affected package(s) -> {} suite(s){}",
+        changed.len(),
+        ignored,
+        seeds.len(),
+        if guests_changed { " + guests" } else { "" },
+        affected.len(),
+        selected.len(),
+        if acceptance { " + acceptance" } else { "" },
+    );
+    if !seeds.is_empty() {
+        println!(
+            "  seeds: {}",
+            seeds.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if dry_run {
+        for (label, _) in &selected {
+            println!("  would run: {label}");
+        }
+        if acceptance {
+            println!("  would run: the multi-process acceptance suite");
+        }
+        println!("(dry run) nothing executed, ledger untouched");
+        return Ok(());
+    }
+    if selected.is_empty() && !acceptance {
+        println!(
+            "\nvhc-production-gate: no affected test targets — green (nothing to re-verify) in {:.0?}",
+            started.elapsed()
+        );
+        return Ok(());
+    }
+
+    // Memoize the whole selection (the workspace fingerprint plus the selected suite identity),
+    // so re-gating an identical tree — e.g. right after a no-ff merge of a gated tip — is free.
+    let mut selection_id = String::new();
+    for (label, _) in &selected {
+        selection_id.push_str(label);
+        selection_id.push('\n');
+    }
+    selection_id.push_str(if acceptance {
+        "+acceptance"
+    } else {
+        "-acceptance"
+    });
+    run_lane_memoized(&root, "vhc-gate-diff", selection_id.as_bytes(), || {
+        if !selected.is_empty() {
+            println!("\n== vhc-production-gate: preflight (dep-check + guests) ==");
+            vhc_dep_check()?;
+            build_guests()?;
+            run_lane_suites("vhc-gate-diff", &selected, det_schedule_from_env())?;
+        }
+        if acceptance {
+            vhc_acceptance()?;
+        }
+        Ok(())
+    })?;
+    println!(
+        "\nvhc-production-gate: GREEN (diff-scoped: {} suite(s){}) in {:.0?}",
+        selected.len(),
+        if acceptance { " + acceptance" } else { "" },
+        started.elapsed()
     );
     Ok(())
 }
