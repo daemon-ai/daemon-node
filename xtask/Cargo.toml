@@ -22,6 +22,10 @@ serde = { workspace = true }
 # raw `reqwest::Client` in xtask code — the clippy `disallowed_types` ban is respected) and the
 # `tokenizers` crate does the BPE. Versions match the workspace lock (tokenizers 0.22, hf-hub 0.5).
 daemon-vhc-session = { workspace = true }
+# `build-guests`: the shared guest-workspace builder (reproducibility remap env + cross-process
+# build lock) — the same code path every wasm-backed test harness builds through, so the manifest
+# this command pins and the bytes the suites rebuild can never diverge on build env.
+daemon-vhc-guest-build = { workspace = true }
 # The chunk-addressed corpus contract (`tokenize-corpus` / `publish-corpus`): the canonical-CBOR
 # CorpusManifest + shard fold identities live in the proto contracts crate.
 daemon-vhc-proto = { workspace = true }

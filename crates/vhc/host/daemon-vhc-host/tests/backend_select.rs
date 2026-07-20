@@ -16,35 +16,13 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(feature = "wgpu")]
 
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use daemon_vhc_host::run::{start_run, MemorySink, RunConfig, RunError, RunIdentity};
 use daemon_vhc_host::{DeviceComputeGuard, EngineConfig, Worker};
 
-fn guests_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../guests")
-        .canonicalize()
-        .expect("guests workspace path")
-}
-
-static BUILD: Once = Once::new();
-
 fn guest(name: &str) -> Vec<u8> {
-    BUILD.call_once(|| {
-        let status = Command::new("cargo")
-            .current_dir(guests_root())
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("RUSTC_WRAPPER")
-            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
-            .status()
-            .expect("run cargo for guests");
-        assert!(status.success(), "building guest modules failed");
-    });
-    let path = guests_root().join(format!("target/wasm32-unknown-unknown/release/{name}.wasm"));
-    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    daemon_vhc_guest_build::guest_wasm(name)
 }
 
 /// An unavailable admitted wgpu backend (device-less runner OR an occupied device-compute

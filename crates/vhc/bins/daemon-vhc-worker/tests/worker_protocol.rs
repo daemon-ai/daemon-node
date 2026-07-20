@@ -26,7 +26,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Once;
 use std::time::Duration;
 
@@ -38,35 +37,11 @@ use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
 // -- guest module loading (mirrors tests/join.rs) ---------------------------------------------
 
-fn guests_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../guests")
-        .canonicalize()
-        .expect("guests workspace path")
-}
-
 fn guest_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("VHC_TEST_GUEST_DIR") {
         return PathBuf::from(dir);
     }
-    guests_root().join("target/wasm32-unknown-unknown/release")
-}
-
-/// RUSTFLAGS that make the guest `.wasm` byte-reproducible across checkouts/machines by remapping the
-/// absolute prefixes rustc embeds in panic locations (the `<checkout>` root + the cargo registry).
-/// MUST match `xtask build-guests` (`guest_remap_rustflags`) so a local rebuild reproduces the bytes
-/// recorded in the committed `guests/guests.blake3`.
-fn guest_remap_rustflags() -> String {
-    let root = guests_root();
-    let checkout = root.ancestors().nth(3).unwrap_or(&root).to_path_buf();
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo"));
-    format!(
-        "--remap-path-prefix={}=/daemon-node --remap-path-prefix={}=/cargo",
-        checkout.display(),
-        cargo_home.display(),
-    )
+    daemon_vhc_guest_build::guests_root().join("target/wasm32-unknown-unknown/release")
 }
 
 /// Stale-guest guard (Merge-1 adjudication): compare every module named in the committed
@@ -74,7 +49,7 @@ fn guest_remap_rustflags() -> String {
 /// fails loud; a **hash mismatch** only WARNS (guest bytes are byte-reproducible within one
 /// checkout, not across worktrees — see the Merge-1 decision in `docs/specs/swarm-p2-ledger.md`).
 fn verify_guest_manifest(dir: &Path) {
-    let manifest = guests_root().join("guests.blake3");
+    let manifest = daemon_vhc_guest_build::guests_root().join("guests.blake3");
     let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {
         panic!(
             "read guest manifest {}: {e} — run `cargo run -p xtask -- build-guests`",
@@ -108,15 +83,7 @@ fn ensure_built() {
             verify_guest_manifest(&guest_dir());
             return;
         }
-        let status = Command::new("cargo")
-            .current_dir(guests_root())
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("RUSTC_WRAPPER")
-            .env("RUSTFLAGS", guest_remap_rustflags())
-            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
-            .status()
-            .expect("run cargo for guests (dev shell provides the wasm target)");
-        assert!(status.success(), "building guest modules failed");
+        daemon_vhc_guest_build::ensure_built().unwrap_or_else(|e| panic!("{e}"));
         verify_guest_manifest(&guest_dir());
     });
 }

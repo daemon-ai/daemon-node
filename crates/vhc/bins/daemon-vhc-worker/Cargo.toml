@@ -98,6 +98,9 @@ harness = [
 ]
 
 [dev-dependencies]
+# The shared guest-workspace builder every wasm-backed test suite in this crate goes through
+# (reproducibility remap env + cross-process build lock live there, once). Test-only.
+daemon-vhc-guest-build = { workspace = true }
 # tests/worker_protocol.rs (moved with the bin — `env!("CARGO_BIN_EXE_daemon-vhc-worker")` only
 # resolves in the crate that owns the `[[bin]]` target): spawns the REAL worker binary through the
 # node-side supervisor and directly over the provision cut, against a real tiny-llama `.wasm`.

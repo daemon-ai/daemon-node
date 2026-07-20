@@ -18,9 +18,7 @@
 // Dev/test harness: shells `cargo build` for the guests (same pattern as worker_protocol.rs).
 #![allow(clippy::disallowed_methods)]
 
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use daemon_vhc_abi::AbiRefusalCode;
 use daemon_vhc_host::run::{
@@ -29,42 +27,8 @@ use daemon_vhc_host::run::{
 };
 use daemon_vhc_host::{EngineConfig, TrapCode, Worker};
 
-fn guests_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../guests")
-        .canonicalize()
-        .expect("guests workspace path")
-}
-
-fn guest_remap_rustflags() -> String {
-    let root = guests_root();
-    let checkout = root.ancestors().nth(3).unwrap_or(&root).to_path_buf();
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo"));
-    format!(
-        "--remap-path-prefix={}=/daemon-node --remap-path-prefix={}=/cargo",
-        checkout.display(),
-        cargo_home.display(),
-    )
-}
-
-static BUILD: Once = Once::new();
-
 fn test_claim_wasm() -> Vec<u8> {
-    BUILD.call_once(|| {
-        let status = Command::new("cargo")
-            .current_dir(guests_root())
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("RUSTC_WRAPPER")
-            .env("RUSTFLAGS", guest_remap_rustflags())
-            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
-            .status()
-            .expect("run cargo for guests");
-        assert!(status.success(), "building guest modules failed");
-    });
-    let path = guests_root().join("target/wasm32-unknown-unknown/release/test_claim_v2.wasm");
-    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    daemon_vhc_guest_build::guest_wasm("test_claim_v2")
 }
 
 /// A permissive test lane (numbers are deployment config — §9.6): GPU optional, no floors,

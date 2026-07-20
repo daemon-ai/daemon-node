@@ -338,35 +338,14 @@ fn build_guests() -> anyhow::Result<()> {
         guests.display()
     );
 
-    // xtask is dev tooling; the crate-level `#![allow(clippy::disallowed_methods)]` covers this
-    // developer-controlled spawn.
-    let status = Command::new("cargo")
-        .current_dir(&guests)
-        // The devShell pins `CARGO_TARGET_DIR` to the parent checkout's `target/`; left inherited it
-        // redirects the guests' wasm out of `guests/target/` (where the test harness reads them). The
-        // guests are their own workspace, so clear it and let cargo default to `guests/target/`.
-        .env_remove("CARGO_TARGET_DIR")
-        // The devShell also exports `RUSTC_WRAPPER=sccache` (shared compilation cache). An env
-        // wrapper OVERRIDES the guests workspace's config-wired `rustc-wrapper` reproducibility
-        // shim (`guest-rustc-shim.sh` — the `-C metadata` pin + the wasm32 getrandom backend cfg),
-        // so strip it here (and in every `ensure_built()` copy) to keep the shim authoritative.
-        .env_remove("RUSTC_WRAPPER")
-        // Remap the absolute checkout + cargo-registry prefixes rustc bakes into panic locations.
-        // Together with the guests workspace's COMMITTED Cargo.lock (B3 sitting 2 — without it,
-        // floating registry patch versions re-hashed every SDK-linking guest between builds), this
-        // makes the `.wasm` bytes byte-reproducible across clean rebuilds within one checkout path.
-        // The remaining cross-worktree/machine variance — cargo derives each path package's
-        // `-C metadata` crate-disambiguator from its absolute manifest dir, which reorders the
-        // linked module (remap rewrites path *strings*, not that hash) — is removed by the guests
-        // workspace's `.cargo/config.toml` `rustc-wrapper` (`guest-rustc-shim.sh`), so `.wasm` bytes
-        // (hence `guests.blake3`) are now byte-identical across checkout paths (C2 lead-in). That
-        // wrapper is wired via config, so it applies here AND to the test-harness `ensure_built()`
-        // copies (which apply the SAME remap) without per-call-site coordination.
-        .env("RUSTFLAGS", guest_remap_rustflags(&root))
-        .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to run cargo for the guests workspace: {e}"))?;
-    anyhow::ensure!(status.success(), "building guests failed with {status}");
+    // The SHARED builder (`daemon-vhc-guest-build`): the identical env-scrubbed, remapped,
+    // lock-serialized `cargo build` every wasm-backed test harness goes through. One code path
+    // means the manifest this command pins and the bytes the suites rebuild can never diverge on
+    // build env (the remap/RUSTFLAGS rationale lives with the builder). Together with the guests
+    // workspace's COMMITTED Cargo.lock (B3 sitting 2) and its config-wired `rustc-wrapper`
+    // (`guest-rustc-shim.sh` — the `-C metadata` pin + the wasm32 getrandom backend cfg), the
+    // `.wasm` bytes (hence `guests.blake3`) are byte-identical across checkout paths (C2 lead-in).
+    daemon_vhc_guest_build::build_guests().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Stale-guest guard (an archived engineering-ledger Merge-1 follow-on): write the committed
     // blake3 manifest of
@@ -2071,25 +2050,6 @@ fn vhc_dep_check() -> anyhow::Result<()> {
     }
     println!("\nok: no dependency-direction violations");
     Ok(())
-}
-
-/// RUSTFLAGS that remap the absolute source prefixes rustc embeds in panic locations: the
-/// `<checkout>` root (workspace + path deps like the guest SDK crates) and the cargo registry
-/// (`$CARGO_HOME`, else `$HOME/.cargo`). With the guests' committed `Cargo.lock` this makes the
-/// `.wasm` bytes byte-reproducible across clean rebuilds within one checkout path. The
-/// cross-worktree `-C metadata` reordering that this remap does NOT rewrite is handled separately
-/// by the guests workspace's `rustc-wrapper` (`guest-rustc-shim.sh`, wired in
-/// `crates/vhc/guests/.cargo/config.toml`), so the guests are byte-identical across checkout paths.
-/// Kept in lockstep with the `ensure_built()` copies in the wasm-backed test harnesses.
-fn guest_remap_rustflags(checkout: &Path) -> String {
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo"));
-    format!(
-        "--remap-path-prefix={}=/daemon-node --remap-path-prefix={}=/cargo",
-        checkout.display(),
-        cargo_home.display(),
-    )
 }
 
 /// Hash every built `.wasm` in `guests/target/wasm32-unknown-unknown/release` and write the sorted

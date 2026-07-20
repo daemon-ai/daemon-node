@@ -19,9 +19,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::Command as ProcCommand;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -49,29 +47,8 @@ use daemon_vhc_supervisor::SwitchOutcome;
 
 // -- guest build harness (the established testkit pattern) ----------------------------------------
 
-fn guests_root() -> PathBuf {
-    // crates/vhc/host/daemon-vhc-node -> crates/vhc/guests
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../guests")
-        .canonicalize()
-        .expect("guests workspace path")
-}
-
-static BUILD: Once = Once::new();
-
 fn guest_wasm(name: &str) -> Vec<u8> {
-    BUILD.call_once(|| {
-        let status = ProcCommand::new("cargo")
-            .current_dir(guests_root())
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("RUSTC_WRAPPER")
-            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
-            .status()
-            .expect("run cargo for guests (dev shell provides the wasm target)");
-        assert!(status.success(), "building guest modules failed");
-    });
-    let path = guests_root().join(format!("target/wasm32-unknown-unknown/release/{name}.wasm"));
-    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    daemon_vhc_guest_build::guest_wasm(name)
 }
 
 fn key(seed: u8) -> SigningKey {

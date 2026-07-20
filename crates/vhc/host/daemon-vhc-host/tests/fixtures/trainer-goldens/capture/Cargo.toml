@@ -24,6 +24,7 @@ publish = false
 
 [dependencies]
 daemon-vhc-host = { path = "../../../.." }
+daemon-vhc-guest-build = { path = "../../../../../daemon-vhc-guest-build" }
 daemon-vhc-proto = { path = "../../../../../../contracts/daemon-vhc-proto" }
 daemon-vhc-abi = { path = "../../../../../../contracts/daemon-vhc-abi" }
 daemon-vhc-sdk-profiles = { path = "../../../../../../sdk/daemon-vhc-sdk-profiles" }

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-guest-build"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = """
+The ONE guest-workspace builder every wasm-backed test harness shares: builds the vhc guests
+workspace (`crates/vhc/guests`) for wasm32-unknown-unknown with the reproducibility remap env, and
+serializes the build behind a cross-process advisory lockfile so concurrent test binaries can never
+rewrite guest `.wasm` bytes while another suite is mid-read. Dev/gate tooling by charter — linked
+only by test targets, xtask, and harness-feature-gated oracle code; never by a production binary.
+"""
+
+[dependencies]
+
+[lints]
+workspace = true
