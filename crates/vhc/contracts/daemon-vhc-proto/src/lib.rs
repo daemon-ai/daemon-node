@@ -38,6 +38,7 @@ pub mod grants;
 pub mod hash;
 pub mod merkle;
 pub mod revocation;
+pub mod roster;
 pub mod seat;
 pub mod sign;
 pub mod transition;
@@ -71,6 +72,10 @@ pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
 pub use revocation::{
     RevocationError, RevocationLedger, RunKeyRevocation, RunKeyRevocationBody, REVOCATION_DOMAIN_V2,
+};
+pub use roster::{
+    freshest_per_node, RosterDecision, RosterMutationResponse, RosterRecord, RosterRecordBody,
+    RosterRecordError, RosterSlot, RosterSnapshot, MAX_ROSTER_DIRECT_ADDRS, MAX_ROSTER_ENTRIES,
 };
 pub use seat::{
     ControlEndpoint, SeatDecision, SeatLease, SeatLeaseBody, SeatLeaseError, SeatMutationResponse,
