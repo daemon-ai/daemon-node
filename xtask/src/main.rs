@@ -92,7 +92,7 @@ enum Cmd {
     VhcAcceptance,
     /// The single merge gate (D-P10): `vhc-ci-det` + `vhc-ci-t2` + `vhc-ci-node` + the
     /// multi-process acceptance suite. Nothing merges on the deterministic subset alone; every
-    /// branch in this program passes `vhc-production-gate`.
+    /// integration branch passes `vhc-production-gate` before it merges.
     VhcProductionGate,
     /// Tokenize a corpus into fixed-width shards + `manifest.json` (spec §8; M1 seam).
     TokenizeCorpus {
@@ -758,8 +758,8 @@ fn vhc_acceptance() -> anyhow::Result<()> {
 
 /// The single merge gate (D-P10): the deterministic tier-1 aggregate (which already folds
 /// `vhc-ci-node` + the dependency-direction / negative-architecture check), the tier-2 whole-run
-/// suites, and the multi-process acceptance suite. Every branch in this program passes this
-/// aggregate; nothing merges on the deterministic subset alone.
+/// suites, and the multi-process acceptance suite. Every integration branch passes this
+/// aggregate before it merges; nothing merges on the deterministic subset alone.
 fn vhc_production_gate() -> anyhow::Result<()> {
     println!("== vhc-production-gate: vhc-ci-det + vhc-ci-t2 + vhc-acceptance ==");
     vhc_ci_det()?;
