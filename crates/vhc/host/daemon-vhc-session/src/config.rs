@@ -95,19 +95,53 @@ pub struct RegistryConfig {
     pub auth: RegistryAuthConfig,
 }
 
-/// The iroh transport knobs (`[vhc].iroh`, §7.1). Gossip is mandatory, so unreachable relays make
-/// the node vhc-ineligible (§6.5); this MVP surface carries only the relay selector.
+/// The iroh transport knobs (`[vhc].iroh`, §7.1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IrohConfig {
-    /// `"default"` for the built-in relays, or explicit relay URLs.
+    /// Whether the node authors an iroh plane at join (publish this node's signed roster record
+    /// to the registry, fetch + verify the run's roster, and select the dual plane in the
+    /// worker's credentials). Default OFF: a WS-only join, byte-identical to the pre-roster
+    /// behavior — enabling iroh is an explicit owner decision.
+    pub enabled: bool,
+    /// `"default"` (or empty) for no pinned relays — direct-only reachability from the published
+    /// roster addresses — or explicit comma-separated relay URLs, published in this node's
+    /// roster record and pinned in the worker's plane selection.
     pub relays: String,
+    /// The UDP port the worker's iroh endpoint binds (`0` = the node picks a free port at join
+    /// authoring). The node pins this BEFORE publishing the roster record so the published
+    /// direct addresses and the bound socket agree by construction.
+    pub bind_port: u16,
+    /// The IPs advertised (as `ip:port` with [`Self::bind_port`]) in this node's roster record.
+    /// Default loopback (the single-host / test topology); LAN/WAN operators list their
+    /// reachable interface addresses.
+    pub advertise_ips: Vec<String>,
 }
 
 impl Default for IrohConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             relays: "default".to_string(),
+            bind_port: 0,
+            advertise_ips: vec!["127.0.0.1".to_string()],
+        }
+    }
+}
+
+impl IrohConfig {
+    /// The explicit relay URLs this config pins (`"default"`/empty = none — the roster's direct
+    /// addresses are the reachability; a future built-in relay set would resolve here).
+    #[must_use]
+    pub fn relay_urls(&self) -> Vec<String> {
+        match self.relays.trim() {
+            "" | "default" => Vec::new(),
+            explicit => explicit
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
         }
     }
 }
@@ -315,6 +349,20 @@ mod tests {
         assert_eq!(cfg.default_policy.duty_cycle_pct, 100);
         assert_eq!(cfg.module_trust, ModuleTrust::Signed);
         assert_eq!(cfg.iroh.relays, "default");
+        // The iroh plane is opt-in: default OFF keeps every join WS-only (pre-roster behavior).
+        assert!(!cfg.iroh.enabled);
+        assert_eq!(cfg.iroh.bind_port, 0);
+        assert_eq!(cfg.iroh.advertise_ips, vec!["127.0.0.1".to_string()]);
+        // "default" pins no explicit relays; explicit URLs split on commas.
+        assert!(cfg.iroh.relay_urls().is_empty());
+        let explicit = IrohConfig {
+            relays: "http://a:3340, http://b:3340".into(),
+            ..IrohConfig::default()
+        };
+        assert_eq!(
+            explicit.relay_urls(),
+            vec!["http://a:3340".to_string(), "http://b:3340".to_string()]
+        );
     }
 
     #[test]

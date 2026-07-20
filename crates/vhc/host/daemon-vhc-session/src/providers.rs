@@ -199,7 +199,7 @@ async fn connect_iroh(
     let secret = keystore
         .iroh_secret()
         .map_err(|e| format!("iroh transport secret: {e}"))?;
-    let roster = plane
+    let roster: Vec<IrohPeer> = plane
         .roster
         .iter()
         .map(|p| IrohPeer {
@@ -212,15 +212,32 @@ async fn connect_iroh(
             relay_url: p.relay_url.clone(),
         })
         .collect();
+    // The node-pinned bind address (the socket the node already PUBLISHED in this peer's roster
+    // record): binding anything else would advertise addresses no one can dial, so a bad pin is
+    // a typed refusal, never a silent ephemeral fallback.
+    let bind_addr = match &plane.bind_addr {
+        Some(raw) => Some(
+            raw.parse()
+                .map_err(|e| format!("iroh bind addr `{raw}`: {e}"))?,
+        ),
+        None => None,
+    };
+    let roster_len = roster.len();
     let gossip = IrohGossip::connect(IrohGossipConfig {
         secret_key: *secret.bytes(),
         relay_urls: plane.relay_urls.clone(),
         roster,
         genesis_hash,
         rebroadcast: RebroadcastConfig::default(),
-        bind_addr: None,
+        bind_addr,
     })
     .await
     .map_err(|e| format!("iroh gossip plane: {e}"))?;
+    tracing::info!(
+        endpoint = %daemon_vhc_proto::Hash(gossip.node_id()).to_hex(),
+        roster = roster_len,
+        relays = plane.relay_urls.len(),
+        "iroh gossip plane up"
+    );
     Ok(Arc::new(gossip))
 }
