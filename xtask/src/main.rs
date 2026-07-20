@@ -63,6 +63,12 @@ enum Cmd {
     /// pinned suite list, failing on the first red. No GPU, no live substrate (env-gated live tests
     /// skip). This is the single in-repo definition of the per-PR vhc gate — the superproject CI
     /// job and a local operator both invoke `cargo run -p xtask -- vhc-ci-det`.
+    ///
+    /// Scheduling (coverage is identical in every mode — the same pinned suites, args, and
+    /// pass/fail semantics): by default suites run as 3 concurrent package groups with
+    /// `--test-threads=4` each (total cap 12 threads; same-package suites stay sequential in
+    /// pinned order). `VHC_DET_SERIAL=1` restores the historical fully-serial schedule;
+    /// `VHC_DET_GROUPS` / `VHC_DET_TEST_THREADS` tune the caps.
     VhcCiDet,
     /// Run the vhc **CI tier-2** whole-run suites (decisions D4): the deterministic sim/testkit
     /// whole runs as they land — SDK-side `daemon-vhc-sim` native whole runs (the SPARTA
@@ -354,15 +360,196 @@ fn build_guests() -> anyhow::Result<()> {
 /// The GPU (`wgpu`/`cuda`) and live-substrate lanes are deliberately EXCLUDED: those are the scheduled
 /// per-lane tier 2 and the manual hardware-in-loop gate tier 3 (see swarm-p2-gate-runbook.md).
 ///
+/// Scheduling knobs for a CI lane's pinned suite list. This is SCHEDULING ONLY: every schedule
+/// runs the identical suite list with identical per-suite arguments and pass/fail semantics —
+/// only ordering/overlap and the libtest thread count change, never what is tested.
+#[derive(Clone, Copy)]
+struct LaneSchedule {
+    /// How many package groups run concurrently. Suites of the SAME package always run
+    /// sequentially in their pinned order (same-package suites share test binaries and
+    /// crate-scoped fixtures — e.g. the det lane's `daemon-vhc-observe` journal subset re-runs
+    /// binaries its full-suite entry built — so they must never overlap themselves).
+    groups: usize,
+    /// `--test-threads` handed to every test binary (`None` = the libtest default). Bounds
+    /// TOTAL lane threads at `groups * test_threads` — the host-discipline cap.
+    test_threads: Option<usize>,
+}
+
+impl LaneSchedule {
+    /// The historical schedule: one suite at a time, libtest default threads, live output.
+    fn serial() -> Self {
+        LaneSchedule {
+            groups: 1,
+            test_threads: None,
+        }
+    }
+}
+
+/// The det lane's schedule: 3 concurrent package groups x 4 libtest threads (total cap 12 of the
+/// 32 hardware threads) by default — the lane is dominated by serially-executed test binaries
+/// (measured ~1.5 cores busy of 32), not compilation, so bounded overlap cuts wall time without
+/// threatening the host. `VHC_DET_SERIAL=1` restores the historical fully-serial schedule;
+/// `VHC_DET_GROUPS` / `VHC_DET_TEST_THREADS` tune the caps.
+fn det_schedule_from_env() -> LaneSchedule {
+    if std::env::var("VHC_DET_SERIAL").is_ok_and(|v| v == "1") {
+        return LaneSchedule::serial();
+    }
+    let groups = std::env::var("VHC_DET_GROUPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&g: &usize| g >= 1)
+        .unwrap_or(3);
+    let test_threads = std::env::var("VHC_DET_TEST_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&t: &usize| t >= 1)
+        .unwrap_or(4);
+    LaneSchedule {
+        groups,
+        test_threads: Some(test_threads),
+    }
+}
+
+/// One pinned suite entry: (human label, `cargo test` args).
+type SuiteEntry<'a> = (&'a str, &'a [&'a str]);
+
+/// The package a suite entry tests (the value after `-p` — every pinned suite names exactly one).
+fn suite_package<'a>(args: &[&'a str]) -> &'a str {
+    args.iter()
+        .position(|a| *a == "-p")
+        .and_then(|i| args.get(i + 1))
+        .copied()
+        .expect("every pinned suite entry names its package via -p")
+}
+
+/// Serialize the interleaved completion prints of concurrently running lanes/suites (the det and
+/// t2 lanes can run at once under `VHC_GATE_PARALLEL=1`, each with its own internal overlap).
+static SUITE_PRINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run a lane's pinned suite list under a [`LaneSchedule`].
+///
+/// The serial schedule streams each suite's output live (the historical behavior). Any
+/// overlapped schedule captures per-suite output and prints it whole on completion (under a
+/// global print lock), so concurrent suites never interleave lines; the first red stops new
+/// suites from starting (in-flight suites finish) and the lane fails with the red suite's label.
+fn run_lane_suites(
+    lane: &str,
+    suites: &[(&str, &[&str])],
+    schedule: LaneSchedule,
+) -> anyhow::Result<()> {
+    let root = workspace_root();
+    if schedule.groups <= 1 && schedule.test_threads.is_none() {
+        for (label, args) in suites {
+            println!("\n== {lane}: {label} ==");
+            let started = std::time::Instant::now();
+            let status = Command::new("cargo")
+                .current_dir(&root)
+                .arg("test")
+                .args(*args)
+                .status()
+                .map_err(|e| anyhow::anyhow!("running cargo test {args:?}: {e}"))?;
+            anyhow::ensure!(status.success(), "{lane} suite failed: {label}");
+            println!("== {lane}: {label} — green in {:.0?} ==", started.elapsed());
+        }
+        return Ok(());
+    }
+
+    // Group by package, preserving pinned intra-group order; schedule bigger groups first so the
+    // longest sequential chain (e.g. the det lane's 12 daemon-vhc-host entries) starts earliest.
+    let mut groups: Vec<(&str, Vec<SuiteEntry<'_>>)> = Vec::new();
+    for &(label, args) in suites {
+        let pkg = suite_package(args);
+        match groups.iter_mut().find(|(p, _)| *p == pkg) {
+            Some((_, entries)) => entries.push((label, args)),
+            None => groups.push((pkg, vec![(label, args)])),
+        }
+    }
+    groups.sort_by_key(|(_, entries)| std::cmp::Reverse(entries.len()));
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let next_group = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let failures: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..schedule.groups.min(groups.len()) {
+            scope.spawn(|| loop {
+                let g = next_group.fetch_add(1, Ordering::SeqCst);
+                let Some((_, entries)) = groups.get(g) else {
+                    return;
+                };
+                for &(label, args) in entries {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let started = std::time::Instant::now();
+                    let mut cmd = Command::new("cargo");
+                    cmd.current_dir(&root).arg("test").args(args);
+                    if let Some(threads) = schedule.test_threads {
+                        cmd.args(["--", &format!("--test-threads={threads}")]);
+                    }
+                    let output = cmd.output();
+                    let _print = SUITE_PRINT_LOCK.lock().expect("suite print lock");
+                    match output {
+                        Ok(out) => {
+                            let verdict = if out.status.success() {
+                                "green"
+                            } else {
+                                "FAILED"
+                            };
+                            println!(
+                                "\n== {lane}: {label} — {verdict} in {:.0?} ==",
+                                started.elapsed()
+                            );
+                            print!("{}", String::from_utf8_lossy(&out.stdout));
+                            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+                            if !out.status.success() {
+                                failures
+                                    .lock()
+                                    .expect("failures lock")
+                                    .push(label.to_string());
+                                stop.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            failures
+                                .lock()
+                                .expect("failures lock")
+                                .push(format!("{label} (spawn: {e})"));
+                            stop.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let failures = failures.into_inner().expect("failures lock");
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{lane} suite failed: {}",
+        failures.join("; ")
+    );
+    Ok(())
+}
+
 /// The `daemon-conformance` detached-delegation trio (a known parallel-load flake, pass-in-isolation
 /// = green) is NOT a vhc crate and NOT in this list, so it never gates the vhc tier.
 fn vhc_ci_det() -> anyhow::Result<()> {
-    let root = workspace_root();
     // Dependency-direction invariant (architecture §7) first — cheap (metadata only) and fails fast
     // on a host/*->sdk/* regression before spending a compile.
     println!("\n== vhc-ci-det: daemon-vhc dependency-direction check ==");
     vhc_dep_check()?;
     build_guests()?;
+    vhc_ci_det_suites(det_schedule_from_env())
+}
+
+/// The det-lane suite list + scheduler, WITHOUT the dep-check/guest preflight (so the production
+/// gate can run the preflight once and overlap this lane with tier-2). The suite list and each
+/// suite's pass/fail semantics are identical in every schedule — only ordering/overlap changes.
+fn vhc_ci_det_suites(schedule: LaneSchedule) -> anyhow::Result<()> {
     // (label, cargo test args). Each runs in its own process; the first red aborts.
     let suites: &[(&str, &[&str])] = &[
         (
@@ -596,16 +783,8 @@ fn vhc_ci_det() -> anyhow::Result<()> {
     // The node + supervisor lifecycle suites are part of the SAME mandatory aggregate (the
     // run-instance state machine and supervision are consensus-adjacent product paths, not a
     // side lane); `vhc-ci-node` also runs them standalone for focused iteration.
-    for (label, args) in suites.iter().chain(VHC_NODE_SUITES) {
-        println!("\n== vhc-ci-det: {label} ==");
-        let status = Command::new("cargo")
-            .current_dir(&root)
-            .arg("test")
-            .args(*args)
-            .status()
-            .map_err(|e| anyhow::anyhow!("running cargo test {args:?}: {e}"))?;
-        anyhow::ensure!(status.success(), "vhc CI tier-1 suite failed: {label}");
-    }
+    let all: Vec<(&str, &[&str])> = suites.iter().chain(VHC_NODE_SUITES).copied().collect();
+    run_lane_suites("vhc-ci-det", &all, schedule)?;
     println!("\nvhc-ci-det: all tier-1 (CPU consensus-critical) vhc suites green");
     Ok(())
 }
@@ -658,11 +837,16 @@ fn vhc_ci_node() -> anyhow::Result<()> {
 /// the wasm guests + compiles wasmtime), so it is a separate gate — never folded into
 /// `vhc-ci-det`, which stays the CPU-only deterministic tier-1 bar.
 fn vhc_ci_t2() -> anyhow::Result<()> {
-    let root = workspace_root();
     // Same dependency-direction preflight as tier-1, then the guests the testkit runs.
     println!("\n== vhc-ci-t2: daemon-vhc dependency-direction check ==");
     vhc_dep_check()?;
     build_guests()?;
+    vhc_ci_t2_suites(LaneSchedule::serial())
+}
+
+/// The tier-2 suite list, WITHOUT the dep-check/guest preflight (see `vhc_ci_det_suites` — same
+/// split, same "scheduling only, never coverage" contract).
+fn vhc_ci_t2_suites(schedule: LaneSchedule) -> anyhow::Result<()> {
     let suites: &[(&str, &[&str])] = &[
         (
             // SDK-side native whole run (architecture §6): the SPARTA-shaped continuous-averaging
@@ -696,19 +880,7 @@ fn vhc_ci_t2() -> anyhow::Result<()> {
             &["-p", "daemon-vhc-observe", "--test", "consensus_replay"],
         ),
     ];
-    for (label, args) in suites {
-        println!("\n== vhc-ci-t2: {label} ==");
-        let status = Command::new("cargo")
-            .current_dir(&root)
-            .arg("test")
-            .args(*args)
-            .status()
-            .map_err(|e| anyhow::anyhow!("running cargo test {args:?}: {e}"))?;
-        anyhow::ensure!(
-            status.success(),
-            "vhc CI tier-2 whole-run suite failed: {label}"
-        );
-    }
+    run_lane_suites("vhc-ci-t2", suites, schedule)?;
     println!("\nvhc-ci-t2: all tier-2 (sim/testkit) whole-run suites green");
     Ok(())
 }
