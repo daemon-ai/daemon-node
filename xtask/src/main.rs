@@ -95,6 +95,12 @@ enum Cmd {
     /// multi-layer trainer module exceeds the supervisor's assess watchdog) and points the suite
     /// at them via `VHC_ACCEPTANCE_BIN_DIR`; the required gates run as named tests. Heavy
     /// (multi-process + burn compute), so it is its own command, folded into `vhc-production-gate`.
+    ///
+    /// The release build is cached under a sound source key (HEAD + dirty/untracked content +
+    /// toolchain + codegen env — see `acceptance_release_bins`): a byte-identical workspace
+    /// reuses its binaries instead of rebuilding (~12 min). `VHC_ACCEPTANCE_BIN_CACHE=0`
+    /// disables; any other value overrides the cache dir (default
+    /// `$HOME/.cache/vhc-acceptance-bins`).
     VhcAcceptance,
     /// The single merge gate (D-P10): `vhc-ci-det` + `vhc-ci-t2` + `vhc-ci-node` + the
     /// multi-process acceptance suite. Nothing merges on the deterministic subset alone; every
@@ -899,27 +905,7 @@ fn vhc_acceptance() -> anyhow::Result<()> {
     let root = workspace_root();
     build_guests()?;
 
-    println!("\n== vhc-acceptance: building the node + worker product binaries (release) ==");
-    let build = Command::new("cargo")
-        .current_dir(&root)
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "daemon",
-            "-p",
-            "daemon-vhc-worker",
-            "--features",
-            "daemon-vhc-worker/vhc-net,daemon-vhc-worker/burn-ndarray",
-        ])
-        .status()
-        .map_err(|e| anyhow::anyhow!("building acceptance product binaries: {e}"))?;
-    anyhow::ensure!(
-        build.success(),
-        "vhc-acceptance: product binary build failed"
-    );
-
-    let bin_dir = root.join("target").join("release");
+    let bin_dir = acceptance_release_bins(&root)?;
     println!(
         "\n== vhc-acceptance: multi-process gates (bin dir {}) ==",
         bin_dir.display()
@@ -936,6 +922,218 @@ fn vhc_acceptance() -> anyhow::Result<()> {
     );
     println!("\nvhc-acceptance: all multi-process gates green");
     Ok(())
+}
+
+/// The exact release build the acceptance lane spawns (see `vhc_acceptance` — debug wasmtime
+/// instantiation exceeds the assess watchdog, so the PRODUCT binaries are release).
+const ACCEPTANCE_BUILD_ARGS: &[&str] = &[
+    "build",
+    "--release",
+    "-p",
+    "daemon",
+    "-p",
+    "daemon-vhc-worker",
+    "--features",
+    "daemon-vhc-worker/vhc-net,daemon-vhc-worker/burn-ndarray",
+];
+
+/// The product binaries that build emits and the acceptance harness spawns.
+const ACCEPTANCE_BINS: &[&str] = &["daemon", "daemon-vhc-worker"];
+
+/// Produce the acceptance lane's release product binaries, reusing a source-keyed cache when the
+/// workspace is byte-identical to a previously built state (the release rebuild is ~12 min of
+/// every acceptance run; across worktrees of the same commit it is pure waste).
+///
+/// Soundness: the cache key hashes EVERY input that feeds the binaries — the HEAD commit id
+/// (which also pins the embedded `git describe` build-metadata suffix), the content of every
+/// tracked-but-modified AND untracked (non-ignored) file in the working tree (deletions
+/// included), the exact build args, the toolchain (`rustc -vV`), and the ambient env knobs that
+/// alter codegen (`RUSTFLAGS` family, `DAEMON_BUILD_ID`). Any input this key cannot prove
+/// (key computation failing, cache disabled, no `HOME`) falls back to an unconditional build —
+/// a stale binary is impossible, the failure mode is only a redundant rebuild.
+///
+/// `VHC_ACCEPTANCE_BIN_CACHE=0` disables the cache; any other value overrides the cache dir
+/// (default `$HOME/.cache/vhc-acceptance-bins`). Entries are pruned to the 8 most recent.
+fn acceptance_release_bins(root: &Path) -> anyhow::Result<PathBuf> {
+    let fresh = root.join("target").join("release");
+    let Some(cache_root) = acceptance_cache_root() else {
+        println!("\n== vhc-acceptance: binary cache disabled — building release binaries ==");
+        build_acceptance_bins(root)?;
+        return Ok(fresh);
+    };
+    let key = match acceptance_source_key(root) {
+        Ok(key) => key,
+        Err(e) => {
+            // No provable key (e.g. not a git checkout) -> never guess, always build.
+            println!(
+                "\n== vhc-acceptance: no sound cache key ({e:#}) — building release binaries =="
+            );
+            build_acceptance_bins(root)?;
+            return Ok(fresh);
+        }
+    };
+    let entry = cache_root.join(&key);
+    if ACCEPTANCE_BINS.iter().all(|b| entry.join(b).is_file()) {
+        println!(
+            "\n== vhc-acceptance: release binaries cache HIT ({key}) — skipping the release build =="
+        );
+        // Refresh the entry's recency (a file write bumps the dir mtime the pruner sorts by).
+        let _ = std::fs::write(
+            entry.join("last-used"),
+            format!("{:?}\n", std::time::SystemTime::now()),
+        );
+        return Ok(entry);
+    }
+    println!("\n== vhc-acceptance: release binaries cache MISS ({key}) — building ==");
+    build_acceptance_bins(root)?;
+    // Populate atomically: stage into a tmp dir, then rename into place. A concurrent populator
+    // of the same key loses the rename race harmlessly (the winner's binaries are, by key
+    // construction, byte-equivalent inputs).
+    let staging = cache_root.join(format!(".tmp-{}-{}", key, std::process::id()));
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| anyhow::anyhow!("create cache staging dir {}: {e}", staging.display()))?;
+    for bin in ACCEPTANCE_BINS {
+        let from = fresh.join(bin);
+        let to = staging.join(bin);
+        std::fs::copy(&from, &to)
+            .map_err(|e| anyhow::anyhow!("cache {} -> {}: {e}", from.display(), to.display()))?;
+    }
+    match std::fs::rename(&staging, &entry) {
+        Ok(()) => {}
+        Err(_) if ACCEPTANCE_BINS.iter().all(|b| entry.join(b).is_file()) => {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            anyhow::bail!("publish cache entry {}: {e}", entry.display());
+        }
+    }
+    prune_acceptance_cache(&cache_root, 8);
+    Ok(entry)
+}
+
+/// Run the pinned acceptance release build (the historical unconditional path).
+fn build_acceptance_bins(root: &Path) -> anyhow::Result<()> {
+    println!("\n== vhc-acceptance: building the node + worker product binaries (release) ==");
+    let build = Command::new("cargo")
+        .current_dir(root)
+        .args(ACCEPTANCE_BUILD_ARGS)
+        .status()
+        .map_err(|e| anyhow::anyhow!("building acceptance product binaries: {e}"))?;
+    anyhow::ensure!(
+        build.success(),
+        "vhc-acceptance: product binary build failed"
+    );
+    Ok(())
+}
+
+/// The acceptance binary cache root, or `None` when disabled (`VHC_ACCEPTANCE_BIN_CACHE=0`, or
+/// no `HOME` to anchor the default under).
+fn acceptance_cache_root() -> Option<PathBuf> {
+    match std::env::var("VHC_ACCEPTANCE_BIN_CACHE") {
+        Ok(v) if v == "0" => None,
+        Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join(".cache")
+                .join("vhc-acceptance-bins")
+        }),
+    }
+}
+
+/// Hash every input that feeds the acceptance release binaries into one cache key (see
+/// `acceptance_release_bins` for the soundness argument). Fails (rather than guessing) when the
+/// workspace state cannot be proven — the caller then builds unconditionally.
+fn acceptance_source_key(root: &Path) -> anyhow::Result<String> {
+    let git = |args: &[&str]| -> anyhow::Result<String> {
+        let out = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("git {args:?}: {e}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"commit=");
+    hasher.update(git(&["rev-parse", "HEAD"])?.as_bytes());
+    // The build-metadata suffix daemon-common's build.rs embeds (tag moves change it without a
+    // commit change, so hash the description itself, not just HEAD).
+    hasher.update(b"describe=");
+    hasher.update(git(&["describe", "--always", "--dirty"])?.as_bytes());
+
+    // Every divergence from HEAD: tracked modifications/deletions (staged or not) and untracked
+    // non-ignored files. Hash the WORKING-TREE content — that is what cargo compiles.
+    hasher.update(b"status=");
+    let status = git(&["status", "--porcelain=v1", "-uall", "--no-renames"])?;
+    for line in status.lines() {
+        // Format: `XY <path>` (v1, no renames). Hash the path plus its current content.
+        let Some(path) = line.get(3..) else { continue };
+        // git quotes paths with special characters; un-escaping them here is not worth the
+        // soundness risk (a mis-resolved path would hash the wrong content) — refuse the key
+        // and let the caller build unconditionally.
+        anyhow::ensure!(
+            !path.starts_with('"'),
+            "dirty path needs git unquoting: {path}"
+        );
+        hasher.update(path.as_bytes());
+        hasher.update(b"=");
+        match std::fs::read(root.join(path)) {
+            Ok(bytes) => hasher.update(&bytes),
+            Err(_) => hasher.update(b"<absent>"),
+        };
+        hasher.update(b";");
+    }
+
+    // Toolchain + codegen environment.
+    let rustc = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .map_err(|e| anyhow::anyhow!("rustc -vV: {e}"))?;
+    anyhow::ensure!(rustc.status.success(), "rustc -vV failed");
+    hasher.update(b"rustc=");
+    hasher.update(&rustc.stdout);
+    hasher.update(b"args=");
+    hasher.update(ACCEPTANCE_BUILD_ARGS.join(" ").as_bytes());
+    for var in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "DAEMON_BUILD_ID",
+    ] {
+        hasher.update(var.as_bytes());
+        hasher.update(b"=");
+        hasher.update(std::env::var(var).unwrap_or_default().as_bytes());
+        hasher.update(b";");
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Keep the newest `keep` cache entries (by directory mtime — bumped on every hit), delete the
+/// rest. Best-effort: pruning failures never fail the lane.
+fn prune_acceptance_cache(cache_root: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|d| d.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|d| !d.file_name().to_string_lossy().starts_with(".tmp-"))
+        .filter_map(|d| {
+            let mtime = d.metadata().ok()?.modified().ok()?;
+            Some((mtime, d.path()))
+        })
+        .collect();
+    dirs.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    for (_, dir) in dirs.into_iter().skip(keep) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// The single merge gate (D-P10): the deterministic tier-1 aggregate (which already folds
