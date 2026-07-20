@@ -197,7 +197,7 @@ async fn main() {
     // undebuggable in a live/multi-process run. Honors `RUST_LOG` (default off/warn).
     daemon_telemetry::init_subscriber();
 
-    // Fleet-validation readout (C2): print the same `hardware()` + `device_limits()` the live
+    // Fleet-validation readout: print the same `hardware()` + `device_limits()` the live
     // `Probe`/assess path computes, then exit — so a cross-built worker on a bare fleet box (Windows
     // cmd.exe, macOS, RunPod) can report its DeviceLimits without hand-framing a CBOR `Probe`.
     if std::env::var_os("DAEMON_TRAIN_PROBE").is_some() {
@@ -206,10 +206,10 @@ async fn main() {
         return;
     }
 
-    // Fleet cache-warming mode (P3 lane S): fetch the run's module/corpus by content hash from the
-    // payload store into the on-disk content cache, print per-object evidence, then exit — the
-    // fleet-staging entry point (replaces P2's scp pre-staging). Like DAEMON_TRAIN_PROBE, it runs on
-    // a bare box with no CBOR framing.
+    // Fleet cache-warming mode (the artifact-distribution path): fetch the run's module/corpus by
+    // content hash from the payload store into the on-disk content cache, print per-object
+    // evidence, then exit — the fleet-staging entry point (replaces the earlier scp pre-staging).
+    // Like DAEMON_TRAIN_PROBE, it runs on a bare box with no CBOR framing.
     if std::env::var_os("DAEMON_TRAIN_PREFETCH").is_some() {
         #[cfg(feature = "vhc-net")]
         {
