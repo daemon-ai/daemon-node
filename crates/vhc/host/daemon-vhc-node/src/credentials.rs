@@ -22,7 +22,7 @@ use daemon_vhc_proto::RunKeyCertificate;
 use daemon_vhc_session::config::{RegistryAuthConfig, RegistryConfig};
 use daemon_vhc_session::keystore::{KeystoreError, VhcKeystore};
 use daemon_vhc_session::protocol::{
-    CheckpointRestore, CredentialsRecord, SessionCredentials, WsAuthSpec,
+    CheckpointRestore, CredentialsRecord, IrohPlane, SessionCredentials, WsAuthSpec,
 };
 use daemon_vhc_session::provisioning::{provision_run_identity, ProvisionScope};
 
@@ -38,6 +38,20 @@ pub struct SeatBootstrap {
     pub peer_certs: Vec<RunKeyCertificate>,
     /// The seat-published WS control endpoint, when the lease carries one.
     pub ws_base: Option<String>,
+}
+
+/// The resolved plane-bootstrap material one authorship pass consumes: the late-join checkpoint
+/// restore, the coordinator-seat bootstrap, and the (opt-in) iroh half from the verified
+/// registry roster — grouped because they are resolved together ahead of authoring and consumed
+/// together by it.
+#[derive(Default)]
+pub struct JoinBootstrap {
+    /// The late-join checkpoint restore (`None` = fresh start).
+    pub restore: Option<CheckpointRestore>,
+    /// The coordinator-seat bootstrap (incumbent certificate + published endpoint).
+    pub seat: SeatBootstrap,
+    /// The node-resolved iroh plane (`None` = WS-only; opt-in via `[vhc].iroh.enabled`).
+    pub iroh: Option<IrohPlane>,
 }
 
 /// The output of one authorship pass: the wire credentials bytes for `JoinRun.credentials` and
@@ -77,10 +91,14 @@ pub fn author_join(
     identity: &RunInstanceIdentity<'_>,
     coordinator: &str,
     registry: &RegistryConfig,
-    restore: Option<CheckpointRestore>,
     local_payload_plane: bool,
-    seat: SeatBootstrap,
+    bootstrap: JoinBootstrap,
 ) -> Result<AuthoredJoin, VhcError> {
+    let JoinBootstrap {
+        restore,
+        seat,
+        iroh,
+    } = bootstrap;
     let cred = |e: KeystoreError| VhcError::Internal(format!("credential authorship: {e}"));
 
     // -- per-run identity: mint the key + issue its certificate under the base identity ---------
@@ -136,7 +154,9 @@ pub fn author_join(
         // The secret-bearing auth lives in the keystore record (secret_ref); the wire body's
         // auth stays None ([CI-9] — never a token on the command payload).
         ws_auth: WsAuthSpec::None,
-        iroh: None,
+        // The node-resolved iroh plane (registry-served signed roster, verified node-side;
+        // `None` = WS-only — the iroh plane is opt-in via `[vhc].iroh.enabled`).
+        iroh,
         presign_base,
         // Bootstrap trust: the incumbent coordinator's certificate from the seat lease, so the
         // worker authenticates coordinator frames without waiting for the on-plane announcement

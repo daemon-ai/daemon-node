@@ -247,6 +247,12 @@ pub struct NodeSpec<'a> {
 
 /// Spawn a node process with a seeded base identity, blocking until it serves its socket.
 pub fn spawn_node(spec: &NodeSpec<'_>) -> Node {
+    spawn_node_with(spec, "")
+}
+
+/// [`spawn_node`] with extra `[vhc]`-scoped TOML appended to the node config (e.g. the
+/// dual-plane gate's `[vhc.iroh]` table) — additive, so the shared spec shape stays untouched.
+pub fn spawn_node_with(spec: &NodeSpec<'_>, extra_vhc_toml: &str) -> Node {
     let data_dir = tempfile::tempdir().expect("node data dir");
     let socket = data_dir.path().join("api.sock");
     // Pre-create the identity keystore so the harness can read the node's base pubkey BEFORE the
@@ -283,6 +289,12 @@ pub fn spawn_node(spec: &NodeSpec<'_>) -> Node {
     writeln!(toml, "reconcile_tick_ms = {}", spec.reconcile_tick_ms).unwrap();
     if spec.initial_backoff_ms > 0 {
         writeln!(toml, "initial_backoff_ms = {}", spec.initial_backoff_ms).unwrap();
+    }
+    if !extra_vhc_toml.is_empty() {
+        toml.push_str(extra_vhc_toml);
+        if !extra_vhc_toml.ends_with('\n') {
+            toml.push('\n');
+        }
     }
     let config_path = data_dir.path().join("node.toml");
     std::fs::write(&config_path, toml).expect("write node config");
@@ -647,6 +659,20 @@ pub fn upgrade_authority_key() -> SigningKey {
 /// The base peer id of a node.
 pub fn base_peer(node: &Node) -> daemon_vhc_proto::PeerId {
     peer_id(&node.base_key)
+}
+
+/// Whether a spawned node's captured log (node stderr + the worker child's inherited stderr)
+/// contains `needle` — the black-box observability seat for transport-formation markers the
+/// dual-plane gate asserts (e.g. the iroh `NeighborUp` marker: gossip only logs it when a real
+/// QUIC connection formed).
+pub fn node_log_contains(name: &str, needle: &str) -> bool {
+    let log_dir = std::path::PathBuf::from(
+        std::env::var("VHC_ACCEPTANCE_LOG_DIR")
+            .unwrap_or_else(|_| "/tmp/vhc-acceptance-logs".into()),
+    );
+    std::fs::read_to_string(log_dir.join(format!("{name}.log")))
+        .map(|s| s.contains(needle))
+        .unwrap_or(false)
 }
 
 /// Count a node's live `daemon-vhc-worker` children (via `/proc`) — the process-isolation +

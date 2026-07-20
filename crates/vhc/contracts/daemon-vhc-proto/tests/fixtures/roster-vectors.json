@@ -1,0 +1,145 @@
+{
+  "description": "Normative roster-slot fold vectors: every conforming roster registry (the Rust RosterSlot::fold, the cloud implementation) must reproduce these decisions and slot transitions bit-for-bit. The fold is structural only — signatures and authority are peer-side and deliberately absent here. Byte fields are fill-byte tags: `run`/`sender`/`module`/`endpoint` N means the 32-byte array [N; 32]. `expect.kind` matches the decision variant only (structural reasons are diagnostics, not contract). `expect_slot` is the observable projection after the step: `incarnation`/`issued_at_ms` of the stored record, null when never published.",
+  "record_defaults": {
+    "domain": "daemon-vhc/roster-record/1.0.0",
+    "run": 1,
+    "role": "trainer",
+    "epoch": 0,
+    "sender": 10,
+    "module": 204,
+    "endpoint": 85,
+    "direct_addrs": ["127.0.0.1:4550"],
+    "relay_url": null
+  },
+  "vectors": [
+    {
+      "name": "first_publish_on_a_virgin_slot_is_accepted",
+      "initial": null,
+      "steps": [
+        {
+          "record": { "incarnation": 1, "issued_at_ms": 1000 },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "incarnation": 1, "issued_at_ms": 1000 }
+        }
+      ]
+    },
+    {
+      "name": "same_incarnation_later_issue_supersedes_the_readdress_republish",
+      "initial": { "incarnation": 1, "issued_at_ms": 1000 },
+      "steps": [
+        {
+          "record": { "incarnation": 1, "issued_at_ms": 2000 },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "incarnation": 1, "issued_at_ms": 2000 }
+        }
+      ]
+    },
+    {
+      "name": "equal_freshness_key_is_the_idempotent_republish",
+      "initial": { "incarnation": 1, "issued_at_ms": 2000 },
+      "steps": [
+        {
+          "record": { "incarnation": 1, "issued_at_ms": 2000 },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "incarnation": 1, "issued_at_ms": 2000 }
+        }
+      ]
+    },
+    {
+      "name": "same_incarnation_earlier_issue_is_rejected_stale",
+      "initial": { "incarnation": 1, "issued_at_ms": 2000 },
+      "steps": [
+        {
+          "record": { "incarnation": 1, "issued_at_ms": 1500 },
+          "expect": { "kind": "rejected_stale" },
+          "expect_slot": { "incarnation": 1, "issued_at_ms": 2000 }
+        }
+      ]
+    },
+    {
+      "name": "higher_incarnation_supersedes_even_with_an_earlier_wall_clock",
+      "initial": { "incarnation": 1, "issued_at_ms": 5000 },
+      "steps": [
+        {
+          "record": { "incarnation": 2, "issued_at_ms": 500 },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "incarnation": 2, "issued_at_ms": 500 }
+        },
+        {
+          "record": { "incarnation": 1, "issued_at_ms": 9000 },
+          "expect": { "kind": "rejected_stale" },
+          "expect_slot": { "incarnation": 2, "issued_at_ms": 500 }
+        }
+      ]
+    },
+    {
+      "name": "wrong_domain_is_rejected_structural",
+      "initial": null,
+      "steps": [
+        {
+          "record": {
+            "incarnation": 1,
+            "issued_at_ms": 1000,
+            "domain": "daemon-vhc/seat-lease/1.0.0"
+          },
+          "expect": { "kind": "rejected_structural" },
+          "expect_slot": null
+        }
+      ]
+    },
+    {
+      "name": "undialable_record_is_rejected_structural",
+      "initial": null,
+      "steps": [
+        {
+          "record": {
+            "incarnation": 1,
+            "issued_at_ms": 1000,
+            "direct_addrs": [],
+            "relay_url": null
+          },
+          "expect": { "kind": "rejected_structural" },
+          "expect_slot": null
+        }
+      ]
+    },
+    {
+      "name": "relay_only_reachability_is_dialable_and_accepted",
+      "initial": null,
+      "steps": [
+        {
+          "record": {
+            "incarnation": 1,
+            "issued_at_ms": 1000,
+            "direct_addrs": [],
+            "relay_url": "http://relay.example:3340"
+          },
+          "expect": { "kind": "accepted" },
+          "expect_slot": { "incarnation": 1, "issued_at_ms": 1000 }
+        }
+      ]
+    },
+    {
+      "name": "unstamped_issue_is_rejected_structural",
+      "initial": null,
+      "steps": [
+        {
+          "record": { "incarnation": 1, "issued_at_ms": 0 },
+          "expect": { "kind": "rejected_structural" },
+          "expect_slot": null
+        }
+      ]
+    },
+    {
+      "name": "a_publish_for_a_different_run_never_mutates_the_slot",
+      "initial": { "incarnation": 1, "issued_at_ms": 1000 },
+      "steps": [
+        {
+          "record": { "incarnation": 2, "issued_at_ms": 2000, "run": 9 },
+          "expect": { "kind": "rejected_structural" },
+          "expect_slot": { "incarnation": 1, "issued_at_ms": 1000 }
+        }
+      ]
+    }
+  ]
+}

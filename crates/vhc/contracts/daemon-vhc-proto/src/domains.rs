@@ -60,6 +60,11 @@ pub const SEAT_LEASE_DOMAIN: &str = "daemon-vhc/seat-lease/1.0.0";
 /// never be replayed as a live lease.
 pub const SEAT_RELEASE_DOMAIN: &str = "daemon-vhc/seat-release/1.0.0";
 
+/// Domain-separation tag bound into every iroh roster-record preimage (the registry-served
+/// signed reachability statement). Distinct from the seat/cert/frame domains so a roster
+/// signature can never be replayed as any other signed object, and vice versa.
+pub const ROSTER_RECORD_DOMAIN: &str = "daemon-vhc/roster-record/1.0.0";
+
 /// Domain-separation tag folded into every corpus **shard identity** (the chunk-addressed data
 /// contract): `shard_hash = blake3(domain ++ u64le(chunk_size) ++ u64le(token_count) ++
 /// u64le(byte_len) ++ c_0 ++ … ++ c_{n-1})` where `c_i = blake3(chunk_i bytes)`. The fold — not
@@ -92,6 +97,7 @@ mod tests {
             super::CHECKPOINT_ATTESTATION_DOMAIN.as_bytes(),
             super::SEAT_LEASE_DOMAIN.as_bytes(),
             super::SEAT_RELEASE_DOMAIN.as_bytes(),
+            super::ROSTER_RECORD_DOMAIN.as_bytes(),
             super::GENESIS_SEED_DOMAIN,
             super::GOSSIP_TOPIC_DOMAIN,
             super::CORPUS_SHARD_DOMAIN,
@@ -133,6 +139,7 @@ mod tests {
             super::CHECKPOINT_ATTESTATION_DOMAIN.as_bytes(),
             super::SEAT_LEASE_DOMAIN.as_bytes(),
             super::SEAT_RELEASE_DOMAIN.as_bytes(),
+            super::ROSTER_RECORD_DOMAIN.as_bytes(),
             super::GENESIS_SEED_DOMAIN,
             super::GOSSIP_TOPIC_DOMAIN,
             super::CORPUS_SHARD_DOMAIN,

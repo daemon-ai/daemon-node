@@ -774,6 +774,13 @@ pub struct IrohPlane {
     /// The bootstrap roster (may be empty; later roster updates ride the control plane).
     #[serde(default)]
     pub roster: Vec<IrohRosterPeer>,
+    /// The node-chosen iroh bind address (`"ip:port"`). The node pins the port BEFORE publishing
+    /// this peer's roster record, so the published direct addresses and the socket the worker
+    /// actually binds agree by construction. `None` ⇒ the worker binds ephemeral (relay-only
+    /// reachability, or tests that wire rosters by hand). **Additive:** `#[serde(default)]`
+    /// keeps pre-extension credential buffers decodable.
+    #[serde(default)]
+    pub bind_addr: Option<String>,
 }
 
 /// The canonical-CBOR body of `Command::JoinRun.credentials` for the ROLE-SESSION live attach:
@@ -1451,6 +1458,7 @@ mod tests {
                     direct_addrs: vec!["127.0.0.1:4550".into()],
                     relay_url: None,
                 }],
+                bind_addr: Some("127.0.0.1:4551".into()),
             }),
             presign_base: Some("http://127.0.0.1:8795/api/v1/vhc".into()),
             peer_certs: vec![cert],
@@ -1489,6 +1497,32 @@ mod tests {
         };
         assert!(SessionCredentials::from_bytes(&legacy.to_bytes().unwrap()).is_err());
         assert!(SessionCredentials::from_bytes(&[]).is_err());
+    }
+
+    /// The node-pinned iroh bind address is additive on the plane selection: a credentials
+    /// buffer authored before the field existed (a CBOR map WITHOUT it) still decodes, with
+    /// `bind_addr` defaulting to `None` (the worker binds ephemeral — the pre-extension
+    /// behavior, unchanged).
+    #[test]
+    fn iroh_plane_bind_addr_is_additive_back_compatible() {
+        #[derive(serde::Serialize)]
+        struct LegacyIrohPlane {
+            relay_urls: Vec<String>,
+            roster: Vec<IrohRosterPeer>,
+        }
+        let legacy = LegacyIrohPlane {
+            relay_urls: vec!["http://127.0.0.1:3340".into()],
+            roster: vec![IrohRosterPeer {
+                endpoint_id: [0x55; 32],
+                direct_addrs: vec!["127.0.0.1:4550".into()],
+                relay_url: None,
+            }],
+        };
+        let decoded: IrohPlane = decode(&encode(&legacy).expect("encode legacy")).expect(
+            "a pre-extension iroh plane still decodes (the field is additive, never re-keying)",
+        );
+        assert_eq!(decoded.bind_addr, None, "missing bind addr defaults None");
+        assert_eq!(decoded.roster.len(), 1);
     }
 
     /// `engine_params_payload_retention_is_additive_back_compatible`: the resync-work field

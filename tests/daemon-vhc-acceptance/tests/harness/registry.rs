@@ -17,10 +17,10 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use daemon_vhc_net::FakeSeatRegistry;
+use daemon_vhc_net::{FakeRosterRegistry, FakeSeatRegistry};
 use daemon_vhc_proto::{
-    blake3_hash, from_canonical_slice, to_canonical_vec, SeatDecision, SeatLease, SeatRelease,
-    SeatState,
+    blake3_hash, from_canonical_slice, to_canonical_vec, RosterDecision, RosterRecord,
+    SeatDecision, SeatLease, SeatRelease, SeatState,
 };
 use daemon_vhc_testkit::LiveGenesis;
 use futures::{SinkExt as _, StreamExt as _};
@@ -47,6 +47,9 @@ pub struct FixtureRegistry {
     envelope_bytes: Vec<u8>,
     proto_version: u32,
     seats: FakeSeatRegistry,
+    /// The iroh roster slots (the normative monotonic-upsert fold) — untrusted storage for the
+    /// nodes' signed reachability records; peers verify.
+    roster: FakeRosterRegistry,
     /// Published checkpoint pointers, one slot per `(role, kind)` (a fresher round replaces).
     checkpoints: Mutex<HashMap<(String, String), Checkpoint>>,
     /// Presign object store: object key → bytes (the R2 payload tier + the envelope object).
@@ -173,6 +176,7 @@ pub async fn serve(
         envelope_bytes: genesis.wire.clone(),
         proto_version: u32::from(daemon_vhc_proto::VHC_PROTO_VERSION.0),
         seats: FakeSeatRegistry::new(),
+        roster: FakeRosterRegistry::new(),
         checkpoints: Mutex::new(HashMap::new()),
         objects: Mutex::new(HashMap::new()),
         base: Mutex::new(base.clone()),
@@ -371,6 +375,29 @@ fn route(reg: &FixtureRegistry, method: &str, path: &str, body: &[u8]) -> Vec<u8
     // Seat CAS: GET/PUT/POST(heartbeat)/DELETE {base}/runs/:id/seat/:role.
     if let Some(role) = p.strip_prefix(&format!("/runs/{run}/seat/")) {
         return seat(reg, method, role, body);
+    }
+    // Iroh roster: GET (snapshot) / PUT (monotonic upsert) {base}/runs/:id/roster.
+    if p == format!("/runs/{run}/roster") {
+        if method == "GET" {
+            let snapshot = reg.roster.snapshot(run);
+            return http(
+                "200 OK",
+                "application/cbor",
+                &to_canonical_vec(&snapshot).expect("encode roster snapshot"),
+            );
+        }
+        if method == "PUT" {
+            let Ok(record) = from_canonical_slice::<RosterRecord>(body) else {
+                return http("400 Bad Request", "text/plain", b"bad roster record");
+            };
+            let resp = reg.roster.publish(run, &record);
+            let bytes = to_canonical_vec(&resp).expect("encode roster resp");
+            return if resp.decision == RosterDecision::Accepted {
+                http("200 OK", "application/cbor", &bytes)
+            } else {
+                http("409 Conflict", "application/cbor", &bytes)
+            };
+        }
     }
 
     http("404 Not Found", "text/plain", b"no route")

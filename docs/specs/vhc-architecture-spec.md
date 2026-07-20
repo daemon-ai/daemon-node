@@ -793,6 +793,22 @@ purely from the frozen genesis plus the certificate the frame carries.
   reaches a worker subprocess only by secret reference or an inherited protected descriptor — never
   embedded in an ordinary command payload, argument vector, or journal/log record. Journals and
   command channels carry references, not secrets.
+- **[CI-10]** **Transport reachability is a signed, certificate-carried statement — the iroh
+  roster record.** Each admitted node publishes to the registry one record per run binding its
+  iroh endpoint id (the transport public key, a separate CSPRNG identity from every signing key)
+  to its current direct addresses and/or relay URL, signed by its certified per-run key and
+  carried with the certificate (the seat-lease distribution shape). Peers fetch the run's roster
+  and verify every entry themselves — signature, certificate chain to a genesis-trusted base
+  ([CI-3]), exact scope ([CI-2]) — before dialing an address. The registry stores records under a
+  structural monotonic upsert only: untrusted storage that can withhold a record but never forge
+  one, and never becomes a discovery authority.
+- **[CI-11]** **Roster staleness is precedence, never wall clock.** A record's freshness key is
+  `(incarnation, issued_at_ms)`, lexicographic: a rejoined node's higher incarnation supersedes
+  every record of its prior incarnations ([CI-5] extended to reachability), and within one
+  incarnation a later issue supersedes (the re-address republish). Readers group verified records
+  by `(role, certificate base identity)` — the durable node key; the per-run key rotates with the
+  incarnation — and keep only the freshest per group, so a registry serving stale state can delay
+  but never roll back a reader that observed a newer record.
 
 ### 6.3.2 The admitted tuple
 

@@ -20,8 +20,9 @@
 
 use daemon_egress::{EgressClient, EgressRequest, Redirects};
 use daemon_vhc_proto::{
-    blake3_hash, from_canonical_slice, to_canonical_vec, SeatDecision, SeatLease,
-    SeatMutationResponse, SeatRelease, SeatState,
+    blake3_hash, from_canonical_slice, to_canonical_vec, RosterDecision, RosterMutationResponse,
+    RosterRecord, RosterSnapshot, SeatDecision, SeatLease, SeatMutationResponse, SeatRelease,
+    SeatState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -158,6 +159,26 @@ pub enum SeatClaimOutcome {
         decision: SeatDecision,
         /// The slot's current state (the incumbent lease, or unclaimed + tombstone floor).
         state: SeatState,
+    },
+}
+
+/// The outcome of a roster publish against the registry's monotonic freshness upsert.
+///
+/// `Accepted` is a **storage** outcome, not an authority grant (the registry is untrusted):
+/// peers verify every fetched record themselves. `Refused` carries the registry's structural
+/// verdict plus the slot's stored record — the re-read a stale publisher needs to republish at a
+/// fresher `(incarnation, issued_at_ms)` key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RosterPublishOutcome {
+    /// The upsert accepted; the slot now stores this record.
+    Accepted,
+    /// The upsert refused; the slot is unchanged.
+    Refused {
+        /// The registry's structural refusal.
+        decision: RosterDecision,
+        /// The slot's stored record (boxed for variant-size hygiene; `None` on a structural
+        /// refusal against an empty slot).
+        stored: Option<Box<RosterRecord>>,
     },
 }
 
@@ -475,6 +496,78 @@ impl RegistryClient {
         Err(VhcNetError::Transport(format!(
             "release seat {role} returned {status}: {rendered}"
         )))
+    }
+
+    /// Publish this node's iroh roster record for a run (`PUT {base}/runs/:id/roster` with the
+    /// canonical-CBOR signed record). The registry applies the normative monotonic freshness
+    /// upsert (structural only — it stores, never judges authority). A 409 refusal comes back
+    /// typed with the slot's stored record (the re-read a stale publisher needs to bid fresher).
+    pub async fn publish_roster(
+        &self,
+        run: &RunId,
+        record: &RosterRecord,
+    ) -> Result<RosterPublishOutcome, VhcNetError> {
+        let url = format!("{}/runs/{}/roster", self.base_url, run.as_str());
+        let bytes = to_canonical_vec(record)
+            .map_err(|e| VhcNetError::Transport(format!("encode roster record: {e}")))?;
+        let req = self.authed_request(
+            EgressRequest::put(&url, bytes).header("content-type", "application/cbor"),
+        );
+        let resp = self
+            .egress
+            .execute(req, Redirects::None)
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("publish roster: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("read roster publish body: {e}")))?;
+        if status.is_success() {
+            return Ok(RosterPublishOutcome::Accepted);
+        }
+        if status.as_u16() == 409 {
+            let refusal: RosterMutationResponse = from_canonical_slice(&body)
+                .map_err(|e| VhcNetError::Transport(format!("decode roster refusal (409): {e}")))?;
+            return Ok(RosterPublishOutcome::Refused {
+                decision: refusal.decision,
+                stored: refusal.record.map(Box::new),
+            });
+        }
+        Err(VhcNetError::Transport(format!(
+            "publish roster returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        )))
+    }
+
+    /// Fetch a run's roster snapshot (`GET {base}/runs/:id/roster`): every stored record, as the
+    /// registry holds them. The caller MUST verify each entry itself (`RosterRecord::authorize`
+    /// against the genesis-trusted bases + the freshness precedence) before trusting an address —
+    /// the registry stores, it never vouches. `Ok(empty)` on a 404 (unknown run / no roster yet).
+    pub async fn fetch_roster(&self, run: &RunId) -> Result<Vec<RosterRecord>, VhcNetError> {
+        let url = format!("{}/runs/{}/roster", self.base_url, run.as_str());
+        let req = self.authed_request(EgressRequest::get(&url));
+        let resp = self
+            .egress
+            .execute(req, Redirects::None)
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("fetch roster: {e}")))?;
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(Vec::new());
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| VhcNetError::Transport(format!("read roster body: {e}")))?;
+        if !status.is_success() {
+            return Err(VhcNetError::Transport(format!(
+                "fetch roster returned {status}"
+            )));
+        }
+        let snapshot: RosterSnapshot = from_canonical_slice(&body)
+            .map_err(|e| VhcNetError::Transport(format!("decode roster snapshot: {e}")))?;
+        Ok(snapshot.entries)
     }
 
     /// Issue one seat mutation (claim/renew) and map the frozen status contract: 2xx + `Accepted`
