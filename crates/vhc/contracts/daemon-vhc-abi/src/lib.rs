@@ -50,7 +50,13 @@ pub const DA_ABI_MAJOR_V2: u32 = 2;
 /// forces a declared minor ≥ 2 (§1.3 step 5 `AbiDeclarationMismatch` otherwise) — so a module
 /// declaring minor ≤ 1 can never receive a tag-5 event. `AbiMinorTooNew` continues to refuse
 /// declarations above this constant.
-pub const DA_ABI_MINOR_V2: u32 = 2;
+///
+/// **Minor 3 is the det-state write surface** ([`STATE_MINOR_V2`]; ABI §12.14 [SF-4]): the three
+/// `vhc@2` state imports (`state_open`/`state_emit`/`state_seal`) over the host-side
+/// chunk-addressed state store, bumped — per the same coupled-to-the-working-driver discipline —
+/// in the commit that wired the state store + the three imports into the event-loop driver.
+/// Importing any state symbol forces a declared minor ≥ 3 (§1.3 step 5).
+pub const DA_ABI_MINOR_V2: u32 = 3;
 
 /// The set of ABI **majors this host generation implements** (i.e. carries a driver for).
 ///
@@ -231,6 +237,20 @@ pub const COMPUTE_MINOR_V2: u32 = 2;
 /// a provably additive change is at most a compute-minor). One pinned version per ABI major.
 pub const COMPUTE_BURN_VERSION: &str = "0.21.0";
 
+/// The major-2 minor at which the `vhc@2` det-state write surface is introduced (ABI §12.14
+/// [SF-4]): `state_open(tag_ptr, tag_len, byte_len) -> stream`, `state_emit(stream, ptr, len)
+/// -> ordinal`, `state_seal(stream, out_ptr) -> status`. [`DA_ABI_MINOR_V2`] reached this minor
+/// with the host state-store wiring (declaration + implementation together, the
+/// `register_chunks` precedent).
+///
+/// Determinism classes (§2.7 / §12.14 [SF-4]): `state_open`/`state_emit` are `dc` — stream ids
+/// are counter-deterministic (the guest-created top-bit namespace), chunk bytes come from
+/// replay-reproduced guest memory, re-executed at replay into a replay-side state chunk store;
+/// `state_seal` is `nr` — the 32-byte family fold is recorded (the journal-record-only
+/// [`READBACK_KIND_STATE_SEAL`]) and cross-checked at replay against the re-derived fold, the
+/// O(1) fold-divergence detector.
+pub const STATE_MINOR_V2: u32 = 3;
+
 /// The v1 five-phase lifecycle exports whose presence (with a `tabi@1`-only import shape) marks a
 /// **candidate major-1** module (ABI §1.3 step 2: "exports include the v1 lifecycle (`da_build` …)").
 pub const V1_LIFECYCLE_EXPORTS: &[&str] = &[
@@ -342,6 +362,14 @@ pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
     // host-implemented minor: the symbol enters the registry in the same change that wires the
     // chunked fetch path into the event-loop driver (declaration + implementation bump together).
     (NS_DATA_V2, "register_chunks", 2),
+    // -- minor 3 (the chunk-addressed det-state contract, ABI §12.14 [SF-4]): state writes -------
+    // The three-state-import write side of the host state store: open a family write stream,
+    // emit verified chunks (host copies + blake3-hashes + stores content-addressed), seal to the
+    // domain-separated family fold. Registered at the host-implemented minor in the same change
+    // that wires the state store into the event-loop driver (the register_chunks precedent).
+    (NS_VHC_V2, "state_open", STATE_MINOR_V2),
+    (NS_VHC_V2, "state_emit", STATE_MINOR_V2),
+    (NS_VHC_V2, "state_seal", STATE_MINOR_V2),
 ];
 
 /// The minor at which `(namespace, symbol)` was introduced, or `None` if it is not a registered
@@ -772,6 +800,14 @@ pub const READBACK_KIND_STREAM_BYTES: u32 = 4;
 /// buffer from that record and re-executes no kernel (§8.7). Never a valid `read_back` CALL
 /// argument (the same never-callable discipline as kind 4 and the ≥ 128 bridge journal kinds).
 pub const READBACK_KIND_TENSOR_EXPORT: u32 = 5;
+/// Kind 6 — **journal-record kind only** (assigned by the det-state minor, ABI §12.14 [SF-4]):
+/// the 32-byte family fold behind a `state_seal` return. The seal is the state plane's one
+/// `nr`-class import — the fold is deterministic *given the emitted bytes*, and recording it
+/// verbatim (a §8.3 tag-2 record, `src` = the sealed stream id) keeps the journal O(records)
+/// while making fold divergence detectable at the seal in O(1): replay re-derives the fold over
+/// the re-emitted chunk hashes and compares it against this record. Never a valid `read_back`
+/// CALL argument (the same never-callable discipline as kinds 4/5).
+pub const READBACK_KIND_STATE_SEAL: u32 = 6;
 /// `read_back` kinds ≥ this were the retired bridge's reserved journal kinds (permanent, never
 /// reused); never valid as
 /// call arguments (ABI §6.4).
@@ -1213,9 +1249,10 @@ mod tests {
         assert_eq!(HOST_IMPLEMENTED_MAJORS, &[2]);
         assert_eq!(host_minor_for(DA_ABI_MAJOR), None);
         // B1 bumped the major-2 minor to 1 with Completion delivery; C1 bumped it to 2 with
-        // Fence delivery + the compute@2 shim (the ratified coupled-to-the-working-driver path,
-        // ABI §1.4/§4.6); minor 3 stays AbiMinorTooNew.
-        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(COMPUTE_MINOR_V2));
+        // Fence delivery + the compute@2 shim; the det-state wave bumped it to 3 with the
+        // state store + the three state imports (the ratified coupled-to-the-working-driver
+        // path, ABI §1.4/§4.6); minor 4 stays AbiMinorTooNew.
+        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(STATE_MINOR_V2));
         assert_eq!(host_minor_for(3), None);
     }
 
@@ -1380,15 +1417,47 @@ mod tests {
         assert!(call_kinds
             .iter()
             .all(|k| *k < READBACK_KIND_BRIDGE_JOURNAL_MIN));
-        // Kinds 4/5 are JOURNAL-record kinds (stream-read completion bytes, B1; tensor-export
-        // completion bytes, C1) — distinct from every call kind and below the bridge journal
-        // floor, never callable.
-        assert_eq!(READBACK_KIND_STREAM_BYTES, 4);
-        assert_eq!(READBACK_KIND_TENSOR_EXPORT, 5);
-        assert!(!call_kinds.contains(&READBACK_KIND_STREAM_BYTES));
-        assert!(!call_kinds.contains(&READBACK_KIND_TENSOR_EXPORT));
-        assert_ne!(READBACK_KIND_TENSOR_EXPORT, READBACK_KIND_STREAM_BYTES);
+        // Kinds 4/5/6 are JOURNAL-record kinds (stream-read completion bytes, B1; tensor-export
+        // completion bytes, C1; state-seal folds, the det-state minor) — distinct from every
+        // call kind and below the bridge journal floor, never callable.
+        let journal_kinds = [
+            READBACK_KIND_STREAM_BYTES,
+            READBACK_KIND_TENSOR_EXPORT,
+            READBACK_KIND_STATE_SEAL,
+        ];
+        assert_eq!(journal_kinds, [4, 5, 6]);
+        for k in journal_kinds {
+            assert!(!call_kinds.contains(&k));
+            assert!(k < READBACK_KIND_BRIDGE_JOURNAL_MIN);
+        }
         assert_eq!(READBACK_KIND_BRIDGE_JOURNAL_MIN, 128);
+    }
+
+    #[test]
+    fn state_ops_register_at_the_det_state_minor() {
+        // ABI §12.14 [SF-4]: the three state imports register at STATE_MINOR_V2, which the host
+        // implements (declaration + implementation together — the register_chunks precedent).
+        assert_eq!(STATE_MINOR_V2, 3);
+        assert_eq!(DA_ABI_MINOR_V2, STATE_MINOR_V2);
+        for sym in ["state_open", "state_emit", "state_seal"] {
+            assert_eq!(
+                v2_symbol_minor(NS_VHC_V2, sym),
+                Some(STATE_MINOR_V2),
+                "vhc@2::{sym} registers at the det-state minor"
+            );
+        }
+        // A state import lifts the required declared minor (§1.3 step 5) and validates cleanly
+        // on this host.
+        assert_eq!(
+            required_v2_minor(&[("vhc@2", "next_event"), ("vhc@2", "state_emit")]),
+            STATE_MINOR_V2
+        );
+        validate_imports(&[
+            ("vhc@2", "state_open"),
+            ("vhc@2", "state_emit"),
+            ("vhc@2", "state_seal"),
+        ])
+        .unwrap();
     }
 
     #[test]
