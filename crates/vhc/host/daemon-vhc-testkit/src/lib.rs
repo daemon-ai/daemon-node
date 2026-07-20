@@ -26,6 +26,7 @@
 //! The first whole-run gate wired into tier-2 CI is the SPARTA-shaped `toy_averager.wasm` production
 //! blob (timers + publish, no coordinator) — deterministic, journaled, replay-verified.
 
+pub mod ceremony;
 pub mod coordinator;
 pub mod genesis_run;
 pub mod live_genesis;
