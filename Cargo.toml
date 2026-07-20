@@ -83,6 +83,7 @@ wasmtime = { version = "46", default-features = false, features = ["runtime", "c
 # already pins in Cargo.lock (0.251), so this is a lock-neutral dev-dep — no new crate/source enters
 # the graph. Never a normal dependency; only `daemon-vhc-host`'s dev-deps use it.
 wasm-encoder = { version = "0.251", default-features = false }
+wat = "1.251"
 # The training engine, isolated to `daemon-vhc-host`. default-features = false + the ndarray backend
 # and autodiff only are ALWAYS on (the CPU/G1 lane); GPU backends stay OUT of the default gate. The
 # `wgpu` backend (burn 0.21's `wgpu` feature -> burn-wgpu + cubecl + wgpu 29; the P1 GPU lane targets

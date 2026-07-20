@@ -101,6 +101,12 @@ pub(crate) struct PumpState {
     pub(crate) data_read_used: u64,
     /// The stream table (kind 9, §3.3 credit flow control).
     pub(crate) streams: StreamTable,
+    /// The host state store (ABI §12.14): chunk-addressed canonical det-lane state the guest
+    /// writes via `state_open`/`state_emit`/`state_seal` and reads via `data@2::fetch`
+    /// ([SF-R1] — a self-sealed fold is fetchable by construction, ahead of the grant check).
+    /// Instance-scoped by construction: a restart starts empty, so torn (unsealed) folds can
+    /// never survive a crash ([SF-4]).
+    pub(crate) state: crate::run::state_store::StateStore,
     /// Requests awaiting the embedder (the async-runtime bridge): `(op, request)` in issue order.
     pub(crate) op_requests: Vec<(u64, OpRequest)>,
     /// A `Stop` has been enqueued — no further deliveries will be accepted after it.
@@ -949,6 +955,14 @@ impl PumpHandle {
     #[must_use]
     pub fn logs(&self) -> Vec<(u32, String)> {
         self.shared.state.lock().expect("pump lock").logs.clone()
+    }
+
+    /// The host state store's introspection snapshot (ABI §12.14): sealed folds, open streams,
+    /// live retained bytes — the torn-fold-GC / retention evidence surface (tests, the
+    /// fleet-preflight disk/RAM line item).
+    #[must_use]
+    pub fn state_store_stats(&self) -> crate::run::state_store::StateStoreStats {
+        self.shared.state.lock().expect("pump lock").state.stats()
     }
 }
 

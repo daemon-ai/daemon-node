@@ -41,7 +41,21 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 c.data_mut().enter("fetch")?;
                 let hash_bytes = read_guest(c, hash_ptr, 32)?;
                 let hash: [u8; 32] = hash_bytes.as_slice().try_into().expect("32-byte span");
-                if !c.data().granted_artifacts.contains(&hash) {
+                let granted = c.data().granted_artifacts.contains(&hash);
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                // [SF-R1] (ABI §12.14): a fold the instance itself sealed is registered — and
+                // fetchable — BY CONSTRUCTION: the host built the chunk map as the chunks were
+                // emitted, so no `register_chunks` call and no grant entry gate it. Serviced
+                // host-locally at the call (the store is in-process; no embedder round-trip),
+                // completing through the ordinary Completion protocol so the guest-visible
+                // shape is identical to every other fetch.
+                if st.state.sealed(&hash).is_some() {
+                    let op = service_self_sealed_fetch(&mut st, hash, range_off, range_len)?;
+                    st.note_egress();
+                    return Ok(op);
+                }
+                if !granted {
                     return Err(Trap::new(
                         TrapCode::GrantViolation,
                         "fetch",
@@ -56,8 +70,6 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         ),
                     ));
                 }
-                let shared = c.data().shared.clone();
-                let mut st = shared.state.lock().expect("pump lock");
                 let chunked = st.chunk_maps.get(&hash).map(|m| (m.byte_len, m.chunk_size));
                 let (used, budget) = (st.data_read_used, st.data_read_budget);
                 let op = match chunked {
@@ -238,6 +250,87 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
     )?;
 
     Ok(())
+}
+
+/// Service a `data.fetch` of a **self-sealed state fold** ([SF-R1], ABI §12.14) host-locally at
+/// the call: bounds + read-budget checks (state reads ride the existing `data-read-budget`,
+/// [CC-5]), a uniform OpId mint (§7.1) retired at once, range assembly from the state store's
+/// content-addressed chunks (per-chunk lengths — per-parameter chunking is not a uniform grid),
+/// and an immediate journaled completion. The guest-visible protocol is byte-identical to an
+/// embedder-serviced fetch; replay materializes the same completion from its replay-side state
+/// chunk store (never the payload table — `ReplayMissingPayload` cannot fire for a self-sealed
+/// root).
+fn service_self_sealed_fetch(
+    st: &mut PumpState,
+    hash: [u8; 32],
+    range_off: u64,
+    range_len: u64,
+) -> Result<u64, Trap> {
+    let byte_len = st
+        .state
+        .sealed(&hash)
+        .expect("caller checked sealed")
+        .byte_len;
+    let end = if range_len == 0 {
+        byte_len
+    } else {
+        range_off.saturating_add(range_len)
+    };
+    if range_off > byte_len || end > byte_len {
+        return immediate_fetch_refusal(
+            st,
+            hash,
+            range_off,
+            range_len,
+            daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+            format!("range [{range_off}, {end}) out of bounds (sealed family is {byte_len} bytes)"),
+        );
+    }
+    let charge = end - range_off;
+    let (used, budget) = (st.data_read_used, st.data_read_budget);
+    if budget != 0 && used.saturating_add(charge) > budget {
+        return immediate_fetch_refusal(
+            st,
+            hash,
+            range_off,
+            range_len,
+            COMP_ERR_GRANT_EXHAUSTED,
+            format!(
+                "data-read budget exhausted ({used} of {budget} bytes used; {charge} more \
+                 requested)"
+            ),
+        );
+    }
+    st.data_read_used += charge;
+    let op = st
+        .ops
+        .begin(OpRequest::ArtifactFetch {
+            hash,
+            range_off,
+            range_len,
+        })
+        .map_err(|code| Trap::new(code, "fetch", None, "max_outstanding grant (§2.3)"))?;
+    st.ops.finish(op);
+    let result = match st
+        .state
+        .read_range(&hash, range_off, end)
+        .expect("caller checked sealed")
+    {
+        Ok(bytes) => match st.buffers.create_host(Arc::new(bytes)) {
+            Some(handle) => CompletionResult::Ok(SuccessPayload::Handle(handle)),
+            None => CompletionResult::Err(CompError {
+                code: COMP_ERR_GRANT_EXHAUSTED,
+                detail: Some("buffer quota exhausted (deny new buffers)".into()),
+            }),
+        },
+        Err(detail) => CompletionResult::Err(CompError {
+            code: daemon_vhc_abi::COMP_ERR_HASH_MISMATCH,
+            detail: Some(detail),
+        }),
+    };
+    st.enqueue_completion(op, &result)
+        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+    Ok(op)
 }
 
 /// Mint + immediately refuse one `data.fetch` op with a typed completion error (bounds/budget

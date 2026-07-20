@@ -157,6 +157,12 @@ daemon-vhc-session = { workspace = true, features = ["harness"] }
 # lane. Already resolved in Cargo.lock (a wasmtime/cranelift transitive), so this dev-dep adds no
 # new crate to the graph.
 wasm-encoder = { workspace = true }
+# Test-only: the det-state conformance fixtures (`tests/state_ops.rs`) are hand-authored WAT —
+# behavioral guests (event loops + state ops + publishes) are legible as text where the
+# wasm-encoder builder pattern is not, and the tier-1 lane stays free of the wasm32 toolchain
+# and the guest workspace (real-guest state-op conformance through the SDK lands with the
+# trainer wave, which owns guest re-pins). Same wasm-tools family/version as wasm-encoder.
+wat = { workspace = true }
 # Test-only: the trainer-goldens bundle's `expected.json` (pins + recorded digests/schedule) is
 # JSON; the reproduction tests parse it. Already a workspace pin.
 serde_json = { workspace = true }
