@@ -133,6 +133,9 @@ cuda = ["burn/cuda", "dep:cudarc"]
 harness = ["dep:daemon-vhc-sdk-consensus"]
 
 [dev-dependencies]
+# The shared guest-workspace builder every wasm-backed test suite in this crate goes through
+# (reproducibility remap env + cross-process build lock live there, once). Test-only.
+daemon-vhc-guest-build = { workspace = true }
 # The `cfg(test)` builds of the harness-gated coordinator module need the optional SDK schema dep
 # present without the feature (same pattern as the session crate's dev-deps).
 daemon-vhc-sdk-consensus = { workspace = true }

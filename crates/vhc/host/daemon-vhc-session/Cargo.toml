@@ -25,6 +25,7 @@ path = "src/lib.rs"
 harness = [
     "dep:daemon-vhc-observe",
     "dep:daemon-vhc-sdk-consensus",
+    "dep:daemon-vhc-guest-build",
     "daemon-vhc-host/harness",
 ]
 # `live` exposes the role session's live transport-provider construction (`providers`): the WS
@@ -82,6 +83,10 @@ daemon-vhc-safetensors = { workspace = true }
 # participant build. Path dep already in the frozen root `[workspace.dependencies]` (no root edit),
 # and observe depends only on proto + coordinator (no cycle back to `daemon-vhc-session`).
 daemon-vhc-observe = { workspace = true, optional = true }
+# The shared guest-workspace builder (reproducibility remap env + cross-process build lock live
+# there, once): the `harness`-gated replay sandbox builds the `coordinator-quorum` module through
+# it. OPTIONAL — the default production session graph never shells cargo.
+daemon-vhc-guest-build = { workspace = true, optional = true }
 tokio = { workspace = true }
 # `futures::future::join_all` drives the barrier's bounded-concurrency payload fetch (engine.rs,
 # `RoundEngine::with_download_scheduler`). Already a frozen `[workspace.dependencies]` entry.
@@ -108,6 +113,9 @@ xxhash-rust = { workspace = true }
 # Same as the coordinator: the `cfg(test)` harness build uses observe's `digest_tally` / `DesyncVerdict`
 # (the desync trigger) even with the `harness` feature off.
 daemon-vhc-observe = { workspace = true }
+# Same pattern: the `cfg(test)` build of the replay sandbox builds guests through the shared
+# builder even with the `harness` feature off.
+daemon-vhc-guest-build = { workspace = true }
 # The `cfg(test)` builds of the harness-gated modules (engine/checkpoint/upgrade/harness/…) need
 # the optional deps present without the feature: the SDK schema layer and the host's own
 # harness-gated coordinator drive.

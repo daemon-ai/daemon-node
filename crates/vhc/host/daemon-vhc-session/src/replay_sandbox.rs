@@ -34,8 +34,6 @@
 //! decisions equal the native `tick` reference over identical inputs.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
@@ -225,53 +223,11 @@ fn decode_frame(frame: &[u8]) -> Option<VhcMessage> {
     from_canonical_slice::<VhcMessage>(payload).ok()
 }
 
-/// The guests workspace root (`crates/vhc/guests`).
-fn guests_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../guests")
-        .canonicalize()
-        .expect("guests workspace path")
-}
-
-fn guest_remap_rustflags() -> String {
-    let root = guests_root();
-    let checkout = root.ancestors().nth(3).unwrap_or(&root).to_path_buf();
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo"));
-    format!(
-        "--remap-path-prefix={}=/daemon-node --remap-path-prefix={}=/cargo",
-        checkout.display(),
-        cargo_home.display(),
-    )
-}
-
-static BUILD: Once = Once::new();
-
-/// Build (once) and read the production `coordinator-quorum.wasm` from the guests workspace — the
-/// established testkit dev pattern (the dev shell provides the wasm32 target). Shared with the
-/// in-process whole-run harness's coordinator recording drive (`harness`), so a recorded run
-/// and its replay oracle drive the byte-identical content-addressed module.
-#[allow(clippy::disallowed_methods)] // dev/gate-only guest build (shells cargo), not node code.
+/// Build (once) and read the production `coordinator-quorum.wasm` from the guests workspace via
+/// the shared builder (`daemon-vhc-guest-build`: the reproducibility remap env + the cross-process
+/// build lock live there, once). Shared with the in-process whole-run harness's coordinator
+/// recording drive (`harness`), so a recorded run and its replay oracle drive the byte-identical
+/// content-addressed module.
 pub(crate) fn coordinator_quorum_wasm() -> Result<Vec<u8>, ReplayError> {
-    let mut build_err: Option<String> = None;
-    BUILD.call_once(|| {
-        let status = std::process::Command::new("cargo")
-            .current_dir(guests_root())
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("RUSTC_WRAPPER")
-            .env("RUSTFLAGS", guest_remap_rustflags())
-            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => build_err = Some(format!("building guest modules failed: {s}")),
-            Err(e) => build_err = Some(format!("spawn cargo for guests: {e}")),
-        }
-    });
-    if let Some(e) = build_err {
-        return Err(ReplayError::Sandbox(e));
-    }
-    let path = guests_root().join("target/wasm32-unknown-unknown/release/coordinator_quorum.wasm");
-    std::fs::read(&path).map_err(|e| ReplayError::Sandbox(format!("read {}: {e}", path.display())))
+    daemon_vhc_guest_build::module_bytes("coordinator_quorum").map_err(ReplayError::Sandbox)
 }

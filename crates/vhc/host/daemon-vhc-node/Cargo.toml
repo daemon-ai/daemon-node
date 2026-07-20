@@ -57,6 +57,9 @@ daemon-vhc-session = { workspace = true, features = ["harness"] }
 daemon-vhc-proto = { workspace = true }
 daemon-vhc-abi = { workspace = true }
 ciborium = { workspace = true }
+# The shared guest-workspace builder (reproducibility remap env + cross-process build lock live
+# there, once) — the switch_module acceptance builds the real migratable guests through it.
+daemon-vhc-guest-build = { workspace = true }
 
 [lints]
 workspace = true

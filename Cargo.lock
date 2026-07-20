@@ -4899,6 +4899,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-guest-build"
+version = "0.0.1"
+
+[[package]]
 name = "daemon-vhc-host"
 version = "0.0.1"
 dependencies = [
@@ -4912,6 +4916,7 @@ dependencies = [
  "ciborium",
  "cudarc 0.19.8",
  "daemon-vhc-abi",
+ "daemon-vhc-guest-build",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
@@ -4974,6 +4979,7 @@ dependencies = [
  "ciborium",
  "daemon-api",
  "daemon-vhc-abi",
+ "daemon-vhc-guest-build",
  "daemon-vhc-host",
  "daemon-vhc-net",
  "daemon-vhc-proto",
@@ -5093,6 +5099,7 @@ dependencies = [
  "ciborium",
  "daemon-egress",
  "daemon-vhc-abi",
+ "daemon-vhc-guest-build",
  "daemon-vhc-host",
  "daemon-vhc-journal",
  "daemon-vhc-net",
@@ -5146,6 +5153,7 @@ dependencies = [
  "blake3",
  "ciborium",
  "daemon-vhc-abi",
+ "daemon-vhc-guest-build",
  "daemon-vhc-host",
  "daemon-vhc-node",
  "daemon-vhc-observe",
@@ -5167,6 +5175,7 @@ dependencies = [
  "daemon-provision",
  "daemon-telemetry",
  "daemon-vhc-abi",
+ "daemon-vhc-guest-build",
  "daemon-vhc-host",
  "daemon-vhc-journal",
  "daemon-vhc-net",
@@ -18809,6 +18818,7 @@ dependencies = [
  "daemon-common",
  "daemon-egress",
  "daemon-protocol",
+ "daemon-vhc-guest-build",
  "daemon-vhc-net",
  "daemon-vhc-proto",
  "daemon-vhc-session",
