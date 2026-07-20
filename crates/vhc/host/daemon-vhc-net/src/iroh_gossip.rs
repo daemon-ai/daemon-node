@@ -494,18 +494,23 @@ async fn receive_loop(mut receiver: GossipReceiver, shared: Arc<Mutex<Shared>>) 
                 }
             }
             Ok(Event::NeighborUp(id)) => {
-                shared
-                    .lock()
-                    .expect("gossip shared lock")
-                    .neighbors
-                    .insert(id);
+                let count = {
+                    let mut sh = shared.lock().expect("gossip shared lock");
+                    sh.neighbors.insert(id);
+                    sh.neighbors.len()
+                };
+                // The mesh-formation marker (info so the acceptance log capture sees it at the
+                // default filter): a NeighborUp only fires when a real iroh QUIC gossip
+                // connection formed — the black-box proof the second transport carries.
+                tracing::info!(peer = %id, neighbors = count, "iroh gossip neighbor up");
             }
             Ok(Event::NeighborDown(id)) => {
-                shared
-                    .lock()
-                    .expect("gossip shared lock")
-                    .neighbors
-                    .remove(&id);
+                let count = {
+                    let mut sh = shared.lock().expect("gossip shared lock");
+                    sh.neighbors.remove(&id);
+                    sh.neighbors.len()
+                };
+                tracing::info!(peer = %id, neighbors = count, "iroh gossip neighbor down");
             }
             // `Lagged` means the subscription fell behind; the rebroadcast loop covers the gap.
             Ok(Event::Lagged) => {}
