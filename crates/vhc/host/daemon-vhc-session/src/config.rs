@@ -226,6 +226,14 @@ pub struct VhcConfig {
     /// The vhc identity keystore directory (base identity, iroh transport secret, per-run keys —
     /// `crate::keystore`). Empty (the default) derives `<data_dir>/vhc/identity` at boot.
     pub identity_dir: String,
+    /// The filesystem payload-plane root override (`crate::journal_home::PAYLOAD_DIR_ENV`).
+    /// Empty (the default) roots the run's content store under its own state dir
+    /// (`<data_dir>/vhc/runs/<label hash>/payload`). A multi-node single-host deployment (the
+    /// multi-process acceptance topology) points every node at ONE shared root here — the
+    /// filesystem plane is the local stand-in for a shared object store, so peers can fetch
+    /// each other's content-addressed payloads. Journals and identities stay per-node.
+    #[serde(default)]
+    pub payload_dir: String,
     /// Data/artifact cache budget in GiB (the artifact LRU bound, §8, RUN-4).
     pub data_cache_gb: u32,
     /// Default participation policy for joined runs.
@@ -275,6 +283,7 @@ impl Default for VhcConfig {
             // exited, so a stock `[vhc] enabled` node crash-looped its supervisor on spawn.
             worker_path: "daemon-vhc-worker".to_string(),
             identity_dir: String::new(),
+            payload_dir: String::new(),
             data_cache_gb: 50,
             default_policy: VhcPolicyConfig::default(),
             module_trust: ModuleTrust::Signed,

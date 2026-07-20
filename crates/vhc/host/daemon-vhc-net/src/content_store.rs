@@ -82,15 +82,14 @@ impl ContentStore for FsContentStore {
             }
             Err(e) => return Err(VhcNetError::Transport(format!("read content object: {e}"))),
         };
-        // Defense in depth: the caller's pump re-verifies regardless, but a store that returns
-        // bytes not matching their own address is broken and says so typed.
-        let actual = blake3_hash(&bytes);
-        if &actual != hash {
-            return Err(VhcNetError::HashMismatch {
-                expected: hash.to_hex(),
-                actual: actual.to_hex(),
-            });
-        }
+        // The store is UNTRUSTED and the requested address is not always the object's plain
+        // blake3: a chunk-addressed corpus shard is keyed by its domain-separated CHUNK FOLD
+        // (`daemon_vhc_proto::shard_fold`), which never equals `blake3(bytes)`. Verification is
+        // the PUMP's job — it re-checks every fetched object against the requested plain hash
+        // (payloads/checkpoints/whole artifacts) or the registered covering-chunk hashes
+        // (chunk-addressed shards). So this seat serves the keyed bytes verbatim, exactly like
+        // the in-process [`MemoryContentStore`]; a plain-hash gate here would wrongly reject every
+        // chunk-addressed range fetch.
         Ok(bytes)
     }
 }
@@ -123,22 +122,29 @@ mod tests {
     }
 
     #[tokio::test]
-    // Test-only in-place corruption of a fixture file inside the test's own temp root — not a
+    // Test-only in-place write of a fixture file inside the test's own temp root — not a
     // production fs path.
     #[allow(clippy::disallowed_methods)]
-    async fn tampered_object_is_a_typed_hash_mismatch() {
-        let dir = temp_root("content-fs-tamper");
+    async fn get_content_serves_keyed_bytes_verbatim() {
+        // The content store is UNTRUSTED and its key is not always the object's plain blake3: a
+        // chunk-addressed corpus shard is keyed by its domain-separated CHUNK FOLD, which never
+        // equals `blake3(bytes)`. So `get_content` serves the keyed bytes verbatim — verification
+        // is the PUMP's job (plain hash for payloads/whole artifacts, covering-chunk hashes for
+        // chunk-addressed shards). A plain-hash gate here would reject every chunk-addressed range
+        // fetch; the pump is the sole arbiter (this is the same behavior as `MemoryContentStore`).
+        let dir = temp_root("content-fs-verbatim");
         let store = FsContentStore::open(dir.path()).unwrap();
         let hash = store.put_content(b"honest").await.unwrap();
 
-        // Corrupt the object in place (the store root is plain files).
+        // Write different bytes under the SAME key (a chunk-addressed shard is exactly this shape:
+        // the key is the fold, not blake3(bytes)). The store returns them verbatim; a downstream
+        // pump verifies against the requested hash / registered chunk map.
         let path = dir.path().join(hash.to_hex());
-        std::fs::write(&path, b"tampered").unwrap();
-
-        let err = store.get_content(&hash).await.unwrap_err();
-        assert!(
-            matches!(err, VhcNetError::HashMismatch { .. }),
-            "got {err:?}"
+        std::fs::write(&path, b"fold-keyed-bytes").unwrap();
+        assert_eq!(
+            store.get_content(&hash).await.unwrap(),
+            b"fold-keyed-bytes",
+            "the untrusted store serves the keyed bytes; the pump verifies"
         );
     }
 }

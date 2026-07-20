@@ -183,6 +183,22 @@ impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
         &self.experiment
     }
 
+    /// The resync watermark: the last round whose committed set this driver ingested (`None`
+    /// before the first ingest). A checkpoint taken at a round boundary records it so a restore
+    /// can [`resume_from`](Self::resume_from) it.
+    #[must_use]
+    pub fn last_ingested(&self) -> Option<RoundId> {
+        self.last_ingested
+    }
+
+    /// Seed the resync watermark from a restored checkpoint (§9/§10.2 late-join restore): the
+    /// snapshot's state already folds every round up to and including `last_ingested`, so
+    /// records at or below it must never re-ingest (a double outer-step would diverge). Records
+    /// ABOVE the watermark ingest normally — the restored peer catches up from live traffic.
+    pub fn resume_from(&mut self, last_ingested: Option<RoundId>) {
+        self.last_ingested = last_ingested;
+    }
+
     /// Handle `RoundOpen(r)` — ported from the engine's `on_round_open` + `train_and_commit`:
     /// first make progress on any stalled rounds (in-order catch-up), then either skip (still
     /// stalled: heartbeat + budget) or train + commit this round.

@@ -336,6 +336,12 @@ pub struct VhcService {
     /// The resident coordinator seat keeper (present only when the owner enabled coordinator
     /// duty AND a seat directory + identity store are wired).
     seat: Option<crate::seat_keeper::SeatKeeper>,
+    /// The registry seat READ seam, retained for EVERY node with a registry (not only claimers):
+    /// a trainer reads the coordinator seat at join to bootstrap the incumbent's certificate into
+    /// its session credentials (the seat lease is the out-of-band trust the on-plane §12.3
+    /// distribution cannot supply to a late subscriber — the coordinator's one-shot announcement
+    /// predates the trainer's connection).
+    seat_read: Option<Arc<dyn crate::seat_keeper::SeatDirectory>>,
     events_tx: broadcast::Sender<VhcEvent>,
     feed: Option<NodeFeed>,
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
@@ -366,6 +372,7 @@ impl VhcService {
             ),
             _ => None,
         };
+        let seat_read = parts.seat_directory.clone();
         Self {
             config: parts.config,
             store: parts.store,
@@ -376,6 +383,7 @@ impl VhcService {
             worker_factory: parts.worker_factory,
             identity_dir: parts.identity_dir,
             seat,
+            seat_read,
             events_tx,
             feed: parts.feed,
             current_run: Mutex::new(None),
@@ -553,12 +561,14 @@ impl VhcService {
                 .as_deref()
                 .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
             let restore = self.resolve_restore(&run.run_id).await;
+            let seat = self.resolve_seat_bootstrap(&run.run_id).await;
             let (delivery_tuple, credentials, credentials_ref) = match self.author_join(
                 &run.run_id,
                 &run.coordinator,
                 &id,
                 persisted_tuple,
                 restore,
+                seat,
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -835,22 +845,55 @@ impl VhcService {
         }
         self.store
             .set_execution_identity(&run.run_id, id.epoch, &id.role, id.instance)?;
+        // The fresh child holds NO resolved run: a JoinRun without a prior AssessRun is a typed
+        // worker refusal ("JoinRun before AssessRun"). Re-run the assess on THIS child with the
+        // run's envelope and the persisted directed role — exactly what the original join did —
+        // so the child resolves the genesis/module before the join lands. The admitted tuple
+        // still comes from the store (identity continuity), never from this re-assess.
+        if let Some(discovery) = &self.discovery {
+            let assess = async {
+                let envelope = discovery.fetch_envelope(&run.run_id).await?;
+                let elig = worker.assess(envelope, Some(id.role.clone())).await?;
+                if !elig.eligible {
+                    return Err(VhcError::Internal(format!(
+                        "reconverge re-assess ineligible: {}",
+                        elig.reasons.join("; ")
+                    )));
+                }
+                Ok(())
+            };
+            if let Err(e) = assess.await {
+                tracing::warn!(run_id = run.run_id, error = %e, "reconverge: re-assess on the fresh child failed");
+                self.arbiter.release(&id);
+                if self.worker_factory.is_some() {
+                    worker.shutdown().await;
+                }
+                return Err(e);
+            }
+        }
         let persisted_tuple = run
             .admitted_tuple
             .as_deref()
             .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
         let restore = self.resolve_restore(&run.run_id).await;
-        let (delivery_tuple, credentials, _credentials_ref) =
-            match self.author_join(&run.run_id, &run.coordinator, &id, persisted_tuple, restore) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.arbiter.release(&id);
-                    if self.worker_factory.is_some() {
-                        worker.shutdown().await;
-                    }
-                    return Err(e);
+        let seat = self.resolve_seat_bootstrap(&run.run_id).await;
+        let (delivery_tuple, credentials, _credentials_ref) = match self.author_join(
+            &run.run_id,
+            &run.coordinator,
+            &id,
+            persisted_tuple,
+            restore,
+            seat,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.arbiter.release(&id);
+                if self.worker_factory.is_some() {
+                    worker.shutdown().await;
                 }
-            };
+                return Err(e);
+            }
+        };
         if let Some(tuple) = &delivery_tuple {
             if let Ok(bytes) = protocol::encode(tuple) {
                 let _ = self.store.set_admitted_tuple(&run.run_id, &bytes);
@@ -1046,8 +1089,18 @@ impl VhcService {
                 let discovery = discovery.clone();
                 let (run, round, hash) = (run_id.clone(), *round, hash.clone());
                 tokio::spawn(async move {
-                    let _ = discovery.publish_checkpoint(&run, round, &hash, 0).await;
+                    match discovery.publish_checkpoint(&run, round, &hash, 0).await {
+                        Ok(()) => tracing::debug!(run, round, hash, "checkpoint pointer published"),
+                        Err(e) => {
+                            tracing::warn!(run, round, error = %e, "checkpoint pointer publication failed")
+                        }
+                    }
                 });
+            } else {
+                tracing::debug!(
+                    run_id,
+                    "checkpoint published but no discovery is wired (pointer not recorded)"
+                );
             }
         }
 
@@ -1335,6 +1388,62 @@ impl VhcService {
         }
     }
 
+    /// The coordinator-duty join attempt ([SEAT-1] end-to-end): assess the configured seat role,
+    /// then claim (or re-adopt) the registry seat slot through the resident keeper — the join
+    /// runs at the WON LEASE'S incarnation, so the fencing token IS the certified execution
+    /// identity's incarnation. Any refusal (keeper unwired, ineligible seat-role assessment, a
+    /// live foreign incumbent, a lost CAS race, a directory fault) returns `None`: the caller
+    /// stands down to the trainer default — coordinator duty is opportunistic, never a join
+    /// failure.
+    async fn try_seat_join(
+        &self,
+        worker: &Arc<dyn WorkerControl>,
+        run_id: &str,
+    ) -> Option<(
+        String,
+        VhcEligibility,
+        Option<protocol::AdmittedTuple>,
+        Option<u64>,
+    )> {
+        let keeper = self.seat.as_ref()?;
+        let seat_role = self.config.seat_role.clone();
+        let (coordinator, eligibility, tuple) = self
+            .resolve_join(worker, run_id, Some(seat_role.clone()))
+            .await
+            .ok()?;
+        if !eligibility.eligible {
+            return None;
+        }
+        let tuple_ref = tuple.as_ref()?;
+        let candidate = crate::seat_keeper::SeatCandidate {
+            run_label: run_id.to_string(),
+            genesis_hash: tuple_ref.genesis_hash,
+            role: seat_role,
+            epoch: 0,
+            module_hash: tuple_ref.module_hash,
+            endpoint: daemon_vhc_proto::ControlEndpoint {
+                ws: (!coordinator.is_empty()).then(|| coordinator.clone()),
+                iroh_ticket: None,
+            },
+        };
+        match keeper.claim_now(&candidate, now_ms() as u64).await {
+            Ok(Some(incarnation)) => Some((coordinator, eligibility, tuple, Some(incarnation))),
+            Ok(None) => None, // a live incumbent / lost race — stand down to the trainer default
+            Err(e) => {
+                let mut emitted = Vec::new();
+                let _ = self.emit(
+                    VhcEvent::Warning {
+                        run_id: run_id.to_string(),
+                        class: "seat_claim".to_string(),
+                        detail: format!("seat claim failed (joining as trainer): {e}"),
+                    },
+                    &mut emitted,
+                );
+                None
+            }
+        }
+    }
+
     /// Stamp the node-owned device-profile / owner-policy revisions into an assessed admitted
     /// tuple (architecture §6.3). `None` in ⇒ `None` out (an ineligible assessment admitted
     /// nothing). The incarnation field stays as assessed (0 = unassigned); the join mints it.
@@ -1361,6 +1470,7 @@ impl VhcService {
         id: &RoleInstanceId,
         tuple: Option<protocol::AdmittedTuple>,
         restore: Option<protocol::CheckpointRestore>,
+        seat: crate::credentials::SeatBootstrap,
     ) -> Result<AuthoredDelivery, VhcError> {
         let tuple = tuple.map(|mut t| {
             t.incarnation = id.instance;
@@ -1389,8 +1499,29 @@ impl VhcService {
             coordinator,
             &self.config.registry,
             restore,
+            !self.config.payload_dir.is_empty(),
+            seat,
         )?;
         Ok((Some(tuple), authored.wire, authored.credentials_ref))
+    }
+
+    /// Resolve the coordinator-seat bootstrap for a run: read the configured seat role's slot and,
+    /// when it holds a lease, hand the incumbent's certificate + published endpoint to credential
+    /// authorship. This is the out-of-band trust a trainer needs — the coordinator's on-plane
+    /// §12.3 certificate announcement is a one-shot a later subscriber never sees, so the seat
+    /// lease (untrusted storage, but carrying the cert) is how a joining trainer authenticates the
+    /// incumbent's frames from the first round. `CertCheck` still gates trust by the genesis base.
+    async fn resolve_seat_bootstrap(&self, run_label: &str) -> crate::credentials::SeatBootstrap {
+        let Some(dir) = &self.seat_read else {
+            return crate::credentials::SeatBootstrap::default();
+        };
+        match dir.read_seat(run_label, &self.config.seat_role).await {
+            Ok(daemon_vhc_proto::SeatState::Leased(lease)) => crate::credentials::SeatBootstrap {
+                peer_certs: vec![lease.certificate.clone()],
+                ws_base: lease.body.endpoint.ws.clone(),
+            },
+            _ => crate::credentials::SeatBootstrap::default(),
+        }
     }
 
     /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's latest
@@ -1480,10 +1611,27 @@ impl VhcApi for VhcService {
         // and take the coordinator endpoint from discovery. With no discovery configured, fall back
         // to the probe-based eligibility against the allowlisted coordinator (offline / no-registry
         // path). Either way the persisted eligibility is node-computed — the app never re-derives it.
-        let (coordinator, eligibility, assessed_tuple) = self
-            .resolve_join(&worker, &run_id, None)
-            .await
-            .map_err(|e| e.to_api())?;
+        //
+        // COORDINATOR DUTY FIRST (architecture §6.3; [SEAT-1]): when the owner enabled seat
+        // claiming and this is a fresh instance, try the seat — assess the configured seat role,
+        // claim (or re-adopt) the registry slot, and run the join AT THE WON LEASE'S INCARNATION
+        // (fencing_token == incarnation end-to-end). A live foreign incumbent, a lost CAS race,
+        // or an ineligible seat-role assessment stands down to the trainer default.
+        let seat_join = if existing.is_none() {
+            self.try_seat_join(&worker, &run_id).await
+        } else {
+            None
+        };
+        let (coordinator, eligibility, assessed_tuple, seat_incarnation) = match seat_join {
+            Some(won) => won,
+            None => {
+                let (coordinator, eligibility, assessed_tuple) = self
+                    .resolve_join(&worker, &run_id, None)
+                    .await
+                    .map_err(|e| e.to_api())?;
+                (coordinator, eligibility, assessed_tuple, None)
+            }
+        };
 
         // The admission funnel's LAST stage (decisions D6 point 5; architecture §3.5): the
         // aggregate owner arbitration — an atomic check-and-reserve against the remaining
@@ -1512,14 +1660,22 @@ impl VhcApi for VhcService {
                     // ledger entry by blake3(RunLabel) until then (decisions D1 lazy backfill).
                     run_id: run_hash.unwrap_or_else(|| *blake3::hash(run_id.as_bytes()).as_bytes()),
                     epoch,
-                    role: if role.is_empty() {
+                    // The seat-won join runs the configured seat role; else the persisted role
+                    // (the trainer default for a fresh row).
+                    role: if seat_incarnation.is_some() {
+                        self.config.seat_role.clone()
+                    } else if role.is_empty() {
                         "trainer".to_string()
                     } else {
                         role
                     },
-                    // A restart-re-join retains the logical incarnation; a genuinely new
-                    // role-instance mints a never-reused one (decisions D1).
-                    instance: if persisted_instance > 0 {
+                    // The seat-won join runs at the LEASE incarnation ([SEAT-1]: the fencing
+                    // token IS the incarnation — the CAS mints identity, never the counter).
+                    // Otherwise: a restart-re-join retains the logical incarnation; a genuinely
+                    // new role-instance mints a never-reused one (decisions D1).
+                    instance: if let Some(inc) = seat_incarnation {
+                        inc
+                    } else if persisted_instance > 0 {
                         persisted_instance
                     } else {
                         self.store
@@ -1547,8 +1703,9 @@ impl VhcApi for VhcService {
         // author the secrets-free plane-selection credentials (the token, if any, lands only in
         // the keystore record `credentials_ref` points at — never on the wire).
         let restore = self.resolve_restore(&run_id).await;
+        let seat = self.resolve_seat_bootstrap(&run_id).await;
         let (delivery_tuple, credentials, credentials_ref) =
-            match self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore) {
+            match self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore, seat) {
                 Ok(v) => v,
                 Err(e) => {
                     if existing.is_none() {
@@ -1640,12 +1797,18 @@ impl VhcApi for VhcService {
             .map_err(map)?;
         // The owner took manual control: no reconvergence is pending or owed.
         self.store.clear_retry(&run_id).map_err(map)?;
-        let worker = {
+        let (worker, held) = {
             let instances = self.instances.lock().unwrap();
-            instances
-                .get(&run_id)
-                .map_or_else(|| self.worker.clone(), |e| e.worker.clone())
+            match instances.get(&run_id) {
+                Some(e) => (e.worker.clone(), true),
+                None => (self.worker.clone(), false),
+            }
         };
+        tracing::debug!(
+            run_id,
+            instance_held = held,
+            "vhc leave: dispatching to the run's worker"
+        );
         worker
             .leave(run_id.clone(), to_leave_mode(mode))
             .await

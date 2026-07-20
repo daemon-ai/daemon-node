@@ -80,6 +80,7 @@ pub async fn build_role_providers(inputs: LiveAttachInputs<'_>) -> Result<RolePr
             )
         }
     };
+    tracing::debug!(run = inputs.run_label, ws_base = %ws_base, "live attach: connecting WS control plane");
     let ws = WsControlPlane::connect(WsConfig {
         base_url: ws_base.clone(),
         run_id: inputs.run_label.to_string(),
@@ -90,6 +91,10 @@ pub async fn build_role_providers(inputs: LiveAttachInputs<'_>) -> Result<RolePr
     .map_err(|e| format!("ws control plane {ws_base}: {e}"))?;
     ws.add_resubscribe_frame(inputs.own_cert_announcement);
     let ws = Arc::new(ws);
+    tracing::debug!(
+        run = inputs.run_label,
+        "live attach: WS control plane connected"
+    );
 
     let control: Arc<dyn ControlPlane> = match &creds.iroh {
         None => ws,
@@ -114,6 +119,7 @@ pub async fn build_role_providers(inputs: LiveAttachInputs<'_>) -> Result<RolePr
     // -- payload + artifact planes: content-addressed, R2 or the run's fs store ----------------
     let stores: Arc<dyn ContentStore> = match &creds.presign_base {
         Some(base) if !base.is_empty() => {
+            tracing::debug!(run = inputs.run_label, presign_base = %base, "live attach: presigned R2 content plane");
             let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
                 .map_err(|e| format!("egress client: {e}"))?;
             let presign_egress =
@@ -123,12 +129,20 @@ pub async fn build_role_providers(inputs: LiveAttachInputs<'_>) -> Result<RolePr
             Arc::new(R2Store::new(presign, egress, RunId::new(inputs.run_label)))
         }
         _ => {
-            let root = journal_home::run_dir_from_env().ok_or_else(|| {
-                "no presign base and no run-state root reference (the fs content store needs \
-                 the node-delivered run dir)"
-                    .to_string()
-            })?;
-            let dir = journal_home::payload_dir(&root, inputs.run_label);
+            // The node-delivered payload-plane override wins (a shared single-host root, so
+            // multi-process peers serve each other's content); else the run's own state dir.
+            let dir = match journal_home::payload_dir_from_env() {
+                Some(shared) => journal_home::payload_dir(&shared, inputs.run_label),
+                None => {
+                    let root = journal_home::run_dir_from_env().ok_or_else(|| {
+                        "no presign base and no run-state root reference (the fs content store \
+                         needs the node-delivered run dir)"
+                            .to_string()
+                    })?;
+                    journal_home::payload_dir(&root, inputs.run_label)
+                }
+            };
+            tracing::debug!(run = inputs.run_label, dir = %dir.display(), "live attach: filesystem content plane");
             Arc::new(
                 FsContentStore::open(&dir)
                     .map_err(|e| format!("fs content store {}: {e}", dir.display()))?,

@@ -187,10 +187,49 @@ impl CertCheck {
             }
         }
         if !certified {
+            // Diagnostic: which certs are present and how their scopes compare to the frame's.
+            // A live session that refuses a peer frame without saying why is undebuggable.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let want = format!(
+                    "run={} epoch={} role={} inst={} module={}",
+                    hex8(&scope.run_id.0),
+                    scope.epoch,
+                    scope.role,
+                    scope.instance,
+                    hex8(&scope.module_hash.0),
+                );
+                let have: Vec<String> = self
+                    .certs
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "[base={} run_key={} role={} inst={} epoch={} module={} trusted={}]",
+                            hex8(&c.base_identity.0),
+                            hex8(&c.body.run_key.0),
+                            c.body.scope.role,
+                            c.body.scope.instance,
+                            c.body.scope.epoch,
+                            hex8(&c.body.scope.module_hash.0),
+                            self.trusted_bases.contains(&c.base_identity),
+                        )
+                    })
+                    .collect();
+                tracing::debug!(
+                    sender = %hex8(&sender.0),
+                    want = %want,
+                    certs = ?have,
+                    "cert judge: no certificate authenticates the frame sender"
+                );
+            }
             return Err(last);
         }
         self.revocations.judge(scope, sender)
     }
+}
+
+/// A short hex prefix for diagnostics (never a security surface).
+fn hex8(bytes: &[u8; 32]) -> String {
+    bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Inbound §12.1 verification state for one run attach: the expected run scope + per
@@ -412,7 +451,14 @@ impl InboundFrames {
         seq: u64,
         payload: &[u8],
     ) -> InboundVerdict {
-        let cursor = self.cursors.entry((sender, channel)).or_insert(0);
+        // MID-STREAM ADOPTION: the first observed frame from an unseen `(sender, channel)` seats
+        // the cursor at ITS seq. A late joiner (fresh incarnation restoring mid-run) cannot — and
+        // need not — see a peer's stream from seq 0: its state comes from the checkpoint, the
+        // relay replays no history, and insisting on density-from-zero turned every late attach
+        // into an unrecoverable-gap terminal (a rejoin loop). Density (dedup/gap/hold, §12.2)
+        // applies from the adopted point on; a replayed pre-adoption frame is at worst an
+        // authentic duplicate the module's own round machinery already treats idempotently.
+        let cursor = self.cursors.entry((sender, channel)).or_insert(seq);
         match seq.cmp(cursor) {
             std::cmp::Ordering::Less => InboundVerdict::Duplicate {
                 sender,

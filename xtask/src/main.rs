@@ -82,6 +82,18 @@ enum Cmd {
     /// `sdk/*`, `contracts/*` links neither, `sdk/*` never links `host/*`. The honest current
     /// exceptions are listed inline and each is tracked to the phase that removes it.
     VhcDepCheck,
+    /// Run the vhc **multi-process acceptance** suite: three REAL `daemon` node processes
+    /// (seat-claimed coordinator + two trainers) over Unix sockets on the full product path,
+    /// driven only through the node API, over WS control + the filesystem / R2 payload planes.
+    /// Builds the node + worker binaries in RELEASE first (debug wasmtime compilation of the
+    /// multi-layer trainer module exceeds the supervisor's assess watchdog) and points the suite
+    /// at them via `VHC_ACCEPTANCE_BIN_DIR`; the required gates run as named tests. Heavy
+    /// (multi-process + burn compute), so it is its own command, folded into `vhc-production-gate`.
+    VhcAcceptance,
+    /// The single merge gate (D-P10): `vhc-ci-det` + `vhc-ci-t2` + `vhc-ci-node` + the
+    /// multi-process acceptance suite. Nothing merges on the deterministic subset alone; every
+    /// integration branch passes `vhc-production-gate` before it merges.
+    VhcProductionGate,
     /// Tokenize a corpus into fixed-width shards + `manifest.json` (spec §8; M1 seam).
     TokenizeCorpus {
         /// HF dataset repo id (e.g. `roneneldan/TinyStories`); omit when using `--text`.
@@ -203,6 +215,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::VhcCiT2 => vhc_ci_t2(),
         Cmd::VhcCiNode => vhc_ci_node(),
         Cmd::VhcDepCheck => vhc_dep_check(),
+        Cmd::VhcAcceptance => vhc_acceptance(),
+        Cmd::VhcProductionGate => vhc_production_gate(),
         Cmd::TokenizeCorpus {
             dataset,
             dataset_file,
@@ -691,6 +705,68 @@ fn vhc_ci_t2() -> anyhow::Result<()> {
         );
     }
     println!("\nvhc-ci-t2: all tier-2 (sim/testkit) whole-run suites green");
+    Ok(())
+}
+
+/// Run the multi-process acceptance suite (spec §7): three REAL `daemon` node processes on the
+/// full product path. Builds the node + worker binaries in RELEASE first — a debug-compiled
+/// wasmtime instantiation of the multi-layer trainer module exceeds the supervisor's 30s assess
+/// watchdog, so the acceptance suite spawns the release binaries (located via
+/// `VHC_ACCEPTANCE_BIN_DIR`, the durable finding baked into the lane). The suite itself is a
+/// debug test binary; only the spawned product binaries are release.
+fn vhc_acceptance() -> anyhow::Result<()> {
+    let root = workspace_root();
+    build_guests()?;
+
+    println!("\n== vhc-acceptance: building the node + worker product binaries (release) ==");
+    let build = Command::new("cargo")
+        .current_dir(&root)
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "daemon",
+            "-p",
+            "daemon-vhc-worker",
+            "--features",
+            "daemon-vhc-worker/vhc-net,daemon-vhc-worker/burn-ndarray",
+        ])
+        .status()
+        .map_err(|e| anyhow::anyhow!("building acceptance product binaries: {e}"))?;
+    anyhow::ensure!(
+        build.success(),
+        "vhc-acceptance: product binary build failed"
+    );
+
+    let bin_dir = root.join("target").join("release");
+    println!(
+        "\n== vhc-acceptance: multi-process gates (bin dir {}) ==",
+        bin_dir.display()
+    );
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .env("VHC_ACCEPTANCE_BIN_DIR", &bin_dir)
+        .args(["test", "-p", "daemon-vhc-acceptance"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("running the acceptance suite: {e}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "vhc-acceptance: a multi-process gate failed"
+    );
+    println!("\nvhc-acceptance: all multi-process gates green");
+    Ok(())
+}
+
+/// The single merge gate (D-P10): the deterministic tier-1 aggregate (which already folds
+/// `vhc-ci-node` + the dependency-direction / negative-architecture check), the tier-2 whole-run
+/// suites, and the multi-process acceptance suite. Every integration branch passes this
+/// aggregate before it merges; nothing merges on the deterministic subset alone.
+fn vhc_production_gate() -> anyhow::Result<()> {
+    println!("== vhc-production-gate: vhc-ci-det + vhc-ci-t2 + vhc-acceptance ==");
+    vhc_ci_det()?;
+    vhc_ci_t2()?;
+    vhc_acceptance()?;
+    println!("\nvhc-production-gate: GREEN (det + t2 + node + acceptance)");
     Ok(())
 }
 

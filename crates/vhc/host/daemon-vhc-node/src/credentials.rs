@@ -18,6 +18,7 @@
 //! The authored bytes are what the node hands `JoinRun.credentials`; the returned `credentials_ref`
 //! is what `vhc.db` persists (never the secret itself).
 
+use daemon_vhc_proto::RunKeyCertificate;
 use daemon_vhc_session::config::{RegistryAuthConfig, RegistryConfig};
 use daemon_vhc_session::keystore::{KeystoreError, VhcKeystore};
 use daemon_vhc_session::protocol::{
@@ -26,6 +27,18 @@ use daemon_vhc_session::protocol::{
 use daemon_vhc_session::provisioning::{provision_run_identity, ProvisionScope};
 
 use crate::service::VhcError;
+
+/// The coordinator-seat bootstrap a trainer's credentials carry: the incumbent's certificate (so
+/// the worker's attach can authenticate coordinator frames before the on-plane §12.3 distribution
+/// arrives) and the seat-published control endpoint (dialed in preference to the discovered base).
+#[derive(Clone, Default)]
+pub struct SeatBootstrap {
+    /// The incumbent coordinator's certificate (chained to a genesis-trusted base; the worker's
+    /// `CertCheck` still gates trust — an untrusted cert simply never authenticates a frame).
+    pub peer_certs: Vec<RunKeyCertificate>,
+    /// The seat-published WS control endpoint, when the lease carries one.
+    pub ws_base: Option<String>,
+}
 
 /// The output of one authorship pass: the wire credentials bytes for `JoinRun.credentials` and
 /// the keystore reference `vhc.db` persists (`None` when no secret record was needed).
@@ -65,6 +78,8 @@ pub fn author_join(
     coordinator: &str,
     registry: &RegistryConfig,
     restore: Option<CheckpointRestore>,
+    local_payload_plane: bool,
+    seat: SeatBootstrap,
 ) -> Result<AuthoredJoin, VhcError> {
     let cred = |e: KeystoreError| VhcError::Internal(format!("credential authorship: {e}"));
 
@@ -102,16 +117,31 @@ pub fn author_join(
         }
     };
 
-    let presign_base = (!registry.base.is_empty()).then(|| registry.base.clone());
+    // Plane selection: a configured shared FILESYSTEM payload root (`[vhc] payload_dir`, the
+    // multi-node single-host topology) uses the fs content store — the worker roots it at the
+    // node-delivered shared dir, so `presign_base` stays absent even when a registry base is
+    // configured for discovery + the seat CAS. Otherwise the presigned R2 plane is selected
+    // from the registry base.
+    let presign_base =
+        (!local_payload_plane && !registry.base.is_empty()).then(|| registry.base.clone());
+    // The seat-published endpoint (when present) is the authoritative coordinator control plane;
+    // otherwise the node-resolved discovery coordinator.
+    let ws_base = seat
+        .ws_base
+        .filter(|b| !b.is_empty())
+        .or_else(|| (!coordinator.is_empty()).then(|| coordinator.to_string()));
     let credentials = SessionCredentials {
         genesis_hash: identity.genesis_hash,
-        ws_base: (!coordinator.is_empty()).then(|| coordinator.to_string()),
+        ws_base,
         // The secret-bearing auth lives in the keystore record (secret_ref); the wire body's
         // auth stays None ([CI-9] — never a token on the command payload).
         ws_auth: WsAuthSpec::None,
         iroh: None,
         presign_base,
-        peer_certs: Vec::new(),
+        // Bootstrap trust: the incumbent coordinator's certificate from the seat lease, so the
+        // worker authenticates coordinator frames without waiting for the on-plane announcement
+        // (which a late subscriber misses). `CertCheck` still gates trust by genesis base.
+        peer_certs: seat.peer_certs,
         secret_ref,
         expires_at_ms,
         restore,

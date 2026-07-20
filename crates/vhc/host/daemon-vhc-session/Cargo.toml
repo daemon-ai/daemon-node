@@ -42,6 +42,10 @@ live-iroh = ["live", "daemon-vhc-net/iroh"]
 # its only in-repo invoker was `daemon-vhc-e2e`'s equally dead `iroh` feature.
 
 [dependencies]
+# Structured diagnostics for the live role session + provider construction (a live session that
+# emits nothing is undebuggable in a multi-process run). Events only, no subscriber — the binary
+# (worker/node) installs the subscriber and picks the sink; `RUST_LOG` selects levels.
+tracing = { workspace = true }
 daemon-vhc-proto = { workspace = true }
 # The frozen ABI constants (event/outcome/quiesce-reason/stop-reason codes, the default control
 # channel id) two consumers share: the production upgrade-transaction adapter

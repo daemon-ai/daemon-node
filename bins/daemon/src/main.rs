@@ -3032,6 +3032,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 // payload plane live under it (`<data_dir>/vhc/runs/<blake3(label)>/…`). Handed
                 // to workers as a path REFERENCE, exactly like the identity dir.
                 let run_dir = cfg.data_dir.join("vhc").join("runs");
+                // The optional shared filesystem payload-plane root (`[vhc] payload_dir`):
+                // multi-node single-host deployments point every node at one root so peers can
+                // fetch each other's content-addressed payloads (journals stay per-node).
+                let payload_dir = (!cfg.vhc.payload_dir.is_empty())
+                    .then(|| std::path::PathBuf::from(&cfg.vhc.payload_dir));
+                let payload_dir_for_factory = payload_dir.clone();
                 let worker_cfg = |path: &str| {
                     let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(path);
                     wc.env.push((
@@ -3042,6 +3048,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         daemon_vhc_session::journal_home::RUN_DIR_ENV.to_string(),
                         run_dir.display().to_string(),
                     ));
+                    if let Some(dir) = &payload_dir {
+                        wc.env.push((
+                            daemon_vhc_session::journal_home::PAYLOAD_DIR_ENV.to_string(),
+                            dir.display().to_string(),
+                        ));
+                    }
                     wc
                 };
                 let worker: Arc<dyn daemon_vhc_node::WorkerControl> = Arc::new(
@@ -3064,6 +3076,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         daemon_vhc_session::journal_home::RUN_DIR_ENV.to_string(),
                         factory_run_dir.display().to_string(),
                     ));
+                    if let Some(dir) = &payload_dir_for_factory {
+                        wc.env.push((
+                            daemon_vhc_session::journal_home::PAYLOAD_DIR_ENV.to_string(),
+                            dir.display().to_string(),
+                        ));
+                    }
                     Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(wc))
                         as Arc<dyn daemon_vhc_node::WorkerControl>
                 });
@@ -3142,13 +3160,17 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         cfg.vhc.data_cache_gb,
                     )
                 };
-                // The registry seat-slot directory (architecture §6.3; D-P9): wired only when the
-                // owner enabled coordinator duty AND a registry is configured — the resident seat
-                // keeper claims/heartbeats/releases through it.
-                let seat_directory: Option<Arc<dyn daemon_vhc_node::SeatDirectory>> = if cfg
+                // The registry seat-slot directory (architecture §6.3; D-P9): wired whenever a
+                // registry is configured. A coordinator-duty node drives claim/heartbeat/release
+                // through it (the resident keeper); EVERY node also READS it at join to bootstrap
+                // the incumbent coordinator's certificate into a trainer's session credentials
+                // (the seat lease is the out-of-band trust a late subscriber cannot get from the
+                // coordinator's one-shot on-plane announcement).
+                let seat_directory: Option<Arc<dyn daemon_vhc_node::SeatDirectory>> = if !cfg
                     .vhc
-                    .seat_claim
-                    && !cfg.vhc.registry.base.is_empty()
+                    .registry
+                    .base
+                    .is_empty()
                 {
                     match daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()) {
                         Ok(egress) => {

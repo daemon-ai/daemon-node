@@ -4858,6 +4858,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-acceptance"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "daemon-api",
+ "daemon-host",
+ "daemon-vhc-journal",
+ "daemon-vhc-net",
+ "daemon-vhc-proto",
+ "daemon-vhc-session",
+ "daemon-vhc-testkit",
+ "futures",
+ "nix 0.31.3",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "wiremock",
+]
+
+[[package]]
 name = "daemon-vhc-det"
 version = "0.0.1"
 
@@ -4965,6 +4987,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -5084,6 +5107,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "xxhash-rust",
  "zeroize",
 ]

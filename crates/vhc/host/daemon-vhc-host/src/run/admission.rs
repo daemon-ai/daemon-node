@@ -142,8 +142,15 @@ impl ParticipationLane {
                 max_live_bytes: 1 << 30,
                 max_readback_bytes: 64 << 20,
                 max_outstanding_ops: 256,
-                // The compute@2 queue-depth ceiling (C1; mirrors the `RunConfig` default).
-                compute_queue_depth: 1024,
+                // The compute@2 queue-depth ceiling (C1). A real multi-layer TinyLlama
+                // forward+backward+optimizer inner step enqueues far more than a thousand ops
+                // before its per-step reclaim fence, so the TRAINER lane sizes this for training
+                // (the in-process whole-run harness sets the same 1<<20 straight on `RunConfig`,
+                // bypassing admission; the production admitted path must match, or a real step
+                // traps `GrantViolation: compute queue depth reached` mid-inner-step). The
+                // per-fence reclaim (§3.3) still bounds live device memory; this only raises the
+                // between-fences ceiling to what a transformer step needs.
+                compute_queue_depth: 1 << 20,
                 // No lane ceiling on the cumulative data@2 read budget: the envelope grant
                 // stands (0 = unbounded by this grant, ABI §2.3).
                 data_read_budget_bytes: 0,
