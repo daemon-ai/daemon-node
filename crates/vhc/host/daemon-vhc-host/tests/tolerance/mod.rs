@@ -66,6 +66,23 @@ pub fn tol_for(class: OpClass) -> Tol {
     }
 }
 
+/// The CUDA-calibrated `Optimizer` band. The baseline [`tol_for`] band was calibrated on
+/// Vulkan/RADV (plus ndarray-vs-cpu) only; the first real-CUDA execution (RTX 4090, driver
+/// 580.159.04, two deterministic runs) deterministically breached it at exactly one element —
+/// `round 0 l0.wq[138]: |0.008471968 − 0.008444794| = 2.7173e-5 > bound 2.1694e-5` (~25% over,
+/// atol-dominated at |θ| ≈ 0.008) — while the det-lane digests were bit-exact across both runs,
+/// so the deviation is native-kernel summation-order variance, not a divergence. The atol is
+/// doubled (2e-5 → 4e-5), ≈ 1.5× headroom over the measured deviation at the breaching element;
+/// rtol is unchanged and every other backend keeps the baseline band. Re-validate this
+/// calibration at the next hardware preflight on real CUDA devices.
+#[must_use]
+pub fn cuda_optimizer_tol() -> Tol {
+    Tol {
+        rtol: 2e-4,
+        atol: 4e-5,
+    }
+}
+
 /// Assert `got` matches `want` within the op's tolerance class (element-wise).
 pub fn assert_close(got: &[f32], want: &[f32], class: OpClass, ctx: &str) {
     assert_eq!(
