@@ -353,6 +353,7 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         roles,
         artifacts,
         corpus_manifest: Some(manifest_hash),
+        state_contract: None,
         authority: AuthorityConfig {
             topology: Topology::SingleKey(SingleKey::new(coordinator_base)),
             records_channel: DEFAULT_RECORDS_CHANNEL,

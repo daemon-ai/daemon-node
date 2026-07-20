@@ -89,6 +89,7 @@ fn genesis_wire(old_module: Hash) -> (Vec<u8>, Hash, GenesisEnvelope) {
         roles,
         artifacts,
         corpus_manifest: None,
+        state_contract: None,
         authority: ciborium::value::Value::Map(vec![]),
         transport: TransportSelection::default(),
         identities: Identities {

@@ -127,6 +127,7 @@ fn genesis_wire(trusted_bases: &[PeerId]) -> (Vec<u8>, [u8; 32]) {
         roles,
         artifacts,
         corpus_manifest: None,
+        state_contract: None,
         authority: Value::Null,
         transport: TransportSelection::default(),
         identities: Identities {

@@ -30,6 +30,7 @@ pub mod capability;
 pub mod cert;
 pub mod corpus;
 pub mod crypto;
+pub mod det_state;
 pub mod domains;
 pub mod envelope;
 pub mod error;
@@ -60,12 +61,21 @@ pub use crypto::{
     hash as crypto_hash, verify_sig, VerifyOutcome, HASH_LEN, VERIFY_PUBLIC_KEY_LEN,
     VERIFY_SIGNATURE_LEN,
 };
+pub use det_state::{
+    derive_state_chunk_size, family_byte_len, family_chunk_count, family_chunk_hashes, family_fold,
+    param_chunk_count, validate_checkpoint_cadence, validate_profile_chunk,
+    validate_state_chunk_size, CkptDocSection, DetStateManifest, FamilyEntry, FamilyRef,
+    LayoutBinding, DET_STATE_MANIFEST_FORMAT, MASTER_FAMILY, REPLICATED_FAMILY_PREFIX,
+    STATE_CHUNK_SIZE_TARGET, STATE_ELEM_BYTES, STATE_RETAIN_ROOTS_DEFAULT, STATE_STORE_BYTES_GRANT,
+    STATE_STREAMS_MAX_GRANT, STATE_WRITE_BUDGET_GRANT,
+};
 pub use envelope::{DeviceMinimums, SignedEnvelope};
 pub use error::VhcProtoError;
 pub use genesis::{
     peek_schema, BufferReq, ChannelDecl, ControlTransport, EventCap, EventCaps, FrozenGenesis,
     GenesisEnvelope, GrantBound, Identities, MigrationGrant, RoleEntry, RoleGrants, RunSection,
-    SnapshotArtifact, TransportSelection, WorldGrant, GENESIS_SCHEMA_MAJOR,
+    SnapshotArtifact, StateContract, StateInit, TransportSelection, WorldGrant,
+    GENESIS_SCHEMA_MAJOR,
 };
 pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsDoc, GrantsError, LaneCeilings};
 pub use hash::blake3_hash;

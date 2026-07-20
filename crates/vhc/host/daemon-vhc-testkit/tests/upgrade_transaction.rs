@@ -181,6 +181,7 @@ fn drill_genesis(
         roles,
         artifacts,
         corpus_manifest: None,
+        state_contract: None,
         authority: ciborium::value::Value::Map(vec![]),
         transport: TransportSelection::default(),
         identities: Identities {

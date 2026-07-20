@@ -1,0 +1,43 @@
+{
+  "comment": "Shared det-state chunk-geometry vectors: the genesis-authoring rules every conforming validator must reproduce. The ceremony geometry mirrors the frozen ceremony model (d_model 1536, 24 layers, vocab 32768, qdim 1536, swiglu hidden 4608; registration order: token embedding; per block attn-norm, wq, wk, wv, wo, ffn-norm, w1, w3, w2; final norm). The norm parameters ARE d_model wide, so the profile chunk must divide 1536 itself; a chunk that divides the matrices but not d_model (e.g. 4096) is refused at the first norm parameter.",
+  "ceremony_geometry": {
+    "d_model": 1536,
+    "n_layers": 24,
+    "vocab": 32768,
+    "qdim": 1536,
+    "hidden": 4608
+  },
+  "profile_chunk_vectors": [
+    { "name": "acceptance-tier chunk 64 divides every ceremony numel", "chunk": 64, "expect": "accept" },
+    { "name": "chunk 512 divides 1536 and every matrix", "chunk": 512, "expect": "accept" },
+    { "name": "chunk 1536 (= d_model) is the widest norm-compatible chunk", "chunk": 1536, "expect": "accept" },
+    { "name": "chunk 768 divides 1536", "chunk": 768, "expect": "accept" },
+    { "name": "profile default 4096 divides the matrices but NOT the 1536-wide norms", "chunk": 4096, "expect": "refuse" },
+    { "name": "chunk 3072 exceeds d_model and cannot divide the norms", "chunk": 3072, "expect": "refuse" },
+    { "name": "chunk 1024 does not divide 1536", "chunk": 1024, "expect": "refuse" },
+    { "name": "zero chunk is degenerate", "chunk": 0, "expect": "refuse" }
+  ],
+  "state_chunk_size_vectors": [
+    { "name": "chunk 64: 4 MiB is exactly 16384 compression-chunk widths", "chunk": 64, "state_chunk_size": 4194304, "expect": "accept" },
+    { "name": "chunk 1536: 682 x 6144 B is the ~4 MiB multiple", "chunk": 1536, "state_chunk_size": 4190208, "expect": "accept" },
+    { "name": "chunk 1536: a bare 4 MiB is not a 6144 B multiple", "chunk": 1536, "state_chunk_size": 4194304, "expect": "refuse" },
+    { "name": "chunk 64: off-by-one is not a 256 B multiple", "chunk": 64, "state_chunk_size": 4194305, "expect": "refuse" },
+    { "name": "one chunk width is the smallest legal size", "chunk": 64, "state_chunk_size": 256, "expect": "accept" },
+    { "name": "zero state chunk size is degenerate", "chunk": 64, "state_chunk_size": 0, "expect": "refuse" }
+  ],
+  "derive_state_chunk_size_vectors": [
+    { "chunk": 64, "derived": 4194304 },
+    { "chunk": 1536, "derived": 4190208 },
+    { "chunk": 1, "derived": 4194304 },
+    { "chunk": 2097152, "derived": 8388608 }
+  ],
+  "cadence_retention_vectors": [
+    { "name": "cadence 20 + one churn slot fits retention 40", "cadence": 20, "retention": 40, "expect": "accept" },
+    { "name": "cadence 20 + one churn slot exceeds retention 39", "cadence": 20, "retention": 39, "expect": "refuse" },
+    { "name": "cadence 30 strands a rejoiner past retention 16", "cadence": 30, "retention": 16, "expect": "refuse" },
+    { "name": "retention 0 = unbounded, no constraint", "cadence": 20, "retention": 0, "expect": "accept" },
+    { "name": "cadence 0 = remote publication disabled, nothing to bound", "cadence": 0, "retention": 8, "expect": "accept" },
+    { "name": "cadence 1 needs retention >= 2", "cadence": 1, "retention": 2, "expect": "accept" },
+    { "name": "cadence 1 refuses retention 1", "cadence": 1, "retention": 1, "expect": "refuse" }
+  ]
+}
