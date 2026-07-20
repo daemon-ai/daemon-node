@@ -39,6 +39,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod streaming;
+
 // ================================================================================================
 // payload wire
 // ================================================================================================
@@ -80,7 +82,7 @@ pub fn decode_payload(bytes: &[u8]) -> Result<Vec<Section>, String> {
 }
 
 /// A tensor section's f32 data, or an error naming the section.
-fn tensor_data(sections: &[Section], idx: usize) -> Result<&[f32], String> {
+pub(crate) fn tensor_data(sections: &[Section], idx: usize) -> Result<&[f32], String> {
     match sections.get(idx) {
         Some(Section::Tensor { data, .. }) => Ok(data),
         Some(Section::Bytes(_)) => Err(format!("section {idx}: expected Tensor, got Bytes")),
@@ -90,18 +92,18 @@ fn tensor_data(sections: &[Section], idx: usize) -> Result<&[f32], String> {
 
 /// Packed `U8` payload bytes from their f32-per-byte tensor ride (the v1 container convention).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn bytes_of(data: &[f32]) -> Vec<u8> {
+pub(crate) fn bytes_of(data: &[f32]) -> Vec<u8> {
     data.iter().map(|&f| f as u8).collect()
 }
 
 /// Chunk-local u32 indices from their f32 tensor ride.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn indices_of(data: &[f32]) -> Vec<u32> {
+pub(crate) fn indices_of(data: &[f32]) -> Vec<u32> {
     data.iter().map(|&f| f as u32).collect()
 }
 
 /// A packed byte vector as its f32-per-byte tensor ride.
-fn f32_of_bytes(bytes: &[u8]) -> Vec<f32> {
+pub(crate) fn f32_of_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes.iter().map(|&b| f32::from(b)).collect()
 }
 
@@ -141,7 +143,7 @@ fn delta_of(p: &ParamView<'_>) -> Vec<f32> {
 
 /// Elementwise `a·s + b` in the v1 native op order (`mul_s` then `add`), f32.
 #[allow(clippy::cast_possible_truncation)]
-fn scale_add(a: &[f32], s: f64, b: &[f32]) -> Vec<f32> {
+pub(crate) fn scale_add(a: &[f32], s: f64, b: &[f32]) -> Vec<f32> {
     let sf = s as f32;
     a.iter().zip(b.iter()).map(|(&x, &y)| x * sf + y).collect()
 }
@@ -620,7 +622,7 @@ impl Demo {
 
 /// The median of a list of contribution norms (guest f64 math over det-lane `det_l2norm`
 /// results; deterministic ⇒ safe on the agree-path). Empty ⇒ `+∞` (no clip). v1 verbatim.
-fn median_of(norms: &[f64]) -> f64 {
+pub(crate) fn median_of(norms: &[f64]) -> f64 {
     if norms.is_empty() {
         return f64::INFINITY;
     }

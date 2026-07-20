@@ -5079,7 +5079,10 @@ dependencies = [
  "burn",
  "ciborium",
  "daemon-vhc-det",
+ "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

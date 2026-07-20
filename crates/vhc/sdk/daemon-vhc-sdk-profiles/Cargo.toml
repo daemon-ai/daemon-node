@@ -25,6 +25,12 @@ license.workspace = true
 
 [dependencies]
 daemon-vhc-det = { workspace = true }
+# The streamed det-lane fold walks (`streaming`) consume the consensus SDK's pinned
+# slice-decomposition schedule (`fold_walk`) and streaming digest carry (`digest::DigestCarry`).
+# A lower→same-layer sdk edge (sdk-consensus links contracts only), wasm32-clean; the guest graph
+# already links both crates, and profiles is dev/harness-only on the host side, so the host-graph
+# negative architecture test is unaffected.
+daemon-vhc-sdk-consensus = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 ciborium = { workspace = true }
 # The pinned Burn the compute@2 wire is defined against (decisions D8): tensor core only, no
@@ -32,6 +38,10 @@ ciborium = { workspace = true }
 burn = { version = "=0.21.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# The windowed ≡ resident parity + schedule-conformance suites: `Seed` for the digest carry and
+# the shared fold-walk/digest-carry vector fixtures (JSON).
+daemon-vhc-proto = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

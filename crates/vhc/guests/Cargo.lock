@@ -1577,6 +1577,7 @@ dependencies = [
  "burn",
  "ciborium",
  "daemon-vhc-det",
+ "daemon-vhc-sdk-consensus",
  "serde",
 ]
 
