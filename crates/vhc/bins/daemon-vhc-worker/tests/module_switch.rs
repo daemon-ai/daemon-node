@@ -202,11 +202,15 @@ fn switch_tuple(
         grants: control_channel(),
         run_artifacts: std::collections::BTreeSet::new(),
     };
+    // The admitted role config carries UNCHANGED across the switch: the drill role's config is
+    // the single CBOR byte `0` (the counter seed) — the claim + config hash are computed over
+    // exactly what the migrated instance initializes with.
+    let config = to_canonical_vec(&Value::from(0u8)).expect("role config bytes");
     let admission = daemon_vhc_host::run::admit(
         &worker,
         new_wasm,
         Some(&new_module),
-        &[],
+        &config,
         &grants,
         &daemon_vhc_host::run::ParticipationLane {
             gpu: 1,
@@ -232,7 +236,7 @@ fn switch_tuple(
     .expect("target admits");
     let tuple = AdmittedTuple {
         module_hash: new_module,
-        config_hash: *blake3::hash(&[]).as_bytes(),
+        config_hash: *blake3::hash(&config).as_bytes(),
         grants_hash,
         claim_hash: *blake3::hash(&admission.claim_bytes).as_bytes(),
         genesis_hash,

@@ -1451,6 +1451,11 @@ pub(crate) async fn assess_switch(
         Err(reason) => return Ok(ineligible(reason, Some("SwitchTargetUnresolvable"))),
     };
     let worker = Worker::new(assess_engine_config()).map_err(|e| format!("engine: {e}"))?;
+    // The admitted role config carries UNCHANGED across the switch (upgrade records pin module
+    // + grants; config carriage arrives when records carry one) — the target is assessed, and
+    // later re-admitted at the fence, with the exact config the running instance was admitted
+    // under, so the migrated instance initializes like its predecessor.
+    let config = resolved.config.clone();
     // The grants anchor (§10.3 step 3): the re-derived document must hash to the committed
     // record's grants_hash — refused typed here, and re-checked by the session at the fence.
     let role_grants = &genesis.env.roles[&genesis.worker_role].grants;
@@ -1487,9 +1492,9 @@ pub(crate) async fn assess_switch(
         &worker,
         &bytes,
         Some(&target.new_module),
-        // The session's re-admission at the fence evaluates the same empty config, so the
+        // The session's re-admission at the fence evaluates the same carried config, so the
         // claim bytes — and the tuple's claim hash — match by construction.
-        &[],
+        &config,
         &grants,
         &selected_lane(),
         &device,
@@ -1509,7 +1514,7 @@ pub(crate) async fn assess_switch(
             refusal_code: None,
             admitted_tuple: Some(daemon_vhc_session::protocol::AdmittedTuple {
                 module_hash: target.new_module,
-                config_hash: *blake3::hash(&[]).as_bytes(),
+                config_hash: *blake3::hash(&config).as_bytes(),
                 grants_hash: target.grants_hash,
                 claim_hash: *blake3::hash(&admission.claim_bytes).as_bytes(),
                 genesis_hash: genesis.frozen.run_id().0,
@@ -1546,6 +1551,7 @@ pub(crate) fn switch_binding(
     deadline_ms: u64,
     tuple: daemon_vhc_session::protocol::AdmittedTuple,
     old_incarnation: u64,
+    config: Vec<u8>,
 ) -> Result<daemon_vhc_session::role_session::SwitchBinding, String> {
     use daemon_vhc_session::keystore::VhcKeystore;
 
@@ -1681,8 +1687,10 @@ pub(crate) fn switch_binding(
         grants_hash,
         tuple,
         module_bytes,
-        // Upgrade records pin module + grants; config carriage arrives when they carry one.
-        config: Vec::new(),
+        // The admitted role config carries UNCHANGED across the switch (upgrade records pin
+        // module + grants; config carriage arrives when records carry one): the migrated
+        // instance initializes exactly like its predecessor.
+        config,
         signing_seed: run_key.to_bytes(),
         own_cert: cert,
         role_grants: genesis.env.roles[&genesis.worker_role].grants.clone(),

@@ -66,6 +66,18 @@ impl VhcApi for NodeApiImpl {
         }
     }
 
+    async fn vhc_switch_module(
+        &self,
+        run_id: String,
+        upgrade_record: Vec<u8>,
+        op_id: String,
+    ) -> Result<daemon_api::VhcSwitchOutcome, ApiError> {
+        match self.vhc.get() {
+            Some(s) => s.vhc_switch_module(run_id, upgrade_record, op_id).await,
+            None => Err(ApiError::Unsupported("vhc_switch_module".into())),
+        }
+    }
+
     async fn vhc_set_policy(&self, policy: VhcPolicy) -> Result<(), ApiError> {
         match self.vhc.get() {
             Some(s) => s.vhc_set_policy(policy).await,

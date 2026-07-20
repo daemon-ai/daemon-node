@@ -703,6 +703,9 @@ async fn main() {
                     deadline_ms,
                     *tuple,
                     handle.generation(),
+                    // The admitted role config carries unchanged across the switch (upgrade
+                    // records pin module + grants; config carriage arrives when they carry one).
+                    resolved.config.clone(),
                 ) {
                     Ok(binding) => handle.switch(binding),
                     Err(reason) => send(&writer, &refusal(reason)).await,

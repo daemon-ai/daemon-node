@@ -579,8 +579,22 @@ impl Worker {
                         } else {
                             None
                         };
+                        // Request/reply ANSWERS always reach the inbox, pump armed or not: a
+                        // probe/assess/switch exchange issued WHILE a run streams (the pre-switch
+                        // assessment, the switch command itself) must see its reply — the node's
+                        // stream consumer does nothing with these — or the exchange would starve
+                        // behind the pump and trip the watchdog.
+                        let request_reply = matches!(
+                            event,
+                            Event::Ready { .. }
+                                | Event::Probed(..)
+                                | Event::Assessed(..)
+                                | Event::Pong
+                                | Event::ModuleSwitched { .. }
+                                | Event::SwitchRefused { .. }
+                        );
                         let mut routed_to_pump = false;
-                        if !first {
+                        if !first && !request_reply {
                             let sink = reader_pump.lock().expect("pump lock").clone();
                             if let Some(tx) = sink {
                                 if tx.send(event.clone()).is_ok() {

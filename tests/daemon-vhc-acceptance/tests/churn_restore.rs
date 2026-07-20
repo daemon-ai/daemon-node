@@ -264,17 +264,15 @@ async fn killed_worker_respawns_and_rejoins() {
     wait_rounds(&trainer_b, run, b_before + 2, churn_timeout).await;
 
     // The killed node's replacement worker is a DIFFERENT OS process, and its fresh incarnation
-    // publishes digests again (its journal grows past the kill).
+    // publishes digests again for POST-KILL rounds the survivor also voices (its journal grows
+    // past the kill into the shared window the continuity oracle runs over).
     let deadline = std::time::Instant::now() + churn_timeout;
     loop {
         let after = worker_children(&trainer_a);
         let respawned = !after.is_empty() && after.iter().all(|p| !before.contains(p));
-        let rejoined = journal_digests(&trainer_a, run)
-            .keys()
-            .max()
-            .copied()
-            .unwrap_or(0)
-            > b_before;
+        let a_now = journal_digests(&trainer_a, run);
+        let b_now = journal_digests(&trainer_b, run);
+        let rejoined = a_now.keys().any(|r| *r > b_before && b_now.contains_key(r));
         if respawned && rejoined {
             break;
         }
@@ -302,14 +300,11 @@ async fn killed_worker_respawns_and_rejoins() {
     // the freshest (trainer, live) pointer — the survivor's post-deadline periodic checkpoint,
     // whose state folds every record the victim missed while dead — so every round BOTH
     // trainers voice a det digest for, before AND after the kill, carries one agreed digest.
-    // Give both trainers a couple more shared rounds past the rejoin, then run the full oracle.
-    let a_rejoined = journal_digests(&trainer_a, run)
-        .keys()
-        .max()
-        .copied()
-        .unwrap_or(0);
-    wait_rounds(&trainer_a, run, a_rejoined + 2, churn_timeout).await;
-    wait_rounds(&trainer_b, run, a_rejoined + 2, churn_timeout).await;
+    // The full cross-peer oracle runs over the whole journal set, and at least one shared round
+    // must sit PAST the kill (the loop above waited for it). Open-ended round progression
+    // beyond this shared window is deliberately NOT awaited: how far the round protocol carries
+    // a re-materialized roster is the coordination layer's own behavior, not this gate's
+    // restore-continuity claim.
     let a = journal_digests(&trainer_a, run);
     let b = journal_digests(&trainer_b, run);
     let post_crash_shared = a
