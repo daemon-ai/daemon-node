@@ -3016,6 +3016,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // `daemon-vhc-supervisor::TrainSupervisor`, re-converges durable join intents (§10.3), and routes
     // its `VhcChanged` invalidation pointers onto the existing node feed. A `Weak` feed handle
     // avoids a node↔service `Arc` cycle. Drags no burn/wasmtime/iroh onto the default build.
+    //
+    // The handle is RETAINED past `set_vhc` for the shutdown hook below: a node holding the
+    // coordinator seat releases it (fenced) on clean shutdown, so a standby takes over at
+    // floor + 1 without waiting out the lease TTL.
+    let mut vhc_service: Option<Arc<daemon_vhc_node::VhcService>> = None;
     if cfg.vhc.enabled {
         match daemon_vhc_node::VhcStore::open(cfg.data_dir.join("vhc.db")) {
             Ok(store) => {
@@ -3228,7 +3233,8 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 if svc.spawn_seat_keeper().is_some() {
                     tracing::info!("vhc: coordinator seat keeper resident ([vhc] seat_claim)");
                 }
-                node.set_vhc(svc as Arc<dyn daemon_api::VhcApi>);
+                node.set_vhc(svc.clone() as Arc<dyn daemon_api::VhcApi>);
+                vhc_service = Some(svc);
                 tracing::info!("vhc: VhcService bound ([vhc] enabled)");
             }
             Err(e) => {
@@ -3583,6 +3589,18 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
 
     let signal = shutdown.await?;
     tracing::info!(signal, "shutdown signal received; shutting down");
+    // A clean shutdown SURRENDERS any held coordinator seat (the fenced release) so a standby
+    // takes over at floor + 1 without waiting out the lease TTL. Bounded: the release is
+    // best-effort network I/O against the seat registry — a hung registry must not stall the
+    // shutdown (the TTL remains the safety net).
+    if let Some(vhc) = &vhc_service {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), vhc.release_seats())
+            .await
+            .is_err()
+        {
+            tracing::warn!("vhc: seat release timed out at shutdown (the lease TTL expires it)");
+        }
+    }
     // Stop the workspace-index reconcile loop cleanly (no-op when the index was never wired).
     workspace_index_cancel.cancel();
     #[cfg(unix)]

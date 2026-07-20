@@ -281,6 +281,84 @@ async fn keeper_claims_renews_and_releases_on_pause() {
     }
 }
 
+/// The SHUTDOWN hook (`VhcService::release_seats`, driven by the daemon's graceful-shutdown
+/// block): a node holding the coordinator seat surrenders it FENCED on clean shutdown — the slot
+/// unclaims with the token floor persisted, so a standby takes over at floor + 1 without waiting
+/// out the lease TTL. Idempotent: a second release (nothing held) is a no-op.
+#[tokio::test]
+async fn shutdown_releases_the_held_seat_fenced() {
+    let identity = tempfile::tempdir().unwrap();
+    VhcKeystore::open(identity.path()).unwrap();
+    let directory = FakeDirectory::new();
+    let svc = Arc::new(VhcService::new(VhcServiceParts {
+        config: VhcConfig {
+            enabled: true,
+            seat_claim: true,
+            ..VhcConfig::default()
+        },
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: Arc::new(IdleWorker),
+        feed: None,
+        discovery: None,
+        budget: None,
+        worker_factory: None,
+        identity_dir: Some(identity.path().to_path_buf()),
+        seat_directory: Some(directory.clone()),
+    }));
+    svc.bind_self();
+
+    let policy = VhcPolicy {
+        mode: VhcPolicyMode::Always,
+        vram_cap_mb: 0,
+        duty_cycle_pct: 100,
+        schedule: None,
+    };
+    svc.store()
+        .put_join_intent(
+            RUN,
+            "wss://coord.example",
+            &policy,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+    svc.store().set_execution_identity(RUN, 0, ROLE, 1).unwrap();
+    svc.store()
+        .set_admitted_tuple(RUN, &protocol::encode(&tuple()).unwrap())
+        .unwrap();
+
+    // The keeper claims the seat (the resident coverage pass).
+    let notes = svc.seat_tick().await.unwrap();
+    assert!(
+        matches!(notes.as_slice(), [SeatNote::Claimed { .. }]),
+        "got {notes:?}"
+    );
+    assert!(matches!(
+        directory.registry.read(RUN, ROLE),
+        SeatState::Leased(_)
+    ));
+
+    // Clean shutdown: every held seat releases fenced — unclaimed slot, floor persisted.
+    svc.release_seats().await;
+    match directory.registry.read(RUN, ROLE) {
+        SeatState::Unclaimed { last_fencing_token } => {
+            assert_eq!(
+                last_fencing_token,
+                Some(0),
+                "the floor survives the release"
+            );
+        }
+        other => panic!("expected the released slot, got {other:?}"),
+    }
+
+    // Idempotent: a second shutdown release holds nothing and touches nothing.
+    svc.release_seats().await;
+    assert!(matches!(
+        directory.registry.read(RUN, ROLE),
+        SeatState::Unclaimed { .. }
+    ));
+}
+
 /// A discovery fake naming a fixed coordinator endpoint (the allowlisted relay URL).
 struct FixedDiscovery;
 
