@@ -17,7 +17,7 @@ use daemon_vhc_net::{RegistryClient, RunId};
 
 use crate::service::VhcError;
 
-/// A published-checkpoint pointer resolved from the registry (spec §9; lane R): the round a
+/// A published-checkpoint pointer resolved from the registry (spec §9): the round a
 /// checkpoint covers and its content address, the late-join restore input. Pointers are keyed
 /// per `(role, kind)` — a role restores only from its own role's state, and a periodic LIVE
 /// pointer is a distinct slot from a graceful-leave DRAIN snapshot.
@@ -61,7 +61,7 @@ pub trait RunDiscovery: Send + Sync {
     /// unknown or the bytes do not match the descriptor's hash.
     async fn fetch_envelope(&self, run_id: &str) -> Result<Vec<u8>, VhcError>;
 
-    /// Publish this run's latest checkpoint pointer to the registry (spec §9; lane R), keyed by
+    /// Publish this run's latest checkpoint pointer to the registry (spec §9), keyed by
     /// the `(role, kind)` slot it fills. The checkpoint DOCUMENT already lives on the payload
     /// plane (the session put it there); this records the round → content-address pointer a
     /// late joiner reads. Best-effort: the default is a no-op so fakes/offline nodes need not

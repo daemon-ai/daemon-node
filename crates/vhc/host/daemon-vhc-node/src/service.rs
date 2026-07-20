@@ -131,9 +131,9 @@ pub trait WorkerControl: Send + Sync {
         policy: JoinPolicy,
         admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<(), VhcError>;
-    /// Join a run and return the **continuous** worker event stream (A3 event pump). The default
+    /// Join a run and return the **continuous** worker event stream (the continuous event pump). The default
     /// delegates to [`join`](Self::join) and returns an already-closed receiver, so test fakes and
-    /// non-streaming workers keep the pre-A3 behavior; `TrainSupervisor` overrides it with the real
+    /// non-streaming workers keep the drain-and-drop behavior; `TrainSupervisor` overrides it with the real
     /// per-round stream. `admitted_tuple` carries the node-minted incarnation the worker runs as.
     async fn join_streaming(
         &self,
@@ -309,7 +309,7 @@ pub struct VhcServiceParts {
     pub worker: Arc<dyn WorkerControl>,
     /// The node-feed sink for `VhcChanged` pointers (`None` on a headless / test build).
     pub feed: Option<NodeFeed>,
-    /// The run-discovery seam (A1). When present, `vhc_join` discovers the run + fetches the frozen
+    /// The run-discovery seam. When present, `vhc_join` discovers the run + fetches the frozen
     /// envelope + runs the worker's real §6.5 `AssessRun` before `JoinRun`. `None` keeps the
     /// probe-based eligibility path (no coordinator configured), so the service stays usable offline.
     pub discovery: Option<Arc<dyn RunDiscovery>>,
@@ -382,7 +382,7 @@ pub struct VhcService {
     current_run: Mutex<Option<String>>,
     /// The coalescing vhc-feed revision stamped on each `VhcChanged` pointer.
     rev: AtomicU64,
-    /// The service's own `Arc` handle (A3), bound post-construction via [`bind_self`](Self::bind_self)
+    /// The service's own `Arc` handle (the event-pump wiring), bound post-construction via [`bind_self`](Self::bind_self)
     /// so `vhc_join`/`start` can spawn a detached event-pump task that outlives the `&self` call.
     /// Unbound (test builds) → the non-streaming `join` path, drained-and-dropped.
     me: std::sync::OnceLock<std::sync::Weak<VhcService>>,
@@ -430,7 +430,7 @@ impl VhcService {
         &self.arbiter
     }
 
-    /// Bind the service's own `Arc` handle (A3 event pump), mirroring the node's `set_vhc`
+    /// Bind the service's own `Arc` handle (the continuous event pump), mirroring the node's `set_vhc`
     /// post-`Arc` binder. After this, `vhc_join` / `start` drive `join_streaming` + a detached pump
     /// task feeding the worker's continuous event stream into [`handle_worker_event`](Self::handle_worker_event)
     /// → `NodeEvent::VhcChanged`, so `vhc.db` reflects live round progression (§10.3/§10.4).
@@ -439,7 +439,7 @@ impl VhcService {
         let _ = self.me.set(Arc::downgrade(self));
     }
 
-    /// Join a run and pump its continuous worker event stream into the service (A3). The public entry
+    /// Join a run and pump its continuous worker event stream into the service. The public entry
     /// the boot site / e2e use to drive a **live-attach** join with authored `JoinCredentials`; the
     /// pump feeds each event through `handle_worker_event`. Requires [`bind_self`](Self::bind_self).
     pub async fn join_and_pump(
@@ -618,7 +618,7 @@ impl VhcService {
                     let _ = self.store.set_admitted_tuple(&run.run_id, &bytes);
                 }
             }
-            // A3: re-issue via the streaming path + pump so a re-converged run resumes reporting
+            // Re-issue via the streaming path + pump so a re-converged run resumes reporting
             // live round progression into vhc.db (durable-intent re-convergence, §10.3).
             let rx = match worker
                 .join_streaming(
@@ -1057,7 +1057,7 @@ impl VhcService {
     }
 
     /// Translate + persist + fan out a worker event (spec §10.3 "all are persisted / fanned out by
-    /// the node"). Returns the [`VhcEvent`]s emitted (0..2 per worker event). B3 wires the live
+    /// the node"). Returns the [`VhcEvent`]s emitted (0..2 per worker event). The boot wiring routes the live
     /// worker event stream into this; unit tests drive it directly.
     pub fn handle_worker_event(&self, ev: &protocol::Event) -> Result<Vec<VhcEvent>, VhcError> {
         // Stale-generation discard (the idempotency/generation invariant): every run-scoped
@@ -1121,7 +1121,7 @@ impl VhcService {
             _ => {}
         }
 
-        // Checkpoint-pointer publication (spec §9; lane R): the checkpoint DOCUMENT is already on
+        // Checkpoint-pointer publication (spec §9): the checkpoint DOCUMENT is already on
         // the payload plane (the session put it there); record the round → content-address
         // pointer at the registry under the run's `(role, kind)` slot so a late joiner restores
         // role-scoped (a coordinator pointer never shadows a trainer restore source). Best-effort
@@ -1411,7 +1411,7 @@ impl VhcService {
             .unwrap_or_default()
     }
 
-    /// Resolve the `(coordinator, eligibility)` for a join (A1), against the role-instance's own
+    /// Resolve the `(coordinator, eligibility)` for a join, against the role-instance's own
     /// `worker` (per-instance children run their own §6.5 assess).
     ///
     /// With a discovery seam: `GET /runs/:id` → fetch + blake3-verify the frozen envelope →
@@ -1927,7 +1927,7 @@ impl VhcApi for VhcService {
         // child is torn down, never left idling.
         let fresh_child = existing.is_none() && self.worker_factory.is_some();
 
-        // Node-computed eligibility (ADR-003). A1: when a discovery seam is configured, resolve the
+        // Node-computed eligibility (ADR-003). When a discovery seam is configured, resolve the
         // run + fetch the frozen envelope + run the worker's real §6.5 `AssessRun` before `JoinRun`,
         // and take the coordinator endpoint from discovery. With no discovery configured, fall back
         // to the probe-based eligibility against the allowlisted coordinator (offline / no-registry
@@ -2066,9 +2066,9 @@ impl VhcApi for VhcService {
             }
         }
 
-        // A3: join over the streaming path + pump the continuous worker event stream into
+        // Join over the streaming path + pump the continuous worker event stream into
         // `handle_worker_event` so vhc.db reflects live round progression (§10.3/§10.4). The
-        // opaque `JoinRun.credentials` the worker's live attach parses (§2 of the A3 ledger) are
+        // opaque `JoinRun.credentials` the worker's live attach parses are
         // authored where the node identity + roster are known (the e2e / boot join_and_pump path);
         // an API-initiated join with no authored credentials keeps the worker's self-driven round
         // (WS-only baseline), still pumped.
@@ -2415,8 +2415,8 @@ fn hardware_report(hw: Hardware) -> VhcHardwareReport {
     VhcHardwareReport {
         gpus: hw.gpus,
         vram_mb: hw.vram_mb,
-        // A1 / wire v42: mirror the worker's unified-memory spillover (GTT) into the app-facing DTO
-        // additively (the P1 Merge-2 recorded follow-on), so the GUI's "what can my GPU do" panel
+        // Wire v42: mirror the worker's unified-memory spillover (GTT) into the app-facing DTO
+        // additively (a recorded follow-on), so the GUI's "what can my GPU do" panel
         // shows the true effective budget on integrated/UMA boxes.
         shared_mb: hw.shared_mb,
         ram_mb: hw.ram_mb,
@@ -2433,7 +2433,7 @@ fn hardware_report(hw: Hardware) -> VhcHardwareReport {
     }
 }
 
-/// Map the worker's real §6.5 `AssessRun` verdict onto the app-facing eligibility DTO (A1). The
+/// Map the worker's real §6.5 `AssessRun` verdict onto the app-facing eligibility DTO. The
 /// worker's `headroom` is an ordered `Vec<(String, i64)>`; the wire DTO is a `BTreeMap`. The app
 /// renders this; it never re-derives eligibility (ADR-003).
 fn eligibility_from_assess(e: &Eligibility) -> VhcEligibility {

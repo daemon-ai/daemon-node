@@ -40,7 +40,7 @@ pub use discovery::{
     best_restore_pointer, CheckpointPointer, DiscoveredRun, EgressRunDiscovery, RunDiscovery,
 };
 // Re-exported so the boot site constructs the registry-backed discovery seam without a direct
-// `daemon-vhc-net` dep edge (A3 boot wiring; additive).
+// `daemon-vhc-net` dep edge (boot wiring; additive).
 pub use daemon_vhc_net::RegistryClient;
 pub use seat_keeper::{SeatCandidate, SeatDirectory, SeatKeeper, SeatNote};
 pub use service::{NodeFeed, VhcError, VhcService, VhcServiceParts, WorkerControl};

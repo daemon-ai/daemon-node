@@ -80,7 +80,7 @@ struct DataEnvelope<T> {
     data: T,
 }
 
-/// One published-checkpoint pointer (spec §9; lane R), read from
+/// One published-checkpoint pointer (spec §9), read from
 /// `GET {base}/runs/:id/state`.`data.checkpoints[]`. Pointers are keyed **per `(role, kind)`**:
 /// a role's restore source is scoped to that role's state (a coordinator pointer can never
 /// shadow a trainer restore source), and within a role a periodic LIVE checkpoint is a distinct
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn run_state_decodes_checkpoint_pointers_and_empty() {
-        // The `GET /state` shape (lane R): the per-(role, kind) `data.checkpoints` pointers a
+        // The `GET /state` shape (spec §9): the per-(role, kind) `data.checkpoints` pointers a
         // rejoining peer reads.
         let with = r#"{"data":{"phase":"round_train","round":6,"epoch":1,"finished":false,
             "roster":["aa"],"committed":[],"coord_pubkey":"bb",
