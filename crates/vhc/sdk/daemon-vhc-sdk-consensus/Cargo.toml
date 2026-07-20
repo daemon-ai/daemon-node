@@ -39,6 +39,9 @@ xxhash-rust = { workspace = true }
 # Integer-only property testing of `tick` determinism (relocated with the coordinator driver at
 # D2; TDD PROTO-16). Dev-only: does not affect the crate's wasm-clean normal-dependency surface.
 proptest = { workspace = true }
+# The shared digest-carry / fold-walk vectors (`tests/fixtures/*.json`) are JSON so every
+# conforming streaming-fold implementation executes one fixture (the seat/roster pattern).
+serde_json = { workspace = true }
 # CDDL conformance gate for the round message schemas (`daemon-vhc.cddl`, moved here with the
 # schemas): in-process validator, same exact pin as the daemon-api conformance flow.
 cddl-cat = "=0.7.1"

@@ -1,0 +1,12 @@
+{
+  "comment": "Shared digest-carry equivalence vectors: each case pins digest_state(seed, 64, u32::MAX, state) over a deterministically generated per-parameter state image (splitmix64-style LCG, parameter i seeded generator_seed + i + 1; value = (s >> 40) as f32 / 2^24, f32-le). A conforming streaming carry must reproduce every pinned digest bit-for-bit when fed one-shot, per fold window (per-parameter chunking at window_size — tails short, a parameter never spans a window), per byte, and at any unaligned stride. seed_fill is the 32-byte round-seed fill; block size is pinned at 64 (the production digest granularity).",
+  "block_size": 64,
+  "cases": [
+    { "name": "degenerate single-window tier: one 64-dim parameter", "seed_fill": 1, "generator_seed": 100, "numels": [64], "window_size": 4096, "digest": "a0948aecc66499385074975153788594" },
+    { "name": "parameter tails: 24-byte windows straddle the 64-byte block framing", "seed_fill": 2, "generator_seed": 200, "numels": [16, 4, 8], "window_size": 24, "digest": "cecdb1f2179b411a809cb551b1efdae3" },
+    { "name": "multi-chunk parameters at a block-aligned window", "seed_fill": 3, "generator_seed": 300, "numels": [96, 32], "window_size": 128, "digest": "15544929bc0d84c94c57eba5c0d13dd1" },
+    { "name": "window size equals the digest block size", "seed_fill": 4, "generator_seed": 400, "numels": [48, 16], "window_size": 64, "digest": "51a80894e1defa94886fdb865c82ced1" },
+    { "name": "ceremony-shaped registration order, scaled (profile chunk 16, window 3 chunks)", "seed_fill": 5, "generator_seed": 500, "numels": [1024, 16, 256, 256, 256, 256, 16, 768, 768, 768, 16], "window_size": 192, "digest": "6d23d477728a3b994faa967c2d7183ce" },
+    { "name": "partial final block: state is not a block multiple", "seed_fill": 6, "generator_seed": 600, "numels": [7], "window_size": 16, "digest": "9b724020f3a794ad2b28c6710607910e" }
+  ]
+}

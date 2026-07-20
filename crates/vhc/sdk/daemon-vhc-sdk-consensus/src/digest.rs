@@ -125,6 +125,83 @@ pub fn digest_state(seed: &Seed, block_size: u32, sample_count: u32, state: &[u8
     digest_with_schedule(seed, layout, &schedule, state)
 }
 
+/// The **streaming digest carry**: the full-coverage round state digest computed incrementally,
+/// without ever materializing the state.
+///
+/// With `sample_count = u32::MAX` the schedule is *all blocks, ascending* — a sequential fold
+/// over the state image — so the exact [`digest_state`] value is computable as a carry: the
+/// seeded streaming hasher plus the absolute byte offset, injecting the 8-byte LE block-index
+/// frame at each `block_size` boundary independent of how the update calls slice the state.
+/// Feeding the identical bytes in the identical order through ANY split
+/// (chunk-sized windows, parameter tails, mid-block splits) reproduces
+/// `digest_state(seed, block_size, u32::MAX, full_state)` **bit-for-bit** — the equivalence the
+/// carry's shared vectors pin.
+///
+/// Full coverage holds while the block count fits `u32::MAX` (at the pinned `block_size = 64`
+/// that is state < 256 GiB); beyond it [`digest_state`] itself stops covering every block and
+/// the carry no longer corresponds.
+#[derive(Clone)]
+pub struct DigestCarry {
+    hasher: Xxh3,
+    block_size: u64,
+    offset: u64,
+}
+
+impl core::fmt::Debug for DigestCarry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DigestCarry")
+            .field("block_size", &self.block_size)
+            .field("offset", &self.offset)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DigestCarry {
+    /// A fresh carry for the round `seed` at `block_size` (the pinned digest granularity, 64).
+    ///
+    /// # Panics
+    /// `block_size == 0` is a contract violation (no digest is defined over zero-byte blocks).
+    #[must_use]
+    pub fn new(seed: &Seed, block_size: u32) -> Self {
+        assert!(block_size > 0, "digest block size must be > 0");
+        Self {
+            hasher: Xxh3::with_seed(xxh3_64_with_seed(seed.as_bytes(), DIGEST_SALT)),
+            block_size: u64::from(block_size),
+            offset: 0,
+        }
+    }
+
+    /// Feed the next `bytes` of the state image (any split — block-index framing is injected
+    /// from the absolute offset, independent of update boundaries).
+    pub fn update(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let within = self.offset % self.block_size;
+            if within == 0 {
+                self.hasher
+                    .update(&(self.offset / self.block_size).to_le_bytes());
+            }
+            let room = self.block_size - within;
+            let take = usize::try_from(room.min(bytes.len() as u64)).expect("span fits usize");
+            self.hasher.update(&bytes[..take]);
+            self.offset += take as u64;
+            bytes = &bytes[take..];
+        }
+    }
+
+    /// The total bytes folded so far (the absolute state offset).
+    #[must_use]
+    pub fn bytes_folded(&self) -> u64 {
+        self.offset
+    }
+
+    /// Finish: the 16-byte round state digest, bit-identical to
+    /// `digest_state(seed, block_size, u32::MAX, state)` over the same bytes.
+    #[must_use]
+    pub fn finalize(&self) -> StateDigest {
+        StateDigest(self.hasher.digest128().to_le_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +217,41 @@ mod tests {
     fn schedule_all_blocks_when_sample_exceeds() {
         let s = derive_schedule(&Seed([1; 32]), StateLayout::of(&[0u8; 256], 64), 100);
         assert_eq!(s.blocks, vec![0, 1, 2, 3]);
+    }
+
+    /// The carry reproduces the full-coverage digest bit-for-bit regardless of update splits —
+    /// one-shot, per-byte, and a mid-block/partial-tail mix all agree with `digest_state`.
+    #[test]
+    fn carry_equals_full_coverage_digest_for_any_split() {
+        let seed = Seed([9; 32]);
+        let state: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let want = digest_state(&seed, 64, u32::MAX, &state);
+
+        let mut one_shot = DigestCarry::new(&seed, 64);
+        one_shot.update(&state);
+        assert_eq!(one_shot.finalize(), want);
+        assert_eq!(one_shot.bytes_folded(), 1000);
+
+        let mut per_byte = DigestCarry::new(&seed, 64);
+        for b in &state {
+            per_byte.update(core::slice::from_ref(b));
+        }
+        assert_eq!(per_byte.finalize(), want);
+
+        let mut mixed = DigestCarry::new(&seed, 64);
+        for chunk in state.chunks(37) {
+            mixed.update(chunk);
+        }
+        assert_eq!(mixed.finalize(), want);
+    }
+
+    /// Empty state: the carry agrees with the zero-block digest (no frames injected).
+    #[test]
+    fn carry_of_empty_state_matches() {
+        let seed = Seed([3; 32]);
+        assert_eq!(
+            DigestCarry::new(&seed, 64).finalize(),
+            digest_state(&seed, 64, u32::MAX, &[])
+        );
     }
 }

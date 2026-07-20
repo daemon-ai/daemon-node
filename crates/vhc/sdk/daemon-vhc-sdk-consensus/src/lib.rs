@@ -44,6 +44,7 @@ pub mod checkpoint;
 pub mod committed;
 pub mod coordinator;
 pub mod digest;
+pub mod fold_walk;
 pub mod messages;
 pub mod record_set;
 
@@ -69,7 +70,8 @@ pub use committed::{
     Committed, CommittedItem, HostStaged, MintError, PayloadCheck, PayloadRepr, PayloadSource,
 };
 pub use digest::{
-    derive_schedule, digest_state, digest_with_schedule, DigestSchedule, StateLayout,
+    derive_schedule, digest_state, digest_with_schedule, DigestCarry, DigestSchedule, StateLayout,
 };
+pub use fold_walk::{windows, FoldWalk, SliceActions, UnexpectedCompletion, Window};
 pub use messages::{SignedMessage, VhcMessage};
 pub use record_set::RecordSet;
