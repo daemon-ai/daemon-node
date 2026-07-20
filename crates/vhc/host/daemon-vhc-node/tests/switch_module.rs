@@ -64,6 +64,7 @@ fn guest_wasm(name: &str) -> Vec<u8> {
         let status = ProcCommand::new("cargo")
             .current_dir(guests_root())
             .env_remove("CARGO_TARGET_DIR")
+            .env_remove("RUSTC_WRAPPER")
             .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
             .status()
             .expect("run cargo for guests (dev shell provides the wasm target)");

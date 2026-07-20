@@ -111,6 +111,7 @@ fn ensure_built() {
         let status = Command::new("cargo")
             .current_dir(guests_root())
             .env_remove("CARGO_TARGET_DIR")
+            .env_remove("RUSTC_WRAPPER")
             .env("RUSTFLAGS", guest_remap_rustflags())
             .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
             .status()
