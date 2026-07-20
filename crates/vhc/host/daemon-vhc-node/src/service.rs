@@ -106,6 +106,22 @@ pub trait WorkerControl: Send + Sync {
         envelope: Vec<u8>,
         role: Option<String>,
     ) -> Result<Eligibility, VhcError>;
+    /// Assess a live-upgrade TARGET (ABI §10.3 pre-switch assessment): the worker — which alone
+    /// touches module bytes — resolves the hash-pinned target, re-derives the grants document
+    /// against the committed record's grants anchor, runs the claim admission funnel, and
+    /// answers with a post-switch admitted tuple (claim hash computed worker-side). Default:
+    /// unsupported (fakes / non-upgrading workers); `TrainSupervisor` overrides it.
+    async fn assess_switch(
+        &self,
+        envelope: Vec<u8>,
+        role: Option<String>,
+        target: daemon_vhc_session::protocol::SwitchTarget,
+    ) -> Result<Eligibility, VhcError> {
+        let _ = (envelope, role, target);
+        Err(VhcError::Worker(
+            "assess_switch unsupported by this worker".into(),
+        ))
+    }
     /// Join a run.
     async fn join(
         &self,
@@ -115,9 +131,9 @@ pub trait WorkerControl: Send + Sync {
         policy: JoinPolicy,
         admitted_tuple: Option<protocol::AdmittedTuple>,
     ) -> Result<(), VhcError>;
-    /// Join a run and return the **continuous** worker event stream (A3 event pump). The default
+    /// Join a run and return the **continuous** worker event stream (the continuous event pump). The default
     /// delegates to [`join`](Self::join) and returns an already-closed receiver, so test fakes and
-    /// non-streaming workers keep the pre-A3 behavior; `TrainSupervisor` overrides it with the real
+    /// non-streaming workers keep the drain-and-drop behavior; `TrainSupervisor` overrides it with the real
     /// per-round stream. `admitted_tuple` carries the node-minted incarnation the worker runs as.
     async fn join_streaming(
         &self,
@@ -187,6 +203,16 @@ impl WorkerControl for TrainSupervisor {
         role: Option<String>,
     ) -> Result<Eligibility, VhcError> {
         TrainSupervisor::assess(self, envelope, role)
+            .await
+            .map_err(VhcError::worker)
+    }
+    async fn assess_switch(
+        &self,
+        envelope: Vec<u8>,
+        role: Option<String>,
+        target: daemon_vhc_session::protocol::SwitchTarget,
+    ) -> Result<Eligibility, VhcError> {
+        TrainSupervisor::assess_switch(self, envelope, role, target)
             .await
             .map_err(VhcError::worker)
     }
@@ -283,7 +309,7 @@ pub struct VhcServiceParts {
     pub worker: Arc<dyn WorkerControl>,
     /// The node-feed sink for `VhcChanged` pointers (`None` on a headless / test build).
     pub feed: Option<NodeFeed>,
-    /// The run-discovery seam (A1). When present, `vhc_join` discovers the run + fetches the frozen
+    /// The run-discovery seam. When present, `vhc_join` discovers the run + fetches the frozen
     /// envelope + runs the worker's real §6.5 `AssessRun` before `JoinRun`. `None` keeps the
     /// probe-based eligibility path (no coordinator configured), so the service stays usable offline.
     pub discovery: Option<Arc<dyn RunDiscovery>>,
@@ -314,7 +340,14 @@ type AuthoredDelivery = (Option<protocol::AdmittedTuple>, Vec<u8>, Option<String
 
 /// One live supervised role-instance: its ledger identity and its worker child.
 struct InstanceEntry {
+    /// The identity ADMITTED against the owner ledgers — the arbiter's reservation key. It
+    /// stays fixed for the entry's whole life (release must present the admitted key), even
+    /// across a live module switch.
     id: RoleInstanceId,
+    /// The instance's CURRENT generation (== incarnation): `id.instance` at join, advanced by
+    /// a live module switch (the switch mints a new never-reused incarnation without a new
+    /// sandbox). The stale-generation event guard compares against THIS.
+    generation: u64,
     worker: Arc<dyn WorkerControl>,
 }
 
@@ -349,7 +382,7 @@ pub struct VhcService {
     current_run: Mutex<Option<String>>,
     /// The coalescing vhc-feed revision stamped on each `VhcChanged` pointer.
     rev: AtomicU64,
-    /// The service's own `Arc` handle (A3), bound post-construction via [`bind_self`](Self::bind_self)
+    /// The service's own `Arc` handle (the event-pump wiring), bound post-construction via [`bind_self`](Self::bind_self)
     /// so `vhc_join`/`start` can spawn a detached event-pump task that outlives the `&self` call.
     /// Unbound (test builds) → the non-streaming `join` path, drained-and-dropped.
     me: std::sync::OnceLock<std::sync::Weak<VhcService>>,
@@ -397,7 +430,7 @@ impl VhcService {
         &self.arbiter
     }
 
-    /// Bind the service's own `Arc` handle (A3 event pump), mirroring the node's `set_vhc`
+    /// Bind the service's own `Arc` handle (the continuous event pump), mirroring the node's `set_vhc`
     /// post-`Arc` binder. After this, `vhc_join` / `start` drive `join_streaming` + a detached pump
     /// task feeding the worker's continuous event stream into [`handle_worker_event`](Self::handle_worker_event)
     /// → `NodeEvent::VhcChanged`, so `vhc.db` reflects live round progression (§10.3/§10.4).
@@ -406,7 +439,7 @@ impl VhcService {
         let _ = self.me.set(Arc::downgrade(self));
     }
 
-    /// Join a run and pump its continuous worker event stream into the service (A3). The public entry
+    /// Join a run and pump its continuous worker event stream into the service. The public entry
     /// the boot site / e2e use to drive a **live-attach** join with authored `JoinCredentials`; the
     /// pump feeds each event through `handle_worker_event`. Requires [`bind_self`](Self::bind_self).
     pub async fn join_and_pump(
@@ -560,7 +593,7 @@ impl VhcService {
                 .admitted_tuple
                 .as_deref()
                 .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
-            let restore = self.resolve_restore(&run.run_id).await;
+            let restore = self.resolve_restore(&run.run_id, &run.role).await;
             let seat = self.resolve_seat_bootstrap(&run.run_id).await;
             let (delivery_tuple, credentials, credentials_ref) = match self.author_join(
                 &run.run_id,
@@ -585,7 +618,7 @@ impl VhcService {
                     let _ = self.store.set_admitted_tuple(&run.run_id, &bytes);
                 }
             }
-            // A3: re-issue via the streaming path + pump so a re-converged run resumes reporting
+            // Re-issue via the streaming path + pump so a re-converged run resumes reporting
             // live round progression into vhc.db (durable-intent re-convergence, §10.3).
             let rx = match worker
                 .join_streaming(
@@ -605,10 +638,14 @@ impl VhcService {
                 }
             };
             let generation = id.instance;
-            self.instances
-                .lock()
-                .unwrap()
-                .insert(run.run_id.clone(), InstanceEntry { id, worker });
+            self.instances.lock().unwrap().insert(
+                run.run_id.clone(),
+                InstanceEntry {
+                    generation: id.instance,
+                    id,
+                    worker,
+                },
+            );
             self.spawn_pump(Some((run.run_id.clone(), generation)), rx);
             self.store.mark_running(&run.run_id)?;
             rejoined += 1;
@@ -875,7 +912,7 @@ impl VhcService {
             .admitted_tuple
             .as_deref()
             .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
-        let restore = self.resolve_restore(&run.run_id).await;
+        let restore = self.resolve_restore(&run.run_id, &run.role).await;
         let seat = self.resolve_seat_bootstrap(&run.run_id).await;
         let (delivery_tuple, credentials, _credentials_ref) = match self.author_join(
             &run.run_id,
@@ -920,10 +957,14 @@ impl VhcService {
             }
         };
         let generation = id.instance;
-        self.instances
-            .lock()
-            .unwrap()
-            .insert(run.run_id.clone(), InstanceEntry { id, worker });
+        self.instances.lock().unwrap().insert(
+            run.run_id.clone(),
+            InstanceEntry {
+                generation: id.instance,
+                id,
+                worker,
+            },
+        );
         self.spawn_pump(Some((run.run_id.clone(), generation)), rx);
         self.store.mark_running(&run.run_id)?;
         self.emit_changed(Some(run.run_id.clone()));
@@ -1016,7 +1057,7 @@ impl VhcService {
     }
 
     /// Translate + persist + fan out a worker event (spec §10.3 "all are persisted / fanned out by
-    /// the node"). Returns the [`VhcEvent`]s emitted (0..2 per worker event). B3 wires the live
+    /// the node"). Returns the [`VhcEvent`]s emitted (0..2 per worker event). The boot wiring routes the live
     /// worker event stream into this; unit tests drive it directly.
     pub fn handle_worker_event(&self, ev: &protocol::Event) -> Result<Vec<VhcEvent>, VhcError> {
         // Stale-generation discard (the idempotency/generation invariant): every run-scoped
@@ -1080,19 +1121,42 @@ impl VhcService {
             _ => {}
         }
 
-        // Checkpoint-pointer publication (spec §9; lane R): the checkpoint DOCUMENT is already on
+        // Checkpoint-pointer publication (spec §9): the checkpoint DOCUMENT is already on
         // the payload plane (the session put it there); record the round → content-address
-        // pointer at the registry so a late joiner can restore. Best-effort + detached (a pointer
-        // is advisory; the joiner hash-verifies regardless, so an unknown size is 0).
-        if let protocol::Event::CheckpointPublished { round, hash, .. } = ev {
+        // pointer at the registry under the run's `(role, kind)` slot so a late joiner restores
+        // role-scoped (a coordinator pointer never shadows a trainer restore source). Best-effort
+        // + detached (a pointer is advisory; the joiner hash-verifies regardless, so an unknown
+        // size is 0).
+        if let protocol::Event::CheckpointPublished {
+            round, hash, kind, ..
+        } = ev
+        {
             if let Some(discovery) = &self.discovery {
+                let role = self
+                    .store
+                    .get_run(&run_id)?
+                    .map(|r| r.role)
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| "trainer".to_string());
                 let discovery = discovery.clone();
-                let (run, round, hash) = (run_id.clone(), *round, hash.clone());
+                let (run, round, hash, kind) = (run_id.clone(), *round, hash.clone(), kind.clone());
                 tokio::spawn(async move {
-                    match discovery.publish_checkpoint(&run, round, &hash, 0).await {
-                        Ok(()) => tracing::debug!(run, round, hash, "checkpoint pointer published"),
+                    match discovery
+                        .publish_checkpoint(&run, &role, &kind, round, &hash, 0)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::debug!(
+                                run,
+                                role,
+                                kind,
+                                round,
+                                hash,
+                                "checkpoint pointer published"
+                            );
+                        }
                         Err(e) => {
-                            tracing::warn!(run, round, error = %e, "checkpoint pointer publication failed")
+                            tracing::warn!(run, role, kind, round, error = %e, "checkpoint pointer publication failed");
                         }
                     }
                 });
@@ -1285,7 +1349,9 @@ impl VhcService {
     fn expected_generation(&self, run_id: &str) -> Result<Option<u64>, VhcError> {
         let live = {
             let instances = self.instances.lock().unwrap();
-            instances.get(run_id).map(|e| e.id.instance)
+            // The CURRENT generation (advanced by a live module switch), not the admitted
+            // ledger key — post-switch events carry the new incarnation.
+            instances.get(run_id).map(|e| e.generation)
         };
         if live.is_some() {
             return Ok(live);
@@ -1345,7 +1411,7 @@ impl VhcService {
             .unwrap_or_default()
     }
 
-    /// Resolve the `(coordinator, eligibility)` for a join (A1), against the role-instance's own
+    /// Resolve the `(coordinator, eligibility)` for a join, against the role-instance's own
     /// `worker` (per-instance children run their own §6.5 assess).
     ///
     /// With a discovery seam: `GET /runs/:id` → fetch + blake3-verify the frozen envelope →
@@ -1524,13 +1590,268 @@ impl VhcService {
         }
     }
 
-    /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's latest
-    /// checkpoint pointer, decoded to the wire restore form (`None` = fresh start / no discovery
-    /// / no checkpoint published). A malformed pointer hash is dropped (fresh start), never a
-    /// hard join failure.
-    async fn resolve_restore(&self, run_id: &str) -> Option<protocol::CheckpointRestore> {
+    /// Consume one committed run-level module-upgrade record and drive the live switch through
+    /// the worker-control surface (architecture §5.4; ABI §10.3) — the node-side record
+    /// consumption seam behind [`VhcApi::vhc_switch_module`].
+    ///
+    /// The record is NEVER trusted as presented. Validation is total and fail-closed, against
+    /// state the node derives itself:
+    ///
+    /// 1. decode the canonical-CBOR record; find the live role-instance;
+    /// 2. fetch + verify the frozen genesis (discovery), cross-check the run identity;
+    /// 3. rebuild the transition chain from genesis + the node's persisted record mirror, then
+    ///    validate-and-append the presented record (domain, hash-link, strictly-monotone epoch,
+    ///    stale-old-module, authority threshold — any failure refuses, the chain untouched);
+    /// 4. worker pre-switch assessment of the target (the worker computes the post-switch
+    ///    tuple's claim hash — the node never touches module bytes);
+    /// 5. mint the post-switch incarnation (strictly above the running one) and provision its
+    ///    key + certificate in the identity keystore (the re-issuance handshake);
+    /// 6. drive `switch_module`; on activation persist the record mirror + the advanced
+    ///    execution identity.
+    ///
+    /// Validation refusals return [`VhcSwitchOutcome::Refused`] in-band (operator-facing);
+    /// infrastructure faults (store/discovery/worker transport) are `Err`.
+    async fn consume_upgrade_record(
+        &self,
+        run_id: &str,
+        record_bytes: &[u8],
+    ) -> Result<daemon_api::VhcSwitchOutcome, VhcError> {
+        use daemon_api::VhcSwitchOutcome as Outcome;
+        use daemon_vhc_proto::{TransitionChain, UpgradeAuthority, UpgradeRecord};
+
+        let refused = |reason: String| Ok(Outcome::Refused { reason });
+
+        // 1. Decode the presented record (canonical CBOR, never trusted as presented).
+        let record: UpgradeRecord = match daemon_vhc_proto::from_canonical_slice(record_bytes) {
+            Ok(r) => r,
+            Err(e) => return refused(format!("undecodable upgrade record: {e}")),
+        };
+
+        // The live role-instance this record targets.
+        let instance = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .get(run_id)
+                .map(|e| (e.id.clone(), e.worker.clone()))
+        };
+        let Some((id, worker)) = instance else {
+            return refused(format!("no live role-instance is held for run `{run_id}`"));
+        };
+        if record.body.role != id.role {
+            return refused(format!(
+                "the record upgrades role `{}` but this node's instance holds `{}`",
+                record.body.role, id.role
+            ));
+        }
+
+        // 2. The frozen genesis (the chain anchor), fetched + verified through discovery.
+        let Some(discovery) = &self.discovery else {
+            return refused(
+                "no run discovery is configured (the record cannot be validated against a \
+                 verified genesis)"
+                    .into(),
+            );
+        };
+        let envelope_bytes = discovery.fetch_envelope(run_id).await?;
+        let wire: daemon_vhc_proto::SignedEnvelope =
+            match daemon_vhc_proto::from_canonical_slice(&envelope_bytes) {
+                Ok(w) => w,
+                Err(e) => return refused(format!("run envelope is not a signed envelope: {e}")),
+            };
+        let frozen =
+            match daemon_vhc_proto::FrozenGenesis::open(wire.bytes, wire.signature, wire.signer) {
+                Ok(f) => f,
+                Err(e) => return refused(format!("genesis envelope verification: {e}")),
+            };
+        let genesis = match frozen.decode() {
+            Ok(g) => g,
+            Err(e) => return refused(format!("genesis decode: {e}")),
+        };
+        let run_id_hash = *frozen.run_id();
+        if record.body.run_id != run_id_hash {
+            return refused("the record's run_id is not this run's genesis hash".into());
+        }
+        // Cross-check the row's backfilled identity when present (a stale label / spoof guard).
+        if let Some(row) = self.store.get_run(run_id)? {
+            if let Some(existing) = row.run_id_hash {
+                if existing != run_id_hash.0 {
+                    return refused(
+                        "the run row's backfilled genesis hash disagrees with the fetched \
+                         envelope"
+                            .into(),
+                    );
+                }
+            }
+        }
+
+        // 3. Rebuild the chain from genesis + the persisted record mirror, then validate-append.
+        let authority = match UpgradeAuthority::from_genesis(&genesis.identities) {
+            Ok(a) => a,
+            Err(e) => return refused(format!("upgrade authority: {e}")),
+        };
+        let mut chain = match TransitionChain::genesis(&genesis, run_id_hash) {
+            Ok(c) => c,
+            Err(e) => return refused(format!("chain anchor: {e}")),
+        };
+        for (epoch, bytes) in self.store.upgrade_records(run_id)? {
+            let mirrored: UpgradeRecord =
+                daemon_vhc_proto::from_canonical_slice(&bytes).map_err(|e| {
+                    VhcError::Internal(format!(
+                        "persisted upgrade-record mirror for epoch {epoch} is undecodable: {e}"
+                    ))
+                })?;
+            chain.append(mirrored, &authority).map_err(|e| {
+                VhcError::Internal(format!(
+                    "persisted upgrade-record mirror for epoch {epoch} fails re-validation: {e}"
+                ))
+            })?;
+        }
+        let target = match chain.append(record.clone(), &authority) {
+            Ok(descriptor) => descriptor,
+            Err(e) => return refused(format!("upgrade record refused: {e}")),
+        };
+        let epoch = target.epoch;
+        let new_module = record.body.new_module;
+        let grants_hash = record.body.grants_hash;
+
+        // 4. Worker pre-switch assessment of the committed target (claim hash computed where
+        // the module bytes live).
+        let verdict = worker
+            .assess_switch(
+                envelope_bytes,
+                Some(id.role.clone()),
+                daemon_vhc_session::protocol::SwitchTarget {
+                    epoch,
+                    new_module: new_module.0,
+                    grants_hash: grants_hash.0,
+                },
+            )
+            .await?;
+        if !verdict.eligible {
+            return refused(format!(
+                "switch target assessment refused: {}",
+                verdict.reasons.join("; ")
+            ));
+        }
+        let Some(mut tuple) = self.stamp_admitted_tuple(verdict.admitted_tuple)? else {
+            return refused("switch target assessment produced no admitted tuple".into());
+        };
+
+        // 5. Mint the post-switch incarnation (strictly above the running one — a seat-leased
+        // incarnation can exceed the counter) and provision its key + re-issued certificate.
+        let Some(dir) = &self.identity_dir else {
+            return refused(
+                "node identity authorship is not configured (no identity keystore to provision \
+                 the post-switch certificate in)"
+                    .into(),
+            );
+        };
+        let new_instance = self.store.mint_incarnation_above(id.instance)?;
+        tuple.incarnation = new_instance;
+        let keystore = daemon_vhc_session::keystore::VhcKeystore::open(dir)
+            .map_err(|e| VhcError::Internal(format!("open identity keystore: {e}")))?;
+        daemon_vhc_session::provisioning::provision_run_identity(
+            &keystore,
+            &daemon_vhc_session::provisioning::ProvisionScope {
+                run_label: run_id,
+                genesis_hash: run_id_hash.0,
+                epoch,
+                role: &id.role,
+                incarnation: new_instance,
+                module_hash: new_module.0,
+            },
+        )
+        .map_err(|e| VhcError::Internal(format!("provision post-switch identity: {e}")))?;
+
+        // 6. Drive the local transaction (the node clamps the drain deadline to its ceiling).
+        let deadline_ms = self.config.upgrade.quiesce_deadline_max_ms;
+        let outcome = worker
+            .switch_module(
+                run_id.to_string(),
+                epoch,
+                id.role.clone(),
+                new_module.0,
+                grants_hash.0,
+                deadline_ms,
+                Some(tuple.clone()),
+            )
+            .await?;
+        match outcome {
+            SwitchOutcome::Activated {
+                epoch,
+                module,
+                retries,
+            } => {
+                // The record consumed cleanly: persist the mirror + the advanced identity
+                // (backfilling the row's cryptographic RunId — the consumption verified the
+                // frozen genesis, so the label→hash binding is now known-good).
+                self.store.put_upgrade_record(run_id, epoch, record_bytes)?;
+                self.store.backfill_run_id(run_id, &run_id_hash.0)?;
+                self.store
+                    .set_execution_identity(run_id, epoch, &id.role, new_instance)?;
+                if let Some(row) = self.store.get_run(run_id)? {
+                    self.store.set_observability(
+                        run_id,
+                        row.envelope_schema_major,
+                        row.module_abi_major,
+                        row.selected_driver.as_deref(),
+                        Some(&module),
+                    )?;
+                }
+                if let Ok(bytes) = protocol::encode(&tuple) {
+                    let _ = self.store.set_admitted_tuple(run_id, &bytes);
+                }
+                // Advance the live entry's CURRENT generation so post-switch pump events
+                // (stamped with the new incarnation) pass the stale-generation guard. The
+                // ledger id (`entry.id`) deliberately stays as admitted — it is the arbiter's
+                // reservation key, and the reservation carries across the switch (same
+                // sandbox, same charge) until the instance's terminal release.
+                {
+                    let mut instances = self.instances.lock().unwrap();
+                    if let Some(entry) = instances.get_mut(run_id) {
+                        entry.generation = new_instance;
+                    }
+                }
+                let mut emitted = Vec::new();
+                let row = self.store.get_run(run_id)?;
+                self.emit(
+                    VhcEvent::Phase {
+                        run_id: run_id.to_string(),
+                        phase: "module_switched".to_string(),
+                        epoch,
+                        round: row.map(|r| r.last_round).unwrap_or(0),
+                    },
+                    &mut emitted,
+                )?;
+                self.emit_changed(Some(run_id.to_string()));
+                Ok(Outcome::Activated {
+                    epoch,
+                    module_hash: daemon_vhc_proto::Hash(module).to_hex(),
+                    retries,
+                })
+            }
+            SwitchOutcome::Refused { reason } => Ok(Outcome::Refused { reason }),
+            SwitchOutcome::Left { reason } => {
+                // Post-fence exit: the run-level record stays committed; this node's instance
+                // left (its terminal RunTerminated drives the state machine via the pump).
+                Ok(Outcome::Left { reason })
+            }
+        }
+    }
+
+    /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's best
+    /// pointer FOR THIS ROLE — the freshest live pointer, else the freshest drain snapshot;
+    /// another role's pointer is never consulted — decoded to the wire restore form (`None` =
+    /// fresh start / no discovery / nothing published for the role). A malformed pointer hash
+    /// is dropped (fresh start), never a hard join failure.
+    async fn resolve_restore(
+        &self,
+        run_id: &str,
+        role: &str,
+    ) -> Option<protocol::CheckpointRestore> {
         let discovery = self.discovery.as_ref()?;
-        let pointer = discovery.fetch_checkpoint(run_id).await.ok()??;
+        let role = if role.is_empty() { "trainer" } else { role };
+        let pointer = discovery.fetch_checkpoint(run_id, role).await.ok()??;
         let hash = hex32(&pointer.hash)?;
         Some(protocol::CheckpointRestore {
             round: pointer.round,
@@ -1606,7 +1927,7 @@ impl VhcApi for VhcService {
         // child is torn down, never left idling.
         let fresh_child = existing.is_none() && self.worker_factory.is_some();
 
-        // Node-computed eligibility (ADR-003). A1: when a discovery seam is configured, resolve the
+        // Node-computed eligibility (ADR-003). When a discovery seam is configured, resolve the
         // run + fetch the frozen envelope + run the worker's real §6.5 `AssessRun` before `JoinRun`,
         // and take the coordinator endpoint from discovery. With no discovery configured, fall back
         // to the probe-based eligibility against the allowlisted coordinator (offline / no-registry
@@ -1702,7 +2023,7 @@ impl VhcApi for VhcService {
         // certificate under the base identity, stamp the minted incarnation into the tuple, and
         // author the secrets-free plane-selection credentials (the token, if any, lands only in
         // the keystore record `credentials_ref` points at — never on the wire).
-        let restore = self.resolve_restore(&run_id).await;
+        let restore = self.resolve_restore(&run_id, &id.role).await;
         let seat = self.resolve_seat_bootstrap(&run_id).await;
         let (delivery_tuple, credentials, credentials_ref) =
             match self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore, seat) {
@@ -1745,9 +2066,9 @@ impl VhcApi for VhcService {
             }
         }
 
-        // A3: join over the streaming path + pump the continuous worker event stream into
+        // Join over the streaming path + pump the continuous worker event stream into
         // `handle_worker_event` so vhc.db reflects live round progression (§10.3/§10.4). The
-        // opaque `JoinRun.credentials` the worker's live attach parses (§2 of the A3 ledger) are
+        // opaque `JoinRun.credentials` the worker's live attach parses are
         // authored where the node identity + roster are known (the e2e / boot join_and_pump path);
         // an API-initiated join with no authored credentials keeps the worker's self-driven round
         // (WS-only baseline), still pumped.
@@ -1775,10 +2096,14 @@ impl VhcApi for VhcService {
             }
         };
         let generation = id.instance;
-        self.instances
-            .lock()
-            .unwrap()
-            .insert(run_id.clone(), InstanceEntry { id, worker });
+        self.instances.lock().unwrap().insert(
+            run_id.clone(),
+            InstanceEntry {
+                generation: id.instance,
+                id,
+                worker,
+            },
+        );
         self.spawn_pump(Some((run_id.clone(), generation)), rx);
         self.emit_changed(Some(run_id));
         Ok(())
@@ -1923,6 +2248,19 @@ impl VhcApi for VhcService {
         }
         self.emit_changed(Some(run_id));
         Ok(())
+    }
+
+    async fn vhc_switch_module(
+        &self,
+        run_id: String,
+        upgrade_record: Vec<u8>,
+        _op_id: String,
+    ) -> Result<daemon_api::VhcSwitchOutcome, ApiError> {
+        // Idempotency is enforced upstream by the dispatch op-id dedup guard.
+        self.require_enabled().map_err(|e| e.to_api())?;
+        self.consume_upgrade_record(&run_id, &upgrade_record)
+            .await
+            .map_err(|e| e.to_api())
     }
 
     async fn vhc_set_policy(&self, policy: VhcPolicy) -> Result<(), ApiError> {
@@ -2077,8 +2415,8 @@ fn hardware_report(hw: Hardware) -> VhcHardwareReport {
     VhcHardwareReport {
         gpus: hw.gpus,
         vram_mb: hw.vram_mb,
-        // A1 / wire v42: mirror the worker's unified-memory spillover (GTT) into the app-facing DTO
-        // additively (the P1 Merge-2 recorded follow-on), so the GUI's "what can my GPU do" panel
+        // Wire v42: mirror the worker's unified-memory spillover (GTT) into the app-facing DTO
+        // additively (a recorded follow-on), so the GUI's "what can my GPU do" panel
         // shows the true effective budget on integrated/UMA boxes.
         shared_mb: hw.shared_mb,
         ram_mb: hw.ram_mb,
@@ -2095,7 +2433,7 @@ fn hardware_report(hw: Hardware) -> VhcHardwareReport {
     }
 }
 
-/// Map the worker's real §6.5 `AssessRun` verdict onto the app-facing eligibility DTO (A1). The
+/// Map the worker's real §6.5 `AssessRun` verdict onto the app-facing eligibility DTO. The
 /// worker's `headroom` is an ordered `Vec<(String, i64)>`; the wire DTO is a `BTreeMap`. The app
 /// renders this; it never re-derives eligibility (ADR-003).
 fn eligibility_from_assess(e: &Eligibility) -> VhcEligibility {

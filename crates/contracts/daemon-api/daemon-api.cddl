@@ -1441,6 +1441,9 @@ request-vhc-join = { "VhcJoin": { "run_id": tstr, "policy": vhc-policy, "op_id":
 request-vhc-leave = { "VhcLeave": { "run_id": tstr, "mode": vhc-leave-mode, "op_id": tstr } }
 request-vhc-pause = { "VhcPause": { "run_id": tstr, "op_id": tstr } }
 request-vhc-resume = { "VhcResume": { "run_id": tstr, "op_id": tstr } }
+; wire v43: the operator-driven live module-upgrade consumption op — the committed upgrade
+; record travels as opaque canonical-CBOR bytes (bstr); the node validates it fail-closed.
+request-vhc-switch-module = { "VhcSwitchModule": { "run_id": tstr, "upgrade_record": byte-array, "op_id": tstr } }
 request-vhc-set-policy = { "VhcSetPolicy": { "policy": vhc-policy } }
 request-vhc-hardware-report = "VhcHardwareReport"
 request-models = { "Models": { ? "after": (tstr / null) } }
@@ -1736,6 +1739,7 @@ api-request = request-submit
             / request-vhc-leave
             / request-vhc-pause
             / request-vhc-resume
+            / request-vhc-switch-module
             / request-vhc-set-policy
             / request-vhc-hardware-report
             / request-models
@@ -1918,6 +1922,14 @@ response-model-inspect = { "ModelInspect": gguf-info }
 response-vhc-runs = { "VhcRuns": [* vhc-run-summary] }
 response-vhc-run-detail = { "VhcRunDetail": (vhc-run-detail / null) }
 response-vhc-hardware-report = { "VhcHardwareReport": vhc-hardware-report }
+; wire v43: the consumed upgrade record's switch outcome (activated / refused / left).
+vhc-switch-outcome-activated = { "Activated": { "epoch": uint64, "module_hash": tstr, "retries": uint } }
+vhc-switch-outcome-refused = { "Refused": { "reason": tstr } }
+vhc-switch-outcome-left = { "Left": { "reason": tstr } }
+vhc-switch-outcome = vhc-switch-outcome-activated
+                     / vhc-switch-outcome-refused
+                     / vhc-switch-outcome-left
+response-vhc-switch-outcome = { "VhcSwitchOutcome": vhc-switch-outcome }
 response-profiles = { "Profiles": [* profile-info] }
 response-profile = { "Profile": (profile-spec / null) }   ; ProfileGet returns null on a missing id
 response-soul-text = { "SoulText": tstr }                 ; SoulGet returns the persona (SOUL.md) text
@@ -2052,6 +2064,7 @@ api-response = response-ok
              / response-vhc-runs
              / response-vhc-run-detail
              / response-vhc-hardware-report
+             / response-vhc-switch-outcome
              / response-profiles
              / response-profile
              / response-soul-text

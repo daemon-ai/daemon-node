@@ -278,7 +278,40 @@ async fn main() {
         };
         match cmd {
             Command::Probe => send(&writer, &Event::Probed(backend::hardware())).await,
-            Command::AssessRun { envelope, role } => {
+            Command::AssessRun {
+                envelope,
+                role,
+                switch_target: Some(target),
+            } => {
+                // The pre-switch assessment (ABI §10.3): resolve the run to its genesis, then
+                // assess the committed TARGET — the worker (which alone touches module bytes)
+                // computes the post-switch tuple's claim hash. Read-only: the cached run and
+                // the assessed join tuple are deliberately NOT replaced (the running instance's
+                // admission stands until the switch itself lands).
+                match backend::resolve_run(&envelope, role.as_deref()).await {
+                    Ok(resolved) => match resolved.genesis.as_ref() {
+                        Some(genesis) => {
+                            match backend::assess_switch(&resolved, genesis, &target).await {
+                                Ok(elig) => send(&writer, &Event::Assessed(elig)).await,
+                                Err(detail) => send(&writer, &worker_error(&detail)).await,
+                            }
+                        }
+                        None => {
+                            send(
+                                &writer,
+                                &worker_error("switch assessment: the run carries no genesis"),
+                            )
+                            .await
+                        }
+                    },
+                    Err(detail) => send(&writer, &worker_error(&detail)).await,
+                }
+            }
+            Command::AssessRun {
+                envelope,
+                role,
+                switch_target: None,
+            } => {
                 match backend::resolve_run(&envelope, role.as_deref()).await {
                     Ok(resolved) => {
                         // The admitted tuple's non-artifact identity: the run's genesis hash + the
@@ -670,6 +703,9 @@ async fn main() {
                     deadline_ms,
                     *tuple,
                     handle.generation(),
+                    // The admitted role config carries unchanged across the switch (upgrade
+                    // records pin module + grants; config carriage arrives when they carry one).
+                    resolved.config.clone(),
                 ) {
                     Ok(binding) => handle.switch(binding),
                     Err(reason) => send(&writer, &refusal(reason)).await,

@@ -284,6 +284,7 @@ async fn join_live(seat: &mut Seat, wire: &[u8], creds: &SessionCredentials, ste
         .send(&Command::AssessRun {
             envelope: wire.to_vec(),
             role: None,
+            switch_target: None,
         })
         .await;
     let elig = seat

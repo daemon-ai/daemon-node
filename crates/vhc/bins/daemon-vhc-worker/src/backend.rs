@@ -1350,6 +1350,191 @@ pub(crate) fn role_binding(
 /// stores (or the store-fetch path resolves it here under the networked build).
 pub(crate) const SWITCH_MODULE_ENV: &str = "DAEMON_VHC_SWITCH_MODULE";
 
+/// Resolve a live-upgrade TARGET module's bytes by its committed content hash (the pre-switch
+/// assessment's artifact source, hash-verified whichever source serves):
+///
+/// 1. the explicit [`SWITCH_MODULE_ENV`] override (dev / node-controlled),
+/// 2. the run's filesystem content plane (the node-delivered shared payload root / run-state
+///    dir — the single-host topology, where peers seed each other's content-addressed objects),
+/// 3. the networked store-fetch path (content cache + presigned store) under `vhc-net`.
+///
+/// No resolvable source is a typed refusal — a switch target that cannot be fetched is never
+/// guessed at.
+async fn resolve_switch_module(run_label: &str, new_module: [u8; 32]) -> Result<Vec<u8>, String> {
+    let verify = |bytes: Vec<u8>, source: &str| {
+        if *blake3::hash(&bytes).as_bytes() == new_module {
+            Ok(bytes)
+        } else {
+            Err(format!(
+                "the switch target resolved from {source} does not hash to the committed module"
+            ))
+        }
+    };
+    if let Ok(path) = std::env::var(SWITCH_MODULE_ENV) {
+        let bytes =
+            std::fs::read(&path).map_err(|e| format!("reading switch module {path}: {e}"))?;
+        return verify(bytes, "the explicit override");
+    }
+    // The filesystem content plane, exactly as the live attach roots it (shared payload root
+    // override first, else the run's own state dir).
+    let fs_dir = daemon_vhc_session::journal_home::payload_dir_from_env()
+        .map(|shared| daemon_vhc_session::journal_home::payload_dir(&shared, run_label))
+        .or_else(|| {
+            daemon_vhc_session::journal_home::run_dir_from_env()
+                .map(|root| daemon_vhc_session::journal_home::payload_dir(&root, run_label))
+        });
+    if let Some(dir) = fs_dir {
+        use daemon_vhc_net::ContentStore as _;
+        let store = daemon_vhc_net::FsContentStore::open(&dir)
+            .map_err(|e| format!("fs content store {}: {e}", dir.display()))?;
+        if let Ok(bytes) = store.get_content(&daemon_vhc_proto::Hash(new_module)).await {
+            return verify(bytes, "the filesystem content plane");
+        }
+    }
+    #[cfg(feature = "vhc-net")]
+    {
+        use daemon_vhc_net::ContentStore as _;
+        let ctx = store_fetch_context();
+        let cache = open_content_cache(&ctx)?;
+        if let Some(bytes) = cache
+            .get(&daemon_vhc_net::ContentHash::new(new_module))
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return verify(bytes, "the content cache");
+        }
+        if let Some(base) = &ctx.presign_base {
+            let egress = daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
+                .map_err(|e| format!("egress client: {e}"))?;
+            let presign_egress =
+                daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default())
+                    .map_err(|e| format!("presign egress client: {e}"))?;
+            let presign = daemon_vhc_net::HttpPresignClient::new(presign_egress, base.clone());
+            let store = daemon_vhc_net::R2Store::new(
+                presign,
+                egress,
+                daemon_vhc_net::RunId::new(run_label),
+            );
+            if let Ok(bytes) = store.get_content(&daemon_vhc_proto::Hash(new_module)).await {
+                return verify(bytes, "the presigned content store");
+            }
+        }
+    }
+    Err(format!(
+        "switch target {} is not resolvable from any worker-side source (no override, not on \
+         the filesystem content plane, not in the content cache/store)",
+        daemon_vhc_proto::Hash(new_module).to_hex()
+    ))
+}
+
+/// Assess a live-upgrade TARGET (ABI §10.3 pre-switch assessment): resolve the hash-pinned
+/// target bytes, re-derive the grants document against the committed record's grants anchor,
+/// run the SAME claim admission funnel the join uses (empty config — upgrade records pin the
+/// module and grants; config carriage arrives when they carry one), and produce the post-switch
+/// admitted tuple, its claim hash computed here over the target's re-evaluated claim (the node
+/// never touches module bytes). The session's pre-fence checks re-verify all of it fail-closed.
+pub(crate) async fn assess_switch(
+    resolved: &ResolvedRun,
+    genesis: &GenesisRun,
+    target: &daemon_vhc_session::protocol::SwitchTarget,
+) -> Result<Eligibility, String> {
+    let ineligible = |reason: String, code: Option<&str>| Eligibility {
+        eligible: false,
+        reasons: vec![reason],
+        headroom: Vec::new(),
+        refusal_code: code.map(str::to_string),
+        admitted_tuple: None,
+    };
+    let run_label = genesis.env.run.run_label.clone();
+    let bytes = match resolve_switch_module(&run_label, target.new_module).await {
+        Ok(bytes) => bytes,
+        Err(reason) => return Ok(ineligible(reason, Some("SwitchTargetUnresolvable"))),
+    };
+    let worker = Worker::new(assess_engine_config()).map_err(|e| format!("engine: {e}"))?;
+    // The admitted role config carries UNCHANGED across the switch (upgrade records pin module
+    // + grants; config carriage arrives when records carry one) — the target is assessed, and
+    // later re-admitted at the fence, with the exact config the running instance was admitted
+    // under, so the migrated instance initializes like its predecessor.
+    let config = resolved.config.clone();
+    // The grants anchor (§10.3 step 3): the re-derived document must hash to the committed
+    // record's grants_hash — refused typed here, and re-checked by the session at the fence.
+    let role_grants = &genesis.env.roles[&genesis.worker_role].grants;
+    let grants = match derive_grants(&worker, &bytes, role_grants) {
+        Ok(g) => g,
+        Err(reason) => return Ok(ineligible(reason, None)),
+    };
+    if *blake3::hash(&grants).as_bytes() != target.grants_hash {
+        return Ok(ineligible(
+            "re-derived grants do not match the committed record's grants anchor".into(),
+            Some("SwitchGrantsAnchorMismatch"),
+        ));
+    }
+    let selection = match measured_backend(resolved.device_min.as_ref()) {
+        Ok(sel) => sel,
+        Err(reason) => return Ok(ineligible(reason, Some("BackendUnavailable"))),
+    };
+    let hw = hardware();
+    let dl = device_limits();
+    let device = daemon_vhc_host::run::DeviceProfile {
+        gpu: hw.gpus > 0,
+        vram_bytes: dl.vram_mb << 20,
+        ram_bytes: dl.ram_mb << 20,
+        disk_bytes: hw.disk_free_mb << 20,
+    };
+    let owner = daemon_vhc_host::run::OwnerPolicy {
+        participation_enabled: true,
+        vram_cap_bytes: 0,
+        host_cap_bytes: 0,
+    };
+    let envelope_grants =
+        daemon_vhc_host::run::EnvelopeRoleGrants::from_genesis(&genesis.env, &genesis.worker_role);
+    match daemon_vhc_host::run::admit(
+        &worker,
+        &bytes,
+        Some(&target.new_module),
+        // The session's re-admission at the fence evaluates the same carried config, so the
+        // claim bytes — and the tuple's claim hash — match by construction.
+        &config,
+        &grants,
+        &selected_lane(),
+        &device,
+        &owner,
+        resolved.device_min.as_ref(),
+        envelope_grants.as_ref(),
+    ) {
+        Ok(admission) => Ok(Eligibility {
+            eligible: true,
+            reasons: vec![format!(
+                "switch target admitted for epoch {}: device {} B / host {} B",
+                target.epoch,
+                admission.claim.device_total(),
+                admission.claim.host_total(),
+            )],
+            headroom: Vec::new(),
+            refusal_code: None,
+            admitted_tuple: Some(daemon_vhc_session::protocol::AdmittedTuple {
+                module_hash: target.new_module,
+                config_hash: *blake3::hash(&config).as_bytes(),
+                grants_hash: target.grants_hash,
+                claim_hash: *blake3::hash(&admission.claim_bytes).as_bytes(),
+                genesis_hash: genesis.frozen.run_id().0,
+                role: genesis.worker_role.clone(),
+                // 0 = unassigned; the node mints the post-switch incarnation and stamps it into
+                // the tuple it delivers with SwitchModule (never here).
+                incarnation: 0,
+                device_profile_rev: 0,
+                owner_policy_rev: 0,
+                backend: selection.slug.clone(),
+                gpu_index: selection.gpu_index,
+            }),
+        }),
+        Err(refusal) => Ok(ineligible(
+            format!("switch target re-admission refused: {refusal}"),
+            None,
+        )),
+    }
+}
+
 /// Author the live-switch binding (the worker's pre-flight half of ABI §10.3): resolve the
 /// node-provisioned POST-SWITCH identity read-only from the keystore (the node minted the new
 /// incarnation's key and re-issued its certificate before sending the command — the worker never
@@ -1366,6 +1551,7 @@ pub(crate) fn switch_binding(
     deadline_ms: u64,
     tuple: daemon_vhc_session::protocol::AdmittedTuple,
     old_incarnation: u64,
+    config: Vec<u8>,
 ) -> Result<daemon_vhc_session::role_session::SwitchBinding, String> {
     use daemon_vhc_session::keystore::VhcKeystore;
 
@@ -1501,8 +1687,10 @@ pub(crate) fn switch_binding(
         grants_hash,
         tuple,
         module_bytes,
-        // Upgrade records pin module + grants; config carriage arrives when they carry one.
-        config: Vec::new(),
+        // The admitted role config carries UNCHANGED across the switch (upgrade records pin
+        // module + grants; config carriage arrives when records carry one): the migrated
+        // instance initializes exactly like its predecessor.
+        config,
         signing_seed: run_key.to_bytes(),
         own_cert: cert,
         role_grants: genesis.env.roles[&genesis.worker_role].grants.clone(),

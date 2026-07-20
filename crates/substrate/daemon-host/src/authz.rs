@@ -161,6 +161,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | VhcLeave { .. }
         | VhcPause { .. }
         | VhcResume { .. }
+        | VhcSwitchModule { .. }
         | VhcSetPolicy { .. } => C::ControlWrite,
 
         // -- serve_profile: profiles + skills (versioned) + personas (wire v36) -----------------

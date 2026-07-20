@@ -26,6 +26,7 @@
 //! The first whole-run gate wired into tier-2 CI is the SPARTA-shaped `toy_averager.wasm` production
 //! blob (timers + publish, no coordinator) — deterministic, journaled, replay-verified.
 
+pub mod ceremony;
 pub mod coordinator;
 pub mod genesis_run;
 pub mod live_genesis;
@@ -39,7 +40,7 @@ pub use genesis_run::{
     genesis_envelope, genesis_whole_run, FaultAction, FaultPlan, FaultRule, FrameKind,
     GenesisRunReport, GenesisRunSpec, GenesisWorkerReport,
 };
-pub use live_genesis::{live_genesis, LiveGenesis, LiveGenesisSpec};
+pub use live_genesis::{live_genesis, role_grants_hash, LiveGenesis, LiveGenesisSpec};
 pub use run::{whole_run, ReplayReport, RunSpec, WholeRunReport};
 
 use daemon_vhc_host::{EngineConfig, Worker};

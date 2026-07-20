@@ -302,6 +302,21 @@ ALTER TABLE vhc_runs ADD COLUMN running_since_ms INTEGER;
 ALTER TABLE vhc_runs ADD COLUMN terminal_reason TEXT;
 ";
 
+/// M6: the node-local mirror of each run's **committed transition-chain records** (architecture
+/// §5.4): one row per committed epoch, holding the canonical-CBOR `UpgradeRecord` the node
+/// validated and consumed. The mirror is what lets the next switch's fail-closed validation
+/// rebuild the chain from genesis without refetching history; it is written only after the
+/// record authorized + appended cleanly AND the local switch activated. Append-only.
+const M6_UPGRADE_RECORDS: &str = "\
+CREATE TABLE IF NOT EXISTS vhc_upgrade_records (
+    run_id     TEXT NOT NULL,
+    epoch      INTEGER NOT NULL,
+    record     BLOB NOT NULL,
+    created_ms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, epoch)
+);
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(SCHEMA),
@@ -309,6 +324,7 @@ fn migrations() -> Migrations<'static> {
         M::up(M3_ARBITER),
         M::up(M4_ADMITTED_TUPLE),
         M::up(M5_RUN_LIFECYCLE),
+        M::up(M6_UPGRADE_RECORDS),
     ])
 }
 
@@ -847,6 +863,56 @@ impl VhcStore {
             |row| row.get(0),
         )?;
         Ok(value as u64)
+    }
+
+    /// Mint the next incarnation id, guaranteed **strictly above `floor`** — the live-upgrade
+    /// minting rule (ABI §8.1/§10.3): the post-switch incarnation must supersede the running
+    /// one, and the running one may exceed the counter when it was minted out-of-band (a seat
+    /// lease's fencing token IS the incarnation). Atomic: the counter is raised to
+    /// `max(counter, floor) + 1` and read in one statement, so the never-reused guarantee holds
+    /// for every later [`mint_incarnation`](Self::mint_incarnation) too.
+    pub fn mint_incarnation_above(&self, floor: u64) -> Result<u64, StoreError> {
+        let conn = self.lock();
+        let value: i64 = conn.query_row(
+            "UPDATE vhc_counters SET value = MAX(value, ?1) + 1 WHERE name = 'incarnation' \
+             RETURNING value",
+            params![floor as i64],
+            |row| row.get(0),
+        )?;
+        Ok(value as u64)
+    }
+
+    /// Persist one committed transition-chain record for a run (the M6 node-local mirror):
+    /// canonical-CBOR `UpgradeRecord` bytes keyed by the epoch the record establishes.
+    /// Idempotent per `(run_id, epoch)` — a re-consumed record overwrites with identical bytes.
+    pub fn put_upgrade_record(
+        &self,
+        run_id: &str,
+        epoch: u64,
+        record: &[u8],
+    ) -> Result<(), StoreError> {
+        self.lock().execute(
+            "INSERT INTO vhc_upgrade_records (run_id, epoch, record, created_ms) \
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(run_id, epoch) DO UPDATE SET record = excluded.record",
+            params![run_id, epoch as i64, record, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The run's persisted transition-chain records, ordered by epoch (the chain-rebuild input
+    /// for the next switch's fail-closed validation).
+    pub fn upgrade_records(&self, run_id: &str) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT epoch, record FROM vhc_upgrade_records WHERE run_id = ?1 ORDER BY epoch",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Set the owner's preemption priority for a run (decisions D6 point 4: node-side owner

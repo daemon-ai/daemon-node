@@ -49,6 +49,7 @@ pub mod vhc;
 pub use vhc::{
     VhcApi, VhcCapabilities, VhcContribution, VhcEligibility, VhcEvent, VhcEventStream,
     VhcHardwareReport, VhcLeaveMode, VhcPolicy, VhcPolicyMode, VhcRunDetail, VhcRunSummary,
+    VhcSwitchOutcome,
 };
 
 pub mod profile;

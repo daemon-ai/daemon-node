@@ -268,6 +268,7 @@ async fn assess_role(seat: &mut Seat, wire: &[u8], role: &str, step: Duration) -
         .send(&Command::AssessRun {
             envelope: wire.to_vec(),
             role: Some(role.to_string()),
+            switch_target: None,
         })
         .await;
     let elig = seat

@@ -371,6 +371,7 @@ async fn checkpoint_published_yields_contribution_event_and_credit() {
             hash: "abc".into(),
             location: "r2://x".into(),
             generation: 1,
+            kind: "drain".into(),
         })
         .unwrap();
     // CheckpointPublished emits a Contribution event carrying the fresh totals (1 credit).
@@ -579,13 +580,13 @@ async fn collect(sub: &mut daemon_api::VhcEventStream, n: usize) -> Vec<VhcEvent
 }
 
 /// The late-join checkpoint seam (spec §9; lane R): a run discovery that records published
-/// pointers and hands back the latest one — the round-trip the node's publish hook + join-time
-/// restore resolution drive. The default trait methods are overridden here exactly as the
-/// production `EgressRunDiscovery` overrides them over the registry.
+/// pointers per `(role, kind)` slot and resolves the role-scoped best — the round-trip the
+/// node's publish hook + join-time restore resolution drive. The default trait methods are
+/// overridden here exactly as the production `EgressRunDiscovery` overrides them over the
+/// registry.
 #[derive(Default)]
 struct CheckpointDiscovery {
-    published: Mutex<Vec<(String, u64, String)>>,
-    latest: Mutex<Option<daemon_vhc_node::CheckpointPointer>>,
+    published: Mutex<Vec<daemon_vhc_node::CheckpointPointer>>,
 }
 
 #[async_trait]
@@ -601,50 +602,76 @@ impl RunDiscovery for CheckpointDiscovery {
     }
     async fn publish_checkpoint(
         &self,
-        run_id: &str,
+        _run_id: &str,
+        role: &str,
+        kind: &str,
         round: u64,
         hash: &str,
-        _size: u64,
+        size: u64,
     ) -> Result<(), VhcError> {
         self.published
             .lock()
             .unwrap()
-            .push((run_id.to_string(), round, hash.to_string()));
-        // A publish becomes the latest pointer a subsequent joiner restores from.
-        *self.latest.lock().unwrap() = Some(daemon_vhc_node::CheckpointPointer {
-            round,
-            hash: hash.to_string(),
-            size: 0,
-        });
+            .push(daemon_vhc_node::CheckpointPointer {
+                role: role.to_string(),
+                kind: kind.to_string(),
+                round,
+                hash: hash.to_string(),
+                size,
+            });
         Ok(())
     }
     async fn fetch_checkpoint(
         &self,
         _run_id: &str,
+        role: &str,
     ) -> Result<Option<daemon_vhc_node::CheckpointPointer>, VhcError> {
-        Ok(self.latest.lock().unwrap().clone())
+        Ok(daemon_vhc_node::best_restore_pointer(
+            &self.published.lock().unwrap(),
+            role,
+        ))
     }
 }
 
 #[tokio::test]
-async fn checkpoint_pointer_publishes_and_is_fetched_for_restore() {
+async fn checkpoint_pointers_are_role_and_kind_scoped() {
     let d = CheckpointDiscovery::default();
-    let hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    let live_hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
-    // A published checkpoint is recorded (the node's CheckpointPublished hook target)...
-    RunDiscovery::publish_checkpoint(&d, "run-ckpt", 7, hash, 4096)
+    // A trainer drain snapshot, a FRESHER trainer live checkpoint, and a coordinator drain
+    // snapshot at an even higher round all publish (the node's CheckpointPublished hook target).
+    RunDiscovery::publish_checkpoint(&d, "run-ckpt", "trainer", "drain", 7, "dd", 4096)
         .await
         .unwrap();
-    assert_eq!(
-        &*d.published.lock().unwrap(),
-        &[("run-ckpt".to_string(), 7, hash.to_string())]
-    );
+    RunDiscovery::publish_checkpoint(&d, "run-ckpt", "trainer", "live", 9, live_hash, 2048)
+        .await
+        .unwrap();
+    RunDiscovery::publish_checkpoint(&d, "run-ckpt", "coordinator", "drain", 12, "cc", 512)
+        .await
+        .unwrap();
 
-    // ...and a later joiner reads it back as the restore pointer (the join-time resolve target).
-    let pointer = RunDiscovery::fetch_checkpoint(&d, "run-ckpt")
+    // A trainer restores from ITS freshest LIVE pointer — the coordinator's higher-round drain
+    // snapshot never shadows it (the per-role rule), and the drain slot never outranks a
+    // fresher live one (the per-kind rule).
+    let pointer = RunDiscovery::fetch_checkpoint(&d, "run-ckpt", "trainer")
         .await
         .unwrap()
-        .expect("a pointer is published");
-    assert_eq!(pointer.round, 7);
-    assert_eq!(pointer.hash, hash);
+        .expect("a trainer pointer is published");
+    assert_eq!(pointer.kind, "live");
+    assert_eq!(pointer.round, 9);
+    assert_eq!(pointer.hash, live_hash);
+
+    // With no live pointer, the role falls back to its own drain snapshot.
+    let coord = RunDiscovery::fetch_checkpoint(&d, "run-ckpt", "coordinator")
+        .await
+        .unwrap()
+        .expect("a coordinator pointer is published");
+    assert_eq!(coord.kind, "drain");
+    assert_eq!(coord.round, 12);
+
+    // A role with no pointers starts fresh.
+    assert!(RunDiscovery::fetch_checkpoint(&d, "run-ckpt", "verifier")
+        .await
+        .unwrap()
+        .is_none());
 }

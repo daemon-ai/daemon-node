@@ -17,10 +17,16 @@ use daemon_vhc_net::{RegistryClient, RunId};
 
 use crate::service::VhcError;
 
-/// A published-checkpoint pointer resolved from the registry (spec §9; lane R): the round a
-/// checkpoint covers and its content address, the late-join restore input.
+/// A published-checkpoint pointer resolved from the registry (spec §9): the round a
+/// checkpoint covers and its content address, the late-join restore input. Pointers are keyed
+/// per `(role, kind)` — a role restores only from its own role's state, and a periodic LIVE
+/// pointer is a distinct slot from a graceful-leave DRAIN snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointPointer {
+    /// The envelope role whose state the checkpoint captures.
+    pub role: String,
+    /// The pointer kind (`"live"` / `"drain"`).
+    pub kind: String,
     /// The round the checkpoint captures.
     pub round: u64,
     /// blake3 of the checkpoint document (hex).
@@ -55,27 +61,54 @@ pub trait RunDiscovery: Send + Sync {
     /// unknown or the bytes do not match the descriptor's hash.
     async fn fetch_envelope(&self, run_id: &str) -> Result<Vec<u8>, VhcError>;
 
-    /// Publish this run's latest checkpoint pointer to the registry (spec §9; lane R). The
-    /// checkpoint DOCUMENT already lives on the payload plane (the session put it there); this
-    /// records the round → content-address pointer a late joiner reads. Best-effort: the default
-    /// is a no-op so fakes/offline nodes need not implement it.
+    /// Publish this run's latest checkpoint pointer to the registry (spec §9), keyed by
+    /// the `(role, kind)` slot it fills. The checkpoint DOCUMENT already lives on the payload
+    /// plane (the session put it there); this records the round → content-address pointer a
+    /// late joiner reads. Best-effort: the default is a no-op so fakes/offline nodes need not
+    /// implement it.
     async fn publish_checkpoint(
         &self,
         run_id: &str,
+        role: &str,
+        kind: &str,
         round: u64,
         hash: &str,
         size: u64,
     ) -> Result<(), VhcError> {
-        let _ = (run_id, round, hash, size);
+        let _ = (run_id, role, kind, round, hash, size);
         Ok(())
     }
 
-    /// Read this run's latest published-checkpoint pointer (spec §9; the late-join restore input);
-    /// `None` when none is published yet (a fresh start). Default `None` (no registry state).
-    async fn fetch_checkpoint(&self, run_id: &str) -> Result<Option<CheckpointPointer>, VhcError> {
-        let _ = run_id;
+    /// Resolve `role`'s best restore pointer for this run (spec §9; the late-join restore
+    /// input): the freshest LIVE pointer for the role, falling back to the freshest DRAIN
+    /// pointer — a drain snapshot never shadows a fresher live restore source, and another
+    /// role's pointer is never consulted. `None` when the role has no pointer (a fresh start).
+    /// Default `None` (no registry state).
+    async fn fetch_checkpoint(
+        &self,
+        run_id: &str,
+        role: &str,
+    ) -> Result<Option<CheckpointPointer>, VhcError> {
+        let _ = (run_id, role);
         Ok(None)
     }
+}
+
+/// The role-scoped restore preference (spec §9): the freshest `live` pointer, else the freshest
+/// `drain` pointer, over the run's published `(role, kind)` slots.
+pub fn best_restore_pointer(
+    pointers: &[CheckpointPointer],
+    role: &str,
+) -> Option<CheckpointPointer> {
+    let of_kind = |kind: &str| {
+        pointers
+            .iter()
+            .filter(|p| p.role == role && p.kind == kind)
+            .max_by_key(|p| p.round)
+            .cloned()
+    };
+    of_kind(daemon_vhc_net::CHECKPOINT_KIND_LIVE)
+        .or_else(|| of_kind(daemon_vhc_net::CHECKPOINT_KIND_DRAIN))
 }
 
 /// The production [`RunDiscovery`]: a [`RegistryClient`] against a vhc coordinator base.
@@ -145,26 +178,40 @@ impl RunDiscovery for EgressRunDiscovery {
     async fn publish_checkpoint(
         &self,
         run_id: &str,
+        role: &str,
+        kind: &str,
         round: u64,
         hash: &str,
         size: u64,
     ) -> Result<(), VhcError> {
         self.registry
-            .publish_checkpoint(run_id, round, hash, size)
+            .publish_checkpoint(run_id, role, kind, round, hash, size)
             .await
             .map_err(|e| VhcError::Discovery(e.to_string()))
     }
 
-    async fn fetch_checkpoint(&self, run_id: &str) -> Result<Option<CheckpointPointer>, VhcError> {
+    async fn fetch_checkpoint(
+        &self,
+        run_id: &str,
+        role: &str,
+    ) -> Result<Option<CheckpointPointer>, VhcError> {
         let state = self
             .registry
             .fetch_state(run_id)
             .await
             .map_err(|e| VhcError::Discovery(e.to_string()))?;
-        Ok(state.and_then(|s| s.checkpoint).map(|c| CheckpointPointer {
-            round: c.round,
-            hash: c.hash,
-            size: c.size,
-        }))
+        let pointers: Vec<CheckpointPointer> = state
+            .map(|s| s.checkpoints)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| CheckpointPointer {
+                role: c.role,
+                kind: c.kind,
+                round: c.round,
+                hash: c.hash,
+                size: c.size,
+            })
+            .collect();
+        Ok(best_restore_pointer(&pointers, role))
     }
 }

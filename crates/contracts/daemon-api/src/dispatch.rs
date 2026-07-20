@@ -362,6 +362,14 @@ async fn serve_vhc(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
         } => unit_or_err(api.vhc_leave(run_id, mode, op_id).await),
         ApiRequest::VhcPause { run_id, op_id } => unit_or_err(api.vhc_pause(run_id, op_id).await),
         ApiRequest::VhcResume { run_id, op_id } => unit_or_err(api.vhc_resume(run_id, op_id).await),
+        ApiRequest::VhcSwitchModule {
+            run_id,
+            upgrade_record,
+            op_id,
+        } => ok_or_err(
+            api.vhc_switch_module(run_id, upgrade_record, op_id).await,
+            ApiResponse::VhcSwitchOutcome,
+        ),
         ApiRequest::VhcSetPolicy { policy } => unit_or_err(api.vhc_set_policy(policy).await),
         ApiRequest::VhcHardwareReport => ok_or_err(
             api.vhc_hardware_report().await,

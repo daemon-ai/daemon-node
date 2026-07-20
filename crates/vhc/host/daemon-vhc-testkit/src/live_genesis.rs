@@ -140,6 +140,40 @@ pub struct LiveGenesisSpec<'a> {
     pub k_absences: u32,
     /// The coordinator's liveness timing (see [`LiveTiming`]).
     pub timing: LiveTiming,
+    /// The run's upgrade authority (whose unanimous signatures authorize a module-upgrade
+    /// record — architecture §5.4). Empty = an immutable run (no upgrade admits).
+    pub upgrade_authority: Vec<PeerId>,
+}
+
+/// Derive the grants-document hash a role's admission authors for `module` under this genesis
+/// (the module's linked worlds ∪ the genesis role grant list — the same deterministic
+/// derivation assess/join/switch use), i.e. the `grants_hash` anchor a module-upgrade record
+/// must carry (architecture §5.4; the worker re-derives and compares fail-closed).
+///
+/// # Errors
+/// A human-readable failure (undecodable wire, unknown role, engine/linking failure).
+pub fn role_grants_hash(
+    genesis_wire: &[u8],
+    role: &str,
+    module: &[u8],
+) -> Result<[u8; 32], String> {
+    let wire: SignedEnvelope = daemon_vhc_proto::from_canonical_slice(genesis_wire)
+        .map_err(|e| format!("genesis wire: {e}"))?;
+    let frozen = daemon_vhc_proto::FrozenGenesis::open(wire.bytes, wire.signature, wire.signer)
+        .map_err(|e| format!("open genesis: {e}"))?;
+    let env = frozen
+        .decode()
+        .map_err(|e| format!("decode genesis: {e}"))?;
+    let entry = env
+        .roles
+        .get(role)
+        .ok_or_else(|| format!("role `{role}` absent from the genesis role set"))?;
+    let worker = daemon_vhc_host::Worker::new(daemon_vhc_host::EngineConfig::default())
+        .map_err(|e| format!("engine: {e}"))?;
+    let linked = daemon_vhc_host::linked_worlds(&worker, module)
+        .map_err(|e| format!("linked worlds: {e}"))?;
+    let grants = daemon_vhc_proto::GrantsDoc::author(&linked, &entry.grants).to_canonical_bytes();
+    Ok(*blake3::hash(&grants).as_bytes())
 }
 
 /// Author the acceptance genesis: the coordinator role carrying its opaque
@@ -328,7 +362,7 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         identities: Identities {
             coordinator: Some(coordinator_base),
             coordinator_set: spec.trusted_bases.to_vec(),
-            upgrade_authority: Vec::new(),
+            upgrade_authority: spec.upgrade_authority.clone(),
         },
     };
     let author = SigningKey::from_bytes(&[0x42; 32]);

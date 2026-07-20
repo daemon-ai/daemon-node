@@ -80,12 +80,22 @@ struct DataEnvelope<T> {
     data: T,
 }
 
-/// The coordinator's latest published-checkpoint pointer (spec §9; lane R), read from
-/// `GET {base}/runs/:id/state`.`data.checkpoint`. `None` there ⇒ no checkpoint published yet (a
-/// rejoining peer falls back to fresh-state, §9 first-epoch). Mirrors the cloud `CheckpointPointer`
+/// One published-checkpoint pointer (spec §9), read from
+/// `GET {base}/runs/:id/state`.`data.checkpoints[]`. Pointers are keyed **per `(role, kind)`**:
+/// a role's restore source is scoped to that role's state (a coordinator pointer can never
+/// shadow a trainer restore source), and within a role a periodic LIVE checkpoint is a distinct
+/// slot from a graceful-leave DRAIN snapshot (restore prefers the freshest live pointer,
+/// falling back to drain). Mirrors the cloud `CheckpointPointer`
 /// (`apps/vhc/src/coordinator/checkpoint.ts`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointPointer {
+    /// The envelope role whose state the checkpoint captures.
+    #[serde(default)]
+    pub role: String,
+    /// The pointer kind: [`CHECKPOINT_KIND_LIVE`] (periodic mid-run cadence) or
+    /// [`CHECKPOINT_KIND_DRAIN`] (a graceful-leave drain snapshot).
+    #[serde(default)]
+    pub kind: String,
     /// The round the checkpoint captures (post-ingest state).
     pub round: u64,
     /// blake3 of the checkpoint bytes, 64 lowercase hex chars (the content address to verify).
@@ -97,6 +107,13 @@ pub struct CheckpointPointer {
     #[serde(default)]
     pub cross_checked: bool,
 }
+
+/// The periodic mid-run checkpoint kind (spec §9): published on the live cadence, so a
+/// hard-crashed peer has a fresh restore source even though it never drained.
+pub const CHECKPOINT_KIND_LIVE: &str = "live";
+
+/// The graceful-leave drain-snapshot checkpoint kind (spec §9).
+pub const CHECKPOINT_KIND_DRAIN: &str = "drain";
 
 /// The coordinator run-state projection (`GET {base}/runs/:id/state`.`data`), the queryable surface
 /// a rejoining peer reads for the current round + the latest checkpoint pointer (lane R). Only the
@@ -115,9 +132,10 @@ pub struct RunState {
     /// Whether the run has finished.
     #[serde(default)]
     pub finished: bool,
-    /// The latest published-checkpoint pointer, or `None` if none published yet.
+    /// The published-checkpoint pointers, one per `(role, kind)` slot (empty = none published
+    /// yet; a rejoining peer falls back to fresh-state, §9 first-epoch).
     #[serde(default)]
-    pub checkpoint: Option<CheckpointPointer>,
+    pub checkpoints: Vec<CheckpointPointer>,
 }
 
 /// The outcome of a seat claim/renew against the registry's fencing-token compare-and-swap.
@@ -264,18 +282,23 @@ impl RegistryClient {
     }
 
     /// Publish this peer's latest checkpoint manifest to the coordinator (spec §9; lane R):
-    /// `POST {base}/runs/:id/checkpoint` with `{round, hash, size}`. The coordinator tracks the
-    /// latest pointer + cross-checks a two-checkpointer both-match (RUN-6). Best-effort — a failure
-    /// is a soft warning (the pointer is advisory; the run is unaffected).
+    /// `POST {base}/runs/:id/checkpoint` with `{role, kind, round, hash, size}` — the pointer is
+    /// tracked per `(role, kind)` slot. The coordinator keeps the latest pointer per slot +
+    /// cross-checks a two-checkpointer both-match (RUN-6). Best-effort — a failure is a soft
+    /// warning (the pointer is advisory; the run is unaffected).
     pub async fn publish_checkpoint(
         &self,
         run_id: &str,
+        role: &str,
+        kind: &str,
         round: u64,
         hash: &str,
         size: u64,
     ) -> Result<(), VhcNetError> {
         let url = format!("{}/runs/{run_id}/checkpoint", self.base_url);
-        let body = serde_json::json!({ "round": round, "hash": hash, "size": size });
+        let body = serde_json::json!({
+            "role": role, "kind": kind, "round": round, "hash": hash, "size": size
+        });
         let ereq = EgressRequest::post_json(&url, &body)
             .map_err(|e| VhcNetError::Transport(format!("encode checkpoint pointer: {e}")))?;
         let resp = self
@@ -575,25 +598,30 @@ mod tests {
     }
 
     #[test]
-    fn run_state_decodes_checkpoint_pointer_and_null() {
-        // The `GET /state` shape (lane R): the `data.checkpoint` pointer a rejoining peer reads.
+    fn run_state_decodes_checkpoint_pointers_and_empty() {
+        // The `GET /state` shape (spec §9): the per-(role, kind) `data.checkpoints` pointers a
+        // rejoining peer reads.
         let with = r#"{"data":{"phase":"round_train","round":6,"epoch":1,"finished":false,
             "roster":["aa"],"committed":[],"coord_pubkey":"bb",
-            "checkpoint":{"round":3,"hash":"cc","size":4096,"cross_checked":true,"uploads":2}}}"#;
+            "checkpoints":[
+              {"role":"trainer","kind":"live","round":5,"hash":"dd","size":2048,"cross_checked":false,"uploads":1},
+              {"role":"trainer","kind":"drain","round":3,"hash":"cc","size":4096,"cross_checked":true,"uploads":2}
+            ]}}"#;
         let env: DataEnvelope<RunState> = serde_json::from_str(with).unwrap();
         let s = env.data;
         assert_eq!(s.phase, "round_train");
         assert_eq!(s.round, 6);
-        let ckpt = s.checkpoint.expect("pointer present");
-        assert_eq!(ckpt.round, 3);
-        assert_eq!(ckpt.hash, "cc");
-        assert_eq!(ckpt.size, 4096);
-        assert!(ckpt.cross_checked);
+        assert_eq!(s.checkpoints.len(), 2);
+        assert_eq!(s.checkpoints[0].role, "trainer");
+        assert_eq!(s.checkpoints[0].kind, CHECKPOINT_KIND_LIVE);
+        assert_eq!(s.checkpoints[0].round, 5);
+        assert_eq!(s.checkpoints[1].kind, CHECKPOINT_KIND_DRAIN);
+        assert!(s.checkpoints[1].cross_checked);
 
-        // No checkpoint published yet → `None` (the fresh-state fallback trigger).
+        // No checkpoint published yet → empty (the fresh-state fallback trigger).
         let without = r#"{"data":{"phase":"waiting","round":0,"epoch":0,"finished":false,
-            "roster":[],"committed":[],"coord_pubkey":"bb","checkpoint":null}}"#;
+            "roster":[],"committed":[],"coord_pubkey":"bb","checkpoints":[]}}"#;
         let env2: DataEnvelope<RunState> = serde_json::from_str(without).unwrap();
-        assert!(env2.data.checkpoint.is_none());
+        assert!(env2.data.checkpoints.is_empty());
     }
 }
