@@ -256,7 +256,7 @@ async fn killed_worker_respawns_and_rejoins() {
             .max()
             .copied()
             .unwrap_or(0)
-            >= b_before + 1;
+            > b_before;
         if respawned && rejoined {
             break;
         }
