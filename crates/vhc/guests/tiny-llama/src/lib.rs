@@ -124,6 +124,18 @@ struct LiveCfg {
     run_label: String,
     /// The genesis-pinned chunk-addressed corpus manifest's content hash (a granted artifact).
     manifest: Hash,
+    /// The periodic live checkpoint cadence in rounds: every `ckpt_every`-th ingested round the
+    /// module exports its full restorable state (masters + EF + AdamW moments + the round
+    /// watermark) as a checkpoint DOCUMENT on the payload plane, so a hard-crashed peer has a
+    /// fresh restore source even though it never drained. `0` disables the cadence (the drain
+    /// snapshot remains the only pointer source); absent = every round.
+    #[serde(default = "default_ckpt_every")]
+    ckpt_every: u64,
+}
+
+/// The default live checkpoint cadence: every ingested round.
+fn default_ckpt_every() -> u64 {
+    1
 }
 
 /// One staged batch: `(sequences, seq_len, tokens)` in training order.
@@ -436,6 +448,18 @@ struct LiveCorpus {
     total_sequences: u64,
 }
 
+/// A periodic live checkpoint's export walk (the boundary's post-ingest masters/EF captured
+/// synchronously when the walk starts; the AdamW moments arrive as export completions —
+/// the same async shape as the quiesce walk, without ending the run).
+struct CkptWalk {
+    /// The ingested round this checkpoint's state folds (the restore watermark).
+    round: u64,
+    master_le: Vec<u8>,
+    ef_le: Vec<u8>,
+    collected: Vec<Option<Vec<f32>>>,
+    ops: BTreeMap<u64, usize>,
+}
+
 /// The live-mode session state (module-driven data + wire announcements).
 struct LiveState {
     cfg: LiveCfg,
@@ -447,6 +471,12 @@ struct LiveState {
     pending_records: BTreeMap<u64, PendingRecord>,
     /// payload_put op → the commitment to publish once the store write is durable.
     pending_puts: BTreeMap<u64, Commitment>,
+    /// The in-flight periodic checkpoint export walk (one at a time; a boundary that fires
+    /// while one is in flight skips its cadence slot rather than queueing).
+    pending_ckpt: Option<CkptWalk>,
+    /// Outstanding checkpoint-document `payload_put` ops (their completions are drained; the
+    /// pointer publication rides the host's put seam, not a wire message).
+    ckpt_puts: std::collections::BTreeSet<u64>,
 }
 
 impl LiveState {
@@ -459,7 +489,111 @@ impl LiveState {
             pending_open: None,
             pending_records: BTreeMap::new(),
             pending_puts: BTreeMap::new(),
+            pending_ckpt: None,
+            ckpt_puts: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// Start the periodic checkpoint export walk at an ingested-round boundary, when the
+    /// cadence says so and no walk is already in flight. The post-ingest masters + EF are
+    /// captured synchronously here; the moments arrive as export completions.
+    fn maybe_start_checkpoint(&mut self, core: &Rc<RefCell<Core>>, round: u64) {
+        if self.cfg.ckpt_every == 0 || round % self.cfg.ckpt_every != 0 {
+            return;
+        }
+        if self.pending_ckpt.is_some() {
+            return;
+        }
+        let (master_le, ef_le) = {
+            let c = core.borrow();
+            (flat_le(&c.master), flat_le(c.profile.ef_state()))
+        };
+        let tensors = core.borrow().model.moment_tensors();
+        let n = tensors.len();
+        let mut ops = BTreeMap::new();
+        for (i, t) in tensors.into_iter().enumerate() {
+            ops.insert(export_tensor(t), i);
+        }
+        self.pending_ckpt = Some(CkptWalk {
+            round,
+            master_le,
+            ef_le,
+            collected: vec![None; n],
+            ops,
+        });
+    }
+
+    /// Finish a completed checkpoint walk: author the same four-section state manifest the
+    /// drain snapshot stages (plus the round watermark), wrap it as the checkpoint DOCUMENT
+    /// (`[manifest, [[name, bytes], …]]` — the restore decoder's exact shape), and put it on
+    /// the payload plane. Best-effort: a failed export abandons the walk (training continues;
+    /// the next cadence slot retries).
+    fn finish_checkpoint(&mut self, walk: CkptWalk) {
+        let mut moments = Vec::with_capacity(walk.collected.len());
+        for c in walk.collected {
+            match c {
+                Some(v) => moments.push(v),
+                None => return, // a failed moment export — abandon this cadence slot
+            }
+        }
+        let n = moments.len() / 2;
+        let sections = [
+            OwnedSection {
+                name: "master".to_string(),
+                schema: 1,
+                class: 0,
+                bytes: walk.master_le,
+            },
+            OwnedSection {
+                name: "ef".to_string(),
+                schema: 1,
+                class: 1,
+                bytes: walk.ef_le,
+            },
+            OwnedSection {
+                name: "adamw_m".to_string(),
+                schema: 1,
+                class: 1,
+                bytes: flat_le(&moments[..n]),
+            },
+            OwnedSection {
+                name: "adamw_v".to_string(),
+                schema: 1,
+                class: 1,
+                bytes: flat_le(&moments[n..]),
+            },
+            OwnedSection {
+                name: "round".to_string(),
+                schema: 1,
+                class: 1,
+                bytes: walk.round.to_le_bytes().to_vec(),
+            },
+        ];
+        let manifest = build_manifest(Hash([0u8; 32]), 1, &sections);
+        let Ok(manifest_bytes) = to_canonical_vec(&manifest) else {
+            return;
+        };
+        let doc = ciborium::value::Value::Array(vec![
+            ciborium::value::Value::Bytes(manifest_bytes),
+            ciborium::value::Value::Array(
+                sections
+                    .iter()
+                    .map(|s| {
+                        ciborium::value::Value::Array(vec![
+                            ciborium::value::Value::Text(s.name.clone()),
+                            ciborium::value::Value::Bytes(s.bytes.clone()),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ]);
+        let Ok(bytes) = to_canonical_vec(&doc) else {
+            return;
+        };
+        let buf = daemon_vhc_sdk::create_from(&bytes);
+        let op = daemon_vhc_sdk::payload_put(buf);
+        daemon_vhc_sdk::buffer_release(buf);
+        self.ckpt_puts.insert(op);
     }
 
     /// Announce this peer to the coordinator: a Join plus the ready-Heartbeat that drives the
@@ -875,10 +1009,16 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                                 }
                             }
                             let pending = PendingRecord { rr, entries, ops };
+                            let pending_round = pending.rr.round;
                             if pending.ops.is_empty() {
                                 dispatch_record(&mut driver, &mut payloads, true, pending);
+                                // The ingested-round boundary: the periodic live checkpoint
+                                // cadence fires here (post-ingest state, spec §9).
+                                if let Some(l) = live.as_mut() {
+                                    l.maybe_start_checkpoint(&core, pending_round);
+                                }
                             } else if let Some(l) = live.as_mut() {
-                                l.pending_records.insert(pending.rr.round, pending);
+                                l.pending_records.insert(pending_round, pending);
                             }
                             continue;
                         }
@@ -938,6 +1078,38 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                         publish_wire(&VhcMessage::Commitment(commitment));
                         continue;
                     }
+                    if l.ckpt_puts.remove(&op) {
+                        // The checkpoint document is durable; the pointer publication rides the
+                        // host's put seam (spec §9), never a wire message.
+                        continue;
+                    }
+                    // The periodic checkpoint walk's moment exports (spec §9): collect; a failed
+                    // export abandons the cadence slot (training continues; the next fires).
+                    let ckpt_hit = l.pending_ckpt.as_mut().and_then(|walk| {
+                        walk.ops
+                            .remove(&op)
+                            .map(|idx| match completion_tensor(&ev) {
+                                Some(t) => {
+                                    walk.collected[idx] = Some(t);
+                                    true
+                                }
+                                None => false,
+                            })
+                    });
+                    match ckpt_hit {
+                        Some(true) => {
+                            if l.pending_ckpt.as_ref().is_some_and(|w| w.ops.is_empty()) {
+                                let walk = l.pending_ckpt.take().expect("the in-flight checkpoint");
+                                l.finish_checkpoint(walk);
+                            }
+                            continue;
+                        }
+                        Some(false) => {
+                            l.pending_ckpt = None;
+                            continue;
+                        }
+                        None => {}
+                    }
                     let open_hit = l.pending_open.as_mut().and_then(|open| {
                         open.ops.remove(&op).map(|(slot, seg)| {
                             open.slots[slot].segs[seg] = Some(
@@ -982,6 +1154,9 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                                 .remove(&round)
                                 .expect("the completed record");
                             dispatch_record(&mut driver, &mut payloads, true, pending);
+                            // The ingested-round boundary: the periodic live checkpoint
+                            // cadence fires here (post-ingest state, spec §9).
+                            l.maybe_start_checkpoint(&core, round);
                         }
                         continue;
                     }

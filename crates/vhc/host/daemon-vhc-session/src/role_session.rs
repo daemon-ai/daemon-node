@@ -1248,7 +1248,7 @@ async fn relay_egress(
 
     for (op, request) in pump.take_op_requests() {
         tracing::trace!(op, request = %op_kind(&request), "egress: servicing capability op");
-        service_op(pump, providers, op, request).await?;
+        service_op(pump, providers, op, request, events, generation).await?;
     }
 
     let metrics = pump.metrics();
@@ -1259,7 +1259,6 @@ async fn relay_egress(
         });
     }
     *metrics_cursor = metrics.len();
-    let _ = generation; // metrics are ambient (un-stamped); the terminal event carries the class
     Ok(())
 }
 
@@ -1270,10 +1269,30 @@ async fn service_op(
     providers: &RoleProviders,
     op: u64,
     request: OpRequest,
+    events: &mpsc::UnboundedSender<Event>,
+    generation: u64,
 ) -> Result<(), String> {
     let outcome = match request {
         OpRequest::PayloadPut { bytes } => match providers.payloads.put_content(&bytes).await {
-            Ok(_hash) => OpOutcome::PutDone,
+            Ok(hash) => {
+                // The periodic LIVE checkpoint cadence (spec §9): a put whose bytes carry the
+                // host's own §10.2 checkpoint-document shape — a hash-consistent state manifest
+                // plus its sections and a round watermark — is a mid-run full-state checkpoint,
+                // surfaced so the node records the (role, live) pointer. Structural recognition
+                // over the HOST's contract shape only (the module's round vocabulary stays
+                // opaque); a non-checkpoint put never matches.
+                if let Some(round) = live_checkpoint_watermark(&bytes) {
+                    let hash = hash.to_hex();
+                    let _ = events.send(Event::CheckpointPublished {
+                        round,
+                        hash: hash.clone(),
+                        location: format!("payload/{hash}"),
+                        generation,
+                        kind: "live".into(),
+                    });
+                }
+                OpOutcome::PutDone
+            }
             Err(e) => OpOutcome::Failed {
                 code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
                 detail: format!("payload put: {e}"),
@@ -1485,6 +1504,7 @@ async fn finish(
                     hash: hash.clone(),
                     location: format!("payload/{hash}"),
                     generation,
+                    kind: "drain".into(),
                 });
             }
             let _ = run_label;
@@ -1614,6 +1634,61 @@ pub fn encode_snapshot_doc(
         ),
     ]);
     to_canonical_vec(&doc).map_err(|e| format!("encode snapshot doc: {e}"))
+}
+
+/// Recognize a payload-plane put as a §10.2 checkpoint DOCUMENT and return its round watermark
+/// (the periodic LIVE checkpoint cadence's announcement seam, spec §9). Recognition is strictly
+/// structural over the HOST's own contract shapes — the `[manifest, sections]` document paired
+/// with `encode_snapshot_doc`, whose manifest is the §10.2 state-manifest map — and every
+/// declared section must hash-match its bytes (a coincidental or corrupt object never registers
+/// a pointer). The module's round vocabulary is never decoded. `None` = not a checkpoint.
+fn live_checkpoint_watermark(bytes: &[u8]) -> Option<u64> {
+    let capture = decode_snapshot_doc(bytes).ok()?;
+    // The §10.2 state-manifest map: `sections: [{name, hash, size, …}]`.
+    let v: ciborium::value::Value = ciborium::de::from_reader(capture.manifest.as_slice()).ok()?;
+    let ciborium::value::Value::Map(entries) = v else {
+        return None;
+    };
+    let sections_v = entries.iter().find_map(|(k, val)| match k {
+        ciborium::value::Value::Text(t) if t == "sections" => Some(val),
+        _ => None,
+    })?;
+    let ciborium::value::Value::Array(decls) = sections_v else {
+        return None;
+    };
+    if decls.len() != capture.sections.len() || decls.is_empty() {
+        return None;
+    }
+    let mut watermark = None;
+    for (decl, (name, section_bytes)) in decls.iter().zip(&capture.sections) {
+        let ciborium::value::Value::Map(fields) = decl else {
+            return None;
+        };
+        let field = |want: &str| {
+            fields.iter().find_map(|(k, val)| match k {
+                ciborium::value::Value::Text(t) if t == want => Some(val),
+                _ => None,
+            })
+        };
+        match field("name") {
+            Some(ciborium::value::Value::Text(t)) if t == name => {}
+            _ => return None,
+        }
+        match field("hash") {
+            Some(ciborium::value::Value::Bytes(h))
+                if h.as_slice() == blake3::hash(section_bytes).as_bytes() => {}
+            _ => return None,
+        }
+        if name == "round" {
+            watermark = <[u8; 8]>::try_from(section_bytes.as_slice())
+                .ok()
+                .map(u64::from_le_bytes)
+                .filter(|w| *w != u64::MAX);
+        }
+    }
+    // Only a doc carrying the live watermark section registers a LIVE pointer (the drain path
+    // has its own event; a watermark-less doc has no restore ordering to offer).
+    watermark
 }
 
 /// Decode a checkpoint document back into a [`SnapshotCapture`] (the late-join restore input).

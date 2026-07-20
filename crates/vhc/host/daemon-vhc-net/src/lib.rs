@@ -87,6 +87,7 @@ pub use presign::{
 pub use r2_store::{r2_object_key, R2Store};
 pub use registry::{
     CheckpointPointer, RegistryClient, RunArtifact, RunDescriptor, RunState, SeatClaimOutcome,
+    CHECKPOINT_KIND_DRAIN, CHECKPOINT_KIND_LIVE,
 };
 pub use seam::{ContentHash, PayloadKey, PeerId, RoundId, RunId};
 pub use seat_registry::FakeSeatRegistry;

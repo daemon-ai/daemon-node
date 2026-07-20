@@ -33,6 +33,7 @@ async fn malformed_frame_and_untrusted_cert_are_typed_refusals() {
         payload_dir: Some(payload_root.path()),
         allowlist: &base_url,
         reconcile_tick_ms: 500,
+        initial_backoff_ms: 0,
     });
     let trainer_a = spawn_node(&NodeSpec {
         name: "trainer-a",
@@ -41,6 +42,7 @@ async fn malformed_frame_and_untrusted_cert_are_typed_refusals() {
         payload_dir: Some(payload_root.path()),
         allowlist: &base_url,
         reconcile_tick_ms: 500,
+        initial_backoff_ms: 0,
     });
     let trainer_b = spawn_node(&NodeSpec {
         name: "trainer-b",
@@ -49,6 +51,7 @@ async fn malformed_frame_and_untrusted_cert_are_typed_refusals() {
         payload_dir: Some(payload_root.path()),
         allowlist: &base_url,
         reconcile_tick_ms: 500,
+        initial_backoff_ms: 0,
     });
 
     let bases = [

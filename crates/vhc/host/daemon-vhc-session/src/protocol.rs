@@ -325,6 +325,12 @@ pub struct Eligibility {
     pub refusal_code: Option<String>,
 }
 
+/// The default checkpoint-pointer kind for an unstamped `CheckpointPublished` frame: the
+/// graceful-leave drain snapshot (the pre-cadence sole pointer source).
+fn checkpoint_kind_drain() -> String {
+    "drain".to_string()
+}
+
 /// A parent → worker command frame (§10.2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
@@ -514,6 +520,11 @@ pub enum Event {
         /// The emitting role-instance's generation counter (see [`Event::RunPhase`]).
         #[serde(default)]
         generation: u64,
+        /// The pointer kind (spec §9): `"live"` — the periodic mid-run cadence — or `"drain"` —
+        /// a graceful-leave drain snapshot. Additive `#[serde(default)]`; an unstamped frame
+        /// reads as a drain snapshot (the pre-cadence sole source).
+        #[serde(default = "checkpoint_kind_drain")]
+        kind: String,
     },
     /// A non-fatal warning (desync-warning, straggling, quota).
     Warning {
@@ -1150,6 +1161,7 @@ mod tests {
             hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
             location: "r2://run-42/ckpt-200.safetensors".into(),
             generation: 3,
+            kind: "live".into(),
         });
         round_trip_event(Event::Warning {
             class: "straggle".into(),

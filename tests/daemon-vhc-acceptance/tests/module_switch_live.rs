@@ -129,6 +129,7 @@ async fn live_module_switch_activates_through_the_product_api() {
         payload_dir: Some(payload_root.path()),
         allowlist: Box::leak(base_url.clone().into_boxed_str()),
         reconcile_tick_ms: 500,
+        initial_backoff_ms: 0,
     };
     let coord = spawn_node(&mk("coordinator", true));
     let trainer_a = spawn_node(&mk("trainer-a", false));

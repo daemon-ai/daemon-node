@@ -239,6 +239,10 @@ pub struct NodeSpec<'a> {
     pub allowlist: &'a str,
     /// Reconcile tick (ms) — kept short so churn reconvergence is prompt in-test.
     pub reconcile_tick_ms: u64,
+    /// The first reconvergence backoff (ms); `0` = the node default. The hard-crash continuity
+    /// gate raises it so the rejoin resolves its restore AFTER the survivor's post-deadline
+    /// live checkpoint lands (deterministic restore freshness, never a race).
+    pub initial_backoff_ms: u64,
 }
 
 /// Spawn a node process with a seeded base identity, blocking until it serves its socket.
@@ -277,6 +281,9 @@ pub fn spawn_node(spec: &NodeSpec<'_>) -> Node {
     writeln!(toml, "base = {:?}", spec.registry_base).unwrap();
     toml.push_str("[vhc.retry]\n");
     writeln!(toml, "reconcile_tick_ms = {}", spec.reconcile_tick_ms).unwrap();
+    if spec.initial_backoff_ms > 0 {
+        writeln!(toml, "initial_backoff_ms = {}", spec.initial_backoff_ms).unwrap();
+    }
     let config_path = data_dir.path().join("node.toml");
     std::fs::write(&config_path, toml).expect("write node config");
 

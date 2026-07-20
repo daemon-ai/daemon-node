@@ -593,7 +593,7 @@ impl VhcService {
                 .admitted_tuple
                 .as_deref()
                 .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
-            let restore = self.resolve_restore(&run.run_id).await;
+            let restore = self.resolve_restore(&run.run_id, &run.role).await;
             let seat = self.resolve_seat_bootstrap(&run.run_id).await;
             let (delivery_tuple, credentials, credentials_ref) = match self.author_join(
                 &run.run_id,
@@ -912,7 +912,7 @@ impl VhcService {
             .admitted_tuple
             .as_deref()
             .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
-        let restore = self.resolve_restore(&run.run_id).await;
+        let restore = self.resolve_restore(&run.run_id, &run.role).await;
         let seat = self.resolve_seat_bootstrap(&run.run_id).await;
         let (delivery_tuple, credentials, _credentials_ref) = match self.author_join(
             &run.run_id,
@@ -1123,17 +1123,40 @@ impl VhcService {
 
         // Checkpoint-pointer publication (spec §9; lane R): the checkpoint DOCUMENT is already on
         // the payload plane (the session put it there); record the round → content-address
-        // pointer at the registry so a late joiner can restore. Best-effort + detached (a pointer
-        // is advisory; the joiner hash-verifies regardless, so an unknown size is 0).
-        if let protocol::Event::CheckpointPublished { round, hash, .. } = ev {
+        // pointer at the registry under the run's `(role, kind)` slot so a late joiner restores
+        // role-scoped (a coordinator pointer never shadows a trainer restore source). Best-effort
+        // + detached (a pointer is advisory; the joiner hash-verifies regardless, so an unknown
+        // size is 0).
+        if let protocol::Event::CheckpointPublished {
+            round, hash, kind, ..
+        } = ev
+        {
             if let Some(discovery) = &self.discovery {
+                let role = self
+                    .store
+                    .get_run(&run_id)?
+                    .map(|r| r.role)
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| "trainer".to_string());
                 let discovery = discovery.clone();
-                let (run, round, hash) = (run_id.clone(), *round, hash.clone());
+                let (run, round, hash, kind) = (run_id.clone(), *round, hash.clone(), kind.clone());
                 tokio::spawn(async move {
-                    match discovery.publish_checkpoint(&run, round, &hash, 0).await {
-                        Ok(()) => tracing::debug!(run, round, hash, "checkpoint pointer published"),
+                    match discovery
+                        .publish_checkpoint(&run, &role, &kind, round, &hash, 0)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::debug!(
+                                run,
+                                role,
+                                kind,
+                                round,
+                                hash,
+                                "checkpoint pointer published"
+                            );
+                        }
                         Err(e) => {
-                            tracing::warn!(run, round, error = %e, "checkpoint pointer publication failed")
+                            tracing::warn!(run, role, kind, round, error = %e, "checkpoint pointer publication failed");
                         }
                     }
                 });
@@ -1816,13 +1839,19 @@ impl VhcService {
         }
     }
 
-    /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's latest
-    /// checkpoint pointer, decoded to the wire restore form (`None` = fresh start / no discovery
-    /// / no checkpoint published). A malformed pointer hash is dropped (fresh start), never a
-    /// hard join failure.
-    async fn resolve_restore(&self, run_id: &str) -> Option<protocol::CheckpointRestore> {
+    /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's best
+    /// pointer FOR THIS ROLE — the freshest live pointer, else the freshest drain snapshot;
+    /// another role's pointer is never consulted — decoded to the wire restore form (`None` =
+    /// fresh start / no discovery / nothing published for the role). A malformed pointer hash
+    /// is dropped (fresh start), never a hard join failure.
+    async fn resolve_restore(
+        &self,
+        run_id: &str,
+        role: &str,
+    ) -> Option<protocol::CheckpointRestore> {
         let discovery = self.discovery.as_ref()?;
-        let pointer = discovery.fetch_checkpoint(run_id).await.ok()??;
+        let role = if role.is_empty() { "trainer" } else { role };
+        let pointer = discovery.fetch_checkpoint(run_id, role).await.ok()??;
         let hash = hex32(&pointer.hash)?;
         Some(protocol::CheckpointRestore {
             round: pointer.round,
@@ -1994,7 +2023,7 @@ impl VhcApi for VhcService {
         // certificate under the base identity, stamp the minted incarnation into the tuple, and
         // author the secrets-free plane-selection credentials (the token, if any, lands only in
         // the keystore record `credentials_ref` points at — never on the wire).
-        let restore = self.resolve_restore(&run_id).await;
+        let restore = self.resolve_restore(&run_id, &id.role).await;
         let seat = self.resolve_seat_bootstrap(&run_id).await;
         let (delivery_tuple, credentials, credentials_ref) =
             match self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore, seat) {

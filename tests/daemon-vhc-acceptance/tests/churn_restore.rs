@@ -13,14 +13,16 @@
 //! same checkpoint document before running, so training resumes with identical state and the
 //! per-round det digests agree across the churn.
 //!
-//! **Hard churn** (`killed_worker_respawns_and_rejoins`): a trainer's WORKER SUBPROCESS is
-//! SIGKILLed mid-run. The node's supervisor respawns the child and reconciliation re-joins the
-//! run as a new incarnation; the coordinator absence-drops the dead incarnation and the run
-//! reconverges — training rounds advance again for both trainer nodes, every node process stays
-//! up, and the killed node's replacement worker is a different OS process. (Digest continuity
-//! across a HARD crash requires a periodic live checkpoint cadence — the pointer published at a
-//! graceful drain is the only restore source today — so this variant asserts lifecycle
-//! reconvergence, not cross-peer digest equality for the crashed peer.)
+//! **Hard churn + digest continuity** (`killed_worker_respawns_and_rejoins`): a trainer's
+//! WORKER SUBPROCESS is SIGKILLed mid-run. The node's supervisor respawns the child and
+//! reconciliation re-joins the run as a new incarnation; the coordinator absence-drops the dead
+//! incarnation and the run reconverges — training rounds advance again for both trainer nodes,
+//! every node process stays up, and the killed node's replacement worker is a different OS
+//! process. Digest continuity across the HARD crash rides the periodic LIVE checkpoint cadence
+//! (spec §9): the trainers publish full-state checkpoint pointers every ingested round, so the
+//! rejoined incarnation — whose reconvergence backoff outlasts the survivor's deadline round —
+//! restores from the survivor's post-deadline live pointer and voices AGREEING det digests for
+//! every shared round across the kill (the full cross-peer oracle, not just reconvergence).
 
 mod harness;
 
@@ -31,23 +33,29 @@ use harness::{
     start_cluster_with, wait_rounds, worker_children, NodeSpec,
 };
 
-/// Wait until the registry holds a checkpoint pointer at (or past) `min_round`.
+/// Wait until the registry holds a trainer checkpoint pointer of `kind` at (or past)
+/// `min_round`.
 async fn wait_checkpoint(
     cluster: &harness::Cluster,
+    kind: &str,
     min_round: u64,
     timeout: Duration,
 ) -> harness::registry::Checkpoint {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Some(c) = cluster.registry.checkpoint() {
+        if let Some(c) = cluster.registry.checkpoint("trainer", kind) {
             if c.round >= min_round {
                 return c;
             }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "no checkpoint pointer at round >= {min_round} within {timeout:?} (got {:?})",
-            cluster.registry.checkpoint().map(|c| c.round)
+            "no trainer {kind} checkpoint pointer at round >= {min_round} within {timeout:?} \
+             (got {:?})",
+            cluster
+                .registry
+                .checkpoint("trainer", kind)
+                .map(|c| c.round)
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -68,6 +76,7 @@ async fn graceful_churn_rejoins_through_checkpoint_restore() {
         payload_dir: Some(payload_root.path()),
         allowlist: Box::leak(base_url.clone().into_boxed_str()),
         reconcile_tick_ms: 500,
+        initial_backoff_ms: 0,
     };
     let coord = spawn_node(&mk("coordinator", true));
     let trainer_a = spawn_node(&mk("trainer-a", false));
@@ -104,7 +113,7 @@ async fn graceful_churn_rejoins_through_checkpoint_restore() {
     // Trainer A leaves gracefully: drain snapshot -> checkpoint document + pointer. The stalled
     // round finalizes at the deadline with A absent (dropped), the floor breach forces cooldown.
     leave(&trainer_a, run, daemon_api::VhcLeaveMode::Graceful, "op-la").await;
-    wait_checkpoint(&cluster, 0, Duration::from_secs(60)).await;
+    wait_checkpoint(&cluster, "drain", 0, Duration::from_secs(60)).await;
 
     // The survivor folds the interregnum record; ITS later checkpoint must win the pointer so
     // both rejoiners restore a state that already contains every record either of them missed.
@@ -133,7 +142,7 @@ async fn graceful_churn_rejoins_through_checkpoint_restore() {
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     leave(&trainer_b, run, daemon_api::VhcLeaveMode::Graceful, "op-lb").await;
-    let pointer = wait_checkpoint(&cluster, after_a, Duration::from_secs(60)).await;
+    let pointer = wait_checkpoint(&cluster, "drain", after_a, Duration::from_secs(60)).await;
 
     // Both trainers rejoin as fresh incarnations; each node resolves the pointer and the worker
     // migrates from the checkpoint document before running (§10.3 step 4).
@@ -186,17 +195,22 @@ async fn killed_worker_respawns_and_rejoins() {
     let base_port = harness::free_port();
     let base_url = format!("http://127.0.0.1:{base_port}/api/v1/vhc");
 
-    let mk = |name: &str, seat_claim: bool| NodeSpec {
+    let mk = |name: &str, seat_claim: bool, backoff_ms: u64| NodeSpec {
         name: Box::leak(name.to_string().into_boxed_str()),
         registry_base: Box::leak(base_url.clone().into_boxed_str()),
         seat_claim,
         payload_dir: Some(payload_root.path()),
         allowlist: Box::leak(base_url.clone().into_boxed_str()),
         reconcile_tick_ms: 500,
+        initial_backoff_ms: backoff_ms,
     };
-    let coord = spawn_node(&mk("coordinator", true));
-    let trainer_a = spawn_node(&mk("trainer-a", false));
-    let trainer_b = spawn_node(&mk("trainer-b", false));
+    let coord = spawn_node(&mk("coordinator", true, 0));
+    // The victim's first reconvergence backoff outlasts the deadline round the survivor
+    // finalizes alone (~30s at the churn timing): the rejoin then resolves the SURVIVOR's
+    // post-deadline live checkpoint as its restore source — the digest-continuity input —
+    // deterministically, never racing the round settle.
+    let trainer_a = spawn_node(&mk("trainer-a", false, 40_000));
+    let trainer_b = spawn_node(&mk("trainer-b", false, 0));
 
     let bases = [
         base_peer(&coord),
@@ -222,6 +236,10 @@ async fn killed_worker_respawns_and_rejoins() {
     let timeout = Duration::from_secs(180);
     wait_rounds(&trainer_a, run, 2, timeout).await;
     wait_rounds(&trainer_b, run, 2, timeout).await;
+
+    // The periodic LIVE checkpoint cadence is producing pointers BEFORE the crash (spec §9):
+    // the hard-killed peer never drains, so this is the only restore source it will have.
+    wait_checkpoint(&cluster, "live", 1, Duration::from_secs(60)).await;
 
     // SIGKILL trainer-a's worker SUBPROCESS (never the node): the supervisor must respawn it and
     // the node's reconciliation must re-join the run as a fresh incarnation.
@@ -279,6 +297,33 @@ async fn killed_worker_respawns_and_rejoins() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+
+    // DIGEST CONTINUITY ACROSS THE HARD CRASH (spec §9): the rejoined incarnation restored from
+    // the freshest (trainer, live) pointer — the survivor's post-deadline periodic checkpoint,
+    // whose state folds every record the victim missed while dead — so every round BOTH
+    // trainers voice a det digest for, before AND after the kill, carries one agreed digest.
+    // Give both trainers a couple more shared rounds past the rejoin, then run the full oracle.
+    let a_rejoined = journal_digests(&trainer_a, run)
+        .keys()
+        .max()
+        .copied()
+        .unwrap_or(0);
+    wait_rounds(&trainer_a, run, a_rejoined + 2, churn_timeout).await;
+    wait_rounds(&trainer_b, run, a_rejoined + 2, churn_timeout).await;
+    let a = journal_digests(&trainer_a, run);
+    let b = journal_digests(&trainer_b, run);
+    let post_crash_shared = a
+        .keys()
+        .filter(|r| **r > b_before && b.contains_key(r))
+        .count();
+    assert!(
+        post_crash_shared >= 1,
+        "the rejoined incarnation shares no post-crash rounds with the survivor \
+         (A={:?} B={:?})",
+        a.keys().collect::<Vec<_>>(),
+        b.keys().collect::<Vec<_>>()
+    );
+    assert_digests_agree(&a, &b, 3);
 
     // Every node process survived the churn.
     for node in [&coord, &trainer_a, &trainer_b] {

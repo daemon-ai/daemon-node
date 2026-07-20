@@ -29,9 +29,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio_tungstenite::tungstenite::Message;
 
-/// A published checkpoint pointer (`round → content hash`).
+/// A published checkpoint pointer, keyed per `(role, kind)` slot (spec §9): `kind` is `"live"`
+/// (the periodic mid-run cadence) or `"drain"` (a graceful-leave drain snapshot).
 #[derive(Clone)]
 pub struct Checkpoint {
+    pub role: String,
+    pub kind: String,
     pub round: u64,
     pub hash: String,
     pub size: u64,
@@ -44,7 +47,8 @@ pub struct FixtureRegistry {
     envelope_bytes: Vec<u8>,
     proto_version: u32,
     seats: FakeSeatRegistry,
-    checkpoint: Mutex<Option<Checkpoint>>,
+    /// Published checkpoint pointers, one slot per `(role, kind)` (a fresher round replaces).
+    checkpoints: Mutex<HashMap<(String, String), Checkpoint>>,
     /// Presign object store: object key → bytes (the R2 payload tier + the envelope object).
     objects: Mutex<HashMap<String, Vec<u8>>>,
     base: Mutex<String>,
@@ -66,9 +70,17 @@ impl FixtureRegistry {
         self.seats.read(&self.run_label, role)
     }
 
-    /// Publish a checkpoint pointer directly (test seeding).
+    /// Publish a checkpoint pointer directly (test seeding): fills the `(role, kind)` slot when
+    /// the round is not older than the slot's current pointer.
     pub fn set_checkpoint(&self, ckpt: Checkpoint) {
-        *self.checkpoint.lock().unwrap() = Some(ckpt);
+        let mut slots = self.checkpoints.lock().unwrap();
+        let key = (ckpt.role.clone(), ckpt.kind.clone());
+        match slots.get(&key) {
+            Some(current) if current.round > ckpt.round => {}
+            _ => {
+                slots.insert(key, ckpt);
+            }
+        }
     }
 
     /// Seed a presign object directly (the R2 payload tier / envelope object).
@@ -81,9 +93,14 @@ impl FixtureRegistry {
         self.objects.lock().unwrap().get(key).cloned()
     }
 
-    /// The latest published checkpoint pointer (the churn/restore gates wait on it).
-    pub fn checkpoint(&self) -> Option<Checkpoint> {
-        self.checkpoint.lock().unwrap().clone()
+    /// The published checkpoint pointer for one `(role, kind)` slot (the churn/restore gates
+    /// wait on these).
+    pub fn checkpoint(&self, role: &str, kind: &str) -> Option<Checkpoint> {
+        self.checkpoints
+            .lock()
+            .unwrap()
+            .get(&(role.to_string(), kind.to_string()))
+            .cloned()
     }
 
     /// Inject a raw binary frame to EVERY connected control-plane peer — the adversarial-injection
@@ -156,7 +173,7 @@ pub async fn serve(
         envelope_bytes: genesis.wire.clone(),
         proto_version: u32::from(daemon_vhc_proto::VHC_PROTO_VERSION.0),
         seats: FakeSeatRegistry::new(),
-        checkpoint: Mutex::new(None),
+        checkpoints: Mutex::new(HashMap::new()),
         objects: Mutex::new(HashMap::new()),
         base: Mutex::new(base.clone()),
         ws_peers: Mutex::new(HashMap::new()),
@@ -286,33 +303,48 @@ fn route(reg: &FixtureRegistry, method: &str, path: &str, body: &[u8]) -> Vec<u8
     if method == "GET" && p == format!("/runs/{run}") {
         return json_ok(&serde_json::json!({ "data": descriptor_json(reg) }));
     }
-    // GET /runs/:id/state — the checkpoint pointer projection.
+    // GET /runs/:id/state — the per-(role, kind) checkpoint pointer projection.
     if method == "GET" && p == format!("/runs/{run}/state") {
-        let ckpt = reg.checkpoint.lock().unwrap().clone();
-        let checkpoint = ckpt.map(|c| {
-            serde_json::json!({ "round": c.round, "hash": c.hash, "size": c.size, "cross_checked": true })
-        });
+        let checkpoints: Vec<serde_json::Value> = reg
+            .checkpoints
+            .lock()
+            .unwrap()
+            .values()
+            .map(|c| {
+                serde_json::json!({
+                    "role": c.role, "kind": c.kind, "round": c.round, "hash": c.hash,
+                    "size": c.size, "cross_checked": true
+                })
+            })
+            .collect();
         return json_ok(&serde_json::json!({
-            "data": { "phase": "round_train", "round": 0, "epoch": 0, "finished": false, "checkpoint": checkpoint }
+            "data": { "phase": "round_train", "round": 0, "epoch": 0, "finished": false, "checkpoints": checkpoints }
         }));
     }
-    // POST /runs/:id/checkpoint — record a pointer.
+    // POST /runs/:id/checkpoint — record a pointer under its (role, kind) slot.
     if method == "POST" && p == format!("/runs/{run}/checkpoint") {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+            let text = |key: &str, default: &str| {
+                v.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(default)
+                    .to_string()
+            };
             let round = v
                 .get("round")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
-            let hash = v
-                .get("hash")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
             let size = v
                 .get("size")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
-            reg.set_checkpoint(Checkpoint { round, hash, size });
+            reg.set_checkpoint(Checkpoint {
+                role: text("role", "trainer"),
+                kind: text("kind", "drain"),
+                round,
+                hash: text("hash", ""),
+                size,
+            });
         }
         return json_ok(&serde_json::json!({ "data": { "ok": true } }));
     }

@@ -34,6 +34,7 @@ async fn three_node_training_over_presigned_r2_payload_plane() {
         payload_dir: None,
         allowlist: Box::leak(base_url.clone().into_boxed_str()),
         reconcile_tick_ms: 500,
+        initial_backoff_ms: 0,
     };
     let coord = spawn_node(&mk("coordinator", true));
     let trainer_a = spawn_node(&mk("trainer-a", false));
