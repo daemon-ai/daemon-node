@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use daemon_api::{
     ApiRequest, ApiResponse, EventsPage, NodeEvent, VhcCapabilities, VhcContribution,
     VhcEligibility, VhcEvent, VhcHardwareReport, VhcLeaveMode, VhcPolicy, VhcPolicyMode,
-    VhcRunDetail, VhcRunSummary,
+    VhcRunDetail, VhcRunSummary, VhcSwitchOutcome,
 };
 
 const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-api.cddl"));
@@ -214,6 +214,14 @@ fn vhc_requests_validate() {
             },
         ),
         (
+            "VhcSwitchModule",
+            ApiRequest::VhcSwitchModule {
+                run_id: "run-1".into(),
+                upgrade_record: vec![0xa1, 0x64, 0x74, 0x65],
+                op_id: "op-7".into(),
+            },
+        ),
+        (
             "VhcSetPolicy",
             ApiRequest::VhcSetPolicy {
                 policy: policy(VhcPolicyMode::Always, None),
@@ -252,6 +260,26 @@ fn vhc_responses_validate() {
         (
             "VhcHardwareReport",
             ApiResponse::VhcHardwareReport(hardware()),
+        ),
+        (
+            "VhcSwitchOutcome(Activated)",
+            ApiResponse::VhcSwitchOutcome(VhcSwitchOutcome::Activated {
+                epoch: 1,
+                module_hash: "ab".repeat(32),
+                retries: 0,
+            }),
+        ),
+        (
+            "VhcSwitchOutcome(Refused)",
+            ApiResponse::VhcSwitchOutcome(VhcSwitchOutcome::Refused {
+                reason: "record not authorized".into(),
+            }),
+        ),
+        (
+            "VhcSwitchOutcome(Left)",
+            ApiResponse::VhcSwitchOutcome(VhcSwitchOutcome::Left {
+                reason: "migrate budget exhausted".into(),
+            }),
         ),
     ];
     for (label, resp) in cases {

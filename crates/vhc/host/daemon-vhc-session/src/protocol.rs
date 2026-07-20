@@ -252,6 +252,22 @@ impl AdmittedTuple {
     }
 }
 
+/// The live-upgrade target a pre-switch assessment evaluates (ABI §10.3): the committed
+/// transition-chain facts — the epoch the switch activates, the hash-pinned target module, and
+/// the committed record's grants anchor. Carried inside [`Command::AssessRun`] so the worker
+/// (which alone touches module bytes) can compute the post-switch admitted tuple's claim hash;
+/// every field is re-verified fail-closed by the session's own pre-fence checks regardless.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitchTarget {
+    /// The committed transition-chain epoch the switch activates (§8.1).
+    pub epoch: u64,
+    /// The hash-pinned target module for the assessed role at `epoch`.
+    pub new_module: [u8; 32],
+    /// The committed upgrade record's grants anchor — the re-derived grants document must hash
+    /// to it or the assessment refuses.
+    pub grants_hash: [u8; 32],
+}
+
 /// The classified terminal outcome of one role-instance run — the typed exit the role session
 /// produces and the worker reports verbatim ([`Event::RunTerminated`]). The node's run-instance
 /// state machine consumes the class; the reason strings are operator-facing detail, never
@@ -324,6 +340,15 @@ pub enum Command {
         /// role set is a typed refusal.
         #[serde(default)]
         role: Option<String>,
+        /// When present, assess the LIVE-UPGRADE TARGET instead of the genesis-pinned module
+        /// (ABI §10.3 pre-switch assessment): the worker resolves the target bytes by their
+        /// committed content hash, re-derives the grants document against the record's grants
+        /// anchor, runs the same claim admission funnel, and answers [`Event::Assessed`] with a
+        /// post-switch admitted tuple (its claim hash computed over the target's re-evaluated
+        /// claim — the node never touches module bytes). Additive `#[serde(default)]`; boxed
+        /// for variant-size parity.
+        #[serde(default)]
+        switch_target: Option<Box<SwitchTarget>>,
     },
     /// Join a run, then stream [`Event`]s.
     JoinRun {
@@ -899,6 +924,16 @@ mod tests {
         round_trip_command(Command::AssessRun {
             envelope: vec![1, 2, 3, 4],
             role: Some("coordinator".into()),
+            switch_target: None,
+        });
+        round_trip_command(Command::AssessRun {
+            envelope: vec![1, 2, 3, 4],
+            role: Some("trainer".into()),
+            switch_target: Some(Box::new(SwitchTarget {
+                epoch: 3,
+                new_module: [7u8; 32],
+                grants_hash: [9u8; 32],
+            })),
         });
         round_trip_command(Command::JoinRun {
             run_id: "run-42".into(),

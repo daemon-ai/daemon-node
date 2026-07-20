@@ -595,6 +595,7 @@ pub async fn start_cluster_with(
         steps_per_round: 2,
         k_absences,
         timing,
+        upgrade_authority: vec![peer_id(&upgrade_authority_key())],
     });
 
     let (registry, base_url, task) = registry::serve(&genesis, run_label, port).await;
@@ -627,6 +628,13 @@ pub fn authorize_seat(
 /// A signing helper for the malformed-cert / seat negative fixtures.
 pub fn key_from(seed: &str) -> SigningKey {
     SigningKey::from_bytes(blake3::hash(seed.as_bytes()).as_bytes())
+}
+
+/// The suite's run-level upgrade authority signing key: every acceptance genesis names its
+/// public half as the (single-key, hence unanimous) upgrade authority, so the live-switch gate
+/// can author an authorized module-upgrade record the product path validates fail-closed.
+pub fn upgrade_authority_key() -> SigningKey {
+    key_from("acceptance/upgrade-authority")
 }
 
 /// The base peer id of a node.

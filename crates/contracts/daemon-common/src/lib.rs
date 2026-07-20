@@ -775,7 +775,15 @@ impl WireVersion {
     /// GUI shows the true effective device budget on integrated/UMA boxes. A single additive DTO
     /// field (`#[serde(default)]`) + its `vhc-hardware-report` CDDL key; strict-equal
     /// `is_compatible` still holds; clients feature-detect via the `api/42` Hello feature.
-    pub const CURRENT: Self = Self(42);
+    ///
+    /// (v43) additive `VhcSwitchModule` request + `VhcSwitchOutcome` response — the
+    /// operator-driven live module-upgrade consumption op: the client submits a committed
+    /// canonical-CBOR upgrade record; the node validates it fail-closed against the run's
+    /// rebuilt transition chain and drives the local switch transaction, answering with the
+    /// typed outcome (activated / refused / left). One additive request arm + one additive
+    /// response arm + their CDDL rules; strict-equal `is_compatible` still holds; clients
+    /// feature-detect via the `api/43` Hello feature.
+    pub const CURRENT: Self = Self(43);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

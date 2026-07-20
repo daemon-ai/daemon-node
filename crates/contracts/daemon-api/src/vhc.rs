@@ -226,6 +226,37 @@ pub struct VhcRunDetail {
     pub recent_events: Vec<VhcEvent>,
 }
 
+/// The outcome of a consumed run-level module-upgrade record (wire v43): the node validated the
+/// record against the run's transition chain fail-closed and drove the local switch transaction
+/// through its worker. The three arms mirror the switch's terminal facts — activation, a
+/// pre-fence refusal with the old module untouched, or a post-fence exit that left the run.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VhcSwitchOutcome {
+    /// The new module activated locally under the target epoch — no process restart.
+    Activated {
+        /// The epoch now running locally (the record's committed target epoch).
+        epoch: u64,
+        /// Lowercase hex of the new module's blake3 now bound to the role-instance.
+        module_hash: String,
+        /// Rollback-and-retry cycles used before activation (`0` on a clean first migration).
+        retries: u32,
+    },
+    /// The switch was refused before the transaction touched the running instance (record
+    /// validation, target resolution, identity provisioning, or pre-fence admission). The old
+    /// module keeps running.
+    Refused {
+        /// Why (operator-facing detail, never branched on).
+        reason: String,
+    },
+    /// The local transaction failed closed / exhausted its retries after the fence and left the
+    /// run. The run-level record stays committed; only this node left.
+    Left {
+        /// Why (operator-facing detail, never branched on).
+        reason: String,
+    },
+}
+
 /// How a peer leaves a run (spec §10.2/§10.4). Wire mirror of the worker's `LeaveMode`.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +415,21 @@ pub trait VhcApi: Send + Sync {
     /// the run paused — and participation reconverges.
     async fn vhc_resume(&self, _run_id: String, _op_id: String) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("vhc_resume".into()))
+    }
+
+    /// Consume a committed run-level module-upgrade record and drive the live module switch
+    /// for the run's role-instance (idempotent via `op_id`). `upgrade_record` is the
+    /// canonical-CBOR authorized record; the node validates it fail-closed against the run's
+    /// rebuilt transition chain (domain, hash-link, monotone epoch, authority threshold),
+    /// provisions the post-switch identity, and drives the local transaction through its
+    /// worker. The record is never trusted as presented — validation happens node-side.
+    async fn vhc_switch_module(
+        &self,
+        _run_id: String,
+        _upgrade_record: Vec<u8>,
+        _op_id: String,
+    ) -> Result<VhcSwitchOutcome, ApiError> {
+        Err(ApiError::Unsupported("vhc_switch_module".into()))
     }
 
     /// Set the default participation policy for newly-joined runs (§10.5).

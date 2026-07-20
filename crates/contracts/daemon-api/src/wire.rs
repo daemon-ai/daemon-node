@@ -302,6 +302,17 @@ pub enum ApiRequest {
         /// The client-minted idempotency key (ADR-006).
         op_id: String,
     },
+    /// [`VhcApi::vhc_switch_module`] (wire v43).
+    VhcSwitchModule {
+        /// The run whose role-instance switches.
+        run_id: String,
+        /// The canonical-CBOR committed upgrade record (validated fail-closed node-side —
+        /// never trusted as presented).
+        #[serde(with = "serde_bytes")]
+        upgrade_record: Vec<u8>,
+        /// The client-minted idempotency key (ADR-006).
+        op_id: String,
+    },
     /// [`VhcApi::vhc_set_policy`].
     VhcSetPolicy {
         /// The new default participation policy.
@@ -1349,7 +1360,8 @@ impl ApiRequest {
             ApiRequest::VhcJoin { op_id, .. }
             | ApiRequest::VhcLeave { op_id, .. }
             | ApiRequest::VhcPause { op_id, .. }
-            | ApiRequest::VhcResume { op_id, .. } => return Some(op_id.as_str()),
+            | ApiRequest::VhcResume { op_id, .. }
+            | ApiRequest::VhcSwitchModule { op_id, .. } => return Some(op_id.as_str()),
             _ => return None,
         };
         op.as_deref()
@@ -1434,6 +1446,8 @@ pub enum ApiResponse {
     VhcRunDetail(Option<VhcRunDetail>),
     /// This node's training-capability report.
     VhcHardwareReport(VhcHardwareReport),
+    /// A consumed module-upgrade record's switch outcome (wire v43).
+    VhcSwitchOutcome(VhcSwitchOutcome),
     /// A profile listing (the active default marked).
     Profiles(Vec<ProfileInfo>),
     /// One profile's full spec, or `None` if unknown / no active default (profile_get).
@@ -2427,18 +2441,20 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v42 (the additive
-    /// `VhcHardwareReport.shared_mb` UMA-spillover mirror, Vhc P2 A1 — on top of v41's
-    /// crash-consent surface, v40's `VhcApi` surface, and v39's rungs 1+2+3, spec 09 §10.4).
-    /// Distinct from the transport-envelope [`WIRE_VERSION`] above (= 2), which the mirror rungs did
-    /// not touch. Bumping the contract version is a deliberate act — this assertion is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v43 (the additive
+    /// `VhcSwitchModule` request + `VhcSwitchOutcome` response — the operator-driven live
+    /// module-upgrade consumption op — on top of v42's `VhcHardwareReport.shared_mb`
+    /// UMA-spillover mirror, v41's crash-consent surface, and v40's `VhcApi` surface).
+    /// Distinct from the transport-envelope [`WIRE_VERSION`] above (= 2), which these additive
+    /// rungs did not touch. Bumping the contract version is a deliberate act — this assertion
+    /// is the gate.
     #[test]
-    fn contract_wire_version_is_v42() {
+    fn contract_wire_version_is_v43() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(42)
+            daemon_common::WireVersion(43)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(42));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(43));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

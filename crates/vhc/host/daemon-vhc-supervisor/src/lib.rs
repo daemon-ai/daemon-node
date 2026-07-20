@@ -204,10 +204,41 @@ impl TrainSupervisor {
         envelope: Vec<u8>,
         role: Option<String>,
     ) -> Result<Eligibility, TrainClientError> {
-        self.exchange(Command::AssessRun { envelope, role }, |ev| match ev {
-            Event::Assessed(elig) => Some(Ok(elig)),
-            _ => None,
-        })
+        self.exchange(
+            Command::AssessRun {
+                envelope,
+                role,
+                switch_target: None,
+            },
+            |ev| match ev {
+                Event::Assessed(elig) => Some(Ok(elig)),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    /// Assess a live-upgrade TARGET (ABI §10.3 pre-switch assessment): the worker resolves the
+    /// hash-pinned target module, re-derives the grants document against the committed record's
+    /// grants anchor, runs the claim admission funnel, and answers with a post-switch admitted
+    /// tuple (its claim hash computed worker-side — the node never touches module bytes).
+    pub async fn assess_switch(
+        &self,
+        envelope: Vec<u8>,
+        role: Option<String>,
+        target: protocol::SwitchTarget,
+    ) -> Result<Eligibility, TrainClientError> {
+        self.exchange(
+            Command::AssessRun {
+                envelope,
+                role,
+                switch_target: Some(Box::new(target)),
+            },
+            |ev| match ev {
+                Event::Assessed(elig) => Some(Ok(elig)),
+                _ => None,
+            },
+        )
         .await
     }
 

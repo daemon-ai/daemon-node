@@ -302,6 +302,7 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
     cut.send(&Command::AssessRun {
         envelope: genesis_wire("role-a"),
         role: None,
+        switch_target: None,
     })
     .await;
     let elig = cut
@@ -348,6 +349,7 @@ async fn command_loop_stays_responsive_across_join_leave_shutdown() {
     cut.send(&Command::AssessRun {
         envelope: genesis_wire("role-b"),
         role: None,
+        switch_target: None,
     })
     .await;
     let elig_b = cut
@@ -460,6 +462,7 @@ async fn join_refuses_when_no_identity_was_provisioned() {
     cut.send(&Command::AssessRun {
         envelope: genesis_wire("role-unprovisioned"),
         role: None,
+        switch_target: None,
     })
     .await;
     let elig = cut

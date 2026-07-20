@@ -339,6 +339,7 @@ async fn switch_reissues_identity_and_continues_the_durable_journal() {
     cut.send(&Command::AssessRun {
         envelope: genesis_wire(run_label),
         role: None,
+        switch_target: None,
     })
     .await;
     let elig = cut
