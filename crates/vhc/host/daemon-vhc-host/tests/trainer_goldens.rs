@@ -54,6 +54,11 @@ use daemon_vhc_host::run::{
     RunEnd, RunIdentity,
 };
 use daemon_vhc_host::{EngineConfig, Worker};
+use daemon_vhc_proto::det_state::{
+    derive_state_chunk_size, DetStateManifest, FamilyEntry, LayoutBinding,
+    DET_STATE_MANIFEST_FORMAT, MASTER_FAMILY,
+};
+use daemon_vhc_proto::genesis::{StateContract, StateInit};
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId, Seed};
 use daemon_vhc_sdk_consensus::messages::{
@@ -135,8 +140,12 @@ struct Goldens {
     payloads: Vec<Vec<u8>>,
     /// Per-round post-ingest det digests (the equality-class oracle).
     digests: Vec<[u8; 16]>,
-    /// The guest config bytes the goldens were captured with (model + profile + init).
+    /// The guest config bytes (model + profile + the genesis state contract).
     cfg_bytes: Vec<u8>,
+    /// The run-pinned `state_chunk_size` (the fold-walk window size).
+    state_chunk_size: u64,
+    /// What the embedder serves for the artifact-form init boot.
+    serve: ServeCtx,
 }
 
 fn load_goldens() -> Goldens {
@@ -195,7 +204,13 @@ fn load_goldens() -> Goldens {
     assert_eq!(trained.len() as u64, ROUNDS);
     assert_eq!(payloads.len() as u64, ROUNDS);
     assert_eq!(digests.len() as u64, ROUNDS);
-    let cfg_bytes = guest_cfg_bytes(&j, &init);
+    // The fold-walk window / state chunk size is derived from the profile compression chunk
+    // (§3.2): the largest multiple of `chunk × 4` ≤ ~4 MiB — for this tiny geometry that is far
+    // larger than any parameter, so every family is one window (the degenerate tier, §10.2).
+    let profile_chunk = j["profile_cfg"]["chunk"].as_u64().expect("profile chunk");
+    let state_chunk_size = derive_state_chunk_size(profile_chunk);
+    let serve = init_artifact(&init, state_chunk_size);
+    let cfg_bytes = guest_cfg_bytes(&j, state_chunk_size, serve.manifest_hash);
     Goldens {
         numels,
         names,
@@ -203,13 +218,72 @@ fn load_goldens() -> Goldens {
         payloads,
         digests,
         cfg_bytes,
+        state_chunk_size,
+        serve,
     }
 }
 
-/// Rebuild the exact guest config (canonical CBOR) from the recorded literals + matched init — the
-/// trainer `GuestCfg` map. The model/profile sub-maps are handed through verbatim from `expected.json`.
-fn guest_cfg_bytes(j: &serde_json::Value, init: &[Vec<f32>]) -> Vec<u8> {
-    let flat: Vec<f32> = init.iter().flatten().copied().collect();
+/// What the embedder must serve for the streamed guest's artifact-form init boot: the pinned
+/// det-state manifest (fetched whole) and the master family fold (fetched length-aware, ranges
+/// sliced from the flat init image). The trainer goldens migrate their explicit init to the
+/// artifact form with byte-identical values (design §6.4), so the pinned digests survive.
+#[derive(Clone)]
+struct ServeCtx {
+    /// blake3 of the init manifest (a granted plain artifact).
+    manifest_hash: [u8; 32],
+    /// The canonical-CBOR init manifest bytes.
+    manifest_bytes: Vec<u8>,
+    /// The master family fold (a granted, length-aware-registered artifact).
+    master_fold: [u8; 32],
+    /// The flat f32-le init image the master fold's ranges slice from.
+    init_flat: Vec<u8>,
+}
+
+/// Author the artifact-form init from the matched init at `chunk_size`: the master det-state
+/// manifest + its fold, and the flat image the ranges serve from. `manifest_hash` is the init pin.
+fn init_artifact(init: &[Vec<f32>], chunk_size: u64) -> ServeCtx {
+    let param_bytes: Vec<Vec<u8>> = init
+        .iter()
+        .map(|p| {
+            let mut b = Vec::with_capacity(p.len() * 4);
+            for v in p {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b
+        })
+        .collect();
+    let views: Vec<&[u8]> = param_bytes.iter().map(Vec::as_slice).collect();
+    let master = FamilyEntry::author(&views, chunk_size).expect("author master family");
+    let numels_u64: Vec<u64> = init.iter().map(|p| p.len() as u64).collect();
+    let manifest = DetStateManifest {
+        format: DET_STATE_MANIFEST_FORMAT,
+        run_id: Hash([0x67; 32]),
+        round: 0,
+        layout: LayoutBinding::of_numels(&numels_u64).expect("layout binding"),
+        chunk_size,
+        families: [(MASTER_FAMILY.to_string(), master.clone())]
+            .into_iter()
+            .collect(),
+    };
+    let manifest_bytes = manifest.to_canonical_bytes().expect("manifest cbor");
+    ServeCtx {
+        manifest_hash: blake3_hash(&manifest_bytes).0,
+        manifest_bytes,
+        master_fold: master.fold.0,
+        init_flat: param_bytes.concat(),
+    }
+}
+
+/// Rebuild the exact guest config (canonical CBOR) — the trainer `GuestCfg` map. Init is now the
+/// genesis **state contract** (chunk_size + artifact-form init pin) rather than inline f32s; the
+/// model/profile sub-maps are handed through verbatim from `expected.json`.
+fn guest_cfg_bytes(j: &serde_json::Value, chunk_size: u64, manifest_hash: [u8; 32]) -> Vec<u8> {
+    let contract = StateContract {
+        chunk_size,
+        init: StateInit::Manifest {
+            manifest: Hash(manifest_hash),
+        },
+    };
     let map = Value::Map(vec![
         (Value::Text("model".into()), json_to_cbor(&j["model_cfg"])),
         (Value::Text("peer".into()), Value::Bytes(PEER.to_vec())),
@@ -228,8 +302,8 @@ fn guest_cfg_bytes(j: &serde_json::Value, init: &[Vec<f32>]) -> Vec<u8> {
             json_to_cbor(&j["profile_cfg"]),
         ),
         (
-            Value::Text("init".into()),
-            Value::serialized(&flat).expect("init"),
+            Value::Text("state".into()),
+            Value::serialized(&contract).expect("state contract"),
         ),
     ]);
     to_canonical_vec(&map).expect("guest cfg")
@@ -322,10 +396,10 @@ fn decode_publish(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
     Some((uint(0)?, uint(1)?, bytes))
 }
 
-fn wait_published(pump: &daemon_vhc_host::run::PumpHandle, n: usize) {
+fn wait_published(pump: &daemon_vhc_host::run::PumpHandle, n: usize, serve: &ServeCtx) {
     let deadline = Instant::now() + Duration::from_secs(180);
     while pump.published().len() < n {
-        service_puts(pump);
+        service_ops(pump, serve);
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {n} publishes (have {}); logs: {:?}",
@@ -334,21 +408,56 @@ fn wait_published(pump: &daemon_vhc_host::run::PumpHandle, n: usize) {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    service_puts(pump);
+    service_ops(pump, serve);
 }
 
-/// The async-runtime seat's minimal duty here: the trainer `payload_put`s its sealed committed
-/// container each round (the B1 discipline); this harness compares against RECORDED payloads, so
-/// the put is acknowledged and its bytes dropped.
-fn service_puts(pump: &daemon_vhc_host::run::PumpHandle) {
+/// The embedder seat's duties: acknowledge the trainer's own committed-payload `payload_put`
+/// (compared against RECORDED payloads, so the bytes are dropped), and serve the artifact-form
+/// init boot — the pinned manifest whole, and the master fold's ranges sliced length-aware from
+/// the flat init image (the guest's self-sealed master/ef folds are serviced host-locally, so
+/// they never surface here).
+fn service_ops(pump: &daemon_vhc_host::run::PumpHandle, serve: &ServeCtx) {
     for (op, request) in pump.take_op_requests() {
         match request {
             OpRequest::PayloadPut { .. } => {
                 pump.complete_op(op, OpOutcome::PutDone).expect("put done");
             }
+            OpRequest::ArtifactFetch { hash, .. } if hash == serve.manifest_hash => {
+                pump.complete_op(
+                    op,
+                    OpOutcome::FetchDone {
+                        artifact: serve.manifest_bytes.clone(),
+                    },
+                )
+                .expect("manifest fetch done");
+            }
+            OpRequest::ArtifactRange {
+                hash,
+                span_off,
+                span_len,
+                ..
+            } if hash == serve.master_fold => {
+                let (s, e) = (span_off as usize, (span_off + span_len) as usize);
+                pump.complete_op(
+                    op,
+                    OpOutcome::RangeDone {
+                        bytes: serve.init_flat[s..e].to_vec(),
+                    },
+                )
+                .expect("init range done");
+            }
             other => panic!("unexpected op request from the trainer guest: {other:?}"),
         }
     }
+}
+
+/// Provision the state plane on a run config: the run-pinned `state_chunk_size` and the grants for
+/// the artifact-form init (the manifest + the master fold). Grant bounds stay unbounded (`0`) —
+/// the harness is not the budget gate; only the geometry + grant membership matter.
+fn provision_state_plane(run_cfg: &mut RunConfig, g: &Goldens) {
+    run_cfg.state_chunk_size = g.state_chunk_size;
+    run_cfg.granted_artifacts.insert(g.serve.manifest_hash);
+    run_cfg.granted_artifacts.insert(g.serve.master_fold);
 }
 
 // -- driving the trainer -------------------------------------------------------------------------
@@ -404,8 +513,8 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
     assert_eq!(sel.driver, daemon_vhc_abi::CandidateDriver::V2);
     assert_eq!(
         (sel.major, sel.minor),
-        (2, daemon_vhc_abi::COMPUTE_MINOR_V2),
-        "the trainer guest is a compute@2 module"
+        (2, daemon_vhc_abi::STATE_MINOR_V2),
+        "the streamed trainer imports the det-state write surface (minor 3)"
     );
 
     let identity = RunIdentity {
@@ -417,6 +526,7 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
     };
     let mut run_cfg = RunConfig::new(identity, [0x9d; 32], g.cfg_bytes.clone(), Vec::new());
     run_cfg.compute_queue_depth = 1 << 20;
+    provision_state_plane(&mut run_cfg, g);
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, run_cfg, Box::new(sink)).expect("start");
     let pump = run.pump.clone();
@@ -438,7 +548,7 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
                 .expect("stage batch");
         }
         deliver(&round_open(round), &mut seq);
-        wait_published(&pump, (round as usize) * 3 + 2); // + theta + commitment
+        wait_published(&pump, (round as usize) * 3 + 2, &g.serve); // + theta + commitment
 
         // Barrier: feed the RECORDED golden payload (the trainer's own committed set), then the
         // single-peer record.
@@ -446,7 +556,7 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
         pump.stage_payload(update_wrapper(round, &bytes), None)
             .expect("stage update");
         deliver(&round_record(round, &bytes), &mut seq);
-        wait_published(&pump, (round as usize) * 3 + 3); // + digest
+        wait_published(&pump, (round as usize) * 3 + 3, &g.serve); // + digest
     }
 
     pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
@@ -658,6 +768,7 @@ fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
     };
     let mut run_cfg = RunConfig::new(identity, [0x9e; 32], g.cfg_bytes.clone(), Vec::new());
     run_cfg.compute_queue_depth = 1 << 20;
+    provision_state_plane(&mut run_cfg, g);
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, run_cfg, Box::new(sink)).expect("start");
     let pump = run.pump.clone();
@@ -679,7 +790,7 @@ fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
             .expect("stage batch");
     }
     deliver(&round_open(0), &mut seq);
-    wait_published(&pump, 2); // theta(0) + commitment(0)
+    wait_published(&pump, 2, &g.serve); // theta(0) + commitment(0)
 
     // The record arrives while the committed payload is NOT yet fetchable → straggle (the trainer
     // guest publishes nothing on a straggle heartbeat, so there is no publish to await here).
@@ -695,13 +806,13 @@ fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
             .expect("stage batch");
     }
     deliver(&round_open(1), &mut seq);
-    wait_published(&pump, 4); // theta(1) + commitment(1)
+    wait_published(&pump, 4, &g.serve); // theta(1) + commitment(1)
 
     // Barrier 1, normal path → the final (round 1) digest.
     pump.stage_payload(update_wrapper(1, &g.payloads[1]), None)
         .expect("stage update 1");
     deliver(&round_record(1, &g.payloads[1]), &mut seq);
-    wait_published(&pump, 5); // digest(1)
+    wait_published(&pump, 5, &g.serve); // digest(1)
 
     pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
         .expect("stop");
@@ -815,6 +926,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
         Vec::new(),
     );
     run_cfg.compute_queue_depth = 1 << 20;
+    provision_state_plane(&mut run_cfg, &g);
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink)).expect("start");
     let pump = run.pump.clone();
@@ -835,11 +947,11 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
             .expect("stage batch");
     }
     deliver(&pump, &round_open(0), &mut seq);
-    wait_published(&pump, 2); // theta(0) + commitment(0)
+    wait_published(&pump, 2, &g.serve); // theta(0) + commitment(0)
     pump.stage_payload(update_wrapper(0, &g.payloads[0]), None)
         .expect("stage update 0");
     deliver(&pump, &round_record(0, &g.payloads[0]), &mut seq);
-    wait_published(&pump, 3); // digest(0)
+    wait_published(&pump, 3, &g.serve); // digest(0)
 
     // -- quiesce: the §10.2 producing protocol snapshots the typed manifest -----------------------
     pump.quiesce(daemon_vhc_abi::QUIESCE_REASON_UPGRADE, 60_000)
@@ -891,6 +1003,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
     };
     let mut run_cfg2 = RunConfig::new(identity2, [0xa0; 32], g.cfg_bytes.clone(), Vec::new());
     run_cfg2.compute_queue_depth = 1 << 20;
+    provision_state_plane(&mut run_cfg2, &g);
     let sink2 = Arc::new(Mutex::new(MemorySink::new()));
     let run2 = start_run_migrating(
         &worker,
@@ -913,7 +1026,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
             .expect("stage batch");
     }
     deliver(&pump2, &round_open(1), &mut seq2);
-    wait_published(&pump2, 2); // theta(1) + commitment(1)
+    wait_published(&pump2, 2, &g.serve); // theta(1) + commitment(1)
 
     // The ef-restore pin: round 1's committed payload is a function of (theta, round_base, ef);
     // master/round_base continuity alone would still digest-match after ingesting the RECORDED
@@ -929,7 +1042,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
         .stage_payload(update_wrapper(1, &g.payloads[1]), None)
         .expect("stage update 1");
     deliver(&pump2, &round_record(1, &g.payloads[1]), &mut seq2);
-    wait_published(&pump2, 3); // digest(1)
+    wait_published(&pump2, 3, &g.serve); // digest(1)
 
     pump2
         .stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)

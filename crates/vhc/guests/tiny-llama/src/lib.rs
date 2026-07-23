@@ -187,6 +187,11 @@ struct Core {
     master_fold: [u8; 32],
     /// The in-flight streamed ingest walk (one at a time; the barrier serializes on its seal).
     ingest_walk: Option<IngestWalkState>,
+    /// Whether the next kicked-off ingest voices its digest at seal. A `RoundRecord`-triggered
+    /// (or resume-triggered) ingest voices; a catch-up ingest kicked off inside `on_round_open`
+    /// folds SILENTLY (the digest is implicit in the folded state) — the original guest dropped
+    /// `on_round_open`'s outbounds and voiced only from the record handler.
+    ingest_voices: bool,
     /// Host-staged batches, FIFO in training order.
     batches: VecDeque<BatchItem>,
     /// Accumulated micro-batch gradients of the current inner step (summed in arrival order,
@@ -212,6 +217,9 @@ struct IngestWalkState {
     base_fold: [u8; 32],
     /// Outstanding round-base fetches: `data@2` op → window ordinal.
     ops: BTreeMap<u64, u64>,
+    /// Whether this walk's digest is voiced at seal (record-triggered) or folds silently
+    /// (a catch-up ingest kicked off inside `on_round_open`).
+    voice: bool,
     /// Scratch for the f32→le state-emit seam.
     byte_buf: Vec<u8>,
 }
@@ -307,12 +315,14 @@ impl RoundExperiment<Vec<u8>> for C3Round {
             let op = daemon_vhc_sdk::data_fetch(&base_fold, off, w.len);
             ops.insert(op, w.ordinal);
         }
+        let voice = core.ingest_voices;
         core.ingest_walk = Some(IngestWalkState {
             round,
             walk,
             stream,
             base_fold,
             ops,
+            voice,
             byte_buf: Vec::new(),
         });
         IngestOutcome::Deferred
@@ -354,8 +364,9 @@ impl GuestModule for TinyLlama {
         ModuleDecl {
             name: "tiny-llama",
             version: env!("CARGO_PKG_VERSION"),
-            // compute@2 imports force the Phase-C minor (ABI §1.3 step 5).
-            abi_minor: 2,
+            // The det-state write surface (state_open/emit/seal) + register_state_chunks force
+            // the minor-3 declaration (ABI §1.3 step 5; the highest introducing minor imported).
+            abi_minor: 3,
             channels: vec![0],
             // Guest-side det-lane state (masters + bases + ef) + decode scratch; device holds
             // the working weights + AdamW moments + activations.
@@ -853,22 +864,47 @@ fn dispatch_record(
     emit_round_outbounds(wire, &out);
 }
 
-/// Start a harness-mode round: run the barrier's train+commit (the `Commit` outbound is dropped —
-/// the real profile update runs on the export completions) and open the round's θ export walk.
-fn start_harness_round(
+/// Open a harness-mode round, honoring the async fold serialization. If an ingest is mid-flight
+/// (round r's sealed master is round r+1's round base), the round waits in `deferred_open` until
+/// the fold seals. Otherwise the barrier runs `on_round_open` — which may itself kick off a
+/// deferred CATCH-UP ingest (a straggled earlier round whose payload just became fetchable), in
+/// which case training is deferred behind that fold too. Only a round that actually trained (a
+/// `Commit` outbound) opens its θ export walk; a genuinely stalled round trains nothing.
+fn try_open_round(
+    core: &Rc<RefCell<Core>>,
     driver: &mut BarrierRound<C3Round>,
     payloads: &mut PayloadMap,
     numels: &[usize],
-    ro: &RoundOpen,
+    ro: RoundOpen,
     export: &mut Option<ExportState>,
+    deferred_open: &mut Option<RoundOpen>,
 ) {
-    let _out = driver.on_round_open(ro, payloads);
-    *export = Some(ExportState {
-        round: ro.round,
-        collected: vec![None; numels.len()],
-        ops: BTreeMap::new(),
-    });
-    fence(ro.round + 1); // the round-final fence the walk waits for
+    if driver.ingest_in_flight() {
+        *deferred_open = Some(ro);
+        return;
+    }
+    // A catch-up ingest kicked off inside `on_round_open` folds SILENTLY (its digest is implicit
+    // in the folded state — the record handler is the only digest voice).
+    core.borrow_mut().ingest_voices = false;
+    let out = driver.on_round_open(&ro, payloads);
+    // Record-triggered ingests (and finish_ingest resumes) voice again after this open.
+    core.borrow_mut().ingest_voices = true;
+    emit_round_outbounds(false, &out);
+    if driver.ingest_in_flight() {
+        // `on_round_open` kicked off a catch-up ingest; this round's training waits for its seal.
+        *deferred_open = Some(ro);
+    } else if out
+        .iter()
+        .any(|o| matches!(o, daemon_vhc_sdk_rounds::Outbound::Commit { .. }))
+    {
+        *export = Some(ExportState {
+            round: ro.round,
+            collected: vec![None; numels.len()],
+            ops: BTreeMap::new(),
+        });
+        fence(ro.round + 1); // the round-final fence the walk waits for
+    }
+    // else: a genuinely stalled round (payload not yet fetchable) — no training, no export.
 }
 
 /// Per-parameter byte base offsets into the flat family image (prefix sums of `numel × 4`).
@@ -1000,22 +1036,38 @@ fn drive_boot_completion(
     true
 }
 
-/// Drive one completion against the in-flight streamed ingest walk; returns `true` if it was
-/// consumed. Folds the maximal contiguous run now available (each fold `state_emit`s its master
-/// window and advances the carry, and — this commit — mirrors the value into the resident master
-/// for the still-resident `make_update`/upload/checkpoint), refills the read window, and at seal
-/// closes the fold, uploads the new master, and voices the round digest via `finish_ingest`.
+/// The outcome of routing a completion to the in-flight ingest walk.
+enum IngestStep {
+    /// The op is not an ingest-walk window read (route it elsewhere).
+    NotMine,
+    /// A window folded (or a read was issued); the walk continues.
+    Progressed,
+    /// The final slice sealed the fold: the new master fold is durable, the master is uploaded,
+    /// and the round's digest is ready — the caller voices it via `finish_ingest`.
+    Sealed {
+        /// The ingested round.
+        round: u64,
+        /// The post-ingest det digest (the carry finalize).
+        digest: [u8; 16],
+        /// Whether this round's digest is voiced (record-triggered) or folds silently (catch-up
+        /// inside `on_round_open`).
+        voice: bool,
+    },
+}
+
+/// Drive one completion against the in-flight streamed ingest walk. Folds the maximal contiguous
+/// run now available (each fold `state_emit`s its master window and advances the carry, and — this
+/// commit — mirrors the value into the resident master for the still-resident
+/// `make_update`/upload/checkpoint), refills the read window, and at seal closes the fold, uploads
+/// the new master, and advances the round base. The caller finishes the barrier + digest voice.
 fn drive_ingest_completion(
     core: &Rc<RefCell<Core>>,
-    driver: &mut BarrierRound<C3Round>,
-    payloads: &mut PayloadMap,
-    wire: bool,
     ev: &daemon_vhc_sdk::Event,
     op: u64,
-) -> bool {
+) -> IngestStep {
     match core.borrow().ingest_walk.as_ref() {
         Some(w) if w.ops.contains_key(&op) => {}
-        _ => return false,
+        _ => return IngestStep::NotMine,
     }
     let bytes = completion_bytes(ev).expect("round-base window fetch completes (fail loud)");
     let vals = le_bytes_to_f32s(&bytes).expect("round-base window is an f32-le image");
@@ -1050,13 +1102,14 @@ fn drive_ingest_completion(
         sealed = slice.sealed;
     }
     if !sealed {
-        return true;
+        return IngestStep::Progressed;
     }
     // The sealing slice: close the fold, finalize the carry, upload the new master, advance the
-    // round base, and voice the digest (which resumes the barrier queue).
+    // round base.
     let mut core_mut = core.borrow_mut();
     let state = core_mut.ingest_walk.take().expect("the sealed walk");
     let round = state.round;
+    let voice = state.voice;
     let fold = daemon_vhc_sdk::state_seal(state.stream);
     let digest = *state
         .walk
@@ -1068,10 +1121,11 @@ fn drive_ingest_completion(
     let flat = core_mut.master.clone();
     core_mut.model.set_params_from_flat(&flat);
     core_mut.round_base = flat;
-    drop(core_mut);
-    let out = driver.finish_ingest(round, digest, payloads);
-    emit_round_outbounds(wire, &out);
-    true
+    IngestStep::Sealed {
+        round,
+        digest,
+        voice,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1157,6 +1211,7 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
         window_size,
         master_fold,
         ingest_walk: None,
+        ingest_voices: true,
         batches: VecDeque::new(),
         pending_grads: None,
         next_step_fence: 0,
@@ -1317,7 +1372,15 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                             deferred_open = Some(ro);
                             continue;
                         }
-                        start_harness_round(&mut driver, &mut payloads, &numels, &ro, &mut export);
+                        try_open_round(
+                            &core,
+                            &mut driver,
+                            &mut payloads,
+                            &numels,
+                            ro,
+                            &mut export,
+                            &mut deferred_open,
+                        );
                     }
                     VhcMessage::RoundRecord(rr) => {
                         let entries: Vec<RecordEntry> = rr.inline.clone().unwrap_or_default();
@@ -1381,29 +1444,53 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                             booted = true;
                             boot = None;
                             if let Some(ro) = deferred_open.take() {
-                                start_harness_round(
+                                try_open_round(
+                                    &core,
                                     &mut driver,
                                     &mut payloads,
                                     &numels,
-                                    &ro,
+                                    ro,
                                     &mut export,
+                                    &mut deferred_open,
                                 );
                             }
                         }
                         continue;
                     }
                 }
-                // The in-flight streamed ingest walk's round-base window reads (the digest voices
-                // at seal via finish_ingest).
-                if drive_ingest_completion(
-                    &core,
-                    &mut driver,
-                    &mut payloads,
-                    live.is_some(),
-                    &ev,
-                    op,
-                ) {
-                    continue;
+                // The in-flight streamed ingest walk's round-base window reads. At seal, voice the
+                // round digest (finish_ingest) and — now that the fold is durable and the master
+                // uploaded — retry any round whose training was waiting behind it (catch-up).
+                match drive_ingest_completion(&core, &ev, op) {
+                    IngestStep::NotMine => {}
+                    IngestStep::Progressed => continue,
+                    IngestStep::Sealed {
+                        round,
+                        digest,
+                        voice,
+                    } => {
+                        let out = driver.finish_ingest(round, digest, &mut payloads);
+                        // A catch-up ingest kicked off inside `on_round_open` folds silently; only
+                        // a record-triggered ingest voices its digest (matches the resident guest,
+                        // which dropped `on_round_open`'s outbounds).
+                        if voice {
+                            emit_round_outbounds(live.is_some(), &out);
+                        }
+                        if !driver.ingest_in_flight() {
+                            if let Some(ro) = deferred_open.take() {
+                                try_open_round(
+                                    &core,
+                                    &mut driver,
+                                    &mut payloads,
+                                    &numels,
+                                    ro,
+                                    &mut export,
+                                    &mut deferred_open,
+                                );
+                            }
+                        }
+                        continue;
+                    }
                 }
                 // Live-mode completion routing first: the manifest fetch, a pending open's
                 // corpus segments, a pending record's committed payloads, a durable payload put.
