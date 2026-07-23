@@ -1330,6 +1330,11 @@ pub(crate) fn role_binding(
     run.claim_bytes = admission.claim_bytes.clone();
     run.manifest_bytes = admission.manifest_bytes.clone();
     admission.apply_quotas(&mut run);
+    // Provision the state plane from the genesis state contract (§6.3): the run-pinned
+    // `state_chunk_size` the streamed det-lane fold runs under (`None` = no host-side state).
+    if let Some(sc) = &genesis.env.state_contract {
+        run.state_chunk_size = sc.chunk_size;
+    }
 
     // Inbound trust: the base identities the genesis names — never ambient config.
     let trusted_bases = daemon_vhc_session::identity::TrustedBases::from_genesis(&genesis.env)

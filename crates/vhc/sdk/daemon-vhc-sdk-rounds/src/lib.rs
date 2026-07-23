@@ -78,6 +78,26 @@ pub struct StepCtx {
     pub mb_count: u32,
 }
 
+/// The outcome of a barrier ingest ([`RoundExperiment::begin_ingest`]): the det-lane digest
+/// **now**, or **deferred** to an asynchronous fold the experiment drives itself.
+///
+/// The streaming det-lane fold (ABI §12.14) reads round-base windows and emits master windows
+/// through completion-driven ABI ops, so its digest is not knowable inside the synchronous barrier
+/// call — the experiment kicks off its walk here and voices the digest when the walk seals, at
+/// which point the driver is told via [`BarrierRound::finish_ingest`]. A synchronous experiment
+/// (the resident SDK oracle, toy profiles, the in-guest coordinator, native tests) never returns
+/// `Deferred`: the default [`RoundExperiment::begin_ingest`] wraps the synchronous
+/// [`RoundExperiment::ingest`] as `Ready`, so those implementors are entirely unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// The digest is available synchronously (the resident/immediate fold).
+    Ready([u8; 16]),
+    /// The fold is asynchronous; the experiment will voice the digest and call
+    /// [`BarrierRound::finish_ingest`] when it seals. The barrier serializes: it starts no further
+    /// ingest until this one finishes (round r's sealed master IS round r+1's round base).
+    Deferred,
+}
+
 /// The surviving `Experiment` trait (refactor §5 A2: "`Experiment` survives as
 /// `RoundExperiment`"): the four math points the barrier choreography calls. How the math happens
 /// is the implementor's business — a guest drives the `tabi@1` bridge / `compute@2`; a native
@@ -90,8 +110,19 @@ pub trait RoundExperiment<P = Vec<u8>> {
     /// Seal this round's outer update as opaque payload bytes.
     fn make_update(&mut self, round: RoundId) -> Vec<u8>;
     /// The barrier ingest of the authority-verified, record-ordered committed set → the det-lane
-    /// digest.
+    /// digest. The synchronous contract: implementors that fold in place return the digest here.
     fn ingest(&mut self, round: RoundId, committed: &Committed<P>) -> [u8; 16];
+
+    /// Begin the barrier ingest, returning the digest now ([`IngestOutcome::Ready`]) or deferring
+    /// it to an asynchronous fold ([`IngestOutcome::Deferred`]) the experiment drives itself.
+    ///
+    /// The default is fully synchronous — it wraps [`RoundExperiment::ingest`] as `Ready` — so
+    /// every existing implementor keeps its contract with zero change. Only the streaming det-lane
+    /// guest overrides this to kick off its fold-walk and return `Deferred`; it then calls
+    /// [`BarrierRound::finish_ingest`] with the sealed digest.
+    fn begin_ingest(&mut self, round: RoundId, committed: &Committed<P>) -> IngestOutcome {
+        IngestOutcome::Ready(self.ingest(round, committed))
+    }
 }
 
 /// Static per-epoch configuration (the engine's `EngineConfig` subset the round logic consumes).
@@ -161,7 +192,19 @@ pub struct BarrierRound<E, P = Vec<u8>> {
     stalled_rounds: u32,
     /// Resync watermark: rounds at/below never re-ingest (a double outer-step would diverge).
     last_ingested: Option<RoundId>,
+    /// An asynchronous ingest in flight ([`IngestOutcome::Deferred`]): the barrier starts no
+    /// further ingest until [`BarrierRound::finish_ingest`] clears it (round r's sealed master IS
+    /// round r+1's round base — the folds strictly serialize).
+    deferred: Option<DeferredIngest>,
     _payload: std::marker::PhantomData<P>,
+}
+
+/// A deferred (asynchronous) ingest awaiting its walk's seal: the round being folded and whether
+/// it was ingested on its own record's arrival (`RoundComplete`) or as a catch-up (`CaughtUp`).
+#[derive(Debug, Clone, Copy)]
+struct DeferredIngest {
+    round: RoundId,
+    on_time: bool,
 }
 
 impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
@@ -174,6 +217,7 @@ impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
             straggling: false,
             stalled_rounds: 0,
             last_ingested: None,
+            deferred: None,
             _payload: std::marker::PhantomData,
         }
     }
@@ -304,18 +348,41 @@ impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
         out: &mut Vec<Outbound>,
     ) {
         let authorized = Authorized::from_authoritative_channel(DEFAULT_RECORDS_CHANNEL);
-        while let Some(round) = self.pending.keys().next().copied() {
+        // An in-flight deferred ingest blocks the queue: round r's sealed master IS round r+1's
+        // round base, so the folds strictly serialize (the loop condition, not just `break`, so a
+        // record arriving mid-fold enqueues without starting a second walk).
+        while self.deferred.is_none() {
+            let Some(round) = self.pending.keys().next().copied() else {
+                break;
+            };
             let entries = self.pending[&round].clone();
             match Committed::mint(&authorized, round, &entries, source) {
                 Ok(committed) => {
-                    let digest = self.experiment.ingest(round, &committed);
-                    self.last_ingested = Some(round);
-                    self.pending.remove(&round);
                     let on_time = !self.straggling && trigger == Some(round);
-                    if on_time {
-                        out.push(Outbound::RoundComplete { round, digest });
-                    } else {
-                        out.push(Outbound::CaughtUp { round, digest });
+                    match self.experiment.begin_ingest(round, &committed) {
+                        IngestOutcome::Ready(digest) => {
+                            self.last_ingested = Some(round);
+                            self.pending.remove(&round);
+                            if on_time {
+                                out.push(Outbound::RoundComplete { round, digest });
+                            } else {
+                                out.push(Outbound::CaughtUp { round, digest });
+                            }
+                        }
+                        IngestOutcome::Deferred => {
+                            // The experiment kicked off its async fold. Take the round out of the
+                            // queue (it IS being ingested) and record it as in-flight; the loop
+                            // condition now blocks further ingest until `finish_ingest`. Advance
+                            // the resync watermark NOW, at acceptance — not at seal: a duplicate
+                            // record arriving mid-fold must be dropped (`rr.round <= last_ingested`
+                            // in `on_round_record`), else it re-queues behind the deferred fold and
+                            // re-ingests when the queue resumes (a double outer-step + a second
+                            // digest voice). In-flight folds are never checkpointed, so this never
+                            // over-advances a restore watermark.
+                            self.pending.remove(&round);
+                            self.last_ingested = Some(round);
+                            self.deferred = Some(DeferredIngest { round, on_time });
+                        }
                     }
                 }
                 Err(MintError::Missing { .. }) => break, // head unfetchable — stall (ladder)
@@ -329,10 +396,50 @@ impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
                 }
             }
         }
-        if self.pending.is_empty() {
+        // Straggle state clears only when nothing is queued AND nothing is mid-fold.
+        if self.pending.is_empty() && self.deferred.is_none() {
             self.straggling = false;
             self.stalled_rounds = 0;
         }
+    }
+
+    /// Whether an asynchronous ingest is mid-fold (the barrier is serializing on its seal).
+    #[must_use]
+    pub fn ingest_in_flight(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    /// Complete the in-flight deferred ingest ([`IngestOutcome::Deferred`]): the experiment's
+    /// fold-walk sealed and produced `digest`. Advances the resync watermark, voices the round's
+    /// digest (`RoundComplete` if it was ingested on its own record's arrival, else `CaughtUp`),
+    /// and resumes the barrier queue — starting the next pending round's ingest, which was blocked
+    /// while this fold was in flight.
+    ///
+    /// `round` MUST match the in-flight ingest (the caller drives exactly one walk at a time); a
+    /// mismatch or a call with nothing in flight yields no outbounds (a defensive no-op).
+    pub fn finish_ingest(
+        &mut self,
+        round: RoundId,
+        digest: [u8; 16],
+        source: &mut impl PayloadSource<P>,
+    ) -> Vec<Outbound> {
+        let mut out = Vec::new();
+        let Some(deferred) = self.deferred else {
+            return out;
+        };
+        if deferred.round != round {
+            return out;
+        }
+        self.deferred = None;
+        self.last_ingested = Some(round);
+        if deferred.on_time {
+            out.push(Outbound::RoundComplete { round, digest });
+        } else {
+            out.push(Outbound::CaughtUp { round, digest });
+        }
+        // Resume: a round queued while this fold ran late-ingests now (trigger None ⇒ CaughtUp).
+        self.advance(None, source, &mut out);
+        out
     }
 }
 

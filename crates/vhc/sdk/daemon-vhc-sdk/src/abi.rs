@@ -31,6 +31,13 @@ extern "C" {
     fn abi_buffer_release(buffer: u64);
     #[link_name = "cancel"]
     fn abi_cancel(op: u64) -> u32;
+    // -- minor 3: the det-state write surface (ABI §12.14 [SF-4]) ------------------------------
+    #[link_name = "state_open"]
+    fn abi_state_open(tag_ptr: u32, tag_len: u32, byte_len: u64) -> u64;
+    #[link_name = "state_emit"]
+    fn abi_state_emit(stream: u64, ptr: u32, len: u32) -> u64;
+    #[link_name = "state_seal"]
+    fn abi_state_seal(stream: u64, out_ptr: u32) -> u32;
 }
 
 #[link(wasm_import_module = "net@2")]
@@ -60,6 +67,9 @@ extern "C" {
     // -- minor 2: chunk-map registration (the chunk-addressed corpus contract) ------------------
     #[link_name = "register_chunks"]
     fn abi_data_register_chunks(desc_ptr: u32, desc_len: u32) -> u32;
+    // -- minor 3: det-state fold registration ([SF-R2]) -----------------------------------------
+    #[link_name = "register_state_chunks"]
+    fn abi_data_register_state_chunks(desc_ptr: u32, desc_len: u32) -> u32;
 }
 
 #[link(wasm_import_module = "compute@2")]
@@ -332,6 +342,23 @@ pub fn read_buffer(buffer: u64) -> Vec<u8> {
     out
 }
 
+/// Read a byte range `[offset, offset+len)` of a sealed buffer into guest memory (the ranged
+/// linear-memory IN path, [SF-R3]): the same `read_into` import [`read_buffer`] uses, with an
+/// explicit offset so a fold window can pull one (peer, parameter) payload-section slice or one
+/// device-export θ window WITHOUT materializing the whole buffer. Returns the bytes actually
+/// delivered (`≤ len`; the host clamps at the sealed end). Charged against the per-slice readback
+/// allowance like every `read_into`.
+#[must_use]
+pub fn read_range(buffer: u64, offset: u64, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    if len > 0 {
+        // SAFETY: `out` is a live `len`-byte guest span for the call's duration.
+        let n = unsafe { abi_read_into(buffer, offset, out.as_mut_ptr() as u32, len as u32) };
+        out.truncate(n as usize);
+    }
+    out
+}
+
 /// The sealed length of a buffer (deterministic bookkeeping).
 #[must_use]
 pub fn buffer_len(buffer: u64) -> u64 {
@@ -350,6 +377,46 @@ pub fn buffer_release(buffer: u64) {
 pub fn cancel(op: u64) -> u32 {
     // SAFETY: plain-value import.
     unsafe { abi_cancel(op) }
+}
+
+// -- minor 3 (the det-state write surface, ABI §12.14 [SF-4]) -------------------------------------
+
+/// Open a family write stream (`vhc@2::state_open`): `tag` names the family (e.g. `"master"`,
+/// `"ef"`), `byte_len` is its total f32-le length (knowable from the layout). Returns the
+/// counter-deterministic stream id (top-bit namespace, `dc` class — a pure function of guest
+/// call order, no journal record). A misframed open (unprovisioned state plane, zero-length
+/// family, or the `state-streams-max` grant) traps typed host-side — the call never returns.
+pub fn state_open(tag: &str, byte_len: u64) -> u64 {
+    // SAFETY: `tag` is a live guest span for the call's duration.
+    unsafe { abi_state_open(tag.as_ptr() as u32, tag.len() as u32, byte_len) }
+}
+
+/// Emit exactly one chunk to an open stream (`vhc@2::state_emit`): the host copies the span out
+/// of linear memory, blake3-hashes it, and stores it content-addressed. Returns the 0-based
+/// chunk ordinal (under the pinned window schedule this IS the family chunk ordinal). Coarse
+/// framing (`0 < len ≤ chunk_size`, never past the declared `byte_len`) and the
+/// `state-write-budget` are enforced host-side — a breach traps typed (`StateMisframedEmit` /
+/// `GrantViolation`), so the call never returns on a violation.
+pub fn state_emit(stream: u64, chunk: &[u8]) -> u64 {
+    // SAFETY: `chunk` is a live guest span for the call's duration.
+    unsafe { abi_state_emit(stream, chunk.as_ptr() as u32, chunk.len() as u32) }
+}
+
+/// Seal a stream (`vhc@2::state_seal`): the host computes the domain-separated family fold over
+/// the accumulated chunk hashes, registers it retained + fetchable ([SF-R1]), and writes the
+/// 32-byte fold into guest memory. An incomplete seal (bytes emitted ≠ declared `byte_len`) or a
+/// `state-store-bytes` refusal traps typed host-side (the call never returns); a returned status
+/// is always `0`. Yields the sealed family fold — the artifact identity a subsequent
+/// `data@2::fetch` reads windows back from.
+#[must_use]
+pub fn state_seal(stream: u64) -> [u8; 32] {
+    let mut fold = [0u8; 32];
+    // SAFETY: `fold` is a live 32-byte guest span for the call's duration.
+    let status = unsafe { abi_state_seal(stream, fold.as_mut_ptr() as u32) };
+    if status != 0 {
+        unreachable!("unknown state_seal status (fail closed, §5.2)");
+    }
+    fold
 }
 
 /// Store a sealed buffer on the run's payload plane (§3.4). Returns the `OpId`; completes with
@@ -390,6 +457,19 @@ pub fn data_fetch(hash: &[u8; 32], range_off: u64, range_len: u64) -> u64 {
 pub fn data_register_chunks(desc: &[u8]) -> u32 {
     // SAFETY: `desc` is a live guest span for the call's duration.
     unsafe { abi_data_register_chunks(desc.as_ptr() as u32, desc.len() as u32) }
+}
+
+/// Register an externally-sourced **det-state** fold's length-aware chunk map
+/// (`data@2::register_state_chunks`, minor 3, [SF-R2]): `desc` is the canonical CBOR of a
+/// `daemon_vhc_proto::det_state::DetStateChunkMap` — per-chunk lengths derived from the parameter
+/// layout, so per-parameter interior short tails resolve correctly (unlike the uniform corpus
+/// grid). The host re-derives the domain-separated family fold and admits the map ONLY when the
+/// fold is a granted artifact (else it traps `GrantViolation`); returns 0 on (idempotent)
+/// registration. After registration, [`data_fetch`] of that fold is a verified length-aware
+/// covering-span range read. Register BEFORE ranging an externally-sourced fold.
+pub fn data_register_state_chunks(desc: &[u8]) -> u32 {
+    // SAFETY: `desc` is a live guest span for the call's duration.
+    unsafe { abi_data_register_state_chunks(desc.as_ptr() as u32, desc.len() as u32) }
 }
 
 // -- minor 2 (Phase C, track C1): the compute@2 command queue (ABI §15) ---------------------------

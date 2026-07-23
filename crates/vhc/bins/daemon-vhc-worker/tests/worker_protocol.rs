@@ -198,21 +198,6 @@ fn param_numels() -> Vec<usize> {
     out
 }
 
-/// A deterministic small init (the guest asserts the flat length against its layout).
-fn deterministic_init(total: usize) -> Vec<f32> {
-    let mut s = 0x5EED_C0DEu64;
-    (0..total)
-        .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            #[allow(clippy::cast_precision_loss)]
-            let v = ((s >> 33) % 2001) as f32;
-            (v - 1000.0) / 20000.0 // [-0.05, 0.05]
-        })
-        .collect()
-}
-
 /// The compute@2 trainer's guest config (`GuestCfg`, authored SDK-free as raw canonical CBOR —
 /// the tiny t2 parity model + `sparse_loco` profile + matched init): single-peer roster, 2 inner
 /// steps, one sequence per micro window.
@@ -242,8 +227,6 @@ fn guest_config() -> Value {
         (Value::from("outer_alpha"), Value::from(1.0f64)),
         (Value::from("clip"), Value::Bool(false)),
     ]);
-    let total: usize = param_numels().iter().sum();
-    let init = deterministic_init(total);
     Value::Map(vec![
         (Value::from("model"), model),
         (Value::from("peer"), Value::Bytes(vec![7u8; 32])),
@@ -256,10 +239,45 @@ fn guest_config() -> Value {
         (Value::from("stall_rounds_max"), Value::from(2u32)),
         (Value::from("profile"), profile),
         (
-            Value::from("init"),
-            Value::serialized(&init).expect("init value"),
+            Value::from("state"),
+            Value::serialized(&seed_state_contract()).expect("state contract"),
         ),
     ])
+}
+
+/// The genesis seed-form state contract (§6.1a) for this suite's trainer layout — replaces the
+/// deleted inline init (the guest seals the seed expansion and cross-checks `expected_root`).
+fn seed_state_contract() -> daemon_vhc_proto::genesis::StateContract {
+    use daemon_vhc_proto::det_state::{derive_state_chunk_size, FamilyEntry};
+    use daemon_vhc_proto::genesis::{StateContract, StateInit};
+    let seed = [0x5eu8; 32];
+    let dist = daemon_vhc_det::SEED_INIT_DIST_V1;
+    let chunk_size = derive_state_chunk_size(64);
+    let param_bytes: Vec<Vec<u8>> = param_numels()
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let vals =
+                daemon_vhc_det::seed_init_param(&seed, dist, i as u64, n).expect("known dist");
+            let mut b = Vec::with_capacity(n * 4);
+            for v in vals {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b
+        })
+        .collect();
+    let views: Vec<&[u8]> = param_bytes.iter().map(Vec::as_slice).collect();
+    let expected_root = FamilyEntry::author(&views, chunk_size)
+        .expect("author")
+        .fold;
+    StateContract {
+        chunk_size,
+        init: StateInit::Seed {
+            seed: daemon_vhc_proto::Seed(seed),
+            dist,
+            expected_root,
+        },
+    }
 }
 
 /// A real signed **genesis envelope v2** wire for the run (the worker's only resolvable form):
@@ -343,7 +361,7 @@ fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
         roles,
         artifacts,
         corpus_manifest: None,
-        state_contract: None,
+        state_contract: Some(seed_state_contract()),
         // The opaque Authority section (D1 vocabulary; the host never interprets it) — nominal
         // for assess-only drives.
         authority: Value::Map(vec![

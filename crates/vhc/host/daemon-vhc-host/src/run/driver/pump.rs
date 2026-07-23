@@ -95,6 +95,14 @@ pub(crate) struct PumpState {
     /// (`data@2::register_chunks` re-derives the fold and admits only granted identities), so
     /// this table is replay-reconstructible and carries no journal record.
     pub(crate) chunk_maps: std::collections::HashMap<[u8; 32], daemon_vhc_proto::ChunkMap>,
+    /// The registered **det-state** chunk maps ([SF-R2], ABI §12.14): fold identity → the
+    /// length-aware map a module registered for an externally-sourced family fold (artifact-form
+    /// init, restore roots). Per-parameter chunking is not a uniform grid, so these carry explicit
+    /// per-chunk lengths and `fetch` resolves the covering span by walking actual offsets. Like
+    /// `chunk_maps` this is deterministic guest output (`register_state_chunks` re-derives the fold
+    /// and admits only granted identities) — replay-reconstructible, no journal record.
+    pub(crate) state_chunk_maps:
+        std::collections::HashMap<[u8; 32], daemon_vhc_proto::det_state::DetStateChunkMap>,
     /// The cumulative `data@2` read budget (raw bytes; `0` = unbounded) + its ledger. Charged
     /// at the fetch CALL from the requested range — guest-call-order deterministic.
     pub(crate) data_read_budget: u64,
@@ -800,67 +808,132 @@ impl PumpHandle {
                 // map, then slices the guest's original range. A whole-object answer
                 // (`FetchDone`, the in-process content-store seat) has its span extracted
                 // first; a span answer (`RangeDone`) must be exactly the requested span.
-                let map = st.chunk_maps.get(&hash).cloned();
-                match map {
-                    None => CompletionResult::Err(CompError {
-                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                        detail: Some(
-                            "chunk map unregistered at completion (pump invariant)".into(),
-                        ),
-                    }),
-                    Some(map) => {
-                        let span = match outcome {
-                            OpOutcome::RangeDone { bytes } => {
-                                if bytes.len() as u64 == span_len {
-                                    Ok(bytes)
-                                } else {
-                                    Err(format!(
-                                        "span answer is {} bytes, the covering span is \
+                //
+                // [SF-R2]: an externally-registered DET-STATE fold verifies LENGTH-AWARE against
+                // its per-chunk offsets (per-parameter chunking is not a uniform grid). Same
+                // covering-span discipline, walked over actual lengths rather than a grid.
+                if let Some(smap) = st.state_chunk_maps.get(&hash).cloned() {
+                    let span = match outcome {
+                        OpOutcome::RangeDone { bytes } => {
+                            if bytes.len() as u64 == span_len {
+                                Ok(bytes)
+                            } else {
+                                Err(format!(
+                                    "span answer is {} bytes, the covering span is {span_len}",
+                                    bytes.len()
+                                ))
+                            }
+                        }
+                        OpOutcome::FetchDone { artifact } => {
+                            if artifact.len() as u64 == smap.byte_len {
+                                let s = span_off as usize;
+                                Ok(artifact[s..s + span_len as usize].to_vec())
+                            } else {
+                                Err(format!(
+                                    "whole-object answer is {} bytes, the registered fold is {}",
+                                    artifact.len(),
+                                    smap.byte_len
+                                ))
+                            }
+                        }
+                        _ => unreachable!("outer match arm admits only Range/FetchDone"),
+                    };
+                    match span.and_then(|bytes| {
+                        smap.verify_covering_span(span_off, &bytes)
+                            .map(|()| bytes)
+                            .map_err(|e| e.to_string())
+                    }) {
+                        Err(detail) => CompletionResult::Err(CompError {
+                            code: COMP_ERR_HASH_MISMATCH,
+                            detail: Some(detail),
+                        }),
+                        Ok(span_bytes) => {
+                            let end = if range_len == 0 {
+                                smap.byte_len
+                            } else {
+                                range_off + range_len
+                            };
+                            let lo = (range_off - span_off) as usize;
+                            let hi = lo + (end - range_off) as usize;
+                            let slice = span_bytes[lo..hi].to_vec();
+                            match st.buffers.create_host(Arc::new(slice)) {
+                                Some(handle) => {
+                                    minted = Some(handle);
+                                    CompletionResult::Ok(SuccessPayload::Handle(handle))
+                                }
+                                None => CompletionResult::Err(CompError {
+                                    code: COMP_ERR_GRANT_EXHAUSTED,
+                                    detail: Some(
+                                        "buffer quota exhausted (deny new buffers)".into(),
+                                    ),
+                                }),
+                            }
+                        }
+                    }
+                } else {
+                    let map = st.chunk_maps.get(&hash).cloned();
+                    match map {
+                        None => CompletionResult::Err(CompError {
+                            code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                            detail: Some(
+                                "chunk map unregistered at completion (pump invariant)".into(),
+                            ),
+                        }),
+                        Some(map) => {
+                            let span = match outcome {
+                                OpOutcome::RangeDone { bytes } => {
+                                    if bytes.len() as u64 == span_len {
+                                        Ok(bytes)
+                                    } else {
+                                        Err(format!(
+                                            "span answer is {} bytes, the covering span is \
                                          {span_len}",
-                                        bytes.len()
-                                    ))
-                                }
-                            }
-                            OpOutcome::FetchDone { artifact } => {
-                                if artifact.len() as u64 == map.byte_len {
-                                    let s = span_off as usize;
-                                    Ok(artifact[s..s + span_len as usize].to_vec())
-                                } else {
-                                    Err(format!(
-                                        "whole-object answer is {} bytes, the registered \
-                                         shard is {}",
-                                        artifact.len(),
-                                        map.byte_len
-                                    ))
-                                }
-                            }
-                            _ => unreachable!("outer match arm admits only Range/FetchDone"),
-                        };
-                        match span.and_then(|bytes| verify_covering_span(&map, span_off, bytes)) {
-                            Err(detail) => CompletionResult::Err(CompError {
-                                code: COMP_ERR_HASH_MISMATCH,
-                                detail: Some(detail),
-                            }),
-                            Ok(span_bytes) => {
-                                let end = if range_len == 0 {
-                                    map.byte_len
-                                } else {
-                                    range_off + range_len
-                                };
-                                let lo = (range_off - span_off) as usize;
-                                let hi = lo + (end - range_off) as usize;
-                                let slice = span_bytes[lo..hi].to_vec();
-                                match st.buffers.create_host(Arc::new(slice)) {
-                                    Some(handle) => {
-                                        minted = Some(handle);
-                                        CompletionResult::Ok(SuccessPayload::Handle(handle))
+                                            bytes.len()
+                                        ))
                                     }
-                                    None => CompletionResult::Err(CompError {
-                                        code: COMP_ERR_GRANT_EXHAUSTED,
-                                        detail: Some(
-                                            "buffer quota exhausted (deny new buffers)".into(),
-                                        ),
-                                    }),
+                                }
+                                OpOutcome::FetchDone { artifact } => {
+                                    if artifact.len() as u64 == map.byte_len {
+                                        let s = span_off as usize;
+                                        Ok(artifact[s..s + span_len as usize].to_vec())
+                                    } else {
+                                        Err(format!(
+                                            "whole-object answer is {} bytes, the registered \
+                                         shard is {}",
+                                            artifact.len(),
+                                            map.byte_len
+                                        ))
+                                    }
+                                }
+                                _ => unreachable!("outer match arm admits only Range/FetchDone"),
+                            };
+                            match span.and_then(|bytes| verify_covering_span(&map, span_off, bytes))
+                            {
+                                Err(detail) => CompletionResult::Err(CompError {
+                                    code: COMP_ERR_HASH_MISMATCH,
+                                    detail: Some(detail),
+                                }),
+                                Ok(span_bytes) => {
+                                    let end = if range_len == 0 {
+                                        map.byte_len
+                                    } else {
+                                        range_off + range_len
+                                    };
+                                    let lo = (range_off - span_off) as usize;
+                                    let hi = lo + (end - range_off) as usize;
+                                    let slice = span_bytes[lo..hi].to_vec();
+                                    match st.buffers.create_host(Arc::new(slice)) {
+                                        Some(handle) => {
+                                            minted = Some(handle);
+                                            CompletionResult::Ok(SuccessPayload::Handle(handle))
+                                        }
+                                        None => CompletionResult::Err(CompError {
+                                            code: COMP_ERR_GRANT_EXHAUSTED,
+                                            detail: Some(
+                                                "buffer quota exhausted (deny new buffers)".into(),
+                                            ),
+                                        }),
+                                    }
                                 }
                             }
                         }

@@ -23,6 +23,9 @@ daemon-vhc-sdk-rounds = { path = "../../sdk/daemon-vhc-sdk-rounds" }
 # round vocabulary is SDK/guest territory, the proto is mechanism-only).
 daemon-vhc-sdk-consensus = { path = "../../sdk/daemon-vhc-sdk-consensus" }
 daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }
+# The bit-exact fp32 kernels — the guest expands seed-derived init through the same dual-compiled
+# distribution the host/genesis pin (§6.1a); linked directly (wasm-clean, zero-dependency).
+daemon-vhc-det = { path = "../../contracts/daemon-vhc-det" }
 burn = { version = "=0.21.0", default-features = false, features = ["std", "autodiff"] }
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }

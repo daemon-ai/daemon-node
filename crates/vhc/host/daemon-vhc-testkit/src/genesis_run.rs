@@ -44,6 +44,8 @@ use daemon_vhc_host::run::{
     ReplayScript, RunConfig, RunEnd, RunIdentity, SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
+use daemon_vhc_proto::det_state::{derive_state_chunk_size, FamilyEntry};
+use daemon_vhc_proto::genesis::{StateContract, StateInit};
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, ControlTransport, GenesisEnvelope, Hash,
     Identities, IrohId, PeerId, RoleEntry, RoleGrants, RunSection, Seed, SigningKey,
@@ -190,21 +192,55 @@ fn param_numels() -> Vec<usize> {
     out
 }
 
-/// A deterministic matched init (identical across the roster — the cross-peer digest-agreement
-/// precondition; the guest asserts the flat length against its layout).
+/// The profile compression chunk the t2 parity shape uses (§3.2: divides every parameter numel;
+/// the `sparse_loco` profile below pins `chunk = 64`).
+const TRAINER_PROFILE_CHUNK: u64 = 64;
+/// The pinned seed-init seed. Shared across the roster, so every worker expands byte-identical
+/// init through the versioned distribution and agrees on the det-lane digest by construction.
+const TRAINER_INIT_SEED: [u8; 32] = [0x5e; 32];
+
+/// The run-pinned `state_chunk_size` the trainer runs under (the fold-walk window size).
 #[must_use]
-fn matched_init(total: usize) -> Vec<f32> {
-    let mut s = 0x5EED_C0DEu64;
-    (0..total)
-        .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            #[allow(clippy::cast_precision_loss)]
-            let v = ((s >> 33) % 2001) as f32;
-            (v - 1000.0) / 20000.0 // [-0.05, 0.05]
+pub fn trainer_state_chunk_size() -> u64 {
+    derive_state_chunk_size(TRAINER_PROFILE_CHUNK)
+}
+
+/// The genesis **seed-form state contract** for the trainer layout (§6.1a): the derived state
+/// chunk size + a pinned `(seed, dist)` whose deterministic expansion the guest seals and
+/// cross-checks against `expected_root`. Authored here so both the guest config (the init pin) and
+/// the genesis envelope carry the identical contract; the roster shares the seed, so init is
+/// byte-identical everywhere (the cross-peer digest-agreement precondition, formerly the inline
+/// matched init).
+#[must_use]
+pub fn trainer_state_contract() -> StateContract {
+    let chunk_size = trainer_state_chunk_size();
+    let dist = daemon_vhc_det::SEED_INIT_DIST_V1;
+    let numels = param_numels();
+    let param_bytes: Vec<Vec<u8>> = numels
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let vals = daemon_vhc_det::seed_init_param(&TRAINER_INIT_SEED, dist, i as u64, n)
+                .expect("the versioned seed-init distribution is implemented");
+            let mut b = Vec::with_capacity(n * 4);
+            for v in vals {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b
         })
-        .collect()
+        .collect();
+    let views: Vec<&[u8]> = param_bytes.iter().map(Vec::as_slice).collect();
+    let expected_root = FamilyEntry::author(&views, chunk_size)
+        .expect("author the seed-init master family")
+        .fold;
+    StateContract {
+        chunk_size,
+        init: StateInit::Seed {
+            seed: Seed(TRAINER_INIT_SEED),
+            dist,
+            expected_root,
+        },
+    }
 }
 
 /// The compute@2 trainer's guest config, authored SDK-free as raw canonical CBOR (module docs):
@@ -242,8 +278,6 @@ pub fn trainer_config(
         (text("outer_alpha"), Value::Float(1.0)),
         (text("clip"), Value::Bool(false)),
     ]);
-    let total: usize = param_numels().iter().sum();
-    let init = matched_init(total);
     let cfg = Value::Map(vec![
         (text("model"), model),
         (text("peer"), Value::Bytes(peer.0.to_vec())),
@@ -255,7 +289,10 @@ pub fn trainer_config(
         (text("micro_batch"), uint(u64::from(micro_batch))),
         (text("stall_rounds_max"), uint(u64::from(stall_rounds_max))),
         (text("profile"), profile),
-        (text("init"), Value::serialized(&init).expect("init value")),
+        (
+            text("state"),
+            Value::serialized(&trainer_state_contract()).expect("state contract value"),
+        ),
     ]);
     to_canonical_vec(&cfg).expect("guest config cbor")
 }
@@ -546,7 +583,7 @@ pub fn genesis_envelope(
         roles,
         artifacts,
         corpus_manifest: None,
-        state_contract: None,
+        state_contract: Some(trainer_state_contract()),
         // The run's declared trust topology (D1's typed AuthorityConfig, encoded into the opaque
         // section the host never interprets): launch SingleKey over the coordinator identity,
         // records on the default authoritative channel.
@@ -812,6 +849,9 @@ pub fn genesis_whole_run(
         // A real transformer's per-round op stream exceeds the tiny default queue depth (the
         // guest also fences per inner step to reclaim depth).
         run_cfg.compute_queue_depth = 1 << 20;
+        // Provision the state plane: the run-pinned chunk size the streamed det-lane fold runs
+        // under (seed-form init self-seals host-locally — no external artifact grants needed).
+        run_cfg.state_chunk_size = trainer_state_chunk_size();
         let run = start_run(&engine, worker_wasm, run_cfg, Box::new(sink.clone()))
             .map_err(|e| format!("worker {i} start_run: {e}"))?;
         workers.push(LiveWorker {
@@ -1116,6 +1156,10 @@ pub fn genesis_whole_run(
             .collect();
         let mut script = ReplayScript::from_entries(&entries);
         script.identity = Some(w.identity.clone());
+        // Provision the replay-side state plane so the streamed det-lane ops re-execute (the
+        // self-sealed folds rebuild into the replay-side state chunk store; without the chunk
+        // size the guest's state_open would trap NotProvisioned and the replay would diverge).
+        script.state_chunk_size = trainer_state_chunk_size();
         let replayed = replay(&w.engine, worker_wasm, &w.config, &phase_a_grants(), script)
             .map_err(|e| format!("worker {i} replay harness: {e}"))?;
         let redriven: Vec<Decision> = replayed

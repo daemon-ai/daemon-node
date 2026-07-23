@@ -29,6 +29,9 @@ daemon-vhc-host = { workspace = true, features = ["harness"] }
 daemon-vhc-abi = { workspace = true }
 # The signed control-plane wire (SignedMessage / VhcMessage), envelope, blake3. contracts/*.
 daemon-vhc-proto = { workspace = true }
+# The bit-exact fp32 kernels — the whole-run genesis authors seed-derived init through the same
+# dual-compiled distribution the guest expands, and folds it to the pinned `expected_root`.
+daemon-vhc-det = { workspace = true }
 # The consensus SDK layer (assignment math + the shared coordinator types). The whole-run
 # harness re-derives worker windows with the same `assign_batches` the guests use, and authors
 # the genesis coordinator role's opaque config (`{state: CoordinatorState}`) + the typed

@@ -218,9 +218,11 @@ fn record_bad_sig_rejected() {
 #[test]
 fn wrong_run_version_rejected() {
     use daemon_vhc_proto::version::VhcProtoVersion;
+    // A v1 peer (the pre-det-state control plane) signs validly, but a v2 run's join gate rejects
+    // it — the det-state surface cannot mix with a v1 fleet.
     let msg = SignedMessage::sign(
         &key(),
-        VhcProtoVersion(2),
+        VhcProtoVersion(1),
         VhcMessage::Heartbeat(Heartbeat {
             round: 1,
             ready: None,

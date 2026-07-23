@@ -18,8 +18,15 @@ pub struct VhcProtoVersion(pub u16);
 
 /// The version this build speaks.
 ///
-/// Version 1 is the shipping control plane (`0` was the scaffold placeholder before it froze).
-pub const VHC_PROTO_VERSION: VhcProtoVersion = VhcProtoVersion(1);
+/// - `0` was the scaffold placeholder before the plane froze.
+/// - `1` was the shipping control plane through the resident det-lane.
+/// - **`2`** is the chunk-addressed det-state plane: the genesis envelope's `state_contract`
+///   (chunk_size + init pin, §6.3) becomes wire-visible and shipping-consumed at admission — the
+///   streamed trainer reads it and the deleted inline `init` no longer crosses the config. The
+///   deferred bump lands here per the wire-change discipline (design §10.3): a run pins one
+///   version and peers with any other cannot join, so the det-state surface cannot mix with a
+///   v1 fleet.
+pub const VHC_PROTO_VERSION: VhcProtoVersion = VhcProtoVersion(2);
 
 impl VhcProtoVersion {
     /// Whether `peer` may join a run pinned to `self` — exact match only.

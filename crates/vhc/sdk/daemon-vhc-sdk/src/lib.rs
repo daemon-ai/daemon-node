@@ -11,10 +11,11 @@ pub mod abi;
 #[cfg(target_arch = "wasm32")]
 pub use abi::{
     buffer_len, buffer_release, cancel, compute_export, compute_fence, compute_import,
-    compute_submit_op, create_from, data_fetch, data_register_chunks, device_profile, emit_metric,
-    hash_accel, next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint,
-    read_buffer, rng_seed, set_timer, snapshot_state, stage_state, stream_accept, stream_open,
-    stream_read, stream_write, verify_sig_accel, Event,
+    compute_submit_op, create_from, data_fetch, data_register_chunks, data_register_state_chunks,
+    device_profile, emit_metric, hash_accel, next_event, payload_get, payload_put, publish,
+    read_back_bytes, read_back_uint, read_buffer, read_range, rng_seed, set_timer, snapshot_state,
+    stage_state, state_emit, state_open, state_seal, stream_accept, stream_open, stream_read,
+    stream_write, verify_sig_accel, Event,
 };
 
 pub mod corpus;
@@ -83,15 +84,29 @@ macro_rules! main {
                 $crate::module::rt::da_free(ptr, size, align)
             }
 
+            /// # Safety
+            /// The host writes the config span before the call (ABI §2.3/§9.1).
             #[no_mangle]
-            pub extern "C" fn da_manifest(_cfg: u32, _cfg_len: u32) -> u64 {
-                let decl = <$module as $crate::module::GuestModule>::decl();
+            pub unsafe extern "C" fn da_manifest(cfg_ptr: u32, cfg_len: u32) -> u64 {
+                let cfg = if cfg_len == 0 {
+                    ::std::vec::Vec::new()
+                } else {
+                    ::std::slice::from_raw_parts(cfg_ptr as *const u8, cfg_len as usize).to_vec()
+                };
+                let decl = <$module as $crate::module::GuestModule>::decl_for_config(&cfg);
                 $crate::module::rt::emit_cbor(&$crate::module::manifest_bytes(&decl))
             }
 
+            /// # Safety
+            /// The host writes the config + grants spans before the call (ABI §2.3/§9.1).
             #[no_mangle]
-            pub extern "C" fn da_claim(_c: u32, _cl: u32, _g: u32, _gl: u32) -> u64 {
-                let decl = <$module as $crate::module::GuestModule>::decl();
+            pub unsafe extern "C" fn da_claim(c: u32, cl: u32, _g: u32, _gl: u32) -> u64 {
+                let cfg = if cl == 0 {
+                    ::std::vec::Vec::new()
+                } else {
+                    ::std::slice::from_raw_parts(c as *const u8, cl as usize).to_vec()
+                };
+                let decl = <$module as $crate::module::GuestModule>::decl_for_config(&cfg);
                 $crate::module::rt::emit_cbor(&$crate::module::derive_claim(&decl))
             }
 
