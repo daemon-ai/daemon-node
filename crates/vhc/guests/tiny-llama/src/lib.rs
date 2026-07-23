@@ -154,13 +154,20 @@ struct LiveCfg {
     run_label: String,
     /// The genesis-pinned chunk-addressed corpus manifest's content hash (a granted artifact).
     manifest: Hash,
-    /// The periodic live checkpoint cadence in rounds: every `ckpt_every`-th ingested round the
-    /// module exports its full restorable state (masters + EF + AdamW moments + the round
-    /// watermark) as a checkpoint DOCUMENT on the payload plane, so a hard-crashed peer has a
-    /// fresh restore source even though it never drained. `0` disables the cadence (the drain
-    /// snapshot remains the only pointer source); absent = every round.
+    /// The **local** checkpoint cadence in rounds (D-SF3): the round boundaries at which a
+    /// checkpoint is considered. The canonical families are already sealed every round, so a local
+    /// checkpoint is pointer bookkeeping — cheap, restorable by a co-located/LAN peer. `0` disables
+    /// the cadence (the drain snapshot remains the only pointer source); absent = every round.
     #[serde(default = "default_ckpt_every")]
     ckpt_every: u64,
+    /// The **remote** upload cadence in rounds (D-SF3, byte-budgeted): every `remote_ckpt_every`-th
+    /// checkpoint boundary, the ONE deterministically-elected publisher for that slot uploads the
+    /// by-reference document + its family chunks to the payload plane (others skip — R identical
+    /// uploads per round are pure waste). `0` = upload at every local boundary (the default when
+    /// unset). Genesis authoring refuses a cadence that could strand a rejoiner past
+    /// `payload_retention_rounds` ([`daemon_vhc_proto::det_state::validate_checkpoint_cadence`]).
+    #[serde(default)]
+    remote_ckpt_every: u64,
 }
 
 /// The default live checkpoint cadence: every ingested round.
@@ -575,6 +582,10 @@ struct CkptWalk {
 /// The live-mode session state (module-driven data + wire announcements).
 struct LiveState {
     cfg: LiveCfg,
+    /// This peer id (for the per-slot publisher election).
+    peer: PeerId,
+    /// The run roster (for the per-slot publisher election).
+    roster: Vec<PeerId>,
     corpus: Option<LiveCorpus>,
     manifest_op: Option<u64>,
     /// Whether a round has been observed (stops the periodic Join/Heartbeat re-announce).
@@ -592,9 +603,11 @@ struct LiveState {
 }
 
 impl LiveState {
-    fn new(cfg: LiveCfg) -> Self {
+    fn new(cfg: LiveCfg, peer: PeerId, roster: Vec<PeerId>) -> Self {
         Self {
             cfg,
+            peer,
+            roster,
             corpus: None,
             manifest_op: None,
             admitted: false,
@@ -606,12 +619,42 @@ impl LiveState {
         }
     }
 
-    /// Start the periodic checkpoint export walk at an ingested-round boundary, when the
-    /// cadence says so and no walk is already in flight. The already-sealed master + ef families
-    /// are captured by-reference here (zero extra reads); only the AdamW moments export.
+    /// Start the periodic checkpoint export walk at an ingested-round boundary, when the cadence
+    /// says so, no walk is already in flight, and this peer is the slot's designated publisher.
+    /// The already-sealed master + ef families are captured by-reference here (zero extra reads);
+    /// only the AdamW moments export.
+    ///
+    /// D-SF3 publication policy: the LOCAL cadence (`ckpt_every`) gates the checkpoint boundary
+    /// (the folds already exist — a local checkpoint is bookkeeping); the REMOTE cadence
+    /// (`remote_ckpt_every`) + a ONE-per-slot deterministic publisher election gate the upload, so
+    /// a replicated group uploads once per slot, not once per peer. A slot whose publisher has died
+    /// simply goes unpublished; the next slot's rotation covers it (the one-slot slack term).
     fn maybe_start_checkpoint(&mut self, core: &Rc<RefCell<Core>>, round: u64) {
         if self.cfg.ckpt_every == 0 || !round.is_multiple_of(self.cfg.ckpt_every) {
             return;
+        }
+        // Remote upload cadence + single-publisher gating. `remote_ckpt_every == 0` uploads at
+        // every local boundary (the pre-cadence default). A non-boundary remote round is a
+        // local-only checkpoint: the fold already exists, nothing to upload.
+        let remote = if self.cfg.remote_ckpt_every == 0 {
+            self.cfg.ckpt_every
+        } else {
+            self.cfg.remote_ckpt_every
+        };
+        if remote == 0 || !round.is_multiple_of(remote) {
+            return;
+        }
+        let slot = round / remote;
+        // The election seed is the corpus manifest hash — run-specific and identical across every
+        // peer, so all peers derive the same publisher for the slot without exchanging a message.
+        let seed = Seed(self.cfg.manifest.0);
+        let publisher = daemon_vhc_sdk_consensus::assignment::elect_checkpoint_publisher_for_slot(
+            &self.roster,
+            &seed,
+            slot,
+        );
+        if publisher != Some(self.peer) {
+            return; // not this slot's publisher — skip (others upload; R identical uploads waste)
         }
         if self.pending_ckpt.is_some() {
             return;
@@ -1551,7 +1594,10 @@ fn drive_update_completion(
 fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
     let numels = cfg.model.param_numels();
     let vocab = cfg.model.vocab;
-    let mut live = cfg.live.take().map(LiveState::new);
+    let mut live = cfg
+        .live
+        .take()
+        .map(|c| LiveState::new(c, cfg.peer, cfg.roster.clone()));
     let restored_round = restored.as_ref().and_then(|r| r.round);
     let window_size = cfg.state.chunk_size;
     let family_base = family_base_offsets(&numels);
