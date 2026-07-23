@@ -395,6 +395,12 @@ pub(crate) async fn join_and_run(
     // A real transformer's per-round op stream exceeds the tiny default queue depth (the guest
     // also fences per inner step to reclaim depth).
     run_cfg.compute_queue_depth = 1 << 20;
+    // Provision the state plane from the genesis state contract (§6.3): the run-pinned
+    // `state_chunk_size` the streamed det-lane fold runs under. `None` leaves it unprovisioned
+    // (a run without host-side canonical state).
+    if let Some(sc) = &genesis.env.state_contract {
+        run_cfg.state_chunk_size = sc.chunk_size;
+    }
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, module, run_cfg, Box::new(sink.clone()))
         .map_err(|e| format!("v2 start_run: {e}"))?;
