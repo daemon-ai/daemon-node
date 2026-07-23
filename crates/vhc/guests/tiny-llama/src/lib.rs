@@ -601,7 +601,7 @@ impl LiveState {
     /// cadence says so and no walk is already in flight. The post-ingest masters + EF are
     /// captured synchronously here; the moments arrive as export completions.
     fn maybe_start_checkpoint(&mut self, core: &Rc<RefCell<Core>>, round: u64) {
-        if self.cfg.ckpt_every == 0 || round % self.cfg.ckpt_every != 0 {
+        if self.cfg.ckpt_every == 0 || !round.is_multiple_of(self.cfg.ckpt_every) {
             return;
         }
         if self.pending_ckpt.is_some() {
