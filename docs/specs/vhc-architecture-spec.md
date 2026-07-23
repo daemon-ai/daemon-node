@@ -922,6 +922,21 @@ from silence.
   payload-retention floor — a configuration that could strand a rejoiner past retention is
   refused at authoring, never discovered at rejoin.
 
+  **Checkpoint carriage is by-reference (streaming det fold, [SF-6]).** A checkpoint document is
+  `[manifest, sections]` where large families (`master`, `ef`, the AdamW moments) are carried
+  **by reference** — a `{fold, byte_len, chunk_size, chunk_hashes}` descriptor of an
+  already-sealed chunk-addressed family — and only small state (the round watermark) is inline. A
+  live checkpoint therefore costs **zero extra local bytes**: the canonical families are already
+  the round's sealed folds, so "sealing" the document is naming them. Restore is **streaming
+  rehydration**: a rejoiner resolves its `(role, live)` pointer, fetches the small document,
+  registers the referenced family folds as externally-sourced roots, and streams their windows on
+  demand — reconstructing device weights and optimizer moments with guest memory bounded at
+  O(windows in flight), never materializing a whole family. The published family chunks ride the
+  content-addressed payload plane content-addressed, so a chunk unchanged since a prior slot
+  uploads nothing; and consensus continuity holds because a restored instance folds forward from
+  the checkpoint's canonical master exactly as its survivors did — the digest values are
+  preserved bit-for-bit across the restore, not merely close.
+
 ---
 
 ## 7. The consensus and aggregation seam
