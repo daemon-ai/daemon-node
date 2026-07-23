@@ -936,6 +936,12 @@ from silence.
   uploads nothing; and consensus continuity holds because a restored instance folds forward from
   the checkpoint's canonical master exactly as its survivors did — the digest values are
   preserved bit-for-bit across the restore, not merely close.
+  The one carriage that does **not** touch the content plane is a **live module switch** (§6.4):
+  an in-process migrate on one node, not a rejoin. The switch transaction carries the draining
+  instance's sealed families directly into the successor instance's state store and the successor
+  inherits the run-pinned `state_chunk_size`, so it serves those folds **self-sealed** — the host
+  keeps custody of canonical state across the fence, publishing nothing to and fetching nothing
+  from the payload plane. Local switch ≠ content-plane restore.
 
 ---
 

@@ -1999,6 +1999,15 @@ impl VhcService {
         let role = if role.is_empty() { "trainer" } else { role };
         let pointer = discovery.fetch_checkpoint(run_id, role).await.ok()??;
         let hash = hex32(&pointer.hash)?;
+        // The node resolved this role's freshest restore pointer (spec §9); the joining worker
+        // fetches its by-reference checkpoint document and streams each family's windows via
+        // chunk-keyed rehydration ([SF-6]). This is the node-visible half of the restore path.
+        tracing::info!(
+            run = run_id,
+            role,
+            round = pointer.round,
+            "resolved late-join checkpoint restore pointer (streaming by-ref rehydration follows)"
+        );
         Some(protocol::CheckpointRestore {
             round: pointer.round,
             hash,

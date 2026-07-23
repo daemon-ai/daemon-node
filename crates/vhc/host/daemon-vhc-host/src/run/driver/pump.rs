@@ -724,6 +724,25 @@ impl PumpHandle {
             .cloned()
     }
 
+    /// Lift a sealed det-state family out of this instance's store for carriage into a successor
+    /// within the SAME node (the in-process live-module-switch transaction, [SF-6]). Called on the
+    /// DRAINING instance while it is still alive (its store not yet dropped), so the successor can
+    /// serve the drain snapshot's folds self-sealed ([SF-R1]) instead of fetching them from a
+    /// content plane the in-process switch never published to. `None` if the fold is not sealed
+    /// here.
+    #[must_use]
+    pub fn export_sealed_family(
+        &self,
+        fold: &[u8; 32],
+    ) -> Option<crate::run::state_store::CarriedFamily> {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .state
+            .export_sealed_family(fold)
+    }
+
     /// Whether a migrating instance's `da_migrate` returned `Ready` (§10.3 step 5) — the
     /// embedder-visible VALIDATE marker the upgrade transaction gates activation on. `false`
     /// until validation, and forever on a non-migrating instance.

@@ -630,6 +630,14 @@ pub(crate) async fn join_and_run(
     // The identity behind the recorded run: what `sys@2::rng_seed` re-derives from at replay
     // (in a real journal this rides the tag-0 run header).
     script.identity = Some(identity);
+    // Provision the replay-side state plane from the same genesis state contract the LIVE run
+    // used (§6.3 / [SF-5]): admission state that rides beside the identity, not a journal record.
+    // Without it the replay-side `state_chunk_size` stays 0 and a replayed streamed guest's
+    // `state_open` traps "state plane not provisioned", diverging from a recording that sealed
+    // state fine.
+    if let Some(sc) = &genesis.env.state_contract {
+        script.state_chunk_size = sc.chunk_size;
+    }
     let replayed = replay(&worker, module, config, &grants, script)
         .map_err(|e| format!("replay harness: {e}"))?;
     if replayed.end != ReplayEnd::Outcome(0) {

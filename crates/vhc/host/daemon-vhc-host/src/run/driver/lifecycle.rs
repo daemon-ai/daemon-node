@@ -205,6 +205,21 @@ pub fn start_run_migrating(
         shared: shared.clone(),
     };
 
+    // Seed the successor's state store with the sealed families the in-process live-module-switch
+    // transaction carried from the draining instance ([SF-6]). Done here, before `da_run`, so the
+    // streamed restore walk resolves the drain snapshot's folds self-sealed ([SF-R1], host-local)
+    // — the switch is the one migrate where the same node keeps custody of canonical state, so no
+    // content-plane fetch is needed (and none would resolve: the in-process switch publishes
+    // nothing). Empty for a content-plane late-join restore.
+    if let Some(mig) = &migration {
+        if !mig.carried_state.is_empty() {
+            let mut st = shared.state.lock().expect("pump lock");
+            for fam in &mig.carried_state {
+                st.state.inject_sealed_family(fam);
+            }
+        }
+    }
+
     let mut linker: Linker<Host> = Linker::new(worker.engine());
     link_v2(&mut linker).map_err(|e| RunError::Sandbox(e.to_string()))?;
 

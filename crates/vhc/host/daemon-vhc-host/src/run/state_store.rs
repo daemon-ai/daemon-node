@@ -184,6 +184,22 @@ pub struct SealedFold {
     pub chunks: Vec<([u8; 32], u32)>,
 }
 
+/// A sealed family lifted out of one instance's store to be carried into a successor's within
+/// the SAME node (the in-process live-module-switch transaction, [SF-6]): the family tag, its
+/// byte length, and its content-addressed chunks (hash + bytes) in fold order. The successor
+/// [`StateStore::inject_sealed_family`]s these so it serves the drain snapshot's folds
+/// **self-sealed** ([SF-R1], host-local) — the switch moves zero bytes on the wire, and unlike a
+/// content-plane restore the chunks never leave the node.
+#[derive(Debug, Clone)]
+pub struct CarriedFamily {
+    /// The family tag (`master`/`ef`/`adamw_m`/`adamw_v`).
+    pub tag: String,
+    /// The family byte length.
+    pub byte_len: u64,
+    /// `(chunk blake3, chunk bytes)` in fold order.
+    pub chunks: Vec<(daemon_vhc_proto::Hash, Vec<u8>)>,
+}
+
 /// Introspection snapshot for tests / the fleet-preflight disk line item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateStoreStats {
@@ -438,6 +454,75 @@ impl StateStore {
             out.push((daemon_vhc_proto::Hash(*h), (*entry.bytes).clone()));
         }
         Some(out)
+    }
+
+    /// Lift a sealed family out for carriage into a successor instance's store (the in-process
+    /// live-module-switch transaction, [SF-6]): the tag, byte length, and its chunks (hash +
+    /// bytes) in fold order. `None` when the fold is not sealed here. The counterpart of
+    /// [`Self::inject_sealed_family`].
+    #[must_use]
+    pub fn export_sealed_family(&self, fold: &[u8; 32]) -> Option<CarriedFamily> {
+        let sealed = self.sealed.get(fold)?;
+        let mut chunks = Vec::with_capacity(sealed.chunks.len());
+        for (h, _len) in &sealed.chunks {
+            let entry = self.chunks.get(h)?;
+            chunks.push((daemon_vhc_proto::Hash(*h), (*entry.bytes).clone()));
+        }
+        Some(CarriedFamily {
+            tag: sealed.tag.clone(),
+            byte_len: sealed.byte_len,
+            chunks,
+        })
+    }
+
+    /// Seed a sealed family carried from a predecessor instance's store (the in-process
+    /// live-module-switch transaction, [SF-6]) so the successor serves the drain snapshot's fold
+    /// **self-sealed** ([SF-R1], host-local) with no content-plane fetch. Content-addressed and
+    /// refcounted exactly like [`Self::seal`]; the fold re-derives from the injected chunk hashes
+    /// (identity by construction). The injected fold is **pinned** — retention-exempt — so a
+    /// concurrent seal's eviction cannot collect it out from under the successor's streaming
+    /// restore walk (the walk reads it at `da_run` start). Idempotent per identity. Returns the
+    /// re-derived family fold.
+    pub fn inject_sealed_family(&mut self, fam: &CarriedFamily) -> [u8; 32] {
+        let hashes: Vec<daemon_vhc_proto::Hash> = fam.chunks.iter().map(|(h, _)| *h).collect();
+        let fold = family_fold(self.cfg.chunk_size, fam.byte_len, &hashes).0;
+        if self.sealed.contains_key(&fold) {
+            // Already present (a re-entered switch / shared chunk): pin and return the identity —
+            // content addressing makes the re-injection a no-op.
+            self.pinned.insert(fold);
+            return fold;
+        }
+        for (h, bytes) in &fam.chunks {
+            let entry = self.chunks.entry(h.0).or_insert_with(|| ChunkEntry {
+                bytes: Arc::new(bytes.clone()),
+                refs: 0,
+                sealed_refs: 0,
+            });
+            entry.refs += 1;
+            entry.sealed_refs += 1;
+            if entry.sealed_refs == 1 {
+                self.retained_bytes += entry.bytes.len() as u64;
+            }
+        }
+        self.sealed.insert(
+            fold,
+            SealedFold {
+                tag: fam.tag.clone(),
+                byte_len: fam.byte_len,
+                #[allow(clippy::cast_possible_truncation)]
+                chunks: fam
+                    .chunks
+                    .iter()
+                    .map(|(h, b)| (h.0, b.len() as u32))
+                    .collect(),
+            },
+        );
+        self.family_order
+            .entry(fam.tag.clone())
+            .or_default()
+            .push_back(fold);
+        self.pinned.insert(fold);
+        fold
     }
 
     /// Reconstruct the [`daemon_vhc_proto::det_state::FamilyRef`] a by-reference checkpoint

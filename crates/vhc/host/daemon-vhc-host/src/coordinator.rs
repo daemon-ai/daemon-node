@@ -271,6 +271,7 @@ impl Coordinator {
                 capture,
                 restore: true,
                 migrate_fuel: None,
+                carried_state: Vec::new(),
             }),
         )
     }

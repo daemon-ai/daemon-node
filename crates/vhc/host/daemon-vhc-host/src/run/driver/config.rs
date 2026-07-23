@@ -353,4 +353,11 @@ pub struct MigrationInput {
     /// The explicit migrate fuel budget (§10.2 "under an explicit bounded budget"); `None` uses
     /// the engine's per-call fuel. Exhaustion traps `MigrateBudget`.
     pub migrate_fuel: Option<u64>,
+    /// Sealed det-state families carried from the DRAINING instance's store into this successor's
+    /// store within the in-process live-module-switch transaction ([SF-6]). Empty for a
+    /// content-plane late-join restore (whose chunks are fetched from the payload plane) — the
+    /// switch is the one migrate where the same node retains custody of canonical state, so the
+    /// successor serves these folds self-sealed ([SF-R1]) rather than fetching them from a plane
+    /// the in-process switch never published to.
+    pub carried_state: Vec<crate::run::state_store::CarriedFamily>,
 }
