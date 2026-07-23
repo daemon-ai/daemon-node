@@ -303,9 +303,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use daemon_vhc_host::run::{
-    admit, start_run_migrating, DeviceProfile, EnvelopeRoleGrants, MemorySink, MigrationInput,
-    OwnerPolicy, ParticipationLane, PumpHandle, Run, RunConfig, RunEnd, RunIdentity, SinkEntry,
-    SnapshotCapture, SpooledFrame,
+    admit, start_run_migrating, CarriedFamily, DeviceProfile, EnvelopeRoleGrants, MemorySink,
+    MigrationInput, OwnerPolicy, ParticipationLane, PumpHandle, Run, RunConfig, RunEnd,
+    RunIdentity, SinkEntry, SnapshotCapture, SpooledFrame,
 };
 use daemon_vhc_host::Worker;
 use daemon_vhc_proto::blake3_hash;
@@ -397,6 +397,9 @@ pub struct LiveUpgradeSteps<'w> {
     // captured / derived state
     journal_prefix: Vec<SinkEntry>,
     capture: Option<SnapshotCapture>,
+    /// The drain snapshot's sealed det-state families, lifted out of the draining instance's
+    /// store during quiesce (while it is still alive), to seed the successor's store ([SF-6]).
+    carried_state: Vec<CarriedFamily>,
     spooled: Vec<SpooledFrame>,
     pending: Option<ActivatedInstance>,
     activated: Option<ActivatedInstance>,
@@ -428,6 +431,7 @@ impl<'w> LiveUpgradeSteps<'w> {
             attempt: 0,
             journal_prefix: Vec::new(),
             capture: None,
+            carried_state: Vec::new(),
             spooled: Vec::new(),
             pending: None,
             activated: None,
@@ -564,6 +568,20 @@ impl UpgradeSteps for LiveUpgradeSteps<'_> {
             )
             .build()
             .map_err(|e| StepFailure::new(format!("seam manifest: {e:?}")))?;
+        // Carry the drain snapshot's sealed det-state families into the successor's store ([SF-6]):
+        // lift each by-reference family's chunks out of the DRAINING instance's store NOW, while
+        // it is still alive (its pump not yet dropped), so the successor serves them self-sealed
+        // ([SF-R1], host-local). The in-process switch publishes nothing to the content plane, so
+        // without this carry the successor's streamed restore would miss every chunk and trap.
+        // Held in this transaction until the successor's store is seeded — no window where the
+        // chunks exist nowhere (a crash leaves the old instance intact or the successor seedable).
+        for section in &capture.sections {
+            if let daemon_vhc_proto::det_state::CkptDocSection::ByRef(_, family) = section {
+                if let Some(carried) = self.old_pump.export_sealed_family(&family.fold.0) {
+                    self.carried_state.push(carried);
+                }
+            }
+        }
         self.capture = Some(capture);
         Ok(SnapshotSeam {
             manifest,
@@ -639,6 +657,10 @@ impl UpgradeSteps for LiveUpgradeSteps<'_> {
                 capture,
                 restore: true,
                 migrate_fuel: fuel,
+                // Seed the successor's store with the draining instance's sealed families ([SF-6])
+                // so its streamed restore resolves them self-sealed (clone: a retried attempt
+                // re-seeds a fresh successor store).
+                carried_state: self.carried_state.clone(),
             }),
         )
         .map_err(|e| StepFailure::new(format!("start_run_migrating: {e}")))?;

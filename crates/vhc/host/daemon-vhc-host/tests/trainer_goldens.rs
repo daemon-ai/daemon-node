@@ -1068,6 +1068,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
             capture,
             restore: true,
             migrate_fuel: None,
+            carried_state: Vec::new(),
         }),
     )
     .expect("start migrating");

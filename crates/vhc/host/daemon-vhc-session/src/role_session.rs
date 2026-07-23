@@ -323,6 +323,14 @@ async fn run_role(
     } = spec;
 
     let mut identity = run_cfg.identity.clone();
+    // The run-pinned genesis state contract's `state_chunk_size` ([SF-5]): captured before
+    // `run_cfg` is consumed so a later live module switch can provision the successor's state
+    // plane with it. `RunConfig::new` defaults it to 0 (state plane disabled), and the switch
+    // re-admits the NEW module without re-reading the genesis contract — so without carrying this
+    // the successor comes up unprovisioned: its self-sealed carried folds re-derive under
+    // `chunk_size = 0` (wrong identity) and its own `state_open` traps. It is genesis-pinned, so
+    // identical across the switch.
+    let run_state_chunk_size = run_cfg.state_chunk_size;
     let mut own_sender = own_cert.body.run_key;
     let own_cert_record = crate::distribution::DistributionRecord::Cert(own_cert.clone());
     if !peer_certs.contains(&own_cert) {
@@ -499,6 +507,7 @@ async fn run_role(
                             admitted_quotas.as_ref(),
                             run_label,
                             events,
+                            run_state_chunk_size,
                         )
                         .await
                         {
@@ -631,6 +640,7 @@ async fn perform_switch(
     admitted_quotas: Option<&AdmittedQuotas>,
     run_label: &str,
     events: &mpsc::UnboundedSender<Event>,
+    run_state_chunk_size: u64,
 ) -> SwitchStep {
     let old_identity = current.identity.clone();
 
@@ -833,6 +843,24 @@ async fn perform_switch(
         };
     };
     let spooled = old_pump.take_spooled_frames();
+    // Carry the drain snapshot's sealed det-state families into the successor's store within the
+    // switch transaction ([SF-6]): lift each by-reference family's chunks out of the DRAINING
+    // instance's store NOW, while `old_pump` is still alive (it is dropped just below). An
+    // in-process switch is the one migrate where the same node keeps custody of canonical state
+    // and publishes nothing to the content plane, so the successor serves these folds self-sealed
+    // ([SF-R1]); without this carry its streamed restore fetches them as externally-sourced and
+    // misses every chunk (payload miss → trap). Held in this Vec until the successor's store is
+    // seeded (below), so a crash mid-switch never leaves the chunks existing nowhere.
+    let carried_state: Vec<_> = capture
+        .sections
+        .iter()
+        .filter_map(|s| match s {
+            daemon_vhc_proto::det_state::CkptDocSection::ByRef(_, family) => {
+                old_pump.export_sealed_family(&family.fold.0)
+            }
+            daemon_vhc_proto::det_state::CkptDocSection::Inline(..) => None,
+        })
+        .collect();
     // Retire the old instance's handles BEFORE the seam journal opens: the journal seam
     // continues one file series, and the retired sink (inside the old pump state) must drop
     // first — one writer per series.
@@ -868,6 +896,11 @@ async fn perform_switch(
         cfg.claim_bytes = admission.claim_bytes.clone();
         cfg.manifest_bytes = admission.manifest_bytes.clone();
         admission.apply_quotas(&mut cfg);
+        // Provision the successor's state plane from the run-pinned genesis state contract
+        // ([SF-5]): `RunConfig::new` defaults `state_chunk_size` to 0 and `apply_quotas` never
+        // sets it (it is the contract, not a grant), so carry it from the run so the successor
+        // serves the carried folds self-sealed and its own `state_open` is provisioned.
+        cfg.state_chunk_size = run_state_chunk_size;
         let started = daemon_vhc_host::run::start_run_migrating(
             worker,
             &module_bytes,
@@ -877,6 +910,10 @@ async fn perform_switch(
                 capture: capture.clone(),
                 restore: true,
                 migrate_fuel: binding.migrate_fuel,
+                // The sealed families carried from the draining instance (above), so the
+                // successor's streamed restore resolves them self-sealed ([SF-R1]); clone because
+                // a rollback-and-retry attempt re-seeds a fresh successor store.
+                carried_state: carried_state.clone(),
             }),
         );
         let failure = match started {

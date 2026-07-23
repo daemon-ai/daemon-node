@@ -141,6 +141,8 @@ async fn join_live(
                 capture,
                 restore: true,
                 migrate_fuel: None,
+                // A content-plane late-join restore (checkpoint document from the payload plane).
+                carried_state: Vec::new(),
             })
         }
     };
