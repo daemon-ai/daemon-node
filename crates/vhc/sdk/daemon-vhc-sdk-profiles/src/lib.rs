@@ -10,6 +10,23 @@
 //! — pinned bit-for-bit by this crate's golden suite against the current SDK implementation
 //! (`tests/goldens.rs`; oracle provenance documented there).
 //!
+//! ## Resident vs streaming (why the resident profiles are retained)
+//!
+//! The production/guest det lane is the chunk-addressed [`streaming`] fold engine — the flagship
+//! trainer guest links ONLY [`streaming`] + [`SparseLocoCfg`] and holds no resident canonical
+//! state. The resident [`SparseLoco`]/[`DiLoCo`]/[`Demo`] implementations here are deliberately
+//! RETAINED as dev/test-quarantined reference math, for two reasons:
+//!
+//! - they are the **live parity oracle** the streaming engine is proven bit-identical against
+//!   (`tests/streaming_parity.rs`, `tests/streaming_schedule.rs`, and the trainer-golden capture
+//!   harness all recompute this oracle at test time — the proof is not self-standing frozen
+//!   captures, and a live oracle is strictly stronger evidence than a frozen capture of itself);
+//! - `DiLoCo`/`Demo` have no windowed counterpart and no production consumer, so windowing them
+//!   would be speculative surface; they stay as the pinned-golden baseline reference.
+//!
+//! Deleting these would delete evidence, not dead code. Do not re-derive a delete decision from
+//! stale design intent — retention here is the adjudicated outcome.
+//!
 //! ## The two lanes (architecture §3.2/§3.6)
 //!
 //! - **Det lane (`ingest`)** — consensus math peers must agree on byte-for-byte. Every kernel
@@ -322,33 +339,6 @@ impl SparseLoco {
     #[must_use]
     pub fn ef_state(&self) -> &[Vec<f32>] {
         &self.ef
-    }
-
-    /// Restore the error-feedback residuals from a checkpoint/migration snapshot (the counterpart
-    /// of [`SparseLoco::ef_state`]). Shapes must match the construction-time param layout.
-    ///
-    /// # Errors
-    /// A `String` naming the first param whose element count differs from the layout this profile
-    /// was built with — a shape drift fails loud, never a silent truncation.
-    pub fn restore_ef(&mut self, ef: Vec<Vec<f32>>) -> Result<(), String> {
-        if ef.len() != self.ef.len() {
-            return Err(format!(
-                "ef restore: {} params in the snapshot, {} in the layout",
-                ef.len(),
-                self.ef.len()
-            ));
-        }
-        for (i, (got, want)) in ef.iter().zip(self.ef.iter()).enumerate() {
-            if got.len() != want.len() {
-                return Err(format!(
-                    "ef restore: param {i} has {} elements, layout expects {}",
-                    got.len(),
-                    want.len()
-                ));
-            }
-        }
-        self.ef = ef;
-        Ok(())
     }
 }
 
