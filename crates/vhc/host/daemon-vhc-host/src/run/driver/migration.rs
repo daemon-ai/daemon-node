@@ -5,29 +5,58 @@
 //! level — the host never links the SDK's typed manifest) and the migration-descriptor
 //! encoding handed to `da_migrate` (manifest verbatim + restore bindings in manifest order).
 
+/// One restore binding the host hands `da_migrate` (ABI §10.2, [SF-6]): an **inline** section
+/// staged host-side (read via `read_back(kind = 3)`) or a **by-reference** family the new
+/// instance registers ([SF-R2]) and streams in `da_run`. Mirrors the SDK's `MigrationSection`
+/// untagged forms; built at the CBOR-value level (the host never links the SDK — dependency wall).
+pub(crate) enum RestoreBinding {
+    /// `{name, staging_id}` — an inline staged section.
+    Inline { name: String, staging_id: u64 },
+    /// `{name, family}` — a by-reference already-sealed family.
+    ByRef {
+        name: String,
+        family: daemon_vhc_proto::det_state::FamilyRef,
+    },
+}
+
 /// Build the §10.2 migration-descriptor bytes: the old module's accepted manifest **verbatim**
 /// (decoded and re-embedded as a CBOR value — the bytes were journaled verbatim as tag 10; the
 /// descriptor is a fresh encoding whose `manifest` field decodes to the identical value) plus the
 /// restore bindings in manifest order. Built at the CBOR-value level for the same dependency-wall
-/// reason as [`decode_manifest_sections`].
+/// reason as [`decode_manifest_sections`]; each by-ref family is re-encoded from its canonical
+/// form so the field decodes to the SDK's `FamilyRef` verbatim.
 pub(crate) fn build_migration_descriptor(
     manifest: &[u8],
-    bindings: &[(String, u64)],
+    bindings: &[RestoreBinding],
 ) -> Result<Vec<u8>, String> {
     use ciborium::value::Value;
     let manifest_value: Value = ciborium::de::from_reader(manifest).map_err(|e| e.to_string())?;
     let sections = bindings
         .iter()
-        .map(|(name, id)| {
-            Value::Map(vec![
-                (Value::Text("name".into()), Value::Text(name.clone())),
-                (
-                    Value::Text("staging_id".into()),
-                    Value::Integer((*id).into()),
-                ),
-            ])
+        .map(|b| -> Result<Value, String> {
+            Ok(match b {
+                RestoreBinding::Inline { name, staging_id } => Value::Map(vec![
+                    (Value::Text("name".into()), Value::Text(name.clone())),
+                    (
+                        Value::Text("staging_id".into()),
+                        Value::Integer((*staging_id).into()),
+                    ),
+                ]),
+                RestoreBinding::ByRef { name, family } => {
+                    // Re-encode the FamilyRef to a CBOR value so the descriptor's `family` field
+                    // decodes to the SDK `FamilyRef` shape verbatim.
+                    let family_bytes =
+                        daemon_vhc_proto::to_canonical_vec(family).map_err(|e| e.to_string())?;
+                    let family_value: Value = ciborium::de::from_reader(family_bytes.as_slice())
+                        .map_err(|e| e.to_string())?;
+                    Value::Map(vec![
+                        (Value::Text("name".into()), Value::Text(name.clone())),
+                        (Value::Text("family".into()), family_value),
+                    ])
+                }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     let descriptor = Value::Map(vec![
         (Value::Text("manifest".into()), manifest_value),
         (Value::Text("sections".into()), Value::Array(sections)),

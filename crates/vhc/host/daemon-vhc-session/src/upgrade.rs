@@ -549,8 +549,11 @@ impl UpgradeSteps for LiveUpgradeSteps<'_> {
             self.old_module,
             daemon_vhc_proto::StateDigest([0u8; 16]),
         );
-        for (name, bytes) in &capture.sections {
-            builder = builder.section(name.clone(), SectionKind::Module, 1, bytes);
+        for section in &capture.sections {
+            let bytes = section
+                .content_bytes()
+                .map_err(|e| StepFailure::new(format!("section content-bytes: {e}")))?;
+            builder = builder.section(section.name().to_string(), SectionKind::Module, 1, &bytes);
         }
         let manifest = builder
             .section(
@@ -605,8 +608,11 @@ impl UpgradeSteps for LiveUpgradeSteps<'_> {
             .ok_or_else(|| StepFailure::new("quiesce did not capture a snapshot"))?;
         // The typed seam content-addresses exactly the captured module state (E1's format).
         if let Some(module_section) = seam.manifest.section(SectionKind::Module) {
-            if let Some((_, first)) = capture.sections.first() {
-                if module_section.hash != blake3_hash(first) {
+            if let Some(first) = capture.sections.first() {
+                let first_bytes = first
+                    .content_bytes()
+                    .map_err(|e| StepFailure::new(format!("section content-bytes: {e}")))?;
+                if module_section.hash != blake3_hash(&first_bytes) {
                     return Err(StepFailure::new(
                         "seam module section does not content-address the captured snapshot",
                     ));

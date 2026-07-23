@@ -303,15 +303,22 @@ pub enum RunEnd {
 }
 
 /// The accepted snapshot an upgrade transaction carries across the module switch (ABI §10.2/§10.3
-/// step 2): the verbatim accepted state-manifest bytes plus the staged section bytes, in manifest
-/// order. Captured by `snapshot_state` on the OLD instance (via
-/// [`PumpHandle::snapshot_capture`]); consumed by [`MigrationInput`] on the NEW one.
+/// step 2): the verbatim accepted state-manifest bytes plus its sections, in manifest order.
+/// Captured by `snapshot_state` on the OLD instance (via [`PumpHandle::snapshot_capture`]);
+/// consumed by [`MigrationInput`] on the NEW one.
+///
+/// Sections are the checkpoint-document v2 forms ([SF-6]): **inline** bytes for small state (the
+/// round watermark), staged host-side; **by-reference** for already-sealed families
+/// (master/ef/adamw) — zero section bytes moved, the new instance registers the fold ([SF-R2])
+/// and streams it in `da_run`. A by-ref section's [`FamilyRef`](daemon_vhc_proto::det_state::FamilyRef)
+/// is reconstructed host-side from the draining instance's own state store
+/// ([`crate::run::state_store::StateStore::sealed_family_ref`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotCapture {
     /// The accepted state-manifest bytes, verbatim (journaled as tag 10).
     pub manifest: Vec<u8>,
-    /// `(section name, section bytes)` in the manifest's declared order.
-    pub sections: Vec<(String, Vec<u8>)>,
+    /// The checkpoint-document sections (inline or by-ref) in the manifest's declared order.
+    pub sections: Vec<daemon_vhc_proto::det_state::CkptDocSection>,
 }
 
 /// One authoritative frame that spooled undelivered through a Quiesce drain (§4.4), as

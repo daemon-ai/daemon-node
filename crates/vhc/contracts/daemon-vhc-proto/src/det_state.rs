@@ -669,6 +669,64 @@ impl CkptDocSection {
             Self::ByRef(name, _) | Self::Inline(name, _) => name,
         }
     }
+
+    /// The section's content bytes for content-addressing in a seam/upgrade manifest: inline
+    /// bytes verbatim, or the canonical [`FamilyRef`] encoding for a by-reference section (the
+    /// family's identity is its fold; the ref's canonical bytes are its stable seam content).
+    ///
+    /// # Errors
+    /// Propagates a codec error encoding a by-ref section (structurally unreachable).
+    pub fn content_bytes(&self) -> Result<Vec<u8>, VhcProtoError> {
+        match self {
+            Self::Inline(_, bytes) => Ok(bytes.clone()),
+            Self::ByRef(_, family) => to_canonical_vec(family),
+        }
+    }
+}
+
+/// Encode the **checkpoint-document v2** outer form (design §7.2): the 2-element array
+/// `[manifest_bytes, [ckpt-doc-section…]]` — the state-manifest bytes (opaque here; the module's
+/// §10.2 schema) as a byte string, followed by the section array in the manifest's declared
+/// order. This is the one shared codec the guest author, the session structural recognizer, and
+/// the restore decoder all use, so a by-ref section round-trips identically across the seam.
+pub fn encode_checkpoint_doc(
+    manifest_bytes: &[u8],
+    sections: &[CkptDocSection],
+) -> Result<Vec<u8>, VhcProtoError> {
+    use ciborium::value::Value;
+    let sections_val = Value::serialized(&sections)
+        .map_err(|e| VhcProtoError::Validation(format!("checkpoint-doc sections encode: {e}")))?;
+    let doc = Value::Array(vec![Value::Bytes(manifest_bytes.to_vec()), sections_val]);
+    let mut out = Vec::new();
+    ciborium::into_writer(&doc, &mut out)
+        .map_err(|e| VhcProtoError::Validation(format!("checkpoint-doc encode: {e}")))?;
+    Ok(out)
+}
+
+/// Decode a [`encode_checkpoint_doc`] document into `(manifest_bytes, sections)`. Fails typed on
+/// any structural surprise — a malformed checkpoint never yields a partial capture.
+pub fn decode_checkpoint_doc(
+    bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<CkptDocSection>), VhcProtoError> {
+    use ciborium::value::Value;
+    let doc: Value = ciborium::de::from_reader(bytes)
+        .map_err(|e| VhcProtoError::Validation(format!("checkpoint-doc decode: {e}")))?;
+    let Value::Array(parts) = doc else {
+        return Err(VhcProtoError::Validation(
+            "checkpoint-doc is not a 2-element array".into(),
+        ));
+    };
+    let [manifest_v, sections_v] = <[Value; 2]>::try_from(parts)
+        .map_err(|_| VhcProtoError::Validation("checkpoint-doc arity != 2".into()))?;
+    let Value::Bytes(manifest) = manifest_v else {
+        return Err(VhcProtoError::Validation(
+            "checkpoint-doc manifest is not a byte string".into(),
+        ));
+    };
+    let sections: Vec<CkptDocSection> = sections_v
+        .deserialized()
+        .map_err(|e| VhcProtoError::Validation(format!("checkpoint-doc sections decode: {e}")))?;
+    Ok((manifest, sections))
 }
 
 /// The profile-chunk constraint (genesis-authoring rule): the compression profile's `chunk`
@@ -913,6 +971,37 @@ mod tests {
         fam.chunk_hashes = hashes;
         fam.fold = family_fold(32, fam.byte_len, &fam.chunk_hashes);
         assert!(m.validate_with_numels(&[16, 4, 8]).is_err());
+    }
+
+    #[test]
+    fn checkpoint_doc_round_trips_mixed_sections() {
+        let params: Vec<Vec<u8>> = [16u64, 4].iter().map(|&n| param_bytes(n, n)).collect();
+        let views: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
+        let entry = FamilyEntry::author(&views, 24).unwrap();
+        let fref = FamilyRef {
+            fold: entry.fold,
+            byte_len: entry.byte_len,
+            chunk_size: 24,
+            chunk_hashes: entry.chunk_hashes,
+        };
+        let manifest = b"opaque-state-manifest-bytes".to_vec();
+        let sections = vec![
+            CkptDocSection::ByRef("master".into(), fref.clone()),
+            CkptDocSection::Inline("round".into(), 7u64.to_le_bytes().to_vec()),
+        ];
+        let doc = encode_checkpoint_doc(&manifest, &sections).unwrap();
+        let (back_manifest, back_sections) = decode_checkpoint_doc(&doc).unwrap();
+        assert_eq!(back_manifest, manifest, "manifest bytes survive verbatim");
+        assert_eq!(back_sections, sections, "sections survive the round-trip");
+        // The by-ref section is fully reconstructable (fold self-consistent).
+        let CkptDocSection::ByRef(_, back_ref) = &back_sections[0] else {
+            panic!("first section is by-ref");
+        };
+        back_ref.validate().unwrap();
+        assert_eq!(back_ref, &fref);
+        // A truncated / non-array doc is a typed refusal, never a partial capture.
+        assert!(decode_checkpoint_doc(&doc[..doc.len() - 1]).is_err());
+        assert!(decode_checkpoint_doc(b"\x01").is_err());
     }
 
     #[test]

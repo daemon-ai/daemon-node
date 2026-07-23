@@ -676,6 +676,22 @@ impl PumpHandle {
         std::mem::take(&mut self.shared.state.lock().expect("pump lock").op_requests)
     }
 
+    /// The `(chunk hash, chunk bytes)` list of a fold this instance self-sealed ([SF-R1]) — the
+    /// content a checkpoint publisher uploads to the payload plane, and what the golden harness
+    /// reads from the draining instance to stand in for that plane. `None` if not sealed here.
+    #[must_use]
+    pub fn sealed_fold_chunks(
+        &self,
+        fold: &[u8; 32],
+    ) -> Option<Vec<(daemon_vhc_proto::Hash, Vec<u8>)>> {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .state
+            .sealed_chunks(fold)
+    }
+
     /// The registered **det-state** chunk map for `fold`, if the guest registered one ([SF-R2]).
     /// The chunk-keyed resolver ([SF-6] restore carriage) consults this — the single source of
     /// truth for a family's covering geometry — to decompose an `ArtifactRange` covering span into

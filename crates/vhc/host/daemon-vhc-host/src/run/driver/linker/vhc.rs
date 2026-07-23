@@ -459,34 +459,58 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         "a snapshot was already accepted in this drain (§10.2)",
                     ));
                 }
-                // Verify every declared section is guest-staged and hash-consistent; rejected
-                // attempts MAY be corrected and retried within the drain (never "exactly once").
-                let mut captured: Vec<(String, Vec<u8>)> = Vec::with_capacity(sections.len());
+                // Verify + capture every declared section in one of the two §10.2/[SF-6] forms;
+                // rejected attempts MAY be corrected and retried within the drain (never "exactly
+                // once"). INLINE: a guest-staged plain-bytes entry matching by content hash (the
+                // small round watermark). BY-REFERENCE: the decl's `hash` is a family FOLD the
+                // instance itself sealed — the host reconstructs the FamilyRef from its own state
+                // store (chunk hashes recorded on emit; §7.2), moving zero section bytes, so the
+                // per-section byte cap does not apply to it.
+                let mut captured: Vec<daemon_vhc_proto::det_state::CkptDocSection> =
+                    Vec::with_capacity(sections.len());
                 for decl in &sections {
-                    if max_section_bytes != 0 && decl.size > max_section_bytes {
-                        return Ok(daemon_vhc_abi::SNAPSHOT_STATE_GRANT_EXCEEDED);
-                    }
-                    // Match a guest-staged (§10.2 top-bit id) plain-bytes entry by content hash.
-                    let found = st.staged.iter().find(|(id, (kind, bytes))| {
-                        *id & daemon_vhc_abi::GUEST_STAGING_ID_TOP_BIT != 0
-                            && *kind == STAGED_KIND_BYTES
-                            && bytes.len() as u64 == decl.size
-                            && blake3::hash(bytes).as_bytes() == &decl.hash
-                    });
-                    match found {
-                        Some((_, (_, bytes))) => captured.push((decl.name.clone(), bytes.clone())),
-                        None => {
-                            // Distinguish the §10.2 statuses: staged-but-mutated vs never staged.
-                            let name_sized = st.staged.values().any(|(kind, bytes)| {
-                                *kind == STAGED_KIND_BYTES && bytes.len() as u64 == decl.size
-                            });
-                            return Ok(if name_sized {
-                                daemon_vhc_abi::SNAPSHOT_STATE_HASH_MISMATCH
-                            } else {
-                                SNAPSHOT_STATE_SECTION_MISSING
-                            });
+                    let inline = st
+                        .staged
+                        .iter()
+                        .find(|(id, (kind, bytes))| {
+                            *id & daemon_vhc_abi::GUEST_STAGING_ID_TOP_BIT != 0
+                                && *kind == STAGED_KIND_BYTES
+                                && bytes.len() as u64 == decl.size
+                                && blake3::hash(bytes).as_bytes() == &decl.hash
+                        })
+                        .map(|(_, (_, bytes))| bytes.clone());
+                    if let Some(bytes) = inline {
+                        if max_section_bytes != 0 && decl.size > max_section_bytes {
+                            return Ok(daemon_vhc_abi::SNAPSHOT_STATE_GRANT_EXCEEDED);
                         }
+                        captured.push(daemon_vhc_proto::det_state::CkptDocSection::Inline(
+                            decl.name.clone(),
+                            bytes,
+                        ));
+                        continue;
                     }
+                    if let Some(fref) = st.state.sealed_family_ref(&decl.hash) {
+                        // The manifest's declared `size` for a by-ref section is the family
+                        // byte_len; a disagreement is the §10.2 hash/geometry-mismatch status.
+                        if fref.byte_len != decl.size {
+                            return Ok(daemon_vhc_abi::SNAPSHOT_STATE_HASH_MISMATCH);
+                        }
+                        captured.push(daemon_vhc_proto::det_state::CkptDocSection::ByRef(
+                            decl.name.clone(),
+                            fref,
+                        ));
+                        continue;
+                    }
+                    // Neither staged bytes nor a known self-sealed fold: distinguish the §10.2
+                    // statuses (staged-but-mutated vs never staged).
+                    let name_sized = st.staged.values().any(|(kind, bytes)| {
+                        *kind == STAGED_KIND_BYTES && bytes.len() as u64 == decl.size
+                    });
+                    return Ok(if name_sized {
+                        daemon_vhc_abi::SNAPSHOT_STATE_HASH_MISMATCH
+                    } else {
+                        SNAPSHOT_STATE_SECTION_MISSING
+                    });
                 }
                 // Accepted: journal the manifest verbatim (tag 10) under the sink's durability
                 // barrier (§8.4 rule 2), then capture for the upgrade transaction.

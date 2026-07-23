@@ -419,6 +419,21 @@ impl StateStore {
         self.sealed.get(hash)
     }
 
+    /// The `(chunk hash, chunk bytes)` list of a sealed fold in fold order — what a checkpoint
+    /// publisher (or the golden harness standing in for the payload plane) uploads content-addressed
+    /// so a restoring instance's chunk-keyed [SF-R2] fetch resolves. `None` if the fold is not
+    /// sealed here.
+    #[must_use]
+    pub fn sealed_chunks(&self, fold: &[u8; 32]) -> Option<Vec<(daemon_vhc_proto::Hash, Vec<u8>)>> {
+        let sealed = self.sealed.get(fold)?;
+        let mut out = Vec::with_capacity(sealed.chunks.len());
+        for (h, _len) in &sealed.chunks {
+            let entry = self.chunks.get(h)?;
+            out.push((daemon_vhc_proto::Hash(*h), (*entry.bytes).clone()));
+        }
+        Some(out)
+    }
+
     /// Reconstruct the [`daemon_vhc_proto::det_state::FamilyRef`] a by-reference checkpoint
     /// section carries (design §7.2, [SF-6]) from the store's own record of a self-sealed fold.
     /// `None` when the fold is not sealed here. The host is the authority for its self-sealed
