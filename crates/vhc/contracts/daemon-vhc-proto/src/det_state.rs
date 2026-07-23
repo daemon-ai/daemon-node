@@ -150,6 +150,219 @@ pub fn family_chunk_hashes(params: &[&[u8]], chunk_size: u64) -> Vec<Hash> {
         .collect()
 }
 
+/// The per-chunk byte lengths of a param-shaped family under the per-parameter chunking rule, in
+/// order — the length-aware twin of [`family_chunk_hashes`]. Interior parameters end in a short
+/// tail (a parameter never spans a chunk boundary), so the sequence is NOT a uniform grid; these
+/// are the lengths a [`DetStateChunkMap`] carries so an externally-registered fold resolves ranges
+/// against actual offsets ([SF-R2]).
+#[must_use]
+pub fn family_chunk_lens(numels: &[u64], chunk_size: u64) -> Vec<u32> {
+    let mut lens = Vec::new();
+    if chunk_size == 0 {
+        return lens;
+    }
+    for &n in numels {
+        let mut remaining = n * STATE_ELEM_BYTES;
+        while remaining > 0 {
+            let take = remaining.min(chunk_size);
+            #[allow(clippy::cast_possible_truncation)]
+            lens.push(take as u32);
+            remaining -= take;
+        }
+    }
+    lens
+}
+
+/// A **det-state registration descriptor** ([SF-R2], ruling of 2026-07-23): what a guest passes to
+/// register an *externally-sourced* family fold (artifact-form init, restore roots) so a
+/// subsequent `data@2::fetch` resolves ranges **length-aware**. Per-parameter chunking gives a
+/// family interior short tails, so — unlike the uniform-grid corpus [`crate::corpus::ChunkMap`] —
+/// the covering geometry needs explicit per-chunk lengths.
+///
+/// The lengths are **guest-derived from the layout** (numels + chunk_size, [`family_chunk_lens`]),
+/// NOT a new field on [`FamilyRef`] or [`DetStateManifest`]: the family fold already pins the
+/// ordered chunk hashes; the lengths are only framing hints for where to split served bytes. A
+/// lying descriptor cannot corrupt — a wrong split re-hashes to something other than the granted
+/// `c_i` and fails [`DetStateChunkMap::verify_covering_span`] chunk-by-chunk. So root minimality
+/// and digest continuity are preserved with no new trust surface (the deciding argument for the
+/// ruling): the fold is the integrity anchor, the lengths are self-correcting framing. This is the
+/// symmetric twin of the self-sealed state store's `(hash, len)` model — self-sealed folds carry
+/// their emitted lengths, externally-registered folds carry derived lengths, both resolve by
+/// walking actual offsets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetStateChunkMap {
+    /// The state chunk size the family was chunked at.
+    pub chunk_size: u64,
+    /// The family's total byte length.
+    pub byte_len: u64,
+    /// `(chunk blake3, chunk len)` in fold order — lengths derived from the parameter layout.
+    pub chunks: Vec<(Hash, u32)>,
+}
+
+impl DetStateChunkMap {
+    /// Derive a descriptor from a family's ordered chunk hashes + the parameter layout: pair each
+    /// hash with its per-parameter-chunking length ([`family_chunk_lens`]). The `chunk_hashes`
+    /// come from the fetched [`FamilyRef`]/[`DetStateManifest`]; the guest already knows `numels`.
+    ///
+    /// # Errors
+    /// [`VhcProtoError::Validation`] when the derived length count does not match the supplied
+    /// chunk-hash count (the fetched geometry disagrees with the layout — a typed refusal, never a
+    /// silent mismatch).
+    pub fn derive(
+        chunk_size: u64,
+        numels: &[u64],
+        chunk_hashes: &[Hash],
+    ) -> Result<Self, VhcProtoError> {
+        let lens = family_chunk_lens(numels, chunk_size);
+        if lens.len() != chunk_hashes.len() {
+            return Err(VhcProtoError::Validation(format!(
+                "det-state descriptor: layout yields {} chunks but the fetched family lists {}",
+                lens.len(),
+                chunk_hashes.len()
+            )));
+        }
+        Ok(Self {
+            chunk_size,
+            byte_len: family_byte_len(numels),
+            chunks: chunk_hashes.iter().copied().zip(lens).collect(),
+        })
+    }
+
+    /// The family fold this descriptor covers (its artifact identity — the value that must be a
+    /// granted artifact for the registered fold to be fetchable, exactly the corpus posture).
+    #[must_use]
+    pub fn fold(&self) -> Hash {
+        let hashes: Vec<Hash> = self.chunks.iter().map(|(h, _)| *h).collect();
+        family_fold(self.chunk_size, self.byte_len, &hashes)
+    }
+
+    /// Structural validity: non-degenerate geometry, every chunk `0 < len ≤ chunk_size`, and the
+    /// lengths summing to exactly `byte_len` (the framing is well-formed). The fold is NOT
+    /// self-checkable here (it is derived, not carried) — the host admits the map only when
+    /// [`Self::fold`] is a granted artifact, and verification re-hashes each served chunk.
+    pub fn validate(&self) -> Result<(), VhcProtoError> {
+        if self.chunk_size == 0 || self.byte_len == 0 || self.chunks.is_empty() {
+            return Err(VhcProtoError::Validation(
+                "det-state chunk map needs non-zero geometry and a chunk list".into(),
+            ));
+        }
+        let mut total = 0u64;
+        for (i, (_, len)) in self.chunks.iter().enumerate() {
+            let len = u64::from(*len);
+            if len == 0 || len > self.chunk_size {
+                return Err(VhcProtoError::Validation(format!(
+                    "det-state chunk {i} length {len} is not in 1..={}",
+                    self.chunk_size
+                )));
+            }
+            total += len;
+        }
+        if total != self.byte_len {
+            return Err(VhcProtoError::Validation(format!(
+                "det-state chunk lengths sum to {total}, not the declared byte_len {}",
+                self.byte_len
+            )));
+        }
+        Ok(())
+    }
+
+    /// The minimal chunk-aligned covering span of the byte range `[off, end)` under the actual
+    /// per-chunk offsets (the det-state analogue of [`crate::corpus::covering_span`], length-aware
+    /// rather than uniform-grid): returns `(span_off, span_len)` where `span_off` is the start of
+    /// the first chunk touching `off` and the span ends at the end of the last chunk touching
+    /// `end`. `(off, 0)` for an empty range.
+    #[must_use]
+    pub fn covering_span(&self, off: u64, end: u64) -> (u64, u64) {
+        if off >= end {
+            return (off, 0);
+        }
+        let mut cursor = 0u64;
+        let mut span_off = 0u64;
+        let mut span_end = 0u64;
+        let mut started = false;
+        for (_, len) in &self.chunks {
+            let chunk_start = cursor;
+            let chunk_end = cursor + u64::from(*len);
+            cursor = chunk_end;
+            if chunk_end <= off {
+                continue;
+            }
+            if chunk_start >= end {
+                break;
+            }
+            if !started {
+                span_off = chunk_start;
+                started = true;
+            }
+            span_end = chunk_end;
+        }
+        if !started {
+            return (off, 0);
+        }
+        (span_off, span_end - span_off)
+    }
+
+    /// Verify a covering span served from an untrusted store against the descriptor's fold-pinned
+    /// chunk hashes, walking the actual per-chunk offsets: `span_off` must fall on a chunk
+    /// boundary, and every chunk the span covers must blake3 to the descriptor's hash at that
+    /// position. Returns the verified bytes, or the first mismatch described. A lying length or a
+    /// tampered store fails HERE — the fold-committed hashes are the anchor.
+    ///
+    /// # Errors
+    /// A `String` describing a boundary/length/hash violation.
+    pub fn verify_covering_span(&self, span_off: u64, bytes: &[u8]) -> Result<(), VhcProtoError> {
+        // Locate the starting chunk index (span_off must be a chunk boundary).
+        let mut cursor = 0u64;
+        let mut index = 0usize;
+        while index < self.chunks.len() && cursor < span_off {
+            cursor += u64::from(self.chunks[index].1);
+            index += 1;
+        }
+        if cursor != span_off {
+            return Err(VhcProtoError::Validation(format!(
+                "det-state span_off {span_off} is not a chunk boundary"
+            )));
+        }
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let Some((hash, len)) = self.chunks.get(index) else {
+                return Err(VhcProtoError::Validation(format!(
+                    "det-state span reaches past the chunk list (chunk {index})"
+                )));
+            };
+            let end = pos + *len as usize;
+            if end > bytes.len() {
+                return Err(VhcProtoError::Validation(format!(
+                    "det-state span truncates chunk {index} ({} of {len} bytes)",
+                    bytes.len() - pos
+                )));
+            }
+            if blake3_hash(&bytes[pos..end]) != *hash {
+                return Err(VhcProtoError::Validation(format!(
+                    "det-state chunk {index} does not hash to the fold-registered chunk hash"
+                )));
+            }
+            pos = end;
+            index += 1;
+        }
+        Ok(())
+    }
+
+    /// Encode to the one wire form (canonical CBOR) — the descriptor a guest passes to the host's
+    /// det-state chunk registration import, after [`Self::validate`].
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, VhcProtoError> {
+        self.validate()?;
+        to_canonical_vec(self)
+    }
+
+    /// Decode + validate a descriptor from its canonical bytes.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, VhcProtoError> {
+        let map: Self = from_canonical_slice(bytes)?;
+        map.validate()?;
+        Ok(map)
+    }
+}
+
 /// The layout binding: the parameter count and the blake3 of the canonical-CBOR numels list —
 /// enough for a peer to refuse a manifest authored over a different registration-order layout
 /// without carrying the (large) list itself.
@@ -680,6 +893,103 @@ mod tests {
         assert_eq!(back, sections);
         assert_eq!(back[0].name(), "round");
         assert_eq!(back[1].name(), "master");
+    }
+
+    #[test]
+    fn det_state_chunk_map_derives_lengths_and_matches_the_fold() {
+        // numels 16/4/8 f32 → 64/16/32 bytes; chunk 24 → per-param 3+1+2 = 6 chunks.
+        let numels = [16u64, 4, 8];
+        let params: Vec<Vec<u8>> = numels
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| param_bytes(i as u64 + 1, n))
+            .collect();
+        let views: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
+        let entry = FamilyEntry::author(&views, 24).unwrap();
+
+        let lens = family_chunk_lens(&numels, 24);
+        assert_eq!(
+            lens,
+            vec![24, 24, 16, 16, 24, 8],
+            "per-parameter short tails"
+        );
+
+        let map = DetStateChunkMap::derive(24, &numels, &entry.chunk_hashes).unwrap();
+        map.validate().unwrap();
+        // The descriptor covers the SAME fold identity as the manifest family entry.
+        assert_eq!(map.fold(), entry.fold);
+        assert_eq!(map.byte_len, 112);
+        assert_eq!(map.chunks.len(), 6);
+
+        // Round-trips through canonical CBOR.
+        let wire = map.to_canonical_bytes().unwrap();
+        assert_eq!(DetStateChunkMap::from_canonical_bytes(&wire).unwrap(), map);
+
+        // A layout that disagrees with the fetched chunk-hash count is a typed refusal.
+        assert!(DetStateChunkMap::derive(24, &[16, 4], &entry.chunk_hashes).is_err());
+    }
+
+    #[test]
+    fn det_state_verify_walks_actual_offsets_and_catches_lies() {
+        let numels = [16u64, 4, 8];
+        let params: Vec<Vec<u8>> = numels
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| param_bytes(i as u64 + 1, n))
+            .collect();
+        let flat: Vec<u8> = params.concat(); // the family byte image
+        let views: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
+        let entry = FamilyEntry::author(&views, 24).unwrap();
+        let map = DetStateChunkMap::derive(24, &numels, &entry.chunk_hashes).unwrap();
+
+        // A whole-family span at a boundary verifies.
+        map.verify_covering_span(0, &flat).unwrap();
+
+        // The covering span of an interior range is chunk-aligned to actual offsets; serving it
+        // verifies, and the served span is exactly the covering chunks.
+        let (span_off, span_len) = map.covering_span(30, 70);
+        assert_eq!(
+            span_off, 24,
+            "starts at the boundary of the chunk containing 30"
+        );
+        let served = flat[span_off as usize..(span_off + span_len) as usize].to_vec();
+        map.verify_covering_span(span_off, &served).unwrap();
+
+        // A tampered byte fails re-verification (the fold-pinned hashes are the anchor).
+        let mut bad = flat.clone();
+        bad[0] ^= 0xff;
+        assert!(map.verify_covering_span(0, &bad).is_err());
+
+        // A span_off that is not a chunk boundary is refused.
+        assert!(map.verify_covering_span(10, &flat[10..]).is_err());
+
+        // A lying length (claim a full-width tail) makes the split re-hash wrong → refused.
+        let mut lying = map.clone();
+        let last = lying.chunks.len() - 1;
+        lying.chunks[last].1 = 24; // was 8
+        lying.byte_len += 16;
+        assert!(lying.verify_covering_span(0, &flat).is_err());
+    }
+
+    #[test]
+    fn det_state_chunk_map_validate_rejects_broken_framing() {
+        let numels = [8u64];
+        let params: Vec<Vec<u8>> = numels.iter().map(|&n| param_bytes(1, n)).collect();
+        let views: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
+        let entry = FamilyEntry::author(&views, 16).unwrap();
+        let good = DetStateChunkMap::derive(16, &numels, &entry.chunk_hashes).unwrap();
+
+        let mut m = good.clone();
+        m.chunks[0].1 = 0;
+        assert!(m.validate().is_err(), "zero-length chunk");
+
+        let mut m = good.clone();
+        m.chunks[0].1 = 99; // > chunk_size
+        assert!(m.validate().is_err(), "chunk longer than chunk_size");
+
+        let mut m = good;
+        m.byte_len += 1; // lengths no longer sum to byte_len
+        assert!(m.validate().is_err(), "length sum mismatch");
     }
 
     #[test]

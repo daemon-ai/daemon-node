@@ -40,6 +40,19 @@ pub trait GuestModule: Sized {
     /// The static declaration the manifest + claim derive from.
     fn decl() -> ModuleDecl;
 
+    /// The **config-dependent** declaration (ABI §9.1): the honest manifest/claim derive from the
+    /// run config, not a fixed constant. A module whose host/device footprint is a function of the
+    /// geometry it is admitted for — the streamed trainer's working set is O(window buffers +
+    /// resident payload sections + bookkeeping), derived from the model layout + profile — makes
+    /// its claim honest here, so the fleet preflight's capability-fit line item is checkable
+    /// (production program §9). The default is config-independent (`Self::decl()`), so modules
+    /// with a fixed footprint need not override it. `da_manifest`/`da_claim` are handed the config
+    /// span the host wrote (both run before `da_init`).
+    fn decl_for_config(config: &[u8]) -> ModuleDecl {
+        let _ = config;
+        Self::decl()
+    }
+
     /// Build state from config + grants (`da_init`, ABI §2.3) — bridge registration is legal
     /// exactly here (§2.5). A nonzero code refuses the join (module-defined detail ≥ 16).
     fn init(config: &[u8], grants: &[u8]) -> Result<Self, u32>;

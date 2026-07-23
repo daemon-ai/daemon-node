@@ -66,6 +66,12 @@ pub enum DetError {
         /// The chunk size it exceeded.
         chunk: usize,
     },
+    /// A seed-init expansion named a distribution id this build does not implement (the id is a
+    /// derivation identity — an unknown one is a typed refusal, never a silent reinterpretation).
+    UnsupportedDist {
+        /// The unimplemented distribution id.
+        dist: u64,
+    },
 }
 
 impl fmt::Display for DetError {
@@ -89,6 +95,9 @@ impl fmt::Display for DetError {
             Self::Empty => write!(f, "empty operand list: no shape to infer"),
             Self::KTooLarge { k, chunk } => {
                 write!(f, "top-k k={k} exceeds chunk size {chunk}")
+            }
+            Self::UnsupportedDist { dist } => {
+                write!(f, "unsupported seed-init distribution id {dist}")
             }
         }
     }
@@ -685,6 +694,106 @@ fn f16_bits_to_f32(h: u16) -> f32 {
     }
 }
 
+// -- seed-derived init (genesis state-contract seed init; ABI §12.14 [SF-5], design §6.1a) -------
+//
+// The deterministic, versioned expansion of a fresh joiner's matched initial canonical state from
+// a 32-byte seed + a distribution id — the seed form of the genesis init pin. Like every kernel in
+// this crate it is fixed-order fp32 and dual-compiled (wasm32 guest ≡ native host, bit-exact), so
+// every peer that shares (seed, dist) reproduces byte-identical init and the genesis
+// `expected_root` cross-check is meaningful. The expansion is **counter-based**: element `e` of a
+// parameter is a pure function of the parameter's stream key and `e`, so any window `[off, len)`
+// expands independently of the split — the guest streams one bounded window at a time (O(window)
+// memory, one O(N) pass per fresh join), emitting through `state_open`/`state_emit`/`state_seal`
+// and sealing to a fold it checks against the pinned `expected_root`.
+
+/// The versioned seed-init distribution id this build expands (`StateContract` seed init `dist`).
+/// A different law is a NEW id — the id is a derivation identity, never silently reinterpreted;
+/// an unknown id is [`DetError::UnsupportedDist`], and the pinned `expected_root` is the final
+/// cross-check.
+pub const SEED_INIT_DIST_V1: u64 = 1;
+
+/// The half-width of the `SEED_INIT_DIST_V1` symmetric-uniform init interval `[-SCALE, +SCALE]`
+/// (a conventional small init magnitude; role-aware laws — e.g. unit-init norms — would be a new
+/// dist id, a genesis-authoring choice for the model that adopts them).
+const SEED_INIT_V1_SCALE: f32 = 0.02;
+
+/// The splitmix64 odd increment / mixing gamma (the canonical constant).
+const SEED_INIT_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The splitmix64 finalizer, re-hosted here so the det crate keeps its zero-dependency contract.
+/// Pure integer arithmetic — bit-identical on wasm32 and native.
+fn splitmix64_mix(z: u64) -> u64 {
+    let mut z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The per-parameter stream base key: folds the 32-byte seed (four LE u64 words), the distribution
+/// id, and the registration-order parameter index into one mixed key, so distinct parameters draw
+/// disjoint streams and a different seed or dist yields a disjoint expansion.
+fn seed_param_key(seed: &[u8; 32], dist: u64, param_index: u64) -> u64 {
+    let mut k = splitmix64_mix(dist.wrapping_mul(SEED_INIT_GAMMA));
+    for w in 0..4 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&seed[w * 8..w * 8 + 8]);
+        k = splitmix64_mix(k ^ u64::from_le_bytes(b));
+    }
+    splitmix64_mix(k ^ param_index.wrapping_mul(SEED_INIT_GAMMA))
+}
+
+/// One element's f32 value under `SEED_INIT_DIST_V1`: a counter-based draw (element `e` is a pure
+/// function of the parameter key and `e`) mapped to a uniform value in
+/// `[-SEED_INIT_V1_SCALE, +SEED_INIT_V1_SCALE)` from the draw's top 24 bits — an exactly
+/// representable `[0, 1)` fraction, then the fixed affine, all fixed-order f32.
+fn seed_init_v1_value(param_key: u64, elem_index: u64) -> f32 {
+    let draw = splitmix64_mix(param_key.wrapping_add(elem_index.wrapping_mul(SEED_INIT_GAMMA)));
+    #[allow(clippy::cast_precision_loss)]
+    let unit = (draw >> 40) as f32 / 16_777_216.0_f32;
+    (unit * 2.0_f32 - 1.0_f32) * SEED_INIT_V1_SCALE
+}
+
+/// Expand one parameter's `[off, off + len)` element window of the seed-derived init into `out`
+/// (cleared first), in element order — the window-streaming entry point the guest drives one
+/// bounded window at a time. Values are independent of the window split (`param_index` is the
+/// registration-order position).
+///
+/// # Errors
+/// [`DetError::UnsupportedDist`] when `dist` is not a distribution id this build implements.
+pub fn seed_init_window(
+    seed: &[u8; 32],
+    dist: u64,
+    param_index: u64,
+    off: usize,
+    len: usize,
+    out: &mut Vec<f32>,
+) -> Result<(), DetError> {
+    if dist != SEED_INIT_DIST_V1 {
+        return Err(DetError::UnsupportedDist { dist });
+    }
+    out.clear();
+    out.reserve(len);
+    let key = seed_param_key(seed, dist, param_index);
+    for e in 0..len {
+        out.push(seed_init_v1_value(key, (off + e) as u64));
+    }
+    Ok(())
+}
+
+/// Expand a whole parameter of `numel` elements ([`seed_init_window`] over `[0, numel)`).
+///
+/// # Errors
+/// [`DetError::UnsupportedDist`] for an unknown `dist`.
+pub fn seed_init_param(
+    seed: &[u8; 32],
+    dist: u64,
+    param_index: u64,
+    numel: usize,
+) -> Result<Vec<f32>, DetError> {
+    let mut out = Vec::new();
+    seed_init_window(seed, dist, param_index, 0, numel, &mut out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,5 +1200,84 @@ mod tests {
         for (a, b) in s1.iter().zip(s2.iter()) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+    }
+
+    // -- seed-derived init -----------------------------------------------------------------------
+
+    /// The pinned first three draws (f32 bit patterns) of parameter 5 under [`seed32`] +
+    /// [`SEED_INIT_DIST_V1`] — the reproducibility vector for the `dist=1` law.
+    const SEED_INIT_V1_PIN: [u32; 3] = [0xbc01_a780, 0xbc5b_e6ae, 0xbaa8_6e29];
+
+    /// A fixed seed for the seed-init vectors (distinct byte pattern per word).
+    fn seed32() -> [u8; 32] {
+        let mut s = [0u8; 32];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(1);
+        }
+        s
+    }
+
+    #[test]
+    fn seed_init_window_split_is_independent_of_boundaries() {
+        let seed = seed32();
+        // The whole parameter expanded in one call…
+        let whole = seed_init_param(&seed, SEED_INIT_DIST_V1, 3, 40).unwrap();
+        // …equals any concatenation of windows (element e is a pure function of (key, e)).
+        let mut pieced = Vec::new();
+        for (off, len) in [(0usize, 7usize), (7, 1), (8, 20), (28, 12)] {
+            let mut w = Vec::new();
+            seed_init_window(&seed, SEED_INIT_DIST_V1, 3, off, len, &mut w).unwrap();
+            pieced.extend(w);
+        }
+        assert_eq!(whole.len(), 40);
+        for (a, b) in whole.iter().zip(pieced.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "window split changed a value");
+        }
+    }
+
+    #[test]
+    fn seed_init_streams_are_per_parameter_disjoint_and_in_range() {
+        let seed = seed32();
+        let p0 = seed_init_param(&seed, SEED_INIT_DIST_V1, 0, 16).unwrap();
+        let p1 = seed_init_param(&seed, SEED_INIT_DIST_V1, 1, 16).unwrap();
+        assert_ne!(p0, p1, "distinct parameters draw distinct streams");
+        for v in p0.iter().chain(p1.iter()) {
+            assert!(
+                v.abs() <= SEED_INIT_V1_SCALE,
+                "value {v} outside the init interval"
+            );
+        }
+        // A different seed yields a disjoint expansion.
+        let mut other = seed;
+        other[0] ^= 0xff;
+        assert_ne!(
+            seed_init_param(&other, SEED_INIT_DIST_V1, 0, 16).unwrap(),
+            p0
+        );
+    }
+
+    #[test]
+    fn seed_init_is_bit_reproducible_and_pins_the_law() {
+        let seed = seed32();
+        let a = seed_init_param(&seed, SEED_INIT_DIST_V1, 5, 12).unwrap();
+        let b = seed_init_param(&seed, SEED_INIT_DIST_V1, 5, 12).unwrap();
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.to_bits(), y.to_bits());
+        }
+        // Pin the exact first three draws of parameter 5 (the reproducibility vector — any change
+        // to the law's constants or ordering is a NEW dist id, never a silent edit).
+        let pinned: [u32; 3] = [a[0].to_bits(), a[1].to_bits(), a[2].to_bits()];
+        assert_eq!(
+            pinned, SEED_INIT_V1_PIN,
+            "seed-init law drifted (bump the dist id, don't edit)"
+        );
+    }
+
+    #[test]
+    fn seed_init_unknown_dist_is_typed() {
+        assert_eq!(
+            seed_init_param(&seed32(), 999, 0, 4).unwrap_err(),
+            DetError::UnsupportedDist { dist: 999 }
+        );
     }
 }
