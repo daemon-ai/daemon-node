@@ -372,8 +372,15 @@ impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
                         IngestOutcome::Deferred => {
                             // The experiment kicked off its async fold. Take the round out of the
                             // queue (it IS being ingested) and record it as in-flight; the loop
-                            // condition now blocks further ingest until `finish_ingest`.
+                            // condition now blocks further ingest until `finish_ingest`. Advance
+                            // the resync watermark NOW, at acceptance — not at seal: a duplicate
+                            // record arriving mid-fold must be dropped (`rr.round <= last_ingested`
+                            // in `on_round_record`), else it re-queues behind the deferred fold and
+                            // re-ingests when the queue resumes (a double outer-step + a second
+                            // digest voice). In-flight folds are never checkpointed, so this never
+                            // over-advances a restore watermark.
                             self.pending.remove(&round);
+                            self.last_ingested = Some(round);
                             self.deferred = Some(DeferredIngest { round, on_time });
                         }
                     }

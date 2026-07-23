@@ -5158,6 +5158,7 @@ dependencies = [
  "blake3",
  "ciborium",
  "daemon-vhc-abi",
+ "daemon-vhc-det",
  "daemon-vhc-guest-build",
  "daemon-vhc-host",
  "daemon-vhc-node",
