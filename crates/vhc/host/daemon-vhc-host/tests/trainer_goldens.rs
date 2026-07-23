@@ -237,6 +237,11 @@ struct ServeCtx {
     master_fold: [u8; 32],
     /// The flat f32-le init image the master fold's ranges slice from.
     init_flat: Vec<u8>,
+    /// Content-addressed checkpoint family chunks (`chunk blake3 → bytes`) — the harness's
+    /// stand-in for the payload plane: after a drain, the draining instance's sealed family chunks
+    /// are copied here, and a restoring instance's chunk-keyed [SF-R2] fetch reassembles its
+    /// covering span from them (exactly the production chunk-keyed resolver). Empty until a restore.
+    ckpt_chunks: std::collections::HashMap<[u8; 32], Vec<u8>>,
 }
 
 /// Author the artifact-form init from the matched init at `chunk_size`: the master det-state
@@ -271,6 +276,7 @@ fn init_artifact(init: &[Vec<f32>], chunk_size: u64) -> ServeCtx {
         manifest_bytes,
         master_fold: master.fold.0,
         init_flat: param_bytes.concat(),
+        ckpt_chunks: std::collections::HashMap::new(),
     }
 }
 
@@ -445,6 +451,35 @@ fn service_ops(pump: &daemon_vhc_host::run::PumpHandle, serve: &ServeCtx) {
                     },
                 )
                 .expect("init range done");
+            }
+            OpRequest::ArtifactRange {
+                hash,
+                span_off,
+                span_len,
+                ..
+            } => {
+                // A restore fetch of a CHECKPOINT family fold ([SF-6]): reassemble the covering
+                // span CHUNK-KEYED from the harness chunk store (standing in for the payload
+                // plane), driven by the pump's registered det-state map — exactly the production
+                // resolver, so the golden's local restore is honest evidence for the chunk-keyed
+                // path (not a whole-object shortcut).
+                let map = pump
+                    .state_chunk_map(&hash)
+                    .expect("restore fold registered ([SF-R2]) before its windows are fetched");
+                let covering = map
+                    .covering_chunks(span_off, span_len)
+                    .expect("covering chunks for a chunk-aligned span");
+                let mut bytes = Vec::with_capacity(span_len as usize);
+                for (chunk_hash, _len) in &covering {
+                    bytes.extend_from_slice(
+                        serve
+                            .ckpt_chunks
+                            .get(&chunk_hash.0)
+                            .expect("checkpoint chunk uploaded to the (harness) payload plane"),
+                    );
+                }
+                pump.complete_op(op, OpOutcome::RangeDone { bytes })
+                    .expect("restore range done");
             }
             other => panic!("unexpected op request from the trainer guest: {other:?}"),
         }
@@ -967,19 +1002,22 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
         capture
             .sections
             .iter()
-            .map(|(name, _)| name.as_str())
+            .map(daemon_vhc_proto::det_state::CkptDocSection::name)
             .collect::<Vec<_>>(),
         vec!["master", "ef", "adamw_m", "adamw_v"],
         "the typed manifest declares the canonical masters + the replica-local continuity state \
          (error feedback and AdamW moments)"
     );
     let total: usize = g.numels.iter().sum();
-    for (name, bytes) in &capture.sections {
-        assert_eq!(
-            bytes.len(),
-            total * 4,
-            "section `{name}` is the flat f32-le canonical layout"
-        );
+    for section in &capture.sections {
+        // v2 by-ref sections move no inline bytes; an inline section is the flat f32-le layout.
+        if let daemon_vhc_proto::det_state::CkptDocSection::Inline(name, bytes) = section {
+            assert_eq!(
+                bytes.len(),
+                total * 4,
+                "inline section `{name}` is the flat f32-le canonical layout"
+            );
+        }
     }
     let round0_digest: [u8; 16] = {
         let published = pump.published();
@@ -995,6 +1033,22 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
         round0_digest, g.digests[0],
         "pre-snapshot round-0 digest matches the golden (the baseline for continuity)"
     );
+
+    // Copy the drain's referenced family chunks into the harness payload plane ([SF-6]): the state
+    // store is instance-scoped, so a restoring incarnation fetches the families content-addressed
+    // through the chunk-keyed resolver — the drain/upgrade uploads chunks exactly like the remote
+    // publisher. This is what makes the local restore honest evidence for the chunk-keyed path.
+    let mut serve2 = g.serve.clone();
+    for section in &capture.sections {
+        if let daemon_vhc_proto::det_state::CkptDocSection::ByRef(_, fref) = section {
+            let chunks = pump
+                .sealed_fold_chunks(&fref.fold.0)
+                .expect("the drained family is sealed in the draining instance's state store");
+            for (h, bytes) in chunks {
+                serve2.ckpt_chunks.insert(h.0, bytes);
+            }
+        }
+    }
 
     // -- instance 2: da_init -> da_migrate(restore) -> round 1 ------------------------------------
     let identity2 = RunIdentity {
@@ -1026,7 +1080,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
             .expect("stage batch");
     }
     deliver(&pump2, &round_open(1), &mut seq2);
-    wait_published(&pump2, 2, &g.serve); // theta(1) + commitment(1)
+    wait_published(&pump2, 2, &serve2); // theta(1) + commitment(1)
 
     // The ef-restore pin: round 1's committed payload is a function of (theta, round_base, ef);
     // master/round_base continuity alone would still digest-match after ingesting the RECORDED
@@ -1042,7 +1096,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
         .stage_payload(update_wrapper(1, &g.payloads[1]), None)
         .expect("stage update 1");
     deliver(&pump2, &round_record(1, &g.payloads[1]), &mut seq2);
-    wait_published(&pump2, 3, &g.serve); // digest(1)
+    wait_published(&pump2, 3, &serve2); // digest(1)
 
     pump2
         .stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)

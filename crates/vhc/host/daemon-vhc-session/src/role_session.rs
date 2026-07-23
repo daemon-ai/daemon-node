@@ -44,8 +44,7 @@ use daemon_vhc_host::trap::TrapCode;
 use daemon_vhc_host::{EngineConfig, Worker};
 use daemon_vhc_net::{ContentStore, ControlPlane};
 use daemon_vhc_proto::{
-    blake3_hash, peer_id, to_canonical_vec, AdmittedQuotas, CertScope, Hash, PeerId,
-    RunKeyCertificate, SigningKey,
+    blake3_hash, peer_id, AdmittedQuotas, CertScope, Hash, PeerId, RunKeyCertificate, SigningKey,
 };
 use tokio::sync::{mpsc, Notify};
 
@@ -1282,6 +1281,30 @@ async fn service_op(
                 // over the HOST's contract shape only (the module's round vocabulary stays
                 // opaque); a non-checkpoint put never matches.
                 if let Some(round) = live_checkpoint_watermark(&bytes) {
+                    // Publish the referenced family CHUNKS to the content plane ([SF-6]/C5): a
+                    // restoring peer fetches them chunk-keyed ([SF-R2]). The chunks come from THIS
+                    // (publishing) instance's self-sealed store; content-addressed `put_content` is
+                    // idempotent, so family chunks unchanged since a prior slot upload NOTHING
+                    // (skip-on-present) — the amortized remote cost is the changed chunks + the
+                    // small document, not the whole family every slot.
+                    if let Ok(capture) = decode_snapshot_doc(&bytes) {
+                        let mut referenced: Vec<[u8; 32]> = Vec::new();
+                        for section in &capture.sections {
+                            if let daemon_vhc_proto::det_state::CkptDocSection::ByRef(_, fref) =
+                                section
+                            {
+                                referenced.push(fref.fold.0);
+                                if let Some(chunks) = pump.sealed_fold_chunks(&fref.fold.0) {
+                                    for (_h, chunk) in &chunks {
+                                        let _ = providers.artifacts.put_content(chunk).await;
+                                    }
+                                }
+                            }
+                        }
+                        // Pin the freshest checkpoint's families out of retention eviction (§8.2,
+                        // C6); a superseded checkpoint's folds re-enter ordinary retention.
+                        pump.repin_checkpoint(&referenced);
+                    }
                     let hash = hash.to_hex();
                     let _ = events.send(Event::CheckpointPublished {
                         round,
@@ -1332,38 +1355,76 @@ async fn service_op(
             span_len,
             ..
         } => {
-            // A chunk-addressed shard (fold identity): the content store holds the whole
-            // object under the fold key; this in-process seat slices the requested covering
-            // span itself — the pump verifies every covering chunk against the registered
-            // chunk map either way (the provider is untrusted by construction). A store that
-            // cannot serve the span is a typed refusal, never silent bytes.
-            match providers
-                .artifacts
-                .get_content(&daemon_vhc_proto::Hash(hash))
-                .await
-            {
-                Ok(artifact) => {
-                    let lo = usize::try_from(span_off).unwrap_or(usize::MAX);
-                    let hi = lo.saturating_add(usize::try_from(span_len).unwrap_or(usize::MAX));
-                    if hi <= artifact.len() {
-                        OpOutcome::RangeDone {
-                            bytes: artifact[lo..hi].to_vec(),
+            // An externally-sourced DET-STATE fold ([SF-R2]/[SF-6]) is served CHUNK-KEYED — the
+            // symmetric twin of the replay-side materialization (`run/replay.rs`): the family's
+            // chunks live in the content-addressed plane each under its OWN blake3, so the
+            // covering span is reassembled by fetching those chunks and concatenating them, never
+            // a whole-family object under the fold key. The registered `DetStateChunkMap` (held by
+            // the pump — the single source of truth) decomposes the chunk-aligned span into its
+            // `(chunk hash, len)` list. The pump still verifies the reassembled covering span
+            // against the fold-committed hashes at completion (unchanged) — the resolver is
+            // untrusted, and content-addressed `get_content` self-verifies each chunk besides.
+            if let Some(map) = pump.state_chunk_map(&hash) {
+                match map.covering_chunks(span_off, span_len) {
+                    Ok(chunks) => {
+                        let mut bytes = Vec::with_capacity(usize::try_from(span_len).unwrap_or(0));
+                        let mut failure: Option<OpOutcome> = None;
+                        for (chunk_hash, _len) in &chunks {
+                            match providers.artifacts.get_content(chunk_hash).await {
+                                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                                Err(e) => {
+                                    failure = Some(OpOutcome::Failed {
+                                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                                        detail: format!(
+                                            "det-state chunk {} fetch: {e}",
+                                            chunk_hash.to_hex()
+                                        ),
+                                    });
+                                    break;
+                                }
+                            }
                         }
-                    } else {
-                        OpOutcome::Failed {
-                            code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                            detail: format!(
-                                "artifact range: stored object is {} bytes, span \
-                                 [{span_off}, +{span_len}) does not fit",
-                                artifact.len()
-                            ),
+                        failure.unwrap_or(OpOutcome::RangeDone { bytes })
+                    }
+                    Err(e) => OpOutcome::Failed {
+                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                        detail: format!("det-state covering span: {e}"),
+                    },
+                }
+            } else {
+                // A chunk-addressed corpus shard (fold identity): the content store holds the
+                // whole object under the fold key; this in-process seat slices the requested
+                // covering span itself — the pump verifies every covering chunk against the
+                // registered chunk map either way (the provider is untrusted by construction). A
+                // store that cannot serve the span is a typed refusal, never silent bytes.
+                match providers
+                    .artifacts
+                    .get_content(&daemon_vhc_proto::Hash(hash))
+                    .await
+                {
+                    Ok(artifact) => {
+                        let lo = usize::try_from(span_off).unwrap_or(usize::MAX);
+                        let hi = lo.saturating_add(usize::try_from(span_len).unwrap_or(usize::MAX));
+                        if hi <= artifact.len() {
+                            OpOutcome::RangeDone {
+                                bytes: artifact[lo..hi].to_vec(),
+                            }
+                        } else {
+                            OpOutcome::Failed {
+                                code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                                detail: format!(
+                                    "artifact range: stored object is {} bytes, span \
+                                     [{span_off}, +{span_len}) does not fit",
+                                    artifact.len()
+                                ),
+                            }
                         }
                     }
+                    Err(e) => OpOutcome::Failed {
+                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                        detail: format!("artifact range fetch: {e}"),
+                    },
                 }
-                Err(e) => OpOutcome::Failed {
-                    code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                    detail: format!("artifact range fetch: {e}"),
-                },
             }
         }
         // Direct peer streams await their live transport binding: refuse typed, never hang the
@@ -1479,10 +1540,13 @@ async fn finish(
             let round = capture
                 .as_ref()
                 .and_then(|c| {
-                    c.sections.iter().find_map(|(name, bytes)| {
-                        (name == "round")
-                            .then(|| <[u8; 8]>::try_from(bytes.as_slice()).ok())
-                            .flatten()
+                    c.sections.iter().find_map(|s| match s {
+                        daemon_vhc_proto::det_state::CkptDocSection::Inline(name, bytes)
+                            if name == "round" =>
+                        {
+                            <[u8; 8]>::try_from(bytes.as_slice()).ok()
+                        }
+                        _ => None,
                     })
                 })
                 .map(u64::from_le_bytes)
@@ -1612,28 +1676,16 @@ async fn persist_drain_snapshot(
     }
 }
 
-/// The content-addressed checkpoint document: `[manifest, [[name, section-bytes], …]]` in the
+/// The content-addressed checkpoint document v2 ([SF-6]): `[manifest, [ckpt-doc-section…]]` in the
 /// manifest's declared order (the object a checkpoint pointer addresses). Encoder + decoder are
-/// paired so a late joiner rebuilds the exact [`SnapshotCapture`] the leaving peer wrote.
+/// the shared proto codec, so a late joiner rebuilds the exact [`SnapshotCapture`] the leaving
+/// peer wrote — inline sections verbatim, by-ref sections as their `FamilyRef` (the referenced
+/// family chunks ride the payload plane via the publisher/leave chunk upload).
 pub fn encode_snapshot_doc(
     capture: &daemon_vhc_host::run::SnapshotCapture,
 ) -> Result<Vec<u8>, String> {
-    let doc = ciborium::value::Value::Array(vec![
-        ciborium::value::Value::Bytes(capture.manifest.clone()),
-        ciborium::value::Value::Array(
-            capture
-                .sections
-                .iter()
-                .map(|(name, bytes)| {
-                    ciborium::value::Value::Array(vec![
-                        ciborium::value::Value::Text(name.clone()),
-                        ciborium::value::Value::Bytes(bytes.clone()),
-                    ])
-                })
-                .collect(),
-        ),
-    ]);
-    to_canonical_vec(&doc).map_err(|e| format!("encode snapshot doc: {e}"))
+    daemon_vhc_proto::det_state::encode_checkpoint_doc(&capture.manifest, &capture.sections)
+        .map_err(|e| format!("encode snapshot doc: {e}"))
 }
 
 /// Recognize a payload-plane put as a §10.2 checkpoint DOCUMENT and return its round watermark
@@ -1643,6 +1695,7 @@ pub fn encode_snapshot_doc(
 /// declared section must hash-match its bytes (a coincidental or corrupt object never registers
 /// a pointer). The module's round vocabulary is never decoded. `None` = not a checkpoint.
 fn live_checkpoint_watermark(bytes: &[u8]) -> Option<u64> {
+    use daemon_vhc_proto::det_state::CkptDocSection;
     let capture = decode_snapshot_doc(bytes).ok()?;
     // The §10.2 state-manifest map: `sections: [{name, hash, size, …}]`.
     let v: ciborium::value::Value = ciborium::de::from_reader(capture.manifest.as_slice()).ok()?;
@@ -1660,7 +1713,7 @@ fn live_checkpoint_watermark(bytes: &[u8]) -> Option<u64> {
         return None;
     }
     let mut watermark = None;
-    for (decl, (name, section_bytes)) in decls.iter().zip(&capture.sections) {
+    for (decl, section) in decls.iter().zip(&capture.sections) {
         let ciborium::value::Value::Map(fields) = decl else {
             return None;
         };
@@ -1671,19 +1724,32 @@ fn live_checkpoint_watermark(bytes: &[u8]) -> Option<u64> {
             })
         };
         match field("name") {
-            Some(ciborium::value::Value::Text(t)) if t == name => {}
+            Some(ciborium::value::Value::Text(t)) if t == section.name() => {}
             _ => return None,
         }
-        match field("hash") {
-            Some(ciborium::value::Value::Bytes(h))
-                if h.as_slice() == blake3::hash(section_bytes).as_bytes() => {}
-            _ => return None,
+        // The decl's `hash` cross-checks the section: for an INLINE section it is the blake3 of
+        // the bytes; for a BY-REFERENCE section it is the family FOLD, and the ref must be
+        // self-consistent (its fold IS the fold of its own chunk list — the host store holds
+        // those chunks by construction, §7.2). A coincidental or corrupt object never matches.
+        let hash_ok = match (field("hash"), section) {
+            (Some(ciborium::value::Value::Bytes(h)), CkptDocSection::Inline(_, section_bytes)) => {
+                h.as_slice() == blake3::hash(section_bytes).as_bytes()
+            }
+            (Some(ciborium::value::Value::Bytes(h)), CkptDocSection::ByRef(_, family)) => {
+                family.validate().is_ok() && h.as_slice() == family.fold.0.as_slice()
+            }
+            _ => false,
+        };
+        if !hash_ok {
+            return None;
         }
-        if name == "round" {
-            watermark = <[u8; 8]>::try_from(section_bytes.as_slice())
-                .ok()
-                .map(u64::from_le_bytes)
-                .filter(|w| *w != u64::MAX);
+        if let CkptDocSection::Inline(name, section_bytes) = section {
+            if name == "round" {
+                watermark = <[u8; 8]>::try_from(section_bytes.as_slice())
+                    .ok()
+                    .map(u64::from_le_bytes)
+                    .filter(|w| *w != u64::MAX);
+            }
         }
     }
     // Only a doc carrying the live watermark section registers a LIVE pointer (the drain path
@@ -1691,37 +1757,13 @@ fn live_checkpoint_watermark(bytes: &[u8]) -> Option<u64> {
     watermark
 }
 
-/// Decode a checkpoint document back into a [`SnapshotCapture`] (the late-join restore input).
-/// Fails typed on any structural surprise — a malformed checkpoint never yields a partial state.
+/// Decode a checkpoint document back into a [`SnapshotCapture`] (the late-join restore input),
+/// via the shared checkpoint-document v2 codec ([SF-6]): inline sections carry bytes, by-ref
+/// sections carry a `FamilyRef` the restoring instance registers + streams. Fails typed on any
+/// structural surprise — a malformed checkpoint never yields a partial state.
 pub fn decode_snapshot_doc(bytes: &[u8]) -> Result<daemon_vhc_host::run::SnapshotCapture, String> {
-    let v: ciborium::value::Value =
-        ciborium::de::from_reader(bytes).map_err(|e| format!("snapshot doc cbor: {e}"))?;
-    let ciborium::value::Value::Array(parts) = v else {
-        return Err("snapshot doc is not an array".into());
-    };
-    let [manifest_v, sections_v] = <[ciborium::value::Value; 2]>::try_from(parts)
-        .map_err(|_| "snapshot doc arity != 2".to_string())?;
-    let ciborium::value::Value::Bytes(manifest) = manifest_v else {
-        return Err("snapshot manifest is not bytes".into());
-    };
-    let ciborium::value::Value::Array(section_vs) = sections_v else {
-        return Err("snapshot sections is not an array".into());
-    };
-    let mut sections = Vec::with_capacity(section_vs.len());
-    for entry in section_vs {
-        let ciborium::value::Value::Array(kv) = entry else {
-            return Err("snapshot section is not a [name, bytes] pair".into());
-        };
-        let [name_v, bytes_v] = <[ciborium::value::Value; 2]>::try_from(kv)
-            .map_err(|_| "snapshot section arity != 2".to_string())?;
-        let ciborium::value::Value::Text(name) = name_v else {
-            return Err("snapshot section name is not text".into());
-        };
-        let ciborium::value::Value::Bytes(section) = bytes_v else {
-            return Err("snapshot section value is not bytes".into());
-        };
-        sections.push((name, section));
-    }
+    let (manifest, sections) =
+        daemon_vhc_proto::det_state::decode_checkpoint_doc(bytes).map_err(|e| e.to_string())?;
     Ok(daemon_vhc_host::run::SnapshotCapture { manifest, sections })
 }
 
@@ -1795,11 +1837,21 @@ mod tests {
     fn snapshot_doc_round_trips_and_refuses_malformed() {
         // The late-join restore codec: a capture encodes + decodes to the identical sections in
         // declared order; junk refuses typed (a malformed checkpoint never yields partial state).
+        use daemon_vhc_proto::det_state::{CkptDocSection, FamilyRef};
+        // A mix of inline + by-reference sections (the v2 forms) round-trips verbatim.
+        let fref = FamilyRef {
+            fold: daemon_vhc_proto::Hash([9u8; 32]),
+            byte_len: 8,
+            chunk_size: 8,
+            chunk_hashes: vec![daemon_vhc_proto::Hash(
+                *blake3::hash(b"abcdefgh").as_bytes(),
+            )],
+        };
         let capture = daemon_vhc_host::run::SnapshotCapture {
             manifest: b"manifest-bytes".to_vec(),
             sections: vec![
-                ("params".into(), vec![1, 2, 3]),
-                ("residual".into(), vec![4, 5]),
+                CkptDocSection::ByRef("master".into(), fref),
+                CkptDocSection::Inline("round".into(), vec![4, 5]),
             ],
         };
         let bytes = encode_snapshot_doc(&capture).expect("encode");

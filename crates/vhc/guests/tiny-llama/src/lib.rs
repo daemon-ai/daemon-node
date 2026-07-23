@@ -63,13 +63,15 @@ use std::rc::Rc;
 use daemon_vhc_proto::capability::CapabilitySet;
 use daemon_vhc_proto::corpus::{CorpusManifest, Endianness, TokenWidth};
 use daemon_vhc_proto::det_state::{
-    family_byte_len, DetStateChunkMap, DetStateManifest, MASTER_FAMILY,
+    encode_checkpoint_doc, family_byte_len, CkptDocSection, DetStateChunkMap, DetStateManifest,
+    FamilyRef, MASTER_FAMILY,
 };
 use daemon_vhc_proto::genesis::{StateContract, StateInit};
 use daemon_vhc_proto::{blake3_hash, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed};
 use daemon_vhc_proto::{IrohId, StateDigest};
 use daemon_vhc_sdk::{
-    build_manifest, GuestModule, MigrationDescriptor, ModuleDecl, OwnedSection, SectionReader,
+    GuestModule, MigrationDescriptor, MigrationSection, ModuleDecl, SectionDecl, SectionReader,
+    StateManifest,
 };
 use daemon_vhc_sdk_compute::{export_tensor, fence, AutodiffHostBackend, HostBackend};
 use daemon_vhc_sdk_consensus::digest::DigestCarry;
@@ -93,8 +95,16 @@ const DIGEST_BLOCK: u32 = 64;
 /// The in-flight window bound for the streamed fold walks (bounded read-ahead; the honest fuel
 /// claim is per-window, §5.5). Small — the harness geometry is a handful of windows.
 const WALK_IN_FLIGHT: u64 = 4;
+/// The max in-flight restore window fetches (bounded read-ahead): the three restore families are
+/// streamed with refill so the walk never exceeds the admitted `max_outstanding_ops`.
+const RESTORE_IN_FLIGHT: usize = 4;
 /// The error-feedback family tag (replica-local, digest-invisible — never in the state root).
 const EF_FAMILY: &str = "ef";
+/// The AdamW first-moment family tag (replica-local; materialized as a sealed family only at
+/// checkpoint/drain from the device export).
+const ADAMW_M_FAMILY: &str = "adamw_m";
+/// The AdamW second-moment family tag (replica-local; as above).
+const ADAMW_V_FAMILY: &str = "adamw_v";
 
 use model::{ModelCfg, TinyLlamaModel};
 
@@ -144,13 +154,20 @@ struct LiveCfg {
     run_label: String,
     /// The genesis-pinned chunk-addressed corpus manifest's content hash (a granted artifact).
     manifest: Hash,
-    /// The periodic live checkpoint cadence in rounds: every `ckpt_every`-th ingested round the
-    /// module exports its full restorable state (masters + EF + AdamW moments + the round
-    /// watermark) as a checkpoint DOCUMENT on the payload plane, so a hard-crashed peer has a
-    /// fresh restore source even though it never drained. `0` disables the cadence (the drain
-    /// snapshot remains the only pointer source); absent = every round.
+    /// The **local** checkpoint cadence in rounds (D-SF3): the round boundaries at which a
+    /// checkpoint is considered. The canonical families are already sealed every round, so a local
+    /// checkpoint is pointer bookkeeping — cheap, restorable by a co-located/LAN peer. `0` disables
+    /// the cadence (the drain snapshot remains the only pointer source); absent = every round.
     #[serde(default = "default_ckpt_every")]
     ckpt_every: u64,
+    /// The **remote** upload cadence in rounds (D-SF3, byte-budgeted): every `remote_ckpt_every`-th
+    /// checkpoint boundary, the ONE deterministically-elected publisher for that slot uploads the
+    /// by-reference document + its family chunks to the payload plane (others skip — R identical
+    /// uploads per round are pure waste). `0` = upload at every local boundary (the default when
+    /// unset). Genesis authoring refuses a cadence that could strand a rejoiner past
+    /// `payload_retention_rounds` ([`daemon_vhc_proto::det_state::validate_checkpoint_cadence`]).
+    #[serde(default)]
+    remote_ckpt_every: u64,
 }
 
 /// The default live checkpoint cadence: every ingested round.
@@ -179,10 +196,17 @@ struct Core {
     /// sealed master ([SF-R1] self-sealed) — the artifact the ingest AND update walks read their
     /// round-base windows from. THE canonical master lives here (host-side), not resident.
     master_fold: [u8; 32],
+    /// The current master family's ordered chunk hashes (accumulated as each chunk is emitted) —
+    /// what a by-reference checkpoint section ([SF-6]) lists for the sealed master, so the
+    /// checkpoint costs zero extra reads of the already-sealed family.
+    master_chunks: Vec<Hash>,
     /// The current error-feedback family fold: a zeroed family sealed at boot, then each
     /// `make_update`'s emitted ef family ([SF-R1] self-sealed). The update walk reads its ef
     /// windows from here; the replica-local ef lives here, not resident.
     ef_fold: [u8; 32],
+    /// The current ef family's ordered chunk hashes (as [`Self::master_chunks`], for the ef
+    /// by-reference section).
+    ef_chunks: Vec<Hash>,
     /// The in-flight streamed ingest walk (one at a time; the barrier serializes on its seal).
     ingest_walk: Option<IngestWalkState>,
     /// The in-flight streamed `make_update` walk (kicked off when the round's θ export completes).
@@ -225,6 +249,9 @@ struct IngestWalkState {
     master_assembly: Vec<Vec<f32>>,
     /// Scratch for the f32→le state-emit seam.
     byte_buf: Vec<u8>,
+    /// The emitted master family's ordered chunk hashes (accumulated per `state_emit`) — moved
+    /// into [`Core::master_chunks`] at seal, so a checkpoint references the sealed master by fold.
+    chunk_hashes: Vec<Hash>,
 }
 
 /// The in-flight streamed `make_update` walk (design §5.4): the resident
@@ -255,6 +282,8 @@ struct UpdateWalkState {
     ef: BTreeMap<u64, Vec<f32>>,
     /// Scratch for the f32→le state-emit seam.
     byte_buf: Vec<u8>,
+    /// The emitted NEW ef family's ordered chunk hashes — moved into [`Core::ef_chunks`] at seal.
+    ef_chunks: Vec<Hash>,
 }
 
 /// The `RoundExperiment` adapter: v1 call points over the shared core.
@@ -359,6 +388,7 @@ impl RoundExperiment<Vec<u8>> for C3Round {
             voice,
             master_assembly,
             byte_buf: Vec::new(),
+            chunk_hashes: Vec::new(),
         });
         IngestOutcome::Deferred
     }
@@ -378,12 +408,15 @@ impl PayloadSource<Vec<u8>> for PayloadMap {
 
 // -- the GuestModule under `main!` -------------------------------------------------------------------
 
-/// Flat state a `da_migrate` restore carries into `run` (split by the model layout there).
-struct Restored {
-    master: Vec<f32>,
-    ef: Vec<f32>,
-    adamw_m: Vec<f32>,
-    adamw_v: Vec<f32>,
+/// The by-reference families a `da_migrate` restore carries into `run` ([SF-6]): the restoring
+/// instance registers each fold ([SF-R2]) and streams it window-by-window in `da_run` — no bulk
+/// bytes cross the migrate seam (whose only legal read is `read_back(kind=3)`, §6.6, used solely
+/// for the inline round watermark).
+struct RestoredRefs {
+    master: FamilyRef,
+    ef: FamilyRef,
+    adamw_m: FamilyRef,
+    adamw_v: FamilyRef,
     /// The snapshot's resync watermark (the last round its state folds), when the snapshot
     /// recorded one — the restored driver never re-ingests at or below it (§9 restore).
     round: Option<u64>,
@@ -391,7 +424,7 @@ struct Restored {
 
 struct TinyLlama {
     cfg_bytes: Vec<u8>,
-    restored: Option<Restored>,
+    restored: Option<RestoredRefs>,
 }
 
 impl GuestModule for TinyLlama {
@@ -430,50 +463,43 @@ impl GuestModule for TinyLlama {
         run_module(cfg, self.restored.take())
     }
 
-    /// The §10.2 consuming protocol: read the `master`/`ef`/`adamw_m`/`adamw_v` flat f32-le
-    /// sections staged by the old instance's snapshot; `run` splits them by the model layout and
-    /// rebuilds from them.
+    /// The §10.2 consuming protocol (v2, [SF-6]): record the by-reference `master`/`ef`/`adamw_m`/
+    /// `adamw_v` family descriptors (fold + geometry + chunk hashes) the host built from the
+    /// checkpoint document, plus the inline `round` watermark. `da_migrate` does NO bulk reads
+    /// (§6.6 legality unchanged) — `da_run` registers each fold ([SF-R2]) and STREAMS it.
     fn migrate(&mut self, descriptor: &MigrationDescriptor, reader: &mut dyn SectionReader) -> u32 {
-        let cfg: GuestCfg =
-            from_canonical_slice(&self.cfg_bytes).expect("config validated at init");
-        let total: usize = cfg.model.param_numels().iter().sum();
-        let mut master: Option<Vec<f32>> = None;
-        let mut ef: Option<Vec<f32>> = None;
-        let mut adamw_m: Option<Vec<f32>> = None;
-        let mut adamw_v: Option<Vec<f32>> = None;
+        let mut master: Option<FamilyRef> = None;
+        let mut ef: Option<FamilyRef> = None;
+        let mut adamw_m: Option<FamilyRef> = None;
+        let mut adamw_v: Option<FamilyRef> = None;
         let mut round: Option<u64> = None;
         for binding in &descriptor.sections {
-            let bytes = reader.read(binding.staging_id);
-            if binding.name == "round" {
-                // The resync watermark: 8 bytes LE; `u64::MAX` = the snapshot predates any
-                // ingest (no watermark).
-                let Ok(raw) = <[u8; 8]>::try_from(bytes.as_slice()) else {
-                    return MIGRATE_INCOMPATIBLE_SECTIONS;
-                };
-                let val = u64::from_le_bytes(raw);
-                round = (val != u64::MAX).then_some(val);
-                continue;
-            }
-            let vals: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            if vals.len() != total {
-                return MIGRATE_INCOMPATIBLE_SECTIONS;
-            }
-            match binding.name.as_str() {
-                "master" => master = Some(vals),
-                "ef" => ef = Some(vals),
-                "adamw_m" => adamw_m = Some(vals),
-                "adamw_v" => adamw_v = Some(vals),
-                _ => return MIGRATE_INCOMPATIBLE_SECTIONS,
+            match binding {
+                MigrationSection::Inline { name, staging_id } if name == "round" => {
+                    // The resync watermark: 8 bytes LE; `u64::MAX` = the snapshot predates any
+                    // ingest (no watermark). The one legal `read_back(kind=3)` in `da_migrate`.
+                    let bytes = reader.read(*staging_id);
+                    let Ok(raw) = <[u8; 8]>::try_from(bytes.as_slice()) else {
+                        return MIGRATE_INCOMPATIBLE_SECTIONS;
+                    };
+                    let val = u64::from_le_bytes(raw);
+                    round = (val != u64::MAX).then_some(val);
+                }
+                MigrationSection::ByRef { name, family } => match name.as_str() {
+                    "master" => master = Some(family.clone()),
+                    "ef" => ef = Some(family.clone()),
+                    "adamw_m" => adamw_m = Some(family.clone()),
+                    "adamw_v" => adamw_v = Some(family.clone()),
+                    _ => return MIGRATE_INCOMPATIBLE_SECTIONS,
+                },
+                MigrationSection::Inline { .. } => return MIGRATE_INCOMPATIBLE_SECTIONS,
             }
         }
         let (Some(master), Some(ef), Some(adamw_m), Some(adamw_v)) = (master, ef, adamw_m, adamw_v)
         else {
             return MIGRATE_INCOMPATIBLE_SECTIONS;
         };
-        self.restored = Some(Restored {
+        self.restored = Some(RestoredRefs {
             master,
             ef,
             adamw_m,
@@ -485,18 +511,6 @@ impl GuestModule for TinyLlama {
 }
 
 daemon_vhc_sdk::main!(TinyLlama);
-
-/// Split the flat init into per-param canonical vectors.
-fn split_flat(flat: &[f32], numels: &[usize]) -> Vec<Vec<f32>> {
-    let mut out = Vec::with_capacity(numels.len());
-    let mut off = 0;
-    for &n in numels {
-        out.push(flat[off..off + n].to_vec());
-        off += n;
-    }
-    assert_eq!(off, flat.len(), "init length matches the canonical layout");
-    out
-}
 
 /// Publish `[tag, round, bytes]` on the control channel.
 fn publish_tagged(tag: u64, round: u64, bytes: &[u8]) {
@@ -548,24 +562,30 @@ struct LiveCorpus {
     total_sequences: u64,
 }
 
-/// A periodic live checkpoint's export walk (the boundary's post-ingest masters/EF captured
-/// synchronously when the walk starts; the AdamW moments arrive as export completions —
-/// the same async shape as the quiesce walk, without ending the run).
+/// A periodic live checkpoint's export walk ([SF-6]). The master + ef families are already sealed,
+/// so the checkpoint references them by fold (`master_fref`/`ef_fref` captured at the boundary —
+/// ZERO extra bytes read); only the AdamW moments export off the device (async completions), and
+/// are sealed into their own families at finish. The same async shape as the quiesce walk, without
+/// ending the run.
 struct CkptWalk {
     /// The ingested round this checkpoint's state folds (the restore watermark).
     round: u64,
-    /// The whole-family master + ef fetches (from the sealed folds) + their bytes once landed.
-    master_op: u64,
-    master_bytes: Option<Vec<u8>>,
-    ef_op: u64,
-    ef_bytes: Option<Vec<u8>>,
+    /// The already-sealed master + ef family references (captured at the boundary).
+    master_fref: FamilyRef,
+    ef_fref: FamilyRef,
+    /// The exported AdamW moment tensors (all `m` then all `v`), per parameter, once landed.
     collected: Vec<Option<Vec<f32>>>,
+    /// Outstanding moment export ops → collected index.
     ops: BTreeMap<u64, usize>,
 }
 
 /// The live-mode session state (module-driven data + wire announcements).
 struct LiveState {
     cfg: LiveCfg,
+    /// This peer id (for the per-slot publisher election).
+    peer: PeerId,
+    /// The run roster (for the per-slot publisher election).
+    roster: Vec<PeerId>,
     corpus: Option<LiveCorpus>,
     manifest_op: Option<u64>,
     /// Whether a round has been observed (stops the periodic Join/Heartbeat re-announce).
@@ -583,9 +603,11 @@ struct LiveState {
 }
 
 impl LiveState {
-    fn new(cfg: LiveCfg) -> Self {
+    fn new(cfg: LiveCfg, peer: PeerId, roster: Vec<PeerId>) -> Self {
         Self {
             cfg,
+            peer,
+            roster,
             corpus: None,
             manifest_op: None,
             admitted: false,
@@ -597,45 +619,76 @@ impl LiveState {
         }
     }
 
-    /// Start the periodic checkpoint export walk at an ingested-round boundary, when the
-    /// cadence says so and no walk is already in flight. The post-ingest masters + EF are
-    /// captured synchronously here; the moments arrive as export completions.
+    /// Start the periodic checkpoint export walk at an ingested-round boundary, when the cadence
+    /// says so, no walk is already in flight, and this peer is the slot's designated publisher.
+    /// The already-sealed master + ef families are captured by-reference here (zero extra reads);
+    /// only the AdamW moments export.
+    ///
+    /// D-SF3 publication policy: the LOCAL cadence (`ckpt_every`) gates the checkpoint boundary
+    /// (the folds already exist — a local checkpoint is bookkeeping); the REMOTE cadence
+    /// (`remote_ckpt_every`) + a ONE-per-slot deterministic publisher election gate the upload, so
+    /// a replicated group uploads once per slot, not once per peer. A slot whose publisher has died
+    /// simply goes unpublished; the next slot's rotation covers it (the one-slot slack term).
     fn maybe_start_checkpoint(&mut self, core: &Rc<RefCell<Core>>, round: u64) {
         if self.cfg.ckpt_every == 0 || !round.is_multiple_of(self.cfg.ckpt_every) {
             return;
         }
+        // Remote upload cadence + single-publisher gating. `remote_ckpt_every == 0` uploads at
+        // every local boundary (the pre-cadence default). A non-boundary remote round is a
+        // local-only checkpoint: the fold already exists, nothing to upload.
+        let remote = if self.cfg.remote_ckpt_every == 0 {
+            self.cfg.ckpt_every
+        } else {
+            self.cfg.remote_ckpt_every
+        };
+        if remote == 0 || !round.is_multiple_of(remote) {
+            return;
+        }
+        let slot = round / remote;
+        // The election seed is the corpus manifest hash — run-specific and identical across every
+        // peer, so all peers derive the same publisher for the slot without exchanging a message.
+        let seed = Seed(self.cfg.manifest.0);
+        let publisher = daemon_vhc_sdk_consensus::assignment::elect_checkpoint_publisher_for_slot(
+            &self.roster,
+            &seed,
+            slot,
+        );
+        if publisher != Some(self.peer) {
+            return; // not this slot's publisher — skip (others upload; R identical uploads waste)
+        }
         if self.pending_ckpt.is_some() {
             return;
         }
-        let (tensors, master_fold, ef_fold) = {
+        let (tensors, master_fref, ef_fref) = {
             let c = core.borrow();
-            (c.model.moment_tensors(), c.master_fold, c.ef_fold)
+            let byte_len = family_byte_len(&numels_u64(&c.numels));
+            (
+                c.model.moment_tensors(),
+                family_ref(c.master_fold, &c.master_chunks, byte_len, c.window_size),
+                family_ref(c.ef_fold, &c.ef_chunks, byte_len, c.window_size),
+            )
         };
         let n = tensors.len();
         let mut ops = BTreeMap::new();
         for (i, t) in tensors.into_iter().enumerate() {
             ops.insert(export_tensor(t), i);
         }
-        // Fetch the canonical master + replica-local ef whole from their sealed folds ([SF-R1]).
-        let master_op = daemon_vhc_sdk::data_fetch(&master_fold, 0, 0);
-        let ef_op = daemon_vhc_sdk::data_fetch(&ef_fold, 0, 0);
         self.pending_ckpt = Some(CkptWalk {
             round,
-            master_op,
-            master_bytes: None,
-            ef_op,
-            ef_bytes: None,
+            master_fref,
+            ef_fref,
             collected: vec![None; n],
             ops,
         });
     }
 
-    /// Finish a completed checkpoint walk: author the same four-section state manifest the
-    /// drain snapshot stages (plus the round watermark), wrap it as the checkpoint DOCUMENT
-    /// (`[manifest, [[name, bytes], …]]` — the restore decoder's exact shape), and put it on
-    /// the payload plane. Best-effort: a failed export abandons the walk (training continues;
-    /// the next cadence slot retries).
-    fn finish_checkpoint(&mut self, walk: CkptWalk) {
+    /// Finish a completed checkpoint walk ([SF-6]): seal the exported AdamW moments into their own
+    /// families (accumulating their chunk hashes), author the by-reference checkpoint DOCUMENT
+    /// (master + ef + adamw_m + adamw_v by fold, plus the inline round watermark) via the shared
+    /// codec, and put it on the payload plane. A live checkpoint moves ZERO family bytes locally —
+    /// the families are already sealed; the referenced chunks are uploaded host-side on recognition
+    /// of the document. Best-effort: a failed export abandons the walk (the next cadence retries).
+    fn finish_checkpoint(&mut self, core: &Rc<RefCell<Core>>, walk: CkptWalk) {
         let mut moments = Vec::with_capacity(walk.collected.len());
         for c in walk.collected {
             match c {
@@ -644,60 +697,43 @@ impl LiveState {
             }
         }
         let n = moments.len() / 2;
-        let (Some(master_le), Some(ef_le)) = (walk.master_bytes, walk.ef_bytes) else {
-            return; // the master/ef fetches did not both land — abandon this cadence slot
+        let (window_size, byte_len) = {
+            let c = core.borrow();
+            (c.window_size, family_byte_len(&numels_u64(&c.numels)))
         };
-        let sections = [
-            OwnedSection {
-                name: "master".to_string(),
-                schema: 1,
+        let (m_fold, m_chunks) = seal_family(ADAMW_M_FAMILY, &moments[..n], window_size);
+        let (v_fold, v_chunks) = seal_family(ADAMW_V_FAMILY, &moments[n..], window_size);
+        let parts = vec![
+            CkptPart::Family {
+                name: MASTER_FAMILY,
                 class: 0,
-                bytes: master_le,
+                fref: walk.master_fref,
             },
-            OwnedSection {
-                name: "ef".to_string(),
-                schema: 1,
+            CkptPart::Family {
+                name: EF_FAMILY,
                 class: 1,
-                bytes: ef_le,
+                fref: walk.ef_fref,
             },
-            OwnedSection {
-                name: "adamw_m".to_string(),
-                schema: 1,
+            CkptPart::Family {
+                name: ADAMW_M_FAMILY,
                 class: 1,
-                bytes: flat_le(&moments[..n]),
+                fref: family_ref(m_fold, &m_chunks, byte_len, window_size),
             },
-            OwnedSection {
-                name: "adamw_v".to_string(),
-                schema: 1,
+            CkptPart::Family {
+                name: ADAMW_V_FAMILY,
                 class: 1,
-                bytes: flat_le(&moments[n..]),
+                fref: family_ref(v_fold, &v_chunks, byte_len, window_size),
             },
-            OwnedSection {
-                name: "round".to_string(),
-                schema: 1,
+            CkptPart::Inline {
+                name: "round",
                 class: 1,
                 bytes: walk.round.to_le_bytes().to_vec(),
             },
         ];
-        let manifest = build_manifest(Hash([0u8; 32]), 1, &sections);
-        let Ok(manifest_bytes) = to_canonical_vec(&manifest) else {
+        let Some(manifest_bytes) = ckpt_manifest_bytes(&parts) else {
             return;
         };
-        let doc = ciborium::value::Value::Array(vec![
-            ciborium::value::Value::Bytes(manifest_bytes),
-            ciborium::value::Value::Array(
-                sections
-                    .iter()
-                    .map(|s| {
-                        ciborium::value::Value::Array(vec![
-                            ciborium::value::Value::Text(s.name.clone()),
-                            ciborium::value::Value::Bytes(s.bytes.clone()),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ]);
-        let Ok(bytes) = to_canonical_vec(&doc) else {
+        let Ok(bytes) = encode_checkpoint_doc(&manifest_bytes, &ckpt_sections(&parts)) else {
             return;
         };
         let buf = daemon_vhc_sdk::create_from(&bytes);
@@ -755,19 +791,17 @@ struct ExportState {
     ops: BTreeMap<u64, usize>,
 }
 
-/// The quiesce snapshot's async collection: the AdamW moments export off the device (op → moment
-/// index, all `m` then all `v`) PLUS the canonical master + replica-local ef families fetched
-/// whole from their sealed folds ([SF-R1], host-local) — the snapshot's four flat f32-le sections
-/// assemble once all three arrive (no resident master/ef).
+/// The quiesce snapshot's async collection ([SF-6]): only the AdamW moments export off the device
+/// (op → moment index, all `m` then all `v`). The already-sealed master + ef families are captured
+/// by-reference at drain start (`master_fref`/`ef_fref`); the moments are sealed into their own
+/// families at finish and the four sections are declared by fold — the host reconstructs the
+/// by-ref FamilyRefs from its state store, and the drain moves ZERO family bytes.
 struct QuiesceWalk {
     collected: Vec<Option<Vec<f32>>>,
     ops: BTreeMap<u64, usize>,
-    /// The whole-family master fetch op + its bytes once landed.
-    master_op: u64,
-    master_bytes: Option<Vec<u8>>,
-    /// The whole-family ef fetch op + its bytes once landed.
-    ef_op: u64,
-    ef_bytes: Option<Vec<u8>>,
+    /// The already-sealed master + ef family references (captured at drain start).
+    master_fref: FamilyRef,
+    ef_fref: FamilyRef,
 }
 
 /// Decode one export completion's payload: `[status, handle]` → the tensor's f32 vec (None on a
@@ -791,17 +825,6 @@ fn completion_tensor(ev: &daemon_vhc_sdk::Event) -> Option<Vec<f32>> {
     daemon_vhc_sdk::buffer_release(handle);
     let data = daemon_vhc_sdk_compute::decode_tensor_data(&bytes);
     data.to_vec::<f32>().ok()
-}
-
-/// Flatten per-param canonical vectors to f32-le bytes (the snapshot section encoding).
-fn flat_le(params: &[Vec<f32>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(params.iter().map(Vec::len).sum::<usize>() * 4);
-    for p in params {
-        for v in p {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-    out
 }
 
 /// Plan one round's batch slots + `data@2` fetches from the assigned interval (live mode):
@@ -976,21 +999,102 @@ fn family_base_offsets(numels: &[usize]) -> Vec<u64> {
 /// `state_open`/`state_emit`/`state_seal` in per-parameter `window_size`-byte windows (the
 /// fold-walk chunking, so the sealed fold IS the family fold the walk schedule assumes). Used to
 /// give a resident init (seed-expanded or restored) a fetchable round-base fold.
-fn seal_family(tag: &str, params: &[Vec<f32>], window_size: u64) -> [u8; 32] {
+fn seal_family(tag: &str, params: &[Vec<f32>], window_size: u64) -> ([u8; 32], Vec<Hash>) {
     let byte_len: u64 = params.iter().map(|p| (p.len() as u64) * 4).sum();
     let stream = daemon_vhc_sdk::state_open(tag, byte_len);
     let step = (window_size / 4).max(1) as usize; // elements per window
     let mut buf = Vec::new();
+    // Accumulate each emitted chunk's blake3 in emit order — the fold-walk window IS the state
+    // chunk, so this is exactly the family's ordered chunk-hash list ([SF-R1] self-sealed), what a
+    // by-reference checkpoint section ([SF-6]) needs without re-reading the sealed family.
+    let mut chunks = Vec::new();
     for p in params {
         let mut off = 0usize;
         while off < p.len() {
             let end = (off + step).min(p.len());
             f32s_to_le_bytes(&p[off..end], &mut buf);
             daemon_vhc_sdk::state_emit(stream, &buf);
+            chunks.push(blake3_hash(&buf));
             off = end;
         }
     }
-    daemon_vhc_sdk::state_seal(stream)
+    (daemon_vhc_sdk::state_seal(stream), chunks)
+}
+
+/// One section the trainer's checkpoint document declares ([SF-6]): a by-reference already-sealed
+/// family (zero bytes moved) or a small inline blob (the round watermark).
+enum CkptPart {
+    Family {
+        name: &'static str,
+        class: u64,
+        fref: FamilyRef,
+    },
+    Inline {
+        name: &'static str,
+        class: u64,
+        bytes: Vec<u8>,
+    },
+}
+
+/// The parameter numels as `u64` (registration order) — the layout the family geometry helpers take.
+fn numels_u64(numels: &[usize]) -> Vec<u64> {
+    numels.iter().map(|&n| n as u64).collect()
+}
+
+/// Assemble a [`FamilyRef`] for a self-sealed family from its fold + accumulated chunk hashes.
+fn family_ref(fold: [u8; 32], chunk_hashes: &[Hash], byte_len: u64, chunk_size: u64) -> FamilyRef {
+    FamilyRef {
+        fold: Hash(fold),
+        byte_len,
+        chunk_size,
+        chunk_hashes: chunk_hashes.to_vec(),
+    }
+}
+
+/// The §10.2 state-manifest bytes for a checkpoint document: a by-ref section declares its family
+/// FOLD as `hash` and `byte_len` as `size` (the [SF-6] alternative); an inline section declares
+/// the blake3 + length of its bytes. The host decodes this at the value level (dependency wall).
+fn ckpt_manifest_bytes(parts: &[CkptPart]) -> Option<Vec<u8>> {
+    let sections: Vec<SectionDecl> = parts
+        .iter()
+        .map(|p| match p {
+            CkptPart::Family { name, class, fref } => SectionDecl {
+                name: (*name).to_string(),
+                schema: 1,
+                hash: fref.fold,
+                size: fref.byte_len,
+                class: *class,
+            },
+            CkptPart::Inline { name, class, bytes } => SectionDecl {
+                name: (*name).to_string(),
+                schema: 1,
+                hash: blake3_hash(bytes),
+                size: bytes.len() as u64,
+                class: *class,
+            },
+        })
+        .collect();
+    let manifest = StateManifest {
+        schema: 1,
+        module: Hash([0u8; 32]),
+        sections,
+    };
+    to_canonical_vec(&manifest).ok()
+}
+
+/// The checkpoint-document section array in manifest order.
+fn ckpt_sections(parts: &[CkptPart]) -> Vec<CkptDocSection> {
+    parts
+        .iter()
+        .map(|p| match p {
+            CkptPart::Family { name, fref, .. } => {
+                CkptDocSection::ByRef((*name).to_string(), fref.clone())
+            }
+            CkptPart::Inline { name, bytes, .. } => {
+                CkptDocSection::Inline((*name).to_string(), bytes.clone())
+            }
+        })
+        .collect()
 }
 
 /// The async artifact-form init boot (§6.1b): fetch the pinned det-state manifest, register its
@@ -1058,7 +1162,13 @@ fn drive_boot_completion(
             status, 0,
             "the init master fold is a granted artifact (fail loud)"
         );
-        core.borrow_mut().master_fold = master.fold.0;
+        {
+            let mut c = core.borrow_mut();
+            c.master_fold = master.fold.0;
+            // The externally-registered master's chunk hashes (from the fetched manifest) — the
+            // by-ref list for a checkpoint taken before the first ingest re-seals a native master.
+            c.master_chunks = master.chunk_hashes.clone();
+        }
         boot.schedule = daemon_vhc_sdk_consensus::fold_walk::windows(&numels_u64, window_size);
         let (base_fold, family_base) = {
             let c = core.borrow();
@@ -1087,8 +1197,144 @@ fn drive_boot_completion(
         c.model.set_params_from_flat(&flat);
         let window_size = c.window_size;
         let zeroed: Vec<Vec<f32>> = c.numels.iter().map(|&n| vec![0.0f32; n]).collect();
-        c.ef_fold = seal_family(EF_FAMILY, &zeroed, window_size);
+        let (ef_fold, ef_chunks) = seal_family(EF_FAMILY, &zeroed, window_size);
+        c.ef_fold = ef_fold;
+        c.ef_chunks = ef_chunks;
         boot.done = true;
+    }
+    true
+}
+
+/// The streaming checkpoint REHYDRATION walk ([SF-6], design §7.3): a restoring instance registers
+/// the checkpoint's family folds ([SF-R2]) and fetches their windows on demand — master → device
+/// weights, adamw_m/v → device moments — with no whole-state materialization beyond the transient
+/// per-parameter upload buffers (freed once uploaded). The `ef` family is registered but not
+/// streamed here: the `make_update` walk reads its windows directly from the adopted fold.
+struct RestoreState {
+    /// The shared per-parameter window schedule (same layout + window size for every family).
+    schedule: Vec<Window>,
+    /// The three streamed family folds, indexed by family code: 0 master, 1 adamw_m, 2 adamw_v.
+    folds: [[u8; 32]; 3],
+    /// Per-parameter byte base offsets (maps a window to an absolute fetch offset).
+    family_base: Vec<u64>,
+    /// Not-yet-issued `(family, window ordinal)` fetches, in order — drained with bounded refill
+    /// so the walk never exceeds `max_outstanding_ops` (the families are large; issuing every
+    /// window at once would breach the op grant).
+    pending: VecDeque<(u8, u64)>,
+    /// In-flight fetches: `data@2` op → `(family, window ordinal)`.
+    inflight: BTreeMap<u64, (u8, u64)>,
+    /// The assembling master / moments (per parameter), filled as windows arrive.
+    master_assembled: Vec<Vec<f32>>,
+    m_assembled: Vec<Vec<f32>>,
+    v_assembled: Vec<Vec<f32>>,
+    /// Windows not yet assembled across all three families.
+    remaining: usize,
+    /// Whether the rehydration is complete (weights + moments uploaded).
+    done: bool,
+}
+
+impl RestoreState {
+    /// Register the four checkpoint folds ([SF-R2]), adopt the master + ef folds as the round
+    /// base, and kick off the bounded master/adamw_m/adamw_v window streaming. Called at `da_run`
+    /// start (imports legal), never in `da_migrate`.
+    fn begin(core: &Rc<RefCell<Core>>, refs: &RestoredRefs) -> Self {
+        let (numels, window_size, family_base) = {
+            let c = core.borrow();
+            (c.numels.clone(), c.window_size, c.family_base.clone())
+        };
+        let numels_u64: Vec<u64> = numels.iter().map(|&n| n as u64).collect();
+        // Register every externally-sourced fold so `data@2::fetch` resolves length-aware ([SF-R2]).
+        for fref in [&refs.master, &refs.ef, &refs.adamw_m, &refs.adamw_v] {
+            let desc = DetStateChunkMap::derive(fref.chunk_size, &numels_u64, &fref.chunk_hashes)
+                .expect("restore family geometry matches the layout")
+                .to_canonical_bytes()
+                .expect("descriptor cbor");
+            assert_eq!(
+                daemon_vhc_sdk::data_register_state_chunks(&desc),
+                0,
+                "the restore family fold is a granted artifact (fail loud)"
+            );
+        }
+        // Adopt the master + ef folds as the round base — the folds already exist in the plane, so
+        // no re-seal: the ingest/update walks read their windows straight from these folds.
+        {
+            let mut c = core.borrow_mut();
+            c.master_fold = refs.master.fold.0;
+            c.master_chunks = refs.master.chunk_hashes.clone();
+            c.ef_fold = refs.ef.fold.0;
+            c.ef_chunks = refs.ef.chunk_hashes.clone();
+        }
+        let schedule = daemon_vhc_sdk_consensus::fold_walk::windows(&numels_u64, window_size);
+        let mut pending: VecDeque<(u8, u64)> = VecDeque::new();
+        for family in 0u8..3 {
+            for w in &schedule {
+                pending.push_back((family, w.ordinal));
+            }
+        }
+        let assembled = || numels.iter().map(|&n| vec![0.0f32; n]).collect::<Vec<_>>();
+        let mut st = Self {
+            schedule,
+            folds: [refs.master.fold.0, refs.adamw_m.fold.0, refs.adamw_v.fold.0],
+            family_base,
+            remaining: pending.len(),
+            pending,
+            inflight: BTreeMap::new(),
+            master_assembled: assembled(),
+            m_assembled: assembled(),
+            v_assembled: assembled(),
+            done: false,
+        };
+        st.issue_more();
+        st
+    }
+
+    /// Issue pending window fetches up to the in-flight bound (bounded read-ahead).
+    fn issue_more(&mut self) {
+        while self.inflight.len() < RESTORE_IN_FLIGHT {
+            let Some((family, ordinal)) = self.pending.pop_front() else {
+                break;
+            };
+            let w = self.schedule[usize::try_from(ordinal).expect("ordinal fits usize")];
+            let off = self.family_base[w.param as usize] + w.param_off;
+            let op = daemon_vhc_sdk::data_fetch(&self.folds[family as usize], off, w.len);
+            self.inflight.insert(op, (family, ordinal));
+        }
+    }
+}
+
+/// Drive one completion against the in-flight restore walk; returns `true` if it was consumed.
+/// Assembles the arrived window into its family buffer, refills the in-flight window, and when
+/// master + both moments are fully streamed uploads the weights (`set_params_from_flat`) +
+/// moments (`set_moments_from_flat`) to the device and marks the rehydration done.
+fn drive_restore_completion(
+    core: &Rc<RefCell<Core>>,
+    restore: &mut RestoreState,
+    ev: &daemon_vhc_sdk::Event,
+    op: u64,
+) -> bool {
+    let Some((family, ordinal)) = restore.inflight.remove(&op) else {
+        return false;
+    };
+    let bytes = completion_bytes(ev).expect("a restore window fetches (fail loud)");
+    let vals = le_bytes_to_f32s(&bytes).expect("restore window is an f32-le image");
+    let window = restore.schedule[usize::try_from(ordinal).expect("ordinal fits usize")];
+    let off = (window.param_off / 4) as usize;
+    let target = match family {
+        0 => &mut restore.master_assembled,
+        1 => &mut restore.m_assembled,
+        _ => &mut restore.v_assembled,
+    };
+    target[window.param as usize][off..off + vals.len()].copy_from_slice(&vals);
+    restore.remaining -= 1;
+    restore.issue_more();
+    if restore.remaining == 0 {
+        let mut c = core.borrow_mut();
+        let master = std::mem::take(&mut restore.master_assembled);
+        c.model.set_params_from_flat(&master);
+        let m = std::mem::take(&mut restore.m_assembled);
+        let v = std::mem::take(&mut restore.v_assembled);
+        c.model.set_moments_from_flat(&m, &v);
+        restore.done = true;
     }
     true
 }
@@ -1146,6 +1392,7 @@ fn drive_ingest_completion(
         for (window, master_vals) in &slice.emitted {
             f32s_to_le_bytes(master_vals, &mut w.byte_buf);
             daemon_vhc_sdk::state_emit(w.stream, &w.byte_buf);
+            w.chunk_hashes.push(blake3_hash(&w.byte_buf));
             let off = (window.param_off / 4) as usize;
             w.master_assembly[window.param as usize][off..off + master_vals.len()]
                 .copy_from_slice(master_vals);
@@ -1175,6 +1422,7 @@ fn drive_ingest_completion(
         .finalize()
         .as_bytes();
     core_mut.master_fold = fold;
+    core_mut.master_chunks = std::mem::take(&mut state.chunk_hashes);
     let flat = std::mem::take(&mut state.master_assembly);
     core_mut.model.set_params_from_flat(&flat);
     IngestStep::Sealed {
@@ -1210,6 +1458,7 @@ fn start_update_walk(core: &Rc<RefCell<Core>>, round: u64, theta: Vec<Vec<f32>>)
         rb: BTreeMap::new(),
         ef: BTreeMap::new(),
         byte_buf: Vec::new(),
+        ef_chunks: Vec::new(),
     };
     for w in &opening.issue {
         let off = c.family_base[w.param as usize] + w.param_off;
@@ -1304,6 +1553,7 @@ fn drive_update_completion(
             for (_w, ef_new) in &step.emitted {
                 f32s_to_le_bytes(ef_new, &mut st.byte_buf);
                 daemon_vhc_sdk::state_emit(st.ef_stream, &st.byte_buf);
+                st.ef_chunks.push(blake3_hash(&st.byte_buf));
             }
             for w in &step.issue {
                 let off = family_base[w.param as usize] + w.param_off;
@@ -1324,8 +1574,9 @@ fn drive_update_completion(
     if !sealed {
         return UpdateStep::Progressed;
     }
-    let st = c.update_walk.take().expect("the sealed update walk");
+    let mut st = c.update_walk.take().expect("the sealed update walk");
     c.ef_fold = daemon_vhc_sdk::state_seal(st.ef_stream);
+    c.ef_chunks = std::mem::take(&mut st.ef_chunks);
     let sections = st
         .walk
         .seal()
@@ -1340,10 +1591,13 @@ fn drive_update_completion(
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
+fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
     let numels = cfg.model.param_numels();
     let vocab = cfg.model.vocab;
-    let mut live = cfg.live.take().map(LiveState::new);
+    let mut live = cfg
+        .live
+        .take()
+        .map(|c| LiveState::new(c, cfg.peer, cfg.roster.clone()));
     let restored_round = restored.as_ref().and_then(|r| r.round);
     let window_size = cfg.state.chunk_size;
     let family_base = family_base_offsets(&numels);
@@ -1353,65 +1607,56 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
     // walk completes, [`BootState`]). `booted == false` defers the first round until the init is
     // resident.
     let mut boot: Option<BootState> = None;
-    let (init, restored_local, mut booted) = match &restored {
-        Some(r) => (
-            split_flat(&r.master, &numels),
-            Some((
-                split_flat(&r.ef, &numels),
-                split_flat(&r.adamw_m, &numels),
-                split_flat(&r.adamw_v, &numels),
-            )),
-            true,
-        ),
+    // The init source (§6) / restore rebuild:
+    //   - Restore ([SF-6]): the model boots from zeros; a [`RestoreState`] walk registers the
+    //     checkpoint's family folds ([SF-R2]) and STREAMS master → device weights and adamw_m/v →
+    //     device moments, adopting the master/ef folds as the round base. `booted` stays false
+    //     until the walk lands (the first round defers behind it, like the artifact boot).
+    //   - Seed: deterministic expansion, sealed + `expected_root`-cross-checked synchronously.
+    //   - Artifact: fetched asynchronously ([`BootState`]); boots from zeros until it lands.
+    let init: Vec<Vec<f32>> = match &restored {
+        Some(_) => numels.iter().map(|&n| vec![0.0f32; n]).collect(),
         None => match cfg.state.init {
-            StateInit::Seed { seed, dist, .. } => {
-                let expanded: Vec<Vec<f32>> = numels
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &n)| {
-                        daemon_vhc_det::seed_init_param(&seed.0, dist, i as u64, n)
-                            .expect("the genesis seed-init distribution id is implemented")
-                    })
-                    .collect();
-                (expanded, None, true)
-            }
+            StateInit::Seed { seed, dist, .. } => numels
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| {
+                    daemon_vhc_det::seed_init_param(&seed.0, dist, i as u64, n)
+                        .expect("the genesis seed-init distribution id is implemented")
+                })
+                .collect(),
             StateInit::Manifest { manifest } => {
                 boot = Some(BootState::new(manifest, &numels));
-                (
-                    numels.iter().map(|&n| vec![0.0f32; n]).collect(),
-                    None,
-                    false,
-                )
+                numels.iter().map(|&n| vec![0.0f32; n]).collect()
             }
         },
     };
+    // Seed init is resident synchronously; a restore or an artifact fetch defers the first round.
+    let mut booted = restored.is_none() && boot.is_none();
     let device = daemon_vhc_sdk_compute::device();
-    let mut model =
-        TinyLlamaModel::<AutodiffHostBackend>::from_flat(cfg.model.clone(), device, &init);
+    let model = TinyLlamaModel::<AutodiffHostBackend>::from_flat(cfg.model.clone(), device, &init);
     // The canonical master + replica-local ef live host-side as sealed folds (no resident copy).
-    // A booted init (seed/restore) seals both synchronously now — master from the init, ef from
-    // the restored residuals or a zeroed family; the artifact form registers/seals them at boot.
+    // Seed-init seals both synchronously now — master from the expansion (cross-checked against
+    // the pin) and a zeroed ef; restore adopts the checkpoint's folds; the artifact form
+    // registers/seals at boot.
     let mut master_fold = [0u8; 32];
+    let mut master_chunks: Vec<Hash> = Vec::new();
     let mut ef_fold = [0u8; 32];
+    let mut ef_chunks: Vec<Hash> = Vec::new();
     if booted {
-        master_fold = seal_family(MASTER_FAMILY, &init, window_size);
-        let ef_init: Vec<Vec<f32>> = match &restored_local {
-            Some((ef, _m, _v)) => ef.clone(),
-            None => numels.iter().map(|&n| vec![0.0f32; n]).collect(),
-        };
-        ef_fold = seal_family(EF_FAMILY, &ef_init, window_size);
-        if let Some((_ef, m, v)) = &restored_local {
-            model.set_moments_from_flat(m, v);
-        }
+        let (mf, mc) = seal_family(MASTER_FAMILY, &init, window_size);
+        master_fold = mf;
+        master_chunks = mc;
+        let zeroed: Vec<Vec<f32>> = numels.iter().map(|&n| vec![0.0f32; n]).collect();
+        let (ff, fc) = seal_family(EF_FAMILY, &zeroed, window_size);
+        ef_fold = ff;
+        ef_chunks = fc;
         // Seed-init admission cross-check (§6.1a): the sealed expansion MUST reproduce the pin.
-        if restored.is_none() {
-            if let StateInit::Seed { expected_root, .. } = cfg.state.init {
-                assert_eq!(
-                    master_fold, expected_root.0,
-                    "seed-init sealed fold does not match the pinned expected_root (typed init \
-                     failure)"
-                );
-            }
+        if let StateInit::Seed { expected_root, .. } = cfg.state.init {
+            assert_eq!(
+                master_fold, expected_root.0,
+                "seed-init sealed fold does not match the pinned expected_root (typed init failure)"
+            );
         }
     }
     let core = Rc::new(RefCell::new(Core {
@@ -1421,7 +1666,9 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
         family_base,
         window_size,
         master_fold,
+        master_chunks,
         ef_fold,
+        ef_chunks,
         ingest_walk: None,
         update_walk: None,
         ingest_voices: true,
@@ -1429,6 +1676,12 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
         pending_grads: None,
         next_step_fence: 0,
     }));
+    // Restore ([SF-6]): register the checkpoint's family folds ([SF-R2]), adopt the master/ef
+    // folds as the round base, and kick off the streamed rehydration (master → weights,
+    // adamw_m/v → moments; ef needs no materialization — the update walk reads its windows).
+    let mut restore: Option<RestoreState> = restored
+        .as_ref()
+        .map(|refs| RestoreState::begin(&core, refs));
     // Fresh artifact-form join: kick off the init boot (fetch the pinned manifest).
     if let Some(b) = boot.as_mut() {
         b.manifest_op = Some(daemon_vhc_sdk::data_fetch(&b.manifest.0, 0, 0));
@@ -1478,26 +1731,27 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                 // the snapshot is an async export walk (same shape as the round's θ export —
                 // Fence/Completion events keep delivering during a drain, §4.4). The manifest is
                 // authored and submitted when the last completion lands (EV_COMPLETION below).
-                let (tensors, master_fold, ef_fold) = {
+                let (tensors, master_fref, ef_fref) = {
                     let c = core.borrow();
-                    (c.model.moment_tensors(), c.master_fold, c.ef_fold)
+                    let byte_len = family_byte_len(&numels_u64(&c.numels));
+                    (
+                        c.model.moment_tensors(),
+                        family_ref(c.master_fold, &c.master_chunks, byte_len, c.window_size),
+                        family_ref(c.ef_fold, &c.ef_chunks, byte_len, c.window_size),
+                    )
                 };
                 let mut ops = BTreeMap::new();
                 let n = tensors.len();
                 for (i, t) in tensors.into_iter().enumerate() {
                     ops.insert(export_tensor(t), i);
                 }
-                // Fetch the canonical master + replica-local ef whole from their sealed folds
-                // ([SF-R1], host-local) — the snapshot's class-0 + class-1 flat sections.
-                let master_op = daemon_vhc_sdk::data_fetch(&master_fold, 0, 0);
-                let ef_op = daemon_vhc_sdk::data_fetch(&ef_fold, 0, 0);
+                // The master + ef families are already sealed — captured by-reference (zero extra
+                // reads); only the AdamW moments export here ([SF-6]).
                 quiesce = Some(QuiesceWalk {
                     collected: vec![None; n],
                     ops,
-                    master_op,
-                    master_bytes: None,
-                    ef_op,
-                    ef_bytes: None,
+                    master_fref,
+                    ef_fref,
                 });
             }
             EV_PAYLOAD_READY => {
@@ -1682,6 +1936,28 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                         continue;
                     }
                 }
+                // The streamed checkpoint rehydration ([SF-6]): master/adamw_m/adamw_v window reads.
+                // When the last lands (weights + moments uploaded), a round that arrived early runs.
+                if let Some(rs) = restore.as_mut() {
+                    if drive_restore_completion(&core, rs, &ev, op) {
+                        if rs.done {
+                            booted = true;
+                            restore = None;
+                            if let Some(ro) = deferred_open.take() {
+                                try_open_round(
+                                    &core,
+                                    &mut driver,
+                                    &mut payloads,
+                                    &numels,
+                                    ro,
+                                    &mut export,
+                                    &mut deferred_open,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                }
                 // The in-flight streamed ingest walk's round-base window reads. At seal, voice the
                 // round digest (finish_ingest) and — now that the fold is durable and the master
                 // uploaded — retry any round whose training was waiting behind it (catch-up).
@@ -1787,45 +2063,24 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                     // The periodic checkpoint walk's moment exports (spec §9): collect; a failed
                     // export abandons the cadence slot (training continues; the next fires).
                     let ckpt_hit = l.pending_ckpt.as_mut().and_then(|walk| {
-                        if let Some(idx) = walk.ops.remove(&op) {
-                            Some(match completion_tensor(&ev) {
+                        walk.ops
+                            .remove(&op)
+                            .map(|idx| match completion_tensor(&ev) {
                                 Some(t) => {
                                     walk.collected[idx] = Some(t);
                                     true
                                 }
                                 None => false,
                             })
-                        } else if op == walk.master_op {
-                            Some(match completion_bytes(&ev) {
-                                Some(b) => {
-                                    walk.master_bytes = Some(b);
-                                    true
-                                }
-                                None => false,
-                            })
-                        } else if op == walk.ef_op {
-                            Some(match completion_bytes(&ev) {
-                                Some(b) => {
-                                    walk.ef_bytes = Some(b);
-                                    true
-                                }
-                                None => false,
-                            })
-                        } else {
-                            None
-                        }
                     });
                     match ckpt_hit {
                         Some(true) => {
                             let done = l.pending_ckpt.as_ref().is_some_and(|w| {
-                                w.ops.is_empty()
-                                    && w.collected.iter().all(Option::is_some)
-                                    && w.master_bytes.is_some()
-                                    && w.ef_bytes.is_some()
+                                w.ops.is_empty() && w.collected.iter().all(Option::is_some)
                             });
                             if done {
                                 let walk = l.pending_ckpt.take().expect("the in-flight checkpoint");
-                                l.finish_checkpoint(walk);
+                                l.finish_checkpoint(&core, walk);
                             }
                             continue;
                         }
@@ -1888,99 +2143,90 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                 }
                 // The quiesce walk's completions (§10.2 phase 2): collect the exported moments;
                 // when the last lands, author + submit the typed manifest and QuiesceReady.
-                if let Some(walk) = quiesce.as_mut() {
-                    let mut hit = true;
-                    if let Some(idx) = walk.ops.remove(&op) {
+                if quiesce.as_ref().is_some_and(|w| w.ops.contains_key(&op)) {
+                    {
+                        let walk = quiesce.as_mut().expect("quiesce present");
+                        let idx = walk.ops.remove(&op).expect("checked present");
                         walk.collected[idx] = Some(
                             completion_tensor(&ev)
                                 .expect("moment export completes (quiesce fails loud)"),
                         );
-                    } else if op == walk.master_op {
-                        walk.master_bytes =
-                            Some(completion_bytes(&ev).expect("quiesce master fetch (fail loud)"));
-                    } else if op == walk.ef_op {
-                        walk.ef_bytes =
-                            Some(completion_bytes(&ev).expect("quiesce ef fetch (fail loud)"));
-                    } else {
-                        hit = false;
                     }
-                    if hit {
-                        if walk.ops.is_empty()
-                            && walk.collected.iter().all(Option::is_some)
-                            && walk.master_bytes.is_some()
-                            && walk.ef_bytes.is_some()
-                        {
-                            let moments: Vec<Vec<f32>> = walk
-                                .collected
-                                .iter_mut()
-                                .map(|c| c.take().expect("collected"))
-                                .collect();
-                            let n = moments.len() / 2;
-                            // The canonical master + replica-local ef, fetched whole from the
-                            // sealed folds (no resident copy).
-                            let master_le = walk.master_bytes.take().expect("master bytes");
-                            let ef_le = walk.ef_bytes.take().expect("ef bytes");
-                            // `module` is zeroed — a module cannot hash its own bytes; the host
-                            // verifies sections by content hash (the drill-pair convention).
-                            let sections = [
-                                OwnedSection {
-                                    name: "master".to_string(),
-                                    schema: 1,
-                                    class: 0, // consensus-canonical (the digest-covered masters)
-                                    bytes: master_le,
-                                },
-                                OwnedSection {
-                                    name: "ef".to_string(),
-                                    schema: 1,
-                                    class: 1, // replica-local; continuity-required
-                                    bytes: ef_le,
-                                },
-                                OwnedSection {
-                                    name: "adamw_m".to_string(),
-                                    schema: 1,
-                                    class: 1,
-                                    bytes: flat_le(&moments[..n]),
-                                },
-                                OwnedSection {
-                                    name: "adamw_v".to_string(),
-                                    schema: 1,
-                                    class: 1,
-                                    bytes: flat_le(&moments[n..]),
-                                },
-                            ];
-                            let mut sections = sections.to_vec();
-                            // The resync watermark (§9): the last round this snapshot's state
-                            // folds; a restore never re-ingests at/below it (`u64::MAX` = no
-                            // ingest yet). LIVE-MODE ONLY — the deterministic harness rings pin
-                            // the four-section manifest shape, and only the live module-driven
-                            // path restores through the watermark.
-                            if live.is_some() {
-                                sections.push(OwnedSection {
-                                    name: "round".to_string(),
-                                    schema: 1,
-                                    class: 1,
-                                    bytes: driver
-                                        .last_ingested()
-                                        .unwrap_or(u64::MAX)
-                                        .to_le_bytes()
-                                        .to_vec(),
-                                });
-                            }
-                            for s in &sections {
-                                let _staging_id = daemon_vhc_sdk::stage_state(&s.bytes);
-                            }
-                            let manifest = build_manifest(Hash([0u8; 32]), 1, &sections);
-                            let manifest_bytes =
-                                to_canonical_vec(&manifest).expect("state-manifest cbor");
-                            let status = daemon_vhc_sdk::snapshot_state(&manifest_bytes);
-                            assert_eq!(status, 0, "snapshot_state rejected the trainer manifest");
-                            // Same deliberate-leak shutdown discipline as Stop (§7.3).
-                            std::mem::forget(driver);
-                            std::mem::forget(core);
-                            return OUTCOME_QUIESCE_READY;
+                    let done = quiesce.as_ref().is_some_and(|w| {
+                        w.ops.is_empty() && w.collected.iter().all(Option::is_some)
+                    });
+                    if done {
+                        let walk = quiesce.take().expect("quiesce present");
+                        let mut moments = walk.collected;
+                        let moments: Vec<Vec<f32>> = moments
+                            .iter_mut()
+                            .map(|c| c.take().expect("collected"))
+                            .collect();
+                        let n = moments.len() / 2;
+                        let (window_size, byte_len) = {
+                            let c = core.borrow();
+                            (c.window_size, family_byte_len(&numels_u64(&c.numels)))
+                        };
+                        // Seal the exported moments into their own families ([SF-6]); master + ef
+                        // are already sealed and referenced by fold (`walk.master_fref`/`ef_fref`).
+                        let (m_fold, m_chunks) =
+                            seal_family(ADAMW_M_FAMILY, &moments[..n], window_size);
+                        let (v_fold, v_chunks) =
+                            seal_family(ADAMW_V_FAMILY, &moments[n..], window_size);
+                        let mut parts = vec![
+                            CkptPart::Family {
+                                name: MASTER_FAMILY,
+                                class: 0, // consensus-canonical (the digest-covered masters)
+                                fref: walk.master_fref,
+                            },
+                            CkptPart::Family {
+                                name: EF_FAMILY,
+                                class: 1, // replica-local; continuity-required
+                                fref: walk.ef_fref,
+                            },
+                            CkptPart::Family {
+                                name: ADAMW_M_FAMILY,
+                                class: 1,
+                                fref: family_ref(m_fold, &m_chunks, byte_len, window_size),
+                            },
+                            CkptPart::Family {
+                                name: ADAMW_V_FAMILY,
+                                class: 1,
+                                fref: family_ref(v_fold, &v_chunks, byte_len, window_size),
+                            },
+                        ];
+                        // The resync watermark (§9): LIVE-MODE ONLY — the deterministic harness
+                        // rings pin the four-section manifest shape, and only the live path
+                        // restores through the watermark.
+                        if live.is_some() {
+                            parts.push(CkptPart::Inline {
+                                name: "round",
+                                class: 1,
+                                bytes: driver
+                                    .last_ingested()
+                                    .unwrap_or(u64::MAX)
+                                    .to_le_bytes()
+                                    .to_vec(),
+                            });
                         }
-                        continue;
+                        // Stage inline sections host-side; by-ref sections need no staging — the
+                        // host reconstructs their FamilyRef from its own state store on
+                        // `snapshot_state` (the families are sealed there).
+                        for p in &parts {
+                            if let CkptPart::Inline { bytes, .. } = p {
+                                let _ = daemon_vhc_sdk::stage_state(bytes);
+                            }
+                        }
+                        let manifest_bytes =
+                            ckpt_manifest_bytes(&parts).expect("state-manifest cbor");
+                        let status = daemon_vhc_sdk::snapshot_state(&manifest_bytes);
+                        assert_eq!(status, 0, "snapshot_state rejected the trainer manifest");
+                        // Same deliberate-leak shutdown discipline as Stop (§7.3).
+                        std::mem::forget(driver);
+                        std::mem::forget(core);
+                        return OUTCOME_QUIESCE_READY;
                     }
+                    continue;
                 }
                 let Some(st) = export.as_mut() else { continue };
                 let Some(param_idx) = st.ops.remove(&op) else {

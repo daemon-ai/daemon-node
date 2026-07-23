@@ -9,7 +9,7 @@
 use daemon_vhc_proto::{blake3_hash, Hash};
 use daemon_vhc_sdk::{
     build_manifest, derive_claim, manifest_bytes, migrate, MigrateState, MigrationDescriptor,
-    ModuleDecl, OwnedSection, SectionReader,
+    MigrationSection, ModuleDecl, OwnedSection, SectionReader,
 };
 
 /// A toy migratable module state: a consensus counter + a replica-local cursor.
@@ -47,8 +47,11 @@ impl MigrateState for Toy {
             .iter()
             .zip(&descriptor.sections)
         {
-            assert_eq!(decl.name, binding.name, "descriptor order (§10.2)");
-            let bytes = reader.read(binding.staging_id);
+            assert_eq!(decl.name, binding.name(), "descriptor order (§10.2)");
+            let MigrationSection::Inline { staging_id, .. } = binding else {
+                return 19; // this sim module snapshots only inline sections
+            };
+            let bytes = reader.read(*staging_id);
             // The host verified hashes before staging; the module may re-verify for free.
             assert_eq!(blake3_hash(&bytes), decl.hash);
             match decl.name.as_str() {

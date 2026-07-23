@@ -37,7 +37,9 @@ use std::collections::BTreeMap;
 
 use daemon_vhc_abi::{EV_TAG_COMPLETION, EV_TAG_FRAME, EV_TAG_QUIESCE, EV_TAG_STOP, EV_TAG_TIMER};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, PeerId};
-use daemon_vhc_sdk::migrate::{build_manifest, MigrationDescriptor, OwnedSection, SectionReader};
+use daemon_vhc_sdk::migrate::{
+    build_manifest, MigrationDescriptor, MigrationSection, OwnedSection, SectionReader,
+};
 use daemon_vhc_sdk::module::{GuestModule, ModuleDecl};
 use daemon_vhc_sdk_consensus::coordinator::{
     tick, tick_authenticated, CoordinatorState, Input, Output,
@@ -202,10 +204,14 @@ impl GuestModule for Coordinator {
     fn migrate(&mut self, descriptor: &MigrationDescriptor, reader: &mut dyn SectionReader) -> u32 {
         let mut restored: Option<CoordinatorState> = None;
         for binding in &descriptor.sections {
-            if binding.name != STATE_SECTION {
+            if binding.name() != STATE_SECTION {
                 return MIGRATE_INCOMPATIBLE;
             }
-            let bytes = reader.read(binding.staging_id);
+            // The coordinator's whole state is one inline section (never by-reference).
+            let MigrationSection::Inline { staging_id, .. } = binding else {
+                return MIGRATE_INCOMPATIBLE;
+            };
+            let bytes = reader.read(*staging_id);
             match from_canonical_slice::<CoordinatorState>(&bytes) {
                 Ok(s) => restored = Some(s),
                 Err(_) => return MIGRATE_INCOMPATIBLE,

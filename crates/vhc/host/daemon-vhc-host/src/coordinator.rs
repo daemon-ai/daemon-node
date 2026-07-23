@@ -534,10 +534,17 @@ pub fn frame_sender(frame: &Value) -> Result<[u8; 32], String> {
 pub fn coordinator_state_from_capture(
     capture: &SnapshotCapture,
 ) -> Result<CoordinatorState, String> {
-    let (_, bytes) = capture
+    let bytes = capture
         .sections
         .iter()
-        .find(|(name, _)| name == COORDINATOR_STATE_SECTION)
+        .find_map(|s| match s {
+            daemon_vhc_proto::det_state::CkptDocSection::Inline(name, bytes)
+                if name == COORDINATOR_STATE_SECTION =>
+            {
+                Some(bytes)
+            }
+            _ => None,
+        })
         .ok_or_else(|| format!("capture carries no `{COORDINATOR_STATE_SECTION}` section"))?;
     from_canonical_slice::<CoordinatorState>(bytes)
         .map_err(|e| format!("coordinator state decode: {e}"))

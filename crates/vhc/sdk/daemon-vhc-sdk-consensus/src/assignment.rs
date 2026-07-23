@@ -176,6 +176,38 @@ pub fn elect_checkpointer(roster: &[PeerId], seed: &Seed) -> Option<PeerId> {
     Some(pool[idx])
 }
 
+/// Elect the **remote-checkpoint publisher for a cadence slot** deterministically from
+/// `(seed, roster, remote_slot_index)` — the single designated uploader per (role, kind) slot
+/// (design §7.4, D-SF3). Additive beside [`elect_checkpointer`] (the `(seed, roster)` tie-breaker
+/// keeps its contract): the checkpointer-salted base index is **rotated by the slot index**, so
+/// consecutive cadence slots deterministically designate *different* publishers whenever the
+/// roster has ≥ 2 members. That rotation IS the publisher-churn cover: a slot whose designated
+/// publisher has died simply goes unpublished, and the NEXT slot's rotation lands on a different
+/// peer — exactly the **one-slot slack** term `validate_checkpoint_cadence` reserves
+/// (`remote_cadence + one slot ≤ payload_retention`). Every peer derives the same publisher from
+/// the same `(seed, roster, slot)` without exchanging a message. `None` for an empty roster; a
+/// single-peer roster degrades to that sole peer every slot.
+#[must_use]
+pub fn elect_checkpoint_publisher_for_slot(
+    roster: &[PeerId],
+    seed: &Seed,
+    remote_slot_index: u64,
+) -> Option<PeerId> {
+    if roster.is_empty() {
+        return None;
+    }
+    let mut pool = roster.to_vec();
+    pool.sort_unstable();
+    pool.dedup();
+    let n = pool.len() as u64;
+    let mut rng = seeded_lcg(seed, CHECKPOINTER_SALT);
+    let base = rng.below(n);
+    // Rotate by the slot: adjacent slots pick adjacent pool members (a deterministic rotation),
+    // so a missed slot is always covered by the next slot's distinct publisher (n ≥ 2).
+    let idx = ((base + (remote_slot_index % n)) % n) as usize;
+    Some(pool[idx])
+}
+
 /// Elect `count` checkpointers deterministically from `(seed, roster)` — the checkpointer committee
 /// (§9; TDD RUN-6). The spec runs **two** elected checkpointers that upload independently and whose
 /// manifests must agree (both-match registration); this returns the first `count` of the
@@ -357,6 +389,52 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(sorted, (0..50).collect::<Vec<_>>());
         assert_ne!(v, (0..50).collect::<Vec<_>>(), "should reorder");
+    }
+
+    #[test]
+    fn checkpoint_publisher_slot_rotation_covers_churn() {
+        let roster: Vec<PeerId> = (0..4).map(peer).collect();
+        let s = seed(9);
+
+        // Deterministic + order-independent (a shuffled roster elects the same publisher).
+        let mut shuffled = roster.clone();
+        shuffled.reverse();
+        for slot in 0..8 {
+            assert_eq!(
+                elect_checkpoint_publisher_for_slot(&roster, &s, slot),
+                elect_checkpoint_publisher_for_slot(&shuffled, &s, slot),
+                "publisher is a pure function of the peer SET + seed + slot"
+            );
+        }
+
+        // Consecutive slots designate DISTINCT publishers (the rotation) — so a slot whose
+        // publisher died is covered by the very next slot's different publisher (one-slot slack).
+        for slot in 0..12u64 {
+            let a = elect_checkpoint_publisher_for_slot(&roster, &s, slot).unwrap();
+            let b = elect_checkpoint_publisher_for_slot(&roster, &s, slot + 1).unwrap();
+            assert_ne!(a, b, "adjacent slots rotate to a different publisher");
+        }
+
+        // Over n consecutive slots every peer is designated exactly once (a full rotation).
+        let n = roster.len() as u64;
+        let designated: std::collections::BTreeSet<PeerId> = (0..n)
+            .map(|slot| elect_checkpoint_publisher_for_slot(&roster, &s, slot).unwrap())
+            .collect();
+        assert_eq!(
+            designated.len(),
+            roster.len(),
+            "a full rotation covers all peers"
+        );
+
+        // Degenerate rosters: empty → None; single peer → that peer every slot.
+        assert_eq!(elect_checkpoint_publisher_for_slot(&[], &s, 3), None);
+        let solo = vec![peer(7)];
+        for slot in 0..5 {
+            assert_eq!(
+                elect_checkpoint_publisher_for_slot(&solo, &s, slot),
+                Some(peer(7))
+            );
+        }
     }
 
     #[test]

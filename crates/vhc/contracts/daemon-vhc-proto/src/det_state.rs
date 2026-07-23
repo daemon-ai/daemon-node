@@ -348,6 +348,53 @@ impl DetStateChunkMap {
         Ok(())
     }
 
+    /// The ordered `(chunk hash, chunk len)` pairs that a chunk-aligned covering span
+    /// `[span_off, span_off + span_len)` is composed of — the list a chunk-keyed resolver fetches
+    /// and concatenates to reassemble the span, symmetric with the replay-side chunk-keyed
+    /// materialization ([SF-R2]). `span_off` MUST be a chunk boundary and the span MUST end on a
+    /// chunk boundary (both hold for a span produced by [`Self::covering_span`]); anything else is
+    /// a typed refusal so the resolver never fetches a mis-aligned or over-reaching span.
+    ///
+    /// # Errors
+    /// A `String` describing a boundary/length violation.
+    pub fn covering_chunks(
+        &self,
+        span_off: u64,
+        span_len: u64,
+    ) -> Result<Vec<(Hash, u32)>, VhcProtoError> {
+        // Locate the starting chunk (span_off must be a chunk boundary).
+        let mut cursor = 0u64;
+        let mut index = 0usize;
+        while index < self.chunks.len() && cursor < span_off {
+            cursor += u64::from(self.chunks[index].1);
+            index += 1;
+        }
+        if cursor != span_off {
+            return Err(VhcProtoError::Validation(format!(
+                "det-state span_off {span_off} is not a chunk boundary"
+            )));
+        }
+        let mut out = Vec::new();
+        let mut remaining = span_len;
+        while remaining > 0 {
+            let Some(&(hash, len)) = self.chunks.get(index) else {
+                return Err(VhcProtoError::Validation(format!(
+                    "det-state covering span [{span_off}, +{span_len}) reaches past the chunk list \
+                     (chunk {index})"
+                )));
+            };
+            out.push((hash, len));
+            remaining = remaining.checked_sub(u64::from(len)).ok_or_else(|| {
+                VhcProtoError::Validation(format!(
+                    "det-state covering span [{span_off}, +{span_len}) does not end on a chunk \
+                     boundary (chunk {index} overshoots)"
+                ))
+            })?;
+            index += 1;
+        }
+        Ok(out)
+    }
+
     /// Encode to the one wire form (canonical CBOR) — the descriptor a guest passes to the host's
     /// det-state chunk registration import, after [`Self::validate`].
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, VhcProtoError> {
@@ -622,6 +669,64 @@ impl CkptDocSection {
             Self::ByRef(name, _) | Self::Inline(name, _) => name,
         }
     }
+
+    /// The section's content bytes for content-addressing in a seam/upgrade manifest: inline
+    /// bytes verbatim, or the canonical [`FamilyRef`] encoding for a by-reference section (the
+    /// family's identity is its fold; the ref's canonical bytes are its stable seam content).
+    ///
+    /// # Errors
+    /// Propagates a codec error encoding a by-ref section (structurally unreachable).
+    pub fn content_bytes(&self) -> Result<Vec<u8>, VhcProtoError> {
+        match self {
+            Self::Inline(_, bytes) => Ok(bytes.clone()),
+            Self::ByRef(_, family) => to_canonical_vec(family),
+        }
+    }
+}
+
+/// Encode the **checkpoint-document v2** outer form (design §7.2): the 2-element array
+/// `[manifest_bytes, [ckpt-doc-section…]]` — the state-manifest bytes (opaque here; the module's
+/// §10.2 schema) as a byte string, followed by the section array in the manifest's declared
+/// order. This is the one shared codec the guest author, the session structural recognizer, and
+/// the restore decoder all use, so a by-ref section round-trips identically across the seam.
+pub fn encode_checkpoint_doc(
+    manifest_bytes: &[u8],
+    sections: &[CkptDocSection],
+) -> Result<Vec<u8>, VhcProtoError> {
+    use ciborium::value::Value;
+    let sections_val = Value::serialized(&sections)
+        .map_err(|e| VhcProtoError::Validation(format!("checkpoint-doc sections encode: {e}")))?;
+    let doc = Value::Array(vec![Value::Bytes(manifest_bytes.to_vec()), sections_val]);
+    let mut out = Vec::new();
+    ciborium::into_writer(&doc, &mut out)
+        .map_err(|e| VhcProtoError::Validation(format!("checkpoint-doc encode: {e}")))?;
+    Ok(out)
+}
+
+/// Decode a [`encode_checkpoint_doc`] document into `(manifest_bytes, sections)`. Fails typed on
+/// any structural surprise — a malformed checkpoint never yields a partial capture.
+pub fn decode_checkpoint_doc(
+    bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<CkptDocSection>), VhcProtoError> {
+    use ciborium::value::Value;
+    let doc: Value = ciborium::de::from_reader(bytes)
+        .map_err(|e| VhcProtoError::Validation(format!("checkpoint-doc decode: {e}")))?;
+    let Value::Array(parts) = doc else {
+        return Err(VhcProtoError::Validation(
+            "checkpoint-doc is not a 2-element array".into(),
+        ));
+    };
+    let [manifest_v, sections_v] = <[Value; 2]>::try_from(parts)
+        .map_err(|_| VhcProtoError::Validation("checkpoint-doc arity != 2".into()))?;
+    let Value::Bytes(manifest) = manifest_v else {
+        return Err(VhcProtoError::Validation(
+            "checkpoint-doc manifest is not a byte string".into(),
+        ));
+    };
+    let sections: Vec<CkptDocSection> = sections_v
+        .deserialized()
+        .map_err(|e| VhcProtoError::Validation(format!("checkpoint-doc sections decode: {e}")))?;
+    Ok((manifest, sections))
 }
 
 /// The profile-chunk constraint (genesis-authoring rule): the compression profile's `chunk`
@@ -869,6 +974,37 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_doc_round_trips_mixed_sections() {
+        let params: Vec<Vec<u8>> = [16u64, 4].iter().map(|&n| param_bytes(n, n)).collect();
+        let views: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
+        let entry = FamilyEntry::author(&views, 24).unwrap();
+        let fref = FamilyRef {
+            fold: entry.fold,
+            byte_len: entry.byte_len,
+            chunk_size: 24,
+            chunk_hashes: entry.chunk_hashes,
+        };
+        let manifest = b"opaque-state-manifest-bytes".to_vec();
+        let sections = vec![
+            CkptDocSection::ByRef("master".into(), fref.clone()),
+            CkptDocSection::Inline("round".into(), 7u64.to_le_bytes().to_vec()),
+        ];
+        let doc = encode_checkpoint_doc(&manifest, &sections).unwrap();
+        let (back_manifest, back_sections) = decode_checkpoint_doc(&doc).unwrap();
+        assert_eq!(back_manifest, manifest, "manifest bytes survive verbatim");
+        assert_eq!(back_sections, sections, "sections survive the round-trip");
+        // The by-ref section is fully reconstructable (fold self-consistent).
+        let CkptDocSection::ByRef(_, back_ref) = &back_sections[0] else {
+            panic!("first section is by-ref");
+        };
+        back_ref.validate().unwrap();
+        assert_eq!(back_ref, &fref);
+        // A truncated / non-array doc is a typed refusal, never a partial capture.
+        assert!(decode_checkpoint_doc(&doc[..doc.len() - 1]).is_err());
+        assert!(decode_checkpoint_doc(b"\x01").is_err());
+    }
+
+    #[test]
     fn family_ref_and_doc_sections_round_trip() {
         let params: Vec<Vec<u8>> = [16u64, 4].iter().map(|&n| param_bytes(n, n)).collect();
         let views: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
@@ -969,6 +1105,43 @@ mod tests {
         lying.chunks[last].1 = 24; // was 8
         lying.byte_len += 16;
         assert!(lying.verify_covering_span(0, &flat).is_err());
+    }
+
+    #[test]
+    fn det_state_covering_chunks_reassembles_span_and_rejects_misalignment() {
+        let numels = [16u64, 4, 8];
+        let params: Vec<Vec<u8>> = numels
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| param_bytes(i as u64 + 1, n))
+            .collect();
+        let flat: Vec<u8> = params.concat();
+        let views: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
+        let entry = FamilyEntry::author(&views, 24).unwrap();
+        let map = DetStateChunkMap::derive(24, &numels, &entry.chunk_hashes).unwrap();
+
+        // The covering span of an interior range decomposes into exactly its constituent chunks,
+        // in order, and the concatenated chunk bytes ARE the covering span the resolver serves.
+        let (span_off, span_len) = map.covering_span(30, 70);
+        let chunks = map.covering_chunks(span_off, span_len).unwrap();
+        let listed_len: u64 = chunks.iter().map(|(_, l)| u64::from(*l)).sum();
+        assert_eq!(listed_len, span_len, "listed chunk lengths sum to the span");
+        // Each listed hash is the blake3 of the corresponding slice of the family image.
+        let mut pos = span_off as usize;
+        for (hash, len) in &chunks {
+            let end = pos + *len as usize;
+            assert_eq!(blake3_hash(&flat[pos..end]), *hash);
+            pos = end;
+        }
+        // A whole-family span lists every chunk.
+        let all = map.covering_chunks(0, map.byte_len).unwrap();
+        assert_eq!(all.len(), map.chunks.len());
+        // A non-boundary offset and an over-reaching span are typed refusals.
+        assert!(map.covering_chunks(10, 24).is_err(), "off not a boundary");
+        assert!(
+            map.covering_chunks(0, map.byte_len + 1).is_err(),
+            "span past the chunk list"
+        );
     }
 
     #[test]

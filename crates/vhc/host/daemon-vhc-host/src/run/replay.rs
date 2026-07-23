@@ -1196,13 +1196,32 @@ pub fn replay_migrating(
     // is answered from the recorded kind-3 read-backs (`script.readbacks`), so the reconstruction
     // is byte-identical to the live one.
     if let Some(mig) = &migration {
-        let bindings: Vec<(String, u64)> = mig
-            .capture
-            .sections
-            .iter()
-            .enumerate()
-            .map(|(i, (name, _))| (name.clone(), i as u64 + 1))
-            .collect();
+        // Rebuild the restore bindings ([SF-6]) exactly as the live migrate step did: INLINE
+        // sections get host staging IDs monotone from 1 in manifest order (the recording's
+        // assignment — the guest's `read_back(id, 3)` is answered from `script.readbacks`);
+        // BY-REFERENCE families carry their FamilyRef (re-registered by the replayed guest's
+        // `register_state_chunks`, dc class — no grant gate at replay; the streamed fetch
+        // materializes from the replay-side chunk-keyed store).
+        use daemon_vhc_proto::det_state::CkptDocSection;
+        let mut next_inline_id = 1u64;
+        let mut bindings: Vec<super::driver::RestoreBinding> = Vec::new();
+        for section in &mig.capture.sections {
+            match section {
+                CkptDocSection::Inline(name, _) => {
+                    bindings.push(super::driver::RestoreBinding::Inline {
+                        name: name.clone(),
+                        staging_id: next_inline_id,
+                    });
+                    next_inline_id += 1;
+                }
+                CkptDocSection::ByRef(name, family) => {
+                    bindings.push(super::driver::RestoreBinding::ByRef {
+                        name: name.clone(),
+                        family: family.clone(),
+                    });
+                }
+            }
+        }
         let descriptor =
             super::driver::build_migration_descriptor(&mig.capture.manifest, &bindings)
                 .map_err(|e| RunError::Sandbox(format!("replay migration descriptor: {e}")))?;

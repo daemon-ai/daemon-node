@@ -243,6 +243,27 @@ pub fn trainer_state_contract() -> StateContract {
     }
 }
 
+/// Genesis-authoring cadence gate (D-SF3, 2026-07-23 ruling; ABI §12.14 [SF-5]). The host cannot
+/// decode a trainer's opaque module config at admission, so the cadence↔retention invariant is
+/// GUARANTEED here — at authoring — against EXPLICIT inputs (the ceremony-tier genesis, authored in
+/// a later wave, inherits this gate rather than assuming defaults): a remote checkpoint cadence
+/// whose gap plus one publisher-churn slot could strand a rejoiner past `payload_retention_rounds`
+/// is a TYPED authoring refusal. `remote_ckpt_every == 0` (upload every local boundary) and
+/// `payload_retention_rounds == 0` (unbounded retention) are unconstrained.
+///
+/// # Errors
+/// A `String` describing the refusal when `remote_ckpt_every * 2 > payload_retention_rounds`.
+pub fn author_check_checkpoint_cadence(
+    remote_ckpt_every: u64,
+    payload_retention_rounds: u64,
+) -> Result<(), String> {
+    daemon_vhc_proto::det_state::validate_checkpoint_cadence(
+        remote_ckpt_every,
+        payload_retention_rounds,
+    )
+    .map_err(|e| format!("genesis authoring refused the checkpoint cadence: {e}"))
+}
+
 /// The compute@2 trainer's guest config, authored SDK-free as raw canonical CBOR (module docs):
 /// the tiny t2 parity model + the `sparse_loco` profile + the deterministic matched init.
 #[must_use]

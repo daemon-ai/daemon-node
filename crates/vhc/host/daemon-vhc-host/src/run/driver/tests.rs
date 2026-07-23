@@ -527,8 +527,14 @@ fn manifest_sections_decode_and_descriptor_round_trips() {
     assert_eq!(&decls[0].hash, blake3::hash(&section_bytes).as_bytes());
 
     // The descriptor embeds the manifest value verbatim + the restore bindings (§10.2).
-    let desc =
-        build_migration_descriptor(&manifest_bytes, &[("counter".into(), 42)]).expect("builds");
+    let desc = build_migration_descriptor(
+        &manifest_bytes,
+        &[super::migration::RestoreBinding::Inline {
+            name: "counter".into(),
+            staging_id: 42,
+        }],
+    )
+    .expect("builds");
     let v: Value = ciborium::de::from_reader(desc.as_slice()).unwrap();
     let Value::Map(entries) = v else {
         panic!("descriptor is a map")

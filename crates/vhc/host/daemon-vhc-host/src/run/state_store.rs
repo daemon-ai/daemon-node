@@ -209,6 +209,11 @@ pub struct StateStore {
     family_order: HashMap<String, VecDeque<[u8; 32]>>,
     /// Pinned folds (checkpoint-referenced / init artifacts): exempt from retention eviction.
     pinned: std::collections::HashSet<[u8; 32]>,
+    /// The folds pinned by the CURRENT freshest (role,kind) checkpoint (design §8.2) — the subset
+    /// of [`Self::pinned`] that [`Self::repin_checkpoint`] swaps when a fresher checkpoint
+    /// supersedes it, so a stale checkpoint's families re-enter ordinary retention while init/
+    /// permanent pins are untouched.
+    ckpt_pins: std::collections::HashSet<[u8; 32]>,
     /// Live retained bytes (unique chunks with `sealed_refs > 0`).
     retained_bytes: u64,
     /// The write token bucket: available bytes + the last refill instant (logical pump ms).
@@ -229,6 +234,7 @@ impl StateStore {
             sealed: HashMap::new(),
             family_order: HashMap::new(),
             pinned: std::collections::HashSet::new(),
+            ckpt_pins: std::collections::HashSet::new(),
             retained_bytes: 0,
             bucket_bytes: cfg.write_rate_per_min,
             bucket_at_ms: 0,
@@ -419,6 +425,47 @@ impl StateStore {
         self.sealed.get(hash)
     }
 
+    /// The `(chunk hash, chunk bytes)` list of a sealed fold in fold order — what a checkpoint
+    /// publisher (or the golden harness standing in for the payload plane) uploads content-addressed
+    /// so a restoring instance's chunk-keyed [SF-R2] fetch resolves. `None` if the fold is not
+    /// sealed here.
+    #[must_use]
+    pub fn sealed_chunks(&self, fold: &[u8; 32]) -> Option<Vec<(daemon_vhc_proto::Hash, Vec<u8>)>> {
+        let sealed = self.sealed.get(fold)?;
+        let mut out = Vec::with_capacity(sealed.chunks.len());
+        for (h, _len) in &sealed.chunks {
+            let entry = self.chunks.get(h)?;
+            out.push((daemon_vhc_proto::Hash(*h), (*entry.bytes).clone()));
+        }
+        Some(out)
+    }
+
+    /// Reconstruct the [`daemon_vhc_proto::det_state::FamilyRef`] a by-reference checkpoint
+    /// section carries (design §7.2, [SF-6]) from the store's own record of a self-sealed fold.
+    /// `None` when the fold is not sealed here. The host is the authority for its self-sealed
+    /// folds' geometry: the ordered chunk hashes were recorded on emit and `chunk_size` is the
+    /// run-pinned state-contract value, so the reconstructed ref re-derives exactly `fold` (it
+    /// validates by construction — `seal` mints the identity with the same `family_fold` inputs).
+    /// This is what lets the DRAIN path carry by-ref sections without the guest re-listing chunk
+    /// hashes it already emitted: the guest names the sealed fold, the host fills the geometry.
+    #[must_use]
+    pub fn sealed_family_ref(
+        &self,
+        fold: &[u8; 32],
+    ) -> Option<daemon_vhc_proto::det_state::FamilyRef> {
+        let sealed = self.sealed.get(fold)?;
+        Some(daemon_vhc_proto::det_state::FamilyRef {
+            fold: daemon_vhc_proto::Hash(*fold),
+            byte_len: sealed.byte_len,
+            chunk_size: self.cfg.chunk_size,
+            chunk_hashes: sealed
+                .chunks
+                .iter()
+                .map(|(h, _)| daemon_vhc_proto::Hash(*h))
+                .collect(),
+        })
+    }
+
     /// Assemble the byte range `[off, end)` of a sealed fold from its content-addressed chunks,
     /// re-hashing each contributing chunk (custody cross-check). `None` when the fold is
     /// unknown; `Err` describes an out-of-bounds range or a custody violation (impossible
@@ -472,6 +519,31 @@ impl StateStore {
     /// the NEXT seal of its family (eviction runs at seals, never spontaneously).
     pub fn unpin(&mut self, fold: &[u8; 32]) {
         self.pinned.remove(fold);
+    }
+
+    /// Whether `fold` is currently pinned (checkpoint-referenced or init/permanent) — exempt from
+    /// retention eviction.
+    #[must_use]
+    pub fn is_pinned(&self, fold: &[u8; 32]) -> bool {
+        self.pinned.contains(fold)
+    }
+
+    /// Re-pin the freshest (role,kind) checkpoint's referenced folds to exactly `folds` (design
+    /// §8.2): the current checkpoint's families stay exempt from retention eviction; a superseded
+    /// checkpoint's now-unreferenced folds re-enter ordinary retention (evicted at the next seal
+    /// of their family). Init/permanent pins (via [`Self::pin`]) are untouched. Idempotent —
+    /// re-pinning the same set is a no-op. Driven by the checkpoint publication seam (C6).
+    pub fn repin_checkpoint(&mut self, folds: &[[u8; 32]]) {
+        let next: std::collections::HashSet<[u8; 32]> = folds.iter().copied().collect();
+        for stale in &self.ckpt_pins {
+            if !next.contains(stale) {
+                self.pinned.remove(stale);
+            }
+        }
+        for &fold in &next {
+            self.pinned.insert(fold);
+        }
+        self.ckpt_pins = next;
     }
 
     /// Force-reclaim every open (unsealed) stream — the torn-fold GC ([SF-4] crash rule),
@@ -612,6 +684,33 @@ mod tests {
     }
 
     #[test]
+    fn sealed_family_ref_reconstructs_a_validating_by_ref_section() {
+        // The DRAIN by-ref carriage ([SF-6]): the host reconstructs the FamilyRef a checkpoint
+        // section references from its own record of the self-sealed fold — no guest re-listing.
+        let mut s = StateStore::new(cfg(8));
+        let id = s.open("master", 12).unwrap();
+        s.emit(id, b"AAAAAAAA", 0).unwrap();
+        s.emit(id, b"BBBB", 0).unwrap();
+        let fold = s.seal(id).unwrap();
+
+        let fref = s
+            .sealed_family_ref(&fold)
+            .expect("sealed fold reconstructs");
+        // The reconstructed ref IS self-consistent: its fold is the fold of its own chunk list.
+        fref.validate().expect("reconstructed FamilyRef validates");
+        assert_eq!(fref.fold.0, fold);
+        assert_eq!(fref.byte_len, 12);
+        assert_eq!(fref.chunk_size, 8);
+        assert_eq!(fref.chunk_hashes.len(), 2, "8-byte chunk + 4-byte tail");
+        assert_eq!(
+            fref.chunk_hashes[0],
+            daemon_vhc_proto::Hash(*blake3::hash(b"AAAAAAAA").as_bytes())
+        );
+        // An unknown fold has no reconstruction.
+        assert!(s.sealed_family_ref(&[0u8; 32]).is_none());
+    }
+
+    #[test]
     fn degenerate_single_window_geometry_is_the_same_code_path() {
         // chunk_size ≥ byte_len ⇒ one chunk, one window — the 64-dim acceptance shape.
         let mut s = StateStore::new(cfg(64));
@@ -658,6 +757,40 @@ mod tests {
         // The failed seal did NOT close the stream (it may be completed and retried).
         s.emit(id, b"BBBB", 0).unwrap();
         s.seal(id).unwrap();
+    }
+
+    #[test]
+    fn repin_checkpoint_swaps_the_freshest_slot_and_keeps_init_pins() {
+        // Two retained masters (retain_roots covers both) + an init pin; a checkpoint pins one.
+        let mut s = StateStore::new(StateStoreConfig {
+            chunk_size: 8,
+            retain_roots: 8, // no retention pressure — isolate the pin behaviour
+            ..StateStoreConfig::default()
+        });
+        let seal = |s: &mut StateStore, tag: &str, b: &[u8]| {
+            let id = s.open(tag, b.len() as u64).unwrap();
+            s.emit(id, b, 0).unwrap();
+            s.seal(id).unwrap()
+        };
+        let m0 = seal(&mut s, "master", b"master00");
+        let v0 = seal(&mut s, "adamw_v", b"adamwv00");
+        let init = seal(&mut s, "init", b"initroot");
+        s.pin(init); // a permanent (init-artifact) pin
+
+        // Slot 1 checkpoint references {m0, v0}.
+        s.repin_checkpoint(&[m0, v0]);
+        assert!(s.is_pinned(&m0) && s.is_pinned(&v0) && s.is_pinned(&init));
+
+        // Slot 2 supersedes it, referencing a fresh master + moment {m1, v1}.
+        let m1 = seal(&mut s, "master", b"master11");
+        let v1 = seal(&mut s, "adamw_v", b"adamwv11");
+        s.repin_checkpoint(&[m1, v1]);
+        // The superseded slot's folds re-enter ordinary retention; the fresh slot is pinned; the
+        // init pin is untouched.
+        assert!(!s.is_pinned(&m0), "superseded master unpinned");
+        assert!(!s.is_pinned(&v0), "superseded moment unpinned");
+        assert!(s.is_pinned(&m1) && s.is_pinned(&v1), "fresh slot pinned");
+        assert!(s.is_pinned(&init), "init pin survives checkpoint churn");
     }
 
     #[test]

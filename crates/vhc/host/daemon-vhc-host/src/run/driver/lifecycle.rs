@@ -21,7 +21,7 @@ use crate::run::buffer::BufferTable;
 use crate::run::driver::config::{MigrationInput, RunConfig, RunEnd, RunError};
 use crate::run::driver::host::{derive_rng_seed, Host, SliceState};
 use crate::run::driver::linker::link_v2;
-use crate::run::driver::migration::build_migration_descriptor;
+use crate::run::driver::migration::{build_migration_descriptor, RestoreBinding};
 use crate::run::driver::pump::{PumpHandle, PumpShared, PumpState};
 use crate::run::journal::{JournalSink, SinkError};
 use crate::run::ops::OpTable;
@@ -377,25 +377,46 @@ pub fn start_run_migrating(
 
             // -- the migrate step (§10.3 steps 4–5), on a migrating instance only ----------------
             if let Some(mig) = &migration {
-                // Stage the snapshot's sections host-side under kind-3 staging IDs; the restore
-                // IDs travel IN the descriptor (§10.2 — the module is not in `da_run` and sees
-                // no PayloadReady).
-                let bindings: Vec<(String, u64)> = {
+                // Build the restore bindings, in manifest order ([SF-6]): INLINE sections stage
+                // host-side under kind-3 staging IDs (read via `read_back(kind=3)` in
+                // `da_migrate`); BY-REFERENCE families carry their FamilyRef so the new instance
+                // registers the fold ([SF-R2]) and streams it in `da_run` — zero section bytes move
+                // through the migrate seam. The bindings travel IN the descriptor (§10.2 — the
+                // module is not in `da_run` and sees no PayloadReady).
+                use daemon_vhc_proto::det_state::CkptDocSection;
+                let bindings: Vec<RestoreBinding> = {
                     let mut st = shared.state.lock().expect("pump lock");
                     mig.capture
                         .sections
                         .iter()
-                        .map(|(name, bytes)| {
-                            let id = st.next_host_staging_id;
-                            st.next_host_staging_id += 1;
-                            st.staged.insert(
-                                id,
-                                (daemon_vhc_abi::STAGED_KIND_STATE_SECTION, bytes.clone()),
-                            );
-                            (name.clone(), id)
+                        .map(|section| match section {
+                            CkptDocSection::Inline(name, bytes) => {
+                                let id = st.next_host_staging_id;
+                                st.next_host_staging_id += 1;
+                                st.staged.insert(
+                                    id,
+                                    (daemon_vhc_abi::STAGED_KIND_STATE_SECTION, bytes.clone()),
+                                );
+                                RestoreBinding::Inline {
+                                    name: name.clone(),
+                                    staging_id: id,
+                                }
+                            }
+                            CkptDocSection::ByRef(name, family) => RestoreBinding::ByRef {
+                                name: name.clone(),
+                                family: family.clone(),
+                            },
                         })
                         .collect()
                 };
+                // Grant the by-ref family folds on the NEW instance before `da_run`, so its
+                // `register_state_chunks` ([SF-R2]) + streamed `data@2::fetch` resolve (the family
+                // chunks are served from the content plane by the chunk-keyed resolver).
+                for section in &mig.capture.sections {
+                    if let CkptDocSection::ByRef(_, family) = section {
+                        store.data_mut().granted_artifacts.insert(family.fold.0);
+                    }
+                }
                 let descriptor = build_migration_descriptor(&mig.capture.manifest, &bindings)
                     .map_err(|e| RunError::Sandbox(format!("migration descriptor: {e}")))?;
                 let desc_ptr = write_span(&mut store, &descriptor)?;

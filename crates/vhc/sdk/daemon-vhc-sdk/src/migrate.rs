@@ -9,6 +9,7 @@
 //! round-trip — a tested surface for Phase E's upgrade transaction to call. Full host-side
 //! materialization (`stage_state`/`snapshot_state` staging, the §10.3 transaction) is Phase E.
 
+use daemon_vhc_proto::det_state::FamilyRef;
 use daemon_vhc_proto::{blake3_hash, from_canonical_slice, to_canonical_vec, Hash};
 use serde::{Deserialize, Serialize};
 
@@ -38,14 +39,45 @@ pub struct StateManifest {
     pub sections: Vec<SectionDecl>,
 }
 
-/// One restore binding (ABI §10.2 `migration-section`): the staging ID is carried **in the
-/// descriptor itself** — the consuming module is not in `da_run` and sees no `PayloadReady`.
+/// One restore binding (ABI §10.2 `migration-section`) — carried **in the descriptor itself**
+/// (the consuming module is not in `da_run` and sees no `PayloadReady`). Two forms, distinguished
+/// structurally (untagged) by the second field, mirroring the checkpoint-document section forms
+/// ([SF-6]):
+///
+/// - **Inline** (`{name, staging_id}`): small state (the round watermark) staged host-side and
+///   read via `read_back(id, kind = 3)`, legal during `da_migrate` (§6.6).
+/// - **By-reference** (`{name, family}`): an already-sealed family the restoring instance
+///   REGISTERS ([SF-R2]) and streams window-by-window in `da_run` — never bulk-read in
+///   `da_migrate` (whose only legal read is `read_back(kind = 3)`, §6.6). This is how the
+///   `VhcProtoVersion`-2 descriptor carries master/ef/adamw families without moving their bytes
+///   through the migrate seam.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MigrationSection {
-    /// = the corresponding `SectionDecl::name`.
-    pub name: String,
-    /// The restore staging ID (`read_back(id, kind = 3)`, legal during `da_migrate`, §6.6).
-    pub staging_id: u64,
+#[serde(untagged)]
+pub enum MigrationSection {
+    /// `{name, family}` — a by-reference family the new instance registers + streams in `da_run`.
+    ByRef {
+        /// = the corresponding `SectionDecl::name`.
+        name: String,
+        /// The already-sealed family artifact (fold + geometry + ordered chunk hashes).
+        family: FamilyRef,
+    },
+    /// `{name, staging_id}` — an inline section staged host-side (`read_back(kind = 3)`).
+    Inline {
+        /// = the corresponding `SectionDecl::name`.
+        name: String,
+        /// The restore staging ID (`read_back(id, kind = 3)`, legal during `da_migrate`, §6.6).
+        staging_id: u64,
+    },
+}
+
+impl MigrationSection {
+    /// The section name (either form).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::ByRef { name, .. } | Self::Inline { name, .. } => name,
+        }
+    }
 }
 
 /// The host-produced migration descriptor (ABI §10.2) — never section bytes, never old memory.
@@ -143,7 +175,7 @@ impl SimSections {
         for (i, s) in sections.iter().enumerate() {
             let id = (1u64 << 63) | (i as u64 + 1);
             staged.push((id, s.bytes.clone()));
-            bindings.push(MigrationSection {
+            bindings.push(MigrationSection::Inline {
                 name: s.name.clone(),
                 staging_id: id,
             });
@@ -177,4 +209,70 @@ pub fn roundtrip<S: MigrateState>(old: &S, new: &mut S, module: Hash, schema: u6
     let decoded = MigrationDescriptor::from_wire(&wire).expect("descriptor decode");
     assert_eq!(decoded, descriptor, "descriptor codec round-trip");
     new.restore(&decoded, &mut reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_vhc_proto::det_state::FamilyRef;
+
+    #[test]
+    fn migration_section_by_ref_round_trips_through_wire() {
+        let fref = FamilyRef {
+            fold: Hash([7u8; 32]),
+            byte_len: 96,
+            chunk_size: 24,
+            chunk_hashes: vec![
+                Hash([1u8; 32]),
+                Hash([2u8; 32]),
+                Hash([3u8; 32]),
+                Hash([4u8; 32]),
+            ],
+        };
+        let descriptor = MigrationDescriptor {
+            manifest: StateManifest {
+                schema: 1,
+                module: Hash([0u8; 32]),
+                sections: vec![
+                    SectionDecl {
+                        name: "master".into(),
+                        schema: 1,
+                        hash: fref.fold,
+                        size: fref.byte_len,
+                        class: 0,
+                    },
+                    SectionDecl {
+                        name: "round".into(),
+                        schema: 1,
+                        hash: blake3_hash(&7u64.to_le_bytes()),
+                        size: 8,
+                        class: 1,
+                    },
+                ],
+            },
+            sections: vec![
+                MigrationSection::ByRef {
+                    name: "master".into(),
+                    family: fref.clone(),
+                },
+                MigrationSection::Inline {
+                    name: "round".into(),
+                    staging_id: (1u64 << 63) | 1,
+                },
+            ],
+        };
+        let wire = descriptor.to_wire().expect("descriptor to_wire");
+        let back = MigrationDescriptor::from_wire(&wire).expect("descriptor from_wire");
+        assert_eq!(
+            back, descriptor,
+            "by-ref + inline sections survive the wire round-trip"
+        );
+        match &back.sections[0] {
+            MigrationSection::ByRef { name, family } => {
+                assert_eq!(name, "master");
+                assert_eq!(family, &fref);
+            }
+            other => panic!("first section should be by-ref, got {other:?}"),
+        }
+    }
 }
