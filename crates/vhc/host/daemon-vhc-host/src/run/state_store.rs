@@ -419,6 +419,32 @@ impl StateStore {
         self.sealed.get(hash)
     }
 
+    /// Reconstruct the [`daemon_vhc_proto::det_state::FamilyRef`] a by-reference checkpoint
+    /// section carries (design §7.2, [SF-6]) from the store's own record of a self-sealed fold.
+    /// `None` when the fold is not sealed here. The host is the authority for its self-sealed
+    /// folds' geometry: the ordered chunk hashes were recorded on emit and `chunk_size` is the
+    /// run-pinned state-contract value, so the reconstructed ref re-derives exactly `fold` (it
+    /// validates by construction — `seal` mints the identity with the same `family_fold` inputs).
+    /// This is what lets the DRAIN path carry by-ref sections without the guest re-listing chunk
+    /// hashes it already emitted: the guest names the sealed fold, the host fills the geometry.
+    #[must_use]
+    pub fn sealed_family_ref(
+        &self,
+        fold: &[u8; 32],
+    ) -> Option<daemon_vhc_proto::det_state::FamilyRef> {
+        let sealed = self.sealed.get(fold)?;
+        Some(daemon_vhc_proto::det_state::FamilyRef {
+            fold: daemon_vhc_proto::Hash(*fold),
+            byte_len: sealed.byte_len,
+            chunk_size: self.cfg.chunk_size,
+            chunk_hashes: sealed
+                .chunks
+                .iter()
+                .map(|(h, _)| daemon_vhc_proto::Hash(*h))
+                .collect(),
+        })
+    }
+
     /// Assemble the byte range `[off, end)` of a sealed fold from its content-addressed chunks,
     /// re-hashing each contributing chunk (custody cross-check). `None` when the fold is
     /// unknown; `Err` describes an out-of-bounds range or a custody violation (impossible
@@ -609,6 +635,33 @@ mod tests {
         // The stream is closed: a second seal is UnknownStream.
         assert_eq!(s.seal(id).unwrap_err(), StateStoreError::UnknownStream);
         assert_eq!(s.stats().retained_bytes, 12);
+    }
+
+    #[test]
+    fn sealed_family_ref_reconstructs_a_validating_by_ref_section() {
+        // The DRAIN by-ref carriage ([SF-6]): the host reconstructs the FamilyRef a checkpoint
+        // section references from its own record of the self-sealed fold — no guest re-listing.
+        let mut s = StateStore::new(cfg(8));
+        let id = s.open("master", 12).unwrap();
+        s.emit(id, b"AAAAAAAA", 0).unwrap();
+        s.emit(id, b"BBBB", 0).unwrap();
+        let fold = s.seal(id).unwrap();
+
+        let fref = s
+            .sealed_family_ref(&fold)
+            .expect("sealed fold reconstructs");
+        // The reconstructed ref IS self-consistent: its fold is the fold of its own chunk list.
+        fref.validate().expect("reconstructed FamilyRef validates");
+        assert_eq!(fref.fold.0, fold);
+        assert_eq!(fref.byte_len, 12);
+        assert_eq!(fref.chunk_size, 8);
+        assert_eq!(fref.chunk_hashes.len(), 2, "8-byte chunk + 4-byte tail");
+        assert_eq!(
+            fref.chunk_hashes[0],
+            daemon_vhc_proto::Hash(*blake3::hash(b"AAAAAAAA").as_bytes())
+        );
+        // An unknown fold has no reconstruction.
+        assert!(s.sealed_family_ref(&[0u8; 32]).is_none());
     }
 
     #[test]
