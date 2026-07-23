@@ -194,6 +194,23 @@ impl SectionReader for SimSections {
     }
 }
 
+/// The sim round-trip (the Phase-A acceptance for this scaffolding): snapshot `old` → manifest →
+/// descriptor → restore into `new`. Returns `da_migrate`'s status code (`0` = `Ready`).
+pub fn roundtrip<S: MigrateState>(old: &S, new: &mut S, module: Hash, schema: u64) -> u32 {
+    let sections = old.snapshot();
+    let manifest = build_manifest(module, schema, &sections);
+    let (mut reader, bindings) = SimSections::stage(&sections);
+    let descriptor = MigrationDescriptor {
+        manifest,
+        sections: bindings,
+    };
+    // The wire round-trip is part of the oracle: what `da_migrate` decodes is what E encodes.
+    let wire = descriptor.to_wire().expect("descriptor wire");
+    let decoded = MigrationDescriptor::from_wire(&wire).expect("descriptor decode");
+    assert_eq!(decoded, descriptor, "descriptor codec round-trip");
+    new.restore(&decoded, &mut reader)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,21 +275,4 @@ mod tests {
             other => panic!("first section should be by-ref, got {other:?}"),
         }
     }
-}
-
-/// The sim round-trip (the Phase-A acceptance for this scaffolding): snapshot `old` → manifest →
-/// descriptor → restore into `new`. Returns `da_migrate`'s status code (`0` = `Ready`).
-pub fn roundtrip<S: MigrateState>(old: &S, new: &mut S, module: Hash, schema: u64) -> u32 {
-    let sections = old.snapshot();
-    let manifest = build_manifest(module, schema, &sections);
-    let (mut reader, bindings) = SimSections::stage(&sections);
-    let descriptor = MigrationDescriptor {
-        manifest,
-        sections: bindings,
-    };
-    // The wire round-trip is part of the oracle: what `da_migrate` decodes is what E encodes.
-    let wire = descriptor.to_wire().expect("descriptor wire");
-    let decoded = MigrationDescriptor::from_wire(&wire).expect("descriptor decode");
-    assert_eq!(decoded, descriptor, "descriptor codec round-trip");
-    new.restore(&decoded, &mut reader)
 }

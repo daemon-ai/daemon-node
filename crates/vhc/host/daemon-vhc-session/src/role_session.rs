@@ -1837,11 +1837,21 @@ mod tests {
     fn snapshot_doc_round_trips_and_refuses_malformed() {
         // The late-join restore codec: a capture encodes + decodes to the identical sections in
         // declared order; junk refuses typed (a malformed checkpoint never yields partial state).
+        use daemon_vhc_proto::det_state::{CkptDocSection, FamilyRef};
+        // A mix of inline + by-reference sections (the v2 forms) round-trips verbatim.
+        let fref = FamilyRef {
+            fold: daemon_vhc_proto::Hash([9u8; 32]),
+            byte_len: 8,
+            chunk_size: 8,
+            chunk_hashes: vec![daemon_vhc_proto::Hash(
+                *blake3::hash(b"abcdefgh").as_bytes(),
+            )],
+        };
         let capture = daemon_vhc_host::run::SnapshotCapture {
             manifest: b"manifest-bytes".to_vec(),
             sections: vec![
-                ("params".into(), vec![1, 2, 3]),
-                ("residual".into(), vec![4, 5]),
+                CkptDocSection::ByRef("master".into(), fref),
+                CkptDocSection::Inline("round".into(), vec![4, 5]),
             ],
         };
         let bytes = encode_snapshot_doc(&capture).expect("encode");
