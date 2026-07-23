@@ -1882,11 +1882,10 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                             let pending_round = pending.rr.round;
                             if pending.ops.is_empty() {
                                 dispatch_record(&mut driver, &mut payloads, true, pending);
-                                // The ingested-round boundary: the periodic live checkpoint
-                                // cadence fires here (post-ingest state, spec §9).
-                                if let Some(l) = live.as_mut() {
-                                    l.maybe_start_checkpoint(&core, pending_round);
-                                }
+                                // The live checkpoint fires at SEAL (in the ingest-walk `Sealed`
+                                // handler), not here: `dispatch_record` only KICKS OFF the async
+                                // deferred fold, so the canonical master has not yet advanced to
+                                // this round — capturing now would strand a restorer a round back.
                             } else if let Some(l) = live.as_mut() {
                                 l.pending_records.insert(pending_round, pending);
                             }
@@ -1975,6 +1974,17 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                         // which dropped `on_round_open`'s outbounds).
                         if voice {
                             emit_round_outbounds(live.is_some(), &out);
+                            // The ingested-round boundary (spec §9): the deferred fold has NOW
+                            // sealed, so `core.master_fold` IS this round's canonical master and a
+                            // live checkpoint's by-ref master agrees with its inline round
+                            // watermark. Capturing at record dispatch (before the async seal) sealed
+                            // the PRIOR round's master under this round's watermark, so a restorer
+                            // resumed one outer step behind the survivor and diverged at its first
+                            // post-restore round. Only record-triggered ingests reach a cadence
+                            // boundary — the resident guest's synchronous checkpoint point.
+                            if let Some(l) = live.as_mut() {
+                                l.maybe_start_checkpoint(&core, round);
+                            }
                         }
                         if !driver.ingest_in_flight() {
                             if let Some(ro) = deferred_open.take() {
@@ -2134,9 +2144,9 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                                 .remove(&round)
                                 .expect("the completed record");
                             dispatch_record(&mut driver, &mut payloads, true, pending);
-                            // The ingested-round boundary: the periodic live checkpoint
-                            // cadence fires here (post-ingest state, spec §9).
-                            l.maybe_start_checkpoint(&core, round);
+                            // The live checkpoint fires at SEAL (in the ingest-walk `Sealed`
+                            // handler), not here: `dispatch_record` only kicks off the async
+                            // deferred fold, so the canonical master is not yet this round's.
                         }
                         continue;
                     }
