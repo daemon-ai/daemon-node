@@ -209,6 +209,11 @@ pub struct StateStore {
     family_order: HashMap<String, VecDeque<[u8; 32]>>,
     /// Pinned folds (checkpoint-referenced / init artifacts): exempt from retention eviction.
     pinned: std::collections::HashSet<[u8; 32]>,
+    /// The folds pinned by the CURRENT freshest (role,kind) checkpoint (design §8.2) — the subset
+    /// of [`Self::pinned`] that [`Self::repin_checkpoint`] swaps when a fresher checkpoint
+    /// supersedes it, so a stale checkpoint's families re-enter ordinary retention while init/
+    /// permanent pins are untouched.
+    ckpt_pins: std::collections::HashSet<[u8; 32]>,
     /// Live retained bytes (unique chunks with `sealed_refs > 0`).
     retained_bytes: u64,
     /// The write token bucket: available bytes + the last refill instant (logical pump ms).
@@ -229,6 +234,7 @@ impl StateStore {
             sealed: HashMap::new(),
             family_order: HashMap::new(),
             pinned: std::collections::HashSet::new(),
+            ckpt_pins: std::collections::HashSet::new(),
             retained_bytes: 0,
             bucket_bytes: cfg.write_rate_per_min,
             bucket_at_ms: 0,
@@ -515,6 +521,31 @@ impl StateStore {
         self.pinned.remove(fold);
     }
 
+    /// Whether `fold` is currently pinned (checkpoint-referenced or init/permanent) — exempt from
+    /// retention eviction.
+    #[must_use]
+    pub fn is_pinned(&self, fold: &[u8; 32]) -> bool {
+        self.pinned.contains(fold)
+    }
+
+    /// Re-pin the freshest (role,kind) checkpoint's referenced folds to exactly `folds` (design
+    /// §8.2): the current checkpoint's families stay exempt from retention eviction; a superseded
+    /// checkpoint's now-unreferenced folds re-enter ordinary retention (evicted at the next seal
+    /// of their family). Init/permanent pins (via [`Self::pin`]) are untouched. Idempotent —
+    /// re-pinning the same set is a no-op. Driven by the checkpoint publication seam (C6).
+    pub fn repin_checkpoint(&mut self, folds: &[[u8; 32]]) {
+        let next: std::collections::HashSet<[u8; 32]> = folds.iter().copied().collect();
+        for stale in &self.ckpt_pins {
+            if !next.contains(stale) {
+                self.pinned.remove(stale);
+            }
+        }
+        for &fold in &next {
+            self.pinned.insert(fold);
+        }
+        self.ckpt_pins = next;
+    }
+
     /// Force-reclaim every open (unsealed) stream — the torn-fold GC ([SF-4] crash rule),
     /// run at instance teardown beside the buffer/op/stream force-reclaims. Sealed artifacts
     /// are instance-scoped anyway (the store dies with the pump); this exists so a live
@@ -726,6 +757,40 @@ mod tests {
         // The failed seal did NOT close the stream (it may be completed and retried).
         s.emit(id, b"BBBB", 0).unwrap();
         s.seal(id).unwrap();
+    }
+
+    #[test]
+    fn repin_checkpoint_swaps_the_freshest_slot_and_keeps_init_pins() {
+        // Two retained masters (retain_roots covers both) + an init pin; a checkpoint pins one.
+        let mut s = StateStore::new(StateStoreConfig {
+            chunk_size: 8,
+            retain_roots: 8, // no retention pressure — isolate the pin behaviour
+            ..StateStoreConfig::default()
+        });
+        let seal = |s: &mut StateStore, tag: &str, b: &[u8]| {
+            let id = s.open(tag, b.len() as u64).unwrap();
+            s.emit(id, b, 0).unwrap();
+            s.seal(id).unwrap()
+        };
+        let m0 = seal(&mut s, "master", b"master00");
+        let v0 = seal(&mut s, "adamw_v", b"adamwv00");
+        let init = seal(&mut s, "init", b"initroot");
+        s.pin(init); // a permanent (init-artifact) pin
+
+        // Slot 1 checkpoint references {m0, v0}.
+        s.repin_checkpoint(&[m0, v0]);
+        assert!(s.is_pinned(&m0) && s.is_pinned(&v0) && s.is_pinned(&init));
+
+        // Slot 2 supersedes it, referencing a fresh master + moment {m1, v1}.
+        let m1 = seal(&mut s, "master", b"master11");
+        let v1 = seal(&mut s, "adamw_v", b"adamwv11");
+        s.repin_checkpoint(&[m1, v1]);
+        // The superseded slot's folds re-enter ordinary retention; the fresh slot is pinned; the
+        // init pin is untouched.
+        assert!(!s.is_pinned(&m0), "superseded master unpinned");
+        assert!(!s.is_pinned(&v0), "superseded moment unpinned");
+        assert!(s.is_pinned(&m1) && s.is_pinned(&v1), "fresh slot pinned");
+        assert!(s.is_pinned(&init), "init pin survives checkpoint churn");
     }
 
     #[test]

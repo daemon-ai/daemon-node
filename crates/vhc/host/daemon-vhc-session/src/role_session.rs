@@ -1281,6 +1281,30 @@ async fn service_op(
                 // over the HOST's contract shape only (the module's round vocabulary stays
                 // opaque); a non-checkpoint put never matches.
                 if let Some(round) = live_checkpoint_watermark(&bytes) {
+                    // Publish the referenced family CHUNKS to the content plane ([SF-6]/C5): a
+                    // restoring peer fetches them chunk-keyed ([SF-R2]). The chunks come from THIS
+                    // (publishing) instance's self-sealed store; content-addressed `put_content` is
+                    // idempotent, so family chunks unchanged since a prior slot upload NOTHING
+                    // (skip-on-present) — the amortized remote cost is the changed chunks + the
+                    // small document, not the whole family every slot.
+                    if let Ok(capture) = decode_snapshot_doc(&bytes) {
+                        let mut referenced: Vec<[u8; 32]> = Vec::new();
+                        for section in &capture.sections {
+                            if let daemon_vhc_proto::det_state::CkptDocSection::ByRef(_, fref) =
+                                section
+                            {
+                                referenced.push(fref.fold.0);
+                                if let Some(chunks) = pump.sealed_fold_chunks(&fref.fold.0) {
+                                    for (_h, chunk) in &chunks {
+                                        let _ = providers.artifacts.put_content(chunk).await;
+                                    }
+                                }
+                            }
+                        }
+                        // Pin the freshest checkpoint's families out of retention eviction (§8.2,
+                        // C6); a superseded checkpoint's folds re-enter ordinary retention.
+                        pump.repin_checkpoint(&referenced);
+                    }
                     let hash = hash.to_hex();
                     let _ = events.send(Event::CheckpointPublished {
                         round,

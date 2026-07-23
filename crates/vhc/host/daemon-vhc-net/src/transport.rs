@@ -105,6 +105,14 @@ impl MemoryContentStore {
         Self::default()
     }
 
+    /// The number of DISTINCT content-addressed objects held — the dedup meter a checkpoint
+    /// cadence test reads to prove content-addressed puts are idempotent (unchanged family chunks
+    /// across publisher slots upload nothing).
+    #[must_use]
+    pub fn object_count(&self) -> usize {
+        self.objects.lock().expect("content store lock").len()
+    }
+
     /// Seed an object directly (test/genesis staging helper). Returns its content hash.
     pub fn seed(&self, bytes: &[u8]) -> ContentHash {
         let hash = daemon_vhc_proto::blake3_hash(bytes);

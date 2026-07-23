@@ -676,6 +676,18 @@ impl PumpHandle {
         std::mem::take(&mut self.shared.state.lock().expect("pump lock").op_requests)
     }
 
+    /// Re-pin the freshest (role,kind) checkpoint's referenced folds (design §8.2, C6): keep the
+    /// current checkpoint's families exempt from retention eviction and release a superseded
+    /// checkpoint's now-unreferenced folds. Driven by the checkpoint publication seam.
+    pub fn repin_checkpoint(&self, folds: &[[u8; 32]]) {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .state
+            .repin_checkpoint(folds);
+    }
+
     /// The `(chunk hash, chunk bytes)` list of a fold this instance self-sealed ([SF-R1]) — the
     /// content a checkpoint publisher uploads to the payload plane, and what the golden harness
     /// reads from the draining instance to stand in for that plane. `None` if not sealed here.
