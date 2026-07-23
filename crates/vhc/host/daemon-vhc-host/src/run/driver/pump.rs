@@ -676,6 +676,26 @@ impl PumpHandle {
         std::mem::take(&mut self.shared.state.lock().expect("pump lock").op_requests)
     }
 
+    /// The registered **det-state** chunk map for `fold`, if the guest registered one ([SF-R2]).
+    /// The chunk-keyed resolver ([SF-6] restore carriage) consults this — the single source of
+    /// truth for a family's covering geometry — to decompose an `ArtifactRange` covering span into
+    /// its constituent `(chunk hash, len)` list and fetch each chunk content-addressed, symmetric
+    /// with the replay-side chunk-keyed materialization. Returns a clone (small: hashes + lengths),
+    /// so the resolver holds no pump lock while it awaits the store.
+    #[must_use]
+    pub fn state_chunk_map(
+        &self,
+        fold: &[u8; 32],
+    ) -> Option<daemon_vhc_proto::det_state::DetStateChunkMap> {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .state_chunk_maps
+            .get(fold)
+            .cloned()
+    }
+
     /// Whether a migrating instance's `da_migrate` returned `Ready` (§10.3 step 5) — the
     /// embedder-visible VALIDATE marker the upgrade transaction gates activation on. `false`
     /// until validation, and forever on a non-migrating instance.

@@ -1332,38 +1332,76 @@ async fn service_op(
             span_len,
             ..
         } => {
-            // A chunk-addressed shard (fold identity): the content store holds the whole
-            // object under the fold key; this in-process seat slices the requested covering
-            // span itself — the pump verifies every covering chunk against the registered
-            // chunk map either way (the provider is untrusted by construction). A store that
-            // cannot serve the span is a typed refusal, never silent bytes.
-            match providers
-                .artifacts
-                .get_content(&daemon_vhc_proto::Hash(hash))
-                .await
-            {
-                Ok(artifact) => {
-                    let lo = usize::try_from(span_off).unwrap_or(usize::MAX);
-                    let hi = lo.saturating_add(usize::try_from(span_len).unwrap_or(usize::MAX));
-                    if hi <= artifact.len() {
-                        OpOutcome::RangeDone {
-                            bytes: artifact[lo..hi].to_vec(),
+            // An externally-sourced DET-STATE fold ([SF-R2]/[SF-6]) is served CHUNK-KEYED — the
+            // symmetric twin of the replay-side materialization (`run/replay.rs`): the family's
+            // chunks live in the content-addressed plane each under its OWN blake3, so the
+            // covering span is reassembled by fetching those chunks and concatenating them, never
+            // a whole-family object under the fold key. The registered `DetStateChunkMap` (held by
+            // the pump — the single source of truth) decomposes the chunk-aligned span into its
+            // `(chunk hash, len)` list. The pump still verifies the reassembled covering span
+            // against the fold-committed hashes at completion (unchanged) — the resolver is
+            // untrusted, and content-addressed `get_content` self-verifies each chunk besides.
+            if let Some(map) = pump.state_chunk_map(&hash) {
+                match map.covering_chunks(span_off, span_len) {
+                    Ok(chunks) => {
+                        let mut bytes = Vec::with_capacity(usize::try_from(span_len).unwrap_or(0));
+                        let mut failure: Option<OpOutcome> = None;
+                        for (chunk_hash, _len) in &chunks {
+                            match providers.artifacts.get_content(chunk_hash).await {
+                                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                                Err(e) => {
+                                    failure = Some(OpOutcome::Failed {
+                                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                                        detail: format!(
+                                            "det-state chunk {} fetch: {e}",
+                                            chunk_hash.to_hex()
+                                        ),
+                                    });
+                                    break;
+                                }
+                            }
                         }
-                    } else {
-                        OpOutcome::Failed {
-                            code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                            detail: format!(
-                                "artifact range: stored object is {} bytes, span \
-                                 [{span_off}, +{span_len}) does not fit",
-                                artifact.len()
-                            ),
+                        failure.unwrap_or(OpOutcome::RangeDone { bytes })
+                    }
+                    Err(e) => OpOutcome::Failed {
+                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                        detail: format!("det-state covering span: {e}"),
+                    },
+                }
+            } else {
+                // A chunk-addressed corpus shard (fold identity): the content store holds the
+                // whole object under the fold key; this in-process seat slices the requested
+                // covering span itself — the pump verifies every covering chunk against the
+                // registered chunk map either way (the provider is untrusted by construction). A
+                // store that cannot serve the span is a typed refusal, never silent bytes.
+                match providers
+                    .artifacts
+                    .get_content(&daemon_vhc_proto::Hash(hash))
+                    .await
+                {
+                    Ok(artifact) => {
+                        let lo = usize::try_from(span_off).unwrap_or(usize::MAX);
+                        let hi = lo.saturating_add(usize::try_from(span_len).unwrap_or(usize::MAX));
+                        if hi <= artifact.len() {
+                            OpOutcome::RangeDone {
+                                bytes: artifact[lo..hi].to_vec(),
+                            }
+                        } else {
+                            OpOutcome::Failed {
+                                code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                                detail: format!(
+                                    "artifact range: stored object is {} bytes, span \
+                                     [{span_off}, +{span_len}) does not fit",
+                                    artifact.len()
+                                ),
+                            }
                         }
                     }
+                    Err(e) => OpOutcome::Failed {
+                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                        detail: format!("artifact range fetch: {e}"),
+                    },
                 }
-                Err(e) => OpOutcome::Failed {
-                    code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                    detail: format!("artifact range fetch: {e}"),
-                },
             }
         }
         // Direct peer streams await their live transport binding: refuse typed, never hang the

@@ -348,6 +348,53 @@ impl DetStateChunkMap {
         Ok(())
     }
 
+    /// The ordered `(chunk hash, chunk len)` pairs that a chunk-aligned covering span
+    /// `[span_off, span_off + span_len)` is composed of — the list a chunk-keyed resolver fetches
+    /// and concatenates to reassemble the span, symmetric with the replay-side chunk-keyed
+    /// materialization ([SF-R2]). `span_off` MUST be a chunk boundary and the span MUST end on a
+    /// chunk boundary (both hold for a span produced by [`Self::covering_span`]); anything else is
+    /// a typed refusal so the resolver never fetches a mis-aligned or over-reaching span.
+    ///
+    /// # Errors
+    /// A `String` describing a boundary/length violation.
+    pub fn covering_chunks(
+        &self,
+        span_off: u64,
+        span_len: u64,
+    ) -> Result<Vec<(Hash, u32)>, VhcProtoError> {
+        // Locate the starting chunk (span_off must be a chunk boundary).
+        let mut cursor = 0u64;
+        let mut index = 0usize;
+        while index < self.chunks.len() && cursor < span_off {
+            cursor += u64::from(self.chunks[index].1);
+            index += 1;
+        }
+        if cursor != span_off {
+            return Err(VhcProtoError::Validation(format!(
+                "det-state span_off {span_off} is not a chunk boundary"
+            )));
+        }
+        let mut out = Vec::new();
+        let mut remaining = span_len;
+        while remaining > 0 {
+            let Some(&(hash, len)) = self.chunks.get(index) else {
+                return Err(VhcProtoError::Validation(format!(
+                    "det-state covering span [{span_off}, +{span_len}) reaches past the chunk list \
+                     (chunk {index})"
+                )));
+            };
+            out.push((hash, len));
+            remaining = remaining.checked_sub(u64::from(len)).ok_or_else(|| {
+                VhcProtoError::Validation(format!(
+                    "det-state covering span [{span_off}, +{span_len}) does not end on a chunk \
+                     boundary (chunk {index} overshoots)"
+                ))
+            })?;
+            index += 1;
+        }
+        Ok(out)
+    }
+
     /// Encode to the one wire form (canonical CBOR) — the descriptor a guest passes to the host's
     /// det-state chunk registration import, after [`Self::validate`].
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, VhcProtoError> {
@@ -969,6 +1016,43 @@ mod tests {
         lying.chunks[last].1 = 24; // was 8
         lying.byte_len += 16;
         assert!(lying.verify_covering_span(0, &flat).is_err());
+    }
+
+    #[test]
+    fn det_state_covering_chunks_reassembles_span_and_rejects_misalignment() {
+        let numels = [16u64, 4, 8];
+        let params: Vec<Vec<u8>> = numels
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| param_bytes(i as u64 + 1, n))
+            .collect();
+        let flat: Vec<u8> = params.concat();
+        let views: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
+        let entry = FamilyEntry::author(&views, 24).unwrap();
+        let map = DetStateChunkMap::derive(24, &numels, &entry.chunk_hashes).unwrap();
+
+        // The covering span of an interior range decomposes into exactly its constituent chunks,
+        // in order, and the concatenated chunk bytes ARE the covering span the resolver serves.
+        let (span_off, span_len) = map.covering_span(30, 70);
+        let chunks = map.covering_chunks(span_off, span_len).unwrap();
+        let listed_len: u64 = chunks.iter().map(|(_, l)| u64::from(*l)).sum();
+        assert_eq!(listed_len, span_len, "listed chunk lengths sum to the span");
+        // Each listed hash is the blake3 of the corresponding slice of the family image.
+        let mut pos = span_off as usize;
+        for (hash, len) in &chunks {
+            let end = pos + *len as usize;
+            assert_eq!(blake3_hash(&flat[pos..end]), *hash);
+            pos = end;
+        }
+        // A whole-family span lists every chunk.
+        let all = map.covering_chunks(0, map.byte_len).unwrap();
+        assert_eq!(all.len(), map.chunks.len());
+        // A non-boundary offset and an over-reaching span are typed refusals.
+        assert!(map.covering_chunks(10, 24).is_err(), "off not a boundary");
+        assert!(
+            map.covering_chunks(0, map.byte_len + 1).is_err(),
+            "span past the chunk list"
+        );
     }
 
     #[test]
