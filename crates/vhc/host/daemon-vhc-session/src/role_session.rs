@@ -343,6 +343,25 @@ async fn run_role(
     // runs (§10.3 step 4: `da_migrate` under budget between `da_init` and `da_run`); a
     // migrate-refusal is a terminal admission fault, never a silent fresh start.
     let restoring = restore.is_some();
+    if let Some(mig) = &restore {
+        // The by-reference families (master/ef/adamw) carry only their FamilyRef through the
+        // migrate seam; the new instance registers each fold (register_state_chunks, [SF-R2])
+        // and streams its windows via chunk-keyed `data@2::fetch` in `da_run`. Naming the count
+        // here is the restore path's observability seam (the streaming-rehydration marker).
+        use daemon_vhc_proto::det_state::CkptDocSection;
+        let by_ref = mig
+            .capture
+            .sections
+            .iter()
+            .filter(|s| matches!(s, CkptDocSection::ByRef(..)))
+            .count();
+        tracing::info!(
+            run = run_label,
+            by_ref_families = by_ref,
+            "streaming restore from checkpoint document: registering by-ref det-state roots \
+             (register_state_chunks + chunk-keyed rehydration)"
+        );
+    }
     let run = match daemon_vhc_host::run::start_run_migrating(
         &worker, &module, run_cfg, journal, restore,
     ) {
