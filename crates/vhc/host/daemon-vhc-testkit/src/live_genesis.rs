@@ -353,7 +353,7 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         roles,
         artifacts,
         corpus_manifest: Some(manifest_hash),
-        state_contract: None,
+        state_contract: Some(live_state_contract(64)),
         authority: AuthorityConfig {
             topology: Topology::SingleKey(SingleKey::new(coordinator_base)),
             records_channel: DEFAULT_RECORDS_CHANNEL,
@@ -411,22 +411,6 @@ fn param_numels(vocab: u32) -> Vec<usize> {
     out
 }
 
-/// A deterministic matched init (identical across the roster — the cross-peer digest-agreement
-/// precondition; the guest asserts the flat length against its layout).
-fn matched_init(total: usize) -> Vec<f32> {
-    let mut s = 0x5EED_C0DEu64;
-    (0..total)
-        .map(|_| {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            #[allow(clippy::cast_precision_loss)]
-            let v = ((s >> 33) % 2001) as f32;
-            (v - 1000.0) / 20000.0 // [-0.05, 0.05]
-        })
-        .collect()
-}
-
 fn text(s: &str) -> Value {
     Value::Text(s.into())
 }
@@ -468,8 +452,6 @@ fn trainer_live_config(run_label: &str, manifest: &CorpusManifest, manifest_hash
         (text("outer_alpha"), Value::Float(1.0)),
         (text("clip"), Value::Bool(false)),
     ]);
-    let total: usize = param_numels(vocab).iter().sum();
-    let init = matched_init(total);
     let live = Value::Map(vec![
         (text("run_label"), text(run_label)),
         (
@@ -488,7 +470,46 @@ fn trainer_live_config(run_label: &str, manifest: &CorpusManifest, manifest_hash
         (text("micro_batch"), uint(1)),
         (text("stall_rounds_max"), uint(4)),
         (text("profile"), profile),
-        (text("init"), Value::serialized(&init).expect("init value")),
+        (
+            text("state"),
+            Value::serialized(&live_state_contract(vocab)).expect("state contract value"),
+        ),
         (text("live"), live),
     ])
+}
+
+/// The live run's genesis seed-form state contract (§6.1a) for the trainer layout at `vocab`:
+/// the derived state chunk size + a pinned `(seed, dist)` the guest expands, self-seals, and
+/// cross-checks against `expected_root` (replaces the deleted inline init).
+pub fn live_state_contract(vocab: u32) -> daemon_vhc_proto::genesis::StateContract {
+    use daemon_vhc_proto::det_state::{derive_state_chunk_size, FamilyEntry};
+    use daemon_vhc_proto::genesis::{StateContract, StateInit};
+    let seed = [0x5eu8; 32];
+    let dist = daemon_vhc_det::SEED_INIT_DIST_V1;
+    let chunk_size = derive_state_chunk_size(64);
+    let param_bytes: Vec<Vec<u8>> = param_numels(vocab)
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let vals =
+                daemon_vhc_det::seed_init_param(&seed, dist, i as u64, n).expect("known dist");
+            let mut b = Vec::with_capacity(n * 4);
+            for v in vals {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b
+        })
+        .collect();
+    let views: Vec<&[u8]> = param_bytes.iter().map(Vec::as_slice).collect();
+    let expected_root = FamilyEntry::author(&views, chunk_size)
+        .expect("author")
+        .fold;
+    StateContract {
+        chunk_size,
+        init: StateInit::Seed {
+            seed: daemon_vhc_proto::Seed(seed),
+            dist,
+            expected_root,
+        },
+    }
 }

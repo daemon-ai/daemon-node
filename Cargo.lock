@@ -5181,6 +5181,7 @@ dependencies = [
  "daemon-provision",
  "daemon-telemetry",
  "daemon-vhc-abi",
+ "daemon-vhc-det",
  "daemon-vhc-guest-build",
  "daemon-vhc-host",
  "daemon-vhc-journal",
