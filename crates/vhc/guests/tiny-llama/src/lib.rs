@@ -62,22 +62,36 @@ use std::rc::Rc;
 
 use daemon_vhc_proto::capability::CapabilitySet;
 use daemon_vhc_proto::corpus::{CorpusManifest, Endianness, TokenWidth};
+use daemon_vhc_proto::det_state::{
+    family_byte_len, DetStateChunkMap, DetStateManifest, MASTER_FAMILY,
+};
+use daemon_vhc_proto::genesis::{StateContract, StateInit};
 use daemon_vhc_proto::{blake3_hash, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed};
 use daemon_vhc_proto::{IrohId, StateDigest};
 use daemon_vhc_sdk::{
     build_manifest, GuestModule, MigrationDescriptor, ModuleDecl, OwnedSection, SectionReader,
 };
 use daemon_vhc_sdk_compute::{export_tensor, fence, AutodiffHostBackend, HostBackend};
-use daemon_vhc_sdk_consensus::digest_state;
+use daemon_vhc_sdk_consensus::digest::DigestCarry;
+use daemon_vhc_sdk_consensus::fold_walk::Window;
 use daemon_vhc_sdk_consensus::messages::{
     Commitment, Digest, Heartbeat, Join, RecordEntry, RoundOpen, ThroughputClass, VhcMessage,
 };
-use daemon_vhc_sdk_profiles::{encode_payload, IngestParam, ParamView, SparseLoco, SparseLocoCfg};
+use daemon_vhc_sdk_profiles::streaming::{
+    f32s_to_le_bytes, le_bytes_to_f32s, SparseLocoIngestWalk,
+};
+use daemon_vhc_sdk_profiles::{encode_payload, ParamView, Section, SparseLoco, SparseLocoCfg};
 use daemon_vhc_sdk_rounds::{
-    interval_for, slice_interval, BarrierRound, Committed, PayloadSource, RoundCfg,
+    interval_for, slice_interval, BarrierRound, Committed, IngestOutcome, PayloadSource, RoundCfg,
     RoundExperiment, StepCtx as RoundStepCtx,
 };
 use serde::Deserialize;
+
+/// The digest block size (the pinned det-lane granularity, matching `digest_state`).
+const DIGEST_BLOCK: u32 = 64;
+/// The in-flight window bound for the streamed fold walks (bounded read-ahead; the honest fuel
+/// claim is per-window, §5.5). Small — the harness geometry is a handful of windows.
+const WALK_IN_FLIGHT: u64 = 4;
 
 use model::{ModelCfg, TinyLlamaModel};
 
@@ -106,8 +120,11 @@ struct GuestCfg {
     micro_batch: u32,
     stall_rounds_max: u32,
     profile: SparseLocoCfg,
-    /// The canonical flat init (concatenated params, registration order) — matched init.
-    init: Vec<f32>,
+    /// The genesis **state contract** (§6.3): the run-pinned `state_chunk_size` + the init pin
+    /// (seed-derived or content-addressed artifact). Replaces the deleted inline `init: Vec<f32>`
+    /// — canonical state is chunk-addressed host-side now, so the config drops from gigabytes to
+    /// bytes and the matched init is expanded (seed) or fetched (artifact) at run start.
+    state: StateContract,
     /// The MODULE-DRIVEN live mode (absent = the harness contract above): the module announces
     /// itself on the control plane (Join/ready-Heartbeat), fetches its own training data from
     /// the genesis-pinned chunk-addressed corpus via `data@2`, fetches committed peer payloads
@@ -146,10 +163,30 @@ type BatchItem = (u32, u32, Vec<u32>);
 struct Core {
     model: TinyLlamaModel<AutodiffHostBackend>,
     profile: SparseLoco,
-    /// Canonical det-lane masters (guest-side, registration order).
+    /// The profile config — the streamed ingest walk's geometry (the resident `profile` above is
+    /// the still-used `make_update` oracle this commit; both derive from the same cfg).
+    profile_cfg: SparseLocoCfg,
+    /// Canonical det-lane masters (guest-side, registration order). RETAINED THIS COMMIT for the
+    /// still-resident `make_update`, the device upload, and the checkpoint/quiesce sections; the
+    /// per-round VALUE is now produced by the streamed ingest walk (assembled from its emitted
+    /// windows), and the DIGEST comes from the walk's carry — the resident copy is transitional
+    /// and is deleted in the follow-up commit that moves those consumers onto the sealed folds.
     master: Vec<Vec<f32>>,
-    /// The round bases θ⁽ᵗ⁾ (post-ingest master snapshots).
+    /// The round bases θ⁽ᵗ⁾ (post-ingest master snapshots) — resident twin of [`Self::master_fold`].
     round_base: Vec<Vec<f32>>,
+    /// The parameter numels (registration order) — the walk geometry.
+    numels: Vec<usize>,
+    /// Per-parameter byte base offsets into the flat family image (prefix sums of `numel × 4`) —
+    /// maps a fold [`Window`] `(param, param_off)` to an absolute `data@2::fetch` offset.
+    family_base: Vec<u64>,
+    /// The run-pinned `state_chunk_size` (the fold-walk window size).
+    window_size: u64,
+    /// The current round-base master family fold: the init fold before round 0, then each round's
+    /// sealed master ([SF-R1] self-sealed) — the artifact the ingest walk reads its round-base
+    /// windows from.
+    master_fold: [u8; 32],
+    /// The in-flight streamed ingest walk (one at a time; the barrier serializes on its seal).
+    ingest_walk: Option<IngestWalkState>,
     /// Host-staged batches, FIFO in training order.
     batches: VecDeque<BatchItem>,
     /// Accumulated micro-batch gradients of the current inner step (summed in arrival order,
@@ -159,26 +196,24 @@ struct Core {
     next_step_fence: u64,
 }
 
-impl Core {
-    /// The post-ingest det digest — the exact v1 `WasmBackend::digest_of` formula over the
-    /// canonical state (masters, then the profile's replicated det state), computed in-guest.
-    fn digest_of(&self, round: u64) -> [u8; 16] {
-        let mut state = Vec::new();
-        for m in &self.master {
-            for v in m {
-                state.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        for r in self.profile.replicated_state() {
-            for v in r {
-                state.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        let mut seed = [0u8; 32];
-        seed[..8].copy_from_slice(&round.to_le_bytes());
-        let d = digest_state(&Seed(seed), 64, u32::MAX, &state);
-        *d.as_bytes()
-    }
+/// The in-flight streamed ingest walk (ABI §12.14, design §3.4/§5.4): the resident
+/// `SparseLoco::ingest` re-expressed as a completion-driven multi-slice state machine over
+/// round-base windows fetched from [`Core::master_fold`], emitting master windows into a
+/// `state_open` stream and threading the digest carry — kicked off by
+/// [`RoundExperiment::begin_ingest`], driven by fetch completions, sealed in the final slice.
+struct IngestWalkState {
+    /// The round being folded.
+    round: u64,
+    /// The fold engine (owns the payloads, the schedule, and the digest carry).
+    walk: SparseLocoIngestWalk,
+    /// The open master-family write stream (`state_open`).
+    stream: u64,
+    /// The round-base family fold this walk reads its windows from.
+    base_fold: [u8; 32],
+    /// Outstanding round-base fetches: `data@2` op → window ordinal.
+    ops: BTreeMap<u64, u64>,
+    /// Scratch for the f32→le state-emit seam.
+    byte_buf: Vec<u8>,
 }
 
 /// The `RoundExperiment` adapter: v1 call points over the shared core.
@@ -226,9 +261,20 @@ impl RoundExperiment<Vec<u8>> for C3Round {
         Vec::new()
     }
 
-    fn ingest(&mut self, round: u64, committed: &Committed<Vec<u8>>) -> [u8; 16] {
-        let mut core = self.core.borrow_mut();
-        let payloads: Vec<_> = committed
+    fn ingest(&mut self, _round: u64, _committed: &Committed<Vec<u8>>) -> [u8; 16] {
+        // The streaming trainer never folds synchronously — it defers via `begin_ingest` and
+        // voices the digest when the walk seals (the deferred-ingest seam, sdk-rounds).
+        unreachable!("the streaming trainer defers ingest via begin_ingest")
+    }
+
+    /// Kick off the streamed det-lane ingest ([SF-4], design §5.4): decode the record-ordered
+    /// committed payloads, open a `master` write stream, build the `SparseLocoIngestWalk` with a
+    /// round-seeded digest carry, and issue the opening round-base window reads against
+    /// [`Core::master_fold`] (the init fold before round 0, then the prior round's sealed master).
+    /// The walk is stashed in `Core` and driven by fetch completions ([`drive_ingest_completion`]);
+    /// the digest is voiced at seal via [`BarrierRound::finish_ingest`]. Returns `Deferred`.
+    fn begin_ingest(&mut self, round: u64, committed: &Committed<Vec<u8>>) -> IngestOutcome {
+        let payloads: Vec<Vec<Section>> = committed
             .items()
             .iter()
             .map(|it| {
@@ -236,32 +282,40 @@ impl RoundExperiment<Vec<u8>> for C3Round {
                     .expect("committed payload decodes (hash-verified at mint)")
             })
             .collect();
-        // Det-lane ingest over the guest-held canonical state (zero host support).
-        {
-            let Core {
-                profile,
-                master,
-                round_base,
-                ..
-            } = &mut *core;
-            let mut params: Vec<IngestParam<'_>> = master
-                .iter_mut()
-                .zip(round_base.iter())
-                .map(|(m, b)| IngestParam {
-                    master: m,
-                    round_base: b,
-                })
-                .collect();
-            profile
-                .ingest(&mut params, &payloads)
-                .expect("det ingest over verified committed payloads");
+        let mut core = self.core.borrow_mut();
+        let (numels, window_size, base_fold) =
+            (core.numels.clone(), core.window_size, core.master_fold);
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&round.to_le_bytes());
+        let carry = DigestCarry::new(&Seed(seed), DIGEST_BLOCK);
+        let numels_u64: Vec<u64> = numels.iter().map(|&n| n as u64).collect();
+        let byte_len = family_byte_len(&numels_u64);
+        let mut walk = SparseLocoIngestWalk::new(
+            &core.profile_cfg,
+            &numels,
+            window_size,
+            WALK_IN_FLIGHT,
+            &payloads,
+            carry,
+        )
+        .expect("ingest walk geometry (profile chunk divides every numel; window aligned)");
+        let opening = walk.start().expect("ingest walk start");
+        let stream = daemon_vhc_sdk::state_open(MASTER_FAMILY, byte_len);
+        let mut ops = BTreeMap::new();
+        for w in &opening.issue {
+            let off = core.family_base[w.param as usize] + w.param_off;
+            let op = daemon_vhc_sdk::data_fetch(&base_fold, off, w.len);
+            ops.insert(op, w.ordinal);
         }
-        // The post-ingest master becomes the working weights and the next round base (the v1
-        // ingest epilogue, guest-owned here).
-        let flat = core.master.clone();
-        core.model.set_params_from_flat(&flat);
-        core.round_base = flat;
-        core.digest_of(round)
+        core.ingest_walk = Some(IngestWalkState {
+            round,
+            walk,
+            stream,
+            base_fold,
+            ops,
+            byte_buf: Vec::new(),
+        });
+        IngestOutcome::Deferred
     }
 }
 
@@ -799,16 +853,242 @@ fn dispatch_record(
     emit_round_outbounds(wire, &out);
 }
 
+/// Start a harness-mode round: run the barrier's train+commit (the `Commit` outbound is dropped —
+/// the real profile update runs on the export completions) and open the round's θ export walk.
+fn start_harness_round(
+    driver: &mut BarrierRound<C3Round>,
+    payloads: &mut PayloadMap,
+    numels: &[usize],
+    ro: &RoundOpen,
+    export: &mut Option<ExportState>,
+) {
+    let _out = driver.on_round_open(ro, payloads);
+    *export = Some(ExportState {
+        round: ro.round,
+        collected: vec![None; numels.len()],
+        ops: BTreeMap::new(),
+    });
+    fence(ro.round + 1); // the round-final fence the walk waits for
+}
+
+/// Per-parameter byte base offsets into the flat family image (prefix sums of `numel × 4`).
+fn family_base_offsets(numels: &[usize]) -> Vec<u64> {
+    let mut bases = Vec::with_capacity(numels.len());
+    let mut acc = 0u64;
+    for &n in numels {
+        bases.push(acc);
+        acc += (n as u64) * 4;
+    }
+    bases
+}
+
+/// Seal a resident family into a self-sealed fold ([SF-R1]) by streaming it through
+/// `state_open`/`state_emit`/`state_seal` in per-parameter `window_size`-byte windows (the
+/// fold-walk chunking, so the sealed fold IS the family fold the walk schedule assumes). Used to
+/// give a resident init (seed-expanded or restored) a fetchable round-base fold.
+fn seal_family(tag: &str, params: &[Vec<f32>], window_size: u64) -> [u8; 32] {
+    let byte_len: u64 = params.iter().map(|p| (p.len() as u64) * 4).sum();
+    let stream = daemon_vhc_sdk::state_open(tag, byte_len);
+    let step = (window_size / 4).max(1) as usize; // elements per window
+    let mut buf = Vec::new();
+    for p in params {
+        let mut off = 0usize;
+        while off < p.len() {
+            let end = (off + step).min(p.len());
+            f32s_to_le_bytes(&p[off..end], &mut buf);
+            daemon_vhc_sdk::state_emit(stream, &buf);
+            off = end;
+        }
+    }
+    daemon_vhc_sdk::state_seal(stream)
+}
+
+/// The async artifact-form init boot (§6.1b): fetch the pinned det-state manifest, register its
+/// master family for length-aware ranged fetch ([SF-R2]), then stream the master windows back to
+/// assemble the resident init and upload it to the device. The model boots from zeros; this
+/// replaces those with the matched init before the first round trains.
+struct BootState {
+    /// The pinned init det-state manifest hash (a granted plain artifact).
+    manifest: Hash,
+    /// The outstanding manifest fetch, until it lands.
+    manifest_op: Option<u64>,
+    /// Outstanding master-window fetches: `data@2` op → window ordinal.
+    window_ops: BTreeMap<u64, u64>,
+    /// The master family's window schedule (set once the manifest lands).
+    schedule: Vec<Window>,
+    /// The assembling init (per parameter), filled as windows arrive.
+    assembled: Vec<Vec<f32>>,
+    /// Whether the init is fully assembled + uploaded.
+    done: bool,
+}
+
+impl BootState {
+    fn new(manifest: Hash, numels: &[usize]) -> Self {
+        Self {
+            manifest,
+            manifest_op: None,
+            window_ops: BTreeMap::new(),
+            schedule: Vec::new(),
+            assembled: numels.iter().map(|&n| vec![0.0f32; n]).collect(),
+            done: false,
+        }
+    }
+}
+
+/// Drive one completion against the artifact-form init boot; returns `true` if it was consumed.
+/// On the manifest completion: parse + register the master family ([SF-R2]) and issue every
+/// master-window read. On a window completion: assemble it; when the family is complete, upload
+/// the init to the device and mark the boot done.
+fn drive_boot_completion(
+    core: &Rc<RefCell<Core>>,
+    boot: &mut BootState,
+    ev: &daemon_vhc_sdk::Event,
+    op: u64,
+) -> bool {
+    if boot.manifest_op == Some(op) {
+        boot.manifest_op = None;
+        let bytes = completion_bytes(ev).expect("the pinned init manifest fetches (fail loud)");
+        let manifest =
+            DetStateManifest::from_canonical_bytes(&bytes).expect("the init manifest parses");
+        let (numels, window_size) = {
+            let c = core.borrow();
+            (c.numels.clone(), c.window_size)
+        };
+        let numels_u64: Vec<u64> = numels.iter().map(|&n| n as u64).collect();
+        let master = manifest
+            .families
+            .get(MASTER_FAMILY)
+            .expect("the init manifest carries a master family");
+        let descriptor = DetStateChunkMap::derive(window_size, &numels_u64, &master.chunk_hashes)
+            .expect("the fetched master geometry matches the layout")
+            .to_canonical_bytes()
+            .expect("descriptor cbor");
+        let status = daemon_vhc_sdk::data_register_state_chunks(&descriptor);
+        assert_eq!(
+            status, 0,
+            "the init master fold is a granted artifact (fail loud)"
+        );
+        core.borrow_mut().master_fold = master.fold.0;
+        boot.schedule = daemon_vhc_sdk_consensus::fold_walk::windows(&numels_u64, window_size);
+        let (base_fold, family_base) = {
+            let c = core.borrow();
+            (c.master_fold, c.family_base.clone())
+        };
+        for w in &boot.schedule {
+            let off = family_base[w.param as usize] + w.param_off;
+            let fop = daemon_vhc_sdk::data_fetch(&base_fold, off, w.len);
+            boot.window_ops.insert(fop, w.ordinal);
+        }
+        return true;
+    }
+    let Some(ordinal) = boot.window_ops.remove(&op) else {
+        return false;
+    };
+    let bytes = completion_bytes(ev).expect("an init master window fetches (fail loud)");
+    let vals = le_bytes_to_f32s(&bytes).expect("init window is an f32-le image");
+    let window = boot.schedule[usize::try_from(ordinal).expect("ordinal fits usize")];
+    let off = (window.param_off / 4) as usize;
+    boot.assembled[window.param as usize][off..off + vals.len()].copy_from_slice(&vals);
+    if boot.window_ops.is_empty() {
+        let mut c = core.borrow_mut();
+        c.master = boot.assembled.clone();
+        c.round_base = boot.assembled.clone();
+        let flat = boot.assembled.clone();
+        c.model.set_params_from_flat(&flat);
+        boot.done = true;
+    }
+    true
+}
+
+/// Drive one completion against the in-flight streamed ingest walk; returns `true` if it was
+/// consumed. Folds the maximal contiguous run now available (each fold `state_emit`s its master
+/// window and advances the carry, and — this commit — mirrors the value into the resident master
+/// for the still-resident `make_update`/upload/checkpoint), refills the read window, and at seal
+/// closes the fold, uploads the new master, and voices the round digest via `finish_ingest`.
+fn drive_ingest_completion(
+    core: &Rc<RefCell<Core>>,
+    driver: &mut BarrierRound<C3Round>,
+    payloads: &mut PayloadMap,
+    wire: bool,
+    ev: &daemon_vhc_sdk::Event,
+    op: u64,
+) -> bool {
+    match core.borrow().ingest_walk.as_ref() {
+        Some(w) if w.ops.contains_key(&op) => {}
+        _ => return false,
+    }
+    let bytes = completion_bytes(ev).expect("round-base window fetch completes (fail loud)");
+    let vals = le_bytes_to_f32s(&bytes).expect("round-base window is an f32-le image");
+
+    let sealed;
+    {
+        let mut core_mut = core.borrow_mut();
+        let Core {
+            ingest_walk,
+            master,
+            family_base,
+            ..
+        } = &mut *core_mut;
+        let w = ingest_walk.as_mut().expect("ingest walk present");
+        let ordinal = w.ops.remove(&op).expect("op is an outstanding window read");
+        let slice = w
+            .walk
+            .on_window_ready(ordinal, &vals)
+            .expect("the walk accepts the completed window");
+        for (window, master_vals) in &slice.emitted {
+            f32s_to_le_bytes(master_vals, &mut w.byte_buf);
+            daemon_vhc_sdk::state_emit(w.stream, &w.byte_buf);
+            let off = (window.param_off / 4) as usize;
+            master[window.param as usize][off..off + master_vals.len()]
+                .copy_from_slice(master_vals);
+        }
+        for window in &slice.issue {
+            let off = family_base[window.param as usize] + window.param_off;
+            let fop = daemon_vhc_sdk::data_fetch(&w.base_fold, off, window.len);
+            w.ops.insert(fop, window.ordinal);
+        }
+        sealed = slice.sealed;
+    }
+    if !sealed {
+        return true;
+    }
+    // The sealing slice: close the fold, finalize the carry, upload the new master, advance the
+    // round base, and voice the digest (which resumes the barrier queue).
+    let mut core_mut = core.borrow_mut();
+    let state = core_mut.ingest_walk.take().expect("the sealed walk");
+    let round = state.round;
+    let fold = daemon_vhc_sdk::state_seal(state.stream);
+    let digest = *state
+        .walk
+        .seal()
+        .expect("the walk sealed after every window folded")
+        .finalize()
+        .as_bytes();
+    core_mut.master_fold = fold;
+    let flat = core_mut.master.clone();
+    core_mut.model.set_params_from_flat(&flat);
+    core_mut.round_base = flat;
+    drop(core_mut);
+    let out = driver.finish_ingest(round, digest, payloads);
+    emit_round_outbounds(wire, &out);
+    true
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
     let numels = cfg.model.param_numels();
     let vocab = cfg.model.vocab;
     let mut live = cfg.live.take().map(LiveState::new);
     let restored_round = restored.as_ref().and_then(|r| r.round);
-    // A restored instance rebuilds from the snapshot's masters + error feedback + AdamW moments
-    // (post-ingest state: master IS the round base); a fresh instance starts from the config's
-    // matched init with zeroed local state.
-    let (init, restored_local) = match restored {
+    let window_size = cfg.state.chunk_size;
+    let family_base = family_base_offsets(&numels);
+    // The init source (§6): a restore rebuilds from the snapshot; a fresh join expands the seed
+    // (synchronous, sealed + `expected_root`-checked here) or fetches the content-addressed
+    // artifact (async — the model boots from zeros and the fetched init uploads when the boot
+    // walk completes, [`BootState`]). `booted == false` defers the first round until the init is
+    // resident.
+    let mut boot: Option<BootState> = None;
+    let (init, restored_local, mut booted) = match &restored {
         Some(r) => (
             split_flat(&r.master, &numels),
             Some((
@@ -816,8 +1096,29 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                 split_flat(&r.adamw_m, &numels),
                 split_flat(&r.adamw_v, &numels),
             )),
+            true,
         ),
-        None => (split_flat(&cfg.init, &numels), None),
+        None => match cfg.state.init {
+            StateInit::Seed { seed, dist, .. } => {
+                let expanded: Vec<Vec<f32>> = numels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| {
+                        daemon_vhc_det::seed_init_param(&seed.0, dist, i as u64, n)
+                            .expect("the genesis seed-init distribution id is implemented")
+                    })
+                    .collect();
+                (expanded, None, true)
+            }
+            StateInit::Manifest { manifest } => {
+                boot = Some(BootState::new(manifest, &numels));
+                (
+                    numels.iter().map(|&n| vec![0.0f32; n]).collect(),
+                    None,
+                    false,
+                )
+            }
+        },
     };
     let mut profile = SparseLoco::new(cfg.profile.clone(), &numels);
     let device = daemon_vhc_sdk_compute::device();
@@ -829,15 +1130,41 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
             .expect("snapshot ef matches the model layout (validated at da_migrate)");
         model.set_moments_from_flat(&m, &v);
     }
+    // The round-base fold: a resident init (seed/restore) is sealed into a self-sealed fold
+    // ([SF-R1]) now; the artifact form registers the fetched fold during boot (set there).
+    let master_fold = if booted {
+        seal_family(MASTER_FAMILY, &init, window_size)
+    } else {
+        [0u8; 32]
+    };
+    // Seed-init admission cross-check (§6.1a): the sealed expansion MUST reproduce the pinned root.
+    if restored.is_none() {
+        if let StateInit::Seed { expected_root, .. } = cfg.state.init {
+            assert_eq!(
+                master_fold, expected_root.0,
+                "seed-init sealed fold does not match the pinned expected_root (typed init failure)"
+            );
+        }
+    }
     let core = Rc::new(RefCell::new(Core {
         model,
         profile,
+        profile_cfg: cfg.profile.clone(),
         master: init.clone(),
         round_base: init,
+        numels: numels.clone(),
+        family_base,
+        window_size,
+        master_fold,
+        ingest_walk: None,
         batches: VecDeque::new(),
         pending_grads: None,
         next_step_fence: 0,
     }));
+    // Fresh artifact-form join: kick off the init boot (fetch the pinned manifest).
+    if let Some(b) = boot.as_mut() {
+        b.manifest_op = Some(daemon_vhc_sdk::data_fetch(&b.manifest.0, 0, 0));
+    }
     let round_cfg = RoundCfg {
         peer: cfg.peer,
         roster: cfg.roster.clone(),
@@ -855,6 +1182,8 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
     };
     let mut export: Option<ExportState> = None;
     let mut quiesce: Option<QuiesceWalk> = None;
+    // A harness RoundOpen that arrives before the async init boot completes waits here.
+    let mut deferred_open: Option<RoundOpen> = None;
 
     // Live mode boots by fetching the genesis-pinned corpus manifest (everything else waits on
     // it: chunk registration precedes any shard range fetch, and the Join announcement waits so
@@ -981,14 +1310,14 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
                             continue;
                         }
                         // Harness mode: batches were host-staged; train + (dropped) commit,
-                        // then the export walk for this round's θ.
-                        let _out = driver.on_round_open(&ro, &mut payloads);
-                        export = Some(ExportState {
-                            round,
-                            collected: vec![None; numels.len()],
-                            ops: BTreeMap::new(),
-                        });
-                        fence(round + 1); // the round-final fence the walk waits for
+                        // then the export walk for this round's θ. If the async init boot has not
+                        // finished, this round waits until the matched init is resident.
+                        let _ = round;
+                        if !booted {
+                            deferred_open = Some(ro);
+                            continue;
+                        }
+                        start_harness_round(&mut driver, &mut payloads, &numels, &ro, &mut export);
                     }
                     VhcMessage::RoundRecord(rr) => {
                         let entries: Vec<RecordEntry> = rr.inline.clone().unwrap_or_default();
@@ -1044,6 +1373,38 @@ fn run_module(mut cfg: GuestCfg, restored: Option<Restored>) -> u32 {
             }
             EV_COMPLETION => {
                 let op = ev.uint(1);
+                // The async init boot ([SF-R2] artifact form): manifest fetch → register → master
+                // window reads → upload. When it completes, a round that arrived early runs now.
+                if let Some(b) = boot.as_mut() {
+                    if drive_boot_completion(&core, b, &ev, op) {
+                        if b.done {
+                            booted = true;
+                            boot = None;
+                            if let Some(ro) = deferred_open.take() {
+                                start_harness_round(
+                                    &mut driver,
+                                    &mut payloads,
+                                    &numels,
+                                    &ro,
+                                    &mut export,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                }
+                // The in-flight streamed ingest walk's round-base window reads (the digest voices
+                // at seal via finish_ingest).
+                if drive_ingest_completion(
+                    &core,
+                    &mut driver,
+                    &mut payloads,
+                    live.is_some(),
+                    &ev,
+                    op,
+                ) {
+                    continue;
+                }
                 // Live-mode completion routing first: the manifest fetch, a pending open's
                 // corpus segments, a pending record's committed payloads, a durable payload put.
                 if let Some(l) = live.as_mut() {

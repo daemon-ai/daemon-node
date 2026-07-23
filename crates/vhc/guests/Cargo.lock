@@ -4657,6 +4657,7 @@ version = "0.0.1"
 dependencies = [
  "burn",
  "ciborium",
+ "daemon-vhc-det",
  "daemon-vhc-proto",
  "daemon-vhc-sdk",
  "daemon-vhc-sdk-compute",
