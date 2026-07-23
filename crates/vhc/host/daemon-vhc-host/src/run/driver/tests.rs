@@ -53,6 +53,7 @@ fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
         buffers: BufferTable::new(0, 0, 0),
         ops: OpTable::new(0, 0),
         chunk_maps: std::collections::HashMap::new(),
+        state_chunk_maps: std::collections::HashMap::new(),
         data_read_budget: 0,
         data_read_used: 0,
         streams: StreamTable::new(0),

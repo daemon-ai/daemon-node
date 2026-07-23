@@ -174,6 +174,7 @@ pub fn start_run_migrating(
             buffers: BufferTable::new(0, run.max_live_buffer_handles, run.max_live_buffer_bytes),
             ops: OpTable::new(0, run.max_outstanding_ops),
             chunk_maps: std::collections::HashMap::new(),
+            state_chunk_maps: std::collections::HashMap::new(),
             data_read_budget: run.data_read_budget_bytes,
             data_read_used: 0,
             streams: StreamTable::new(0),

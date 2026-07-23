@@ -206,6 +206,12 @@ struct ReplayHost {
     /// entries (the chunk hashes are the content addresses; the shard fold has no whole-object
     /// bytes anywhere).
     chunk_maps: HashMap<[u8; 32], daemon_vhc_proto::ChunkMap>,
+    /// Det-state chunk maps re-registered by the replayed guest ([SF-R2]; `register_state_chunks`
+    /// is deterministic guest output — re-executed, never journaled): fold identity → length-aware
+    /// map. A fetch of a registered det-state identity materializes its covering span from
+    /// CHUNK-keyed payload-table entries walked over the actual per-chunk offsets (externally
+    /// sourced roots ride the payload plane exactly like corpus shards — [CC-4]).
+    state_chunk_maps: HashMap<[u8; 32], daemon_vhc_proto::det_state::DetStateChunkMap>,
     /// `stream_read` ops awaiting their journaled kind-4 bytes at completion delivery.
     stream_read_ops: std::collections::HashSet<u64>,
     /// `compute.export` ops awaiting their journaled kind-5 tensor bytes at completion delivery.
@@ -351,6 +357,60 @@ fn dispatch(
                                     }
                                     None => unreachable!("sealed() checked above"),
                                 }
+                            } else if let Some(map) = host.state_chunk_maps.get(&hash) {
+                                // [SF-R2] externally-sourced det-state fold: reassemble the
+                                // covering span from CHUNK-keyed payload-table entries, walked over
+                                // the map's actual per-chunk offsets (length-aware — not a uniform
+                                // grid), then slice the recorded range.
+                                let end = if len == 0 {
+                                    map.byte_len
+                                } else {
+                                    off.saturating_add(len)
+                                };
+                                if off > map.byte_len || end > map.byte_len {
+                                    return Err(diverged(format!(
+                                        "fetch completion for op {op:#x} succeeded but the range \
+                                         [{off}, {end}) exceeds the registered det-state fold \
+                                         ({} bytes)",
+                                        map.byte_len
+                                    )));
+                                }
+                                let (span_off, span_len) = map.covering_span(off, end);
+                                let mut span = Vec::with_capacity(span_len as usize);
+                                let mut cursor = 0u64;
+                                let mut i = 0usize;
+                                while cursor < span_off {
+                                    cursor += u64::from(map.chunks[i].1);
+                                    i += 1;
+                                }
+                                while (span.len() as u64) < span_len {
+                                    let Some((chunk_hash, _)) = map.chunks.get(i) else {
+                                        return Err(diverged(format!(
+                                            "fetch completion for op {op:#x}: covering span \
+                                             reaches past the registered det-state chunk list"
+                                        )));
+                                    };
+                                    let Some(bytes) = host.script.payloads.get(&chunk_hash.0)
+                                    else {
+                                        return Err(diverged(format!(
+                                            "ReplayMissingPayload: fetch completion for op \
+                                             {op:#x} needs det-state chunk {} but the replay \
+                                             payload table lacks it",
+                                            hex8(&chunk_hash.0)
+                                        )));
+                                    };
+                                    span.extend_from_slice(bytes);
+                                    i += 1;
+                                }
+                                let lo = (off - span_off) as usize;
+                                let hi = lo + (end - off) as usize;
+                                if hi > span.len() {
+                                    return Err(diverged(format!(
+                                        "fetch completion for op {op:#x}: reassembled det-state \
+                                         span is shorter than the recorded range"
+                                    )));
+                                }
+                                span[lo..hi].to_vec()
                             } else if let Some(map) = host.chunk_maps.get(&hash) {
                                 let end = if len == 0 {
                                     map.byte_len
@@ -665,6 +725,24 @@ fn dispatch(
             let map = super::driver::decode_chunk_descriptor(&desc)
                 .map_err(|e| diverged(format!("register_chunks undecodable at replay: {e}")))?;
             caller.data_mut().chunk_maps.insert(map.fold().0, map);
+            results[0] = Val::I32(0);
+            Ok(())
+        }
+        ("data@2", "register_state_chunks") => {
+            // [SF-R2]: deterministic guest output, re-executed exactly like `register_chunks` —
+            // rebuild the length-aware det-state map so a later fetch of the fold materializes its
+            // covering span from CHUNK-keyed payload-table entries (the grant/fold check passed at
+            // recording; a violation would have trapped there).
+            let (ptr, len) = (p_u32(params, 0), p_u32(params, 1));
+            let mem = mem_of(caller)?;
+            let mut desc = vec![0u8; len as usize];
+            mem.read(&mut *caller, ptr as usize, &mut desc)
+                .map_err(|e| wasmtime::Error::msg(format!("register_state_chunks read: {e}")))?;
+            let map = daemon_vhc_proto::det_state::DetStateChunkMap::from_canonical_bytes(&desc)
+                .map_err(|e| {
+                    diverged(format!("register_state_chunks undecodable at replay: {e}"))
+                })?;
+            caller.data_mut().state_chunk_maps.insert(map.fold().0, map);
             results[0] = Val::I32(0);
             Ok(())
         }
@@ -1037,6 +1115,7 @@ pub fn replay_migrating(
         op_hashes: HashMap::new(),
         op_fetches: HashMap::new(),
         chunk_maps: HashMap::new(),
+        state_chunk_maps: HashMap::new(),
         stream_read_ops: std::collections::HashSet::new(),
         tensor_export_ops: std::collections::HashSet::new(),
         host_buffers: HashMap::new(),

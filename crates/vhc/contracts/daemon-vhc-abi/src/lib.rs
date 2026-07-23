@@ -179,7 +179,7 @@ pub const SYS_V2_SYMBOLS: &[&str] = &[
 ///   `data-read-budget` grant is charged per fetch at the call (breach completes
 ///   `Err(GrantExhausted)`, never silent truncation). Registration is deterministic guest
 ///   output (§2.7 dc class — no journal record; replay re-executes it).
-pub const DATA_V2_SYMBOLS: &[&str] = &["fetch", "register_chunks"];
+pub const DATA_V2_SYMBOLS: &[&str] = &["fetch", "register_chunks", "register_state_chunks"];
 
 /// The domain-separation context for the run-scoped RNG seed (`sys@2::rng_seed`): the seed is
 /// `blake3::derive_key(RNG_SEED_DOMAIN_V2, material)` where `material` is the unambiguous
@@ -370,6 +370,12 @@ pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
     (NS_VHC_V2, "state_open", STATE_MINOR_V2),
     (NS_VHC_V2, "state_emit", STATE_MINOR_V2),
     (NS_VHC_V2, "state_seal", STATE_MINOR_V2),
+    // -- minor 3 (the chunk-addressed det-state contract, ABI §12.14 [SF-R2]): the read side of
+    // an EXTERNALLY-sourced fold (artifact-form init, restore roots). Registers a length-aware
+    // chunk map (per-parameter chunking has interior short tails — not the uniform corpus grid),
+    // its fold gated as a granted artifact exactly like `register_chunks`; after registration
+    // `fetch` of that identity is a length-aware covering-span, chunk-verified range read.
+    (NS_DATA_V2, "register_state_chunks", STATE_MINOR_V2),
 ];
 
 /// The minor at which `(namespace, symbol)` was introduced, or `None` if it is not a registered

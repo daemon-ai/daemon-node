@@ -70,6 +70,16 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         ),
                     ));
                 }
+                // [SF-R2]: an externally-registered det-state fold resolves length-aware (its
+                // per-chunk lengths were registered — per-parameter chunking is not a uniform
+                // grid). Checked before the corpus map: the two registries are disjoint by
+                // construction (distinct fold domains), but the det-state map governs the covering
+                // geometry when both a length and a uniform reading would otherwise differ.
+                if let Some(map) = st.state_chunk_maps.get(&hash).cloned() {
+                    let op = service_state_ranged_fetch(&mut st, &map, hash, range_off, range_len)?;
+                    st.note_egress();
+                    return Ok(op);
+                }
                 let chunked = st.chunk_maps.get(&hash).map(|m| (m.byte_len, m.chunk_size));
                 let (used, budget) = (st.data_read_used, st.data_read_budget);
                 let op = match chunked {
@@ -249,6 +259,55 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
         },
     )?;
 
+    // ---- data@2::register_state_chunks — det-state fold registration ([SF-R2], minor 3) ---------
+    // The read side of an EXTERNALLY-sourced det-state fold (artifact-form init, restore roots).
+    // The module presents a `DetStateChunkMap` descriptor — canonical CBOR carrying per-chunk
+    // lengths GUEST-DERIVED from the parameter layout (per-parameter chunking has interior short
+    // tails, so the covering geometry is NOT the uniform corpus grid). The host re-derives the
+    // domain-separated family fold and admits the map ONLY when the fold IS a granted artifact —
+    // a lying descriptor can neither derive a granted identity nor survive the per-chunk blake3
+    // re-verification at fetch (the fold pins the ordered chunk hashes; the lengths are only
+    // framing hints). Deterministic guest output (§2.7 dc class): no journal record; replay
+    // re-executes the registration over reproduced guest memory. Idempotent per identity.
+    linker.func_wrap(
+        NS_DATA_V2,
+        "register_state_chunks",
+        |mut c: Caller<'_, Host>, desc_ptr: u32, desc_len: u32| -> Result<u32, wasmtime::Error> {
+            let r: Result<u32, Trap> = (|c: &mut Caller<'_, Host>| {
+                c.data_mut().enter("register_state_chunks")?;
+                let desc = read_guest(c, desc_ptr, desc_len)?;
+                let map =
+                    daemon_vhc_proto::det_state::DetStateChunkMap::from_canonical_bytes(&desc)
+                        .map_err(|e| {
+                            Trap::new(
+                                TrapCode::BadEnum,
+                                "register_state_chunks",
+                                None,
+                                e.to_string(),
+                            )
+                        })?;
+                let fold = map.fold();
+                if !c.data().granted_artifacts.contains(&fold.0) {
+                    return Err(Trap::new(
+                        TrapCode::GrantViolation,
+                        "register_state_chunks",
+                        None,
+                        format!(
+                            "det-state fold {} is not in the admitted artifact set (which \
+                             artifacts a module may touch is a grant, architecture §3.2)",
+                            fold.to_hex()
+                        ),
+                    ));
+                }
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.state_chunk_maps.insert(fold.0, map);
+                Ok(0)
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+
     Ok(())
 }
 
@@ -330,6 +389,93 @@ fn service_self_sealed_fetch(
     };
     st.enqueue_completion(op, &result)
         .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+    Ok(op)
+}
+
+/// Service a `data.fetch` of an **externally-registered det-state fold** ([SF-R2]): bounds +
+/// read-budget checks at the call, then the LENGTH-AWARE covering span (per-parameter chunking is
+/// not a uniform grid — the registered map carries actual per-chunk offsets) issued as an
+/// `OpRequest::ArtifactRange`. The completion pump verifies the covering chunks against the
+/// fold-committed hashes with the det-state verifier and slices the guest's range. An empty range
+/// completes an empty buffer at the call (deterministic, journaled), the corpus precedent.
+fn service_state_ranged_fetch(
+    st: &mut PumpState,
+    map: &daemon_vhc_proto::det_state::DetStateChunkMap,
+    hash: [u8; 32],
+    range_off: u64,
+    range_len: u64,
+) -> Result<u64, Trap> {
+    let byte_len = map.byte_len;
+    let end = if range_len == 0 {
+        byte_len
+    } else {
+        range_off.saturating_add(range_len)
+    };
+    if range_off > byte_len || end > byte_len {
+        return immediate_fetch_refusal(
+            st,
+            hash,
+            range_off,
+            range_len,
+            daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+            format!(
+                "range [{range_off}, {end}) out of bounds (registered fold is {byte_len} bytes)"
+            ),
+        );
+    }
+    let charge = end - range_off;
+    let (used, budget) = (st.data_read_used, st.data_read_budget);
+    if budget != 0 && used.saturating_add(charge) > budget {
+        return immediate_fetch_refusal(
+            st,
+            hash,
+            range_off,
+            range_len,
+            COMP_ERR_GRANT_EXHAUSTED,
+            format!(
+                "data-read budget exhausted ({used} of {budget} bytes used; {charge} more \
+                 requested)"
+            ),
+        );
+    }
+    st.data_read_used += charge;
+    let (span_off, span_len) = map.covering_span(range_off, end);
+    if span_len == 0 {
+        let request = OpRequest::ArtifactRange {
+            hash,
+            range_off,
+            range_len,
+            span_off,
+            span_len,
+        };
+        let op = st
+            .ops
+            .begin(request)
+            .map_err(|code| Trap::new(code, "fetch", None, "max_outstanding grant (§2.3)"))?;
+        st.ops.finish(op);
+        let result = match st.buffers.create_host(Arc::new(vec![])) {
+            Some(handle) => CompletionResult::Ok(SuccessPayload::Handle(handle)),
+            None => CompletionResult::Err(CompError {
+                code: COMP_ERR_GRANT_EXHAUSTED,
+                detail: Some("buffer quota exhausted (deny new buffers)".into()),
+            }),
+        };
+        st.enqueue_completion(op, &result)
+            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+        return Ok(op);
+    }
+    let request = OpRequest::ArtifactRange {
+        hash,
+        range_off,
+        range_len,
+        span_off,
+        span_len,
+    };
+    let op = st
+        .ops
+        .begin(request.clone())
+        .map_err(|code| Trap::new(code, "fetch", None, "max_outstanding grant (§2.3)"))?;
+    st.op_requests.push((op, request));
     Ok(op)
 }
 

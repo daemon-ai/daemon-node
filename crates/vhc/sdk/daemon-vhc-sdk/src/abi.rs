@@ -67,6 +67,9 @@ extern "C" {
     // -- minor 2: chunk-map registration (the chunk-addressed corpus contract) ------------------
     #[link_name = "register_chunks"]
     fn abi_data_register_chunks(desc_ptr: u32, desc_len: u32) -> u32;
+    // -- minor 3: det-state fold registration ([SF-R2]) -----------------------------------------
+    #[link_name = "register_state_chunks"]
+    fn abi_data_register_state_chunks(desc_ptr: u32, desc_len: u32) -> u32;
 }
 
 #[link(wasm_import_module = "compute@2")]
@@ -454,6 +457,19 @@ pub fn data_fetch(hash: &[u8; 32], range_off: u64, range_len: u64) -> u64 {
 pub fn data_register_chunks(desc: &[u8]) -> u32 {
     // SAFETY: `desc` is a live guest span for the call's duration.
     unsafe { abi_data_register_chunks(desc.as_ptr() as u32, desc.len() as u32) }
+}
+
+/// Register an externally-sourced **det-state** fold's length-aware chunk map
+/// (`data@2::register_state_chunks`, minor 3, [SF-R2]): `desc` is the canonical CBOR of a
+/// `daemon_vhc_proto::det_state::DetStateChunkMap` — per-chunk lengths derived from the parameter
+/// layout, so per-parameter interior short tails resolve correctly (unlike the uniform corpus
+/// grid). The host re-derives the domain-separated family fold and admits the map ONLY when the
+/// fold is a granted artifact (else it traps `GrantViolation`); returns 0 on (idempotent)
+/// registration. After registration, [`data_fetch`] of that fold is a verified length-aware
+/// covering-span range read. Register BEFORE ranging an externally-sourced fold.
+pub fn data_register_state_chunks(desc: &[u8]) -> u32 {
+    // SAFETY: `desc` is a live guest span for the call's duration.
+    unsafe { abi_data_register_state_chunks(desc.as_ptr() as u32, desc.len() as u32) }
 }
 
 // -- minor 2 (Phase C, track C1): the compute@2 command queue (ABI §15) ---------------------------
