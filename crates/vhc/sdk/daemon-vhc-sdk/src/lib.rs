@@ -35,6 +35,39 @@ pub use migrate::{
 };
 pub use module::{derive_claim, manifest_bytes, GuestModule, ModuleDecl};
 
+/// Report a peer's per-round outcome — the post-ingest det digest plus the barrier's
+/// committed / ingested / stalled bookkeeping — through the host METRIC ABI, under the reserved
+/// [`daemon_vhc_abi::round_metrics`] name contract.
+///
+/// This is the OPACITY-SAFE live surface for the digest: the guest emits the outcome as a group of
+/// reserved `vhc.round.<round>.<field>` metrics (`(name, f64)` pairs, the digest carried as four
+/// little-endian `u32` words), and the host role session recognizes the reserved names and folds
+/// them into a round-outcome event — it never decodes a module control frame to obtain the digest.
+///
+/// The digest is ALSO the guest's own `[4, round, digest]` det-lane publish (the journal voice);
+/// this call is a strictly ADDITIONAL, host-visible report. It changes no det-lane math, no round
+/// logic, and no tag-4 voice — the guest already computed the digest and drove the ingest, so
+/// `committed`/`ingested`/`stalled` are honest guest-known values.
+#[cfg(target_arch = "wasm32")]
+pub fn report_round_outcome(
+    round: u64,
+    committed: u32,
+    ingested: u32,
+    stalled: bool,
+    digest: [u8; 16],
+) {
+    let outcome = daemon_vhc_abi::round_metrics::RoundOutcome {
+        round,
+        committed,
+        ingested,
+        stalled,
+        digest,
+    };
+    for (name, value) in outcome.metric_pairs() {
+        emit_metric(&name, value);
+    }
+}
+
 /// A [`crate::migrate::SectionReader`] over the live `read_back(kind = 3)` restore capability —
 /// what `main!`'s `da_migrate` hands the module (§6.6: kind 3 is legal exactly there).
 #[cfg(target_arch = "wasm32")]

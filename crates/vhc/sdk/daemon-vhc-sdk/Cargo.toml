@@ -15,6 +15,10 @@ higher guest SDK crates (compute/profiles/rounds) build on.
 
 [dependencies]
 ciborium = { workspace = true }
+# The shared, dependency-free ABI contract ground (dual-compiled native + wasm32). Home of the
+# reserved round-outcome metric-name contract (`round_metrics`) the trainer emits its per-round
+# digest + barrier bookkeeping through, so the host recognizes the same names — pinned once here.
+daemon-vhc-abi = { path = "../../contracts/daemon-vhc-abi" }
 daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }
 serde = { workspace = true, features = ["derive"] }
 # The corpus manifest is JSON (`manifest.json`, the same schema the v1 host pipeline reads) —
