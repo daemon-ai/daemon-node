@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 42)
+wire_version = uint                 ; daemon-common WireVersion (current = 44)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -1069,11 +1069,16 @@ vhc-run-summary = { "run_id": tstr, "phase": tstr, "joined": bool, "eligibility"
                       ? "run_id_hash": tstr, ? "epoch": uint64, ? "role": tstr, ? "instance": uint64,
                       ? "envelope_schema_major": uint, ? "module_abi_major": uint, ? "selected_driver": tstr, ? "module_hash": tstr,
                       ? "run_state": tstr, ? "retry_count": uint64, ? "terminal_reason": tstr }
-vhc-run-detail = { "summary": vhc-run-summary, "coordinator": tstr, "contribution": vhc-contribution, "recent_events": [* vhc-event] }
+; wire v44: the newest round's 16-byte post-ingest det-state digest, surfaced on the snapshot so a
+; polling client reads it without an event subscription (skip-if-none — absent before any round).
+vhc-run-detail = { "summary": vhc-run-summary, "coordinator": tstr, "contribution": vhc-contribution, "recent_events": [* vhc-event], ? "last_round_digest": vhc-round-digest }
 vhc-leave-mode = "graceful" / "immediate"
+; wire v44: the 16-byte post-ingest det-state digest (a `[u8; 16]` — serializes as a CBOR array of
+; ints, no serde_bytes, exactly like `content-hash`).
+vhc-round-digest = [* uint]
 vhc-event-phase = { "Phase": { "run_id": tstr, "phase": tstr, "epoch": uint64, "round": uint64 } }
 vhc-event-progress = { "Progress": { "run_id": tstr, "inner_step": uint, "loss_micros": uint64, "tokens_per_s_milli": uint64, "peers": uint } }
-vhc-event-round-outcome = { "RoundOutcome": { "run_id": tstr, "round": uint64, "committed": uint, "ingested": uint, "stalled": bool } }
+vhc-event-round-outcome = { "RoundOutcome": { "run_id": tstr, "round": uint64, "committed": uint, "ingested": uint, "stalled": bool, "digest": vhc-round-digest } }
 vhc-event-contribution = { "Contribution": { "run_id": tstr, "contribution": vhc-contribution } }
 vhc-event-warning = { "Warning": { "run_id": tstr, "class": tstr, "detail": tstr } }
 vhc-event-error = { "Error": { "run_id": tstr, "class": tstr, "detail": tstr } }

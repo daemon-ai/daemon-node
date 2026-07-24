@@ -224,6 +224,14 @@ pub struct VhcRunDetail {
     pub contribution: VhcContribution,
     /// The windowed recent events for the run (newest last).
     pub recent_events: Vec<VhcEvent>,
+    /// The 16-byte post-ingest det-state digest of the newest round this node has observed an
+    /// outcome for (the digest carried by the highest-round [`VhcEvent::RoundOutcome`]), or `None`
+    /// before any round completes. **Additive (wire v44):** surfaces the per-round digest on the
+    /// snapshot so a polling client (`daemon-cli vhc detail --watch`) collects the digest-agreement
+    /// transcript without an event subscription. The node decides, the app renders — never
+    /// re-derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_round_digest: Option<[u8; 16]>,
 }
 
 /// The outcome of a consumed run-level module-upgrade record (wire v43): the node validated the
@@ -312,6 +320,13 @@ pub enum VhcEvent {
         ingested: u32,
         /// Whether this node stalled the round.
         stalled: bool,
+        /// The 16-byte post-ingest det-state digest for the round (§5.6): the worker session
+        /// reports it and every peer that completes the round must produce a byte-identical value
+        /// — the digest-agreement (G-2) evidence a polling client collects. **Additive (wire
+        /// v44):** the node previously dropped this at the API boundary; `#[serde(default)]` keeps
+        /// a pre-v44 stored event decodable (fills all-zero).
+        #[serde(default)]
+        digest: [u8; 16],
     },
     /// A contribution-ledger delta (the running totals after the update).
     Contribution {
