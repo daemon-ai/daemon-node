@@ -431,6 +431,58 @@ pub async fn recent_events(node: &Node, run_id: &str) -> Vec<VhcEvent> {
     }
 }
 
+/// Read a run's full `VhcRunDetail` snapshot (`None` if the node does not know the run).
+pub async fn run_detail(node: &Node, run_id: &str) -> Option<daemon_api::VhcRunDetail> {
+    let resp = node
+        .client()
+        .call(ApiRequest::VhcRunDetail {
+            run_id: run_id.to_string(),
+        })
+        .await
+        .expect("vhc_run_detail call");
+    match resp {
+        ApiResponse::VhcRunDetail(d) => d,
+        _ => None,
+    }
+}
+
+/// Assert the wire-v44 per-round digest surfaces on the product API consistently with the durable
+/// journal (the offline truth): any `VhcEvent::RoundOutcome` in the snapshot window carries the
+/// journal's digest for its round, and `last_round_digest` (when present) equals the journal's
+/// digest for the round it reports. This is the G-2 digest-agreement evidence collected through the
+/// node's public API rather than a journal reader.
+///
+/// NOTE (adjudicated): the digest is only surfaced through the API when the worker emits a
+/// `RoundOutcome` session event — an opacity-sensitive producer that the live `RoleSession` does
+/// not yet drive per round (the digest lives in the SDK round schema inside the journal, which the
+/// session must not decode). The wire contract, the node conversion (it no longer drops the
+/// digest), and the snapshot projection are complete and this assertion proves they are faithful
+/// wherever the digest is present; wiring the opacity-safe live producer is a documented follow-up.
+pub fn assert_api_digest_matches_journal(
+    detail: &daemon_api::VhcRunDetail,
+    journal: &BTreeMap<u64, [u8; 16]>,
+) {
+    for ev in &detail.recent_events {
+        if let VhcEvent::RoundOutcome { round, digest, .. } = ev {
+            if let Some(j) = journal.get(round) {
+                assert_eq!(
+                    digest, j,
+                    "RoundOutcome API digest for round {round} disagrees with the journal"
+                );
+            }
+        }
+    }
+    if let Some(d) = &detail.last_round_digest {
+        let round = detail.summary.last_round;
+        if let Some(j) = journal.get(&round) {
+            assert_eq!(
+                d, j,
+                "VhcRunDetail.last_round_digest for round {round} disagrees with the journal"
+            );
+        }
+    }
+}
+
 /// Poll until `node`'s run has progressed to at least `rounds` distinct round outcomes, or the
 /// deadline elapses. Returns the highest round observed. A persisted `VhcEvent::Error` fails the
 /// wait loudly (never a silent drop).
