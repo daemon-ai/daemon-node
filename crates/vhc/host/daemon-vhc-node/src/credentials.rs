@@ -175,6 +175,55 @@ pub fn author_join(
     })
 }
 
+/// The spawn-env the node hands its worker child so the worker's **assess-time** `r2://`
+/// module/corpus fetch has a presign client (defect B: the node derived `presign_base` internally
+/// but never propagated it, so the worker refused `r2:// needs a presign client`).
+///
+/// The sanctioned channel is the worker's spawn env (`TrainClientConfig::env` → the child process
+/// environment `backend::store_fetch_context()` reads) — the design already documents this as "the
+/// presign context the node sets when spawning the worker … a node-controlled input at assess
+/// time", the exact analogue of `DAEMON_TRAIN_MODULE`.
+///
+/// Populated ONLY when the presigned-R2 content plane is selected: no local filesystem payload
+/// plane (`local_payload_plane == false`) AND a registry base is configured — the SAME gate
+/// [`author_join`] uses for the credentials' `presign_base` (a filesystem-plane node serves
+/// artifacts from its content store and needs no presign). The presign **RunId** is deliberately
+/// NOT set here (a worker child is spawned run-agnostically): the worker derives it from the
+/// genesis it decodes at assess (`frozen.run_id()`), so a config-time spawn env suffices.
+///
+/// The env names mirror `daemon-vhc-worker`'s `store_fetch_context()` exactly; the
+/// [`tests`] module below pins them so the two sides cannot drift.
+#[must_use]
+pub fn worker_presign_env(
+    registry: &RegistryConfig,
+    local_payload_plane: bool,
+    cache_dir: &std::path::Path,
+    cache_gb: u32,
+) -> Vec<(String, String)> {
+    if local_payload_plane || registry.base.is_empty() {
+        return Vec::new();
+    }
+    let mut env = vec![
+        ("DAEMON_VHC_PRESIGN_BASE".to_string(), registry.base.clone()),
+        (
+            "DAEMON_VHC_CACHE_DIR".to_string(),
+            cache_dir.display().to_string(),
+        ),
+        ("DAEMON_VHC_CACHE_GB".to_string(), cache_gb.to_string()),
+    ];
+    match &registry.auth {
+        RegistryAuthConfig::None => {}
+        RegistryAuthConfig::Bearer { token } => {
+            env.push(("DAEMON_VHC_BEARER".to_string(), token.clone()));
+        }
+        RegistryAuthConfig::Internal { org_id, actor } => {
+            env.push(("DAEMON_VHC_ORG".to_string(), org_id.clone()));
+            env.push(("DAEMON_VHC_ACTOR".to_string(), actor.clone()));
+        }
+    }
+    env
+}
+
 /// Map the node's registry auth config onto the worker-wire auth vocabulary.
 fn registry_ws_auth(auth: &RegistryAuthConfig) -> WsAuthSpec {
     match auth {
@@ -184,5 +233,93 @@ fn registry_ws_auth(auth: &RegistryAuthConfig) -> WsAuthSpec {
             org_id: org_id.clone(),
             actor: actor.clone(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_presign_env;
+    use daemon_vhc_session::config::{RegistryAuthConfig, RegistryConfig};
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    /// The node hands the worker its presign context (base + auth + cache) when the R2 content
+    /// plane is selected — the defect-B fix. The env names match the worker's
+    /// `store_fetch_context()` reads.
+    #[test]
+    fn presign_env_present_with_registry_and_no_local_plane() {
+        let registry = RegistryConfig {
+            base: "https://reg.example/api/v1/vhc".to_string(),
+            auth: RegistryAuthConfig::Internal {
+                org_id: "org_ceremony".to_string(),
+                actor: "key:strix".to_string(),
+            },
+        };
+        let env: HashMap<_, _> =
+            worker_presign_env(&registry, false, Path::new("/data/vhc/vhc-cache"), 50)
+                .into_iter()
+                .collect();
+        assert_eq!(
+            env.get("DAEMON_VHC_PRESIGN_BASE").map(String::as_str),
+            Some("https://reg.example/api/v1/vhc")
+        );
+        assert_eq!(
+            env.get("DAEMON_VHC_ORG").map(String::as_str),
+            Some("org_ceremony")
+        );
+        assert_eq!(
+            env.get("DAEMON_VHC_ACTOR").map(String::as_str),
+            Some("key:strix")
+        );
+        assert_eq!(
+            env.get("DAEMON_VHC_CACHE_DIR").map(String::as_str),
+            Some("/data/vhc/vhc-cache")
+        );
+        assert_eq!(
+            env.get("DAEMON_VHC_CACHE_GB").map(String::as_str),
+            Some("50")
+        );
+        // The run id is NOT set at spawn (the worker derives it from the genesis).
+        assert!(!env.contains_key("DAEMON_VHC_RUN_ID"));
+    }
+
+    #[test]
+    fn presign_env_bearer_auth() {
+        let registry = RegistryConfig {
+            base: "https://reg".to_string(),
+            auth: RegistryAuthConfig::Bearer {
+                token: "vhc:t0ken".to_string(),
+            },
+        };
+        let env: HashMap<_, _> = worker_presign_env(&registry, false, Path::new("/c"), 20)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            env.get("DAEMON_VHC_BEARER").map(String::as_str),
+            Some("vhc:t0ken")
+        );
+        assert!(!env.contains_key("DAEMON_VHC_ORG"));
+    }
+
+    /// No presign context: a local filesystem payload plane serves artifacts from the content
+    /// store, and a node with no registry base has nothing to presign against.
+    #[test]
+    fn presign_env_empty_without_r2_plane() {
+        let registry = RegistryConfig {
+            base: "https://reg".to_string(),
+            auth: RegistryAuthConfig::None,
+        };
+        assert!(
+            worker_presign_env(&registry, true, Path::new("/c"), 20).is_empty(),
+            "a local fs payload plane needs no presign env"
+        );
+        let no_registry = RegistryConfig {
+            base: String::new(),
+            auth: RegistryAuthConfig::None,
+        };
+        assert!(
+            worker_presign_env(&no_registry, false, Path::new("/c"), 20).is_empty(),
+            "no registry base ⇒ no presign context"
+        );
     }
 }
