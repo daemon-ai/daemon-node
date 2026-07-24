@@ -354,6 +354,51 @@ pub fn ceremony_trainer_config_harness(roster: &[PeerId]) -> Value {
     ])
 }
 
+/// The frozen ceremony trainer config in its **round-walk gate** form: the harness form
+/// ([`ceremony_trainer_config_harness`]) with exactly two documented deviations, so a gate can
+/// drive the ROUND path (θ export → `make_update` → ingest → quiesce) at the real ceremony
+/// geometry on a CPU lane in minutes.
+///
+/// - `steps_per_round = 0` — the round opens, commits, fences and exports WITHOUT the training
+///   math. A single 30-step inner loop at seq 2048 over this 24-layer decoder is hours of ndarray
+///   CPU; the round path's residency class is a property of the state walks (which windows are
+///   read back, folded, emitted and applied), not of the gradients that produced θ. The trainer
+///   goldens own the training math (bit-exact at a toy geometry); this owns the geometry.
+/// - `topk` is the caller's, not the frozen 64 — the committed PAYLOAD is `n_chunks × topk`
+///   values and it crosses the guest boundary as ONE decoded container (the profile wire is a
+///   whole-blob section list, not a chunk-addressed family). At this geometry the frozen
+///   `topk = 64` is ~210 MB of payload per peer per round, which no wasm32 linear memory holds:
+///   that residency is a PAYLOAD-PLANE class, separate from the state-family class this gate
+///   locks down, and it is not fixable guest-side. Driving with a low `topk` keeps the payload
+///   bounded while every state family stays at full ceremony size.
+///
+/// Everything else — the frozen model, the state contract, the pinned `expected_root`, the window
+/// size, the roster shape — is shared with the fleet form by construction.
+#[must_use]
+pub fn ceremony_trainer_config_round_walk(roster: &[PeerId], topk: u64) -> Value {
+    let Value::Map(fields) = ceremony_trainer_config_harness(roster) else {
+        unreachable!("the harness form is a map")
+    };
+    let patched = fields
+        .into_iter()
+        .map(|(k, v)| match (&k, &v) {
+            (Value::Text(name), _) if name == "steps_per_round" => (k, Value::Integer(0u64.into())),
+            (Value::Text(name), Value::Map(profile)) if name == "profile" => {
+                let profile = profile
+                    .iter()
+                    .map(|(pk, pv)| match pk {
+                        Value::Text(f) if f == "topk" => (pk.clone(), Value::Integer(topk.into())),
+                        _ => (pk.clone(), pv.clone()),
+                    })
+                    .collect();
+                (k, Value::Map(profile))
+            }
+            _ => (k, v),
+        })
+        .collect();
+    Value::Map(patched)
+}
+
 /// The real fleet RUN TIMERS + stop condition the ceremony operator calibrates at preflight and
 /// binds into the coordinator config — closing the documented "the fleet operator tunes real
 /// timers at preflight" seam inside this reviewed module instead of at a CLI.
