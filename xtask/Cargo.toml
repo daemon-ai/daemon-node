@@ -21,7 +21,22 @@ serde = { workspace = true }
 # run by maintainers, not the shipped node, so its egress goes through `hf-hub` (revision-pinned; no
 # raw `reqwest::Client` in xtask code — the clippy `disallowed_types` ban is respected) and the
 # `tokenizers` crate does the BPE. Versions match the workspace lock (tokenizers 0.22, hf-hub 0.5).
-daemon-vhc-session = { workspace = true }
+## `tokenize-corpus` needs only the base session crate; `vhc-replay` (below) additionally needs the
+## `harness` feature for the `SandboxedCoordinator` replay driver.
+daemon-vhc-session = { workspace = true, features = ["harness"] }
+# `author-ceremony-genesis`: the FROZEN ceremony genesis authoring library (never reimplemented —
+# this xtask is a thin CLI around `daemon_vhc_testkit::ceremony::ceremony_genesis`).
+daemon-vhc-testkit = { workspace = true }
+# `vhc-replay`: the executable replay/archive verdict command runs BOTH oracle modes (input replay +
+# sandboxed consensus re-derivation) over an on-disk archive. `daemon-vhc-observe` is the
+# harness/oracle tooling seat (it decodes SDK round schemas — never linked by the production graph).
+## `vhc-replay` decodes the run's `AuthorityConfig` (to judge the archive's attested heads) and
+## rebuilds `RecordSig`s; both are re-exported from `daemon-vhc-observe` (the exempt oracle tooling
+## crate), so xtask never takes a direct `sdk-consensus` edge (the dep-direction check treats xtask
+## as production — only the listed harness/tooling crates carry the sdk exemption).
+daemon-vhc-observe = { workspace = true }
+# base64 for the ceremony seeder's `VHC_ENVELOPE_B64` artifact.
+base64 = { workspace = true }
 # `build-guests`: the shared guest-workspace builder (reproducibility remap env + cross-process
 # build lock) — the same code path every wasm-backed test harness builds through, so the manifest
 # this command pins and the bytes the suites rebuild can never diverge on build env.

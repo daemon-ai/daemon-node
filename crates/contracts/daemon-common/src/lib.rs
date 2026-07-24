@@ -783,7 +783,15 @@ impl WireVersion {
     /// typed outcome (activated / refused / left). One additive request arm + one additive
     /// response arm + their CDDL rules; strict-equal `is_compatible` still holds; clients
     /// feature-detect via the `api/43` Hello feature.
-    pub const CURRENT: Self = Self(43);
+    ///
+    /// (v44) additive per-round det-state digest on the vhc run surface — `VhcEvent::RoundOutcome`
+    /// gains a `digest` (the 16-byte post-ingest state digest the worker session already reports,
+    /// which the node previously dropped at the API boundary) and `VhcRunDetail` gains
+    /// `last_round_digest` so a polling client reads the newest round's digest without an event
+    /// subscription. One additive event field + one additive optional response field + their CDDL
+    /// rules; strict-equal `is_compatible` still holds; clients feature-detect via the `api/44`
+    /// Hello feature.
+    pub const CURRENT: Self = Self(44);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

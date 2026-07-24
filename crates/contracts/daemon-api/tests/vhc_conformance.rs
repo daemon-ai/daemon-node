@@ -106,6 +106,11 @@ fn all_events() -> Vec<VhcEvent> {
             committed: 3,
             ingested: 3,
             stalled: false,
+            // wire v44: the per-round post-ingest det-state digest the node now surfaces.
+            digest: [
+                0x56, 0xd8, 0x43, 0xda, 0x34, 0x24, 0xc3, 0xc2, 0x56, 0xdc, 0xfa, 0x23, 0xa6, 0xc9,
+                0x05, 0x09,
+            ],
         },
         VhcEvent::Contribution {
             run_id: "run-1".into(),
@@ -241,6 +246,11 @@ fn vhc_responses_validate() {
         coordinator: "https://api.daemon.ai/api/v1/vhc".into(),
         contribution: contribution(),
         recent_events: all_events(),
+        // wire v44: the newest round's digest surfaced on the snapshot.
+        last_round_digest: Some([
+            0x56, 0xd8, 0x43, 0xda, 0x34, 0x24, 0xc3, 0xc2, 0x56, 0xdc, 0xfa, 0x23, 0xa6, 0xc9,
+            0x05, 0x09,
+        ]),
     };
     let cases: Vec<(&str, ApiResponse)> = vec![
         (

@@ -3731,6 +3731,9 @@ dependencies = [
  "daemon-host",
  "daemon-protocol",
  "daemon-telemetry",
+ "daemon-vhc-proto",
+ "daemon-vhc-session",
+ "serde_json",
  "tokio",
 ]
 
@@ -18862,6 +18865,7 @@ name = "xtask"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "blake3",
  "clap",
  "daemon-api",
@@ -18870,8 +18874,10 @@ dependencies = [
  "daemon-protocol",
  "daemon-vhc-guest-build",
  "daemon-vhc-net",
+ "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-session",
+ "daemon-vhc-testkit",
  "hf-hub 0.5.0",
  "serde",
  "serde_json",

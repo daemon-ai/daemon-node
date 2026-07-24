@@ -18,9 +18,16 @@ daemon-telemetry = { workspace = true }
 daemon-api = { workspace = true }
 daemon-host = { workspace = true }
 daemon-protocol = { workspace = true }
+# `vhc identity` reads the LOCAL base identity from the vhc keystore (no wire call — works with the
+# node stopped); `daemon-vhc-proto` derives the PeerId hex. The default (non-harness) session
+# surface only — the keystore is production, schema-free.
+daemon-vhc-session = { workspace = true }
+daemon-vhc-proto = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# `--json` output for the vhc verbs (stable machine-readable transcripts for the ceremony operator).
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

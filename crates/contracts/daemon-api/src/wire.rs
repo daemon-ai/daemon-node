@@ -2441,20 +2441,20 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v43 (the additive
-    /// `VhcSwitchModule` request + `VhcSwitchOutcome` response — the operator-driven live
-    /// module-upgrade consumption op — on top of v42's `VhcHardwareReport.shared_mb`
-    /// UMA-spillover mirror, v41's crash-consent surface, and v40's `VhcApi` surface).
-    /// Distinct from the transport-envelope [`WIRE_VERSION`] above (= 2), which these additive
-    /// rungs did not touch. Bumping the contract version is a deliberate act — this assertion
-    /// is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v44 (the additive per-round
+    /// `VhcEvent::RoundOutcome.digest` + `VhcRunDetail.last_round_digest` — surfacing the det-state
+    /// digest the node previously dropped — on top of v43's `VhcSwitchModule` request +
+    /// `VhcSwitchOutcome` response, v42's `VhcHardwareReport.shared_mb` UMA-spillover mirror, v41's
+    /// crash-consent surface, and v40's `VhcApi` surface). Distinct from the transport-envelope
+    /// [`WIRE_VERSION`] above (= 2), which these additive rungs did not touch. Bumping the contract
+    /// version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v43() {
+    fn contract_wire_version_is_v44() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(43)
+            daemon_common::WireVersion(44)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(43));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(44));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

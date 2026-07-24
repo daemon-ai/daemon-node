@@ -2048,11 +2048,24 @@ impl VhcApi for VhcService {
             .store
             .recent_events(&run_id, EVENT_WINDOW)
             .map_err(map)?;
+        // Surface the newest round's digest on the snapshot (wire v44): the highest-round
+        // `RoundOutcome` in the window carries it, so a polling `--watch` client collects the
+        // digest-agreement transcript without an event subscription. The node decides; the app
+        // renders — this is a projection of events the node already owns, never re-derived.
+        let last_round_digest = recent_events
+            .iter()
+            .filter_map(|e| match e {
+                VhcEvent::RoundOutcome { round, digest, .. } => Some((*round, *digest)),
+                _ => None,
+            })
+            .max_by_key(|(round, _)| *round)
+            .map(|(_, digest)| digest);
         Ok(Some(VhcRunDetail {
             coordinator: run.coordinator.clone(),
             summary: run_summary(run),
             contribution,
             recent_events,
+            last_round_digest,
         }))
     }
 
@@ -2662,6 +2675,7 @@ fn translate(ev: &protocol::Event, run_id: &str) -> Option<VhcEvent> {
             committed,
             ingested,
             stalled,
+            digest,
             ..
         } => Some(VhcEvent::RoundOutcome {
             run_id: run_id.to_string(),
@@ -2669,6 +2683,9 @@ fn translate(ev: &protocol::Event, run_id: &str) -> Option<VhcEvent> {
             committed: *committed,
             ingested: *ingested,
             stalled: *stalled,
+            // Surface the worker session's post-ingest det-state digest (§5.6) — the node used to
+            // drop it here with a `..` pattern; it is the G-2 digest-agreement evidence (wire v44).
+            digest: *digest,
         }),
         protocol::Event::Warning { class, detail } => Some(VhcEvent::Warning {
             run_id: run_id.to_string(),

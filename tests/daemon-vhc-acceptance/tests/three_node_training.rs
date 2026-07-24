@@ -13,8 +13,8 @@ mod harness;
 use std::time::Duration;
 
 use harness::{
-    assert_digests_agree, base_peer, join, journal_digests, leave, seed_corpus_fs, spawn_node,
-    start_cluster_on, wait_rounds, NodeSpec,
+    assert_api_digest_matches_journal, assert_digests_agree, base_peer, join, journal_digests,
+    leave, run_detail, seed_corpus_fs, spawn_node, start_cluster_on, wait_rounds, NodeSpec,
 };
 
 const RUN: &str = "acceptance-baseline";
@@ -78,6 +78,13 @@ async fn three_node_training_converges_with_agreeing_digests() {
     let timeout = Duration::from_secs(180);
     wait_rounds(&trainer_a, RUN, rounds, timeout).await;
     wait_rounds(&trainer_b, RUN, rounds, timeout).await;
+
+    // wire v44: the per-round det digest surfaced on the product API agrees with the durable
+    // journal (the G-2 evidence, collected through the node's public API — the node no longer
+    // drops the digest at the boundary, and the snapshot carries `last_round_digest`).
+    if let Some(detail) = run_detail(&trainer_a, RUN).await {
+        assert_api_digest_matches_journal(&detail, &journal_digests(&trainer_a, RUN));
+    }
 
     // Graceful leave (drains + settles the journals).
     leave(&trainer_a, RUN, daemon_api::VhcLeaveMode::Graceful, "op-la").await;

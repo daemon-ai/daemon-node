@@ -21,6 +21,7 @@ mod member;
 mod model;
 mod orchestration;
 mod session;
+mod vhc;
 
 /// Route a parsed top-level command to its handler.
 pub(crate) async fn dispatch(client: &ApiClient, command: Command) -> anyhow::Result<()> {
@@ -32,6 +33,7 @@ pub(crate) async fn dispatch(client: &ApiClient, command: Command) -> anyhow::Re
         Command::Member { cmd } => member::run(client, cmd).await,
         Command::Contact { cmd } => contact::run(client, cmd).await,
         Command::Directory { cmd } => directory::run(client, cmd).await,
+        Command::Vhc { cmd } => vhc::run(client, cmd).await,
         flat => {
             let Some(flat) = session::try_run(client, flat).await? else {
                 return Ok(());
