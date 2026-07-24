@@ -46,12 +46,11 @@ use serde::{Deserialize, Serialize};
 
 use daemon_vhc_observe::journal::archive::{ChainHead, RecordArchive};
 use daemon_vhc_observe::{
-    replay_consensus_from_archive, AttestedHead, ConsensusReplayError, ReplayError,
-    ReplicationPolicy, RetentionPolicy,
+    replay_consensus_from_archive, AttestedHead, AuthorityConfig, ConsensusReplayError, RecordSig,
+    ReplayError, ReplicationPolicy, RetentionPolicy,
 };
 use daemon_vhc_proto::genesis::GenesisEnvelope;
 use daemon_vhc_proto::{blake3_hash, from_canonical_slice, Hash, PeerId, Signature};
-use daemon_vhc_sdk_consensus::{AuthorityConfig, RecordSig};
 use daemon_vhc_session::replay_sandbox::SandboxedCoordinator;
 
 /// The parsed `vhc-replay` inputs.

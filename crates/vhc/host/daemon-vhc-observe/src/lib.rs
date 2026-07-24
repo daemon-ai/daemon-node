@@ -44,6 +44,11 @@ pub use journal::{
     RotatePolicy, SidecarError,
 };
 pub use log::{MessageKind, MessageLog};
+// Re-exported so tooling (the `xtask vhc-replay` archive verdict) can judge an archive's attested
+// heads + rebuild record signatures WITHOUT taking a direct edge to the schema/consensus SDK: this
+// oracle crate already links it under a documented dep-direction exemption, so consumers reach these
+// consensus-authority types through the tooling seat.
+pub use daemon_vhc_sdk_consensus::{AuthorityConfig, RecordSig};
 pub use replay::{
     genesis_seed, logged_round_records, replay_capture, replay_from_state, CoordinatorSandbox,
     ReplayDivergence, ReplayError, ReplayReport,

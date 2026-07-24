@@ -18876,7 +18876,6 @@ dependencies = [
  "daemon-vhc-net",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
- "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "daemon-vhc-testkit",
  "hf-hub 0.5.0",

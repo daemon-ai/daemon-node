@@ -30,11 +30,11 @@ daemon-vhc-testkit = { workspace = true }
 # `vhc-replay`: the executable replay/archive verdict command runs BOTH oracle modes (input replay +
 # sandboxed consensus re-derivation) over an on-disk archive. `daemon-vhc-observe` is the
 # harness/oracle tooling seat (it decodes SDK round schemas — never linked by the production graph).
+## `vhc-replay` decodes the run's `AuthorityConfig` (to judge the archive's attested heads) and
+## rebuilds `RecordSig`s; both are re-exported from `daemon-vhc-observe` (the exempt oracle tooling
+## crate), so xtask never takes a direct `sdk-consensus` edge (the dep-direction check treats xtask
+## as production — only the listed harness/tooling crates carry the sdk exemption).
 daemon-vhc-observe = { workspace = true }
-# `vhc-replay` decodes the run's `AuthorityConfig` (to judge the archive's attested heads) and
-# rebuilds `RecordSig`s. xtask is maintainer tooling (not a production host crate), so linking the
-# schema/consensus SDK is outside the host→sdk dep-check prohibition.
-daemon-vhc-sdk-consensus = { workspace = true }
 # base64 for the ceremony seeder's `VHC_ENVELOPE_B64` artifact.
 base64 = { workspace = true }
 # `build-guests`: the shared guest-workspace builder (reproducibility remap env + cross-process
