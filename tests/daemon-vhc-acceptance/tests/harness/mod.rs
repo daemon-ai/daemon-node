@@ -252,7 +252,25 @@ pub fn spawn_node(spec: &NodeSpec<'_>) -> Node {
 
 /// [`spawn_node`] with extra `[vhc]`-scoped TOML appended to the node config (e.g. the
 /// dual-plane gate's `[vhc.iroh]` table) — additive, so the shared spec shape stays untouched.
+/// The owner budget defaults to the permissive `unbounded = true` posture (most gates are about
+/// transport / restore / upgrade, not arbitration); a gate that must exercise the FINITE owner
+/// ledgers the live node runs (the coordinator+trainer duty arbitration) uses
+/// [`spawn_node_with_budget`] instead.
 pub fn spawn_node_with(spec: &NodeSpec<'_>, extra_vhc_toml: &str) -> Node {
+    spawn_node_with_budget(spec, extra_vhc_toml, "unbounded = true\n")
+}
+
+/// [`spawn_node_with`] with an explicit `[vhc.owner_budget]` body (the TOML that follows the
+/// `[vhc.owner_budget]` header — e.g. `"duty_pct = 100\n"` for a finite ledger, or
+/// `"unbounded = true\n"` for the permissive default). This is the seam that lets a gate run
+/// against the SAME finite arbitration ledgers the shipped node derives, so a defect in owner
+/// admission (e.g. a coordinator seat starving its co-located trainer on the duty ledger) is
+/// caught by the gate instead of only on real hardware.
+pub fn spawn_node_with_budget(
+    spec: &NodeSpec<'_>,
+    extra_vhc_toml: &str,
+    owner_budget_body: &str,
+) -> Node {
     let data_dir = tempfile::tempdir().expect("node data dir");
     let socket = data_dir.path().join("api.sock");
     // Pre-create the identity keystore so the harness can read the node's base pubkey BEFORE the
@@ -292,7 +310,11 @@ pub fn spawn_node_with(spec: &NodeSpec<'_>, extra_vhc_toml: &str) -> Node {
             toml.push('\n');
         }
     }
-    toml.push_str("[vhc.owner_budget]\nunbounded = true\n");
+    toml.push_str("[vhc.owner_budget]\n");
+    toml.push_str(owner_budget_body);
+    if !owner_budget_body.ends_with('\n') {
+        toml.push('\n');
+    }
     toml.push_str("[vhc.registry]\n");
     writeln!(toml, "base = {:?}", spec.registry_base).unwrap();
     toml.push_str("[vhc.retry]\n");

@@ -270,6 +270,13 @@ pub struct VhcConfig {
     pub payload_dir: String,
     /// Data/artifact cache budget in GiB (the artifact LRU bound, §8, RUN-4).
     pub data_cache_gb: u32,
+    /// The worker's `AssessRun` reply deadline, in SECONDS (the supervisor's per-assess watchdog,
+    /// distinct from the 30 s chatty-op watchdog). Assess is compute-bound by design — device
+    /// bring-up + first-run kernel/DXIL compilation + the seed-init `expected_root` reproduction —
+    /// and emits no intermediate events, so it needs a generous, minutes-scale budget or a healthy
+    /// GPU-lane / first-join assess is killed as a false transport fault. Default 300 s.
+    #[serde(default = "default_assess_timeout_secs")]
+    pub assess_timeout_secs: u64,
     /// Default participation policy for joined runs.
     pub default_policy: VhcPolicyConfig,
     /// Module-trust posture.
@@ -317,6 +324,12 @@ fn default_seat_role() -> String {
     "coordinator".to_string()
 }
 
+/// The default `AssessRun` reply deadline (seconds) — generous + minutes-scale so a compute-bound
+/// GPU-lane / first-join assess is never killed by the chatty-op watchdog (the RTX 5090 STOP).
+fn default_assess_timeout_secs() -> u64 {
+    300
+}
+
 impl Default for VhcConfig {
     fn default() -> Self {
         // Mirrors the spec §10.6 TOML defaults verbatim.
@@ -329,6 +342,7 @@ impl Default for VhcConfig {
             identity_dir: String::new(),
             payload_dir: String::new(),
             data_cache_gb: 50,
+            assess_timeout_secs: default_assess_timeout_secs(),
             default_policy: VhcPolicyConfig::default(),
             module_trust: ModuleTrust::Signed,
             coordinator_allowlist: vec!["https://api.daemon.ai/api/v1/vhc".to_string()],
@@ -356,6 +370,8 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.worker_path, "daemon-vhc-worker");
         assert_eq!(cfg.data_cache_gb, 50);
+        // The assess watchdog defaults generous (minutes) — distinct from the 30 s chatty-op one.
+        assert_eq!(cfg.assess_timeout_secs, 300);
         assert_eq!(cfg.default_policy.mode, PolicyMode::Idle);
         assert_eq!(cfg.default_policy.duty_cycle_pct, 100);
         assert_eq!(cfg.module_trust, ModuleTrust::Signed);
@@ -408,8 +424,28 @@ mod tests {
         // Omitted keys keep their defaults.
         assert_eq!(cfg.worker_path, "daemon-vhc-worker");
         assert_eq!(cfg.data_cache_gb, 50);
+        assert_eq!(cfg.assess_timeout_secs, 300);
         assert_eq!(cfg.default_policy.vram_cap_mb, 0);
         assert_eq!(cfg.iroh.relays, "default");
+    }
+
+    #[test]
+    fn assess_timeout_secs_extracts_and_overrides() {
+        // Default when omitted (the generous minutes-scale assess watchdog).
+        assert_eq!(VhcConfig::default().assess_timeout_secs, 300);
+
+        // An explicit `[vhc] assess_timeout_secs` overrides it additively (e.g. a slow first-run
+        // GPU box that wants an even longer seed-init budget).
+        let toml = r#"
+            [vhc]
+            enabled = true
+            assess_timeout_secs = 600
+        "#;
+        let cfg: VhcConfig = Figment::new()
+            .merge(Toml::string(toml))
+            .extract_inner("vhc")
+            .expect("extract [vhc]");
+        assert_eq!(cfg.assess_timeout_secs, 600);
     }
 
     #[test]

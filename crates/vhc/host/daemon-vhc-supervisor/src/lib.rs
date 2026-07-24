@@ -53,8 +53,19 @@ pub struct TrainClientConfig {
     pub env: Vec<(String, String)>,
     /// How long to wait for `Event::Ready` after spawning.
     pub spawn_timeout: Duration,
-    /// How long to wait for a command reply before declaring a transport fault.
+    /// How long to wait for a **chatty** command reply before declaring a transport fault (the
+    /// per-event watchdog window: probe / join-ack / ping / throttle / switch — ops that either
+    /// reply promptly or stream progress events that keep feeding the watchdog).
     pub op_timeout: Duration,
+    /// How long to wait for an [`AssessRun`](protocol::Command::AssessRun) reply. Assess is
+    /// compute-bound BY DESIGN — device bring-up + first-run kernel/DXIL compilation + the
+    /// seed-init `expected_root` reproduction (a 786 M-param expansion) — and emits no
+    /// intermediate events, so the chatty-op [`op_timeout`](Self::op_timeout) watchdog would kill
+    /// a healthy GPU-lane assess (the Windows RTX 5090 fleet-smoke STOP: "no reply within 30s").
+    /// It gets its own generous, config-surfaced deadline (`[vhc] assess_timeout_secs`), distinct
+    /// from the chatty-op watchdog. Applies to standalone trainers on first join too, not only
+    /// co-located trainers.
+    pub assess_timeout: Duration,
     /// Crash-loop meltdown: max restarts allowed within [`TrainClientConfig::restart_window`].
     pub max_restarts: u32,
     /// The sliding window over which [`TrainClientConfig::max_restarts`] is counted.
@@ -73,6 +84,10 @@ impl TrainClientConfig {
             env: Vec::new(),
             spawn_timeout: Duration::from_secs(30),
             op_timeout: Duration::from_secs(30),
+            // Assess is compute-bound (device bring-up + kernel compile + seed-init expansion): a
+            // generous default measured in minutes, well clear of a cold GPU-lane first assess,
+            // and overridable via `[vhc] assess_timeout_secs`.
+            assess_timeout: Duration::from_secs(300),
             max_restarts: 3,
             restart_window: Duration::from_secs(60),
             respawn_backoff: Duration::from_millis(200),
@@ -204,12 +219,13 @@ impl TrainSupervisor {
         envelope: Vec<u8>,
         role: Option<String>,
     ) -> Result<Eligibility, TrainClientError> {
-        self.exchange(
+        self.exchange_with_timeout(
             Command::AssessRun {
                 envelope,
                 role,
                 switch_target: None,
             },
+            self.inner.cfg.assess_timeout,
             |ev| match ev {
                 Event::Assessed(elig) => Some(Ok(elig)),
                 _ => None,
@@ -228,12 +244,13 @@ impl TrainSupervisor {
         role: Option<String>,
         target: protocol::SwitchTarget,
     ) -> Result<Eligibility, TrainClientError> {
-        self.exchange(
+        self.exchange_with_timeout(
             Command::AssessRun {
                 envelope,
                 role,
                 switch_target: Some(Box::new(target)),
             },
+            self.inner.cfg.assess_timeout,
             |ev| match ev {
                 Event::Assessed(elig) => Some(Ok(elig)),
                 _ => None,
@@ -442,9 +459,25 @@ impl TrainSupervisor {
 
     /// Send a command and await the first event `extract` accepts, mapping `Event::Error` frames to
     /// [`TrainClientError::Worker`] and tearing the worker down on a fault that warrants a respawn.
+    /// Uses the chatty-op watchdog ([`TrainClientConfig::op_timeout`]); a compute-bound op with its
+    /// own deadline (assess) goes through [`exchange_with_timeout`](Self::exchange_with_timeout).
     async fn exchange<T>(
         &self,
         cmd: Command,
+        extract: impl Fn(Event) -> Option<Result<T, TrainClientError>>,
+    ) -> Result<T, TrainClientError> {
+        self.exchange_with_timeout(cmd, self.inner.cfg.op_timeout, extract)
+            .await
+    }
+
+    /// [`exchange`](Self::exchange) with an explicit per-op reply deadline. The watchdog window is
+    /// per-received-event (`round_trip` grants a fresh window on every event), so a long op that
+    /// streams progress stays fed on the short `op_timeout`; a long op that emits NOTHING until it
+    /// replies (assess) needs the generous `timeout` here or the watchdog kills a healthy call.
+    async fn exchange_with_timeout<T>(
+        &self,
+        cmd: Command,
+        timeout: Duration,
         extract: impl Fn(Event) -> Option<Result<T, TrainClientError>>,
     ) -> Result<T, TrainClientError> {
         let mut guard = self.inner.worker.lock().await;
@@ -452,9 +485,7 @@ impl TrainSupervisor {
             *guard = Some(self.inner.spawn_worker().await?);
         }
         let worker = guard.as_mut().expect("worker present after spawn");
-        let result = worker
-            .round_trip(&cmd, self.inner.cfg.op_timeout, &extract)
-            .await;
+        let result = worker.round_trip(&cmd, timeout, &extract).await;
         if let Err(ref failure) = result {
             if failure.should_replace_worker() {
                 if let Some(mut dead) = guard.take() {
@@ -727,6 +758,21 @@ mod tests {
         let cfg = TrainClientConfig::new("/usr/bin/daemon-vhc");
         assert_eq!(cfg.max_restarts, 3);
         assert_eq!(cfg.spawn_timeout, Duration::from_secs(30));
+    }
+
+    /// Assess gets its own generous, minutes-scale deadline — distinct from (and longer than) the
+    /// 30 s chatty-op watchdog that killed the RTX 5090 GPU-lane seed-init assess. This is the
+    /// config default half of the fix; the `[vhc] assess_timeout_secs` override is plumbed in
+    /// `daemon-vhc-session`'s config layer.
+    #[test]
+    fn assess_timeout_defaults_generous_and_distinct_from_op_watchdog() {
+        let cfg = TrainClientConfig::new("/usr/bin/daemon-vhc");
+        assert_eq!(cfg.op_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.assess_timeout, Duration::from_secs(300));
+        assert!(
+            cfg.assess_timeout > cfg.op_timeout,
+            "assess must get a longer deadline than the chatty-op watchdog"
+        );
     }
 
     /// A bogus worker binary makes every spawn fail; the supervisor must trip the crash-loop
