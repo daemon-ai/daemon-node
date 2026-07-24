@@ -578,7 +578,7 @@ impl VhcService {
                     self.store.mint_incarnation()?
                 },
             };
-            let charge = self.derive_charge(&run.eligibility, &run.policy);
+            let charge = self.derive_charge(&run.eligibility, &run.policy, &id.role);
             let priority = self.store.run_priority(&run.run_id)?;
             if let Err(refusal) = self.admit_placed(&id, charge, priority) {
                 if self.worker_factory.is_some() {
@@ -898,7 +898,7 @@ impl VhcService {
             },
             instance: self.store.mint_incarnation()?,
         };
-        let charge = self.derive_charge(&run.eligibility, &run.policy);
+        let charge = self.derive_charge(&run.eligibility, &run.policy, &id.role);
         let priority = self.store.run_priority(&run.run_id)?;
         if let Err(refusal) = self.admit_placed(&id, charge, priority) {
             if self.worker_factory.is_some() {
@@ -1087,7 +1087,7 @@ impl VhcService {
             role: "trainer".to_string(),
             instance,
         };
-        let charge = self.derive_charge(&eligibility, policy);
+        let charge = self.derive_charge(&eligibility, policy, &id.role);
         let priority = self.store.run_priority(run_id).unwrap_or(0);
         if let Err(refusal) = self.admit_placed(&id, charge, priority) {
             warn_co!(format!(
@@ -1161,7 +1161,25 @@ impl VhcService {
     /// when no device claim is present (the tightening overlay, never an inflation); `duty_cycle_pct`
     /// is the duty charge. Net/disk tiers are left to the assess claim (not separately reported
     /// here yet). The device id is placed by [`Self::admit_placed`] (first-fit) — a placeholder here.
-    fn derive_charge(&self, eligibility: &VhcEligibility, policy: &VhcPolicy) -> InstanceCharge {
+    ///
+    /// **Duty is the ACCELERATOR's duty-cycle ledger** (`OwnerBudget.duty_pct`, 100 = one full
+    /// accelerator-duty). A **coordinator/consensus** role-instance (`role == seat_role`) runs
+    /// ONLY the consensus wasm — it performs no training compute on the accelerator — so it claims
+    /// **zero** accelerator duty by design (decisions D6; the seat role's lane is host-side
+    /// consensus, not the training lane). This is what lets a single-peer trainer+coordinator box
+    /// admit BOTH role-instances under the default 100% duty ledger: the coordinator seat instance
+    /// claims 0% and its co-located trainer claims the policy duty, so the seat no longer starves
+    /// its own trainer (the M4 fleet-smoke duty-arbitration defect — a full-duty coordinator
+    /// exhausted the ledger and refused the co-located trainer). A non-seat (trainer) role keeps
+    /// the policy duty. The device/host tiers are the assess claim verbatim regardless of role —
+    /// the consensus module's own (near-zero) device footprint stands, never a silent zero
+    /// fall-through (D-10).
+    fn derive_charge(
+        &self,
+        eligibility: &VhcEligibility,
+        policy: &VhcPolicy,
+        role: &str,
+    ) -> InstanceCharge {
         const MIB: u64 = 1 << 20;
         let claim = |key: &str| {
             eligibility
@@ -1176,6 +1194,13 @@ impl VhcService {
         // estimate — NEVER a silent zero fall-through (D-10).
         let cap_bytes = u64::from(policy.vram_cap_mb).saturating_mul(MIB);
         let device_bytes = claim("claim_device_bytes").unwrap_or(cap_bytes);
+        // The consensus coordinator role claims no accelerator duty (see the doc-comment): duty is
+        // the accelerator's ledger and the seat role does no accelerator compute.
+        let duty_pct = if role == self.config.seat_role {
+            0
+        } else {
+            policy.duty_cycle_pct.min(100) as u8
+        };
         InstanceCharge {
             device: String::new(),
             tiers: ClaimTiers {
@@ -1188,7 +1213,7 @@ impl VhcService {
             disk_bytes: 0,
             net_up_bps: 0,
             net_down_bps: 0,
-            duty_pct: policy.duty_cycle_pct.min(100) as u8,
+            duty_pct,
         }
     }
 
@@ -2354,7 +2379,7 @@ impl VhcApi for VhcService {
                             .map_err(|e| VhcError::from(e).to_api())?
                     },
                 };
-                let charge = self.derive_charge(&eligibility, &policy);
+                let charge = self.derive_charge(&eligibility, &policy, &id.role);
                 let priority = self
                     .store
                     .run_priority(&run_id)
@@ -2591,7 +2616,7 @@ impl VhcApi for VhcService {
                 .map(|e| (e.id.clone(), e.worker.clone()))
         };
         if let Some((id, worker)) = entry_worker {
-            let charge = self.derive_charge(&run.eligibility, &run.policy);
+            let charge = self.derive_charge(&run.eligibility, &run.policy, &id.role);
             let priority = self.store.run_priority(&run_id).map_err(map)?;
             if let Err(refusal) = self.admit_placed(&id, charge, priority) {
                 return Err(VhcError::from(refusal).to_api());
@@ -2951,5 +2976,218 @@ mod tests {
             &[String::new()],
             "https://coord.example/api/v1/vhc"
         ));
+    }
+}
+
+/// Defect — the co-located trainer duty-arbitration fix (the M4 fleet-smoke blocker): a
+/// seat-holding node with `coordinator_trains = true` must admit BOTH its coordinator seat
+/// role-instance AND its co-located trainer role-instance under the node's DEFAULT (finite) owner
+/// duty ledger — the coordinator/consensus role claiming zero accelerator duty is what makes room
+/// for the trainer's full duty. These tests drive the SAME arbitration code path the live node
+/// runs ([`VhcService::derive_charge`] → [`VhcService::admit_placed`] → [`OwnerArbiter::admit`])
+/// against the exact `OwnerBudget::from_config` default the M4 used (`duty_pct = 100`), so the
+/// pre-fix behavior (a full-duty coordinator exhausting the ledger and refusing its own trainer)
+/// is caught here rather than only on real hardware.
+#[cfg(test)]
+mod arbitration_tests {
+    use super::*;
+    use daemon_api::{VhcEligibility, VhcPolicy, VhcPolicyMode};
+    use daemon_vhc_session::config::OwnerBudgetConfig;
+
+    /// A worker seam that never spawns a subprocess — these tests exercise only the node-side
+    /// charge derivation + arbiter admission (no worker traffic).
+    struct NoopWorker;
+
+    #[async_trait]
+    impl WorkerControl for NoopWorker {
+        async fn probe(&self) -> Result<Hardware, VhcError> {
+            Ok(Hardware::default())
+        }
+        async fn assess(
+            &self,
+            _envelope: Vec<u8>,
+            _role: Option<String>,
+        ) -> Result<Eligibility, VhcError> {
+            Ok(Eligibility::default())
+        }
+        async fn join(
+            &self,
+            _run_id: String,
+            _coordinator: String,
+            _credentials: Vec<u8>,
+            _policy: JoinPolicy,
+            _admitted_tuple: Option<protocol::AdmittedTuple>,
+        ) -> Result<(), VhcError> {
+            Ok(())
+        }
+        async fn leave(&self, _run_id: String, _mode: LeaveMode) -> Result<(), VhcError> {
+            Ok(())
+        }
+        async fn throttle(
+            &self,
+            _vram_cap_mb: Option<u32>,
+            _duty_cycle_pct: Option<u8>,
+            _paused: bool,
+        ) -> Result<(), VhcError> {
+            Ok(())
+        }
+    }
+
+    /// A claim-bearing eligibility (the discovery/assess input shape `derive_charge` reads):
+    /// `device`/`host` bytes onto the claim-shaped headroom keys.
+    fn eligibility(device: i64, host: i64) -> VhcEligibility {
+        let mut headroom = BTreeMap::new();
+        headroom.insert("claim_device_bytes".to_string(), device);
+        headroom.insert("claim_host_bytes".to_string(), host);
+        VhcEligibility {
+            eligible: true,
+            reasons: Vec::new(),
+            headroom,
+        }
+    }
+
+    fn policy(duty: u32) -> VhcPolicy {
+        VhcPolicy {
+            mode: VhcPolicyMode::Always,
+            vram_cap_mb: 0,
+            duty_cycle_pct: duty,
+            schedule: None,
+        }
+    }
+
+    /// A seat-claiming, coordinator-training node over `budget` — the single-peer trainer+coordinator
+    /// shape (the ceremony's M4/Strix box in miniature).
+    fn coordinator_trainer_service(budget: OwnerBudget) -> VhcService {
+        VhcService::new(VhcServiceParts {
+            config: VhcConfig {
+                enabled: true,
+                seat_claim: true,
+                coordinator_trains: true,
+                ..VhcConfig::default()
+            },
+            store: VhcStore::open_in_memory().unwrap(),
+            worker: Arc::new(NoopWorker),
+            feed: None,
+            discovery: None,
+            budget: Some(budget),
+            worker_factory: Some(Arc::new(|| Arc::new(NoopWorker) as Arc<dyn WorkerControl>)),
+            identity_dir: None,
+            seat_directory: None,
+        })
+    }
+
+    fn instance_id(role: &str, instance: u64) -> RoleInstanceId {
+        RoleInstanceId {
+            run_id: [0x5A; 32],
+            epoch: 0,
+            role: role.to_string(),
+            instance,
+        }
+    }
+
+    /// The DEFAULT finite owner budget the live node derives (`OwnerBudget::from_config` with the
+    /// probe, no `[vhc.owner_budget]` configured) grants exactly ONE full accelerator-duty
+    /// (`duty_pct = 100`) — the ledger the M4 self-coordinated run ran under.
+    #[test]
+    fn default_owner_budget_grants_one_full_accelerator_duty() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        assert_eq!(
+            budget.duty_pct, 100,
+            "the default duty ledger is one full accelerator-duty"
+        );
+    }
+
+    /// The seat-holding node admits BOTH role-instances under the default 100% duty ledger: the
+    /// coordinator/consensus seat instance claims ZERO accelerator duty (it runs only the consensus
+    /// wasm), so its co-located trainer's full-duty claim still fits. Pre-fix the coordinator also
+    /// claimed the policy's 100% duty and exhausted the ledger, refusing its own trainer
+    /// (`duty cycle exhausted: requested 100%, remaining 0%`) — the exact M4 fleet-smoke STOP.
+    #[test]
+    fn seat_holder_admits_coordinator_and_co_located_trainer_under_default_duty_ledger() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        let svc = coordinator_trainer_service(budget);
+
+        // The coordinator seat role-instance (role == seat_role): consensus wasm, no device
+        // footprint, ZERO accelerator duty by design.
+        let coord_charge =
+            svc.derive_charge(&eligibility(0, 64 << 20), &policy(100), "coordinator");
+        assert_eq!(
+            coord_charge.duty_pct, 0,
+            "the consensus coordinator claims zero accelerator duty"
+        );
+        svc.admit_placed(&instance_id("coordinator", 1), coord_charge, 100)
+            .expect("the coordinator seat instance admits");
+
+        // The co-located trainer role-instance: the policy duty (full), a real device+host claim.
+        let trainer_charge =
+            svc.derive_charge(&eligibility(5 << 30, 8 << 30), &policy(100), "trainer");
+        assert_eq!(
+            trainer_charge.duty_pct, 100,
+            "the co-located trainer claims the policy duty"
+        );
+        svc.admit_placed(&instance_id("trainer", 2), trainer_charge, 100)
+            .expect(
+                "the co-located trainer admits under the SAME finite duty ledger the live node runs",
+            );
+
+        // Both live; the duty ledger is exactly spent (coordinator 0% + trainer 100% == 100%).
+        let snap = svc.arbiter().remaining();
+        assert_eq!(snap.instances, 2, "both role-instances are reserved");
+        assert_eq!(
+            snap.duty_pct, 0,
+            "the trainer consumed the whole duty ledger"
+        );
+    }
+
+    /// The negative: over-budget refusal still works — a SECOND full-duty (trainer) role-instance
+    /// on the same box exceeds the 100% duty ledger and is refused TYPED (`DutyExhausted`), so the
+    /// fix widens admission for the legitimate coordinator+trainer pair without disabling the
+    /// ledger's protection.
+    #[test]
+    fn over_budget_duty_is_still_refused_typed() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        let svc = coordinator_trainer_service(budget);
+
+        // Coordinator (0%) + one full-duty trainer (100%) fill the ledger.
+        let coord = svc.derive_charge(&eligibility(0, 64 << 20), &policy(100), "coordinator");
+        svc.admit_placed(&instance_id("coordinator", 1), coord, 100)
+            .expect("coordinator admits");
+        let trainer = svc.derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer");
+        svc.admit_placed(&instance_id("trainer", 2), trainer, 100)
+            .expect("first trainer admits");
+
+        // A second full-duty trainer has no duty left — a typed refusal, never a silent admit.
+        let extra = svc.derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer");
+        let refusal = svc
+            .admit_placed(&instance_id("trainer", 3), extra, 100)
+            .expect_err("a second full-duty trainer exceeds the 100% duty ledger");
+        assert!(
+            matches!(
+                refusal,
+                AdmitRefusal::DutyExhausted {
+                    requested: 100,
+                    remaining: 0
+                }
+            ),
+            "expected a typed duty-exhausted refusal, got {refusal:?}"
+        );
     }
 }

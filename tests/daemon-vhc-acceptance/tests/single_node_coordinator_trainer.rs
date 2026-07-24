@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use harness::{
     assert_api_digests_cover_and_match_journal, base_peer, collect_api_digests, join,
-    journal_digests, leave, seed_corpus_fs, spawn_node_with, start_cluster_membership, wait_rounds,
-    NodeSpec,
+    journal_digests, leave, seed_corpus_fs, spawn_node_with_budget, start_cluster_membership,
+    wait_rounds, NodeSpec,
 };
 
 const RUN: &str = "acceptance-single-peer";
@@ -39,7 +39,18 @@ async fn single_node_coordinator_and_trainer_completes_rounds() {
 
     // ONE box: coordinator seat + its own trainer. `coordinator_trains` opts a seat-holding node
     // into ALSO running a trainer role-instance for the same run (defect D).
-    let node = spawn_node_with(
+    //
+    // Crucially this gate runs against a FINITE owner budget with exactly ONE full accelerator-duty
+    // (`duty_pct = 100`) — the SAME ledger the shipped node derives by default (`from_config`),
+    // NOT the harness's permissive `unbounded = true`. That is what makes this gate exercise the
+    // real owner-arbitration path the live M4/Windows boxes ran: the seat-holding node must admit
+    // BOTH its coordinator seat instance (which claims zero accelerator duty — consensus only) AND
+    // its co-located trainer (full duty) under a single 100% duty ledger. Pre-fix the coordinator
+    // claimed the full 100% duty and starved its own trainer (`duty cycle exhausted: requested
+    // 100%, remaining 0%` → peers=0, 0 rounds), so this gate would fail; the device/host ledgers
+    // are sized large so DUTY is the exercised constraint (the arbitration honesty gap the
+    // fleet-smoke exposed — the gate previously ran unbounded and never touched the duty ledger).
+    let node = spawn_node_with_budget(
         &NodeSpec {
             name: "single-peer",
             registry_base: &base_url,
@@ -50,6 +61,7 @@ async fn single_node_coordinator_and_trainer_completes_rounds() {
             initial_backoff_ms: 0,
         },
         "coordinator_trains = true\n",
+        "duty_pct = 100\nhost_ram_mb = 131072\n\n[vhc.owner_budget.device_memory_mb]\n\"gpu:0\" = 131072\n",
     );
 
     let bases = [base_peer(&node)];

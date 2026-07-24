@@ -3057,8 +3057,13 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                     cfg.vhc.data_cache_gb,
                 );
                 let presign_env_for_factory = presign_env.clone();
+                // The compute-bound `AssessRun` deadline (`[vhc] assess_timeout_secs`, default
+                // 300 s) — distinct from the 30 s chatty-op watchdog, so a GPU-lane / first-join
+                // seed-init assess is never killed as a false transport fault (the RTX 5090 STOP).
+                let assess_timeout = std::time::Duration::from_secs(cfg.vhc.assess_timeout_secs);
                 let worker_cfg = |path: &str| {
                     let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(path);
+                    wc.assess_timeout = assess_timeout;
                     wc.env.push((
                         daemon_vhc_session::keystore::IDENTITY_DIR_ENV.to_string(),
                         identity_dir.display().to_string(),
@@ -3088,6 +3093,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 let factory_run_dir = run_dir.clone();
                 let worker_factory: daemon_vhc_node::service::WorkerFactory = Arc::new(move || {
                     let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(&worker_path);
+                    wc.assess_timeout = assess_timeout;
                     wc.env.push((
                         daemon_vhc_session::keystore::IDENTITY_DIR_ENV.to_string(),
                         factory_identity_dir.display().to_string(),
