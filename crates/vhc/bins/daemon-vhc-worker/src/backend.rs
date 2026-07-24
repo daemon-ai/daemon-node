@@ -1334,6 +1334,18 @@ pub(crate) fn role_binding(
     // `state_chunk_size` the streamed det-lane fold runs under (`None` = no host-side state).
     if let Some(sc) = &genesis.env.state_contract {
         run.state_chunk_size = sc.chunk_size;
+        // Disk-back the state store under the durable run-state home (design §8.1): the retained
+        // det-lane roots (≈14.65 GiB at the ceremony tier) live on disk, not the memory-floor
+        // peer's unified RAM. Absent a run-state home (ephemeral/dev), the store keeps its
+        // resident RAM backing.
+        run.state_dir = daemon_vhc_session::journal_home::run_dir_from_env().map(|root| {
+            daemon_vhc_session::journal_home::state_dir(
+                &root,
+                &genesis.env.run.run_label,
+                &genesis.worker_role,
+                incarnation,
+            )
+        });
     }
 
     // Inbound trust: the base identities the genesis names — never ambient config.

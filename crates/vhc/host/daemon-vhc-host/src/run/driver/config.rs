@@ -126,6 +126,13 @@ pub struct RunConfig {
     /// [`daemon_vhc_proto::STATE_RETAIN_ROOTS_DEFAULT`] — the current round base and the
     /// freshly sealed round.
     pub state_retain_roots: u64,
+    /// The per-instance **state-chunk spill directory** (design §8.1): when `Some`, the host
+    /// state store spills canonical det-lane chunk BYTES here (`<dir>/<blake3-hex>`) and keeps
+    /// only the index (lengths/refcounts/seal order) resident, so the retained roots live on disk
+    /// instead of RAM — mandatory at the ceremony tier where the retained footprint would overrun
+    /// the memory floor peer's unified budget. `None` ⇒ the resident (RAM) backing (the
+    /// acceptance tier + tests). Set by the worker from the durable run-state home.
+    pub state_dir: Option<std::path::PathBuf>,
     // ---- migration grant (Phase E, ABI §2.6 `migration-grant` / §10.2) ------------------------
     /// `migration-grant.max_sections`: the max sections one `snapshot_state` manifest may declare
     /// (`0` = unbounded by this grant). Exceeding it returns `SNAPSHOT_STATE_GRANT_EXCEEDED`.
@@ -180,6 +187,7 @@ impl RunConfig {
             state_write_rate_per_min: 0,
             state_store_bytes: 0,
             state_retain_roots: daemon_vhc_proto::STATE_RETAIN_ROOTS_DEFAULT,
+            state_dir: None,
             migration_max_sections: 0,
             migration_max_section_bytes: 0,
             compute_fault_after_ops: None,

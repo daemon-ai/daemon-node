@@ -14,6 +14,17 @@
 //! its verifying at the write). Fetch assembly walks the sealed fold's ordered `(hash, len)`
 //! list and re-hashes the served span as a custody cross-check.
 //!
+//! ## Chunk backing: resident vs disk-spilled (design §8.1)
+//!
+//! Chunk BYTES live either resident (an `Arc<Vec<u8>>` in RAM — the default, and the only backing
+//! for the 64-dim acceptance tier and every test) or **disk-spilled** through a [`SpillStore`]
+//! when the run pins a state directory. Disk backing is what lets the ceremony tier's ≈ 14.65 GiB
+//! of retained roots live off the M4 memory floor's unified pool: RAM keeps only the index
+//! (per-chunk lengths, refcounts, seal order, the write token bucket), the bytes are on disk. The
+//! custody contract is IDENTICAL across backings — every read re-hashes the served bytes against
+//! the requested content address, and a missing/mismatching disk object is the same loud, typed
+//! fault a resident miss/violation is (never a silent substitution).
+//!
 //! ## Per-parameter chunking ⇒ per-chunk lengths
 //!
 //! Det-state families are chunked **per parameter** (a parameter never spans a chunk boundary;
@@ -43,6 +54,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use daemon_vhc_proto::family_fold;
+
+use crate::run::state_spill::{SpillReadError, SpillStore};
 
 /// The top bit set on guest-created state stream ids — the same never-collides-with-host-ids
 /// namespace discipline as guest staging ids (ABI §10.2), with its own per-instance counter.
@@ -154,9 +167,21 @@ impl Default for StateStoreConfig {
     }
 }
 
-/// One content-addressed chunk object plus its holder counts.
+/// Where one chunk's bytes live.
+enum ChunkBacking {
+    /// Bytes held in RAM (the default backing; the only one for the acceptance tier + tests).
+    Resident(Arc<Vec<u8>>),
+    /// Bytes spilled to the [`SpillStore`] under their content address; RAM holds only metadata.
+    Spilled,
+}
+
+/// One content-addressed chunk object's index entry plus its holder counts. The BYTES live per
+/// [`ChunkBacking`]; this entry (length + refcounts) always stays resident so the retained-byte
+/// meter, eviction order, and range resolution never touch disk.
 struct ChunkEntry {
-    bytes: Arc<Vec<u8>>,
+    backing: ChunkBacking,
+    /// The chunk's byte length (the retained-byte meter + range walk read this, never the bytes).
+    len: u32,
     /// Total holders: open streams + sealed folds (per occurrence).
     refs: u64,
     /// Sealed-fold holders only — the retained-byte meter counts a chunk while this is > 0.
@@ -217,6 +242,9 @@ pub struct StateStoreStats {
 /// buffer/op/stream tables; every method runs under the pump lock.
 pub struct StateStore {
     cfg: StateStoreConfig,
+    /// The on-disk chunk spill (design §8.1). `None` ⇒ chunk bytes stay resident in RAM (the
+    /// acceptance tier + tests); `Some` ⇒ bytes spill to disk and RAM keeps only the index.
+    spill: Option<SpillStore>,
     chunks: HashMap<[u8; 32], ChunkEntry>,
     open: HashMap<u64, OpenStream>,
     next_stream: u64,
@@ -238,12 +266,22 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    /// A fresh store under the admitted bounds. The token bucket opens full (one minute's
-    /// worth) at logical time zero.
+    /// A fresh **resident** store under the admitted bounds (chunk bytes held in RAM) — the
+    /// acceptance tier + every test. The token bucket opens full (one minute's worth) at logical
+    /// time zero.
     #[must_use]
     pub fn new(cfg: StateStoreConfig) -> Self {
+        Self::new_with_spill(cfg, None)
+    }
+
+    /// A fresh store that spills chunk bytes to `spill` when `Some` (the ceremony tier's
+    /// disk-backed store, design §8.1) or holds them resident when `None` ([`Self::new`]). The
+    /// index (lengths, refcounts, seal order, token bucket) stays resident either way.
+    #[must_use]
+    pub fn new_with_spill(cfg: StateStoreConfig, spill: Option<SpillStore>) -> Self {
         Self {
             cfg,
+            spill,
             chunks: HashMap::new(),
             open: HashMap::new(),
             next_stream: 1,
@@ -404,7 +442,7 @@ impl StateStore {
             let e = self.chunks.get_mut(h).expect("stream chunk held");
             e.sealed_refs += 1;
             if e.sealed_refs == 1 {
-                self.retained_bytes += e.bytes.len() as u64;
+                self.retained_bytes += u64::from(e.len);
             }
         }
         self.sealed.insert(
@@ -451,7 +489,11 @@ impl StateStore {
         let mut out = Vec::with_capacity(sealed.chunks.len());
         for (h, _len) in &sealed.chunks {
             let entry = self.chunks.get(h)?;
-            out.push((daemon_vhc_proto::Hash(*h), (*entry.bytes).clone()));
+            // Custody-verified read (resident or disk); a corrupt/missing spilled chunk yields
+            // `None` here — the publisher/harness treats an unavailable chunk as fatal, never a
+            // silent short upload.
+            let bytes = self.read_chunk(h, entry).ok()?;
+            out.push((daemon_vhc_proto::Hash(*h), bytes));
         }
         Some(out)
     }
@@ -466,7 +508,8 @@ impl StateStore {
         let mut chunks = Vec::with_capacity(sealed.chunks.len());
         for (h, _len) in &sealed.chunks {
             let entry = self.chunks.get(h)?;
-            chunks.push((daemon_vhc_proto::Hash(*h), (*entry.bytes).clone()));
+            let bytes = self.read_chunk(h, entry).ok()?;
+            chunks.push((daemon_vhc_proto::Hash(*h), bytes));
         }
         Some(CarriedFamily {
             tag: sealed.tag.clone(),
@@ -493,15 +536,27 @@ impl StateStore {
             return fold;
         }
         for (h, bytes) in &fam.chunks {
-            let entry = self.chunks.entry(h.0).or_insert_with(|| ChunkEntry {
-                bytes: Arc::new(bytes.clone()),
-                refs: 0,
-                sealed_refs: 0,
+            let spill = self.spill.as_ref();
+            let entry = self.chunks.entry(h.0).or_insert_with(|| {
+                #[allow(clippy::cast_possible_truncation)]
+                let len = bytes.len() as u32;
+                let backing = if let Some(spill) = spill {
+                    let _ = spill.write(&h.0, bytes);
+                    ChunkBacking::Spilled
+                } else {
+                    ChunkBacking::Resident(Arc::new(bytes.clone()))
+                };
+                ChunkEntry {
+                    backing,
+                    len,
+                    refs: 0,
+                    sealed_refs: 0,
+                }
             });
             entry.refs += 1;
             entry.sealed_refs += 1;
             if entry.sealed_refs == 1 {
-                self.retained_bytes += entry.bytes.len() as u64;
+                self.retained_bytes += u64::from(entry.len);
             }
         }
         self.sealed.insert(
@@ -583,12 +638,24 @@ impl StateStore {
             let Some(entry) = self.chunks.get(hash) else {
                 return Some(Err("sealed fold references an evicted chunk".into()));
             };
-            if blake3::hash(&entry.bytes).as_bytes() != hash {
-                return Some(Err("custody violation: chunk bytes do not re-hash".into()));
-            }
+            // Custody-verified read (resident or disk-spilled). A missing spilled object and a
+            // re-hash mismatch are BOTH loud, typed errors here — the disk backing does not
+            // weaken the custody cross-check (the bytes moving to disk changes only latency).
+            let bytes = match self.read_chunk(hash, entry) {
+                Ok(b) => b,
+                Err(SpillReadError::Missing) => {
+                    return Some(Err("sealed fold references an evicted chunk".into()))
+                }
+                Err(SpillReadError::Custody) => {
+                    return Some(Err("custody violation: chunk bytes do not re-hash".into()))
+                }
+                Err(SpillReadError::Io(e)) => {
+                    return Some(Err(format!("state chunk spill read failed: {e}")))
+                }
+            };
             let lo = off.saturating_sub(chunk_start) as usize;
             let hi = (end.min(chunk_end) - chunk_start) as usize;
-            out.extend_from_slice(&entry.bytes[lo..hi]);
+            out.extend_from_slice(&bytes[lo..hi]);
         }
         Some(Ok(out))
     }
@@ -670,8 +737,21 @@ impl StateStore {
         match self.chunks.entry(hash) {
             std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().refs += 1,
             std::collections::hash_map::Entry::Vacant(e) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let len = bytes.len() as u32;
+                // Spill the bytes to disk (index-only in RAM) when a spill is configured, else
+                // hold them resident. Write is content-addressed + atomic (idempotent).
+                let backing = if let Some(spill) = &self.spill {
+                    // A write failure surfaces at read (typed Missing/Io) — the same loud custody
+                    // posture as a resident miss, never a silent success that reads back empty.
+                    let _ = spill.write(&hash, bytes);
+                    ChunkBacking::Spilled
+                } else {
+                    ChunkBacking::Resident(Arc::new(bytes.to_vec()))
+                };
                 e.insert(ChunkEntry {
-                    bytes: Arc::new(bytes.to_vec()),
+                    backing,
+                    len,
                     refs: 1,
                     sealed_refs: 0,
                 });
@@ -683,8 +763,34 @@ impl StateStore {
         if let Some(e) = self.chunks.get_mut(&hash) {
             e.refs -= 1;
             if e.refs == 0 {
+                let spilled = matches!(e.backing, ChunkBacking::Spilled);
                 self.chunks.remove(&hash);
+                // The chunk has no holders left: delete its disk object too (retention eviction /
+                // torn-fold GC). Idempotent — a missing object is not an error.
+                if spilled {
+                    if let Some(spill) = &self.spill {
+                        spill.remove(&hash);
+                    }
+                }
             }
+        }
+    }
+
+    /// Read one held chunk's bytes, re-hashing against its content address (the custody
+    /// cross-check, uniform across backings). Resident bytes are re-verified against
+    /// memory-corruption; spilled bytes are re-verified against the untrusted disk.
+    fn read_chunk(&self, hash: &[u8; 32], entry: &ChunkEntry) -> Result<Vec<u8>, SpillReadError> {
+        match &entry.backing {
+            ChunkBacking::Resident(bytes) => {
+                if blake3::hash(bytes.as_slice()).as_bytes() != hash {
+                    return Err(SpillReadError::Custody);
+                }
+                Ok((**bytes).clone())
+            }
+            ChunkBacking::Spilled => match &self.spill {
+                Some(spill) => spill.read_verify(hash),
+                None => Err(SpillReadError::Missing),
+            },
         }
     }
 
@@ -718,7 +824,7 @@ impl StateStore {
             if let Some(e) = self.chunks.get_mut(h) {
                 e.sealed_refs -= 1;
                 if e.sealed_refs == 0 {
-                    self.retained_bytes -= e.bytes.len() as u64;
+                    self.retained_bytes -= u64::from(e.len);
                 }
             }
             self.release_chunk(*h);
@@ -1026,5 +1132,102 @@ mod tests {
         assert_eq!(ids_a, ids_b, "ids are a pure function of call order");
         assert_eq!(ids_a[0], STATE_STREAM_ID_TOP_BIT | 1);
         assert_eq!(ids_a[1], STATE_STREAM_ID_TOP_BIT | 2);
+    }
+
+    // -- disk-backed (spilled) backing -----------------------------------------------------------
+
+    #[allow(clippy::disallowed_methods)] // test-only temp dir + object-count assertion
+    fn spill_root(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "daemon-vhc-statestore-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        p
+    }
+
+    #[allow(clippy::disallowed_methods)] // test-only object-count over the spill dir
+    fn object_count(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root)
+            .map(|rd| rd.filter_map(Result::ok).count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test-only temp-dir cleanup
+    fn spilled_backing_matches_the_resident_fold_and_serves_ranges_from_disk() {
+        let root = spill_root("parity");
+        let spill = SpillStore::open(&root).unwrap();
+        let mut s = StateStore::new_with_spill(cfg(8), Some(spill));
+        let id = s.open("master", 12).unwrap();
+        s.emit(id, b"AAAAAAAA", 0).unwrap();
+        s.emit(id, b"BBBB", 0).unwrap();
+        let fold = s.seal(id).unwrap();
+        // The disk-backed fold IS the same identity the resident store mints (backing-agnostic).
+        assert_eq!(fold, expected_fold(8, 12, &[b"AAAAAAAA", b"BBBB"]));
+        // Ranges assemble from the on-disk objects, custody re-hash preserved.
+        assert_eq!(s.read_range(&fold, 6, 10).unwrap().unwrap(), b"AABB");
+        assert_eq!(
+            s.read_range(&fold, 0, 12).unwrap().unwrap(),
+            b"AAAAAAAABBBB"
+        );
+        // Retained-byte meter is identical to the resident store (index counts, not backing).
+        assert_eq!(s.stats().retained_bytes, 12);
+        // Bytes really are on disk (two content objects), not resident.
+        assert_eq!(object_count(&root), 2, "chunk objects spilled to disk");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test-only temp-dir cleanup
+    fn spilled_eviction_and_torn_gc_delete_disk_objects() {
+        let root = spill_root("evict");
+        let spill = SpillStore::open(&root).unwrap();
+        let mut s = StateStore::new_with_spill(
+            StateStoreConfig {
+                chunk_size: 8,
+                retain_roots: 1,
+                ..StateStoreConfig::default()
+            },
+            Some(spill),
+        );
+        // Two distinct 8-byte master roots; retain_roots=1 evicts the first at the second seal.
+        let a = s.open("master", 8).unwrap();
+        s.emit(a, b"AAAAAAAA", 0).unwrap();
+        let f0 = s.seal(a).unwrap();
+        let b = s.open("master", 8).unwrap();
+        s.emit(b, b"BBBBBBBB", 0).unwrap();
+        s.seal(b).unwrap();
+        assert!(s.sealed(&f0).is_none(), "oldest root evicted");
+        assert_eq!(object_count(&root), 1, "evicted root's disk object deleted");
+        // A torn (opened-but-unsealed) stream's staged object is GCed at teardown.
+        let c = s.open("master", 8).unwrap();
+        s.emit(c, b"CCCCCCCC", 0).unwrap();
+        assert_eq!(object_count(&root), 2, "staged torn object on disk");
+        s.clear_open();
+        assert_eq!(object_count(&root), 1, "torn object GCed from disk");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test-only tamper of a spilled object
+    fn spilled_custody_violation_is_loud() {
+        let root = spill_root("custody");
+        let spill = SpillStore::open(&root).unwrap();
+        let mut s = StateStore::new_with_spill(cfg(8), Some(spill));
+        let id = s.open("master", 8).unwrap();
+        s.emit(id, b"AAAAAAAA", 0).unwrap();
+        let fold = s.seal(id).unwrap();
+        // Tamper the on-disk object; the fetch re-hash catches it — a loud typed error, never a
+        // silent substitution (custody does not weaken because the bytes moved to disk).
+        let hash = daemon_vhc_proto::Hash(*blake3::hash(b"AAAAAAAA").as_bytes());
+        std::fs::write(root.join(hash.to_hex()), b"TAMPERED!").unwrap();
+        let err = s.read_range(&fold, 0, 8).unwrap().unwrap_err();
+        assert!(err.contains("custody violation"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

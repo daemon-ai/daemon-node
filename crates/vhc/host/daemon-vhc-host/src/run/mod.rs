@@ -24,6 +24,7 @@ pub mod event;
 pub mod journal;
 pub mod ops;
 pub mod replay;
+pub mod state_spill;
 pub mod state_store;
 pub mod streams;
 
@@ -46,6 +47,7 @@ pub use replay::{
     replay, replay_migrating, ReplayEnd, ReplayMigration, ReplayScript, ReplayedDecision,
     ReplayedRun,
 };
+pub use state_spill::{SpillReadError, SpillStore};
 pub use state_store::{
     CarriedFamily, SealedFold, StateStore, StateStoreConfig, StateStoreError, StateStoreStats,
     STATE_STREAM_ID_TOP_BIT,
