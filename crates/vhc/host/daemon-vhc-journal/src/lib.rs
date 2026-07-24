@@ -142,14 +142,131 @@ impl JournalPaths {
 
 /// fsync a directory so a freshly-created segment's directory entry is durable (§8.4: "on segment
 /// creation, also the directory entry").
+///
+/// A directory is not an ordinary file, and the two platforms disagree about it, so this barrier is
+/// per-platform rather than one idiom that happens to compile everywhere:
+///
+/// * **Unix** — the POSIX idiom: open the directory and `sync_all` it. A failure here is a real
+///   durability failure and propagates.
+/// * **Windows** — `File::open` on a directory (`GENERIC_READ`, no flags) is REFUSED with
+///   `ERROR_ACCESS_DENIED` (os error 5); a directory handle requires `FILE_FLAG_BACKUP_SEMANTICS`,
+///   and `FlushFileBuffers` on that handle additionally requires WRITE access (a read-only or
+///   zero-access directory handle also returns error 5 — measured on the fleet's Windows box). So
+///   the Windows arm asks for exactly that handle, and treats a refusal as SUCCESS rather than a
+///   journal failure: Windows guarantees nothing about flushing a directory handle, while NTFS
+///   commits a file's creation with the file's own metadata — which every caller here has just
+///   flushed (`File::sync_all` is `FlushFileBuffers` on the segment). The barrier is taken wherever
+///   the platform offers it, and can never turn a healthy journal into a failed run.
+///
+/// Running the Unix idiom on Windows is what made every fresh journal there terminal: the first
+/// segment's header wrote, this call was denied, and each worker generation died `FailedRetryable`
+/// on a freshly created directory (`journal io error: Access is denied. (os error 5)`) — a run that
+/// never reached a single round.
+#[cfg(unix)]
 pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
-    // Opening a directory read-only and calling `sync_all` fsyncs the directory entry on Unix.
     let f = fs::File::open(dir)?;
     f.sync_all()
+}
+
+#[cfg(windows)]
+pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    /// `FILE_FLAG_BACKUP_SEMANTICS` — the flag that makes `CreateFileW` hand back a handle to a
+    /// directory at all.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    if let Ok(handle) = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+    {
+        let _ = handle.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn fsync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// The journal format version this build writes (ABI §8.2 / §8.3 tag-0 `format`).
 #[must_use]
 pub fn format_version() -> u32 {
     JOURNAL_FORMAT_VERSION
+}
+
+/// The §8.4 directory barrier's PLATFORM discipline. The substrate's behavioral suites live with
+/// `daemon-vhc-observe` (which re-exports this crate); these stay here because they assert
+/// `pub(crate)` platform semantics — and because this crate cross-compiles to Windows on its own,
+/// so the Windows arm can be run on a real Windows box as a `--target x86_64-pc-windows-gnu` test
+/// binary instead of being taken on faith.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique scratch directory under the platform temp dir (no dev-dependencies in this crate).
+    fn scratch(tag: &str) -> PathBuf {
+        let unique = format!(
+            "daemon-vhc-journal-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// The segment-creation path end to end: create → append → commit → re-open, each of which
+    /// takes the directory barrier. Portable by design — on Windows this is the regression test for
+    /// the barrier that refused a freshly created journal directory with `Access is denied`
+    /// (os error 5) and terminated every worker generation before its first round.
+    #[test]
+    fn segment_create_and_reopen_take_the_directory_barrier() {
+        let dir = scratch("segment-barrier");
+        let paths = JournalPaths::open(&dir).expect("journal paths");
+        let id = record::ExecIdentity {
+            run_id: daemon_vhc_proto::Hash([1u8; 32]),
+            epoch: 0,
+            role: "trainer".into(),
+            instance: 1,
+            module: daemon_vhc_proto::Hash([2u8; 32]),
+        };
+        let header = segment::SegmentHeader {
+            id,
+            segment: 0,
+            prev_blake3: segment::GENESIS_PREV,
+        };
+        let path = paths.segment(0);
+        let mut writer = segment::SegmentWriter::create(&path, &header)
+            .expect("create segment 0 (§8.4 barrier)");
+        writer.commit().expect("commit barrier");
+        let bytes = fs::read(&path).expect("read segment");
+        drop(writer);
+        segment::SegmentWriter::reopen(&path, &bytes, 0).expect("re-open segment 0 (§8.4 barrier)");
+        fsync_dir(paths.root()).expect("directory barrier on the journal root");
+        fsync_dir(&paths.sidecars()).expect("directory barrier on the sidecar dir");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Windows only: pin the platform semantics the barrier is split for. The Unix idiom
+    /// (`File::open` on a directory) is denied — os error 5, the `ERROR_ACCESS_DENIED` the fleet box
+    /// reported — while the barrier itself succeeds on the same directory. If a future edit puts the
+    /// Unix idiom back on this platform, this fails instead of the fleet.
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_handles_need_backup_semantics() {
+        let dir = scratch("windows-dir-handle");
+        let denied = fs::File::open(&dir).expect_err("a plain directory open must be refused");
+        assert_eq!(
+            denied.raw_os_error(),
+            Some(5),
+            "expected ERROR_ACCESS_DENIED from a directory open without FILE_FLAG_BACKUP_SEMANTICS, \
+             got {denied:?}"
+        );
+        fsync_dir(&dir).expect("the §8.4 barrier must succeed where the Unix idiom cannot");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
