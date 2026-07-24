@@ -10,10 +10,17 @@
 //! into a [`CeremonyGenesisSpec`], freeze the genesis with the author key, and write the four
 //! operator artifacts:
 //!
-//! - `envelope.cbor` — the canonical frozen envelope bytes (the object the registry stores; the
-//!   run id is their blake3);
-//! - `envelope.b64` — base64 of those exact bytes, for the cloud seeder's `VHC_ENVELOPE_B64`;
-//! - `run-id.txt` — the genesis hash hex (the cryptographic run id);
+//! - `envelope.cbor` — the canonical [`daemon_vhc_proto::SignedEnvelope`] **wire form**
+//!   (`{ bytes, signature, signer }`) wrapping the frozen genesis. This is the object the
+//!   registry stores and hands verbatim to the node's assess path
+//!   (`from_canonical_slice::<SignedEnvelope>` → `FrozenGenesis::open`); emitting the raw inner
+//!   `FrozenGenesis::bytes()` instead makes `vhc join` refuse `UnsignedEnvelopeRetired … missing
+//!   field bytes` (the smoke-surfaced defect). **Inner-vs-wire:** the inner genesis is the frozen
+//!   envelope bytes the author signed; the wire is those bytes plus the signature + signer.
+//! - `envelope.b64` — base64 of those exact SignedEnvelope wire bytes, for the cloud seeder's
+//!   `VHC_ENVELOPE_B64` (seed it verbatim — no operator-side re-wrapping);
+//! - `run-id.txt` — the genesis hash hex (the cryptographic run id = blake3 of the **inner**
+//!   frozen genesis bytes, NOT the wire object's hash);
 //! - `authoring-report.txt` — every frozen pin restated for human ratification.
 //!
 //! It also authors single-peer smoke-run geneses (min=max=1, small `--stop-rounds`): nothing here
@@ -26,7 +33,9 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 
 use daemon_vhc_proto::corpus::CorpusManifest;
-use daemon_vhc_proto::{blake3_hash, Hash, PeerId, SigningKey};
+use daemon_vhc_proto::{
+    blake3_hash, to_canonical_vec, FrozenGenesis, Hash, PeerId, SignedEnvelope, SigningKey,
+};
 use daemon_vhc_testkit::ceremony::{
     ceremony_expected_state_root, ceremony_genesis, ceremony_profile_chunk,
     ceremony_state_chunk_size, CeremonyGenesisSpec, CeremonyRunTimers, CEREMONY_EXPECTED_ROOT,
@@ -204,9 +213,16 @@ pub fn run(args: Args) -> Result<()> {
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("create --out dir {}", args.out.display()))?;
     let run_id_hex = frozen.run_id().to_hex();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(frozen.bytes());
+    // The registry object + node assess path decode a `SignedEnvelope { bytes, signature, signer }`
+    // (`daemon-vhc-node/src/service.rs` → `from_canonical_slice::<SignedEnvelope>` → `FrozenGenesis
+    // ::open`), so the tool MUST emit that wire form — NOT the raw inner `frozen.bytes()`, which is
+    // what made `vhc join` refuse `UnsignedEnvelopeRetired … missing field bytes`. The run id
+    // (`run-id.txt`, below) stays blake3(inner frozen bytes); the wire object's own blake3 is the
+    // registry descriptor's `envelope_hash` and is deliberately different.
+    let envelope_wire = signed_envelope_wire(&frozen).context("encode SignedEnvelope wire")?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&envelope_wire);
 
-    std::fs::write(args.out.join("envelope.cbor"), frozen.bytes())
+    std::fs::write(args.out.join("envelope.cbor"), &envelope_wire)
         .context("write envelope.cbor")?;
     std::fs::write(args.out.join("envelope.b64"), &b64).context("write envelope.b64")?;
     std::fs::write(args.out.join("run-id.txt"), format!("{run_id_hex}\n"))
@@ -240,6 +256,19 @@ pub fn run(args: Args) -> Result<()> {
     println!("  wrote envelope.cbor, envelope.b64, run-id.txt, authoring-report.txt");
     print!("\n{report}");
     Ok(())
+}
+
+/// Wrap a frozen genesis into its canonical [`SignedEnvelope`] wire form — the exact object the
+/// registry stores and the node's assess path decodes (`from_canonical_slice::<SignedEnvelope>` →
+/// [`FrozenGenesis::open`]). Emitting the raw inner [`FrozenGenesis::bytes`] instead is the
+/// smoke-surfaced defect (`UnsignedEnvelopeRetired … missing field bytes`).
+fn signed_envelope_wire(frozen: &FrozenGenesis) -> Result<Vec<u8>> {
+    let wire = SignedEnvelope {
+        bytes: frozen.bytes().to_vec(),
+        signature: *frozen.signature(),
+        signer: *frozen.signer(),
+    };
+    to_canonical_vec(&wire).map_err(|e| anyhow::anyhow!("encode SignedEnvelope: {e}"))
 }
 
 struct AuthoringReport<'a> {
@@ -371,4 +400,111 @@ fn authoring_report(r: &AuthoringReport<'_>) -> String {
         "cadence check        : PASSED at authoring (cadence + one churn slot <= retention)"
     );
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemon_vhc_proto::corpus::{
+        CorpusManifest, Endianness, SequenceBoundary, TokenWidth, TokenizerId,
+        CORPUS_DEFAULT_CHUNK_SIZE, CORPUS_MANIFEST_FORMAT,
+    };
+    use daemon_vhc_testkit::ceremony::{
+        ceremony_genesis, CeremonyGenesisSpec, CeremonyRunTimers, CEREMONY_SEQ_LEN,
+    };
+
+    /// A minimal single-shard corpus manifest at the frozen ceremony sequence length — enough to
+    /// author a valid smoke genesis.
+    fn minimal_manifest() -> CorpusManifest {
+        // 2048 u16 tokens = exactly one sequence in one 4 MiB chunk.
+        let bytes = vec![0u8; (CEREMONY_SEQ_LEN as usize) * 2];
+        let shard = CorpusManifest::author_shard(
+            &bytes,
+            u64::from(CEREMONY_SEQ_LEN),
+            CORPUS_DEFAULT_CHUNK_SIZE,
+        )
+        .expect("author shard");
+        CorpusManifest {
+            format_version: CORPUS_MANIFEST_FORMAT,
+            token_width: TokenWidth::U16,
+            endianness: Endianness::Little,
+            seq_len: CEREMONY_SEQ_LEN,
+            sequence_boundary: SequenceBoundary::WholeSequencesPerShard,
+            eos_id: Some(2),
+            pad_id: Some(2),
+            chunk_size: CORPUS_DEFAULT_CHUNK_SIZE,
+            tokenizer: TokenizerId {
+                hash: blake3_hash(b"tokenizer-fixture"),
+                name: "fixture".into(),
+                revision: "deadbeef".into(),
+            },
+            total_tokens: u64::from(CEREMONY_SEQ_LEN),
+            shards: vec![shard],
+        }
+    }
+
+    /// Regression coverage for the smoke-surfaced authoring defect: the CLI tool must emit the
+    /// `SignedEnvelope` **wire** form, and that emitted `envelope.cbor` must decode + validate
+    /// through the EXACT chain the node's assess path applies (`from_canonical_slice::
+    /// <SignedEnvelope>` → `peek_schema` → `FrozenGenesis::open`). The pre-fix tool wrote the raw
+    /// inner `frozen.bytes()`, which is not a `SignedEnvelope` and made `vhc join` refuse
+    /// `UnsignedEnvelopeRetired … missing field bytes`. The acceptance suite never caught this
+    /// because it authors geneses via the testkit library, never through this CLI tool.
+    #[test]
+    fn emitted_envelope_is_signed_envelope_wire_and_passes_node_assess_validation() {
+        let author = SigningKey::from_bytes(&[7u8; 32]);
+        let manifest = minimal_manifest();
+        let manifest_hash = manifest.manifest_hash().expect("manifest hash");
+        let corpus_artifacts: Vec<(String, Hash)> = vec![
+            ("corpus-manifest.cbor".to_string(), manifest_hash),
+            ("tokenizer.json".to_string(), manifest.tokenizer.hash),
+            ("shard-0.bin".to_string(), manifest.shards[0].shard_hash),
+        ];
+        let base = PeerId::new([9u8; 32]);
+        let spec = CeremonyGenesisSpec {
+            run_label: "smoke-test",
+            coordinator_module: blake3_hash(b"coord.wasm"),
+            trainer_module: blake3_hash(b"trainer.wasm"),
+            corpus_manifest: manifest_hash,
+            corpus_artifacts: &corpus_artifacts,
+            seq_len: u64::from(CEREMONY_SEQ_LEN),
+            trusted_bases: &[base],
+            roster: &[base],
+            upgrade_authority: Vec::new(),
+            min_peers: 1,
+            max_peers: 1,
+            remote_ckpt_cadence_rounds: 2,
+            payload_retention_rounds: 64,
+            timers: CeremonyRunTimers::default(),
+        };
+        let frozen = ceremony_genesis(&spec, &author).expect("author ceremony genesis");
+        let wire_bytes = signed_envelope_wire(&frozen).expect("wire encode");
+
+        // 1. The emitted bytes decode as a `SignedEnvelope` (the object the registry stores and
+        //    the node hands to `worker.assess`).
+        let wire: SignedEnvelope = daemon_vhc_proto::from_canonical_slice(&wire_bytes)
+            .expect("envelope.cbor must decode as SignedEnvelope (the join-refusal regression)");
+        // 2. Routes on the genesis schema major, exactly like the worker's `resolve_run`.
+        assert_eq!(
+            daemon_vhc_proto::peek_schema(&wire.bytes),
+            Some(daemon_vhc_proto::GENESIS_SCHEMA_MAJOR),
+        );
+        // 3. Re-opens + verifies + validates, exactly like `FrozenGenesis::open` on the node's
+        //    assess path (`daemon-vhc-node/src/service.rs`).
+        let reopened = FrozenGenesis::open(wire.bytes.clone(), wire.signature, wire.signer)
+            .expect("the node's assess path must FrozenGenesis::open the emitted envelope");
+        // 4. run id == blake3(inner frozen bytes), and is NOT the wire object's own hash.
+        assert_eq!(reopened.run_id(), frozen.run_id());
+        assert_ne!(
+            blake3_hash(&wire_bytes),
+            *frozen.run_id(),
+            "the SignedEnvelope wire hash is the descriptor envelope_hash, distinct from the run id",
+        );
+        // Regression guard: the raw inner bytes are NOT a SignedEnvelope (the old, broken output
+        // that the node rejected).
+        assert!(
+            daemon_vhc_proto::from_canonical_slice::<SignedEnvelope>(frozen.bytes()).is_err(),
+            "the inner frozen genesis must NOT masquerade as a SignedEnvelope wire form",
+        );
+    }
 }
