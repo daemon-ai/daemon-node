@@ -86,6 +86,12 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
 # (a lane-owned target/feature edit — no root Cargo.toml change). Feature modules per design §4
 # (Threading omitted — the §3 budget-change event is not wired at probe time). Compiles for
 # `x86_64-pc-windows-gnu` (MinGW) as well as msvc.
+# Portable free-disk probe (`statvfs`) on unix (Linux + macOS): `libc` is already resolved in the
+# committed Cargo.lock (a broad transitive), so this is a lock-neutral, lane-owned edge — no new
+# third-party crate enters the graph. Used ONLY by the scoped-`unsafe` `probe::unix_ffi` module.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
@@ -94,6 +100,8 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D12",
     "Win32_System_SystemInformation",
+    # `GetDiskFreeSpaceExW` — the Windows free-disk probe (the trainer lane-floor fix).
+    "Win32_Storage_FileSystem",
 ] }
 
 # Per-backend lane selection (spec §10.1). These features only toggle burn's *dependency* backend

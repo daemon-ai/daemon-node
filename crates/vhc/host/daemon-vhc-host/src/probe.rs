@@ -64,6 +64,221 @@ pub fn parse_amdgpu_mem_mb(contents: &str) -> Option<u64> {
     contents.trim().parse::<u64>().ok().map(|bytes| bytes / MIB)
 }
 
+// =====================================================================================
+// Portable host RAM + free-disk probes (platform-agnostic; the admission funnel's lane
+// device-floor inputs). The worker's `Hardware` report sources `ram_mb` / `disk_free_mb`
+// from these on EVERY platform — the pre-fix worker hardcoded `disk_free_mb: 0` and read RAM
+// only from Linux `/proc`, so a macOS/Windows trainer spuriously refused the lane floor
+// (`below lane floor: ram/disk`) despite hundreds of GiB free. All decision logic stays in the
+// admission funnel; these only gather raw OS scalars (fixture-free — they read the live host,
+// so the unit test only asserts "nonzero on the host OS").
+// =====================================================================================
+
+/// Total physical host RAM in MiB, portably: Linux `/proc/meminfo` `MemTotal`, macOS
+/// `sysctl hw.memsize`, Windows `GlobalMemoryStatusEx().ullTotalPhys`. `0` only when the
+/// platform source is unavailable (the caller then uses the large "unknown" budget sentinel so an
+/// unprobed number never spuriously rejects).
+#[must_use]
+pub fn host_ram_mb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        linux_mem_total_mb()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac_ffi::ram_mb()
+    }
+    #[cfg(windows)]
+    {
+        win_ffi::ram_mb()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        0
+    }
+}
+
+/// Free disk space in MiB on the filesystem containing `path`, portably: unix `statvfs`
+/// (`f_bavail × f_frsize` — space available to a non-privileged process), Windows
+/// `GetDiskFreeSpaceExW` (free bytes available to the caller). `0` when the query fails (a
+/// non-existent path, or an unsupported platform) — callers pass an existing path (the run's
+/// cache / state home, or the process cwd).
+#[must_use]
+pub fn host_disk_free_mb(path: &std::path::Path) -> u64 {
+    #[cfg(unix)]
+    {
+        unix_ffi::disk_free_mb(path)
+    }
+    #[cfg(windows)]
+    {
+        win_ffi::disk_free_mb(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        0
+    }
+}
+
+// =====================================================================================
+// wgpu graphics-API selection (the fleet's third GPU API: DX12 on Windows).
+//
+// cubecl-wgpu 0.10's `AutoGraphicsApi::backend()` hardcodes `wgpu::Backend::Vulkan` on every
+// non-macOS / non-wasm target (its `AUTO_GRAPHICS_BACKEND` override is `#[cfg(test)]`-gated), so a
+// released Windows worker ALWAYS came up Vulkan and `WGPU_BACKEND=dx12` had no effect — the fleet's
+// G-1 three-distinct-GPU-API requirement could never be met (Windows would run Vulkan, same as
+// Strix). We select the graphics API EXPLICITLY at bring-up instead: Windows defaults to Dx12,
+// with an operator override that MIRRORS how `DAEMON_TRAIN_BACKEND` selects the lane. Linux/macOS
+// behavior is unchanged (AutoGraphicsApi = Vulkan on Linux, Metal on macOS).
+// =====================================================================================
+
+/// The env knob that overrides the wgpu graphics API selection, mirroring `DAEMON_TRAIN_BACKEND`'s
+/// lane selection: `dx12` | `vulkan` | `metal` | `auto`. Unset ⇒ the platform default (Dx12 on
+/// Windows, Auto elsewhere).
+pub const GRAPHICS_API_ENV: &str = "DAEMON_TRAIN_GRAPHICS_API";
+
+/// Which wgpu graphics API a bring-up selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphicsApiChoice {
+    /// cubecl's `AutoGraphicsApi` — Vulkan on Linux, Metal on macOS (the pre-fix behavior, kept
+    /// unchanged for those platforms).
+    Auto,
+    /// Force Vulkan.
+    Vulkan,
+    /// Force Metal.
+    Metal,
+    /// Force DirectX 12 (the Windows fleet lane).
+    Dx12,
+}
+
+/// Resolve the wgpu graphics API from the target OS + an optional operator override
+/// (`DAEMON_TRAIN_GRAPHICS_API`). Pure + unit-tested cross-platform (the feature-gated bring-up
+/// maps the choice onto `init_setup::<G>`):
+///
+/// - an explicit, recognized override wins on every OS (`dx12`/`vulkan`/`metal`/`auto`, case- and
+///   whitespace-insensitive; an unrecognized value falls back to the platform default so a typo
+///   never silently forces the wrong API);
+/// - otherwise **Windows defaults to Dx12** (AutoGraphicsApi would pick Vulkan there), and every
+///   other OS keeps **Auto** (Vulkan on Linux, Metal on macOS — unchanged).
+#[must_use]
+pub fn resolve_graphics_api(target_os: &str, override_env: Option<&str>) -> GraphicsApiChoice {
+    let platform_default = if target_os == "windows" {
+        GraphicsApiChoice::Dx12
+    } else {
+        GraphicsApiChoice::Auto
+    };
+    match override_env.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(v) if v.is_empty() => platform_default,
+        Some(v) => match v.as_str() {
+            "dx12" | "directx12" | "d3d12" => GraphicsApiChoice::Dx12,
+            "vulkan" | "vk" => GraphicsApiChoice::Vulkan,
+            "metal" => GraphicsApiChoice::Metal,
+            "auto" => GraphicsApiChoice::Auto,
+            _ => platform_default,
+        },
+        None => platform_default,
+    }
+}
+
+/// The wgpu graphics API this host selects right now (the live-env resolution of
+/// [`resolve_graphics_api`]).
+#[must_use]
+pub fn selected_graphics_api() -> GraphicsApiChoice {
+    resolve_graphics_api(
+        std::env::consts::OS,
+        std::env::var(GRAPHICS_API_ENV).ok().as_deref(),
+    )
+}
+
+/// Bring up (register) the default-or-`device` wgpu client under the SELECTED graphics API. This is
+/// the single choke point that replaces cubecl's `AutoGraphicsApi` bring-up: it branches on
+/// [`selected_graphics_api`] and calls `init_setup::<G>` with the concrete graphics type, so a
+/// Windows worker registers a **Dx12** client. Returns the adapter's `WgpuProbe`; `None` never —
+/// callers wrap it in `catch_unwind` (cubecl panics when no adapter matches the requested API).
+#[cfg(feature = "wgpu")]
+fn init_setup_selected(
+    device: &burn::backend::wgpu::WgpuDevice,
+    options: burn::backend::wgpu::RuntimeOptions,
+) -> burn::backend::wgpu::WgpuSetup {
+    use burn::backend::wgpu::{
+        graphics::{AutoGraphicsApi, Dx12, Metal, Vulkan},
+        init_setup,
+    };
+    match selected_graphics_api() {
+        GraphicsApiChoice::Dx12 => init_setup::<Dx12>(device, options),
+        GraphicsApiChoice::Vulkan => init_setup::<Vulkan>(device, options),
+        GraphicsApiChoice::Metal => init_setup::<Metal>(device, options),
+        GraphicsApiChoice::Auto => init_setup::<AutoGraphicsApi>(device, options),
+    }
+}
+
+/// Ensure the wgpu compute client for `device` is registered under the selected graphics API,
+/// idempotently. The probe brings up `DefaultDevice` (so the ceremony's default-GPU path is
+/// already correct via [`probe_wgpu`]); this is the belt-and-suspenders for a node-directed
+/// *discrete* placement (`WgpuDevice::DiscreteGpu(i)`), which the probe did not register — without
+/// it the router's lazy bring-up would fall back to cubecl's `AutoGraphicsApi` (Vulkan on Windows).
+/// An already-registered device (an "already registered" panic) is caught and left as-is. Never
+/// panics.
+#[cfg(feature = "wgpu")]
+pub fn ensure_wgpu_registered(device: &burn::backend::wgpu::WgpuDevice) {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = init_setup_selected(device, burn::backend::wgpu::RuntimeOptions::default());
+    }));
+    std::panic::set_hook(prev);
+}
+
+/// Linux `MemTotal` (kB) → MiB. `0` when `/proc/meminfo` is unreadable / unparseable.
+#[cfg(target_os = "linux")]
+fn linux_mem_total_mb() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            if let Some(kb) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                return kb / 1024;
+            }
+        }
+    }
+    0
+}
+
+// -------------------------------------------------------------------------------------
+// Unix free-disk FFI (`statvfs`) — Linux + macOS. `libc` is a workspace dep already in the
+// lock (lock-neutral edge); the raw call is the same scoped-`unsafe` pattern the CUDA /
+// Windows / macOS probes use under the crate's `#![deny(unsafe_code)]`.
+// -------------------------------------------------------------------------------------
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod unix_ffi {
+    use super::MIB;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// Free space (available to a non-privileged process) in MiB on `path`'s filesystem, via
+    /// `statvfs`. `0` on any error (e.g. a non-existent path).
+    pub(super) fn disk_free_mb(path: &Path) -> u64 {
+        let mut cpath: Vec<u8> = path.as_os_str().as_bytes().to_vec();
+        cpath.push(0);
+        // SAFETY: `cpath` is a NUL-terminated C string; `stat` is a valid, zero-initialized
+        // `statvfs` out-pointer of the exact type the libc binding expects.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(cpath.as_ptr().cast::<libc::c_char>(), &mut stat) };
+        if rc != 0 {
+            return 0;
+        }
+        let frsize = stat.f_frsize as u64;
+        let avail = stat.f_bavail as u64;
+        frsize.saturating_mul(avail) / MIB
+    }
+}
+
 /// A honest snapshot of what a wgpu adapter exposes for resource planning (feature `wgpu`). Total
 /// VRAM is **not** wgpu-queryable (see the module docs), so [`Self::vram_mb`] reports the adapter's
 /// `max_buffer_size` as a documented lower-bound proxy; [`Self::max_alloc_mb`] is the same limit
@@ -115,15 +330,16 @@ pub fn probe_wgpu() -> Option<WgpuProbe> {
 
 #[cfg(feature = "wgpu")]
 fn probe_wgpu_uncached() -> Option<WgpuProbe> {
-    use burn::backend::wgpu::{graphics::AutoGraphicsApi, init_setup, RuntimeOptions, WgpuDevice};
+    use burn::backend::wgpu::{RuntimeOptions, WgpuDevice};
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    // Tier 1 — canonical bring-up: `init_setup` requests the adapter AND registers the default
-    // client. Full adapter info incl. `device_type` (→ `unified`).
+    // Tier 1 — canonical bring-up: `init_setup_selected` requests the adapter AND registers the
+    // default client UNDER THE SELECTED GRAPHICS API (Dx12 on Windows, else Auto — the DX12 fix),
+    // instead of cubecl's `AutoGraphicsApi` which hardcodes Vulkan off macOS. Full adapter info
+    // incl. `device_type` (→ `unified`).
     let attempt = std::panic::catch_unwind(|| {
-        let setup =
-            init_setup::<AutoGraphicsApi>(&WgpuDevice::DefaultDevice, RuntimeOptions::default());
+        let setup = init_setup_selected(&WgpuDevice::DefaultDevice, RuntimeOptions::default());
         let info = setup.adapter.get_info();
         let limits = setup.adapter.limits();
         let max_alloc_mb = (limits.max_buffer_size / MIB).max(1);
@@ -501,7 +717,7 @@ mod win_ffi {
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
     /// Physical RAM in MiB from `GlobalMemoryStatusEx().ullTotalPhys`; `0` on failure.
-    fn ram_mb() -> u64 {
+    pub(super) fn ram_mb() -> u64 {
         let mut status = MEMORYSTATUSEX {
             dwLength: size_of::<MEMORYSTATUSEX>() as u32,
             ..Default::default()
@@ -509,6 +725,21 @@ mod win_ffi {
         // SAFETY: `status` is a valid, `dwLength`-initialized MEMORYSTATUSEX out-pointer.
         match unsafe { GlobalMemoryStatusEx(&mut status) } {
             Ok(()) => status.ullTotalPhys / MIB,
+            Err(_) => 0,
+        }
+    }
+
+    /// Free disk space (available to the caller) in MiB on `path`'s volume, from
+    /// `GetDiskFreeSpaceExW`. `0` on any error.
+    pub(super) fn disk_free_mb(path: &std::path::Path) -> u64 {
+        use windows::core::HSTRING;
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let dir = HSTRING::from(path.as_os_str());
+        let mut free_to_caller: u64 = 0;
+        // SAFETY: `dir` is a valid wide C string; `free_to_caller` is a valid u64 out-pointer;
+        // the two unused out-params are `None`.
+        match unsafe { GetDiskFreeSpaceExW(&dir, Some(&mut free_to_caller), None, None) } {
+            Ok(()) => free_to_caller / MIB,
             Err(_) => 0,
         }
     }
@@ -650,6 +881,11 @@ mod mac_ffi {
         unsafe { sel_registerName(name.as_ptr()) }
     }
 
+    /// Physical RAM in MiB from `sysctl hw.memsize`; `0` on failure.
+    pub(super) fn ram_mb() -> u64 {
+        sysctl_u64(c"hw.memsize") / super::MIB
+    }
+
     fn sysctl_u64(name: &core::ffi::CStr) -> u64 {
         let mut val: u64 = 0;
         let mut len = size_of::<u64>();
@@ -735,6 +971,73 @@ pub fn cuda_adapter_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The portable host probes return real, nonzero numbers on the host OS (the cross-platform
+    /// leg of the disk/RAM fix — the pre-fix worker hardcoded `disk_free_mb: 0` and read RAM only
+    /// from Linux `/proc`, spuriously failing the trainer lane floor off-Linux).
+    #[test]
+    fn host_ram_and_disk_free_are_nonzero_on_this_host() {
+        assert!(
+            host_ram_mb() > 0,
+            "host RAM probe must report a nonzero total"
+        );
+        let cwd = std::env::current_dir().expect("cwd");
+        assert!(
+            host_disk_free_mb(&cwd) > 0,
+            "free-disk probe must report nonzero on the cwd filesystem"
+        );
+        // A non-existent path yields 0 (never a spurious large number).
+        assert_eq!(
+            host_disk_free_mb(std::path::Path::new(
+                "/definitely/not/a/real/path/for/vhc/probe/test"
+            )),
+            0
+        );
+    }
+
+    /// The DX12 selection fix: Windows defaults to Dx12 (the fleet's third GPU API), Linux/macOS
+    /// keep Auto (Vulkan/Metal — unchanged), and the operator override wins on every OS.
+    #[test]
+    fn graphics_api_selection_defaults_and_override() {
+        // Platform defaults (no override): Windows → Dx12; Linux/macOS → Auto.
+        assert_eq!(
+            resolve_graphics_api("windows", None),
+            GraphicsApiChoice::Dx12,
+            "Windows must default to Dx12 (AutoGraphicsApi would pick Vulkan there)"
+        );
+        assert_eq!(resolve_graphics_api("linux", None), GraphicsApiChoice::Auto);
+        assert_eq!(resolve_graphics_api("macos", None), GraphicsApiChoice::Auto);
+        // The override wins everywhere, case/whitespace-insensitive.
+        assert_eq!(
+            resolve_graphics_api("linux", Some(" DX12 ")),
+            GraphicsApiChoice::Dx12
+        );
+        assert_eq!(
+            resolve_graphics_api("windows", Some("vulkan")),
+            GraphicsApiChoice::Vulkan
+        );
+        assert_eq!(
+            resolve_graphics_api("windows", Some("auto")),
+            GraphicsApiChoice::Auto
+        );
+        assert_eq!(
+            resolve_graphics_api("macos", Some("metal")),
+            GraphicsApiChoice::Metal
+        );
+        // An empty or unrecognized override falls back to the platform default (no silent wrong API).
+        assert_eq!(
+            resolve_graphics_api("windows", Some("")),
+            GraphicsApiChoice::Dx12
+        );
+        assert_eq!(
+            resolve_graphics_api("windows", Some("nonsense")),
+            GraphicsApiChoice::Dx12
+        );
+        assert_eq!(
+            resolve_graphics_api("linux", Some("nonsense")),
+            GraphicsApiChoice::Auto
+        );
+    }
 
     #[test]
     fn parse_amdgpu_mem_mb_fixtures() {
