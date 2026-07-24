@@ -338,6 +338,18 @@ pub struct VhcServiceParts {
 /// the `credentials_ref` to persist.
 type AuthoredDelivery = (Option<protocol::AdmittedTuple>, Vec<u8>, Option<String>);
 
+/// The role-instance that authors + binds this node's SINGLE iroh endpoint for a run
+/// (architecture [CI-10]: the iroh endpoint id is the NODE's transport identity and each admitted
+/// node publishes ONE roster record per run). Identified by `(role, incarnation)` — the pair that
+/// names a role-instance in the instance maps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IrohEndpointOwner {
+    /// The owning role-instance's role.
+    role: String,
+    /// The owning role-instance's incarnation (== its generation).
+    incarnation: u64,
+}
+
 /// One live supervised role-instance: its ledger identity and its worker child.
 struct InstanceEntry {
     /// The identity ADMITTED against the owner ledgers — the arbiter's reservation key. It
@@ -394,6 +406,10 @@ pub struct VhcService {
     /// The pinned iroh bind port per run label (chosen once per node lifetime, so the published
     /// roster addresses and every re-authored credentials body agree on the socket).
     iroh_ports: Mutex<BTreeMap<String, u16>>,
+    /// Which role-instance owns this node's single iroh endpoint per run label ([CI-10]) — see
+    /// [`VhcService::claim_node_iroh_endpoint`]. Co-located siblings of the owner attach WS-only
+    /// instead of binding a second socket on the node's one pinned port.
+    iroh_endpoint: Mutex<BTreeMap<String, IrohEndpointOwner>>,
     /// The service's own `Arc` handle (the event-pump wiring), bound post-construction via [`bind_self`](Self::bind_self)
     /// so `vhc_join`/`start` can spawn a detached event-pump task that outlives the `&self` call.
     /// Unbound (test builds) → the non-streaming `join` path, drained-and-dropped.
@@ -435,6 +451,7 @@ impl VhcService {
             current_run: Mutex::new(None),
             rev: AtomicU64::new(0),
             iroh_ports: Mutex::new(BTreeMap::new()),
+            iroh_endpoint: Mutex::new(BTreeMap::new()),
             me: std::sync::OnceLock::new(),
         }
     }
@@ -622,8 +639,25 @@ impl VhcService {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    // One intent that cannot re-author never blocks the rest of re-convergence
+                    // (the contract in this method's doc): release, surface LOUD, move on. A box
+                    // carrying a superseded run's intent (a re-used ceremony box) must still
+                    // rejoin the run it is actually here for — and must not keep that intent's
+                    // ledger reservation while it fails.
                     self.arbiter.release(&id);
-                    return Err(e);
+                    if self.worker_factory.is_some() {
+                        worker.shutdown().await;
+                    }
+                    let mut emitted = Vec::new();
+                    let _ = self.emit(
+                        VhcEvent::Error {
+                            run_id: run.run_id.clone(),
+                            class: "reconvergence".to_string(),
+                            detail: format!("re-convergence authorship failed: {e}"),
+                        },
+                        &mut emitted,
+                    );
+                    continue;
                 }
             };
             // The credentials-record reference is deterministic per `(role, incarnation)`, so a
@@ -649,9 +683,22 @@ impl VhcService {
             {
                 Ok(rx) => rx,
                 Err(e) => {
-                    // No child came up — surrender the reservation (nothing to observe tear down).
+                    // No child came up — surrender the reservation (nothing to observe tear down)
+                    // and keep re-converging the remaining intents (same contract as above).
                     self.arbiter.release(&id);
-                    return Err(e);
+                    if self.worker_factory.is_some() {
+                        worker.shutdown().await;
+                    }
+                    let mut emitted = Vec::new();
+                    let _ = self.emit(
+                        VhcEvent::Error {
+                            run_id: run.run_id.clone(),
+                            class: "reconvergence".to_string(),
+                            detail: format!("re-convergence join failed: {e}"),
+                        },
+                        &mut emitted,
+                    );
+                    continue;
                 }
             };
             let generation = id.instance;
@@ -1798,7 +1845,9 @@ impl VhcService {
     }
 
     /// Resolve the iroh half of the plane selection (`None` when `[vhc].iroh.enabled` is off —
-    /// the WS-only default, byte-identical to pre-roster behavior):
+    /// the WS-only default, byte-identical to pre-roster behavior — or when another role-instance
+    /// on this node already owns the node's single iroh endpoint for the run, see
+    /// [`Self::claim_node_iroh_endpoint`]):
     ///
     /// 1. pin this run's iroh bind port (once per node lifetime; config `bind_port` or a free
     ///    UDP port) and derive the advertised `ip:port` addresses;
@@ -1821,6 +1870,11 @@ impl VhcService {
             ));
         };
         let run_label = identity.run_label;
+        // The node's iroh endpoint is a NODE-level singleton ([CI-10]): a co-located sibling of
+        // its owner attaches WS-only instead of binding a second socket on the same pinned port.
+        if !self.claim_node_iroh_endpoint(run_label, identity.role, identity.incarnation) {
+            return Ok(None);
+        }
 
         // 1. The pinned bind socket + the advertised addresses (agree by construction).
         let port = self.iroh_bind_port(run_label)?;
@@ -1901,6 +1955,79 @@ impl VhcService {
         Ok(daemon_vhc_session::identity::TrustedBases::from_genesis(
             &env,
         ))
+    }
+
+    /// Claim this node's SINGLE iroh endpoint for `run_label` on behalf of the `(role,
+    /// incarnation)` role-instance about to author credentials. `true` ⇒ this instance authors +
+    /// publishes the node's roster record and binds the pinned socket; `false` ⇒ another LIVE
+    /// role-instance on this node already owns it, so this one attaches WS-only.
+    ///
+    /// **Why ownership is exclusive (architecture [CI-10] / [CI-11]).** The iroh endpoint id is
+    /// the NODE's transport identity — one `identity/iroh.key`, read by both the node's roster
+    /// authorship and every worker's endpoint (`keystore.iroh_secret()`, §7.2) — and each admitted
+    /// node publishes ONE reachability record per run binding that endpoint id to its addresses.
+    /// Two co-resident role-instances therefore cannot each bind their own socket: they would be
+    /// two live iroh endpoints presenting the SAME endpoint id, so a record naming either socket
+    /// is a false statement about the other, roster readers (who fold per node and drop entries
+    /// matching their own endpoint id, [CI-11]) cannot tell them apart, and a peer dialing the node
+    /// reaches whichever socket the fold happened to keep. Co-located role-instances share the
+    /// node's one endpoint; the WS control plane (mandatory on every attach, and the plane every
+    /// member of a run is connected to) carries the sibling's frames.
+    ///
+    /// Ownership is `(role, incarnation)`-keyed and **self-healing**: it is honored only while the
+    /// recorded owner is still a live instance of that run, so a terminal / leave / reconvergence
+    /// at a new incarnation lets the next authorship take the endpoint over. Re-authoring for the
+    /// SAME role-instance (reconvergence within an incarnation) keeps it — the credentials body
+    /// must keep naming the socket the published record already advertises.
+    fn claim_node_iroh_endpoint(&self, run_label: &str, role: &str, incarnation: u64) -> bool {
+        let mut owners = self.iroh_endpoint.lock().expect("iroh endpoint lock");
+        if let Some(owner) = owners.get(run_label) {
+            if owner.role == role && owner.incarnation == incarnation {
+                return true; // Idempotent re-authorship by the owner itself.
+            }
+            if self.iroh_owner_is_live(run_label, owner) {
+                tracing::info!(
+                    run = run_label,
+                    role,
+                    incarnation,
+                    owner_role = owner.role,
+                    owner_incarnation = owner.incarnation,
+                    "co-located role-instance shares this node's single iroh endpoint (owned by \
+                     its sibling): attaching WS-only, no second bind on the node's pinned port"
+                );
+                return false;
+            }
+        }
+        owners.insert(
+            run_label.to_string(),
+            IrohEndpointOwner {
+                role: role.to_string(),
+                incarnation,
+            },
+        );
+        true
+    }
+
+    /// Whether `owner` still names a live role-instance of `run_label` (its primary instance or
+    /// its co-located trainer sibling) — the liveness half of [`Self::claim_node_iroh_endpoint`].
+    fn iroh_owner_is_live(&self, run_label: &str, owner: &IrohEndpointOwner) -> bool {
+        let live = |map: &Mutex<BTreeMap<String, InstanceEntry>>| {
+            map.lock()
+                .expect("instances lock")
+                .get(run_label)
+                .is_some_and(|e| e.id.role == owner.role && e.generation == owner.incarnation)
+        };
+        live(&self.instances) || live(&self.co_trainers)
+    }
+
+    /// Forget which role-instance owned this node's iroh endpoint for `run_label` (the run is
+    /// over — leave / terminal). Purely bookkeeping: a stale owner is already ignored by
+    /// [`Self::claim_node_iroh_endpoint`]'s liveness check.
+    fn forget_node_iroh_endpoint(&self, run_label: &str) {
+        self.iroh_endpoint
+            .lock()
+            .expect("iroh endpoint lock")
+            .remove(run_label);
     }
 
     /// The pinned iroh bind port for `run_label`: the configured `[vhc].iroh.bind_port`, or a
@@ -2544,6 +2671,8 @@ impl VhcApi for VhcService {
             e.worker.shutdown().await;
             self.arbiter.release(&e.id);
         }
+        // The run holds no role-instance here anymore: this node's iroh endpoint is unowned.
+        self.forget_node_iroh_endpoint(&run_id);
         // A leaving coordinator surrenders its seat (fenced release; the floor persists).
         self.release_seat_for(&run_id).await;
         self.emit_changed(Some(run_id));
@@ -2996,7 +3125,7 @@ mod arbitration_tests {
 
     /// A worker seam that never spawns a subprocess — these tests exercise only the node-side
     /// charge derivation + arbiter admission (no worker traffic).
-    struct NoopWorker;
+    pub(super) struct NoopWorker;
 
     #[async_trait]
     impl WorkerControl for NoopWorker {
@@ -3057,7 +3186,7 @@ mod arbitration_tests {
 
     /// A seat-claiming, coordinator-training node over `budget` — the single-peer trainer+coordinator
     /// shape (the ceremony's M4/Strix box in miniature).
-    fn coordinator_trainer_service(budget: OwnerBudget) -> VhcService {
+    pub(super) fn coordinator_trainer_service(budget: OwnerBudget) -> VhcService {
         VhcService::new(VhcServiceParts {
             config: VhcConfig {
                 enabled: true,
@@ -3076,7 +3205,7 @@ mod arbitration_tests {
         })
     }
 
-    fn instance_id(role: &str, instance: u64) -> RoleInstanceId {
+    pub(super) fn instance_id(role: &str, instance: u64) -> RoleInstanceId {
         RoleInstanceId {
             run_id: [0x5A; 32],
             epoch: 0,
@@ -3151,6 +3280,56 @@ mod arbitration_tests {
         );
     }
 
+    /// An admitted role-instance whose LIVE ATTACH was refused must give its duty back. The worker
+    /// reports such a refusal as that generation's terminal (`FailedRetryable` — the fixed worker
+    /// emits one when a plane cannot be brought up), and the node's terminal edge releases the
+    /// ledger. Pre-fix a refused attach produced only a classified `Error` event: no terminal, no
+    /// release, no retry — the admitted-instance record lived on holding 100% duty, which is how
+    /// the Windows box's superseded runs rehydrated on boot and refused every new admission until
+    /// the operator wiped its run state.
+    #[test]
+    fn a_refused_live_attach_releases_the_instances_duty() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        let svc = coordinator_trainer_service(budget);
+
+        // The co-located trainer is admitted (full duty) and live.
+        let id = instance_id("trainer", 8);
+        let charge = svc.derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer");
+        svc.admit_placed(&id, charge, 100).expect("trainer admits");
+        svc.co_trainers.lock().unwrap().insert(
+            "run-a".to_string(),
+            InstanceEntry {
+                id,
+                generation: 8,
+                worker: Arc::new(NoopWorker),
+            },
+        );
+        assert_eq!(svc.arbiter.remaining().duty_pct, 0, "the ledger is spent");
+
+        // Its worker could not bring up its transport: the typed, generation-stamped terminal.
+        svc.handle_worker_event(&protocol::Event::RunTerminated {
+            run_id: "run-a".to_string(),
+            generation: 8,
+            outcome: protocol::TerminalOutcome::FailedRetryable {
+                reason: "iroh plane: iroh gossip plane did not come up within 60s".to_string(),
+            },
+        })
+        .expect("terminal handled");
+
+        assert_eq!(
+            svc.arbiter.remaining().duty_pct,
+            100,
+            "a refused attach must return its duty to the ledger, not hold it until a state wipe"
+        );
+        assert_eq!(svc.arbiter.remaining().instances, 0);
+    }
+
     /// The negative: over-budget refusal still works — a SECOND full-duty (trainer) role-instance
     /// on the same box exceeds the 100% duty ledger and is refused TYPED (`DutyExhausted`), so the
     /// fix widens admission for the legitimate coordinator+trainer pair without disabling the
@@ -3189,5 +3368,98 @@ mod arbitration_tests {
             ),
             "expected a typed duty-exhausted refusal, got {refusal:?}"
         );
+    }
+}
+
+/// Defect — the co-located role-instance iroh **bind collision** (the M4 + Windows fleet-smoke
+/// blocker): with `coordinator_trains = true` both role-instances of one node authored their own
+/// iroh endpoint on the node's single pinned `[vhc.iroh] bind_port`, so the second one either
+/// failed closed (`endpoint bind failed: Failed to bind sockets`, macOS) or hung before seed-init
+/// (Windows). The node's iroh endpoint is a NODE-level singleton ([CI-10]: one `identity/iroh.key`,
+/// one reachability record per run), so exactly one role-instance per `(node, run)` may own it and
+/// its co-located siblings attach WS-only. These tests pin that ownership contract.
+#[cfg(test)]
+mod iroh_endpoint_tests {
+    use super::arbitration_tests::{coordinator_trainer_service, instance_id, NoopWorker};
+    use super::*;
+
+    /// Register `role`/`incarnation` as the run's live PRIMARY role-instance (what a completed
+    /// join does) so the ownership liveness check has something to observe.
+    fn live_primary(svc: &VhcService, run: &str, role: &str, incarnation: u64) {
+        svc.instances.lock().unwrap().insert(
+            run.to_string(),
+            InstanceEntry {
+                id: instance_id(role, incarnation),
+                generation: incarnation,
+                worker: Arc::new(NoopWorker),
+            },
+        );
+    }
+
+    /// The ceremony's Strix/M4 shape: the seat instance authors first and owns the node's endpoint
+    /// (hence the pinned `bind_port`); its co-located trainer sibling does NOT get a second
+    /// endpoint while the owner is live, so the two never contend for the same socket.
+    #[test]
+    fn a_co_located_sibling_never_authors_a_second_iroh_endpoint() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        assert!(
+            svc.claim_node_iroh_endpoint("run-a", "coordinator", 7),
+            "the first (seat) instance takes the node's endpoint"
+        );
+        assert!(
+            svc.claim_node_iroh_endpoint("run-a", "coordinator", 7),
+            "re-authorship within the incarnation keeps it (the published record's socket stands)"
+        );
+        live_primary(&svc, "run-a", "coordinator", 7);
+        assert!(
+            !svc.claim_node_iroh_endpoint("run-a", "trainer", 8),
+            "the co-located trainer must attach WS-only, never bind the node's port twice"
+        );
+        // Ownership is per RUN: the same node joining another run authors that run's endpoint.
+        assert!(svc.claim_node_iroh_endpoint("run-b", "trainer", 8));
+    }
+
+    /// Ownership is self-healing: once the owning instance is gone (terminal / leave / a
+    /// reconvergence that minted a new incarnation), the next authorship takes the endpoint over —
+    /// a dead owner can never strand the node's reachability.
+    #[test]
+    fn a_dead_owner_hands_the_endpoint_to_the_next_authorship() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        assert!(svc.claim_node_iroh_endpoint("run-a", "coordinator", 7));
+        live_primary(&svc, "run-a", "coordinator", 7);
+        assert!(!svc.claim_node_iroh_endpoint("run-a", "trainer", 8));
+
+        // The owner's instance is reaped (the terminal edge removed it).
+        svc.instances.lock().unwrap().remove("run-a");
+        assert!(
+            svc.claim_node_iroh_endpoint("run-a", "trainer", 8),
+            "an owner that is no longer live releases the node's endpoint"
+        );
+        live_primary(&svc, "run-a", "trainer", 8);
+
+        // The coordinator rejoining at a NEW incarnation finds the endpoint held by a live owner.
+        assert!(!svc.claim_node_iroh_endpoint("run-a", "coordinator", 9));
+
+        // Leaving the run drops the bookkeeping outright.
+        svc.forget_node_iroh_endpoint("run-a");
+        assert!(svc.claim_node_iroh_endpoint("run-a", "coordinator", 9));
+    }
+
+    /// A co-located sibling is recognised as a live owner too (the endpoint may be owned by the
+    /// trainer half of the pair — whichever authored first), so the coordinator does not then bind
+    /// a second socket behind its back.
+    #[test]
+    fn a_co_trainer_owner_is_honored_as_live() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        assert!(svc.claim_node_iroh_endpoint("run-a", "trainer", 4));
+        svc.co_trainers.lock().unwrap().insert(
+            "run-a".to_string(),
+            InstanceEntry {
+                id: instance_id("trainer", 4),
+                generation: 4,
+                worker: Arc::new(NoopWorker),
+            },
+        );
+        assert!(!svc.claim_node_iroh_endpoint("run-a", "coordinator", 5));
     }
 }

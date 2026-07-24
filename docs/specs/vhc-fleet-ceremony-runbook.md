@@ -381,7 +381,27 @@ coordinator endpoint). The build host's config additionally volunteers for the c
 genesis names its base identity as the coordinator). Windows uses the same TOML; the named-pipe
 socket is implied (`DAEMON_SOCKET_PATH` only if non-default).
 
+`bind_port` is **one port per BOX**, and that holds on the box that also trains
+(`coordinator_trains = true`). The iroh endpoint is a node-level identity — one keystore transport
+key, one published roster record per run (architecture [CI-10]) — so co-located role-instances share
+the box's single endpoint rather than binding a port each: the instance that joins first (the seat
+instance on the build host) owns it, and its sibling attaches over the WS control plane every member
+of the run is already on. The node says so explicitly (`co-located role-instance shares this node's
+single iroh endpoint … attaching WS-only`); it is the intended topology, not a degraded run. Giving
+a co-located instance its own port would publish reachability the box cannot honor (two live
+endpoints, one endpoint id).
+
 ### 5.2 Evidence capture starts before bring-up
+
+Start every box on **fresh vhc run state**. A persisted join intent from a superseded run rehydrates
+at boot and is re-admitted against the owner ledgers before the node knows whether that run still
+exists (the reservation is what converges the ledger to the genuinely-running set), so a stale
+trainer intent holds a full accelerator-duty until its re-join resolves — bounded now (a refused
+attach reports a typed terminal, releasing the duty and scheduling the retry; a failed re-authorship
+no longer aborts the other intents' re-convergence), but still a noisy start. Either
+`daemon-cli vhc leave <old-run>` first, or wipe the run state (`vhc.db*`, `vhc/runs/`,
+`vhc/identity/runs/`) while PRESERVING `vhc/identity/base.key` — the genesis trust set names that
+base identity.
 
 On each box: node log to a file (`RUST_LOG=info,daemon_vhc=debug`); record the journal paths under the
 node state dir (the primary replay artifact). On the build host, start the digest-transcript

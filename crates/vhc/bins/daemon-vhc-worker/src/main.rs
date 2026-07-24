@@ -74,11 +74,43 @@ fn in_process_providers() -> RoleProviders {
     }
 }
 
+/// A live-attach refusal: the operator-facing detail plus the class the worker reports it under.
+///
+/// Classification is load-bearing: a plane that could not be dialed/bound (or that blew its
+/// bring-up deadline) is [`ErrorClass::Transient`] — a recoverable environment fault the node
+/// re-converges under its retry budget — while everything else keeps the module class. Without it
+/// every attach failure looked the same to the node.
+#[cfg(feature = "vhc-net")]
+struct AttachRefusal {
+    class: ErrorClass,
+    detail: String,
+}
+
+#[cfg(feature = "vhc-net")]
+impl From<String> for AttachRefusal {
+    fn from(detail: String) -> Self {
+        Self {
+            class: ErrorClass::Module,
+            detail,
+        }
+    }
+}
+
+#[cfg(feature = "vhc-net")]
+impl From<daemon_vhc_session::providers::PlaneError> for AttachRefusal {
+    fn from(e: daemon_vhc_session::providers::PlaneError) -> Self {
+        Self {
+            class: e.class(),
+            detail: e.to_string(),
+        }
+    }
+}
+
 /// Author the live role-session spec for a join whose credentials selected the production
 /// planes: re-run the admission binding, open the durable journal home, and construct the
 /// transport providers from the plane selection (WS connect fails FAST on an unreachable
-/// endpoint — one dial, typed error; reconnect policy applies only to an established plane, so
-/// the command loop never hangs here).
+/// endpoint — one dial, typed error; every plane bring-up is bounded by the session crate's
+/// bring-up deadline, so the command loop never hangs here).
 #[cfg(feature = "vhc-net")]
 async fn join_live(
     resolved: &backend::ResolvedRun,
@@ -87,7 +119,7 @@ async fn join_live(
     coordinator: &str,
     creds: &daemon_vhc_session::protocol::SessionCredentials,
     incarnation: u64,
-) -> Result<RoleSessionSpec, String> {
+) -> Result<RoleSessionSpec, AttachRefusal> {
     use daemon_vhc_session::providers::{build_role_providers, LiveAttachInputs};
 
     // Credentials bind to ONE run identity: a body authored for a different genesis refuses.
@@ -96,7 +128,8 @@ async fn join_live(
         return Err(format!(
             "JoinRun for run `{run_id}`: the credentials' genesis hash does not match the \
              resolved run (credentials authored for a different run)"
-        ));
+        )
+        .into());
     }
     let binding = backend::role_binding(resolved, genesis, run_id, incarnation)?;
     let journal = journal_sink(run_id, &binding.run.identity)?;
@@ -507,7 +540,36 @@ async fn main() {
                             let handle = spawn_role(run_id.clone(), spec, role_events.clone());
                             roles.insert(run_id, handle);
                         }
-                        Err(detail) => send(&writer, &worker_error(&detail)).await,
+                        Err(refusal) => {
+                            // The classified refusal (a transport bring-up fault is retryable).
+                            send(
+                                &writer,
+                                &Event::Error {
+                                    class: refusal.class,
+                                    detail: refusal.detail.clone(),
+                                },
+                            )
+                            .await;
+                            // ...and the OBSERVED TERMINAL for the generation the node admitted.
+                            // No role session was spawned, so nothing else will ever report this
+                            // instance's exit: without the terminal the node's admitted-instance
+                            // record lives on holding its ledger reservation (the Windows
+                            // fleet-smoke stale-duty finding — persisted intents rehydrated on
+                            // boot, refused their attach, and kept 100% duty until the operator
+                            // wiped run state) and no retry is ever scheduled. Retryable: the
+                            // node's bounded retry budget escalates to terminal on its own.
+                            send(
+                                &writer,
+                                &Event::RunTerminated {
+                                    run_id: run_id.clone(),
+                                    generation: expected.incarnation,
+                                    outcome: protocol::TerminalOutcome::FailedRetryable {
+                                        reason: refusal.detail,
+                                    },
+                                },
+                            )
+                            .await;
+                        }
                     }
                     continue;
                 }
