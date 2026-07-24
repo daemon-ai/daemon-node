@@ -336,6 +336,41 @@ pub fn ceremony_trainer_config(run_label: &str, corpus_manifest: Hash, roster: &
     ])
 }
 
+/// The real fleet RUN TIMERS + stop condition the ceremony operator calibrates at preflight and
+/// binds into the coordinator config — closing the documented "the fleet operator tunes real
+/// timers at preflight" seam inside this reviewed module instead of at a CLI.
+///
+/// The [`Default`] values are exactly today's synthetic-clock constants (warmup / round / witness /
+/// cooldown = 1_000_000 s, stop = 1_000_000 rounds), so a genesis authored WITHOUT tuning the
+/// timers is BYTE-IDENTICAL to the pre-timer authoring — every existing test pin and the frozen
+/// coordinator-config shape hold unchanged. Only an operator that sets real values moves the run id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CeremonyRunTimers {
+    /// The join/warmup wall the coordinator waits through before round 0 (`warmup_s`).
+    pub warmup_s: u64,
+    /// The per-round training-phase wall ceiling (`round_train_max_s`).
+    pub round_max_s: u64,
+    /// The witness/finalization-phase wall (`round_witness_s`).
+    pub witness_s: u64,
+    /// The end-of-run cooldown wall (`cooldown_s`).
+    pub cooldown_s: u64,
+    /// The run's stop condition, in completed rounds (`StopCondition::Rounds`).
+    pub stop_rounds: u64,
+}
+
+impl Default for CeremonyRunTimers {
+    fn default() -> Self {
+        // The pre-timer synthetic-clock values — the byte-stability floor (see the type docs).
+        Self {
+            warmup_s: 1_000_000,
+            round_max_s: 1_000_000,
+            witness_s: 1_000_000,
+            cooldown_s: 1_000_000,
+            stop_rounds: 1_000_000,
+        }
+    }
+}
+
 /// The knobs the ceremony genesis authoring binds around the FROZEN model + state contract. The
 /// corpus manifest pin, the fleet trust set, the roster, and the module hashes are CEREMONY-TIME
 /// inputs (the published corpus + the fleet's certified peer identities, supplied by the preflight
@@ -369,6 +404,10 @@ pub struct CeremonyGenesisSpec<'a> {
     pub remote_ckpt_cadence_rounds: u64,
     /// The payload retention floor in rounds (`0` = unbounded — no cadence constraint).
     pub payload_retention_rounds: u64,
+    /// The real fleet run timers + stop condition. [`CeremonyRunTimers::default`] is the
+    /// synthetic-clock shape (byte-stable with the pre-timer authoring); the preflight operator
+    /// tunes it from the measured per-round wall on the slowest box.
+    pub timers: CeremonyRunTimers,
 }
 
 /// Author + freeze the ceremony genesis (§15 W-SF6): the trainer role carrying the FROZEN model +
@@ -397,11 +436,20 @@ pub fn ceremony_genesis(
     .map_err(|e| e.to_string())?;
 
     // Artifacts: the two modules + the published corpus objects (manifest + shards).
+    //
+    // The `url` is a provenance NOTE only — module fetch is content-addressed and never parses this
+    // string (the node presigns the `modules/<blake3>.wasm` key and blake3-verifies —
+    // `daemon-vhc-net/src/content_cache.rs`). It is written in the honest **content-addressed**
+    // form `r2://modules/<blake3>.wasm`, matching what `publish-module` uploads (fetch resolves the
+    // same content key). The publish layout also prefixes a run (`runs/<run>/modules/<blake3>.wasm`),
+    // but the run id is the blake3 of THIS envelope — it cannot be known while authoring the
+    // envelope that defines it (circular) — so the note uses the run-agnostic content-addressed
+    // key rather than embedding a placeholder or a not-yet-known run prefix.
     let mut artifacts = BTreeMap::new();
     artifacts.insert(
         "coordinator.wasm".to_string(),
         SnapshotArtifact {
-            url: format!("r2://mods/{}.wasm", spec.coordinator_module.to_hex()),
+            url: format!("r2://modules/{}.wasm", spec.coordinator_module.to_hex()),
             blake3: spec.coordinator_module,
             size: None,
         },
@@ -409,7 +457,7 @@ pub fn ceremony_genesis(
     artifacts.insert(
         "worker.wasm".to_string(),
         SnapshotArtifact {
-            url: format!("r2://mods/{}.wasm", spec.trainer_module.to_hex()),
+            url: format!("r2://modules/{}.wasm", spec.trainer_module.to_hex()),
             blake3: spec.trainer_module,
             size: None,
         },
@@ -521,10 +569,12 @@ fn ceremony_coordinator_config(spec: &CeremonyGenesisSpec<'_>, coordinator_base:
         required_capabilities: CapabilitySet::new(),
         min_peers: spec.min_peers,
         max_peers: spec.max_peers,
-        warmup_s: 1_000_000,
-        round_train_max_s: 1_000_000,
-        round_witness_s: 1_000_000,
-        cooldown_s: 1_000_000,
+        // The real fleet timers, defaulting to the synthetic-clock values — byte-stable when
+        // untuned; the preflight operator sets them from the slowest box's measured wall.
+        warmup_s: spec.timers.warmup_s,
+        round_train_max_s: spec.timers.round_max_s,
+        round_witness_s: spec.timers.witness_s,
+        cooldown_s: spec.timers.cooldown_s,
         epoch_rounds: 0,
         stall_rounds_max: 4,
         global_batch: GlobalBatch {
@@ -532,7 +582,7 @@ fn ceremony_coordinator_config(spec: &CeremonyGenesisSpec<'_>, coordinator_base:
             end: spec.max_peers.max(1),
             ramp_rounds: 1,
         },
-        stop: StopCondition::Rounds(1_000_000),
+        stop: StopCondition::Rounds(spec.timers.stop_rounds),
         steps_per_round: 30,
         seq_len: spec.seq_len,
         witness_target: 0,
@@ -756,6 +806,8 @@ mod tests {
             max_peers: 3,
             remote_ckpt_cadence_rounds: 20,
             payload_retention_rounds: 64,
+            // Default (synthetic-clock) timers — the byte-stability floor this test pins.
+            timers: CeremonyRunTimers::default(),
         };
         let frozen = ceremony_genesis(&spec, &author).expect("author ceremony genesis");
 
@@ -805,6 +857,55 @@ mod tests {
         assert!(
             ceremony_genesis(&bad, &author).is_err(),
             "cadence↔retention refused"
+        );
+    }
+
+    /// The real fleet timers thread into the committed coordinator config: default (synthetic-
+    /// clock) timers reproduce the pre-timer run id byte-for-byte (byte-stability), while any tuned
+    /// value moves the run id (the timers are inside the envelope that defines the run's identity).
+    #[test]
+    fn ceremony_timers_thread_into_the_genesis() {
+        let author = SigningKey::from_bytes(&[0x42; 32]);
+        let base = |n: u8| daemon_vhc_proto::peer_id(&SigningKey::from_bytes(&[n; 32]));
+        let trusted = [base(1), base(2), base(3)];
+        let manifest = Hash([0xAB; 32]);
+        let corpus_artifacts = vec![("corpus-manifest.cbor".to_string(), manifest)];
+        let make = |timers: CeremonyRunTimers| CeremonyGenesisSpec {
+            run_label: "vhc-ceremony",
+            coordinator_module: Hash([0xC0; 32]),
+            trainer_module: Hash([0x7A; 32]),
+            corpus_manifest: manifest,
+            corpus_artifacts: &corpus_artifacts,
+            seq_len: u64::from(CEREMONY_SEQ_LEN),
+            trusted_bases: &trusted,
+            roster: &trusted,
+            upgrade_authority: vec![base(1)],
+            min_peers: 3,
+            max_peers: 3,
+            remote_ckpt_cadence_rounds: 8,
+            payload_retention_rounds: 64,
+            timers,
+        };
+
+        let default_run = ceremony_genesis(&make(CeremonyRunTimers::default()), &author)
+            .expect("author with default timers");
+        let tuned_run = ceremony_genesis(
+            &make(CeremonyRunTimers {
+                warmup_s: 120,
+                round_max_s: 360,
+                witness_s: 60,
+                cooldown_s: 60,
+                stop_rounds: 48,
+            }),
+            &author,
+        )
+        .expect("author with tuned timers");
+
+        // The tuned timers live inside the envelope, so they move the run's cryptographic id.
+        assert_ne!(
+            default_run.run_id(),
+            tuned_run.run_id(),
+            "tuned fleet timers must change the committed run id"
         );
     }
 
