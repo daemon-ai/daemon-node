@@ -822,10 +822,10 @@ pub(crate) fn measured_backend(
 }
 
 /// The engine config a JOIN runs under: the measured backend selection materialized
-/// (`EngineConfig.backend` + `gpu_index`), with the roomy 160M-scale sandbox budgets on the
-/// device lanes and under an explicit operator selection (the defaults are tuned for the tiny
-/// reference model; a 768-wide model's real fp32 steps trip the 5 s epoch watchdog — mirrors
-/// `preset_160m.rs::roomy_engine`).
+/// (`EngineConfig.backend` + `gpu_index`), with the REAL-MODEL sandbox budgets
+/// ([`EngineConfig::real_model`]) on the device lanes and under an explicit operator selection
+/// (the defaults are tuned for the tiny reference model; a real geometry's fp32 steps trip the 5 s
+/// epoch watchdog and its fresh-join seed-init expansion trips the default fuel budget).
 ///
 /// # Errors
 ///
@@ -843,15 +843,7 @@ pub(crate) fn engine_for_join(
     })?;
     let gpu_index = backend.is_device().then_some(sel.gpu_index);
     if backend.is_device() || directed_backend().is_some() {
-        Ok(EngineConfig {
-            fuel_per_call: 1 << 34,
-            epoch_deadline: std::time::Duration::from_secs(600),
-            op_budget: 1 << 30,
-            max_step_handles: 1 << 24,
-            backend,
-            gpu_index,
-            ..EngineConfig::default()
-        })
+        Ok(EngineConfig::real_model(backend, gpu_index))
     } else {
         Ok(EngineConfig {
             backend,
@@ -867,14 +859,7 @@ pub(crate) fn engine_for_join(
 /// join engine.
 pub(crate) fn assess_engine_config() -> EngineConfig {
     if std::env::var_os("DAEMON_TRAIN_BACKEND").is_some() {
-        EngineConfig {
-            fuel_per_call: 1 << 34,
-            epoch_deadline: std::time::Duration::from_secs(600),
-            op_budget: 1 << 30,
-            max_step_handles: 1 << 24,
-            backend: daemon_vhc_host::BackendKind::Cpu,
-            ..EngineConfig::default()
-        }
+        EngineConfig::real_model(daemon_vhc_host::BackendKind::Cpu, None)
     } else {
         EngineConfig::default()
     }
