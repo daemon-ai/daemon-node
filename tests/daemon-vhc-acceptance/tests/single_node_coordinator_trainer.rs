@@ -14,6 +14,14 @@
 //! This is the ceremony's Strix shape in miniature (trainer + coordinator seat) and the exact gap
 //! the three-node baseline never caught — there the coordinator node is coordinator-ONLY (its
 //! two SEPARATE trainer nodes meet the floor).
+//!
+//! The second gate here closes the TRANSPORT half of the same honesty gap: the first one runs the
+//! WS-only plane, so it stayed GREEN while BOTH real boxes failed at iroh bring-up — two
+//! co-located role-instances each authoring an endpoint on the node's ONE pinned
+//! `[vhc.iroh] bind_port` (fail-closed `Failed to bind sockets` on macOS, a silent pre-seed-init
+//! hang on Windows/DX12). A colocation gate that never binds an iroh socket cannot catch that, so
+//! `single_node_coordinator_and_trainer_over_a_pinned_iroh_plane` runs the SAME dual-plane
+//! transport the fleet runs, on ONE host, with ONE pinned bind port.
 
 mod harness;
 
@@ -21,11 +29,18 @@ use std::time::Duration;
 
 use harness::{
     assert_api_digests_cover_and_match_journal, base_peer, collect_api_digests, join,
-    journal_digests, leave, seed_corpus_fs, spawn_node_with_budget, start_cluster_membership,
-    wait_rounds, NodeSpec,
+    journal_digests, leave, node_log_contains, seed_corpus_fs, spawn_node_with_budget,
+    start_cluster_membership, wait_rounds, NodeSpec,
 };
 
 const RUN: &str = "acceptance-single-peer";
+/// The colocation gate's run over the pinned iroh plane (its own run label + node names, so the
+/// two gates in this file never share state).
+const RUN_IROH: &str = "acceptance-single-peer-iroh";
+/// The owner budget both gates run: ONE full accelerator-duty (the ledger the shipped node
+/// derives by default), device/host sized large so DUTY is the exercised constraint.
+const FINITE_DUTY_BUDGET: &str =
+    "duty_pct = 100\nhost_ram_mb = 131072\n\n[vhc.owner_budget.device_memory_mb]\n\"gpu:0\" = 131072\n";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_node_coordinator_and_trainer_completes_rounds() {
@@ -61,7 +76,7 @@ async fn single_node_coordinator_and_trainer_completes_rounds() {
             initial_backoff_ms: 0,
         },
         "coordinator_trains = true\n",
-        "duty_pct = 100\nhost_ram_mb = 131072\n\n[vhc.owner_budget.device_memory_mb]\n\"gpu:0\" = 131072\n",
+        FINITE_DUTY_BUDGET,
     );
 
     let bases = [base_peer(&node)];
@@ -88,6 +103,100 @@ async fn single_node_coordinator_and_trainer_completes_rounds() {
     assert_api_digests_cover_and_match_journal(&api, &journal_digests(&node, RUN), rounds);
 
     leave(&node, RUN, daemon_api::VhcLeaveMode::Graceful, "op-leave").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    drop(cluster);
+}
+
+/// The same one-box coordinator+trainer topology, now over the **iroh dual plane with a PINNED
+/// bind port** — the ceremony's `[vhc.iroh] bind_port = 41414`-per-box config on the node that
+/// also trains (runbook §9.1).
+///
+/// Both fleet boxes died exactly here: the seat instance bound the pinned port, then the
+/// co-located trainer authored a SECOND endpoint on the same port and either failed closed
+/// (`iroh gossip plane: … endpoint bind failed: Failed to bind sockets`) or hung silently before
+/// seed-init — 0 rounds either way. The node's iroh endpoint is a NODE-level singleton
+/// (architecture [CI-10]: one keystore transport identity, ONE reachability record per run), so
+/// the seat instance owns it and its co-located sibling attaches WS-only; the run then reaches its
+/// own membership floor and completes real rounds over the transport the fleet actually runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_node_coordinator_and_trainer_over_a_pinned_iroh_plane() {
+    let _serial = harness::serial_guard();
+    let payload_root = tempfile::tempdir().expect("shared payload root");
+
+    let base_port = harness::free_port();
+    let base_url = format!("http://127.0.0.1:{base_port}/api/v1/vhc");
+
+    // ONE pinned UDP port for the whole box — the ceremony pin, not a node-picked ephemeral one
+    // (`bind_port = 0` can never collide, which is precisely why the existing dual-plane gate
+    // never caught this).
+    let bind_port = harness::free_udp_port();
+    // `coordinator_trains` is a bare `[vhc]` key, so it must precede the `[vhc.iroh]` table.
+    let extra =
+        format!("coordinator_trains = true\n[vhc.iroh]\nenabled = true\nbind_port = {bind_port}\n");
+
+    let node = spawn_node_with_budget(
+        &NodeSpec {
+            name: "single-peer-iroh",
+            registry_base: &base_url,
+            seat_claim: true,
+            payload_dir: Some(payload_root.path()),
+            allowlist: &base_url,
+            reconcile_tick_ms: 500,
+            initial_backoff_ms: 0,
+        },
+        &extra,
+        FINITE_DUTY_BUDGET,
+    );
+
+    let bases = [base_peer(&node)];
+    let cluster = start_cluster_membership(base_port, RUN_IROH, &bases, 0, 2, 1, 1).await;
+    seed_corpus_fs(payload_root.path(), RUN_IROH, &cluster.genesis);
+
+    join(&node, RUN_IROH, "op-single-iroh").await;
+
+    let rounds = 2u64;
+    let timeout = Duration::from_secs(240);
+    let reached = wait_rounds(&node, RUN_IROH, rounds, timeout).await;
+    assert!(
+        reached >= rounds,
+        "the co-located trainer must complete ≥{rounds} rounds over the pinned iroh plane (got \
+         {reached})"
+    );
+
+    // The transport actually came up on the PINNED socket (the endpoint the node published), and
+    // the co-located sibling shared the node's single endpoint instead of binding a second one.
+    assert!(
+        node_log_contains("single-peer-iroh", "iroh gossip plane up"),
+        "the seat instance's iroh endpoint never came up — this gate must run the real dual plane"
+    );
+    assert!(
+        node_log_contains(
+            "single-peer-iroh",
+            "co-located role-instance shares this node's single iroh endpoint"
+        ),
+        "the co-located trainer must be told to share the node's endpoint (else it is binding its \
+         own socket and this gate is not covering the fleet defect)"
+    );
+    // The regression itself: no second bind was attempted, on any platform.
+    for marker in ["endpoint bind failed", "Failed to bind sockets"] {
+        assert!(
+            !node_log_contains("single-peer-iroh", marker),
+            "an iroh bind failure (`{marker}`) surfaced on the co-located box"
+        );
+    }
+
+    // The G-2 evidence still holds on the product path over the dual plane.
+    let api = collect_api_digests(&node, RUN_IROH, rounds, timeout).await;
+    assert_api_digests_cover_and_match_journal(&api, &journal_digests(&node, RUN_IROH), rounds);
+
+    leave(
+        &node,
+        RUN_IROH,
+        daemon_api::VhcLeaveMode::Graceful,
+        "op-leave-iroh",
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     drop(cluster);

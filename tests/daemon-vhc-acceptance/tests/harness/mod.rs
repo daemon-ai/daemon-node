@@ -124,6 +124,18 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// A free loopback **UDP** port — what an iroh endpoint binds. The colocation gates PIN this into
+/// `[vhc.iroh] bind_port` exactly as the ceremony runbook pins a per-box port, so the gate
+/// exercises the pinned-socket path (a node-picked `bind_port = 0` cannot collide and would hide
+/// the co-located bind collision the fleet smoke hit).
+pub fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("bind ephemeral udp port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
 /// The path to a built guest blob (the guests workspace's release target).
 pub fn guest_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
