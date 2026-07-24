@@ -530,7 +530,17 @@ impl HostCompute {
             crate::runtime::BackendKind::Wgpu => {
                 let slot = DeviceComputeGuard::acquire()?;
                 let device = match cfg.gpu_index {
-                    Some(i) => burn::backend::wgpu::WgpuDevice::DiscreteGpu(i as usize),
+                    Some(i) => {
+                        let d = burn::backend::wgpu::WgpuDevice::DiscreteGpu(i as usize);
+                        // The probe registered only `DefaultDevice` under the selected graphics
+                        // API (Dx12 on Windows); a node-directed discrete placement must register
+                        // THAT device under the same API too, else the router's lazy bring-up
+                        // falls back to cubecl's `AutoGraphicsApi` (Vulkan on Windows). Idempotent
+                        // + panic-safe. (The `None`/default path is already brought up by the
+                        // mandatory `backend_available` → `probe_wgpu` that precedes this.)
+                        crate::probe::ensure_wgpu_registered(&d);
+                        d
+                    }
                     None => burn::backend::wgpu::WgpuDevice::DefaultDevice,
                 };
                 let runner = catch_bringup(|| ComputeRunner::<burn::backend::Wgpu>::new(device))

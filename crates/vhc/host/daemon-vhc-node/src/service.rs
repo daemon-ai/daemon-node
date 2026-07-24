@@ -360,8 +360,17 @@ pub struct VhcService {
     /// The D6 owner arbiter: every join is admitted against the aggregate typed ledgers before
     /// any child is touched, and released only on observed teardown.
     arbiter: OwnerArbiter,
-    /// Per-role-instance children (Phase E N-sandbox supervision), keyed by `RunLabel`.
+    /// Per-role-instance children (Phase E N-sandbox supervision), keyed by `RunLabel`. Holds the
+    /// node's PRIMARY role-instance for a run (the coordinator seat instance on a seat-claiming
+    /// node, else the trainer).
     instances: Mutex<BTreeMap<String, InstanceEntry>>,
+    /// The CO-LOCATED trainer role-instance a seat-holding node ALSO runs when
+    /// `[vhc].coordinator_trains` is set (a trainer+coordinator box — the single-peer /
+    /// self-coordinated fix, defect D). Keyed by `RunLabel`, SEPARATE from `instances` (which holds
+    /// the coordinator seat instance) so the primary join/leave/reconcile bookkeeping is unchanged;
+    /// its own worker child, incarnation, and ledger reservation. Empty unless the flag is set, so
+    /// every existing gate is byte-identical.
+    co_trainers: Mutex<BTreeMap<String, InstanceEntry>>,
     worker_factory: Option<WorkerFactory>,
     /// The identity keystore directory (D-P8 credential + per-run cert authorship); `None`
     /// disables node-side authorship (tests / headless).
@@ -416,6 +425,7 @@ impl VhcService {
             discovery: parts.discovery,
             arbiter: OwnerArbiter::new(parts.budget.unwrap_or_else(OwnerBudget::unbounded)),
             instances: Mutex::new(BTreeMap::new()),
+            co_trainers: Mutex::new(BTreeMap::new()),
             worker_factory: parts.worker_factory,
             identity_dir: parts.identity_dir,
             seat,
@@ -655,6 +665,15 @@ impl VhcService {
             );
             self.spawn_pump(Some((run.run_id.clone(), generation)), rx);
             self.store.mark_running(&run.run_id)?;
+            // Defect D: reconverge the co-located trainer sibling for a seat/coordinator run when
+            // `coordinator_trains` is set (best-effort — a restart re-seats then re-trains).
+            if self.config.coordinator_trains
+                && !run.role.is_empty()
+                && run.role == self.config.seat_role
+            {
+                self.spawn_co_located_trainer(&run.run_id, &run.policy)
+                    .await;
+            }
             rejoined += 1;
         }
         if rejoined > 0 {
@@ -990,6 +1009,140 @@ impl VhcService {
         }
     }
 
+    /// Bring up the CO-LOCATED trainer role-instance for a seat-holding node (defect D — the
+    /// single-peer / trainer+coordinator fix). It runs in a SEPARATE worker child (one sandbox =
+    /// one role-instance) that assesses + joins the run's **trainer** role and attaches to the
+    /// coordinator THIS node just seated, exactly like a remote trainer — so a self-coordinated run
+    /// meets its own membership floor instead of parking at `peers=0` below `min_peers`.
+    ///
+    /// Requires the per-role-instance worker factory (the coordinator seat instance already holds
+    /// the shared/primary worker; a second concurrent role-instance needs its own child). It is
+    /// best-effort: any failure is surfaced as a `Warning` event and warned, but never fails the
+    /// (already-succeeded) coordinator join — the absence of round progress is the operator signal.
+    async fn spawn_co_located_trainer(&self, run_id: &str, policy: &VhcPolicy) {
+        let mut emitted = Vec::new();
+        macro_rules! warn_co {
+            ($detail:expr) => {{
+                let _ = self.emit(
+                    VhcEvent::Warning {
+                        run_id: run_id.to_string(),
+                        class: "co_trainer".to_string(),
+                        detail: $detail,
+                    },
+                    &mut emitted,
+                );
+            }};
+        }
+        if self.worker_factory.is_none() {
+            warn_co!(
+                "coordinator_trains is set but no per-role-instance worker factory is configured; \
+                 the co-located trainer cannot start"
+                    .to_string()
+            );
+            return;
+        }
+        // Idempotent: a repeated seat-join re-converges on the existing co-trainer.
+        if self.co_trainers.lock().unwrap().contains_key(run_id) {
+            return;
+        }
+        let worker = self.instance_worker();
+        // Assess + resolve the coordinator endpoint for the TRAINER role (node-directed).
+        let (coordinator, eligibility, assessed_tuple) = match self
+            .resolve_join(&worker, run_id, Some("trainer".to_string()))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn_co!(format!("co-located trainer assess failed: {e}"));
+                worker.shutdown().await;
+                return;
+            }
+        };
+        if !eligibility.eligible {
+            warn_co!(format!(
+                "co-located trainer ineligible: {}",
+                eligibility.reasons.join("; ")
+            ));
+            worker.shutdown().await;
+            return;
+        }
+        let run_hash = self
+            .instances
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .map(|e| e.id.run_id)
+            .unwrap_or_else(|| *blake3::hash(run_id.as_bytes()).as_bytes());
+        let instance = match self.store.mint_incarnation() {
+            Ok(i) => i,
+            Err(e) => {
+                warn_co!(format!("co-located trainer incarnation mint failed: {e}"));
+                worker.shutdown().await;
+                return;
+            }
+        };
+        let id = RoleInstanceId {
+            run_id: run_hash,
+            epoch: 0,
+            role: "trainer".to_string(),
+            instance,
+        };
+        let charge = self.derive_charge(&eligibility, policy);
+        let priority = self.store.run_priority(run_id).unwrap_or(0);
+        if let Err(refusal) = self.admit_placed(&id, charge, priority) {
+            warn_co!(format!(
+                "co-located trainer refused by owner arbitration: {refusal}"
+            ));
+            worker.shutdown().await;
+            return;
+        }
+        let restore = self.resolve_restore(run_id, "trainer").await;
+        let seat = self.resolve_seat_bootstrap(run_id).await;
+        let (delivery_tuple, credentials, _credentials_ref) = match self
+            .author_join(run_id, &coordinator, &id, assessed_tuple, restore, seat)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                self.arbiter.release(&id);
+                warn_co!(format!(
+                    "co-located trainer credential authorship failed: {e}"
+                ));
+                worker.shutdown().await;
+                return;
+            }
+        };
+        let rx = match worker
+            .join_streaming(
+                run_id.to_string(),
+                coordinator,
+                credentials,
+                to_join_policy(policy),
+                delivery_tuple,
+            )
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                self.arbiter.release(&id);
+                warn_co!(format!("co-located trainer join failed: {e}"));
+                worker.shutdown().await;
+                return;
+            }
+        };
+        let generation = id.instance;
+        self.co_trainers.lock().unwrap().insert(
+            run_id.to_string(),
+            InstanceEntry {
+                generation,
+                id,
+                worker,
+            },
+        );
+        self.spawn_pump(Some((run_id.to_string(), generation)), rx);
+        self.emit_changed(Some(run_id.to_string()));
+    }
+
     /// Derive a role-instance's ledger charge (decisions D6 point 3) from the node-computed
     /// eligibility. Both live eligibility sources reach this through **one** claim-shaped input
     /// contract (decisions D-10):
@@ -1079,10 +1232,22 @@ impl VhcService {
         if let Some(generation) = event_generation(ev) {
             if generation != 0 {
                 if let Some(run_id) = self.event_run_id(ev) {
-                    if let Some(expected) = self.expected_generation(&run_id)? {
-                        if generation != expected {
-                            return Ok(Vec::new());
-                        }
+                    // Accept an event whose generation matches the run's CURRENT primary instance
+                    // OR its co-located trainer sibling (defect D — a seat-holding
+                    // trainer+coordinator node runs BOTH, each with its own incarnation; the
+                    // trainer's per-round digest events carry the trainer generation and must not
+                    // be dropped by the coordinator-generation guard). An event passes ungated only
+                    // when NEITHER a primary nor a co-trainer generation is known for the run.
+                    let expected = self.expected_generation(&run_id)?;
+                    let co_gen = self
+                        .co_trainers
+                        .lock()
+                        .unwrap()
+                        .get(&run_id)
+                        .map(|e| e.generation);
+                    let known = expected.is_some() || co_gen.is_some();
+                    if known && expected != Some(generation) && co_gen != Some(generation) {
+                        return Ok(Vec::new());
                     }
                 }
             }
@@ -1222,6 +1387,23 @@ impl VhcService {
         generation: u64,
         outcome: &protocol::TerminalOutcome,
     ) -> Result<Vec<VhcEvent>, VhcError> {
+        // Defect D: a terminal stamped with a CO-LOCATED trainer's generation tears down ONLY that
+        // sibling role-instance (its ledger reservation) — never the shared run row or the
+        // coordinator seat instance, whose state machine is driven by the PRIMARY instance's
+        // terminal. Idempotent: `vhc_leave` may have already removed it (then this is a no-op).
+        {
+            let co = {
+                let mut co = self.co_trainers.lock().unwrap();
+                match co.get(run_id) {
+                    Some(e) if e.generation == generation => co.remove(run_id),
+                    _ => None,
+                }
+            };
+            if let Some(e) = co {
+                self.arbiter.release(&e.id);
+                return Ok(Vec::new());
+            }
+        }
         let row = self.store.get_run(run_id)?;
         let entry_live = self.instances.lock().unwrap().contains_key(run_id);
         if !entry_live {
@@ -2275,6 +2457,12 @@ impl VhcApi for VhcService {
             },
         );
         self.spawn_pump(Some((run_id.clone(), generation)), rx);
+        // Defect D: a seat-holding trainer+coordinator node ALSO runs a trainer role-instance for
+        // the same run (config-gated: `coordinator_trains`), so a self-coordinated run meets its
+        // own membership floor. Only on a fresh seat-won join; best-effort (never fails the join).
+        if seat_incarnation.is_some() && existing.is_none() && self.config.coordinator_trains {
+            self.spawn_co_located_trainer(&run_id, &policy).await;
+        }
         self.emit_changed(Some(run_id));
         Ok(())
     }
@@ -2322,6 +2510,15 @@ impl VhcApi for VhcService {
             self.arbiter.release(&e.id);
         }
         self.store.commit_release(&run_id).map_err(map)?;
+        // Defect D: tear down the co-located trainer sibling too — drain it (graceful/hard per the
+        // owner's mode), stop its child, and release its ledger reservation. Its pending terminal
+        // (dispatched by generation) then finds no entry and is a no-op.
+        let co = self.co_trainers.lock().unwrap().remove(&run_id);
+        if let Some(e) = co {
+            let _ = e.worker.leave(run_id.clone(), to_leave_mode(mode)).await;
+            e.worker.shutdown().await;
+            self.arbiter.release(&e.id);
+        }
         // A leaving coordinator surrenders its seat (fenced release; the floor persists).
         self.release_seat_for(&run_id).await;
         self.emit_changed(Some(run_id));

@@ -183,7 +183,15 @@ async fn resolve_genesis_run(
         })?;
         let pin = Some(artifact.blake3.0);
         let module_name = role.module.clone();
-        (fetch_genesis_artifact(artifact, &module_name).await?, pin)
+        // The presign RunId is the genesis run id (blake3 of the frozen bytes) — the registry
+        // namespaces `runs/<run>/modules/…` under it. Deriving it here means a correct r2 fetch
+        // even though the worker's spawn env carries no per-run id (defect B: the node hands the
+        // worker the presign BASE + AUTH via env; the run id comes from the genesis it decodes).
+        let run_id_hex = frozen.run_id().to_hex();
+        (
+            fetch_genesis_artifact(artifact, &module_name, Some(&run_id_hex)).await?,
+            pin,
+        )
     };
     Ok(ResolvedRun {
         config,
@@ -200,17 +208,25 @@ async fn resolve_genesis_run(
 
 /// Fetch one genesis artifact-map entry (blake3-verified): `file://` through the file resolver;
 /// network URLs through the payload-store path under the `vhc-net` feature.
+///
+/// `run_id` is the presign RunId the store-fetch path namespaces `r2://` objects under
+/// (`POST /runs/<run_id>/presign`). Pass the genesis run id (`frozen.run_id().to_hex()`) so the
+/// module/corpus fetch targets the correct `runs/<run>/…` prefix regardless of the worker's spawn
+/// env; `None` falls back to the env `DAEMON_VHC_RUN_ID` (the standalone prefetch path).
 async fn fetch_genesis_artifact(
     artifact: &daemon_vhc_proto::SnapshotArtifact,
     name: &str,
+    run_id: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     let art = ArtifactRef::new(artifact.url.clone(), artifact.blake3);
     #[cfg(feature = "vhc-net")]
     if !artifact.url.starts_with("file://") {
-        return fetch_artifact_from_store(&art)
+        return fetch_artifact_from_store(&art, run_id)
             .await
             .map_err(|e| format!("fetch `{name}` ({}) from store: {e}", artifact.url));
     }
+    #[cfg(not(feature = "vhc-net"))]
+    let _ = run_id;
     ArtifactResolver::new()
         .fetch(&art)
         .await
@@ -237,7 +253,9 @@ pub(crate) async fn resolve_coordinator_module(
             role.module
         )
     })?;
-    fetch_genesis_artifact(artifact, &role.module).await
+    // Harness-only coordinator-module fetch (in-process self-driven join): the env
+    // `DAEMON_VHC_RUN_ID` is authoritative here (no frozen handle at this call site).
+    fetch_genesis_artifact(artifact, &role.module, None).await
 }
 
 /// The presign context the node sets when spawning the worker for a live run (small env strings, NOT
@@ -322,8 +340,16 @@ pub(crate) fn store_resolver(ctx: &StoreFetchContext) -> Result<ArtifactResolver
 /// Fetch `art` from the payload store (presigned GET), checking the on-disk content cache first and
 /// caching the verified bytes on a miss (the fleet artifact-distribution path).
 #[cfg(feature = "vhc-net")]
-pub(crate) async fn fetch_artifact_from_store(art: &ArtifactRef) -> Result<Vec<u8>, String> {
-    let ctx = store_fetch_context();
+pub(crate) async fn fetch_artifact_from_store(
+    art: &ArtifactRef,
+    run_id: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let mut ctx = store_fetch_context();
+    // The genesis-derived run id (when the caller has one) overrides the env default so the
+    // presign request targets the right `runs/<run>/…` prefix.
+    if let Some(run_id) = run_id {
+        ctx.run_id = run_id.to_string();
+    }
     let cache = open_content_cache(&ctx)?;
     if let Some(bytes) = cache.get(&art.blake3).await.map_err(|e| e.to_string())? {
         return Ok(bytes);
@@ -888,24 +914,48 @@ pub(crate) fn host_capabilities() -> WorkerCapabilities {
     }
 }
 
-/// Host RAM in MiB from `/proc/meminfo` `MemTotal` (Linux, best effort). `0` if unavailable.
+/// Total host RAM in MiB — the PORTABLE probe (Linux `/proc`, macOS `sysctl hw.memsize`, Windows
+/// `GlobalMemoryStatusEx`). The pre-fix local reader was `/proc`-only, so a macOS/Windows trainer
+/// reported `0` and the admission funnel refused the lane RAM floor spuriously.
 fn host_ram_mb() -> u64 {
-    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
-        return 0;
-    };
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            // `MemTotal:   16384000 kB`
-            if let Some(kb) = rest
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse::<u64>().ok())
-            {
-                return kb / 1024;
+    daemon_vhc_host::probe::host_ram_mb()
+}
+
+/// Free disk space in MiB on the filesystem the run actually spills onto — the content cache
+/// (corpus shards) or the durable run-state home, falling back to the process cwd — the portable
+/// probe (unix `statvfs`, Windows `GetDiskFreeSpaceExW`). The pre-fix worker hardcoded
+/// `disk_free_mb: 0` in every `hardware()` arm, so the trainer lane's disk floor was never met
+/// off a device that happened to fill it, and macOS/Windows refused `below lane floor: ram/disk`
+/// despite hundreds of GiB free.
+fn host_disk_free_mb() -> u64 {
+    daemon_vhc_host::probe::host_disk_free_mb(&disk_probe_path())
+}
+
+/// The path whose filesystem the disk-free probe measures: the first EXISTING ancestor of the
+/// content-cache dir, else of the run-state home, else the process cwd (always existing).
+/// `statvfs`/`GetDiskFreeSpaceExW` need a live path, and the cache/state dirs may not exist yet at
+/// probe time (assess precedes the first fetch).
+fn disk_probe_path() -> std::path::PathBuf {
+    fn existing_ancestor(p: std::path::PathBuf) -> Option<std::path::PathBuf> {
+        let mut cur: Option<&std::path::Path> = Some(p.as_path());
+        while let Some(c) = cur {
+            if c.exists() {
+                return Some(c.to_path_buf());
             }
+            cur = c.parent();
         }
+        None
     }
-    0
+    std::env::var_os("DAEMON_VHC_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .and_then(existing_ancestor)
+        .or_else(|| {
+            std::env::var_os(daemon_vhc_session::journal_home::RUN_DIR_ENV)
+                .map(std::path::PathBuf::from)
+                .and_then(existing_ancestor)
+        })
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 /// Read an amdgpu sysfs memory-total file for the first DRM card that exposes it, in MiB.
@@ -967,7 +1017,7 @@ pub(crate) fn hardware() -> Hardware {
                 capabilities: host_capabilities(),
                 up_kbps: 0,
                 down_kbps: 0,
-                disk_free_mb: 0,
+                disk_free_mb: host_disk_free_mb(),
                 throughput_class: "c1".to_string(),
             };
         }
@@ -987,7 +1037,7 @@ pub(crate) fn hardware() -> Hardware {
                 capabilities: host_capabilities(),
                 up_kbps: 0,
                 down_kbps: 0,
-                disk_free_mb: 0,
+                disk_free_mb: host_disk_free_mb(),
                 throughput_class: "c1".to_string(),
             };
         }
@@ -1008,7 +1058,7 @@ pub(crate) fn hardware() -> Hardware {
                 capabilities: host_capabilities(),
                 up_kbps: 0,
                 down_kbps: 0,
-                disk_free_mb: 0,
+                disk_free_mb: host_disk_free_mb(),
                 throughput_class: "c1".to_string(),
             };
         }
@@ -1034,7 +1084,7 @@ pub(crate) fn hardware() -> Hardware {
                 capabilities: host_capabilities(),
                 up_kbps: 0,
                 down_kbps: 0,
-                disk_free_mb: 0,
+                disk_free_mb: host_disk_free_mb(),
                 throughput_class: "c1".to_string(),
             };
         }
@@ -1049,7 +1099,7 @@ pub(crate) fn hardware() -> Hardware {
         capabilities: host_capabilities(),
         up_kbps: 0,
         down_kbps: 0,
-        disk_free_mb: 0,
+        disk_free_mb: host_disk_free_mb(),
         throughput_class: "c1".to_string(),
     }
 }

@@ -159,10 +159,16 @@ cadence vs retention) refuse at authoring.
 
 Outputs into `--out`:
 
-- `envelope.cbor` — the canonical frozen envelope bytes (the object the registry stores; its blake3
-  IS the run id);
-- `envelope.b64` — base64 of those exact bytes, for the cloud seeder's `VHC_ENVELOPE_B64`;
-- `run-id.txt` — the genesis hash hex;
+- `envelope.cbor` — the canonical `SignedEnvelope` **wire form** (`{ bytes, signature, signer }`)
+  wrapping the frozen genesis: this is the object the registry stores and the node's assess path
+  decodes (`from_canonical_slice::<SignedEnvelope>` → `FrozenGenesis::open`). Seed it verbatim —
+  do NOT unwrap it to the inner genesis (the pre-fix tool emitted the raw inner bytes, which made
+  `vhc join` refuse `UnsignedEnvelopeRetired … missing field bytes`). **Inner vs wire:** the run
+  id is `blake3(inner frozen genesis)`, NOT the blake3 of this wire object (the latter is the
+  registry descriptor's `envelope_hash`);
+- `envelope.b64` — base64 of those exact `SignedEnvelope` wire bytes, for the cloud seeder's
+  `VHC_ENVELOPE_B64`;
+- `run-id.txt` — the genesis hash hex (blake3 of the inner frozen genesis — the cryptographic run id);
 - `authoring-report.txt` — every frozen pin (param count, expected root, chunk sizes, cadence check,
   timer values, module + corpus hashes, trust set, roster, upgrade authority) restated for human
   ratification.

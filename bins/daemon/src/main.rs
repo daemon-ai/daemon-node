@@ -3043,6 +3043,20 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 let payload_dir = (!cfg.vhc.payload_dir.is_empty())
                     .then(|| std::path::PathBuf::from(&cfg.vhc.payload_dir));
                 let payload_dir_for_factory = payload_dir.clone();
+                // Defect B: the presign context the node hands its worker over the SANCTIONED
+                // spawn-env channel (the child env `store_fetch_context()` reads), so the worker's
+                // assess-time `r2://` module/corpus fetch has a presign client. Empty when a local
+                // fs payload plane is selected or no registry is configured (mirrors the
+                // credentials' `presign_base` gate). The on-disk content cache lives under the
+                // node data dir; the presign RunId is derived worker-side from the genesis.
+                let vhc_cache_dir = cfg.data_dir.join("vhc").join("vhc-cache");
+                let presign_env = daemon_vhc_node::credentials::worker_presign_env(
+                    &cfg.vhc.registry,
+                    !cfg.vhc.payload_dir.is_empty(),
+                    &vhc_cache_dir,
+                    cfg.vhc.data_cache_gb,
+                );
+                let presign_env_for_factory = presign_env.clone();
                 let worker_cfg = |path: &str| {
                     let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(path);
                     wc.env.push((
@@ -3059,6 +3073,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                             dir.display().to_string(),
                         ));
                     }
+                    wc.env.extend(presign_env.iter().cloned());
                     wc
                 };
                 let worker: Arc<dyn daemon_vhc_node::WorkerControl> = Arc::new(
@@ -3087,6 +3102,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                             dir.display().to_string(),
                         ));
                     }
+                    wc.env.extend(presign_env_for_factory.iter().cloned());
                     Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(wc))
                         as Arc<dyn daemon_vhc_node::WorkerControl>
                 });
