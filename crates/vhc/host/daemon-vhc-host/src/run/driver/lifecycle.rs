@@ -178,7 +178,7 @@ pub fn start_run_migrating(
             data_read_budget: run.data_read_budget_bytes,
             data_read_used: 0,
             streams: StreamTable::new(0),
-            state: crate::run::state_store::StateStore::new(
+            state: crate::run::state_store::StateStore::new_with_spill(
                 crate::run::state_store::StateStoreConfig {
                     chunk_size: run.state_chunk_size,
                     streams_max: run.state_streams_max,
@@ -186,6 +186,16 @@ pub fn start_run_migrating(
                     write_rate_per_min: run.state_write_rate_per_min,
                     store_bytes_max: run.state_store_bytes,
                     retain_roots: run.state_retain_roots,
+                },
+                // Disk-back the state store when the run pins a state directory (design §8.1);
+                // a spill that cannot open refuses the run (a provisioned state plane that
+                // cannot persist must not silently fall back to RAM on the memory-floor peer).
+                match &run.state_dir {
+                    Some(dir) => Some(
+                        crate::run::state_spill::SpillStore::open(dir)
+                            .map_err(|e| RunError::Sandbox(format!("open state spill: {e}")))?,
+                    ),
+                    None => None,
                 },
             ),
             op_requests: Vec::new(),

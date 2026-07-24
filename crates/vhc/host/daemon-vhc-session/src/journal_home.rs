@@ -84,6 +84,20 @@ pub fn payload_dir(root: &Path, run_label: &str) -> PathBuf {
     run_state_dir(root, run_label).join("payload")
 }
 
+/// The per-incarnation **state-store spill directory** (design §8.1):
+/// `<root>/<blake3(label)>/<role>-<incarnation>/state`. The host state store spills canonical
+/// det-lane chunk bytes here (content-addressed) so the retained roots live on disk rather than
+/// the memory-floor peer's unified RAM. Per-incarnation like the journal: a fresh incarnation
+/// gets a fresh spill; a reaped incarnation's spill can be deleted atomically. (Unlike the
+/// content-addressed payload plane, the spill is instance-scoped — a torn/unsealed fold is never
+/// durable, [SF-4].)
+#[must_use]
+pub fn state_dir(root: &Path, run_label: &str, role: &str, incarnation: u64) -> PathBuf {
+    run_state_dir(root, run_label)
+        .join(format!("{role}-{incarnation}"))
+        .join("state")
+}
+
 /// The durable [`JournalSink`]: the §8 crash-safe segmented [`Journal`] adapted onto the
 /// driver's dependency-inverted sink seam. Open-or-recover semantics: a fresh incarnation
 /// creates segment 0; a resumed incarnation (node restart, retained incarnation) verifies the
@@ -434,6 +448,10 @@ mod tests {
         assert_eq!(
             payload_dir(root, "run-x"),
             root.join(&hashed).join("payload")
+        );
+        assert_eq!(
+            state_dir(root, "run-x", "trainer", 7),
+            root.join(&hashed).join("trainer-7").join("state")
         );
     }
 
