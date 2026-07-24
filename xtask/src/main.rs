@@ -21,7 +21,9 @@
 
 #![forbid(unsafe_code)]
 
+mod ceremony;
 mod publish;
+mod replay;
 mod tokenize;
 
 use clap::{Parser, Subcommand};
@@ -136,6 +138,84 @@ enum Cmd {
         /// anything or touching the green ledger. For inspecting what a diff would gate.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Author + freeze the fleet-ceremony genesis (a thin wrapper around the reviewed
+    /// `daemon_vhc_testkit::ceremony::ceremony_genesis` — never a reimplementation). Emits
+    /// `envelope.cbor`, `envelope.b64` (the cloud seeder's `VHC_ENVELOPE_B64`), `run-id.txt` (the
+    /// genesis hash hex), and `authoring-report.txt` (every frozen pin, for human ratification).
+    /// Also authors single-peer smoke geneses (`--min-peers 1 --max-peers 1 --stop-rounds <small>`).
+    AuthorCeremonyGenesis {
+        /// The human/registry-facing run label.
+        #[arg(long)]
+        run_label: String,
+        /// The genesis author signing key: a file (32 raw bytes or 64-hex text) or a bare 64-hex.
+        #[arg(long)]
+        author_key: String,
+        /// The pinned coordinator module blake3 (64-hex), from `guests.blake3` / `build-guests`.
+        #[arg(long)]
+        coordinator_module: String,
+        /// The pinned trainer module blake3 (64-hex).
+        #[arg(long)]
+        trainer_module: String,
+        /// The published `corpus-manifest.cbor` (its blake3 is the genesis corpus pin; its shards
+        /// + tokenizer become the trainer's `data@2` fetch grants).
+        #[arg(long)]
+        corpus_manifest: PathBuf,
+        /// A genesis-trusted base identity PeerId (64-hex). Repeat; ORDERED — the FIRST is the
+        /// coordinator authority.
+        #[arg(long = "trusted-base")]
+        trusted_base: Vec<String>,
+        /// A trainer roster PeerId (64-hex). Repeat.
+        #[arg(long)]
+        roster: Vec<String>,
+        /// An upgrade-authority PeerId (64-hex). Repeat; empty authors an immutable run.
+        #[arg(long = "upgrade-authority")]
+        upgrade_authority: Vec<String>,
+        /// Minimum healthy peers to leave WaitingForMembers (the fleet floor; `1` for a smoke).
+        #[arg(long, default_value_t = 3)]
+        min_peers: u32,
+        /// Roster ceiling.
+        #[arg(long, default_value_t = 3)]
+        max_peers: u32,
+        /// The remote checkpoint cadence in rounds (validated against retention at authoring).
+        #[arg(long = "ckpt-cadence", default_value_t = 8)]
+        ckpt_cadence: u64,
+        /// The payload retention floor in rounds (`0` = unbounded).
+        #[arg(long = "payload-retention", default_value_t = 64)]
+        payload_retention: u64,
+        /// Real run timer: join/warmup wall (seconds).
+        #[arg(long = "warmup-s", default_value_t = 1_000_000)]
+        warmup_s: u64,
+        /// Real run timer: per-round training-phase wall ceiling (seconds).
+        #[arg(long = "round-max-s", default_value_t = 1_000_000)]
+        round_max_s: u64,
+        /// Real run timer: witness/finalization-phase wall (seconds).
+        #[arg(long = "witness-s", default_value_t = 1_000_000)]
+        witness_s: u64,
+        /// Real run timer: end-of-run cooldown wall (seconds).
+        #[arg(long = "cooldown-s", default_value_t = 1_000_000)]
+        cooldown_s: u64,
+        /// Stop after this many completed rounds.
+        #[arg(long = "stop-rounds", default_value_t = 1_000_000)]
+        stop_rounds: u64,
+        /// The output directory for the four ceremony artifacts.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Run BOTH replay-oracle modes (input replay + sandboxed consensus re-derivation) over an
+    /// on-disk archive directory and emit a per-round, per-peer machine-readable verdict
+    /// (agree/disagree + first divergence round). Green over a genuine archive; red with the
+    /// divergence round over a corrupted copy. See the archive-layout contract in `--help`.
+    VhcReplay {
+        /// The archive directory (see the layout contract in this command's long help / runbook).
+        #[arg(long)]
+        archive: PathBuf,
+        /// The run id (genesis hash hex) the archive belongs to.
+        #[arg(long)]
+        run: String,
+        /// Emit the verdict as machine-readable JSON (default: human-readable text).
+        #[arg(long)]
+        json: bool,
     },
     /// Tokenize a corpus into fixed-width shards + `manifest.json` (spec §8; M1 seam).
     TokenizeCorpus {
@@ -260,6 +340,46 @@ fn main() -> anyhow::Result<()> {
         Cmd::VhcDepCheck => vhc_dep_check(),
         Cmd::VhcAcceptance => vhc_acceptance(),
         Cmd::VhcProductionGate { all, base, dry_run } => vhc_production_gate(all, base, dry_run),
+        Cmd::AuthorCeremonyGenesis {
+            run_label,
+            author_key,
+            coordinator_module,
+            trainer_module,
+            corpus_manifest,
+            trusted_base,
+            roster,
+            upgrade_authority,
+            min_peers,
+            max_peers,
+            ckpt_cadence,
+            payload_retention,
+            warmup_s,
+            round_max_s,
+            witness_s,
+            cooldown_s,
+            stop_rounds,
+            out,
+        } => ceremony::run(ceremony::Args {
+            run_label,
+            author_key,
+            coordinator_module,
+            trainer_module,
+            corpus_manifest,
+            trusted_base,
+            roster,
+            upgrade_authority,
+            min_peers,
+            max_peers,
+            ckpt_cadence,
+            payload_retention,
+            warmup_s,
+            round_max_s,
+            witness_s,
+            cooldown_s,
+            stop_rounds,
+            out,
+        }),
+        Cmd::VhcReplay { archive, run, json } => replay::run(replay::Args { archive, run, json }),
         Cmd::TokenizeCorpus {
             dataset,
             dataset_file,
