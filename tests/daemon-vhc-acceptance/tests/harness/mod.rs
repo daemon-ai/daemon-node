@@ -452,12 +452,12 @@ pub async fn run_detail(node: &Node, run_id: &str) -> Option<daemon_api::VhcRunD
 /// digest for the round it reports. This is the G-2 digest-agreement evidence collected through the
 /// node's public API rather than a journal reader.
 ///
-/// NOTE (adjudicated): the digest is only surfaced through the API when the worker emits a
-/// `RoundOutcome` session event — an opacity-sensitive producer that the live `RoleSession` does
-/// not yet drive per round (the digest lives in the SDK round schema inside the journal, which the
-/// session must not decode). The wire contract, the node conversion (it no longer drops the
-/// digest), and the snapshot projection are complete and this assertion proves they are faithful
-/// wherever the digest is present; wiring the opacity-safe live producer is a documented follow-up.
+/// The digest reaches the API through the OPACITY-SAFE live producer: the trainer guest reports
+/// its per-round outcome (digest + committed/ingested/stalled) over the reserved `round_metrics`
+/// metric plane, the role session folds the reserved metric group into a `RoundOutcome` session
+/// event (decoding no module frame), and the node projects it — the conversion no longer drops the
+/// digest, and the snapshot carries `last_round_digest`. See
+/// [`assert_api_digests_cover_and_match_journal`] for the stronger progression assertion.
 pub fn assert_api_digest_matches_journal(
     detail: &daemon_api::VhcRunDetail,
     journal: &BTreeMap<u64, [u8; 16]>,
@@ -473,13 +473,112 @@ pub fn assert_api_digest_matches_journal(
         }
     }
     if let Some(d) = &detail.last_round_digest {
-        let round = detail.summary.last_round;
-        if let Some(j) = journal.get(&round) {
-            assert_eq!(
-                d, j,
-                "VhcRunDetail.last_round_digest for round {round} disagrees with the journal"
+        // The snapshot pointer is the digest of the HIGHEST-round `RoundOutcome` in the window
+        // (the node's projection) — NOT `summary.last_round`, which tracks the phase round. Pair
+        // it with the max event round so the journal cross-check is over the right round.
+        let round = detail
+            .recent_events
+            .iter()
+            .filter_map(|ev| match ev {
+                VhcEvent::RoundOutcome { round, .. } => Some(*round),
+                _ => None,
+            })
+            .max();
+        if let Some(round) = round {
+            if let Some(j) = journal.get(&round) {
+                assert_eq!(
+                    d, j,
+                    "VhcRunDetail.last_round_digest for round {round} disagrees with the journal"
+                );
+            }
+        }
+    }
+}
+
+/// Poll a node's `vhc_run_detail` (a PRODUCT API — no pump access, no journal read, no SDK schema
+/// decode) and accumulate the per-round det digests it surfaces, until digests for at least
+/// `want_rounds` distinct rounds have been observed or the deadline elapses. Returns the collected
+/// `round → digest` map (product-API-sourced).
+///
+/// Both API surfaces are folded: every `VhcEvent::RoundOutcome` in the windowed event stream AND
+/// the `last_round_digest`/`summary.last_round` progression — so a `--watch`-style client that only
+/// sampled the snapshot pointer, and one that read the event feed, both collect the same evidence.
+pub async fn collect_api_digests(
+    node: &Node,
+    run_id: &str,
+    want_rounds: u64,
+    timeout: Duration,
+) -> BTreeMap<u64, [u8; 16]> {
+    let deadline = Instant::now() + timeout;
+    let mut digests: BTreeMap<u64, [u8; 16]> = BTreeMap::new();
+    loop {
+        if let Some(detail) = run_detail(node, run_id).await {
+            let mut max_round: Option<u64> = None;
+            for ev in &detail.recent_events {
+                if let VhcEvent::Error { class, detail, .. } = ev {
+                    panic!(
+                        "node `{}` run `{run_id}` errored: {class}: {detail}",
+                        node.name
+                    );
+                }
+                if let VhcEvent::RoundOutcome { round, digest, .. } = ev {
+                    // The event carries its OWN round — the authoritative key.
+                    digests.insert(*round, *digest);
+                    max_round = Some(max_round.map_or(*round, |m| m.max(*round)));
+                }
+            }
+            // The `last_round_digest` snapshot pointer is the node's projection of the
+            // HIGHEST-round `RoundOutcome` in the window (service.rs); exercise that surface too
+            // and cross-check it agrees with the event we recorded for that round (never keyed by
+            // `summary.last_round`, which tracks the phase round, not the digest's round).
+            if let (Some(d), Some(mr)) = (detail.last_round_digest, max_round) {
+                assert_eq!(
+                    digests.get(&mr),
+                    Some(&d),
+                    "VhcRunDetail.last_round_digest disagrees with the max-round RoundOutcome event"
+                );
+                digests.insert(mr, d);
+            }
+        }
+        if digests.keys().filter(|r| **r < want_rounds).count() as u64 >= want_rounds {
+            return digests;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "node `{}` run `{run_id}`: the product API surfaced digests for only {:?} \
+                 (< {want_rounds} rounds) within {timeout:?}",
+                node.name,
+                digests.keys().collect::<Vec<_>>()
             );
         }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// The strengthened G-2 assertion: EVERY completed round in `0..want_rounds` has a digest that is
+/// observable via the product API (`api`, collected by [`collect_api_digests`]) and is byte-equal
+/// to the offline journal oracle (`journal`) for that round. Proves the live opacity-safe producer
+/// actually surfaces each round's digest — not merely that any present digest happens to agree.
+pub fn assert_api_digests_cover_and_match_journal(
+    api: &BTreeMap<u64, [u8; 16]>,
+    journal: &BTreeMap<u64, [u8; 16]>,
+    want_rounds: u64,
+) {
+    for round in 0..want_rounds {
+        let observed = api.get(&round).unwrap_or_else(|| {
+            panic!(
+                "the product API surfaced NO digest for completed round {round} (observed rounds: \
+                 {:?}) — the live per-round digest producer is not driving the API",
+                api.keys().collect::<Vec<_>>()
+            )
+        });
+        let truth = journal.get(&round).unwrap_or_else(|| {
+            panic!("the journal oracle has no digest for round {round} (cannot cross-check)")
+        });
+        assert_eq!(
+            observed, truth,
+            "product-API digest for round {round} disagrees with the journal oracle"
+        );
     }
 }
 

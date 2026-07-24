@@ -13,8 +13,9 @@ mod harness;
 use std::time::Duration;
 
 use harness::{
-    assert_api_digest_matches_journal, assert_digests_agree, base_peer, join, journal_digests,
-    leave, run_detail, seed_corpus_fs, spawn_node, start_cluster_on, wait_rounds, NodeSpec,
+    assert_api_digests_cover_and_match_journal, assert_digests_agree, base_peer,
+    collect_api_digests, join, journal_digests, leave, seed_corpus_fs, spawn_node,
+    start_cluster_on, wait_rounds, NodeSpec,
 };
 
 const RUN: &str = "acceptance-baseline";
@@ -79,12 +80,20 @@ async fn three_node_training_converges_with_agreeing_digests() {
     wait_rounds(&trainer_a, RUN, rounds, timeout).await;
     wait_rounds(&trainer_b, RUN, rounds, timeout).await;
 
-    // wire v44: the per-round det digest surfaced on the product API agrees with the durable
-    // journal (the G-2 evidence, collected through the node's public API — the node no longer
-    // drops the digest at the boundary, and the snapshot carries `last_round_digest`).
-    if let Some(detail) = run_detail(&trainer_a, RUN).await {
-        assert_api_digest_matches_journal(&detail, &journal_digests(&trainer_a, RUN));
-    }
+    // wire v44 + the live opacity-safe producer: EVERY completed round's det digest is observable
+    // via the product API on BOTH trainers (collected through `vhc_run_detail` only — the event
+    // stream + the `last_round_digest` progression), byte-identical across peers, and byte-equal to
+    // the offline journal oracle. The digest reaches the API because the trainer guest reports its
+    // per-round outcome over the reserved `round_metrics` metric plane and the role session folds
+    // that reserved metric group into a `RoundOutcome` — decoding no module frame (the digest
+    // vocabulary stays guest-side). This is the G-2 digest-agreement evidence, live on the product
+    // path rather than conditional on a producer that never ran.
+    let api_a = collect_api_digests(&trainer_a, RUN, rounds, timeout).await;
+    let api_b = collect_api_digests(&trainer_b, RUN, rounds, timeout).await;
+    assert_api_digests_cover_and_match_journal(&api_a, &journal_digests(&trainer_a, RUN), rounds);
+    assert_api_digests_cover_and_match_journal(&api_b, &journal_digests(&trainer_b, RUN), rounds);
+    // Cross-peer byte-identity, established through the PRODUCT API (not the journal reader).
+    assert_digests_agree(&api_a, &api_b, rounds as usize);
 
     // Graceful leave (drains + settles the journals).
     leave(&trainer_a, RUN, daemon_api::VhcLeaveMode::Graceful, "op-la").await;

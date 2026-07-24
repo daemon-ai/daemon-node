@@ -229,6 +229,20 @@ contract wire revision was bumped one rung and the conformance suite validates t
 node no longer drops the digest at the conversion boundary, and the snapshot projects the newest
 round's digest for the `detail --watch` transcript.
 
+**Digest origin (opacity-safe live producer).** On the live run path the digest reaches the API
+without any host-side frame decoding. The trainer guest already computes its per-round det digest and
+voices it as its own `[4, round, digest]` det-lane publish (the journal transcript); it ALSO reports
+that same digest — plus the barrier's `committed`/`ingested`/`stalled` bookkeeping — through the host
+metric ABI (`sys@2::emit_metric`) under the reserved `round_metrics` name contract (a group of
+`vhc.round.<round>.<field>` metrics; the 16-byte digest rides as four little-endian `u32` words, each
+lossless in an `f64`). The role session recognizes those reserved metric NAMES only — it never decodes
+the module's `[tag, round, bytes]` frame vocabulary — and folds each round's completed metric group
+into a `RoundOutcome` session event, which the node projects as above. The guest reports honest,
+guest-known values: at the barrier every record-listed committed payload has been fetched and folded,
+so `committed == ingested` (the record-listed set size), and `stalled` marks a round that straggled and
+caught up. The reserved contract is defined once in `daemon-vhc-abi` (`round_metrics`), pinned by both
+the guest SDK emitter (`daemon_vhc_sdk::report_round_outcome`) and the host session recognizer.
+
 ---
 
 ## 4. Preflight (per item: commands → evidence → remedy)
