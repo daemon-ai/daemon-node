@@ -185,6 +185,92 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: DirectoryCmd,
     },
+    /// Drive this node's VHC (decentralized training) participation over the node API: list/detail
+    /// runs, join/leave, pause/resume, report hardware, and read the local base identity. Every
+    /// verb maps 1:1 onto an existing `ApiRequest` variant (no wire change) and supports `--json`.
+    Vhc {
+        #[command(subcommand)]
+        cmd: VhcCmd,
+    },
+}
+
+/// VHC operator verbs (the ceremony drive surface). Each marshals one existing `ApiRequest`, except
+/// `identity`, which reads the LOCAL keystore with no wire call (works with the node stopped).
+#[derive(Subcommand)]
+pub(crate) enum VhcCmd {
+    /// List discovered + joined runs with node-computed eligibility (`VhcRunList`).
+    Runs {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one run's full detail (`VhcRunDetail`); `--watch <secs>` polls, printing phase, round,
+    /// last-round digest, and peers each interval.
+    Detail {
+        /// The run id.
+        run_id: String,
+        /// Poll every `<secs>` seconds instead of printing once (0 / omitted = a single snapshot).
+        #[arg(long)]
+        watch: Option<u64>,
+        /// Emit machine-readable JSON (one object per poll under `--watch`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Join a run (`VhcJoin`; a fresh idempotency `op_id` is minted per ADR-006).
+    Join {
+        /// The run id.
+        run_id: String,
+        /// The participation policy mode (`always` | `idle` | `manual`; default `idle`).
+        #[arg(long)]
+        policy: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Leave a run (`VhcLeave`); `--immediate` aborts in-flight work instead of finishing the round.
+    Leave {
+        /// The run id.
+        run_id: String,
+        /// Leave immediately (abort in-flight work) instead of gracefully.
+        #[arg(long)]
+        immediate: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause a run (`VhcPause`; durable owner intent).
+    Pause {
+        /// The run id.
+        run_id: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume a paused run (`VhcResume`).
+    Resume {
+        /// The run id.
+        run_id: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report this node's training-capability probe (`VhcHardwareReport`).
+    Hardware {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print this node's base-identity PeerId (hex) by reading the LOCAL vhc keystore — NO wire
+    /// call, so it works with the node stopped (the preflight identity-collection step).
+    Identity {
+        /// The node state dir (the keystore is `<state-dir>/vhc/identity`). Omit to use
+        /// `$DAEMON_VHC_IDENTITY_DIR`, else `$DAEMON_DATA_DIR/vhc/identity`.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Conversation management over the messaging-adapter interface (`conv_*` ops). `transport` is the
