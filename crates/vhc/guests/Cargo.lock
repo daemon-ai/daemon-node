@@ -1539,6 +1539,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "ciborium",
+ "daemon-vhc-abi",
  "daemon-vhc-proto",
  "serde",
  "serde_json",

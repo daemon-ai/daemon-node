@@ -244,6 +244,11 @@ struct IngestWalkState {
     /// Whether this walk's digest is voiced at seal (record-triggered) or folds silently
     /// (a catch-up ingest kicked off inside `on_round_open`).
     voice: bool,
+    /// The barrier ingest size: the number of record-listed committed payloads this walk folds.
+    /// At the barrier every committed payload is fetchable-and-verified before the fold begins, so
+    /// this is BOTH the round's `committed` and this peer's `ingested` count — the honest
+    /// guest-known bookkeeping reported alongside the digest over the reserved metric plane.
+    committed: u32,
     /// The emitted master assembled per parameter — a TRANSIENT device-upload buffer freed with
     /// the walk (the post-ingest master uploads to the device once sealed; no resident master).
     master_assembly: Vec<Vec<f32>>,
@@ -378,6 +383,9 @@ impl RoundExperiment<Vec<u8>> for C3Round {
             ops.insert(op, w.ordinal);
         }
         let voice = core.ingest_voices;
+        // The barrier folds exactly the record-listed committed set (every item fetchable +
+        // blake3-verified at `Committed::mint`), so the ingested count IS the committed count.
+        let committed = u32::try_from(committed.items().len()).unwrap_or(u32::MAX);
         let master_assembly = numels.iter().map(|&n| vec![0.0f32; n]).collect();
         core.ingest_walk = Some(IngestWalkState {
             round,
@@ -386,6 +394,7 @@ impl RoundExperiment<Vec<u8>> for C3Round {
             base_fold,
             ops,
             voice,
+            committed,
             master_assembly,
             byte_buf: Vec::new(),
             chunk_hashes: Vec::new(),
@@ -930,6 +939,26 @@ fn emit_round_outbounds(wire: bool, out: &[daemon_vhc_sdk_rounds::Outbound]) {
     }
 }
 
+/// Report the round outcome over the reserved metric plane for every digest-voicing outbound (the
+/// opacity-safe live digest surface, ABI `round_metrics`). Called alongside [`emit_round_outbounds`]
+/// at the ingest seal, where the barrier ingest size is known: `committed == ingested` (every
+/// record-listed payload folded to reach the digest), and `stalled` distinguishes a straggled
+/// round that caught up (`CaughtUp`) from an on-time ingest (`RoundComplete`). This is a strictly
+/// ADDITIONAL host-visible report of the SAME digest the guest already voiced as tag-4; it touches
+/// no det-lane math, no round logic, and no frame vocabulary.
+fn report_round_metrics(committed: u32, out: &[daemon_vhc_sdk_rounds::Outbound]) {
+    for o in out {
+        let (round, digest, stalled) = match o {
+            daemon_vhc_sdk_rounds::Outbound::RoundComplete { round, digest } => {
+                (*round, *digest, false)
+            }
+            daemon_vhc_sdk_rounds::Outbound::CaughtUp { round, digest } => (*round, *digest, true),
+            _ => continue,
+        };
+        daemon_vhc_sdk::report_round_outcome(round, committed, committed, stalled, digest);
+    }
+}
+
 /// Run the barrier on a fully-staged record and voice the outbounds.
 fn dispatch_record(
     driver: &mut BarrierRound<C3Round>,
@@ -1355,6 +1384,9 @@ enum IngestStep {
         /// Whether this round's digest is voiced (record-triggered) or folds silently (catch-up
         /// inside `on_round_open`).
         voice: bool,
+        /// The barrier ingest size (committed == ingested) — reported with the digest over the
+        /// reserved metric plane.
+        committed: u32,
     },
 }
 
@@ -1414,6 +1446,7 @@ fn drive_ingest_completion(
     let mut state = core_mut.ingest_walk.take().expect("the sealed walk");
     let round = state.round;
     let voice = state.voice;
+    let committed = state.committed;
     let fold = daemon_vhc_sdk::state_seal(state.stream);
     let digest = *state
         .walk
@@ -1429,6 +1462,7 @@ fn drive_ingest_completion(
         round,
         digest,
         voice,
+        committed,
     }
 }
 
@@ -1967,6 +2001,7 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                         round,
                         digest,
                         voice,
+                        committed,
                     } => {
                         let out = driver.finish_ingest(round, digest, &mut payloads);
                         // A catch-up ingest kicked off inside `on_round_open` folds silently; only
@@ -1974,6 +2009,13 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                         // which dropped `on_round_open`'s outbounds).
                         if voice {
                             emit_round_outbounds(live.is_some(), &out);
+                            // Additionally report the round outcome over the reserved metric plane
+                            // (the opacity-safe LIVE digest surface, ABI `round_metrics`): the host
+                            // role session recognizes these metric NAMES and folds them into a
+                            // `RoundOutcome` event — it never decodes this guest's `[4, round,
+                            // digest]` frame. `committed == ingested` at the barrier (every
+                            // record-listed payload folded); `stalled` is the caught-up class.
+                            report_round_metrics(committed, &out);
                             // The ingested-round boundary (spec §9): the deferred fold has NOW
                             // sealed, so `core.master_fold` IS this round's canonical master and a
                             // live checkpoint's by-ref master agrees with its inline round

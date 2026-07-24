@@ -18,6 +18,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod round_metrics;
+
 use std::collections::BTreeSet;
 use std::fmt;
 

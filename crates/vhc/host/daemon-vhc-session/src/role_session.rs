@@ -296,6 +296,11 @@ struct LiveInstance {
     own_sender: PeerId,
     published_cursor: usize,
     metrics_cursor: usize,
+    /// Assembles the guest's reserved round-outcome metrics (the opacity-safe per-round digest +
+    /// barrier bookkeeping, ABI `round_metrics`) into [`Event::RoundOutcome`]s. Per-incarnation:
+    /// a module switch mints a fresh instance and hence a fresh accumulator, and the pump's metric
+    /// buffer starts empty, so partial groups never straddle the fence.
+    digest_accum: daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator,
 }
 
 /// The session body: bind, run, service, switch, classify. Returns the terminal outcome (the
@@ -441,6 +446,7 @@ async fn run_role(
         own_sender,
         published_cursor: 0,
         metrics_cursor: 0,
+        digest_accum: daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator::new(),
     };
 
     // Loop state: held frames (gap/back-pressure), throttle level, exit causes.
@@ -475,7 +481,7 @@ async fn run_role(
             _ = egress.notified() => {
                 if let Err(reason) = relay_egress(
                     &current.pump, &providers, &mut current.published_cursor,
-                    &mut current.metrics_cursor, events, gen_now,
+                    &mut current.metrics_cursor, &mut current.digest_accum, events, gen_now,
                 ).await {
                     transport_fault = Some(reason);
                     break 'session;
@@ -579,6 +585,7 @@ async fn run_role(
         &providers,
         &mut current.published_cursor,
         &mut current.metrics_cursor,
+        &mut current.digest_accum,
         events,
         gen_now,
     )
@@ -1032,6 +1039,7 @@ async fn perform_switch(
             own_sender,
             published_cursor: 0,
             metrics_cursor: 0,
+            digest_accum: daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator::new(),
         },
         retries: attempt,
         quotas: admission.quotas.clone(),
@@ -1282,11 +1290,19 @@ fn envelope_sender(frame: &[u8]) -> Option<[u8; 32]> {
 /// Relay pending guest egress: published frames onto the control plane verbatim (they are
 /// already §12.1-signed by the certified per-run key), op requests against the content-addressed
 /// providers, metrics as advisory events. Returns a fault reason on transport failure.
+///
+/// Metrics carry a reserved round-outcome group (ABI `round_metrics`): the trainer guest reports
+/// its per-round det digest + barrier bookkeeping as `vhc.round.<round>.<field>` `(name, f64)`
+/// metrics. The session recognizes those reserved NAMES — it decodes no module frame — folds them
+/// into [`Event::RoundOutcome`] as each round's group completes, and consumes them (only ordinary
+/// telemetry rides on as an [`Event::Metric`]). This is the sole opacity-safe live producer of the
+/// per-round digest on the product path.
 async fn relay_egress(
     pump: &PumpHandle,
     providers: &RoleProviders,
     published_cursor: &mut usize,
     metrics_cursor: &mut usize,
+    digest_accum: &mut daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator,
     events: &mpsc::UnboundedSender<Event>,
     generation: u64,
 ) -> Result<(), String> {
@@ -1308,10 +1324,27 @@ async fn relay_egress(
 
     let metrics = pump.metrics();
     for (name, value) in metrics.iter().skip(*metrics_cursor) {
-        let _ = events.send(Event::Metric {
-            name: name.clone(),
-            value: *value,
-        });
+        // Fold the reserved round-outcome group into a RoundOutcome the moment its digest
+        // completes (all four LE words). The values are treated as opaque numbers under a reserved
+        // NAMING contract — no frame is decoded here. Robust to partial groups / reordering.
+        if let Some(outcome) = digest_accum.observe(name, *value) {
+            let _ = events.send(Event::RoundOutcome {
+                round: outcome.round,
+                committed: outcome.committed,
+                ingested: outcome.ingested,
+                stalled: outcome.stalled,
+                digest: outcome.digest,
+                generation,
+            });
+        }
+        // The reserved carrier metrics are consumed above; only ordinary telemetry is forwarded as
+        // an advisory metric event (a reserved name is never surfaced as bare telemetry).
+        if !daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator::is_reserved(name) {
+            let _ = events.send(Event::Metric {
+                name: name.clone(),
+                value: *value,
+            });
+        }
     }
     *metrics_cursor = metrics.len();
     Ok(())
