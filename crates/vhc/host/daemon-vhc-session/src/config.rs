@@ -288,6 +288,16 @@ pub struct VhcConfig {
     /// the conventional label.
     #[serde(default = "default_seat_role")]
     pub seat_role: String,
+    /// Whether a coordinator-seat-holding node ALSO runs a **trainer** role-instance for the same
+    /// run (a trainer+coordinator box — e.g. a single-peer self-coordinated run, or the ceremony's
+    /// Strix seat which is trainer + coordinator). Default `false`: `seat_claim` alone brings up
+    /// ONLY the coordinator role, so a single-peer run parks at the membership floor (`peers=0 <
+    /// min_peers`) with 0 rounds — the smoke-surfaced defect. When `true` AND this node holds the
+    /// seat, the node spawns a second (trainer) role-instance in its OWN worker child that joins
+    /// the coordinator like any remote trainer. Requires the per-role-instance worker factory
+    /// (multi-instance supervision). Ignored on a non-seat-claiming (pure trainer) node.
+    #[serde(default)]
+    pub coordinator_trains: bool,
     /// The reconvergence retry budget + reconciliation-tick cadence (`[vhc.retry]`).
     #[serde(default)]
     pub retry: RetryConfig,
@@ -324,6 +334,7 @@ impl Default for VhcConfig {
             coordinator_allowlist: vec!["https://api.daemon.ai/api/v1/vhc".to_string()],
             seat_claim: false,
             seat_role: default_seat_role(),
+            coordinator_trains: false,
             retry: RetryConfig::default(),
             registry: RegistryConfig::default(),
             iroh: IrohConfig::default(),

@@ -282,6 +282,16 @@ pub fn spawn_node_with(spec: &NodeSpec<'_>, extra_vhc_toml: &str) -> Node {
     if let Some(dir) = spec.payload_dir {
         writeln!(toml, "payload_dir = {:?}", dir.display().to_string()).unwrap();
     }
+    // Additive `[vhc]`-scoped TOML injected here — BEFORE the sub-tables — so a caller-supplied
+    // bare key (e.g. `coordinator_trains = true`) lands under `[vhc]`, and a caller-supplied
+    // sub-table (e.g. `[vhc.iroh]`) simply precedes the ones below (TOML table order is
+    // irrelevant). Appending it at the END would misfile a bare key under the last sub-table.
+    if !extra_vhc_toml.is_empty() {
+        toml.push_str(extra_vhc_toml);
+        if !extra_vhc_toml.ends_with('\n') {
+            toml.push('\n');
+        }
+    }
     toml.push_str("[vhc.owner_budget]\nunbounded = true\n");
     toml.push_str("[vhc.registry]\n");
     writeln!(toml, "base = {:?}", spec.registry_base).unwrap();
@@ -289,12 +299,6 @@ pub fn spawn_node_with(spec: &NodeSpec<'_>, extra_vhc_toml: &str) -> Node {
     writeln!(toml, "reconcile_tick_ms = {}", spec.reconcile_tick_ms).unwrap();
     if spec.initial_backoff_ms > 0 {
         writeln!(toml, "initial_backoff_ms = {}", spec.initial_backoff_ms).unwrap();
-    }
-    if !extra_vhc_toml.is_empty() {
-        toml.push_str(extra_vhc_toml);
-        if !extra_vhc_toml.ends_with('\n') {
-            toml.push('\n');
-        }
     }
     let config_path = data_dir.path().join("node.toml");
     std::fs::write(&config_path, toml).expect("write node config");
@@ -765,6 +769,48 @@ pub async fn start_cluster_with(
         steps_per_round: 2,
         k_absences,
         timing,
+        upgrade_authority: vec![peer_id(&upgrade_authority_key())],
+    });
+
+    let (registry, base_url, task) = registry::serve(&genesis, run_label, port).await;
+    Cluster {
+        registry,
+        genesis,
+        run_label: run_label.to_string(),
+        base_url,
+        _registry_task: task,
+    }
+}
+
+/// [`start_cluster_on`] with an explicit membership floor/ceiling — used by the single-node
+/// coordinator+trainer gate (min=max=1: the one box is its own coordinator AND its only trainer).
+pub async fn start_cluster_membership(
+    port: u16,
+    run_label: &str,
+    trusted_bases: &[daemon_vhc_proto::PeerId],
+    epoch_rounds: u32,
+    global_batch: u32,
+    min_peers: u32,
+    max_peers: u32,
+) -> Cluster {
+    let coordinator_wasm = guest_wasm("coordinator_quorum");
+    let trainer_wasm = guest_wasm("tiny_llama");
+    let corpus = corpus_dir();
+    let genesis = live_genesis(&LiveGenesisSpec {
+        run_label,
+        coordinator_wasm: &coordinator_wasm,
+        coordinator_url: format!("file://{}", guest_path("coordinator_quorum").display()),
+        trainer_wasm: &trainer_wasm,
+        trainer_url: format!("file://{}", guest_path("tiny_llama").display()),
+        corpus_dir: &corpus,
+        trusted_bases,
+        min_peers,
+        max_peers,
+        epoch_rounds,
+        global_batch,
+        steps_per_round: 2,
+        k_absences: 6,
+        timing: daemon_vhc_testkit::live_genesis::LiveTiming::default(),
         upgrade_authority: vec![peer_id(&upgrade_authority_key())],
     });
 
