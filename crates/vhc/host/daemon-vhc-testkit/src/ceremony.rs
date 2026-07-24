@@ -308,11 +308,6 @@ fn ceremony_profile_value() -> Value {
 #[must_use]
 pub fn ceremony_trainer_config(run_label: &str, corpus_manifest: Hash, roster: &[PeerId]) -> Value {
     let text = |s: &str| Value::Text(s.into());
-    let roster_val = Value::Array(roster.iter().map(|p| Value::Bytes(p.0.to_vec())).collect());
-    let peer = roster.first().map_or_else(
-        || Value::Bytes(vec![0u8; 32]),
-        |p| Value::Bytes(p.0.to_vec()),
-    );
     let live = Value::Map(vec![
         (text("run_label"), text(run_label)),
         (
@@ -320,6 +315,30 @@ pub fn ceremony_trainer_config(run_label: &str, corpus_manifest: Hash, roster: &
             Value::serialized(&corpus_manifest).expect("manifest hash value"),
         ),
     ]);
+    let Value::Map(mut fields) = ceremony_trainer_config_harness(roster) else {
+        unreachable!("the harness form is a map")
+    };
+    fields.push((text("live"), live));
+    Value::Map(fields)
+}
+
+/// The FROZEN ceremony trainer config in its **harness** form: [`ceremony_trainer_config`] without
+/// the `live` section, i.e. the same frozen model + profile + seed-form state contract driven over
+/// host staging instead of module-driven corpus/wire traffic (the guest's documented
+/// absent-`live` contract).
+///
+/// This is what a gate that must exercise the ceremony GEOMETRY without the ceremony's data plane
+/// feeds — the real-geometry init gate (`tests/ceremony_geometry.rs`). It shares the frozen halves
+/// with the fleet form by construction, so a geometry or state-contract edit cannot move one
+/// without the other.
+#[must_use]
+pub fn ceremony_trainer_config_harness(roster: &[PeerId]) -> Value {
+    let text = |s: &str| Value::Text(s.into());
+    let roster_val = Value::Array(roster.iter().map(|p| Value::Bytes(p.0.to_vec())).collect());
+    let peer = roster.first().map_or_else(
+        || Value::Bytes(vec![0u8; 32]),
+        |p| Value::Bytes(p.0.to_vec()),
+    );
     Value::Map(vec![
         (text("model"), ceremony_model_value()),
         (text("peer"), peer),
@@ -332,7 +351,6 @@ pub fn ceremony_trainer_config(run_label: &str, corpus_manifest: Hash, roster: &
             text("state"),
             Value::serialized(&ceremony_state_contract()).expect("state contract value"),
         ),
-        (text("live"), live),
     ])
 }
 

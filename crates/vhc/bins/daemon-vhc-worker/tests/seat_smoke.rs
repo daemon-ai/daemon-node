@@ -27,6 +27,7 @@ use std::time::Duration;
 use ciborium::value::Value;
 use daemon_common::SessionId;
 use daemon_provision::{Placement, PlacementSpec, ProcessProvisioner, Provisioner};
+use daemon_vhc_guest_build::guests_root;
 use daemon_vhc_net::ws_relay::MockWsCoordinator;
 use daemon_vhc_net::FakeSeatRegistry;
 use daemon_vhc_node::seat::{author_claim, authorize_incumbent, derive_bid, CoordinatorSeat};

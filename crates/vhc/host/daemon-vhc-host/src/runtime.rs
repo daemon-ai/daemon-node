@@ -119,6 +119,44 @@ impl Default for EngineConfig {
     }
 }
 
+impl EngineConfig {
+    /// The REAL-MODEL sandbox profile: the budgets a production-geometry run needs, as opposed to
+    /// [`EngineConfig::default`], whose values are sized for the tiny reference model the
+    /// acceptance tier trains.
+    ///
+    /// The two budgets a real geometry blows past are both per-slice (fuel and the epoch deadline
+    /// both reset on every delivered event, ABI §4.1/§5.5) and both are dominated by the same
+    /// slice: the fresh-join seed-init, which expands every parameter element from
+    /// `daemon-vhc-det`'s counter-based distribution, folds it into the master family, and uploads
+    /// it to the device. At the fleet-ceremony geometry (786_507_264 parameters) that ONE slice
+    /// measures **323.3 G fuel / ~100 s** on the CPU lane (`daemon-vhc-testkit`'s
+    /// `ceremony_geometry` gate), so `fuel_per_call` is `1 << 39` (549.8 G — the measured cost with
+    /// ~1.7× headroom) and the epoch deadline is the 600 s device-lane wall. The wall-clock guard
+    /// against a wedged guest is that epoch watchdog; fuel is the deterministic budget, and a
+    /// budget under the init cost turns a healthy fresh join into a `BudgetFuel` trap.
+    ///
+    /// `max_memory_bytes` is deliberately NOT raised: a conforming guest streams state families
+    /// window-by-window (design §3.2 — the fold walks, the seed expansion, the checkpoint
+    /// rehydration), so its linear-memory high-water is O(window), independent of the geometry.
+    /// Raising the cap here would hide exactly the class of guest regression the ceremony-geometry
+    /// init gate exists to catch.
+    ///
+    /// Both the worker's join engine and the ceremony-geometry init gate build from this one
+    /// definition, so a budget change is reviewed against a test rather than transcribed.
+    #[must_use]
+    pub fn real_model(backend: BackendKind, gpu_index: Option<u32>) -> Self {
+        Self {
+            fuel_per_call: 1 << 39,
+            epoch_deadline: Duration::from_secs(600),
+            op_budget: 1 << 30,
+            max_step_handles: 1 << 24,
+            backend,
+            gpu_index,
+            ..Self::default()
+        }
+    }
+}
+
 // -- worker + engine ------------------------------------------------------------------------------
 
 struct EpochThread {

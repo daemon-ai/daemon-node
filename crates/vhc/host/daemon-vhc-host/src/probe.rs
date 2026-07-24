@@ -230,6 +230,10 @@ pub fn ensure_wgpu_registered(device: &burn::backend::wgpu::WgpuDevice) {
 }
 
 /// Linux `MemTotal` (kB) → MiB. `0` when `/proc/meminfo` is unreadable / unparseable.
+// Declared raw-fs site (Phase 4 hardening / clippy.toml): a fixed `/proc` pseudo-file, never an
+// attacker- or guest-influenced path, and this crate links no `ContainedRoot` (the choke point is
+// for contained trees, not for procfs stat reads).
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 fn linux_mem_total_mb() -> u64 {
     let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {

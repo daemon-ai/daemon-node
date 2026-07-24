@@ -1024,10 +1024,12 @@ fn family_base_offsets(numels: &[usize]) -> Vec<u64> {
     bases
 }
 
-/// Seal a resident family into a self-sealed fold ([SF-R1]) by streaming it through
+/// Seal a RESIDENT family into a self-sealed fold ([SF-R1]) by streaming it through
 /// `state_open`/`state_emit`/`state_seal` in per-parameter `window_size`-byte windows (the
-/// fold-walk chunking, so the sealed fold IS the family fold the walk schedule assumes). Used to
-/// give a resident init (seed-expanded or restored) a fetchable round-base fold.
+/// fold-walk chunking, so the sealed fold IS the family fold the walk schedule assumes). The
+/// checkpoint walk's AdamW moments arrive this way — resident, because the device export delivers
+/// them per parameter. An init never materializes a family: see [`stream_seed_init`] /
+/// [`seal_zeroed_family`].
 fn seal_family(tag: &str, params: &[Vec<f32>], window_size: u64) -> ([u8; 32], Vec<Hash>) {
     let byte_len: u64 = params.iter().map(|p| (p.len() as u64) * 4).sum();
     let stream = daemon_vhc_sdk::state_open(tag, byte_len);
@@ -1045,6 +1047,67 @@ fn seal_family(tag: &str, params: &[Vec<f32>], window_size: u64) -> ([u8; 32], V
             daemon_vhc_sdk::state_emit(stream, &buf);
             chunks.push(blake3_hash(&buf));
             off = end;
+        }
+    }
+    (daemon_vhc_sdk::state_seal(stream), chunks)
+}
+
+/// Expand the seed-derived matched init (§6.1a) and land it in its two homes in ONE bounded pass:
+/// every `window_size`-byte window is emitted into the master family's seal stream (accumulating
+/// the chunk hash, so the sealed fold IS the fold the walk schedule assumes and the chunk list is
+/// the [SF-R1] self-sealed one a by-reference checkpoint section needs) and written straight into
+/// the device parameter. Returns the sealed master fold + its ordered chunk hashes.
+///
+/// The expansion is counter-based, so a window expands independently of the split
+/// (`daemon_vhc_det::seed_init_window` exists for exactly this, and the genesis authoring folds the
+/// pinned `expected_root` the same streaming way): peak guest memory is ONE window, not one
+/// parameter and never one family — at the fleet-ceremony geometry a resident family is ~2.93 GiB.
+fn stream_seed_init(
+    model: &mut TinyLlamaModel<AutodiffHostBackend>,
+    numels: &[usize],
+    seed: &[u8; 32],
+    dist: u64,
+    window_size: u64,
+) -> ([u8; 32], Vec<Hash>) {
+    let stream = daemon_vhc_sdk::state_open(MASTER_FAMILY, family_byte_len(&numels_u64(numels)));
+    let step = (window_size / 4).max(1) as usize; // elements per window
+    let mut window: Vec<f32> = Vec::with_capacity(step);
+    let mut bytes: Vec<u8> = Vec::with_capacity(step * 4);
+    let mut chunks = Vec::new();
+    for (i, &numel) in numels.iter().enumerate() {
+        // Per-parameter chunking: a parameter never spans a chunk boundary; its last chunk is
+        // short (the `det_state` family chunking every fold walk assumes).
+        let mut off = 0usize;
+        while off < numel {
+            let take = step.min(numel - off);
+            daemon_vhc_det::seed_init_window(seed, dist, i as u64, off, take, &mut window)
+                .expect("the genesis seed-init distribution id is implemented");
+            f32s_to_le_bytes(&window, &mut bytes);
+            daemon_vhc_sdk::state_emit(stream, &bytes);
+            chunks.push(blake3_hash(&bytes));
+            model.write_param_window(i, off, &window);
+            off += take;
+        }
+    }
+    (daemon_vhc_sdk::state_seal(stream), chunks)
+}
+
+/// Seal an ALL-ZERO family into a self-sealed fold ([SF-R1]) — the fresh-join `ef` residuals —
+/// from one reusable zero window, so the cost is the fold, not a resident family. Chunked exactly
+/// like [`stream_seed_init`], so the fold is the one a zeroed family would have produced.
+fn seal_zeroed_family(tag: &str, numels: &[usize], window_size: u64) -> ([u8; 32], Vec<Hash>) {
+    let stream = daemon_vhc_sdk::state_open(tag, family_byte_len(&numels_u64(numels)));
+    let step = (window_size / 4).max(1) as usize; // elements per window
+    let zeros = vec![0u8; step * 4];
+    let mut chunks = Vec::new();
+    for &numel in numels {
+        let mut off = 0usize;
+        while off < numel {
+            let take = step.min(numel - off);
+            let chunk = &zeros[..take * 4];
+            daemon_vhc_sdk::state_emit(stream, chunk);
+            chunks.push(blake3_hash(chunk));
+            off += take;
         }
     }
     (daemon_vhc_sdk::state_seal(stream), chunks)
@@ -1224,9 +1287,8 @@ fn drive_boot_completion(
         // seal a zeroed ef family for round 0 (the update walk reads its ef windows from it).
         let flat = std::mem::take(&mut boot.assembled);
         c.model.set_params_from_flat(&flat);
-        let window_size = c.window_size;
-        let zeroed: Vec<Vec<f32>> = c.numels.iter().map(|&n| vec![0.0f32; n]).collect();
-        let (ef_fold, ef_chunks) = seal_family(EF_FAMILY, &zeroed, window_size);
+        let (window_size, numels) = (c.window_size, c.numels.clone());
+        let (ef_fold, ef_chunks) = seal_zeroed_family(EF_FAMILY, &numels, window_size);
         c.ef_fold = ef_fold;
         c.ef_chunks = ef_chunks;
         boot.done = true;
@@ -1635,64 +1697,54 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
     let restored_round = restored.as_ref().and_then(|r| r.round);
     let window_size = cfg.state.chunk_size;
     let family_base = family_base_offsets(&numels);
-    // The init source (§6): a restore rebuilds from the snapshot; a fresh join expands the seed
-    // (synchronous, sealed + `expected_root`-checked here) or fetches the content-addressed
-    // artifact (async — the model boots from zeros and the fetched init uploads when the boot
-    // walk completes, [`BootState`]). `booted == false` defers the first round until the init is
-    // resident.
+    // The init source (§6) / restore rebuild. The model is allocated on-device as zeros in every
+    // form and the real values are written in bounded windows — a guest-resident family is
+    // O(parameters) (~2.93 GiB per copy at the fleet-ceremony geometry), which no wasm32 linear
+    // memory holds, and holding one would break the streaming design's bounded-guest-memory
+    // invariant (§3.2: the guest folds at O(chunks in flight)).
+    //   - Restore ([SF-6]): a [`RestoreState`] walk registers the checkpoint's family folds
+    //     ([SF-R2]) and STREAMS master → device weights and adamw_m/v → device moments, adopting
+    //     the master/ef folds as the round base. `booted` stays false until the walk lands (the
+    //     first round defers behind it, like the artifact boot).
+    //   - Seed: deterministic expansion, streamed + sealed + `expected_root`-cross-checked
+    //     synchronously ([`stream_seed_init`]).
+    //   - Artifact: fetched asynchronously ([`BootState`]); trains from zeros until it lands.
     let mut boot: Option<BootState> = None;
-    // The init source (§6) / restore rebuild:
-    //   - Restore ([SF-6]): the model boots from zeros; a [`RestoreState`] walk registers the
-    //     checkpoint's family folds ([SF-R2]) and STREAMS master → device weights and adamw_m/v →
-    //     device moments, adopting the master/ef folds as the round base. `booted` stays false
-    //     until the walk lands (the first round defers behind it, like the artifact boot).
-    //   - Seed: deterministic expansion, sealed + `expected_root`-cross-checked synchronously.
-    //   - Artifact: fetched asynchronously ([`BootState`]); boots from zeros until it lands.
-    let init: Vec<Vec<f32>> = match &restored {
-        Some(_) => numels.iter().map(|&n| vec![0.0f32; n]).collect(),
-        None => match cfg.state.init {
-            StateInit::Seed { seed, dist, .. } => numels
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| {
-                    daemon_vhc_det::seed_init_param(&seed.0, dist, i as u64, n)
-                        .expect("the genesis seed-init distribution id is implemented")
-                })
-                .collect(),
-            StateInit::Manifest { manifest } => {
-                boot = Some(BootState::new(manifest, &numels));
-                numels.iter().map(|&n| vec![0.0f32; n]).collect()
-            }
-        },
-    };
-    // Seed init is resident synchronously; a restore or an artifact fetch defers the first round.
-    let mut booted = restored.is_none() && boot.is_none();
     let device = daemon_vhc_sdk_compute::device();
-    let model = TinyLlamaModel::<AutodiffHostBackend>::from_flat(cfg.model.clone(), device, &init);
+    let mut model = TinyLlamaModel::<AutodiffHostBackend>::zeros(cfg.model.clone(), device);
     // The canonical master + replica-local ef live host-side as sealed folds (no resident copy).
-    // Seed-init seals both synchronously now — master from the expansion (cross-checked against
-    // the pin) and a zeroed ef; restore adopts the checkpoint's folds; the artifact form
+    // Seed-init seals both synchronously — master from the streamed expansion (cross-checked
+    // against the pin) and a zeroed ef; restore adopts the checkpoint's folds; the artifact form
     // registers/seals at boot.
     let mut master_fold = [0u8; 32];
     let mut master_chunks: Vec<Hash> = Vec::new();
     let mut ef_fold = [0u8; 32];
     let mut ef_chunks: Vec<Hash> = Vec::new();
-    if booted {
-        let (mf, mc) = seal_family(MASTER_FAMILY, &init, window_size);
-        master_fold = mf;
-        master_chunks = mc;
-        let zeroed: Vec<Vec<f32>> = numels.iter().map(|&n| vec![0.0f32; n]).collect();
-        let (ff, fc) = seal_family(EF_FAMILY, &zeroed, window_size);
-        ef_fold = ff;
-        ef_chunks = fc;
-        // Seed-init admission cross-check (§6.1a): the sealed expansion MUST reproduce the pin.
-        if let StateInit::Seed { expected_root, .. } = cfg.state.init {
-            assert_eq!(
-                master_fold, expected_root.0,
-                "seed-init sealed fold does not match the pinned expected_root (typed init failure)"
-            );
+    if restored.is_none() {
+        match cfg.state.init {
+            StateInit::Seed {
+                seed,
+                dist,
+                expected_root,
+            } => {
+                let (mf, mc) = stream_seed_init(&mut model, &numels, &seed.0, dist, window_size);
+                master_fold = mf;
+                master_chunks = mc;
+                let (ff, fc) = seal_zeroed_family(EF_FAMILY, &numels, window_size);
+                ef_fold = ff;
+                ef_chunks = fc;
+                // Seed-init admission cross-check (§6.1a): the sealed expansion MUST reproduce
+                // the pin.
+                assert_eq!(
+                    master_fold, expected_root.0,
+                    "seed-init sealed fold does not match the pinned expected_root (typed init failure)"
+                );
+            }
+            StateInit::Manifest { manifest } => boot = Some(BootState::new(manifest, &numels)),
         }
     }
+    // Seed init is resident synchronously; a restore or an artifact fetch defers the first round.
+    let mut booted = restored.is_none() && boot.is_none();
     let core = Rc::new(RefCell::new(Core {
         model,
         profile_cfg: cfg.profile.clone(),

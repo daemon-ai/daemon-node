@@ -139,10 +139,115 @@ fn zeros_inner<B: AutodiffBackend>(device: &B::Device, n: usize) -> Tensor<B::In
 }
 
 impl<B: AutodiffBackend> TinyLlamaModel<B> {
-    /// Build from the canonical flat state (registration order — matched init).
+    /// Build the model with every parameter and both AdamW moments allocated **on device** as
+    /// zeros — `Tensor::zeros` is a device op, so not one element crosses the boundary and the
+    /// guest holds no parameter-shaped buffer at all.
+    ///
+    /// This is the constructor every init form goes through ([`TinyLlamaModel::write_param_window`]
+    /// then writes the real values in bounded windows): a guest-side flat state is O(family) —
+    /// ~2.93 GiB per copy at the fleet-ceremony geometry — which no wasm32 linear memory holds.
+    /// [`TinyLlamaModel::from_flat`] stays for the natively-driven lanes that already own a
+    /// resident state (the dual-compiled oracle + the toy harnesses).
+    #[must_use]
+    pub fn zeros(cfg: ModelCfg, device: B::Device) -> Self {
+        let numels = cfg.param_numels();
+        let mut it = numels.iter();
+        let leaf = |n: usize| Tensor::<B, 1>::zeros([n], &device).require_grad();
+        let tok = leaf(*it.next().expect("tok"));
+        let blocks = (0..cfg.n_layers)
+            .map(|_| Block {
+                attn_norm: leaf(*it.next().expect("attn_norm")),
+                wq: leaf(*it.next().expect("wq")),
+                wk: leaf(*it.next().expect("wk")),
+                wv: leaf(*it.next().expect("wv")),
+                wo: leaf(*it.next().expect("wo")),
+                ffn_norm: leaf(*it.next().expect("ffn_norm")),
+                w_gate: leaf(*it.next().expect("w_gate")),
+                w_up: leaf(*it.next().expect("w_up")),
+                w_down: leaf(*it.next().expect("w_down")),
+            })
+            .collect();
+        let norm = leaf(*it.next().expect("norm"));
+        let moments = || {
+            numels
+                .iter()
+                .map(|&n| Tensor::<B::InnerBackend, 1>::zeros([n], &device))
+                .collect()
+        };
+        let (m, v) = (moments(), moments());
+        Self {
+            cfg,
+            device,
+            tok,
+            blocks,
+            norm,
+            m,
+            v,
+        }
+    }
+
+    /// Write one bounded `[off, off + vals.len())` element window into the parameter at `index`
+    /// (canonical registration order) — the device-side counterpart of the state plane's window
+    /// streaming: an init walks a family window-by-window and lands each window here, so the peak
+    /// guest buffer is one window rather than one parameter (let alone one family).
+    ///
+    /// The parameter is re-materialized as a fresh AD leaf (`from_inner(...).require_grad()`), the
+    /// same discipline as every other parameter write in this file. Init-time only: a window write
+    /// during a live autodiff graph would detach the leaf the tape recorded.
+    ///
+    /// # Panics
+    /// If `index` is not a canonical parameter position.
+    pub fn write_param_window(&mut self, index: usize, off: usize, vals: &[f32]) {
+        let len = vals.len();
+        let patch = Tensor::<B::InnerBackend, 1>::from_data(
+            TensorData::new(vals.to_vec(), [len]),
+            &self.device,
+        );
+        let param = self.param_mut(index);
+        let written = param.clone().inner().slice_assign([off..off + len], patch);
+        *param = Tensor::from_inner(written).require_grad();
+    }
+
+    /// The parameter at canonical registration position `index` (`tok`, then per block
+    /// `attn_norm, wq, wk, wv, wo, ffn_norm, w_gate, w_up, w_down`, then `norm`).
+    fn param_mut(&mut self, index: usize) -> &mut Tensor<B, 1> {
+        const PER_BLOCK: usize = 9;
+        if index == 0 {
+            return &mut self.tok;
+        }
+        let within = index - 1;
+        let block = within / PER_BLOCK;
+        if block >= self.blocks.len() {
+            assert_eq!(
+                within,
+                self.blocks.len() * PER_BLOCK,
+                "canonical param index"
+            );
+            return &mut self.norm;
+        }
+        let b = &mut self.blocks[block];
+        match within % PER_BLOCK {
+            0 => &mut b.attn_norm,
+            1 => &mut b.wq,
+            2 => &mut b.wk,
+            3 => &mut b.wv,
+            4 => &mut b.wo,
+            5 => &mut b.ffn_norm,
+            6 => &mut b.w_gate,
+            7 => &mut b.w_up,
+            _ => &mut b.w_down,
+        }
+    }
+
+    /// Build from a RESIDENT canonical flat state (registration order — matched init). The guest
+    /// never has one (it streams init windows into [`TinyLlamaModel::zeros`]); the natively
+    /// compiled oracle lanes, which own their init image outright, do.
     ///
     /// # Panics
     /// If `flat` does not match [`ModelCfg::param_numels`].
+    // Dead in the wasm32 guest compilation, live in the native dual-compile (this file is compiled
+    // twice — see the module docs); the guest's own init path is `zeros` + `write_param_window`.
+    #[allow(dead_code)]
     #[must_use]
     pub fn from_flat(cfg: ModelCfg, device: B::Device, flat: &[Vec<f32>]) -> Self {
         let numels = cfg.param_numels();
