@@ -135,6 +135,15 @@ impl EngineConfig {
     /// against a wedged guest is that epoch watchdog; fuel is the deterministic budget, and a
     /// budget under the init cost turns a healthy fresh join into a `BudgetFuel` trap.
     ///
+    /// The ROUND path was measured against this same budget rather than assumed under it
+    /// (`ceremony_round`, the round-path gate: θ export → `make_update` → ingest → quiesce at the
+    /// frozen geometry, instrumenting the per-slice fuel at the `next_event` seam). Its worst slice
+    /// measures **1.015 G fuel** — the ingest walk's sealing slice — with the next at 0.77 G and
+    /// the streamed window slices at ~0.38 G. That is 316× under the init slice and ~540× under
+    /// this budget, because every round-path walk is bounded per window by construction while init
+    /// is one unbroken pass. So the budget above stands on the init measurement alone; the rounds
+    /// do not move it.
+    ///
     /// `max_memory_bytes` is deliberately NOT raised: a conforming guest streams state families
     /// window-by-window (design §3.2 — the fold walks, the seed expansion, the checkpoint
     /// rehydration), so its linear-memory high-water is O(window), independent of the geometry.

@@ -103,17 +103,27 @@ pub fn pow_iter(base: f64, t: u32) -> f64 {
     acc
 }
 
-/// One block's parameters (flat rank-1 leaves; the forward reshapes to natural ranks).
+/// Parameters per transformer block (the canonical per-block registration run).
+const PER_BLOCK: usize = 9;
+
+/// The canonical within-block parameter positions — the ONE place the per-block registration
+/// order is written down (`ModelCfg::param_numels` emits its numels in exactly this order, and
+/// [`TinyLlamaModel::param_at`]/[`TinyLlamaModel::param_mut`] index by it).
+const ATTN_NORM: usize = 0;
+const WQ: usize = 1;
+const WK: usize = 2;
+const WV: usize = 3;
+const WO: usize = 4;
+const FFN_NORM: usize = 5;
+const W_GATE: usize = 6;
+const W_UP: usize = 7;
+const W_DOWN: usize = 8;
+
+/// One block's parameters (flat rank-1 leaves; the forward reshapes to natural ranks), held as a
+/// canonically-ordered array so the registration order exists once (the consts above) instead of
+/// once per traversal.
 struct Block<B: AutodiffBackend> {
-    attn_norm: Tensor<B, 1>,
-    wq: Tensor<B, 1>,
-    wk: Tensor<B, 1>,
-    wv: Tensor<B, 1>,
-    wo: Tensor<B, 1>,
-    ffn_norm: Tensor<B, 1>,
-    w_gate: Tensor<B, 1>,
-    w_up: Tensor<B, 1>,
-    w_down: Tensor<B, 1>,
+    p: [Tensor<B, 1>; PER_BLOCK],
 }
 
 /// The decoder: flat AD leaves + `InnerBackend` AdamW moments, all device-resident.
@@ -134,8 +144,11 @@ fn leaf<B: AutodiffBackend>(device: &B::Device, data: &[f32]) -> Tensor<B, 1> {
     Tensor::<B, 1>::from_data(TensorData::new(data.to_vec(), [n]), device).require_grad()
 }
 
-fn zeros_inner<B: AutodiffBackend>(device: &B::Device, n: usize) -> Tensor<B::InnerBackend, 1> {
-    Tensor::from_data(TensorData::new(vec![0.0f32; n], [n]), device)
+/// Where a canonical parameter index lives in the struct (the target of the one order mapping).
+enum Slot {
+    Tok,
+    Block(usize, usize),
+    Norm,
 }
 
 impl<B: AutodiffBackend> TinyLlamaModel<B> {
@@ -151,23 +164,17 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
     #[must_use]
     pub fn zeros(cfg: ModelCfg, device: B::Device) -> Self {
         let numels = cfg.param_numels();
-        let mut it = numels.iter();
-        let leaf = |n: usize| Tensor::<B, 1>::zeros([n], &device).require_grad();
-        let tok = leaf(*it.next().expect("tok"));
-        let blocks = (0..cfg.n_layers)
-            .map(|_| Block {
-                attn_norm: leaf(*it.next().expect("attn_norm")),
-                wq: leaf(*it.next().expect("wq")),
-                wk: leaf(*it.next().expect("wk")),
-                wv: leaf(*it.next().expect("wv")),
-                wo: leaf(*it.next().expect("wo")),
-                ffn_norm: leaf(*it.next().expect("ffn_norm")),
-                w_gate: leaf(*it.next().expect("w_gate")),
-                w_up: leaf(*it.next().expect("w_up")),
-                w_down: leaf(*it.next().expect("w_down")),
+        // Allocation is BY CANONICAL INDEX (never by traversal order), so this constructor holds
+        // no second copy of the registration order.
+        let leaf = |i: usize| Tensor::<B, 1>::zeros([numels[i]], &device).require_grad();
+        let n_layers = cfg.n_layers as usize;
+        let tok = leaf(0);
+        let blocks = (0..n_layers)
+            .map(|b| Block {
+                p: std::array::from_fn(|f| leaf(1 + b * PER_BLOCK + f)),
             })
             .collect();
-        let norm = leaf(*it.next().expect("norm"));
+        let norm = leaf(1 + n_layers * PER_BLOCK);
         let moments = || {
             numels
                 .iter()
@@ -186,14 +193,21 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
         }
     }
 
+    /// The number of canonical parameters (== `ModelCfg::param_numels().len()`).
+    #[must_use]
+    pub fn param_count(&self) -> usize {
+        2 + PER_BLOCK * self.blocks.len()
+    }
+
     /// Write one bounded `[off, off + vals.len())` element window into the parameter at `index`
     /// (canonical registration order) — the device-side counterpart of the state plane's window
     /// streaming: an init walks a family window-by-window and lands each window here, so the peak
     /// guest buffer is one window rather than one parameter (let alone one family).
     ///
     /// The parameter is re-materialized as a fresh AD leaf (`from_inner(...).require_grad()`), the
-    /// same discipline as every other parameter write in this file. Init-time only: a window write
-    /// during a live autodiff graph would detach the leaf the tape recorded.
+    /// same discipline as every other parameter write in this file. Between-graph only (init, and
+    /// the post-ingest master apply at the round boundary): a window write during a live autodiff
+    /// graph would detach the leaf the tape recorded.
     ///
     /// # Panics
     /// If `index` is not a canonical parameter position.
@@ -208,12 +222,63 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
         *param = Tensor::from_inner(written).require_grad();
     }
 
+    /// Write one bounded element window into an AdamW moment (`second == false` → `m`, `true` →
+    /// `v`) at canonical position `index` — the moment counterpart of
+    /// [`TinyLlamaModel::write_param_window`], used by the streamed checkpoint rehydration so a
+    /// restore never materializes a moment family guest-side.
+    ///
+    /// # Panics
+    /// If `index` is out of range.
+    pub fn write_moment_window(&mut self, second: bool, index: usize, off: usize, vals: &[f32]) {
+        let len = vals.len();
+        let patch = Tensor::<B::InnerBackend, 1>::from_data(
+            TensorData::new(vals.to_vec(), [len]),
+            &self.device,
+        );
+        let moment = if second {
+            &mut self.v[index]
+        } else {
+            &mut self.m[index]
+        };
+        *moment = moment.clone().slice_assign([off..off + len], patch);
+    }
+
     /// The parameter at canonical registration position `index` (`tok`, then per block
     /// `attn_norm, wq, wk, wv, wo, ffn_norm, w_gate, w_up, w_down`, then `norm`).
+    ///
+    /// This and its `_mut` twin are THE canonical-order accessor: every traversal in this file
+    /// (`from_flat`, `flat_params`, the AdamW writeback, the windowed init/ingest writes) indexes
+    /// through them, so the order is written down once here and once in
+    /// [`ModelCfg::param_numels`] — the two the layout arithmetic genuinely needs — instead of
+    /// being re-spelled per traversal and silently drifting apart.
+    ///
+    /// # Panics
+    /// If `index` is not a canonical parameter position.
+    fn param_at(&self, index: usize) -> &Tensor<B, 1> {
+        match self.slot(index) {
+            Slot::Tok => &self.tok,
+            Slot::Block(b, f) => &self.blocks[b].p[f],
+            Slot::Norm => &self.norm,
+        }
+    }
+
+    /// The mutable twin of [`TinyLlamaModel::param_at`] (same canonical mapping).
+    ///
+    /// # Panics
+    /// If `index` is not a canonical parameter position.
     fn param_mut(&mut self, index: usize) -> &mut Tensor<B, 1> {
-        const PER_BLOCK: usize = 9;
+        match self.slot(index) {
+            Slot::Tok => &mut self.tok,
+            Slot::Block(b, f) => &mut self.blocks[b].p[f],
+            Slot::Norm => &mut self.norm,
+        }
+    }
+
+    /// The canonical registration index → storage slot mapping (the single definition of the
+    /// parameter ORDER; the within-block field order lives in the `ATTN_NORM…W_DOWN` consts).
+    fn slot(&self, index: usize) -> Slot {
         if index == 0 {
-            return &mut self.tok;
+            return Slot::Tok;
         }
         let within = index - 1;
         let block = within / PER_BLOCK;
@@ -223,20 +288,9 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
                 self.blocks.len() * PER_BLOCK,
                 "canonical param index"
             );
-            return &mut self.norm;
+            return Slot::Norm;
         }
-        let b = &mut self.blocks[block];
-        match within % PER_BLOCK {
-            0 => &mut b.attn_norm,
-            1 => &mut b.wq,
-            2 => &mut b.wk,
-            3 => &mut b.wv,
-            4 => &mut b.wo,
-            5 => &mut b.ffn_norm,
-            6 => &mut b.w_gate,
-            7 => &mut b.w_up,
-            _ => &mut b.w_down,
-        }
+        Slot::Block(block, within % PER_BLOCK)
     }
 
     /// Build from a RESIDENT canonical flat state (registration order — matched init). The guest
@@ -255,59 +309,19 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
         for (f, n) in flat.iter().zip(numels.iter()) {
             assert_eq!(f.len(), *n, "init param numel");
         }
-        let mut it = flat.iter();
-        let tok = leaf::<B>(&device, it.next().expect("tok"));
-        let blocks = (0..cfg.n_layers)
-            .map(|_| Block {
-                attn_norm: leaf::<B>(&device, it.next().expect("attn_norm")),
-                wq: leaf::<B>(&device, it.next().expect("wq")),
-                wk: leaf::<B>(&device, it.next().expect("wk")),
-                wv: leaf::<B>(&device, it.next().expect("wv")),
-                wo: leaf::<B>(&device, it.next().expect("wo")),
-                ffn_norm: leaf::<B>(&device, it.next().expect("ffn_norm")),
-                w_gate: leaf::<B>(&device, it.next().expect("w_gate")),
-                w_up: leaf::<B>(&device, it.next().expect("w_up")),
-                w_down: leaf::<B>(&device, it.next().expect("w_down")),
-            })
-            .collect();
-        let norm = leaf::<B>(&device, it.next().expect("norm"));
-        let m = numels
-            .iter()
-            .map(|&n| zeros_inner::<B>(&device, n))
-            .collect();
-        let v = numels
-            .iter()
-            .map(|&n| zeros_inner::<B>(&device, n))
-            .collect();
-        Self {
-            cfg,
-            device,
-            tok,
-            blocks,
-            norm,
-            m,
-            v,
+        let mut model = Self::zeros(cfg, device);
+        let device = model.device.clone();
+        for (i, values) in flat.iter().enumerate() {
+            *model.param_mut(i) = leaf::<B>(&device, values);
         }
+        model
     }
 
     /// The AD-leaf params in canonical registration order.
     fn flat_params(&self) -> Vec<Tensor<B, 1>> {
-        let mut ps = vec![self.tok.clone()];
-        for b in &self.blocks {
-            ps.extend([
-                b.attn_norm.clone(),
-                b.wq.clone(),
-                b.wk.clone(),
-                b.wv.clone(),
-                b.wo.clone(),
-                b.ffn_norm.clone(),
-                b.w_gate.clone(),
-                b.w_up.clone(),
-                b.w_down.clone(),
-            ]);
-        }
-        ps.push(self.norm.clone());
-        ps
+        (0..self.param_count())
+            .map(|i| self.param_at(i).clone())
+            .collect()
     }
 
     /// Detached (inner) clones of the params, canonical order — the export surface (over
@@ -327,44 +341,6 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
             .cloned()
             .chain(self.v.iter().cloned())
             .collect()
-    }
-
-    /// Replace the AdamW moments from canonical per-param vectors (the restore counterpart of
-    /// [`TinyLlamaModel::moment_tensors`]).
-    ///
-    /// # Panics
-    /// If either moment set does not match [`ModelCfg::param_numels`].
-    pub fn set_moments_from_flat(&mut self, m: &[Vec<f32>], v: &[Vec<f32>]) {
-        let numels = self.cfg.param_numels();
-        assert_eq!(m.len(), numels.len(), "m param count");
-        assert_eq!(v.len(), numels.len(), "v param count");
-        let upload = |d: &Vec<f32>| {
-            Tensor::<B::InnerBackend, 1>::from_data(
-                TensorData::new(d.clone(), [d.len()]),
-                &self.device,
-            )
-        };
-        self.m = m.iter().map(upload).collect();
-        self.v = v.iter().map(upload).collect();
-    }
-
-    /// Replace the params with a new canonical flat state (post-ingest master upload). The AdamW
-    /// moments are kept — the v1 outer step never resets them.
-    pub fn set_params_from_flat(&mut self, flat: &[Vec<f32>]) {
-        let mut it = flat.iter();
-        self.tok = leaf::<B>(&self.device, it.next().expect("tok"));
-        for b in &mut self.blocks {
-            b.attn_norm = leaf::<B>(&self.device, it.next().expect("attn_norm"));
-            b.wq = leaf::<B>(&self.device, it.next().expect("wq"));
-            b.wk = leaf::<B>(&self.device, it.next().expect("wk"));
-            b.wv = leaf::<B>(&self.device, it.next().expect("wv"));
-            b.wo = leaf::<B>(&self.device, it.next().expect("wo"));
-            b.ffn_norm = leaf::<B>(&self.device, it.next().expect("ffn_norm"));
-            b.w_gate = leaf::<B>(&self.device, it.next().expect("w_gate"));
-            b.w_up = leaf::<B>(&self.device, it.next().expect("w_up"));
-            b.w_down = leaf::<B>(&self.device, it.next().expect("w_down"));
-        }
-        self.norm = leaf::<B>(&self.device, it.next().expect("norm"));
     }
 
     fn rmsnorm(&self, x: Tensor<B, 2>, w: &Tensor<B, 1>, d: usize) -> Tensor<B, 2> {
@@ -436,7 +412,7 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
 
         for blk in &self.blocks {
             // Attention.
-            let normed = self.rmsnorm(h.clone(), &blk.attn_norm, d);
+            let normed = self.rmsnorm(h.clone(), &blk.p[ATTN_NORM], d);
             let mk = |w: &Tensor<B, 1>| -> Tensor<B, 4> {
                 normed
                     .clone()
@@ -444,9 +420,9 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
                     .reshape([b, s, nh, hd])
                     .swap_dims(1, 2) // [b, nh, s, hd]
             };
-            let q = self.rope(mk(&blk.wq), s);
-            let k = self.rope(mk(&blk.wk), s);
-            let v = mk(&blk.wv);
+            let q = self.rope(mk(&blk.p[WQ]), s);
+            let k = self.rope(mk(&blk.p[WK]), s);
+            let v = mk(&blk.p[WV]);
             // Dense causal attention over [bh, s, hd].
             let bh = b * nh;
             let q3 = q.reshape([bh, s, hd]);
@@ -467,18 +443,20 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
                 .reshape([b, nh, s, hd])
                 .swap_dims(1, 2) // [b, s, nh, hd]
                 .reshape([rows, qdim])
-                .matmul(blk.wo.clone().reshape([qdim, d])); // [rows, d]
+                .matmul(blk.p[WO].clone().reshape([qdim, d])); // [rows, d]
             h = h.add(attn);
 
             // SwiGLU FFN.
-            let normed2 = self.rmsnorm(h.clone(), &blk.ffn_norm, d);
+            let normed2 = self.rmsnorm(h.clone(), &blk.p[FFN_NORM], d);
             let gate = activation::silu(
                 normed2
                     .clone()
-                    .matmul(blk.w_gate.clone().reshape([d, hidden])),
+                    .matmul(blk.p[W_GATE].clone().reshape([d, hidden])),
             );
-            let up = normed2.matmul(blk.w_up.clone().reshape([d, hidden]));
-            let ffn = gate.mul(up).matmul(blk.w_down.clone().reshape([hidden, d]));
+            let up = normed2.matmul(blk.p[W_UP].clone().reshape([d, hidden]));
+            let ffn = gate
+                .mul(up)
+                .matmul(blk.p[W_DOWN].clone().reshape([hidden, d]));
             h = h.add(ffn);
         }
 
@@ -571,19 +549,8 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
             self.v[i] = v1;
             new_params.push(Tensor::<B, 1>::from_inner(w1).require_grad());
         }
-        let mut it = new_params.into_iter();
-        self.tok = it.next().expect("tok");
-        for blk in &mut self.blocks {
-            blk.attn_norm = it.next().expect("attn_norm");
-            blk.wq = it.next().expect("wq");
-            blk.wk = it.next().expect("wk");
-            blk.wv = it.next().expect("wv");
-            blk.wo = it.next().expect("wo");
-            blk.ffn_norm = it.next().expect("ffn_norm");
-            blk.w_gate = it.next().expect("w_gate");
-            blk.w_up = it.next().expect("w_up");
-            blk.w_down = it.next().expect("w_down");
+        for (i, p) in new_params.into_iter().enumerate() {
+            *self.param_mut(i) = p;
         }
-        self.norm = it.next().expect("norm");
     }
 }
