@@ -242,6 +242,33 @@ struct ServeCtx {
     /// are copied here, and a restoring instance's chunk-keyed [SF-R2] fetch reassembles its
     /// covering span from them (exactly the production chunk-keyed resolver). Empty until a restore.
     ckpt_chunks: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    /// The FETCHABLE committed payloads (`blake3 → container bytes`): what the guest's own
+    /// `payload_get` is served from. [SF-R3] — a committed payload reaches the trainer as a host
+    /// buffer it range-reads, in every mode, so the goldens drive the production ingest path
+    /// rather than a staging shortcut. Shared (`Arc`) so a cloned `ServeCtx` and its origin serve
+    /// one archive, and mutable behind the lock so the drive can decide WHEN a payload becomes
+    /// fetchable (the straggle).
+    committed: Arc<Mutex<CommittedArchive>>,
+}
+
+/// The record-listed committed payloads a drive has published, plus the `payload_get` ops still
+/// waiting on one. A get for an unpublished address is HELD, never failed: the record promised the
+/// payload, so an archive that has not caught up stalls the round instead of breaking it.
+#[derive(Default)]
+struct CommittedArchive {
+    by_hash: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    deferred: Vec<(u64, [u8; 32])>,
+}
+
+impl ServeCtx {
+    /// Make a committed container fetchable (content-addressed, exactly as the record names it).
+    fn publish_committed(&self, payload: &[u8]) {
+        self.committed
+            .lock()
+            .expect("archive")
+            .by_hash
+            .insert(blake3_hash(payload).0, payload.to_vec());
+    }
 }
 
 /// Author the artifact-form init from the matched init at `chunk_size`: the master det-state
@@ -277,6 +304,7 @@ fn init_artifact(init: &[Vec<f32>], chunk_size: u64) -> ServeCtx {
         master_fold: master.fold.0,
         init_flat: param_bytes.concat(),
         ckpt_chunks: std::collections::HashMap::new(),
+        committed: Arc::new(Mutex::new(CommittedArchive::default())),
     }
 }
 
@@ -369,16 +397,6 @@ fn batch_wrapper(round: u64, step: u32, tokens: &[u32]) -> Vec<u8> {
     to_canonical_vec(&v).expect("batch wrapper")
 }
 
-fn update_wrapper(round: u64, payload: &[u8]) -> Vec<u8> {
-    let v = Value::Array(vec![
-        Value::from(1u8),
-        Value::from(round),
-        Value::Bytes(PEER.to_vec()),
-        Value::Bytes(payload.to_vec()),
-    ]);
-    to_canonical_vec(&v).expect("update wrapper")
-}
-
 fn decode_publish(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
     let v: Value = ciborium::de::from_reader(frame).ok()?;
     let Value::Array(parts) = v else { return None };
@@ -427,6 +445,14 @@ fn service_ops(pump: &daemon_vhc_host::run::PumpHandle, serve: &ServeCtx) {
         match request {
             OpRequest::PayloadPut { .. } => {
                 pump.complete_op(op, OpOutcome::PutDone).expect("put done");
+            }
+            OpRequest::PayloadGet { hash } => {
+                serve
+                    .committed
+                    .lock()
+                    .expect("archive")
+                    .deferred
+                    .push((op, hash));
             }
             OpRequest::ArtifactFetch { hash, .. } if hash == serve.manifest_hash => {
                 pump.complete_op(
@@ -483,6 +509,24 @@ fn service_ops(pump: &daemon_vhc_host::run::PumpHandle, serve: &ServeCtx) {
             }
             other => panic!("unexpected op request from the trainer guest: {other:?}"),
         }
+    }
+    // Serve every committed-payload fetch the archive can now answer; hold the rest.
+    let ready: Vec<(u64, Vec<u8>)> = {
+        let mut archive = serve.committed.lock().expect("archive");
+        let mut pending = Vec::new();
+        let mut ready = Vec::new();
+        for (op, hash) in std::mem::take(&mut archive.deferred) {
+            match archive.by_hash.get(&hash) {
+                Some(bytes) => ready.push((op, bytes.clone())),
+                None => pending.push((op, hash)),
+            }
+        }
+        archive.deferred = pending;
+        ready
+    };
+    for (op, bytes) in ready {
+        pump.complete_op(op, OpOutcome::GetDone { bytes })
+            .expect("committed payload get done");
     }
 }
 
@@ -548,8 +592,9 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
     assert_eq!(sel.driver, daemon_vhc_abi::CandidateDriver::V2);
     assert_eq!(
         (sel.major, sel.minor),
-        (2, daemon_vhc_abi::STATE_MINOR_V2),
-        "the streamed trainer imports the det-state write surface (minor 3)"
+        (2, daemon_vhc_abi::BUFFER_STAGE_MINOR_V2),
+        "the streamed trainer imports the det-state write surface (minor 3) and the incremental \
+         buffer staging its committed container is built through (minor 4)"
     );
 
     let identity = RunIdentity {
@@ -585,11 +630,10 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
         deliver(&round_open(round), &mut seq);
         wait_published(&pump, (round as usize) * 3 + 2, &g.serve); // + theta + commitment
 
-        // Barrier: feed the RECORDED golden payload (the trainer's own committed set), then the
-        // single-peer record.
+        // Barrier: publish the RECORDED golden payload to the archive (the trainer's own committed
+        // set — which it fetches back itself), then the single-peer record.
         let bytes = g.payloads[round as usize].clone();
-        pump.stage_payload(update_wrapper(round, &bytes), None)
-            .expect("stage update");
+        g.serve.publish_committed(&bytes);
         deliver(&round_record(round, &bytes), &mut seq);
         wait_published(&pump, (round as usize) * 3 + 3, &g.serve); // + digest
     }
@@ -783,15 +827,15 @@ fn trainer_goldens_reproduce_cuda_end_to_end() {
 // -- the straggle -> catch-up leg (ported from parity's catch_up_after_straggle lane) ---------
 
 /// Drive a STRAGGLE -> CATCH-UP schedule against the goldens: round 0 trains + commits, but its
-/// record arrives while the committed payload is not yet fetchable (straggle); the payload lands;
-/// `RoundOpen(1)` then makes the guest ingest round 0 (catch-up) AND train round 1 in one event
-/// slice — the §5.9 ingest epilogue must run at the ingest->training boundary, so round 1 trains
-/// against the post-ingest-0 base and the run ends in EXACTLY the clean run's det state.
+/// record arrives while the committed payload is NOT yet fetchable (the archive has not caught up)
+/// — so the guest's `payload_get` stays outstanding and the round cannot mint its committed set.
+/// The payload then lands, the guest folds round 0, and only after that does `RoundOpen(1)` train
+/// round 1 — against the post-ingest-0 base, so the run ends in EXACTLY the clean run's det state.
 ///
-/// The compute@2 trainer publishes the catch-up digest from the record handler, not the
-/// `RoundOpen` handler (the guest defers only the training/export from `RoundOpen`), so the
-/// caught-up round-0 digest is folded into the final state and the observable is the final
-/// (round 1) digest — exactly what parity's lane asserts against the clean run.
+/// Under module-driven payload custody the catch-up is triggered by the payload becoming
+/// FETCHABLE, not by the next open: a record whose set the guest cannot fetch never reaches the
+/// round driver at all. The observable is therefore the ordering — round 0's digest lands late but
+/// before round 1 trains — and the final det state, which must equal the clean run's.
 fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
     let worker = Worker::new(EngineConfig::default()).expect("engine");
     let identity = RunIdentity {
@@ -827,27 +871,36 @@ fn drive_straggle(g: &Goldens, wasm: &[u8]) -> Reproduced {
     deliver(&round_open(0), &mut seq);
     wait_published(&pump, 2, &g.serve); // theta(0) + commitment(0)
 
-    // The record arrives while the committed payload is NOT yet fetchable → straggle (the trainer
-    // guest publishes nothing on a straggle heartbeat, so there is no publish to await here).
+    // The record arrives while the committed payload is NOT yet fetchable → straggle. Pump the
+    // seat so the guest's `payload_get` is actually taken and left outstanding, then prove the
+    // stall: no digest can exist for a set the guest cannot fetch.
     deliver(&round_record(0, &g.payloads[0]), &mut seq);
+    for _ in 0..20 {
+        service_ops(&pump, &g.serve);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        pump.published().len(),
+        2,
+        "a record whose committed payload is unfetchable voices no digest"
+    );
 
-    // The payload lands (the archive/store caught up).
-    pump.stage_payload(update_wrapper(0, &g.payloads[0]), None)
-        .expect("stage update 0");
+    // The archive catches up: the payload becomes fetchable and round 0 folds (catch-up).
+    g.serve.publish_committed(&g.payloads[0]);
+    wait_published(&pump, 3, &g.serve); // digest(0)
 
-    // RoundOpen(1): ONE slice ingests round 0 (catch-up, folded into state) and trains round 1.
+    // RoundOpen(1) then trains against the post-ingest-0 base, exactly as the clean run did.
     for h in 0..STEPS_PER_ROUND {
         pump.stage_payload(batch_wrapper(1, h, &tokens_for(1, h)), None)
             .expect("stage batch");
     }
     deliver(&round_open(1), &mut seq);
-    wait_published(&pump, 4, &g.serve); // theta(1) + commitment(1)
+    wait_published(&pump, 5, &g.serve); // theta(1) + commitment(1)
 
     // Barrier 1, normal path → the final (round 1) digest.
-    pump.stage_payload(update_wrapper(1, &g.payloads[1]), None)
-        .expect("stage update 1");
+    g.serve.publish_committed(&g.payloads[1]);
     deliver(&round_record(1, &g.payloads[1]), &mut seq);
-    wait_published(&pump, 5, &g.serve); // digest(1)
+    wait_published(&pump, 6, &g.serve); // digest(1)
 
     pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
         .expect("stop");
@@ -868,19 +921,24 @@ fn trainer_goldens_catch_up_after_straggle_cpu() {
     let r = drive_straggle(&g, &wasm);
 
     let final_round = (ROUNDS - 1) as usize;
-    // The compute@2 trainer voices the round-0 catch-up digest from the record handler only; here
-    // the catch-up happens inside `RoundOpen(1)` (whose outbound the guest defers), so round 0's
-    // digest is folded into the round-1 state and the single observable digest is the FINAL one —
-    // which must equal the clean run's recorded final digest.
+    // The detour delays the fold, it does not skip it: a straggled record folds — and voices —
+    // the moment its committed set becomes fetchable, so both rounds' digests are observable and
+    // both must equal the clean run's recorded digests bit-for-bit. Round 1's is the load-bearing
+    // one: it can only match if round 0 was folded BEFORE round 1 trained (the §5.9 epilogue at
+    // the ingest->training boundary).
     assert_eq!(
         r.digests.len(),
-        1,
-        "the catch-up run publishes exactly the folded final digest"
+        ROUNDS as usize,
+        "the catch-up run voices a digest per round (the stalled one, late)"
     );
     assert_eq!(
-        r.digests[0], g.digests[final_round],
-        "catch-up (ingest round 0 + train round 1 in ONE slice) must reproduce the clean run's \
-         final det digest — the §5.9 epilogue runs at the ingest->training boundary"
+        r.digests, g.digests,
+        "catch-up (fold the straggled round 0, then train round 1) must reproduce the clean run's \
+         det digests — the §5.9 epilogue runs at the ingest->training boundary"
+    );
+    assert_eq!(
+        r.digests[final_round], g.digests[final_round],
+        "the straggle detour changes the path, never the final state"
     );
 
     // Both rounds' trained theta are voiced (round 0 trained normally, round 1 from the
@@ -983,8 +1041,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
     }
     deliver(&pump, &round_open(0), &mut seq);
     wait_published(&pump, 2, &g.serve); // theta(0) + commitment(0)
-    pump.stage_payload(update_wrapper(0, &g.payloads[0]), None)
-        .expect("stage update 0");
+    g.serve.publish_committed(&g.payloads[0]);
     deliver(&pump, &round_record(0, &g.payloads[0]), &mut seq);
     wait_published(&pump, 3, &g.serve); // digest(0)
 
@@ -1093,9 +1150,7 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
          (error-feedback continuity across the migration)"
     );
 
-    pump2
-        .stage_payload(update_wrapper(1, &g.payloads[1]), None)
-        .expect("stage update 1");
+    serve2.publish_committed(&g.payloads[1]);
     deliver(&pump2, &round_record(1, &g.payloads[1]), &mut seq2);
     wait_published(&pump2, 3, &serve2); // digest(1)
 

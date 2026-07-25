@@ -21,25 +21,41 @@
 // (`ceremony_trainer_config_round_walk`): the barrier still opens, commits, fences and exports, so
 // every STATE walk runs at full ceremony size, but the 30-step inner loop — hours of ndarray CPU at
 // seq 2048 over 24 layers — does not. The trainer goldens own the training math (bit-exact, toy
-// geometry); this owns the geometry. The committed payload rides a low `topk` for the reason
-// documented on that config helper: the profile's payload wire is a whole-blob container, so its
-// size is a payload-plane residency class of its own, separate from the state families under test.
+// geometry); this owns the geometry. The compression profile is the FROZEN one (`topk = 64`), so
+// the committed payload is the fleet's real ~54 MB container and its ingest is the real one: the
+// gate ingests a THREE-peer record whose entries are real-size containers, range-read a fold window
+// at a time out of the host buffers `payload_get` delivered ([SF-R3]).
 //
-// The two assertions that carry the class:
+// The cap is the CLAIM's, not a host constant. The engine's linear-memory ceiling comes from the
+// admitted claim's hard-accountable host tier (`EngineConfig::with_claimed_memory`, architecture
+// §3.5) — the module's own `decl_for_config` figure at this exact geometry, run through the real
+// admission funnel here. The gate additionally pins that the claim stays UNDER the 64 MiB the host
+// used to hardcode: the fix was enforcement wiring, not a raised ceiling, and an honest claim that
+// crept past the old constant would be a regression this suite must catch.
 //
-//  1. COMPLETION under the production budgets. `EngineConfig::real_model` keeps the toy-tier 64 MiB
-//     linear-memory cap, so reaching `QuiesceReady` at all is the bounded-guest-memory proof — a
-//     whole-family θ/master/moment buffer traps `GuestPanic` (alloc abort) long before here.
-//  2. WINDOWED READBACKS. Every device export is journaled verbatim (§8.3 tag 2, kind
+// The four assertions that carry the class:
+//
+//  1. COMPLETION under the admitted claim. Reaching `QuiesceReady` at all is the bounded-guest-
+//     memory proof — a whole-family θ/master/moment buffer, or a whole decoded peer payload, traps
+//     `GuestPanic` (alloc abort) long before here.
+//  2. THE MEASURED PEAK. The pump samples the guest's linear memory at every event slice (wasm
+//     memory never shrinks, so the sample IS the high-water). The gate asserts the MEASUREMENT
+//     against the claim, so "it did not trap" is not the evidence — the number is.
+//  3. WINDOWED READBACKS. Every device export is journaled verbatim (§8.3 tag 2, kind
 //     `READBACK_KIND_TENSOR_EXPORT`), so the journal IS the record of how much crossed the boundary
 //     per readback. The gate asserts the LARGEST one is a window, not a parameter — which fails on
 //     the old whole-tensor export by three orders of magnitude (192 MiB vs ~4 MiB) even on a host
 //     with enough memory to have survived assertion 1.
+//  4. THE RED LINE (`ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim`): the
+//     retired whole-blob ingest's per-peer residency, computed from the run's OWN pinned geometry,
+//     against the same claim — and a live proof that this engine really refuses an over-cap guest,
+//     so assertion 1 is not vacuous.
 //
 // Cost: this and `ceremony_geometry` are the battery's two real-geometry lanes. It expands + folds
-// the ~2.93 GiB init, then walks ~3 GiB of θ off the device, folds a full master family, and seals
-// both moment families — the real fp32 device working set (master + both moments ≈ 8.8 GiB of
-// ndarray tensors) plus the sealed families in the state store. Minutes, single, no training math.
+// the ~2.93 GiB init, then walks ~3 GiB of θ off the device, folds a full master family against a
+// three-peer committed set, and seals both moment families — the real fp32 device working set
+// (master + both moments ≈ 8.8 GiB of ndarray tensors) plus the sealed families in the state store.
+// Minutes, single, no training math.
 
 // Dev/test harness: the guest builder shells `cargo` for the guests workspace.
 #![allow(clippy::disallowed_methods)]
@@ -49,8 +65,8 @@ use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
 use daemon_vhc_host::run::{
-    start_run, Dropped, JournalSink, OpOutcome, OpRequest, RunConfig, RunEnd, RunIdentity,
-    SinkError,
+    admit, start_run, DeviceProfile, Dropped, JournalSink, MemoryClaim, OpOutcome, OpRequest,
+    OwnerPolicy, ParticipationLane, RunConfig, RunEnd, RunIdentity, SinkError,
 };
 use daemon_vhc_host::{BackendKind, EngineConfig, Worker};
 use daemon_vhc_proto::det_state::family_byte_len;
@@ -60,21 +76,45 @@ use daemon_vhc_sdk_consensus::messages::{
     BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, VhcMessage,
 };
 use daemon_vhc_testkit::ceremony::{
-    ceremony_param_numels, ceremony_state_chunk_size, ceremony_trainer_config_round_walk,
-    CEREMONY_PARAM_COUNT,
+    ceremony_param_numels, ceremony_profile_chunk, ceremony_state_chunk_size,
+    ceremony_trainer_config_round_walk, CEREMONY_PARAM_COUNT,
 };
 
-/// The sole trainer identity the harness form pins as `peer`/`roster`.
-const PEER: [u8; 32] = [0x3b; 32];
+/// The trainer identities the record lists. The first is the run's own `peer` (the harness form
+/// pins `roster[0]`); the frozen ceremony roster is three trainers, so the gate folds a three-peer
+/// committed set — the fleet's shape, at the fleet's payload size.
+const PEERS: [[u8; 32]; 3] = [[0x3b; 32], [0x3c; 32], [0x3d; 32]];
 
-/// The compression density this gate drives (see `ceremony_trainer_config_round_walk`): one value
-/// per 1536-wide profile chunk keeps the whole-blob payload container ~10 MB instead of ~210 MB.
-const ROUND_WALK_TOPK: u64 = 1;
+/// The FROZEN compression density (`ceremony_profile_value`): 64 selected values per 1536-wide
+/// profile chunk. Restated here only so the gate can compute the retired path's residency and the
+/// container's own size from the same numbers the config carries.
+const CEREMONY_TOPK: u64 = 64;
+
+/// The absmax value width the frozen profile packs at (`ceremony_profile_value`).
+const CEREMONY_BITS: u32 = 2;
+
+/// The committed container's fixed header (the module-policy layout in
+/// `daemon-vhc-sdk-profiles::payload`). The testkit links host + contracts only, never the SDK, so
+/// the one number it needs from that layout is restated here; the gate's own container measurement
+/// below cross-checks it against the bytes the guest actually produced.
+const CONTAINER_HEADER_BYTES: u64 = 40;
 
 /// The per-slice readback allowance the production TRAINER lane grants
 /// (`ParticipationLane::trainer_launch_defaults`). The gate runs the real grant, not the driver
 /// default, because the windowed readbacks under test are exactly what it bounds.
 const TRAINER_LANE_READBACK_BYTES: u64 = 64 << 20;
+
+/// The live-buffer grants the production TRAINER lane carries (`max_live_bytes` /
+/// `max_live_handles`). Three real-size committed payloads plus the guest's own sealed container
+/// are live at once at the barrier, which is what this grant is sized for.
+const TRAINER_LANE_BUFFER_BYTES: u64 = 1 << 30;
+const TRAINER_LANE_BUFFER_HANDLES: u64 = 1024;
+
+/// The linear-memory ceiling the host used to HARDCODE for every run (`EngineConfig::default`).
+/// It is no longer a cap — the admitted claim is — but it stays the gate's yardstick: the fix was
+/// enforcement wiring, so an honest claim at the frozen ceremony geometry must still come in under
+/// the figure the constant used to impose.
+const UNRAISED_MEMORY_CAP: u64 = 64 << 20;
 
 /// A journal sink that MEASURES instead of retaining. The run reads ~3 GiB of θ and ~6 GiB of
 /// moments back off the device and every byte is journaled verbatim (§8.3 tag 2) — a `MemorySink`
@@ -93,6 +133,10 @@ struct MeasuringSink {
     snapshots: Vec<Vec<u8>>,
     /// Per-channel durable publish sequence.
     next_seq: u64,
+    /// The run's terminal record, once it has one. A trapped guest stops producing publishes, so
+    /// without this the gate would sit out its whole (necessarily generous, real-geometry) deadline
+    /// and then report a timeout instead of the trap that caused it.
+    terminal: Option<String>,
 }
 
 impl MeasuringSink {
@@ -190,10 +234,11 @@ impl JournalSink for MeasuringSink {
     }
     fn terminal(
         &mut self,
-        _kind: u64,
-        _outcome: Option<u64>,
-        _trap: Option<(String, String, String, String)>,
+        kind: u64,
+        outcome: Option<u64>,
+        trap: Option<(String, String, String, String)>,
     ) -> Result<(), SinkError> {
+        self.terminal = Some(format!("kind {kind}, outcome {outcome:?}, trap {trap:?}"));
         Ok(())
     }
 }
@@ -254,69 +299,168 @@ fn round_open(round: u64) -> VhcMessage {
     })
 }
 
+/// The round's record: one entry per roster peer, every one naming the SAME container. The gate
+/// has one real trainer, so the other two peers' committed updates are that trainer's own container
+/// under their identities — which makes the fold a genuine three-peer ingest at the fleet's payload
+/// size (three separate `payload_get`s, three host buffers, three ranged reads per fold window)
+/// without a second real trainer's hours of ndarray CPU.
 fn round_record(round: u64, payload: &[u8]) -> VhcMessage {
-    let entry = RecordEntry {
-        peer: PeerId(PEER),
-        hash: blake3_hash(payload),
-        size: payload.len() as u64,
-    };
+    let hash = blake3_hash(payload);
+    let entries: Vec<RecordEntry> = PEERS
+        .iter()
+        .map(|p| RecordEntry {
+            peer: PeerId(*p),
+            hash,
+            size: payload.len() as u64,
+        })
+        .collect();
+    let set: Vec<(PeerId, Hash)> = PEERS.iter().map(|p| (PeerId(*p), hash)).collect();
     VhcMessage::RoundRecord(RoundRecord {
         round,
-        set: commit_set(&[(PeerId(PEER), entry.hash)]).commitment(),
+        set: commit_set(&set).commitment(),
         drops: Vec::new(),
         next_seed: Seed([0; 32]),
         set_locator: Locator::StoreKey(String::new()),
-        inline: Some(vec![entry]),
+        inline: Some(entries),
     })
 }
 
-/// The staged committed-payload wrapper the harness contract takes: `[1, round, peer32, payload]`.
-fn update_wrapper(round: u64, payload: &[u8]) -> Vec<u8> {
-    let v = Value::Array(vec![
-        Value::from(1u8),
-        Value::from(round),
-        Value::Bytes(PEER.to_vec()),
-        Value::Bytes(payload.to_vec()),
-    ]);
-    to_canonical_vec(&v).expect("update wrapper")
+/// The embedder seat: the guest's own committed container is captured at its `payload_put`, and
+/// every record-listed `payload_get` is answered content-addressed from what the seat has
+/// published. [SF-R3] — the payload reaches the guest as a host BUFFER it range-reads, so this gate
+/// drives the same ingest the fleet does, at the same size.
+#[derive(Default)]
+struct Seat {
+    /// The container the guest PUT this round.
+    put: Option<Vec<u8>>,
+    /// The fetchable committed containers, by content address.
+    store: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    /// `payload_get` ops the store could not answer yet (held, never failed).
+    deferred: Vec<(u64, [u8; 32])>,
 }
 
-/// Service the guest's op requests, capturing the committed container it PUTs (the gate feeds the
-/// trainer its own payload back at the barrier — the single-peer committed set).
-fn service_ops(pump: &daemon_vhc_host::run::PumpHandle, put: &mut Option<Vec<u8>>) {
-    for (op, request) in pump.take_op_requests() {
-        match request {
-            OpRequest::PayloadPut { bytes } => {
-                *put = Some(bytes.to_vec());
-                pump.complete_op(op, OpOutcome::PutDone).expect("put done");
-            }
-            other => panic!("unexpected op request from the trainer guest: {other:?}"),
-        }
+impl Seat {
+    fn publish_committed(&mut self, payload: &[u8]) {
+        self.store.insert(blake3_hash(payload).0, payload.to_vec());
     }
 }
 
-/// Pump until `cond` holds, servicing ops (the guest's own puts) as they arrive.
+fn service_ops(pump: &daemon_vhc_host::run::PumpHandle, seat: &Mutex<Seat>) {
+    for (op, request) in pump.take_op_requests() {
+        let mut s = seat.lock().expect("seat");
+        match request {
+            OpRequest::PayloadPut { bytes } => {
+                s.put = Some(bytes.to_vec());
+                drop(s);
+                pump.complete_op(op, OpOutcome::PutDone).expect("put done");
+            }
+            OpRequest::PayloadGet { hash } => s.deferred.push((op, hash)),
+            other => panic!("unexpected op request from the trainer guest: {other:?}"),
+        }
+    }
+    let ready: Vec<(u64, Vec<u8>)> = {
+        let mut s = seat.lock().expect("seat");
+        let mut pending = Vec::new();
+        let mut ready = Vec::new();
+        for (op, hash) in std::mem::take(&mut s.deferred) {
+            match s.store.get(&hash) {
+                Some(bytes) => ready.push((op, bytes.clone())),
+                None => pending.push((op, hash)),
+            }
+        }
+        s.deferred = pending;
+        ready
+    };
+    for (op, bytes) in ready {
+        pump.complete_op(op, OpOutcome::GetDone { bytes })
+            .expect("committed payload get done");
+    }
+}
+
+/// Pump until `cond` holds, servicing the guest's ops as they arrive. A run that reaches its
+/// terminal record without satisfying `cond` fails HERE with the trap, not after the deadline: at
+/// this geometry the deadline is half an hour, and a half-hour timeout report hides the one line
+/// that says what went wrong.
 fn wait_for(
     pump: &daemon_vhc_host::run::PumpHandle,
-    put: &mut Option<Vec<u8>>,
+    seat: &Mutex<Seat>,
+    sink: &Arc<Mutex<MeasuringSink>>,
     what: &str,
     timeout: Duration,
     cond: impl Fn(&daemon_vhc_host::run::PumpHandle) -> bool,
 ) {
     let deadline = Instant::now() + timeout;
     loop {
-        service_ops(pump, put);
+        service_ops(pump, seat);
         if cond(pump) {
             return;
         }
+        // One lock at a time, sink first, guard released before the pump lock is taken: the guest
+        // thread journals (sink) from inside imports (pump lock), so holding both here in the other
+        // order deadlocks the run.
+        let terminal = sink.lock().expect("sink").terminal.clone();
+        let peak = pump.guest_memory_high_water();
+        if let Some(terminal) = terminal {
+            panic!(
+                "the run ended before {what}: {terminal}. Peak guest linear memory {peak} B \
+                 (a GuestPanic at this seam is an allocation the admitted claim does not cover)"
+            );
+        }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {what}; published {} frame(s), logs: {:?}",
+            "timed out waiting for {what}; published {} frame(s), peak guest linear memory \
+             {peak} B, logs: {:?}",
             pump.published().len(),
             pump.logs()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Run the REAL admission funnel over the ceremony trainer config and return the claim the module
+/// derives for this exact geometry (`decl_for_config` → `da_claim`). This is the number the
+/// production join engine enforces as the sandbox's memory cap and the number this gate measures
+/// against — obtained the same way the worker obtains it, not restated.
+///
+/// The lane is the production trainer lane with its DEVICE floor relaxed: this gate runs the CPU
+/// backend, and the floor is about which hardware may join, not about what the module may use. Its
+/// ceilings — the claim bounds the funnel checks the claim against, the buffer and readback quotas
+/// the run then runs under — are the production ones, unmodified.
+fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
+    let mut lane = ParticipationLane::trainer_launch_defaults();
+    lane.gpu = 1;
+    lane.vram_bytes = 0;
+    lane.ram_bytes = 0;
+    lane.disk_bytes = 0;
+    let device = DeviceProfile {
+        gpu: false,
+        vram_bytes: 0,
+        ram_bytes: 64 << 30,
+        disk_bytes: 512 << 30,
+    };
+    let owner = OwnerPolicy {
+        participation_enabled: true,
+        vram_cap_bytes: 0,
+        host_cap_bytes: 0,
+    };
+    // The worker's assessment seat: manifest/claim evaluation never runs compute, so it stays on
+    // the roomy CPU profile (`backend::assess_engine_config`) regardless of the measured selection.
+    let assessment =
+        Worker::new(EngineConfig::real_model(BackendKind::Cpu, None)).expect("assessment engine");
+    admit(
+        &assessment,
+        wasm,
+        Some(blake3::hash(wasm).as_bytes()),
+        cfg_bytes,
+        &[],
+        &lane,
+        &device,
+        &owner,
+        None,
+        None,
+    )
+    .expect("the ceremony trainer's own claim admits under the production trainer lane")
+    .claim
 }
 
 #[test]
@@ -332,13 +476,24 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
         "the gate drives the frozen ceremony geometry"
     );
 
-    // The production join-lane profile — notably NOT a raised linear-memory cap: a conforming
-    // guest streams its families, so the toy-tier 64 MiB cap must suffice at any geometry.
-    let engine = EngineConfig::real_model(BackendKind::Cpu, None);
+    let roster: Vec<PeerId> = PEERS.iter().map(|p| PeerId(*p)).collect();
+    let cfg_bytes = to_canonical_vec(&ceremony_trainer_config_round_walk(&roster))
+        .expect("ceremony trainer config (round-walk form)");
+
+    // The cap is the module's OWN admitted claim at this geometry, through the real funnel.
+    let claim = admitted_claim(&wasm, &cfg_bytes);
+    assert!(
+        claim.hard_accountable.host <= UNRAISED_MEMORY_CAP,
+        "the ceremony trainer's honest linear-memory claim is {} B, past the {UNRAISED_MEMORY_CAP} \
+         B the host used to hardcode — the defect was enforcement wiring, not a low ceiling, so a \
+         claim that needs MORE than the old constant is a residency regression, not a bigger cap",
+        claim.hard_accountable.host
+    );
+    let engine = EngineConfig::real_model(BackendKind::Cpu, None)
+        .with_claimed_memory(claim.hard_accountable.host);
     assert_eq!(
-        engine.max_memory_bytes,
-        EngineConfig::default().max_memory_bytes,
-        "the real-model profile must not buy its way past the bounded-guest-memory invariant"
+        engine.max_memory_bytes as u64, claim.hard_accountable.host,
+        "the sandbox's memory cap IS the admitted claim (architecture §3.5), not a host constant"
     );
     let worker = Worker::new(engine).expect("engine");
 
@@ -349,22 +504,23 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
         instance: 1,
         module: *blake3::hash(&wasm).as_bytes(),
     };
-    let cfg_bytes = to_canonical_vec(&ceremony_trainer_config_round_walk(
-        &[PeerId(PEER)],
-        ROUND_WALK_TOPK,
-    ))
-    .expect("ceremony trainer config (round-walk form)");
     let mut run_cfg = RunConfig::new(identity, [0x9d; 32], cfg_bytes, Vec::new());
     run_cfg.state_chunk_size = window_size;
     run_cfg.compute_queue_depth = 1 << 20;
-    // The production trainer lane's grants, not the driver defaults: the windowed readbacks under
-    // test are charged against exactly this allowance.
+    // The production trainer lane's grants, not the driver defaults: the windowed readbacks and
+    // the three real-size committed payloads under test are charged against exactly these.
     run_cfg.max_readback_bytes_per_slice = TRAINER_LANE_READBACK_BYTES;
+    run_cfg.max_live_buffer_bytes = TRAINER_LANE_BUFFER_BYTES;
+    run_cfg.max_live_buffer_handles = TRAINER_LANE_BUFFER_HANDLES;
+    // The other exactly-metered tier of the same declaration: the host-side bytes the module stages
+    // above its linear-memory floor — for this round, the committed container it builds through
+    // `buffer_append` and never holds itself (`role_binding` wires exactly this on the live path).
+    run_cfg.hard_accountable_host_bytes = claim.declared_peak.host;
 
     let sink = MeasuringSink::shared();
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
     let pump = run.pump.clone();
-    let mut put: Option<Vec<u8>> = None;
+    let seat = Mutex::new(Seat::default());
     let mut seq = 0u64;
     let sender = [9u8; 32];
     let deliver = |msg: &VhcMessage, seq: &mut u64| {
@@ -383,12 +539,17 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
     deliver(&round_open(0), &mut seq);
     wait_for(
         &pump,
-        &mut put,
+        &seat,
+        &sink,
         "the round-0 commitment (tag 3) — the θ export + make_update walk",
         Duration::from_secs(1800),
         |pump| !pump.published().is_empty(),
     );
-    let payload = put.take().unwrap_or_else(|| {
+    eprintln!(
+        "ceremony_round[stage]: peak after the θ export + make_update walk = {} B",
+        pump.guest_memory_high_water()
+    );
+    let payload = seat.lock().expect("seat").put.take().unwrap_or_else(|| {
         // Copy the diagnostic out and RELEASE the lock before panicking: the guest thread journals
         // through this sink, and unwinding while holding it would poison the mutex and bury the
         // real failure under a lock panic.
@@ -410,16 +571,30 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
         )
     });
 
-    // -- the barrier: feed the trainer its own committed payload, then the record ------------------
-    pump.stage_payload(update_wrapper(0, &payload), None)
-        .expect("stage the committed payload");
+    // The container the guest built append-by-append is exactly the geometry's size — the layout is
+    // arithmetic from the run's own pinned config, which is what lets a consumer range-address it.
+    assert_eq!(
+        payload.len() as u64,
+        container_bytes(&numels_u64),
+        "the committed container's length must be the layout's, computed from the pinned geometry"
+    );
+
+    // -- the barrier: publish the committed set, then the three-peer record -----------------------
+    // The guest fetches each record entry itself and range-reads the rows one fold window needs
+    // ([SF-R3]) — no committed payload ever enters linear memory whole, at the fleet's real size.
+    seat.lock().expect("seat").publish_committed(&payload);
     deliver(&round_record(0, &payload), &mut seq);
     wait_for(
         &pump,
-        &mut put,
-        "the round-0 post-ingest digest (tag 4) — the streamed ingest walk",
+        &seat,
+        &sink,
+        "the round-0 post-ingest digest (tag 4) — the streamed three-peer ingest walk",
         Duration::from_secs(1800),
         |pump| pump.published().len() >= 2,
+    );
+    eprintln!(
+        "ceremony_round[stage]: peak after the three-peer ingest walk = {} B",
+        pump.guest_memory_high_water()
     );
 
     // -- the drain: the §10.2 producing protocol seals both moment families window-by-window -------
@@ -427,21 +602,39 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
         .expect("quiesce delivery");
     wait_for(
         &pump,
-        &mut put,
+        &seat,
+        &sink,
         "the quiesce snapshot",
         Duration::from_secs(1800),
         |_| !sink.lock().expect("sink").snapshots.is_empty(),
     );
 
+    // Read the guest's peak linear memory BEFORE the run is torn down.
+    let peak = pump.guest_memory_high_water();
+
     match run.wait().expect("guest thread clean") {
         RunEnd::Outcome(2) => {} // OUTCOME_QUIESCE_READY
         other => panic!(
-            "the ceremony-geometry ROUND path must complete inside the production sandbox budgets, \
-             got {other:?} (a GuestPanic here is a guest-resident family — a whole-θ export \
-             collection, a whole master assembly, or a whole moment family at seal — that does not \
-             scale to the fleet geometry; OutOfFuel is the real-model per-slice fuel budget)"
+            "the ceremony-geometry ROUND path must complete inside the admitted claim ({} B), got \
+             {other:?} (a GuestPanic here is a guest-resident object that does not scale to the \
+             fleet geometry — a whole-θ export collection, a whole master assembly, a whole moment \
+             family at seal, or a whole decoded peer payload; OutOfFuel is the per-slice fuel \
+             budget). Peak guest linear memory reached {peak} B.",
+            claim.hard_accountable.host
         ),
     }
+
+    // THE MEASURED-PEAK assertion: the run's real footprint, sampled at every event slice, against
+    // the claim the module made for this exact geometry. Completion alone would only say "nothing
+    // trapped"; this says how much was actually resident — and it is what makes the claim honest
+    // evidence rather than a number nobody checks.
+    assert!(
+        peak <= claim.hard_accountable.host,
+        "measured peak guest linear memory {peak} B exceeds the admitted claim {} B — the module \
+         under-claimed at this geometry (the claim is derived in `decl_for_config`; fix the \
+         derivation, do not raise the cap)",
+        claim.hard_accountable.host
+    );
 
     let stats = pump.state_store_stats();
     let measured = sink.lock().expect("sink");
@@ -502,7 +695,9 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
 
     eprintln!(
         "ceremony_round: {} windowed device exports, largest readback {} B (window {} B); \
-         {} folds sealed, {} retained bytes at {} parameters; payload {} B (topk {})",
+         {} folds sealed, {} retained bytes at {} parameters; committed container {} B per peer \
+         (topk {CEREMONY_TOPK}) x {} peers ingested; claim hard/peak host {} / {} B; MEASURED peak \
+         guest linear memory {} B ({:.1} % of the claim, {:.1} % of the retired {} B constant)",
         measured.export_readbacks,
         measured.max_export_readback,
         window_size,
@@ -510,6 +705,155 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
         stats.retained_bytes,
         CEREMONY_PARAM_COUNT,
         payload.len(),
-        ROUND_WALK_TOPK,
+        PEERS.len(),
+        claim.hard_accountable.host,
+        claim.declared_peak.host,
+        peak,
+        100.0 * peak as f64 / claim.hard_accountable.host as f64,
+        100.0 * peak as f64 / UNRAISED_MEMORY_CAP as f64,
+        UNRAISED_MEMORY_CAP,
     );
+}
+
+/// THE RED LINE: the retired whole-blob ingest cannot fit the admitted claim, and the claim is
+/// really enforced.
+///
+/// Two halves, both real:
+///
+///  1. **The arithmetic, from the run's own pinned geometry.** The retired ingest decoded each
+///     peer's committed payload up front and held its index section as a `Vec<u32>` — one machine
+///     word per selected value, `n_chunks × topk` of them — plus the unpacked values and the
+///     container itself. That figure is computed here from the frozen ceremony config (parameter
+///     numels, profile chunk, topk, value width), not restated, and compared against the SAME
+///     claim the streaming gate above runs under. It is multiples of it, per peer, before the fold
+///     allocates anything: a fleet round on the retired path could not start, which is the defect.
+///  2. **The enforcement, live.** A cap nobody enforces would make assertion 1 of the streaming
+///     gate vacuous ("it completed" proves nothing if nothing bounds it). So the same trainer, the
+///     same geometry, is started under a cap BELOW its honest floor and must fail to bring its
+///     state plane up. This is the failure MODE the retired path produced — a guest that asks
+///     linear memory for more than the sandbox admits — reproduced through the real engine.
+#[test]
+fn ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim() {
+    let wasm = daemon_vhc_guest_build::guest_wasm("tiny_llama");
+    let numels = ceremony_param_numels();
+    let numels_u64: Vec<u64> = numels.iter().map(|&n| n as u64).collect();
+    let roster: Vec<PeerId> = PEERS.iter().map(|p| PeerId(*p)).collect();
+    let cfg_bytes = to_canonical_vec(&ceremony_trainer_config_round_walk(&roster))
+        .expect("ceremony trainer config (round-walk form)");
+    let claim = admitted_claim(&wasm, &cfg_bytes);
+
+    // -- half 1: the retired residency, derived from the frozen geometry -------------------------
+    let chunk = ceremony_profile_chunk();
+    let rows: u64 = numels_u64.iter().map(|n| n / chunk).sum();
+    let selected = rows * CEREMONY_TOPK;
+    // What the retired path materialized per peer, before folding anything:
+    //   - the indices as one `Vec<u32>` (the dominant term),
+    //   - the unpacked values as one `Vec<f32>`,
+    //   - the container itself, read whole out of the payload buffer.
+    let resident_indices = selected * 4;
+    let resident_values = selected * 4;
+    let container = container_bytes(&numels_u64);
+    let whole_blob_per_peer = resident_indices + resident_values + container;
+
+    assert!(
+        whole_blob_per_peer > claim.hard_accountable.host,
+        "the red line is not red: one peer's whole-blob residency {whole_blob_per_peer} B fits the \
+         admitted claim {} B",
+        claim.hard_accountable.host
+    );
+    let over = whole_blob_per_peer as f64 / claim.hard_accountable.host as f64;
+    assert!(
+        over >= 4.0,
+        "one peer's whole-blob residency is only {over:.1}x the claim — the frozen geometry's \
+         margin collapsed; re-derive before trusting either gate"
+    );
+    eprintln!(
+        "ceremony_round[red line]: {rows} compression rows x topk {CEREMONY_TOPK} = {selected} \
+         selected values per peer -> retired resident form {whole_blob_per_peer} B ({} B indices \
+         + {} B values + {} B container) = {over:.1}x the admitted claim {} B, PER PEER, x {} \
+         peers; the streamed form reads {} B of container rows per fold window per peer",
+        resident_indices,
+        resident_values,
+        container,
+        claim.hard_accountable.host,
+        PEERS.len(),
+        window_section_bytes(),
+    );
+
+    // -- half 2: the cap is really enforced ------------------------------------------------------
+    // A cap of TWO fold windows: derived from the run's own geometry, comfortably above the wasm
+    // image's static data (so the instance starts and the guest really runs) and below what any
+    // streaming walk here needs — the init expansion alone holds the generated window, its f32-le
+    // image and the zeroed `ef` window. So the guest must fail to bring its state plane up.
+    let starved = 2 * ceremony_state_chunk_size();
+    assert!(
+        starved < claim.hard_accountable.host,
+        "the starved cap must be below the honest claim to prove anything"
+    );
+    let engine = EngineConfig::real_model(BackendKind::Cpu, None).with_claimed_memory(starved);
+    let worker = Worker::new(engine).expect("engine");
+    let identity = RunIdentity {
+        run_id: [0xcf; 32],
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance: 1,
+        module: *blake3::hash(&wasm).as_bytes(),
+    };
+    let mut run_cfg = RunConfig::new(identity, [0x9d; 32], cfg_bytes, Vec::new());
+    run_cfg.state_chunk_size = ceremony_state_chunk_size();
+    run_cfg.compute_queue_depth = 1 << 20;
+    run_cfg.max_readback_bytes_per_slice = TRAINER_LANE_READBACK_BYTES;
+
+    let sink = MeasuringSink::shared();
+    match start_run(&worker, &wasm, run_cfg, Box::new(sink)) {
+        // The instance never came up: the pooling allocator refused the module's own memory
+        // demand outright. The cap is enforced at the earliest possible point.
+        Err(_) => {}
+        Ok(run) => {
+            let pump = run.pump.clone();
+            pump.stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
+                .expect("stop");
+            let end = run.wait().expect("guest thread clean");
+            assert!(
+                !matches!(end, RunEnd::Outcome(0)),
+                "a guest starved to {starved} B — two fold windows, against an honest claim of \
+                 {} B — brought its ceremony-geometry state plane up anyway: the claim-derived cap \
+                 is NOT being enforced, which would make the streaming gate's completion assertion \
+                 vacuous",
+                claim.hard_accountable.host
+            );
+            eprintln!("ceremony_round[red line]: starved to {starved} B, run ended {end:?}");
+        }
+    }
+}
+
+/// The committed container's total length at the frozen ceremony geometry, from the geometry
+/// alone: the fixed header plus, per compression row, one absmax-packed value row and its
+/// `topk` chunk-local indices at their own bit width.
+fn container_bytes(numels: &[u64]) -> u64 {
+    let chunk = ceremony_profile_chunk();
+    let rows: u64 = numels.iter().map(|n| n / chunk).sum();
+    let topk = usize::try_from(CEREMONY_TOPK).expect("topk fits usize");
+    CONTAINER_HEADER_BYTES
+        + rows * daemon_vhc_det::absmax_row_bytes(topk, CEREMONY_BITS) as u64
+        + daemon_vhc_det::packed_index_len(
+            usize::try_from(rows * CEREMONY_TOPK).expect("count fits usize"),
+            usize::try_from(chunk).expect("chunk fits usize"),
+        )
+        .expect("index geometry") as u64
+}
+
+/// One fold window's committed-payload section rows per peer at the frozen geometry — the working
+/// set the streamed ingest actually holds, for the contrast the red line is measured against.
+fn window_section_bytes() -> u64 {
+    let chunk = ceremony_profile_chunk();
+    let window_rows = ceremony_state_chunk_size() / (chunk * 4);
+    let topk = usize::try_from(CEREMONY_TOPK).expect("topk fits usize");
+    let values = window_rows * daemon_vhc_det::absmax_row_bytes(topk, CEREMONY_BITS) as u64;
+    let indices = daemon_vhc_det::packed_index_len(
+        usize::try_from(window_rows * CEREMONY_TOPK).expect("count fits usize"),
+        usize::try_from(chunk).expect("chunk fits usize"),
+    )
+    .expect("index geometry") as u64;
+    values + indices
 }

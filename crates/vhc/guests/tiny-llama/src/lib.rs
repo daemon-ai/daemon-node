@@ -79,19 +79,30 @@ use daemon_vhc_sdk_consensus::fold_walk::{FoldWalk, Window};
 use daemon_vhc_sdk_consensus::messages::{
     Commitment, Digest, Heartbeat, Join, RecordEntry, RoundOpen, ThroughputClass, VhcMessage,
 };
+use daemon_vhc_sdk_profiles::payload::HEADER_BYTES;
 use daemon_vhc_sdk_profiles::streaming::{
-    f32s_to_le_bytes, le_bytes_to_f32s, SparseLocoIngestWalk, SparseLocoUpdateWalk,
-    UpdateWindowInputs,
+    f32s_to_le_bytes, le_bytes_to_f32s, IngestFetch, IngestPart, SparseLocoIngestWalk,
+    SparseLocoUpdateWalk, UpdateWindowInputs,
 };
-use daemon_vhc_sdk_profiles::{encode_payload, Section, SparseLocoCfg};
+use daemon_vhc_sdk_profiles::SparseLocoCfg;
 use daemon_vhc_sdk_rounds::{
-    interval_for, slice_interval, BarrierRound, Committed, IngestOutcome, PayloadSource, RoundCfg,
-    RoundExperiment, StepCtx as RoundStepCtx,
+    interval_for, slice_interval, BarrierRound, Committed, HostStaged, IngestOutcome,
+    PayloadSource, RoundCfg, RoundExperiment, StepCtx as RoundStepCtx,
 };
 use serde::Deserialize;
 
 /// The digest block size (the pinned det-lane granularity, matching `digest_state`).
 const DIGEST_BLOCK: u32 = 64;
+/// The module's own linear-memory floor, independent of geometry: the wasm image's static data plus
+/// the allocator arena a Rust `cdylib` of this size touches before it folds anything (the Burn
+/// router's op-encoding buffers, the event-frame scratch, the parsed config). Added to the
+/// geometry-derived working set in [`TinyLlama::decl_for_config`]; measured on the real-geometry
+/// gates, which print the run's peak linear memory beside the claim this figure feeds.
+///
+/// This module's own figure, well above the universal toolchain floor the SDK lifts every claim to
+/// ([`daemon_vhc_sdk::module::WASM_LINEAR_MEMORY_FLOOR_BYTES`]): that one is what a bare `cdylib`
+/// costs, this one is what THIS image costs.
+const MODULE_BASELINE_BYTES: u64 = 12 << 20;
 /// The in-flight window bound for the streamed fold walks (bounded read-ahead; the honest fuel
 /// claim is per-window, §5.5). Small — the harness geometry is a handful of windows.
 const WALK_IN_FLIGHT: u64 = 4;
@@ -256,12 +267,17 @@ struct Core {
 struct IngestWalkState {
     /// The round being folded.
     round: u64,
-    /// The fold engine (owns the payloads, the schedule, and the digest carry).
+    /// The fold engine (owns the schedule, the clip carries, and the digest carry).
     walk: SparseLocoIngestWalk,
     /// The open master-family write stream (`state_open`).
     stream: u64,
     /// The round-base family fold this walk reads its windows from.
     base_fold: [u8; 32],
+    /// The record-ordered committed payloads, as the host BUFFERS `payload_get` delivered them
+    /// ([SF-R3]): the host blake3-verified each against its record-listed hash before completing
+    /// (architecture §3.4), and the fold reads section rows out of them with ranged `read_into` —
+    /// no peer's payload ever enters linear memory whole.
+    peer_buffers: Vec<u64>,
     /// Outstanding round-base fetches: `data@2` op → window ordinal.
     ops: BTreeMap<u64, u64>,
     /// Whether this walk's digest is voiced at seal (record-triggered) or folds silently
@@ -319,6 +335,10 @@ struct UpdateWalkState {
     byte_buf: Vec<u8>,
     /// The emitted NEW ef family's ordered chunk hashes — moved into [`Core::ef_chunks`] at seal.
     ef_chunks: Vec<Hash>,
+    /// The open committed-payload buffer stream: the container is APPENDED window by window and
+    /// sealed into the `BufferHandle` `payload_put` takes, so the producing side never holds it
+    /// (the emit-side half of [SF-R3]).
+    payload_stream: u64,
     /// The harness-tier trained-θ voice image (tag 2), filled window-by-window at the window's
     /// absolute family offset and published at seal. `None` when the voice is skipped: live mode
     /// (no consumer) or a θ image past [`THETA_VOICE_MAX_BYTES`].
@@ -330,7 +350,7 @@ struct C3Round {
     core: Rc<RefCell<Core>>,
 }
 
-impl RoundExperiment<Vec<u8>> for C3Round {
+impl RoundExperiment<HostStaged> for C3Round {
     fn train_step(&mut self, ctx: &RoundStepCtx) {
         let mut core = self.core.borrow_mut();
         let (sequences, seq_len, tokens) = core
@@ -370,7 +390,7 @@ impl RoundExperiment<Vec<u8>> for C3Round {
         Vec::new()
     }
 
-    fn ingest(&mut self, _round: u64, _committed: &Committed<Vec<u8>>) -> [u8; 16] {
+    fn ingest(&mut self, _round: u64, _committed: &Committed<HostStaged>) -> [u8; 16] {
         // The streaming trainer never folds synchronously — it defers via `begin_ingest` and
         // voices the digest when the walk seals (the deferred-ingest seam, sdk-rounds).
         unreachable!("the streaming trainer defers ingest via begin_ingest")
@@ -382,15 +402,11 @@ impl RoundExperiment<Vec<u8>> for C3Round {
     /// [`Core::master_fold`] (the init fold before round 0, then the prior round's sealed master).
     /// The walk is stashed in `Core` and driven by fetch completions ([`drive_ingest_completion`]);
     /// the digest is voiced at seal via [`BarrierRound::finish_ingest`]. Returns `Deferred`.
-    fn begin_ingest(&mut self, round: u64, committed: &Committed<Vec<u8>>) -> IngestOutcome {
-        let payloads: Vec<Vec<Section>> = committed
-            .items()
-            .iter()
-            .map(|it| {
-                daemon_vhc_sdk_profiles::decode_payload(&it.bytes)
-                    .expect("committed payload decodes (hash-verified at mint)")
-            })
-            .collect();
+    fn begin_ingest(&mut self, round: u64, committed: &Committed<HostStaged>) -> IngestOutcome {
+        // The committed set is R host BUFFERS, not R decoded containers: the host verified each
+        // against the record-listed hash before delivering its completion, and the fold reads the
+        // rows it needs out of them ([SF-R3]).
+        let peer_buffers: Vec<u64> = committed.items().iter().map(|it| it.bytes.0).collect();
         let mut core = self.core.borrow_mut();
         let (numels, window_size, base_fold) =
             (core.numels.clone(), core.window_size, core.master_fold);
@@ -406,18 +422,22 @@ impl RoundExperiment<Vec<u8>> for C3Round {
             &numels,
             window_size,
             walk_in_flight(window_size, 2),
-            &payloads,
+            peer_buffers.len(),
             carry,
         )
         .expect("ingest walk geometry (profile chunk divides every numel; window aligned)");
+        // Cross-check every peer's container against the run's own geometry from its 40-byte
+        // header alone — a producer that compressed under a different density or windowing is a
+        // typed refusal here, never a mis-decode of its rows deeper in the fold.
+        for (p, &buf) in peer_buffers.iter().enumerate() {
+            let header = daemon_vhc_sdk::read_range(buf, 0, HEADER_BYTES as usize);
+            walk.layout()
+                .check_header(&header)
+                .unwrap_or_else(|e| panic!("peer {p} committed payload: {e}"));
+        }
         let opening = walk.start().expect("ingest walk start");
         let stream = daemon_vhc_sdk::state_open(MASTER_FAMILY, byte_len);
-        let mut ops = BTreeMap::new();
-        for w in &opening.issue {
-            let off = core.family_base[w.param as usize] + w.param_off;
-            let op = daemon_vhc_sdk::data_fetch(&base_fold, off, w.len);
-            ops.insert(op, w.ordinal);
-        }
+        let ops = BTreeMap::new();
         let voice = core.ingest_voices;
         // The barrier folds exactly the record-listed committed set (every item fetchable +
         // blake3-verified at `Committed::mint`), so the ingested count IS the committed count.
@@ -427,25 +447,42 @@ impl RoundExperiment<Vec<u8>> for C3Round {
             walk,
             stream,
             base_fold,
+            peer_buffers,
             ops,
             voice,
             committed,
             byte_buf: Vec::new(),
             chunk_hashes: Vec::new(),
         });
+        // Serve the opening reads: the payload rows resolve synchronously out of their buffers
+        // (a prompt ranged `read_into`), the round-base windows are async `data@2` fetches.
+        let Core {
+            ingest_walk,
+            family_base,
+            model,
+            ..
+        } = &mut *core;
+        let st = ingest_walk.as_mut().expect("the ingest walk just stashed");
+        drive_ingest_fetches(st, family_base, model, opening.issue);
         IngestOutcome::Deferred
     }
 }
 
-/// The guest's payload source at the barrier: unwrapped committed payloads by `(round, peer)`;
-/// `Committed::mint` re-verifies each against the record-listed blake3 in-guest.
+/// The guest's payload source at the barrier: the committed payloads by `(round, peer)` as the host
+/// BUFFERS `payload_get` delivered ([SF-R3]).
+///
+/// The repr is [`HostStaged`] — the mint's host-verified class: the host blake3-checks a fetched
+/// payload against the requested content address before it delivers the completion (architecture
+/// §3.4), so re-hashing it in-guest would mean reading the whole blob into linear memory to
+/// re-derive a fact the host already established. Ordering and all-or-nothing semantics at the mint
+/// are unchanged.
 struct PayloadMap {
-    map: BTreeMap<(u64, PeerId), Vec<u8>>,
+    map: BTreeMap<(u64, PeerId), HostStaged>,
 }
 
-impl PayloadSource<Vec<u8>> for PayloadMap {
-    fn payload(&mut self, round: u64, peer: &PeerId) -> Option<Vec<u8>> {
-        self.map.get(&(round, *peer)).cloned()
+impl PayloadSource<HostStaged> for PayloadMap {
+    fn payload(&mut self, round: u64, peer: &PeerId) -> Option<HostStaged> {
+        self.map.get(&(round, *peer)).copied()
     }
 }
 
@@ -475,17 +512,85 @@ impl GuestModule for TinyLlama {
         ModuleDecl {
             name: "tiny-llama",
             version: env!("CARGO_PKG_VERSION"),
-            // The det-state write surface (state_open/emit/seal) + register_state_chunks force
-            // the minor-3 declaration (ABI §1.3 step 5; the highest introducing minor imported).
-            abi_minor: 3,
+            // The incremental buffer-staging trio (buffer_open/append/seal) is the highest
+            // introducing minor this module imports, so it fixes the declaration at 4 (ABI §1.3
+            // step 5); the det-state write surface + register_state_chunks sit below it at 3.
+            abi_minor: 4,
             channels: vec![0],
-            // Guest-side det-lane state (masters + bases + ef) + decode scratch; device holds
-            // the working weights + AdamW moments + activations.
+            // The config-independent fallback (a harness that hands no decodable config). The
+            // honest, geometry-derived figures are `decl_for_config` below — this module's
+            // footprint is a function of the run it is admitted for, not a constant.
             host_state_bytes: 16 << 20,
             host_scratch_bytes: 16 << 20,
             device_state_bytes: 32 << 20,
             device_scratch_bytes: 32 << 20,
         }
+    }
+
+    /// The **config-dependent** declaration (ABI §9.1, streaming det fold §5.5): this module's
+    /// footprint is a function of the geometry it is admitted for, and the host enforces the
+    /// declaration as the sandbox's memory cap — so it is derived here from the same constants that
+    /// bound the walks, not guessed.
+    ///
+    /// Linear memory (`host_state_bytes`, the hard tier the pooling allocator meters exactly) is
+    /// **O(fold windows + payload section rows + bookkeeping)** at ANY geometry, because both planes
+    /// stream: state families window by window ([`walk_in_flight`]) and committed payloads through
+    /// ranged reads of the host buffers they arrive in ([SF-R3]).
+    ///
+    /// The three walks' working sets are **summed, not maxed**. They never overlap in time — the
+    /// init expansion finishes before a round opens, and the barrier defers a round open behind an
+    /// in-flight fold — but wasm linear memory never shrinks and the guest allocator does not return
+    /// pages, so a phase's peak is not recovered for the next one: their block sizes differ enough
+    /// (one window vs four vs two-plus-per-peer-rows) that freed blocks do not satisfy the next
+    /// phase's request. The high-water is therefore cumulative across phases, which is exactly what
+    /// "linear memory never shrinks, so a module's transient peak IS its long-lived floor" means.
+    /// `ceremony_round`'s measured-peak assertion is what keeps this derivation honest at the real
+    /// geometry; it is why the sum, not the max, is declared.
+    ///
+    /// Host-side staging (`host_scratch_bytes`, the peak tier) is the outgoing committed container,
+    /// which the module appends into a host buffer and never holds itself.
+    fn decl_for_config(config: &[u8]) -> ModuleDecl {
+        let mut decl = Self::decl();
+        let Ok(cfg) = from_canonical_slice::<GuestCfg>(config) else {
+            return decl;
+        };
+        let numels = cfg.model.param_numels();
+        if numels.is_empty() || cfg.profile.chunk == 0 {
+            return decl;
+        }
+        let numels_u64: Vec<u64> = numels.iter().map(|&n| n as u64).collect();
+        let window = cfg.state.chunk_size.max(1);
+        // A window never spans a parameter, so the widest one is bounded by the largest parameter.
+        let largest_param = numels_u64.iter().max().copied().unwrap_or(0) * 4;
+        let w = window.min(largest_param.max(1));
+        let peers = cfg.roster.len().max(1) as u64;
+        let (chunk, k) = (u64::from(cfg.profile.chunk), u64::from(cfg.profile.topk));
+        let rows = (w / (chunk * 4)).max(1);
+        // One window's payload rows per peer: the decoded values + indices, plus the packed bytes
+        // the ranged read lands (values row stride + the bit-packed index rows).
+        let stride = 2 + (k * u64::from(cfg.profile.bits)).div_ceil(8);
+        let idx_bits = u64::from(daemon_vhc_det::index_bits(chunk as usize).unwrap_or(32));
+        let payload_window = rows * k * 8 + rows * stride + (rows * k * idx_bits).div_ceil(8);
+        // The seed/artifact init expansion: the window it generates, its f32-le image, and the
+        // zeroed `ef` window it seals beside it.
+        let init_peak = 3 * w;
+        // The update walk: θ, round base, ef and the emitted ef window, plus the folded window's
+        // payload section pair on its way to `buffer_append`.
+        let update_peak = walk_in_flight(window, 4) * (4 * w + payload_window);
+        // The ingest walk: the round-base and master windows, plus one window's decoded section
+        // rows per committed peer.
+        let ingest_peak = walk_in_flight(window, 2) * (2 * w + peers * payload_window);
+        // Bookkeeping that scales with the geometry: the four families' chunk-hash lists (master +
+        // ef every round, both AdamW moments at a checkpoint/drain) and the per-parameter tables.
+        let chunks = daemon_vhc_proto::det_state::family_chunk_count(&numels_u64, window);
+        let bookkeeping = 4 * chunks * 32 + numels_u64.len() as u64 * 256;
+        decl.host_state_bytes =
+            MODULE_BASELINE_BYTES + init_peak + update_peak + ingest_peak + bookkeeping;
+        // The outgoing container: one section pair per window, staged host-side.
+        let total_rows = numels_u64.iter().sum::<u64>() / chunk;
+        decl.host_scratch_bytes =
+            total_rows * stride + (total_rows * k * idx_bits).div_ceil(8) + HEADER_BYTES;
+        decl
     }
 
     fn init(config: &[u8], _grants: &[u8]) -> Result<Self, u32> {
@@ -632,9 +737,6 @@ struct LiveState {
     /// Whether a round has been observed (stops the periodic Join/Heartbeat re-announce).
     admitted: bool,
     pending_open: Option<PendingOpen>,
-    pending_records: BTreeMap<u64, PendingRecord>,
-    /// payload_put op → the commitment to publish once the store write is durable.
-    pending_puts: BTreeMap<u64, Commitment>,
     /// The in-flight periodic checkpoint export walk (one at a time; a boundary that fires
     /// while one is in flight skips its cadence slot rather than queueing).
     pending_ckpt: Option<CkptWalk>,
@@ -653,8 +755,6 @@ impl LiveState {
             manifest_op: None,
             admitted: false,
             pending_open: None,
-            pending_records: BTreeMap::new(),
-            pending_puts: BTreeMap::new(),
             pending_ckpt: None,
             ckpt_puts: std::collections::BTreeSet::new(),
         }
@@ -788,8 +888,9 @@ impl LiveState {
     }
 }
 
-/// Read one completion's `Ok(BufferHandle)` payload as raw bytes (`None` on a failed op).
-fn completion_bytes(ev: &daemon_vhc_sdk::Event) -> Option<Vec<u8>> {
+/// One completion's `Ok(BufferHandle)` (`None` on a failed op) — the handle KEPT, not read: the
+/// caller decides whether to pull the whole buffer into linear memory or range-read it ([SF-R3]).
+fn completion_handle(ev: &daemon_vhc_sdk::Event) -> Option<u64> {
     let ciborium::value::Value::Array(result) = ev.items.get(2)? else {
         return None;
     };
@@ -800,13 +901,39 @@ fn completion_bytes(ev: &daemon_vhc_sdk::Event) -> Option<Vec<u8>> {
     if !ok {
         return None;
     }
-    let handle = result
+    result
         .get(1)
         .and_then(|v| v.as_integer())
-        .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))?;
+        .map(|n| u64::try_from(i128::from(n)).unwrap_or(0))
+}
+
+/// Read one completion's `Ok(BufferHandle)` payload as raw bytes and release it (`None` on a failed
+/// op) — for the SMALL completions whose whole object is the point (a manifest, a state window).
+fn completion_bytes(ev: &daemon_vhc_sdk::Event) -> Option<Vec<u8>> {
+    let handle = completion_handle(ev)?;
     let bytes = daemon_vhc_sdk::read_buffer(handle);
     daemon_vhc_sdk::buffer_release(handle);
     Some(bytes)
+}
+
+/// One completion's `Ok(Hash)` payload — the 32-byte content address a `payload_put` reports once
+/// the object is durable. The producing guest learns its own commitment hash here rather than
+/// hashing the container itself: it never held the container to hash.
+fn completion_hash(ev: &daemon_vhc_sdk::Event) -> Option<[u8; 32]> {
+    let ciborium::value::Value::Array(result) = ev.items.get(2)? else {
+        return None;
+    };
+    let ok = result
+        .first()
+        .and_then(|v| v.as_integer())
+        .is_some_and(|n| i128::from(n) == 0);
+    if !ok {
+        return None;
+    }
+    match result.get(1) {
+        Some(ciborium::value::Value::Bytes(b)) => b.as_slice().try_into().ok(),
+        _ => None,
+    }
 }
 
 /// The quiesce snapshot's async moment seal ([SF-6]): only the AdamW moments export off the
@@ -969,7 +1096,7 @@ fn report_round_metrics(committed: u32, out: &[daemon_vhc_sdk_rounds::Outbound])
 
 /// Run the barrier on a fully-staged record and voice the outbounds.
 fn dispatch_record(
-    driver: &mut BarrierRound<C3Round>,
+    driver: &mut BarrierRound<C3Round, HostStaged>,
     payloads: &mut PayloadMap,
     wire: bool,
     pending: PendingRecord,
@@ -986,7 +1113,7 @@ fn dispatch_record(
 /// `Commit` outbound) opens its θ export walk; a genuinely stalled round trains nothing.
 fn try_open_round(
     core: &Rc<RefCell<Core>>,
-    driver: &mut BarrierRound<C3Round>,
+    driver: &mut BarrierRound<C3Round, HostStaged>,
     payloads: &mut PayloadMap,
     ro: RoundOpen,
     export: &mut Option<u64>,
@@ -1569,6 +1696,68 @@ fn drive_restore_completion(
     true
 }
 
+/// Serve a set of ingest-walk reads to fixpoint ([SF-R3]).
+///
+/// A committed-payload read is a RANGE of a host buffer the guest already holds, so it is a prompt
+/// `read_into` served right here — no op, no completion, no whole-payload decode; peak residency is
+/// one window's section rows per peer (~hundreds of KB). Only the round-base state windows are
+/// asynchronous `data@2` fetches, which is also what paces the walk: each completion drives one
+/// window's fold, so per-slice work stays bounded by construction.
+///
+/// Folded windows are `state_emit`ted and written straight into their device parameter as they are
+/// produced, so the post-ingest master lands at window granularity and no resident master exists.
+fn drive_ingest_fetches(
+    st: &mut IngestWalkState,
+    family_base: &[u64],
+    model: &mut TinyLlamaModel<AutodiffHostBackend>,
+    issue: Vec<IngestFetch>,
+) -> bool {
+    let mut queue: VecDeque<IngestFetch> = issue.into();
+    let mut sealed = false;
+    while let Some(fetch) = queue.pop_front() {
+        let Some((offset, len)) = fetch.span else {
+            // A round-base state window: the asynchronous half.
+            let off = family_base[fetch.window.param as usize] + fetch.window.param_off;
+            let op = daemon_vhc_sdk::data_fetch(&st.base_fold, off, fetch.window.len);
+            st.ops.insert(op, fetch.window.ordinal);
+            continue;
+        };
+        let peer = match fetch.part {
+            IngestPart::Values(p) | IngestPart::Indices(p) => p as usize,
+            IngestPart::RoundBase => unreachable!("the round base carries no payload span"),
+        };
+        let bytes = daemon_vhc_sdk::read_range(
+            st.peer_buffers[peer],
+            offset,
+            usize::try_from(len).expect("a section span fits usize"),
+        );
+        let slice = st
+            .walk
+            .on_part_ready(fetch.part, fetch.window.ordinal, &bytes)
+            .expect("the walk accepts the section rows it asked for");
+        emit_ingest_windows(st, model, &slice.emitted);
+        queue.extend(slice.issue);
+        sealed |= slice.sealed;
+    }
+    sealed
+}
+
+/// Emit one slice's folded master windows: into the family's write stream (accumulating the [SF-R1]
+/// chunk hash) and straight onto the device parameter.
+fn emit_ingest_windows(
+    st: &mut IngestWalkState,
+    model: &mut TinyLlamaModel<AutodiffHostBackend>,
+    emitted: &[(Window, Vec<f32>)],
+) {
+    for (window, master_vals) in emitted {
+        f32s_to_le_bytes(master_vals, &mut st.byte_buf);
+        daemon_vhc_sdk::state_emit(st.stream, &st.byte_buf);
+        st.chunk_hashes.push(blake3_hash(&st.byte_buf));
+        let off = usize::try_from(window.param_off / 4).expect("offset fits usize");
+        model.write_param_window(window.param as usize, off, master_vals);
+    }
+}
+
 /// The outcome of routing a completion to the in-flight ingest walk.
 enum IngestStep {
     /// The op is not an ingest-walk window read (route it elsewhere).
@@ -1607,7 +1796,6 @@ fn drive_ingest_completion(
         _ => return IngestStep::NotMine,
     }
     let bytes = completion_bytes(ev).expect("round-base window fetch completes (fail loud)");
-    let vals = le_bytes_to_f32s(&bytes).expect("round-base window is an f32-le image");
 
     let sealed;
     {
@@ -1622,21 +1810,10 @@ fn drive_ingest_completion(
         let ordinal = w.ops.remove(&op).expect("op is an outstanding window read");
         let slice = w
             .walk
-            .on_window_ready(ordinal, &vals)
+            .on_part_ready(IngestPart::RoundBase, ordinal, &bytes)
             .expect("the walk accepts the completed window");
-        for (window, master_vals) in &slice.emitted {
-            f32s_to_le_bytes(master_vals, &mut w.byte_buf);
-            daemon_vhc_sdk::state_emit(w.stream, &w.byte_buf);
-            w.chunk_hashes.push(blake3_hash(&w.byte_buf));
-            let off = usize::try_from(window.param_off / 4).expect("offset fits usize");
-            model.write_param_window(window.param as usize, off, master_vals);
-        }
-        for window in &slice.issue {
-            let off = family_base[window.param as usize] + window.param_off;
-            let fop = daemon_vhc_sdk::data_fetch(&w.base_fold, off, window.len);
-            w.ops.insert(fop, window.ordinal);
-        }
-        sealed = slice.sealed;
+        emit_ingest_windows(w, model, &slice.emitted);
+        sealed = slice.sealed | drive_ingest_fetches(w, family_base, model, slice.issue);
     }
     if !sealed {
         return IngestStep::Progressed;
@@ -1646,6 +1823,10 @@ fn drive_ingest_completion(
     // was emitted.
     let mut core_mut = core.borrow_mut();
     let mut state = core_mut.ingest_walk.take().expect("the sealed walk");
+    // The peers' payload buffers have been fully read; give their quota back (§3.4 ownership).
+    for buf in state.peer_buffers.drain(..) {
+        daemon_vhc_sdk::buffer_release(buf);
+    }
     let round = state.round;
     let voice = state.voice;
     let committed = state.committed;
@@ -1696,6 +1877,10 @@ fn start_update_walk(
     .expect("update walk geometry (profile chunk divides every numel; window aligned)");
     let opening = walk.start().expect("update walk start");
     let ef_stream = daemon_vhc_sdk::state_open(EF_FAMILY, byte_len);
+    // Open the committed container and lay its fixed header down first; every folded window
+    // appends its own section pair after it, in fold order (the layout's own order).
+    let payload_stream = daemon_vhc_sdk::buffer_open();
+    daemon_vhc_sdk::buffer_append(payload_stream, &walk.payload_header());
     let theta_voice = (voice && byte_len <= THETA_VOICE_MAX_BYTES)
         .then(|| vec![0u8; usize::try_from(byte_len).expect("a voiced θ image fits usize")]);
     let mut st = UpdateWalkState {
@@ -1713,6 +1898,7 @@ fn start_update_walk(
         theta: BTreeMap::new(),
         byte_buf: Vec::new(),
         ef_chunks: Vec::new(),
+        payload_stream,
         theta_voice,
     };
     issue_update_windows(&mut st, &c.family_base, &opening.issue);
@@ -1746,15 +1932,15 @@ enum UpdateStep {
     NotMine,
     /// A window arrived / folded; the walk continues.
     Progressed,
-    /// The final slice sealed the ef family + assembled the payload sections — the caller puts the
-    /// committed container and voices the tag-3 commitment.
+    /// The final slice sealed the ef family and the committed container — the caller has PUT the
+    /// container and voices the tag-3 commitment when the put reports its content address.
     Sealed {
         /// The committed round.
         round: u64,
-        /// The sealed committed-container bytes.
-        payload: Vec<u8>,
-        /// Its blake3 (the commitment hash).
-        hash: Hash,
+        /// The container's byte length (the record entry's `size`).
+        size: u64,
+        /// The in-flight `payload_put` whose completion carries the commitment hash.
+        put_op: u64,
         /// The harness-tier trained-θ image to voice as tag 2 before the commitment, when the
         /// walk assembled one (see [`UpdateWalkState::theta_voice`]).
         theta_voice: Option<Vec<u8>>,
@@ -1848,6 +2034,11 @@ fn drive_update_completion(
                 daemon_vhc_sdk::state_emit(st.ef_stream, &st.byte_buf);
                 st.ef_chunks.push(blake3_hash(&st.byte_buf));
             }
+            // The window's committed-payload section pair leaves for the host buffer as it is
+            // folded; the walk keeps only the running length.
+            for (_w, bytes) in &step.payload {
+                daemon_vhc_sdk::buffer_append(st.payload_stream, bytes.as_slice());
+            }
             let issue = step.issue.clone();
             issue_update_windows(st, family_base, &issue);
             step.sealed
@@ -1862,16 +2053,19 @@ fn drive_update_completion(
     c.ef_fold = daemon_vhc_sdk::state_seal(st.ef_stream);
     c.ef_chunks = std::mem::take(&mut st.ef_chunks);
     let theta_voice = st.theta_voice.take();
-    let sections = st
+    let size = st
         .walk
         .seal()
-        .expect("the update walk sealed after every window folded");
-    let payload = encode_payload(&sections);
-    let hash = blake3_hash(&payload);
+        .expect("the update walk sealed after every window folded and tiled its layout");
+    // Seal the appended container into the buffer `payload_put` takes. The commitment hash comes
+    // back on the put's completion — the guest never held the container to hash it itself.
+    let buf = daemon_vhc_sdk::buffer_seal(st.payload_stream);
+    let put_op = daemon_vhc_sdk::payload_put(buf);
+    daemon_vhc_sdk::buffer_release(buf);
     UpdateStep::Sealed {
         round: st.round,
-        payload,
-        hash,
+        size,
+        put_op,
         theta_voice,
     }
 }
@@ -1969,7 +2163,8 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
         micro_batch: cfg.micro_batch,
         stall_rounds_max: cfg.stall_rounds_max,
     };
-    let mut driver = BarrierRound::new(C3Round { core: core.clone() }, round_cfg.clone());
+    let mut driver: BarrierRound<C3Round, HostStaged> =
+        BarrierRound::new(C3Round { core: core.clone() }, round_cfg.clone());
     // A restored instance never re-ingests at or below the snapshot's watermark (§9 restore).
     if restored_round.is_some() {
         driver.resume_from(restored_round);
@@ -1977,6 +2172,10 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
     let mut payloads = PayloadMap {
         map: BTreeMap::new(),
     };
+    // Record-listed committed payloads awaiting their `payload_get` completions (both modes).
+    let mut pending_records: BTreeMap<u64, PendingRecord> = BTreeMap::new();
+    // `payload_put` op → the (round, size) whose commitment its content address will voice.
+    let mut pending_commit: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
     // The round awaiting its round-final fence (its θ export walk starts there).
     let mut export: Option<u64> = None;
     let mut quiesce: Option<QuiesceWalk> = None;
@@ -2058,24 +2257,11 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                             .batches
                             .push_back((sequences, seq_len, tokens));
                     }
-                    1 => {
-                        // A committed payload: [1, round, peer32, payload].
-                        let round = uint(1);
-                        let peer: [u8; 32] = match items.get(2) {
-                            Some(ciborium::value::Value::Bytes(b)) => {
-                                match b.as_slice().try_into() {
-                                    Ok(p) => p,
-                                    Err(_) => continue,
-                                }
-                            }
-                            _ => continue,
-                        };
-                        let payload = match items.get(3) {
-                            Some(ciborium::value::Value::Bytes(b)) => b.clone(),
-                            _ => continue,
-                        };
-                        payloads.map.insert((round, PeerId(peer)), payload);
-                    }
+                    // Kind 1 (`[1, round, peer32, payload]`) is RETIRED: a committed payload never
+                    // enters linear memory, in either mode. Both the harness and the live plane
+                    // hand the guest the record's content address and it `payload_get`s the blob
+                    // into a host buffer it then range-reads ([SF-R3]) — one code path, which is
+                    // also what keeps the real-geometry gates honest about the toy tier (§1.3/§10.2).
                     _ => {}
                 }
             }
@@ -2134,37 +2320,34 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                     }
                     VhcMessage::RoundRecord(rr) => {
                         let entries: Vec<RecordEntry> = rr.inline.clone().unwrap_or_default();
-                        if live.is_some() {
-                            // Module-driven payload staging: fetch every record-listed
-                            // committed payload from the content-addressed plane (self
-                            // included — idempotent and uniform), then run the barrier.
-                            if let Some(last) = driver.last_ingested() {
-                                if rr.round <= last {
-                                    continue; // at/below the watermark — never re-fetched
-                                }
+                        // Module-driven payload custody, in BOTH modes: fetch every record-listed
+                        // committed payload from the content-addressed plane (self included —
+                        // idempotent and uniform) into a host buffer, then run the barrier. The
+                        // host hash-verifies each fetch against the record's address before the
+                        // completion lands, and the fold reads rows out of the buffer.
+                        if let Some(last) = driver.last_ingested() {
+                            if rr.round <= last {
+                                continue; // at/below the watermark — never re-fetched
                             }
-                            let mut ops = BTreeMap::new();
-                            for e in &entries {
-                                if !payloads.map.contains_key(&(rr.round, e.peer)) {
-                                    let op = daemon_vhc_sdk::payload_get(&e.hash.0);
-                                    ops.insert(op, e.peer);
-                                }
-                            }
-                            let pending = PendingRecord { rr, entries, ops };
-                            let pending_round = pending.rr.round;
-                            if pending.ops.is_empty() {
-                                dispatch_record(&mut driver, &mut payloads, true, pending);
-                                // The live checkpoint fires at SEAL (in the ingest-walk `Sealed`
-                                // handler), not here: `dispatch_record` only KICKS OFF the async
-                                // deferred fold, so the canonical master has not yet advanced to
-                                // this round — capturing now would strand a restorer a round back.
-                            } else if let Some(l) = live.as_mut() {
-                                l.pending_records.insert(pending_round, pending);
-                            }
-                            continue;
                         }
-                        let out = driver.on_round_record(&rr, entries, &mut payloads);
-                        emit_round_outbounds(false, &out);
+                        let mut ops = BTreeMap::new();
+                        for e in &entries {
+                            if !payloads.map.contains_key(&(rr.round, e.peer)) {
+                                let op = daemon_vhc_sdk::payload_get(&e.hash.0);
+                                ops.insert(op, e.peer);
+                            }
+                        }
+                        let pending = PendingRecord { rr, entries, ops };
+                        let pending_round = pending.rr.round;
+                        if pending.ops.is_empty() {
+                            dispatch_record(&mut driver, &mut payloads, live.is_some(), pending);
+                            // The live checkpoint fires at SEAL (in the ingest-walk `Sealed`
+                            // handler), not here: `dispatch_record` only KICKS OFF the async
+                            // deferred fold, so the canonical master has not yet advanced to
+                            // this round — capturing now would strand a restorer a round back.
+                        } else {
+                            pending_records.insert(pending_round, pending);
+                        }
                     }
                     _ => {}
                 }
@@ -2292,30 +2475,36 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                     UpdateStep::Progressed => continue,
                     UpdateStep::Sealed {
                         round,
-                        payload,
-                        hash,
+                        size,
+                        put_op,
                         theta_voice,
                     } => {
                         if let Some(image) = theta_voice {
                             publish_tagged(2, round, &image);
                         }
-                        let buf = daemon_vhc_sdk::create_from(&payload);
-                        let put_op = daemon_vhc_sdk::payload_put(buf);
-                        daemon_vhc_sdk::buffer_release(buf);
-                        publish_tagged(3, round, &hash.0);
-                        if let Some(l) = live.as_mut() {
-                            l.pending_puts.insert(
-                                put_op,
-                                Commitment {
-                                    round,
-                                    payload: hash,
-                                    size: payload.len() as u64,
-                                    locators: Vec::new(),
-                                },
-                            );
-                        }
+                        // The commitment voice waits for the put: its completion carries the
+                        // container's content address (which is also when it is durable, so the
+                        // coordinator's availability check and every peer's fetch can find it).
+                        pending_commit.insert(put_op, (round, size));
                         continue;
                     }
+                }
+                // The committed container is durable: voice the commitment the put's content
+                // address names.
+                if let Some((round, size)) = pending_commit.remove(&op) {
+                    let hash = Hash(
+                        completion_hash(&ev).expect("the committed container PUTs (fail loud)"),
+                    );
+                    publish_tagged(3, round, &hash.0);
+                    if live.is_some() {
+                        publish_wire(&VhcMessage::Commitment(Commitment {
+                            round,
+                            payload: hash,
+                            size,
+                            locators: Vec::new(),
+                        }));
+                    }
+                    continue;
                 }
                 // Live-mode completion routing first: the manifest fetch, a pending open's
                 // corpus segments, a pending record's committed payloads, a durable payload put.
@@ -2343,12 +2532,6 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                         // Announce (and keep re-announcing until the first round opens).
                         l.announce();
                         daemon_vhc_sdk::set_timer(500);
-                        continue;
-                    }
-                    if let Some(commitment) = l.pending_puts.remove(&op) {
-                        // The sealed container is durable on the plane: NOW the wire commitment
-                        // is publishable (the coordinator's availability check will find it).
-                        publish_wire(&VhcMessage::Commitment(commitment));
                         continue;
                     }
                     if l.ckpt_puts.remove(&op) {
@@ -2398,30 +2581,30 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                         }
                         continue;
                     }
-                    let record_round = l
-                        .pending_records
-                        .iter_mut()
-                        .find_map(|(round, p)| p.ops.remove(&op).map(|peer| (*round, peer)));
-                    if let Some((round, peer)) = record_round {
-                        let bytes = completion_bytes(&ev)
-                            .expect("a record-listed committed payload fetches (fail loud)");
-                        payloads.map.insert((round, peer), bytes);
-                        let done = l
-                            .pending_records
-                            .get(&round)
-                            .is_some_and(|p| p.ops.is_empty());
-                        if done {
-                            let pending = l
-                                .pending_records
-                                .remove(&round)
-                                .expect("the completed record");
-                            dispatch_record(&mut driver, &mut payloads, true, pending);
-                            // The live checkpoint fires at SEAL (in the ingest-walk `Sealed`
-                            // handler), not here: `dispatch_record` only kicks off the async
-                            // deferred fold, so the canonical master is not yet this round's.
-                        }
-                        continue;
+                }
+                // A record-listed committed payload landed as a host BUFFER (both modes): stash
+                // the handle — never its bytes — and run the barrier once the record's whole set
+                // is fetched.
+                let record_round = pending_records
+                    .iter_mut()
+                    .find_map(|(round, p)| p.ops.remove(&op).map(|peer| (*round, peer)));
+                if let Some((round, peer)) = record_round {
+                    let handle = completion_handle(&ev)
+                        .expect("a record-listed committed payload fetches (fail loud)");
+                    payloads.map.insert((round, peer), HostStaged(handle));
+                    let done = pending_records
+                        .get(&round)
+                        .is_some_and(|p| p.ops.is_empty());
+                    if done {
+                        let pending = pending_records
+                            .remove(&round)
+                            .expect("the completed record");
+                        dispatch_record(&mut driver, &mut payloads, live.is_some(), pending);
+                        // The live checkpoint fires at SEAL (in the ingest-walk `Sealed`
+                        // handler), not here: `dispatch_record` only kicks off the async
+                        // deferred fold, so the canonical master is not yet this round's.
                     }
+                    continue;
                 }
                 // The quiesce walk's completions (§10.2 phase 2): emit the exported moment windows
                 // into their family streams; when both seal, author + submit the typed manifest

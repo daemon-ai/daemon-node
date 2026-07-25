@@ -22,7 +22,7 @@ use crate::run::driver::config::{MigrationInput, RunConfig, RunEnd, RunError};
 use crate::run::driver::host::{derive_rng_seed, Host, SliceState};
 use crate::run::driver::linker::link_v2;
 use crate::run::driver::migration::{build_migration_descriptor, RestoreBinding};
-use crate::run::driver::pump::{PumpHandle, PumpShared, PumpState};
+use crate::run::driver::pump::{BufferStreams, PumpHandle, PumpShared, PumpState};
 use crate::run::journal::{JournalSink, SinkError};
 use crate::run::ops::OpTable;
 use crate::run::streams::StreamTable;
@@ -198,6 +198,8 @@ pub fn start_run_migrating(
                     None => None,
                 },
             ),
+            guest_memory_high_water: 0,
+            buffer_streams: BufferStreams::default(),
             op_requests: Vec::new(),
             stop_enqueued: false,
             stop_cut: None,

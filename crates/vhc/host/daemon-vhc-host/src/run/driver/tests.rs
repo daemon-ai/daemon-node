@@ -18,6 +18,7 @@ use wasmtime::StoreLimitsBuilder;
 
 use crate::run::buffer::BufferTable;
 use crate::run::completion::{CompError, CompletionResult};
+use crate::run::driver::BufferStreams;
 use crate::run::journal::{JournalSink, MemorySink, SinkEntry};
 use crate::run::ops::{OpRequest, OpTable};
 use crate::run::streams::StreamTable;
@@ -60,6 +61,8 @@ fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
         state: crate::run::state_store::StateStore::new(
             crate::run::state_store::StateStoreConfig::default(),
         ),
+        guest_memory_high_water: 0,
+        buffer_streams: BufferStreams::default(),
         op_requests: Vec::new(),
         stop_enqueued: false,
         stop_cut: None,

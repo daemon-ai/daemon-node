@@ -49,13 +49,23 @@
 //!
 //! ## The payload wire
 //!
-//! [`Section`] is CBOR-identical to the v1 update-container wire (the host's `SectionWire`:
-//! externally-tagged `Bytes`/`Tensor{data, shape}`), so a payload sealed by this crate decodes
-//! under a v1 ingest and vice versa — the profile owns both ends, and the vhc never parses
-//! payloads (opaque by invariant).
+//! A committed update is ONE opaque blob identified by `blake3(whole bytes)`, riding
+//! `payload_put`/`payload_get` — the vhc never parses payloads (opaque by invariant), so its
+//! *format* is module policy and lives here.
+//!
+//! - [`payload`] is the **production** layout: a fixed header plus the per-fold-window section
+//!   pairs, so a consumer range-reads exactly the rows one window needs out of the host buffer the
+//!   payload arrived in ([SF-R3]) and a producer appends them window by window. Neither side ever
+//!   holds a whole container.
+//! - [`Section`] is the **resident reference** container — CBOR-identical to the v1 update-container
+//!   wire (the host's `SectionWire`: externally-tagged `Bytes`/`Tensor{data, shape}`) — carried by
+//!   the retained resident profiles below. [`payload::PayloadLayout::encode_sections`] is the
+//!   definition bridge between the two forms, and the parity suites use it to prove the streamed
+//!   producer emits exactly the rows the resident one does.
 
 use serde::{Deserialize, Serialize};
 
+pub mod payload;
 pub mod streaming;
 
 // ================================================================================================

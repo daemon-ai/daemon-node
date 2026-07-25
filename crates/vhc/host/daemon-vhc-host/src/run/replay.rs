@@ -216,6 +216,9 @@ struct ReplayHost {
     stream_read_ops: std::collections::HashSet<u64>,
     /// `compute.export` ops awaiting their journaled kind-5 tensor bytes at completion delivery.
     tensor_export_ops: std::collections::HashSet<u64>,
+    /// Open incremental buffer streams (`buffer_open`/`buffer_append`/`buffer_seal`, dc class):
+    /// re-executed here so a sealed handle is the same deterministic buffer id the recording minted.
+    buffer_streams: crate::run::driver::BufferStreams,
     /// Host-partition (completion-minted) buffers, keyed by the handle the journaled completion
     /// frame carries, materialized from `script.payloads` / `script.stream_bytes` at delivery.
     host_buffers: HashMap<u64, Arc<Vec<u8>>>,
@@ -626,6 +629,41 @@ fn dispatch(
                 .buffers
                 .create(Arc::new(bytes))
                 .map_err(|c| diverged(format!("create_from refused at replay: {c:?}")))?;
+            results[0] = Val::I64(handle as i64);
+            Ok(())
+        }
+        // The incremental buffer-staging trio (dc, like `create_from`): re-executed over the
+        // replay-reproduced guest memory, so the sealed handle is the same deterministic buffer id
+        // the recording minted. No journal record exists for any of the three — none is needed.
+        ("vhc@2", "buffer_open") => {
+            results[0] = Val::I64(caller.data_mut().buffer_streams.open() as i64);
+            Ok(())
+        }
+        ("vhc@2", "buffer_append") => {
+            let (stream, ptr, len) = (p_u64(params, 0), p_u32(params, 1), p_u32(params, 2));
+            let mem = mem_of(caller)?;
+            let mut bytes = vec![0u8; len as usize];
+            mem.read(&mut *caller, ptr as usize, &mut bytes)
+                .map_err(|e| wasmtime::Error::msg(format!("buffer_append read: {e}")))?;
+            let n = caller
+                .data_mut()
+                .buffer_streams
+                .append(stream, &bytes)
+                .map_err(|e| diverged(format!("buffer_append refused at replay: {e}")))?;
+            results[0] = Val::I64(n as i64);
+            Ok(())
+        }
+        ("vhc@2", "buffer_seal") => {
+            let stream = p_u64(params, 0);
+            let host = caller.data_mut();
+            let bytes = host
+                .buffer_streams
+                .take(stream)
+                .map_err(|e| diverged(format!("buffer_seal refused at replay: {e}")))?;
+            let handle = host
+                .buffers
+                .create(Arc::new(bytes))
+                .map_err(|c| diverged(format!("buffer_seal refused at replay: {c:?}")))?;
             results[0] = Val::I64(handle as i64);
             Ok(())
         }
@@ -1118,6 +1156,7 @@ pub fn replay_migrating(
         state_chunk_maps: HashMap::new(),
         stream_read_ops: std::collections::HashSet::new(),
         tensor_export_ops: std::collections::HashSet::new(),
+        buffer_streams: crate::run::driver::BufferStreams::default(),
         host_buffers: HashMap::new(),
         state,
     };

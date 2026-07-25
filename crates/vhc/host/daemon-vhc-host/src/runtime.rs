@@ -120,6 +120,27 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    /// Take the guest linear-memory cap from an **admitted module claim** (ABI §9.1 / architecture
+    /// §3.5): the claim's hard-accountable host tier is "the resource the host meters exactly — the
+    /// enforceable cap", and for a wasm instance the pooling allocator is exactly that meter.
+    ///
+    /// This is where the experiment's own declaration becomes the enforced number. The claim is
+    /// deterministic from the genesis-pinned config (`decl_for_config` → `da_claim`), its hash
+    /// already rides the admitted tuple, and admission has already checked it against the lane's
+    /// claim bounds and the owner's caps — so by the time it reaches here it is a reviewed,
+    /// hash-committed, policy-bounded figure. A host constant in its place would be a guess about
+    /// an experiment the host cannot see, and invisible to a verifier reading the run's identity.
+    ///
+    /// `0` (a claim that declares no host tier) leaves the profile's own cap in place.
+    #[must_use]
+    pub fn with_claimed_memory(mut self, hard_accountable_host_bytes: u64) -> Self {
+        if hard_accountable_host_bytes > 0 {
+            self.max_memory_bytes =
+                usize::try_from(hard_accountable_host_bytes).unwrap_or(usize::MAX);
+        }
+        self
+    }
+
     /// The REAL-MODEL sandbox profile: the budgets a production-geometry run needs, as opposed to
     /// [`EngineConfig::default`], whose values are sized for the tiny reference model the
     /// acceptance tier trains.
@@ -144,14 +165,17 @@ impl EngineConfig {
     /// is one unbroken pass. So the budget above stands on the init measurement alone; the rounds
     /// do not move it.
     ///
-    /// `max_memory_bytes` is deliberately NOT raised: a conforming guest streams state families
-    /// window-by-window (design §3.2 — the fold walks, the seed expansion, the checkpoint
-    /// rehydration), so its linear-memory high-water is O(window), independent of the geometry.
-    /// Raising the cap here would hide exactly the class of guest regression the ceremony-geometry
-    /// init gate exists to catch.
+    /// `max_memory_bytes` is deliberately NOT raised here, and on the admitted path it is not this
+    /// value at all: it comes from the module's own claim ([`EngineConfig::with_claimed_memory`]).
+    /// A conforming guest streams both planes — state families window-by-window (design §3.2) and
+    /// committed payloads through ranged reads of the host buffers they arrive in ([SF-R3]) — so
+    /// its linear-memory high-water is O(fold windows + payload section rows + bookkeeping),
+    /// independent of the geometry. The figure below is the profile a run that carries no claim
+    /// falls back to; raising IT would hide exactly the class of guest regression the
+    /// real-geometry gates exist to catch.
     ///
-    /// Both the worker's join engine and the ceremony-geometry init gate build from this one
-    /// definition, so a budget change is reviewed against a test rather than transcribed.
+    /// Both the worker's join engine and the real-geometry gates build from this one definition, so
+    /// a budget change is reviewed against a test rather than transcribed.
     #[must_use]
     pub fn real_model(backend: BackendKind, gpu_index: Option<u32>) -> Self {
         Self {

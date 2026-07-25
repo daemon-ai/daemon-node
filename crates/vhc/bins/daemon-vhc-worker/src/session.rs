@@ -263,17 +263,6 @@ fn batch_wrapper(round: u64, step: u32, sequences: u32, tokens: &[u32]) -> Resul
     to_canonical_vec(&v).map_err(|e| format!("batch wrapper: {e}"))
 }
 
-/// The trainer's staged committed-payload wrapper: `[1, round, peer32, payload]`.
-fn update_wrapper(round: u64, peer: &[u8; 32], payload: &[u8]) -> Result<Vec<u8>, String> {
-    let v = ciborium::value::Value::Array(vec![
-        ciborium::value::Value::from(1u8),
-        ciborium::value::Value::from(round),
-        ciborium::value::Value::Bytes(peer.to_vec()),
-        ciborium::value::Value::Bytes(payload.to_vec()),
-    ]);
-    to_canonical_vec(&v).map_err(|e| format!("update wrapper: {e}"))
-}
-
 /// Decode one published frame's module-authored `[tag, round, bytes]` payload.
 fn decode_tagged(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
     let v: ciborium::value::Value = ciborium::de::from_reader(frame).ok()?;
@@ -469,6 +458,8 @@ pub(crate) async fn join_and_run(
     let mut coord_seq = 0u64;
     // Sealed bytes captured while servicing the guest's payload_put ops (the async-runtime seat).
     let mut puts: Vec<Vec<u8>> = Vec::new();
+    // The content-addressed archive the guest fetches the record-listed committed set back from.
+    let mut archive = CommittedArchive::default();
     let step_timeout = Duration::from_secs(120);
 
     while rounds_done < DRIVE_ROUNDS {
@@ -520,6 +511,7 @@ pub(crate) async fn join_and_run(
                     &pump,
                     (rounds_done as usize) * 3 + 2,
                     &mut puts,
+                    &mut archive,
                     &artifacts,
                 )?;
                 let sealed = puts
@@ -572,10 +564,10 @@ pub(crate) async fn join_and_run(
                         }],
                     }),
                 )?;
-                // Stage the committed set for the barrier BEFORE the record arrives (§5.11:
-                // record-listed order; single peer = the one guest-put payload).
-                pump.stage_payload(update_wrapper(ro.round, &worker_peer.0, &sealed)?, None)
-                    .map_err(|e| format!("stage update: {e}"))?;
+                // Make the committed set FETCHABLE before the record arrives (§5.11:
+                // record-listed order; single peer = the one guest-put payload). The guest's own
+                // `payload_get` is what carries it back — the fleet's path, not a harness one.
+                archive.publish(&sealed);
             }
             VhcMessage::RoundRecord(rr) => {
                 deliver_to_worker(&pump, sender, &msg, evidence.clone(), &mut coord_seq)?;
@@ -584,6 +576,7 @@ pub(crate) async fn join_and_run(
                     &pump,
                     (rounds_done as usize) * 3 + 3,
                     &mut puts,
+                    &mut archive,
                     &artifacts,
                 )?;
                 let digest_bytes = published
@@ -638,6 +631,11 @@ pub(crate) async fn join_and_run(
     if let Some(sc) = &genesis.env.state_contract {
         script.state_chunk_size = sc.chunk_size;
     }
+    // §8.7: bulk payloads are RE-FETCHED at replay, never copied into the journal — the same
+    // content-addressed archive the live drive served the guest's `payload_get`s from.
+    script
+        .payloads
+        .extend(archive.by_hash.iter().map(|(h, b)| (*h, b.clone())));
     let replayed = replay(&worker, module, config, &grants, script)
         .map_err(|e| format!("replay harness: {e}"))?;
     if replayed.end != ReplayEnd::Outcome(0) {
@@ -717,15 +715,35 @@ fn deliver_to_worker(
     }
 }
 
+/// The committed payloads this seat can serve, keyed by content address — the archive the guest's
+/// own `payload_get` reads from ([SF-R3]: a committed payload reaches the guest as a host buffer it
+/// range-reads, never as staged linear-memory bytes), and the same table the §12.6 replay soak
+/// re-fetches from.
+#[derive(Default)]
+struct CommittedArchive {
+    by_hash: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    /// `payload_get` ops whose address the archive did not hold yet — retried, never failed.
+    deferred: Vec<(u64, [u8; 32])>,
+}
+
+impl CommittedArchive {
+    fn publish(&mut self, payload: &[u8]) {
+        self.by_hash
+            .insert(blake3_hash(payload).0, payload.to_vec());
+    }
+}
+
 /// Wait (bounded) until the pump has published at least `target` frames in total, servicing the
 /// guest's ops meanwhile (the async-runtime seat): `payload_put`s' sealed bytes are captured
-/// into `puts` (the barrier's staging + commitment-evidence input), and `data.fetch`s are
+/// into `puts` (the availability-evidence + commitment-evidence input), record-listed
+/// `payload_get`s are answered content-addressed from `archive`, and `data.fetch`s are
 /// answered from the run's artifact store — the SAME `HarnessArtifacts::fetch` the session's own
 /// corpus staging reads through (one fetch path; the pump re-verifies + range-slices).
 fn wait_publishes_servicing(
     pump: &daemon_vhc_host::run::PumpHandle,
     target: usize,
     puts: &mut Vec<Vec<u8>>,
+    archive: &mut CommittedArchive,
     artifacts: &HarnessArtifacts,
 ) -> Result<Vec<(u64, u64, Vec<u8>)>, String> {
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -736,6 +754,9 @@ fn wait_publishes_servicing(
                     puts.push(bytes.to_vec());
                     pump.complete_op(op, daemon_vhc_host::run::OpOutcome::PutDone)
                         .map_err(|e| format!("put completion: {e}"))?;
+                }
+                daemon_vhc_host::run::OpRequest::PayloadGet { hash } => {
+                    archive.deferred.push((op, hash));
                 }
                 daemon_vhc_host::run::OpRequest::ArtifactFetch { hash, .. }
                 | daemon_vhc_host::run::OpRequest::ArtifactRange { hash, .. } => {
@@ -764,6 +785,22 @@ fn wait_publishes_servicing(
                 other => return Err(format!("unexpected op request from the guest: {other:?}")),
             }
         }
+        let mut pending = Vec::new();
+        for (op, hash) in std::mem::take(&mut archive.deferred) {
+            match archive.by_hash.get(&hash) {
+                Some(bytes) => {
+                    pump.complete_op(
+                        op,
+                        daemon_vhc_host::run::OpOutcome::GetDone {
+                            bytes: bytes.clone(),
+                        },
+                    )
+                    .map_err(|e| format!("get completion: {e}"))?;
+                }
+                None => pending.push((op, hash)),
+            }
+        }
+        archive.deferred = pending;
         let published = pump.published();
         if published.len() >= target {
             return Ok(published);

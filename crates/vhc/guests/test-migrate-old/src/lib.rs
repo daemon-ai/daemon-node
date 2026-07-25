@@ -115,8 +115,13 @@ pub extern "C" fn da_claim(_c: u32, _cl: u32, _g: u32, _gl: u32) -> u64 {
         ])
     };
     let claim = ciborium::value::Value::Map(vec![
-        (text("hard_accountable"), tier(0, 1 << 16)),
-        (text("declared_peak"), tier(0, 1 << 20)),
+        // The wasm32 Rust `cdylib` linear-memory floor: this tier is what the host enforces as
+        // the sandbox cap, and the toolchain floor (shadow stack + data + first heap pages) is
+        // beneath any module state — measured at 4 MiB in
+        // `daemon_vhc_sdk::module::WASM_LINEAR_MEMORY_FLOOR_BYTES`, restated here because this
+        // guest hand-authors its claim.
+        (text("hard_accountable"), tier(0, 4 << 20)),
+        (text("declared_peak"), tier(0, 5 << 20)),
         (text("workspace"), tier(0, 1 << 16)),
         (
             text("under_pressure"),

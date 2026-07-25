@@ -9,8 +9,10 @@
 // arrival permutations — the engine preserves the pinned contract, it does not re-derive it.
 
 use daemon_vhc_sdk_consensus::digest::DigestCarry;
+use daemon_vhc_sdk_profiles::payload::PayloadLayout;
 use daemon_vhc_sdk_profiles::streaming::{
-    SparseLocoIngestWalk, SparseLocoUpdateWalk, UpdateWindowInputs, WalkSlice,
+    f32s_to_le_bytes, IngestFetch, IngestPart, SparseLocoIngestWalk, SparseLocoUpdateWalk,
+    UpdateWindowInputs, WalkSlice,
 };
 use daemon_vhc_sdk_profiles::{ParamView, SparseLoco, SparseLocoCfg};
 
@@ -155,12 +157,23 @@ fn profile_walks_reproduce_the_shared_schedule_vectors() {
         let efs: Vec<Vec<f32>> = case.numels.iter().map(|&n| vec![0.0; n]).collect();
 
         // -- ingest walk ------------------------------------------------------------------
+        //
+        // A committed payload stays in its host buffer, so a window's inputs arrive as several ranged
+        // reads (its round base plus a value and an index section per peer) and the walk runs the clip
+        // pre-pass over the same schedule before the emitting fold phase. Both phases must walk the
+        // pinned window order; the vectors' fold/seal decomposition is asserted against the
+        // EMITTING phase (the pre-pass emits nothing by construction).
+        let layout = PayloadLayout::new(&cfg, &case.numels, case.window_size).unwrap();
+        let buffers: Vec<Vec<u8>> = payloads
+            .iter()
+            .map(|s| layout.encode_sections(s).unwrap())
+            .collect();
         let mut ingest = SparseLocoIngestWalk::new(
             &cfg,
             &case.numels,
             case.window_size,
             case.in_flight,
-            &payloads,
+            buffers.len(),
             DigestCarry::new(&Seed([7; 32]), 64),
         )
         .unwrap();
@@ -173,16 +186,103 @@ fn profile_walks_reproduce_the_shared_schedule_vectors() {
             .collect();
         assert_eq!(schedule, case.windows, "{}: window enumeration", case.name);
 
-        let opening = observe(&ingest.start().unwrap());
-        assert_slice(&case.name, 0, &opening, &case.slices[0]);
+        // Deliver one window's parts as a group, in the pinned arrival order, so each window
+        // produces exactly one slice — the shape the vectors pin.
+        let mut byte_buf = Vec::new();
+        let deliver = |walk: &mut SparseLocoIngestWalk,
+                       pending: &mut Vec<IngestFetch>,
+                       ordinal: u64,
+                       byte_buf: &mut Vec<u8>|
+         -> (Vec<u64>, Vec<u64>, bool) {
+            let mut fold = Vec::new();
+            let mut issue = Vec::new();
+            let mut seal = false;
+            let (mine, rest): (Vec<IngestFetch>, Vec<IngestFetch>) = pending
+                .iter()
+                .copied()
+                .partition(|f| f.window.ordinal == ordinal);
+            *pending = rest;
+            assert!(!mine.is_empty(), "the pinned arrival must be outstanding");
+            for fetch in mine {
+                let bytes = match fetch.span {
+                    Some((off, len)) => {
+                        let peer = match fetch.part {
+                            IngestPart::Values(p) | IngestPart::Indices(p) => p as usize,
+                            IngestPart::RoundBase => unreachable!(),
+                        };
+                        buffers[peer][off as usize..(off + len) as usize].to_vec()
+                    }
+                    None => {
+                        let w = fetch.window;
+                        let (off, elems) = (
+                            usize::try_from(w.param_off / 4).unwrap(),
+                            usize::try_from(w.len / 4).unwrap(),
+                        );
+                        f32s_to_le_bytes(&bases[w.param as usize][off..off + elems], byte_buf);
+                        byte_buf.clone()
+                    }
+                };
+                let step = walk
+                    .on_part_ready(fetch.part, fetch.window.ordinal, &bytes)
+                    .unwrap();
+                fold.extend(step.emitted.iter().map(|(w, _)| w.ordinal));
+                for f in &step.issue {
+                    if !issue.contains(&f.window.ordinal) {
+                        issue.push(f.window.ordinal);
+                    }
+                    pending.push(*f);
+                }
+                seal |= step.sealed;
+            }
+            (fold, issue, seal)
+        };
+
+        // Phase 1 (the clip pre-pass): the same window order, no emissions.
+        let mut pending: Vec<IngestFetch> = Vec::new();
+        let opening = ingest.start().unwrap();
+        let mut opening_windows: Vec<u64> = Vec::new();
+        for f in &opening.issue {
+            if !opening_windows.contains(&f.window.ordinal) {
+                opening_windows.push(f.window.ordinal);
+            }
+            pending.push(*f);
+        }
+        assert_eq!(
+            opening_windows, case.slices[0].issue,
+            "{}: pre-pass opening issues the pinned windows",
+            case.name
+        );
+        // The pre-pass runs the same arrival order; its last window's slice carries the emitting
+        // phase's opening issues (the phase transition is internal to the walk).
+        let mut phase_two_opening: Vec<u64> = Vec::new();
         for (i, &arrival) in case.arrivals.iter().enumerate() {
-            let w = ingest.schedule()[usize::try_from(arrival).unwrap()];
-            let (off, elems) = (
-                usize::try_from(w.param_off / 4).unwrap(),
-                usize::try_from(w.len / 4).unwrap(),
+            let (fold, issue, seal) = deliver(&mut ingest, &mut pending, arrival, &mut byte_buf);
+            assert!(
+                fold.is_empty() && !seal,
+                "{}: the clip pre-pass emits nothing and never seals the walk",
+                case.name
             );
-            let base_win = bases[w.param as usize][off..off + elems].to_vec();
-            let step = observe(&ingest.on_window_ready(arrival, &base_win).unwrap());
+            if i + 1 < case.arrivals.len() {
+                assert_eq!(
+                    issue,
+                    case.slices[i + 1].issue,
+                    "{}: pre-pass slice {} issues",
+                    case.name,
+                    i + 1
+                );
+            } else {
+                phase_two_opening = issue;
+            }
+        }
+        assert_eq!(
+            phase_two_opening, case.slices[0].issue,
+            "{}: the emitting phase opens on the pinned windows",
+            case.name
+        );
+
+        // Phase 2 (the emitting fold): the pinned fold/issue/seal decomposition, verbatim.
+        for (i, &arrival) in case.arrivals.iter().enumerate() {
+            let step = deliver(&mut ingest, &mut pending, arrival, &mut byte_buf);
             assert_slice(&case.name, i + 1, &step, &case.slices[i + 1]);
         }
         ingest.seal().unwrap();

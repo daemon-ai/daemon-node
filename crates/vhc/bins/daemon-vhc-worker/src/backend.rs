@@ -825,13 +825,16 @@ pub(crate) fn measured_backend(
 /// (`EngineConfig.backend` + `gpu_index`), with the REAL-MODEL sandbox budgets
 /// ([`EngineConfig::real_model`]) on the device lanes and under an explicit operator selection
 /// (the defaults are tuned for the tiny reference model; a real geometry's fp32 steps trip the 5 s
-/// epoch watchdog and its fresh-join seed-init expansion trips the default fuel budget).
+/// epoch watchdog and its fresh-join seed-init expansion trips the default fuel budget) — and the
+/// guest linear-memory cap taken from the **admitted claim** (`claim_host_bytes`, the claim's
+/// hard-accountable host tier), so no host constant governs an admitted experiment's memory.
 ///
 /// # Errors
 ///
 /// The typed `BackendUnavailable` reason — the join refuses; there is no fallback.
 pub(crate) fn engine_for_join(
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
+    claim_host_bytes: u64,
 ) -> Result<EngineConfig, String> {
     let sel = measured_backend(device_min)?;
     let backend = kind_for_slug(&sel.slug).ok_or_else(|| {
@@ -842,15 +845,16 @@ pub(crate) fn engine_for_join(
         )
     })?;
     let gpu_index = backend.is_device().then_some(sel.gpu_index);
-    if backend.is_device() || directed_backend().is_some() {
-        Ok(EngineConfig::real_model(backend, gpu_index))
+    let base = if backend.is_device() || directed_backend().is_some() {
+        EngineConfig::real_model(backend, gpu_index)
     } else {
-        Ok(EngineConfig {
+        EngineConfig {
             backend,
             gpu_index,
             ..EngineConfig::default()
-        })
-    }
+        }
+    };
+    Ok(base.with_claimed_memory(claim_host_bytes))
 }
 
 /// The engine config for the ASSESSMENT instance (the CPU-cheap admission path: manifest/claim
@@ -1242,6 +1246,11 @@ pub(crate) struct RoleBinding {
     /// The quotas the admission funnel derived — the grant-containment baseline a later live
     /// module switch compares its re-admitted quotas against (fail closed, ABI §10.3 step 3).
     pub(crate) quotas: Option<daemon_vhc_proto::AdmittedQuotas>,
+    /// The admitted claim's hard-accountable HOST tier: the guest linear-memory ceiling the
+    /// experiment declared for this exact config (`decl_for_config` -> `da_claim`), already checked
+    /// against the lane's claim bounds and the owner's caps by the funnel. The join engine enforces
+    /// it as the sandbox cap, so no host constant governs an admitted run's memory.
+    pub(crate) claim_host_bytes: u64,
 }
 
 /// Author the role-session binding for a resolved genesis run: re-run the admission funnel over
@@ -1364,6 +1373,12 @@ pub(crate) fn role_binding(
     );
     run.claim_bytes = admission.claim_bytes.clone();
     run.manifest_bytes = admission.manifest_bytes.clone();
+    // The exactly-metered host-side staging ceiling, from the claim's peak tier (ABI §9.1): the
+    // bytes a module stages host-side (`stage_state`, `create_from`, `buffer_append` — an outgoing
+    // committed update is built through the last of these) above its linear-memory floor, which the
+    // engine caps separately from the claim's hard tier. Previously left uncapped on this path;
+    // wiring it is the other half of "the claim is what governs, not a host constant".
+    run.hard_accountable_host_bytes = admission.claim.declared_peak.host;
     admission.apply_quotas(&mut run);
     // Provision the state plane from the genesis state contract (§6.3): the run-pinned
     // `state_chunk_size` the streamed det-lane fold runs under (`None` = no host-side state).
@@ -1392,6 +1407,7 @@ pub(crate) fn role_binding(
         own_cert: cert,
         trusted_bases,
         quotas: admission.quotas.clone(),
+        claim_host_bytes: admission.claim.hard_accountable.host,
     })
 }
 

@@ -112,12 +112,14 @@ fn delayed_committed_payloads_stall_then_catch_up() {
     // The AFFIRMATIVE stall + recovery evidence, pinned as the exact ordered decision shapes
     // (tag, round) of the guest's voices — not just a count:
     //  - the clean run voices the full per-round ladder, digest included;
-    //  - the faulted run's round-0 record was consumed yet produced NO (4,0) digest voice before
-    //    round 1's training — the OBSERVED stall (the driver could not mint the committed set);
-    //  - (2,1)/(3,1) exist at all — the OBSERVED recovery: the round driver trains + commits
-    //    round 1 only after its round-1 open successfully ingested the held round 0 (a
-    //    still-stalled driver skips training and voices nothing);
-    //  - the single (4,1) is the caught-up fold's terminal digest.
+    //  - `stalled_voices` is the faulted worker's voice shape at the instant BEFORE round 0's
+    //    payloads became fetchable: its record had long since been delivered and it had still
+    //    voiced NO (4, 0) — the OBSERVED stall. Under module-driven custody the guest cannot mint
+    //    a committed set it cannot fetch, so the round simply does not fold;
+    //  - the faulted run then voices the SAME ladder as the clean one: the detour delays the fold,
+    //    it does not skip it — the round-0 digest is real evidence the peer owes the coordinator,
+    //    and it lands as soon as the archive catches up (before round 1 trains, which is what
+    //    keeps the two runs' state identical).
     let shape = |w: &daemon_vhc_testkit::GenesisWorkerReport| -> Vec<(u64, u64)> {
         w.voices.iter().map(|(t, r, _)| (*t, *r)).collect()
     };
@@ -127,13 +129,19 @@ fn delayed_committed_payloads_stall_then_catch_up() {
         "clean run: theta+commitment+digest per round"
     );
     assert_eq!(
-        shape(w),
-        vec![(2, 0), (3, 0), (2, 1), (3, 1), (4, 1)],
-        "faulted run: round 0 stalls at its record (no (4,0)), round 1 trains + commits after \
-         the catch-up ingest, and the terminal digest is the caught-up fold"
+        w.stalled_voices.as_deref(),
+        Some([(2, 0), (3, 0)].as_slice()),
+        "faulted run: round 0's record was delivered and produced NO digest while its committed \
+         payloads were unfetchable — the observed stall"
     );
-    // The detour's recorded decisions: theta+commitment per round + the single (final) digest.
-    assert_eq!(w.replay_decisions, 5);
+    assert_eq!(
+        shape(w),
+        vec![(2, 0), (3, 0), (4, 0), (2, 1), (3, 1), (4, 1)],
+        "faulted run: the caught-up round 0 folds and voices before round 1 trains, so the \
+         detour reproduces the clean ladder"
+    );
+    // The detour's recorded decisions: theta+commitment+digest per round.
+    assert_eq!(w.replay_decisions, 6);
     assert!(faulted.is_green());
 
     // Catch-up parity: the detour changes the path, never the state — the final guest-voiced

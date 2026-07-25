@@ -24,9 +24,20 @@ pub struct ModuleDecl {
     pub abi_minor: u32,
     /// Channels the module publishes/subscribes on (manifest `channels`, §6.2).
     pub channels: Vec<u32>,
-    /// Long-lived host-accountable state bytes (params, queues, config) — the module's floor.
+    /// Long-lived host-accountable state bytes — for a wasm module, its **guest linear-memory
+    /// ceiling** (params, queues, config, fold-window buffers, decoded payload rows).
+    ///
+    /// Linear memory never shrinks, so a module's transient peak IS its long-lived floor: whatever
+    /// it touches once, the host reserves for its lifetime. This tier therefore accounts the
+    /// module's peak linear memory, and it is the tier the host ENFORCES as the sandbox's memory
+    /// cap (`EngineConfig::with_claimed_memory` — the ABI §9.1 "resources the host meters exactly",
+    /// metered by the pooling allocator itself). Declare it from a measurement, at the geometry the
+    /// run admits under ([`GuestModule::decl_for_config`]).
     pub host_state_bytes: u64,
-    /// Transient host scratch above the state floor (decode buffers, staging copies).
+    /// Transient host scratch ABOVE the linear-memory floor: the host-side bytes the module stages
+    /// but never holds in linear memory — staged sections and buffers it seals (`create_from`,
+    /// `buffer_append`), e.g. an outgoing committed update built append-by-append. Metered exactly
+    /// too (against the peak tier), just against a different resource.
     pub host_scratch_bytes: u64,
     /// Long-lived device-resident bytes (0 for a pure-bridge or host-only module — device
     /// residency is host-mechanism under the §2.5 bridge).
@@ -76,6 +87,25 @@ pub trait GuestModule: Sized {
 /// but claims account bytes; 4 KiB keeps tiers honest without gifting slack).
 const CLAIM_PAGE: u64 = 4096;
 
+/// The **linear-memory floor of a wasm32 Rust `cdylib`** — the bytes the module's image needs
+/// before any declared state exists: the linker's initial memory (the 1 MiB default shadow stack,
+/// the data segments, the first heap pages) plus the allocator arena the SDK's own event-frame and
+/// CBOR scratch touches on the first slice.
+///
+/// It is a floor on [`ModuleDecl::host_state_bytes`], applied here rather than left to each author,
+/// because that tier is what the host ENFORCES as the sandbox's linear-memory cap
+/// (`EngineConfig::with_claimed_memory`): a module that declares only its own working set is not
+/// making a smaller claim, it is making a false one — the runtime beneath it does not become
+/// smaller for having gone undeclared, and the instance simply fails to come up.
+///
+/// **Measured, not guessed**: every guest in `crates/vhc/guests` fails to instantiate at a 1 MiB
+/// cap ("module memory does not fit in pooling allocator requirements") and comes up at 2 MiB,
+/// independent of its size — it is the toolchain's floor, not the module's. The declared figure is
+/// double the measured minimum so a toy module has real working margin. A floor can only ever
+/// RAISE a claim, so it cannot hide an over-run, and any module whose own derived figure is larger
+/// (the trainer's is ~59 MiB at the ceremony geometry) is unaffected.
+pub const WASM_LINEAR_MEMORY_FLOOR_BYTES: u64 = 4 << 20;
+
 fn round_page(v: u64) -> u64 {
     v.div_ceil(CLAIM_PAGE) * CLAIM_PAGE
 }
@@ -90,7 +120,8 @@ fn uint(v: u64) -> ciborium::value::Value {
 
 /// Derive the tiered memory claim (ABI §9.1) from the declaration:
 ///
-/// - `hard_accountable` = the declared state floor (page-rounded) — what the host must reserve;
+/// - `hard_accountable` = the declared state floor, lifted to [`WASM_LINEAR_MEMORY_FLOOR_BYTES`]
+///   and page-rounded — what the host must reserve, and for a wasm module what it enforces;
 /// - `workspace`       = the declared transient scratch (page-rounded);
 /// - `declared_peak`   = state + scratch (page-rounded) — one extra transient copy of
 ///   everything, the conservative headroom a module may briefly hold beyond the accounted
@@ -104,19 +135,17 @@ pub fn derive_claim(decl: &ModuleDecl) -> Vec<u8> {
     let tier = |d: u64, h: u64| {
         ciborium::value::Value::Map(vec![(text("device"), uint(d)), (text("host"), uint(h))])
     };
+    let host_state = decl.host_state_bytes.max(WASM_LINEAR_MEMORY_FLOOR_BYTES);
     let claim = ciborium::value::Value::Map(vec![
         (
             text("hard_accountable"),
-            tier(
-                round_page(decl.device_state_bytes),
-                round_page(decl.host_state_bytes),
-            ),
+            tier(round_page(decl.device_state_bytes), round_page(host_state)),
         ),
         (
             text("declared_peak"),
             tier(
                 round_page(decl.device_state_bytes + decl.device_scratch_bytes),
-                round_page(decl.host_state_bytes + decl.host_scratch_bytes),
+                round_page(host_state + decl.host_scratch_bytes),
             ),
         ),
         (
