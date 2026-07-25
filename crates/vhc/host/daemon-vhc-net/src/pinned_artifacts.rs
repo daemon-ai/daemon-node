@@ -12,7 +12,9 @@
 //! artifact map is `name -> (url, blake3)`, and the run's publisher writes each object at the key
 //! that url names: `modules/<blake3>.wasm` for a module and, for the chunk-addressed corpus,
 //! `corpus/<manifest blake3>.cbor` / `corpus/<tokenizer blake3>.json` / `corpus/<fold>.bin`
-//! (ABI §12.7 [CC-7]; `xtask publish-corpus`).
+//! (ABI §12.7 [CC-7]; `xtask publish-corpus`). Both sides derive those keys from
+//! [`PublishedArtifact`](crate::PublishedArtifact) — the one place the scheme is spelled, so a
+//! genesis cannot pin a url the publisher does not write.
 //!
 //! The committed-PAYLOAD plane is a different namespace on the same store: [RS-4]'s
 //! `payload/<blake3-hex>`, where the module's own `payload_put` objects and the checkpoint family

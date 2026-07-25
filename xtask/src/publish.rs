@@ -17,6 +17,10 @@
 //!   `corpus/<manifest_blake3>.cbor`. Prints the genesis `corpus_manifest` pin + the complete
 //!   artifact list a trainer role's grants must carry.
 //!
+//! Every key above comes from [`PublishedArtifact`] — the shared definition the genesis-authoring
+//! paths derive their artifact-map urls from — so what this command writes and what a genesis pins
+//! cannot drift apart. `genesis_authoring_pins_the_keys_the_publisher_writes` is the gate.
+//!
 //! xtask is maintainer dev tooling (not the shipped node); its egress rides the SSRF-safe
 //! [`daemon_egress::EgressClient`] and the fs reads are covered by main.rs's crate-level
 //! `#![allow(clippy::disallowed_methods)]`.
@@ -25,7 +29,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
-use daemon_vhc_net::{HttpPresignClient, PresignClient, PresignOp, PresignRequest, RunId};
+use daemon_vhc_net::{
+    HttpPresignClient, PresignClient, PresignOp, PresignRequest, PublishedArtifact, RunId,
+};
 use daemon_vhc_proto::corpus::CorpusManifest;
 
 /// The presign coordinator target + auth (mirrors the worker's `JoinCredentials` auth choices).
@@ -92,8 +98,9 @@ async fn put_artifact(
 pub fn publish_module(module: PathBuf, target: Target) -> Result<()> {
     let bytes =
         std::fs::read(&module).with_context(|| format!("read module {}", module.display()))?;
-    let hash = blake3::hash(&bytes).to_hex().to_string();
-    let path = format!("modules/{hash}.wasm");
+    let content_id = daemon_vhc_proto::blake3_hash(&bytes);
+    let hash = content_id.to_hex();
+    let path = PublishedArtifact::Module(content_id).object_path();
     let rt = tokio::runtime::Runtime::new().context("tokio runtime")?;
     rt.block_on(async {
         let presign = target.presign_client()?;
@@ -120,7 +127,8 @@ pub fn publish_corpus(manifest_path: PathBuf, target: Target) -> Result<()> {
         .with_context(|| format!("read {}", manifest_path.display()))?;
     let manifest = CorpusManifest::from_canonical_bytes(&manifest_bytes)
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", manifest_path.display()))?;
-    let manifest_hash = daemon_vhc_proto::blake3_hash(&manifest_bytes).to_hex();
+    let manifest_id = daemon_vhc_proto::blake3_hash(&manifest_bytes);
+    let manifest_hash = manifest_id.to_hex();
 
     let tokenizer_bytes = std::fs::read(dir.join("tokenizer.json"))
         .context("read tokenizer.json beside the manifest")?;
@@ -151,23 +159,27 @@ pub fn publish_corpus(manifest_path: PathBuf, target: Target) -> Result<()> {
                 "shard {i} bytes do not fold to the manifest identity {}",
                 shard.shard_hash.to_hex()
             );
-            let path = format!("corpus/{}.bin", shard.shard_hash.to_hex());
+            let path = PublishedArtifact::CorpusShard(shard.shard_hash).object_path();
             put_artifact(&presign, &egress, &run, &path, &bytes).await?;
             println!("  shard {i} -> r2://{path} ({} bytes)", bytes.len());
         }
-        let tokenizer_key = format!("corpus/{}.json", manifest.tokenizer.hash.to_hex());
+        let tokenizer_key =
+            PublishedArtifact::CorpusTokenizer(manifest.tokenizer.hash).object_path();
         put_artifact(&presign, &egress, &run, &tokenizer_key, &tokenizer_bytes).await?;
         println!(
             "  tokenizer -> r2://{tokenizer_key} ({} bytes)",
             tokenizer_bytes.len()
         );
         // Upload the manifest LAST (so a partial corpus never has a resolvable manifest).
-        let manifest_key = format!("corpus/{manifest_hash}.cbor");
+        let manifest_key = PublishedArtifact::CorpusManifest(manifest_id).object_path();
         put_artifact(&presign, &egress, &run, &manifest_key, &manifest_bytes).await?;
         anyhow::Ok(())
     })?;
 
-    println!("published corpus manifest to r2://corpus/{manifest_hash}.cbor");
+    println!(
+        "published corpus manifest to {}",
+        PublishedArtifact::CorpusManifest(manifest_id).url()
+    );
     println!("  genesis `corpus_manifest` pin        = {manifest_hash}");
     println!(
         "  tokenizer artifact blake3            = {}",

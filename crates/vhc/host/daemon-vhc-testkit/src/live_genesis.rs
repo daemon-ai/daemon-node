@@ -22,6 +22,7 @@ use std::path::Path;
 
 use ciborium::value::Value;
 
+use daemon_vhc_net::PublishedArtifact;
 use daemon_vhc_proto::envelope::{Access, GlobalBatch, StopCondition};
 use daemon_vhc_proto::genesis::{
     ChannelDecl, GenesisEnvelope, Identities, RoleEntry, RoleGrants, RunSection, SnapshotArtifact,
@@ -62,8 +63,9 @@ pub struct LiveGenesis {
 /// the bytes.
 ///
 /// Carrying the url (rather than the id alone) is what keeps a staging harness honest. The run-time
-/// artifact plane resolves a pinned content id at the url the ENVELOPE commits — `corpus/<manifest
-/// blake3>.cbor`, `corpus/<fold>.bin` (ABI §12.7 [CC-7], what `xtask publish-corpus` writes) — which
+/// artifact plane resolves a pinned content id at the url the ENVELOPE commits —
+/// [`PublishedArtifact`]'s `corpus/<manifest blake3>.cbor`, `corpus/<fold>.bin` (ABI §12.7 [CC-7],
+/// what `xtask publish-corpus` writes) — which
 /// is a different namespace from the committed-payload plane's `payload/<blake3>`. A harness that
 /// staged corpus objects under the payload key instead proved only that the payload plane works: it
 /// left the published layout ungated, and the first fleet trainer to reach the data plane died
@@ -217,8 +219,9 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
 
     // The corpus objects the run's content planes serve: the manifest by content hash, each shard
     // by its fold identity (the fixture files are fold-named by the authoring pipeline). Each
-    // carries the url the envelope pins it at, which IS the key the publisher writes.
-    let manifest_url = format!("r2://corpus/{}.cbor", manifest_hash.to_hex());
+    // carries the url the envelope pins it at, derived from [`PublishedArtifact`] — the same key
+    // scheme `xtask publish-corpus` writes at, so this genesis cannot spell a key of its own.
+    let manifest_url = PublishedArtifact::CorpusManifest(manifest_hash).url();
     let mut corpus_objects = vec![CorpusObject {
         id: manifest_hash.0,
         url: manifest_url.clone(),
@@ -242,7 +245,7 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         )
         .expect("read a vendored corpus shard");
         granted.insert(shard.shard_hash);
-        let url = format!("r2://corpus/{}.bin", shard.shard_hash.to_hex());
+        let url = PublishedArtifact::CorpusShard(shard.shard_hash).url();
         artifacts.insert(
             format!("shard-{i}.bin"),
             SnapshotArtifact {

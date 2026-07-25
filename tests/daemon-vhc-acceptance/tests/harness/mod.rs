@@ -409,12 +409,22 @@ pub fn spawn_node_with_budget(
 /// **Why not the payload key.** This used to stage every corpus object under
 /// `runs/<run>/payload/<hex>` — the committed-PAYLOAD plane's key ([RS-4]) — which is not where any
 /// publisher puts a corpus object: `xtask publish-corpus` writes `corpus/<manifest blake3>.cbor`,
-/// `corpus/<tokenizer blake3>.json` and `corpus/<fold>.bin` (ABI §12.7 [CC-7]), and those are the
-/// urls the genesis artifact map commits. Staging at the payload key made the suite agree with the
-/// runtime about a layout NOBODY publishes, so the whole module-driven corpus plane passed green
-/// while being unreachable on a real fleet box: the first trainer to get past init died on a typed
-/// `payload miss` fetching its genesis-pinned corpus manifest. Deriving the key from the envelope's
-/// own url is what makes this lane a gate on the PUBLISHED layout rather than on itself.
+/// `corpus/<tokenizer blake3>.json` and `corpus/<fold>.bin` (ABI §12.7 [CC-7]). Staging at the
+/// payload key made the suite agree with the runtime about a layout NOBODY publishes, so the whole
+/// module-driven corpus plane passed green while being unreachable on a real fleet box: the first
+/// trainer to get past init died on a typed `payload miss` fetching its genesis-pinned corpus
+/// manifest.
+///
+/// **What this lane does NOT prove.** The staging key is derived from the genesis url under test,
+/// so this lane agrees with whatever genesis it is handed — it is a gate on the *runtime* resolving
+/// a pinned id at the *committed* url, not on that url being a key any publisher writes. It is
+/// honest only because `live_genesis` derives its urls from `daemon_vhc_net::PublishedArtifact`,
+/// the one definition `publish-corpus` also writes at. The self-consistency was load-bearing once:
+/// while this lane was green, the FROZEN `ceremony_genesis` — the only genesis a fleet box runs —
+/// pinned an extensionless `corpus/<hash>` that nothing published, and both fleet trainers took a
+/// 404. The gate that forces the publisher and the ceremony authoring to agree by construction is
+/// `xtask` `genesis_pinned_urls_resolve_against_the_publishers_own_keys`, which stages with the
+/// real publisher instead of with the artifact under test.
 pub fn seed_corpus_r2(cluster: &Cluster, run_label: &str, genesis: &LiveGenesis) {
     for object in &genesis.corpus_objects {
         cluster.registry.put_object(

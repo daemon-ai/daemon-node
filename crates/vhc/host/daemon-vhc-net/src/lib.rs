@@ -54,6 +54,9 @@ pub mod iroh_gossip;
 /// commits (cache-first) and delegating every other address to the committed-payload plane.
 pub mod pinned_artifacts;
 pub mod presign;
+/// The one definition of where a run's genesis-pinned objects are published — the key scheme both
+/// the publisher and every genesis-authoring path derive their keys and urls from.
+pub mod published;
 pub mod r2_store;
 /// Run discovery + envelope fetch against the coordinator registry (spec §6.1/§11.1; A1).
 pub mod registry;
@@ -90,6 +93,7 @@ pub use pinned_artifacts::PinnedArtifactStore;
 pub use presign::{
     HttpPresignClient, ObjectKind, PresignClient, PresignOp, PresignRequest, PresignResponse,
 };
+pub use published::PublishedArtifact;
 pub use r2_store::{r2_object_key, R2Store};
 pub use registry::{
     CheckpointPointer, RegistryClient, RosterPublishOutcome, RunArtifact, RunDescriptor, RunState,
