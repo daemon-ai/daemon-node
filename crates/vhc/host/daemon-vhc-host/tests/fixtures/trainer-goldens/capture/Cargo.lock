@@ -1705,6 +1705,10 @@ name = "daemon-vhc-det"
 version = "0.0.1"
 
 [[package]]
+name = "daemon-vhc-guest-build"
+version = "0.0.1"
+
+[[package]]
 name = "daemon-vhc-host"
 version = "0.0.1"
 dependencies = [
@@ -1716,8 +1720,8 @@ dependencies = [
  "burn-router",
  "ciborium",
  "daemon-vhc-abi",
- "daemon-vhc-det",
  "daemon-vhc-proto",
+ "libc",
  "serde",
  "thiserror 2.0.18",
  "wasmtime",
@@ -1733,6 +1737,15 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "serde",
+]
+
+[[package]]
+name = "daemon-vhc-sdk-consensus"
+version = "0.0.1"
+dependencies = [
+ "ciborium",
+ "daemon-vhc-proto",
+ "serde",
  "xxhash-rust",
 ]
 
@@ -1743,6 +1756,7 @@ dependencies = [
  "burn",
  "ciborium",
  "daemon-vhc-det",
+ "daemon-vhc-sdk-consensus",
  "serde",
 ]
 
@@ -5199,8 +5213,10 @@ dependencies = [
  "blake3",
  "ciborium",
  "daemon-vhc-abi",
+ "daemon-vhc-guest-build",
  "daemon-vhc-host",
  "daemon-vhc-proto",
+ "daemon-vhc-sdk-consensus",
  "daemon-vhc-sdk-profiles",
  "serde",
  "serde_json",

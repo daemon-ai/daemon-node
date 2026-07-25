@@ -54,6 +54,20 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
         |mut c: Caller<'_, Host>, buf_ptr: u32, buf_cap: u32| -> Result<u64, wasmtime::Error> {
             let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("next_event")?;
+                // The bounded-guest-memory MEASUREMENT (the declared-budget evidence surface): wasm
+                // linear memory never shrinks, so its size at the one seam every event slice passes
+                // through is the run's high-water. Recorded here so a run's real footprint is a
+                // measured number a gate can assert against its DECLARED budget, instead of being
+                // inferred from "it did not trap".
+                if let Some(size) = c
+                    .get_export("memory")
+                    .and_then(wasmtime::Extern::into_memory)
+                    .map(|m| m.data_size(&c) as u64)
+                {
+                    let shared = c.data().shared.clone();
+                    let mut st = shared.state.lock().expect("pump lock");
+                    st.guest_memory_high_water = st.guest_memory_high_water.max(size);
+                }
                 // Mandatory-retry rule: after NeedCapacity the re-call must be big enough (§4.1).
                 if let Some(required) = c.data().slice.pending_next {
                     if u64::from(buf_cap) < required {
@@ -557,6 +571,86 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 st.buffers
                     .create(Arc::new(bytes))
                     .map_err(|code| Trap::new(code, "create_from", None, "buffer quota (§7.3)"))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    // buffer_open / buffer_append / buffer_seal — the INCREMENTAL twin of `create_from` (ABI
+    // minor 4, the host-resource layer only: no wire, no contract, no new event). `create_from`
+    // requires the whole object in linear memory at once, which is precisely the residency a
+    // producer of a large committed update cannot afford (the emit-side mirror of [SF-R3]: the
+    // consuming side range-reads the payload out of a host buffer, so the producing side must be
+    // able to build one without ever holding it). The shape mirrors `state_open/emit/seal`: open a
+    // stream, append bounded spans, seal into exactly the kind-8 `BufferHandle` `create_from`
+    // would have returned — usable by `payload_put` unchanged.
+    //
+    // dc class throughout: stream ids are counter-deterministic per instance, the appended bytes
+    // come from replay-reproduced guest memory, and the sealed handle is the buffer table's next
+    // deterministic id — so no journal record, exactly like `create_from`.
+    linker.func_wrap(
+        NS_VHC_V2,
+        "buffer_open",
+        |mut c: Caller<'_, Host>| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
+                c.data_mut().enter("buffer_open")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                Ok(st.buffer_streams.open())
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_VHC_V2,
+        "buffer_append",
+        |mut c: Caller<'_, Host>,
+         stream: u64,
+         ptr: u32,
+         len: u32|
+         -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
+                c.data_mut().enter("buffer_append")?;
+                let bytes = read_guest(c, ptr, len)?;
+                // Same hard-accountable meter `create_from` charges: the growing host-side object
+                // is a guest-initiated allocation the host meters exactly (ABI §9.1).
+                {
+                    let d = c.data_mut();
+                    d.accountable_staged_bytes += u64::from(len);
+                    if d.hard_accountable_host_bytes != 0
+                        && d.accountable_staged_bytes > d.hard_accountable_host_bytes
+                    {
+                        return Err(Trap::new(
+                            TrapCode::BudgetMemory,
+                            "buffer_append",
+                            None,
+                            "hard-accountable host cap breached (attributable, ABI §9.1)",
+                        ));
+                    }
+                }
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                st.buffer_streams
+                    .append(stream, &bytes)
+                    .map_err(|e| Trap::new(TrapCode::InvalidHandle, "buffer_append", None, e))
+            })(&mut c);
+            stash(&mut c, r)
+        },
+    )?;
+    linker.func_wrap(
+        NS_VHC_V2,
+        "buffer_seal",
+        |mut c: Caller<'_, Host>, stream: u64| -> Result<u64, wasmtime::Error> {
+            let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
+                c.data_mut().enter("buffer_seal")?;
+                let shared = c.data().shared.clone();
+                let mut st = shared.state.lock().expect("pump lock");
+                let bytes = st
+                    .buffer_streams
+                    .take(stream)
+                    .map_err(|e| Trap::new(TrapCode::InvalidHandle, "buffer_seal", None, e))?;
+                st.buffers
+                    .create(Arc::new(bytes))
+                    .map_err(|code| Trap::new(code, "buffer_seal", None, "buffer quota (§7.3)"))
             })(&mut c);
             stash(&mut c, r)
         },

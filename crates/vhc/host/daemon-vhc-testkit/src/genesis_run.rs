@@ -20,9 +20,11 @@
 //!   worker's node key and delivered to the coordinator pump as host-verified frames (the same
 //!   relay shape as the worker binary's self-driven join);
 //! - **payload plane**: the harness services `payload_put`, verifies the guest's tag-3 voice
-//!   covers exactly the serviced bytes, authors the availability `StorageReceipt`, and stages the
-//!   record-listed payload set to every worker (record order, §5.11) as the trainer's
-//!   `[1, round, peer32, payload]` kind-0 wrapper.
+//!   covers exactly the serviced bytes, authors the availability `StorageReceipt`, and makes the
+//!   record-listed payload set FETCHABLE to every worker (a content-addressed store keyed by the
+//!   record's blake3). A committed payload reaches the guest exactly as it does on the fleet —
+//!   through the module's own `payload_get` into a host buffer it range-reads ([SF-R3]) — never as
+//!   staged linear-memory bytes.
 //!
 //! **Round digests are the guest's own det-lane voice** (the tag-4 frame, computed in-guest over
 //! the post-ingest canonical state) — never a host-side re-derivation. Cross-worker digest
@@ -97,10 +99,10 @@ fn uint(v: u64) -> Value {
 // -- the fault-injection rig (adversarial-suite seeds, architecture §4.2) -------------------------
 //
 // Coordinator→worker deliveries pass through a deterministic [`FaultPlan`]: authoritative frames
-// can be **dropped** or **duplicated** per `(worker, round, kind)` rule, and a round's
-// committed-payload staging can be **delayed** past its record (the straggle trigger at the
-// round-driver layer: a record whose payloads cannot be minted stalls; the guest catches up when
-// the payloads arrive at the next open).
+// can be **dropped** or **duplicated** per `(worker, round, kind)` rule, and a round's committed
+// payloads can be made **unfetchable** past their record (the straggle trigger: the record lands,
+// the archive has not, so the guest's `payload_get`s stay outstanding and the round cannot mint;
+// the guest catches up when the payloads become fetchable at the next open).
 
 /// Which coordinator→worker authoritative frame a [`FaultRule`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,8 +140,9 @@ pub struct FaultRule {
 pub struct FaultPlan {
     /// Frame-plane faults (drop / duplicate).
     pub rules: Vec<FaultRule>,
-    /// Payload-plane faults: `(worker, round)` pairs whose committed payloads are staged only at
-    /// the NEXT round's open instead of before the record — the straggle trigger (module docs).
+    /// Payload-plane faults: `(worker, round)` pairs whose committed payloads become fetchable
+    /// only at the NEXT round's open instead of before the record — the straggle trigger (module
+    /// docs).
     pub delay_payload_staging: Vec<(usize, u64)>,
 }
 
@@ -354,17 +357,6 @@ fn batch_wrapper(round: u64, step: u32, sequences: u32, tokens: &[u32]) -> Vec<u
     to_canonical_vec(&v).expect("batch wrapper")
 }
 
-/// The trainer's staged committed-payload wrapper: `[1, round, peer32, payload]`.
-fn update_wrapper(round: u64, peer: &PeerId, payload: &[u8]) -> Vec<u8> {
-    let v = Value::Array(vec![
-        uint(1),
-        uint(round),
-        Value::Bytes(peer.0.to_vec()),
-        Value::Bytes(payload.to_vec()),
-    ]);
-    to_canonical_vec(&v).expect("update wrapper")
-}
-
 /// Decode one published frame's module-authored `[tag, round, bytes]` payload.
 fn decode_tagged(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
     let v: Value = ciborium::de::from_reader(frame).ok()?;
@@ -451,6 +443,11 @@ pub struct GenesisWorkerReport {
     pub replay_matched: bool,
     /// How many decisions the replay re-derived.
     pub replay_decisions: usize,
+    /// The voice shape `(tag, round)` captured the instant BEFORE a withheld round's committed
+    /// payloads became fetchable — `None` when no payload-plane fault targeted this worker. The
+    /// affirmative stall evidence: a record whose payloads the archive has not caught up with
+    /// yields no digest, because the guest cannot mint a set it cannot fetch.
+    pub stalled_voices: Option<Vec<(u64, u64)>>,
 }
 
 impl GenesisWorkerReport {
@@ -639,12 +636,23 @@ struct LiveWorker {
     coord_seq: u64,
     /// The guest's `payload_put` bytes, serviced by the harness.
     puts: Vec<Vec<u8>>,
-    /// Round → the round's sealed payload set (stashed at commit, staged at the record).
+    /// Round → the round's sealed payload set (stashed at commit, published at the record).
     stash: BTreeMap<u64, BTreeMap<PeerId, Vec<u8>>>,
-    /// Pre-wrapped committed-payload staging bytes whose ingest was delayed past their record
-    /// (the straggle trigger): round → record-ordered wrappers, staged at the NEXT open (the
-    /// catch-up input).
+    /// The FETCHABLE committed payloads, keyed by content address: what this worker's
+    /// `payload_get` is served from. The harness plays the content-addressed plane, so a payload
+    /// the store does not hold is simply not yet fetchable — which is the straggle, expressed
+    /// where the fleet expresses it.
+    store: BTreeMap<[u8; 32], Vec<u8>>,
+    /// `payload_get` ops whose content address the store did not hold when they were taken —
+    /// retried on every service pass (never dropped: an unfetchable payload stalls, it does not
+    /// fail).
+    deferred_gets: Vec<(u64, [u8; 32])>,
+    /// Committed payloads withheld from [`Self::store`] past their record (the straggle trigger):
+    /// round → the record-ordered bytes, published at the NEXT open (the catch-up input).
     held_payloads: BTreeMap<u64, Vec<Vec<u8>>>,
+    /// The worker's voice shape captured the instant before a withheld round became fetchable —
+    /// the affirmative stall evidence (see [`GenesisWorkerReport::stalled_voices`]).
+    stalled_voices: Option<Vec<(u64, u64)>>,
 }
 
 impl LiveWorker {
@@ -703,8 +711,14 @@ impl LiveWorker {
             .collect()
     }
 
+    /// The network + async-runtime seat's duties: acknowledge the guest's own committed-container
+    /// `payload_put`, and serve every record-listed `payload_get` out of the content-addressed
+    /// store. A get whose content address is not (yet) fetchable is HELD, not failed — the guest
+    /// is entitled to a payload the record listed, so the round stalls until the archive catches
+    /// up.
     fn service_ops(&mut self) -> Result<(), String> {
-        for (op, request) in self.pump.take_op_requests() {
+        let taken = self.pump.take_op_requests();
+        for (op, request) in taken {
             match request {
                 OpRequest::PayloadPut { bytes } => {
                     self.puts.push(bytes.to_vec());
@@ -712,12 +726,62 @@ impl LiveWorker {
                         .complete_op(op, OpOutcome::PutDone)
                         .map_err(|e| format!("put completion: {e}"))?;
                 }
+                OpRequest::PayloadGet { hash } => self.deferred_gets.push((op, hash)),
                 other => {
                     return Err(format!(
                         "unexpected op request from the trainer guest: {other:?}"
                     ))
                 }
             }
+        }
+        let mut still_pending = Vec::new();
+        for (op, hash) in std::mem::take(&mut self.deferred_gets) {
+            match self.store.get(&hash) {
+                Some(bytes) => {
+                    self.pump
+                        .complete_op(
+                            op,
+                            OpOutcome::GetDone {
+                                bytes: bytes.clone(),
+                            },
+                        )
+                        .map_err(|e| format!("get completion: {e}"))?;
+                }
+                None => still_pending.push((op, hash)),
+            }
+        }
+        self.deferred_gets = still_pending;
+        Ok(())
+    }
+
+    /// Make a committed payload fetchable on this worker's seat (content-addressed, exactly as the
+    /// record names it).
+    fn publish_committed(&mut self, payload: &[u8]) {
+        self.store.insert(blake3_hash(payload).0, payload.to_vec());
+    }
+
+    /// Release every payload withheld past its record — the archive catching up — and let the
+    /// stalled rounds fold before the next open reaches the guest (a catch-up fold that landed
+    /// AFTER the next round trained would fork this worker's state from a clean run's). Captures
+    /// the stall evidence first: the voice shape at the moment the payloads were still missing.
+    fn release_held_payloads(&mut self, timeout: Duration) -> Result<(), String> {
+        if self.held_payloads.is_empty() {
+            return Ok(());
+        }
+        if self.stalled_voices.is_none() {
+            self.stalled_voices = Some(self.voices().iter().map(|(t, r, _)| (*t, *r)).collect());
+        }
+        let held = std::mem::take(&mut self.held_payloads);
+        for payloads in held.values() {
+            for p in payloads {
+                self.publish_committed(p);
+            }
+        }
+        for round in held.keys() {
+            let round = *round;
+            self.wait_for(timeout, "the caught-up round digest", |v| {
+                voices_for(v, 4, round) >= 1
+            })?;
         }
         Ok(())
     }
@@ -887,7 +951,10 @@ pub fn genesis_whole_run(
             coord_seq: 0,
             puts: Vec::new(),
             stash: BTreeMap::new(),
+            store: BTreeMap::new(),
+            deferred_gets: Vec::new(),
             held_payloads: BTreeMap::new(),
+            stalled_voices: None,
         });
     }
 
@@ -931,22 +998,14 @@ pub fn genesis_whole_run(
         match &msg {
             VhcMessage::RoundOpen(ro) => {
                 let round = ro.round;
-                // Stage each worker's assigned batches, then deliver the open — first flushing any
-                // payload wrappers held from an earlier record (the straggle catch-up input,
-                // staged BEFORE this open so the driver ingests the stalled round then trains the
-                // new one; the guest folds the caught-up round's digest into its state — the
-                // compute@2 trainer voices tag-4 only from the record handler).
+                // Stage each worker's assigned batches, then deliver the open — first making any
+                // payload withheld from an earlier record fetchable (the straggle catch-up input,
+                // published BEFORE this open and folded before it, so the worker ingests the
+                // stalled round and only then trains the new one).
                 for (i, worker) in workers.iter_mut().enumerate() {
-                    let held: Vec<Vec<Vec<u8>>> = worker.held_payloads.values().cloned().collect();
-                    for wrappers in held {
-                        for wb in wrappers {
-                            worker
-                                .pump
-                                .stage_payload(wb, None)
-                                .map_err(|e| format!("worker {i} stage held update: {e}"))?;
-                        }
-                    }
-                    worker.held_payloads.clear();
+                    worker
+                        .release_held_payloads(spec.timeout)
+                        .map_err(|e| format!("worker {i} catch-up: {e}"))?;
 
                     let mine = assigned_len(ro.batch, ro.seed, &roster, &worker.peer);
                     if mine == 0 || !mine.is_multiple_of(u64::from(spec.steps_per_round)) {
@@ -1035,31 +1094,27 @@ pub fn genesis_whole_run(
                     return Err(format!("round {round} record carries no inline entries"));
                 }
                 for (i, worker) in workers.iter_mut().enumerate() {
-                    // Record-listed staging order (§5.11): resolve each entry to its sealed
-                    // bytes and pre-wrap it as the trainer's `[1, round, peer, payload]` kind-0
-                    // staging wrapper.
+                    // Record-listed order (§5.11): resolve each entry to its sealed bytes, which
+                    // the worker's seat then serves content-addressed to the guest's `payload_get`.
                     let sealed = worker.stash.remove(&round).unwrap_or_default();
                     let ordered: Vec<Vec<u8>> = entries
                         .iter()
                         .map(|e| {
                             sealed
                                 .get(&e.peer)
-                                .map(|p| update_wrapper(round, &e.peer, p))
+                                .cloned()
                                 .ok_or_else(|| "record entry for unknown peer".to_string())
                         })
                         .collect::<Result<_, String>>()?;
                     if spec.faults.payloads_delayed(i, round) {
-                        // The straggle trigger: the record arrives, its payloads do not (staged at
-                        // the next open instead) — the driver stalls; the compute@2 trainer voices
-                        // nothing for the stalled round (the straggle detour is observable as the
-                        // absent tag-4 + the preserved final-state agreement).
+                        // The straggle trigger: the record arrives, its payloads are not fetchable
+                        // (published at the next open instead) — the guest's `payload_get`s stay
+                        // outstanding, so the round cannot mint and voices nothing until the
+                        // archive catches up.
                         worker.held_payloads.insert(round, ordered);
                     } else {
-                        for wb in &ordered {
-                            worker
-                                .pump
-                                .stage_payload(wb.clone(), None)
-                                .map_err(|e| format!("worker {i} stage update: {e}"))?;
+                        for p in &ordered {
+                            worker.publish_committed(p);
                         }
                     }
                     deliver_record_under_faults(
@@ -1077,7 +1132,9 @@ pub fn genesis_whole_run(
                         || spec.faults.action(i, round, FrameKind::Record)
                             == Some(FaultAction::Drop)
                     {
-                        // Straggling (or record-less) workers voice no digest for this round.
+                        // A record-less worker never folds this round; a straggling one folds it
+                        // only once its committed set becomes fetchable (at the next open), so
+                        // neither has a digest to relay here.
                         continue;
                     }
                     let voices =
@@ -1104,37 +1161,13 @@ pub fn genesis_whole_run(
         }
     }
 
-    // Payloads delayed in the FINAL driven round have no next open in the closed drive; pull one
-    // more coordinator open so the stragglers catch up (the coordinator keeps opening rounds).
-    // The catch-up ingest happens inside the open's event slice; the new round's tag-3 commitment
-    // voice is the completion barrier (the caught-up digest folds into state, unvoiced).
-    if workers.iter().any(|w| !w.held_payloads.is_empty()) {
-        let mut opened = false;
-        while !opened {
-            let (sender, evidence, msg) = coord.next_decision(spec.timeout)?;
-            if let VhcMessage::RoundOpen(ro) = &msg {
-                for (i, worker) in workers.iter_mut().enumerate() {
-                    let held: Vec<Vec<Vec<u8>>> = worker.held_payloads.values().cloned().collect();
-                    for wrappers in held {
-                        for wb in wrappers {
-                            worker
-                                .pump
-                                .stage_payload(wb, None)
-                                .map_err(|e| format!("worker {i} stage held update: {e}"))?;
-                        }
-                    }
-                    worker.held_payloads.clear();
-                    let mine = assigned_len(ro.batch, ro.seed, &roster, &worker.peer);
-                    worker.stage_batches(i, ro.round, mine, spec.steps_per_round, 1)?;
-                    worker.deliver_from_coordinator(sender, &msg, evidence.clone())?;
-                    let round = ro.round;
-                    worker.wait_for(spec.timeout, "catch-up commitment", |v| {
-                        voices_for(v, 3, round) >= 1
-                    })?;
-                }
-                opened = true;
-            }
-        }
+    // Payloads withheld in the FINAL driven round have no next open to be released at. Release
+    // them here: under module-driven custody the catch-up needs no further coordinator decision —
+    // the round folds the moment its committed set becomes fetchable.
+    for (i, worker) in workers.iter_mut().enumerate() {
+        worker
+            .release_held_payloads(spec.timeout)
+            .map_err(|e| format!("worker {i} final catch-up: {e}"))?;
     }
 
     // Clean stop; §8.7 replay-verify each worker (bit-for-bit decisions).
@@ -1181,6 +1214,12 @@ pub fn genesis_whole_run(
         // self-sealed folds rebuild into the replay-side state chunk store; without the chunk
         // size the guest's state_open would trap NotProvisioned and the replay would diverge).
         script.state_chunk_size = trainer_state_chunk_size();
+        // §8.7: bulk payloads are RE-FETCHED at replay, never copied into the journal. The harness
+        // plays the content-addressed archive here exactly as it did during the run — the worker's
+        // own store IS that archive.
+        script
+            .payloads
+            .extend(w.store.iter().map(|(hash, bytes)| (*hash, bytes.clone())));
         let replayed = replay(&w.engine, worker_wasm, &w.config, &phase_a_grants(), script)
             .map_err(|e| format!("worker {i} replay harness: {e}"))?;
         let redriven: Vec<Decision> = replayed
@@ -1197,6 +1236,7 @@ pub fn genesis_whole_run(
             digest,
             replay_matched,
             replay_decisions: redriven.len(),
+            stalled_voices: w.stalled_voices.clone(),
         });
     }
 

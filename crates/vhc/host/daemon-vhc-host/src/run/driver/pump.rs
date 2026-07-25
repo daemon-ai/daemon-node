@@ -115,6 +115,14 @@ pub(crate) struct PumpState {
     /// Instance-scoped by construction: a restart starts empty, so torn (unsealed) folds can
     /// never survive a crash ([SF-4]).
     pub(crate) state: crate::run::state_store::StateStore,
+    /// The high-water mark of the guest's linear memory in bytes, sampled at the `next_event` seam
+    /// (wasm memory never shrinks, so this IS the run's peak residency). The measured half of the
+    /// module's claimed host-accountable footprint: a gate asserts the measurement against the
+    /// admitted claim instead of inferring the footprint from the absence of a trap.
+    pub(crate) guest_memory_high_water: u64,
+    /// Open incremental buffer streams (`buffer_open`/`buffer_append`/`buffer_seal`): the host-side
+    /// accumulation a guest builds a large sealed buffer through without ever holding it whole.
+    pub(crate) buffer_streams: BufferStreams,
     /// Requests awaiting the embedder (the async-runtime bridge): `(op, request)` in issue order.
     pub(crate) op_requests: Vec<(u64, OpRequest)>,
     /// A `Stop` has been enqueued — no further deliveries will be accepted after it.
@@ -145,6 +153,45 @@ pub(crate) struct PumpState {
     /// embedder-visible VALIDATE marker the upgrade transaction gates activation on, independent
     /// of what (or whether) the migrated module publishes. Never set on a non-migrating start.
     pub(crate) migrate_validated: bool,
+}
+
+/// The open incremental buffer streams of one instance (ABI minor 4:
+/// `buffer_open`/`buffer_append`/`buffer_seal`).
+///
+/// Deterministic by construction: stream ids are a per-instance counter, so a replay that
+/// re-executes the same guest code opens the same ids in the same order — which is why the three
+/// imports carry no journal record (the dc class, exactly like `create_from`).
+#[derive(Debug, Default)]
+pub(crate) struct BufferStreams {
+    open: std::collections::BTreeMap<u64, Vec<u8>>,
+    next: u64,
+}
+
+impl BufferStreams {
+    /// Open a fresh stream and return its counter-deterministic id.
+    pub(crate) fn open(&mut self) -> u64 {
+        self.next += 1;
+        self.open.insert(self.next, Vec::new());
+        self.next
+    }
+
+    /// Append to an open stream; returns the stream's accumulated length.
+    pub(crate) fn append(&mut self, stream: u64, bytes: &[u8]) -> Result<u64, String> {
+        let buf = self
+            .open
+            .get_mut(&stream)
+            .ok_or_else(|| format!("buffer stream {stream} is not open"))?;
+        buf.extend_from_slice(bytes);
+        Ok(buf.len() as u64)
+    }
+
+    /// Close a stream and take its bytes (the seal input). An unsealed stream at instance teardown
+    /// simply drops — nothing durable was minted, the `state_open` torn-fold rule in miniature.
+    pub(crate) fn take(&mut self, stream: u64) -> Result<Vec<u8>, String> {
+        self.open
+            .remove(&stream)
+            .ok_or_else(|| format!("buffer stream {stream} is not open"))
+    }
 }
 
 impl PumpState {
@@ -1103,6 +1150,19 @@ impl PumpHandle {
     #[must_use]
     pub fn state_store_stats(&self) -> crate::run::state_store::StateStoreStats {
         self.shared.state.lock().expect("pump lock").state.stats()
+    }
+
+    /// The guest's peak linear memory in bytes, sampled at every event slice (wasm memory never
+    /// shrinks). This is the MEASUREMENT behind a module's claimed host-accountable footprint — the
+    /// number a real-geometry gate asserts stays under the admitted claim, and the number an
+    /// honest `decl_for_config` is derived from in the first place.
+    #[must_use]
+    pub fn guest_memory_high_water(&self) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .guest_memory_high_water
     }
 }
 

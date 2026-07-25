@@ -43,6 +43,11 @@
 //!
 //! Dev/test harness: shells `cargo build` for the guests, so fs/process use is expected here.
 
+// This is a fixture recorder, not product code: it reads and rewrites the golden bundle in the
+// checkout it lives in, so the product's contained-root filesystem discipline does not apply (the
+// same allowance the wasm-backed harness suites carry).
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,14 +55,18 @@ use std::time::{Duration, Instant};
 use ciborium::value::Value;
 use daemon_vhc_host::run::{start_run, DeliverVerdict, MemorySink, RunConfig, RunEnd, RunIdentity};
 use daemon_vhc_host::{EngineConfig, Worker};
+use daemon_vhc_proto::det_state::{
+    derive_state_chunk_size, DetStateManifest, FamilyEntry, LayoutBinding,
+    DET_STATE_MANIFEST_FORMAT,
+};
+use daemon_vhc_proto::genesis::{StateContract, StateInit};
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId, Seed};
 use daemon_vhc_sdk_consensus::messages::{
     BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, VhcMessage,
 };
-use daemon_vhc_sdk_profiles::{
-    decode_payload, encode_payload, IngestParam, ParamView, SparseLoco, SparseLocoCfg,
-};
+use daemon_vhc_sdk_profiles::payload::PayloadLayout;
+use daemon_vhc_sdk_profiles::{IngestParam, ParamView, SparseLoco, SparseLocoCfg};
 use serde::{Deserialize, Serialize};
 
 // The pinned parity shape (the trainer_parity harness shape): 1 layer, seq 9, 2 rounds x 2 inner steps,
@@ -128,17 +137,6 @@ fn batch_wrapper(round: u64, step: u32, tokens: &[u32]) -> Vec<u8> {
     to_canonical_vec(&v).expect("batch wrapper")
 }
 
-/// A staged committed-payload wrapper: `[1, round, peer32, payload]`.
-fn update_wrapper(round: u64, payload: &[u8]) -> Vec<u8> {
-    let v = Value::Array(vec![
-        Value::from(1u8),
-        Value::from(round),
-        Value::Bytes(PEER.to_vec()),
-        Value::Bytes(payload.to_vec()),
-    ]);
-    to_canonical_vec(&v).expect("update wrapper")
-}
-
 /// One published frame's `[tag, round, bytes]` decoded.
 fn decode_publish(frame: &[u8]) -> Option<(u64, u64, Vec<u8>)> {
     let v: Value = ciborium::de::from_reader(frame).ok()?;
@@ -192,9 +190,21 @@ fn theta_from_le(bytes: &[u8], numels: &[usize]) -> Vec<Vec<f32>> {
     split_params(&flat, numels)
 }
 
-/// The guest config map (canonical CBOR — the trainer `GuestCfg`).
-fn guest_cfg_bytes(model: &ModelCfgLit, profile: &SparseLocoCfg, init: &[Vec<f32>]) -> Vec<u8> {
-    let flat: Vec<f32> = init.iter().flatten().copied().collect();
+/// The guest config map (canonical CBOR — the trainer `GuestCfg`). Init is the genesis **state
+/// contract** (the run-pinned `state_chunk_size` + the artifact-form init pin the guest fetches and
+/// self-seals), not inline f32s — canonical state is chunk-addressed host-side.
+fn guest_cfg_bytes(
+    model: &ModelCfgLit,
+    profile: &SparseLocoCfg,
+    chunk_size: u64,
+    manifest_hash: [u8; 32],
+) -> Vec<u8> {
+    let contract = StateContract {
+        chunk_size,
+        init: StateInit::Manifest {
+            manifest: Hash(manifest_hash),
+        },
+    };
     let map = Value::Map(vec![
         (
             Value::Text("model".into()),
@@ -216,8 +226,8 @@ fn guest_cfg_bytes(model: &ModelCfgLit, profile: &SparseLocoCfg, init: &[Vec<f32
             Value::serialized(profile).expect("profile cfg"),
         ),
         (
-            Value::Text("init".into()),
-            Value::serialized(&flat).expect("init"),
+            Value::Text("state".into()),
+            Value::serialized(&contract).expect("state contract"),
         ),
     ]);
     to_canonical_vec(&map).expect("guest cfg")
@@ -242,10 +252,10 @@ impl PartialEq for Captured {
     }
 }
 
-fn wait_published(pump: &daemon_vhc_host::run::PumpHandle, n: usize) {
+fn wait_published(pump: &daemon_vhc_host::run::PumpHandle, n: usize, serve: &ServeCtx) {
     let deadline = Instant::now() + Duration::from_secs(180);
     while pump.published().len() < n {
-        service_puts(pump);
+        service_ops(pump, serve);
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {n} publishes (have {}); logs: {:?}",
@@ -254,21 +264,131 @@ fn wait_published(pump: &daemon_vhc_host::run::PumpHandle, n: usize) {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    service_puts(pump);
+    service_ops(pump, serve);
 }
 
-/// The async-runtime seat's minimal duty: the trainer `payload_put`s its sealed committed
-/// container each round (B1 discipline); the capture reconstructs the payload natively and
-/// verifies via the tag-3 hash, so the put is acknowledged and its bytes dropped.
-fn service_puts(pump: &daemon_vhc_host::run::PumpHandle) {
+/// What the embedder must serve the streamed trainer: the artifact-form init boot (the pinned
+/// det-state manifest whole, and the master fold's ranges sliced length-aware from the flat init
+/// image), and the content-addressed committed payloads the guest fetches back at each barrier.
+struct ServeCtx {
+    manifest_hash: [u8; 32],
+    manifest_bytes: Vec<u8>,
+    master_fold: [u8; 32],
+    init_flat: Vec<u8>,
+    /// The fetchable committed containers (`blake3 → bytes`) and the `payload_get` ops waiting on
+    /// one. [SF-R3]: a committed payload reaches the guest as a host buffer it range-reads, so the
+    /// capture records the production path, never a staging shortcut.
+    committed: Mutex<CommittedArchive>,
+}
+
+#[derive(Default)]
+struct CommittedArchive {
+    by_hash: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    deferred: Vec<(u64, [u8; 32])>,
+}
+
+impl ServeCtx {
+    /// Author the artifact-form init from the matched init at `chunk_size`.
+    fn new(init: &[Vec<f32>], chunk_size: u64) -> Self {
+        let param_bytes: Vec<Vec<u8>> = init
+            .iter()
+            .map(|p| flat_le_bytes(std::slice::from_ref(p)))
+            .collect();
+        let views: Vec<&[u8]> = param_bytes.iter().map(Vec::as_slice).collect();
+        let master = FamilyEntry::author(&views, chunk_size).expect("author master family");
+        let numels_u64: Vec<u64> = init.iter().map(|p| p.len() as u64).collect();
+        let manifest = DetStateManifest {
+            format: DET_STATE_MANIFEST_FORMAT,
+            run_id: Hash([0x67; 32]),
+            round: 0,
+            layout: LayoutBinding::of_numels(&numels_u64).expect("layout binding"),
+            chunk_size,
+            families: [("master".to_string(), master.clone())]
+                .into_iter()
+                .collect(),
+        };
+        let manifest_bytes = manifest.to_canonical_bytes().expect("manifest cbor");
+        Self {
+            manifest_hash: blake3_hash(&manifest_bytes).0,
+            manifest_bytes,
+            master_fold: master.fold.0,
+            init_flat: param_bytes.concat(),
+            committed: Mutex::new(CommittedArchive::default()),
+        }
+    }
+
+    /// Make a committed container fetchable (content-addressed, as the record names it).
+    fn publish_committed(&self, payload: &[u8]) {
+        self.committed
+            .lock()
+            .expect("archive")
+            .by_hash
+            .insert(blake3_hash(payload).0, payload.to_vec());
+    }
+}
+
+/// The embedder seat's duties: acknowledge the trainer's `payload_put` (the capture reconstructs
+/// the payload natively and verifies it against the tag-3 hash, so the put's bytes are dropped),
+/// serve the artifact-form init boot, and serve every record-listed `payload_get` out of the
+/// content-addressed archive.
+fn service_ops(pump: &daemon_vhc_host::run::PumpHandle, serve: &ServeCtx) {
+    use daemon_vhc_host::run::{OpOutcome, OpRequest};
     for (op, request) in pump.take_op_requests() {
         match request {
-            daemon_vhc_host::run::OpRequest::PayloadPut { .. } => {
-                pump.complete_op(op, daemon_vhc_host::run::OpOutcome::PutDone)
-                    .expect("put done");
+            OpRequest::PayloadPut { .. } => {
+                pump.complete_op(op, OpOutcome::PutDone).expect("put done");
+            }
+            OpRequest::PayloadGet { hash } => {
+                serve
+                    .committed
+                    .lock()
+                    .expect("archive")
+                    .deferred
+                    .push((op, hash));
+            }
+            OpRequest::ArtifactFetch { hash, .. } if hash == serve.manifest_hash => {
+                pump.complete_op(
+                    op,
+                    OpOutcome::FetchDone {
+                        artifact: serve.manifest_bytes.clone(),
+                    },
+                )
+                .expect("manifest fetch done");
+            }
+            OpRequest::ArtifactRange {
+                hash,
+                span_off,
+                span_len,
+                ..
+            } if hash == serve.master_fold => {
+                let (s, e) = (span_off as usize, (span_off + span_len) as usize);
+                pump.complete_op(
+                    op,
+                    OpOutcome::RangeDone {
+                        bytes: serve.init_flat[s..e].to_vec(),
+                    },
+                )
+                .expect("init range done");
             }
             other => panic!("unexpected op request from the trainer guest: {other:?}"),
         }
+    }
+    let ready: Vec<(u64, Vec<u8>)> = {
+        let mut archive = serve.committed.lock().expect("archive");
+        let mut pending = Vec::new();
+        let mut ready = Vec::new();
+        for (op, hash) in std::mem::take(&mut archive.deferred) {
+            match archive.by_hash.get(&hash) {
+                Some(bytes) => ready.push((op, bytes.clone())),
+                None => pending.push((op, hash)),
+            }
+        }
+        archive.deferred = pending;
+        ready
+    };
+    for (op, bytes) in ready {
+        pump.complete_op(op, OpOutcome::GetDone { bytes })
+            .expect("committed payload get done");
     }
 }
 
@@ -286,9 +406,15 @@ fn capture_once(
     assert_eq!(sel.driver, daemon_vhc_abi::CandidateDriver::V2);
     assert_eq!(
         (sel.major, sel.minor),
-        (2, daemon_vhc_abi::COMPUTE_MINOR_V2),
-        "the trainer guest is a compute@2 module"
+        (2, daemon_vhc_abi::BUFFER_STAGE_MINOR_V2),
+        "the trainer guest imports the det-state write surface and the incremental buffer staging \
+         its committed container is built through"
     );
+
+    // The fold-walk window / state chunk size is derived from the profile compression chunk
+    // (§3.2), exactly as the reproduction tiers derive it from the recorded profile literals.
+    let chunk_size = derive_state_chunk_size(u64::from(profile_cfg.chunk));
+    let serve = ServeCtx::new(init, chunk_size);
 
     let identity = RunIdentity {
         run_id: [0x67; 32],
@@ -300,12 +426,15 @@ fn capture_once(
     let mut run_cfg = RunConfig::new(
         identity,
         [0x9d; 32],
-        guest_cfg_bytes(model, profile_cfg, init),
+        guest_cfg_bytes(model, profile_cfg, chunk_size, serve.manifest_hash),
         Vec::new(),
     );
     // A real transformer's per-round op stream exceeds the tiny default queue depth (the guest
     // also fences per inner step to reclaim depth) — the trainer_parity setting.
     run_cfg.compute_queue_depth = 1 << 20;
+    run_cfg.state_chunk_size = chunk_size;
+    run_cfg.granted_artifacts.insert(serve.manifest_hash);
+    run_cfg.granted_artifacts.insert(serve.master_fold);
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&worker, wasm, run_cfg, Box::new(sink)).expect("start");
     let pump = run.pump.clone();
@@ -328,6 +457,11 @@ fn capture_once(
     let mut profile = SparseLoco::new(profile_cfg.clone(), numels);
     let mut master = init.to_vec();
     let mut round_base = init.to_vec();
+    // The container layout the guest emits its committed update through: the definition bridge
+    // between the resident reference sections above and the range-addressable bytes on the wire
+    // (`PayloadLayout::encode_sections`). Reconstructing THROUGH it is what makes the recorded
+    // payload bytes the guest's own.
+    let layout = PayloadLayout::new(profile_cfg, numels, chunk_size).expect("payload layout");
 
     let mut trained: Vec<Vec<Vec<f32>>> = Vec::new();
     let mut payloads: Vec<Vec<u8>> = Vec::new();
@@ -352,7 +486,7 @@ fn capture_once(
             }),
             &mut seq,
         );
-        wait_published(&pump, (round as usize) * 3 + 2); // + theta + commitment
+        wait_published(&pump, (round as usize) * 3 + 2, &serve); // + theta + commitment
 
         // Recover this round's theta (tag 2) and the guest's commitment hash (tag 3).
         let published = pump.published();
@@ -384,7 +518,9 @@ fn capture_once(
             })
             .collect();
         let sections = profile.make_update(&views);
-        let payload = encode_payload(&sections);
+        let payload = layout
+            .encode_sections(&sections)
+            .expect("the reference sections tile the container layout");
         assert_eq!(
             blake3_hash(&payload).0,
             guest_hash,
@@ -392,14 +528,14 @@ fn capture_once(
              commitment (the det lane is bit-identical wasm-vs-native)"
         );
 
-        // Self-ingest: stage the trainer's OWN committed payload, then the single-peer record.
+        // Self-ingest: publish the trainer's OWN committed container to the archive it fetches
+        // from, then the single-peer record.
         let entry = RecordEntry {
             peer: PeerId(PEER),
             hash: blake3_hash(&payload),
             size: payload.len() as u64,
         };
-        pump.stage_payload(update_wrapper(round, &payload), None)
-            .expect("stage update");
+        serve.publish_committed(&payload);
         let set: Vec<(PeerId, Hash)> = vec![(PeerId(PEER), entry.hash)];
         deliver(
             &VhcMessage::RoundRecord(RoundRecord {
@@ -412,7 +548,7 @@ fn capture_once(
             }),
             &mut seq,
         );
-        wait_published(&pump, (round as usize) * 3 + 3); // + digest
+        wait_published(&pump, (round as usize) * 3 + 3, &serve); // + digest
 
         // Advance the native mirror exactly as the guest's ingest does (rebase over the same
         // committed set), so the next round's base matches the guest's.
@@ -426,7 +562,7 @@ fn capture_once(
                 })
                 .collect();
             profile
-                .ingest(&mut params, &[decode_payload(&payload).expect("decode")])
+                .ingest(&mut params, std::slice::from_ref(&sections))
                 .expect("ingest");
         }
         round_base = master.clone();

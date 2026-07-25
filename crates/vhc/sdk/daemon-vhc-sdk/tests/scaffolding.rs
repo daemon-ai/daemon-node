@@ -143,10 +143,14 @@ fn derived_claim_matches_the_section_9_1_wire_schema_and_page_rounds() {
         };
         (get("device"), get("host"))
     };
-    assert_eq!(tier("hard_accountable"), (0, 8192));
+    // The declared 5000 B of state is below the wasm32 Rust `cdylib`'s own linear-memory floor,
+    // which the derivation lifts it to: that tier is what the host enforces as the sandbox's
+    // memory cap, and the runtime beneath a module does not shrink for having gone undeclared.
+    let floor = daemon_vhc_sdk::module::WASM_LINEAR_MEMORY_FLOOR_BYTES;
+    assert_eq!(tier("hard_accountable"), (0, floor));
     assert_eq!(tier("workspace"), (0, 4096));
-    // peak = state + scratch, rounded ONCE over the sum (5100 → 8192).
-    assert_eq!(tier("declared_peak"), (0, 8192));
+    // peak = the floored state + scratch, rounded ONCE over the sum.
+    assert_eq!(tier("declared_peak"), (0, floor + 4096));
     let pressure = m
         .iter()
         .find(|(k, _)| matches!(k, ciborium::value::Value::Text(s) if s == "under_pressure"))

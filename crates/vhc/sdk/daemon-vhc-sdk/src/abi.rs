@@ -32,6 +32,12 @@ extern "C" {
     #[link_name = "cancel"]
     fn abi_cancel(op: u64) -> u32;
     // -- minor 3: the det-state write surface (ABI §12.14 [SF-4]) ------------------------------
+    #[link_name = "buffer_open"]
+    fn abi_buffer_open() -> u64;
+    #[link_name = "buffer_append"]
+    fn abi_buffer_append(stream: u64, ptr: u32, len: u32) -> u64;
+    #[link_name = "buffer_seal"]
+    fn abi_buffer_seal(stream: u64) -> u64;
     #[link_name = "state_open"]
     fn abi_state_open(tag_ptr: u32, tag_len: u32, byte_len: u64) -> u64;
     #[link_name = "state_emit"]
@@ -357,6 +363,30 @@ pub fn read_range(buffer: u64, offset: u64, len: usize) -> Vec<u8> {
         out.truncate(n as usize);
     }
     out
+}
+
+/// Open an incremental buffer stream (ABI minor 4) — the twin of [`create_from`] for an object
+/// too large to hold in linear memory: append it in bounded spans, then [`buffer_seal`] it into
+/// exactly the kind-8 `BufferHandle` [`create_from`] would have returned.
+///
+/// The emit-side half of [SF-R3]: a producer of a large committed update builds the buffer
+/// `payload_put` takes without ever holding the container, exactly as the consuming side
+/// [`read_range`]s it without ever holding it.
+pub fn buffer_open() -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_buffer_open() }
+}
+
+/// Append a span to an open buffer stream; returns the stream's accumulated length.
+pub fn buffer_append(stream: u64, bytes: &[u8]) -> u64 {
+    // SAFETY: `bytes` is a live guest span for the call's duration.
+    unsafe { abi_buffer_append(stream, bytes.as_ptr() as u32, bytes.len() as u32) }
+}
+
+/// Close an open buffer stream and take its sealed kind-8 `BufferHandle`.
+pub fn buffer_seal(stream: u64) -> u64 {
+    // SAFETY: plain-value import.
+    unsafe { abi_buffer_seal(stream) }
 }
 
 /// The sealed length of a buffer (deterministic bookkeeping).

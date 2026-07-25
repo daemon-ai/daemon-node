@@ -17,8 +17,9 @@
 
 use daemon_vhc_proto::bytes::{Seed, StateDigest};
 use daemon_vhc_sdk_consensus::digest::{digest_state, DigestCarry};
+use daemon_vhc_sdk_profiles::payload::PayloadLayout;
 use daemon_vhc_sdk_profiles::streaming::{
-    f32s_to_le_bytes, le_bytes_to_f32s, SparseLocoIngestWalk, SparseLocoUpdateWalk,
+    f32s_to_le_bytes, IngestFetch, IngestPart, SparseLocoIngestWalk, SparseLocoUpdateWalk,
     UpdateWindowInputs,
 };
 use daemon_vhc_sdk_profiles::{IngestParam, ParamView, Section, SparseLoco, SparseLocoCfg};
@@ -77,18 +78,42 @@ enum Arrival {
     Shuffled(u64),
 }
 
-fn pick(outstanding: &mut Vec<u64>, arrival: Arrival, lcg: &mut u64) -> u64 {
-    let i = match arrival {
+fn pick_index(len: usize, arrival: Arrival, lcg: &mut u64) -> usize {
+    match arrival {
         Arrival::Fifo => 0,
-        Arrival::Lifo => outstanding.len() - 1,
+        Arrival::Lifo => len - 1,
         Arrival::Shuffled(_) => {
             *lcg = lcg
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            usize::try_from(*lcg >> 33).unwrap() % outstanding.len()
+            usize::try_from(*lcg >> 33).unwrap() % len
         }
-    };
+    }
+}
+
+fn pick(outstanding: &mut Vec<u64>, arrival: Arrival, lcg: &mut u64) -> u64 {
+    let i = pick_index(outstanding.len(), arrival, lcg);
     outstanding.remove(i)
+}
+
+fn pick_fetch(outstanding: &mut Vec<IngestFetch>, arrival: Arrival, lcg: &mut u64) -> IngestFetch {
+    let i = pick_index(outstanding.len(), arrival, lcg);
+    outstanding.remove(i)
+}
+
+/// The committed containers of a set of resident payloads, in the production layout — the host
+/// buffers the ingest driver range-reads, in a `Vec` (the harness's stand-in for the buffer table).
+fn publish(
+    cfg: &SparseLocoCfg,
+    numels: &[usize],
+    window_size: u64,
+    payloads: &[Vec<Section>],
+) -> Vec<Vec<u8>> {
+    let layout = PayloadLayout::new(cfg, numels, window_size).unwrap();
+    payloads
+        .iter()
+        .map(|sections| layout.encode_sections(sections).unwrap())
+        .collect()
 }
 
 fn arrival_seed(arrival: Arrival) -> u64 {
@@ -113,40 +138,65 @@ fn drive_ingest(
     bases: &[Vec<f32>],
     arrival: Arrival,
 ) -> (Vec<Vec<f32>>, StateDigest) {
+    let buffers = publish(cfg, numels, window_size, payloads);
     let mut walk = SparseLocoIngestWalk::new(
         cfg,
         numels,
         window_size,
         in_flight,
-        payloads,
+        buffers.len(),
         DigestCarry::new(seed, 64),
     )
     .unwrap();
+    for buf in &buffers {
+        walk.layout().check_header(buf).unwrap();
+    }
     let schedule = walk.schedule().to_vec();
     let mut masters: Vec<Vec<f32>> = numels.iter().map(|&n| vec![0.0f32; n]).collect();
-    let mut outstanding: Vec<u64> = Vec::new();
+    let mut outstanding: Vec<IngestFetch> = Vec::new();
     let mut lcg = arrival_seed(arrival);
     let mut next_fold = 0u64;
     let mut seals = 0u32;
+    // The widest slice a phase issues: the fold phase's round base + a value and an index chunk
+    // per peer, times the in-flight window bound.
+    let per_window = 1 + 2 * payloads.len() as u64;
+    let mut byte_buf = Vec::new();
 
     let opening = walk.start().unwrap();
     assert!(opening.emitted.is_empty());
-    outstanding.extend(opening.issue.iter().map(|w| w.ordinal));
+    outstanding.extend(opening.issue);
     assert!(
-        outstanding.len() as u64 <= in_flight.max(1),
+        outstanding.len() as u64 <= in_flight.max(1) * per_window,
         "bounded issue"
     );
     seals += u32::from(opening.sealed);
 
     while !outstanding.is_empty() {
-        let ordinal = pick(&mut outstanding, arrival, &mut lcg);
-        let w = schedule[usize::try_from(ordinal).unwrap()];
-        let (off, elems) = (
-            usize::try_from(w.param_off / 4).unwrap(),
-            usize::try_from(w.len / 4).unwrap(),
-        );
-        let base_win = bases[w.param as usize][off..off + elems].to_vec();
-        let step = walk.on_window_ready(ordinal, &base_win).unwrap();
+        let fetch = pick_fetch(&mut outstanding, arrival, &mut lcg);
+        let bytes = match fetch.span {
+            // Committed-payload section rows: a RANGE of that peer's buffer ([SF-R3]).
+            Some((off, len)) => {
+                let peer = match fetch.part {
+                    IngestPart::Values(p) | IngestPart::Indices(p) => p as usize,
+                    IngestPart::RoundBase => unreachable!(),
+                };
+                let (s, e) = (off as usize, (off + len) as usize);
+                buffers[peer][s..e].to_vec()
+            }
+            // The round-base state window: the f32-le image of the window's slice.
+            None => {
+                let w = fetch.window;
+                let (off, elems) = (
+                    usize::try_from(w.param_off / 4).unwrap(),
+                    usize::try_from(w.len / 4).unwrap(),
+                );
+                f32s_to_le_bytes(&bases[w.param as usize][off..off + elems], &mut byte_buf);
+                byte_buf.clone()
+            }
+        };
+        let step = walk
+            .on_part_ready(fetch.part, fetch.window.ordinal, &bytes)
+            .unwrap();
         for (win, master) in &step.emitted {
             assert_eq!(win.ordinal, next_fold, "folds ascending and contiguous");
             next_fold += 1;
@@ -156,7 +206,11 @@ fn drive_ingest(
             );
             masters[win.param as usize][o..o + e].copy_from_slice(master);
         }
-        outstanding.extend(step.issue.iter().map(|w| w.ordinal));
+        outstanding.extend(step.issue);
+        assert!(
+            outstanding.len() as u64 <= in_flight.max(1) * per_window,
+            "bounded issue"
+        );
         seals += u32::from(step.sealed);
     }
     assert_eq!(next_fold, schedule.len() as u64, "every window folded");
@@ -165,8 +219,9 @@ fn drive_ingest(
     (masters, digest)
 }
 
-/// Drive the streamed update walk to completion — returns the assembled payload sections and
-/// the emitted new error-feedback family.
+/// Drive the streamed update walk to completion — returns the chunk-addressed committed container
+/// it published (index document + chunk objects, in fold order) and the emitted new
+/// error-feedback family.
 // One flat driver signature keeps every parity call site self-describing (test-only helper).
 #[allow(clippy::too_many_arguments)]
 fn drive_update(
@@ -178,10 +233,13 @@ fn drive_update(
     bases: &[Vec<f32>],
     efs: &[Vec<f32>],
     arrival: Arrival,
-) -> (Vec<Section>, Vec<Vec<f32>>) {
+) -> (Vec<u8>, Vec<Vec<f32>>) {
     let mut walk = SparseLocoUpdateWalk::new(cfg, numels, window_size, in_flight).unwrap();
     let schedule = walk.schedule().to_vec();
     let mut ef_new: Vec<Vec<f32>> = numels.iter().map(|&n| vec![0.0f32; n]).collect();
+    // The container the driver builds by APPENDING: header first, then each folded window's
+    // section pair — exactly what the guest's `buffer_open`/`buffer_append` stream accumulates.
+    let mut container: Vec<u8> = walk.payload_header();
     let mut outstanding: Vec<u64> = Vec::new();
     let mut lcg = arrival_seed(arrival);
     let mut seals = 0u32;
@@ -211,11 +269,28 @@ fn drive_update(
             );
             ef_new[win.param as usize][o..o + e].copy_from_slice(ef);
         }
+        // The container's section pairs leave the walk as each window folds, in fold order — the
+        // driver appends them and keeps nothing (here: appends into the buffer to compare).
+        assert_eq!(
+            step.payload.len(),
+            step.emitted.len(),
+            "one payload section pair per folded window"
+        );
+        for ((win, bytes), (ef_win, _)) in step.payload.iter().zip(step.emitted.iter()) {
+            assert_eq!(win.ordinal, ef_win.ordinal);
+            container.extend_from_slice(bytes.as_slice());
+        }
         outstanding.extend(step.issue.iter().map(|w| w.ordinal));
         seals += u32::from(step.sealed);
     }
     assert_eq!(seals, 1);
-    (walk.seal().unwrap(), ef_new)
+    let total = walk.seal().unwrap();
+    assert_eq!(
+        container.len() as u64,
+        total,
+        "the appended container tiles the layout"
+    );
+    (container, ef_new)
 }
 
 /// The resident ingest oracle over the same inputs.
@@ -378,8 +453,13 @@ fn windowed_ingest_is_bit_identical_to_resident() {
     }
 }
 
-/// Streamed make_update ≡ resident make_update: payload sections AND the rewritten
+/// Streamed make_update ≡ resident make_update: the committed CONTAINER AND the rewritten
 /// error-feedback family, bit-for-bit.
+///
+/// The container comparison is against the resident payload re-expressed through the definition
+/// bridge ([`chunk_resident_payload`]) — so it proves the streamed container carries exactly the
+/// rows the resident container carries, chunk object for chunk object, plus an identical index
+/// document (hence an identical commitment hash).
 #[test]
 fn windowed_update_is_bit_identical_to_resident() {
     for g in geometries() {
@@ -412,9 +492,13 @@ fn windowed_update_is_bit_identical_to_resident() {
         let want_ef: Vec<Vec<f32>> = resident.ef_state().to_vec();
 
         for &window_size in g.window_sizes {
+            let want_container = PayloadLayout::new(&g.cfg, g.numels, window_size)
+                .unwrap()
+                .encode_sections(&want_sections)
+                .unwrap();
             for in_flight in [1u64, 3, 8] {
                 for arrival in [Arrival::Fifo, Arrival::Lifo, Arrival::Shuffled(0xBEEF)] {
-                    let (got_sections, got_ef) = drive_update(
+                    let (got_container, got_ef) = drive_update(
                         &g.cfg,
                         g.numels,
                         window_size,
@@ -425,8 +509,8 @@ fn windowed_update_is_bit_identical_to_resident() {
                         arrival,
                     );
                     assert_eq!(
-                        got_sections, want_sections,
-                        "{}: sections (window {window_size}, in-flight {in_flight})",
+                        got_container, want_container,
+                        "{}: committed container (window {window_size}, in-flight {in_flight})",
                         g.name
                     );
                     assert_eq!(
@@ -477,7 +561,7 @@ fn windowed_trajectory_tracks_resident_across_rounds() {
                 .collect();
             payloads_resident.push(profile.make_update(&views));
 
-            let (sections, ef_new) = drive_update(
+            let (container, ef_new) = drive_update(
                 &g.cfg,
                 g.numels,
                 window_size,
@@ -488,8 +572,12 @@ fn windowed_trajectory_tracks_resident_across_rounds() {
                 Arrival::Shuffled(round * 31 + peer as u64),
             );
             assert_eq!(
-                sections, payloads_resident[peer],
-                "round {round} peer {peer}: payload sections"
+                container,
+                PayloadLayout::new(&g.cfg, g.numels, window_size)
+                    .unwrap()
+                    .encode_sections(&payloads_resident[peer])
+                    .unwrap(),
+                "round {round} peer {peer}: committed container"
             );
             assert_eq!(
                 bits_of(&ef_new),
@@ -497,7 +585,7 @@ fn windowed_trajectory_tracks_resident_across_rounds() {
                 "round {round} peer {peer}: ef"
             );
             windowed_ef[peer] = ef_new;
-            payloads_windowed.push(sections);
+            payloads_windowed.push(payloads_resident[peer].clone());
         }
 
         let masters_resident =
@@ -572,7 +660,7 @@ fn geometry_violations_are_typed_construction_refusals() {
         &[100],
         64,
         2,
-        &[],
+        0,
         DigestCarry::new(&Seed([1; 32]), 64)
     )
     .is_err());
@@ -595,29 +683,49 @@ fn walk_protocol_violations_are_typed() {
         &numels,
         64,
         2,
-        &[],
+        0,
         DigestCarry::new(&Seed([1; 32]), 64),
     )
     .unwrap();
+    let window = vec![0u8; 64];
     // Completion before start is refused.
-    assert!(walk.on_window_ready(0, &[0.0; 16]).is_err());
+    assert!(walk
+        .on_part_ready(IngestPart::RoundBase, 0, &window)
+        .is_err());
     let opening = walk.start().unwrap();
+    // With no committed peers the only input a window needs is its round base.
     assert_eq!(opening.issue.len(), 2);
+    assert!(opening.issue.iter().all(|f| f.span.is_none()));
     // A second start is refused.
     assert!(walk.start().is_err());
     // A never-issued ordinal is refused.
-    assert!(walk.on_window_ready(3, &[0.0; 16]).is_err());
-    // A mis-sized window is refused.
-    assert!(walk.on_window_ready(0, &[0.0; 4]).is_err());
-    // Sealing with outstanding windows is refused.
-    let base = vec![0.0f32; 16];
-    let _ = walk.on_window_ready(0, &base).unwrap();
+    assert!(walk
+        .on_part_ready(IngestPart::RoundBase, 3, &window)
+        .is_err());
+    // A mis-sized window is refused (and leaves the walk drivable).
+    assert!(walk
+        .on_part_ready(IngestPart::RoundBase, 0, &window[..16])
+        .is_err());
+    // A torn (non-multiple-of-4) window read is refused.
+    assert!(walk
+        .on_part_ready(IngestPart::RoundBase, 0, &window[..63])
+        .is_err());
+    let _ = walk
+        .on_part_ready(IngestPart::RoundBase, 0, &window)
+        .unwrap();
     // A duplicate completion is refused.
-    assert!(walk.on_window_ready(0, &base).is_err());
+    assert!(walk
+        .on_part_ready(IngestPart::RoundBase, 0, &window)
+        .is_err());
+    // Sealing with outstanding windows is refused.
+    assert!(walk.seal().is_err());
 }
 
+/// A committed payload whose bytes are the wrong length for the window they claim to cover (a
+/// mis-framed producer, or a buffer read that came back short) is refused AT THE SEAM, leaving the
+/// fold cursor and the digest carry untouched so the driver can re-deliver.
 #[test]
-fn seal_before_completion_is_refused() {
+fn a_misframed_payload_section_is_refused_at_the_seam() {
     let cfg = SparseLocoCfg {
         h: 1,
         ef_decay: 0.95,
@@ -627,22 +735,33 @@ fn seal_before_completion_is_refused() {
         outer_alpha: 1.0,
         clip: false,
     };
-    let mut walk = SparseLocoUpdateWalk::new(&cfg, &[64], 64, 2).unwrap();
-    let _ = walk.start().unwrap();
-    assert!(walk.seal().is_err());
-}
-
-#[test]
-fn byte_seam_round_trips_and_refuses_torn_windows() {
-    let vals: Vec<f32> = vec![1.5, -2.25, 0.0, f32::MIN_POSITIVE];
-    let mut buf = Vec::new();
-    f32s_to_le_bytes(&vals, &mut buf);
-    assert_eq!(buf.len(), 16);
-    let back = le_bytes_to_f32s(&buf).unwrap();
-    assert_eq!(
-        back.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-    );
-    // A torn (non-multiple-of-4) window read is a typed refusal.
-    assert!(le_bytes_to_f32s(&buf[..7]).is_err());
+    let numels = [64usize];
+    let bases = family(12, &numels);
+    let payloads = peer_payloads(&cfg, &numels, &bases, 78, 1);
+    let buffers = publish(&cfg, &numels, 64, &payloads);
+    let mut walk = SparseLocoIngestWalk::new(
+        &cfg,
+        &numels,
+        64,
+        2,
+        buffers.len(),
+        DigestCarry::new(&Seed([1; 32]), 64),
+    )
+    .unwrap();
+    let opening = walk.start().unwrap();
+    let fetch = opening
+        .issue
+        .iter()
+        .find(|f| f.span.is_some())
+        .copied()
+        .expect("the fold phase reads payload section rows");
+    let (off, len) = fetch.span.unwrap();
+    let rows = &buffers[0][off as usize..(off + len) as usize];
+    assert!(walk
+        .on_part_ready(fetch.part, fetch.window.ordinal, &rows[..rows.len() - 1])
+        .is_err());
+    // The honest rows still land afterwards.
+    assert!(walk
+        .on_part_ready(fetch.part, fetch.window.ordinal, rows)
+        .is_ok());
 }

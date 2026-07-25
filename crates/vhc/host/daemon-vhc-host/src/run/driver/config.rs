@@ -65,12 +65,17 @@ pub struct RunConfig {
     /// sender cannot use the reliable class as a memory-DoS vector. Overflow back-pressures
     /// that sender only.
     pub per_sender_quota: usize,
-    /// The claim's **hard-accountable host-tier cap** in raw bytes (`0` = uncapped): the
-    /// enforceable tier the host meters EXACTLY (ABI §9.1). At Phase A the metered
-    /// guest-attributable allocations are the staged bytes (`stage_state`); tensors/buffers join
-    /// the meter with the Phase-B buffer layer. Breach is the typed attributable
-    /// `BudgetMemory` trap — the under-claim acceptance (refactor §5 A2). The admission funnel
-    /// (`v2::admission`) supplies this from the evaluated claim.
+    /// The claim's **host-tier staging cap** in raw bytes (`0` = uncapped): the ceiling on
+    /// guest-authored host-side bytes this instance may hold — staged sections (`stage_state`) and
+    /// sealed buffers (`create_from`, `buffer_append`). Breach is the typed attributable
+    /// `BudgetMemory` trap — the under-claim acceptance (refactor §5 A2).
+    ///
+    /// Sourced from the evaluated claim's `declared_peak.host` (ABI §9.1), not its hard tier: for a
+    /// wasm instance the HARD tier is the guest's linear-memory ceiling — the resource the pooling
+    /// allocator meters exactly, and what [`crate::EngineConfig::with_claimed_memory`] enforces —
+    /// while a container the module stages host-side is precisely the "transient host scratch above
+    /// the state floor" the peak tier accounts. Two exactly-metered resources, two tiers of one
+    /// declaration.
     pub hard_accountable_host_bytes: u64,
     /// The **admitted artifact set** (track B2, architecture §3.2 `data@`): the blake3 hashes of
     /// the envelope's committed artifact map, intersected with the role's artifact grants ("which

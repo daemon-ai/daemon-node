@@ -179,10 +179,22 @@ pub fn det_sum(xs: &[&[f32]]) -> Result<Vec<f32>, DetError> {
 #[must_use]
 pub fn det_l2norm(x: &[f32]) -> f32 {
     let mut acc = 0.0_f32;
-    for &v in x {
-        acc += v * v;
-    }
+    det_sumsq_into(&mut acc, x);
     acc.sqrt()
+}
+
+/// Accumulate `Σ v·v` of `x` into `acc`, left-to-right (the carry form of [`det_l2norm`]).
+///
+/// A contribution norm over a value section that arrives in pieces — the chunk-addressed
+/// committed payload delivers one window of compression rows at a time — is folded through this
+/// carry: `det_l2norm(x) == { let mut a = 0.0; for part in parts { det_sumsq_into(&mut a, part) }
+/// a.sqrt() }` bit-for-bit for **any** split of `x` into consecutive `parts`, because the
+/// accumulation order is the same index order either way. Pinned by
+/// [`tests::sumsq_carry_equals_l2norm_for_any_split`].
+pub fn det_sumsq_into(acc: &mut f32, x: &[f32]) {
+    for &v in x {
+        *acc += v * v;
+    }
 }
 
 // -- det lane: elementwise ----------------------------------------------------------------------
@@ -414,6 +426,16 @@ fn read_bits_lsb(bytes: &[u8], bit_pos: usize, bits: u32) -> u32 {
     v
 }
 
+/// The byte stride of ONE absmax-packed row of `chunk` values at `bits` (ABI §6.6): the 2-byte f16
+/// codebook scalar plus the codes packed LSB-first and zero-padded to a byte.
+///
+/// The layout's own definition, so a consumer laying out or range-addressing packed rows computes
+/// their spans from the kernel that writes them rather than restating the arithmetic.
+#[must_use]
+pub fn absmax_row_bytes(chunk: usize, bits: u32) -> usize {
+    2 + (chunk * bits as usize).div_ceil(8)
+}
+
 /// Encode a blockwise fp32 payload to the absmax-packed `U8` layout (ABI `absmax_pack@1`, §6.6).
 ///
 /// The exact inverse-direction partner of [`det_absmax_unpack`]: `x` is viewed flattened as
@@ -440,8 +462,7 @@ pub fn absmax_pack(x: &[f32], chunk: usize, bits: u32) -> Result<Vec<u8>, DetErr
             divisor: chunk,
         });
     }
-    let code_bytes = (chunk * bits as usize).div_ceil(8);
-    let stride = 2 + code_bytes;
+    let stride = absmax_row_bytes(chunk, bits);
     let n_chunks = x.len() / chunk;
     let max_code = (1u32 << bits) - 1;
     let max_code_f = max_code as f32;
@@ -455,7 +476,7 @@ pub fn absmax_pack(x: &[f32], chunk: usize, bits: u32) -> Result<Vec<u8>, DetErr
         let off = c * stride;
         out[off..off + 2].copy_from_slice(&absmax_h.to_le_bytes());
         let absmax_stored = f16_bits_to_f32(absmax_h);
-        let codes = &mut out[off + 2..off + 2 + code_bytes];
+        let codes = &mut out[off + 2..off + stride];
         for (e, &v) in block.iter().enumerate() {
             let code = if absmax_stored == 0.0 {
                 // Midpoint: decodes to 0 for even max_code; for odd bit widths the nearest even
@@ -468,6 +489,95 @@ pub fn absmax_pack(x: &[f32], chunk: usize, bits: u32) -> Result<Vec<u8>, DetErr
             };
             write_bits_lsb(codes, e * bits as usize, bits, code);
         }
+    }
+    Ok(out)
+}
+
+/// The bit width one **chunk-local index** occupies in the packed index layout: the bits needed
+/// to hold `chunk - 1` (so `chunk = 1536` ⇒ 11 bits, `chunk = 64` ⇒ 6, `chunk = 1` ⇒ 0).
+///
+/// A sparse payload's indices are chunk-local by construction (`0 ≤ idx < chunk`, the invariant
+/// [`det_chunk_scatter_add`] enforces), so their domain — not the machine word they are held in —
+/// fixes the wire width.
+///
+/// # Errors
+///
+/// [`DetError::NotDivisible`] when `chunk == 0` (no index domain).
+pub fn index_bits(chunk: usize) -> Result<u32, DetError> {
+    if chunk == 0 {
+        return Err(DetError::NotDivisible { len: 0, divisor: 0 });
+    }
+    Ok(usize::BITS - (chunk - 1).leading_zeros())
+}
+
+/// The packed byte length of `count` chunk-local indices at `chunk`: `ceil(count × bits / 8)`
+/// (LSB-first, zero-padded to a byte — the [`absmax_pack`] code layout's discipline).
+///
+/// # Errors
+///
+/// [`DetError::NotDivisible`] when `chunk == 0`.
+pub fn packed_index_len(count: usize, chunk: usize) -> Result<usize, DetError> {
+    Ok((count * index_bits(chunk)? as usize).div_ceil(8))
+}
+
+/// Pack chunk-local indices into the compact bit layout: each index as an [`index_bits`]-wide
+/// unsigned code, LSB-first, zero-padded to a byte boundary.
+///
+/// The inverse of [`unpack_chunk_indices`], and — unlike the value codebook — **lossless**: an
+/// index is an integer inside a known domain. Riding an 11-bit index in an f32 (or a u32) costs
+/// 3–4× the bytes for no information, which at a real geometry is the bulk of a committed payload.
+///
+/// # Errors
+///
+/// [`DetError::NotDivisible`] when `chunk == 0`; [`DetError::IndexOutOfRange`] when an index is
+/// `>= chunk` (the bound the scatter kernels enforce — a payload that lies here could not be
+/// scattered, so it is refused at the encode seam).
+pub fn pack_chunk_indices(idx: &[u32], chunk: usize) -> Result<Vec<u8>, DetError> {
+    let bits = index_bits(chunk)?;
+    let mut out = vec![0u8; packed_index_len(idx.len(), chunk)?];
+    for (i, &v) in idx.iter().enumerate() {
+        if v as usize >= chunk {
+            return Err(DetError::IndexOutOfRange {
+                index: v as usize,
+                bound: chunk,
+            });
+        }
+        write_bits_lsb(&mut out, i * bits as usize, bits, v);
+    }
+    Ok(out)
+}
+
+/// Unpack `count` chunk-local indices from the [`pack_chunk_indices`] layout.
+///
+/// # Errors
+///
+/// [`DetError::NotDivisible`] when `chunk == 0`; [`DetError::ShapeMismatch`] when `bytes` is not
+/// exactly the packed length of `count` indices (a torn or over-long index chunk is typed, never
+/// silently truncated); [`DetError::IndexOutOfRange`] when a decoded index is `>= chunk` (reachable
+/// only for a non-power-of-two `chunk`, whose top codes fall outside the domain).
+pub fn unpack_chunk_indices(
+    bytes: &[u8],
+    chunk: usize,
+    count: usize,
+) -> Result<Vec<u32>, DetError> {
+    let bits = index_bits(chunk)?;
+    let need = packed_index_len(count, chunk)?;
+    if bytes.len() != need {
+        return Err(DetError::ShapeMismatch {
+            expected: need,
+            got: bytes.len(),
+        });
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let v = read_bits_lsb(bytes, i * bits as usize, bits);
+        if v as usize >= chunk {
+            return Err(DetError::IndexOutOfRange {
+                index: v as usize,
+                bound: chunk,
+            });
+        }
+        out.push(v);
     }
     Ok(out)
 }
@@ -1279,5 +1389,78 @@ mod tests {
             seed_init_param(&seed32(), 999, 0, 4).unwrap_err(),
             DetError::UnsupportedDist { dist: 999 }
         );
+    }
+
+    /// The carry form of the contribution norm equals the whole-slice norm BIT-FOR-BIT at every
+    /// split — the property a chunk-addressed payload's clip pre-pass rests on (it accumulates one
+    /// window of value rows at a time and must land on the resident path's f32 exactly).
+    #[test]
+    fn sumsq_carry_equals_l2norm_for_any_split() {
+        let x: Vec<f32> = (0..97)
+            .map(|i| (i as f32) * 0.37 - 11.0 + (i as f32) * (i as f32) * 1e-3)
+            .collect();
+        let whole = det_l2norm(&x);
+        for split in 0..=x.len() {
+            let mut acc = 0.0f32;
+            det_sumsq_into(&mut acc, &x[..split]);
+            det_sumsq_into(&mut acc, &x[split..]);
+            assert_eq!(
+                acc.sqrt().to_bits(),
+                whole.to_bits(),
+                "carry diverged at split {split}"
+            );
+        }
+        // Many-part split (one element at a time) — still the same index order.
+        let mut acc = 0.0f32;
+        for v in &x {
+            det_sumsq_into(&mut acc, std::slice::from_ref(v));
+        }
+        assert_eq!(acc.sqrt().to_bits(), whole.to_bits());
+    }
+
+    /// The compact chunk-local index encoding: width from the domain, lossless round trip, and
+    /// typed refusals for an out-of-domain index and a torn chunk.
+    #[test]
+    fn packed_chunk_indices_round_trip_losslessly() {
+        assert_eq!(index_bits(1536).unwrap(), 11);
+        assert_eq!(index_bits(64).unwrap(), 6);
+        assert_eq!(index_bits(4096).unwrap(), 12);
+        assert_eq!(index_bits(1).unwrap(), 0);
+        assert!(index_bits(0).is_err());
+
+        for chunk in [1usize, 2, 64, 1000, 1536, 4096] {
+            let idx: Vec<u32> = (0..37u32).map(|i| (i * 41) % chunk as u32).collect();
+            let packed = pack_chunk_indices(&idx, chunk).unwrap();
+            assert_eq!(packed.len(), packed_index_len(idx.len(), chunk).unwrap());
+            assert_eq!(
+                unpack_chunk_indices(&packed, chunk, idx.len()).unwrap(),
+                idx,
+                "chunk {chunk} round trip"
+            );
+            // The frozen size claim: 11-bit indices at chunk 1536 cost 11 bits, not 32.
+            if chunk == 1536 {
+                assert_eq!(packed.len(), (37 * 11_usize).div_ceil(8));
+            }
+        }
+
+        assert_eq!(
+            pack_chunk_indices(&[1536], 1536).unwrap_err(),
+            DetError::IndexOutOfRange {
+                index: 1536,
+                bound: 1536
+            }
+        );
+        let packed = pack_chunk_indices(&[3, 4, 5], 64).unwrap();
+        assert!(matches!(
+            unpack_chunk_indices(&packed[..1], 64, 3).unwrap_err(),
+            DetError::ShapeMismatch { .. }
+        ));
+        // A non-power-of-two domain: the top codes of the last byte are outside it and refuse.
+        let mut over = pack_chunk_indices(&[0, 0], 1000).unwrap();
+        over.fill(0xff);
+        assert!(matches!(
+            unpack_chunk_indices(&over, 1000, 2).unwrap_err(),
+            DetError::IndexOutOfRange { .. }
+        ));
     }
 }

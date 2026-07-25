@@ -1,7 +1,7 @@
 {
   "captured_from": {
     "capture": "tests/fixtures/trainer-goldens/capture (see ../README.md)",
-    "commit": "e93217b9",
+    "commit": "vhc-integration (the commit whose guests.blake3 pins module.blake3 below)",
     "compute_lane": "host ndarray ComputeRunner (the compute@2 host execution backend at this commit; EngineConfig.backend does not select the compute@2 tier)",
     "trainer": "compute@2 tiny-llama (real Burn LLaMA over Autodiff<HostBackend>, SparseLoco det-lane ingest in-guest, BarrierRound, kind-0 staging)",
     "tree": "vhc/trainer-goldens (the current tree — the live compute@2 trainer lane)"
@@ -32,10 +32,10 @@
     "wd": 0.1
   },
   "module": {
-    "blake3": "1e7d25ac792cf81827b43a298bbbdee6999692170390ac7ecb5b26c9934bed8b",
-    "bytes": 1024466,
+    "blake3": "faed4bbe9200edac6342e3a4343e118560eac63cec5735a2f6386a193b7a36c8",
+    "bytes": 1254244,
     "name": "tiny_llama.wasm",
-    "source": "guests/target build at capture (byte-identical across checkout paths via the guests workspace rustc remap; pinned in guests.blake3 at the commit). INFORMATIONAL field, mechanically re-synced when the trainer guest gained checkpoint/migration support + payload externalization, and again at the durable-rename pass (guest crate promoted to the clean tiny-llama name; SDK crate renamed; domain-salt registry) — the recorded golden bytes and digests below are unchanged on every re-sync and were NOT re-captured (the guest's training math is untouched; the reproduce lanes stay green against them)."
+    "source": "guests/target build at capture (byte-identical across checkout paths via the guests workspace rustc remap; pinned in guests.blake3 at the commit)"
   },
   "param_names": [
     "tok.weight",
@@ -65,13 +65,13 @@
   ],
   "payloads": [
     {
-      "blake3": "3894a20d705d89c820a90f980b3e1429410b46c796ec19a6a9c968c437c06122",
-      "bytes": 26026,
+      "blake3": "99a586e2d3965681e498089f1deae2a263e7011b19d7ad82b727d6a36b0056a8",
+      "bytes": 7110,
       "file": "payload-round-0.bin"
     },
     {
-      "blake3": "01153cd1d868f5b679c98a58ddeea0a634d4379b2024c21379e4fc10268195ca",
-      "bytes": 26026,
+      "blake3": "129135470b968c20bbb0428830dc87d3c2f551bb08470eddcd6c7a4efe35ff50",
+      "bytes": 7110,
       "file": "payload-round-1.bin"
     }
   ],
@@ -84,7 +84,7 @@
     "outer_alpha": 1.0,
     "topk": 8
   },
-  "provenance": "v1 parity oracle (matched init + config literals) -> trainer_parity det-equality (reauthored_tiny_llama_parity_vs_v1_oracle_cpu) green at captured_from.commit -> these goldens. See ../README.md for the full chain and the exact comparison surface.",
+  "provenance": "HISTORICAL (the v1 parity oracle retired with the v1 parity lanes, retirement plan §3): v1 parity oracle (matched init + config literals) -> trainer_parity det-equality green at the original capture commit -> these goldens. The matched init now lives in this self-contained bundle (init.f32le.bin). See ../README.md for the full historical chain and the exact comparison surface.",
   "schedule": {
     "micro_batch": 2,
     "peer": "[7; 32]",

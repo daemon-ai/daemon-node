@@ -58,7 +58,14 @@ pub const DA_ABI_MAJOR_V2: u32 = 2;
 /// chunk-addressed state store, bumped — per the same coupled-to-the-working-driver discipline —
 /// in the commit that wired the state store + the three imports into the event-loop driver.
 /// Importing any state symbol forces a declared minor ≥ 3 (§1.3 step 5).
-pub const DA_ABI_MINOR_V2: u32 = 3;
+///
+/// **Minor 4 is the incremental buffer-staging surface** ([`BUFFER_STAGE_MINOR_V2`]): the three
+/// `vhc@2` imports (`buffer_open`/`buffer_append`/`buffer_seal`) that build a sealed kind-8
+/// `BufferHandle` from bounded appends instead of one whole span. Host-resource layer only — no
+/// wire, no new event, no contract: the sealed handle is exactly what `create_from` returns and
+/// `payload_put` already takes. Importing any of the three forces a declared minor ≥ 4 (§1.3
+/// step 5).
+pub const DA_ABI_MINOR_V2: u32 = 4;
 
 /// The set of ABI **majors this host generation implements** (i.e. carries a driver for).
 ///
@@ -253,6 +260,22 @@ pub const COMPUTE_BURN_VERSION: &str = "0.21.0";
 /// O(1) fold-divergence detector.
 pub const STATE_MINOR_V2: u32 = 3;
 
+/// The major-2 minor at which the `vhc@2` **incremental buffer-staging** surface is introduced:
+/// `buffer_open() -> stream`, `buffer_append(stream, ptr, len) -> len`, `buffer_seal(stream) ->
+/// BufferHandle`.
+///
+/// The incremental twin of `create_from`, and the emit-side half of [SF-R3]: a producer of a large
+/// committed update must be able to build the sealed buffer `payload_put` takes WITHOUT ever
+/// holding the object in linear memory, exactly as the consuming side range-reads it without ever
+/// holding it. Nothing above the host resource layer moves — the payload's wire identity, the
+/// record entry, the mint and the replay oracle are untouched.
+///
+/// Determinism classes (§2.7): all three are `dc` — stream ids are counter-deterministic per
+/// instance, appended bytes come from replay-reproduced guest memory, and the sealed handle is the
+/// buffer table's next deterministic id, so none of them carries a journal record (the
+/// `create_from` precedent).
+pub const BUFFER_STAGE_MINOR_V2: u32 = 4;
+
 /// The v1 five-phase lifecycle exports whose presence (with a `tabi@1`-only import shape) marks a
 /// **candidate major-1** module (ABI §1.3 step 2: "exports include the v1 lifecycle (`da_build` …)").
 pub const V1_LIFECYCLE_EXPORTS: &[&str] = &[
@@ -372,6 +395,9 @@ pub const V2_SYMBOL_REGISTRY: &[(&str, &str, u32)] = &[
     (NS_VHC_V2, "state_open", STATE_MINOR_V2),
     (NS_VHC_V2, "state_emit", STATE_MINOR_V2),
     (NS_VHC_V2, "state_seal", STATE_MINOR_V2),
+    (NS_VHC_V2, "buffer_open", BUFFER_STAGE_MINOR_V2),
+    (NS_VHC_V2, "buffer_append", BUFFER_STAGE_MINOR_V2),
+    (NS_VHC_V2, "buffer_seal", BUFFER_STAGE_MINOR_V2),
     // -- minor 3 (the chunk-addressed det-state contract, ABI §12.14 [SF-R2]): the read side of
     // an EXTERNALLY-sourced fold (artifact-form init, restore roots). Registers a length-aware
     // chunk map (per-parameter chunking has interior short tails — not the uniform corpus grid),
@@ -1258,9 +1284,10 @@ mod tests {
         assert_eq!(host_minor_for(DA_ABI_MAJOR), None);
         // B1 bumped the major-2 minor to 1 with Completion delivery; C1 bumped it to 2 with
         // Fence delivery + the compute@2 shim; the det-state wave bumped it to 3 with the
-        // state store + the three state imports (the ratified coupled-to-the-working-driver
-        // path, ABI §1.4/§4.6); minor 4 stays AbiMinorTooNew.
-        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(STATE_MINOR_V2));
+        // state store + the three state imports; the buffer-staging trio bumped it to 4 (all on
+        // the ratified coupled-to-the-working-driver path, ABI §1.4/§4.6). Minor 5 stays
+        // AbiMinorTooNew.
+        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(BUFFER_STAGE_MINOR_V2));
         assert_eq!(host_minor_for(3), None);
     }
 
@@ -1446,7 +1473,7 @@ mod tests {
         // ABI §12.14 [SF-4]: the three state imports register at STATE_MINOR_V2, which the host
         // implements (declaration + implementation together — the register_chunks precedent).
         assert_eq!(STATE_MINOR_V2, 3);
-        assert_eq!(DA_ABI_MINOR_V2, STATE_MINOR_V2);
+        const { assert!(DA_ABI_MINOR_V2 >= STATE_MINOR_V2) };
         for sym in ["state_open", "state_emit", "state_seal"] {
             assert_eq!(
                 v2_symbol_minor(NS_VHC_V2, sym),
@@ -1464,6 +1491,34 @@ mod tests {
             ("vhc@2", "state_open"),
             ("vhc@2", "state_emit"),
             ("vhc@2", "state_seal"),
+        ])
+        .unwrap();
+    }
+
+    /// The incremental buffer-staging trio registers at its own minor, which the host implements,
+    /// and importing any of it lifts the required declared minor (§1.3 step 5). It is a
+    /// host-resource surface: nothing about the payload wire, the event vocabulary or the journal
+    /// moves with it.
+    #[test]
+    fn buffer_staging_ops_register_at_their_own_minor() {
+        assert_eq!(BUFFER_STAGE_MINOR_V2, 4);
+        assert_eq!(DA_ABI_MINOR_V2, BUFFER_STAGE_MINOR_V2);
+        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(BUFFER_STAGE_MINOR_V2));
+        for sym in ["buffer_open", "buffer_append", "buffer_seal"] {
+            assert_eq!(
+                v2_symbol_minor(NS_VHC_V2, sym),
+                Some(BUFFER_STAGE_MINOR_V2),
+                "vhc@2::{sym} registers at the buffer-staging minor"
+            );
+        }
+        assert_eq!(
+            required_v2_minor(&[("vhc@2", "next_event"), ("vhc@2", "buffer_append")]),
+            BUFFER_STAGE_MINOR_V2
+        );
+        validate_imports(&[
+            ("vhc@2", "buffer_open"),
+            ("vhc@2", "buffer_append"),
+            ("vhc@2", "buffer_seal"),
         ])
         .unwrap();
     }
