@@ -25,6 +25,10 @@
 // (decisions D8, ABI §15). Unconditional — the tier-1 ndarray backend is always compiled (the root
 // `burn` dep pins `ndarray`+`autodiff`); wgpu/cuda ride the same generic seam behind their features.
 pub mod compute;
+// Panic capture for the device lanes: the stacks under this crate report failures by panicking and
+// then swallow the payload, so a recording hook is what lets a device fault reach the run TYPED and
+// carrying the device's own message (ABI §7.6/§15) instead of as a poisoned-lock symptom.
+pub mod device_panic;
 // The PERMANENT device probe (decisions D5: "the device probe stays forever").
 /// The whole-run coordinator drive: configure + run `coordinator_quorum.wasm` under the real
 /// driver and route frames to/from it, decoding its round decisions. Harness machinery (the

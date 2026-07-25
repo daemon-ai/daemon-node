@@ -45,6 +45,14 @@ ciborium = { workspace = true }
 # Typed harness errors (the D2 coordinator configuration seat's matrix refusals).
 thiserror = { workspace = true }
 
+# Device-lane pass-throughs for the hardware-gated real-geometry lane
+# (`tests/ceremony_device_lane.rs`). They only forward the host's own backend features, so a
+# default `cargo build`/`test`/`deny` of this crate still compiles no GPU tree.
+[features]
+default = []
+wgpu = ["daemon-vhc-host/wgpu"]
+cuda = ["daemon-vhc-host/cuda"]
+
 [dev-dependencies]
 # The shared guest-workspace builder every wasm-backed test suite in this crate goes through
 # (reproducibility remap env + cross-process build lock live there, once). Test-only.

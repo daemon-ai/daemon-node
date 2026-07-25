@@ -49,6 +49,10 @@ pub mod gossip;
 /// default workspace build never compiles the iroh/QUIC/relay tree.
 #[cfg(feature = "iroh")]
 pub mod iroh_gossip;
+/// The run's genesis-pinned artifact plane presented as a [`ContentStore`] — the seat the
+/// module-driven `data.fetch` binds, resolving each pinned content id at the url the envelope
+/// commits (cache-first) and delegating every other address to the committed-payload plane.
+pub mod pinned_artifacts;
 pub mod presign;
 pub mod r2_store;
 /// Run discovery + envelope fetch against the coordinator registry (spec §6.1/§11.1; A1).
@@ -82,6 +86,7 @@ pub use fetch::{
 pub use gossip::LoopbackGossip;
 #[cfg(feature = "iroh")]
 pub use iroh_gossip::{IrohGossip, IrohGossipConfig, IrohPeer, RebroadcastConfig};
+pub use pinned_artifacts::PinnedArtifactStore;
 pub use presign::{
     HttpPresignClient, ObjectKind, PresignClient, PresignOp, PresignRequest, PresignResponse,
 };
