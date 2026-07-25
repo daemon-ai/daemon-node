@@ -40,7 +40,9 @@ pub use genesis_run::{
     genesis_envelope, genesis_whole_run, FaultAction, FaultPlan, FaultRule, FrameKind,
     GenesisRunReport, GenesisRunSpec, GenesisWorkerReport,
 };
-pub use live_genesis::{live_genesis, role_grants_hash, LiveGenesis, LiveGenesisSpec};
+pub use live_genesis::{
+    live_genesis, role_grants_hash, CorpusObject, LiveGenesis, LiveGenesisSpec,
+};
 pub use run::{whole_run, ReplayReport, RunSpec, WholeRunReport};
 
 use daemon_vhc_host::{EngineConfig, Worker};

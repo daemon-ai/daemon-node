@@ -363,6 +363,50 @@ pub(crate) async fn fetch_artifact_from_store(
     Ok(bytes)
 }
 
+/// Bind the run's **genesis-pinned artifact plane** over the session's committed-payload plane, so
+/// the module-driven `data.fetch` seat resolves a pinned content id at the url the ENVELOPE commits
+/// (`modules/<blake3>.wasm`, `corpus/<blake3>.cbor`, `corpus/<fold>.bin`, …) instead of looking for
+/// it under the payload plane's own `payload/<hex>` key, where nothing publishes it.
+///
+/// This is the runtime twin of [`fetch_genesis_artifact`] — the same resolver, the same on-disk
+/// content cache, the same presign context — for the artifacts the GUEST fetches rather than the
+/// ones the worker fetches on its behalf. Hashes the envelope does not pin (committed payloads,
+/// checkpoint documents, det-state family chunks) fall through to `content` unchanged.
+#[cfg(feature = "vhc-net")]
+pub(crate) fn pinned_artifact_plane(
+    genesis: &GenesisRun,
+    run_label: &str,
+    content: std::sync::Arc<dyn daemon_vhc_net::ContentStore>,
+) -> Result<std::sync::Arc<dyn daemon_vhc_net::ContentStore>, String> {
+    let pinned: std::collections::BTreeMap<daemon_vhc_net::ContentHash, String> = genesis
+        .env
+        .artifacts
+        .values()
+        .map(|a| (a.blake3, a.url.clone()))
+        .collect();
+    if pinned.is_empty() {
+        return Ok(content);
+    }
+    let mut ctx = store_fetch_context();
+    // The presign RunId is the run label the SESSION's content plane is namespaced under
+    // (`R2Store::new(.., RunId::new(run_label))`), because a pinned artifact and a committed
+    // payload live in two namespaces of the SAME per-run bucket prefix. (On the fleet the run label
+    // is the genesis hash hex, so this is also the module fetch's prefix.)
+    ctx.run_id = run_label.to_string();
+    // No presign base means no artifact plane to resolve against (the referenceless in-process
+    // seat, or a filesystem content plane that already holds everything by content address) —
+    // leave the content plane bound alone rather than wrapping it with a resolver that can only
+    // refuse.
+    if ctx.presign_base.is_none() {
+        return Ok(content);
+    }
+    let cache = open_content_cache(&ctx).ok();
+    let resolver = store_resolver(&ctx)?;
+    Ok(std::sync::Arc::new(
+        daemon_vhc_net::PinnedArtifactStore::new(pinned, resolver, cache, content),
+    ))
+}
+
 /// Decode a 64-char lowercase-hex blake3 into a content hash.
 #[cfg(feature = "vhc-net")]
 pub(crate) fn hash_from_hex(s: &str) -> Option<daemon_vhc_net::ContentHash> {

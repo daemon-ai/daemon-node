@@ -139,7 +139,7 @@ async fn join_live(
         daemon_vhc_session::distribution::DistributionRecord::Cert(binding.own_cert.clone())
             .to_bytes()
             .map_err(|e| format!("certificate announcement: {e}"))?;
-    let providers = build_role_providers(LiveAttachInputs {
+    let mut providers = build_role_providers(LiveAttachInputs {
         credentials: creds,
         coordinator,
         run_label: run_id,
@@ -147,6 +147,11 @@ async fn join_live(
         keystore: &keystore,
     })
     .await?;
+    // The module-driven `data.fetch` seat resolves the run's GENESIS-PINNED artifacts at the urls
+    // the envelope commits (the corpus manifest, tokenizer and chunk-addressed shards live at the
+    // published `corpus/…` keys, not at the committed-payload plane's `payload/<hex>`); everything
+    // else keeps falling through to the payload plane this returned.
+    providers.artifacts = backend::pinned_artifact_plane(genesis, run_id, providers.artifacts)?;
     // Bootstrap trust: the node-authored peer certificates (e.g. the verified seat holder's)
     // plus our own; later arrivals ride the control plane as §12.3 distribution records.
     let mut peer_certs = creds.peer_certs.clone();

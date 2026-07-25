@@ -1022,6 +1022,26 @@ const VHC_T2_SUITES: &[SuiteEntry<'static>] = &[
         &["-p", "daemon-vhc-testkit"],
     ),
     (
+        // The real-geometry round WITH the training math (`ceremony_training_step`): the frozen
+        // ceremony parameter set actually stepped through forward/backward/AdamW before the θ
+        // export and commit — the one seam the training-free round walk and the toy-geometry
+        // trainer goldens leave between them. RELEASE, and `--ignored`, because the optimizer
+        // steps are host fp32 matmuls: 229 s here against >9 min under the test profile, which
+        // would make this lane's wall a property of the profile rather than of the code (the
+        // suite's own `#[ignore]` reason records the measurement).
+        "daemon-vhc-testkit ceremony training-step lane (real geometry WITH the optimizer, release)",
+        &[
+            "-p",
+            "daemon-vhc-testkit",
+            "--release",
+            "--test",
+            "ceremony_training_step",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ],
+    ),
+    (
         // D2's CONSENSUS REPLAY — the third replay tier (architecture §3.6; refactor §10 gate
         // row "Consensus replay from archive alone", tier-2): a third party re-verifies every
         // consensus decision and every digest from the record archive's signed, hash-chained,

@@ -53,9 +53,30 @@ pub struct LiveGenesis {
     pub genesis_hash: [u8; 32],
     /// The corpus manifest's content hash (the `corpus_manifest` pin).
     pub manifest_hash: [u8; 32],
-    /// The corpus objects the payload plane must hold, `(content key, bytes)`: the manifest
-    /// under its blake3, each shard under its chunk-fold identity.
-    pub corpus_objects: Vec<([u8; 32], Vec<u8>)>,
+    /// The corpus objects a run's content planes must hold — each carrying the **genesis-pinned
+    /// url** it is published at, so a harness cannot stage them anywhere the envelope does not say.
+    pub corpus_objects: Vec<CorpusObject>,
+}
+
+/// One published corpus object: the content id the module names, the url the envelope pins, and
+/// the bytes.
+///
+/// Carrying the url (rather than the id alone) is what keeps a staging harness honest. The run-time
+/// artifact plane resolves a pinned content id at the url the ENVELOPE commits — `corpus/<manifest
+/// blake3>.cbor`, `corpus/<fold>.bin` (ABI §12.7 [CC-7], what `xtask publish-corpus` writes) — which
+/// is a different namespace from the committed-payload plane's `payload/<blake3>`. A harness that
+/// staged corpus objects under the payload key instead proved only that the payload plane works: it
+/// left the published layout ungated, and the first fleet trainer to reach the data plane died
+/// fetching its genesis-pinned corpus manifest from a key nothing had ever published it at.
+#[derive(Clone, Debug)]
+pub struct CorpusObject {
+    /// The content id the guest's `data.fetch` names: the manifest's blake3, or a shard's
+    /// domain-separated chunk FOLD (which never equals `blake3(bytes)`).
+    pub id: [u8; 32],
+    /// The genesis artifact-map url this object is published at (`r2://corpus/<…>`).
+    pub url: String,
+    /// The object bytes.
+    pub bytes: Vec<u8>,
 }
 
 /// The coordinator's liveness timing. The baseline tiers run EVENT-DRIVEN (no timer, effectively
@@ -194,16 +215,22 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         .expect("the vendored corpus manifest parses");
     let manifest_hash = blake3_hash(&manifest_bytes);
 
-    // The corpus objects the payload plane serves: the manifest by content hash, each shard by
-    // its fold identity (the fixture files are fold-named by the authoring pipeline).
-    let mut corpus_objects = vec![(manifest_hash.0, manifest_bytes.clone())];
+    // The corpus objects the run's content planes serve: the manifest by content hash, each shard
+    // by its fold identity (the fixture files are fold-named by the authoring pipeline). Each
+    // carries the url the envelope pins it at, which IS the key the publisher writes.
+    let manifest_url = format!("r2://corpus/{}.cbor", manifest_hash.to_hex());
+    let mut corpus_objects = vec![CorpusObject {
+        id: manifest_hash.0,
+        url: manifest_url.clone(),
+        bytes: manifest_bytes.clone(),
+    }];
     let mut granted: BTreeSet<Hash> = BTreeSet::new();
     granted.insert(manifest_hash);
     let mut artifacts = BTreeMap::new();
     artifacts.insert(
         "corpus-manifest.cbor".to_string(),
         SnapshotArtifact {
-            url: format!("r2://corpus/{}.cbor", manifest_hash.to_hex()),
+            url: manifest_url,
             blake3: manifest_hash,
             size: Some(manifest_bytes.len() as u64),
         },
@@ -215,15 +242,20 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         )
         .expect("read a vendored corpus shard");
         granted.insert(shard.shard_hash);
+        let url = format!("r2://corpus/{}.bin", shard.shard_hash.to_hex());
         artifacts.insert(
             format!("shard-{i}.bin"),
             SnapshotArtifact {
-                url: format!("r2://corpus/{}.bin", shard.shard_hash.to_hex()),
+                url: url.clone(),
                 blake3: shard.shard_hash,
                 size: Some(bytes.len() as u64),
             },
         );
-        corpus_objects.push((shard.shard_hash.0, bytes));
+        corpus_objects.push(CorpusObject {
+            id: shard.shard_hash.0,
+            url,
+            bytes,
+        });
     }
 
     let coordinator_hash = blake3_hash(spec.coordinator_wasm);

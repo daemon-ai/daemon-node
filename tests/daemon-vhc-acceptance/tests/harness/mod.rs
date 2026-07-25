@@ -164,9 +164,9 @@ pub fn seed_corpus_fs(shared_payload_root: &Path, run_label: &str, genesis: &Liv
         .join(blake3::hash(run_label.as_bytes()).to_hex().as_str())
         .join("payload");
     std::fs::create_dir_all(&dir).expect("shared payload dir");
-    for (hash, bytes) in &genesis.corpus_objects {
-        let hex = daemon_vhc_proto::Hash(*hash).to_hex();
-        std::fs::write(dir.join(hex.as_str()), bytes).expect("seed corpus object");
+    for object in &genesis.corpus_objects {
+        let hex = daemon_vhc_proto::Hash(object.id).to_hex();
+        std::fs::write(dir.join(hex.as_str()), &object.bytes).expect("seed corpus object");
     }
 }
 
@@ -401,16 +401,41 @@ pub fn spawn_node_with_budget(
 }
 
 /// Seed the run's chunk-addressed corpus objects into the fixture's presigned OBJECT store (the
-/// R2-compatible payload tier): each object under the `runs/<run>/payload/<hex>` key the
-/// production `R2Store` content seam presigns for it. The live trainer fetches them by content
+/// R2-compatible tier) **at the keys the run's own publisher writes** — the genesis artifact map's
+/// url for each object, mapped to a bucket key by the one §11.3 layout function both the registry
+/// and the client share (`daemon_vhc_net::r2_object_key`). The live trainer fetches them by content
 /// hash via `data@2`; the pump verifies covering chunks (the store is untrusted).
+///
+/// **Why not the payload key.** This used to stage every corpus object under
+/// `runs/<run>/payload/<hex>` — the committed-PAYLOAD plane's key ([RS-4]) — which is not where any
+/// publisher puts a corpus object: `xtask publish-corpus` writes `corpus/<manifest blake3>.cbor`,
+/// `corpus/<tokenizer blake3>.json` and `corpus/<fold>.bin` (ABI §12.7 [CC-7]), and those are the
+/// urls the genesis artifact map commits. Staging at the payload key made the suite agree with the
+/// runtime about a layout NOBODY publishes, so the whole module-driven corpus plane passed green
+/// while being unreachable on a real fleet box: the first trainer to get past init died on a typed
+/// `payload miss` fetching its genesis-pinned corpus manifest. Deriving the key from the envelope's
+/// own url is what makes this lane a gate on the PUBLISHED layout rather than on itself.
 pub fn seed_corpus_r2(cluster: &Cluster, run_label: &str, genesis: &LiveGenesis) {
-    for (hash, bytes) in &genesis.corpus_objects {
-        let hex = daemon_vhc_proto::Hash(*hash).to_hex();
-        cluster
-            .registry
-            .put_object(&format!("runs/{run_label}/payload/{hex}"), bytes.clone());
+    for object in &genesis.corpus_objects {
+        cluster.registry.put_object(
+            &published_object_key(run_label, &object.url),
+            object.bytes.clone(),
+        );
     }
+}
+
+/// The bucket key one genesis-pinned `r2://<path>` url resolves to for `run_label`, through the
+/// same §11.3 layout the presign surface mints (`runs/<run>/<path>`).
+fn published_object_key(run_label: &str, url: &str) -> String {
+    let path = url
+        .strip_prefix("r2://")
+        .unwrap_or_else(|| panic!("a published corpus artifact must carry an r2:// url, got {url}"))
+        .trim_start_matches('/');
+    daemon_vhc_net::r2_object_key(
+        &daemon_vhc_net::RunId::new(run_label),
+        &daemon_vhc_net::PresignRequest::artifact(daemon_vhc_net::PresignOp::Get, path),
+    )
+    .expect("artifact presign requests carry a path")
 }
 
 /// A default participation policy (always-on, uncapped — the arbiter is unbounded in-suite).

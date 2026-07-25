@@ -213,20 +213,87 @@ fn init_setup_selected(
 }
 
 /// Ensure the wgpu compute client for `device` is registered under the selected graphics API,
-/// idempotently. The probe brings up `DefaultDevice` (so the ceremony's default-GPU path is
-/// already correct via [`probe_wgpu`]); this is the belt-and-suspenders for a node-directed
-/// *discrete* placement (`WgpuDevice::DiscreteGpu(i)`), which the probe did not register — without
-/// it the router's lazy bring-up would fall back to cubecl's `AutoGraphicsApi` (Vulkan on Windows).
-/// An already-registered device (an "already registered" panic) is caught and left as-is. Never
-/// panics.
+/// idempotently. The probe brings up `DefaultDevice` (so the ceremony's default-GPU path is already
+/// correct via [`probe_wgpu`]); this is the bring-up for an explicitly-placed device, which the
+/// probe did not register — without it the router's lazy bring-up would fall back to cubecl's
+/// `AutoGraphicsApi` (Vulkan on Windows).
+///
+/// An already-registered device (an "already registered" panic) is benign and reported as success.
+/// **Every other bring-up failure is returned**, with the panic's own message and location: this
+/// used to swallow them, so a placement naming an adapter the host does not have registered nothing
+/// and returned "fine" — and the run then met the poisoned router lock that the swallowed panic had
+/// left behind, one call later and with no mention of the device.
+///
+/// # Errors
+/// The recorded panic text when the device cannot be brought up.
 #[cfg(feature = "wgpu")]
-pub fn ensure_wgpu_registered(device: &burn::backend::wgpu::WgpuDevice) {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+pub fn ensure_wgpu_registered(device: &burn::backend::wgpu::WgpuDevice) -> Result<(), String> {
+    let outcome = crate::device_panic::catch(true, || {
         let _ = init_setup_selected(device, burn::backend::wgpu::RuntimeOptions::default());
-    }));
-    std::panic::set_hook(prev);
+    });
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(text) if text.contains("already registered") => Ok(()),
+        Err(text) => Err(text),
+    }
+}
+
+/// The `WgpuDevice` one measured device PLACEMENT names, honouring the adapter class the probe
+/// actually found.
+///
+/// The placement is an ordinal over the devices the worker's own probe inventoried — it is NOT a
+/// statement that the adapter is discrete. Mapping it unconditionally onto
+/// `WgpuDevice::DiscreteGpu(i)` (which selects the i-th DISCRETE adapter) is correct only on a box
+/// whose accelerator happens to be discrete; on a unified/integrated one — every Apple Silicon
+/// seat — it names no adapter at all, the bring-up fails, and the failure only becomes visible as
+/// the backend router's poisoned lock at the first tensor op.
+///
+/// Placement `0` is the device [`probe_wgpu`] measured and registered under the selected graphics
+/// API, so it resolves to `DefaultDevice` — the same adapter whose limits the admitted tuple
+/// records. A higher ordinal is an explicit operator placement (`DAEMON_VHC_GPU_INDEX`) and is
+/// resolved within the probed adapter's class, then registered eagerly so an unbringable placement
+/// refuses HERE rather than deep inside the first device op.
+///
+/// # Errors
+/// A `BackendUnavailable`-vocabulary reason when no adapter is present, when the probed adapter
+/// class cannot carry an ordinal placement, or when the placed device fails to register.
+#[cfg(feature = "wgpu")]
+pub fn wgpu_device_for_placement(
+    placement: Option<u32>,
+) -> Result<burn::backend::wgpu::WgpuDevice, String> {
+    use burn::backend::wgpu::WgpuDevice;
+    let Some(index) = placement else {
+        return Ok(WgpuDevice::DefaultDevice);
+    };
+    let probe = probe_wgpu().ok_or_else(|| {
+        "BackendUnavailable: the wgpu lane was selected but no adapter can be brought up on this \
+         host"
+            .to_string()
+    })?;
+    if index == 0 {
+        // The measured device itself — already up under the selected graphics API.
+        return Ok(WgpuDevice::DefaultDevice);
+    }
+    let device = match probe.device_type.as_str() {
+        "DiscreteGpu" => WgpuDevice::DiscreteGpu(index as usize),
+        "IntegratedGpu" => WgpuDevice::IntegratedGpu(index as usize),
+        "VirtualGpu" => WgpuDevice::VirtualGpu(index as usize),
+        other => {
+            return Err(format!(
+                "BackendUnavailable: device placement {index} cannot be resolved on an adapter the \
+                 probe classifies as `{other}` (only the discrete/integrated/virtual classes carry \
+                 an ordinal; placement 0 is the probed device)"
+            ))
+        }
+    };
+    ensure_wgpu_registered(&device).map_err(|e| {
+        format!(
+            "BackendUnavailable: device placement {index} ({device:?}) failed to register on the \
+             `{}` adapter class: {e}",
+            probe.device_type
+        )
+    })?;
+    Ok(device)
 }
 
 /// Linux `MemTotal` (kB) → MiB. `0` when `/proc/meminfo` is unreadable / unparseable.
@@ -336,13 +403,16 @@ pub fn probe_wgpu() -> Option<WgpuProbe> {
 fn probe_wgpu_uncached() -> Option<WgpuProbe> {
     use burn::backend::wgpu::{RuntimeOptions, WgpuDevice};
 
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     // Tier 1 — canonical bring-up: `init_setup_selected` requests the adapter AND registers the
     // default client UNDER THE SELECTED GRAPHICS API (Dx12 on Windows, else Auto — the DX12 fix),
     // instead of cubecl's `AutoGraphicsApi` which hardcodes Vulkan off macOS. Full adapter info
     // incl. `device_type` (→ `unified`).
-    let attempt = std::panic::catch_unwind(|| {
+    //
+    // Captured `quiet` (an absent adapter is an expected probe outcome, not an incident) through
+    // the RECORDING capture rather than a blanked global hook: the old idiom silenced every
+    // thread's panic report for the duration of the probe, which is how a device runner thread's
+    // primary failure went unreported on a fleet box.
+    let attempt = crate::device_panic::catch(true, || {
         let setup = init_setup_selected(&WgpuDevice::DefaultDevice, RuntimeOptions::default());
         let info = setup.adapter.get_info();
         let limits = setup.adapter.limits();
@@ -358,20 +428,14 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
             unified,
         }
     });
-    std::panic::set_hook(prev);
 
     match attempt {
         Ok(probe) => Some(probe),
-        Err(payload) => {
+        Err(msg) => {
             // Tier 2 — register-or-reuse: an "already registered" panic means an adapter is up
             // (a burn op registered the default client before this probe). Report availability
             // rather than caching `None`; the per-buffer limit / device_type are unknown via reuse
             // (the worker path never hits this — it probes before any wgpu op).
-            let msg = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("");
             if msg.contains("already registered") {
                 Some(WgpuProbe {
                     gpus: 1,

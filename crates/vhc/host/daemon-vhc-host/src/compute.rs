@@ -529,20 +529,11 @@ impl HostCompute {
             #[cfg(feature = "wgpu")]
             crate::runtime::BackendKind::Wgpu => {
                 let slot = DeviceComputeGuard::acquire()?;
-                let device = match cfg.gpu_index {
-                    Some(i) => {
-                        let d = burn::backend::wgpu::WgpuDevice::DiscreteGpu(i as usize);
-                        // The probe registered only `DefaultDevice` under the selected graphics
-                        // API (Dx12 on Windows); a node-directed discrete placement must register
-                        // THAT device under the same API too, else the router's lazy bring-up
-                        // falls back to cubecl's `AutoGraphicsApi` (Vulkan on Windows). Idempotent
-                        // + panic-safe. (The `None`/default path is already brought up by the
-                        // mandatory `backend_available` → `probe_wgpu` that precedes this.)
-                        crate::probe::ensure_wgpu_registered(&d);
-                        d
-                    }
-                    None => burn::backend::wgpu::WgpuDevice::DefaultDevice,
-                };
+                // The placement is an ordinal over the PROBED devices, not a claim that the
+                // adapter is discrete — `wgpu_device_for_placement` resolves it against the class
+                // the probe found and registers it eagerly, so a placement this host cannot serve
+                // refuses here instead of surfacing as a poisoned router lock at the first op.
+                let device = crate::probe::wgpu_device_for_placement(cfg.gpu_index)?;
                 let runner = catch_bringup(|| ComputeRunner::<burn::backend::Wgpu>::new(device))
                     .map_err(|e| format!("wgpu device bring-up: {e}"))?;
                 (SelectedRunner::Wgpu(runner), Some(slot))
@@ -586,9 +577,13 @@ impl HostCompute {
         match &mut self.runner {
             SelectedRunner::Ndarray(r) => r.submit_op(op_cbor),
             #[cfg(feature = "wgpu")]
-            SelectedRunner::Wgpu(r) => r.submit_op(op_cbor),
+            SelectedRunner::Wgpu(r) => {
+                crate::device_panic::run_device_call("submit_op", || r.submit_op(op_cbor))
+            }
             #[cfg(feature = "cuda")]
-            SelectedRunner::Cuda(r) => r.submit_op(op_cbor),
+            SelectedRunner::Cuda(r) => {
+                crate::device_panic::run_device_call("submit_op", || r.submit_op(op_cbor))
+            }
         }
     }
 
@@ -605,9 +600,9 @@ impl HostCompute {
         match &mut self.runner {
             SelectedRunner::Ndarray(r) => r.fence(),
             #[cfg(feature = "wgpu")]
-            SelectedRunner::Wgpu(r) => r.fence(),
+            SelectedRunner::Wgpu(r) => crate::device_panic::run_device_call("fence", || r.fence()),
             #[cfg(feature = "cuda")]
-            SelectedRunner::Cuda(r) => r.fence(),
+            SelectedRunner::Cuda(r) => crate::device_panic::run_device_call("fence", || r.fence()),
         }
     }
 
@@ -621,9 +616,13 @@ impl HostCompute {
         match &mut self.runner {
             SelectedRunner::Ndarray(r) => r.read_tensor(ir_cbor),
             #[cfg(feature = "wgpu")]
-            SelectedRunner::Wgpu(r) => r.read_tensor(ir_cbor),
+            SelectedRunner::Wgpu(r) => {
+                crate::device_panic::run_device_call("read_tensor", || r.read_tensor(ir_cbor))
+            }
             #[cfg(feature = "cuda")]
-            SelectedRunner::Cuda(r) => r.read_tensor(ir_cbor),
+            SelectedRunner::Cuda(r) => {
+                crate::device_panic::run_device_call("read_tensor", || r.read_tensor(ir_cbor))
+            }
         }
     }
 
@@ -637,9 +636,17 @@ impl HostCompute {
         match &mut self.runner {
             SelectedRunner::Ndarray(r) => r.import_tensor(id, data_cbor),
             #[cfg(feature = "wgpu")]
-            SelectedRunner::Wgpu(r) => r.import_tensor(id, data_cbor),
+            SelectedRunner::Wgpu(r) => {
+                crate::device_panic::run_device_call("import_tensor", || {
+                    r.import_tensor(id, data_cbor)
+                })
+            }
             #[cfg(feature = "cuda")]
-            SelectedRunner::Cuda(r) => r.import_tensor(id, data_cbor),
+            SelectedRunner::Cuda(r) => {
+                crate::device_panic::run_device_call("import_tensor", || {
+                    r.import_tensor(id, data_cbor)
+                })
+            }
         }
     }
 
@@ -668,22 +675,14 @@ impl HostCompute {
     }
 }
 
-/// Run a device bring-up closure under `catch_unwind` with the panic hook silenced (the probe
-/// idiom this crate already uses): cubecl panics on a missing/failed adapter, and that panic
-/// must surface as a typed error on the guest thread — never a host abort.
+/// Run a device bring-up closure under the recording panic capture: cubecl panics on a
+/// missing/failed adapter, and that panic must surface as a typed error on the guest thread —
+/// never a host abort, and never a payload the caller cannot read. `quiet` because a bring-up
+/// failure here is EXPECTED and reported by the caller; the recorder keeps the message + location
+/// either way ([`crate::device_panic`]).
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 fn catch_bringup<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Result<T, String> {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let res = std::panic::catch_unwind(f);
-    std::panic::set_hook(prev);
-    res.map_err(|payload| {
-        payload
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "device bring-up panicked".to_string())
-    })
+    crate::device_panic::catch(true, f)
 }
 
 /// Minimal blocking executor for the runner's readback future. A synchronous backend's

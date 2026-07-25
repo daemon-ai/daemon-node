@@ -388,6 +388,77 @@ pub fn ceremony_trainer_config_round_walk(roster: &[PeerId]) -> Value {
     Value::Map(patched)
 }
 
+/// The frozen ceremony trainer config in its **training-step gate** form: the harness form with
+/// real training math at the frozen profile, over a SHORTENED sequence.
+///
+/// # Why this form exists
+///
+/// [`ceremony_trainer_config_round_walk`] deliberately drops the inner loop (`steps_per_round = 0`)
+/// so the state walks can be gated at the real geometry in minutes. That leaves one seam untested
+/// at ceremony scale: the round path WITH the optimizer running — 786_507_264 real parameters
+/// stepped through forward → backward → `inner_update` → the round-final fence → the θ export the
+/// commitment is built from. Every lane that runs the training math (the trainer goldens) runs it
+/// at a toy geometry, and every lane at this geometry skips it, so nothing in the battery observed
+/// what a fleet peer does between "init finished" and "round 0 committed".
+///
+/// # The bound, and why it still covers the seam
+///
+/// `seq_len` is the ONE deviation, and it is the only knob that buys the difference: a step's
+/// arithmetic is `O(parameters × tokens)`, so the frozen 2048-token sequence makes a single CPU
+/// step ~9.7 TFLOP — hours per round, which is not a gate. `steps_per_round` and the sequence are
+/// the caller's, and the recommended bound is a short sequence with more than one step.
+///
+/// What shortening the sequence does NOT change is exactly what this lane is for. The parameter
+/// layout, the optimizer state, the gradient buffers, the per-parameter device traffic, the
+/// compression profile (`topk = 64`) and the export/commit walks are all `O(parameters)` and run at
+/// FULL ceremony size at any sequence length; only the activation tensors scale with the sequence.
+/// So the residency, readback, fuel and device-op behaviour of a real training step at this
+/// geometry is exercised, while the part that is merely expensive is not. `> 1` step is required
+/// because the AdamW accumulation boundary (`inner_update`) only behaves like a round's inner loop
+/// when there is more than one step to accumulate across.
+///
+/// Everything else — the model geometry, the state contract, the pinned `expected_root`, the window
+/// size, the profile, the roster shape — is shared with the fleet form by construction.
+///
+/// # Panics
+/// If `seq_len` is zero (a step with no tokens is not a training step).
+#[must_use]
+pub fn ceremony_trainer_config_training_step(
+    roster: &[PeerId],
+    steps_per_round: u64,
+    seq_len: u32,
+) -> Value {
+    assert!(seq_len > 0, "a training step needs at least one token");
+    let Value::Map(fields) = ceremony_trainer_config_harness(roster) else {
+        unreachable!("the harness form is a map")
+    };
+    let patched = fields
+        .into_iter()
+        .map(|(k, v)| match &k {
+            Value::Text(name) if name == "steps_per_round" => {
+                (k, Value::Integer(steps_per_round.into()))
+            }
+            Value::Text(name) if name == "model" => {
+                let Value::Map(model) = v else {
+                    unreachable!("the frozen model is a map")
+                };
+                let model = model
+                    .into_iter()
+                    .map(|(mk, mv)| match &mk {
+                        Value::Text(f) if f == "seq_len" => {
+                            (mk, Value::Integer(u64::from(seq_len).into()))
+                        }
+                        _ => (mk, mv),
+                    })
+                    .collect();
+                (k, Value::Map(model))
+            }
+            _ => (k, v),
+        })
+        .collect();
+    Value::Map(patched)
+}
+
 /// The real fleet RUN TIMERS + stop condition the ceremony operator calibrates at preflight and
 /// binds into the coordinator config — closing the documented "the fleet operator tunes real
 /// timers at preflight" seam inside this reviewed module instead of at a CLI.
