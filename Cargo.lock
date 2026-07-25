@@ -5166,6 +5166,7 @@ dependencies = [
  "daemon-vhc-det",
  "daemon-vhc-guest-build",
  "daemon-vhc-host",
+ "daemon-vhc-net",
  "daemon-vhc-node",
  "daemon-vhc-observe",
  "daemon-vhc-proto",

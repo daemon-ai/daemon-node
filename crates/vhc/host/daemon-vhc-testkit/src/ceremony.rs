@@ -50,6 +50,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ciborium::value::Value;
 
+use daemon_vhc_net::PublishedArtifact;
 use daemon_vhc_proto::det_state::{
     derive_state_chunk_size, family_byte_len, family_fold, validate_checkpoint_cadence,
     validate_profile_chunk, validate_state_chunk_size,
@@ -508,9 +509,11 @@ pub struct CeremonyGenesisSpec<'a> {
     /// The pinned corpus manifest hash (the published TinyStories corpus under the TinyLlama
     /// SentencePiece tokenizer) — committed as the run's data identity.
     pub corpus_manifest: Hash,
-    /// The published corpus objects to map + grant, `(artifact name, content hash)` — the
-    /// manifest plus its shard folds (the trainer's `data@2` fetch grants).
-    pub corpus_artifacts: &'a [(String, Hash)],
+    /// The published corpus objects to map + grant, `(artifact name, published object)` — the
+    /// manifest, the tokenizer and every shard fold (the trainer's `data@2` fetch grants). Each
+    /// object carries its KIND, which is what fixes the key it is published at
+    /// ([`PublishedArtifact`]).
+    pub corpus_artifacts: &'a [(String, PublishedArtifact)],
     /// The sequence length the corpus was tokenized at (coordinator run config).
     pub seq_len: u64,
     /// Every participating peer's genesis-trusted base identity (the trust set).
@@ -558,21 +561,23 @@ pub fn ceremony_genesis(
     )
     .map_err(|e| e.to_string())?;
 
-    // Artifacts: the two modules + the published corpus objects (manifest + shards).
+    // Artifacts: the two modules + the published corpus objects (manifest, tokenizer, shards).
     //
-    // The `url` is a provenance NOTE only — module fetch is content-addressed and never parses this
-    // string (the node presigns the `modules/<blake3>.wasm` key and blake3-verifies —
-    // `daemon-vhc-net/src/content_cache.rs`). It is written in the honest **content-addressed**
-    // form `r2://modules/<blake3>.wasm`, matching what `publish-module` uploads (fetch resolves the
-    // same content key). The publish layout also prefixes a run (`runs/<run>/modules/<blake3>.wasm`),
-    // but the run id is the blake3 of THIS envelope — it cannot be known while authoring the
-    // envelope that defines it (circular) — so the note uses the run-agnostic content-addressed
-    // key rather than embedding a placeholder or a not-yet-known run prefix.
+    // Every `url` is derived from [`PublishedArtifact`] — the one place the run's published key
+    // scheme is spelled — so the url a role fetches from is by construction the key the run's own
+    // publisher (`xtask publish-module` / `publish-corpus`) writes. Spelling the scheme here as
+    // well is how the corpus urls came to omit the publisher's suffix, which made every
+    // genesis-pinned corpus fetch presign a key nothing had published.
+    //
+    // The publish layout also prefixes a run (`runs/<run>/modules/<blake3>.wasm`), but the run id is
+    // the blake3 of THIS envelope — it cannot be known while authoring the envelope that defines it
+    // (circular) — so the url carries the run-relative path and the presign surface prefixes the run
+    // (`daemon_vhc_net::r2_object_key`, §11.3).
     let mut artifacts = BTreeMap::new();
     artifacts.insert(
         "coordinator.wasm".to_string(),
         SnapshotArtifact {
-            url: format!("r2://modules/{}.wasm", spec.coordinator_module.to_hex()),
+            url: PublishedArtifact::Module(spec.coordinator_module).url(),
             blake3: spec.coordinator_module,
             size: None,
         },
@@ -580,22 +585,23 @@ pub fn ceremony_genesis(
     artifacts.insert(
         "worker.wasm".to_string(),
         SnapshotArtifact {
-            url: format!("r2://modules/{}.wasm", spec.trainer_module.to_hex()),
+            url: PublishedArtifact::Module(spec.trainer_module).url(),
             blake3: spec.trainer_module,
             size: None,
         },
     );
     let mut granted: BTreeSet<Hash> = BTreeSet::new();
-    for (name, hash) in spec.corpus_artifacts {
+    for (name, object) in spec.corpus_artifacts {
+        let content_id = object.content_id();
         artifacts.insert(
             name.clone(),
             SnapshotArtifact {
-                url: format!("r2://corpus/{}", hash.to_hex()),
-                blake3: *hash,
+                url: object.url(),
+                blake3: content_id,
                 size: None,
             },
         );
-        granted.insert(*hash);
+        granted.insert(content_id);
     }
     granted.insert(spec.corpus_manifest);
 
@@ -912,8 +918,14 @@ mod tests {
         let trusted = [base(1), base(2), base(3)]; // Strix Halo + M4 + Windows 5090
         let manifest = Hash([0xAB; 32]);
         let corpus_artifacts = vec![
-            ("corpus-manifest.cbor".to_string(), manifest),
-            ("shard-0.bin".to_string(), Hash([0x01; 32])),
+            (
+                "corpus-manifest.cbor".to_string(),
+                PublishedArtifact::CorpusManifest(manifest),
+            ),
+            (
+                "shard-0.bin".to_string(),
+                PublishedArtifact::CorpusShard(Hash([0x01; 32])),
+            ),
         ];
         let spec = CeremonyGenesisSpec {
             run_label: "vhc-ceremony",
@@ -992,7 +1004,10 @@ mod tests {
         let base = |n: u8| daemon_vhc_proto::peer_id(&SigningKey::from_bytes(&[n; 32]));
         let trusted = [base(1), base(2), base(3)];
         let manifest = Hash([0xAB; 32]);
-        let corpus_artifacts = vec![("corpus-manifest.cbor".to_string(), manifest)];
+        let corpus_artifacts = vec![(
+            "corpus-manifest.cbor".to_string(),
+            PublishedArtifact::CorpusManifest(manifest),
+        )];
         let make = |timers: CeremonyRunTimers| CeremonyGenesisSpec {
             run_label: "vhc-ceremony",
             coordinator_module: Hash([0xC0; 32]),

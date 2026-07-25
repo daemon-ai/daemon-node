@@ -55,5 +55,12 @@ serde_json = { workspace = true }
 hf-hub = { workspace = true }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
+[dev-dependencies]
+# The publisher↔author parity gate drives the REAL `publish-module`/`publish-corpus` into the
+# reusable mock presign/object server and then resolves every `ceremony_genesis`-pinned url back
+# through the product artifact plane. Test-only: the shipped `cargo build -p xtask` never enables
+# `harness` (and the acceptance suite already enables it in the workspace build).
+daemon-vhc-net = { workspace = true, features = ["harness"] }
+
 [lints]
 workspace = true

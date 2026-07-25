@@ -25,6 +25,10 @@ two-layer split on opposite sides of the wasm boundary). vhc_dep_check enforces 
 # `harness` exposes the host's whole-run coordinator drive (the testkit's coordinator seat is a
 # re-export of it) — the testkit is wholesale harness tooling, so the feature is always on here.
 daemon-vhc-host = { workspace = true, features = ["harness"] }
+# The run's PUBLISHED artifact key scheme (`PublishedArtifact`): both genesis-authoring seats here
+# derive every artifact-map url from it, so an authored url is by construction the key the run's own
+# publisher writes. host/* -> host/* (allowed). Default features only — no iroh, no WS.
+daemon-vhc-net = { workspace = true }
 # The shared ABI vocabulary (event tags, channel table, stop reasons, outcome codes). contracts/*.
 daemon-vhc-abi = { workspace = true }
 # The signed control-plane wire (SignedMessage / VhcMessage), envelope, blake3. contracts/*.

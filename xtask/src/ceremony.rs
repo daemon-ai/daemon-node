@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 
+use daemon_vhc_net::PublishedArtifact;
 use daemon_vhc_proto::corpus::CorpusManifest;
 use daemon_vhc_proto::{
     blake3_hash, to_canonical_vec, FrozenGenesis, Hash, PeerId, SignedEnvelope, SigningKey,
@@ -149,15 +150,7 @@ pub fn run(args: Args) -> Result<()> {
         manifest.seq_len
     );
 
-    // The trainer role's `data@2` fetch grants: the manifest + the tokenizer + every shard, each by
-    // its content/fold identity — exactly the set `publish-corpus` uploads and prints.
-    let mut corpus_artifacts: Vec<(String, Hash)> = vec![
-        ("corpus-manifest.cbor".to_string(), corpus_manifest_hash),
-        ("tokenizer.json".to_string(), manifest.tokenizer.hash),
-    ];
-    for (i, shard) in manifest.shards.iter().enumerate() {
-        corpus_artifacts.push((format!("shard-{i}.bin"), shard.shard_hash));
-    }
+    let corpus_artifacts = corpus_artifact_pins(&manifest, corpus_manifest_hash);
 
     let timers = CeremonyRunTimers {
         warmup_s: args.warmup_s,
@@ -256,6 +249,33 @@ pub fn run(args: Args) -> Result<()> {
     println!("  wrote envelope.cbor, envelope.b64, run-id.txt, authoring-report.txt");
     print!("\n{report}");
     Ok(())
+}
+
+/// The trainer role's `data@2` artifact map + fetch grants for `manifest`: the manifest, the
+/// tokenizer and every shard, each by its content/fold identity AND its published KIND — exactly
+/// the set `publish-corpus` uploads, at the keys `publish-corpus` writes (both sides derive them
+/// from [`PublishedArtifact`], so an authored url is the published key by construction).
+fn corpus_artifact_pins(
+    manifest: &CorpusManifest,
+    manifest_hash: Hash,
+) -> Vec<(String, PublishedArtifact)> {
+    let mut pins = vec![
+        (
+            "corpus-manifest.cbor".to_string(),
+            PublishedArtifact::CorpusManifest(manifest_hash),
+        ),
+        (
+            "tokenizer.json".to_string(),
+            PublishedArtifact::CorpusTokenizer(manifest.tokenizer.hash),
+        ),
+    ];
+    for (i, shard) in manifest.shards.iter().enumerate() {
+        pins.push((
+            format!("shard-{i}.bin"),
+            PublishedArtifact::CorpusShard(shard.shard_hash),
+        ));
+    }
+    pins
 }
 
 /// Wrap a frozen genesis into its canonical [`SignedEnvelope`] wire form — the exact object the
@@ -413,11 +433,18 @@ mod tests {
         ceremony_genesis, CeremonyGenesisSpec, CeremonyRunTimers, CEREMONY_SEQ_LEN,
     };
 
+    /// The fixture tokenizer artifact's bytes (its blake3 is the manifest's tokenizer identity).
+    const FIXTURE_TOKENIZER: &[u8] = b"tokenizer-fixture";
+
+    /// The fixture shard's bytes: 2048 u16 tokens = exactly one sequence in one 4 MiB chunk.
+    fn fixture_shard_bytes() -> Vec<u8> {
+        vec![0u8; (CEREMONY_SEQ_LEN as usize) * 2]
+    }
+
     /// A minimal single-shard corpus manifest at the frozen ceremony sequence length — enough to
     /// author a valid smoke genesis.
     fn minimal_manifest() -> CorpusManifest {
-        // 2048 u16 tokens = exactly one sequence in one 4 MiB chunk.
-        let bytes = vec![0u8; (CEREMONY_SEQ_LEN as usize) * 2];
+        let bytes = fixture_shard_bytes();
         let shard = CorpusManifest::author_shard(
             &bytes,
             u64::from(CEREMONY_SEQ_LEN),
@@ -434,7 +461,7 @@ mod tests {
             pad_id: Some(2),
             chunk_size: CORPUS_DEFAULT_CHUNK_SIZE,
             tokenizer: TokenizerId {
-                hash: blake3_hash(b"tokenizer-fixture"),
+                hash: blake3_hash(FIXTURE_TOKENIZER),
                 name: "fixture".into(),
                 revision: "deadbeef".into(),
             },
@@ -455,10 +482,19 @@ mod tests {
         let author = SigningKey::from_bytes(&[7u8; 32]);
         let manifest = minimal_manifest();
         let manifest_hash = manifest.manifest_hash().expect("manifest hash");
-        let corpus_artifacts: Vec<(String, Hash)> = vec![
-            ("corpus-manifest.cbor".to_string(), manifest_hash),
-            ("tokenizer.json".to_string(), manifest.tokenizer.hash),
-            ("shard-0.bin".to_string(), manifest.shards[0].shard_hash),
+        let corpus_artifacts: Vec<(String, PublishedArtifact)> = vec![
+            (
+                "corpus-manifest.cbor".to_string(),
+                PublishedArtifact::CorpusManifest(manifest_hash),
+            ),
+            (
+                "tokenizer.json".to_string(),
+                PublishedArtifact::CorpusTokenizer(manifest.tokenizer.hash),
+            ),
+            (
+                "shard-0.bin".to_string(),
+                PublishedArtifact::CorpusShard(manifest.shards[0].shard_hash),
+            ),
         ];
         let base = PeerId::new([9u8; 32]);
         let spec = CeremonyGenesisSpec {
@@ -506,5 +542,164 @@ mod tests {
             daemon_vhc_proto::from_canonical_slice::<SignedEnvelope>(frozen.bytes()).is_err(),
             "the inner frozen genesis must NOT masquerade as a SignedEnvelope wire form",
         );
+    }
+
+    /// A unique scratch directory for the fixture corpus + modules (xtask is maintainer tooling;
+    /// its raw fs is covered by main.rs's crate-level allow).
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "daemon-vhc-{tag}-{pid}-{nanos}",
+            pid = std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        dir
+    }
+
+    /// **The publisher↔author parity gate.** Author the FROZEN ceremony genesis, run the REAL
+    /// publisher (`publish-module` + `publish-corpus`) into an object store, and then resolve
+    /// EVERY artifact that genesis pins — modules and corpus objects alike — through the PRODUCT
+    /// artifact plane (`PinnedArtifactStore` over `ArtifactResolver`, the seat the worker binds for
+    /// the module-driven `data.fetch`), by content id, at the url the envelope commits.
+    ///
+    /// **Why it has to be shaped this way.** The acceptance corpus lane stages each object at a key
+    /// DERIVED FROM the genesis url under test, so it agrees with whatever the genesis says and
+    /// cannot notice a genesis pointing where nothing publishes — and it authors with
+    /// `live_genesis`, not with the `ceremony_genesis` a fleet box actually runs. That blind spot
+    /// let the ceremony authoring commit `r2://corpus/<hash>` while the publisher wrote
+    /// `corpus/<hash>.cbor|.json|.bin`: every genesis-pinned corpus fetch presigned a key nothing
+    /// had published, took a 404, and the trainer guest's fail-loud `expect` trapped at init. Here
+    /// the staging side is the publisher's own code and the authoring side is the frozen ceremony
+    /// path, so the two can only pass by agreeing on the key.
+    ///
+    /// The content plane behind the pinned plane is EMPTY, so nothing can resolve by falling
+    /// through to the committed-payload namespace: every byte returned came from the published key.
+    #[test]
+    fn genesis_pinned_urls_resolve_against_the_publishers_own_keys() {
+        use crate::publish::Target;
+        use daemon_vhc_net::mock_r2::MockR2;
+        use daemon_vhc_net::{
+            ArtifactResolver, ContentHash, ContentStore, MemoryContentStore, PinnedArtifactStore,
+            RunId,
+        };
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        // The wiremock presign/object server runs on this runtime; the publisher builds its OWN
+        // runtime (as the CLI does), so it must be called from outside this one's context.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let mock = rt.block_on(MockR2::start());
+
+        // -- the fixture the publisher reads: a corpus laid out as `publish-corpus` expects it,
+        //    plus the two modules `publish-module` uploads --------------------------------------
+        let dir = scratch_dir("ceremony-publish-parity");
+        let manifest = minimal_manifest();
+        let manifest_bytes = manifest.to_canonical_bytes().expect("canonical manifest");
+        let manifest_hash = blake3_hash(&manifest_bytes);
+        let shard_bytes = fixture_shard_bytes();
+        let shard_hash = manifest.shards[0].shard_hash;
+        std::fs::write(dir.join("corpus-manifest.cbor"), &manifest_bytes).expect("write manifest");
+        std::fs::write(dir.join("tokenizer.json"), FIXTURE_TOKENIZER).expect("write tokenizer");
+        std::fs::write(
+            dir.join(format!("{}.bin", shard_hash.to_hex())),
+            &shard_bytes,
+        )
+        .expect("write shard");
+
+        let coordinator_wasm = b"coordinator module bytes".to_vec();
+        let trainer_wasm = b"trainer module bytes".to_vec();
+        std::fs::write(dir.join("coordinator.wasm"), &coordinator_wasm).expect("write coordinator");
+        std::fs::write(dir.join("worker.wasm"), &trainer_wasm).expect("write trainer");
+
+        // -- author the FROZEN ceremony genesis (the only genesis a fleet box runs) --------------
+        let author = SigningKey::from_bytes(&[11u8; 32]);
+        let base = PeerId::new([5u8; 32]);
+        let corpus_artifacts = corpus_artifact_pins(&manifest, manifest_hash);
+        let spec = CeremonyGenesisSpec {
+            run_label: "ceremony-publish-parity",
+            coordinator_module: blake3_hash(&coordinator_wasm),
+            trainer_module: blake3_hash(&trainer_wasm),
+            corpus_manifest: manifest_hash,
+            corpus_artifacts: &corpus_artifacts,
+            seq_len: u64::from(CEREMONY_SEQ_LEN),
+            trusted_bases: &[base],
+            roster: &[base],
+            upgrade_authority: Vec::new(),
+            min_peers: 1,
+            max_peers: 1,
+            remote_ckpt_cadence_rounds: 2,
+            payload_retention_rounds: 64,
+            timers: CeremonyRunTimers::default(),
+        };
+        let frozen = ceremony_genesis(&spec, &author).expect("author ceremony genesis");
+        // The run id IS the genesis hash, and the publish layout is namespaced by it — so the
+        // objects land under exactly the prefix this run's presign context reads from.
+        let run_id = frozen.run_id().to_hex();
+
+        // -- publish, through the shipped publisher, at ITS keys ---------------------------------
+        let target = || Target {
+            presign_base: mock.coordinator_base(),
+            run: run_id.clone(),
+            bearer: None,
+            internal: None,
+        };
+        crate::publish::publish_module(dir.join("coordinator.wasm"), target())
+            .expect("publish the coordinator module");
+        crate::publish::publish_module(dir.join("worker.wasm"), target())
+            .expect("publish the trainer module");
+        crate::publish::publish_corpus(dir.join("corpus-manifest.cbor"), target())
+            .expect("publish the corpus");
+
+        // -- resolve every pinned artifact through the product plane -----------------------------
+        let env = frozen.decode().expect("decode the frozen genesis");
+        // The worker's own binding (`daemon-vhc-worker` `pinned_artifact_plane`): content id -> the
+        // url the ENVELOPE commits.
+        let pinned: BTreeMap<ContentHash, String> = env
+            .artifacts
+            .values()
+            .map(|a| (a.blake3, a.url.clone()))
+            .collect();
+        let expected: BTreeMap<ContentHash, Vec<u8>> = BTreeMap::from([
+            (blake3_hash(&coordinator_wasm), coordinator_wasm.clone()),
+            (blake3_hash(&trainer_wasm), trainer_wasm.clone()),
+            (manifest_hash, manifest_bytes.clone()),
+            (blake3_hash(FIXTURE_TOKENIZER), FIXTURE_TOKENIZER.to_vec()),
+            (shard_hash, shard_bytes.clone()),
+        ]);
+        assert_eq!(
+            env.artifacts.len(),
+            expected.len(),
+            "the genesis pins two modules, the manifest, the tokenizer and one shard"
+        );
+        assert_eq!(pinned.len(), expected.len(), "distinct content ids");
+
+        let resolver = ArtifactResolver::with_egress(mock.egress())
+            .with_presign(Arc::new(mock.presign_client()), RunId::new(&run_id));
+        let store =
+            PinnedArtifactStore::new(pinned, resolver, None, Arc::new(MemoryContentStore::new()));
+        rt.block_on(async {
+            for (name, artifact) in &env.artifacts {
+                let bytes = store
+                    .get_content(&artifact.blake3)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "`{name}` is pinned at {} but the publisher wrote no such object: {e}",
+                            artifact.url
+                        )
+                    });
+                assert_eq!(
+                    &bytes,
+                    expected.get(&artifact.blake3).expect("a pinned content id"),
+                    "`{name}` resolved to the wrong object at {}",
+                    artifact.url
+                );
+            }
+        });
+
+        std::fs::remove_dir_all(&dir).expect("clean the scratch dir");
     }
 }
