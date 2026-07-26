@@ -101,6 +101,62 @@ pub enum EnforcementClass {
     ProfiledAndMeasured,
 }
 
+/// What a cost term's figure actually rests on.
+///
+/// Without this, an invented workspace ratio is byte-indistinguishable from a measured one. The
+/// two-enforcement-classes rule requires the classes to be recorded **distinctly** in every
+/// conformance record and certification statement, and that is not satisfiable from a single
+/// profile-level evidence digest: the digest says the profile was certified, not which of its
+/// twenty-odd terms anybody actually observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationBasis {
+    /// Observed on the running implementation — from allocator statistics or a direct probe.
+    Measured,
+    /// Read out of the backend implementation's own source or its documented behavior. Grounded,
+    /// but not observed on this machine.
+    SourceGrounded,
+    /// A deliberately conservative upper bound, where neither measurement nor source was
+    /// available. Over-reserves on purpose.
+    ConservativeBound,
+    /// Not calibrated at all. The term is a placeholder, and the profile is **not** certified for
+    /// it — a statement citing this profile has to say so.
+    Absent,
+}
+
+impl CalibrationBasis {
+    /// Whether this basis is evidence about the running implementation rather than about a
+    /// document or a guess.
+    pub fn is_observed(self) -> bool {
+        matches!(self, Self::Measured)
+    }
+}
+
+/// How many of a profile's terms rest on each basis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalibrationSummary {
+    /// Terms observed on the running implementation.
+    pub measured: usize,
+    /// Terms grounded in the implementation's source or documentation.
+    pub source_grounded: usize,
+    /// Terms carrying a deliberate conservative bound.
+    pub conservative_bound: usize,
+    /// Terms with no calibration at all.
+    pub absent: usize,
+}
+
+impl CalibrationSummary {
+    /// Whether every term rests on something.
+    pub fn is_complete(&self) -> bool {
+        self.absent == 0
+    }
+
+    /// The total number of terms summarized.
+    pub fn total(&self) -> usize {
+        self.measured + self.source_grounded + self.conservative_bound + self.absent
+    }
+}
+
 /// A logical quantity the planner supplies when it evaluates a profile formula. The formula
 /// language is deliberately over *logical* inputs: a profile prices logical demand, it does not
 /// re-derive it.
@@ -301,6 +357,18 @@ pub struct CostTerm {
     /// Whether conformance evidence established this term's sharing behavior. When false the term
     /// MUST use [`CompositionRule::Sum`].
     pub sharing_evidenced: bool,
+    /// What this term's figure rests on.
+    pub calibration_basis: CalibrationBasis,
+    /// For a [`EnforcementClass::ProfiledAndMeasured`] term, the scope at which the backend
+    /// actually **exposes** the statistic that observes it — which is not always the scope the
+    /// allocation happens at, and differs across backends.
+    ///
+    /// Required for that class and forbidden for the other. `[RC-10]` compares hidden and shared
+    /// usage with the aggregate claim *at the scope where it is measurable*, and a per-role
+    /// certification must not claim attribution for a driver statistic that exists only per
+    /// process or per device. Without this member there is nothing to compare at, so the clause
+    /// could be written into a certification statement without being true of anything.
+    pub observation_scope: Option<AllocationScope>,
 }
 
 impl CostTerm {
@@ -338,6 +406,23 @@ impl CostTerm {
                  composes per-role terms across roles, so this would count them twice",
                 self.name
             )));
+        }
+        match (self.enforcement, self.observation_scope) {
+            (EnforcementClass::ProfiledAndMeasured, None) => {
+                return Err(ProfileError::Invalid(format!(
+                    "term `{}` is profiled-and-measured but names no observation scope; there is \
+                     then no scope at which its aggregate comparison is defined",
+                    self.name
+                )))
+            }
+            (EnforcementClass::DirectlyEnforceable, Some(_)) => {
+                return Err(ProfileError::Invalid(format!(
+                    "term `{}` is directly enforceable, so it is attributed per role at creation \
+                     and must not also name an observation scope",
+                    self.name
+                )))
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -431,6 +516,12 @@ pub struct Headroom {
     /// A flat reserve held against allocations the host cannot intercept at all — the
     /// profiled hidden-overhead reserve of `[RC-10]`(3).
     pub hidden_overhead_reserve_bytes: u64,
+    /// The scope at which the hidden overhead is actually **observable** on this backend. It must
+    /// appear in the ledger as its own visible component at this scope, rather than folded into a
+    /// per-role total, and it is never enforced per allocation.
+    pub hidden_overhead_observation_scope: AllocationScope,
+    /// What the hidden-overhead figure rests on.
+    pub hidden_overhead_basis: CalibrationBasis,
     /// Plain-language statement of what the uncertainty is and where it comes from. A headroom
     /// figure with no stated basis is a guess wearing a measurement's clothes.
     pub basis: String,
@@ -453,6 +544,14 @@ impl Headroom {
         if self.basis.trim().is_empty() {
             return Err(ProfileError::Invalid(
                 "headroom must state the basis of its uncertainty".into(),
+            ));
+        }
+        if self.hidden_overhead_observation_scope == AllocationScope::PerAllocation {
+            return Err(ProfileError::Invalid(
+                "the hidden-overhead reserve is an aggregate occupancy figure and cannot be \
+                 observed per allocation; it is budgeted and observed in aggregate, never \
+                 individually enforced"
+                    .into(),
             ));
         }
         Ok(())
@@ -647,6 +746,41 @@ impl BackendExecutionProfile {
             .iter()
             .find(|w| w.operation_family == family)
     }
+
+    /// How many of this profile's terms rest on each calibration basis, the hidden-overhead reserve
+    /// included. This is what a certification statement reports instead of "the profile was
+    /// certified".
+    pub fn calibration_summary(&self) -> CalibrationSummary {
+        let mut summary = CalibrationSummary::default();
+        for basis in self
+            .terms()
+            .map(|t| t.calibration_basis)
+            .chain(std::iter::once(self.headroom.hidden_overhead_basis))
+        {
+            let slot = match basis {
+                CalibrationBasis::Measured => &mut summary.measured,
+                CalibrationBasis::SourceGrounded => &mut summary.source_grounded,
+                CalibrationBasis::ConservativeBound => &mut summary.conservative_bound,
+                CalibrationBasis::Absent => &mut summary.absent,
+            };
+            *slot += 1;
+        }
+        summary
+    }
+
+    /// The terms this profile claims to have **measured**.
+    ///
+    /// A binary that cannot report allocator statistics cannot reproduce the evidence behind these,
+    /// which is what [`crate::trust::authenticate`] refuses on.
+    pub fn measured_terms(&self) -> impl Iterator<Item = &CostTerm> {
+        self.terms().filter(|t| t.calibration_basis.is_observed())
+    }
+
+    /// Whether this profile claims any measured figure at all — including the hidden-overhead
+    /// reserve, which is not a [`CostTerm`] and would otherwise escape the check.
+    pub fn claims_measurement(&self) -> bool {
+        self.measured_terms().next().is_some() || self.headroom.hidden_overhead_basis.is_observed()
+    }
 }
 
 #[cfg(test)]
@@ -668,6 +802,13 @@ pub(crate) mod fixtures {
             enforcement,
             formula,
             sharing_evidenced: rule != CompositionRule::Sum,
+            calibration_basis: CalibrationBasis::SourceGrounded,
+            // Only the profiled-and-measured class names an observation scope, and for a term the
+            // host cannot intercept the honest default is the scope it is allocated at.
+            observation_scope: match enforcement {
+                EnforcementClass::ProfiledAndMeasured => Some(scope),
+                EnforcementClass::DirectlyEnforceable => None,
+            },
         }
     }
 
@@ -752,6 +893,8 @@ pub(crate) mod fixtures {
                 hidden_overhead_reserve_bytes: 128 << 20,
                 basis: "measured allocator high-water spread across the conformance workloads"
                     .into(),
+                hidden_overhead_observation_scope: AllocationScope::PerDevice,
+                hidden_overhead_basis: CalibrationBasis::ConservativeBound,
             },
             conformance_suite_version: 1,
             conformance_evidence_digest: Hash([9u8; 32]),
@@ -855,6 +998,8 @@ mod tests {
             enforcement: EnforcementClass::ProfiledAndMeasured,
             formula: CostExpr::Const(1),
             sharing_evidenced: false,
+            calibration_basis: CalibrationBasis::ConservativeBound,
+            observation_scope: Some(AllocationScope::PerProcess),
         });
         assert!(p
             .validate()
@@ -1015,6 +1160,87 @@ mod tests {
         let mut p = profile(BackendClass::Vulkan);
         p.headroom.basis = "  ".into();
         assert!(p.validate().unwrap_err().to_string().contains("basis"));
+    }
+
+    /// A profile can say which of its terms anybody actually observed. Without this an invented
+    /// ratio is byte-indistinguishable from a measured one.
+    #[test]
+    fn every_term_declares_what_its_figure_rests_on() {
+        let p = profile(BackendClass::Vulkan);
+        let summary = p.calibration_summary();
+        assert_eq!(
+            summary.total(),
+            p.terms().count() + 1,
+            "the hidden-overhead reserve is summarized too — it is not a CostTerm and would \
+             otherwise escape the count"
+        );
+        assert!(summary.is_complete());
+        assert!(!p.claims_measurement(), "the fixture claims no measurement");
+
+        let mut measured = profile(BackendClass::Vulkan);
+        measured.standing_terms[0].calibration_basis = CalibrationBasis::Measured;
+        assert_eq!(measured.calibration_summary().measured, 1);
+        assert_eq!(measured.measured_terms().count(), 1);
+        assert!(measured.claims_measurement());
+
+        let mut uncalibrated = profile(BackendClass::Vulkan);
+        uncalibrated.standing_terms[0].calibration_basis = CalibrationBasis::Absent;
+        let summary = uncalibrated.calibration_summary();
+        assert_eq!(summary.absent, 1);
+        assert!(!summary.is_complete());
+    }
+
+    /// A hidden term must name the scope at which its statistic is actually exposed, which is not
+    /// always the scope it is allocated at and differs across backends. A directly enforceable term
+    /// must not name one: it is attributed per role at creation.
+    #[test]
+    fn only_profiled_and_measured_terms_name_an_observation_scope() {
+        let p = profile(BackendClass::Vulkan);
+        for t in p.terms() {
+            match t.enforcement {
+                EnforcementClass::ProfiledAndMeasured => assert!(t.observation_scope.is_some()),
+                EnforcementClass::DirectlyEnforceable => assert!(t.observation_scope.is_none()),
+            }
+        }
+
+        let mut missing = profile(BackendClass::Vulkan);
+        let hidden = missing
+            .standing_terms
+            .iter_mut()
+            .find(|t| t.enforcement == EnforcementClass::ProfiledAndMeasured)
+            .expect("a hidden term");
+        hidden.observation_scope = None;
+        assert!(missing
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("names no observation scope"));
+
+        let mut spurious = profile(BackendClass::Vulkan);
+        let enforceable = spurious
+            .standing_terms
+            .iter_mut()
+            .find(|t| t.enforcement == EnforcementClass::DirectlyEnforceable)
+            .expect("an enforceable term");
+        enforceable.observation_scope = Some(AllocationScope::PerProcess);
+        assert!(spurious
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must not also name an observation scope"));
+    }
+
+    /// The hidden-overhead reserve is an aggregate figure. Observing it per allocation is not a
+    /// thing a backend does, and claiming to would let a certification assert enforcement nobody has.
+    #[test]
+    fn the_hidden_overhead_reserve_cannot_be_observed_per_allocation() {
+        let mut p = profile(BackendClass::Vulkan);
+        p.headroom.hidden_overhead_observation_scope = AllocationScope::PerAllocation;
+        assert!(p
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be observed per allocation"));
     }
 
     #[test]

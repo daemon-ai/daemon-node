@@ -31,6 +31,7 @@
 
 pub mod capability;
 pub mod composition_record;
+pub mod governor;
 pub mod planner;
 pub mod profile;
 pub mod revision;
@@ -43,7 +44,12 @@ pub use capability::{
 pub use composition_record::{
     validate_citation, CandidateTuple, CompositionEvidenceLedger, CompositionEvidenceRecord,
     ConsequenceClass, EvidenceCitation, EvidenceError, EvidenceSubject, RecordStanding, Revocation,
-    GOVERNOR_VERSION,
+    COMPOSITION_RECORD_MEMBERS, GOVERNOR_VERSION,
+};
+pub use governor::{
+    compare_views, derive_reservation, evaluate_occupancy, pool_sizing_for, GovernorError,
+    OccupancyVerdict, PoolSizing, Reservation, ReservationBounds, ReservationComponents,
+    ReservationIdentity, ReservationStore, ScopeComponent, RESERVATION_ARITHMETIC_VERSION,
 };
 pub use planner::{
     aggregate, compose, select, validate_against, AggregateClaim, DivergenceAuthority,

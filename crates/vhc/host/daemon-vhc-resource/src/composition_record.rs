@@ -34,7 +34,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId};
 use serde::{Deserialize, Serialize};
 
+use crate::governor::{ReservationComponents, ReservationIdentity};
 use crate::planner::{AggregateClaim, PhysicalClaim};
+
+/// The number of normative bindings a layer-2 composition evidence record carries.
+///
+/// Asserted rather than merely documented, because the count is the thing a reader checks a record
+/// against and it has already grown once.
+pub const COMPOSITION_RECORD_MEMBERS: usize = 12;
 
 /// The resource governor's implementation identity.
 ///
@@ -132,6 +139,13 @@ pub struct EvidenceSubject {
 }
 
 /// One layer-2 **composition evidence record**. Immutable once appended.
+///
+/// It carries [`COMPOSITION_RECORD_MEMBERS`] normative bindings: the role/incarnation and
+/// participant/device identity, the profile digest and its authority, the capability-report digest,
+/// the plan hash, the grant digest, the composed role claim and the node/device aggregate, the
+/// planner identity, the governor identity, the reservation identity, the reservation digest, and
+/// the scope-separated reservation components. The lifecycle members (`supersedes`, the trigger
+/// reason and the consequence class) are the record's own bookkeeping and are counted separately.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompositionEvidenceRecord {
     /// What this record is about.
@@ -161,6 +175,23 @@ pub struct CompositionEvidenceRecord {
     pub planner_version: u32,
     /// The governor that reserved it.
     pub governor_version: u32,
+    /// The identity of the **single reservation** this admission took, as recorded in the admitted
+    /// tuple. The owner-ledger charge and the governor's occupancy reservation are the same
+    /// reservation seen twice, and this is the identity both views refer to.
+    pub reservation_identity: ReservationIdentity,
+    /// The digest of that reservation's canonical encoding.
+    ///
+    /// Identity alone only **locates** a reservation; it does not prove what was charged. A record
+    /// carrying identity and no digest lets an auditor find the reservation and then trust its
+    /// current contents.
+    pub reservation_digest: Hash,
+    /// The reserved amounts separated by allocation scope, with the hidden-overhead reserve as its
+    /// own visible component and the two enforcement classes separated.
+    ///
+    /// Totals without scope separation cannot distinguish a correctly-shared process-scoped term
+    /// from a double-counted per-role one — which is precisely the colocation defect the legacy
+    /// per-role tier sum produced.
+    pub reservation_components: ReservationComponents,
     /// The record this one replaces, or `None` for the first record of its subject.
     pub supersedes: Option<Hash>,
     /// Plain language: why this record exists. A human reads this first.
@@ -585,8 +616,24 @@ mod tests {
         let prof = profile(BackendClass::Vulkan);
         let binding = Binding::from([("micro_batch".to_string(), DimensionValue::Uint(2))]);
         let (claim, occ) = compose(&p, &binding, &prof, 1).unwrap();
-        let agg = aggregate(&[(role.to_string(), claim.clone(), occ)]).unwrap();
+        let agg = aggregate(&[(role.to_string(), claim.clone(), occ.clone())]).unwrap();
+        let reservation = crate::governor::derive_reservation(
+            ReservationIdentity {
+                role: role.into(),
+                incarnation,
+                device_identity: "0000:c4:00.0".into(),
+                sequence: 1,
+            },
+            &claim,
+            &occ,
+            &agg,
+            &prof,
+        )
+        .unwrap();
         CompositionEvidenceRecord {
+            reservation_identity: reservation.identity.clone(),
+            reservation_digest: reservation.reservation_digest().unwrap(),
+            reservation_components: reservation.bounds().components,
             subject: subject(role, incarnation),
             profile_digest: prof.profile_digest().unwrap(),
             profile_authority: PeerId([7u8; 32]),
@@ -928,6 +975,41 @@ mod tests {
                 "the frozen tuple must not reference `{forward_reference}`"
             );
         }
+    }
+
+    /// The record binds the single reservation: its identity locates it, its digest proves what was
+    /// charged, and the scope-separated components make a shared term distinguishable from a
+    /// double-counted per-role one.
+    #[test]
+    fn the_record_binds_the_reservation_by_identity_digest_and_scope_separated_components() {
+        assert_eq!(COMPOSITION_RECORD_MEMBERS, 12);
+
+        let r = record("trainer", 1, None, ConsequenceClass::InitialComposition);
+        assert_eq!(r.reservation_identity.role, "trainer");
+        assert_eq!(r.reservation_identity.incarnation, 1);
+        assert_ne!(r.reservation_digest, Hash([0u8; 32]));
+
+        let c = r.reservation_components;
+        // Hidden overhead is its own visible component, not folded into the per-role total.
+        assert!(c.hidden_overhead_bytes > 0);
+        assert_ne!(c.per_role.total(), c.occupancy_bytes());
+        // The two enforcement classes are separated, and together they account for the occupancy.
+        assert_eq!(
+            c.directly_enforceable_bytes() + c.profiled_and_measured_bytes(),
+            c.occupancy_bytes()
+        );
+        // The per-allocation constraint is carried but is not occupancy.
+        assert!(c.max_individual_allocation_bytes > 0);
+
+        // Identity alone does not prove what was charged: a record whose components differ has a
+        // different digest even at the same identity.
+        let mut altered = r.clone();
+        altered
+            .reservation_components
+            .per_role
+            .directly_enforceable_bytes += 1;
+        assert_eq!(altered.reservation_identity, r.reservation_identity);
+        assert_ne!(altered.record_digest().unwrap(), r.record_digest().unwrap());
     }
 
     /// Layer 1 carries exactly the two identities whose `[PC-13]` row reaches it, and the full ABI

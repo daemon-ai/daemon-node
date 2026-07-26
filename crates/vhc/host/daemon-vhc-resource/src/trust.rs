@@ -127,6 +127,9 @@ pub struct ProfileAcceptancePolicy {
     /// Whether this side requires the per-allocation ceiling to have been **measured** rather than
     /// merely reported.
     pub require_measured_allocation_ceiling: bool,
+    /// Whether this side requires every cost term to rest on *something* — no term with an absent
+    /// calibration basis.
+    pub require_full_calibration: bool,
     /// Profile digests this side has revoked.
     pub revoked_profiles: BTreeSet<Hash>,
 }
@@ -237,6 +240,24 @@ pub enum AuthenticationRefusal {
         side: PolicySide,
         /// Why the ceiling is not certified.
         detail: String,
+    },
+    /// The profile claims measured figures that this binary cannot reproduce.
+    #[error(
+        "the profile claims {measured} measured term(s), but this binary cannot report allocator \
+         statistics; the evidence behind those figures is unreproducible here, so the profile's \
+         own certification is unverifiable on this binary"
+    )]
+    CalibrationUnreproducible {
+        /// How many terms claim measurement.
+        measured: usize,
+    },
+    /// A policy requires every term to rest on something.
+    #[error("{side} requires full calibration, but {absent} term(s) have no calibration basis")]
+    CalibrationIncomplete {
+        /// Which policy refused.
+        side: PolicySide,
+        /// How many terms are uncalibrated.
+        absent: usize,
     },
     /// The running implementation revision is not one the profile covers.
     #[error(
@@ -402,6 +423,29 @@ pub fn authenticate(
         }
     }
 
+    // 6b. Calibration. A profile whose pooling or workspace terms were calibrated FROM allocator
+    //     statistics must not be accepted by a binary that cannot produce them: the evidence behind
+    //     those figures cannot be reproduced there, so the profile's certification is unverifiable
+    //     on the very binary about to compose with it. This is the teeth on the
+    //     `statistics_available` member, which would otherwise be a declaration nothing reads.
+    if profile.claims_measurement() && !running.allocator.statistics_available {
+        return Err(AuthenticationRefusal::CalibrationUnreproducible {
+            measured: profile.measured_terms().count()
+                + usize::from(profile.headroom.hidden_overhead_basis.is_observed()),
+        });
+    }
+    let calibration = profile.calibration_summary();
+    if !calibration.is_complete() {
+        let owner_needs = owner.require_full_calibration;
+        let run_needs = run.require_full_calibration;
+        if owner_needs || run_needs {
+            return Err(AuthenticationRefusal::CalibrationIncomplete {
+                side: side_of(!owner_needs, !run_needs),
+                absent: calibration.absent,
+            });
+        }
+    }
+
     // 7. Revision binding. Absolute: an unmatched revision prevents role execution until
     //    revalidation succeeds.
     if running.backend_implementation.revision != envelope.implementation_revision {
@@ -521,6 +565,7 @@ mod tests {
             accepted_planner_versions: [1].into_iter().collect(),
             require_conformance_evidence: true,
             require_measured_allocation_ceiling: true,
+            require_full_calibration: true,
             revoked_profiles: BTreeSet::new(),
         }
     }
@@ -735,6 +780,77 @@ mod tests {
         relaxed.require_measured_allocation_ceiling = false;
         authenticate(&p, &e, &relaxed, &relaxed, &revision(), 1, NOW)
             .expect("a policy may accept an unmeasured ceiling explicitly");
+    }
+
+    /// The teeth on `statistics_available`: a profile whose figures were *measured* from allocator
+    /// statistics must not be accepted by a binary that cannot produce them, because the evidence
+    /// behind those figures is unreproducible there.
+    #[test]
+    fn a_profile_claiming_measured_terms_is_refused_by_a_binary_without_statistics() {
+        let mut p = profile(BackendClass::Vulkan);
+        p.standing_terms[0].calibration_basis = crate::profile::CalibrationBasis::Measured;
+        let e = envelope(&p);
+
+        let mut running = revision();
+        running.allocator.statistics_available = false;
+        let err = authenticate(&p, &e, &policy(), &policy(), &running, 1, NOW).unwrap_err();
+        assert!(matches!(
+            err,
+            AuthenticationRefusal::CalibrationUnreproducible { measured: 1 }
+        ));
+
+        // The same profile on a binary that can report statistics authenticates.
+        authenticate(&p, &e, &policy(), &policy(), &revision(), 1, NOW)
+            .expect("statistics available, so the evidence is reproducible");
+
+        // A profile claiming nothing measured is unaffected by the binary's capability.
+        let plain = profile(BackendClass::Vulkan);
+        assert!(!plain.claims_measurement());
+        authenticate(
+            &plain,
+            &envelope(&plain),
+            &policy(),
+            &policy(),
+            &running,
+            1,
+            NOW,
+        )
+        .expect("a profile claiming no measurement needs no statistics");
+    }
+
+    /// The hidden-overhead reserve is not a `CostTerm`, so a check that only walked the terms would
+    /// let a measured hidden figure through on a binary that cannot reproduce it.
+    #[test]
+    fn a_measured_hidden_overhead_figure_is_covered_by_the_same_teeth() {
+        let mut p = profile(BackendClass::Vulkan);
+        p.headroom.hidden_overhead_basis = crate::profile::CalibrationBasis::Measured;
+        assert!(p.claims_measurement());
+        let e = envelope(&p);
+        let mut running = revision();
+        running.allocator.statistics_available = false;
+        assert!(matches!(
+            authenticate(&p, &e, &policy(), &policy(), &running, 1, NOW).unwrap_err(),
+            AuthenticationRefusal::CalibrationUnreproducible { .. }
+        ));
+    }
+
+    /// A policy may require every term to rest on something, and the refusal names which side asked.
+    #[test]
+    fn a_policy_may_require_full_calibration() {
+        let mut p = profile(BackendClass::Vulkan);
+        p.standing_terms[0].calibration_basis = crate::profile::CalibrationBasis::Absent;
+        let e = envelope(&p);
+
+        let err = authenticate(&p, &e, &policy(), &policy(), &revision(), 1, NOW).unwrap_err();
+        assert!(matches!(
+            err,
+            AuthenticationRefusal::CalibrationIncomplete { absent: 1, .. }
+        ));
+
+        let mut relaxed = policy();
+        relaxed.require_full_calibration = false;
+        authenticate(&p, &e, &relaxed, &relaxed, &revision(), 1, NOW)
+            .expect("a policy may accept an uncalibrated term explicitly");
     }
 
     #[test]
