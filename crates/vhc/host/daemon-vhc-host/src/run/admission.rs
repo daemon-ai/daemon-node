@@ -944,7 +944,7 @@ pub fn assess_resource_plan(
     wasm: &[u8],
     config: &[u8],
     grants: &[u8],
-) -> Result<(LogicalResourcePlan, Vec<u8>), AbiRefusal> {
+) -> Result<(daemon_vhc_proto::ModuleDerivedPlan, Vec<u8>), AbiRefusal> {
     let selection = select_driver(worker, wasm, None)?;
     if selection.minor < daemon_vhc_abi::CERTIFICATION_MINOR_V2 {
         return Err(AbiRefusal::new(
@@ -966,7 +966,12 @@ pub fn assess_resource_plan(
             "assessment produced no Logical Resource Plan",
         )
     })?;
-    Ok((plan, assessed.resource_plan_bytes))
+    // Wrapped here, and only here: the provenance travels with the plan so an authoring seat can
+    // require one a module actually produced, and a fixture's plan cannot be mistaken for one.
+    Ok((
+        daemon_vhc_proto::ModuleDerivedPlan::from_module_assessment(plan),
+        assessed.resource_plan_bytes,
+    ))
 }
 
 /// Map an assessment-time wasm error into a typed refusal. A deny-stub trap
@@ -1127,6 +1132,97 @@ fn decode_claim(bytes: &[u8]) -> Result<MemoryClaim, AbiRefusal> {
         workspace: tier(CLAIM_KEY_WORKSPACE)?,
         under_pressure,
     })
+}
+/// One role's authoring inputs: the module bytes the envelope pins, and the canonical configuration
+/// and Capability Grants its assessment runs against.
+pub struct RoleAuthoringInput<'a> {
+    /// The role name as it appears in the envelope.
+    pub role: &'a str,
+    /// The module bytes. These must be the bytes the envelope's artifact digest names — assessing
+    /// one module and pinning another would produce a plan for code the run never executes.
+    pub wasm: &'a [u8],
+    /// The canonical configuration the role's `da_init` receives.
+    pub config: &'a [u8],
+    /// The canonical Capability Grants document.
+    pub grants: &'a [u8],
+    /// The backend classes the run permits this role to execute on.
+    pub allowed_backend_classes: Vec<String>,
+    /// What the run demands of a Backend Execution Profile before it may be composed against.
+    pub profile_certification: daemon_vhc_proto::ProfileCertificationRequirements,
+    /// The hardware-independent minima the role needs regardless of backend.
+    pub minima: daemon_vhc_proto::HardwareIndependentMinima,
+    /// How the run selects the configuration a uniform-run plan freezes.
+    pub grant: GrantPolicy,
+}
+
+/// How a uniform-run plan's frozen Execution Grant is chosen.
+///
+/// A policy rather than a grant, because a grant names the plan it resolves by digest and the plan
+/// does not exist until the module has been assessed. Asking a caller for the grant up front would
+/// mean asking it to know a digest it cannot yet compute.
+pub enum GrantPolicy {
+    /// The run selected this configuration itself.
+    Explicit(daemon_vhc_proto::ExecutionGrant),
+    /// Select each dimension's smallest admissible value — the sound floor of the plan's cost, and
+    /// the right choice only when the configuration is not what is under test.
+    DomainMinimum,
+    /// The plan is per-participant, so there is nothing to freeze: each participant resolves its own
+    /// configuration under the equivalence contract the plan declares.
+    PerParticipant,
+}
+
+/// Derive every role's execution requirements from its own module, for an authoring seat to place.
+///
+/// The single seam between a caller that holds module bytes and an authoring seat that holds only
+/// digests. Authoring runs each module's own assessment export on the canonical configuration and
+/// grants, and the requirements are derived from what the module emitted — so the module is the only
+/// source, and the seat receives a structure it cannot have invented.
+///
+/// A uniform-run plan's Execution Grant is frozen here as a by-product: the derivation computes the
+/// plan digest and binds the grant rather than accepting either, so there is no separate freezing
+/// step to forget. The grant is supplied per role because *which* configuration a run selects is a
+/// run-authoring decision, not something the module chooses for itself.
+///
+/// # Errors
+/// [`AbiRefusal`] when a module cannot be assessed, and a validation refusal when a plan will not
+/// derive — a uniform-run plan without its grant, a per-participant plan without an equivalence
+/// contract, or a grant that does not bind to the plan.
+pub fn author_execution(
+    worker: &Worker,
+    roles: Vec<RoleAuthoringInput<'_>>,
+) -> Result<daemon_vhc_proto::AuthoredExecution, String> {
+    let mut authored = daemon_vhc_proto::AuthoredExecution::new();
+    for input in roles {
+        let (plan, _bytes) = assess_resource_plan(worker, input.wasm, input.config, input.grants)
+            .map_err(|refusal| {
+            format!(
+                "role `{}`: its module's own assessment produced no usable Logical Resource \
+                     Plan ({refusal:?})",
+                input.role
+            )
+        })?;
+        // Resolved now the plan exists: a grant names its plan by digest, so the policy could not
+        // have been a grant before the module was asked.
+        let grant = match input.grant {
+            GrantPolicy::Explicit(grant) => Some(grant),
+            GrantPolicy::DomainMinimum => Some(
+                daemon_vhc_proto::ExecutionGrant::selecting_domain_minimum(plan.plan())
+                    .map_err(|e| format!("role `{}`: {e}", input.role))?,
+            ),
+            GrantPolicy::PerParticipant => None,
+        };
+        authored = authored
+            .derive(
+                input.role,
+                &plan,
+                input.allowed_backend_classes,
+                input.profile_certification,
+                input.minima,
+                grant.as_ref(),
+            )
+            .map_err(|e| format!("role `{}`: {e}", input.role))?;
+    }
+    Ok(authored)
 }
 
 #[cfg(test)]

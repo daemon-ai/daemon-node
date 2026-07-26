@@ -45,8 +45,9 @@ use crate::coordinator_config::{
     coordinator_role_config, CoordinatorAuthoring, PhaseDeadlines, RoundSchedule,
 };
 use daemon_vhc_host::run::{
-    replay, start_run, DeliverVerdict, MemorySink, OpOutcome, OpRequest, PumpHandle, ReplayEnd,
-    ReplayScript, RunConfig, RunEnd, RunIdentity, SinkEntry,
+    author_execution, replay, start_run, DeliverVerdict, GrantPolicy, MemorySink, OpOutcome,
+    OpRequest, PumpHandle, ReplayEnd, ReplayScript, RoleAuthoringInput, RunConfig, RunEnd,
+    RunIdentity, SinkEntry,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::det_state::{derive_state_chunk_size, FamilyEntry};
@@ -56,6 +57,7 @@ use daemon_vhc_proto::{
     Identities, IrohId, PeerId, RoleEntry, RoleGrants, RunSection, Seed, SigningKey,
     SnapshotArtifact, StateDigest, TransportSelection, GENESIS_SCHEMA_MAJOR,
 };
+use daemon_vhc_proto::{HardwareIndependentMinima, ProfileCertificationRequirements};
 use daemon_vhc_sdk_consensus::messages::{
     BatchWindow, Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
 };
@@ -495,6 +497,31 @@ impl GenesisRunReport {
     }
 }
 
+/// The inputs [`genesis_envelope`] authors from.
+///
+/// A named struct rather than a positional list, matching the other two authoring seats: all three
+/// now take one named input each, so a reader comparing them compares the same shape — and adding the
+/// execution requirements did not turn this call into eight unlabelled arguments.
+pub struct EnvelopeInputs<'a> {
+    /// The run label.
+    pub run_label: &'a str,
+    /// The coordinator module digest the envelope pins.
+    pub coordinator_wasm_blake3: Hash,
+    /// The trainer module digest.
+    pub worker_wasm_blake3: Hash,
+    /// The coordinator's identity.
+    pub coordinator_identity: PeerId,
+    /// Roster size.
+    pub workers: u32,
+    /// Inner steps per round.
+    pub steps_per_round: u32,
+    /// Sequences per round across the roster.
+    pub global_batch: u32,
+    /// Placed, never composed here: derived upstream from each module's own assessment output. This
+    /// seat names its modules by digest, so it has nothing to ask and no business inventing an answer.
+    pub execution: &'a daemon_vhc_proto::AuthoredExecution,
+}
+
 /// Author the end-state **genesis envelope v2** for a barrier run: the coordinator role pinning the
 /// `coordinator_quorum.wasm` blob with its opaque `{state: CoordinatorState}` config, one trainer
 /// role pinning the worker blob, and the envelope-named `SingleKey` coordinator identity.
@@ -504,15 +531,17 @@ impl GenesisRunReport {
 /// envelope at D0). Phase deadlines are effectively infinite: the run is driven entirely by
 /// event-driven fast paths so the guest's synthetic clock (one tick per event) suffices.
 #[must_use]
-pub fn genesis_envelope(
-    run_label: &str,
-    coordinator_wasm_blake3: Hash,
-    worker_wasm_blake3: Hash,
-    coordinator_identity: PeerId,
-    workers: u32,
-    steps_per_round: u32,
-    global_batch: u32,
-) -> GenesisEnvelope {
+pub fn genesis_envelope(inputs: &EnvelopeInputs<'_>) -> GenesisEnvelope {
+    let &EnvelopeInputs {
+        run_label,
+        coordinator_wasm_blake3,
+        worker_wasm_blake3,
+        coordinator_identity,
+        workers,
+        steps_per_round,
+        global_batch,
+        execution,
+    } = inputs;
     // The coordinator's opaque `da_init` config, through the shared authoring seat (the one place
     // a genesis's round schedule and clock are decided — `crate::coordinator_config`): the barrier
     // harness runs the event-driven clock, so its deadlines stay effectively infinite and every
@@ -555,10 +584,10 @@ pub fn genesis_envelope(
     roles.insert(
         "coordinator".to_string(),
         RoleEntry {
-            // No execution-requirement structure yet: the real one is obtained from the module's own
-            // assessment export per the authoring flow, which is why nothing is hand-authored here.
-            // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
-            execution: None,
+            // Placed, not composed: what the module's own assessment produced, derived upstream. A
+            // role absent from the authored set stays `None`, which `validate` refuses for a runnable
+            // envelope — defaulting here would be this seat inventing a resource requirement.
+            execution: execution.for_role("coordinator"),
             lane: "coordinator".into(),
             module: "coordinator.wasm".into(),
             abi: "vhc@2".into(),
@@ -570,10 +599,10 @@ pub fn genesis_envelope(
     roles.insert(
         "trainer".to_string(),
         RoleEntry {
-            // No execution-requirement structure yet: the real one is obtained from the module's own
-            // assessment export per the authoring flow, which is why nothing is hand-authored here.
-            // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
-            execution: None,
+            // Placed, not composed: what the module's own assessment produced, derived upstream. A
+            // role absent from the authored set stays `None`, which `validate` refuses for a runnable
+            // envelope — defaulting here would be this seat inventing a resource requirement.
+            execution: execution.for_role("trainer"),
             lane: "trainer".into(),
             module: "worker.wasm".into(),
             abi: "vhc@2".into(),
@@ -846,9 +875,9 @@ fn assigned_len(window: BatchWindow, seed: Seed, roster: &[PeerId], peer: &PeerI
 /// # Errors
 /// A `String` on any harness-level failure.
 #[allow(clippy::too_many_lines)]
-pub fn genesis_whole_run(
-    coordinator_wasm: &[u8],
-    worker_wasm: &[u8],
+pub fn genesis_whole_run<'a>(
+    coordinator_wasm: &'a [u8],
+    worker_wasm: &'a [u8],
     spec: &GenesisRunSpec,
 ) -> Result<GenesisRunReport, String> {
     let coord_hash = Hash(*blake3::hash(coordinator_wasm).as_bytes());
@@ -872,15 +901,44 @@ pub fn genesis_whole_run(
 
     // The genesis envelope v2 + the coordinator configuration derived from it (the
     // configuration half — the exact seat that REFUSES under envelope v1).
-    let genesis = genesis_envelope(
-        &spec.run_label,
-        coord_hash,
-        Hash(worker_hash),
-        coord_identity,
-        spec.workers as u32,
-        spec.steps_per_round,
-        spec.global_batch,
-    );
+    // Derived from the two real modules this harness is about to run, through the single seam — so
+    // what the envelope pins as a resource requirement is what these modules' own assessment said,
+    // and a drift between the pinned plan and the running code cannot open up here.
+    let authoring_engine =
+        Worker::new(EngineConfig::default()).map_err(|e| format!("authoring engine: {e}"))?;
+    let role_input = |role: &'static str, wasm: &'a [u8]| RoleAuthoringInput {
+        role,
+        wasm,
+        // The role config each module's assessment runs against. Empty is what these two modules
+        // receive at assess time in this harness; a run whose plan varied with its configuration
+        // would have to pass the same bytes the envelope pins, or the plan would describe a
+        // configuration the run never uses.
+        config: &[],
+        grants: &grants,
+        allowed_backend_classes: vec!["cpu".to_string()],
+        profile_certification: ProfileCertificationRequirements::default(),
+        minima: HardwareIndependentMinima::default(),
+        // The floor, chosen explicitly: this harness's subject is the run lifecycle, not the
+        // configuration, so the smallest admissible selection is the honest one to freeze.
+        grant: GrantPolicy::DomainMinimum,
+    };
+    let execution = author_execution(
+        &authoring_engine,
+        vec![
+            role_input("coordinator", coordinator_wasm),
+            role_input("trainer", worker_wasm),
+        ],
+    )?;
+    let genesis = genesis_envelope(&EnvelopeInputs {
+        run_label: &spec.run_label,
+        coordinator_wasm_blake3: coord_hash,
+        worker_wasm_blake3: Hash(worker_hash),
+        coordinator_identity: coord_identity,
+        workers: spec.workers as u32,
+        steps_per_round: spec.steps_per_round,
+        global_batch: spec.global_batch,
+        execution: &execution,
+    });
     let author = SigningKey::from_bytes(
         blake3::hash(format!("genesis_run-author/{}", spec.run_label).as_bytes()).as_bytes(),
     );

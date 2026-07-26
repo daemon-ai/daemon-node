@@ -747,6 +747,18 @@ pub struct CeremonyGenesisSpec<'a> {
     /// [`CeremonyRunTimers::default`] is the effectively-infinite shape; the preflight operator
     /// tunes it from the measured per-round wall on the slowest box.
     pub timers: CeremonyRunTimers,
+    /// The per-role execution requirements this seat **places** into the envelope, derived upstream
+    /// from each module's own assessment output.
+    ///
+    /// It arrives as an input because this spec names its modules by digest, not by bytes: the seat
+    /// has nothing to ask. The caller — which resolved and therefore holds the module bytes — runs
+    /// `assess_resource_plan` against them and derives the requirements, so the module remains the
+    /// single source and this seat has no way to state a requirement of its own.
+    ///
+    /// A role missing from here is placed as `None`, and `validate` refuses a runnable envelope
+    /// whose role carries no requirement structure. That is deliberate: defaulting would be this
+    /// seat inventing a resource requirement, which is the failure the type exists to prevent.
+    pub execution: daemon_vhc_proto::AuthoredExecution,
 }
 
 /// Author + freeze the ceremony genesis (§15 W-SF6): the trainer role carrying the FROZEN model +
@@ -850,10 +862,10 @@ pub fn ceremony_genesis(
     roles.insert(
         "coordinator".to_string(),
         RoleEntry {
-            // No execution-requirement structure yet: the real one is obtained from the module's own
-            // assessment export per the authoring flow, which is why nothing is hand-authored here.
-            // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
-            execution: None,
+            // Placed, not composed: what the module's own assessment produced, derived upstream. A
+            // role absent from the authored set stays `None`, which `validate` refuses for a runnable
+            // envelope — defaulting here would be this seat inventing a resource requirement.
+            execution: spec.execution.for_role("coordinator"),
             lane: "coordinator".into(),
             module: "coordinator.wasm".into(),
             abi: "vhc@2".into(),
@@ -865,10 +877,10 @@ pub fn ceremony_genesis(
     roles.insert(
         "trainer".to_string(),
         RoleEntry {
-            // No execution-requirement structure yet: the real one is obtained from the module's own
-            // assessment export per the authoring flow, which is why nothing is hand-authored here.
-            // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
-            execution: None,
+            // Placed, not composed: what the module's own assessment produced, derived upstream. A
+            // role absent from the authored set stays `None`, which `validate` refuses for a runnable
+            // envelope — defaulting here would be this seat inventing a resource requirement.
+            execution: spec.execution.for_role("trainer"),
             lane: "trainer".into(),
             module: "worker.wasm".into(),
             abi: "vhc@2".into(),
@@ -898,9 +910,29 @@ pub fn ceremony_genesis(
             upgrade_authority: spec.upgrade_authority.clone(),
         },
     };
-    genesis
+    // Phase 1 of the three-phase authoring validation, at the seat rather than at its callers: the
+    // frozen bytes are re-opened (which re-derives the run hash and verifies the signature) and the
+    // decoded envelope validated, so what leaves here is provably an envelope that re-opens.
+    //
+    // At the seat because a caller that skipped it would publish an envelope nothing had checked —
+    // and the check that matters most is the one this migration made possible: `validate` refuses a
+    // runnable role carrying no execution requirement, so a role the derivation missed is caught
+    // before signing rather than at the first participant's admission.
+    let frozen = genesis
         .freeze(author)
-        .map_err(|e| format!("freeze the ceremony genesis: {e}"))
+        .map_err(|e| format!("freeze the ceremony genesis: {e}"))?;
+    let reopened = daemon_vhc_proto::FrozenGenesis::open(
+        frozen.bytes().to_vec(),
+        *frozen.signature(),
+        *frozen.signer(),
+    )
+    .map_err(|e| format!("the frozen ceremony genesis does not re-open: {e}"))?;
+    reopened
+        .decode()
+        .map_err(|e| format!("the frozen ceremony genesis does not decode: {e}"))?
+        .validate()
+        .map_err(|e| format!("the frozen ceremony genesis does not validate: {e}"))?;
+    Ok(frozen)
 }
 
 /// The ceremony's round schedule for a `peers`-strong trainer roster, DERIVED from the frozen
@@ -967,10 +999,59 @@ fn ceremony_authority(coordinator_base: PeerId) -> Value {
     }
     .encode()
 }
+/// Derive the ceremony's per-role execution requirements from the two modules its genesis pins.
+///
+/// The single place the real ceremony turns modules into resource requirements. It runs each module's
+/// own assessment export and derives from what the module emitted; [`ceremony_genesis`] then places
+/// the result, having had no opportunity to state a requirement of its own.
+///
+/// The frozen selection is the plan's **domain minimum**, chosen here explicitly rather than
+/// defaulted out of sight: at the ratified ceremony parameters the run's configuration is already
+/// pinned by the frozen trainer config, so the floor is the configuration the run actually occupies.
+/// A ceremony that meant to run at a larger selection would change this line.
+///
+/// # Errors
+/// A human-readable failure when a module cannot be assessed or its plan will not derive.
+pub fn ceremony_execution(
+    coordinator_wasm: &[u8],
+    trainer_wasm: &[u8],
+) -> Result<daemon_vhc_proto::AuthoredExecution, String> {
+    use daemon_vhc_host::run::{author_execution, GrantPolicy, RoleAuthoringInput};
+
+    let engine = daemon_vhc_host::Worker::new(daemon_vhc_host::EngineConfig::default())
+        .map_err(|e| format!("authoring engine: {e}"))?;
+    fn role<'a>(name: &'a str, wasm: &'a [u8]) -> RoleAuthoringInput<'a> {
+        RoleAuthoringInput {
+            role: name,
+            wasm,
+            config: &[],
+            grants: &[],
+            // The run's own policy about where each role may execute — not an inference from what any
+            // particular box turned out to have.
+            allowed_backend_classes: vec![
+                "cpu".to_string(),
+                "cuda".to_string(),
+                "metal".to_string(),
+                "vulkan".to_string(),
+            ],
+            profile_certification: daemon_vhc_proto::ProfileCertificationRequirements::default(),
+            minima: daemon_vhc_proto::HardwareIndependentMinima::default(),
+            grant: GrantPolicy::DomainMinimum,
+        }
+    }
+    author_execution(
+        &engine,
+        vec![
+            role("coordinator", coordinator_wasm),
+            role("trainer", trainer_wasm),
+        ],
+    )
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_genesis::fixture_authored_execution;
 
     /// The frozen geometry's arithmetic, pinned to the AMENDED-fleet invariants (memory floor =
     /// the M4's 32 GiB unified memory; canonical state host-side and streamed, not in guest
@@ -1158,6 +1239,9 @@ mod tests {
             ),
         ];
         let spec = CeremonyGenesisSpec {
+            // A fixture: these pin module digests that resolve to no bytes, so there is no module to
+            // assess. Reports itself as not module-derived rather than passing as an assessment result.
+            execution: fixture_authored_execution(),
             run_label: "vhc-ceremony",
             coordinator_module: Hash([0xC0; 32]),
             trainer_module: Hash([0x7A; 32]),
@@ -1237,6 +1321,8 @@ mod tests {
             PublishedArtifact::CorpusManifest(manifest),
         )];
         let make = |timers: CeremonyRunTimers| CeremonyGenesisSpec {
+            // A fixture: the pinned digests resolve to no bytes, so there is no module to assess.
+            execution: fixture_authored_execution(),
             run_label: "vhc-ceremony",
             coordinator_module: Hash([0xC0; 32]),
             trainer_module: Hash([0x7A; 32]),
@@ -1297,6 +1383,9 @@ mod tests {
             PublishedArtifact::CorpusManifest(manifest),
         )];
         let spec = CeremonyGenesisSpec {
+            // A fixture: these pin module digests that resolve to no bytes, so there is no module to
+            // assess. Reports itself as not module-derived rather than passing as an assessment result.
+            execution: fixture_authored_execution(),
             run_label: "vhc-ceremony",
             coordinator_module: Hash([0xC0; 32]),
             trainer_module: Hash([0x7A; 32]),
@@ -1399,6 +1488,9 @@ mod tests {
             PublishedArtifact::CorpusManifest(manifest),
         )];
         let spec = CeremonyGenesisSpec {
+            // A fixture: these pin module digests that resolve to no bytes, so there is no module to
+            // assess. Reports itself as not module-derived rather than passing as an assessment result.
+            execution: fixture_authored_execution(),
             run_label: "vhc-ceremony",
             coordinator_module: Hash([0xC0; 32]),
             trainer_module: Hash([0x7A; 32]),

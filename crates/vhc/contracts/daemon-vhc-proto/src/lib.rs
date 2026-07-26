@@ -79,8 +79,8 @@ pub use execution_grant::{
     ExecutionGrant, GrantValue, EXECUTION_GRANT_BYTES_MAX, EXECUTION_GRANT_SCHEMA,
 };
 pub use execution_requirements::{
-    AcceleratorRequirement, HardwareIndependentMinima, ProfileCertificationRequirements,
-    RoleExecutionRequirements, SelectionRequirement,
+    AcceleratorRequirement, AuthoredExecution, HardwareIndependentMinima, ModuleDerivedPlan,
+    ProfileCertificationRequirements, RoleExecutionRequirements, SelectionRequirement,
 };
 pub use framing::{
     frame, unframe, GenesisFrameHeader, GENESIS_FEATURE_EXECUTION_REQUIREMENTS,

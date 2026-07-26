@@ -176,6 +176,15 @@ pub struct LiveGenesisSpec<'a> {
     /// The run's upgrade authority (whose unanimous signatures authorize a module-upgrade
     /// record — architecture §5.4). Empty = an immutable run (no upgrade admits).
     pub upgrade_authority: Vec<PeerId>,
+    /// The per-role execution requirements this seat **places**, derived upstream from each module's
+    /// own assessment output.
+    ///
+    /// This spec does carry module bytes, so deriving in-seat would be possible — it is an input
+    /// anyway, for two reasons. It keeps all three authoring seats the same shape, so there is no
+    /// seat where the reader has to ask whether the requirement was placed or invented; and it keeps
+    /// an envelope builder from standing up a wasm engine as a side effect of authoring. Callers
+    /// derive through [`daemon_vhc_host::run::author_execution`], which is the single seam.
+    pub execution: daemon_vhc_proto::AuthoredExecution,
 }
 
 /// Derive the grants-document hash a role's admission authors for `module` under this genesis
@@ -351,10 +360,10 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
     roles.insert(
         "coordinator".to_string(),
         RoleEntry {
-            // No execution-requirement structure yet: the real one is obtained from the module's own
-            // assessment export per the authoring flow, which is why nothing is hand-authored here.
-            // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
-            execution: None,
+            // Placed, not composed: what the module's own assessment produced, derived upstream. A
+            // role absent from the authored set stays `None`, which `validate` refuses for a runnable
+            // envelope — defaulting here would be this seat inventing a resource requirement.
+            execution: spec.execution.for_role("coordinator"),
             lane: "coordinator".into(),
             module: "coordinator.wasm".into(),
             abi: "vhc@2".into(),
@@ -366,10 +375,10 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
     roles.insert(
         "trainer".to_string(),
         RoleEntry {
-            // No execution-requirement structure yet: the real one is obtained from the module's own
-            // assessment export per the authoring flow, which is why nothing is hand-authored here.
-            // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
-            execution: None,
+            // Placed, not composed: what the module's own assessment produced, derived upstream. A
+            // role absent from the authored set stays `None`, which `validate` refuses for a runnable
+            // envelope — defaulting here would be this seat inventing a resource requirement.
+            execution: spec.execution.for_role("trainer"),
             lane: "trainer".into(),
             module: "worker.wasm".into(),
             abi: "vhc@2".into(),
@@ -566,4 +575,65 @@ pub fn live_state_contract(vocab: u32) -> daemon_vhc_proto::genesis::StateContra
             expected_root,
         },
     }
+}
+
+/// An [`AuthoredExecution`](daemon_vhc_proto::AuthoredExecution) over the canonical trivial plan,
+/// covering the `coordinator` and `trainer` roles, for a **fixture** that authors an envelope without
+/// a module to assess.
+///
+/// Named for what it is. Most negative and geometry fixtures pin module digests that resolve to no
+/// bytes at all — they are testing an authoring rule, not a module — so there is nothing to assess and
+/// requiring one would only force every such fixture to carry a wasm blob it never runs. What this
+/// must never become is a shortcut on the real path: the plan inside reports
+/// `is_module_derived() == false`, and a scan rule keeps this function out of non-test targets.
+#[must_use]
+pub fn fixture_authored_execution() -> daemon_vhc_proto::AuthoredExecution {
+    fixture_authored_execution_for(&["coordinator", "trainer"])
+}
+
+/// The same, for a named role set.
+#[must_use]
+pub fn fixture_authored_execution_for(roles: &[&str]) -> daemon_vhc_proto::AuthoredExecution {
+    let plan = daemon_vhc_proto::ModuleDerivedPlan::fixture(
+        daemon_vhc_proto::LogicalResourcePlan::trivial(
+            daemon_vhc_proto::WASM_GUEST_LINEAR_FLOOR_BYTES,
+        ),
+    );
+    let grant = daemon_vhc_proto::ExecutionGrant {
+        logical_resource_plan_hash: plan.plan().plan_hash().expect("the trivial plan hashes"),
+        scope: daemon_vhc_proto::SelectionScope::UniformRun,
+        values: std::collections::BTreeMap::new(),
+    };
+    let mut authored = daemon_vhc_proto::AuthoredExecution::new();
+    for role in roles {
+        authored = authored
+            .derive(
+                role,
+                &plan,
+                vec!["cpu".to_string()],
+                daemon_vhc_proto::ProfileCertificationRequirements::default(),
+                daemon_vhc_proto::HardwareIndependentMinima::default(),
+                Some(&grant),
+            )
+            .expect(
+                "the canonical trivial plan and its empty uniform grant derive by construction",
+            );
+    }
+    authored
+}
+
+/// Derive the live cluster's per-role execution requirements from the two real modules it runs.
+///
+/// The counterpart of [`fixture_authored_execution`] for a caller that *has* modules: the acceptance
+/// cluster runs real guests, so its envelope pins what those guests' own assessment said rather than
+/// a fixture's stand-in. That is the whole point of the seam — a harness with modules has no excuse
+/// to author a requirement nothing derived.
+///
+/// # Errors
+/// A human-readable failure when a module cannot be assessed or its plan will not derive.
+pub fn live_execution(
+    coordinator_wasm: &[u8],
+    trainer_wasm: &[u8],
+) -> Result<daemon_vhc_proto::AuthoredExecution, String> {
+    crate::ceremony::ceremony_execution(coordinator_wasm, trainer_wasm)
 }

@@ -37,8 +37,9 @@ use daemon_vhc_proto::corpus::CorpusManifest;
 use daemon_vhc_proto::{
     blake3_hash, to_canonical_vec, FrozenGenesis, Hash, PeerId, SignedEnvelope, SigningKey,
 };
+
 use daemon_vhc_testkit::ceremony::{
-    ceremony_expected_state_root, ceremony_genesis, ceremony_profile_chunk,
+    ceremony_execution, ceremony_expected_state_root, ceremony_genesis, ceremony_profile_chunk,
     ceremony_round_schedule, ceremony_state_chunk_size, CeremonyGenesisSpec, CeremonyRunTimers,
     CEREMONY_EXPECTED_ROOT, CEREMONY_PARAM_COUNT, CEREMONY_SEQ_LEN, CEREMONY_TICK_PERIOD_MS,
 };
@@ -49,6 +50,16 @@ pub struct Args {
     pub author_key: String,
     pub coordinator_module: String,
     pub trainer_module: String,
+    /// The coordinator module **file**, whose digest must equal `coordinator_module`.
+    ///
+    /// The command needs the bytes, not only the digest: the role's resource requirements are
+    /// derived by running the module's own assessment export, and a digest cannot be asked what it
+    /// needs. Requiring both, and checking they agree, also closes something that was open before —
+    /// the command used to pin a module digest it had never seen a module for, so a typo pinned a
+    /// run to an artifact nobody could have run.
+    pub coordinator_wasm: PathBuf,
+    /// The trainer module file, whose digest must equal `trainer_module`.
+    pub trainer_wasm: PathBuf,
     pub corpus_manifest: PathBuf,
     pub trusted_base: Vec<String>,
     pub roster: Vec<String>,
@@ -160,10 +171,45 @@ pub fn run(args: Args) -> Result<()> {
         stop_rounds: args.stop_rounds,
     };
 
+    // -- the execution requirements, derived from the modules themselves -------------------------
+    //
+    // Read the bytes and check each against the digest the command was given, so a module is
+    // assessed if and only if it is the one the envelope pins. Assessing one module and pinning
+    // another would produce a resource requirement for code the run never executes — the exact
+    // drift the derivation invariant exists to prevent, and one no downstream check could catch.
+    let coordinator_wasm = std::fs::read(&args.coordinator_wasm).with_context(|| {
+        format!(
+            "read coordinator module {}",
+            args.coordinator_wasm.display()
+        )
+    })?;
+    let trainer_wasm = std::fs::read(&args.trainer_wasm)
+        .with_context(|| format!("read trainer module {}", args.trainer_wasm.display()))?;
+    for (label, bytes, pinned, path) in [
+        (
+            "coordinator",
+            &coordinator_wasm,
+            coordinator_module,
+            &args.coordinator_wasm,
+        ),
+        ("trainer", &trainer_wasm, trainer_module, &args.trainer_wasm),
+    ] {
+        let actual = blake3_hash(bytes);
+        anyhow::ensure!(
+            actual == pinned,
+            "the {label} module file {} hashes to {actual:?} but the genesis pins {pinned:?} — refuse \
+             rather than pin a digest for a module this command never assessed",
+            path.display()
+        );
+    }
+    let execution = ceremony_execution(&coordinator_wasm, &trainer_wasm)
+        .map_err(|e| anyhow::anyhow!("derive the ceremony execution requirements: {e}"))?;
+
     let spec = CeremonyGenesisSpec {
         run_label: &args.run_label,
         coordinator_module,
         trainer_module,
+        execution,
         corpus_manifest: corpus_manifest_hash,
         corpus_artifacts: &corpus_artifacts,
         seq_len: u64::from(manifest.seq_len),
@@ -459,6 +505,7 @@ mod tests {
     use daemon_vhc_testkit::ceremony::{
         ceremony_genesis, CeremonyGenesisSpec, CeremonyRunTimers, CEREMONY_SEQ_LEN,
     };
+    use daemon_vhc_testkit::live_genesis::fixture_authored_execution;
 
     /// The fixture tokenizer artifact's bytes (its blake3 is the manifest's tokenizer identity).
     const FIXTURE_TOKENIZER: &[u8] = b"tokenizer-fixture";
@@ -525,6 +572,9 @@ mod tests {
         ];
         let base = PeerId::new([9u8; 32]);
         let spec = CeremonyGenesisSpec {
+            // A fixture: these pin module digests that resolve to no bytes, so there is no module to
+            // assess. Reports itself as not module-derived rather than passing as an assessment result.
+            execution: fixture_authored_execution(),
             run_label: "smoke-test",
             coordinator_module: blake3_hash(b"coord.wasm"),
             trainer_module: blake3_hash(b"trainer.wasm"),
@@ -646,6 +696,9 @@ mod tests {
         let base = PeerId::new([5u8; 32]);
         let corpus_artifacts = corpus_artifact_pins(&manifest, manifest_hash);
         let spec = CeremonyGenesisSpec {
+            // A fixture: these pin module digests that resolve to no bytes, so there is no module to
+            // assess. Reports itself as not module-derived rather than passing as an assessment result.
+            execution: fixture_authored_execution(),
             run_label: "ceremony-publish-parity",
             coordinator_module: blake3_hash(&coordinator_wasm),
             trainer_module: blake3_hash(&trainer_wasm),

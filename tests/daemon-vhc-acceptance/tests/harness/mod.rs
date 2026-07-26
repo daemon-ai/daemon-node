@@ -823,7 +823,13 @@ pub async fn start_cluster_with(
     let coordinator_wasm = guest_wasm("coordinator_quorum");
     let trainer_wasm = guest_wasm("tiny_llama");
     let corpus = corpus_dir();
+    // Derived from the real guests this cluster runs, so the envelope pins what those modules' own
+    // assessment said rather than a stand-in.
+    let execution =
+        daemon_vhc_testkit::live_genesis::live_execution(&coordinator_wasm, &trainer_wasm)
+            .expect("derive the live cluster execution requirements");
     let genesis = live_genesis(&LiveGenesisSpec {
+        execution,
         run_label,
         coordinator_wasm: &coordinator_wasm,
         coordinator_url: format!("file://{}", guest_path("coordinator_quorum").display()),
@@ -865,7 +871,13 @@ pub async fn start_cluster_membership(
     let coordinator_wasm = guest_wasm("coordinator_quorum");
     let trainer_wasm = guest_wasm("tiny_llama");
     let corpus = corpus_dir();
+    // Derived from the real guests this cluster runs, so the envelope pins what those modules' own
+    // assessment said rather than a stand-in.
+    let execution =
+        daemon_vhc_testkit::live_genesis::live_execution(&coordinator_wasm, &trainer_wasm)
+            .expect("derive the live cluster execution requirements");
     let genesis = live_genesis(&LiveGenesisSpec {
+        execution,
         run_label,
         coordinator_wasm: &coordinator_wasm,
         coordinator_url: format!("file://{}", guest_path("coordinator_quorum").display()),

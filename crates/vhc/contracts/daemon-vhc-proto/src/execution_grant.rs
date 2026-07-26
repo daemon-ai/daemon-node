@@ -37,7 +37,7 @@ use crate::bytes::Hash;
 use crate::canonical::to_canonical_vec;
 use crate::hash::blake3_hash;
 use crate::resource_plan::{
-    Binding, DimensionValue, LogicalResourcePlan, PlanRefusal, SelectionScope,
+    Binding, DimensionValue, Domain, LogicalResourcePlan, PlanRefusal, SelectionScope,
 };
 
 /// The schema this build authors and accepts.
@@ -73,6 +73,49 @@ pub struct ExecutionGrant {
 }
 
 impl ExecutionGrant {
+    /// The grant that selects each dimension's **smallest admissible value**.
+    ///
+    /// A named authoring policy, not a default. Selecting a configuration is a run-authoring
+    /// decision — nothing about a plan says which point in its parametric freedom a run should
+    /// occupy — so this exists to be *chosen*, and its name says what it chooses.
+    ///
+    /// It is the floor of the plan's cost, soundly: every operator in the plan's expression grammar
+    /// is monotone non-decreasing in its dimension arguments, so no other admissible selection costs
+    /// less. That makes it the right choice for a harness whose subject is some other rule, and the
+    /// wrong one for a run that means to train at a real batch size.
+    ///
+    /// An enumerated dimension takes its first spelling, which is well-defined because a plan's
+    /// enum domains are validated as sorted and unique.
+    ///
+    /// # Errors
+    /// [`PlanRefusal`] when the plan does not validate, when its digest cannot be computed, or when
+    /// a dimension declares an empty enum domain (nothing is admissible, so there is no minimum).
+    pub fn selecting_domain_minimum(plan: &LogicalResourcePlan) -> Result<Self, PlanRefusal> {
+        plan.validate()?;
+        let mut values = BTreeMap::new();
+        for dimension in &plan.dimensions {
+            let selected = match &dimension.domain {
+                Domain::UintRange { lo, .. } => GrantValue::Uint(*lo),
+                Domain::Enum(spellings) => {
+                    let first = spellings.first().ok_or_else(|| {
+                        PlanRefusal::Invalid(format!(
+                            "dimension `{}` declares an empty enum domain, so it has no smallest \
+                             admissible value",
+                            dimension.name
+                        ))
+                    })?;
+                    GrantValue::Text(first.clone())
+                }
+            };
+            values.insert(dimension.name.clone(), selected);
+        }
+        Ok(Self {
+            logical_resource_plan_hash: plan.plan_hash()?,
+            scope: plan.selection_scope,
+            values,
+        })
+    }
+
     /// The grant's canonical CBOR bytes — the exact bytes frozen in a signed role entry for
     /// [`SelectionScope::UniformRun`], and the exact bytes every participant consumes.
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, PlanRefusal> {

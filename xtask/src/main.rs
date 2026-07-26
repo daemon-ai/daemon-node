@@ -157,6 +157,14 @@ enum Cmd {
         /// The pinned trainer module blake3 (64-hex).
         #[arg(long)]
         trainer_module: String,
+        /// The coordinator module FILE. Required alongside its digest, and checked against it: the
+        /// role's resource requirements are derived by running the module's own assessment export, and
+        /// a digest cannot be asked what it needs.
+        #[arg(long)]
+        coordinator_wasm: PathBuf,
+        /// The trainer module FILE, checked against `--trainer-module`.
+        #[arg(long)]
+        trainer_wasm: PathBuf,
         /// The published `corpus-manifest.cbor` (its blake3 is the genesis corpus pin; its shards
         /// + tokenizer become the trainer's `data@2` fetch grants).
         #[arg(long)]
@@ -345,6 +353,8 @@ fn main() -> anyhow::Result<()> {
             author_key,
             coordinator_module,
             trainer_module,
+            coordinator_wasm,
+            trainer_wasm,
             corpus_manifest,
             trusted_base,
             roster,
@@ -364,6 +374,8 @@ fn main() -> anyhow::Result<()> {
             author_key,
             coordinator_module,
             trainer_module,
+            coordinator_wasm,
+            trainer_wasm,
             corpus_manifest,
             trusted_base,
             roster,

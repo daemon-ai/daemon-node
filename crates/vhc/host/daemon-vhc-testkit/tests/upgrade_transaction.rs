@@ -532,7 +532,7 @@ fn worker_upgrade_live_epoch_fenced_without_restart() {
     );
     assert!(old_entries.iter().any(|e| matches!(
         e,
-        SinkEntry::Terminal { kind: 0, outcome: Some(o) } if *o == u64::from(OUTCOME_QUIESCE_READY)
+        SinkEntry::Terminal { kind: 0, outcome: Some(o), .. } if *o == u64::from(OUTCOME_QUIESCE_READY)
     )));
 
     // The NEW journal opens with tag-13 reason 2 (upgrade-activation), before da_init (tag 11).
@@ -773,7 +773,7 @@ fn grant_expanding_upgrade_fails_closed_and_the_worker_exits() {
     let old_entries = drill.old_sink.lock().expect("sink").entries.clone();
     assert!(matches!(
         old_entries.last(),
-        Some(SinkEntry::Terminal { kind: 0, outcome: Some(o) })
+        Some(SinkEntry::Terminal { kind: 0, outcome: Some(o), .. })
             if *o == u64::from(OUTCOME_QUIESCE_READY)
     ));
     // Unused fields hold the drill shape together even on the refused path.
@@ -843,7 +843,8 @@ fn quiesce_ignoring_module_hits_the_deadline_and_the_worker_leaves() {
             old_entries.last(),
             Some(SinkEntry::Terminal {
                 kind: 1,
-                outcome: None
+                outcome: None,
+                ..
             })
         ),
         "trap terminal journaled, got {:?}",

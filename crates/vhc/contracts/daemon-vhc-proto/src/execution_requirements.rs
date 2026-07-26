@@ -25,6 +25,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
 use crate::bytes::{Hash, PeerId};
 use crate::error::VhcProtoError;
 use crate::execution_grant::ExecutionGrant;
@@ -302,6 +304,142 @@ impl RoleExecutionRequirements {
     }
 }
 
+/// A Logical Resource Plan **together with where it came from**.
+///
+/// The derivation invariant is that the module's own assessment output is the only source of a
+/// plan — an authoring seat that composed one itself would be stating a second, unverifiable
+/// opinion about the algorithm's needs, and the two would diverge silently. The plan is a plain
+/// struct with public fields, so nothing stops code from building one; what this wrapper does is
+/// make the *provenance* travel with it, so a seat can require a plan that came from a module and
+/// a fixture's plan cannot be mistaken for one.
+///
+/// The two constructors are the whole surface, and which code may call them is a scanned rule
+/// rather than a naming convention: `from_module_assessment` belongs to the assessment path alone,
+/// and `fixture` to test targets alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleDerivedPlan {
+    plan: LogicalResourcePlan,
+    module_derived: bool,
+}
+
+impl ModuleDerivedPlan {
+    /// Wrap the plan a module's own assessment export produced.
+    ///
+    /// **The assessment path is the only caller.** Everything else takes one of these as an input;
+    /// see the type's own note on why that is a scanned rule.
+    #[must_use]
+    pub fn from_module_assessment(plan: LogicalResourcePlan) -> Self {
+        Self {
+            plan,
+            module_derived: true,
+        }
+    }
+
+    /// Wrap a plan that no module produced, for a fixture that has no module to ask.
+    ///
+    /// Named so it cannot be mistaken for the real thing at a call site, and reported honestly by
+    /// [`Self::is_module_derived`] rather than passing as an assessment result.
+    #[must_use]
+    pub fn fixture(plan: LogicalResourcePlan) -> Self {
+        Self {
+            plan,
+            module_derived: false,
+        }
+    }
+
+    /// The plan itself.
+    #[must_use]
+    pub fn plan(&self) -> &LogicalResourcePlan {
+        &self.plan
+    }
+
+    /// Whether a module's assessment produced this plan.
+    ///
+    /// A gate that requires real provenance checks this rather than trusting the call site.
+    #[must_use]
+    pub fn is_module_derived(&self) -> bool {
+        self.module_derived
+    }
+}
+
+/// The per-role execution requirements an authoring seat **places into** a genesis envelope.
+///
+/// Authoring seats do not construct execution requirements. They are handed this and place what is
+/// in it, which is what makes the module the single source: a seat has no way to state a resource
+/// requirement of its own, because the only thing it can do with this type is look a role up in it.
+///
+/// A role that is missing from here gets no requirement structure, and `validate` refuses a runnable
+/// envelope carrying none — so an incomplete derivation fails closed and loudly at the existing gate
+/// rather than needing a new one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthoredExecution {
+    per_role: BTreeMap<String, RoleExecutionRequirements>,
+}
+
+impl AuthoredExecution {
+    /// Nothing derived yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Derive one role's requirements from the plan its module produced, and add them.
+    ///
+    /// This is the only way requirements enter, and it is [`RoleExecutionRequirements::derive`]
+    /// underneath — so the plan is validated, its digest computed here rather than accepted, and a
+    /// uniform-run plan's Execution Grant frozen into the signed role entry as a by-product of
+    /// authoring. Nothing about grant freezing is optional or separately invocable.
+    ///
+    /// # Errors
+    /// [`VhcProtoError::Validation`] when the plan is invalid, when a uniform-run plan arrives
+    /// without the grant it must freeze, when a per-participant plan declares no equivalence
+    /// contract, or when the grant does not bind to the plan.
+    pub fn derive(
+        mut self,
+        role: &str,
+        plan: &ModuleDerivedPlan,
+        allowed_backend_classes: Vec<String>,
+        profile_certification: ProfileCertificationRequirements,
+        minima: HardwareIndependentMinima,
+        uniform_grant: Option<&ExecutionGrant>,
+    ) -> Result<Self, VhcProtoError> {
+        let requirements = RoleExecutionRequirements::derive(
+            plan.plan(),
+            allowed_backend_classes,
+            profile_certification,
+            minima,
+            uniform_grant,
+        )?;
+        self.per_role.insert(role.to_string(), requirements);
+        Ok(self)
+    }
+
+    /// One role's requirements, or `None` when nothing was derived for it.
+    ///
+    /// `None` is placed as-is: `validate` refuses a runnable envelope whose role carries no
+    /// requirement structure, so a role the derivation missed is refused at the gate that already
+    /// exists instead of being papered over with a default here. A default would be this seat
+    /// stating a resource requirement, which is the whole thing the type exists to prevent.
+    #[must_use]
+    pub fn for_role(&self, role: &str) -> Option<RoleExecutionRequirements> {
+        self.per_role.get(role).cloned()
+    }
+
+    /// The roles requirements were derived for, in canonical order.
+    pub fn roles(&self) -> impl Iterator<Item = &str> {
+        self.per_role.keys().map(String::as_str)
+    }
+
+    /// Whether every one of `roles` had requirements derived for it.
+    ///
+    /// For a caller that would rather refuse before authoring than author an envelope its own
+    /// `validate` will reject.
+    #[must_use]
+    pub fn covers(&self, roles: &[&str]) -> bool {
+        roles.iter().all(|role| self.per_role.contains_key(*role))
+    }
+}
+
 /// A minimal but real execution-requirement structure for in-crate tests that need a *runnable*
 /// role entry: a one-dimension plan and the uniform grant that resolves it.
 #[cfg(test)]
@@ -541,5 +679,188 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("at least one backend class"));
+    }
+}
+
+#[cfg(test)]
+mod authoring_interface_tests {
+    use super::*;
+    use crate::resource_plan::{Dimension, Domain, Expr, LinearLifetime, LinearMemoryTerm};
+
+    fn plan_with_dimensions() -> LogicalResourcePlan {
+        LogicalResourcePlan {
+            selection_scope: SelectionScope::UniformRun,
+            equivalence_contract_hash: None,
+            dimensions: vec![
+                Dimension {
+                    name: "micro_batch".into(),
+                    domain: Domain::UintRange { lo: 2, hi: 16 },
+                },
+                Dimension {
+                    name: "precision".into(),
+                    domain: Domain::Enum(vec!["bf16".into(), "f32".into()]),
+                },
+            ],
+            tensors: vec![],
+            operations: vec![],
+            transfers: vec![],
+            linear_memory: vec![LinearMemoryTerm {
+                name: "floor".into(),
+                lifetime: LinearLifetime::Persistent,
+                bytes: Expr::Const(1 << 20),
+            }],
+            transient_live_sets: vec![],
+            linear_fragmentation_headroom: Expr::Const(0),
+        }
+    }
+
+    /// A plan carries where it came from, so a fixture's plan cannot pass as a module's.
+    ///
+    /// This is the whole mechanism behind the derivation invariant at the authoring seats: the plan
+    /// type has public fields and always will, so provenance has to travel beside it rather than be
+    /// inferred from the shape of what arrived.
+    #[test]
+    fn a_plan_reports_whether_a_module_produced_it() {
+        let assessed = ModuleDerivedPlan::from_module_assessment(plan_with_dimensions());
+        assert!(assessed.is_module_derived());
+
+        let fixture = ModuleDerivedPlan::fixture(plan_with_dimensions());
+        assert!(
+            !fixture.is_module_derived(),
+            "a fixture's plan must not report itself as an assessment result"
+        );
+        // Same plan either way — the difference is only ever the provenance.
+        assert_eq!(assessed.plan(), fixture.plan());
+    }
+
+    /// An authoring seat can only look a role up; it has no way to state a requirement.
+    ///
+    /// A role nobody derived comes back `None`, which the envelope's own `validate` refuses for a
+    /// runnable role. Defaulting instead would be the seat inventing a resource requirement, which is
+    /// the failure this type exists to prevent — so the absence is preserved all the way to the gate.
+    #[test]
+    fn an_unauthored_role_yields_nothing_rather_than_a_default() {
+        let plan = ModuleDerivedPlan::from_module_assessment(plan_with_dimensions());
+        let grant = ExecutionGrant::selecting_domain_minimum(plan.plan()).expect("floor grant");
+        let authored = AuthoredExecution::new()
+            .derive(
+                "trainer",
+                &plan,
+                vec!["cuda".into()],
+                ProfileCertificationRequirements::default(),
+                HardwareIndependentMinima::default(),
+                Some(&grant),
+            )
+            .expect("the trainer derives");
+
+        assert!(authored.for_role("trainer").is_some());
+        assert!(
+            authored.for_role("coordinator").is_none(),
+            "a role nobody derived must not acquire a default requirement here"
+        );
+        assert!(!authored.covers(&["trainer", "coordinator"]));
+        assert!(authored.covers(&["trainer"]));
+        assert_eq!(authored.roles().collect::<Vec<_>>(), vec!["trainer"]);
+    }
+
+    /// Deriving freezes the uniform-run grant as a by-product — there is no separate step to forget.
+    ///
+    /// The frozen bytes are canonical and the digest is computed here rather than accepted, so a
+    /// caller cannot hand in a grant digest that names something other than the grant it shipped.
+    #[test]
+    fn deriving_a_uniform_run_role_freezes_its_grant_and_computes_the_digest_itself() {
+        let plan = ModuleDerivedPlan::from_module_assessment(plan_with_dimensions());
+        let grant = ExecutionGrant::selecting_domain_minimum(plan.plan()).expect("floor grant");
+        let authored = AuthoredExecution::new()
+            .derive(
+                "trainer",
+                &plan,
+                vec!["cuda".into()],
+                ProfileCertificationRequirements::default(),
+                HardwareIndependentMinima::default(),
+                Some(&grant),
+            )
+            .expect("derives");
+        let requirements = authored.for_role("trainer").expect("present");
+
+        let SelectionRequirement::UniformRun {
+            execution_grant_hash,
+            execution_grant,
+        } = &requirements.selection
+        else {
+            panic!("a uniform-run plan must freeze a uniform-run selection");
+        };
+        assert_eq!(
+            *execution_grant,
+            grant.to_canonical_bytes().expect("canonical grant"),
+            "the frozen bytes are the grant's own canonical encoding"
+        );
+        assert_eq!(
+            *execution_grant_hash,
+            crate::hash::blake3_hash(execution_grant)
+        );
+        assert_eq!(
+            requirements.logical_resource_plan_hash,
+            crate::hash::blake3_hash(&requirements.logical_resource_plan)
+        );
+    }
+
+    /// A uniform-run plan cannot be authored without the grant it must freeze.
+    #[test]
+    fn a_uniform_run_role_refuses_to_derive_without_a_grant() {
+        let plan = ModuleDerivedPlan::from_module_assessment(plan_with_dimensions());
+        let refusal = AuthoredExecution::new()
+            .derive(
+                "trainer",
+                &plan,
+                vec!["cuda".into()],
+                ProfileCertificationRequirements::default(),
+                HardwareIndependentMinima::default(),
+                None,
+            )
+            .expect_err("a uniform-run plan without its grant must refuse");
+        assert!(
+            format!("{refusal}").contains("must freeze one Execution Grant"),
+            "the refusal says what is missing: {refusal}"
+        );
+    }
+
+    /// The domain-minimum policy selects each dimension's smallest admissible value.
+    ///
+    /// Sound as a floor because every operator in the plan's grammar is monotone non-decreasing in
+    /// its dimension arguments, so no other admissible selection costs less. It is a named choice,
+    /// not a default: a run that means to train at a real batch size selects for itself.
+    #[test]
+    fn the_domain_minimum_policy_selects_the_floor_of_every_dimension() {
+        let plan = plan_with_dimensions();
+        let grant = ExecutionGrant::selecting_domain_minimum(&plan).expect("floor grant");
+
+        assert_eq!(grant.scope, SelectionScope::UniformRun);
+        assert_eq!(
+            grant.values.get("micro_batch"),
+            Some(&crate::execution_grant::GrantValue::Uint(2)),
+            "the range's inclusive lower bound, not zero — zero is not admissible here"
+        );
+        assert_eq!(
+            grant.values.get("precision"),
+            Some(&crate::execution_grant::GrantValue::Text("bf16".into())),
+            "the first spelling of a domain validated as sorted and unique"
+        );
+        // It names the plan it resolves, so it cannot be applied to a different one.
+        assert_eq!(
+            grant.logical_resource_plan_hash,
+            plan.plan_hash().expect("plan hash")
+        );
+        grant
+            .bind_to(&plan)
+            .expect("the floor grant binds to its plan");
+    }
+
+    /// An empty enum domain has no smallest admissible value, and saying so beats picking one.
+    #[test]
+    fn an_empty_enum_domain_has_no_minimum_and_refuses() {
+        let mut plan = plan_with_dimensions();
+        plan.dimensions[1].domain = Domain::Enum(vec![]);
+        assert!(ExecutionGrant::selecting_domain_minimum(&plan).is_err());
     }
 }

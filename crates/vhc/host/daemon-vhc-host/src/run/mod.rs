@@ -29,9 +29,9 @@ pub mod state_store;
 pub mod streams;
 
 pub use admission::{
-    admit, apply_admitted_quotas, apply_state_grant_bounds, Admission, DeviceProfile,
-    EnvelopeRoleGrants, FunnelRefusal, MemoryClaim, OwnerPolicy, ParticipationLane, TierBytes,
-    STATE_RETAIN_ROOTS_GRANT,
+    admit, apply_admitted_quotas, apply_state_grant_bounds, author_execution, Admission,
+    DeviceProfile, EnvelopeRoleGrants, FunnelRefusal, GrantPolicy, MemoryClaim, OwnerPolicy,
+    ParticipationLane, RoleAuthoringInput, TierBytes, STATE_RETAIN_ROOTS_GRANT,
 };
 pub use buffer::BufferTable;
 pub use completion::{CompError, CompletionCodecError, CompletionResult, SuccessPayload};
