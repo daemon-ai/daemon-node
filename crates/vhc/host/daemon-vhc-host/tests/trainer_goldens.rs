@@ -592,9 +592,14 @@ fn drive_reproduce(engine: EngineConfig, g: &Goldens, wasm: &[u8]) -> Reproduced
     assert_eq!(sel.driver, daemon_vhc_abi::CandidateDriver::V2);
     assert_eq!(
         (sel.major, sel.minor),
-        (2, daemon_vhc_abi::BUFFER_STAGE_MINOR_V2),
-        "the streamed trainer imports the det-state write surface (minor 3) and the incremental \
-         buffer staging its committed container is built through (minor 4)"
+        (2, daemon_vhc_abi::CERTIFICATION_MINOR_V2),
+        "the trainer declares the certification rung. Its IMPORTS would fix it at the \
+         buffer-staging rung — the det-state write surface and the incremental buffer staging its \
+         committed container is built through — but it also emits a Logical Resource Plan, \
+         consumes an Execution Grant before initialization and forwards a panic from inside \
+         `da_init`, and none of those three is visible in an import shape. Declaring the rung is \
+         what makes a host that does not implement them refuse this module by name instead of \
+         trapping it"
     );
 
     let identity = RunIdentity {
