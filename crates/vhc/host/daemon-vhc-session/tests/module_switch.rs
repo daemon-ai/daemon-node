@@ -229,6 +229,8 @@ fn switch_binding_for(
         &owner(),
         None,
         Some(&envelope_grants),
+        // The legacy switch path: a lower-minor module declares its own claim, so no authority.
+        None,
     )
     .expect("target admits");
     let tuple = AdmittedTuple {

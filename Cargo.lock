@@ -4924,6 +4924,7 @@ dependencies = [
  "daemon-vhc-guest-build",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
+ "daemon-vhc-resource",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "libc",

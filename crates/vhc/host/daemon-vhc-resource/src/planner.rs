@@ -745,7 +745,7 @@ fn grant_for(
 }
 
 /// The all-minimum binding: the smallest configuration the plan permits.
-fn minimum_binding(plan: &LogicalResourcePlan) -> Result<Binding, PlannerError> {
+pub(crate) fn minimum_binding(plan: &LogicalResourcePlan) -> Result<Binding, PlannerError> {
     let mut binding = Binding::new();
     for dim in &plan.dimensions {
         let value = match &dim.domain {
@@ -762,6 +762,36 @@ fn minimum_binding(plan: &LogicalResourcePlan) -> Result<Binding, PlannerError> 
         binding.insert(dim.name.clone(), value);
     }
     Ok(binding)
+}
+
+/// Compose one configuration and the Execution Grant that carries it — **without authorizing it**.
+///
+/// Separate from [`select`] because the authorization steps have a required order that a function
+/// doing both cannot express: a composed claim is bounded by the participation lane *before* it is
+/// compared against the machine's supply or the owner's cap, so that an absurd claim is refused as a
+/// lane violation rather than reported as a machine that is too small. A caller needing that order —
+/// admission is the one that does — composes here and then authorizes in sequence.
+///
+/// The grant's digest is stamped into the claim, so the claim names the configuration it prices.
+///
+/// # Errors
+/// [`PlannerError`] when the plan and profile do not compose, or the grant cannot be encoded.
+pub fn compose_selection(
+    plan: &LogicalResourcePlan,
+    binding: &Binding,
+    profile: &BackendExecutionProfile,
+    co_resident_roles: u64,
+    scope: SelectionScope,
+) -> Result<Selection, PlannerError> {
+    let (mut claim, occupancy) = compose(plan, binding, profile, co_resident_roles)?;
+    let grant = grant_for(plan, binding, scope)?;
+    claim.execution_grant_hash = grant.grant_hash()?;
+    Ok(Selection {
+        binding: binding.clone(),
+        grant,
+        claim,
+        occupancy,
+    })
 }
 
 /// Compose over the plan's bounded choice set, select an admissible configuration under `policy`,
@@ -788,15 +818,7 @@ pub fn select(
     policy: &SelectionPolicy,
 ) -> Result<Selection, PlannerError> {
     let finish = |binding: Binding| -> Result<Selection, PlannerError> {
-        let (mut claim, occupancy) = compose(plan, &binding, profile, co_resident_roles)?;
-        let grant = grant_for(plan, &binding, scope)?;
-        claim.execution_grant_hash = grant.grant_hash()?;
-        Ok(Selection {
-            binding,
-            grant,
-            claim,
-            occupancy,
-        })
+        compose_selection(plan, &binding, profile, co_resident_roles, scope)
     };
 
     match policy {
@@ -927,17 +949,14 @@ pub mod vectors {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
     use super::*;
-    use crate::capability::fixtures::report;
-    use crate::profile::fixtures::profile;
-    use crate::revision::BackendClass;
     use daemon_vhc_proto::resource_plan::{
         Dimension, Dtype, Expr, Lifetime, LinearLifetime, LinearMemoryTerm, OperationDecl,
         Retention, TensorDecl, TransferDecl, TransferKind,
     };
 
-    fn plan() -> LogicalResourcePlan {
+    pub(crate) fn plan() -> LogicalResourcePlan {
         LogicalResourcePlan {
             selection_scope: SelectionScope::UniformRun,
             equivalence_contract_hash: None,
@@ -985,9 +1004,18 @@ mod tests {
         }
     }
 
-    fn binding(micro_batch: u64) -> Binding {
+    pub(crate) fn binding(micro_batch: u64) -> Binding {
         Binding::from([("micro_batch".to_string(), DimensionValue::Uint(micro_batch))])
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{binding, plan};
+    use super::*;
+    use crate::capability::fixtures::report;
+    use crate::profile::fixtures::profile;
+    use crate::revision::BackendClass;
 
     #[test]
     fn composition_is_deterministic_and_stamps_its_authorities() {

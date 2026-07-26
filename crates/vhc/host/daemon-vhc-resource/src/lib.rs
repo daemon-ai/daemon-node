@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admit;
 pub mod capability;
 pub mod composition_record;
 pub mod governor;
@@ -38,6 +39,7 @@ pub mod revision;
 pub mod store;
 pub mod trust;
 
+pub use admit::{admit_composition, AdmissionInputs, AdmissionRefusal, AdmittedComposition};
 pub use capability::{
     admit_device_bytes, admit_node_memory_bytes, derive_device_supply, revision_record_digest,
     CapabilityError, DeviceAdmissionRefusal, DeviceCapabilityReport, DeviceMemorySource,
@@ -56,9 +58,9 @@ pub use governor::{
     RESERVATION_ARITHMETIC_VERSION,
 };
 pub use planner::{
-    aggregate, check_claim_against_lane, compose, select, validate_against, AggregateClaim,
-    DivergenceAuthority, LaneClaimBounds, PhysicalClaim, PlannerError, ScopedOccupancy, ScopedTerm,
-    Selection, SelectionPolicy, PLANNER_VERSION,
+    aggregate, check_claim_against_lane, compose, compose_selection, select, validate_against,
+    AggregateClaim, DivergenceAuthority, LaneClaimBounds, PhysicalClaim, PlannerError,
+    ScopedOccupancy, ScopedTerm, Selection, SelectionPolicy, PLANNER_VERSION,
 };
 pub use profile::{
     AllocationCeilings, AllocationScope, BackendExecutionProfile, CompilationBehavior,

@@ -322,9 +322,13 @@ fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
         &owner,
         None,
         None,
+        // The trainer this staging test drives declares a tiered claim, so no composition authority
+        // is involved and the declared claim is what comes back.
+        None,
     )
     .expect("the trainer's own claim admits under the production trainer lane")
     .claim
+    .expect("a lower-minor trainer declares its own claim")
 }
 
 /// What the driven round produced.

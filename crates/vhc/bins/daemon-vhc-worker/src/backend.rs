@@ -1346,6 +1346,12 @@ pub(crate) fn role_binding(
         &owner,
         resolved.device_min.as_ref(),
         envelope_grants.as_ref(),
+        // No resource authority is assembled on this path yet, so a certification-minor module is
+        // refused `ClaimNotComposable` here — which is the correct answer today rather than a gap
+        // being papered over. Assembling one needs a certified profile to select, and no certified
+        // profile artifact exists on any box: profile certification is the measurement wave's
+        // deliverable and release signing is fenced. The funnel composes as soon as one is present.
+        None,
     )
     .map_err(|refusal| format!("join re-admission: {refusal}"))?;
 
@@ -1418,7 +1424,7 @@ pub(crate) fn role_binding(
     // committed update is built through the last of these) above its linear-memory floor, which the
     // engine caps separately from the claim's hard tier. Previously left uncapped on this path;
     // wiring it is the other half of "the claim is what governs, not a host constant".
-    run.hard_accountable_host_bytes = admission.claim.declared_peak.host;
+    run.hard_accountable_host_bytes = admission.hard_accountable_host_bytes();
     admission.apply_quotas(&mut run);
     // Provision the state plane from the genesis state contract (§6.3): the run-pinned
     // `state_chunk_size` the streamed det-lane fold runs under (`None` = no host-side state).
@@ -1447,7 +1453,7 @@ pub(crate) fn role_binding(
         own_cert: cert,
         trusted_bases,
         quotas: admission.quotas.clone(),
-        claim_host_bytes: admission.claim.hard_accountable.host,
+        claim_host_bytes: admission.claim_host_bytes(),
     })
 }
 
@@ -1604,14 +1610,16 @@ pub(crate) async fn assess_switch(
         &owner,
         resolved.device_min.as_ref(),
         envelope_grants.as_ref(),
+        // As on the join path: no certified profile exists to select, so no authority is assembled.
+        None,
     ) {
         Ok(admission) => Ok(Eligibility {
             eligible: true,
             reasons: vec![format!(
                 "switch target admitted for epoch {}: device {} B / host {} B",
                 target.epoch,
-                admission.claim.device_total(),
-                admission.claim.host_total(),
+                admission.charged_device_bytes(),
+                admission.charged_host_bytes(),
             )],
             headroom: Vec::new(),
             refusal_code: None,
@@ -1908,6 +1916,8 @@ fn assess_module(
         // the lane at stage 4.0 (mixed-fleet retired-native-coordinator). `None` on the v1-envelope path, where the
         // funnel's pre-D0 defaults stand.
         envelope_grants,
+        // As on the join path: no certified profile exists to select, so no authority is assembled.
+        None,
     ) {
         Ok(admission) => {
             // The immutable admitted tuple this assessment produced (architecture §6.3): the exact
@@ -1936,9 +1946,9 @@ fn assess_module(
                 reasons: vec![format!(
                     "major-2 claim admitted: device {} B / host {} B (disjoint tier sums), \
                      pressure order {:?}",
-                    admission.claim.device_total(),
-                    admission.claim.host_total(),
-                    admission.claim.under_pressure,
+                    admission.charged_device_bytes(),
+                    admission.charged_host_bytes(),
+                    admission.declared_pressure_order(),
                 )],
                 // The legacy declared tiers. A certification-minor admission additionally reports
                 // the composed reservation under the `reservation_*` keys, which the node's ledger
@@ -1948,11 +1958,11 @@ fn assess_module(
                 headroom: vec![
                     (
                         "claim_device_bytes".to_string(),
-                        admission.claim.device_total() as i64,
+                        admission.charged_device_bytes() as i64,
                     ),
                     (
                         "claim_host_bytes".to_string(),
-                        admission.claim.host_total() as i64,
+                        admission.charged_host_bytes() as i64,
                     ),
                 ],
                 refusal_code: None,

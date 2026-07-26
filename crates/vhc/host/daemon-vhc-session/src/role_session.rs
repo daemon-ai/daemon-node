@@ -781,6 +781,9 @@ async fn perform_switch(
         &binding.owner,
         None,
         binding.envelope_grants.as_ref(),
+        // No certified profile exists to select on this path yet; a certification-minor module is
+        // refused `ClaimNotComposable` rather than admitted against a substituted figure.
+        None,
     ) {
         Ok(a) => a,
         Err(refusal) => return refused(current, format!("switch re-admission: {refusal}")),

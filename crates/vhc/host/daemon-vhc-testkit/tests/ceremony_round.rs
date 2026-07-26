@@ -461,9 +461,13 @@ fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
         &owner,
         None,
         None,
+        // The ceremony trainer declares a tiered claim at its current minor, so no composition
+        // authority is involved and the declared claim is what comes back.
+        None,
     )
     .expect("the ceremony trainer's own claim admits under the production trainer lane")
     .claim
+    .expect("a lower-minor trainer declares its own claim")
 }
 
 #[test]

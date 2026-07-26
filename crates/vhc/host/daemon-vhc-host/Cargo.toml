@@ -24,6 +24,12 @@ path = "src/bin/daemon-vhc-probe.rs"
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+# The host side of the three-object resource model. Admission is one of the composition planner's four
+# callers (`[DI-10]`: authoring validation, node admission, sealed-binary conformance, ceremony
+# preflight), and the funnel composes the Physical Claim it authorizes rather than carrying a second
+# implementation of the same arithmetic. host/* → host/* is a permitted direction; the dependency the
+# model forbids is any guest-linked crate reaching this one, which the dep-check enforces separately.
+daemon-vhc-resource = { workspace = true }
 # The shared ABI contract (the major-2 constants, import-namespace
 # vocabulary, candidate-selection helpers, and the split admission-refusal taxonomy). A0 uses it
 # for driver selection (ABI §1.3) — promoted from a dev-dep (the `abi_surface` sync check) to a

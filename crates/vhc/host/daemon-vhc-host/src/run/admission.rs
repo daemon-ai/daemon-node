@@ -220,6 +220,31 @@ pub struct OwnerPolicy {
     pub host_cap_bytes: u64,
 }
 
+/// What the node brings to a certification-minor admission so a claim can be **composed** here.
+///
+/// Absent, a certification-minor module is refused `ClaimNotComposable` — which is the correct floor
+/// and not a defect: the module declares no physical figure, so without an authenticated profile and a
+/// capability report there is nothing to reserve, and the owner's own cap is never substituted for a
+/// figure that was supposed to be derived.
+///
+/// It is a borrowed bundle rather than owned state because none of it belongs to the funnel: the
+/// profile was selected against injected policies, the report was measured by the probe, the lane
+/// bounds are node configuration, and the reservation identity is the caller's.
+pub struct ResourceAuthority<'a> {
+    /// The authenticated certified profile for the backend implementation this node is running.
+    pub profile: &'a daemon_vhc_resource::AuthenticatedProfile<'a>,
+    /// This node's Device Capability Report — measured supply, stable rather than instantaneous.
+    pub report: &'a daemon_vhc_resource::DeviceCapabilityReport,
+    /// The lane's profile-keyed Physical Claim sanity bounds.
+    pub lane_bounds: &'a daemon_vhc_resource::LaneClaimBounds,
+    /// Role instances sharing this device, this one included.
+    pub co_resident_roles: u64,
+    /// The reservation identity this admission would hold.
+    pub reservation_identity: daemon_vhc_resource::ReservationIdentity,
+    /// The frozen configuration a uniform-run participant must verify rather than reselect.
+    pub frozen_binding: Option<&'a daemon_vhc_proto::resource_plan::Binding>,
+}
+
 /// The envelope-v2 grants input to the funnel (D0): one role's grant list from the genesis
 /// envelope plus the run's committed artifact-map hashes. `None` at the funnel means "no envelope
 /// grants" — the pre-D0 (v1-envelope / Phase-A default) path, where the driver defaults stand.
@@ -250,8 +275,18 @@ impl EnvelopeRoleGrants {
 pub struct Admission {
     /// The ABI §1.3 selection (driver, major, minor).
     pub selection: Selection,
-    /// The decoded, bounds-checked claim.
-    pub claim: MemoryClaim,
+    /// The decoded, bounds-checked claim the module **declared** — ABI ≤ 2.4 only.
+    ///
+    /// `None` at the certification minor, where the module declares no physical figure and
+    /// [`Self::composition`] carries the host's composed answer instead. Exactly one of the two is
+    /// present, and the accessors below read whichever it is: a consumer that reached for a declared
+    /// claim on a composed admission would be asking the guest a question the guest no longer answers.
+    pub claim: Option<MemoryClaim>,
+    /// The composed admission at the certification minor: the claim the host priced from the plan and
+    /// an authenticated profile, the grant that configures it, the aggregate, and the reservation.
+    ///
+    /// `None` below the certification minor.
+    pub composition: Option<daemon_vhc_resource::AdmittedComposition>,
     /// The claim's verbatim CBOR bytes (byte-identity is part of the contract, §9.2). Empty at the
     /// certification minor, which declares no tiered claim.
     pub claim_bytes: Vec<u8>,
@@ -268,6 +303,68 @@ pub struct Admission {
 }
 
 impl Admission {
+    /// The host linear-memory ceiling this admission authorizes, whichever authority set it.
+    ///
+    /// Below the certification minor it is the declared claim's peak host tier. At the certification
+    /// minor it is the composed claim's linear-memory figure, which the planner derives from the
+    /// module's own backend-neutral host-memory terms — the same quantity, now derived rather than
+    /// declared. Both are reviewed, bounded figures by the time they reach here.
+    #[must_use]
+    pub fn hard_accountable_host_bytes(&self) -> u64 {
+        match (&self.claim, &self.composition) {
+            (Some(claim), _) => claim.declared_peak.host,
+            (None, Some(composed)) => composed.claim().linear_memory_bytes,
+            (None, None) => 0,
+        }
+    }
+
+    /// The host bytes the engine caps the guest's linear memory at.
+    #[must_use]
+    pub fn claim_host_bytes(&self) -> u64 {
+        match (&self.claim, &self.composition) {
+            (Some(claim), _) => claim.hard_accountable.host,
+            (None, Some(composed)) => composed.claim().linear_memory_bytes,
+            (None, None) => 0,
+        }
+    }
+
+    /// The device bytes the owner's ledger charges for this admission.
+    ///
+    /// At the certification minor this is the **composed** claim's device total — the figure the node
+    /// actually reserved — rather than anything the module said about itself. That is the point of the
+    /// conversion: the ledger and the governor must charge one reservation, not two figures that
+    /// happen to be close.
+    #[must_use]
+    pub fn charged_device_bytes(&self) -> u64 {
+        match (&self.claim, &self.composition) {
+            (Some(claim), _) => claim.device_total(),
+            (None, Some(composed)) => composed.claim().device_total_bytes(),
+            (None, None) => 0,
+        }
+    }
+
+    /// The host bytes the owner's ledger charges for this admission.
+    #[must_use]
+    pub fn charged_host_bytes(&self) -> u64 {
+        match (&self.claim, &self.composition) {
+            (Some(claim), _) => claim.host_total(),
+            (None, Some(composed)) => composed.claim().linear_memory_bytes,
+            (None, None) => 0,
+        }
+    }
+
+    /// The module's declared degradation order — a **legacy** claim member.
+    ///
+    /// Empty at the certification minor, where no such declaration exists: what a module gives up
+    /// under pressure is not part of a supply-and-demand statement, and the governor observes pressure
+    /// at run time rather than being told about it at admission.
+    #[must_use]
+    pub fn declared_pressure_order(&self) -> &[u64] {
+        self.claim
+            .as_ref()
+            .map_or(&[][..], |claim| &claim.under_pressure)
+    }
+
     /// Copy the admitted quotas into a [`crate::run::RunConfig`] — the D0 envelope→admission→
     /// run-config derivation seam (deliverable 2). A no-op when the admission carried no envelope
     /// grants (the config's Phase-A defaults stand). `granted_artifacts` REPLACES the config's
@@ -418,6 +515,7 @@ pub fn admit(
     owner: &OwnerPolicy,
     envelope_min: Option<&daemon_vhc_proto::DeviceMinimums>,
     envelope_grants: Option<&EnvelopeRoleGrants>,
+    resources: Option<&ResourceAuthority<'_>>,
 ) -> Result<Admission, FunnelRefusal> {
     // -- stage 1: owner participation policy — free, local, before ANY other work ----------------
     if !owner.participation_enabled {
@@ -579,37 +677,79 @@ pub fn admit(
     // is the host's to compose from the plan and an authenticated Backend Execution Profile, and
     // until that composition exists on this node there is nothing to reserve — so the admission is
     // refused rather than falling back to any other figure.
-    let Some(claim) = assessed.claim.as_ref() else {
-        return Err(FunnelRefusal::typed(
-            4,
-            AbiRefusal::new(
-                AbiRefusalCode::ClaimNotComposable,
-                format!(
-                    "the module declares major-2 minor {} and emitted a Logical Resource Plan, but \
-                     this node has no authenticated Backend Execution Profile to compose a \
-                     Physical Claim with; no claim means no reservation and no admission",
-                    selection.minor
-                ),
-            ),
-        ));
+    let (composition, dt, ht) = match assessed.claim.as_ref() {
+        // ABI ≤ 2.4 — the module declared its own tiers, and the legacy scalar bounds check them
+        // unchanged. Lower-minor modules must keep being admitted exactly as before.
+        Some(claim) => {
+            let dt = claim.device_total();
+            let ht = claim.host_total();
+            let [dmin, dmax] = lane.claim_bounds_device;
+            let [hmin, hmax] = lane.claim_bounds_host;
+            if dt < dmin || dt > dmax || ht < hmin || ht > hmax {
+                return Err(FunnelRefusal::typed(
+                    4,
+                    AbiRefusal::new(
+                        AbiRefusalCode::ClaimExceedsPolicy,
+                        format!(
+                            "claim outside lane `{}` bounds: device {dt} ∉ [{dmin}, {dmax}] or \
+                             host {ht} ∉ [{hmin}, {hmax}]",
+                            lane.lane
+                        ),
+                    ),
+                ));
+            }
+            (None, dt, ht)
+        }
+        // The certification minor — the claim is the host's to compose, and the lane's bounds are
+        // profile-keyed and applied to the composed figure rather than to a declaration.
+        None => {
+            let plan = assessed.resource_plan.as_ref().ok_or_else(|| {
+                FunnelRefusal::typed(
+                    4,
+                    AbiRefusal::new(
+                        AbiRefusalCode::ClaimNotComposable,
+                        "the module declared the certification minor but the assessment produced \
+                         neither a tiered claim nor a Logical Resource Plan"
+                            .to_string(),
+                    ),
+                )
+            })?;
+            let Some(authority) = resources else {
+                return Err(FunnelRefusal::typed(
+                    4,
+                    AbiRefusal::new(
+                        AbiRefusalCode::ClaimNotComposable,
+                        format!(
+                            "the module declares major-2 minor {} and emitted a Logical Resource \
+                             Plan, but this node has no authenticated Backend Execution Profile to \
+                             compose a Physical Claim with; no claim means no reservation and no \
+                             admission",
+                            selection.minor
+                        ),
+                    ),
+                ));
+            };
+            let composed =
+                daemon_vhc_resource::admit_composition(&daemon_vhc_resource::AdmissionInputs {
+                    plan,
+                    profile: authority.profile,
+                    report: authority.report,
+                    // The owner's cap is applied once, at stage 5, where it has been applied all
+                    // along and where its refusal is already attributed to owner policy. Passing it
+                    // here as well would check one policy twice and leave two places to change it.
+                    owner_cap: None,
+                    lane: &lane.lane,
+                    lane_bounds: authority.lane_bounds,
+                    co_resident_roles: authority.co_resident_roles,
+                    reservation_identity: authority.reservation_identity.clone(),
+                    frozen_binding: authority.frozen_binding,
+                })
+                .map_err(composition_refusal)?;
+            let dt = composed.claim().device_total_bytes();
+            let ht = composed.claim().linear_memory_bytes;
+            (Some(composed), dt, ht)
+        }
     };
-    let dt = claim.device_total();
-    let ht = claim.host_total();
-    let [dmin, dmax] = lane.claim_bounds_device;
-    let [hmin, hmax] = lane.claim_bounds_host;
-    if dt < dmin || dt > dmax || ht < hmin || ht > hmax {
-        return Err(FunnelRefusal::typed(
-            4,
-            AbiRefusal::new(
-                AbiRefusalCode::ClaimExceedsPolicy,
-                format!(
-                    "claim outside lane `{}` bounds: device {dt} ∉ [{dmin}, {dmax}] or \
-                     host {ht} ∉ [{hmin}, {hmax}]",
-                    lane.lane
-                ),
-            ),
-        ));
-    }
 
     // -- stage 5: claim vs owner resource authorization — last (needs the claim), supreme ---------
     // Conservative A2 arbitration (decisions D6): the single-instance guard + scalar caps; the
@@ -642,12 +782,46 @@ pub fn admit(
 
     Ok(Admission {
         selection,
-        claim: claim.clone(),
+        claim: assessed.claim.clone(),
+        composition,
         claim_bytes: assessed.claim_bytes,
         resource_plan_bytes: assessed.resource_plan_bytes,
         manifest_bytes: assessed.manifest_bytes,
         quotas,
     })
+}
+
+/// Map a composition refusal onto the funnel stage and the ratified refusal code that named it.
+///
+/// The taxonomy already separates these, and the separation is the point: an operator told
+/// `ClaimExceedsPolicy` looks at policy, `PhysicalClaimExceedsLane` at the lane's envelope,
+/// `LaneProfileUnsupported` at the lane's configuration for this backend, and `ClaimNotComposable` at
+/// whether a profile is present and authenticated at all. Collapsing them into one code would put all
+/// four investigations behind the same word.
+fn composition_refusal(refusal: daemon_vhc_resource::AdmissionRefusal) -> FunnelRefusal {
+    use daemon_vhc_resource::{AdmissionRefusal, PlannerError};
+
+    let (stage, code) = match &refusal {
+        // The lane has no envelope for the priced backend class: nothing to check against, so nothing
+        // is admitted. Distinct from a claim that breached an envelope that does exist.
+        AdmissionRefusal::ExceedsLane(PlannerError::LaneStatesNoBoundsForClass { .. }) => {
+            (4, AbiRefusalCode::LaneProfileUnsupported)
+        }
+        AdmissionRefusal::ExceedsLane(_) => (4, AbiRefusalCode::PhysicalClaimExceedsLane),
+        // No usable claim came out of composition — a missing, incompatible or unusable input.
+        AdmissionRefusal::NotComposable(_) | AdmissionRefusal::CapabilityUnusable(_) => {
+            (4, AbiRefusalCode::ClaimNotComposable)
+        }
+        // The machine, the owner's policy, or the allocator the profile describes said no. Stage 5,
+        // because these are authorization answers about a claim that is otherwise well-formed.
+        AdmissionRefusal::Unauthorized(_)
+        | AdmissionRefusal::PoolBound(_)
+        | AdmissionRefusal::Aggregation(_) => (5, AbiRefusalCode::ClaimExceedsPolicy),
+    };
+    FunnelRefusal::typed(
+        stage,
+        AbiRefusal::new(code, format!("{} refused: {refusal}", refusal.stage())),
+    )
 }
 
 /// What the restricted assessment instance yielded (§9.2/§9.4 steps 4–7).
@@ -1264,6 +1438,7 @@ mod tests {
             &owner,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert_eq!(err.stage, 1);
@@ -1289,6 +1464,7 @@ mod tests {
             &l,
             &DeviceProfile::default(),
             &owner,
+            None,
             None,
             None,
         )
@@ -1336,6 +1512,7 @@ mod tests {
             &owner,
             None,
             Some(&eg),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.stage, 4);
@@ -1450,6 +1627,7 @@ mod tests {
             &owner,
             None,
             Some(&eg),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.stage, 4);
@@ -1482,12 +1660,13 @@ mod tests {
                 major: 2,
                 minor: 0,
             },
-            claim: MemoryClaim {
+            claim: Some(MemoryClaim {
                 hard_accountable: TierBytes::default(),
                 declared_peak: TierBytes::default(),
                 workspace: TierBytes::default(),
                 under_pressure: Vec::new(),
-            },
+            }),
+            composition: None,
             claim_bytes: Vec::new(),
             manifest_bytes: Vec::new(),
             quotas: Some(quotas),
