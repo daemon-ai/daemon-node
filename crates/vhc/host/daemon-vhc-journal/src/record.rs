@@ -503,6 +503,11 @@ impl Body {
             15 => Body::DeviceProfile(de(body)?),
             16 => Body::Condition(de(body)?),
             17 => Body::Seal(de(body)?),
+            // The grant-application result. Writable but not readable until now, which means a
+            // certification run could journal a record no replay could decode — and replay is the whole
+            // point of journaling it. Encode and decode are two halves of one contract; a tag added to
+            // one of them is not added.
+            18 => Body::ExecutionGrant(de(body)?),
             other => {
                 return Err(JournalError::UnknownTag(other));
             }

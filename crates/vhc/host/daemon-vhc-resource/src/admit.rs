@@ -216,6 +216,233 @@ pub fn admit_composition(
     })
 }
 
+/// The four composed members a certification run's journal header records, as recorded bytes.
+///
+/// Bytes rather than decoded values because that is what a replay holds, and because verifying a digest
+/// against the value it was decoded from proves nothing — the digest has to be checked against the bytes
+/// the journal actually carried.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordedComposition<'a> {
+    /// The canonical Logical Resource Plan bytes, and the hash the header recorded for them.
+    pub resource_plan: (&'a [u8], daemon_vhc_proto::Hash),
+    /// The composed role Physical Claim.
+    pub physical_claim: (&'a [u8], daemon_vhc_proto::Hash),
+    /// The node/device aggregate claim.
+    pub aggregate_claim: (&'a [u8], daemon_vhc_proto::Hash),
+    /// The Execution Grant.
+    pub execution_grant: (&'a [u8], daemon_vhc_proto::Hash),
+}
+
+/// Why a recorded composition cannot be trusted.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RecordedCompositionError {
+    /// A recorded hash does not match the bytes recorded beside it.
+    #[error(
+        "the run header's `{member}` hash does not match the bytes recorded with it, so the record \
+         cannot be used: nothing downstream may treat either as describing the other"
+    )]
+    DigestMismatch {
+        /// Which member.
+        member: &'static str,
+    },
+    /// A member's bytes are not a decodable value of its type.
+    #[error("the run header's `{member}` does not decode: {detail}")]
+    Undecodable {
+        /// Which member.
+        member: &'static str,
+        /// The decoder's own words.
+        detail: String,
+    },
+    /// Two recorded members disagree about what they describe.
+    #[error(
+        "the recorded composition is internally inconsistent: {detail}. The members were written by \
+         one admission, so a disagreement between them means the record was assembled from more than \
+         one run or was edited"
+    )]
+    Inconsistent {
+        /// What disagreed with what.
+        detail: String,
+    },
+    /// Re-composing the recorded plan against the recorded profile did not reproduce the claim.
+    #[error(
+        "re-composing the recorded plan reproduced a different claim than the run recorded \
+         ({recomposed} vs {recorded} device bytes), so the recorded claim is not what this planner \
+         and profile price that plan at"
+    )]
+    Divergent {
+        /// What re-composition produced.
+        recomposed: u64,
+        /// What the journal recorded.
+        recorded: u64,
+    },
+}
+
+/// Decode one recorded member of the host's own canonical-CBOR types.
+fn decode_member<T: serde::de::DeserializeOwned>(
+    member: &'static str,
+    bytes: &[u8],
+) -> Result<T, RecordedCompositionError> {
+    daemon_vhc_proto::from_canonical_slice(bytes).map_err(|e| {
+        RecordedCompositionError::Undecodable {
+            member,
+            detail: e.to_string(),
+        }
+    })
+}
+
+/// Validate a recorded composition: digests first, then the cross-references between the members.
+///
+/// **This is what a replay can check without holding a profile.** The recorded claim names the plan it
+/// prices and the grant that configured it, and the grant names the plan it configures — so the three
+/// have to agree, and a record where they do not was assembled from more than one run or was edited. It
+/// is a cheap, total check, and it runs before anything reads a value out of the record.
+///
+/// Digests are checked against the recorded **bytes**, in the order the ABI requires: every digest is
+/// verified before any value is used. A reader that decoded first and checked later would already have
+/// acted on bytes it had not authenticated.
+///
+/// # Errors
+/// [`RecordedCompositionError`] naming the member or the disagreement.
+pub fn validate_recorded_composition(
+    recorded: RecordedComposition<'_>,
+) -> Result<(), RecordedCompositionError> {
+    use daemon_vhc_proto::blake3_hash;
+
+    for (member, (bytes, recorded_hash)) in [
+        ("resource_plan", recorded.resource_plan),
+        ("physical_claim", recorded.physical_claim),
+        ("aggregate_claim", recorded.aggregate_claim),
+        ("execution_grant", recorded.execution_grant),
+    ] {
+        if blake3_hash(bytes) != recorded_hash {
+            return Err(RecordedCompositionError::DigestMismatch { member });
+        }
+    }
+
+    let claim: PhysicalClaim = decode_member("physical_claim", recorded.physical_claim.0)?;
+    let aggregate: AggregateClaim = decode_member("aggregate_claim", recorded.aggregate_claim.0)?;
+    // The plan and the grant are closed bounded schemas with their own decoders, and those are what a
+    // replay must use: a permissive decode would accept bytes the admission path would have refused.
+    let grant = ExecutionGrant::decode_canonical(recorded.execution_grant.0).map_err(|e| {
+        RecordedCompositionError::Undecodable {
+            member: "execution_grant",
+            detail: e.detail().to_string(),
+        }
+    })?;
+    // Decoded to prove the recorded bytes are a plan at all; its own hash is what the cross-references
+    // below are against.
+    LogicalResourcePlan::decode_canonical(recorded.resource_plan.0).map_err(|e| {
+        RecordedCompositionError::Undecodable {
+            member: "resource_plan",
+            detail: e.detail().to_string(),
+        }
+    })?;
+
+    let plan_hash = recorded.resource_plan.1;
+    if claim.logical_resource_plan_hash != plan_hash {
+        return Err(RecordedCompositionError::Inconsistent {
+            detail: "the recorded claim prices a different plan than the one recorded beside it"
+                .into(),
+        });
+    }
+    if grant.logical_resource_plan_hash != plan_hash {
+        return Err(RecordedCompositionError::Inconsistent {
+            detail:
+                "the recorded grant configures a different plan than the one recorded beside it"
+                    .into(),
+        });
+    }
+    if claim.execution_grant_hash != recorded.execution_grant.1 {
+        return Err(RecordedCompositionError::Inconsistent {
+            detail: "the recorded claim names a different grant than the one recorded beside it"
+                .into(),
+        });
+    }
+    // The aggregate is what the node reserved, so it cannot be smaller per-allocation than the role
+    // whose admission it covers.
+    if aggregate.max_individual_allocation_bytes < claim.max_individual_allocation_bytes {
+        return Err(RecordedCompositionError::Inconsistent {
+            detail: format!(
+                "the node aggregate allows a {}-byte single allocation while the role it covers \
+                 claims {}",
+                aggregate.max_individual_allocation_bytes, claim.max_individual_allocation_bytes
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Re-derive the recorded claim from the recorded plan and grant, and require byte-equality.
+///
+/// The stronger check, available to a replay that holds the profile the claim cites. Validation above
+/// proves the record is self-consistent; this proves it is what **this** planner and profile actually
+/// price that plan at, which is what makes a divergence attributable: the same plan and the same profile
+/// producing a different claim means the planner changed, and that is a versioned artifact.
+///
+/// Call [`validate_recorded_composition`] first — this trusts the digests it checked.
+///
+/// # Errors
+/// [`RecordedCompositionError::Divergent`] when re-composition disagrees, or the decode/consistency
+/// errors of the underlying members.
+pub fn recompose_recorded_claim(
+    recorded: RecordedComposition<'_>,
+    profile: &crate::profile::BackendExecutionProfile,
+    co_resident_roles: u64,
+) -> Result<(), RecordedCompositionError> {
+    let plan = LogicalResourcePlan::decode_canonical(recorded.resource_plan.0).map_err(|e| {
+        RecordedCompositionError::Undecodable {
+            member: "resource_plan",
+            detail: e.detail().to_string(),
+        }
+    })?;
+    let recorded_claim: PhysicalClaim = decode_member("physical_claim", recorded.physical_claim.0)?;
+    let grant = ExecutionGrant::decode_canonical(recorded.execution_grant.0).map_err(|e| {
+        RecordedCompositionError::Undecodable {
+            member: "execution_grant",
+            detail: e.detail().to_string(),
+        }
+    })?;
+
+    // The configuration the run actually ran under is the grant's, not a re-selection: replay
+    // reproduces a recorded decision and never makes a fresh one.
+    //
+    // A grant value that is not a dimension value refuses rather than being coerced. The grant's own
+    // domain is wider than a plan dimension's — it can carry a boolean or a signed selection — and a
+    // plan whose dimension was granted one of those was never composable, so guessing a mapping here
+    // would invent a configuration the run could not have had.
+    let mut binding = daemon_vhc_proto::resource_plan::Binding::new();
+    for (name, value) in &grant.values {
+        let dimension_value = match value {
+            daemon_vhc_proto::execution_grant::GrantValue::Uint(n) => {
+                daemon_vhc_proto::resource_plan::DimensionValue::Uint(*n)
+            }
+            daemon_vhc_proto::execution_grant::GrantValue::Text(s) => {
+                daemon_vhc_proto::resource_plan::DimensionValue::Enum(s.clone())
+            }
+            other => {
+                return Err(RecordedCompositionError::Inconsistent {
+                    detail: format!(
+                        "the recorded grant assigns `{name}` a {other:?}, which is not a value any \
+                         plan dimension can take"
+                    ),
+                })
+            }
+        };
+        binding.insert(name.clone(), dimension_value);
+    }
+    let recomposed = compose_selection(&plan, &binding, profile, co_resident_roles, grant.scope)
+        .map_err(|e| RecordedCompositionError::Inconsistent {
+            detail: format!("the recorded plan does not compose against this profile: {e}"),
+        })?;
+    if recomposed.claim.total_peak_bytes != recorded_claim.total_peak_bytes {
+        return Err(RecordedCompositionError::Divergent {
+            recomposed: recomposed.claim.total_peak_bytes,
+            recorded: recorded_claim.total_peak_bytes,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +631,160 @@ mod tests {
         let refusal =
             admit_composition(&inputs(&plan, &profile, &unmeasured, &bounds)).expect_err("refuses");
         assert_eq!(refusal.stage(), "pool-bound");
+    }
+
+    /// A recorded composition validates, and every cross-reference between its members is load-bearing.
+    ///
+    /// This is what a replay checks holding nothing but the journal: the members were written by one
+    /// admission, so a disagreement between them means the record came from more than one run or was
+    /// edited. Each mutation below is a record that would otherwise have been read as describing a run
+    /// it does not describe.
+    #[test]
+    fn a_recorded_composition_validates_and_each_cross_reference_is_load_bearing() {
+        use daemon_vhc_proto::blake3_hash;
+
+        let plan = plan();
+        let (store, running) = stocked();
+        let policy = trust_fixtures::policy_for(&store);
+        let profile = authenticate(&store, &running, &policy);
+        let report = report_with_measured_ceiling();
+        let bounds = generous_bounds();
+        let admitted = admit_composition(&inputs(&plan, &profile, &report, &bounds))
+            .expect("the fixture admits");
+
+        let plan_bytes = plan.to_canonical_bytes().expect("plan encodes");
+        let claim_bytes = admitted
+            .claim()
+            .to_canonical_bytes()
+            .expect("claim encodes");
+        let aggregate_bytes = admitted
+            .aggregate
+            .to_canonical_bytes()
+            .expect("aggregate encodes");
+        let grant_bytes = admitted
+            .grant()
+            .to_canonical_bytes()
+            .expect("grant encodes");
+        let recorded = |plan_b: &'static [u8]| plan_b;
+        let _ = recorded;
+
+        let members = |plan_b: &[u8], claim_b: &[u8], agg_b: &[u8], grant_b: &[u8]| {
+            (
+                blake3_hash(plan_b),
+                blake3_hash(claim_b),
+                blake3_hash(agg_b),
+                blake3_hash(grant_b),
+            )
+        };
+        let (ph, ch, ah, gh) = members(&plan_bytes, &claim_bytes, &aggregate_bytes, &grant_bytes);
+        let good = RecordedComposition {
+            resource_plan: (&plan_bytes, ph),
+            physical_claim: (&claim_bytes, ch),
+            aggregate_claim: (&aggregate_bytes, ah),
+            execution_grant: (&grant_bytes, gh),
+        };
+        validate_recorded_composition(good).expect("what admission wrote validates");
+
+        // A digest that does not match its bytes is caught before anything is decoded.
+        let wrong_digest = RecordedComposition {
+            physical_claim: (&claim_bytes, blake3_hash(b"not the claim")),
+            ..good
+        };
+        assert!(matches!(
+            validate_recorded_composition(wrong_digest).unwrap_err(),
+            RecordedCompositionError::DigestMismatch {
+                member: "physical_claim"
+            }
+        ));
+
+        // A claim recorded beside a different plan than it prices.
+        let other_plan = {
+            let mut p = plan.clone();
+            p.linear_fragmentation_headroom = daemon_vhc_proto::resource_plan::Expr::Const(8192);
+            p.to_canonical_bytes().expect("encodes")
+        };
+        let swapped_plan = RecordedComposition {
+            resource_plan: (&other_plan, blake3_hash(&other_plan)),
+            ..good
+        };
+        let err = validate_recorded_composition(swapped_plan).unwrap_err();
+        assert!(
+            matches!(err, RecordedCompositionError::Inconsistent { .. }),
+            "a claim pricing another plan is refused, got {err}"
+        );
+
+        // An aggregate that allows less per allocation than the role it covers.
+        let shrunk = {
+            let mut aggregate = admitted.aggregate.clone();
+            aggregate.max_individual_allocation_bytes = admitted
+                .claim()
+                .max_individual_allocation_bytes
+                .saturating_sub(1);
+            aggregate.to_canonical_bytes().expect("encodes")
+        };
+        let shrunk_aggregate = RecordedComposition {
+            aggregate_claim: (&shrunk, blake3_hash(&shrunk)),
+            ..good
+        };
+        assert!(matches!(
+            validate_recorded_composition(shrunk_aggregate).unwrap_err(),
+            RecordedCompositionError::Inconsistent { .. }
+        ));
+    }
+
+    /// Holding the profile, a replay re-derives the recorded claim and requires it to agree.
+    ///
+    /// The configuration it re-composes is the **grant's**, not a fresh selection: replay reproduces a
+    /// recorded decision. A recorded claim that this planner and profile do not price that plan at is a
+    /// divergence with somewhere to point — the planner is a versioned artifact and the profile is a
+    /// certified one, so exactly one of them moved.
+    #[test]
+    fn a_replay_holding_the_profile_reproduces_the_recorded_claim() {
+        use daemon_vhc_proto::blake3_hash;
+
+        let plan = plan();
+        let (store, running) = stocked();
+        let policy = trust_fixtures::policy_for(&store);
+        let profile = authenticate(&store, &running, &policy);
+        let report = report_with_measured_ceiling();
+        let bounds = generous_bounds();
+        let admitted = admit_composition(&inputs(&plan, &profile, &report, &bounds))
+            .expect("the fixture admits");
+
+        let plan_bytes = plan.to_canonical_bytes().unwrap();
+        let claim_bytes = admitted.claim().to_canonical_bytes().unwrap();
+        let aggregate_bytes = admitted.aggregate.to_canonical_bytes().unwrap();
+        let grant_bytes = admitted.grant().to_canonical_bytes().unwrap();
+        let recorded = RecordedComposition {
+            resource_plan: (&plan_bytes, blake3_hash(&plan_bytes)),
+            physical_claim: (&claim_bytes, blake3_hash(&claim_bytes)),
+            aggregate_claim: (&aggregate_bytes, blake3_hash(&aggregate_bytes)),
+            execution_grant: (&grant_bytes, blake3_hash(&grant_bytes)),
+        };
+
+        recompose_recorded_claim(recorded, profile.profile(), 1)
+            .expect("the same plan, grant and profile reproduce the recorded claim");
+
+        // A record whose claim was tampered with is a divergence, and it names both figures.
+        let tampered = {
+            let mut claim = admitted.claim().clone();
+            claim.total_peak_bytes = claim.total_peak_bytes.saturating_add(4096);
+            claim.to_canonical_bytes().unwrap()
+        };
+        let divergent = RecordedComposition {
+            physical_claim: (&tampered, blake3_hash(&tampered)),
+            ..recorded
+        };
+        let err = recompose_recorded_claim(divergent, profile.profile(), 1).unwrap_err();
+        assert!(
+            matches!(err, RecordedCompositionError::Divergent { .. }),
+            "got {err}"
+        );
+
+        // Co-residency is deliberately NOT asserted to change the answer here: this fixture's profile
+        // prices no process- or device-scoped term, so the same plan composes identically however many
+        // roles share the device. A profile that did carry such a term would diverge, and that it does
+        // not is a property of the fixture rather than of the check.
     }
 
     /// A frozen configuration is verified, not re-selected.

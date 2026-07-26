@@ -11,6 +11,11 @@ path = "src/lib.rs"
 [dependencies]
 # The wire contract (message types, canonical codec, envelope, hashes).
 daemon-vhc-proto = { workspace = true }
+# The host resource model, for one job: validating the composed members a certification run's tag-0
+# header records. A replay that read those values without checking their digests and cross-references
+# would be re-driving a run from a record it had not authenticated, and the types that say what those
+# members mean live there. host/* → host/* is a permitted direction.
+daemon-vhc-resource = { workspace = true }
 # The shared coordinator types + round message schemas the replay oracle carries (PROTO-20):
 # `CoordinatorState` (the genesis-derived config the coordinator module is initialized with), the
 # `Input` trace, and the decoded round messages the journal/desync/health oracles inspect. The

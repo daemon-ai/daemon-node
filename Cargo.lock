@@ -5014,6 +5014,7 @@ dependencies = [
  "daemon-vhc-abi",
  "daemon-vhc-journal",
  "daemon-vhc-proto",
+ "daemon-vhc-resource",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "serde",

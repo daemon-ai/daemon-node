@@ -39,7 +39,10 @@ pub mod revision;
 pub mod store;
 pub mod trust;
 
-pub use admit::{admit_composition, AdmissionInputs, AdmissionRefusal, AdmittedComposition};
+pub use admit::{
+    admit_composition, recompose_recorded_claim, validate_recorded_composition, AdmissionInputs,
+    AdmissionRefusal, AdmittedComposition, RecordedComposition, RecordedCompositionError,
+};
 pub use capability::{
     admit_device_bytes, admit_node_memory_bytes, derive_device_supply, revision_record_digest,
     AllocationProbeMethod, CapabilityError, DeviceAdmissionRefusal, DeviceCapabilityReport,

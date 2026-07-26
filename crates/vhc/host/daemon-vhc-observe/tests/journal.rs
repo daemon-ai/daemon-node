@@ -17,9 +17,9 @@ use daemon_vhc_proto::{blake3_hash, Hash};
 
 use daemon_vhc_observe::journal::record::{
     Body, ClockRec, CompletionRec, ConditionRec, DeviceProfileRec, DropId, DropRec, EventRec,
-    EvidenceRef, ExecIdentity, InitRec, InstantiationRec, PublishRec, ReadBackRec, Record,
-    RunHeader, SealRec, SidecarRef, SignedFrameRec, SnapshotRec, TerminalRec, ThrottleRec,
-    TimerArmRec, TimerCancelRec, TrapInfo,
+    EvidenceRef, ExecIdentity, ExecutionGrantRec, InitRec, InstantiationRec, PublishRec,
+    ReadBackRec, Record, RunHeader, SealRec, SidecarRef, SignedFrameRec, SnapshotRec, TerminalRec,
+    ThrottleRec, TimerArmRec, TimerCancelRec, TrapInfo,
 };
 use daemon_vhc_observe::journal::segment::{
     scan_bytes, SegmentHeader, SegmentWriter, GENESIS_PREV,
@@ -161,6 +161,13 @@ fn all_bodies() -> Vec<Body> {
             segment_blake3: h(8),
             records: 18,
         }),
+        // tag 18 — the grant-application result a certification run records after the export returns.
+        // It was added to the grammar without a sample here, so this set stopped covering the record
+        // set it claims to cover and the assertion below caught it as soon as anyone ran the suite.
+        Body::ExecutionGrant(ExecutionGrantRec {
+            execution_grant_hash: h(18),
+            status: 0,
+        }),
     ]
 }
 
@@ -172,7 +179,7 @@ fn every_record_tag_round_trips_and_conforms_to_the_grammar() {
     for t in JOURNAL_RECORD_TAGS {
         assert!(tags.contains(t), "tag {t} missing from the round-trip set");
     }
-    assert_eq!(tags, (0u8..=17).collect::<Vec<_>>(), "tags in 0..=17 order");
+    assert_eq!(tags, (0u8..=18).collect::<Vec<_>>(), "tags in 0..=18 order");
 
     for (i, body) in bodies.into_iter().enumerate() {
         let record = Record::new(i as u64, body);
@@ -439,6 +446,7 @@ fn verifier_skeleton_pass_diverge_missing_terminal() {
             frame: b"f".to_vec(),
         }],
         expected: vec![expected.clone()],
+        composition: Default::default(),
     };
 
     // Pass: the guest reproduces the recorded publish.
@@ -478,6 +486,7 @@ fn verifier_skeleton_pass_diverge_missing_terminal() {
             }),
         }],
         expected: vec![],
+        composition: Default::default(),
     };
     let mut g = EchoGuest { to_emit: vec![] };
     assert_eq!(
@@ -492,6 +501,7 @@ fn verifier_skeleton_pass_diverge_missing_terminal() {
     let term_plan = ReplayPlan {
         steps: vec![ReplayStep::Terminal { ord: 9, kind: 1 }],
         expected: vec![],
+        composition: Default::default(),
     };
     let mut g2 = EchoGuest { to_emit: vec![] };
     assert_eq!(
