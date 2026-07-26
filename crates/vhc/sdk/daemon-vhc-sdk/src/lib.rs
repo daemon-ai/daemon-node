@@ -25,9 +25,10 @@ pub mod module;
 #[cfg(target_arch = "wasm32")]
 pub use corpus::register_shard_chunks;
 pub use corpus::{
-    chunk_descriptor, decode_sequence_tokens, derive_assignment, plan_window, sequence_byte_range,
-    Assignment, AssignmentParams, BatchLocation, CorpusError, CorpusManifest, CorpusWindow,
-    Manifest, RangeFetch, ShardDesc, TokenWidth,
+    chunk_descriptor, decode_sequence_tokens, derive_assignment, plan_covering_window, plan_window,
+    sequence_byte_range, Assignment, AssignmentParams, BatchLocation, CorpusError, CorpusManifest,
+    CorpusWindow, Manifest, RangeFetch, SequenceSlice, ShardDesc, SlicePart, TokenWidth,
+    WindowPlan,
 };
 pub use migrate::{
     build_manifest, MigrateState, MigrationDescriptor, MigrationSection, OwnedSection, SectionDecl,
@@ -111,8 +112,13 @@ macro_rules! main {
             pub extern "C" fn da_abi() -> u32 {
                 // The declaration is cross-checked against the import shape at selection
                 // (ABI §1.3 step 5): the declared minor must cover every imported symbol's
-                // introducing minor.
-                (2 << 16) | <$module as $crate::module::GuestModule>::decl().abi_minor
+                // introducing minor — and, for the certification minor, the BEHAVIORAL dependency
+                // the import shape cannot see (pre-loop panic forwarding), which
+                // `declared_abi_minor` folds in from the same predicate that arms it.
+                (2 << 16)
+                    | $crate::module::declared_abi_minor(
+                        <$module as $crate::module::GuestModule>::decl().abi_minor,
+                    )
             }
 
             #[no_mangle]
@@ -160,6 +166,11 @@ macro_rules! main {
                 grants_ptr: u32,
                 grants_len: u32,
             ) -> u32 {
+                // Arm panic forwarding before the module's own logic can panic — initialization
+                // allocates the state plane, and a wasm allocation failure aborts through the
+                // panic path, so this hook is the last moment the message exists. Inert below the
+                // certification minor, where the pre-loop call would be a phase violation.
+                $crate::module::rt::arm_pre_loop_diagnostics();
                 let read = |ptr: u32, len: u32| -> Vec<u8> {
                     if len == 0 {
                         Vec::new()
@@ -194,6 +205,10 @@ macro_rules! main {
             /// The host writes the descriptor span before the call (ABI §10.2).
             #[no_mangle]
             pub unsafe extern "C" fn da_migrate(descriptor_ptr: u32, descriptor_len: u32) -> u32 {
+                // Migration reconstructs the state plane: the same pre-loop phase, the same
+                // reason (see `da_init`). Guarded by the same `Once`, so this is a no-op when
+                // initialization already armed it.
+                $crate::module::rt::arm_pre_loop_diagnostics();
                 let bytes = ::std::slice::from_raw_parts(
                     descriptor_ptr as *const u8,
                     descriptor_len as usize,

@@ -401,6 +401,9 @@ pub enum CorpusError {
         /// The roster size.
         roster: u32,
     },
+    /// A window plan was asked for over a manifest declaring a zero chunk size (an unvalidated
+    /// manifest — the covering grid is undefined).
+    ZeroChunkSize,
 }
 
 impl std::fmt::Display for CorpusError {
@@ -445,6 +448,7 @@ impl std::fmt::Display for CorpusError {
             Self::AssignmentOutOfRange { peer, roster } => {
                 write!(f, "peer index {peer} out of range (roster size {roster})")
             }
+            Self::ZeroChunkSize => write!(f, "manifest declares chunk_size 0"),
         }
     }
 }
@@ -664,6 +668,129 @@ pub fn plan_window(
             range_len,
         })
         .collect())
+}
+
+/// One contiguous piece of a requested sequence, inside one of a [`WindowPlan`]'s fetches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlicePart {
+    /// Index into [`WindowPlan::fetches`].
+    pub fetch: usize,
+    /// Byte offset of this piece within that fetch's bytes.
+    pub offset: u64,
+    /// Byte length of this piece.
+    pub len: u64,
+}
+
+/// Where one requested sequence's bytes sit inside a [`WindowPlan`]'s fetches. A sequence that
+/// straddles a covering-chunk boundary is carried by consecutive fetches, so this is an ordered
+/// list whose lengths sum to the sequence's byte length; the common case is one part.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceSlice {
+    /// The pieces, in sequence-byte order.
+    pub parts: Vec<SlicePart>,
+}
+
+/// A window's fetch plan with every requested sequence located inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowPlan {
+    /// The fetches to issue, in (shard, offset) order — one per covering chunk the window touches.
+    pub fetches: Vec<RangeFetch>,
+    /// One entry per requested sequence, in the requested order.
+    pub sequences: Vec<SequenceSlice>,
+}
+
+/// Plan a whole window's fetches so **each covering chunk is fetched exactly once**.
+///
+/// [`plan_window`] coalesces only the sequences handed to one call, so a caller that plans
+/// micro-batch by micro-batch issues one range per micro-batch — and when several of them fall in
+/// the same covering chunk, the host transfers and verifies that whole chunk once per range. The
+/// duplication is invisible to the caller (each range verifies and returns exactly the bytes it
+/// asked for) and is paid for entirely in artifact-plane traffic.
+///
+/// This planner takes the window whole: it merges every requested sequence's byte range into
+/// maximal contiguous per-shard runs, then splits those runs on the manifest's covering-chunk
+/// grid. The split is what bounds the transfer — one fetch never spans more than one chunk, so
+/// the bytes a caller holds for one fetch are bounded by `chunk_size` and never by the shard.
+/// What remains after coalescing is **granularity**, not duplication: a chunk that carries more
+/// than the window needs still crosses the wire whole, because a chunk is the unit the manifest
+/// makes verifiable.
+///
+/// # Errors
+/// [`CorpusError::BatchOutOfRange`] when any id is past the last sequence;
+/// [`CorpusError::ZeroChunkSize`] on a manifest with no covering grid.
+pub fn plan_covering_window(
+    manifest: &CorpusManifest,
+    seqs: &[u64],
+) -> Result<WindowPlan, CorpusError> {
+    let chunk = manifest.chunk_size;
+    if chunk == 0 {
+        return Err(CorpusError::ZeroChunkSize);
+    }
+    let located: Vec<(usize, u64, u64)> = seqs
+        .iter()
+        .map(|&s| sequence_byte_range(manifest, s))
+        .collect::<Result<_, _>>()?;
+
+    // Merge each shard's requested ranges into maximal contiguous runs.
+    let mut per_shard: BTreeMap<usize, Vec<(u64, u64)>> = BTreeMap::new();
+    for &(shard, off, len) in &located {
+        per_shard.entry(shard).or_default().push((off, off + len));
+    }
+
+    // Split every run on the covering-chunk grid: one fetch per (shard, chunk) the window touches.
+    let mut fetches = Vec::new();
+    let mut units: BTreeMap<usize, Vec<(u64, u64, usize)>> = BTreeMap::new();
+    for (shard, mut runs) in per_shard {
+        runs.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(runs.len());
+        for (start, end) in runs {
+            match merged.last_mut() {
+                Some((_, prev_end)) if start <= *prev_end => *prev_end = (*prev_end).max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        let shard_units = units.entry(shard).or_default();
+        for (start, end) in merged {
+            let mut at = start;
+            while at < end {
+                let boundary = (at / chunk).saturating_add(1).saturating_mul(chunk);
+                let unit_end = end.min(boundary);
+                shard_units.push((at, unit_end, fetches.len()));
+                fetches.push(RangeFetch {
+                    shard_hash: manifest.shards[shard].shard_hash.0,
+                    range_off: at,
+                    range_len: unit_end - at,
+                });
+                at = unit_end;
+            }
+        }
+    }
+
+    // Locate every requested sequence inside the fetches that carry it.
+    let mut sequences = Vec::with_capacity(located.len());
+    for (shard, off, len) in located {
+        let shard_units = units.get(&shard).ok_or(CorpusError::BatchOutOfRange {
+            batch: 0,
+            total: manifest.total_sequences(),
+        })?;
+        let end = off + len;
+        let mut at = off;
+        let mut i = shard_units.partition_point(|(_, unit_end, _)| *unit_end <= at);
+        let mut parts = Vec::with_capacity(1);
+        while at < end {
+            let (unit_off, unit_end, fetch) = shard_units[i];
+            let take = end.min(unit_end) - at;
+            parts.push(SlicePart {
+                fetch,
+                offset: at - unit_off,
+                len: take,
+            });
+            at += take;
+            i += 1;
+        }
+        sequences.push(SequenceSlice { parts });
+    }
+    Ok(WindowPlan { fetches, sequences })
 }
 
 /// Build the canonical-CBOR `register_chunks` descriptor for shard `shard` —
@@ -1002,6 +1129,157 @@ mod tests {
         assert_eq!(plan[1].shard_hash, m.shards[1].shard_hash.0);
         assert_eq!((plan[1].range_off, plan[1].range_len), (16, 16));
         assert_eq!((plan[2].range_off, plan[2].range_len), (32, 16));
+    }
+
+    /// Reassemble one planned sequence's bytes out of the plan's fetched ranges — what a caller's
+    /// staging step does when the last fetch lands.
+    fn reassemble(plan: &WindowPlan, seq: usize, served: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in &plan.sequences[seq].parts {
+            let off = part.offset as usize;
+            out.extend_from_slice(&served[part.fetch][off..off + part.len as usize]);
+        }
+        out
+    }
+
+    /// The bytes the host would serve for each planned fetch, cut out of the shard image.
+    fn serve(plan: &WindowPlan, shard_bytes: &[Vec<u8>], order: &[[u8; 32]]) -> Vec<Vec<u8>> {
+        plan.fetches
+            .iter()
+            .map(|f| {
+                let shard = order
+                    .iter()
+                    .position(|h| *h == f.shard_hash)
+                    .expect("shard");
+                let off = f.range_off as usize;
+                shard_bytes[shard][off..off + f.range_len as usize].to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn covering_window_fetches_each_chunk_once_and_locates_every_sequence() {
+        let m = chunked_manifest(); // 3 shards, chunk_size 32 B, seq 8 tokens = 16 B
+        let order: Vec<[u8; 32]> = m.shards.iter().map(|s| s.shard_hash.0).collect();
+        let images = [
+            shard_bytes(11, 32, 64),
+            shard_bytes(22, 64, 64),
+            shard_bytes(33, 32, 64),
+        ];
+
+        // Shard 0 holds sequences 0..4 (two per 32 B chunk). Asking for all four used to plan two
+        // ranges per chunk; the covering planner plans exactly one fetch per chunk.
+        let plan = plan_covering_window(&m, &[0, 1, 2, 3]).unwrap();
+        assert_eq!(
+            plan.fetches.len(),
+            2,
+            "two chunks in shard 0, one fetch each"
+        );
+        assert_eq!(
+            (plan.fetches[0].range_off, plan.fetches[0].range_len),
+            (0, 32)
+        );
+        assert_eq!(
+            (plan.fetches[1].range_off, plan.fetches[1].range_len),
+            (32, 32)
+        );
+        let served = serve(&plan, &images, &order);
+        for (i, seq) in [0u64, 1, 2, 3].iter().enumerate() {
+            let (shard, off, len) = sequence_byte_range(&m, *seq).unwrap();
+            assert_eq!(
+                reassemble(&plan, i, &served),
+                images[shard][off as usize..(off + len) as usize],
+                "sequence {seq} reassembles byte-for-byte out of the coalesced fetches"
+            );
+        }
+    }
+
+    #[test]
+    fn covering_window_never_fetches_one_chunk_twice_however_the_window_repeats_it() {
+        let m = chunked_manifest();
+        // The same chunk named by every requested sequence, out of order and with repeats — the
+        // shape a micro-batch-at-a-time planner turns into one fetch per request.
+        let plan = plan_covering_window(&m, &[1, 0, 1, 0, 1]).unwrap();
+        assert_eq!(
+            plan.fetches.len(),
+            1,
+            "one covering chunk, one fetch, however many times the window names it"
+        );
+        assert_eq!(
+            (plan.fetches[0].range_off, plan.fetches[0].range_len),
+            (0, 32)
+        );
+        assert!(plan
+            .sequences
+            .iter()
+            .all(|s| s.parts.len() == 1 && s.parts[0].fetch == 0));
+        assert_eq!(plan.sequences[0].parts[0].offset, 16);
+        assert_eq!(plan.sequences[1].parts[0].offset, 0);
+    }
+
+    #[test]
+    fn covering_window_bounds_each_fetch_by_the_chunk_and_splits_a_straddling_sequence() {
+        // chunk_size 24 B against a 16 B sequence: sequence 1 spans bytes 16..32, straddling the
+        // 24 B boundary, so it is carried by two consecutive fetches.
+        let mut m = chunked_manifest();
+        m.chunk_size = 24;
+        let plan = plan_covering_window(&m, &[0, 1]).unwrap();
+        for f in &plan.fetches {
+            assert!(
+                f.range_len <= m.chunk_size,
+                "no fetch spans more than one covering chunk"
+            );
+        }
+        assert_eq!(
+            plan.fetches
+                .iter()
+                .map(|f| (f.range_off, f.range_len))
+                .collect::<Vec<_>>(),
+            vec![(0, 24), (24, 8)],
+            "the contiguous run splits on the covering grid"
+        );
+        assert_eq!(
+            plan.sequences[1].parts,
+            vec![
+                SlicePart {
+                    fetch: 0,
+                    offset: 16,
+                    len: 8
+                },
+                SlicePart {
+                    fetch: 1,
+                    offset: 0,
+                    len: 8
+                }
+            ],
+            "a straddling sequence names both carriers, in byte order"
+        );
+        assert_eq!(
+            plan.sequences[1].parts.iter().map(|p| p.len).sum::<u64>(),
+            16,
+            "the parts sum to the sequence"
+        );
+    }
+
+    #[test]
+    fn covering_window_spans_shards_and_refuses_a_gridless_manifest() {
+        let m = chunked_manifest();
+        // Sequences 3 (shard 0, second chunk) and 4 (shard 1, first chunk).
+        let plan = plan_covering_window(&m, &[3, 4]).unwrap();
+        assert_eq!(plan.fetches.len(), 2);
+        assert_eq!(plan.fetches[0].shard_hash, m.shards[0].shard_hash.0);
+        assert_eq!(plan.fetches[1].shard_hash, m.shards[1].shard_hash.0);
+
+        let mut gridless = chunked_manifest();
+        gridless.chunk_size = 0;
+        assert!(matches!(
+            plan_covering_window(&gridless, &[0]),
+            Err(CorpusError::ZeroChunkSize)
+        ));
+        assert!(matches!(
+            plan_covering_window(&m, &[16]),
+            Err(CorpusError::BatchOutOfRange { batch: 16, .. })
+        ));
     }
 
     #[test]

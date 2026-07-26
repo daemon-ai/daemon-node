@@ -398,24 +398,26 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
             .reshape([1, s, s])
     }
 
-    /// The one-hot target matrix `[rows, vocab]`: `1.0` at each row's target id, `+0.0` elsewhere.
+    /// Each row's target log-probability, `[rows, 1]`, selected by index out of the `[rows, vocab]`
+    /// log-softmax.
     ///
-    /// Built ON DEVICE by comparing the class ordinals against the targets, for the same reason as
-    /// [`TinyLlamaModel::causal_mask`] and with far more at stake: at the frozen `(seq_len, vocab)`
-    /// this image is `2047 × 32768 × 4` = 256 MiB, several times a trainer's whole admitted linear
-    /// memory. The guest keeps only the `rows`-long target ids it already built.
+    /// This replaces a one-hot mask-and-reduce. The mask was a second `[rows, vocab]` image —
+    /// `2047 × 32768 × 4` = 256 MiB at the frozen `(seq_len, vocab)` — built only so an
+    /// all-elements reduction could pick `rows` of its `rows × vocab` entries, and the elementwise
+    /// product it fed was a third image of the same size. An indexed selection reads the same
+    /// `rows` values and materializes neither.
     ///
-    /// The VALUES are unchanged, which is what keeps the loss bit-exact: a bool cast is exactly
-    /// `1.0`/`0.0`, and the reduction that consumes it still runs over the whole `[rows, vocab]`
-    /// product in the same order.
-    fn target_one_hot(&self, tgt: Vec<i64>, rows: usize, vocab: usize) -> Tensor<B, 2> {
+    /// **The gradient is unchanged, bit for bit**, which is what keeps the trajectory on its
+    /// recorded goldens: the backward of a `gather` scatters the incoming row gradients back to
+    /// exactly the selected positions and leaves every other position zero — the same
+    /// `[rows, vocab]` matrix the one-hot product's backward produced. What does change is the
+    /// forward loss *scalar*'s summation order (`rows` terms instead of `rows × vocab` terms, the
+    /// extra ones being exact zeros); the scalar is consumed only as `backward()`'s root, which is
+    /// seeded independently of its value.
+    fn target_logprobs(&self, logsm: Tensor<B, 2>, tgt: Vec<i64>, rows: usize) -> Tensor<B, 2> {
         let targets = Tensor::<B, 1, Int>::from_data(TensorData::new(tgt, [rows]), &self.device)
-            .reshape([rows, 1])
-            .expand([rows, vocab]);
-        let classes = Tensor::<B, 1, Int>::arange(0..vocab as i64, &self.device)
-            .reshape([1, vocab])
-            .expand([rows, vocab]);
-        classes.equal(targets).float()
+            .reshape([rows, 1]);
+        logsm.gather(1, targets)
     }
 
     /// One forward pass → the scaled mean cross-entropy loss tensor (for `backward`).
@@ -497,13 +499,12 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
         let max = logits.clone().max_dim(1).detach(); // [rows, 1]
         let shifted = logits.sub(max);
         let logsm = shifted.clone().sub(shifted.exp().sum_dim(1).log());
-        let oh = self.target_one_hot(tgt, rows, vocab);
+        let picked = self.target_logprobs(logsm, tgt, rows);
         #[allow(clippy::cast_precision_loss)]
         let denom = rows.max(1) as f32;
         #[allow(clippy::cast_possible_truncation)]
         let s_f32 = loss_scale as f32;
-        logsm
-            .mul(oh)
+        picked
             .sum()
             .mul_scalar(-1.0 / denom)
             .mul_scalar(s_f32)

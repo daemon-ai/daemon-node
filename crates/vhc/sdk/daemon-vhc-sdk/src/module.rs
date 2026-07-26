@@ -46,6 +46,30 @@ pub struct ModuleDecl {
     pub device_scratch_bytes: u64,
 }
 
+/// Whether this build's ABI contract makes pre-loop panic forwarding legal, i.e. whether the host
+/// generation these modules are built against implements the certification minor.
+///
+/// The SDK arms the panic hook before `da_init` exactly when this is true, and raises the declared
+/// minor by the same predicate — one condition, two consequences, so a module can never be armed
+/// without declaring the rung that negotiates it.
+pub const PRE_LOOP_DIAGNOSTICS: bool =
+    daemon_vhc_abi::pre_loop_log_legal(daemon_vhc_abi::DA_ABI_MINOR_V2);
+
+/// The major-2 minor a module actually declares, given the minor its own surface requires.
+///
+/// Pre-loop panic forwarding is a **behavioral** dependency: it imports no new symbol, so the
+/// import-shape floor (`daemon_vhc_abi::required_v2_minor`) cannot see it, and a module relying on
+/// it must be made to declare the certification minor deliberately. This is that deliberate step,
+/// and it is derived from the same predicate that arms the forwarding.
+#[must_use]
+pub const fn declared_abi_minor(module_minor: u32) -> u32 {
+    if PRE_LOOP_DIAGNOSTICS && daemon_vhc_abi::CERTIFICATION_MINOR_V2 > module_minor {
+        daemon_vhc_abi::CERTIFICATION_MINOR_V2
+    } else {
+        module_minor
+    }
+}
+
 /// A major-2 module under [`crate::main!`]: the v2 analogue of the v1 SDK's `Experiment`.
 pub trait GuestModule: Sized {
     /// The static declaration the manifest + claim derive from.
@@ -360,10 +384,12 @@ pub mod rt {
     /// trap with no message, since the payload dies with the linear memory. The hook is the only
     /// moment the message is both formed and still reachable.
     ///
-    /// `main!` calls this at the top of `da_run` and nowhere else, deliberately: capability
-    /// imports are illegal during `da_init`/`da_migrate` (ABI §6.6), so logging from a hook armed
-    /// there would re-class the guest's panic as a `PhaseViolation` and destroy the classification
-    /// the forwarding exists to preserve.
+    /// `main!` calls this at the top of `da_run` unconditionally, and at the top of `da_init` and
+    /// `da_migrate` only through [`arm_pre_loop_diagnostics`]. The distinction is the whole of the
+    /// exemption's safety: capability imports are illegal in the two pre-loop phases below the
+    /// certification minor, so a hook armed there against an older host would re-class the guest's
+    /// panic as a `PhaseViolation` and destroy the very classification the forwarding exists to
+    /// preserve.
     #[cfg(target_arch = "wasm32")]
     pub fn forward_panics() {
         use std::sync::Once;
@@ -398,5 +424,69 @@ pub mod rt {
                 crate::abi::log(daemon_vhc_abi::LOG_LEVEL_ERROR, &line);
             }));
         });
+    }
+
+    /// Arm panic forwarding for the two PRE-LOOP phases — `da_init` and `da_migrate` — where a
+    /// guest is most likely to die and where, until the certification minor, it could only die
+    /// anonymously: initialization allocates the state plane and migration reconstructs it, and a
+    /// wasm allocation failure aborts through the same path as a panic, so the message and its
+    /// `file:line:col` are the entire diagnosis and they die with the linear memory.
+    ///
+    /// Armed only when this build's ABI contract makes the pre-loop call legal
+    /// ([`super::PRE_LOOP_DIAGNOSTICS`]), and the module's declared minor is raised by that same
+    /// predicate ([`super::declared_abi_minor`]) so an older host refuses the module with a typed,
+    /// minor-naming admission refusal instead of trapping it at initialization.
+    #[cfg(target_arch = "wasm32")]
+    pub fn arm_pre_loop_diagnostics() {
+        if super::PRE_LOOP_DIAGNOSTICS {
+            forward_panics();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{declared_abi_minor, PRE_LOOP_DIAGNOSTICS};
+    use daemon_vhc_abi::{
+        pre_loop_log_legal, BUFFER_STAGE_MINOR_V2, CERTIFICATION_MINOR_V2, DA_ABI_MINOR_V2,
+    };
+
+    /// The certification minor sits above every rung whose floor the import shape can derive, so a
+    /// module never reaches it by accident.
+    #[test]
+    fn the_certification_minor_is_above_the_import_derivable_rungs() {
+        assert!(CERTIFICATION_MINOR_V2 > BUFFER_STAGE_MINOR_V2);
+    }
+
+    /// The behavioral-floor coupling, asserted in BOTH directions: arming pre-loop forwarding raises the declared
+    /// minor to the certification rung, and not arming it leaves the declaration exactly where the
+    /// module's own surface put it. Neither half is allowed to drift from the other, because the
+    /// declaration is what makes an older host refuse the module cleanly instead of trapping it.
+    #[test]
+    fn arming_pre_loop_forwarding_and_declaring_the_minor_are_one_decision() {
+        assert_eq!(
+            PRE_LOOP_DIAGNOSTICS,
+            pre_loop_log_legal(DA_ABI_MINOR_V2),
+            "arming is derived from the ABI contract, never from a second switch"
+        );
+        for module_minor in 0..=BUFFER_STAGE_MINOR_V2 {
+            let declared = declared_abi_minor(module_minor);
+            if PRE_LOOP_DIAGNOSTICS {
+                assert!(
+                    declared >= CERTIFICATION_MINOR_V2,
+                    "an armed module must declare at least the certification minor"
+                );
+            } else {
+                assert_eq!(
+                    declared, module_minor,
+                    "an unarmed module declares exactly what its own surface requires"
+                );
+            }
+        }
+        // A module already declaring above the rung is never lowered.
+        assert_eq!(
+            declared_abi_minor(CERTIFICATION_MINOR_V2 + 3),
+            CERTIFICATION_MINOR_V2 + 3
+        );
     }
 }

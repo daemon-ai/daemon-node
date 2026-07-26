@@ -71,7 +71,7 @@ use daemon_vhc_proto::{blake3_hash, from_canonical_slice, to_canonical_vec, Hash
 use daemon_vhc_proto::{IrohId, StateDigest};
 use daemon_vhc_sdk::{
     GuestModule, MigrationDescriptor, MigrationSection, ModuleDecl, SectionDecl, SectionReader,
-    StateManifest,
+    SequenceSlice, StateManifest,
 };
 use daemon_vhc_sdk_compute::{export_tensor, fence, AutodiffHostBackend, HostBackend};
 use daemon_vhc_sdk_consensus::digest::DigestCarry;
@@ -154,6 +154,22 @@ const OUTCOME_QUIESCE_READY: u32 = 2;
 /// `da_migrate` Incompatible detail: a section is missing/unknown or its length mismatches the
 /// model layout (§10.2 — module-defined detail codes are ≥ 16).
 const MIGRATE_INCOMPATIBLE_SECTIONS: u32 = 16;
+
+/// `da_run` outcomes for EXTERNAL INPUT this module refuses.
+///
+/// Each of the boundaries below reads bytes the module did not author — a fetched artifact, a
+/// window named by a frame off the wire, a peer's committed payload. Malformed input there is an
+/// ordinary, expected outcome of talking to other parties, so it MUST leave the run with a status
+/// that names WHICH boundary refused and WHY. An abort would instead reach the host as an
+/// undifferentiated guest trap, which is the failure class that has repeatedly cost a fleet
+/// attempt: the trap says the guest died, never that a peer sent a container from a different
+/// compression profile.
+///
+/// The codes are module-defined and disjoint from the `da_migrate` detail codes above.
+const OUTCOME_CORPUS_MANIFEST_INVALID: u32 = 32;
+const OUTCOME_CORPUS_RANGE_INVALID: u32 = 33;
+const OUTCOME_ROUND_WINDOW_UNPLANNABLE: u32 = 34;
+const OUTCOME_COMMITTED_PAYLOAD_INVALID: u32 = 35;
 
 /// Per-step queue-depth-reset fences start here; round-final fences are `round + 1`.
 const STEP_FENCE_BASE: u64 = 1 << 32;
@@ -257,6 +273,10 @@ struct Core {
     pending_grads: Option<Vec<burn::tensor::Tensor<HostBackend, 1>>>,
     /// Fence-id mint for the per-step depth-reset fences.
     next_step_fence: u64,
+    /// A latched typed refusal of external input, set at the boundary that read it and returned as
+    /// the run's outcome at the next event-loop turn. Boundaries reached from inside the barrier
+    /// driver cannot return a run status themselves, so they latch it here instead of aborting.
+    refusal: Option<u32>,
 }
 
 /// The in-flight streamed ingest walk (ABI §12.14, design §3.4/§5.4): the resident
@@ -429,11 +449,12 @@ impl RoundExperiment<HostStaged> for C3Round {
         // Cross-check every peer's container against the run's own geometry from its 40-byte
         // header alone — a producer that compressed under a different density or windowing is a
         // typed refusal here, never a mis-decode of its rows deeper in the fold.
-        for (p, &buf) in peer_buffers.iter().enumerate() {
+        for &buf in &peer_buffers {
             let header = daemon_vhc_sdk::read_range(buf, 0, HEADER_BYTES as usize);
-            walk.layout()
-                .check_header(&header)
-                .unwrap_or_else(|e| panic!("peer {p} committed payload: {e}"));
+            if walk.layout().check_header(&header).is_err() {
+                core.refusal = Some(OUTCOME_COMMITTED_PAYLOAD_INVALID);
+                return IngestOutcome::Deferred;
+            }
         }
         let opening = walk.start().expect("ingest walk start");
         let stream = daemon_vhc_sdk::state_open(MASTER_FAMILY, byte_len);
@@ -584,18 +605,26 @@ impl GuestModule for TinyLlama {
         // ef every round, both AdamW moments at a checkpoint/drain) and the per-parameter tables.
         let chunks = daemon_vhc_proto::det_state::family_chunk_count(&numels_u64, window);
         let bookkeeping = 4 * chunks * 32 + numels_u64.len() as u64 * 256;
-        // The training step's guest-resident working set: the input and target id rows the forward
-        // pass builds per micro-batch (`i64` each), plus the corpus segment bytes a live round
-        // stages for one micro-batch and their decoded `u32` tokens.
+        // The training step's guest-resident working set, in two named terms because they live on
+        // two different scales:
         //
-        // This term is O(TOKENS), and keeping it there is a standing requirement, not an
-        // observation: the causal mask and the one-hot targets are O(tokens²) and O(tokens × vocab),
+        //   * per MICRO-BATCH — the input and target id rows the forward pass builds (`i64` each),
+        //     alive only for the step that consumes them;
+        //   * per ROUND — a live round plans and stages the whole round's window before it trains
+        //     the first step, so the fetched corpus bytes (one `token_width`-wide element per
+        //     token, bounded by the covering-chunk grid the fetch plan splits on) and their decoded
+        //     `u32` tokens are ALL resident across the round's inner loop. Declaring these at
+        //     micro-batch scale would under-declare them by `steps_per_round`.
+        //
+        // Both terms are O(TOKENS), and keeping them there is a standing requirement, not an
+        // observation: the causal mask and the target selection are O(tokens²) and O(tokens × vocab),
         // which at the fleet geometry are 16 MiB and 256 MiB — multiples of this whole claim. Both
         // are built and held ON DEVICE (`model.rs`). A forward pass that materializes either one in
         // linear memory does not overrun a budget, it exhausts the sandbox's memory cap and aborts
         // the guest.
-        let tokens = u64::from(cfg.model.seq_len) * u64::from(cfg.micro_batch);
-        let step_peak = tokens * (8 + 8 + 4 + 4);
+        let tokens_mb = u64::from(cfg.model.seq_len) * u64::from(cfg.micro_batch);
+        let tokens_round = tokens_mb * u64::from(cfg.steps_per_round.max(1));
+        let step_peak = tokens_mb * (8 + 8) + tokens_round * (4 + 4);
         decl.host_state_bytes =
             MODULE_BASELINE_BYTES + init_peak + update_peak + ingest_peak + bookkeeping + step_peak;
         // The outgoing container: one section pair per window, staged host-side.
@@ -693,17 +722,22 @@ fn publish_wire(msg: &VhcMessage) {
 }
 
 /// One pending batch slot of an in-flight round open (live mode): the slot's sequence count and
-/// its fetched shard segments, in corpus order.
+/// where each of its sequences sits inside the round's coalesced fetches, in corpus order.
 struct PendingBatch {
     sequences: u32,
-    segs: Vec<Option<Vec<u8>>>,
+    slices: Vec<SequenceSlice>,
 }
 
 /// A round open awaiting its `data@2` corpus fetches (live mode).
 struct PendingOpen {
     ro: RoundOpen,
-    /// fetch op → (slot index, segment index).
-    ops: BTreeMap<u64, (usize, usize)>,
+    /// fetch op → index into [`PendingOpen::fetched`].
+    ops: BTreeMap<u64, usize>,
+    /// The byte length each fetch was planned for — what its completion must deliver exactly.
+    planned: Vec<u64>,
+    /// The round's coalesced fetches, one per covering chunk the window touches; `None` until the
+    /// fetch completes.
+    fetched: Vec<Option<Vec<u8>>>,
     /// Batch slots in training order (step-major, then micro-window).
     slots: Vec<PendingBatch>,
 }
@@ -984,40 +1018,64 @@ fn completion_tensor(ev: &daemon_vhc_sdk::Event) -> Option<Vec<f32>> {
 }
 
 /// Plan one round's batch slots + `data@2` fetches from the assigned interval (live mode):
-/// slots in training order (step-major, then micro-window), each slot's sequences coalesced
-/// into per-shard contiguous byte segments.
-fn plan_open_fetches(corpus: &LiveCorpus, ro: &RoundOpen, round_cfg: &RoundCfg) -> PendingOpen {
+/// slots in training order (step-major, then micro-window), over ONE fetch plan for the whole
+/// round.
+///
+/// The window is planned whole rather than micro-batch by micro-batch. A micro-batch-at-a-time
+/// plan issues one range per micro-batch, and when several of them fall inside the same covering
+/// chunk — which is what the ceremony corpus's shard-sized chunks guarantee for a single peer's
+/// round — the host transfers and verifies that whole chunk once per range. Planning the round
+/// whole fetches each covering chunk exactly once; each fetch stays bounded by the chunk, so the
+/// bytes the guest holds are bounded by the manifest's declared `chunk_size` and never by the
+/// shard.
+///
+/// Returns `None` when the window a `RoundOpen` names does not plan over the pinned manifest: the
+/// frame is external input, so an unplannable window is a typed refusal at the caller, never an
+/// abort inside the planner.
+fn plan_open_fetches(
+    corpus: &LiveCorpus,
+    ro: &RoundOpen,
+    round_cfg: &RoundCfg,
+) -> Option<PendingOpen> {
     let interval = interval_for(ro.batch, ro.seed, &round_cfg.roster, &round_cfg.peer);
     let steps = slice_interval(interval, round_cfg.steps_per_round, round_cfg.micro_batch);
-    let mut slots = Vec::new();
-    let mut ops = BTreeMap::new();
+    // The round's sequences in training order, plus where each slot's run starts in them. Global
+    // sequence ids wrap modulo the corpus (the established window rule).
+    let mut window: Vec<u64> = Vec::new();
+    let mut spans: Vec<(usize, usize, u32)> = Vec::new();
     for step in &steps {
         for mb in &step.micro {
-            // Global sequence ids wrap modulo the corpus (the established window rule); the SDK
-            // planner coalesces them into maximal per-shard contiguous ranges.
-            let seqs: Vec<u64> = (mb.start..mb.end)
-                .map(|s| s % corpus.total_sequences)
-                .collect();
-            let fetches = daemon_vhc_sdk::plan_window(&corpus.manifest, &seqs)
-                .expect("the assigned window plans over the verified manifest");
-            let slot_idx = slots.len();
-            let mut segs = Vec::with_capacity(fetches.len());
-            for (seg_idx, f) in fetches.iter().enumerate() {
-                let op = daemon_vhc_sdk::data_fetch(&f.shard_hash, f.range_off, f.range_len);
-                ops.insert(op, (slot_idx, seg_idx));
-                segs.push(None);
-            }
-            slots.push(PendingBatch {
-                sequences: u32::try_from(mb.end - mb.start).unwrap_or(0),
-                segs,
-            });
+            let start = window.len();
+            window.extend((mb.start..mb.end).map(|s| s % corpus.total_sequences));
+            spans.push((
+                start,
+                window.len() - start,
+                u32::try_from(mb.end - mb.start).unwrap_or(0),
+            ));
         }
     }
-    PendingOpen {
+    let plan = daemon_vhc_sdk::plan_covering_window(&corpus.manifest, &window).ok()?;
+    let mut ops = BTreeMap::new();
+    for (idx, f) in plan.fetches.iter().enumerate() {
+        ops.insert(
+            daemon_vhc_sdk::data_fetch(&f.shard_hash, f.range_off, f.range_len),
+            idx,
+        );
+    }
+    let slots = spans
+        .into_iter()
+        .map(|(start, count, sequences)| PendingBatch {
+            sequences,
+            slices: plan.sequences[start..start + count].to_vec(),
+        })
+        .collect();
+    Some(PendingOpen {
         ro: ro.clone(),
         ops,
+        planned: plan.fetches.iter().map(|f| f.range_len).collect(),
+        fetched: (0..plan.fetches.len()).map(|_| None).collect(),
         slots,
-    }
+    })
 }
 
 /// Decode a pending open's fetched segments into staged batches (training order), clamped into
@@ -1026,16 +1084,22 @@ fn plan_open_fetches(corpus: &LiveCorpus, ro: &RoundOpen, round_cfg: &RoundCfg) 
 fn stage_fetched_batches(
     core: &Rc<RefCell<Core>>,
     corpus: &LiveCorpus,
-    open: &mut PendingOpen,
+    open: &PendingOpen,
     vocab: u32,
 ) {
     let seq_len = corpus.manifest.seq_len;
     let width = corpus.manifest.token_width;
     let little = corpus.manifest.endianness == Endianness::Little;
-    for slot in &mut open.slots {
+    for slot in &open.slots {
         let mut raw = Vec::new();
-        for seg in &mut slot.segs {
-            raw.extend_from_slice(&seg.take().expect("all segments fetched"));
+        for seq in &slot.slices {
+            for part in &seq.parts {
+                let bytes = open.fetched[part.fetch]
+                    .as_deref()
+                    .expect("every planned fetch landed before staging");
+                let off = part.offset as usize;
+                raw.extend_from_slice(&bytes[off..off + part.len as usize]);
+            }
         }
         let tokens: Vec<u32> = match width {
             TokenWidth::U16 => raw
@@ -2157,6 +2221,7 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
         batches: VecDeque::new(),
         pending_grads: None,
         next_step_fence: 0,
+        refusal: None,
     }));
     // Restore ([SF-6]): register the checkpoint's family folds ([SF-R2]), adopt the master/ef
     // folds as the round base, and kick off the streamed rehydration (master → weights,
@@ -2203,6 +2268,11 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
+        // A boundary that read malformed external input latched its typed refusal rather than
+        // aborting; the run ends on it here, naming which boundary refused.
+        if let Some(code) = core.borrow().refusal {
+            return code;
+        }
         let ev = daemon_vhc_sdk::next_event(&mut buf);
         match ev.tag {
             EV_STOP => {
@@ -2310,7 +2380,10 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                             if l.pending_open.is_some() {
                                 continue;
                             }
-                            l.pending_open = Some(plan_open_fetches(corpus, &ro, &round_cfg));
+                            let Some(open) = plan_open_fetches(corpus, &ro, &round_cfg) else {
+                                return OUTCOME_ROUND_WINDOW_UNPLANNABLE;
+                            };
+                            l.pending_open = Some(open);
                             continue;
                         }
                         // Harness mode: batches were host-staged; train + (dropped) commit,
@@ -2523,20 +2596,30 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                 if let Some(l) = live.as_mut() {
                     if l.manifest_op == Some(op) {
                         l.manifest_op = None;
-                        let bytes = completion_bytes(&ev)
-                            .expect("the genesis-pinned corpus manifest fetches (fail loud)");
-                        let manifest = CorpusManifest::from_canonical_bytes(&bytes)
-                            .expect("the fetched corpus manifest parses");
+                        // EXTERNAL INPUT: the corpus manifest is a fetched artifact. The host
+                        // proved its bytes match the genesis pin; nothing proved they decode to a
+                        // manifest this run can plan over, so every step of accepting it is a
+                        // typed refusal rather than an abort.
+                        let Some(bytes) = completion_bytes(&ev) else {
+                            return OUTCOME_CORPUS_MANIFEST_INVALID;
+                        };
+                        let Ok(manifest) = CorpusManifest::from_canonical_bytes(&bytes) else {
+                            return OUTCOME_CORPUS_MANIFEST_INVALID;
+                        };
                         // Register every shard's chunk map: after registration a shard's fold
                         // identity is range-fetchable with covering-chunk verification.
                         for i in 0..manifest.shards.len() {
-                            let desc = daemon_vhc_sdk::chunk_descriptor(&manifest, i)
-                                .expect("manifest shard yields a chunk descriptor");
-                            let status = daemon_vhc_sdk::data_register_chunks(&desc);
-                            assert_eq!(status, 0, "chunk registration is granted (fail loud)");
+                            let Ok(desc) = daemon_vhc_sdk::chunk_descriptor(&manifest, i) else {
+                                return OUTCOME_CORPUS_MANIFEST_INVALID;
+                            };
+                            if daemon_vhc_sdk::data_register_chunks(&desc) != 0 {
+                                return OUTCOME_CORPUS_MANIFEST_INVALID;
+                            }
                         }
                         let total_sequences = manifest.total_sequences();
-                        assert!(total_sequences > 0, "the pinned corpus is non-empty");
+                        if total_sequences == 0 {
+                            return OUTCOME_CORPUS_MANIFEST_INVALID;
+                        }
                         l.corpus = Some(LiveCorpus {
                             manifest,
                             total_sequences,
@@ -2571,20 +2654,27 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                         }
                         Some(MomentStep::NotMine) | None => {}
                     }
+                    // EXTERNAL INPUT: a corpus range's completion. The host verified the bytes
+                    // against the shard's registered chunk hashes, which says nothing about the
+                    // op having succeeded or the delivered span being the one that was planned —
+                    // and a short span would otherwise slice out of bounds mid-stage.
                     let open_hit = l.pending_open.as_mut().and_then(|open| {
-                        open.ops.remove(&op).map(|(slot, seg)| {
-                            open.slots[slot].segs[seg] = Some(
-                                completion_bytes(&ev)
-                                    .expect("a granted corpus range fetch completes (fail loud)"),
-                            );
-                            open.ops.is_empty()
+                        open.ops.remove(&op).map(|idx| match completion_bytes(&ev) {
+                            Some(bytes) if bytes.len() as u64 == open.planned[idx] => {
+                                open.fetched[idx] = Some(bytes);
+                                Ok(open.ops.is_empty())
+                            }
+                            _ => Err(()),
                         })
                     });
                     if let Some(done) = open_hit {
+                        let Ok(done) = done else {
+                            return OUTCOME_CORPUS_RANGE_INVALID;
+                        };
                         if done {
-                            let mut open = l.pending_open.take().expect("the in-flight open");
+                            let open = l.pending_open.take().expect("the in-flight open");
                             let corpus = l.corpus.as_ref().expect("corpus ready");
-                            stage_fetched_batches(&core, corpus, &mut open, vocab);
+                            stage_fetched_batches(&core, corpus, &open, vocab);
                             let ro = open.ro;
                             let round = ro.round;
                             let _out = driver.on_round_open(&ro, &mut payloads);

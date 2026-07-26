@@ -23,21 +23,32 @@
 //
 //   1. the manifest fetch (`ArtifactFetch` over the pinned hash) and per-shard `register_chunks`;
 //   2. the round plan — the guest's own `interval_for`/`slice_interval` over the window a
-//      `RoundOpen` names — and one `data@2` fetch per planned segment;
+//      `RoundOpen` names — coalesced into one `data@2` fetch per COVERING CHUNK;
 //   3. the CHUNK-COLLIDING shape the ceremony corpus actually has: one chunk hash per 2 MiB shard
 //      and 512 sequences inside it, so all 30 of a single-peer round's sequences resolve to the
-//      SAME covering chunk of the SAME shard. Thirty fetches, thirty distinct sub-ranges, one
-//      chunk — the case a manifest with many small chunks would never produce;
-//   4. `stage_fetched_batches` decoding those thirty verified slices into thirty staged batches;
+//      SAME covering chunk of the SAME shard — the case a manifest with many small chunks would
+//      never produce, and the case that decides whether the round transfers that chunk once or
+//      thirty times;
+//   4. `stage_fetched_batches` cutting those verified bytes into thirty staged batches;
 //   5. the round's inner loop over them, its commitment, and its θ export.
 //
-// THE RED LINE is assertion 4 below: the MEASURED peak guest linear memory against the module's
-// OWN admitted claim, with a real training step running at the frozen `(seq_len, vocab)`. That is
-// the assertion the fleet failed. The forward pass built two guest-resident, geometry-scaled
-// images in linear memory — the `s × s` causal mask and the `rows × vocab` one-hot target matrix
-// (256 MiB at the frozen values, against a whole-module claim of ~57 MiB) — so the guest's
-// allocator hit the sandbox's memory cap and Rust aborted into a wasm `unreachable`. Every prior
-// gate ran at 64 tokens, where the same two images are 16 KiB and 8 MiB and fit comfortably.
+// THE RED LINES are assertions 4 and 5 below.
+//
+// Assertion 4 is BYTES ON THE ARTIFACT PLANE. Every sequence of a single-peer round lands in one
+// covering chunk, so a plan made micro-batch by micro-batch asks for that chunk thirty times: the
+// host verifies and transfers 62,914,560 B to deliver 122,880 B of tokens, and the fleet measured
+// exactly that. The plan is made for the whole round now, so the chunk crosses the plane ONCE.
+// What is left is granularity, not duplication, and the assertion names both numbers so neither
+// can drift silently.
+//
+// Assertion 5 is the MEASURED peak guest linear memory against the module's OWN admitted claim,
+// with a real training step running at the frozen `(seq_len, vocab)`. That is the assertion the
+// fleet failed. The forward pass built two guest-resident, geometry-scaled images in linear memory
+// — the `s × s` causal mask and a `rows × vocab` one-hot target matrix (256 MiB at the frozen
+// values, against a whole-module claim of ~57 MiB) — so the guest's allocator hit the sandbox's
+// memory cap and Rust aborted into a wasm `unreachable`. Every prior gate ran at 64 tokens, where
+// the same two images are 16 KiB and 8 MiB and fit comfortably. The mask is built on device now
+// and the one-hot is gone entirely — the loss reads each row's target log-probability by index.
 //
 // The bound: the parameter layout is reduced (`ceremony_trainer_config_live_staging` owns the
 // argument) because 30 real steps over 786_507_264 parameters at 2048 tokens is ~290 TFLOP. The
@@ -523,6 +534,170 @@ fn drive_live_round(wasm: &[u8], corpus: &CorpusFixture) -> StagedRound {
     }
 }
 
+// -- the external-input refusal lanes ------------------------------------------------------------
+
+// The trainer's module-defined `da_run` outcomes for refused external input, as declared in
+// `crates/vhc/guests/tiny-llama/src/lib.rs`. A guest cdylib exports no constants a host test can
+// link, so these are the second spelling — and the lanes below are what binds them: a code that
+// moves on one side without the other fails here rather than drifting.
+const OUTCOME_CORPUS_MANIFEST_INVALID: u32 = 32;
+const OUTCOME_CORPUS_RANGE_INVALID: u32 = 33;
+
+/// The malformed external input a refusal lane feeds the guest.
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+    /// The genesis-pinned corpus manifest fetches successfully and does not decode. (The pin is
+    /// the hash OF the malformed bytes, so the host's content check passes and the guest is the
+    /// one that has to refuse — which is the point: a content address proves provenance, never
+    /// that the bytes mean anything.)
+    ManifestUndecodable,
+    /// A planned corpus range does not arrive: the op completes failed, as it does when the
+    /// covering chunk a store served fails its registered-hash check.
+    RangeUnavailable,
+}
+
+/// Drive a live round until the guest ends, with `fault` injected. Returns how the run ended.
+fn drive_live_refusal(wasm: &[u8], corpus: &CorpusFixture, fault: Fault) -> RunEnd {
+    let roster = [PeerId(PEER)];
+    let bad_manifest = b"this is not a canonical corpus manifest".to_vec();
+    let pinned = match fault {
+        Fault::ManifestUndecodable => Hash(*blake3::hash(&bad_manifest).as_bytes()),
+        Fault::RangeUnavailable => corpus.manifest_hash,
+    };
+    let cfg_bytes = to_canonical_vec(&ceremony_trainer_config_live_staging(
+        RUN_LABEL, pinned, &roster,
+    ))
+    .expect("live-staging trainer config");
+
+    let claim = admitted_claim(wasm, &cfg_bytes);
+    let engine = EngineConfig::real_model(BackendKind::Cpu, None)
+        .with_claimed_memory(claim.hard_accountable.host);
+    let worker = Worker::new(engine).expect("engine");
+    let identity = RunIdentity {
+        run_id: [0x5e; 32],
+        epoch: 0,
+        role: "trainer".to_string(),
+        instance: 1,
+        module: *blake3::hash(wasm).as_bytes(),
+    };
+    let mut run_cfg = RunConfig::new(identity, [0x9d; 32], cfg_bytes, Vec::new());
+    run_cfg.state_chunk_size = corpus_state_chunk_size();
+    run_cfg.compute_queue_depth = 1 << 20;
+    run_cfg.max_readback_bytes_per_slice = TRAINER_LANE_READBACK_BYTES;
+    run_cfg.max_live_buffer_bytes = TRAINER_LANE_BUFFER_BYTES;
+    run_cfg.max_live_buffer_handles = TRAINER_LANE_BUFFER_HANDLES;
+    run_cfg.max_outstanding_ops = TRAINER_LANE_OUTSTANDING_OPS;
+    run_cfg.hard_accountable_host_bytes = claim.declared_peak.host;
+    let mut granted: BTreeSet<[u8; 32]> = BTreeSet::new();
+    granted.insert(pinned.0);
+    granted.extend(corpus.order.iter().copied());
+    run_cfg.granted_artifacts = granted;
+
+    let sink = MeasuringSink::shared();
+    let run = start_run(&worker, wasm, run_cfg, Box::new(sink.clone())).expect("start");
+    let pump = run.pump.clone();
+
+    let window = u64::from(CEREMONY_STEPS_PER_ROUND) * u64::from(CEREMONY_MICRO_BATCH);
+    let open = to_canonical_vec(&VhcMessage::RoundOpen(RoundOpen {
+        round: 0,
+        seed: Seed([0; 32]),
+        roster_digest: Hash([0; 32]),
+        batch: BatchWindow {
+            start: 0,
+            end: window,
+        },
+        deadline_unix_s: 0,
+    }))
+    .expect("round open");
+
+    let mut opened = false;
+    let deadline = Instant::now() + ROUND_DEADLINE;
+    loop {
+        for (op, request) in pump.take_op_requests() {
+            match request {
+                OpRequest::ArtifactFetch { hash, .. } => {
+                    let artifact =
+                        if hash == pinned.0 && matches!(fault, Fault::ManifestUndecodable) {
+                            bad_manifest.clone()
+                        } else {
+                            corpus.manifest_bytes.clone()
+                        };
+                    pump.complete_op(op, OpOutcome::FetchDone { artifact })
+                        .map(|_| ())
+                        .expect("manifest fetch");
+                }
+                OpRequest::ArtifactRange { .. } => {
+                    pump.complete_op(
+                        op,
+                        OpOutcome::Failed {
+                            code: 1,
+                            detail: "injected: the covering chunk is unavailable".into(),
+                        },
+                    )
+                    .map(|_| ())
+                    .expect("range failure");
+                }
+                other => panic!("unexpected op request from the refusal lane: {other:?}"),
+            }
+        }
+        if !opened && pump.published().len() >= 2 {
+            assert_eq!(
+                pump.deliver_frame(0, 0, [9u8; 32], open.clone(), open.clone())
+                    .expect("deliver round open"),
+                daemon_vhc_host::run::DeliverVerdict::Accepted
+            );
+            opened = true;
+        }
+        if run.is_finished() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the refusal lane ({fault:?}) neither refused nor progressed within {ROUND_DEADLINE:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    run.wait().expect("guest thread clean")
+}
+
+/// A fetched corpus manifest that does not decode ends the run with the module's NAMED refusal —
+/// not with a guest abort.
+///
+/// The distinction is the whole of it. Both outcomes stop the run; only one of them says what
+/// happened. An abort reaches the host as an undifferentiated guest trap, and an operator holding
+/// that trap cannot tell a corrupt corpus artifact from an out-of-memory forward pass from a
+/// logic bug — which is exactly the position three fleet attempts ended in.
+#[test]
+fn an_undecodable_corpus_manifest_is_a_named_refusal_not_an_abort() {
+    let wasm = daemon_vhc_guest_build::guest_wasm("tiny_llama");
+    let corpus = corpus_fixture();
+    match drive_live_refusal(&wasm, &corpus, Fault::ManifestUndecodable) {
+        RunEnd::Outcome(code) => assert_eq!(
+            code, OUTCOME_CORPUS_MANIFEST_INVALID,
+            "the corpus-manifest boundary names itself"
+        ),
+        other => panic!(
+            "an undecodable corpus manifest must end the run with a typed outcome, got {other:?}"
+        ),
+    }
+}
+
+/// A planned corpus range that does not arrive ends the run with the module's NAMED refusal.
+#[test]
+fn an_unavailable_corpus_range_is_a_named_refusal_not_an_abort() {
+    let wasm = daemon_vhc_guest_build::guest_wasm("tiny_llama");
+    let corpus = corpus_fixture();
+    match drive_live_refusal(&wasm, &corpus, Fault::RangeUnavailable) {
+        RunEnd::Outcome(code) => assert_eq!(
+            code, OUTCOME_CORPUS_RANGE_INVALID,
+            "the corpus-range boundary names itself"
+        ),
+        other => panic!(
+            "an unavailable corpus range must end the run with a typed outcome, got {other:?}"
+        ),
+    }
+}
+
 /// The run-pinned `state_chunk_size` of the reduced staging layout (the state contract's own).
 fn corpus_state_chunk_size() -> u64 {
     daemon_vhc_testkit::ceremony::staging_gate_state_contract().chunk_size
@@ -551,35 +726,33 @@ fn the_trainer_feeds_itself_from_the_pinned_corpus_and_trains_the_round_it_plans
 
     let round = drive_live_round(&wasm, &corpus);
 
-    // 1. THE PLAN. The guest issued one fetch per planned sequence — 30 inner steps × 1
-    //    micro-batch — with no host staging anywhere.
-    assert_eq!(
-        round.ranges.len() as u64,
-        window,
-        "the guest plans and fetches one segment per assigned sequence"
-    );
+    // 1. THE PLAN. The guest planned the whole round at once, so its assigned interval — which is
+    //    contiguous — is ONE range covering every one of its sequences, not one range per
+    //    sequence, and that range asks for exactly the tokens the round trains on.
     let token_bytes = u64::from(CEREMONY_SEQ_LEN) * TokenWidth::U16.bytes();
-    for (i, (shard, off, len)) in round.ranges.iter().enumerate() {
-        assert_eq!(
-            *shard, corpus.order[0],
-            "sequence {i} resolves to the first shard"
-        );
-        assert_eq!(*len, token_bytes, "each segment is one whole sequence");
-        assert_eq!(
-            *off,
-            i as u64 * token_bytes,
-            "the segments tile the assigned interval in training order"
-        );
-    }
+    let useful = window * token_bytes;
+    assert_eq!(
+        round.ranges.len(),
+        1,
+        "the round's contiguous assignment is ONE coalesced range, got {:?}",
+        round.ranges
+    );
+    assert_eq!(
+        round.ranges[0],
+        (corpus.order[0], 0, useful),
+        "the coalesced range is the assigned interval itself: shard 0, offset 0, {useful} B"
+    );
 
-    // 2. THE COLLISION. Every one of those distinct sub-ranges resolved to the SAME covering
-    //    chunk — the ceremony corpus's real shape, and the one a many-small-chunks manifest
-    //    would never produce. Thirty fetches, one chunk.
+    // 2. THE RED LINE ON THE ARTIFACT PLANE. Every sequence of this round falls in one covering
+    //    chunk, so the question the fleet answered badly is how many times that chunk crosses the
+    //    plane. Once. The remaining excess is the manifest's chunk granularity — a corpus-authoring
+    //    question, not a fetch-plan one — and it is asserted by its exact figure so it cannot grow
+    //    unnoticed.
     let distinct: BTreeSet<([u8; 32], u64, u64)> = round.spans.iter().copied().collect();
     assert_eq!(
         distinct.len(),
         1,
-        "all {window} verified ranges must cover ONE chunk of ONE shard, got {distinct:?}"
+        "the round's ranges must cover ONE chunk of ONE shard, got {distinct:?}"
     );
     let (_, span_off, span_len) = round.spans[0];
     assert_eq!(
@@ -587,22 +760,46 @@ fn the_trainer_feeds_itself_from_the_pinned_corpus_and_trains_the_round_it_plans
         (0, CORPUS_CHUNK_SIZE),
         "the covering span is the whole 2 MiB chunk the manifest registers"
     );
+    let served: u64 = round.spans.iter().map(|(_, _, len)| *len).sum();
+    assert_eq!(
+        round.spans.len(),
+        1,
+        "the covering chunk is transferred and verified EXACTLY ONCE per round; {} transfers is \
+         the per-sequence fetch plan the fleet measured, which moved {} B for {useful} B of tokens",
+        round.spans.len(),
+        window * CORPUS_CHUNK_SIZE
+    );
+    assert_eq!(
+        served, CORPUS_CHUNK_SIZE,
+        "the round's whole artifact-plane cost is one covering chunk: {CORPUS_CHUNK_SIZE} B \
+         served for {useful} B of useful tokens"
+    );
+    assert_eq!(
+        (served / useful, served % useful),
+        (17, 8_192),
+        "the residual amplification is GRANULARITY, not duplication: one {CORPUS_CHUNK_SIZE} B \
+         chunk for {useful} B of tokens. The duplication figure this replaces was {}x ({} B). \
+         A change here is a corpus-manifest chunk-size decision, not a fetch-plan regression",
+        window * CORPUS_CHUNK_SIZE / useful,
+        window * CORPUS_CHUNK_SIZE
+    );
 
     // 3. THE ROUND COMMITTED. Reaching the tag-3 commitment means the manifest fetched and
-    //    registered, the plan resolved, all thirty slices decoded into staged batches, thirty real
-    //    optimizer steps ran over them at the frozen sequence, the fence passed, θ exported
-    //    window-by-window and the committed container was built and PUT.
+    //    registered, the plan resolved, all thirty sequences cut out of the coalesced bytes into
+    //    staged batches, thirty real optimizer steps ran over them at the frozen sequence, the
+    //    fence passed, θ exported window-by-window and the committed container was built and PUT.
     assert!(
         !round.container.is_empty(),
         "the committed container carries this peer's compressed progress"
     );
 
-    // 4. THE RED LINE. The measured peak fits the module's OWN admitted claim, with a real
-    //    training step running at the FROZEN `(seq_len, vocab)`. This is the assertion the fleet
-    //    failed: the forward pass materialized an `s × s` causal mask and a `rows × vocab` one-hot
-    //    in linear memory — 16 MiB and 256 MiB at these values — against a ~57 MiB cap, and the
-    //    allocator's failure aborted the guest into a wasm `unreachable`. Both images are built on
-    //    DEVICE now; the guest holds only the O(tokens) index rows.
+    // 4. THE RED LINE ON LINEAR MEMORY. The measured peak fits the module's OWN admitted claim,
+    //    with a real training step running at the FROZEN `(seq_len, vocab)`. This is the assertion
+    //    the fleet failed: the forward pass materialized an `s × s` causal mask and a
+    //    `rows × vocab` one-hot in linear memory — 16 MiB and 256 MiB at these values — against a
+    //    ~57 MiB cap, and the allocator's failure aborted the guest into a wasm `unreachable`. The
+    //    mask is built on DEVICE now and the one-hot is gone; the guest holds only the O(tokens)
+    //    index rows and the round's staged token window.
     assert!(
         round.peak <= round.claim_host,
         "measured peak guest linear memory {} B exceeds the admitted claim {} B while training at \
@@ -615,12 +812,16 @@ fn the_trainer_feeds_itself_from_the_pinned_corpus_and_trains_the_round_it_plans
 
     let params: usize = staging_gate_param_numels().iter().sum();
     eprintln!(
-        "ceremony_live_staging: {window} module-driven corpus ranges ({} B each) over ONE 2 MiB \
-         covering chunk, decoded into {window} staged batches and trained through \
-         {CEREMONY_STEPS_PER_ROUND} optimizer steps at seq {CEREMONY_SEQ_LEN} / vocab \
+        "ceremony_live_staging: {} module-driven corpus range(s) totalling {useful} B over ONE \
+         2 MiB covering chunk served ONCE ({served} B on the artifact plane, {}x granularity; the \
+         per-sequence plan served {} B, {}x), decoded into {window} staged batches and trained \
+         through {CEREMONY_STEPS_PER_ROUND} optimizer steps at seq {CEREMONY_SEQ_LEN} / vocab \
          {CEREMONY_VOCAB} over {params} parameters; committed {} B in {:.1} s. MEASURED peak guest \
          linear memory {} B ({:.1} % of the admitted claim {} B)",
-        token_bytes,
+        round.ranges.len(),
+        served / useful,
+        window * CORPUS_CHUNK_SIZE,
+        window * CORPUS_CHUNK_SIZE / useful,
         round.container.len(),
         round.wall.as_secs_f64(),
         round.peak,
