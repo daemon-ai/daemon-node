@@ -25,6 +25,11 @@
 
 #[path = "../../../guests/tiny-llama/src/model.rs"]
 #[allow(dead_code)]
+// `slice_assign([off..off + len], patch)` is the compute framework's rank-1 slice API — one range
+// per tensor dimension, and this tensor has one dimension. The single-range-in-vec-init lint reads
+// it as a collection literal someone got wrong; it is not one. Scoped to this include so the lint
+// stays live for real collection literals in the test itself.
+#[allow(clippy::single_range_in_vec_init)]
 mod model;
 
 #[path = "../../../guests/tiny-llama/src/plan.rs"]
