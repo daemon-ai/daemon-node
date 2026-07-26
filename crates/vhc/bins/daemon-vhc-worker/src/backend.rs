@@ -684,19 +684,23 @@ pub(crate) fn backend_inventory() -> Vec<BackendCapability> {
     }
     #[cfg(feature = "wgpu")]
     if let Some(p) = daemon_vhc_host::probe::probe_wgpu() {
-        let vram_sysfs = amdgpu_sysfs_mem_mb("mem_info_vram_total");
+        let class = p.backend.to_lowercase();
         out.push(BackendCapability {
             backend: "wgpu".to_string(),
             // The graphics API the adapter came up on IS the device backend class the run
             // pre-screen matches ("vulkan" / "metal" / "dx12").
-            class: p.backend.to_lowercase(),
+            class: class.clone(),
             adapter: p.adapter.clone(),
             device_index: 0,
-            vram_mb: if vram_sysfs > 0 {
-                vram_sysfs
-            } else {
-                p.max_alloc_mb
-            },
+            // The node's derived usable supply, or nothing.
+            //
+            // This record used to fall back to the per-buffer ceiling when sysfs had no dedicated
+            // figure — which is how a two-gigabyte device supply was once advertised for a card with a
+            // thirty-gigabyte budget, in the same report whose top-level figure was right. A ceiling
+            // on one allocation is not a quantity of memory, and the two are not interchangeable in
+            // either direction. Absence is `0` here (this record's documented "unknown"), which
+            // advertises nothing rather than advertising something false.
+            vram_mb: derived_supply_mb_for_class(&class),
             max_alloc_mb: p.max_alloc_mb,
             shared_mb: amdgpu_sysfs_mem_mb("mem_info_gtt_total"),
             unified: p.unified,
@@ -1099,13 +1103,10 @@ pub(crate) fn hardware() -> Hardware {
     #[cfg(feature = "wgpu")]
     {
         if let Some(p) = daemon_vhc_host::probe::probe_wgpu() {
-            // Dedicated VRAM from sysfs (true lower bound); fall back to the max-alloc proxy.
-            let vram_sysfs = amdgpu_sysfs_mem_mb("mem_info_vram_total");
-            let vram_mb = if vram_sysfs > 0 {
-                vram_sysfs
-            } else {
-                p.max_alloc_mb
-            };
+            // The derived usable supply, never the per-buffer ceiling: a ceiling on one allocation
+            // says nothing about how much memory the device has, and substituting it here advertised
+            // two gigabytes for a card with tens.
+            let vram_mb = derived_supply_mb_for_class(&p.backend.to_lowercase());
             let shared_mb = amdgpu_sysfs_mem_mb("mem_info_gtt_total");
             return Hardware {
                 gpus: p.gpus,
@@ -1328,12 +1329,7 @@ pub(crate) fn role_binding(
     let grants = derive_grants(&worker, &resolved.module, role_grants)?;
     let hw = hardware();
     let dl = device_limits();
-    let device = daemon_vhc_host::run::DeviceProfile {
-        gpu: hw.gpus > 0,
-        vram_bytes: dl.vram_mb << 20,
-        ram_bytes: dl.ram_mb << 20,
-        disk_bytes: hw.disk_free_mb << 20,
-    };
+    let device = admission_device_profile(&hw, &dl);
     let owner = daemon_vhc_host::run::OwnerPolicy {
         participation_enabled: true,
         vram_cap_bytes: 0,
@@ -1587,12 +1583,7 @@ pub(crate) async fn assess_switch(
     };
     let hw = hardware();
     let dl = device_limits();
-    let device = daemon_vhc_host::run::DeviceProfile {
-        gpu: hw.gpus > 0,
-        vram_bytes: dl.vram_mb << 20,
-        ram_bytes: dl.ram_mb << 20,
-        disk_bytes: hw.disk_free_mb << 20,
-    };
+    let device = admission_device_profile(&hw, &dl);
     let owner = daemon_vhc_host::run::OwnerPolicy {
         participation_enabled: true,
         vram_cap_bytes: 0,
@@ -1751,12 +1742,7 @@ pub(crate) fn switch_binding(
     // role grants the new grants document derives from.
     let hw = hardware();
     let dl = device_limits();
-    let device = daemon_vhc_host::run::DeviceProfile {
-        gpu: hw.gpus > 0,
-        vram_bytes: dl.vram_mb << 20,
-        ram_bytes: dl.ram_mb << 20,
-        disk_bytes: hw.disk_free_mb << 20,
-    };
+    let device = admission_device_profile(&hw, &dl);
     let owner = daemon_vhc_host::run::OwnerPolicy {
         participation_enabled: true,
         vram_cap_bytes: 0,
@@ -1883,12 +1869,7 @@ fn assess_module(
             }
         }
     };
-    let device = daemon_vhc_host::run::DeviceProfile {
-        gpu: hw.gpus > 0,
-        vram_bytes: dl.vram_mb << 20,
-        ram_bytes: dl.ram_mb << 20,
-        disk_bytes: hw.disk_free_mb << 20,
-    };
+    let device = admission_device_profile(&hw, &dl);
     let owner = daemon_vhc_host::run::OwnerPolicy {
         participation_enabled: true,
         vram_cap_bytes: 0,
@@ -2369,6 +2350,282 @@ fn sealed_binary_identity() -> daemon_vhc_resource::SealedBinaryIdentity {
         });
     daemon_vhc_resource::SealedBinaryIdentity { blake3, size_bytes }
 }
+/// The device figures the admission funnel compares a role's claim against.
+///
+/// The device-memory figure is the node's **derived usable supply**, not the dedicated carve-out the
+/// legacy probe reports. On a unified part those differ by most of the machine: the carve-out is a true
+/// fact about a BIOS reservation and a false statement about what the device may use, so a lane floor
+/// or an envelope minimum above it refused a device that could have served the role.
+///
+/// No derivation means **zero**, and zero on a box that reports a GPU refuses at the lane floor. That is
+/// the intended outcome: a device whose usable supply cannot be derived is not admissible, and the one
+/// thing that must not happen is a substitute figure — a per-buffer ceiling or a physical-RAM total —
+/// standing in for the measurement, because then the refusal arrives at an allocation instead.
+fn admission_device_profile(
+    hw: &Hardware,
+    dl: &DeviceLimits,
+) -> daemon_vhc_host::run::DeviceProfile {
+    daemon_vhc_host::run::DeviceProfile {
+        gpu: hw.gpus > 0,
+        vram_bytes: derived_device_supply_bytes().unwrap_or(0),
+        ram_bytes: dl.ram_mb << 20,
+        disk_bytes: hw.disk_free_mb << 20,
+    }
+}
+
+/// The device this node's platform ladder found, with the facts a supply derivation reads.
+///
+/// One ladder, used by the report and by the admission funnel alike, in the order
+/// [`device_limits`] already dispatches: a second ordering here would let the two disagree about the
+/// same machine, which is the class of defect that put a per-buffer ceiling on one of them.
+struct ProbedDevice {
+    facts: daemon_vhc_resource::HostDeviceFacts,
+    class: daemon_vhc_resource::BackendClass,
+    adapter_name: String,
+}
+
+/// Gather the platform facts a device-supply derivation reads, or `None` on a box with no device lane.
+///
+/// `None` is not a failure: a CPU-only participant has no device supply to state, and a report about a
+/// device it does not have would be a fiction. What matters is that no *device* box lands here — the
+/// derivation's own fail-closed path handles a device whose facts do not add up to a trustworthy figure.
+// Every arm below is platform- or lane-gated, so a build with no device lane on this OS uses none of
+// the three names — the same shape as the gated `allow` in `backend_inventory`.
+#[cfg_attr(
+    not(any(feature = "wgpu", feature = "cuda", windows, target_os = "macos")),
+    allow(unused_imports)
+)]
+fn probed_device() -> Option<ProbedDevice> {
+    use daemon_vhc_resource::{BackendClass, HostDeviceFacts, SupplyPlatform};
+
+    let mib = |mb: u64| mb << 20;
+    let ram_bytes = mib(host_ram_mb());
+
+    #[cfg(windows)]
+    {
+        if let Some(dl) = daemon_vhc_host::probe::probe_windows_device_limits() {
+            return Some(ProbedDevice {
+                facts: HostDeviceFacts {
+                    platform: SupplyPlatform::Windows,
+                    unified: dl.unified,
+                    dedicated_bytes: mib(dl.vram_mb),
+                    shared_pool_bytes: mib(dl.shared_mb),
+                    host_ram_bytes: if dl.ram_mb > 0 {
+                        mib(dl.ram_mb)
+                    } else {
+                        ram_bytes
+                    },
+                    // The platform's own statement, read as itself rather than through the shared pool
+                    // the mapper folds it into.
+                    platform_budget_bytes: daemon_vhc_host::probe::probe_windows_local_budget_bytes(
+                    ),
+                    advertised_device_heap_bytes: None,
+                },
+                class: BackendClass::Dx12,
+                adapter_name: probed_adapter()
+                    .map_or_else(|| "dx12 adapter".to_string(), |p| p.adapter),
+            });
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(dl) = daemon_vhc_host::probe::probe_macos_device_limits() {
+            return Some(ProbedDevice {
+                facts: HostDeviceFacts {
+                    platform: SupplyPlatform::Macos,
+                    unified: dl.unified,
+                    dedicated_bytes: mib(dl.vram_mb),
+                    shared_pool_bytes: mib(dl.shared_mb),
+                    host_ram_bytes: if dl.ram_mb > 0 {
+                        mib(dl.ram_mb)
+                    } else {
+                        ram_bytes
+                    },
+                    // `macos_device_limits` maps `vram_mb` from `recommendedMaxWorkingSetSize`, which
+                    // IS Metal's budget query — the platform saying what this process may use, not a
+                    // total we inferred. So it enters as the budget it is.
+                    platform_budget_bytes: Some(mib(dl.vram_mb)).filter(|b| *b > 0),
+                    advertised_device_heap_bytes: None,
+                },
+                class: BackendClass::Metal,
+                adapter_name: probed_adapter()
+                    .map_or_else(|| "metal device".to_string(), |p| p.adapter),
+            });
+        }
+    }
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(p) = daemon_vhc_host::probe::probe_cuda() {
+            return Some(ProbedDevice {
+                facts: HostDeviceFacts {
+                    platform: SupplyPlatform::Cuda,
+                    unified: false,
+                    // A discrete card's dedicated memory IS its budget, and the CUDA driver reports it
+                    // directly — the one platform here that needs no derivation.
+                    dedicated_bytes: mib(p.vram_mb),
+                    shared_pool_bytes: 0,
+                    host_ram_bytes: ram_bytes,
+                    platform_budget_bytes: None,
+                    advertised_device_heap_bytes: None,
+                },
+                class: BackendClass::Cuda,
+                adapter_name: p.adapter,
+            });
+        }
+    }
+    #[cfg(feature = "wgpu")]
+    {
+        if let Some(p) = daemon_vhc_host::probe::probe_wgpu() {
+            let vulkan = daemon_vhc_host::probe::probe_vulkan_heap_budget();
+            return Some(ProbedDevice {
+                facts: HostDeviceFacts {
+                    platform: SupplyPlatform::Linux,
+                    unified: p.unified,
+                    // The sysfs carve-out, as a FACT. It is a true lower bound on a unified part and
+                    // was never a supply statement; reading it as one is the defect the derivation
+                    // above exists to correct. Absent sysfs it contributes nothing rather than
+                    // borrowing the per-buffer ceiling — a ceiling is not a capacity.
+                    dedicated_bytes: mib(amdgpu_sysfs_mem_mb("mem_info_vram_total")),
+                    // Read, never assumed: the GTT size is a kernel-cmdline setting on this box and
+                    // the historical default is a different fraction of RAM entirely.
+                    shared_pool_bytes: mib(amdgpu_sysfs_mem_mb("mem_info_gtt_total")),
+                    host_ram_bytes: ram_bytes,
+                    // The driver's live heap BUDGET is deliberately not the supply figure, though it
+                    // is the more precise number: it moves with what else on the box holds memory, and
+                    // two probes of one idle machine minutes apart produce two different budgets and
+                    // therefore two different report digests. The report is cited by digest and
+                    // compared across incarnations, and volatile occupancy pressure is the governor's
+                    // business — so what enters here is the STABLE statement, and the live budget stays
+                    // a pressure reading.
+                    platform_budget_bytes: None,
+                    // The heap the driver presents for device allocations, which on this class of part
+                    // is a fixed fraction of one DRAM pool. It bounds the static derivation to what the
+                    // backend will actually serve, and being a property of the device and driver rather
+                    // than of the moment, it is reproducible.
+                    advertised_device_heap_bytes: vulkan.map(|v| v.heap_size_bytes),
+                },
+                class: match p.backend.to_lowercase().as_str() {
+                    "metal" => BackendClass::Metal,
+                    "dx12" => BackendClass::Dx12,
+                    _ => BackendClass::Vulkan,
+                },
+                adapter_name: p.adapter,
+            });
+        }
+    }
+    let _ = ram_bytes;
+    None
+}
+
+/// The **Device Capability Report** this node states about its device, or `None` on a box with no
+/// device lane.
+///
+/// This is the producer the report was missing. The measurement behind it was never lost — the
+/// platform probes survived and are called on every assess — but nothing turned their facts into the
+/// artifact admission compares against, so the capability report existed as a type with fixtures and no
+/// production constructor.
+///
+/// Two things it deliberately does not do. It does not populate the measured per-allocation ceiling:
+/// every ceiling reachable here is a *stated* one (a framework constant, a driver's advertised buffer
+/// limit), and putting a stated ceiling in a field whose contract says "measured" re-creates the
+/// substitution that once reported a two-gigabyte supply on a thirty-gigabyte card. And it does not
+/// carry an owner's cap: that is node policy, applied afterwards and independently, so a hardware
+/// statement never carries a preference.
+pub(crate) fn device_capability_report() -> Option<daemon_vhc_resource::DeviceCapabilityReport> {
+    use daemon_vhc_resource::{
+        DeviceCapabilityReport, LinkCapacity, Maybe, MemoryPoolTopology, Unavailable,
+        DEVICE_CAPABILITY_REPORT_SCHEMA,
+    };
+
+    let device = probed_device()?;
+    let measured_or_failed = |mb: u64| {
+        if mb > 0 {
+            Maybe::Available(mb << 20)
+        } else {
+            // The probe ran and produced nothing usable. `ProbeFailed` rather than a platform gap:
+            // every platform this runs on can report its memory and its free disk, so an absence here
+            // is a defect on this node — and a zero would refuse the machine while looking measured.
+            Maybe::Unavailable(Unavailable::ProbeFailed)
+        }
+    };
+
+    let capability = BackendCapability {
+        backend: device.class.slug().to_string(),
+        class: device.class.slug().to_string(),
+        adapter: device.adapter_name.clone(),
+        device_index: 0,
+        vram_mb: 0,
+        max_alloc_mb: 0,
+        shared_mb: 0,
+        unified: device.facts.unified,
+        ready: true,
+    };
+    let revision_digest =
+        daemon_vhc_resource::revision_record_digest(&revision_record(&capability)).ok()?;
+
+    Some(DeviceCapabilityReport {
+        schema: DEVICE_CAPABILITY_REPORT_SCHEMA,
+        backend_class: device.class,
+        adapter_name: device.adapter_name,
+        device_supply: daemon_vhc_resource::derive_device_supply(&device.facts),
+        memory_pool: if device.facts.unified {
+            MemoryPoolTopology::Unified
+        } else {
+            MemoryPoolTopology::Separate
+        },
+        measured_max_allocation_bytes: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+        host_memory_bytes: measured_or_failed(host_ram_mb()),
+        disk_bytes: measured_or_failed(host_disk_free_mb()),
+        // Not enumerated per device by anything in this build. Left empty rather than filled from the
+        // module's own vocabulary: a family gate reading this set must refuse for want of evidence,
+        // and inventing entries here would be the report asserting support nobody probed.
+        supported_operation_families: std::collections::BTreeSet::new(),
+        supported_dtypes: std::collections::BTreeSet::new(),
+        // No link measurement exists on this path; the advertised throughput figures are zeros the
+        // probe never measured, so they arrive as an absence instead of as a measured zero.
+        link: LinkCapacity {
+            uplink_bps: Maybe::Unavailable(Unavailable::ProbeFailed),
+            downlink_bps: Maybe::Unavailable(Unavailable::ProbeFailed),
+        },
+        implementation_revision_digest: revision_digest,
+        // No profile has been resolved at probe time: resolution is a selection against the run's and
+        // the owner's policies, which do not exist here.
+        applicable_profile_digest: Maybe::default(),
+    })
+}
+
+/// The derived usable supply in MiB for one advertised backend class, or `0` when there is none.
+///
+/// Class-matched on purpose: a build carrying two device lanes probes one of them, and attributing that
+/// lane's supply to the other lane's record is the same error as filling one lane's revision record from
+/// another lane's adapter.
+#[cfg(feature = "wgpu")]
+fn derived_supply_mb_for_class(class: &str) -> u64 {
+    probed_device()
+        .filter(|device| device.class.slug() == class)
+        .and_then(|device| {
+            daemon_vhc_resource::derive_device_supply(&device.facts)
+                .value()
+                .map(|supply| supply.usable_bytes >> 20)
+        })
+        .unwrap_or(0)
+}
+
+/// Usable device supply in bytes as this node derives it, for the admission funnel's device figure.
+///
+/// The funnel used to be handed the amdgpu carve-out on a unified box — 4 GiB on a machine with tens of
+/// gigabytes usable — so a lane floor above the carve-out refused a device that could have served the
+/// role. Feeding it from the same derivation the report states keeps one answer per machine.
+///
+/// `None` when there is no device or no trustworthy derivation. The caller decides what that means; it
+/// must not become a zero, and it must not become a ceiling borrowed from somewhere else.
+pub(crate) fn derived_device_supply_bytes() -> Option<u64> {
+    let device = probed_device()?;
+    daemon_vhc_resource::derive_device_supply(&device.facts)
+        .value()
+        .map(|supply| supply.usable_bytes)
+}
+
 /// One allocator reading at the device bring-up boundary, taken on the probe path.
 ///
 /// The same sample the run path takes at `AfterBringUp`, reachable without a seeded run, published

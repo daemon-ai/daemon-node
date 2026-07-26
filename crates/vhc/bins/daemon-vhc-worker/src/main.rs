@@ -269,6 +269,50 @@ async fn main() {
                  allocator occupancy — an ABSENCE, not a zero)"
             ),
         }
+        // The device heap the backend presents, and the driver's live budget for it.
+        //
+        // Two numbers on purpose, and only the first is supply: the heap size is a property of the
+        // device and driver, while the budget moves with whatever else on the box holds memory. The
+        // live figure is a pressure reading for the governor, printed here because a calibration pass
+        // wants to see the gap — never because a claim should be admitted against it.
+        match daemon_vhc_host::probe::probe_vulkan_heap_budget() {
+            Some(heap) => println!(
+                "device_heap = {} bytes advertised; live budget {}",
+                heap.heap_size_bytes,
+                match heap.heap_budget_bytes {
+                    Some(budget) => format!("{budget} bytes (volatile — not the supply figure)"),
+                    None => "not reported by this driver".to_string(),
+                }
+            ),
+            None => println!(
+                "device_heap = unavailable (no Vulkan heap could be queried on this build or box)"
+            ),
+        }
+        // The Device Capability Report this node states about its device: the supply figure admission
+        // compares a composed claim against, with the derivation that produced it named.
+        //
+        // Printed with its digest and its validation verdict because both are what make it evidence
+        // rather than a readout: the digest is what an admitted tuple and a composition record cite,
+        // and a report that does not validate must never be quietly used by anything.
+        match backend::device_capability_report() {
+            Some(report) => {
+                println!("device_capability_report = {report:#?}");
+                match report.report_digest() {
+                    Ok(digest) => {
+                        println!("device_capability_report.digest = {}", digest.to_hex());
+                    }
+                    Err(e) => println!("device_capability_report.digest = unavailable ({e})"),
+                }
+                match report.validate() {
+                    Ok(()) => println!("device_capability_report.validates = yes"),
+                    Err(e) => println!("device_capability_report.validates = NO ({e})"),
+                }
+            }
+            None => println!(
+                "device_capability_report = none (this build found no device lane, so this node \
+                 states no device supply — a CPU-only participant, not a defect)"
+            ),
+        }
         // The revision record each probed backend makes about itself — the structure that replaces
         // a Debug-printed adapter line, readable by whatever compares it to a profile's range.
         for capability in backend::backend_inventory() {

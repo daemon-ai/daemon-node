@@ -573,11 +573,19 @@ pub fn validate_against(
     report.validate()?;
     // Both comparisons, and the typed refusal is preserved in the message so a reader can tell a
     // policy refusal from a hardware one — while the shape stays the one callers already match on.
-    if let Err(refusal) =
-        crate::capability::admit_device_bytes(claim.total_peak_bytes, report, owner_cap)
-    {
+    //
+    // The claim's host side rides along because on a unified device it is not a separate budget: the
+    // linear-memory cap and the device residency come out of one DRAM pool, so a role that fits each
+    // figure separately can still over-commit the machine. Passing both is what lets the report's
+    // topology decide whether a joint comparison applies, instead of this call site assuming.
+    if let Err(refusal) = crate::capability::admit_node_memory_bytes(
+        claim.total_peak_bytes,
+        claim.linear_memory_bytes,
+        report,
+        owner_cap,
+    ) {
         return Err(PlannerError::NoAdmissibleConfiguration {
-            required: claim.total_peak_bytes,
+            required: refusal.claimed_bytes(),
             available: refusal.binding_limit_bytes(),
         });
     }

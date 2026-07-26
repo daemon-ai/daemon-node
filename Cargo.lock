@@ -4909,6 +4909,7 @@ version = "0.0.1"
 name = "daemon-vhc-host"
 version = "0.0.1"
 dependencies = [
+ "ash",
  "blake3",
  "burn",
  "burn-backend",

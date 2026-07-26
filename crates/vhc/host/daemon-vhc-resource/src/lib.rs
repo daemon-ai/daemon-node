@@ -39,9 +39,10 @@ pub mod store;
 pub mod trust;
 
 pub use capability::{
-    admit_device_bytes, derive_device_supply, CapabilityError, DeviceAdmissionRefusal,
-    DeviceCapabilityReport, DeviceMemorySource, DeviceMemorySupply, HostDeviceFacts, LinkCapacity,
-    OwnerDeviceCap, SupplyPlatform, DEVICE_CAPABILITY_REPORT_SCHEMA,
+    admit_device_bytes, admit_node_memory_bytes, derive_device_supply, revision_record_digest,
+    CapabilityError, DeviceAdmissionRefusal, DeviceCapabilityReport, DeviceMemorySource,
+    DeviceMemorySupply, HostDeviceFacts, LinkCapacity, MemoryPoolTopology, OwnerDeviceCap,
+    SupplyPlatform, DEVICE_CAPABILITY_REPORT_SCHEMA,
 };
 pub use composition_record::{
     validate_citation, CandidateTuple, CompositionEvidenceLedger, CompositionEvidenceRecord,

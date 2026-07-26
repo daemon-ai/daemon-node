@@ -609,6 +609,149 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
 }
 
 // =====================================================================================
+// Vulkan device-heap budget (the Linux device lane's own statement of supply).
+//
+// This is the platform budget query Linux was missing. Windows has DXGI's local budget and macOS has
+// Metal's recommended working set — both read below — and on both, the platform states what this
+// process may use. On Linux the analogue is `VK_EXT_memory_budget` on the heap the runtime allocates
+// from: the driver's own budget for that heap, which accounts for the split it presents to allocators
+// and for what else on the box already holds memory.
+//
+// Why it matters that this is a *query* and not arithmetic: the static derivation from
+// `mem_info_vram_total` + `mem_info_gtt_total` can exceed the device-local heap the driver advertises,
+// because on a unified part the driver divides one DRAM pool into a device-local heap and a
+// host-visible one. A supply figure above that heap is memory no allocation can reach, so it moves the
+// refusal from admission to the first allocation. The heap SIZE is returned alongside the budget for
+// exactly that reason — it bounds the static fallback when the budget query is unavailable.
+// =====================================================================================
+
+/// What Vulkan says about the device-local heap the runtime allocates from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VulkanHeapBudget {
+    /// `VkMemoryHeap::size` for the selected heap — what the backend advertises as its device heap.
+    pub heap_size_bytes: u64,
+    /// `VkPhysicalDeviceMemoryBudgetPropertiesEXT::heapBudget` for that heap, when the device supports
+    /// the extension. `None` is an absence: the driver stated no budget, and a total is not a budget.
+    pub heap_budget_bytes: Option<u64>,
+}
+
+/// Query the selected device's Vulkan device-local heap: its advertised size and, where the driver
+/// exposes it, its budget.
+///
+/// **Memoized**, because it creates and destroys a Vulkan instance and nothing about the answer moves
+/// within a process — the budget is deliberately the *stable* figure, not an instantaneous one
+/// (volatile pressure is the governor's business, `[RC-4]`).
+///
+/// `None` throughout rather than a zero or a guess: no loader, no matching device, no device-local heap
+/// are all absences, and a supply derivation that inferred a number from any of them would be inventing
+/// the one figure this whole path exists to measure.
+///
+/// The physical device is matched to the adapter the graphics probe actually brought up, by vendor and
+/// device id. Reading the *first* device's heap on a multi-adapter box would attribute one adapter's
+/// budget to another — the same mistake as filling one lane's revision record from another lane's probe.
+#[cfg(all(feature = "wgpu", target_os = "linux"))]
+#[must_use]
+pub fn probe_vulkan_heap_budget() -> Option<VulkanHeapBudget> {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<Option<VulkanHeapBudget>> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        // A bring-up failure inside the loader panics on some drivers; this whole query is an expected
+        // absence when Vulkan is not present, so it is captured quietly like the adapter probe.
+        crate::device_panic::catch(true, vk_heap_budget).unwrap_or(None)
+    })
+}
+
+/// Neither the extension nor the API exists to be queried here, so the absence is a `cfg` fact.
+#[cfg(not(all(feature = "wgpu", target_os = "linux")))]
+#[must_use]
+pub fn probe_vulkan_heap_budget() -> Option<VulkanHeapBudget> {
+    None
+}
+
+/// The Vulkan calls themselves. Scoped `unsafe` under the crate's `#![deny(unsafe_code)]`, exactly as
+/// the DXGI and Metal probes below are.
+#[cfg(all(feature = "wgpu", target_os = "linux"))]
+#[allow(unsafe_code)]
+fn vk_heap_budget() -> Option<VulkanHeapBudget> {
+    use ash::vk;
+
+    // SAFETY: `Entry::load` dlopens the Vulkan loader. Absent loader is an `Err`, not a crash.
+    let entry = unsafe { ash::Entry::load() }.ok()?;
+    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+    let create = vk::InstanceCreateInfo::default().application_info(&app);
+    // SAFETY: `create` outlives the call; no extensions or layers are requested.
+    let instance = unsafe { entry.create_instance(&create, None) }.ok()?;
+
+    let selected = probe_wgpu();
+    let result = (|| {
+        // SAFETY: the instance is live for the whole closure.
+        let devices = unsafe { instance.enumerate_physical_devices() }.ok()?;
+        let physical = devices.into_iter().find(|pd| {
+            // SAFETY: `pd` came from this instance.
+            let props = unsafe { instance.get_physical_device_properties(*pd) };
+            match selected.as_ref() {
+                // The adapter the graphics probe brought up, by identity rather than by position.
+                Some(probe) => {
+                    probe.vendor_id == Some(props.vendor_id)
+                        && probe.device_id == Some(props.device_id)
+                }
+                // No adapter identity to match (the reuse path claims none): any real GPU beats none,
+                // and a CPU-type Vulkan device is not a device lane's supply.
+                None => props.device_type != vk::PhysicalDeviceType::CPU,
+            }
+        })?;
+
+        // SAFETY: `physical` came from this instance.
+        let extensions =
+            unsafe { instance.enumerate_device_extension_properties(physical) }.ok()?;
+        let budget_supported = extensions.iter().any(|ext| {
+            ext.extension_name_as_c_str()
+                .is_ok_and(|name| name == c"VK_EXT_memory_budget")
+        });
+
+        let mut budget_props = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let (heaps, heap_count, budgets) = {
+            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+            if budget_supported {
+                props2 = props2.push_next(&mut budget_props);
+            }
+            // SAFETY: `physical` came from this instance and `props2` is a live, correctly chained
+            // output struct; the call only writes it.
+            unsafe { instance.get_physical_device_memory_properties2(physical, &mut props2) };
+            let memory = props2.memory_properties;
+            (
+                memory.memory_heaps,
+                usize::try_from(memory.memory_heap_count).unwrap_or(0),
+                budget_supported,
+            )
+        };
+
+        // The heap the runtime allocates device memory from: the largest device-local one. On a
+        // unified part the driver presents several heaps over one DRAM pool, and the device-local one
+        // is the heap a device allocation is served from.
+        let (index, heap) = heaps
+            .iter()
+            .take(heap_count.min(heaps.len()))
+            .enumerate()
+            .filter(|(_, heap)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .max_by_key(|(_, heap)| heap.size)?;
+
+        Some(VulkanHeapBudget {
+            heap_size_bytes: heap.size,
+            // Zero from the driver is not a budget, so it stays an absence rather than becoming a
+            // supply figure of zero — which would refuse the machine instead of reporting the gap.
+            heap_budget_bytes: budgets
+                .then(|| budget_props.heap_budget[index])
+                .filter(|b| *b > 0),
+        })
+    })();
+
+    // SAFETY: no Vulkan object created from this instance outlives this point (none was created).
+    unsafe { instance.destroy_instance(None) };
+    result
+}
+
+// =====================================================================================
 // CUDA device-memory probe (the CUDA backend lane). Unlike wgpu, the CUDA driver exposes
 // total device memory (`cuDeviceTotalMem`), so `vram_mb` is the real dedicated VRAM (24564 MiB on the
 // RunPod 4090) — a discrete-device honest number (no UMA on this card). The pure mapper is
@@ -1053,6 +1196,28 @@ pub fn probe_windows_device_limits() -> Option<DeviceLimits> {
             );
             limits
         })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The DXGI **local budget** for the selected adapter — the Windows platform budget query.
+///
+/// Carried separately from [`probe_windows_device_limits`] because the mapper folds it into the shared
+/// pool, where a supply derivation can no longer tell it apart from the static `SharedSystemMemory`
+/// ceiling. The two are different kinds of number: one is the platform saying what this process may
+/// use, the other is a limit on what could ever be borrowed. A supply derivation must prefer the first.
+///
+/// Zero is not a budget, so it comes back as an absence.
+#[must_use]
+pub fn probe_windows_local_budget_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        win_ffi::probe()
+            .map(|(_, raw)| raw.budget_local)
+            .filter(|budget| *budget > 0)
     }
     #[cfg(not(windows))]
     {

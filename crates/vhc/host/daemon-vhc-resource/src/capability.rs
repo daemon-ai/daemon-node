@@ -124,7 +124,23 @@ pub struct HostDeviceFacts {
     ///
     /// Preferred over any static derivation when present, because it is the platform stating what this
     /// process may use rather than us inferring it from totals.
+    ///
+    /// **A figure that moves with co-tenant pressure does not belong here.** Some platforms expose their
+    /// budget as a live quantity that shrinks while another process holds memory; that is precisely the
+    /// volatile pressure the governor owns, and the report is the *stable* statement admission compares
+    /// against and cites by digest. A live figure here would give two probes of one idle machine two
+    /// digests, and no artifact could cite the report it was produced beside.
     pub platform_budget_bytes: Option<u64>,
+    /// What the backend itself advertises as the size of the device heap it allocates from, where the
+    /// backend says. `None` when it does not.
+    ///
+    /// This bounds the static derivation, and it is the reason the static derivation is a *fallback*
+    /// rather than an alternative. Adding most of a unified machine's spillover pool to the dedicated
+    /// carve-out can exceed what the backend will ever hand out of its device heap: the same DRAM is
+    /// presented to the allocator as a device heap of a fixed fraction, and a supply figure above that
+    /// promises memory no allocation can reach. Admitting against it would put the refusal at the first
+    /// allocation instead of at admission, which is where a supply figure exists to put it.
+    pub advertised_device_heap_bytes: Option<u64>,
 }
 
 /// The fraction of the shared pool a static derivation will claim, in percent.
@@ -146,8 +162,12 @@ const SHARED_POOL_CLAIMABLE_PERCENT: u64 = 90;
 /// 1. **The platform's own budget query**, where it has one. The platform stating what this process may
 ///    use beats us inferring it from totals.
 /// 2. **The validated static derivation** for a unified device: the dedicated carve-out plus most of the
-///    shared pool, clamped by physical RAM. The clamp matters — a variable-graphics-memory part can
-///    report tens of gigabytes of "video memory" that is the same RAM counted twice.
+///    shared pool, clamped by physical RAM **and** by the heap the backend advertises. The RAM clamp
+///    matters because a variable-graphics-memory part can report tens of gigabytes of "video memory"
+///    that is the same RAM counted twice; the heap clamp matters because the backend hands out device
+///    memory from a heap of its own choosing, and a supply figure above that heap promises memory no
+///    allocation can reach. Both are conservative by construction, and a fallback that is not
+///    conservative is not a fallback — it is a different, unvalidated answer.
 /// 3. **The dedicated figure** for a discrete device, which for a discrete card *is* the budget.
 /// 4. **Nothing**, typed, which fails closed.
 #[must_use]
@@ -175,12 +195,17 @@ pub fn derive_device_supply(facts: &HostDeviceFacts) -> Maybe<DeviceMemorySupply
         });
     }
 
+    let heap_clamp = |bytes: u64| match facts.advertised_device_heap_bytes.filter(|h| *h > 0) {
+        Some(heap) => bytes.min(heap),
+        None => bytes,
+    };
+
     if facts.unified {
         let claimable = facts
             .shared_pool_bytes
             .saturating_mul(SHARED_POOL_CLAIMABLE_PERCENT)
             / 100;
-        let derived = ram_clamp(facts.dedicated_bytes.saturating_add(claimable));
+        let derived = heap_clamp(ram_clamp(facts.dedicated_bytes.saturating_add(claimable)));
         if derived > 0 {
             return Maybe::Available(DeviceMemorySupply {
                 usable_bytes: derived,
@@ -226,6 +251,42 @@ pub struct LinkCapacity {
     pub downlink_bps: Maybe<u64>,
 }
 
+/// The digest of a backend implementation revision record, as a capability report cites it.
+///
+/// The report and the record are read together at admission — one says what the machine has, the other
+/// says what is running on it — so the report cites the record it was produced beside rather than
+/// restating any of it. Citing by digest is what makes "produced beside" checkable later.
+///
+/// # Errors
+/// [`CapabilityError::Invalid`] when the record does not encode canonically.
+pub fn revision_record_digest(
+    record: &crate::revision::BackendImplementationRevision,
+) -> Result<Hash, CapabilityError> {
+    let bytes = to_canonical_vec(record)
+        .map_err(|e| CapabilityError::Invalid(format!("revision record encoding: {e}")))?;
+    Ok(blake3_hash(&bytes))
+}
+
+/// Whether this device's memory and the host's are one physical pool or two.
+///
+/// Carried in the report because the report states two memory figures, and on a unified device those
+/// two figures are **the same DRAM described twice**. A reader that adds them, or that spends against
+/// one without counting the other, has over-committed the machine while every individual comparison
+/// passed — the failure then arrives at an allocation rather than at admission, attributed to whichever
+/// side happened to ask last.
+///
+/// A device the platform reports as unified is not a special case to tolerate; it is the fleet's own
+/// hardware. Making the topology explicit is what lets [`admit_node_memory_bytes`] make the joint
+/// comparison instead of leaving each caller to remember that it should.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPoolTopology {
+    /// Device memory and host memory are separate physical pools, independently available.
+    Separate,
+    /// One physical pool serves both. The device and host figures are not additive supply.
+    Unified,
+}
+
 /// What one participating node reports about one device.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceCapabilityReport {
@@ -244,6 +305,8 @@ pub struct DeviceCapabilityReport {
     /// of unknown meaning where a measurement belongs, which is how a two-gigabyte reading once stood
     /// in for a thirty-gigabyte budget in a report whose other figures were correct.
     pub device_supply: Maybe<DeviceMemorySupply>,
+    /// Whether the device supply and [`Self::host_memory_bytes`] describe one physical pool or two.
+    pub memory_pool: MemoryPoolTopology,
     /// The largest single physical allocation the driver was **measured** to accept. Typed
     /// unavailability when it has not been probed — the reported ceiling is not evidence of what
     /// the driver enforces, and the two are carried separately in the profile for the same reason.
@@ -440,6 +503,57 @@ pub fn admit_device_bytes(
     Ok(())
 }
 
+/// Admit a role's device **and** host figures against one node's report, respecting pool topology.
+///
+/// On a device with [`MemoryPoolTopology::Separate`] memory this is exactly the device comparison plus
+/// the host one: two pools, two independent budgets, and nothing links them.
+///
+/// On a [`MemoryPoolTopology::Unified`] device the two figures are one DRAM pool described twice, so a
+/// third comparison applies and it is the binding one: **the sum** must fit in the smaller of the
+/// derived device supply and the measured host memory. Without it, a role claiming most of the supply
+/// on the device side and most of host memory on the linear-memory side passes both comparisons and
+/// over-commits the machine — the historical shape of this error, which the pre-refactor derivation
+/// guarded with a joint-pool check that was lost with the rest of the arithmetic.
+///
+/// # Errors
+/// [`DeviceAdmissionRefusal`] naming which comparison refused. The joint refusal is distinct from the
+/// supply refusal on purpose: "your role fits the device but not beside its own host footprint" sends
+/// an operator somewhere different than "your role does not fit this device".
+pub fn admit_node_memory_bytes(
+    device_claimed_bytes: u64,
+    host_claimed_bytes: u64,
+    report: &DeviceCapabilityReport,
+    owner_cap: Option<OwnerDeviceCap>,
+) -> Result<(), DeviceAdmissionRefusal> {
+    admit_device_bytes(device_claimed_bytes, report, owner_cap)?;
+    if report.memory_pool == MemoryPoolTopology::Separate {
+        return Ok(());
+    }
+    // The pool is whichever of the two figures is smaller: the device side cannot exceed the supply
+    // derivation, and neither side can exceed the physical RAM they share.
+    let supply = report.usable_device_supply_bytes().map_err(|_| {
+        DeviceAdmissionRefusal::NoTrustworthySupply {
+            adapter: report.adapter_name.clone(),
+        }
+    })?;
+    let pool = match report.host_memory_bytes.value() {
+        Some(host) => supply.min(*host),
+        // Host memory unmeasured: the device derivation is the only bound in hand, and using it alone
+        // is conservative here because the derivation is already clamped by physical RAM.
+        None => supply,
+    };
+    let joint = device_claimed_bytes.saturating_add(host_claimed_bytes);
+    if joint > pool {
+        return Err(DeviceAdmissionRefusal::ExceedsUnifiedPool {
+            device_bytes: device_claimed_bytes,
+            host_bytes: host_claimed_bytes,
+            pool_bytes: pool,
+            adapter: report.adapter_name.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Which of the two device-memory comparisons refused.
 ///
 /// Typed rather than a message, because the two are acted on differently: a supply refusal means this
@@ -485,9 +599,44 @@ pub enum DeviceAdmissionRefusal {
         /// What the device actually has, so the refusal cannot be mistaken for a hardware limit.
         supply_bytes: u64,
     },
+    /// Device and host figures each fit, but not together in the one pool they share.
+    #[error(
+        "on `{adapter}` the device memory and the host memory are one physical pool, and the role's \
+         {device_bytes} device bytes beside its {host_bytes} host bytes exceed the {pool_bytes} \
+         bytes that pool holds; each figure fits on its own, which is why this is checked jointly"
+    )]
+    ExceedsUnifiedPool {
+        /// The device side of the claim.
+        device_bytes: u64,
+        /// The host side of the claim.
+        host_bytes: u64,
+        /// The shared pool the two compete for.
+        pool_bytes: u64,
+        /// The adapter.
+        adapter: String,
+    },
 }
 
 impl DeviceAdmissionRefusal {
+    /// What was asked for, as the refusing comparison counted it.
+    ///
+    /// The joint refusal counts both sides, because a caller reporting "required N against available M"
+    /// would otherwise print the device figure beside a pool bound that the host figure is what
+    /// exceeded — a pair of numbers that do not explain each other.
+    #[must_use]
+    pub fn claimed_bytes(&self) -> u64 {
+        match self {
+            Self::NoTrustworthySupply { .. } => 0,
+            Self::ExceedsSupply { claimed_bytes, .. }
+            | Self::ExceedsOwnerCap { claimed_bytes, .. } => *claimed_bytes,
+            Self::ExceedsUnifiedPool {
+                device_bytes,
+                host_bytes,
+                ..
+            } => device_bytes.saturating_add(*host_bytes),
+        }
+    }
+
     /// The limit that bound, for a caller reporting `required` against `available`.
     #[must_use]
     pub fn binding_limit_bytes(&self) -> u64 {
@@ -495,6 +644,7 @@ impl DeviceAdmissionRefusal {
             Self::NoTrustworthySupply { .. } => 0,
             Self::ExceedsSupply { supply_bytes, .. } => *supply_bytes,
             Self::ExceedsOwnerCap { cap_bytes, .. } => *cap_bytes,
+            Self::ExceedsUnifiedPool { pool_bytes, .. } => *pool_bytes,
         }
     }
 }
@@ -513,6 +663,7 @@ pub(crate) mod fixtures {
                 usable_bytes: 32_952_745_984,
                 source: DeviceMemorySource::LinuxUnifiedMemoryBudget,
             }),
+            memory_pool: MemoryPoolTopology::Unified,
             measured_max_allocation_bytes: Maybe::Available(4 << 30),
             host_memory_bytes: Maybe::Available(64 << 30),
             disk_bytes: Maybe::Available(247 << 30),
@@ -566,6 +717,7 @@ mod tests {
             shared_pool_bytes: 28 * 1024 * 1024 * 1024,
             host_ram_bytes: 32 * 1024 * 1024 * 1024,
             platform_budget_bytes: None,
+            advertised_device_heap_bytes: None,
         };
         let supply = derive_device_supply(&strix)
             .value()
@@ -586,6 +738,92 @@ mod tests {
         assert!(supply.usable_bytes < strix.host_ram_bytes);
     }
 
+    /// The backend's own heap bounds the static fallback, so the fallback stays a fallback.
+    ///
+    /// This is the fleet's Strix box: a 4 GiB carve-out beside ~117 GiB of spillover pool on ~121 GiB
+    /// of RAM, where the backend presents a device heap of ~81 GiB. The unclamped arithmetic yields
+    /// ~109 GiB — under physical RAM, so the RAM clamp does not catch it, and above every allocation
+    /// the backend will serve out of that heap. A supply figure the allocator cannot honour moves the
+    /// refusal from admission to the first allocation, which is the one place it must never be.
+    #[test]
+    fn the_advertised_device_heap_bounds_the_static_fallback() {
+        let mib = 1024 * 1024_u64;
+        let strix = HostDeviceFacts {
+            platform: SupplyPlatform::Linux,
+            unified: true,
+            dedicated_bytes: 4096 * mib,
+            shared_pool_bytes: 120_000 * mib,
+            host_ram_bytes: 124_096 * mib,
+            platform_budget_bytes: None,
+            advertised_device_heap_bytes: Some(82_730 * mib),
+        };
+        let clamped = derive_device_supply(&strix).value().copied().unwrap();
+        assert_eq!(clamped.usable_bytes, 82_730 * mib);
+
+        let unclamped = derive_device_supply(&HostDeviceFacts {
+            advertised_device_heap_bytes: None,
+            ..strix
+        })
+        .value()
+        .copied()
+        .unwrap();
+        assert!(
+            unclamped.usable_bytes > clamped.usable_bytes,
+            "without the heap clamp the fallback exceeds what the backend hands out"
+        );
+        assert!(
+            unclamped.usable_bytes < strix.host_ram_bytes,
+            "and physical RAM does not catch it, which is why the heap clamp is not redundant"
+        );
+    }
+
+    /// The platform's own budget still wins over both clamps' inputs — it is a statement, not a total.
+    #[test]
+    fn the_platform_budget_outranks_the_advertised_heap_derivation() {
+        let mib = 1024 * 1024_u64;
+        let facts = HostDeviceFacts {
+            platform: SupplyPlatform::Linux,
+            unified: true,
+            dedicated_bytes: 4096 * mib,
+            shared_pool_bytes: 120_000 * mib,
+            host_ram_bytes: 124_096 * mib,
+            platform_budget_bytes: Some(60_000 * mib),
+            advertised_device_heap_bytes: Some(82_730 * mib),
+        };
+        let supply = derive_device_supply(&facts).value().copied().unwrap();
+        assert_eq!(supply.usable_bytes, 60_000 * mib);
+    }
+
+    /// One physical pool is compared jointly, and the joint refusal is its own attribution.
+    ///
+    /// Each figure fitting on its own is exactly the state in which the machine gets over-committed:
+    /// both comparisons pass and the sum does not fit.
+    #[test]
+    fn a_unified_pool_is_compared_jointly_and_refuses_with_its_own_attribution() {
+        let r = report(BackendClass::Vulkan);
+        let supply = r.usable_device_supply_bytes().unwrap();
+        let host = *r.host_memory_bytes.value().unwrap();
+        let pool = supply.min(host);
+
+        // Each side alone is admissible; together they are not.
+        admit_device_bytes(pool - 1024, &r, None).expect("the device side fits on its own");
+        let refusal = admit_node_memory_bytes(pool - 1024, 4096, &r, None).unwrap_err();
+        assert!(matches!(
+            refusal,
+            DeviceAdmissionRefusal::ExceedsUnifiedPool { .. }
+        ));
+        assert!(refusal.to_string().contains("one physical pool"));
+
+        // Fitting jointly admits.
+        admit_node_memory_bytes(pool / 2, pool / 4, &r, None).expect("a joint fit admits");
+
+        // A separate-pool device makes no joint comparison: two pools are two budgets.
+        let mut discrete = report(BackendClass::Cuda);
+        discrete.memory_pool = MemoryPoolTopology::Separate;
+        admit_node_memory_bytes(supply, host, &discrete, None)
+            .expect("separate pools are independently available");
+    }
+
     /// Physical RAM is the ceiling on a unified device, so a driver reporting inflated "video memory"
     /// cannot produce a supply larger than the machine.
     ///
@@ -600,6 +838,7 @@ mod tests {
             shared_pool_bytes: 48 * 1024 * 1024 * 1024,
             host_ram_bytes: 16 * 1024 * 1024 * 1024,
             platform_budget_bytes: None,
+            advertised_device_heap_bytes: None,
         };
         let supply = derive_device_supply(&inflated).value().copied().unwrap();
         assert_eq!(
@@ -621,6 +860,7 @@ mod tests {
             shared_pool_bytes: 24 * 1024 * 1024 * 1024,
             host_ram_bytes: 32 * 1024 * 1024 * 1024,
             platform_budget_bytes: Some(21 * 1024 * 1024 * 1024),
+            advertised_device_heap_bytes: None,
         };
         let supply = derive_device_supply(&facts).value().copied().unwrap();
         assert_eq!(supply.usable_bytes, 21 * 1024 * 1024 * 1024);
@@ -641,6 +881,7 @@ mod tests {
             shared_pool_bytes: 0,
             host_ram_bytes: 16 * 1024 * 1024 * 1024,
             platform_budget_bytes: None,
+            advertised_device_heap_bytes: None,
         };
         let supply = derive_device_supply(&discrete).value().copied().unwrap();
         assert_eq!(supply.usable_bytes, 24 * 1024 * 1024 * 1024);
@@ -661,6 +902,7 @@ mod tests {
             shared_pool_bytes: 0,
             host_ram_bytes: 0,
             platform_budget_bytes: None,
+            advertised_device_heap_bytes: None,
         };
         assert!(derive_device_supply(&nothing).value().is_none());
 
