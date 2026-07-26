@@ -4633,6 +4633,17 @@ fn provenance_scan() -> anyhow::Result<()> {
             ],
             "authoring a genesis from a fixture's requirements must stay in test targets",
         ),
+        (
+            // The fourth minting constructor, found while verifying the authoring-site migration. It
+            // stamps a role's execution requirements over a trivial plan no module produced — the same
+            // provenance forgery as the three above, and it was outside the gate because the gate was
+            // written before it existed. Every current caller is a test target; this is what keeps
+            // that true.
+            "RoleExecutionRequirements::fixture_over_trivial_plan",
+            &["contracts/daemon-vhc-proto/src/execution_requirements.rs"],
+            "a role's execution requirements must come from a module's own assessment, never from a \
+             fixture's trivial plan, on any shipping path",
+        ),
     ];
 
     let mut violations: Vec<String> = Vec::new();
