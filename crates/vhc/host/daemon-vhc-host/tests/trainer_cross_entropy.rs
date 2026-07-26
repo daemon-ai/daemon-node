@@ -26,10 +26,10 @@
 
 use burn::backend::Autodiff;
 use burn::tensor::{Int, Tensor, TensorData};
-use burn_ndarray::NdArray;
+use burn_ndarray::{NdArray, NdArrayDevice};
 
 type Back = Autodiff<NdArray<f32, i64, i8>>;
-type Device = <NdArray<f32, i64, i8> as burn::tensor::backend::Backend>::Device;
+type Device = NdArrayDevice;
 
 /// Which target-selection formulation the tail runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
