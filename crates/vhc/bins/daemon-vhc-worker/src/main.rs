@@ -253,6 +253,22 @@ async fn main() {
             None => println!("device_availability = available"),
             Some(reason) => println!("device_availability = {reason}"),
         }
+        // One allocator reading with no run apparatus at all — the bring-up-boundary sample.
+        //
+        // The run-path readout needs a seeded run, published modules and a genesis envelope, so the
+        // allocator terms a profile is calibrated against were unobtainable without that whole
+        // apparatus. This is the same reading at the same boundary, on a path an operator can invoke
+        // on a bare box.
+        //
+        // Absence is printed as absence: a backend that cannot report occupancy records nothing, and
+        // a reader taking that for zero would calibrate a profile against a figure nobody measured.
+        match backend::probe_allocator_sample() {
+            Some(sample) => println!("allocator_sample[after-bring-up] = {sample:#?}"),
+            None => println!(
+                "allocator_sample[after-bring-up] = unavailable (this backend cannot report \
+                 allocator occupancy — an ABSENCE, not a zero)"
+            ),
+        }
         // The revision record each probed backend makes about itself — the structure that replaces
         // a Debug-printed adapter line, readable by whatever compares it to a profile's range.
         for capability in backend::backend_inventory() {

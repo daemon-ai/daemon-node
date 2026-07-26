@@ -2369,6 +2369,44 @@ fn sealed_binary_identity() -> daemon_vhc_resource::SealedBinaryIdentity {
         });
     daemon_vhc_resource::SealedBinaryIdentity { blake3, size_bytes }
 }
+/// One allocator reading at the device bring-up boundary, taken on the probe path.
+///
+/// The same sample the run path takes at `AfterBringUp`, reachable without a seeded run, published
+/// modules or a genesis envelope — which is what made the allocator terms unobtainable on a bare box.
+///
+/// `None` is an absence and not a zero: a backend that cannot report occupancy records nothing, and a
+/// profile calibrated against a manufactured zero would be calibrated against nothing.
+#[must_use]
+pub(crate) fn probe_allocator_sample() -> Option<daemon_vhc_host::compute::AllocatorSample> {
+    // The DEVICE lane, explicitly. The default is the CPU lane, whose sampler declines by design —
+    // its allocations go through the host allocator, which answers a different question than a device
+    // profile's pooling terms ask — so probing the default would report an absence on a box that has
+    // an accelerator, which is exactly the kind of misreading this readout exists to prevent.
+    let backend = {
+        #[cfg(feature = "cuda")]
+        {
+            daemon_vhc_host::runtime::BackendKind::Cuda
+        }
+        #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
+        {
+            daemon_vhc_host::runtime::BackendKind::Wgpu
+        }
+        // No device lane compiled in: there is nothing to sample, and the CPU lane declining is the
+        // honest answer rather than a defect.
+        #[cfg(not(any(feature = "wgpu", feature = "cuda")))]
+        {
+            daemon_vhc_host::runtime::BackendKind::Cpu
+        }
+    };
+    let cfg = daemon_vhc_host::EngineConfig {
+        backend,
+        ..daemon_vhc_host::EngineConfig::default()
+    };
+    // Built on this thread, sampled on this thread: the runner is thread-pinned, so a sample taken
+    // anywhere else would be a programming error rather than a measurement.
+    let compute = daemon_vhc_host::compute::HostCompute::build(&cfg).ok()?;
+    compute.sample_allocator()
+}
 
 #[cfg(test)]
 mod tests {
