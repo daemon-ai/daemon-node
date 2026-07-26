@@ -86,7 +86,16 @@ pub(crate) struct PumpState {
     /// The last log line the guest stamped with [`daemon_vhc_abi::GUEST_PANIC_LOG_PREFIX`] — the
     /// SDK panic hook's forwarded message, held aside so the trap that follows a beat later can
     /// carry it as its typed detail instead of reaching the embedder as a bare `unreachable`.
-    pub(crate) guest_panic: Option<String>,
+    /// The forwarded guest-panic line, **tagged with the execution context it was emitted in**
+    /// (`[LX-10]`).
+    ///
+    /// Emitting a prefixed line does not imply trapping: a guest may log one and continue, or log
+    /// one during initialization and trap much later for an unrelated reason. An unscoped slot lifts
+    /// that stale line into the later trap's detail, producing an authoritative-looking source
+    /// location that belongs to a different failure — a diagnostic that names a different bug
+    /// convincingly, which is worse than no diagnostic. So the context travels with the message and
+    /// the lift happens only on an exact match.
+    pub(crate) guest_panic: Option<(daemon_vhc_abi::ExecutionContext, String)>,
     /// Published frames, for embedder-side assertions: `(channel, seq, signed frame bytes)`.
     pub(crate) published: Vec<(u64, u64, Vec<u8>)>,
     /// The per-instance buffer table (kind 8, architecture §3.4) — shared between the guest

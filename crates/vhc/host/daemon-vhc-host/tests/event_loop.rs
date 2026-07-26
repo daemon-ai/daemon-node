@@ -22,8 +22,8 @@ use daemon_vhc_abi::{DEFAULT_CHANNEL_CONTROL_ID, FRAME_ENVELOPE_DOMAIN_V2};
 use daemon_vhc_host::run::{start_run, JournalSink, RunConfig, RunEnd, RunIdentity, SinkError};
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_observe::journal::record::{
-    ClockRec, DropId, DropRec, EventRec, InitRec, InstantiationRec, RunHeader, SignedFrameRec,
-    TerminalRec, TimerArmRec, TimerCancelRec, TrapInfo,
+    ClockRec, DropId, DropRec, EventRec, ExecutionGrantRec, InitRec, InstantiationRec, RunHeader,
+    SignedFrameRec, TerminalRec, TimerArmRec, TimerCancelRec, TrapInfo,
 };
 use daemon_vhc_observe::journal::{Body, ExecIdentity, Journal, RotatePolicy, StaticKey};
 use daemon_vhc_proto::sign::verify_bytes;
@@ -101,6 +101,16 @@ impl JournalSink for JournalAdapter {
             .append(Body::Init(InitRec {
                 config_hash: Hash(config_hash),
                 grants_hash: Hash(grants_hash),
+                status,
+            }))
+            .map(|_| ())
+            .map_err(|e| SinkError(e.to_string()))
+    }
+
+    fn execution_grant(&mut self, hash: [u8; 32], status: u64) -> Result<(), SinkError> {
+        self.journal
+            .append(Body::ExecutionGrant(ExecutionGrantRec {
+                execution_grant_hash: Hash(hash),
                 status,
             }))
             .map(|_| ())

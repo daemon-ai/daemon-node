@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use daemon_vhc_host::run::{Dropped, JournalSink, RunIdentity, SinkError};
 use daemon_vhc_journal::record::{
     Body, ClockRec, CompletionRec, ConditionRec, DeviceProfileRec, DropId, DropRec, EventRec,
-    ExecIdentity, InitRec, InstantiationRec, RunHeader, SignedFrameRec, SnapshotRec, TerminalRec,
-    TimerArmRec, TimerCancelRec, TrapInfo,
+    ExecIdentity, ExecutionGrantRec, InitRec, InstantiationRec, RunHeader, SignedFrameRec,
+    SnapshotRec, TerminalRec, TimerArmRec, TimerCancelRec, TrapInfo,
 };
 use daemon_vhc_journal::{format_version, Journal, JournalError, RotatePolicy, StaticKey};
 use daemon_vhc_proto::Hash;
@@ -239,6 +239,20 @@ impl JournalSink for DurableSink {
             .append(Body::Init(InitRec {
                 config_hash: Hash(config_hash),
                 grants_hash: Hash(grants_hash),
+                status,
+            }))
+            .map(|_| ())
+            .map_err(sink_err)
+    }
+
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.journal
+            .append(Body::ExecutionGrant(ExecutionGrantRec {
+                execution_grant_hash: Hash(execution_grant_hash),
                 status,
             }))
             .map(|_| ())

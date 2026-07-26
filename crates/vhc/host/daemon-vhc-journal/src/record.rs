@@ -266,6 +266,20 @@ pub struct InitRec {
     pub status: u64,
 }
 
+/// tag 18 — the Execution Grant application result (ABI §8.3 at the certification minor).
+///
+/// Written exactly once after `da_apply_execution_grant` **returns** — status zero or nonzero — and
+/// before the tag-11 init record. On a trap it is absent and exactly one terminal trap carrying the
+/// grant-application context occupies that branch instead; the grammar admits one or the other,
+/// never both and never neither, and a replay reproduces whichever branch was taken.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionGrantRec {
+    /// blake3 of the tag-0 `execution_grant` bytes.
+    pub execution_grant_hash: Hash,
+    /// The `da_apply_execution_grant` return status (`0` = accepted).
+    pub status: u64,
+}
+
 /// tag 12 — signed-frame (ABI §8.3, §8.6): the original signed wire frame behind an authoritative
 /// event, inline (Phase A) or as an archive evidence reference (Phase D). Exactly one present.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +385,8 @@ pub enum Body {
     Condition(ConditionRec),
     /// tag 17.
     Seal(SealRec),
+    /// tag 18.
+    ExecutionGrant(ExecutionGrantRec),
 }
 
 impl Body {
@@ -396,6 +412,7 @@ impl Body {
             Body::DeviceProfile(_) => 15,
             Body::Condition(_) => 16,
             Body::Seal(_) => 17,
+            Body::ExecutionGrant(_) => daemon_vhc_abi::JOURNAL_TAG_EXECUTION_GRANT,
         }
     }
 
@@ -419,6 +436,7 @@ impl Body {
             Body::DeviceProfile(x) => Value::serialized(x),
             Body::Condition(x) => Value::serialized(x),
             Body::Seal(x) => Value::serialized(x),
+            Body::ExecutionGrant(x) => Value::serialized(x),
         };
         v.map_err(|e| JournalError::Codec(format!("serialize body: {e}")))
     }

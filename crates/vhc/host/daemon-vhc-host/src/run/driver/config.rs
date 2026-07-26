@@ -38,8 +38,25 @@ pub struct RunConfig {
     /// Run-header fields the admission path pinned (verbatim canonical bytes; §8.3 tag 0). Empty
     /// until the A2 admission funnel wires them — recorded as such.
     pub manifest_bytes: Vec<u8>,
-    /// Run-header claim bytes (see [`RunConfig::manifest_bytes`]).
+    /// Run-header claim bytes (see [`RunConfig::manifest_bytes`]). Empty at the certification minor,
+    /// which records the plan, the composed claims and the grant instead.
     pub claim_bytes: Vec<u8>,
+    /// The negotiated major-2 ABI minor for this instance.
+    ///
+    /// It is the selector for the minor-dependent behaviour: which assessment export ran, which
+    /// run-header variant the journal writes, and which terminal-context renderer applies. Defaults
+    /// to the host's own implemented minor; admission overwrites it with the module's declared one.
+    pub abi_minor: u32,
+    /// The canonical Logical Resource Plan bytes (run-header, certification minor). Empty below it.
+    pub resource_plan_bytes: Vec<u8>,
+    /// The canonical Execution Grant bytes to apply before `da_init`.
+    ///
+    /// Empty means there is no grant to apply — a lower-minor module, which has no grant seam at
+    /// all. A certification-minor run carries the exact bytes: copied verbatim from the signed role
+    /// entry for a uniform run, or host-derived and bound to the role instance and incarnation for
+    /// per-participant selection. The span the guest sees is **borrowed** and is reclaimed with the
+    /// instance; neither side frees it.
+    pub execution_grant: Vec<u8>,
     /// Run-header channel-table bytes (the Phase-A default table until D0).
     pub channels_bytes: Vec<u8>,
     /// Run-header device-profile bytes.
@@ -170,6 +187,9 @@ impl RunConfig {
             grants,
             manifest_bytes: Vec::new(),
             claim_bytes: Vec::new(),
+            abi_minor: daemon_vhc_abi::DA_ABI_MINOR_V2,
+            resource_plan_bytes: Vec::new(),
+            execution_grant: Vec::new(),
             channels_bytes: Vec::new(),
             device_bytes: Vec::new(),
             max_frame_bytes: 1 << 20,
@@ -313,6 +333,11 @@ pub enum RunEnd {
     MigrateRefused(u32),
     /// The guest trapped (typed, journaled as terminal kind 1); the subprocess survives (§7.6).
     Trapped(Trap),
+    /// `da_apply_execution_grant` returned nonzero on the run instance, so `da_init` never ran.
+    ///
+    /// Carries the module's status verbatim. Deterministic and non-retryable for that
+    /// `(module, plan, grant)` tuple: retrying needs changed admitted input, not a fresh instance.
+    ExecutionGrantRejected(u32),
 }
 
 /// The accepted snapshot an upgrade transaction carries across the module switch (ABI §10.2/§10.3

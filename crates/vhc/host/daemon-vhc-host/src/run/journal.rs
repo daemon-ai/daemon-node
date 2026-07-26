@@ -104,6 +104,18 @@ pub trait JournalSink: Send {
         status: u64,
     ) -> Result<(), SinkError>;
 
+    /// tag 18 — the Execution Grant application result.
+    ///
+    /// Written exactly once after `da_apply_execution_grant` **returns**, whatever the status, and
+    /// before the tag-11 init record. On a trap it is absent and exactly one terminal trap with the
+    /// grant-application context occupies that branch instead; the grammar admits one or the other,
+    /// never both and never neither.
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError>;
+
     /// tag 1 — a delivered event: the exact frame bytes `next_event` returned, with the logical
     /// delivery time. Written before the guest observes the frame (§8.4 rule 4).
     fn event(&mut self, at: u64, frame: &[u8]) -> Result<(), SinkError>;
@@ -219,6 +231,15 @@ impl<S: JournalSink> JournalSink for std::sync::Arc<std::sync::Mutex<S>> {
             .expect("sink lock")
             .init(config_hash, grants_hash, status)
     }
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.lock()
+            .expect("sink lock")
+            .execution_grant(execution_grant_hash, status)
+    }
     fn event(&mut self, at: u64, frame: &[u8]) -> Result<(), SinkError> {
         self.lock().expect("sink lock").event(at, frame)
     }
@@ -314,6 +335,11 @@ pub enum SinkEntry {
     Init {
         status: u64,
     },
+    /// tag 18 — the Execution Grant application result.
+    ExecutionGrant {
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    },
     Event {
         at: u64,
         frame: Vec<u8>,
@@ -389,6 +415,7 @@ impl SinkEntry {
             Self::Terminal { .. } => 9,
             Self::Snapshot { .. } => 10,
             Self::Init { .. } => 11,
+            Self::ExecutionGrant { .. } => daemon_vhc_abi::JOURNAL_TAG_EXECUTION_GRANT,
             Self::SignedFrame { .. } => 12,
             Self::Instantiation { .. } => 13,
             Self::Completion { .. } => 14,
@@ -464,6 +491,18 @@ impl JournalSink for MemorySink {
         status: u64,
     ) -> Result<(), SinkError> {
         self.entries.push(SinkEntry::Init { status });
+        Ok(())
+    }
+
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.entries.push(SinkEntry::ExecutionGrant {
+            execution_grant_hash,
+            status,
+        });
         Ok(())
     }
 

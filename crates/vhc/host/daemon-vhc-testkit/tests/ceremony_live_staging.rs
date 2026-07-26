@@ -206,6 +206,9 @@ impl JournalSink for MeasuringSink {
     fn init(&mut self, _c: [u8; 32], _g: [u8; 32], _status: u64) -> Result<(), SinkError> {
         Ok(())
     }
+    fn execution_grant(&mut self, _hash: [u8; 32], _status: u64) -> Result<(), SinkError> {
+        Ok(())
+    }
     fn event(&mut self, _at: u64, _frame: &[u8]) -> Result<(), SinkError> {
         Ok(())
     }

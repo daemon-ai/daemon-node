@@ -1736,6 +1736,12 @@ fn classify_natural_end(
         Ok(RunEnd::MigrateRefused(code)) => TerminalOutcome::FailedTerminal {
             reason: format!("module refused migration ({code})"),
         },
+        // Terminal, not retryable: the refusal is deterministic for this (module, plan, grant)
+        // tuple, so a fresh instance would reach the same status. Retrying needs changed admitted
+        // input — a different selected configuration — which is a new admission, not a restart.
+        Ok(RunEnd::ExecutionGrantRejected(status)) => TerminalOutcome::FailedTerminal {
+            reason: format!("module refused the execution grant (status {status})"),
+        },
         Ok(RunEnd::Trapped(trap)) => classify_trap(&trap),
         Err(e) => TerminalOutcome::FailedTerminal {
             reason: format!("guest thread: {e}"),

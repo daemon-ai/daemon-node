@@ -69,10 +69,13 @@ fn genesis_wire(old_module: Hash) -> (Vec<u8>, Hash, GenesisEnvelope) {
         roles.insert(
             name.to_string(),
             RoleEntry {
-                // No execution-requirement structure yet: the real one is obtained from the module's own
-                // assessment export per the authoring flow, which is why nothing is hand-authored here.
-                // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
-                execution: None,
+                // A fixture envelope: this exercises paths that have nothing to do with resources, and it
+                // uses the SAME shared trivial construction every compute-free module emits.
+                execution: Some(
+                    daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                        "cpu".to_string(),
+                    ]),
+                ),
                 lane: lane.into(),
                 module: module.into(),
                 abi: "vhc@2".into(),

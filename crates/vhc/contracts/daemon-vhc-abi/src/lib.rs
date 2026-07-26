@@ -644,6 +644,36 @@ pub enum AbiRefusalCode {
     ClaimExceedsPolicy,
     /// Repeated `da_claim` invocations returned different bytes (ABI §9.4 step 7). Reserved for A2.
     ClaimInconsistent,
+    /// `da_resource_plan` returned bytes that are not a well-formed schema-1 Logical Resource Plan:
+    /// a zero or out-of-bounds span, malformed or non-canonical CBOR, unresolved names, or content
+    /// naming a physical backend.
+    LogicalResourcePlanInvalid,
+    /// A well-formed plan breached a declared bound — the byte ceiling, the node or dimension
+    /// count, expression depth, or the derived derivation budget.
+    LogicalResourcePlanExceedsPolicy,
+    /// The plan the module reproduced at join is not the plan the envelope pins, or two
+    /// `da_resource_plan` invocations disagreed.
+    ///
+    /// Deliberately **not** [`AbiRefusalCode::ClaimInconsistent`]: that names a mismatch between
+    /// repeated physical-tier claim results, which is a different object with different semantics.
+    /// Reusing it would silently equate the two.
+    ResourcePlanInconsistent,
+    /// `da_apply_execution_grant` returned a nonzero status. Records the module's `u32` verbatim and
+    /// is deterministic and non-retryable for that `(module, plan, grant)` tuple — a retry requires
+    /// changed admitted input, not a fresh instance.
+    ExecutionGrantRejected,
+    /// The selected composed role Physical Claim breached the participation lane's profile-resolved
+    /// sanity envelope (checked after composition and grant selection, before capability comparison
+    /// and owner authorization).
+    PhysicalClaimExceedsLane,
+    /// The participation lane carries no Physical Claim sanity envelope for the resolved Backend
+    /// Execution Profile, so there is nothing to check the composed claim against.
+    LaneProfileUnsupported,
+    /// No composed Physical Claim is available — a missing, incompatible or unauthenticated Backend
+    /// Execution Profile — so no reservation exists and the admission is refused.
+    ///
+    /// The owner's own cap is never substituted for a figure that was supposed to be derived.
+    ClaimNotComposable,
     /// `switch_module` targets a module without `da_migrate` — always an admission refusal, never a
     /// trap (ABI §1.5, §10.3). Reserved for Phase E; part of the taxonomy now.
     MigrateUnsupported,
@@ -668,6 +698,13 @@ impl AbiRefusalCode {
             Self::GrantsExceedLane => "GrantsExceedLane",
             Self::ClaimExceedsPolicy => "ClaimExceedsPolicy",
             Self::ClaimInconsistent => "ClaimInconsistent",
+            Self::LogicalResourcePlanInvalid => "LogicalResourcePlanInvalid",
+            Self::LogicalResourcePlanExceedsPolicy => "LogicalResourcePlanExceedsPolicy",
+            Self::ResourcePlanInconsistent => "ResourcePlanInconsistent",
+            Self::ExecutionGrantRejected => "ExecutionGrantRejected",
+            Self::PhysicalClaimExceedsLane => "PhysicalClaimExceedsLane",
+            Self::LaneProfileUnsupported => "LaneProfileUnsupported",
+            Self::ClaimNotComposable => "ClaimNotComposable",
             Self::MigrateUnsupported => "MigrateUnsupported",
             Self::CustomOpUnsupported => "CustomOpUnsupported",
         }

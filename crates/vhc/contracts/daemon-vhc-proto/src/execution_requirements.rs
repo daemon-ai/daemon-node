@@ -190,6 +190,40 @@ impl RoleExecutionRequirements {
         })
     }
 
+    /// A role structure over the **canonical trivial plan**, for negative and conformance fixtures.
+    ///
+    /// **This is not a production authoring path and must never become one.** A production role's
+    /// structure is derived from the plan that role's own module emitted through its assessment
+    /// export; the owner withdrew the compute-free carve-out precisely so no second source for a
+    /// derived value exists. What this serves is `[DI-2]`'s fixture exemption: the upgrade
+    /// transaction, the switch-module path, the join refusals and the worker protocol all need a
+    /// *runnable-shaped* envelope to exercise behaviour that has nothing to do with resources, and
+    /// before this member existed they got one for free.
+    ///
+    /// It uses [`LogicalResourcePlan::trivial`] — the same shared construction every compute-free
+    /// module emits — rather than spelling a plan out again, so even the fixture path cannot drift
+    /// from the format.
+    ///
+    /// The `fixture_` prefix is load-bearing: it is what a scan can key on to prove no production
+    /// path calls this.
+    #[must_use]
+    pub fn fixture_over_trivial_plan(allowed_backend_classes: Vec<String>) -> Self {
+        let plan = LogicalResourcePlan::trivial(crate::WASM_GUEST_LINEAR_FLOOR_BYTES);
+        let grant = ExecutionGrant {
+            logical_resource_plan_hash: plan.plan_hash().expect("trivial plan hashes"),
+            scope: SelectionScope::UniformRun,
+            values: std::collections::BTreeMap::new(),
+        };
+        Self::derive(
+            &plan,
+            allowed_backend_classes,
+            ProfileCertificationRequirements::default(),
+            HardwareIndependentMinima::default(),
+            Some(&grant),
+        )
+        .expect("the canonical trivial plan and its empty grant are valid by construction")
+    }
+
     /// Decode and validate the embedded plan, checking the digest and the selection coupling.
     ///
     /// # Errors

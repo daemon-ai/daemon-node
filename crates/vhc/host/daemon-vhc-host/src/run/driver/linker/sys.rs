@@ -131,14 +131,55 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
          -> Result<(), wasmtime::Error> {
             let r: Result<(), Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("log")?;
-                let msg = String::from_utf8_lossy(&read_guest(c, msg_ptr, msg_len)?).into_owned();
+                // [LX-6]: the bounds are applied BEFORE the guest-memory read, and in this order.
+                // The guest-supplied length is untrusted input and MUST NOT size a host allocation,
+                // so a call is admitted or dropped against the phase's call budget using only the
+                // arguments, the raw length is clamped, and only the accepted prefix is read. A host
+                // that reads first and limits afterwards has already spent the memory the limit
+                // exists to protect.
+                let context = c.data().slice.execution_context();
+                let exempt_phase = matches!(
+                    context,
+                    daemon_vhc_abi::ExecutionContext::Init
+                        | daemon_vhc_abi::ExecutionContext::Migrate
+                );
+                if exempt_phase {
+                    let d = c.data_mut();
+                    // A call past either budget is DROPPED — counted, never delivered, never a trap.
+                    // Dropping must never trap: two peers must reach identical decisions whether or
+                    // not either host dropped a line.
+                    if d.slice.log_calls_this_phase >= daemon_vhc_abi::LOG_CALLS_PER_PHASE_MAX {
+                        return Ok(());
+                    }
+                    d.slice.log_calls_this_phase += 1;
+                }
+                let remaining = if exempt_phase {
+                    daemon_vhc_abi::LOG_BYTES_PER_PHASE_MAX
+                        .saturating_sub(c.data().slice.log_bytes_this_phase)
+                } else {
+                    daemon_vhc_abi::LOG_BYTES_PER_PHASE_MAX
+                };
+                let accepted = daemon_vhc_abi::log_accepted_prefix_len(msg_len, remaining);
+                if accepted == 0 {
+                    return Ok(());
+                }
+                // Only now is guest memory touched, and only for the accepted prefix. A pointer
+                // genuinely outside the guest's memory still traps `MemOob`; an absurd length is a
+                // truncation, not a trap, because it was clamped above.
+                let raw = read_guest(c, msg_ptr, accepted)?;
+                if exempt_phase {
+                    c.data_mut().slice.log_bytes_this_phase += u64::from(accepted);
+                }
+                // Lossy conversion and truncation at a character boundary; neither is a trap.
+                let msg = String::from_utf8_lossy(&raw).into_owned();
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
                 // The SDK panic hook's forwarded message (ABI §3.6): hold it aside so the
                 // `unreachable` that follows a beat later traps WITH the message rather than
-                // as an anonymous `GuestPanic` (`take_trap`).
+                // as an anonymous `GuestPanic` (`take_trap`). It is tagged with the context it was
+                // emitted in, and is lifted only into a trap carrying that same context ([LX-10]).
                 if let Some(detail) = msg.strip_prefix(daemon_vhc_abi::GUEST_PANIC_LOG_PREFIX) {
-                    st.guest_panic = Some(detail.to_string());
+                    st.guest_panic = Some((context, detail.to_string()));
                 }
                 st.logs.push((level.min(5), msg));
                 st.note_egress();

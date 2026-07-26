@@ -54,6 +54,10 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
         |mut c: Caller<'_, Host>, buf_ptr: u32, buf_cap: u32| -> Result<u64, wasmtime::Error> {
             let r: Result<u64, Trap> = (|c: &mut Caller<'_, Host>| {
                 c.data_mut().enter("next_event")?;
+                // Asking for the next event ends the slice that was active: from here until the
+                // next delivery the instance is genuinely between slices, and a trap in that window
+                // must not be attributed to the slice that already returned.
+                c.data_mut().slice.slice_ordinal = None;
                 // The bounded-guest-memory MEASUREMENT (the declared-budget evidence surface): wasm
                 // linear memory never shrinks, so its size at the one seam every event slice passes
                 // through is the run's high-water. Recorded here so a run's real footprint is a
@@ -203,6 +207,10 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 d.slice.now = at;
                 d.slice.op_calls = 0;
                 d.slice.readback_bytes = 0;
+                // The slice becomes active here, and its ordinal is the delivery count — so a trap
+                // inside it names the slice it is actually in.
+                d.slice.slice_ordinal = Some(d.slice.slices_delivered);
+                d.slice.slices_delivered = d.slice.slices_delivered.saturating_add(1);
                 if frame.tag == EV_TAG_STOP {
                     d.slice.stopped = true;
                 }

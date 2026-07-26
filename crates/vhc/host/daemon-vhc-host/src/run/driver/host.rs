@@ -46,6 +46,57 @@ pub(crate) struct SliceState {
     /// The already-computed value behind a pending `read_back` retry (§6.4 "the staged value
     /// remains available"): the retry re-delivers the SAME value.
     pub(crate) pending_readback_value: Option<Vec<u8>>,
+    /// Inside `da_run` (set once the run loop is entered).
+    pub(crate) in_run: bool,
+    /// The ordinal of the slice currently active, or `None` between slices.
+    ///
+    /// The four `da_run` states are distinct and a trap that is not inside a slice MUST NOT invent
+    /// one: "before the first event", "between slices" and "after the last slice" are each different
+    /// from "in slice n", and attributing a between-slices trap to the last slice that happened to
+    /// run would point a reader at code that had already returned.
+    pub(crate) slice_ordinal: Option<u64>,
+    /// How many event slices have been delivered. Zero means the first event has not arrived, which
+    /// is what distinguishes "before the first slice" from "between slices".
+    pub(crate) slices_delivered: u64,
+    /// Accepted `sys@2::log` calls in the current exempt phase (`[LX-6]`). Each exempt phase has its
+    /// own independent budget, reset when the phase is entered.
+    pub(crate) log_calls_this_phase: u64,
+    /// Accepted `sys@2::log` bytes in the current exempt phase (`[LX-6]`).
+    pub(crate) log_bytes_this_phase: u64,
+}
+
+impl SliceState {
+    /// The execution context this state represents.
+    ///
+    /// One derivation, at the single point where lifecycle state is known, reused by the diagnostic
+    /// tagging, the panic-detail lift, the trap classification and the journal — because a context
+    /// derived twice is a context that can disagree with itself.
+    pub(crate) fn execution_context(&self) -> daemon_vhc_abi::ExecutionContext {
+        use daemon_vhc_abi::ExecutionContext;
+        if self.in_init {
+            return ExecutionContext::Init;
+        }
+        if self.in_migrate {
+            return ExecutionContext::Migrate;
+        }
+        if !self.in_run {
+            // The run instance exists but its loop has not been entered: the phase it is about to
+            // enter is initialization.
+            return ExecutionContext::Init;
+        }
+        if let Some(ordinal) = self.slice_ordinal {
+            return ExecutionContext::RunSlice(ordinal);
+        }
+        // A consumed stop means no further slice can begin, so this is after the last one.
+        if self.stopped {
+            return ExecutionContext::RunAfterLastSlice;
+        }
+        if self.slices_delivered == 0 {
+            ExecutionContext::RunBeforeFirstSlice
+        } else {
+            ExecutionContext::RunBetweenSlices
+        }
+    }
 }
 
 /// The wasmtime `Store` data for a v2 run instance.
@@ -118,7 +169,17 @@ impl Host {
                 "import after Stop was consumed (§4.4)",
             ));
         }
-        if self.slice.in_init {
+        // The §6.6 temporal-legality rules admit exactly ONE exemption: `sys@2::log`, in `da_init`
+        // and `da_migrate`, on the run instance (`[LX-1]`/`[LX-2]`). It is observational — no
+        // journal record, no state, no digest, no decision — so it introduces nothing the guest
+        // could branch on. Every other capability import remains illegal in those phases.
+        //
+        // The reason this exemption exists at all: a guest that panics or exhausts its linear memory
+        // during initialization or migration otherwise reaches the host as an ANONYMOUS trap, and
+        // arming the forwarding without this exemption would convert the panic into a phase
+        // violation and destroy the very classification the forwarding preserves.
+        let log_exempt = import == "log";
+        if self.slice.in_init && !log_exempt {
             return Err(Trap::new(
                 TrapCode::PhaseViolation,
                 import,
@@ -126,13 +187,26 @@ impl Host {
                 "capability import during da_init (§6.6)",
             ));
         }
-        if self.slice.in_migrate && import != "read_back" {
+        if self.slice.in_migrate && !log_exempt && import != "read_back" {
             return Err(Trap::new(
                 TrapCode::PhaseViolation,
                 import,
                 None,
                 "only read_back(kind = state-section) is legal during da_migrate (§6.6/§10.2)",
             ));
+        }
+        // [LX-9]: a pending mandatory retry MUST NOT convert a `log` call into a protocol violation,
+        // in ANY phase, and a `log` call never satisfies or clears a pending retry. A guest that
+        // panics inside a retry window must still be able to name itself — and a capacity problem is
+        // exactly when a panic is likely.
+        if log_exempt {
+            // [LX-7]: exempt-phase log calls are charged against the per-phase counters only, never
+            // against the per-event-slice operation budget, which is a `da_run` concept with no
+            // meaning before the first slice.
+            if self.slice.in_init || self.slice.in_migrate {
+                return Ok(());
+            }
+            return self.charge_op(import);
         }
         if self.slice.pending_next.is_some() && import != "next_event" {
             return Err(Trap::new(

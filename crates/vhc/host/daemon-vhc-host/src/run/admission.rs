@@ -37,6 +37,8 @@ use daemon_vhc_abi::{
     CLAIM_TIER_KEY_DEVICE, CLAIM_TIER_KEY_HOST, PHASE_A_DEFAULT_CHANNEL_TABLE,
 };
 
+use daemon_vhc_proto::LogicalResourcePlan;
+
 use crate::runtime::Worker;
 use crate::select::{select_driver, Selection};
 
@@ -250,8 +252,13 @@ pub struct Admission {
     pub selection: Selection,
     /// The decoded, bounds-checked claim.
     pub claim: MemoryClaim,
-    /// The claim's verbatim CBOR bytes (byte-identity is part of the contract, §9.2).
+    /// The claim's verbatim CBOR bytes (byte-identity is part of the contract, §9.2). Empty at the
+    /// certification minor, which declares no tiered claim.
     pub claim_bytes: Vec<u8>,
+    /// The canonical Logical Resource Plan bytes the module emitted. Empty below the certification
+    /// minor. These are the bytes the run header records and the bytes a participant's reproduced
+    /// plan is compared against.
+    pub resource_plan_bytes: Vec<u8>,
     /// The manifest's verbatim CBOR bytes.
     pub manifest_bytes: Vec<u8>,
     /// The admitted numeric quotas derived from `lane ∩ envelope role grants` (D0, ABI §2.6 core;
@@ -513,7 +520,7 @@ pub fn admit(
     }
     let module = Module::new(worker.engine(), wasm)
         .map_err(|e| FunnelRefusal::local(4, format!("recompile: {e}")))?;
-    let assessed = assess_instance(worker, &module, config, grants)
+    let assessed = assess_instance(worker, &module, config, grants, selection.minor)
         .map_err(|refusal| FunnelRefusal::typed(4, refusal))?;
 
     // Manifest checks (§9.4 step 6, the Phase-A subset): the ABI echo must match the selection
@@ -566,7 +573,26 @@ pub fn admit(
         .map_err(|refusal| FunnelRefusal::typed(4, refusal))?;
 
     // Claim-vs-lane sanity bounds (§9.3 stage 4 tail: "claim within the lane's claim bounds").
-    let claim = &assessed.claim;
+    //
+    // The gate is MINOR-SELECTED. A lower-minor module keeps the legacy check against its declared
+    // tiers, unchanged. A certification-minor module declares no physical figure at all: the claim
+    // is the host's to compose from the plan and an authenticated Backend Execution Profile, and
+    // until that composition exists on this node there is nothing to reserve — so the admission is
+    // refused rather than falling back to any other figure.
+    let Some(claim) = assessed.claim.as_ref() else {
+        return Err(FunnelRefusal::typed(
+            4,
+            AbiRefusal::new(
+                AbiRefusalCode::ClaimNotComposable,
+                format!(
+                    "the module declares major-2 minor {} and emitted a Logical Resource Plan, but \
+                     this node has no authenticated Backend Execution Profile to compose a \
+                     Physical Claim with; no claim means no reservation and no admission",
+                    selection.minor
+                ),
+            ),
+        ));
+    };
     let dt = claim.device_total();
     let ht = claim.host_total();
     let [dmin, dmax] = lane.claim_bounds_device;
@@ -616,8 +642,9 @@ pub fn admit(
 
     Ok(Admission {
         selection,
-        claim: assessed.claim,
+        claim: claim.clone(),
         claim_bytes: assessed.claim_bytes,
+        resource_plan_bytes: assessed.resource_plan_bytes,
         manifest_bytes: assessed.manifest_bytes,
         quotas,
     })
@@ -625,8 +652,15 @@ pub fn admit(
 
 /// What the restricted assessment instance yielded (§9.2/§9.4 steps 4–7).
 struct Assessed {
-    claim: MemoryClaim,
+    /// The legacy tiered claim. `None` at the certification minor, where `da_resource_plan`
+    /// replaces `da_claim` in the assessment sequence and the physical figures are the host's to
+    /// compose rather than the guest's to declare.
+    claim: Option<MemoryClaim>,
     claim_bytes: Vec<u8>,
+    /// The canonical Logical Resource Plan. `Some` exactly at the certification minor.
+    resource_plan: Option<LogicalResourcePlan>,
+    /// Its canonical bytes, as returned by the module.
+    resource_plan_bytes: Vec<u8>,
     manifest_bytes: Vec<u8>,
     manifest_abi: u64,
     manifest_channels: Vec<u64>,
@@ -645,10 +679,19 @@ fn assess_instance(
     module: &Module,
     config: &[u8],
     grants: &[u8],
+    declared_minor: u32,
 ) -> Result<Assessed, AbiRefusal> {
+    let certification = declared_minor >= daemon_vhc_abi::CERTIFICATION_MINOR_V2;
     let mut store: Store<()> = Store::new(worker.engine(), ());
     store
-        .set_fuel(ASSESS_FUEL)
+        // Plan derivation is capability-, compute-, allocation- and execution-free, so its budget is
+        // analytic: a fixed base plus a bounded cost per plan node and per output byte, under an
+        // absolute ceiling. The ceiling is what can be armed before the plan exists.
+        .set_fuel(if certification {
+            daemon_vhc_proto::PLAN_DERIVATION_FUEL_CEILING
+        } else {
+            ASSESS_FUEL
+        })
         .map_err(|e| AbiRefusal::new(AbiRefusalCode::BadModule, format!("fuel seeding: {e}")))?;
     store.set_epoch_deadline(worker.epoch_ticks_pub());
 
@@ -720,13 +763,47 @@ fn assess_instance(
     )?;
     let (manifest_abi, manifest_channels, manifest_custom_ops) = decode_manifest(&manifest_bytes)?;
 
-    // da_claim — twice, byte-identical, deterministic (§9.2): `ClaimInconsistent` on divergence.
     let args = [
         cfg_ptr,
         config.len() as u32,
         grants_ptr,
         grants.len() as u32,
     ];
+
+    // The assessment export is selected by the module's DECLARED MINOR, not by what it happens to
+    // export. A certification-minor module still exports `da_claim` — the rung is additive — and the
+    // host simply does not call it; a lower-minor module keeps the legacy path unchanged and must
+    // continue to be admitted under its existing contract.
+    if certification {
+        // Twice, byte-identical: the plan is a deterministic function of the configuration and the
+        // Capability Grants. A mismatch is `ResourcePlanInconsistent` and NOT `ClaimInconsistent` —
+        // those name different objects, and equating them would reinterpret old evidence.
+        let resource_plan_bytes = call_resource_plan_export(&instance, &mut store, &args)?;
+        let plan_again = call_resource_plan_export(&instance, &mut store, &args)?;
+        if resource_plan_bytes != plan_again {
+            return Err(AbiRefusal::new(
+                AbiRefusalCode::ResourcePlanInconsistent,
+                format!(
+                    "repeated da_resource_plan invocations returned different bytes ({} vs {})",
+                    resource_plan_bytes.len(),
+                    plan_again.len()
+                ),
+            ));
+        }
+        let plan = decode_resource_plan(&resource_plan_bytes)?;
+        return Ok(Assessed {
+            claim: None,
+            claim_bytes: Vec::new(),
+            resource_plan: Some(plan),
+            resource_plan_bytes,
+            manifest_bytes,
+            manifest_abi,
+            manifest_channels,
+            manifest_custom_ops,
+        });
+    }
+
+    // da_claim — twice, byte-identical, deterministic (§9.2): `ClaimInconsistent` on divergence.
     let claim_bytes = call_cbor_export(&instance, &mut store, "da_claim", &args)?;
     let claim_again = call_cbor_export(&instance, &mut store, "da_claim", &args)?;
     if claim_bytes != claim_again {
@@ -742,14 +819,154 @@ fn assess_instance(
     let claim = decode_claim(&claim_bytes)?;
 
     Ok(Assessed {
-        claim,
+        claim: Some(claim),
         claim_bytes,
+        resource_plan: None,
+        resource_plan_bytes: Vec::new(),
         manifest_bytes,
         manifest_abi,
         manifest_channels,
         manifest_custom_ops,
     })
     // `store` drops here — the assessment instance is discarded, never promoted (§9.2).
+}
+
+/// Call `da_resource_plan` and copy out its canonical bytes, with the ratified ownership and
+/// ceiling discipline (`[RC-12]`).
+///
+/// The order is normative and each step's failure mode differs:
+///
+/// 1. **The export traps** → the assessment-trap classification stands and the instance is
+///    discarded. The host MUST NOT attempt `da_free` after a trapping export: the allocation's
+///    state is unknown and a free against a guessed layout is worse than a leak in a store that is
+///    about to drop.
+/// 2. **The returned length exceeds the byte ceiling** → refused **without reading it**, instance
+///    discarded, and again no free: the host never guesses a layout for a span it has rejected.
+/// 3. **The span is zero or out of bounds** → `LogicalResourcePlanInvalid`, discarded, no free.
+/// 4. **The span is valid** → copy at most the ceiling, then free **exactly once** with the
+///    identical `(len, 1)` layout the SDK allocated with — even when the copied bytes are
+///    subsequently refused, because ownership does not depend on whether the content was any good.
+///    A trap inside that free refuses assessment and discards the instance.
+fn call_resource_plan_export(
+    instance: &wasmtime::Instance,
+    store: &mut Store<()>,
+    args: &[u32; 4],
+) -> Result<Vec<u8>, AbiRefusal> {
+    let export = daemon_vhc_abi::DA_RESOURCE_PLAN_EXPORT;
+    let packed = instance
+        .get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, export)
+        .map_err(|_| {
+            AbiRefusal::new(
+                AbiRefusalCode::BadModule,
+                format!("missing/mis-typed `{export}` at the certification minor"),
+            )
+        })?
+        .call(&mut *store, (args[0], args[1], args[2], args[3]))
+        .map_err(|e| deny_or_bad(e, store))?;
+
+    let (ptr, len) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as usize);
+
+    // Step 2: the ceiling is checked BEFORE the read. The guest-supplied length is untrusted input
+    // and must not size a host allocation.
+    if len > daemon_vhc_proto::LOGICAL_RESOURCE_PLAN_BYTES_MAX {
+        return Err(AbiRefusal::new(
+            AbiRefusalCode::LogicalResourcePlanExceedsPolicy,
+            format!(
+                "`{export}` returned {len} bytes, above the {} ceiling; refused without reading \
+                 the span and without freeing it",
+                daemon_vhc_proto::LOGICAL_RESOURCE_PLAN_BYTES_MAX
+            ),
+        ));
+    }
+    if ptr == 0 || len == 0 {
+        return Err(AbiRefusal::new(
+            AbiRefusalCode::LogicalResourcePlanInvalid,
+            format!("`{export}` returned an empty span"),
+        ));
+    }
+
+    // Step 3/4: validate the span, then copy.
+    let memory = instance
+        .get_memory(&mut *store, "memory")
+        .ok_or_else(|| AbiRefusal::new(AbiRefusalCode::BadModule, "no exported memory"))?;
+    let start = ptr as usize;
+    let copied = memory
+        .data(&*store)
+        .get(start..start + len)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            AbiRefusal::new(
+                AbiRefusalCode::LogicalResourcePlanInvalid,
+                format!("`{export}` returned an out-of-bounds span"),
+            )
+        })?;
+
+    // The span is guest-owned and is freed exactly once, with the identical layout the SDK
+    // allocated with.
+    let free = instance
+        .get_typed_func::<(u32, u32, u32), ()>(&mut *store, "da_free")
+        .map_err(|_| AbiRefusal::new(AbiRefusalCode::BadModule, "missing/mis-typed da_free"))?;
+    free.call(&mut *store, (ptr, len as u32, 1))
+        .map_err(|e| deny_or_bad(e, store))?;
+
+    Ok(copied)
+}
+
+/// Decode and fully validate a Logical Resource Plan, mapping its refusal onto the typed admission
+/// taxonomy: a malformed, non-canonical, unresolved or physically-contaminated plan is
+/// `LogicalResourcePlanInvalid`, and a bound breach is `LogicalResourcePlanExceedsPolicy`.
+fn decode_resource_plan(bytes: &[u8]) -> Result<LogicalResourcePlan, AbiRefusal> {
+    LogicalResourcePlan::decode_canonical(bytes).map_err(|refusal| {
+        let code = match refusal {
+            daemon_vhc_proto::PlanRefusal::Invalid(_) => AbiRefusalCode::LogicalResourcePlanInvalid,
+            daemon_vhc_proto::PlanRefusal::ExceedsPolicy(_) => {
+                AbiRefusalCode::LogicalResourcePlanExceedsPolicy
+            }
+        };
+        AbiRefusal::new(code, refusal.detail().to_string())
+    })
+}
+
+/// Obtain a module's canonical Logical Resource Plan through its own assessment path — the seam
+/// authoring uses (`[DI-8]` step 2).
+///
+/// This is the *only* way a plan comes into existence. Authoring runs the module the envelope pins,
+/// on the canonical configuration and Capability Grants, and embeds what the module emitted. There
+/// is deliberately no second path: a hand-authored plan would be a value maintained in two places,
+/// able to drift when the schema or encoding changes, and a route by which authoring could pin a
+/// plan the module never produced.
+///
+/// # Errors
+/// [`AbiRefusal`] if the module cannot be compiled, does not declare the certification minor, or its
+/// plan does not check out.
+pub fn assess_resource_plan(
+    worker: &Worker,
+    wasm: &[u8],
+    config: &[u8],
+    grants: &[u8],
+) -> Result<(LogicalResourcePlan, Vec<u8>), AbiRefusal> {
+    let selection = select_driver(worker, wasm, None)?;
+    if selection.minor < daemon_vhc_abi::CERTIFICATION_MINOR_V2 {
+        return Err(AbiRefusal::new(
+            AbiRefusalCode::AbiDeclarationMismatch,
+            format!(
+                "the module declares major-2 minor {}, below the certification minor {}; only a \
+                 certification-minor module emits a Logical Resource Plan",
+                selection.minor,
+                daemon_vhc_abi::CERTIFICATION_MINOR_V2
+            ),
+        ));
+    }
+    let module = Module::new(worker.engine(), wasm)
+        .map_err(|e| AbiRefusal::new(AbiRefusalCode::BadModule, format!("compile: {e}")))?;
+    let assessed = assess_instance(worker, &module, config, grants, selection.minor)?;
+    let plan = assessed.resource_plan.ok_or_else(|| {
+        AbiRefusal::new(
+            AbiRefusalCode::LogicalResourcePlanInvalid,
+            "assessment produced no Logical Resource Plan",
+        )
+    })?;
+    Ok((plan, assessed.resource_plan_bytes))
 }
 
 /// Map an assessment-time wasm error into a typed refusal. A deny-stub trap
@@ -1060,6 +1277,11 @@ mod tests {
         roles.insert(
             "worker".to_string(),
             daemon_vhc_proto::RoleEntry {
+                execution: Some(
+                    daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                        "cpu".to_string(),
+                    ]),
+                ),
                 lane: "trainer".into(),
                 module: "worker-mod".into(),
                 abi: "vhc@2".into(),
@@ -1071,6 +1293,11 @@ mod tests {
         roles.insert(
             "coordinator".to_string(),
             daemon_vhc_proto::RoleEntry {
+                execution: Some(
+                    daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                        "cpu".to_string(),
+                    ]),
+                ),
                 lane: "coordinator".into(),
                 module: "coord-mod".into(),
                 abi: "vhc@2".into(),
@@ -1153,6 +1380,7 @@ mod tests {
             granted_artifacts: [daemon_vhc_proto::Hash([7u8; 32])].into_iter().collect(),
         };
         let admission = Admission {
+            resource_plan_bytes: Vec::new(),
             selection: Selection {
                 driver: CandidateDriver::V2,
                 major: 2,
