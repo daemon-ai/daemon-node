@@ -34,7 +34,10 @@ pub use migrate::{
     build_manifest, MigrateState, MigrationDescriptor, MigrationSection, OwnedSection, SectionDecl,
     SectionReader, SimSections, StateManifest,
 };
-pub use module::{derive_claim, manifest_bytes, GuestModule, ModuleDecl};
+pub use module::{
+    derive_claim, manifest_bytes, ExecutionGrant, GuestModule, LogicalResourcePlan, ModuleDecl,
+    CERTIFICATION_MINOR_V2,
+};
 
 /// Report a peer's per-round outcome — the post-ingest det digest plus the barrier's
 /// committed / ingested / stalled bookkeeping — through the host METRIC ABI, under the reserved
@@ -112,13 +115,10 @@ macro_rules! main {
             pub extern "C" fn da_abi() -> u32 {
                 // The declaration is cross-checked against the import shape at selection
                 // (ABI §1.3 step 5): the declared minor must cover every imported symbol's
-                // introducing minor — and, for the certification minor, the BEHAVIORAL dependency
-                // the import shape cannot see (pre-loop panic forwarding), which
-                // `declared_abi_minor` folds in from the same predicate that arms it.
-                (2 << 16)
-                    | $crate::module::declared_abi_minor(
-                        <$module as $crate::module::GuestModule>::decl().abi_minor,
-                    )
+                // introducing minor. At the certification rung it additionally covers a
+                // BEHAVIORAL dependency the import shape cannot see — pre-loop panic forwarding —
+                // which the SDK arms from this same declared value and nothing else.
+                (2 << 16) | <$module as $crate::module::GuestModule>::decl().abi_minor
             }
 
             #[no_mangle]
@@ -157,6 +157,71 @@ macro_rules! main {
                 $crate::module::rt::emit_cbor(&$crate::module::derive_claim(&decl))
             }
 
+            /// The certification rung's assessment export: the module's Logical Resource Plan
+            /// for this configuration, as canonical bytes the host copies out and frees.
+            ///
+            /// The returned span is GUEST-owned and obtained with exactly `da_alloc(len, 1)`, so
+            /// the host can free it with the identical layout. Handing back a slice into a
+            /// differently aligned or excess-capacity allocation would leave the host guessing a
+            /// layout, which is why the span is built here rather than borrowed from the encoder.
+            /// A zero span is the refusal: the host reads no bytes and discards the instance.
+            ///
+            /// # Safety
+            /// The host writes the config + grants spans before the call.
+            #[no_mangle]
+            pub unsafe extern "C" fn da_resource_plan(
+                cfg_ptr: u32,
+                cfg_len: u32,
+                grants_ptr: u32,
+                grants_len: u32,
+            ) -> u64 {
+                let read = |ptr: u32, len: u32| -> Vec<u8> {
+                    if len == 0 {
+                        ::std::vec::Vec::new()
+                    } else {
+                        ::std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec()
+                    }
+                };
+                let config = read(cfg_ptr, cfg_len);
+                let grants = read(grants_ptr, grants_len);
+                let Ok(plan) =
+                    <$module as $crate::module::GuestModule>::resource_plan(&config, &grants)
+                else {
+                    return 0;
+                };
+                let Ok(bytes) = plan.to_canonical_bytes() else {
+                    return 0;
+                };
+                $crate::module::rt::emit_cbor(&bytes)
+            }
+
+            /// The certification rung's pre-initialization input: the logical configuration the
+            /// host selected out of the plan's bounded choice sets.
+            ///
+            /// The span is HOST-written and BORROWED for the call, on the same convention as the
+            /// configuration and capability grants: decode it here and keep the value, never the
+            /// pointer. Neither side frees it — it is reclaimed with the instance.
+            ///
+            /// # Safety
+            /// The host writes the grant span before the call and keeps it alive for its duration.
+            #[no_mangle]
+            pub unsafe extern "C" fn da_apply_execution_grant(ptr: u32, len: u32) -> u32 {
+                let bytes = if len == 0 {
+                    ::std::vec::Vec::new()
+                } else {
+                    ::std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec()
+                };
+                let Ok(grant) = $crate::module::ExecutionGrant::decode_canonical(&bytes) else {
+                    return 1;
+                };
+                let status =
+                    <$module as $crate::module::GuestModule>::apply_execution_grant(&grant);
+                if status == 0 {
+                    $crate::module::rt::retain_execution_grant(grant);
+                }
+                status
+            }
+
             /// # Safety
             /// The host writes both spans before the call (ABI §2.3/§9.4 step 11).
             #[no_mangle]
@@ -169,8 +234,10 @@ macro_rules! main {
                 // Arm panic forwarding before the module's own logic can panic — initialization
                 // allocates the state plane, and a wasm allocation failure aborts through the
                 // panic path, so this hook is the last moment the message exists. Inert below the
-                // certification minor, where the pre-loop call would be a phase violation.
-                $crate::module::rt::arm_pre_loop_diagnostics();
+                // certification rung, where the pre-loop call would be a phase violation.
+                $crate::module::rt::arm_pre_loop_diagnostics(
+                    <$module as $crate::module::GuestModule>::decl().abi_minor,
+                );
                 let read = |ptr: u32, len: u32| -> Vec<u8> {
                     if len == 0 {
                         Vec::new()
@@ -208,7 +275,9 @@ macro_rules! main {
                 // Migration reconstructs the state plane: the same pre-loop phase, the same
                 // reason (see `da_init`). Guarded by the same `Once`, so this is a no-op when
                 // initialization already armed it.
-                $crate::module::rt::arm_pre_loop_diagnostics();
+                $crate::module::rt::arm_pre_loop_diagnostics(
+                    <$module as $crate::module::GuestModule>::decl().abi_minor,
+                );
                 let bytes = ::std::slice::from_raw_parts(
                     descriptor_ptr as *const u8,
                     descriptor_len as usize,

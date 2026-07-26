@@ -408,31 +408,24 @@ pub const STATE_MINOR_V2: u32 = 3;
 /// `create_from` precedent).
 pub const BUFFER_STAGE_MINOR_V2: u32 = 4;
 
-/// The **certification minor**: the major-2 minor at which observational `sys@2::log` becomes
-/// legal during `da_init` and `da_migrate`, and at which the resource-plan and execution-grant
-/// exports are required.
-///
-/// This rung is unlike every rung below it in one respect that the declaration machinery has to be
-/// told about explicitly: its floor is **behavioral, not derivable from the import shape**.
-/// [`required_v2_minor`] computes the minimum a module must declare from the introducing minors of
-/// the symbols it imports, and `sys@2::log` keeps its own original introducing minor — the symbol
-/// is unchanged, only *when a conforming host accepts a call to it* changes. A module that logs
-/// before its event loop is therefore relying on host behavior that `required_v2_minor` cannot
-/// see, so the SDK raises the declared minor to this rung whenever it arms that forwarding
-/// ([`pre_loop_log_legal`]). Getting that coupling wrong in the permissive direction is precisely
-/// the failure the rung exists to prevent: on a host implementing a lower minor, the guest's legal
-/// pre-loop log call becomes a `PhaseViolation` at initialization — an anonymous trap, which is the
-/// outcome the exemption was introduced to abolish. With the declaration raised, the same skew is
-/// instead the existing typed too-new admission refusal, which names the minor.
-///
-/// A host implements this rung only when it implements ALL of it — the logging semantics and both
-/// resource exports land together or not at all — so [`DA_ABI_MINOR_V2`] reaching this value is
-/// what makes the behavior real, and is the single condition every consumer keys on.
-pub const CERTIFICATION_MINOR_V2: u32 = 5;
-
 /// Whether a host implementing major-2 minor `host_minor` accepts observational `sys@2::log`
-/// during `da_init`/`da_migrate` — the one predicate the SDK's pre-loop arming and the module's
-/// declared minor are BOTH derived from, so they cannot disagree.
+/// during `da_init` and `da_migrate`.
+///
+/// The certification rung is unlike every rung below it in one respect the declaration machinery
+/// has to be told about explicitly: its logging floor is **behavioral, not derivable from the
+/// import shape**. [`required_v2_minor`] computes the minimum a module must declare from the
+/// introducing minors of the symbols it imports, and `sys@2::log` keeps its own original
+/// introducing minor — the symbol is unchanged; only *when a conforming host accepts a call to it*
+/// changes. A module that logs before its event loop is therefore relying on host behavior
+/// `required_v2_minor` cannot see.
+///
+/// This predicate is the single condition both consequences are derived from: the SDK arms
+/// pre-loop panic forwarding exactly when it holds, and raises the module's declared minor by the
+/// same test, so the two cannot disagree. Getting that coupling wrong in the permissive direction
+/// is precisely the failure the rung exists to prevent — on a host implementing a lower minor the
+/// guest's legal pre-loop log call becomes a `PhaseViolation` at initialization, an anonymous trap,
+/// which is the outcome the exemption abolishes. With the declaration raised, the same skew is
+/// instead the existing typed too-new admission refusal, which names the minor.
 #[must_use]
 pub const fn pre_loop_log_legal(host_minor: u32) -> bool {
     host_minor >= CERTIFICATION_MINOR_V2

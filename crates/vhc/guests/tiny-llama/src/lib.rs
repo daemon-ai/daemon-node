@@ -55,6 +55,7 @@
 //! deferred-voice shape as the retired bridge trainer's held commit.
 
 mod model;
+mod plan;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -70,8 +71,8 @@ use daemon_vhc_proto::genesis::{StateContract, StateInit};
 use daemon_vhc_proto::{blake3_hash, from_canonical_slice, to_canonical_vec, Hash, PeerId, Seed};
 use daemon_vhc_proto::{IrohId, StateDigest};
 use daemon_vhc_sdk::{
-    GuestModule, MigrationDescriptor, MigrationSection, ModuleDecl, SectionDecl, SectionReader,
-    SequenceSlice, StateManifest,
+    GuestModule, LogicalResourcePlan, MigrationDescriptor, MigrationSection, ModuleDecl,
+    SectionDecl, SectionReader, SequenceSlice, StateManifest,
 };
 use daemon_vhc_sdk_compute::{export_tensor, fence, AutodiffHostBackend, HostBackend};
 use daemon_vhc_sdk_consensus::digest::DigestCarry;
@@ -166,6 +167,16 @@ const MIGRATE_INCOMPATIBLE_SECTIONS: u32 = 16;
 /// compression profile.
 ///
 /// The codes are module-defined and disjoint from the `da_migrate` detail codes above.
+/// `da_resource_plan` refusals: the configuration did not decode, or the derived plan failed the
+/// module's own copy of admission's checks. Both are module defects surfaced at the derivation
+/// site rather than one layer away.
+const PLAN_CONFIG_UNDECODABLE: u32 = 1;
+const PLAN_SELF_CHECK_FAILED: u32 = 2;
+
+/// `da_apply_execution_grant` refusal: the grant does not name the one dimension this module left
+/// free, so there is no selected micro-batch to run at.
+const GRANT_MICRO_BATCH_MISSING: u32 = 16;
+
 const OUTCOME_CORPUS_MANIFEST_INVALID: u32 = 32;
 const OUTCOME_CORPUS_RANGE_INVALID: u32 = 33;
 const OUTCOME_ROUND_WINDOW_UNPLANNABLE: u32 = 34;
@@ -533,18 +544,28 @@ impl GuestModule for TinyLlama {
         ModuleDecl {
             name: "tiny-llama",
             version: env!("CARGO_PKG_VERSION"),
-            // The incremental buffer-staging trio (buffer_open/append/seal) is the highest
-            // introducing minor this module imports, so it fixes the declaration at 4 (ABI §1.3
-            // step 5); the det-state write surface + register_state_chunks sit below it at 3.
-            abi_minor: 4,
+            // The certification rung. The import shape alone would fix this at 4 (the
+            // incremental buffer-staging trio is the highest introducing minor this module
+            // imports), but this module also emits a Logical Resource Plan, consumes an
+            // Execution Grant before initialization, and forwards a panic from inside
+            // `da_init` — three behavioral dependencies on the host that the import shape cannot
+            // see. Declaring the rung is what makes a host that does not implement them refuse
+            // this module by name instead of trapping it at initialization.
+            abi_minor: daemon_vhc_sdk::CERTIFICATION_MINOR_V2,
             channels: vec![0],
             // The config-independent fallback (a harness that hands no decodable config). The
             // honest, geometry-derived figures are `decl_for_config` below — this module's
             // footprint is a function of the run it is admitted for, not a constant.
             host_state_bytes: 16 << 20,
             host_scratch_bytes: 16 << 20,
-            device_state_bytes: 32 << 20,
-            device_scratch_bytes: 32 << 20,
+            // NO DEVICE PHYSICS. This module states what its algorithm needs in logical terms and
+            // nothing else: its device demand is the tensor terms of its Logical Resource Plan,
+            // priced by the host against the certified profile for the backend the machine will
+            // actually use. The two figures that used to sit here were a guess about hardware the
+            // module is forbidden to know about, and they would have had to move whenever a
+            // driver did.
+            device_state_bytes: 0,
+            device_scratch_bytes: 0,
         }
     }
 
@@ -632,6 +653,44 @@ impl GuestModule for TinyLlama {
         decl.host_scratch_bytes =
             total_rows * stride + (total_rows * k * idx_bits).div_ceil(8) + HEADER_BYTES;
         decl
+    }
+
+    /// Derive this configuration's Logical Resource Plan. Symbolic throughout: it allocates no
+    /// tensor, runs no model and touches no capability — the numbers are formulas over the
+    /// admitted geometry, and the one dimension left free is the micro-batch.
+    fn resource_plan(config: &[u8], _capability_grants: &[u8]) -> Result<LogicalResourcePlan, u32> {
+        let Ok(cfg) = from_canonical_slice::<GuestCfg>(config) else {
+            return Err(PLAN_CONFIG_UNDECODABLE);
+        };
+        let decl = Self::decl_for_config(config);
+        let numels: Vec<u64> = cfg.model.param_numels().iter().map(|&n| n as u64).collect();
+        let chunks = daemon_vhc_proto::det_state::family_chunk_count(&numels, cfg.state.chunk_size);
+        let bookkeeping = 4 * chunks * 32 + numels.len() as u64 * 256;
+        let plan = plan::derive(
+            &cfg.model,
+            cfg.micro_batch,
+            cfg.steps_per_round,
+            cfg.state.chunk_size,
+            bookkeeping,
+            MODULE_BASELINE_BYTES,
+        );
+        let _ = decl;
+        // Refuse a plan this module would not stand behind rather than hand the host something it
+        // has to reject: the checks are the same ones admission runs, so a defect surfaces here,
+        // at its derivation site, instead of as an opaque refusal one layer away.
+        if plan.validate().is_err() {
+            return Err(PLAN_SELF_CHECK_FAILED);
+        }
+        Ok(plan)
+    }
+
+    /// Accept the host's selected logical configuration. The module offered a micro-batch range;
+    /// the grant names the value inside it that the machine can take. Nothing physical crosses.
+    fn apply_execution_grant(grant: &daemon_vhc_sdk::ExecutionGrant) -> u32 {
+        match grant.values.get(plan::DIM_MICRO_BATCH) {
+            Some(daemon_vhc_proto::execution_grant::GrantValue::Uint(v)) if *v >= 1 => 0,
+            _ => GRANT_MICRO_BATCH_MISSING,
+        }
     }
 
     fn init(config: &[u8], _grants: &[u8]) -> Result<Self, u32> {
@@ -2147,6 +2206,15 @@ fn drive_update_completion(
 }
 
 #[allow(clippy::too_many_lines)]
+/// The micro-batch the host selected, if an Execution Grant was applied to this instance.
+fn granted_micro_batch() -> Option<u32> {
+    let grant = daemon_vhc_sdk::module::rt::execution_grant()?;
+    match grant.values.get(plan::DIM_MICRO_BATCH)? {
+        daemon_vhc_proto::execution_grant::GrantValue::Uint(v) => u32::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
 fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
     let numels = cfg.model.param_numels();
     let vocab = cfg.model.vocab;
@@ -2233,11 +2301,17 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
     if let Some(b) = boot.as_mut() {
         b.manifest_op = Some(daemon_vhc_sdk::data_fetch(&b.manifest.0, 0, 0));
     }
+    // The micro-batch is the one dimension this module leaves free. Where an Execution Grant was
+    // applied, the host has already priced the offered range against the machine and selected a
+    // value inside it, and that selection is what the run's admitted record names — so it is what
+    // the round plans on. Without a grant (a harness, or a host below the certification rung) the
+    // authored value stands, which is the same value the offered range tops out at.
+    let micro_batch = granted_micro_batch().unwrap_or(cfg.micro_batch);
     let round_cfg = RoundCfg {
         peer: cfg.peer,
         roster: cfg.roster.clone(),
         steps_per_round: cfg.steps_per_round,
-        micro_batch: cfg.micro_batch,
+        micro_batch,
         stall_rounds_max: cfg.stall_rounds_max,
     };
     let mut driver: BarrierRound<C3Round, HostStaged> =
