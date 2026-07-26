@@ -45,19 +45,22 @@ pub const DEVICE_CAPABILITY_REPORT_SCHEMA: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceMemorySource {
-    /// The Windows local-budget query for this adapter.
-    DxgiLocalBudget,
-    /// The Metal recommended working-set size.
-    MetalRecommendedWorkingSet,
-    /// A conservative derivation for a Linux unified-memory device, from the platform's own
-    /// memory-budget facts.
+    /// The platform stated a **stable** budget for this process, and it was used as stated.
     ///
-    /// Named separately because the obvious reading is wrong on this class of device: the driver's
-    /// carve-out on a unified-memory part is not a statement of what the device may use, and reading
-    /// it as one under-reports the supply by most of the machine's memory.
-    LinuxUnifiedMemoryBudget,
-    /// The CUDA driver's device-total query.
-    CudaDeviceTotal,
+    /// Reserved for a platform figure that is a property of the device and the OS build rather than of
+    /// the moment. A budget that moves with co-tenant pressure is not this: it is pressure, it belongs
+    /// to the governor, and no arm currently qualifies — Linux's heap budget and the Windows local
+    /// budget are both documented-dynamic, and both are recorded beside the report instead.
+    PlatformStatedBudget,
+    /// The validated static derivation for a unified device: the dedicated carve-out plus most of the
+    /// shared pool, clamped by physical RAM and by the heap the backend advertises.
+    ///
+    /// The obvious reading is wrong on this class of device — the driver's carve-out on a unified part
+    /// is not a statement of what the device may use, and reading it as one under-reports the supply by
+    /// most of the machine's memory.
+    UnifiedStaticDerivation,
+    /// A discrete device's dedicated memory, which for a discrete card *is* the budget.
+    DedicatedDeviceMemory,
 }
 
 /// How much of this device is **usable supply**, as measured on the node that has it.
@@ -80,8 +83,24 @@ pub enum DeviceMemorySource {
 pub struct DeviceMemorySupply {
     /// Usable device memory in bytes, conservatively derived.
     pub usable_bytes: u64,
-    /// Which host derivation produced it. No variant admits a human-supplied figure.
+    /// Which **derivation** produced it. No variant admits a human-supplied figure.
+    ///
+    /// A derivation, not a platform. The source used to be picked from the platform before the
+    /// derivation branched, so a report read the same whether the platform had stated the figure or our
+    /// arithmetic had hit a clamp — one name for two different provenances, which is the defect class
+    /// that also put one lane's adapter identity in another lane's record. The platform is a separate
+    /// member and the clamps below say which bound actually bit.
     pub source: DeviceMemorySource,
+    /// Whose facts the derivation read.
+    pub platform: SupplyPlatform,
+    /// Whether the physical-RAM clamp is what bound the figure.
+    ///
+    /// Recorded because a clamp that bites is the difference between a derivation and a limit: a
+    /// variable-graphics-memory part whose figure came out at exactly physical RAM was clamped, not
+    /// measured, and a reader comparing two boxes should be able to see that without re-deriving.
+    pub ram_clamp_bound: bool,
+    /// Whether the backend's advertised device heap is what bound the figure.
+    pub device_heap_clamp_bound: bool,
 }
 
 /// The platform whose facts a supply derivation is reading.
@@ -172,54 +191,74 @@ const SHARED_POOL_CLAIMABLE_PERCENT: u64 = 90;
 /// 4. **Nothing**, typed, which fails closed.
 #[must_use]
 pub fn derive_device_supply(facts: &HostDeviceFacts) -> Maybe<DeviceMemorySupply> {
-    let source = match facts.platform {
-        SupplyPlatform::Windows => DeviceMemorySource::DxgiLocalBudget,
-        SupplyPlatform::Macos => DeviceMemorySource::MetalRecommendedWorkingSet,
-        SupplyPlatform::Linux => DeviceMemorySource::LinuxUnifiedMemoryBudget,
-        SupplyPlatform::Cuda => DeviceMemorySource::CudaDeviceTotal,
-    };
-    let ram_clamp = |bytes: u64| {
-        // Only a unified device competes with the host for one pool; clamping a discrete card by host
-        // RAM would under-report a card with more memory than the box.
-        if facts.unified && facts.host_ram_bytes > 0 {
-            bytes.min(facts.host_ram_bytes)
-        } else {
-            bytes
+    let ram_ceiling = (facts.unified && facts.host_ram_bytes > 0).then_some(facts.host_ram_bytes);
+    let heap_ceiling = facts.advertised_device_heap_bytes.filter(|h| *h > 0);
+    // Which ceiling bit is recorded, not just applied: a figure that came out at exactly a ceiling was
+    // clamped rather than derived, and a reader comparing two boxes should not have to re-derive to
+    // learn that.
+    let clamp = |bytes: u64| {
+        let mut out = bytes;
+        let mut ram_bound = false;
+        let mut heap_bound = false;
+        if let Some(ram) = ram_ceiling {
+            if out > ram {
+                out = ram;
+                ram_bound = true;
+            }
         }
+        if let Some(heap) = heap_ceiling {
+            if out > heap {
+                out = heap;
+                heap_bound = true;
+                // A RAM clamp that was itself clamped away did not bind the answer.
+                ram_bound = false;
+            }
+        }
+        (out, ram_bound, heap_bound)
+    };
+    let supply = |usable_bytes: u64, source, (ram_clamp_bound, device_heap_clamp_bound)| {
+        Maybe::Available(DeviceMemorySupply {
+            usable_bytes,
+            source,
+            platform: facts.platform,
+            ram_clamp_bound,
+            device_heap_clamp_bound,
+        })
     };
 
     if let Some(budget) = facts.platform_budget_bytes.filter(|b| *b > 0) {
-        return Maybe::Available(DeviceMemorySupply {
-            usable_bytes: ram_clamp(budget),
-            source,
-        });
+        let (usable, ram_bound, heap_bound) = clamp(budget);
+        return supply(
+            usable,
+            DeviceMemorySource::PlatformStatedBudget,
+            (ram_bound, heap_bound),
+        );
     }
-
-    let heap_clamp = |bytes: u64| match facts.advertised_device_heap_bytes.filter(|h| *h > 0) {
-        Some(heap) => bytes.min(heap),
-        None => bytes,
-    };
 
     if facts.unified {
         let claimable = facts
             .shared_pool_bytes
             .saturating_mul(SHARED_POOL_CLAIMABLE_PERCENT)
             / 100;
-        let derived = heap_clamp(ram_clamp(facts.dedicated_bytes.saturating_add(claimable)));
+        let (derived, ram_bound, heap_bound) =
+            clamp(facts.dedicated_bytes.saturating_add(claimable));
         if derived > 0 {
-            return Maybe::Available(DeviceMemorySupply {
-                usable_bytes: derived,
-                source,
-            });
+            return supply(
+                derived,
+                DeviceMemorySource::UnifiedStaticDerivation,
+                (ram_bound, heap_bound),
+            );
         }
         return Maybe::Unavailable(Unavailable::ProbeFailed);
     }
 
     if facts.dedicated_bytes > 0 {
-        return Maybe::Available(DeviceMemorySupply {
-            usable_bytes: facts.dedicated_bytes,
-            source,
-        });
+        let (usable, ram_bound, heap_bound) = clamp(facts.dedicated_bytes);
+        return supply(
+            usable,
+            DeviceMemorySource::DedicatedDeviceMemory,
+            (ram_bound, heap_bound),
+        );
     }
 
     // Nothing trustworthy. `ProbeFailed` rather than "not exposed by the platform": every platform
@@ -653,16 +692,24 @@ impl DeviceAdmissionRefusal {
 pub(crate) mod fixtures {
     use super::*;
 
+    /// A derived supply figure for a fixture: the static derivation, with nothing clamped.
+    pub(crate) fn derived_supply(usable_bytes: u64) -> DeviceMemorySupply {
+        DeviceMemorySupply {
+            usable_bytes,
+            source: DeviceMemorySource::UnifiedStaticDerivation,
+            platform: SupplyPlatform::Linux,
+            ram_clamp_bound: false,
+            device_heap_clamp_bound: false,
+        }
+    }
+
     /// A complete, valid report.
     pub(crate) fn report(class: BackendClass) -> DeviceCapabilityReport {
         DeviceCapabilityReport {
             schema: DEVICE_CAPABILITY_REPORT_SCHEMA,
             backend_class: class,
             adapter_name: "Radeon 8060S Graphics (RADV GFX1151)".into(),
-            device_supply: Maybe::Available(DeviceMemorySupply {
-                usable_bytes: 32_952_745_984,
-                source: DeviceMemorySource::LinuxUnifiedMemoryBudget,
-            }),
+            device_supply: Maybe::Available(derived_supply(32_952_745_984)),
             memory_pool: MemoryPoolTopology::Unified,
             measured_max_allocation_bytes: Maybe::Available(4 << 30),
             host_memory_bytes: Maybe::Available(64 << 30),
@@ -683,7 +730,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::report;
+    use super::fixtures::{derived_supply, report};
     use super::*;
     use crate::revision::Unavailable;
 
@@ -724,7 +771,7 @@ mod tests {
             .copied()
             .expect("a unified device with a shared pool derives supply");
 
-        assert_eq!(supply.source, DeviceMemorySource::LinuxUnifiedMemoryBudget);
+        assert_eq!(supply.source, DeviceMemorySource::UnifiedStaticDerivation);
         // 4 GiB + 90% of 28 GiB = 29.2 GiB, under the 32 GiB physical ceiling. Multiply before
         // dividing, so the percentage does not lose a remainder to integer truncation.
         assert_eq!(
@@ -847,12 +894,14 @@ mod tests {
         );
     }
 
-    /// The platform's own budget query wins over any static derivation.
+    /// A platform-stated **stable** budget wins over any static derivation, and says so as itself.
     ///
-    /// The platform stating what this process may use beats us inferring it from totals — that is what
-    /// makes the Windows and macOS paths authoritative rather than approximate.
+    /// The slot is kept for a platform figure that is a property of the device and the OS build. No arm
+    /// currently populates it — the Linux heap budget and the Windows local budget are both
+    /// documented-dynamic and print beside the report as pressure — but the preference is the rule, and
+    /// a report that used it must be able to say it did.
     #[test]
-    fn a_platform_budget_query_is_preferred_over_the_static_derivation() {
+    fn a_platform_stated_budget_is_preferred_and_names_itself() {
         let facts = HostDeviceFacts {
             platform: SupplyPlatform::Macos,
             unified: true,
@@ -864,9 +913,111 @@ mod tests {
         };
         let supply = derive_device_supply(&facts).value().copied().unwrap();
         assert_eq!(supply.usable_bytes, 21 * 1024 * 1024 * 1024);
+        assert_eq!(supply.source, DeviceMemorySource::PlatformStatedBudget);
+        assert_eq!(supply.platform, SupplyPlatform::Macos);
+        assert!(!supply.ram_clamp_bound && !supply.device_heap_clamp_bound);
+    }
+
+    /// **The report names the derivation, not the platform.**
+    ///
+    /// Two boxes on different platforms reaching the figure the same way say the same thing about how
+    /// they reached it, and one box whose arithmetic hit a clamp does not read as though its platform
+    /// had stated the number. The source used to be chosen from the platform before the derivation
+    /// branched, so a Windows report said "local budget" while deriving statically from totals — the
+    /// same defect class as one lane's record carrying another lane's adapter.
+    #[test]
+    fn the_derivation_is_named_and_the_binding_clamp_is_recorded() {
+        let gib = 1024 * 1024 * 1024_u64;
+        let unified_of = |platform| HostDeviceFacts {
+            platform,
+            unified: true,
+            dedicated_bytes: 4 * gib,
+            shared_pool_bytes: 28 * gib,
+            host_ram_bytes: 32 * gib,
+            platform_budget_bytes: None,
+            advertised_device_heap_bytes: None,
+        };
+        for platform in [
+            SupplyPlatform::Linux,
+            SupplyPlatform::Windows,
+            SupplyPlatform::Macos,
+        ] {
+            let supply = derive_device_supply(&unified_of(platform))
+                .value()
+                .copied()
+                .unwrap();
+            assert_eq!(
+                supply.source,
+                DeviceMemorySource::UnifiedStaticDerivation,
+                "the same arithmetic is named the same way on every platform"
+            );
+            assert_eq!(
+                supply.platform, platform,
+                "the platform is a separate member"
+            );
+            assert!(
+                !supply.ram_clamp_bound && !supply.device_heap_clamp_bound,
+                "nothing bound here: 4 + 90% of 28 is under the 32 GiB machine"
+            );
+        }
+
+        // The heap clamp binding is recorded, and it supersedes the RAM clamp it clamped away.
+        let heap_bound = derive_device_supply(&HostDeviceFacts {
+            advertised_device_heap_bytes: Some(8 * gib),
+            ..unified_of(SupplyPlatform::Linux)
+        })
+        .value()
+        .copied()
+        .unwrap();
+        assert_eq!(heap_bound.usable_bytes, 8 * gib);
+        assert!(heap_bound.device_heap_clamp_bound && !heap_bound.ram_clamp_bound);
+
+        // The RAM clamp binding is recorded on its own.
+        let ram_bound = derive_device_supply(&HostDeviceFacts {
+            shared_pool_bytes: 64 * gib,
+            ..unified_of(SupplyPlatform::Windows)
+        })
+        .value()
+        .copied()
+        .unwrap();
+        assert_eq!(ram_bound.usable_bytes, 32 * gib);
+        assert!(ram_bound.ram_clamp_bound && !ram_bound.device_heap_clamp_bound);
+    }
+
+    /// The macOS shape: the working set bounds the derivation as a heap, and there is no carve-out.
+    ///
+    /// This is the arm the addendum corrected. `recommendedMaxWorkingSetSize` is a fixed fraction of
+    /// physical RAM — a property of the device and the OS build — so it belongs where the Vulkan device
+    /// heap belongs, bounding the static derivation, rather than in the slot that means "the platform
+    /// told us what we may use right now". The figure is the same; what it claims about itself is not.
+    #[test]
+    fn the_macos_working_set_bounds_the_derivation_as_a_heap() {
+        let gib = 1024 * 1024 * 1024_u64;
+        // An M-series shape: no dedicated carve-out, the machine's DRAM as the shared pool, and the
+        // working set at two thirds of it.
+        let apple_silicon = HostDeviceFacts {
+            platform: SupplyPlatform::Macos,
+            unified: true,
+            dedicated_bytes: 0,
+            shared_pool_bytes: 32 * gib,
+            host_ram_bytes: 32 * gib,
+            platform_budget_bytes: None,
+            advertised_device_heap_bytes: Some(32 * gib * 2 / 3),
+        };
+        let supply = derive_device_supply(&apple_silicon)
+            .value()
+            .copied()
+            .unwrap();
         assert_eq!(
-            supply.source,
-            DeviceMemorySource::MetalRecommendedWorkingSet
+            supply.usable_bytes,
+            32 * gib * 2 / 3,
+            "the working set bounds it, so the answer is the working set"
+        );
+        assert_eq!(supply.source, DeviceMemorySource::UnifiedStaticDerivation);
+        assert!(supply.device_heap_clamp_bound, "and the clamp is recorded");
+        assert!(
+            supply.usable_bytes < 32 * gib * 9 / 10,
+            "which is more conservative than claiming most of the machine, as dropping it would"
         );
     }
 
@@ -885,7 +1036,7 @@ mod tests {
         };
         let supply = derive_device_supply(&discrete).value().copied().unwrap();
         assert_eq!(supply.usable_bytes, 24 * 1024 * 1024 * 1024);
-        assert_eq!(supply.source, DeviceMemorySource::CudaDeviceTotal);
+        assert_eq!(supply.source, DeviceMemorySource::DedicatedDeviceMemory);
     }
 
     /// **No trustworthy derivation fails closed**, and never asks a human for a number.
@@ -965,15 +1116,14 @@ mod tests {
         // operator-supplied number could arrive through: the node is what can measure the device, and
         // asking the operator instead inverted the responsibility.
         for source in [
-            DeviceMemorySource::DxgiLocalBudget,
-            DeviceMemorySource::MetalRecommendedWorkingSet,
-            DeviceMemorySource::LinuxUnifiedMemoryBudget,
-            DeviceMemorySource::CudaDeviceTotal,
+            DeviceMemorySource::PlatformStatedBudget,
+            DeviceMemorySource::UnifiedStaticDerivation,
+            DeviceMemorySource::DedicatedDeviceMemory,
         ] {
             let mut candidate = report(BackendClass::Dx12);
             candidate.device_supply = Maybe::Available(DeviceMemorySupply {
-                usable_bytes: 32_952_745_984,
                 source,
+                ..derived_supply(32_952_745_984)
             });
             candidate
                 .validate()
@@ -987,8 +1137,8 @@ mod tests {
     fn a_ceiling_above_the_whole_budget_is_refused() {
         let mut r = report(BackendClass::Dx12);
         r.device_supply = Maybe::Available(DeviceMemorySupply {
-            usable_bytes: 2047 << 20,
-            source: DeviceMemorySource::DxgiLocalBudget,
+            source: DeviceMemorySource::PlatformStatedBudget,
+            ..derived_supply(2047 << 20)
         });
         r.measured_max_allocation_bytes = Maybe::Available(4 << 30);
         assert!(r
@@ -1002,10 +1152,7 @@ mod tests {
     #[test]
     fn a_zero_reading_is_refused_and_absence_is_typed() {
         let mut r = report(BackendClass::Vulkan);
-        r.device_supply = Maybe::Available(DeviceMemorySupply {
-            usable_bytes: 0,
-            source: DeviceMemorySource::LinuxUnifiedMemoryBudget,
-        });
+        r.device_supply = Maybe::Available(derived_supply(0));
         assert!(matches!(
             r.validate().unwrap_err(),
             CapabilityError::ZeroInsteadOfUnavailable { .. }

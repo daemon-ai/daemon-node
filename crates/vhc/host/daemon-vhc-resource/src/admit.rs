@@ -219,7 +219,7 @@ pub fn admit_composition(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability::{DeviceMemorySource, DeviceMemorySupply, MemoryPoolTopology};
+    use crate::capability::MemoryPoolTopology;
     use crate::planner::fixtures::{binding, plan};
     use crate::revision::{BackendClass, BackendImplementationRevision, Maybe};
     use crate::store::{AuthenticationContext, ProfileStore};
@@ -334,10 +334,8 @@ mod tests {
         let policy = trust_fixtures::policy_for(&store);
         let profile = authenticate(&store, &running, &policy);
         let mut report = report_with_measured_ceiling();
-        report.device_supply = Maybe::Available(DeviceMemorySupply {
-            usable_bytes: 1 << 20,
-            source: DeviceMemorySource::LinuxUnifiedMemoryBudget,
-        });
+        report.device_supply =
+            Maybe::Available(crate::capability::fixtures::derived_supply(1 << 20));
         // The ceiling stays under the supply, or the report itself is invalid and refuses a step
         // earlier — which would make this test pass for the wrong reason.
         report.measured_max_allocation_bytes = Maybe::Available(4096);
@@ -364,10 +362,7 @@ mod tests {
 
         // Supply too small: a hardware refusal.
         let mut tight = report.clone();
-        tight.device_supply = Maybe::Available(DeviceMemorySupply {
-            usable_bytes: 4096,
-            source: DeviceMemorySource::LinuxUnifiedMemoryBudget,
-        });
+        tight.device_supply = Maybe::Available(crate::capability::fixtures::derived_supply(4096));
         // Kept under the supply so the report is valid and the supply comparison is what refuses.
         tight.measured_max_allocation_bytes = Maybe::Available(4096);
         let refusal =

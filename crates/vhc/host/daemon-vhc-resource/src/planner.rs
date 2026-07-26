@@ -1132,10 +1132,7 @@ mod tests {
         // And supply itself refuses on its own terms when the device genuinely lacks the memory.
         let mut small = r.clone();
         small.device_supply =
-            crate::revision::Maybe::Available(crate::capability::DeviceMemorySupply {
-                usable_bytes: 1024,
-                source: crate::capability::DeviceMemorySource::LinuxUnifiedMemoryBudget,
-            });
+            crate::revision::Maybe::Available(crate::capability::fixtures::derived_supply(1024));
         small.measured_max_allocation_bytes = crate::revision::Maybe::Available(1024);
         let supply_typed =
             crate::capability::admit_device_bytes(claim.total_peak_bytes, &small, None)

@@ -2460,18 +2460,32 @@ fn probed_device() -> Option<ProbedDevice> {
                 facts: HostDeviceFacts {
                     platform: SupplyPlatform::Macos,
                     unified: dl.unified,
-                    dedicated_bytes: mib(dl.vram_mb),
+                    // On a unified Apple part there is no dedicated carve-out at all: the device
+                    // allocates out of the machine's DRAM. Feeding the working set in here as if it
+                    // were dedicated memory would double-count it against the shared pool below.
+                    dedicated_bytes: if dl.unified { 0 } else { mib(dl.vram_mb) },
                     shared_pool_bytes: mib(dl.shared_mb),
                     host_ram_bytes: if dl.ram_mb > 0 {
                         mib(dl.ram_mb)
                     } else {
                         ram_bytes
                     },
-                    // `macos_device_limits` maps `vram_mb` from `recommendedMaxWorkingSetSize`, which
-                    // IS Metal's budget query — the platform saying what this process may use, not a
-                    // total we inferred. So it enters as the budget it is.
-                    platform_budget_bytes: Some(mib(dl.vram_mb)).filter(|b| *b > 0),
-                    advertised_device_heap_bytes: None,
+                    // NOT the platform-stated-budget slot, which is where this used to go.
+                    //
+                    // `recommendedMaxWorkingSetSize` is the macOS analogue of the Vulkan device heap,
+                    // not of a live budget grant: on Apple Silicon it is a fixed fraction of physical
+                    // RAM (measured at exactly two thirds on the M1, with two thirds also documented as
+                    // the arithmetic fallback when the framework call is unavailable), so it is a
+                    // property of the device and the OS build rather than of the moment. That is what
+                    // qualifies it as the stable statement — and it enters as the *heap* that bounds the
+                    // static derivation, so the report says which clamp bound the answer instead of
+                    // claiming the platform handed us a budget.
+                    //
+                    // If it ever does move with co-tenant pressure, the acceptance check catches it:
+                    // two back-to-back probes on an idle box would produce two report digests, and the
+                    // recorded derivation names the heap clamp as the member that moved.
+                    platform_budget_bytes: None,
+                    advertised_device_heap_bytes: Some(mib(dl.vram_mb)).filter(|b| *b > 0),
                 },
                 class: BackendClass::Metal,
                 adapter_name: probed_adapter()
