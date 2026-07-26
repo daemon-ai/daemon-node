@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod composition_record;
 pub mod planner;
 pub mod profile;
 pub mod revision;
@@ -38,6 +39,11 @@ pub mod trust;
 pub use capability::{
     CapabilityError, DeviceCapabilityReport, DeviceMemoryBudget, DeviceMemorySource, LinkCapacity,
     DEVICE_CAPABILITY_REPORT_SCHEMA,
+};
+pub use composition_record::{
+    validate_citation, CandidateTuple, CompositionEvidenceLedger, CompositionEvidenceRecord,
+    ConsequenceClass, EvidenceCitation, EvidenceError, EvidenceSubject, RecordStanding, Revocation,
+    GOVERNOR_VERSION,
 };
 pub use planner::{
     aggregate, compose, select, validate_against, AggregateClaim, DivergenceAuthority,
