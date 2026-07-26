@@ -529,17 +529,17 @@ pub mod rt {
     }
 }
 
+/// The certification rung sits above every rung whose floor the import shape can derive, so a
+/// module never reaches it by accident — and this build's contract implements it, or the arming
+/// predicate below would be dead. A compile error rather than a test failure, following the rung
+/// ladder's own discipline: a constant that went backwards would silently disarm every module.
+const _: () =
+    assert!(daemon_vhc_abi::CERTIFICATION_MINOR_V2 > daemon_vhc_abi::BUFFER_STAGE_MINOR_V2);
+
 #[cfg(test)]
 mod tests {
     use super::pre_loop_diagnostics_armed;
-    use daemon_vhc_abi::{BUFFER_STAGE_MINOR_V2, CERTIFICATION_MINOR_V2, DA_ABI_MINOR_V2};
-
-    /// The certification rung sits above every rung whose floor the import shape can derive, so a
-    /// module never reaches it by accident.
-    #[test]
-    fn the_certification_minor_is_above_the_import_derivable_rungs() {
-        assert!(CERTIFICATION_MINOR_V2 > BUFFER_STAGE_MINOR_V2);
-    }
+    use daemon_vhc_abi::CERTIFICATION_MINOR_V2;
 
     /// The behavioral-floor coupling, asserted in BOTH directions: a module is armed for pre-loop
     /// diagnostics only if it declares the certification rung, and every module that declares it
@@ -547,10 +547,6 @@ mod tests {
     /// host refuse the module cleanly instead of trapping it at initialization.
     #[test]
     fn arming_pre_loop_forwarding_and_declaring_the_rung_are_one_decision() {
-        assert!(
-            DA_ABI_MINOR_V2 >= CERTIFICATION_MINOR_V2,
-            "this build's ABI contract implements the certification rung"
-        );
         for module_minor in 0..CERTIFICATION_MINOR_V2 {
             assert!(
                 !pre_loop_diagnostics_armed(module_minor),
