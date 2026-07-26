@@ -241,11 +241,12 @@ pub enum AuthenticationRefusal {
         /// Why the ceiling is not certified.
         detail: String,
     },
-    /// The profile claims measured figures that this binary cannot reproduce.
+    /// The profile carries figures measured **from allocator statistics** that this binary cannot
+    /// reproduce. Directly-probed figures are unaffected.
     #[error(
-        "the profile claims {measured} measured term(s), but this binary cannot report allocator \
-         statistics; the evidence behind those figures is unreproducible here, so the profile's \
-         own certification is unverifiable on this binary"
+        "the profile carries {measured} figure(s) measured from allocator statistics, but this \
+         binary cannot report them; that evidence is unreproducible here, so the profile's own \
+         certification is unverifiable on this binary"
     )]
     CalibrationUnreproducible {
         /// How many terms claim measurement.
@@ -428,10 +429,20 @@ pub fn authenticate(
     //     those figures cannot be reproduced there, so the profile's certification is unverifiable
     //     on the very binary about to compose with it. This is the teeth on the
     //     `statistics_available` member, which would otherwise be a declaration nothing reads.
-    if profile.claims_measurement() && !running.allocator.statistics_available {
+    //     The check keys on the *source* of the measurement, not on "was it measured": a directly
+    //     probed figure is reproducible on any binary, and refusing it would make recording a
+    //     truthful measurement the expensive choice while downgrading it to a weaker basis cleared
+    //     the refusal — an incentive to mislabel, which is precisely what the per-term basis exists
+    //     to prevent.
+    if profile.requires_allocator_statistics() && !running.allocator.statistics_available {
         return Err(AuthenticationRefusal::CalibrationUnreproducible {
-            measured: profile.measured_terms().count()
-                + usize::from(profile.headroom.hidden_overhead_basis.is_observed()),
+            measured: profile.statistics_dependent_terms().count()
+                + usize::from(
+                    profile
+                        .headroom
+                        .hidden_overhead_basis
+                        .requires_allocator_statistics(),
+                ),
         });
     }
     let calibration = profile.calibration_summary();
@@ -775,9 +786,14 @@ mod tests {
             AuthenticationRefusal::CeilingNotMeasured { .. }
         ));
 
-        // A policy that does not require it composes on the reported figure at its own risk.
+        // A policy that does not require it composes on the reported figure at its own risk — and it
+        // has to say so on BOTH axes, because an unmeasured ceiling now shows up in the calibration
+        // census as uncalibrated. That coupling is deliberate: the two flags are two ways of asking
+        // the same question, and a policy that waived one while still demanding full calibration was
+        // asking for something it had already given up.
         let mut relaxed = policy();
         relaxed.require_measured_allocation_ceiling = false;
+        relaxed.require_full_calibration = false;
         authenticate(&p, &e, &relaxed, &relaxed, &revision(), 1, NOW)
             .expect("a policy may accept an unmeasured ceiling explicitly");
     }
@@ -786,9 +802,10 @@ mod tests {
     /// statistics must not be accepted by a binary that cannot produce them, because the evidence
     /// behind those figures is unreproducible there.
     #[test]
-    fn a_profile_claiming_measured_terms_is_refused_by_a_binary_without_statistics() {
+    fn a_statistics_derived_figure_is_refused_by_a_binary_without_statistics() {
         let mut p = profile(BackendClass::Vulkan);
-        p.standing_terms[0].calibration_basis = crate::profile::CalibrationBasis::Measured;
+        p.standing_terms[0].calibration_basis =
+            crate::profile::CalibrationBasis::MeasuredFromAllocatorStatistics;
         let e = envelope(&p);
 
         let mut running = revision();
@@ -803,9 +820,9 @@ mod tests {
         authenticate(&p, &e, &policy(), &policy(), &revision(), 1, NOW)
             .expect("statistics available, so the evidence is reproducible");
 
-        // A profile claiming nothing measured is unaffected by the binary's capability.
+        // A profile needing no statistics is unaffected by the binary's capability.
         let plain = profile(BackendClass::Vulkan);
-        assert!(!plain.claims_measurement());
+        assert!(!plain.requires_allocator_statistics());
         authenticate(
             &plain,
             &envelope(&plain),
@@ -815,16 +832,34 @@ mod tests {
             1,
             NOW,
         )
-        .expect("a profile claiming no measurement needs no statistics");
+        .expect("a profile needing no allocator statistics authenticates anywhere");
+    }
+
+    /// A **directly probed** measurement is reproducible anywhere, so it must not be refused. The
+    /// alternative punished honest recording: a truthful profile became unusable, while downgrading
+    /// the figure to a weaker basis cleared the refusal — an incentive to mislabel, which is the
+    /// exact failure the per-term basis exists to prevent.
+    #[test]
+    fn a_directly_probed_measurement_is_not_refused_for_want_of_statistics() {
+        let mut p = profile(BackendClass::Vulkan);
+        p.standing_terms[0].calibration_basis =
+            crate::profile::CalibrationBasis::MeasuredByDirectProbe;
+        assert!(!p.requires_allocator_statistics());
+
+        let mut running = revision();
+        running.allocator.statistics_available = false;
+        authenticate(&p, &envelope(&p), &policy(), &policy(), &running, 1, NOW)
+            .expect("an honestly recorded direct probe authenticates on any binary");
     }
 
     /// The hidden-overhead reserve is not a `CostTerm`, so a check that only walked the terms would
-    /// let a measured hidden figure through on a binary that cannot reproduce it.
+    /// let a statistics-derived hidden figure through on a binary that cannot reproduce it.
     #[test]
-    fn a_measured_hidden_overhead_figure_is_covered_by_the_same_teeth() {
+    fn a_statistics_derived_hidden_overhead_figure_is_covered_by_the_same_teeth() {
         let mut p = profile(BackendClass::Vulkan);
-        p.headroom.hidden_overhead_basis = crate::profile::CalibrationBasis::Measured;
-        assert!(p.claims_measurement());
+        p.headroom.hidden_overhead_basis =
+            crate::profile::CalibrationBasis::MeasuredFromAllocatorStatistics;
+        assert!(p.requires_allocator_statistics());
         let e = envelope(&p);
         let mut running = revision();
         running.allocator.statistics_available = false;

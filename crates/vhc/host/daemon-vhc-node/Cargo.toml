@@ -12,6 +12,12 @@ description = "The node-side vhc-training service: durable vhc.db state, worker 
 # Structured diagnostics for the service's lifecycle seams (leave/drain dispatch, checkpoint
 # pointer publication). Events only — the node binary owns the subscriber.
 tracing = { workspace = true }
+# The typed admission-refusal slugs and the reservation keys the owner-ledger projection reads
+# (architecture §9.6 [RC-13]/[RC-14]). The worker composes the reservation and reports it under
+# those keys; this crate charges it. Both sides read ONE spelling from the contracts crate, because
+# a value two components must agree on byte-for-byte needs a single authority. Direction is
+# host -> contracts, which the dependency gate permits.
+daemon-vhc-abi = { workspace = true }
 # The VhcApi trait + wire DTOs + NodeEvent this service implements / emits (spec §10.4).
 daemon-api = { workspace = true }
 # The frozen worker protocol (Event/Command/Hardware/Eligibility) + the `[vhc]` config type.

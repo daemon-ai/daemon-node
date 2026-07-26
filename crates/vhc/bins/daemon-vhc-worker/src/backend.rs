@@ -1959,6 +1959,11 @@ fn assess_module(
                     admission.claim.host_total(),
                     admission.claim.under_pressure,
                 )],
+                // The legacy declared tiers. A certification-minor admission additionally reports
+                // the composed reservation under the `reservation_*` keys, which the node's ledger
+                // projection prefers — the owner's memory charge and the governor's occupancy
+                // reservation being the same reservation seen twice, read through one spelling
+                // rather than two.
                 headroom: vec![
                     (
                         "claim_device_bytes".to_string(),

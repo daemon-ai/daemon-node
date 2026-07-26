@@ -111,8 +111,19 @@ pub enum EnforcementClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CalibrationBasis {
-    /// Observed on the running implementation — from allocator statistics or a direct probe.
-    Measured,
+    /// Observed on the running implementation **through its allocator statistics**.
+    ///
+    /// Split from a direct probe deliberately. The evidence behind this basis is only reproducible
+    /// on a binary that can report those statistics, so it is the one basis whose acceptance depends
+    /// on that capability. Keying the check on "measured" as a whole punished the honest recording
+    /// of a directly-probed figure — making a truthful profile unusable while downgrading it to a
+    /// weaker basis cleared the refusal, which is an incentive to mislabel and exactly what the
+    /// per-term basis exists to prevent.
+    MeasuredFromAllocatorStatistics,
+    /// Observed on the running implementation **by a direct probe** — a bring-up residency reading,
+    /// a ceiling probe. Reproducible on any binary that can run the probe, so it carries no
+    /// allocator-statistics requirement.
+    MeasuredByDirectProbe,
     /// Read out of the backend implementation's own source or its documented behavior. Grounded,
     /// but not observed on this machine.
     SourceGrounded,
@@ -128,7 +139,18 @@ impl CalibrationBasis {
     /// Whether this basis is evidence about the running implementation rather than about a
     /// document or a guess.
     pub fn is_observed(self) -> bool {
-        matches!(self, Self::Measured)
+        matches!(
+            self,
+            Self::MeasuredFromAllocatorStatistics | Self::MeasuredByDirectProbe
+        )
+    }
+
+    /// Whether reproducing this basis's evidence requires the binary to report allocator statistics.
+    ///
+    /// True for exactly one basis. This is what the authentication check keys on, rather than on
+    /// "was it measured" — a distinction with teeth, since the alternative refused honest profiles.
+    pub fn requires_allocator_statistics(self) -> bool {
+        matches!(self, Self::MeasuredFromAllocatorStatistics)
     }
 }
 
@@ -752,13 +774,24 @@ impl BackendExecutionProfile {
     /// certified".
     pub fn calibration_summary(&self) -> CalibrationSummary {
         let mut summary = CalibrationSummary::default();
+        // The per-allocation ceiling is counted too. It is not a `CostTerm`, and it is the one
+        // figure composition actually gates on — a profile with a measured ceiling and no measured
+        // cost terms reporting `measured: 0` would understate its own evidence at the point it
+        // matters most.
+        let ceiling_basis = if self.allocation_ceilings.measured_bytes.is_available() {
+            CalibrationBasis::MeasuredByDirectProbe
+        } else {
+            CalibrationBasis::Absent
+        };
         for basis in self
             .terms()
             .map(|t| t.calibration_basis)
             .chain(std::iter::once(self.headroom.hidden_overhead_basis))
+            .chain(std::iter::once(ceiling_basis))
         {
             let slot = match basis {
-                CalibrationBasis::Measured => &mut summary.measured,
+                CalibrationBasis::MeasuredFromAllocatorStatistics
+                | CalibrationBasis::MeasuredByDirectProbe => &mut summary.measured,
                 CalibrationBasis::SourceGrounded => &mut summary.source_grounded,
                 CalibrationBasis::ConservativeBound => &mut summary.conservative_bound,
                 CalibrationBasis::Absent => &mut summary.absent,
@@ -768,18 +801,26 @@ impl BackendExecutionProfile {
         summary
     }
 
-    /// The terms this profile claims to have **measured**.
+    /// The terms whose evidence needs allocator statistics to reproduce.
     ///
-    /// A binary that cannot report allocator statistics cannot reproduce the evidence behind these,
-    /// which is what [`crate::trust::authenticate`] refuses on.
-    pub fn measured_terms(&self) -> impl Iterator<Item = &CostTerm> {
-        self.terms().filter(|t| t.calibration_basis.is_observed())
+    /// A binary that cannot report them cannot reproduce this evidence, which is what
+    /// [`crate::trust::authenticate`] refuses on. A directly-probed figure is deliberately not here:
+    /// it is reproducible without statistics, and refusing it would make honest recording the
+    /// expensive choice.
+    pub fn statistics_dependent_terms(&self) -> impl Iterator<Item = &CostTerm> {
+        self.terms()
+            .filter(|t| t.calibration_basis.requires_allocator_statistics())
     }
 
-    /// Whether this profile claims any measured figure at all — including the hidden-overhead
-    /// reserve, which is not a [`CostTerm`] and would otherwise escape the check.
-    pub fn claims_measurement(&self) -> bool {
-        self.measured_terms().next().is_some() || self.headroom.hidden_overhead_basis.is_observed()
+    /// Whether any figure in this profile needs allocator statistics to reproduce — the
+    /// hidden-overhead reserve included, since it is not a [`CostTerm`] and would otherwise escape
+    /// the check.
+    pub fn requires_allocator_statistics(&self) -> bool {
+        self.statistics_dependent_terms().next().is_some()
+            || self
+                .headroom
+                .hidden_overhead_basis
+                .requires_allocator_statistics()
     }
 }
 
@@ -1170,24 +1211,40 @@ mod tests {
         let summary = p.calibration_summary();
         assert_eq!(
             summary.total(),
-            p.terms().count() + 1,
-            "the hidden-overhead reserve is summarized too — it is not a CostTerm and would \
-             otherwise escape the count"
+            p.terms().count() + 2,
+            "the hidden-overhead reserve AND the per-allocation ceiling are summarized too — \
+             neither is a CostTerm, and the ceiling is the one figure composition gates on"
         );
         assert!(summary.is_complete());
-        assert!(!p.claims_measurement(), "the fixture claims no measurement");
+        assert_eq!(
+            summary.measured, 1,
+            "the fixture's measured ceiling counts, even with no measured cost term"
+        );
+        assert!(
+            !p.requires_allocator_statistics(),
+            "and it needs no allocator statistics, being a direct probe"
+        );
 
-        let mut measured = profile(BackendClass::Vulkan);
-        measured.standing_terms[0].calibration_basis = CalibrationBasis::Measured;
-        assert_eq!(measured.calibration_summary().measured, 1);
-        assert_eq!(measured.measured_terms().count(), 1);
-        assert!(measured.claims_measurement());
+        let mut from_statistics = profile(BackendClass::Vulkan);
+        from_statistics.standing_terms[0].calibration_basis =
+            CalibrationBasis::MeasuredFromAllocatorStatistics;
+        assert_eq!(from_statistics.calibration_summary().measured, 2);
+        assert_eq!(from_statistics.statistics_dependent_terms().count(), 1);
+        assert!(from_statistics.requires_allocator_statistics());
 
         let mut uncalibrated = profile(BackendClass::Vulkan);
         uncalibrated.standing_terms[0].calibration_basis = CalibrationBasis::Absent;
         let summary = uncalibrated.calibration_summary();
         assert_eq!(summary.absent, 1);
         assert!(!summary.is_complete());
+
+        // A profile with no measured ceiling reports the ceiling as uncalibrated, which is what
+        // makes the gap visible rather than silently absent from the census.
+        let mut unmeasured_ceiling = profile(BackendClass::Vulkan);
+        unmeasured_ceiling.allocation_ceilings.measured_bytes = Maybe::default();
+        let summary = unmeasured_ceiling.calibration_summary();
+        assert_eq!(summary.measured, 0);
+        assert_eq!(summary.absent, 1);
     }
 
     /// A hidden term must name the scope at which its statistic is actually exposed, which is not

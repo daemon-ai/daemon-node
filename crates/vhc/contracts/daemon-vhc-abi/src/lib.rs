@@ -950,6 +950,33 @@ pub const RUN_HEADER_KEY_EXECUTION_GRANT_HASH: &str = "execution_grant_hash";
 /// verbatim `da_claim` result.
 pub const RUN_HEADER_KEY_LEGACY_CLAIM: &str = "claim";
 
+// -- the reservation the owner ledger charges (architecture §9.6 `[RC-13]`, `[RC-14]`) ------------
+//
+// The owner's memory ledger charge and the resource governor's occupancy reservation are the SAME
+// reservation seen twice. The worker composes it at admission and reports it under these keys; the
+// node's ledger projection reads the same keys. They are spelled once, here, because a value two
+// components must agree on byte-for-byte needs a single authority — and two hand-kept spellings
+// agree only until one of them is edited.
+
+/// The reservation's device-memory bound, in bytes: every scope's occupancy plus the profiled
+/// hidden-overhead reserve, with the per-allocation constraint deliberately excluded.
+pub const RESERVATION_DEVICE_BYTES_KEY: &str = "reservation_device_bytes";
+/// The reservation's host-RAM bound, in bytes — the guest's own linear-memory peak.
+pub const RESERVATION_HOST_BYTES_KEY: &str = "reservation_host_bytes";
+/// Reserved per role instance, in bytes.
+pub const RESERVATION_PER_ROLE_BYTES_KEY: &str = "reservation_per_role_bytes";
+/// Reserved once per process, in bytes, however many role instances it holds.
+pub const RESERVATION_PER_PROCESS_BYTES_KEY: &str = "reservation_per_process_bytes";
+/// Reserved once per device, in bytes, across every process using it.
+pub const RESERVATION_PER_DEVICE_BYTES_KEY: &str = "reservation_per_device_bytes";
+/// The profiled hidden-overhead reserve, in bytes, as its own visible component rather than folded
+/// into a per-role total.
+pub const RESERVATION_HIDDEN_OVERHEAD_BYTES_KEY: &str = "reservation_hidden_overhead_bytes";
+/// The largest single allocation the reservation permits, in bytes. A **maximum constraint**
+/// validated against the capability report's limit — never occupancy, and never added to a ledger
+/// total.
+pub const RESERVATION_MAX_ALLOCATION_BYTES_KEY: &str = "reservation_max_allocation_bytes";
+
 /// Whether a tag-0 run header written under `abi_minor` uses the certification variant.
 #[must_use]
 pub fn run_header_is_certification_variant(abi_minor: u32) -> bool {
