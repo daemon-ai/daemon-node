@@ -39,8 +39,8 @@ use daemon_vhc_proto::{
 };
 use daemon_vhc_testkit::ceremony::{
     ceremony_expected_state_root, ceremony_genesis, ceremony_profile_chunk,
-    ceremony_state_chunk_size, CeremonyGenesisSpec, CeremonyRunTimers, CEREMONY_EXPECTED_ROOT,
-    CEREMONY_PARAM_COUNT, CEREMONY_SEQ_LEN,
+    ceremony_round_schedule, ceremony_state_chunk_size, CeremonyGenesisSpec, CeremonyRunTimers,
+    CEREMONY_EXPECTED_ROOT, CEREMONY_PARAM_COUNT, CEREMONY_SEQ_LEN, CEREMONY_TICK_PERIOD_MS,
 };
 
 /// The parsed `author-ceremony-genesis` inputs (see the [`crate::Cmd`] arm docs for each flag).
@@ -408,7 +408,34 @@ fn authoring_report(r: &AuthoringReport<'_>) -> String {
     let _ = writeln!(s, "checkpoint cadence   : {} rounds", r.ckpt_cadence);
     let _ = writeln!(s, "payload retention    : {} rounds", r.payload_retention);
     let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "-- round schedule (derived from the frozen trainer config) --"
+    );
+    let schedule = ceremony_round_schedule(u32::try_from(r.roster.len()).unwrap_or(u32::MAX));
+    let _ = writeln!(s, "inner steps / round  : {}", schedule.steps_per_round);
+    let _ = writeln!(s, "sequences / step     : {}", schedule.micro_batch);
+    let _ = writeln!(
+        s,
+        "sequences / peer     : {}   ({} steps x {} sequences)",
+        schedule.sequences_per_peer(),
+        schedule.steps_per_round,
+        schedule.micro_batch
+    );
+    let _ = writeln!(
+        s,
+        "global batch         : {}   ({} per peer x {} roster peers)",
+        schedule.global_batch,
+        schedule.sequences_per_peer(),
+        schedule.peers
+    );
+    let _ = writeln!(s);
     let _ = writeln!(s, "-- real run timers (calibrated) --");
+    let _ = writeln!(
+        s,
+        "coordinator tick     : {CEREMONY_TICK_PERIOD_MS} ms  (the clock the walls below are \
+         counted on)"
+    );
     let _ = writeln!(s, "warmup               : {} s", r.timers.warmup_s);
     let _ = writeln!(s, "round train max      : {} s", r.timers.round_max_s);
     let _ = writeln!(s, "round witness        : {} s", r.timers.witness_s);

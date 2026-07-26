@@ -50,6 +50,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ciborium::value::Value;
 
+use crate::coordinator_config::{
+    coordinator_role_config, CoordinatorAuthoring, PhaseDeadlines, RoundSchedule,
+    EVENT_CLOCK_DEADLINE_S, WALL_CLOCK_TICK_PERIOD_MS,
+};
 use daemon_vhc_net::PublishedArtifact;
 use daemon_vhc_proto::det_state::{
     derive_state_chunk_size, family_byte_len, family_fold, validate_checkpoint_cadence,
@@ -93,6 +97,22 @@ pub const CEREMONY_WD: f64 = 0.1;
 pub const CEREMONY_ROPE_THETA: f64 = 10_000.0;
 /// RMSNorm epsilon.
 pub const CEREMONY_RMSNORM_EPS: f64 = 1.0e-5;
+
+/// Inner optimizer steps per round — the trainer config's `steps_per_round`.
+pub const CEREMONY_STEPS_PER_ROUND: u32 = 30;
+/// Sequences per inner step — the trainer config's `micro_batch`.
+pub const CEREMONY_MICRO_BATCH: u32 = 1;
+/// Fetch-recovery budget before a stalled peer leaves for the epoch (`stall_rounds_max`).
+pub const CEREMONY_STALL_ROUNDS_MAX: u32 = 4;
+/// Record absences before a silent member is dropped from the roster (`k_absences`).
+pub const CEREMONY_K_ABSENCES: u32 = 3;
+
+/// The ceremony coordinator's real-timer period: the fleet run is a LIVE deployment, so its
+/// clock measures wall time and the authored `*_s` timers ([`CeremonyRunTimers`]) mean seconds.
+/// Without it the guest's `#[serde(default)] tick_period_ms = 0` leaves the coordinator on the
+/// deterministic event-driven clock, where a "300 s" warmup is 300 delivered events and a quiet
+/// run's deadline never arrives.
+pub const CEREMONY_TICK_PERIOD_MS: u64 = WALL_CLOCK_TICK_PERIOD_MS;
 
 /// The frozen total parameter count of the ceremony geometry (pinned by
 /// [`tests::ceremony_geometry_is_frozen`]; the sum of [`ceremony_param_numels`]).
@@ -344,9 +364,18 @@ pub fn ceremony_trainer_config_harness(roster: &[PeerId]) -> Value {
         (text("model"), ceremony_model_value()),
         (text("peer"), peer),
         (text("roster"), roster_val),
-        (text("steps_per_round"), Value::Integer(30u64.into())),
-        (text("micro_batch"), Value::Integer(1u64.into())),
-        (text("stall_rounds_max"), Value::Integer(4u64.into())),
+        (
+            text("steps_per_round"),
+            Value::Integer(u64::from(CEREMONY_STEPS_PER_ROUND).into()),
+        ),
+        (
+            text("micro_batch"),
+            Value::Integer(u64::from(CEREMONY_MICRO_BATCH).into()),
+        ),
+        (
+            text("stall_rounds_max"),
+            Value::Integer(u64::from(CEREMONY_STALL_ROUNDS_MAX).into()),
+        ),
         (text("profile"), ceremony_profile_value()),
         (
             text("state"),
@@ -464,10 +493,11 @@ pub fn ceremony_trainer_config_training_step(
 /// binds into the coordinator config — closing the documented "the fleet operator tunes real
 /// timers at preflight" seam inside this reviewed module instead of at a CLI.
 ///
-/// The [`Default`] values are exactly today's synthetic-clock constants (warmup / round / witness /
-/// cooldown = 1_000_000 s, stop = 1_000_000 rounds), so a genesis authored WITHOUT tuning the
-/// timers is BYTE-IDENTICAL to the pre-timer authoring — every existing test pin and the frozen
-/// coordinator-config shape hold unchanged. Only an operator that sets real values moves the run id.
+/// These are WALL-CLOCK SECONDS: the ceremony coordinator config arms the real timer
+/// ([`CEREMONY_TICK_PERIOD_MS`]), so a tuned value is the wall it says it is. The [`Default`]
+/// values (warmup / round / witness / cooldown = 1_000_000 s, stop = 1_000_000 rounds) are the
+/// effectively-infinite shape: every phase then exits through its event-driven fast path.
+/// Only an operator that sets real values moves the run id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CeremonyRunTimers {
     /// The join/warmup wall the coordinator waits through before round 0 (`warmup_s`).
@@ -484,12 +514,12 @@ pub struct CeremonyRunTimers {
 
 impl Default for CeremonyRunTimers {
     fn default() -> Self {
-        // The pre-timer synthetic-clock values — the byte-stability floor (see the type docs).
+        // The effectively-infinite shape: every phase exits through its fast path (type docs).
         Self {
-            warmup_s: 1_000_000,
-            round_max_s: 1_000_000,
-            witness_s: 1_000_000,
-            cooldown_s: 1_000_000,
+            warmup_s: EVENT_CLOCK_DEADLINE_S,
+            round_max_s: EVENT_CLOCK_DEADLINE_S,
+            witness_s: EVENT_CLOCK_DEADLINE_S,
+            cooldown_s: EVENT_CLOCK_DEADLINE_S,
             stop_rounds: 1_000_000,
         }
     }
@@ -530,8 +560,8 @@ pub struct CeremonyGenesisSpec<'a> {
     pub remote_ckpt_cadence_rounds: u64,
     /// The payload retention floor in rounds (`0` = unbounded — no cadence constraint).
     pub payload_retention_rounds: u64,
-    /// The real fleet run timers + stop condition. [`CeremonyRunTimers::default`] is the
-    /// synthetic-clock shape (byte-stable with the pre-timer authoring); the preflight operator
+    /// The real fleet run timers + stop condition, in wall-clock seconds.
+    /// [`CeremonyRunTimers::default`] is the effectively-infinite shape; the preflight operator
     /// tunes it from the measured per-round wall on the slowest box.
     pub timers: CeremonyRunTimers,
 }
@@ -542,9 +572,11 @@ pub struct CeremonyGenesisSpec<'a> {
 /// commit into the genesis hash (the run's cryptographic id).
 ///
 /// # Errors
-/// A human-readable failure when a genesis-authoring geometry rule is violated (profile chunk
-/// does not divide the layout, an invalid state chunk size, or a checkpoint cadence that could
-/// strand a rejoiner past payload retention) or the envelope fails to validate/freeze.
+/// A human-readable failure when a genesis-authoring rule is violated (profile chunk does not
+/// divide the layout, an invalid state chunk size, a checkpoint cadence that could strand a
+/// rejoiner past payload retention, a round schedule the trainers cannot slice, or wall-clock
+/// timers authored onto a clock that does not measure wall time) or the envelope fails to
+/// validate/freeze.
 pub fn ceremony_genesis(
     spec: &CeremonyGenesisSpec<'_>,
     author: &SigningKey,
@@ -627,9 +659,9 @@ pub fn ceremony_genesis(
         .copied()
         .unwrap_or(PeerId([0; 32]));
 
-    // The coordinator's opaque config (the guest's `da_init` shape), event-driven synthetic clock
-    // — the deterministic authoring shape; the fleet operator tunes real timers at preflight.
-    let coord_config = ceremony_coordinator_config(spec, coordinator_base);
+    // The coordinator's opaque config (the guest's `da_init` shape): the round schedule derived
+    // from the frozen trainer config, on the real clock the authored timers are denominated in.
+    let coord_config = ceremony_coordinator_config(spec)?;
 
     let mut roles = BTreeMap::new();
     roles.insert(
@@ -680,51 +712,58 @@ pub fn ceremony_genesis(
         .map_err(|e| format!("freeze the ceremony genesis: {e}"))
 }
 
-/// The coordinator role's opaque `{state, …}` config (the `da_init` shape), authored from the
-/// ceremony run parameters — the event-driven synthetic-clock shape (real fleet timers are a
-/// preflight operator choice).
-fn ceremony_coordinator_config(spec: &CeremonyGenesisSpec<'_>, coordinator_base: PeerId) -> Value {
-    use daemon_vhc_proto::envelope::{GlobalBatch, StopCondition};
-    use daemon_vhc_proto::{CapabilitySet, VHC_PROTO_VERSION};
-    use daemon_vhc_sdk_consensus::coordinator::{
-        CoordinatorState, RunConfig as CoordinatorRunConfig,
-    };
+/// The ceremony's round schedule for a `peers`-strong trainer roster, DERIVED from the frozen
+/// trainer config: [`CEREMONY_STEPS_PER_ROUND`] × [`CEREMONY_MICRO_BATCH`] × `peers` sequences per
+/// round, i.e. one micro-batch per inner step per peer.
+///
+/// The round window and the inner loop are one relationship, so the authoring computes the window
+/// from the config it embeds rather than spelling a second number beside it: a window sized to
+/// anything else (the roster size, say) leaves each peer a share the 30-step inner loop cannot
+/// divide, and an unsliceable share plans no fetches at all — the peer trains nothing and never
+/// commits.
+#[must_use]
+pub fn ceremony_round_schedule(peers: u32) -> RoundSchedule {
+    RoundSchedule::derived(CEREMONY_STEPS_PER_ROUND, CEREMONY_MICRO_BATCH, peers)
+}
 
-    let _ = coordinator_base;
-    let run_config = CoordinatorRunConfig {
-        run_id: spec.run_label.to_string(),
-        proto_version: VHC_PROTO_VERSION,
-        envelope_hash: Hash([0u8; 32]),
-        required_capabilities: CapabilitySet::new(),
+/// The coordinator role's opaque `{state, tick_period_ms, verify_availability}` config (the
+/// `da_init` shape), authored from the ceremony run parameters through the shared authoring seat
+/// ([`crate::coordinator_config`]): the round schedule derived from the frozen trainer config, and
+/// the real timer that makes the operator's calibrated seconds wall-clock seconds.
+///
+/// # Errors
+/// The authoring refusals of [`coordinator_role_config`] (an unsliceable round schedule, or
+/// wall-clock deadlines on a clock that does not measure wall time).
+fn ceremony_coordinator_config(spec: &CeremonyGenesisSpec<'_>) -> Result<Value, String> {
+    use daemon_vhc_proto::envelope::StopCondition;
+
+    let peers = u32::try_from(spec.roster.len())
+        .map_err(|_| "the ceremony trainer roster does not fit a peer count".to_string())?;
+    coordinator_role_config(&CoordinatorAuthoring {
+        run_label: spec.run_label,
         min_peers: spec.min_peers,
         max_peers: spec.max_peers,
-        // The real fleet timers, defaulting to the synthetic-clock values — byte-stable when
-        // untuned; the preflight operator sets them from the slowest box's measured wall.
-        warmup_s: spec.timers.warmup_s,
-        round_train_max_s: spec.timers.round_max_s,
-        round_witness_s: spec.timers.witness_s,
-        cooldown_s: spec.timers.cooldown_s,
         epoch_rounds: 0,
-        stall_rounds_max: 4,
-        global_batch: GlobalBatch {
-            start: spec.max_peers.max(1),
-            end: spec.max_peers.max(1),
-            ramp_rounds: 1,
-        },
-        stop: StopCondition::Rounds(spec.timers.stop_rounds),
-        steps_per_round: 30,
+        stall_rounds_max: CEREMONY_STALL_ROUNDS_MAX,
+        k_absences: CEREMONY_K_ABSENCES,
         seq_len: spec.seq_len,
-        witness_target: 0,
-        overlap_bps: 0,
-        k_absences: 3,
-        verification_percent: 0,
-        authorized: Vec::new(),
-    };
-    let state = CoordinatorState::new(run_config, Seed([0x33; 32]), 0);
-    Value::Map(vec![(
-        Value::Text("state".into()),
-        Value::serialized(&state).expect("coordinator state to cbor value"),
-    )])
+        // The window the trainers can actually consume: derived from the trainer config this same
+        // genesis embeds, over the roster it assigns against.
+        schedule: ceremony_round_schedule(peers),
+        // The real fleet timers, defaulting to the effectively-infinite values — byte-stable when
+        // untuned; the preflight operator sets them from the slowest box's measured wall.
+        deadlines: PhaseDeadlines {
+            warmup_s: spec.timers.warmup_s,
+            round_train_max_s: spec.timers.round_max_s,
+            round_witness_s: spec.timers.witness_s,
+            cooldown_s: spec.timers.cooldown_s,
+        },
+        tick_period_ms: CEREMONY_TICK_PERIOD_MS,
+        stop: StopCondition::Rounds(spec.timers.stop_rounds),
+        // The fleet coordinator does NOT availability-verify commitments against the content
+        // plane (the guest default): an owner decision, not an authoring one.
+        verify_availability: false,
+    })
 }
 
 /// The envelope `authority` config (opaque to the host; D1's consensus SDK interprets it): the
@@ -941,7 +980,6 @@ mod tests {
             max_peers: 3,
             remote_ckpt_cadence_rounds: 20,
             payload_retention_rounds: 64,
-            // Default (synthetic-clock) timers — the byte-stability floor this test pins.
             timers: CeremonyRunTimers::default(),
         };
         let frozen = ceremony_genesis(&spec, &author).expect("author ceremony genesis");
@@ -995,9 +1033,8 @@ mod tests {
         );
     }
 
-    /// The real fleet timers thread into the committed coordinator config: default (synthetic-
-    /// clock) timers reproduce the pre-timer run id byte-for-byte (byte-stability), while any tuned
-    /// value moves the run id (the timers are inside the envelope that defines the run's identity).
+    /// The real fleet timers thread into the committed coordinator config: a tuned value moves the
+    /// run id (the timers are inside the envelope that defines the run's identity).
     #[test]
     fn ceremony_timers_thread_into_the_genesis() {
         let author = SigningKey::from_bytes(&[0x42; 32]);
@@ -1045,6 +1082,168 @@ mod tests {
             tuned_run.run_id(),
             "tuned fleet timers must change the committed run id"
         );
+    }
+
+    /// The committed coordinator config and the committed trainer config describe the SAME round:
+    /// the window the coordinator opens is the roster's worth of the trainer's own inner loop, and
+    /// the clock the deadlines are counted on measures wall time.
+    ///
+    /// These two halves are what a fleet round is made of. A window sized to anything but the
+    /// trainer's schedule leaves each peer a share the inner loop cannot divide (no inner steps,
+    /// no fetches, no commitment), and deadlines authored onto the event-driven clock count
+    /// delivered events, so a quiet round cannot even time out.
+    #[test]
+    fn the_committed_round_schedule_matches_the_committed_trainer_config() {
+        use crate::coordinator_config::WALL_CLOCK_TICK_PERIOD_MS;
+        use daemon_vhc_sdk_consensus::coordinator::CoordinatorState;
+
+        let author = SigningKey::from_bytes(&[0x42; 32]);
+        let base = |n: u8| daemon_vhc_proto::peer_id(&SigningKey::from_bytes(&[n; 32]));
+        let trusted = [base(1), base(2), base(3)];
+        let manifest = Hash([0xAB; 32]);
+        let corpus_artifacts = vec![(
+            "corpus-manifest.cbor".to_string(),
+            PublishedArtifact::CorpusManifest(manifest),
+        )];
+        let spec = CeremonyGenesisSpec {
+            run_label: "vhc-ceremony",
+            coordinator_module: Hash([0xC0; 32]),
+            trainer_module: Hash([0x7A; 32]),
+            corpus_manifest: manifest,
+            corpus_artifacts: &corpus_artifacts,
+            seq_len: u64::from(CEREMONY_SEQ_LEN),
+            trusted_bases: &trusted,
+            roster: &trusted,
+            upgrade_authority: vec![base(1)],
+            min_peers: 3,
+            max_peers: 3,
+            remote_ckpt_cadence_rounds: 8,
+            payload_retention_rounds: 64,
+            // The calibrated fleet timers: seconds, on a clock that measures seconds.
+            timers: CeremonyRunTimers {
+                warmup_s: 300,
+                round_max_s: 600,
+                witness_s: 300,
+                cooldown_s: 60,
+                stop_rounds: 48,
+            },
+        };
+        let env = ceremony_genesis(&spec, &author)
+            .expect("author ceremony genesis")
+            .decode()
+            .expect("decode");
+
+        let field = |cfg: &Value, name: &str| -> Value {
+            let Value::Map(entries) = cfg else {
+                panic!("a role config is a map");
+            };
+            entries
+                .iter()
+                .find_map(|(k, v)| matches!(k, Value::Text(t) if t == name).then(|| v.clone()))
+                .unwrap_or_else(|| panic!("`{name}` in the role config"))
+        };
+        let uint = |cfg: &Value, name: &str| -> u64 {
+            u64::try_from(i128::from(
+                field(cfg, name).as_integer().expect("an integer field"),
+            ))
+            .expect("a non-negative field")
+        };
+
+        // The trainer's half: the frozen inner loop over the fleet roster.
+        let trainer = &env.roles.get("trainer").expect("trainer role").config;
+        let steps = uint(trainer, "steps_per_round");
+        let micro = uint(trainer, "micro_batch");
+        let Value::Array(roster) = field(trainer, "roster") else {
+            panic!("the trainer roster is an array");
+        };
+        assert_eq!(
+            (steps, micro, roster.len()),
+            (
+                u64::from(CEREMONY_STEPS_PER_ROUND),
+                u64::from(CEREMONY_MICRO_BATCH),
+                trusted.len()
+            )
+        );
+
+        // The coordinator's half: the window, and the clock the deadlines live on.
+        let coordinator = &env
+            .roles
+            .get("coordinator")
+            .expect("coordinator role")
+            .config;
+        let state: CoordinatorState = field(coordinator, "state")
+            .deserialized()
+            .expect("the coordinator state decodes");
+        let expected = steps * micro * roster.len() as u64;
+        assert_eq!(expected, 90, "30 inner steps × 1 sequence × 3 peers");
+        assert_eq!(u64::from(state.config.global_batch.start), expected);
+        assert_eq!(u64::from(state.config.global_batch.end), expected);
+        assert_eq!(u64::from(state.config.steps_per_round), steps);
+        assert_eq!(
+            u64::from(state.config.global_batch.start) / roster.len() as u64 % steps,
+            0,
+            "a peer's share of the window is a whole number of inner steps"
+        );
+        assert_eq!(
+            uint(coordinator, "tick_period_ms"),
+            WALL_CLOCK_TICK_PERIOD_MS,
+            "the authored seconds are counted on a clock that measures seconds"
+        );
+        assert_eq!(state.config.warmup_s, 300);
+        assert_eq!(state.config.round_train_max_s, 600);
+        assert_eq!(state.config.round_witness_s, 300);
+        assert_eq!(state.config.cooldown_s, 60);
+    }
+
+    /// A roster the derivation cannot serve is an authoring refusal, not a run that parks: an
+    /// empty trainer roster assigns nobody any sequences.
+    #[test]
+    fn ceremony_genesis_refuses_a_roster_it_cannot_schedule() {
+        let author = SigningKey::from_bytes(&[0x42; 32]);
+        let base = |n: u8| daemon_vhc_proto::peer_id(&SigningKey::from_bytes(&[n; 32]));
+        let trusted = [base(1), base(2), base(3)];
+        let manifest = Hash([0xAB; 32]);
+        let corpus_artifacts = vec![(
+            "corpus-manifest.cbor".to_string(),
+            PublishedArtifact::CorpusManifest(manifest),
+        )];
+        let spec = CeremonyGenesisSpec {
+            run_label: "vhc-ceremony",
+            coordinator_module: Hash([0xC0; 32]),
+            trainer_module: Hash([0x7A; 32]),
+            corpus_manifest: manifest,
+            corpus_artifacts: &corpus_artifacts,
+            seq_len: u64::from(CEREMONY_SEQ_LEN),
+            trusted_bases: &trusted,
+            roster: &[],
+            upgrade_authority: vec![base(1)],
+            min_peers: 3,
+            max_peers: 3,
+            remote_ckpt_cadence_rounds: 8,
+            payload_retention_rounds: 64,
+            timers: CeremonyRunTimers::default(),
+        };
+        let err = ceremony_genesis(&spec, &author).expect_err("an empty roster must refuse");
+        assert!(err.contains("assignment roster is empty"), "{err}");
+    }
+
+    /// The derivation is the trainer config's own arithmetic, at every fleet size.
+    #[test]
+    fn the_round_schedule_is_derived_from_the_frozen_trainer_config() {
+        for peers in 1..=3u32 {
+            let schedule = ceremony_round_schedule(peers);
+            assert_eq!(
+                schedule.global_batch,
+                CEREMONY_STEPS_PER_ROUND * CEREMONY_MICRO_BATCH * peers
+            );
+            assert_eq!(schedule.sequences_per_peer(), CEREMONY_STEPS_PER_ROUND);
+            schedule
+                .validate()
+                .expect("the derived schedule is sliceable");
+        }
+        // The single-peer smoke and the three-peer fleet: 30 and 90 sequences per round.
+        assert_eq!(ceremony_round_schedule(1).global_batch, 30);
+        assert_eq!(ceremony_round_schedule(3).global_batch, 90);
     }
 
     #[test]
